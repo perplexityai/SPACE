@@ -350,8 +350,7 @@ fn update_baseline(
         } else {
             not_added.push(NotAdded {
                 table: table.clone(),
-                path: file.path.clone(),
-                count,
+                entry: Some((file.path.clone(), count)),
                 line: format!(
                     "not added: {} ({}); {advice}",
                     file.path,

@@ -14,6 +14,7 @@ use std::{
 
 use pplx_space_archcheck::{
     BASELINE_FILE, Baseline, Context, LoadError, WriteBaselineError, check,
+    config::CrateNamesPolicy,
     context::find_workspace_root,
     report::{Format, UnknownFormatError, render, summary},
     skipped, write_baseline, write_baseline_table,
@@ -22,7 +23,7 @@ use thiserror::Error;
 
 const USAGE: &str = "\
 usage: archcheck [--root <path>] [--format human|rdjson]
-                 [--base-baseline <path>]
+                 [--base-baseline <path>] [--base-architecture <path>]
        archcheck [--root <path>] --write-baseline[=<table>]
 
   --root <path>       repository root (default: the Cargo workspace containing
@@ -31,14 +32,21 @@ usage: archcheck [--root <path>] [--format human|rdjson]
                       summary on stderr
   --base-baseline <path>
                       the base branch's architecture-baseline.toml, which the
-                      no_new_entries and no_raised_caps behaviours compare
-                      with (skipped without it)
+                      no_new_entries and no_raised_caps behaviours (skipped
+                      without it) and crate_names.no_new (limited to the
+                      crates listed when it was added without it) compare
+                      with
+  --base-architecture <path>
+                      the base branch's ARCHITECTURE.toml, which
+                      crate_names.policy_changed compares with (skipped
+                      without it)
   --write-baseline[=<table>]
                       update or remove the entries of architecture-baseline.toml
-                      to match the current tree, or with =<table> (file_size or
-                      pattern_ratchet.<instance>) only that table's, keeping
-                      the others. It lists each violation without an entry,
-                      with the entries to add by hand, and never adds one";
+                      to match the current tree, or with =<table> (file_size,
+                      crate_names or pattern_ratchet.<instance>) only that
+                      table's, keeping the others. It lists each violation
+                      without an entry, with the entries to add by hand, and
+                      never adds one";
 
 const EXIT_REQUIRED_FINDINGS: u8 = 1;
 const EXIT_ERROR: u8 = 2;
@@ -54,8 +62,8 @@ enum UsageError {
     UnexpectedArgument(String),
     #[error("unexpected argument {0:?}; name a table as --write-baseline={0}")]
     WriteBaselineTable(String),
-    #[error("--base-baseline cannot be combined with --write-baseline")]
-    BaseBaselineWithWriteBaseline,
+    #[error("{0} cannot be combined with --write-baseline")]
+    BaseWithWriteBaseline(&'static str),
     #[error(transparent)]
     Format(#[from] UnknownFormatError),
 }
@@ -78,6 +86,7 @@ struct Options {
     root: Option<PathBuf>,
     format: Format,
     base_baseline: Option<PathBuf>,
+    base_architecture: Option<PathBuf>,
     write_baseline: Option<WriteBaseline>,
 }
 
@@ -133,7 +142,7 @@ fn run(options: Options) -> Result<ExitCode, RunError> {
         let counts: Vec<String> = tables
             .iter()
             .filter_map(|table| {
-                let entries = written.baseline.table(table)?.len();
+                let entries = written.baseline.table_len(table)?;
                 Some(format!("{entries} {table}"))
             })
             .collect();
@@ -166,6 +175,9 @@ fn run(options: Options) -> Result<ExitCode, RunError> {
     let mut ctx = Context::load(&root)?;
     if let Some(path) = &options.base_baseline {
         ctx.base_baseline = Baseline::load_base(path)?;
+    }
+    if let Some(path) = &options.base_architecture {
+        ctx.base_architecture = CrateNamesPolicy::load_base(path)?;
     }
     let findings = check(&ctx);
     let report = render(options.format, &findings, ctx.files.len());
@@ -209,6 +221,7 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Option<Options>, U
         root: None,
         format: Format::Human,
         base_baseline: None,
+        base_architecture: None,
         write_baseline: None,
     };
     let mut args = args
@@ -231,6 +244,7 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Option<Options>, U
             "--root" => options.root = Some(PathBuf::from(value()?)),
             "--format" => options.format = value()?.parse()?,
             "--base-baseline" => options.base_baseline = Some(PathBuf::from(value()?)),
+            "--base-architecture" => options.base_architecture = Some(PathBuf::from(value()?)),
             // A table is only ever given after `=`, so a following argument
             // is never taken as one; after a bare `--write-baseline`, the
             // error says how to name it.
@@ -247,8 +261,13 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Option<Options>, U
             other => return Err(UsageError::UnexpectedArgument(other.to_owned())),
         }
     }
-    if options.write_baseline.is_some() && options.base_baseline.is_some() {
-        return Err(UsageError::BaseBaselineWithWriteBaseline);
+    if options.write_baseline.is_some() {
+        if options.base_baseline.is_some() {
+            return Err(UsageError::BaseWithWriteBaseline("--base-baseline"));
+        }
+        if options.base_architecture.is_some() {
+            return Err(UsageError::BaseWithWriteBaseline("--base-architecture"));
+        }
     }
     Ok(Some(options))
 }

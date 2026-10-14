@@ -6,6 +6,7 @@ use std::{fs, path::Path, process::Command};
 
 use pplx_space_archcheck::{
     BaseBaseline, Baseline, Context, check,
+    config::CrateNamesPolicy,
     context::count_code_lines,
     report::{Format, render},
     skipped, write_baseline,
@@ -22,12 +23,37 @@ fn code(lines: usize) -> String {
 
 const ADVISORY: [&str; 5] = ["advisory"; 5];
 
-/// The summary's line when no base baseline is given.
-const SKIPPED: &str = "archcheck: file_size.no_new_entries and file_size.no_raised_caps skipped \
-                       (no --base-baseline given)\n";
+/// The summary's line when no base architecture is given.
+const POLICY_SKIPPED: &str =
+    "archcheck: crate_names.policy_changed skipped (no --base-architecture given)\n";
 
-/// `modes` of no_crossing, no_new_entries, no_raised_caps, listed_no_growth
-/// and stale_entries.
+/// The summary's lines when neither base is given.
+const SKIPPED: &str = "archcheck: file_size.no_new_entries and file_size.no_raised_caps skipped \
+                       (no --base-baseline given)\n\
+                       archcheck: crate_names.no_new allows only the 16 crates listed when the \
+                       rule was added in [crate_names] (no --base-baseline given)\n\
+                       archcheck: crate_names.policy_changed skipped (no --base-architecture \
+                       given)\n";
+
+/// `crate_names`' lines after the other skip lines, for a base baseline
+/// without `[crate_names]` and no base architecture.
+const CRATE_NAMES_SKIPPED: [&str; 2] = [
+    "the base branch's architecture-baseline.toml has no [crate_names] table; crate_names.no_new \
+     allows only the 16 crates listed when the rule was added in [crate_names]",
+    "crate_names.policy_changed skipped (no --base-architecture given)",
+];
+
+/// `[rules.crate_names]` as in the repository's `ARCHITECTURE.toml`.
+const CRATE_NAMES: &str = "[rules.crate_names]\n\
+                           banned_tokens = [\"common\", \"shared\", \"util\", \"utils\", \
+                           \"helper\", \"helpers\", \"misc\", \"core\"]\n\
+                           allow = []\n\
+                           [rules.crate_names.no_new]\nmode = \"required\"\n\
+                           [rules.crate_names.stale_entries]\nmode = \"advisory\"\n\
+                           [rules.crate_names.policy_changed]\nmode = \"advisory\"\n";
+
+/// `modes` of file_size's no_crossing, no_new_entries, no_raised_caps,
+/// listed_no_growth and stale_entries, followed by [`CRATE_NAMES`].
 fn config(modes: [&str; 5]) -> String {
     let [
         no_crossing,
@@ -42,16 +68,44 @@ fn config(modes: [&str; 5]) -> String {
          [rules.file_size.no_new_entries]\nmode = \"{no_new_entries}\"\n\
          [rules.file_size.no_raised_caps]\nmode = \"{no_raised_caps}\"\n\
          [rules.file_size.listed_no_growth]\nmode = \"{listed_no_growth}\"\n\
-         [rules.file_size.stale_entries]\nmode = \"{stale_entries}\"\n"
+         [rules.file_size.stale_entries]\nmode = \"{stale_entries}\"\n\
+         {CRATE_NAMES}"
     )
 }
 
+/// [`config`] with file_size's behaviours advisory, and the `key` line of
+/// `[rules.crate_names]` replaced with `key = <value>`.
+fn with_crate_names(key: &str, value: &str) -> String {
+    let advisory = config(ADVISORY);
+    let line = advisory
+        .lines()
+        .find(|line| line.starts_with(&format!("{key} = ")))
+        .expect("CRATE_NAMES has the key");
+    advisory.replace(line, &format!("{key} = {value}"))
+}
+
+/// `[file_size]` with `entries` and an empty `[crate_names]`.
 fn baseline(entries: &[(&str, usize)]) -> String {
+    tables(entries, &[])
+}
+
+/// `[file_size]` and `[crate_names]` with these entries.
+fn tables(file_size: &[(&str, usize)], crate_names: &[(&str, &str)]) -> String {
     let mut text = String::from("[file_size]\n");
-    for (path, cap) in entries {
+    for (path, cap) in file_size {
         text.push_str(&format!("{path:?} = {cap}\n"));
     }
+    text.push_str("[crate_names]\n");
+    for (name, member) in crate_names {
+        text.push_str(&format!("{name:?} = {member:?}\n"));
+    }
     text
+}
+
+/// A member manifest for package `name`. Its library's source is outside
+/// `src/`, so that it is not a production file, and need not exist.
+fn package(name: &str) -> String {
+    format!("[package]\nname = {name:?}\n[lib]\npath = \"lib.rs\"\n")
 }
 
 /// A workspace with members `crates/a` and `crates/b`, every behaviour
@@ -63,8 +117,8 @@ fn workspace(files: &[(&str, String)]) -> TempDir {
             "Cargo.toml",
             "[workspace]\nmembers = [\"crates/a\", \"crates/b\"]\n".to_owned(),
         ),
-        ("crates/a/Cargo.toml", "[package]\n".to_owned()),
-        ("crates/b/Cargo.toml", "[package]\n".to_owned()),
+        ("crates/a/Cargo.toml", package("a")),
+        ("crates/b/Cargo.toml", package("b")),
         ("ARCHITECTURE.toml", config(ADVISORY)),
         ("architecture-baseline.toml", baseline(&[])),
     ];
@@ -76,14 +130,49 @@ fn workspace(files: &[(&str, String)]) -> TempDir {
     dir
 }
 
+/// A workspace with members `crates/a`, `crates/b` and one per
+/// `(member, package name)` in `packages`, and `files` written over the
+/// defaults.
+fn crate_workspace(packages: &[(&str, &str)], files: &[(&str, String)]) -> TempDir {
+    let mut members = vec!["crates/a", "crates/b"];
+    members.extend(packages.iter().map(|(member, _)| *member));
+    let manifests: Vec<(String, String)> = packages
+        .iter()
+        .map(|(member, name)| (format!("{member}/Cargo.toml"), package(name)))
+        .collect();
+    let mut all: Vec<(&str, String)> = vec![(
+        "Cargo.toml",
+        format!("[workspace]\nmembers = {members:?}\n"),
+    )];
+    all.extend(
+        manifests
+            .iter()
+            .map(|(path, text)| (path.as_str(), text.clone())),
+    );
+    all.extend(files.iter().cloned());
+    workspace(&all)
+}
+
 /// The workspace's context, with `base` written to `base-baseline.toml` and
 /// read as the base branch's baseline.
 fn load(root: &Path, base: Option<&str>) -> Context {
+    load_with(root, base, None)
+}
+
+/// [`load`], also with `architecture` written to `base-architecture.toml`
+/// and read as the base branch's `ARCHITECTURE.toml`.
+fn load_with(root: &Path, base: Option<&str>, architecture: Option<&str>) -> Context {
     let mut ctx = Context::load(root).expect("the workspace loads");
     if let Some(text) = base {
         let path = root.join("base-baseline.toml");
         fs::write(&path, text).expect("write the base baseline");
         ctx.base_baseline = Baseline::load_base(&path).expect("the base baseline is readable");
+    }
+    if let Some(text) = architecture {
+        let path = root.join("base-architecture.toml");
+        fs::write(&path, text).expect("write the base architecture");
+        ctx.base_architecture =
+            CrateNamesPolicy::load_base(&path).expect("the base architecture is readable");
     }
     ctx
 }
@@ -172,8 +261,8 @@ fn inventory() {
     ];
     let mut files: Vec<(&str, String)> = cases.iter().map(|(path, _)| (*path, code(1))).collect();
     files.extend([
-        ("crates/a/src/inner/Cargo.toml", "[package]\n".to_owned()),
-        ("crates/c/Cargo.toml", "[package]\n".to_owned()),
+        ("crates/a/src/inner/Cargo.toml", package("inner")),
+        ("crates/c/Cargo.toml", package("c")),
     ]);
     let mut members = vec!["crates/a", "crates/b", "crates/a/src/inner"];
     let mut expected: Vec<&str> = cases
@@ -185,7 +274,7 @@ fn inventory() {
     {
         // `crates/s/src` is a symlink to `shared/src`, made below.
         files.extend([
-            ("crates/s/Cargo.toml", "[package]\n".to_owned()),
+            ("crates/s/Cargo.toml", package("s")),
             ("shared/src/lib.rs", code(1)),
         ]);
         members.push("crates/s");
@@ -478,7 +567,10 @@ fn lenient_base_baseline() {
             .map(|finding| finding.behaviour)
             .collect();
         assert_eq!(found, *expected, "{name}");
-        let skipped = skipped(&ctx);
+        let skipped: Vec<String> = skipped(&ctx)
+            .into_iter()
+            .filter(|line| line.contains("file_size."))
+            .collect();
         match problem {
             None => {
                 assert!(
@@ -501,6 +593,962 @@ fn lenient_base_baseline() {
             }
         }
     }
+}
+
+/// Pairs such as `(member, package name)` or `(behaviour, message)`.
+type Pairs<'a> = &'a [(&'a str, &'a str)];
+
+/// The base branch's `[crate_names]`, as a column of the tables below.
+#[derive(Clone, Copy)]
+enum Base<'a> {
+    /// No `--base-baseline`, as when the base can't be resolved.
+    Unresolved,
+    /// A copy without the table, from before the rule.
+    NoTable,
+    Names(&'a [&'a str]),
+}
+
+impl Base<'_> {
+    fn text(self) -> Option<String> {
+        match self {
+            Self::Unresolved => None,
+            Self::NoTable => Some("[file_size]\n".to_owned()),
+            Self::Names(names) => {
+                let entries: Vec<(&str, &str)> =
+                    names.iter().map(|name| (*name, "crates/x")).collect();
+                Some(tables(&[], &entries))
+            }
+        }
+    }
+}
+
+/// `(behaviour, message)` of each `crate_names` finding.
+fn crate_findings(ctx: &Context) -> Vec<(&'static str, String)> {
+    check(ctx)
+        .into_iter()
+        .filter(|finding| finding.rule == "crate_names")
+        .map(|finding| (finding.behaviour, finding.message()))
+        .collect()
+}
+
+fn assert_findings(name: &str, found: &[(&str, String)], expected: &[(&str, &str)]) {
+    assert_eq!(found.len(), expected.len(), "{name}: {found:#?}");
+    for ((behaviour, message), (want_behaviour, want_message)) in found.iter().zip(expected) {
+        assert_eq!(behaviour, want_behaviour, "{name}");
+        assert!(message.starts_with(want_message), "{name}: {message}");
+    }
+}
+
+/// One row per situation: the base branch's `[crate_names]`, the baseline's
+/// entries, the extra members as `(member, package name)`, and the expected
+/// `(behaviour, start of message)` of each `crate_names` finding.
+#[test]
+fn crate_names_behaviours() {
+    const LISTED: &str = "pplx-space-common-io";
+    type Case<'a> = (
+        &'a str,
+        Base<'a>,
+        &'a [(&'a str, &'a str)],
+        &'a [(&'a str, &'a str)],
+        &'a [(&'a str, &'a str)],
+    );
+    let new = |member: &str, name: &str, token: &str| {
+        format!("{member}/Cargo.toml: `{name}` uses `{token}`, a catch-all name.")
+    };
+    let underscores = new("crates/x", "pplx_space_foo_utils", "utils");
+    let mixed_case = new("crates/x", "Foo-Utils", "utils");
+    let mixed_separators = new("crates/x", "foo_Shared-io", "shared");
+    let unprefixed = new("crates/x", "foo-core", "core");
+    let first = new("crates/x", "pplx-space-common-core", "common");
+    let renamed_to_utils = new("crates/x", "pplx-space-io-utils", "utils");
+    let not_bootstrap = "pplx-space-foo-utils is in [crate_names] in architecture-baseline.toml \
+                         but not one of the 16 crates listed when the rule was added, and there \
+                         is no base branch copy of [crate_names] to compare with; catch-all crate \
+                         names can't be added. Name the crate for what it does instead.";
+    let elsewhere = "crates/new/Cargo.toml: `pplx-space-common-io` is listed in \
+                     architecture-baseline.toml at crates/old, but this crate is at crates/new. \
+                     An entry only covers the crate at its path: if the listed crate moved here, \
+                     update the entry's path; otherwise name this crate for what it does.";
+    let foo_utils = [("crates/libs/foo-utils", "pplx-space-foo-utils")];
+    let foo_utils_entry = [("pplx-space-foo-utils", "crates/libs/foo-utils")];
+    let cases: &[Case] = &[
+        (
+            "a new catch-all crate",
+            Base::Unresolved,
+            &[],
+            &foo_utils,
+            &[(
+                "no_new",
+                "crates/libs/foo-utils/Cargo.toml: `pplx-space-foo-utils` uses `utils`, a \
+                 catch-all name. Name the crate for what it does, and split it if it holds \
+                 unrelated things. Existing catch-all crates are listed in \
+                 architecture-baseline.toml; new ones can't be added.",
+            )],
+        ),
+        (
+            "underscores",
+            Base::Unresolved,
+            &[],
+            &[("crates/x", "pplx_space_foo_utils")],
+            &[("no_new", &underscores)],
+        ),
+        (
+            "mixed case",
+            Base::Unresolved,
+            &[],
+            &[("crates/x", "Foo-Utils")],
+            &[("no_new", &mixed_case)],
+        ),
+        (
+            "mixed separators",
+            Base::Unresolved,
+            &[],
+            &[("crates/x", "foo_Shared-io")],
+            &[("no_new", &mixed_separators)],
+        ),
+        (
+            "a name without the pplx-space- prefix",
+            Base::Unresolved,
+            &[],
+            &[("crates/x", "foo-core")],
+            &[("no_new", &unprefixed)],
+        ),
+        (
+            "the first matching part is named",
+            Base::Unresolved,
+            &[],
+            &[("crates/x", "pplx-space-common-core")],
+            &[("no_new", &first)],
+        ),
+        (
+            "whole parts only",
+            Base::Unresolved,
+            &[],
+            &[
+                ("crates/p0", "pplx-space-database"),
+                ("crates/p1", "pplx-space-coreutils"),
+                ("crates/p2", "encore"),
+                ("crates/p3", "pplx-space-uncommon"),
+                ("crates/p4", "utility_helpersets"),
+            ],
+            &[],
+        ),
+        (
+            "a listed crate",
+            Base::Names(&[LISTED]),
+            &[(LISTED, "crates/x")],
+            &[("crates/x", LISTED)],
+            &[],
+        ),
+        (
+            "an entry was added",
+            Base::Names(&[]),
+            &[(LISTED, "crates/x")],
+            &[("crates/x", LISTED)],
+            &[(
+                "no_new",
+                "pplx-space-common-io is in [crate_names] in architecture-baseline.toml but not \
+                 in the base branch's copy; catch-all crate names can't be added. Name the crate \
+                 for what it does instead.",
+            )],
+        ),
+        (
+            "a new crate with an entry of its own",
+            Base::Names(&[]),
+            &foo_utils_entry,
+            &foo_utils,
+            &[("no_new", "pplx-space-foo-utils is in [crate_names]")],
+        ),
+        (
+            "an entry in the base, though not a bootstrap crate",
+            Base::Names(&["pplx-space-foo-utils"]),
+            &foo_utils_entry,
+            &foo_utils,
+            &[],
+        ),
+        (
+            "no base table: a bootstrap entry",
+            Base::NoTable,
+            &[(LISTED, "crates/x")],
+            &[("crates/x", LISTED)],
+            &[],
+        ),
+        (
+            "no base table: any other entry",
+            Base::NoTable,
+            &foo_utils_entry,
+            &foo_utils,
+            &[("no_new", not_bootstrap)],
+        ),
+        (
+            "an unresolved base: a bootstrap entry",
+            Base::Unresolved,
+            &[(LISTED, "crates/x")],
+            &[("crates/x", LISTED)],
+            &[],
+        ),
+        (
+            "an unresolved base: any other entry",
+            Base::Unresolved,
+            &foo_utils_entry,
+            &foo_utils,
+            &[("no_new", not_bootstrap)],
+        ),
+        (
+            "an entry was removed",
+            Base::Names(&[LISTED, "pplx-space-misc"]),
+            &[(LISTED, "crates/x")],
+            &[("crates/x", LISTED)],
+            &[],
+        ),
+        (
+            "a listed name at another path",
+            Base::Names(&[LISTED]),
+            &[(LISTED, "crates/old")],
+            &[("crates/new", LISTED)],
+            &[("no_new", elsewhere)],
+        ),
+        (
+            "a listed crate moved, and its entry's path with it",
+            Base::Names(&[LISTED]),
+            &[(LISTED, "crates/new")],
+            &[("crates/new", LISTED)],
+            &[],
+        ),
+        (
+            "a listed crate was renamed to a clean name",
+            Base::Names(&[LISTED]),
+            &[(LISTED, "crates/x")],
+            &[("crates/x", "pplx-space-io-buffers")],
+            &[(
+                "stale_entries",
+                "pplx-space-common-io: listed in architecture-baseline.toml but no workspace \
+                 member has this name. Remove the entry; a renamed crate is checked under its new \
+                 name.",
+            )],
+        ),
+        (
+            "a listed crate was removed",
+            Base::Names(&[LISTED]),
+            &[(LISTED, "crates/x")],
+            &[],
+            &[("stale_entries", "pplx-space-common-io: listed in")],
+        ),
+        (
+            "a listed crate was renamed to another catch-all name",
+            Base::Names(&[LISTED]),
+            &[(LISTED, "crates/x")],
+            &[("crates/x", "pplx-space-io-utils")],
+            &[
+                ("no_new", &renamed_to_utils),
+                ("stale_entries", "pplx-space-common-io: listed in"),
+            ],
+        ),
+        (
+            "a listed name that is not a catch-all name",
+            Base::Names(&["pplx-space-io-buffers"]),
+            &[("pplx-space-io-buffers", "crates/x")],
+            &[("crates/x", "pplx-space-io-buffers")],
+            &[(
+                "stale_entries",
+                "pplx-space-io-buffers: listed in architecture-baseline.toml but no longer a \
+                 catch-all name. Remove the entry.",
+            )],
+        ),
+    ];
+    for (name, base, entries, packages, expected) in cases {
+        let ws = crate_workspace(
+            packages,
+            &[("architecture-baseline.toml", tables(&[], entries))],
+        );
+
+        let found = crate_findings(&load(ws.path(), base.text().as_deref()));
+
+        assert_findings(name, &found, expected);
+    }
+}
+
+/// Cargo makes a path dependency inside the workspace a member, though the
+/// root manifest's `members` does not list it: both rules check it.
+#[test]
+fn implicit_members() {
+    let ws = workspace(&[
+        (
+            "crates/a/Cargo.toml",
+            format!(
+                "{}[dependencies]\nfoo = {{ path = \"../../libs/foo-utils\", package = \
+                 \"pplx-space-foo-utils\" }}\n",
+                package("a")
+            ),
+        ),
+        ("libs/foo-utils/Cargo.toml", package("pplx-space-foo-utils")),
+        ("libs/foo-utils/src/big.rs", code(LIMIT + 1)),
+        ("libs/foo-utils/src/ok.rs", code(LIMIT)),
+    ]);
+
+    let ctx = load(ws.path(), None);
+
+    let files: Vec<&str> = ctx.files.iter().map(|file| file.path.as_str()).collect();
+    assert_eq!(
+        files,
+        ["libs/foo-utils/src/big.rs", "libs/foo-utils/src/ok.rs"]
+    );
+    let found: Vec<_> = check(&ctx)
+        .into_iter()
+        .map(|finding| (finding.behaviour, finding.location.path))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            ("no_crossing", "libs/foo-utils/src/big.rs".to_owned()),
+            ("no_new", "libs/foo-utils/Cargo.toml".to_owned()),
+        ]
+    );
+    assert_eq!(run(ws.path(), &[]).code, 1);
+}
+
+/// The library's name is checked too, as written in `[lib] name` or derived
+/// from the package name; the package name is reported first.
+#[test]
+fn crate_names_library_names() {
+    let cases: &[(&str, &str, Pairs)] = &[
+        (
+            "pplx-space-io",
+            "name = \"utils\"\n",
+            &[(
+                "no_new",
+                "crates/x/Cargo.toml: the library of `pplx-space-io` is named `utils`, which uses \
+                 `utils`, a catch-all name. Name the crate",
+            )],
+        ),
+        (
+            "pplx-space-io",
+            "name = \"io_Helpers\"\n",
+            &[(
+                "no_new",
+                "crates/x/Cargo.toml: the library of `pplx-space-io` is named",
+            )],
+        ),
+        ("pplx-space-io", "name = \"io_buffers\"\n", &[]),
+        ("pplx-space-io", "", &[]),
+        (
+            "pplx-space-misc-io",
+            "",
+            &[(
+                "no_new",
+                "crates/x/Cargo.toml: `pplx-space-misc-io` uses `misc`",
+            )],
+        ),
+        (
+            "pplx-space-misc-io",
+            "name = \"utils\"\n",
+            &[(
+                "no_new",
+                "crates/x/Cargo.toml: `pplx-space-misc-io` uses `misc`",
+            )],
+        ),
+    ];
+    for (package, lib, expected) in cases {
+        let manifest = format!("[package]\nname = {package:?}\n[lib]\npath = \"lib.rs\"\n{lib}");
+        let ws = crate_workspace(
+            &[("crates/x", package)],
+            &[("crates/x/Cargo.toml", manifest)],
+        );
+
+        let found = crate_findings(&load(ws.path(), None));
+
+        assert_findings(&format!("{package} {lib}"), &found, expected);
+    }
+
+    // Shown on the `[lib] name` line.
+    let ws = crate_workspace(
+        &[("crates/x", "pplx-space-io")],
+        &[(
+            "crates/x/Cargo.toml",
+            "[package]\nname = \"pplx-space-io\"\n\n[lib]\npath = \"lib.rs\"\nname = \"utils\"\n"
+                .to_owned(),
+        )],
+    );
+    let document = rdjson(ws.path(), None);
+    assert_eq!(
+        document["diagnostics"][0]["location"]["range"]["start"]["line"],
+        6
+    );
+}
+
+/// `allow` exempts exact package names; one that is also in the baseline is
+/// a configuration error, and one that no longer applies is stale.
+#[test]
+fn crate_names_allow() {
+    let shared = "pplx-space-shared-memory";
+    let cases: &[(&str, &str, Pairs, Pairs)] = &[
+        ("[\"pplx-space-shared-memory\"]", shared, &[], &[]),
+        (
+            "[\"pplx-space-shared\"]",
+            shared,
+            &[],
+            &[
+                (
+                    "no_new",
+                    "crates/x/Cargo.toml: `pplx-space-shared-memory` uses `shared`",
+                ),
+                (
+                    "stale_entries",
+                    "pplx-space-shared: in [rules.crate_names] allow in ARCHITECTURE.toml but no \
+                     workspace member has this name. Remove it from allow.",
+                ),
+            ],
+        ),
+        (
+            "[\"pplx-space-memory\"]",
+            "pplx-space-memory",
+            &[],
+            &[(
+                "stale_entries",
+                "pplx-space-memory: in [rules.crate_names] allow in ARCHITECTURE.toml but not a \
+                 catch-all name. Remove it from allow.",
+            )],
+        ),
+    ];
+    for (allow, package, entries, expected) in cases {
+        let ws = crate_workspace(
+            &[("crates/x", package)],
+            &[
+                ("ARCHITECTURE.toml", with_crate_names("allow", allow)),
+                ("architecture-baseline.toml", tables(&[], entries)),
+            ],
+        );
+
+        let found = crate_findings(&load(ws.path(), None));
+
+        assert_findings(allow, &found, expected);
+    }
+
+    let ws = crate_workspace(
+        &[("crates/x", shared)],
+        &[
+            (
+                "ARCHITECTURE.toml",
+                with_crate_names("allow", "[\"pplx-space-shared-memory\"]"),
+            ),
+            (
+                "architecture-baseline.toml",
+                tables(&[], &[(shared, "crates/x")]),
+            ),
+        ],
+    );
+    let error = Context::load(ws.path()).unwrap_err().to_string();
+    assert!(
+        error.starts_with(
+            "pplx-space-shared-memory is in both [rules.crate_names] allow in ARCHITECTURE.toml \
+             and [crate_names] in architecture-baseline.toml"
+        ),
+        "{error}"
+    );
+    assert_eq!(run(ws.path(), &[]).code, 2);
+}
+
+/// `policy_changed` compares `[rules.crate_names]` with the base branch's
+/// `ARCHITECTURE.toml` and shows each difference on its line there; the
+/// base copy is read leniently.
+#[test]
+fn crate_names_policy_changed() {
+    let base = config(ADVISORY);
+    let without_misc = base.replace(", \"misc\"", "");
+    let allowing = base.replace(
+        "allow = []",
+        "allow = [\n  \"pplx-space-shared-memory\",\n]",
+    );
+    let advisory_no_new = base.replace(
+        "[rules.crate_names.no_new]\nmode = \"required\"",
+        "[rules.crate_names.no_new]\nmode = \"advisory\"",
+    );
+    let line_of =
+        |text: &str, needle: &str| text.lines().position(|line| line.contains(needle)).unwrap() + 1;
+    let tokens = line_of(&base, "banned_tokens");
+    type Case<'a> = (&'a str, &'a str, String, &'a [(usize, &'a str)]);
+    let cases: &[Case] = &[
+        ("unchanged", &base, base.clone(), &[]),
+        (
+            "a token removed",
+            &base,
+            without_misc.clone(),
+            &[(
+                tokens,
+                "ARCHITECTURE.toml: `misc` was removed from [rules.crate_names] banned_tokens, so \
+                 crate names using it are no longer checked.",
+            )],
+        ),
+        (
+            "a token added",
+            &without_misc,
+            base.clone(),
+            &[(
+                tokens,
+                "ARCHITECTURE.toml: `misc` was added to [rules.crate_names] banned_tokens.",
+            )],
+        ),
+        (
+            "an allow entry added",
+            &base,
+            allowing.clone(),
+            &[(
+                line_of(&allowing, "\"pplx-space-shared-memory\""),
+                "ARCHITECTURE.toml: `pplx-space-shared-memory` was added to [rules.crate_names] \
+                 allow, exempting it from the rule.",
+            )],
+        ),
+        (
+            "an allow entry removed",
+            &allowing,
+            base.clone(),
+            &[(
+                line_of(&base, "allow"),
+                "ARCHITECTURE.toml: `pplx-space-shared-memory` was removed from \
+                 [rules.crate_names] allow.",
+            )],
+        ),
+        (
+            "a mode changed",
+            &base,
+            advisory_no_new.clone(),
+            &[(
+                line_of(&advisory_no_new, "[rules.crate_names.no_new]") + 1,
+                "ARCHITECTURE.toml: crate_names.no_new mode changed from required to advisory.",
+            )],
+        ),
+        (
+            "a base from before the rule",
+            "[rules.file_size]\nlimit = 5\n",
+            base.clone(),
+            &[(
+                tokens,
+                "ARCHITECTURE.toml: [rules.crate_names] is not in the base branch's copy; the \
+                 whole policy is new.",
+            )],
+        ),
+        (
+            "unknown keys and behaviours in the base",
+            &format!("{base}extra = 1\n[rules.crate_names.retired]\nmode = \"advisory\"\n"),
+            base.clone(),
+            &[],
+        ),
+    ];
+    for (name, base, policy, expected) in cases {
+        let ws = crate_workspace(
+            &[("crates/x", "pplx-space-shared-memory")],
+            &[("ARCHITECTURE.toml", policy.clone())],
+        );
+
+        let ctx = load_with(ws.path(), None, Some(base));
+
+        let found: Vec<_> = check(&ctx)
+            .into_iter()
+            .filter(|finding| finding.behaviour == "policy_changed")
+            .map(|finding| (finding.location.line, finding.message(), finding.mode))
+            .collect();
+        assert_eq!(found.len(), expected.len(), "{name}: {found:#?}");
+        for ((line, message, mode), (want_line, want)) in found.iter().zip(*expected) {
+            assert_eq!(line, want_line, "{name}");
+            assert_eq!(message, want, "{name}");
+            assert_eq!(*mode, pplx_space_archcheck::Mode::Advisory, "{name}");
+        }
+        assert!(
+            !skipped(&ctx)
+                .iter()
+                .any(|line| line.contains("policy_changed")),
+            "{name}"
+        );
+    }
+
+    // A copy that does not parse skips the comparison with a warning, and so
+    // does the lack of one; neither fails the check.
+    let ws = workspace(&[("base.toml", "[rules\n".to_owned())]);
+    let base = ws.path().join("base.toml");
+    let run_unusable = run(ws.path(), &["--base-architecture", base.to_str().unwrap()]);
+    assert_eq!(run_unusable.code, 0, "{}", run_unusable.stderr);
+    let warning = format!(
+        "archcheck: warning: could not parse {} at line 1: ",
+        base.display()
+    );
+    let last = run_unusable.stdout.lines().last().unwrap();
+    assert!(
+        last.starts_with(&warning) && last.ends_with("; crate_names.policy_changed skipped"),
+        "{}",
+        run_unusable.stdout
+    );
+    assert!(run(ws.path(), &[]).stdout.ends_with(POLICY_SKIPPED));
+    let missing = ws.path().join("missing.toml");
+    let run_missing = run(
+        ws.path(),
+        &["--base-architecture", missing.to_str().unwrap()],
+    );
+    assert_eq!(run_missing.code, 2);
+}
+
+/// The base branch's `[crate_names]` is read on its own: other tables and the
+/// values are ignored. Without the table, only the bootstrap crates may be
+/// listed; a table that does not parse counts as empty, with a warning. The
+/// baseline lists `pplx-space-common-io`, a bootstrap crate.
+#[test]
+fn crate_names_lenient_base_baseline() {
+    /// Name, the base's copy, the `crate_names` behaviours found, the
+    /// summary's line, and the exit status.
+    type Case<'a> = (&'a str, String, &'a [&'a str], Option<&'a str>, i32);
+    let listed = "[crate_names]\n\"pplx-space-common-io\" = \"crates/x\"\n";
+    let missing = CRATE_NAMES_SKIPPED[0];
+    let cases: &[Case] = &[
+        ("the table", listed.to_owned(), &[], None, 0),
+        (
+            "other tables and keys",
+            format!("version = 2\n[other]\nx = 1\n{listed}"),
+            &[],
+            None,
+            0,
+        ),
+        (
+            "values of another shape",
+            "[crate_names]\n\"pplx-space-common-io\" = { path = 1 }\n".to_owned(),
+            &[],
+            None,
+            0,
+        ),
+        (
+            "a [file_size] that does not parse",
+            format!("[file_size]\n\"x\" = \"9\"\n{listed}"),
+            &[],
+            None,
+            0,
+        ),
+        ("an empty file", String::new(), &[], Some(missing), 0),
+        (
+            "no [crate_names] table",
+            "[file_size]\n".to_owned(),
+            &[],
+            Some(missing),
+            0,
+        ),
+        (
+            "[crate_names] is not a table",
+            "crate_names = 3\n".to_owned(),
+            &["no_new"],
+            Some("at line 1: "),
+            1,
+        ),
+        (
+            "invalid TOML",
+            format!("{listed}[file_size\n"),
+            &["no_new"],
+            Some("at line 3: "),
+            1,
+        ),
+    ];
+    for (name, base, expected, line, code) in cases {
+        let ws = crate_workspace(
+            &[("crates/x", "pplx-space-common-io")],
+            &[
+                (
+                    "architecture-baseline.toml",
+                    format!("[file_size]\n{listed}"),
+                ),
+                ("base-baseline.toml", base.clone()),
+            ],
+        );
+
+        let ctx = load(ws.path(), Some(base));
+
+        let found: Vec<_> = check(&ctx)
+            .iter()
+            .filter(|finding| finding.rule == "crate_names")
+            .map(|finding| finding.behaviour)
+            .collect();
+        assert_eq!(found, *expected, "{name}");
+        // However the copy reads, policy_changed's skip is reported once.
+        let policy: Vec<String> = skipped(&ctx)
+            .into_iter()
+            .filter(|line| line.contains("crate_names.policy_changed"))
+            .collect();
+        assert_eq!(
+            policy,
+            [POLICY_SKIPPED.trim_start_matches("archcheck: ").trim_end()],
+            "{name}"
+        );
+        let skipped: Vec<String> = skipped(&ctx)
+            .into_iter()
+            .filter(|line| {
+                line.contains("crate_names.no_new")
+                    || matches!(ctx.base_baseline, BaseBaseline::Unusable(_))
+                        && line.starts_with("warning: ")
+            })
+            .collect();
+        match line {
+            None => assert_eq!(skipped, Vec::<String>::new(), "{name}"),
+            Some(at) if at.starts_with("at line") => {
+                let path = ws.path().join("base-baseline.toml");
+                let [line] = skipped.as_slice() else {
+                    panic!("{name}: {skipped:?}");
+                };
+                let start = format!("warning: could not parse {} {at}", path.display());
+                // A copy that is not TOML at all gets the one warning for
+                // every comparison skipped; no_new's findings say why.
+                let end = if matches!(ctx.base_baseline, BaseBaseline::Unusable(_)) {
+                    "; file_size.no_new_entries and file_size.no_raised_caps skipped"
+                } else {
+                    "; crate_names.no_new counts every [crate_names] entry as added"
+                };
+                assert!(
+                    line.starts_with(&start) && line.ends_with(end) && !line.contains('\n'),
+                    "{name}: {line}"
+                );
+            }
+            Some(line) => assert_eq!(skipped, [*line], "{name}"),
+        }
+        let base = ws.path().join("base-baseline.toml");
+        let run = run(ws.path(), &["--base-baseline", base.to_str().unwrap()]);
+        assert_eq!(run.code, *code, "{name}: {}{}", run.stdout, run.stderr);
+    }
+}
+
+/// `--write-baseline` keeps each entry whose crate still matches, removes
+/// the others, adds none, and leaves an entry whose crate is at another path
+/// as it is. `[crate_names]` is written even when empty.
+#[test]
+fn crate_names_write_baseline() {
+    let rows: &[(Pairs, Pairs, &str, &[&str])] = &[
+        (
+            &[
+                ("crates/x", "pplx-space-common-io"),
+                ("crates/new", "pplx-space-common-jobs"),
+                ("crates/y", "pplx-space-io-buffers"),
+                ("crates/libs/foo-utils", "pplx-space-foo-utils"),
+            ],
+            &[
+                ("pplx-space-common-io", "crates/x"),
+                ("pplx-space-common-jobs", "crates/old"),
+                ("pplx-space-io-buffers", "crates/y"),
+                ("pplx-space-gone-core", "crates/gone"),
+            ],
+            "[file_size]\n[crate_names]\npplx-space-common-io = \"crates/x\"\n\
+             pplx-space-common-jobs = \"crates/old\"\n",
+            &[
+                "not added: pplx-space-foo-utils (crates/libs/foo-utils/Cargo.toml) uses \
+                 `utils`, a catch-all name; name the crate for what it does",
+                "not updated: pplx-space-common-jobs is listed at crates/old but is at \
+                 crates/new; update the entry's path by hand if it moved",
+            ],
+        ),
+        (
+            &[("crates/y", "pplx-space-io-buffers")],
+            &[("pplx-space-gone-core", "crates/gone")],
+            "[file_size]\n[crate_names]\n",
+            &[],
+        ),
+    ];
+    for (packages, entries, expected, expected_not_added) in rows {
+        let ws = crate_workspace(
+            packages,
+            &[("architecture-baseline.toml", tables(&[], entries))],
+        );
+
+        let written = write_baseline(ws.path()).unwrap();
+
+        let mut not_added = written.not_added.clone();
+        not_added.sort();
+        assert_eq!(not_added, *expected_not_added);
+        let text = fs::read_to_string(ws.path().join("architecture-baseline.toml")).unwrap();
+        assert!(
+            text.contains("\n\n# [crate_names] maps each workspace package"),
+            "{text}"
+        );
+        let body: String = text
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert_eq!(body, *expected);
+
+        let run = run(ws.path(), &["--write-baseline"]);
+        assert_eq!(run.code, 0, "{}", run.stderr);
+        assert_eq!(
+            fs::read_to_string(ws.path().join("architecture-baseline.toml")).unwrap(),
+            text,
+            "a generated baseline is written back unchanged"
+        );
+    }
+}
+
+/// `--write-baseline=crate_names` updates only `[crate_names]`, and lists no
+/// entries to paste for a crate it did not add; `--write-baseline=file_size`
+/// keeps `[crate_names]` as it is.
+#[test]
+fn crate_names_scoped_write_baseline() {
+    const BASELINE: &str = "architecture-baseline.toml";
+    let ws = crate_workspace(
+        &[
+            ("crates/x", "pplx-space-common-io"),
+            ("crates/libs/foo-utils", "pplx-space-foo-utils"),
+        ],
+        &[
+            (
+                BASELINE,
+                "[file_size]\n\"crates/a/src/big.rs\" = 9\n\n[crate_names]\n\
+                 pplx-space-common-io = \"crates/x\"\npplx-space-gone-core = \"crates/gone\"\n"
+                    .to_owned(),
+            ),
+            ("crates/a/src/big.rs", code(LIMIT + 1)),
+        ],
+    );
+
+    let wrote = run(ws.path(), &["--write-baseline=crate_names"]);
+
+    assert_eq!(wrote.code, 0, "{}", wrote.stderr);
+    let output = write_output(&wrote.stdout);
+    assert_eq!(
+        output.not_added,
+        [
+            "not added: pplx-space-foo-utils (crates/libs/foo-utils/Cargo.toml) uses `utils`, a \
+          catch-all name; name the crate for what it does"
+        ]
+    );
+    assert!(
+        output
+            .summary
+            .starts_with("archcheck: wrote 1 crate_names entries to ")
+            && output.summary.ends_with("; other tables kept"),
+        "{}",
+        wrote.stdout
+    );
+    assert_eq!(output.entries, "");
+    let after = fs::read_to_string(ws.path().join(BASELINE)).unwrap();
+    assert!(
+        after.contains("[file_size]\n\"crates/a/src/big.rs\" = 9\n"),
+        "{after}"
+    );
+    assert!(
+        after.ends_with("[crate_names]\npplx-space-common-io = \"crates/x\"\n"),
+        "{after}"
+    );
+
+    let wrote = run(ws.path(), &["--write-baseline=file_size"]);
+
+    assert_eq!(wrote.code, 0, "{}", wrote.stderr);
+    let output = write_output(&wrote.stdout);
+    assert!(
+        output
+            .summary
+            .starts_with("archcheck: wrote 1 file_size entries to "),
+        "{}",
+        wrote.stdout
+    );
+    let kept = fs::read_to_string(ws.path().join(BASELINE)).unwrap();
+    assert!(
+        kept.contains("[file_size]\n\"crates/a/src/big.rs\" = 6\n"),
+        "{kept}"
+    );
+    assert!(
+        kept.ends_with("[crate_names]\npplx-space-common-io = \"crates/x\"\n"),
+        "{kept}"
+    );
+}
+
+/// A new catch-all crate is an `ERROR` on its manifest's `name =` line and
+/// exits 1; a new baseline entry is one on the entry's line; a stale entry is
+/// a `WARNING` there.
+#[test]
+fn crate_names_rdjson_and_exit_codes() {
+    let packages = [
+        ("crates/x", "pplx-space-common-io"),
+        ("crates/libs/foo-utils", "pplx-space-foo-utils"),
+    ];
+    let baseline = "[file_size]\n\n[crate_names]\n# A comment.\n\"pplx-space-common-io\" = \
+                    \"crates/x\"\n'pplx-space-gone-utils' = \"crates/gone\"\n";
+    let ws = crate_workspace(
+        &packages,
+        &[
+            (
+                "crates/libs/foo-utils/Cargo.toml",
+                format!("# A comment.\n\n{}", package("pplx-space-foo-utils")),
+            ),
+            ("architecture-baseline.toml", baseline.to_owned()),
+        ],
+    );
+    let diagnostic = |path: &str, line: u64, severity: &str, behaviour: &str| {
+        json!({
+            "path": path,
+            "line": line,
+            "severity": severity,
+            "code": format!("crate_names.{behaviour}"),
+        })
+    };
+
+    let document = rdjson(
+        ws.path(),
+        Base::Names(&["pplx-space-gone-utils"]).text().as_deref(),
+    );
+
+    let diagnostics: Vec<Value> = document["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            json!({
+                "path": d["location"]["path"],
+                "line": d["location"]["range"]["start"]["line"],
+                "severity": d["severity"],
+                "code": d["code"]["value"],
+            })
+        })
+        .collect();
+    assert_eq!(
+        diagnostics,
+        [
+            diagnostic("crates/libs/foo-utils/Cargo.toml", 4, "ERROR", "no_new"),
+            diagnostic("architecture-baseline.toml", 5, "ERROR", "no_new"),
+            diagnostic("architecture-baseline.toml", 6, "WARNING", "stale_entries"),
+        ]
+    );
+
+    let run_human = run(ws.path(), &[]);
+    assert_eq!(run_human.code, 1, "{}", run_human.stderr);
+    assert!(
+        run_human.stdout.contains(
+            "crate_names.no_new (required):\n  crates/libs/foo-utils/Cargo.toml: \
+             `pplx-space-foo-utils` uses `utils`"
+        ),
+        "{}",
+        run_human.stdout
+    );
+
+    // Only the advisory stale entry left.
+    let ws = crate_workspace(
+        &packages[..1],
+        &[
+            ("architecture-baseline.toml", baseline.to_owned()),
+            (
+                "base.toml",
+                tables(
+                    &[],
+                    &[
+                        ("pplx-space-common-io", "crates/x"),
+                        ("pplx-space-gone-utils", "crates/gone"),
+                    ],
+                ),
+            ),
+        ],
+    );
+    let base = ws.path().join("base.toml");
+    let run_stale = run(
+        ws.path(),
+        &[
+            "--format",
+            "rdjson",
+            "--base-baseline",
+            base.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(run_stale.code, 0, "{}", run_stale.stderr);
+    let document: Value = serde_json::from_str(&run_stale.stdout).unwrap();
+    assert_eq!(document["diagnostics"][0]["severity"], "WARNING");
 }
 
 /// One finding per behaviour, each reported in its own mode; only required
@@ -594,10 +1642,20 @@ fn modes_and_exit_codes() {
     let skipped = SKIPPED;
     let summary = "archcheck: no findings (0 production Rust files checked)\n";
     let base = clean.path().join("architecture-baseline.toml");
+    let architecture = clean.path().join("ARCHITECTURE.toml");
     for (args, stdout) in [
         (vec![], format!("{summary}{skipped}")),
         (
             vec!["--base-baseline", base.to_str().unwrap()],
+            format!("{summary}{POLICY_SKIPPED}"),
+        ),
+        (
+            vec![
+                "--base-baseline",
+                base.to_str().unwrap(),
+                "--base-architecture",
+                architecture.to_str().unwrap(),
+            ],
             summary.to_owned(),
         ),
     ] {
@@ -690,8 +1748,9 @@ fn configuration_errors() {
     };
     let valid_instance = instance(&[r"\bold_table\b"], &["crates/a/**"]);
     let parse = "could not parse";
-    let glob = "contains glob characters";
-    let unnormalized = "has an empty, `.` or `..` component";
+    let cargo = "`cargo metadata` failed";
+    let crate_names = |key: &str, value: &str| Some(with_crate_names(key, value));
+    let tokens = |list: &str| crate_names("banned_tokens", list);
     let cases: &[(&str, &str, Option<String>, &str)] = &[
         (
             "unknown behaviour key",
@@ -708,7 +1767,7 @@ fn configuration_errors() {
         (
             "unknown rule",
             CONFIG,
-            Some(format!("{advisory}[rules.crate_names]\n")),
+            Some(format!("{advisory}[rules.module_names]\n")),
             parse,
         ),
         (
@@ -722,6 +1781,69 @@ fn configuration_errors() {
             CONFIG,
             Some(advisory.replace("[rules.file_size.stale_entries]\nmode = \"advisory\"\n", "")),
             parse,
+        ),
+        (
+            "empty banned tokens",
+            CONFIG,
+            tokens("[]"),
+            "banned_tokens is empty",
+        ),
+        (
+            "banned token with -",
+            CONFIG,
+            tokens("[\"util\", \"foo-bar\"]"),
+            "banned token \"foo-bar\" can never match",
+        ),
+        (
+            "banned token with _",
+            CONFIG,
+            tokens("[\"foo_bar\"]"),
+            "banned token \"foo_bar\" can never match",
+        ),
+        (
+            "uppercase banned token",
+            CONFIG,
+            tokens("[\"Common\"]"),
+            "banned token \"Common\" can never match",
+        ),
+        (
+            "empty banned token",
+            CONFIG,
+            tokens("[\"\"]"),
+            "banned token \"\" can never match",
+        ),
+        (
+            "strip_prefix",
+            CONFIG,
+            Some(advisory.replace("allow = []", "allow = []\nstrip_prefix = \"x-\"")),
+            "unknown field `strip_prefix`",
+        ),
+        (
+            "missing allow",
+            CONFIG,
+            Some(advisory.replace("allow = []\n", "")),
+            "missing field `allow`",
+        ),
+        (
+            "uppercase allow entry",
+            CONFIG,
+            crate_names("allow", "[\"pplx-space-Shared\"]"),
+            "allow entry \"pplx-space-Shared\" is not a lowercase package name",
+        ),
+        (
+            "duplicate allow entry",
+            CONFIG,
+            crate_names("allow", "[\"x-shared\", \"y\", \"x-shared\"]"),
+            "allow lists \"x-shared\" twice",
+        ),
+        (
+            "missing policy_changed",
+            CONFIG,
+            Some(advisory.replace(
+                "[rules.crate_names.policy_changed]\nmode = \"advisory\"\n",
+                "",
+            )),
+            "missing field `policy_changed`",
         ),
         ("unparseable", CONFIG, text("[rules.file_size\n"), parse),
         (
@@ -791,6 +1913,7 @@ fn configuration_errors() {
             parse,
         ),
         ("missing baseline", BASELINE, None, "could not read"),
+        ("missing member", MANIFEST, members("crates/c"), cargo),
         (
             "baseline table for no instance",
             BASELINE,
@@ -804,58 +1927,34 @@ fn configuration_errors() {
             parse,
         ),
         (
-            "glob member",
+            "unparseable root manifest",
             MANIFEST,
-            members("crates/*"),
-            "member crates/* contains glob characters",
-        ),
-        ("glob ?", MANIFEST, members("crates/b?"), glob),
-        ("glob [", MANIFEST, members("crates/[b"), glob),
-        ("glob ]", MANIFEST, members("crates/b]"), glob),
-        ("glob {", MANIFEST, members("crates/{b"), glob),
-        ("glob }", MANIFEST, members("crates/b}"), glob),
-        (
-            "member with ..",
-            MANIFEST,
-            members("crates/b/../b"),
-            unnormalized,
+            text("[workspace\n"),
+            cargo,
         ),
         (
-            "member with .",
+            "root manifest without a workspace",
             MANIFEST,
-            members("crates/./b"),
-            unnormalized,
+            text("[x]\n"),
+            cargo,
         ),
         (
-            "member with //",
-            MANIFEST,
-            members("crates//b"),
-            unnormalized,
+            "member without a package name",
+            "crates/a/Cargo.toml",
+            text("[package]\nversion = \"0.1.0\"\n"),
+            cargo,
         ),
         (
-            "member ending in /",
-            MANIFEST,
-            members("crates/b/"),
-            unnormalized,
+            "member without [package]",
+            "crates/b/Cargo.toml",
+            text("[lib]\n"),
+            cargo,
         ),
         (
-            "absolute member",
-            MANIFEST,
-            members("/crates/b"),
-            unnormalized,
-        ),
-        ("empty member", MANIFEST, members(""), unnormalized),
-        (
-            "missing member",
-            MANIFEST,
-            members("crates/c"),
-            "member crates/c has no Cargo.toml",
-        ),
-        (
-            "no members",
-            MANIFEST,
-            text("[workspace]\n"),
-            "has no [workspace] members list",
+            "member without a target",
+            "crates/b/Cargo.toml",
+            text("[package]\nname = \"b\"\n"),
+            "no targets specified",
         ),
     ];
     for (name, file, contents, problem) in cases {
@@ -890,8 +1989,8 @@ fn configuration_errors() {
         ),
         (
             "Cargo.toml",
-            "[workspace]\nmembers = [\"crates/a/../a\"]\n",
-            "Cargo.toml: workspace member \"crates/a/../a\" has",
+            "[workspace]\nmembers = [\"crates/zz\"]\n",
+            "`cargo metadata` failed in ",
         ),
     ];
     for (file, contents, problem) in cases {
@@ -961,13 +2060,13 @@ fn write_baseline_output() {
                 ("crates/a/src/tests.rs", LIMIT + 9),
             ],
             "[file_size]\n\"crates/a/src/grew.rs\" = 8\n\"crates/a/src/same.rs\" = 7\n\
-             \"crates/a/src/shrank.rs\" = 6\n",
+             \"crates/a/src/shrank.rs\" = 6\n[crate_names]\n",
             vec![not_added("crates/b/src/new.rs", 12)],
         ),
         (
             &[],
             &[("crates/a/src/ok.rs", LIMIT)],
-            "[file_size]\n",
+            "[file_size]\n[crate_names]\n",
             vec![],
         ),
     ];
@@ -1018,7 +2117,7 @@ fn write_baseline_output() {
     let (listed, wrote) = run.stdout.split_once('\n').unwrap();
     assert_eq!(listed, not_added("crates/a/src/big.rs", 6));
     assert!(
-        wrote.starts_with("archcheck: wrote 1 file_size entries to "),
+        wrote.starts_with("archcheck: wrote 1 file_size, 0 crate_names entries to "),
         "{}",
         run.stdout
     );
@@ -1074,7 +2173,10 @@ fn base_baseline_problems() {
                 serde_json::from_str::<Value>(&run.stdout).expect("one JSON document");
                 run.stderr
             };
-            let warning = summary.lines().last().unwrap_or_default();
+            let warning = summary
+                .lines()
+                .find(|line| line.contains("file_size."))
+                .unwrap_or_default();
             assert!(
                 warning.starts_with(&format!("archcheck: warning: {problem} {path} at line "))
                     && warning.ends_with("file_size.no_raised_caps skipped"),
@@ -1239,6 +2341,16 @@ fn arguments() {
             &["--base-baseline=base.toml", "--write-baseline"],
             2,
             "archcheck: --base-baseline cannot be combined",
+        ),
+        (
+            &["--write-baseline", "--base-architecture", "base.toml"],
+            2,
+            "archcheck: --base-architecture cannot be combined with --write-baseline",
+        ),
+        (
+            &["--base-architecture"],
+            2,
+            "archcheck: --base-architecture needs a value",
         ),
         (
             &["--bogus"],
@@ -1924,6 +3036,7 @@ fn pattern_ratchet_base_baseline() {
         let path = ws.path().join("base-baseline.toml");
         let (info, skipped): (Vec<String>, Vec<String>) = skipped(&ctx)
             .into_iter()
+            .filter(|line| !line.contains("crate_names."))
             .partition(|line| line.starts_with("base baseline has "));
         let expected_info: Vec<String> = ignored
             .iter()
@@ -2052,12 +3165,16 @@ fn pattern_ratchet_base_table_that_does_not_parse_skips_only_its_instance() {
     let path = ws.path().join("base-baseline.toml");
     assert_eq!(
         skipped(&ctx),
-        [format!(
-            "warning: could not parse {} at line 2: invalid type: string \"1\", expected usize; \
-             pattern_ratchet.alpha.no_new_entries and pattern_ratchet.alpha.no_raised_caps \
-             skipped",
-            path.display()
-        )]
+        [
+            format!(
+                "warning: could not parse {} at line 2: invalid type: string \"1\", expected \
+                 usize; pattern_ratchet.alpha.no_new_entries and \
+                 pattern_ratchet.alpha.no_raised_caps skipped",
+                path.display()
+            ),
+            CRATE_NAMES_SKIPPED[0].to_owned(),
+            CRATE_NAMES_SKIPPED[1].to_owned(),
+        ]
     );
 }
 
@@ -2114,6 +3231,8 @@ fn skip_lines_come_in_rule_then_instance_order() {
             "base baseline has [pattern_ratchet.delta], which is not configured; skipped"
                 .to_owned(),
             "base baseline has [pattern_ratchet.zeta], which is not configured; skipped".to_owned(),
+            CRATE_NAMES_SKIPPED[0].to_owned(),
+            CRATE_NAMES_SKIPPED[1].to_owned(),
         ]
     );
 }
@@ -2279,8 +3398,8 @@ fn pattern_ratchet_write_baseline() {
     );
     assert!(
         output.summary.starts_with(
-            "archcheck: wrote 1 file_size, 3 pattern_ratchet.old, 0 pattern_ratchet.unused \
-             entries to "
+            "archcheck: wrote 1 file_size, 3 pattern_ratchet.old, 0 pattern_ratchet.unused, \
+             0 crate_names entries to "
         ),
         "{}",
         wrote.stdout
@@ -2302,7 +3421,7 @@ fn pattern_ratchet_write_baseline() {
         body,
         "[file_size]\n\"crates/b/src/sub/big.rs\" = 7\n[pattern_ratchet.old]\n\
          \"crates/a/src/one.rs\" = 1\n\"crates/a/src/z.rs\" = 2\n\
-         \"crates/b/src/sub/big.rs\" = 2\n[pattern_ratchet.unused]\n"
+         \"crates/b/src/sub/big.rs\" = 2\n[pattern_ratchet.unused]\n[crate_names]\n"
     );
     // Only the file left out is still a finding.
     let checked = run(ws.path(), &[]);
@@ -2359,7 +3478,7 @@ fn pattern_ratchet_write_creates_no_table() {
             )
         } else {
             format!(
-                "archcheck: wrote 0 file_size, 1 pattern_ratchet.old entries to {}",
+                "archcheck: wrote 0 file_size, 1 pattern_ratchet.old, 0 crate_names entries to {}",
                 ws.path().join(BASELINE).display()
             )
         };
@@ -2524,8 +3643,8 @@ fn pattern_ratchet_scoped_write_baseline() {
     assert_eq!(generated.code, 0, "{}", generated.stderr);
     assert!(
         generated.stdout.starts_with(
-            "archcheck: wrote 1 file_size, 1 pattern_ratchet.old, 1 pattern_ratchet.other \
-             entries to "
+            "archcheck: wrote 1 file_size, 1 pattern_ratchet.old, 1 pattern_ratchet.other, \
+             0 crate_names entries to "
         ),
         "{}",
         generated.stdout
@@ -2727,7 +3846,12 @@ fn pattern_ratchet_scoped_write_keeps_an_empty_table() {
         table_section(&after, "pattern_ratchet.old"),
         "[pattern_ratchet.old]\n\n"
     );
-    assert!(after.ends_with("[pattern_ratchet.other]\n"), "{after}");
+    // Only [crate_names], always written last, follows it.
+    assert!(
+        after.contains("[pattern_ratchet.other]\n\n# [crate_names] ")
+            && after.ends_with("\n[crate_names]\n"),
+        "{after}"
+    );
     assert_eq!(codes(ws.path()), ["pattern_ratchet.old.no_crossing"]);
 
     // Pasted inside the existing table, as the comment says, the entries
@@ -2809,7 +3933,8 @@ fn write_baseline_entries_paste_into_their_tables() {
             "file_size",
             "pattern_ratchet.fresh",
             "pattern_ratchet.old",
-            "pattern_ratchet.zz"
+            "pattern_ratchet.zz",
+            "crate_names"
         ]
     );
     assert_eq!(
@@ -2942,7 +4067,7 @@ fn write_baseline_takes_a_table_only_after_equals() {
         assert_eq!(run.code, 0, "{}", run.stderr);
         assert!(
             run.stdout
-                .starts_with("archcheck: wrote 0 file_size entries to ")
+                .starts_with("archcheck: wrote 0 file_size, 0 crate_names entries to ")
                 && !run.stdout.contains("other tables kept"),
             "{}",
             run.stdout
@@ -3045,9 +4170,11 @@ fn pattern_ratchet_errors_point_at_the_line() {
             config(ADVISORY),
             ratchet("old", patterns, allow, ADVISORY),
         );
-        let line = 1 + text
-            .lines()
-            .position(|line| line.starts_with(&format!("{key} = ")))
+        // The last: [rules.crate_names], before the instance, has an allow too.
+        let lines: Vec<&str> = text.lines().collect();
+        let line = 1 + lines
+            .iter()
+            .rposition(|line| line.starts_with(&format!("{key} = ")))
             .unwrap();
         let column = key.len() + " = ".len() + 1;
         let ws = workspace(&[("ARCHITECTURE.toml", text)]);

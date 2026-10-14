@@ -7,6 +7,7 @@ use std::{collections::BTreeMap, fs};
 use super::*;
 use crate::{
     baseline::BaseBaseline,
+    config::{BaseArchitecture, CrateNamesPolicy},
     context::{code_lines, count_code_lines},
 };
 
@@ -73,7 +74,11 @@ fn context(baseline: Baseline, files: &[(&str, &str)]) -> Context {
                   [rules.file_size.no_new_entries]\nmode = \"advisory\"\n\
                   [rules.file_size.no_raised_caps]\nmode = \"advisory\"\n\
                   [rules.file_size.listed_no_growth]\nmode = \"advisory\"\n\
-                  [rules.file_size.stale_entries]\nmode = \"advisory\"\n";
+                  [rules.file_size.stale_entries]\nmode = \"advisory\"\n\
+                  [rules.crate_names]\nbanned_tokens = [\"common\"]\nallow = []\n\
+                  [rules.crate_names.no_new]\nmode = \"advisory\"\n\
+                  [rules.crate_names.stale_entries]\nmode = \"advisory\"\n\
+                  [rules.crate_names.policy_changed]\nmode = \"advisory\"\n";
     let mut files: Vec<ProductionFile> = files
         .iter()
         .map(|(path, text)| ProductionFile {
@@ -87,7 +92,10 @@ fn context(baseline: Baseline, files: &[(&str, &str)]) -> Context {
         config: toml::from_str(config).expect("the configuration parses"),
         baseline,
         base_baseline: BaseBaseline::NotGiven,
+        crate_names_policy: CrateNamesPolicy::default(),
+        base_architecture: BaseArchitecture::NotGiven,
         files,
+        crates: Vec::new(),
     }
 }
 

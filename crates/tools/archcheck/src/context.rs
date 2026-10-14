@@ -1,26 +1,28 @@
 //! Everything a rule may inspect, loaded once before any rule runs.
 
 use std::{
+    env,
     ffi::OsStr,
     io,
     path::{Path, PathBuf},
+    process::{Command, ExitStatus},
 };
 
 use serde::Deserialize;
 use thiserror::Error;
+use toml::Spanned;
 
 use crate::{
-    baseline::{BASELINE_FILE, BaseBaseline, Baseline},
-    config::{ArchitectureConfig, CONFIG_FILE},
+    baseline::{BASELINE_FILE, BaseBaseline, Baseline, line_of},
+    config::{ArchitectureConfig, BaseArchitecture, CONFIG_FILE, CrateNamesPolicy},
     rules,
 };
 
-/// The root manifest, whose `[workspace] members` decide which files are
-/// checked.
+/// The root manifest, the workspace `cargo metadata` reads.
 const ROOT_MANIFEST: &str = "Cargo.toml";
 
-/// Characters Cargo expands as globs in `[workspace] members`.
-const GLOB_CHARACTERS: &[char] = &['*', '?', '[', ']', '{', '}'];
+/// Cargo target kinds that build a library crate, whose name code imports.
+const LIB_KINDS: &[&str] = &["lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"];
 
 #[derive(Debug, Error)]
 pub enum LoadError {
@@ -36,19 +38,31 @@ pub enum LoadError {
         #[source]
         source: toml::de::Error,
     },
-    #[error("{path} has no [workspace] members list")]
-    NoWorkspaceMembers { path: PathBuf },
+    #[error("could not run `cargo metadata` in {root}: {source}")]
+    CargoMetadataSpawn {
+        root: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("`cargo metadata` failed in {root} ({status}):\n{stderr}")]
+    CargoMetadataFailed {
+        root: PathBuf,
+        status: ExitStatus,
+        stderr: String,
+    },
+    #[error("could not read the output of `cargo metadata` in {root}: {source}")]
+    CargoMetadataOutput {
+        root: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("workspace member {manifest} is not under the workspace root {root}")]
+    MemberOutsideRoot { manifest: PathBuf, root: PathBuf },
     #[error(
-        "{path}: workspace member {member} contains glob characters; list every member explicitly"
+        "{name} is in both [rules.crate_names] allow in {CONFIG_FILE} and [crate_names] in \
+         {BASELINE_FILE}; an allowed crate needs no entry, so remove one of them"
     )]
-    GlobMember { path: PathBuf, member: String },
-    #[error(
-        "{path}: workspace member {member:?} has an empty, `.` or `..` component; write it as a \
-         plain relative path"
-    )]
-    UnnormalizedMember { path: PathBuf, member: String },
-    #[error("workspace member {member} has no Cargo.toml at {manifest}")]
-    MissingMember { member: String, manifest: PathBuf },
+    AllowedAndListed { name: String },
     /// Debug-formatted, so the invalid bytes are shown escaped.
     #[error("{path:?} is not valid UTF-8")]
     NonUtf8Path { path: PathBuf },
@@ -80,16 +94,52 @@ pub struct ProductionFile {
     pub code_lines: usize,
 }
 
+/// A workspace member's package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Crate {
+    /// `[package] name`.
+    pub name: String,
+    /// The name of its library target, which Cargo derives from the package
+    /// name unless `[lib] name` sets it; `None` without a library.
+    pub lib: Option<String>,
+    /// The member's directory relative to the workspace root, `/`-separated;
+    /// empty for a root package.
+    pub member: String,
+    /// The 1-based line of `name` in the member's `Cargo.toml`.
+    pub name_line: usize,
+    /// The 1-based line of `[lib] name`, when the manifest sets it.
+    pub lib_name_line: Option<usize>,
+}
+
+impl Crate {
+    /// Repository-relative, `/`-separated.
+    pub fn manifest(&self) -> String {
+        if self.member.is_empty() {
+            ROOT_MANIFEST.to_owned()
+        } else {
+            format!("{}/{ROOT_MANIFEST}", self.member)
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Context {
     pub config: ArchitectureConfig,
     pub baseline: Baseline,
     /// Behaviours that compare with the base branch's baseline are skipped
-    /// unless it is [`BaseBaseline::Loaded`].
+    /// unless it is [`BaseBaseline::Loaded`]; `crate_names.no_new` is limited
+    /// instead.
     pub base_baseline: BaseBaseline,
-    /// Every production Rust file of the root `Cargo.toml`'s workspace
-    /// members, sorted by path.
+    /// `[rules.crate_names]` of `ARCHITECTURE.toml`, with the line of each
+    /// part.
+    pub crate_names_policy: CrateNamesPolicy,
+    /// The same table of the base branch's `ARCHITECTURE.toml`, given with
+    /// `--base-architecture`.
+    pub base_architecture: BaseArchitecture,
+    /// Every production Rust file of the workspace members, sorted by path.
     pub files: Vec<ProductionFile>,
+    /// The package of each workspace member, sorted by member path.
+    pub crates: Vec<Crate>,
 }
 
 impl Context {
@@ -99,7 +149,9 @@ impl Context {
     }
 
     pub fn load_with_baseline(root: &Path, baseline: Baseline) -> Result<Self, LoadError> {
-        let config: ArchitectureConfig = parse_toml(&root.join(CONFIG_FILE))?;
+        let config_path = root.join(CONFIG_FILE);
+        let (config, config_text): (ArchitectureConfig, String) =
+            parse_toml_with_text(&config_path)?;
         // A table for an instance that no longer exists would never be
         // checked, so it cannot silently outlive its configuration.
         let configured = rules::tables(&config.rules);
@@ -113,13 +165,29 @@ impl Context {
                 table,
             });
         }
-        let members = load_members(&root.join(ROOT_MANIFEST))?;
-        let files = production_files(root, &members)?;
+        let crate_names_policy = CrateNamesPolicy::parse(&config_text)
+            .map_err(|source| LoadError::Parse {
+                path: config_path,
+                source,
+            })?
+            .unwrap_or_default();
+        if let Some(name) = baseline
+            .crate_names
+            .keys()
+            .find(|name| config.rules.crate_names.allow.contains(name))
+        {
+            return Err(LoadError::AllowedAndListed { name: name.clone() });
+        }
+        let crates = workspace_crates(root)?;
+        let files = production_files(root, &crates)?;
         Ok(Self {
             config,
             baseline,
-            base_baseline: BaseBaseline::NotGiven,
+            base_baseline: BaseBaseline::default(),
+            crate_names_policy,
+            base_architecture: BaseArchitecture::NotGiven,
             files,
+            crates,
         })
     }
 
@@ -205,63 +273,126 @@ pub(crate) fn parse_toml_with_text<T: for<'de> Deserialize<'de>>(
     }
 }
 
-/// Only the part of the root manifest the inventory needs; other keys are
-/// Cargo's business.
+/// The part of `cargo metadata --format-version 1` the inventory needs.
 #[derive(Deserialize)]
-struct RootManifest {
-    workspace: Option<WorkspaceManifest>,
+struct Metadata {
+    packages: Vec<MetadataPackage>,
+    workspace_members: Vec<String>,
+    workspace_root: PathBuf,
 }
 
 #[derive(Deserialize)]
-struct WorkspaceManifest {
-    members: Option<Vec<String>>,
+struct MetadataPackage {
+    id: String,
+    name: String,
+    manifest_path: PathBuf,
+    targets: Vec<MetadataTarget>,
 }
 
-fn load_members(path: &Path) -> Result<Vec<String>, LoadError> {
-    let manifest: RootManifest = parse_toml(path)?;
-    let members = manifest
-        .workspace
-        .and_then(|workspace| workspace.members)
-        .ok_or_else(|| LoadError::NoWorkspaceMembers {
-            path: path.to_path_buf(),
+#[derive(Deserialize)]
+struct MetadataTarget {
+    name: String,
+    kind: Vec<String>,
+}
+
+/// Every workspace member as Cargo sees it: the root manifest's `members`,
+/// expanded, and every path dependency inside the workspace, which Cargo makes
+/// a member too. `cargo` is the one running archcheck under `cargo run`.
+fn workspace_crates(root: &Path) -> Result<Vec<Crate>, LoadError> {
+    let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let output = Command::new(cargo)
+        .args([
+            "metadata",
+            "--no-deps",
+            "--format-version",
+            "1",
+            "--offline",
+        ])
+        .current_dir(root)
+        .output()
+        .map_err(|source| LoadError::CargoMetadataSpawn {
+            root: root.to_path_buf(),
+            source,
         })?;
-    for member in &members {
-        let error = if member.contains(GLOB_CHARACTERS) {
-            LoadError::GlobMember {
-                path: path.to_path_buf(),
-                member: member.clone(),
-            }
-        } else if member
-            .split('/')
-            .any(|part| part.is_empty() || part == "." || part == "..")
-        {
-            // Files are keyed by the path they are found under, so `a/../a`
-            // would not match the baseline's `a`.
-            LoadError::UnnormalizedMember {
-                path: path.to_path_buf(),
-                member: member.clone(),
-            }
-        } else {
-            continue;
-        };
-        return Err(error);
+    if !output.status.success() {
+        return Err(LoadError::CargoMetadataFailed {
+            root: root.to_path_buf(),
+            status: output.status,
+            stderr: String::from_utf8_lossy(&output.stderr)
+                .trim_end()
+                .to_owned(),
+        });
     }
-    Ok(members)
+    let metadata: Metadata = serde_json::from_slice(&output.stdout).map_err(|source| {
+        LoadError::CargoMetadataOutput {
+            root: root.to_path_buf(),
+            source,
+        }
+    })?;
+    let mut crates = metadata
+        .packages
+        .into_iter()
+        .filter(|package| metadata.workspace_members.contains(&package.id))
+        .map(|package| load_crate(&metadata.workspace_root, package))
+        .collect::<Result<Vec<_>, _>>()?;
+    crates.sort_by(|a, b| a.member.cmp(&b.member));
+    Ok(crates)
 }
 
-fn production_files(root: &Path, members: &[String]) -> Result<Vec<ProductionFile>, LoadError> {
+/// Only the names of a member's manifest, for their lines; Cargo has read
+/// the rest.
+#[derive(Deserialize)]
+struct MemberManifest {
+    package: Option<NameTable>,
+    lib: Option<NameTable>,
+}
+
+#[derive(Deserialize)]
+struct NameTable {
+    name: Option<Spanned<String>>,
+}
+
+fn load_crate(workspace_root: &Path, package: MetadataPackage) -> Result<Crate, LoadError> {
+    let manifest = package.manifest_path;
+    let dir = manifest.parent().unwrap_or(&manifest);
+    let Ok(member) = dir.strip_prefix(workspace_root) else {
+        return Err(LoadError::MemberOutsideRoot {
+            manifest,
+            root: workspace_root.to_path_buf(),
+        });
+    };
+    let member = relative_path(Path::new(""), member)?;
+    let (parsed, text): (MemberManifest, String) = parse_toml_with_text(&manifest)?;
+    let line = |table: Option<NameTable>| {
+        table
+            .and_then(|table| table.name)
+            .map(|name| line_of(&text, name.span().start))
+    };
+    let lib = package
+        .targets
+        .into_iter()
+        .find(|target| {
+            target
+                .kind
+                .iter()
+                .any(|kind| LIB_KINDS.contains(&kind.as_str()))
+        })
+        .map(|target| target.name);
+    Ok(Crate {
+        name: package.name,
+        lib,
+        member,
+        name_line: line(parsed.package).unwrap_or(1),
+        lib_name_line: line(parsed.lib),
+    })
+}
+
+fn production_files(root: &Path, crates: &[Crate]) -> Result<Vec<ProductionFile>, LoadError> {
     let mut paths = Vec::new();
-    for member in members {
-        let manifest = root.join(member).join("Cargo.toml");
-        if !manifest.is_file() {
-            return Err(LoadError::MissingMember {
-                member: member.clone(),
-                manifest,
-            });
-        }
+    for krate in crates {
         // A member directory or `src` that is itself a symlink is followed;
         // symlinks below `src/` are not.
-        let src = root.join(member).join("src");
+        let src = root.join(&krate.member).join("src");
         if src.is_dir() {
             collect_rust_files(&src, &mut paths)?;
         }

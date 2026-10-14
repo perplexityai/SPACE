@@ -3,8 +3,8 @@ use std::fs;
 use super::*;
 use crate::{config::ArchitectureConfig, rules};
 
-/// `file_size` and two `pattern_ratchet` instances, every behaviour advisory:
-/// a table of every registered rule with a baseline.
+/// `file_size`, two `pattern_ratchet` instances and `crate_names`, every
+/// behaviour advisory: a table of every registered rule with a baseline.
 fn config() -> ArchitectureConfig {
     let behaviours = |table: &str| -> String {
         [
@@ -24,8 +24,13 @@ fn config() -> ArchitectureConfig {
             behaviours(&format!("pattern_ratchet.{name}"))
         )
     };
+    let crate_names: String = ["no_new", "stale_entries", "policy_changed"]
+        .iter()
+        .map(|behaviour| format!("[rules.crate_names.{behaviour}]\nmode = \"advisory\"\n"))
+        .collect();
     let text = format!(
-        "[rules.file_size]\nlimit = 5\n{}{}{}",
+        "[rules.file_size]\nlimit = 5\n{}{}{}\
+         [rules.crate_names]\nbanned_tokens = [\"common\"]\nallow = []\n{crate_names}",
         behaviours("file_size"),
         instance("alpha"),
         instance("beta"),
@@ -59,6 +64,12 @@ fn every_configured_table_is_read_from_a_base_copy() {
 
     let base = Baseline::load_base(&path).expect("every registered rule's tables are read");
     for (cap, table) in tables.iter().enumerate() {
+        // `[crate_names]` maps names to paths: only its names are read.
+        if table == CrateNames::NAME {
+            let names = BTreeSet::from([format!("{table}.rs")]);
+            assert_eq!(base.crate_names().ok(), Some(Some(&names)), "{table}");
+            continue;
+        }
         let entries = base.table(table).ok();
         let expected = BTreeMap::from([(format!("{table}.rs"), cap)]);
         assert_eq!(entries, Some(&expected), "{table}");

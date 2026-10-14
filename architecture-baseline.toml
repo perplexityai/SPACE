@@ -139,3 +139,23 @@
 "crates/libs/template/mgr/src/service.rs" = 3
 "crates/libs/vol/mgr/server/src/staging.rs" = 2
 
+# [crate_names] maps each workspace package with a catch-all name (a part such
+# as `common`, `utils` or `core`) to its member path. Only remove entries: a pull
+# request that adds one is reported, and fails the check.
+[crate_names]
+pplx-space-common-cli = "crates/libs/common/cli"
+pplx-space-common-connection-admission = "crates/libs/common/connection/admission"
+pplx-space-common-core = "crates/libs/common/core"
+pplx-space-common-grpc = "crates/libs/common/grpc"
+pplx-space-common-grpc-lb = "crates/libs/common/grpc-lb"
+pplx-space-common-io = "crates/libs/common/io"
+pplx-space-common-jobs = "crates/libs/common/jobs"
+pplx-space-common-lru-reaper = "crates/libs/common/lru-reaper"
+pplx-space-common-proto-build = "crates/libs/common/proto-build"
+pplx-space-common-svc = "crates/libs/common/svc"
+pplx-space-common-work-coalescer = "crates/libs/common/work-coalescer"
+pplx-space-credential-injection-core = "crates/libs/credential/injection/core"
+pplx-space-execution-common = "crates/libs/execution/common"
+pplx-space-net-common = "crates/libs/net/common"
+pplx-space-node-runtime-core = "crates/libs/node/runtime/core"
+pplx-space-spaced-common = "crates/libs/spaced/common"

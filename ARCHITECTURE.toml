@@ -77,3 +77,18 @@ mode = "required"
 
 [rules.pattern_ratchet.rootfs_copy.stale_entries]
 mode = "required"
+
+[rules.crate_names]
+# A crate matches if a part of its package or library name, lowercased and
+# split on `-` and `_`, is one of these.
+banned_tokens = ["common", "shared", "util", "utils", "helper", "helpers", "misc", "core"]
+allow = []                            # exact package names exempt from the rule
+
+[rules.crate_names.no_new]            # no new catch-all crate, and no new baseline entries
+mode = "required"
+
+[rules.crate_names.stale_entries]     # entries and allow names that no longer apply
+mode = "advisory"
+
+[rules.crate_names.policy_changed]    # changes to this table, compared with the base branch
+mode = "advisory"

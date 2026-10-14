@@ -1,6 +1,8 @@
 use crate::config::Mode;
 
-/// One reported problem. `path` is repository-relative with `/` separators.
+/// One reported problem. `path` is what it is about: a repository-relative
+/// path with `/` separators, or the key of a baseline entry such as a crate
+/// name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Finding {
     pub rule: &'static str,
