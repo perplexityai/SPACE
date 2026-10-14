@@ -14,16 +14,13 @@ use uuid::Uuid;
 
 use super::redis_bucket::{ConsumeOutcome, RedisTokenBucket};
 use super::*;
-use crate::controllers::substrate::{Substrate, direct::DirectSubstrate};
-
-use pplx_space_test_env::TestResult;
-
+use crate::controllers::substrate::Substrate;
 // Direct is only a placeholder capacity source for most of this module's tests:
 // they need zero or some eligible nodes. `capacity_probe_failure_fails_open`
 // needs a count that fails, which only Direct's can.
-pub(crate) fn direct_substrate(pool: &PgPool) -> Substrate {
-    Substrate::Direct(Box::new(DirectSubstrate::new(pool.clone())))
-}
+use crate::test_support::{direct_substrate, enabled_config};
+
+use pplx_space_test_env::TestResult;
 
 fn admission(
     substrate: Substrate,
@@ -47,15 +44,6 @@ fn admission_with_flags(
         bucket,
         config: sanitize_config(config),
         feature_flags,
-    }
-}
-
-pub(crate) fn enabled_config() -> ClusterSandboxAdmissionConfig {
-    ClusterSandboxAdmissionConfig {
-        enabled: true,
-        refill_rps: 6.0,
-        burst: 60.0,
-        redis_url: None,
     }
 }
 

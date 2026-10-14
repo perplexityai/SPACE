@@ -2,6 +2,10 @@ use pplx_space_common_svc::bearer_token::{
     SPACE_INTERNAL_CONTROL_TOKEN_ENV, SPACE_INTERNAL_TOKEN_ENV,
     SPACE_NODE_API_INTERNAL_TOKEN_PATH_ENV, SPACE_NODE_API_TOKEN_PATH_ENV,
 };
+use sqlx::PgPool;
+
+use crate::cluster_admission::ClusterSandboxAdmissionConfig;
+use crate::controllers::substrate::{Substrate, direct::DirectSubstrate};
 
 const SIM_WORKER_TOKEN: &str = "sim-worker-test-token";
 const SIM_WORKER_CONTROL_TOKEN: &str = "sim-worker-test-control-token";
@@ -51,4 +55,20 @@ fn enter_sim_worker_process_with_token_paths(
         (SPACE_NODE_API_TOKEN_PATH_ENV, node_api),
         (SPACE_NODE_API_INTERNAL_TOKEN_PATH_ENV, node_api_internal),
     ])
+}
+
+/// A Direct substrate over the test database; it needs no apiserver.
+pub(crate) fn direct_substrate(pool: &PgPool) -> Substrate {
+    Substrate::Direct(Box::new(DirectSubstrate::new(pool.clone())))
+}
+
+/// An enabled cluster-admission config with no Redis URL, so the admission
+/// it configures has no token bucket.
+pub(crate) fn enabled_config() -> ClusterSandboxAdmissionConfig {
+    ClusterSandboxAdmissionConfig {
+        enabled: true,
+        refill_rps: 6.0,
+        burst: 60.0,
+        redis_url: None,
+    }
 }

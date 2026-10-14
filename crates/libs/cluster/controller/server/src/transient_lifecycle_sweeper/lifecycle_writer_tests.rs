@@ -47,7 +47,8 @@ fn age() -> PositiveDuration {
 }
 
 // Direct is only a placeholder: it supplies `managed_by`, and only the converge
-// CAS would decide differently for a Kubernetes label (see the module doc).
+// CAS and the failed-active repair CAS would decide differently for a
+// Kubernetes label (see the module doc).
 fn direct_sink(pool: &PgPool) -> SubstrateSweepSink {
     SubstrateSweepSink::new(
         pool.clone(),

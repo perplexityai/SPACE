@@ -20,8 +20,7 @@ use pplx_space_test_env::TestResult;
 
 use super::*;
 use crate::controllers::sandbox::wake_completion::wake_completion_redrive;
-use crate::controllers::substrate::Substrate;
-use crate::controllers::substrate::direct::DirectSubstrate;
+use crate::test_support::direct_substrate;
 
 /// Values `sandboxes.lifecycle` can hold that are not `SandboxLifecycle`
 /// variants (see `SandboxLifecycle::all`).
@@ -123,10 +122,6 @@ async fn tracked(pool: &PgPool, sandbox_id: SandboxId) -> TestResult<Sandbox> {
     Ok(crate::controllers::sandbox::fetch_sandbox(pool, sandbox_id)
         .await?
         .expect("sandbox row exists"))
-}
-
-fn direct_substrate(pool: &PgPool) -> Substrate {
-    Substrate::Direct(Box::new(DirectSubstrate::new(pool.clone())))
 }
 
 fn direct_controller(pool: &PgPool) -> SandboxController {

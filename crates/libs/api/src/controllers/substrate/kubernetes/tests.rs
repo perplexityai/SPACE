@@ -9547,10 +9547,11 @@ mod kubernetes_tests {
             mock_kubernetes_client(Arc::clone(&captured_pod_creates)),
         );
 
-        // Empty nodes inventory → the admission capacity probe reports zero
-        // eligible nodes → EmptyCluster rejection (no Redis needed).
         let admission = std::sync::Arc::new(
             crate::cluster_admission::ClusterSandboxAdmission::with_config(
+                // Direct is only a placeholder capacity source: its empty nodes inventory reports
+                // zero eligible nodes, as a synced, empty Kubernetes node cache would, so admission
+                // rejects with EmptyCluster (no Redis needed).
                 Substrate::Direct(Box::new(
                     crate::controllers::substrate::direct::DirectSubstrate::new(pool.clone()),
                 )),
