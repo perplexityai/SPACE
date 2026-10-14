@@ -819,3 +819,11 @@ Retained traces are a diagnostic sample. Tail retention and missing spans can
 bias cohort shares and percentiles. Use independently counted caller requests
 for population latency, error and cancellation rates; restore counters and
 reconnect-attempt counters do not necessarily count one event per connect.
+
+## Kind certification
+
+The [OTLP certification handoff](observability-certification.md) provides an
+opt-in, credential-free Kind run with per-producer Prometheus, Loki and Tempo
+assertions, revision/image evidence, a Datadog-default negative control, and
+explicit guest/filesystem-worker gaps. It includes teardown commands; see its
+report limitations before interpreting an exit status.

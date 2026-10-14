@@ -1,0 +1,187 @@
+{
+  "schema_version": 1,
+  "identity_metric_pattern": "space_.*",
+  "runtime_revision": "a85c35f98cc9d6628184c1c561ba908fdbc6f0e6",
+  "kind_image": "kindest/node:v1.34.0",
+  "kubernetes_cluster": "space-local",
+  "platform_cluster": "kind-local",
+  "fixes": {
+    "361": {
+      "revision": "d1a31bf9ea8763b9f8de3c5321d4e5c7747dfcfc",
+      "tree": "charts",
+      "reason": "Alloy builder source exclusion"
+    },
+    "362": {
+      "revision": "78c06afa21a2e24e499d4c311e286cfd03d09385",
+      "tree": "runtime",
+      "reason": "emitter service versus peer/logical role"
+    },
+    "376": {
+      "revision": "60388661b2a05c168062d2763536e7677d140c9e",
+      "tree": "runtime",
+      "reason": "requested template version must not collapse into process version"
+    },
+    "377": {
+      "revision": "9082777e6c0b31ed8c95c5bf0bdf812ed8bbaac8",
+      "tree": "runtime",
+      "reason": "Kubernetes name must not be replaced by platform cluster ID"
+    }
+  },
+  "producers": [
+    {
+      "service": "space-api",
+      "metrics": [
+        "space_sandbox_api_created_total",
+        "space_sandbox_api_latency_milliseconds"
+      ],
+      "min_instances": 1
+    },
+    {
+      "service": "space-cluster-api",
+      "metrics": [
+        "space_grpc_server_active_requests"
+      ],
+      "min_instances": 1
+    },
+    {
+      "service": "space-cluster-controller",
+      "metrics": [
+        "space_node_group_mirror_tick_completed_total",
+        "space_cluster_reconciler_loop_latency_milliseconds"
+      ],
+      "min_instances": 1
+    },
+    {
+      "service": "space-data-plane",
+      "metrics": [
+        "space_data_plane_stream_active"
+      ],
+      "min_instances": 1
+    },
+    {
+      "service": "space-node-ctl",
+      "metrics": [
+        "space_tokio_runtime_num_workers"
+      ],
+      "min_instances": 2
+    },
+    {
+      "service": "space-node-api",
+      "metrics": [
+        "space_grpc_server_active_requests"
+      ],
+      "min_instances": 2
+    },
+    {
+      "service": "space-node-manager",
+      "metrics": [
+        "space_node_mgr_loop_devices_present"
+      ],
+      "min_instances": 2
+    },
+    {
+      "service": "space-sandbox-manager",
+      "metrics": [
+        "space_sandbox_worker_lifecycle_count"
+      ],
+      "min_instances": 2
+    },
+    {
+      "service": "space-template-manager",
+      "metrics": [
+        "space_grpc_server_active_requests"
+      ],
+      "min_instances": 2
+    },
+    {
+      "service": "space-volume-manager",
+      "metrics": [
+        "space_grpc_server_active_requests"
+      ],
+      "min_instances": 2
+    },
+    {
+      "service": "space-credential-manager",
+      "metrics": [
+        "space_grpc_server_active_requests"
+      ],
+      "min_instances": 2
+    },
+    {
+      "service": "space-runtime-supervisor",
+      "metrics": [
+        "space_grpc_server_active_requests"
+      ],
+      "min_instances": 2
+    },
+    {
+      "service": "space-runtime-manager",
+      "metrics": [
+        "space_grpc_server_active_requests"
+      ],
+      "min_instances": 2
+    },
+    {
+      "service": "space-net-gateway",
+      "metrics": [
+        "space_gateway_policy_ref"
+      ],
+      "min_instances": 3
+    },
+    {
+      "service": "space-spaced-host",
+      "metrics": [
+        "space_grpc_server_active_requests"
+      ],
+      "min_instances": 3
+    },
+    {
+      "service": "containerd-shim-space-v2",
+      "metrics": [
+        "space_shim_operation_latency_ms_milliseconds"
+      ],
+      "logql": "{source=\"journal\"} |= \"[space-shim]\"",
+      "min_instances": 3
+    },
+    {
+      "service": "space-spaced-guest",
+      "skip": "Expected guest gap: no guest-to-Collector collection path; docs/observability.md"
+    },
+    {
+      "service": "space-spaced-guest-worker",
+      "skip": "Expected filesystem-worker gap: identity worker runs inside Firecracker, behind the same guest boundary; docs/observability.md"
+    }
+  ],
+  "counters": [
+    {
+      "service": "space-api",
+      "name": "space_sandbox_api_created_total"
+    },
+    {
+      "service": "space-cluster-controller",
+      "name": "space_node_group_mirror_tick_completed_total"
+    }
+  ],
+  "histograms": [
+    {
+      "service": "space-api",
+      "name": "space_sandbox_api_latency_milliseconds"
+    },
+    {
+      "service": "space-cluster-controller",
+      "name": "space_cluster_reconciler_loop_latency_milliseconds"
+    },
+    {
+      "service": "containerd-shim-space-v2",
+      "name": "space_shim_operation_latency_ms_milliseconds"
+    }
+  ],
+  "lifecycle_gauge": {
+    "service": "space-sandbox-manager",
+    "name": "space_sandbox_worker_lifecycle_count",
+    "labels": {
+      "state": "started"
+    }
+  },
+  "requested_version_metric": "space_template_fetch_error_total"
+}
