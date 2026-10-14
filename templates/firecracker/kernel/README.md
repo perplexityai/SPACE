@@ -16,9 +16,11 @@ the requested version; the base config digest is verified before compilation.
 The build and QEMU smoke images share a digest-pinned Ubuntu base and a dated
 [Ubuntu package snapshot](https://snapshot.ubuntu.com/). Update the base digest
 and `UBUNTU_SNAPSHOT` in `Dockerfile` together to pick up dependency fixes, using
-a snapshot no older than the base image. The checksum-pinned CA bundle bootstraps
-HTTPS for APT; update its URL and checksum when needed. Validate pin updates
-with a kernel build and `smoke-boot.sh` before publishing artifacts.
+a snapshot no older than the base image. The base is pinned by its linux/amd64
+manifest digest, which its line in `ci/mirrored-images.txt` must name too. The
+checksum-pinned CA bundle bootstraps HTTPS for APT; update its URL and checksum
+when needed. Validate pin updates with a kernel build and `smoke-boot.sh` before
+publishing artifacts.
 
 ## Optional BPF/module-signing profile
 

@@ -1,4 +1,7 @@
-FROM ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3 AS base
+# The linux/amd64 image, not the multi-platform index: BuildKit keys its cache
+# by the manifest it resolves, and the image mirror (ci/mirrored-images.txt)
+# serves this manifest, so the source and the mirror share cached layers.
+FROM ubuntu:24.04@sha256:496754492fb28b4d3049432f2ca787449331e23fb14f0dd3fffea86bf5a93eb4 AS base
 
 ARG UBUNTU_SNAPSHOT=20260923T000000Z
 

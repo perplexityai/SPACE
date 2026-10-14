@@ -11,7 +11,7 @@ WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "${WORK_DIR}"' EXIT
 
 REPOSITORY="registry.example/space-guest-kernel-ci"
-BASE="ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3"
+BASE="ubuntu:24.04@sha256:496754492fb28b4d3049432f2ca787449331e23fb14f0dd3fffea86bf5a93eb4"
 MIRROR="ghcr.io/example/mirror@sha256:$(printf 'b%.0s' {1..64})"
 
 mkdir -p "${WORK_DIR}/bin"
