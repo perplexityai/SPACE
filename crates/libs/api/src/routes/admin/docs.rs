@@ -78,7 +78,8 @@ fn admin_openapi_value() -> Value {
                     ],
                     "responses": {
                         "200": { "description": "Cordon accepted" },
-                        "409": { "description": "Node transition conflict" }
+                        "409": { "description": "Node transition conflict" },
+                        "501": { "description": "Not available on the active substrate" }
                     }
                 }
             },
@@ -90,7 +91,8 @@ fn admin_openapi_value() -> Value {
                     ],
                     "responses": {
                         "200": { "description": "Uncordon accepted" },
-                        "409": { "description": "Node transition conflict" }
+                        "409": { "description": "Node transition conflict" },
+                        "501": { "description": "Not available on the active substrate" }
                     }
                 }
             },
@@ -127,7 +129,8 @@ fn admin_openapi_value() -> Value {
                     },
                     "responses": {
                         "200": { "description": "Drain accepted" },
-                        "409": { "description": "Node transition conflict" }
+                        "409": { "description": "Node transition conflict" },
+                        "501": { "description": "Not available on the active substrate" }
                     }
                 }
             },
@@ -151,7 +154,8 @@ fn admin_openapi_value() -> Value {
                     ],
                     "responses": {
                         "200": { "description": "Terminate accepted" },
-                        "409": { "description": "Node transition conflict" }
+                        "409": { "description": "Node transition conflict" },
+                        "501": { "description": "Not available on the active substrate" }
                     }
                 }
             },
@@ -163,7 +167,8 @@ fn admin_openapi_value() -> Value {
                     ],
                     "responses": {
                         "200": { "description": "Repair trigger result" },
-                        "409": { "description": "Node transition conflict" }
+                        "409": { "description": "Node transition conflict" },
+                        "501": { "description": "Not available on the active substrate" }
                     }
                 }
             },

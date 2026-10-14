@@ -2199,6 +2199,14 @@ pub struct SubstrateCapabilities {
     pub resolves_cold_create_shape: bool,
     /// Create requests may carry a Kubernetes node-pool placement pin.
     pub supports_node_pool_placement: bool,
+    /// The substrate has a node scheduling primitive for
+    /// [`Substrate::set_node_schedulability`] to patch, and the cluster
+    /// controller has a node-drain reconciler for it (opt-in through
+    /// `SPACE_NODE_DRAIN_ENABLED`; the controller picks its loops by
+    /// substrate, not from this field). When false, the admin drain, cordon
+    /// and force-upload actions refuse before reading the node, except
+    /// `:undrain`, which only clears a `drain_phase` an earlier drain left.
+    pub supports_node_drain: bool,
 }
 
 impl SubstrateCapabilities {
@@ -2208,6 +2216,7 @@ impl SubstrateCapabilities {
         registers_nodes_via_admin_api: true,
         resolves_cold_create_shape: false,
         supports_node_pool_placement: false,
+        supports_node_drain: false,
     };
 
     pub const KUBERNETES: Self = Self {
@@ -2216,6 +2225,7 @@ impl SubstrateCapabilities {
         registers_nodes_via_admin_api: false,
         resolves_cold_create_shape: true,
         supports_node_pool_placement: true,
+        supports_node_drain: true,
     };
 }
 
@@ -2962,6 +2972,12 @@ impl Substrate {
     /// Keeping this on `Substrate` means admin handlers stay free of
     /// substrate-specific clients and the substrate boundary owns the
     /// scheduling primitive.
+    ///
+    /// Returns `Unsupported` exactly where
+    /// [`SubstrateCapabilities::supports_node_drain`] is false, which the
+    /// admin drain routes check before committing a phase; keep the two in
+    /// step (`node_drain_capability_matches_set_node_schedulability` asserts
+    /// it).
     pub async fn set_node_schedulability(
         &self,
         _request: NodeSchedulabilityRequest<'_>,

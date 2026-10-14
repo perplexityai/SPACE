@@ -20,9 +20,11 @@
 //!   clears its routing.
 //! - Direct-only: the node registry and the template pull and delete routes in
 //!   `routes/admin/node_maintenance.rs` (501 on Kubernetes).
-//! - No drain or evacuation. After drain-state validation, admin `:drain`,
-//!   `:undrain`, `:cordon` and `:uncordon` return 502 on a Direct node;
-//!   `:drain` still commits `drain_phase='draining'`, which nothing advances.
+//! - No drain or evacuation ([`SubstrateCapabilities::supports_node_drain`]
+//!   is false). Admin `:drain`, `:terminate`, `:cordon`, `:uncordon` and
+//!   `:force-upload-local-snapshots` return 501 before reading or writing the
+//!   node. `:undrain` is the way out of a `draining` or `drained` phase an
+//!   earlier drain left: it clears it without a substrate call.
 //!
 //! # Kubernetes-only reconcilers
 //!

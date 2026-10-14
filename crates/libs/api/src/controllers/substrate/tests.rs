@@ -654,3 +654,42 @@ async fn a_contended_node_group_catalog_read_is_retryable() -> pplx_space_test_e
     );
     Ok(())
 }
+
+/// The admin drain routes read `supports_node_drain` to decide whether to
+/// commit a phase before patching the node. If it claimed support where the
+/// patch is `Unsupported`, a refused patch would follow a committed phase;
+/// if it denied support where the patch works, the routes would refuse a
+/// real drain.
+#[tokio::test(flavor = "current_thread")]
+async fn node_drain_capability_matches_set_node_schedulability() {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_millis(1))
+        .connect_lazy("postgres://postgres@127.0.0.1:1/postgres")
+        .expect("lazy pool should parse");
+    #[cfg_attr(not(feature = "kubernetes"), allow(unused_mut))]
+    let mut substrates = vec![Substrate::Direct(Box::new(direct::DirectSubstrate::new(
+        pool.clone(),
+    )))];
+    #[cfg(feature = "kubernetes")]
+    substrates.push(Substrate::Kubernetes(Box::new(
+        kubernetes::tests::substrate_with_store(pool),
+    )));
+
+    for substrate in substrates {
+        let result = substrate
+            .set_node_schedulability(
+                NodeSchedulabilityRequest {
+                    substrate_node_id: "worker-a",
+                },
+                NodeSchedulability::Unschedulable,
+            )
+            .await;
+        assert_eq!(
+            matches!(result, Err(SubstrateError::Unsupported { .. })),
+            !substrate.capabilities().supports_node_drain,
+            "{} substrate: {result:?}",
+            substrate.managed_by()
+        );
+    }
+}

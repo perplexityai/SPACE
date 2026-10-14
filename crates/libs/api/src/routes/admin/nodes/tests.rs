@@ -1252,3 +1252,292 @@ async fn node_sandbox_pages_are_scoped_deduplicated_and_complete() -> TestResult
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     Ok(())
 }
+
+/// `AppState::from_pool` picks its substrate from the process environment, so
+/// the schedulability tests pin it to Direct and swap a Kubernetes substrate
+/// in where they need one. Returns false in the parent process.
+fn enter_direct_test_process() -> bool {
+    pplx_space_test_env::enter_test_process(&[(
+        "SPACE_K8S_CONTROL_PLANE",
+        Some(std::ffi::OsStr::new("false")),
+    )])
+}
+
+/// `nodes` columns the drain and cordon actions write.
+type DrainColumns = (
+    Option<String>,
+    Option<String>,
+    Option<OffsetDateTime>,
+    Option<String>,
+    bool,
+);
+
+async fn insert_drain_test_node(
+    pool: &sqlx::PgPool,
+    managed_by: NodeManagedBy,
+    drain_phase: Option<&str>,
+) -> TestResult<NodeId> {
+    let node_id = NodeId::new();
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role, managed_by, drain_phase, drain_mode,
+                            drain_started_at, drain_last_error)
+         VALUES ($1, '127.0.0.1', 'worker', $2, $3,
+                 CASE WHEN $3::TEXT IS NULL THEN NULL ELSE 'forced' END,
+                 CASE WHEN $3::TEXT IS NULL THEN NULL ELSE NOW() END,
+                 CASE WHEN $3::TEXT IS NULL THEN NULL
+                      ELSE 'substrate cordon patch failed' END)"
+    ))
+    .bind(node_id)
+    .bind(managed_by.as_str())
+    .bind(drain_phase)
+    .execute(pool)
+    .await?;
+    Ok(node_id)
+}
+
+async fn drain_columns(pool: &sqlx::PgPool, node_id: NodeId) -> TestResult<DrainColumns> {
+    Ok(sqlx::query_as(sql!(
+        "SELECT drain_phase, drain_mode, drain_started_at, drain_last_error,
+                terminate_decrement_capacity
+           FROM nodes
+          WHERE id = $1"
+    ))
+    .bind(node_id)
+    .fetch_one(pool)
+    .await?)
+}
+
+async fn post_node_action(
+    state: &AppState,
+    actor: &User,
+    node_id: NodeId,
+    action: DrainAction,
+    body: &'static str,
+) -> TestResult<(StatusCode, serde_json::Value)> {
+    let response = dispatch_node_action(
+        State(state.clone()),
+        Extension(AuthUser(actor.clone())),
+        Path(format!("{node_id}:{}", action.label())),
+        Bytes::from_static(body.as_bytes()),
+    )
+    .await;
+    let status = response.status();
+    let body = serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 100_000).await?)?;
+    Ok((status, body))
+}
+
+/// Direct has no node scheduling primitive and runs no node-drain reconciler,
+/// so a committed drain phase could never converge or advance. Each action is
+/// refused before the node is read or locked: an unknown id gets the same 501
+/// rather than a 404, and a node whose row another transaction holds
+/// `FOR UPDATE` is refused without waiting for it. That node starts in a phase
+/// the action would otherwise accept, so the refusal is the substrate's, and
+/// its row must read the same afterwards.
+#[tokio::test(flavor = "current_thread")]
+async fn direct_refuses_node_drain_and_cordon_before_writing() -> TestResult {
+    if !enter_direct_test_process() {
+        return Ok(());
+    }
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let state = AppState::from_pool(db.pool.clone()).await?;
+    let actor =
+        inventory_test_actor(crate::routes::authz::cluster_managing_org_id(&db.pool).await?);
+    let refused = serde_json::json!({
+        "error": "node drain and cordon are not supported on the Direct substrate"
+    });
+
+    for (action, phase, body) in [
+        (DrainAction::Drain, None, r#"{"mode":"forced"}"#),
+        (DrainAction::Terminate, Some(PHASE_DRAINED), ""),
+        (DrainAction::Cordon, None, ""),
+        (DrainAction::Uncordon, None, ""),
+        // Forced `draining` closes the wake gate this action requires.
+        (
+            DrainAction::ForceUploadLocalSnapshots,
+            Some(PHASE_DRAINING),
+            "",
+        ),
+    ] {
+        let label = action.label();
+        let unknown = post_node_action(&state, &actor, NodeId::new(), action, body).await?;
+        assert_eq!(
+            unknown,
+            (StatusCode::NOT_IMPLEMENTED, refused.clone()),
+            "{label}"
+        );
+
+        let node_id = insert_drain_test_node(&db.pool, NodeManagedBy::Space, phase).await?;
+        let before = drain_columns(&db.pool, node_id).await?;
+        let mut lock = db.pool.begin().await?;
+        sqlx::query(sql!("SELECT 1 FROM nodes WHERE id = $1 FOR UPDATE"))
+            .bind(node_id)
+            .execute(&mut *lock)
+            .await?;
+
+        let locked = tokio::time::timeout(
+            Duration::from_secs(5),
+            post_node_action(&state, &actor, node_id, action, body),
+        )
+        .await
+        .map_err(|_| format!("{label} waited on the node's row lock"))??;
+
+        lock.rollback().await?;
+        assert_eq!(
+            locked,
+            (StatusCode::NOT_IMPLEMENTED, refused.clone()),
+            "{label}"
+        );
+        assert_eq!(drain_columns(&db.pool, node_id).await?, before, "{label}");
+    }
+    Ok(())
+}
+
+/// A Direct node can still hold the `draining` phase an older `:drain`
+/// committed before it failed the cordon patch. `:undrain` clears it, with
+/// the mode the shared drain gates read and the error the failed patch left,
+/// and needs no substrate call to succeed.
+#[tokio::test(flavor = "current_thread")]
+async fn direct_undrain_clears_a_phase_an_earlier_drain_left() -> TestResult {
+    if !enter_direct_test_process() {
+        return Ok(());
+    }
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let state = AppState::from_pool(db.pool.clone()).await?;
+    let actor =
+        inventory_test_actor(crate::routes::authz::cluster_managing_org_id(&db.pool).await?);
+    let node_id =
+        insert_drain_test_node(&db.pool, NodeManagedBy::Space, Some(PHASE_DRAINING)).await?;
+
+    let (status, body) =
+        post_node_action(&state, &actor, node_id, DrainAction::Undrain, "").await?;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["drain_phase"].is_null(), "{body}");
+    assert_eq!(
+        drain_columns(&db.pool, node_id).await?,
+        (None, None, None, None, false)
+    );
+    Ok(())
+}
+
+/// Positive control for the Direct refusal: on Kubernetes every action still
+/// runs, each drain-phase action commits its transition, and each one with a
+/// scheduling effect patches its node's `spec.unschedulable`.
+#[cfg(feature = "kubernetes")]
+#[tokio::test(flavor = "current_thread")]
+async fn kubernetes_node_drain_and_cordon_converge_the_node() -> TestResult {
+    use axum::http::{Method, Request, Response};
+    use http_body_util::BodyExt;
+    use kube::client::{Body, ClientBuilder};
+    use std::sync::{Arc, Mutex};
+
+    if !enter_direct_test_process() {
+        return Ok(());
+    }
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let patches: Arc<Mutex<Vec<(String, serde_json::Value)>>> = Arc::default();
+    let recorded = Arc::clone(&patches);
+    let client = ClientBuilder::new(
+        tower::service_fn(move |req: Request<Body>| {
+            let recorded = Arc::clone(&recorded);
+            async move {
+                assert_eq!(req.method(), Method::PATCH, "{}", req.uri());
+                let name = req
+                    .uri()
+                    .path()
+                    .strip_prefix("/api/v1/nodes/")
+                    .expect("a core.v1.Node patch")
+                    .to_string();
+                let patch: serde_json::Value =
+                    serde_json::from_slice(&req.into_body().collect().await?.to_bytes())?;
+                let node = serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Node",
+                    "metadata": {"name": name},
+                    "spec": patch["spec"],
+                });
+                recorded.lock().unwrap().push((name, patch));
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Response::new(Body::from(
+                    serde_json::to_vec(&node)?,
+                )))
+            }
+        }),
+        "space",
+    )
+    .build();
+    let mut state = AppState::from_pool(db.pool.clone()).await?;
+    state.sandbox_controller = crate::controllers::sandbox::SandboxController::new(
+        crate::controllers::substrate::Substrate::Kubernetes(Box::new(
+            crate::controllers::substrate::kubernetes::tests::substrate_with_store_and_client(
+                db.pool.clone(),
+                client,
+            ),
+        )),
+    );
+    let actor =
+        inventory_test_actor(crate::routes::authz::cluster_managing_org_id(&db.pool).await?);
+
+    for (action, phase, unschedulable, phase_after) in [
+        (DrainAction::Drain, None, Some(true), Some(PHASE_DRAINING)),
+        (DrainAction::Cordon, None, Some(true), None),
+        (DrainAction::Uncordon, None, Some(false), None),
+        (
+            DrainAction::Undrain,
+            Some(PHASE_DRAINING),
+            Some(false),
+            None,
+        ),
+        (
+            DrainAction::Terminate,
+            Some(PHASE_DRAINED),
+            None,
+            Some(PHASE_TERMINATING),
+        ),
+        // The node holds no local-only snapshots, so there is nothing to upload.
+        (
+            DrainAction::ForceUploadLocalSnapshots,
+            Some(PHASE_DRAINING),
+            None,
+            Some(PHASE_DRAINING),
+        ),
+    ] {
+        let label = action.label();
+        let node_id = insert_drain_test_node(&db.pool, NodeManagedBy::Kubernetes, phase).await?;
+        let node_name = format!("kind-worker-{label}");
+        sqlx::query(sql!(
+            "INSERT INTO node_k8s (node_id, k8s_node_name) VALUES ($1, $2)"
+        ))
+        .bind(node_id)
+        .bind(&node_name)
+        .execute(&db.pool)
+        .await?;
+
+        let (status, body) = post_node_action(&state, &actor, node_id, action, "").await?;
+
+        assert_eq!(status, StatusCode::OK, "{label}: {body}");
+        assert_eq!(
+            drain_columns(&db.pool, node_id).await?.0.as_deref(),
+            phase_after,
+            "{label}"
+        );
+        let node_patches: Vec<_> = patches
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(name, _)| *name == node_name)
+            .map(|(_, patch)| patch.clone())
+            .collect();
+        let expected: Vec<_> = unschedulable
+            .map(|value| serde_json::json!({"spec": {"unschedulable": value}}))
+            .into_iter()
+            .collect();
+        assert_eq!(node_patches, expected, "{label}");
+    }
+    Ok(())
+}

@@ -686,8 +686,12 @@ export default function NodesPage() {
       width: 120,
       render: (_, record) => {
         const drainPhase = record.drain_phase;
+        // The direct/self-managed substrate refuses node drain with 501;
+        // undrain stays available there to clear a phase an earlier drain left.
         const canDrain =
-          (record.role === 'worker' || record.role === 'builder') && drainPhase === null;
+          substrate !== 'space' &&
+          (record.role === 'worker' || record.role === 'builder') &&
+          drainPhase === null;
         const canUndrain =
           (record.role === 'worker' || record.role === 'builder') &&
           (drainPhase === 'draining' || drainPhase === 'drained');

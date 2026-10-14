@@ -28,6 +28,7 @@ use super::support::{
 };
 use crate::controllers::substrate::{NodeApiTarget, NodeSchedulability, NodeSchedulabilityRequest};
 use crate::middleware::auth::AuthUser;
+use crate::models::User;
 use crate::routes::AppState;
 
 /// Drain-phase states stored in `nodes.drain_phase`. NULL means the node is
@@ -35,6 +36,14 @@ use crate::routes::AppState;
 const PHASE_DRAINING: &str = "draining";
 const PHASE_DRAINED: &str = "drained";
 const PHASE_TERMINATING: &str = "terminating";
+
+/// The 501 body's `error` for a node drain or cordon action on a substrate
+/// without [`SubstrateCapabilities::supports_node_drain`]. Only Direct lacks
+/// it.
+///
+/// [`SubstrateCapabilities::supports_node_drain`]: crate::controllers::substrate::SubstrateCapabilities::supports_node_drain
+const NODE_DRAIN_UNSUPPORTED: &str =
+    "node drain and cordon are not supported on the Direct substrate";
 
 #[derive(Debug, Clone, Copy)]
 enum DrainAction {
@@ -79,6 +88,17 @@ impl DrainAction {
             "force-upload-local-snapshots" => Some(Self::ForceUploadLocalSnapshots),
             _ => None,
         }
+    }
+
+    /// Whether the action may run on a substrate without node drain. Only
+    /// `:undrain` may: it is how an operator clears a `drain_phase` an
+    /// earlier drain left, and it needs no substrate call there.
+    /// `:force-upload-local-snapshots` is refused with the rest, because its
+    /// gate opens only in a drain phase nothing on such a substrate can enter
+    /// any more (a leftover one is cleared by `:undrain`), and the
+    /// `:terminate` it unblocks is refused too.
+    fn runs_without_node_drain(self) -> bool {
+        matches!(self, Self::Undrain)
     }
 }
 
@@ -746,6 +766,46 @@ fn terminate_blocked_by_occupancy(occupancy: &node_store::SandboxOccupancy) -> b
     occupancy.active > 0 || occupancy.local_snapshots > 0
 }
 
+/// The 501 for an action [`DrainAction::runs_without_node_drain`] excludes,
+/// on a substrate without [`SubstrateCapabilities::supports_node_drain`];
+/// `None` when the action may run.
+///
+/// Callers check this after authorization and before reading or locking the
+/// node, so a refused action writes nothing to `nodes` and never waits on its
+/// row lock: on such a substrate the cordon patch can never succeed, and no
+/// reconciler would advance or re-assert a committed phase.
+///
+/// [`SubstrateCapabilities::supports_node_drain`]: crate::controllers::substrate::SubstrateCapabilities::supports_node_drain
+fn refuse_without_node_drain(
+    state: &AppState,
+    actor: &User,
+    node_id: NodeId,
+    action: DrainAction,
+    drain_mode: Option<NodeDrainMode>,
+) -> Option<axum::response::Response> {
+    if action.runs_without_node_drain()
+        || state
+            .sandbox_controller
+            .substrate_capabilities()
+            .supports_node_drain
+    {
+        return None;
+    }
+    audit::record(AdminAuditEntry {
+        actor,
+        action: action.label(),
+        node_id,
+        node_name: None,
+        from_phase: None,
+        to_phase: None,
+        drain_mode,
+        success: false,
+        error: Some(NODE_DRAIN_UNSUPPORTED),
+        outcome_counts: None,
+    });
+    Some(api_error(StatusCode::NOT_IMPLEMENTED, NODE_DRAIN_UNSUPPORTED).into_response())
+}
+
 async fn apply_drain_action(
     State(state): State<AppState>,
     Extension(AuthUser(actor)): Extension<AuthUser>,
@@ -764,6 +824,18 @@ async fn apply_drain_action(
     // `:drain` is exactly when an operator wants to know which mode was
     // attempted.
     let requested_mode = matches!(action, DrainAction::Drain).then_some(drain_request.mode);
+
+    // `:undrain` passes on a substrate without node drain, and skips the
+    // substrate patch below.
+    if let Some(refusal) =
+        refuse_without_node_drain(&state, &actor, node_id, action, requested_mode)
+    {
+        return refusal;
+    }
+    let supports_node_drain = state
+        .sandbox_controller
+        .substrate_capabilities()
+        .supports_node_drain;
 
     // Phase 1 — DB transition under `FOR UPDATE`.
     //
@@ -933,7 +1005,13 @@ async fn apply_drain_action(
     // crates. If it fails, we persist `drain_last_error` on the row (best
     // effort) so the node-drain reconciler can pick it up and re-assert
     // cordon state.
-    let substrate_outcome = converge_substrate_schedulability(&state, &current, action).await;
+    let substrate_outcome = if supports_node_drain {
+        converge_substrate_schedulability(&state, &current, action).await
+    } else {
+        // Only `:undrain` gets here. The substrate has no cordon to lift: no
+        // admin action could have applied one.
+        Ok(())
+    };
 
     if let Err(ref substrate_err) = substrate_outcome
         && phase_was_written
@@ -1143,6 +1221,15 @@ async fn apply_force_upload_local_snapshots(
 ) -> axum::response::Response {
     if let Err(err) = require_managing_org_admin(&state.pool, &actor).await {
         return err.into_response();
+    }
+    if let Some(refusal) = refuse_without_node_drain(
+        &state,
+        &actor,
+        node_id,
+        DrainAction::ForceUploadLocalSnapshots,
+        None,
+    ) {
+        return refusal;
     }
 
     let store = AdminNodeStore::new(state.pool.clone());
