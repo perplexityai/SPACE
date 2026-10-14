@@ -1063,10 +1063,7 @@ impl SandboxController {
         self
     }
 
-    pub(crate) fn with_egress_profiles(
-        mut self,
-        egress: crate::egress_profiles::EgressProfiles,
-    ) -> Self {
+    pub fn with_egress_profiles(mut self, egress: crate::egress_profiles::EgressProfiles) -> Self {
         self.egress_profiles = egress;
         self
     }

@@ -696,20 +696,24 @@ async fn native_executor_requeues_create_when_cluster_admission_rejects() -> Tes
     let substrate = Substrate::Direct(Box::new(
         pplx_space_api::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),
     ));
-    let executor = NativePublicOperationExecutor::with_cluster_admission_config(
+    let executor = NativePublicOperationExecutor::with_cluster_admission(
         db.pool.clone(),
-        substrate,
-        ClusterSandboxAdmissionConfig {
-            enabled: true,
-            refill_rps: 6.0,
-            burst: 60.0,
-            redis_url: None,
-        },
-        FeatureFlagClient::disabled(),
+        substrate.clone(),
+        ClusterSandboxAdmission::with_config(
+            substrate,
+            ClusterSandboxAdmissionConfig {
+                enabled: true,
+                refill_rps: 6.0,
+                burst: 60.0,
+                redis_url: None,
+            },
+            FeatureFlagClient::disabled(),
+        ),
         test_route_ed25519_authority(),
         pplx_space_common_svc::federated_identity::FederatedIdentityPolicy::default()
             .grant_audience,
         None,
+        EgressProfiles::default(),
     );
 
     let result = executor.execute("claim-token", operation).await;
@@ -752,7 +756,7 @@ async fn native_executor_requeues_create_when_cluster_admission_rejects() -> Tes
 }
 
 #[tokio::test]
-async fn native_executor_persists_exemptions_on_policy_update_and_template_reset() -> TestResult {
+async fn native_executor_persists_operator_policy_on_update_and_template_reset() -> TestResult {
     use pplx_space_api::public_sandbox_operations::UpdateSandboxOperationPayload;
     use pplx_space_public_api::{SandboxNetworkPolicyPatch, UpdateSandboxRequest};
 
@@ -783,37 +787,46 @@ async fn native_executor_persists_exemptions_on_policy_update_and_template_reset
     let exemptions =
         TlsInterceptionExemptions::from_config(r#"[{"wildcard_domain":"*.relay.example.test"}]"#)?;
 
+    let profiles: EgressProfiles = serde_json::from_value(serde_json::json!({
+        "sensor": {"default": true, "allow": [{"domain": "sensor.example.test"}]}
+    }))?;
+
     for configured in [false, true] {
         let sandbox_id = PublicSandboxId::new();
         sqlx::query(sql!(
             "INSERT INTO sandboxes (
                  id, user_id, org_id, managed_by, lifecycle, placement,
-                 template_id, network_policy_generation
-             ) VALUES ($1, $2, $3, 'k8s', 'started', 'unplaced', 'seed', 1)"
+                 template_id, network_policy_generation, egress_profiles
+             ) VALUES ($1, $2, $3, 'k8s', 'started', 'unplaced', 'seed', 1, $4)"
         ))
         .bind(sandbox_id.as_uuid())
         .bind(user_id)
         .bind(org_id)
+        .bind(if configured { vec!["sensor"] } else { vec![] })
         .execute(&db.pool)
         .await?;
         // Direct is only a placeholder here: this test never reaches the substrate.
         let substrate = Substrate::Direct(Box::new(
             pplx_space_api::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),
         ));
-        let executor = NativePublicOperationExecutor::with_cluster_admission_config(
+        let executor = NativePublicOperationExecutor::with_cluster_admission(
             db.pool.clone(),
-            substrate,
-            ClusterSandboxAdmissionConfig {
-                enabled: false,
-                refill_rps: 6.0,
-                burst: 60.0,
-                redis_url: None,
-            },
-            FeatureFlagClient::disabled(),
+            substrate.clone(),
+            ClusterSandboxAdmission::with_config(
+                substrate,
+                ClusterSandboxAdmissionConfig {
+                    enabled: false,
+                    refill_rps: 6.0,
+                    burst: 60.0,
+                    redis_url: None,
+                },
+                FeatureFlagClient::disabled(),
+            ),
             test_route_ed25519_authority(),
             pplx_space_common_svc::federated_identity::FederatedIdentityPolicy::default()
                 .grant_audience,
             configured.then(|| exemptions.clone()),
+            profiles.clone(),
         );
 
         for reset in [false, true] {
@@ -866,6 +879,19 @@ async fn native_executor_persists_exemptions_on_policy_update_and_template_reset
                     override_policy.clone()
                 };
                 if configured {
+                    let allows = expected["egress"]["allow"].as_array_mut().unwrap();
+                    allows.push(serde_json::json!({"domain": "sensor.example.test"}));
+                    if !reset {
+                        allows.extend(
+                            serde_json::json!([
+                                {"cidr": "8.8.8.8/32"}, {"cidr": "1.1.1.1/32"}
+                            ])
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .cloned(),
+                        );
+                    }
                     expected["tls_interception_exemptions"] = serde_json::json!([
                         {"wildcard_domain": "*.relay.example.test"}
                     ]);

@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use pplx_space_api::cluster_admission::{ClusterSandboxAdmission, ClusterSandboxAdmissionConfig};
 use pplx_space_api::controllers::sandbox::SandboxController;
 use pplx_space_api::controllers::substrate::Substrate;
+use pplx_space_api::egress_profiles::EgressProfiles;
 use pplx_space_api::fork_operation_executor::ForkSandboxOperationExecutor;
 use pplx_space_api::public_operations::{
     ApiProduct, ClaimPublicOperations, ClaimedPublicOperation, CompleteClaimedPublicOperation,
@@ -191,46 +192,44 @@ impl NativePublicOperationExecutor {
         feature_flags: FeatureFlagClient,
         grant_audience: pplx_space_common_core::types::FederatedGrantAudience,
         tls_interception_exemptions: Option<TlsInterceptionExemptions>,
+        egress_profiles: EgressProfiles,
     ) -> Result<Self, pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Error>
     {
         let route_ed25519_authority = Arc::new(
             pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Authority::load_required_from_env()?,
         );
-        Ok(Self::with_cluster_admission_config(
+        Ok(Self::with_cluster_admission(
             pool,
-            substrate,
-            ClusterSandboxAdmissionConfig::from_env(),
-            feature_flags,
+            substrate.clone(),
+            ClusterSandboxAdmission::with_config(
+                substrate,
+                ClusterSandboxAdmissionConfig::from_env(),
+                feature_flags,
+            ),
             route_ed25519_authority,
             grant_audience,
             tls_interception_exemptions,
+            egress_profiles,
         ))
     }
 
-    fn with_cluster_admission_config(
+    fn with_cluster_admission(
         pool: PgPool,
         substrate: Substrate,
-        admission_config: ClusterSandboxAdmissionConfig,
-        feature_flags: FeatureFlagClient,
+        cluster_admission: ClusterSandboxAdmission,
         route_ed25519_authority: Arc<
             pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Authority,
         >,
         grant_audience: pplx_space_common_core::types::FederatedGrantAudience,
         tls_interception_exemptions: Option<TlsInterceptionExemptions>,
+        egress_profiles: EgressProfiles,
     ) -> Self {
-        // Absent an SDK key the injected client is disabled and the dynamic
-        // gate defaults on, leaving the limiter env-var-gated exactly as
-        // before.
-        let cluster_admission = ClusterSandboxAdmission::with_config(
-            substrate.clone(),
-            admission_config,
-            feature_flags,
-        );
         let controller =
             SandboxController::with_cluster_admission(substrate.clone(), cluster_admission.clone())
                 .with_route_ed25519_authority(Some(route_ed25519_authority))
                 .with_federated_grant_audience(grant_audience)
-                .with_tls_interception_exemptions(tls_interception_exemptions);
+                .with_tls_interception_exemptions(tls_interception_exemptions)
+                .with_egress_profiles(egress_profiles);
         Self {
             cluster_admission,
             create_sandbox: CreateSandboxOperationExecutor::new(pool.clone(), controller.clone()),

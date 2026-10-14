@@ -3,7 +3,9 @@
 [Documentation](../README.md)
 
 Operators configure named, additive policies with `SPACE_EGRESS_PROFILES` on
-API processes at startup. Unset or `{}` disables profiles. For example:
+API and cluster-controller processes at startup, including standby controllers.
+Use the same configuration on both services. Unset or `{}` disables profiles.
+For example:
 
 ```json
 {
@@ -39,7 +41,8 @@ The sandbox stores the selected names in `egress_profiles`, a PostgreSQL
 text array. Selection is immutable for its lifetime; definitions are not stored.
 Fresh creates, tenant policy replacement, and explicit template inheritance resolve
 those names against the handling process's current configuration. A missing saved
-name returns HTTP 503 without replacing the policy; queued creates retry.
+name returns HTTP 503 without replacing the policy; queued creates retry within
+the dispatcher's attempt and deadline limits.
 Defaults apply only at admission, never when resolving a saved selection.
 
 Native queued creates persist the names, including an explicit empty array, and
@@ -62,10 +65,23 @@ use `profile:unknown`; missing saved definitions use the previously admitted nam
 Alert on `failed/unconfigured` for configuration drift.
 
 Upgrade database schemas and queued operation executors before API producers.
-Configure every API replica before callers send selections or rely on changed
-definitions; replicas with different configuration may compose different policies.
+Configure every API and cluster-controller replica before callers send selections
+or rely on changed definitions. Different definitions may compose different
+policies; a worker missing a selected name returns 503 and may exhaust retries.
 All policy readers and running gateways must support TLS exemptions before
 configuring nonempty exemption lists. Before downgrading, use compatible binaries
 to remove exemptions from stored policies or retire the affected resources.
 Disabling configuration does not remove saved policies. There is no automatic
 refresh or separate definition registry.
+
+## Upgrading from the legacy configuration
+
+The old variables and header are no longer read. Move
+`SPACE_FALCON_EGRESS_DESTINATIONS` into a named profile's `allow` list. Copy the
+same destinations into `tls_interception_exemptions` only if
+`SPACE_FALCON_TLS_INTERCEPTION_EXEMPTIONS_ENABLED` was enabled. Configure
+`SPACE_EGRESS_PROFILES` on APIs and cluster controllers before replacing
+`X-Space-Falcon: true` with `X-Space-Egress-Profiles: +<name>` (or making that
+profile a default). Unknown selections now return 400. Remove the old variables
+and update dashboards from `space.sandbox.falcon_create_admission` to
+`space.sandbox.egress_profile_admission`.

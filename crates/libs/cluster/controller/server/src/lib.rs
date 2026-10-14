@@ -7,6 +7,7 @@
 //! this library without copying any of the service.
 
 use pplx_space_api::controllers::substrate::Substrate;
+use pplx_space_api::egress_profiles::{EgressProfiles, EgressProfilesConfigError};
 use pplx_space_api::tls_interception_exemptions::{
     TlsInterceptionExemptions, TlsInterceptionExemptionsConfigError,
 };
@@ -71,6 +72,8 @@ pub struct ClusterControllerConfig {
 /// caller decides what a non-zero exit means for its own supervisor.
 #[derive(Debug, thiserror::Error)]
 pub enum RunClusterControllerError {
+    #[error("invalid egress profiles: {0}")]
+    EgressProfiles(#[from] EgressProfilesConfigError),
     #[error("invalid TLS interception exemptions: {0}")]
     TlsInterceptionExemptions(#[from] TlsInterceptionExemptionsConfigError),
     #[error("failed to initialize the cluster-controller space_user pool: {0}")]
@@ -103,6 +106,7 @@ pub async fn run(
 ) -> Result<(), RunClusterControllerError> {
     // Validate on standbys too, before leader election can mark a replica Ready.
     let tls_interception_exemptions = TlsInterceptionExemptions::from_env()?;
+    let egress_profiles = EgressProfiles::from_env()?;
     let pool = pplx_space_common_svc::sql::connect_space_user_pool_lazy(
         &config.database_url,
         SERVICE_NAME,
@@ -211,6 +215,7 @@ pub async fn run(
         credentials_pool,
         substrate,
         tls_interception_exemptions,
+        egress_profiles,
         reconciler_token,
     )
     .await;

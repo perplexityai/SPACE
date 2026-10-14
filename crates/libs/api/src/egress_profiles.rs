@@ -11,7 +11,7 @@ const ENV: &str = "SPACE_EGRESS_PROFILES";
 pub(crate) const HEADER: &str = "x-space-egress-profiles";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
-pub(crate) struct EgressProfiles(BTreeMap<ProfileName, EgressProfile>);
+pub struct EgressProfiles(BTreeMap<ProfileName, EgressProfile>);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -124,7 +124,7 @@ pub enum EgressProfileSelectionError {
 }
 
 impl EgressProfiles {
-    pub(crate) fn from_env() -> Result<Self, EgressProfilesConfigError> {
+    pub fn from_env() -> Result<Self, EgressProfilesConfigError> {
         match std::env::var(ENV) {
             Ok(raw) => Self::from_config(&raw),
             Err(std::env::VarError::NotPresent) => Ok(Self::default()),
