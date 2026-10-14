@@ -49,9 +49,12 @@ a { color: var(--docs-color-accent); }
 /* Keep wide field tables accessible inside the native content column. */
 #reference .api-content table { display: block; max-width: 100%; overflow-x: auto; }
 footer { padding: 24px 32px; font-size: 13px; }
-/* Sample tabs use the page surface; panels retain the contrasting code colors. */
+/* Native code tokens and tabs need foregrounds for their respective surfaces. */
 #reference [role="tabpanel"] { color: var(--docs-color-code-text); }
-#reference [role="tab"][aria-selected="true"] { background-color: var(--docs-color-surface); }
+#reference :is(pre, .redoc-json) .token.boolean, #reference :is(pre, .redoc-json) .token.null, #reference :is(pre, .redoc-json) .token.keyword { color: var(--docs-color-response-error-text); }
+#reference :is(pre, .redoc-json) .token.property, #reference :is(pre, .redoc-json) .token.number, #reference :is(pre, .redoc-json) .token.function { color: var(--docs-color-code-text); }
+#reference [role="tab"][aria-selected="true"] { background-color: var(--docs-color-raised); border-color: var(--docs-color-muted); }
+#reference .http-verb, #reference .operation-type { color: var(--docs-color-method-text); }
 #reference h3 { color: var(--docs-color-text); }
 /* Native section labels and uncolored arrows need the shared foreground too. */
 #reference h5 { color: var(--docs-color-muted); border-color: var(--docs-color-border); }

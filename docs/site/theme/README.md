@@ -8,8 +8,11 @@ Python 3 for this staging step. The Guide loads the stylesheet through mdBook's
 additional CSS configuration; the API Reference loads it from its HTML page.
 
 `curiosity.css` provides font faces, shared layout dimensions, and semantic
-Curiosity Light and Dark colors. The dark palette is provisional; its values live
-under `--docs-dark-*` in that stylesheet. Code keeps a monospace font.
+Curiosity Light and Dark colors. Each mode uses one page background for the
+header, toolbar, sidebar and content, with separate raised and code surfaces.
+Text, borders, status indicators and API response tabs use the shared palette;
+dark values live under `--docs-dark-*` in that stylesheet. Code keeps a monospace
+font, and the Guide preserves native highlighting with readable print colors.
 
 Both sections load `system-theme.js` before their content. It selects the system
 color preference once per page load and ignores legacy mdBook theme choices.

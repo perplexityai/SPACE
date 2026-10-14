@@ -18,24 +18,32 @@
     --icons-hover: var(--docs-color-accent);
     --links: var(--docs-color-accent);
     --inline-code-color: var(--docs-color-text);
-    --theme-popup-bg: var(--docs-color-surface);
+    --theme-popup-bg: var(--docs-color-raised);
     --theme-popup-border: var(--docs-color-border);
-    --theme-hover: var(--docs-color-background);
-    --quote-bg: var(--docs-color-surface);
+    --theme-hover: var(--docs-color-soft);
+    --quote-bg: var(--docs-color-quote);
     --quote-border: var(--docs-color-border);
     --table-border-color: var(--docs-color-border);
-    --table-header-bg: var(--docs-color-border);
-    --table-alternate-bg: var(--docs-color-surface);
-    --searchbar-bg: var(--docs-color-surface);
+    --table-header-bg: var(--docs-color-quote);
+    --table-alternate-bg: var(--docs-color-raised);
+    --searchbar-bg: var(--docs-color-raised);
     --searchbar-fg: var(--docs-color-text);
-    --searchbar-border-color: var(--docs-color-muted);
+    --searchbar-border-color: var(--docs-color-border);
+    --searchbar-shadow-color: transparent;
     --searchresults-header-fg: var(--docs-color-muted);
     --searchresults-border-color: var(--docs-color-border);
-    --searchresults-li-bg: var(--docs-color-surface);
+    --searchresults-li-bg: var(--docs-color-raised);
+    --search-mark-bg: var(--docs-color-soft);
     --overlay-bg: rgba(0, 0, 0, .35);
 }
 
 html, button, input { font-family: var(--docs-font-body); }
+
+/* Keep native syntax highlighting on a surface from the reading palette. */
+.content pre > .hljs { background: var(--docs-color-reading-code-background); color: var(--docs-color-text); }
+.content :not(pre) > code { background: var(--docs-color-inline-code); }
+.content .hljs-addition { color: var(--docs-color-success); background: var(--docs-color-soft); }
+.content .hljs-deletion { color: var(--docs-color-error); background: var(--docs-color-soft); }
 
 .docs-header {
     position: fixed;
@@ -105,6 +113,20 @@ main > h1:first-child { margin-top: 0; font-size: 30px; line-height: 1.25; lette
 }
 
 @media print {
+    :root, :root[data-docs-theme] {
+        --bg: #ffffff;
+        --fg: #000000;
+        --links: #000000;
+        --inline-code-color: #000000;
+        --quote-bg: #f4f4f4;
+        --quote-border: #cccccc;
+        --table-border-color: #cccccc;
+        --table-header-bg: #f4f4f4;
+        --table-alternate-bg: #ffffff;
+        color-scheme: light;
+    }
+    .content pre > .hljs, .content :not(pre) > code { background: #f4f4f4; color: #000000; }
+    .content pre > .hljs * { color: #000000 !important; }
     .docs-header, #page-wrapper #menu-bar { display: none; }
     .page { margin-top: 0; padding-top: 0; }
     .content main { max-width: none; }

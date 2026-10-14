@@ -22,12 +22,6 @@
     "sidebar": {
       "width": "248px"
     },
-    "colors": {
-      "responses": {
-        "success": { "tabTextColor": "#a0fbaa" },
-        "error": { "tabTextColor": "#ffaaaa" }
-      }
-    },
     "typography": {
       "fontSize": "16px",
       "lineHeight": "1.65em",
