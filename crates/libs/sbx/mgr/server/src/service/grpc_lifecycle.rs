@@ -17,7 +17,8 @@ use super::recovery::SuspendSnapshotPublicationRecoveryOrigin;
 use super::suspend_snapshot_publication::{
     SuspendSnapshotPublicationDecision, canonical_suspend_snapshot_dir,
     classify_suspend_snapshot_publication, publish_suspend_snapshot_dir,
-    read_encrypted_capture_record, remove_encrypted_capture_record, suspend_snapshot_staging_dir,
+    read_encrypted_capture_record, recorded_encrypted_capture_to_seal,
+    remove_encrypted_capture_record, suspend_snapshot_staging_dir,
     suspend_snapshot_staging_parent_dir, write_encrypted_capture_record,
 };
 use super::tail_support::*;

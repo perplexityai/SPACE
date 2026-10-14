@@ -182,7 +182,8 @@ fn sealing_node_manager(refusals: usize) -> crate::node_manager_transport::fake:
         .serve()
 }
 
-/// One periodic publication-recovery pass over the row.
+/// One periodic publication-recovery pass over the row, including the seal
+/// task it spawns, which finishes before the next tick in these tests.
 async fn recover_batch(service: &SandboxManagerService, cache: &Path, id: &str) {
     service
         .recover_deferred_suspend_publication_batch(
@@ -193,6 +194,11 @@ async fn recover_batch(service: &SandboxManagerService, cache: &Path, id: &str) 
             (),
         )
         .await;
+    // The seal task holds the row's wake lock until it finishes.
+    let wake = service.auto_lifecycle.wake_lock(id);
+    tokio::time::timeout(std::time::Duration::from_secs(10), wake.lock())
+        .await
+        .expect("the seal task finishes");
 }
 
 #[tokio::test]
@@ -231,7 +237,13 @@ async fn unsealed_encrypted_capture_survives_restart_and_publishes_once_sealed()
     assert_eq!(row.state, SandboxState::Suspending);
     assert!(staging.join(publication::ENCRYPTED_CAPTURE_RECORD).exists());
 
-    // Once the holder exits, the next pass seals and publishes that capture.
+    // Once the holder exits, the next pass seals it and the one after
+    // publishes that capture.
+    recover_batch(&service, cache.path(), &id).await;
+    assert_eq!(
+        service.lookup_sandbox(&id).unwrap().state,
+        SandboxState::Suspending
+    );
     recover_batch(&service, cache.path(), &id).await;
     assert_eq!(
         node_manager.calls(),
@@ -279,6 +291,39 @@ async fn expired_encrypted_capture_is_quarantined_without_a_seal_attempt() {
     );
     let row = service.lookup_sandbox(&id).unwrap();
     assert_eq!(row.state, SandboxState::Quarantined);
-    assert_eq!(row.current_local_artifact_id, None);
+    // This reason is what makes deletion keep the only copy.
+    assert_eq!(
+        row.failure_reason.as_deref(),
+        Some(crate::db::SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE)
+    );
     assert!(staging.exists(), "the unsealed capture must be retained");
+}
+
+#[tokio::test]
+async fn complete_staged_capture_publishes_past_an_older_unsealed_record() {
+    use crate::service::suspend_snapshot_publication as publication;
+    let node_manager = sealing_node_manager(usize::MAX);
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    let cache = tempfile::tempdir().unwrap();
+    record_encrypted_capture(&conn, cache.path(), &id, std::time::Duration::ZERO);
+    let newer = LocalArtifactId::new();
+    publication::write_full_suspend_artifact(
+        &publication::suspend_snapshot_staging_dir(&cache.path().join(&id), newer),
+        &id,
+        newer,
+        b"newer",
+    );
+    let sockets = tempfile::tempdir().unwrap();
+    let service = service_with_node_manager(conn, node_manager.connector(), sockets.path());
+
+    recover_batch(&service, cache.path(), &id).await;
+
+    assert!(
+        node_manager.calls().is_empty(),
+        "a complete capture needs no seal"
+    );
+    let row = service.lookup_sandbox(&id).unwrap();
+    assert_eq!(row.state, SandboxState::CleanupRequired);
+    assert_eq!(row.current_local_artifact_id, Some(newer));
 }

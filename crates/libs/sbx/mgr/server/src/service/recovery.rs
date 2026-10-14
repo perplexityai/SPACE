@@ -725,8 +725,7 @@ impl SandboxManagerService {
             if shutdown.is_cancelled() {
                 break;
             }
-            self.seal_encrypted_capture_for_recovery(cache_dir, row)
-                .await;
+            self.spawn_encrypted_capture_seal(cache_dir, row);
         }
         let verdicts = self
             .inspect_retained_sources_in(
@@ -755,11 +754,13 @@ impl SandboxManagerService {
         })
     }
 
-    /// Retry the seal of an encrypted capture that a suspend recorded but could
-    /// not seal, so the classification that follows publishes it as staged.
-    /// Only the newest record can describe the volume's contents. A failure
-    /// leaves it pending for the next pass until its retry window ends.
-    pub(super) async fn seal_encrypted_capture_for_recovery(
+    /// Retry, in its own task, the seal of an encrypted capture that a suspend
+    /// recorded but could not seal. A refused close can take tens of seconds,
+    /// so it must not hold up this periodic pass. The task keeps the row's
+    /// wake, artifact and cleanup fences until it finishes, so a later pass
+    /// neither starts a second seal nor classifies the row mid-seal. Once the
+    /// seal succeeds, the next pass publishes the staged capture.
+    pub(super) fn spawn_encrypted_capture_seal(
         &self,
         cache_dir: &Path,
         row: &crate::db::SandboxRow,
@@ -767,55 +768,63 @@ impl SandboxManagerService {
         if !row.volume_encryption {
             return;
         }
-        let pending = match suspend_snapshot_publication::encrypted_captures_awaiting_seal(
+        match suspend_snapshot_publication::recorded_encrypted_capture_to_seal(
             &cache_dir.join(&row.id),
         ) {
-            Ok(pending) => pending,
+            Ok(Some(_)) => {}
+            Ok(None) => return,
             Err(error) => {
-                tracing::warn!(sandbox_id = %row.id, %error, "cannot list unsealed encrypted captures; will retry");
+                tracing::warn!(sandbox_id = %row.id, %error, "cannot select an unsealed encrypted capture; will retry");
                 return;
             }
-        };
-        let Some(capture) = pending.last() else {
+        }
+        let (Ok(wake), Ok(artifact)) = (
+            self.auto_lifecycle.wake_lock(&row.id).try_lock_owned(),
+            self.auto_lifecycle.artifact_lock(&row.id).try_lock_owned(),
+        ) else {
             return;
         };
-        // The teardown driver holds both locks for its whole run.
-        let wake = self.auto_lifecycle.wake_lock(&row.id);
-        let artifact = self.auto_lifecycle.artifact_lock(&row.id);
-        let (Ok(_wake), Ok(_artifact)) = (wake.try_lock(), artifact.try_lock()) else {
+        let CleanupLockTryResult::Acquired(cleanup) = self.try_cleanup_fence(&row.id) else {
             return;
         };
-        let current = self.startup_recovery_db().and_then(|db| {
-            let teardown_owned = crate::db::teardown_suspend_status(&db, &row.id)?
-                .and_then(|status| status.operation)
-                .is_some_and(|operation| operation.status.is_active());
-            let current = crate::db::get_sandbox(&db, &row.id)?;
-            Ok(current.filter(|current| !teardown_owned && unowned_publication(current)))
+        let owned = self.startup_recovery_db().and_then(|db| {
+            if !crate::db::startup_resident_witness_current(&db, row)?
+                || crate::db::teardown_suspend_status(&db, &row.id)?
+                    .and_then(|status| status.operation)
+                    .is_some_and(|operation| operation.status.is_active())
+            {
+                return Ok(None);
+            }
+            Ok(crate::db::get_sandbox(&db, &row.id)?.filter(unowned_publication))
         });
-        let current = match current {
-            Ok(Some(current)) => current,
+        let row = match owned {
+            Ok(Some(row)) => row,
             Ok(None) => return,
             Err(error) => {
                 tracing::warn!(sandbox_id = %row.id, %error, "cannot confirm unsealed encrypted capture owner; will retry");
                 return;
             }
         };
-        match self
-            .seal_encrypted_capture(&current, &capture.staging_dir)
-            .await
-        {
-            Ok(()) => tracing::info!(
-                sandbox_id = %current.id,
-                local_artifact_id = %capture.local_artifact_id,
-                "sealed interrupted encrypted suspend capture"
-            ),
-            Err(error) => tracing::warn!(
-                sandbox_id = %current.id,
-                local_artifact_id = %capture.local_artifact_id,
-                %error,
-                "encrypted suspend capture is still unsealed; recovery will retry"
-            ),
-        }
+        let (service, cache_dir) = (self.clone(), cache_dir.to_path_buf());
+        self.task_tracker.spawn(async move {
+            let _fences = (wake, artifact, cleanup);
+            match service
+                .seal_recorded_encrypted_capture(&row, &cache_dir)
+                .await
+            {
+                Ok(Some(capture)) => tracing::info!(
+                    sandbox_id = %row.id,
+                    local_artifact_id = %capture,
+                    "sealed interrupted encrypted suspend capture"
+                ),
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    sandbox_id = %row.id,
+                    %error,
+                    "encrypted suspend capture is still unsealed; recovery will retry"
+                ),
+            }
+        });
     }
 
     /// Retry only unowned publications. Startup's broader recovery is unsafe

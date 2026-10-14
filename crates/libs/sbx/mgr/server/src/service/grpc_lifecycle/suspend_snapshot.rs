@@ -219,8 +219,8 @@ impl SandboxManagerService {
         }
     }
 
-    /// Seal an encrypted capture's volume into its staging directory and write
-    /// the sidecar its capture record carries. This is the only
+    /// Seal an encrypted capture's volume into its staging directory, write
+    /// its sidecar from `metadata` and drop its record. This is the only
     /// encrypted-specific publication step: the live suspend and recovery
     /// both run it, and the sealed staging directory then publishes like a
     /// plaintext one.
@@ -228,9 +228,8 @@ impl SandboxManagerService {
         &self,
         sandbox: &crate::db::SandboxRow,
         staging_dir: &std::path::Path,
+        metadata: &crate::snapshot_upload::SnapshotMeta,
     ) -> Result<(), EncryptedCaptureSealError> {
-        let metadata = read_encrypted_capture_record(staging_dir)?
-            .ok_or(EncryptedCaptureSealError::MissingRecord)?;
         // node-manager seals and stages both ciphertext artifacts in one
         // privileged step: only it can read the sandbox-private instance dir.
         crate::snapshot_encryption::release_encrypted_snapshot_volume(
@@ -242,13 +241,34 @@ impl SandboxManagerService {
         .await
         .map_err(EncryptedCaptureSealError::Release)?;
         crate::snapshot_upload::write_snapshot_metadata(
-            &metadata,
+            metadata,
             staging_dir,
             &crate::snapshot_upload::encrypted_vm_artifacts(),
             None,
         )?;
         remove_encrypted_capture_record(staging_dir)
             .map_err(EncryptedCaptureSealError::RemoveRecord)
+    }
+
+    /// Seal the newest recorded capture of `sandbox` that is still inside its
+    /// retry window, unless a complete staged capture already awaits
+    /// publication. Every seal retry selects through this; the caller has
+    /// already established that it owns the row's publication. Returns the
+    /// sealed capture, if any.
+    pub(in crate::service) async fn seal_recorded_encrypted_capture(
+        &self,
+        sandbox: &crate::db::SandboxRow,
+        cache_dir: &std::path::Path,
+    ) -> Result<Option<LocalArtifactId>, EncryptedCaptureSealError> {
+        let Some(capture) = recorded_encrypted_capture_to_seal(&cache_dir.join(&sandbox.id))?
+        else {
+            return Ok(None);
+        };
+        let metadata = read_encrypted_capture_record(&capture.staging_dir)?
+            .ok_or(EncryptedCaptureSealError::MissingRecord)?;
+        self.seal_encrypted_capture(sandbox, &capture.staging_dir, &metadata)
+            .await?;
+        Ok(Some(capture.local_artifact_id))
     }
 
     pub(in crate::service) fn record_suspend_snapshot_publication_failure_after_staging(
@@ -579,6 +599,30 @@ impl SandboxManagerService {
             // Keyed off the sandbox's immutable volume_encryption flag; `None` for
             // plaintext sandboxes — the plaintext producer below is then
             // byte-identical to before. A failure here is fail-closed.
+            // An encrypted capture's sidecar metadata depends only on the row,
+            // so build it while a failure can still roll back to paused.
+            let encrypted_capture_metadata = if sandbox.volume_encryption {
+                match suspend_artifact_metadata(
+                    &sandbox,
+                    published_format,
+                    local_artifact_id,
+                    true,
+                    None,
+                ) {
+                    Ok(metadata) => Some(metadata),
+                    Err(status) => {
+                        let reason =
+                            format!("local artifact metadata construction failed: {status}");
+                        self.record_suspend_snapshot_publication_failure_after_begin(
+                            &sandbox.id,
+                            &reason,
+                        );
+                        return Err(status);
+                    }
+                }
+            } else {
+                None
+            };
             let enc_snapshot = if sandbox.volume_encryption {
                 // A restored VM's encrypted memory file is the base into which
                 // Firecracker 1.15 writes the next Diff snapshot. Never format
@@ -701,36 +745,23 @@ impl SandboxManagerService {
             // carried to durable storage as opaque blobs; reflink keeps the copy
             // instant and sparse. The plaintext rootfs codec branch below is skipped
             // for encrypted snapshots (there is no plaintext `rootfs.ext4` to diff).
-            if encrypted {
+            if let Some(metadata) = &encrypted_capture_metadata {
                 // The runtime is gone, so this capture now exists only in the
-                // volume. Record it in the staging directory before sealing:
-                // a failed seal then leaves a capture recovery can still seal
-                // and publish, instead of a row with nothing to publish.
-                let metadata = match suspend_artifact_metadata(
-                    &sandbox,
-                    published_format,
-                    local_artifact_id,
-                    true,
-                    None,
-                ) {
-                    Ok(metadata) => metadata,
-                    Err(status) => {
-                        let reason =
-                            format!("local artifact metadata construction failed: {status}");
-                        self.record_suspend_snapshot_publication_failure_after_begin(
-                            &sandbox.id,
-                            &reason,
-                        );
-                        return Err(status);
-                    }
-                };
-                if let Err(error) = write_encrypted_capture_record(&staging_dir, &metadata) {
-                    let reason = format!("record encrypted capture failed: {error}");
-                    self.record_suspend_snapshot_publication_failure_after_begin(&sandbox.id, &reason);
-                    record_artifact_stage_failure(&reason);
-                    return Err(Status::internal(reason));
+                // volume. Record it before sealing, so a failed seal leaves a
+                // capture recovery can still seal and publish. Only a failed
+                // seal needs the record: if writing it fails, still seal, which
+                // also releases the volume.
+                if let Err(error) = write_encrypted_capture_record(&staging_dir, metadata) {
+                    tracing::warn!(
+                        sandbox_id = %sandbox.id,
+                        %error,
+                        "cannot record encrypted capture; a failed seal will not be recoverable"
+                    );
                 }
-                if let Err(error) = self.seal_encrypted_capture(&sandbox, &staging_dir).await {
+                if let Err(error) = self
+                    .seal_encrypted_capture(&sandbox, &staging_dir, metadata)
+                    .await
+                {
                     let reason = format!("seal/stage encrypted snapshot volume failed: {error}");
                     if self.record_suspend_snapshot_publication_failure_after_staging(
                         &sandbox.id,
@@ -742,7 +773,25 @@ impl SandboxManagerService {
                     {
                         staging_guard.disarm();
                     }
-                    record_artifact_stage_failure(&reason);
+                    if matches!(error, EncryptedCaptureSealError::Metadata(_)) {
+                        pplx_space_metrics::snapshot::create_failed(
+                            create_kind,
+                            create_codec,
+                            sandbox.volume_encryption,
+                            "publish",
+                            "metadata_failed",
+                            create_started_at,
+                        );
+                        emit_suspend_failed_event(
+                            &sandbox.id,
+                            &suspend_event_details,
+                            "publish",
+                            "metadata_failed",
+                            reason.clone(),
+                        );
+                    } else {
+                        record_artifact_stage_failure(&reason);
+                    }
                     return Err(Status::internal(reason));
                 }
             }

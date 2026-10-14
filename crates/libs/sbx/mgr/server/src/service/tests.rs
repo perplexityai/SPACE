@@ -14642,6 +14642,35 @@ pub(crate) mod service_tests {
     }
 
     #[tokio::test]
+    async fn live_publish_failure_with_an_unconfirmed_retained_source_stays_suspending() {
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        insert_suspending_resuspend(&conn, &id);
+        let cache = tempfile::tempdir().unwrap();
+        let sandbox_dir = cache.path().join(&id);
+        let artifact_id = LocalArtifactId::new();
+        let staging = suspend_snapshot_staging_dir(&sandbox_dir, artifact_id);
+        let _bundle =
+            write_deferred_suspend_artifact(&staging, &id, artifact_id, uuid::Uuid::now_v7(), 64);
+        let service = service_with_runtime_liveness(conn, false);
+
+        // No node-manager answer yet: periodic recovery owns the retry.
+        let disposition = service.record_suspend_snapshot_publication_failure_after_staging(
+            &id,
+            &sandbox_dir,
+            &staging,
+            "publish failed",
+            &Default::default(),
+        );
+
+        assert_eq!(disposition, SuspendSnapshotStagingDisposition::Preserve);
+        let row = service.lookup_sandbox(&id).unwrap();
+        assert_eq!(row.state, SandboxState::Suspending);
+        assert!(row.failure_reason.is_none());
+        assert!(staging.exists());
+    }
+
+    #[tokio::test]
     async fn periodic_suspend_recovery_follows_node_manager_for_a_deferred_capture() {
         use crate::retained_source::{FakeInspector, RetainedSourceCheck};
         for (answer, expected_state) in [
