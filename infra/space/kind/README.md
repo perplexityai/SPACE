@@ -682,10 +682,11 @@ answers a missing bind-mount source by creating an empty directory, so an
 unstaged vendor tree used to reach the workers as an empty `/space/vendor`
 and fail on the first sandbox with a healthy-looking cluster.
 
-| Knob | Default | What mounts it |
+| Knob | Default | What uses it |
 | -- | -- | -- |
-| `SPACE_VENDOR_ROOT` | `~/.space-devbox/space/vendor` | `/space/vendor` on the sandbox and builder nodes |
-| `SPACE_KIND_DATA_ROOT` | `~/.kind-data` | `/var/lib/containerd` on every node |
+| `SPACE_VENDOR_ROOT` | `~/.space-devbox/space/vendor` | mounted at `/space/vendor` on the sandbox and builder nodes |
+| `SPACE_KIND_DATA_ROOT` | `~/.kind-data` | mounted at `/var/lib/containerd` on every node |
+| `SPACE_KIND_PRUNE_SUPERSEDED_IMAGES` | on | `0` keeps every superseded build of SPACE's own images in the `SPACE_KIND_DATA_ROOT` stores; see [Diagnosing iteration disk pressure](#diagnosing-iteration-disk-pressure) |
 | `SPACE_KIND_CONFIG` | `~/.space-devbox/kind/kind-cluster.yaml` | the rendered config itself |
 
 That path is where a completed render is *published*, not the file any given
@@ -776,15 +777,50 @@ template-release tags that resolve `seed:latest`.
 
 ### Diagnosing iteration disk pressure
 
-Tilt repeatedly loads large images into each Kind node's containerd store. A
-full node may report image extraction or build failures while the host root
-filesystem still has space. Inspect and reclaim only unreferenced node images:
+Every build loads its images into each Kind node's containerd store, which
+lives under `$SPACE_KIND_DATA_ROOT` and survives `kind delete cluster`. A
+rebuilt `:local` image leaves its previous build behind untagged, and every
+Tilt build adds another `:tilt-<hash>` tag, so unpruned stores keep every
+image of every build on all six nodes. A full store reports image extraction
+or build failures while the host root filesystem may still have space.
+
+Both bring-up paths therefore remove superseded builds themselves:
+`bootstrap.sh` at the end of a successful bring-up, and the Tilt resource
+`prune-superseded-images` whenever an update has settled.
+`scripts/prune-superseded-images.py` removes an image from a node only when
+all of these hold:
+
+- It is one of the images in `lib/space-images.sh`, which the harness builds
+  locally and Kind cannot pull: each of its tags names one of them or, once
+  untagged, its `org.opencontainers.image.title` label does.
+- Nothing current names it. Current means the `:local` tags `build-images.sh`
+  loads, every image a workload in the cluster references (the rendered charts
+  as applied, including Jobs whose pods have finished), and the images the Tilt
+  serving the cluster last built.
+- No container on that node uses it, running or exited.
+
+It stands down while that Tilt has an update pending or in progress, because a
+build it just loaded is not deployed yet, and removes nothing when it cannot
+read the cluster. It prints nothing when nothing is superseded; otherwise it
+logs each image it removes and the space that freed on each node.
+Third-party images, and images of repositories the harness no longer builds,
+are never touched. `--dry-run` lists what it would remove;
+`SPACE_KIND_PRUNE_SUPERSEDED_IMAGES=0` turns it off on both paths.
+
+Do not run `crictl rmi --prune` in a node instead. It removes every image no
+container is using at that moment, which includes SPACE images Kind cannot pull
+back: the seed publisher between publishes, or the worker image while a builder
+or debug pod on that node is restarting. The next pod that needs one fails with
+`ImagePullBackOff` until the image is rebuilt and loaded.
+
+Before it creates anything, `bootstrap.sh` warns, without refusing, when the
+Docker data root or `$SPACE_KIND_DATA_ROOT` has less than
+`SPACE_KIND_MIN_FREE_GIB` (default 30) GiB free, and names the cleanups that
+cannot remove anything a bring-up needs. To inspect a node:
 
 ```bash
-docker exec space-local-worker df -h /
-for node in $(kind get nodes --name space-local); do
-  docker exec "$node" crictl rmi --prune
-done
+docker exec space-local-worker df -h /var/lib/containerd
+python3 infra/space/kind/scripts/prune-superseded-images.py --dry-run
 ```
 
 The BuildKit cache is host-global and shared by other worktrees. Do not run

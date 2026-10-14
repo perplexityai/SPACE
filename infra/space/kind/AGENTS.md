@@ -101,9 +101,11 @@ or suites.
 ## Operational boundary
 
 Use teardown only for a task-owned cluster. Deleting `.kind-data` invalidates
-cluster state; delete the Kind cluster first. `crictl rmi --prune` inside a Kind
-node removes unreferenced images from that node, but `docker builder prune` is
-host-global and requires explicit approval with its shared-cache impact stated.
+cluster state; delete the Kind cluster first. Both bring-up paths prune
+superseded SPACE builds from the node stores (`scripts/prune-superseded-images.py`);
+do not run `crictl rmi --prune` inside a node, which also removes SPACE images
+Kind cannot pull back. `docker builder prune` is host-global and requires
+explicit approval with its shared-cache impact stated.
 
 If migration startup reports an applied version absent from the binary, use the
 recovery procedure in `infra/space/kind/README.md`; it destroys the task-owned

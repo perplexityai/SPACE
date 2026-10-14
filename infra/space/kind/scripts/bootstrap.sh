@@ -35,6 +35,11 @@
 #                            Collectors. datadog uses the native exporters; off
 #                            disables metrics and traces. Metrics sinks are
 #                            exclusive; logs stay on stdout in every mode.
+#   SPACE_KIND_PRUNE_SUPERSEDED_IMAGES=0 keep superseded builds of SPACE's
+#                            images in the node stores (default: removed once
+#                            the stack is up; see prune-superseded-images.py)
+#   SPACE_KIND_MIN_FREE_GIB  warn before bring-up when the Docker data root or
+#                            SPACE_KIND_DATA_ROOT has less free (default: 30)
 #
 # Host-path knobs, shared with the rendered cluster config and documented in
 # infra/space/kind/scripts/lib/kind-host-paths.sh:
@@ -166,6 +171,11 @@ kind_prepare_host_mounts
 # the renderer and as render-cluster-config.sh.
 cp -f "$SPACE_KIND_CONFIG" "$kind_config_staged"
 mv -f "$kind_config_staged" "$kind_config_published"
+
+# ── Step 0d: disk headroom ───────────────────────────────────────────────────
+# Warns, never refuses: a bring-up that runs either disk out fails as an image
+# extraction or build error far from the cause. Names the safe cleanups.
+SPACE_KIND_CLUSTER="$KIND_CLUSTER" bash "$KIND_DIR/scripts/check-disk-headroom.sh"
 
 # ── Step 1: kind cluster ────────────────────────────────────────────────────
 if kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER"; then
@@ -588,6 +598,16 @@ for ((i = 1; i <= 60; i++)); do
   sleep 1
 done
 (( entry_ready )) || { log "ERROR: the API did not answer on localhost:8080 (its entry NodePort)"; exit 1; }
+
+# ── Step 10: prune superseded SPACE images ───────────────────────────────────
+# Each bring-up loads new builds into every node's containerd store under
+# $SPACE_KIND_DATA_ROOT, which outlives the cluster, and a moved `:local` tag
+# leaves the previous build behind. Remove the builds of SPACE's own images that
+# nothing deployed, loaded or running still names; third-party images and
+# anything a container uses stay. Quiet when there is nothing to remove, and
+# never fails the bring-up that already succeeded.
+python3 "$KIND_DIR/scripts/prune-superseded-images.py" --cluster "$KIND_CLUSTER" \
+  || log "WARNING: the superseded-image prune did not finish; the stack is up, and the next bring-up retries it"
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 cat <<MSG

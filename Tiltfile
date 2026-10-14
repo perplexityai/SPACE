@@ -685,3 +685,23 @@ k8s_resource(
     labels = ["bootstrap"],
     resource_deps = ["space-internal-api", "space-object-store-bucket-init"],
 )
+
+# ── Superseded image prune ───────────────────────────────────────────────────
+#
+# Every build Tilt loads adds a `:tilt-<hash>` tag to each node's containerd
+# store under $SPACE_KIND_DATA_ROOT, which outlives the cluster. Whenever Tilt
+# has nothing pending or in progress and what the cluster deploys has changed,
+# this removes the builds of SPACE's own images that nothing deployed, built or
+# running still names; third-party images are never touched. The rule and its
+# safety are in prune-superseded-images.py and the Kind README.
+# SPACE_KIND_PRUNE_SUPERSEDED_IMAGES=0 leaves the resource out.
+if os.getenv("SPACE_KIND_PRUNE_SUPERSEDED_IMAGES", "1") != "0":
+    local_resource(
+        "prune-superseded-images",
+        serve_cmd = ["python3", "infra/space/kind/scripts/prune-superseded-images.py",
+                     "--cluster", KIND_CLUSTER, "--watch", "30",
+                     "--tilt-resource", "prune-superseded-images"],
+        deps = ["infra/space/kind/scripts/prune-superseded-images.py",
+                "infra/space/kind/lib/space-images.sh"],
+        labels = ["bootstrap"],
+    )

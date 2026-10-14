@@ -131,15 +131,11 @@ build_space_ui() {
   kind_load space-ui:local
 }
 
-ALL_IMAGES=(
-  space-api
-  space-data-plane
-  space-cluster-controller
-  space-worker
-  space-seed-publish
-  space-ui
-  space-kind-key-broker
-)
+# One list with the superseded-image prune (lib/space-images.sh), so every
+# image built here also has its old builds removed from the nodes.
+# shellcheck source=../lib/space-images.sh
+. "$REPO_ROOT/infra/space/kind/lib/space-images.sh"
+ALL_IMAGES=("${SPACE_KIND_LOCAL_IMAGES[@]}")
 
 dispatch() {
   case $1 in
