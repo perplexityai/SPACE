@@ -295,6 +295,7 @@ type task struct {
 	generationTeardown  bool   // final durable-teardown policy captured from the pod contract
 	sandboxDetached     bool   // sbx-manager released this execution; teardown never polls it again
 	legacyStopIssued    bool   // this task initiated the stop preceding legacy deletion
+	releasedAfterExit   bool   // release proof arrived after the VM exited; Kill re-announces the exit
 	containerID         string // OCI container type
 	pid                 int
 	podIP               string
@@ -1339,11 +1340,19 @@ func (s *spaceTaskService) Kill(ctx context.Context, r *taskAPI.KillRequest) (_ 
 	// and its retries arrive here first, so a stopped generation task still
 	// waits for the release. Legacy and released tasks have nothing to wait for.
 	if t.status == tasktypes.Status_STOPPED && !(needsTeardown && t.generationTeardown) {
+		// Until Delete removes the task, containerd has not finished handling
+		// its exit, and an earlier announcement may have been lost.
+		var exit *eventstypes.TaskExit
+		if t.releasedAfterExit {
+			exit = t.exitEvent()
+		}
 		s.mu.Unlock()
+		if exit != nil {
+			s.publishReleasedExit(ctx, exit)
+		}
 		return &ptypes.Empty{}, nil
 	}
-	exitedBeforeKill := t.status == tasktypes.Status_STOPPED
-	if exitedBeforeKill {
+	if t.status == tasktypes.Status_STOPPED {
 		logShim("Kill: task %s stopped before sbx-manager released it; waiting for release", r.ID)
 	}
 	sandboxID := t.sandboxID
@@ -1369,15 +1378,11 @@ func (s *spaceTaskService) Kill(ctx context.Context, r *taskAPI.KillRequest) (_ 
 	var exit *eventstypes.TaskExit
 	_, err := s.mutateTaskAfterTeardownRelease(ctx, "kill", r.ID, t, needsTeardown, func(current *task) {
 		if current.status == tasktypes.Status_STOPPED {
-			if exitedBeforeKill {
-				exit = &eventstypes.TaskExit{
-					ContainerID: r.ID,
-					ID:          r.ID,
-					Pid:         uint32(current.pid),
-					ExitStatus:  current.exitCode,
-					ExitedAt:    timestamppb.New(current.exitedAt),
-				}
-			}
+			// Overlapping Kills of one exited task each reach this point and
+			// each announce the exit; containerd handles a repeated exit of a
+			// sandbox it has already handled as a no-op.
+			current.releasedAfterExit = true
+			exit = current.exitEvent()
 			return
 		}
 		current.status = tasktypes.Status_STOPPED
@@ -1395,11 +1400,22 @@ func (s *spaceTaskService) Kill(ctx context.Context, r *taskAPI.KillRequest) (_ 
 	return &ptypes.Empty{}, nil
 }
 
+func (t *task) exitEvent() *eventstypes.TaskExit {
+	return &eventstypes.TaskExit{
+		ContainerID: t.id,
+		ID:          t.id,
+		Pid:         uint32(t.pid),
+		ExitStatus:  t.exitCode,
+		ExitedAt:    timestamppb.New(t.exitedAt),
+	}
+}
+
 // publishReleasedExit re-announces the exit of a task whose release proof
 // arrived after containerd's exit handling gave up. containerd v2.1's pod
 // sandbox controller drops its own retry of that handling, so the sandbox
 // stays ready and StopPodSandbox waits on it while it retries this Kill. The
-// event drives that handling again; its Delete no longer polls.
+// event drives that handling again; its Delete no longer polls. A send that
+// fails, or handling that fails, is retried by the next Kill.
 func (s *spaceTaskService) publishReleasedExit(ctx context.Context, exit *eventstypes.TaskExit) {
 	if s.publisher == nil {
 		return

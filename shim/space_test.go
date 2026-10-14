@@ -1674,9 +1674,12 @@ func TestKillOfExitedTaskWaitsForTeardownRelease(t *testing.T) {
 			t.Fatalf("published exit = %+v, want the sandbox task's exit", publisher.events[0])
 		}
 
-		// containerd retries Kill and then Delete; neither polls a released task.
+		// Until Delete, each later Kill re-announces the exit without polling.
 		if _, err := scenario.service.Kill(context.Background(), &taskAPI.KillRequest{ID: "task"}); err != nil {
 			t.Fatalf("second Kill() error = %v", err)
+		}
+		if len(scenario.client.teardownRequests) != 2 || len(publisher.events) != 2 {
+			t.Fatalf("second Kill: %d requests, %d events; want 2 and 2", len(scenario.client.teardownRequests), len(publisher.events))
 		}
 		if _, err := scenario.service.Delete(context.Background(), &taskAPI.DeleteRequest{ID: "task"}); err != nil {
 			t.Fatalf("Delete() error = %v", err)
@@ -1684,8 +1687,68 @@ func TestKillOfExitedTaskWaitsForTeardownRelease(t *testing.T) {
 		if _, exists := scenario.service.tasks["task"]; exists {
 			t.Fatal("Delete() left the released task in the task map")
 		}
-		if len(scenario.client.teardownRequests) != 2 || len(publisher.events) != 1 {
-			t.Fatalf("released task polled or published again: %d requests, %d events", len(scenario.client.teardownRequests), len(publisher.events))
+		// containerd's handling has succeeded once Delete removed the task.
+		if _, err := scenario.service.Kill(context.Background(), &taskAPI.KillRequest{ID: "task"}); err != nil {
+			t.Fatalf("Kill() after Delete error = %v", err)
+		}
+		if len(scenario.client.teardownRequests) != 2 || len(publisher.events) != 2 {
+			t.Fatalf("deleted task polled or published: %d requests, %d events", len(scenario.client.teardownRequests), len(publisher.events))
+		}
+	})
+
+	t.Run("failed announcement is retried by the next Kill", func(t *testing.T) {
+		publisher := &fakePublisher{failures: 1}
+		scenario := newTeardownScenario(t, func(scenario *teardownScenario) {
+			scenario.task.status = tasktypes.Status_STOPPED
+			scenario.client.teardownResults = []teardownSuspendResult{durable}
+		})
+		scenario.service.publisher = publisher
+
+		for attempt := 1; attempt <= 2; attempt++ {
+			if _, err := scenario.service.Kill(context.Background(), &taskAPI.KillRequest{ID: "task"}); err != nil {
+				t.Fatalf("Kill() attempt %d error = %v", attempt, err)
+			}
+		}
+		if publisher.attempts != 2 || len(publisher.events) != 1 {
+			t.Fatalf("publish attempts = %d, delivered = %d; want a retry after the failed send", publisher.attempts, len(publisher.events))
+		}
+		if len(scenario.client.teardownRequests) != 1 {
+			t.Fatalf("retry polled sbx-manager again: %d requests", len(scenario.client.teardownRequests))
+		}
+	})
+
+	t.Run("overlapping Kills each announce the exit", func(t *testing.T) {
+		publisher := &fakePublisher{}
+		firstPoll := make(chan struct{})
+		releaseFirstPoll := make(chan struct{})
+		scenario := newTeardownScenario(t, func(scenario *teardownScenario) {
+			scenario.task.status = tasktypes.Status_STOPPED
+			scenario.client.teardownResults = []teardownSuspendResult{durable}
+			scenario.client.onTeardownCall = func() {
+				close(firstPoll)
+				<-releaseFirstPoll
+			}
+		})
+		scenario.service.publisher = publisher
+
+		errs := make(chan error, 2)
+		kill := func() {
+			_, err := scenario.service.Kill(context.Background(), &taskAPI.KillRequest{ID: "task"})
+			errs <- err
+		}
+		go kill()
+		<-firstPoll
+		// The second Kill either waits behind the first or arrives after the
+		// release; both paths announce, so the count holds for either order.
+		go kill()
+		close(releaseFirstPoll)
+		for range 2 {
+			if err := <-errs; err != nil {
+				t.Fatalf("Kill() error = %v", err)
+			}
+		}
+		if len(publisher.events) != 2 || len(scenario.client.teardownRequests) != 1 {
+			t.Fatalf("overlapping Kills: %d events, %d polls; want 2 and 1", len(publisher.events), len(scenario.client.teardownRequests))
 		}
 	})
 
@@ -1699,7 +1762,11 @@ func TestKillOfExitedTaskWaitsForTeardownRelease(t *testing.T) {
 		if _, err := scenario.service.Kill(context.Background(), &taskAPI.KillRequest{ID: "task"}); err != nil {
 			t.Fatalf("Kill() error = %v", err)
 		}
-		// containerd observes this stop through Wait and handles it itself.
+		// containerd observes this stop through Wait and handles it itself,
+		// so a later Kill of the stopped task has no exit to re-announce.
+		if _, err := scenario.service.Kill(context.Background(), &taskAPI.KillRequest{ID: "task"}); err != nil {
+			t.Fatalf("second Kill() error = %v", err)
+		}
 		if len(publisher.events) != 0 {
 			t.Fatalf("Kill() of a running task published %v", publisher.events)
 		}
@@ -2349,11 +2416,20 @@ func newTeardownScenario(t *testing.T, configure ...func(*teardownScenario)) *te
 }
 
 type fakePublisher struct {
-	topics []string
-	events []events.Event
+	mu       sync.Mutex
+	failures int // fail this many sends before delivering
+	attempts int
+	topics   []string
+	events   []events.Event
 }
 
 func (f *fakePublisher) Publish(_ context.Context, topic string, event events.Event) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.attempts++
+	if f.attempts <= f.failures {
+		return errors.New("events service unavailable")
+	}
 	f.topics = append(f.topics, topic)
 	f.events = append(f.events, event)
 	return nil
