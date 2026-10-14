@@ -354,8 +354,14 @@ impl NodeManagerService {
             // Not resolved here: staging below is part of the same RPC, so the
             // metric settles once the whole release-and-stage has either
             // finished or failed.
-            if let Err(e) =
-                encrypted_volume::release(&operation_sandbox_id, &volume_name, &mount_dir).await
+            let backing_path = volume_backing_path(&operation_sandbox_id, &volume_name);
+            if let Err(e) = encrypted_volume::release(
+                &operation_sandbox_id,
+                &volume_name,
+                &backing_path,
+                &mount_dir,
+            )
+            .await
             {
                 metric.failed(dmcrypt_error_phase(&e));
                 return Err(dmcrypt_error_to_status(e));

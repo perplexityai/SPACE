@@ -547,7 +547,8 @@ async fn force_free_mapper(mapper: &str) {
         Err(_) => None,
     };
     let leak = format!(
-        "{mapper}-leak-{}",
+        "{}{}",
+        leaked_mapper_prefix(mapper),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |t| t.as_secs())
@@ -563,6 +564,124 @@ async fn force_free_mapper(mapper: &str) {
     if let Some(loop_dev) = loop_dev {
         let _ = ReleaseDevice::Loop(&loop_dev).run().await;
     }
+}
+
+fn leaked_mapper_prefix(mapper: &str) -> String {
+    format!("{mapper}-leak-")
+}
+
+/// Names in `dmsetup ls` output that [`force_free_mapper`] renamed away from
+/// `mapper`: the prefix followed by its numeric stamp only, so another volume
+/// whose own name extends this one is never mistaken for a leak. Pure for
+/// testing.
+fn leaked_mappers(listing: &str, mapper: &str) -> Vec<String> {
+    let prefix = leaked_mapper_prefix(mapper);
+    listing
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|name| {
+            name.strip_prefix(&prefix)
+                .is_some_and(|stamp| !stamp.is_empty() && stamp.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+/// What a leaked mapping can still do to the volume's backing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeakBacking {
+    /// Writable and backed by the volume's current backing file.
+    Current,
+    /// Backed by the current backing, but its dm device is read-only, as
+    /// [`release`] leaves a mapping it sealed before force-freeing it.
+    ReadOnly,
+    /// An inode a later prepare replaced or deleted. Debris that
+    /// `reconcile_stale_mapper` force-freed is always this.
+    Orphaned,
+    /// The mapping no longer exists, e.g. its re-armed removal just fired.
+    Removed,
+    /// The probe failed. Never evidence that the backing is safe.
+    Unknown,
+}
+
+/// Leaked mappings that can still change the current backing. Pure for
+/// testing.
+fn leaks_holding_backing(leaks: Vec<(String, LeakBacking)>) -> Vec<String> {
+    leaks
+        .into_iter()
+        .filter(|(_, backing)| matches!(backing, LeakBacking::Current | LeakBacking::Unknown))
+        .map(|(name, _)| name)
+        .collect()
+}
+
+async fn leak_backing(leak: &str, backing: &std::fs::File) -> LeakBacking {
+    let deps = match run("dmsetup", &["deps", "-o", "devname", leak]).await {
+        Ok(deps) => deps,
+        Err(DmCryptError::Command { stderr, .. })
+            if stderr.to_lowercase().contains("does not exist") =>
+        {
+            return LeakBacking::Removed;
+        }
+        Err(_) => return LeakBacking::Unknown,
+    };
+    let (Some(device), Ok(backing)) = (
+        loop_dep(&String::from_utf8_lossy(&deps)),
+        backing.try_clone(),
+    ) else {
+        return LeakBacking::Unknown;
+    };
+    let device = PathBuf::from(device);
+    match device_backing::blocking(move || device_backing::matches_loop(&device, &backing)).await {
+        Ok(false) => return LeakBacking::Orphaned,
+        Ok(true) => {}
+        Err(_) => return LeakBacking::Unknown,
+    }
+    let Ok((major, minor)) = crypt_mapper_numbers(leak).await else {
+        return LeakBacking::Unknown;
+    };
+    match tokio::fs::read_to_string(format!("/sys/dev/block/{major}:{minor}/ro")).await {
+        Ok(ro) if ro.trim() == "1" => LeakBacking::ReadOnly,
+        Ok(_) => LeakBacking::Current,
+        Err(_) => LeakBacking::Unknown,
+    }
+}
+
+/// A force-freed mapping stays open under its leak name until its holder
+/// exits and the deferred remove fires. A later release finds the original
+/// name absent, which is not proof of a seal: a writable leak over the
+/// current backing can still change what staging reads. One that release
+/// sealed read-only, or one over a replaced or deleted inode, cannot.
+async fn confirm_no_writable_leak(mapper: &str, backing_path: &Path) -> Result<(), DmCryptError> {
+    let listing = run("dmsetup", &["ls"]).await?;
+    let leaked = leaked_mappers(&String::from_utf8_lossy(&listing), mapper);
+    if leaked.is_empty() {
+        return Ok(());
+    }
+    let path = backing_path.to_owned();
+    let backing = device_backing::blocking(move || Backing::open(&path, false)).await?;
+    let mut verdicts = Vec::new();
+    for leak in leaked {
+        // A deferred remove that failed when the mapping was force-freed
+        // would leave it forever once its holder exits. Re-arming is
+        // idempotent on a held mapping and removes an idle one.
+        if let Err(error) = run("dmsetup", &["remove", "--deferred", "--noudevsync", &leak]).await {
+            tracing::warn!(%leak, %error, "re-arming leaked encrypted-volume mapping removal failed");
+        }
+        let verdict = match &backing {
+            // Without a current backing a leak can only hold a deleted inode.
+            None => LeakBacking::Orphaned,
+            Some(backing) => leak_backing(&leak, &backing.file).await,
+        };
+        verdicts.push((leak, verdict));
+    }
+    let holding = leaks_holding_backing(verdicts);
+    if holding.is_empty() {
+        return Ok(());
+    }
+    Err(DmCryptError::Command {
+        cmd: format!("confirm {mapper} closed"),
+        stderr: format!("force-freed mapping still writable: {}", holding.join(", ")),
+    })
 }
 
 /// A mapping already holds this volume's name: if it is debris (its backing
@@ -757,7 +876,7 @@ pub async fn prepare(params: PrepareParams<'_>) -> Result<PreparedEncryptedVolum
     match build_volume(&mapper, &backing_path, &mount_dir, size_bytes, dek, fresh).await {
         Ok(()) => Ok(PreparedEncryptedVolume { mount_dir }),
         Err(e) => {
-            let _ = release(&sandbox_id, &volume_name, &mount_dir).await;
+            let _ = release(&sandbox_id, &volume_name, &backing_path, &mount_dir).await;
             Err(e)
         }
     }
@@ -886,7 +1005,7 @@ async fn explain_leaked_mapping(mapper: &str, error: DmCryptError) -> DmCryptErr
     else {
         return error;
     };
-    let prefix = format!("{mapper}-leak-");
+    let prefix = leaked_mapper_prefix(mapper);
     let names = String::from_utf8_lossy(&names);
     let Some(leak) = names
         .lines()
@@ -934,18 +1053,29 @@ async fn mount_mapper(mapper: &str, mount_dir: &Path) -> Result<(), DmCryptError
 /// filesystem's superblock and the dm device were verified read-only
 /// before the mapping was force-freed, and the mapping disappears when the
 /// holder exits. Reopening the same backing fails retryably until then (see
-/// [`explain_leaked_mapping`]).
+/// [`explain_leaked_mapping`]). An earlier release that force-freed a
+/// writable mapping keeps every later one unsealed while that mapping holds
+/// the current backing (see [`confirm_no_writable_leak`]).
 pub async fn release(
     sandbox_id: &SandboxId,
     volume_name: &str,
+    backing_path: &Path,
     mount_dir: &Path,
 ) -> Result<(), DmCryptError> {
-    release_with(sandbox_id, volume_name, mount_dir, &CloseRetry::DEFAULT).await
+    release_with(
+        sandbox_id,
+        volume_name,
+        backing_path,
+        mount_dir,
+        &CloseRetry::DEFAULT,
+    )
+    .await
 }
 
 async fn release_with(
     sandbox_id: &SandboxId,
     volume_name: &str,
+    backing_path: &Path,
     mount_dir: &Path,
     retry: &CloseRetry<'_>,
 ) -> Result<(), DmCryptError> {
@@ -1032,6 +1162,7 @@ async fn release_with(
         // Unknown probe: never claim the mapper closed.
         MapperIdentity::Error(error) => return Err(error),
     }
+    confirm_no_writable_leak(&mapper, backing_path).await?;
     // Positive postcondition before wiping or reporting success: the mount is
     // gone. (Wiping is guarded by the same confirmation, so it can never
     // delete into a live encrypted mount.)

@@ -489,6 +489,7 @@ async fn busy_close_reports_its_holders_and_recovers() {
     release_with(
         &sandbox_id,
         "snapshot",
+        &backing_path,
         &mount_dir,
         &CloseRetry {
             delays: &[std::time::Duration::from_millis(100)],
@@ -563,6 +564,7 @@ async fn busy_close_reports_its_holders_and_recovers() {
     release_with(
         &sandbox_id,
         "snapshot",
+        &backing_path,
         &mount_dir,
         &CloseRetry {
             delays: &[],
@@ -636,6 +638,7 @@ async fn busy_close_reports_its_holders_and_recovers() {
     release_with(
         &sandbox_id,
         "snapshot",
+        &backing_path,
         &mount_dir,
         &CloseRetry {
             delays: &[],
@@ -675,6 +678,7 @@ async fn busy_close_reports_its_holders_and_recovers() {
     release_with(
         &sandbox_id,
         "snapshot",
+        &backing_path,
         &mount_dir,
         &CloseRetry {
             delays: &[],
@@ -683,11 +687,27 @@ async fn busy_close_reports_its_holders_and_recovers() {
     )
     .await
     .expect_err("a writer blocks the read-only seal");
+    // The original name is gone now, but the writer still holds the leaked
+    // mapping over this backing: a retry must not report it sealed.
+    release_with(
+        &sandbox_id,
+        "snapshot",
+        &backing_path,
+        &mount_dir,
+        &CloseRetry {
+            delays: &[],
+            observe: &record,
+        },
+    )
+    .await
+    .expect_err("a writable leak keeps the volume unsealed");
     reports.lock().unwrap().clear();
     drop(writer);
     reopen(|| prepare(params(false))).await;
     assert_eq!(std::fs::read(&memory).unwrap(), b"vmstate");
-    release(&sandbox_id, "snapshot", &mount_dir).await.unwrap();
+    release(&sandbox_id, "snapshot", &backing_path, &mount_dir)
+        .await
+        .unwrap();
     let names = run(
         "dmsetup",
         &["info", "--columns", "--noheadings", "-o", "name"],
@@ -729,4 +749,40 @@ fn superblock_read_only_reads_the_superblock_options_of_the_visible_mount() {
         &line("rw", "rw,rootcontext=x"),
         point
     ));
+}
+
+/// A retried release after a force-free sees the original name absent; the
+/// leak name is what still proves the device open.
+#[test]
+fn leaked_mappers_names_only_this_volumes_force_freed_mappings() {
+    let mapper = mapper_name(&sid(), "snapshot");
+    let listing = format!(
+        "{mapper}-leak-1700000000\t(253:4)\n\
+         {mapper}-other\t(253:5)\n\
+         {mapper}-leak-1700000000-data\t(253:6)\n\
+         sbxroot-{}-cow\t(253:2)\n",
+        sid()
+    );
+    assert_eq!(
+        leaked_mappers(&listing, &mapper),
+        vec![format!("{mapper}-leak-1700000000")]
+    );
+    assert!(leaked_mappers("No devices found\n", &mapper).is_empty());
+}
+
+/// Only a writable leak over the current backing, or one that cannot be
+/// probed, keeps a volume unsealed.
+#[test]
+fn only_writable_leaks_over_the_current_backing_keep_a_volume_unsealed() {
+    let leak = |name: &str, backing| (name.to_owned(), backing);
+    assert_eq!(
+        leaks_holding_backing(vec![
+            leak("sealed", LeakBacking::ReadOnly),
+            leak("debris", LeakBacking::Orphaned),
+            leak("removed", LeakBacking::Removed),
+            leak("held", LeakBacking::Current),
+            leak("unprobed", LeakBacking::Unknown),
+        ]),
+        ["held", "unprobed"]
+    );
 }

@@ -216,7 +216,7 @@ async fn pinned_devices_survive_replacement_and_encrypted_reopen() {
                 b"encrypted snapshot"
             );
         }
-        encrypted_volume::release(&sandbox_id, "test", &mount)
+        encrypted_volume::release(&sandbox_id, "test", &volume_backing, &mount)
             .await
             .unwrap();
     }
