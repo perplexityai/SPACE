@@ -1,26 +1,37 @@
 #!/usr/bin/env bash
 # Regression test for templates/firecracker/kernel/ci.sh against a fake docker:
 # a recorded pass skips the build; a missing one builds, smoke-boots and, only
-# when publishing, records the pass after it; a failing build records nothing;
-# a lookup or write that fails never fails the check; and the builds take the
-# Ubuntu base from the mirror when it has it.
+# when publishing, saves the toolchain cache and records the pass after it; a
+# failing build records nothing; a lookup, export or push that fails or stalls
+# never fails the check; the builder starts from the mirrored BuildKit image,
+# else its source, else Docker's own builder; a build that fails fetching from
+# the mirror or the cache, or stalls importing the cache, runs once more without
+# them; and the input hash covers each file's executable bit.
 set -euo pipefail
 
-SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../templates/firecracker/kernel" && pwd)/ci.sh"
+KERNEL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../templates/firecracker/kernel" && pwd)"
+SCRIPT="${KERNEL_DIR}/ci.sh"
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "${WORK_DIR}"' EXIT
 
 REPOSITORY="registry.example/space-guest-kernel-ci"
 BASE="ubuntu:24.04@sha256:496754492fb28b4d3049432f2ca787449331e23fb14f0dd3fffea86bf5a93eb4"
 MIRROR="ghcr.io/example/mirror@sha256:$(printf 'b%.0s' {1..64})"
+BUILDKIT="moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8"
+BUILDKIT_MIRROR="ghcr.io/example/mirror@sha256:$(printf 'e%.0s' {1..64})"
 
 mkdir -p "${WORK_DIR}/bin"
 cat >"${WORK_DIR}/bin/docker" <<'SH'
 #!/usr/bin/env bash
-# The registry's references are the lines of FAKE_REGISTRY. FAKE_LOOKUP_ERROR
-# makes lookups fail as an unreachable registry does, FAKE_BUILD_FAILS fails
-# the kernel build, and FAKE_PUSH_FAILS fails the marker push.
+# The registry's references are the lines of FAKE_REGISTRY, the builders those
+# of FAKE_BUILDERS ("<name> <image>"). FAKE_LOOKUP_ERROR is the error of every
+# lookup; FAKE_STALL lists the operations that never answer (lookup, export,
+# push, cached-build); FAKE_BAD_BUILDKIT lists BuildKit images that do not
+# start. FAKE_BUILD_FAILS fails the kernel build in its own step,
+# FAKE_FETCH_FAILS fails each build that uses the mirror or the cache, and
+# FAKE_EXPORT_DROPS makes cache exports succeed without writing the tag.
 printf '%s\n' "$*" >>"${FAKE_CALLS}"
+stalls() { [[ " ${FAKE_STALL:-} " == *" $1 "* ]]; }
 # option <name> <args>...: prints the value of --name=value or --name value.
 option() {
     local name="$1"
@@ -33,26 +44,51 @@ option() {
         shift
     done
 }
+external() { [[ " $* " == *" --cache-from="* || " $* " == *" --build-context="* ]]; }
 case "$1 ${2:-} ${3:-}" in
     "login "*) cat >/dev/null ;;
     "buildx imagetools inspect")
         ref="${*: -1}"
-        [ -z "${FAKE_LOOKUP_ERROR:-}" ] || { echo "ERROR: dial tcp: connect: connection refused" >&2; exit 1; }
+        ! stalls lookup || exec sleep 30
+        [ -z "${FAKE_LOOKUP_ERROR:-}" ] || { echo "ERROR: ${FAKE_LOOKUP_ERROR}" >&2; exit 1; }
         grep -qxF "${ref}" "${FAKE_REGISTRY}" || { echo "ERROR: ${ref}: not found" >&2; exit 1; }
         ;;
-    "buildx inspect "*) ;;
+    "buildx inspect --bootstrap")
+        image="$(awk -v name="$4" '$1 == name { print $2 }' "${FAKE_BUILDERS}")"
+        [[ " ${FAKE_BAD_BUILDKIT:-} " != *" ${image} "* ]] || exit 1
+        ;;
+    "buildx inspect "*) grep -q "^$3 " "${FAKE_BUILDERS}" ;;
+    "buildx create "*)
+        image="$(option --driver-opt "$@")"
+        printf '%s %s\n' "$(option --name "$@")" "${image#image=}" >>"${FAKE_BUILDERS}"
+        ;;
+    "buildx rm "*) sed -i "/^$3 /d" "${FAKE_BUILDERS}" ;;
     "buildx build "*)
         [[ " $* " != *" --file - "* ]] || cat >/dev/null
-        output="$(option --output "$@")"
-        if [[ "${output}" == type=registry,name=* ]]; then
-            [ -z "${FAKE_PUSH_FAILS:-}" ] || exit 1
-            name="${output#type=registry,name=}"
-            printf '%s\n' "${name%%,*}" >>"${FAKE_REGISTRY}"
+        cache_to="$(option --cache-to "$@")"
+        if [ -n "${cache_to}" ]; then
+            ! stalls export || exec sleep 30
+            [ -n "${FAKE_EXPORT_DROPS:-}" ] || { ref="${cache_to#*ref=}"; printf '%s\n' "${ref%%,*}" >>"${FAKE_REGISTRY}"; }
         fi
         ;;
+    "push "*)
+        ! stalls push || exec sleep 30
+        [ -z "${FAKE_PUSH_FAILS:-}" ] || exit 1
+        printf '%s\n' "${*: -1}" >>"${FAKE_REGISTRY}"
+        ;;
     "build "*)
+        if external "$@"; then
+            [[ " $* " != *" --cache-from="* ]] || ! stalls cached-build || exec sleep 30
+            if [ -n "${FAKE_FETCH_FAILS:-}" ]; then
+                echo "ERROR: failed to build: failed to solve: failed to copy: httpReadSeeker: failed open: unexpected status code 502 Bad Gateway" >&2
+                exit 1
+            fi
+        fi
         if [[ " $* " == *" --target export "* ]]; then
-            [ -z "${FAKE_BUILD_FAILS:-}" ] || exit 1
+            if [ -n "${FAKE_BUILD_FAILS:-}" ]; then
+                echo 'ERROR: failed to build: failed to solve: process "/bin/sh -c ./build-kernel.sh" did not complete successfully: exit code: 2' >&2
+                exit 1
+            fi
             dest="$(option --output "$@")"
             dir="${dest#type=local,dest=}/vmlinux-6.1.155"
             mkdir -p "${dir}"
@@ -71,7 +107,22 @@ case "$1 ${2:-} ${3:-}" in
 esac
 SH
 chmod +x "${WORK_DIR}/bin/docker"
-printf '%s %s %s\n' "${BASE}" "${MIRROR#*@}" ghcr.io/example/mirror:ubuntu-24.04 >"${WORK_DIR}/list"
+printf '%s %s %s\n%s %s %s\n' \
+    "${BASE}" "${MIRROR#*@}" ghcr.io/example/mirror:ubuntu-24.04 \
+    "${BUILDKIT}" "${BUILDKIT_MIRROR#*@}" ghcr.io/example/mirror:buildkit >"${WORK_DIR}/list"
+
+# A PATH without GNU timeout, as on macOS: every other command it had.
+mkdir -p "${WORK_DIR}/no-timeout"
+IFS=: read -r -a path_dirs <<<"${WORK_DIR}/bin:${PATH}"
+for dir in "${path_dirs[@]}"; do
+    for command in "${dir}"/*; do
+        name="${command##*/}"
+        case "${name}" in timeout | gtimeout) continue ;; esac
+        if [ -x "${command}" ] && [ ! -e "${WORK_DIR}/no-timeout/${name}" ]; then
+            ln -s "${command}" "${WORK_DIR}/no-timeout/${name}"
+        fi
+    done
+done
 
 FAILURES=0
 fail() {
@@ -79,67 +130,133 @@ fail() {
     FAILURES=$((FAILURES + 1))
 }
 
-# run <registry references> <args>...: runs the script, leaving its output in
-# ${WORK_DIR}/out and its docker calls in ${WORK_DIR}/calls.
+# run <registry references> <args>...: runs the script with no builder yet,
+# leaving its output in ${WORK_DIR}/out and its docker calls in
+# ${WORK_DIR}/calls.
 run() {
     local registry="$1"
     shift
     : >"${WORK_DIR}/calls"
+    : >"${WORK_DIR}/builders"
     printf '%s\n' "${registry}" >"${WORK_DIR}/registry"
-    PATH="${WORK_DIR}/bin:${PATH}" FAKE_CALLS="${WORK_DIR}/calls" FAKE_REGISTRY="${WORK_DIR}/registry" \
+    PATH="${TEST_PATH:-${WORK_DIR}/bin:${PATH}}" FAKE_CALLS="${WORK_DIR}/calls" \
+        FAKE_REGISTRY="${WORK_DIR}/registry" FAKE_BUILDERS="${WORK_DIR}/builders" \
         SPACE_GUEST_KERNEL_CI_REPOSITORY="${REPOSITORY}" SPACE_MIRRORED_IMAGES="${WORK_DIR}/list" \
-        SPACE_CI_IMAGE_MIRROR="${SPACE_CI_IMAGE_MIRROR:-}" GITHUB_SHA=0123abcd GHCR_TOKEN=token \
+        SPACE_CI_IMAGE_MIRROR="${SPACE_CI_IMAGE_MIRROR-ghcr}" GITHUB_SHA=0123abcd GHCR_TOKEN=token \
+        SPACE_GUEST_KERNEL_REGISTRY_TIMEOUT_SECONDS=1 SPACE_GUEST_KERNEL_WRITE_TIMEOUT_SECONDS=1 \
+        SPACE_GUEST_KERNEL_BUILD_TIMEOUT_SECONDS=2 \
         bash "${SCRIPT}" "$@" >"${WORK_DIR}/out" 2>&1
 }
 calls() { grep -c -e "$1" "${WORK_DIR}/calls" || true; }
 said() { grep -qF -e "$1" "${WORK_DIR}/out"; }
+recorded() { grep -qxF "${MARKER}" "${WORK_DIR}/registry"; }
 
 hash="$(bash "${SCRIPT}" hash)"
 [[ "${hash}" =~ ^[0-9a-f]{16}$ ]] || fail "the input hash is not 16 hex digits: ${hash}"
 [ "$(KERNEL_VERSION=9.9.9 bash "${SCRIPT}" hash)" = "${hash}" ] || fail "the input hash depends on the environment"
 MARKER="${REPOSITORY}:${hash}"
+CACHES="${REPOSITORY}:toolchain-cache"$'\n'"${REPOSITORY}:smoke-cache"
+MIRRORS="${MIRROR}"$'\n'"${BUILDKIT_MIRROR}"
+
+# A copy of the directory in its own repository, to change a file's mode.
+copy="${WORK_DIR}/repo/templates/firecracker/kernel"
+mkdir -p "${copy}"
+cp -p "${KERNEL_DIR}"/* "${KERNEL_DIR}/.gitignore" "${copy}/"
+git -C "${WORK_DIR}/repo" init --quiet
+copy_hash="$(bash "${copy}/ci.sh" hash)"
+chmod -x "${copy}/build-kernel.sh"
+[ "$(bash "${copy}/ci.sh" hash)" != "${copy_hash}" ] || fail "the input hash ignores a lost executable bit"
 
 run "${MARKER}" publish || fail "a recorded pass failed the check: $(cat "${WORK_DIR}/out")"
 said "skipping the rebuild" || fail "a recorded pass did not say it skipped the rebuild"
-[ "$(calls ' build ')$(calls '^build ')" = 00 ] || fail "a recorded pass still built"
+[ "$(calls 'build ')$(calls 'buildx create')" = 00 ] || fail "a recorded pass still built or started a builder"
 
-run "" publish || fail "a passing build failed the check: $(cat "${WORK_DIR}/out")"
-said "No passing build of these kernel inputs is recorded as ${MARKER}" || fail "a missing marker was not reported"
-said "::warning::" && fail "a missing marker was reported as a warning"
-[ "$(calls "--cache-to type=registry,ref=${REPOSITORY}:toolchain-cache,")" = 1 ] ||
-    fail "publish did not save the build toolchain cache"
-[ "$(calls "--cache-to type=registry,ref=${REPOSITORY}:smoke-cache,")" = 1 ] ||
-    fail "publish did not save the smoke toolchain cache"
-[ "$(calls "--cache-from=type=registry,ref=${REPOSITORY}:toolchain-cache")" = 4 ] ||
-    fail "not every build read the toolchain cache"
+TEST_PATH="${WORK_DIR}/no-timeout" run "${MARKER}" publish ||
+    fail "a recorded pass without GNU timeout failed: $(cat "${WORK_DIR}/out")"
+said "skipping the rebuild" || fail "without GNU timeout the marker was not found: $(cat "${WORK_DIR}/out")"
+
+run "${MIRRORS}" publish || fail "a passing build failed the check: $(cat "${WORK_DIR}/out")"
+said "No passing build of these kernel inputs is recorded; ${MARKER} does not exist" ||
+    fail "a missing marker was not reported"
+said "::warning::No passing build" && fail "a missing marker was reported as a warning"
+[ "$(calls "buildx create ")" = 1 ] && [ "$(calls "image=${BUILDKIT_MIRROR}")" = 1 ] ||
+    fail "the builder did not start from the mirrored BuildKit image: $(grep 'buildx create' "${WORK_DIR}/calls")"
+[ "$(calls '^build .*--builder=space-guest-kernel')" = 2 ] || fail "the builds did not use the started builder"
+[ "$(calls "^build .*--build-context=${BASE}=docker-image://${MIRROR}")" = 2 ] ||
+    fail "the kernel and smoke builds did not take the Ubuntu base from the mirror"
 [ "$(calls 'KERNEL_VERSION=6.1.155')" = 1 ] || fail "the kernel build did not take the default version"
 [ "$(calls '^build .*--target smoke.* --load')" = 1 ] || fail "the smoke image was not loaded into Docker"
 [ "$(calls '^start ')" = 1 ] || fail "the kernel was not smoke-booted"
-grep -qxF "${MARKER}" "${WORK_DIR}/registry" || fail "a passing build was not recorded"
-[ "$(tail -n 1 "${WORK_DIR}/calls" | grep -c 'type=registry,name=')" = 1 ] ||
+said "Saved the toolchain layers to ${REPOSITORY}:toolchain-cache" || fail "the build toolchain cache was not saved"
+said "Saved the smoke layers to ${REPOSITORY}:smoke-cache" || fail "the smoke toolchain cache was not saved"
+recorded || fail "a passing build was not recorded"
+[ "$(tail -n 1 "${WORK_DIR}/calls")" = "push --quiet ${MARKER}" ] ||
     fail "the pass was not recorded last: $(tail -n 1 "${WORK_DIR}/calls")"
 
-KERNEL_VERSION=9.9.9 CONFIG_FRAGMENT=custom.config run "" check ||
+run "${MIRRORS}"$'\n'"${CACHES}" publish || fail "a cached build failed the check: $(cat "${WORK_DIR}/out")"
+[ "$(calls "^build .*--cache-from=type=registry,ref=${REPOSITORY}:toolchain-cache")" = 2 ] ||
+    fail "the builds did not read the toolchain cache"
+
+FAKE_BAD_BUILDKIT="${BUILDKIT_MIRROR}" run "${MIRRORS}" publish ||
+    fail "a broken mirrored BuildKit image failed the check: $(cat "${WORK_DIR}/out")"
+said "::warning::Could not start the space-guest-kernel builder from ${BUILDKIT_MIRROR}" ||
+    fail "a broken mirrored BuildKit image was not reported"
+[ "$(calls "buildx create .*image=${BUILDKIT}")" = 1 ] || fail "the builder did not fall back to BuildKit's source"
+recorded || fail "a build on the source BuildKit image was not recorded"
+
+FAKE_BAD_BUILDKIT="${BUILDKIT_MIRROR} ${BUILDKIT}" run "${MIRRORS}"$'\n'"${CACHES}" publish ||
+    fail "a BuildKit outage failed the check: $(cat "${WORK_DIR}/out")"
+said "::warning::Building on Docker's own builder" || fail "the fallback to Docker's own builder was not reported"
+[ "$(calls '^build .*--builder=')" = 0 ] || fail "a build used a builder that did not start"
+[ "$(calls '^build .*--cache-from=')" = 2 ] || fail "Docker's own builder did not read the toolchain cache"
+[ "$(calls 'cache-to')" = 0 ] || fail "Docker's own builder tried to export the cache"
+recorded || fail "a build on Docker's own builder was not recorded"
+
+KERNEL_VERSION=9.9.9 CONFIG_FRAGMENT=custom.config run "${MIRRORS}" check ||
     fail "check failed a passing build: $(cat "${WORK_DIR}/out")"
 [ "$(calls 'KERNEL_VERSION=6.1.155')" = 1 ] || fail "check built a kernel profile the hash does not cover"
-[ "$(calls 'cache-to')" = 0 ] || fail "check wrote a cache"
-grep -qxF "${MARKER}" "${WORK_DIR}/registry" && fail "check recorded a pass"
+[ "$(calls 'cache-to')$(calls '^push ')" = 00 ] || fail "check wrote to the registry"
 
-FAKE_BUILD_FAILS=1 run "" publish && fail "a failing build passed the check"
-grep -qxF "${MARKER}" "${WORK_DIR}/registry" && fail "a failing build recorded a pass"
-[ "$(calls '^start ')" = 0 ] || fail "a failing build was smoke-booted"
+FAKE_BUILD_FAILS=1 run "${MIRRORS}"$'\n'"${CACHES}" publish && fail "a failing build passed the check"
+recorded && fail "a failing build recorded a pass"
+[ "$(calls '--target export')" = 1 ] || fail "a failing build step was retried"
+[ "$(calls '^start ')$(calls 'cache-to')" = 00 ] || fail "a failing build was smoke-booted or saved"
 
-FAKE_LOOKUP_ERROR=1 run "" publish || fail "an unreachable registry failed the check: $(cat "${WORK_DIR}/out")"
-said "::warning::Building the guest kernel; could not look up ${MARKER}: ERROR: dial tcp" ||
+FAKE_LOOKUP_ERROR="failed to do request: dial tcp: connect: connection refused" run "" publish ||
+    fail "an unreachable registry failed the check: $(cat "${WORK_DIR}/out")"
+said "::warning::No passing build of these kernel inputs is recorded; could not look up ${MARKER}: ERROR: failed to do request" ||
     fail "an unreachable registry was not reported as a warning"
 [ "$(calls '^start ')" = 1 ] || fail "an unreachable registry did not build and boot the kernel"
 
-FAKE_PUSH_FAILS=1 run "" publish || fail "a failed marker write failed the check: $(cat "${WORK_DIR}/out")"
-said "::warning::Could not record the passing build as ${MARKER}" || fail "a failed marker write was not reported"
+FAKE_LOOKUP_ERROR="docker-credential-ghcr: executable file not found" run "" check ||
+    fail "a broken credential helper failed the check"
+said "::warning::No passing build of these kernel inputs is recorded; could not look up" ||
+    fail "an error that merely says 'not found' was taken for a missing marker"
 
-SPACE_CI_IMAGE_MIRROR=ghcr run "${MIRROR}" check || fail "a mirrored build failed: $(cat "${WORK_DIR}/out")"
-[ "$(calls "--build-context=${BASE}=docker-image://${MIRROR}")" = 2 ] ||
-    fail "the kernel and smoke builds did not take the Ubuntu base from the mirror"
+FAKE_STALL="lookup export push" run "" publish ||
+    fail "a registry that accepts and then stalls failed the check: $(cat "${WORK_DIR}/out")"
+said "::warning::No passing build of these kernel inputs is recorded; ${MARKER} gave no answer within 1 s" ||
+    fail "a stalled lookup was not reported"
+said "::warning::Could not save the toolchain layers" || fail "a stalled cache export was not reported"
+said "::warning::Could not record the passing build as ${MARKER}" || fail "a stalled marker push was not reported"
+said "reached the VFS handoff" || fail "a stalled registry stopped the build"
+
+FAKE_FETCH_FAILS=1 run "${MIRRORS}"$'\n'"${CACHES}" publish ||
+    fail "a broken mirror copy failed the check: $(cat "${WORK_DIR}/out")"
+said "::warning::The build failed or stalled taking layers from the image mirror or the toolchain cache" ||
+    fail "a failed fetch from the mirror was not reported"
+[ "$(calls '--target export')" = 2 ] || fail "a failed fetch from the mirror was not retried once"
+[ "$(grep -e '--target export' "${WORK_DIR}/calls" | tail -n 1 | grep -cE -e '--(cache-from|build-context)=')" = 0 ] ||
+    fail "the retry still used the mirror or the cache"
+recorded || fail "a build retried without the mirror was not recorded"
+
+FAKE_STALL=cached-build run "${MIRRORS}"$'\n'"${CACHES}" publish ||
+    fail "a stalled cache import failed the check: $(cat "${WORK_DIR}/out")"
+[ "$(calls '--target export')" = 2 ] || fail "a stalled cache import was not retried without the cache"
+
+FAKE_EXPORT_DROPS=1 run "${MIRRORS}" publish || fail "a dropped cache export failed the check"
+said "::warning::The toolchain layers were not saved: ${REPOSITORY}:toolchain-cache does not exist after the export" ||
+    fail "a cache export that wrote nothing was not reported"
 
 if [ "${FAILURES}" -ne 0 ]; then
     echo "${FAILURES} guest kernel CI check(s) failed" >&2

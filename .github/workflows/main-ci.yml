@@ -154,8 +154,10 @@ jobs:
   # passing hash as a GHCR marker; main commits that change none of it skip the
   # ~30-minute rebuild and its dependence on snapshot.ubuntu.com. A failing
   # change never records a marker, so it fails every main run until fixed. A
-  # missing or unreachable marker only costs one rebuild, whose toolchain comes
-  # from the registry cache the script keeps.
+  # missing marker costs one rebuild, whose base, toolchain and BuildKit image
+  # come from GHCR (the script's registry cache and the image mirror). When
+  # GHCR is unreachable the rebuild loses those too and takes them from Docker
+  # Hub and snapshot.ubuntu.com, as every rebuild did before.
   #
   # Runs for the same inputs queue instead of overlapping, so the later ones
   # find the earlier one's marker. queue: max keeps every pending run; the
