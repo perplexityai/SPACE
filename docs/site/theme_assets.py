@@ -11,7 +11,6 @@ ASSETS = (
     "InterVariable.woff2",
     "InterVariable-Italic.woff2",
     "LICENSE-Inter.txt",
-    "NOTICE.txt",
     "assets.json",
 )
 
