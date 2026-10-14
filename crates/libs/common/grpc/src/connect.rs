@@ -110,8 +110,8 @@ where
         let connect_span = ConnectSpan::start(
             service_name,
             "Connect",
-            "uds",
-            socket_path.display().to_string(),
+            Some("uds"),
+            Some(socket_path.display().to_string()),
             retry_index,
         );
         let remaining = retry_policy
@@ -348,8 +348,8 @@ where
         let connect_span = ConnectSpan::start(
             service_name,
             "Connect",
-            "tcp",
-            target.to_owned(),
+            Some("tcp"),
+            Some(target.to_owned()),
             retry_index,
         );
         let outcome = tokio::time::timeout(attempt_cap, attempt().instrument(connect_span.span()))
@@ -497,21 +497,21 @@ impl tower::Service<http::Uri> for RetryingTcpConnector {
 /// dial, with no traced span current, records nothing when it connects, so a
 /// reconnecting loop does not open a root trace per dial; when it fails, a
 /// root span records the error.
-struct ConnectSpan {
+pub(crate) struct ConnectSpan {
     service_name: &'static str,
     command: &'static str,
-    transport: &'static str,
-    target: String,
+    transport: Option<&'static str>,
+    target: Option<String>,
     retry_index: usize,
     span: tracing::Span,
 }
 
 impl ConnectSpan {
-    fn start(
+    pub(crate) fn start(
         service_name: &'static str,
         command: &'static str,
-        transport: &'static str,
-        target: String,
+        transport: Option<&'static str>,
+        target: Option<String>,
         retry_index: usize,
     ) -> Self {
         let mut connect = Self {
@@ -536,31 +536,42 @@ impl ConnectSpan {
             otel.status_code = tracing::field::Empty,
             otel.status_description = tracing::field::Empty,
             "operation.name" = "grpc.client.connect",
+            rpc.grpc.status_code = tracing::field::Empty,
             peer.service = self.service_name,
             command = self.command,
             transport = self.transport,
-            target = %self.target,
+            target = self.target.as_deref(),
             retry = self.retry_index,
         ))
     }
 
-    fn span(&self) -> tracing::Span {
+    pub(crate) fn span(&self) -> tracing::Span {
         self.span.clone()
     }
 
-    fn record_ok(&self) {
+    pub(crate) fn record_ok(&self) {
         self.span.record("otel.status_code", "OK");
     }
 
-    fn record_error(&self, error: &dyn std::fmt::Display) {
+    pub(crate) fn record_error(&self, error: &dyn std::fmt::Display) {
+        self.failed_span()
+            .record("otel.status_description", error.to_string().as_str());
+    }
+
+    pub(crate) fn record_status(&self, status: &tonic::Status) {
+        let span = self.failed_span();
+        span.record("otel.status_description", status.message());
+        span.record("rpc.grpc.status_code", status.code() as i32);
+    }
+
+    fn failed_span(&self) -> tracing::Span {
         let span = if self.span.is_none() {
             self.open()
         } else {
             self.span.clone()
         };
-        let description = error.to_string();
         span.record("otel.status_code", "ERROR");
-        span.record("otel.status_description", description.as_str());
+        span
     }
 }
 
