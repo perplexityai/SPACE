@@ -14652,7 +14652,7 @@ pub(crate) mod service_tests {
         let staging = suspend_snapshot_staging_dir(&sandbox_dir, artifact_id);
         let _bundle =
             write_deferred_suspend_artifact(&staging, &id, artifact_id, uuid::Uuid::now_v7(), 64);
-        let service = service_with_runtime_liveness(conn, false);
+        let service = service_with_runtime_probe(conn, false);
 
         // No node-manager answer yet: periodic recovery owns the retry.
         let disposition = service.record_suspend_snapshot_publication_failure_after_staging(

@@ -210,8 +210,7 @@ async fn unsealed_encrypted_capture_survives_restart_and_publishes_once_sealed()
     let cache = tempfile::tempdir().unwrap();
     let (capture, staging) =
         record_encrypted_capture(&conn, cache.path(), &id, std::time::Duration::ZERO);
-    let sockets = tempfile::tempdir().unwrap();
-    let service = service_with_node_manager(conn, node_manager.connector(), sockets.path());
+    let service = service_with_node_manager(conn, node_manager.connector());
 
     // The live seal failure, a restart and a refused retry all keep it.
     let disposition = service.record_suspend_snapshot_publication_failure_after_staging(
@@ -280,8 +279,7 @@ async fn expired_encrypted_capture_is_quarantined_without_a_seal_attempt() {
         &id,
         publication::ENCRYPTED_SEAL_RETRY_WINDOW + std::time::Duration::from_secs(60),
     );
-    let sockets = tempfile::tempdir().unwrap();
-    let service = service_with_node_manager(conn, node_manager.connector(), sockets.path());
+    let service = service_with_node_manager(conn, node_manager.connector());
 
     recover_batch(&service, cache.path(), &id).await;
 
@@ -314,8 +312,7 @@ async fn complete_staged_capture_publishes_past_an_older_unsealed_record() {
         newer,
         b"newer",
     );
-    let sockets = tempfile::tempdir().unwrap();
-    let service = service_with_node_manager(conn, node_manager.connector(), sockets.path());
+    let service = service_with_node_manager(conn, node_manager.connector());
 
     recover_batch(&service, cache.path(), &id).await;
 
