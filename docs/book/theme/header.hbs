@@ -1,5 +1,10 @@
 <header class="docs-header">
-    <a class="docs-brand" href="{{ path_to_root }}index.html"><strong>SPACE</strong> Docs</a>
+    <div class="docs-branding">
+        <button class="docs-menu-toggle" type="button" aria-label="Toggle navigation" aria-expanded="false" aria-controls="sidebar" hidden>
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 6h16M4 12h16M4 18h16" fill="none" stroke="currentColor" stroke-width="2"/></svg>
+        </button>
+        <a class="docs-brand" href="{{ path_to_root }}index.html"><strong>SPACE</strong> Docs</a>
+    </div>
     <nav class="docs-sections" aria-label="Documentation sections">
         <a href="{{ path_to_root }}index.html" aria-current="page">Guide</a>
         <a class="docs-api-link" href="{{ path_to_root }}api/index.md">API reference</a>

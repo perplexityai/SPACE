@@ -11,7 +11,7 @@ use-default-preprocessors = false
 [output.html]
 no-section-label = true
 additional-css = ["theme/curiosity.css", "guide.css", "navigation.css"]
-additional-js = ["page-toc.js", "mermaid-init.js"]
+additional-js = ["theme/mobile-menu.js", "page-toc.js", "mermaid-init.js"]
 # Keep the generated 404 page's base URL relative, too.
 site-url = "./"
 

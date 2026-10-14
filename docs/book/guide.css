@@ -88,6 +88,10 @@ main > h1:first-child { margin-top: 0; font-size: 30px; line-height: 1.25; }
 .nav-wrapper { display: block; max-width: var(--content-max-width); }
 .mobile-nav-chapters { color: var(--links); background: transparent; border: 0; }
 
+@media screen and (max-width: 800px) {
+    [data-docs-menu="ready"] #sidebar-toggle { display: none; }
+}
+
 @media screen and (max-width: 620px) {
     :root { --page-padding: 20px; }
     #page-wrapper #menu-bar { padding-inline: 20px; }

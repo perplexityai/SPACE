@@ -25,6 +25,15 @@ Only the active chapter gains smaller H2 links for navigating within the page;
 these share the chapter links' hover background and keyboard focus treatment.
 The sidebar remains scrollable, and mdBook owns its chapter links and controls.
 
+At widths up to 800px, both sections use a hamburger button before the brand
+and right-aligned section links. `mobile-menu.js` connects that button to the
+native navigation toggle, synchronizes its expanded state, and supports keyboard
+focus and Escape. The Guide retains its toolbar toggle on wider screens and
+without JavaScript. The API adapter hides Redoc's floating toggle after binding
+the header button. It checks the pinned Redoc 2.5.4 sidebar/toggle structure and
+leaves the original control available if that structure changes; review the
+adapter when upgrading the renderer.
+
 Both sections load `system-theme.js` before their content. It selects the system
 color preference once per page load and ignores legacy mdBook theme choices.
 There is no theme switcher. When the system preference changes, the shared script

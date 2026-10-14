@@ -9,6 +9,7 @@ import sys
 ASSETS = (
     "curiosity.css",
     "system-theme.js",
+    "mobile-menu.js",
     "InterVariable.woff2",
     "InterVariable-Italic.woff2",
     "LICENSE-Inter.txt",

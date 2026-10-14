@@ -6,10 +6,11 @@
     "archiveSha256": "9883fdd4a49d4fb66bd8177ba6625ef9a64aa45899767dde3d36aa425756b11e"
   },
   "files": {
-    "curiosity.css": "242c1995452c5bf570b43ab8728095783b40fbbc4a56faec0cae782f95203fb1",
+    "curiosity.css": "755253e6e773f93f6a4c60cec646ba59af7295b68e9576284d7f6f12c7c5f7e0",
     "InterVariable.woff2": "693b77d4f32ee9b8bfc995589b5fad5e99adf2832738661f5402f9978429a8e3",
     "InterVariable-Italic.woff2": "e564f652916db6c139570fefb9524a77c4d48f30c92928de9db19b6b5c7a262a",
     "LICENSE-Inter.txt": "262481e844521b326f5ecd053e59b98c8b2da78c8ee1bdbb6e8174305e54935a",
-    "system-theme.js": "58130dabd41f192abc67d7584022f5d1153739cfe98e13ee83923e9854e47ae0"
+    "system-theme.js": "58130dabd41f192abc67d7584022f5d1153739cfe98e13ee83923e9854e47ae0",
+    "mobile-menu.js": "240b581061480d60f213f857e47c4f01dda8ec764bfb01030150f2c5741e4e1c"
   }
 }
