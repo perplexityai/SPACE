@@ -3,10 +3,6 @@
 .chapter .page-toc a { font-size: 0.9em; }
 .docs-build { margin-top: 4rem; font-size: 0.8em; }
 #sidebar a:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
-.section-nav { display: flex; flex-direction: column; gap: .7rem; margin: 0 10px 1.8rem; padding-bottom: 1.4rem; border-bottom: 1px solid var(--table-border-color); }
-.section-nav a { display: block; color: var(--sidebar-fg); font-size: 1.5rem; text-decoration: none; padding-block: .3rem; }
-.section-nav [aria-current] { font-weight: 700; color: var(--sidebar-active); }
-.section-nav a:hover { text-decoration: underline; }
 .mermaid-diagram { margin: 2rem 0; overflow: auto; padding: 1rem; }
 .mermaid-diagram:focus-visible { outline: 2px solid var(--fg); outline-offset: 2px; }
 .mermaid-diagram svg { display: block; margin: auto; min-width: 480px; max-width: 100%; height: auto; }

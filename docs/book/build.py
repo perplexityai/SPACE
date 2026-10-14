@@ -29,13 +29,12 @@ UNPUBLISHED = {
     "runtime-manager-catalog.md": "prototype; artifacts are not selectable yet",
     "snapshot-upload-streaming.md": "implementation notes and measurements",
 }
-ASSETS = ("navigation.css", "page-toc.js", "mermaid-init.js")
+ASSETS = ("guide.css", "navigation.css", "page-toc.js", "mermaid-init.js", "LICENSE-mdBook.txt")
+TEMPLATES = ("header.hbs", "toc.js.hbs")
 LIBRARY_ASSETS = {
     "mermaid.min.js": "target/docs/diagram/mermaid.min.js",
     "MERMAID-LICENSES.txt": "target/docs/diagram/MERMAID-LICENSES.txt",
 }
-# API reference falls back to its pinned source page in a standalone guide.
-SECTION_LINKS = (("SPACE Guide", "index.html"), ("API Reference", "api/index.md"))
 
 
 def chapter_source(chapter):
@@ -71,6 +70,11 @@ def stage_sources(stage):
     for asset, source in LIBRARY_ASSETS.items():
         shutil.copyfile(ROOT / source, stage / asset)
     stage_theme_assets(ROOT, stage / "theme")
+    for name in TEMPLATES:
+        source = ROOT / "docs/book/theme" / name
+        if source.resolve() != source or not source.is_file():
+            raise ValueError(f"Missing or unsafe Guide template: {name}")
+        shutil.copyfile(source, stage / "theme" / name)
     for chapter in CHAPTERS:
         (stage / "src" / chapter).write_text(chapter_markdown(chapter))
 
@@ -125,7 +129,10 @@ class RepositoryLinks(HTMLParser):
         href = dict(attrs).get("href")
         if href is None:
             return
-        target = repository_link(href, self.output, self.commit, self.source_page)
+        # The shared header's destination is relative to docs/, independent
+        # of the canonical source directory of the current chapter.
+        source_page = None if "docs-api-link" in dict(attrs).get("class", "").split() else self.source_page
+        target = repository_link(href, self.output, self.commit, source_page)
         if target == href:
             return
         original = self.get_starttag_text()
@@ -139,22 +146,6 @@ class RepositoryLinks(HTMLParser):
         self.replacements[original] = rewritten
 
 
-def sidebar_links(html, output, commit, iframe=False):
-    target = ' target="_parent"' if iframe else ""
-    links = "".join(
-        '<a href="' + escape(repository_link(href, output, commit), quote=True)
-        + '"' + target + (' aria-current="true"' if label == "SPACE Guide" else "")
-        + ">" + escape(label) + "</a>"
-        for label, href in SECTION_LINKS
-    )
-    # Sibling sections are deliberately outside mdBook's chapter list.
-    marker = '<ol class="chapter">'
-    if html.count(marker) != 1:
-        raise ValueError("Review mdBook sidebar markup for documentation sections")
-    return html.replace(marker, '<nav class="section-nav" aria-label="Documentation sections">'
-                        + links + "</nav>" + marker)
-
-
 def build():
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     commit = git("rev-parse", "HEAD")
@@ -163,22 +154,11 @@ def build():
         stage_sources(stage)
         subprocess.run(["mdbook", "build", str(stage)], check=True)
         rendered = stage / "book"
-        for asset in LIBRARY_ASSETS:
+        for asset in (*LIBRARY_ASSETS, "LICENSE-mdBook.txt"):
             shutil.copyfile(stage / asset, rendered / asset)
         (rendered / "theme").mkdir(exist_ok=True)
         for asset in THEME_ASSETS:
             shutil.copyfile(stage / "theme" / asset, rendered / "theme" / asset)
-        for name in ("toc.html", "toc.js"):
-            page = rendered / name
-            html = sidebar_links(page.read_text(), rendered, commit, name == "toc.html")
-            if name == "toc.js":
-                # mdBook aliases index.html to the first chapter anchor. The
-                # sibling section switcher must not take that first position.
-                selector = 'this.querySelectorAll("a")'
-                if html.count(selector) != 1:
-                    raise ValueError("Review mdBook active-chapter selection after an upgrade")
-                html = html.replace(selector, 'this.querySelectorAll(".chapter a")')
-            page.write_text(html)
         # Rewrite each chapter in its canonical source directory. Apply the
         # same unambiguous link rewrites to mdBook's concatenated print page.
         print_links = {}

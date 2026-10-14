@@ -62,6 +62,11 @@ class GuideTests(unittest.TestCase):
                 shutil.copyfile(source, root / source.relative_to(build.ROOT))
             for name in ("book.toml", "SUMMARY.md", *build.ASSETS):
                 shutil.copyfile(build.ROOT / "docs/book" / name, root / "docs/book" / name)
+            templates = root / "docs/book/theme"
+            templates.mkdir()
+            for name in build.TEMPLATES:
+                shutil.copyfile(build.ROOT / "docs/book/theme" / name, templates / name)
+            (templates / "unapproved.hbs").write_text("DO_NOT_PUBLISH")
             for name in build.LIBRARY_ASSETS.values():
                 source = Path(name)
                 (root / source).parent.mkdir(parents=True, exist_ok=True)
@@ -79,11 +84,25 @@ class GuideTests(unittest.TestCase):
                 {file.relative_to(stage).as_posix() for file in stage.rglob("*") if file.is_file()},
                 {"book.toml", "src/SUMMARY.md", *build.ASSETS, *build.LIBRARY_ASSETS,
                  *(f"theme/{name}" for name in build.THEME_ASSETS),
+                 *(f"theme/{name}" for name in build.TEMPLATES),
                  *(f"src/{name}" for name in build.CHAPTERS)},
             )
             with patch.object(build, "ROOT", root):
                 for name in build.CHAPTERS:
                     self.assertEqual((stage / "src" / name).read_text(), build.chapter_markdown(name))
+                for name in build.TEMPLATES:
+                    source = templates / name
+                    original = source.read_bytes()
+                    for failure in ("missing", "symlink"):
+                        with self.subTest(template=name, failure=failure):
+                            source.unlink()
+                            if failure == "symlink":
+                                source.symlink_to(stage / "theme" / name)
+                            with self.assertRaisesRegex(ValueError, "Missing or unsafe Guide template"):
+                                build.stage_sources(Path(temp) / f"{name}-{failure}")
+                            if failure == "symlink":
+                                source.unlink()
+                            source.write_bytes(original)
             for name in build.THEME_ASSETS:
                 original = (theme / name).read_bytes()
                 with self.subTest(asset=name, failure="missing"):
@@ -174,20 +193,18 @@ class GuideTests(unittest.TestCase):
         )
         self.assertEqual(
             [href for href in self.pages["toc.html"].anchors if not urlsplit(href).scheme],
-            ["index.html", *self.chapters],
+            self.chapters,
         )
         self.assertEqual(
             re.findall(r"^# (.+)$", summary, re.MULTILINE),
             ["Summary"],
         )
         self.assertEqual(self.chapters[0], "introduction.html")
-        for _, href in build.SECTION_LINKS:
-            pinned = build.repository_link(href, self.output, self.commit)
-            self.assertIn(pinned, self.pages["toc.html"].anchors)
-            self.assertIn(pinned, (self.output / "toc.js").read_text())
-        toc = (self.output / "toc.html").read_text()
-        self.assertLess(toc.index('class="section-nav"'), toc.index('<ol class="chapter">'))
-        self.assertNotIn("API Reference", toc.split('<ol class="chapter">', 1)[1])
+        pinned = build.repository_link("api/index.md", self.output, self.commit)
+        for page in (*self.chapters, "index.html", "print.html", "404.html"):
+            self.assertIn("index.html", self.pages[page].anchors)
+            self.assertIn(pinned, self.pages[page].anchors)
+        self.assertNotIn(pinned, self.pages["toc.html"].anchors)
         self.assertEqual(
             (self.output / "index.html").read_bytes(),
             (self.output / self.chapters[0]).read_bytes(),
