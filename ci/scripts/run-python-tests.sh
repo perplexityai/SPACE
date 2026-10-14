@@ -64,7 +64,8 @@ fi
 # committed uv.lock. CI uses --locked, which fails when uv.lock no longer
 # matches pyproject.toml, so a dependency change cannot pass on a stale lock.
 # Local runs use --frozen, the lock as committed, which such a host uv would
-# otherwise refuse.
+# otherwise refuse. The tests' own packages are pyproject.toml's `test` group,
+# so the lock pins them too.
 if [ -n "${CI:-}" ]; then
     uv_lock_mode=--locked
 else
@@ -76,14 +77,7 @@ echo "--- :python: Running every discovered Python test"
     "${uv_lock_mode}" \
     --project "${REPO_ROOT}" \
     --python 3.11 \
-    --with boto3 \
-    --with cel-python \
-    --with pglast==7.10 \
-    --with 'psycopg[binary]' \
-    --with pytest==8.4.2 \
-    --with python-hcl2 \
-    --with pyyaml \
-    --with requests \
+    --group test \
     python -m pytest \
         -c /dev/null \
         -p no:cacheprovider \

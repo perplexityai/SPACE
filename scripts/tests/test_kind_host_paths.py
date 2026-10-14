@@ -12,6 +12,7 @@ assert where the paths land rather than that the harness runs.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import pathlib
 import re
@@ -1632,6 +1633,68 @@ class InstallerAgreementTests(unittest.TestCase):
         )
         self.assertIn("already installed", second.stdout)
         self.assertIn("vmlinux already present", second.stdout)
+
+
+    def serving_curl(self, body: bytes) -> tuple[pathlib.Path, pathlib.Path]:
+        """A `curl` on PATH that records its argv and writes `body` to its -o file."""
+        stub_dir = self.tmp / "curlbin"
+        stub_dir.mkdir(exist_ok=True)
+        (self.tmp / "kernel-body").write_bytes(body)
+        log = self.tmp / "curl.log"
+        stub = stub_dir / "curl"
+        stub.write_text(
+            textwrap.dedent(
+                f"""\
+                #!/usr/bin/env bash
+                printf '%s\\n' "$*" >>{shell_quote(str(log))}
+                while [[ $# -gt 0 ]]; do
+                  if [[ "$1" == -o ]]; then cp {shell_quote(str(self.tmp / "kernel-body"))} "$2"; fi
+                  shift
+                done
+                """
+            )
+        )
+        stub.chmod(0o755)
+        return stub_dir, log
+
+    def download_kernel(self, body: bytes, **overrides: str):
+        """Install with the image providing Firecracker but no kernel, so the kernel downloads."""
+        shutil.rmtree(self.image_vendor / "kernels")
+        stub_dir, log = self.serving_curl(body)
+        env = dict(self.env, **overrides)
+        env["PATH"] = f"{stub_dir}:{env['PATH']}"
+        result = subprocess.run(
+            ["bash", str(INSTALL_FC_VENDOR)],
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        kernel_dir = self.home / f".space-devbox/space/vendor/firecracker/{FC_VERSION}/kernel"
+        return result, log.read_text(), kernel_dir
+
+    def test_the_kernel_is_the_pinned_object_at_its_checksum(self) -> None:
+        body = b"pinned-kernel\n"
+        result, calls, kernel_dir = self.download_kernel(
+            body,
+            SPACE_FC_KERNEL_VERSION="6.1.999",
+            SPACE_FC_KERNEL_SHA256=hashlib.sha256(body).hexdigest(),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # One request, for the pinned key: no bucket listing picks the newest patch.
+        self.assertEqual(len(calls.splitlines()), 1, calls)
+        self.assertIn("https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/x86_64/vmlinux-6.1.999", calls)
+        self.assertIn("--retry", calls)
+        self.assertEqual((kernel_dir / "vmlinux.bin").read_bytes(), body)
+
+    def test_a_kernel_that_fails_its_checksum_is_not_installed(self) -> None:
+        # The default pin, against content that cannot match it.
+        result, _, kernel_dir = self.download_kernel(b"some-other-kernel\n")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not the pinned", result.stderr)
+        self.assertEqual(sorted(path.name for path in kernel_dir.iterdir()), [])
 
 
 class RenderWrapperTests(unittest.TestCase):

@@ -230,9 +230,11 @@ run_squawk() {
     return
   fi
 
+  # Pinned: a squawk release can add default rules, and then fail a migration
+  # that passed the day before.
   local uv_bin
   uv_bin="$(bash "${repo_root}/ci/scripts/ensure-uv.sh")"
-  "${uv_bin}" tool run --from "${SQUAWK_CLI_PACKAGE:-squawk-cli}" squawk \
+  "${uv_bin}" tool run --from "${SQUAWK_CLI_PACKAGE:-squawk-cli==2.69.0}" squawk \
     --pg-version="${pg_version}" \
     --assume-in-transaction \
     "$@"

@@ -8,9 +8,42 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 LOCAL_BIN_DIR="${REPO_ROOT}/ci/bin"
 LOCAL_UV_BIN="${LOCAL_BIN_DIR}/uv"
 
+# The release this script installs, as ci/Dockerfile.ci pins it. Each release
+# archive is checked against its sha256, so neither download host can hand CI
+# another uv. To try another release, set SPACE_UV_VERSION and SPACE_UV_SHA256
+# together.
+UV_VERSION="${SPACE_UV_VERSION:-0.12.18}"
+case "$(uname -s)-$(uname -m)" in
+    Linux-x86_64)
+        uv_target=x86_64-unknown-linux-gnu
+        uv_sha256=89eadd7c76fc063887959510d5ba0ab1264dfd5f1143b925ddb73021a40acf16
+        ;;
+    Linux-aarch64 | Linux-arm64)
+        uv_target=aarch64-unknown-linux-gnu
+        uv_sha256=afb6291f3f0a6b4521fc67b947822506c41dde5b60d2189dd8f3695b2ac8c9e7
+        ;;
+    Darwin-arm64)
+        uv_target=aarch64-apple-darwin
+        uv_sha256=cf40e0c6a202190ccd9e0406dcfdd5b2d6668a9a5c779b17948963df32aafe5b
+        ;;
+    Darwin-x86_64)
+        uv_target=x86_64-apple-darwin
+        uv_sha256=2e4108f5395397c8bc5d43bf83d3bdbb2d0e92b90d0efa607756be704905fa33
+        ;;
+    *)
+        uv_target=""
+        uv_sha256=""
+        ;;
+esac
+if [ -n "${SPACE_UV_VERSION:-}" ]; then
+    uv_sha256="${SPACE_UV_SHA256:-}"
+fi
+
 mkdir -p "${LOCAL_BIN_DIR}"
 
-if [ -x "${LOCAL_UV_BIN}" ]; then
+# ci/bin/uv is this script's own install, used only at the pinned release.
+if [ -x "${LOCAL_UV_BIN}" ] &&
+    [ "$("${LOCAL_UV_BIN}" --version 2>/dev/null | awk '{ print $2 }')" = "${UV_VERSION}" ]; then
     printf '%s\n' "${LOCAL_UV_BIN}"
     exit 0
 fi
@@ -20,51 +53,70 @@ if command -v uv >/dev/null 2>&1; then
     exit 0
 fi
 
+if [ -z "${uv_target}" ]; then
+    echo "Error: no pinned uv release for $(uname -s) $(uname -m); install uv yourself." >&2
+    exit 1
+fi
+if [ -z "${uv_sha256}" ]; then
+    echo "Error: SPACE_UV_VERSION=${UV_VERSION} needs SPACE_UV_SHA256, the sha256 of uv-${uv_target}.tar.gz." >&2
+    exit 1
+fi
 if ! command -v curl >/dev/null 2>&1; then
     echo "Error: curl is required to install uv." >&2
     exit 1
 fi
 
-echo "Installing uv..." >&2
+sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{ print $1 }'
+    else
+        shasum -a 256 "$1" | awk '{ print $1 }'
+    fi
+}
+
+echo "Installing uv ${UV_VERSION} (${uv_target})..." >&2
 tmp_dir="$(mktemp -d)"
-installer="${tmp_dir}/install-uv.sh"
+archive="${tmp_dir}/uv.tar.gz"
 trap 'rm -rf "${tmp_dir}"' EXIT
 
-# The installer's fetch has no retry, and the installer tries each of its
-# download URLs once, so one reset connection can fail the job. Each attempt
-# starts over.
-attempts=3
-delay=5
+# Astral's release mirror first and GitHub's release download second, which
+# is also the order of astral.sh's installer. Each attempt tries both, so an
+# outage of either host does not fail the job; a checksum mismatch is retried
+# like a failed download.
+urls=(
+    "https://releases.astral.sh/github/uv/releases/download/${UV_VERSION}/uv-${uv_target}.tar.gz"
+    "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-${uv_target}.tar.gz"
+)
+attempts="${SPACE_UV_INSTALL_ATTEMPTS:-3}"
+delay="${SPACE_UV_INSTALL_RETRY_DELAY_SECONDS:-5}"
+installed=""
 for ((attempt = 1; ; attempt++)); do
-    if curl -LsSf https://astral.sh/uv/install.sh -o "${installer}" &&
-        env UV_UNMANAGED_INSTALL="${LOCAL_BIN_DIR}" sh "${installer}" >&2; then
-        break
-    fi
+    for url in "${urls[@]}"; do
+        rm -f "${archive}"
+        if ! curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 20 --max-time 300 \
+            "${url}" -o "${archive}"; then
+            echo "Could not download ${url}." >&2
+            continue
+        fi
+        actual="$(sha256 "${archive}")"
+        if [ "${actual}" != "${uv_sha256}" ]; then
+            echo "${url} has sha256 ${actual}, not ${uv_sha256}." >&2
+            continue
+        fi
+        tar -xzf "${archive}" -C "${tmp_dir}"
+        install -m 0755 "${tmp_dir}/uv-${uv_target}/uv" "${tmp_dir}/uv-${uv_target}/uvx" "${LOCAL_BIN_DIR}/"
+        installed=1
+        break 2
+    done
     if ((attempt >= attempts)); then
-        echo "Error: could not install uv after ${attempts} attempts." >&2
-        exit 1
+        break
     fi
     echo "uv install failed (attempt ${attempt}/${attempts}); retrying in ${delay}s." >&2
     sleep "${delay}"
     delay=$((delay * 2))
 done
-
-if [ -x "${LOCAL_UV_BIN}" ]; then
-    printf '%s\n' "${LOCAL_UV_BIN}"
-    exit 0
+if [ -z "${installed}" ]; then
+    echo "Error: could not install uv ${UV_VERSION} after ${attempts} attempts." >&2
+    exit 1
 fi
-
-for candidate in "${HOME}/.local/bin/uv" "${HOME}/.cargo/bin/uv"; do
-    if [ -x "${candidate}" ]; then
-        printf '%s\n' "${candidate}"
-        exit 0
-    fi
-done
-
-if command -v uv >/dev/null 2>&1; then
-    printf '%s\n' "$(command -v uv)"
-    exit 0
-fi
-
-echo "Error: uv is unavailable after installation." >&2
-exit 1
+printf '%s\n' "${LOCAL_UV_BIN}"

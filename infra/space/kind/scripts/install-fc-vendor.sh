@@ -30,8 +30,17 @@ FC_VERSION="${SPACE_FC_VERSION:-v1.15.1}"
 # ships kernel 5.10.x and 6.1.x; pick 6.1 (matches the kernel digest the
 # production seed manifests reference).
 FC_CI_VERSION="${SPACE_FC_CI_VERSION:-v1.15}"
-KERNEL_SERIES="${SPACE_FC_KERNEL_SERIES:-vmlinux-6.1}"
 ARCH="${SPACE_FC_ARCH:-x86_64}"
+# One pinned object and its sha256, rather than the newest 6.1 patch in the
+# bucket listing, so a kernel firecracker-ci publishes cannot change an
+# unchanged bring-up. To upgrade, set SPACE_FC_KERNEL_VERSION and
+# SPACE_FC_KERNEL_SHA256 together (a version alone fails the checksum and
+# prints the sha256 it got); the bucket lists what exists:
+#   curl -fsSL 'https://s3.amazonaws.com/spec.ccfc.min/?list-type=2&prefix=firecracker-ci/v1.15/x86_64/vmlinux-6.1.'
+KERNEL_VERSION="${SPACE_FC_KERNEL_VERSION:-6.1.155}"
+KERNEL_SHA256="${SPACE_FC_KERNEL_SHA256:-e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2}"
+# The devbox image's kernels are matched by series, as before.
+KERNEL_SERIES="${SPACE_FC_KERNEL_SERIES:-vmlinux-${KERNEL_VERSION%.*}}"
 # shellcheck source=lib/kind-host-paths.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/kind-host-paths.sh"
 kind_host_paths__require SPACE_VENDOR_ROOT
@@ -203,19 +212,25 @@ elif [[ -n "$image_kernel" && -f "$image_kernel" ]]; then
   rm -f "$kernel_dir/vmlinux.bin"
   install -m 0644 "$image_kernel" "$kernel_dir/vmlinux.bin"
 else
-  log "discovering latest $KERNEL_SERIES kernel under firecracker-ci/$FC_CI_VERSION/$ARCH"
-  # firecracker-ci publishes kernels as flat files keyed by vmlinux-MAJ.MIN.PATCH.
-  # Pull the bucket listing (XML) and pick the newest patch matching our series.
-  listing=$(curl -fsSL "https://s3.amazonaws.com/spec.ccfc.min/?prefix=firecracker-ci/${FC_CI_VERSION}/${ARCH}/${KERNEL_SERIES}.&list-type=2") \
-    || die "failed to list firecracker-ci S3 bucket; check network egress to s3.amazonaws.com"
-  kernel_key=$(echo "$listing" \
-    | grep -Eo "firecracker-ci/${FC_CI_VERSION}/${ARCH}/${KERNEL_SERIES}\\.[0-9]+" \
-    | sort -V | uniq | tail -1)
-  [[ -n "$kernel_key" ]] || die "no $KERNEL_SERIES kernel found in firecracker-ci/$FC_CI_VERSION/$ARCH"
+  kernel_key="firecracker-ci/${FC_CI_VERSION}/${ARCH}/vmlinux-${KERNEL_VERSION}"
   log "downloading $kernel_key"
   rm -f "$kernel_dir/vmlinux.bin"   # in case a stale symlink survived
-  curl -fsSL "https://s3.amazonaws.com/spec.ccfc.min/${kernel_key}" -o "$kernel_dir/vmlinux.bin"
-  log "vmlinux installed at $kernel_dir/vmlinux.bin"
+  # Into a temporary file beside the destination, renamed only once its
+  # checksum matches: an interrupted or corrupt download never becomes the
+  # "already present" kernel of the next run. The retries are the Firecracker
+  # download's above.
+  kernel_tmp="$(mktemp "$kernel_dir/.vmlinux.bin.XXXXXX")"
+  trap 'rm -f "$kernel_tmp"' EXIT
+  curl -fsSL --retry 6 --retry-all-errors \
+    "https://s3.amazonaws.com/spec.ccfc.min/${kernel_key}" -o "$kernel_tmp" \
+    || die "failed to download $kernel_key; check network egress to s3.amazonaws.com"
+  kernel_sha256="$(sha256sum "$kernel_tmp" | awk '{print $1}')"
+  [[ "$kernel_sha256" == "$KERNEL_SHA256" ]] \
+    || die "$kernel_key has sha256 $kernel_sha256, not the pinned $KERNEL_SHA256; set SPACE_FC_KERNEL_SHA256 only after checking the new object"
+  chmod 0644 "$kernel_tmp"
+  mv -f "$kernel_tmp" "$kernel_dir/vmlinux.bin"
+  trap - EXIT
+  log "vmlinux $KERNEL_VERSION (sha256 $kernel_sha256) installed at $kernel_dir/vmlinux.bin"
 fi
 
 log "done. vendor tree at $VENDOR_ROOT/firecracker:"

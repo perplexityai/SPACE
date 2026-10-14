@@ -79,7 +79,10 @@ ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="gcc" \
 
 FROM rust-base AS chef-base
 
-RUN cargo install --locked cargo-chef
+# Without a version, an unchanged build installs whatever cargo-chef crates.io
+# serves that day.
+ARG CARGO_CHEF_VERSION=0.1.78
+RUN cargo install --locked --version "${CARGO_CHEF_VERSION}" cargo-chef
 
 FROM chef-base AS planner
 

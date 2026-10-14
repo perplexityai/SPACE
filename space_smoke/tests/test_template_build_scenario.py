@@ -14,6 +14,8 @@ renders the recipe into the SDK calls with the run's credentials.
 from __future__ import annotations
 
 import json
+import os
+import shlex
 import shutil
 import sys
 import types
@@ -465,6 +467,29 @@ class HarnessOps(unittest.TestCase):
         result = subprocess.run([shutil.which("bash") or "bash", "-c", script], capture_output=True, text=True, timeout=30, env={"PATH": "/nonexistent"})
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("ctr images list failed", result.stderr)
+
+    @unittest.skipUnless(shutil.which("bash") and shutil.which("grep") and shutil.which("sed"), "needs bash, grep and sed")
+    def test_the_residue_script_finds_the_source_image_of_a_pinned_reference(self) -> None:
+        import subprocess
+        import tempfile
+
+        from space_smoke.adapters import _CONTAINERD_RESIDUE_SCRIPT
+
+        # containerd names the pull by repository and digest; the scenario's
+        # reference also carries the tag, which must not hide the record.
+        digest = OCI_IMAGE.rsplit("@", 1)[1]
+        with tempfile.TemporaryDirectory() as tmp:
+            ctr = Path(tmp) / "ctr"
+            ctr.write_text(f"#!/usr/bin/env bash\nprintf '%s\\n' 'docker.io/library/python@{digest}' 'docker.io/library/debian@{digest}'\n")
+            ctr.chmod(0o755)
+            for image in (OCI_IMAGE, "docker.io/library/python:3.12-slim-bookworm", f"docker.io/library/python@{digest}"):
+                script = _CONTAINERD_RESIDUE_SCRIPT.replace("__IMAGE__", shlex.quote(image))
+                result = subprocess.run(
+                    [shutil.which("bash") or "bash", "-c", script],
+                    capture_output=True, text=True, timeout=30, env={"PATH": f"{tmp}:{os.environ['PATH']}"},
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines(), [f"source-image-record: docker.io/library/python@{digest}"], image)
 
     def test_handoff_failure_text_comes_from_the_script(self) -> None:
         harness, _ = _harness(

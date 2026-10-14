@@ -5061,8 +5061,10 @@ sed -n 's/.*"spaced_compatibility_family": "\([^"]*\)".*/\1/p' "$metadata_path"
 # (which exit 1 on no match) are tolerated.
 _CONTAINERD_RESIDUE_SCRIPT = r"""set -u
 image=__IMAGE__
+# containerd records the pull by repository and digest, without the tag: drop
+# the reference's digest, then any tag on its last path component.
 repo="${image%@*}"
-if [ "$repo" = "$image" ]; then repo="${image%:*}"; fi
+case "${repo##*/}" in *:*) repo="${repo%:*}" ;; esac
 if ! images="$(ctr --namespace space-builds images list --quiet)"; then
   echo "ctr images list failed in the space-builds namespace" >&2
   exit 3
