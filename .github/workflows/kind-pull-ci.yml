@@ -13,6 +13,17 @@ on:
       - Tiltfile
       - docker/Dockerfile.rust-build-kind
       - docker/Dockerfile.worker
+      # The runtime images Tilt builds, whose dependency stages
+      # infra/space/kind/scripts/runtime-image-cache.sh names, and the seed
+      # builder infra/space/kind/scripts/build-seed.sh runs.
+      - docker/Dockerfile.api
+      - docker/Dockerfile.data-plane
+      - docker/Dockerfile.cluster-controller
+      - docker/Dockerfile.seed-publish
+      - docker/Dockerfile.ui
+      - docker/Dockerfile.kind-key-broker
+      - templates/firecracker/seed/**
+      - templates/firecracker/recipes/seed.toml
       - crates/libs/sbx/mgr/server/src/service/activation_support.rs
       - infra/space/observability/**
       - crates/libs/observability/**

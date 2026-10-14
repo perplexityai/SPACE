@@ -96,11 +96,24 @@ jobs:
 
   # Exports the dependency stages of the runtime images and the seed builder
   # that every shard's Tilt bring-up imports (runtime-image-cache.sh). Only a
-  # main push runs it. A failed export leaves the previous layers in place,
-  # and the shards build whatever misses cold, so it never fails the run.
+  # main push whose four shards all passed runs it, so a layer that broke the
+  # smoke is not published. The export rebuilds any stage the cache lacks
+  # from upstream, at its own time; a layer that is broken anyway stays in use
+  # until SPACE_KIND_LAYER_CACHE_EPOCH (infra/space/kind/lib/build-cache.sh)
+  # is bumped. Exports run one at a time (a newer one waiting replaces an
+  # older one that has not started) and only for the current tip of main, so
+  # an older commit cannot overwrite a newer one's layers. A failed export leaves the previous layers in place, and the
+  # shards build whatever misses cold, so it never fails the run.
   runtime_image_cache:
     if: github.repository == 'perplexityai/SPACE' && github.event_name == 'push' && github.ref == 'refs/heads/main'
     name: Export the Kind runtime image cache
+    needs: smoke
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: kind-runtime-image-cache
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     continue-on-error: true
@@ -116,10 +129,21 @@ jobs:
 
       - name: Export the runtime images' and the seed builder's cached stages
         env:
+          GH_TOKEN: ${{ github.token }}
           SPACE_CI_IMAGE_MIRROR: ghcr
           SPACE_KIND_BUILD_CACHE_REPOSITORY: ghcr.io/perplexityai/space-kind-build-cache
           SPACE_KIND_BUILD_CACHE_WRITE: '1'
-        run: bash infra/space/kind/scripts/runtime-image-cache.sh publish
+        run: |
+          set -euo pipefail
+          if ! tip="$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq .sha)"; then
+            echo "::warning::Could not read the tip of main; exporting this commit's layers"
+            tip="${GITHUB_SHA}"
+          fi
+          if [[ "${tip}" != "${GITHUB_SHA}" ]]; then
+            echo "main has moved on to ${tip}; that commit's run exports the cache"
+            exit 0
+          fi
+          bash infra/space/kind/scripts/runtime-image-cache.sh publish
 
   smoke:
     if: github.repository == 'perplexityai/SPACE'

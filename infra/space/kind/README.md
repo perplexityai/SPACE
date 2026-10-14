@@ -193,17 +193,42 @@ fetched again from Debian, Ubuntu, npm, PyPI, GitHub releases or kernel.org.
 Each runtime Dockerfile ends those layers at a named stage before its first
 SPACE binary, script or seed (`runtime-deps`, plus `smoke-build` for the API's
 smoke environment and `deps` for the UI's `npm ci`), and each stage has its own
-`kind-<image>-<stage>` tag; `infra/space/kind/scripts/runtime-image-cache.sh`
-lists them. The seed builder's tag, `kind-seed-builder`, also holds the
+`kind-<image>-<stage>-e<epoch>` tag; `infra/space/kind/scripts/runtime-image-cache.sh`
+lists them and runs every runtime image build, for Tilt and `build-images.sh`
+alike. The seed builder's tag, `kind-seed-builder-e<epoch>`, also holds the
 recipe's dated Ubuntu cloud image with its signed checksums, which
 `rootfs-builder.sh` verifies again before use. The copies of a commit's
-binaries are never exported. Only the main push's `runtime_image_cache` job
-writes these tags; the shards read them with `SPACE_KIND_BUILD_CACHE_REPOSITORY`
-and build any missing layer cold. The seed's in-chroot package installation
-still reaches the Ubuntu archive. A local bring-up reads the same tags when
-`SPACE_KIND_BUILD_CACHE_REPOSITORY` names a reachable cache (main's package, or
-a registry on the loopback interface, `localhost:<port>/<name>`), and builds as
-before otherwise.
+binaries are never exported.
+
+Only main's `runtime_image_cache` job writes these tags, after all four shards
+of that commit have passed and only while the commit is still the tip of
+main. A failed export marks that job failed, without failing the run, and
+leaves the previous layers.
+The shards read them with `SPACE_KIND_BUILD_CACHE_REPOSITORY` and build any
+missing layer cold. A build that cannot read a layer the cache names (a
+missing or corrupt blob) is built again once without the cache.
+
+A layer stays in use while its inputs are unchanged, even one captured while
+an archive served a broken package. To retire every runtime and seed builder
+layer, bump `SPACE_KIND_LAYER_CACHE_EPOCH` in
+`infra/space/kind/lib/build-cache.sh` and merge: readers move to the new, empty
+tags at once and build cold until main's next export has rebuilt each layer
+from upstream. Pull requests based on an older main keep reading the old tags
+until they rebase.
+
+The seed's in-chroot `apt-get update` and package installation still reach the
+Ubuntu archive on every seed build, and `|| dpkg --configure -a` lets a seed
+build complete without its packages when that installation fails.
+
+A layer's key depends on where its base image came from: a base taken from the
+GHCR mirror and the same base pulled from its source give different keys. Main
+exports with the mirror, so a local bring-up reads main's layers only with
+`SPACE_CI_IMAGE_MIRROR=ghcr`, read access to the mirror and cache packages
+(`docker login ghcr.io` while they are private), and
+`SPACE_KIND_BUILD_CACHE_REPOSITORY=ghcr.io/perplexityai/space-kind-build-cache`.
+A registry on the loopback interface (`localhost:<port>/<name>`) is accepted
+for trying the cache locally. Without these, or when the cache or the mirror
+cannot be reached, builds fetch from upstream as before.
 
 ### Scripted steps
 

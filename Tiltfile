@@ -176,20 +176,17 @@ RUST_ARTIFACT_BUILD = "bash infra/space/kind/scripts/build-rust-artifacts.sh"
 def pull_base_images(*dockerfiles):
     return "bash infra/space/kind/scripts/pull-base-images.sh " + " ".join(dockerfiles)
 
-# In GitHub CI (SPACE_CI_IMAGE_MIRROR set) a build takes each registry base
-# listed in ci/mirrored-images.txt from the repository's GHCR mirror, through
-# --build-context options; the Dockerfiles are unchanged. Elsewhere this
-# expands to nothing.
-def mirrored_bases(dockerfile):
-    return "$(bash ci/scripts/mirror-images.sh build-contexts {})".format(dockerfile)
-
-# With SPACE_KIND_BUILD_CACHE_REPOSITORY set, as in Kind CI, a build imports
-# its image's dependency stages from the registry layer cache main CI writes,
-# so an unchanged package list downloads nothing; see
-# infra/space/kind/scripts/runtime-image-cache.sh. Elsewhere this expands to
-# nothing. A miss or an unreachable cache builds those layers cold.
-def cached_layers(image):
-    return "$(bash infra/space/kind/scripts/runtime-image-cache.sh cache-from {})".format(image)
+# Every runtime image is built by infra/space/kind/scripts/runtime-image-cache.sh,
+# which adds the image's Dockerfile and its bases and cache imports to the given
+# arguments. In GitHub CI (SPACE_CI_IMAGE_MIRROR set) a build takes each
+# registry base listed in ci/mirrored-images.txt from the repository's GHCR
+# mirror, through --build-context options; the Dockerfiles are unchanged. With
+# SPACE_KIND_BUILD_CACHE_REPOSITORY set as well, as in Kind CI, it imports its
+# dependency stages from the registry layer cache main CI writes, so an
+# unchanged package list downloads nothing. A miss, an unreachable cache or a
+# cached layer that cannot be read builds those layers cold.
+def image_build(image):
+    return "bash infra/space/kind/scripts/runtime-image-cache.sh build " + image
 
 # Up to eight updates at once instead of Tilt's default three. Every Rust image
 # waits on the artifact lock anyway, so the default mostly kept image builds and
@@ -210,12 +207,10 @@ def rust_runtime_image(name, dockerfile, runtime_deps):
     cmd = " && ".join([
         pull_base_images(dockerfile),
         RUST_ARTIFACT_BUILD,
-        ("docker build -t $EXPECTED_REF -f {dockerfile} {mirrored} {cached} " +
+        ("{build} -t $EXPECTED_REF " +
          "--build-arg SPACE_RUST_BUILD_IMAGE={rust_image} " +
          "--build-arg SPACE_GIT_SHA={git_sha} .").format(
-            dockerfile = dockerfile,
-            mirrored = mirrored_bases(dockerfile),
-            cached = cached_layers(name),
+            build = image_build(name),
             rust_image = RUST_ARTIFACT_IMAGE,
             git_sha = KIND_GIT_SHA,
         ),
@@ -268,10 +263,8 @@ custom_build(
         # --provenance=false keeps buildx from emitting a multi-platform
         # manifest list, which `kind load docker-image` cannot ingest
         # ("content digest ... not found").
-        ("docker build --provenance=false --sbom=false -t $EXPECTED_REF " +
-         "-f docker/Dockerfile.worker {} {} " +
+        (image_build("space-worker") + " --provenance=false --sbom=false -t $EXPECTED_REF " +
          "--build-arg SPACE_RUST_BUILD_IMAGE={} --build-arg SPACE_GIT_SHA={} .").format(
-            mirrored_bases("docker/Dockerfile.worker"), cached_layers("space-worker"),
             RUST_ARTIFACT_IMAGE, KIND_GIT_SHA),
     ]),
     deps = RUST_ARTIFACT_DEPS + [
@@ -298,9 +291,7 @@ custom_build(
         pull_base_images("docker/Dockerfile.seed-publish"),
         RUST_ARTIFACT_BUILD,
         "SPACE_RUST_BUILD_IMAGE={} bash infra/space/kind/scripts/build-seed.sh".format(RUST_ARTIFACT_IMAGE),
-        ("docker build --provenance=false --sbom=false -t $EXPECTED_REF " +
-         "-f docker/Dockerfile.seed-publish " + mirrored_bases("docker/Dockerfile.seed-publish") + " " +
-         cached_layers("space-seed-publish") + " " +
+        (image_build("space-seed-publish") + " --provenance=false --sbom=false -t $EXPECTED_REF " +
          "--build-context seed=$HOME/.space-devbox/kind/seed/build ."),
     ]),
     deps = RUST_ARTIFACT_DEPS + [
@@ -320,8 +311,7 @@ custom_build(
     ref = "space-ui:local",
     command = " && ".join([
         pull_base_images("docker/Dockerfile.ui"),
-        ("docker build -t $EXPECTED_REF -f docker/Dockerfile.ui " +
-         mirrored_bases("docker/Dockerfile.ui") + " " + cached_layers("space-ui") + " " +
+        (image_build("space-ui") + " -t $EXPECTED_REF " +
          "--build-arg NEXT_PUBLIC_API_URL=http://space-api:8080 ."),
     ]),
     deps = ["docker/Dockerfile.ui", "ui"],

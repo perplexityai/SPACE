@@ -55,11 +55,12 @@ build_rust_artifacts() {
   bash "$REPO_ROOT/infra/space/kind/scripts/build-rust-artifacts.sh"
 }
 
-# The registry layer cache's import options for an image's dependency stages,
-# one per line, as the Tiltfile's builds take them; none unless
-# SPACE_KIND_BUILD_CACHE_REPOSITORY is set.
-cached_layers() {
-  bash "$REPO_ROOT/infra/space/kind/scripts/runtime-image-cache.sh" cache-from "$1"
+# `docker build` for one runtime image, as the Tiltfile runs it: its Dockerfile,
+# its bases from the GHCR mirror when SPACE_CI_IMAGE_MIRROR is set, and its
+# dependency stages from the registry layer cache when
+# SPACE_KIND_BUILD_CACHE_REPOSITORY is set (see runtime-image-cache.sh).
+image_build() {
+  bash "$REPO_ROOT/infra/space/kind/scripts/runtime-image-cache.sh" build "$@"
 }
 
 # Build the runtime image that copies its binaries out of the shared artifact
@@ -67,13 +68,11 @@ cached_layers() {
 build_rust_runtime() {
   local name=$1 dockerfile=$2
   local runtime_ref="${name}:local"
-  local -a cached
 
   build_rust_artifacts
 
   log "building runtime image: $runtime_ref ($dockerfile)"
-  mapfile -t cached < <(cached_layers "$name")
-  docker build --provenance=false --sbom=false -t "$runtime_ref" -f "$dockerfile" "${cached[@]}" \
+  image_build "$name" --provenance=false --sbom=false -t "$runtime_ref" \
     --build-arg "SPACE_RUST_BUILD_IMAGE=${RUST_ARTIFACT_IMAGE}" \
     --build-arg "SPACE_GIT_SHA=${KIND_GIT_SHA:-unknown}" \
     .
@@ -118,10 +117,7 @@ build_space_seed_publish() {
     bash "$REPO_ROOT/infra/space/kind/scripts/build-seed.sh"
 
   log "building runtime image: space-seed-publish:local"
-  local -a cached
-  mapfile -t cached < <(cached_layers space-seed-publish)
-  docker build --provenance=false --sbom=false -t space-seed-publish:local "${cached[@]}" \
-    -f docker/Dockerfile.seed-publish \
+  image_build space-seed-publish --provenance=false --sbom=false -t space-seed-publish:local \
     --build-context "seed=$SEED_OUTPUT_DIR" \
     .
 
@@ -134,10 +130,7 @@ build_space_seed_publish() {
 # in-cluster Service DNS (Tilt uses the same value).
 build_space_ui() {
   log "building runtime image: space-ui:local"
-  local -a cached
-  mapfile -t cached < <(cached_layers space-ui)
-  docker build --provenance=false --sbom=false -t space-ui:local "${cached[@]}" \
-    -f docker/Dockerfile.ui \
+  image_build space-ui --provenance=false --sbom=false -t space-ui:local \
     --build-arg NEXT_PUBLIC_API_URL=http://space-api:8080 \
     --build-arg NEXT_PUBLIC_DATA_PLANE_URL=http://space-data-plane:8090 \
     .

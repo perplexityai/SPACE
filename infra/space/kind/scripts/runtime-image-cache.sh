@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # runtime-image-cache.sh — the Kind runtime images' part of the registry layer
 # cache (infra/space/kind/lib/build-cache.sh): which stages of each image the
-# cache keeps, the options a build reads them with, and main CI's export.
+# cache keeps, the build every bring-up runs to read them, and main CI's export.
 #
 # Each runtime Dockerfile ends its dependency layers at a named stage: the
 # base, the packages, the downloaded tools and the installed language
@@ -13,14 +13,22 @@
 # repository, or when the cache misses or cannot be reached, a build fetches
 # from upstream as before. The seed builder's scope belongs to build-seed.sh.
 #
+# A layer's cache key includes where its base image came from: a base taken
+# from the GHCR mirror (SPACE_CI_IMAGE_MIRROR set, ci/mirrored-images.txt) has
+# a different key from the same image pulled from its source. Main exports
+# with the mirror, so every build here takes its bases the same way, and reads
+# main's layers only when SPACE_CI_IMAGE_MIRROR is set as well.
+#
 # Usage:
-#   bash infra/space/kind/scripts/runtime-image-cache.sh cache-from <image>
-#       Print the options that import <image>'s stages, one per line; nothing
-#       without SPACE_KIND_BUILD_CACHE_REPOSITORY. Never exports.
+#   bash infra/space/kind/scripts/runtime-image-cache.sh build <image> <docker build args>...
+#       Build <image> from its Dockerfile with its mirrored bases and the
+#       options that import its stages (never an export), then the given
+#       arguments, which are relative to the repository root. A build that
+#       fails reading a cached layer is built again without the cache.
 #   bash infra/space/kind/scripts/runtime-image-cache.sh publish
 #       Main CI (SPACE_KIND_BUILD_CACHE_WRITE=1): build every cached stage,
-#       and the seed builder's, and export them. With writes off it only
-#       builds them, which warms the local build cache.
+#       and the seed builder's, and export them; a failed export fails. With
+#       writes off it only builds them, which warms the local build cache.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
@@ -30,6 +38,10 @@ source "$REPO_ROOT/infra/space/kind/lib/build-cache.sh"
 
 log() { printf '[runtime-image-cache] %s\n' "$*" >&2; }
 die() { printf '[runtime-image-cache] ERROR: %s\n' "$*" >&2; exit 1; }
+warn() {
+  log "WARNING: $*"
+  [[ "${GITHUB_ACTIONS:-}" != true ]] || printf '::warning::%s\n' "$*" >&2
+}
 
 # <image> <dockerfile> <stage>...: the stages each image's build imports and
 # main exports, in build order. The key broker installs nothing.
@@ -48,23 +60,30 @@ image_entry() {
 }
 
 scope() { # image stage
-  printf 'kind-%s-%s\n' "${1#space-}" "$2"
+  space_kind_layer_scope "${1#space-}-$2"
 }
 
-cache_from() {
+# In GitHub CI the --build-context options that take the Dockerfile's bases
+# from the mirror; a base the mirror lacks, or every base outside CI, comes
+# from its source.
+mirror_flags() {
+  mapfile -t MIRROR_FLAGS < <(bash ci/scripts/mirror-images.sh build-contexts "$1")
+}
+
+build() {
   local image=$1 entry stage
-  local -a fields
+  local -a fields imports=()
+  shift
   entry="$(image_entry "$image")" || die "no cached stages are declared for $image"
   read -r -a fields <<<"$entry"
   for stage in "${fields[@]:2}"; do
     SPACE_KIND_BUILD_CACHE_WRITE=0 space_kind_cache_flags "$(scope "$image" "$stage")" \
       || die "invalid build cache configuration"
-    # Pairs of option and value, printed as one word each for $(...) expansion.
-    while (( ${#CACHE_FLAGS[@]} )); do
-      printf '%s=%s\n' "${CACHE_FLAGS[0]}" "${CACHE_FLAGS[1]}"
-      CACHE_FLAGS=("${CACHE_FLAGS[@]:2}")
-    done
+    imports+=("${CACHE_FROM_FLAGS[@]}")
   done
+  mirror_flags "${fields[1]}"
+  space_kind_build_reading_cache "${#imports[@]}" "${imports[@]}" \
+    -f "${fields[1]}" "${MIRROR_FLAGS[@]}" "$@"
 }
 
 # Build each stage on its own, with no output but the cache. A failure leaves
@@ -72,42 +91,43 @@ cache_from() {
 # stale or missing scope build those layers cold.
 publish() {
   local entry dockerfile stage failures=0
-  local -a fields mirror
+  local -a fields
   [[ "${SPACE_KIND_BUILD_CACHE_WRITE:-0}" == 1 ]] \
     || log "SPACE_KIND_BUILD_CACHE_WRITE is not 1: building the cached stages without exporting them"
   while read -r entry; do
     read -r -a fields <<<"$entry"
     (( ${#fields[@]} > 2 )) || continue
     dockerfile=${fields[1]}
-    # In GitHub CI the same mirrored bases the readers' builds take, so both
-    # compute the same cache keys; elsewhere none.
-    mapfile -t mirror < <(bash ci/scripts/mirror-images.sh build-contexts "$dockerfile")
+    mirror_flags "$dockerfile"
     for stage in "${fields[@]:2}"; do
-      space_kind_cache_flags "$(scope "${fields[0]}" "$stage")" || die "invalid build cache configuration"
+      space_kind_cache_flags "$(scope "${fields[0]}" "$stage")" --fail-on-export-error \
+        || die "invalid build cache configuration"
       log "${fields[0]}: $stage → $(scope "${fields[0]}" "$stage")"
-      if ! docker build -f "$dockerfile" --target "$stage" --output type=cacheonly \
-          "${mirror[@]}" "${CACHE_FLAGS[@]}" . </dev/null; then
-        log "WARNING: could not build $stage of $dockerfile; its scope keeps main's previous layers"
+      if ! space_kind_build_reading_cache "${#CACHE_FROM_FLAGS[@]}" "${CACHE_FROM_FLAGS[@]}" \
+          -f "$dockerfile" --target "$stage" --output type=cacheonly \
+          "${MIRROR_FLAGS[@]}" "${CACHE_TO_FLAGS[@]}" . </dev/null; then
+        warn "could not build or export $stage of $dockerfile; $(scope "${fields[0]}" "$stage") keeps main's previous layers"
         failures=$((failures + 1))
       fi
     done
   done <<<"$IMAGES"
   log "seed builder"
   if ! bash infra/space/kind/scripts/build-seed.sh --cache-only; then
-    log "WARNING: could not build the seed builder's cached stages"
+    warn "could not build or export the seed builder's cached stages"
     failures=$((failures + 1))
   fi
   (( failures == 0 )) || die "$failures cached build(s) failed"
 }
 
 case "${1:-}" in
-  cache-from)
-    (( $# == 2 )) || die "usage: $0 cache-from <image>"
-    cache_from "$2"
+  build)
+    (( $# >= 2 )) || die "usage: $0 build <image> <docker build args>..."
+    shift
+    build "$@"
     ;;
   publish)
     (( $# == 1 )) || die "usage: $0 publish"
     publish
     ;;
-  *) die "usage: $0 cache-from <image> | publish" ;;
+  *) die "usage: $0 build <image> <docker build args>... | publish" ;;
 esac

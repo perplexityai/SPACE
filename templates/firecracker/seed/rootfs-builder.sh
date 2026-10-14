@@ -20,6 +20,10 @@ set -euo pipefail
 # the one signer whose checksums a seed accepts.
 SEED_IMAGE_KEYRING=/usr/share/keyrings/ubuntu-cloudimage-keyring.gpg
 SEED_IMAGE_SIGNER=D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81
+# Downloads of the release's files give up on a host that does not connect
+# within 30 s or stalls below 1 KiB/s for a minute, each attempt, instead of
+# waiting on it indefinitely.
+SEED_IMAGE_CURL=(curl -fSL --retry 3 --retry-delay 5 --connect-timeout 30 --speed-limit 1024 --speed-time 60)
 
 # Set SEED_IMAGE_BASE_URL and SEED_IMAGE_NAME to a dated Ubuntu minimal cloud
 # release and its squashfs for the given machine architecture.
@@ -42,10 +46,10 @@ seed_image_source() {
 verified_checksum() (
   set -euo pipefail
   local base_url="$1" name="$2" cache_dir="$3" keyring="$4" signer="$5"
-  local verify_dir checksum file downloaded=""
+  local verify_dir checksum file downloaded="" cache_tmp=""
   local sums_cache="${cache_dir}/sums/${base_url#*://}"
   verify_dir="$(mktemp -d)"
-  trap 'rm -rf "$verify_dir"' EXIT
+  trap 'rm -rf "$verify_dir"; [[ -z "$cache_tmp" ]] || rm -f "$cache_tmp"' EXIT
 
   signed_by_pinned_signer() {
     gpgv --status-fd 3 --homedir "$verify_dir" --keyring "$keyring" \
@@ -67,7 +71,7 @@ verified_checksum() (
   fi
   if [[ ! -f "${verify_dir}/SHA256SUMS" ]]; then
     for file in SHA256SUMS SHA256SUMS.gpg; do
-      curl -fSL --retry 3 --retry-delay 5 -o "${verify_dir}/${file}" "${base_url}/${file}"
+      "${SEED_IMAGE_CURL[@]}" -o "${verify_dir}/${file}" "${base_url}/${file}"
     done
     if ! signed_by_pinned_signer; then
       echo "ERROR: checksum signature does not match the pinned signer" >&2
@@ -83,8 +87,11 @@ verified_checksum() (
   if [[ -n "$downloaded" && -d "$cache_dir" ]]; then
     mkdir -p "$sums_cache"
     for file in SHA256SUMS SHA256SUMS.gpg; do
-      cp "${verify_dir}/${file}" "${sums_cache}/.${file}.tmp"
-      mv -f "${sums_cache}/.${file}.tmp" "${sums_cache}/${file}"
+      cache_tmp="$(mktemp "${sums_cache}/.${file}.XXXXXX")"
+      cp "${verify_dir}/${file}" "$cache_tmp"
+      chmod 0644 "$cache_tmp"
+      mv -f "$cache_tmp" "${sums_cache}/${file}"
+      cache_tmp=""
     done
   fi
   printf '%s\n' "$checksum"
@@ -110,7 +117,7 @@ fetch_verified_squashfs() (
   fi
   if [[ ! -f "${verify_dir}/image.squashfs" ]]; then
     echo "Downloading: ${name}"
-    curl -fSL --retry 3 --retry-delay 5 -o "${verify_dir}/image.squashfs" "${base_url}/${name}"
+    "${SEED_IMAGE_CURL[@]}" -o "${verify_dir}/image.squashfs" "${base_url}/${name}"
     printf '%s  %s\n' "$checksum" "${verify_dir}/image.squashfs" | sha256sum --check --strict -
     if [[ -d "$cache_dir" ]]; then
       cache_tmp="$(mktemp "${cache_dir}/.${name}.XXXXXX")"

@@ -29,7 +29,7 @@
 #
 # The builder image's layers and the recipe's Ubuntu cloud image (its signed
 # checksums and the squashfs) come from the Kind registry layer cache
-# (infra/space/kind/lib/build-cache.sh, scope kind-seed-builder) when it holds
+# (infra/space/kind/lib/build-cache.sh, scope kind-seed-builder-e<epoch>) when it holds
 # them; rootfs-builder.sh verifies both before use, and downloads whatever the
 # cache could not provide.
 #
@@ -92,20 +92,27 @@ done
 # In GitHub CI (SPACE_CI_IMAGE_MIRROR set) the builder's base comes from the
 # repository's GHCR mirror (ci/mirrored-images.txt); elsewhere this adds nothing.
 # The cache options import the builder's layers, and export them only when
-# the caller enables writes.
+# the caller enables writes; main takes its bases from the mirror the same
+# way, so the layers' keys agree. A build that fails reading a cached layer is
+# built again without the imports.
 seed_builder_build() {
   local -a mirror
   mapfile -t mirror < <(bash "$REPO_ROOT/ci/scripts/mirror-images.sh" build-contexts "$SEED_DIR/Dockerfile")
-  space_kind_cache_flags kind-seed-builder || die "invalid build cache configuration"
-  docker build "${mirror[@]}" "${CACHE_FLAGS[@]}" \
+  space_kind_cache_flags "$(space_kind_layer_scope seed-builder)" "${SEED_CACHE_OPTION[@]}" \
+    || die "invalid build cache configuration"
+  space_kind_build_reading_cache "${#CACHE_FROM_FLAGS[@]}" "${CACHE_FROM_FLAGS[@]}" \
+    "${mirror[@]}" "${CACHE_TO_FLAGS[@]}" \
     --build-arg "SPACE_SEED_UBUNTU_RELEASE=$SEED_UBUNTU_RELEASE" \
     --build-arg "SPACE_SEED_UBUNTU_VERSION=$SEED_UBUNTU_VERSION" \
     --build-arg "SPACE_SEED_UBUNTU_DATE=$SEED_UBUNTU_DATE" \
     "$@" "$SEED_DIR"
 }
+SEED_CACHE_OPTION=()
 
 if [[ "${1:-}" == "--cache-only" ]]; then
   log "building the seed builder's cached stages (the builder and the recipe's cloud image)"
+  # The export is this mode's only purpose, so its failure is not ignored.
+  SEED_CACHE_OPTION=(--fail-on-export-error)
   seed_builder_build --target cloud-image --output type=cacheonly
   exit 0
 fi
