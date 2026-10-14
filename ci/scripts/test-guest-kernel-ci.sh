@@ -6,8 +6,8 @@
 # never fails the check; the builder starts from the mirrored BuildKit image,
 # else its source, else Docker's own builder; a build that fails fetching from
 # the mirror or the cache, or stalls importing the cache, runs once more without
-# them, as does the rest of the run, on another builder after a stall; and the
-# input hash covers each file's executable bit.
+# them, as does the rest of the run, on a new builder; and the input hash covers
+# each file's executable bit.
 set -euo pipefail
 
 KERNEL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../templates/firecracker/kernel" && pwd)"
@@ -27,12 +27,13 @@ cat >"${WORK_DIR}/bin/docker" <<'SH'
 # The registry's references are the lines of FAKE_REGISTRY, the builders those
 # of FAKE_BUILDERS ("<name> <image>"). FAKE_LOOKUP_ERROR is the error of every
 # lookup; FAKE_STALL lists the operations that never answer (lookup, export,
-# push, and external-build: any build that uses the mirror or the cache); FAKE_BAD_BUILDKIT lists BuildKit
-# images that do not start. FAKE_BUILD_FAILS fails the kernel build in its own
-# step, after an earlier error line that reads like a fetch failure;
-# FAKE_FETCH_FAILS fails each build that uses the mirror or the cache;
-# FAKE_EXPORT_FAILS fails cache exports, and FAKE_EXPORT_DROPS makes them
-# succeed without writing the tag.
+# push, and external-build: any build that uses the mirror or the cache).
+# FAKE_BAD_BUILDKIT lists BuildKit images that do not start, FAKE_BAD_BUILDER
+# is the name prefix of builders that do not, and FAKE_RM_FAILS fails builder
+# removals. FAKE_BUILD_FAILS fails the kernel build in its own step, after an
+# earlier error line that reads like a fetch failure; FAKE_FETCH_FAILS fails
+# each build that uses the mirror or the cache; FAKE_EXPORT_FAILS fails cache
+# exports, and FAKE_EXPORT_DROPS makes them succeed without writing the tag.
 printf '%s\n' "$*" >>"${FAKE_CALLS}"
 stalls() { [[ " ${FAKE_STALL:-} " == *" $1 "* ]]; }
 # option <name> <args>...: prints the value of --name=value or --name value.
@@ -59,13 +60,17 @@ case "$1 ${2:-} ${3:-}" in
     "buildx inspect --bootstrap")
         image="$(awk -v name="$4" '$1 == name { print $2 }' "${FAKE_BUILDERS}")"
         [[ " ${FAKE_BAD_BUILDKIT:-} " != *" ${image} "* ]] || exit 1
+        [[ -z "${FAKE_BAD_BUILDER:-}" || "$4" != "${FAKE_BAD_BUILDER}"* ]] || exit 1
         ;;
     "buildx inspect "*) grep -q "^$3 " "${FAKE_BUILDERS}" ;;
     "buildx create "*)
         image="$(option --driver-opt "$@")"
         printf '%s %s\n' "$(option --name "$@")" "${image#image=}" >>"${FAKE_BUILDERS}"
         ;;
-    "buildx rm "*) sed -i "/^$3 /d" "${FAKE_BUILDERS}" ;;
+    "buildx rm "*)
+        [ -z "${FAKE_RM_FAILS:-}" ] || exit 1
+        sed -i "/^$3 /d" "${FAKE_BUILDERS}"
+        ;;
     "buildx build "*)
         [[ " $* " != *" --file - "* ]] || cat >/dev/null
         cache_to="$(option --cache-to "$@")"
@@ -159,6 +164,15 @@ run() {
         bash "${SCRIPT}" "$@" >"${WORK_DIR}/out" 2>&1
 }
 calls() { grep -c -e "$1" "${WORK_DIR}/calls" || true; }
+# without_external_after <pattern>: the calls matching it all came after the
+# fallback, without the mirror and the cache.
+without_external_after() {
+    [ "$(grep -e "$1" "${WORK_DIR}/calls" | grep -cE -e '--(cache-from|build-context)=')" = 0 ]
+}
+# The retry ran on the builder started for it.
+retry_on_new_builder() {
+    grep -e '--target export' "${WORK_DIR}/calls" | tail -n 1 | grep -q -e '--builder=space-guest-kernel-retry-'
+}
 said() { grep -qF -e "$1" "${WORK_DIR}/out"; }
 recorded() { grep -qxF "${MARKER}" "${WORK_DIR}/registry"; }
 
@@ -257,24 +271,19 @@ FAKE_FETCH_FAILS=1 run "${MIRRORS}"$'\n'"${CACHES}" publish ||
 said "::warning::The build failed or stalled taking layers from the image mirror or the toolchain cache" ||
     fail "a failed fetch from the mirror was not reported"
 [ "$(calls '--target export')" = 2 ] || fail "a failed fetch from the mirror was not retried once"
-[ "$(calls '^buildx rm ')" = 0 ] || fail "a failed fetch, not a stall, replaced the builder"
+retry_on_new_builder || fail "the retry after a failed fetch did not run on a new builder"
 [ "$(grep -e '--target export' "${WORK_DIR}/calls" | tail -n 1 | grep -cE -e '--(cache-from|build-context)=')" = 0 ] ||
     fail "the retry still used the mirror or the cache"
 recorded || fail "a build retried without the mirror was not recorded"
 
-# without_external_after <pattern>: the calls matching it all came after the
-# fallback, without the mirror and the cache.
-without_external_after() {
-    [ "$(grep -e "$1" "${WORK_DIR}/calls" | grep -cE -e '--(cache-from|build-context)=')" = 0 ]
-}
-
 FAKE_STALL=external-build run "${MIRRORS}"$'\n'"${CACHES}" publish ||
     fail "a stalled mirror and cache failed the check: $(cat "${WORK_DIR}/out")"
 [ "$(calls '--target export')" = 2 ] || fail "a stalled kernel build was not retried without the mirror and cache"
-[ "$(calls '^buildx rm space-guest-kernel')$(calls '^buildx create ')" = 12 ] ||
-    fail "the builder that held the stalled build was not replaced: $(grep '^buildx' "${WORK_DIR}/calls")"
-[ "$(grep -e '--target export' "${WORK_DIR}/calls" | tail -n 1 | grep -c -e '--builder=space-guest-kernel')" = 1 ] ||
-    fail "the retry did not run on the new builder"
+[ "$(calls '^buildx rm space-guest-kernel$')" = 1 ] || fail "the builder that held the stalled build was not removed"
+retry_on_new_builder || fail "the retry did not run on a new builder: $(grep -e '--target export' "${WORK_DIR}/calls")"
+[ "$(grep -e '--target smoke' "${WORK_DIR}/calls" | grep -cE -e '--builder=space-guest-kernel( |$)')" = 0 ] ||
+    fail "the smoke build went back to the builder that held the stalled build"
+[ "$(calls '^buildx rm space-guest-kernel-retry-')" = 1 ] || fail "the run did not remove the builder it started for the retry"
 [ "$(calls '^build .*--target smoke')" = 1 ] || fail "the smoke build stalled again instead of going without them"
 without_external_after '^build .*--target smoke' || fail "the smoke build after the fallback used the mirror or cache"
 without_external_after 'cache-to' || fail "the exports after the fallback used the mirror or cache"
@@ -283,13 +292,25 @@ recorded || fail "a run that fell back was not recorded"
 
 PRESET_BUILDER=1 FAKE_STALL=external-build run "${MIRRORS}"$'\n'"${CACHES}" publish ||
     fail "a stall on the caller's builder failed the check: $(cat "${WORK_DIR}/out")"
-[ "$(calls '^buildx rm ')" = 0 ] || fail "the caller's builder was removed"
-[ "$(grep -e '--target export' "${WORK_DIR}/calls" | tail -n 1 | grep -c -e '--builder=')" = 0 ] ||
-    fail "the retry stayed on the caller's builder that held the stalled build"
-[ "$(grep -e '--target smoke' "${WORK_DIR}/calls" | grep -c -e '--builder=')" = 0 ] ||
+[ "$(calls '^buildx rm space-guest-kernel$')" = 0 ] || fail "the caller's builder was removed"
+retry_on_new_builder || fail "the retry stayed on the caller's builder that held the stalled build"
+[ "$(grep -e '--target smoke' "${WORK_DIR}/calls" | grep -cE -e '--builder=space-guest-kernel( |$)')" = 0 ] ||
     fail "the smoke build went back to the caller's builder"
-[ "$(calls 'cache-to')" = 0 ] || fail "Docker's own builder tried to export the cache after the fallback"
 recorded || fail "a run that left the caller's builder was not recorded"
+
+# The removal fails, and the stalled builder keeps its name: the retry must not
+# take it back by that name.
+FAKE_RM_FAILS=1 FAKE_STALL=external-build run "${MIRRORS}"$'\n'"${CACHES}" publish ||
+    fail "a stall whose builder could not be removed failed the check: $(cat "${WORK_DIR}/out")"
+said "::warning::Could not remove the space-guest-kernel builder" || fail "a failed builder removal was not reported"
+retry_on_new_builder || fail "the retry reused the builder that held the stalled build after its removal failed"
+
+FAKE_BAD_BUILDER=space-guest-kernel-retry FAKE_STALL=external-build run "${MIRRORS}"$'\n'"${CACHES}" publish ||
+    fail "a stall whose new builder did not start failed the check: $(cat "${WORK_DIR}/out")"
+[ "$(grep -e '--target export' "${WORK_DIR}/calls" | tail -n 1 | grep -c -e '--builder=')" = 0 ] ||
+    fail "the retry did not fall back to Docker's own builder when the new one did not start"
+[ "$(calls 'cache-to')" = 0 ] || fail "Docker's own builder tried to export the cache after the fallback"
+recorded || fail "a retry on Docker's own builder was not recorded"
 
 FAKE_STALL=external-build run "${MIRRORS}" publish ||
     fail "a stalled mirror without a cache failed the check: $(cat "${WORK_DIR}/out")"
