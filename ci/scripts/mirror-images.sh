@@ -117,9 +117,22 @@ mirrored() {
     space_with_deadline "${READ_TIMEOUT_SECONDS}" docker buildx imagetools inspect --raw "$1" >/dev/null 2>&1
 }
 
+# Records are read with jq. Without it, say once per run that images pinned by
+# digest come from their sources, rather than skip the mirror silently.
+JQ_WARNED=0
+have_jq() {
+    command -v jq >/dev/null 2>&1 && return 0
+    if [ "${JQ_WARNED}" -eq 0 ]; then
+        echo "::warning::jq is not installed, so the mirror's records cannot be read; images pinned by digest come from their sources" >&2
+        JQ_WARNED=1
+    fi
+    return 1
+}
+
 # Whether a pairing's record exists and names the given digest.
 record_names() {
     local named
+    have_jq || return 1
     named="$(space_with_deadline "${READ_TIMEOUT_SECONDS}" \
         docker buildx imagetools inspect --format '{{json .Manifest}}' "$1" 2>/dev/null | jq -r '.digest // empty')" ||
         return 1
@@ -267,6 +280,10 @@ check_listed_digest() {
 
 publish() {
     local listed name mirror destination use sources digest failures=0
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "::error::publish needs jq to verify and record the pairings of images pinned by digest"
+        return 1
+    fi
     listed="$(entries)"
     registry_login
     while read -r name mirror destination use sources; do

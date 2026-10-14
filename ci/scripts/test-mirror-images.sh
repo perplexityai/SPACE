@@ -311,6 +311,47 @@ FAKE_CREATE_DIGEST="sha256:$(printf 'b%.0s' {1..64})" run "" "${PINNED_MIRROR} $
 FAKE_CREATE_FAILS=1 run "" "${PINNED_MIRROR} ${PINNED_RECORD}=${PINNED_DIGEST}" publish && fail "publish succeeded although every copy failed"
 [ "$(calls_matching "imagetools create")" -eq 4 ] || fail "publish did not retry both repositories"
 
+# ── without jq ───────────────────────────────────────────────────────────────
+# Every tool on PATH but jq: records cannot be read, so digest-pinned images
+# come from their sources, and the run says so once; publish refuses.
+mkdir -p "${WORK_DIR}/no-jq"
+IFS=: read -ra path_dirs <<<"${PATH}"
+for dir in "${path_dirs[@]}"; do
+    for tool in "${dir}"/*; do
+        [ -x "${tool}" ] && [ "${tool##*/}" != jq ] && [ ! -e "${WORK_DIR}/no-jq/${tool##*/}" ] &&
+            ln -s "${tool}" "${WORK_DIR}/no-jq/${tool##*/}"
+    done
+done
+SECOND_PINNED_NAME="registry.example/library/rust:1-slim@sha256:$(printf 'f%.0s' {1..64})"
+SECOND_PINNED_RECORD="ghcr.io/example/mirror:pin-$(printf '%s %s' "${SECOND_PINNED_NAME}" "${PINNED_DIGEST}" | sha256sum | cut -c1-40)"
+cp "${WORK_DIR}/list" "${WORK_DIR}/two-pinned"
+printf '%s %s ghcr.io/example/mirror:rust-1-slim\n' "${SECOND_PINNED_NAME}" "${PINNED_DIGEST}" >>"${WORK_DIR}/two-pinned"
+printf 'FROM %s\nFROM %s\nFROM %s\n' "${PINNED_NAME}" "${SECOND_PINNED_NAME}" "${NAME}" >"${WORK_DIR}/Dockerfile.two"
+without_jq() { PATH="${WORK_DIR}/no-jq" "$@"; }
+command -v jq >/dev/null 2>&1 && PATH="${WORK_DIR}/no-jq" command -v jq >/dev/null 2>&1 &&
+    fail "the test could not remove jq from PATH"
+
+SPACE_MIRRORED_IMAGES="${WORK_DIR}/two-pinned" without_jq run "" \
+    "${MIRROR} ${PINNED_MIRROR} ${PINNED_RECORD}=${PINNED_DIGEST} ${SECOND_PINNED_RECORD}=${PINNED_DIGEST}" \
+    build-contexts "${WORK_DIR}/Dockerfile.two" || fail "build-contexts without jq exited nonzero"
+[ "$(cat "${WORK_DIR}/out")" = "--build-context=${NAME}=docker-image://${MIRROR}" ] ||
+    fail "build-contexts without jq overrode a digest-pinned base or dropped a tag-only one: $(cat "${WORK_DIR}/out")"
+[ "$(grep -c "jq is not installed" "${WORK_DIR}/err")" -eq 1 ] ||
+    fail "build-contexts without jq did not warn exactly once: $(cat "${WORK_DIR}/err")"
+grep -q "images pinned by digest come from their sources" "${WORK_DIR}/err" || fail "the warning did not say what it costs"
+
+without_jq run "" "${PINNED_MIRROR} ${PINNED_RECORD}=${PINNED_DIGEST}" verified "${PINNED_NAME}" &&
+    fail "verified without jq accepted a record it could not read"
+grep -q "jq is not installed" "${WORK_DIR}/err" || fail "verified without jq did not say why"
+[ -s "${WORK_DIR}/out" ] && fail "verified without jq wrote to stdout, which callers capture"
+
+without_jq run "${PINNED_RECORD}=${PINNED_MIRROR}" "" pull "${PINNED_NAME}" || fail "pull without jq exited nonzero"
+called "tag ${PINNED_MIRROR} ${PINNED_NAME%%@*}" || fail "pull, which needs no jq, stopped taking the mirror without it"
+
+without_jq run "" "${MIRROR}" publish && fail "publish ran without jq"
+grep -q "::error::publish needs jq" "${WORK_DIR}/out" || fail "publish without jq did not say why"
+grep -q "imagetools create" "${WORK_DIR}/calls" && fail "publish without jq copied or recorded something"
+
 printf '%s %s %s\n' "${NAME}" "${DIGEST#sha256:}" "${DESTINATION}" >"${WORK_DIR}/unpinned"
 SPACE_MIRRORED_IMAGES="${WORK_DIR}/unpinned" run "" "" pull "${NAME}" &&
     fail "a line without a SHA-256 digest was accepted"
