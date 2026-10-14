@@ -73,16 +73,21 @@ impl GitHubReleaseSource {
                 span.record("http.response.status_code", response.status().as_u16());
                 response.error_for_status()
             });
-        match &response {
-            Ok(_) => {
+        match response {
+            Ok(response) => {
                 span.record("otel.status_code", "OK");
+                Ok(response)
             }
             Err(error) => {
+                // reqwest's error names the final URL, which after GitHub's
+                // redirect is a signed object-storage URL; `location` already
+                // names the public one.
+                let error = error.without_url();
                 span.record("otel.status_code", "ERROR");
                 span.record("otel.status_description", error.to_string().as_str());
+                Err(fetch(error))
             }
         }
-        response.map_err(fetch)
     }
 }
 
