@@ -2218,6 +2218,33 @@ impl SubstrateCapabilities {
     };
 }
 
+/// What [`SubstrateAdapter::ensure_routable_execution`] found for a sandbox's
+/// active execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionRoutabilityCheck {
+    /// The substrate's `started` makes no pod-routability promise, so the row
+    /// is routable as written. Nothing was checked or written.
+    Unconditional,
+    /// A live pod matching the active execution backed it, and its identity
+    /// was copied onto the execution row. The execution is now routable.
+    Hydrated,
+    /// The execution row was already routable.
+    AlreadyRoutable,
+    /// The execution is not routable. At most, the pod identity was recorded
+    /// on an execution row that is not running.
+    NotRoutable,
+}
+
+impl ExecutionRoutabilityCheck {
+    /// Whether a caller may treat the execution as routable.
+    pub const fn is_routable(self) -> bool {
+        match self {
+            Self::Unconditional | Self::Hydrated | Self::AlreadyRoutable => true,
+            Self::NotRoutable => false,
+        }
+    }
+}
+
 #[allow(async_fn_in_trait)]
 pub trait SubstrateAdapter: Send + Sync {
     /// Stable label written to control-plane metadata for this substrate.
@@ -2428,6 +2455,28 @@ pub trait SubstrateAdapter: Send + Sync {
         options: ActivationOptions,
         charge: RecoveryCharge,
     ) -> Result<ActivationCompletion, SubstrateError>;
+
+    /// Verify, and repair where the substrate can, that a `restoring`
+    /// sandbox's active execution is routable before a caller converges the
+    /// row to `started`.
+    ///
+    /// On a substrate whose `started` promises a routable execution row that
+    /// may need hydrating from a live pod (Kubernetes), this checks the
+    /// execution against the substrate and copies a live matching pod's
+    /// identity onto a row a dead wake handler never finished. `budget`
+    /// bounds the apiserver read; a timeout or transport error is returned as
+    /// an error, never as `NotRoutable`. The answer is advisory: a caller's
+    /// lifecycle CAS must still re-check routability inside its own write.
+    ///
+    /// The default is for a substrate whose `started` makes no such promise
+    /// (Direct): it answers `Unconditional` without checking anything.
+    async fn ensure_routable_execution(
+        &self,
+        _sandbox_id: SandboxId,
+        _budget: Duration,
+    ) -> Result<ExecutionRoutabilityCheck, SubstrateError> {
+        Ok(ExecutionRoutabilityCheck::Unconditional)
+    }
 
     /// Suspend a sandbox through the active execution object.
     ///
@@ -2776,6 +2825,18 @@ pub enum Substrate {
 }
 
 impl Substrate {
+    /// The Kubernetes substrate, for code that needs Kubernetes-only state
+    /// (its client, caches, or reconcilers typed on it). Behavior shared code
+    /// asks a substrate to perform belongs on [`SubstrateAdapter`], and static
+    /// facts on [`SubstrateCapabilities`].
+    #[cfg(feature = "kubernetes")]
+    pub fn as_kubernetes(&self) -> Option<&kubernetes::KubernetesSubstrate> {
+        match self {
+            Self::Direct(_) => None,
+            Self::Kubernetes(substrate) => Some(substrate),
+        }
+    }
+
     pub fn live_node_names(&self) -> Option<std::collections::HashSet<String>> {
         match self {
             Self::Direct(_) => None,
@@ -3395,8 +3456,7 @@ impl SubstrateAdapter for Substrate {
         pod_names: &[PodName],
     ) -> HashMap<PodName, ObservedPodIdentity> {
         match self {
-            // No pod objects, so nothing to observe; the default applies.
-            Self::Direct(_) => HashMap::new(),
+            Self::Direct(substrate) => substrate.observe_pod_identities(pod_names).await,
             #[cfg(feature = "kubernetes")]
             Self::Kubernetes(substrate) => substrate.observe_pod_identities(pod_names).await,
         }
@@ -3461,6 +3521,26 @@ impl SubstrateAdapter for Substrate {
             Self::Kubernetes(substrate) => {
                 substrate
                     .restore_execution(metric_identity, sandbox_id, options, charge)
+                    .await
+            }
+        }
+    }
+
+    async fn ensure_routable_execution(
+        &self,
+        sandbox_id: SandboxId,
+        budget: Duration,
+    ) -> Result<ExecutionRoutabilityCheck, SubstrateError> {
+        match self {
+            Self::Direct(substrate) => {
+                substrate
+                    .ensure_routable_execution(sandbox_id, budget)
+                    .await
+            }
+            #[cfg(feature = "kubernetes")]
+            Self::Kubernetes(substrate) => {
+                substrate
+                    .ensure_routable_execution(sandbox_id, budget)
                     .await
             }
         }

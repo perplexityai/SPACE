@@ -81,11 +81,11 @@ use crate::{
 use super::{
     ActivationCompletion, ActivationOptions, BuilderClient, CreateExecutionOutcome,
     CreateExecutionRequest, ExecutionActivation, ExecutionActivityKind, ExecutionBinding,
-    ExecutionIdentity, NODE_RPC_TIMEOUT, NodeApiTarget, NodeInventoryEntry, ObservedPod,
-    ObservedPodIdentity, OwnedNodeApiTarget, PodFenceMismatch, PodIdentityFence, RecordedExecution,
-    RetireExecutionOutcome, RetireExecutionRequest, RetireFence, RuntimeClient, SubstrateAdapter,
-    SubstrateCapabilities, SubstrateError, TeardownProgress, WaitReadyTimeoutPhase, connect_worker,
-    node_api_endpoint,
+    ExecutionIdentity, ExecutionRoutabilityCheck, NODE_RPC_TIMEOUT, NodeApiTarget,
+    NodeInventoryEntry, ObservedPod, ObservedPodIdentity, OwnedNodeApiTarget, PodFenceMismatch,
+    PodIdentityFence, RecordedExecution, RetireExecutionOutcome, RetireExecutionRequest,
+    RetireFence, RuntimeClient, SubstrateAdapter, SubstrateCapabilities, SubstrateError,
+    TeardownProgress, WaitReadyTimeoutPhase, connect_worker, node_api_endpoint,
 };
 
 const START_WAIT_FAST_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -1205,19 +1205,19 @@ impl KubernetesSubstrate {
 
 mod adapter;
 #[cfg(test)]
-mod adapter_characterization_tests;
+pub(crate) mod adapter_characterization_tests;
 mod execution;
 mod node_sync;
 mod per_sandbox_setup;
 mod pod_ops;
 mod pool;
 #[cfg(test)]
-mod scripted_test_doubles;
+pub(crate) mod scripted_test_doubles;
 mod support;
 #[cfg(test)]
 pub(crate) mod tests;
 mod wait_ready;
 
 pub use node_sync::SyncNodeInventoryError;
-pub use pod_ops::ExecutionHydrationOutcome;
+use pod_ops::ExecutionHydrationOutcome;
 use pod_ops::{ActivationAttemptAssignment, PodMaterializationOwnership, StartedRecoveryOwnership};

@@ -1224,6 +1224,22 @@ impl SubstrateAdapter for KubernetesSubstrate {
         .await
     }
 
+    async fn ensure_routable_execution(
+        &self,
+        sandbox_id: SandboxId,
+        budget: Duration,
+    ) -> Result<ExecutionRoutabilityCheck, SubstrateError> {
+        Ok(
+            match self.hydrate_restored_execution(sandbox_id, budget).await? {
+                ExecutionHydrationOutcome::Hydrated => ExecutionRoutabilityCheck::Hydrated,
+                ExecutionHydrationOutcome::AlreadyRoutable => {
+                    ExecutionRoutabilityCheck::AlreadyRoutable
+                }
+                ExecutionHydrationOutcome::NotRoutable => ExecutionRoutabilityCheck::NotRoutable,
+            },
+        )
+    }
+
     async fn suspend_execution(
         &self,
         sandbox_id: SandboxId,

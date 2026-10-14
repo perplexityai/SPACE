@@ -374,8 +374,8 @@ pub async fn run_reconcilers(
     // already marked failed but still carrying active execution rows. Runs for
     // both substrates because a stuck row outside any drain context still
     // wedges future operations on the row, and the sink only needs DB access +
-    // `SubstrateAdapter::delete_execution`, both of which the `Substrate` enum
-    // exposes uniformly. Transient lifecycle aging remains default-disabled,
+    // `SubstrateAdapter` methods, which the `Substrate` enum exposes
+    // uniformly. Transient lifecycle aging remains default-disabled,
     // while failed-sandbox cleanup runs unless
     // `SPACE_FAILED_SANDBOX_CLEANUP_ENABLED=false`.
     handles.push(tokio::spawn(
@@ -387,12 +387,12 @@ pub async fn run_reconcilers(
         ),
     ));
 
-    match substrate.as_ref() {
-        Substrate::Direct(_) => {
+    match substrate.as_kubernetes() {
+        None => {
             tracing::info!("skipping Kubernetes-only reconcilers on direct substrate");
         }
-        Substrate::Kubernetes(kube) => {
-            let kube = Arc::new((**kube).clone());
+        Some(kube) => {
+            let kube = Arc::new(kube.clone());
             let warm_pool_token = shutdown_token.child_token();
             let warm_pool_store = WarmPoolStore::new(pool.clone());
             let warm_pool_kube = kube.k8s.client.clone();

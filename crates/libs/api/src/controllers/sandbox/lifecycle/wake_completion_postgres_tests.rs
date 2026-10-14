@@ -170,3 +170,82 @@ async fn wake_completion_fence_follows_the_running_substrate() -> TestResult {
     }
     Ok(())
 }
+
+/// On Kubernetes the cancelled-wake redrive asks the substrate to hydrate a
+/// `restoring` row whose execution the database still reports unroutable (no
+/// pod IP yet): when the apiserver serves the execution's live, matching pod,
+/// the hydration makes the row routable and the redrive completes it to
+/// `started`. When the pod is gone, the row stays `restoring` for the sweeper;
+/// the completion CAS's own routability predicate also holds that case.
+#[cfg(feature = "kubernetes")]
+#[tokio::test(flavor = "current_thread")]
+async fn wake_completion_redrive_on_kubernetes_hydrates_before_completing() -> TestResult {
+    use axum::http::StatusCode;
+
+    use crate::controllers::sandbox::wake_completion::wake_completion_redrive;
+    use crate::controllers::substrate::Substrate;
+    use crate::controllers::substrate::kubernetes::adapter_characterization_tests::sandbox_pod;
+    use crate::controllers::substrate::kubernetes::scripted_test_doubles::{
+        kube_status, pod_reply, scripted_kube_client,
+    };
+    use crate::controllers::substrate::kubernetes::tests::{
+        insert_k8s_execution, substrate_with_store_and_client,
+    };
+    use pplx_space_metrics::sandbox::api::WakeCompletionAction;
+
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+
+    for (pod_is_live, expected) in [(true, "started"), (false, "restoring")] {
+        let sandbox_id = SandboxId::new();
+        let pod_name = format!("space-sbx-{sandbox_id}-g1");
+        insert_sandbox(pool, sandbox_id, "restoring").await?;
+        insert_k8s_execution(pool, sandbox_id, 1, &pod_name, "", None, true).await?;
+        sqlx::query(sql!(
+            "UPDATE sandbox_k8s_executions SET state = 'creating' WHERE sandbox_id = $1"
+        ))
+        .bind(sandbox_id)
+        .execute(pool)
+        .await?;
+        let live_pod = sandbox_pod(
+            &pod_name,
+            "redrive-uid",
+            sandbox_id,
+            1,
+            "Running",
+            Some("192.0.2.9"),
+        );
+        let (client, _log) = scripted_kube_client(move |_request| {
+            if pod_is_live {
+                pod_reply(&live_pod)
+            } else {
+                kube_status(StatusCode::NOT_FOUND, "NotFound")
+            }
+        });
+        let substrate = Substrate::Kubernetes(Box::new(substrate_with_store_and_client(
+            pool.clone(),
+            client,
+        )));
+
+        // A zero budget makes exactly one attempt: read, routability check,
+        // fenced CAS.
+        wake_completion_redrive(
+            pool.clone(),
+            substrate,
+            sandbox_id,
+            WakeCompletionAction::Wake,
+            std::time::Duration::ZERO,
+        )
+        .await;
+
+        let lifecycle = lifecycle_and_placement(pool, sandbox_id)
+            .await?
+            .map(|(lifecycle, _)| lifecycle);
+        assert_eq!(
+            lifecycle.as_deref(),
+            Some(expected),
+            "pod is live: {pod_is_live}"
+        );
+    }
+    Ok(())
+}

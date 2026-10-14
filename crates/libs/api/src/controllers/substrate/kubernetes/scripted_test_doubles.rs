@@ -37,22 +37,22 @@ pub(super) const WORKER_NODE: &str = "node-a";
 // ── Scripted Kubernetes apiserver ───────────────────────────────────────────
 
 #[derive(Debug, Clone)]
-pub(super) struct KubeRequest {
-    pub(super) method: Method,
-    pub(super) path: String,
-    pub(super) body: Option<serde_json::Value>,
+pub(crate) struct KubeRequest {
+    pub(crate) method: Method,
+    pub(crate) path: String,
+    pub(crate) body: Option<serde_json::Value>,
 }
 
-pub(super) enum KubeReply {
+pub(crate) enum KubeReply {
     Json(StatusCode, serde_json::Value),
     /// Never answer, for callers that bound the read with their own budget.
     Hang,
 }
 
-pub(super) type KubeLog = Arc<Mutex<Vec<KubeRequest>>>;
+pub(crate) type KubeLog = Arc<Mutex<Vec<KubeRequest>>>;
 
 /// A kube client whose every request is recorded and answered by `reply`.
-pub(super) fn scripted_kube_client(
+pub(crate) fn scripted_kube_client(
     reply: impl Fn(&KubeRequest) -> KubeReply + Send + Sync + 'static,
 ) -> (Client, KubeLog) {
     scripted_kube_client_async(move |request| std::future::ready(reply(&request)))
@@ -94,7 +94,7 @@ where
     (ClientBuilder::new(service, "space").build(), log)
 }
 
-pub(super) fn kube_status(code: StatusCode, reason: &str) -> KubeReply {
+pub(crate) fn kube_status(code: StatusCode, reason: &str) -> KubeReply {
     KubeReply::Json(
         code,
         serde_json::json!({
@@ -108,7 +108,7 @@ pub(super) fn kube_status(code: StatusCode, reason: &str) -> KubeReply {
     )
 }
 
-pub(super) fn pod_reply(pod: &Pod) -> KubeReply {
+pub(crate) fn pod_reply(pod: &Pod) -> KubeReply {
     KubeReply::Json(
         StatusCode::OK,
         serde_json::to_value(pod).expect("pod serializes"),

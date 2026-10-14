@@ -1,4 +1,5 @@
-//! `pod_ops::hydrate_restored_execution` and `suspend_execution`.
+//! `pod_ops::hydrate_restored_execution`, the `ensure_routable_execution`
+//! answer built on it, and `suspend_execution`.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,7 +18,7 @@ use super::super::tests::{
     substrate_with_store_and_client, substrate_with_store_client_proxy_port_and_pod,
 };
 use super::*;
-use crate::controllers::substrate::PublishedLocalArtifact;
+use crate::controllers::substrate::{ExecutionRoutabilityCheck, PublishedLocalArtifact, Substrate};
 
 /// Long enough that a correct suspend retirement never misses it on a slow
 /// runner; the doubles answer the DELETE and the absence check immediately.
@@ -283,6 +284,76 @@ async fn hydrate_restored_execution_does_not_hydrate_an_execution_retired_mid_re
     let (state, active, pod_uid, pod_ip) = execution_row(&db.pool, sandbox_id, 1).await?;
     assert!(!active);
     assert_eq!((state.as_str(), pod_uid, pod_ip), ("creating", None, None));
+    Ok(())
+}
+
+// ── ensure_routable_execution ───────────────────────────────────────────────
+
+/// The routability check the wake-completion redrive and the
+/// transient-lifecycle sweeper ask through `Substrate` answers with this
+/// substrate's hydration verdict. Each row: the execution's state and pod IP
+/// before the check, what the apiserver holds, and the answer (`None` for an
+/// error).
+#[rstest::rstest]
+#[case::matching_pod_hydrates(
+    ("creating", None),
+    HydrationPod::Matching,
+    Some(ExecutionRoutabilityCheck::Hydrated)
+)]
+#[case::routable_row_needs_no_apiserver(
+    ("running", Some(UNDIALED_POD_IP)),
+    HydrationPod::Forbidden,
+    Some(ExecutionRoutabilityCheck::AlreadyRoutable)
+)]
+#[case::absent_pod_is_not_routable(
+    ("creating", None),
+    HydrationPod::Absent,
+    Some(ExecutionRoutabilityCheck::NotRoutable)
+)]
+#[case::apiserver_error_is_an_error(("creating", None), HydrationPod::Forbidden, None)]
+#[tokio::test(flavor = "current_thread")]
+async fn routability_check_answers_with_the_hydration_verdict(
+    #[case] (initial_state, initial_pod_ip): (&str, Option<&str>),
+    #[case] apiserver: HydrationPod,
+    #[case] expected: Option<ExecutionRoutabilityCheck>,
+) -> TestResult {
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let sandbox_id = SandboxId::new();
+    insert_test_sandbox_row(&db.pool, sandbox_id, "restoring").await?;
+    insert_execution(
+        &db.pool,
+        sandbox_id,
+        ExecutionSeed {
+            generation: 2,
+            pod_uid: None,
+            pod_ip: initial_pod_ip,
+            state: initial_state,
+            ..ExecutionSeed::running(HYDRATE_POD, "unused")
+        },
+    )
+    .await?;
+    let (client, _log) = scripted_kube_client(move |_request| match apiserver {
+        HydrationPod::Absent => kube_status(StatusCode::NOT_FOUND, "NotFound"),
+        HydrationPod::Matching => pod_reply(&sandbox_pod(
+            HYDRATE_POD,
+            "hydrate-uid",
+            sandbox_id,
+            2,
+            "Running",
+            Some("192.0.2.9"),
+        )),
+        HydrationPod::Forbidden => kube_status(StatusCode::FORBIDDEN, "Forbidden"),
+        HydrationPod::PriorGeneration => unreachable!("no case scripts a predecessor's pod"),
+    });
+    let substrate = Substrate::Kubernetes(Box::new(substrate_with_stale_cached_pod(
+        &db.pool, client, sandbox_id,
+    )));
+
+    let check = substrate
+        .ensure_routable_execution(sandbox_id, Duration::from_secs(5))
+        .await;
+
+    assert_eq!(check.as_ref().ok().copied(), expected, "{check:?}");
     Ok(())
 }
 

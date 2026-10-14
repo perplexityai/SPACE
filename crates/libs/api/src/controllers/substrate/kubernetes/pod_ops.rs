@@ -43,7 +43,7 @@ use read::{
 pub(super) use redrive::RedriveOutcome;
 #[cfg(test)]
 use redrive::{PreconditionReread, classify_precondition_reread};
-pub use restore::ExecutionHydrationOutcome;
+pub(super) use restore::ExecutionHydrationOutcome;
 use restore::pod_matches_execution_generation;
 #[cfg(test)]
 use restore::restored_pod_routability;

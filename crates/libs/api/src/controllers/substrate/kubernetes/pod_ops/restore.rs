@@ -12,7 +12,7 @@ pub(in crate::controllers::substrate::kubernetes) struct SuspendRestorePlan {
 /// kube-verified repair of an active execution row whose pod metadata a dead
 /// wake handler never persisted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecutionHydrationOutcome {
+pub(in crate::controllers::substrate::kubernetes) enum ExecutionHydrationOutcome {
     /// A live Running pod matching the active execution's generation was
     /// found and its `pod_uid`/`pod_ip` were persisted onto the execution
     /// row. The execution is now routable.
@@ -20,27 +20,13 @@ pub enum ExecutionHydrationOutcome {
     /// The execution row was already routable (`running` + `pod_ip`) — a
     /// concurrent hydration (e.g. the real wake path) won the race.
     AlreadyRoutable,
-    /// No routable backing pod: the row has no active execution, the pod is
-    /// gone from the apiserver, or the pod that exists does not match the
+    /// The execution is not routable: the row has no active execution, the
+    /// pod is gone from the apiserver, the pod that exists does not match the
     /// active execution (wrong sandbox/generation, not Running, deleting, or
-    /// no IP yet). Nothing was written.
+    /// no IP yet), the row is `recovering`, or the execution was retired or
+    /// replaced mid-read. At most, the pod identity was recorded on an
+    /// execution row that is not running, such as a `recovering` one.
     NotRoutable,
-}
-
-impl ExecutionHydrationOutcome {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Hydrated => "hydrated",
-            Self::AlreadyRoutable => "already_routable",
-            Self::NotRoutable => "not_routable",
-        }
-    }
-}
-
-impl fmt::Display for ExecutionHydrationOutcome {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
 }
 
 /// Whether `pod`'s identity annotations match this sandbox execution — the
@@ -93,11 +79,13 @@ impl KubernetesSubstrate {
     /// never persisted — the wake handler created the pod and the node-side
     /// restore succeeded, but the handler died before `persist_pod_metadata`
     /// ran, leaving the execution unroutable (`pod_ip` NULL / not `running`)
-    /// while a healthy pod serves traffic. Used by the cluster controller's
-    /// transient-lifecycle sweeper before it converges an alive `restoring`
-    /// row to `started`: in this substrate `started` is a contract that a
-    /// routable execution exists, and asserting it without one wedges the
-    /// sandbox behind the gen≥2 fresh-pod refusal.
+    /// while a healthy pod serves traffic. It answers this substrate's
+    /// [`SubstrateAdapter::ensure_routable_execution`], which the cluster
+    /// controller's transient-lifecycle sweeper and the api's cancelled-wake
+    /// completion redrive call before converging an alive `restoring` row to
+    /// `started`: in this substrate `started` is a contract that a routable
+    /// execution exists, and asserting it without one wedges the sandbox
+    /// behind the gen≥2 fresh-pod refusal.
     ///
     /// Truth-copying, not truth-inventing: the only write is
     /// [`K8sStore::persist_pod_metadata`] — the exact statement the wake path
@@ -118,10 +106,10 @@ impl KubernetesSubstrate {
     /// generation-guarded `persist_pod_metadata` reports this) returns
     /// `NotRoutable`, never `Hydrated`. Even so, the returned outcome is
     /// advisory, not a fence — `Hydrated`/`AlreadyRoutable` can go stale the
-    /// instant this returns. The sweeper's converge CAS re-checks
-    /// routability inside the `UPDATE` itself; do not treat this outcome as
-    /// proof for any other lifecycle write.
-    pub async fn hydrate_restored_execution(
+    /// instant this returns. Each caller's converge CAS (the sweeper's and
+    /// the redrive's) re-checks routability inside the `UPDATE` itself; do
+    /// not treat this outcome as proof for any other lifecycle write.
+    pub(in crate::controllers::substrate::kubernetes) async fn hydrate_restored_execution(
         &self,
         sandbox_id: SandboxId,
         budget: Duration,

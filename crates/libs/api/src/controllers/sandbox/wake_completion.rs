@@ -41,7 +41,7 @@ use pplx_space_sandbox_store as sandbox_store;
 use sqlx::PgPool;
 use tokio::sync::Semaphore;
 
-use crate::controllers::substrate::{Substrate, SubstrateCapabilities};
+use crate::controllers::substrate::{Substrate, SubstrateAdapter, SubstrateCapabilities};
 
 /// How often the redrive re-checks the row and re-attempts hydration. The
 /// node-side restore this waits on takes seconds to low tens of seconds;
@@ -50,8 +50,8 @@ use crate::controllers::substrate::{Substrate, SubstrateCapabilities};
 const REDRIVE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Per-attempt budget for the substrate's uncached pod GET inside
-/// [`hydrate once`](Substrate)-style calls; mirrors the sweeper's probe
-/// timeout scale.
+/// [`SubstrateAdapter::ensure_routable_execution`]; mirrors the sweeper's
+/// probe timeout scale.
 const REDRIVE_HYDRATE_BUDGET: Duration = Duration::from_secs(10);
 
 /// Cap on concurrently-running redrive tasks across the process. The shield
@@ -242,9 +242,10 @@ fn fenced_completion_cas() -> String {
 }
 
 /// Build the production redrive future for a cancelled wake: polls the
-/// Kubernetes substrate's kube-verified execution hydration (the same repair
-/// primitive the sweeper uses) until the execution is routable, then runs
-/// the fenced completion CAS. Bounded by `budget`.
+/// substrate's [`SubstrateAdapter::ensure_routable_execution`] (the same
+/// repair primitive the sweeper uses; on Kubernetes, the kube-verified
+/// execution hydration) until the execution is routable, then runs the
+/// fenced completion CAS. Bounded by `budget`.
 pub(super) fn wake_completion_redrive(
     pool: PgPool,
     substrate: Substrate,
@@ -254,23 +255,12 @@ pub(super) fn wake_completion_redrive(
 ) -> BoxFuture<'static, ()> {
     Box::pin(async move {
         let hydrate = || async {
-            match &substrate {
-                Substrate::Direct(_) => Ok(true),
-                #[cfg(feature = "kubernetes")]
-                Substrate::Kubernetes(kube) => {
-                    use crate::controllers::substrate::kubernetes::ExecutionHydrationOutcome;
-                    match kube
-                        .hydrate_restored_execution(sandbox_id, REDRIVE_HYDRATE_BUDGET)
-                        .await
-                    {
-                        Ok(
-                            ExecutionHydrationOutcome::Hydrated
-                            | ExecutionHydrationOutcome::AlreadyRoutable,
-                        ) => Ok(true),
-                        Ok(ExecutionHydrationOutcome::NotRoutable) => Ok(false),
-                        Err(err) => Err(err.to_string()),
-                    }
-                }
+            match substrate
+                .ensure_routable_execution(sandbox_id, REDRIVE_HYDRATE_BUDGET)
+                .await
+            {
+                Ok(check) => Ok(check.is_routable()),
+                Err(err) => Err(err.to_string()),
             }
         };
         let outcome = redrive_wake_completion(

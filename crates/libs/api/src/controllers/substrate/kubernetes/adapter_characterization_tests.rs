@@ -129,7 +129,7 @@ async fn active_execution_count(pool: &PgPool, sandbox_id: SandboxId) -> Result<
 }
 
 /// A sandbox pod stamped with the identity annotations the create path writes.
-fn sandbox_pod(
+pub(crate) fn sandbox_pod(
     pod_name: &str,
     pod_uid: &str,
     sandbox_id: SandboxId,

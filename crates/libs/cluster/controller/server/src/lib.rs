@@ -143,8 +143,8 @@ pub async fn run(
     // than `let _ =`, which would drop it immediately.
     let mut _readiness = None;
     let authority: leader_election::ReconcilerAuthority<leader_election::KubeLeaseStore> =
-        match &substrate {
-            Substrate::Kubernetes(kube) if le_config.enabled => {
+        match substrate.as_kubernetes() {
+            Some(_) if le_config.enabled => {
                 // Renewals and standby polls are the idle steady state, so the
                 // lease gets a client that records spans only for failures.
                 // The renewal in flight at shutdown is abandoned, not failed.

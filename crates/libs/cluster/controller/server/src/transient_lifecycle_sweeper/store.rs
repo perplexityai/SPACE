@@ -5,13 +5,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg(feature = "kubernetes")]
-use pplx_space_api::controllers::substrate::kubernetes::ExecutionHydrationOutcome;
 use pplx_space_api::controllers::substrate::{
-    CommandReadyProbe, NodeApiTarget, ObservedPodIdentity, PodFenceMismatch, PodIdentityFence,
-    RecordedExecution, RetireExecutionOutcome, RetireExecutionRequest, RetireFence, RuntimeClient,
-    Substrate, SubstrateAdapter, SubstrateError, connect_node_api_client_for_target,
-    sandbox_states_with_client,
+    CommandReadyProbe, ExecutionRoutabilityCheck, NodeApiTarget, ObservedPodIdentity,
+    PodFenceMismatch, PodIdentityFence, RecordedExecution, RetireExecutionOutcome,
+    RetireExecutionRequest, RetireFence, RuntimeClient, Substrate, SubstrateAdapter,
+    SubstrateError, connect_node_api_client_for_target, sandbox_states_with_client,
 };
 use pplx_space_common_core::types::{
     NodeManagedBy, NodeRole, PodName, PodUid, PositiveDuration, SandboxActivationAttemptId,
@@ -937,62 +935,61 @@ impl SweepSink for SubstrateSweepSink {
     }
 
     /// Routability verify-and-repair for an alive `restoring` candidate the
-    /// DB reported unroutable. The Kubernetes substrate consults the
-    /// apiserver and hydrates the execution row from a live matching pod
-    /// (`hydrate_restored_execution`); the direct substrate has no
-    /// pod-routability contract, so its rows are always routable (and in
-    /// practice never reach this call — the candidate select's fact is
-    /// unconditionally true for `managed_by <> 'k8s'` rows).
+    /// DB reported unroutable, through the substrate's
+    /// [`SubstrateAdapter::ensure_routable_execution`]. The Kubernetes
+    /// substrate consults the apiserver and hydrates the execution row from a
+    /// live matching pod; the direct substrate has no pod-routability
+    /// contract, so its rows are always routable (and in practice never reach
+    /// this call — the candidate select's fact is unconditionally true for
+    /// `managed_by <> 'k8s'` rows).
     async fn ensure_routable_execution(
         &self,
         sandbox_id: SandboxId,
         probe_timeout: Duration,
     ) -> Result<ExecutionRoutability, String> {
-        match self.substrate.as_ref() {
-            Substrate::Direct(_) => Ok(ExecutionRoutability::Routable),
-            #[cfg(feature = "kubernetes")]
-            Substrate::Kubernetes(kube) => {
-                let outcome = kube
-                    .hydrate_restored_execution(sandbox_id, probe_timeout)
-                    .await
-                    .map_err(|err| {
-                        // A broken check (apiserver unreachable, RBAC, DB
-                        // error) must be distinguishable from "nothing to
-                        // do": the affected rows sit `restoring` until this
-                        // path works again, so its failure rate needs its
-                        // own alertable signal.
-                        OutcomeEvent::execution_hydration(HydrationOutcome::Error)
-                            .sandbox_id(sandbox_id)
-                            .error(&err)
-                            .warn();
-                        err.to_string()
-                    })?;
-                match outcome {
-                    ExecutionHydrationOutcome::Hydrated => OutcomeEvent::execution_hydration(
-                        HydrationOutcome::HydratedExecutionFromLivePod,
-                    )
+        let check = SubstrateAdapter::ensure_routable_execution(
+            self.substrate.as_ref(),
+            sandbox_id,
+            probe_timeout,
+        )
+        .await
+        .map_err(|err| {
+            // A broken check (apiserver unreachable, RBAC, DB error) must
+            // be distinguishable from "nothing to do": the affected rows
+            // sit `restoring` until this path works again, so its failure
+            // rate needs its own alertable signal.
+            OutcomeEvent::execution_hydration(HydrationOutcome::Error)
+                .sandbox_id(sandbox_id)
+                .error(&err)
+                .warn();
+            err.to_string()
+        })?;
+        match check {
+            // Nothing was checked, so there is no hydration outcome to report.
+            ExecutionRoutabilityCheck::Unconditional => {}
+            ExecutionRoutabilityCheck::Hydrated => {
+                OutcomeEvent::execution_hydration(HydrationOutcome::HydratedExecutionFromLivePod)
                     .sandbox_id(sandbox_id)
-                    .info(),
-                    ExecutionHydrationOutcome::AlreadyRoutable => {
-                        OutcomeEvent::execution_hydration(HydrationOutcome::Skipped)
-                            .reason("already_routable")
-                            .sandbox_id(sandbox_id)
-                            .debug()
-                    }
-                    ExecutionHydrationOutcome::NotRoutable => {
-                        OutcomeEvent::execution_hydration(HydrationOutcome::Deferred)
-                            .reason("no_routable_pod")
-                            .sandbox_id(sandbox_id)
-                            .debug()
-                    }
-                }
-                Ok(match outcome {
-                    ExecutionHydrationOutcome::Hydrated
-                    | ExecutionHydrationOutcome::AlreadyRoutable => ExecutionRoutability::Routable,
-                    ExecutionHydrationOutcome::NotRoutable => ExecutionRoutability::NotRoutable,
-                })
+                    .info()
+            }
+            ExecutionRoutabilityCheck::AlreadyRoutable => {
+                OutcomeEvent::execution_hydration(HydrationOutcome::Skipped)
+                    .reason("already_routable")
+                    .sandbox_id(sandbox_id)
+                    .debug()
+            }
+            ExecutionRoutabilityCheck::NotRoutable => {
+                OutcomeEvent::execution_hydration(HydrationOutcome::Deferred)
+                    .reason("no_routable_pod")
+                    .sandbox_id(sandbox_id)
+                    .debug()
             }
         }
+        Ok(if check.is_routable() {
+            ExecutionRoutability::Routable
+        } else {
+            ExecutionRoutability::NotRoutable
+        })
     }
 
     async fn converge_restoring(
