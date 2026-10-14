@@ -48,6 +48,18 @@ nodeSelector:
   space.pplx.net/node-pool: {{ index .ctx.Values.node.pools $role | quote }}
 {{- end -}}
 
+{{/*
+Node services carry the built-in system-node-critical class, as deployments
+give their node-service DaemonSets (infra/space/kind/manifests/priorityclasses.yaml
+has the cluster's other classes): a node-service pod that cannot fit preempts
+lower-priority pods rather than leaving the node without it, and the kubelet's
+node-pressure eviction ranks it behind lower-priority pods that exceed their
+requests.
+*/}}
+{{- define "space-node-service.priorityClass" -}}
+priorityClassName: system-node-critical
+{{- end -}}
+
 {{- define "space-node-service.image" -}}
 image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
 imagePullPolicy: {{ .Values.image.pullPolicy }}

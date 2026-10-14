@@ -170,6 +170,16 @@ None of these are provisioned here:
   kubectl --context CONTEXT apply -f infra/space/kind/manifests/runtimeclass.yaml
   ```
 
+- PriorityClasses `space-control-plane` and `space-replaceable`, which the
+  control plane and the migrate Job name (the node services use the built-in
+  `system-node-critical`). Kind applies them from
+  `infra/space/kind/manifests/priorityclasses.yaml`, and `install.sh` checks
+  them, read-only. Apply the same manifest once per cluster:
+
+  ```bash
+  kubectl --context CONTEXT apply -f infra/space/kind/manifests/priorityclasses.yaml
+  ```
+
 - Nodes labelled `space.pplx.net/infra=true` for the control plane, and
   `space.pplx.net/node-pool=sandbox` (workers) or `builder` (builders) for the
   node services (`node.pools`). Sandbox workers also carry the label the API

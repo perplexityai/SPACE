@@ -1007,7 +1007,7 @@ kind cluster: space-local (kind-cluster.yaml.tmpl — 6 nodes)
 │   ├── space-redis           (Deployment; the rate limiters' store, which api, admin-api and cluster-controller reach through SPACE_REDIS_URL)
 │   ├── space-api             (Deployment, 2–3 replicas by HPA; SPACE_K8S_CONTROL_PLANE=true)
 │   ├── space-admin-api       (Deployment; the same binary on the dedicated admin surface)
-│   ├── space-internal-api    (Deployment; ClusterApi — node registration + template releases)
+│   ├── space-internal-api    (Deployment, 2 replicas; ClusterApi — node registration + template releases)
 │   ├── space-credmgr-authority (Deployment, 2 replicas; credential-manager authority — credential tables + platform KEK)
 │   ├── space-kind-key-broker (Deployment; Kind-only intermediate-key broker fixture behind the platform KEK)
 │   ├── space-data-plane      (Deployment, 2–3 replicas by HPA)
@@ -1103,6 +1103,10 @@ load-balanced entry, scaled on load.
 - **cluster-controller** runs two replicas with leader election on: the Lease
   holder runs every reconciler and the other stands by, Ready, to take over.
   `smoke-kind-leader-election-brownout.sh` exercises the handoff.
+- **internal-api** (ClusterApi) runs two replicas behind its ClusterIP
+  Service and rolls one at a time. It needs no election: its state is in
+  Postgres, written under row locks and claim tokens, its RPCs are unary, and
+  its per-replica caches are bounded (the chart's values cite the code).
 - **Admin API.** `space-admin-api` runs the same binary with
   `--surface admin`, the dedicated admin surface, in its own Deployment and
   ClusterIP Service. Clients and the harness keep using the shared surface's
@@ -1119,6 +1123,57 @@ A cluster created before the port mappings cannot gain them, since Docker fixes
 a node container's ports when it creates it. `check-node-layout.sh` refuses it
 with the commands to recreate it (see
 [Upgrading from the node-stack layout](#upgrading-from-the-node-stack-layout)).
+
+## Shutdown, disruption and self-repair
+
+The control plane stops, moves and repairs itself as deployments run it, so
+the code paths for draining, voluntary disruption and stuck rows run here
+too. Each chart's values cite the code behind its numbers.
+
+- **Graceful shutdown.** space-api and space-admin-api (one binary) render
+  `--shutdown-grace-secs` at the binary's 150 s default. On SIGTERM the
+  process reports draining on `/readyz`, stops accepting, and finishes
+  in-flight requests, SSE streams and the substrate work it tracks (a
+  restore leader, a suspend continuation) within that grace. A 5 s preStop
+  sleep keeps the pod serving while it leaves the entry Services' endpoints,
+  and the 180 s termination grace covers both plus exit. The data plane has no
+  drain budget of its own: it stops accepting and waits for plain HTTP
+  streaming responses (native session SSE, ECW process and file streams), so
+  it gets the same preStop delay and a 180 s grace as their bound. Upgraded
+  connections do not drain: service-port proxies and ingress, upgraded HTTP
+  proxies and raw service sessions close at SIGTERM, and the other WebSocket
+  session attaches end with the process. internal-api waits for in-flight ClusterApi calls,
+  which the server does not bound and every client times out at 30 s, with a
+  5 s preStop and a 50 s grace that covers both and the telemetry flush.
+  cluster-controller bounds its reconciler drain at 10 s inside its 30 s
+  grace.
+- **Startup and rollouts.** The API's startupProbe on `/readyz` is the boot
+  budget its Pod reflector leaves to Kubernetes (a replica whose initial LIST
+  never completes is restarted); the data plane's covers waiting for
+  ClusterApi before it binds. API, data plane and internal-api replicas count
+  as available after 10 s Ready (`minReadySeconds`), and each rolls one
+  replica at a time.
+- **Disruption budgets.** space-api, space-admin-api, space-data-plane,
+  space-cluster-controller, space-internal-api and space-credmgr-authority
+  each have a PodDisruptionBudget of `maxUnavailable: 1`: an eviction takes
+  one replica at a time and waits for its replacement. They all run on the
+  infra node; the node-drain scenarios drain sandbox workers, which carry
+  none of them. A Deployment rollout is not an eviction and follows its own
+  strategy.
+- **Priority.** `manifests/priorityclasses.yaml`, applied by both bring-up
+  paths before any workload, defines `space-control-plane` (the control-plane
+  Deployments and the in-cluster Postgres, object store, Redis and key
+  broker) and `space-replaceable` (the UI and the one-shot Jobs; it never
+  preempts). Node-service DaemonSets run as `system-node-critical`.
+- **Backstop reconcilers.** cluster-controller runs the ones deployments run:
+  the transient-lifecycle sweeper (restoring rows after 600 s, the other
+  transient lifecycles effectively off, failed-sandbox cleanup on), the
+  stuck-snapshot reaper, the started-sandbox and failed-restorable repairs
+  (live), the gone-node queue GC (dry-run) and the orphaned-restore-pod GC
+  (dry-run). At these ages a row a scenario holds mid-transition is not old
+  enough to touch; a row one of them acts on during a run was stuck past what
+  a deployment tolerates. The reconcile-queue GC, which would call EC2, stays
+  off (see the differences table).
 
 ## How the node registers itself
 
@@ -1499,6 +1554,10 @@ asks of the hosting deployment.
 | vhost-vsock jail nodes provided by the AMI                | the Kind-only `space-kind-vsock-jails.service` mknods them into each jail under `/space/cache/firecracker/jails` as it appears (kind-only) |
 | Sandbox SSH key generated by Packer per AMI               | generated per host by `build-seed.sh` under `~/.space-devbox/kind/ssh` |
 | ALB ingress in front of api / data-plane / ui             | NodePort entry Services behind the cluster's host port mappings for api and data-plane (kube-proxy balances per connection); `kubectl port-forward` for the single-replica ui |
+| preStop delays on api, admin-api, data-plane and internal-api sized for the load balancer's deregistration | the same hooks at 5 s: kube-proxy removes a terminating pod from the NodePort entry and ClusterIP Services in about a second, so a deployment-sized delay would only slow every rollout |
+| Control-plane replicas spread across nodes | no anti-affinity or topology spread: every control-plane pod runs on the one infra node, where a spread constraint has nothing to spread over and a required anti-affinity would leave second replicas Pending |
+| space-admin-api under a PodDisruptionBudget like the public API | one replica (operator traffic only) under the same `maxUnavailable: 1` budget, so it never holds a drain and does not keep the admin surface up during one; it rolls by `Recreate`, so a rollout leaves the admin surface down while the old pod drains and the new one starts |
+| Reconcile-queue GC (`SPACE_RECONCILE_QUEUE_GC_*`) prunes dead letters and asks EC2 whether a non-ready node's instance is gone | off, because a Kind bench must not call AWS: for a candidate it would sign `DescribeInstances` to the public EC2 API with the object store's keys. A reply with no live instance reads as gone; Kind's refs would be kept only because that call fails. No switch disables the EC2 detector alone, its EC2 client takes only the global `AWS_ENDPOINT_URL` (which would also redirect the controller's S3 clients), and its Postgres-only dead-letter pass runs in the same instance, so both stay off. The gone-node queue GC runs, dry-run |
 | The runtime manager installs releases and kernels, which node-manager publishes into the root-owned store `/space/vendor/artifacts` | `/space/vendor` is a read-only host bind, so the runtime manager runs `--list-only`: listing and cache checks work, installs are off |
 | Operators run node-local CLIs from the node host's shell   | the same CLIs run in the Kind-only `space-node-debug` root shell DaemonSet     |
 | Release binaries, built without `test-hooks`              | binaries built with `test-hooks` (`docker/Dockerfile.rust-build-kind`), so smokes can shrink timers and flip scenario switches; no chart sets a hook for authentication, and the TokenReview listeners read their namespace from the ServiceAccount mount as release binaries do |

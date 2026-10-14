@@ -278,10 +278,12 @@ bash "$KIND_DIR/scripts/install-observability.sh"
 log "installing containerd-shim-space-v2 on sandbox workers"
 bash "$KIND_DIR/scripts/install-shim.sh"
 
-# ── Step 5: shared manifests (namespace + RuntimeClass) ──────────────────────
-log "applying namespace + RuntimeClass"
+# ── Step 5: shared manifests (namespace, RuntimeClass, PriorityClasses) ──────
+log "applying namespace + RuntimeClass + PriorityClasses"
 kubectl --context "$KCTX" apply -f "$KIND_DIR/manifests/namespace.yaml" >/dev/null
 kubectl --context "$KCTX" apply -f "$KIND_DIR/manifests/runtimeclass.yaml" >/dev/null
+# Before any chart: admission rejects a pod that names a missing class.
+kubectl --context "$KCTX" apply -f "$KIND_DIR/manifests/priorityclasses.yaml" >/dev/null
 
 # Internal RPC TLS: the cluster's CA and the listeners' identities as Secrets,
 # before any workload that mounts them (docs/internal-rpc-tls.md).

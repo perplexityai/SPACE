@@ -44,6 +44,9 @@ apiServiceAccount: space-api
 # to whatever it found.
 replicaCount: 2
 
+# Scheduling priority (infra/space/kind/manifests/priorityclasses.yaml).
+priorityClassName: space-control-plane
+
 nodeSelector:
   space.pplx.net/infra: "true"
 
@@ -122,14 +125,19 @@ reconcilers:
     env:
       SPACE_PUBLIC_OPERATION_DISPATCHER_ENABLED: "true"
       SPACE_PUBLIC_OPERATION_DISPATCHER_EXECUTION_CONCURRENCY: "16"
-  # These repairs are live when enabled. Keep kind explicitly disabled until
-  # the end-to-end and smoke suites exercise their default-on behavior.
+  # Both repairs ship on and live, with no dry-run mode, and deployments run
+  # them so. Each moves a sandbox row back to `suspended` only when no
+  # execution or pod is left and a restorable snapshot is ready, after a
+  # minimum age: 180 s for failed rows (MIN_AGE_SECS,
+  # crates/libs/cluster/controller/server/src/failed_restorable_repair/mod.rs),
+  # 300 s for started ones (DEFAULT_MIN_AGE_SECS, started_sandbox_repair/mod.rs).
+  # Rendered explicitly so the chart says what runs.
   failedRestorableRepair:
     env:
-      SPACE_FAILED_RESTORABLE_REPAIR_ENABLED: "false"
+      SPACE_FAILED_RESTORABLE_REPAIR_ENABLED: "true"
   startedSandboxRepair:
     env:
-      SPACE_STARTED_SANDBOX_REPAIR_ENABLED: "false"
+      SPACE_STARTED_SANDBOX_REPAIR_ENABLED: "true"
   orphanedSandboxes:
     env: {}
   warmPool:
@@ -167,22 +175,40 @@ reconcilers:
     env:
       SPACE_KUBE_NODE_SYNC_ENABLED: "true"
   # Transient-lifecycle sweeper: cluster-wide backstop for sandbox rows
-  # wedged in a transient lifecycle. Default-off here too — the kind e2e
-  # tests that need it can opt in via per-test env overrides.
-  # Keep the default off: a globally-on sweeper acts on rows the other suites
-  # are mid-way through using. The suite that opts in restores these values on
-  # exit and verifies the restore. The suite owns its scope and cleanup.
+  # wedged in a transient lifecycle (ReconcilerConfig::from_env,
+  # crates/libs/cluster/controller/server/src/transient_lifecycle_sweeper/mod.rs).
+  # The binary ships it off; deployments run it on with minutes-scale ages,
+  # and so does Kind:
+  # - `restoring` rows are failed after 600 s, the binary's default age, sized
+  #   to cover an end-to-end suspend/restore round trip. The same switch runs
+  #   the unrestorable-restoring phase, which fails a markerless `restoring`
+  #   row with no source node, snapshot or upload in flight once its
+  #   placement is 300 s old.
+  # - Every other transient lifecycle is effectively off. creating, starting,
+  #   pausing, resuming and stopping have no per-lifecycle knob and take the
+  #   default age, so the default is a year; suspending and checkpointing
+  #   take `0`, which disables them.
+  # - Failed-sandbox cleanup (retrying the teardown of `failed` rows that
+  #   still hold an active execution) ships on; rendered explicitly.
+  # At these ages a row a scenario legitimately holds mid-transition is never
+  # old enough to sweep; one that is swept was stuck past what a deployment
+  # tolerates.
   transientLifecycleSweeper:
     env:
-      SPACE_TRANSIENT_LIFECYCLE_SWEEPER_ENABLED: "false"
-      SPACE_TRANSIENT_LIFECYCLE_SWEEPER_DEFAULT_AGE_SECS: "60"
-  # Stuck-snapshot reaper: cluster-wide backstop for suspend-snapshot rows
-  # wedged in `state = 'creating'` past the upload worker's retry window.
-  # Default-off here too — kind e2e tests that need it can opt in via
-  # per-test env overrides.
+      SPACE_TRANSIENT_LIFECYCLE_SWEEPER_ENABLED: "true"
+      SPACE_TRANSIENT_LIFECYCLE_SWEEPER_DEFAULT_AGE_SECS: "31536000"
+      SPACE_TRANSIENT_LIFECYCLE_SWEEPER_RESTORING_AGE_SECS: "600"
+      SPACE_TRANSIENT_LIFECYCLE_SWEEPER_SUSPENDING_AGE_SECS: "0"
+      SPACE_TRANSIENT_LIFECYCLE_SWEEPER_CHECKPOINTING_AGE_SECS: "0"
+      SPACE_FAILED_SANDBOX_CLEANUP_ENABLED: "true"
+  # Stuck-snapshot reaper: cluster-wide backstop that fails suspend-snapshot
+  # rows wedged in `state = 'creating'` past the upload worker's retry window.
+  # Ships off; deployments enable it. Its 24 h age and 5 min tick are fixed
+  # (DEFAULT_MIN_AGE_SECS, stuck_snapshot_reaper/mod.rs), so on Kind it scans
+  # and, unless an upload really hangs for a day, reaps nothing.
   stuckSnapshotReaper:
     env:
-      SPACE_STUCK_SNAPSHOT_REAPER_ENABLED: "false"
+      SPACE_STUCK_SNAPSHOT_REAPER_ENABLED: "true"
   # The minimum age (SPACE_SNAPSHOT_RETENTION_SWEEPER_MIN_AGE_SECS) is a test
   # hook left at its release value, which equals the API's fork-retention grace
   # (crates/libs/common/core/src/types/snapshot.rs). The retention scenarios
@@ -202,16 +228,37 @@ reconcilers:
       SPACE_SUSPENDED_EXECUTION_REAPER_ENABLED: "false"
   # Orphaned-restore-pod GC: reaps restore pods their owning row has provably
   # superseded (row deleted, no active execution on a reverted row, or a
-  # strictly-older generation). Default-off and dry-run here too — kind e2e
-  # tests that need it can opt in via per-test env overrides (and shrink
-  # THRESHOLD_SECS to make an orphan reapable within the test window).
+  # strictly-older generation). Ships off and dry-run; deployments enable it
+  # and keep it dry-run, classifying and reporting without deleting, at the
+  # binary's 60 s interval, 45 s tick budget and 300 s threshold
+  # (orphaned_restore_pod_gc/config.rs). The orphaned-restore-pod GC scenario
+  # scopes a live, short-threshold config to itself and restores this one.
   orphanedRestorePodGc:
     env:
-      SPACE_ORPHANED_RESTORE_POD_GC_ENABLED: "false"
+      SPACE_ORPHANED_RESTORE_POD_GC_ENABLED: "true"
       SPACE_ORPHANED_RESTORE_POD_GC_DRY_RUN: "true"
-      SPACE_ORPHANED_RESTORE_POD_GC_INTERVAL_SECS: "5"
-      SPACE_ORPHANED_RESTORE_POD_GC_THRESHOLD_SECS: "300"
-      SPACE_ORPHANED_RESTORE_POD_GC_TICK_BUDGET_SECS: "4"
+  # Reconcile-queue GC, one reconciler with two detector instances
+  # (reconcilers.rs, reconcile_queue_gc/mod.rs).
+  # - `SPACE_RECONCILE_QUEUE_GC_*`, the EC2 instance, ships off. Deployments
+  #   run it; Kind keeps it off because a Kind bench must not call AWS. For
+  #   a non-ready node whose live refs are 24 h old, Ec2Detector signs a
+  #   DescribeInstances call with the controller's AWS_REGION and the object
+  #   store's keys, to the public EC2 API. A reply with no live instance
+  #   would read as gone (Ec2InstanceLookup); only the call's own failure,
+  #   read as unknown, would keep the refs. There is no switch for the
+  #   detector alone, and its EC2 client (pplx_space_aws_client::ec2) takes
+  #   only the global AWS_ENDPOINT_URL, which would also redirect the
+  #   controller's S3 clients. The same instance runs the Postgres-only
+  #   dead-letter pass (run_dead_prune), so that stays off too.
+  # - `SPACE_GONE_NODE_QUEUE_GC_*`, the gone-node queue GC, ships on and
+  #   dry-run: it reports the live refs of nodes absent from Kubernetes
+  #   without deleting them, from Postgres and Kubernetes reads only.
+  #   Rendered explicitly at those defaults.
+  reconcileQueueGc:
+    env:
+      SPACE_RECONCILE_QUEUE_GC_ENABLED: "false"
+      SPACE_GONE_NODE_QUEUE_GC_ENABLED: "true"
+      SPACE_GONE_NODE_QUEUE_GC_DRY_RUN: "true"
 
 resources:
   requests:

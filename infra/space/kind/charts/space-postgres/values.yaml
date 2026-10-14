@@ -46,14 +46,15 @@ server:
   #                    crates/libs/api/src/run.rs) x 4 pods (HPA maximum 3,
   #                    plus 1 rolling-update surge)                       800
   #   space-admin-api  2 x 100 x 1 (Recreate)                              200
-  #   internal-api     30 + 3 (template-visibility sideline pool,
-  #                    crates/libs/internal/api/server/src/run.rs) x 1     33
+  #   internal-api     (30 + 3 (template-visibility sideline pool,
+  #                    crates/libs/internal/api/server/src/run.rs)) x 3
+  #                    (2 replicas + 1 surge)                              99
   #   cluster-controller (2 x 25 + 1 node-drain listener,
   #                    node_drain/store.rs) x 3 (2 replicas + 1 surge)    153
   #   credmgr-authority 25 (space_creds) x 3 (2 replicas + 1 surge)        75
   #   space-db-migrate one connection per step (lib.rs, bootstrap_roles.rs)  1
   #                                                                    -----
-  #                                                                     1262
+  #                                                                     1328
   # The rest is headroom for operator and harness psql sessions and the
   # superuser reserve (superuser_reserved_connections, 3). A pool-size or
   # replica change in those charts must keep this sum below the setting.
@@ -61,6 +62,9 @@ server:
   # Logs each lock wait longer than deadlock_timeout (1 s), as the deployed
   # server does, so contention shows up in Kind's logs.
   logLockWaits: "on"
+
+# Scheduling priority (infra/space/kind/manifests/priorityclasses.yaml).
+priorityClassName: space-control-plane
 
 nodeSelector:
   space.pplx.net/infra: "true"

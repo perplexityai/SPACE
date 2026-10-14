@@ -44,6 +44,12 @@ RECOVERY_ENVIRONMENT = (
     "SPACE_SMOKE_NATIVE_RECOVERY_CONTEXT",
     "SPACE_SMOKE_NATIVE_RECOVERY_CLUSTER_UID",
 )
+# Also waits for the replaced pods to be gone, so it is shorter than the API's
+# and data plane's 180 s termination grace. That is enough because a restart
+# here holds nothing open: the data-plane scenario closes its command's stream
+# before restarting (max_events), and the API scenario restarts with its create
+# queued behind the stopped controller, so each old pod exits after its 5 s
+# preStop. A scenario that restarts under an open stream needs a longer wait.
 ROLLOUT_TIMEOUT = 90.0
 # The cluster-controller's leader-election kill switch: on unless one of these
 # values turns it off (truthy_default in

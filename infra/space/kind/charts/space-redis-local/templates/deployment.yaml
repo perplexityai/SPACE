@@ -29,6 +29,7 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      priorityClassName: {{ .Values.priorityClassName }}
       terminationGracePeriodSeconds: 5
       containers:
         - name: redis

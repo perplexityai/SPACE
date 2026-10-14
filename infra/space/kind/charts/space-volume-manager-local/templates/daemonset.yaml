@@ -28,6 +28,7 @@ spec:
         {{- include "space-node-service.labels" $ctx | nindent 8 }}
     spec:
       {{- include "space-node-service.nodeSelector" $ctx | nindent 6 }}
+      {{- include "space-node-service.priorityClass" $ctx | nindent 6 }}
       serviceAccountName: {{ include "space-node-service.name" $ctx }}
       automountServiceAccountToken: false
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | int }}

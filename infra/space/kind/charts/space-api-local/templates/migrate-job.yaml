@@ -34,6 +34,7 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      priorityClassName: {{ .Values.migrate.priorityClassName }}
       automountServiceAccountToken: false
       initContainers:
         # bootstrap-roles is convergent and brackets the migrations: the

@@ -39,6 +39,45 @@ autoscaling:
   targetCPUUtilizationPercentage: 80
   targetMemoryAverageValue: 384Mi
 
+# Graceful shutdown, as deployments run it, for both surfaces (one binary).
+#
+# On SIGTERM the process reports draining on /readyz and stops accepting in the
+# same instant, then gives in-flight work --shutdown-grace-secs to finish
+# (drain_before_shutdown and drain_server, crates/libs/api/src/run.rs): HTTP
+# requests, including operation and sandbox-event SSE streams, the ingress
+# activation listener, and the substrate work its TaskTracker holds, such as
+# a restore leader or a suspend continuation. Rendered at the binary's
+# default, DEFAULT_SHUTDOWN_GRACE_SECS in that file.
+shutdownGraceSeconds: 150
+
+# Seconds the pod keeps serving after it starts terminating, before SIGTERM,
+# so it leaves the Services' endpoints before its listener stops: the process
+# itself has no lame-duck window. Deployments size this for their load
+# balancer's deregistration; Kind's NodePort entry is kube-proxy, which drops
+# the endpoint in about a second, so 5 s (the builder node-api's delay) covers
+# it.
+preStopSleepSeconds: 5
+
+# Covers the preStop delay, the full shutdown grace, and the telemetry flush
+# and exit after it. The template refuses a value that does not exceed the
+# first two.
+terminationGracePeriodSeconds: 180
+
+# The boot budget the Pod reflector leaves to Kubernetes (`start`,
+# crates/libs/api/src/controllers/substrate/kubernetes/pod_reflector.rs): a
+# replica whose reflector never completes its initial LIST stays NotReady
+# until restarted. Startup blocks up to 30 s on the node caches before serving
+# (STORE_READY_TIMEOUT, kubernetes/caches.rs), then the LIST runs; 18 x 5 s
+# gives that three times over before the kubelet restarts the container.
+startupProbe:
+  periodSeconds: 5
+  failureThreshold: 18
+
+# A replacement counts as available only after staying Ready this long, two
+# readiness periods, so one that fails its first probes stops the rollout
+# before an old replica is retired.
+minReadySeconds: 10
+
 # The dedicated admin API (`--surface admin`) in its own Deployment, as a
 # deployment that separates the admin surface from the public one runs it.
 # The harness and the admin CLI keep using the shared surface's
@@ -88,6 +127,9 @@ migrate:
   # default for an unstated deadline (MIGRATION_JOB_ACTIVE_DEADLINE,
   # crates/libs/db/migrator/src/migration_retry.rs).
   jobDeadlineSeconds: 1800
+  # A one-shot Job, re-run by the next rollout: replaceable
+  # (infra/space/kind/manifests/priorityclasses.yaml).
+  priorityClassName: space-replaceable
 
 postgres:
   # Secret holding POSTGRES_CONNECTION_STRING.
@@ -135,6 +177,9 @@ k8s:
   # labels the KinD workers before bringing the charts up.
   sandboxNodeSelectorKey: node.kubernetes.io/space-enabled
   sandboxNodeSelectorValue: "true"
+
+# Scheduling priority (infra/space/kind/manifests/priorityclasses.yaml).
+priorityClassName: space-control-plane
 
 nodeSelector:
   space.pplx.net/infra: "true"

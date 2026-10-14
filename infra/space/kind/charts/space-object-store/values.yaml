@@ -73,6 +73,12 @@ extraArgs:
   - --pprof
   - 127.0.0.1:6060
 
+# Scheduling priority (infra/space/kind/manifests/priorityclasses.yaml).
+priorityClassName: space-control-plane
+
+# The bucket-init Job is idempotent and re-runnable: replaceable.
+bucketInitPriorityClassName: space-replaceable
+
 # Object store placed on the infra node so a sandbox-worker drain never
 # disturbs it.
 nodeSelector:

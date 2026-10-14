@@ -368,10 +368,19 @@ local_resource(
 
 # Label the infra node so Postgres, space-api, and space-cluster-controller
 # can pin there via nodeSelector. These components must not run on sandbox
-# worker nodes that the drain reconciler can delete.
+# worker nodes that the drain reconciler can delete. Every workload that names
+# a SPACE PriorityClass waits on this resource, and admission rejects a pod
+# whose class does not exist yet, so the classes are applied here too (the
+# k8s_yaml keeps them Tilt-managed, as the Namespace manifest is).
+k8s_yaml("infra/space/kind/manifests/priorityclasses.yaml")
 local_resource(
     "label-kind-infra",
-    cmd = "kubectl --context kind-{cluster} label nodes -l 'space.pplx.net/node-pool=infra' space.pplx.net/infra=true --overwrite".format(cluster = KIND_CLUSTER),
+    cmd = """
+set -eu
+kubectl --context kind-{cluster} apply -f infra/space/kind/manifests/priorityclasses.yaml >/dev/null
+kubectl --context kind-{cluster} label nodes -l 'space.pplx.net/node-pool=infra' space.pplx.net/infra=true --overwrite
+""".format(cluster = KIND_CLUSTER),
+    deps = ["infra/space/kind/manifests/priorityclasses.yaml"],
     labels = ["bootstrap"],
 )
 

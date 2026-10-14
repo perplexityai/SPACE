@@ -30,6 +30,7 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      priorityClassName: {{ .Values.priorityClassName }}
       terminationGracePeriodSeconds: 10
       containers:
         - name: object-store

@@ -113,6 +113,7 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      priorityClassName: {{ .Values.priorityClassName }}
       serviceAccountName: {{ $name }}
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | int }}
       # space-sbxmgr's UID and GID, the account credential-manager runs as on

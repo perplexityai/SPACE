@@ -8,13 +8,19 @@ metadata:
     app.kubernetes.io/instance: {{ .Release.Name }}
     team: {{ .Values.datadogTeam | quote }}
 spec:
-  replicas: 1
+  replicas: {{ .Values.replicas }}
+  minReadySeconds: {{ .Values.minReadySeconds }}
   selector:
     matchLabels:
       app.kubernetes.io/name: space-internal-api
       app.kubernetes.io/instance: {{ .Release.Name }}
+  # ClusterApi keeps its state in Postgres, so a rollout replaces one replica
+  # at a time and the other keeps serving (values.yaml).
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   template:
     metadata:
       annotations:
@@ -29,8 +35,9 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      priorityClassName: {{ .Values.priorityClassName }}
       serviceAccountName: {{ .Values.serviceAccount.name }}
-      terminationGracePeriodSeconds: 10
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | int }}
       containers:
         - name: internal-api
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -167,6 +174,12 @@ spec:
             - name: grpc
               containerPort: {{ .Values.service.port }}
               protocol: TCP
+          # Leave the Service's endpoints before SIGTERM closes the listener
+          # (values.yaml).
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: {{ .Values.preStopSleepSeconds | int }}
           readinessProbe:
             exec:
               command:

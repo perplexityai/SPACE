@@ -35,6 +35,43 @@ clusterApiAuth:
   tenantPublishers:
     - space-builder-build-manager
 
+# Two replicas behind the ClusterIP Service, as deployments run several. The
+# binary keeps no state a later call has to find on the same replica and runs
+# no singleton work: every write is a Postgres transaction under row locks or
+# claim tokens (FOR UPDATE / SKIP LOCKED in crates/libs/internal/api/server),
+# its RPCs are all unary, and its only per-replica caches (the
+# template-visibility cache below, the TokenReview cache) are bounded and
+# documented per replica.
+replicas: 2
+
+# A replacement counts as available only after staying Ready this long, two
+# readiness periods, so a replica that fails its first probes stops the
+# rollout before the old one is retired.
+minReadySeconds: 10
+
+# On SIGTERM the listener stops accepting at once and tonic's graceful
+# shutdown waits for in-flight calls with no deadline of its own
+# (serve_with_incoming_shutdown, crates/libs/internal/api/server/src/run.rs).
+# The server sets no per-call deadline either (PublishNodeState runs several
+# database operations unbounded), so a call lasts until its client gives up
+# and resets the stream: every ClusterApi client, node-ctl's included, times
+# out at 30 s (CLUSTER_API_RPC_TIMEOUT in
+# crates/libs/node/api/client/src/cluster.rs, CLUSTER_RPC_TIMEOUT in
+# crates/libs/node/ctl/server/src/lib.rs). A call admitted at the end of the
+# preStop delay can therefore run until 5 + 30 s. Telemetry shutdown then
+# flushes metrics and traces in turn, each capped at 5 s (SHUTDOWN_TIMEOUT in
+# crates/libs/observability/src/sink/otlp.rs, the tracer provider's
+# shutdown_with_timeout in crates/libs/observability/src/lib.rs). The grace
+# is 5 + 30 + 10, plus 5 s to exit.
+terminationGracePeriodSeconds: 50
+
+# Seconds the pod keeps serving after it starts terminating, before SIGTERM,
+# while Kubernetes removes it from the Service's endpoints: without it a
+# caller that resolves the Service in that window reaches a closed listener.
+# Kind's kube-proxy removes an endpoint in about a second; deployments size
+# this for their load balancer.
+preStopSleepSeconds: 5
+
 service:
   name: space-internal-api
   port: 9800
@@ -70,6 +107,9 @@ postgres:
   # pool keeps its own fixed cap. Somewhat above the binary's default of 25,
   # as deployed. The space-postgres chart's max_connections holds it.
   poolMaxConnections: 30
+
+# Scheduling priority (infra/space/kind/manifests/priorityclasses.yaml).
+priorityClassName: space-control-plane
 
 nodeSelector:
   space.pplx.net/infra: "true"

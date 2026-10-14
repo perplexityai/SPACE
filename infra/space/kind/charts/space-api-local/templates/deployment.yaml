@@ -7,6 +7,9 @@ the shared Deployment runs the ingress activation listener, and only it is
 behind the space-api Service. Neither runs the migrations: the space-db-migrate
 Job (migrate-job.yaml) does, once, before either starts.
 */ -}}
+{{- if le (int .Values.terminationGracePeriodSeconds) (add (int .Values.preStopSleepSeconds) (int .Values.shutdownGraceSeconds)) -}}
+{{- fail "terminationGracePeriodSeconds must exceed preStopSleepSeconds + shutdownGraceSeconds" -}}
+{{- end -}}
 {{- range $surface := list "shared" "admin" }}
 {{- if or (eq $surface "shared") $.Values.admin.enabled }}
 {{- with $ }}
@@ -30,6 +33,7 @@ spec:
   {{- else }}
   replicas: {{ .Values.admin.replicas }}
   {{- end }}
+  minReadySeconds: {{ .Values.minReadySeconds }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ $name }}
@@ -59,8 +63,9 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      priorityClassName: {{ .Values.priorityClassName }}
       serviceAccountName: {{ .Values.serviceAccount.name }}
-      terminationGracePeriodSeconds: 10
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | int }}
       # docker/Dockerfile.api runs the api as space-api (UID and GID 952).
       # Secret files are root-owned, so the ingress activation listener reads
       # its key through this group, with mode 0440 on rpc-identity: the
@@ -77,6 +82,8 @@ spec:
             - {{ $surface }}
             - --listen
             - "0.0.0.0:{{ .Values.service.port }}"
+            - --shutdown-grace-secs
+            - {{ .Values.shutdownGraceSeconds | quote }}
           env:
             {{- if $shared }}
             # IngressActivationApi (docs/internal-rpc-tls.md, "Ingress
@@ -276,10 +283,25 @@ spec:
             - name: http
               containerPort: {{ .Values.service.port }}
               protocol: TCP
+          # Leave the entry Services' endpoints before SIGTERM stops the
+          # listener (values.yaml).
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: {{ .Values.preStopSleepSeconds | int }}
+          # The boot budget (values.yaml). Liveness and readiness start once
+          # it passes.
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: {{ .Values.startupProbe.periodSeconds }}
+            failureThreshold: {{ .Values.startupProbe.failureThreshold }}
           readinessProbe:
             # /readyz flips to ok only after KubernetesSubstrate's Pod
             # reflector has completed its initial LIST; this prevents traffic
-            # from hitting an api-server replica with a cold cache.
+            # from hitting an api-server replica with a cold cache. It reports
+            # draining from the moment SIGTERM arrives.
             httpGet:
               path: /readyz
               port: http
@@ -289,7 +311,6 @@ spec:
             httpGet:
               path: /healthz
               port: http
-            initialDelaySeconds: 15
             periodSeconds: 15
           {{- with .Values.resources }}
           resources:

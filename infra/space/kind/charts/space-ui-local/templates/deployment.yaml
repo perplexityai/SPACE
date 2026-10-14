@@ -22,6 +22,11 @@ spec:
         app.kubernetes.io/instance: {{ .Release.Name }}
         team: {{ .Values.datadogTeam | quote }}
     spec:
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      priorityClassName: {{ .Values.priorityClassName }}
       terminationGracePeriodSeconds: 10
       containers:
         - name: ui

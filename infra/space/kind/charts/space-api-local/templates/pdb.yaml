@@ -1,0 +1,30 @@
+{{- /*
+A disruption budget per API Deployment, as deployed: a voluntary eviction
+(a node drain, a cluster upgrade) takes at most one replica of each at a time
+and waits for its replacement to be ready before the next. The shared
+surface runs two or three replicas under its autoscaler, so one always
+serves; the admin surface runs one, which the budget still lets a drain move.
+Rollouts are not evictions: the Deployments' own strategies bound those.
+*/ -}}
+{{- range $surface := list "shared" "admin" }}
+{{- if or (eq $surface "shared") $.Values.admin.enabled }}
+{{- with $ }}
+{{- $name := ternary "space-api" "space-admin-api" (eq $surface "shared") }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ .Release.Name }}-{{ ternary "api" "admin-api" (eq $surface "shared") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $name }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+{{- end }}
+{{- end }}

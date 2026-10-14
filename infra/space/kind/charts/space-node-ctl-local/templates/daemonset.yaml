@@ -22,6 +22,7 @@ spec:
         {{- include "space-node-service.labels" $ctx | nindent 8 }}
     spec:
       {{- include "space-node-service.nodeSelector" $ctx | nindent 6 }}
+      {{- include "space-node-service.priorityClass" $ctx | nindent 6 }}
       # The Kubernetes node-local controller authenticates with this
       # ServiceAccount's token (rbac.yaml, fenced by node-fence.yaml); it
       # activates because SPACE_K8S_NODE_NAME is set

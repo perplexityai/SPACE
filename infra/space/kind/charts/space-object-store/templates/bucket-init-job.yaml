@@ -20,6 +20,7 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      priorityClassName: {{ .Values.bucketInitPriorityClassName }}
       containers:
         - name: bucket-init
           image: "{{ .Values.bucketInitImage.repository }}:{{ .Values.bucketInitImage.tag }}"

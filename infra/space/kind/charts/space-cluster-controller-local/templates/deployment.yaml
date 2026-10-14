@@ -39,6 +39,7 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      priorityClassName: {{ .Values.priorityClassName }}
       serviceAccountName: {{ .Values.serviceAccount.name }}
       terminationGracePeriodSeconds: 30
       containers:

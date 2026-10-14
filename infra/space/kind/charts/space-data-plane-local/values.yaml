@@ -39,6 +39,43 @@ autoscaling:
 # refreshes it at 80% of that.
 nodeApiTokenExpirationSeconds: 600
 
+# Graceful shutdown, as deployments give the data plane. The process has no
+# drain budget of its own: on SIGTERM its listener stops accepting at once,
+# /readyz keeps answering ok, and axum's graceful shutdown waits without a
+# deadline for plain HTTP responses still streaming (run,
+# crates/libs/data/plane/server/src/lib.rs): native session SSE and ECW
+# process and file streams, which last as long as their commands. Upgraded
+# connections do not drain. Sandbox service-port proxies and ingress and
+# upgraded HTTP proxies watch child tokens of the shutdown token and close at
+# SIGTERM (proxy_upgraded_connection, native/proxy.rs). Native WebSocket
+# session attaches run outside the server's connection tracking: raw service
+# sessions close at SIGTERM (bridge_raw_service_session, native.rs) and the
+# rest end with the process.
+#
+# Seconds the pod keeps serving after it starts terminating, before SIGTERM,
+# so it leaves the entry Services' endpoints first: kube-proxy drops an
+# endpoint in about a second, and deployments size this for their load
+# balancer instead.
+preStopSleepSeconds: 5
+
+# The only bound on the HTTP streams above. Sized like the API's: its 150 s
+# shutdown grace for the same clients' in-flight work, the preStop delay, and
+# exit.
+terminationGracePeriodSeconds: 180
+
+# The boot budget. The listener binds only once ClusterApi answers: startup
+# retries it with backoff to 5 s, each attempt with a 5 s connect timeout
+# (connect_cluster_api_for_startup, lib.rs), so a data plane that starts
+# beside a rolling internal-api waits for it here rather than in liveness
+# restarts. 24 x 5 s.
+startupProbe:
+  periodSeconds: 5
+  failureThreshold: 24
+
+# As the API's: a replacement counts as available after two readiness
+# periods Ready.
+minReadySeconds: 10
+
 internal:
   secretName: space-internal
   apiEndpoint: https://space-internal-api:9800
@@ -49,6 +86,9 @@ grpcClient:
 
 # JSON array of {apiHost, host} pairs (SPACE_ECW_HOSTS).
 ecwHosts: '[{"apiHost":"api.local.e2b.test","host":"local.e2b.test"}]'
+
+# Scheduling priority (infra/space/kind/manifests/priorityclasses.yaml).
+priorityClassName: space-control-plane
 
 nodeSelector:
   space.pplx.net/infra: "true"
