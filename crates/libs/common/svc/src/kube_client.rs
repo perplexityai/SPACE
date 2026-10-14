@@ -8,6 +8,7 @@ use kube::{
     Client, Config, Error,
     client::{Body, ClientBuilder},
 };
+use tokio_util::sync::CancellationToken;
 use tower_http::{
     classify::ServerErrorsFailureClass,
     trace::{MakeSpan, TraceLayer},
@@ -25,20 +26,40 @@ pub async fn traced_kube_client_from_env() -> Result<Client, Error> {
 /// reflector or a periodic list) and succeeds on every idle tick, so it records
 /// a span only when it fails; see [`FailureOnlyLayer`].
 pub fn traced_kube_client(config: Config) -> Result<Client, Error> {
-    kube_client_with_trace(config, FailureOnlyLayer { all_calls: false })
+    kube_client_with_trace(
+        config,
+        FailureOnlyLayer {
+            all_calls: false,
+            shutdown: None,
+        },
+    )
 }
 
 /// A Kubernetes client for a periodic loop whose every successful call is the
 /// idle steady state, such as lease renewal. A call with no traced span current
 /// records a span only when it fails, whatever its verb; the loop marks the
 /// ticks that change something itself.
-pub fn failure_traced_kube_client(config: Config) -> Result<Client, Error> {
-    kube_client_with_trace(config, FailureOnlyLayer { all_calls: true })
+///
+/// Such a loop abandons its in-flight call when the process shuts down, so a
+/// call dropped once `shutdown` is cancelled records nothing.
+pub fn failure_traced_kube_client(
+    config: Config,
+    shutdown: CancellationToken,
+) -> Result<Client, Error> {
+    kube_client_with_trace(
+        config,
+        FailureOnlyLayer {
+            all_calls: true,
+            shutdown: Some(shutdown),
+        },
+    )
 }
 
-pub async fn failure_traced_kube_client_from_env() -> Result<Client, Error> {
+pub async fn failure_traced_kube_client_from_env(
+    shutdown: CancellationToken,
+) -> Result<Client, Error> {
     let config = Config::infer().await.map_err(Error::InferConfig)?;
-    failure_traced_kube_client(config)
+    failure_traced_kube_client(config, shutdown)
 }
 
 fn kube_client_with_trace(config: Config, failure_only: FailureOnlyLayer) -> Result<Client, Error> {
@@ -87,10 +108,12 @@ struct SpanOnFailureOnly;
 /// `kubernetes.client` span recording the error, so a failing background loop
 /// is still traced. A call fails when it errors, answers with an unexpected
 /// error status ([`is_expected_status`]), its response body fails, or it is
-/// dropped before its body completes, as a caller's timeout does.
-#[derive(Clone, Copy, Debug)]
+/// dropped before its body completes, as a caller's timeout does, unless the
+/// `shutdown` token was cancelled first.
+#[derive(Clone, Debug)]
 struct FailureOnlyLayer {
     all_calls: bool,
+    shutdown: Option<CancellationToken>,
 }
 
 impl<S> tower::Layer<S> for FailureOnlyLayer {
@@ -100,6 +123,7 @@ impl<S> tower::Layer<S> for FailureOnlyLayer {
         FailureOnly {
             inner,
             all_calls: self.all_calls,
+            shutdown: self.shutdown.clone(),
         }
     }
 }
@@ -108,6 +132,7 @@ impl<S> tower::Layer<S> for FailureOnlyLayer {
 struct FailureOnly<S> {
     inner: S,
     all_calls: bool,
+    shutdown: Option<CancellationToken>,
 }
 
 impl<S, B> tower::Service<Request<Body>> for FailureOnly<S>
@@ -140,13 +165,16 @@ where
             return Box::pin(async move {
                 Ok(call.await?.map(|body| FailureWatchedBody {
                     inner: body,
-                    pending: PendingFailure(None),
+                    pending: PendingFailure::disarmed(),
                 }))
             });
         }
         request.extensions_mut().insert(SpanOnFailureOnly);
         // Armed until the body completes: a drop before then is a failure.
-        let mut pending = PendingFailure(Some(FailedCallSpan::new(&request, operation)));
+        let mut pending = PendingFailure {
+            call: Some(FailedCallSpan::new(&request, operation)),
+            shutdown: self.shutdown.clone(),
+        };
         let all_calls = self.all_calls;
         let call = self.inner.call(request);
         Box::pin(async move {
@@ -155,7 +183,7 @@ where
                 Ok(response) => {
                     let status = response.status();
                     let expected = pending
-                        .0
+                        .call
                         .as_ref()
                         .is_some_and(|call| is_expected_status(&call.operation, all_calls, status));
                     if (status.is_client_error() || status.is_server_error()) && !expected {
@@ -194,35 +222,52 @@ fn is_expected_status(operation: &str, all_calls: bool, status: http::StatusCode
 
 /// A failure-only call that has not finished: recorded as failed if it is
 /// dropped while armed.
-struct PendingFailure(Option<FailedCallSpan>);
+struct PendingFailure {
+    call: Option<FailedCallSpan>,
+    shutdown: Option<CancellationToken>,
+}
 
 impl PendingFailure {
+    fn disarmed() -> Self {
+        Self {
+            call: None,
+            shutdown: None,
+        }
+    }
+
     fn fail(&mut self, status: Option<http::StatusCode>, description: &str) {
-        if let Some(call) = self.0.take() {
+        if let Some(call) = self.call.take() {
             call.record(status, description);
         }
     }
 
     fn complete(&mut self) {
-        self.0 = None;
+        self.call = None;
+    }
+
+    /// Whether dropping the call now is a failure. A watch is a stream its
+    /// consumer ends by dropping it, so only its errors count, and a loop
+    /// abandons its call on purpose once the process shuts down. Any other
+    /// call dropped early timed out.
+    fn drop_is_failure(&self) -> bool {
+        self.call
+            .as_ref()
+            .is_some_and(|call| call.operation != "watch")
+            && !self
+                .shutdown
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
     }
 }
 
 impl Drop for PendingFailure {
-    /// A watch is a stream its consumer ends by dropping it, so only its errors
-    /// count; any other call dropped early timed out or was abandoned.
     fn drop(&mut self) {
-        if self
-            .0
-            .as_ref()
-            .is_some_and(|call| call.operation == "watch")
-        {
-            return;
+        if self.drop_is_failure() {
+            self.fail(
+                None,
+                "the call was dropped before its response completed, as by a caller's timeout",
+            );
         }
-        self.fail(
-            None,
-            "the call was dropped before its response completed, as by a caller's timeout",
-        );
     }
 }
 

@@ -147,10 +147,13 @@ pub async fn run(
             Substrate::Kubernetes(kube) if le_config.enabled => {
                 // Renewals and standby polls are the idle steady state, so the
                 // lease gets a client that records spans only for failures.
+                // The renewal in flight at shutdown is abandoned, not failed.
                 let lease_client =
-                    pplx_space_common_svc::kube_client::failure_traced_kube_client_from_env()
-                        .await
-                        .map_err(RunClusterControllerError::LeaseClient)?;
+                    pplx_space_common_svc::kube_client::failure_traced_kube_client_from_env(
+                        shutdown_token.clone(),
+                    )
+                    .await
+                    .map_err(RunClusterControllerError::LeaseClient)?;
                 let store = std::sync::Arc::new(leader_election::KubeLeaseStore::new(
                     lease_client,
                     &config.lease_namespace,

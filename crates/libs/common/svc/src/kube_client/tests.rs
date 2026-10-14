@@ -4,7 +4,12 @@ use http::{Method, Request};
 use tower_http::trace::MakeSpan;
 use tracing_subscriber::{Layer, layer::Context, prelude::*};
 
-use super::{K8sPathParts, KubeMakeSpan, k8s_otel_name, k8s_path_parts, kube_operation};
+use tokio_util::sync::CancellationToken;
+
+use super::{
+    FailedCallSpan, K8sPathParts, KubeMakeSpan, PendingFailure, k8s_otel_name, k8s_path_parts,
+    kube_operation,
+};
 
 #[test]
 fn k8s_path_parts_parses_api_paths() {
@@ -112,6 +117,69 @@ fn k8s_otel_name_formats_operation_and_resource() {
 
     for (name, operation, resource, want) in cases {
         assert_eq!(k8s_otel_name(operation, resource), want, "{name}");
+    }
+}
+
+#[test]
+fn a_call_dropped_early_fails_unless_abandoned_at_shutdown() {
+    struct Case {
+        name: &'static str,
+        operation: &'static str,
+        shutdown: Option<bool>,
+        want_failure: bool,
+    }
+
+    let cases = [
+        Case {
+            name: "lease renewal cut off by a caller timeout",
+            operation: "replace",
+            shutdown: Some(false),
+            want_failure: true,
+        },
+        Case {
+            name: "lease renewal abandoned at shutdown",
+            operation: "replace",
+            shutdown: Some(true),
+            want_failure: false,
+        },
+        Case {
+            name: "background read cut off by a caller timeout",
+            operation: "get",
+            shutdown: None,
+            want_failure: true,
+        },
+        Case {
+            name: "watch ended by its consumer",
+            operation: "watch",
+            shutdown: None,
+            want_failure: false,
+        },
+    ];
+
+    for case in cases {
+        let request = Request::builder()
+            .uri("/apis/coordination.k8s.io/v1/namespaces/space/leases/space-cluster-controller")
+            .body(kube::client::Body::empty())
+            .unwrap();
+        let shutdown = case.shutdown.map(|cancelled| {
+            let token = CancellationToken::new();
+            if cancelled {
+                token.cancel();
+            }
+            token
+        });
+        let mut pending = PendingFailure {
+            call: Some(FailedCallSpan::new(&request, case.operation.to_string())),
+            shutdown,
+        };
+
+        assert_eq!(
+            pending.drop_is_failure(),
+            case.want_failure,
+            "{}",
+            case.name
+        );
+        pending.complete();
     }
 }
 
