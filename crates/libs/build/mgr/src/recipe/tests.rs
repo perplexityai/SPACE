@@ -166,13 +166,8 @@ release = "questing"
     assert!(message.contains("missing field"));
 }
 
-/// The shared seed pins the BPF guest kernel, so the Falcon sensor can attach
-/// CO-RE instead of falling back to Reduced Functionality Mode. Pinning it here
-/// rather than in a Falcon-specific seed keeps one lineage, which is the agreed
-/// architecture, and makes staging a hard prerequisite: a node without this
-/// exact kernel in its runtime inventory cannot cold-boot anything built from
-/// this seed. Every cluster's worker and builder values must carry the matching
-/// `additionalGuestKernel` entry before this pin changes.
+/// The shared seed requires its exact BPF-capable kernel in the node runtime
+/// inventory before a template built from it can cold-boot.
 #[test]
 fn ordinary_seed_recipe_pins_the_bpf_guest_kernel() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))

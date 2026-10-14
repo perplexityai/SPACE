@@ -260,44 +260,26 @@ Explicit destination denies and platform guardrails take precedence. Exemptions
 grant no egress permission and bypass HTTP inspection and credential injection.
 Other destinations retain the policy's interception mode.
 
-The API's configured Falcon destination composition always adds its exact
-destinations to the allow list. It also adds them to the exemption list when
-`SPACE_FALCON_TLS_INTERCEPTION_EXEMPTIONS_ENABLED=true`. This API startup setting
-accepts `true` or `false` and defaults to `false` when unset. DNS resolver
-allowances are not exempted. Policies are persisted at create time; existing
-sandboxes need recreation or an explicit policy update to acquire exemptions.
+The API composes [operator egress profiles](egress-profiles.md) into the tenant's
+policy on authenticated federated creates. A profile independently supplies
+allowances and TLS exemptions. DNS resolver allowances are not exempted.
+Selected names are persisted separately from the effective policy. Fresh creates,
+policy replacement, and explicit template inheritance resolve current definitions.
+Forks retain the selected names and saved effective policy; resume and restart do
+not refresh profile destinations.
 An established exempt flow retains its verified hostname binding for its lifetime,
 so DNS expiry or cache eviction does not disconnect it on an unrelated policy
 update. Each update still rechecks current egress permissions and exemptions;
 removing an exemption closes the flow when the updated policy requires interception.
 New connections require fresh DNS evidence.
 
-Roll out in two phases:
+Before configuring nonempty profile exemptions, upgrade every policy reader and
+running gateway to support TLS exemptions. Native sandbox and template policy
+writers must observe the same reader compatibility requirement. Upgrade queued
+operation executors before APIs begin admitting profile selections.
 
-1. Leave the activation setting unset or `false` while upgrading every policy
-   reader, including all API replicas, the internal API, and the credential
-   manager, and every running worker gateway. Falcon composition continues adding
-   allowances without adding exemptions. Empty
-   exemption lists are omitted from JSON and preserve existing policy hashes.
-   An old internal API rejects an entire node policy batch when any requested
-   policy contains the new field; the credential manager also reads stored
-   policies when authorizing credential resolution.
-2. Once all readers and running gateways are compatible, set the activation
-   setting to `true` and roll the API. After activation completes, recreate
-   affected sandboxes or explicitly update their policies. Creates reaching a
-   replica that has not activated yet retain the previous behavior.
-
-API replicas both read and write policies; enabling composition during a mixed
-old/new API rollout is unsafe. Older JSON readers reject the new field, while
-older protobuf readers cannot enforce it. The activation setting gates automatic
-Falcon composition only. Native sandbox and template policy writers must also
-wait until all readers and gateways are compatible before submitting nonempty
-exemptions.
-
-Before downgrading, set activation to `false`, finish rolling all API replicas,
-and stop direct exemption writes. The setting does not strip existing exemptions.
-Use compatible binaries to remove exemptions from all stored policies, including
-template defaults (or retire their resources), before reverting any reader.
-Then roll back API writers before workers and other readers. Removing an exemption
-restores interception, so pinned clients require an appropriate operational
-fallback before rollback.
+Before downgrading a reader, remove exemptions from stored policies and operator
+profile selections using compatible binaries, or retire the affected resources.
+Disabling configuration does not strip an existing sandbox's profile selection.
+Removing an exemption restores interception, so pinned clients need an
+appropriate operational fallback before rollback.

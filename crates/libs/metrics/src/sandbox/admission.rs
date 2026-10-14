@@ -266,28 +266,29 @@ pub fn cluster_eligible_nodes(value: u64) {
 }
 
 metric_vocabulary! {
-    /// Result of the optional Falcon overlay on a sandbox create.
-    FalconCreateOutcome {
+    /// Result of operator egress profile selection on a sandbox create.
+    EgressProfileOutcome {
         Ready => "ready",
         InvalidRequest => "invalid_request",
         Unconfigured => "unconfigured",
     }
 }
 
-pub fn falcon_create(outcome: FalconCreateOutcome) {
+pub fn egress_profile(profile: &str, outcome: EgressProfileOutcome) {
     counter(
-        "space.sandbox.falcon_create_admission",
+        "space.sandbox.egress_profile_admission",
         1,
         &[
             tag(
                 "outcome",
-                if outcome == FalconCreateOutcome::Ready {
+                if outcome == EgressProfileOutcome::Ready {
                     "ok"
                 } else {
                     "failed"
                 },
             ),
             tag("reason", outcome),
+            tag("profile", profile),
         ],
     );
 }

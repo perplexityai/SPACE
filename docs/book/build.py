@@ -25,7 +25,6 @@ CHAPTERS = tuple(re.findall(r"\]\(([^)]+)\)", SUMMARY.read_text()))
 # top-level page must appear in SUMMARY.md, so a new page cannot silently miss
 # the published guide.
 UNPUBLISHED = {
-    "falcon-egress.md": "deployment-specific integration with pending renames",
     "runtime-manager-catalog.md": "prototype; artifacts are not selectable yet",
     "snapshot-upload-streaming.md": "implementation notes and measurements",
 }

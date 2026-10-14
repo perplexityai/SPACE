@@ -45,7 +45,7 @@ Read the hosted [Guide](https://space.docs.perplexity.ai/guide/index.html) and [
 | [E2B Compatibility Wrapper](docs/ecw.md) | Configure ECW, create a compatibility API key, use the tested E2B Python SDK, and understand supported behavior and limitations. |
 | [API reference](docs/api/index.md) | Endpoints, request and response fields, and examples. |
 | [Troubleshooting](docs/troubleshooting.md) | Local setup, authentication, lifecycle operations, command streams, and safe retries. |
-| [Optional Falcon egress](docs/falcon-egress.md) | Configure the destination bundle for federated creates and upgrade existing deployments. |
+| [Operator egress profiles](docs/egress-profiles.md) | Configure named policy additions for federated native and ECW creates. |
 | [Observability](docs/observability.md) | Telemetry build features, the Rust/Go selector contract, and unchanged image defaults. |
 | [Warm pools](docs/warm-pools.md) | Keep booted sandboxes ready on Kubernetes so creates skip a cold boot. |
 | [Base snapshots](docs/base-snapshots.md) | Restore sandboxes from a snapshot on a single node, optionally with a node warm pool. |

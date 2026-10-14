@@ -86,8 +86,15 @@ pub async fn create_sandbox(
         .as_ref()
         .map(|Extension(AuthFederatedOwner(owner))| owner);
     let grant = super::owner_scope::required_grant(&headers, owner)?;
+    let selected = state
+        .sandbox_controller
+        .select_egress_profiles(&headers, owner.is_some())
+        .map_err(|error| PublicApiError::bad_request(error.to_string()))?;
     let federated_create = owner.zip(grant.as_ref()).map(|(owner, grant)| {
-        crate::fork_operations::ForkFederatedCreateContext::from_request(owner, grant)
+        let mut context =
+            crate::fork_operations::ForkFederatedCreateContext::from_request(owner, grant);
+        context.egress_profiles = Some(selected);
+        context
     });
     let pool_claims =
         native_create_pool_claim_enabled(&state.feature_flags).then_some(&state.sandbox_controller);
@@ -155,7 +162,17 @@ pub(crate) async fn create_native_sandbox_operation(
     federated_create: Option<crate::fork_operations::ForkFederatedCreateContext>,
     pool_claims: Option<&SandboxController>,
 ) -> Result<SandboxOperationResponse, PublicApiError> {
-    let (request, fingerprint) = prepare_native_create_request(request)?;
+    let (request, mut fingerprint) = prepare_native_create_request(request)?;
+    if let Some(profiles) = federated_create
+        .as_ref()
+        .and_then(|context| context.egress_profiles.as_ref())
+        // Preserve pre-profile fingerprints for empty selections without changing the payload.
+        .filter(|profiles| !profiles.is_empty())
+    {
+        fingerprint = request_fingerprint(&serde_json::json!({
+            "request": fingerprint, "egress_profiles": profiles,
+        }))?;
+    }
     let plan = match pool_claims {
         None => NativeCreatePoolPlan::Unclaimed(AdmissionClaimOutcome::Disabled),
         Some(controller) => {
@@ -1080,7 +1097,7 @@ fn validate_update_request(request: &UpdateSandboxRequest) -> Result<(), PublicA
 }
 
 fn request_fingerprint(
-    request: &CreateSandboxRequest,
+    request: &impl serde::Serialize,
 ) -> Result<RequestFingerprint, PublicApiError> {
     let bytes = serde_json::to_vec(request).map_err(|error| {
         tracing::error!(error = %error, "failed to serialize public create sandbox request");

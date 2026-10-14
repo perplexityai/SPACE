@@ -419,6 +419,12 @@ impl CreateSandboxOperationExecutor {
         let federated_context = FederatedSandboxCreateContext::new(
             federated.as_ref().map(|(owner, _)| owner),
             federated.as_ref().map(|(_, grant)| grant),
+        )
+        .with_egress_profiles(
+            payload
+                .federated_create
+                .as_ref()
+                .and_then(|context| context.egress_profiles.as_ref()),
         );
         let response = match payload.pool_claim {
             None => {

@@ -64,7 +64,7 @@ pub enum AppStateError {
         #[from] crate::tls_interception_exemptions::TlsInterceptionExemptionsConfigError,
     ),
     #[error(transparent)]
-    FalconEgress(#[from] crate::falcon_egress::FalconEgressConfigError),
+    EgressProfiles(#[from] crate::egress_profiles::EgressProfilesConfigError),
     #[error("federated identity configuration failed: {0}")]
     FederatedIdentity(#[from] crate::federated_identity::FederatedIdentityPolicyError),
     #[error("sandbox controller initialization failed: {0}")]
@@ -109,7 +109,7 @@ impl AppState {
         >,
     ) -> Result<Self, AppStateError> {
         let federated_identity = crate::federated_identity::FederatedIdentityConfig::from_env()?;
-        let falcon_egress = crate::falcon_egress::FalconEgress::from_env()?;
+        let egress_profiles = crate::egress_profiles::EgressProfiles::from_env()?;
         let tls_interception_exemptions =
             crate::tls_interception_exemptions::TlsInterceptionExemptions::from_env()?;
         let feature_flags = pplx_space_feature_flags::FeatureFlagClient::from_env();
@@ -135,7 +135,7 @@ impl AppState {
             )
             .with_route_ed25519_authority(route_ed25519_authority)
             .with_federated_grant_audience(federated_identity.policy.grant_audience.clone())
-            .with_falcon_egress(falcon_egress)
+            .with_egress_profiles(egress_profiles)
             .with_tls_interception_exemptions(tls_interception_exemptions);
         let template_controller =
             crate::controllers::template::TemplateController::new(substrate.clone(), pool.clone());

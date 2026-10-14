@@ -439,6 +439,9 @@ impl ForkSandboxOperationExecutor {
         let execution_generation =
             frozen_execution_generation(source.active_execution_generation, lifecycle)?;
         let target_config = ForkTargetConfig {
+            egress_profiles: crate::egress_profiles::load(self.store.pool(), source.id)
+                .await
+                .map_err(ForkExecutionError::retry_error)?,
             template,
             source_template_id: Some(source_template_id),
             runtime: None,
@@ -1028,7 +1031,8 @@ impl ForkSandboxOperationExecutor {
                 .map(|(owner, service_grant)| (Some(owner), Some(service_grant)))
                 .unwrap_or((None, None));
             let federated =
-                FederatedSandboxCreateContext::new(federated_owner, federated_service_grant);
+                FederatedSandboxCreateContext::new(federated_owner, federated_service_grant)
+                    .with_egress_profiles(Some(&config.egress_profiles));
             let request = create_request(&config, payload.requested_timeout_seconds());
             match tokio::time::timeout(
                 remaining,

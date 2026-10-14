@@ -341,6 +341,9 @@ pub enum ForkCaptureProgress {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForkFederatedCreateContext {
+    /// Names selected at admission; execution resolves current definitions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) egress_profiles: Option<crate::egress_profiles::EgressProfileSelection>,
     issuer: UpstreamIssuer,
     org_id: UpstreamOrgId,
     subject_id: UpstreamSubjectId,
@@ -374,6 +377,7 @@ impl ForkFederatedCreateContext {
         service_grant: &crate::federated_identity::FederatedServiceGrant,
     ) -> Self {
         Self {
+            egress_profiles: None,
             issuer: owner.issuer.clone(),
             org_id: owner.org_id.clone(),
             subject_id: owner.subject_id.clone(),
@@ -488,6 +492,11 @@ impl std::fmt::Display for ForkSourceLifecycle {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForkTargetConfig {
+    #[serde(
+        default,
+        skip_serializing_if = "crate::egress_profiles::EgressProfileSelection::is_empty"
+    )]
+    pub(crate) egress_profiles: crate::egress_profiles::EgressProfileSelection,
     pub template: TemplateReference,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_template_id: Option<String>,

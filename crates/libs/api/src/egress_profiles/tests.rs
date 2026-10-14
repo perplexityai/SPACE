@@ -1,27 +1,24 @@
 use super::*;
 
 #[rstest::rstest]
-#[case(None, false)]
-#[case(Some("false"), false)]
-#[case(Some("true"), true)]
-fn composition_preserves_policy_and_deny_precedence(
-    #[case] activation: Option<&str>,
-    #[case] exemptions_enabled: bool,
-) {
-    let egress = FalconEgress::from_config(
-        r#"[
-            {"ip":"192.0.2.10"},
-            {"ip":"192.0.2.11"},
-            {"cidr":"203.0.113.0/25"},
-            {"cidr":"2001:db8:1234::/56"},
-            {"ip":"169.254.169.254"},
-            {"domain":"denied.example.test"},
-            {"domain":"sensor.example.test"}
-        ]"#,
-        activation,
+#[case(false)]
+#[case(true)]
+fn composition_preserves_policy_and_deny_precedence(#[case] exemptions_enabled: bool) {
+    let destinations = serde_json::json!([
+        {"ip":"192.0.2.10"}, {"ip":"192.0.2.11"},
+        {"cidr":"203.0.113.0/25"}, {"cidr":"2001:db8:1234::/56"},
+        {"ip":"169.254.169.254"}, {"domain":"denied.example.test"},
+        {"domain":"sensor.example.test"}
+    ]);
+    let egress = EgressProfiles::from_config(
+        &serde_json::json!({
+            "sensor": {"allow": destinations, "tls_interception_exemptions":
+                if exemptions_enabled { destinations.clone() } else { serde_json::json!([]) }}
+        })
+        .to_string(),
     )
     .unwrap();
-
+    egress.compose_override(None, None).unwrap_err();
     for default_action in [EgressDefaultAction::Deny, EgressDefaultAction::Allow] {
         let base = NetworkPolicyV1 {
             version: Default::default(),
@@ -139,8 +136,10 @@ fn composition_preserves_policy_and_deny_precedence(
                 .is_allowed()
         }));
         assert_eq!(egress.compose(&composed), composed);
-        let disabled =
-            FalconEgress::from_config(r#"[{"domain":"sensor.example.test"}]"#, None).unwrap();
+        let disabled = EgressProfiles::from_config(
+            r#"{"sensor":{"allow":[{"domain":"sensor.example.test"}]}}"#,
+        )
+        .unwrap();
         assert_eq!(disabled.compose(&composed), composed);
     }
 }
@@ -149,32 +148,55 @@ fn composition_preserves_policy_and_deny_precedence(
 #[case("")]
 #[case("[]")]
 #[case("null")]
-#[case(r#"[{"ip":"not-an-ip"}]"#)]
-#[case(r#"[{"domain":"not a domain"}]"#)]
-#[case(r#"[{"unknown":"example.test"}]"#)]
-#[case(r#"[{"wildcard_domain":"*.example.test"}]"#)]
-#[case(r#"[{"cidr":"192.0.2.0/33"}]"#)]
-#[case(r#"[{"cidr":"2001:db8::/129"}]"#)]
+#[case(r#"{"sensor":{"allow":[]}}"#)]
+#[case(r#"{"Sensor":{"allow":[{"ip":"192.0.2.1"}]}}"#)]
+#[case(r#"{"":{"allow":[{"ip":"192.0.2.1"}]}}"#)]
+#[case(r#"{"sensor":{"allow":[{"ip":"not-an-ip"}]}}"#)]
+#[case(r#"{"sensor":{"allow":[{"domain":"not a domain"}]}}"#)]
+#[case(r#"{"sensor":{"allow":[{"unknown":"example.test"}]}}"#)]
+#[case(r#"{"sensor":{"allow":[{"wildcard_domain":"*.example.test"}]}}"#)]
+#[case(r#"{"sensor":{"allow":[{"cidr":"192.0.2.0/33"}]}}"#)]
+#[case(r#"{"sensor":{"allow":[{"cidr":"2001:db8::/129"}]}}"#)]
+#[case(r#"{"sensor":{"allow":[{"ip":"192.0.2.1"}]},"sensor":{"allow":[{"ip":"192.0.2.2"}]}}"#)]
 fn rejects_invalid_or_unsupported_configuration(#[case] raw: &str) {
-    FalconEgress::from_config(raw, None).unwrap_err();
+    EgressProfiles::from_config(raw).unwrap_err();
 }
 
 #[test]
-fn create_fallback_preserves_the_requested_overlay() {
-    let configured =
-        FalconEgress::from_config(r#"[{"domain":"sensor.example.test"}]"#, None).unwrap();
-    assert!(for_create(false, Some(&configured)).is_none());
-    assert!(for_create(true, None).is_none());
-    let selected = for_create(true, Some(&configured)).unwrap();
-    assert!(std::ptr::eq(selected, &configured));
-}
-
-#[test]
-fn rejects_invalid_exemption_activation() {
-    for activation in ["", "1", "0", "TRUE", " false "] {
-        assert!(matches!(
-            FalconEgress::from_config(r#"[{"domain":"sensor.example.test"}]"#, Some(activation)),
-            Err(FalconEgressConfigError::ExemptionsActivation(_))
-        ));
+fn selection_preserves_defaults_and_rejects_invalid_requests() {
+    let configured = EgressProfiles::from_config(
+        r#"{
+        "baseline":{"default":true,"allow":[{"ip":"192.0.2.1"}]},
+        "sensor":{"allow":[{"domain":"sensor.example.test"}]}
+    }"#,
+    )
+    .unwrap();
+    let names = |profiles: EgressProfileSelection| {
+        profiles.names.into_iter().map(|n| n.0).collect::<Vec<_>>()
+    };
+    assert_eq!(names(configured.select(None, true).unwrap()), ["baseline"]);
+    assert_eq!(
+        names(configured.select(Some("+sensor -baseline"), true).unwrap()),
+        ["sensor"]
+    );
+    assert_eq!(
+        names(configured.select(Some("+sensor"), true).unwrap()),
+        ["baseline", "sensor"]
+    );
+    assert!(names(configured.select(Some("+sensor"), false).unwrap()).is_empty());
+    assert!(names(configured.select(None, false).unwrap()).is_empty());
+    assert!(names(EgressProfiles::default().select(None, true).unwrap()).is_empty());
+    for header in [
+        "",
+        "sensor",
+        "+",
+        "+Sensor",
+        "+sensor +sensor",
+        "+sensor -sensor",
+        "+missing",
+        "-missing",
+        "+sensor\t-baseline",
+    ] {
+        assert!(configured.select(Some(header), true).is_err(), "{header}");
     }
 }

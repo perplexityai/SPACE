@@ -12,10 +12,8 @@ name = "seed"
 description = "Minimal Ubuntu Firecracker seed"
 from = "scratch"
 
-# The Falcon sensor's bpf backend needs the BPF/tracing support the stock
-# guest kernel compiles out, so the shared lineage carries the published
-# BPF kernel rather than a Falcon-specific seed. Every node that can run a
-# template from this lineage must already stage this exact kernel.
+# The shared lineage carries a BPF/tracing-capable guest kernel. Every node
+# running a template from this lineage must stage this exact kernel.
 [guest_kernel]
 version = "vmlinux-6.1.155-bpf-modsig"
 digest = "sha256:15ea4431a450eedbfcb4b4d3d85dd8e941b829a0606db6cd0e0167530421f933"

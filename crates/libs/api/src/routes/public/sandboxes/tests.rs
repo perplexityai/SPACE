@@ -215,52 +215,92 @@ fn native_create_rejects_zero_vcpu_before_operation_admission() {
 #[tokio::test]
 async fn native_create_persists_default_policy_in_operation_payload() -> TestDbResult<()> {
     let db = pg_test_db().await?;
-    let idempotency_key = IdempotencyKey::parse("native-default-policy-persistence")?;
-    let response = create_native_sandbox_operation(
-        &db.pool,
-        OrgId::from_uuid(SEED_ORG_ID),
-        UserId::from_uuid(SEED_USER_ID),
-        &idempotency_key,
-        create_request_with_auto_lifecycle(None),
-        None,
-        None,
-    )
-    .await
-    .expect("native create should persist an operation");
-    let retry_response = create_native_sandbox_operation(
-        &db.pool,
-        OrgId::from_uuid(SEED_ORG_ID),
-        UserId::from_uuid(SEED_USER_ID),
-        &idempotency_key,
-        create_request_with_auto_lifecycle(None),
-        None,
-        None,
-    )
-    .await
-    .expect("an identical retry should reuse the operation");
+    let context: crate::fork_operations::ForkFederatedCreateContext =
+        serde_json::from_value(serde_json::json!({
+            "issuer": "example-issuer", "org_id": "example-org", "subject_id": "example-user"
+        }))?;
+    let selections = [
+        None, // Payloads admitted before profile selection was introduced.
+        Some(crate::egress_profiles::EgressProfileSelection::default()),
+        Some(serde_json::from_value(serde_json::json!(["sensor"]))?),
+        Some(serde_json::from_value(serde_json::json!(["audit"]))?),
+    ];
+    for (initial, selection) in selections.iter().enumerate() {
+        let idempotency_key =
+            IdempotencyKey::parse(format!("native-default-policy-persistence-{initial}"))?;
+        let mut admitted = context.clone();
+        admitted.egress_profiles = selection.clone();
+        let response = create_native_sandbox_operation(
+            &db.pool,
+            OrgId::from_uuid(SEED_ORG_ID),
+            UserId::from_uuid(SEED_USER_ID),
+            &idempotency_key,
+            create_request_with_auto_lifecycle(None),
+            Some(admitted),
+            None,
+        )
+        .await
+        .expect("native create should persist an operation");
+        for (retry, selection) in selections.iter().enumerate() {
+            let mut retried = context.clone();
+            retried.egress_profiles = selection.clone();
+            let result = create_native_sandbox_operation(
+                &db.pool,
+                OrgId::from_uuid(SEED_ORG_ID),
+                UserId::from_uuid(SEED_USER_ID),
+                &idempotency_key,
+                create_request_with_auto_lifecycle(None),
+                Some(retried),
+                None,
+            )
+            .await;
+            if initial == retry || (initial < 2 && retry < 2) {
+                assert_eq!(
+                    result
+                        .expect("equivalent selections must reuse the operation")
+                        .operation_id,
+                    response.operation_id,
+                );
+            } else {
+                assert_eq!(
+                    axum::response::IntoResponse::into_response(
+                        result.expect_err("different nonempty selections must conflict")
+                    )
+                    .status(),
+                    axum::http::StatusCode::CONFLICT,
+                );
+            }
+        }
 
-    assert_eq!(retry_response.operation_id, response.operation_id);
+        let SqlJson(payload): SqlJson<serde_json::Value> = sqlx::query_scalar(sql!(
+            "SELECT payload_json FROM public_operations WHERE operation_id = $1"
+        ))
+        .bind(response.operation_id.as_uuid())
+        .fetch_one(&db.pool)
+        .await?;
+        let payload: CreateSandboxOperationPayload = serde_json::from_value(payload)?;
+        assert_eq!(
+            &payload
+                .federated_create
+                .expect("federated context is durable")
+                .egress_profiles,
+            selection,
+            "explicitly empty selection must survive serialization and retries",
+        );
+        let policy = payload
+            .request
+            .auto_lifecycle
+            .expect("native default must be durable in the operation payload");
 
-    let SqlJson(payload): SqlJson<serde_json::Value> = sqlx::query_scalar(sql!(
-        "SELECT payload_json FROM public_operations WHERE operation_id = $1"
-    ))
-    .bind(response.operation_id.as_uuid())
-    .fetch_one(&db.pool)
-    .await?;
-    let payload: CreateSandboxOperationPayload = serde_json::from_value(payload)?;
-    let policy = payload
-        .request
-        .auto_lifecycle
-        .expect("native default must be durable in the operation payload");
-
-    assert_eq!(
-        policy.stages,
-        vec![AutoLifecycleStage {
-            condition_set: AutoLifecycleConditionSetId::AccessIdle,
-            at: DEFAULT_NATIVE_IDLE_TIMEOUT_SECS,
-            action: AutoLifecycleIdleAction::Suspend,
-        }]
-    );
+        assert_eq!(
+            policy.stages,
+            vec![AutoLifecycleStage {
+                condition_set: AutoLifecycleConditionSetId::AccessIdle,
+                at: DEFAULT_NATIVE_IDLE_TIMEOUT_SECS,
+                action: AutoLifecycleIdleAction::Suspend,
+            }]
+        );
+    }
     Ok(())
 }
 

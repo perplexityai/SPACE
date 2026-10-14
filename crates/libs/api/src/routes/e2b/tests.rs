@@ -1575,6 +1575,118 @@ async fn sdk_v2_create_and_connect_routes_are_mounted() {
     }
 }
 
+#[cfg(feature = "kubernetes")]
+#[rstest]
+#[tokio::test(flavor = "current_thread")]
+async fn egress_profile_header_applies_only_to_federated_creates(
+    #[future] kubernetes_app_state_fixture: TestResult<KubernetesAppStateFixture>,
+) -> TestResult {
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    use crate::federated_identity::{
+        FEDERATED_SERVICE_GRANT_EXPIRES_AT_HEADER, FEDERATED_SERVICE_GRANT_HEADER,
+    };
+    let mut fixture = kubernetes_app_state_fixture.await?;
+    sqlx::query(sql!(
+        "INSERT INTO templates (id, name, visibility, network_policy_json)
+         VALUES ($1, 'seed', 'generic', '{\"egress\":{\"default_action\":\"deny\"}}')"
+    ))
+    .bind(Uuid::now_v7())
+    .execute(&fixture.pool)
+    .await?;
+    let release_id = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO template_releases (id, template_name, type, hash)
+         VALUES ($1, 'seed', 'fc', 'sha256:egress-profile-test')"
+    ))
+    .bind(release_id)
+    .execute(&fixture.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_release_tags (template_release_id, template_name, tag)
+         VALUES ($1, 'seed', 'latest')"
+    ))
+    .bind(release_id)
+    .execute(&fixture.pool)
+    .await?;
+    fixture.state.sandbox_controller = fixture
+        .state
+        .sandbox_controller
+        .clone()
+        .with_egress_profiles(crate::egress_profiles::EgressProfiles::from_config(
+            r#"{"sensor":{"allow":[{"domain":"sensor.example.test"}]}}"#,
+        )?);
+    use pplx_space_common_core::types::{UpstreamIssuer, UpstreamOrgId, UpstreamSubjectId};
+    let owner = crate::federated_identity::FederatedOwner {
+        issuer: UpstreamIssuer::parse("example-issuer")?,
+        org_id: UpstreamOrgId::parse("example-org")?,
+        subject_id: UpstreamSubjectId::parse("example-user")?,
+    };
+    let materialized = crate::federated_identity::materialize_owner(&fixture.pool, &owner).await?;
+    for federated in [false, true] {
+        let user_id = if federated {
+            materialized.user_id
+        } else {
+            UserId::from_uuid(SEED_USER_ID)
+        };
+        let actor = sqlx::query_as::<_, crate::models::User>(sql!(
+            "SELECT id, email, password_hash, display_name, org_id, role, owner_source,
+                    created_at, updated_at FROM users WHERE id = $1"
+        ))
+        .bind(user_id)
+        .fetch_one(&fixture.pool)
+        .await?;
+        let mut app = e2b_api_routes()
+            .layer(Extension(AuthEcwActor(Some(actor))))
+            .layer(Extension(test_ecw_host_config()));
+        if federated {
+            app = app.layer(Extension(crate::middleware::auth::AuthFederatedOwner(
+                owner.clone(),
+            )));
+        }
+        let response = app
+            .with_state(fixture.state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/sandboxes")
+                    .header(header::HOST, TEST_ECW_API_HOST)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("X-Space-Egress-Profiles", "+sensor")
+                    .header(FEDERATED_SERVICE_GRANT_HEADER, "test-profile-grant")
+                    .header(
+                        FEDERATED_SERVICE_GRANT_EXPIRES_AT_HEADER,
+                        (OffsetDateTime::now_utc() + time::Duration::hours(1))
+                            .unix_timestamp()
+                            .to_string(),
+                    )
+                    .body(Body::from(
+                        r#"{"templateID":"seed","allowInternetAccess":false}"#,
+                    ))?,
+            )
+            .await?;
+        let status = response.status();
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await?)?;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let sandbox_id = body["sandboxID"].as_str().unwrap().parse()?;
+        let sandbox = crate::controllers::sandbox::fetch_sandbox(&fixture.pool, sandbox_id)
+            .await?
+            .expect("created sandbox");
+        let policy = sandbox.network_policy.expect("resolved policy").0;
+        assert_eq!(policy.allows_domain("sensor.example.test"), federated);
+        assert!(!policy.allows_domain("unlisted.example.test"));
+        assert_eq!(
+            crate::egress_profiles::load(&fixture.pool, sandbox_id)
+                .await?
+                .is_empty(),
+            !federated
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn unknown_e2b_create_parameter_is_forward_compatible() {
     let response = Router::new()
@@ -4860,33 +4972,6 @@ fn ecw_request_logs(events: &[CapturedEvent]) -> Vec<&[(String, String)]> {
         })
         .map(Vec::as_slice)
         .collect()
-}
-
-mod ecw_falcon_header {
-    use axum::http::{HeaderMap, HeaderValue};
-
-    use super::super::translate::{ECW_FALCON_HEADER, falcon_egress_requested};
-
-    #[test]
-    fn accepts_only_federated_true_requests() {
-        let mut headers = HeaderMap::new();
-        assert!(!falcon_egress_requested(&headers, true));
-
-        for (value, expected) in [
-            ("true", true),
-            (" TRUE ", true),
-            ("false", false),
-            ("us2", false),
-            ("other", false),
-            ("", false),
-        ] {
-            headers.insert(ECW_FALCON_HEADER, HeaderValue::from_static(value));
-            assert_eq!(falcon_egress_requested(&headers, true), expected, "{value}");
-            assert!(!falcon_egress_requested(&headers, false), "{value}");
-        }
-        headers.insert(ECW_FALCON_HEADER, HeaderValue::from_bytes(&[0xff]).unwrap());
-        assert!(!falcon_egress_requested(&headers, true));
-    }
 }
 
 fn test_ecw_host_config() -> EcwHostConfig {

@@ -573,6 +573,7 @@ fn pooled_create_input<'a>(
         template_network_policy,
         template_network_policy_generation: 1,
         network_policy_override: req.network_policy.as_ref(),
+        egress_profiles: Default::default(),
         boot_mode: CreateBootMode::Pool,
         federated_owner: None,
         federated_service_grant: None,
@@ -2768,7 +2769,9 @@ async fn postgres_federated_restore_inserts_restore_ownership() -> TestResult {
                  IF NEW.lifecycle = 'restoring'
                     AND NEW.restore_lease_token IS NOT NULL
                     AND NEW.restore_lease_expires_at IS NOT NULL
-                    AND NEW.preserve_local_artifact_on_restore_failure THEN
+                    AND NEW.preserve_local_artifact_on_restore_failure
+                    AND NEW.egress_profiles = ARRAY['sensor']::text[]
+                    AND NEW.network_policy_override_json->'egress'->'allow' @> '[{\"domain\":\"sensor.example.test\"}]'::jsonb THEN
                      RAISE EXCEPTION 'observed correct federated restore ownership';
                  END IF;
                  RAISE EXCEPTION 'missing federated restore ownership';
@@ -2786,9 +2789,16 @@ async fn postgres_federated_restore_inserts_restore_ownership() -> TestResult {
     .execute(&db.pool)
     .await?;
 
+    let profiles = crate::egress_profiles::EgressProfiles::from_config(
+        r#"{"sensor":{"allow":[{"domain":"sensor.example.test"}]}}"#,
+    )?;
+    let selection = profiles.select(Some("+sensor"), true)?;
+    // The source and its configuration may be gone; restore retains the saved policy.
     let controller = direct_sandbox_controller(&db.pool);
     let mut req = pooled_create_request("federated-restore-sandbox", None);
     req.boot_mode = Some("cold".to_string());
+    req.network_policy =
+        Some(profiles.compose(&pplx_space_net_common::NetworkPolicyV1::deny_all()));
     req.template = Some("seed:latest".parse()?);
     let owner = test_federated_owner("8a3f64c2-1f2b-4c4e-9a90-1f0d4f6f5a02")?;
     let grant = test_service_grant()?;
@@ -2802,7 +2812,8 @@ async fn postgres_federated_restore_inserts_restore_ownership() -> TestResult {
             SandboxApiMetricIdentity::native("fork"),
             RestoreForkDiskAsNewContext {
                 sandbox_id: SandboxId::new(),
-                federated: FederatedSandboxCreateContext::new(Some(&owner), Some(&grant)),
+                federated: FederatedSandboxCreateContext::new(Some(&owner), Some(&grant))
+                    .with_egress_profiles(Some(&selection)),
                 operation_id,
                 restore_lease_seconds: 300,
                 snapshot: crate::controllers::substrate::SnapshotRef {
@@ -3076,49 +3087,6 @@ async fn postgres_strict_pool_placement_refusal_is_a_conflict_not_unavailable() 
         StatusCode::INTERNAL_SERVER_ERROR,
         "a boundary that cannot be computed is a control-plane fault, not a client \
          conflict and not a retry instruction: {unresolvable_error:?}"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn unconfigured_falcon_create_continues_to_database_access() -> TestResult {
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .acquire_timeout(std::time::Duration::from_millis(50))
-        .connect_lazy("postgresql://postgres:postgres@127.0.0.1:1/unused")?;
-    let controller = direct_sandbox_controller(&pool);
-    let owner = test_federated_owner("example-org")?;
-    let grant = test_service_grant()?;
-    let actor = User {
-        id: UserId::new(),
-        email: "actor@example.com".into(),
-        password_hash: "!".into(),
-        display_name: "Test actor".into(),
-        org_id: OrgId::new(),
-        role: crate::user_role::UserRole::Member,
-        owner_source: pplx_space_common_core::types::SandboxOwnerSource::Local,
-        created_at: time::OffsetDateTime::UNIX_EPOCH,
-        updated_at: time::OffsetDateTime::UNIX_EPOCH,
-    };
-
-    let error = controller
-        .create(
-            &pool,
-            &actor,
-            &pooled_create_request("unconfigured-egress", None),
-            SandboxApiMetricIdentity::native("create"),
-            FederatedSandboxCreateContext::new(Some(&owner), Some(&grant)).with_falcon_egress(),
-        )
-        .await
-        .unwrap_err();
-
-    assert_eq!(
-        error.status(),
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR
-    );
-    assert!(
-        error
-            .to_string()
-            .contains("failed to start federated sandbox owner transaction")
     );
     Ok(())
 }

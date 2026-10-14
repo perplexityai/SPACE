@@ -151,6 +151,7 @@ struct PooledCreateInput<'a> {
     template_network_policy: &'a NetworkPolicyV1,
     template_network_policy_generation: u64,
     network_policy_override: Option<&'a NetworkPolicyV1>,
+    egress_profiles: crate::egress_profiles::EgressProfileSelection,
     boot_mode: CreateBootMode,
     federated_owner: Option<&'a crate::federated_identity::FederatedOwner>,
     federated_service_grant: Option<&'a crate::federated_identity::FederatedServiceGrant>,
@@ -370,7 +371,7 @@ impl From<crate::federated_identity::FederatedOwnerRecord> for SandboxCreateOwne
 pub struct FederatedSandboxCreateContext<'a> {
     owner: Option<&'a crate::federated_identity::FederatedOwner>,
     service_grant: Option<&'a crate::federated_identity::FederatedServiceGrant>,
-    falcon_egress: bool,
+    egress_profiles: Option<&'a crate::egress_profiles::EgressProfileSelection>,
 }
 
 impl<'a> FederatedSandboxCreateContext<'a> {
@@ -381,12 +382,15 @@ impl<'a> FederatedSandboxCreateContext<'a> {
         Self {
             owner,
             service_grant,
-            falcon_egress: false,
+            egress_profiles: None,
         }
     }
 
-    pub fn with_falcon_egress(mut self) -> Self {
-        self.falcon_egress = true;
+    pub(crate) fn with_egress_profiles(
+        mut self,
+        profiles: Option<&'a crate::egress_profiles::EgressProfileSelection>,
+    ) -> Self {
+        self.egress_profiles = profiles;
         self
     }
 }
@@ -906,12 +910,12 @@ fn pool_attempt_resources(pool_shape: Option<PooledExecutionPoolShape>) -> Sandb
 impl SandboxController {
     pub async fn from_env(pool: &PgPool) -> Result<Self, SandboxControllerInitError> {
         let policy = crate::federated_identity::FederatedIdentityPolicy::from_env()?;
-        let falcon_egress = crate::falcon_egress::FalconEgress::from_env()?;
+        let egress_profiles = crate::egress_profiles::EgressProfiles::from_env()?;
         let tls_interception_exemptions =
             crate::tls_interception_exemptions::TlsInterceptionExemptions::from_env()?;
         Ok(Self::new(Substrate::from_env(pool).await?)
             .with_federated_grant_audience(policy.grant_audience)
-            .with_falcon_egress(falcon_egress)
+            .with_egress_profiles(egress_profiles)
             .with_tls_interception_exemptions(tls_interception_exemptions))
     }
 
@@ -1180,8 +1184,17 @@ impl SandboxController {
             restore_operation_id,
             restore_lease_seconds,
         } = mode;
-        let falcon_egress =
-            crate::falcon_egress::for_create(federated.falcon_egress, self.falcon_egress.as_ref());
+        let egress_profiles = if let Some(selected) = federated.egress_profiles {
+            selected.clone()
+        } else if restore_from.is_some() {
+            return Err(ControllerError::internal(
+                "fork restore requires an explicit egress profile selection",
+            ));
+        } else {
+            self.egress_profiles
+                .select(None, federated.owner.is_some())
+                .map_err(|error| ControllerError::bad_request(error.to_string()))?
+        };
         if restore_from.is_some() && req.node_pool.is_some() {
             return Err(ControllerError::bad_request(
                 "node-pool placement is not supported for fork disk restores",
@@ -1225,16 +1238,15 @@ impl SandboxController {
         };
         let auto_lifecycle = effective_create_auto_lifecycle(req, &resolved_template)?;
         let template_network_policy = resolved_template.default_network_policy;
-        let network_policy_override = if let Some(egress) = falcon_egress {
-            Some(
-                egress.compose(
-                    req.network_policy
-                        .as_ref()
-                        .unwrap_or(&template_network_policy),
-                ),
-            )
-        } else {
+        // Fork restoration reuses the source's saved effective policy. Re-resolving
+        // names here would add new destinations without removing old profile allows.
+        let network_policy_override = if restore_from.is_some() {
             req.network_policy.clone()
+        } else {
+            self.egress_profiles
+                .resolve(&egress_profiles)
+                .map_err(|error| ControllerError::bad_request(error.to_string()))?
+                .compose_override(req.network_policy.clone(), Some(&template_network_policy))?
         };
         let network_policy_override = crate::tls_interception_exemptions::compose(
             self.tls_interception_exemptions.as_ref(),
@@ -1297,6 +1309,7 @@ impl SandboxController {
             template,
             content_hash: &resolved_content_hash,
             template_release_id: resolved_template_release_id,
+            egress_profiles: egress_profiles.clone(),
             template_network_policy: &template_network_policy,
             template_network_policy_generation,
             network_policy_override: network_policy_override.as_ref(),
@@ -1372,6 +1385,7 @@ impl SandboxController {
 
         // Store the resolved hash as the sandbox's immutable build pin; wake and restore
         // keep using it even if a tag moves later.
+        let egress_profile_names = egress_profiles.as_names();
         let insert = pplx_space_sandbox_store::SandboxCreate {
             id: sandbox_uuid,
             name: req.name.as_deref(),
@@ -1388,6 +1402,7 @@ impl SandboxController {
             metadata: &req.metadata,
             auto_lifecycle: &auto_lifecycle,
             network_policy_override_json: network_policy_override_json.as_ref(),
+            egress_profiles: &egress_profile_names,
         };
         match (federated_owner, federated_service_grant) {
             (None, None) => {
@@ -2842,6 +2857,7 @@ async fn insert_pooled_sandbox(
             metadata: &input.req.metadata,
             auto_lifecycle: input.auto_lifecycle,
             network_policy_override_json: network_policy_override_json.as_ref(),
+            egress_profiles: &input.egress_profiles.as_names(),
         },
         claim.active_node_id,
     )

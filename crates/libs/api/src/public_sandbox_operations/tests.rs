@@ -73,7 +73,7 @@ fn direct_sandbox_controller(pool: &PgPool) -> SandboxController {
 
 #[cfg(feature = "kubernetes")]
 #[tokio::test(flavor = "current_thread")]
-async fn native_create_executor_persists_exemptions_without_changing_egress() -> TestResult {
+async fn native_create_executor_preserves_operator_policy_across_replacements() -> TestResult {
     use std::sync::{Arc, Mutex};
 
     use crate::controllers::substrate::kubernetes::tests::{
@@ -126,10 +126,26 @@ async fn native_create_executor_persists_exemptions_without_changing_egress() ->
 
     let exemptions =
         TlsInterceptionExemptions::from_config(r#"[{"wildcard_domain":"*.relay.example.test"}]"#)?;
+    let profiles = crate::egress_profiles::EgressProfiles::from_config(
+        r#"{
+        "sensor":{"allow":[{"domain":"sensor.example.test"}],
+                  "tls_interception_exemptions":[{"domain":"sensor.example.test"}]}
+    }"#,
+    )?;
+    let owner = crate::federated_identity::FederatedOwner {
+        issuer: UpstreamIssuer::parse("example-issuer")?,
+        org_id: UpstreamOrgId::parse("profile-org")?,
+        subject_id: UpstreamSubjectId::parse("profile-subject")?,
+    };
+    let effective_owner = crate::federated_identity::materialize_owner(&db.pool, &owner).await?;
+    let grant = crate::federated_identity::FederatedServiceGrant::new(
+        b"test-profile-grant".to_vec(),
+        time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+    )?;
     let captured_pods = Arc::new(Mutex::new(Vec::new()));
     // Native create probes the pod's TCP listener even with command readiness disabled.
     let pod_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    for configured in [false, true] {
+    for (configured, federated) in [(false, false), (true, false), (true, true)] {
         let substrate = crate::controllers::substrate::Substrate::Kubernetes(Box::new(
             substrate_with_store_client_proxy_port_and_pod(
                 db.pool.clone(),
@@ -139,18 +155,35 @@ async fn native_create_executor_persists_exemptions_without_changing_egress() ->
             ),
         ));
         let controller = SandboxController::new(substrate)
+            .with_egress_profiles(profiles.clone())
             .with_tls_interception_exemptions(configured.then(|| exemptions.clone()));
         let executor = CreateSandboxOperationExecutor::new(db.pool.clone(), controller);
         for inherit_template in [false, true] {
             let sandbox_id = SandboxId::new();
+            let (org_id, user_id) = if federated {
+                (effective_owner.org_id, effective_owner.user_id)
+            } else {
+                (org_id, user_id)
+            };
             let mut operation = claimed_create_operation_for(sandbox_id, org_id, user_id);
+            let mut context =
+                crate::fork_operations::ForkFederatedCreateContext::from_request(&owner, &grant);
+            // The payload freezes names, while execution uses current destinations.
+            let admission = direct_sandbox_controller(&db.pool).with_egress_profiles(
+                crate::egress_profiles::EgressProfiles::from_config(
+                    r#"{"sensor":{"allow":[{"domain":"retired.example.test"}]}}"#,
+                )?,
+            );
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(crate::egress_profiles::HEADER, "+sensor".parse()?);
+            context.egress_profiles = Some(admission.select_egress_profiles(&headers, true)?);
             let mut request = public_create_request();
             request.network_policy = (!inherit_template).then(|| policy.clone());
             operation.payload = CreateSandboxOperationPayload {
                 sandbox_id: sandbox_id.into(),
                 request,
                 node_pool: None,
-                federated_create: None,
+                federated_create: federated.then_some(context),
                 pool_claim: None,
             }
             .into_json();
@@ -171,12 +204,73 @@ async fn native_create_executor_persists_exemptions_without_changing_egress() ->
                     {"wildcard_domain": "*.relay.example.test"}
                 ]))?;
             }
-            assert_eq!(effective, &expected);
+            if federated {
+                assert!(effective.allows_domain("sensor.example.test"));
+                assert!(!effective.allows_domain("retired.example.test"));
+                assert!(!effective.allows_domain("blocked.example.test"));
+                let updated_controller = executor.controller.clone().with_egress_profiles(
+                    crate::egress_profiles::EgressProfiles::from_config(
+                        r#"{"sensor":{"allow":[{"domain":"updated.example.test"}]}}"#,
+                    )?,
+                );
+                assert!(!effective.allows_domain("unlisted.example.test"));
+                for patch in [
+                    ControllerSandboxNetworkPolicyPatch::Set {
+                        policy: NetworkPolicyV1::deny_all(),
+                    },
+                    ControllerSandboxNetworkPolicyPatch::InheritTemplateDefault,
+                ] {
+                    let sandbox = fetch_sandbox(&db.pool, sandbox_id)
+                        .await?
+                        .expect("created sandbox");
+                    updated_controller
+                        .set_network_policy(&db.pool, &sandbox, patch, None)
+                        .await?;
+                    let updated = fetch_sandbox(&db.pool, sandbox_id)
+                        .await?
+                        .expect("updated sandbox");
+                    let effective = updated.network_policy.expect("profile remains composed").0;
+                    assert!(effective.allows_domain("updated.example.test"));
+                    assert!(!effective.allows_domain("sensor.example.test"));
+                    assert!(!effective.allows_domain("retired.example.test"));
+                    assert!(!effective.allows_domain("unlisted.example.test"));
+                    assert!(!effective.tls_interception_exemptions.contains(
+                        &pplx_space_net_common::EgressDestinationV1::Domain(
+                            "sensor.example.test".parse()?,
+                        ),
+                    ));
+                    let sandbox = fetch_sandbox(&db.pool, sandbox_id).await?.unwrap();
+                    executor
+                        .controller
+                        .clone()
+                        .with_egress_profiles(Default::default())
+                        .set_network_policy(
+                            &db.pool,
+                            &sandbox,
+                            ControllerSandboxNetworkPolicyPatch::Set {
+                                policy: NetworkPolicyV1::deny_all(),
+                            },
+                            None,
+                        )
+                        .await
+                        .expect_err("missing selected profile must fail composition");
+                    assert_eq!(
+                        fetch_sandbox(&db.pool, sandbox_id)
+                            .await?
+                            .unwrap()
+                            .network_policy,
+                        sandbox.network_policy,
+                        "failed composition must preserve the saved policy"
+                    );
+                }
+            } else {
+                assert_eq!(effective, &expected);
+            }
         }
     }
     assert_eq!(
         captured_pods.lock().expect("capture mutex poisoned").len(),
-        4
+        6
     );
     Ok(())
 }

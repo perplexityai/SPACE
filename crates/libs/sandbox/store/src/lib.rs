@@ -547,3 +547,17 @@ pub async fn auto_lifecycle_execution(
     .fetch_optional(executor)
     .await?)
 }
+
+/// Immutable operator profile names selected at create.
+/// Tenant policy replacements never write this column.
+pub async fn egress_profiles(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+) -> Result<Option<Vec<String>>, SandboxStoreError> {
+    Ok(
+        sqlx::query_scalar(sql!("SELECT egress_profiles FROM sandboxes WHERE id = $1"))
+            .bind(sandbox_id)
+            .fetch_optional(executor)
+            .await?,
+    )
+}

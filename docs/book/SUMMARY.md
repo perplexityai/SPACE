@@ -17,6 +17,7 @@
   - [Base snapshots](base-snapshots.md)
   - [Internal RPC TLS](internal-rpc-tls.md)
   - [TLS interception exemptions](tls-interception-exemptions.md)
+  - [Operator egress profiles](egress-profiles.md)
 
 - [Development](development-overview.md)
   - [Architecture](architecture.md)

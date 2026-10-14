@@ -26,6 +26,7 @@ fn invalid_capture_leader_state_is_terminal() {
 
 fn target_config() -> ForkTargetConfig {
     ForkTargetConfig {
+        egress_profiles: Default::default(),
         template: "seed:latest".parse().unwrap(),
         source_template_id: Some("seed".to_string()),
         runtime: None,

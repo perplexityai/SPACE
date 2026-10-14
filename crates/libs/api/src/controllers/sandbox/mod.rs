@@ -1023,7 +1023,7 @@ pub enum AdmissionPoolPlan {
 
 #[derive(Clone)]
 pub struct SandboxController {
-    falcon_egress: Option<crate::falcon_egress::FalconEgress>,
+    pub(crate) egress_profiles: crate::egress_profiles::EgressProfiles,
     tls_interception_exemptions:
         Option<crate::tls_interception_exemptions::TlsInterceptionExemptions>,
     federated_grant_audience: pplx_space_common_core::types::FederatedGrantAudience,
@@ -1047,7 +1047,7 @@ pub enum SandboxControllerInitError {
         #[from] crate::tls_interception_exemptions::TlsInterceptionExemptionsConfigError,
     ),
     #[error(transparent)]
-    FalconEgress(#[from] crate::falcon_egress::FalconEgressConfigError),
+    EgressProfiles(#[from] crate::egress_profiles::EgressProfilesConfigError),
     #[error(transparent)]
     Substrate(#[from] super::substrate::SubstrateError),
     #[error(transparent)]
@@ -1063,11 +1063,11 @@ impl SandboxController {
         self
     }
 
-    pub(crate) fn with_falcon_egress(
+    pub(crate) fn with_egress_profiles(
         mut self,
-        egress: Option<crate::falcon_egress::FalconEgress>,
+        egress: crate::egress_profiles::EgressProfiles,
     ) -> Self {
-        self.falcon_egress = egress;
+        self.egress_profiles = egress;
         self
     }
 
@@ -1081,7 +1081,7 @@ impl SandboxController {
 
     pub fn new(substrate: Substrate) -> Self {
         Self {
-            falcon_egress: None,
+            egress_profiles: Default::default(),
             tls_interception_exemptions: None,
             federated_grant_audience: crate::federated_identity::FederatedIdentityPolicy::default()
                 .grant_audience,
@@ -1096,7 +1096,7 @@ impl SandboxController {
         cluster_admission: crate::cluster_admission::ClusterSandboxAdmission,
     ) -> Self {
         Self {
-            falcon_egress: None,
+            egress_profiles: Default::default(),
             tls_interception_exemptions: None,
             federated_grant_audience: crate::federated_identity::FederatedIdentityPolicy::default()
                 .grant_audience,

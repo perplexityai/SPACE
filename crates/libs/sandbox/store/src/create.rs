@@ -27,6 +27,7 @@ pub struct SandboxCreate<'a> {
     pub metadata: &'a SandboxMetadata,
     pub auto_lifecycle: &'a AutoLifecyclePolicy,
     pub network_policy_override_json: Option<&'a JsonValue>,
+    pub egress_profiles: &'a [&'a str],
 }
 
 /// Insert an unplaced sandbox. A restore token starts it in `restoring` and
@@ -47,7 +48,7 @@ pub async fn insert_unplaced(
             metadata, auto_lifecycle_json, network_policy_override_json,
             network_policy_generation, volume_encryption,
             restore_lease_token, restore_lease_expires_at,
-            preserve_local_artifact_on_restore_failure
+            preserve_local_artifact_on_restore_failure, egress_profiles
         ) VALUES (
             $1, $2, $3, $4, $5,
             CASE WHEN $18::uuid IS NULL THEN 'creating' ELSE 'restoring' END,
@@ -57,7 +58,7 @@ pub async fn insert_unplaced(
                  THEN NULL
                  ELSE NOW() + make_interval(secs => $19::double precision)
             END,
-            $18::uuid IS NOT NULL
+            $18::uuid IS NOT NULL, $20
         )"
     ))
     .bind(input.id)
@@ -79,12 +80,14 @@ pub async fn insert_unplaced(
     .bind(volume_encryption)
     .bind(restore_lease_token)
     .bind(restore_lease_seconds)
+    .bind(input.egress_profiles)
     .execute(executor)
     .await?;
     Ok(())
 }
 
-/// Insert a sandbox adopted from a warm pool, paused on its existing node.
+/// Insert a sandbox adopted from a warm pool with its existing placement.
+/// Substrates without a database node row pass no active node id.
 /// The caller owns the transaction that also records the pool claim.
 pub async fn insert_pooled(
     executor: impl sqlx::PgExecutor<'_>,
@@ -98,12 +101,13 @@ pub async fn insert_pooled(
             template_id, content_hash, vcpu, memory_mib, disk_mib,
             disk_io_max_operations_per_sec,
             disk_io_max_bandwidth_mib_per_sec, env, metadata,
-            auto_lifecycle_json, network_policy_override_json, network_policy_generation
+            auto_lifecycle_json, network_policy_override_json, network_policy_generation,
+            egress_profiles
         )
         VALUES (
             $1, $2, $3, $4, $5, 'paused', 'on_node',
             $6, $6, NOW(),
-            $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 1
+            $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 1, $18
         )"
     ))
     .bind(input.id)
@@ -123,6 +127,7 @@ pub async fn insert_pooled(
     .bind(sqlx::types::Json(input.metadata))
     .bind(sqlx::types::Json(input.auto_lifecycle))
     .bind(input.network_policy_override_json)
+    .bind(input.egress_profiles)
     .execute(executor)
     .await?;
     Ok(())

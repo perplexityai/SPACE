@@ -541,6 +541,7 @@ async fn fork_admission_waits_for_source_lifecycle_guard() -> TestResult {
 
 fn test_target_config() -> ForkTargetConfig {
     ForkTargetConfig {
+        egress_profiles: Default::default(),
         template: "seed:latest".parse().unwrap(),
         source_template_id: Some("seed".to_string()),
         runtime: None,
