@@ -10,8 +10,8 @@ on:
         type: boolean
         default: false
   # Main CI calls this after every merge. Run it by hand on a branch that
-  # changes packaging; it reads main's cache and never writes it, and never
-  # publishes: a dispatched run has no `publish` input.
+  # changes packaging; it reads main's layer cache and never writes it, and
+  # never publishes: a dispatched run has no `publish` input.
   workflow_dispatch:
 
 permissions:
@@ -32,12 +32,14 @@ jobs:
     name: Build ${{ matrix.feature }} image
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
-    # Reads the third-party image mirror; see ci/mirrored-images.txt. The OIDC
-    # token is only exchanged when publishing, and the push role trusts only
-    # `main`; a caller must grant id-token: write for this job to start.
+    # Reads the third-party image mirror (ci/mirrored-images.txt) and the layer
+    # cache below; packages: write lets main's run refresh that cache, and the
+    # build script writes it from no other run. The OIDC token is only
+    # exchanged when publishing, and the push role trusts only `main`; a caller
+    # must grant id-token: write and packages: write for this job to start.
     permissions:
       contents: read
-      packages: read
+      packages: write
       id-token: write
     strategy:
       fail-fast: false
@@ -65,12 +67,15 @@ jobs:
       # oss-registry root's output; infra/space/aws/oss-registry/README.md has
       # the setup.
       SPACE_BUNDLE_PUBLISH: ${{ (inputs.publish && vars.SPACE_ECR_PUSH_ROLE_ARN != '') && '1' || '0' }}
-      # Merge-group refs are ephemeral: reuse main's cache without spending
-      # minutes exporting layers that no later run can read.
+      # BuildKit layers live in one GHCR package, under a tag per feature and
+      # kind, rather than in the Actions cache, whose size limit evicted them
+      # and other jobs' entries. Only main writes them; any other run reuses
+      # main's layers without spending minutes exporting layers no later run
+      # reads. A missing or unreachable cache only makes the build cold.
       SPACE_BUNDLE_CACHE: >-
         ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' &&
         'enabled' || 'read-only' }}
-      SPACE_BUNDLE_CACHE_BACKEND: gha
+      SPACE_BUNDLE_CACHE_REPOSITORY: ghcr.io/perplexityai/space-bundle-cache
       SPACE_BUNDLE_RELEASE_LTO: thin
       # Take each Dockerfile's listed bases from the GHCR mirror through
       # --build-context options; the Dockerfiles, which the private pipeline
@@ -84,16 +89,14 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # The repository script invokes Buildx directly, so expose the ephemeral
-      # cache-service credentials that official Docker actions normally pass
-      # to BuildKit on its behalf.
-      - name: Expose the GitHub Actions cache to BuildKit
-        uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
-
+      # For the image mirror and the layer cache. Both fall back to the
+      # sources when GHCR is unavailable, so a failed login only warns.
       - name: Log in to GHCR
         env:
           GHCR_TOKEN: ${{ github.token }}
-        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+        run: |
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin ||
+            echo "::warning::Could not log in to ghcr.io; the build takes its bases and layers from the sources"
 
       # Used for the registry login at the start of the build and the push at
       # its end, so the session spans the job's timeout.
@@ -125,7 +128,7 @@ jobs:
         # The runner's own Python runs the standard-library-only script, and
         # the build uses the runner's docker and aws, so no installer runs
         # on the host after the push credentials exist. BuildKit is pinned by
-        # digest in the script.
+        # digest in the script, which takes it from the image mirror first.
         run: python3 ci/scripts/run-space-bundle-builds.py "${FEATURE}"
 
   shim_artifact:

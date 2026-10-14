@@ -118,11 +118,12 @@ jobs:
   artifacts:
     if: github.repository == 'perplexityai/SPACE'
     uses: ./.github/workflows/artifact-ci.yml
-    # Reads the third-party image mirror, and the bundle build exchanges this
-    # job's OIDC token for the image push role.
+    # Reads the third-party image mirror, writes the bundle builds' layer cache
+    # (ghcr.io/perplexityai/space-bundle-cache), and the bundle build exchanges
+    # this job's OIDC token for the image push role.
     permissions:
       contents: read
-      packages: read
+      packages: write
       id-token: write
     with:
       publish: true
