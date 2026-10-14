@@ -3591,8 +3591,11 @@ async fn node_scoped_lookups_hide_unplaced_private_releases() -> TestResult {
 
 /// A sandbox of the template placed on a node, by active or target
 /// placement, lets that node and only that node resolve the release.
+#[rstest::rstest]
 #[tokio::test(flavor = "current_thread")]
-async fn placed_sandbox_unlocks_private_release_for_its_node_only() -> TestResult {
+async fn placed_sandbox_unlocks_private_release_for_its_node_only(
+    #[values("present", "deleting")] desired_state: &str,
+) -> TestResult {
     let Some(fixture) = cluster_fixture().await? else {
         return Ok(());
     };
@@ -3640,6 +3643,13 @@ async fn placed_sandbox_unlocks_private_release_for_its_node_only() -> TestResul
         release_id.to_string()
     );
     assert_eq!(found.authorized_org_id, None);
+
+    sqlx::query(sql!(
+        "UPDATE templates SET desired_state = $1 WHERE name = 'private-base'"
+    ))
+    .bind(desired_state)
+    .execute(pool)
+    .await?;
 
     // Forwarding must intersect scopes; naming a different node cannot borrow
     // the receiving node's placement, and a sandbox delegates its stored org.
@@ -3710,6 +3720,27 @@ async fn placed_sandbox_unlocks_private_release_for_its_node_only() -> TestResul
             }
         }
     }
+
+    // Static-only installations retain their operator trust boundary.
+    let mut request = Request::new(FindTemplateReleaseByHashRequest {
+        generic_only: false,
+        template_name: "private-base".into(),
+        hash: hash.clone(),
+        caller_org_id: None,
+    });
+    TemplateLookupScope::Sandbox {
+        id: SandboxId::from_uuid(sandbox_id),
+        caller_node: None,
+    }
+    .attach(&mut request);
+    let response = fixture
+        .service
+        .find_template_release_by_hash(request)
+        .await?;
+    assert_eq!(
+        response.get_ref().authorized_org_id,
+        Some(owner.to_string())
+    );
 
     // A pending migration is a target placement; the destination may pull
     // before it becomes active, and the source keeps access while it still

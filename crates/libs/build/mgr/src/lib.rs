@@ -600,6 +600,30 @@ impl TemplateBuilder {
         self
     }
 
+    fn base_lookup_request(
+        &self,
+        template: TemplateRef,
+    ) -> (
+        pplx_space_common_svc::template_lookup::TemplateLookupScope,
+        tonic::Request<pplx_space_template_mgr_client::proto::GetTemplateRequest>,
+    ) {
+        use pplx_space_common_svc::template_lookup::TemplateLookupScope;
+        let scope = if self.caller_org.is_some() {
+            TemplateLookupScope::Cluster
+        } else {
+            TemplateLookupScope::LocalExecution
+        };
+        let mut request =
+            tonic::Request::new(pplx_space_template_mgr_client::proto::GetTemplateRequest {
+                caller_org_id: self.caller_org.map(|org| org.to_string()),
+                template: Some(template),
+                vcpu: None,
+                memory_mib: None,
+            });
+        scope.attach(&mut request);
+        (scope, request)
+    }
+
     pub async fn build(
         &self,
         recipe_label: &str,
@@ -667,14 +691,7 @@ impl TemplateBuilder {
                 .map_err(|e| {
                     BuildError::message(format!("cannot connect to template-manager: {e}"))
                 })?;
-            let mut request = tonic::Request::new(pplx_space_template_mgr_client::proto::GetTemplateRequest {
-                    caller_org_id: self.caller_org.map(|org| org.to_string()),
-                    template: Some(TemplateRef::try_from(&base)?),
-                    vcpu: None,
-                    memory_mib: None,
-                });
-            let scope = pplx_space_common_svc::template_lookup::TemplateLookupScope::Cluster;
-            scope.attach(&mut request);
+            let (scope, request) = self.base_lookup_request(TemplateRef::try_from(&base)?);
             let resp = tmpl_client.get_template(request)
                 .await
                 .map_err(|e| {

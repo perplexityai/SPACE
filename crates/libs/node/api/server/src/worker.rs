@@ -567,7 +567,7 @@ impl WorkerApi for WorkerApiService {
         if let Some(sandbox_id) = r.get_ref().sandbox_id.as_deref() {
             record_sandbox_id(&tracing::Span::current(), sandbox_id);
         }
-        crate::template_lookup::bind_caller_scope(&mut r)?;
+        crate::template_lookup::bind_create_caller_scope(&mut r)?;
         // Overrides and nonzero generations require policy authority. A generation
         // persists even without an override and can block later sandbox-specific
         // policy corrections. No override and generation zero retain inheritance.

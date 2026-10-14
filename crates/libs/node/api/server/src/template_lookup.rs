@@ -21,3 +21,21 @@ pub(crate) fn bind_caller_scope<T>(
     scope.attach(request);
     Ok(scope)
 }
+
+/// Control-plane creation delegates the stored sandbox placement, not the API
+/// pod's address. Peer forwarding retains both nodes' placement requirements.
+pub(crate) fn bind_create_caller_scope<T>(request: &mut Request<T>) -> Result<(), Status> {
+    use pplx_space_common_svc::auth::NetworkPolicyMutationAuthority;
+    if request
+        .extensions()
+        .get::<NodeApiAuthenticatedCaller>()
+        .is_some_and(|caller| {
+            caller.network_policy_authority() == NetworkPolicyMutationAuthority::Granted
+        })
+    {
+        TemplateLookupScope::Cluster.attach(request);
+    } else {
+        bind_caller_scope(request)?;
+    }
+    Ok(())
+}

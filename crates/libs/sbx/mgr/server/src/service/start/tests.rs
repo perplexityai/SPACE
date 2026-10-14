@@ -981,6 +981,7 @@ async fn suspend_restore_dir_keeps_a_previous_scope_it_cannot_cancel() {
 
     let error = prepare_suspend_restore_dir(
         &service,
+        &service.lookup_sandbox(&id).unwrap().user,
         id.clone(),
         Some("s3://snapshots/suspend/synthetic?region=us-east-1".to_owned()),
         Some(ExecutionGeneration::new(3).unwrap()),

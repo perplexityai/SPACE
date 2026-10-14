@@ -653,7 +653,7 @@ pub(super) fn checkpoint_start_response_for_existing_started_sandbox(
     }
 }
 
-pub(super) fn template_lookup_scope(
+pub(crate) fn template_lookup_scope(
     owner: &SandboxOwner,
     sandbox_id: Option<&str>,
 ) -> Result<TemplateLookupScope, Status> {
