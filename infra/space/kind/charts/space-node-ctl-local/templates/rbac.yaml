@@ -2,10 +2,9 @@
 {{- $name := include "space-node-service.name" $ctx -}}
 # Same RBAC shape as the prod space-node-ctl chart: node-ctl's Kubernetes
 # node-local controller watches its own Node and advertises the
-# space.pplx.net/network-slots extended resource on status.capacity (the
-# production source of the capacity bootstrap.sh also seeds statically). Only
-# node-ctl's ServiceAccount holds it; no other node service talks to the
-# Kubernetes API.
+# space.pplx.net/network-slots extended resource on status.capacity, the only
+# source of that capacity here as on a deployed node. Only node-ctl's
+# ServiceAccount holds it; no other node service talks to the Kubernetes API.
 {{ include "space-node-service.serviceAccount" $ctx }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1

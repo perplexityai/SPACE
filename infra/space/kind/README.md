@@ -223,9 +223,8 @@ kernel is staged again, so step 2 is optional in practice. It is otherwise
 idempotent: it
 creates the kind cluster (if missing) with the SPACE Kind node image on the
 sandbox workers and builders (see [The node layer](#the-node-layer)), labels
-nodes, advertises the `space.pplx.net/network-slots` extended resource,
-installs the local observability backends when the `otel` profile is selected, installs
-the containerd shim on the sandbox workers, applies the `space` and
+nodes, installs the local observability backends when the `otel` profile is
+selected, installs the containerd shim on the sandbox workers, applies the `space` and
 `sandboxes` Namespaces + `RuntimeClass` and the sandbox namespace's
 NetworkPolicies,
 builds every image and `kind load`s it (first run is the long step; the
@@ -706,9 +705,10 @@ workloads: `datadog` keeps DogStatsD, `otel` selects OTLP, and `off` selects
 would keep emitting DogStatsD metrics through an otel comparison.
 Datadog mode keeps the existing node-local shim settings.
 
-Updating the shim binary or wrapper does not restart containerd unless its
-configuration also changed. Existing sandbox shims keep their launch settings;
-create fresh test-owned sandboxes when changing phases.
+Updating the shim binary or wrapper never restarts containerd: the node image
+registers the `space` runtime, and `install-shim.sh` only replaces the files
+containerd runs for each new sandbox. Existing sandbox shims keep their launch
+settings; create fresh test-owned sandboxes when changing phases.
 
 `install-prereqs.sh` falls back to user-local installs (`$HOME/.local/bin`,
 `$HOME/.local/go`) when run without root, so it works on sudo-less hosts
@@ -978,7 +978,7 @@ kind cluster: space-local (kind-cluster.yaml.tmpl — 6 nodes)
 │   ├── space-runtime-supervisor.service (systemd; installed by node-manager's init
 │   │                                     container; runs every Firecracker VM and
 │   │                                     each sandbox's space-netgtw-svc)
-│   ├── containerd-shim-space-v2        (installed into containerd by install-shim.sh)
+│   ├── containerd-shim-space-v2        (runtime registered by the node image, binary installed by install-shim.sh)
 │   ├── one pod per node-service DaemonSet (release `space`):
 │   │   ├── space-node-manager        → host supervisor (root, privileged)
 │   │   ├── space-runtime-manager     (read-only list)  (space-rtmgr)
@@ -1394,7 +1394,11 @@ asks of the hosting deployment.
 |-----------------------------------------------------------|-------------------------------------------------------------------------------|
 | One DaemonSet per node service, systemd watchdogs via k8s probes | One DaemonSet per node service and role from the Kind charts (`charts/space-<service>-local`), probed on each service's health socket; runtime-supervisor is the same host systemd unit node-manager's init container installs |
 | Node image (packer) provides `/space/cache`, the cgroup subtree, loop devices, device permissions, SPACE accounts and the `/space` skeleton before any pod starts | Sandbox workers and builders boot the SPACE Kind node image, which bakes in the same as systemd units that run before kubelet on every node start (see [The node layer](#the-node-layer)) |
-| `/space/cache` is btrfs on instance-store NVMe            | btrfs on a sparse loopback image at `/var/lib/space-cache.img` on the kind node (40 GiB, same code paths, less I/O headroom), mounted on the node's `/space/cache` by `space-cache.service`, so it outlives pod restarts like the NVMe does |
+| `/space/cache` is btrfs on instance-store NVMe, reformatted on every boot | btrfs on a sparse loopback image at `/var/lib/space-cache.img` on the kind node (40 GiB, same code paths, less I/O headroom), mounted `nosuid,noatime` on the node's `/space/cache` by `space-cache.service`, which reformats it on every start of the node container, so like the NVMe it outlives pod restarts but not node restarts |
+| The node bootstrap installs a checksum-verified `containerd-shim-space-v2` before containerd starts, and registers the `space` runtime under `io.containerd.cri.v1.runtime` with a `CniConfDir` option | the node image registers the same runtime with the same options (in kind's version 2 config format, which containerd migrates to that plugin), so containerd loads it on its first start; the binary arrives after the cluster exists, copied onto each running sandbox worker by `install-shim.sh`, which checks its SHA-256 on the node. Installing it at boot would need the shim built and staged on a host path before `kind create` in every bring-up path |
+| Every node group's bootstrap sets kubelet `eventRecordQPS: 0` and `--fail-swap-on=false` | the same settings on sandbox workers and builders, baked into the node image as a kubelet `--config-dir` drop-in (`node/kubelet/50-space.conf`); the infra node runs the unmodified base image, so its kubelet keeps kind's event rate limit (`failSwapOn` is already `false` there). No sandbox pod runs on it, so none of their events pass through that limit |
+| Release binaries read no test hooks | every binary is built with `test-hooks`, and the charts set these hooks on every run: sandbox-manager's on-node snapshot reaper at target fraction 0, interval 15 s, grace 60 s and idle 120 s, against release values of 0.40, 300 s, 1800 s and 86400 s (`charts/space-sandbox-manager-local/values.yaml`, `snapshot_gc.rs`); template-manager's cache GC at interval 15 s and grace 60 s, against 300 s and 1800 s, and its prefetch latest-N at 1, against 5 (`charts/space-template-manager-local/values.yaml`, `eviction.rs`, `prefetch.rs`); the disk-admission reservation below; and api's and internal-api's TokenReview namespace, set to the release namespace that release builds read from the service-account mount. Scenarios shorten further hooks, such as the snapshot-retention sweeper's minimum age and the activation-admission burst, for their own run and restore them. The public-operation dispatcher's tick, claim limit and claim staleness stay at their release values |
+| 8 GiB disk-admission reservation per cache allocation (release default) | 1 GiB through the `SPACE_NODE_DISK_ADMISSION_ALLOCATION_RESERVATION_BYTES` test hook, with the 1 GiB `MIN_AVAILABLE_BYTES` floor, so allocations fit the 40 GiB cache (`charts/space-node-service/values.yaml`) |
 | Postgres on RDS, secrets via ExternalSecrets / AWS Secrets Manager | In-cluster `space-postgres` StatefulSet, one pod on a 1 GiB volume, static Kubernetes Secrets |
 | PostgreSQL 17 | The same major version (`postgres:17`; CI takes it from the image mirror at a pinned digest) |
 | Every client connects with `sslmode=require`              | The same `sslmode=require` on every connection: the services and the migrate Job through the `space-postgres` Secret's connection string, and the harness's `psql` helpers over loopback TLS inside the pod. The certificate is self-signed per pod start, which `require` accepts because it does not verify the server. Kind's server also refuses unencrypted TCP, so no Kind client runs in plaintext and one that sets `sslmode=disable` fails. A client that omits `sslmode` still connects over TLS, because libpq and sqlx default to `prefer`, so Kind cannot catch a connection string that loses `sslmode=require` |
@@ -1452,10 +1456,16 @@ infra node. The builder release selects only `pool=builder`, and the builder
 nodes are deliberately not `space-enabled`, so user sandbox pods cannot land
 there.
 
-The two sandbox workers also advertise an extended resource
-`space.pplx.net/network-slots: 100` so the kube scheduler can satisfy each
-sandbox pod's `space.pplx.net/network-slots: 1` request. Bootstrap advertises
-a static pool in place of node-controller's dynamic capacity updates.
+Each sandbox pod requests `space.pplx.net/network-slots: 1`. As on a deployed
+node, each sandbox worker's node-ctl advertises that extended resource on its
+Node's `status.capacity`, from its node-manager's `network_pool_max_slots`
+(`crates/libs/node/ctl/server/src/kubernetes_controller/network_slots.rs`), and
+re-advertises it on every periodic tick, including after the Node object is
+recreated. node-manager keeps no warm pool of slots, as deployed nodes do not
+(`SPACE_NODEMGR_NETWORK_POOL_TARGET`, `_RETAIN_READY` and `_MIN_READY` are `0`
+in `charts/space-node-manager-local`): each slot, a sandbox's or a build's, is
+set up when it is allocated and torn down when it is released, and no slot is
+kept ready for the next allocation.
 
 ## The node layer
 
@@ -1475,7 +1485,7 @@ these units, enabled in the image:
 | `space-kind-devices.service` | mode 0666 on `/dev/kvm`, `/dev/vhost-vsock`, `/dev/vhost-net` | the `kvm` group; Kind-only, never on a worker |
 | `space-cgroup.service` | `/sys/fs/cgroup/space` with `+cpu +memory +io +pids` delegated | `space-cgroup.service` (07-sysctl.sh) |
 | `space-layout.service` | the SPACE groups and service accounts; the `/space/run` skeleton and dependency-drain gates; protected Firecracker copies under `/space/bin/runtime/firecracker` and `/space/bin/{firecracker,jailer}` links; `/space/etc/sandbox.toml`; `/var/run/netns` | 07-sysctl.sh accounts and directory skeleton, 04-firecracker.sh runtime installation |
-| `space-cache.service` | formats `/var/lib/space-cache.img` on first boot (sparse, 40 GiB), mounts it on `/space/cache` with loop autoclear and shared propagation, then creates the cache skeleton | 01-partitions.sh / 11-nvme-cache.sh |
+| `space-cache.service` | formats `/var/lib/space-cache.img` on every boot (sparse, 40 GiB), mounts it `nosuid,noatime` on `/space/cache` with loop autoclear and shared propagation, then creates the cache skeleton | 01-partitions.sh / 11-nvme-cache.sh |
 | `space-kind-vsock-jails.service` | long-running: mknods `/dev/vhost-vsock` into each Firecracker jail under `/space/cache/firecracker/jails` as it appears (the jailer does not) | the node image provides it; Kind-only |
 
 They are ordered `Before=kubelet` and run on every boot of the node container,
@@ -1484,11 +1494,31 @@ and cgroups; all but the vhost-vsock unit are oneshots. Nothing is installed
 when the cluster comes up. The sandbox workers and builders run this image
 (`kind-cluster.yaml.tmpl`); the control-plane and infra nodes run its
 base unchanged, as production's non-SPACE nodes carry no SPACE node layer, so
-every node runs the same Kubernetes version. The cache image sits on the node's
-`/var`, which kind keeps on a Docker volume, so the cache survives pod and node
-restarts. Defaults are baked like the rest of the layer; a node's
-`/etc/space/kind-node.env` can override `SPACE_CACHE_SIZE_MB` and
-`SPACE_LOOP_DEVICE_TARGET` for its next boot.
+every node runs the same Kubernetes version. The cache survives pod restarts but
+not node restarts, as the instance-store cache of a deployed node does: on every
+start of the node container `space-cache.service` truncates the image on the
+node's `/var` and formats it afresh, so templates, sandboxes and snapshots on the
+cache are gone and the node services re-create what they need (template-manager
+pulls templates again, node-manager's init container stages the guest kernel
+again). What was put on the cache by hand is not re-created: templates the
+optional `scripts/bootstrap-prod-seed.sh` staged must be staged again by
+re-running it, which skips the workers that still have them. Re-running the
+unit within one boot keeps the mounted cache. Defaults are baked like the rest
+of the layer; a node's `/etc/space/kind-node.env` can
+override `SPACE_CACHE_SIZE_MB` and `SPACE_LOOP_DEVICE_TARGET` for its next boot.
+
+The image also carries the kubelet and containerd settings a deployed node's
+bootstrap applies (`infra/space/aws/eks/modules/space/templates/`): a kubelet
+`--config-dir` drop-in (`node/kubelet/50-space.conf`) with no client-side event
+rate limit (`eventRecordQPS: 0`) and `failSwapOn: false`, and the `space`
+runtime handler with its `CniConfDir` option (`node/containerd/space-runtime.toml`).
+The drop-in is written in the version 2 format of kind's own containerd config,
+which imports it, so containerd migrates both into the CRI v1 runtime plugin
+where a deployed node has the handler, and kind's runc settings (the systemd
+cgroup driver, which kubelet adopts from containerd) still apply; the image
+build fails otherwise. Check them with
+`kubectl get --raw /api/v1/nodes/<node>/proxy/configz` and `docker exec <node>
+containerd config dump`.
 
 The vendor mount remains a read-only, developer-owned download cache. At boot,
 `space-layout.service` copies the bootstrap Firecracker 1.15.1 binaries into
@@ -1525,13 +1555,10 @@ the pod and never reach the node's mount table. Check a node's view with
 `docker exec <node> findmnt -o TARGET,FSTYPE,PROPAGATION`.
 
 Diagnose a node with `docker exec <node> systemctl status 'space-*'` and
-`docker exec <node> journalctl -u space-cache`. To start a node's cache clean or
-at a new size, delete the node-service DaemonSets of that node's role, run
-`systemctl stop space-runtime-supervisor && umount /space/cache && rm
-/var/lib/space-cache.img` on the node (adding `SPACE_CACHE_SIZE_MB=<MiB>` to
-`/etc/space/kind-node.env` for a new size), then `systemctl restart
-space-cache` and re-apply the charts. Recreating the cluster
-also starts clean.
+`docker exec <node> journalctl -u space-cache`. To start a node's cache clean,
+`docker restart <node>`; for a new size, first add `SPACE_CACHE_SIZE_MB=<MiB>`
+to the node's `/etc/space/kind-node.env`. Recreating the cluster also starts
+clean.
 
 **Clusters created before this image, or from an older build of it, must be
 recreated.** A kind node keeps the image it was created from, so such a

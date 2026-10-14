@@ -258,26 +258,18 @@ apply_node_labels() {
 }
 apply_node_labels
 
-# ── Step 3: extended resource — network slots ─────────────────────────────────
+# ── Step 3: network-slot capacity ────────────────────────────────────────────
 # Every sandbox pod requests `space.pplx.net/network-slots: "1"` (set by
-# KubernetesSubstrate::build_sandbox_pod). Without a node advertising
-# capacity, the kube scheduler leaves sandbox pods Pending forever. In prod
-# space-node-ctl patches each Node's status.capacity from node-manager's
-# `network_pool_max_slots`; locally we advertise a static pool.
-log "advertising network-slots capacity on sandbox workers"
-for node in $(kubectl --context "$KCTX" get nodes -l space.pplx.net/node-pool=sandbox -o name); do
-  # JSON-patch `add` on a map key is idempotent. ~1 in the json-pointer is
-  # the escape for `/` inside the key `space.pplx.net/network-slots`.
-  kubectl --context "$KCTX" patch "$node" --subresource=status --type=json \
-    -p '[{"op":"add","path":"/status/capacity/space.pplx.net~1network-slots","value":"100"}]' \
-    >/dev/null || true
-done
+# KubernetesSubstrate::build_sandbox_pod). Each node's space-node-ctl advertises
+# its node-manager's `network_pool_max_slots` on the Node's status.capacity, as
+# on a deployed node (crates/libs/node/ctl/server/src/kubernetes_controller/
+# network_slots.rs). Nothing seeds it here, as nothing does on a deployed node.
 
 # ── Step 4: install the SPACE containerd shim on each sandbox worker ─────────
 # Without this, RuntimeClass `space` (handler: space) is unresolvable and
-# every per-sandbox pod fails to start. install-shim.sh is idempotent: it
-# only builds the shim if needed and only edits containerd config.toml if
-# the runtime stanza isn't already present.
+# every per-sandbox pod fails to start. The node image registers the runtime
+# with containerd; install-shim.sh installs the binary containerd runs for it,
+# and is idempotent: it only builds the shim if needed.
 # Reconcile receivers and owned log collection before changing producers.
 # Local node-side endpoints stay at the Kind profiles' fixed ClusterIPs, so
 # already-running exporters can also reconnect after a backend restart.

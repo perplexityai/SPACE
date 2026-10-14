@@ -30,6 +30,34 @@ COPY --chmod=0755 infra/space/kind/node/space-kind-node.sh /usr/local/lib/space/
 COPY --chmod=0644 scripts/lib/space-loop-devices.sh /usr/local/lib/space/kind-node/space-loop-devices.sh
 COPY --chmod=0644 infra/space/identity/node-identities.sh /usr/local/lib/space/kind-node/node-identities.sh
 COPY --chmod=0644 infra/space/kind/node/systemd/ /etc/systemd/system/
+# The kubelet and containerd settings a deployed node's bootstrap applies before
+# either starts (infra/space/aws/eks/modules/space/templates/
+# worker-bootstrap.sh.tftpl). Baked in rather than patched into the cluster
+# config, so a cluster created without them runs another image tag and
+# check-kind-node-image.sh refuses it. kind's kubelet unit takes extra flags from
+# /etc/default/kubelet, and its containerd config (version 2) gains an import of
+# the version 2 drop-in. The build fails unless the configuration containerd
+# loads has the `space` runtime with its option and still has kind's own
+# settings: runc's systemd cgroup driver, which kubelet adopts from containerd,
+# and discard_unpacked_layers (see the drop-in for how a version mismatch loses
+# them). The awk prints each `table|key = value` of the dump.
+COPY --chmod=0644 infra/space/kind/node/kubelet/50-space.conf /etc/kubernetes/kubelet.conf.d/50-space.conf
+COPY --chmod=0644 infra/space/kind/node/containerd/space-runtime.toml /etc/containerd/conf.d/space-runtime.toml
+RUN sed -i 's|^KUBELET_EXTRA_ARGS=|KUBELET_EXTRA_ARGS=--config-dir=/etc/kubernetes/kubelet.conf.d |' /etc/default/kubelet \
+ && grep -q '^KUBELET_EXTRA_ARGS=--config-dir=/etc/kubernetes/kubelet.conf.d ' /etc/default/kubelet \
+ && sed -i '0,/^version = 2$/s||version = 2\nimports = ["/etc/containerd/conf.d/*.toml"]|' /etc/containerd/config.toml \
+ && containerd config dump 2>/dev/null \
+    | awk '/^ *\[/ { table = $0; gsub(/^ *\[|\] *$/, "", table); next } NF { sub(/^ */, ""); print table "|" $0 }' \
+    > /tmp/containerd-config \
+ && for want in \
+      "plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.space|runtime_type = 'io.containerd.space.v2'" \
+      "plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.space|pod_annotations = ['space.pplx.net/*']" \
+      "plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.space.options|CniConfDir = '/etc/cni/net.d'" \
+      "plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc.options|SystemdCgroup = true" \
+      "plugins.'io.containerd.cri.v1.images'|discard_unpacked_layers = true"; do \
+      grep -qxF "$want" /tmp/containerd-config || { echo "containerd config lacks: $want" >&2; exit 1; }; \
+    done \
+ && rm /tmp/containerd-config
 RUN systemctl enable \
       space-loop-nodes.service \
       space-kind-devices.service \

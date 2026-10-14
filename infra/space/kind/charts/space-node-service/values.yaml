@@ -37,11 +37,14 @@ node:
     credentialsSecretName: space-object-store
     endpoint: http://object-store:8333
     region: us-east-1
-  # Disk-admission sizing for /space/cache. Production defaults assume NVMe
+  # Disk-admission sizing for /space/cache. Release defaults assume NVMe
   # (50 GiB min-available floor, 8 GiB per-sandbox allocation reservation);
   # the Kind cache is a 40 GiB sparse loopback btrfs image, so both byte knobs
-  # scale to 1 GiB through the same production config surface. Without this
-  # every node publishes scheduling_status=full and sandbox-manager rejects
+  # scale to 1 GiB. The floor is a deployment setting; the reservation is a
+  # test hook that only the Kind build's test-hooks feature reads, and release
+  # binaries always reserve 8 GiB
+  # (crates/libs/common/core/src/host/disk_admission.rs). Without this every
+  # node publishes scheduling_status=full and sandbox-manager rejects
   # prepare_sandbox with disk_available_below_threshold. Read by the services
   # that admit cache allocations: node-manager, sandbox-manager,
   # volume-manager and build-manager.

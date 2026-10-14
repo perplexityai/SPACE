@@ -36,6 +36,8 @@ DOCKERFILE=infra/space/kind/node/Dockerfile
 INPUTS=(
   "${DOCKERFILE}"
   infra/space/kind/node/space-kind-node.sh
+  infra/space/kind/node/containerd/space-runtime.toml
+  infra/space/kind/node/kubelet/50-space.conf
   infra/space/kind/node/systemd/space-cache.service
   infra/space/kind/node/systemd/space-cgroup.service
   infra/space/kind/node/systemd/space-kind-devices.service

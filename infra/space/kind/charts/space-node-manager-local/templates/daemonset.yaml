@@ -258,6 +258,28 @@ spec:
             # Sandbox pods own their network namespaces (KubernetesSubstrate).
             - name: SPACE_NODEMGR_SERVICE_PORT_INGRESS_ISOLATION
               value: shared_host
+            # No warm network-slot pool, as deployed nodes run. Each slot is its
+            # own network namespace, bridged to the sandbox pod's namespace or,
+            # for an allocation without one, to the node's; claim_allocation
+            # (crates/libs/node/mgr/server/src/slot_pool.rs) serves only the
+            # latter from the pool. Sandbox pods bring their own namespace
+            # (KubernetesSubstrate), so their slots are set up on allocation
+            # and torn down on release either way. The binary defaults also
+            # keep max(target, retained) slots, every slot the node has, ready
+            # and bridged to the node (the fill loop in slot_pool/worker.rs):
+            # a sandbox claim then takes one of those and rebuilds it for the
+            # pod, and the pool rebuilds it after release. build-manager
+            # allocates without a namespace, so with the pool off builders set
+            # up their slots on demand instead of leasing pooled ones. With no
+            # ready minimum the pool reports healthy while empty (pool_status
+            # in service/network_helpers.rs). Read at startup in
+            # crates/libs/node/mgr/server/src/run.rs.
+            - name: SPACE_NODEMGR_NETWORK_POOL_TARGET
+              value: "0"
+            - name: SPACE_NODEMGR_NETWORK_POOL_RETAIN_READY
+              value: "0"
+            - name: SPACE_NODEMGR_NETWORK_POOL_MIN_READY
+              value: "0"
             {{- if ne (toString .Values.loopDeviceTarget) "" }}
             - name: SPACE_LOOP_DEVICE_TARGET
               value: {{ .Values.loopDeviceTarget | quote }}

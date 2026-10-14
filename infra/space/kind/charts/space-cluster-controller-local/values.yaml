@@ -109,15 +109,15 @@ reconcilers:
   # /v1/sandboxes is POSTed under KubernetesSubstrate. It is ON by default in
   # the binary, so the explicit enable below is redundant but keeps local
   # smoke deployments independent of that default; setting it to false leaves
-  # CreateSandbox returning 202 with the operation `queued` forever. Tight
-  # ticks/concurrency keep local smoke turnaround snappy.
+  # CreateSandbox returning 202 with the operation `queued` forever. The tick,
+  # claim limit and claim staleness are test hooks
+  # (crates/libs/cluster/controller/server/src/public_operation_dispatcher.rs)
+  # left at their release values, so Kind picks up queued operations on the
+  # deployed 25 ms tick. Execution concurrency is a deployment setting.
   publicOperationDispatcher:
     env:
       SPACE_PUBLIC_OPERATION_DISPATCHER_ENABLED: "true"
-      SPACE_PUBLIC_OPERATION_DISPATCHER_TICK_SECS: "1"
-      SPACE_PUBLIC_OPERATION_DISPATCHER_CLAIM_LIMIT: "64"
       SPACE_PUBLIC_OPERATION_DISPATCHER_EXECUTION_CONCURRENCY: "16"
-      SPACE_PUBLIC_OPERATION_DISPATCHER_CLAIM_STALE_SECS: "60"
   # These repairs are live when enabled. Keep kind explicitly disabled until
   # the end-to-end and smoke suites exercise their default-on behavior.
   failedRestorableRepair:
@@ -179,8 +179,11 @@ reconcilers:
   stuckSnapshotReaper:
     env:
       SPACE_STUCK_SNAPSHOT_REAPER_ENABLED: "false"
+  # The minimum age (SPACE_SNAPSHOT_RETENTION_SWEEPER_MIN_AGE_SECS) is a test
+  # hook left at its release value, which equals the API's fork-retention grace
+  # (crates/libs/common/core/src/types/snapshot.rs). The retention scenarios
+  # shorten it for their own run and restore it afterwards.
   snapshotRetentionSweeper:
-    minAgeSeconds: "3600"
     env:
       SPACE_SNAPSHOT_RETENTION_SWEEPER_ENABLED: "true"
   snapshotStorageSweeper:

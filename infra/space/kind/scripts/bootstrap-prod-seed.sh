@@ -25,6 +25,13 @@
 #   TEMPLATE_BOOTSTRAP_NAMES   — comma/space-separated. Default: seed.
 #
 # This script is idempotent: re-running it skips work that's already done.
+#
+# Re-run it after a sandbox worker restarts. The staged files live on the
+# worker's /space/cache, which space-cache.service reformats on every boot of
+# the node (infra/space/kind/node/space-kind-node.sh), and nothing else puts
+# them back: template-manager cannot pull them from this bucket. A re-run
+# stages the templates onto the restarted worker again and skips the workers
+# that still have them on their cache.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -136,12 +143,15 @@ SQL
     local s3_path="${storage_uri%%\?*}"
     s3_path="${s3_path%/}"
 
-    # If the worker already has this hash registered, skip — idempotency.
-    # `space-tmplmgr list` truncates the hash to ~12 hex chars, so grep on
-    # the bare prefix (post-`sha256:`).
+    # If the worker already has this hash registered and its build directory
+    # is on the cache, skip — idempotency. `space-tmplmgr list` truncates the
+    # hash to ~12 hex chars, so grep on the bare prefix (post-`sha256:`). The
+    # directory check covers a worker restarted moments ago, whose catalog
+    # can still list the build until template-manager's startup recovery
+    # prunes it.
     local hex_prefix="${hash#sha256:}"
     hex_prefix="${hex_prefix:0:12}"
-    if kubectl -n space exec "$pod" -c shell -- bash -c "space-tmplmgr list 2>/dev/null | grep -q $hex_prefix" 2>/dev/null; then
+    if kubectl -n space exec "$pod" -c shell -- bash -c "space-tmplmgr list 2>/dev/null | grep -q $hex_prefix && compgen -G '/space/cache/firecracker/templates/${name}/*${hex_prefix}*' >/dev/null" 2>/dev/null; then
       log "    $name@${hash:0:24}… already staged locally; skip"
       continue
     fi

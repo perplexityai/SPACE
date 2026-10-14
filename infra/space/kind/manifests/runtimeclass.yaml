@@ -1,16 +1,20 @@
 # KubernetesSubstrate pins per-sandbox pods to runtimeClassName: space.
-# `infra/space/kind/scripts/install-shim.sh` installs the SPACE containerd
-# shim (`io.containerd.space.v2`) on each kind sandbox worker and registers
-# a `space` CRI runtime that points at it. The shim hijacks the per-sandbox
-# pod's pause container, reads the SPACE annotations (sandbox-id, vcpu,
-# memory, template, …), and calls into the local sandbox-manager UDS to
-# create a real sandbox via node-manager, which launches Firecracker through
-# the node's runtime-supervisor, as in production.
+# The SPACE Kind node image registers the `space` CRI runtime handler with
+# containerd (infra/space/kind/node/containerd/space-runtime.toml), pointing at
+# the SPACE containerd shim (`io.containerd.space.v2`), and
+# `infra/space/kind/scripts/install-shim.sh` installs the shim binary on each
+# kind sandbox worker. The shim hijacks the per-sandbox pod's pause container,
+# reads the SPACE annotations (sandbox-id, vcpu, memory, template, …), and
+# calls into the local sandbox-manager UDS to create a real sandbox via
+# node-manager, which launches Firecracker through the node's
+# runtime-supervisor, as in production.
 #
-# If the shim isn't installed (e.g. on a fresh cluster before bootstrap.sh
-# has run install-shim.sh), kubelet will fail pod-start with
-# "runtime handler 'space' is not configured" and the api-server will report
-# `proxy_unreachable`. Run install-shim.sh and recreate the affected pods.
+# If the shim binary isn't installed (e.g. on a fresh cluster before
+# bootstrap.sh has run install-shim.sh), containerd cannot start the pod's
+# sandbox and kubelet reports FailedCreatePodSandBox. Run install-shim.sh and
+# recreate the affected pods; containerd is not restarted. A node whose image
+# predates the registration has no `space` handler at all; recreate the cluster
+# (scripts/check-kind-node-image.sh).
 apiVersion: node.k8s.io/v1
 kind: RuntimeClass
 metadata:

@@ -328,9 +328,10 @@ custom_build(
 # `KubernetesSubstrate::build_sandbox_pod` pins per-sandbox pods to
 # `runtimeClassName: space` and `nodeSelector: node.kubernetes.io/space-enabled=true`.
 # Neither exists in vanilla KinD, so we materialize them before the charts
-# land. RuntimeClass `space` resolves to containerd-shim-space-v2 once
-# install-shim.sh has wired it into each sandbox worker's containerd (the
-# `install-space-shim` bootstrap resource below, full harness only).
+# land. The SPACE Kind node image registers RuntimeClass `space`'s handler with
+# containerd; it resolves to containerd-shim-space-v2 once install-shim.sh has
+# installed that binary on each sandbox worker (the `install-space-shim`
+# bootstrap resource below, full harness only).
 
 # Namespace + RuntimeClass live in infra/space/kind/manifests/ so the scripted
 # bootstrap (infra/space/kind/scripts/bootstrap.sh) and tilt up share one
@@ -363,25 +364,6 @@ local_resource(
     "label-kind-workers",
     cmd = "kubectl --context kind-{cluster} label nodes -l 'space.pplx.net/node-pool=sandbox' node.kubernetes.io/space-enabled=true --overwrite".format(cluster = KIND_CLUSTER),
     labels = ["bootstrap"],
-)
-
-# Advertise the network-slot extended resource on sandbox workers. Every
-# sandbox pod requests `space.pplx.net/network-slots: "1"` (see
-# `KubernetesSubstrate::build_sandbox_pod`), so without a node advertising
-# capacity the scheduler leaves every sandbox pod Pending. Node-controller
-# advertises node-manager's `network_pool_max_slots`; locally we advertise a
-# static pool to exercise scheduling. JSON-patch `add` on a map key is idempotent
-# across re-runs.
-local_resource(
-    "advertise-kind-worker-network-slots",
-    cmd = """
-for node in $(kubectl --context kind-{cluster} get nodes -l 'space.pplx.net/node-pool=sandbox' -o name); do
-  kubectl --context kind-{cluster} patch "$node" --subresource=status --type=json \\
-    -p '[{{"op":"add","path":"/status/capacity/space.pplx.net~1network-slots","value":"100"}}]'
-done
-""".format(cluster = KIND_CLUSTER),
-    labels = ["bootstrap"],
-    resource_deps = ["label-kind-workers"],
 )
 
 # Label the infra node so Postgres, space-api, and space-cluster-controller
@@ -468,9 +450,8 @@ local_resource(
 # required: Tilt runs nothing else beside a serial local resource, and this one
 # runs for minutes. It waits for the serial bootstrap resources because Tilt
 # holds those while anything else is building.
-RUST_ARTIFACTS_AFTER = ["label-kind-workers", "advertise-kind-worker-network-slots",
-                        "label-kind-infra", "sandbox-ssh-secret", "internal-rpc-tls",
-                        "check-kind-node-image", "install-space-shim"]
+RUST_ARTIFACTS_AFTER = ["label-kind-workers", "label-kind-infra", "sandbox-ssh-secret",
+                        "internal-rpc-tls", "check-kind-node-image", "install-space-shim"]
 local_resource(
     "rust-artifacts",
     cmd = RUST_ARTIFACT_BUILD,
@@ -516,9 +497,8 @@ k8s_resource(
 # lands, and the rate limiters' store should answer before the first create
 # reaches them (they would admit it open, not fail it).
 SPACE_API_DEPS = ["space-postgres", "label-kind-workers", "label-kind-infra",
-                  "advertise-kind-worker-network-slots", "install-space-shim",
-                  "internal-rpc-tls", "space-sandbox-network-policy", "space-db-migrate",
-                  "space-redis"]
+                  "install-space-shim", "internal-rpc-tls", "space-sandbox-network-policy",
+                  "space-db-migrate", "space-redis"]
 # No port_forward: localhost:8080 is the cluster's host port mapping onto the
 # space-api-entry NodePort (kind-cluster.yaml.tmpl), which spreads connections
 # across the autoscaled replicas as a deployment's load balancer does.

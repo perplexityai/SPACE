@@ -1,0 +1,29 @@
+# The `space` runtime handler RuntimeClass `space` names
+# (infra/space/kind/manifests/runtimeclass.yaml), registered with the options a
+# deployed node's bootstrap gives it (infra/space/aws/eks/modules/space/
+# templates/worker-bootstrap.sh.tftpl, `spec.containerd.config`). Baked into the
+# Kind node image, whose containerd config imports this file, so containerd
+# loads it when it first starts and is never restarted to pick it up.
+#
+# Version 2, the version of the kind config.toml that imports it. containerd
+# merges an import over that config, its version included, and migrates the
+# result to version 3 only when the merged version is below 3. A version 3 file
+# here would make the merged config version 3 and leave kind's own settings
+# (runc's SystemdCgroup and base_runtime_spec, discard_unpacked_layers, the
+# test-handler runtime) unmigrated under io.containerd.grpc.v1.cri, which the version 3
+# CRI plugins do not read: containerd would report the cgroupfs driver, and
+# kubelet would adopt it. Written as version 2, this table is migrated with
+# kind's into io.containerd.cri.v1.runtime, where a deployed node's containerd
+# has it. node/Dockerfile fails the build unless both survive.
+version = 2
+
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.space]
+  # containerd runs /usr/local/bin/containerd-shim-space-v2, which
+  # scripts/install-shim.sh installs.
+  runtime_type = "io.containerd.space.v2"
+  # The shim reads its instructions (sandbox id, owner, template, sizing) from
+  # the space.pplx.net/* pod annotations in the OCI spec; containerd forwards
+  # only the annotations listed here.
+  pod_annotations = ["space.pplx.net/*"]
+  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.space.options]
+    CniConfDir = "/etc/cni/net.d"

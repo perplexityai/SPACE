@@ -83,8 +83,6 @@ spec:
             # BYOK switch here too (same value as the api chart).
             - name: SPACE_BYOK_VOLUME_ENCRYPTION
               value: {{ .Values.byokVolumeEncryption | quote }}
-            - name: SPACE_SNAPSHOT_RETENTION_SWEEPER_MIN_AGE_SECS
-              value: {{ .Values.reconcilers.snapshotRetentionSweeper.minAgeSeconds | quote }}
             - name: SPACE_INTERNAL_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -187,10 +185,8 @@ spec:
             {{- end }}
             {{- range $name, $reconciler := .Values.reconcilers }}
             {{- range $key, $value := (default (dict) $reconciler.env) }}
-            {{- if ne $key "SPACE_SNAPSHOT_RETENTION_SWEEPER_MIN_AGE_SECS" }}
             - name: {{ $key }}
               value: {{ $value | quote }}
-            {{- end }}
             {{- end }}
             {{- end }}
           # Ready once the process has reached the Lease (won it, or been validly
