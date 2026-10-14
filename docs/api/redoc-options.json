@@ -1,6 +1,7 @@
 {
   "disableGoogleFont": true,
   "disableSearch": true,
+  "scrollYOffset": ".docs-utility",
   "hideDownloadButton": true,
   "hideHostname": false,
   "pathInMiddlePanel": true,
@@ -17,20 +18,33 @@
       "medium": "200rem",
       "large": "220rem"
     },
-    "spacing": { "sectionHorizontal": 28, "sectionVertical": 24 },
-    "sidebar": { "width": "270px" },
-    "rightPanel": { "backgroundColor": "#e1e6e8", "textColor": "#fff" },
+    "spacing": { "sectionHorizontal": 32, "sectionVertical": 28 },
+    "sidebar": {
+      "width": "248px",
+      "backgroundColor": "#ffffff",
+      "textColor": "#526565",
+      "activeTextColor": "#176f72"
+    },
+    "rightPanel": { "backgroundColor": "#ffffff", "textColor": "#fff" },
     "codeBlock": { "backgroundColor": "#263238" },
     "colors": {
+      "primary": { "main": "#176f72" },
+      "text": { "primary": "#263333", "secondary": "#526565" },
+      "border": { "light": "#dce5e5", "dark": "#526565" },
       "responses": {
         "success": { "tabTextColor": "#a0fbaa" },
         "error": { "tabTextColor": "#ffaaaa" }
       }
     },
     "typography": {
-      "fontFamily": "system-ui, sans-serif",
-      "headings": { "fontFamily": "system-ui, sans-serif" },
-      "code": { "fontFamily": "monospace" }
-    }
+      "fontSize": "16px",
+      "lineHeight": "1.65em",
+      "fontFamily": "var(--docs-font-body)",
+      "headings": { "fontFamily": "var(--docs-font-body)", "fontWeight": "600", "lineHeight": "1.25em" },
+      "code": { "fontFamily": "var(--docs-font-code)", "color": "#263333" },
+      "links": { "color": "#176f72", "visited": "#176f72", "hover": "#176f72", "hoverTextDecoration": "underline" }
+    },
+    "schema": { "typeNameColor": "#176f72", "linesColor": "#dce5e5" },
+    "fab": { "backgroundColor": "#176f72", "color": "#ffffff" }
   }
 }

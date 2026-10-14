@@ -146,19 +146,36 @@ writeFileSync(resolve(output, 'reference.js'),
 spec.info.description = '# Overview\\n\\n' + document.getElementById('overview').innerHTML + '\\n\\n' + spec.info.description;
 Redoc.init(spec, ${JSON.stringify(options)}, document.getElementById('reference'), error => {
   if (error) { document.body.dataset.renderError = String(error); throw error; }
-  enhanceSchemaNavigation(${JSON.stringify(schemaCatalog)});
+  enhanceSchemaNavigation(${JSON.stringify(schemaCatalog)}, document.querySelector('.docs-utility').getBoundingClientRect().bottom);
+  // The outer utility links use browser anchors rather than Redoc's scroller.
+  document.querySelectorAll('.docs-utility a[href^="#"]').forEach(link => {
+    link.addEventListener('click', event => {
+      if (event.defaultPrevented || event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+      requestAnimationFrame(() => {
+        const target = document.getElementById(decodeURIComponent(link.hash.slice(1)));
+        if (!target) return;
+        const offset = document.querySelector('.docs-utility').getBoundingClientRect().bottom;
+        window.scrollTo(0, window.scrollY + target.getBoundingClientRect().top + 1 - offset);
+      });
+    });
+  });
   document.body.dataset.renderReady = 'true';
 });\n`);
 writeFileSync(resolve(output, 'index.html'), `<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'none'; worker-src blob:; base-uri 'none'; form-action 'none'">
-<title>SPACE API</title><link rel="stylesheet" href="reference.css">
+<title>SPACE API</title><link rel="stylesheet" href="theme/curiosity.css"><link rel="stylesheet" href="reference.css">
 </head><body>
-<header><nav class="section-nav" aria-label="Documentation sections"><a href="https://github.com/perplexityai/SPACE/blob/${commit}/docs/introduction.md">SPACE Guide</a>
-<a href="index.html" aria-current="true">API Reference</a></nav>
-<a href="#section/Overview">Overview</a> · <a href="#tag/Sandboxes">Endpoints</a> ·
-<a href="openapi.json" download>Download OpenAPI JSON</a></header>
+<header class="docs-header">
+<a class="docs-brand" href="https://github.com/perplexityai/SPACE/blob/${commit}/docs/introduction.md">SPACE</a>
+<nav class="docs-sections" aria-label="Documentation sections">
+<a href="https://github.com/perplexityai/SPACE/blob/${commit}/docs/introduction.md">Guide</a>
+<a href="index.html" aria-current="page">API Reference</a></nav></header>
+<nav class="docs-utility" aria-label="API reading controls">
+<div class="docs-utility-links"><a href="#section/Overview">Overview</a><a href="#tag/Sandboxes">Endpoints</a></div>
+<span class="docs-utility-title">API Reference</span>
+<a href="openapi.json" download>Download OpenAPI JSON</a></nav>
 <template id="overview">${overview}</template>
 <section id="reference" aria-label="Endpoint reference"></section>
 <footer><a href="build.json">Build details</a></footer>

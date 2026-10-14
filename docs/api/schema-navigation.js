@@ -1,5 +1,5 @@
 // Progressive enhancement of native Redoc schema output, never a schema renderer.
-function enhanceSchemaNavigation(catalog) {
+function enhanceSchemaNavigation(catalog, scrollOffset = 0) {
   const initialHash = location.hash;
   for (const { name, purpose, related, primitive } of catalog) {
     const section = document.querySelector(`[data-section-id="schema/${name}"]`);
@@ -40,9 +40,16 @@ function enhanceSchemaNavigation(catalog) {
   // Collapsing earlier samples changes layout. Re-anchor an initial legacy
   // schema/index link after enhancement without rewriting its hash or history.
   if (initialHash.startsWith('#schema/') || initialHash === '#tag/Schemas') {
-    requestAnimationFrame(() => {
+    const reanchor = () => {
       if (location.hash !== initialHash) return;
-      document.getElementById(decodeURIComponent(initialHash.slice(1)))?.scrollIntoView();
-    });
+      const anchor = document.getElementById(decodeURIComponent(initialHash.slice(1)));
+      if (!anchor) return;
+      // Land just past the section boundary, matching native active-item tracking.
+      window.scrollTo(0, window.scrollY + anchor.getBoundingClientRect().top + 1 - scrollOffset);
+    };
+    // Reload scroll restoration and font layout must finish before re-anchoring.
+    const afterLoad = () => document.fonts.ready.then(() => requestAnimationFrame(reanchor));
+    if (document.readyState === 'complete') afterLoad();
+    else window.addEventListener('load', afterLoad, { once: true });
   }
 }
