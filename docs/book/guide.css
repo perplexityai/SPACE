@@ -1,7 +1,7 @@
 /* Native reading controls use the shared system-selected Curiosity palette. */
 :root {
     --sidebar-target-width: var(--docs-sidebar-width);
-    --page-padding: 32px;
+    --page-padding: var(--docs-content-padding);
     --content-max-width: 950px;
     --menu-bar-height: var(--docs-utility-height);
     --mono-font: var(--docs-font-code);
@@ -45,33 +45,6 @@ html, button, input { font-family: var(--docs-font-body); }
 .content .hljs-addition { color: var(--docs-color-success); background: var(--docs-color-soft); }
 .content .hljs-deletion { color: var(--docs-color-error); background: var(--docs-color-soft); }
 
-.docs-header {
-    position: fixed;
-    inset: 0 0 auto;
-    z-index: 102;
-    height: var(--docs-header-height);
-    display: flex;
-    align-items: center;
-    gap: 40px;
-    padding-inline: 24px;
-    box-sizing: border-box;
-    background: var(--docs-color-surface);
-    border-bottom: 1px solid var(--table-border-color);
-}
-.docs-header a { color: var(--fg); text-decoration: none; }
-.docs-brand { font-size: 20px; font-weight: 700; letter-spacing: .04em; }
-.docs-sections { display: flex; align-self: stretch; gap: 28px; }
-.docs-sections a {
-    display: flex;
-    align-items: center;
-    font-size: 14px;
-    border-bottom: 3px solid transparent;
-    padding-top: 3px;
-}
-.docs-sections [aria-current] { color: var(--sidebar-active); border-color: currentColor; font-weight: 600; }
-.docs-header a:hover { color: var(--links); }
-.docs-header a:focus-visible { outline: 2px solid currentColor; outline-offset: 3px; }
-
 /* Keep the native toolbar available beneath the site header while scrolling. */
 #menu-bar-hover-placeholder { display: none; }
 #page-wrapper #menu-bar {
@@ -81,32 +54,39 @@ html, button, input { font-family: var(--docs-font-body); }
     right: 0;
     height: var(--docs-utility-height);
     margin: 0;
-    padding-inline: 16px;
+    padding-inline: 24px;
     box-sizing: border-box;
     flex-wrap: nowrap;
+    justify-content: space-between;
     border-bottom: 1px solid var(--table-border-color);
     background: var(--docs-color-background);
 }
-.menu-title { font-size: 14px; font-weight: 500; }
+.left-buttons, .right-buttons { margin: 0; }
+/* The native scroll controller keeps a reference to this title. */
+.menu-title { display: none; }
+#page-wrapper #menu-bar .icon-button { padding: 0; }
+#page-wrapper #menu-bar i { padding-inline: 12px; }
 .sidebar { top: calc(var(--docs-header-height) + var(--docs-utility-height)); border-right: 1px solid var(--table-border-color); }
 .sidebar .sidebar-scrollbox { padding: 16px; }
+.chapter-item > a:not(.toggle) { flex: 1; padding: 4px 8px; border-radius: 4px; }
+.chapter-item > a.active { background: var(--docs-color-soft); font-weight: 600; }
 #sidebar-toggle-anchor:checked ~ .page-wrapper { margin-inline-start: var(--sidebar-width); transform: none; }
 .page { margin-top: calc(var(--docs-header-height) + var(--docs-utility-height)); padding-top: 28px; }
 .content { padding: 0 0 48px; }
 .content main { margin-inline: 0; }
-main > h1:first-child { margin-top: 0; font-size: 30px; line-height: 1.25; letter-spacing: -.02em; }
+main > h1:first-child { margin-top: 0; font-size: 30px; line-height: 1.25; }
+.content :is(h1, h2, h3, h4) { font-weight: var(--docs-heading-weight); line-height: 1.25; letter-spacing: var(--docs-heading-tracking); }
 .content p, .content li { line-height: 1.65; }
 :target { scroll-margin-top: calc(var(--docs-header-height) + var(--docs-utility-height) + 20px); }
 
 /* The native footer links work at all widths without covering chapter text. */
 .nav-wide-wrapper { display: none; }
 .nav-wrapper { display: block; max-width: var(--content-max-width); }
-.mobile-nav-chapters { color: var(--links); border: 1px solid var(--table-border-color); }
+.mobile-nav-chapters { color: var(--links); background: transparent; border: 0; }
 
 @media screen and (max-width: 620px) {
     :root { --page-padding: 20px; }
-    .docs-header { gap: 24px; padding-inline: 20px; }
-    .docs-sections { gap: 20px; }
+    #page-wrapper #menu-bar { padding-inline: 20px; }
     #sidebar-toggle-anchor:checked ~ .page-wrapper { margin-inline-start: 0; }
     .sidebar { z-index: 100; box-shadow: 4px 0 12px var(--overlay-bg); }
     main > h1:first-child { font-size: 26px; }

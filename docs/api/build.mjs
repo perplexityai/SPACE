@@ -170,14 +170,12 @@ writeFileSync(resolve(output, 'index.html'), `<!doctype html>
 <script src="theme/system-theme.js"></script>
 </head><body>
 <header class="docs-header">
-<a class="docs-brand" href="https://github.com/perplexityai/SPACE/blob/${commit}/docs/introduction.md">SPACE</a>
+<a class="docs-brand" href="https://github.com/perplexityai/SPACE/blob/${commit}/docs/introduction.md"><strong>SPACE</strong> Docs</a>
 <nav class="docs-sections" aria-label="Documentation sections">
 <a href="https://github.com/perplexityai/SPACE/blob/${commit}/docs/introduction.md">Guide</a>
-<a href="index.html" aria-current="page">API Reference</a></nav></header>
+<a href="index.html" aria-current="page">API reference</a></nav></header>
 <nav class="docs-utility" aria-label="API reading controls">
-<div class="docs-utility-links"><a href="#section/Overview">Overview</a><a href="#tag/Sandboxes">Endpoints</a></div>
-<span class="docs-utility-title">API Reference</span>
-<a href="openapi.json" download>Download OpenAPI JSON</a></nav>
+<div class="docs-utility-links"><a href="#section/Overview">Overview</a><a href="#tag/Sandboxes">Endpoints</a><a href="openapi.json" download>Download OpenAPI</a></div></nav>
 <template id="overview">${overview}</template>
 <section id="reference" aria-label="Endpoint reference"></section>
 <footer><a href="build.json">Build details</a></footer>

@@ -12,6 +12,16 @@ function referenceTheme(options) {
         backgroundColor: color('background'),
         textColor: color('muted'),
         activeTextColor: color('accent'),
+        groupItems: {
+          ...theme.sidebar?.groupItems,
+          textTransform: 'none',
+        },
+        level1Items: {
+          ...theme.sidebar?.level1Items,
+          activeBackgroundColor: color('soft'),
+          activeTextColor: color('accent'),
+          textTransform: 'none',
+        },
       },
       rightPanel: {
         ...theme.rightPanel,

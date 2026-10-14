@@ -1,47 +1,26 @@
 body { margin: 0; color: var(--docs-color-text); background: var(--docs-color-surface); font-family: var(--docs-font-body); }
 a { color: var(--docs-color-accent); }
-.docs-header {
-  position: fixed;
-  inset: 0 0 auto;
-  z-index: 300;
-  height: var(--docs-header-height);
-  display: flex;
-  align-items: center;
-  gap: 40px;
-  padding-inline: 24px;
-  box-sizing: border-box;
-  background: var(--docs-color-surface);
-  border-bottom: 1px solid var(--docs-color-border);
-}
-.docs-header a { color: var(--docs-color-text); text-decoration: none; }
-.docs-brand { font-size: 20px; font-weight: 700; letter-spacing: .04em; }
-.docs-sections { display: flex; align-self: stretch; gap: 28px; }
-.docs-sections a { display: flex; align-items: center; font-size: 14px; border-bottom: 3px solid transparent; padding-top: 3px; }
-.docs-sections [aria-current] { color: var(--docs-color-accent); border-color: currentColor; font-weight: 600; }
-.docs-header a:hover { color: var(--docs-color-accent); }
-.docs-header a:focus-visible, .docs-utility a:focus-visible { outline: 2px solid currentColor; outline-offset: 3px; }
+.docs-utility a:focus-visible { outline: 2px solid currentColor; outline-offset: 3px; }
 .docs-utility {
   position: fixed;
   top: var(--docs-header-height);
   inset-inline: 0;
   z-index: 300;
   height: var(--docs-utility-height);
-  display: grid;
-  grid-template-columns: 1fr auto 1fr;
+  display: flex;
   align-items: center;
   padding-inline: 24px;
   box-sizing: border-box;
   border-bottom: 1px solid var(--docs-color-border);
   background: var(--docs-color-background);
-  font-size: 14px;
+  font-size: 13px;
 }
-.docs-utility-links { display: flex; gap: 20px; }
+.docs-utility-links { display: flex; gap: 24px; }
 .docs-utility a { text-decoration: none; }
 .docs-utility a:hover { text-decoration: underline; }
-.docs-utility-title { color: var(--docs-color-muted); }
-.docs-utility > a { justify-self: end; }
 #reference { padding-top: calc(var(--docs-header-height) + var(--docs-utility-height)); }
-#reference h1 { margin-top: 0; font-size: 30px; line-height: 1.25; letter-spacing: -.02em; }
+#reference h1 { margin-top: 0; font-size: 30px; line-height: 1.25; }
+#reference :is(h1, h2, h3, h4) { font-weight: var(--docs-heading-weight); letter-spacing: var(--docs-heading-tracking); }
 #reference .menu-content { border-right: 1px solid var(--docs-color-border); font-size: 14px; }
 /* Group labels need full opacity for contrast with the muted sidebar palette. */
 #reference .menu-content [data-item-id^="group/"] > label { opacity: 1; }
@@ -67,10 +46,7 @@ footer { padding: 24px 32px; font-size: 13px; }
 .schema-example > summary:focus-visible { outline: 2px solid currentColor; outline-offset: 3px; }
 
 @media screen and (max-width: 620px) {
-  .docs-header { gap: 24px; padding-inline: 20px; }
-  .docs-sections { gap: 20px; }
-  .docs-utility { grid-template-columns: 1fr auto; padding-inline: 20px; font-size: 12px; }
+  .docs-utility { padding-inline: 20px; font-size: 12px; }
   .docs-utility-links { gap: 16px; }
-  .docs-utility-title { display: none; }
   #reference h1 { font-size: 26px; }
 }

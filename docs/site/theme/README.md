@@ -14,6 +14,12 @@ Text, borders, status indicators and API response tabs use the shared palette;
 dark values live under `--docs-dark-*` in that stylesheet. Code keeps a monospace
 font, and the Guide preserves native highlighting with readable print colors.
 
+The shared stylesheet also owns the SPACE Docs header and section tabs. Desktop
+tabs align with the reading column; narrow screens use a compact header. Each
+renderer keeps its native reading controls in the utility row without a repeated
+section title. Both use the shared heading weight and tracking, and a soft
+palette background marks the selected navigation entry.
+
 Both sections load `system-theme.js` before their content. It selects the system
 color preference once per page load and ignores legacy mdBook theme choices.
 There is no theme switcher. When the system preference changes, the shared script
