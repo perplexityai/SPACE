@@ -8,10 +8,10 @@
 # the mirror lacks, from the name's repository or else that other one. GitHub
 # CI then uses the mirror in two ways, and never fails because of it:
 #
-# - `pull` pulls an image from the mirror by digest and tags it with its name,
-#   so the tools that use that name find it locally. If the mirror lacks the
-#   digest or cannot be reached, it pulls the same digest from the sources; if
-#   that fails too, it leaves the image to the tools' own pulls, as before.
+# - `pull` pulls an image from the mirror and tags it with its name, so the
+#   tools that use that name find it locally. If the mirror lacks it or cannot
+#   be reached, it pulls the same digest from the sources; if that fails too,
+#   it leaves the image to the tools' own pulls, as before.
 # - `build-contexts` prints a `--build-context <name>=docker-image://<mirror>`
 #   option for each listed image the given Dockerfiles name, which makes a
 #   build take that FROM image from the mirror without changing the
@@ -32,14 +32,21 @@
 #        ci/scripts/mirror-images.sh pinned <name>
 #
 # GHCR_TOKEN, when set, logs in to ghcr.io first; the package is private while
-# the repository is. SPACE_MIRRORED_IMAGES overrides the list. The login and
-# each pull end after SPACE_DOCKER_PULL_TIMEOUT_SECONDS (default 300), so a
-# stalled mirror falls back to the source instead of holding the job.
+# the repository is. SPACE_MIRRORED_IMAGES overrides the list. Logins and
+# manifest reads end after SPACE_REGISTRY_READ_TIMEOUT_SECONDS (default 60), and
+# each pull or copy after SPACE_DOCKER_PULL_TIMEOUT_SECONDS (default 300), so a
+# stalled registry falls back to the source instead of holding the job.
 #
 # The mirror holds each listed digest for linux/amd64, the platform GitHub CI
-# runs. Before copying a digest, and on every run for a name pinned by digest,
-# publish checks that the name serves that digest for linux/amd64, so that a
-# name bumped without its digest does not leave CI on the old image.
+# runs. A name pinned by digest pins a multi-platform index, and its line
+# lists the index's linux/amd64 manifest; nothing but the index itself says
+# the two belong together. So publish reads the index once, when it first sees
+# that pairing, and records the pairing it verified as a `pin-<hash>` tag on
+# the mirrored manifest. Jobs take such an image from the mirror only through
+# that tag: a name bumped without its digest has no record, so it is neither
+# copied nor substituted, and builds keep its pinned index from the source. An
+# index publish cannot read is not recorded either, and is tried again on the
+# next run.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -48,17 +55,20 @@ LIST="${SPACE_MIRRORED_IMAGES:-${REPO_ROOT}/ci/mirrored-images.txt}"
 COPY_ATTEMPTS="${SPACE_MIRROR_COPY_ATTEMPTS:-5}"
 COPY_RETRY_DELAY_SECONDS="${SPACE_MIRROR_COPY_RETRY_DELAY_SECONDS:-10}"
 PULL_TIMEOUT_SECONDS="${SPACE_DOCKER_PULL_TIMEOUT_SECONDS:-300}"
+READ_TIMEOUT_SECONDS="${SPACE_REGISTRY_READ_TIMEOUT_SECONDS:-60}"
 # shellcheck source=lib/test-deps.sh
 source "${SCRIPT_DIR}/lib/test-deps.sh"
 
-# Print "<name> <mirror> <destination> <source>..." for each listed image: its
-# name, the GHCR repository at the pinned digest, the tagged destination, and
-# each repository that serves the digest, at the digest. Jobs use the mirror by
-# digest; the tag only names the image in the package. Fail on a line whose
-# name has no tag, whose digest is not a SHA-256 digest, whose destination is
-# not tagged, or whose other repository carries a tag or digest.
+# Print "<name> <mirror> <destination> <use> <source>..." for each listed
+# image: its name, the GHCR repository at the pinned digest, the tagged
+# destination, the reference jobs take from the mirror, and each repository
+# that serves the digest, at the digest. Jobs use the mirror by digest, or for
+# a name pinned by digest through the tag that records its verified pairing;
+# the destination tag only names the image in the package. Fail on a line
+# whose name has no tag, whose digest is not a SHA-256 digest, whose
+# destination is not tagged, or whose other repository carries a tag or digest.
 entries() {
-    local name digest destination other extra repository
+    local name digest destination other extra repository use
     while read -r name digest destination other extra; do
         case "${name}" in "" | "#"*) continue ;; esac
         repository="${name%%@*}"
@@ -68,26 +78,40 @@ entries() {
             echo "Malformed line in ${LIST}: ${name} ${digest} ${destination} ${other} ${extra}" >&2
             return 1
         fi
-        printf '%s %s %s %s' "${name}" "${destination%:*}@${digest}" "${destination}" \
+        use="${destination%:*}@${digest}"
+        [[ "${name}" != *@* ]] || use="${destination%:*}:$(pin_tag "${name}" "${digest}")"
+        printf '%s %s %s %s %s' "${name}" "${destination%:*}@${digest}" "${destination}" "${use}" \
             "${repository%:*}@${digest}"
         [ -z "${other}" ] || printf ' %s' "${other}@${digest}"
         printf '\n'
     done <"${LIST}"
 }
 
+# The tag that records a verified pairing of a name pinned by digest with its
+# listed linux/amd64 digest: a hash of both, so a new pairing has none.
+pin_tag() {
+    local hash
+    if command -v sha256sum >/dev/null 2>&1; then
+        hash="$(printf '%s %s' "$1" "$2" | sha256sum)"
+    else
+        hash="$(printf '%s %s' "$1" "$2" | shasum -a 256)"
+    fi
+    printf 'pin-%s\n' "${hash:0:40}"
+}
+
 registry_login() {
     [ -n "${GHCR_TOKEN:-}" ] || return 0
     printf '%s' "${GHCR_TOKEN}" |
-        space_with_deadline 60 docker login ghcr.io --username "${GITHUB_ACTOR:-space-ci}" \
+        space_with_deadline "${READ_TIMEOUT_SECONDS}" docker login ghcr.io --username "${GITHUB_ACTOR:-space-ci}" \
             --password-stdin >/dev/null
 }
 
 mirrored() {
-    docker buildx imagetools inspect --raw "$1" >/dev/null 2>&1
+    space_with_deadline "${READ_TIMEOUT_SECONDS}" docker buildx imagetools inspect --raw "$1" >/dev/null 2>&1
 }
 
 pull() {
-    local listed image entry name mirror sources source error status started
+    local listed image entry name mirror use sources source error status started
     listed="$(entries)"
     if ! registry_login; then
         echo "::warning::Could not log in to ghcr.io; the mirror pulls below may fail"
@@ -98,20 +122,25 @@ pull() {
             echo "::warning::${image} is not listed in ${LIST#"${REPO_ROOT}/"}; the job pulls it itself"
             continue
         fi
-        read -r name mirror _ sources <<<"${entry}"
+        read -r name mirror _ use sources <<<"${entry}"
         # A tag cannot carry a digest; a name pinned by digest keeps its tag.
         name="${name%%@*}"
         started="${SECONDS}"
         status=0
-        error="$(space_with_deadline "${PULL_TIMEOUT_SECONDS}" docker pull --quiet "${mirror}" 2>&1 >/dev/null)" ||
+        error="$(space_with_deadline "${PULL_TIMEOUT_SECONDS}" docker pull --quiet "${use}" 2>&1 >/dev/null)" ||
             status=$?
+        # Through a pairing's tag, take only the listed digest.
+        if [ "${status}" -eq 0 ] && ! docker image inspect "${mirror}" >/dev/null 2>&1; then
+            status=1
+            error="${use} is not ${mirror#*@}"
+        fi
         if [ "${status}" -eq 0 ]; then
             docker tag "${mirror}" "${name}"
             echo "Pulled ${name} from ${mirror} in $((SECONDS - started)) s"
             continue
         fi
-        [ "${status}" -ne 124 ] || error="no answer within ${PULL_TIMEOUT_SECONDS} s"
-        echo "::warning::Pulling ${name} from its source; ${mirror} is unavailable: ${error%%$'\n'*}"
+        ! space_deadline_expired "${status}" || error="no answer within ${PULL_TIMEOUT_SECONDS} s"
+        echo "::warning::Pulling ${name} from its source; ${use} is unavailable: ${error%%$'\n'*}"
         for source in ${sources}; do
             started="${SECONDS}"
             if space_pull_docker_image "${source}"; then
@@ -125,7 +154,7 @@ pull() {
 }
 
 build_contexts() {
-    local listed tokens name mirror
+    local listed tokens name mirror use
     [ -n "${SPACE_CI_IMAGE_MIRROR:-}" ] || return 0
     listed="$(entries)"
     if ! registry_login >&2; then
@@ -134,13 +163,13 @@ build_contexts() {
     # Whitespace- and =-separated words, so that FROM lines and ARG defaults
     # both name their images exactly.
     tokens="$(awk -F '[[:space:]=]+' '{ for (i = 1; i <= NF; i++) print $i }' "$@")"
-    while read -r name mirror _; do
+    while read -r name mirror _ use _; do
         [ -n "${name}" ] || continue
         grep -qxF -- "${name}" <<<"${tokens}" || continue
-        if mirrored "${mirror}"; then
+        if mirrored "${use}"; then
             printf -- '--build-context=%s=docker-image://%s\n' "${name}" "${mirror}"
         else
-            echo "::warning::Building from ${name} at its source; ${mirror} is unavailable" >&2
+            echo "::warning::Building from ${name} at its source; ${use} is unavailable" >&2
         fi
     done <<<"${listed}"
 }
@@ -155,7 +184,8 @@ copy_with_retries() {
         for source in "$@"; do
             # With one source and --prefer-index=false, imagetools pushes the
             # pinned manifest byte for byte, so the mirror keeps its digest.
-            if docker buildx imagetools create --prefer-index=false --tag "${destination}" "${source}"; then
+            if space_with_deadline "${PULL_TIMEOUT_SECONDS}" \
+                docker buildx imagetools create --prefer-index=false --tag "${destination}" "${source}"; then
                 echo "Copied ${source}"
                 return 0
             fi
@@ -173,56 +203,90 @@ copy_with_retries() {
 # The digest a name serves for linux/amd64: its entry for that platform when
 # the name is an index, else the name's own manifest.
 platform_digest() {
-    docker buildx imagetools inspect --format '{{json .Manifest}}' "$1" |
+    space_with_deadline "${READ_TIMEOUT_SECONDS}" docker buildx imagetools inspect --format '{{json .Manifest}}' "$1" |
         jq -r 'if .manifests then
                 ([.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64")
                   | .digest][0] // empty)
             else .digest end'
 }
 
-# Fail when a name pinned by digest does not serve the listed digest for
-# linux/amd64: the line was bumped without it. A tag can legitimately move
-# after its line was written, and an unreadable name proves nothing, so those
-# only warn.
+# Whether a name serves the listed digest for linux/amd64: 0 when it does, 1
+# when it serves another, 2 when that cannot be read. Says which, and why.
 check_listed_digest() {
-    local name="$1" digest="$2" served
-    if ! served="$(platform_digest "${name}" 2>/dev/null)" || [ -z "${served}" ]; then
-        echo "::warning::Could not check that ${name} serves ${digest} for linux/amd64"
+    local name="$1" digest="$2" served error_file error status=0
+    error_file="$(mktemp)"
+    served="$(platform_digest "${name}" 2>"${error_file}")" || status=$?
+    error="$(head -n 1 "${error_file}")"
+    rm -f "${error_file}"
+    if [ "${status}" -ne 0 ] || [ -z "${served}" ]; then
+        ! space_deadline_expired "${status}" || error="no answer within ${READ_TIMEOUT_SECONDS} s"
+        echo "::warning::Could not check that ${name} serves ${digest} for linux/amd64: ${error:-it lists no linux/amd64 manifest}"
+        return 2
+    fi
+    if [ "${served}" = "${digest}" ]; then
+        echo "Verified that ${name} serves ${digest} for linux/amd64"
         return 0
     fi
-    [ "${served}" != "${digest}" ] || return 0
     if [[ "${name}" == *@* ]]; then
         echo "::error::${name} serves ${served} for linux/amd64, not the listed ${digest}"
-        return 1
+    else
+        echo "::warning::${name} now serves ${served} for linux/amd64, not the listed ${digest}; its tag has moved"
     fi
-    echo "::warning::${name} now serves ${served} for linux/amd64, not the listed ${digest}; its tag has moved"
+    return 1
 }
 
 publish() {
-    local listed name mirror destination sources failures=0
+    local listed name mirror destination use sources digest failures=0
     listed="$(entries)"
     registry_login
-    while read -r name mirror destination sources; do
+    while read -r name mirror destination use sources; do
         [ -n "${name}" ] || continue
-        if [[ "${name}" == *@* ]] && ! check_listed_digest "${name}" "${mirror#*@}"; then
-            failures=$((failures + 1))
-            continue
-        fi
-        if mirrored "${mirror}"; then
-            echo "${name} is already mirrored as ${mirror}"
-            continue
-        fi
-        if [[ "${name}" != *@* ]]; then
-            check_listed_digest "${name}" "${mirror#*@}"
-        fi
-        # shellcheck disable=SC2086 # sources are digest references without spaces
-        if ! copy_with_retries "${destination}" ${sources}; then
-            failures=$((failures + 1))
-            continue
+        digest="${mirror#*@}"
+        if [[ "${name}" == *@* ]]; then
+            # Its pairing is read from the index once, then from its record.
+            if mirrored "${use}"; then
+                echo "${name} is already mirrored as ${mirror}, verified as ${use##*:}"
+                continue
+            fi
+            check_listed_digest "${name}" "${digest}" || case $? in
+                1)
+                    failures=$((failures + 1))
+                    continue
+                    ;;
+                *)
+                    echo "::warning::Not mirroring ${name} until its pairing with ${digest} is verified; jobs take it from its source"
+                    continue
+                    ;;
+            esac
+        else
+            if mirrored "${mirror}"; then
+                echo "${name} is already mirrored as ${mirror}"
+                continue
+            fi
+            # A tag can move after its line was written; the digest is the pin.
+            check_listed_digest "${name}" "${digest}" || true
         fi
         if ! mirrored "${mirror}"; then
-            echo "::error::Copied ${name}, but ${mirror} does not exist"
-            failures=$((failures + 1))
+            # shellcheck disable=SC2086 # sources are digest references without spaces
+            if ! copy_with_retries "${destination}" ${sources}; then
+                failures=$((failures + 1))
+                continue
+            fi
+            if ! mirrored "${mirror}"; then
+                echo "::error::Copied ${name}, but ${mirror} does not exist"
+                failures=$((failures + 1))
+                continue
+            fi
+        fi
+        if [[ "${name}" == *@* ]]; then
+            if ! space_with_deadline "${READ_TIMEOUT_SECONDS}" \
+                docker buildx imagetools create --prefer-index=false --tag "${use}" "${mirror}" ||
+                ! mirrored "${use}"; then
+                echo "::error::Could not record ${name}'s verified pairing as ${use}"
+                failures=$((failures + 1))
+                continue
+            fi
+            echo "Mirrored ${name} as ${mirror}, verified as ${use##*:}"
             continue
         fi
         echo "Mirrored ${name} as ${mirror}"

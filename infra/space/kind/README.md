@@ -1767,6 +1767,9 @@ set, `ensure` also pulls that base for the control-plane and infra nodes from
 the mirror, falling back to its source, and the renderer names it by the digest
 the mirror holds: the index's linux/amd64 manifest, the only digest the pulled
 copy resolves under, so `kind create` uses it instead of pulling the index from
+Docker Hub. The mirror serves it only once main's mirror job has verified
+that the index lists that manifest and recorded the pairing
+(`ci/scripts/mirror-images.sh`); until then `ensure` takes the same digest from
 Docker Hub. That lookup needs Docker's containerd image store, which Kind CI
 enables; on the classic store `kind create` pulls the manifest from Docker Hub
 as before. Elsewhere the config names the index and kind pulls it. A package

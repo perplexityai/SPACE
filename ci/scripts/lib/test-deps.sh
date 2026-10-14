@@ -19,15 +19,26 @@ space_test_dependency_redis_image() {
 
 # Run a command, ending it after the given number of seconds, so a registry
 # transfer that stalls fails over instead of holding the job until its own
-# deadline. Unbounded where `timeout` is missing (stock macOS).
+# deadline. In the foreground, so Ctrl-C at a terminal still reaches the
+# command; the commands bounded here are single processes, which is all
+# --foreground bounds. A plain `timeout` without GNU options bounds it from
+# its own process group, and without `timeout` (stock macOS) it is unbounded.
 space_with_deadline() {
     local seconds="$1"
     shift
-    if command -v timeout >/dev/null 2>&1; then
-        timeout --kill-after=10 "${seconds}" "$@"
+    if timeout --foreground --kill-after=10 1 true >/dev/null 2>&1; then
+        timeout --foreground --kill-after=10 "${seconds}" "$@"
+    elif command -v timeout >/dev/null 2>&1; then
+        timeout "${seconds}" "$@"
     else
         "$@"
     fi
+}
+
+# Whether an exit status from space_with_deadline means the deadline ended the
+# command: 124 after SIGTERM, 137 when it had to be killed.
+space_deadline_expired() {
+    [ "$1" -eq 124 ] || [ "$1" -eq 137 ]
 }
 
 # Registry throttling is transient and a failed pull may still cache completed

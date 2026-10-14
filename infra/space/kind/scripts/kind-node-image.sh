@@ -25,9 +25,10 @@
 #   build    build the reference locally, whatever is present
 #   publish  push the reference to GHCR unless it is already there (main CI)
 #
-# GHCR_TOKEN, when set, logs in to the registry first. The login and the pull
-# end after SPACE_DOCKER_PULL_TIMEOUT_SECONDS (default 300), so a stalled
-# registry costs a local build rather than the job.
+# GHCR_TOKEN, when set, logs in to the registry first. The login and manifest
+# reads end after SPACE_REGISTRY_READ_TIMEOUT_SECONDS (default 60), the pull
+# after SPACE_DOCKER_PULL_TIMEOUT_SECONDS (default 300), so a stalled registry
+# costs a local build rather than the job.
 # SPACE_KIND_NODE_IMAGE_REPOSITORY overrides the repository. Builds take the
 # base from the repository's third-party image mirror when SPACE_CI_IMAGE_MIRROR
 # is set and the mirror has it (ci/mirrored-images.txt), as the CI image does;
@@ -133,7 +134,7 @@ with_deadline() {
 registry_login() {
   [ -n "${GHCR_TOKEN:-}" ] || return 0
   printf '%s' "${GHCR_TOKEN}" |
-    with_deadline 60 docker login "${REPOSITORY%%/*}" --username "${GITHUB_ACTOR:-space-ci}" \
+    with_deadline "${SPACE_REGISTRY_READ_TIMEOUT_SECONDS:-60}" docker login "${REPOSITORY%%/*}" --username "${GITHUB_ACTOR:-space-ci}" \
       --password-stdin >/dev/null
 }
 
@@ -166,7 +167,7 @@ build_local() {
 }
 
 ensure() {
-  local ref error
+  local ref error status=0
   ensure_cluster_base
   ref="$(image_ref)"
   if docker image inspect "${ref}" >/dev/null 2>&1; then
@@ -175,10 +176,14 @@ ensure() {
     if ! registry_login; then
       log "WARNING: could not log in to ${REPOSITORY%%/*}; the pull below may fail"
     fi
-    if error="$(with_deadline "${SPACE_DOCKER_PULL_TIMEOUT_SECONDS:-300}" \
-      docker pull --quiet "${ref}" 2>&1 >/dev/null)"; then
+    error="$(with_deadline "${SPACE_DOCKER_PULL_TIMEOUT_SECONDS:-300}" \
+      docker pull --quiet "${ref}" 2>&1 >/dev/null)" || status=$?
+    if [[ "${status}" -eq 0 ]]; then
       log "pulled the published ${ref}"
     else
+      # 124 and 137: the deadline ended the pull (space_deadline_expired).
+      [[ "${status}" -ne 124 && "${status}" -ne 137 ]] \
+        || error="no answer within ${SPACE_DOCKER_PULL_TIMEOUT_SECONDS:-300} s"
       log "building ${ref} locally; it is not published or not reachable: ${error%%$'\n'*}"
       build_local
     fi
@@ -190,7 +195,7 @@ publish() {
   local ref context status=0
   ref="$(image_ref)"
   registry_login
-  if docker manifest inspect "${ref}" >/dev/null 2>&1; then
+  if with_deadline "${SPACE_REGISTRY_READ_TIMEOUT_SECONDS:-60}" docker manifest inspect "${ref}" >/dev/null 2>&1; then
     echo "${ref} is already published"
     return 0
   fi

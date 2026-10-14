@@ -108,7 +108,8 @@ check_render "$base" -u SPACE_CI_IMAGE_MIRROR
 check_render "$mirrored_base" SPACE_CI_IMAGE_MIRROR=ghcr
 
 # ── ensure takes the cluster's base from the mirror in GitHub CI ─────────────
-# A docker that has the SPACE node image, pulls what FAKE_PULLABLE lists, and
+# A docker that has the SPACE node image, pulls what FAKE_PULLABLE lists (a
+# `tag=digest-ref` entry pulls a tag that resolves to that digest), and
 # resolves a tag with a digest as the containerd image store does: to the
 # image tagged with that name, if it was pulled by that digest.
 mkdir -p "$work/ensure-bin"
@@ -118,8 +119,13 @@ printf '%s\n' "$*" >>"$FAKE_CALLS"
 case "$1 $2" in
   "image inspect") [[ "$3" == "$FAKE_NODE_REF" ]] || grep -qxF -- "$3" "$FAKE_LOCAL" ;;
   "pull "*)
-    [[ " ${FAKE_PULLABLE:-} " == *" ${*: -1} "* ]] || { echo "unreachable: ${*: -1}" >&2; exit 1; }
-    echo "${*: -1}" >>"$FAKE_LOCAL"
+    for entry in ${FAKE_PULLABLE:-}; do
+      [[ "${entry%%=*}" == "${*: -1}" ]] || continue
+      printf '%s\n' "${entry%%=*}" "${entry#*=}" >>"$FAKE_LOCAL"
+      exit 0
+    done
+    echo "unreachable: ${*: -1}" >&2
+    exit 1
     ;;
   "tag "*) printf '%s\n%s@%s\n' "$3" "$3" "${2#*@}" >>"$FAKE_LOCAL" ;;
   *) echo "unexpected docker call: $*" >&2; exit 99 ;;
@@ -128,6 +134,9 @@ EOF
 chmod +x "$work/ensure-bin/docker"
 mirror_ref="ghcr.io/example/mirror@$mirror_digest"
 source_ref="${base%%:*}@$mirror_digest"
+# The base is pinned by digest, so jobs take it through the tag publish wrote
+# when it verified the pairing (mirror-images.sh).
+pin_ref="ghcr.io/example/mirror:pin-$(printf '%s %s' "$base" "$mirror_digest" | sha256sum | cut -c1-40)"
 # Arguments go to env (options first).
 run_ensure() {
   : >"$work/calls"
@@ -136,13 +145,17 @@ run_ensure() {
     FAKE_NODE_REF="$ref" SPACE_DOCKER_PULL_ATTEMPTS=1 \
     bash "$image_script" ensure >"$work/out" 2>"$work/err"
 }
-run_ensure SPACE_CI_IMAGE_MIRROR=ghcr FAKE_PULLABLE="$mirror_ref" \
+run_ensure SPACE_CI_IMAGE_MIRROR=ghcr FAKE_PULLABLE="$pin_ref=$mirror_ref" \
   || fail "ensure from the mirror failed: $(cat "$work/err")"
 [[ "$(cat "$work/out")" == "$ref" ]] || fail "ensure printed more than the node image: $(cat "$work/out")"
 grep -qxF "tag $mirror_ref ${base%%@*}" "$work/calls" || fail "ensure did not take the base from the mirror"
 grep -qxF -- "$mirrored_base" "$work/local" \
   || fail "the mirrored base does not resolve under the name the cluster config gives it"
 grep -qxF "pull $source_ref" "$work/calls" && fail "ensure pulled the base from its source although the mirror had it"
+run_ensure SPACE_CI_IMAGE_MIRROR=ghcr FAKE_PULLABLE="$mirror_ref $source_ref" \
+  || fail "ensure without a verified pairing failed: $(cat "$work/err")"
+grep -qxF "tag $mirror_ref ${base%%@*}" "$work/calls" && fail "ensure took a digest publish never verified from the mirror"
+grep -qxF "tag $source_ref ${base%%@*}" "$work/calls" || fail "an unverified pairing did not fall back to the source"
 run_ensure SPACE_CI_IMAGE_MIRROR=ghcr FAKE_PULLABLE="$source_ref" \
   || fail "ensure from the source failed: $(cat "$work/err")"
 grep -qxF "tag $source_ref ${base%%@*}" "$work/calls" || fail "ensure did not fall back to the source's digest"
@@ -150,7 +163,7 @@ run_ensure SPACE_CI_IMAGE_MIRROR=ghcr FAKE_PULLABLE= \
   || fail "ensure failed although kind create can still pull the base: $(cat "$work/err")"
 [[ "$(cat "$work/out")" == "$ref" ]] || fail "ensure printed more than the node image: $(cat "$work/out")"
 grep -q "kind create pulls it" "$work/err" || fail "ensure did not say that kind create pulls the base"
-run_ensure -u SPACE_CI_IMAGE_MIRROR FAKE_PULLABLE="$mirror_ref" || fail "ensure outside GitHub CI failed"
+run_ensure -u SPACE_CI_IMAGE_MIRROR FAKE_PULLABLE="$pin_ref=$mirror_ref" || fail "ensure outside GitHub CI failed"
 grep -q "^pull " "$work/calls" && fail "ensure pulled the base outside GitHub CI"
 unset SPACE_MIRRORED_IMAGES
 
