@@ -27,7 +27,8 @@ spec.loader.exec_module(config)
 
 
 @pytest.mark.parametrize("mode", ["datadog", "otel", "off"])
-def test_chart_and_executed_shim_share_isolated_identity(mode, tmp_path):
+@pytest.mark.parametrize("global_overlay", [None, "null"], ids=["absent", "null"])
+def test_chart_and_executed_shim_share_isolated_identity(mode, global_overlay, tmp_path):
     settings = config.configuration(
         {
             "SPACE_KIND_TELEMETRY_MODE": mode,
@@ -50,6 +51,10 @@ def test_chart_and_executed_shim_share_isolated_identity(mode, tmp_path):
     args = [
         item for setting in settings["helm_set"] for item in ("--set-string", setting)
     ]
+    # Unsetting an overlay must preserve the Kind identity/exporter contract
+    # instead of activating global validation.
+    if global_overlay is not None:
+        args += ["--set", f"global.observability={global_overlay}"]
     for chart in TELEMETRY_CHARTS:
         # Not "docs": oss/refs-to-private.sh reads that word on a path-joining
         # line as the private docs/ tree and fails the OSS export gate.
@@ -169,25 +174,51 @@ def test_chart_and_executed_shim_share_isolated_identity(mode, tmp_path):
         )
 
 
-@pytest.mark.parametrize("mode", ["datadog", "otel", "off"])
-def test_build_manager_traces_and_command_logs_stay_excluded_across_profiles(mode):
+@pytest.mark.parametrize(
+    "path,mode",
+    [("kind", "datadog"), ("kind", "otel"), ("kind", "off"), ("global", "datadog"), ("global", "otlp")],
+)
+@pytest.mark.parametrize(
+    "trace_exporter",
+    [None, '"off"', "off", "false", "null"],
+    ids=["default", "quoted-off", "bare-off", "false", "null"],
+)
+def test_build_manager_traces_and_command_logs_stay_excluded_across_profiles(path, mode, trace_exporter, tmp_path):
     """Build failures can carry guest output, so build-manager exports no traces."""
-    settings = config.configuration({"SPACE_KIND_TELEMETRY_MODE": mode})
-    manifests = render(
-        BUILD_MANAGER_CHART, "space-builder",
-        *(item for setting in settings["helm_set"] for item in ("--set-string", setting)),
-    )
+    if path == "kind":
+        settings = config.configuration({"SPACE_KIND_TELEMETRY_MODE": mode})
+        args = [item for setting in settings["helm_set"] for item in ("--set-string", setting)]
+        metrics = config.MODES[mode][0]
+    else:
+        args = [
+            "--set-string", f"global.observability.mode={mode}",
+            "--set-string", "global.observability.environment=example",
+            "--set-string", "global.observability.cluster=cluster-a",
+        ]
+        metrics = mode
+    if trace_exporter is not None:
+        # Use YAML, not Python booleans, to cover the caller-side conversion of
+        # bare off to false and Helm's removal of a null default.
+        values = tmp_path / "build-manager.yaml"
+        values.write_text(f"traceExporter: {trace_exporter}\n")
+        args += ["-f", str(values)]
+    manifests = render(BUILD_MANAGER_CHART, "space-builder", *args)
     workload = next(doc for doc in manifests if doc["kind"] == "DaemonSet")
     annotations = workload["spec"]["template"]["metadata"]["annotations"]
     assert annotations["ad.datadoghq.com/build-manager.logs_exclude"] == "true"
-    assert (annotations.get("ad.datadoghq.com/logs_exclude") == "true") == (mode == "otel")
+    assert (annotations.get("ad.datadoghq.com/logs_exclude") == "true") == (path == "kind" and mode == "otel")
     env = {
         entry["name"]: entry.get("value")
         for entry in workload["spec"]["template"]["spec"]["containers"][0]["env"]
     }
     assert env["SPACE_TRACE_EXPORTER"] == "off"
     assert "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT" not in env
-    assert env["SPACE_METRICS_SINK"] == config.MODES[mode][0]
+    if path == "global":
+        assert env.get("DD_TRACE_ENABLED") != "true"
+        assert "DD_TRACE_AGENT_PORT" not in env
+        assert "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL" not in env
+        assert "OTEL_TRACES_SAMPLER" not in env
+    assert env["SPACE_METRICS_SINK"] == metrics
 
 
 @pytest.mark.parametrize("chart", TELEMETRY_CHARTS, ids=lambda chart: chart.name)
@@ -370,9 +401,42 @@ def test_default_environment_is_a_valid_telemetry_token():
         ("SPACE_KIND_OTLP_TRACES_ENDPOINT", "http://[::1]:4317"),
         ("SPACE_KIND_OTLP_METRICS_ENDPOINT", "http://localhost:4317"),
         ("SPACE_KIND_OTLP_TRACES_ENDPOINT", "http://collector,telemetry.traceExporter=off"),
+        ("global.observability", "false"),
+        ("global.observability.mode", "unknown"),
+        ("global.observability.mode", "true"),
+        ("global.observability.otlp.protocol", "http/protobuf"),
+        ("global.observability.otlp.nodeLocalPort", "0"),
+        ("global.observability.otlp.nodeLocalPort", "65536"),
+        ("global.observability.otlp.nodeLocalPort", "4317.5"),
+        ("global.observability.datadog.apmPort", "8136"),
     ],
 )
 def test_invalid_configuration_rejected_before_bootstrap_mutates(key, value, tmp_path):
+    if key.startswith("global."):
+        # Global overlays enter through Helm, not the Kind profile parser.
+        # Start from an accepted render so an unrelated chart failure cannot
+        # make a rejected-input case pass vacuously.
+        mode = "datadog" if ".datadog." in key else "otlp"
+        args = [
+            "--set", f"global.observability.mode={mode}",
+            "--set", "global.observability.environment=example",
+            "--set", "global.observability.cluster=cluster-a",
+        ]
+        chart = KIND_DIR / "charts/space-node-manager-local"
+        assert render(chart, "space", *args)
+        if key == "global.observability.datadog.apmPort":
+            # Refuse partial native routing without blocking modes that do
+            # not use this setting at all.
+            for unused_mode in ("off", "otlp"):
+                assert render(
+                    chart, "space", *args, "--set", f"{key}={value}",
+                    "--set", f"global.observability.mode={unused_mode}",
+                )
+        with pytest.raises(subprocess.CalledProcessError) as rejected:
+            render(chart, "space", *args, "--set", f"{key}={value}")
+        assert key in rejected.value.stderr
+        assert not rejected.value.stdout
+        return
     env = {
         **bootstrap_guard_environment(tmp_path),
         "SPACE_KIND_TELEMETRY_MODE": "otel",
