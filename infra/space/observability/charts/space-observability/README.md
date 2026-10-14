@@ -153,7 +153,7 @@ your nodes' taints if needed.
 
 ## Host-network producers
 
-The SPACE node charts (`infra/space/charts`, installed through `space-worker`)
+The existing SPACE node charts (`infra/space/kind/charts`, with cluster overlays)
 point every producer at `http://$(NODE_IP):<nodeLocalPort>` in otlp mode, with
 `NODE_IP` from `status.hostIP`; install this release first, from the same
 values file, so the port matches. Pod-network node services
@@ -181,8 +181,8 @@ nodeLocal:
 ```
 
 Read [Sandbox isolation](#sandbox-isolation) first: host peers are safe only
-where the sandbox egress policy denies the node range, which the `space`
-chart's `sandbox.networkPolicy` does for private node addresses.
+where the sandbox egress policy denies the node range, which the
+`space-sandbox-network-policy` chart does for private node addresses.
 
 ## Sandbox isolation
 
@@ -194,9 +194,9 @@ its microVM through its sandbox pod's network namespace, so two layers apply:
    configured host peers. The sandbox namespace must not be in
    `spaceNamespaces`.
 2. **The sandbox namespace's egress policy**, which must deny the pod,
-   Service and node address ranges: `sandbox.networkPolicy` in the `space`
-   chart (private ranges by default; add node or Service CIDRs that are not
-   private), or the Kind `space-sandbox-network-policy` chart.
+   Service and node address ranges: the existing `space-sandbox-network-policy`
+   chart denies private ranges by default. Add node or Service CIDRs that are
+   not private; the same policy chart is used for Kind and cluster deployments.
 
 Host peers weaken layer 1: a CNI that source-NATs pod traffic to node
 addresses (kindnet does, for destinations outside the pod range) delivers a

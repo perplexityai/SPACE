@@ -29,8 +29,8 @@ Phases:
 
 1. receiver-policies: the observability charts' NetworkPolicies alone, with
    default values.
-2. with-sandbox-policy: plus the sandbox namespace's own NetworkPolicy, from
-   the space chart's sandbox.networkPolicy (or the Kind chart without it).
+2. with-sandbox-policy: plus the existing space-sandbox-network-policy chart
+   shared by the Kind and cluster deployment paths.
 3. host-peers: plus every node address in nodeLocal.hostPeers and
    datadog.hostPeers. Some CNIs (kindnet among them) exempt only root host
    processes from NetworkPolicy, so a non-root host-network producer needs
@@ -46,7 +46,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import secrets
 import shutil
 import subprocess
@@ -59,11 +58,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 CHARTS = ROOT / "infra/space/observability/charts"
 UMBRELLA = CHARTS / "space-observability"
-# The sandbox egress policy: the portable space chart's sandbox.networkPolicy,
-# or the Kind chart's equivalent on trees without it.
-SPACE_CHART = ROOT / "infra/space/charts/space"
-SPACE_EXAMPLE_VALUES = ROOT / "infra/space/charts/examples/values-example.yaml"
-KIND_SANDBOX_POLICY_CHART = ROOT / "infra/space/kind/charts/space-sandbox-network-policy"
+SANDBOX_POLICY_CHART = ROOT / "infra/space/kind/charts/space-sandbox-network-policy"
 
 OTLP_NS = "space-observability"
 DATADOG_NS = "space-datadog"
@@ -345,63 +340,30 @@ def probe(cluster: Cluster, phase: str, sources: list[Source], found: list[Targe
     return failures
 
 
-def sandbox_policy() -> str | None:
+def sandbox_policy() -> str:
     """The sandbox namespace's NetworkPolicies, rendered from the repository."""
-    if SPACE_CHART.is_dir():
-        run(["helm", "dependency", "build", str(SPACE_CHART)])
-        rendered = run(
-            [
-                "helm",
-                "template",
-                "space",
-                str(SPACE_CHART),
-                "--namespace",
-                SPACE_NS,
-                "-f",
-                str(SPACE_EXAMPLE_VALUES),
-                "--set",
-                f"global.space.sandboxNamespace={SANDBOX_NS}",
-            ]
-        ).stdout
-        # Keep only the sandbox namespace's NetworkPolicies; plain text
-        # selection keeps the script free of a YAML dependency.
-        policies = [
-            doc
-            for doc in rendered.split("\n---\n")
-            if re.search(r"^kind: NetworkPolicy$", doc, re.MULTILINE)
-            and re.search(rf"^  namespace: {re.escape(SANDBOX_NS)}$", doc, re.MULTILINE)
+    return run(
+        [
+            "helm",
+            "template",
+            "space",
+            str(SANDBOX_POLICY_CHART),
+            "--namespace",
+            SPACE_NS,
+            "--set",
+            f"sandboxNamespace={SANDBOX_NS}",
         ]
-        if not policies:
-            raise SystemExit(f"{SPACE_CHART} rendered no NetworkPolicy in {SANDBOX_NS}")
-        return "\n---\n".join(policies) + "\n"
-    if KIND_SANDBOX_POLICY_CHART.is_dir():
-        return run(
-            [
-                "helm",
-                "template",
-                "space",
-                str(KIND_SANDBOX_POLICY_CHART),
-                "--namespace",
-                SPACE_NS,
-                "--set",
-                f"sandboxNamespace={SANDBOX_NS}",
-            ]
-        ).stdout
-    return None
+    ).stdout
 
 
-def apply_sandbox_policy(cluster: Cluster) -> bool:
+def apply_sandbox_policy(cluster: Cluster) -> None:
     manifest = sandbox_policy()
-    if manifest is None:
-        log("no sandbox network policy chart found; skipping the sandbox-policy phase")
-        return False
     run(
         ["kubectl", "--kubeconfig", str(cluster.kubeconfig), "--context", cluster.context, "apply", "-f", "-"],
         stdin=manifest,
     )
     applied = cluster.json("-n", SANDBOX_NS, "get", "networkpolicy")["items"]
     log(f"sandbox policies: {[p['metadata']['name'] for p in applied]}")
-    return True
 
 
 def set_host_peers(cluster: Cluster) -> None:
@@ -472,10 +434,10 @@ def main() -> int:
         sources = start_probes(cluster, worker)
         found = targets(cluster)
         failures = probe(cluster, "receiver-policies", sources, found, worker)
-        if apply_sandbox_policy(cluster):
-            failures += probe(cluster, "with-sandbox-policy", sources, found, worker)
-            set_host_peers(cluster)
-            failures += probe(cluster, "host-peers", sources, found, worker)
+        apply_sandbox_policy(cluster)
+        failures += probe(cluster, "with-sandbox-policy", sources, found, worker)
+        set_host_peers(cluster)
+        failures += probe(cluster, "host-peers", sources, found, worker)
         print()
         if failures:
             for failure in failures:

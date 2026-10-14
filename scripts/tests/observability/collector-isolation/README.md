@@ -34,9 +34,9 @@ each UDP datagram carries a unique metric name looked up in the Agent's
 `dogstatsd-stats`.
 
 Phases: the receivers' NetworkPolicies alone; then with the sandbox
-namespace's egress policy, rendered from the `space` chart's
-`sandbox.networkPolicy` (`infra/space/charts/space`), or from
-`infra/space/kind/charts/space-sandbox-network-policy` on trees without it;
+namespace's egress policy, rendered from the existing
+`infra/space/kind/charts/space-sandbox-network-policy` chart shared by the
+Kind and cluster deployment paths;
 then with every node address in `nodeLocal.hostPeers` and `datadog.hostPeers`.
 The exit status is non-zero if any asserted expectation fails; reachability
 the test does not assert is printed as `not asserted`.
