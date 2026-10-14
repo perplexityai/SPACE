@@ -12,8 +12,9 @@
 #   cluster-base
 #            print the kindest/node the cluster config names for the nodes
 #            that do not run the SPACE image: the base, or, when
-#            SPACE_CI_IMAGE_MIRROR is set, the base's tag pinned to the digest
-#            the mirror holds, which `ensure` pulls (see cluster_base_ref)
+#            SPACE_CI_IMAGE_MIRROR is set and the mirror holds a verified copy,
+#            the base's tag pinned to that copy's digest, which `ensure`
+#            pulls (see cluster_base_ref)
 #   inputs   print the files the tag covers, one per line
 #   ensure   make the reference available locally: use a local image with that
 #            tag, else pull it from GHCR, else build it. Main CI publishes each
@@ -90,15 +91,20 @@ base_ref() {
 # does not resolve locally. The Dockerfile pins the multi-platform index, and
 # the mirror holds that index's linux/amd64 manifest, so the copy `ensure`
 # pulls from the mirror resolves under the manifest's digest and not the
-# index's. Only the containerd image store resolves that tag and digest to a
-# copy pulled from another repository, and Kind CI enables it; on the classic
-# store `kind create` pulls the manifest from the source. Outside GitHub CI the
-# config keeps the index, so kind takes the host's platform.
+# index's. The config names that digest only while the mirror's record of the
+# pairing names it (`mirror-images.sh verified`, one bounded read): only then
+# does `ensure` take it from the mirror. Otherwise, as outside GitHub CI, the
+# config keeps the index, which `ensure` falls back to and kind pulls for the
+# host's platform; a listed digest the index does not vouch for is never run.
+# Only the containerd image store resolves the tag and digest to a copy pulled
+# from another repository, and Kind CI enables it; on the classic store
+# `kind create` pulls the manifest from the source.
 cluster_base_ref() {
   local base pinned
   base="$(base_ref)"
   # Captured, so a list that fails after printing cannot add a second line.
-  if [[ -n "${SPACE_CI_IMAGE_MIRROR:-}" ]] && pinned="$(bash "${MIRROR_IMAGES}" pinned "${base}")"; then
+  if [[ -n "${SPACE_CI_IMAGE_MIRROR:-}" ]] && pinned="$(bash "${MIRROR_IMAGES}" pinned "${base}")" &&
+    bash "${MIRROR_IMAGES}" verified "${base}"; then
     printf '%s\n' "${pinned}"
     return 0
   fi

@@ -10,26 +10,32 @@
 #
 # - `pull` pulls an image from the mirror and tags it with its name, so the
 #   tools that use that name find it locally. If the mirror lacks it or cannot
-#   be reached, it pulls the same digest from the sources; if that fails too,
-#   it leaves the image to the tools' own pulls, as before.
+#   be reached, it pulls the same digest from the sources, or for a name
+#   pinned by digest the index it pins; if that fails too, it leaves the image
+#   to the tools' own pulls, as before.
 # - `build-contexts` prints a `--build-context <name>=docker-image://<mirror>`
 #   option for each listed image the given Dockerfiles name, which makes a
 #   build take that FROM image from the mirror without changing the
 #   Dockerfile. An image the mirror lacks gets no option, so its build pulls
 #   the source as before. It prints nothing unless SPACE_CI_IMAGE_MIRROR is
 #   set, so builders outside GitHub CI are unchanged.
-# - `pinned` prints the name `pull` tags, pinned to the digest it pulls. On the
+# - `pinned` prints the name `pull` tags, pinned to the listed digest. On the
 #   containerd image store a tag with a digest resolves to a local image of
 #   that name and digest, so a tool that is given this reference and pulls only
-#   what is missing, as `kind create` does, uses the copy `pull` took. The
-#   listed name's own digest can pin a multi-platform index, which that copy
-#   does not answer to.
+#   what is missing, as `kind create` does, uses the copy `pull` took from the
+#   mirror. The listed name's own digest can pin a multi-platform index, which
+#   that copy does not answer to.
+# - `verified` succeeds when jobs take the name from the mirror: for a name
+#   pinned by digest, when its pairing's record is there and names the listed
+#   digest. Only then does `pull` leave the listed digest, so only then should
+#   a tool be given `pinned`'s reference; otherwise give it the name itself.
 #
 # Usage: ci/scripts/mirror-images.sh publish
 #        ci/scripts/mirror-images.sh pull <name>...
 #        ci/scripts/mirror-images.sh build-contexts <dockerfile>...
 #        ci/scripts/mirror-images.sh listed <name>
 #        ci/scripts/mirror-images.sh pinned <name>
+#        ci/scripts/mirror-images.sh verified <name>
 #
 # GHCR_TOKEN, when set, logs in to ghcr.io first; the package is private while
 # the repository is. SPACE_MIRRORED_IMAGES overrides the list. Logins and
@@ -43,10 +49,11 @@
 # the two belong together. So publish reads the index once, when it first sees
 # that pairing, and records the pairing it verified as a `pin-<hash>` tag on
 # the mirrored manifest. Jobs take such an image from the mirror only through
-# that tag: a name bumped without its digest has no record, so it is neither
-# copied nor substituted, and builds keep its pinned index from the source. An
-# index publish cannot read is not recorded either, and is tried again on the
-# next run.
+# that tag, and only while it names the listed digest: a name bumped without
+# its digest has no record, so it is neither copied nor substituted, and jobs
+# and builds keep its pinned index from the source. An index publish cannot
+# read is not recorded either, and is tried again on the next run; a record
+# that names another digest is a miss, which publish repairs.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -110,6 +117,24 @@ mirrored() {
     space_with_deadline "${READ_TIMEOUT_SECONDS}" docker buildx imagetools inspect --raw "$1" >/dev/null 2>&1
 }
 
+# Whether a pairing's record exists and names the given digest.
+record_names() {
+    local named
+    named="$(space_with_deadline "${READ_TIMEOUT_SECONDS}" \
+        docker buildx imagetools inspect --format '{{json .Manifest}}' "$1" 2>/dev/null | jq -r '.digest // empty')" ||
+        return 1
+    [ "${named}" = "$2" ]
+}
+
+# Whether jobs take a listed image from the mirror: <name> <mirror> <use>.
+on_mirror() {
+    if [[ "$1" == *@* ]]; then
+        record_names "$3" "${2#*@}"
+    else
+        mirrored "$2"
+    fi
+}
+
 pull() {
     local listed image entry name mirror use sources source error status started
     listed="$(entries)"
@@ -123,6 +148,11 @@ pull() {
             continue
         fi
         read -r name mirror _ use sources <<<"${entry}"
+        # Without its verified record, a name pinned by digest falls back to
+        # the index it pins, never to the listed digest the index may not hold.
+        if [[ "${name}" == *@* ]]; then
+            sources="$(for source in ${sources}; do printf '%s@%s ' "${source%@*}" "${name##*@}"; done)"
+        fi
         # A tag cannot carry a digest; a name pinned by digest keeps its tag.
         name="${name%%@*}"
         started="${SECONDS}"
@@ -166,7 +196,7 @@ build_contexts() {
     while read -r name mirror _ use _; do
         [ -n "${name}" ] || continue
         grep -qxF -- "${name}" <<<"${tokens}" || continue
-        if mirrored "${use}"; then
+        if on_mirror "${name}" "${mirror}" "${use}"; then
             printf -- '--build-context=%s=docker-image://%s\n' "${name}" "${mirror}"
         else
             echo "::warning::Building from ${name} at its source; ${use} is unavailable" >&2
@@ -244,9 +274,12 @@ publish() {
         digest="${mirror#*@}"
         if [[ "${name}" == *@* ]]; then
             # Its pairing is read from the index once, then from its record.
-            if mirrored "${use}"; then
+            if record_names "${use}" "${digest}"; then
                 echo "${name} is already mirrored as ${mirror}, verified as ${use##*:}"
                 continue
+            fi
+            if mirrored "${use}"; then
+                echo "::warning::${use} does not name ${digest}; verifying ${name} again to repair it"
             fi
             check_listed_digest "${name}" "${digest}" || case $? in
                 1)
@@ -281,7 +314,7 @@ publish() {
         if [[ "${name}" == *@* ]]; then
             if ! space_with_deadline "${READ_TIMEOUT_SECONDS}" \
                 docker buildx imagetools create --prefer-index=false --tag "${use}" "${mirror}" ||
-                ! mirrored "${use}"; then
+                ! record_names "${use}" "${digest}"; then
                 echo "::error::Could not record ${name}'s verified pairing as ${use}"
                 failures=$((failures + 1))
                 continue
@@ -313,6 +346,14 @@ case "${1:-}" in
         [ $# -eq 2 ] || { echo "usage: $0 listed <name>" >&2; exit 2; }
         entries | awk -v name="$2" '$1 == name { found = 1 } END { exit !found }'
         ;;
+    verified)
+        [ $# -eq 2 ] || { echo "usage: $0 verified <name>" >&2; exit 2; }
+        entry="$(entries | awk -v name="$2" '$1 == name { print; exit }')"
+        [ -n "${entry}" ] || exit 1
+        read -r name mirror _ use _ <<<"${entry}"
+        registry_login || true
+        on_mirror "${name}" "${mirror}" "${use}"
+        ;;
     pinned)
         [ $# -eq 2 ] || { echo "usage: $0 pinned <name>" >&2; exit 2; }
         entries | awk -v name="$2" '$1 == name && !found {
@@ -323,7 +364,7 @@ case "${1:-}" in
         } END { exit !found }'
         ;;
     *)
-        echo "usage: $0 publish|pull <name>...|build-contexts <dockerfile>...|listed <name>|pinned <name>" >&2
+        echo "usage: $0 publish|pull <name>...|build-contexts <dockerfile>...|listed <name>|pinned <name>|verified <name>" >&2
         exit 2
         ;;
 esac

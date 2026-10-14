@@ -61,32 +61,91 @@ bash "$repo_root/ci/scripts/mirror-images.sh" listed "$base" \
   || fail "$base is not in ci/mirrored-images.txt"
 
 # In GitHub CI the other nodes name the base by the digest the mirror holds,
-# the one a pull from the mirror resolves under; elsewhere by the base's own
-# pin. The list is synthetic, so the mirrored digest is known here.
+# the one a pull from the mirror resolves under, but only while the mirror's
+# record of that pairing names it; otherwise, and outside GitHub CI, by the
+# base's own pin. The list is synthetic, so the mirrored digest is known here.
 mirror_digest="sha256:$(printf 'b%.0s' {1..64})"
 printf '%s %s ghcr.io/example/mirror:kindest-node\n' "$base" "$mirror_digest" >"$work/mirrored-images.txt"
 mirrored_base="${base%%@*}@$mirror_digest"
 export SPACE_MIRRORED_IMAGES="$work/mirrored-images.txt"
-[[ "$(env -u SPACE_CI_IMAGE_MIRROR bash "$image_script" cluster-base)" == "$base" ]] \
+mirror_ref="ghcr.io/example/mirror@$mirror_digest"
+source_ref="${base%%:*}@$mirror_digest"
+index_ref="${base%%:*}@${base##*@}"
+# The base is pinned by digest, so jobs take it through the tag publish wrote
+# when it verified the pairing (mirror-images.sh).
+pin_ref="ghcr.io/example/mirror:pin-$(printf '%s %s' "$base" "$mirror_digest" | sha256sum | cut -c1-40)"
+stale_digest="sha256:$(printf 'e%.0s' {1..64})"
+
+# A docker that has the SPACE node image, pulls what FAKE_PULLABLE lists (a
+# `tag=digest-ref` entry pulls a tag that resolves to that digest), reads the
+# pairing records FAKE_RECORDS lists (`record=digest`), and resolves a tag
+# with a digest as the containerd image store does: to the image tagged with
+# that name, if it was pulled by that digest.
+mkdir -p "$work/stub-bin"
+cat >"$work/stub-bin/docker" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$FAKE_CALLS"
+case "$1 $2" in
+  "image inspect") [[ "$3" == "$FAKE_NODE_REF" ]] || grep -qxF -- "$3" "$FAKE_LOCAL" ;;
+  "pull "*)
+    for entry in ${FAKE_PULLABLE:-}; do
+      [[ "${entry%%=*}" == "${*: -1}" ]] || continue
+      printf '%s\n' "${entry%%=*}" "${entry#*=}" >>"$FAKE_LOCAL"
+      exit 0
+    done
+    echo "unreachable: ${*: -1}" >&2
+    exit 1
+    ;;
+  "tag "*) printf '%s\n%s@%s\n' "$3" "$3" "${2#*@}" >>"$FAKE_LOCAL" ;;
+  "buildx imagetools")
+    for entry in ${FAKE_RECORDS:-}; do
+      [[ "${entry%%=*}" == "${*: -1}" ]] || continue
+      printf '{"digest":"%s"}\n' "${entry#*=}"
+      exit 0
+    done
+    echo "manifest unknown: ${*: -1}" >&2
+    exit 1
+    ;;
+  *) echo "unexpected docker call: $*" >&2; exit 99 ;;
+esac
+EOF
+chmod +x "$work/stub-bin/docker"
+: >"$work/local"
+# Runs its arguments (settings, then the command) under env with the stub
+# docker; an empty SPACE_CI_IMAGE_MIRROR is unset as far as the scripts go.
+with_stub() {
+  env -u GHCR_TOKEN -u SPACE_KIND_NODE_IMAGE -u SPACE_KIND_BASE_NODE_IMAGE \
+    PATH="$work/stub-bin:$PATH" FAKE_CALLS="$work/calls" FAKE_LOCAL="$work/local" \
+    FAKE_NODE_REF="$ref" SPACE_DOCKER_PULL_ATTEMPTS=1 "$@"
+}
+cluster_base() { with_stub "$@" bash "$image_script" cluster-base 2>/dev/null; }
+
+[[ "$(cluster_base SPACE_CI_IMAGE_MIRROR= FAKE_RECORDS="$pin_ref=$mirror_digest")" == "$base" ]] \
   || fail "outside GitHub CI the cluster does not run the pinned base"
-[[ "$(SPACE_CI_IMAGE_MIRROR=ghcr bash "$image_script" cluster-base)" == "$mirrored_base" ]] \
-  || fail "in GitHub CI the cluster does not name the mirrored digest of the base"
+[[ "$(cluster_base SPACE_CI_IMAGE_MIRROR=ghcr FAKE_RECORDS="$pin_ref=$mirror_digest")" == "$mirrored_base" ]] \
+  || fail "in GitHub CI the cluster does not name the verified mirrored digest of the base"
+# An index bumped without its digest has no record: the cluster keeps the index
+# rather than run the stale listed digest.
+[[ "$(cluster_base SPACE_CI_IMAGE_MIRROR=ghcr FAKE_RECORDS=)" == "$base" ]] \
+  || fail "a pairing without a record put the cluster on the listed digest instead of the pinned index"
+[[ "$(cluster_base SPACE_CI_IMAGE_MIRROR=ghcr FAKE_RECORDS="$pin_ref=$stale_digest")" == "$base" ]] \
+  || fail "a record that names another digest put the cluster on the listed digest"
 # A malformed line after the base's: the list is rejected, and the config
 # still gets one reference, the base's own.
 cp "$work/mirrored-images.txt" "$work/malformed-images.txt"
 echo "registry.example/unpinned sha256:short ghcr.io/example/mirror" >>"$work/malformed-images.txt"
-[[ "$(SPACE_MIRRORED_IMAGES="$work/malformed-images.txt" SPACE_CI_IMAGE_MIRROR=ghcr \
-  bash "$image_script" cluster-base 2>/dev/null)" == "$base" ]] \
+[[ "$(cluster_base SPACE_MIRRORED_IMAGES="$work/malformed-images.txt" SPACE_CI_IMAGE_MIRROR=ghcr \
+  FAKE_RECORDS="$pin_ref=$mirror_digest")" == "$base" ]] \
   || fail "a malformed list did not leave the cluster on exactly the pinned base"
 
 # The rendered space-local config: SPACE nodes on the image, the rest on its
-# base. Arguments after the expected base go to env (options first).
+# base. Arguments after the expected base are settings for with_stub.
 rendered="$work/kind-cluster.yaml"
 check_render() {
   local base_want="$1" images role pool image want
   shift
   # shellcheck disable=SC2016 # expanded by the inner shell
-  env -u SPACE_KIND_NODE_IMAGE -u SPACE_KIND_BASE_NODE_IMAGE "$@" HOME="$work/home" bash -c \
+  with_stub "$@" HOME="$work/home" bash -c \
     'source "$1"; kind_render_cluster_config "$2" "$3"' _ \
     "$repo_root/infra/space/kind/scripts/lib/kind-host-paths.sh" \
     "$repo_root/infra/space/kind/kind-cluster.yaml.tmpl" "$rendered"
@@ -104,66 +163,41 @@ check_render() {
   done <<<"$images"
   [[ "$(grep -c "image: $ref\$" "$rendered")" == 4 ]] || fail "expected four SPACE nodes on $ref"
 }
-check_render "$base" -u SPACE_CI_IMAGE_MIRROR
-check_render "$mirrored_base" SPACE_CI_IMAGE_MIRROR=ghcr
+check_render "$base" SPACE_CI_IMAGE_MIRROR=
+check_render "$mirrored_base" SPACE_CI_IMAGE_MIRROR=ghcr FAKE_RECORDS="$pin_ref=$mirror_digest"
+check_render "$base" SPACE_CI_IMAGE_MIRROR=ghcr FAKE_RECORDS=
 
 # ── ensure takes the cluster's base from the mirror in GitHub CI ─────────────
-# A docker that has the SPACE node image, pulls what FAKE_PULLABLE lists (a
-# `tag=digest-ref` entry pulls a tag that resolves to that digest), and
-# resolves a tag with a digest as the containerd image store does: to the
-# image tagged with that name, if it was pulled by that digest.
-mkdir -p "$work/ensure-bin"
-cat >"$work/ensure-bin/docker" <<'EOF'
-#!/usr/bin/env bash
-printf '%s\n' "$*" >>"$FAKE_CALLS"
-case "$1 $2" in
-  "image inspect") [[ "$3" == "$FAKE_NODE_REF" ]] || grep -qxF -- "$3" "$FAKE_LOCAL" ;;
-  "pull "*)
-    for entry in ${FAKE_PULLABLE:-}; do
-      [[ "${entry%%=*}" == "${*: -1}" ]] || continue
-      printf '%s\n' "${entry%%=*}" "${entry#*=}" >>"$FAKE_LOCAL"
-      exit 0
-    done
-    echo "unreachable: ${*: -1}" >&2
-    exit 1
-    ;;
-  "tag "*) printf '%s\n%s@%s\n' "$3" "$3" "${2#*@}" >>"$FAKE_LOCAL" ;;
-  *) echo "unexpected docker call: $*" >&2; exit 99 ;;
-esac
-EOF
-chmod +x "$work/ensure-bin/docker"
-mirror_ref="ghcr.io/example/mirror@$mirror_digest"
-source_ref="${base%%:*}@$mirror_digest"
-# The base is pinned by digest, so jobs take it through the tag publish wrote
-# when it verified the pairing (mirror-images.sh).
-pin_ref="ghcr.io/example/mirror:pin-$(printf '%s %s' "$base" "$mirror_digest" | sha256sum | cut -c1-40)"
-# Arguments go to env (options first).
 run_ensure() {
   : >"$work/calls"
   : >"$work/local"
-  env -u GHCR_TOKEN "$@" PATH="$work/ensure-bin:$PATH" FAKE_CALLS="$work/calls" FAKE_LOCAL="$work/local" \
-    FAKE_NODE_REF="$ref" SPACE_DOCKER_PULL_ATTEMPTS=1 \
-    bash "$image_script" ensure >"$work/out" 2>"$work/err"
+  with_stub "$@" bash "$image_script" ensure >"$work/out" 2>"$work/err"
 }
-run_ensure SPACE_CI_IMAGE_MIRROR=ghcr FAKE_PULLABLE="$pin_ref=$mirror_ref" \
+run_ensure SPACE_CI_IMAGE_MIRROR=ghcr FAKE_RECORDS="$pin_ref=$mirror_digest" FAKE_PULLABLE="$pin_ref=$mirror_ref" \
   || fail "ensure from the mirror failed: $(cat "$work/err")"
 [[ "$(cat "$work/out")" == "$ref" ]] || fail "ensure printed more than the node image: $(cat "$work/out")"
 grep -qxF "tag $mirror_ref ${base%%@*}" "$work/calls" || fail "ensure did not take the base from the mirror"
 grep -qxF -- "$mirrored_base" "$work/local" \
   || fail "the mirrored base does not resolve under the name the cluster config gives it"
-grep -qxF "pull $source_ref" "$work/calls" && fail "ensure pulled the base from its source although the mirror had it"
-run_ensure SPACE_CI_IMAGE_MIRROR=ghcr FAKE_PULLABLE="$mirror_ref $source_ref" \
+grep -q "^pull .*$source_ref" "$work/calls" && fail "ensure pulled the base from its source although the mirror had it"
+# The stale-digest regression: an index bumped without its digest. Nothing
+# runs the listed digest; ensure takes the pinned index, which is what the
+# config then names and finds locally.
+run_ensure SPACE_CI_IMAGE_MIRROR=ghcr FAKE_RECORDS= FAKE_PULLABLE="$mirror_ref $source_ref $index_ref" \
   || fail "ensure without a verified pairing failed: $(cat "$work/err")"
 grep -qxF "tag $mirror_ref ${base%%@*}" "$work/calls" && fail "ensure took a digest publish never verified from the mirror"
-grep -qxF "tag $source_ref ${base%%@*}" "$work/calls" || fail "an unverified pairing did not fall back to the source"
-run_ensure SPACE_CI_IMAGE_MIRROR=ghcr FAKE_PULLABLE="$source_ref" \
-  || fail "ensure from the source failed: $(cat "$work/err")"
-grep -qxF "tag $source_ref ${base%%@*}" "$work/calls" || fail "ensure did not fall back to the source's digest"
-run_ensure SPACE_CI_IMAGE_MIRROR=ghcr FAKE_PULLABLE= \
+grep -q "^pull .*$source_ref" "$work/calls" && fail "ensure pulled the unverified listed digest from the source"
+grep -qxF "tag $index_ref ${base%%@*}" "$work/calls" || fail "an unverified pairing did not fall back to the pinned index"
+grep -qxF -- "$base" "$work/local" || fail "the pinned index does not resolve under the name the cluster config gives it"
+run_ensure SPACE_CI_IMAGE_MIRROR=ghcr FAKE_RECORDS="$pin_ref=$mirror_digest" FAKE_PULLABLE="$index_ref" \
+  || fail "ensure with the mirror down failed: $(cat "$work/err")"
+grep -qxF "tag $index_ref ${base%%@*}" "$work/calls" || fail "ensure did not fall back to the pinned index"
+run_ensure SPACE_CI_IMAGE_MIRROR=ghcr FAKE_RECORDS= FAKE_PULLABLE= \
   || fail "ensure failed although kind create can still pull the base: $(cat "$work/err")"
 [[ "$(cat "$work/out")" == "$ref" ]] || fail "ensure printed more than the node image: $(cat "$work/out")"
 grep -q "kind create pulls it" "$work/err" || fail "ensure did not say that kind create pulls the base"
-run_ensure -u SPACE_CI_IMAGE_MIRROR FAKE_PULLABLE="$pin_ref=$mirror_ref" || fail "ensure outside GitHub CI failed"
+run_ensure SPACE_CI_IMAGE_MIRROR= FAKE_RECORDS="$pin_ref=$mirror_digest" FAKE_PULLABLE="$pin_ref=$mirror_ref" \
+  || fail "ensure outside GitHub CI failed"
 grep -q "^pull " "$work/calls" && fail "ensure pulled the base outside GitHub CI"
 unset SPACE_MIRRORED_IMAGES
 

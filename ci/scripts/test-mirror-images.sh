@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Regression test for ci/scripts/mirror-images.sh against a fake docker: jobs
 # take the mirror by digest, or a name pinned by digest only through the tag
-# that records its verified pairing; they fall back to the source's digest,
+# that records its verified pairing, and only while it names the listed
+# digest; they fall back to the source's digest, or to the index a name pins,
 # never fail for a missing image, and give up on a registry that does not
 # answer; builds get a build context only for a mirrored image their
 # Dockerfile names; pinned names the copy a pull leaves by the digest it
@@ -9,7 +10,8 @@
 # the first fails, fails when the copy does not keep the source's digest, and
 # reads a pinned index only for a pairing it has not recorded, recording it
 # when the index serves the listed digest, refusing it when the index serves
-# another, and leaving it unmirrored when the index cannot be read.
+# another, leaving it unmirrored when the index cannot be read, and repairing
+# a record that names another digest.
 set -euo pipefail
 
 SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/mirror-images.sh"
@@ -28,6 +30,7 @@ PINNED_DIGEST="sha256:$(printf 'c%.0s' {1..64})"
 PINNED_NAME="registry.example/library/rust:1-bookworm@sha256:$(printf 'd%.0s' {1..64})"
 PINNED_MIRROR="ghcr.io/example/mirror@${PINNED_DIGEST}"
 PINNED_ORIGIN="registry.example/library/rust@${PINNED_DIGEST}"
+PINNED_INDEX_ORIGIN="registry.example/library/rust@${PINNED_NAME##*@}"
 PINNED_DESTINATION="ghcr.io/example/mirror:rust-1-bookworm"
 PINNED_RECORD="ghcr.io/example/mirror:pin-$(printf '%s %s' "${PINNED_NAME}" "${PINNED_DIGEST}" | sha256sum | cut -c1-40)"
 STALE="sha256:$(printf 'e%.0s' {1..64})"
@@ -38,7 +41,8 @@ cat >"${WORK_DIR}/bin/docker" <<'SH'
 # FAKE_PULLABLE lists what pulls give: `ref`, or `tag=digest-ref` for a tag
 # that resolves to that digest. What was pulled or tagged is local
 # (FAKE_LOCAL). A pull or read of a reference in FAKE_HANG never answers. The
-# registry's manifests and tags, which imagetools inspects and creates, are the
+# registry's manifests (`repo@digest`) and tags (`repo:tag=digest`, the last
+# line for a tag winning), which imagetools inspects and creates, are the
 # lines of FAKE_REGISTRY. FAKE_SERVES lists name=digest pairs: the linux/amd64
 # digest each upstream name serves, as an index for a name pinned by digest
 # and as a single manifest otherwise.
@@ -73,17 +77,26 @@ case "$1 ${2:-} ${3:-}" in
                 fi
                 exit 0
             done
+            named="$(grep -F -- "${ref}=" "${FAKE_REGISTRY}" | tail -n 1)"
+            if [ -n "${named}" ]; then
+                printf '{"digest":"%s"}\n' "${named#*=}"
+                exit 0
+            fi
+            if grep -qxF -- "${ref}" "${FAKE_REGISTRY}"; then
+                printf '{"digest":"%s"}\n' "${ref#*@}"
+                exit 0
+            fi
             echo "manifest unknown: ${ref}" >&2
             exit 1
         fi
-        grep -qxF -- "${ref}" "${FAKE_REGISTRY}"
+        grep -qxF -- "${ref}" "${FAKE_REGISTRY}" || grep -qF -- "${ref}=" "${FAKE_REGISTRY}"
         ;;
     "buildx imagetools create")
         [ -z "${FAKE_CREATE_FAILS:-}" ] || exit 1
         [[ " ${FAKE_UNREACHABLE:-} " != *" ${ref} "* ]] || exit 1
         destination="${*: -2:1}"
         digest="${FAKE_CREATE_DIGEST:-${ref}}"
-        printf '%s@%s\n%s\n' "${destination%:*}" "${digest#*@}" "${destination}" >>"${FAKE_REGISTRY}"
+        printf '%s@%s\n%s=%s\n' "${destination%:*}" "${digest#*@}" "${destination}" "${digest#*@}" >>"${FAKE_REGISTRY}"
         ;;
     *) echo "unexpected docker call: $*" >&2; exit 99 ;;
 esac
@@ -155,17 +168,22 @@ run "${PINNED_RECORD}=${PINNED_MIRROR}" "" pull "${PINNED_NAME}" || fail "pull o
 called "pull --quiet ${PINNED_RECORD}" || fail "a digest-pinned name was not pulled through its pairing's record"
 called "tag ${PINNED_MIRROR} ${PINNED_NAME%%@*}" || fail "a digest-pinned name was not tagged by its tag"
 
-run "${PINNED_MIRROR} ${PINNED_ORIGIN}" "" pull "${PINNED_NAME}" || fail "pull of an unverified pairing exited nonzero"
+# An index bumped without its digest: the listed digest is stale, and an
+# unverified pairing never runs it, from the mirror or the source; it falls
+# back to the index the name pins.
+run "${PINNED_MIRROR} ${PINNED_ORIGIN} ${PINNED_INDEX_ORIGIN}" "" pull "${PINNED_NAME}" ||
+    fail "pull of an unverified pairing exited nonzero"
 called "tag ${PINNED_MIRROR} ${PINNED_NAME%%@*}" && fail "a digest publish never verified was taken from the mirror"
-called "tag ${PINNED_ORIGIN} ${PINNED_NAME%%@*}" || fail "an unverified pairing did not fall back to the source"
+called "pull ${PINNED_ORIGIN}" && fail "an unverified pairing pulled the listed digest from the source"
+called "tag ${PINNED_INDEX_ORIGIN} ${PINNED_NAME%%@*}" || fail "an unverified pairing did not fall back to the pinned index"
 
-run "${PINNED_RECORD}=ghcr.io/example/mirror@${STALE} ${PINNED_ORIGIN}" "" pull "${PINNED_NAME}" ||
+run "${PINNED_RECORD}=ghcr.io/example/mirror@${STALE} ${PINNED_ORIGIN} ${PINNED_INDEX_ORIGIN}" "" pull "${PINNED_NAME}" ||
     fail "pull through a record of another digest exited nonzero"
-called "tag ${PINNED_ORIGIN} ${PINNED_NAME%%@*}" || fail "a record of another digest was not refused"
+called "tag ${PINNED_INDEX_ORIGIN} ${PINNED_NAME%%@*}" || fail "a record of another digest was not refused"
 grep -q "${PINNED_RECORD} is not ${PINNED_DIGEST}" "${WORK_DIR}/out" || fail "the refusal did not say why"
 
 # ── build-contexts ───────────────────────────────────────────────────────────
-run "" "${MIRROR} ${PINNED_MIRROR} ${PINNED_RECORD}" build-contexts "${WORK_DIR}/Dockerfile" ||
+run "" "${MIRROR} ${PINNED_MIRROR} ${PINNED_RECORD}=${PINNED_DIGEST}" build-contexts "${WORK_DIR}/Dockerfile" ||
     fail "build-contexts exited nonzero"
 [ "$(cat "${WORK_DIR}/out")" = "--build-context=${NAME}=docker-image://${MIRROR}
 --build-context=${PINNED_NAME}=docker-image://${PINNED_MIRROR}" ] ||
@@ -176,6 +194,11 @@ run "" "${MIRROR} ${PINNED_MIRROR}" build-contexts "${WORK_DIR}/Dockerfile" ||
 [ "$(cat "${WORK_DIR}/out")" = "--build-context=${NAME}=docker-image://${MIRROR}" ] ||
     fail "build-contexts substituted a digest whose pairing publish never verified: $(cat "${WORK_DIR}/out")"
 
+run "" "${MIRROR} ${PINNED_RECORD}=${STALE}" build-contexts "${WORK_DIR}/Dockerfile" ||
+    fail "build-contexts with a record of another digest exited nonzero"
+[ "$(cat "${WORK_DIR}/out")" = "--build-context=${NAME}=docker-image://${MIRROR}" ] ||
+    fail "build-contexts trusted a record that names another digest: $(cat "${WORK_DIR}/out")"
+
 run "" "${MIRROR}" build-contexts "${WORK_DIR}/Dockerfile" || fail "build-contexts with a missing mirror exited nonzero"
 [ "$(cat "${WORK_DIR}/out")" = "--build-context=${NAME}=docker-image://${MIRROR}" ] ||
     fail "build-contexts overrode a base the mirror lacks: $(cat "${WORK_DIR}/out")"
@@ -183,7 +206,7 @@ run "" "${MIRROR}" build-contexts "${WORK_DIR}/Dockerfile" || fail "build-contex
 if can_time_out; then
     started="${SECONDS}"
     FAKE_HANG="${PINNED_RECORD}" SPACE_REGISTRY_READ_TIMEOUT_SECONDS=1 \
-        run "" "${MIRROR} ${PINNED_MIRROR} ${PINNED_RECORD}" build-contexts "${WORK_DIR}/Dockerfile" ||
+        run "" "${MIRROR} ${PINNED_MIRROR} ${PINNED_RECORD}=${PINNED_DIGEST}" build-contexts "${WORK_DIR}/Dockerfile" ||
         fail "build-contexts with a mirror that never answers exited nonzero"
     [ $((SECONDS - started)) -lt 15 ] || fail "a mirror that never answers held build-contexts for $((SECONDS - started)) s"
     [ "$(cat "${WORK_DIR}/out")" = "--build-context=${NAME}=docker-image://${MIRROR}" ] ||
@@ -210,21 +233,40 @@ run "" "" pinned "${PINNED_NAME}" || fail "pinned rejected a digest-pinned name"
 run "" "" pinned "${NAME%:*}:17" && fail "pinned accepted an unlisted name"
 [ -s "${WORK_DIR}/out" ] && fail "pinned printed a reference for an unlisted name"
 
-# ── publish ──────────────────────────────────────────────────────────────────
-run "" "${MIRROR} ${PINNED_MIRROR} ${PINNED_RECORD}" publish || fail "publish of mirrored digests exited nonzero"
-grep -q "imagetools create" "${WORK_DIR}/calls" && fail "publish copied a digest already mirrored"
-grep -q "imagetools inspect --format" "${WORK_DIR}/calls" && fail "publish read an upstream name it had already verified"
+run "" "${PINNED_MIRROR} ${PINNED_RECORD}=${PINNED_DIGEST}" verified "${PINNED_NAME}" ||
+    fail "verified rejected a recorded pairing"
+run "" "${PINNED_MIRROR}" verified "${PINNED_NAME}" && fail "verified accepted a pairing without a record"
+run "" "${PINNED_MIRROR} ${PINNED_RECORD}=${STALE}" verified "${PINNED_NAME}" &&
+    fail "verified accepted a record that names another digest"
+run "" "${MIRROR}" verified "${NAME}" || fail "verified rejected a mirrored tag-only name"
+run "" "" verified "${NAME}" && fail "verified accepted a name the mirror lacks"
+run "" "" verified "${NAME%:*}:17" && fail "verified accepted an unlisted name"
 
-run "" "${PINNED_MIRROR} ${PINNED_RECORD}" publish || fail "publish of a missing digest exited nonzero"
+# ── publish ──────────────────────────────────────────────────────────────────
+run "" "${MIRROR} ${PINNED_MIRROR} ${PINNED_RECORD}=${PINNED_DIGEST}" publish || fail "publish of mirrored digests exited nonzero"
+grep -q "imagetools create" "${WORK_DIR}/calls" && fail "publish copied a digest already mirrored"
+grep -qF -- "--format {{json .Manifest}} ${PINNED_NAME}" "${WORK_DIR}/calls" &&
+    fail "publish read an upstream name it had already verified"
+
+# A record that names another digest is a miss, which publish repairs.
+FAKE_SERVES="${PINNED_NAME}=${PINNED_DIGEST}" run "" "${MIRROR} ${PINNED_MIRROR} ${PINNED_RECORD}=${STALE}" publish ||
+    fail "publish could not repair a record that names another digest: $(cat "${WORK_DIR}/out")"
+grep -q "::warning::${PINNED_RECORD} does not name ${PINNED_DIGEST}" "${WORK_DIR}/out" ||
+    fail "publish did not say the record named another digest"
+called "buildx imagetools create --prefer-index=false --tag ${PINNED_RECORD} ${PINNED_MIRROR}" ||
+    fail "publish did not rewrite the record"
+grep -q "Mirrored ${PINNED_NAME} as ${PINNED_MIRROR}, verified" "${WORK_DIR}/out" || fail "publish did not verify the repaired record"
+
+run "" "${PINNED_MIRROR} ${PINNED_RECORD}=${PINNED_DIGEST}" publish || fail "publish of a missing digest exited nonzero"
 called "buildx imagetools create --prefer-index=false --tag ${DESTINATION} ${ORIGIN}" ||
     fail "publish did not copy the pinned digest to the destination"
 
-FAKE_UNREACHABLE="${ORIGIN}" run "" "${PINNED_MIRROR} ${PINNED_RECORD}" publish ||
+FAKE_UNREACHABLE="${ORIGIN}" run "" "${PINNED_MIRROR} ${PINNED_RECORD}=${PINNED_DIGEST}" publish ||
     fail "publish failed although another repository had the digest"
 called "buildx imagetools create --prefer-index=false --tag ${DESTINATION} ${OTHER}" ||
     fail "publish did not copy from the other repository when the first failed"
 
-FAKE_SERVES="${NAME}=${STALE}" run "" "${PINNED_MIRROR} ${PINNED_RECORD}" publish ||
+FAKE_SERVES="${NAME}=${STALE}" run "" "${PINNED_MIRROR} ${PINNED_RECORD}=${PINNED_DIGEST}" publish ||
     fail "publish refused a digest whose tag has since moved"
 grep -q "::warning::${NAME} now serves ${STALE}" "${WORK_DIR}/out" || fail "publish did not warn that the tag moved"
 called "buildx imagetools create --prefer-index=false --tag ${DESTINATION} ${ORIGIN}" ||
@@ -264,9 +306,9 @@ called "buildx imagetools create --prefer-index=false --tag ${PINNED_DESTINATION
 called "buildx imagetools create --prefer-index=false --tag ${PINNED_RECORD} ${PINNED_MIRROR}" ||
     fail "publish did not record a new verified pairing"
 
-FAKE_CREATE_DIGEST="sha256:$(printf 'b%.0s' {1..64})" run "" "${PINNED_MIRROR} ${PINNED_RECORD}" publish &&
+FAKE_CREATE_DIGEST="sha256:$(printf 'b%.0s' {1..64})" run "" "${PINNED_MIRROR} ${PINNED_RECORD}=${PINNED_DIGEST}" publish &&
     fail "publish accepted a copy that changed the digest"
-FAKE_CREATE_FAILS=1 run "" "${PINNED_MIRROR} ${PINNED_RECORD}" publish && fail "publish succeeded although every copy failed"
+FAKE_CREATE_FAILS=1 run "" "${PINNED_MIRROR} ${PINNED_RECORD}=${PINNED_DIGEST}" publish && fail "publish succeeded although every copy failed"
 [ "$(calls_matching "imagetools create")" -eq 4 ] || fail "publish did not retry both repositories"
 
 printf '%s %s %s\n' "${NAME}" "${DIGEST#sha256:}" "${DESTINATION}" >"${WORK_DIR}/unpinned"

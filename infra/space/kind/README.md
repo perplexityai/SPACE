@@ -1769,17 +1769,23 @@ warm Docker cache). Both bring-up paths run it before `kind create`, and the
 renderer writes the tag into the cluster config. Main CI publishes each new tag
 once; Kind CI jobs pull it and fall back to a build. Builds take the
 `kindest/node` base from the third-party image mirror (`ci/mirrored-images.txt`)
-when `SPACE_CI_IMAGE_MIRROR` is set, and from the source otherwise. With it
-set, `ensure` also pulls that base for the control-plane and infra nodes from
-the mirror, falling back to its source, and the renderer names it by the digest
-the mirror holds: the index's linux/amd64 manifest, the only digest the pulled
-copy resolves under, so `kind create` uses it instead of pulling the index from
-Docker Hub. The mirror serves it only once main's mirror job has verified
-that the index lists that manifest and recorded the pairing
-(`ci/scripts/mirror-images.sh`); until then `ensure` takes the same digest from
-Docker Hub. That lookup needs Docker's containerd image store, which Kind CI
-enables; on the classic store `kind create` pulls the manifest from Docker Hub
-as before. Elsewhere the config names the index and kind pulls it. A package
+when `SPACE_CI_IMAGE_MIRROR` is set, and from the source otherwise.
+
+With `SPACE_CI_IMAGE_MIRROR` set, `ensure` also pulls that base for the
+control-plane and infra nodes from the mirror. The mirror holds the index's
+linux/amd64 manifest, which is the only digest the pulled copy resolves under.
+So the renderer names the base by that digest, and `kind create` uses the copy
+instead of pulling the index from Docker Hub.
+- This holds only while main's mirror job has a record that the index lists
+  that manifest (`ci/scripts/mirror-images.sh`). The renderer checks the record
+  with one bounded read.
+- With no record (a list change main has not published yet), or a record that
+  names another digest, nothing uses the listed digest. `ensure` takes the
+  pinned index from Docker Hub, and the config names the index.
+- The lookup needs Docker's containerd image store, which Kind CI enables. On
+  the classic store, `kind create` pulls the manifest from Docker Hub as before.
+
+Elsewhere the config names the index and kind pulls it. A package
 administrator has to make the `space-kind-node` package public for bring-ups
 outside CI to pull it; until then they build it, with the same result.
 
