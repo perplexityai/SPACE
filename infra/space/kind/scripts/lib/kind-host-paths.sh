@@ -34,8 +34,9 @@
 #                         node images the config names (default: what
 #                         ../kind-node-image.sh prints for `ref` / `base`)
 
-# The binary a sandbox worker executes through /space/vendor. The staging
-# check in bootstrap.sh gates on this same path; this is the one definition.
+# The binary a sandbox worker executes through /space/vendor; the mount
+# preflight refuses a vendor root without it. Whether a tree is fully
+# staged, kernel included, is `install-fc-vendor.sh --check`'s to decide.
 KIND_HOST_PATHS_VENDOR_PROBE="firecracker/default/bin/firecracker"
 
 # The node image script, found from this file so every caller resolves the same

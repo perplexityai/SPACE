@@ -17,7 +17,9 @@
 # it still splits them; the bring-up scripts pass one resolved value to both.
 #
 # Idempotent: re-running with the binaries already installed is a no-op fast
-# path. Everything lands under $SPACE_VENDOR_ROOT. There is one escalation
+# path. `--check` writes nothing and exits 0 only when that is so: the
+# Firecracker release and the guest kernel at its pinned sha256 are both
+# staged. The bring-up scripts run the installer when it does not. Everything lands under $SPACE_VENDOR_ROOT. There is one escalation
 # below, with two triggers: a vendor root that exists but belongs to root (the
 # shape the devbox platform provisions), and a root that cannot be created
 # because something above it is unwritable. In the second case the chown
@@ -39,7 +41,8 @@ ARCH="${SPACE_FC_ARCH:-x86_64}"
 #   curl -fsSL 'https://s3.amazonaws.com/spec.ccfc.min/?list-type=2&prefix=firecracker-ci/v1.15/x86_64/vmlinux-6.1.'
 KERNEL_VERSION="${SPACE_FC_KERNEL_VERSION:-6.1.155}"
 KERNEL_SHA256="${SPACE_FC_KERNEL_SHA256:-e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2}"
-# The devbox image's kernels are matched by series, as before.
+# Candidates among the devbox image's kernels are matched by series; only one
+# at the pinned sha256 is staged.
 KERNEL_SERIES="${SPACE_FC_KERNEL_SERIES:-vmlinux-${KERNEL_VERSION%.*}}"
 # shellcheck source=lib/kind-host-paths.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/kind-host-paths.sh"
@@ -56,7 +59,44 @@ require_bin() {
     command -v "$bin" >/dev/null 2>&1 || die "required binary missing: $bin"
   done
 }
-require_bin curl tar
+
+# `firecracker/default` is a symlink to firecracker/$FC_VERSION, so the kernel
+# staged under $FC_VERSION/kernel/ also resolves at default/kernel/.
+kernel_dir="$VENDOR_ROOT/firecracker/$FC_VERSION/kernel"
+# The pinned sha256 with the size and mtime of the kernel it was checked
+# against, so an unchanged kernel is not hashed again on every run and a
+# replaced one is. A dotfile, which the node services' kernel scans skip.
+kernel_stamp="$kernel_dir/.vmlinux.bin.sha256"
+
+file_sha256() { sha256sum "$1" | awk '{print $1}'; }
+kernel_fingerprint() { stat -c '%s %Y' "$1"; }
+
+firecracker_current() {
+  local bin_dir="$VENDOR_ROOT/firecracker/$FC_VERSION/bin" installed
+  [[ -x "$bin_dir/firecracker" && -x "$bin_dir/jailer" ]] || return 1
+  installed=$("$bin_dir/firecracker" --version 2>&1 | awk '/^Firecracker/ {print $2}' | head -1)
+  [[ "$installed" == "$FC_VERSION" ]] || return 1
+  [[ "$(readlink "$VENDOR_ROOT/firecracker/default" 2>/dev/null)" == "$FC_VERSION" ]]
+}
+
+# The staged kernel is the pinned one: by its stamp while the file is
+# unchanged, else by hashing it.
+kernel_current() {
+  local kernel="$kernel_dir/vmlinux.bin"
+  [[ -f "$kernel" && ! -L "$kernel" ]] || return 1
+  if [[ -f "$kernel_stamp" \
+        && "$(cat "$kernel_stamp")" == "$KERNEL_SHA256 $(kernel_fingerprint "$kernel")" ]]; then
+    return 0
+  fi
+  [[ "$(file_sha256 "$kernel")" == "$KERNEL_SHA256" ]]
+}
+
+if [[ "${1:-}" == --check ]]; then
+  firecracker_current && kernel_current
+  exit
+fi
+
+require_bin curl tar sha256sum stat
 
 # On some devbox images the parent ~/.space-devbox tree is pre-provisioned
 # with `vendor/` owned by root. Sudo-chown to the current user once so this script
@@ -189,14 +229,11 @@ fi
 ln -sfn "$FC_VERSION" "$VENDOR_ROOT/firecracker/default"
 
 # ── Guest kernel (vmlinux) ──────────────────────────────────────────────────
-# Pulled from the upstream firecracker-ci public S3 bucket. The bucket is
-# anonymously readable (no creds required); we use plain curl.
-#
-# Note: `firecracker/default` is a symlink to firecracker/$FC_VERSION (set
-# above), so writing the kernel under $FC_VERSION/kernel/ also makes it
-# resolvable at default/kernel/. We don't create a separate
-# default/kernel/vmlinux.bin — that would be a self-referencing symlink.
-kernel_dir="$VENDOR_ROOT/firecracker/$FC_VERSION/kernel"
+# Every kernel staged here, whatever its source, is the pinned one: a kernel
+# already present, one the devbox image provides, or one downloaded from the
+# upstream firecracker-ci public S3 bucket (anonymously readable; plain curl).
+# Each is checked against KERNEL_SHA256, and one that does not match is
+# replaced, so a host staged before a pin change stages the new kernel.
 mkdir -p "$kernel_dir"
 # If a previous bad run left a self-referencing symlink at the destination,
 # remove it before the actual download.
@@ -204,34 +241,81 @@ if [[ -L "$kernel_dir/vmlinux.bin" && ! -e "$kernel_dir/vmlinux.bin" ]]; then
   log "removing dangling symlink at $kernel_dir/vmlinux.bin"
   rm -f "$kernel_dir/vmlinux.bin"
 fi
-image_kernel="$(ls -d "$IMAGE_VENDOR_ROOT"/kernels/"$KERNEL_SERIES".*/vmlinux.bin 2>/dev/null | sort -V | tail -1 || true)"
-if [[ -f "$kernel_dir/vmlinux.bin" && ! -L "$kernel_dir/vmlinux.bin" ]]; then
-  log "vmlinux already present at $kernel_dir/vmlinux.bin"
-elif [[ -n "$image_kernel" && -f "$image_kernel" ]]; then
-  log "staging image-provided kernel $(basename "$(dirname "$image_kernel")") from $IMAGE_VENDOR_ROOT"
-  rm -f "$kernel_dir/vmlinux.bin"
-  install -m 0644 "$image_kernel" "$kernel_dir/vmlinux.bin"
-else
-  kernel_key="firecracker-ci/${FC_CI_VERSION}/${ARCH}/vmlinux-${KERNEL_VERSION}"
-  log "downloading $kernel_key"
-  rm -f "$kernel_dir/vmlinux.bin"   # in case a stale symlink survived
-  # Into a temporary file beside the destination, renamed only once its
-  # checksum matches: an interrupted or corrupt download never becomes the
-  # "already present" kernel of the next run. The retries are the Firecracker
-  # download's above.
-  kernel_tmp="$(mktemp "$kernel_dir/.vmlinux.bin.XXXXXX")"
-  trap 'rm -f "$kernel_tmp"' EXIT
-  curl -fsSL --retry 6 --retry-all-errors \
-    "https://s3.amazonaws.com/spec.ccfc.min/${kernel_key}" -o "$kernel_tmp" \
-    || die "failed to download $kernel_key; check network egress to s3.amazonaws.com"
-  kernel_sha256="$(sha256sum "$kernel_tmp" | awk '{print $1}')"
-  [[ "$kernel_sha256" == "$KERNEL_SHA256" ]] \
-    || die "$kernel_key has sha256 $kernel_sha256, not the pinned $KERNEL_SHA256; set SPACE_FC_KERNEL_SHA256 only after checking the new object"
+
+# Renamed into place only at the pinned checksum: an interrupted copy or
+# download never becomes the next run's present kernel.
+kernel_tmp=""
+trap 'rm -f "${kernel_tmp:-}"' EXIT
+stage_kernel() {
+  local source="$1" got
+  got="$(file_sha256 "$kernel_tmp")"
+  [[ "$got" == "$KERNEL_SHA256" ]] || return 1
   chmod 0644 "$kernel_tmp"
+  rm -f "$kernel_dir/vmlinux.bin"
   mv -f "$kernel_tmp" "$kernel_dir/vmlinux.bin"
-  trap - EXIT
-  log "vmlinux $KERNEL_VERSION (sha256 $kernel_sha256) installed at $kernel_dir/vmlinux.bin"
+  kernel_tmp=""
+  printf '%s %s\n' "$KERNEL_SHA256" "$(kernel_fingerprint "$kernel_dir/vmlinux.bin")" >"$kernel_stamp"
+  log "vmlinux $KERNEL_VERSION (sha256 $got) installed at $kernel_dir/vmlinux.bin from $source"
+}
+
+# Fetch the pinned object into $kernel_tmp. Each attempt has connection and
+# transfer deadlines, and aborts a transfer that stalls, so a hung S3
+# connection costs minutes rather than the job's timeout. A timeout, a reset
+# connection or a 408, 429 or 5xx is retried with a doubling backoff; any
+# other HTTP error, such as the 404 of a mistyped SPACE_FC_KERNEL_VERSION,
+# fails at once.
+download_kernel() {
+  local url="$1" attempts=5 delay=2 attempt status code
+  for ((attempt = 1; ; attempt++)); do
+    status=0
+    code="$(curl -sSL --connect-timeout 20 --max-time 300 --speed-limit 10240 --speed-time 60 \
+      -w '%{http_code}' -o "$kernel_tmp" "$url")" || status=$?
+    if [[ "$status" -eq 0 && "$code" == 200 ]]; then
+      return 0
+    fi
+    if [[ "$code" =~ ^[1-4][0-9][0-9]$ && "$code" != 408 && "$code" != 429 ]]; then
+      die "$url answered HTTP $code; check SPACE_FC_KERNEL_VERSION and network egress to s3.amazonaws.com"
+    fi
+    if ((attempt >= attempts)); then
+      die "failed to download $url after $attempts attempts (curl exit $status, HTTP $code); check network egress to s3.amazonaws.com"
+    fi
+    log "kernel download failed (curl exit $status, HTTP $code; attempt $attempt/$attempts); retrying in ${delay}s"
+    sleep "$delay"
+    delay=$((delay * 2))
+  done
+}
+
+if kernel_current; then
+  printf '%s %s\n' "$KERNEL_SHA256" "$(kernel_fingerprint "$kernel_dir/vmlinux.bin")" >"$kernel_stamp"
+  log "vmlinux already present at $kernel_dir/vmlinux.bin (sha256 $KERNEL_SHA256)"
+else
+  if [[ -e "$kernel_dir/vmlinux.bin" ]]; then
+    log "replacing $kernel_dir/vmlinux.bin: it is not the pinned vmlinux $KERNEL_VERSION (sha256 $KERNEL_SHA256)"
+  fi
+  rm -f "$kernel_stamp"
+  staged=""
+  while IFS= read -r image_kernel; do
+    [[ -f "$image_kernel" ]] || continue
+    kernel_tmp="$(mktemp "$kernel_dir/.vmlinux.bin.XXXXXX")"
+    cp "$image_kernel" "$kernel_tmp"
+    if stage_kernel "image-provided $image_kernel"; then
+      staged=1
+      break
+    fi
+    log "not staging image-provided $image_kernel: its sha256 is not the pinned $KERNEL_SHA256"
+    rm -f "$kernel_tmp"
+    kernel_tmp=""
+  done < <(ls -d "$IMAGE_VENDOR_ROOT"/kernels/"$KERNEL_SERIES".*/vmlinux.bin 2>/dev/null | sort -rV || true)
+  if [[ -z "$staged" ]]; then
+    kernel_key="firecracker-ci/${FC_CI_VERSION}/${ARCH}/vmlinux-${KERNEL_VERSION}"
+    log "downloading $kernel_key"
+    kernel_tmp="$(mktemp "$kernel_dir/.vmlinux.bin.XXXXXX")"
+    download_kernel "https://s3.amazonaws.com/spec.ccfc.min/${kernel_key}"
+    stage_kernel "$kernel_key" \
+      || die "$kernel_key has sha256 $(file_sha256 "$kernel_tmp"), not the pinned $KERNEL_SHA256; set SPACE_FC_KERNEL_SHA256 only after checking the new object"
+  fi
 fi
+trap - EXIT
 
 log "done. vendor tree at $VENDOR_ROOT/firecracker:"
 ls -la "$VENDOR_ROOT/firecracker/" 2>/dev/null | head -10

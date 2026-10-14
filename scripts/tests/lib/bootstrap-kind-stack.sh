@@ -905,7 +905,10 @@ bootstrap_kind_stack__prepare_cluster() {
     kind_stack_config="$(mktemp "${TMPDIR:-/tmp}/kind-cluster-bringup.XXXXXX")"
     kind_render_cluster_config \
         "$REPO_ROOT/infra/space/kind/kind-cluster.yaml.tmpl" "$kind_stack_config"
-    if [[ ! -x "$SPACE_VENDOR_ROOT/$KIND_HOST_PATHS_VENDOR_PROBE" ]]; then
+    # Staged unless the tree lacks this Firecracker release or the pinned
+    # guest kernel, as bootstrap.sh decides.
+    if ! SPACE_VENDOR_ROOT="$SPACE_VENDOR_ROOT" \
+        bash "$REPO_ROOT/infra/space/kind/scripts/install-fc-vendor.sh" --check; then
         echo "[bootstrap] staging Firecracker vendor tree → $SPACE_VENDOR_ROOT"
         SPACE_VENDOR_ROOT="$SPACE_VENDOR_ROOT" \
             bash "$REPO_ROOT/infra/space/kind/scripts/install-fc-vendor.sh"

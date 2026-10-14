@@ -62,9 +62,10 @@ ghcr.io/versity/versitygw:v1.8.0 sha256:97e7d5a35ab758eb1761a9e717644fafc614c5f6
 registry.k8s.io/metrics-server/metrics-server:v0.9.0 sha256:25d291fde59974547bac6f07fa9d6cf6f5bedd1f19d60c893311c5e741e0a42f ghcr.io/perplexityai/space-ci-mirror:metrics-server-v0.9.0
 
 # Source image of the Kind OCI template-build smoke (space_smoke/template_build.py),
-# held here by its pinned index. The builder pulls it from Docker Hub itself,
-# which has no mirror setting yet, so no job reads this copy so far.
-docker.io/library/python:3.12-slim-bookworm@sha256:34386ef0cb081344d7ec1c103ba398e6e9f64e9ab3a1509accc92a4e24a07258 sha256:2ed6491b93cd49272ee6de2b5a38440c3448360322c089fc23e370722d74179d ghcr.io/perplexityai/space-ci-mirror:python-3.12-slim-bookworm public.ecr.aws/docker/library/python
+# which pins this manifest. No job reads this copy yet: the template builder
+# pulls only from Docker Hub, by the image's own repository, so using it needs
+# a builder setting that maps library/python to this package as well.
+docker.io/library/python:3.12-slim-bookworm@sha256:2ed6491b93cd49272ee6de2b5a38440c3448360322c089fc23e370722d74179d sha256:2ed6491b93cd49272ee6de2b5a38440c3448360322c089fc23e370722d74179d ghcr.io/perplexityai/space-ci-mirror:python-3.12-slim-bookworm public.ecr.aws/docker/library/python
 
 # Images the local observability backends run, pinned by their multi-platform
 # index in infra/space/observability/charts/*/values.yaml. The Kind profiles

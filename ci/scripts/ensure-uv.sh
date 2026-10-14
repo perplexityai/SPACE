@@ -11,7 +11,9 @@ LOCAL_UV_BIN="${LOCAL_BIN_DIR}/uv"
 # The release this script installs, as ci/Dockerfile.ci pins it. Each release
 # archive is checked against its sha256, so neither download host can hand CI
 # another uv. To try another release, set SPACE_UV_VERSION and SPACE_UV_SHA256
-# together.
+# together. Each checksum below is the asset's `digest` in GitHub's release
+# API (gh api repos/astral-sh/uv/releases/tags/<version>) and matches the
+# archive both hosts serve.
 UV_VERSION="${SPACE_UV_VERSION:-0.12.18}"
 case "$(uname -s)-$(uname -m)" in
     Linux-x86_64)
@@ -41,15 +43,21 @@ fi
 
 mkdir -p "${LOCAL_BIN_DIR}"
 
+uv_version_of() {
+    "$1" --version 2>/dev/null | awk '{ print $2 }'
+}
+
 # ci/bin/uv is this script's own install, used only at the pinned release.
-if [ -x "${LOCAL_UV_BIN}" ] &&
-    [ "$("${LOCAL_UV_BIN}" --version 2>/dev/null | awk '{ print $2 }')" = "${UV_VERSION}" ]; then
+if [ -x "${LOCAL_UV_BIN}" ] && [ "$(uv_version_of "${LOCAL_UV_BIN}")" = "${UV_VERSION}" ]; then
     printf '%s\n' "${LOCAL_UV_BIN}"
     exit 0
 fi
 
-if command -v uv >/dev/null 2>&1; then
-    printf '%s\n' "$(command -v uv)"
+# A uv on PATH, such as the CI image's, is used as it is, unless
+# SPACE_UV_VERSION asks for another release.
+if path_uv="$(command -v uv)" &&
+    { [ -z "${SPACE_UV_VERSION:-}" ] || [ "$(uv_version_of "${path_uv}")" = "${UV_VERSION}" ]; }; then
+    printf '%s\n' "${path_uv}"
     exit 0
 fi
 
@@ -105,6 +113,7 @@ for ((attempt = 1; ; attempt++)); do
         fi
         tar -xzf "${archive}" -C "${tmp_dir}"
         install -m 0755 "${tmp_dir}/uv-${uv_target}/uv" "${tmp_dir}/uv-${uv_target}/uvx" "${LOCAL_BIN_DIR}/"
+        echo "Installed uv ${UV_VERSION} from ${url}" >&2
         installed=1
         break 2
     done

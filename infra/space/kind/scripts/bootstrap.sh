@@ -136,13 +136,14 @@ kind_render_cluster_config "$KIND_DIR/kind-cluster.yaml.tmpl"
 # ── Step 0b: stage the Firecracker vendor tree ───────────────────────────────
 # The sandbox and builder kind nodes bind-mount $SPACE_VENDOR_ROOT at
 # /space/vendor, where the host runtime-supervisor and the node services read
-# it. Reuse an already staged vendor tree
+# it. Reuse an already staged vendor tree, which `install-fc-vendor.sh
+# --check` confirms holds this Firecracker release and the pinned guest kernel,
 # or run the artifact installer here. The root is
 # named at the call site even though sourcing the library already exported it:
 # one resolved value reaching both the mount and the writer is the whole point
 # of the fix, so the call that stages the tree says which value it is rather
 # than leaving it to an inherited environment.
-if [[ ! -x "$SPACE_VENDOR_ROOT/$KIND_HOST_PATHS_VENDOR_PROBE" ]]; then
+if ! SPACE_VENDOR_ROOT="$SPACE_VENDOR_ROOT" bash "$KIND_DIR/scripts/install-fc-vendor.sh" --check; then
   log "staging Firecracker vendor tree (no sudo) → $SPACE_VENDOR_ROOT"
   SPACE_VENDOR_ROOT="$SPACE_VENDOR_ROOT" bash "$KIND_DIR/scripts/install-fc-vendor.sh"
 else
