@@ -36,13 +36,13 @@ unrecognized value selects Direct, and a Kubernetes init failure is an error,
 not a fallback. Shipped images and Kind enable the feature; a plain
 `cargo build -p pplx-space-api-svc` does not.
 
-What Direct does today (its `Unsupported` and no-op methods, admin routes,
-Kubernetes-only reconcilers and known gaps) is in the `direct.rs` module doc;
-update it with any change to Direct. Don't cite a cluster-controller
-reconciler as the retry path for a failed Direct execution retire or repair;
-the `direct.rs` module doc lists the Kubernetes-only loops. Don't change a
-known gap as a side effect of other work: rejecting or implementing one
-changes Direct behavior and belongs in its own PR.
+What Direct does today (its `Unsupported` and no-op methods, admin routes
+and Kubernetes-only reconcilers) is in the `direct.rs` module doc; update it
+with any change to Direct. Don't cite a cluster-controller reconciler as the
+retry path for a failed Direct execution retire or repair; the `direct.rs`
+module doc lists the Kubernetes-only loops. Don't change what that doc
+records as a side effect of other work: a change to Direct behavior belongs
+in its own PR.
 
 For new work:
 

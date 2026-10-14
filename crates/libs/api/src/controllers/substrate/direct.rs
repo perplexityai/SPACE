@@ -11,13 +11,24 @@
 //!   an execution.
 //! - Warm-pool claims adopt node-side; custom vcpu/memory or encrypted claims
 //!   go cold. Admission-time pool slot claims always miss.
-//! - [`SubstrateError::Unsupported`]: node-pool placement, forks and cluster
-//!   pool configs.
+//! - [`SubstrateError::Unsupported`]: node-pool placement, forks, cluster
+//!   pool configs, and a vCPU or memory override on one-shot create
+//!   (`use_one_shot_create`), whose sbx-mgr `CreateRequest` cannot carry
+//!   them. `create_execution` refuses before any node call, and the shared
+//!   create path's failure handling deletes the row it inserted, best
+//!   effort, as for any substrate create failure. Only a `wait_until_ready`
+//!   cold create can be refused: `CreateBootMode::from_api` already answers
+//!   400 for a snapshot or pool boot with a custom shape. It guards future
+//!   callers: today native and admin creates never wait
+//!   (`controller_create_request`), ECW creates carry no vCPU or memory, and
+//!   fork restores stop at the fork refusal. Disk size is forwarded, and the
+//!   two-call create and start carries the full shape.
 //! - No-ops returning `None` or nothing: `sandbox_ip`, `access_sandbox_ip`,
 //!   `list_inventory_nodes` (Postgres is the inventory),
 //!   `retire_fence_mismatch` and `observe_pod_identities`.
 //!   `retire_execution` ignores its fence, but still stops the sandbox and
-//!   clears its routing.
+//!   clears its routing. It enqueues no stopped-disk backup (see below); the
+//!   stopped disk stays on the node.
 //! - Direct-only: the node registry and the template pull and delete routes in
 //!   `routes/admin/node_maintenance.rs` (501 on Kubernetes).
 //! - No drain or evacuation. After drain-state validation, admin `:drain`,
@@ -33,19 +44,12 @@
 //! it executes. Direct reaches `retire_execution` only through the
 //! transient-lifecycle sweeper's best-effort `cleanup_after_sweep`, and the
 //! sweeper's failed-cleanup retry does nothing unless the running substrate is
-//! Kubernetes, so nothing retries a failed Direct retire.
-//!
-//! # Known gaps
-//!
-//! Both succeed silently today:
-//!
-//! - One-shot create (`use_one_shot_create`) does not forward requested vCPU
-//!   or memory overrides: sbx-mgr's `CreateRequest` has no fields for them, so
-//!   autostart uses node-side defaults and memory policy while
-//!   `public.sandboxes` records the requested values. Disk size is forwarded.
-//! - `retire_execution` never enqueues the stopped-disk backup that
-//!   [`SubstrateAdapter::retire_execution`] documents; the Kubernetes teardown
-//!   does.
+//! Kubernetes, so nothing retries a failed Direct retire. That is also why
+//! Direct's retire enqueues no stopped-disk backup: the Kubernetes teardown
+//! fails its retire when a retryable enqueue fails and relies on that retry,
+//! and even a best-effort enqueue is not a cheap side call, since sbx-mgr
+//! refuses it with `FailedPrecondition` on a node without cluster-api wiring
+//! and otherwise takes a btrfs snapshot of the stopped sandbox.
 
 use pplx_space_common_core::sql;
 use pplx_space_common_svc::sql::contention;
@@ -75,9 +79,9 @@ use super::{
     CreateExecutionRequest, DbContext, ExecutionActivation, ExecutionActivityKind,
     ExecutionBinding, NodeApiTarget, NodeInventoryEntry, OwnedNodeApiTarget, PooledExecutionClaim,
     PooledExecutionClaimAttempt, PooledExecutionClaimRequest, PooledExecutionPoolShape,
-    RetireExecutionOutcome, RetireExecutionRequest, RuntimeClient, SubstrateAdapter,
-    SubstrateCapabilities, SubstrateError, connect_builder, connect_worker, node_api_endpoint,
-    substrate_db_error,
+    RetireExecutionOutcome, RetireExecutionRequest, RuntimeClient, SandboxResources,
+    SubstrateAdapter, SubstrateCapabilities, SubstrateError, connect_builder, connect_worker,
+    node_api_endpoint, substrate_db_error,
 };
 use crate::controllers::auto_lifecycle::policy_to_proto;
 use crate::controllers::{ControllerError, db_contention_error};
@@ -3501,6 +3505,7 @@ impl SubstrateAdapter for DirectSubstrate {
         ensure_direct_create_supported(request.restore_from.is_some())?;
         let one_shot_create =
             use_one_shot_create(request.wait_until_ready, request.template_ref.boot_mode);
+        ensure_direct_create_shape_supported(one_shot_create, request.resources)?;
         let sandbox_id = request.sandbox_id;
         let cached_candidates = self
             .cached_worker_create_candidates(
@@ -3819,6 +3824,8 @@ impl SubstrateAdapter for DirectSubstrate {
         // Unlike `delete_execution`, the stop is the whole operation here, so
         // its outcome must propagate to the caller. Nothing retries a failed
         // Direct retire: the failed-cleanup pass skips every substrate but Kubernetes.
+        // No stopped-disk backup follows the stop, unlike the Kubernetes
+        // teardown, whose enqueue failure relies on that retry.
         client
             .stop_sandbox(pplx_space_sbx_mgr_client::proto::StopRequest {
                 sandbox_id: sandbox_id.to_string(),
@@ -4259,6 +4266,25 @@ impl SubstrateAdapter for DirectSubstrate {
         // its SQL query.
         Ok(None)
     }
+}
+
+/// One-shot create sends a single sbx-mgr `CreateRequest`, which has no vCPU
+/// or memory fields, and sbx-mgr's autostart boots node-side defaults, so the
+/// VM would not match the shape `public.sandboxes` records. Disk size is
+/// forwarded (`rootfs_size_mb`), and the two-call path's `StartRequest`
+/// carries vCPU and memory.
+fn ensure_direct_create_shape_supported(
+    one_shot_create: bool,
+    resources: &SandboxResources,
+) -> Result<(), SubstrateError> {
+    if one_shot_create && (resources.vcpu.is_some() || resources.memory_mib.is_some()) {
+        return Err(SubstrateError::Unsupported {
+            message: "custom vCPU/memory is not supported for one-shot create on the Direct \
+                      substrate"
+                .to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn ensure_direct_create_supported(fork_disk_restore: bool) -> Result<(), SubstrateError> {

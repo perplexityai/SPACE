@@ -2194,8 +2194,8 @@ pub struct SubstrateCapabilities {
     /// fallthrough create takes a configured or policy pool shape, and
     /// otherwise vCPU and memory the request left unset come from the
     /// template's build shape. Without it, the requested shape goes to the
-    /// node unchanged, except that Direct's one-shot create cannot carry vCPU
-    /// or memory (see the [`direct`] module doc).
+    /// node unchanged, except that Direct refuses a one-shot create that sets
+    /// vCPU or memory, which it cannot carry (see the [`direct`] module doc).
     pub resolves_cold_create_shape: bool,
     /// Create requests may carry a Kubernetes node-pool placement pin.
     pub supports_node_pool_placement: bool,
@@ -2258,9 +2258,15 @@ pub trait SubstrateAdapter: Send + Sync {
     /// Retire the active execution object for a sandbox while preserving
     /// node-local sandbox state.
     ///
-    /// Issues an in-VM stop, explicitly enqueues a stopped-disk backup, and
-    /// releases substrate-owned pod/binding state, but never sends the sbx-mgr
-    /// delete that removes the sandbox's filesystem and local-artifact rows.
+    /// Issues an in-VM stop and releases substrate-owned pod/binding state,
+    /// but never sends the sbx-mgr delete that removes the sandbox's
+    /// filesystem and local-artifact rows. Kubernetes also enqueues a
+    /// stopped-disk backup between the stop and the release when the pod has
+    /// a reachable runtime, and keeps the execution tracked for the
+    /// failed-cleanup retry when a retryable enqueue fails; a terminal
+    /// refusal (no sbx-mgr row, a failed sandbox, a full suspend snapshot)
+    /// lets the retire finish without a backup. Direct enqueues none (see the
+    /// [`direct`] module doc): the stopped disk stays on its node.
     /// Failure reconcilers must use this instead of [`Self::delete_execution`]:
     /// a sandbox that reached `failed` mid-suspend may hold its only
     /// up-to-date copy on the node, and retire keeps that copy salvageable

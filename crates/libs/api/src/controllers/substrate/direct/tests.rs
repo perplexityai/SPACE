@@ -2678,6 +2678,225 @@ async fn two_step_direct_create_initializes_identity_for_initial_start() -> Test
     Ok(())
 }
 
+/// A Direct controller over one sim worker that has `seed` cached, so a create
+/// the controller lets through reaches the worker.
+struct DirectCreateFixture {
+    postgres: PostgresFixture,
+    controller: crate::controllers::sandbox::SandboxController,
+    actor: crate::models::User,
+    _server: SimWorkerHarness,
+    worker: SimState,
+}
+
+async fn direct_create_fixture() -> TestResult<Option<DirectCreateFixture>> {
+    let Some(postgres) = postgres_fixture().await? else {
+        return Ok(None);
+    };
+    let node_id = NodeId::new();
+    let (server, worker) = start_sim_worker(node_id).await?;
+    insert_ready_worker(&postgres.pool, node_id, server.endpoint(), "9.0.0").await?;
+    insert_template_inventory(&postgres.pool, node_id, "seed", "hash-seed", "9.0.0").await?;
+    let release_id = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO template_releases (id, template_name, type, hash)
+         VALUES ($1, 'seed', 'fc', 'hash-seed')"
+    ))
+    .bind(release_id)
+    .execute(&postgres.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO template_release_tags (template_release_id, template_name, tag)
+         VALUES ($1, 'seed', 'latest')"
+    ))
+    .bind(release_id)
+    .execute(&postgres.pool)
+    .await?;
+    // The baseline's seeded user, which `insert_sandbox` also owns rows as.
+    let actor = sqlx::query_as::<_, crate::models::User>(sql!(
+        "SELECT id, email, password_hash, display_name, org_id, role, owner_source,
+                created_at, updated_at
+           FROM users
+          WHERE id = '00000000-0000-0000-0000-000000000010'"
+    ))
+    .fetch_one(&postgres.pool)
+    .await?;
+    let controller = crate::controllers::sandbox::SandboxController::new(
+        super::super::Substrate::Direct(Box::new(DirectSubstrate::new(postgres.pool.clone()))),
+    );
+    Ok(Some(DirectCreateFixture {
+        postgres,
+        controller,
+        actor,
+        _server: server,
+        worker,
+    }))
+}
+
+/// A create that takes Direct's one-shot path: it waits for readiness and
+/// boots cold.
+fn one_shot_create_request() -> TestResult<crate::models::CreateSandboxRequest> {
+    Ok(crate::models::CreateSandboxRequest {
+        name: None,
+        template: Some("seed:latest".parse()?),
+        runtime: Some("fc".to_string()),
+        boot_mode: Some("cold".to_string()),
+        env: Default::default(),
+        metadata: Default::default(),
+        vcpu: None,
+        memory_mib: None,
+        disk_mib: None,
+        file_changes: None,
+        auto_lifecycle: None,
+        wait_until_ready: true,
+        network_policy: None,
+        node_pool: None,
+    })
+}
+
+impl DirectCreateFixture {
+    async fn create(
+        &self,
+        request: &crate::models::CreateSandboxRequest,
+    ) -> Result<crate::models::SandboxResponse, ControllerError> {
+        self.controller
+            .create(
+                &self.postgres.pool,
+                &self.actor,
+                request,
+                pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity::native("create"),
+                crate::controllers::sandbox::FederatedSandboxCreateContext::new(None, None),
+            )
+            .await
+    }
+
+    async fn assert_refused_without_a_node_call(
+        &self,
+        request: &crate::models::CreateSandboxRequest,
+    ) -> TestResult {
+        let error = match self.create(request).await {
+            Ok(response) => panic!(
+                "one-shot create with a custom shape created {}",
+                response.id
+            ),
+            Err(error) => error,
+        };
+        assert_eq!(error.status(), axum::http::StatusCode::NOT_IMPLEMENTED);
+        assert!(
+            error.to_string().contains("one-shot create"),
+            "unexpected refusal: {error}"
+        );
+        let sandbox_rows = sqlx::query_scalar::<_, i64>(sql!("SELECT COUNT(*) FROM sandboxes"))
+            .fetch_one(&self.postgres.pool)
+            .await?;
+        assert_eq!(sandbox_rows, 0, "the failed create must not leave its row");
+        assert!(
+            self.worker.list().await.is_empty(),
+            "the refusal must precede the worker create"
+        );
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn one_shot_direct_create_boots_a_default_shape_on_the_worker() -> TestResult {
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let Some(fixture) = direct_create_fixture().await? else {
+        return Ok(());
+    };
+
+    let response = fixture.create(&one_shot_create_request()?).await?;
+
+    assert_eq!(response.lifecycle.as_deref(), Some("started"));
+    fixture.worker.get(&response.id.to_string()).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn one_shot_direct_create_refuses_a_custom_vcpu() -> TestResult {
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let Some(fixture) = direct_create_fixture().await? else {
+        return Ok(());
+    };
+    let mut request = one_shot_create_request()?;
+    request.vcpu = Some(4);
+
+    fixture.assert_refused_without_a_node_call(&request).await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn one_shot_direct_create_refuses_a_custom_memory() -> TestResult {
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let Some(fixture) = direct_create_fixture().await? else {
+        return Ok(());
+    };
+    let mut request = one_shot_create_request()?;
+    request.memory_mib = Some(2048);
+
+    fixture.assert_refused_without_a_node_call(&request).await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn one_shot_direct_create_refuses_a_custom_vcpu_with_an_inferred_cold_boot() -> TestResult {
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let Some(fixture) = direct_create_fixture().await? else {
+        return Ok(());
+    };
+    // A custom shape without a boot mode boots cold (`CreateBootMode::from_api`).
+    let mut request = one_shot_create_request()?;
+    request.boot_mode = None;
+    request.vcpu = Some(4);
+
+    fixture.assert_refused_without_a_node_call(&request).await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn two_call_direct_create_boots_a_custom_shape_on_the_worker() -> TestResult {
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let Some(fixture) = direct_create_fixture().await? else {
+        return Ok(());
+    };
+    // The shape the native create operation sends (`controller_create_request`):
+    // no boot mode and no readiness wait, so the create and start are two calls.
+    let mut request = one_shot_create_request()?;
+    request.boot_mode = None;
+    request.wait_until_ready = false;
+    request.vcpu = Some(4);
+    request.memory_mib = Some(2048);
+
+    let response = fixture.create(&request).await?;
+
+    fixture.worker.get(&response.id.to_string()).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn one_shot_direct_create_accepts_a_custom_disk() -> TestResult {
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let Some(fixture) = direct_create_fixture().await? else {
+        return Ok(());
+    };
+    // One-shot create forwards disk size (`rootfs_size_mb`).
+    let mut request = one_shot_create_request()?;
+    request.disk_mib = Some(4096);
+
+    let response = fixture.create(&request).await?;
+
+    fixture.worker.get(&response.id.to_string()).await?;
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn live_cpu_update_preserves_allocation_across_cold_restart() -> TestResult {
     if !crate::test_support::enter_sim_worker_process() {
