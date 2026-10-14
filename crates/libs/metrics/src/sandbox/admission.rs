@@ -266,7 +266,7 @@ pub fn cluster_eligible_nodes(value: u64) {
 }
 
 metric_vocabulary! {
-    /// Result of operator egress profile selection on a sandbox create.
+    /// Result of operator egress profile selection or saved-selection resolution.
     EgressProfileOutcome {
         Ready => "ready",
         InvalidRequest => "invalid_request",

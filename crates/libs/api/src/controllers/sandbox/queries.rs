@@ -1244,8 +1244,7 @@ impl SandboxController {
             req.network_policy.clone()
         } else {
             self.egress_profiles
-                .resolve(&egress_profiles)
-                .map_err(|error| ControllerError::bad_request(error.to_string()))?
+                .resolve(&egress_profiles)?
                 .compose_override(req.network_policy.clone(), Some(&template_network_policy))?
         };
         let network_policy_override = crate::tls_interception_exemptions::compose(

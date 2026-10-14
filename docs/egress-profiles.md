@@ -38,9 +38,9 @@ denies still win; TLS exemptions do not themselves allow traffic.
 The sandbox stores the selected names in `egress_profiles`, a PostgreSQL
 text array. Selection is immutable for its lifetime; definitions are not stored.
 Fresh creates, tenant policy replacement, and explicit template inheritance resolve
-those names against the handling process's current configuration. A missing name
-fails composition without replacing the saved policy. Defaults are applied only
-at admission, never when resolving a saved selection.
+those names against the handling process's current configuration. A missing saved
+name returns HTTP 503 without replacing the policy; queued creates retry.
+Defaults apply only at admission, never when resolving a saved selection.
 
 Native queued creates persist the names, including an explicit empty array, and
 resolve definitions at execution. Nonempty selections participate in idempotency
@@ -48,15 +48,18 @@ matching; empty selections retain the pre-profile fingerprint.
 
 Running sandboxes and lifecycle operations (stop/start, pause/resume,
 suspend/restore, rollback, and forks) retain the saved effective policy. Forks
-also carry the selected names. To apply definition changes, explicitly replace
-the policy or inherit the template default on each affected sandbox, including
-fork descendants, or recreate it. Keep selected profiles defined while doing
-this: removing a name fails composition rather than revoking its saved policy.
+also carry the selected names. The original tenant base is not stored. To refresh
+destinations, recreate with the intended policy or inherit the template default
+(which discards tenant overrides). Replacement resolves current definitions only
+against the supplied policy: supply a fresh, uncomposed tenant base. Resubmitting
+the saved effective policy retains old profile allows as tenant allows. Keep
+selected profiles configured while replacing or inheriting policies.
 
 `space.sandbox.egress_profile_admission{profile,outcome,reason}` reports `ok/ready`
 for selected profiles and `failed/invalid_request` or `failed/unconfigured` for
-invalid selections. Invalid and unknown names use `profile:unknown`, keeping
-untrusted names out of metric cardinality. Alert on failed admissions.
+invalid selections and missing saved definitions. Untrusted names at admission
+use `profile:unknown`; missing saved definitions use the previously admitted name.
+Alert on `failed/unconfigured` for configuration drift.
 
 Upgrade database schemas and queued operation executors before API producers.
 Configure every API replica before callers send selections or rely on changed

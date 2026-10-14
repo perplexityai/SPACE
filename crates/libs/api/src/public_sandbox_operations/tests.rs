@@ -188,6 +188,19 @@ async fn native_create_executor_preserves_operator_policy_across_replacements() 
             }
             .into_json();
 
+            if federated {
+                let unconfigured = CreateSandboxOperationExecutor::new(
+                    db.pool.clone(),
+                    executor
+                        .controller
+                        .clone()
+                        .with_egress_profiles(Default::default()),
+                );
+                let result = Box::pin(unconfigured.execute(&operation)).await;
+                assert_eq!(result.state, OperationState::Queued, "{result:?}");
+                assert_eq!(result.retry_after, Some(CREATE_RETRY_AFTER));
+                assert!(fetch_sandbox(&db.pool, sandbox_id).await?.is_none());
+            }
             let result = Box::pin(executor.execute(&operation)).await;
             assert_eq!(result.state, OperationState::Succeeded, "{result:?}");
             let persisted: Option<sqlx::types::Json<NetworkPolicyV1>> = sqlx::query_scalar(sql!(
@@ -240,7 +253,7 @@ async fn native_create_executor_preserves_operator_policy_across_replacements() 
                         ),
                     ));
                     let sandbox = fetch_sandbox(&db.pool, sandbox_id).await?.unwrap();
-                    executor
+                    let error = executor
                         .controller
                         .clone()
                         .with_egress_profiles(Default::default())
@@ -254,6 +267,7 @@ async fn native_create_executor_preserves_operator_policy_across_replacements() 
                         )
                         .await
                         .expect_err("missing selected profile must fail composition");
+                    assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
                     assert_eq!(
                         fetch_sandbox(&db.pool, sandbox_id)
                             .await?

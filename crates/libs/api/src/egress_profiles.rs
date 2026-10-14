@@ -190,7 +190,7 @@ impl EgressProfiles {
     pub(crate) fn resolve(
         &self,
         selection: &EgressProfileSelection,
-    ) -> Result<Self, EgressProfileSelectionError> {
+    ) -> Result<Self, crate::controllers::ControllerError> {
         selection
             .names
             .iter()
@@ -199,7 +199,13 @@ impl EgressProfiles {
                     .get(name)
                     .cloned()
                     .map(|profile| (name.clone(), profile))
-                    .ok_or_else(|| EgressProfileSelectionError::Unconfigured(name.0.clone()))
+                    .ok_or_else(|| {
+                        egress_profile(&name.0, EgressProfileOutcome::Unconfigured);
+                        crate::controllers::ControllerError::service_unavailable(format!(
+                            "saved egress profile is not configured: {}",
+                            name.0
+                        ))
+                    })
             })
             .collect::<Result<_, _>>()
             .map(Self)

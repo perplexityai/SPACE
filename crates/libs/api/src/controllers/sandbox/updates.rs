@@ -342,17 +342,13 @@ impl SandboxController {
             "inherit_template_default"
         };
         let profiles = crate::egress_profiles::load(pool, sandbox.id).await?;
-        let policy_override = self
-            .egress_profiles
-            .resolve(&profiles)
-            .map_err(|error| ControllerError::bad_request(error.to_string()))?
-            .compose_override(
-                policy_override,
-                sandbox
-                    .template_network_policy
-                    .as_ref()
-                    .map(|policy| &policy.0),
-            )?;
+        let policy_override = self.egress_profiles.resolve(&profiles)?.compose_override(
+            policy_override,
+            sandbox
+                .template_network_policy
+                .as_ref()
+                .map(|policy| &policy.0),
+        )?;
         let policy_override = crate::tls_interception_exemptions::compose(
             self.tls_interception_exemptions.as_ref(),
             policy_override,
