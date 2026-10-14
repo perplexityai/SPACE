@@ -9,13 +9,9 @@ RUN chmod 0644 /etc/ssl/certs/ca-certificates.crt \
     && sed -i "s|^URIs:.*|URIs: https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/|" \
         /etc/apt/sources.list.d/ubuntu.sources
 
-FROM base AS build
-
-ARG KERNEL_VERSION
-ARG FIRECRACKER_CI_VERSION
-ARG KERNEL_SOURCE_COMMIT
-ARG BASE_CONFIG_SHA256
-ARG CONFIG_FRAGMENT
+# The build toolchain is its own stage so that CI can cache it without the
+# kernel compile (ci.sh).
+FROM base AS toolchain
 
 RUN apt-get -o Acquire::Retries=5 update --error-on=any \
     && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install --yes --no-install-recommends \
@@ -33,6 +29,16 @@ RUN apt-get -o Acquire::Retries=5 update --error-on=any \
         openssl \
         python3 \
     && rm -rf /var/lib/apt/lists/*
+
+FROM toolchain AS build
+
+# Declared after the toolchain: a RUN depends on every ARG declared before it,
+# so a kernel bump would otherwise reinstall the packages.
+ARG KERNEL_VERSION
+ARG FIRECRACKER_CI_VERSION
+ARG KERNEL_SOURCE_COMMIT
+ARG BASE_CONFIG_SHA256
+ARG CONFIG_FRAGMENT
 
 WORKDIR /build
 RUN test -n "${KERNEL_VERSION}" \
