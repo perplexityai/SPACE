@@ -204,9 +204,11 @@ pub(super) async fn pause_with_reconciliation(
     ) {
         // The quarantine compare-and-set refuses a row that left `pausing`,
         // which is how a Stop that killed the VM mid-pause surfaces here. It
-        // answers false only when its own write did not apply, so a
-        // `quarantined` row was quarantined by another writer. A failed read
-        // or a missing row still reports pause's quarantine.
+        // also answers false on a poisoned connection or a database error, so
+        // the row is read again: a row found outside `pausing`, a
+        // `quarantined` one included, was moved by another writer. A failed
+        // read, a missing row or a row still `pausing` reports pause's
+        // quarantine.
         let found = crate::node_state_sync::connection_or_signal_failure(db)
             .ok()
             .and_then(|db| {

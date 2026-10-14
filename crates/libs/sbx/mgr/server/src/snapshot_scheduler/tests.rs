@@ -202,6 +202,19 @@ fn checkpoint_admission_writes_only_over_a_started_or_paused_row() {
     }
 }
 
+/// A missing row keeps the text the retired generic writer's outcome rendered.
+#[test]
+fn checkpoint_admission_of_a_missing_row_reports_it() {
+    let db = crate::db::test_conn();
+    let before = crate::db::tests::database_rows(&db);
+
+    assert_eq!(
+        begin_checkpoint_state(&db, &SandboxId::new().to_string()).unwrap_err(),
+        "sandbox state write was not applied: missing"
+    );
+    assert_eq!(crate::db::tests::database_rows(&db), before);
+}
+
 #[tokio::test]
 async fn skipped_checkpoint_never_publishes_an_artifact() {
     let cases = SandboxState::all()

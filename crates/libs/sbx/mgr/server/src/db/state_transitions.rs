@@ -48,136 +48,6 @@ pub enum SupersedeActivationError {
     StateWriteNotApplied(#[from] SandboxStateWriteNotApplied),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[must_use = "callers must distinguish an applied state write from a superseded one"]
-pub enum SandboxStateWriteOutcome {
-    Applied,
-    Missing,
-    BlockedByQuarantine,
-    SupersededByCleanupEpisode,
-}
-
-impl SandboxStateWriteOutcome {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Applied => "applied",
-            Self::Missing => "missing",
-            Self::BlockedByQuarantine => "blocked_by_quarantine",
-            Self::SupersededByCleanupEpisode => "superseded_by_cleanup_episode",
-        }
-    }
-
-    pub const fn is_applied(self) -> bool {
-        matches!(self, Self::Applied)
-    }
-
-    pub fn require_applied(self) -> std::result::Result<(), SandboxStateWriteNotApplied> {
-        if self.is_applied() {
-            Ok(())
-        } else {
-            Err(SandboxStateWriteNotApplied { outcome: self })
-        }
-    }
-}
-
-impl fmt::Display for SandboxStateWriteOutcome {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("sandbox state write was not applied: {outcome}")]
-pub struct SandboxStateWriteNotApplied {
-    pub outcome: SandboxStateWriteOutcome,
-}
-
-pub fn update_state(
-    conn: &Connection,
-    id: &str,
-    state: SandboxState,
-) -> Result<SandboxStateWriteOutcome> {
-    if matches!(state, SandboxState::Quarantined | SandboxState::Failed) {
-        return Err(rusqlite::Error::InvalidQuery);
-    }
-    if state == SandboxState::Deleting && conn.is_autocommit() {
-        let tx = immediate_transaction(conn)?;
-        let outcome = update_state(&tx, id, state)?;
-        tx.commit()?;
-        return Ok(outcome);
-    }
-    let previous_state = current_state_label(conn, id)?;
-    let previous_state_value = previous_state
-        .as_deref()
-        .and_then(|state| state.parse::<SandboxState>().ok());
-    match generic_state_write_refusal(conn, id, previous_state_value, state)? {
-        Some(StateWriteRefusal::Quarantined) => {
-            tracing::warn!(
-                sandbox_id = %id,
-                target_state = %state,
-                "ignored generic sandbox state update because sandbox is quarantined"
-            );
-            return Ok(SandboxStateWriteOutcome::BlockedByQuarantine);
-        }
-        // The generic guards never answer `FromState`.
-        Some(StateWriteRefusal::CleanupOwned | StateWriteRefusal::FromState) => {
-            tracing::warn!(
-                sandbox_id = %id,
-                target_state = %state,
-                "ignored generic sandbox state update because cleanup owns the transition"
-            );
-            return Ok(SandboxStateWriteOutcome::SupersededByCleanupEpisode);
-        }
-        None => {}
-    }
-
-    let changed = conn.execute(
-        "UPDATE sandboxes
-         SET state = ?1,
-             state_changed_at = CASE WHEN state IS NOT ?1 THEN ?2 ELSE state_changed_at END,
-             failure_reason = NULL,
-             restore_origin = CASE WHEN ?1 = 'restoring' THEN restore_origin ELSE NULL END,
-             restore_phase = CASE WHEN ?1 = 'restoring' THEN restore_phase ELSE NULL END,
-             restore_storage_uri = CASE WHEN ?1 = 'restoring' THEN restore_storage_uri ELSE NULL END,
-             transition_receipt_id = CASE
-                 WHEN ?1 = transition_receipt_target_state THEN transition_receipt_id
-                 ELSE NULL
-             END,
-             transition_receipt_kind = CASE
-                 WHEN ?1 = transition_receipt_target_state THEN transition_receipt_kind
-                 ELSE NULL
-             END,
-             transition_receipt_target_state = CASE
-                 WHEN ?1 = transition_receipt_target_state THEN transition_receipt_target_state
-                 ELSE NULL
-             END,
-             transition_receipt_execution_generation = CASE
-                 WHEN ?1 = transition_receipt_target_state THEN transition_receipt_execution_generation
-                 ELSE NULL
-             END,
-             transition_receipt_activation_attempt_id = CASE
-                 WHEN ?1 = transition_receipt_target_state THEN transition_receipt_activation_attempt_id
-                 ELSE NULL
-             END,
-             transition_receipt_reason_code = CASE
-                 WHEN ?1 = transition_receipt_target_state THEN transition_receipt_reason_code
-                 ELSE NULL
-             END,
-             updated_at = ?2
-         WHERE id = ?3
-           AND (?1 = 'deleting' OR state != 'quarantined')",
-        params![state.as_str(), now()?, id],
-    )?;
-    if changed != 0 && state == SandboxState::Deleting {
-        teardown_jobs::fail_active(conn, id, TeardownSuspendFailure::Deleting)?;
-    }
-    Ok(if changed == 0 {
-        SandboxStateWriteOutcome::Missing
-    } else {
-        SandboxStateWriteOutcome::Applied
-    })
-}
-
 pub(crate) fn restore_checkpoint_state(
     conn: &Connection,
     id: &str,
@@ -199,9 +69,10 @@ pub(crate) fn restore_checkpoint_state(
     Ok(changed == 1)
 }
 
-/// Fence policy installation and Paused -> Resuming in one transaction.
-/// An absent generation matches only an identity-free legacy resident; it is
-/// never a wildcard for an execution that has acquired a generation.
+/// Fence policy installation and `paused` -> `resuming` in one transaction:
+/// [`edges::RESUME_BEGIN`] refuses any other state. An absent generation
+/// matches only an identity-free legacy resident; it is never a wildcard for an
+/// execution that has acquired a generation.
 pub(crate) fn begin_resident_resume_with_policy(
     conn: &Connection,
     id: &str,
@@ -212,13 +83,12 @@ pub(crate) fn begin_resident_resume_with_policy(
     let Some(sandbox) = get_sandbox(&tx, id)? else {
         return Ok(false);
     };
-    if sandbox.state != SandboxState::Paused
-        || sandbox.space_api_route_identity.execution_generation != generation
-    {
+    if sandbox.space_api_route_identity.execution_generation != generation {
         return Ok(false);
     }
-    if update_state(&tx, id, SandboxState::Resuming)? != SandboxStateWriteOutcome::Applied {
-        return Ok(false);
+    match update_state_from(&tx, id, &edges::RESUME_BEGIN)? {
+        StateWriteOutcome::Applied { .. } => {}
+        StateWriteOutcome::Refused { .. } | StateWriteOutcome::Missing => return Ok(false),
     }
     install_activation_auto_lifecycle(&tx, id, policy)?;
     tx.commit()?;
@@ -311,7 +181,7 @@ pub(crate) fn update_state_superseding_activation_in_transaction(
             params![id, episode.completion.as_str(), episode.keep_filesystem],
         )?;
     }
-    update_state(conn, id, state)?.require_applied()?;
+    write_cleanup_admission_state(conn, id, state)??;
     Ok(())
 }
 

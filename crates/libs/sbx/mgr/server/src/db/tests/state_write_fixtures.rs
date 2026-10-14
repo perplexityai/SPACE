@@ -18,9 +18,11 @@ use rusqlite::{Connection, params};
 
 use super::{TestSandboxInsert, insert_test_sandbox};
 use crate::db::{
-    CleanupCompletion, CleanupEpisodeSpec, InsertSandboxParams, ORPHANED_SANDBOX_OWNER,
-    ORPHANED_SANDBOX_TEMPLATE, PolicyAuthority, begin_suspend, complete_row_intent_cleanup_for_job,
-    ensure_teardown_suspend_operation, insert_sandbox_with_cleanup_episode_and_route_evidence,
+    CleanupCompletion, CleanupEpisodeSpec, Edge, InsertSandboxParams, ORPHANED_SANDBOX_OWNER,
+    ORPHANED_SANDBOX_TEMPLATE, PolicyAuthority, StateWriteOutcome, begin_suspend,
+    complete_row_intent_cleanup_for_job, ensure_teardown_suspend_operation, immediate_transaction,
+    insert_sandbox_with_cleanup_episode_and_route_evidence, set_cleanup_intent, update_state_from,
+    update_state_superseding_activation_in_transaction,
 };
 use crate::state::SandboxState;
 
@@ -385,6 +387,38 @@ pub(crate) fn force_state(conn: &Connection, id: &str, state: SandboxState) {
         params![state.as_str(), restoring, id, RESTORE_STORAGE_URI],
     )
     .unwrap();
+}
+
+/// Write `edge` with `update_state_from`, which must apply.
+pub(crate) fn apply_edge(conn: &Connection, id: &str, edge: &'static Edge) {
+    let outcome = update_state_from(conn, id, edge).unwrap();
+    assert!(
+        matches!(outcome, StateWriteOutcome::Applied { .. }),
+        "{}: {outcome:?}",
+        edge.name()
+    );
+}
+
+/// A non-blocking Stop's admission transaction, as the cleanup fence runs it:
+/// supersede any activation, write `stopping` and persist the `mark_stopped`
+/// intent.
+pub(crate) fn admit_stop(conn: &Connection, id: &str) {
+    let tx = immediate_transaction(conn).unwrap();
+    update_state_superseding_activation_in_transaction(&tx, id, SandboxState::Stopping).unwrap();
+    assert!(set_cleanup_intent(&tx, id, true, CleanupCompletion::MarkStopped).unwrap());
+    tx.commit().unwrap();
+}
+
+/// Stop's row-intent completion of [`admit_stop`]: `stopping` to `stopped`.
+pub(crate) fn complete_stop(conn: &Connection, id: &str) {
+    complete_row_intent_cleanup_for_job(conn, id, CleanupCompletion::MarkStopped, None, None, None)
+        .unwrap();
+}
+
+/// A non-blocking Stop from admission to completion.
+pub(crate) fn stop(conn: &Connection, id: &str) {
+    admit_stop(conn, id);
+    complete_stop(conn, id);
 }
 
 pub(super) const RESTORE_STORAGE_URI: &str = "s3://snapshots/suspend/restore?region=us-east-1";

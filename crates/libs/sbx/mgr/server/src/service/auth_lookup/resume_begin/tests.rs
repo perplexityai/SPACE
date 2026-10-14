@@ -19,7 +19,6 @@ use pplx_space_node_mgr_client::proto::{ResumeSandboxRequest, ResumeSandboxRespo
 use tonic::{Code, Status};
 
 use super::BEGIN_BARRIER;
-use crate::db::CleanupCompletion;
 use crate::db::tests::state_write_fixtures::snapshot;
 use crate::node_manager_transport::fake::FakeNodeManager;
 use crate::proto::ResumeRequest;
@@ -157,29 +156,7 @@ fn move_row(conn: &rusqlite::Connection, id: &str, found: Found) {
     };
     match state {
         SandboxState::Paused => {}
-        SandboxState::Stopped => {
-            let tx = crate::db::immediate_transaction(conn).unwrap();
-            crate::db::update_state_superseding_activation_in_transaction(
-                &tx,
-                id,
-                SandboxState::Stopping,
-            )
-            .unwrap();
-            assert!(
-                crate::db::set_cleanup_intent(&tx, id, true, CleanupCompletion::MarkStopped)
-                    .unwrap()
-            );
-            tx.commit().unwrap();
-            crate::db::complete_row_intent_cleanup_for_job(
-                conn,
-                id,
-                CleanupCompletion::MarkStopped,
-                None,
-                None,
-                None,
-            )
-            .unwrap();
-        }
+        SandboxState::Stopped => crate::db::tests::state_write_fixtures::stop(conn, id),
         state => {
             // The schema ties the restore columns to `restoring`.
             conn.execute(

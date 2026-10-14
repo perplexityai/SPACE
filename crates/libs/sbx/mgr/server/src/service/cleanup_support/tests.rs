@@ -14,13 +14,10 @@ use tokio_util::task::TaskTracker;
 use tonic::Code;
 
 use super::{
-    StateWriteGuard, StateWriteRejected, require_state_write, require_state_write_from,
-    state_write_result, update_state_from_best_effort,
+    StateWriteRejected, require_state_write_from, state_write_result, update_state_from_best_effort,
 };
 use crate::db::tests::state_write_fixtures::{assert_unchanged, snapshot};
-use crate::db::{
-    Edge, SandboxStateWriteOutcome, StateSet, StateWriteOutcome, StateWriteRefusal, edges,
-};
+use crate::db::{Edge, StateSet, StateWriteGuard, StateWriteOutcome, StateWriteRefusal, edges};
 use crate::service::drain::{CriticalTaskGuard, DrainState};
 use crate::service::tests::service_tests::insert_test_sandbox;
 use crate::state::SandboxState;
@@ -31,19 +28,21 @@ const CONTEXT: &str = "complete synthetic transition";
 /// until it joins the chain.
 fn refusals() -> Vec<StateWriteRefusal> {
     let next = |refusal| match refusal {
-        StateWriteRefusal::FromState => Some(StateWriteRefusal::Quarantined),
-        StateWriteRefusal::Quarantined => Some(StateWriteRefusal::CleanupOwned),
-        StateWriteRefusal::CleanupOwned => None,
+        StateWriteRefusal::FromState => {
+            Some(StateWriteRefusal::Guard(StateWriteGuard::Quarantined))
+        }
+        StateWriteRefusal::Guard(StateWriteGuard::Quarantined) => {
+            Some(StateWriteRefusal::Guard(StateWriteGuard::CleanupOwned))
+        }
+        StateWriteRefusal::Guard(StateWriteGuard::CleanupOwned) => None,
     };
     std::iter::successors(Some(StateWriteRefusal::FromState), |refusal| next(*refusal)).collect()
 }
 
-/// The messages `require_state_write` returned for `update_state` before
-/// `update_state_from` existed, copied from 8f12bd6: it formats
-/// `"{context}: {SandboxStateWriteNotApplied}"` (`service/cleanup_support.rs`)
-/// over `SandboxStateWriteOutcome::as_str` (`db/state_transitions.rs`), and
-/// `update_state`'s guards answer `BlockedByQuarantine` and
-/// `SupersededByCleanupEpisode` there.
+/// The messages the retired generic `update_state` caller path returned,
+/// copied from 8f12bd6: `"{context}: {SandboxStateWriteNotApplied}"` over
+/// `SandboxStateWriteOutcome::as_str`. Clients still receive them for a guard
+/// refusal and a missing row.
 const BLOCKED_BY_QUARANTINE: &str =
     "complete synthetic transition: sandbox state write was not applied: blocked_by_quarantine";
 const SUPERSEDED_BY_CLEANUP_EPISODE: &str = "complete synthetic transition: sandbox state write \
@@ -69,11 +68,11 @@ fn expected_rejection(outcome: StateWriteOutcome) -> Result<SandboxState, StateW
         StateWriteOutcome::Applied { from } => Ok(from),
         StateWriteOutcome::Refused { found, refusal } => Err(match refusal {
             StateWriteRefusal::FromState => StateWriteRejected::FromState { found },
-            StateWriteRefusal::Quarantined => StateWriteRejected::Guard {
+            StateWriteRefusal::Guard(StateWriteGuard::Quarantined) => StateWriteRejected::Guard {
                 refusal: StateWriteGuard::Quarantined,
                 found,
             },
-            StateWriteRefusal::CleanupOwned => StateWriteRejected::Guard {
+            StateWriteRefusal::Guard(StateWriteGuard::CleanupOwned) => StateWriteRejected::Guard {
                 refusal: StateWriteGuard::CleanupOwned,
                 found,
             },
@@ -90,8 +89,10 @@ fn expected_status(outcome: StateWriteOutcome) -> Result<(), (Code, String)> {
                 Code::Aborted,
                 format!("{CONTEXT}: sandbox state write was superseded: sandbox is {found}"),
             ),
-            StateWriteRefusal::Quarantined => (Code::Aborted, BLOCKED_BY_QUARANTINE.to_owned()),
-            StateWriteRefusal::CleanupOwned => {
+            StateWriteRefusal::Guard(StateWriteGuard::Quarantined) => {
+                (Code::Aborted, BLOCKED_BY_QUARANTINE.to_owned())
+            }
+            StateWriteRefusal::Guard(StateWriteGuard::CleanupOwned) => {
                 (Code::Aborted, SUPERSEDED_BY_CLEANUP_EPISODE.to_owned())
             }
         }),
@@ -129,47 +130,16 @@ fn every_state_write_outcome_has_its_rejection_and_status() {
     }
 }
 
-/// The literals above are still what the `update_state` caller path returns.
 #[test]
-fn update_state_outcomes_keep_their_statuses() {
-    for (outcome, expected) in [
-        (SandboxStateWriteOutcome::Applied, Ok(())),
-        (
-            SandboxStateWriteOutcome::BlockedByQuarantine,
-            Err(BLOCKED_BY_QUARANTINE),
-        ),
-        (
-            SandboxStateWriteOutcome::SupersededByCleanupEpisode,
-            Err(SUPERSEDED_BY_CLEANUP_EPISODE),
-        ),
-        (SandboxStateWriteOutcome::Missing, Err(MISSING)),
-    ] {
-        assert_eq!(
-            code_and_message(require_state_write(Ok(outcome), CONTEXT)),
-            expected.map_err(|message| (Code::Aborted, message.to_owned())),
-            "{outcome}"
-        );
-    }
-}
-
-#[test]
-fn a_database_error_is_internal_as_for_update_state() {
-    let from = code_and_message(require_state_write_from(
-        Err(rusqlite::Error::InvalidQuery),
-        CONTEXT,
-    ));
+fn a_database_error_is_internal() {
     assert_eq!(
-        from,
+        code_and_message(require_state_write_from(
+            Err(rusqlite::Error::InvalidQuery),
+            CONTEXT,
+        )),
         Err((
             Code::Internal,
             "complete synthetic transition: Query is not read-only".to_owned()
-        ))
-    );
-    assert_eq!(
-        from,
-        code_and_message(require_state_write(
-            Err(rusqlite::Error::InvalidQuery),
-            CONTEXT
         ))
     );
 }
@@ -244,10 +214,10 @@ const GUARDED_ROWS: [GuardedRow; 4] = [
     },
 ];
 
-/// For the same row, a guard refusal or a missing row maps to the status the
-/// `update_state` caller path returned, even with the row's state expected.
+/// A guard refusal or a missing row maps to the status the retired generic
+/// caller path returned, even with the row's state expected.
 #[test]
-fn guard_refusals_and_a_missing_row_keep_update_state_statuses() {
+fn guard_refusals_and_a_missing_row_keep_their_statuses() {
     for row in GUARDED_ROWS {
         let conn = crate::db::test_conn();
         let id = SandboxId::new().to_string();
@@ -267,18 +237,12 @@ fn guard_refusals_and_a_missing_row_keep_update_state_statuses() {
             "{}",
             row.name
         );
-        let from = code_and_message(require_state_write_from(Ok(outcome), CONTEXT));
-        let generic = code_and_message(require_state_write(
-            crate::db::update_state(&conn, &id, row.target),
-            CONTEXT,
-        ));
         assert_eq!(
-            from,
+            code_and_message(require_state_write_from(Ok(outcome), CONTEXT)),
             Err((Code::Aborted, row.message.to_owned())),
             "{}",
             row.name
         );
-        assert_eq!(from, generic, "{}", row.name);
         assert_unchanged(row.name, &before, &conn);
     }
 }
@@ -332,7 +296,7 @@ fn best_effort_refusals_change_nothing() {
             Some(SandboxState::Stopping),
             StateWriteOutcome::Refused {
                 found: SandboxState::Stopping,
-                refusal: StateWriteRefusal::CleanupOwned,
+                refusal: StateWriteRefusal::Guard(StateWriteGuard::CleanupOwned),
             },
         ),
         ("missing row", None, StateWriteOutcome::Missing),

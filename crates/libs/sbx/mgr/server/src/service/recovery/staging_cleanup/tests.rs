@@ -140,10 +140,11 @@ async fn staging_cleanup_rediscovery_survives_rollback_failed_deletion_and_resta
         SandboxState::Started,
         SandboxState::Paused,
     ] {
-        crate::db::update_state(&service.db.lock().unwrap(), &id, state)
-            .unwrap()
-            .require_applied()
-            .unwrap();
+        crate::db::tests::state_write_fixtures::force_state(
+            &service.db.lock().unwrap(),
+            &id,
+            state,
+        );
         assert_eq!(sweep(&service, cache.path()), expected);
         assert!(
             suspend_snapshot_publication::find_complete_suspend_snapshot_staging_dir(
@@ -165,10 +166,11 @@ async fn staging_cleanup_rediscovery_survives_rollback_failed_deletion_and_resta
         fresh_id,
         b"new attempt",
     );
-    crate::db::update_state(&service.db.lock().unwrap(), &id, SandboxState::Suspending)
-        .unwrap()
-        .require_applied()
-        .unwrap();
+    crate::db::tests::state_write_fixtures::force_state(
+        &service.db.lock().unwrap(),
+        &id,
+        SandboxState::Suspending,
+    );
     let _wake = service
         .auto_lifecycle
         .wake_lock(&id)

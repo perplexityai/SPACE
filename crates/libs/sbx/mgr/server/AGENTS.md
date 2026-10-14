@@ -2,12 +2,11 @@
 
 ## Changes
 
-- Write `sandboxes.state` only through `src/db` writers. A new transition
-  calls `update_state_from` with its edge, or adds a specialized
-  compare-and-set writer in `src/db`. Do not add `update_state` callers: it
-  overwrites any state its cleanup and quarantine guards admit. Record the
-  edge in `src/db/state_write.rs`, and add any new disagreement with
-  `can_transition_to`, with a reason, to `ALLOWLIST` in
+- Write the node-local SQLite `sandboxes.state` only through `src/db`: every
+  persisted write goes through `update_state_from` with an explicit edge, or
+  through a named specialized writer. A new edge in `src/db/state_write.rs`
+  needs a kind and a doc comment naming its writer; add any new disagreement
+  with `can_transition_to`, with a reason, to `ALLOWLIST` in
   `src/db/tests/state_write_table.rs`. Nothing checks the table against the
   writers; the `&'static Edge` argument does that at call sites. A refused
   write must leave every row unchanged. Map an `update_state_from` outcome to

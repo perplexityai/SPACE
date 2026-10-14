@@ -10,23 +10,13 @@ use pplx_space_common_core::types::SandboxQuarantineReasonCode;
 
 use super::*;
 use crate::db::tests::state_write_fixtures::{
-    assert_unchanged, backdate, force_state, insert_creating, insert_row, seed_receipt,
+    admit_stop, assert_unchanged, backdate, force_state, insert_creating, insert_row, seed_receipt,
     set_failure_reason, snapshot,
 };
 use crate::db::{
     ActivationKind, CleanupCompletion, CleanupEpisodeRequestOutcome,
     CompleteRowIntentCleanupDisposition,
 };
-
-/// A non-blocking Stop's admission transaction: supersede the activation,
-/// write `stopping` and persist the `mark_stopped` intent.
-fn admit_stop(conn: &rusqlite::Connection, id: &str) {
-    let tx = crate::db::immediate_transaction(conn).unwrap();
-    crate::db::update_state_superseding_activation_in_transaction(&tx, id, SandboxState::Stopping)
-        .unwrap();
-    assert!(crate::db::set_cleanup_intent(&tx, id, true, CleanupCompletion::MarkStopped).unwrap());
-    tx.commit().unwrap();
-}
 
 fn state(conn: &rusqlite::Connection, id: &str) -> SandboxState {
     crate::db::get_sandbox(conn, id).unwrap().unwrap().state
@@ -260,7 +250,7 @@ fn check(case: &str, conn: &rusqlite::Connection, id: &str, write: Write, expect
     }
 }
 
-/// Every row carries the side columns a same-state `update_state` write would
+/// Every row carries the side columns a same-state generic write would
 /// change: a failure reason, a receipt for another target and backdated
 /// timestamps. So a writer that rewrites a row it should leave alone, such as
 /// an already-`suspended` warm-start row, is visible in the row.

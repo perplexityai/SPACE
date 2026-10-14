@@ -371,11 +371,22 @@ pub enum RecoverStartupStatesError {
     CleanupRequest(#[from] RequestCleanupEpisodeError),
     #[error("armed cleanup episode has unsupported activation state {0}")]
     UnsupportedActivationState(SandboxState),
-    #[error("startup recovery write {edge} was not applied: {outcome:?}")]
-    StateWriteNotApplied {
+    #[error("startup recovery write {edge} was refused: sandbox is {found}, {}", refusal_text(.refusal))]
+    StateWriteRefused {
         edge: &'static str,
-        outcome: StateWriteOutcome,
+        found: SandboxState,
+        refusal: StateWriteRefusal,
     },
+    #[error("startup recovery write {edge} found no sandbox row")]
+    StateWriteMissing { edge: &'static str },
+}
+
+fn refusal_text(refusal: &StateWriteRefusal) -> &'static str {
+    match refusal {
+        StateWriteRefusal::FromState => "outside the edge's source states",
+        StateWriteRefusal::Guard(StateWriteGuard::Quarantined) => "blocked by quarantine",
+        StateWriteRefusal::Guard(StateWriteGuard::CleanupOwned) => "owned by cleanup",
+    }
 }
 
 /// [`update_state_from`] for a startup recovery writer that requires its
@@ -393,9 +404,15 @@ pub fn require_startup_state_write(
 ) -> std::result::Result<(), RecoverStartupStatesError> {
     match update_state_from(conn, id, edge)? {
         StateWriteOutcome::Applied { .. } => Ok(()),
-        outcome => Err(RecoverStartupStatesError::StateWriteNotApplied {
-            edge: edge.name(),
-            outcome,
-        }),
+        StateWriteOutcome::Refused { found, refusal } => {
+            Err(RecoverStartupStatesError::StateWriteRefused {
+                edge: edge.name(),
+                found,
+                refusal,
+            })
+        }
+        StateWriteOutcome::Missing => {
+            Err(RecoverStartupStatesError::StateWriteMissing { edge: edge.name() })
+        }
     }
 }

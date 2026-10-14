@@ -147,28 +147,6 @@ fn sandbox_inventory_dirty(conn: &rusqlite::Connection, id: &str) -> bool {
         })
 }
 
-/// Stop admission as the cleanup fence runs it, with a non-blocking Stop's
-/// persisted intent, then Stop's row-intent completion.
-fn stop_sandbox(conn: &rusqlite::Connection, id: &str) {
-    let tx = crate::db::immediate_transaction(conn).unwrap();
-    crate::db::update_state_superseding_activation_in_transaction(&tx, id, SandboxState::Stopping)
-        .unwrap();
-    assert!(
-        crate::db::set_cleanup_intent(&tx, id, true, crate::db::CleanupCompletion::MarkStopped)
-            .unwrap()
-    );
-    tx.commit().unwrap();
-    crate::db::complete_row_intent_cleanup_for_job(
-        conn,
-        id,
-        crate::db::CleanupCompletion::MarkStopped,
-        None,
-        None,
-        None,
-    )
-    .unwrap();
-}
-
 /// The template base-snapshot completion and its failure rollback hold only
 /// the wake lock, which Stop does not take. A Stop that completes while the
 /// snapshot is captured or hashed leaves `stopped`, and neither write may
@@ -185,7 +163,7 @@ fn template_base_snapshot_writes_leave_a_stop_that_completed_during_capture_stop
         );
         begin_template_base_snapshot_state(&conn, &id).unwrap();
         assert_eq!(sandbox_state(&conn, &id), SandboxState::Checkpointing);
-        stop_sandbox(&conn, &id);
+        crate::db::tests::state_write_fixtures::stop(&conn, &id);
         assert_eq!(sandbox_state(&conn, &id), SandboxState::Stopped);
         let before = crate::db::tests::database_rows(&conn);
         let db = Arc::new(Mutex::new(conn));

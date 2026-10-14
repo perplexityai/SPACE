@@ -13,19 +13,20 @@ use super::state_write_fixtures::{
     Cell, ExpectedDiff, NULL, RESTORE_STORAGE_URI, Snapshot, as_synthetic_orphan, assert_accepts,
     assert_unchanged, backdate, decorate, endpoint_proof, execution_metadata, generation,
     insert_creating, insert_row, int, quarantine_history_entered, quarantine_state_entered,
-    receipt_cleared, restore_source, seed_receipt, set_failure_reason, snapshot, snapshot_path,
-    text, with_sandbox_params,
+    receipt_cleared, restore_source, seed_receipt, seed_teardown_job, set_failure_reason, snapshot,
+    snapshot_path, teardown_job_failed, text, with_sandbox_params,
 };
 use crate::db::{
     ActivationKind, ActivationRouteAdmission, CleanupCompletion, CleanupEpisodeSpec,
-    QuarantineAdoptionOutcome, RestoreAdoptOrphanInsertError, SandboxStateWriteOutcome,
-    StartupResidentSettlement, SupersedeActivationError, adopt_quarantine_cleanup_episode,
-    begin_activation_with_route_evidence, begin_teardown_suspend, get_sandbox,
-    immediate_transaction, insert_cleanup_episode, insert_quarantined_sandbox_in_transaction,
-    insert_restore_transfer_scope, mark_local_artifact_backup_completed,
-    pin_suspended_artifact_for_cleanup, request_cleanup_episode,
-    restore_adopt_orphan_or_insert_sandbox, restore_checkpoint_state, settle_startup_resident,
-    stage_teardown_suspend_artifact, test_conn, update_state_superseding_activation_in_transaction,
+    QuarantineAdoptionOutcome, RestoreAdoptOrphanInsertError, SandboxStateWriteNotApplied,
+    StartupResidentSettlement, StateWriteGuard, SupersedeActivationError,
+    adopt_quarantine_cleanup_episode, begin_activation_with_route_evidence, begin_teardown_suspend,
+    get_sandbox, immediate_transaction, insert_cleanup_episode,
+    insert_quarantined_sandbox_in_transaction, insert_restore_transfer_scope,
+    mark_local_artifact_backup_completed, pin_suspended_artifact_for_cleanup,
+    request_cleanup_episode, restore_adopt_orphan_or_insert_sandbox, restore_checkpoint_state,
+    settle_startup_resident, stage_teardown_suspend_artifact, test_conn,
+    update_state_superseding_activation_in_transaction,
 };
 use crate::restore_operation::RemoteRestoreOperation;
 use crate::state::SandboxState;
@@ -115,8 +116,10 @@ fn superseded(target: SandboxState) -> Vec<(&'static str, Cell)> {
     ]
 }
 
-/// Per-source-state outcomes are `update_state`'s, pinned by
-/// `update_state_matrix`; these cases pin what supersession adds around it.
+/// The write answers each source state as `update_state_from` expecting every
+/// state does, which `update_state_matrix` pins; these cases pin what
+/// supersession adds around it, and admission's full write over a row already
+/// in its target.
 #[test]
 fn activation_supersession_retires_the_episode_before_the_generic_write() {
     for target in [SandboxState::Stopping, SandboxState::Deleting] {
@@ -190,8 +193,9 @@ fn activation_supersession_retires_the_episode_before_the_generic_write() {
                 |result| {
                     matches!(
                         result,
-                        Err(SupersedeActivationError::StateWriteNotApplied(error))
-                            if error.outcome == SandboxStateWriteOutcome::BlockedByQuarantine
+                        Err(SupersedeActivationError::StateWriteNotApplied(
+                            SandboxStateWriteNotApplied::Guard(StateWriteGuard::Quarantined)
+                        ))
                     )
                 },
             );
@@ -246,6 +250,31 @@ fn activation_supersession_retires_the_episode_before_the_generic_write() {
             );
         }
 
+        // Admission re-admits a row already in its target with the whole
+        // generic write: the failure reason and a receipt for another state
+        // are cleared and `updated_at` advances, while `state_changed_at`
+        // keeps the original transition. Re-admitting `deleting` also fails
+        // the active teardown jobs.
+        let readmitted = insert_row(&conn, target);
+        if target == SandboxState::Deleting {
+            seed_teardown_job(&conn, &readmitted);
+        }
+        decorate(&conn, &readmitted, SandboxState::Started);
+        let mut cells = vec![("failure_reason", NULL), ("updated_at", Cell::NowText)];
+        cells.extend(receipt_cleared(SandboxState::Started));
+        let expected = if target == SandboxState::Deleting {
+            teardown_job_failed(&readmitted, "sandbox is deleting")
+        } else {
+            ExpectedDiff::new()
+        }
+        .sandbox(&readmitted, cells);
+        assert_accepts(
+            &format!("{target} re-admitted"),
+            &conn,
+            || supersede(&conn, &readmitted, target).unwrap(),
+            expected,
+        );
+
         refuses(
             &format!("missing row -> {target}"),
             &conn,
@@ -253,8 +282,9 @@ fn activation_supersession_retires_the_episode_before_the_generic_write() {
             |result| {
                 matches!(
                     result,
-                    Err(SupersedeActivationError::StateWriteNotApplied(error))
-                        if error.outcome == SandboxStateWriteOutcome::Missing
+                    Err(SupersedeActivationError::StateWriteNotApplied(
+                        SandboxStateWriteNotApplied::Missing
+                    ))
                 )
             },
         );

@@ -62,10 +62,7 @@ fn node_execution_cleanup_acknowledgements_are_retryable_and_fenced() {
     .unwrap();
     let staged = node_execution_fence(&conn, &id).unwrap().unwrap();
     assert!(staged.previous().is_none());
-    assert_eq!(
-        update_state(&conn, &id, SandboxState::Created).unwrap(),
-        SandboxStateWriteOutcome::Applied
-    );
+    state_write_fixtures::apply_edge(&conn, &id, &edges::CREATE_COMPLETE);
     assert!(complete_create(&conn, &id, staging_cleanup, false).unwrap());
     let activate = || {
         let episode = begin_activation(
@@ -275,14 +272,17 @@ fn cleanup_intent_cannot_be_replaced_by_suspend_or_resident_completion() {
         );
         assert!(set_cleanup_intent(&conn, &id, false, CleanupCompletion::DeleteRow).unwrap());
         for stale_completion in [
-            SandboxState::Pausing,
-            SandboxState::Paused,
-            SandboxState::Started,
-            SandboxState::Resuming,
+            &edges::PAUSE_BEGIN,
+            &edges::PAUSE_COMPLETE,
+            &edges::PAUSE_ROLLBACK,
+            &edges::RESUME_BEGIN,
         ] {
             assert_eq!(
-                update_state(&conn, &id, stale_completion).unwrap(),
-                SandboxStateWriteOutcome::SupersededByCleanupEpisode
+                update_state_from(&conn, &id, stale_completion).unwrap(),
+                StateWriteOutcome::Refused {
+                    found: cleanup_state,
+                    refusal: StateWriteRefusal::Guard(StateWriteGuard::CleanupOwned),
+                }
             );
             assert!(!begin_suspend(&conn, &id).unwrap());
             let row = get_sandbox(&conn, &id).unwrap().unwrap();
@@ -320,7 +320,8 @@ fn application_state_write_updates_only_state_changed_at() {
     .unwrap();
 
     // Act
-    let outcome = update_state(&conn, &sandbox_id, SandboxState::Paused).unwrap();
+    let outcome =
+        update_state_from_states(&conn, &sandbox_id, StateSet::ALL, SandboxState::Paused).unwrap();
     let after_transition: (String, String) = conn
         .query_row(
             "SELECT state_changed_at, updated_at FROM sandboxes WHERE id = ?1",
@@ -328,7 +329,8 @@ fn application_state_write_updates_only_state_changed_at() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    let retry_outcome = update_state(&conn, &sandbox_id, SandboxState::Paused).unwrap();
+    let retry_outcome =
+        update_state_from_states(&conn, &sandbox_id, StateSet::ALL, SandboxState::Paused).unwrap();
     let after_retry: String = conn
         .query_row(
             "SELECT state_changed_at FROM sandboxes WHERE id = ?1",
@@ -351,9 +353,19 @@ fn application_state_write_updates_only_state_changed_at() {
         )
         .unwrap();
     assert_ne!(after_transition.0, "123");
-    assert_eq!(outcome, SandboxStateWriteOutcome::Applied);
+    assert_eq!(
+        outcome,
+        StateWriteOutcome::Applied {
+            from: SandboxState::Started
+        }
+    );
     assert_eq!(after_transition.0, after_transition.1);
-    assert_eq!(retry_outcome, SandboxStateWriteOutcome::Applied);
+    assert_eq!(
+        retry_outcome,
+        StateWriteOutcome::Applied {
+            from: SandboxState::Paused
+        }
+    );
     assert_eq!(after_retry, after_transition.0);
     assert_eq!(after_unrelated_write, after_transition.0);
 }
@@ -391,10 +403,12 @@ fn every_allowed_state_transition_tracks_the_change_time() {
                 )
                 .unwrap_or_else(|error| panic!("{from} -> {to}: {error}"));
             } else {
-                update_state(&conn, &sandbox_id, to)
-                    .unwrap()
-                    .require_applied()
-                    .unwrap();
+                assert_eq!(
+                    update_state_from_states(&conn, &sandbox_id, StateSet::of(&[from]), to)
+                        .unwrap(),
+                    StateWriteOutcome::Applied { from },
+                    "{from} -> {to}"
+                );
             }
 
             // Assert
@@ -2329,10 +2343,7 @@ fn suspended_cleanup_completion_dedupes_prior_suspend_row() {
     assert!(get_local_artifact(&conn, a1).unwrap().is_some());
 
     // Simulate a wake-and-resuspend cycle, including its stable paused state.
-    assert_eq!(
-        update_state(&conn, "sandbox-1", SandboxState::Paused).unwrap(),
-        SandboxStateWriteOutcome::Applied
-    );
+    state_write_fixtures::force_state(&conn, "sandbox-1", SandboxState::Paused);
     assert!(begin_suspend(&conn, "sandbox-1").unwrap());
     let a2 = LocalArtifactId::new();
     complete_row_intent_cleanup(
@@ -2563,10 +2574,7 @@ fn stopped_publication_commits_disk_identity_with_terminal_state() {
         &conn,
         TestSandboxInsert::new("sandbox-1", "sandbox1", SandboxState::Started),
     );
-    update_state(&conn, "sandbox-1", SandboxState::Stopping)
-        .unwrap()
-        .require_applied()
-        .unwrap();
+    state_write_fixtures::apply_edge(&conn, "sandbox-1", &edges::STOP_ADMISSION);
 
     let local_artifact_id = LocalArtifactId::new();
     publish_stopped_artifact(
@@ -6615,10 +6623,7 @@ fn start_arms_access_idle_only_after_guest_readiness() {
         restored.auto_lifecycle_state.conditions[&AutoLifecycleConditionSetId::AccessIdle].epoch_at;
     assert_eq!(restored_epoch, None);
 
-    assert_eq!(
-        update_state(&conn, "restore-ready-sandbox", SandboxState::Resuming).unwrap(),
-        SandboxStateWriteOutcome::Applied
-    );
+    state_write_fixtures::apply_edge(&conn, "restore-ready-sandbox", &edges::RESUME_BEGIN);
     assert!(
         restore_resident_resume_state(&conn, "restore-ready-sandbox", SandboxState::Started,)
             .unwrap()
@@ -6630,10 +6635,7 @@ fn start_arms_access_idle_only_after_guest_readiness() {
         resumed.auto_lifecycle_state.conditions[&AutoLifecycleConditionSetId::AccessIdle].epoch_at;
     assert!(resumed_epoch.is_some());
 
-    assert_eq!(
-        update_state(&conn, "restore-ready-sandbox", SandboxState::Resuming).unwrap(),
-        SandboxStateWriteOutcome::Applied
-    );
+    state_write_fixtures::force_state(&conn, "restore-ready-sandbox", SandboxState::Resuming);
     assert!(
         restore_resident_resume_state(&conn, "restore-ready-sandbox", SandboxState::Started,)
             .unwrap()
@@ -6840,10 +6842,6 @@ fn generic_lifecycle_writers_reject_failed_targets() {
         TestSandboxInsert::new("starting", "starting", SandboxState::Starting),
     );
     assert!(matches!(
-        update_state(&conn, "starting", SandboxState::Failed),
-        Err(rusqlite::Error::InvalidQuery)
-    ));
-    assert!(matches!(
         rollback_starting(&conn, "starting", SandboxState::Failed),
         Err(rusqlite::Error::InvalidQuery)
     ));
@@ -6895,8 +6893,11 @@ fn cleanup_recovery_owns_failure_clearance_not_stale_resident_completion() {
     )
     .unwrap();
     assert_eq!(
-        update_state(&conn, "sandbox-1", SandboxState::Started).unwrap(),
-        SandboxStateWriteOutcome::SupersededByCleanupEpisode
+        update_state_from(&conn, "sandbox-1", &edges::PAUSE_ROLLBACK).unwrap(),
+        StateWriteOutcome::Refused {
+            found: SandboxState::CleanupFailed,
+            refusal: StateWriteRefusal::Guard(StateWriteGuard::CleanupOwned),
+        }
     );
     complete_row_intent_cleanup(&conn, "sandbox-1", CleanupCompletion::MarkStopped, None).unwrap();
 
@@ -6924,8 +6925,11 @@ fn quarantined_state_is_not_exited_by_generic_failure_writers() {
     .unwrap();
 
     assert_eq!(
-        update_state(&conn, "sandbox-1", SandboxState::Started).unwrap(),
-        SandboxStateWriteOutcome::BlockedByQuarantine,
+        update_state_from(&conn, "sandbox-1", &edges::PAUSE_ROLLBACK).unwrap(),
+        StateWriteOutcome::Refused {
+            found: SandboxState::Quarantined,
+            refusal: StateWriteRefusal::Guard(StateWriteGuard::Quarantined),
+        }
     );
 
     let row = get_sandbox(&conn, "sandbox-1").unwrap().unwrap();
@@ -6935,10 +6939,7 @@ fn quarantined_state_is_not_exited_by_generic_failure_writers() {
         Some("runtime evidence is inconsistent")
     );
 
-    update_state(&conn, "sandbox-1", SandboxState::Deleting)
-        .unwrap()
-        .require_applied()
-        .unwrap();
+    state_write_fixtures::apply_edge(&conn, "sandbox-1", &edges::DELETE_ADMISSION);
     let row = get_sandbox(&conn, "sandbox-1").unwrap().unwrap();
     assert_eq!(row.state, SandboxState::Deleting);
 }

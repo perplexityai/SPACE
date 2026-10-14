@@ -1,15 +1,13 @@
 //! Every outcome of the generic node-local SQLite `sandboxes.state` writer,
-//! `update_state`, over all 18×18 `(from, to)` lifecycle pairs and each
-//! cleanup-ownership shape that changes its answer, once with a transition
-//! receipt for the target and once with a receipt for another state.
+//! `update_state_from` with every state expected, over all 18×18 `(from, to)`
+//! lifecycle pairs and each cleanup-ownership shape that changes its answer,
+//! once with a transition receipt for the target and once with a receipt for
+//! another state. With every state expected only the generic guards refuse, so
+//! the grids pin those guards.
 //!
 //! The expected outcomes are written out below as one grid per shape, not
-//! derived from `SandboxState::can_transition_to`: `update_state` deliberately
-//! has no expected-state predicate, so the grids record which writes it applies
-//! today, including edges the state machine forbids.
-//!
-//! The same grids and row diffs drive `update_state_from` with every state
-//! expected, which must answer every cell exactly as `update_state` does.
+//! derived from `SandboxState::can_transition_to`: the grids record which
+//! writes the guards admit, including edges the state machine forbids.
 
 use pplx_space_common_core::types::{
     SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineReasonCode,
@@ -22,10 +20,10 @@ use super::state_write_fixtures::{
     test_start, text,
 };
 use crate::db::{
-    CleanupCompletion, CleanupEpisodeRequestOutcome, CleanupEpisodeSpec, SandboxStateWriteOutcome,
-    StateSet, StateWriteOutcome, StateWriteRefusal, begin_teardown_suspend, insert_cleanup_episode,
+    CleanupCompletion, CleanupEpisodeRequestOutcome, CleanupEpisodeSpec, StateSet, StateWriteGuard,
+    StateWriteOutcome, StateWriteRefusal, begin_teardown_suspend, insert_cleanup_episode,
     mark_suspending_quarantined, request_cleanup_episode, set_cleanup_intent, test_conn,
-    update_state, update_state_from_states,
+    update_state_from_states,
 };
 use crate::state::SandboxState;
 
@@ -345,21 +343,17 @@ pub(super) fn applied_diff(
     )
 }
 
-/// A generic writer the grids characterize.
+/// `update_state_from` with every state expected, standalone or inside a
+/// caller's transaction.
 #[derive(Clone, Copy, Debug)]
-pub(super) enum Writer {
-    UpdateState,
-    /// `update_state_from` with every state expected, standalone or inside a
-    /// caller's transaction.
-    UpdateStateFromAll {
-        in_transaction: bool,
-    },
+pub(super) struct Writer {
+    pub(super) in_transaction: bool,
 }
 
 impl Writer {
     /// Write `to` and name the outcome in the grids' terms. `seeded` is the
-    /// row's state, which `update_state_from` must report as found or as the
-    /// applied write's origin.
+    /// row's state, which the writer must report as found or as the applied
+    /// write's origin.
     fn write(
         self,
         case: &str,
@@ -368,34 +362,27 @@ impl Writer {
         seeded: Option<SandboxState>,
         to: SandboxState,
     ) -> Expected {
-        match self {
-            Self::UpdateState => match update_state(conn, id, to) {
-                Ok(SandboxStateWriteOutcome::Applied) => Expected::Applied,
-                Ok(SandboxStateWriteOutcome::BlockedByQuarantine) => Expected::Quarantine,
-                Ok(SandboxStateWriteOutcome::SupersededByCleanupEpisode) => Expected::Superseded,
-                Ok(SandboxStateWriteOutcome::Missing) => Expected::Missing,
-                Err(rusqlite::Error::InvalidQuery) => Expected::Rejected,
+        let (observed, expected) =
+            match write_from(conn, id, StateSet::ALL, to, self.in_transaction) {
+                Ok(StateWriteOutcome::Applied { from }) => (Some(from), Expected::Applied),
+                Ok(StateWriteOutcome::Refused {
+                    found,
+                    refusal: StateWriteRefusal::Guard(StateWriteGuard::Quarantined),
+                }) => (Some(found), Expected::Quarantine),
+                Ok(StateWriteOutcome::Refused {
+                    found,
+                    refusal: StateWriteRefusal::Guard(StateWriteGuard::CleanupOwned),
+                }) => (Some(found), Expected::Superseded),
+                Ok(StateWriteOutcome::Refused {
+                    found,
+                    refusal: StateWriteRefusal::FromState,
+                }) => panic!("{case}: every state is expected, yet {found} was refused"),
+                Ok(StateWriteOutcome::Missing) => (None, Expected::Missing),
+                Err(rusqlite::Error::InvalidQuery) => return Expected::Rejected,
                 Err(error) => panic!("{case}: {error}"),
-            },
-            Self::UpdateStateFromAll { in_transaction } => {
-                match write_from(conn, id, StateSet::ALL, to, in_transaction) {
-                    Ok(StateWriteOutcome::Applied { from }) if Some(from) == seeded => {
-                        Expected::Applied
-                    }
-                    Ok(StateWriteOutcome::Refused {
-                        found,
-                        refusal: StateWriteRefusal::Quarantined,
-                    }) if Some(found) == seeded => Expected::Quarantine,
-                    Ok(StateWriteOutcome::Refused {
-                        found,
-                        refusal: StateWriteRefusal::CleanupOwned,
-                    }) if Some(found) == seeded => Expected::Superseded,
-                    Ok(StateWriteOutcome::Missing) if seeded.is_none() => Expected::Missing,
-                    Err(rusqlite::Error::InvalidQuery) => Expected::Rejected,
-                    other => panic!("{case}: seeded {seeded:?}, got {other:?}"),
-                }
-            }
-        }
+            };
+        assert_eq!(observed, seeded, "{case}: the outcome names the seeded row");
+        expected
     }
 }
 
@@ -509,16 +496,6 @@ pub(super) fn sweep_quarantine_episode_and_missing_row(writer: Writer) {
             ExpectedDiff::new(),
         );
     }
-}
-
-#[test]
-fn generic_state_write_outcomes_cover_every_lifecycle_pair_and_cleanup_shape() {
-    sweep_lifecycle_pairs_and_cleanup_shapes(Writer::UpdateState);
-}
-
-#[test]
-fn generic_state_write_outcomes_over_a_quarantine_episode_and_a_missing_row() {
-    sweep_quarantine_episode_and_missing_row(Writer::UpdateState);
 }
 
 #[test]

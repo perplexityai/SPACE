@@ -307,9 +307,10 @@ async fn identity_equal_adoption_does_not_overwrite_an_owned_execution() {
                 SandboxState::Started
             }
             ExecutionOwner::LifecycleTransition => {
-                assert_eq!(
-                    crate::db::update_state(&conn, &id, SandboxState::Stopping).unwrap(),
-                    crate::db::SandboxStateWriteOutcome::Applied
+                crate::db::tests::state_write_fixtures::apply_edge(
+                    &conn,
+                    &id,
+                    &crate::db::edges::STOP_ADMISSION,
                 );
                 SandboxState::Stopping
             }

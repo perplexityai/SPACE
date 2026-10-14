@@ -210,10 +210,11 @@ async fn artifact_alias_waits_on_canonical_lock_and_rereads_after_admission() {
     let pending = service.lock_artifact_for_sandbox("01939e3e1111");
     tokio::pin!(pending);
     assert!(futures_util::poll!(&mut pending).is_pending());
-    crate::db::update_state(&service.db_conn().unwrap(), id, SandboxState::Stopped)
-        .unwrap()
-        .require_applied()
-        .unwrap();
+    crate::db::tests::state_write_fixtures::apply_edge(
+        &service.db_conn().unwrap(),
+        id,
+        &crate::db::edges::AUTO_LIFECYCLE_STOP_SUSPENDED,
+    );
     drop(lock);
     let (row, guard) = pending.await.unwrap();
     assert_eq!(row.id, id);
@@ -1383,10 +1384,11 @@ fn deleting_sandbox_with_closed_teardown_suspend(
             .status,
         crate::db::TeardownSuspendOperationStatus::Running
     );
-    crate::db::update_state(conn, &id, SandboxState::Deleting)
-        .unwrap()
-        .require_applied()
-        .unwrap();
+    crate::db::tests::state_write_fixtures::apply_edge(
+        conn,
+        &id,
+        &crate::db::edges::DELETE_ADMISSION,
+    );
     // The transition fails the job before any shim request arrives.
     assert_eq!(
         crate::db::latest_teardown_suspend_operation(conn, &id)
@@ -1796,9 +1798,10 @@ async fn teardown_suspend_pause_failure_recovery_allows_same_generation_retry() 
         let original = crate::db::latest_teardown_suspend_operation(&conn, &id)
             .unwrap()
             .unwrap();
-        assert_eq!(
-            crate::db::update_state(&conn, &id, SandboxState::Pausing).unwrap(),
-            crate::db::SandboxStateWriteOutcome::Applied
+        crate::db::tests::state_write_fixtures::apply_edge(
+            &conn,
+            &id,
+            &crate::db::edges::PAUSE_BEGIN,
         );
         crate::db::mark_quarantined_from_state(
             &conn,
@@ -2264,10 +2267,11 @@ async fn suspend_completion_refuses_a_superseded_row_before_runtime_cleanup() {
         match supersession {
             Supersession::CleanupActive => {}
             Supersession::Deleted => {
-                crate::db::update_state(&conn, &id, SandboxState::Deleting)
-                    .unwrap()
-                    .require_applied()
-                    .unwrap();
+                crate::db::tests::state_write_fixtures::apply_edge(
+                    &conn,
+                    &id,
+                    &crate::db::edges::DELETE_ADMISSION,
+                );
                 commit_sandbox_delete(&conn, &id);
                 assert!(crate::db::get_sandbox(&conn, &id).unwrap().is_none());
             }

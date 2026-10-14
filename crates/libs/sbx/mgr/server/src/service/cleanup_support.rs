@@ -224,30 +224,13 @@ pub(super) async fn service_cleanup_via_node_with_options(
 
 pub(super) use crate::db::CleanupCompletion;
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the update_state parity tests call it; production writes use update_state_from"
-    )
-)]
-pub(super) fn require_state_write(
-    result: rusqlite::Result<crate::db::SandboxStateWriteOutcome>,
-    context: &'static str,
-) -> Result<(), Status> {
-    let outcome = result.map_err(|error| Status::internal(format!("{context}: {error}")))?;
-    outcome
-        .require_applied()
-        .map_err(|error| Status::aborted(format!("{context}: {error}")))
-}
-
-/// [`require_state_write`] for [`crate::db::update_state_from`]. A database
+/// Map a [`crate::db::update_state_from`] result to a status. A database
 /// error is `Internal`. Every refusal is `Aborted`: a from-state refusal
 /// reports the state another transition left the row in, and a generic-guard
-/// refusal or a missing row keeps `update_state`'s message.
+/// refusal or a missing row renders [`crate::db::SandboxStateWriteNotApplied`].
 pub(super) fn require_state_write_from(
     result: rusqlite::Result<crate::db::StateWriteOutcome>,
-    context: &'static str,
+    context: &str,
 ) -> Result<(), Status> {
     let outcome = result.map_err(|error| Status::internal(format!("{context}: {error}")))?;
     state_write_result(outcome)
@@ -264,20 +247,13 @@ pub(super) enum StateWriteRejected {
     FromState {
         found: SandboxState,
     },
-    /// A generic guard refused, as it refuses `update_state`. The guards
-    /// answer first, so `found` may also be outside the edge's source states.
+    /// A generic guard refused. The guards answer first, so `found` may also
+    /// be outside the edge's source states.
     Guard {
-        refusal: StateWriteGuard,
+        refusal: crate::db::StateWriteGuard,
         found: SandboxState,
     },
     Missing,
-}
-
-/// The generic guards `update_state` and `update_state_from` share.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum StateWriteGuard {
-    Quarantined,
-    CleanupOwned,
 }
 
 pub(super) fn state_write_result(
@@ -292,45 +268,25 @@ pub(super) fn state_write_result(
         } => Err(StateWriteRejected::FromState { found }),
         StateWriteOutcome::Refused {
             found,
-            refusal: StateWriteRefusal::Quarantined,
-        } => Err(StateWriteRejected::Guard {
-            refusal: StateWriteGuard::Quarantined,
-            found,
-        }),
-        StateWriteOutcome::Refused {
-            found,
-            refusal: StateWriteRefusal::CleanupOwned,
-        } => Err(StateWriteRejected::Guard {
-            refusal: StateWriteGuard::CleanupOwned,
-            found,
-        }),
+            refusal: StateWriteRefusal::Guard(refusal),
+        } => Err(StateWriteRejected::Guard { refusal, found }),
         StateWriteOutcome::Missing => Err(StateWriteRejected::Missing),
     }
 }
 
 impl StateWriteRejected {
     pub(super) fn into_status(self, context: &str) -> Status {
-        use crate::db::{SandboxStateWriteNotApplied, SandboxStateWriteOutcome};
-        let outcome = match self {
+        use crate::db::SandboxStateWriteNotApplied;
+        let not_applied = match self {
             Self::FromState { found } => {
                 return Status::aborted(format!(
                     "{context}: sandbox state write was superseded: sandbox is {found}"
                 ));
             }
-            Self::Guard {
-                refusal: StateWriteGuard::Quarantined,
-                ..
-            } => SandboxStateWriteOutcome::BlockedByQuarantine,
-            Self::Guard {
-                refusal: StateWriteGuard::CleanupOwned,
-                ..
-            } => SandboxStateWriteOutcome::SupersededByCleanupEpisode,
-            Self::Missing => SandboxStateWriteOutcome::Missing,
+            Self::Guard { refusal, .. } => SandboxStateWriteNotApplied::Guard(refusal),
+            Self::Missing => SandboxStateWriteNotApplied::Missing,
         };
-        Status::aborted(format!(
-            "{context}: {}",
-            SandboxStateWriteNotApplied { outcome }
-        ))
+        Status::aborted(format!("{context}: {not_applied}"))
     }
 }
 
@@ -353,12 +309,20 @@ pub(super) fn update_state_from_best_effort(
             mark_sandbox_dirty(db, sandbox_id);
             Some(outcome)
         }
-        Ok(outcome @ (StateWriteOutcome::Refused { .. } | StateWriteOutcome::Missing)) => {
+        Ok(outcome @ StateWriteOutcome::Refused { .. }) => {
             tracing::warn!(
                 sandbox_id,
                 state = edge.to().as_str(),
                 ?outcome,
                 "sandbox state write was superseded"
+            );
+            Some(outcome)
+        }
+        Ok(outcome @ StateWriteOutcome::Missing) => {
+            tracing::warn!(
+                sandbox_id,
+                state = edge.to().as_str(),
+                "sandbox state write found no sandbox row"
             );
             Some(outcome)
         }

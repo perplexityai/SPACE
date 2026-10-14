@@ -1,10 +1,13 @@
-//! Stop's cleanup admission from every node-local SQLite `sandboxes.state`
-//! source state, and the Stop RPC's runtime gate in front of it.
+//! Stop's and Delete's cleanup admission from every node-local SQLite
+//! `sandboxes.state` source state, and the Stop RPC's runtime gate in front of
+//! it.
 //!
 //! Stop admission does not consult `SandboxState::transition`, unlike Kill: it
-//! supersedes any activation and writes `stopping` through the generic writer,
-//! so every state the generic writer does not refuse is admitted. The
-//! expected outcomes are written out here, not derived from that writer.
+//! supersedes any activation and writes `stopping` over every state the generic
+//! guards do not refuse, a `stopping` row included. Delete admission writes
+//! `deleting` the same way, over a `deleting` row too, unless the row's suspend
+//! state has not reached the cluster. The expected outcomes are written out
+//! here, not derived from that writer.
 //!
 //! The Stop RPC admits only a sandbox whose runtime is live: it resolves its
 //! target with `running_only`, which selects nothing unless the sandbox's
@@ -23,7 +26,10 @@ use pplx_space_common_core::types::SandboxId;
 use pplx_space_common_svc::PeerIdentity;
 use tonic::Request;
 
-use super::{CleanupAdmission, SandboxManagerService, SandboxManagerServiceOptions, StopRequest};
+use super::{
+    CleanupAdmission, CleanupAdmissionError, SandboxManagerService, SandboxManagerServiceOptions,
+    StopRequest,
+};
 use crate::db::CleanupCompletion;
 use crate::db::tests::state_write_fixtures::{assert_unchanged, snapshot};
 use crate::service::tests::service_tests::insert_test_sandbox;
@@ -80,13 +86,14 @@ fn insert_row(conn: &rusqlite::Connection, state: SandboxState) -> SandboxId {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Admission {
-    /// Admitted, and the Stop RPC can reach it for a live runtime.
+    /// Admitted, and the RPC can reach it: Stop only for a live runtime.
     Admitted,
     /// Admitted, but only by calling admission directly: the state has no
     /// Firecracker process, so the Stop RPC's runtime gate selects nothing.
     AdmittedOnlyDirectly,
-    /// Refused with `Unavailable`.
-    Refused,
+    /// Refused: Stop with `Unavailable` and this message, Delete (`None`)
+    /// because the row's suspend state has not reached the cluster.
+    Refused(Option<&'static str>),
 }
 
 /// What Stop admission answers for a plain row in `state`. Wildcard-free, so
@@ -109,60 +116,107 @@ fn admission(state: SandboxState) -> Admission {
         | SandboxState::Created
         | SandboxState::Stopped
         | SandboxState::Suspended => Admission::AdmittedOnlyDirectly,
-        // The generic writer leaves a `deleting` row to its delete and a
+        // The generic guards leave a `deleting` row to its delete and a
         // `quarantined` row to quarantine.
-        SandboxState::Deleting | SandboxState::Quarantined => Admission::Refused,
+        SandboxState::Deleting => Admission::Refused(Some(
+            "cleanup lifecycle claim was superseded: sandbox state write was not applied: \
+             superseded_by_cleanup_episode",
+        )),
+        SandboxState::Quarantined => Admission::Refused(Some(
+            "cleanup lifecycle claim was superseded: sandbox state write was not applied: \
+             blocked_by_quarantine",
+        )),
     }
 }
 
-/// Assert one admission's outcome: an admitted Stop leaves the row `stopping`
+/// What Delete admission answers for a plain row in `state`. Wildcard-free,
+/// so a new lifecycle state does not compile until it is placed.
+fn delete_admission(state: SandboxState) -> Admission {
+    match state {
+        SandboxState::Creating
+        | SandboxState::Created
+        | SandboxState::Starting
+        | SandboxState::Started
+        | SandboxState::Stopping
+        | SandboxState::Stopped
+        | SandboxState::Deleting
+        | SandboxState::Pausing
+        | SandboxState::Paused
+        | SandboxState::Resuming
+        | SandboxState::Checkpointing
+        | SandboxState::Suspended
+        | SandboxState::Restoring
+        | SandboxState::CleanupRequired
+        | SandboxState::CleanupFailed
+        | SandboxState::Quarantined
+        | SandboxState::Failed => Admission::Admitted,
+        // Its suspend state has not reached the cluster yet.
+        SandboxState::Suspending => Admission::Refused(None),
+    }
+}
+
+/// The lifecycle cleanup an admission sweep runs.
+#[derive(Clone, Copy, Debug)]
+enum Cleanup {
+    Stop,
+    Delete,
+}
+
+impl Cleanup {
+    fn completion(self) -> CleanupCompletion {
+        match self {
+            Self::Stop => CleanupCompletion::MarkStopped,
+            Self::Delete => CleanupCompletion::DeleteRow,
+        }
+    }
+
+    fn target(self) -> SandboxState {
+        match self {
+            Self::Stop => SandboxState::Stopping,
+            Self::Delete => SandboxState::Deleting,
+        }
+    }
+
+    fn keep_filesystem(self) -> bool {
+        match self {
+            Self::Stop => true,
+            Self::Delete => false,
+        }
+    }
+
+    fn admission(self, state: SandboxState) -> Admission {
+        match self {
+            Self::Stop => admission(state),
+            Self::Delete => delete_admission(state),
+        }
+    }
+
+    /// Whether `result` is this cleanup's refusal of a row in `state`; for
+    /// Stop, with exactly `message`.
+    fn refused(
+        self,
+        state: SandboxState,
+        message: Option<&str>,
+        result: Result<CleanupAdmission, CleanupAdmissionError>,
+    ) -> bool {
+        match (self, result) {
+            (Self::Stop, Err(error)) => {
+                let status = error.into_status();
+                (status.code(), Some(status.message())) == (tonic::Code::Unavailable, message)
+            }
+            (
+                Self::Delete,
+                Err(CleanupAdmissionError::SuspendPublicationPending { state: found, .. }),
+            ) => found == state,
+            (Self::Delete, Err(_)) | (Self::Stop | Self::Delete, Ok(_)) => false,
+        }
+    }
+}
+
+/// Admit `cleanup` over a plain row in every source state, with and without
+/// a persisted intent. An admitted cleanup leaves the row in its target state
 /// with its intent and cleanup job; a refused one changes nothing.
-fn check_admission(
-    case: &str,
-    service: &SandboxManagerService,
-    id: &str,
-    state: SandboxState,
-    persist_intent: bool,
-    result: Result<CleanupAdmission, super::CleanupAdmissionError>,
-    before: &crate::db::tests::state_write_fixtures::Snapshot,
-) {
-    let db = service.db_conn().unwrap();
-    if admission(state) == Admission::Refused {
-        let status = match result {
-            Err(error) => error.into_status(),
-            Ok(_) => panic!("{case}: expected a refusal"),
-        };
-        assert_eq!(
-            status.code(),
-            tonic::Code::Unavailable,
-            "{case}: {status:?}"
-        );
-        assert_unchanged(case, before, &db);
-        return;
-    }
-    assert!(
-        matches!(result, Ok(CleanupAdmission::Persisted { .. })),
-        "{case}: expected a persisted admission"
-    );
-    let row = crate::db::get_sandbox(&db, id).unwrap().unwrap();
-    assert_eq!(row.state, SandboxState::Stopping, "{case}");
-    assert_eq!(
-        (row.cleanup_completion, row.cleanup_keep_filesystem),
-        if persist_intent {
-            (Some(CleanupCompletion::MarkStopped), Some(true))
-        } else {
-            (None, None)
-        },
-        "{case}"
-    );
-    assert!(
-        pplx_space_common_jobs::db::find_active_job(&db, crate::db::cleanup_jobs::KIND, id)
-            .unwrap()
-            .is_some(),
-        "{case}: admission persists its cleanup job"
-    );
-}
-
+///
 /// Admission never consults the shutdown token, but the cleanup executor it
 /// starts does not start once the service is shut down. Each case cancels the
 /// token and waits for the service's own tasks to exit before admitting, so
@@ -170,23 +224,16 @@ fn check_admission(
 /// whole-database comparison sees admission's writes alone, and an admitted
 /// row stays as admission left it. The empty task tracker after admission
 /// checks that.
-#[tokio::test(flavor = "current_thread")]
-async fn stop_admission_answers_every_source_state() {
-    if !crate::service::tests::enter_route_test_process(&[
-        ("EPPO_SDK_KEY", None),
-        ("SPACE_FLAGD_ENABLED", None),
-    ]) {
-        return;
-    }
-    // A non-blocking Stop persists its intent; a blocking one does not.
+async fn sweep_every_source_state(cleanup: Cleanup) {
     for persist_intent in [true, false] {
         for state in SandboxState::all() {
             let case = format!(
-                "{state} ({:?}), persist intent {persist_intent}",
-                admission(state)
+                "{cleanup:?} of {state} ({:?}), persist intent {persist_intent}",
+                cleanup.admission(state)
             );
             let conn = crate::db::test_conn();
             let sandbox_id = insert_row(&conn, state);
+            let id = sandbox_id.to_string();
             let scratch = tempfile::tempdir().unwrap();
             let service = isolated_service(conn, scratch.path());
             // The service's own background tasks exit on cancellation; once
@@ -205,7 +252,7 @@ async fn stop_admission_answers_every_source_state() {
                 WAIT,
                 service.admit_selected_cleanup(
                     sandbox_id,
-                    CleanupCompletion::MarkStopped,
+                    cleanup.completion(),
                     false,
                     persist_intent,
                     None,
@@ -219,18 +266,67 @@ async fn stop_admission_answers_every_source_state() {
                 "{case}: no cleanup executor started"
             );
 
-            check_admission(
-                &case,
-                &service,
-                &sandbox_id.to_string(),
-                state,
-                persist_intent,
-                result,
-                &before,
-            );
+            {
+                let db = service.db_conn().unwrap();
+                if let Admission::Refused(message) = cleanup.admission(state) {
+                    assert!(
+                        cleanup.refused(state, message, result),
+                        "{case}: expected a refusal"
+                    );
+                    assert_unchanged(&case, &before, &db);
+                } else {
+                    assert!(
+                        matches!(result, Ok(CleanupAdmission::Persisted { .. })),
+                        "{case}: expected a persisted admission"
+                    );
+                    let row = crate::db::get_sandbox(&db, &id).unwrap().unwrap();
+                    assert_eq!(row.state, cleanup.target(), "{case}");
+                    assert_eq!(
+                        (row.cleanup_completion, row.cleanup_keep_filesystem),
+                        if persist_intent {
+                            (Some(cleanup.completion()), Some(cleanup.keep_filesystem()))
+                        } else {
+                            (None, None)
+                        },
+                        "{case}"
+                    );
+                    assert!(
+                        pplx_space_common_jobs::db::find_active_job(
+                            &db,
+                            crate::db::cleanup_jobs::KIND,
+                            &id
+                        )
+                        .unwrap()
+                        .is_some(),
+                        "{case}: admission persists its cleanup job"
+                    );
+                }
+            }
             shutdown(service).await;
         }
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stop_admission_answers_every_source_state() {
+    if !crate::service::tests::enter_route_test_process(&[
+        ("EPPO_SDK_KEY", None),
+        ("SPACE_FLAGD_ENABLED", None),
+    ]) {
+        return;
+    }
+    sweep_every_source_state(Cleanup::Stop).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn delete_admission_answers_every_source_state() {
+    if !crate::service::tests::enter_route_test_process(&[
+        ("EPPO_SDK_KEY", None),
+        ("SPACE_FLAGD_ENABLED", None),
+    ]) {
+        return;
+    }
+    sweep_every_source_state(Cleanup::Delete).await;
 }
 
 /// The Stop RPC selects nothing without a live runtime, whatever the row's

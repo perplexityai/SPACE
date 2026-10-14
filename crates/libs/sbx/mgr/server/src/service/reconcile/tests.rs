@@ -953,3 +953,53 @@ async fn stop_admitted_during_auto_lifecycle_stop_keeps_its_completion() {
         "the Stop's completion clears the runtime it stopped"
     );
 }
+
+/// A Delete admitted between auto-lifecycle Stop's re-read and its write
+/// leaves a `deleting` row with a current `delete_row` intent, which the
+/// cleanup-ownership guard refuses. The Stop skips without recording the
+/// transition or reporting an error, and the delete keeps its row and intent.
+#[tokio::test]
+async fn delete_admitted_during_auto_lifecycle_stop_keeps_its_row() {
+    let scratch = tempfile::tempdir().unwrap();
+    let service = isolated_service(scratch.path());
+    let id = SandboxId::new().to_string();
+    insert_due_suspended_sandbox(&service, &id, 10);
+
+    let (result, before) = stop_suspended_with_concurrent_write(&service, &id, |db| {
+        // A non-blocking Delete's admission transaction.
+        let admission = crate::db::immediate_transaction(db).unwrap();
+        crate::db::update_state_superseding_activation_in_transaction(
+            &admission,
+            &id,
+            SandboxState::Deleting,
+        )
+        .unwrap();
+        assert!(
+            crate::db::set_cleanup_intent(
+                &admission,
+                &id,
+                false,
+                crate::db::CleanupCompletion::DeleteRow
+            )
+            .unwrap()
+        );
+        admission.commit().unwrap();
+    })
+    .await;
+
+    assert!(result.is_ok(), "{result:?}");
+    let db = service.db.lock().unwrap();
+    crate::db::tests::state_write_fixtures::assert_unchanged(
+        "auto-lifecycle Stop after Delete admission",
+        &before,
+        &db,
+    );
+    let row = crate::db::get_sandbox(&db, &id).unwrap().unwrap();
+    assert_eq!(
+        (row.state, row.cleanup_completion),
+        (
+            SandboxState::Deleting,
+            Some(crate::db::CleanupCompletion::DeleteRow)
+        )
+    );
+}

@@ -94,8 +94,8 @@ enum Expected {
 }
 
 /// The generic guard that refuses a `pausing`, `started` or `paused` write
-/// over `found`, as `update_state`'s message names it, or `None` when only
-/// the from-set refuses. Written out per state from #372's `PLAIN` grid for a
+/// over `found`, as the generic guards' message names it, or `None` when
+/// only the from-set refuses. Written out per state from #372's `PLAIN` grid for a
 /// row with no cleanup intent or episode, not derived from the writer.
 fn guard_refusal(found: SandboxState) -> Option<&'static str> {
     match found {

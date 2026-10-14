@@ -1,9 +1,8 @@
 //! `update_state_from`, the expected-state generic writer of the node-local
 //! SQLite `sandboxes.state`: with every state expected it answers each cell of
-//! `update_state`'s matrix identically, and a from-set that excludes the row's
-//! state refuses with the row unchanged. Each runs standalone and inside a
-//! caller's transaction. An edge binds the from-set and target a call site
-//! writes.
+//! the generic guards' matrix, and a from-set that excludes the row's state
+//! refuses with the row unchanged. Each runs standalone and inside a caller's
+//! transaction. An edge binds the from-set and target a call site writes.
 
 use super::state_write_fixtures::{assert_diff, assert_unchanged, snapshot, test_start};
 use super::update_state_matrix::{
@@ -11,23 +10,24 @@ use super::update_state_matrix::{
     sweep_lifecycle_pairs_and_cleanup_shapes, sweep_quarantine_episode_and_missing_row, write_from,
 };
 use crate::db::{
-    EDGES, StateSet, StateWriteOutcome, StateWriteRefusal, edges, test_conn, update_state_from,
+    EDGES, StateSet, StateWriteGuard, StateWriteOutcome, StateWriteRefusal, edges, test_conn,
+    update_state_from,
 };
 use crate::state::SandboxState;
 
 const IN_TRANSACTION: [bool; 2] = [false, true];
 
 #[test]
-fn expecting_every_state_matches_update_state_on_every_lifecycle_pair_and_cleanup_shape() {
+fn expecting_every_state_answers_every_lifecycle_pair_and_cleanup_shape() {
     for in_transaction in IN_TRANSACTION {
-        sweep_lifecycle_pairs_and_cleanup_shapes(Writer::UpdateStateFromAll { in_transaction });
+        sweep_lifecycle_pairs_and_cleanup_shapes(Writer { in_transaction });
     }
 }
 
 #[test]
-fn expecting_every_state_matches_update_state_over_a_quarantine_episode_and_a_missing_row() {
+fn expecting_every_state_answers_a_quarantine_episode_and_a_missing_row() {
     for in_transaction in IN_TRANSACTION {
-        sweep_quarantine_episode_and_missing_row(Writer::UpdateStateFromAll { in_transaction });
+        sweep_quarantine_episode_and_missing_row(Writer { in_transaction });
     }
 }
 
@@ -58,8 +58,12 @@ fn expected_outcome(
     match cell(PLAIN[index(from)], to) {
         Expected::Applied if from_set_contains_row => Some(StateWriteOutcome::Applied { from }),
         Expected::Applied => Some(refused(StateWriteRefusal::FromState)),
-        Expected::Quarantine => Some(refused(StateWriteRefusal::Quarantined)),
-        Expected::Superseded => Some(refused(StateWriteRefusal::CleanupOwned)),
+        Expected::Quarantine => Some(refused(StateWriteRefusal::Guard(
+            StateWriteGuard::Quarantined,
+        ))),
+        Expected::Superseded => Some(refused(StateWriteRefusal::Guard(
+            StateWriteGuard::CleanupOwned,
+        ))),
         Expected::Rejected => None,
         Expected::Missing => panic!("a seeded row cannot be missing"),
     }

@@ -342,6 +342,12 @@ pub(super) fn admit_warm_start(sandbox: &crate::db::SandboxRow) -> Result<(), St
 /// the meantime needs no write. A row another transition moved anywhere else
 /// is `FailedPrecondition`, as [`admit_warm_start`] answers it; a generic-guard
 /// refusal or a missing row keeps `require_state_write_from`'s `Aborted`.
+/// A guard refusal of a `suspended` row (`Guard { found: Suspended }`) stays
+/// `Aborted`, unlike `FromState { Suspended }`: the guard means cleanup or
+/// quarantine owns the row, so it is not a staged row the restore may claim.
+/// A transient row answers `FailedPrecondition`, where a cold Start answers
+/// `Unavailable`, deliberately: warm start does not wait out a transition, it
+/// refuses a row it cannot restage.
 pub(super) fn write_warm_start_restaged(db: &rusqlite::Connection, id: &str) -> Result<(), Status> {
     const CONTEXT: &str = "prepare recovered sandbox restore";
     let outcome = crate::db::update_state_from(db, id, &crate::db::edges::WARM_START_RESTAGE)

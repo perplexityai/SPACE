@@ -378,8 +378,6 @@ pub(super) enum CleanupCompletionError {
     Database(#[from] rusqlite::Error),
     #[error(transparent)]
     RowIntent(#[from] crate::db::CompleteRowIntentCleanupError),
-    #[error(transparent)]
-    StateWriteNotApplied(#[from] crate::db::SandboxStateWriteNotApplied),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1236,9 +1234,9 @@ impl SandboxManagerService {
             Err(crate::db::SupersedeActivationError::QuarantineRecoveryInProgress) => {
                 return Err(CleanupAdmissionError::QuarantineRecoveryInProgress { sandbox_id });
             }
-            Err(crate::db::SupersedeActivationError::StateWriteNotApplied(error))
-                if error.outcome == crate::db::SandboxStateWriteOutcome::Missing =>
-            {
+            Err(crate::db::SupersedeActivationError::StateWriteNotApplied(
+                crate::db::SandboxStateWriteNotApplied::Missing,
+            )) => {
                 if mode.auto_lifecycle_delete_expectation().is_some() {
                     return Err(Status::unavailable(
                         "sandbox disappeared during auto-lifecycle delete admission",

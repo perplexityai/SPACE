@@ -77,10 +77,11 @@ async fn legacy_delete_after_durable_delete_does_not_dispatch_node_cleanup() {
     );
     {
         let db = service.db.lock().unwrap();
-        crate::db::update_state(&db, &id, SandboxState::Deleting)
-            .unwrap()
-            .require_applied()
-            .unwrap();
+        crate::db::tests::state_write_fixtures::apply_edge(
+            &db,
+            &id,
+            &crate::db::edges::DELETE_ADMISSION,
+        );
         crate::db::set_cleanup_intent(&db, &id, false, CleanupCompletion::DeleteRow).unwrap();
         crate::db::complete_row_intent_cleanup(&db, &id, CleanupCompletion::DeleteRow, None)
             .unwrap();

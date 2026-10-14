@@ -16,7 +16,9 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
-use crate::db::tests::state_write_fixtures::{Snapshot, assert_unchanged, force_state, snapshot};
+use crate::db::tests::state_write_fixtures::{
+    Snapshot, assert_unchanged, force_state, snapshot, stop,
+};
 use crate::guest_filesystem_flush::GuestFlushError;
 use crate::node_manager_transport::fake::{FakeNodeManager, ServedNodeManager};
 use crate::service::activation_support::internal_request;
@@ -151,29 +153,7 @@ enum Interleave {
 impl Interleave {
     fn apply(self, conn: &rusqlite::Connection, id: &str) {
         match self {
-            Self::Stop => {
-                let tx = crate::db::immediate_transaction(conn).unwrap();
-                crate::db::update_state_superseding_activation_in_transaction(
-                    &tx,
-                    id,
-                    SandboxState::Stopping,
-                )
-                .unwrap();
-                assert!(
-                    crate::db::set_cleanup_intent(&tx, id, true, CleanupCompletion::MarkStopped)
-                        .unwrap()
-                );
-                tx.commit().unwrap();
-                crate::db::complete_row_intent_cleanup_for_job(
-                    conn,
-                    id,
-                    CleanupCompletion::MarkStopped,
-                    None,
-                    None,
-                    None,
-                )
-                .unwrap();
-            }
+            Self::Stop => stop(conn, id),
             Self::Force(SandboxState::Pausing) => {}
             Self::Force(state) => force_state(conn, id, state),
         }
@@ -196,7 +176,7 @@ enum Expected {
 }
 
 /// The generic guard that refuses a `started` or `paused` write over `found`,
-/// as `update_state`'s message names it, or `None` when only the from-set
+/// as the generic guards' message names it, or `None` when only the from-set
 /// refuses. Written out per state from #372's `PLAIN` grid for a row with no
 /// cleanup intent or episode, not derived from the writer.
 fn guard_refusal(found: SandboxState) -> Option<&'static str> {

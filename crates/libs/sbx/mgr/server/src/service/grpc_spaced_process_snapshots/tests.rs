@@ -1,4 +1,5 @@
 use super::*;
+use crate::db::tests::state_write_fixtures::{admit_stop, complete_stop};
 
 #[test]
 fn snapshot_inventory_does_not_return_partial_success_for_oversized_sidecars() {
@@ -346,28 +347,6 @@ fn rollback_replaces_optional_sidecars_or_reports_unremovable_stale_evidence() {
 
 fn sandbox_state(conn: &rusqlite::Connection, id: &str) -> SandboxState {
     crate::db::get_sandbox(conn, id).unwrap().unwrap().state
-}
-
-/// Stop admission as the cleanup fence runs it, with a non-blocking Stop's
-/// persisted intent.
-fn admit_stop(conn: &rusqlite::Connection, id: &str) {
-    let tx = crate::db::immediate_transaction(conn).unwrap();
-    crate::db::update_state_superseding_activation_in_transaction(&tx, id, SandboxState::Stopping)
-        .unwrap();
-    assert!(crate::db::set_cleanup_intent(&tx, id, true, CleanupCompletion::MarkStopped).unwrap());
-    tx.commit().unwrap();
-}
-
-fn complete_stop(conn: &rusqlite::Connection, id: &str) {
-    crate::db::complete_row_intent_cleanup_for_job(
-        conn,
-        id,
-        CleanupCompletion::MarkStopped,
-        None,
-        None,
-        None,
-    )
-    .unwrap();
 }
 
 /// The full rollback holds the artifact lock, which Stop does not take, while

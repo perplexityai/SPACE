@@ -16,8 +16,8 @@ use pplx_space_common_core::types::{
 use rusqlite::{Connection, params};
 
 use super::state_write_fixtures::{
-    Cell, ExpectedDiff, NULL, assert_accepts, backdate, decorate, generation, insert_creating,
-    insert_creating_with, insert_row, insert_suspended_with_artifact, int,
+    Cell, ExpectedDiff, NULL, apply_edge, assert_accepts, backdate, decorate, generation,
+    insert_creating, insert_creating_with, insert_row, insert_suspended_with_artifact, int,
     quarantine_history_entered, quarantine_state_entered, receipt_cleared, runtime_cleared,
     seed_receipt, seed_runtime, snapshot_path, suspend_artifact_inserted, text,
 };
@@ -27,10 +27,10 @@ use crate::db::{
     CleanupEpisodeRequestOutcome, CompleteRowIntentCleanupDisposition,
     begin_activation_with_route_evidence, begin_suspend, charge_prepared_clone_disposal_attempt,
     complete_cleanup_episode_for_job, complete_create, complete_pool_clone,
-    complete_row_intent_cleanup_for_job, mark_cleanup_required, mark_restore_succeeded,
+    complete_row_intent_cleanup_for_job, edges, mark_cleanup_required, mark_restore_succeeded,
     mark_start_succeeded, quarantine_cleanup_episode_for_job, rearm_prepared_clone_disposal,
     record_cleanup_episode_failure, request_cleanup_episode, rollback_restoring_episode,
-    rollback_starting_episode, set_cleanup_intent, test_conn, update_state,
+    rollback_starting_episode, set_cleanup_intent, test_conn,
 };
 use crate::state::SandboxState;
 
@@ -299,10 +299,10 @@ fn activation_completion_publishes_the_target_and_retires_its_episode() {
                 CleanupCompletion::DeleteRow,
                 Some((generation(7), attempt())),
             );
-            assert_eq!(
-                update_state(&conn, &id, settled).unwrap(),
-                crate::db::SandboxStateWriteOutcome::Applied
-            );
+            apply_edge(&conn, &id, &edges::CREATE_COMPLETE);
+            if settled == SandboxState::Suspended {
+                apply_edge(&conn, &id, &edges::CREATE_BASE_SNAPSHOT_COMPLETE);
+            }
             seed_receipt(&conn, &id, SandboxState::Stopped);
             backdate(&conn, &id);
             let mut cells = vec![

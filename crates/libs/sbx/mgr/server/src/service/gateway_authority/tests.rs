@@ -458,7 +458,7 @@ async fn gateway_authority_rechecks_ownership_after_await_but_not_ordinary_polic
                         crate::db::update_netgtw_pid(&db, &id.to_string(), sandbox.uid.unwrap(), sandbox.netgtw_pid.unwrap() + 1).unwrap();
                     }
                     "pool" => { crate::db::set_pool_template(&db, &id.to_string(), Some("warm-pool")).unwrap(); }
-                    "stopping" => { assert!(matches!(crate::db::update_state(&db, &id.to_string(), SandboxState::Stopping).unwrap(), crate::db::SandboxStateWriteOutcome::Applied)); }
+                    "stopping" => crate::db::tests::state_write_fixtures::apply_edge(&db, &id.to_string(), &crate::db::edges::STOP_ADMISSION),
                     "cleanup" => { crate::db::mark_cleanup_required(&db, &id.to_string(), true, crate::db::CleanupCompletion::MarkSuspended, "restore failed").unwrap(); }
                     "policy" => { crate::db::update_network_policy_override(&db, &id.to_string(), Some(&NetworkPolicyV1::deny_all()), 2, crate::db::PolicyAuthority::Cluster, false, false).unwrap(); }
                     _ => unreachable!(),

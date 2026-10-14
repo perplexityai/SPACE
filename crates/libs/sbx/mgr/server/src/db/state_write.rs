@@ -1,6 +1,7 @@
 //! The transitions sbx-manager persists in the node-local SQLite
 //! `sandboxes.state` column, and `update_state_from`, the generic writer that
-//! compares against the caller's expected states.
+//! compares against the caller's expected states. Every other writer of the
+//! column is a named specialized writer in `src/db`.
 //!
 //! `SandboxState::can_transition_to` is the RPC-admission machine. [`EDGES`]
 //! is a separate inventory of the transitions the database writers implement:
@@ -12,8 +13,8 @@
 //! The table follows these conventions:
 //! - A specialized compare-and-set writer's from-set is its SQL predicate,
 //!   narrowed to the states its production callers reach.
-//! - A generic `update_state` caller writes from any state the generic guards
-//!   admit. Its edge lists the states the caller relies on.
+//! - An `update_state_from` edge's from-set is exactly what its callers
+//!   legitimately see.
 //! - An empty from-set is an insert: no row existed.
 //! - A write over a row already in the target state changes no state and has
 //!   no edge.
@@ -235,8 +236,9 @@ edge_table! {
     /// `pause` after a node connect failure, and `pause_with_reconciliation`,
     /// best effort.
     PAUSE_ROLLBACK: Compensation, of(&[Pausing]) => Started;
-    /// `begin_resident_resume_with_policy`, and `begin_resident_resume`'s
-    /// `update_state_from` without an activation policy.
+    /// `begin_resident_resume_with_policy`'s `update_state_from` inside its
+    /// policy transaction, and `begin_resident_resume`'s without an activation
+    /// policy.
     RESUME_BEGIN: Request, of(&[Paused]) => Resuming;
     /// `restore_resident_resume_state(Started)` through
     /// `rollback_activation_state`.
@@ -281,14 +283,14 @@ edge_table! {
     // Stop and delete.
 
     /// Stop admission: `admit_lifecycle_cleanup_fenced` through
-    /// `update_state_superseding_activation_in_transaction(Stopping)`. Stop
-    /// does not consult `transition`, but resolves its target only while the
-    /// runtime is live (`fc.pid`), and admission does not re-check it. A
-    /// settled `created`, `stopped` or `suspended` source is therefore
-    /// reached only in the window between that gate and the cleanup fence,
-    /// or with a leaked runtime; a `creating` row has none. Kill admits only
-    /// `started` and `paused` through the same writer, and the generic guards
-    /// refuse `deleting` and `quarantined`.
+    /// `update_state_superseding_activation_in_transaction(Stopping)` and
+    /// `write_cleanup_admission_state`. Stop does not consult `transition`,
+    /// but resolves its target only while the runtime is live (`fc.pid`), and
+    /// admission does not re-check it. A settled `created`, `stopped` or
+    /// `suspended` source is therefore reached only in the window between
+    /// that gate and the cleanup fence, or with a leaked runtime; a `creating`
+    /// row has none. Kill admits only `started` and `paused` through the same
+    /// writer, and the generic guards refuse `deleting` and `quarantined`.
     STOP_ADMISSION: Request,
         StateSet::ALL
             .without(Creating)
@@ -302,8 +304,9 @@ edge_table! {
     /// `stop_suspended_for_auto_lifecycle`, which bypasses every RPC.
     AUTO_LIFECYCLE_STOP_SUSPENDED: Request, of(&[Suspended]) => Stopped;
     /// Delete admission: `admit_lifecycle_cleanup_fenced` through
-    /// `update_state_superseding_activation_in_transaction(Deleting)`, from
-    /// the Delete RPC and auto-lifecycle Delete.
+    /// `update_state_superseding_activation_in_transaction(Deleting)` and
+    /// `write_cleanup_admission_state`, from the Delete RPC and auto-lifecycle
+    /// Delete.
     DELETE_ADMISSION: Request, StateSet::ALL.without(Deleting) => Deleting;
     /// The eviction claims: `claim_stopped_sandbox_for_eviction`,
     /// `claim_suspended_sandbox_for_eviction`,
@@ -424,32 +427,54 @@ edge_table! {
 
 pub use edges::EDGES;
 
+/// A generic guard that refused a write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StateWriteGuard {
+    /// Only deletion leaves `quarantined`.
+    Quarantined,
+    /// Cleanup owns the row.
+    CleanupOwned,
+}
+
 /// Why [`update_state_from`] did not write.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StateWriteRefusal {
     /// The row is not in any of the edge's source states.
     FromState,
-    /// `update_state`'s quarantine guard: only deletion leaves `quarantined`.
-    Quarantined,
-    /// `update_state`'s cleanup-ownership guard.
-    CleanupOwned,
+    Guard(StateWriteGuard),
 }
 
-/// The guards `update_state` and `update_state_from` share. Quarantine answers
-/// first: only deletion leaves `quarantined`. Cleanup then owns the row while
-/// an episode that keeps the row exists or has been requested, while a
-/// cleanup state carries a current `delete_row` intent (except for deletion
-/// itself), and against any target that would revive a `stopping` or cleanup
-/// row. An armed `delete_row` create episode deliberately does not block:
-/// create completion writes through it. Never answers `FromState`.
+/// A guard refusal or a missing row, in the text clients receive.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum SandboxStateWriteNotApplied {
+    #[error("sandbox state write was not applied: {}", guard_label(.0))]
+    Guard(StateWriteGuard),
+    #[error("sandbox state write was not applied: missing")]
+    Missing,
+}
+
+fn guard_label(guard: &StateWriteGuard) -> &'static str {
+    match guard {
+        StateWriteGuard::Quarantined => "blocked_by_quarantine",
+        StateWriteGuard::CleanupOwned => "superseded_by_cleanup_episode",
+    }
+}
+
+/// The guards every generic write of the node-local SQLite `sandboxes.state`
+/// shares. Quarantine answers first: only deletion leaves `quarantined`.
+/// Cleanup then owns the row while an episode that keeps the row exists or has
+/// been requested, while a cleanup state carries a current `delete_row` intent
+/// (except for deletion itself), and against any target that would revive a
+/// `stopping` or cleanup row. An armed `delete_row` create episode
+/// deliberately does not block: create completion writes through it.
 pub(super) fn generic_state_write_refusal(
     conn: &Connection,
     id: &str,
     previous: Option<SandboxState>,
     target: SandboxState,
-) -> Result<Option<StateWriteRefusal>> {
+) -> Result<Option<StateWriteGuard>> {
     if generic_writer_transition_blocked(previous, target) {
-        return Ok(Some(StateWriteRefusal::Quarantined));
+        return Ok(Some(StateWriteGuard::Quarantined));
     }
     let cleanup_owned = cleanup_episode(conn, id)?
         .is_some_and(|episode| !episode.completion.deletes_row() || episode.requested_at.is_some())
@@ -477,7 +502,7 @@ pub(super) fn generic_state_write_refusal(
                 | SandboxState::Resuming
                 | SandboxState::Checkpointing
         ));
-    Ok(cleanup_owned.then_some(StateWriteRefusal::CleanupOwned))
+    Ok(cleanup_owned.then_some(StateWriteGuard::CleanupOwned))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -495,23 +520,19 @@ pub enum StateWriteOutcome {
 
 /// Write `edge.to()` only if the row is in one of `edge.from()`.
 ///
-/// This is `update_state` with an expected-state predicate, part of the
-/// `UPDATE` itself. The generic guards answer first, so every write
-/// `update_state` refuses is refused for the same reason, and converting an
-/// `update_state` caller changes only rows outside the edge's from-set. A
-/// guard refusal does not say whether the row was also outside the from-set:
-/// a caller that must tell the two apart checks `from.contains(found)`, not
-/// the refusal.
+/// The expected-state predicate is part of the `UPDATE` itself. The generic
+/// guards answer first, so a guard refusal does not say whether the row was
+/// also outside the from-set: a caller that must tell the two apart checks
+/// `from.contains(found)`, not the refusal.
 ///
-/// Side effects match `update_state`: the failure reason, restore columns and
-/// non-matching receipts are cleared, and a `deleting` write fails the active
-/// teardown jobs. Inside a caller's transaction this runs in it. In
-/// autocommit it opens its own `IMMEDIATE` transaction, so the guard reads,
-/// the write and the job failure commit together; it never nests one.
+/// The failure reason, restore columns and receipts for another target are
+/// cleared, and a `deleting` write fails the active teardown jobs. Inside a
+/// caller's transaction this runs in it. In autocommit it opens its own
+/// `IMMEDIATE` transaction, so the guard reads, the write and the job failure
+/// commit together; it never nests one.
 ///
-/// Inserts, and targets `update_state` rejects (`quarantined`, `failed`), are
-/// `InvalidQuery`. A write that matches
-/// no row although the row was read in a source state is
+/// Inserts and `quarantined` or `failed` targets are `InvalidQuery`. A write
+/// that matches no row although the row was read in a source state is
 /// `StatementChangedRows(0)`.
 pub fn update_state_from(
     conn: &Connection,
@@ -534,6 +555,52 @@ pub(crate) fn update_state_from_states(
     to: SandboxState,
 ) -> Result<StateWriteOutcome> {
     write_state_from(conn, id, from, to)
+}
+
+/// Stop and Delete admission's write, for
+/// `update_state_superseding_activation_in_transaction` alone. It writes over
+/// every state the generic guards admit, so it is not an `update_state_from`
+/// edge: admission also re-admits a row already in its target, a `stopping`
+/// row for a repeated Stop of a live runtime and a `deleting` row for a
+/// repeated Delete, and no edge lists its own target. The guards refuse a Stop
+/// of a `deleting` or `quarantined` row. [`edges::STOP_ADMISSION`] and
+/// [`edges::DELETE_ADMISSION`] list the transitions it makes.
+pub(super) fn write_cleanup_admission_state(
+    conn: &Connection,
+    id: &str,
+    target: SandboxState,
+) -> Result<std::result::Result<(), SandboxStateWriteNotApplied>> {
+    if !matches!(target, SandboxState::Stopping | SandboxState::Deleting) {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    match write_state_from(conn, id, StateSet::ALL, target)? {
+        StateWriteOutcome::Applied { .. } => Ok(Ok(())),
+        StateWriteOutcome::Refused {
+            refusal: StateWriteRefusal::Guard(guard),
+            ..
+        } => {
+            match guard {
+                StateWriteGuard::Quarantined => tracing::warn!(
+                    sandbox_id = %id,
+                    target_state = %target,
+                    "ignored generic sandbox state update because sandbox is quarantined"
+                ),
+                StateWriteGuard::CleanupOwned => tracing::warn!(
+                    sandbox_id = %id,
+                    target_state = %target,
+                    "ignored generic sandbox state update because cleanup owns the transition"
+                ),
+            }
+            Ok(Err(SandboxStateWriteNotApplied::Guard(guard)))
+        }
+        // `ALL` holds the row's state, so a write that missed it is the
+        // invariant error `write_state_from` returns, never this refusal.
+        StateWriteOutcome::Refused {
+            refusal: StateWriteRefusal::FromState,
+            ..
+        } => Err(rusqlite::Error::StatementChangedRows(0)),
+        StateWriteOutcome::Missing => Ok(Err(SandboxStateWriteNotApplied::Missing)),
+    }
 }
 
 fn write_state_from(
@@ -566,8 +633,11 @@ fn write_state_from_in_transaction(
     let found = found.parse::<SandboxState>().map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error))
     })?;
-    if let Some(refusal) = generic_state_write_refusal(conn, id, Some(found), to)? {
-        return Ok(StateWriteOutcome::Refused { found, refusal });
+    if let Some(guard) = generic_state_write_refusal(conn, id, Some(found), to)? {
+        return Ok(StateWriteOutcome::Refused {
+            found,
+            refusal: StateWriteRefusal::Guard(guard),
+        });
     }
     let from_labels =
         serde_json::to_string(&from.iter().map(|state| state.as_str()).collect::<Vec<_>>())

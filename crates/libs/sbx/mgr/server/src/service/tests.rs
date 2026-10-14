@@ -1906,10 +1906,15 @@ pub(crate) mod service_tests {
                 .as_ref(),
             )
             .unwrap();
-            assert!(
-                crate::db::update_state(&db, &sandbox_id_string, SandboxState::Suspended)
-                    .unwrap()
-                    .is_applied()
+            crate::db::tests::state_write_fixtures::apply_edge(
+                &db,
+                &sandbox_id_string,
+                &crate::db::edges::CREATE_COMPLETE,
+            );
+            crate::db::tests::state_write_fixtures::apply_edge(
+                &db,
+                &sandbox_id_string,
+                &crate::db::edges::CREATE_BASE_SNAPSHOT_COMPLETE,
             );
             assert!(crate::db::complete_create(&db, &sandbox_id_string, cleanup_id, true).unwrap());
             assert!(crate::route_activation_claims::claim_exists(&db, &sandbox_id_string).unwrap());
@@ -5366,10 +5371,11 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Starting);
-        crate::db::update_state(&conn, &sandbox_id, SandboxState::Deleting)
-            .unwrap()
-            .require_applied()
-            .unwrap();
+        crate::db::tests::state_write_fixtures::apply_edge(
+            &conn,
+            &sandbox_id,
+            &crate::db::edges::DELETE_ADMISSION,
+        );
         crate::db::set_cleanup_intent(
             &conn,
             &sandbox_id,
@@ -6693,6 +6699,23 @@ pub(crate) mod service_tests {
 
     fn insert_started_test_sandbox(conn: &rusqlite::Connection, id: &str) {
         insert_test_sandbox_with_runtime(conn, id, SandboxState::Started);
+    }
+
+    /// Move a live `started` row to `restoring`, keeping its empty restore
+    /// columns. No production edge writes this.
+    fn restage_started_as_restoring(conn: &rusqlite::Connection, id: &str) {
+        assert_eq!(
+            crate::db::update_state_from_states(
+                conn,
+                id,
+                crate::db::StateSet::of(&[SandboxState::Started]),
+                SandboxState::Restoring,
+            )
+            .unwrap(),
+            crate::db::StateWriteOutcome::Applied {
+                from: SandboxState::Started
+            }
+        );
     }
 
     pub(crate) fn complete_runtime_endpoint_identity(conn: &rusqlite::Connection, id: &str) {
@@ -10228,10 +10251,11 @@ pub(crate) mod service_tests {
         .expect("delete must reach the cleanup claim");
         {
             let db = service.db.lock().expect("mutex poisoned");
-            crate::db::update_state(&db, &sandbox_id_string, SandboxState::Suspending)
-                .unwrap()
-                .require_applied()
-                .unwrap();
+            crate::db::tests::state_write_fixtures::force_state(
+                &db,
+                &sandbox_id_string,
+                SandboxState::Suspending,
+            );
         }
         drop(cleanup_blocker);
 
@@ -10701,10 +10725,11 @@ pub(crate) mod service_tests {
         let sandbox_id = SandboxId::new();
         let sandbox_id_string = sandbox_id.to_string();
         insert_test_sandbox(&conn, &sandbox_id_string, SandboxState::Started);
-        crate::db::update_state(&conn, &sandbox_id_string, SandboxState::Paused)
-            .unwrap()
-            .require_applied()
-            .unwrap();
+        crate::db::tests::state_write_fixtures::force_state(
+            &conn,
+            &sandbox_id_string,
+            SandboxState::Paused,
+        );
         let service = SandboxManagerService::for_test(conn);
 
         let result = service
@@ -10922,10 +10947,11 @@ pub(crate) mod service_tests {
                 runtime_fields(ExecutionGeneration::new(2).unwrap(), 7),
             )
             .unwrap();
-            crate::db::update_state(&conn, &sandbox_id, SandboxState::Stopping)
-                .unwrap()
-                .require_applied()
-                .unwrap();
+            crate::db::tests::state_write_fixtures::apply_edge(
+                &conn,
+                &sandbox_id,
+                &crate::db::edges::STOP_ADMISSION,
+            );
             crate::db::set_cleanup_intent(
                 &conn,
                 &sandbox_id,
@@ -11048,10 +11074,11 @@ pub(crate) mod service_tests {
             runtime_fields(deleted_generation, 7),
         )
         .unwrap();
-        crate::db::update_state(conn, sandbox_id, SandboxState::Deleting)
-            .unwrap()
-            .require_applied()
-            .unwrap();
+        crate::db::tests::state_write_fixtures::apply_edge(
+            conn,
+            sandbox_id,
+            &crate::db::edges::DELETE_ADMISSION,
+        );
         crate::db::set_cleanup_intent(
             conn,
             sandbox_id,
@@ -11762,10 +11789,11 @@ pub(crate) mod service_tests {
             ExecutionGeneration::new(1).unwrap(),
         )
         .unwrap();
-        crate::db::update_state(&conn, &sandbox_id.to_string(), SandboxState::Paused)
-            .unwrap()
-            .require_applied()
-            .unwrap();
+        crate::db::tests::state_write_fixtures::apply_edge(
+            &conn,
+            &sandbox_id.to_string(),
+            &crate::db::edges::SUSPEND_ROLLBACK,
+        );
         crate::db::update_runtime_fields(
             &conn,
             sandbox_id,
@@ -14869,10 +14897,11 @@ pub(crate) mod service_tests {
         };
         {
             let db = service.db.lock().expect("mutex poisoned");
-            crate::db::update_state(&db, &sandbox_id, SandboxState::Paused)
-                .unwrap()
-                .require_applied()
-                .unwrap();
+            crate::db::tests::state_write_fixtures::apply_edge(
+                &db,
+                &sandbox_id,
+                &crate::db::edges::SUSPEND_ROLLBACK,
+            );
         }
         let cache_dir = tempfile::tempdir().unwrap();
 
@@ -16487,10 +16516,11 @@ pub(crate) mod service_tests {
         let service = SandboxManagerService::for_test(conn);
         {
             let db = service.db.lock().expect("mutex poisoned");
-            crate::db::update_state(&db, &sandbox_id, SandboxState::Suspended)
-                .unwrap()
-                .require_applied()
-                .unwrap();
+            crate::db::tests::state_write_fixtures::force_state(
+                &db,
+                &sandbox_id,
+                SandboxState::Suspended,
+            );
         }
         let stale = seed_due_access_idle_sandbox_state(&service, &sandbox_id, &policy, 300);
 
@@ -17123,10 +17153,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_started_test_sandbox(&conn, &sandbox_id);
-        crate::db::update_state(&conn, &sandbox_id, SandboxState::Restoring)
-            .unwrap()
-            .require_applied()
-            .unwrap();
+        restage_started_as_restoring(&conn, &sandbox_id);
         // The test service's node-manager refuses every dial, so the
         // retirement's cleanup cannot start and the row keeps the intent it
         // persisted.
@@ -17814,10 +17841,11 @@ pub(crate) mod service_tests {
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Suspended);
         register_full_suspend_artifact(&conn, &sandbox_id);
-        crate::db::update_state(&conn, &sandbox_id, SandboxState::Restoring)
-            .unwrap()
-            .require_applied()
-            .unwrap();
+        crate::db::tests::state_write_fixtures::apply_edge(
+            &conn,
+            &sandbox_id,
+            &crate::db::edges::RESTORE_BEGIN,
+        );
         let service = service_with_runtime_probe(conn, false);
 
         let _ = service
@@ -18133,10 +18161,7 @@ pub(crate) mod service_tests {
 
         let complete_but_dead_id = Uuid::now_v7().to_string();
         insert_started_test_sandbox(&conn, &complete_but_dead_id);
-        crate::db::update_state(&conn, &complete_but_dead_id, SandboxState::Restoring)
-            .unwrap()
-            .require_applied()
-            .unwrap();
+        restage_started_as_restoring(&conn, &complete_but_dead_id);
         let complete_but_dead = crate::db::get_sandbox(&conn, &complete_but_dead_id)
             .unwrap()
             .expect("sandbox row");

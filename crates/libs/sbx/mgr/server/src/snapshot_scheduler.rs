@@ -41,16 +41,14 @@ fn lock_db(ctx: &CheckpointContext) -> Result<MutexGuard<'_, rusqlite::Connectio
 
 /// `do_checkpoint`'s admission to the node-local SQLite `sandboxes.state`:
 /// `started` or `paused` to `checkpointing`, under the connection guard that
-/// read the state. Guard refusals and a missing row keep `update_state`'s
-/// message, and a from-state refusal reports the state found; this module's
+/// read the state. Guard refusals and a missing row render
+/// `SandboxStateWriteNotApplied`, and a from-state refusal reports the state
+/// found; this module's
 /// errors are strings, so it cannot use the service's status mapping.
 fn begin_checkpoint_state(db: &rusqlite::Connection, sandbox_id: &str) -> Result<(), String> {
-    use crate::db::{
-        SandboxStateWriteNotApplied, SandboxStateWriteOutcome as Legacy, StateWriteOutcome,
-        StateWriteRefusal,
-    };
+    use crate::db::{SandboxStateWriteNotApplied, StateWriteOutcome, StateWriteRefusal};
     let edge = &crate::db::edges::CHECKPOINT_BEGIN;
-    let outcome = match crate::db::update_state_from(db, sandbox_id, edge)
+    let not_applied = match crate::db::update_state_from(db, sandbox_id, edge)
         .map_err(|error| format!("db error: {error}"))?
     {
         StateWriteOutcome::Applied { .. } => return Ok(()),
@@ -63,16 +61,12 @@ fn begin_checkpoint_state(db: &rusqlite::Connection, sandbox_id: &str) -> Result
             ));
         }
         StateWriteOutcome::Refused {
-            refusal: StateWriteRefusal::Quarantined,
+            refusal: StateWriteRefusal::Guard(guard),
             ..
-        } => Legacy::BlockedByQuarantine,
-        StateWriteOutcome::Refused {
-            refusal: StateWriteRefusal::CleanupOwned,
-            ..
-        } => Legacy::SupersededByCleanupEpisode,
-        StateWriteOutcome::Missing => Legacy::Missing,
+        } => SandboxStateWriteNotApplied::Guard(guard),
+        StateWriteOutcome::Missing => SandboxStateWriteNotApplied::Missing,
     };
-    Err(SandboxStateWriteNotApplied { outcome }.to_string())
+    Err(not_applied.to_string())
 }
 
 pub(crate) fn write_file_atomic(
