@@ -2,7 +2,7 @@ use pplx_space_common_core::sql;
 use std::collections::{BTreeSet, HashSet};
 
 use pplx_space_common_core::types::NodeId;
-use pplx_space_common_core::types::{NodeManagedBy, NodeRole as SpaceNodeRole};
+use pplx_space_common_core::types::{NodeManagedBy, NodeRole as SpaceNodeRole, SubstrateKind};
 use pplx_space_common_svc::types::{
     RECONCILE_REASON_MAX_CHARS, ReconcileReason,
     normalize_reconcile_reason as normalize_shared_reconcile_reason,
@@ -241,11 +241,12 @@ pub async fn fetch_trigger_targets(
          LEFT JOIN node_k8s nk ON nk.node_id = n.id
          WHERE n.id = ANY($1)
            AND n.role IN ($2, $3)
-           AND (n.managed_by != 'space' OR (nd.node_id IS NOT NULL AND nd.deleted_at IS NULL))"
+           AND (n.managed_by != $4 OR (nd.node_id IS NOT NULL AND nd.deleted_at IS NULL))"
     ))
     .bind(node_ids)
     .bind(SpaceNodeRole::Worker)
     .bind(SpaceNodeRole::Builder)
+    .bind(SubstrateKind::Space)
     .fetch_all(pool)
     .await?;
     // An empty warm snapshot means membership is unknown, not that every node

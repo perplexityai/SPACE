@@ -7,8 +7,8 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::{
-    FieldPatch, SandboxDesiredStatePatch, SandboxMetadata, SandboxMetadataValue,
-    any_undescribed_artifact_owner, get, update_desired_state,
+    AutoLifecycleExecution, FieldPatch, SandboxDesiredStatePatch, SandboxMetadata,
+    SandboxMetadataValue, any_undescribed_artifact_owner, get, update_desired_state,
 };
 
 /// The three desired-state columns, read back raw.
@@ -94,6 +94,31 @@ fn field_patch_default_does_not_require_t_default() {
         SandboxDesiredStatePatch::default().vcpu,
         FieldPatch::Unchanged
     );
+}
+
+/// Only a Kubernetes-managed row can prove there is no execution; a Direct or
+/// unrecognized `managed_by` leaves the outcome uncertain.
+#[test]
+fn proves_no_execution_only_for_kubernetes_rows() {
+    for (managed_by, proves) in [
+        ("k8s", true),
+        ("space", false),
+        ("kubernetes", false),
+        ("", false),
+    ] {
+        let execution = AutoLifecycleExecution {
+            managed_by: managed_by.to_owned(),
+            lifecycle: "started".to_owned(),
+            placement: "unplaced".to_owned(),
+            active_node_id: None,
+            target_node_id: None,
+            execution_generation: None,
+            has_direct_route: false,
+            has_activation_lease: false,
+            policy: sqlx::types::Json(Default::default()),
+        };
+        assert_eq!(execution.proves_no_execution(), proves, "{managed_by:?}");
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

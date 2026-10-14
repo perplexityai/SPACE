@@ -185,15 +185,18 @@ must not fail the batch, read it as text and parse it per row, as
 an unrecognized value. Test fixtures may write literal `managed_by` values into
 the rows they set up; the rule covers the statements under test.
 
-The cluster controller's own statements follow this, except where they embed
-`routable_execution_or_non_k8s`
+The production code of the cluster controller, internal-api and the trigger
+queue follows this, except where it embeds `routable_execution_or_non_k8s`
 (`crates/libs/common/svc/src/sql/sandbox_routability.rs`), a shared fragment
 that writes `managed_by <> 'k8s'` into the transient sweeper's aged-transient
-list and restoring convergence, and into internal-api and api statements. That
-fragment and a few dozen production lines elsewhere that compare `managed_by`
-with a raw `'k8s'` or `'space'`
-(`crates/libs/api/src/controllers/substrate/direct.rs` has about a dozen) are
-existing debt to convert when touched, not a pattern to copy.
+list and restoring convergence, internal-api's restored-state convergence and
+the api crate's wake completion. That fragment is existing debt, as are the
+sandbox store's public `SandboxRecord.managed_by` and
+`AutoLifecycleExecution.managed_by` fields, which single-row reads still return
+as text (`proves_no_execution` parses the latter), and a few dozen production
+lines elsewhere that compare `managed_by` with a raw `'k8s'` or `'space'`
+(`crates/libs/api/src/controllers/substrate/direct.rs` has about a dozen).
+Convert them when touched; they are not a pattern to copy.
 
 ## Log targets: pin the ones searches select on
 

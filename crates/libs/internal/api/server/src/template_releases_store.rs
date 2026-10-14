@@ -6,7 +6,7 @@
 //!
 //! [`WarmPoolStore`]: pplx_space_cluster_pool::WarmPoolStore
 
-use pplx_space_common_core::types::{NodeId, OrgId};
+use pplx_space_common_core::types::{NodeId, OrgId, SubstrateKind};
 
 use std::net::IpAddr;
 
@@ -121,10 +121,12 @@ impl TemplateReleasesStore {
             "SELECT id
              FROM nodes
              WHERE address = $1::INET
-               AND managed_by IN ('space', 'k8s')
+               AND managed_by IN ($2, $3)
                AND COALESCE(state, 'registered') != 'deleted'"
         ))
         .bind(address.to_string())
+        .bind(SubstrateKind::Space)
+        .bind(SubstrateKind::Kubernetes)
         .fetch_all(&self.pool)
         .await?;
         Ok(TemplateReadScope::NodeScoped { node_ids })

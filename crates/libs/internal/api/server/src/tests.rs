@@ -1,5 +1,6 @@
 mod prefetch_catalog;
 mod reconcile_claim_origins;
+mod substrate_scope;
 use pplx_space_common_core::types::{LocalArtifactId, NodeId, OrgId, SnapshotId, UserId};
 
 use super::metadata::*;

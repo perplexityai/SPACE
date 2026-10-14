@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::{NodeId, SnapshotId};
+use pplx_space_common_core::types::{NodeId, SnapshotId, SubstrateKind};
 
 use pplx_space_common_core::sql;
 use std::collections::{BTreeMap, BTreeSet};
@@ -2183,7 +2183,7 @@ pub async fn publish_sandbox_states(
                  SELECT s.id
                  FROM sandboxes s
                  WHERE s.active_node_id = $1
-                   AND s.managed_by = 'space'
+                   AND s.managed_by = $3
                    AND s.lifecycle = 'stopped'
                    AND s.id = ANY($2)
              ),
@@ -2204,6 +2204,7 @@ pub async fn publish_sandbox_states(
         ))
         .bind(node_id)
         .bind(&absent_ids)
+        .bind(SubstrateKind::Space)
         .fetch_all(&mut *conn)
         .await
         .map_err(|err| {
@@ -2594,7 +2595,7 @@ pub async fn publish_sandbox_states(
                JOIN sandboxes s ON s.id = input.sandbox_id
                JOIN sandbox_k8s_executions e ON e.sandbox_id = s.id
               WHERE s.active_node_id = $1
-                AND s.managed_by = 'k8s'
+                AND s.managed_by = $5
                 AND s.lifecycle = 'started'
                 AND e.active AND e.state IN ('running', 'recovering')
                 AND e.generation = input.execution_generation
@@ -2625,6 +2626,7 @@ pub async fn publish_sandbox_states(
     .bind(rows_json.clone())
     .bind(FACET_SANDBOX_DESIRED_STATE)
     .bind(SANDBOX_LOCAL_SUSPEND_KEY)
+    .bind(SubstrateKind::Kubernetes)
     .execute(&mut *conn)
     .await
     .map_err(|err| Status::internal(format!("publish local suspend handoff observation: {err}")))?;
@@ -3373,7 +3375,7 @@ async fn project_node_published_failed_sandboxes(
              FROM sandboxes s
              JOIN input ON input.sandbox_id = s.id
              WHERE s.active_node_id = $1
-               AND s.managed_by = 'k8s'
+               AND s.managed_by = $3
                AND LOWER(TRIM(input.status)) = 'failed'
                AND LOWER(TRIM(s.lifecycle)) NOT IN (
                    'failed',
@@ -3392,6 +3394,7 @@ async fn project_node_published_failed_sandboxes(
     ))
     .bind(node_id)
     .bind(rows_json)
+    .bind(SubstrateKind::Kubernetes)
     .fetch_all(&mut *conn)
     .await
     .map_err(|err| Status::internal(format!("mark failed sandbox lifecycle: {err}")))?;

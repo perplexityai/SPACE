@@ -50,7 +50,7 @@ use pplx_space_common_core::types::{
     ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, BackupAttemptId, Digest, ExactStorageUri,
     LocalArtifactId, NodeId, NodeRole as SpaceNodeRole, OrgId, RuntimeKind, SandboxId,
     SnapshotArtifact as SnapshotArtifactFile, SnapshotContentHash, SnapshotId, SnapshotKind,
-    SnapshotName, SnapshotState, TemplateName,
+    SnapshotName, SnapshotState, SubstrateKind, TemplateName,
 };
 use pplx_space_common_svc::types::{
     FACET_NETWORK_POLICY, FACET_NODE_STATUS, FACET_SANDBOX_DESIRED_STATE, FACET_SANDBOX_INVENTORY,
@@ -1294,11 +1294,12 @@ impl ClusterApiService {
              JOIN node_direct nd ON nd.node_id = n.id
              WHERE ($1::TEXT IS NULL OR n.role = $1)
                AND ($2::BOOL OR nd.deleted_at IS NULL)
-               AND n.managed_by = 'space'
+               AND n.managed_by = $3
              ORDER BY n.role ASC, nd.name ASC NULLS LAST, nd.node_api_endpoint ASC"
         ))
         .bind(role.map(SpaceNodeRole::as_str))
         .bind(include_deleted)
+        .bind(SubstrateKind::Space)
         .fetch_all(&self.pool)
         .await
         .map_err(|err| Status::internal(format!("query nodes: {err}")))
@@ -1328,7 +1329,7 @@ impl ClusterApiService {
              FROM nodes n
              JOIN node_k8s nk ON nk.node_id = n.id
              WHERE nk.k8s_node_name = $1
-               AND n.managed_by = 'k8s'
+               AND n.managed_by = $3
                AND n.role = $2
                AND COALESCE(n.state, 'registered') != 'deleted'
              ORDER BY nk.updated_at DESC, n.created_at DESC
@@ -1336,6 +1337,7 @@ impl ClusterApiService {
         ))
         .bind(&value)
         .bind(role_hint_str)
+        .bind(SubstrateKind::Kubernetes)
         .fetch_optional(&self.pool)
         .await
         .map_err(|err| Status::internal(format!("resolve Kubernetes origin node: {err}")))?;
@@ -1403,19 +1405,20 @@ impl ClusterApiService {
 
         let inserted = sqlx::query_scalar::<_, NodeId>(sql!(
             "INSERT INTO nodes (id, address, role, managed_by, state, last_heartbeat)
-             VALUES ($1, $2::INET, $3, 'k8s', 'registered', NOW())
+             VALUES ($1, $2::INET, $3, $4, 'registered', NOW())
              ON CONFLICT (id) DO UPDATE
              SET address = EXCLUDED.address,
                  role = EXCLUDED.role,
                  managed_by = EXCLUDED.managed_by,
                  state = COALESCE(nodes.state, EXCLUDED.state),
                  last_heartbeat = NOW()
-             WHERE nodes.managed_by = 'k8s'
+             WHERE nodes.managed_by = $4
              RETURNING id"
         ))
         .bind(node_id)
         .bind(remote_ip.to_string())
         .bind(role.as_str())
+        .bind(SubstrateKind::Kubernetes)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|err| Status::internal(format!("bootstrap Kubernetes node registry: {err}")))?;
@@ -1521,12 +1524,14 @@ async fn registered_origin_node(
          FROM nodes n
          WHERE n.id = $1
            AND ($2::TEXT IS NULL OR n.role = $2)
-           AND n.managed_by IN ('space', 'k8s')
+           AND n.managed_by IN ($3, $4)
            AND COALESCE(n.state, 'registered') != 'deleted'
          LIMIT 1"
     ))
     .bind(node_id.as_uuid())
     .bind(role_hint.map(SpaceNodeRole::as_str))
+    .bind(SubstrateKind::Space)
+    .bind(SubstrateKind::Kubernetes)
     .fetch_optional(executor)
     .await
     .map_err(|err| Status::internal(format!("resolve origin node: {err}")))?;

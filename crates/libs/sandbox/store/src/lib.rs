@@ -60,7 +60,7 @@ use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_common_core::types::{NodeId, SandboxId, SubstrateKind};
 use pplx_space_sandbox_portability::{
     artifact_has_durable_copy, sandbox_attached_anywhere, sandbox_attached_to_node,
 };
@@ -513,9 +513,13 @@ pub struct AutoLifecycleExecution {
 impl AutoLifecycleExecution {
     /// Kubernetes publishes activation ownership before launching a runtime;
     /// direct launch does not provide equivalent durable proof of absence.
+    /// `managed_by` holds the column's text; only a value that parses as
+    /// [`SubstrateKind::Kubernetes`] proves absence.
     pub fn proves_no_execution(&self) -> bool {
-        self.managed_by == "k8s"
-            && self.placement == "unplaced"
+        matches!(
+            self.managed_by.parse::<SubstrateKind>(),
+            Ok(SubstrateKind::Kubernetes)
+        ) && self.placement == "unplaced"
             && self.active_node_id.is_none()
             && self.target_node_id.is_none()
             && self.execution_generation.is_none()

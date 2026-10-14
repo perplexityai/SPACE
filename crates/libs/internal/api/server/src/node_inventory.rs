@@ -1,7 +1,10 @@
 //! Kubernetes registrations for node inventory, not direct-node template polling.
 
 use super::NodeRow;
-use pplx_space_common_core::{sql, types::NodeRole};
+use pplx_space_common_core::{
+    sql,
+    types::{NodeRole, SubstrateKind},
+};
 use pplx_space_node_api_client::DEFAULT_PORT;
 use sqlx::PgExecutor;
 
@@ -26,7 +29,7 @@ pub(super) async fn list_kubernetes(
          FROM nodes n
          JOIN node_k8s nk ON nk.node_id = n.id
          LEFT JOIN node_k8s_tombstones t ON t.node_id = n.id
-         WHERE n.managed_by = 'k8s'
+         WHERE n.managed_by = $5
            AND ($1::TEXT IS NULL OR n.role = $1)
            AND ($2::BOOL OR (n.state IS DISTINCT FROM 'deleted' AND t.node_id IS NULL))
          ORDER BY n.role, nk.k8s_node_name, n.id"
@@ -35,6 +38,7 @@ pub(super) async fn list_kubernetes(
     .bind(include_deleted)
     .bind(DEFAULT_PORT.to_string())
     .bind(pplx_space_common_grpc::internal_transport::advertised_endpoint_prefix())
+    .bind(SubstrateKind::Kubernetes)
     .fetch_all(executor)
     .await
 }

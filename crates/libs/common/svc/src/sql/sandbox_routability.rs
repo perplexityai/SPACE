@@ -48,6 +48,12 @@ pub fn routable_k8s_execution_exists(sandbox_alias: &str) -> String {
 /// aliased as `sandbox_alias` satisfies the routability contract *or* has no
 /// such contract (`managed_by <> 'k8s'`). The composition callers gate
 /// `started`-convergence on.
+///
+/// The substrate value is still spelled in the fragment rather than bound
+/// (see "Substrate values are bound parameters" in
+/// `docs/rust/space-conventions.md`): binding it means every caller passes the
+/// placeholder its own statement numbers, including the api crate's
+/// wake-completion statement.
 pub fn routable_execution_or_non_k8s(sandbox_alias: &str) -> String {
     let routable = routable_k8s_execution_exists(sandbox_alias);
     format!(

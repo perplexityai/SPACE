@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::NodeId;
+use pplx_space_common_core::types::{NodeId, SubstrateKind};
 
 use super::*;
 use pplx_space_common_core::sql;
@@ -46,7 +46,7 @@ pub(super) async fn prune_absent_node_sandboxes(
                  restore_lease_expires_at = NULL,
                  restore_lease_token = NULL
              WHERE s.active_node_id = $1
-               AND s.managed_by = 'space'
+               AND s.managed_by = $4
                AND s.lifecycle NOT IN ('deleted', 'deleting')
                AND NOT (s.id = ANY($2))
              RETURNING s.id AS sandbox_id
@@ -58,6 +58,7 @@ pub(super) async fn prune_absent_node_sandboxes(
     .bind(node_id)
     .bind(present_sandbox_ids)
     .bind(FACET_NETWORK_POLICY)
+    .bind(SubstrateKind::Space)
     .execute(&mut *conn)
     .await
     .map_err(|err| {

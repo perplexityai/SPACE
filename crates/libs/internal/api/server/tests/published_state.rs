@@ -17,7 +17,7 @@ use pplx_space_common_core::{
 use pplx_space_common_svc::types::{
     AutoLifecyclePolicyFingerprint, FACET_NETWORK_POLICY, FACET_SANDBOX_DESIRED_STATE,
     NetworkPolicyTarget, SANDBOX_FAILURE_ACTIVATION_ATTEMPT_ID_KEY, SANDBOX_FAILURE_EPISODE_KEY,
-    SANDBOX_FAILURE_EXECUTION_GENERATION_KEY,
+    SANDBOX_FAILURE_EXECUTION_GENERATION_KEY, SANDBOX_LOCAL_SUSPEND_KEY,
 };
 use pplx_space_db_test_fixtures::{
     insert_pool_slot_receipt, insert_ready_worker_node, pg_test_db, pool_slot_receipt_state,
@@ -2044,6 +2044,55 @@ async fn publishing_suspended_node_state_with_mismatched_execution_identity_pres
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn publishing_local_suspend_handoff_records_only_kubernetes_rows() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    insert_ready_worker_node(&db.pool, node_id).await?;
+    let mut published = Vec::new();
+    let mut sandboxes = Vec::new();
+    for managed_by in ["k8s", "space"] {
+        let sandbox_id = SandboxId::new();
+        insert_active_sandbox_with_managed_by(&db.pool, sandbox_id, node_id, "started", managed_by)
+            .await?;
+        insert_k8s_execution(&db.pool, sandbox_id, 1, "running", None).await?;
+        let mut state = published_sandbox_state(sandbox_id, "suspended");
+        state.execution_generation = Some(1);
+        state.pod_uid = Some("pod-uid-1".to_string());
+        state.current_local_artifact_id = Some(Uuid::now_v7().to_string());
+        state.current_local_artifact_kind =
+            Some(pplx_space_sbx_mgr_client::proto::ArtifactKind::Full as i32);
+        state.current_local_artifact_origin =
+            Some(pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend as i32);
+        published.push(state);
+        sandboxes.push((sandbox_id, managed_by == "k8s"));
+    }
+
+    let mut conn = db.pool.acquire().await?;
+    publish_sandbox_states(&mut conn, node_id, &published).await?;
+    drop(conn);
+
+    for (sandbox_id, recorded) in sandboxes {
+        let handoff: bool = sqlx::query_scalar(sql!(
+            "SELECT EXISTS (
+                 SELECT 1 FROM node_facet_observed_status
+                  WHERE node_id = $1 AND facet = $2 AND element = $3
+                    AND observed_payload ? $4
+             )"
+        ))
+        .bind(node_id)
+        .bind(FACET_SANDBOX_DESIRED_STATE)
+        .bind(sandbox_id.to_string())
+        .bind(SANDBOX_LOCAL_SUSPEND_KEY)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(handoff, recorded, "sandbox {sandbox_id}");
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn publishing_exact_suspend_recovers_execution_with_cleared_pod_uid() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
@@ -2242,25 +2291,48 @@ async fn publishing_absent_stopped_space_sandbox_deletes_central_row() -> TestRe
     };
     let node_id = NodeId::new();
     let sandbox_id = SandboxId::new();
+    // Otherwise identical, but Kubernetes-managed: absence does not delete it.
+    let k8s_sandbox_id = SandboxId::new();
     insert_ready_worker_node(&db.pool, node_id).await?;
     insert_active_sandbox_with_managed_by(&db.pool, sandbox_id, node_id, "stopped", "space")
         .await?;
+    insert_active_sandbox_with_managed_by(&db.pool, k8s_sandbox_id, node_id, "stopped", "k8s")
+        .await?;
 
     insert_pool_slot_receipt(&db.pool, sandbox_id, "bound").await?;
+    insert_pool_slot_receipt(&db.pool, k8s_sandbox_id, "bound").await?;
 
     let mut conn = db.pool.acquire().await?;
     publish_sandbox_states(
         &mut conn,
         node_id,
-        &[published_sandbox_state(sandbox_id, "stopped")],
+        &[
+            published_sandbox_state(sandbox_id, "stopped"),
+            published_sandbox_state(k8s_sandbox_id, "stopped"),
+        ],
     )
     .await?;
-    let accepted =
-        publish_sandbox_states(&mut conn, node_id, &[absent_sandbox_state(sandbox_id)]).await?;
+    let accepted = publish_sandbox_states(
+        &mut conn,
+        node_id,
+        &[
+            absent_sandbox_state(sandbox_id),
+            absent_sandbox_state(k8s_sandbox_id),
+        ],
+    )
+    .await?;
 
-    assert_eq!(accepted.accepted, 1);
+    assert_eq!(accepted.accepted, 2);
     assert!(!sandbox_exists(&db.pool, sandbox_id).await?);
     assert_eq!(pool_slot_receipt_state(&db.pool, sandbox_id).await?, None);
+    assert_eq!(
+        sandbox_lifecycle(&db.pool, k8s_sandbox_id).await?,
+        "stopped"
+    );
+    assert_eq!(
+        pool_slot_receipt_state(&db.pool, k8s_sandbox_id).await?,
+        Some("bound".to_owned())
+    );
     Ok(())
 }
 
