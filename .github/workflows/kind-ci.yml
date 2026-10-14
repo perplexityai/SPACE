@@ -108,9 +108,10 @@ jobs:
     if: github.repository == 'perplexityai/SPACE' && github.event_name == 'push' && github.ref == 'refs/heads/main'
     name: Export the Kind runtime image cache
     needs: smoke
-    permissions:
-      contents: read
-      packages: write
+    # No permissions block: GitHub checks a called job's permissions against
+    # every caller, including this skipped job against the pull request
+    # caller's packages: read, and rejects the whole workflow file. The token
+    # is the caller's, which only main's call grants packages: write.
     concurrency:
       group: kind-runtime-image-cache
       cancel-in-progress: false
