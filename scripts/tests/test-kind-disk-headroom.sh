@@ -2,7 +2,8 @@
 # Exercise check-disk-headroom.sh with stub `docker` and `df`; never reads the
 # host's disks or daemon.
 #   1. Both disks with room: silent.
-#   2. A low Docker data root warns with its safe cleanup, and only that.
+#   2. A low Docker data root warns with its safe cleanups, the host image
+#      prune among them, and only that.
 #   3. A low data root that does not exist yet is measured at its nearest
 #      existing ancestor and warns with the superseded-image prune, never
 #      recommending `crictl rmi --prune`.
@@ -56,6 +57,7 @@ STUB_DOCKER_FREE_KIB=$plenty STUB_DATA_FREE_KIB=$plenty run
 STUB_DOCKER_FREE_KIB=$short STUB_DATA_FREE_KIB=$plenty run
 has "the Docker data root ($work/docker-root) has 12.0 GiB free, under 30 GiB."
 has "docker image prune -f"
+has "prune-superseded-images.py --host --cluster space-local"
 lacks "SPACE_KIND_DATA_ROOT ("
 
 # Case 3.

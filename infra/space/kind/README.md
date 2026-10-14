@@ -687,6 +687,7 @@ and fail on the first sandbox with a healthy-looking cluster.
 | `SPACE_VENDOR_ROOT` | `~/.space-devbox/space/vendor` | mounted at `/space/vendor` on the sandbox and builder nodes |
 | `SPACE_KIND_DATA_ROOT` | `~/.kind-data` | mounted at `/var/lib/containerd` on every node |
 | `SPACE_KIND_PRUNE_SUPERSEDED_IMAGES` | on | `0` keeps every superseded build of SPACE's own images in the `SPACE_KIND_DATA_ROOT` stores; see [Diagnosing iteration disk pressure](#diagnosing-iteration-disk-pressure) |
+| `SPACE_TILT_PRUNE_HOST_IMAGES` | on | `0` keeps every superseded build of SPACE's own images in the host's Docker store, under Tilt and after `bootstrap.sh`; see [Diagnosing iteration disk pressure](#diagnosing-iteration-disk-pressure) |
 | `SPACE_KIND_CONFIG` | `~/.space-devbox/kind/kind-cluster.yaml` | the rendered config itself |
 
 That path is where a completed render is *published*, not the file any given
@@ -810,6 +811,20 @@ Third-party images, and images of repositories the harness no longer builds,
 are never touched. `--dry-run` lists what it would remove;
 `SPACE_KIND_PRUNE_SUPERSEDED_IMAGES=0` turns it off on both paths.
 
+The host's Docker store, where the images are built, keeps old builds too.
+Every Tilt build of an image adds two tags to it: `:tilt-build-<time>`, the
+`$EXPECTED_REF` the Tiltfile's `custom_build` commands tag, and Tilt's own
+`:tilt-<hash>`. Tilt's built-in pruner (`docker_prune_settings`) never removes
+these builds, whatever their labels, because it passes over every image with
+more than one tag. On Docker's graph-driver store, a rebuilt `:local` image
+also leaves its previous build behind untagged; the containerd image store
+drops it. So the same script runs with `--host`: as the Tilt resource
+`prune-host-images` whenever an update has settled, and in `bootstrap.sh` after
+the node pass. It applies the rules above to the host's images, with any
+container on the host holding an image, and also keeps each image's newest
+build that nothing current names, so the build before the current one stays.
+`SPACE_TILT_PRUNE_HOST_IMAGES=0` turns it off on both paths.
+
 Do not run `crictl rmi --prune` in a node instead. It removes every image no
 container is using at that moment, which includes SPACE images Kind cannot pull
 back: the seed publisher between publishes, or the worker image while a builder
@@ -824,10 +839,15 @@ cannot remove anything a bring-up needs. To inspect a node:
 ```bash
 docker exec space-local-worker df -h /var/lib/containerd
 python3 infra/space/kind/scripts/prune-superseded-images.py --dry-run
+python3 infra/space/kind/scripts/prune-superseded-images.py --host --dry-run
 ```
 
 The BuildKit cache is host-global and shared by other worktrees. Do not run
 `docker builder prune` without explicit approval after stating that impact.
+Tilt's built-in pruner, on by default because the Tiltfile does not configure
+it, already removes BuildKit cache that no build has used for six hours, from
+every worktree: Docker (29.x) accepts the label filter it sends with that request but
+does not apply it.
 The Docker data root may live on a separate volume, so check available space
 inside a Kind node before starting a large build. Cold Rust builds can consume
 substantial space; the incremental artifact build keeps its `target/` under

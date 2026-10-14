@@ -38,6 +38,9 @@
 #   SPACE_KIND_PRUNE_SUPERSEDED_IMAGES=0 keep superseded builds of SPACE's
 #                            images in the node stores (default: removed once
 #                            the stack is up; see prune-superseded-images.py)
+#   SPACE_TILT_PRUNE_HOST_IMAGES=0 keep superseded builds in the host's Docker store
+#                            (default: all but the current and previous build
+#                            of each removed, here and under Tilt)
 #   SPACE_KIND_MIN_FREE_GIB  warn before bring-up when the Docker data root or
 #                            SPACE_KIND_DATA_ROOT has less free (default: 30)
 #
@@ -608,6 +611,11 @@ done
 # never fails the bring-up that already succeeded.
 python3 "$KIND_DIR/scripts/prune-superseded-images.py" --cluster "$KIND_CLUSTER" \
   || log "WARNING: the superseded-image prune did not finish; the stack is up, and the next bring-up retries it"
+# The host's Docker store keeps the builds too, by the same rules plus the build
+# before the current one: Tilt's builds of these images from earlier sessions,
+# and, on Docker's graph-driver store, each `:local` build the last one replaced.
+python3 "$KIND_DIR/scripts/prune-superseded-images.py" --host --cluster "$KIND_CLUSTER" \
+  || log "WARNING: the host image prune did not finish; the stack is up, and the next bring-up retries it"
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 cat <<MSG

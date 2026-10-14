@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Remove superseded builds of SPACE's locally built images from the Kind nodes.
+"""Remove superseded builds of SPACE's locally built images from the Kind nodes,
+or with --host from the host's Docker store.
 
 Every bring-up loads fresh builds of the images in lib/space-images.sh into
 every node's containerd store, which lives under $SPACE_KIND_DATA_ROOT and
@@ -19,19 +20,31 @@ An image is removed only when all of these hold:
   serving this cluster last built;
 * no container on that node, running or exited, uses it.
 
+With --host the same rules select from the host's Docker store, where the
+builds are made, except that each image also keeps its newest build nothing
+current names: the build before the current one. There every Tilt build adds a
+`:tilt-build-<time>` tag and Tilt's own `:tilt-<hash>` (custom_build), and on
+Docker's graph-driver store a rebuilt `:local` leaves the previous build
+untagged. Tilt's docker_prune_settings pruner removes none of them: it passes
+over every image with more than one tag (internal/engine/dockerprune/
+docker_pruner.go in tilt-dev/tilt).
+
 Anything else, third-party images included, is left alone. Pruning is skipped
 while the Tilt serving this cluster has a build pending or in progress, because
 a just-loaded image is not deployed yet, and checked again before each removal,
 stopping the pass as soon as Tilt has begun one. The sizes it logs are what
-`crictl images` reports, the image content; the unpacked layers free more.
+`crictl images` (or, on the host, `docker image inspect`) reports, the image
+content; the unpacked layers free more, and layers a kept build shares stay.
 
 Usage:
   prune-superseded-images.py                  # one pass (bootstrap.sh)
   prune-superseded-images.py --dry-run        # report only
   prune-superseded-images.py --watch 30 \\
       --tilt-resource prune-superseded-images  # the Tiltfile's resource
+  prune-superseded-images.py --host           # the host's Docker store
 
-Set SPACE_KIND_PRUNE_SUPERSEDED_IMAGES=0 to disable it.
+Set SPACE_KIND_PRUNE_SUPERSEDED_IMAGES=0 to keep the nodes' builds, and
+SPACE_TILT_PRUNE_HOST_IMAGES=0 to keep the host's.
 """
 
 from __future__ import annotations
@@ -45,11 +58,13 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 KIND_DIR = Path(__file__).resolve().parents[1]
 IMAGES_LIB = KIND_DIR / "lib/space-images.sh"
 OPT_OUT = "SPACE_KIND_PRUNE_SUPERSEDED_IMAGES"
+HOST_OPT_OUT = "SPACE_TILT_PRUNE_HOST_IMAGES"
 TITLE_LABEL = "org.opencontainers.image.title"
 LOCAL_TAG = "local"
 # The workload kinds whose pod templates name images. A ReplicaSet scaled to
@@ -110,6 +125,9 @@ class Image:
     refs: tuple[str, ...]
     size: int
     title: str | None = None
+    # When the image was last built or tagged, in seconds since the epoch; only
+    # the host store reports it.
+    tagged_at: float = 0.0
 
     def describe(self) -> str:
         if self.refs:
@@ -183,6 +201,78 @@ def superseded(
         and not any(ref in current_refs for ref in image.refs)
         and is_space_image(image, repos)
     ]
+
+
+def image_repository(image: Image) -> str:
+    """The SPACE repository of an image `is_space_image` accepted."""
+    if image.refs:
+        return min(repository(ref) for ref in image.refs)
+    return repository(normalize(image.title or "") or "")
+
+
+def superseded_on_host(
+    images: list[Image],
+    repos: frozenset[str],
+    current_refs: set[str],
+    in_use_ids: set[str],
+) -> list[Image]:
+    """The host images that are safe to remove. Pure; see the module doc.
+
+    As on a node, plus: the newest build of each image that nothing current
+    names stays, so the build before the current one is always kept.
+    """
+    candidates = superseded(images, repos, current_refs, set())
+    previous: dict[str, Image] = {}
+    for image in candidates:
+        repo = image_repository(image)
+        if repo not in previous or image.tagged_at > previous[repo].tagged_at:
+            previous[repo] = image
+    keep = {image.id for image in previous.values()} | in_use_ids
+    return [image for image in candidates if image.id not in keep]
+
+
+def parse_time(value: str | None) -> float:
+    """A Docker timestamp in seconds since the epoch; 0 when absent."""
+    try:
+        return datetime.fromisoformat(value or "").timestamp()
+    except ValueError:
+        return 0.0
+
+
+def parse_docker_images(inspects: list) -> list[Image]:
+    """`docker image inspect` output as Images, references normalized."""
+    images = []
+    for item in inspects:
+        refs = [
+            normalize(ref)
+            for ref in (item.get("RepoTags") or []) + (item.get("RepoDigests") or [])
+        ]
+        labels = (item.get("Config") or {}).get("Labels") or {}
+        images.append(
+            Image(
+                id=item["Id"],
+                refs=tuple(sorted({ref for ref in refs if ref})),
+                size=int(item.get("Size") or 0),
+                title=labels.get(TITLE_LABEL),
+                tagged_at=max(
+                    parse_time((item.get("Metadata") or {}).get("LastTagTime")),
+                    parse_time(item.get("Created")),
+                ),
+            )
+        )
+    return images
+
+
+def docker_containers_in_use(inspects: list) -> tuple[set[str], set[str]]:
+    """Image IDs and references of every container `docker ps -a` lists."""
+    ids: set[str] = set()
+    refs: set[str] = set()
+    for container in inspects:
+        if image_id := container.get("Image"):
+            ids.add(image_id)
+        if normalized := normalize((container.get("Config") or {}).get("Image") or ""):
+            refs.add(normalized)
+    return ids, refs
 
 
 def _pod_specs(item: dict):
@@ -309,6 +399,7 @@ class Pruner:
     tilt_resource: str | None
     require_tilt: bool
     dry_run: bool
+    host: bool = False
 
     @property
     def context(self) -> str:
@@ -423,8 +514,67 @@ class Pruner:
                     log(f"  {image.describe()}")
         return len(removed), sum(image.size for image in removed), held or failed
 
+    def docker_inspect(self, kind: str, ids: list[str]) -> list:
+        if not ids:
+            return []
+        output = run(["docker", kind, "inspect", *ids], 120)
+        try:
+            return json.loads(output or "[]")
+        except json.JSONDecodeError as error:
+            raise PruneError(f"docker {kind} inspect: unparseable output") from error
+
+    def prune_host(
+        self, repos: frozenset[str], current: set[str], view: TiltView | None
+    ) -> tuple[int, int, bool]:
+        """Remove the host Docker store's superseded images; as prune_node.
+
+        A tagged image goes by untagging each of its tags, never by ID, so
+        Docker deletes it only if it gained no tag since it was listed.
+        """
+        ids = sorted(set(run(["docker", "image", "ls", "-q", "--no-trunc"]).split()))
+        images = parse_docker_images(self.docker_inspect("image", ids))
+        containers = run(["docker", "ps", "-aq", "--no-trunc"]).split()
+        in_use_ids, in_use_refs = docker_containers_in_use(
+            self.docker_inspect("container", containers)
+        )
+        in_use_ids |= {
+            image.id
+            for image in images
+            if any(ref in in_use_refs for ref in image.refs)
+        }
+        doomed = superseded_on_host(images, repos, current, in_use_ids)
+        held = len(superseded_on_host(images, repos, current, set())) > len(doomed)
+        if not doomed:
+            return 0, 0, held
+        if self.dry_run:
+            log(f"host: would remove {len(doomed)} superseded image(s):")
+            for image in doomed:
+                log(f"  {image.describe()}")
+            return len(doomed), sum(image.size for image in doomed), held
+        removed: list[Image] = []
+        failed = False
+        try:
+            for image in doomed:
+                self.assert_tilt_unchanged(view, current)
+                tags = [ref for ref in image.refs if "@" not in ref]
+                try:
+                    run(["docker", "image", "rm", *(tags or [image.id])])
+                    removed.append(image)
+                except PruneError as error:
+                    failed = True
+                    log(f"WARNING: host: could not remove {image.describe()}: {error}")
+        finally:
+            if removed:
+                log(
+                    f"host: removed {len(removed)} superseded image(s), "
+                    f"{human(sum(image.size for image in removed))} of image content:"
+                )
+                for image in removed:
+                    log(f"  {image.describe()}")
+        return len(removed), sum(image.size for image in removed), held or failed
+
     def prune(self) -> bool | None:
-        """One pass over every node.
+        """One pass over every node, or over the host store with --host.
 
         None when it stood down for a busy Tilt; otherwise whether a
         superseded image stayed behind, for the watcher to retry.
@@ -438,6 +588,8 @@ class Pruner:
         names = local_image_names()
         repos = space_repositories(names)
         current = self.current_refs(names, view)
+        if self.host:
+            return self.prune_host(repos, current, view)[2]
         total_images = total_bytes = 0
         left_behind = False
         for node in self.nodes():
@@ -536,14 +688,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
+        "--host",
+        action="store_true",
+        help="prune the host's Docker store, keeping each image's previous build",
+    )
+    parser.add_argument(
         "--watch",
         type=positive_seconds,
         metavar="SECONDS",
         help="keep running, pruning after each settled Tilt update (implies a Tilt is required)",
     )
     args = parser.parse_args(argv)
-    if os.environ.get(OPT_OUT, "1") == "0":
-        log(f"superseded-image pruning is off ({OPT_OUT}=0)")
+    opt_out = HOST_OPT_OUT if args.host else OPT_OUT
+    if os.environ.get(opt_out, "1") == "0":
+        log(f"superseded-image pruning is off ({opt_out}=0)")
         if args.watch is not None:
             # A Tilt serve_cmd that exits shows as an error; idle instead.
             while True:
@@ -555,6 +713,7 @@ def main(argv: list[str] | None = None) -> int:
         tilt_resource=args.tilt_resource,
         require_tilt=args.watch is not None,
         dry_run=args.dry_run,
+        host=args.host,
     )
     if args.watch is not None:
         pruner.watch(args.watch)

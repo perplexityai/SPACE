@@ -705,3 +705,23 @@ if os.getenv("SPACE_KIND_PRUNE_SUPERSEDED_IMAGES", "1") != "0":
                 "infra/space/kind/lib/space-images.sh"],
         labels = ["bootstrap"],
     )
+
+# The host's Docker store, where those builds are made, keeps every one of them
+# too: each Tilt build adds a `:tilt-build-<time>` tag (the $EXPECTED_REF the
+# custom_build commands above tag) and Tilt's own `:tilt-<hash>`. Tilt's built-in
+# pruner (docker_prune_settings) cannot remove them, labelled or not: it passes
+# over every image with more than one tag (internal/engine/dockerprune/
+# docker_pruner.go in tilt-dev/tilt). So whenever an update has settled, the
+# same script removes from the host the builds of SPACE's images it would remove
+# from the nodes, except that the build before the current one stays too.
+# SPACE_TILT_PRUNE_HOST_IMAGES=0 leaves the resource out.
+if os.getenv("SPACE_TILT_PRUNE_HOST_IMAGES", "1") != "0":
+    local_resource(
+        "prune-host-images",
+        serve_cmd = ["python3", "infra/space/kind/scripts/prune-superseded-images.py",
+                     "--host", "--cluster", KIND_CLUSTER, "--watch", "30",
+                     "--tilt-resource", "prune-host-images"],
+        deps = ["infra/space/kind/scripts/prune-superseded-images.py",
+                "infra/space/kind/lib/space-images.sh"],
+        labels = ["bootstrap"],
+    )

@@ -48,6 +48,10 @@ low() {
 docker_root="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)"
 if [[ -n "$docker_root" && -e "$docker_root" ]] && low "the Docker data root" "$docker_root"; then
   say "Image builds may fail part-way. Safe to run:"
+  say "  python3 $kind_dir/scripts/prune-superseded-images.py --host --cluster $cluster"
+  say "      with the cluster up, removes superseded builds of SPACE's own images but"
+  say "      the previous one; bootstrap.sh and Tilt run it too unless"
+  say "      SPACE_TILT_PRUNE_HOST_IMAGES=0"
   say "  docker image prune -f"
   say "      removes dangling images only"
   say "docker builder prune frees the BuildKit cache as well, but that cache is host-global"

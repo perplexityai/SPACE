@@ -588,3 +588,256 @@ def test_watch_interval_must_be_positive(seconds, capsys, monkeypatch):
         prune.main(["--watch", seconds])
     assert exit.value.code == 2
     assert "must be at least 1 second" in capsys.readouterr().err
+
+
+# ── The host's Docker store (--host) ─────────────────────────────────────────
+
+
+def stamp(seconds: int) -> str:
+    return f"2026-10-14T00:{seconds // 60:02d}:{seconds % 60:02d}.123456789Z"
+
+
+def host_image(n, tags=(), when=0, title=None):
+    return {
+        "Id": image_id(n),
+        "RepoTags": list(tags),
+        # The containerd image store lists one digest per repository.
+        "RepoDigests": sorted({f"{tag.rsplit(':', 1)[0]}@{image_id(n)}" for tag in tags}),
+        "Size": 100_000_000,
+        "Created": stamp(when),
+        "Metadata": {"LastTagTime": stamp(when + 1) if tags else "0001-01-01T00:00:00Z"},
+        "Config": {"Labels": {prune.TITLE_LABEL: title} if title else None},
+    }
+
+
+# `docker image inspect` of the host store after a few rebuilds. Every Tilt
+# build carries its `tilt-build-<time>` tag and Tilt's `tilt-<hash>`.
+DOCKER_IMAGES = [
+    # The api build Tilt last built, the one before it, an older one, an
+    # untagged one, and the one `:local` names.
+    host_image(1, ["space-api:tilt-build-300", "space-api:tilt-0000000000000301"], 300),
+    host_image(2, ["space-api:tilt-build-200", "space-api:tilt-0000000000000201"], 200),
+    host_image(3, ["space-api:tilt-build-100", "space-api:tilt-0000000000000101"], 100),
+    host_image(4, [], 50, title="space-api"),
+    host_image(5, ["space-api:local"], 10),
+    # Worker builds: the one a DaemonSet deploys, the one before it, an older
+    # one an exited container uses, and the oldest.
+    host_image(6, ["space-worker:tilt-0000000000000003"], 300),
+    host_image(7, ["space-worker:tilt-0000000000000007"], 250),
+    host_image(8, ["space-worker:tilt-0000000000000008"], 100),
+    host_image(9, ["space-worker:tilt-0000000000000009"], 90),
+    # The only seed-publish build, untagged: the newest, so it stays.
+    host_image(10, [], 100, title="space-seed-publish"),
+    # Third-party: tagged, untagged with another title, another registry's
+    # space-api.
+    host_image(11, ["postgres:16-alpine"], 5),
+    host_image(12, [], 5, title="Grafana"),
+    host_image(13, ["ghcr.io/example/space-api:local"], 5),
+    # UI builds: Tilt's current one, the one before, an older one a container
+    # names by tag, and the oldest.
+    host_image(14, ["space-ui:tilt-0000000000000014"], 300),
+    host_image(15, ["space-ui:tilt-0000000000000015"], 200),
+    host_image(16, ["space-ui:tilt-0000000000000016"], 100),
+    host_image(17, ["space-ui:tilt-0000000000000017"], 50),
+]
+
+DOCKER_CONTAINERS = [
+    {"Image": image_id(8), "Config": {"Image": image_id(8)}, "State": {"Status": "exited"}},
+    {
+        "Image": image_id(99),
+        "Config": {"Image": "space-ui:tilt-0000000000000016"},
+        "State": {"Status": "running"},
+    },
+]
+
+HOST_TILT_IMAGES = ("space-api:tilt-0000000000000301", "space-ui:tilt-0000000000000014")
+
+
+def host_selected(*extra):
+    images = prune.parse_docker_images(DOCKER_IMAGES)
+    in_use_ids, in_use_refs = prune.docker_containers_in_use(DOCKER_CONTAINERS)
+    in_use_ids |= {i.id for i in images if any(r in in_use_refs for r in i.refs)}
+    doomed = prune.superseded_on_host(images, REPOS, current_refs(*extra), in_use_ids)
+    return {image.id for image in doomed}
+
+
+def test_host_selection_keeps_the_build_before_the_current_one():
+    assert host_selected(*HOST_TILT_IMAGES) == {image_id(n) for n in (3, 4, 9, 17)}
+
+
+@pytest.mark.parametrize(
+    "kept, why",
+    [
+        (1, "the api build Tilt last built"),
+        (2, "the api build before it"),
+        (5, "the :local tag"),
+        (6, "the worker build a DaemonSet deploys"),
+        (7, "the worker build before it"),
+        (8, "an older worker build an exited container uses"),
+        (10, "the only seed-publish build, untagged"),
+        (11, "third-party"),
+        (12, "untagged with a third-party title"),
+        (13, "another registry's repository"),
+        (14, "the UI build Tilt last built"),
+        (15, "the UI build before it"),
+        (16, "an older UI build a container names by tag"),
+    ],
+)
+def test_host_kept(kept, why):
+    assert image_id(kept) not in host_selected(*HOST_TILT_IMAGES), why
+
+
+def test_host_without_tilt_keeps_the_newest_build_as_the_previous_one():
+    # bootstrap.sh's pass: `:local` is current, so the last Tilt build of
+    # each image is the previous one.
+    removed = host_selected()
+    assert image_id(1) not in removed
+    assert image_id(2) in removed
+    assert image_id(14) not in removed and image_id(15) in removed
+
+
+def test_host_previous_build_is_the_most_recently_tagged():
+    # A rebuild that reproduces an older image retags it: it is the newest.
+    images = prune.parse_docker_images(
+        [
+            host_image(1, ["space-api:tilt-0000000000000001"], 100),
+            {**host_image(2, ["space-api:tilt-0000000000000002"], 50),
+             "Metadata": {"LastTagTime": stamp(200)}},
+        ]
+    )
+    doomed = prune.superseded_on_host(images, REPOS, set(), set())
+    assert [image.id for image in doomed] == [image_id(1)]
+
+
+def test_parse_time():
+    assert prune.parse_time("1970-01-01T00:00:01.999999999Z") == pytest.approx(1.999999)
+    assert prune.parse_time("") == 0.0
+    assert prune.parse_time(None) == 0.0
+
+
+class HostFakeCommands(FakeCommands):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.containers = copy.deepcopy(DOCKER_CONTAINERS)
+        self.host_removed: list[list[str]] = []
+
+    def gone(self) -> set[str]:
+        untagged = {ref for removal in self.host_removed for ref in removal}
+        return {
+            image["Id"]
+            for image in DOCKER_IMAGES
+            if image["Id"] in untagged
+            or (image["RepoTags"] and {prune.normalize(t) for t in image["RepoTags"]} <= untagged)
+        }
+
+    def __call__(self, args, timeout=60):
+        match args:
+            case ["kind", *_]:
+                raise AssertionError("the host pass read the nodes")
+            case ["docker", "image", "ls", "-q", "--no-trunc"]:
+                self.image_lists += 1
+                gone = self.gone()
+                return "\n".join(i["Id"] for i in DOCKER_IMAGES if i["Id"] not in gone)
+            case ["docker", "image", "inspect", *ids]:
+                return json.dumps([i for i in DOCKER_IMAGES if i["Id"] in ids])
+            case ["docker", "ps", "-aq", "--no-trunc"]:
+                return "\n".join(f"c{n}" for n in range(len(self.containers)))
+            case ["docker", "container", "inspect", *names]:
+                return json.dumps(self.containers[: len(names)])
+            case ["docker", "image", "rm", *refs]:
+                self.host_removed.append(refs)
+                if self.after_rmi:
+                    self.after_rmi(self)
+                return ""
+        return super().__call__(args, timeout)
+
+
+def test_host_pass_untags_each_build_and_reports(monkeypatch, capsys):
+    fake = HostFakeCommands(tilt=tilt_state(images=HOST_TILT_IMAGES))
+    assert pass_with(monkeypatch, fake, "--host") == 0
+    assert sorted(fake.host_removed) == sorted(
+        [
+            [
+                "docker.io/library/space-api:tilt-0000000000000101",
+                "docker.io/library/space-api:tilt-build-100",
+            ],
+            # Untagged: only its ID names it.
+            [image_id(4)],
+            ["docker.io/library/space-worker:tilt-0000000000000009"],
+            ["docker.io/library/space-ui:tilt-0000000000000017"],
+        ]
+    )
+    output = capsys.readouterr().out
+    assert "host: removed 4 superseded image(s), 381.5 MiB of image content:" in output
+    assert "space-api (untagged " in output
+
+    # A second pass finds nothing and says nothing.
+    assert pass_with(monkeypatch, fake, "--host") == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_host_dry_run_removes_nothing(monkeypatch, capsys):
+    fake = HostFakeCommands(tilt=tilt_state(images=HOST_TILT_IMAGES))
+    assert pass_with(monkeypatch, fake, "--host", "--dry-run") == 0
+    assert fake.host_removed == []
+    assert "host: would remove 4 superseded image(s)" in capsys.readouterr().out
+
+
+def test_host_busy_tilt_stands_down(monkeypatch, capsys):
+    fake = HostFakeCommands(tilt=tilt_state(busy=("space-api",), images=HOST_TILT_IMAGES))
+    assert pass_with(monkeypatch, fake, "--host") == 0
+    assert fake.host_removed == []
+    assert "Tilt is updating space-api" in capsys.readouterr().out
+
+
+def test_host_tilt_turning_busy_between_removals_stops_the_pass(monkeypatch, capsys):
+    def start_update(fake):
+        fake.tilt = tilt_state(busy=("space-api",), images=HOST_TILT_IMAGES)
+
+    fake = HostFakeCommands(tilt=tilt_state(images=HOST_TILT_IMAGES), after_rmi=start_update)
+    assert pass_with(monkeypatch, fake, "--host") == 1
+    assert len(fake.host_removed) == 1
+    output = capsys.readouterr().out
+    assert "host: removed 1 superseded image(s)" in output
+    assert "Tilt started an update" in output
+
+
+def test_host_unreadable_cluster_removes_nothing(monkeypatch, capsys):
+    fake = HostFakeCommands(kubectl_fails=True)
+    assert pass_with(monkeypatch, fake, "--host") == 1
+    assert fake.host_removed == []
+    assert "connection refused" in capsys.readouterr().out
+
+
+def test_host_opt_out_is_its_own(monkeypatch, capsys):
+    monkeypatch.setenv(prune.HOST_OPT_OUT, "0")
+    fake = HostFakeCommands(tilt=tilt_state(images=HOST_TILT_IMAGES))
+    assert pass_with(monkeypatch, fake, "--host") == 0
+    assert fake.host_removed == []
+    assert f"{prune.HOST_OPT_OUT}=0" in capsys.readouterr().out
+
+    # The node opt-out leaves the host pass on.
+    monkeypatch.delenv(prune.HOST_OPT_OUT)
+    monkeypatch.setenv(prune.OPT_OUT, "0")
+    assert pass_with(monkeypatch, fake, "--host") == 0
+    assert len(fake.host_removed) == 4
+
+
+def test_host_watch_retries_an_image_a_container_held(monkeypatch):
+    fake = HostFakeCommands(tilt=tilt_state(images=HOST_TILT_IMAGES))
+    monkeypatch.setattr(prune, "run", fake)
+    monkeypatch.setattr(prune.shutil, "which", lambda _: "/usr/bin/tilt")
+    pruner = prune.Pruner("space-local", "10350", None, True, False, host=True)
+    state = prune.WatchState()
+
+    pruner.tick(state)
+    assert len(fake.host_removed) == 4
+    assert state.left_behind
+
+    # Both containers go: the two builds they held are superseded now.
+    fake.containers = []
+    for _ in range(prune.RETRY_TICKS):
+        pruner.tick(state)
+    assert ["docker.io/library/space-worker:tilt-0000000000000008"] in fake.host_removed
+    assert ["docker.io/library/space-ui:tilt-0000000000000016"] in fake.host_removed
+    assert not state.left_behind
