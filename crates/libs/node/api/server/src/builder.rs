@@ -12,7 +12,7 @@ use pplx_space_common_grpc::{RequestAdmission, fwd_retry};
 use pplx_space_common_svc::auth::build::authorize_template_build;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
-use tonic::{Request, Response, Status};
+use tonic::{Code, Request, Response, Status};
 
 pub struct BuilderApiService {
     clients: BackendClients,
@@ -37,6 +37,28 @@ impl BuilderApiService {
             &[("UploadBuildBlob", 1)],
         )
     }
+}
+
+/// build-manager authenticates node-api's own credential, never the end
+/// user's, so its refusal is a server-side credential fault. Forwarding the
+/// code unchanged would report an auth error for a caller whose credential is
+/// fine; report it as a server error instead.
+fn gateway_credential_rejected(rpc: &'static str, status: &Status) -> Option<Status> {
+    if !matches!(
+        status.code(),
+        Code::Unauthenticated | Code::PermissionDenied
+    ) {
+        return None;
+    }
+    tracing::warn!(
+        rpc,
+        code = ?status.code(),
+        error = status.message(),
+        "build-manager rejected the builder gateway credential"
+    );
+    Some(Status::internal(format!(
+        "build-manager {rpc}: builder rejected the gateway credential"
+    )))
 }
 
 /// Forward a request to a backend client RPC, converting the error to `Status`.
@@ -294,10 +316,12 @@ impl BuilderApi for BuilderApiService {
             .start_build(r)
             .await
             .map_err(|err| {
-                Status::new(
-                    err.code(),
-                    format!("build-manager StartBuild: {}", err.message()),
-                )
+                gateway_credential_rejected("StartBuild", &err).unwrap_or_else(|| {
+                    Status::new(
+                        err.code(),
+                        format!("build-manager StartBuild: {}", err.message()),
+                    )
+                })
             })?
             .into_inner();
         Ok(Response::new(BuildTemplateResponse {
@@ -316,6 +340,7 @@ impl BuilderApi for BuilderApiService {
             get_build_status,
             r
         )
+        .map_err(|err| gateway_credential_rejected("GetBuildStatus", &err).unwrap_or(err))
     }
 
     async fn upload_build_blob(
@@ -332,10 +357,12 @@ impl BuilderApi for BuilderApiService {
             |_| Ok(()),
             move |upstream| async move {
                 client.upload_blob(upstream).await.map_err(|err| {
-                    Status::new(
-                        err.code(),
-                        format!("build-manager UploadBlob: {}", err.message()),
-                    )
+                    gateway_credential_rejected("UploadBlob", &err).unwrap_or_else(|| {
+                        Status::new(
+                            err.code(),
+                            format!("build-manager UploadBlob: {}", err.message()),
+                        )
+                    })
                 })
             },
         )

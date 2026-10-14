@@ -199,13 +199,20 @@ async fn legacy_node_caller_cannot_borrow_publisher_authority() {
 
 #[tokio::test]
 async fn invalid_review_and_exhausted_budget_fail_closed() {
-    for (mut status, expected) in [
-        (TokenReviewStatus::default(), Code::Unauthenticated),
+    // (status, code as reviewed, code once the review also reports the token
+    // unauthenticated)
+    for (mut status, expected, expected_rejected) in [
+        (
+            TokenReviewStatus::default(),
+            Code::Unauthenticated,
+            Code::Unauthenticated,
+        ),
         (
             service_account_status(
                 "wrong-audience",
                 "system:serviceaccount:space:space-builder",
             ),
+            Code::Unauthenticated,
             Code::Unauthenticated,
         ),
         (
@@ -217,9 +224,13 @@ async fn invalid_review_and_exhausted_budget_fail_closed() {
                 )
             },
             Code::Unavailable,
+            Code::Unauthenticated,
         ),
     ] {
-        for authenticated in [status.authenticated, Some(false)] {
+        for (authenticated, expected) in [
+            (status.authenticated, expected),
+            (Some(false), expected_rejected),
+        ] {
             status.authenticated = authenticated;
             let (reviewer, _) = reviewer(status.clone(), "space-build-manager");
 
@@ -242,6 +253,28 @@ async fn invalid_review_and_exhausted_budget_fail_closed() {
         Code::Unavailable
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+/// The apiserver's answer for a token with another audience: rejected, with
+/// the reason in `error` and no audiences or user. A verdict, not an outage.
+#[tokio::test]
+async fn rejected_token_review_with_reason_is_unauthenticated() {
+    let (reviewer, calls) = reviewer(
+        TokenReviewStatus {
+            authenticated: Some(false),
+            error: Some(
+                "[invalid bearer token, token audiences [\"space-node-api\"] is invalid for the target audiences [\"space-build-manager\"]]"
+                    .to_string(),
+            ),
+            ..Default::default()
+        },
+        "space-build-manager",
+    );
+
+    let result = reviewer.authenticate(TOKEN).await;
+
+    assert_eq!(result.unwrap_err().code(), Code::Unauthenticated);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
