@@ -1,8 +1,10 @@
 {{- /*
 Renders nothing. Fails the render when the caller's values leave a Kind
 development value in place, or when the release does not have its role's
-shape. Only values the caller supplied are visible here (a subchart's own
-defaults are not), which is the point: each listed input must be supplied.
+shape. Helm merges each subchart's own defaults into .Values before this
+renders, so a key the caller left out still reads as the Kind default here.
+A presence check alone therefore passes on a Kind default: every check also
+rejects the Kind value itself.
 */ -}}
 {{- $v := .Values -}}
 {{- $fail := list -}}
@@ -23,8 +25,12 @@ defaults are not), which is the point: each listed input must be supplied.
 {{- $nodeCharts = append $nodeCharts "space-build-manager-local" -}}
 {{- end -}}
 
-{{- /* Role shape. */ -}}
+{{- /* Role shape. Both releases read one values file, so a switch flipped
+       there would otherwise drop components from a running install. */ -}}
 {{- if eq $v.role "worker" -}}
+{{- if not $v.controlPlane.enabled -}}
+{{- $fail = append $fail "role worker: controlPlane.enabled must be true (the control plane runs in the space release)" -}}
+{{- end -}}
 {{- if $v.buildManager.enabled -}}
 {{- $fail = append $fail "role worker: buildManager.enabled must be false (build-manager runs in the space-builder release)" -}}
 {{- end -}}
@@ -45,6 +51,9 @@ defaults are not), which is the point: each listed input must be supplied.
 {{- else -}}
 {{- $fail = append $fail (printf "role must be worker or builder, got %q" (toString $v.role)) -}}
 {{- end -}}
+{{- if not $v.nodeServices.enabled -}}
+{{- $fail = append $fail (printf "role %s: nodeServices.enabled must be true" (toString $v.role)) -}}
+{{- end -}}
 {{- if and (eq $v.role "worker") (ne .Release.Name "space") -}}
 {{- $fail = append $fail (printf "role worker installs as release space, not %s" .Release.Name) -}}
 {{- end -}}
@@ -54,13 +63,16 @@ defaults are not), which is the point: each listed input must be supplied.
 {{- if $v.nodeServices.enabled -}}{{- $enabled = concat $enabled $nodeServices -}}{{- end -}}
 {{- if $v.buildManager.enabled -}}{{- $enabled = append $enabled "space-build-manager-local" -}}{{- end -}}
 
-{{- /* Images and cluster identity, for every enabled subchart. */ -}}
+{{- /* Images and cluster identity, for every enabled subchart. The Kind
+       repositories are the subcharts' defaults (their values.yaml), which
+       name images Kind loads locally. */ -}}
+{{- $kindRepositories := list "space-api" "space-data-plane" "space-cluster-controller" "space-worker" -}}
 {{- $clusterIds := list -}}
 {{- range $c := $enabled -}}
 {{- $s := index $v $c | default dict -}}
 {{- $img := $s.image | default dict -}}
-{{- if or (not $img.repository) (not $img.tag) (eq (toString $img.tag) "local") -}}
-{{- $fail = append $fail (printf "%s.image.repository and image.tag are required (a published image, not the Kind tag local)" $c) -}}
+{{- if or (not $img.repository) (has (toString $img.repository) $kindRepositories) (not $img.tag) (eq (toString $img.tag) "local") -}}
+{{- $fail = append $fail (printf "%s.image.repository and image.tag are required (a published image, not the Kind repository %s or tag local)" $c (toString $img.repository)) -}}
 {{- end -}}
 {{- if and (has $c $nodeCharts) (ne (toString (($s.node | default dict).role | default "worker")) (toString $v.role)) -}}
 {{- $fail = append $fail (printf "%s.node.role must equal role %s" $c (toString $v.role)) -}}

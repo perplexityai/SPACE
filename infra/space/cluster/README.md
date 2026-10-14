@@ -71,10 +71,12 @@ helm template space-builder infra/space/cluster/chart -n space \
 The render fails, listing every gap, unless the file supplies:
 
 - `global.observability.mode` (`"off"`, `datadog` or `otlp`, quoted: bare YAML
-  `off` is a boolean), `environment` and `cluster`. Ports, protocol and trace
-  sampler are optional (space-kind-telemetry README).
-- `image.repository` and `image.tag` for every enabled subchart. The Kind tag
-  `local` is refused.
+  `off` is a boolean). `datadog` and `otlp` also need `environment` and
+  `cluster`; `"off"` renders without them. Ports, protocol and trace sampler
+  are optional (space-kind-telemetry README).
+- `image.repository` and `image.tag` for every enabled subchart. The Kind
+  repositories (`space-api`, `space-data-plane`, `space-cluster-controller`,
+  `space-worker`) and the Kind tag `local` are refused.
 - The same `clusterId` on every subchart that has one, other than `kind-local`.
 - `postgres.rolesSecretName` on `space-api-local`, `space-internal-api-local`,
   `space-cluster-controller-local` and `space-credmgr-authority-local`. With it

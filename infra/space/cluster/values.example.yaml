@@ -87,7 +87,7 @@ space-cluster-controller-local:
 
 space-sandbox-network-policy:
   # Every private range sandboxes must not reach: pod, Service and node CIDRs
-  # included (README.md, Network policy).
+  # included (README.md, Prerequisites).
   internetExcept:
     - 10.0.0.0/8
     - 100.64.0.0/10

@@ -3,7 +3,9 @@
 # through the space-cluster umbrella (README.md).
 #
 #   install.sh -f VALUES --template [--observability-namespace NS]
-#       Print what would be applied and exit. Needs no cluster.
+#       Print what would be applied and exit. Needs no cluster, but when the
+#       observability chart is in the tree it runs `helm dependency build` on
+#       it, which writes that chart's charts/ and Chart.lock.
 #   install.sh -f VALUES --kube-context CONTEXT [--namespace space]
 #              [--observability-namespace space-observability] [--timeout 600s]
 #       Check, then install, in this order: read-only checks of the namespaces
@@ -192,13 +194,36 @@ fi
 log "running space-db-migrate"
 k -n "$namespace" delete job space-db-migrate --ignore-not-found >/dev/null
 k -n "$namespace" apply -f - <<<"$migrate" >/dev/null
-k -n "$namespace" wait --for=condition=complete job/space-db-migrate --timeout="$timeout" >/dev/null
-
-for args in worker builder; do
-  declare -n a=${args}_args
-  log "helm upgrade --install ${a[0]}"
-  helm upgrade --install "${a[@]}" --kube-context "$context" --wait --timeout "$timeout" \
-    2> >(grep -v 'found symbolic link in path' >&2)
-  unset -n a
+# Wait for whichever terminal condition comes first: a Job that exhausts its
+# backoffLimit is Failed, never Complete, and would otherwise hold the install
+# for the whole timeout.
+k wait --for=condition=complete job/space-db-migrate --timeout="$timeout" -n "$namespace" >/dev/null 2>&1 &
+complete_pid=$!
+k wait --for=condition=failed job/space-db-migrate --timeout="$timeout" -n "$namespace" >/dev/null 2>&1 &
+failed_pid=$!
+while kill -0 "$complete_pid" 2>/dev/null && kill -0 "$failed_pid" 2>/dev/null; do
+  sleep 2
 done
+if ! kill -0 "$complete_pid" 2>/dev/null && wait "$complete_pid"; then
+  kill "$failed_pid" 2>/dev/null || true
+  wait "$failed_pid" 2>/dev/null || true
+else
+  outcome="did not complete within $timeout"
+  if ! kill -0 "$failed_pid" 2>/dev/null && wait "$failed_pid"; then outcome=failed; fi
+  kill "$complete_pid" "$failed_pid" 2>/dev/null || true
+  wait "$complete_pid" "$failed_pid" 2>/dev/null || true
+  echo "install.sh: space-db-migrate $outcome:" >&2
+  k logs job/space-db-migrate --all-containers --tail=50 -n "$namespace" >&2 || true
+  exit 1
+fi
+
+# Plain calls rather than a loop over namerefs: `declare -n` needs bash 4.3,
+# and on an older bash it would fail here, after the migrations ran.
+release() {
+  log "helm upgrade --install $1"
+  helm upgrade --install "$@" --kube-context "$context" --wait --timeout "$timeout" \
+    2> >(grep -v 'found symbolic link in path' >&2)
+}
+release "${worker_args[@]}"
+release "${builder_args[@]}"
 log "installed space and space-builder in $context/$namespace"

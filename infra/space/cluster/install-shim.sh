@@ -60,9 +60,6 @@ export SPACE_SERVICE_NAME=containerd-shim-space-v2
 export DD_SERVICE=containerd-shim-space-v2
 export SPACE_VERSION=$version
 export DD_VERSION=$version
-if [[ -n \${OTEL_RESOURCE_ATTRIBUTES:-} ]]; then
-  export OTEL_RESOURCE_ATTRIBUTES="\$OTEL_RESOURCE_ATTRIBUTES,host.name=\$(hostname)"
-fi
 exec $real "\$@"
 EOF
 }
@@ -82,9 +79,17 @@ echo "install-shim.sh: installed $root$real ($version) and $root$wrapper"
 
 config=$root/etc/containerd/config.toml
 if ! grep -qs 'io.containerd.space.v2' "$config"; then
-  cat >&2 <<'EOF'
-install-shim.sh: containerd has no `space` runtime yet. Add, then restart containerd:
-  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.space]
+  # containerd 2.x (config version 3) moved the CRI runtimes to
+  # io.containerd.cri.v1.runtime; 1.x configs (version 2) keep
+  # io.containerd.grpc.v1.cri. The EKS worker bootstrap writes the 2.x form
+  # (infra/space/aws/eks/modules/space/templates/worker-bootstrap.sh.tftpl).
+  plugin=io.containerd.grpc.v1.cri
+  if grep -qsE '^[[:space:]]*version[[:space:]]*=[[:space:]]*3' "$config"; then
+    plugin=io.containerd.cri.v1.runtime
+  fi
+  cat >&2 <<EOF
+install-shim.sh: containerd has no \`space\` runtime yet. Add, then restart containerd:
+  [plugins."$plugin".containerd.runtimes.space]
     runtime_type = "io.containerd.space.v2"
     pod_annotations = ["space.pplx.net/*"]
 EOF
