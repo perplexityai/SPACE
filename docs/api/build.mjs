@@ -167,7 +167,8 @@ writeFileSync(resolve(output, 'index.html'), `<!doctype html>
 </div>
 <nav class="docs-sections" aria-label="Documentation sections">
 <a href="https://github.com/perplexityai/SPACE/blob/${commit}/docs/introduction.md">Guide</a>
-<a href="index.html" aria-current="page">API reference</a></nav></header>
+<a href="index.html" aria-current="page">API reference</a>
+<a class="docs-github" href="https://github.com/perplexityai/SPACE">GitHub →</a></nav></header>
 <nav class="docs-utility" aria-label="API reading controls">
 <a href="openapi.json" download>Download OpenAPI</a></nav>
 <template id="overview">${overview}</template>

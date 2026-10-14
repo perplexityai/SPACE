@@ -92,12 +92,14 @@
   border-bottom: 2px solid transparent;
   padding-top: 2px;
 }
+.docs-github { margin-inline-start: auto; }
 .docs-sections [aria-current] { color: var(--docs-color-accent); border-color: currentColor; }
 .docs-header a:hover { color: var(--docs-color-accent); }
 .docs-header a:focus-visible { outline: 2px solid currentColor; outline-offset: 3px; }
 
 @media screen and (max-width: 800px) {
   .docs-header { display: flex; gap: 12px; padding-inline: 12px; }
+  .docs-sections .docs-github { display: none; }
   .docs-branding { flex-shrink: 0; gap: 4px; }
   .docs-menu-toggle:not([hidden]) { display: inline-flex; align-items: center; justify-content: center; width: 44px; height: 44px; }
   .docs-brand { padding-inline-start: 0; }
