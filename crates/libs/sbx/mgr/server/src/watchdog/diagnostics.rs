@@ -30,6 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use pplx_space_common_core::host::linux::paths;
 use pplx_space_metrics::sandbox::worker::{
     SandboxHealthEvidenceOutcome, SandboxRawVsockCheckOutcome,
 };
@@ -476,12 +477,8 @@ impl EvidencePaths {
     fn for_sandbox(sandbox_id: &str) -> Self {
         Self {
             cgroup: pplx_space_node_runtime_core::cgroup_paths::jailer_cgroup_path(sandbox_id),
-            // The launch configures Firecracker's own log as `/fc.log` inside
-            // the jail.
-            firecracker_log: PathBuf::from(format!(
-                "{}/firecracker/{sandbox_id}/root/fc.log",
-                pplx_space_common_core::host::linux::paths::FIRECRACKER_JAIL_DIR
-            )),
+            // The launch configures Firecracker's own log inside the jail.
+            firecracker_log: paths::jail_root(sandbox_id).join(paths::FIRECRACKER_LOG_FILE),
             // Created only when `SPACE_ENABLE_GUEST_CONSOLE_LOGS` is set, as
             // the jailer's output. Guest serial output reaches it only if
             // Firecracker's own stdout does, which a daemonizing jailer

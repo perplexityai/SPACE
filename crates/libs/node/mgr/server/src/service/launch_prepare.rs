@@ -335,7 +335,7 @@ impl NodeManagerService {
         // Place kernel + rootfs + config into the jailer's expected chroot root dir.
         // Clean any leftover from a previous launch (jailer fails with "Text file busy"
         // or "File exists" if artifacts remain from a prior attempt).
-        let jail_root = format!("{chroot_base}/firecracker/{sandbox_id}/root");
+        let jail_root = paths::jail_root(sandbox_id).display().to_string();
         let observed_id = sandbox_id.to_string();
         let existing_pid = self
             .off_runtime("observe jail ownership", move || {
@@ -593,14 +593,14 @@ impl NodeManagerService {
             kill_launched_process_after_pid_persist_failure(self, sandbox_id, fc_pid).await;
             return Err(status);
         }
-        let api_socket_path = format!("{JAIL_DIR}/firecracker/{sandbox_id}/root/firecracker.sock");
+        let api_socket_path = format!("{jail_root}/firecracker.sock");
         if !req.snapshot_restore {
             // Make v.sock connectable by sbx-manager (for direct vsock health checks).
             // FC creates it owned by sandbox UID; set group to space-sbxmgr so
             // sbx-manager (with that primary group) can connect. Snapshot restores
             // create v.sock during load_snapshot instead, so waiting here only adds
             // a fixed 1s delay.
-            let vsock_path = format!("{chroot_base}/firecracker/{sandbox_id}/root/v.sock");
+            let vsock_path = format!("{jail_root}/v.sock");
             let started = Instant::now();
             loop {
                 let vsock_path_b = vsock_path.clone();

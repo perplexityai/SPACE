@@ -26,7 +26,7 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use pplx_space_common_core::host::linux::paths::{
-    FIRECRACKER_JAIL_DIR, FIRECRACKER_LOG_FILE, FIRECRACKER_METRICS_FIFO,
+    FIRECRACKER_LOG_FILE, FIRECRACKER_METRICS_FIFO, jail_root,
 };
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -68,9 +68,7 @@ impl VmOutputReaders {
         let Some(runtime_pid) = runtime_pid else {
             return;
         };
-        let jail_root = PathBuf::from(format!(
-            "{FIRECRACKER_JAIL_DIR}/firecracker/{sandbox_id}/root"
-        ));
+        let jail_root = jail_root(sandbox_id);
         if !tokio::fs::metadata(&jail_root)
             .await
             .is_ok_and(|metadata| metadata.is_dir())

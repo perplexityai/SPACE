@@ -47,6 +47,14 @@ pub const FIRECRACKER_JAIL_DIR: &str = "/space/cache/firecracker/jails";
 pub const FIRECRACKER_LOG_FILE: &str = "fc.log";
 /// The FIFO Firecracker writes its metrics flushes to, in its jail root.
 pub const FIRECRACKER_METRICS_FIFO: &str = "fc-metrics.fifo";
+
+/// A sandbox's jail root, the chroot the jailer builds under
+/// [`FIRECRACKER_JAIL_DIR`] as `<chroot base>/<exec file name>/<id>/root`.
+pub fn jail_root(sandbox_id: &str) -> PathBuf {
+    PathBuf::from(format!(
+        "{FIRECRACKER_JAIL_DIR}/firecracker/{sandbox_id}/root"
+    ))
+}
 /// Template artifact directory root.
 pub const TEMPLATE_DIR: &str = "/space/cache/firecracker/templates";
 
