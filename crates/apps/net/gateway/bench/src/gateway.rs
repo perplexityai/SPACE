@@ -14,13 +14,10 @@ use pplx_space_net_common::{
     EffectiveNetworkPolicyRef, EffectiveNetworkPolicyRefScope, NetworkPolicyV1,
 };
 use pplx_space_net_gateway::debug::GatewayDebugState;
-use pplx_space_net_gateway::dns::DnsAllowCache;
-use pplx_space_net_gateway::egress::DnsAttributedTcpTracker;
 use pplx_space_net_gateway::known_egress::KnownEgressState;
 use pplx_space_net_gateway::reserved_dns::ReservedDnsCore;
 use pplx_space_net_gateway::state::{
     GatewayNetworkState, NetworkStateReason, PolicyLoader, PulledNetworkPolicy,
-    ReservedDnsCancellation,
 };
 use pplx_space_net_gateway::stats::ProxyStats;
 use pplx_space_net_gateway::{tcp_proxy, udp_proxy};
@@ -84,7 +81,6 @@ pub async fn serve(args: GatewayArgs) -> anyhow::Result<()> {
         .with_context(|| format!("failed to bind transparent UDP socket on {}", args.udp_port))?;
 
     let stats = Arc::new(ProxyStats::new());
-    let dns_allow_cache = DnsAllowCache::default();
     let network_state = GatewayNetworkState::pending_policy();
     let known_egress_state = KnownEgressState::default();
     let installed_policy_ref = install_policy(&network_state, args.policy).await?;
@@ -97,11 +93,8 @@ pub async fn serve(args: GatewayArgs) -> anyhow::Result<()> {
         listener: tcp_listener,
         stats: stats.clone(),
         network_state: network_state.clone(),
-        dns_allow_cache: dns_allow_cache.clone(),
-        dns_attributed_connections: DnsAttributedTcpTracker::default(),
         tls_interception: Default::default(),
         reserved_dns: reserved_dns.clone(),
-        reserved_dns_cancellation: ReservedDnsCancellation::default(),
         known_egress_state: known_egress_state.clone(),
         debug_state: GatewayDebugState::default(),
         shutdown_token: shutdown.child_token(),
@@ -111,10 +104,8 @@ pub async fn serve(args: GatewayArgs) -> anyhow::Result<()> {
         listener: udp_socket,
         stats,
         network_state,
-        dns_allow_cache,
         known_egress_state,
         reserved_dns,
-        reserved_dns_cancellation: ReservedDnsCancellation::default(),
         shutdown_token: shutdown.child_token(),
     })));
 

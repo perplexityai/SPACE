@@ -21,13 +21,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::debug::GatewayDebugState;
-use crate::dns::DnsAllowCache;
 use crate::egress::{EgressPhase, EgressProtocol};
 use crate::known_egress::KnownEgressState;
 use crate::reserved_dns::ReservedDnsCore;
 use crate::resource_budget::MAX_ACTIVE_TCP_CONNECTIONS;
 use crate::sniff;
-use crate::state::{GatewayNetworkState, PolicyNotReady, ReservedDnsCancellation, TrafficPolicy};
+use crate::state::{GatewayNetworkState, PolicyNotReady, TrafficPolicy};
 use crate::stats::ProxyStats;
 use crate::tls_interception::{TlsInterception, TlsInterceptionError};
 
@@ -43,7 +42,6 @@ mod tls_http;
 mod transport;
 mod upstream;
 
-use crate::egress::DnsAttributedTcpTracker;
 use crate::egress::{AdmittedTcp, TcpAdmissionDenial};
 pub use pplx_space_net_gateway_client::TcpDomainAuthorizationMode;
 
@@ -52,11 +50,8 @@ pub struct TcpProxyConfig {
     pub listener: TcpListener,
     pub stats: Arc<ProxyStats>,
     pub network_state: GatewayNetworkState,
-    pub dns_allow_cache: DnsAllowCache,
-    pub dns_attributed_connections: DnsAttributedTcpTracker,
     pub tls_interception: TlsInterception,
     pub reserved_dns: ReservedDnsCore,
-    pub reserved_dns_cancellation: ReservedDnsCancellation,
     pub known_egress_state: KnownEgressState,
     /// Verbose debug-logging toggle. When enabled (via `EnableDebug`), the proxy
     /// emits a structured per-flow log of each TLS ClientHello SNI scan. Gated so
@@ -77,11 +72,8 @@ pub async fn run(config: TcpProxyConfig) -> io::Result<()> {
         listener,
         stats,
         network_state,
-        dns_allow_cache,
-        dns_attributed_connections,
         tls_interception,
         reserved_dns,
-        reserved_dns_cancellation,
         known_egress_state,
         debug_state,
         shutdown_token,
@@ -92,11 +84,8 @@ pub async fn run(config: TcpProxyConfig) -> io::Result<()> {
         sandbox_id,
         stats,
         network_state,
-        dns_allow_cache,
-        dns_attributed_connections,
         tls_interception,
         reserved_dns,
-        reserved_dns_cancellation,
         known_egress_state,
         debug_state,
         shutdown_token: proxy_shutdown_token.clone(),
@@ -119,11 +108,8 @@ struct TcpProxy {
     sandbox_id: &'static str,
     stats: Arc<ProxyStats>,
     network_state: GatewayNetworkState,
-    dns_allow_cache: DnsAllowCache,
-    dns_attributed_connections: DnsAttributedTcpTracker,
     tls_interception: TlsInterception,
     reserved_dns: ReservedDnsCore,
-    reserved_dns_cancellation: ReservedDnsCancellation,
     known_egress_state: KnownEgressState,
     debug_state: GatewayDebugState,
     shutdown_token: CancellationToken,
@@ -404,7 +390,10 @@ impl TcpProxy {
             // Take the cancellation token before reading policy. A concurrent
             // install therefore either cancels this connection or precedes
             // the policy snapshot used below.
-            let policy_cancellation = self.reserved_dns_cancellation.operation_token();
+            let policy_cancellation = self
+                .network_state
+                .reserved_dns_cancellation()
+                .operation_token();
             let policy = tokio::select! {
                 biased;
                 () = policy_cancellation.cancelled() => return (None, FlowOutcome::Cancelled),
@@ -497,11 +486,11 @@ impl TcpProxy {
         };
         // Register before the final current-policy check so a concurrent
         // update either rejects this handoff or sees the flow in its resweep.
-        let connection = self.dns_attributed_connections.register(
+        let connection = self.network_state.tcp_connections().register(
             admitted.destination(),
             scan.clone(),
             &policy,
-            &self.dns_allow_cache,
+            self.network_state.dns_allow_cache(),
             shutdown.clone(),
         );
         let interception_mode = connection.interception_mode;
@@ -619,12 +608,7 @@ impl TcpProxy {
         Fut: Future<Output = Result<U, transport::Error>> + Send + 'static,
         U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let binding = http_host::HostBinding::new(
-            self.sandbox_id,
-            dst,
-            self.network_state.clone(),
-            self.dns_allow_cache.clone(),
-        );
+        let binding = http_host::HostBinding::new(self.sandbox_id, dst, self.network_state.clone());
         match http_host::serve(client, binding, connect).await {
             Ok(served) => FlowOutcome::Relayed(Relay::HostBoundHttp {
                 requests: served.requests,

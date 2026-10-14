@@ -94,7 +94,7 @@ async fn failed_plaintext_connect() -> FailedPlaintextConnect {
         .unwrap(),
     };
     let (network_state, policy) = ready_policy(policy).await;
-    let dns_allow_cache = DnsAllowCache::default();
+    let dns_allow_cache = network_state.dns_allow_cache();
     dns_allow_cache.observe_response(
         &dns_a_response(ALLOWED_HOST, [93, 184, 216, 34], 60),
         policy.as_ref(),
@@ -103,11 +103,8 @@ async fn failed_plaintext_connect() -> FailedPlaintextConnect {
         sandbox_id: "test",
         stats: Arc::new(ProxyStats::new()),
         network_state,
-        dns_allow_cache,
-        dns_attributed_connections: DnsAttributedTcpTracker::default(),
         tls_interception: Default::default(),
         reserved_dns: crate::reserved_dns::test_support::test_core(),
-        reserved_dns_cancellation: crate::state::ReservedDnsCancellation::default(),
         known_egress_state: crate::known_egress::KnownEgressState::default(),
         debug_state: GatewayDebugState::default(),
         shutdown_token: CancellationToken::new(),
@@ -186,7 +183,7 @@ async fn dns_attributed_pypi_proxy() -> (TcpProxy, Arc<NetworkPolicyV1>) {
         .unwrap(),
     };
     let (network_state, policy) = ready_policy(policy).await;
-    let dns_allow_cache = DnsAllowCache::default();
+    let dns_allow_cache = network_state.dns_allow_cache();
     dns_allow_cache.observe_response(
         &dns_a_response("pypi.org", [93, 184, 216, 34], 60),
         policy.as_ref(),
@@ -195,11 +192,8 @@ async fn dns_attributed_pypi_proxy() -> (TcpProxy, Arc<NetworkPolicyV1>) {
         sandbox_id: "test",
         stats: Arc::new(ProxyStats::new()),
         network_state,
-        dns_allow_cache,
-        dns_attributed_connections: DnsAttributedTcpTracker::default(),
         tls_interception: Default::default(),
         reserved_dns: crate::reserved_dns::test_support::test_core(),
-        reserved_dns_cancellation: crate::state::ReservedDnsCancellation::default(),
         known_egress_state: crate::known_egress::KnownEgressState::default(),
         debug_state: GatewayDebugState::default(),
         shutdown_token: CancellationToken::new(),
@@ -258,7 +252,8 @@ async fn an_address_refused_before_its_client_hello_is_read_does_not_wait_for_on
     proxy.network_state = network_state;
     for address in [[93, 184, 216, 34], [169, 254, 169, 254]] {
         proxy
-            .dns_allow_cache
+            .network_state
+            .dns_allow_cache()
             .observe_response(&dns_a_response("pypi.org", address, 60), policy.as_ref());
     }
     let ready = TrafficPolicy::Ready(policy);
@@ -400,13 +395,7 @@ async fn lazy_plaintext_connect_failure_log_omits_raw_destination() {
 
 #[tokio::test]
 async fn failed_policy_refresh_cancels_established_tcp_connections() {
-    let dns_allow_cache = DnsAllowCache::default();
-    let dns_attributed_connections = DnsAttributedTcpTracker::default();
-    let state = GatewayNetworkState::pending_policy().with_egress(
-        dns_allow_cache.clone(),
-        dns_attributed_connections.clone(),
-        crate::state::ReservedDnsCancellation::default(),
-    );
+    let state = GatewayNetworkState::pending_policy();
     install_policy(
         &state,
         NetworkPolicyV1::allow_all(),
@@ -417,11 +406,11 @@ async fn failed_policy_refresh_cancels_established_tcp_connections() {
     // `TcpProxy::serve` watches each tracked token for the full relay lifetime.
     // Leaving one uncancelled leaves that established tunnel open.
     let dns_attributed_shutdown = CancellationToken::new();
-    let _dns_attributed_connection = dns_attributed_connections.register(
+    let _dns_attributed_connection = state.tcp_connections().register(
         "192.0.2.44:443".parse().unwrap(),
         ClientHelloScan::NoServerName,
         &NetworkPolicyV1::allow_all(),
-        &DnsAllowCache::default(),
+        state.dns_allow_cache(),
         dns_attributed_shutdown.clone(),
     );
     let failed_loader: crate::state::PolicyLoader = Arc::new(|| {
@@ -519,7 +508,8 @@ async fn tcp_admission_returns_the_authorized_route_or_deny() {
         .unwrap(),
     };
     let default_deny_policy = NetworkPolicyV1::deny_all();
-    let cache = DnsAllowCache::default();
+    let network_state = GatewayNetworkState::pending_policy();
+    let cache = network_state.dns_allow_cache();
     cache.observe_response(
         &dns_a_response(ALLOWED_HOST, [93, 184, 216, 34], 60),
         &domain_policy,
@@ -531,12 +521,9 @@ async fn tcp_admission_returns_the_authorized_route_or_deny() {
     let proxy = TcpProxy {
         sandbox_id: "test",
         stats: Arc::new(ProxyStats::new()),
-        network_state: GatewayNetworkState::pending_policy(),
-        dns_allow_cache: cache,
-        dns_attributed_connections: DnsAttributedTcpTracker::default(),
+        network_state,
         tls_interception: Default::default(),
         reserved_dns: crate::reserved_dns::test_support::test_core(),
-        reserved_dns_cancellation: crate::state::ReservedDnsCancellation::default(),
         known_egress_state: crate::known_egress::KnownEgressState::default(),
         debug_state: GatewayDebugState::default(),
         shutdown_token: CancellationToken::new(),
@@ -639,13 +626,14 @@ async fn tcp_admission_returns_the_authorized_route_or_deny() {
             case.name,
         );
     }
-    proxy.dns_allow_cache.observe_response(
+    proxy.network_state.dns_allow_cache().observe_response(
         &dns_a_response(OTHER_ALLOWED_HOST, [93, 184, 216, 34], 60),
         &domain_deny_policy,
     );
     assert!(
         proxy
-            .dns_allow_cache
+            .network_state
+            .dns_allow_cache()
             .allows_ip(destination.ip(), &domain_deny_policy),
         "the other allowed hostname must keep the shared IP eligible",
     );
@@ -688,11 +676,8 @@ async fn tcp_handoff_allows_current_and_rejects_replaced_policy() {
         sandbox_id: "test",
         stats: Arc::new(ProxyStats::new()),
         network_state,
-        dns_allow_cache: DnsAllowCache::default(),
-        dns_attributed_connections: DnsAttributedTcpTracker::default(),
         tls_interception: Default::default(),
         reserved_dns: crate::reserved_dns::test_support::test_core(),
-        reserved_dns_cancellation: crate::state::ReservedDnsCancellation::default(),
         known_egress_state: crate::known_egress::KnownEgressState::default(),
         debug_state: GatewayDebugState::default(),
         shutdown_token: CancellationToken::new(),
@@ -702,11 +687,11 @@ async fn tcp_handoff_allows_current_and_rejects_replaced_policy() {
     let admitted = proxy
         .admit(destination, &ClientHelloScan::NotTls, &current_policy)
         .unwrap();
-    let connection = proxy.dns_attributed_connections.register(
+    let connection = proxy.network_state.tcp_connections().register(
         admitted.destination(),
         ClientHelloScan::NotTls,
         &current_policy,
-        &proxy.dns_allow_cache,
+        proxy.network_state.dns_allow_cache(),
         CancellationToken::new(),
     );
     assert_eq!(proxy.validate_admission_policy(&current_policy), Ok(()));
@@ -718,11 +703,11 @@ async fn tcp_handoff_allows_current_and_rejects_replaced_policy() {
         "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     )
     .await;
-    let _connection = proxy.dns_attributed_connections.register(
+    let _connection = proxy.network_state.tcp_connections().register(
         admitted.destination(),
         ClientHelloScan::NotTls,
         &current_policy,
-        &proxy.dns_allow_cache,
+        proxy.network_state.dns_allow_cache(),
         CancellationToken::new(),
     );
     assert_eq!(
@@ -741,11 +726,8 @@ async fn record_emits_one_connection_metric_and_reports_every_failure_outcome() 
         sandbox_id: "test",
         stats: Arc::new(ProxyStats::new()),
         network_state: GatewayNetworkState::no_identity(),
-        dns_allow_cache: DnsAllowCache::default(),
-        dns_attributed_connections: DnsAttributedTcpTracker::default(),
         tls_interception: Default::default(),
         reserved_dns: crate::reserved_dns::test_support::test_core(),
-        reserved_dns_cancellation: crate::state::ReservedDnsCancellation::default(),
         known_egress_state: crate::known_egress::KnownEgressState::new(vec![host.clone()]),
         debug_state: GatewayDebugState::default(),
         shutdown_token: CancellationToken::new(),
@@ -930,11 +912,8 @@ async fn devbox_full_proxy_run_extracts_sni_from_real_client() {
         listener,
         stats: Arc::new(ProxyStats::new()),
         network_state: state,
-        dns_allow_cache: DnsAllowCache::default(),
-        dns_attributed_connections: DnsAttributedTcpTracker::default(),
         tls_interception: Default::default(),
         reserved_dns: crate::reserved_dns::test_support::test_core(),
-        reserved_dns_cancellation: crate::state::ReservedDnsCancellation::default(),
         known_egress_state: crate::known_egress::KnownEgressState::default(),
         debug_state: debug_state.clone(),
         shutdown_token: shutdown.clone(),

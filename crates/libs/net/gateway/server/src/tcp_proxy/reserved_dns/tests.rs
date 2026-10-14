@@ -12,8 +12,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::debug::GatewayDebugState;
-use crate::dns::DnsAllowCache;
-use crate::egress::DnsAttributedTcpTracker;
 use crate::reserved_dns::test_support::RecordedResolver;
 use crate::state::ReservedDnsCancellation;
 use crate::state::{GatewayNetworkState, NetworkStateReason, PolicyLoader, PulledNetworkPolicy};
@@ -177,12 +175,8 @@ async fn ready_invalidation_cancels_open_reserved_tcp_connections() {
         ReadyInvalidation::FailedRefresh,
     ] {
         let resolver = RecordedResolver::new(Ipv4Addr::new(192, 0, 2, 10));
-        let policy_cancellation = ReservedDnsCancellation::default();
-        let state = GatewayNetworkState::pending_policy().with_egress(
-            DnsAllowCache::default(),
-            crate::egress::DnsAttributedTcpTracker::default(),
-            policy_cancellation.clone(),
-        );
+        let state = GatewayNetworkState::pending_policy();
+        let policy_cancellation = state.reserved_dns_cancellation().clone();
         let state = install_ready(
             state,
             policy(&[
@@ -295,11 +289,8 @@ fn proxy(
         sandbox_id: "test",
         stats: Arc::new(ProxyStats::new()),
         network_state,
-        dns_allow_cache: DnsAllowCache::default(),
-        dns_attributed_connections: DnsAttributedTcpTracker::default(),
         tls_interception: Default::default(),
         reserved_dns: resolver.core(),
-        reserved_dns_cancellation: ReservedDnsCancellation::default(),
         known_egress_state: crate::known_egress::KnownEgressState::default(),
         debug_state: GatewayDebugState::default(),
         shutdown_token,

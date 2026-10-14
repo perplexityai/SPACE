@@ -82,7 +82,8 @@ where
             return FlowOutcome::Cancelled;
         }
         let accepted = proxy
-            .dns_allow_cache
+            .network_state
+            .dns_allow_cache()
             .observe_response(&reply, admitted_policy);
         pplx_space_metrics::gateway::dns_attribution_cache_observation(
             DnsAttributionCacheObservationSource::ReservedDns,

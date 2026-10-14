@@ -29,16 +29,12 @@ use tokio_util::sync::CancellationToken;
 use crate::certificates::{CertificateContext, CertificateProvider, GatewayAuthority};
 use crate::control::NetGatewayControlService;
 use crate::debug::GatewayDebugState;
-use crate::dns::DnsAllowCache;
-use crate::egress::DnsAttributedTcpTracker;
 use crate::ingress::ServicePortIngressState;
 use crate::known_egress::KnownEgressState;
 use crate::proto::net_gateway_control_server::NetGatewayControlServer;
 use crate::reserved_dns::{BuildReservedDnsCoreError, ReservedDnsCore};
 use crate::resource_budget::MAX_CONTROL_CONNECTIONS;
-use crate::state::{
-    GatewayNetworkState, NetworkStateReason, ReservedDnsCancellation, host_control_policy_loader,
-};
+use crate::state::{GatewayNetworkState, NetworkStateReason, host_control_policy_loader};
 use crate::stats::ProxyStats;
 use crate::tls_interception::TlsInterception;
 use crate::{TCP_PROXY_PORT, UDP_PROXY_PORT, tcp_proxy, udp_proxy};
@@ -238,12 +234,6 @@ pub async fn run(
 
     let stats = Arc::new(ProxyStats::new());
     let reserved_dns = ReservedDnsCore::new().map_err(RunNetGatewayError::ReservedDns)?;
-    let reserved_dns_cancellation = ReservedDnsCancellation::default();
-    // Built before the network state so policy installation can reconcile
-    // them on every successful policy install (RPC refresh and self-hydration
-    // alike), not just when the control-plane RPC drives the refresh.
-    let dns_allow_cache = DnsAllowCache::default();
-    let dns_attributed_connections = DnsAttributedTcpTracker::default();
     let network_state = if config.initial_policy_state == InitialPolicyState::NoIdentity {
         emit_sandbox_event(
             sandbox_id,
@@ -261,11 +251,6 @@ pub async fn run(
     } else {
         GatewayNetworkState::pending_policy()
     }
-    .with_egress(
-        dns_allow_cache.clone(),
-        dns_attributed_connections.clone(),
-        reserved_dns_cancellation.clone(),
-    )
     .with_readiness_metrics();
     let policy_loader = host_control_policy_loader(
         config.sandbox_id,
@@ -306,7 +291,7 @@ pub async fn run(
             network_state.spawn_hydration(policy_loader.clone(), proxy_shutdown_token.child_token())
         });
     let dns_cache_shutdown_token = proxy_shutdown_token.child_token();
-    let dns_cache = dns_allow_cache.clone();
+    let dns_cache = network_state.dns_allow_cache().clone();
     let certificate_cache = certificates.clone();
     let dns_cache_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(DNS_CACHE_SWEEP_INTERVAL);
@@ -345,9 +330,7 @@ pub async fn run(
     let tls_interception = TlsInterception::new(certificates.requester());
     let shutdown_tls_interception = tls_interception.clone();
     let tcp_network_state = network_state.clone();
-    let tcp_dns_allow_cache = dns_allow_cache.clone();
     let tcp_reserved_dns = reserved_dns.clone();
-    let tcp_reserved_dns_cancellation = reserved_dns_cancellation.clone();
     let tcp_debug_state = debug_state.clone();
     let tcp_known_egress_state = known_egress_state.clone();
     let tcp_shutdown_token = proxy_shutdown_token.child_token();
@@ -357,11 +340,8 @@ pub async fn run(
             listener: tcp_listener,
             stats: tcp_stats,
             network_state: tcp_network_state,
-            dns_allow_cache: tcp_dns_allow_cache,
-            dns_attributed_connections,
             tls_interception,
             reserved_dns: tcp_reserved_dns,
-            reserved_dns_cancellation: tcp_reserved_dns_cancellation,
             known_egress_state: tcp_known_egress_state,
             debug_state: tcp_debug_state,
             shutdown_token: tcp_shutdown_token,
@@ -393,10 +373,8 @@ pub async fn run(
 
     let udp_stats = stats.clone();
     let udp_network_state = network_state.clone();
-    let udp_dns_allow_cache = dns_allow_cache.clone();
     let udp_known_egress_state = known_egress_state.clone();
     let udp_reserved_dns = reserved_dns;
-    let udp_reserved_dns_cancellation = reserved_dns_cancellation;
     let udp_shutdown_token = proxy_shutdown_token.child_token();
     let mut udp_task = tokio::spawn(async move {
         let result = Box::pin(udp_proxy::run(udp_proxy::UdpProxyConfig {
@@ -404,10 +382,8 @@ pub async fn run(
             listener: udp_listener,
             stats: udp_stats,
             network_state: udp_network_state,
-            dns_allow_cache: udp_dns_allow_cache,
             known_egress_state: udp_known_egress_state,
             reserved_dns: udp_reserved_dns,
-            reserved_dns_cancellation: udp_reserved_dns_cancellation,
             shutdown_token: udp_shutdown_token,
         }))
         .await;

@@ -30,7 +30,6 @@ use tokio_util::task::TaskTracker;
 use tracing::{debug, info, warn};
 
 use crate::UDP_MAPPING_TIMEOUT_SECS;
-use crate::dns::DnsAllowCache;
 use crate::egress::{
     EgressContext, EgressPhase, EgressProtocol, admit_udp as evaluate_udp_egress, evaluate_egress,
 };
@@ -38,7 +37,7 @@ use crate::known_egress::KnownEgressState;
 use crate::orig_dst;
 use crate::reserved_dns::{ReservedDnsCore, ReservedResolver, ResolveOutcome};
 use crate::resource_budget::{MAX_ACTIVE_RESERVED_DNS_DATAGRAMS, MAX_ACTIVE_UDP_SESSIONS};
-use crate::state::{GatewayNetworkState, PolicyNotReady, ReservedDnsCancellation, TrafficPolicy};
+use crate::state::{GatewayNetworkState, PolicyNotReady, TrafficPolicy};
 use crate::stats::ProxyStats;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -364,10 +363,8 @@ pub struct UdpProxyConfig {
     pub listener: std::net::UdpSocket,
     pub stats: Arc<ProxyStats>,
     pub network_state: GatewayNetworkState,
-    pub dns_allow_cache: DnsAllowCache,
     pub known_egress_state: KnownEgressState,
     pub reserved_dns: ReservedDnsCore,
-    pub reserved_dns_cancellation: ReservedDnsCancellation,
     pub shutdown_token: CancellationToken,
 }
 
@@ -389,10 +386,8 @@ struct UdpProxy {
     started_at: Instant,
     stats: Arc<ProxyStats>,
     network_state: GatewayNetworkState,
-    dns_allow_cache: DnsAllowCache,
     known_egress_state: KnownEgressState,
     reserved_dns: ReservedDnsCore,
-    reserved_dns_cancellation: ReservedDnsCancellation,
     shutdown_token: CancellationToken,
     reserved_dns_tasks: TaskTracker,
     reserved_dns_task_slots: Arc<Semaphore>,
@@ -417,10 +412,8 @@ impl UdpProxy {
             listener,
             stats,
             network_state,
-            dns_allow_cache,
             known_egress_state,
             reserved_dns,
-            reserved_dns_cancellation,
             shutdown_token,
         } = config;
         let (session_event_tx, session_event_rx) =
@@ -438,10 +431,8 @@ impl UdpProxy {
             started_at: Instant::now(),
             stats,
             network_state,
-            dns_allow_cache,
             known_egress_state,
             reserved_dns,
-            reserved_dns_cancellation,
             shutdown_token,
             reserved_dns_tasks,
             reserved_dns_task_slots: Arc::new(Semaphore::new(MAX_ACTIVE_RESERVED_DNS_DATAGRAMS)),
@@ -546,7 +537,14 @@ impl UdpProxy {
         let reserved = self
             .reserved_dns
             .resolver_for(flow.orig_dst.ip())
-            .map(|resolver| (resolver, self.reserved_dns_cancellation.operation_token()));
+            .map(|resolver| {
+                (
+                    resolver,
+                    self.network_state
+                        .reserved_dns_cancellation()
+                        .operation_token(),
+                )
+            });
 
         let policy = match self.network_state.udp_policy().await {
             TrafficPolicy::Ready(policy) => policy,
@@ -611,7 +609,10 @@ impl UdpProxy {
             // reserved-DNS work. Recheck the interception dependency gate for
             // each buffered send; a dependency can become unavailable between
             // two iterations of the same batch.
-            let reserved_policy_cancellation = self.reserved_dns_cancellation.operation_token();
+            let reserved_policy_cancellation = self
+                .network_state
+                .reserved_dns_cancellation()
+                .operation_token();
             let policy = match self.network_state.udp_policy().await {
                 TrafficPolicy::Ready(policy) => policy,
                 TrafficPolicy::NotReady(PolicyNotReady::PendingPolicy) => break,
@@ -663,7 +664,11 @@ impl UdpProxy {
         let decision = if reserved.is_some() {
             evaluate_reserved_dns_egress(flow.orig_dst, policy.as_ref())
         } else {
-            evaluate_udp_egress(&self.dns_allow_cache, flow.orig_dst, policy.as_ref())
+            evaluate_udp_egress(
+                self.network_state.dns_allow_cache(),
+                flow.orig_dst,
+                policy.as_ref(),
+            )
         };
         pplx_space_metrics::gateway::udp_datagram(route, decision.is_allowed());
         if !decision.is_allowed() {
@@ -778,7 +783,7 @@ impl UdpProxy {
 
         let wire = wire.to_vec();
         let reserved_dns = self.reserved_dns.clone();
-        let dns_allow_cache = self.dns_allow_cache.clone();
+        let dns_allow_cache = self.network_state.dns_allow_cache().clone();
         let stats = Arc::clone(&self.stats);
         let gateway_shutdown = self.shutdown_token.clone();
         let sandbox_id = self.sandbox_id;

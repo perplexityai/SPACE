@@ -56,12 +56,8 @@ impl TcpProxy {
                     tls::accept(client, &lease, &self.tls_interception).await?;
                 tracing::Span::current()
                     .record("negotiated", HttpProtocol::from(negotiated).as_str());
-                let binding = HostBinding::new(
-                    self.sandbox_id,
-                    destination,
-                    self.network_state.clone(),
-                    self.dns_allow_cache.clone(),
-                );
+                let binding =
+                    HostBinding::new(self.sandbox_id, destination, self.network_state.clone());
                 let interception = self.tls_interception.clone();
                 let upstream_lease = lease.clone();
                 let wire_read = accounting.read.clone();

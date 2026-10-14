@@ -1,3 +1,4 @@
+use crate::dns::DnsAllowCache;
 use std::net::IpAddr;
 
 use pplx_space_net_common::{
@@ -254,8 +255,7 @@ async fn reserved_udp_datagrams_are_independent_and_replies_preserve_the_destina
     let response_addr = response_socket.local_addr().unwrap();
     let dns_tasks = TaskTracker::new();
     let shutdown = CancellationToken::new();
-    let dns_allow_cache = DnsAllowCache::default();
-    let reserved_dns_cancellation = ReservedDnsCancellation::default();
+    let reserved_dns_cancellation = network_state.reserved_dns_cancellation().clone();
     let stats = Arc::new(ProxyStats::new());
     let mut proxy = UdpProxy::new(
         UdpProxyConfig {
@@ -263,10 +263,8 @@ async fn reserved_udp_datagrams_are_independent_and_replies_preserve_the_destina
             listener,
             stats: Arc::clone(&stats),
             network_state,
-            dns_allow_cache,
             known_egress_state: crate::known_egress::KnownEgressState::default(),
             reserved_dns: resolver.core(),
-            reserved_dns_cancellation: reserved_dns_cancellation.clone(),
             shutdown_token: shutdown,
         },
         dns_tasks.clone(),
@@ -326,12 +324,14 @@ async fn reserved_udp_datagrams_are_independent_and_replies_preserve_the_destina
     assert_eq!(resolver.requests().len(), 1);
     assert!(
         proxy
-            .dns_allow_cache
+            .network_state
+            .dns_allow_cache()
             .contains_host_binding("192.0.2.10".parse().unwrap(), "allowed.example",)
     );
     assert!(
         proxy
-            .dns_allow_cache
+            .network_state
+            .dns_allow_cache()
             .allows_ip("192.0.2.10".parse().unwrap(), policy.as_ref())
     );
     assert!(proxy.sessions.is_empty());
@@ -391,10 +391,8 @@ async fn pending_replay_rechecks_ca_readiness_before_each_datagram() {
                 listener,
                 stats: Arc::new(ProxyStats::new()),
                 network_state: state.clone(),
-                dns_allow_cache: DnsAllowCache::default(),
                 known_egress_state: KnownEgressState::default(),
                 reserved_dns: crate::reserved_dns::test_support::test_core(),
-                reserved_dns_cancellation: ReservedDnsCancellation::default(),
                 shutdown_token: CancellationToken::new(),
             },
             TaskTracker::new(),

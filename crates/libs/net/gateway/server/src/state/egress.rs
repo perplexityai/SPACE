@@ -37,18 +37,16 @@ impl ReservedDnsCancellation {
 }
 
 impl GatewayNetworkState {
-    /// Share the gateway's attribution and connection lifetimes before hydration.
-    #[must_use]
-    pub fn with_egress(
-        mut self,
-        cache: DnsAllowCache,
-        connections: DnsAttributedTcpTracker,
-        cancellation: ReservedDnsCancellation,
-    ) -> Self {
-        self.dns_allow_cache = cache;
-        self.tcp_connections = connections;
-        self.reserved_dns_cancellation = cancellation;
-        self
+    pub(crate) fn dns_allow_cache(&self) -> &DnsAllowCache {
+        &self.dns_allow_cache
+    }
+
+    pub(crate) fn tcp_connections(&self) -> &DnsAttributedTcpTracker {
+        &self.tcp_connections
+    }
+
+    pub(crate) fn reserved_dns_cancellation(&self) -> &ReservedDnsCancellation {
+        &self.reserved_dns_cancellation
     }
 
     pub(super) fn reconcile_policy(&self, policy: &NetworkPolicyV1) {

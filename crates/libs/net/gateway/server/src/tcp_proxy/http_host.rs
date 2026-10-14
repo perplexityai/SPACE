@@ -33,7 +33,6 @@ use super::{
     tls_http::HttpProtocol,
     upstream::{self, Upstream},
 };
-use crate::dns::DnsAllowCache;
 use crate::egress::{HostBindingError, authorize_host};
 use crate::state::{GatewayNetworkState, TrafficPolicy};
 use tokio_util::sync::CancellationToken;
@@ -43,7 +42,6 @@ pub(super) struct HostBinding {
     sandbox_id: &'static str,
     destination: SocketAddr,
     network_state: GatewayNetworkState,
-    dns_allow_cache: DnsAllowCache,
 }
 
 impl HostBinding {
@@ -51,13 +49,11 @@ impl HostBinding {
         sandbox_id: &'static str,
         destination: SocketAddr,
         network_state: GatewayNetworkState,
-        dns_allow_cache: DnsAllowCache,
     ) -> Self {
         Self {
             sandbox_id,
             destination,
             network_state,
-            dns_allow_cache,
         }
     }
 
@@ -67,12 +63,16 @@ impl HostBinding {
             TrafficPolicy::Ready(policy) => policy,
             TrafficPolicy::NotReady(_) => return Err(BindingOutcome::PolicyUnavailable),
         };
-        authorize_host(&policy, self.destination, host, &self.dns_allow_cache).map_err(|error| {
-            match error {
-                HostBindingError::HostNotAllowed => BindingOutcome::HostNotAllowed,
-                HostBindingError::HostUnattributed => BindingOutcome::HostUnattributed,
-                HostBindingError::PolicyDenied(_) => BindingOutcome::PolicyDenied,
-            }
+        authorize_host(
+            &policy,
+            self.destination,
+            host,
+            self.network_state.dns_allow_cache(),
+        )
+        .map_err(|error| match error {
+            HostBindingError::HostNotAllowed => BindingOutcome::HostNotAllowed,
+            HostBindingError::HostUnattributed => BindingOutcome::HostUnattributed,
+            HostBindingError::PolicyDenied(_) => BindingOutcome::PolicyDenied,
         })
     }
 }

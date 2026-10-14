@@ -65,7 +65,11 @@ impl TcpProxy {
         let TrafficPolicy::Ready(policy) = policy else {
             return MissingClientHello::Proceeds;
         };
-        crate::egress::missing_client_hello(destination, policy, &self.dns_allow_cache)
+        crate::egress::missing_client_hello(
+            destination,
+            policy,
+            self.network_state.dns_allow_cache(),
+        )
     }
 
     /// Admission based on the original destination and guest DNS attribution.
@@ -75,6 +79,11 @@ impl TcpProxy {
         scan: &ClientHelloScan,
         policy: &NetworkPolicyV1,
     ) -> Result<AdmittedTcp, TcpAdmissionDenial> {
-        crate::egress::admit_tcp(destination, scan, policy, &self.dns_allow_cache)
+        crate::egress::admit_tcp(
+            destination,
+            scan,
+            policy,
+            self.network_state.dns_allow_cache(),
+        )
     }
 }

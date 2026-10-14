@@ -85,12 +85,12 @@ async fn ready_state(policy: NetworkPolicyV1) -> GatewayNetworkState {
 async fn authorization_waits_through_a_transient_policy_refresh() {
     let policy = policy();
     let state = GatewayNetworkState::pending_policy();
-    let cache = DnsAllowCache::default();
+    let cache = state.dns_allow_cache();
     cache.observe_response(
         &dns_a_response(ALLOWED_HOST, [93, 184, 216, 34], 60),
         &policy,
     );
-    let binding = HostBinding::new("test", DESTINATION.parse().unwrap(), state.clone(), cache);
+    let binding = HostBinding::new("test", DESTINATION.parse().unwrap(), state.clone());
     let authorizing =
         tokio::spawn(async move { binding.authorize(&ALLOWED_HOST.parse().unwrap()).await });
     tokio::task::yield_now().await;
@@ -111,12 +111,10 @@ async fn authorization_waits_through_a_transient_policy_refresh() {
 }
 
 async fn assert_request_refused_before_connect(
-    policy: NetworkPolicyV1,
-    cache: DnsAllowCache,
+    state: GatewayNetworkState,
     request: Request<Empty<hyper::body::Bytes>>,
 ) {
-    let state = ready_state(policy).await;
-    let binding = HostBinding::new("test", DESTINATION.parse().unwrap(), state, cache);
+    let binding = HostBinding::new("test", DESTINATION.parse().unwrap(), state);
     let connect_called = Arc::new(AtomicBool::new(false));
     let (guest, guest_peer) = duplex(PIPE);
     let relay = tokio::spawn(serve(guest, binding, {
@@ -156,17 +154,18 @@ async fn a_forbidden_first_host_does_not_invoke_the_connector() {
         .header(header::HOST, CO_TENANT_HOST)
         .body(Empty::new())
         .unwrap();
-    assert_request_refused_before_connect(policy(), DnsAllowCache::default(), request).await;
+    assert_request_refused_before_connect(ready_state(policy()).await, request).await;
 }
 
 #[tokio::test]
 async fn an_explicitly_denied_host_is_refused_despite_a_live_binding() {
-    let cache = DnsAllowCache::default();
+    let deny_policy = policy_denying(ALLOWED_HOST);
+    let state = ready_state(deny_policy.clone()).await;
+    let cache = state.dns_allow_cache();
     cache.observe_response(
         &dns_a_response(ALLOWED_HOST, [93, 184, 216, 34], 60),
         &policy(),
     );
-    let deny_policy = policy_denying(ALLOWED_HOST);
     cache.observe_response(
         &dns_a_response(OTHER_ALLOWED_HOST, [93, 184, 216, 34], 60),
         &deny_policy,
@@ -183,7 +182,7 @@ async fn an_explicitly_denied_host_is_refused_despite_a_live_binding() {
         .header(header::HOST, ALLOWED_HOST)
         .body(Empty::new())
         .unwrap();
-    assert_request_refused_before_connect(deny_policy, cache, request).await;
+    assert_request_refused_before_connect(state, request).await;
 }
 
 #[tokio::test]
@@ -194,7 +193,8 @@ async fn plaintext_upgrades_are_refused_before_connect() {
         ("keep-alive", "test-protocol"),
     ] {
         let policy = policy();
-        let cache = DnsAllowCache::default();
+        let state = ready_state(policy.clone()).await;
+        let cache = state.dns_allow_cache();
         cache.observe_response(
             &dns_a_response(ALLOWED_HOST, [93, 184, 216, 34], 60),
             &policy,
@@ -208,7 +208,7 @@ async fn plaintext_upgrades_are_refused_before_connect() {
             .header(header::SEC_WEBSOCKET_KEY, "dGhlIHNhbXBsZSBub25jZQ==")
             .body(Empty::new())
             .unwrap();
-        assert_request_refused_before_connect(policy, cache, request).await;
+        assert_request_refused_before_connect(state, request).await;
     }
 }
 
@@ -230,12 +230,7 @@ async fn independent_ip_allow_applies_to_an_existing_host_bound_flow() {
         )
         .unwrap(),
     };
-    let binding = HostBinding::new(
-        "test",
-        destination,
-        ready_state(direct_policy).await,
-        DnsAllowCache::default(),
-    );
+    let binding = HostBinding::new("test", destination, ready_state(direct_policy).await);
     binding
         .authorize(&ALLOWED_HOST.parse().unwrap())
         .await
@@ -279,12 +274,12 @@ async fn send_fastly_host_override(
 async fn validates_every_host_on_a_keep_alive_connection() {
     let policy = policy();
     let state = ready_state(policy.clone()).await;
-    let cache = DnsAllowCache::default();
+    let cache = state.dns_allow_cache();
     cache.observe_response(
         &dns_a_response(ALLOWED_HOST, [93, 184, 216, 34], 60),
         &policy,
     );
-    let binding = HostBinding::new("test", DESTINATION.parse().unwrap(), state, cache);
+    let binding = HostBinding::new("test", DESTINATION.parse().unwrap(), state);
 
     let (guest, guest_peer) = duplex(PIPE);
     let (upstream, upstream_peer) = duplex(PIPE);
@@ -458,12 +453,12 @@ fn every_gateway_refusal_closes_the_guest_connection() {
 async fn an_unsolicited_upstream_protocol_upgrade_fails_and_closes() {
     let policy = policy();
     let state = ready_state(policy.clone()).await;
-    let cache = DnsAllowCache::default();
+    let cache = state.dns_allow_cache();
     cache.observe_response(
         &dns_a_response(ALLOWED_HOST, [93, 184, 216, 34], 60),
         &policy,
     );
-    let binding = HostBinding::new("test", DESTINATION.parse().unwrap(), state, cache);
+    let binding = HostBinding::new("test", DESTINATION.parse().unwrap(), state);
     let (guest, guest_peer) = duplex(PIPE);
     let (upstream, upstream_peer) = duplex(PIPE);
     let destination = tokio::spawn(async move {
@@ -518,12 +513,12 @@ async fn an_unsolicited_upstream_protocol_upgrade_fails_and_closes() {
 async fn a_dead_upstream_returns_one_retryable_close() {
     let policy = policy();
     let state = ready_state(policy.clone()).await;
-    let cache = DnsAllowCache::default();
+    let cache = state.dns_allow_cache();
     cache.observe_response(
         &dns_a_response(ALLOWED_HOST, [93, 184, 216, 34], 60),
         &policy,
     );
-    let binding = HostBinding::new("test", DESTINATION.parse().unwrap(), state, cache);
+    let binding = HostBinding::new("test", DESTINATION.parse().unwrap(), state);
     let (guest, guest_peer) = duplex(PIPE);
     let (upstream, upstream_peer) = duplex(PIPE);
     drop(upstream_peer);

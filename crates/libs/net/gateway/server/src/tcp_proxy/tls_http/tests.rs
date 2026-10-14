@@ -349,12 +349,7 @@ async fn credential_refusal_before_origin(
         .get("allowed.test".parse().unwrap(), 443)
         .await
         .unwrap();
-    let binding = HostBinding::new(
-        "test",
-        "93.184.216.34:443".parse().unwrap(),
-        state,
-        Default::default(),
-    );
+    let binding = HostBinding::new("test", "93.184.216.34:443".parse().unwrap(), state);
     let origin_connects = Arc::new(AtomicUsize::new(0));
     let observed = origin_connects.clone();
     let (guest, guest_peer) = tokio::io::duplex(4096);
@@ -398,12 +393,7 @@ async fn concurrent_http2_streams_keep_credential_decisions_request_local() {
         .get("allowed.test".parse().unwrap(), 443)
         .await
         .unwrap();
-    let binding = HostBinding::new(
-        "test",
-        "93.184.216.34:443".parse().unwrap(),
-        state,
-        Default::default(),
-    );
+    let binding = HostBinding::new("test", "93.184.216.34:443".parse().unwrap(), state);
     let (origin, origin_peer) = tokio::io::duplex(4096);
     let (observed_tx, mut observed_rx) = tokio::sync::mpsc::channel(2);
     let origin_server = tokio::spawn(
@@ -482,12 +472,7 @@ async fn policy_change_during_origin_setup_never_forwards_buffered_credentials()
         .get("allowed.test".parse().unwrap(), 443)
         .await
         .unwrap();
-    let binding = HostBinding::new(
-        "test",
-        "93.184.216.34:443".parse().unwrap(),
-        state.clone(),
-        Default::default(),
-    );
+    let binding = HostBinding::new("test", "93.184.216.34:443".parse().unwrap(), state.clone());
     let (origin, mut origin_peer) = tokio::io::duplex(4096);
     let (connect_started_tx, connect_started_rx) = tokio::sync::oneshot::channel();
     let (connect_release_tx, connect_release_rx) = tokio::sync::oneshot::channel();
@@ -534,12 +519,7 @@ async fn fixture() -> (
         .get("allowed.test".parse().unwrap(), 443)
         .await
         .unwrap();
-    let binding = HostBinding::new(
-        "test",
-        "93.184.216.34:443".parse().unwrap(),
-        state,
-        Default::default(),
-    );
+    let binding = HostBinding::new("test", "93.184.216.34:443".parse().unwrap(), state);
     let mut roots = rustls::RootCertStore::empty();
     roots.add(root.der().clone()).unwrap();
     let tls = crate::tls_interception::TlsInterception::default().with_upstream_roots(roots);
