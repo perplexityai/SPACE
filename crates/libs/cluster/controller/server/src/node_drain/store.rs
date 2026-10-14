@@ -21,7 +21,7 @@ use pplx_space_common_core::node_drain_signals::{
 };
 use pplx_space_common_core::types::{
     ArtifactKind, BackupSource, LocalArtifactId, NodeDrainMode, NodeId, NodeManagedBy, NodeRole,
-    PositiveDuration, SandboxId,
+    PositiveDuration, SandboxId, SubstrateKind,
 };
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
@@ -524,8 +524,9 @@ pub(crate) fn restore_pending_evacuations_query(honor_backoff_windows: bool) -> 
     )
 }
 
-/// `$1` = drain phase (`draining`). The reconciler's per-tick work list: every
-/// k8s-managed node in that phase, with the drain mode chosen for it.
+/// `$1` = drain phase (`draining`), `$2` = [`SubstrateKind::Kubernetes`]. The
+/// reconciler's per-tick work list: every k8s-managed node in that phase, with
+/// the drain mode chosen for it.
 ///
 /// Scoped to `managed_by = 'k8s'` for the same reason as the other two node
 /// scans in this file — `managed_by = 'space'` rows must not be fed to a
@@ -533,12 +534,19 @@ pub(crate) fn restore_pending_evacuations_query(honor_backoff_windows: bool) -> 
 pub(crate) fn draining_nodes_query() -> &'static str {
     sql!(
         "SELECT id, drain_mode FROM nodes
-          WHERE drain_phase = $1 AND managed_by = 'k8s'"
+          WHERE drain_phase = $1 AND managed_by = $2"
     )
 }
 
+/// `$1` = drain phase (`terminating`), `$2` = [`SubstrateKind::Kubernetes`].
+/// The terminating-node work list, scoped like [`draining_nodes_query`].
+pub(crate) fn terminating_nodes_query() -> &'static str {
+    sql!("SELECT id FROM nodes WHERE drain_phase = $1 AND managed_by = $2")
+}
+
 /// `$1` = candidate node ids, `$2` = drain phase (`draining`), `$3` = the mode
-/// to write (`forced`), `$4` = escalation age in seconds (BIGINT). Rewrites the
+/// to write (`forced`), `$4` = escalation age in seconds (BIGINT), `$5` =
+/// [`SubstrateKind::Kubernetes`]. Rewrites the
 /// mode on every candidate whose drain is older than that age, and returns the
 /// ids it actually escalated.
 ///
@@ -582,7 +590,7 @@ pub(crate) async fn escalate_stale_gentle_drains(
             SET drain_mode = $3
           WHERE id = ANY($1)
             AND drain_phase = $2
-            AND managed_by = 'k8s'
+            AND managed_by = $5
             AND drain_started_at IS NOT NULL
             AND drain_started_at < NOW() - make_interval(secs => $4::BIGINT)
         RETURNING id"
@@ -591,6 +599,7 @@ pub(crate) async fn escalate_stale_gentle_drains(
     .bind(PHASE_DRAINING)
     .bind(NodeDrainMode::Forced)
     .bind(age_secs)
+    .bind(SubstrateKind::Kubernetes)
     .fetch_all(pool)
     .await
 }
@@ -1875,6 +1884,7 @@ impl NodeDrainSink for SubstrateSink {
         // `from_column_str` resolves both NULL and unrecognized to gentle.
         let rows: Vec<(NodeId, Option<String>)> = sqlx::query_as(draining_nodes_query())
             .bind(PHASE_DRAINING)
+            .bind(SubstrateKind::Kubernetes)
             .fetch_all(&self.pool)
             .await?;
         Ok(rows
@@ -1912,12 +1922,11 @@ impl NodeDrainSink for SubstrateSink {
     }
 
     async fn list_terminating_nodes(&self) -> Result<Vec<NodeId>, sqlx::Error> {
-        sqlx::query_scalar::<_, NodeId>(sql!(
-            "SELECT id FROM nodes WHERE drain_phase = $1 AND managed_by = 'k8s'"
-        ))
-        .bind(PHASE_TERMINATING)
-        .fetch_all(&self.pool)
-        .await
+        sqlx::query_scalar::<_, NodeId>(terminating_nodes_query())
+            .bind(PHASE_TERMINATING)
+            .bind(SubstrateKind::Kubernetes)
+            .fetch_all(&self.pool)
+            .await
     }
 
     async fn count_resident_sandboxes_on_node(
@@ -3486,9 +3495,10 @@ pub(crate) async fn delete_terminating_node_and_record_tombstone(
          LEFT JOIN node_k8s nk ON nk.node_id = n.id
          WHERE n.id = $1
            AND n.drain_phase = 'terminating'
-           AND n.managed_by = 'k8s'"
+           AND n.managed_by = $2"
     ))
     .bind(node_id)
+    .bind(SubstrateKind::Kubernetes)
     .fetch_optional(&mut *tx)
     .await?;
     let Some((role, k8s_node_name)) = snapshot else {
@@ -3498,9 +3508,10 @@ pub(crate) async fn delete_terminating_node_and_record_tombstone(
         "DELETE FROM nodes
          WHERE id = $1
            AND drain_phase = 'terminating'
-           AND managed_by = 'k8s'"
+           AND managed_by = $2"
     ))
     .bind(node_id)
+    .bind(SubstrateKind::Kubernetes)
     .execute(&mut *tx)
     .await?;
     if result.rows_affected() == 0 {

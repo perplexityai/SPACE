@@ -156,6 +156,45 @@ locator. The `execute` helper in
 `crates/libs/db/migrator/src/bootstrap_roles.rs` is the known exception, not a
 precedent. Node-local `rusqlite` call sites are not annotated today.
 
+### Substrate values are bound parameters
+
+Control-plane Postgres `sandboxes.managed_by` and `nodes.managed_by` hold the
+substrate that owns a row, `'k8s'` or `'space'`.
+`pplx_space_common_core::types::SubstrateKind` (an alias of `NodeManagedBy`)
+names that value and encodes as the column's text, so new code binds it as a
+parameter instead of spelling the literal:
+
+```rust
+use pplx_space_common_core::{sql, types::SubstrateKind};
+
+sqlx::query_scalar::<_, NodeId>(sql!(
+    "SELECT id FROM nodes WHERE drain_phase = $1 AND managed_by = $2"
+))
+.bind(PHASE_DRAINING)
+.bind(SubstrateKind::Kubernetes)
+```
+
+The statement stays syntactically whole, as the store rules require: new code
+writes whole statements with bound values, not fragments around the value.
+The started- and failed-restorable repair `row_state_guards` helpers take their
+placeholder as an argument only because they are existing fragment-based sites
+this conversion kept; they are not a pattern for new code. Read a `managed_by`
+column back as `SubstrateKind` rather than comparing strings. Where one bad row
+must not fail the batch, read it as text and parse it per row, as
+`orphaned_restore_pod_gc` does: a typed decode fails the whole `fetch_all` on
+an unrecognized value. Test fixtures may write literal `managed_by` values into
+the rows they set up; the rule covers the statements under test.
+
+The cluster controller's own statements follow this, except where they embed
+`routable_execution_or_non_k8s`
+(`crates/libs/common/svc/src/sql/sandbox_routability.rs`), a shared fragment
+that writes `managed_by <> 'k8s'` into the transient sweeper's aged-transient
+list and restoring convergence, and into internal-api and api statements. That
+fragment and a few dozen production lines elsewhere that compare `managed_by`
+with a raw `'k8s'` or `'space'`
+(`crates/libs/api/src/controllers/substrate/direct.rs` has about a dozen) are
+existing debt to convert when touched, not a pattern to copy.
+
 ## Log targets: pin the ones searches select on
 
 A `tracing` event without `target:` takes `module_path!()` as its target, as

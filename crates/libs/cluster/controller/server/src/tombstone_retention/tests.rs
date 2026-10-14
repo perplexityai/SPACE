@@ -281,3 +281,50 @@ async fn store_keeps_direct_tombstone_pinned_only_by_target_node() -> TestResult
     );
     Ok(())
 }
+
+/// The direct-node prune and its tombstone count both bind the direct (`space`)
+/// substrate: an expired tombstone shape on a Kubernetes node row is neither
+/// deleted nor counted.
+#[tokio::test(flavor = "current_thread")]
+async fn store_prunes_and_counts_only_direct_node_tombstones() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let direct_node = Uuid::now_v7();
+    let k8s_node = Uuid::now_v7();
+    for (node_id, managed_by, endpoint) in [
+        (direct_node, "space", "10.0.0.21:9802"),
+        (k8s_node, "k8s", "10.0.0.22:9802"),
+    ] {
+        sqlx::query(sql!(
+            "INSERT INTO nodes (id, address, role, managed_by, state)
+             VALUES ($1, '10.0.0.1'::INET, 'worker', $2, 'deleted')"
+        ))
+        .bind(node_id)
+        .bind(managed_by)
+        .execute(&db.pool)
+        .await?;
+        sqlx::query(sql!(
+            "INSERT INTO node_direct (node_id, node_api_endpoint, deleted_at)
+             VALUES ($1, $2, NOW() - INTERVAL '8 days')"
+        ))
+        .bind(node_id)
+        .bind(endpoint)
+        .execute(&db.pool)
+        .await?;
+    }
+
+    let report = TombstoneRetentionStore::new(db.pool.clone())
+        .prune_tombstones(Duration::from_secs(7 * 24 * 60 * 60), 100)
+        .await?;
+
+    assert_eq!(report.direct_nodes_deleted, 1);
+    assert_eq!(report.direct_node_tombstones, 0);
+    let k8s_exists: bool =
+        sqlx::query_scalar(sql!("SELECT EXISTS(SELECT 1 FROM nodes WHERE id = $1)"))
+            .bind(k8s_node)
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(k8s_exists);
+    Ok(())
+}

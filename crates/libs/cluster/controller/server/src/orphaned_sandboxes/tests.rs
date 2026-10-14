@@ -2655,3 +2655,41 @@ fn config_from_env_reads_classification_rate_limit() {
     let cfg = ReconcilerConfig::from_environment(&env);
     assert_eq!(cfg.max_classifications_per_minute, 11);
 }
+
+/// The candidate scan and the sweep's upper bound both bind the Kubernetes
+/// substrate: an otherwise-orphaned direct row neither bounds the sweep nor
+/// is listed.
+#[tokio::test(flavor = "current_thread")]
+async fn direct_rows_do_not_bound_the_sweep_or_become_candidates() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    let sandbox_id = SandboxId::new();
+    insert_node(&db.pool, node_id).await?;
+    insert_started_sandbox_with_active_execution(&db.pool, sandbox_id, node_id).await?;
+    let sink = SubstrateActionSink::new_without_substrate(db.pool.clone());
+    let upper = SandboxId::from_uuid(Uuid::max());
+    assert_eq!(sink.current_max_sandbox_id().await?, Some(sandbox_id));
+    assert_eq!(
+        list_candidates_after(&db.pool, None, upper, 10)
+            .await?
+            .len(),
+        1,
+        "the k8s fixture is a candidate"
+    );
+
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET managed_by = 'space' WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(&db.pool)
+    .await?;
+    assert_eq!(sink.current_max_sandbox_id().await?, None);
+    assert!(
+        list_candidates_after(&db.pool, None, upper, 10)
+            .await?
+            .is_empty()
+    );
+    Ok(())
+}

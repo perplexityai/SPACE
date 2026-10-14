@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::{NodeId, SandboxId, SnapshotId};
+use pplx_space_common_core::types::{NodeId, SandboxId, SnapshotId, SubstrateKind};
 
 use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::try_pg_test_db;
@@ -435,6 +435,7 @@ async fn delete_drained_orphan_guards() -> TestResult {
     let deleted = sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
         .bind(clean)
         .bind(Some(node_uid(clean)))
+        .bind(SubstrateKind::Kubernetes)
         .execute(pool)
         .await?
         .rows_affected();
@@ -449,6 +450,7 @@ async fn delete_drained_orphan_guards() -> TestResult {
     let deleted = sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
         .bind(pinned)
         .bind(Some(node_uid(pinned)))
+        .bind(SubstrateKind::Kubernetes)
         .execute(pool)
         .await?
         .rows_affected();
@@ -469,6 +471,7 @@ async fn delete_drained_orphan_guards() -> TestResult {
     let deleted = sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
         .bind(local_only)
         .bind(Some(node_uid(local_only)))
+        .bind(SubstrateKind::Kubernetes)
         .execute(pool)
         .await?
         .rows_affected();
@@ -490,6 +493,7 @@ async fn delete_drained_orphan_guards() -> TestResult {
     let deleted = sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
         .bind(durable)
         .bind(Some(node_uid(durable)))
+        .bind(SubstrateKind::Kubernetes)
         .execute(pool)
         .await?
         .rows_affected();
@@ -506,6 +510,7 @@ async fn delete_drained_orphan_guards() -> TestResult {
     let deleted = sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
         .bind(terminal_ref)
         .bind(Some(node_uid(terminal_ref)))
+        .bind(SubstrateKind::Kubernetes)
         .execute(pool)
         .await?
         .rows_affected();
@@ -522,6 +527,7 @@ async fn delete_drained_orphan_guards() -> TestResult {
     let deleted = sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
         .bind(replaced)
         .bind(Some("stale-observed-uid".to_string()))
+        .bind(SubstrateKind::Kubernetes)
         .execute(pool)
         .await?
         .rows_affected();
@@ -557,6 +563,7 @@ async fn delete_drained_orphan_guards() -> TestResult {
     let deleted = sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
         .bind(terminating)
         .bind(Some(node_uid(terminating)))
+        .bind(SubstrateKind::Kubernetes)
         .execute(pool)
         .await?
         .rows_affected();
@@ -688,6 +695,7 @@ async fn mark_unrecoverable_sandboxes_lost_guards() -> TestResult {
         .bind(Some("stale-observed-uid".to_string()))
         .bind(&all_candidates)
         .bind(DEAD_UPLOAD_SETTLE.as_secs() as i64)
+        .bind(SubstrateKind::Kubernetes)
         .fetch_all(pool)
         .await?;
     assert!(
@@ -701,6 +709,7 @@ async fn mark_unrecoverable_sandboxes_lost_guards() -> TestResult {
         .bind(Some(node_uid(node)))
         .bind(&all_candidates)
         .bind(DEAD_UPLOAD_SETTLE.as_secs() as i64)
+        .bind(SubstrateKind::Kubernetes)
         .fetch_all(pool)
         .await?;
     marked.sort();
@@ -735,6 +744,7 @@ async fn mark_unrecoverable_sandboxes_lost_guards() -> TestResult {
         .bind(Some(node_uid(node)))
         .bind(vec![spared_durable])
         .bind(DEAD_UPLOAD_SETTLE.as_secs() as i64)
+        .bind(SubstrateKind::Kubernetes)
         .fetch_all(pool)
         .await?;
     assert!(
@@ -772,6 +782,7 @@ async fn mark_unrecoverable_sandboxes_lost_guards() -> TestResult {
         .bind(Some(node_uid(terminating)))
         .bind(vec![parked])
         .bind(DEAD_UPLOAD_SETTLE.as_secs() as i64)
+        .bind(SubstrateKind::Kubernetes)
         .fetch_all(pool)
         .await?;
     assert!(

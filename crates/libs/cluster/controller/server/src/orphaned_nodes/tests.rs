@@ -20,6 +20,10 @@
 //! - `t7_delete_error_recorded_but_other_rows_still_processed`
 //! - `t8_max_per_tick_caps_deletes`
 //! - `t9_passes_observed_uid_through_to_delete`
+//!
+//! ## P — Postgres-backed store
+//! - `placement_gate_blocks_on_each_pinning_column_independently`
+//! - `direct_nodes_are_neither_candidates_nor_deleted`
 
 use pplx_space_common_core::types::NodeId;
 
@@ -549,5 +553,48 @@ async fn insert_pinned_sandbox(
     .bind(target_node_id)
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// Both store statements bind the Kubernetes substrate: an otherwise-orphaned
+/// direct node is neither a candidate nor deleted.
+#[tokio::test(flavor = "current_thread")]
+async fn direct_nodes_are_neither_candidates_nor_deleted() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let k8s_node = NodeId::new();
+    let direct_node = NodeId::new();
+    for (node_id, managed_by) in [(k8s_node, "k8s"), (direct_node, "space")] {
+        sqlx::query(sql!(
+            "INSERT INTO nodes (id, address, role, managed_by)
+             VALUES ($1, '10.0.0.1'::INET, 'worker', $2)"
+        ))
+        .bind(node_id)
+        .bind(managed_by)
+        .execute(&db.pool)
+        .await?;
+        sqlx::query(sql!(
+            "INSERT INTO node_k8s (node_id, k8s_node_name) VALUES ($1, $2)"
+        ))
+        .bind(node_id)
+        .bind(format!("orphan-{managed_by}"))
+        .execute(&db.pool)
+        .await?;
+    }
+
+    let store = NodeDbStore::new(db.pool.clone());
+    let ids: Vec<NodeId> = store
+        .list_candidates(100, None)
+        .await?
+        .iter()
+        .map(|c| c.node_id)
+        .collect();
+    assert_eq!(ids, vec![k8s_node]);
+    assert!(
+        !store.delete_node_if_orphan(direct_node, None).await?,
+        "the delete must refuse a direct node"
+    );
+    assert!(store.delete_node_if_orphan(k8s_node, None).await?);
     Ok(())
 }

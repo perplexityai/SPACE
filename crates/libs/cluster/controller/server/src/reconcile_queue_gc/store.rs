@@ -6,7 +6,7 @@
 //! statement; live alone executes its bounded deletes. The node row is never
 //! deleted.
 
-use pplx_space_common_core::types::NodeId;
+use pplx_space_common_core::types::{NodeId, SubstrateKind};
 
 use pplx_space_common_core::sql;
 use std::time::Duration;
@@ -107,7 +107,7 @@ impl QueueGcSink for QueueDbStore {
             "SELECT n.id, k.k8s_node_name, k.k8s_node_uid
              FROM nodes n
              JOIN node_k8s k ON k.node_id = n.id
-             WHERE n.managed_by = 'k8s'
+             WHERE n.managed_by = $4
                AND n.state IS DISTINCT FROM 'ready'
                AND n.drain_phase IS NULL
                AND ($1::UUID IS NULL OR n.id > $1)
@@ -133,6 +133,7 @@ impl QueueGcSink for QueueDbStore {
         .bind(after)
         .bind(retention_secs)
         .bind(i64::from(limit))
+        .bind(SubstrateKind::Kubernetes)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
@@ -175,7 +176,7 @@ impl QueueGcSink for QueueDbStore {
                  FROM nodes n
                  JOIN node_k8s k ON k.node_id = n.id
                  WHERE n.id = $1
-                   AND n.managed_by = 'k8s'
+                   AND n.managed_by = $7
                    AND n.state IS DISTINCT FROM 'ready'
                    AND n.drain_phase IS NULL
                    AND COALESCE(k.k8s_node_uid, '') = COALESCE($2, '')
@@ -268,6 +269,7 @@ impl QueueGcSink for QueueDbStore {
         .bind(i64::from(limit))
         .bind(claim_grace_secs)
         .bind(mode == QueueGcMode::Live)
+        .bind(SubstrateKind::Kubernetes)
         .fetch_one(&self.pool)
         .await?;
         Ok(GoneNodeEvaluation {

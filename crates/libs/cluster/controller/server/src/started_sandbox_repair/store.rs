@@ -2,6 +2,7 @@
 
 use pplx_space_common_core::types::LocalArtifactId;
 use pplx_space_common_core::types::SandboxId;
+use pplx_space_common_core::types::SubstrateKind;
 
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::PositiveDuration;
@@ -39,10 +40,11 @@ fn duration_secs_i64(duration: PositiveDuration) -> i64 {
 /// The row-state guards shared by scan and apply: an aged
 /// `started` Kubernetes row with no active execution and no execution that
 /// still carries a `pod_ip` (a row that could describe a live route). The
-/// snapshot eligibility is composed in separately.
-fn row_state_guards(min_age_param: &str) -> String {
+/// snapshot eligibility is composed in separately. `managed_by_param` is bound
+/// to [`SubstrateKind::Kubernetes`].
+fn row_state_guards(managed_by_param: &str, min_age_param: &str) -> String {
     format!(
-        "s.managed_by = 'k8s'
+        "s.managed_by = {managed_by_param}
          AND s.lifecycle = 'started'
          AND s.lifecycle_changed_at <= NOW() - make_interval(secs => {min_age_param}::BIGINT)
          AND NOT EXISTS (
@@ -116,7 +118,7 @@ impl RepairDbStore {
              LIMIT $4
             ",
             clear_marker = eligibility.clear_marker,
-            guards = row_state_guards("$1"),
+            guards = row_state_guards("$5", "$1"),
             eligible = eligibility.eligible,
         );
         let rows: Vec<ExecutionCandidateRow> =
@@ -125,6 +127,7 @@ impl RepairDbStore {
                 .bind(after_sandbox_id)
                 .bind(upper_bound)
                 .bind(i64::from(batch_size))
+                .bind(SubstrateKind::Kubernetes)
                 .fetch_all(&self.pool)
                 .await?;
 
@@ -212,7 +215,7 @@ impl RepairDbStore {
             RETURNING pre.will_clear",
             clear_marker = eligibility.clear_marker,
             sandbox_assignments = finalization.sandbox_assignments(),
-            guards = row_state_guards("$2"),
+            guards = row_state_guards("$4", "$2"),
             eligible = eligibility.eligible,
         );
         let cleared_marker: Option<bool> =
@@ -220,6 +223,7 @@ impl RepairDbStore {
                 .bind(candidate.sandbox_id)
                 .bind(duration_secs_i64(min_age))
                 .bind(newest_generation)
+                .bind(SubstrateKind::Kubernetes)
                 .fetch_optional(&mut *tx)
                 .await?;
         let Some(cleared_marker) = cleared_marker else {
@@ -277,8 +281,9 @@ impl RepairSink for RepairDbStore {
 
     async fn current_max_sandbox_id(&self) -> Result<Option<SandboxId>, sqlx::Error> {
         let row: Option<(SandboxId,)> = sqlx::query_as(sql!(
-            "SELECT id FROM sandboxes WHERE managed_by = 'k8s' ORDER BY id DESC LIMIT 1"
+            "SELECT id FROM sandboxes WHERE managed_by = $1 ORDER BY id DESC LIMIT 1"
         ))
+        .bind(SubstrateKind::Kubernetes)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|(id,)| id))

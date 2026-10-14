@@ -1,4 +1,7 @@
-use pplx_space_common_core::{sql, types::SandboxId};
+use pplx_space_common_core::{
+    sql,
+    types::{SandboxId, SubstrateKind},
+};
 use std::time::{Duration, Instant};
 
 use sqlx::PgPool;
@@ -88,7 +91,7 @@ impl RetentionSink for TombstoneRetentionStore {
                  SELECT n.id
                    FROM nodes n
                    JOIN node_direct nd ON nd.node_id = n.id
-                  WHERE n.managed_by = 'space'
+                  WHERE n.managed_by = $3
                     AND COALESCE(n.state, 'registered') = 'deleted'
                     AND nd.deleted_at IS NOT NULL
                     AND nd.deleted_at < NOW() - ($1::BIGINT * INTERVAL '1 second')
@@ -114,6 +117,7 @@ impl RetentionSink for TombstoneRetentionStore {
         ))
         .bind(retention_secs)
         .bind(max_records)
+        .bind(SubstrateKind::Space)
         .fetch_all(&mut *tx)
         .await?
         .len() as u64;
@@ -188,10 +192,11 @@ impl RetentionSink for TombstoneRetentionStore {
             "SELECT COUNT(*)
                FROM nodes n
                JOIN node_direct nd ON nd.node_id = n.id
-              WHERE n.managed_by = 'space'
+              WHERE n.managed_by = $1
                 AND COALESCE(n.state, 'registered') = 'deleted'
                 AND nd.deleted_at IS NOT NULL"
         ))
+        .bind(SubstrateKind::Space)
         .fetch_one(&mut *tx)
         .await?;
         let direct_node_tombstones = count_to_u64(direct_node_tombstones_count);

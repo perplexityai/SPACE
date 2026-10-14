@@ -764,6 +764,16 @@ impl TryFrom<String> for NodeManagedBy {
     }
 }
 
+/// Substrate that owns a sandbox or node: the value of control-plane Postgres
+/// `sandboxes.managed_by` and `nodes.managed_by`, and of a route identity's
+/// `substrate_kind`.
+///
+/// `NodeManagedBy` predates its use for sandbox rows; new and converted code
+/// names the value through this alias. It encodes as the column's text, so SQL
+/// binds it as a parameter (`managed_by = $1` with
+/// `.bind(SubstrateKind::Kubernetes)`) rather than spelling `'k8s'`.
+pub type SubstrateKind = NodeManagedBy;
+
 /// Stage of a node's drain, as stored in `nodes.drain_phase`. NULL in that
 /// column means no drain is in progress and has no variant here — model it as
 /// `Option<NodeDrainPhase>`.

@@ -25,6 +25,7 @@
 //! - R10 `r10_newer_non_suspend_snapshot_blocks_marker_clear`
 //! - R11 `r11_exact_current_marker_snapshot_can_precede_lifecycle_changed_at`
 //! - R12 `r12_exact_current_marker_with_later_activity_is_not_listed`
+//! - R13 `r13_direct_rows_are_not_bounded_listed_or_repaired`
 //!
 //! - E3 `e3_execution_generation_race_skips`
 //! - E4 `e4_execution_lifecycle_race_skips`
@@ -1146,6 +1147,53 @@ mod postgres_backed {
                 pod_name: format!("space-sbx-{}-g2", spec.sandbox_id.as_uuid().simple()),
                 generation: 2,
             })
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn r13_direct_rows_are_not_bounded_listed_or_repaired() -> TestResult {
+        let Some(db) = try_pg_test_db().await? else {
+            return Ok(());
+        };
+        let spec = StartedSandboxSpec::repairable(SandboxId::new());
+        insert_started_sandbox(&db.pool, &spec).await?;
+        let set_managed_by = |managed_by: &'static str| {
+            sqlx::query("UPDATE sandboxes SET managed_by = $2 WHERE id = $1")
+                .bind(spec.sandbox_id)
+                .bind(managed_by)
+                .execute(&db.pool)
+        };
+        let store = RepairDbStore::new(db.pool.clone());
+        let candidate = list_all(&store).await?.remove(0);
+
+        set_managed_by("space").await?;
+        assert_eq!(
+            store.current_max_sandbox_id().await?,
+            None,
+            "a direct row does not bound the sweep"
+        );
+        assert!(
+            store
+                .list_candidates(100, None, spec.sandbox_id, default_min_age())
+                .await?
+                .is_empty(),
+            "a direct row is not listed"
+        );
+        assert_eq!(
+            store
+                .revert_started_to_suspended(&candidate, default_min_age())
+                .await?,
+            ApplyOutcome::SkippedRaced,
+            "the apply refuses a direct row"
+        );
+
+        set_managed_by("k8s").await?;
+        assert_eq!(
+            store
+                .revert_started_to_suspended(&candidate, default_min_age())
+                .await?,
+            ApplyOutcome::RevertedToSuspended
         );
         Ok(())
     }

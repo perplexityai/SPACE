@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
+use pplx_space_common_core::types::{SandboxId, SandboxLifecycle, SubstrateKind};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -11,16 +11,21 @@ use super::backend::SandboxStore;
 use super::classify::{RowLifecycle, SandboxRestoreState};
 
 /// Row shape of the classification query: `(sandbox_id, managed_by, lifecycle,
-/// active_generation)`. `lifecycle` is read as text and parsed per row so one
-/// unrecognized value can't fail the batch. `active_generation` is `NULL` when
-/// the LEFT JOIN found no active execution row.
+/// active_generation)`. `managed_by` and `lifecycle` are read as text and
+/// parsed per row so one unrecognized value can't fail the batch.
+/// `active_generation` is `NULL` when the LEFT JOIN found no active execution
+/// row.
 type ClassifyRow = (Uuid, String, String, Option<i64>);
 
 /// Map a raw row's `managed_by` + `lifecycle` to what the classifier may act
 /// on: anything but a Kubernetes-managed row with a known lifecycle is
-/// [`RowLifecycle::Unrecognized`], which the classifier skips.
+/// [`RowLifecycle::Unrecognized`], which the classifier skips. An unparseable
+/// `managed_by` is not Kubernetes-managed.
 fn row_lifecycle(managed_by: &str, lifecycle: &str) -> RowLifecycle {
-    if managed_by != "k8s" {
+    if !matches!(
+        managed_by.parse::<SubstrateKind>(),
+        Ok(SubstrateKind::Kubernetes)
+    ) {
         return RowLifecycle::Unrecognized;
     }
     lifecycle

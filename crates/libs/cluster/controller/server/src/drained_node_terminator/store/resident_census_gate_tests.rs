@@ -9,7 +9,7 @@
 //! fail-closed direction is unchanged: a node the control plane cannot see
 //! keeps every row blocking.
 
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_common_core::types::{NodeId, SandboxId, SubstrateKind};
 
 use std::time::Duration;
 
@@ -245,6 +245,7 @@ async fn refusal_diagnostics_count_residents_through_the_same_predicate() -> Tes
         sqlx::query_as(sqlx::AssertSqlSafe(sql!(query.as_str())))
             .bind(node_id)
             .bind(Option::<String>::None)
+            .bind(SubstrateKind::Kubernetes)
             .fetch_one(pool)
             .await?;
     assert_eq!(

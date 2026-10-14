@@ -220,3 +220,23 @@ async fn publication_quarantine_repair_requires_positive_absence_from_both_owner
         .await
         .expect_err("failed worker probe must defer recovery");
 }
+
+/// The candidate scan binds the Kubernetes substrate: the recoverable fixture
+/// is no candidate once its row is direct-managed.
+#[tokio::test]
+async fn direct_rows_are_not_recovery_candidates() -> TestResult {
+    let db = pg_test_db_with_max_connections(3).await?;
+    let c = fixture(&db.pool).await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET managed_by = 'space' WHERE id = $1"
+    ))
+    .bind(c.sandbox_id)
+    .execute(&db.pool)
+    .await?;
+    assert!(
+        store::candidates(&db.pool, None, Some(c.sandbox_id), 2)
+            .await?
+            .is_empty()
+    );
+    Ok(())
+}

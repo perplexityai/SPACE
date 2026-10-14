@@ -1,5 +1,6 @@
 use pplx_space_common_core::types::NodeId;
 use pplx_space_common_core::types::SnapshotId;
+use pplx_space_common_core::types::SubstrateKind;
 
 use pplx_space_common_core::sql;
 use std::time::Duration;
@@ -116,12 +117,12 @@ pub(crate) fn mark_terminating_query(residency: ResidencyEvidence) -> String {
     )
 }
 
-/// `$1` = node id. Guarded hard-DELETE for the KubeNodeGone recovery path:
-/// reaps a `drained`, `managed_by = 'k8s'` row whose backing EC2 instance
-/// the caller has already confirmed terminated. Keyed on
-/// `drain_phase = 'drained'` (the orphaned-nodes scan only touches
-/// `drain_phase IS NULL`, so it never reaps a drained row — that gap is
-/// exactly what this path closes).
+/// `$1` = node id, `$3` = [`SubstrateKind::Kubernetes`]. Guarded hard-DELETE
+/// for the KubeNodeGone recovery path: reaps a `drained`, Kubernetes-managed
+/// row whose backing EC2 instance the caller has already confirmed
+/// terminated. Keyed on `drain_phase = 'drained'` (the orphaned-nodes scan
+/// only touches `drain_phase IS NULL`, so it never reaps a drained row — that
+/// gap is exactly what this path closes).
 ///
 /// The snapshot + resident `NOT EXISTS` guards are **identical to
 /// [`mark_terminating_query`]**: a drained row is reapable via this direct
@@ -149,7 +150,7 @@ pub(crate) fn delete_drained_node_if_orphan_query(residency: ResidencyEvidence) 
         "DELETE FROM nodes
          WHERE id = $1
            AND drain_phase = 'drained'
-           AND managed_by = 'k8s'
+           AND managed_by = $3
            -- Identity guard: refuse if a same-name kube Node replacement
            -- bumped node_k8s.k8s_node_uid since the EC2 cross-check observed
            -- it (the row would now belong to the fresh node).
@@ -169,13 +170,14 @@ pub(crate) fn delete_drained_node_if_orphan_query(residency: ResidencyEvidence) 
     )
 }
 
-/// `$1` = node id, `$2` = the kube uid observed at the EC2 cross-check.
-/// Post-refusal diagnosis for [`delete_drained_node_if_orphan_query`]:
-/// re-evaluates each of its guards separately so a refusal can be logged and
-/// counted per-reason instead of as one opaque "delete refused". Each column
-/// mirrors one guard verbatim — `phase_drifted` and `uid_mismatch` are the
-/// negations of the DELETE's eligibility and identity guards, and the two
-/// counts reuse the exact predicates behind its `NOT EXISTS` guards.
+/// `$1` = node id, `$2` = the kube uid observed at the EC2 cross-check,
+/// `$3` = [`SubstrateKind::Kubernetes`]. Post-refusal diagnosis for
+/// [`delete_drained_node_if_orphan_query`]: re-evaluates each of its guards
+/// separately so a refusal can be logged and counted per-reason instead of
+/// as one opaque "delete refused". Each column mirrors one guard verbatim —
+/// `phase_drifted` and `uid_mismatch` are the negations of the DELETE's
+/// eligibility and identity guards, and the two counts reuse the exact
+/// predicates behind its `NOT EXISTS` guards.
 ///
 /// Runs as a separate statement *after* the DELETE matched no row, so it can
 /// race concurrent writes; it feeds logging, metrics, and the mark-lost
@@ -189,7 +191,7 @@ pub(crate) fn delete_refusal_diagnostics_query(residency: ResidencyEvidence) -> 
         "SELECT
              NOT EXISTS (
                  SELECT 1 FROM nodes
-                 WHERE id = $1 AND drain_phase = 'drained' AND managed_by = 'k8s'
+                 WHERE id = $1 AND drain_phase = 'drained' AND managed_by = $3
              ) AS phase_drifted,
              NOT EXISTS (
                  SELECT 1 FROM node_k8s
@@ -220,9 +222,10 @@ pub(crate) const DEAD_UPLOAD_SETTLE: Duration = Duration::from_mins(10);
 /// `$3` = the candidate ids the caller has already `FOR UPDATE`-claimed in
 /// the same transaction (only those may flip — see the inline comment),
 /// `$4` = the [`DEAD_UPLOAD_SETTLE`] quiet seconds for same-node `creating`
-/// rows. Mark-lost give-up for the KubeNodeGone recovery: flips every `suspended`
-/// sandbox pinned to the node via `target_node_id` that has no recoverable
-/// copy anywhere to `lifecycle = 'failed'`, returning the flipped ids.
+/// rows, `$5` = [`SubstrateKind::Kubernetes`]. Mark-lost give-up for the
+/// KubeNodeGone recovery: flips every `suspended` sandbox pinned to the node
+/// via `target_node_id` that has no recoverable copy anywhere to
+/// `lifecycle = 'failed'`, returning the flipped ids.
 ///
 /// The caller has already confirmed the node's backing EC2 instance is
 /// **terminated**. That premise drives the two deliberate differences from
@@ -248,7 +251,7 @@ pub(crate) const DEAD_UPLOAD_SETTLE: Duration = Duration::from_mins(10);
 /// Mid-flight rows (`suspending` / `restoring`) are deliberately out of
 /// scope — they keep blocking and stay parked for their own sweepers.
 ///
-/// The `EXISTS` guards re-check the node's `drained` + `managed_by = 'k8s'`
+/// The `EXISTS` guards re-check the node's `drained` + Kubernetes-managed
 /// phase and the `node_k8s.k8s_node_uid` identity (`IS NOT DISTINCT FROM
 /// $2`) **inside the UPDATE**, mirroring [`delete_drained_node_if_orphan_query`]:
 /// a same-name kube replacement or an admin undrain that lands after the EC2
@@ -300,7 +303,7 @@ pub(crate) fn mark_unrecoverable_sandboxes_lost_query() -> String {
             AND NOT {inflight_from_other_node}
             AND EXISTS (
                 SELECT 1 FROM nodes
-                WHERE id = $1 AND drain_phase = 'drained' AND managed_by = 'k8s'
+                WHERE id = $1 AND drain_phase = 'drained' AND managed_by = $5
             )
             AND EXISTS (
                 SELECT 1 FROM node_k8s
@@ -367,12 +370,13 @@ impl NodeDbStore {
 
 impl DrainedNodeTerminatorSink for NodeDbStore {
     async fn list_drained_nodes(&self) -> Result<Vec<NodeId>, sqlx::Error> {
-        // Scoped to `managed_by = 'k8s'`. Direct/admin rows must not be
+        // Scoped to Kubernetes-managed rows. Direct/admin rows must not be
         // fed into the Kubernetes-specific annotation lookup path.
         sqlx::query_scalar::<_, NodeId>(sql!(
-            "SELECT id FROM nodes WHERE drain_phase = $1 AND managed_by = 'k8s'"
+            "SELECT id FROM nodes WHERE drain_phase = $1 AND managed_by = $2"
         ))
         .bind(PHASE_DRAINED)
+        .bind(SubstrateKind::Kubernetes)
         .fetch_all(&self.pool)
         .await
     }
@@ -437,6 +441,7 @@ impl DrainedNodeTerminatorSink for NodeDbStore {
         let result = sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
             .bind(node_id)
             .bind(expected_uid.clone())
+            .bind(SubstrateKind::Kubernetes)
             .execute(&self.pool)
             .await?;
         if result.rows_affected() > 0 {
@@ -455,6 +460,7 @@ impl DrainedNodeTerminatorSink for NodeDbStore {
         ) = sqlx::query_as(sqlx::AssertSqlSafe(sql!(diagnostics.as_str())))
             .bind(node_id)
             .bind(expected_uid)
+            .bind(SubstrateKind::Kubernetes)
             .fetch_one(&self.pool)
             .await?;
         Ok(OrphanDeleteOutcome::Refused(OrphanDeleteRefusal {
@@ -509,10 +515,11 @@ impl DrainedNodeTerminatorSink for NodeDbStore {
         // refusing on drift).
         let node_still_eligible: Option<i32> = sqlx::query_scalar(sql!(
             "SELECT 1 FROM nodes
-              WHERE id = $1 AND drain_phase = 'drained' AND managed_by = 'k8s'
+              WHERE id = $1 AND drain_phase = 'drained' AND managed_by = $2
               FOR SHARE"
         ))
         .bind(node_id)
+        .bind(SubstrateKind::Kubernetes)
         .fetch_optional(&mut *tx)
         .await?;
         let uid_still_matches: Option<i32> = sqlx::query_scalar(sql!(
@@ -593,6 +600,7 @@ impl DrainedNodeTerminatorSink for NodeDbStore {
             .bind(expected_uid)
             .bind(&claimed)
             .bind(DEAD_UPLOAD_SETTLE.as_secs().cast_signed())
+            .bind(SubstrateKind::Kubernetes)
             .fetch_all(&mut *tx)
             .await?;
         if !ids.is_empty() {
@@ -762,3 +770,8 @@ mod inflight_upload_terminate_gate_tests;
 /// and keep every row when the node cannot be seen.
 #[cfg(test)]
 mod resident_census_gate_tests;
+
+/// Postgres-backed coverage for the Kubernetes substrate scope bound into
+/// every terminator statement.
+#[cfg(test)]
+mod substrate_scope_tests;

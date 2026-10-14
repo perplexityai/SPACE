@@ -42,6 +42,11 @@ Read only the references that match the task:
 
 - Wrap every SQL statement passed to `sqlx::query*` in the shared `sql!` locator
   macro. Runtime-built SQL uses `sqlx::AssertSqlSafe(sql!(expr))`.
+- Bind a control-plane `managed_by` substrate value as a parameter
+  (`managed_by = $n` with `.bind(SubstrateKind::Kubernetes)`) instead of
+  writing `'k8s'`/`'space'` in SQL text. Remaining raw-literal sites,
+  including the shared `routable_execution_or_non_k8s` fragment, are existing
+  debt, not precedent.
 - Use UUIDv7 for new SPACE-owned durable identifiers: `Uuid::now_v7()` in Rust
   and `space_uuid_v7()` in Postgres. A UUIDv4 exception needs a concrete privacy
   or protocol reason.

@@ -15,6 +15,9 @@
 //!   the failed adoption wrote in its brief assignment window) no longer
 //!   defers; the repair purges it in the same transaction. Live-looking
 //!   projections and still-assigned sandboxes keep deferring.
+//! - F7 `f7_direct_rows_are_neither_listed_nor_repaired` — the scan and the
+//!   apply both bind the Kubernetes substrate: the repairable fixture with
+//!   `managed_by = 'space'` is not listed and its apply refuses.
 //! - T2 `t2_live_tick_repairs`
 
 use pplx_space_common_core::types::LocalArtifactId;
@@ -648,5 +651,49 @@ async fn t2_live_tick_repairs() -> TestResult {
         .fetch_one(&db.pool)
         .await?;
     assert_eq!(lifecycle, "suspended");
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn f7_direct_rows_are_neither_listed_nor_repaired() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let spec = FailedSandboxSpec::repairable(SandboxId::new());
+    insert_failed_sandbox(&db.pool, &spec).await?;
+    let set_managed_by = |managed_by: &'static str| {
+        sqlx::query("UPDATE sandboxes SET managed_by = $2 WHERE id = $1")
+            .bind(spec.sandbox_id)
+            .bind(managed_by)
+            .execute(&db.pool)
+    };
+
+    let store = RepairDbStore::new(db.pool.clone());
+    let candidates = store.list_candidates(100, None, min_age()).await?;
+    assert_eq!(candidates.len(), 1, "the k8s fixture is listed");
+
+    set_managed_by("space").await?;
+    assert!(
+        store
+            .list_candidates(100, None, min_age())
+            .await?
+            .is_empty(),
+        "a direct row is not listed"
+    );
+    assert_eq!(
+        store
+            .revert_failed_to_suspended(&candidates[0], min_age())
+            .await?,
+        ApplyOutcome::SkippedRaced,
+        "the apply refuses a direct row"
+    );
+
+    set_managed_by("k8s").await?;
+    assert_eq!(
+        store
+            .revert_failed_to_suspended(&candidates[0], min_age())
+            .await?,
+        ApplyOutcome::RevertedToSuspended
+    );
     Ok(())
 }

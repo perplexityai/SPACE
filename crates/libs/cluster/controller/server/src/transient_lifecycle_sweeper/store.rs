@@ -15,7 +15,7 @@ use pplx_space_api::controllers::substrate::{
 };
 use pplx_space_common_core::types::{
     NodeManagedBy, NodeRole, PodName, PodUid, PositiveDuration, SandboxActivationAttemptId,
-    SandboxId, SandboxLifecycle,
+    SandboxId, SandboxLifecycle, SubstrateKind,
 };
 use pplx_space_common_svc::sql::sandbox_routability::routable_execution_or_non_k8s;
 use pplx_space_metrics::cluster_reconciler::{HydrationOutcome, OutcomeEvent};
@@ -81,15 +81,46 @@ pub(super) const HEAL_COMMAND_READY_PENDING_SQL: &str = sql!(
        AND command_ready_pending = true"
 );
 
+/// Failed-cleanup candidates: `failed` rows that still carry an active
+/// execution, oldest attempt first. Bind order: `$1` =
+/// [`SubstrateKind::Kubernetes`] (see [`failed_active_execution_scope`]),
+/// `$2` = batch limit.
+pub(super) const LIST_FAILED_ACTIVE_EXECUTIONS_SQL: &str = sql!(
+    "SELECT s.id, e.k8s_node_name, e.pod_name, e.activation_attempt_id, e.generation,
+            NULLIF(BTRIM(e.pod_uid), '') AS pod_uid, e.route_activation_id
+     FROM sandboxes s
+     JOIN sandbox_k8s_executions e ON e.sandbox_id = s.id
+     WHERE s.managed_by = $1
+       AND s.lifecycle = 'failed'
+       AND e.active
+     ORDER BY e.updated_at ASC, s.id
+     LIMIT $2"
+);
+
+/// Rotate a failed-cleanup candidate behind the others by bumping its active
+/// execution's `updated_at`. Bind order: `$1` = sandbox id, `$2` =
+/// [`SubstrateKind::Kubernetes`] (see [`failed_active_execution_scope`]).
+pub(super) const NOTE_FAILED_CLEANUP_ATTEMPT_SQL: &str = sql!(
+    "UPDATE sandbox_k8s_executions e
+     SET updated_at = NOW()
+     FROM sandboxes s
+     WHERE e.sandbox_id = s.id
+       AND s.id = $1
+       AND s.managed_by = $2
+       AND s.lifecycle = 'failed'
+       AND e.active"
+);
+
 /// Repair only the observed stale-lifecycle split-brain: placement already
 /// says the sandbox is on a node, and the active execution's node reported the
 /// runtime as started. This path does not reconstruct placement metadata.
+/// Bind order: `$1` = sandbox id, `$2` = [`SubstrateKind::Kubernetes`] (see
+/// [`failed_active_execution_scope`]).
 pub(super) const REPAIR_FAILED_ACTIVE_EXECUTION_SQL: &str = sql!(
     "UPDATE sandboxes s
      SET lifecycle = 'started'
    WHERE s.id = $1
      AND s.managed_by = $2
-     AND s.managed_by = 'k8s'
      AND s.lifecycle = 'failed'
      AND s.placement = 'on_node'
      AND EXISTS (
@@ -116,6 +147,17 @@ pub(super) const REAP_COMMAND_READY_PENDING_SQL: &str = sql!(
        AND command_ready_pending = true
      RETURNING to_char(lifecycle_changed_at, 'YYYY-MM-DD HH24:MI:SS.US')"
 );
+
+/// The `managed_by` the failed-active-execution cleanup binds, or `None` when
+/// the running substrate is not Kubernetes. That cleanup's statements scope to
+/// Kubernetes-managed rows only, so on any other substrate they match nothing
+/// and the caller skips them. An unparseable label is not Kubernetes.
+pub(super) fn failed_active_execution_scope(managed_by: &str) -> Option<SubstrateKind> {
+    match managed_by.parse::<SubstrateKind>() {
+        Ok(SubstrateKind::Kubernetes) => Some(SubstrateKind::Kubernetes),
+        Ok(SubstrateKind::Space) | Err(_) => None,
+    }
+}
 
 /// SQL expression naming the lifecycle write a sweep just made.
 ///
@@ -1157,23 +1199,14 @@ impl SweepSink for SubstrateSweepSink {
         &self,
         batch_size: i64,
     ) -> Result<Vec<FailedCleanupCandidate>, sqlx::Error> {
-        let managed_by = self.substrate.managed_by();
-        let rows: Vec<FailedCleanupRow> = sqlx::query_as(sql!(
-            "SELECT s.id, e.k8s_node_name, e.pod_name, e.activation_attempt_id, e.generation,
-                    NULLIF(BTRIM(e.pod_uid), '') AS pod_uid, e.route_activation_id
-             FROM sandboxes s
-             JOIN sandbox_k8s_executions e ON e.sandbox_id = s.id
-             WHERE s.managed_by = $1
-               AND s.managed_by = 'k8s'
-               AND s.lifecycle = 'failed'
-               AND e.active
-             ORDER BY e.updated_at ASC, s.id
-             LIMIT $2"
-        ))
-        .bind(managed_by)
-        .bind(batch_size)
-        .fetch_all(&self.pool)
-        .await?;
+        let Some(managed_by) = failed_active_execution_scope(self.substrate.managed_by()) else {
+            return Ok(Vec::new());
+        };
+        let rows: Vec<FailedCleanupRow> = sqlx::query_as(LIST_FAILED_ACTIVE_EXECUTIONS_SQL)
+            .bind(managed_by)
+            .bind(batch_size)
+            .fetch_all(&self.pool)
+            .await?;
         let observed = observe_candidate_pods(
             &self.substrate,
             rows.iter().map(|row| row.pod_name.as_str()),
@@ -1198,27 +1231,19 @@ impl SweepSink for SubstrateSweepSink {
     }
 
     async fn note_failed_cleanup_attempt(&self, sandbox_id: SandboxId) -> Result<(), sqlx::Error> {
-        let managed_by = self.substrate.managed_by();
+        let Some(managed_by) = failed_active_execution_scope(self.substrate.managed_by()) else {
+            return Ok(());
+        };
         // This bumps `updated_at`, which is also where the age of a
         // materialization attempt comes from. That overlap is safe only
         // because a `failed` sandbox cannot have a create in flight, so
         // nothing reads that age for these rows; were it read, every rotation
         // would refresh it and an abandoned create would defer forever.
-        sqlx::query(sql!(
-            "UPDATE sandbox_k8s_executions e
-             SET updated_at = NOW()
-             FROM sandboxes s
-             WHERE e.sandbox_id = s.id
-               AND s.id = $1
-               AND s.managed_by = $2
-               AND s.managed_by = 'k8s'
-               AND s.lifecycle = 'failed'
-               AND e.active"
-        ))
-        .bind(sandbox_id)
-        .bind(managed_by)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query(NOTE_FAILED_CLEANUP_ATTEMPT_SQL)
+            .bind(sandbox_id)
+            .bind(managed_by)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -1237,7 +1262,9 @@ impl SweepSink for SubstrateSweepSink {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<bool, sqlx::Error> {
-        let managed_by = self.substrate.managed_by();
+        let Some(managed_by) = failed_active_execution_scope(self.substrate.managed_by()) else {
+            return Ok(false);
+        };
         let claimed = sqlx::query_scalar::<_, SandboxId>(REPAIR_FAILED_ACTIVE_EXECUTION_SQL)
             .bind(sandbox_id)
             .bind(managed_by)

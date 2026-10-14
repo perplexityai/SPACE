@@ -30,6 +30,7 @@
 //! - R8 `r8_no_ready_storage_snapshot_is_not_listed_and_apply_skips`
 //! - R9 `r9_activity_after_snapshot_is_not_listed_and_apply_skips`
 //! - R10 `r10_newer_non_suspend_snapshot_blocks_marker_clear`
+//! - R11 `r11_direct_rows_do_not_bound_the_sweep_or_get_listed`
 
 use pplx_space_common_core::types::{NodeId, SandboxId};
 
@@ -1252,6 +1253,33 @@ mod postgres_backed {
             artifact_id,
             Some(marker_id),
             "unsafe repair skip must leave the existing marker untouched"
+        );
+        Ok(())
+    }
+
+    /// The candidate scan and the sweep's upper bound both bind the
+    /// Kubernetes substrate: a direct row with a stale execution neither
+    /// bounds the sweep nor is listed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn r11_direct_rows_do_not_bound_the_sweep_or_get_listed() -> TestResult {
+        let Some(db) = try_pg_test_db().await? else {
+            return Ok(());
+        };
+        let stale = StaleSandboxSpec::stale(SandboxId::new(), NodeId::new());
+        insert_stale_sandbox(&db.pool, &stale).await?;
+        let store = ExecutionDbStore::new(db.pool.clone());
+        assert_eq!(list_all(&store).await?, vec![candidate_for(&stale)]);
+
+        sqlx::query("UPDATE sandboxes SET managed_by = 'space' WHERE id = $1")
+            .bind(stale.sandbox_id)
+            .execute(&db.pool)
+            .await?;
+        assert_eq!(store.current_max_sandbox_id().await?, None);
+        assert!(
+            store
+                .list_candidates(100, None, stale.sandbox_id, default_min_age())
+                .await?
+                .is_empty()
         );
         Ok(())
     }

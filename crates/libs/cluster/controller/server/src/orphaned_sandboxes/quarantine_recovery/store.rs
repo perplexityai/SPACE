@@ -2,7 +2,7 @@
 
 use pplx_space_common_core::{
     sql,
-    types::{LocalArtifactId, NodeId, SandboxId, SnapshotId},
+    types::{LocalArtifactId, NodeId, SandboxId, SnapshotId, SubstrateKind},
 };
 use sqlx::{PgExecutor, PgPool};
 use uuid::Uuid;
@@ -43,7 +43,7 @@ pub(super) async fn candidates<'e>(
            JOIN node_k8s n ON n.node_id = s.active_node_id
            JOIN sandbox_k8s_executions e ON e.sandbox_id = s.id
            JOIN snapshots sn ON sn.sandbox_id = s.id
-          WHERE s.managed_by = 'k8s' AND s.lifecycle = 'quarantined'
+          WHERE s.managed_by = $4 AND s.lifecycle = 'quarantined'
             AND s.current_local_artifact_id IS NULL
             AND s.current_local_artifact_kind IS NULL
             AND s.current_local_artifact_origin IS NULL
@@ -83,6 +83,7 @@ pub(super) async fn candidates<'e>(
     .bind(after)
     .bind(only)
     .bind(limit)
+    .bind(SubstrateKind::Kubernetes)
     .fetch_all(executor)
     .await
 }

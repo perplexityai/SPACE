@@ -83,6 +83,8 @@
 //! - R18 `r18_converge_cas_requires_routable_execution_at_flip_time`
 //! - R19 `r19_candidate_select_carries_active_execution_pod_identity`
 //! - R20 `r20_stranded_stopping_row_without_a_node_is_selected_fenced_and_failed`
+//! - R21 `r21_failed_cleanup_statements_skip_direct_rows`
+//! - R22 `r22_failed_cleanup_runs_only_on_the_kubernetes_substrate`
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -2530,14 +2532,16 @@ mod postgres_backed {
 
     use super::super::store::{
         AgedTransientRow, HEAL_COMMAND_READY_PENDING_SQL, LIST_COMMAND_READY_PENDING_SQL,
+        LIST_FAILED_ACTIVE_EXECUTIONS_SQL, NOTE_FAILED_CLEANUP_ATTEMPT_SQL,
         REAP_COMMAND_READY_PENDING_SQL, REPAIR_FAILED_ACTIVE_EXECUTION_SQL,
         converge_restoring_query, fail_candidate_query, fail_unrestorable_restoring_query,
-        list_aged_transient_query, list_unrestorable_restoring_query, revert_to_suspended_query,
+        failed_active_execution_scope, list_aged_transient_query,
+        list_unrestorable_restoring_query, revert_to_suspended_query,
         undo_revert_to_suspended_query,
     };
     use super::*;
     use pplx_space_common_core::types::SandboxLifecycle;
-    use pplx_space_common_core::types::{NodeId, SandboxId, SnapshotId};
+    use pplx_space_common_core::types::{NodeId, SandboxId, SnapshotId, SubstrateKind};
     use pplx_space_db_test_fixtures::try_pg_test_db;
     use sqlx::PgPool;
 
@@ -4985,5 +4989,79 @@ mod postgres_backed {
         );
         assert_eq!(lifecycle_of(pool, fresh).await?, "stopping");
         Ok(())
+    }
+
+    /// The failed-cleanup statements bind the Kubernetes substrate: a direct
+    /// row with the same failed-with-active-execution shape is not listed,
+    /// not rotated, and not repaired.
+    #[tokio::test(flavor = "current_thread")]
+    async fn r21_failed_cleanup_statements_skip_direct_rows() -> TestResult {
+        let Some(db) = try_pg_test_db().await? else {
+            return Ok(());
+        };
+        let pool = &db.pool;
+        let k8s = SandboxId::new();
+        let direct = SandboxId::new();
+        for (sandbox_id, managed_by) in [(k8s, "k8s"), (direct, "space")] {
+            insert_sandbox_with_lifecycle_and_managed_by(
+                pool,
+                sandbox_id,
+                SandboxLifecycle::Failed,
+                300,
+                managed_by,
+            )
+            .await?;
+            sqlx::query("UPDATE sandboxes SET placement = 'on_node' WHERE id = $1")
+                .bind(sandbox_id)
+                .execute(pool)
+                .await?;
+            insert_execution(pool, sandbox_id, true, 300, Some("node-1")).await?;
+        }
+        let kubernetes = SubstrateKind::Kubernetes;
+
+        let listed: Vec<(SandboxId,)> = sqlx::query_as(LIST_FAILED_ACTIVE_EXECUTIONS_SQL)
+            .bind(kubernetes)
+            .bind(10_i64)
+            .fetch_all(pool)
+            .await?;
+        assert_eq!(listed, vec![(k8s,)]);
+
+        let rotated = |sandbox_id: SandboxId| async move {
+            sqlx::query(NOTE_FAILED_CLEANUP_ATTEMPT_SQL)
+                .bind(sandbox_id)
+                .bind(kubernetes)
+                .execute(pool)
+                .await
+                .map(|result| result.rows_affected())
+        };
+        assert_eq!(rotated(direct).await?, 0, "a direct row is not rotated");
+        assert_eq!(rotated(k8s).await?, 1);
+
+        let repaired = |sandbox_id: SandboxId| async move {
+            sqlx::query_scalar::<_, SandboxId>(REPAIR_FAILED_ACTIVE_EXECUTION_SQL)
+                .bind(sandbox_id)
+                .bind(kubernetes)
+                .fetch_optional(pool)
+                .await
+        };
+        assert_eq!(
+            repaired(direct).await?,
+            None,
+            "a direct row is not repaired"
+        );
+        assert_eq!(repaired(k8s).await?, Some(k8s));
+        Ok(())
+    }
+
+    /// Those statements only run when the controller's substrate is
+    /// Kubernetes; on any other label the sink skips them.
+    #[test]
+    fn r22_failed_cleanup_runs_only_on_the_kubernetes_substrate() {
+        assert_eq!(
+            failed_active_execution_scope("k8s"),
+            Some(SubstrateKind::Kubernetes)
+        );
+        assert_eq!(failed_active_execution_scope("space"), None);
+        assert_eq!(failed_active_execution_scope("unrecognized"), None);
     }
 }

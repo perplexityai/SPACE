@@ -238,6 +238,7 @@ async fn unrecognized_column_value_still_lists_the_node_as_a_gentle_drain() -> T
 
     let rows: Vec<(NodeId, Option<String>)> = sqlx::query_as(draining_nodes_query())
         .bind(PHASE_DRAINING)
+        .bind(SubstrateKind::Kubernetes)
         .fetch_all(&db.pool)
         .await?;
     let raw = rows
@@ -473,6 +474,7 @@ async fn draining_listing_reports_mode_with_null_reading_as_gentle() -> TestResu
 
     let rows: Vec<(NodeId, Option<String>)> = sqlx::query_as(draining_nodes_query())
         .bind(PHASE_DRAINING)
+        .bind(SubstrateKind::Kubernetes)
         .fetch_all(&db.pool)
         .await?;
     let observed: HashMap<NodeId, NodeDrainMode> = rows
@@ -483,5 +485,36 @@ async fn draining_listing_reports_mode_with_null_reading_as_gentle() -> TestResu
     assert_eq!(observed.get(&gentle), Some(&NodeDrainMode::Gentle));
     assert_eq!(observed.get(&forced), Some(&NodeDrainMode::Forced));
     assert_eq!(observed.get(&null_mode), Some(&NodeDrainMode::Gentle));
+    Ok(())
+}
+
+/// The draining work list binds the Kubernetes substrate: a direct node in
+/// the same phase is never handed to the Kubernetes drain pipeline.
+#[tokio::test(flavor = "current_thread")]
+async fn draining_listing_skips_direct_nodes() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let k8s_node = NodeId::new();
+    let direct_node = NodeId::new();
+    for (node_id, managed_by) in [(k8s_node, "k8s"), (direct_node, "space")] {
+        insert_drained_node(
+            &db.pool,
+            node_id,
+            managed_by,
+            Some("draining"),
+            None,
+            Some(30),
+        )
+        .await?;
+    }
+
+    let rows: Vec<(NodeId, Option<String>)> = sqlx::query_as(draining_nodes_query())
+        .bind(PHASE_DRAINING)
+        .bind(SubstrateKind::Kubernetes)
+        .fetch_all(&db.pool)
+        .await?;
+    let listed: Vec<NodeId> = rows.into_iter().map(|(id, _)| id).collect();
+    assert_eq!(listed, vec![k8s_node]);
     Ok(())
 }

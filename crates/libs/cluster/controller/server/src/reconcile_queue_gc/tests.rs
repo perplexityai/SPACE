@@ -1153,4 +1153,48 @@ mod postgres {
         assert_eq!(live_queue_count(&db.pool, node).await?, 3);
         Ok(())
     }
+
+    /// The candidate scan and the gone-node evaluation both bind the
+    /// Kubernetes substrate: a direct node with the same stale refs is neither
+    /// listed nor evaluated eligible, and keeps its refs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn direct_nodes_are_neither_listed_nor_pruned() -> TestResult {
+        let Some(db) = try_pg_test_db().await? else {
+            return Ok(());
+        };
+        let k8s = insert_node(&db.pool, "offline", "uid-k8s").await?;
+        let direct = insert_node(&db.pool, "offline", "uid-direct").await?;
+        sqlx::query("UPDATE nodes SET managed_by = 'space' WHERE id = $1")
+            .bind(direct)
+            .execute(&db.pool)
+            .await?;
+        for node in [k8s, direct] {
+            insert_queue(&db.pool, node, "old", Duration::from_secs(120), false).await?;
+        }
+        let store = QueueDbStore::new(db.pool.clone());
+
+        let ids: Vec<NodeId> = store
+            .list_gone_candidates(Duration::from_secs(60), 100, None)
+            .await?
+            .into_iter()
+            .map(|candidate| candidate.node_id)
+            .collect();
+        assert_eq!(ids, vec![k8s]);
+
+        for (node, uid, expected) in [(k8s, "uid-k8s", 1), (direct, "uid-direct", 0)] {
+            let evaluation = store
+                .evaluate_gone_node(
+                    node,
+                    Some(uid.to_string()),
+                    Duration::from_secs(60),
+                    Duration::from_secs(60),
+                    10,
+                    QueueGcMode::Live,
+                )
+                .await?;
+            assert_eq!(evaluation.deleted.queue, expected);
+            assert_eq!(live_queue_count(&db.pool, node).await?, 1 - expected as i64);
+        }
+        Ok(())
+    }
 }

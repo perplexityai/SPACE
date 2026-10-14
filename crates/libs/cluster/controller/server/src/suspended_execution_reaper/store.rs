@@ -1,7 +1,7 @@
 //! Production [`RetireSink`] backed by Postgres.
 
 use pplx_space_common_core::types::SandboxId;
-use pplx_space_common_core::types::{LocalArtifactId, NodeId};
+use pplx_space_common_core::types::{LocalArtifactId, NodeId, SubstrateKind};
 
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::PositiveDuration;
@@ -61,7 +61,7 @@ impl RetireSink for ExecutionDbStore {
                     s.current_local_artifact_id
                FROM sandboxes s
                JOIN sandbox_k8s_executions e ON e.sandbox_id = s.id AND e.active
-              WHERE s.managed_by = 'k8s'
+              WHERE s.managed_by = $5
                 AND s.lifecycle = 'suspended'
                 AND s.lifecycle_changed_at <= NOW() - make_interval(secs => $1::BIGINT)
                 AND e.created_at <= NOW() - make_interval(secs => $1::BIGINT)
@@ -76,6 +76,7 @@ impl RetireSink for ExecutionDbStore {
             .bind(after_sandbox_id)
             .bind(upper_bound)
             .bind(i64::from(batch_size))
+            .bind(SubstrateKind::Kubernetes)
             .fetch_all(&self.pool)
             .await?;
         Ok(rows
@@ -108,8 +109,9 @@ impl RetireSink for ExecutionDbStore {
         // Pre-PG-15 has no `max(uuid)` aggregate, so ORDER BY DESC LIMIT 1
         // over the primary key index instead.
         let row: Option<(SandboxId,)> = sqlx::query_as(sql!(
-            "SELECT id FROM sandboxes WHERE managed_by = 'k8s' ORDER BY id DESC LIMIT 1"
+            "SELECT id FROM sandboxes WHERE managed_by = $1 ORDER BY id DESC LIMIT 1"
         ))
+        .bind(SubstrateKind::Kubernetes)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|(id,)| id))

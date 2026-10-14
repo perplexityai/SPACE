@@ -22,7 +22,7 @@
 //! and DELETE, kube node-sync upserts the row and bumps the UID. The DELETE
 //! refuses to act if the UID has moved.
 
-use pplx_space_common_core::types::NodeId;
+use pplx_space_common_core::types::{NodeId, SubstrateKind};
 
 use pplx_space_common_core::sql;
 use sqlx::PgPool;
@@ -79,7 +79,7 @@ impl OrphanedNodesSink for NodeDbStore {
                 "SELECT n.id, k.k8s_node_name, k.k8s_node_uid
              FROM nodes n
              JOIN node_k8s k ON k.node_id = n.id
-             WHERE n.managed_by = 'k8s'
+             WHERE n.managed_by = $3
                AND n.drain_phase IS NULL
                AND k.k8s_node_name IS NOT NULL
                AND ($1::UUID IS NULL OR n.id > $1)
@@ -98,6 +98,7 @@ impl OrphanedNodesSink for NodeDbStore {
             ))))
             .bind(after)
             .bind(limit)
+            .bind(SubstrateKind::Kubernetes)
             .fetch_all(&self.pool)
             .await?;
         Ok(rows
@@ -123,7 +124,7 @@ impl OrphanedNodesSink for NodeDbStore {
         let result = sqlx::query(sqlx::AssertSqlSafe(sql!(format!(
             "DELETE FROM nodes n
              WHERE n.id = $1
-               AND n.managed_by = 'k8s'
+               AND n.managed_by = $3
                AND n.drain_phase IS NULL
                AND COALESCE(
                    (SELECT k8s_node_uid FROM node_k8s WHERE node_id = $1),
@@ -142,6 +143,7 @@ impl OrphanedNodesSink for NodeDbStore {
         ))))
         .bind(node_id)
         .bind(expected_uid)
+        .bind(SubstrateKind::Kubernetes)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)

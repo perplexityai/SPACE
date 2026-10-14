@@ -2,6 +2,7 @@
 
 use pplx_space_common_core::types::LocalArtifactId;
 use pplx_space_common_core::types::SandboxId;
+use pplx_space_common_core::types::SubstrateKind;
 
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::PositiveDuration;
@@ -42,9 +43,11 @@ pub struct RepairDbStore {
 /// clears the restore lease, which is only safe once the failed attempt's
 /// lease has expired — previously implied by the repair minimum age exceeding
 /// the lease TTL.
-fn row_state_guards(min_age_param: &str) -> String {
+///
+/// `managed_by_param` is bound to [`SubstrateKind::Kubernetes`].
+fn row_state_guards(managed_by_param: &str, min_age_param: &str) -> String {
     format!(
-        "s.managed_by = 'k8s'
+        "s.managed_by = {managed_by_param}
          AND s.lifecycle = 'failed'
          AND s.lifecycle_changed_at <= NOW() - make_interval(secs => {min_age_param}::BIGINT)
          AND (s.restore_lease_expires_at IS NULL OR s.restore_lease_expires_at < NOW())
@@ -79,7 +82,7 @@ impl RepairDbStore {
         min_age: PositiveDuration,
     ) -> Result<Vec<RepairCandidate>, sqlx::Error> {
         let eligibility = failed_repair_revert_eligibility("s");
-        let guards = row_state_guards("$1");
+        let guards = row_state_guards("$4", "$1");
         let query = format!(
             "SELECT s.id, s.current_local_artifact_id, {clear} AS clear_marker
                FROM sandboxes s
@@ -96,6 +99,7 @@ impl RepairDbStore {
                 .bind(duration_secs_i64(min_age))
                 .bind(after_sandbox_id)
                 .bind(i64::from(batch_size))
+                .bind(SubstrateKind::Kubernetes)
                 .fetch_all(&self.pool)
                 .await?;
         Ok(rows
@@ -149,7 +153,7 @@ impl RepairDbStore {
             RETURNING pre.will_clear",
             clear = eligibility.clear_marker,
             sandbox_assignments = finalization.sandbox_assignments(),
-            guards = row_state_guards("$2"),
+            guards = row_state_guards("$3", "$2"),
             eligible = eligibility.eligible,
         );
         let mut tx = self.pool.begin().await?;
@@ -157,6 +161,7 @@ impl RepairDbStore {
             sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(query.as_str())))
                 .bind(candidate.sandbox_id)
                 .bind(duration_secs_i64(min_age))
+                .bind(SubstrateKind::Kubernetes)
                 .fetch_optional(&mut *tx)
                 .await?;
         let Some(cleared_marker) = cleared_marker else {

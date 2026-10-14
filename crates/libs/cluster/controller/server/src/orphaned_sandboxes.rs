@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 use pplx_space_common_core::types::{
     PodUid, SandboxId, SandboxLifecycle, SandboxQuarantineHistoryAction,
     SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
+    SubstrateKind,
 };
 use pplx_space_common_svc::sql::sandbox_quarantine::{
     quarantine_history_insert_columns, quarantine_state_conflict_assignments,
@@ -1115,8 +1116,9 @@ impl OrphanActionSink for SubstrateActionSink {
         // scan that returns immediately. `fetch_optional` correctly returns
         // `None` for an empty table.
         let row: Option<(SandboxId,)> = sqlx::query_as(sql!(
-            "SELECT id FROM sandboxes WHERE managed_by = 'k8s' ORDER BY id DESC LIMIT 1"
+            "SELECT id FROM sandboxes WHERE managed_by = $1 ORDER BY id DESC LIMIT 1"
         ))
+        .bind(SubstrateKind::Kubernetes)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|(id,)| id))
@@ -1803,7 +1805,7 @@ async fn list_candidates_after(
             FROM sandboxes s
             LEFT JOIN sandbox_k8s_executions e
               ON e.sandbox_id = s.id AND e.active
-            WHERE s.managed_by = 'k8s'
+            WHERE s.managed_by = $9
               AND s.lifecycle <> ALL($1)
               AND (
                   -- Normal: active execution observed.
@@ -1878,6 +1880,7 @@ async fn list_candidates_after(
     .bind(PENDING_POD_LIFECYCLES)
     .bind(CREATE_AGE_THRESHOLD_SECS)
     .bind(ACTIVE_EXECUTION_REQUIRED_LIFECYCLES)
+    .bind(SubstrateKind::Kubernetes)
     .fetch_all(pool)
     .await
 }
