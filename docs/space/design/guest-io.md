@@ -32,9 +32,19 @@ as a virtio block device.
 ## The drive limiter
 
 Every sandbox's root drive has a Firecracker rate limiter with two token
-buckets: operations (requests) and bandwidth (bytes). The defaults are 1,000
+buckets: operations (requests) and bandwidth (bytes). The defaults are 10,000
 operations/s and 100 MiB/s; a warm pool can assign other limits, and each
 sandbox carries its own.
+
+The operations budget counts guest requests even when the host serves them from
+page cache. At 4 KiB per request, 10,000 operations/s permits about 39 MiB/s,
+subject to host contention and the separate bandwidth limit. With the default
+30-second burst, the operations bucket holds 300,000 requests.
+
+Limits are saved with each sandbox and preserved across start and restore.
+Unassigned creates and warm-pool policies with omitted limits use the platform
+default; explicit policy limits take precedence. Existing manually managed pool
+configurations keep their stored assignments when their size is edited.
 
 Each bucket holds `disk_io_burst_secs` (sandbox-manager configuration, default
 30) seconds of its sustained rate and refills at that rate. The sustained

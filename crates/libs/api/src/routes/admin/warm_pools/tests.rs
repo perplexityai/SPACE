@@ -74,11 +74,24 @@ fn disk_capacity_is_bounded_and_reset_is_explicit() {
 
 #[test]
 fn disk_io_policy_must_fit_cluster_safety_ceiling() {
-    let requested = DiskIoLimits::try_new(5_000, 200).unwrap();
-    let error = validate_policy_request(&request(Some(requested)), DiskIoLimits::default())
-        .expect_err("default ceiling must reject an unapproved increase");
-    assert_eq!(error.status(), StatusCode::BAD_REQUEST);
-    validate_policy_request(&request(Some(requested)), requested).unwrap();
+    let defaults = DiskIoLimits::default();
+    for requested in [
+        DiskIoLimits::try_new(
+            defaults.max_operations_per_sec() + 1,
+            defaults.max_bandwidth_mib_per_sec(),
+        )
+        .unwrap(),
+        DiskIoLimits::try_new(
+            defaults.max_operations_per_sec(),
+            defaults.max_bandwidth_mib_per_sec() + 1,
+        )
+        .unwrap(),
+    ] {
+        let error = validate_policy_request(&request(Some(requested)), defaults)
+            .expect_err("default ceiling must reject an unapproved increase");
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+        validate_policy_request(&request(Some(requested)), requested).unwrap();
+    }
 }
 
 #[test]
@@ -231,20 +244,58 @@ fn disk_io_capability_is_hidden_without_an_explicit_cluster_ceiling() {
 
 #[test]
 fn disk_io_capability_reports_cluster_ceiling_and_platform_defaults() {
-    let capability = disk_io_policy_capability_from_values(Some("5000"), Some("200")).unwrap();
+    let defaults = DiskIoLimits::default();
+    let operations = defaults.max_operations_per_sec() * 2;
+    let bandwidth = defaults.max_bandwidth_mib_per_sec() * 2;
+    let capability = disk_io_policy_capability_from_values(
+        Some(&operations.to_string()),
+        Some(&bandwidth.to_string()),
+    )
+    .unwrap();
 
     assert_eq!(
         serde_json::to_value(capability).unwrap(),
         serde_json::json!({
             "disk_capacity": true,
             "disk_io": {
-                "max_operations_per_sec": 5_000,
-                "max_bandwidth_mib_per_sec": 200,
-                "default_operations_per_sec": 1_000,
-                "default_bandwidth_mib_per_sec": 100
+                "max_operations_per_sec": operations,
+                "max_bandwidth_mib_per_sec": bandwidth,
+                "default_operations_per_sec": defaults.max_operations_per_sec(),
+                "default_bandwidth_mib_per_sec": defaults.max_bandwidth_mib_per_sec()
             }
         })
     );
+}
+
+#[test]
+fn disk_io_ceiling_below_the_platform_default_admits_the_default() {
+    let defaults = DiskIoLimits::default();
+    // Raises bandwidth above the default while configuring operations below it.
+    let bandwidth = defaults.max_bandwidth_mib_per_sec() * 2;
+    let capability = disk_io_policy_capability_from_values(
+        Some(&(defaults.max_operations_per_sec() / 2).to_string()),
+        Some(&bandwidth.to_string()),
+    )
+    .unwrap()
+    .disk_io
+    .unwrap();
+    assert_eq!(
+        capability.max_operations_per_sec,
+        defaults.max_operations_per_sec()
+    );
+    assert_eq!(capability.max_bandwidth_mib_per_sec, bandwidth);
+
+    let ceiling = DiskIoLimits::try_new(
+        capability.max_operations_per_sec,
+        capability.max_bandwidth_mib_per_sec,
+    )
+    .unwrap();
+    // An inheriting policy resolves to the default, which an explicit write and
+    // a reset may also set; increases above it stay bounded.
+    validate_policy_request(&request(None), ceiling).unwrap();
+    validate_policy_request(&request(Some(defaults)), ceiling).unwrap();
+    let increase = DiskIoLimits::try_new(defaults.max_operations_per_sec() + 1, bandwidth).unwrap();
+    assert!(validate_policy_request(&request(Some(increase)), ceiling).is_err());
 }
 
 #[test]

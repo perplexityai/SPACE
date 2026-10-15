@@ -409,9 +409,14 @@ fn disk_io_policy_capability_from_values(
         (None, None) => None,
         (Some(operations), Some(bandwidth)) => {
             let defaults = DiskIoLimits::default();
+            // Inheriting policies, resets and unassigned creates all receive the
+            // platform default, so the ceiling never admits less than it. A
+            // configured value only raises a dimension above the default.
             let limits = DiskIoLimits::try_new(
-                parse_positive_u64("SPACE_DISK_IO_SAFETY_MAX_OPERATIONS_PER_SEC", operations)?,
-                parse_positive_u64("SPACE_DISK_IO_SAFETY_MAX_BANDWIDTH_MIB_PER_SEC", bandwidth)?,
+                parse_positive_u64("SPACE_DISK_IO_SAFETY_MAX_OPERATIONS_PER_SEC", operations)?
+                    .max(defaults.max_operations_per_sec()),
+                parse_positive_u64("SPACE_DISK_IO_SAFETY_MAX_BANDWIDTH_MIB_PER_SEC", bandwidth)?
+                    .max(defaults.max_bandwidth_mib_per_sec()),
             )
             .map_err(|error| {
                 ControllerError::internal(format!(

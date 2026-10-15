@@ -104,7 +104,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_NODEMGR_BTRFS_BALANCE_ENABLED` | on | |
 | `SPACE_NODEMGR_BTRFS_SEND_UNSTAMPED_PARENT` | off | Seal retained btrfs send-source parents without the template's received UUID; see [snapshot upload streaming](snapshot-upload-streaming.md). |
 | `SPACE_NODEMGR_DISK_IO_RESERVATION_ENABLED` | off | |
-| `SPACE_DISK_IO_SAFETY_MAX_OPERATIONS_PER_SEC`, `SPACE_DISK_IO_SAFETY_MAX_BANDWIDTH_MIB_PER_SEC` | unset | Set both or neither. |
+| `SPACE_DISK_IO_SAFETY_MAX_OPERATIONS_PER_SEC`, `SPACE_DISK_IO_SAFETY_MAX_BANDWIDTH_MIB_PER_SEC` | unset | Set both or neither. Caps explicit warm-pool policy limits; unset, the cap is the platform default of 10,000 operations/s and 100 MiB/s. A value below the default leaves that dimension at the default. |
 | `SPACE_NODE_DISK_ADMISSION_MIN_AVAILABLE_BYTES` | 50 GiB | Hard free-space floor. Lower it on small disks. |
 | `SPACE_BUILDER_BLOB_MIN_AVAILABLE_BYTES` | 50 GiB | |
 | `SPACE_NODE_API_UDS_PER_SANDBOX` | 64 | Per-sandbox control-socket permits, `1..=node permits`. |

@@ -1663,17 +1663,20 @@ async fn postgres_pool_configured_resources_uses_enabled_release_shape() -> Test
     sqlx::query(sql!(
         "INSERT INTO kubernetes_pool_configs (
              id, template_release_id, vcpu, memory_mib, disk_mib, target_ready_slots,
-             refill_per_tick, max_warming_slots, namespace, enabled
+             refill_per_tick, max_warming_slots, namespace, enabled,
+             disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec
          )
          VALUES
-             ($1, $4, 16, 32768, 65536, 200, 1, 1, 'space', false),
-             ($2, $4, 4, 2048, 4096, 25, 1, 1, 'space', true),
-             ($3, $4, 2, 8192, 32768, 200, 1, 1, 'space', true)"
+             ($1, $4, 16, 32768, 65536, 200, 1, 1, 'space', false, $5, $6),
+             ($2, $4, 4, 2048, 4096, 25, 1, 1, 'space', true, $5, $6),
+             ($3, $4, 2, 8192, 32768, 200, 1, 1, 'space', true, $5, $6)"
     ))
     .bind(Uuid::now_v7())
     .bind(Uuid::now_v7())
     .bind(Uuid::now_v7())
     .bind(release_id)
+    .bind(6_000_i64)
+    .bind(150_i64)
     .execute(&db.pool)
     .await?;
 
@@ -1685,7 +1688,10 @@ async fn postgres_pool_configured_resources_uses_enabled_release_shape() -> Test
     assert_eq!(resources.resources.vcpu, Some(2));
     assert_eq!(resources.resources.memory_mib, Some(8192));
     assert_eq!(resources.resources.disk_mib, Some(32768));
-    assert_eq!(resources.disk_io_limits, Default::default());
+    assert_eq!(
+        resources.disk_io_limits,
+        pplx_space_common_core::types::DiskIoLimits::try_new(6_000, 150)?
+    );
     sqlx::query(sql!(
         "UPDATE kubernetes_pool_configs SET disk_mib = 131073
          WHERE template_release_id = $1 AND vcpu = 2"

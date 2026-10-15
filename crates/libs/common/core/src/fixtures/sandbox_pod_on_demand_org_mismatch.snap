@@ -12,7 +12,7 @@ metadata:
     space.pplx.net/auto-lifecycle-authority: cluster
     space.pplx.net/content-hash: "sha256:969f3d03c5e44174169acb4fc5a8019590338e04aa48e5c11f0fd2e10716e254"
     space.pplx.net/disk-io-max-bandwidth-mib-per-sec: "100"
-    space.pplx.net/disk-io-max-operations-per-sec: "1000"
+    space.pplx.net/disk-io-max-operations-per-sec: "10000"
     space.pplx.net/execution-generation: "16"
     space.pplx.net/memory-mib: "8192"
     space.pplx.net/network-policy: "{\"version\":\"v1\",\"egress\":{\"default_action\":\"deny\",\"allow\":[],\"deny\":[]}}"

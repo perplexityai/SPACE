@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_common_core::types::{DiskIoLimits, NodeId, SandboxId};
 
 use super::*;
 use std::collections::BTreeMap;
@@ -35,6 +35,7 @@ struct ReadyPoolSlotFixture {
 }
 
 async fn insert_ready_pool_slot(pool: &PgPool) -> TestResult<ReadyPoolSlotFixture> {
+    let limits = DiskIoLimits::default();
     let org_id = OrgId::new();
     let user_id = UserId::new();
     let config_id = Uuid::now_v7();
@@ -89,29 +90,35 @@ async fn insert_ready_pool_slot(pool: &PgPool) -> TestResult<ReadyPoolSlotFixtur
     sqlx::query(sql!(
         "INSERT INTO kubernetes_pool_configs (
              id, template_release_id, vcpu, memory_mib, target_ready_slots,
-             refill_per_tick, max_warming_slots, namespace, enabled
+             refill_per_tick, max_warming_slots, namespace, enabled,
+             disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec
          )
-         VALUES ($1, $2, 4, 2048, 1, 1, 1, 'space', true)"
+         VALUES ($1, $2, 4, 2048, 1, 1, 1, 'space', true, $3, $4)"
     ))
     .bind(config_id)
     .bind(latest_release_id)
+    .bind(i64::try_from(limits.max_operations_per_sec())?)
+    .bind(i64::try_from(limits.max_bandwidth_mib_per_sec())?)
     .execute(pool)
     .await?;
     sqlx::query(sql!(
         "INSERT INTO kubernetes_pool_slots (
              config_id, template_release_id, reserved_sandbox_id, template_name,
              content_hash, vcpu, memory_mib, pod_name, pod_namespace, pod_uid,
-             pod_ip, k8s_node_name, state, ready_at
+             pod_ip, k8s_node_name, state, ready_at,
+             disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec
          )
          VALUES (
              $1, $2, $3, 'seed', $4, 4, 2048, 'space-sbx-pooled-g1',
-             'space', 'pod-uid', '10.90.0.11'::inet, 'pool-node-1', 'ready', NOW()
+             'space', 'pod-uid', '10.90.0.11'::inet, 'pool-node-1', 'ready', NOW(), $5, $6
          )"
     ))
     .bind(config_id)
     .bind(latest_release_id)
     .bind(sandbox_id)
     .bind(&content_hash)
+    .bind(i64::try_from(limits.max_operations_per_sec())?)
+    .bind(i64::try_from(limits.max_bandwidth_mib_per_sec())?)
     .execute(pool)
     .await?;
     sqlx::query(sql!(
@@ -148,13 +155,15 @@ async fn insert_pool_config(
     target_ready_slots: i32,
     enabled: bool,
 ) -> TestResult<Uuid> {
+    let limits = DiskIoLimits::default();
     let config_id = Uuid::now_v7();
     sqlx::query(sql!(
         "INSERT INTO kubernetes_pool_configs (
              id, template_release_id, vcpu, memory_mib, target_ready_slots,
-             refill_per_tick, max_warming_slots, namespace, enabled
+             refill_per_tick, max_warming_slots, namespace, enabled,
+             disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec
          )
-         VALUES ($1, $2, $3, $4, $5, 1, $5, 'space', $6)"
+         VALUES ($1, $2, $3, $4, $5, 1, $5, 'space', $6, $7, $8)"
     ))
     .bind(config_id)
     .bind(release_id)
@@ -162,6 +171,8 @@ async fn insert_pool_config(
     .bind(memory_mib)
     .bind(target_ready_slots)
     .bind(enabled)
+    .bind(i64::try_from(limits.max_operations_per_sec())?)
+    .bind(i64::try_from(limits.max_bandwidth_mib_per_sec())?)
     .execute(pool)
     .await?;
     Ok(config_id)
@@ -176,17 +187,19 @@ async fn insert_ready_slot(
     memory_mib: i32,
     pod: (&str, &str),
 ) -> TestResult<SandboxId> {
+    let limits = DiskIoLimits::default();
     let (pod_name, pod_ip) = pod;
     let sandbox_id = SandboxId::new();
     sqlx::query(sql!(
         "INSERT INTO kubernetes_pool_slots (
              config_id, template_release_id, reserved_sandbox_id, template_name,
              content_hash, vcpu, memory_mib, pod_name, pod_namespace, pod_uid,
-             pod_ip, k8s_node_name, state, ready_at
+             pod_ip, k8s_node_name, state, ready_at,
+             disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec
          )
          VALUES (
              $1, $2, $3, 'seed', $4, $5, $6, $7,
-             'space', 'pod-uid', $8::inet, 'pool-node-1', 'ready', NOW()
+             'space', 'pod-uid', $8::inet, 'pool-node-1', 'ready', NOW(), $9, $10
          )"
     ))
     .bind(config_id)
@@ -197,6 +210,8 @@ async fn insert_ready_slot(
     .bind(memory_mib)
     .bind(pod_name)
     .bind(pod_ip)
+    .bind(i64::try_from(limits.max_operations_per_sec())?)
+    .bind(i64::try_from(limits.max_bandwidth_mib_per_sec())?)
     .execute(pool)
     .await?;
     Ok(sandbox_id)

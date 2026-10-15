@@ -1,11 +1,9 @@
 use std::num::NonZeroU32;
 
-/// Default per-sandbox disk operation rate used when a warm-pool configuration
-/// has no explicit assignment.
-pub const DEFAULT_DISK_IO_MAX_OPERATIONS_PER_SEC: u64 = 1_000;
+/// Default per-sandbox disk operation rate when no explicit assignment exists.
+pub const DEFAULT_DISK_IO_MAX_OPERATIONS_PER_SEC: u64 = 10_000;
 
-/// Default per-sandbox disk bandwidth used when a warm-pool configuration has
-/// no explicit assignment.
+/// Default per-sandbox disk bandwidth when no explicit assignment exists.
 pub const DEFAULT_DISK_IO_MAX_BANDWIDTH_MIB_PER_SEC: u64 = 100;
 
 /// Default seconds of its sustained rates a sandbox drive's buckets hold.

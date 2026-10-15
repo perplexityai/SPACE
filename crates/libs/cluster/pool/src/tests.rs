@@ -2071,6 +2071,65 @@ async fn store_claim_routes_by_encryptable_partition() -> TestResult {
     Ok(())
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn manual_pool_creation_uses_platform_limits_and_updates_preserve_assignments() -> TestResult
+{
+    let fixture = postgres_fixture().await?;
+    let (release_id, _, _) = seed_pool_config(&fixture.pool, 0x22).await?;
+    let spec = ManualPoolConfigSpec {
+        vcpu: 8,
+        memory_mib: 4096,
+        disk_mib: None,
+        reset_disk_to_template_default: false,
+        target_ready_slots: 2,
+        refill_per_tick: 1,
+        max_warming_slots: 1,
+        namespace: "space",
+        enabled: true,
+        encryptable: false,
+    };
+    let mut tx = fixture.pool.begin().await?;
+    let id = WarmPoolStore::upsert_manual_config(&mut tx, release_id, &spec).await?;
+    tx.commit().await?;
+    let created = fixture.store.config_with_counts(id).await?.unwrap();
+    let defaults = pplx_space_common_core::types::DiskIoLimits::default();
+    assert_eq!(
+        created.disk_io_max_operations_per_sec,
+        i64::try_from(defaults.max_operations_per_sec())?
+    );
+    assert_eq!(
+        created.disk_io_max_bandwidth_mib_per_sec,
+        i64::try_from(defaults.max_bandwidth_mib_per_sec())?
+    );
+
+    sqlx::query(pplx_space_common_core::sql!(
+        "UPDATE kubernetes_pool_configs
+         SET disk_io_max_operations_per_sec = $2,
+             disk_io_max_bandwidth_mib_per_sec = $3
+         WHERE id = $1"
+    ))
+    .bind(id)
+    .bind(7_000_i64)
+    .bind(50_i64)
+    .execute(&fixture.pool)
+    .await?;
+    let mut tx = fixture.pool.begin().await?;
+    assert_eq!(
+        WarmPoolStore::upsert_manual_config(&mut tx, release_id, &spec).await?,
+        id
+    );
+    tx.commit().await?;
+    let updated = fixture.store.config_with_counts(id).await?.unwrap();
+    assert_eq!(
+        (
+            updated.disk_io_max_operations_per_sec,
+            updated.disk_io_max_bandwidth_mib_per_sec
+        ),
+        (7_000, 50)
+    );
+    Ok(())
+}
+
 /// The store itself fences encryptable seeding while the legacy 3-column
 /// index is live, so a direct store caller cannot persist a row the
 /// autoscaler's partition-scoped upsert would collide with.

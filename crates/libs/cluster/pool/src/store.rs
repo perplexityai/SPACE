@@ -350,9 +350,10 @@ impl WarmPoolStore {
                 "INSERT INTO kubernetes_pool_configs (
                      template_release_id, vcpu, memory_mib, disk_mib, encryptable,
                      target_ready_slots, refill_per_tick, max_warming_slots,
-                     namespace, enabled, managed_by
+                     namespace, enabled, managed_by,
+                     disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec
                  )
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                  RETURNING id"
             ))
             .bind(template_release_id)
@@ -366,6 +367,14 @@ impl WarmPoolStore {
             .bind(spec.namespace)
             .bind(spec.enabled)
             .bind(PoolConfigOwner::Manual.as_str())
+            .bind(
+                i64::try_from(DEFAULT_DISK_IO_MAX_OPERATIONS_PER_SEC)
+                    .expect("default disk IOPS fits in PostgreSQL BIGINT"),
+            )
+            .bind(
+                i64::try_from(DEFAULT_DISK_IO_MAX_BANDWIDTH_MIB_PER_SEC)
+                    .expect("default disk bandwidth fits in PostgreSQL BIGINT"),
+            )
             .fetch_one(&mut **tx)
             .await?
         };
