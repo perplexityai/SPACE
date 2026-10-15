@@ -11,7 +11,11 @@ from typing import cast
 import space_smoke as smoke
 from space_smoke.capabilities import EcwCommandResult
 from space_smoke.fixtures import Ecw
-from space_smoke.network_policy_fastly import verify_fastly_shared_edge_bypass
+from space_smoke.network_policy_fastly import (
+    classify,
+    verify_fastly_shared_edge_bypass,
+)
+from space_smoke.runtime import InconclusiveSmoke, InvariantViolation
 from space_smoke.scenarios import REGISTRY
 
 
@@ -23,28 +27,46 @@ class _Files:
         self.writes.append((path, contents))
 
 
-def _probe_stdout(*, allowed_failed: list[str] | None = None, bypass_detected: list[str] | None = None) -> str:
-    return json.dumps(
-        {
-            "resolved_ip": "151.101.0.223",
-            "verdict": {
-                "allowed_failed": allowed_failed or [],
-                "bypass_detected": bypass_detected or [],
-            },
-        }
-    )
+def _edge(first_line: str, body: str) -> dict[str, object]:
+    return {"first_line": first_line, "body": body, "edge_served": True}
 
 
-NO_VERDICT = "Fastly shared-edge guest probe reported no verdict"
+def _gateway(first_line: str) -> dict[str, object]:
+    return {"first_line": first_line, "body": "", "edge_served": False}
+
+
+EDGE_SSL_REQUIRED = _edge("HTTP/1.1 403 SSL is required", "SSL is required.")
+GATEWAY_FORBIDDEN = _gateway("HTTP/1.1 403 Forbidden")
+GATEWAY_UPSTREAM_FAILED = _gateway("HTTP/1.1 502 Bad Gateway")
+
+
+def _observed(**overrides: object) -> dict[str, object]:
+    """A probe run in which the edge answers and every isolation check holds."""
+
+    observed: dict[str, object] = {
+        "resolved_ip": "192.0.2.10",
+        "matching_tls": {"connected": True, "first_line": "HTTP/1.1 200 OK"},
+        "co_tenant_tls": {"connected": False, "error_type": "ConnectionResetError"},
+        "matching_http": EDGE_SSL_REQUIRED,
+        "co_tenant_http": GATEWAY_FORBIDDEN,
+        "unrelated_http": GATEWAY_FORBIDDEN,
+        "fastly_host_override": EDGE_SSL_REQUIRED,
+    }
+    observed.update(overrides)
+    return observed
+
+
+NO_VERDICT = "Fastly shared-edge guest probe reported no observations"
 ESCAPED = "Fastly shared-edge traffic escaped its DNS-attributed hostname"
-ALLOW_FAILED = "the allowed Fastly host failed through the gateway while every bypass check held"
+ALLOW_FAILED = "the gateway refused the allowed Fastly host while every bypass check held"
 
 
 class _ProbeTest:
-    def __init__(self, exit_code: int, stdout: str) -> None:
+    def __init__(self, stdout: str) -> None:
         self.sandbox = type("Sandbox", (), {"files": _Files()})()
-        self.result = EcwCommandResult(exit_code, stdout, "")
+        self.result = EcwCommandResult(0, stdout, "")
         self.verifications: list[tuple[bool, str]] = []
+        self.recorded: dict[str, object] = {}
 
     @contextmanager
     def phase(self, _name: str) -> Iterator[None]:
@@ -55,9 +77,14 @@ class _ProbeTest:
 
     def verify(self, condition: bool, message: str, **_evidence: object) -> None:
         self.verifications.append((condition, message))
+        if not condition:
+            raise InvariantViolation(message)
+
+    def record(self, name: str, value: object) -> None:
+        self.recorded[name] = value
 
     def collect_guest_network_snapshot(self) -> dict[str, object]:
-        return {}
+        return {"guest_snapshot_status": "exit=0"}
 
 
 class _ScenarioFixture:
@@ -70,8 +97,98 @@ class _ScenarioFixture:
 
 
 class NetworkPolicyFastlyTests(unittest.TestCase):
-    def test_probe_reports_one_independent_fastly_bypass_verdict(self) -> None:
-        test = _ProbeTest(0, _probe_stdout())
+    def test_classify_judges_only_responses_the_edge_served(self) -> None:
+        cases: list[tuple[str, dict[str, object], dict[str, list[str]]]] = [
+            ("held", _observed(), {}),
+            (
+                # The gateway's 502 for a failed upstream fetch carries no edge
+                # evidence, so it is no baseline for the override comparison.
+                "allowed fetch failed upstream",
+                _observed(matching_http=GATEWAY_UPSTREAM_FAILED),
+                {"inconclusive": ["fastly_headers_stripped", "matching_http_reached_edge"]},
+            ),
+            (
+                "allowed request timed out",
+                _observed(matching_http={"error_type": "TimeoutError"}),
+                {"inconclusive": ["fastly_headers_stripped", "matching_http_reached_edge"]},
+            ),
+            (
+                "edge 5xx baseline",
+                _observed(matching_http=_edge("HTTP/1.1 503 Service Unavailable", "busy")),
+                {"inconclusive": ["fastly_headers_stripped"]},
+            ),
+            (
+                "override fetch failed upstream",
+                _observed(fastly_host_override=GATEWAY_UPSTREAM_FAILED),
+                {"inconclusive": ["fastly_headers_stripped"]},
+            ),
+            (
+                "gateway refused the override",
+                _observed(fastly_host_override=GATEWAY_FORBIDDEN),
+                {},
+            ),
+            (
+                "gateway refused the allowed host",
+                _observed(matching_http=GATEWAY_FORBIDDEN),
+                {
+                    "allowed_failed": ["matching_http_reached_edge"],
+                    "inconclusive": ["fastly_headers_stripped"],
+                },
+            ),
+            (
+                "allowed TLS failed",
+                _observed(matching_tls={"connected": False, "error_type": "ConnectionResetError"}),
+                {"allowed_failed": ["matching_tls"]},
+            ),
+            (
+                "edge honored the routing header",
+                _observed(
+                    fastly_host_override=_edge("HTTP/1.1 421 Misdirected Request", "Misdirected request")
+                ),
+                {"bypass_detected": ["fastly_headers_stripped"]},
+            ),
+            (
+                # An edge-served 403 means the request left the gateway.
+                "co-tenant reached the edge",
+                _observed(co_tenant_http=_edge("HTTP/1.1 403 Forbidden", "")),
+                {"bypass_detected": ["co_tenant_http_blocked"]},
+            ),
+            (
+                # A 502 follows host authorization, so the gateway admitted it.
+                "co-tenant admitted, upstream failed",
+                _observed(
+                    matching_http=GATEWAY_UPSTREAM_FAILED,
+                    co_tenant_http=GATEWAY_UPSTREAM_FAILED,
+                ),
+                {
+                    "bypass_detected": ["co_tenant_http_blocked"],
+                    "inconclusive": ["fastly_headers_stripped", "matching_http_reached_edge"],
+                },
+            ),
+            (
+                "unrelated host reached the edge",
+                _observed(unrelated_http=_edge("HTTP/1.1 200 OK", "<html>")),
+                {"bypass_detected": ["unrelated_http_blocked"]},
+            ),
+            (
+                "co-tenant TLS connected",
+                _observed(co_tenant_tls={"connected": True, "first_line": "HTTP/1.1 200 OK"}),
+                {"bypass_detected": ["co_tenant_tls_blocked"]},
+            ),
+        ]
+        for name, observed, expected in cases:
+            with self.subTest(name):
+                self.assertEqual(
+                    classify(observed),
+                    {
+                        "allowed_failed": expected.get("allowed_failed", []),
+                        "bypass_detected": expected.get("bypass_detected", []),
+                        "inconclusive": expected.get("inconclusive", []),
+                    },
+                )
+
+    def test_probe_installs_a_compilable_guest_script_and_passes_when_held(self) -> None:
+        test = _ProbeTest(json.dumps(_observed()))
 
         verify_fastly_shared_edge_bypass(cast(Ecw, test))
 
@@ -84,22 +201,44 @@ class NetworkPolicyFastlyTests(unittest.TestCase):
             [(True, NO_VERDICT), (True, ESCAPED), (True, ALLOW_FAILED)],
         )
 
-    def test_a_failed_allowed_flow_is_not_reported_as_a_bypass(self) -> None:
-        test = _ProbeTest(1, _probe_stdout(allowed_failed=["matching_tls"]))
+    def test_an_allowed_fetch_that_never_reached_the_edge_is_inconclusive(self) -> None:
+        test = _ProbeTest(json.dumps(_observed(matching_http=GATEWAY_UPSTREAM_FAILED)))
 
-        verify_fastly_shared_edge_bypass(cast(Ecw, test))
+        with self.assertRaises(InconclusiveSmoke):
+            verify_fastly_shared_edge_bypass(cast(Ecw, test))
 
         self.assertEqual(
             test.verifications,
-            [(True, NO_VERDICT), (True, ESCAPED), (False, ALLOW_FAILED)],
+            [(True, NO_VERDICT), (True, ESCAPED), (True, ALLOW_FAILED)],
+        )
+        self.assertEqual(
+            test.recorded["inconclusive_checks"],
+            ["fastly_headers_stripped", "matching_http_reached_edge"],
+        )
+        self.assertIn("guest_snapshot_status", test.recorded)
+
+    def test_a_bypass_fails_as_an_escape_even_when_the_baseline_is_missing(self) -> None:
+        test = _ProbeTest(
+            json.dumps(
+                _observed(
+                    matching_http=GATEWAY_UPSTREAM_FAILED,
+                    co_tenant_http=_edge("HTTP/1.1 200 OK", "tenant"),
+                )
+            )
         )
 
-    def test_a_bypass_fails_as_an_escape(self) -> None:
-        test = _ProbeTest(1, _probe_stdout(bypass_detected=["co_tenant_tls_blocked"]))
+        with self.assertRaises(InvariantViolation):
+            verify_fastly_shared_edge_bypass(cast(Ecw, test))
 
-        verify_fastly_shared_edge_bypass(cast(Ecw, test))
+        self.assertEqual(test.verifications[-1], (False, ESCAPED))
 
-        self.assertIn((False, ESCAPED), test.verifications)
+    def test_unparseable_probe_output_is_reported(self) -> None:
+        test = _ProbeTest("Traceback (most recent call last):")
+
+        with self.assertRaises(InvariantViolation):
+            verify_fastly_shared_edge_bypass(cast(Ecw, test))
+
+        self.assertEqual(test.verifications, [(False, NO_VERDICT)])
 
     def test_scenario_allows_only_the_fastly_host_that_seeds_attribution(self) -> None:
         scenario = REGISTRY.get("network_policy.v1_fastly_shared_edge_bypass")
