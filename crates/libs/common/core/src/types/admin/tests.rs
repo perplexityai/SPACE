@@ -66,7 +66,7 @@ fn a_computed_drainability_block_serializes_every_term() {
 /// A `:drain` body that expressed no replacement intent must omit the key
 /// entirely, not send an explicit `null`.
 ///
-/// `space-cli` serializes `DrainRequest` whole and its binaries roll
+/// `space-admin-cli` serializes `DrainRequest` whole and its binaries roll
 /// independently of the api-server, so a new CLI routinely talks to a
 /// previous-release server where this field is a bare `bool`. serde's `default`
 /// fires only on an absent key — an explicit `null` deserializes as

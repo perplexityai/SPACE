@@ -1110,7 +1110,7 @@ pub(super) async fn is_node_wake_gate_closed(
 ///   drain's only record of when it began. Four readers, and only the last is
 ///   not an operator's eyes:
 ///   - The admin node response echoes it (`admin_node_response`).
-///   - `space-cli` renders it as `Drain Started` — the age an operator reads to
+///   - `space-admin-cli` renders it as `Drain Started` — the age an operator reads to
 ///     decide whether a drain has sat too long. Re-stamping resets that reading
 ///     to seconds-ago at the exact moment they concluded it had.
 ///   - The management dashboard computes the same age for its drain column and
@@ -1128,7 +1128,7 @@ pub(super) async fn is_node_wake_gate_closed(
 ///   (`in_flight_replace_conflict`), so the choice is between preserving and
 ///   409ing, never between preserving and silently overwriting.
 ///
-///   Applying an expressed value looks safer and is not. Every `space-cli`
+///   Applying an expressed value looks safer and is not. Every `space-admin-cli`
 ///   built before `replace_after_terminate` became an `Option` sends an
 ///   explicit `!no_replace_after_terminate`, so a plain `--forced` from a stale
 ///   binary carries `true` — and CLI binaries roll independently of the

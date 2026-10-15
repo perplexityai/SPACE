@@ -1170,7 +1170,7 @@ fn only_an_expressed_disagreement_conflicts_with_the_drain_in_flight() {
     );
     assert_eq!(in_flight_replace_conflict(Some(true), false), None);
     // Unexpressed is never a conflict, whatever is stored — this is what keeps a
-    // bodiless repeat and a `space-cli` that omits the flag on the 200 path.
+    // bodiless repeat and a `space-admin-cli` that omits the flag on the 200 path.
     for stored in [true, false] {
         assert_eq!(
             in_flight_replace_conflict(None, stored),

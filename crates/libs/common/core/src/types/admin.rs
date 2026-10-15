@@ -448,12 +448,12 @@ pub struct DrainRequest {
     /// A bare `bool` cannot express that. With no way to tell an omitted field
     /// from an explicit `true`, the endpoint has to choose between refusing
     /// every bodiless repeat against a shrinking node, silently applying a stale
-    /// client's default (every `space-cli` older than this field sends an
+    /// client's default (every `space-admin-cli` older than this field sends an
     /// explicit `!no_replace_after_terminate`), and silently dropping a
     /// deliberate correction. None of those surfaces as an error, which is
     /// exactly the case [`Option`] exists for.
     ///
-    /// `skip_serializing_if` is load-bearing, not tidiness. `space-cli` serializes
+    /// `skip_serializing_if` is load-bearing, not tidiness. `space-admin-cli` serializes
     /// this struct whole, and serde's `default` fires only on an **absent** key —
     /// an explicit `null` against an api-server that still types the field as
     /// `bool` is `invalid type: null, expected a boolean`, i.e. a 400 on every

@@ -1071,7 +1071,7 @@ fn replace_conflict_message(stored_replace: bool, requested: bool) -> String {
          request asked for {requested}. A drain's replacement intent is fixed when it starts, \
          because the terminator may act on it at any time after the node reaches drained. \
          Omit the field to escalate on the existing terms, or send \
-         replace_after_terminate={stored_replace} to match them — note space-cli reaches the \
+         replace_after_terminate={stored_replace} to match them — note space-admin-cli reaches the \
          second only as --no-replace-after-terminate, so if the drain in flight auto-replaces, \
          omitting is the only remedy it can issue. To change the terms, :undrain and start a \
          fresh drain."
@@ -1202,7 +1202,7 @@ fn audited_mode_in_progress(
 ///
 /// Refusing rather than applying, and refusing rather than ignoring:
 ///
-/// - **Applying** would honour a stale client. Every `space-cli` older than
+/// - **Applying** would honour a stale client. Every `space-admin-cli` older than
 ///   `replace_after_terminate: Option<bool>` sends an explicit
 ///   `!no_replace_after_terminate`, so a plain `--forced` escalation from one
 ///   carries `true` and would silently turn a blue-green shrink back into an

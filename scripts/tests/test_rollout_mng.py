@@ -2641,7 +2641,7 @@ class TestAdminApiPrefix:
         The dedicated admin host reaches the same tree at `/v1`, and the ingress
         `/admin` rule is a bare `pathType: Prefix` with no rewrite-target, so
         this is the spelling that resolves on every deployment — the same
-        reasoning `space-cli`'s `ADMIN_API_PREFIX` records.
+        reasoning `space-admin-cli`'s `ADMIN_API_PREFIX` records.
         """
         assert rollout.ADMIN_API_PREFIX == self.LITERAL
 

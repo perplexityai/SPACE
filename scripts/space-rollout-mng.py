@@ -254,8 +254,8 @@ class Ec2Instance:
 # `/admin/api/v1` is the spelling that resolves everywhere: the shared-host
 # api-server mounts it, the dedicated admin host reaches the same tree at `/v1`,
 # and the ingress `/admin` rule is a bare `pathType: Prefix` with no
-# rewrite-target, so the path arrives at the backend intact. `space-cli` picked
-# it for the same reason (`admin_client.rs`, `ADMIN_API_PREFIX`).
+# rewrite-target, so the path arrives at the backend intact. `space-admin-cli`
+# picked it for the same reason (`admin_client.rs`, `ADMIN_API_PREFIX`).
 #
 # Getting it wrong is expensive to notice, which is why it is a named constant
 # rather than four literals. `list_nodes` is the first admin call in a tick, so
