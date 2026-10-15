@@ -12,10 +12,12 @@ preference and an optional organization primary color. An unset color uses the
 preset accent; a configured color derives matching interaction and link states
 without replacing status colors or surfaces. Table density remains page-owned.
 
-The preset and local [Inter 4.1 assets](public/fonts/inter/README.md) are available
-for adoption; existing providers do not load or activate them yet. Consumers
-must load `/fonts/inter/inter.css` and place Ant Design's `App` below the themed
-`ConfigProvider` so contextual feedback inherits the appearance.
+The root provider applies the preset and loads local
+[Inter 4.1 assets](public/fonts/inter/README.md) through `/fonts/inter/inter.css`.
+Login uses the base appearance; the dashboard refines its accent with the
+organization's configured primary color. Existing Light/Dark/Auto preferences
+are preserved. The dashboard places Ant Design's `App` below its themed
+`ConfigProvider`, and sandbox feedback uses `App.useApp()` to inherit that theme.
 
 ## Sandbox dashboard link
 

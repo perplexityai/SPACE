@@ -4,10 +4,10 @@ import { useEffect, useRef, useState } from 'react';
 import { useRouter, usePathname } from 'next/navigation';
 import Link from 'next/link';
 import { useAuth } from '@/lib/auth';
-import { useTheme, useAntAlgorithm } from '@/lib/theme';
+import { useTheme, useCuriosityTheme } from '@/lib/theme';
 import { UserRole } from '@/lib/types';
 import { isManagingOrgAdmin } from '@/lib/userRoles';
-import { Layout, Menu, Typography, Button, ConfigProvider, Avatar, Space, Segmented, Modal } from 'antd';
+import { App, Layout, Menu, Typography, Button, ConfigProvider, Avatar, Space, Segmented, Modal } from 'antd';
 import {
   DashboardOutlined,
   TeamOutlined,
@@ -44,7 +44,7 @@ const menuItems: DashboardMenuItem[] = [
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
   const { user, org, cluster, loading, logout } = useAuth();
   const { mode, setMode, isDark } = useTheme();
-  const algorithm = useAntAlgorithm();
+  const { config, primaryColor, surfaces } = useCuriosityTheme(org?.theme_primary);
   const router = useRouter();
   const pathname = usePathname();
   const [logoutConfirmationOpen, setLogoutConfirmationOpen] = useState(false);
@@ -82,90 +82,75 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
     .filter((item) => pathname.startsWith(item.key))
     .sort((a, b) => b.key.length - a.key.length)[0]?.key || '/dashboard';
 
-  const primary = org.theme_primary || '#1677ff';
-
-  const sidebarBg = isDark
-    ? `color-mix(in srgb, ${primary} 8%, #141414)`
-    : `color-mix(in srgb, ${primary} 10%, #ffffff)`;
-  const sidebarBorder = isDark
-    ? `color-mix(in srgb, ${primary} 12%, #303030)`
-    : `color-mix(in srgb, ${primary} 15%, #e8e8e8)`;
-  const contentBg = isDark ? '#141414' : '#fff';
-
   return (
-    <ConfigProvider
-      theme={{
-        token: {
-          colorPrimary: primary,
-        },
-        algorithm,
-      }}
-    >
-      <Layout style={{ minHeight: '100vh' }}>
-        <Sider
-          width={200}
-          theme={isDark ? 'dark' : 'light'}
-          style={{ background: sidebarBg, borderRight: `1px solid ${sidebarBorder}` }}
-        >
-          <div style={{ padding: '16px 24px', borderBottom: `1px solid ${sidebarBorder}` }}>
-            {org.logo_url ? (
-              <img src={org.logo_url} alt={org.name} style={{ maxWidth: 160, marginBottom: 8 }} />
-            ) : (
-              <Text strong style={{ fontSize: 16 }}>{org.name}</Text>
-            )}
-          </div>
-          <Menu
-            mode="inline"
-            selectedKeys={[selectedKey]}
-            items={visibleItems}
-            style={{ borderRight: 0, background: 'transparent' }}
-          />
-          <div style={{ position: 'absolute', bottom: 0, width: '100%', padding: '16px 24px', borderTop: `1px solid ${sidebarBorder}` }}>
-            <Space orientation="vertical" size={8} style={{ width: '100%' }}>
-              <Segmented
-                size="small"
-                block
-                value={mode}
-                onChange={(v) => setMode(v as 'light' | 'dark' | 'auto')}
-                options={[
-                  { label: 'Light', value: 'light' },
-                  { label: 'Dark', value: 'dark' },
-                  { label: 'Auto', value: 'auto' },
-                ]}
-              />
-              <Space>
-                <Avatar size="small" icon={<UserOutlined />} style={{ background: primary }} />
-                <div>
-                  <Text style={{ fontSize: 13 }}>{user.display_name}</Text>
-                  <br />
-                  <Text type="secondary" style={{ fontSize: 11 }}>{user.role}</Text>
-                </div>
+    <ConfigProvider theme={config}>
+      <App>
+        <Layout style={{ minHeight: '100vh' }}>
+          <Sider
+            width={200}
+            theme={isDark ? 'dark' : 'light'}
+            style={{ background: surfaces.sidebar, borderRight: `1px solid ${surfaces.sidebarBorder}` }}
+          >
+            <div style={{ padding: '16px 24px', borderBottom: `1px solid ${surfaces.sidebarBorder}` }}>
+              {org.logo_url ? (
+                <img src={org.logo_url} alt={org.name} style={{ maxWidth: 160, marginBottom: 8 }} />
+              ) : (
+                <Text strong style={{ fontSize: 16 }}>{org.name}</Text>
+              )}
+            </div>
+            <Menu
+              mode="inline"
+              selectedKeys={[selectedKey]}
+              items={visibleItems}
+              style={{ borderRight: 0, background: 'transparent' }}
+            />
+            <div style={{ position: 'absolute', bottom: 0, width: '100%', padding: '16px 24px', borderTop: `1px solid ${surfaces.sidebarBorder}` }}>
+              <Space orientation="vertical" size={8} style={{ width: '100%' }}>
+                <Segmented
+                  size="small"
+                  block
+                  value={mode}
+                  onChange={(v) => setMode(v as 'light' | 'dark' | 'auto')}
+                  options={[
+                    { label: 'Light', value: 'light' },
+                    { label: 'Dark', value: 'dark' },
+                    { label: 'Auto', value: 'auto' },
+                  ]}
+                />
+                <Space>
+                  <Avatar size="small" icon={<UserOutlined />} style={{ background: primaryColor }} />
+                  <div>
+                    <Text style={{ fontSize: 13 }}>{user.display_name}</Text>
+                    <br />
+                    <Text type="secondary" style={{ fontSize: 11 }}>{user.role}</Text>
+                  </div>
+                </Space>
+                <Button type="text" icon={<LogoutOutlined />} onClick={() => setLogoutConfirmationOpen(true)} size="small" block>
+                  Log out
+                </Button>
               </Space>
-              <Button type="text" icon={<LogoutOutlined />} onClick={() => setLogoutConfirmationOpen(true)} size="small" block>
-                Log out
-              </Button>
-            </Space>
-          </div>
-        </Sider>
-        <Content style={{ padding: 24, background: contentBg }}>{children}</Content>
-      </Layout>
-      <Modal
-        title="Log out?"
-        open={logoutConfirmationOpen}
-        onOk={handleLogout}
-        onCancel={() => {
-          if (!logoutPending.current) setLogoutConfirmationOpen(false);
-        }}
-        okText="Log out"
-        cancelText="Cancel"
-        confirmLoading={isLoggingOut}
-        cancelButtonProps={{ disabled: isLoggingOut }}
-        closable={!isLoggingOut}
-        keyboard={!isLoggingOut}
-        mask={{ closable: !isLoggingOut }}
-      >
-        Are you sure you want to log out of SPACE?
-      </Modal>
+            </div>
+          </Sider>
+          <Content style={{ padding: 24, minWidth: 0, overflowX: 'auto', background: surfaces.page }}>{children}</Content>
+        </Layout>
+        <Modal
+          title="Log out?"
+          open={logoutConfirmationOpen}
+          onOk={handleLogout}
+          onCancel={() => {
+            if (!logoutPending.current) setLogoutConfirmationOpen(false);
+          }}
+          okText="Log out"
+          cancelText="Cancel"
+          confirmLoading={isLoggingOut}
+          cancelButtonProps={{ disabled: isLoggingOut }}
+          closable={!isLoggingOut}
+          keyboard={!isLoggingOut}
+          mask={{ closable: !isLoggingOut }}
+        >
+          Are you sure you want to log out of SPACE?
+        </Modal>
+      </App>
     </ConfigProvider>
   );
 }

@@ -1,0 +1,7 @@
+body {
+  font-family: "Inter", ui-sans-serif, system-ui, sans-serif;
+}
+
+code, kbd, pre, samp {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}

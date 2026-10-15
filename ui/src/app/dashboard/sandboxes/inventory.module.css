@@ -1,0 +1,24 @@
+.inventory {
+  /* Keep forms readable beside the existing sidebar; the content pane can scroll. */
+  min-width: 580px;
+}
+
+.inventory :global(.ant-table-wrapper) {
+  max-width: 100%;
+}
+
+.inventory :global(.ant-table-cell) {
+  padding: 4px 6px !important;
+}
+
+.inventory :global(.ant-table-thead th) {
+  white-space: nowrap;
+}
+
+.inventory :global(.icon-action-btn) {
+  padding-inline: 6px;
+}
+
+.inventory :global(.icon-action-btn .anticon) {
+  font-size: 18px;
+}

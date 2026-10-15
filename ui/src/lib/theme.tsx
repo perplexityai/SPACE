@@ -1,7 +1,8 @@
 'use client';
 
-import { createContext, useContext, useEffect, useState, ReactNode } from 'react';
-import { theme as antTheme } from 'antd';
+import { createContext, useContext, useEffect, useMemo, useState, ReactNode } from 'react';
+import { ConfigProvider } from 'antd';
+import { createCuriosityTheme } from './curiosity-theme';
 
 type ThemeMode = 'light' | 'dark' | 'auto';
 
@@ -45,10 +46,15 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   };
 
   const isDark = mode === 'dark' || (mode === 'auto' && systemDark);
+  const appearance = useMemo(() => createCuriosityTheme({ isDark }), [isDark]);
+
+  useEffect(() => {
+    document.documentElement.style.colorScheme = isDark ? 'dark' : 'light';
+  }, [isDark]);
 
   return (
     <ThemeContext.Provider value={{ mode, setMode, isDark }}>
-      {children}
+      <ConfigProvider theme={appearance.config}>{children}</ConfigProvider>
     </ThemeContext.Provider>
   );
 }
@@ -57,7 +63,7 @@ export function useTheme() {
   return useContext(ThemeContext);
 }
 
-export function useAntAlgorithm() {
+export function useCuriosityTheme(primaryColor?: string | null) {
   const { isDark } = useTheme();
-  return isDark ? antTheme.darkAlgorithm : antTheme.defaultAlgorithm;
+  return useMemo(() => createCuriosityTheme({ isDark, primaryColor }), [isDark, primaryColor]);
 }
