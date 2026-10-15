@@ -43,13 +43,9 @@ async fn durable_lease_survives_producer_removal_and_cancelled_grpc_reader() {
     std::fs::create_dir(&sandbox_path).unwrap();
     let artifact = sandbox_path.join("snapshot");
     std::fs::create_dir(&artifact).unwrap();
-    let source = btrfs_send_source::capture(
-        &artifact,
-        &root.join("parent"),
-        &root.join("instance"),
-        btrfs_send_source::ParentSeal::Stamped,
-    )
-    .unwrap();
+    let source =
+        btrfs_send_source::capture(&artifact, &root.join("parent"), &root.join("instance"))
+            .unwrap();
     let service = crate::service::tests::service_tests::service_for_unit_tests().await;
     let lease = BtrfsSendLease {
         lease_id: Uuid::now_v7().to_string(),
