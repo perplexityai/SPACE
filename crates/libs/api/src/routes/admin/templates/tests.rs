@@ -877,3 +877,113 @@ fn native_runtime_http_steps_preserve_required_wire_variants() {
     )
     .unwrap_err();
 }
+
+/// A template left in `deleting` by a delete operation that already failed
+/// must accept a new delete request. Before the fix the handler returned the
+/// failed operation's id for every later request, so the template could never
+/// leave `deleting` through the API.
+#[tokio::test]
+async fn a_delete_after_a_failed_delete_operation_starts_a_replacement()
+-> pplx_space_db_test_fixtures::TestDbResult<()> {
+    use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID};
+
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let template = TemplateName::parse("failed-delete-retry-probe").expect("valid template name");
+    insert_template(&db.pool, &template).await?;
+    let state = AppState::from_pool(db.pool.clone())
+        .await
+        .expect("app state from the test pool");
+    let actor = User {
+        id: UserId::from_uuid(SEED_USER_ID),
+        email: "failed-delete-retry-probe@example.test".to_string(),
+        password_hash: String::new(),
+        display_name: "failed delete retry probe".to_string(),
+        org_id: OrgId::from_uuid(SEED_ORG_ID),
+        role: crate::user_role::UserRole::OrganizationAdmin,
+        owner_source: pplx_space_common_core::types::SandboxOwnerSource::Local,
+        created_at: OffsetDateTime::now_utc(),
+        updated_at: OffsetDateTime::now_utc(),
+    };
+    let delete = |key: &'static str| {
+        let state = state.clone();
+        let actor = actor.clone();
+        let template = template.clone();
+        async move {
+            let mut headers = HeaderMap::new();
+            headers.insert(IDEMPOTENCY_KEY_HEADER, key.parse().expect("header value"));
+            let response = delete_template(
+                State(state),
+                Extension(AuthUser(actor)),
+                headers,
+                Path(template),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::ACCEPTED, "delete with key {key}");
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 100_000)
+                    .await
+                    .expect("response body"),
+            )
+            .expect("json response");
+            body["operation_id"]
+                .as_str()
+                .expect("operation id in response")
+                .to_string()
+        }
+    };
+    let recorded_operation = || async {
+        sqlx::query_scalar::<_, Option<Uuid>>(sql!(
+            "SELECT delete_operation_id FROM templates WHERE name = $1"
+        ))
+        .bind(template.as_str())
+        .fetch_one(&db.pool)
+        .await
+        .expect("template row")
+        .expect("delete operation recorded")
+    };
+
+    let first = delete("failed-delete-retry-first").await;
+    let first_id = recorded_operation().await;
+    assert_eq!(first, pplx_space_public_api::OperationId::from_uuid(first_id).to_string());
+
+    // While the first operation is active, a new request joins it.
+    assert_eq!(
+        delete("failed-delete-retry-join").await,
+        first,
+        "an active delete is joined, not replaced"
+    );
+
+    // The dispatcher fails the operation, e.g. after exhausting its retry
+    // budget while a sandbox still used the template on a node.
+    sqlx::query(sql!(
+        "UPDATE public_operations
+         SET state = 'failed', completed_at = NOW()
+         WHERE operation_id = $1"
+    ))
+    .bind(first_id)
+    .execute(&db.pool)
+    .await?;
+
+    let second = delete("failed-delete-retry-second").await;
+    assert_ne!(second, first, "a failed delete must be replaced");
+    let second_id = recorded_operation().await;
+    assert_eq!(second, pplx_space_public_api::OperationId::from_uuid(second_id).to_string());
+    let (desired_state, operation_state): (String, String) = sqlx::query_as(sql!(
+        "SELECT t.desired_state, po.state
+         FROM templates t
+         JOIN public_operations po ON po.operation_id = t.delete_operation_id
+         WHERE t.name = $1"
+    ))
+    .bind(template.as_str())
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(desired_state, TemplateDesiredState::Deleting.as_str());
+    assert_eq!(operation_state, "queued", "the replacement is dispatchable");
+
+    // Replaying the first request's key stays idempotent and does not
+    // move the template back to the failed operation.
+    assert_eq!(delete("failed-delete-retry-first").await, first);
+    assert_eq!(recorded_operation().await, second_id);
+    Ok(())
+}

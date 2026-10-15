@@ -1030,10 +1030,16 @@ pub async fn delete_template(
         Err(response) => return response.into_response(),
     };
 
-    let existing_state = match sqlx::query_as::<_, (String, Option<Uuid>)>(sql!(
-        "SELECT desired_state, delete_operation_id
-         FROM templates
-         WHERE name = $1"
+    // The third column is false when the recorded delete operation reached a
+    // terminal state or was garbage-collected. Such a delete can never finish
+    // on its own, so a new request replaces it instead of returning it.
+    let existing_state = match sqlx::query_as::<_, (String, Option<Uuid>, bool)>(sql!(
+        "SELECT t.desired_state,
+                t.delete_operation_id,
+                COALESCE(po.state IN ('queued', 'running'), FALSE)
+         FROM templates t
+         LEFT JOIN public_operations po ON po.operation_id = t.delete_operation_id
+         WHERE t.name = $1"
     ))
     .bind(template_name.as_str())
     .fetch_optional(&state.pool)
@@ -1050,8 +1056,11 @@ pub async fn delete_template(
         }
     };
 
+    let mut stale_delete_operation_id = None;
     match existing_state {
-        Some((state, Some(operation_id))) if state == TemplateDesiredState::Deleting.as_str() => {
+        Some((state, Some(operation_id), true))
+            if state == TemplateDesiredState::Deleting.as_str() =>
+        {
             return (
                 StatusCode::ACCEPTED,
                 Json(TemplateOperationResponse {
@@ -1061,7 +1070,17 @@ pub async fn delete_template(
             )
                 .into_response();
         }
-        Some((state, _)) if state == TemplateDesiredState::Deleted.as_str() => {
+        Some((state, Some(operation_id), false))
+            if state == TemplateDesiredState::Deleting.as_str() =>
+        {
+            tracing::info!(
+                template = template_name.as_str(),
+                stale_operation_id = %operation_id,
+                "template delete operation is no longer active; starting a replacement"
+            );
+            stale_delete_operation_id = Some(operation_id);
+        }
+        Some((state, _, _)) if state == TemplateDesiredState::Deleted.as_str() => {
             return api_error(StatusCode::NOT_FOUND, "Template not found").into_response();
         }
         Some(_) => {}
@@ -1143,12 +1162,19 @@ pub async fn delete_template(
         Err(response) => return response.into_response(),
     };
     let mark_result: Result<u64, sqlx::Error> = async {
+        // The operation id is replaced only when it still names the stale
+        // operation observed above, so a concurrent replacement keeps its
+        // own id instead of being overwritten.
         let updated = sqlx::query(sql!(
             "UPDATE templates
              SET desired_state = $2,
                  delete_requested_at = COALESCE(delete_requested_at, NOW()),
                  delete_requested_by = COALESCE(delete_requested_by, $3),
-                 delete_operation_id = COALESCE(delete_operation_id, $4),
+                 delete_operation_id = CASE
+                     WHEN delete_operation_id IS NULL
+                       OR delete_operation_id = $6 THEN $4
+                     ELSE delete_operation_id
+                 END,
                  updated_at = NOW()
              WHERE name = $1
                AND desired_state <> $5"
@@ -1158,6 +1184,7 @@ pub async fn delete_template(
         .bind(actor.id)
         .bind(operation.as_uuid())
         .bind(TemplateDesiredState::Deleted.as_str())
+        .bind(stale_delete_operation_id)
         .execute(&mut *tx)
         .await?
         .rows_affected();
