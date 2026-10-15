@@ -45,6 +45,16 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # The report after Clippy runs this copy of the package cache helper,
+      # taken before Clippy starts, as in common-ci.yml.
+      - name: Copy the package cache helper
+        if: matrix.cargo_registry
+        run: |
+          set -euo pipefail
+          install -d "${RUNNER_TEMP}/space-ci-helpers"
+          install -m 0444 ci/scripts/package-cache.py "${RUNNER_TEMP}/space-ci-helpers/"
+          chmod 0555 "${RUNNER_TEMP}/space-ci-helpers"
+
       - name: Get the CI image
         id: ci-image
         env:
@@ -236,7 +246,9 @@ jobs:
 
       - name: Report the Cargo registry
         if: always() && matrix.cargo_registry
-        run: python3 ci/scripts/package-cache.py report cargo "${RUNNER_TEMP}/cargo-home/registry"
+        env:
+          PACKAGE_CACHE: ${{ runner.temp }}/space-ci-helpers/package-cache.py
+        run: python3 -I "${PACKAGE_CACHE}" report cargo "${RUNNER_TEMP}/cargo-home/registry"
 
       - name: Decide whether to refresh the Rust compiler cache
         id: refresh-rust-cache

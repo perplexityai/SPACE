@@ -40,6 +40,17 @@ jobs:
         with:
           persist-credentials: false
 
+      # The steps after the workload run this copy of the package cache
+      # helper, taken before the workload starts, so they always run the
+      # reviewed helper. It imports only Python's standard library.
+      - &copy-package-cache-helper
+        name: Copy the package cache helper
+        run: |
+          set -euo pipefail
+          install -d "${RUNNER_TEMP}/space-ci-helpers"
+          install -m 0444 ci/scripts/package-cache.py "${RUNNER_TEMP}/space-ci-helpers/"
+          chmod 0555 "${RUNNER_TEMP}/space-ci-helpers"
+
       # A GitHub release download has answered 500 to four attempts over 8 s,
       # while jobs half a minute either side fetched the same file. Six retries
       # back off over about a minute; --retry-all-errors also retries a reset
@@ -109,10 +120,11 @@ jobs:
         id: report-npm-cache
         if: always()
         env:
+          PACKAGE_CACHE: ${{ runner.temp }}/space-ci-helpers/package-cache.py
           KEY: ${{ steps.npm-cache-key.outputs.key }}
           MATCHED_KEY: ${{ steps.restore-npm-cache.outputs.cache-matched-key }}
         run: >-
-          python3 ci/scripts/package-cache.py report npm "${HOME}/.npm"
+          python3 -I "${PACKAGE_CACHE}" report npm "${HOME}/.npm"
           --decide "${KEY}" --matched-key "${MATCHED_KEY}"
 
       - name: Prepare the npm cache for upload
@@ -121,7 +133,9 @@ jobs:
         if: >-
           success() && github.event_name == 'push' && github.ref == 'refs/heads/main' &&
           steps.report-npm-cache.outputs.npm-save == 'true'
-        run: python3 ci/scripts/package-cache.py trim npm "${HOME}/.npm" docs/api/package-lock.json
+        env:
+          PACKAGE_CACHE: ${{ runner.temp }}/space-ci-helpers/package-cache.py
+        run: python3 -I "${PACKAGE_CACHE}" trim npm "${HOME}/.npm" docs/api/package-lock.json
 
       - name: Save the npm cache
         if: steps.prepare-npm-upload.outcome == 'success'
@@ -140,6 +154,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - *copy-package-cache-helper
 
       # The SPACE Guide saves the npm cache, which the two jobs' identical
       # `npm ci` share, and Rust tests the Cargo registry.
@@ -207,12 +223,16 @@ jobs:
 
       - name: Report the npm cache
         if: always()
-        run: python3 ci/scripts/package-cache.py report npm "${HOME}/.npm"
+        env:
+          PACKAGE_CACHE: ${{ runner.temp }}/space-ci-helpers/package-cache.py
+        run: python3 -I "${PACKAGE_CACHE}" report npm "${HOME}/.npm"
 
       - &report-cargo-registry
         name: Report the Cargo registry
         if: always()
-        run: python3 ci/scripts/package-cache.py report cargo "${RUNNER_TEMP}/cargo-home/registry"
+        env:
+          PACKAGE_CACHE: ${{ runner.temp }}/space-ci-helpers/package-cache.py
+        run: python3 -I "${PACKAGE_CACHE}" report cargo "${RUNNER_TEMP}/cargo-home/registry"
 
       - name: Check standalone outputs and the combined site
         run: |
@@ -241,6 +261,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - *copy-package-cache-helper
 
       # Both tools read every package's manifest through `cargo metadata`,
       # which downloads every crate in Cargo.lock.
@@ -377,6 +399,8 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - *copy-package-cache-helper
 
       # The repository-owned image pins the same toolchain used by the source
       # scripts. Main pushes publish it to this repository's GHCR package; a
@@ -896,6 +920,7 @@ jobs:
         id: report-package-caches
         if: always() && (matrix.cargo_registry || matrix.go_modules || matrix.uv_cache)
         env:
+          PACKAGE_CACHE: ${{ runner.temp }}/space-ci-helpers/package-cache.py
           CARGO_REGISTRY: ${{ matrix.cargo_registry }}
           CARGO_KEY: ${{ steps.package-cache-keys.outputs.cargo-key }}
           CARGO_MATCHED_KEY: ${{ steps.restore-cargo-registry.outputs.cache-matched-key }}
@@ -910,9 +935,9 @@ jobs:
           report() {
             local kind="$1" dir="$2" save="$3" key="$4" matched_key="$5"
             if [[ "${save}" == true ]]; then
-              python3 ci/scripts/package-cache.py report "${kind}" "${dir}" --decide "${key}" --matched-key "${matched_key}"
+              python3 -I "${PACKAGE_CACHE}" report "${kind}" "${dir}" --decide "${key}" --matched-key "${matched_key}"
             else
-              python3 ci/scripts/package-cache.py report "${kind}" "${dir}"
+              python3 -I "${PACKAGE_CACHE}" report "${kind}" "${dir}"
             fi
           }
           if [[ -n "${CARGO_REGISTRY}" ]]; then
@@ -944,6 +969,7 @@ jobs:
           steps.report-package-caches.outputs.go-save == 'true' ||
           steps.report-package-caches.outputs.uv-save == 'true')
         env:
+          PACKAGE_CACHE: ${{ runner.temp }}/space-ci-helpers/package-cache.py
           CARGO_SAVE: ${{ steps.report-package-caches.outputs.cargo-save }}
           GO_SAVE: ${{ steps.report-package-caches.outputs.go-save }}
           UV_SAVE: ${{ steps.report-package-caches.outputs.uv-save }}
@@ -952,11 +978,11 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "${CARGO_SAVE}" == true ]]; then
-            python3 ci/scripts/package-cache.py trim cargo "${RUNNER_TEMP}/cargo-home/registry" Cargo.lock
+            python3 -I "${PACKAGE_CACHE}" trim cargo "${RUNNER_TEMP}/cargo-home/registry" Cargo.lock
           fi
           if [[ "${GO_SAVE}" == true ]]; then
             sudo chown -R "$(id -u):$(id -g)" "${SPACE_CI_GO_MOD_CACHE}/cache/download"
-            python3 ci/scripts/package-cache.py trim go "${SPACE_CI_GO_MOD_CACHE}" shim/go.sum
+            python3 -I "${PACKAGE_CACHE}" trim go "${SPACE_CI_GO_MOD_CACHE}" shim/go.sum
           fi
           if [[ "${UV_SAVE}" == true ]]; then
             docker run --rm --volume "${SPACE_CI_UV_CACHE}:/uv-cache" --env UV_CACHE_DIR=/uv-cache \
