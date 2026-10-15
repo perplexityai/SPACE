@@ -120,6 +120,11 @@ fn admin_openapi_value() -> Value {
                                         "replace_after_terminate": {
                                             "type": "boolean",
                                             "description": "false makes the eventual ASG terminate decrement desired capacity, for a blue/green rollout where the incumbent group must shrink monotonically. Omit the field rather than sending null. On the request that starts a drain, omitting it means true (the ASG auto-replaces the instance). On a node already draining the replacement intent is fixed and cannot be changed: omitting the field escalates on the existing terms, and sending one that disagrees with the drain in flight is a 409 — use :undrain and a fresh :drain to change the terms."
+                                        },
+                                        "require_undrained": {
+                                            "type": "boolean",
+                                            "default": false,
+                                            "description": "true makes the request start-only: it is a 409 if the node already has any drain phase, checked under the same row lock as the write, so it can never escalate or repeat a drain somebody else started. For automation that starts drains; leave it false to escalate a drain in place."
                                         }
                                     }
                                 }
@@ -128,7 +133,7 @@ fn admin_openapi_value() -> Value {
                     },
                     "responses": {
                         "200": { "description": "Drain accepted, escalated in place, or already in the requested mode" },
-                        "409": { "description": "Node transition conflict: the node's drain_phase does not accept :drain, the request asked to downgrade an in-flight forced drain to gentle, or it carried a replace_after_terminate disagreeing with the drain already in flight" },
+                        "409": { "description": "Node transition conflict: the node's drain_phase does not accept :drain, the request asked to downgrade an in-flight forced drain to gentle, it carried a replace_after_terminate disagreeing with the drain already in flight, or it set require_undrained and the node already has a drain phase" },
                         "501": { "description": "Not available on the active substrate" }
                     }
                 }

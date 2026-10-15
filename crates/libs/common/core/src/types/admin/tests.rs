@@ -125,3 +125,31 @@ fn an_unexpressed_replace_after_terminate_resolves_to_auto_replace() {
         .replace_after_terminate_or_default()
     );
 }
+
+/// `require_undrained` is absent from the wire unless it's set, so a request
+/// that doesn't ask for the start-only precondition stays byte-identical to
+/// what a previous-release api-server accepts (`DrainRequest` is
+/// `deny_unknown_fields` there). A set flag reaches the wire and parses back.
+#[test]
+fn require_undrained_is_on_the_wire_only_when_set() {
+    let body = serde_json::to_value(DrainRequest::default()).expect("serializes");
+    assert!(
+        !body
+            .as_object()
+            .expect("object")
+            .contains_key("require_undrained"),
+        "an unset flag must omit the key; got {body}"
+    );
+
+    let set = DrainRequest {
+        require_undrained: true,
+        ..DrainRequest::default()
+    };
+    let body = serde_json::to_value(&set).expect("serializes");
+    assert_eq!(
+        body.get("require_undrained"),
+        Some(&serde_json::Value::Bool(true))
+    );
+    let parsed: DrainRequest = serde_json::from_value(body).expect("parses back");
+    assert!(parsed.require_undrained);
+}

@@ -2245,17 +2245,13 @@ class TestAdminApiDrainBody:
     def test_drain_refuses_a_node_that_is_already_draining(
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """The rollout must not escalate a drain it did not start.
+        """A drain visible on the pre-POST read is skipped without a POST.
 
         `pick_drain_candidates` filters on the tick's snapshot, so a drain an
         operator started inside the snapshot window still reads as
-        `DrainPhase.NONE`. The admin endpoint now accepts `:drain` against an
-        already-draining node — it escalates gentle to forced in place — so the
-        stale read is no longer a harmless 409: if the operator used
-        `--no-replace-after-terminate` (what the rollout-mng module README's
-        shrink procedure prescribes, so the stored intent matches the `false` this script posts), the POST would
-        arm the stale-transient sweep and destroy a resident wedged past the
-        abandon age, irreversibly and unattended.
+        `DrainPhase.NONE`. The endpoint would refuse the POST anyway
+        (`require_undrained`), so this read isn't what keeps the drain safe;
+        it skips the node without a write attempt and reports what it found.
         """
         for phase in ["draining", "drained", "terminating"]:
             api, captured = self._api_with_capture(drain_phase=phase)
@@ -2265,8 +2261,7 @@ class TestAdminApiDrainBody:
             )
             assert not issued, f"{phase}: drain must not be issued"
             assert "url" not in captured, (
-                f"{phase}: no POST may be sent — reaching the endpoint at all is "
-                "what escalates somebody else's drain"
+                f"{phase}: a drain the read can see is skipped without a POST"
             )
             events = [
                 json.loads(line)
@@ -2277,6 +2272,41 @@ class TestAdminApiDrainBody:
                 f"{phase}: the skip is the only trace the caller leaves"
             )
             assert events[0]["drain_phase"] == phase
+
+    def test_drain_requires_an_undrained_node(self) -> None:
+        """Every POST is start-only, so the endpoint can never escalate a drain
+        this process did not start."""
+        api, captured = self._api_with_capture()
+        api.drain("66666666-6666-6666-6666-666666666666", replace_after_terminate=False)
+        assert captured["json"]["require_undrained"] is True
+
+    def test_a_drain_that_lands_after_the_read_is_skipped_not_failed(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The read sees an undrained node, somebody's drain commits before the
+        POST, and the endpoint refuses it with a 409. That is the same outcome
+        as a drain the read saw, not a tick error."""
+        api, captured = self._api_with_capture(
+            drain_phase=None,
+            post_status=409,
+            post_body={
+                "error": "node is already in a drain phase and the request set require_undrained",
+                "current_drain_phase": "draining",
+            },
+        )
+        issued = api.drain(
+            "77777777-7777-7777-7777-777777777777", replace_after_terminate=False
+        )
+        assert not issued
+        assert "url" in captured, "the read saw no drain, so the POST went out"
+        events = [
+            json.loads(line)
+            for line in capsys.readouterr().out.splitlines()
+            if line.strip()
+        ]
+        assert [e["event"] for e in events] == ["drain_skipped_already_draining"]
+        assert events[0]["drain_phase"] == "draining"
+        assert events[0]["refused_by"] == "endpoint"
 
     def test_drain_proceeds_when_the_node_is_still_undrained(self) -> None:
         """The guard must not block the case the rollout exists to drive."""

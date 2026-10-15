@@ -60,6 +60,9 @@ async fn main() {
                 } else {
                     NodeDrainMode::Gentle
                 },
+                // This command is how an operator escalates a drain in place,
+                // so it never asks for the start-only precondition.
+                require_undrained: false,
             };
             client.post_drain(&node, &request).await
         }

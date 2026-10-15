@@ -336,6 +336,7 @@ async fn a_fresh_drain_persists_the_requested_replacement_intent() -> TestResult
             DrainRequest {
                 replace_after_terminate: Some(replace_after_terminate),
                 mode: NodeDrainMode::Forced,
+                ..DrainRequest::default()
             },
         )
         .await;
@@ -446,6 +447,7 @@ async fn escalating_commits_the_mode_and_keeps_the_drain() -> TestResult {
             // Omitted, which is what `space drain-node --forced` sends.
             replace_after_terminate: None,
             mode: NodeDrainMode::Forced,
+            ..DrainRequest::default()
         },
     )
     .await;
@@ -466,6 +468,80 @@ async fn escalating_commits_the_mode_and_keeps_the_drain() -> TestResult {
         "and must not touch the replacement intent"
     );
     assert_eq!(after.phase.as_deref(), Some("draining"));
+    Ok(())
+}
+
+/// `require_undrained` refuses the request an orchestrator would otherwise
+/// turn into an escalation, and still starts a drain on an undrained node.
+///
+/// The refused node is the destructive case: a human's gentle drain started
+/// with `--no-replace-after-terminate`, met by a forced `:drain` whose
+/// replacement intent agrees. Without the precondition that request passes the
+/// mode matrix and the intent check and escalates the drain.
+#[tokio::test(flavor = "current_thread")]
+async fn require_undrained_refuses_an_existing_drain_and_starts_a_new_one() -> TestResult {
+    if !enter_direct_test_process() {
+        return Ok(());
+    }
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let state = kubernetes_state(&db.pool).await?;
+    let actor = managing_org_admin(&db.pool).await?;
+    let start_only = || DrainRequest {
+        replace_after_terminate: Some(false),
+        mode: NodeDrainMode::Forced,
+        require_undrained: true,
+    };
+
+    // A gentle drain whose stored intent agrees with the posted `false`.
+    let draining = insert_node(&db.pool, Some("draining"), Some("gentle"), false).await?;
+    let before = drain_columns(&db.pool, draining).await?;
+    let (status, body) =
+        post_drain_response(&state, &actor, draining, DrainAction::Drain, start_only()).await?;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["current_drain_phase"], "draining");
+    assert_eq!(
+        drain_columns(&db.pool, draining).await?,
+        before,
+        "a refused start-only request must write nothing"
+    );
+
+    // Without the precondition the same request escalates, so the refusal
+    // above is the precondition's and not some other guard's.
+    let control = insert_node(&db.pool, Some("draining"), Some("gentle"), false).await?;
+    let status = post_drain(
+        &state,
+        &actor,
+        control,
+        DrainAction::Drain,
+        DrainRequest {
+            require_undrained: false,
+            ..start_only()
+        },
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_GATEWAY,
+        "expected a post-commit 502"
+    );
+    assert_eq!(
+        drain_columns(&db.pool, control).await?.mode.as_deref(),
+        Some("forced")
+    );
+
+    // An undrained node still drains.
+    let fresh = insert_node(&db.pool, None, None, false).await?;
+    let status = post_drain(&state, &actor, fresh, DrainAction::Drain, start_only()).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_GATEWAY,
+        "expected a post-commit 502"
+    );
+    let after = drain_columns(&db.pool, fresh).await?;
+    assert_eq!(after.phase.as_deref(), Some("draining"));
+    assert_eq!(after.mode.as_deref(), Some("forced"));
     Ok(())
 }
 
@@ -499,6 +575,7 @@ async fn a_disagreeing_replacement_intent_is_refused_only_in_flight() -> TestRes
         DrainRequest {
             replace_after_terminate: Some(true),
             mode: NodeDrainMode::Forced,
+            ..DrainRequest::default()
         },
     )
     .await;
@@ -521,6 +598,7 @@ async fn a_disagreeing_replacement_intent_is_refused_only_in_flight() -> TestRes
         DrainRequest {
             replace_after_terminate: Some(true),
             mode: NodeDrainMode::Forced,
+            ..DrainRequest::default()
         },
     )
     .await;
@@ -578,6 +656,7 @@ async fn the_refusals_reach_the_response_and_write_nothing() -> TestResult {
                 DrainRequest {
                     replace_after_terminate: None,
                     mode: NodeDrainMode::Forced,
+                    ..DrainRequest::default()
                 },
             )
             .await,

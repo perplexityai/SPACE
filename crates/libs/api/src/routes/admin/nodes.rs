@@ -218,6 +218,19 @@ enum TransitionError {
     ModeDowngrade { current_mode: NodeDrainMode },
 }
 
+/// Whether a `:drain` carrying `require_undrained` must be refused: the node
+/// already has a drain phase, so the request would escalate or repeat a drain
+/// it did not start. Only `:drain` parses a body, so every other action
+/// arrives with the field `false`; the action check states that rather than
+/// relying on it.
+fn refuses_existing_drain(
+    action: DrainAction,
+    require_undrained: bool,
+    current_phase: Option<&str>,
+) -> bool {
+    matches!(action, DrainAction::Drain) && require_undrained && current_phase.is_some()
+}
+
 /// Pure state-machine validator. Kept separate so the table is testable
 /// without a Postgres or substrate round trip.
 ///
@@ -1333,6 +1346,37 @@ async fn apply_drain_action(
     let current_mode = NodeDrainMode::from_column_str(current.drain_mode.as_deref());
     let mode_in_progress =
         audited_mode_in_progress(action, current.drain_phase.as_deref(), current_mode);
+
+    // The start-only precondition, checked against the locked row so nothing
+    // can start a drain between this read and the write below.
+    if refuses_existing_drain(
+        action,
+        drain_request.require_undrained,
+        current.drain_phase.as_deref(),
+    ) {
+        audit::record(AdminAuditEntry {
+            actor: &actor,
+            action: action.label(),
+            node_id,
+            node_name: current.substrate_node_id.as_deref(),
+            from_phase: current.drain_phase.as_deref(),
+            to_phase: None,
+            from_drain_mode: mode_in_progress,
+            replace_after_terminate: requested_replace_after_terminate,
+            drain_mode: requested_mode,
+            success: false,
+            error: Some("conflict: require_undrained and the node is already in a drain phase"),
+            outcome_counts: None,
+        });
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "node is already in a drain phase and the request set require_undrained",
+                "current_drain_phase": current.drain_phase,
+            })),
+        )
+            .into_response();
+    }
 
     let transition = match validate_drain_transition(
         current.drain_phase.as_deref(),

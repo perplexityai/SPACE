@@ -539,32 +539,32 @@ class AdminApi:
         # replaces the node, so waiting on a long-lived sandbox would stall the
         # wave indefinitely; the rollout accepts the per-node evacuation
         # disruption in exchange for bounded progress.
+        #
+        # `require_undrained` makes the POST start-only: the endpoint refuses
+        # it with a 409 if the node already has any drain phase, checked under
+        # the same row lock as the write. That is what keeps this request from
+        # ever escalating a drain somebody else started.
         body = {
             "replace_after_terminate": replace_after_terminate,
             "mode": "forced",
+            "require_undrained": True,
         }
 
-        # Re-read the phase immediately before posting, and refuse to post
-        # against a drain that already exists.
+        # Re-read the phase immediately before posting, and skip a node whose
+        # drain already exists.
         #
         # `pick_drain_candidates` filters on the tick's `list_nodes()` snapshot,
         # so a drain someone else started inside the snapshot window still looks
-        # like `DrainPhase.NONE` here. The admin `:drain` endpoint now *accepts*
-        # a request against an already-draining node — it escalates gentle to
-        # forced in place — so that stale read is no longer a harmless 409. If
-        # the other drain was started with `--no-replace-after-terminate` (what
-        # the rollout-mng module README's shrink procedure prescribes, so the
-        # stored intent agrees with the `false` posted above), this POST would escalate a human's gentle drain
-        # and arm the stale-transient sweep, which flips any resident wedged past
-        # the abandon age to `lifecycle = 'failed'` on the next tick,
-        # irreversibly, with no operator in the loop.
+        # like `DrainPhase.NONE` here. The admin `:drain` endpoint accepts a
+        # forced request against a gentle-draining node and escalates it in
+        # place, so posting on that stale read could escalate a human's gentle
+        # drain and arm the stale-transient sweep, with no operator in the loop.
         #
-        # This narrows the window from a whole tick interval to the gap between
-        # this read and the POST below: one HTTP round trip, so milliseconds
-        # normally and at most `self.timeout` (30s) if the POST is slow to be
-        # served. It cannot close the window — only a phase precondition on the
-        # endpoint could — but an unattended wave should not be the thing that
-        # destroys a sandbox a human was protecting.
+        # Safety doesn't rest on this read: `require_undrained` in the body
+        # makes the endpoint refuse the POST under its row lock, which also
+        # covers a drain that lands between this read and the POST. The read
+        # is here so the common case is skipped without a write attempt, and so
+        # the skip event can report the drain it found.
         try:
             current = self.get_node(node_id)
         except MalformedAdminResponse as err:
@@ -617,6 +617,17 @@ class AdminApi:
             )
             return True
         resp = self.session.post(url, json=body, timeout=self.timeout)
+        if resp.status_code == 409:
+            # With `require_undrained`, a `:drain` against an undrained node has
+            # no other 409: the node gained a drain phase between the read
+            # above and this POST, and the endpoint refused to touch it.
+            emit_event(
+                Event.DRAIN_SKIPPED_ALREADY_DRAINING,
+                node_id=node_id,
+                drain_phase=self._response_field(resp, "current_drain_phase"),
+                refused_by="endpoint",
+            )
+            return False
         if resp.status_code == 502 and self._drain_committed_despite_502(resp):
             # The endpoint commits the Postgres transition and *then* patches
             # the substrate, deliberately, so that a failed patch is
@@ -1026,57 +1037,32 @@ def pick_drain_candidates(
     to in this process, so a stale `list_nodes()` read between drain commit
     and the next tick does not re-POST.
 
-    The admin `:drain` endpoint now accepts a repeat against an
-    already-`draining` node, so this filter is no longer what stands between
-    the orchestrator and a 409 — but do not read that as "a repeat is
-    harmless". This orchestrator always posts
-    `{"replace_after_terminate": false, "mode": "forced"}`, and both fields
-    matter on that edge:
-
-    * A node **this** orchestrator drained has
-      `terminate_decrement_capacity = true`, so the posted `false` matches and
-      the call is a 200 that leaves the mode alone. It still patches the
-      Kubernetes cordon, clears `drain_last_error`, and issues a handful of
-      statements per tick per node for no state change.
-    * A node whose drain someone started with a bodiless `:drain` has the
-      auto-replace default, so the posted `false` **disagrees** and the call is
-      a 409 — a drain's replacement intent is fixed for its lifetime.
-    * A node draining **gently** — an inherited drain this process did not
-      start — is escalated in place by that POST. That is a destructive
-      operation: evacuation plus the stale-transient sweep.
+    The admin `:drain` endpoint accepts a forced request against a
+    gentle-draining node and escalates it in place, so a POST reaching an
+    inherited drain would be destructive: evacuation plus the stale-transient
+    sweep. This orchestrator never sends one. Every POST carries
+    `require_undrained: true`, which the endpoint checks under its row lock,
+    so a node that has any drain phase by the time the POST is served is a 409
+    and nothing is written.
 
     `pick_drain_candidates` only ever offers `DrainPhase.NONE` nodes, so a node
     already draining is excluded on any tick that sees it as such. Two windows
-    get past that, and they reach different cases above:
+    get past that, and both end at the endpoint's refusal:
 
     * **Our own stale read.** A `list_nodes()` snapshot still showing `NONE` for
       a node whose `:drain` has already committed. In-process
       `already_drained_ids` closes it, and a restart empties that set — so after
       one, the first tick *offers* a node this process drained moments earlier.
-      It is not re-POSTed: the phase re-read in `drain()` sees `draining` and
-      refuses with `drain_skipped_already_draining`. Before that guard existed
-      the POST went out, and landed as a harmless 200 (the node is already
-      `forced` with a matching intent), which is why this window was documented
-      as benign rather than closed.
+      The phase re-read in `drain()` sees `draining` and skips it with
+      `drain_skipped_already_draining`.
     * **Somebody else's drain, committed inside our snapshot window.** An
-      operator running `space drain-node <node>` by hand during a wave. Our
-      snapshot shows `NONE`, `pick_drain_candidates` offers it, and the POST
-      reaches their in-flight drain. What happens then depends on how *they*
-      started it, because the endpoint checks the mode matrix and then the
-      replacement intent:
+      operator running `space drain-node <node>` by hand during a wave. The
+      phase re-read in `drain()` skips it if the drain is visible by then;
+      if it commits between that read and the POST, the endpoint refuses the
+      POST and `drain()` emits the same event with `refused_by: endpoint`.
 
-      - Started with `--no-replace-after-terminate` (what the rollout-mng
-        module README's shrink procedure prescribes): stored intent matches our posted `false`, so the escalation
-        lands. **This is the destructive case** — evacuation plus the
-        stale-transient sweep, no grace period.
-      - Started bodiless or without that flag: the stored intent is auto-replace,
-        our posted `false` disagrees, and the call is a 409. Noisy, not harmful.
-
-      This *filter* closes neither, because the set it tracks is only what this
-      process drained. What closes them is the phase re-read in `drain()`, which
-      refuses any node whose phase is non-NULL or unreadable — narrowing the
-      exposure from a whole tick interval to one HTTP round trip. Before the
-      admin endpoint accepted `:drain` on a draining node, both were a 409.
+    This *filter* closes neither, because the set it tracks is only what this
+    process drained.
 
     Picks are distributed proportionally across AZs so the source ASG's
     per-AZ count shrinks at roughly the same rate. A purely `instance_id`-

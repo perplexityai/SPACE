@@ -2142,3 +2142,25 @@ async fn kubernetes_node_drain_and_cordon_converge_the_node() -> TestResult {
     }
     Ok(())
 }
+
+/// `require_undrained` refuses `:drain` on every drain phase and on nothing
+/// else: not an undrained node, not a request without the flag, and not any
+/// other action.
+#[test]
+fn require_undrained_refuses_every_existing_drain_phase() {
+    for phase in [PHASE_DRAINING, PHASE_DRAINED, PHASE_TERMINATING] {
+        assert!(
+            refuses_existing_drain(DrainAction::Drain, true, Some(phase)),
+            "{phase}"
+        );
+        assert!(
+            !refuses_existing_drain(DrainAction::Drain, false, Some(phase)),
+            "{phase}: the flag is opt-in"
+        );
+        assert!(
+            !refuses_existing_drain(DrainAction::Terminate, true, Some(phase)),
+            "{phase}: only :drain carries the precondition"
+        );
+    }
+    assert!(!refuses_existing_drain(DrainAction::Drain, true, None));
+}

@@ -52,7 +52,7 @@ fn admin_llms_txt_advertises_admin_roots() {
 /// `forced` is stated as unrecoverable, that its lack of a grace period is
 /// stated, that both pre-flight gauges are named (neither is a superset of what
 /// the sweep destroys, so naming one is worse than naming none), and that the
-/// three ways `:drain` can 409 are all reachable from the response description.
+/// four ways `:drain` can 409 are all reachable from the response description.
 /// Phrase-level assertions rather than a snapshot, so rewording is free and
 /// dropping a fact is not.
 #[test]
@@ -79,7 +79,12 @@ fn the_drain_stub_states_what_forced_mode_destroys() {
     let conflict = drain["responses"]["409"]["description"]
         .as_str()
         .expect("409 description");
-    for cause in ["drain_phase", "downgrade", "replace_after_terminate"] {
+    for cause in [
+        "drain_phase",
+        "downgrade",
+        "replace_after_terminate",
+        "require_undrained",
+    ] {
         assert!(
             conflict.contains(cause),
             "the 409 must name the {cause:?} cause; got {conflict:?}"

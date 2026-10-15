@@ -467,6 +467,20 @@ pub struct DrainRequest {
     /// so this does not restate the policy.
     #[serde(default)]
     pub mode: NodeDrainMode,
+    /// `true` makes `:drain` a start-only request: it succeeds only against a
+    /// node with no drain phase, and any existing drain is a 409 instead of
+    /// being escalated or repeated. The check runs under the handler's row
+    /// lock, so it is atomic with the write. That is what an orchestrator
+    /// needs to start drains without ever escalating one somebody else
+    /// started between its read and its POST.
+    ///
+    /// `false` (the default) keeps the escalate-in-place and same-mode edges.
+    /// Skipped when `false`, so a request that doesn't ask for it stays
+    /// byte-identical to what the previous release accepts. One that does ask
+    /// is a 400 from an api-server that predates the field (this struct is
+    /// `deny_unknown_fields`), which fails closed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require_undrained: bool,
 }
 
 impl DrainRequest {
