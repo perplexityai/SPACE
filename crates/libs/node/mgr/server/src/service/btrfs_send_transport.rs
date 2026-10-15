@@ -85,6 +85,7 @@ impl NodeManagerService {
         )?;
         self.run_artifact_mutation(&req.sandbox_id, move |service| async move {
             let guard = service.send_lease_lock(id).await;
+            let seal = service.send_parent_seal;
             service.off_runtime("stage send source", move || {
                 let _guard = guard;
                 let artifact = trusted_paths::open_directory(&artifact)?;
@@ -93,7 +94,7 @@ impl NodeManagerService {
                 let name = id.to_string();
                 nix::sys::stat::mkdirat(&root, name.as_str(), nix::sys::stat::Mode::from_bits_truncate(0o700)).map_err(artifact_fs::error)?;
                 let destination = artifact_fs::directory(&root, name.as_ref()).map_err(artifact_fs::error)?;
-                let result = btrfs_send_source::capture_open(&destination, &source.parent, &source.source, id, source.received_uuid);
+                let result = btrfs_send_source::capture_open(&destination, &source.parent, &source.source, id, source.received_uuid, seal);
                 if result.is_err() && let Err(error) = artifact_fs::remove_at(&root, name.as_ref()) {
                     tracing::warn!(%error, lease_id = %id, "partial send lease needs orphan cleanup");
                 }

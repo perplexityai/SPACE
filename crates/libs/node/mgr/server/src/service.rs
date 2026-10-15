@@ -187,6 +187,7 @@ pub struct NodeManagerService {
     sandbox_artifact_locks: SandboxCgroupFamilyLocks,
     send_source_locks: SandboxCgroupFamilyLocks,
     send_source_slots: std::sync::Arc<tokio::sync::Semaphore>,
+    send_parent_seal: btrfs_send_source::ParentSeal,
     artifact_work: Option<std::sync::Arc<filesystem_work::ArtifactWork>>,
     /// Shared drain ownership for detached mutations and lifecycle permits.
     device_op_tasks: tokio_util::task::TaskTracker,
@@ -362,6 +363,7 @@ impl NodeManagerService {
             sandbox_artifact_locks: Default::default(),
             send_source_locks: Default::default(),
             send_source_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
+            send_parent_seal: btrfs_send_source::ParentSeal::from_env(),
             artifact_work: None,
             blocking_probe_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 MAX_BLOCKING_PROBES,

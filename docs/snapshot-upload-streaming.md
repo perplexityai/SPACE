@@ -155,12 +155,21 @@ one source identity. Template GC and later sandbox writes cannot change them.
 These copies share extents but can delay physical reclamation until artifact
 retirement. They are not copies of the entire rootfs written to disk.
 
-The private parent does not keep the template's deterministic received UUID;
-each send stamps a short-lived clone with it instead. btrfs lists every
-subvolume carrying a received UUID in one UUID-tree item, and `btrfs receive`
-cannot read that item once it names more than 495 subvolumes, so retained
-bundles must not each add one. Bundles captured with a stamped parent
-(manifest version 1) remain readable until they retire.
+btrfs lists every subvolume carrying a received UUID in one UUID-tree item, and
+`btrfs receive` cannot read that item once it names more than 495 subvolumes.
+A bundle whose private parent keeps the template's deterministic received UUID
+adds one such subvolume, so enough retained suspends of one template build
+break every cross-node restore against it on that node. Each send therefore
+stamps a short-lived clone of the private parent, and node-manager reads a
+parent with or without the stamp.
+
+`SPACE_NODEMGR_BTRFS_SEND_UNSTAMPED_PARENT` selects how capture seals the
+private parent. Unset, capture keeps the stamp and writes manifest version 1,
+which earlier node-manager releases can still read. Set to `true`, capture
+seals the parent without it and writes version 2. Enable it only after every
+node runs a release that reads both versions: earlier releases reject version 2
+bundles and version 1 bundles whose stamp was cleared. Turning it off again is
+always safe.
 
 Before acknowledging submission, node-manager creates an independent upload
 lease under `/space/cache/.btrfs-send-staging`. Volume-manager persists that lease

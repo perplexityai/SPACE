@@ -418,8 +418,9 @@ impl NodeManagerService {
         }
         let (artifact, parent, source) =
             (artifact.to_owned(), parent.to_owned(), source.to_owned());
+        let seal = self.send_parent_seal;
         self.off_runtime("retain immutable send source", move || {
-            let id = super::btrfs_send_source::capture(&artifact, &parent, &source)?;
+            let id = super::btrfs_send_source::capture(&artifact, &parent, &source, seal)?;
             if !defer {
                 return Ok(Some((id, None)));
             }

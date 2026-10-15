@@ -102,6 +102,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_NODEMGR_ACTIVATE_RUNTIME_SUPERVISOR_ON_START` | off | |
 | `SPACE_RTMGR_INSTALL_KERNELS_DIR` | unset | Enables runtime-manager kernel installs in this versioned kernel root, which must exist on the state directory's filesystem. Unset, installs and uninstalls are refused. |
 | `SPACE_NODEMGR_BTRFS_BALANCE_ENABLED` | on | |
+| `SPACE_NODEMGR_BTRFS_SEND_UNSTAMPED_PARENT` | off | Seal retained btrfs send-source parents without the template's received UUID; see [snapshot upload streaming](snapshot-upload-streaming.md). |
 | `SPACE_NODEMGR_DISK_IO_RESERVATION_ENABLED` | off | |
 | `SPACE_DISK_IO_SAFETY_MAX_OPERATIONS_PER_SEC`, `SPACE_DISK_IO_SAFETY_MAX_BANDWIDTH_MIB_PER_SEC` | unset | Set both or neither. |
 | `SPACE_NODE_DISK_ADMISSION_MIN_AVAILABLE_BYTES` | 50 GiB | Hard free-space floor. Lower it on small disks. |

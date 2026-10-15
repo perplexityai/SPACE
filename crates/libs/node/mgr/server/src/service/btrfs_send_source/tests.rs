@@ -112,7 +112,13 @@ fn retained_source_regenerates_after_producer_deletion_and_receives_on_same_file
     .unwrap();
     std::fs::create_dir(root.join("snapshot")).unwrap();
     let snapshot = root.join("snapshot");
-    let id = capture(&snapshot, &root.join("template"), &root.join("instance")).unwrap();
+    let id = capture(
+        &snapshot,
+        &root.join("template"),
+        &root.join("instance"),
+        ParentSeal::Unstamped,
+    )
+    .unwrap();
     // The receiving node's own install of the same template build, outside
     // the cache tree that slot retirement rewrites below.
     let receiver = trusted_paths::open_directory(receiver.path()).unwrap();
@@ -312,7 +318,13 @@ fn retained_sources_keep_the_template_receivable_past_the_uuid_item_search_limit
     for index in 0..500 {
         let artifact = root.join(format!("snapshot-{index}"));
         std::fs::create_dir(&artifact).unwrap();
-        let id = capture(&artifact, &root.join("template"), &root.join("instance")).unwrap();
+        let id = capture(
+            &artifact,
+            &root.join("template"),
+            &root.join("instance"),
+            ParentSeal::Unstamped,
+        )
+        .unwrap();
         captured.push((artifact, id));
     }
     assert_eq!(received_uuid_holders(&root, received_uuid), 1);
@@ -326,9 +338,9 @@ fn retained_sources_keep_the_template_receivable_past_the_uuid_item_search_limit
     assert_eq!(received_uuid_holders(&root, received_uuid), 1);
 }
 
-/// Bundles captured before this change carry the received UUID on the
-/// private parent. They stay readable, and restaging one seals the copy
-/// without it.
+/// The default seal stays readable by releases that predate it. Its bundles
+/// keep working after the stamp is cleared in place, and restaging one under
+/// the unstamped seal writes a copy without the received UUID.
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "requires root and an explicitly supplied disposable btrfs fixture directory"]
@@ -348,35 +360,22 @@ fn stamped_parent_bundles_stay_sendable_and_restage_unstamped() {
     btrfs::stamp(&template, received_uuid).unwrap();
     btrfs::set_readonly(&template, true).unwrap();
     btrfs::snapshot(&template, &directory, "instance".as_ref(), false).unwrap();
-    let instance = artifact_fs::directory(&directory, "instance".as_ref()).unwrap();
     let expected = b"suspended rootfs";
     std::fs::write(root.join("instance/rootfs.ext4"), expected).unwrap();
-    // A version 1 bundle as earlier releases captured it.
     let legacy = root.join("legacy");
-    std::fs::create_dir_all(legacy.join(DIRECTORY)).unwrap();
-    let bundle = trusted_paths::open_directory(&legacy.join(DIRECTORY)).unwrap();
-    stamped_template_copy(&template, &bundle, "parent", received_uuid);
-    btrfs::snapshot(&instance, &bundle, "source".as_ref(), true).unwrap();
-    let uuid_of = |name: &str| {
-        btrfs::info(&artifact_fs::directory(&bundle, name.as_ref()).unwrap())
-            .unwrap()
-            .1
-            .uuid
-            .unwrap()
-    };
-    let id = Uuid::now_v7();
-    let manifest = Manifest {
-        version: STAMPED_PARENT_VERSION,
-        source_id: id,
-        source_uuid: uuid_of("source"),
-        parent_uuid: uuid_of("parent"),
-        received_uuid,
-    };
-    std::fs::write(
-        legacy.join(DIRECTORY).join(MANIFEST),
-        serde_json::to_vec(&manifest).unwrap(),
+    std::fs::create_dir(&legacy).unwrap();
+    let id = capture(
+        &legacy,
+        &root.join("template"),
+        &root.join("instance"),
+        ParentSeal::Stamped,
     )
     .unwrap();
+    let manifest_path = legacy.join(DIRECTORY).join(MANIFEST);
+    let manifest: Manifest =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    assert_eq!(manifest.version, STAMPED_PARENT_VERSION);
+    assert_eq!(manifest.received_uuid, received_uuid);
     assert_eq!(received_uuid_holders(&root, received_uuid), 2);
     assert_eq!(inspect(&legacy, id).unwrap(), expected.len() as u64);
     assert_eq!(
@@ -384,30 +383,38 @@ fn stamped_parent_bundles_stay_sendable_and_restage_unstamped() {
         expected
     );
     // A version 2 manifest over the stamped parent is a lineage mismatch.
-    let mismatched = Manifest {
-        version: UNSTAMPED_PARENT_VERSION,
-        ..manifest
+    let write_version = |version| {
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec(&Manifest {
+                version,
+                ..manifest
+            })
+            .unwrap(),
+        )
+        .unwrap();
     };
-    std::fs::write(
-        legacy.join(DIRECTORY).join(MANIFEST),
-        serde_json::to_vec(&mismatched).unwrap(),
-    )
-    .unwrap();
+    write_version(UNSTAMPED_PARENT_VERSION);
     let artifact = trusted_paths::open_directory(&legacy).unwrap();
     assert!(matches!(
         SendSource::open(&artifact, id),
         Err(SourceError::LineageMismatch)
     ));
-    std::fs::write(
-        legacy.join(DIRECTORY).join(MANIFEST),
-        serde_json::to_vec(&Manifest {
-            version: STAMPED_PARENT_VERSION,
-            ..mismatched
-        })
-        .unwrap(),
-    )
-    .unwrap();
-    // Restaging, as a send lease does, writes an unstamped version 2 copy.
+    write_version(STAMPED_PARENT_VERSION);
+    // Clearing the stamp in place keeps the version 1 bundle usable and
+    // drops its holder.
+    let bundle = trusted_paths::open_directory(&legacy.join(DIRECTORY)).unwrap();
+    let parent = artifact_fs::directory(&bundle, "parent".as_ref()).unwrap();
+    btrfs::set_readonly(&parent, false).unwrap();
+    btrfs::set_readonly(&parent, true).unwrap();
+    drop((parent, bundle));
+    assert_eq!(received_uuid_holders(&root, received_uuid), 1);
+    assert_eq!(inspect(&legacy, id).unwrap(), expected.len() as u64);
+    assert_eq!(
+        receive_materialized(&root, &directory, &legacy, id),
+        expected
+    );
+    // Restaging, as a send lease does, under the unstamped seal.
     let source = SendSource::open(&artifact, id).unwrap();
     let restaged = root.join("restaged");
     std::fs::create_dir(&restaged).unwrap();
@@ -419,15 +426,14 @@ fn stamped_parent_bundles_stay_sendable_and_restage_unstamped() {
         &source.source,
         lease,
         source.received_uuid,
+        ParentSeal::Unstamped,
     )
     .unwrap();
     drop(source);
-    let manifest: serde_json::Value =
+    let restaged_manifest: serde_json::Value =
         serde_json::from_slice(&std::fs::read(restaged.join(DIRECTORY).join(MANIFEST)).unwrap())
             .unwrap();
-    assert_eq!(manifest["version"], UNSTAMPED_PARENT_VERSION);
-    assert_eq!(received_uuid_holders(&root, received_uuid), 2);
-    artifact_fs::remove_at(&directory, "legacy".as_ref()).unwrap();
+    assert_eq!(restaged_manifest["version"], UNSTAMPED_PARENT_VERSION);
     assert_eq!(received_uuid_holders(&root, received_uuid), 1);
     assert_eq!(
         receive_materialized(&root, &directory, &restaged, lease),
