@@ -12,6 +12,10 @@ import space_smoke as smoke
 from space_smoke.capabilities import EcwCommandResult
 from space_smoke.fixtures import Ecw
 from space_smoke.network_policy_fastly import (
+    _EDGE_ERROR_BASELINE,
+    _NO_EDGE_BASELINE,
+    _OVERRIDE_UNANSWERED,
+    _REFUSED_BASELINE,
     classify,
     verify_fastly_shared_edge_bypass,
 )
@@ -38,6 +42,12 @@ def _gateway(first_line: str) -> dict[str, object]:
 EDGE_SSL_REQUIRED = _edge("HTTP/1.1 403 SSL is required", "SSL is required.")
 GATEWAY_FORBIDDEN = _gateway("HTTP/1.1 403 Forbidden")
 GATEWAY_UPSTREAM_FAILED = _gateway("HTTP/1.1 502 Bad Gateway")
+# The co-tenant's own plain-HTTP answer carries no X-Served-By header.
+CO_TENANT_REDIRECT = _gateway("HTTP/1.1 301 Moved Permanently")
+NO_BASELINE = {
+    "fastly_headers_stripped": _NO_EDGE_BASELINE,
+    "matching_http_reached_edge": _NO_EDGE_BASELINE,
+}
 
 
 def _observed(**overrides: object) -> dict[str, object]:
@@ -97,42 +107,65 @@ class _ScenarioFixture:
 
 
 class NetworkPolicyFastlyTests(unittest.TestCase):
-    def test_classify_judges_only_responses_the_edge_served(self) -> None:
-        cases: list[tuple[str, dict[str, object], dict[str, list[str]]]] = [
+    def test_classify_judges_against_an_edge_served_baseline(self) -> None:
+        cases: list[tuple[str, dict[str, object], dict[str, object]]] = [
             ("held", _observed(), {}),
             (
                 # The gateway's 502 for a failed upstream fetch carries no edge
                 # evidence, so it is no baseline for the override comparison.
                 "allowed fetch failed upstream",
                 _observed(matching_http=GATEWAY_UPSTREAM_FAILED),
-                {"inconclusive": ["fastly_headers_stripped", "matching_http_reached_edge"]},
+                {"inconclusive": NO_BASELINE},
             ),
             (
                 "allowed request timed out",
                 _observed(matching_http={"error_type": "TimeoutError"}),
-                {"inconclusive": ["fastly_headers_stripped", "matching_http_reached_edge"]},
+                {"inconclusive": NO_BASELINE},
             ),
             (
                 "edge 5xx baseline",
                 _observed(matching_http=_edge("HTTP/1.1 503 Service Unavailable", "busy")),
-                {"inconclusive": ["fastly_headers_stripped"]},
+                {"inconclusive": {"fastly_headers_stripped": _EDGE_ERROR_BASELINE}},
             ),
             (
                 "override fetch failed upstream",
                 _observed(fastly_host_override=GATEWAY_UPSTREAM_FAILED),
-                {"inconclusive": ["fastly_headers_stripped"]},
+                {"inconclusive": {"fastly_headers_stripped": _OVERRIDE_UNANSWERED}},
             ),
             (
-                "gateway refused the override",
+                "override timed out",
+                _observed(fastly_host_override={"error_type": "TimeoutError"}),
+                {"inconclusive": {"fastly_headers_stripped": _OVERRIDE_UNANSWERED}},
+            ),
+            (
+                "override got an edge 5xx",
+                _observed(fastly_host_override=_edge("HTTP/1.1 503 Service Unavailable", "busy")),
+                {"inconclusive": {"fastly_headers_stripped": _OVERRIDE_UNANSWERED}},
+            ),
+            (
+                # The co-tenant's answer: only routing on Fastly-Host yields it.
+                "edge routed the override to the co-tenant",
+                _observed(fastly_host_override=CO_TENANT_REDIRECT),
+                {"bypass_detected": ["fastly_headers_stripped"]},
+            ),
+            (
+                "override got a different body",
+                _observed(fastly_host_override=_edge("HTTP/1.1 403 SSL is required", "tenant")),
+                {"bypass_detected": ["fastly_headers_stripped"]},
+            ),
+            (
+                # Indistinguishable from a co-tenant origin's empty 403, and
+                # the gateway strips rather than refuses this request.
+                "override got an empty 403 without edge headers",
                 _observed(fastly_host_override=GATEWAY_FORBIDDEN),
-                {},
+                {"bypass_detected": ["fastly_headers_stripped"]},
             ),
             (
                 "gateway refused the allowed host",
                 _observed(matching_http=GATEWAY_FORBIDDEN),
                 {
                     "allowed_failed": ["matching_http_reached_edge"],
-                    "inconclusive": ["fastly_headers_stripped"],
+                    "inconclusive": {"fastly_headers_stripped": _REFUSED_BASELINE},
                 },
             ),
             (
@@ -162,7 +195,7 @@ class NetworkPolicyFastlyTests(unittest.TestCase):
                 ),
                 {
                     "bypass_detected": ["co_tenant_http_blocked"],
-                    "inconclusive": ["fastly_headers_stripped", "matching_http_reached_edge"],
+                    "inconclusive": NO_BASELINE,
                 },
             ),
             (
@@ -183,7 +216,7 @@ class NetworkPolicyFastlyTests(unittest.TestCase):
                     {
                         "allowed_failed": expected.get("allowed_failed", []),
                         "bypass_detected": expected.get("bypass_detected", []),
-                        "inconclusive": expected.get("inconclusive", []),
+                        "inconclusive": expected.get("inconclusive", {}),
                     },
                 )
 
@@ -201,21 +234,49 @@ class NetworkPolicyFastlyTests(unittest.TestCase):
             [(True, NO_VERDICT), (True, ESCAPED), (True, ALLOW_FAILED)],
         )
 
-    def test_an_allowed_fetch_that_never_reached_the_edge_is_inconclusive(self) -> None:
-        test = _ProbeTest(json.dumps(_observed(matching_http=GATEWAY_UPSTREAM_FAILED)))
+    def test_inconclusive_runs_name_the_check_that_could_not_be_judged(self) -> None:
+        cases = [
+            (
+                "allowed fetch failed upstream",
+                _observed(matching_http=GATEWAY_UPSTREAM_FAILED),
+                ["fastly_headers_stripped", "matching_http_reached_edge"],
+                _NO_EDGE_BASELINE,
+            ),
+            (
+                "edge 5xx baseline",
+                _observed(matching_http=_edge("HTTP/1.1 503 Service Unavailable", "busy")),
+                ["fastly_headers_stripped"],
+                _EDGE_ERROR_BASELINE,
+            ),
+            (
+                "override fetch failed upstream",
+                _observed(fastly_host_override=GATEWAY_UPSTREAM_FAILED),
+                ["fastly_headers_stripped"],
+                _OVERRIDE_UNANSWERED,
+            ),
+        ]
+        for name, observed, checks, message in cases:
+            with self.subTest(name):
+                test = _ProbeTest(json.dumps(observed))
 
-        with self.assertRaises(InconclusiveSmoke):
+                with self.assertRaises(InconclusiveSmoke) as raised:
+                    verify_fastly_shared_edge_bypass(cast(Ecw, test))
+
+                self.assertEqual(str(raised.exception), message)
+                self.assertEqual(
+                    test.verifications,
+                    [(True, NO_VERDICT), (True, ESCAPED), (True, ALLOW_FAILED)],
+                )
+                self.assertEqual(test.recorded["inconclusive_checks"], checks)
+                self.assertIn("guest_snapshot_status", test.recorded)
+
+    def test_a_routed_override_without_edge_headers_fails_as_an_escape(self) -> None:
+        test = _ProbeTest(json.dumps(_observed(fastly_host_override=CO_TENANT_REDIRECT)))
+
+        with self.assertRaises(InvariantViolation):
             verify_fastly_shared_edge_bypass(cast(Ecw, test))
 
-        self.assertEqual(
-            test.verifications,
-            [(True, NO_VERDICT), (True, ESCAPED), (True, ALLOW_FAILED)],
-        )
-        self.assertEqual(
-            test.recorded["inconclusive_checks"],
-            ["fastly_headers_stripped", "matching_http_reached_edge"],
-        )
-        self.assertIn("guest_snapshot_status", test.recorded)
+        self.assertEqual(test.verifications[-1], (False, ESCAPED))
 
     def test_a_bypass_fails_as_an_escape_even_when_the_baseline_is_missing(self) -> None:
         test = _ProbeTest(

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypedDict
 
 from space_smoke.runtime import InconclusiveSmoke
 
@@ -16,7 +16,7 @@ _PROBE_PATH = "/tmp/space-smoke-fastly-shared-edge.py"
 # The guest only observes; `classify` judges on the host. The probe records
 # whether each plaintext response carries the edge's `X-Served-By` header:
 # responses the gateway generates itself (403 refusals, 502 upstream failures)
-# never do, so a header comparison is meaningful only between edge responses.
+# never do, so only an edge-served answer can be the comparison baseline.
 _PROBE = r"""
 import json
 import socket
@@ -142,16 +142,42 @@ def _gateway_refused(response: Mapping[str, object]) -> bool:
     )
 
 
-def classify(observed: Mapping[str, object]) -> dict[str, list[str]]:
+_NO_EDGE_BASELINE = (
+    "the allowed host's plaintext request failed in transit or got a gateway 5xx, "
+    "so the Fastly-Host comparison had no edge-served baseline"
+)
+_EDGE_ERROR_BASELINE = (
+    "the edge answered the allowed host's plaintext request with a 5xx, "
+    "so the Fastly-Host comparison had no usable baseline"
+)
+_REFUSED_BASELINE = (
+    "the gateway refused the allowed host's plaintext request, "
+    "so the Fastly-Host comparison had no baseline"
+)
+_OVERRIDE_UNANSWERED = (
+    "the Fastly-Host request failed in transit or got a 5xx, "
+    "so it could not be compared with the edge-served baseline"
+)
+
+
+class ProbeVerdict(TypedDict):
+    allowed_failed: list[str]
+    bypass_detected: list[str]
+    inconclusive: dict[str, str]
+
+
+def classify(observed: Mapping[str, object]) -> ProbeVerdict:
     """Judge one probe run from its observations.
 
     `bypass_detected` names checks whose evidence shows traffic escaping the
     allowed hostname. `allowed_failed` names allowed flows the gateway itself
-    refused. `inconclusive` names checks that could not be judged because the
-    edge never usably answered: an allowed plaintext request that failed in
-    transit, got a gateway 502 for a failed upstream fetch, or got an edge 5xx
-    cannot be the baseline for the `Fastly-Host` comparison, and its failure
-    says nothing about policy. Isolation checks never become inconclusive:
+    refused. `inconclusive` maps each check that could not be judged to the
+    reason: an allowed plaintext request that failed in transit, got a gateway
+    502 for a failed upstream fetch, or got an edge 5xx cannot be the baseline
+    for the `Fastly-Host` comparison, and its failure says nothing about
+    policy. Against an edge-served baseline, only an override that failed in
+    transit or got a 5xx is unjudgeable; any other answer is compared, whether
+    or not it carries edge headers. Isolation checks never become inconclusive:
     the gateway refuses a disallowed host before any upstream fetch.
     """
 
@@ -160,42 +186,45 @@ def classify(observed: Mapping[str, object]) -> dict[str, list[str]]:
     override = _response(observed, "fastly_host_override")
 
     allowed_failed: list[str] = []
-    inconclusive: list[str] = []
+    inconclusive: dict[str, str] = {}
     if not matching_tls:
         allowed_failed.append("matching_tls")
     if _from_edge(matching_http):
-        pass
+        baseline_gap = _EDGE_ERROR_BASELINE if _server_error(matching_http) else None
     elif _status_code(matching_http) is None or _server_error(matching_http):
         # A transport error or a gateway 502 for a failed upstream fetch.
-        inconclusive.append("matching_http_reached_edge")
+        inconclusive["matching_http_reached_edge"] = _NO_EDGE_BASELINE
+        baseline_gap = _NO_EDGE_BASELINE
     else:
         # The gateway answered the allowed host itself without a fetch failure.
         allowed_failed.append("matching_http_reached_edge")
+        baseline_gap = _REFUSED_BASELINE
 
     bypass_blocked = {
         "co_tenant_tls_blocked": not _response(observed, "co_tenant_tls").get("connected", False),
         "co_tenant_http_blocked": _gateway_refused(_response(observed, "co_tenant_http")),
         "unrelated_http_blocked": _gateway_refused(_response(observed, "unrelated_http")),
     }
-    # Stripping is proven when the edge answers the override exactly as it
-    # answers the plain allowed request; an edge answer that differs means it
-    # honored the guest's routing header. A gateway refusal sends nothing
-    # upstream. An edge 5xx baseline reflects the edge's health, not routing.
-    baseline = _from_edge(matching_http) and not _server_error(matching_http)
-    if _gateway_refused(override):
-        bypass_blocked["fastly_headers_stripped"] = True
-    elif baseline and _from_edge(override):
+    # Stripping is proven when the override gets exactly the edge's answer to
+    # the plain allowed request; any other answer means a later hop routed on
+    # the guest's header. The co-tenant's own answer need not carry edge
+    # headers, and an empty 403 is not proof of a gateway refusal here: the
+    # gateway strips these headers rather than refusing the allowed host. An
+    # edge 5xx baseline reflects the edge's health, not its routing.
+    if baseline_gap is not None:
+        inconclusive["fastly_headers_stripped"] = baseline_gap
+    elif _status_code(override) is None or _server_error(override):
+        inconclusive["fastly_headers_stripped"] = _OVERRIDE_UNANSWERED
+    else:
         bypass_blocked["fastly_headers_stripped"] = (
             _status_line(override) == _status_line(matching_http)
             and override.get("body") == matching_http.get("body")
         )
-    else:
-        inconclusive.append("fastly_headers_stripped")
 
     return {
         "allowed_failed": sorted(allowed_failed),
         "bypass_detected": sorted(name for name, ok in bypass_blocked.items() if not ok),
-        "inconclusive": sorted(inconclusive),
+        "inconclusive": dict(sorted(inconclusive.items())),
     }
 
 
@@ -238,13 +267,11 @@ def verify_fastly_shared_edge_bypass(test: Ecw) -> None:
         failed_checks=verdict["allowed_failed"],
         **context,
     )
-    if verdict["inconclusive"]:
+    inconclusive = verdict["inconclusive"]
+    if inconclusive:
         snapshot = test.collect_guest_network_snapshot()
         for name, value in {**context, **snapshot}.items():
             if name != "failure_evidence":
                 test.record(name, value)
-        test.record("inconclusive_checks", verdict["inconclusive"])
-        raise InconclusiveSmoke(
-            "the allowed Fastly host's plaintext request never reached the edge, "
-            "so the Fastly-Host stripping check had no baseline"
-        )
+        test.record("inconclusive_checks", sorted(inconclusive))
+        raise InconclusiveSmoke("; ".join(dict.fromkeys(inconclusive.values())))
