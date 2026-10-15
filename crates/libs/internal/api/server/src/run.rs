@@ -340,8 +340,9 @@ pub async fn run(
         auth::build::BuildAuthLayer::for_template_publication(token.clone()).await?;
     let auth_config = auth::NodeApiAuthConfig::from_env(auth::NodeRole::Cluster, token, None)?;
     let auth_layer = auth::NodeApiAuthLayer::from_config(auth_config).await?;
+    let visibility_observations = svc.visibility_observations.clone();
 
-    let serve_result = pplx_space_common_grpc::internal_transport::server_builder()?
+    let router = pplx_space_common_grpc::internal_transport::server_builder()?
         .http2_keepalive_interval(Some(std::time::Duration::from_secs(10)))
         .http2_keepalive_timeout(Some(std::time::Duration::from_mins(1)))
         // Trace first (outermost) so denied requests still produce server
@@ -352,7 +353,16 @@ pub async fn run(
         .add_service(health_service)
         .add_service(reflection)
         .add_service(cluster_api_server(svc))
-        .add_service(NodeInfoServer::new(node_info))
+        .add_service(NodeInfoServer::new(node_info));
+
+    // Spawned after the last fallible setup step, so a replica that never
+    // serves doesn't report clean zeros.
+    tokio::spawn(crate::visibility_observations::emit(
+        visibility_observations,
+        shutdown_token.clone(),
+    ));
+
+    let serve_result = router
         .serve_with_incoming_shutdown(
             pplx_space_common_grpc::internal_transport::Incoming::new(
                 TcpIncoming::from(listener).with_nodelay(Some(true)),

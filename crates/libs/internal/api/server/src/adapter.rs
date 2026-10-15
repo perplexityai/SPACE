@@ -451,6 +451,7 @@ impl ClusterApi for ClusterApiService {
         let visibility = template_visibility(
             &self.visibility_pool,
             &self.template_visibility_cache,
+            &self.visibility_observations,
             &template_name,
         )
         .await;
@@ -535,6 +536,7 @@ impl ClusterApi for ClusterApiService {
         let visibility = template_visibility(
             &self.visibility_pool,
             &self.template_visibility_cache,
+            &self.visibility_observations,
             &template_name,
         )
         .await;
@@ -565,6 +567,7 @@ impl ClusterApi for ClusterApiService {
         let visibility = template_visibility(
             &self.visibility_pool,
             &self.template_visibility_cache,
+            &self.visibility_observations,
             &template_name,
         )
         .await;
