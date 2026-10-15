@@ -73,15 +73,3 @@ configuring nonempty exemption lists. Before downgrading, use compatible binarie
 to remove exemptions from stored policies or retire the affected resources.
 Disabling configuration does not remove saved policies. There is no automatic
 refresh or separate definition registry.
-
-## Upgrading from the legacy configuration
-
-The old variables and header are no longer read. Move
-`SPACE_FALCON_EGRESS_DESTINATIONS` into a named profile's `allow` list. Copy the
-same destinations into `tls_interception_exemptions` only if
-`SPACE_FALCON_TLS_INTERCEPTION_EXEMPTIONS_ENABLED` was enabled. Configure
-`SPACE_EGRESS_PROFILES` on APIs and cluster controllers before replacing
-`X-Space-Falcon: true` with `X-Space-Egress-Profiles: +<name>` (or making that
-profile a default). Unknown selections now return 400. Remove the old variables
-and update dashboards from `space.sandbox.falcon_create_admission` to
-`space.sandbox.egress_profile_admission`.
