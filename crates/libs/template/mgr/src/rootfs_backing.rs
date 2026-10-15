@@ -1,4 +1,4 @@
-//! Opt-in backing for newly materialized templates. Ready cache entries are immutable.
+//! Backing policy for newly materialized templates. Ready cache entries are immutable.
 
 use std::fs::File;
 use std::io;
@@ -7,8 +7,8 @@ use std::path::Path;
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum RootfsBackingPolicy {
     /// Preserve the filesystem's normal allocation policy.
-    #[default]
     Inherit,
+    #[default]
     NoCow,
 }
 

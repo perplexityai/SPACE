@@ -51,6 +51,13 @@ spec:
             - --health-socket={{ include "space-node-service.healthSocket" $ctx }}
           {{- include "space-node-service.restrictedContainer" . | nindent 10 }}
           env:
+            {{- with .Values.rootfsBackingPolicy }}
+            {{- if not (has . (list "inherit" "nocow")) }}
+            {{- fail "rootfsBackingPolicy must be inherit, nocow, or empty" }}
+            {{- end }}
+            - name: SPACE_TEMPLATE_ROOTFS_BACKING_POLICY
+              value: {{ . | quote }}
+            {{- end }}
             {{- include "space-node-service.env.identity" . | nindent 12 }}
             {{- include "space-node-service.env.clusterApi" . | nindent 12 }}
             {{- with .Values.templateCache }}
