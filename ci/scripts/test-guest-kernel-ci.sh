@@ -26,8 +26,9 @@ BUILDKIT_MIRROR="ghcr.io/example/mirror@sha256:$(printf 'e%.0s' {1..64})"
 mkdir -p "${WORK_DIR}/bin"
 cat >"${WORK_DIR}/bin/docker" <<'SH'
 #!/usr/bin/env bash
-# The registry's references are the lines of FAKE_REGISTRY, the builders those
-# of FAKE_BUILDERS ("<name> <image>"). FAKE_LOOKUP_ERROR is the error of every
+# The registry's references are the lines of FAKE_REGISTRY, a tag that names a
+# digest as "<tag>=<digest>", the builders those of FAKE_BUILDERS
+# ("<name> <image>"). FAKE_LOOKUP_ERROR is the error of every
 # lookup; FAKE_STALL lists the operations that never answer (lookup, export,
 # push, external-build: any build that uses the mirror or the cache, and
 # own-builder-build: any build on Docker's own builder).
@@ -58,7 +59,14 @@ case "$1 ${2:-} ${3:-}" in
         ref="${*: -1}"
         ! stalls lookup || exec sleep 30
         [ -z "${FAKE_LOOKUP_ERROR:-}" ] || { echo "ERROR: ${FAKE_LOOKUP_ERROR}" >&2; exit 1; }
+        named="$(awk -v ref="${ref}=" 'index($0, ref) == 1 { digest = substr($0, length(ref) + 1) } END { print digest }' \
+            "${FAKE_REGISTRY}")"
+        if [ -n "${named}" ]; then
+            [ "$4" != --format ] || printf '{"digest":"%s"}\n' "${named}"
+            exit 0
+        fi
         grep -qxF "${ref}" "${FAKE_REGISTRY}" || { echo "ERROR: ${ref}: not found" >&2; exit 1; }
+        [ "$4" != --format ] || printf '{"digest":"%s"}\n' "${ref#*@}"
         ;;
     "buildx inspect --bootstrap")
         image="$(awk -v name="$4" '$1 == name { print $2 }' "${FAKE_BUILDERS}")"
@@ -185,7 +193,12 @@ hash="$(bash "${SCRIPT}" hash)"
 [ "$(KERNEL_VERSION=9.9.9 bash "${SCRIPT}" hash)" = "${hash}" ] || fail "the input hash depends on the environment"
 MARKER="${REPOSITORY}:${hash}"
 CACHES="${REPOSITORY}:toolchain-cache"$'\n'"${REPOSITORY}:smoke-cache"
-MIRRORS="${MIRROR}"$'\n'"${BUILDKIT_MIRROR}"
+# The mirror takes a name pinned by digest only through the tag that records
+# its verified pairing with the listed digest (ci/scripts/mirror-images.sh).
+record() {
+    printf 'ghcr.io/example/mirror:pin-%s=%s' "$(printf '%s %s' "$1" "$2" | sha256sum | cut -c1-40)" "$2"
+}
+MIRRORS="${MIRROR}"$'\n'"${BUILDKIT_MIRROR}"$'\n'"$(record "${BASE}" "${MIRROR#*@}")"$'\n'"$(record "${BUILDKIT}" "${BUILDKIT_MIRROR#*@}")"
 
 # A copy of the directory in its own repository, to change a file's mode.
 copy="${WORK_DIR}/repo/templates/firecracker/kernel"
