@@ -333,14 +333,16 @@ fn read_some<R: Read>(r: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
                 "read cursor moved beyond buffer length",
             ));
         };
-        match r.read(remaining)? {
-            0 => break,
-            n if n <= remaining.len() => filled += n,
-            _ => {
+        match r.read(remaining) {
+            Ok(0) => break,
+            Ok(n) if n <= remaining.len() => filled += n,
+            Ok(_) => {
                 return Err(std::io::Error::other(
                     "reader reported more bytes than the output buffer can hold",
                 ));
             }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
         }
     }
     Ok(filled)
