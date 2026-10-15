@@ -53,21 +53,6 @@ pub fn gentle_nodes(count: u64) {
     gauge("node_drain.gentle_nodes", count as f64, &[]);
 }
 
-/// A gentle drain that passed its escalation deadline and was rewritten to
-/// `forced`. One per node per escalation. Once-per-drain, but not because the
-/// UPDATE matches on mode: it carries no `drain_mode` predicate. The
-/// gentle/NULL/unrecognized classification lives only in the Rust caller
-/// (`from_column_str`), which stops offering a node as a candidate once the
-/// escalation writes `forced`, so it is never escalated a second time.
-///
-/// Every increment means resident sandboxes on that node are about to be
-/// evacuated and their user calls about to 409, i.e. the disruption the
-/// operator declined by taking the default. Worth alerting on during a shrink
-/// campaign.
-pub fn gentle_escalation(node_id: &str) {
-    counter("node_drain.gentle_escalations", 1, &[tag("node", node_id)]);
-}
-
 /// Sandboxes still resident on a draining node (work queue length).
 pub fn sandboxes_remaining(node_id: &str, count: u64) {
     gauge(

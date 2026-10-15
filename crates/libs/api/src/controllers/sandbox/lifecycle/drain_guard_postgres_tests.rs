@@ -444,10 +444,20 @@ async fn gentle_drain_still_blocks_once_the_node_is_drained() -> TestResult {
     Ok(())
 }
 
-// Escalation is a plain column rewrite, and the gate reads the column per
-// request, so the same sandbox that was served a moment ago starts 409ing with
-// no api-server state to invalidate. This is the property that lets the
-// cluster controller own escalation while the api-server owns the gate.
+// The operator-visible property: once a gently-draining node's `drain_mode`
+// becomes `forced`, the gate treats it exactly as one drained forced from the
+// start. Nothing on this path reads how the mode came to be `forced` — the gate
+// re-reads the column per request — so the same sandbox that was served a moment
+// ago starts 409ing with no api-server state to invalidate and no coordination
+// with whoever wrote the column.
+//
+// The mode is moved here with a direct UPDATE rather than through the admin
+// endpoint: this file's subject is the gate, and driving `:drain` would need the
+// whole handler. The endpoint-to-column wiring is covered elsewhere rather than
+// here — `node_store::in_flight_drain_tests` covers the write,
+// `routes::admin::nodes::tests` covers the transition table, and
+// `routes::admin::nodes::drain_handler_tests` drives a real `:drain` against an
+// already-draining row. So the direct UPDATE is a scoping choice, not a gap.
 #[tokio::test(flavor = "current_thread")]
 async fn escalating_a_gentle_drain_to_forced_closes_the_gate() -> TestResult {
     let db = pg_test_db().await?;

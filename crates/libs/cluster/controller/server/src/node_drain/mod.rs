@@ -68,17 +68,23 @@
 //!   node makes progress without disturbing anyone: an S3-backed artifact both
 //!   releases the node and sends that sandbox's next restore elsewhere. The
 //!   cost is latency, and the failure mode is a node that never converges
-//!   because a resident never suspends — see
-//!   [`ReconcilerConfig::gentle_escalate`].
+//!   because a resident never suspends. Giving up on that wait is the
+//!   operator's call, not this reconciler's: `POST :drain` with
+//!   `mode: forced` against a node already `draining` escalates it in place,
+//!   keeping both the cordon and the drain's original `drain_started_at`.
 //! - **Forced** is the original behavior: evacuate every resident
 //!   `started`/`paused` sandbox immediately, with the 409 gates closed for the
 //!   whole drain window so users cannot race the pipeline. Per-node disruption
 //!   is proportional to resident live-sandbox count.
 //!
-//! Escalation is a single `UPDATE nodes SET drain_mode = 'forced'`: this
-//! reconciler and the user-API gates both read the column, so one committed
-//! write moves every consumer at once and there is no in-memory mode state to
-//! keep consistent across the two processes.
+//! That escalation is one UPDATE in the admin endpoint's transaction. It moves
+//! `drain_mode` to `'forced'` and clears `drain_last_error` — including an error
+//! this reconciler wrote for a cordon it has not yet repaired, which the next
+//! tick then re-derives. This reconciler and the user-API gates re-read the mode
+//! on every pass, so that one committed write moves every consumer at once and
+//! there is no in-memory mode state to keep consistent across the two processes
+//! — which is why the endpoint needs nothing from this reconciler beyond its
+//! next tick.
 //!
 //! ## Drained-to-terminating handoff
 //!
@@ -555,28 +561,6 @@ pub struct ReconcilerConfig {
     ///
     /// `None` by default — the rollout pattern is opt-in per environment.
     pub drain_evacuation_placement: Option<EvacuationPlacement>,
-    /// How long a **gentle** drain may sit in `draining` before the
-    /// reconciler rewrites its `drain_mode` to `forced` and starts evacuating.
-    /// Measured from `nodes.drain_started_at` in SQL (`NOW() - INTERVAL`), so
-    /// it needs no wall clock in this process.
-    ///
-    /// `None` (the default) disables escalation: a gentle drain waits
-    /// indefinitely. That is the right default because escalation is
-    /// destructive — it is the disruption the operator declined by choosing
-    /// gentle — and because a parked gentle drain is visible rather than
-    /// silent (the per-tick stuck-drain warning plus
-    /// `node_drain.sandboxes_remaining`). Set it for a shrink campaign, where
-    /// a node hosting a sandbox that never auto-suspends would otherwise never
-    /// converge; the operator's alternative is `space.pplx.net/drain-keep`
-    /// plus a manual decision per node.
-    ///
-    /// `Option<PositiveDuration>` for the same two reasons as
-    /// [`Self::stale_abandon`]: the disabled case is `None` rather than an
-    /// in-band zero a consumer could forget to check (a zero interval here
-    /// would escalate **every** gentle drain on the tick it starts, converting
-    /// the default mode into the forced one), and when present the value is
-    /// guaranteed non-zero.
-    pub gentle_escalate: Option<PositiveDuration>,
 }
 
 impl Default for ReconcilerConfig {
@@ -601,7 +585,6 @@ impl Default for ReconcilerConfig {
                 DEFAULT_RESTORE_BACKOFF_CAP_SECS,
             )),
             drain_evacuation_placement: None,
-            gentle_escalate: None,
         }
     }
 }
@@ -634,7 +617,6 @@ impl ReconcilerConfig {
                 env,
                 "SPACE_CLUSTER_CONTROLLER_DRAIN_EVACUATION_COHORT_VALUE",
             ),
-            gentle_escalate: None,
         }
     }
 }
@@ -725,27 +707,6 @@ pub trait NodeDrainSink: Send + Sync + 'static {
     fn list_draining_nodes(
         &self,
     ) -> impl std::future::Future<Output = Result<Vec<DrainingNode>, sqlx::Error>> + Send;
-    /// Rewrite `drain_mode` to `forced` on each of `candidates` whose drain
-    /// started more than `age` ago, returning the ids actually escalated.
-    ///
-    /// `candidates` are the nodes the **caller** has already resolved as gentle
-    /// via [`NodeDrainMode::from_column_str`]. Keeping the classification here,
-    /// in Rust, is what stops the NULL-and-unrecognized-read-as-gentle policy
-    /// from being restated in SQL where it could drift from the reader.
-    ///
-    /// The age comparison stays in SQL against `drain_started_at`, so the
-    /// deadline is measured on the database's clock rather than this process's —
-    /// a restarted or clock-skewed controller cannot escalate early.
-    ///
-    /// The UPDATE is the escalation: everything downstream (this reconciler's
-    /// evacuation branch, the user-API 409 gates) reads the column, so a single
-    /// committed write flips every consumer at once with no in-memory state to
-    /// keep consistent.
-    fn escalate_stale_gentle_drains(
-        &self,
-        candidates: &[NodeId],
-        age: PositiveDuration,
-    ) -> impl std::future::Future<Output = Result<Vec<NodeId>, sqlx::Error>> + Send;
     /// Node IDs currently in `nodes.drain_phase = 'terminating'`.
     fn list_terminating_nodes(
         &self,
@@ -1341,8 +1302,9 @@ pub struct Reconciler<S: NodeDrainSink, T: InstanceTerminator> {
 /// The mode travels with the id (rather than being re-read per node) so one
 /// query answers "what is draining, and how" and every branch in
 /// [`Reconciler::handle_draining_node`] reads the same value for the whole
-/// tick. A mode that changes mid-tick — an escalation, or an
-/// `:undrain`+`:drain` — is picked up by the next tick.
+/// tick. A mode that changes mid-tick — an operator escalating with
+/// `:drain --forced`, or an `:undrain`+`:drain` — is picked up by the next
+/// tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DrainingNode {
     pub id: NodeId,
@@ -1377,9 +1339,6 @@ pub struct TickReport {
     /// Draining nodes handled in gentle mode this tick: cordoned, promoted,
     /// and counted, but with no evacuation spawned.
     pub gentle_nodes: usize,
-    /// Gentle drains rewritten to `forced` this tick because they passed
-    /// [`ReconcilerConfig::gentle_escalate`].
-    pub gentle_escalations: usize,
     /// Draining nodes the drain gate held this tick, i.e. `blockers > 0`.
     ///
     /// Counted separately from the residents because the two do not overlap
@@ -1491,26 +1450,9 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
         }
 
         match self.sink.list_draining_nodes().await {
-            Ok(mut nodes) => {
+            Ok(nodes) => {
                 report.draining_nodes = nodes.len();
-                // List, then escalate, then handle — all within this tick, so a
-                // node that just passed the deadline is evacuated now rather
-                // than idling one more tick. The classification is done here
-                // rather than in the UPDATE's `WHERE`: `list_draining_nodes`
-                // already resolved every row through
-                // `NodeDrainMode::from_column_str`, so this is the only place
-                // that decides what "gentle" means.
-                if let Some(age) = self.config.gentle_escalate {
-                    let candidates: Vec<NodeId> = nodes
-                        .iter()
-                        .filter(|node| !node.mode.evacuates_residents())
-                        .map(|node| node.id)
-                        .collect();
-                    self.escalate_gentle_drains(&candidates, age, &mut nodes, &mut report)
-                        .await;
-                }
-                // Prune pacer slots for nodes that left the draining set, after
-                // escalation so it prunes against the set actually handled. The
+                // Prune pacer slots for nodes that left the draining set. The
                 // pacer keys on `Uuid`, so project the ids rather than widening
                 // its signature to a node type it has no other use for.
                 let live: Vec<NodeId> = nodes.iter().map(|node| node.id).collect();
@@ -1769,63 +1711,6 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
         spawned
     }
 
-    /// Escalate the gentle drains in `candidates` that have passed `age`, and
-    /// promote the escalated ones to `Forced` in `nodes` so this same tick
-    /// evacuates them.
-    ///
-    /// Rewriting the in-memory listing is what makes the escalation take effect
-    /// immediately instead of one tick later. It is safe because the DB write
-    /// has already committed by the time we get the ids back — the listing and
-    /// the column now agree, and any other reader (the user-API drain gates)
-    /// sees the same `forced` on its next read.
-    ///
-    /// A failed escalation is logged and dropped: the nodes stay gentle for this
-    /// tick and the next one retries. That is the fail-soft direction — the
-    /// alternative, treating an unconfirmed escalation as forced, would evacuate
-    /// sandboxes on the strength of a write that may not have landed.
-    async fn escalate_gentle_drains(
-        &self,
-        candidates: &[NodeId],
-        age: PositiveDuration,
-        nodes: &mut [DrainingNode],
-        report: &mut TickReport,
-    ) {
-        if candidates.is_empty() {
-            return;
-        }
-        let escalated = match self
-            .sink
-            .escalate_stale_gentle_drains(candidates, age)
-            .await
-        {
-            Ok(escalated) => escalated,
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    candidates = candidates.len(),
-                    "node_drain: escalate_stale_gentle_drains failed; the nodes stay gentle \
-                     this tick and the next one retries"
-                );
-                return;
-            }
-        };
-        report.gentle_escalations += escalated.len();
-        for node_id in escalated {
-            node_drain_metrics::gentle_escalation(&node_id.to_string());
-            tracing::warn!(
-                node_id = %node_id,
-                age_secs = age.get().as_secs(),
-                reason = "drain_gentle_escalated",
-                "node_drain: gentle drain exceeded its escalation deadline; switched \
-                 drain_mode to forced — resident sandboxes will now be evacuated and user \
-                 calls against them will 409"
-            );
-            if let Some(node) = nodes.iter_mut().find(|node| node.id == node_id) {
-                node.mode = NodeDrainMode::Forced;
-            }
-        }
-    }
-
     /// Publish one per-node store query's latency and outcome, and warn — paced
     /// — when a query that still succeeded took long enough to be worth
     /// investigating.
@@ -2048,9 +1933,14 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
         // The cost is that a genuinely wedged transient now parks a gentle node
         // in `draining` instead of being cleared. That is the right trade — a
         // slow drain beats a destroyed user transition — and the park is not
-        // silent: it is counted by `node_drain.drain_blockers` and it converges
-        // if the operator sets the escalation deadline, which rewrites the mode
-        // to `forced` and re-enables this sweep along with the evacuation.
+        // silent, though no single gauge shows all of it: this sweep matches
+        // `active_node_id = $1 OR target_node_id = $1` while
+        // `node_drain.sandboxes_remaining` counts only `active_node_id` rows,
+        // and `node_drain.drain_blockers` inverts the trade.
+        //
+        // Either way it converges as soon as the operator escalates the drain
+        // with `:drain --forced`, which rewrites the mode and re-enables this
+        // sweep along with the evacuation.
         if let Some(age) = self
             .config
             .stale_abandon
@@ -2509,7 +2399,6 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
                 discounted = resident.discounted,
                 blockers = blocking_count,
                 pinned = pinned_total,
-                escalate_secs = self.config.gentle_escalate.map(|age| age.get().as_secs()),
                 "node_drain: gentle drain waiting for resident sandboxes to leave on their \
                  own (auto-suspend on inactivity, user suspend, or delete); no evacuation \
                  will be attempted"

@@ -62,3 +62,66 @@ fn a_computed_drainability_block_serializes_every_term() {
         "every field is serialized, and a new one needs an assertion here: {json}"
     );
 }
+
+/// A `:drain` body that expressed no replacement intent must omit the key
+/// entirely, not send an explicit `null`.
+///
+/// `space-cli` serializes `DrainRequest` whole and its binaries roll
+/// independently of the api-server, so a new CLI routinely talks to a
+/// previous-release server where this field is a bare `bool`. serde's `default`
+/// fires only on an absent key — an explicit `null` deserializes as
+/// `invalid type: null, expected a boolean`, which would 400 every bodiless
+/// drain against that server. Asserted on the serialized bytes because that is
+/// the contract the old server reads; the `Option` alone does not imply it.
+#[test]
+fn an_unexpressed_replace_after_terminate_is_absent_from_the_wire() {
+    let body = serde_json::to_value(DrainRequest::default()).expect("serializes");
+    let object = body.as_object().expect("object");
+    assert!(
+        !object.contains_key("replace_after_terminate"),
+        "an unexpressed intent must omit the key, not send null; got {body}"
+    );
+
+    // Both expressed values still reach the wire — a `skip_serializing_if` that
+    // matched too broadly would silently drop the flag a blue-green shrink
+    // depends on. Serialization only; the deserialize direction is pinned by
+    // `routes::admin::nodes::tests`' `parse_drain_request` cases.
+    for expressed in [true, false] {
+        let body = serde_json::to_value(DrainRequest {
+            replace_after_terminate: Some(expressed),
+            ..DrainRequest::default()
+        })
+        .expect("serializes");
+        assert_eq!(
+            body.get("replace_after_terminate"),
+            Some(&serde_json::Value::Bool(expressed)),
+            "an expressed {expressed} must reach the wire"
+        );
+    }
+}
+
+/// The default resolution used on the edge that starts a drain: an unexpressed
+/// intent means the ASG auto-replaces the terminated instance.
+///
+/// Not entailed by `replace_after_terminate == None` — that pins the parse, this
+/// pins the resolution. Flipping `unwrap_or(true)` to `unwrap_or(false)` leaves
+/// the parse assertion green and drops `terminate_decrement_capacity` to the
+/// wrong value on every fresh drain.
+#[test]
+fn an_unexpressed_replace_after_terminate_resolves_to_auto_replace() {
+    assert!(DrainRequest::default().replace_after_terminate_or_default());
+    assert!(
+        DrainRequest {
+            replace_after_terminate: Some(true),
+            ..DrainRequest::default()
+        }
+        .replace_after_terminate_or_default()
+    );
+    assert!(
+        !DrainRequest {
+            replace_after_terminate: Some(false),
+            ..DrainRequest::default()
+        }
+        .replace_after_terminate_or_default()
+    );
+}

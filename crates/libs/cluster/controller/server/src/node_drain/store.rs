@@ -544,66 +544,6 @@ pub(crate) fn terminating_nodes_query() -> &'static str {
     sql!("SELECT id FROM nodes WHERE drain_phase = $1 AND managed_by = $2")
 }
 
-/// `$1` = candidate node ids, `$2` = drain phase (`draining`), `$3` = the mode
-/// to write (`forced`), `$4` = escalation age in seconds (BIGINT), `$5` =
-/// [`SubstrateKind::Kubernetes`]. Rewrites the
-/// mode on every candidate whose drain is older than that age, and returns the
-/// ids it actually escalated.
-///
-/// **The gentle-vs-forced decision is not made here.** The caller resolves each
-/// node's mode through [`NodeDrainMode::from_column_str`] and passes only the
-/// gentle ones, so the NULL-and-unrecognized-read-as-gentle policy lives in
-/// exactly one place. Matching modes in this `WHERE` clause instead would state
-/// that policy twice — and the copies would diverge the moment a third mode
-/// appeared.
-///
-/// What stays in SQL is the part that must: the age comparison against `NOW()`,
-/// so the deadline is measured on the database clock and a restarted or
-/// clock-skewed controller cannot escalate early. `drain_phase` and `managed_by`
-/// are re-asserted as a compare-and-swap — the ids were listed by an earlier
-/// statement, and a node undrained or replaced in between must not be escalated
-/// on the strength of a stale read.
-///
-/// `drain_started_at IS NOT NULL` is not redundant: an interval comparison
-/// against NULL yields NULL, never true, so a row missing it would silently
-/// never escalate. Requiring it says so out loud — a gentle drain with no start
-/// time is a bug to notice, not a node to escalate on an unknown age.
-///
-/// Escalation is idempotent per drain because the write lands `forced`, which
-/// the caller then stops classifying as a candidate.
-pub(crate) async fn escalate_stale_gentle_drains(
-    pool: &PgPool,
-    candidates: &[NodeId],
-    age: PositiveDuration,
-) -> Result<Vec<NodeId>, sqlx::Error> {
-    if candidates.is_empty() {
-        return Ok(Vec::new());
-    }
-    // Saturating, matching every other age/settle binding in this file. A
-    // wrapping `as i64` would turn an absurd configured age into a *negative*
-    // interval, making `drain_started_at < NOW() + huge` true for every
-    // candidate and escalating them all at once. Saturating fails the other
-    // way: an unrepresentable age means "never escalates".
-    let age_secs = i64::try_from(age.get().as_secs()).unwrap_or(i64::MAX);
-    sqlx::query_scalar::<_, NodeId>(sql!(
-        "UPDATE nodes
-            SET drain_mode = $3
-          WHERE id = ANY($1)
-            AND drain_phase = $2
-            AND managed_by = $5
-            AND drain_started_at IS NOT NULL
-            AND drain_started_at < NOW() - make_interval(secs => $4::BIGINT)
-        RETURNING id"
-    ))
-    .bind(candidates)
-    .bind(PHASE_DRAINING)
-    .bind(NodeDrainMode::Forced)
-    .bind(age_secs)
-    .bind(SubstrateKind::Kubernetes)
-    .fetch_all(pool)
-    .await
-}
-
 /// `$1` = sandbox id, `$2` = backoff base seconds (BIGINT), `$3` = backoff
 /// cap seconds (BIGINT). Records one failed cohort-restore attempt: bumps
 /// `restore_attempt_count` and schedules the earliest next attempt at
@@ -1490,6 +1430,7 @@ type SuspendExecutionResult = Result<Option<PublishedLocalArtifact>, SubstrateEr
 #[cfg(test)]
 type TestSuspendExecutionFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = SuspendExecutionResult> + Send>>;
+
 #[cfg(test)]
 type TestSuspendExecution = dyn Fn(SandboxId) -> TestSuspendExecutionFuture + Send + Sync;
 
@@ -1911,14 +1852,6 @@ impl NodeDrainSink for SubstrateSink {
                 DrainingNode { id, mode }
             })
             .collect())
-    }
-
-    async fn escalate_stale_gentle_drains(
-        &self,
-        candidates: &[NodeId],
-        age: PositiveDuration,
-    ) -> Result<Vec<NodeId>, sqlx::Error> {
-        escalate_stale_gentle_drains(&self.pool, candidates, age).await
     }
 
     async fn list_terminating_nodes(&self) -> Result<Vec<NodeId>, sqlx::Error> {
@@ -3544,13 +3477,6 @@ mod tests;
 #[cfg(test)]
 mod tombstone_tests;
 
-/// Postgres-backed tests for the gentle-drain escalation UPDATE and the
-/// `drain_mode` read on the draining-node listing. The interesting parts are
-/// SQL-side: the age comparison runs on the database clock, and the guards
-/// decide which rows a shrink campaign is allowed to escalate.
-#[cfg(test)]
-mod gentle_escalation_tests;
-
 /// Postgres-backed regression tests for the durable-upload drain gate: a node
 /// must not be reclaimed (nor its sandbox marked `failed`) while a
 /// suspend-snapshot upload is still in flight *from* that node
@@ -3567,6 +3493,14 @@ mod durable_upload_gate_tests;
 /// history, so large histories cannot make a forced drain time out.
 #[cfg(test)]
 mod pinned_local_only_scale_tests;
+
+/// Postgres-backed coverage for how the reconciler reads and re-checks
+/// `nodes.drain_mode`: the draining listing resolves NULL and unrecognized
+/// values to gentle rather than dropping the row, and the evacuation claim
+/// re-asserts the node's phase and mode inside its own UPDATE so a mid-tick
+/// mode change cannot be acted on.
+#[cfg(test)]
+mod drain_mode_tests;
 
 /// Postgres-backed coverage for the node-census residency discount: which
 /// rows stop counting against a draining node, and — the half that matters —

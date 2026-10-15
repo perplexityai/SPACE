@@ -51,7 +51,10 @@ async fn main() {
             forced,
         } => {
             let request = DrainRequest {
-                replace_after_terminate: !no_replace_after_terminate,
+                // `Some(false)` only when the operator asked; otherwise no
+                // opinion, so an escalation leaves the in-flight drain's
+                // intent alone rather than resetting it to the default.
+                replace_after_terminate: no_replace_after_terminate.then_some(false),
                 mode: if forced {
                     NodeDrainMode::Forced
                 } else {

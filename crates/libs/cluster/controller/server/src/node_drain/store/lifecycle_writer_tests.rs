@@ -11,7 +11,7 @@
 //! sink method used here touches only Postgres.
 //!
 //! Refusals already pinned at the query level are not repeated here: the
-//! claim's forced-drain mode (`gentle_escalation_tests`); the redrive's
+//! claim's forced-drain mode (`drain_mode_tests`); the redrive's
 //! marker, retirement and snapshot gates, the in-flight-upload guard of
 //! mark-lost, and the gone-node identity, recoverable-suspend and
 //! marked-restore guards (`durable_upload_gate_tests`).

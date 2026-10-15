@@ -81,37 +81,148 @@ fn admin_node_response_uses_status_snapshot_as_heartbeat() {
     assert!(status.health.expect("health should be present").healthy);
 }
 
+/// `:terminate`, `:undrain`, `:cordon`, `:uncordon` and
+/// `:force-upload-local-snapshots` never consult a drain mode, so the tests
+/// whose subject is the phase table say so by going through this rather than
+/// naming a mode pair each call. `:drain` is the exception and calls
+/// [`validate_drain_transition`] directly.
+fn phase_only(
+    phase: Option<&str>,
+    action: DrainAction,
+) -> Result<DrainTransition, TransitionError> {
+    validate_drain_transition(phase, NodeDrainMode::Gentle, action, None)
+}
+
+/// A `:drain` request as the validator sees it: the node's resolved current
+/// mode and the mode the operator asked for.
+fn drain(
+    phase: Option<&str>,
+    current_mode: NodeDrainMode,
+    requested_mode: NodeDrainMode,
+) -> Result<DrainTransition, TransitionError> {
+    validate_drain_transition(
+        phase,
+        current_mode,
+        DrainAction::Drain,
+        Some(requested_mode),
+    )
+}
+
 #[test]
-fn drain_only_allowed_from_no_phase() {
-    let t = validate_drain_transition(None, DrainAction::Drain).unwrap();
+fn drain_starts_a_drain_only_from_no_phase() {
+    let t = drain(None, NodeDrainMode::Gentle, NodeDrainMode::Gentle).unwrap();
     assert!(matches!(
         t,
-        PhaseTransition::Move {
+        DrainTransition::Move {
             new: Some(PHASE_DRAINING),
             set_started_at: true,
             clear_started_at: false,
         }
     ));
 
-    for phase in [PHASE_DRAINING, PHASE_DRAINED, PHASE_TERMINATING] {
-        let err = validate_drain_transition(Some(phase), DrainAction::Drain).unwrap_err();
-        assert!(matches!(err, TransitionError::Conflict { .. }));
+    // `drained` and `terminating` are past the point where re-draining means
+    // anything — the node is empty and on its way to being destroyed. Only
+    // `draining` gained an edge; see `escalating_a_gentle_drain_*` below.
+    for phase in [PHASE_DRAINED, PHASE_TERMINATING] {
+        for requested in [NodeDrainMode::Gentle, NodeDrainMode::Forced] {
+            let err = drain(Some(phase), NodeDrainMode::Gentle, requested).unwrap_err();
+            assert!(
+                matches!(err, TransitionError::Conflict { .. }),
+                "{phase} + {requested:?} must stay a conflict"
+            );
+        }
+    }
+}
+
+/// The operator-visible property: asking for `forced` on a node that is already
+/// draining gently makes the drain destructive **without restarting it**. A
+/// `Move` with `set_started_at: true` would satisfy "the mode changed" and still
+/// be wrong: it resets the drain's age, which both an operator and
+/// `space-rollout-mng.py`'s stuck detection read.
+/// `node_store::update_in_flight_drain` names each reader.
+#[test]
+fn escalating_a_gentle_drain_keeps_the_drains_age() {
+    let t = drain(
+        Some(PHASE_DRAINING),
+        NodeDrainMode::Gentle,
+        NodeDrainMode::Forced,
+    )
+    .unwrap();
+    // The variants are disjoint, so this alone rules out the `Move` path whose
+    // `:drain` arm stamps `drain_started_at = NOW()`. The *column* half of the
+    // property — that the write really does leave the stamp alone — is not
+    // testable here and is pinned by
+    // `node_store::in_flight_drain_tests::escalation_rewrites_the_mode_and_keeps_the_drains_age`
+    // against a backdated row.
+    assert_eq!(
+        t,
+        DrainTransition::UpdateInFlightDrain(Some(NodeDrainMode::Forced))
+    );
+}
+
+/// That a NULL or unparseable `nodes.drain_mode` is escalatable is a
+/// composition of two properties pinned elsewhere —
+/// `types::node::tests::{absent,unrecognized}_drain_mode_column_reads_as_gentle`
+/// for the resolution, and `escalating_a_gentle_drain_keeps_the_drains_age` for
+/// the transition. There was a test here restating that composition; it asserted
+/// nothing independently breakable, and its docstring claimed to pin the
+/// handler's use of `from_column_str`, which no test in this file reaches —
+/// every test here calls a pure helper. `drain_handler_tests` reaches it, by
+/// driving `:drain` against a real draining row.
+///
+/// A drain cannot be made *less* aggressive in place: the suspends and
+/// cross-node restores a forced drain has already run have no inverse, so the
+/// node would be left half-evacuated in a state neither mode describes.
+/// Refused with both modes named, because "409 conflict" plus a phase list
+/// would point the operator at the phase, which is not what was wrong.
+#[test]
+fn a_forced_drain_cannot_be_downgraded_to_gentle() {
+    let err = drain(
+        Some(PHASE_DRAINING),
+        NodeDrainMode::Forced,
+        NodeDrainMode::Gentle,
+    )
+    .unwrap_err();
+    let TransitionError::ModeDowngrade { current_mode } = err else {
+        panic!("expected ModeDowngrade, got {err:?}");
+    };
+    assert_eq!(current_mode, NodeDrainMode::Forced);
+}
+
+/// Re-asserting the mode a node already has is idempotent *on the mode*, and not
+/// an error: a rollout script that re-issues `--forced` after a timeout should
+/// find the node in the state it asked for, not a 409 it has to special-case.
+///
+/// It takes the same arm as the escalation, carrying the unchanged mode, rather
+/// than a distinct no-op arm. That is deliberate and is the difference from
+/// `:cordon`: the mode is not the only per-drain setting a repeat can change, so
+/// an arm chosen on the mode alone would drop a `replace_after_terminate`
+/// correction behind a 200. `drain_started_at` is untouched either way — the
+/// store function is what guarantees that, for both modes.
+#[test]
+fn re_asserting_the_same_drain_mode_keeps_that_mode() {
+    for mode in [NodeDrainMode::Gentle, NodeDrainMode::Forced] {
+        assert_eq!(
+            drain(Some(PHASE_DRAINING), mode, mode).unwrap(),
+            DrainTransition::UpdateInFlightDrain(None),
+            "{mode:?} -> {mode:?} must not rewrite the mode column"
+        );
     }
 }
 
 #[test]
 fn terminate_only_allowed_from_drained() {
-    let t = validate_drain_transition(Some(PHASE_DRAINED), DrainAction::Terminate).unwrap();
+    let t = phase_only(Some(PHASE_DRAINED), DrainAction::Terminate).unwrap();
     assert!(matches!(
         t,
-        PhaseTransition::Move {
+        DrainTransition::Move {
             new: Some(PHASE_TERMINATING),
             ..
         }
     ));
 
     for phase in [None, Some(PHASE_DRAINING), Some(PHASE_TERMINATING)] {
-        let err = validate_drain_transition(phase, DrainAction::Terminate).unwrap_err();
+        let err = phase_only(phase, DrainAction::Terminate).unwrap_err();
         assert!(matches!(err, TransitionError::Conflict { .. }));
     }
 }
@@ -119,10 +230,10 @@ fn terminate_only_allowed_from_drained() {
 #[test]
 fn undrain_from_draining_or_drained() {
     for phase in [PHASE_DRAINING, PHASE_DRAINED] {
-        let t = validate_drain_transition(Some(phase), DrainAction::Undrain).unwrap();
+        let t = phase_only(Some(phase), DrainAction::Undrain).unwrap();
         assert!(matches!(
             t,
-            PhaseTransition::Move {
+            DrainTransition::Move {
                 new: None,
                 set_started_at: false,
                 clear_started_at: true,
@@ -130,10 +241,10 @@ fn undrain_from_draining_or_drained() {
         ));
     }
 
-    let err = validate_drain_transition(None, DrainAction::Undrain).unwrap_err();
+    let err = phase_only(None, DrainAction::Undrain).unwrap_err();
     assert!(matches!(err, TransitionError::Conflict { .. }));
 
-    let err = validate_drain_transition(Some(PHASE_TERMINATING), DrainAction::Undrain).unwrap_err();
+    let err = phase_only(Some(PHASE_TERMINATING), DrainAction::Undrain).unwrap_err();
     assert!(matches!(err, TransitionError::Conflict { .. }));
 }
 
@@ -176,9 +287,8 @@ fn force_upload_local_snapshots_never_changes_drain_phase() {
         Some(PHASE_DRAINED),
         Some(PHASE_TERMINATING),
     ] {
-        let transition =
-            validate_drain_transition(phase, DrainAction::ForceUploadLocalSnapshots).unwrap();
-        assert!(matches!(transition, PhaseTransition::NoChange));
+        let transition = phase_only(phase, DrainAction::ForceUploadLocalSnapshots).unwrap();
+        assert!(matches!(transition, DrainTransition::NoChange));
     }
 }
 
@@ -287,8 +397,8 @@ fn cordon_is_always_a_no_op_at_the_db_layer() {
         Some(PHASE_TERMINATING),
     ] {
         assert!(matches!(
-            validate_drain_transition(phase, DrainAction::Cordon).unwrap(),
-            PhaseTransition::NoChange
+            phase_only(phase, DrainAction::Cordon).unwrap(),
+            DrainTransition::NoChange
         ));
     }
 }
@@ -297,39 +407,38 @@ fn cordon_is_always_a_no_op_at_the_db_layer() {
 fn uncordon_refuses_while_a_drain_is_active() {
     // No drain in progress: standalone uncordon is fine.
     assert!(matches!(
-        validate_drain_transition(None, DrainAction::Uncordon).unwrap(),
-        PhaseTransition::NoChange
+        phase_only(None, DrainAction::Uncordon).unwrap(),
+        DrainTransition::NoChange
     ));
 
     // Drain in any non-null phase blocks uncordon — operators must use
     // `:undrain`, which clears the phase and uncordons atomically.
     for phase in [PHASE_DRAINING, PHASE_DRAINED, PHASE_TERMINATING] {
-        let err = validate_drain_transition(Some(phase), DrainAction::Uncordon).unwrap_err();
+        let err = phase_only(Some(phase), DrainAction::Uncordon).unwrap_err();
         assert!(matches!(err, TransitionError::Conflict { .. }));
     }
 }
 
-/// Persisted column value derived from the operator-supplied body.
-/// Mirrors the inline `!drain_request.replace_after_terminate` in
-/// `apply_drain_action`; the helper is duplicated in the test so a
-/// future refactor that splits the computation out has a fixed
-/// reference point for the bool inversion.
-fn persisted_decrement_capacity(req: &DrainRequest) -> bool {
-    !req.replace_after_terminate
-}
-
+/// An omitted `replace_after_terminate` is `None`, not `Some(true)`, and
+/// resolves to the auto-replace default only on the edge that starts a drain.
+///
+/// The distinction is load-bearing on the escalation edge, where `None` means
+/// "leave the in-flight drain's intent alone" — so a test that only checked the
+/// resolved bool would pass while the escalation reverted a blue-green shrink.
 #[test]
-fn drain_with_default_body_persists_decrement_capacity_false() {
-    let req = parse_drain_request(&[]).unwrap();
-    assert!(req.replace_after_terminate);
-    assert!(!persisted_decrement_capacity(&req));
-}
-
-#[test]
-fn drain_with_empty_json_object_persists_decrement_capacity_false() {
-    let req = parse_drain_request(b"{}").unwrap();
-    assert!(req.replace_after_terminate);
-    assert!(!persisted_decrement_capacity(&req));
+fn an_omitted_replace_after_terminate_is_unexpressed_and_defaults_to_replace() {
+    for body in [&b""[..], b"{}"] {
+        let req = parse_drain_request(body).unwrap();
+        // This pins the parse only. That an omitted field *resolves* to
+        // auto-replace is a separate, independently-breakable property — flipping
+        // `unwrap_or(true)` leaves this assertion green — and lives with the type
+        // in
+        // `types::admin::tests::an_unexpressed_replace_after_terminate_resolves_to_auto_replace`.
+        assert_eq!(
+            req.replace_after_terminate, None,
+            "{body:?}: an omitted field must stay distinguishable from an explicit true"
+        );
+    }
 }
 
 /// A bodiless `:drain` — what `space-admin-cli drain-node <node>` and a bare `curl -X
@@ -391,14 +500,18 @@ fn drain_with_unknown_mode_value_rejects_as_bad_request() {
 #[test]
 fn drain_with_replace_after_terminate_false_persists_decrement_capacity_true() {
     let req = parse_drain_request(br#"{"replace_after_terminate": false}"#).unwrap();
-    assert!(!req.replace_after_terminate);
+    assert_eq!(req.replace_after_terminate, Some(false));
     assert!(persisted_decrement_capacity(&req));
 }
 
 #[test]
 fn drain_with_explicit_replace_after_terminate_true_persists_decrement_capacity_false() {
     let req = parse_drain_request(br#"{"replace_after_terminate": true}"#).unwrap();
-    assert!(req.replace_after_terminate);
+    assert_eq!(
+        req.replace_after_terminate,
+        Some(true),
+        "an explicit true must be distinguishable from an omitted field"
+    );
     assert!(!persisted_decrement_capacity(&req));
 }
 
@@ -958,6 +1071,494 @@ fn terminate_is_blocked_by_either_half_of_occupancy() {
     }
 }
 
+/// The 502 body's `reconciler_will_retry` must be true only for the phases the
+/// reconciler's work lists actually scan.
+///
+/// The operator-visible property: a 502 that says a retry is coming is an
+/// instruction to wait. On a `drained` node nothing is coming — no reconciler
+/// re-cordons it — so waiting leaves the node schedulable until the drained-node
+/// terminator destroys it, and any sandbox placed in that window dies with the
+/// instance. `:cordon` is exactly the call an operator makes to fence such a
+/// node, so this is the reading most likely to be trusted.
+///
+/// Asserted over every phase rather than just `drained`, because the failure is
+/// a predicate that answers "is a phase set?" instead of "which phase?" — and
+/// that predicate is right for two of the four inputs.
+#[test]
+fn only_draining_and_terminating_promise_an_automatic_cordon_retry() {
+    assert!(reconciler_reasserts_cordon(
+        Some(PHASE_DRAINING),
+        NodeManagedBy::Kubernetes
+    ));
+    assert!(reconciler_reasserts_cordon(
+        Some(PHASE_TERMINATING),
+        NodeManagedBy::Kubernetes
+    ));
+    assert!(
+        !reconciler_reasserts_cordon(Some(PHASE_DRAINED), NodeManagedBy::Kubernetes),
+        "no reconciler re-cordons a drained node; promising a retry parks it \
+         schedulable until the terminator destroys it"
+    );
+    assert!(
+        !reconciler_reasserts_cordon(None, NodeManagedBy::Kubernetes),
+        "an undrained node is out of the reconciler's scope entirely"
+    );
+
+    // `managed_by` is the second conjunct of both work lists, and the case where
+    // getting it wrong is worst: a `space`-managed node has no `node_k8s` row, so
+    // `converge_substrate_schedulability` fails it on *every* `:drain`. Answering
+    // "a retry is coming" there is the one reading that is always wrong.
+    for phase in [Some(PHASE_DRAINING), Some(PHASE_TERMINATING)] {
+        assert!(
+            !reconciler_reasserts_cordon(phase, NodeManagedBy::Space),
+            "{phase:?}: a direct-managed node is in neither work list"
+        );
+    }
+}
+
+/// A fresh `:drain --forced` still takes the drain-starting edge, so it still
+/// persists the request's `replace_after_terminate`.
+///
+/// `set_started_at: true` is the sole selector for writing
+/// `terminate_decrement_capacity`, and the mode does not participate in choosing
+/// that edge. Without this, a refactor that made the `NULL` arm mode-dependent
+/// would pass the rest of the suite while silently dropping
+/// `--no-replace-after-terminate` on every forced first drain of a blue-green
+/// shrink — a source MNG that never shrinks, discovered hours later.
+#[test]
+fn a_fresh_forced_drain_still_starts_the_clock() {
+    for requested in [NodeDrainMode::Gentle, NodeDrainMode::Forced] {
+        assert_eq!(
+            drain(None, NodeDrainMode::Gentle, requested).unwrap(),
+            DrainTransition::Move {
+                new: Some(PHASE_DRAINING),
+                set_started_at: true,
+                clear_started_at: false,
+            },
+            "{requested:?}: a fresh drain must start the clock whatever mode it asks for"
+        );
+    }
+}
+
+/// A `:drain` against a drain already in flight may not change that drain's
+/// replacement intent — but only an *expressed* disagreement is a conflict.
+///
+/// The column is the inverse of the request field, which is the whole reason
+/// this is a named function: `terminate_decrement_capacity = true` means the ASG
+/// terminate decrements desired capacity, i.e. `replace_after_terminate = false`.
+/// An off-by-one-inversion here refuses exactly the requests it should accept.
+#[test]
+fn only_an_expressed_disagreement_conflicts_with_the_drain_in_flight() {
+    // Stored `decrement = true` is a monotonic shrink, i.e. replace = false.
+    assert_eq!(
+        in_flight_replace_conflict(Some(true), true),
+        Some(ReplaceConflict {
+            stored_replace: false,
+            requested_replace: true,
+        })
+    );
+    assert_eq!(in_flight_replace_conflict(Some(false), true), None);
+    // Stored `decrement = false` is the auto-replace default, i.e. replace = true.
+    assert_eq!(
+        in_flight_replace_conflict(Some(false), false),
+        Some(ReplaceConflict {
+            stored_replace: true,
+            requested_replace: false,
+        })
+    );
+    assert_eq!(in_flight_replace_conflict(Some(true), false), None);
+    // Unexpressed is never a conflict, whatever is stored — this is what keeps a
+    // bodiless repeat and a `space-cli` that omits the flag on the 200 path.
+    for stored in [true, false] {
+        assert_eq!(
+            in_flight_replace_conflict(None, stored),
+            None,
+            "stored={stored}: an unexpressed intent must not be refused"
+        );
+    }
+}
+
+/// The two recovery hints the 502 body and the `drain_last_error` write read are
+/// different questions, and each consumer has to read its own.
+///
+/// Asserted as a pair per transition because each flag alone is a one-line
+/// `matches!` that looks obviously right; it is their *disagreement* that
+/// carries the meaning, and a pair is the smallest thing that can pin it.
+///
+/// What this test cannot reach is which consumer reads which flag — it calls
+/// `recovery_hints` directly, so a swap at the call site leaves it green while
+/// reintroducing both regressions the split exists to fix (`:cordon` on a
+/// draining node under-promising a retry the reconciler is already performing,
+/// and `:undrain` over-promising one that nothing will ever perform). That is
+/// what the named `RecoveryHints` fields make unrepresentable, and what
+/// `drain_handler_tests` covers by driving the handler.
+#[test]
+fn the_two_recovery_hints_disagree_exactly_where_they_should() {
+    let start = DrainTransition::Move {
+        new: Some(PHASE_DRAINING),
+        set_started_at: true,
+        clear_started_at: false,
+    };
+    let undrain = DrainTransition::Move {
+        new: None,
+        set_started_at: false,
+        clear_started_at: true,
+    };
+    let in_flight = DrainTransition::UpdateInFlightDrain(Some(NodeDrainMode::Forced));
+
+    // (wrote the drain columns, reconciler will re-assert cordon)
+    assert_eq!(
+        recovery_hints(&start, Some(PHASE_DRAINING), NodeManagedBy::Kubernetes),
+        RecoveryHints {
+            drain_columns_written: true,
+            reconciler_will_reassert: true,
+        }
+    );
+    assert_eq!(
+        recovery_hints(&in_flight, Some(PHASE_DRAINING), NodeManagedBy::Kubernetes),
+        RecoveryHints {
+            drain_columns_written: true,
+            reconciler_will_reassert: true,
+        }
+    );
+    // `:undrain` wrote, and is the case where the two must differ: the phase is
+    // gone, so nothing re-asserts, but the error is still worth recording.
+    assert_eq!(
+        recovery_hints(&undrain, None, NodeManagedBy::Kubernetes),
+        RecoveryHints {
+            drain_columns_written: true,
+            reconciler_will_reassert: false,
+        }
+    );
+    // `:cordon` on a draining node wrote nothing, and is the other case where
+    // they must differ: no trace to record, but the reconciler does re-cordon.
+    assert_eq!(
+        recovery_hints(
+            &DrainTransition::NoChange,
+            Some(PHASE_DRAINING),
+            NodeManagedBy::Kubernetes
+        ),
+        RecoveryHints {
+            drain_columns_written: false,
+            reconciler_will_reassert: true,
+        }
+    );
+    // `:cordon` on a terminating node is the same disagreement as draining —
+    // covered because the terminating handler is a second, independently
+    // deletable caller of `ensure_cordon`.
+    assert_eq!(
+        recovery_hints(
+            &DrainTransition::NoChange,
+            Some(PHASE_TERMINATING),
+            NodeManagedBy::Kubernetes
+        ),
+        RecoveryHints {
+            drain_columns_written: false,
+            reconciler_will_reassert: true,
+        }
+    );
+    // `:cordon` on a drained node: neither. The one phase nothing scans.
+    assert_eq!(
+        recovery_hints(
+            &DrainTransition::NoChange,
+            Some(PHASE_DRAINED),
+            NodeManagedBy::Kubernetes
+        ),
+        RecoveryHints {
+            drain_columns_written: false,
+            reconciler_will_reassert: false,
+        }
+    );
+}
+
+/// The replace-conflict 409 is a sentence an operator reads in a terminal, so it
+/// has to be one — no run of collapsed indentation from a hand-wrapped literal,
+/// and it has to name both values and the way out.
+///
+/// Asserted because the first draft of this message shipped with two 22-space
+/// runs. That was unreachable by any test while the literal was inline in the
+/// handler, which is the argument for the extraction more than for this test.
+#[test]
+fn the_replace_conflict_message_reads_as_one_sentence() {
+    for (stored, requested) in [(false, true), (true, false)] {
+        let message = replace_conflict_message(stored, requested);
+        assert!(!message.contains("  "), "no double spaces; got {message:?}");
+        assert!(!message.contains('\n'), "single line; got {message:?}");
+        assert!(
+            message.contains(&format!("replace_after_terminate={stored}")),
+            "must name the stored value; got {message:?}"
+        );
+        assert!(
+            message.contains(&format!("asked for {requested}")),
+            "must name the requested value; got {message:?}"
+        );
+        // The remedy, not just the refusal — this is the only place an operator
+        // learns that changing the terms means restarting the drain.
+        assert!(
+            message.contains(":undrain"),
+            "must name the way out; got {message:?}"
+        );
+    }
+}
+
+/// The column and the request field are inverses, and this is the only place
+/// that inversion happens — so it is the only thing standing between
+/// `--no-replace-after-terminate` and a blue-green shrink that never shrinks.
+///
+/// Asserted against the production function rather than a restatement of it.
+/// The predecessor of this test restated `!or_default()` in a local helper and
+/// therefore asserted its own copy: deleting the `!` from `apply_drain_action`
+/// failed nothing in the crate.
+#[test]
+fn the_persisted_decrement_capacity_inverts_the_request_field() {
+    let shrink = DrainRequest {
+        replace_after_terminate: Some(false),
+        ..DrainRequest::default()
+    };
+    assert!(
+        persisted_decrement_capacity(&shrink),
+        "replace_after_terminate=false must persist decrement=true, or the ASG \
+         replaces every instance a monotonic shrink terminates"
+    );
+
+    let replace = DrainRequest {
+        replace_after_terminate: Some(true),
+        ..DrainRequest::default()
+    };
+    assert!(!persisted_decrement_capacity(&replace));
+
+    // An omitted field resolves to auto-replace on this edge, so it persists the
+    // same column value as an explicit `true` — the single-node-drain default.
+    assert!(!persisted_decrement_capacity(&DrainRequest::default()));
+}
+
+/// Only the edge that *starts* a drain may persist a replacement intent.
+///
+/// This is the sole guard on the sole writer of
+/// `nodes.terminate_decrement_capacity`. Widening it to any `Move` is silent:
+/// `:terminate` would write the default `false` over a shrink's `true` at the
+/// moment the terminator reads it, with no error and a normal-looking audit
+/// entry. Asserted over every transition rather than just the two `:drain`
+/// edges, because the failure is a guard that admits one transition too many.
+#[test]
+fn only_the_drain_starting_edge_persists_a_replacement_intent() {
+    let start = DrainTransition::Move {
+        new: Some(PHASE_DRAINING),
+        set_started_at: true,
+        clear_started_at: false,
+    };
+    assert!(transition_starts_a_drain(&start));
+
+    let terminate = DrainTransition::Move {
+        new: Some(PHASE_TERMINATING),
+        set_started_at: false,
+        clear_started_at: false,
+    };
+    assert!(
+        !transition_starts_a_drain(&terminate),
+        ":terminate must not rewrite the initiating drain's replacement intent"
+    );
+
+    let undrain = DrainTransition::Move {
+        new: None,
+        set_started_at: false,
+        clear_started_at: true,
+    };
+    assert!(!transition_starts_a_drain(&undrain));
+
+    for mode in [None, Some(NodeDrainMode::Forced)] {
+        assert!(
+            !transition_starts_a_drain(&DrainTransition::UpdateInFlightDrain(mode)),
+            "{mode:?}: a drain in flight keeps the intent it started with"
+        );
+    }
+    assert!(!transition_starts_a_drain(&DrainTransition::NoChange));
+}
+
+/// The phase a transition leaves behind, which both the audit's `to_phase` and
+/// the 502's retry promise read.
+///
+/// `UpdateInFlightDrain` is the case worth asserting: it re-asserts `draining`,
+/// and returning `None` there — mirroring `:undrain`, or copying `NoChange`'s
+/// pass-through — would tell an operator whose cordon patch failed that no retry
+/// is coming, on the one edge where the reconciler re-cordons every tick.
+#[test]
+fn the_phase_after_a_transition_is_the_phase_the_row_holds() {
+    for mode in [None, Some(NodeDrainMode::Forced)] {
+        assert_eq!(
+            phase_after(
+                &DrainTransition::UpdateInFlightDrain(mode),
+                Some(PHASE_DRAINING)
+            ),
+            Some(PHASE_DRAINING),
+            "{mode:?}: the in-flight edge leaves the node draining"
+        );
+    }
+
+    assert_eq!(
+        phase_after(
+            &DrainTransition::Move {
+                new: Some(PHASE_DRAINING),
+                set_started_at: true,
+                clear_started_at: false,
+            },
+            None
+        ),
+        Some(PHASE_DRAINING)
+    );
+    assert_eq!(
+        phase_after(
+            &DrainTransition::Move {
+                new: None,
+                set_started_at: false,
+                clear_started_at: true,
+            },
+            Some(PHASE_DRAINING)
+        ),
+        None,
+        ":undrain leaves no phase"
+    );
+
+    // Cordon-only paths echo whatever the row held.
+    for phase in [PHASE_DRAINING, PHASE_DRAINED, PHASE_TERMINATING] {
+        assert_eq!(
+            phase_after(&DrainTransition::NoChange, Some(phase)),
+            Some(phase)
+        );
+    }
+    assert_eq!(phase_after(&DrainTransition::NoChange, None), None);
+    assert_eq!(
+        phase_after(&DrainTransition::NoChange, Some("some_newer_phase")),
+        None,
+        "a phase this build cannot place in a work list must not be echoed as \
+         one it can"
+    );
+}
+
+/// `from_drain_mode` may only appear on an entry whose action moves the drain,
+/// and only when there is a drain to have a mode.
+///
+/// Both guards were mutation-silent while this was inline in the handler, which
+/// had no test at the time; `drain_handler_tests` now covers that layer too. The
+/// phase guard is the one with teeth: without it every `:drain` that *starts* a
+/// drain audits `from_drain_mode: gentle`, reporting a prior mode the row never
+/// held.
+#[test]
+fn the_audited_from_mode_needs_both_a_moving_action_and_a_drain() {
+    // A drain in progress, on each action that moves the state machine.
+    for action in [
+        DrainAction::Drain,
+        DrainAction::Terminate,
+        DrainAction::Undrain,
+    ] {
+        assert_eq!(
+            audited_mode_in_progress(action, Some(PHASE_DRAINING), NodeDrainMode::Forced),
+            Some(NodeDrainMode::Forced),
+            "{action:?} moves the drain, so the from-mode is real"
+        );
+        assert_eq!(
+            audited_mode_in_progress(action, None, NodeDrainMode::Gentle),
+            None,
+            "{action:?} on a node with no drain has no from-mode to report"
+        );
+    }
+
+    // Actions that cannot move the drain never carry one, whatever the phase.
+    for action in [
+        DrainAction::Cordon,
+        DrainAction::Uncordon,
+        DrainAction::ForceUploadLocalSnapshots,
+    ] {
+        assert_eq!(
+            audited_mode_in_progress(action, Some(PHASE_DRAINING), NodeDrainMode::Forced),
+            None,
+            "{action:?} transitions nothing, so a from-mode would invent one"
+        );
+    }
+}
+
+/// Only `:drain` carries a mode to write, and `:terminate` is the case with
+/// teeth.
+///
+/// `:terminate` is a `Move` with both stamp flags false, so a mode supplied here
+/// reaches `COALESCE($6, drain_mode)` and overwrites a forced drain's `'forced'`
+/// at the `drained → terminating` edge — leaving a node one step from ASG
+/// termination presenting as gentle, with the user-API gates reopened against
+/// whatever is still attached to it.
+#[test]
+fn only_drain_supplies_a_mode_to_write() {
+    let forced = DrainRequest {
+        mode: NodeDrainMode::Forced,
+        ..DrainRequest::default()
+    };
+    assert_eq!(
+        requested_mode_for(DrainAction::Drain, &forced),
+        Some(NodeDrainMode::Forced)
+    );
+    assert_eq!(
+        requested_mode_for(DrainAction::Drain, &DrainRequest::default()),
+        Some(NodeDrainMode::Gentle),
+        "a bodiless :drain still carries a mode — gentle, per the column policy"
+    );
+
+    // Every other action arrives with a `DrainRequest` it never sent, so its
+    // `mode` field is a default nobody chose.
+    for action in [
+        DrainAction::Terminate,
+        DrainAction::Undrain,
+        DrainAction::Cordon,
+        DrainAction::Uncordon,
+        DrainAction::ForceUploadLocalSnapshots,
+    ] {
+        assert_eq!(
+            requested_mode_for(action, &forced),
+            None,
+            "{action:?} must not write a mode, whatever the defaulted body says"
+        );
+    }
+}
+
+/// The replacement-intent conflict check runs on the in-flight edge only.
+///
+/// Running it on the drain-starting edge would refuse fresh drains:
+/// `terminate_decrement_capacity` is `NOT NULL` and is never cleared, not even
+/// by `:undrain`, so a node drained bodiless and then undrained still carries
+/// the previous drain's value — and a re-drain with
+/// `--no-replace-after-terminate` would compute a disagreement against a drain
+/// that does not exist. A blue-green wave would refuse to start on exactly the
+/// nodes a previous wave had touched.
+#[test]
+fn the_replacement_intent_check_runs_only_for_a_drain_in_flight() {
+    for mode in [None, Some(NodeDrainMode::Forced)] {
+        assert!(checks_replacement_intent_conflict(
+            &DrainTransition::UpdateInFlightDrain(mode)
+        ));
+    }
+    for transition in [
+        DrainTransition::Move {
+            new: Some(PHASE_DRAINING),
+            set_started_at: true,
+            clear_started_at: false,
+        },
+        DrainTransition::Move {
+            new: Some(PHASE_TERMINATING),
+            set_started_at: false,
+            clear_started_at: false,
+        },
+        DrainTransition::Move {
+            new: None,
+            set_started_at: false,
+            clear_started_at: true,
+        },
+        DrainTransition::NoChange,
+    ] {
+        assert!(
+            !checks_replacement_intent_conflict(&transition),
+            "{transition:?}: no drain in flight to disagree with"
+        );
+    }
+}
+
 #[tokio::test]
 async fn fleet_http_inventory_preserves_legacy_counts_and_explicit_opt_out() -> TestResult<()> {
     let Some(db) = try_pg_test_db().await? else {
@@ -1256,7 +1857,7 @@ async fn node_sandbox_pages_are_scoped_deduplicated_and_complete() -> TestResult
 /// `AppState::from_pool` picks its substrate from the process environment, so
 /// the schedulability tests pin it to Direct and swap a Kubernetes substrate
 /// in where they need one. Returns false in the parent process.
-fn enter_direct_test_process() -> bool {
+pub(super) fn enter_direct_test_process() -> bool {
     pplx_space_test_env::enter_test_process(&[(
         "SPACE_K8S_CONTROL_PLANE",
         Some(std::ffi::OsStr::new("false")),

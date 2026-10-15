@@ -176,18 +176,9 @@ struct FakeSink {
     /// values both resolve to gentle. Tests that want the evacuating path call
     /// [`FakeSink::set_forced`].
     draining_modes: StdMutex<HashMap<NodeId, NodeDrainMode>>,
-    /// Nodes whose `drain_started_at` the test declares to be older than the
-    /// escalation deadline. `escalate_stale_gentle_drains` escalates the
-    /// intersection of this set with the candidates it is handed — matching
-    /// production, where the age lives in SQL and the gentle classification is
-    /// the caller's. Pair with [`FakeSink::set_gentle`] to make a node a
-    /// candidate, or [`FakeSink::set_draining_list_forced`] to keep it out.
-    escalation_due: StdMutex<Vec<NodeId>>,
-    escalate_calls: StdMutex<Vec<(Vec<NodeId>, PositiveDuration)>>,
     /// `(node, exclude_legacy_rows)` per pinned-list call, so a test can pin that
     /// gentle drains refuse the legacy reupload route.
     pinned_legacy_exclusions: StdMutex<Vec<(NodeId, bool)>>,
-    fail_escalate: StdMutex<Option<String>>,
     terminating_list: StdMutex<Vec<NodeId>>,
     node_state: StdMutex<HashMap<NodeId, String>>,
 
@@ -427,17 +418,8 @@ impl FakeSink {
             .unwrap_or(NodeDrainMode::Gentle)
     }
 
-    /// Declare that `node`'s drain is older than the escalation deadline.
-    fn set_escalation_due(&self, node: NodeId) {
-        self.escalation_due.lock().unwrap().push(node);
-    }
-
     fn pinned_legacy_exclusions(&self) -> Vec<(NodeId, bool)> {
         self.pinned_legacy_exclusions.lock().unwrap().clone()
-    }
-
-    fn escalate_calls(&self) -> Vec<(Vec<NodeId>, PositiveDuration)> {
-        self.escalate_calls.lock().unwrap().clone()
     }
 
     fn set_terminating_list(&self, nodes: Vec<NodeId>) {
@@ -820,35 +802,6 @@ impl NodeDrainSink for FakeSink {
                 mode: self.mode_of(id),
             })
             .collect())
-    }
-
-    async fn escalate_stale_gentle_drains(
-        &self,
-        candidates: &[NodeId],
-        age: PositiveDuration,
-    ) -> Result<Vec<NodeId>, sqlx::Error> {
-        self.escalate_calls
-            .lock()
-            .unwrap()
-            .push((candidates.to_vec(), age));
-        if let Some(msg) = self.fail_escalate.lock().unwrap().take() {
-            return Err(forced_db_err(&msg));
-        }
-        // Production narrows by age in SQL and by mode in the caller, so the fake
-        // escalates exactly the intersection: a candidate the test declared past
-        // its deadline. It deliberately does not re-check the mode — that is the
-        // caller's responsibility, and asserting on `candidates` is how the tests
-        // pin that the caller only ever passes gentle nodes.
-        let due = self.escalation_due.lock().unwrap().clone();
-        let mut modes = self.draining_modes.lock().unwrap();
-        let mut escalated = Vec::new();
-        for node in candidates {
-            if due.contains(node) {
-                modes.insert(*node, NodeDrainMode::Forced);
-                escalated.push(*node);
-            }
-        }
-        Ok(escalated)
     }
 
     async fn list_terminating_nodes(&self) -> Result<Vec<NodeId>, sqlx::Error> {
@@ -1488,10 +1441,6 @@ fn config_enabled(max_per_node: usize, max_per_cluster: usize) -> ReconcilerConf
             DEFAULT_RESTORE_BACKOFF_CAP_SECS,
         )),
         drain_evacuation_placement: None,
-        // Real default: escalation off, so a test that puts a node in gentle
-        // mode observes the gentle behavior rather than an escalation racing
-        // it. The escalation tests set this explicitly.
-        gentle_escalate: None,
     }
 }
 
@@ -1644,13 +1593,6 @@ struct ArcSink(Arc<FakeSink>);
 impl NodeDrainSink for ArcSink {
     async fn list_draining_nodes(&self) -> Result<Vec<DrainingNode>, sqlx::Error> {
         self.0.list_draining_nodes().await
-    }
-    async fn escalate_stale_gentle_drains(
-        &self,
-        candidates: &[NodeId],
-        age: PositiveDuration,
-    ) -> Result<Vec<NodeId>, sqlx::Error> {
-        self.0.escalate_stale_gentle_drains(candidates, age).await
     }
     async fn list_terminating_nodes(&self) -> Result<Vec<NodeId>, sqlx::Error> {
         self.0.list_terminating_nodes().await
@@ -2653,138 +2595,6 @@ async fn gm3_gentle_mode_drains_once_residents_leave_on_their_own() {
     assert!(reconciler.sink.evacuated_ids().is_empty());
 }
 
-/// Escalation off (the default) means a gentle drain waits indefinitely and
-/// the escalation query is never even issued.
-#[tokio::test]
-async fn gm4_escalation_disabled_never_queries_or_evacuates() {
-    let node = NodeId::new();
-    let sandbox = SandboxId::new();
-    let sink = FakeSink::new();
-    sink.set_initial_state(node, PHASE_DRAINING);
-    sink.set_draining_list(vec![node]);
-    sink.set_gentle(node);
-    sink.set_escalation_due(node);
-    sink.enqueue_resident(node, vec![sandbox]);
-    sink.enqueue_resident(node, vec![sandbox]);
-
-    let cfg = ReconcilerConfig {
-        gentle_escalate: None,
-        ..config_enabled(4, 8)
-    };
-    let reconciler = Reconciler::new(cfg, sink, FakeTerminator::default());
-    for _ in 0..2 {
-        let report = reconciler.tick().await;
-        assert_eq!(report.gentle_escalations, 0);
-        assert_eq!(report.spawned_evacuations, 0);
-    }
-    assert!(
-        reconciler.sink.escalate_calls().is_empty(),
-        "`gentle_escalate = None` must not issue the escalation UPDATE at all"
-    );
-}
-
-/// With a deadline configured, a gentle drain past it is rewritten to forced
-/// and evacuates **on the same tick** — the escalation runs before the
-/// draining-node listing precisely so the node does not idle one more tick in
-/// a mode it has already left.
-#[tokio::test]
-async fn gm5_escalation_switches_to_forced_and_evacuates_same_tick() {
-    let node = NodeId::new();
-    let sandbox = SandboxId::new();
-    let sink = FakeSink::new();
-    sink.set_initial_state(node, PHASE_DRAINING);
-    sink.set_draining_list(vec![node]);
-    sink.set_gentle(node);
-    sink.set_escalation_due(node);
-    sink.enqueue_resident(node, vec![sandbox]);
-
-    let age = PositiveDuration::new_panic(Duration::from_secs(3600));
-    let cfg = ReconcilerConfig {
-        gentle_escalate: Some(age),
-        ..config_enabled(4, 8)
-    };
-    let reconciler = Reconciler::new(cfg, sink, FakeTerminator::default());
-    let report = reconciler.tick().await;
-
-    // The candidate set is the load-bearing half now: the SQL escalates whatever
-    // it is handed, so "only gentle nodes get escalated" is a property of what
-    // the caller passes, not of the statement's WHERE clause.
-    assert_eq!(reconciler.sink.escalate_calls(), vec![(vec![node], age)]);
-    assert_eq!(report.gentle_escalations, 1);
-    assert_eq!(
-        report.gentle_nodes, 0,
-        "the escalated node must be handled as forced on this tick"
-    );
-    assert_eq!(report.spawned_evacuations, 1);
-    // The spawn is a task, so wait for it to land before reading what it
-    // recorded — `spawned_evacuations` counts the spawn, not the RPC.
-    wait_in_flight_empty(&reconciler).await;
-    assert_eq!(reconciler.sink.evacuated_ids(), vec![sandbox]);
-}
-
-/// Escalation is idempotent per drain: the second tick sees the node already
-/// forced, so it is not counted (or alerted on) again. Mirrors the production
-/// SQL's `drain_mode = 'gentle'` guard.
-#[tokio::test]
-async fn gm6_escalation_counts_once_per_drain() {
-    let node = NodeId::new();
-    let sink = FakeSink::new();
-    sink.set_initial_state(node, PHASE_DRAINING);
-    sink.set_draining_list(vec![node]);
-    sink.set_gentle(node);
-    sink.set_escalation_due(node);
-    sink.enqueue_resident(node, Vec::new());
-
-    let cfg = ReconcilerConfig {
-        gentle_escalate: PositiveDuration::new(Duration::from_secs(60)),
-        ..config_enabled(4, 8)
-    };
-    let reconciler = Reconciler::new(cfg, sink, FakeTerminator::default());
-    assert_eq!(reconciler.tick().await.gentle_escalations, 1);
-    reconciler.sink.set_draining_list(vec![node]);
-    assert_eq!(reconciler.tick().await.gentle_escalations, 0);
-    // Second tick: the node is `forced` now, so the caller must not offer it as
-    // a candidate at all. That — not a SQL guard — is what keeps
-    // `node_drain.gentle_escalations` one-per-drain.
-    let calls = reconciler.sink.escalate_calls();
-    assert_eq!(
-        calls.len(),
-        1,
-        "no candidates on the second tick, so no call"
-    );
-    assert_eq!(calls[0].0, vec![node]);
-}
-
-/// A failed escalation query must not stop the tick: the draining nodes are
-/// still handled (in their current, un-escalated mode) and the next tick
-/// retries. Same fail-soft shape as every other per-tick query here.
-#[tokio::test]
-async fn gm7_escalation_query_failure_still_handles_draining_nodes() {
-    let node = NodeId::new();
-    let sink = FakeSink::new();
-    sink.set_initial_state(node, PHASE_DRAINING);
-    sink.set_draining_list(vec![node]);
-    sink.set_gentle(node);
-    sink.set_escalation_due(node);
-    sink.enqueue_resident(node, Vec::new());
-    *sink.fail_escalate.lock().unwrap() = Some("escalate boom".to_string());
-
-    let cfg = ReconcilerConfig {
-        gentle_escalate: PositiveDuration::new(Duration::from_secs(60)),
-        ..config_enabled(4, 8)
-    };
-    let reconciler = Reconciler::new(cfg, sink, FakeTerminator::default());
-    let report = reconciler.tick().await;
-
-    assert_eq!(report.gentle_escalations, 0);
-    assert_eq!(report.draining_nodes, 1);
-    assert_eq!(
-        report.drained_transitions, 1,
-        "the node had no residents, so it still converges despite the failed escalation"
-    );
-    assert_eq!(reconciler.sink.mode_of(node), NodeDrainMode::Gentle);
-}
-
 /// A gentle drain must not hand the legacy (no-artifact-id) reupload route any
 /// work.
 ///
@@ -2866,8 +2676,8 @@ async fn gm12_a_gentle_node_held_by_an_invisible_blocker_reports_it() {
 /// migrating every resident, so the user has accepted disruption. Under a gentle
 /// drain it contradicts the contract, which is to cordon and wait without
 /// touching residents. So the sweep is forced-only, and the node parks instead:
-/// visible via `node_drain.drain_blockers`, and convergeable via the escalation
-/// deadline if an operator wants it.
+/// visible via `node_drain.drain_blockers`, and convergeable as soon as an
+/// operator escalates the drain with `:drain --forced`.
 #[tokio::test]
 async fn gm13_gentle_mode_never_abandons_an_aged_transient() {
     let node = NodeId::new();
