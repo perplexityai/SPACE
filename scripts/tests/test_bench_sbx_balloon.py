@@ -430,6 +430,17 @@ def _fake_space_api(root: pathlib.Path):
     import uuid
 
     run, cache, guest = root / "run", root / "cache", root / "guest"
+    # Only run the harness's own guest scripts with integer arguments, rebuilt from
+    # constants, so the fake never executes request-supplied text.
+    known = {script: script for script in (bench.GUEST_SETUP, bench.GUEST_VERIFY, bench.GUEST_ANON_HOLDER, *bench.GUEST_WORKLOADS.values())}
+
+    def trusted_argv(argv):
+        assert argv[:2] == ["sh", "-c"] and argv[3] == "space-bench", argv[:2]
+        rebuilt = ["sh", "-c", known[argv[2]], "space-bench"]
+        for arg in argv[4:]:
+            rebuilt.append(known[arg] if arg in known else str(int(arg)))
+        return rebuilt
+
     states: dict[str, str] = {}
     sessions: dict[str, tuple[int, bytes]] = {}
     seen_tokens: set[str] = set()
@@ -482,7 +493,7 @@ def _fake_space_api(root: pathlib.Path):
             assert m, path
             sid, action = m.groups()
             if action == "/commands":
-                argv = self.body()["command"]
+                argv = trusted_argv(self.body()["command"])
                 log = root / f"cmd-{uuid.uuid4()}.log"
                 with log.open("wb") as out:
                     code = subprocess.run(argv, check=False, stdout=out, stderr=subprocess.STDOUT, env=dict(os.environ, SBX_BENCH_GUEST_ROOT=str(guest / sid))).returncode
