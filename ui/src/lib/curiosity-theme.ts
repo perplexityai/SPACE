@@ -3,20 +3,21 @@ import type { ThemeConfig } from 'antd';
 
 type Tokens = NonNullable<ThemeConfig['token']>;
 
+// Curiosity uses a subtly bluer accent with cooler neutral surfaces.
 const palettes = {
   light: {
-    page: '#fbfbfb', surface: '#ffffff', sidebar: '#e9eded', text: '#0b2833',
-    accent: '#016a71', accentHover: '#0c4f54', accentActive: '#0f3639',
+    page: '#f8fafb', surface: '#fdfefe', sidebar: '#e8edf0', text: '#172b39',
+    accent: '#1e6681', accentHover: '#194c5f', accentActive: '#153441',
     success: '#016b1d', warning: '#97431a', error: '#a23544',
     blue: '#006495', purple: '#7a3abb', indigo: '#3053b3', gold: '#825503',
-    fill: '#1c1c1c', mutedOpacity: 0.75, borderOpacity: 0.15, fillOpacity: 0.035,
+    fill: '#1d2530', mutedOpacity: 0.75, borderOpacity: 0.15, fillOpacity: 0.035,
   },
   dark: {
-    page: '#161616', surface: '#1d1d1d', sidebar: '#111111', text: '#dedede',
-    accent: '#4e99a3', accentHover: '#22808c', accentActive: '#1a636c',
+    page: '#151719', surface: '#1c1e21', sidebar: '#101214', text: '#dde0e3',
+    accent: '#5a94b2', accentHover: '#377b9c', accentActive: '#2a5f79',
     success: '#539e55', warning: '#d57141', error: '#dc6973',
     blue: '#5691c7', purple: '#a96ee0', indigo: '#7989e7', gold: '#bc811e',
-    fill: '#dedede', mutedOpacity: 0.65, borderOpacity: 0.14, fillOpacity: 0.03,
+    fill: '#dde0e3', mutedOpacity: 0.65, borderOpacity: 0.14, fillOpacity: 0.03,
   },
 } as const;
 
@@ -37,6 +38,7 @@ function composite(background: string, foreground: string, opacity: number) {
 
 export interface CuriosityAppearance {
   config: ThemeConfig;
+  buttonClassName: string;
   primaryColor: string;
   surfaces: { page: string; sidebar: string; sidebarBorder: string };
 }
@@ -77,7 +79,7 @@ export function createCuriosityTheme({
     colorTextSecondary: translucent(palette.text, palette.mutedOpacity),
     colorTextTertiary: translucent(palette.text, 0.5),
     colorTextDisabled: translucent(palette.text, 0.2),
-    colorTextPlaceholder: translucent(palette.text, 0.5),
+    colorTextPlaceholder: translucent(palette.text, palette.mutedOpacity),
     colorTextLightSolid: palette.page,
     colorBorder: border,
     colorBorderSecondary: divider,
@@ -89,7 +91,7 @@ export function createCuriosityTheme({
     colorBgContainerDisabled: fill,
     colorBgTextHover: fill,
     colorBgTextActive: strongerFill,
-    colorBgMask: isDark ? translucent(palette.page, 0.7) : 'rgba(212, 212, 212, 0.7)',
+    colorBgMask: isDark ? translucent(palette.page, 0.7) : 'rgba(211, 216, 222, 0.7)',
     colorPrimary: palette.accent,
     colorPrimaryHover: palette.accentHover,
     colorPrimaryActive: palette.accentActive,
@@ -158,6 +160,7 @@ export function createCuriosityTheme({
   const selectedBackground = token.colorPrimaryBg!;
   return {
     primaryColor: primary,
+    buttonClassName: isDark && !override ? 'curiosity-dark-primary' : '',
     surfaces: { page: palette.page, sidebar: palette.sidebar, sidebarBorder: border },
     config: {
       // Derive dimensions and defaults, then preserve the explicit palette in both modes.

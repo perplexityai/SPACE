@@ -54,7 +54,9 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
 
   return (
     <ThemeContext.Provider value={{ mode, setMode, isDark }}>
-      <ConfigProvider theme={appearance.config}>{children}</ConfigProvider>
+      <ConfigProvider theme={appearance.config} button={{ className: appearance.buttonClassName }}>
+        {children}
+      </ConfigProvider>
     </ThemeContext.Provider>
   );
 }
