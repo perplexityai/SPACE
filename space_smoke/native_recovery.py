@@ -35,6 +35,8 @@ from space_smoke.runtime import ScenarioContext, SmokeConfigurationError, Subpro
 
 DEPLOYMENTS = ("space-api", "space-cluster-controller", "space-data-plane")
 STORAGE_DEPLOYMENT = "space-object-store"
+# Bounded re-reads of an autoscaler bounds write before it is reported failed.
+PATCH_ATTEMPTS = 3
 RECOVERY_ENVIRONMENT = (
     "SPACE_SMOKE_NATIVE_RECOVERY",
     "SPACE_SMOKE_NATIVE_RECOVERY_CONTEXT",
@@ -62,6 +64,8 @@ class AutoscalerCapture:
     target: str
     min_replicas: int
     max_replicas: int
+    # Both bounds while the faults run.
+    pinned_replicas: int
 
 
 def _digest(spec: Mapping[str, object]) -> str:
@@ -206,20 +210,45 @@ class NativeRecoveryControl:
             time.sleep(0.5)
         raise TimeoutError(f"{name} did not reach {count} ready replacement pods")
 
-    def _patch_autoscaler(self, name: str, *, uid: str, minimum: int, maximum: int) -> None:
-        autoscaler = self._json("get", "hpa", name, "-o", "json")
-        if autoscaler["metadata"]["uid"] != uid:
-            raise SmokeConfigurationError(f"refusing replaced autoscaler {name}")
-        patch = [
-            {"op": "test", "path": "/metadata/resourceVersion", "value": autoscaler["metadata"]["resourceVersion"]},
-            {"op": "replace", "path": "/spec/minReplicas", "value": minimum},
-            {"op": "replace", "path": "/spec/maxReplicas", "value": maximum},
-        ]
-        result = self.harness.kubectl(
-            "patch", "hpa", name, "--type=json", "--patch", json.dumps(patch), timeout=15
-        )
-        if result.returncode:
-            raise SmokeConfigurationError(f"bounds update failed for autoscaler {name}; concurrent changes are not overwritten")
+    def _patch_autoscaler(
+        self, name: str, *, uid: str, expected: tuple[int, int], bounds: tuple[int, int],
+    ) -> None:
+        """Move an autoscaler's bounds from `expected` to `bounds`, refusing any other value.
+
+        The precondition is the UID and the bounds being replaced, not the
+        resourceVersion: the autoscaler controller rewrites status on every
+        sync it observes a metric change, which bumps the resourceVersion
+        without touching the spec. Server-side `test` ops make the comparison
+        atomic with the write. A failed write is re-read so that one that landed
+        but whose reply was lost, or a transient API error, does not fail the
+        restore, while bounds a third party set are still never overwritten.
+        """
+        for _ in range(PATCH_ATTEMPTS):
+            autoscaler = self._json("get", "hpa", name, "-o", "json")
+            if autoscaler["metadata"]["uid"] != uid:
+                raise SmokeConfigurationError(f"refusing replaced autoscaler {name}")
+            spec = autoscaler["spec"]
+            current = (int(spec.get("minReplicas", 1)), int(spec["maxReplicas"]))
+            if current == bounds:
+                return
+            if current != expected:
+                raise SmokeConfigurationError(
+                    f"autoscaler {name} bounds changed concurrently to {current[0]}..{current[1]}; "
+                    f"expected {expected[0]}..{expected[1]}, not overwriting"
+                )
+            patch = [
+                {"op": "test", "path": "/metadata/uid", "value": uid},
+                {"op": "test", "path": "/spec/minReplicas", "value": expected[0]},
+                {"op": "test", "path": "/spec/maxReplicas", "value": expected[1]},
+                {"op": "replace", "path": "/spec/minReplicas", "value": bounds[0]},
+                {"op": "replace", "path": "/spec/maxReplicas", "value": bounds[1]},
+            ]
+            result = self.harness.kubectl(
+                "patch", "hpa", name, "--type=json", "--patch", json.dumps(patch), timeout=15
+            )
+            if not result.returncode:
+                return
+        raise SmokeConfigurationError(f"bounds update failed for autoscaler {name}; concurrent changes are not overwritten")
 
     def _pin_autoscalers(self, targets: tuple[str, ...]) -> None:
         """Hold each target's autoscaler at the Deployment's current replica count."""
@@ -228,14 +257,18 @@ class NativeRecoveryControl:
             if target.get("kind") != "Deployment" or target.get("name") not in targets:
                 continue
             name, spec = item["metadata"]["name"], item["spec"]
+            self._fence()
+            replicas = int(self._deployment(target["name"])["spec"].get("replicas", 1))
             capture = AutoscalerCapture(
                 item["metadata"]["uid"], target["name"], int(spec.get("minReplicas", 1)), int(spec["maxReplicas"]),
+                replicas,
             )
-            self._fence()
-            replicas = int(self._deployment(capture.target)["spec"].get("replicas", 1))
             # Captured before the write: a pin that lands but times out is still undone.
             self._autoscalers[name] = capture
-            self._patch_autoscaler(name, uid=capture.uid, minimum=replicas, maximum=replicas)
+            self._patch_autoscaler(
+                name, uid=capture.uid,
+                expected=(capture.min_replicas, capture.max_replicas), bounds=(replicas, replicas),
+            )
         self.context.record("native_recovery_pinned_autoscalers", {
             name: {"target": value.target, "min": value.min_replicas, "max": value.max_replicas}
             for name, value in self._autoscalers.items()
@@ -244,8 +277,11 @@ class NativeRecoveryControl:
     def _scale(self, name: str, replicas: int) -> None:
         self._fence()
         deployment = self._deployment(name)
+        # Status writes from the Deployment controller bump the resourceVersion
+        # throughout a rollout; only the UID and the replaced count are preconditions.
         patch = [
-            {"op": "test", "path": "/metadata/resourceVersion", "value": deployment["metadata"]["resourceVersion"]},
+            {"op": "test", "path": "/metadata/uid", "value": deployment["metadata"]["uid"]},
+            {"op": "test", "path": "/spec/replicas", "value": deployment["spec"].get("replicas", 1)},
             {"op": "replace", "path": "/spec/replicas", "value": replicas},
         ]
         result = self.harness.kubectl(
@@ -426,10 +462,11 @@ class NativeRecoveryControl:
         for name, autoscaler in list(self._autoscalers.items()):
             try:
                 self._fence()
-                self._patch_autoscaler(
-                    name, uid=autoscaler.uid,
-                    minimum=autoscaler.min_replicas, maximum=autoscaler.max_replicas,
-                )
+                captured = (autoscaler.min_replicas, autoscaler.max_replicas)
+                pinned = (autoscaler.pinned_replicas, autoscaler.pinned_replicas)
+                # A pin that never landed leaves the captured bounds in place,
+                # which `_patch_autoscaler` treats as already restored.
+                self._patch_autoscaler(name, uid=autoscaler.uid, expected=pinned, bounds=captured)
                 del self._autoscalers[name]
             except Exception as error:
                 failures.append(f"autoscaler {name}: {type(error).__name__}: {error}")

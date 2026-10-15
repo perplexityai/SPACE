@@ -3,7 +3,9 @@
 The faults wait for exact replica counts, which an autoscaler could move under
 them, so each target's autoscaler is pinned at its Deployment's current count
 for the faults' duration and its captured bounds put back after the
-Deployments are restored, refusing an autoscaler replaced in between. The
+Deployments are restored, refusing an autoscaler replaced or re-bounded in
+between. The autoscaler controller's own status writes between the harness's
+read and its patch are not a conflict. The
 dispatcher-fairness precondition counts dispatchers, not controller replicas:
 any count has one while leader election is on.
 """
@@ -35,13 +37,24 @@ class _Kubectl:
         if args[:2] == ("get", "hpa") and args[2] == "-o":
             return self._ok({"items": list(self.hpas.values())})
         if args[:2] == ("get", "hpa"):
-            return self._ok(self.hpas[args[2]])
+            hpa = self.hpas[args[2]]
+            reply = self._ok(hpa)
+            # The autoscaler controller writes status on its next sync, after
+            # this read and before the harness's patch.
+            metadata = hpa["metadata"]
+            metadata["resourceVersion"] = str(int(metadata["resourceVersion"]) + 1)
+            return reply
         if args[:2] == ("get", "deployment"):
             name = args[2]
             return self._ok({"metadata": {"uid": f"deploy-{name}"}, "spec": {"replicas": self.replicas[name]}})
         if args[:2] == ("patch", "hpa"):
-            spec = self.hpas[args[2]]["spec"]
+            hpa = self.hpas[args[2]]
+            spec = hpa["spec"]
             ops = json.loads(args[-1])
+            for op in ops:
+                section, field = op["path"].strip("/").split("/")
+                if op["op"] == "test" and hpa[section].get(field) != op["value"]:
+                    return CommandResult(args, 1, "", "test operation failed")
             values = {op["path"].rsplit("/", 1)[-1]: op["value"] for op in ops if op["op"] == "replace"}
             spec.update(values)
             self.patches.append((args[2], values["minReplicas"], values["maxReplicas"]))
@@ -94,14 +107,41 @@ class AutoscalerPinning(unittest.TestCase):
         self.assertEqual(kubectl.patches[2:], [("space-api", 2, 3), ("space-data-plane", 2, 3)])
         self.assertEqual(control._autoscalers, {})
 
-    def test_a_replaced_autoscaler_fails_the_restore_instead_of_being_overwritten(self) -> None:
+    def test_a_foreign_change_fails_the_restore_instead_of_being_overwritten(self) -> None:
+        cases = (
+            ("uid", "metadata", "someone-else", "replaced autoscaler"),
+            ("bounds", "spec", 4, "bounds changed concurrently"),
+        )
+        for case, section, value, message in cases:
+            with self.subTest(case):
+                kubectl = _Kubectl()
+                control = _control(kubectl)
+                control._pin_autoscalers(("space-api",))
+                field = "uid" if section == "metadata" else "maxReplicas"
+                kubectl.hpas["space-api"][section][field] = value
+                with self.assertRaisesRegex(RuntimeError, message):
+                    control.restore()
+                self.assertEqual(kubectl.patches, [("space-api", 2, 2)])
+                self.assertIn("space-api", control._autoscalers)
+
+    def test_a_pin_that_never_landed_restores_as_a_no_op(self) -> None:
         kubectl = _Kubectl()
         control = _control(kubectl)
-        control._pin_autoscalers(("space-api",))
-        kubectl.hpas["space-api"]["metadata"]["uid"] = "someone-else"
-        with self.assertRaisesRegex(RuntimeError, "replaced autoscaler"):
-            control.restore()
-        self.assertEqual(kubectl.patches, [("space-api", 2, 2)])
+        real = kubectl.kubectl
+
+        def refuse_patches(*args: str, **options: Any) -> CommandResult:
+            if args[:2] == ("patch", "hpa"):
+                return CommandResult(args, 1, "", "transient")
+            return real(*args, **options)
+
+        kubectl.kubectl = refuse_patches  # type: ignore[method-assign]
+        with self.assertRaisesRegex(SmokeConfigurationError, "bounds update failed"):
+            control._pin_autoscalers(("space-api",))
+        kubectl.kubectl = real  # type: ignore[method-assign]
+        control.restore()
+        self.assertEqual(kubectl.patches, [])
+        self.assertEqual(kubectl.hpas["space-api"]["spec"]["maxReplicas"], 3)
+        self.assertEqual(control._autoscalers, {})
 
 
 class DispatcherCapacity(unittest.TestCase):
