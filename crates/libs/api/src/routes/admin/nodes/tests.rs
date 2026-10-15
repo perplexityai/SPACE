@@ -193,12 +193,12 @@ fn a_forced_drain_cannot_be_downgraded_to_gentle() {
 /// an error: a rollout script that re-issues `--forced` after a timeout should
 /// find the node in the state it asked for, not a 409 it has to special-case.
 ///
-/// It takes the same arm as the escalation, carrying the unchanged mode, rather
-/// than a distinct no-op arm. That is deliberate and is the difference from
-/// `:cordon`: the mode is not the only per-drain setting a repeat can change, so
-/// an arm chosen on the mode alone would drop a `replace_after_terminate`
-/// correction behind a 200. `drain_started_at` is untouched either way — the
-/// store function is what guarantees that, for both modes.
+/// It takes the same arm as the escalation, `UpdateInFlightDrain`, but with
+/// `None` for the mode, rather than a distinct no-op arm. That is deliberate
+/// and is the difference from `:cordon`: the repeat still writes, because it
+/// clears `drain_last_error`, while `None` leaves the mode column as it is
+/// (including a token this build can't parse). `drain_started_at` is untouched
+/// either way — the store function is what guarantees that.
 #[test]
 fn re_asserting_the_same_drain_mode_keeps_that_mode() {
     for mode in [NodeDrainMode::Gentle, NodeDrainMode::Forced] {
@@ -1083,7 +1083,8 @@ fn terminate_is_blocked_by_either_half_of_occupancy() {
 ///
 /// Asserted over every phase rather than just `drained`, because the failure is
 /// a predicate that answers "is a phase set?" instead of "which phase?" — and
-/// that predicate is right for two of the four inputs.
+/// that predicate is right for three of the four inputs, wrong only on
+/// `drained`.
 #[test]
 fn only_draining_and_terminating_promise_an_automatic_cordon_retry() {
     assert!(reconciler_reasserts_cordon(

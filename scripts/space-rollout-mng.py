@@ -19,8 +19,9 @@ migration. This script does the per-node sequencing:
     `min` just before issuing terminates, then re-reconcile on the next
     iteration.
   * Issues `POST /admin/api/v1/nodes/{id}:drain
-    {"replace_after_terminate": false, "mode": "forced"}` against the SPACE
-    admin API for up to `--max-concurrent-node-drains` source nodes at a time.
+    {"replace_after_terminate": false, "mode": "forced",
+    "require_undrained": true}` against the SPACE admin API for up to
+    `--max-concurrent-node-drains` source nodes at a time.
     `mode` is explicit because the API default is `gentle`, which waits for
     residents to leave on their own and would stall a wave on any long-lived
     sandbox. ASG terminate-with-decrement decrements source

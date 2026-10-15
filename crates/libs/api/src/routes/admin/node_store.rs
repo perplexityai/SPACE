@@ -1177,7 +1177,8 @@ pub(super) async fn update_drain_phase(
     // whatever the initiating drain wrote, so the terminator honors that intent
     // regardless of when the ASG call actually runs.
     //
-    // `drain_mode` is written on the `NULL -> draining` and in-flight edges,
+    // `drain_mode` is written on the `NULL -> draining` edge and by an in-place
+    // escalation (a same-mode repeat passes `None` and leaves it),
     // cleared by `:undrain` alongside the phase, and left alone by
     // `drained -> terminating`. Clearing it on undrain matters because the
     // user-API gates read the mode: a stale `gentle` left on an undrained node

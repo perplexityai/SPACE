@@ -1250,9 +1250,9 @@ fn in_flight_replace_conflict(
 /// is coming at all.
 ///
 /// There is a third conjunct this cannot see: the reconciler only runs when
-/// `SPACE_NODE_DRAIN_ENABLED` is set, and its code default is `false`. Every
-/// chart and overlay sets it `"true"`, so the answer is right in every deployed
-/// cluster, but a `true` here is an assumption about the cluster's config and
+/// `SPACE_NODE_DRAIN_ENABLED` is set, and its code default is `false`. A
+/// deployment that runs the reconciler sets it `"true"` (the kind chart in this
+/// tree does), but a `true` here is an assumption about the cluster's config and
 /// not a fact about the row. The same-mode arm's comment reasons about the
 /// disabled case explicitly; this predicate assumes it away.
 ///
@@ -1630,8 +1630,10 @@ async fn apply_drain_action(
     // `false` for a NULL phase, so nothing repairs it — the node sits out of the
     // placement pool until someone runs `:uncordon`. Pre-existing (`:cordon` on
     // a draining node has the same shape), but wider now: a `:drain` against an
-    // already-draining node used to 409 before reaching this point, and
-    // `space-rollout-mng.py` issues one automatically. Closing it means holding
+    // already-draining node used to 409 before reaching this point, and an
+    // operator's repeat or escalation now gets here. Automation that sets
+    // `require_undrained` doesn't: it is refused before the commit. Closing it
+    // means holding
     // the row lock across the substrate call, which inverts the dependency this
     // ordering exists to fix.
     let substrate_outcome = if supports_node_drain {
