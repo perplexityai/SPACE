@@ -17,6 +17,8 @@ from typing import Any, cast
 from space_smoke.adapters import KindConfig, KindHarness
 from space_smoke.capabilities import LimiterProbeOutcome
 from space_smoke.rate_limiters import (
+    ISOLATION_CONTROL_CLIENT_ID,
+    ISOLATION_NOISY_CLIENT_ID,
     PER_CLIENT_LIMIT_MESSAGE,
     SERVER_LIMIT_MESSAGE,
     RateLimiterAssertions,
@@ -160,6 +162,78 @@ class PerClientVerdict(unittest.TestCase):
             assertions.expect_fail_open([_outcome(429, f"{SERVER_LIMIT_MESSAGE} x", "2")])
 
 
+class ControlIsolationVerdict(unittest.TestCase):
+    """The isolation verdict only passes on control reconnects that worked.
+
+    A bench run cannot show this: on a healthy cluster the control arm
+    succeeds, so the cases that matter — a control arm that answered only
+    404, 500, or a cluster-level 429 — never occur there. Each is a response
+    set the per-client gate stays quiet through, which is exactly why
+    "no per-client 429" was never evidence that a second client kept working.
+    """
+
+    def _assertions(self) -> RateLimiterAssertions:
+        return RateLimiterAssertions(
+            cast(Any, _Fixture()), cast(Any, None), cast(Any, None), ResourceScope()
+        )
+
+    @staticmethod
+    def _saturated_noisy() -> list[LimiterProbeOutcome]:
+        return [_outcome(429, f"{PER_CLIENT_LIMIT_MESSAGE} too many", "1")] * 17 + [_outcome(201)] * 3
+
+    def test_a_successful_control_arm_passes(self) -> None:
+        control = [LimiterProbeOutcome(200, None, "", None, 0.0)] * 3
+        self._assertions().expect_control_isolated(self._saturated_noisy(), control)
+
+    def test_an_all_404_control_arm_fails(self) -> None:
+        control = [_outcome(404, "sandbox not found")] * 3
+        with self.assertRaisesRegex(InvariantViolation, "control reconnects succeeded"):
+            self._assertions().expect_control_isolated(self._saturated_noisy(), control)
+
+    def test_an_all_500_control_arm_fails(self) -> None:
+        control = [_outcome(500, "internal error")] * 3
+        with self.assertRaisesRegex(InvariantViolation, "control reconnects succeeded"):
+            self._assertions().expect_control_isolated(self._saturated_noisy(), control)
+
+    def test_an_all_cluster_429_control_arm_fails(self) -> None:
+        # The cluster limiter's own message: the per-client gate stayed quiet,
+        # so every per-client check passes and only the success verdict bites.
+        control = [_outcome(429, f"{SERVER_LIMIT_MESSAGE} shedding", "6")] * 3
+        with self.assertRaisesRegex(InvariantViolation, "control reconnects succeeded"):
+            self._assertions().expect_control_isolated(self._saturated_noisy(), control)
+
+    def test_a_partly_successful_control_arm_fails(self) -> None:
+        control = [LimiterProbeOutcome(200, None, "", None, 0.0), _outcome(404, "gone"), _outcome(200)]
+        with self.assertRaisesRegex(InvariantViolation, "only 2 of 3"):
+            self._assertions().expect_control_isolated(self._saturated_noisy(), control)
+
+    def test_a_shared_bucket_fails_as_broken_isolation_not_as_failure(self) -> None:
+        # Both clients on one bucket: the control arm is rejected by the noisy
+        # storm. That has to name isolation, not an unusable target.
+        control = [_outcome(429, f"{PER_CLIENT_LIMIT_MESSAGE} too many", "1")] * 3
+        with self.assertRaisesRegex(InvariantViolation, "not on separate buckets"):
+            self._assertions().expect_control_isolated(self._saturated_noisy(), control)
+
+    def test_an_idle_limiter_fails_even_with_a_clean_control_arm(self) -> None:
+        # Nothing metered: the control arm's success says nothing about
+        # isolation because no client was ever over cap.
+        noisy = [LimiterProbeOutcome(200, None, "", None, 0.0)] * 20
+        control = [LimiterProbeOutcome(200, None, "", None, 0.0)] * 3
+        with self.assertRaisesRegex(InvariantViolation, "drew no 429"):
+            self._assertions().expect_control_isolated(noisy, control)
+
+    def test_an_unanswered_control_request_is_not_a_clean_one(self) -> None:
+        control = [LimiterProbeOutcome(200, None, "", None, 0.0), _outcome(0, "connection refused"), _outcome(200)]
+        with self.assertRaisesRegex(InvariantViolation, "no status at all"):
+            self._assertions().expect_control_isolated(self._saturated_noisy(), control)
+
+    def test_the_two_isolation_client_ids_are_distinct_and_not_the_scenario_id(self) -> None:
+        # One id is one bucket: any collision would have the round loading and
+        # measuring the same bucket from both arms.
+        self.assertNotEqual(ISOLATION_NOISY_CLIENT_ID, ISOLATION_CONTROL_CLIENT_ID)
+        self.assertNotIn("space-smoke", (ISOLATION_NOISY_CLIENT_ID, ISOLATION_CONTROL_CLIENT_ID))
+
+
 class _ScriptedKubectl:
     def __init__(self, results) -> None:
         self.results = list(results)
@@ -171,6 +245,31 @@ class _ScriptedKubectl:
 
 
 class PublicApiEnvOverride(unittest.TestCase):
+    def test_accepts_a_comma_separated_allowlist_and_still_refuses_the_rest(self) -> None:
+        # The kind bench refused `a,b,c` for KNOWN_CLIENTS before the comma was
+        # in the class, which is the one separator that env var's own grammar
+        # requires. Widening it must not let anything else through.
+        harness = KindHarness(_ScriptedKubectl([]), KindConfig())
+        for refused in (
+            "space smoke",
+            "space-smoke;rm -rf /",
+            "$(whoami)",
+            "`id`",
+            "a\nb",
+            "'quoted'",
+            "x" * 65,
+            "",
+        ):
+            with self.subTest(value=refused), self.assertRaisesRegex(ValueError, "refusing"):
+                harness.set_public_api_env({"SPACE_API_CLIENT_CONCURRENCY_KNOWN_CLIENTS": refused})
+        # The accepted shape reaches the key check instead of the value check,
+        # which this closed list of keys then passes; kubectl is never reached
+        # because the scripted runner has no results queued.
+        with self.assertRaises(IndexError):
+            harness.set_public_api_env(
+                {"SPACE_API_CLIENT_CONCURRENCY_KNOWN_CLIENTS": "space-smoke,space-smoke-noisy"}
+            )
+
     def test_refuses_keys_outside_the_limiter_list(self) -> None:
         harness = KindHarness(_ScriptedKubectl([]), KindConfig())
         with self.assertRaisesRegex(ValueError, "refusing"):

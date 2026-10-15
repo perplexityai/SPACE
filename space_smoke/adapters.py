@@ -616,7 +616,11 @@ _RETENTION_BOOLEAN_ENV_VALUES = {
 }
 _RETENTION_ENV_VALUE = re.compile(r"[a-z0-9]{1,16}")
 # Limiter values: booleans, small numbers, a redis:// URL, a client id.
-_LIMITER_ENV_VALUE = re.compile(r"[A-Za-z0-9._:/@-]{1,64}")
+# A comma is in the class because `SPACE_API_CLIENT_CONCURRENCY_KNOWN_CLIENTS`
+# is a comma-separated allowlist by the limiter's own grammar, so any value
+# naming more than one client needs one. Everything this guard exists to
+# refuse — whitespace, quotes, `$`, backticks, newlines — stays out.
+_LIMITER_ENV_VALUE = re.compile(r"[A-Za-z0-9._:/@,-]{1,64}")
 _UNSIGNED_INTEGER = re.compile(r"\+?[0-9]+")
 
 

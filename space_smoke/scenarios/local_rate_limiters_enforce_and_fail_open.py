@@ -4,6 +4,9 @@ import space_smoke as smoke
 
 CALLERS = 20
 FAIL_OPEN_CALLERS = 4
+# The control arm stays inside the per-client cap, since it is asserted to
+# succeed; the noisy arm has to be able to exceed it.
+ISOLATION_CONTROL_CALLERS = 3
 
 
 # The shell suite this replaces reconfigured `deploy/space-api` with `kubectl
@@ -23,7 +26,9 @@ def rate_limiters_enforce_and_fail_open(test: smoke.KindEcw) -> None:
     creates drain the cluster activation bucket to a 429 `Server rate limit:`
     with Retry-After; twenty concurrent creates and twenty concurrent connects
     for one client id each draw at least one 429 `Per-client rate limit:` with
-    Retry-After; and once Redis is unreachable neither limiter rejects."""
+    Retry-After; a separately-bucketed control client reconnects successfully
+    while a twenty-deep storm for another client is over its cap; and once
+    Redis is unreachable neither limiter rejects."""
 
     limiters = test.rate_limiters
 
@@ -33,6 +38,18 @@ def rate_limiters_enforce_and_fail_open(test: smoke.KindEcw) -> None:
     with test.phase("preflight: one create is admitted or rate-limited"):
         first = limiters.preflight()
         connect_target = first.sandbox_id
+
+    with test.phase("per-client isolation: a control client keeps reconnecting"):
+        # Before the drain, so a create can still be admitted and the target is
+        # running: a reconnect that had to wake a sandbox would go through the
+        # activation admission the next phase empties on purpose, and a
+        # cluster-level 429 would then be indistinguishable from the control
+        # client being starved by the noisy one.
+        connect_target = limiters.establish_connect_target(connect_target)
+        noisy, control = limiters.isolation_round(
+            connect_target, noisy=CALLERS, control=ISOLATION_CONTROL_CALLERS
+        )
+        limiters.expect_control_isolated(noisy, control)
 
     with test.phase("cluster admission: drain the token bucket"):
         drained = limiters.drain_cluster_bucket()
