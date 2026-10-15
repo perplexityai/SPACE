@@ -148,6 +148,10 @@ export function createCuriosityTheme({
     token[`${name}3`] = border;
     token[`${name}6`] = color;
     token[`${name}7`] = color;
+    // Legacy and current keys serialize to the same CSS variable in Ant Design 6.
+    for (const shade of [1, 2, 3, 6, 7] as const) {
+      token[`${name}-${shade}`] = token[`${name}${shade}`];
+    }
   }
 
   const primary = token.colorPrimary!;

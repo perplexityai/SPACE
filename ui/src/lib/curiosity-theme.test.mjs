@@ -38,6 +38,12 @@ test('unset organization accents use the preset and explicit palette values surv
     for (const key of ['colorPrimary', 'colorText', 'colorBgContainer', 'colorSuccess', 'blue1', 'purple7']) {
       assert.equal(resolved[key], base.config.token[key], `${key}, dark=${isDark}`);
     }
+    // Both spellings resolve to the same CSS variable in Ant Design 6.
+    for (const color of ['blue', 'geekblue', 'cyan', 'green', 'gold', 'orange', 'red', 'purple']) {
+      for (const shade of [1, 2, 3, 6, 7]) {
+        assert.equal(resolved[`${color}-${shade}`], resolved[`${color}${shade}`]);
+      }
+    }
     assert.equal(resolved.colorBgLayout, base.surfaces.page);
     assert.match(base.config.components.Table.headerBg, /^#[\da-f]{6}$/i);
     assert.match(base.config.components.Table.rowHoverBg, /^#[\da-f]{6}$/i);
