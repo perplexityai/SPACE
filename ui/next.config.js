@@ -19,7 +19,7 @@ const nextConfig = {
       },
       {
         source: '/admin/:path*',
-        destination: `${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080'}/admin/:path*`,
+        destination: `${process.env.NEXT_PUBLIC_ADMIN_API_URL || process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080'}/admin/:path*`,
       },
       // Data-plane session endpoints — process/terminal/file-watch event
       // streams + websocket attaches. The api-server returns these as
