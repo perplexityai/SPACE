@@ -57,21 +57,27 @@ BUILDER="${SPACE_GUEST_KERNEL_BUILDER:-space-guest-kernel}"
 BUILDKIT_IMAGE="moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8"
 # Deadlines: each lookup, login and mirror probe; each cache export and the
 # marker push; and each kernel build that takes layers from the mirror or the
-# cache (the smoke image's build gets half). A kernel build normally takes
-# about 30 minutes cold and far less from the cache.
+# cache (the smoke image's build gets half), and its retry if that runs on
+# Docker's own builder, which may still hold the stalled download. A kernel
+# build normally takes about 30 minutes cold and far less from the cache.
 #
 # The budget against the job's timeout-minutes (180, main-ci.yml), for the worst
 # case: GHCR answers manifests but stalls every download, while Docker Hub and
-# snapshot.ubuntu.com work.
+# snapshot.ubuntu.com work, and the builder for the retry does not start.
 #   login, marker lookup, mirror probes, cache-tag probes   8 min at most
 #   builder: the mirrored BuildKit image stalls (60 + 180 + 60 s), the source
 #   starts                                                   7 min
 #   kernel build with the mirror and cache, cut off         60 min
-#   a new builder for the retry (60 + 60 + 180 s)            5 min
-#   the same build, cold, without them                     ~45 min
+#   the old builder removed, a new one fails to start
+#   (60 + 60 + 180 + 60 s)                                   6 min
+#   the same build, cold, on Docker's own builder, at most  60 min
 #   smoke build, without them since the fallback           ~10 min
-#   two cache exports, two tag checks and the marker push   17 min
-# About 152 minutes.
+#   the marker push (Docker's own builder exports nothing)   5 min
+# About 156 minutes. When neither BuildKit image starts, the builder costs 10
+# minutes and there is no builder to replace: about 153. When the retry builder
+# starts (5 min), the cold build takes about 45 minutes without a deadline, the
+# two cache exports, two tag checks and the push 17, and removing the builder
+# at the end 1: about 153.
 REGISTRY_TIMEOUT_SECONDS="${SPACE_GUEST_KERNEL_REGISTRY_TIMEOUT_SECONDS:-60}"
 WRITE_TIMEOUT_SECONDS="${SPACE_GUEST_KERNEL_WRITE_TIMEOUT_SECONDS:-300}"
 BUILD_TIMEOUT_SECONDS="${SPACE_GUEST_KERNEL_BUILD_TIMEOUT_SECONDS:-3600}"
@@ -83,17 +89,18 @@ BUILDER_OPTION=""
 CACHE_EXPORT=false
 # Whether this run started the builder, and so may remove it.
 OWN_BUILDER=false
-# The BuildKit image of the builder this run started, and the builder that
-# replaced it after a fallback, which the run removes when it ends.
+# The BuildKit image of the builder this run started.
 BUILDER_IMAGE=""
-RETRY_BUILDER=""
 # Set once a build has fallen back; every later build and export then goes
 # without the mirror and the cache too.
 WITHOUT_EXTERNAL=false
 OUTPUT_ROOT=""
 cleanup() {
     [ -z "${OUTPUT_ROOT}" ] || rm -rf "${OUTPUT_ROOT}"
-    [ -z "${RETRY_BUILDER}" ] || with_deadline 60 docker buildx rm "${RETRY_BUILDER}" >/dev/null 2>&1 || true
+    # The builder this run started (after a fallback, the retry's), so that no
+    # later run adopts it by name; never a caller's.
+    [ "${OWN_BUILDER}" != true ] ||
+        with_deadline 60 docker buildx rm "${BUILDER_OPTION#--builder=}" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -116,7 +123,12 @@ with_deadline() {
     fi
 }
 
-# The directory's files, tracked or not, without ignored build output.
+# The directory's files, tracked or not, without ignored build output. The
+# marker covers what is built, and nothing outside this directory: the base is
+# pinned by digest and the image mirror serves the same content, so an edit to
+# the mirror (ci/scripts/mirror-images.sh, ci/mirrored-images.txt) or to the
+# workflow does not change the kernel. Hashing the workflow made every
+# unrelated edit to it force a cold rebuild through the Ubuntu snapshot mirror.
 inputs() {
     git -C "${REPO_ROOT}" ls-files --cached --others --exclude-standard -- "${KERNEL_DIR}" | LC_ALL=C sort -u
 }
@@ -229,11 +241,7 @@ replace_builder() {
         with_deadline 60 docker buildx rm "${old}" >/dev/null 2>&1 ||
             echo "::warning::Could not remove the ${old} builder"
     fi
-    RETRY_BUILDER="${BUILDER}-retry-$$"
-    start_builder "${RETRY_BUILDER}" "${BUILDER_IMAGE:-${BUILDKIT_IMAGE}}" || {
-        RETRY_BUILDER=""
-        use_docker_builder
-    }
+    start_builder "${BUILDER}-retry-$$" "${BUILDER_IMAGE:-${BUILDKIT_IMAGE}}" || use_docker_builder
 }
 
 # The docker build options of every build here, one per line, but the
@@ -262,37 +270,56 @@ effective() {
     if [ "${WITHOUT_EXTERNAL}" = true ]; then without_external "$1"; else printf '%s\n' "$1"; fi
 }
 
+# overran <status> <started> <deadline>: whether a command run with_deadline
+# since SECONDS was <started> was cut off. timeout exits 124, or 137 once it
+# has to kill, but the command can exit with either itself (smoke-boot.sh
+# passes on QEMU's status), so they count only once the deadline has passed,
+# give or take a few seconds.
+overran() {
+    [ -n "${TIMEOUT_BIN}" ] && { [ "$1" -eq 124 ] || [ "$1" -eq 137 ]; } &&
+        [ "$((SECONDS - $2))" -ge "$(($3 - 3))" ]
+}
+
 # attempt <deadline> <options> <command>...: run a build command with
 # KERNEL_DOCKER_BUILD_OPTIONS=<options>, within the deadline if it takes layers
-# from the mirror or the cache. If it then failed fetching from them, or overran
-# (timeout exits 124, or 137 once it has to kill), it runs once more without
-# either and without a deadline, on a new builder, and so does every later
-# build of the run. A failure in one of the build's own steps fails without a
-# retry.
+# from the mirror or the cache. If it then failed fetching from them, or
+# overran, it runs once more without either, on a new builder, and so does
+# every later build of the run. That retry has no deadline unless it runs on
+# Docker's own builder, which may still hold the stalled download. A failure in
+# one of the build's own steps fails without a retry.
 #
 # The output goes to a file that a follower prints, not through a pipe: a
 # docker client that outlives the deadline would hold a pipe open, and the wait
 # for it would have none.
 attempt() {
-    local deadline="$1" requested="$2" options log follower status=0
+    local deadline="$1" requested="$2" options log follower started status=0
     options="$(effective "${requested}")"
     shift 2
     log="$(mktemp)"
     if [[ "${options}" == *--cache-from=* || "${options}" == *--build-context=* ]]; then
         tail -f "${log}" &
         follower=$!
+        started="${SECONDS}"
         with_deadline "${deadline}" env KERNEL_DOCKER_BUILD_OPTIONS="${options}" "$@" >>"${log}" 2>&1 ||
             status=$?
         sleep 1
         kill "${follower}" 2>/dev/null || true
         wait "${follower}" 2>/dev/null || true
-        if [ "${status}" -ne 0 ] && { [ "${status}" -eq 124 ] || [ "${status}" -eq 137 ] ||
+        if [ "${status}" -ne 0 ] && { overran "${status}" "${started}" "${deadline}" ||
             grep '^ERROR:' "${log}" | tail -n 1 | grep -Eq "${FETCH_FAILURE}"; }; then
             echo "::warning::The build failed or stalled taking layers from the image mirror or the toolchain cache; building once more, and for the rest of this run, without them"
             WITHOUT_EXTERNAL=true
             replace_builder
             status=0
-            env KERNEL_DOCKER_BUILD_OPTIONS="$(effective "${requested}")" "$@" || status=$?
+            if [ -n "${BUILDER_OPTION}" ]; then
+                env KERNEL_DOCKER_BUILD_OPTIONS="$(effective "${requested}")" "$@" || status=$?
+            else
+                started="${SECONDS}"
+                with_deadline "${deadline}" env KERNEL_DOCKER_BUILD_OPTIONS="$(effective "${requested}")" "$@" ||
+                    status=$?
+                ! overran "${status}" "${started}" "${deadline}" ||
+                    echo "::error::The cold retry on Docker's own builder overran its ${deadline} s deadline, probably waiting on the stalled download"
+            fi
         fi
     else
         env KERNEL_DOCKER_BUILD_OPTIONS="${options}" "$@" || status=$?

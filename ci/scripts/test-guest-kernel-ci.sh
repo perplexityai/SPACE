@@ -6,7 +6,9 @@
 # never fails the check; the builder starts from the mirrored BuildKit image,
 # else its source, else Docker's own builder; a build that fails fetching from
 # the mirror or the cache, or stalls importing the cache, runs once more without
-# them, as does the rest of the run, on a new builder; and the input hash covers
+# them, as does the rest of the run, on a new builder, or within a deadline on
+# Docker's own builder; a command's own exit 137 is not an overrun; the run
+# removes the builder it started, never a caller's; and the input hash covers
 # each file's executable bit.
 set -euo pipefail
 
@@ -27,7 +29,8 @@ cat >"${WORK_DIR}/bin/docker" <<'SH'
 # The registry's references are the lines of FAKE_REGISTRY, the builders those
 # of FAKE_BUILDERS ("<name> <image>"). FAKE_LOOKUP_ERROR is the error of every
 # lookup; FAKE_STALL lists the operations that never answer (lookup, export,
-# push, and external-build: any build that uses the mirror or the cache).
+# push, external-build: any build that uses the mirror or the cache, and
+# own-builder-build: any build on Docker's own builder).
 # FAKE_BAD_BUILDKIT lists BuildKit images that do not start, FAKE_BAD_BUILDER
 # is the name prefix of builders that do not, and FAKE_RM_FAILS fails builder
 # removals. FAKE_BUILD_FAILS fails the kernel build in its own step, after an
@@ -91,6 +94,7 @@ case "$1 ${2:-} ${3:-}" in
         printf '%s\n' "${*: -1}" >>"${FAKE_REGISTRY}"
         ;;
     "build "*)
+        [[ " $* " == *" --builder="* ]] || ! stalls own-builder-build || exec sleep 30
         if external "$@"; then
             ! stalls external-build || exec sleep 30
             if [ -n "${FAKE_FETCH_FAILS:-}" ]; then
@@ -215,8 +219,13 @@ said "::warning::No passing build" && fail "a missing marker was reported as a w
 said "Saved the toolchain layers to ${REPOSITORY}:toolchain-cache" || fail "the build toolchain cache was not saved"
 said "Saved the smoke layers to ${REPOSITORY}:smoke-cache" || fail "the smoke toolchain cache was not saved"
 recorded || fail "a passing build was not recorded"
-[ "$(tail -n 1 "${WORK_DIR}/calls")" = "push --quiet ${MARKER}" ] ||
+[ "$(grep -v '^buildx rm ' "${WORK_DIR}/calls" | tail -n 1)" = "push --quiet ${MARKER}" ] ||
     fail "the pass was not recorded last: $(tail -n 1 "${WORK_DIR}/calls")"
+[ "$(tail -n 1 "${WORK_DIR}/calls")" = "buildx rm space-guest-kernel" ] && [ ! -s "${WORK_DIR}/builders" ] ||
+    fail "the run did not remove the builder it started: $(grep 'buildx rm' "${WORK_DIR}/calls")"
+
+PRESET_BUILDER=1 run "${MIRRORS}" publish || fail "a build on the caller's builder failed: $(cat "${WORK_DIR}/out")"
+[ "$(calls '^buildx rm ')" = 0 ] || fail "the run removed the caller's builder: $(grep 'buildx rm' "${WORK_DIR}/calls")"
 
 run "${MIRRORS}"$'\n'"${CACHES}" publish || fail "a cached build failed the check: $(cat "${WORK_DIR}/out")"
 [ "$(calls "^build .*--cache-from=type=registry,ref=${REPOSITORY}:toolchain-cache")" = 2 ] ||
@@ -312,20 +321,32 @@ FAKE_BAD_BUILDER=space-guest-kernel-retry FAKE_STALL=external-build run "${MIRRO
 [ "$(calls 'cache-to')" = 0 ] || fail "Docker's own builder tried to export the cache after the fallback"
 recorded || fail "a retry on Docker's own builder was not recorded"
 
+# Docker's own builder may still hold the stalled download, so the retry on it
+# has a deadline too.
+started="${SECONDS}"
+FAKE_BAD_BUILDKIT="${BUILDKIT_MIRROR} ${BUILDKIT}" FAKE_STALL=own-builder-build \
+    run "${MIRRORS}"$'\n'"${CACHES}" publish && fail "a retry that stalled on Docker's own builder passed the check"
+said "::error::The cold retry on Docker's own builder overran its 2 s deadline, probably waiting on the stalled download" ||
+    fail "a stalled retry on Docker's own builder was not reported: $(cat "${WORK_DIR}/out")"
+[ "$((SECONDS - started))" -lt 20 ] || fail "the retry on Docker's own builder had no deadline"
+[ "$(calls '--target export')" = 2 ] || fail "the stalled build on Docker's own builder was not retried once"
+recorded && fail "a retry that overran recorded a pass"
+
 FAKE_STALL=external-build run "${MIRRORS}" publish ||
     fail "a stalled mirror without a cache failed the check: $(cat "${WORK_DIR}/out")"
 [ "$(calls '--target export')" = 2 ] || fail "a build with only the mirror had no deadline"
 without_external_after '^build .*--target smoke' || fail "the smoke build after a mirror-only fallback used the mirror"
 
-# attempt_with <command>: runs the script's attempt on the command with the
-# cache and a one-second deadline, in a subshell, leaving its output in
-# ${WORK_DIR}/out and the seconds it took in ${WORK_DIR}/took.
+# attempt_with <command> [<deadline>]: runs the script's attempt on the
+# command with the cache and the deadline (one second by default), in a
+# subshell, leaving its output in ${WORK_DIR}/out and the seconds it took in
+# ${WORK_DIR}/took.
 attempt_with() {
     local started="${SECONDS}" status=0
     (
         # shellcheck disable=SC1090,SC1091 # the script under test
         source "${SCRIPT}"
-        attempt 1 "--cache-from=type=registry,ref=${REPOSITORY}:toolchain-cache" bash -c "$1"
+        attempt "${2:-1}" "--cache-from=type=registry,ref=${REPOSITORY}:toolchain-cache" bash -c "$1"
     ) >"${WORK_DIR}/out" 2>&1 || status=$?
     echo "$((SECONDS - started))" >"${WORK_DIR}/took"
     return "${status}"
@@ -338,6 +359,13 @@ CACHED_ONLY='[[ "${KERNEL_DOCKER_BUILD_OPTIONS}" != *--cache-from=* ]] ||'
 attempt_with "${CACHED_ONLY} { trap '' TERM; sleep 30; }; echo built" ||
     fail "a build killed after its deadline failed: $(cat "${WORK_DIR}/out")"
 said "built" || fail "a build killed after its deadline (exit 137) was not retried"
+
+# A command that exits 137 itself well before its deadline, as smoke-boot.sh
+# does when QEMU is killed, fails as it is, without the fallback.
+attempt_with 'echo attempted; exit 137' 30 && fail "a command that exited 137 passed"
+[ "$(grep -c attempted "${WORK_DIR}/out")" = 1 ] ||
+    fail "a command that exited 137 before its deadline was taken for an overrun and rebuilt"
+said "::warning::The build failed or stalled" && fail "a command that exited 137 before its deadline fell back"
 
 # A docker client that outlives its shell must not hold the attempt.
 attempt_with "${CACHED_ONLY} { (trap '' TERM; exec sleep 30) & sleep 30; }; echo built" ||
