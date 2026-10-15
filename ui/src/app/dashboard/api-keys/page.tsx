@@ -15,7 +15,7 @@ import {
   Table,
   Tag,
   Typography,
-  message,
+  App,
 } from 'antd';
 import { CopyOutlined, DeleteOutlined, PlusOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
@@ -41,6 +41,7 @@ function formatDate(value: string | null): string {
 }
 
 export default function ApiKeysPage() {
+  const { message } = App.useApp();
   const { org: signedInOrg } = useAuth();
   const [organizations, setOrganizations] = useState<Organization[]>([]);
   const [orgId, setOrgId] = useState<string>();

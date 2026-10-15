@@ -32,7 +32,7 @@ import {
   Table,
   Tag,
   Typography,
-  message,
+  App,
   Tooltip,
 } from 'antd';
 import { DeleteOutlined, PauseCircleOutlined, PlayCircleOutlined, PlusOutlined, ReloadOutlined, SyncOutlined } from '@ant-design/icons';
@@ -356,6 +356,7 @@ function renderReconciler(node: NodeView, nowMs: number) {
 }
 
 export default function NodesPage() {
+  const { message } = App.useApp();
   const { substrate } = useAuth();
   const [selectedNode, setSelectedNode] = useState<NodeView | null>(null);
   const [sandboxPage, setSandboxPage] = useState<NodeSandboxPage | null>(null);

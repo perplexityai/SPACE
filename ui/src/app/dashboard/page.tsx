@@ -26,13 +26,13 @@ export default function DashboardPage() {
     <div>
       <Title level={3}>Dashboard</Title>
       <p>Welcome, {user?.display_name}</p>
-      <Row gutter={16} style={{ marginTop: 24 }}>
-        <Col span={6}>
+      <Row gutter={[16, 16]} style={{ marginTop: 24 }}>
+        <Col xs={24} sm={12} lg={6}>
           <Card>
             <Statistic title="Organizations" value={orgCount} prefix={<TeamOutlined />} />
           </Card>
         </Col>
-        <Col span={6}>
+        <Col xs={24} sm={12} lg={6}>
           <Card>
             <Statistic title="Sandboxes" value={sandboxCount} prefix={<CloudServerOutlined />} />
           </Card>

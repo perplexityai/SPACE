@@ -41,7 +41,7 @@ import {
 } from '@/components/auto-lifecycle';
 import {
   Table, Button, Form, Input, InputNumber, Select, Typography, Space, Tag, Popconfirm,
-  message, Modal, Switch, Tooltip,
+  App, Modal, Switch, Tooltip, theme,
 } from 'antd';
 import {
   DeleteOutlined, ReloadOutlined, DownloadOutlined,
@@ -204,19 +204,6 @@ function roleColor(role: NodeRole) {
   }
 }
 
-function roleTextColor(role: NodeRole) {
-  switch (role) {
-    case 'worker':
-      return '#1677ff';
-    case 'builder':
-      return '#52c41a';
-    case 'cluster':
-      return '#d48806';
-    default:
-      return undefined;
-  }
-}
-
 function shortHash(hash: string | null) {
   if (!hash) return DEFAULT_TEMPLATE_TAG;
   return hash.replace('sha256:', '').slice(0, 12);
@@ -299,18 +286,19 @@ function snapshotStatusDot(color: string, filled: boolean) {
   );
 }
 
-function nodeSnapshotIcon(availability: TemplateNodeAvailability) {
+function NodeSnapshotIcon({ availability }: { availability: TemplateNodeAvailability }) {
+  const { token } = theme.useToken();
   const observedShapes = observedSnapshotShapeLabels(availability.snapshots);
   if (observedShapes.length > 0) {
     return (
       <Tooltip title={`Observed base snapshot: ${observedShapes.join(', ')}`}>
-        {snapshotStatusDot('#389e0d', true)}
+        {snapshotStatusDot(token.colorSuccess, true)}
       </Tooltip>
     );
   }
   return (
     <Tooltip title="No base snapshot">
-      {snapshotStatusDot('#8c8c8c', false)}
+      {snapshotStatusDot(token.colorTextTertiary, false)}
     </Tooltip>
   );
 }
@@ -403,6 +391,7 @@ function hasAutoLifecyclePolicy(policy: Template['default_auto_lifecycle']) {
 }
 
 function PoolSandboxesPanel({ templateName }: { templateName: string }) {
+  const { message } = App.useApp();
   const [loading, setLoading] = useState(true);
   const [poolInfo, setPoolInfo] = useState<PoolInfo | null>(null);
   const [deletingSandbox, setDeletingSandbox] = useState<string | null>(null);
@@ -492,6 +481,8 @@ function PoolSandboxesPanel({ templateName }: { templateName: string }) {
 }
 
 export default function TemplatesPage() {
+  const { message } = App.useApp();
+  const { token } = theme.useToken();
   const { user, cluster, substrate } = useAuth();
   const [templateReleases, setTemplateReleases] = useState<TemplateRelease[]>([]);
   const [templates, setTemplates] = useState<Template[]>([]);
@@ -1490,9 +1481,9 @@ export default function TemplatesPage() {
         render: (value: boolean | null) => (
           <Tooltip title={value ? 'Base snapshot observed' : 'No base snapshot observed'}>
             {value ? (
-              <CheckCircleFilled style={{ color: '#389e0d', fontSize: 13 }} />
+              <CheckCircleFilled style={{ color: token.colorSuccess, fontSize: 13 }} />
             ) : (
-              <ClockCircleOutlined style={{ color: '#8c8c8c', fontSize: 13 }} />
+              <ClockCircleOutlined style={{ color: token.colorTextTertiary, fontSize: 13 }} />
             )}
           </Tooltip>
         ),
@@ -1618,6 +1609,8 @@ export default function TemplatesPage() {
     isDirectSubstrate,
     expandedTemplateRows,
     templateOperations,
+    token.colorSuccess,
+    token.colorTextTertiary,
   ]);
 
   const warmPoolPolicyColumns: ColumnsType<WarmPoolPolicy> = [
@@ -1904,7 +1897,6 @@ export default function TemplatesPage() {
             {sortedItems.map((availability) => {
               const node = availability.node;
               const nodeText = shortNodeIdentity(node);
-              const color = roleTextColor(node.role);
               return (
                 <Tag
                   key={node.id}
@@ -1912,7 +1904,7 @@ export default function TemplatesPage() {
                   style={{ marginRight: 0, paddingRight: node.managed_by === 'space' ? 2 : undefined }}
                 >
                   <Space size={4}>
-                    {nodeSnapshotIcon(availability)}
+                    <NodeSnapshotIcon availability={availability} />
                     <code style={{ fontSize: 12 }}>{nodeText}</code>
                     {node.managed_by !== 'space' ? (
                       <span style={{ opacity: 0.7, fontSize: 11 }}>{node.managed_by}</span>
@@ -1930,7 +1922,7 @@ export default function TemplatesPage() {
                             icon={<DeleteOutlined />}
                             loading={templateOperationRunning(`delete:${record.key}:${node.id}`)}
                             aria-label="Delete from node"
-                            style={{ width: 18, height: 18, minWidth: 18, padding: 0, color }}
+                            style={{ width: 18, height: 18, minWidth: 18, padding: 0, color: 'inherit' }}
                           />
                         </Tooltip>
                       </Popconfirm>

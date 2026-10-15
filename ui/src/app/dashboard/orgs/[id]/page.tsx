@@ -4,14 +4,17 @@ import { useEffect, useState } from 'react';
 import { useParams } from 'next/navigation';
 import { adminApi } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
+import { useCuriosityTheme } from '@/lib/theme';
 import { Organization, OrgMasterKey, Sandbox, User } from '@/lib/types';
-import { Card, Table, Typography, Form, Input, Button, message, Descriptions, Space, Switch, Tag } from 'antd';
+import { Card, Table, Typography, Form, Input, Button, App, Descriptions, Space, Switch, Tag } from 'antd';
 import { LockOutlined, SaveOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 
 const { Title } = Typography;
 
 export default function OrgDetailPage() {
+  const { message } = App.useApp();
+  const { primaryColor: defaultPrimaryColor } = useCuriosityTheme();
   const { id } = useParams<{ id: string }>();
   const { org: authOrg, refreshOrg } = useAuth();
   const [org, setOrg] = useState<Organization | null>(null);
@@ -107,10 +110,10 @@ export default function OrgDetailPage() {
       <Card title="Branding" size="small">
         <Form form={form} layout="vertical" onFinish={handleSave} style={{ maxWidth: 500 }}>
           <Form.Item label="Primary Color" name="theme_primary">
-            <Input placeholder="#1677ff" addonBefore={
+            <Input placeholder={defaultPrimaryColor} addonBefore={
               <input
                 type="color"
-                value={form.getFieldValue('theme_primary') || '#1677ff'}
+                value={form.getFieldValue('theme_primary') || defaultPrimaryColor}
                 onChange={(e) => form.setFieldsValue({ theme_primary: e.target.value })}
                 style={{ width: 24, height: 24, border: 'none', padding: 0, cursor: 'pointer' }}
               />

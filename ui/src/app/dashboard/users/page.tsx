@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react';
 import { adminApi } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import { AdminUser, Organization, UserRole } from '@/lib/types';
-import { Table, Button, Form, Input, Select, Typography, Popconfirm, message, Card, Space, Tag } from 'antd';
+import { Table, Button, Form, Input, Select, Typography, Popconfirm, App, Card, Space, Tag } from 'antd';
 import { assignableRoleOptions, canDeleteUser, canManageUserRole, roleColors, roleLabels } from '@/lib/userRoles';
 import { PlusOutlined, DeleteOutlined } from '@ant-design/icons';
 import Link from 'next/link';
@@ -13,6 +13,7 @@ import type { ColumnsType } from 'antd/es/table';
 const { Title } = Typography;
 
 export default function UsersPage() {
+  const { message } = App.useApp();
   const { user: currentUser, cluster } = useAuth();
   const [orgs, setOrgs] = useState<Organization[]>([]);
   const [selectedOrgId, setSelectedOrgId] = useState('');

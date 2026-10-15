@@ -6,13 +6,14 @@ import { useAuth } from '@/lib/auth';
 import { Cluster, Organization } from '@/lib/types';
 import { isManagingOrgAdmin } from '@/lib/userRoles';
 import Link from 'next/link';
-import { Table, Button, Form, Input, Select, Typography, Space, Popconfirm, message, Card, Tag } from 'antd';
+import { Table, Button, Form, Input, Select, Typography, Space, Popconfirm, App, Card, Tag } from 'antd';
 import { PlusOutlined, DeleteOutlined, ClusterOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 
 const { Title } = Typography;
 
 export default function OrgsPage() {
+  const { message } = App.useApp();
   const { user, cluster, refreshCluster } = useAuth();
   const [orgs, setOrgs] = useState<Organization[]>([]);
   const [loading, setLoading] = useState(false);

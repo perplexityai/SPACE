@@ -6,11 +6,12 @@ import { adminApi } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import { AdminUser, Organization, UserRole } from '@/lib/types';
 import { assignableRoleOptions, canManageUserRole, roleColors, roleLabels } from '@/lib/userRoles';
-import { Typography, Descriptions, Select, Tag, message } from 'antd';
+import { Typography, Descriptions, Select, Tag, App } from 'antd';
 
 const { Title } = Typography;
 
 export default function UserDetailPage() {
+  const { message } = App.useApp();
   const { id } = useParams<{ id: string }>();
   const { user: currentUser, cluster } = useAuth();
   const [user, setUser] = useState<AdminUser | null>(null);

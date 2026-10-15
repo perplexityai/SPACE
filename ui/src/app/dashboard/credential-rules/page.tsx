@@ -16,7 +16,8 @@ import {
   Tag,
   Tooltip,
   Typography,
-  message,
+  App,
+  theme,
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import { KeyOutlined, SafetyCertificateOutlined, SearchOutlined } from '@ant-design/icons';
@@ -106,6 +107,8 @@ function flattenRules(sandboxes: Sandbox[]): CredentialRuleRow[] {
 }
 
 export default function CredentialRulesPage() {
+  const { message } = App.useApp();
+  const { token } = theme.useToken();
   const [sandboxes, setSandboxes] = useState<Sandbox[]>([]);
   const [organizations, setOrganizations] = useState<Organization[]>([]);
   const [loading, setLoading] = useState(true);
@@ -298,7 +301,7 @@ export default function CredentialRulesPage() {
       <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
         <Col xs={24} sm={8}><Card size="small"><Statistic title="Credential rules" value={rows.length} /></Card></Col>
         <Col xs={24} sm={8}><Card size="small"><Statistic title="Sandboxes" value={sandboxCount} /></Card></Col>
-        <Col xs={24} sm={8}><Card size="small"><Statistic title="Host matches denied" value={blockedCount} valueStyle={blockedCount ? { color: '#cf1322' } : undefined} /></Card></Col>
+        <Col xs={24} sm={8}><Card size="small"><Statistic title="Host matches denied" value={blockedCount} valueStyle={blockedCount ? { color: token.colorError } : undefined} /></Card></Col>
       </Row>
 
       <Card size="small">

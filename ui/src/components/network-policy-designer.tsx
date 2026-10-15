@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ColumnsType } from 'antd/es/table';
 import {
   Alert,
+  App,
   Button,
   Divider,
   Input,
@@ -404,6 +405,7 @@ export default function NetworkPolicyDesigner({
   onSave,
   onClear,
 }: NetworkPolicyDesignerProps) {
+  const { modal } = App.useApp();
   const inherited = targetKind === 'sandbox' && !policy;
   const fallbackPolicy = useMemo(() => networkPolicyFromMode('closed'), []);
   const effectivePolicy = useMemo(
@@ -482,7 +484,7 @@ export default function NetworkPolicyDesigner({
 
   const handleModeChange = (nextMode: DesignerMode) => {
     if (mode === 'detailed' && nextMode !== 'detailed' && detailedDraftChanged) {
-      Modal.confirm({
+      modal.confirm({
         title: 'Discard detailed rules?',
         content: 'Switching modes saves only the selected preset and drops detailed allow and deny rules.',
         okText: 'Discard',

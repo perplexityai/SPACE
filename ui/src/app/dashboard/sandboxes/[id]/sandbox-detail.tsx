@@ -9,13 +9,14 @@ import {
   Descriptions,
   Form,
   Input,
-  message,
+  App,
   Popconfirm,
   Space,
   Table,
   Tag,
   Tooltip,
   Typography,
+  theme,
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import {
@@ -280,13 +281,6 @@ function nodeDisplay(sandbox: Sandbox) {
   );
 }
 
-function copyToClipboard(value: string) {
-  if (typeof navigator !== 'undefined' && navigator.clipboard) {
-    void navigator.clipboard.writeText(value);
-    message.success('Copied');
-  }
-}
-
 function sandboxTemplateHash(sandbox: Sandbox) {
   return sandbox.content_hash || sandbox.image_hash;
 }
@@ -389,6 +383,8 @@ function snapshotCodec(type: string): { label: string; color: string } {
 }
 
 function SnapshotsCard({ sandboxId }: { sandboxId: string }) {
+  const { message } = App.useApp();
+  const { token } = theme.useToken();
   const [snapshots, setSnapshots] = useState<SnapshotInfo[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -458,7 +454,7 @@ function SnapshotsCard({ sandboxId }: { sandboxId: string }) {
         locale={{ emptyText: 'No snapshots' }}
         footer={() =>
           snapshots.length === 0 ? null : (
-            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, color: '#666' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 12, color: token.colorTextSecondary }}>
               <span>{snapshots.length} snapshot{snapshots.length === 1 ? '' : 's'}</span>
               <span>total {formatBytes(totalBytes)}</span>
             </div>
@@ -470,6 +466,8 @@ function SnapshotsCard({ sandboxId }: { sandboxId: string }) {
 }
 
 function ExecCard({ sandbox }: { sandbox: Sandbox }) {
+  const { message } = App.useApp();
+  const { token } = theme.useToken();
   const [command, setCommand] = useState('');
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<ProcessRunResult | null>(null);
@@ -530,7 +528,7 @@ function ExecCard({ sandbox }: { sandbox: Sandbox }) {
         </Space>
         {error ? <Text type="danger">{error}</Text> : null}
         {result ? (
-          <div style={{ borderTop: '1px solid rgba(5,5,5,0.08)', paddingTop: 8 }}>
+          <div style={{ borderTop: `1px solid ${token.colorBorderSecondary}`, paddingTop: 8 }}>
             <Descriptions size="small" column={3}>
               <Descriptions.Item label="Outcome">
                 {result.outcome?.type === 'status'
@@ -553,7 +551,7 @@ function ExecCard({ sandbox }: { sandbox: Sandbox }) {
               <>
                 <Text strong style={{ fontSize: 12 }}>stdout</Text>
                 <pre style={{
-                  background: 'rgba(0,0,0,0.04)', padding: 8, borderRadius: 4,
+                  background: token.colorFillQuaternary, padding: 8, borderRadius: token.borderRadiusSM,
                   fontSize: 12, maxHeight: 240, overflow: 'auto',
                 }}>{result.stdout}</pre>
               </>
@@ -562,7 +560,7 @@ function ExecCard({ sandbox }: { sandbox: Sandbox }) {
               <>
                 <Text strong style={{ fontSize: 12 }}>stderr</Text>
                 <pre style={{
-                  background: 'rgba(0,0,0,0.04)', padding: 8, borderRadius: 4,
+                  background: token.colorFillQuaternary, padding: 8, borderRadius: token.borderRadiusSM,
                   fontSize: 12, maxHeight: 240, overflow: 'auto',
                 }}>{result.stderr}</pre>
               </>
@@ -583,6 +581,7 @@ type TerminalLine = {
 };
 
 function TerminalCard({ sandbox }: { sandbox: Sandbox }) {
+  const { token } = theme.useToken();
   const [status, setStatus] = useState<TerminalStatus>('disconnected');
   const [input, setInput] = useState('');
   const [lines, setLines] = useState<TerminalLine[]>([]);
@@ -792,7 +791,7 @@ function TerminalCard({ sandbox }: { sandbox: Sandbox }) {
               alignItems: 'center',
               justifyContent: 'center',
               padding: 24,
-              background: 'rgba(255,255,255,0.86)',
+              background: token.colorBgContainer,
               borderRadius: 4,
               textAlign: 'center',
             }}
@@ -892,6 +891,7 @@ function ControlButtons({ sandbox, onAction, busy }: {
 }
 
 export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: string | null }) {
+  const { message } = App.useApp();
   const params = useParams<{ id: string }>();
   const router = useRouter();
   const id = params.id;
@@ -902,6 +902,13 @@ export default function SandboxDetailPage({ dashboardUrl }: { dashboardUrl: stri
   const [error, setError] = useState<string | null>(null);
   const [editingNetwork, setEditingNetwork] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const copyToClipboard = (value: string) => {
+    if (typeof navigator !== 'undefined' && navigator.clipboard) {
+      void navigator.clipboard.writeText(value);
+      message.success('Copied');
+    }
+  };
 
   const refresh = async (showSpinner = false) => {
     if (showSpinner) setLoading(true);
