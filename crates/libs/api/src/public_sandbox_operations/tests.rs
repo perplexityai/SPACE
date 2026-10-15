@@ -128,7 +128,7 @@ async fn native_create_executor_preserves_operator_policy_across_replacements() 
         TlsInterceptionExemptions::from_config(r#"[{"wildcard_domain":"*.relay.example.test"}]"#)?;
     let profiles = crate::egress_profiles::EgressProfiles::from_config(
         r#"{
-        "sensor":{"allow":[{"domain":"sensor.example.test"}],
+        "sensor":{"default":true,"allow":[{"domain":"sensor.example.test"}],
                   "tls_interception_exemptions":[{"domain":"sensor.example.test"}]}
     }"#,
     )?;
@@ -145,7 +145,12 @@ async fn native_create_executor_preserves_operator_policy_across_replacements() 
     let captured_pods = Arc::new(Mutex::new(Vec::new()));
     // Native create probes the pod's TCP listener even with command readiness disabled.
     let pod_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    for (configured, federated) in [(false, false), (true, false), (true, true)] {
+    for (configured, federated, selected) in [
+        (false, false, false),
+        (true, false, false),
+        (true, true, false), // Legacy federated payload: no saved selection.
+        (true, true, true),
+    ] {
         let substrate = crate::controllers::substrate::Substrate::Kubernetes(Box::new(
             substrate_with_store_client_proxy_port_and_pod(
                 db.pool.clone(),
@@ -176,7 +181,11 @@ async fn native_create_executor_preserves_operator_policy_across_replacements() 
             );
             let mut headers = axum::http::HeaderMap::new();
             headers.insert(crate::egress_profiles::HEADER, "+sensor".parse()?);
-            context.egress_profiles = Some(admission.select_egress_profiles(&headers, true)?);
+            context.egress_profiles = if selected {
+                Some(admission.select_egress_profiles(&headers, true)?)
+            } else {
+                None
+            };
             let mut request = public_create_request();
             request.network_policy = (!inherit_template).then(|| policy.clone());
             operation.payload = CreateSandboxOperationPayload {
@@ -188,7 +197,7 @@ async fn native_create_executor_preserves_operator_policy_across_replacements() 
             }
             .into_json();
 
-            if federated {
+            if selected {
                 let unconfigured = CreateSandboxOperationExecutor::new(
                     db.pool.clone(),
                     executor
@@ -203,6 +212,12 @@ async fn native_create_executor_preserves_operator_policy_across_replacements() 
             }
             let result = Box::pin(executor.execute(&operation)).await;
             assert_eq!(result.state, OperationState::Succeeded, "{result:?}");
+            assert_eq!(
+                crate::egress_profiles::load(&db.pool, sandbox_id)
+                    .await?
+                    .as_names(),
+                if selected { vec!["sensor"] } else { vec![] },
+            );
             let persisted: Option<sqlx::types::Json<NetworkPolicyV1>> = sqlx::query_scalar(sql!(
                 "SELECT network_policy_override_json FROM sandboxes WHERE id = $1"
             ))
@@ -217,7 +232,7 @@ async fn native_create_executor_preserves_operator_policy_across_replacements() 
                     {"wildcard_domain": "*.relay.example.test"}
                 ]))?;
             }
-            if federated {
+            if selected {
                 assert!(effective.allows_domain("sensor.example.test"));
                 assert!(!effective.allows_domain("retired.example.test"));
                 assert!(!effective.allows_domain("blocked.example.test"));
@@ -284,7 +299,7 @@ async fn native_create_executor_preserves_operator_policy_across_replacements() 
     }
     assert_eq!(
         captured_pods.lock().expect("capture mutex poisoned").len(),
-        6
+        8
     );
     Ok(())
 }

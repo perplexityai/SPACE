@@ -416,16 +416,19 @@ impl CreateSandboxOperationExecutor {
         }
         let planned_sandbox_id = SandboxId::from(payload.sandbox_id);
         let controller_request = controller_create_request(payload.request, payload.node_pool);
+        // Legacy queued creates predate profiles; never apply execution-time defaults.
+        let empty_profiles = crate::egress_profiles::EgressProfileSelection::default();
         let federated_context = FederatedSandboxCreateContext::new(
             federated.as_ref().map(|(owner, _)| owner),
             federated.as_ref().map(|(_, grant)| grant),
         )
-        .with_egress_profiles(
+        .with_egress_profiles(Some(
             payload
                 .federated_create
                 .as_ref()
-                .and_then(|context| context.egress_profiles.as_ref()),
-        );
+                .and_then(|context| context.egress_profiles.as_ref())
+                .unwrap_or(&empty_profiles),
+        ));
         let response = match payload.pool_claim {
             None => {
                 self.controller
