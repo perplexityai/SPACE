@@ -442,6 +442,9 @@ def _fake_space_api(root: pathlib.Path):
         return rebuilt
 
     states: dict[str, str] = {}
+    templates: dict[str, str] = {}
+    # Snapshot memory per template, in MiB; "t-elsewhere" wakes on another worker.
+    mem_mib = {"t-base": 8, "t-small": 4, "t-elsewhere": 4}
     sessions: dict[str, tuple[int, bytes]] = {}
     seen_tokens: set[str] = set()
 
@@ -485,6 +488,7 @@ def _fake_space_api(root: pathlib.Path):
                 body = self.body()
                 assert body["resources"] == {"vcpu": 2, "memory_mib": 8192}
                 sid = str(uuid.uuid4())
+                templates[sid] = body["template"]
                 (run / sid).mkdir(parents=True)
                 os.symlink(f"/proc/{os.getpid()}", run / sid / "fc.pid")
                 states[sid] = "running"
@@ -503,7 +507,7 @@ def _fake_space_api(root: pathlib.Path):
             if action == ":suspend":
                 snap = cache / sid / "snapshot"
                 snap.mkdir(parents=True, exist_ok=True)
-                (snap / "memory").write_bytes(b"\x01" * (8 << 20))
+                (snap / "memory").write_bytes(b"\x01" * (mem_mib[templates[sid]] << 20))
                 (snap / "vmstate").write_bytes(b"v" * 4096)
                 time.sleep(0.5)
                 for name in ("memory", "vmstate"):
@@ -511,7 +515,8 @@ def _fake_space_api(root: pathlib.Path):
                 (run / sid / "fc.pid").unlink()
                 states[sid] = "suspended"
             else:
-                os.symlink(f"/proc/{os.getpid()}", run / sid / "fc.pid")
+                if templates[sid] != "t-elsewhere":
+                    os.symlink(f"/proc/{os.getpid()}", run / sid / "fc.pid")
                 states[sid] = "running"
             return self.reply({"sandbox_id": f"sbx_{sid}", "operation_id": f"op_{uuid.uuid4()}"}, 202)
 
@@ -526,7 +531,7 @@ def _fake_space_api(root: pathlib.Path):
     return server, seen_tokens
 
 
-def test_harness_api_mode_with_fake_space_api(tmp_path, monkeypatch):
+def test_harness_api_mode_with_fake_space_api(tmp_path, monkeypatch, capsys):
     import shutil
     import subprocess
 
@@ -540,11 +545,13 @@ def test_harness_api_mode_with_fake_space_api(tmp_path, monkeypatch):
     out_dir = tmp_path / "out"
     args = bench.build_parser().parse_args(
         [
-            "--variant", "baseline=t-base", "--sandboxes", "2", "--cycles", "2", "--concurrency", "2", "--no-sudo",
+            "--variant", "baseline=t-base", "--variant", "reporting=t-small", "--variant", "moved=t-elsewhere",
+            "--sandboxes", "2", "--cycles", "2", "--concurrency", "2", "--no-sudo",
             "--no-compressed-size", "--settle-secs", "0", "--idle-secs", "0", "--pattern-mem-mb", "1",
             "--pattern-file-mb", "1", "--anon-check-mb", "1", "--build-units", "2", "--build-blob-mb", "1",
             "--alloc-min-mb", "8", "--alloc-max-mb", "8", "--file-heavy-mb", "8", "--profiles", "idle",
-            "--sbxmgr", str(tmp_path / "missing-sbxmgr"), "--api-url", url, "--data-plane-url", url, "--api-token-file", str(token),
+            "--sbxmgr", str(tmp_path / "missing-sbxmgr"), "--api-url", url, "--data-plane-url", url,
+            "--api-token-file", str(token),
             "--sandbox-cache-dir", str(tmp_path / "cache"), "--sandbox-run-dir", str(tmp_path / "run"),
             "--jail-dir", str(tmp_path / "jail"), "--output-dir", str(out_dir),
         ]
@@ -556,12 +563,46 @@ def test_harness_api_mode_with_fake_space_api(tmp_path, monkeypatch):
         subprocess.run(["pkill", "-f", str(tmp_path / "guest")], check=False)
 
     rows = summary.load_rows([out_dir / "results.jsonl"])
-    assert len(rows) == 2 * 2
-    assert {r["error"] for r in rows} == {None}
+    by_variant = summary.group_by_variant(rows)
+    good = by_variant["baseline"] + by_variant["reporting"]
+    assert len(good) == 2 * 2 * 2
+    assert {r["error"] for r in good} == {None}
     assert all(r["api_mode"] and r["sandbox_id"].startswith("sbx_") for r in rows)
-    assert all(r["correctness_ok"] for r in rows)
-    # Sizes come from live sampling: the fake removes the files before suspend returns.
-    assert {r["snapshot_mem_bytes"] for r in rows} == {8 * MIB}
-    assert {r["snapshot_local_after_suspend"] for r in rows} == {False}
-    assert {r["restored_on_this_node"] for r in rows} == {True}
+    assert all(r["correctness_ok"] for r in good)
+    # The fake removes the files before suspend returns: measured sizes stay empty
+    # and the sampled ones are kept apart, with how long they held steady.
+    assert {r["snapshot_local_after_suspend"] for r in good} == {False}
+    assert {r["snapshot_mem_disk_bytes"] for r in good} == {None}
+    assert {r["snapshot_mem_bytes_sampled"] for r in by_variant["baseline"]} == {8 * MIB}
+    assert {r["snapshot_mem_bytes_sampled"] for r in by_variant["reporting"]} == {4 * MIB}
+    assert all(r["snapshot_sample_stable_ms"] >= 200 for r in good)
+    # A wake on another worker ends that sandbox with an error instead of empty rows.
+    moved = by_variant["moved"]
+    assert len(moved) == 2
+    assert all(r["cycle"] == 1 and r["correctness_ok"] is None for r in moved)
+    assert {r["error"] for r in moved} == {"restored on another node; cordon the other workers"}
     assert seen_tokens == {"Bearer mgmt-token", "Bearer attach-token"}
+
+    results = str(out_dir / "results.jsonl")
+    capsys.readouterr()
+    # Without opting in, sampled sizes never reach the gate.
+    assert summary.main([results, "--min-reduction-mib", "1", "--fail-on-gate"]) == 1
+    report = capsys.readouterr().out
+    assert "baseline invalid: 4 cycles missing snapshot_mem_disk_bytes" in report
+    # Opting in uses steady samples and says so.
+    gate = summary.evaluate_gate(
+        [r for r in rows if r["variant"] != "moved"], baseline="baseline", min_reduction_bytes=1 * MIB, min_sample_stable_ms=200
+    )
+    assert [(g.variant, g.passed, g.sampled_cycles, g.baseline_sampled_cycles) for g in gate] == [("reporting", True, 4, 4)]
+    # A stricter stability bar than the samples met counts them as missing.
+    strict = summary.evaluate_gate(
+        [r for r in rows if r["variant"] != "moved"], baseline="baseline", min_reduction_bytes=1 * MIB, min_sample_stable_ms=60_000
+    )
+    assert not strict[0].passed and strict[0].missing_cycles == 4
+
+
+def test_api_mode_sudo_prefix(tmp_path):
+    ns = argparse.Namespace(use_sudo="auto", sandbox_run_dir=str(tmp_path))
+    assert bench.api_mode_sudo_prefix(ns) == []
+    assert bench.api_mode_sudo_prefix(argparse.Namespace(use_sudo="yes", sandbox_run_dir=str(tmp_path))) == ["sudo"]
+    assert bench.api_mode_sudo_prefix(argparse.Namespace(use_sudo="no", sandbox_run_dir="/nonexistent")) == []

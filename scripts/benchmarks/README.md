@@ -100,11 +100,20 @@ an API template reference such as `baseline=bench-balloon-baseline:bench`.
 
 API mode still reads Firecracker statistics and snapshot sizes from the host,
 so run it on the worker the sandboxes land on and keep every other worker
-cordoned. A create that lands elsewhere is deleted and recorded as an error.
+cordoned. A create that lands elsewhere is deleted and recorded as an error,
+and a wake that lands elsewhere ends that sandbox's cycles with an error.
+
 An API suspend can remove the local snapshot once it is durable, so the harness
-samples file sizes while suspend runs. `snapshot_local_after_suspend` records
-whether the files survived; when they did not, compressed size and rootfs
-exclusive bytes are `null`. `restored_on_this_node` records where wake landed.
+also samples file sizes every 100 ms while suspend runs.
+`snapshot_local_after_suspend` records whether the files survived. When they
+did not, the measured size fields stay `null` and the samples are recorded
+under `<field>_sampled`, with `snapshot_sample_stable_ms` giving how long the
+memory file's allocated size held at its maximum. A sample can catch a file
+mid-write, so the summary's gate ignores sampled sizes and fails any variant
+or baseline with cycles missing the gate metric. Pass `--use-sampled-sizes` to
+let it use samples that held steady for at least `--min-sample-stable-ms`
+(default 500 ms); the report counts the cycles that used them.
+
 `--api-vcpu` and `--api-memory-mib` (default 2 and 8192) should match the
 templates.
 

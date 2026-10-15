@@ -12,7 +12,14 @@ its snapshot memory is small enough to advance:
   against the variant because a corrupted guest can fail that way).
 
 A baseline with correctness failures or unverified cycles invalidates the
-comparison, so every variant fails in that case.
+comparison, so every variant fails in that case. A measured cycle without the
+gate metric also fails its variant, so missing sizes never pass silently.
+
+API mode can lose the snapshot files before suspend returns. Those rows carry
+sizes sampled during suspend under ``<metric>_sampled`` instead of the measured
+field. The gate ignores them unless ``--use-sampled-sizes`` is set, and even
+then only uses rows whose sampled memory size stayed at its maximum for at
+least ``--min-sample-stable-ms``; the report counts the rows it used.
 """
 
 from __future__ import annotations
@@ -32,6 +39,8 @@ MIB = 1024 * 1024
 METRICS: tuple[tuple[str, str], ...] = (
     ("snapshot_mem_bytes", "bytes"),
     ("snapshot_mem_disk_bytes", "bytes"),
+    ("snapshot_mem_bytes_sampled", "bytes"),
+    ("snapshot_mem_disk_bytes_sampled", "bytes"),
     ("snapshot_mem_compressed_bytes", "bytes"),
     ("rootfs_snapshot_disk_bytes", "bytes"),
     ("rootfs_exclusive_bytes", "bytes"),
@@ -44,6 +53,7 @@ METRICS: tuple[tuple[str, str], ...] = (
     ("host_disk_write_bytes_restore", "bytes"),
 )
 DEFAULT_GATE_METRIC = "snapshot_mem_disk_bytes"
+DEFAULT_MIN_SAMPLE_STABLE_MS = 500
 
 
 def load_rows(paths: Iterable[Path]) -> list[dict[str, Any]]:
@@ -113,6 +123,35 @@ class GateResult:
     reduction_bytes: float | None
     reduction_pct: float | None
     reasons: list[str]
+    sampled_cycles: int = 0
+    missing_cycles: int = 0
+    baseline_sampled_cycles: int = 0
+
+
+def gate_values(
+    rows: Iterable[dict[str, Any]], metric: str, *, min_sample_stable_ms: float | None
+) -> tuple[list[float], int, int]:
+    """Gate values for measured cycles, and how many came from sampling or were missing.
+
+    ``min_sample_stable_ms`` of ``None`` disables the sampled fallback.
+    """
+    values: list[float] = []
+    sampled = missing = 0
+    for row in rows:
+        if not is_cycle(row):
+            continue
+        measured = metric_values([row], metric)
+        if measured:
+            values.extend(measured)
+            continue
+        stable = row.get("snapshot_sample_stable_ms")
+        fallback = metric_values([row], f"{metric}_sampled")
+        if min_sample_stable_ms is not None and fallback and isinstance(stable, (int, float)) and stable >= min_sample_stable_ms:
+            values.extend(fallback)
+            sampled += 1
+        else:
+            missing += 1
+    return values, sampled, missing
 
 
 def evaluate_gate(
@@ -122,19 +161,20 @@ def evaluate_gate(
     metric: str = DEFAULT_GATE_METRIC,
     min_reduction_pct: float = 10.0,
     min_reduction_bytes: float = 64 * MIB,
+    min_sample_stable_ms: float | None = None,
 ) -> list[GateResult]:
     groups = group_by_variant(rows)
     if baseline not in groups:
         raise SystemExit(f"ERROR: baseline variant {baseline!r} not found; have {sorted(groups)}")
     base_rows = groups[baseline]
-    base_values = metric_values([r for r in base_rows if is_cycle(r)], metric)
+    base_values, base_sampled, base_missing = gate_values(base_rows, metric, min_sample_stable_ms=min_sample_stable_ms)
     base_median = statistics.median(base_values) if base_values else None
     base_ok = correctness(base_rows)
 
     results = []
     for variant in sorted(v for v in groups if v != baseline):
         v_rows = groups[variant]
-        values = metric_values([r for r in v_rows if is_cycle(r)], metric)
+        values, sampled, missing = gate_values(v_rows, metric, min_sample_stable_ms=min_sample_stable_ms)
         v_median = statistics.median(values) if values else None
         check = correctness(v_rows)
         reasons: list[str] = []
@@ -148,6 +188,10 @@ def evaluate_gate(
             reasons.append(f"{check.unverified} unverified cycles")
         if check.cycles == 0:
             reasons.append("no measured cycles")
+        if base_missing:
+            reasons.append(f"baseline invalid: {base_missing} cycles missing {metric}")
+        if missing:
+            reasons.append(f"{missing} cycles missing {metric}")
         reduction = reduction_pct = None
         if base_median is None or v_median is None:
             reasons.append(f"missing {metric} for {'baseline' if base_median is None else 'variant'}")
@@ -167,6 +211,9 @@ def evaluate_gate(
                 reduction_bytes=reduction,
                 reduction_pct=reduction_pct,
                 reasons=reasons,
+                sampled_cycles=sampled,
+                missing_cycles=missing,
+                baseline_sampled_cycles=base_sampled,
             )
         )
     return results
@@ -239,15 +286,31 @@ def print_report(rows: Sequence[dict[str, Any]], gate: Sequence[GateResult], *, 
             f" reduction={fmt(result.reduction_bytes, 'bytes')} ({_pct(result.reduction_pct)})"
             + (f"  [{'; '.join(result.reasons)}]" if result.reasons else "")
         )
+        if result.sampled_cycles or result.baseline_sampled_cycles:
+            print(
+                f"  {'':16}       uses sizes sampled during suspend: {result.sampled_cycles} variant cycles,"
+                f" {result.baseline_sampled_cycles} baseline cycles"
+            )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Summarize bench-sbx-balloon.py JSONL results.")
     p.add_argument("results", nargs="+", type=Path, help="results.jsonl files")
     p.add_argument("--baseline", default="baseline", help="Variant label used as the gate baseline.")
-    p.add_argument("--gate-metric", default=DEFAULT_GATE_METRIC, choices=[m for m, u in METRICS if u == "bytes"])
+    p.add_argument("--gate-metric", default=DEFAULT_GATE_METRIC, choices=[m for m, u in METRICS if u == "bytes" and not m.endswith("_sampled")])
     p.add_argument("--min-reduction-pct", type=float, default=10.0)
     p.add_argument("--min-reduction-mib", type=float, default=64.0)
+    p.add_argument(
+        "--use-sampled-sizes",
+        action="store_true",
+        help="Let the gate use <metric>_sampled on rows whose snapshot files were gone after suspend (API mode).",
+    )
+    p.add_argument(
+        "--min-sample-stable-ms",
+        type=float,
+        default=DEFAULT_MIN_SAMPLE_STABLE_MS,
+        help="With --use-sampled-sizes, how long the sampled memory size must have held at its maximum.",
+    )
     p.add_argument("--by-profile", action="store_true", help="Break metrics down by workload profile.")
     p.add_argument("--json", action="store_true", help="Print machine-readable JSON instead of tables.")
     p.add_argument("--fail-on-gate", action="store_true", help="Exit 1 unless every variant passes.")
@@ -260,6 +323,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         metric=args.gate_metric,
         min_reduction_pct=args.min_reduction_pct,
         min_reduction_bytes=args.min_reduction_mib * MIB,
+        min_sample_stable_ms=args.min_sample_stable_ms if args.use_sampled_sizes else None,
     )
     if args.json:
         print(

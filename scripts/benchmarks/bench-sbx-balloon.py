@@ -403,18 +403,18 @@ class SpaceApi:
         self.wait_state(sandbox_id, "running", timeout)
         self.request("GET", f"/v1/sandboxes/{sandbox_id}/processes?limit=1", timeout=min(timeout, 180))
 
-    def create(self, template: str, resources: dict[str, int], timeout: float) -> str:
+    def create(self, template: str, resources: dict[str, int]) -> tuple[str, str]:
+        """POST the create and return (sandbox_id, operation_id) without waiting."""
         body = {"template": template, "runtime": "fc", "resources": resources}
         result = self.request("POST", "/v1/sandboxes", body, idempotent=True)
-        sandbox_id = result.get("sandbox_id")
-        if not isinstance(sandbox_id, str) or not sandbox_id.startswith("sbx_"):
-            raise ApiError(f"create returned no sandbox_id: {result}")
-        try:
-            self.wait_operation(str(result.get("operation_id")), timeout)
-            self.wait_ready(sandbox_id, timeout)
-        except ApiError as error:
-            raise ApiError(f"{sandbox_id}: {error}") from error
-        return sandbox_id
+        sandbox_id, operation_id = result.get("sandbox_id"), result.get("operation_id")
+        if not isinstance(sandbox_id, str) or not sandbox_id.startswith("sbx_") or not isinstance(operation_id, str):
+            raise ApiError(f"create returned no sandbox_id or operation_id: {result}")
+        return sandbox_id, operation_id
+
+    def wait_created(self, sandbox_id: str, operation_id: str, timeout: float) -> None:
+        self.wait_operation(operation_id, timeout)
+        self.wait_ready(sandbox_id, timeout)
 
     def lifecycle(self, sandbox_id: str, action: str, timeout: float) -> None:
         result = self.request("POST", f"/v1/sandboxes/{sandbox_id}:{action}", {}, idempotent=True)
@@ -499,19 +499,37 @@ class SnapshotSampler:
     sampler keeps the largest size seen for each file.
     """
 
+    # The memory file's allocated size, used to judge whether sampling saw a finished write.
+    STABILITY_KEY = "snapshot_mem_disk_bytes"
+
     def __init__(self, probe: HostProbe, sandbox_id: str, interval: float = 0.1) -> None:
         self.probe, self.sandbox_id, self.interval = probe, sandbox_id, interval
         self.best: dict[str, Any] = {}
+        self.stable_ms = 0
+        self._max_since: float | None = None
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True)
 
     def _loop(self) -> None:
         while True:
+            seen = time.monotonic()
             for key, value in self.probe.snapshot_stats(self.sandbox_id).items():
-                if isinstance(value, int) and value > (self.best.get(key) or -1):
+                if not isinstance(value, int):
+                    continue
+                if value > (self.best.get(key) or -1):
                     self.best[key] = value
+                    if key == self.STABILITY_KEY:
+                        self._max_since = seen
+                if key == self.STABILITY_KEY and value == self.best[key] and self._max_since is not None:
+                    self.stable_ms = int((seen - self._max_since) * 1000)
             if self._stop.wait(self.interval):
                 return
+
+    def results(self) -> dict[str, Any]:
+        """Sampled sizes under ``<field>_sampled`` keys, plus how long the memory size held at its maximum."""
+        out: dict[str, Any] = {f"{key}_sampled": value for key, value in self.best.items()}
+        out["snapshot_sample_stable_ms"] = self.stable_ms if self.best else None
+        return out
 
     def __enter__(self) -> SnapshotSampler:  # noqa: PYI034 - Python 3.9 nodes have no typing.Self
         self._thread.start()
@@ -520,6 +538,25 @@ class SnapshotSampler:
     def __exit__(self, *exc: object) -> None:
         self._stop.set()
         self._thread.join(timeout=30)
+
+
+def api_mode_sudo_prefix(args: argparse.Namespace) -> list[str]:
+    """Pick the prefix host probes need in API mode.
+
+    The probes read root-owned sandbox state (``fc.pid`` links, the Firecracker
+    socket, snapshot files). Without access they return ``None`` rather than
+    failing, so an automatic choice must check that access, not a CLI.
+    """
+    if args.use_sudo == "yes":
+        return ["sudo"]
+    if args.use_sudo == "no":
+        return []
+    run_dir = Path(args.sandbox_run_dir)
+    if os.geteuid() == 0 or os.access(run_dir, os.R_OK | os.X_OK):
+        return []
+    if run_capture(["sudo", "-n", "test", "-r", str(run_dir)]).returncode == 0:
+        return ["sudo"]
+    raise SystemExit(f"ERROR: cannot read {run_dir} directly or with passwordless sudo; pass --sudo or run as root.")
 
 
 # --- Host probes -----------------------------------------------------------
@@ -666,14 +703,17 @@ class HostProbe:
         return out
 
     def snapshot_metrics(self, sandbox_id: str, sampled: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Snapshot sizes, preferring live files and falling back to sizes sampled during suspend."""
+        """Snapshot sizes measured on the finished files.
+
+        When suspend removed the files, the measured fields stay ``None`` and the
+        sizes sampled while suspend ran are recorded under ``<field>_sampled``
+        so they cannot stand in for measured values unnoticed.
+        """
         snap = self.snapshot_dir(sandbox_id)
         out = self.snapshot_stats(sandbox_id)
         out["snapshot_local_after_suspend"] = out["snapshot_mem_bytes"] is not None
-        for key, value in (sampled or {}).items():
-            if out.get(key) is None:
-                out[key] = value
         if not out["snapshot_local_after_suspend"]:
+            out.update(sampled or {})
             out["snapshot_mem_compressed_bytes"] = None
             out["rootfs_exclusive_bytes"] = None
             return out
@@ -716,8 +756,8 @@ class BalloonBenchmark:
             if not token:
                 raise SystemExit("ERROR: API mode needs SPACE_API_TOKEN or --api-token-file")
             self.api = SpaceApi(args.api_url, args.data_plane_url, token)
-            # Templates are resolved by the cluster; the local CLI is optional and only reports a version.
-            self.prefix = choose_sudo_prefix(args.sbxmgr if Path(args.sbxmgr).exists() else "/bin/true", args.use_sudo)
+            # The cluster resolves templates, so the prefix only governs the host probes.
+            self.prefix = api_mode_sudo_prefix(args)
         else:
             checked_prereq(args.sbxmgr, "space-sbxmgr")
             checked_prereq(args.tmplmgr, "space-tmplmgr")
@@ -785,7 +825,9 @@ class BalloonBenchmark:
         print(
             f"  {row['variant']:12} {row['sandbox_index']:>3} {row['profile']:10} cycle={row['cycle']}"
             f" suspend={row.get('suspend_ms')}ms restore={row.get('restore_ms')}ms"
-            f" mem_disk={_mib(row.get('snapshot_mem_disk_bytes'))} {status}"
+            f" mem_disk={_mib(row.get('snapshot_mem_disk_bytes'))}"
+            + (f" (sampled ~{_mib(row['snapshot_mem_disk_bytes_sampled'])})" if row.get("snapshot_mem_disk_bytes_sampled") else "")
+            + f" {status}"
             + (f" error={row['error']}" if row.get("error") else ""),
             flush=True,
         )
@@ -811,7 +853,7 @@ class BalloonBenchmark:
             rc, ms, out = self.api_op(self.api.lifecycle, sandbox_id, "suspend", self.args.op_timeout_secs)
             if rc == 0:
                 rc, _, out = self.api_op(self.api.wait_state, sandbox_id, "suspended", self.args.op_timeout_secs)
-        return rc, ms, out, sampler.best
+        return rc, ms, out, sampler.results()
 
     def restore(self, sandbox_id: str) -> tuple[int, int, str]:
         if self.api is None:
@@ -840,15 +882,16 @@ class BalloonBenchmark:
         if self.api is not None:
             resources = {k: v for k, v in (("vcpu", a.api_vcpu), ("memory_mib", a.api_memory_mib)) if v}
             try:
-                sandbox_id = self.api.create(template, resources, a.op_timeout_secs)
+                sandbox_id, operation_id = self.api.create(template, resources)
             except ApiError as error:
-                text = str(error)
-                leaked = re.match(r"(sbx_[0-9a-fA-F-]{36})", text)
-                if leaked:
-                    self.track(leaked.group(1))
-                    self.delete(cli, leaked.group(1))
-                return None, f"create failed: {sanitize_error(text)}"
+                return None, f"create failed: {sanitize_error(str(error))}"
+            # Track before waiting so an interrupted or failed create is still cleaned up.
             self.track(sandbox_id)
+            try:
+                self.api.wait_created(sandbox_id, operation_id, a.op_timeout_secs)
+            except ApiError as error:
+                self.delete(cli, sandbox_id)
+                return None, f"create failed for {sandbox_id}: {sanitize_error(str(error))}"
             deadline = time.monotonic() + a.local_wait_secs
             while self.probe.fc_pid(sandbox_id) is None:
                 if time.monotonic() >= deadline:
@@ -957,8 +1000,12 @@ class BalloonBenchmark:
                 row.update(correctness_ok=None, error=f"restore failed: {sanitize_error(out)}")
                 self.emit(row)
                 return
+            if self.probe.fc_pid(sandbox_id) is None:
+                # Every later host measurement would read nothing, so stop this sandbox here.
+                row.update(correctness_ok=None, error="restored on another node; cordon the other workers")
+                self.emit(row)
+                return
             row["fc_rss_after_restore_kib"] = self.probe.fc_rss_kib(sandbox_id)
-            row["restored_on_this_node"] = self.probe.fc_pid(sandbox_id) is not None
 
             rc, ms, out = self.guest(sandbox_id, GUEST_VERIFY, cycle, 1 if base["anon_check"] else 0)
             row["verify_ms"] = ms
