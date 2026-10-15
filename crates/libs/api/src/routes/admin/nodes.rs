@@ -296,8 +296,11 @@ fn validate_drain_transition(
             //   downgrade would park a half-evacuated node in a state neither
             //   mode describes. Aborting outright is `:undrain`.
             // - Same mode leaves the persisted mode where it is, and is not an
-            //   error: a rollout script re-issuing `--forced` after a timeout
-            //   should find the node in the state it asked for. It still
+            //   error: an operator re-running
+            //   `space-admin-cli drain-node --forced` after a timeout should find
+            //   the node in the state they asked for.
+            //   (Automation that sets `require_undrained` gets a 409 instead,
+            //   before this matrix runs.) It still
             //   re-patches the substrate cordon, a request-path repair for a
             //   diverged one. The reconciler re-asserts cordon every tick for a
             //   `draining` node too, so that patch is redundant whenever the
@@ -1633,9 +1636,8 @@ async fn apply_drain_action(
     // already-draining node used to 409 before reaching this point, and an
     // operator's repeat or escalation now gets here. Automation that sets
     // `require_undrained` doesn't: it is refused before the commit. Closing it
-    // means holding
-    // the row lock across the substrate call, which inverts the dependency this
-    // ordering exists to fix.
+    // means holding the row lock across the substrate call, which inverts the
+    // dependency this ordering exists to fix.
     let substrate_outcome = if supports_node_drain {
         converge_substrate_schedulability(&state, &current, action).await
     } else {

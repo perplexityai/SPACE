@@ -190,8 +190,9 @@ fn a_forced_drain_cannot_be_downgraded_to_gentle() {
 }
 
 /// Re-asserting the mode a node already has is idempotent *on the mode*, and not
-/// an error: a rollout script that re-issues `--forced` after a timeout should
-/// find the node in the state it asked for, not a 409 it has to special-case.
+/// an error: an operator who re-runs `space-admin-cli drain-node --forced`
+/// after a timeout should find the node in the state they asked for, not a 409
+/// to special-case.
 ///
 /// It takes the same arm as the escalation, `UpdateInFlightDrain`, but with
 /// `None` for the mode, rather than a distinct no-op arm. That is deliberate

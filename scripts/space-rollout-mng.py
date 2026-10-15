@@ -1071,7 +1071,7 @@ def pick_drain_candidates(
       The phase re-read in `drain()` sees `draining` and skips it with
       `drain_skipped_already_draining`.
     * **Somebody else's drain, committed inside our snapshot window.** An
-      operator running `space drain-node <node>` by hand during a wave. The
+      operator running `space-admin-cli drain-node <node>` by hand during a wave. The
       phase re-read in `drain()` skips it if the drain is visible by then;
       if it commits between that read and the POST, the endpoint refuses the
       POST and `drain()` emits the same event with `refused_by: endpoint`.

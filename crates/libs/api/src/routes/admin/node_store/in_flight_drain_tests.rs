@@ -36,7 +36,7 @@ struct DrainColumns {
 /// meet an escalation in a live cluster.
 ///
 /// `replace_after_terminate` mirrors the `:drain` request flag: `false` is what
-/// `space drain-node --no-replace-after-terminate` persists as
+/// `space-admin-cli drain-node --no-replace-after-terminate` persists as
 /// `terminate_decrement_capacity = true`, the value a blue-green shrink depends
 /// on.
 async fn insert_draining_node(

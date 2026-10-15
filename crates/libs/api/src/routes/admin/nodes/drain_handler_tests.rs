@@ -444,7 +444,7 @@ async fn escalating_commits_the_mode_and_keeps_the_drain() -> TestResult {
         node_id,
         DrainAction::Drain,
         DrainRequest {
-            // Omitted, which is what `space drain-node --forced` sends.
+            // Omitted, which is what `space-admin-cli drain-node --forced` sends.
             replace_after_terminate: None,
             mode: NodeDrainMode::Forced,
             ..DrainRequest::default()

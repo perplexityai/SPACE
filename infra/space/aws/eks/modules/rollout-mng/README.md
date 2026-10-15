@@ -134,10 +134,15 @@ first real rollout.
   schedule against the incumbent pool (or stay `Pending`), defeating
   the rollout.
 - **Per-drain `replace_after_terminate` flag**. The
-  orchestration script drives `space-admin-cli drain-node --forced
-  --no-replace-after-terminate` so the incumbent MNG shrinks
-  monotonically (`--forced` because the default drain mode is gentle,
-  which waits for residents instead of evacuating them). The `nodes.terminate_decrement_capacity` column and
+  orchestration script posts `:drain` with `mode: forced`,
+  `replace_after_terminate: false` and `require_undrained: true`, so the
+  incumbent MNG shrinks monotonically (`forced` because the default drain
+  mode is gentle, which waits for residents instead of evacuating them) and
+  the request can never escalate a drain somebody else started. Draining a
+  node by hand with `space-admin-cli drain-node --forced
+  --no-replace-after-terminate` has the same replacement intent but no
+  start-only precondition: against a node already gentle-draining it
+  escalates that drain in place. The `nodes.terminate_decrement_capacity` column and
   the corresponding `Ec2InstanceTerminator` path are already on `main`.
 
 **Still pending — wire up before the first real rollout:**
