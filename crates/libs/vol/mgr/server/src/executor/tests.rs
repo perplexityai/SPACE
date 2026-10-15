@@ -1986,7 +1986,7 @@ async fn sparse_decompress_failure_leaves_no_scratch_siblings() {
             &path,
             Some(snapshot_artifact),
             MaterializationMode::Enabled,
-            None,
+            DecodeGate::Permit(None),
         )
         .await;
 
@@ -2008,6 +2008,13 @@ async fn sparse_decompress_failure_leaves_no_scratch_siblings() {
 }
 
 fn codec_test_executor(codec_concurrency: usize) -> TransferExecutor {
+    codec_test_executor_with_store(codec_concurrency, Arc::new(MockObjectStore::default()))
+}
+
+pub(super) fn codec_test_executor_with_store(
+    codec_concurrency: usize,
+    store: Arc<dyn ObjectStore>,
+) -> TransferExecutor {
     TransferExecutor::new_for_test(
         TransferExecutorConfig {
             compress: false,
@@ -2015,7 +2022,7 @@ fn codec_test_executor(codec_concurrency: usize) -> TransferExecutor {
             static_credentials: Some(test_creds()),
             ..Default::default()
         },
-        Arc::new(MockObjectStore::default()),
+        store,
     )
 }
 
@@ -3384,10 +3391,11 @@ async fn memory_decompression_preserves_zero_runs_as_holes() {
         &path,
         Some(SnapshotArtifact::Memory),
         MaterializationMode::Enabled,
-        None,
+        DecodeGate::Permit(None),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .expect_complete();
     assert!(report.candidate_hole_bytes > (ZERO_RUN_BYTES - MEMORY_SPARSE_BLOCK_BYTES * 2) as u64);
 
     // assert
@@ -3420,10 +3428,11 @@ async fn restore_memory_decompression_preserves_leading_and_trailing_holes() {
         &path,
         Some(SnapshotArtifact::Memory),
         MaterializationMode::Enabled,
-        None,
+        DecodeGate::Permit(None),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .expect_complete();
 
     // assert
     assert_eq!(std::fs::read(&path).unwrap(), expected);
@@ -3455,10 +3464,11 @@ async fn restore_rootfs_ext4_decompression_preserves_zero_runs_as_holes() {
         &path,
         Some(SnapshotArtifact::Rootfs),
         MaterializationMode::Enabled,
-        None,
+        DecodeGate::Permit(None),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .expect_complete();
 
     // assert
     assert_eq!(std::fs::read(&path).unwrap(), expected);
@@ -3483,10 +3493,11 @@ async fn rootfs_ext4_partial_zero_block_preserves_length_as_a_hole() {
         &path,
         Some(SnapshotArtifact::Rootfs),
         MaterializationMode::Enabled,
-        None,
+        DecodeGate::Permit(None),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .expect_complete();
 
     assert_eq!(std::fs::read(&path).unwrap(), expected);
     let metadata = std::fs::metadata(&path).unwrap();
@@ -3522,10 +3533,11 @@ async fn rootfs_ext4_preserves_data_around_sparse_block_boundaries() {
         &path,
         Some(SnapshotArtifact::Rootfs),
         MaterializationMode::Enabled,
-        None,
+        DecodeGate::Permit(None),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .expect_complete();
 
     assert_eq!(std::fs::read(&path).unwrap(), expected);
     let metadata = std::fs::metadata(&path).unwrap();
@@ -3552,10 +3564,11 @@ async fn rootfs_btrfs_send_decompression_remains_dense() {
         &path,
         Some(SnapshotArtifact::RootfsBtrfsSend),
         MaterializationMode::Enabled,
-        None,
+        DecodeGate::Permit(None),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .expect_complete();
 
     // assert
     assert_eq!(std::fs::read(&path).unwrap(), expected);
@@ -3581,10 +3594,11 @@ async fn memory_decompression_remains_dense_when_mode_is_disabled() {
         &path,
         Some(SnapshotArtifact::Memory),
         MaterializationMode::Disabled,
-        None,
+        DecodeGate::Permit(None),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .expect_complete();
 
     assert_eq!(std::fs::read(&path).unwrap(), expected);
     let metadata = std::fs::metadata(&path).unwrap();
@@ -3610,10 +3624,11 @@ async fn shadow_memory_decompression_defers_comparison_and_stays_dense() {
         &path,
         Some(SnapshotArtifact::Memory),
         MaterializationMode::Shadow,
-        None,
+        DecodeGate::Permit(None),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .expect_complete();
 
     assert_eq!(std::fs::read(&path).unwrap(), expected);
     assert_eq!(report.mode, MaterializationMode::Shadow);
@@ -3646,10 +3661,11 @@ async fn shadow_rootfs_decompression_defers_comparison_and_stays_dense() {
         &path,
         Some(SnapshotArtifact::Rootfs),
         MaterializationMode::Shadow,
-        None,
+        DecodeGate::Permit(None),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .expect_complete();
 
     assert_eq!(std::fs::read(&path).unwrap(), expected);
     assert_eq!(report.mode, MaterializationMode::Shadow);
@@ -4499,7 +4515,7 @@ async fn stage_encrypted_temp_returns_partial_enc_path_on_aad_derivation_error()
 
 // ── MaybeZstdDecodingWriter (pull-side chained decode) ─────────────
 
-fn zstd_compress(plaintext: &[u8]) -> Vec<u8> {
+pub(super) fn zstd_compress(plaintext: &[u8]) -> Vec<u8> {
     zstd::encode_all(plaintext, 3).unwrap()
 }
 
@@ -4681,10 +4697,11 @@ async fn encrypted_compressed_memory_restore_is_sparse() {
             materialization_mode: MaterializationMode::Enabled,
         },
         Some(&key),
-        None,
+        DecodeGate::Permit(None),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .expect_complete();
 
     assert!(was_decompressed);
     assert_eq!(report.mode, MaterializationMode::Enabled);
@@ -4708,10 +4725,11 @@ async fn encrypted_compressed_memory_restore_is_sparse() {
             materialization_mode: MaterializationMode::Shadow,
         },
         Some(&key),
-        None,
+        DecodeGate::Permit(None),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .expect_complete();
     assert!(was_decompressed);
     assert_eq!(report.mode, MaterializationMode::Shadow);
     assert_eq!(report.candidate_hole_bytes, 0);
@@ -4744,10 +4762,11 @@ async fn encrypted_compressed_memory_restore_is_sparse() {
             materialization_mode: MaterializationMode::Disabled,
         },
         Some(&key),
-        None,
+        DecodeGate::Permit(None),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .expect_complete();
     assert!(was_decompressed);
     assert_eq!(report, DecompressionReport::default());
     assert_eq!(std::fs::read(&plaintext_path).unwrap(), expected);
@@ -4778,10 +4797,11 @@ async fn encrypted_compressed_memory_restore_is_sparse() {
             materialization_mode: MaterializationMode::Enabled,
         },
         Some(&key),
-        None,
+        DecodeGate::Permit(None),
     )
     .await
-    .unwrap();
+    .unwrap()
+    .expect_complete();
     assert!(!was_decompressed);
     assert_eq!(report, DecompressionReport::default());
     assert_eq!(std::fs::read(&plaintext_path).unwrap(), expected);

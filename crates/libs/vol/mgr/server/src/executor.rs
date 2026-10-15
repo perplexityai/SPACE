@@ -1,4 +1,9 @@
+mod decode_admission;
 mod stream_push;
+use decode_admission::{
+    CappedDecode, DecodeGate, DecodedOutputCap, copy_decode_capped, is_output_cap_exceeded,
+    over_cap_or,
+};
 use stream_push::StreamPushConfig;
 pub use stream_push::{
     DEFAULT_STREAM_PUSH_BUFFER_BUDGET_BYTES, SnapshotUploadMode, StreamingPushBudget,
@@ -58,7 +63,8 @@ const ROOTFS_SPARSE_BLOCK_BYTES: usize = 64 * 1024;
 // metadata-sized artifacts behind gigabyte decodes would add pull latency
 // where today there is none. Frames with an unknown decompressed size
 // (streaming zstd, all ciphertext) are never proven small, so they always
-// take a permit regardless of compressed length.
+// take a permit regardless of compressed length, unless their artifact
+// class bypasses admission under an output cap (see `decode_admission`).
 const CODEC_ADMISSION_MIN_INPUT_BYTES: u64 = 256 * 1024 * 1024;
 const SHADOW_COMPARISON_CONCURRENCY: usize = 1;
 
@@ -1335,8 +1341,8 @@ fn compare_sparse_shadow(
 /// rename lands last simply overwrites identical bytes. The name keeps
 /// the `.dec.tmp` suffix residue tooling matches on.
 ///
-/// `codec_permit` (if the caller took one) is moved into the blocking
-/// task and released only when the decode exits, so a cancelled caller
+/// The permit in `gate` (if the caller took one) is moved into the
+/// blocking task and released only when the decode exits, so a cancelled caller
 /// cannot free the permit while the detached `spawn_blocking` keeps
 /// burning CPU.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1349,8 +1355,9 @@ async fn decompress_in_place(
     path: &Path,
     snapshot_artifact: Option<SnapshotArtifact>,
     requested_mode: MaterializationMode,
-    codec_permit: Option<CodecPermit>,
-) -> Result<DecompressionReport, JobError> {
+    gate: DecodeGate,
+) -> Result<CappedDecode<DecompressionReport>, JobError> {
+    let (codec_permit, max_decoded_bytes) = gate.into_parts();
     let snapshot_artifact = snapshot_artifact.or_else(|| snapshot_artifact_from_local_path(path));
     let mode = effective_materialization_mode(snapshot_artifact, requested_mode);
     let block_bytes = materialization_block_bytes(snapshot_artifact);
@@ -1366,9 +1373,9 @@ async fn decompress_in_place(
     let tmp = tmp_path.clone();
     let dst = path.to_path_buf();
 
-    tokio::task::spawn_blocking(move || -> Result<DecompressionReport, JobError> {
+    tokio::task::spawn_blocking(move || {
         let _codec_permit = codec_permit;
-        let result = (|| -> Result<DecompressionReport, JobError> {
+        let result = (|| -> Result<CappedDecode<DecompressionReport>, JobError> {
             let mut reader = std::fs::File::open(&src)
                 .map_err(|e| JobError::Permanent(format!("open for decompression: {e}")))?;
             let writer = std::fs::File::create(&tmp)
@@ -1381,16 +1388,22 @@ async fn decompress_in_place(
                                 "create sparse decompression writer: {error}"
                             ))
                         })?;
-                    zstd::stream::copy_decode(&mut reader, &mut writer)
-                        .map_err(|e| JobError::Permanent(format!("zstd decompress: {e}")))?;
+                    if let CappedDecode::OverCap =
+                        copy_decode_capped(&mut reader, &mut writer, max_decoded_bytes)?
+                    {
+                        return Ok(CappedDecode::OverCap);
+                    }
                     writer.finish_with_stats().map_err(|e| {
                         JobError::Permanent(format!("finalize decompression temp: {e}"))
                     })?
                 }
                 MaterializationMode::Disabled | MaterializationMode::Shadow => {
                     let mut writer = writer;
-                    zstd::stream::copy_decode(&mut reader, &mut writer)
-                        .map_err(|e| JobError::Permanent(format!("zstd decompress: {e}")))?;
+                    if let CappedDecode::OverCap =
+                        copy_decode_capped(&mut reader, &mut writer, max_decoded_bytes)?
+                    {
+                        return Ok(CappedDecode::OverCap);
+                    }
                     writer.flush().map_err(|e| {
                         JobError::Permanent(format!("flush decompression temp: {e}"))
                     })?;
@@ -1406,16 +1419,16 @@ async fn decompress_in_place(
             std::fs::rename(&tmp, &dst)
                 .map_err(|e| JobError::Permanent(format!("rename decompressed file: {e}")))?;
             page_cache::advise_path_dontneed(&dst, "decompressed volume download output");
-            Ok(DecompressionReport {
+            Ok(CappedDecode::Complete(DecompressionReport {
                 mode,
                 candidate_hole_bytes,
-            })
+            }))
         })();
-        if result.is_err() {
+        if !matches!(result, Ok(CappedDecode::Complete(_))) {
             // The unique scratch name has no successor to truncate-and-
             // reuse it, and non-restore destinations have no sweeper —
-            // a failed decompress must reclaim its own scratch or every
-            // failure strands a destination-sized orphan.
+            // a failed or over-cap decompress must reclaim its own
+            // scratch or every failure strands a destination-sized orphan.
             match std::fs::remove_file(&tmp) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -2599,6 +2612,26 @@ enum MaybeZstdState<Input: Write, Output: Write> {
     Transient,
 }
 
+/// A `BufWriter` flush that failed while finishing a
+/// [`MaybeZstdDecodingWriter`]. The sink's error stays the source, so a
+/// typed sink error such as a decode output-cap overflow survives the wrap.
+#[derive(Debug, thiserror::Error)]
+#[error("flush BufWriter at {stage}: {source}")]
+struct BufferedFlushError {
+    stage: &'static str,
+    #[source]
+    source: std::io::Error,
+}
+
+impl BufferedFlushError {
+    fn io<W>(stage: &'static str, error: std::io::IntoInnerError<W>) -> std::io::Error {
+        std::io::Error::other(Self {
+            stage,
+            source: error.into_error(),
+        })
+    }
+}
+
 #[cfg(test)]
 fn identity_decoding_sink<W: Write>(sink: W, _decompressing: bool) -> std::io::Result<W> {
     Ok(sink)
@@ -2668,16 +2701,16 @@ where
                 // as a JobError::Retriable.
                 decoder.finish()?;
                 let (buf_writer, _decoder) = decoder.into_inner();
-                let sink = buf_writer.into_inner().map_err(|e| {
-                    std::io::Error::other(format!("flush BufWriter at decoder finish: {e}"))
-                })?;
+                let sink = buf_writer
+                    .into_inner()
+                    .map_err(|e| BufferedFlushError::io("decoder finish", e))?;
                 sink.complete()?;
                 Ok(true)
             }
             MaybeZstdState::Passthrough(buf_writer) => {
-                let sink = buf_writer.into_inner().map_err(|e| {
-                    std::io::Error::other(format!("flush BufWriter at stream finish: {e}"))
-                })?;
+                let sink = buf_writer
+                    .into_inner()
+                    .map_err(|e| BufferedFlushError::io("stream finish", e))?;
                 sink.complete()?;
                 Ok(false)
             }
@@ -3040,7 +3073,11 @@ impl pplx_space_object_store::FinishingWrite for StreamDecodeSink {
 /// ranged-size objects, whose decode cannot be proven small before the
 /// bytes arrive (the frame header is not on disk yet), so admission is
 /// unconditional — the conservative direction, and exactly what keeps the
-/// highly-compressible multi-GiB snapshot class bounded.
+/// highly-compressible multi-GiB snapshot class bounded. The artifact-class
+/// bypass in `decode_admission` does not apply here: a stream needs more
+/// than one download chunk of wire bytes (8 MiB minimum, 32 MiB by default),
+/// far above any legitimate `metadata` or `vmstate` object, so such an object
+/// is already suspect and keeps its permit.
 struct StreamedPullAdmission<'a> {
     executor: &'a TransferExecutor,
     kind: &'a str,
@@ -3087,8 +3124,10 @@ impl pplx_space_object_store::DecodeAdmission for StreamedPullAdmission<'_> {
 /// is zstd-magic and the caller asked for transparent decompression,
 /// it lands decompressed on disk in one pass.
 ///
-/// Returns the plaintext temp path and decompression report on success. On
-/// failure the partial `.plaintext.tmp` may exist — the caller is
+/// Returns the plaintext temp path and decompression report on success. A
+/// [`DecodeGate::Capped`] pass that overflows its cap removes its own
+/// partial output and returns [`CappedDecode::OverCap`] with the ciphertext
+/// intact. On failure the partial `.plaintext.tmp` may exist — the caller is
 /// responsible for cleaning it up, same contract as
 /// [`stage_encrypted_temp`].
 #[derive(Clone, Copy)]
@@ -3104,12 +3143,13 @@ async fn stage_decrypted_temp(
     ciphertext_path: &Path,
     options: DecryptedPullOptions,
     resolved_dek: Option<&[u8]>,
-    codec_permit: Option<CodecPermit>,
-) -> Result<(PathBuf, bool, DecompressionReport), (PathBuf, JobError)> {
+    gate: DecodeGate,
+) -> Result<CappedDecode<(PathBuf, bool, DecompressionReport)>, (PathBuf, JobError)> {
     let DecryptedPullOptions {
         decompress_if_zstd,
         materialization_mode: requested_mode,
     } = options;
+    let (codec_permit, max_decoded_bytes) = gate.into_parts();
     let plaintext_tmp = decrypted_sibling(ciphertext_path);
     let (wrap_aad, entry_aad) = match derive_artifact_aads(p, enc.organization_id) {
         Ok(a) => a,
@@ -3149,7 +3189,7 @@ async fn stage_decrypted_temp(
     let job_id = job.job_id;
     let subject_id = p.subject_id.clone();
     let job_priority = job.priority;
-    let result: Result<(bool, DecompressionReport), JobError> =
+    let result: Result<CappedDecode<(bool, DecompressionReport)>, JobError> =
         tokio::task::spawn_blocking(move || {
             let _codec_permit = codec_permit;
             let mut src_file = std::fs::File::open(&ciphertext)
@@ -3173,17 +3213,28 @@ async fn stage_decrypted_temp(
                     None,
                     job_priority,
                 )
+                // A passthrough stream decodes nothing, so only a decode is capped.
+                .map(|sink| {
+                    DecodedOutputCap::new(sink, max_decoded_bytes.filter(|_| decompressing))
+                })
             };
             let mut writer = MaybeZstdDecodingWriter::with_sink_selector(
                 dst_file,
                 decompress_if_zstd,
                 select_sink,
             );
-            crypto::decrypt_stream_blocking(&mut src_file, &mut writer, &dek, &entry_aad)
-                .map_err(crypto_error_to_job_error)?;
-            let was_decompressed = writer
-                .finish()
-                .map_err(|e| JobError::Permanent(format!("finalize plaintext writer: {e}")))?;
+            match crypto::decrypt_stream_blocking(&mut src_file, &mut writer, &dek, &entry_aad) {
+                Ok(()) => {}
+                Err(CryptoError::Io(error)) if is_output_cap_exceeded(&error) => {
+                    return Ok(CappedDecode::OverCap);
+                }
+                Err(error) => return Err(crypto_error_to_job_error(error)),
+            }
+            let CappedDecode::Complete(was_decompressed) = over_cap_or(writer.finish())
+                .map_err(|e| JobError::Permanent(format!("finalize plaintext writer: {e}")))?
+            else {
+                return Ok(CappedDecode::OverCap);
+            };
             page_cache::advise_path_dontneed(&plaintext, "decrypted volume download temp");
             tracing::debug!(
                 job_id = %job_id,
@@ -3194,7 +3245,7 @@ async fn stage_decrypted_temp(
             );
             let candidate_hole_bytes =
                 candidate_observer.load(std::sync::atomic::Ordering::Relaxed);
-            Ok((
+            Ok(CappedDecode::Complete((
                 was_decompressed,
                 DecompressionReport {
                     mode: if was_decompressed {
@@ -3204,12 +3255,26 @@ async fn stage_decrypted_temp(
                     },
                     candidate_hole_bytes,
                 },
-            ))
+            )))
         })
         .await
         .unwrap_or_else(|e| Err(JobError::Permanent(format!("decrypt task panicked: {e}"))));
     match result {
-        Ok((was_decompressed, report)) => Ok((plaintext_tmp, was_decompressed, report)),
+        Ok(CappedDecode::Complete((was_decompressed, report))) => Ok(CappedDecode::Complete((
+            plaintext_tmp,
+            was_decompressed,
+            report,
+        ))),
+        Ok(CappedDecode::OverCap) => {
+            unlink_crypto_tmp(
+                &plaintext_tmp,
+                &job.job_id,
+                &p.subject_id,
+                "decode_over_cap",
+            )
+            .await;
+            Ok(CappedDecode::OverCap)
+        }
         Err(err) => Err((plaintext_tmp, err)),
     }
 }
@@ -5376,40 +5441,34 @@ impl TransferExecutor {
             // The chained decode runs inside the decrypt pass, so admit it
             // to the codec limit up front. The frame size can't be read
             // through ciphertext, so this admits conservatively on the
-            // compressed-input floor whenever a decode will run.
-            let codec_permit = if decompress_if_zstd {
-                let codec_wait_started_at = Instant::now();
-                let permit = self
-                    .acquire_codec_permit_for_decode(&tmp_path, job.priority)
-                    .await?;
-                if permit.is_some() {
-                    emit_transfer_phase_duration(
-                        &job.kind,
-                        artifact,
-                        TransferPhase::DecryptWait,
-                        execution_materialization_mode,
-                        codec_wait_started_at,
-                    );
-                }
-                permit
-            } else {
-                None
+            // compressed-input floor whenever a decode will run, unless the
+            // artifact class bypasses admission under an output cap.
+            let ciphertext_path: &Path = &tmp_path;
+            let options = DecryptedPullOptions {
+                decompress_if_zstd,
+                materialization_mode: execution_materialization_mode,
             };
-            let decrypt_started_at = Instant::now();
-            match stage_decrypted_temp(
-                job,
-                p,
-                enc,
-                &tmp_path,
-                DecryptedPullOptions {
-                    decompress_if_zstd,
-                    materialization_mode: execution_materialization_mode,
-                },
-                resolved_dek,
-                codec_permit,
-            )
-            .await
-            {
+            let (decrypt_started_at, staged) = self
+                .run_admitted_decode(
+                    job,
+                    p,
+                    execution_materialization_mode,
+                    decompress_if_zstd.then_some(TransferPhase::DecryptWait),
+                    ciphertext_path,
+                    |gate| {
+                        stage_decrypted_temp(
+                            job,
+                            p,
+                            enc,
+                            ciphertext_path,
+                            options,
+                            resolved_dek,
+                            gate,
+                        )
+                    },
+                )
+                .await?;
+            match staged {
                 Ok((plaintext_tmp, was_decompressed, report)) => {
                     chained_decompressed = was_decompressed;
                     decompression_report = report;
@@ -5542,27 +5601,24 @@ impl TransferExecutor {
                 compressed_bytes = bytes,
                 "decompressing downloaded artifact"
             );
-            let codec_wait_started_at = Instant::now();
-            let codec_permit = self
-                .acquire_codec_permit_for_decode(local_path, job.priority)
-                .await?;
-            if codec_permit.is_some() {
-                emit_transfer_phase_duration(
-                    &job.kind,
-                    artifact,
-                    TransferPhase::DecompressWait,
+            let (decompress_started_at, report) = self
+                .run_admitted_decode(
+                    job,
+                    p,
                     execution_materialization_mode,
-                    codec_wait_started_at,
-                );
-            }
-            let decompress_started_at = Instant::now();
-            let report = decompress_in_place(
-                local_path,
-                snapshot_artifact,
-                execution_materialization_mode,
-                codec_permit,
-            )
-            .await?;
+                    Some(TransferPhase::DecompressWait),
+                    local_path,
+                    |gate| {
+                        decompress_in_place(
+                            local_path,
+                            snapshot_artifact,
+                            execution_materialization_mode,
+                            gate,
+                        )
+                    },
+                )
+                .await?;
+            let report = report?;
             apply_file_mode(local_path, p.file_mode, FileModeApplyPolicy::Required).await?;
             let decompressed = tokio::fs::metadata(local_path)
                 .await

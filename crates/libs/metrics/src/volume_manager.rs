@@ -22,6 +22,14 @@
 //! the source is encrypted: LUKS snapshot artifacts use `zstd` (or `raw` when
 //! compression is disabled), not `aead`. Their artifact tags are
 //! `encrypted_snapshot_volume` and `encrypted_rootfs_cow`.
+//!
+//! `volume_manager.transfer.decode_bypass_overflow` (tags `kind`, `artifact`)
+//! counts pull decodes that skipped codec admission by artifact class, wrote
+//! more than the bypass output cap, and restarted under a codec permit. The
+//! bypass covers `metadata` and `vmstate`, whose legitimate objects stay far
+//! below the cap, so any sustained count means objects are oversized or
+//! corrupt. The restarted pass's wait and duration appear in the usual phase
+//! timings; the abandoned pass is counted only here.
 
 use std::time::Instant;
 
@@ -240,6 +248,14 @@ pub fn transfer_materialization_allocation(
             tags,
         );
     }
+}
+
+pub fn transfer_decode_bypass_overflow(kind: &str, artifact: &str) {
+    counter(
+        "volume_manager.transfer.decode_bypass_overflow",
+        1,
+        &[tag("kind", kind), tag("artifact", artifact)],
+    );
 }
 
 pub fn transfer_materialization_shadow_comparison(artifact: &str, outcome: &str) {
