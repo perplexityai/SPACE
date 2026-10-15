@@ -163,12 +163,41 @@ Prefetch requires the catalog to confirm generic-only release resolution from th
 | `SPACE_TRUSTED_TEMPLATE_STORAGE_BUCKETS` | empty = any bucket | |
 | `SPACE_TEMPLATE_PUBLISH_SYSTEM_SERVICE_ACCOUNTS`, `SPACE_TEMPLATE_PUBLISH_TENANT_SERVICE_ACCOUNTS` | empty | Startup error when the allowed set is empty. An account in both lists (build-manager) must present the grant issued for that system build by the API or a system-only operator; each grant authorizes one release. |
 | `SPACE_BUILD_AUTH_SYSTEM_SERVICE_ACCOUNTS`, `SPACE_BUILD_AUTH_TENANT_SERVICE_ACCOUNTS` | empty | |
+| `SPACE_TEMPLATE_PUBLICATION_TOKEN_PATH` | unset | Direct deployments only: dedicated publisher credential file shared by ClusterApi and build-manager. Never reuse the shared node token; incompatible with Kubernetes authentication. See below. |
 | `SPACE_BUILD_MANAGER_ENDPOINT` | `127.0.0.1:9900` | |
 | `SPACE_BUILD_MANAGER_TLS_SERVER_NAME` | from endpoint | |
 | `SPACE_BUILD_MANAGER_AUTH_ALLOWED_SERVICE_ACCOUNTS` | empty | |
 | `SPACE_BUILD_EXPORT_<NAME>` | unset = not exported | Opt a value into recipe `env_refs` as guest variable `NAME`; see [build environment exports](../templates/firecracker/seed/README.md#build-environment-exports). |
 | `SPACE_BUILDER_ECR_REPOSITORIES` | unset | JSON. |
 | `SPACE_UBUNTU_APT_MIRROR` | `https://archive.ubuntu.com/ubuntu` | |
+
+Direct/systemd deployments can publish API-submitted template builds without
+Kubernetes projected credentials. Generate a separate random publisher secret
+(for example, 32 random bytes encoded as hex), install it in a protected file
+readable only by the appropriate service identity, and set
+`SPACE_TEMPLATE_PUBLICATION_TOKEN_PATH` on **ClusterApi and build-manager only**.
+The file must contain 32–4096 visible ASCII bytes; surrounding whitespace is
+trimmed. Both processes still require their normal shared node bearer and
+internal RPC TLS configuration. Other node services must not receive the
+publisher secret.
+
+Build-manager attaches the dedicated proof only to template and release
+registration. The shared node bearer alone cannot publish. This grants tenant
+publication authority and system publication authority **only with the existing
+per-build grant** issued by the API. It cannot issue system grants itself, and
+does not enable ungranted system builds from the operator CLI. Kubernetes
+publication continues using projected tokens; combining Kubernetes auth with
+the direct receiver credential fails startup.
+
+Upgrade and configure ClusterApi first, then build-manager, before submitting
+builds. Unconfigured receivers retain their existing rejection of static
+publication; a sender upgrade alone cannot enable publication. Missing or
+malformed configured files fail closed. The receiver loads its credential at
+startup; the sender reads it on each registration attempt. To rotate it, pause
+build submissions and drain publishing jobs, replace both files atomically,
+restart ClusterApi, and resume. Removing the setting from both services disables
+direct publication without changing previously published templates. Failed
+builds must be resubmitted after configuration is corrected.
 
 For direct `space-buildmgr build` calls without `--org-id`, configure
 `SPACE_INTERNAL_API_ENDPOINT` and `SPACE_CLUSTER_API_TOKEN_PATH` in the CLI's

@@ -582,11 +582,17 @@ async fn register_with_retry_schedule(
     loop {
         let result = match &request {
             RegisterRequest::Template(inner) => cluster_api
-                .register_template(inner.clone())
+                .register_template(
+                    pplx_space_common_svc::auth::build::publication_request(inner.clone())
+                        .map_err(|error| tonic::Status::failed_precondition(error.to_string()))?,
+                )
                 .await
                 .map(|_| ()),
             RegisterRequest::Release(inner) => cluster_api
-                .register_template_release(inner.as_ref().clone())
+                .register_template_release(
+                    pplx_space_common_svc::auth::build::publication_request(inner.as_ref().clone())
+                        .map_err(|error| tonic::Status::failed_precondition(error.to_string()))?,
+                )
                 .await
                 .map(|_| ()),
         };

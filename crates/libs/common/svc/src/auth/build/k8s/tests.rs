@@ -72,6 +72,7 @@ fn authenticator(reviewer: BuildTokenReviewer, fallback: bool) -> BuildAuthentic
         },
         static_token: "shared-token".to_string(),
         static_fallback_enabled: fallback,
+        direct_publication_token: None,
         reviewer: Some(reviewer),
     }
 }

@@ -15,6 +15,9 @@ use super::{
     constant_time_eq, env_bool_default,
 };
 
+mod direct;
+pub use direct::{DirectPublicationError, publication_request};
+
 #[cfg(feature = "k8s")]
 mod k8s;
 
@@ -52,6 +55,8 @@ impl BuildSurface {
 pub enum BuildAuthError {
     #[error(transparent)]
     Configuration(#[from] AuthConfigError),
+    #[error(transparent)]
+    DirectPublication(#[from] DirectPublicationError),
     #[cfg(feature = "k8s")]
     #[error("Kubernetes build auth requires allowed service accounts")]
     AllowedServiceAccountsMissing,
@@ -79,6 +84,23 @@ impl BuildAuthLayer {
     }
 
     async fn from_env(surface: BuildSurface, static_token: String) -> Result<Self, BuildAuthError> {
+        let direct_publication_token = if matches!(surface, BuildSurface::Publication) {
+            if std::env::var_os(direct::TOKEN_PATH_ENV).is_some()
+                && env_bool_default(super::SPACE_K8S_TOKEN_AUTH_ENABLED_ENV, false)
+            {
+                return Err(DirectPublicationError::KubernetesAuthentication.into());
+            }
+            let token = direct::token_from_env()?;
+            if token
+                .as_ref()
+                .is_some_and(|token| constant_time_eq(token, &static_token))
+            {
+                return Err(DirectPublicationError::SharedCredential.into());
+            }
+            token
+        } else {
+            None
+        };
         #[cfg(feature = "k8s")]
         let reviewer = match super::k8s::K8sTokenAuthConfig::from_env()? {
             Some(config) => Some(k8s::BuildTokenReviewer::from_env(&config, surface).await?),
@@ -97,6 +119,7 @@ impl BuildAuthLayer {
             surface,
             static_token,
             static_fallback_enabled,
+            direct_publication_token,
             #[cfg(feature = "k8s")]
             reviewer,
         };
@@ -104,6 +127,7 @@ impl BuildAuthLayer {
             surface = surface.as_str(),
             mode = authenticator.mode(),
             static_fallback_enabled = authenticator.static_fallback_enabled,
+            direct_publication_enabled = authenticator.direct_publication_token.is_some(),
             "build auth initialized"
         );
         Ok(Self {
@@ -116,11 +140,40 @@ struct BuildAuthenticator {
     surface: BuildSurface,
     static_token: String,
     static_fallback_enabled: bool,
+    direct_publication_token: Option<String>,
     #[cfg(feature = "k8s")]
     reviewer: Option<k8s::BuildTokenReviewer>,
 }
 
 impl BuildAuthenticator {
+    fn authenticate_direct_publication(
+        &self,
+        path: &str,
+        bearer: Option<&str>,
+        credential: Option<&str>,
+    ) -> Result<Option<BuildAuthenticatedCaller>, Status> {
+        let Some(expected) = self.direct_publication_token.as_deref() else {
+            return Ok(None);
+        };
+        if !matches!(self.surface, BuildSurface::Publication) || !self.surface.handles(path) {
+            return Ok(None);
+        }
+        let Some(credential) = credential else {
+            return Ok(None);
+        };
+        let bearer = bearer_token(bearer)?;
+        if !constant_time_eq(bearer, &self.static_token) || !constant_time_eq(credential, expected)
+        {
+            return Err(Status::unauthenticated(
+                "invalid direct publication credentials",
+            ));
+        }
+        Ok(Some(BuildAuthenticatedCaller {
+            can_assert_org: true,
+            system: SystemTemplateAuthority::Granted,
+        }))
+    }
+
     async fn authenticate(
         &self,
         path: &str,
@@ -321,10 +374,23 @@ where
                 .headers()
                 .get("authorization")
                 .and_then(|value| value.to_str().ok());
-            if let Some(caller) = authenticator
-                .authenticate(request.uri().path(), header)
-                .await?
-            {
+            let credential = request
+                .headers()
+                .get(direct::HEADER)
+                .and_then(|value| value.to_str().ok());
+            let caller = match authenticator.authenticate_direct_publication(
+                request.uri().path(),
+                header,
+                credential,
+            )? {
+                Some(caller) => Some(caller),
+                None => {
+                    authenticator
+                        .authenticate(request.uri().path(), header)
+                        .await?
+                }
+            };
+            if let Some(caller) = caller {
                 request.extensions_mut().insert(caller);
             }
             let response = inner.call(request).await.map_err(Into::into)?;
