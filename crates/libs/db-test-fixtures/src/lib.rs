@@ -168,9 +168,10 @@ pub async fn insert_ready_worker_node(pool: &PgPool, node_id: NodeId) -> TestDbR
 /// exact identity with a usable storage location at `storage_uri`.
 ///
 /// This is the catalog state a stopped sandbox's evacuated rootfs leaves
-/// behind: `publish_stopped_artifact` on the node mints the pin, and
-/// `BeginArtifactBackup(Disk)` + a `READY` `FinalizeArtifactBackup` register
-/// the remote copy. Suites that need to vary the snapshot state, timestamp, or
+/// behind: `BeginArtifactBackup(Disk)` + a `READY` `FinalizeArtifactBackup`
+/// register the remote copy. The pin is written here directly:
+/// `publish_stopped_artifact` mints it only in the node's own SQLite store,
+/// and no Postgres writer sets a `stop` pin yet. Suites that need to vary the snapshot state, timestamp, or
 /// artifact identity independently of the pin build their own `INSERT`s;
 /// this covers the "the artifact is durable" shape they all otherwise repeat.
 pub async fn publish_ready_disk_artifact(

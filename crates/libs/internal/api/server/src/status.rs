@@ -2,14 +2,21 @@ use pplx_space_common_core::types::{NodeId, SubstrateKind};
 
 use super::*;
 use pplx_space_common_core::sql;
+use std::sync::LazyLock;
 
-pub(super) async fn prune_absent_node_sandboxes(
-    conn: &mut sqlx::PgConnection,
-    node_id: NodeId,
-    present_sandbox_ids: &[SandboxId],
-) -> Result<(), Status> {
-    sqlx::query(sql!(
-        "WITH removed AS (
+/// Built once: every input is bound, so the text is the same on every publish.
+/// Mirrors `sandbox_quarantine_store`'s composed queries in this crate.
+///
+/// The interpolated term comes from `pplx_space_sandbox_portability` rather
+/// than being spelled here because that crate is the single definition of "are
+/// this sandbox's bytes recoverable elsewhere", and a deletion path is exactly
+/// where a second spelling does damage.
+static PRUNE_ABSENT_NODE_SANDBOXES_QUERY: LazyLock<String> = LazyLock::new(|| {
+    let released_with_durable_artifact =
+        pplx_space_sandbox_portability::stopped_artifact_durable("s");
+    sql!(
+        format!(
+            "WITH removed AS (
              DELETE FROM sandbox_observed_states sos
              WHERE sos.node_id = $1
                AND NOT (sos.sandbox_id = ANY($2))
@@ -48,12 +55,66 @@ pub(super) async fn prune_absent_node_sandboxes(
              WHERE s.active_node_id = $1
                AND s.managed_by = $4
                AND s.lifecycle NOT IN ('deleted', 'deleting')
+               AND NOT {released_with_durable_artifact}
                AND NOT (s.id = ANY($2))
              RETURNING s.id AS sandbox_id
          )
          DELETE FROM sandbox_snapshot_inventory
          WHERE sandbox_id IN (SELECT sandbox_id FROM removed)
             OR sandbox_id IN (SELECT sandbox_id FROM marked_deleted)"
+        )
+        .as_str()
+    )
+});
+
+/// Reconcile a node's complete sandbox census against the cluster's own state.
+///
+/// Two readings of the same absence, with very different weight:
+///
+/// * **Forget the observation.** `sandbox_observed_states` and the
+///   network-policy facet rows for sandboxes the node no longer reports are
+///   deleted. This is what lets a drain discount a phantom `active_node_id` —
+///   see `pplx_space_common_svc::sql::sandbox_residency`.
+/// * **Tombstone the sandbox** (`marked_deleted`). Absence from a *complete*
+///   census is read as proof the sandbox is unrecoverable, so the central row
+///   is moved to `lifecycle = 'deleted'`.
+///
+/// The second reading is only sound while the node's local row is the
+/// sandbox's sole existence, and two of the terms that keep it that way read
+/// like general safety properties without being ones.
+///
+/// `managed_by = $4`, bound to `SubstrateKind::Space`, is a *substrate* filter.
+/// `DirectSubstrate::managed_by()` returns `"space"`
+/// (`api/src/controllers/substrate/direct.rs`) while
+/// `KubernetesSubstrate::managed_by()` returns `"k8s"`
+/// (`.../substrate/kubernetes/adapter/substrate_adapter.rs`), and `sandboxes.managed_by` is
+/// bound from that adapter at create time
+/// (`api/src/controllers/sandbox/queries.rs`) — so on a Kubernetes deployment
+/// this arm matches nothing, and the cluster controller's
+/// `orphaned_sandboxes` reconciler classifies a vanished runtime from pod
+/// evidence instead. Every row this arm can actually reach is a Direct one.
+///
+/// A *settled* `suspended` row is outside the arm because its `active_node_id`
+/// is NULL — a placement fact, not a judgement about its durable snapshot.
+/// Do not read that as an invariant covering suspend generally: on the Direct
+/// substrate the nulling is a **separate** write from the one recording the
+/// artifact pin (`persist_optional_current_local_artifact` touches only the
+/// three `current_local_artifact_*` columns, and the lifecycle flip is applied
+/// by the caller after `suspend_execution` returns), so a suspend in flight is
+/// briefly pinned and still `active_node_id = $1`.
+///
+/// So neither term covers a row whose node-local presence was released *on
+/// purpose* after its bytes were made durable, which is why
+/// `stopped_artifact_durable` is a term of its own rather than an inference
+/// from the two above. Its doc carries the evidence it requires, and the
+/// contract its future producer owes it.
+pub(super) async fn prune_absent_node_sandboxes(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    present_sandbox_ids: &[SandboxId],
+) -> Result<(), Status> {
+    sqlx::query(sqlx::AssertSqlSafe(
+        PRUNE_ABSENT_NODE_SANDBOXES_QUERY.as_str(),
     ))
     .bind(node_id)
     .bind(present_sandbox_ids)

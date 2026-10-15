@@ -2,6 +2,7 @@ use pplx_space_common_core::types::{NodeId, SnapshotId, SubstrateKind};
 
 use pplx_space_common_core::sql;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::LazyLock;
 
 use sqlx::types::Json;
 use time::format_description::well_known::Rfc3339;
@@ -39,7 +40,7 @@ use pplx_space_net_common::proto::NetworkPolicySource;
 use pplx_space_sandbox_portability::{
     SuspendedTargetNodeAssignment, node_published_execution_identity_matches,
     publish_clear_or_preserve_current_local_artifact_marker_assignments,
-    started_suspend_revert_eligibility, suspended_k8s_finalization_sql,
+    started_suspend_revert_eligibility, stopped_artifact_durable, suspended_k8s_finalization_sql,
     suspended_projection_lifecycle_eligible,
 };
 use pplx_space_sbx_mgr_client::proto::{
@@ -1695,6 +1696,57 @@ fn failure_episode_input(
     })
 }
 
+/// Deletes the stopped Direct sandboxes a node reported absent, and detaches
+/// their snapshots' storage locations.
+///
+/// The delete reads the node's absence as proof that its local rootfs, a
+/// stopped sandbox's only copy, is gone. That doesn't hold for a stopped
+/// sandbox released from the node once its pinned artifact was durable, so
+/// [`stopped_artifact_durable`] exempts it, the same term that keeps the
+/// census prune's `marked_deleted` arm off it.
+///
+/// The candidates are locked (`FOR UPDATE`) before anything is detached or
+/// deleted. Without the lock, a row a concurrent writer moved out of `stopped`
+/// after this statement's snapshot was still selected, and the `DELETE`, which
+/// rechecks only its join to the CTE after waiting on the row, deleted it.
+/// Locking makes Postgres re-evaluate the whole condition against the row that
+/// writer committed; only the durability `EXISTS`'s own table scans keep the
+/// statement's snapshot.
+///
+/// Built once: every input is bound.
+static DELETE_ABSENT_STOPPED_SANDBOXES: LazyLock<String> = LazyLock::new(|| {
+    let released_with_durable_artifact = stopped_artifact_durable("s");
+    sql!(
+        format!(
+            "WITH deleted AS MATERIALIZED (
+                 SELECT s.id
+                 FROM sandboxes s
+                 WHERE s.active_node_id = $1
+                   AND s.managed_by = $3
+                   AND s.lifecycle = 'stopped'
+                   AND s.id = ANY($2)
+                   AND NOT {released_with_durable_artifact}
+                 FOR UPDATE OF s
+             ),
+             detached_storage AS (
+                 UPDATE snapshot_storage_locations ssl
+                 SET snapshot_id = NULL, orphaned_at = NOW()
+                 WHERE ssl.snapshot_id IN (
+                     SELECT snapshots.id
+                     FROM snapshots
+                     JOIN deleted ON deleted.id = snapshots.sandbox_id
+                 )
+                 RETURNING 1
+             )
+             DELETE FROM sandboxes s
+             USING deleted
+             WHERE s.id = deleted.id
+             RETURNING s.id"
+        )
+        .as_str()
+    )
+});
+
 /// Publishes a node's sandbox observations.
 ///
 /// Callers that need atomic lifecycle convergence should run this inside a
@@ -2178,29 +2230,8 @@ pub async fn publish_sandbox_states(
             Status::internal(format!("clear absent sandbox facet observations: {err}"))
         })?;
 
-        let deleted_ids = sqlx::query_scalar::<_, SandboxId>(sql!(
-            "WITH deleted AS MATERIALIZED (
-                 SELECT s.id
-                 FROM sandboxes s
-                 WHERE s.active_node_id = $1
-                   AND s.managed_by = $3
-                   AND s.lifecycle = 'stopped'
-                   AND s.id = ANY($2)
-             ),
-             detached_storage AS (
-                 UPDATE snapshot_storage_locations ssl
-                 SET snapshot_id = NULL, orphaned_at = NOW()
-                 WHERE ssl.snapshot_id IN (
-                     SELECT snapshots.id
-                     FROM snapshots
-                     JOIN deleted ON deleted.id = snapshots.sandbox_id
-                 )
-                 RETURNING 1
-             )
-             DELETE FROM sandboxes s
-             USING deleted
-             WHERE s.id = deleted.id
-             RETURNING s.id"
+        let deleted_ids = sqlx::query_scalar::<_, SandboxId>(sqlx::AssertSqlSafe(
+            DELETE_ABSENT_STOPPED_SANDBOXES.as_str(),
         ))
         .bind(node_id)
         .bind(&absent_ids)

@@ -31,6 +31,11 @@
 //! "is this sandbox portable?" question, and the answer must be identical
 //! everywhere it's asked.
 //!
+//! The same module answers a related question for absence-driven deletion:
+//! [`stopped_artifact_durable`] keeps the internal API from deleting a stopped
+//! sandbox, released from its node once its pinned artifact was durable, when
+//! that node stops reporting it.
+//!
 //! ## A third question: is *this row* the pinned artifact?
 //!
 //! [`snapshot_is_current_local_artifact`] answers the per-snapshot inverse of
@@ -1761,6 +1766,155 @@ fn inflight_snapshot_matches_current_suspend(sandbox_alias: &str) -> String {
                      OR sn.timestamp >= {sandbox_alias}.placement_changed_at\n\
                  )\n\
              )\n\
+         )"
+    )
+}
+
+/// Returns a boolean SQL fragment that is TRUE iff the row aliased as
+/// `sandbox_alias` is a `stopped` sandbox whose pinned artifact is durable in
+/// S3 — the question that decides whether a node's report of absence may
+/// remove the row rather than merely forget the observation.
+///
+/// The internal API reads a node's absence as a deletion in two places, both
+/// only sound while the node's local row is the sandbox's sole existence:
+///
+/// * `prune_absent_node_sandboxes` (`internal/api/server/src/status.rs`): a
+///   complete census that omits the sandbox drives a `marked_deleted` arm that
+///   sets `lifecycle = 'deleted'`.
+/// * `publish_sandbox_states` (`internal/api/server/src/published_state.rs`):
+///   an explicit `present: false` for a stopped sandbox deletes its row and
+///   detaches its snapshots' storage locations. A node reports that for any
+///   requested sandbox it no longer holds.
+///
+/// This fragment names the case where the premise fails, so both can skip it.
+///
+/// Three conjuncts, each excluding a different row:
+///
+/// * `lifecycle = 'stopped'` — the cluster still intends the sandbox stopped.
+///   A woken row carrying a stale stop pin does not buy an exemption; its live
+///   instance really is gone when the census stops naming it.
+/// * `current_local_artifact_origin = 'stop'` — the pinned bytes are a
+///   *stopped* instance's, not a prior suspend's. `sandboxes`'
+///   `current_local_artifact_origin` admits only `'stop'` and `'suspend'`
+///   (`sandboxes_current_local_artifact_origin_check`), and a suspend pin
+///   can outlive its cycle: `recoverable_suspend_snapshot_exists` documents
+///   the stale-pin-with-`active_node_id`-set row this excludes.
+/// * The exact pinned artifact has a durable copy —
+///   [`artifact_has_durable_copy`] over the marker's
+///   `(current_local_artifact_id, current_local_artifact_kind)`, so the
+///   fragment vouches for whatever kind the pin names rather than hard-coding
+///   one, and agrees with every other caller on what "durable" means. Hence
+///   `stopped_artifact_durable` and not `..._disk_...`: a stop artifact is a
+///   disk in practice, but nothing here requires it.
+///
+/// Deliberately **not** placement-gated, following the exact-identity branch
+/// of [`fresh_ready_snapshot_exists`] — [`matching_ready_backup_exists`] omits
+/// `placement_changed_at`, and only the markerless legacy branch beside it
+/// compares timestamps. Matching the pin is this module's currency test, so a
+/// re-place must not revoke the exemption.
+///
+/// ## NULL-safety
+///
+/// The caller negates this (`AND NOT …`), so a NULL result would spare a row
+/// instead of reaping it — the opposite of the intended default. It cannot
+/// be NULL. `lifecycle` is `NOT NULL`, and an `EXISTS` is never NULL, so
+/// `current_local_artifact_origin` is the only term that can be.
+/// `sandboxes_current_local_artifact_identity_check`
+/// (`db/postgres/*_baseline.up.sql`) makes it NULL exactly when
+/// `current_local_artifact_id` is, and a NULL id matches no snapshot, so the
+/// `EXISTS` is FALSE and the conjunction is FALSE rather than NULL. That
+/// constraint is load-bearing here, not just a value-domain check: an id
+/// without an origin, over a durable artifact, would make the conjunction NULL
+/// and spare the row.
+///
+/// ## What the producer owes this predicate
+///
+/// **Laxer than the source-release gate, deliberately.** This is a new
+/// predicate, not a reuse of [`snapshot_durable_for_source_release`]. That
+/// gate has no lifecycle or origin term, and for a row that carries a pin,
+/// which is every row this one can match, its `EXISTS` differs from this one's
+/// only by also requiring `sn.type = 'full'`; both match the snapshot's
+/// `artifact_kind` against the pin. So a disk-kind stop pin can earn this
+/// exemption without satisfying the drain gate, and the two are not
+/// interchangeable.
+///
+/// That asymmetry is the right way round for the two questions. Releasing a
+/// node is retryable — refuse it and the drain waits, visibly. Tombstoning is
+/// not: it is an irreversible, user-visible write, so its guard should err
+/// toward sparing. A predicate strict enough for a node release would tombstone
+/// rows it merely cannot vouch for.
+///
+/// It ships ahead of its producer deliberately, and that only works if the
+/// producer meets three obligations this fragment cannot enforce:
+///
+/// * **Re-mint the pin every stop.** Trusting the marker without a cycle
+///   anchor is sound for suspend because "every suspend attempt allocates a
+///   fresh row id and S3 prefix" (module header). A stop path that left a
+///   prior cycle's marker in place after `stop → start → write → stop` would
+///   have this fragment vouch for the *first* session's disk, and the row
+///   would survive as restorable from stale bytes instead of being tombstoned
+///   where the loss is visible.
+/// * **Commit the catalog rows and the pin before the node can first report
+///   the sandbox absent.** Both callers lock the rows they act on: the census arm is an
+///   `UPDATE`, and the `present: false` delete selects its candidates
+///   `FOR UPDATE`. Under Read Committed, a row updated after the statement's
+///   snapshot is re-evaluated against its newest committed version: that
+///   version supplies every reference to the row, including the `EXISTS`'s
+///   correlation to its pin, but the `EXISTS`'s own scans of `snapshots` and
+///   `snapshot_storage_locations` keep the statement's original snapshot. So
+///   a pin committed after that snapshot is seen, while catalog rows committed
+///   after it are not, in the pin's transaction or any other, and the
+///   `EXISTS` is FALSE. The census arm then tombstones a durable row. The
+///   `present: false` delete fails instead, because its cascade into
+///   `snapshots` trips the `RESTRICT` foreign key of the storage location it
+///   couldn't see, so the whole publication is refused. With both commits
+///   ahead of the first absence report, every statement that reads the
+///   absence starts after them.
+/// * **Move the row off the node.** A spared row keeps `active_node_id`, and
+///   the drained-node terminator's `active_resident_predicate` counts a
+///   `stopped` row, so under the default `ResidencyEvidence::LifecycleOnly`
+///   the node stays held. Under census-aware residency the drain discounts the
+///   unobserved row and the node can terminate, leaving a row that names a
+///   node that no longer exists, and nothing sweeps a stranded `stopped` row.
+///
+/// It is not a substitute for the evacuation's own durability gate either: a
+/// caller that deletes a local row without establishing the pin gets no
+/// protection here.
+///
+/// ## Reaches nothing today
+///
+/// Every current Postgres writer of a non-NULL marker is a suspend path, and
+/// four write `'suspend'` whenever they write an origin at all: `kubernetes/store/suspend.rs`'s
+/// suspend-commit `UPDATE` and the cluster controller's quarantine recovery to
+/// `suspended` (`orphaned_sandboxes/quarantine_recovery/store.rs`, which also
+/// nulls `active_node_id`) spell it in their SQL, while
+/// `finalize_suspended_sandbox_in` (both callers bind `ArtifactOrigin::Suspend`)
+/// and `persist_optional_current_local_artifact` (whose only caller, the Direct
+/// substrate's `suspend_execution`, binds it too) take it as a parameter. The
+/// fifth — the internal API's `apply_suspended_k8s_finalization` — mirrors
+/// the artifact the node published, but only through
+/// [`node_published_suspend_evidence`], which requires the published origin to
+/// be `'suspend'` and its kind `'full'`, so it cannot carry a `'stop'` marker
+/// either. It also finalizes through [`suspended_k8s_finalization_sql`], which
+/// nulls `active_node_id` in the same statement, while this arm only reaches
+/// rows whose `active_node_id` names the publishing node. So no current writer
+/// produces a row this term spares. The schema has admitted a `'stop'` origin
+/// since the marker columns were added, so a row an earlier writer left
+/// pinned that way would be spared only if its pinned artifact is durable,
+/// which is the outcome this term exists for.
+pub fn stopped_artifact_durable(sandbox_alias: &str) -> String {
+    let durable = artifact_has_durable_copy(
+        &format!("{sandbox_alias}.id"),
+        &format!("{sandbox_alias}.current_local_artifact_id"),
+        &format!("{sandbox_alias}.current_local_artifact_kind"),
+    );
+    let stopped = SandboxLifecycle::Stopped.as_str();
+    let stop = ArtifactOrigin::Stop.as_str();
+    format!(
+        "(\n\
+             {sandbox_alias}.lifecycle = '{stopped}'\n\
+             AND {sandbox_alias}.current_local_artifact_origin = '{stop}'\n\
+             AND {durable}\n\
          )"
     )
 }
