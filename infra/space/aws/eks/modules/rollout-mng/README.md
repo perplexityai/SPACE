@@ -143,8 +143,8 @@ first real rollout.
   Against a node already gentle-draining, `--forced` alone escalates the
   drain in place on its existing terms; adding
   `--no-replace-after-terminate` escalates only if the drain in flight was
-  started with `replace_after_terminate: false` (by that flag, the API, or
-  this script), and is a 409 otherwise, because a drain's replacement intent
+  started with `replace_after_terminate: false` (by that flag or the
+  API), and is a 409 otherwise, because a drain's replacement intent
   is fixed when it starts. The `nodes.terminate_decrement_capacity` column and
   the corresponding `Ec2InstanceTerminator` path are already on `main`.
 
