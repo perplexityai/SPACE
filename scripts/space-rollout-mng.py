@@ -281,6 +281,17 @@ def resolved_drain_mode(raw: str | None) -> str:
     return raw if raw in ("gentle", "forced") else "gentle"
 
 
+@dataclasses.dataclass(frozen=True)
+class NodeDrainRead:
+    """The drain columns of one node, as the pre-POST re-read in
+    `AdminApi.drain` sees them. No occupancy counts: that read asks the
+    endpoint not to compute them."""
+
+    drain_phase: str | None
+    drain_mode: str | None
+    terminate_decrement_capacity: bool
+
+
 class MalformedAdminResponse(Exception):
     """A 2xx admin response whose body is not the shape we asked for.
 
@@ -493,28 +504,20 @@ class AdminApi:
         rows = resp.json()
         return [parse_admin_node(r) for r in rows]
 
-    def get_node(self, node_id: str) -> AdminNode | None:
-        """Read one node. `None` when the admin row is gone (404).
+    def get_node(self, node_id: str) -> NodeDrainRead | None:
+        """Read one node's drain state. `None` when the admin row is gone (404).
 
-        Note this is the *detail* endpoint, which always computes the
-        drainability counters in the same statement as the occupancy counts,
-        where the list endpoint computes them only under `sort=drainability`.
-        The threshold is not tunable on this route.
-
-        The cost is one extra SQL statement per drain candidate per tick, and it
-        stays SQL whether or not `SPACE_NODE_DRAIN_NODE_CENSUS_RESIDENCY` is on:
-        that flag only selects which predicate `occupies_node_predicate` emits,
-        and the census evidence it turns on is composed entirely of predicates
-        over `node_status_snapshots`. Nothing on this path calls a node-api.
-
-        It is also the cheap shape of that predicate by construction. The
-        30-120 ms figure `sandbox_residency::node_heartbeat_fresh` documents is
-        for a *multi-node* scan, where the discount's node expression has to be
-        a per-row column and forces a hashed SubPlan; a single-node route binds
-        it as a parameter instead.
+        Asks for `include_occupancy=false`: the caller needs the drain columns
+        and nothing else, and the occupancy and drainability counts cost a
+        statement per candidate whose failure or timeout would otherwise skip
+        a drain the endpoint would have accepted. The counts come back `null`
+        on that response, which is why this returns a `NodeDrainRead` rather
+        than an `AdminNode`.
         """
         resp = self.session.get(
-            f"{self.base_url}{ADMIN_API_PREFIX}/nodes/{node_id}", timeout=self.timeout
+            f"{self.base_url}{ADMIN_API_PREFIX}/nodes/{node_id}",
+            params={"include_occupancy": "false"},
+            timeout=self.timeout,
         )
         if resp.status_code == 404:
             return None
@@ -530,7 +533,13 @@ class AdminApi:
             raise MalformedAdminResponse(
                 f"admin node response for {node_id} has no drain_phase field"
             )
-        return parse_admin_node(row)
+        return NodeDrainRead(
+            drain_phase=row.get("drain_phase"),
+            drain_mode=row.get("drain_mode"),
+            terminate_decrement_capacity=bool(
+                row.get("terminate_decrement_capacity", False)
+            ),
+        )
 
     def drain(self, node_id: str, replace_after_terminate: bool) -> bool:
         url = f"{self.base_url}{ADMIN_API_PREFIX}/nodes/{node_id}:drain"
@@ -617,10 +626,15 @@ class AdminApi:
             )
             return True
         resp = self.session.post(url, json=body, timeout=self.timeout)
-        if resp.status_code == 409:
-            # With `require_undrained`, a `:drain` against an undrained node has
-            # no other 409: the node gained a drain phase between the read
-            # above and this POST, and the endpoint refused to touch it.
+        if (
+            resp.status_code == 409
+            and self._response_field(resp, "current_drain_phase") is not None
+        ):
+            # The node gained a drain phase between the read above and this
+            # POST, and `require_undrained` made the endpoint refuse it. Only a
+            # 409 naming the phase means that: the admin API also answers 409
+            # for a retryable serialization or deadlock abort, which started no
+            # drain and falls through to `raise_for_status` below.
             emit_event(
                 Event.DRAIN_SKIPPED_ALREADY_DRAINING,
                 node_id=node_id,

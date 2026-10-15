@@ -2171,8 +2171,11 @@ class TestAdminApiDrainBody:
             def update(self, *_args: Any, **_kwargs: Any) -> None:
                 pass
 
-            def get(self, url: str, timeout: Any = None) -> Any:
+            def get(
+                self, url: str, params: Any = None, timeout: Any = None
+            ) -> Any:
                 captured["get_url"] = url
+                captured["get_params"] = params
 
                 class Resp:
                     status_code = get_status
@@ -2307,6 +2310,46 @@ class TestAdminApiDrainBody:
         assert [e["event"] for e in events] == ["drain_skipped_already_draining"]
         assert events[0]["drain_phase"] == "draining"
         assert events[0]["refused_by"] == "endpoint"
+
+    def test_the_pre_post_read_skips_occupancy_and_accepts_null_counts(
+        self,
+    ) -> None:
+        """The re-read asks for the drain columns only, and the response that
+        produces carries `null` occupancy counts, which must not stop the
+        drain."""
+        api, captured = self._api_with_capture(
+            get_body={
+                "id": "88888888-8888-8888-8888-888888888888",
+                "drain_phase": None,
+                "sandboxes_active": None,
+                "sandboxes_local_snapshots": None,
+                "terminate_decrement_capacity": False,
+            }
+        )
+        assert api.drain(
+            "88888888-8888-8888-8888-888888888888", replace_after_terminate=False
+        )
+        assert captured["get_params"] == {"include_occupancy": "false"}
+        assert "url" in captured
+
+    def test_a_contention_409_is_an_error_not_a_skip(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The admin API also answers 409 for a retryable serialization or
+        deadlock abort. That started no drain and names no phase, so it must
+        raise rather than read as somebody else's drain."""
+        api, _ = self._api_with_capture(
+            drain_phase=None,
+            post_status=409,
+            post_body={
+                "error": "operation conflicted with a concurrent admin write; retry the request"
+            },
+        )
+        with pytest.raises(RuntimeError, match="HTTP 409"):
+            api.drain(
+                "99999999-9999-9999-9999-999999999999", replace_after_terminate=False
+            )
+        assert "drain_skipped_already_draining" not in capsys.readouterr().out
 
     def test_drain_proceeds_when_the_node_is_still_undrained(self) -> None:
         """The guard must not block the case the rollout exists to drive."""
@@ -2631,7 +2674,7 @@ class TestAdminApiPrefix:
             def update(self, *_a: Any, **_k: Any) -> None:
                 pass
 
-            def get(self, url: str, timeout: Any = None) -> Any:
+            def get(self, url: str, params: Any = None, timeout: Any = None) -> Any:
                 seen.append(("GET", url))
 
                 class Resp:
