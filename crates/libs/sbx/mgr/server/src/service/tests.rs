@@ -7107,6 +7107,74 @@ pub(crate) mod service_tests {
         }
     }
 
+    /// node-manager refuses cleanup while another host mutation, such as a
+    /// network-slot reset, holds the sandbox's exclusive claim. A refused
+    /// first attempt fails the eviction RPC after the row was claimed, so the
+    /// claim must leave durable cleanup work that recovery completes without
+    /// another eviction call.
+    #[tokio::test]
+    async fn evict_cluster_deleted_stopped_sandbox_converges_after_a_refused_cleanup() {
+        const REFUSED: &str = "sandbox host mutation or reset is in progress; retry";
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new().to_string();
+        insert_platform_owned_sandbox(&conn, &sandbox_id, SandboxState::Stopped, None);
+        conn.execute(
+            "UPDATE sandboxes SET updated_at = '0' WHERE id = ?1",
+            rusqlite::params![sandbox_id],
+        )
+        .unwrap();
+        let service = service_with_runtime_probe(conn, false);
+
+        let dispatched = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&dispatched);
+        *service.cleanup_executor.dispatch.lock().unwrap() = Some(Arc::new(move |id, kill| {
+            let mut observed = observed.lock().unwrap();
+            observed.push((id, kill));
+            let refused = observed.len() == 1;
+            Box::pin(async move {
+                if refused {
+                    Err(Status::unavailable(REFUSED))
+                } else {
+                    Ok(())
+                }
+            })
+        }));
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            service.evict_cluster_deleted_sandbox(root_peer_request(&sandbox_id)),
+        )
+        .await
+        .expect("the refused attempt must return")
+        .expect_err("the refused cleanup attempt fails the eviction call");
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert!(error.message().contains(REFUSED), "{error:?}");
+
+        let converged = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let gone = crate::db::get_sandbox(&service.db.lock().unwrap(), &sandbox_id)
+                    .unwrap()
+                    .is_none();
+                if gone {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        service.shutdown_token.cancel();
+        service.task_tracker.close();
+        tokio::time::timeout(Duration::from_secs(5), service.task_tracker.wait())
+            .await
+            .expect("eviction and cleanup tasks must drain");
+        converged.expect("durable cleanup recovery must delete the claimed row");
+        assert_eq!(
+            *dispatched.lock().unwrap(),
+            vec![(sandbox_id.clone(), false), (sandbox_id, false)],
+            "recovery retries the same full-delete cleanup once"
+        );
+    }
+
     #[tokio::test]
     async fn evict_cluster_deleted_sandbox_refuses_retained_rows_while_a_pull_holds_the_staging_lock()
      {

@@ -1223,12 +1223,30 @@ class CommandSandboxFixture:
                 sandbox_id, node_names=[worker], since_time=since_time
             )
             if any(event.reason == "cluster_row_absent" for event in evictions):
+                reclaimed_by = "node eviction completed"
+                break
+            # The eviction's first cleanup attempt can be refused as retryable,
+            # for example while node-manager resets the network slot the stop
+            # released: the reset holds the sandbox's exclusive host-mutation
+            # claim. sbx-manager then reports the eviction failed once and
+            # durable cleanup recovery finishes the claimed row without another
+            # eviction event. The failure event proves node reconciliation
+            # claimed the row; the removed rootfs proves the retry finished.
+            claimed = any(
+                event.reason == "cluster_row_absent"
+                for event in control.local_eviction_failures(
+                    sandbox_id, node_names=[worker], since_time=since_time
+                )
+            )
+            if claimed and not control.sandbox_cache_dir_present(worker, sandbox_id):
+                reclaimed_by = "node eviction claimed; durable cleanup retry completed"
                 break
             self.verify(
                 time.monotonic() < deadline,
                 "deleted stopped sandbox was not reclaimed by node reconciliation",
                 worker=worker,
                 sandbox_id=sandbox_id,
+                eviction_claimed_but_cleanup_pending=claimed,
             )
             self._context.wait(10)
         self.verify(
@@ -1236,7 +1254,7 @@ class CommandSandboxFixture:
             "node cleanup completed but retained rootfs still exists",
             worker=worker,
         )
-        self.record("stopped_delete_local_cleanup", "node eviction completed and rootfs removed")
+        self.record("stopped_delete_local_cleanup", f"{reclaimed_by} and rootfs removed")
 
     def start_background_process(
         self, command: str, *, timeout: int = 60

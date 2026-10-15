@@ -1924,6 +1924,35 @@ ON CONFLICT (key_hash) DO NOTHING;
         node_names: Collection[str] | None = None,
         since_time: str | None = None,
     ) -> list[LocalEviction]:
+        return self._local_eviction_events(
+            sandbox_id,
+            "local_eviction_completed",
+            node_names=node_names,
+            since_time=since_time,
+        )
+
+    def local_eviction_failures(
+        self,
+        sandbox_id: str,
+        *,
+        node_names: Collection[str] | None = None,
+        since_time: str | None = None,
+    ) -> list[LocalEviction]:
+        return self._local_eviction_events(
+            sandbox_id,
+            "local_eviction_failed",
+            node_names=node_names,
+            since_time=since_time,
+        )
+
+    def _local_eviction_events(
+        self,
+        sandbox_id: str,
+        event_type: str,
+        *,
+        node_names: Collection[str] | None,
+        since_time: str | None,
+    ) -> list[LocalEviction]:
         canonical = _sql_uuid(sandbox_id)
         return [
             LocalEviction(
@@ -1934,7 +1963,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             )
             for node_name, event in self._sandbox_events(
                 canonical,
-                "local_eviction_completed",
+                event_type,
                 node_names=node_names,
                 since_time=since_time,
             )

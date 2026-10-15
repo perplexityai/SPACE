@@ -2018,7 +2018,8 @@ class ColdEvictionConfig:
 
 @dataclass(frozen=True)
 class LocalEviction:
-    """One `local_eviction_completed` sandbox event from a worker's sbx-manager."""
+    """One `local_eviction_completed` or `local_eviction_failed` sandbox event
+    from a worker's sbx-manager."""
 
     sandbox_id: str
     node_name: str
@@ -2060,6 +2061,22 @@ class ColdEvictionControl(RestoreStateRead, SandboxEventRead, Protocol):
         since_time: str | None = None,
     ) -> list[LocalEviction]:
         """`local_eviction_completed` events for the sandbox, from sandbox-manager logs."""
+        ...
+
+    def local_eviction_failures(
+        self,
+        sandbox_id: str,
+        *,
+        node_names: Collection[str] | None = None,
+        since_time: str | None = None,
+    ) -> list[LocalEviction]:
+        """`local_eviction_failed` events for the sandbox, from sandbox-manager logs.
+
+        sbx-manager emits one only after the eviction has claimed the local row
+        into `deleting`; refusals before the claim emit nothing. The failed
+        attempt leaves a durable cleanup job, and the recovery that finishes it
+        emits no further eviction event.
+        """
         ...
 
     def eviction_loop_log(self, node_name: str, *, since_time: str) -> list[str]:
