@@ -919,7 +919,11 @@ async fn a_delete_after_a_failed_delete_operation_starts_a_replacement()
             )
             .await
             .into_response();
-            assert_eq!(response.status(), StatusCode::ACCEPTED, "delete with key {key}");
+            assert_eq!(
+                response.status(),
+                StatusCode::ACCEPTED,
+                "delete with key {key}"
+            );
             let body: serde_json::Value = serde_json::from_slice(
                 &axum::body::to_bytes(response.into_body(), 100_000)
                     .await
@@ -945,7 +949,10 @@ async fn a_delete_after_a_failed_delete_operation_starts_a_replacement()
 
     let first = delete("failed-delete-retry-first").await;
     let first_id = recorded_operation().await;
-    assert_eq!(first, pplx_space_public_api::OperationId::from_uuid(first_id).to_string());
+    assert_eq!(
+        first,
+        pplx_space_public_api::OperationId::from_uuid(first_id).to_string()
+    );
 
     // While the first operation is active, a new request joins it.
     assert_eq!(
@@ -968,7 +975,10 @@ async fn a_delete_after_a_failed_delete_operation_starts_a_replacement()
     let second = delete("failed-delete-retry-second").await;
     assert_ne!(second, first, "a failed delete must be replaced");
     let second_id = recorded_operation().await;
-    assert_eq!(second, pplx_space_public_api::OperationId::from_uuid(second_id).to_string());
+    assert_eq!(
+        second,
+        pplx_space_public_api::OperationId::from_uuid(second_id).to_string()
+    );
     let (desired_state, operation_state): (String, String) = sqlx::query_as(sql!(
         "SELECT t.desired_state, po.state
          FROM templates t
@@ -981,9 +991,9 @@ async fn a_delete_after_a_failed_delete_operation_starts_a_replacement()
     assert_eq!(desired_state, TemplateDesiredState::Deleting.as_str());
     assert_eq!(operation_state, "queued", "the replacement is dispatchable");
 
-    // Replaying the first request's key stays idempotent and does not
-    // move the template back to the failed operation.
-    assert_eq!(delete("failed-delete-retry-first").await, first);
+    // Replaying any key joins the active replacement rather than reviving
+    // the failed operation.
+    assert_eq!(delete("failed-delete-retry-first").await, second);
     assert_eq!(recorded_operation().await, second_id);
     Ok(())
 }
