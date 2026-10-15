@@ -4,6 +4,19 @@ Run `npm ci` and `npm run dev` for local development, or `npm run build`
 and `npm start` for a production build. Run `npm test` for the
 dashboard URL validation tests.
 
+## Curiosity theme
+
+`src/lib/curiosity-theme.ts` provides a standalone light/dark Ant Design preset
+and page/sidebar surfaces. `createCuriosityTheme` accepts the resolved dark-mode
+preference and an optional organization primary color. An unset color uses the
+preset accent; a configured color derives matching interaction and link states
+without replacing status colors or surfaces. Table density remains page-owned.
+
+The preset and local [Inter 4.1 assets](public/fonts/inter/README.md) are available
+for adoption; existing providers do not load or activate them yet. Consumers
+must load `/fonts/inter/inter.css` and place Ant Design's `App` below the themed
+`ConfigProvider` so contextual feedback inherits the appearance.
+
 ## Sandbox dashboard link
 
 Set `SPACE_UI_DATADOG_DASHBOARD_URL` on the running UI server to enable the
