@@ -32,6 +32,23 @@ fn source_identity_is_required_before_touching_retained_subvolumes() {
 }
 
 #[test]
+fn unstamped_parents_require_an_explicit_opt_in() {
+    for value in ["true", "TRUE", " 1 "] {
+        assert_eq!(ParentSeal::from_setting(Some(value)), ParentSeal::Unstamped);
+    }
+    for value in [
+        None,
+        Some(""),
+        Some("false"),
+        Some("0"),
+        Some("yes"),
+        Some("unstamped"),
+    ] {
+        assert_eq!(ParentSeal::from_setting(value), ParentSeal::Stamped);
+    }
+}
+
+#[test]
 fn inspection_reports_absence_only_for_a_missing_artifact_or_bundle() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();

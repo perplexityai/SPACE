@@ -58,10 +58,12 @@ impl ParentSeal {
     /// `SPACE_NODEMGR_BTRFS_SEND_UNSTAMPED_PARENT=true` selects
     /// [`Self::Unstamped`]; anything else keeps the rollback-safe default.
     pub(crate) fn from_env() -> Self {
-        match std::env::var(ENV_UNSTAMPED_PARENT) {
-            Ok(value) if matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true") => {
-                Self::Unstamped
-            }
+        Self::from_setting(std::env::var(ENV_UNSTAMPED_PARENT).ok().as_deref())
+    }
+
+    fn from_setting(value: Option<&str>) -> Self {
+        match value.map(|value| value.trim().to_ascii_lowercase()) {
+            Some(value) if matches!(value.as_str(), "1" | "true") => Self::Unstamped,
             _ => Self::Stamped,
         }
     }
