@@ -2,6 +2,7 @@
 
 import { Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
+import styles from './inventory.module.css';
 import { usePathname, useSearchParams } from 'next/navigation';
 import { sandboxLabelOrId } from '@/lib/sandbox-id';
 import {
@@ -49,7 +50,7 @@ import {
   summarizeAutoLifecycle,
 } from '@/components/auto-lifecycle';
 import {
-  Table, Button, Form, Input, Select, Typography, Space, Tag, Popconfirm, message, Card, Tooltip, Switch, Checkbox, Modal,
+  App, Table, Button, Form, Input, Select, Typography, Space, Tag, Popconfirm, Card, Tooltip, Switch, Checkbox, Modal,
 } from 'antd';
 import {
   PlusOutlined, StopOutlined, PauseCircleOutlined, ThunderboltOutlined,
@@ -421,6 +422,7 @@ function SandboxActions({ status, id, resourceType, poolTemplate, onAction }: {
 }
 
 function SnapshotsPanel({ sandboxId }: { sandboxId: string }) {
+  const { message } = App.useApp();
   const [snapshots, setSnapshots] = useState<SnapshotInfo[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -525,6 +527,7 @@ export default function SandboxesPageRoute() {
 }
 
 function SandboxesPage() {
+  const { message } = App.useApp();
   const [sandboxes, setSandboxes] = useState<Sandbox[]>([]);
   const [templates, setTemplates] = useState<Template[]>([]);
   const { org: authOrg } = useAuth();
@@ -951,7 +954,7 @@ function SandboxesPage() {
         </Link>
       ),
     },
-    { title: 'Runtime', dataIndex: 'runtime', width: 65, render: (v: string) => v || 'fc' },
+    { title: 'Runtime', dataIndex: 'runtime', width: 76, render: (v: string) => v || 'fc' },
     {
       title: 'State',
       dataIndex: 'status',
@@ -972,7 +975,7 @@ function SandboxesPage() {
     {
       title: 'Template',
       dataIndex: 'template',
-      width: 70,
+      width: 120,
       render: (v: string, record) => {
         if (!v) return '—';
         const contentHash = record.content_hash || record.image_hash;
@@ -985,7 +988,7 @@ function SandboxesPage() {
     },
     {
       title: 'Lifecycle',
-      width: 74,
+      width: 88,
       align: 'center',
       render: (_, record) => {
         const configured = hasAutoLifecyclePolicy(record.auto_lifecycle);
@@ -1043,7 +1046,7 @@ function SandboxesPage() {
     { title: 'Age', dataIndex: 'age', width: 55, render: (v: string) => v || '—' },
     {
       title: 'Activity',
-      width: 86,
+      width: 116,
       render: (_, record) => activityTimeCell(record, nowMs),
     },
     { title: 'User', dataIndex: 'user', width: 95, ellipsis: true, render: (v: string) => v || '—' },
@@ -1080,10 +1083,9 @@ function SandboxesPage() {
   ];
 
   return (
-    <div className="compact-table">
-      <style>{`.compact-table .ant-table-cell { padding: 4px 6px !important; } .compact-table .icon-action-btn { padding-left: 6px; padding-right: 6px; } .compact-table .icon-action-btn .anticon { font-size: 18px; }`}</style>
+    <div className={styles.inventory}>
       <Space align="center" style={{ width: '100%', justifyContent: 'space-between' }}>
-        <Title level={3}>Sandboxes</Title>
+        <Title level={3} style={{ marginTop: 0 }}>Sandboxes</Title>
         <Button
           icon={<ReloadOutlined />}
           loading={manualRefreshing}
@@ -1228,7 +1230,7 @@ function SandboxesPage() {
         loading={loading}
         size="small"
         pagination={tablePagination('sandboxes')}
-        scroll={{ x: 1128 }}
+        scroll={{ x: 1280 }}
         expandable={{
           showExpandColumn: false,
           expandRowByClick: true,

@@ -11,9 +11,13 @@ to `http://localhost:8080`. Admin requests under `/admin/*` use the same backend
 unless `NEXT_PUBLIC_ADMIN_API_URL` is set to a separate admin API origin. An
 unset or empty admin override preserves the existing fallback.
 
-Restart the development server after changing these values. For production,
-set them before `npm run build`; changing the running server's environment does
-not update rewrites already included in a built artifact.
+## Curiosity theme
+
+`src/lib/curiosity-theme.ts` provides a standalone light/dark Ant Design preset
+and page/sidebar surfaces. `createCuriosityTheme` accepts the resolved dark-mode
+preference and an optional organization primary color. An unset color uses the
+preset accent; a configured color derives matching interaction and link states
+without replacing status colors or surfaces. Table density remains page-owned.
 
 ## Sandbox dashboard link
 
