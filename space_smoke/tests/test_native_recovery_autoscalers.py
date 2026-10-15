@@ -30,36 +30,56 @@ class _Kubectl:
             "space-data-plane": _hpa("space-data-plane", "uid-dp", 2, 3),
             "unrelated": _hpa("space-ui", "uid-ui", 1, 1),
         }
-        self.replicas = {"space-api": 2, "space-data-plane": 3}
+        self.deployments = {
+            name: {"metadata": {"uid": f"deploy-{name}", "resourceVersion": "1"}, "spec": {"replicas": replicas}}
+            for name, replicas in (("space-api", 2), ("space-data-plane", 3), ("space-cluster-controller", 2))
+        }
         self.patches: list[tuple[str, int, int]] = []
+        self.scales: list[tuple[str, int]] = []
 
     def kubectl(self, *args: str, timeout: float | None = None, **_options: Any) -> CommandResult:
         if args[:2] == ("get", "hpa") and args[2] == "-o":
             return self._ok({"items": list(self.hpas.values())})
         if args[:2] == ("get", "hpa"):
-            hpa = self.hpas[args[2]]
-            reply = self._ok(hpa)
-            # The autoscaler controller writes status on its next sync, after
-            # this read and before the harness's patch.
-            metadata = hpa["metadata"]
-            metadata["resourceVersion"] = str(int(metadata["resourceVersion"]) + 1)
-            return reply
+            return self._read_then_write_status(self.hpas[args[2]])
         if args[:2] == ("get", "deployment"):
-            name = args[2]
-            return self._ok({"metadata": {"uid": f"deploy-{name}"}, "spec": {"replicas": self.replicas[name]}})
+            return self._read_then_write_status(self.deployments[args[2]])
+        if args[:2] == ("patch", "deployment"):
+            deployment = self.deployments[args[2]]
+            ops = json.loads(args[-1])
+            if not self._preconditions_hold(deployment, ops):
+                return CommandResult(args, 1, "", "test operation failed")
+            (replicas,) = (op["value"] for op in ops if op["op"] == "replace")
+            deployment["spec"]["replicas"] = replicas
+            self.scales.append((args[2], replicas))
+            return CommandResult(args, 0, "", "")
         if args[:2] == ("patch", "hpa"):
             hpa = self.hpas[args[2]]
             spec = hpa["spec"]
             ops = json.loads(args[-1])
-            for op in ops:
-                section, field = op["path"].strip("/").split("/")
-                if op["op"] == "test" and hpa[section].get(field) != op["value"]:
-                    return CommandResult(args, 1, "", "test operation failed")
+            if not self._preconditions_hold(hpa, ops):
+                return CommandResult(args, 1, "", "test operation failed")
             values = {op["path"].rsplit("/", 1)[-1]: op["value"] for op in ops if op["op"] == "replace"}
             spec.update(values)
             self.patches.append((args[2], values["minReplicas"], values["maxReplicas"]))
             return CommandResult(args, 0, "", "")
         raise AssertionError(f"unexpected kubectl call {args}")
+
+    def _read_then_write_status(self, item: dict[str, Any]) -> CommandResult:
+        reply = self._ok(item)
+        # The owning controller writes status after this read and before the
+        # harness's patch, which bumps the resourceVersion but not the spec.
+        metadata = item["metadata"]
+        metadata["resourceVersion"] = str(int(metadata["resourceVersion"]) + 1)
+        return reply
+
+    @staticmethod
+    def _preconditions_hold(item: dict[str, Any], ops: list[dict[str, Any]]) -> bool:
+        for op in ops:
+            section, field = op["path"].strip("/").split("/")
+            if op["op"] == "test" and item[section].get(field) != op["value"]:
+                return False
+        return True
 
     @staticmethod
     def _ok(value: object) -> CommandResult:
@@ -93,6 +113,8 @@ def _control(kubectl: _Kubectl) -> NativeRecoveryControl:
     control._autoscalers = {}
     control._release = lambda: None
     control._fence = lambda: None  # type: ignore[method-assign]
+    control.sleeps = []  # type: ignore[attr-defined]
+    control._sleep = control.sleeps.append  # type: ignore[attr-defined, method-assign]
     return control
 
 
@@ -138,10 +160,25 @@ class AutoscalerPinning(unittest.TestCase):
         with self.assertRaisesRegex(SmokeConfigurationError, "bounds update failed"):
             control._pin_autoscalers(("space-api",))
         kubectl.kubectl = real  # type: ignore[method-assign]
+        self.assertEqual(control.sleeps, [0.5, 1.0])  # type: ignore[attr-defined]
         control.restore()
         self.assertEqual(kubectl.patches, [])
         self.assertEqual(kubectl.hpas["space-api"]["spec"]["maxReplicas"], 3)
         self.assertEqual(control._autoscalers, {})
+
+
+class ControllerFault(unittest.TestCase):
+    def test_the_controller_is_stopped_and_restored_across_status_writes(self) -> None:
+        kubectl = _Kubectl()
+        control = _control(kubectl)
+        name = "space-cluster-controller"
+        control._captures[name] = DeploymentCapture(f"deploy-{name}", 2, "x=y", "d")
+        waits: list[tuple[str, int]] = []
+        control._wait = lambda target, count, **_: waits.append((target, count))  # type: ignore[method-assign]
+        control.stop_controller()
+        control.restore_controller()
+        self.assertEqual(kubectl.scales, [(name, 0), (name, 2)])
+        self.assertEqual(waits, [(name, 0), (name, 2)])
 
 
 class DispatcherCapacity(unittest.TestCase):

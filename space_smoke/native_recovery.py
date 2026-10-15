@@ -35,8 +35,10 @@ from space_smoke.runtime import ScenarioContext, SmokeConfigurationError, Subpro
 
 DEPLOYMENTS = ("space-api", "space-cluster-controller", "space-data-plane")
 STORAGE_DEPLOYMENT = "space-object-store"
-# Bounded re-reads of an autoscaler bounds write before it is reported failed.
+# Bounded re-reads of an autoscaler bounds write before it is reported failed,
+# with a doubling pause between them so the attempts outlast a brief API blip.
 PATCH_ATTEMPTS = 3
+PATCH_RETRY_DELAY = 0.5
 RECOVERY_ENVIRONMENT = (
     "SPACE_SMOKE_NATIVE_RECOVERY",
     "SPACE_SMOKE_NATIVE_RECOVERY_CONTEXT",
@@ -118,6 +120,9 @@ class NativeRecoveryControl:
         self._captures: dict[str, DeploymentCapture] = {}
         self._autoscalers: dict[str, AutoscalerCapture] = {}
         self._release = None
+
+    # Injectable so unit tests can observe the retry backoff without waiting.
+    _sleep = staticmethod(time.sleep)
 
     def _json(self, *args: str) -> dict:
         result = self.harness.kubectl(*args, timeout=15)
@@ -223,7 +228,9 @@ class NativeRecoveryControl:
         but whose reply was lost, or a transient API error, does not fail the
         restore, while bounds a third party set are still never overwritten.
         """
-        for _ in range(PATCH_ATTEMPTS):
+        for attempt in range(PATCH_ATTEMPTS):
+            if attempt:
+                self._sleep(PATCH_RETRY_DELAY * 2 ** (attempt - 1))
             autoscaler = self._json("get", "hpa", name, "-o", "json")
             if autoscaler["metadata"]["uid"] != uid:
                 raise SmokeConfigurationError(f"refusing replaced autoscaler {name}")
