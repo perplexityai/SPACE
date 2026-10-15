@@ -1,4 +1,5 @@
 use super::*;
+use crate::rootfs_backing::RootfsBackingPolicy;
 
 fn template_import_target_path(
     staging_dir: &str,
@@ -227,6 +228,7 @@ async fn materialize_compressed_imported_rootfs(
     content_hash: &str,
     rootfs_path: &Path,
     compressed_rootfs_path: &Path,
+    backing_policy: RootfsBackingPolicy,
 ) -> Result<ImportedRootfs, Status> {
     let decompress_compressed = compressed_rootfs_path.to_path_buf();
     let decompress_rootfs = rootfs_path.to_path_buf();
@@ -238,6 +240,7 @@ async fn materialize_compressed_imported_rootfs(
             &decompress_compressed,
             &decompress_rootfs,
             Some(&expected_rootfs_hash),
+            backing_policy,
         )
     })
     .await
@@ -264,7 +267,15 @@ async fn materialize_uncompressed_imported_rootfs(
     staging_dir: &str,
     rootfs_path: &Path,
     compressed_rootfs_path: &Path,
+    backing_policy: RootfsBackingPolicy,
 ) -> Result<ImportedRootfs, Status> {
+    if backing_policy == RootfsBackingPolicy::NoCow {
+        let raw_path = rootfs_path.to_path_buf();
+        tokio::task::spawn_blocking(move || backing_policy.prepare_raw(&raw_path))
+            .await
+            .map_err(|error| Status::internal(format!("prepare rootfs task: {error}")))?
+            .map_err(|error| Status::internal(format!("prepare rootfs backing: {error}")))?;
+    }
     let actual_rootfs_hash =
         compute_template_file_hash(rootfs_path.to_path_buf(), "compute streamed rootfs hash")
             .await?;
@@ -655,6 +666,7 @@ impl TemplateManagerService {
                 content_hash,
                 &rootfs_path,
                 &compressed_rootfs_path,
+                self.volume_puller.backing_policy,
             )
             .await;
         }
@@ -671,6 +683,7 @@ impl TemplateManagerService {
             staging_dir,
             &rootfs_path,
             &compressed_rootfs_path,
+            self.volume_puller.backing_policy,
         )
         .await
     }

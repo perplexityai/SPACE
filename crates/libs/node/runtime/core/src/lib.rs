@@ -69,14 +69,7 @@ pub async fn connect_runtime_supervisor()
 pub fn reflink_copy(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
-        let status = std::process::Command::new("cp")
-            .arg("--reflink=auto")
-            .arg(src)
-            .arg(dst)
-            .status()?;
-        if status.success() {
-            return Ok(());
-        }
+        pplx_space_common_io::reflink::copy_file(src, dst).map(|_| ())
     }
 
     #[cfg(target_os = "macos")]
@@ -91,6 +84,12 @@ pub fn reflink_copy(src: &std::path::Path, dst: &std::path::Path) -> std::io::Re
         }
     }
 
-    std::fs::copy(src, dst)?;
-    Ok(())
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::fs::copy(src, dst)?;
+        Ok(())
+    }
 }
+
+#[cfg(test)]
+mod tests;

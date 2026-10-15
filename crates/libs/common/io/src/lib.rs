@@ -15,4 +15,6 @@
 //! decisions and compose the shared mechanics.
 
 pub mod fs;
+#[cfg(all(unix, feature = "reflink"))]
+pub mod reflink;
 pub mod sparse;

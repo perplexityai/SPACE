@@ -236,7 +236,16 @@ async fn do_pull_aborts_early_when_build_is_marked_deleting() {
     // fine here. If the guard wasn't in place, do_pull would
     // proceed to the "no usable storage" failure with a
     // different reason.
-    let outcome = do_pull(db, "seed", hash, &[], &[], None).await;
+    let outcome = do_pull(
+        db,
+        "seed",
+        hash,
+        &[],
+        &[],
+        None,
+        RootfsBackingPolicy::Inherit,
+    )
+    .await;
     match outcome {
         Err(PullError::Failure(failure)) => {
             assert_eq!(failure, PullFailure::EvictionInProgress);
@@ -253,7 +262,16 @@ async fn do_pull_treats_empty_storage_locations_as_local_only_uncached() {
     let db = Arc::new(Mutex::new(conn));
     let hash = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
-    let outcome = do_pull(db, "seed", hash, &[], &[], None).await;
+    let outcome = do_pull(
+        db,
+        "seed",
+        hash,
+        &[],
+        &[],
+        None,
+        RootfsBackingPolicy::Inherit,
+    )
+    .await;
 
     match outcome {
         Err(PullError::Failure(failure)) => {
@@ -1311,11 +1329,11 @@ async fn materialize_rootfs_rejects_decoded_bytes_that_disagree_with_the_release
     let result = materialize_rootfs(
         &manifest,
         digest_dir.to_str().unwrap(),
-        rootfs_path.to_str().unwrap(),
         TEMPLATE_ROOTFS_FILE,
         &[],
         "seed",
         &release_hash,
+        RootfsBackingPolicy::Inherit,
     )
     .await;
 

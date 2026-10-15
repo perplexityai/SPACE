@@ -29,6 +29,8 @@ RUN sed -i \
       /etc/apt/sources.list.d/debian.sources \
     && apt-get -o Acquire::Check-Valid-Until=false update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      btrfs-progs \
+      e2fsprogs \
       ca-certificates \
       curl \
       docker.io \

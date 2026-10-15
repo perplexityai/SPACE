@@ -448,28 +448,49 @@ fn normalize_template_cache_tree(path: &Path) -> Result<(), Status> {
 }
 
 fn copy_template_file(src: &Path, dst: &Path) -> Result<(), Status> {
-    match std::process::Command::new("cp")
-        .arg("--reflink=auto")
-        .arg("--preserve=timestamps")
-        .arg(src)
-        .arg(dst)
-        .status()
+    #[cfg(target_os = "linux")]
     {
-        Ok(status) if status.success() => Ok(()),
-        Ok(status) => std::fs::copy(src, dst).map(|_| ()).map_err(|error| {
+        let copy = || -> std::io::Result<()> {
+            let metadata = std::fs::metadata(src)?;
+            let times = std::fs::FileTimes::new()
+                .set_accessed(metadata.accessed()?)
+                .set_modified(metadata.modified()?);
+            pplx_space_common_io::reflink::copy_file(src, dst)?;
+            std::fs::File::open(dst)?.set_times(times)
+        };
+        copy().map_err(|error| {
             Status::internal(format!(
-                "copy {} -> {} after cp exited {status}: {error}",
+                "copy template {} -> {}: {error}",
                 src.display(),
                 dst.display()
             ))
-        }),
-        Err(command_error) => std::fs::copy(src, dst).map(|_| ()).map_err(|error| {
-            Status::internal(format!(
-                "copy {} -> {} after cp failed ({command_error}): {error}",
-                src.display(),
-                dst.display()
-            ))
-        }),
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        match std::process::Command::new("cp")
+            .arg("--reflink=auto")
+            .arg("--preserve=timestamps")
+            .arg(src)
+            .arg(dst)
+            .status()
+        {
+            Ok(status) if status.success() => Ok(()),
+            Ok(status) => std::fs::copy(src, dst).map(|_| ()).map_err(|error| {
+                Status::internal(format!(
+                    "copy {} -> {} after cp exited {status}: {error}",
+                    src.display(),
+                    dst.display()
+                ))
+            }),
+            Err(command_error) => std::fs::copy(src, dst).map(|_| ()).map_err(|error| {
+                Status::internal(format!(
+                    "copy {} -> {} after cp failed ({command_error}): {error}",
+                    src.display(),
+                    dst.display()
+                ))
+            }),
+        }
     }
 }
 
@@ -1438,6 +1459,14 @@ impl TemplateManagerService {
             background_worker,
             sbx_connect_retry_policy: pplx_space_sbx_mgr_client::DEFAULT_CONNECT_RETRY_POLICY,
         })
+    }
+
+    pub(crate) fn with_rootfs_backing_policy(
+        mut self,
+        policy: crate::rootfs_backing::RootfsBackingPolicy,
+    ) -> Self {
+        self.volume_puller.backing_policy = policy;
+        self
     }
 
     /// Handle to the shared background worker, for the service binary

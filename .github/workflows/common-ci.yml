@@ -510,10 +510,10 @@ jobs:
           docker run "${docker_args[@]}" "space-ci:${GITHUB_SHA}" \
             bash -c 'git config --global --add safe.directory /workspace && exec bash -c "$SPACE_CI_COMMAND"'
 
-      # The nextest group `privileged`: 39 tests that need root, CAP_SYS_ADMIN,
+      # The nextest group `privileged`: tests that need root, CAP_SYS_ADMIN,
       # a seccomp profile allowing pidfd_getfd, or a Docker socket, or whose
-      # root path differs, and 14 opt-in tests that return early because
-      # neither step opts them in. Also the M1 generator check. They run the binaries the step above built, whatever its result,
+      # root path differs, plus NoCoW tests on a disposable btrfs filesystem.
+      # Other opt-in tests retain their own opt-ins. Also the M1 generator check. They run the binaries the step above built, whatever its result,
       # without compiling; the script returns anything it creates as root to
       # the runner user. No host network: the setup scripts and testcontainers
       # reach their containers on the bridge network.
@@ -545,7 +545,7 @@ jobs:
             docker_args+=(--env SPACE_CI_MAIN_ONLY_TESTS=1)
           fi
           docker run "${docker_args[@]}" "space-ci:${GITHUB_SHA}" \
-            bash -c 'git config --global --add safe.directory /workspace && exec bash ci/scripts/run-rust-checks.sh tests-privileged'
+            bash -c 'git config --global --add safe.directory /workspace && exec bash ci/scripts/with-nocow-test-filesystem.sh bash ci/scripts/run-rust-checks.sh tests-privileged'
 
       # Their logs print on every run: a test that fails and then passes on
       # nextest's retry leaves the job green.

@@ -1,5 +1,7 @@
 //! Read-only node-local disk metrics emitted by node-manager.
 
+mod rootfs_backing;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -345,12 +347,17 @@ async fn emit_tick(
     // Age from the beginning: a long census must not publish old measurements
     // as freshly observed just because its final command finished now.
     let observed_at = tokio::time::Instant::now();
-    let targets = tokio::task::spawn_blocking(collect_targets)
-        .await
-        .map_err(|error| format!("collect node disk metric targets task failed: {error}"))?
-        .map_err(|error| {
-            format!("node disk inventory incomplete; retaining previous evidence: {error}")
-        })?;
+    let targets = tokio::task::spawn_blocking(|| {
+        // Metadata-only adoption inventory is independent of the much slower
+        // extent accounting below and never runs on a lifecycle request.
+        rootfs_backing::emit_inventory(Path::new(CACHE_DIR), Path::new(TEMPLATE_DIR));
+        collect_targets()
+    })
+    .await
+    .map_err(|error| format!("collect node disk metric targets task failed: {error}"))?
+    .map_err(|error| {
+        format!("node disk inventory incomplete; retaining previous evidence: {error}")
+    })?;
     let measurement = measure_paths(targets.all_paths(), cursor).await;
     disk_usage_cache.replace(&targets, &measurement, observed_at);
     let snapshot = build_snapshot(&targets, &measurement);

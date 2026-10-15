@@ -32,6 +32,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 sqlx = { workspace = true, features = ["macros", "migrate"] }
+tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync", "time"] }
 tokio-stream = { workspace = true, features = ["net"] }
@@ -43,7 +44,7 @@ zstd = { workspace = true }
 
 # internal
 pplx-space-common-core = { workspace = true, features = ["serde"] }
-pplx-space-common-io = { workspace = true }
+pplx-space-common-io = { workspace = true, features = ["reflink"] }
 pplx-space-common-jobs = { workspace = true }
 pplx-space-common-lru-reaper = { workspace = true }
 pplx-space-common-svc = { workspace = true, features = ["sqlite"] }
@@ -67,6 +68,5 @@ nix = { workspace = true, features = ["user"] }
 pplx-space-observability = { workspace = true, features = ["test-capture"] }
 pplx-space-test-env = { workspace = true }
 rstest = { workspace = true }
-tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }

@@ -1,5 +1,64 @@
 use super::*;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{FileExt, symlink};
+
+#[cfg(target_os = "linux")]
+#[test]
+fn staging_preserves_nocow_sparse_files_and_clone_isolation() {
+    use rustix::fs::{IFlags, fstatfs, ioctl_getflags, ioctl_setflags};
+
+    let Some(root) = std::env::var_os("SPACE_NOCOW_TEST_BTRFS_DIR") else {
+        assert!(
+            std::env::var_os("CI").is_none()
+                && std::env::var_os("SPACE_CI_REQUIRE_TEST_DEPS").is_none(),
+            "CI must provide the disposable NoCoW btrfs fixture"
+        );
+        eprintln!("not opted in: set SPACE_NOCOW_TEST_BTRFS_DIR to a disposable btrfs directory");
+        return;
+    };
+    let tmp = tempfile::tempdir_in(root).unwrap();
+    let directory = File::open(tmp.path()).unwrap();
+    assert_eq!(fstatfs(&directory).unwrap().f_type, libc::BTRFS_SUPER_MAGIC);
+    let source_path = tmp.path().join("source");
+    let source = File::options()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&source_path)
+        .unwrap();
+    ioctl_setflags(&source, ioctl_getflags(&source).unwrap() | IFlags::NOCOW).unwrap();
+    source.set_len(16 * 1024 * 1024).unwrap();
+    source.write_all_at(b"original", 1024 * 1024).unwrap();
+    source.sync_all().unwrap();
+
+    for (name, policy) in [
+        ("default", IFlags::empty()),
+        ("nocow", IFlags::NOCOW),
+        ("compressed", IFlags::COMPRESSED),
+        ("uncompressed", IFlags::from_bits_retain(0x0000_0400)),
+    ] {
+        let path = tmp.path().join(name);
+        std::fs::create_dir(&path).unwrap();
+        let destination = File::open(&path).unwrap();
+        ioctl_setflags(&destination, policy).unwrap();
+        let copied = stage_open_file(&source, &destination, "copy".as_ref()).unwrap();
+        assert!(ioctl_getflags(&copied).unwrap().contains(IFlags::NOCOW));
+        assert_eq!(
+            copied.metadata().unwrap().len(),
+            source.metadata().unwrap().len()
+        );
+        assert!(copied.metadata().unwrap().blocks() * 512 < 1024 * 1024);
+        copied.write_all_at(b"modified", 1024 * 1024).unwrap();
+        copied.sync_all().unwrap();
+        let mut bytes = [0; 8];
+        source.read_exact_at(&mut bytes, 1024 * 1024).unwrap();
+        assert_eq!(&bytes, b"original");
+        File::open(path.join("copy"))
+            .unwrap()
+            .read_exact_at(&mut bytes, 1024 * 1024)
+            .unwrap();
+        assert_eq!(&bytes, b"modified");
+    }
+}
 
 #[test]
 fn descriptor_staging_keeps_pins_and_preserves_output_on_failure() {

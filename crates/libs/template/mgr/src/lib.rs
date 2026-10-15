@@ -8,6 +8,8 @@ mod node_state_sync;
 pub mod pinned_digests;
 pub mod pool_manager;
 pub mod prefetch;
+mod rootfs_backing;
+pub use rootfs_backing::RootfsBackingConfigError;
 pub(crate) mod rootfs_cache;
 pub(crate) mod rootfs_zstd;
 mod run;

@@ -127,3 +127,15 @@
 "crates/libs/internal/api/server/src/lib.rs" = 1
 "crates/libs/internal/api/server/src/published_state.rs" = 4
 "crates/libs/sandbox/store/src/lib.rs" = 2
+[pattern_ratchet.rootfs_copy]
+# Local nspawn and privileged builder copies are deferred; builders stay CoW.
+"crates/apps/local/node-mgr/svc/src/snapshot.rs" = 2
+"crates/libs/build/mgr/src/lib.rs" = 1
+# Network configuration and process-snapshot payloads are not rootfs images.
+"crates/libs/node/mgr/server/src/service/launch_prepare.rs" = 1
+"crates/libs/sbx/mgr/server/src/service/grpc_spaced_process_snapshots.rs" = 1
+# Non-Linux fallbacks; Linux paths use common-io's reflink helper.
+"crates/libs/node/runtime/core/src/lib.rs" = 2
+"crates/libs/template/mgr/src/service.rs" = 3
+"crates/libs/vol/mgr/server/src/staging.rs" = 2
+

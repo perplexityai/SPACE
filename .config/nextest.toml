@@ -70,8 +70,8 @@ priority = 10
 max-threads = 8
 
 [[profile.default.overrides]]
-# 53 tests: 39 that exercise privilege in CI, and 14 opt-in tests that return
-# early there because neither CI step opts them in.
+# NoCoW tests receive a disposable btrfs filesystem from the privileged CI
+# wrapper. Other opt-in tests keep their separate activation requirements.
 #
 # Root alone: identity_handoff, clone_tree, transfer_directory, the credmgr
 # volume-socket tests and the spaced worker binaries switch between real
@@ -96,7 +96,14 @@ max-threads = 8
 # containment benchmark, and build-mgr's real containerd and OCI assembly
 # tests.
 filter = '''
-(binary_id(pplx-space-volmgr-svc::bin/space-volmgr-svc) and test(/^identity_handoff::tests::/))
+(package(pplx-space-common-io) and test(=reflink::tests::nocow_preparation_clones_shared_extents_and_rejects_aliases))
+or (package(pplx-space-node-runtime-core) and test(=tests::restored_nocow_file_remains_reflink_compatible))
+or (package(pplx-space-volmgr) and test(=staging::tests::nocow_upload_and_shadow_staging_keep_reflinks))
+or (package(pplx-space-template-mgr) and test(=service::tests::template_refresh_preserves_nocow_and_timestamps))
+or (package(pplx-space-template-mgr) and test(=rootfs_backing::tests::materialization_preserves_bytes_sparsity_and_clone_isolation))
+or (package(pplx-space-node-mgr) and test(=contained_copy::tests::staging_preserves_nocow_sparse_files_and_clone_isolation))
+or (package(pplx-space-node-mgr) and test(=service::node_disk_metrics::rootfs_backing::tests::backing_inspection_reads_actual_btrfs_inode_policy))
+or (binary_id(pplx-space-volmgr-svc::bin/space-volmgr-svc) and test(/^identity_handoff::tests::/))
 or (package(pplx-space-node-mgr) and test(=clone_tree::tests::private_clone_blocks_foreign_uid_grafts_and_shared_clone_is_held))
 or (package(pplx-space-node-mgr) and test(=loop_devices::tests::ensure_capacity_creates_attachable_devices_past_max_loop))
 or (package(pplx-space-node-mgr) and test(=service::gateway_isolation::tests::isolated_gateway_cannot_access_vm_resources))

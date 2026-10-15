@@ -176,6 +176,7 @@ pub(crate) fn decompress_rootfs(
     compressed_path: &Path,
     rootfs_path: &Path,
     expected_rootfs_hash: Option<&str>,
+    backing_policy: crate::rootfs_backing::RootfsBackingPolicy,
 ) -> Result<RootfsZstdDecompressStats, RootfsZstdError> {
     let compressed_size = std::fs::metadata(compressed_path)
         .map_err(|source| RootfsZstdError::Io {
@@ -195,6 +196,13 @@ pub(crate) fn decompress_rootfs(
         path: tmp.display().to_string(),
         source,
     })?;
+    backing_policy
+        .prepare_empty(&output)
+        .map_err(|source| RootfsZstdError::Io {
+            operation: "set rootfs backing policy",
+            path: tmp.display().to_string(),
+            source,
+        })?;
     let digesting_input = DigestingReader::new(input);
     let buffered_input = BufReader::with_capacity(COMPRESSED_INPUT_BUFFER_SIZE, digesting_input);
     let mut decoder =

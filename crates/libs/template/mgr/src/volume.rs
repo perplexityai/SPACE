@@ -58,6 +58,7 @@
 //! - `path_style` (optional) — explicit override for path-style
 //!   addressing.
 
+use crate::rootfs_backing::RootfsBackingPolicy;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -335,6 +336,7 @@ pub enum PullOutcome {
 /// completion or drop; this is not a cache.
 #[derive(Clone, Default)]
 pub struct VolumePuller {
+    pub(crate) backing_policy: RootfsBackingPolicy,
     in_flight: Arc<Mutex<HashMap<PullKey, Arc<InFlightPull>>>>,
     /// Optional handle to tmplmgr's shared durable background worker
     /// (see [`crate::background_jobs`]). When set, `try_pull_from`
@@ -363,6 +365,7 @@ impl VolumePuller {
         >,
     ) -> Self {
         Self {
+            backing_policy: RootfsBackingPolicy::default(),
             in_flight: Arc::default(),
             background_worker: Some(background_worker),
         }
@@ -484,19 +487,19 @@ impl VolumePuller {
                 let storage_uris = storage_uris.clone();
                 let base_tags = base_tags.clone();
                 let background_worker = self.background_worker.clone();
+                let backing_policy = self.backing_policy;
                 // The caller that starts the pull waits for it below, so the
                 // pull runs under that caller's span.
                 tokio::spawn(
                     async move {
-                        let mut path_taken = PullPath::FreshPull;
-                        let outcome = pull_resolved_owner(
+                        let (outcome, path_taken) = pull_resolved_owner(
                             db,
                             &name,
                             &resolved_hash,
                             &storage_uris,
                             &base_tags,
-                            &mut path_taken,
                             background_worker.as_ref(),
+                            backing_policy,
                         )
                         .await;
                         guard.finish(PullTaskResult::new(&outcome, path_taken));
@@ -864,45 +867,44 @@ async fn pull_resolved_owner(
     resolved_hash: &str,
     storage_uris: &[String],
     base_tags: &[String],
-    path_taken: &mut PullPath,
     background_worker: Option<
         &pplx_space_common_jobs::BackgroundWorker<
             crate::background_jobs::TemplateBackgroundExecutor,
         >,
     >,
-) -> PullOutcome {
+    backing_policy: RootfsBackingPolicy,
+) -> (PullOutcome, PullPath) {
     // DB fast-path: a prior call (or startup recovery) already committed
     // this build. This check intentionally runs inside the owner task too:
     // a caller may have won the flight after another caller finished between
     // its first local miss and the flight-map insert.
     if local_build_exists(&db, name, resolved_hash) {
-        *path_taken = PullPath::DbHit;
         info!(
             template = name,
             content_hash = %resolved_hash,
             "build already present in DB; no pull needed"
         );
-        return PullOutcome::Materialized;
+        return (PullOutcome::Materialized, PullPath::DbHit);
     }
 
     // Disk recovery: a prior cache-miss pull (possibly one whose caller
     // was cancelled) may have left a complete artifact set in the digest
     // dir without finishing the DB upsert. Re-register from disk.
     if try_recover_from_disk(&db, name, resolved_hash).await {
-        *path_taken = PullPath::Recovered;
-        return PullOutcome::Materialized;
+        return (PullOutcome::Materialized, PullPath::Recovered);
     }
 
     // Fresh pull. Vol-mgr deduplicates concurrent PullFile calls server-side,
     // and its skip-if-present check elides re-downloads of files already on
     // disk from a prior incomplete attempt.
-    match do_pull(
+    let outcome = match do_pull(
         db,
         name,
         resolved_hash,
         storage_uris,
         base_tags,
         background_worker,
+        backing_policy,
     )
     .await
     {
@@ -918,7 +920,8 @@ async fn pull_resolved_owner(
                 "rootfs.ext4 hash mismatch: expected {expected}, got {actual}"
             )))
         }
-    }
+    };
+    (outcome, PullPath::FreshPull)
 }
 
 /// Connects to the cluster-role node-api and asks
@@ -1201,6 +1204,7 @@ async fn do_pull(
             crate::background_jobs::TemplateBackgroundExecutor,
         >,
     >,
+    backing_policy: RootfsBackingPolicy,
 ) -> Result<(), PullError> {
     // Validate name + hash once — both are URI-independent.
     pplx_space_common_core::types::TemplateName::parse(name.to_string()).map_err(|err| {
@@ -1290,6 +1294,7 @@ async fn do_pull(
             &parts,
             base_tags,
             background_worker,
+            backing_policy,
         )
         .await
         {
@@ -1338,6 +1343,7 @@ async fn try_pull_from(
             crate::background_jobs::TemplateBackgroundExecutor,
         >,
     >,
+    backing_policy: RootfsBackingPolicy,
 ) -> Result<(), PullError> {
     // Parse the template name into the typed identity that becomes the
     // SubjectId we hand to volume-manager. This is also the *only* boundary
@@ -1600,15 +1606,14 @@ async fn try_pull_from(
     } else {
         parsed_manifest.bootable_artifact.as_str()
     };
-    let rootfs_path = format!("{digest_dir}/{rootfs_filename}");
     let rootfs_outcome = materialize_rootfs(
         &parsed_manifest,
         &digest_dir,
-        &rootfs_path,
         rootfs_filename,
         base_tags,
         name,
         content_hash,
+        backing_policy,
     )
     .await?;
 
@@ -2691,12 +2696,13 @@ fn check_manifest_digests_for_target(
 async fn materialize_rootfs(
     manifest: &pplx_space_common_core::types::TemplateManifest,
     digest_dir: &str,
-    rootfs_path: &str,
     rootfs_filename: &str,
     base_tags: &[String],
     name: &str,
     content_hash: &str,
+    backing_policy: RootfsBackingPolicy,
 ) -> Result<RootfsMaterialization, PullError> {
+    let rootfs_path = format!("{digest_dir}/{rootfs_filename}");
     // Decompress every zstd-paired entry the manifest declares — not
     // just the bootable rootfs. Each runs on its own `spawn_blocking`
     // and they fan out via `try_join_all` so a manifest with several
@@ -2755,22 +2761,27 @@ async fn materialize_rootfs(
             target.compressed_path.clone(),
             target.uncompressed_path.clone(),
             target.expected_uncompressed_digest.clone(),
+            if target.uncompressed_name == rootfs_filename {
+                backing_policy
+            } else {
+                RootfsBackingPolicy::Inherit
+            },
         ));
     }
     let phase_started = Instant::now();
-    let decompress_futs =
-        decompress_jobs
-            .into_iter()
-            .map(|(compressed, uncompressed, expected_digest)| async move {
-                tokio::task::spawn_blocking(move || {
-                    crate::rootfs_zstd::decompress_rootfs(
-                        Path::new(&compressed),
-                        Path::new(&uncompressed),
-                        Some(&expected_digest),
-                    )
-                })
-                .await
-            });
+    let decompress_futs = decompress_jobs.into_iter().map(
+        |(compressed, uncompressed, expected_digest, policy)| async move {
+            tokio::task::spawn_blocking(move || {
+                crate::rootfs_zstd::decompress_rootfs(
+                    Path::new(&compressed),
+                    Path::new(&uncompressed),
+                    Some(&expected_digest),
+                    policy,
+                )
+            })
+            .await
+        },
+    );
     let decompress_results = futures_util::future::join_all(decompress_futs).await;
     let mut rootfs_outcome: Option<RootfsMaterialization> = None;
     for (target, joined) in targets.iter().zip(decompress_results) {
@@ -2868,6 +2879,13 @@ async fn materialize_rootfs(
     let hash_source = rootfs_path.to_string();
     let phase_started = Instant::now();
     let (rootfs_hash, rootfs_size) = match tokio::task::spawn_blocking(move || {
+        backing_policy
+            .prepare_raw(Path::new(&hash_source))
+            .map_err(|source| crate::rootfs_zstd::RootfsZstdError::Io {
+                operation: "set raw rootfs backing policy",
+                path: hash_source.clone(),
+                source,
+            })?;
         crate::rootfs_zstd::hash_rootfs_file(Path::new(&hash_source))
     })
     .await

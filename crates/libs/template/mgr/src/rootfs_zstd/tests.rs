@@ -77,7 +77,13 @@ fn rootfs_zstd_round_trips_sparse_file() {
     );
 
     std::fs::remove_file(&rootfs).unwrap();
-    let decompress_stats = decompress_rootfs(&compressed, &rootfs, None).unwrap();
+    let decompress_stats = decompress_rootfs(
+        &compressed,
+        &rootfs,
+        None,
+        crate::rootfs_backing::RootfsBackingPolicy::Inherit,
+    )
+    .unwrap();
     assert_eq!(decompress_stats.rootfs_size, 16 * 1024 * 1024);
     assert_eq!(
         decompress_stats.compressed_size,
@@ -114,7 +120,13 @@ fn decompress_rootfs_refuses_to_publish_a_digest_mismatch() {
     std::fs::remove_file(&rootfs).unwrap();
     let expected = format!("sha256:{}", "1".repeat(64));
 
-    let err = decompress_rootfs(&compressed, &rootfs, Some(&expected)).unwrap_err();
+    let err = decompress_rootfs(
+        &compressed,
+        &rootfs,
+        Some(&expected),
+        crate::rootfs_backing::RootfsBackingPolicy::Inherit,
+    )
+    .unwrap_err();
 
     assert!(
         matches!(
@@ -131,7 +143,13 @@ fn decompress_rootfs_refuses_to_publish_a_digest_mismatch() {
         "only the compressed input may remain; no temp output left behind"
     );
 
-    let stats = decompress_rootfs(&compressed, &rootfs, Some(&actual_rootfs_hash)).unwrap();
+    let stats = decompress_rootfs(
+        &compressed,
+        &rootfs,
+        Some(&actual_rootfs_hash),
+        crate::rootfs_backing::RootfsBackingPolicy::Inherit,
+    )
+    .unwrap();
     assert_eq!(stats.rootfs_hash, actual_rootfs_hash);
     assert!(rootfs.exists());
 }
@@ -159,7 +177,13 @@ fn hash_rootfs_file_matches_decompressed_hash() {
     assert_eq!(legacy_hash, sha256_bytes(&std::fs::read(&rootfs).unwrap()));
 
     std::fs::remove_file(&rootfs).unwrap();
-    let decompress_stats = decompress_rootfs(&compressed, &rootfs, None).unwrap();
+    let decompress_stats = decompress_rootfs(
+        &compressed,
+        &rootfs,
+        None,
+        crate::rootfs_backing::RootfsBackingPolicy::Inherit,
+    )
+    .unwrap();
     assert_eq!(decompress_stats.rootfs_hash, legacy_hash);
     assert_eq!(decompress_stats.rootfs_size, legacy_size);
 }
@@ -180,7 +204,13 @@ fn decompress_rootfs_rejects_truncated_zstd() {
         .unwrap();
     std::fs::remove_file(&rootfs).unwrap();
 
-    let err = decompress_rootfs(&compressed, &rootfs, None).unwrap_err();
+    let err = decompress_rootfs(
+        &compressed,
+        &rootfs,
+        None,
+        crate::rootfs_backing::RootfsBackingPolicy::Inherit,
+    )
+    .unwrap_err();
     assert!(
         matches!(err, RootfsZstdError::Zstd { .. }),
         "truncated zstd must fail in the decoder, got {err:?}"

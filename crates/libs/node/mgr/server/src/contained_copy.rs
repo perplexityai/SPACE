@@ -43,15 +43,12 @@ use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::os::fd::OwnedFd;
-use std::os::unix::fs::{FileExt, MetadataExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use nix::fcntl::{OFlag, open, openat};
 use nix::sys::stat::Mode;
-
-/// Copy buffer for the non-reflink fallback.
-const COPY_BUF_BYTES: usize = 1024 * 1024;
 
 /// Per-process counter making staging temp file names unique.
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -297,84 +294,7 @@ fn unlinkat(dir: &File, name: &OsStr) -> io::Result<()> {
 /// the filesystem supports it, hole-preserving byte copy otherwise. The
 /// destination is a freshly created empty temp file.
 pub(crate) fn copy_on_descriptors(src: &File, dst: &File, len: u64) -> io::Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        // FICLONE = cp --reflink: O(1) and exact (holes included) on btrfs.
-        // Any error (EOPNOTSUPP/EINVAL/EXDEV on non-CoW filesystems) falls
-        // through to the byte copy.
-        if rustix::fs::ioctl_ficlone(dst, src).is_ok() {
-            return Ok(());
-        }
-    }
-    sparse_copy(src, dst, len)
-}
-
-/// `lseek` with a whence std's `Seek` cannot express (`SEEK_DATA` /
-/// `SEEK_HOLE`). Returns the resulting non-negative offset.
-fn lseek(fd: &File, offset: u64, whence: nix::unistd::Whence) -> io::Result<u64> {
-    let offset =
-        libc::off_t::try_from(offset).map_err(|_| io::Error::other("offset exceeds off_t"))?;
-    let out = nix::unistd::lseek(fd, offset, whence)?;
-    u64::try_from(out).map_err(|_| io::Error::other("lseek returned a negative offset"))
-}
-
-/// Byte copy that reproduces the source's holes via `SEEK_DATA`/`SEEK_HOLE`,
-/// so a mostly-hole sparse backing file stays sparse on the destination. On
-/// a filesystem without data/hole seeking the whole range is treated as one
-/// data segment.
-fn sparse_copy(src: &File, dst: &File, len: u64) -> io::Result<()> {
-    // Trailing holes (and the final size) come from the truncate, not writes.
-    dst.set_len(len)?;
-    let mut buf = vec![0u8; COPY_BUF_BYTES];
-    let mut offset: u64 = 0;
-    while offset < len {
-        let data_start = match lseek(src, offset, nix::unistd::Whence::SeekData) {
-            Ok(data_start) => data_start,
-            // No data at or after `offset`: the rest of the file is a hole.
-            Err(e) if e.raw_os_error() == Some(libc::ENXIO) => break,
-            // Filesystem can't seek holes: copy the remainder as data.
-            Err(e)
-                if matches!(
-                    e.raw_os_error(),
-                    Some(libc::EINVAL) | Some(libc::ENOTSUP) | Some(libc::ENOTTY)
-                ) =>
-            {
-                copy_segment(src, dst, offset, len, &mut buf)?;
-                break;
-            }
-            Err(e) => return Err(e),
-        };
-        // A hole always follows data: filesystems report an implicit hole at
-        // EOF, so this cannot fail with ENXIO after a successful SEEK_DATA.
-        let hole_start = lseek(src, data_start, nix::unistd::Whence::SeekHole)?;
-        copy_segment(src, dst, data_start, hole_start, &mut buf)?;
-        offset = hole_start;
-    }
-    Ok(())
-}
-
-fn copy_segment(src: &File, dst: &File, start: u64, end: u64, buf: &mut [u8]) -> io::Result<()> {
-    let mut offset = start;
-    while offset < end {
-        let want = usize::try_from((end - offset).min(buf.len() as u64))
-            .map_err(|_| io::Error::other("segment length exceeds usize"))?;
-        let chunk = buf
-            .get_mut(..want)
-            .ok_or_else(|| io::Error::other("copy chunk exceeds buffer"))?;
-        let got = src.read_at(chunk, offset)?;
-        if got == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "source shrank during copy",
-            ));
-        }
-        let filled = chunk
-            .get(..got)
-            .ok_or_else(|| io::Error::other("read returned more than requested"))?;
-        dst.write_all_at(filled, offset)?;
-        offset += got as u64;
-    }
-    Ok(())
+    pplx_space_common_io::reflink::copy_on_descriptors(src, dst, len).map(|_| ())
 }
 
 #[cfg(test)]

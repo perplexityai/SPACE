@@ -157,24 +157,24 @@ impl StagingDir {
     }
 }
 
-/// Reflink-or-copy `src` to `dst`. Inlined (rather than reaching into
-/// `pplx_space_node_runtime_core`) to avoid pulling that crate's whole
-/// dependency surface into vol-mgr.
+/// Reflink-or-copy `src` to `dst`. Linux shares descriptor-based copy mechanics
+/// with node-manager and restore staging, including verified NoCoW inheritance.
 async fn reflink_copy(src: &Path, dst: &Path) -> Result<StagingMode, String> {
     #[cfg(target_os = "linux")]
     {
-        let status = tokio::process::Command::new("cp")
-            .arg("--reflink=always")
-            .arg(src)
-            .arg(dst)
-            .status()
+        let src = src.to_path_buf();
+        let dst = dst.to_path_buf();
+        tokio::task::spawn_blocking(move || pplx_space_common_io::reflink::copy_file(&src, &dst))
             .await
-            .map_err(|e| format!("spawn cp --reflink=always: {e}"))?;
-        if status.success() {
-            return Ok(StagingMode::Reflink);
-        }
-        // A missing source fails again below with its actual I/O error. A
-        // successful fallback identifies a filesystem without reflink support.
+            .map_err(|error| format!("join staged copy: {error}"))?
+            .map(|cloned| {
+                if cloned {
+                    StagingMode::Reflink
+                } else {
+                    StagingMode::CopyFallback
+                }
+            })
+            .map_err(|error| format!("stage reflink or sparse copy: {error}"))
     }
 
     #[cfg(target_os = "macos")]
@@ -195,10 +195,13 @@ async fn reflink_copy(src: &Path, dst: &Path) -> Result<StagingMode, String> {
         }
     }
 
-    tokio::fs::copy(src, dst)
-        .await
-        .map_err(|e| format!("tokio::fs::copy: {e}"))?;
-    Ok(StagingMode::CopyFallback)
+    #[cfg(not(target_os = "linux"))]
+    {
+        tokio::fs::copy(src, dst)
+            .await
+            .map_err(|error| format!("copy: {error}"))?;
+        Ok(StagingMode::CopyFallback)
+    }
 }
 
 /// Reflink `src` to `dst` without a full-copy fallback.
@@ -210,17 +213,12 @@ async fn reflink_copy(src: &Path, dst: &Path) -> Result<StagingMode, String> {
 pub(crate) async fn reflink_only(src: &Path, dst: &Path) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
-        let status = tokio::process::Command::new("cp")
-            .arg("--reflink=always")
-            .arg(src)
-            .arg(dst)
-            .status()
+        let src = src.to_path_buf();
+        let dst = dst.to_path_buf();
+        tokio::task::spawn_blocking(move || pplx_space_common_io::reflink::reflink_file(&src, &dst))
             .await
-            .map_err(|error| format!("spawn cp --reflink=always: {error}"))?;
-        if status.success() {
-            return Ok(());
-        }
-        Err(format!("cp --reflink=always exited with {status}"))
+            .map_err(|error| format!("join shadow reflink: {error}"))?
+            .map_err(|error| format!("shadow reflink: {error}"))
     }
 
     #[cfg(not(target_os = "linux"))]

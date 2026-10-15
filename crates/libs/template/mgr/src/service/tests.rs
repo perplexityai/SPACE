@@ -2049,3 +2049,35 @@ fn build_staging_dir_staleness_is_age_gated() {
         "staging dir older than the backstop must be reaped"
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn template_refresh_preserves_nocow_and_timestamps() {
+    use rustix::fs::{IFlags, ioctl_getflags, ioctl_setflags};
+    use std::os::unix::fs::FileExt;
+    let Some(root) = std::env::var_os("SPACE_NOCOW_TEST_BTRFS_DIR") else {
+        assert!(
+            std::env::var_os("CI").is_none()
+                && std::env::var_os("SPACE_CI_REQUIRE_TEST_DEPS").is_none(),
+            "CI must provide the disposable NoCoW btrfs fixture"
+        );
+        eprintln!("not opted in: set SPACE_NOCOW_TEST_BTRFS_DIR to a disposable btrfs directory");
+        return;
+    };
+    let temporary = tempfile::tempdir_in(root).unwrap();
+    let src = temporary.path().join("rootfs.ext4");
+    let dst = temporary.path().join("republished.ext4");
+    let file = std::fs::File::create(&src).unwrap();
+    ioctl_setflags(&file, IFlags::NOCOW).unwrap();
+    file.write_all_at(&[7; 8192], 0).unwrap();
+    let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1234567890);
+    file.set_times(std::fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    copy_template_file(&src, &dst).unwrap();
+    let copied = std::fs::File::open(&dst).unwrap();
+    assert!(ioctl_getflags(&copied).unwrap().contains(IFlags::NOCOW));
+    assert_eq!(copied.metadata().unwrap().modified().unwrap(), modified);
+    assert_eq!(std::fs::read(&dst).unwrap(), vec![7; 8192]);
+    file.write_all_at(b"changed", 0).unwrap();
+    assert_eq!(std::fs::read(&dst).unwrap(), vec![7; 8192]);
+}

@@ -46,3 +46,34 @@ mode = "advisory"
 
 [rules.pattern_ratchet.direct_tables.stale_entries]     # entries with fewer matches, none, or gone
 mode = "advisory"
+
+# Rootfs copies must preserve NoCoW and sparse extents through common-io's
+# reflink helper. A line matcher cannot infer a path variable's contents, so
+# conservatively fence all new plain filesystem copies and cp launches.
+# Existing non-rootfs, non-Linux and deferred builder/local paths are counted
+# in the baseline, not freely allowed; their counts may only decrease.
+[rules.pattern_ratchet.rootfs_copy]
+patterns = [
+  '\bCommand\s*::\s*new\s*\(\s*"(?:/bin/|/usr/bin/)?cp"',
+  '\bcommand_as_root\s*\(\s*"(?:/bin/|/usr/bin/)?cp"',
+  '\bfs\s*::\s*copy\s*\(',
+  '\buse\s+(?:std|tokio)\s*::\s*fs\s*::[^;]*\bcopy\b',
+]
+allow = ["crates/libs/common/io/src/reflink.rs"]
+
+[rules.pattern_ratchet.rootfs_copy.no_crossing]
+mode = "required"
+
+# Seeding a new ratchet reports these initial exceptions against the base.
+# Subsequent additions remain explicit review findings; ordinary new uses fail.
+[rules.pattern_ratchet.rootfs_copy.no_new_entries]
+mode = "advisory"
+
+[rules.pattern_ratchet.rootfs_copy.no_raised_caps]
+mode = "required"
+
+[rules.pattern_ratchet.rootfs_copy.listed_no_growth]
+mode = "required"
+
+[rules.pattern_ratchet.rootfs_copy.stale_entries]
+mode = "required"

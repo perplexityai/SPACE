@@ -55,6 +55,10 @@ pub struct TemplateMgrRunConfig {
 /// there is no type-erased I/O variant here.
 #[derive(Debug, thiserror::Error)]
 pub enum RunTemplateMgrError {
+    #[error("invalid template rootfs backing policy: {0}")]
+    RootfsBacking(#[source] crate::RootfsBackingConfigError),
+    #[error("template cache cannot honor the rootfs backing policy: {0}")]
+    RootfsBackingFilesystem(#[source] std::io::Error),
     #[error("failed to bind the template-manager health socket: {0}")]
     HealthSocket(#[source] pplx_space_common_svc::bootstrap::BindUnixSocketError),
     #[error("failed to acquire the template-manager service mutex: {0}")]
@@ -143,6 +147,18 @@ async fn run_service(
     );
     health_server.mark_starting();
 
+    let backing_policy = crate::rootfs_backing::RootfsBackingPolicy::from_env()
+        .map_err(RunTemplateMgrError::RootfsBacking)?;
+    if backing_policy == crate::rootfs_backing::RootfsBackingPolicy::NoCow {
+        let root = std::path::Path::new(pplx_space_common_core::host::linux::paths::TEMPLATE_DIR);
+        tokio::fs::create_dir_all(root)
+            .await
+            .map_err(RunTemplateMgrError::RootfsBackingFilesystem)?;
+        backing_policy
+            .validate_cache(root)
+            .map_err(RunTemplateMgrError::RootfsBackingFilesystem)?;
+    }
+
     pplx_space_common_svc::sql::sqlite::migrate_embedded(
         "template-manager",
         std::path::Path::new(DB_PATH),
@@ -156,8 +172,11 @@ async fn run_service(
 
     let conn = crate::db::open().map_err(RunTemplateMgrError::OpenDatabase)?;
 
-    let service =
-        TemplateManagerService::new(conn).map_err(RunTemplateMgrError::InitializeService)?;
+    tracing::info!(%backing_policy,
+        "template rootfs backing policy applies to new materializations only; existing cache entries remain unchanged");
+    let service = TemplateManagerService::new(conn)
+        .map_err(RunTemplateMgrError::InitializeService)?
+        .with_rootfs_backing_policy(backing_policy);
 
     // Re-arm any durable background jobs that were in flight (i.e.
     // `status='running'`) when the previous tmplmgr exited. Without

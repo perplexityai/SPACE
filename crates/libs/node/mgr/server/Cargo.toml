@@ -47,6 +47,7 @@ zeroize = { workspace = true }
 # internal
 pplx-space-common-core = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
+pplx-space-common-io = { workspace = true, features = ["reflink"] }
 pplx-space-common-svc = { workspace = true, features = ["sqlite"] }
 pplx-space-credmgr-client = { workspace = true }
 pplx-space-events = { workspace = true }

@@ -4,6 +4,40 @@
 
 use crate::emit::{counter, gauge, tag};
 
+/// Node-manager's five-minute census of canonical local rootfs files, including
+/// retained copies. `kind`: template, instance, suspend_checkpoint, disk_snapshot.
+/// `backing`: cow, nocow, non_btrfs, unknown. Counts are not running VM counts,
+/// unique content counts, write traffic or checksum verification. All bounded
+/// categories emit zero on a successful census; incomplete censuses retain the
+/// previous counts. Cluster identity is supplied by the telemetry transport.
+pub fn rootfs_backing_count(kind: &str, backing: &str, count: u64) {
+    gauge(
+        "node_disk.rootfs_backing_count",
+        count as f64,
+        &[tag("kind", kind), tag("backing", backing)],
+    );
+}
+
+/// Whether the last directory census completed. Individual unreadable files
+/// are counted as unknown, so success alone does not prove full classification.
+pub fn rootfs_backing_inventory_success(success: bool) {
+    gauge(
+        "node_disk.rootfs_backing_inventory_success",
+        f64::from(success),
+        &[],
+    );
+}
+
+/// Unix time at the beginning of the last successful backing census. Reject
+/// stale nodes when calculating adoption; an absent series is not a zero count.
+pub fn rootfs_backing_last_success(timestamp: f64) {
+    gauge(
+        "node_disk.rootfs_backing_last_success_timestamp_seconds",
+        timestamp,
+        &[],
+    );
+}
+
 /// Free fraction of the `/space/cache` filesystem in `[0.0, 1.0]`,
 /// measured once per node-ctl reconcile tick.
 pub fn ssd_free_fraction(value: f64) {
