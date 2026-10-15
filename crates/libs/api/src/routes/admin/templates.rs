@@ -1006,6 +1006,25 @@ fn template_delete_fingerprint(
     })
 }
 
+/// Whether a public operation can still run: it exists and is queued or
+/// running.
+async fn delete_operation_is_active(
+    pool: &sqlx::PgPool,
+    operation_id: pplx_space_public_api::OperationId,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(sql!(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM public_operations
+             WHERE operation_id = $1
+               AND state IN ('queued', 'running')
+         )"
+    ))
+    .bind(operation_id.as_uuid())
+    .fetch_one(pool)
+    .await
+}
+
 pub async fn delete_template(
     State(state): State<AppState>,
     Extension(AuthUser(actor)): Extension<AuthUser>,
@@ -1112,8 +1131,36 @@ pub async fn delete_template(
         })
         .await
     {
-        Ok(CreatePublicOperationResult::Created(operation_id))
-        | Ok(CreatePublicOperationResult::Existing(operation_id)) => operation_id,
+        Ok(CreatePublicOperationResult::Created(operation_id)) => operation_id,
+        Ok(CreatePublicOperationResult::Existing(operation_id)) => {
+            // A replayed key answers with its original operation. Once that
+            // operation is terminal it must not become the template's
+            // current delete: it would never run, and installing it could
+            // displace an active replacement. The caller retries with a new
+            // key.
+            match delete_operation_is_active(&state.pool, operation_id).await {
+                Ok(true) => operation_id,
+                Ok(false) => {
+                    return (
+                        StatusCode::ACCEPTED,
+                        Json(TemplateOperationResponse {
+                            operation_id,
+                            template: template_name.to_string(),
+                        }),
+                    )
+                        .into_response();
+                }
+                Err(error) => {
+                    if let Some(response) = contention_response(ContentionScope::ReadOnly, &error)
+                    {
+                        return response.into_response();
+                    }
+                    tracing::error!(%error, template = template_name.as_str(), "failed to load replayed template delete operation");
+                    return api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+                        .into_response();
+                }
+            }
+        }
         Ok(CreatePublicOperationResult::IdempotencyConflict { operation_id, .. }) => {
             let details = operation_id
                 .map(|id| PublicErrorDetail {

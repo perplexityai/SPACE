@@ -995,5 +995,38 @@ async fn a_delete_after_a_failed_delete_operation_starts_a_replacement()
     // the failed operation.
     assert_eq!(delete("failed-delete-retry-first").await, second);
     assert_eq!(recorded_operation().await, second_id);
+
+    // The replacement fails too. Replaying the first key answers with its
+    // original, failed operation and must not reinstall it as the current
+    // delete; a fresh key then starts a dispatchable third attempt.
+    sqlx::query(sql!(
+        "UPDATE public_operations
+         SET state = 'failed', completed_at = NOW()
+         WHERE operation_id = $1"
+    ))
+    .bind(second_id)
+    .execute(&db.pool)
+    .await?;
+    assert_eq!(delete("failed-delete-retry-first").await, first);
+    assert_eq!(
+        recorded_operation().await,
+        second_id,
+        "a terminal replayed operation leaves the current delete untouched"
+    );
+    let third = delete("failed-delete-retry-third").await;
+    assert_ne!(third, first);
+    assert_ne!(third, second);
+    let third_id = recorded_operation().await;
+    assert_eq!(
+        third,
+        pplx_space_public_api::OperationId::from_uuid(third_id).to_string()
+    );
+    let third_state: String = sqlx::query_scalar(sql!(
+        "SELECT state FROM public_operations WHERE operation_id = $1"
+    ))
+    .bind(third_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(third_state, "queued", "the third attempt is dispatchable");
     Ok(())
 }
