@@ -1230,10 +1230,16 @@ class CommandSandboxFixture:
             # released: the reset holds the sandbox's exclusive host-mutation
             # claim. sbx-manager then reports the eviction failed once and
             # durable cleanup recovery finishes the claimed row without another
-            # eviction event. The failure event proves node reconciliation
-            # claimed the row; the removed rootfs proves the retry finished.
+            # eviction event. A failed event alone does not prove the claim:
+            # refusals before it carry the same reason. Only the eviction's own
+            # durable cleanup job, created after the claim, prefixes the
+            # node-manager CleanupSandbox error with its context, so that
+            # prefix proves the claim; the removed rootfs proves the retry
+            # finished. Any other failure leaves the wait on the completed
+            # event above.
             claimed = any(
                 event.reason == "cluster_row_absent"
+                and event.error.startswith(_CLAIMED_EVICTION_CLEANUP_ERROR_PREFIX)
                 for event in control.local_eviction_failures(
                     sandbox_id, node_names=[worker], since_time=since_time
                 )
@@ -4057,6 +4063,12 @@ class StartupRecoveryAssertions:
 # The two healthy outcomes of a remote pull. `remote_local_mismatch` and
 # `remote_metadata_unknown` are anomaly classes and must not pass.
 REMOTE_RESTORE_PROVENANCE = frozenset({"remote_matches_local", "remote_only"})
+
+
+# sbx-manager's durable cleanup job runs with this context and prefixes it to
+# a refused node-manager CleanupSandbox call. A cluster-deleted eviction
+# persists that job only after it has claimed the local row.
+_CLAIMED_EVICTION_CLEANUP_ERROR_PREFIX = "durable sandbox cleanup: "
 
 
 def _log_since_time() -> str:

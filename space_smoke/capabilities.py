@@ -2025,6 +2025,8 @@ class LocalEviction:
     node_name: str
     reason: str
     snapshot_id: str
+    # The failed event's `error`; empty for completed evictions.
+    error: str = ""
 
 
 class ColdEvictionControl(RestoreStateRead, SandboxEventRead, Protocol):
@@ -2072,10 +2074,12 @@ class ColdEvictionControl(RestoreStateRead, SandboxEventRead, Protocol):
     ) -> list[LocalEviction]:
         """`local_eviction_failed` events for the sandbox, from sandbox-manager logs.
 
-        sbx-manager emits one only after the eviction has claimed the local row
-        into `deleting`; refusals before the claim emit nothing. The failed
-        attempt leaves a durable cleanup job, and the recovery that finishes it
-        emits no further eviction event.
+        The event alone does not prove the eviction claimed the local row:
+        sbx-manager emits it, with the same reason, for refusals before the
+        claim (an active cleanup fence, a live restore staging pull, a storage
+        error) as well as for a failed cleanup after it. The `error` tells
+        them apart. A claimed eviction leaves a durable cleanup job, and the
+        recovery that finishes that job emits no further eviction event.
         """
         ...
 

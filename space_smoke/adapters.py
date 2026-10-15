@@ -1960,6 +1960,7 @@ ON CONFLICT (key_hash) DO NOTHING;
                 node_name=node_name,
                 reason=str(event.get("reason", "")),
                 snapshot_id=str(event.get("snapshot_id", "")),
+                error=str(event.get("error", "")),
             )
             for node_name, event in self._sandbox_events(
                 canonical,
