@@ -18,6 +18,7 @@ recorded as null.
 from __future__ import annotations
 
 import argparse
+import base64
 import concurrent.futures
 import json
 import os
@@ -29,6 +30,10 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -311,6 +316,212 @@ def http_response_split(text: str) -> tuple[int | None, str]:
     return (int(code), body) if code.isdigit() else (None, text)
 
 
+# --- SPACE API client (API mode) --------------------------------------------
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+# Never send the management or attachment token through an inherited proxy or a redirect.
+_HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+_TERMINAL_FAILED = {"failed", "canceled", "cancelled", "expired"}
+_SANDBOX_GONE = {"failed", "deleted", "deleting", "stopped"}
+
+
+class ApiError(RuntimeError):
+    pass
+
+
+class SpaceApi:
+    """Minimal stdlib client for the public SPACE API, used by ``--api-url`` mode.
+
+    Commands inside a sandbox need a route token that only the SPACE API mints,
+    so on clusters that enforce it (EKS) node-local ``space-sbxmgr exec`` is
+    refused. In API mode the harness drives every sandbox operation through
+    the API and keeps taking host measurements locally, so it must run on the
+    node the sandboxes land on.
+    """
+
+    def __init__(self, api_url: str, data_plane_url: str, token: str, *, poll_secs: float = 0.25) -> None:
+        self.api_url = api_url.rstrip("/")
+        self.data_plane_url = data_plane_url.rstrip("/")
+        self.token = token
+        self.poll_secs = poll_secs
+
+    def request(self, method: str, path: str, body: Any = None, *, idempotent: bool = False, timeout: float = 30) -> dict[str, Any]:
+        headers = {"Authorization": f"Bearer {self.token}", "Accept": "application/json"}
+        data = None
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+            data = json.dumps(body).encode()
+        if idempotent:
+            headers["Idempotency-Key"] = f"bench-balloon-{uuid.uuid4().hex}"
+        req = urllib.request.Request(self.api_url + path, data=data, headers=headers, method=method)
+        try:
+            with _HTTP.open(req, timeout=timeout) as response:
+                raw = response.read()
+        except urllib.error.HTTPError as error:
+            with error:
+                detail = error.read(2048).decode("utf-8", errors="replace")
+            raise ApiError(f"{method} {path}: HTTP {error.code}: {detail}") from error
+        except (urllib.error.URLError, OSError) as error:
+            raise ApiError(f"{method} {path}: {error}") from error
+        if not raw.strip():
+            return {}
+        result = json.loads(raw)
+        if not isinstance(result, dict):
+            raise ApiError(f"{method} {path}: expected a JSON object")
+        return result
+
+    def wait_operation(self, operation_id: str, timeout: float) -> None:
+        deadline = time.monotonic() + timeout
+        while True:
+            state = self.request("GET", f"/v1/operations/{operation_id}").get("state")
+            if state == "succeeded":
+                return
+            if state in _TERMINAL_FAILED:
+                raise ApiError(f"operation {operation_id} {state}")
+            if time.monotonic() >= deadline:
+                raise ApiError(f"operation {operation_id} still {state} after {timeout:.0f}s")
+            time.sleep(self.poll_secs)
+
+    def wait_state(self, sandbox_id: str, target: str, timeout: float) -> None:
+        deadline = time.monotonic() + timeout
+        while True:
+            state = self.request("GET", f"/v1/sandboxes/{sandbox_id}").get("state")
+            if state == target:
+                return
+            if state in _SANDBOX_GONE:
+                raise ApiError(f"sandbox {sandbox_id} is {state}, expected {target}")
+            if time.monotonic() >= deadline:
+                raise ApiError(f"sandbox {sandbox_id} still {state} after {timeout:.0f}s, expected {target}")
+            time.sleep(self.poll_secs)
+
+    def wait_ready(self, sandbox_id: str, timeout: float) -> None:
+        self.wait_state(sandbox_id, "running", timeout)
+        self.request("GET", f"/v1/sandboxes/{sandbox_id}/processes?limit=1", timeout=min(timeout, 180))
+
+    def create(self, template: str, resources: dict[str, int], timeout: float) -> str:
+        body = {"template": template, "runtime": "fc", "resources": resources}
+        result = self.request("POST", "/v1/sandboxes", body, idempotent=True)
+        sandbox_id = result.get("sandbox_id")
+        if not isinstance(sandbox_id, str) or not sandbox_id.startswith("sbx_"):
+            raise ApiError(f"create returned no sandbox_id: {result}")
+        try:
+            self.wait_operation(str(result.get("operation_id")), timeout)
+            self.wait_ready(sandbox_id, timeout)
+        except ApiError as error:
+            raise ApiError(f"{sandbox_id}: {error}") from error
+        return sandbox_id
+
+    def lifecycle(self, sandbox_id: str, action: str, timeout: float) -> None:
+        result = self.request("POST", f"/v1/sandboxes/{sandbox_id}:{action}", {}, idempotent=True)
+        operation_id = result.get("operation_id")
+        if isinstance(operation_id, str):
+            self.wait_operation(operation_id, timeout)
+
+    def delete(self, sandbox_id: str, timeout: float = 300) -> None:
+        result = self.request("DELETE", f"/v1/sandboxes/{sandbox_id}", idempotent=True)
+        operation_id = result.get("operation_id")
+        if isinstance(operation_id, str):
+            self.wait_operation(operation_id, timeout)
+
+    def events_url(self, attach: dict[str, Any]) -> str:
+        url = str(attach.get("events_url") or "")
+        path = urllib.parse.urlsplit(url).path if "://" in url else url
+        if not path.startswith("/v1/sessions/"):
+            raise ApiError(f"unexpected events URL {url!r}")
+        if self.data_plane_url:
+            return self.data_plane_url + path
+        if "://" in url:
+            return url
+        raise ApiError("the API returned a relative events URL; pass --data-plane-url")
+
+    def run(self, sandbox_id: str, argv: Sequence[str], timeout: float) -> tuple[int, str]:
+        """Run argv in the guest; return (exit code, stdout+stderr). 125 means no clean exit."""
+        body = {"command": list(argv), "timeout": f"{max(1, int(timeout))}s"}
+        command = self.request("POST", f"/v1/sandboxes/{sandbox_id}/commands", body, idempotent=True)
+        attach = command.get("attach") or {}
+        token = attach.get("token")
+        if not isinstance(token, str) or not token:
+            raise ApiError("command response carried no attach token")
+        req = urllib.request.Request(
+            self.events_url(attach), headers={"Authorization": f"Bearer {token}", "Accept": "text/event-stream"}
+        )
+        chunks: list[bytes] = []
+        exit_code: int | None = None
+        try:
+            with _HTTP.open(req, timeout=timeout + 30) as response:
+                data: list[bytes] = []
+                for line in response:
+                    line = line.rstrip(b"\r\n")
+                    if line:
+                        field, _, value = line.partition(b":")
+                        if field == b"data":
+                            data.append(value[1:] if value.startswith(b" ") else value)
+                        continue
+                    if not data:
+                        continue
+                    frame = json.loads(b"\n".join(data))
+                    data = []
+                    kind = frame.get("type") if isinstance(frame, dict) else None
+                    if kind in ("stdout", "stderr"):
+                        chunks.append(base64.b64decode(frame.get("data_base64") or ""))
+                    elif kind == "process_exited":
+                        code = frame.get("exit_code")
+                        exit_code = code if type(code) is int else 125
+                        break
+                    elif kind in ("error", "resync_required"):
+                        chunks.append(f"\n[event stream {kind}: {frame}]".encode())
+                        break
+        except urllib.error.HTTPError as error:
+            with error:
+                detail = error.read(2048).decode("utf-8", errors="replace")
+            raise ApiError(f"events: HTTP {error.code}: {detail}") from error
+        except (urllib.error.URLError, OSError) as error:
+            raise ApiError(f"events: {error}") from error
+        out = b"".join(chunks).decode("utf-8", errors="replace")
+        return (125 if exit_code is None else exit_code), out
+
+
+def local_id(sandbox_id: str) -> str:
+    """The node keys sandbox state by the bare UUID; the API prefixes it with ``sbx_``."""
+    return sandbox_id.removeprefix("sbx_")
+
+
+class SnapshotSampler:
+    """Poll local snapshot file sizes while an API suspend runs.
+
+    An API suspend tears the execution down after the snapshot is durable, so the
+    local files may be gone by the time the operation reports success. The
+    sampler keeps the largest size seen for each file.
+    """
+
+    def __init__(self, probe: HostProbe, sandbox_id: str, interval: float = 0.1) -> None:
+        self.probe, self.sandbox_id, self.interval = probe, sandbox_id, interval
+        self.best: dict[str, Any] = {}
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+
+    def _loop(self) -> None:
+        while True:
+            for key, value in self.probe.snapshot_stats(self.sandbox_id).items():
+                if isinstance(value, int) and value > (self.best.get(key) or -1):
+                    self.best[key] = value
+            if self._stop.wait(self.interval):
+                return
+
+    def __enter__(self) -> SnapshotSampler:  # noqa: PYI034 - Python 3.9 nodes have no typing.Self
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._stop.set()
+        self._thread.join(timeout=30)
+
+
 # --- Host probes -----------------------------------------------------------
 
 
@@ -351,7 +562,7 @@ class HostProbe:
             return None
 
     def fc_pid(self, sandbox_id: str) -> int | None:
-        link = self.run_dir / sandbox_id / "fc.pid"
+        link = self.run_dir / local_id(sandbox_id) / "fc.pid"
         try:
             target = os.readlink(link)
         except PermissionError:
@@ -383,7 +594,7 @@ class HostProbe:
         """GET a Firecracker API path; never raises. Returns {'status', 'body'|'error'}."""
         if not self.curl:
             return {"status": None, "error": "curl not found"}
-        sock = self.jail_dir / "firecracker" / sandbox_id / "root" / "firecracker.sock"
+        sock = self.jail_dir / "firecracker" / local_id(sandbox_id) / "root" / "firecracker.sock"
         result = self.priv(
             [self.curl, "-sS", "--max-time", "5", "--unix-socket", str(sock), "-w", "\n%{http_code}", f"http://localhost{path}"],
             timeout=10,
@@ -442,13 +653,30 @@ class HostProbe:
         text = self.read_text("/proc/meminfo") or ""
         return parse_meminfo_kib(text, ("Dirty", "Writeback"))
 
-    def snapshot_metrics(self, sandbox_id: str) -> dict[str, Any]:
-        snap = self.cache_dir / sandbox_id / "snapshot"
+    def snapshot_dir(self, sandbox_id: str) -> Path:
+        return self.cache_dir / local_id(sandbox_id) / "snapshot"
+
+    def snapshot_stats(self, sandbox_id: str) -> dict[str, Any]:
+        snap = self.snapshot_dir(sandbox_id)
         out: dict[str, Any] = {}
         for key, name in (("snapshot_mem", "memory"), ("snapshot_vmstate", "vmstate"), ("rootfs_snapshot", "rootfs.ext4")):
             st = self.stat_file(snap / name)
             out[f"{key}_bytes"] = st[0] if st else None
             out[f"{key}_disk_bytes"] = st[1] if st else None
+        return out
+
+    def snapshot_metrics(self, sandbox_id: str, sampled: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Snapshot sizes, preferring live files and falling back to sizes sampled during suspend."""
+        snap = self.snapshot_dir(sandbox_id)
+        out = self.snapshot_stats(sandbox_id)
+        out["snapshot_local_after_suspend"] = out["snapshot_mem_bytes"] is not None
+        for key, value in (sampled or {}).items():
+            if out.get(key) is None:
+                out[key] = value
+        if not out["snapshot_local_after_suspend"]:
+            out["snapshot_mem_compressed_bytes"] = None
+            out["rootfs_exclusive_bytes"] = None
+            return out
         out["snapshot_mem_compressed_bytes"] = (
             self.compressed_bytes(snap / "memory") if out["snapshot_mem_bytes"] is not None else None
         )
@@ -480,11 +708,22 @@ class BalloonBenchmark:
         self.fc_version: str | None = None
         self.space_version: str | None = None
 
-        checked_prereq(args.sbxmgr, "space-sbxmgr")
-        checked_prereq(args.tmplmgr, "space-tmplmgr")
-        self.prefix = choose_sudo_prefix(args.sbxmgr, args.use_sudo)
-        for _, template in self.variants:
-            ensure_template(self.prefix, args.tmplmgr, template)
+        self.api: SpaceApi | None = None
+        if args.api_url:
+            token = os.environ.get("SPACE_API_TOKEN", "").strip()
+            if args.api_token_file:
+                token = Path(args.api_token_file).read_text().strip()
+            if not token:
+                raise SystemExit("ERROR: API mode needs SPACE_API_TOKEN or --api-token-file")
+            self.api = SpaceApi(args.api_url, args.data_plane_url, token)
+            # Templates are resolved by the cluster; the local CLI is optional and only reports a version.
+            self.prefix = choose_sudo_prefix(args.sbxmgr if Path(args.sbxmgr).exists() else "/bin/true", args.use_sudo)
+        else:
+            checked_prereq(args.sbxmgr, "space-sbxmgr")
+            checked_prereq(args.tmplmgr, "space-tmplmgr")
+            self.prefix = choose_sudo_prefix(args.sbxmgr, args.use_sudo)
+            for _, template in self.variants:
+                ensure_template(self.prefix, args.tmplmgr, template)
         self.probe = HostProbe(self.prefix, args)
 
     # -- CLI wrappers
@@ -511,6 +750,14 @@ class BalloonBenchmark:
         return rc, now_ms() - started, out
 
     def guest(self, sandbox_id: str, script: str, *script_args: object, timeout: float | None = None) -> tuple[int, int, str]:
+        if self.api is not None:
+            argv = ["sh", "-c", script, "space-bench", *(str(a) for a in script_args)]
+            started = now_ms()
+            try:
+                rc, out = self.api.run(sandbox_id, argv, timeout or self.args.guest_timeout_secs)
+            except ApiError as error:
+                rc, out = 125, str(error)
+            return rc, now_ms() - started, out
         cmd = [*self.prefix, self.args.sbxmgr, "exec", sandbox_id]
         if self.args.guest_user:
             cmd += ["--user", self.args.guest_user]
@@ -547,6 +794,91 @@ class BalloonBenchmark:
         with self.lock:
             write_lines(self.tracked_file, [sandbox_id])
 
+    def api_op(self, fn: Any, *fn_args: Any) -> tuple[int, int, str]:
+        started = now_ms()
+        try:
+            fn(*fn_args)
+            rc, out = 0, ""
+        except ApiError as error:
+            rc, out = 1, str(error)
+        return rc, now_ms() - started, out
+
+    def suspend(self, sandbox_id: str) -> tuple[int, int, str, dict[str, Any]]:
+        if self.api is None:
+            rc, ms, out = self.timed([*self.prefix, self.args.sbxmgr, "suspend", sandbox_id, "--blocking"], timeout=self.args.op_timeout_secs)
+            return rc, ms, out, {}
+        with SnapshotSampler(self.probe, sandbox_id) as sampler:
+            rc, ms, out = self.api_op(self.api.lifecycle, sandbox_id, "suspend", self.args.op_timeout_secs)
+            if rc == 0:
+                rc, _, out = self.api_op(self.api.wait_state, sandbox_id, "suspended", self.args.op_timeout_secs)
+        return rc, ms, out, sampler.best
+
+    def restore(self, sandbox_id: str) -> tuple[int, int, str]:
+        if self.api is None:
+            cmd = [*self.prefix, self.args.sbxmgr, "restore", sandbox_id, "--blocking"]
+            if self.args.ready_timeout_secs:
+                cmd += ["--ready-timeout-secs", str(self.args.ready_timeout_secs)]
+            return self.timed(cmd, timeout=self.args.op_timeout_secs)
+        started = now_ms()
+        rc, _, out = self.api_op(self.api.lifecycle, sandbox_id, "wake", self.args.op_timeout_secs)
+        if rc == 0:
+            rc, _, out = self.api_op(self.api.wait_ready, sandbox_id, self.args.op_timeout_secs)
+        return rc, now_ms() - started, out
+
+    def delete(self, cli: SandboxCli, sandbox_id: str) -> None:
+        if self.api is None:
+            cli.delete(sandbox_id)
+            return
+        try:
+            self.api.delete(sandbox_id)
+        except ApiError as error:
+            print(f"WARNING: cleanup failed for {sandbox_id}: {sanitize_error(str(error))}", file=sys.stderr)
+
+    def create(self, cli: SandboxCli, template: str) -> tuple[str | None, str]:
+        """Create and start one sandbox; return (sandbox_id, error)."""
+        a = self.args
+        if self.api is not None:
+            resources = {k: v for k, v in (("vcpu", a.api_vcpu), ("memory_mib", a.api_memory_mib)) if v}
+            try:
+                sandbox_id = self.api.create(template, resources, a.op_timeout_secs)
+            except ApiError as error:
+                text = str(error)
+                leaked = re.match(r"(sbx_[0-9a-fA-F-]{36})", text)
+                if leaked:
+                    self.track(leaked.group(1))
+                    self.delete(cli, leaked.group(1))
+                return None, f"create failed: {sanitize_error(text)}"
+            self.track(sandbox_id)
+            deadline = time.monotonic() + a.local_wait_secs
+            while self.probe.fc_pid(sandbox_id) is None:
+                if time.monotonic() >= deadline:
+                    self.delete(cli, sandbox_id)
+                    return None, f"{sandbox_id} is not running on this node; cordon the other workers"
+                time.sleep(0.5)
+            return sandbox_id, ""
+        # Node-local: create without autostart, then start. Autostart needs a ready
+        # network slot, which nodes with a zero network-pool target never have.
+        rc, _, out = self.timed(cli.create_cmd(autostart=False, snapshots=True), timeout=a.op_timeout_secs)
+        label = UUID_RE.search(out) or re.search(r"Sandbox:\s+([0-9a-f]{8})\b", out)
+        if rc != 0 or not label:
+            return None, f"create failed: {sanitize_error(out)}"
+        short = label.group(label.lastindex or 0)
+        start = [*self.prefix, a.sbxmgr, "start", short, "--blocking"]
+        if a.ready_timeout_secs:
+            start += ["--ready-timeout-secs", str(a.ready_timeout_secs)]
+        rc, _, out = self.timed(start, timeout=a.op_timeout_secs)
+        # create prints only the short label; health prints the full ID.
+        match = UUID_RE.search(run_capture([*self.prefix, a.sbxmgr, "health", short]).stdout or "")
+        if not match:
+            cli.delete(short)
+            return None, f"id lookup failed for {short}"
+        sandbox_id = match.group(0)
+        self.track(sandbox_id)
+        if rc != 0:
+            cli.delete(sandbox_id)
+            return None, f"start failed: {sanitize_error(out)}"
+        return sandbox_id, ""
+
     # -- Per-sandbox pipeline
 
     def run_sandbox(self, variant: str, template: str, index: int, profile: str) -> None:
@@ -562,19 +894,17 @@ class BalloonBenchmark:
             "sandbox_index": index,
             "profile": profile,
         }
-        rc, _, out = self.timed(cli.create_cmd(autostart=True, snapshots=True), timeout=self.args.op_timeout_secs)
-        match = UUID_RE.search(out)
-        if rc != 0 or not match:
-            self.emit({**base, "cycle": 0, "sandbox_id": None, "correctness_ok": None, "error": f"create failed: {sanitize_error(out)}"})
+        sandbox_id, error = self.create(cli, template)
+        if sandbox_id is None:
+            self.emit({**base, "cycle": 0, "sandbox_id": None, "correctness_ok": None, "error": error})
             return
-        sandbox_id = match.group(0)
-        self.track(sandbox_id)
         base["sandbox_id"] = sandbox_id
+        base["api_mode"] = self.api is not None
         try:
             self.run_cycles(base, sandbox_id, profile, rng)
         finally:
             if not self.args.no_cleanup:
-                cli.delete(sandbox_id)
+                self.delete(cli, sandbox_id)
 
     def run_cycles(self, base: dict[str, Any], sandbox_id: str, profile: str, rng: random.Random) -> None:
         a = self.args
@@ -608,7 +938,7 @@ class BalloonBenchmark:
             row["balloon_stats_before_suspend"] = self.probe.balloon(sandbox_id, "/balloon/statistics")
 
             disk0, commits0 = self.probe.disk_write_bytes(), self.probe.btrfs_commits()
-            rc, ms, out = self.timed([*self.prefix, a.sbxmgr, "suspend", sandbox_id, "--blocking"], timeout=a.op_timeout_secs)
+            rc, ms, out, sampled = self.suspend(sandbox_id)
             disk1 = self.probe.disk_write_bytes()
             row.update(suspend_ms=ms, suspend_rc=rc, host_disk_write_bytes_suspend=_delta(disk0, disk1),
                        host_btrfs_commits_suspend=_delta(commits0, self.probe.btrfs_commits()))
@@ -617,13 +947,10 @@ class BalloonBenchmark:
                 row.update(correctness_ok=None, error=f"suspend failed: {sanitize_error(out)}")
                 self.emit(row)
                 return
-            row.update(self.probe.snapshot_metrics(sandbox_id))
+            row.update(self.probe.snapshot_metrics(sandbox_id, sampled))
 
-            restore = [*self.prefix, a.sbxmgr, "restore", sandbox_id, "--blocking"]
-            if a.ready_timeout_secs:
-                restore += ["--ready-timeout-secs", str(a.ready_timeout_secs)]
             disk0 = self.probe.disk_write_bytes()
-            rc, ms, out = self.timed(restore, timeout=a.op_timeout_secs)
+            rc, ms, out = self.restore(sandbox_id)
             disk1 = self.probe.disk_write_bytes()
             row.update(restore_ms=ms, restore_rc=rc, host_disk_write_bytes_restore=_delta(disk0, disk1))
             if rc != 0:
@@ -631,6 +958,7 @@ class BalloonBenchmark:
                 self.emit(row)
                 return
             row["fc_rss_after_restore_kib"] = self.probe.fc_rss_kib(sandbox_id)
+            row["restored_on_this_node"] = self.probe.fc_pid(sandbox_id) is not None
 
             rc, ms, out = self.guest(sandbox_id, GUEST_VERIFY, cycle, 1 if base["anon_check"] else 0)
             row["verify_ms"] = ms
@@ -649,8 +977,11 @@ class BalloonBenchmark:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.results_file.touch()
         self.tracked_file.touch()
-        version = run_capture([*self.prefix, self.args.sbxmgr, "--version"])
-        self.space_version = version.stdout.strip() if version.returncode == 0 else None
+        try:
+            version = run_capture([*self.prefix, self.args.sbxmgr, "--version"])
+            self.space_version = version.stdout.strip() if version.returncode == 0 else None
+        except OSError:
+            self.space_version = None
         meta = {
             "run_id": self.run_id,
             "host": self.host,
@@ -731,6 +1062,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sudo", dest="use_sudo", action="store_const", const="yes", default="auto")
     p.add_argument("--no-sudo", dest="use_sudo", action="store_const", const="no")
     p.add_argument("--no-cleanup", action="store_true")
+    api = p.add_argument_group("API mode", "Drive sandboxes through the SPACE API instead of node-local space-sbxmgr. "
+                               "Needed where in-sandbox commands require a SPACE API route token (EKS). "
+                               "Run on the node the sandboxes land on; the token comes from SPACE_API_TOKEN or --api-token-file.")
+    api.add_argument("--api-url", default="", help="SPACE API origin, for example http://<space-api ClusterIP>:8080.")
+    api.add_argument("--data-plane-url", default="", help="Data plane origin for command output; defaults to the API's events URL.")
+    api.add_argument("--api-token-file", default="", help="File holding the SPACE API bearer token.")
+    api.add_argument("--api-vcpu", type=int, default=2, help="vCPUs requested at create; match the templates. 0 omits it.")
+    api.add_argument("--api-memory-mib", type=int, default=8192, help="Memory requested at create; match the templates. 0 omits it.")
+    api.add_argument("--local-wait-secs", type=float, default=60, help="How long to wait for a created sandbox to appear on this node.")
     return p
 
 

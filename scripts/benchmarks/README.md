@@ -89,6 +89,25 @@ comparison, so every variant fails. `--gate-metric`, `--min-reduction-pct`, and
 `--min-reduction-mib` change the comparison. `--fail-on-gate` exits with status
 1 unless every variant passes.
 
+### API mode for clusters that require route tokens
+
+Where the sandbox manager only accepts in-sandbox commands carrying a SPACE
+API route token, as on EKS, node-local `space-sbxmgr exec` is refused. Pass
+`--api-url` and `--data-plane-url` to drive create, commands, suspend, wake,
+and delete through the SPACE API instead. Put the bearer token in
+`SPACE_API_TOKEN` or a file named by `--api-token-file`, and give each variant
+an API template reference such as `baseline=bench-balloon-baseline:bench`.
+
+API mode still reads Firecracker statistics and snapshot sizes from the host,
+so run it on the worker the sandboxes land on and keep every other worker
+cordoned. A create that lands elsewhere is deleted and recorded as an error.
+An API suspend can remove the local snapshot once it is durable, so the harness
+samples file sizes while suspend runs. `snapshot_local_after_suspend` records
+whether the files survived; when they did not, compressed size and rootfs
+exclusive bytes are `null`. `restored_on_this_node` records where wake landed.
+`--api-vcpu` and `--api-memory-mib` (default 2 and 8192) should match the
+templates.
+
 Measuring the compressed size reads the memory file after suspend and before
 restore. Suspend has just written that file, so it is usually still in the host
 page cache, but under memory pressure the read can warm pages that restore then
