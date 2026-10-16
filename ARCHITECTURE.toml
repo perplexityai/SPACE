@@ -78,6 +78,90 @@ mode = "required"
 [rules.pattern_ratchet.rootfs_copy.stale_entries]
 mode = "required"
 
+# sbx-mgr's node-local SQLite database (`sandboxes` and every other sbx-mgr
+# table) is opened, migrated and queried only by its store, `src/db` of the
+# server crate. Within sbx-mgr's crates, naming rusqlite, opening a
+# connection or transaction, using the shared SQLite open and migration
+# helpers or the shared job store's SQL functions, binding parameters,
+# executing a statement, or writing an SQL statement literal outside the
+# store is a crossing. Other services' crates use rusqlite for their own
+# databases, so `paths` limits the rule to sbx-mgr's. Existing callers that
+# still name the connection, error and transaction types are baselined
+# until they use the store's own.
+[rules.pattern_ratchet.sbxmgr_sqlite]
+patterns = [
+  '\brusqlite\s*::',
+  '\buse\s+(?:::\s*)?rusqlite\b',
+  '\bextern\s+crate\s+rusqlite\b',
+  '\b(?:Connection|Transaction)\s*::\s*(?:open\w*|new\w*)\s*\(',
+  '\bsql\s*::\s*sqlite\b',
+  '\bpplx_space_common_jobs\s*::\s*(?:db\b|\{[^}]*\bdb\b)',
+  '\b(?:named_)?params\s*!',
+  '\.\s*(?:execute|execute_batch|prepare|prepare_cached|query_row|query_row_and_then|query_one|query_map|query_and_then|transaction|unchecked_transaction|transaction_with_behavior|savepoint|pragma_update|pragma_query|pragma_query_value)\s*\(',
+  '\.\s*(?:query|exists)\s*\(\s*[^)\s]',
+  '\bimmediate_transaction\s*\(',
+  '"\s*(?:SELECT\b|INSERT\s+(?:OR\s+[A-Z]+\s+)?INTO\b|REPLACE\s+INTO\b|UPDATE\s+(?:OR\s+[A-Z]+\s+)?\w+(?:\s+SET\b|\s*$)|DELETE\s+FROM\b|(?:CREATE|DROP|ALTER)\s+(?:TEMP\s+|TEMPORARY\s+|UNIQUE\s+)?(?:TABLE|INDEX|TRIGGER|VIEW)\b|PRAGMA\s+\w|WITH\s+(?:RECURSIVE\s+)?\w+\s+AS\b|(?:BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE|VACUUM)\b[\w\s]*;?\s*")',
+  '^\s*(?:SELECT\s|INSERT\s+(?:OR\s+[A-Z]+\s+)?INTO\s|UPDATE\s+(?:OR\s+[A-Z]+\s+)?\w+(?:\s+SET\s|\s*$)|DELETE\s+FROM\s|WITH\s+(?:RECURSIVE\s+)?\w+\s+AS\b)',
+]
+paths = ["crates/libs/sbx/mgr/**", "crates/apps/sbx/**"]
+allow = [
+  "crates/libs/sbx/mgr/server/src/db.rs",
+  "crates/libs/sbx/mgr/server/src/db/**",
+]
+
+[rules.pattern_ratchet.sbxmgr_sqlite.no_crossing]
+mode = "required"
+
+# Seeding the ratchet reports its initial entries against the base.
+[rules.pattern_ratchet.sbxmgr_sqlite.no_new_entries]
+mode = "advisory"
+
+[rules.pattern_ratchet.sbxmgr_sqlite.no_raised_caps]
+mode = "required"
+
+[rules.pattern_ratchet.sbxmgr_sqlite.listed_no_growth]
+mode = "required"
+
+[rules.pattern_ratchet.sbxmgr_sqlite.stale_entries]
+mode = "required"
+
+# The same database's schema and location, in any crate: its migrations, its
+# path and file name, and the migrator's default-path helper for it belong to
+# the store, which opens and migrates it. The migrations crate defines the
+# migrators and common-core the path. These names are
+# specific enough to check workspace-wide, unlike `sbxmgr_sqlite`'s patterns,
+# which other services' crates match for their own databases.
+[rules.pattern_ratchet.sbxmgr_sqlite_schema]
+patterns = [
+  '\bpplx_space_sbxmgr_migrations\b',
+  '\bSANDBOX_MANAGER_(?:DB|MIGRATOR)\b',
+  '\bsqlite_sandbox_manager\b',
+  '\bsbx-manager\.db\b',
+  '\bdb/sandbox-manager\b',
+]
+allow = [
+  "crates/libs/sbx/mgr/server/src/db.rs",
+  "crates/libs/sbx/mgr/server/src/db/**",
+  "crates/libs/sbx/mgr/migrations/src/**",
+  "crates/libs/common/core/src/host/linux.rs",
+]
+
+[rules.pattern_ratchet.sbxmgr_sqlite_schema.no_crossing]
+mode = "required"
+
+# Seeding the ratchet reports its initial entries against the base.
+[rules.pattern_ratchet.sbxmgr_sqlite_schema.no_new_entries]
+mode = "advisory"
+
+[rules.pattern_ratchet.sbxmgr_sqlite_schema.no_raised_caps]
+mode = "required"
+
+[rules.pattern_ratchet.sbxmgr_sqlite_schema.listed_no_growth]
+mode = "required"
+
+[rules.pattern_ratchet.sbxmgr_sqlite_schema.stale_entries]
+mode = "required"
+
 [rules.crate_names]
 # A crate matches if a part of its package or library name, lowercased and
 # split on `-` and `_`, is one of these.

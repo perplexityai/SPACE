@@ -4,12 +4,10 @@ use pplx_space_common_core::types::{
     AutoLifecycleDeleteReceiptId, ExecutionGeneration, NodeManagedBy, NodeRole, PolicyAuthority,
     SandboxActivationAttemptId, SandboxId,
 };
-use pplx_space_common_svc::sql::sqlite::SqliteU64;
-use pplx_space_common_svc::types::AutoLifecyclePolicyFingerprint;
-use rusqlite::types::Type;
-use rusqlite::{Connection, OptionalExtension, params};
+use pplx_space_common_svc::{sql::sqlite::SqliteU64, types::AutoLifecyclePolicyFingerprint};
+use rusqlite::{Connection, OptionalExtension, params, types::Type};
 
-use super::{
+use crate::auto_lifecycle_delete_receipts::{
     AutoLifecycleDeleteAdmission, AutoLifecycleDeleteBlockReason, AutoLifecycleDeleteBlockedStats,
     AutoLifecycleDeleteOrdinaryReason, AutoLifecycleDeleteOutboxState,
     AutoLifecycleDeleteOutboxStats, AutoLifecycleDeleteReceipt, RouteEvidence,
@@ -183,7 +181,7 @@ pub(crate) fn classify_and_record_admission(
     sandbox_id: SandboxId,
     node_role: Option<NodeRole>,
     node_managed_by: Option<NodeManagedBy>,
-    expectation: super::AutoLifecycleDeleteExpectation,
+    expectation: crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteExpectation,
 ) -> Result<AutoLifecycleDeleteAdmission, AutoLifecycleDeleteEvidenceError> {
     let values = conn
         .query_row(
@@ -1229,3 +1227,6 @@ where
         rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(error))
     })
 }
+
+#[cfg(test)]
+mod tests;

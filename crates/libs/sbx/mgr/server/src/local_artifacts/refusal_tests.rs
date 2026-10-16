@@ -3,6 +3,8 @@
 
 use std::sync::PoisonError;
 
+use rusqlite::{OptionalExtension, params};
+
 use super::*;
 
 const ID: &str = "01939e3e-aaaa-7000-8000-000000000001";

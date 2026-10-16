@@ -270,7 +270,7 @@ pub fn update_auto_lifecycle_with_state(
 ///
 /// One reader moves the eager way. The disk-pressure eviction ages a
 /// `suspended` row with no activity clocks by `updated_at`
-/// (`sandbox_eviction::IDLE_WITNESS_SQL`), so such a row whose stage keeps
+/// (`db::eviction_scan::IDLE_WITNESS_SQL`), so such a row whose stage keeps
 /// failing identically now ages from its last real change rather than its
 /// last repeated record, and can become a candidate sooner than before. That
 /// is the intended meaning of idle, and the eviction's backup proof and claim

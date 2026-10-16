@@ -15,7 +15,7 @@ impl SandboxManagerService {
                 .db
                 .lock()
                 .map_err(|_| Status::internal("database mutex poisoned"))?;
-            crate::auto_lifecycle_delete_receipts::db::list_completed_receipts(&db)
+            crate::db::auto_lifecycle_delete_receipts::list_completed_receipts(&db)
                 .map_err(|error| Status::internal(format!("list delete receipts: {error}")))?
         };
         Ok(Response::new(ListAutoLifecycleDeleteReceiptsResponse {
@@ -58,7 +58,7 @@ impl SandboxManagerService {
                 .db
                 .lock()
                 .map_err(|_| Status::internal("database mutex poisoned"))?;
-            crate::auto_lifecycle_delete_receipts::db::acknowledge_completed_receipts(
+            crate::db::auto_lifecycle_delete_receipts::acknowledge_completed_receipts(
                 &db,
                 &receipt_ids,
             )

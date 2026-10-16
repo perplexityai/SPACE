@@ -17,12 +17,10 @@ use std::time::{Duration, Instant, SystemTime};
 use futures_util::future::BoxFuture;
 use futures_util::stream::FuturesUnordered;
 use futures_util::{FutureExt, StreamExt};
-use rusqlite::types::Type;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{SandboxId, SemVer};
 use pplx_space_metrics::sandbox::worker::{
     NetGatewayRouteVerificationStatus, NetGatewayTlsInterceptionMode,
@@ -30,6 +28,7 @@ use pplx_space_metrics::sandbox::worker::{
 use pplx_space_node_runtime_core::fc_api::FirecrackerVmState;
 
 use crate::auto_lifecycle::AutoLifecycleCoordinator;
+use crate::db::guest_health_scan::{SandboxGuestHealthRow, list_guest_health_rows};
 use crate::node_manager_transport::NodeManagerConnector;
 use crate::node_state_sync::mark_sandbox_dirty;
 use crate::service::network_policy::NetworkPolicyReconcileQueue;
@@ -86,13 +85,6 @@ const GUEST_HEALTH_CATEGORIES: [GuestHealthCategory; 3] = [
     GuestHealthCategory::Degraded,
     GuestHealthCategory::Unreachable,
 ];
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct SandboxGuestHealthRow {
-    id: String,
-    state: crate::state::SandboxState,
-    template_content_hash: Option<String>,
-}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum NetGatewayLifecycle {
@@ -239,12 +231,6 @@ struct GuestHealthGaugeValue {
     lifecycle: &'static str,
     health: &'static str,
     count: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("unknown sandbox state '{value}'")]
-struct SandboxStateParseError {
-    value: String,
 }
 
 #[derive(Clone)]
@@ -1563,14 +1549,14 @@ fn emit_auto_lifecycle_delete_gauges(db: &Arc<std::sync::Mutex<rusqlite::Connect
                 return;
             }
         };
-        let outbox = match crate::auto_lifecycle_delete_receipts::db::outbox_stats(&db) {
+        let outbox = match crate::db::auto_lifecycle_delete_receipts::outbox_stats(&db) {
             Ok(stats) => stats,
             Err(error) => {
                 tracing::warn!(%error, "failed to inspect auto-lifecycle delete outbox gauges");
                 return;
             }
         };
-        let blocked = match crate::auto_lifecycle_delete_receipts::db::blocked_stats(&db) {
+        let blocked = match crate::db::auto_lifecycle_delete_receipts::blocked_stats(&db) {
             Ok(stats) => stats,
             Err(error) => {
                 tracing::warn!(%error, "failed to inspect auto-lifecycle delete block gauges");
@@ -1891,30 +1877,6 @@ async fn emit_net_gateway_route_verification_gauges(
     }
 }
 
-fn list_guest_health_rows(
-    conn: &rusqlite::Connection,
-) -> rusqlite::Result<Vec<SandboxGuestHealthRow>> {
-    let mut stmt = conn.prepare(sql!("SELECT id, state, template_hash FROM sandboxes"))?;
-    let rows = stmt.query_map([], |row| {
-        let state_value = row.get::<_, String>(1)?;
-        let state = state_value
-            .parse::<crate::state::SandboxState>()
-            .map_err(|_| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    1,
-                    Type::Text,
-                    Box::new(SandboxStateParseError { value: state_value }),
-                )
-            })?;
-        Ok(SandboxGuestHealthRow {
-            id: row.get(0)?,
-            state,
-            template_content_hash: row.get(2)?,
-        })
-    })?;
-    rows.collect()
-}
-
 fn sandbox_states_for_ids(
     db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
     sandbox_ids: &[String],
@@ -1926,18 +1888,18 @@ fn sandbox_states_for_ids(
             return None;
         }
     };
-    let mut statement = match db.prepare("SELECT state FROM sandboxes WHERE id = ?1") {
-        Ok(statement) => statement,
+    let labels = match crate::db::guest_health_scan::state_labels_for_ids(&db, sandbox_ids) {
+        Ok(labels) => labels,
         Err(error) => {
             tracing::warn!(%error, "failed to prepare watchdog probe-state lookup");
             return None;
         }
     };
     let mut states = HashMap::with_capacity(sandbox_ids.len());
-    for sandbox_id in sandbox_ids {
-        let state = match statement.query_row([sandbox_id], |row| row.get::<_, String>(0)) {
-            Ok(state) => state,
-            Err(rusqlite::Error::QueryReturnedNoRows) => continue,
+    for (sandbox_id, label) in labels {
+        let state = match label {
+            Ok(Some(state)) => state,
+            Ok(None) => continue,
             Err(error) => {
                 tracing::warn!(sandbox_id, %error, "failed to load watchdog probe state");
                 continue;

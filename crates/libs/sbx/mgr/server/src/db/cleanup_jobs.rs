@@ -275,7 +275,7 @@ pub(crate) fn current(conn: &Connection, work: &CleanupWork) -> rusqlite::Result
         return cleanup_episode_current(conn, &id, episode);
     }
     if work.completion == CleanupCompletion::DeleteRow
-        && !crate::auto_lifecycle_delete_receipts::db::pending_receipt_matches_observed_execution(
+        && !auto_lifecycle_delete_receipts::pending_receipt_matches_observed_execution(
             conn,
             work.sandbox_id,
         )?

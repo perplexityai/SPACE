@@ -89,11 +89,9 @@ pub(crate) fn build_worker(
 }
 
 pub fn refund_interrupted_running_attempts(conn: &rusqlite::Connection) -> rusqlite::Result<usize> {
-    conn.execute(
-        "UPDATE jobs
-         SET attempts = attempts - 1
-         WHERE kind = ?1 AND status = 'running' AND attempts > 0",
-        rusqlite::params![SNAPSHOT_UPLOAD_JOB_KIND],
+    crate::db::snapshot_upload_jobs::refund_interrupted_running_attempts(
+        conn,
+        SNAPSHOT_UPLOAD_JOB_KIND,
     )
 }
 
@@ -517,17 +515,17 @@ pub(crate) fn persist_submitted_transfer_ids(
             "snapshot-upload database mutex poisoned while persisting transfer IDs for {job_id}"
         ))
     })?;
-    let changed = conn
-        .execute(
-            "UPDATE jobs SET payload = ?1
-             WHERE job_id = ?2 AND kind = ?3 AND status IN ('pending', 'running')",
-            rusqlite::params![payload, job_id, SNAPSHOT_UPLOAD_JOB_KIND],
-        )
-        .map_err(|error| {
-            JobError::retriable(format!(
-                "persist submitted transfer IDs for snapshot-upload job {job_id}: {error}"
-            ))
-        })?;
+    let changed = crate::db::snapshot_upload_jobs::replace_active_job_payload(
+        &conn,
+        &payload,
+        job_id,
+        SNAPSHOT_UPLOAD_JOB_KIND,
+    )
+    .map_err(|error| {
+        JobError::retriable(format!(
+            "persist submitted transfer IDs for snapshot-upload job {job_id}: {error}"
+        ))
+    })?;
     if changed != 1 {
         return Err(JobError::permanent(format!(
             "snapshot-upload job {job_id} was not pending or running while persisting transfer IDs"
@@ -1285,8 +1283,7 @@ pub fn backfill_backup_completed_markers(
     let through = match scan.through {
         Some(through) => through,
         None => {
-            let through: Option<i64> =
-                conn.query_row("SELECT MAX(rowid) FROM jobs", [], |r| r.get(0))?;
+            let through = crate::db::snapshot_upload_jobs::max_job_rowid(conn)?;
             let Some(through) = through else {
                 return Ok(report);
             };
@@ -1294,67 +1291,59 @@ pub fn backfill_backup_completed_markers(
             through
         }
     };
-    let mut statement = conn.prepare(
-        "SELECT rowid, payload FROM jobs
-         WHERE kind = 'snapshot_upload' AND status = 'completed'
-           AND rowid > ?1 AND rowid <= ?2 ORDER BY rowid LIMIT ?3",
-    )?;
-    let mut rows = statement.query(rusqlite::params![
+    crate::db::snapshot_upload_jobs::visit_completed_upload_payloads(
+        conn,
         scan.after.unwrap_or(i64::MIN),
         through,
         BACKUP_MARKER_BATCH as i64,
-    ])?;
-    let now = crate::db::now()?;
-    while let Some(row) = rows.next()? {
-        scan.after = Some(row.get(0)?);
-        report.examined += 1;
-        let Ok(payload) = row.get::<_, String>(1) else {
-            report.malformed_payload += 1;
-            continue;
-        };
-        // Extract via `serde_json::Value` rather than the full
-        // `SnapshotUploadJobs` struct: historical payloads predate
-        // several of its fields, and the backfill needs only the
-        // artifact id.
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload) else {
-            report.malformed_payload += 1;
-            continue;
-        };
-        let Some(artifact_id) = value
-            .get("meta")
-            .and_then(|m| m.get("local_artifact_id"))
-            .and_then(|v| v.as_str())
-        else {
-            report.payload_missing_artifact_id += 1;
-            continue;
-        };
-        let changed = match conn.execute(
-            "UPDATE local_artifacts SET backup_completed_at = ?1
-             WHERE local_artifact_id = ?2 AND backup_completed_at IS NULL",
-            rusqlite::params![now, artifact_id],
-        ) {
-            Ok(changed) => changed,
-            Err(error) => {
-                report.marker_write_failed += 1;
-                tracing::warn!(artifact_id, %error, "backup marker repair failed; evidence retained for the next sweep");
-                continue;
+        |now, rowid, payload| {
+            scan.after = Some(rowid);
+            report.examined += 1;
+            let Ok(payload) = payload else {
+                report.malformed_payload += 1;
+                return Ok(());
+            };
+            // Extract via `serde_json::Value` rather than the full
+            // `SnapshotUploadJobs` struct: historical payloads predate
+            // several of its fields, and the backfill needs only the
+            // artifact id.
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload) else {
+                report.malformed_payload += 1;
+                return Ok(());
+            };
+            let Some(artifact_id) = value
+                .get("meta")
+                .and_then(|m| m.get("local_artifact_id"))
+                .and_then(|v| v.as_str())
+            else {
+                report.payload_missing_artifact_id += 1;
+                return Ok(());
+            };
+            let changed = match crate::db::snapshot_upload_jobs::stamp_backup_completed_if_unset(
+                conn,
+                now,
+                artifact_id,
+            ) {
+                Ok(changed) => changed,
+                Err(error) => {
+                    report.marker_write_failed += 1;
+                    tracing::warn!(artifact_id, %error, "backup marker repair failed; evidence retained for the next sweep");
+                    return Ok(());
+                }
+            };
+            if changed == 1 {
+                report.stamped += 1;
+                return Ok(());
             }
-        };
-        if changed == 1 {
-            report.stamped += 1;
-            continue;
-        }
-        let exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM local_artifacts WHERE local_artifact_id = ?1)",
-            rusqlite::params![artifact_id],
-            |r| r.get(0),
-        )?;
-        if exists {
-            report.already_stamped += 1;
-        } else {
-            report.artifact_row_missing += 1;
-        }
-    }
+            let exists = crate::db::snapshot_upload_jobs::local_artifact_exists(conn, artifact_id)?;
+            if exists {
+                report.already_stamped += 1;
+            } else {
+                report.artifact_row_missing += 1;
+            }
+            Ok(())
+        },
+    )?;
     if report.examined < BACKUP_MARKER_BATCH || scan.after == Some(through) {
         *scan = BackupMarkerScan::default();
     }

@@ -1110,7 +1110,7 @@ impl SandboxManagerService {
         }
         if completion.deletes_row()
             && mode.auto_lifecycle_delete_expectation().is_none()
-            && crate::auto_lifecycle_delete_receipts::db::pending_receipt_for_sandbox(
+            && crate::db::auto_lifecycle_delete_receipts::pending_receipt_for_sandbox(
                 &transaction,
                 sandbox_id,
             )
@@ -1130,7 +1130,7 @@ impl SandboxManagerService {
             mode.auto_lifecycle_delete_expectation()
         {
             let admission = match
-                crate::auto_lifecycle_delete_receipts::db::classify_and_record_admission(
+                crate::db::auto_lifecycle_delete_receipts::classify_and_record_admission(
                     &transaction,
                     sandbox_id,
                     self.node_role,
@@ -1139,7 +1139,7 @@ impl SandboxManagerService {
                 )
             {
                 Ok(admission) => admission,
-                Err(error @ crate::auto_lifecycle_delete_receipts::db::AutoLifecycleDeleteEvidenceError::PolicyChanged) => {
+                Err(error @ crate::db::auto_lifecycle_delete_receipts::AutoLifecycleDeleteEvidenceError::PolicyChanged) => {
                     pplx_space_metrics::sandbox::worker::auto_lifecycle_delete_admission(
                         pplx_space_metrics::sandbox::worker::AutoLifecycleDeleteAdmissionDisposition::Failed,
                         pplx_space_metrics::sandbox::worker::AutoLifecycleDeleteAdmissionReason::PolicyChanged,
@@ -1159,7 +1159,7 @@ impl SandboxManagerService {
                         reason: AutoLifecycleDeleteCasLostReason::PolicyChanged,
                     });
                 }
-                Err(error @ crate::auto_lifecycle_delete_receipts::db::AutoLifecycleDeleteEvidenceError::AuthorityChanged { .. }) => {
+                Err(error @ crate::db::auto_lifecycle_delete_receipts::AutoLifecycleDeleteEvidenceError::AuthorityChanged { .. }) => {
                     pplx_space_metrics::sandbox::worker::auto_lifecycle_delete_admission(
                         pplx_space_metrics::sandbox::worker::AutoLifecycleDeleteAdmissionDisposition::Failed,
                         pplx_space_metrics::sandbox::worker::AutoLifecycleDeleteAdmissionReason::AuthorityChanged,
@@ -1318,7 +1318,7 @@ impl SandboxManagerService {
                             "receipt admission is missing its auto-lifecycle delete expectation",
                         )
                     })?;
-                    let receipt = match crate::auto_lifecycle_delete_receipts::db::insert_pending_receipt(
+                    let receipt = match crate::db::auto_lifecycle_delete_receipts::insert_pending_receipt(
                             &transaction,
                             crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteReceipt {
                             receipt_id: pplx_space_common_core::types::AutoLifecycleDeleteReceiptId::generate(),
@@ -1329,7 +1329,7 @@ impl SandboxManagerService {
                             },
                         ) {
                             Ok(receipt) => receipt,
-                            Err(crate::auto_lifecycle_delete_receipts::db::InsertPendingReceiptError::Conflict(error)) => {
+                            Err(crate::db::auto_lifecycle_delete_receipts::InsertPendingReceiptError::Conflict(error)) => {
                                 pplx_space_metrics::sandbox::worker::auto_lifecycle_delete_admission(
                                     pplx_space_metrics::sandbox::worker::AutoLifecycleDeleteAdmissionDisposition::Failed,
                                     pplx_space_metrics::sandbox::worker::AutoLifecycleDeleteAdmissionReason::ReceiptConflict,
@@ -1339,7 +1339,7 @@ impl SandboxManagerService {
                                     sandbox_id,
                                 });
                             }
-                            Err(crate::auto_lifecycle_delete_receipts::db::InsertPendingReceiptError::Database(error)) => {
+                            Err(crate::db::auto_lifecycle_delete_receipts::InsertPendingReceiptError::Database(error)) => {
                                 return Err(Status::unavailable(format!(
                                     "persist auto-lifecycle delete receipt: {error}"
                                 ))
@@ -1678,7 +1678,7 @@ impl SandboxManagerService {
             let sandbox_id = sandbox_id
                 .parse::<SandboxId>()
                 .map_err(|error| error.to_string())?;
-            if !crate::auto_lifecycle_delete_receipts::db::pending_receipt_matches_observed_execution(
+            if !crate::db::auto_lifecycle_delete_receipts::pending_receipt_matches_observed_execution(
                 &db,
                 sandbox_id,
             )

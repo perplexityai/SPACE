@@ -1084,7 +1084,7 @@ pub(crate) mod service_tests {
         assert!(resolved.current_node_id.is_some());
         assert_eq!(resolved.substrate_kind, Some(NodeManagedBy::Space));
         assert!(
-            !crate::route_activation_claims::claim_exists(
+            !crate::db::route_activation_claims::claim_exists(
                 &service.db.lock().unwrap(),
                 &sandbox_id.to_string()
             )
@@ -1821,7 +1821,7 @@ pub(crate) mod service_tests {
             normalized.provenance,
             true,
         ) {
-            crate::auto_lifecycle_delete_receipts::db::record_retained_route_evidence(
+            crate::db::auto_lifecycle_delete_receipts::record_retained_route_evidence(
                 &service.db.lock().unwrap(),
                 sandbox_id,
                 evidence,
@@ -1899,7 +1899,7 @@ pub(crate) mod service_tests {
                     activation_attempt_id: identity.activation_attempt_id,
                 },
                 Some(evidence),
-                crate::route_activation_claims::OpenRouteActivationClaim::for_cluster_fenced_identity(
+                crate::db::route_activation_claims::OpenRouteActivationClaim::for_cluster_fenced_identity(
                     &identity,
                     crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::ClusterFenced,
                 )
@@ -1918,7 +1918,9 @@ pub(crate) mod service_tests {
                 &crate::db::edges::CREATE_BASE_SNAPSHOT_COMPLETE,
             );
             assert!(crate::db::complete_create(&db, &sandbox_id_string, cleanup_id, true).unwrap());
-            assert!(crate::route_activation_claims::claim_exists(&db, &sandbox_id_string).unwrap());
+            assert!(
+                crate::db::route_activation_claims::claim_exists(&db, &sandbox_id_string).unwrap()
+            );
         }
         (service, sandbox_id, identity)
     }
@@ -1977,7 +1979,7 @@ pub(crate) mod service_tests {
             )
             .unwrap();
             assert!(
-                !crate::route_activation_claims::claim_exists(&db, &sandbox_id.to_string())
+                !crate::db::route_activation_claims::claim_exists(&db, &sandbox_id.to_string())
                     .unwrap()
             );
         }
@@ -2054,7 +2056,7 @@ pub(crate) mod service_tests {
             .unwrap()
             .expect("the later Direct activation must claim the sandbox row");
             assert!(
-                !crate::route_activation_claims::claim_exists(&db, &sandbox_id.to_string())
+                !crate::db::route_activation_claims::claim_exists(&db, &sandbox_id.to_string())
                     .unwrap(),
                 "a later non-Kubernetes activation must supersede the open Kubernetes claim"
             );
@@ -2097,7 +2099,7 @@ pub(crate) mod service_tests {
             };
             let provenance =
                 crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::ClusterFenced;
-            let open_claim = crate::route_activation_claims::OpenRouteActivationClaim::for_cluster_fenced_identity(&route, provenance).unwrap();
+            let open_claim = crate::db::route_activation_claims::OpenRouteActivationClaim::for_cluster_fenced_identity(&route, provenance).unwrap();
             let episode = crate::db::begin_activation_with_route_evidence(
                 &conn,
                 &id,
@@ -2196,7 +2198,7 @@ pub(crate) mod service_tests {
                 if receipt.kind() == SandboxTransitionReceiptKind::ActivationRollback
                     && receipt.activation_attempt_id() == Some(if persist_operation { operation } else { route_attempt }))
             );
-            assert!(crate::route_activation_claims::claim_exists(&db, &id).unwrap());
+            assert!(crate::db::route_activation_claims::claim_exists(&db, &id).unwrap());
             assert!(
                 crate::route_activation_claims::validate_cluster_fenced_activation(
                     &db,
@@ -2267,7 +2269,7 @@ pub(crate) mod service_tests {
             .resolve_runtime_activation_identity(&sandbox_id.to_string(), identity, false)
             .expect("the surviving pod and attempt may continue after manager restart");
         assert!(
-            crate::route_activation_claims::claim_exists(
+            crate::db::route_activation_claims::claim_exists(
                 &service.db.lock().unwrap(),
                 &sandbox_id.to_string()
             )
@@ -2281,7 +2283,7 @@ pub(crate) mod service_tests {
             service_with_base_snapshot_create_route_evidence();
         {
             let db = service.db.lock().unwrap();
-            crate::route_activation_claims::close_claim(&db, &sandbox_id.to_string()).unwrap();
+            crate::db::route_activation_claims::close_claim(&db, &sandbox_id.to_string()).unwrap();
         }
         identity.route_generation = Some(RouteGeneration::new(2).unwrap());
         identity.execution_generation = Some(ExecutionGeneration::new(2).unwrap());
@@ -2292,7 +2294,7 @@ pub(crate) mod service_tests {
             .resolve_runtime_activation_identity(&sandbox_id.to_string(), identity, false)
             .expect("a newer rollout-compatible identity remains on the existing path");
         assert!(
-            !crate::route_activation_claims::claim_exists(
+            !crate::db::route_activation_claims::claim_exists(
                 &service.db.lock().unwrap(),
                 &sandbox_id.to_string()
             )
@@ -3477,7 +3479,7 @@ pub(crate) mod service_tests {
                 crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::ClusterFenced,
             )
             .unwrap();
-            crate::auto_lifecycle_delete_receipts::db::insert_pending_receipt(
+            crate::db::auto_lifecycle_delete_receipts::insert_pending_receipt(
                 &db,
                 crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteReceipt {
                     receipt_id: pending_receipt_id,
@@ -3503,7 +3505,7 @@ pub(crate) mod service_tests {
 
         let db = service.db.lock().unwrap();
         assert!(
-            crate::auto_lifecycle_delete_receipts::db::pending_receipt_for_sandbox(
+            crate::db::auto_lifecycle_delete_receipts::pending_receipt_for_sandbox(
                 &db, sandbox_id,
             )
             .unwrap()
@@ -3568,7 +3570,7 @@ pub(crate) mod service_tests {
                 crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::ClusterFenced,
             )
             .unwrap();
-            crate::auto_lifecycle_delete_receipts::db::insert_pending_receipt(&db, pending)
+            crate::db::auto_lifecycle_delete_receipts::insert_pending_receipt(&db, pending)
                 .unwrap();
             db.execute_batch(
                 "CREATE TRIGGER reject_redundant_route_identity_adoption
@@ -3601,7 +3603,7 @@ pub(crate) mod service_tests {
 
         let db = service.db.lock().unwrap();
         assert_eq!(
-            crate::auto_lifecycle_delete_receipts::db::pending_receipt_for_sandbox(
+            crate::db::auto_lifecycle_delete_receipts::pending_receipt_for_sandbox(
                 &db, sandbox_id,
             )
             .unwrap(),
@@ -3679,7 +3681,7 @@ pub(crate) mod service_tests {
         assert_eq!(
             route_identity_adoption_write_rejection_reason(
                 &rusqlite::Error::ToSqlConversionFailure(Box::new(
-                    crate::auto_lifecycle_delete_receipts::db::PendingReceiptOwnsExecution,
+                    crate::db::auto_lifecycle_delete_receipts::PendingReceiptOwnsExecution,
                 )),
             ),
             RouteIdentityAdoptionReason::PendingReceiptOwnsExecution
@@ -3687,7 +3689,7 @@ pub(crate) mod service_tests {
         assert_eq!(
             route_identity_adoption_write_rejection_reason(
                 &rusqlite::Error::ToSqlConversionFailure(Box::new(
-                    crate::auto_lifecycle_delete_receipts::db::LifecycleOwnsExecution,
+                    crate::db::auto_lifecycle_delete_receipts::LifecycleOwnsExecution,
                 )),
             ),
             RouteIdentityAdoptionReason::LifecycleOwnsExecution
@@ -6884,7 +6886,7 @@ pub(crate) mod service_tests {
                     .is_none()
             );
             assert_eq!(
-                crate::auto_lifecycle_delete_receipts::db::pending_receipt_for_sandbox(
+                crate::db::auto_lifecycle_delete_receipts::pending_receipt_for_sandbox(
                     &db, sandbox_id,
                 )
                 .unwrap(),
@@ -6914,7 +6916,7 @@ pub(crate) mod service_tests {
             assert_eq!(row.cleanup_completion, Some(CleanupCompletion::DeleteRow));
             assert_eq!(row.cleanup_keep_filesystem, Some(false));
             assert_eq!(
-                crate::auto_lifecycle_delete_receipts::db::pending_receipt_for_sandbox(
+                crate::db::auto_lifecycle_delete_receipts::pending_receipt_for_sandbox(
                     &db, sandbox_id,
                 )
                 .unwrap(),
@@ -8257,7 +8259,7 @@ pub(crate) mod service_tests {
                     &AutoLifecyclePolicy::disabled(),
                 ),
         };
-        crate::auto_lifecycle_delete_receipts::db::insert_pending_receipt(&conn, receipt).unwrap();
+        crate::db::auto_lifecycle_delete_receipts::insert_pending_receipt(&conn, receipt).unwrap();
         let service = SandboxManagerService::for_test(conn);
 
         let error = service
@@ -8299,7 +8301,7 @@ pub(crate) mod service_tests {
             crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::ClusterFenced,
         )
         .unwrap();
-        crate::auto_lifecycle_delete_receipts::db::insert_pending_receipt(
+        crate::db::auto_lifecycle_delete_receipts::insert_pending_receipt(
             &conn,
             crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteReceipt {
                 receipt_id: pplx_space_common_core::types::AutoLifecycleDeleteReceiptId::generate(),
@@ -9826,7 +9828,7 @@ pub(crate) mod service_tests {
             crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::Unfenced,
         )
         .unwrap();
-        crate::auto_lifecycle_delete_receipts::db::insert_pending_receipt(&conn, receipt).unwrap();
+        crate::db::auto_lifecycle_delete_receipts::insert_pending_receipt(&conn, receipt).unwrap();
         conn.execute(
             "UPDATE sandboxes
                 SET state = 'deleting',
@@ -9836,7 +9838,7 @@ pub(crate) mod service_tests {
             [sandbox_id.to_string()],
         )
         .unwrap();
-        crate::auto_lifecycle_delete_receipts::db::record_retained_route_evidence(
+        crate::db::auto_lifecycle_delete_receipts::record_retained_route_evidence(
             &conn,
             sandbox_id,
             crate::auto_lifecycle_delete_receipts::RouteEvidence {
@@ -10706,7 +10708,7 @@ pub(crate) mod service_tests {
             SandboxState::Started
         );
         assert_eq!(
-            crate::auto_lifecycle_delete_receipts::db::pending_receipt_for_sandbox(
+            crate::db::auto_lifecycle_delete_receipts::pending_receipt_for_sandbox(
                 &db, sandbox_id,
             )
             .unwrap(),
@@ -17542,7 +17544,7 @@ pub(crate) mod service_tests {
                     &AutoLifecyclePolicy::disabled(),
                 ),
         };
-        crate::auto_lifecycle_delete_receipts::db::insert_pending_receipt(&conn, receipt).unwrap();
+        crate::db::auto_lifecycle_delete_receipts::insert_pending_receipt(&conn, receipt).unwrap();
         let service = SandboxManagerService::for_test(conn);
 
         let targets = service.recover_requested_cleanup_targets_for_ids(vec![sandbox_id]);

@@ -61,82 +61,13 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{ArtifactKind, LocalArtifactId, SnapshotName};
-use pplx_space_common_svc::sql::sqlite::SqliteU64;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::Connection;
 
 use crate::db::LocalArtifactRow;
-
-/// One sandbox's current lifecycle artifact that this node cannot prove has
-/// a durable remote copy.
-///
-/// Identity comes from the `sandboxes` pin rather than from the artifact
-/// row, because the case where there *is* no artifact row is one of the
-/// cases this reports. Migration 026's CHECK keeps `current_local_artifact_id`
-/// and `current_local_artifact_kind` set or unset together, so the pin alone
-/// always carries a whole identity.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PendingBackup {
-    pub sandbox_id: String,
-    pub local_artifact_id: LocalArtifactId,
-    pub artifact_kind: ArtifactKind,
-}
-
-/// Logical state of a `local_artifacts` row. Encoded on the row's
-/// `state` column; transitions are CAS via
-/// [`LocalArtifacts::check_out_for_restore`] /
-/// [`LocalArtifacts::check_out_for_delete`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ArtifactState {
-    /// Published and available. The only state from which a checkout
-    /// (restore or delete) can succeed.
-    Ready,
-    /// A restore is currently reading this artifact's `local_path`.
-    /// Reapers must skip; deleters must wait or fail with NotReady.
-    Restoring,
-    /// A delete has reserved this row. The on-disk directory has
-    /// usually been renamed to a `.gc-pending-<id>` sibling. Readers
-    /// should treat the artifact as gone.
-    Deleting,
-}
-
-impl ArtifactState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ArtifactState::Ready => "ready",
-            ArtifactState::Restoring => "restoring",
-            ArtifactState::Deleting => "deleting",
-        }
-    }
-}
-
-/// Error parsing an [`ArtifactState`] from its wire/DB string. The
-/// CHECK constraint on `local_artifacts.state` should make this
-/// unreachable for rows the schema accepted; it surfaces table
-/// corruption or migration drift.
-#[derive(Debug, thiserror::Error)]
-#[error("unrecognized artifact state {0:?}")]
-pub struct ParseArtifactStateError(String);
-
-impl std::str::FromStr for ArtifactState {
-    type Err = ParseArtifactStateError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "ready" => Ok(ArtifactState::Ready),
-            "restoring" => Ok(ArtifactState::Restoring),
-            "deleting" => Ok(ArtifactState::Deleting),
-            _ => Err(ParseArtifactStateError(s.to_string())),
-        }
-    }
-}
-
-impl std::fmt::Display for ArtifactState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+use crate::db::local_artifact_leases as leases;
+pub(crate) use crate::db::local_artifact_leases::NamedArtifactPublication;
+pub use crate::db::local_artifact_leases::{ArtifactState, ParseArtifactStateError, PendingBackup};
 
 /// Reason a checkout (restore or delete) failed.
 #[derive(Debug, thiserror::Error)]
@@ -206,14 +137,6 @@ pub(crate) enum GcDeleteCheckout {
 pub struct LocalArtifacts {
     db: Arc<Mutex<Connection>>,
     orphan_scan: Arc<Mutex<OrphanScan>>,
-}
-
-/// Point-in-time publication evidence for a named snapshot, not a checkout lease.
-pub(crate) struct NamedArtifactPublication {
-    pub snapshot_name: SnapshotName,
-    pub local_path: String,
-    pub artifact_kind: ArtifactKind,
-    pub state: ArtifactState,
 }
 
 #[derive(Clone, Copy)]
@@ -371,36 +294,7 @@ impl LocalArtifacts {
     /// with no report, which every consumer already has to handle.
     pub fn list_pending_backups(&self) -> rusqlite::Result<Vec<PendingBackup>> {
         let conn = self.db_conn()?;
-        conn.prepare(
-            "SELECT s.id, s.current_local_artifact_id, s.current_local_artifact_kind
-               FROM sandboxes AS s
-               LEFT JOIN local_artifacts AS a
-                 ON a.local_artifact_id = s.current_local_artifact_id
-                AND a.sandbox_id = s.id
-              WHERE s.current_local_artifact_id IS NOT NULL
-                AND (a.local_artifact_id IS NULL OR a.backup_completed_at IS NULL)
-              ORDER BY s.id",
-        )?
-        .query_map([], |row| {
-            Ok(PendingBackup {
-                sandbox_id: row.get(0)?,
-                local_artifact_id: row.get::<_, String>(1)?.parse().map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        1,
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    )
-                })?,
-                artifact_kind: row.get::<_, String>(2)?.parse().map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        2,
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    )
-                })?,
-            })
-        })?
-        .collect()
+        leases::list_pending_backups(&conn)
     }
 
     /// Inventory-only observation. Callers must still acquire a checkout before
@@ -409,43 +303,8 @@ impl LocalArtifacts {
         &self,
         sandbox_id: &str,
     ) -> Result<Vec<NamedArtifactPublication>, crate::db::inventory_read::InventoryReadError> {
-        use pplx_space_common_core::inventory::{InventoryBudget, MAX_ITEMS, MAX_RAW_BYTES};
         let conn = self.db_conn()?;
-        let mut statement = conn.prepare(sql!(
-            "SELECT snapshot_name, local_path, artifact_kind, state
-             FROM local_artifacts WHERE sandbox_id = ?1 AND artifact_origin = 'snapshot'"
-        ))?;
-        let mut rows = statement.query([sandbox_id])?;
-        let mut budget = InventoryBudget::new(MAX_ITEMS, MAX_RAW_BYTES);
-        let mut publications = Vec::new();
-        while let Some(row) = rows.next()? {
-            crate::db::inventory_read::check_row(row, &mut budget)?;
-            publications.push(NamedArtifactPublication {
-                snapshot_name: row.get::<_, String>(0)?.parse().map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    )
-                })?,
-                local_path: row.get(1)?,
-                artifact_kind: row.get::<_, String>(2)?.parse().map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        2,
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    )
-                })?,
-                state: row.get::<_, String>(3)?.parse().map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        3,
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    )
-                })?,
-            });
-        }
-        Ok(publications)
+        leases::list_named_publications(&conn, sandbox_id)
     }
 
     /// Mark the artifact's remote backup as durably completed. This
@@ -542,13 +401,7 @@ impl LocalArtifacts {
         let tx =
             rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
         let id_str = local_artifact_id.to_string();
-        let row: Option<(String, String)> = tx
-            .query_row(
-                "SELECT local_path, state FROM local_artifacts WHERE local_artifact_id = ?1",
-                params![id_str],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-            )
-            .optional()?;
+        let row = leases::artifact_path_and_state(&tx, &id_str)?;
         let Some((local_path, state)) = row else {
             return Err(CheckoutError::NotFound(local_artifact_id));
         };
@@ -567,11 +420,7 @@ impl LocalArtifacts {
         // CAS — only flip if still ready. If a concurrent path won
         // the race between the SELECT and the UPDATE, the UPDATE
         // affects 0 rows and we surface NotReady.
-        let changed = tx.execute(
-            "UPDATE local_artifacts SET state = 'restoring'
-             WHERE local_artifact_id = ?1 AND state = 'ready'",
-            params![id_str],
-        )?;
+        let changed = leases::mark_artifact_restoring(&tx, &id_str)?;
         if changed == 0 {
             return Err(CheckoutError::NotReady {
                 id: local_artifact_id,
@@ -622,32 +471,10 @@ impl LocalArtifacts {
         sandbox_id: &str,
         eligibility: GcEligibility,
     ) -> Result<GcDeleteCheckout, CheckoutError> {
-        use crate::db::timestamps::EpochSeconds;
-
         let conn = self.db_conn()?;
         let tx =
             rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
-        let row = tx
-            .query_row(
-                "SELECT created_at, COALESCE(last_touched_at, created_at),
-                    EXISTS(
-                        SELECT 1 FROM sandboxes
-                         WHERE current_local_artifact_id = ?1
-                            OR suspend_predecessor_artifact_id = ?1
-                    ),
-                    backup_completed_at IS NOT NULL
-               FROM local_artifacts WHERE local_artifact_id = ?1 AND sandbox_id = ?2",
-                params![local_artifact_id.to_string(), sandbox_id],
-                |row| {
-                    Ok((
-                        row.get::<_, EpochSeconds>(0)?,
-                        row.get::<_, EpochSeconds>(1)?,
-                        row.get::<_, bool>(2)?,
-                        row.get::<_, bool>(3)?,
-                    ))
-                },
-            )
-            .optional()?;
+        let row = leases::gc_checkout_evidence(&tx, &local_artifact_id.to_string(), sandbox_id)?;
         let Some((created_at, touched_at, pinned, backed_up)) = row else {
             return Err(CheckoutError::NotFound(local_artifact_id));
         };
@@ -685,24 +512,11 @@ impl LocalArtifacts {
         let id_str = local_artifact_id.to_string();
         // The IMMEDIATE transaction serializes pin changes with checkout for
         // every deleter, including named-snapshot deletion outside GC.
-        let pinned: bool = tx.query_row(
-            sql!(
-                "SELECT EXISTS(SELECT 1 FROM sandboxes
-                   WHERE current_local_artifact_id = ?1 OR suspend_predecessor_artifact_id = ?1)"
-            ),
-            [&id_str],
-            |row| row.get(0),
-        )?;
+        let pinned = leases::artifact_is_pinned(tx, &id_str)?;
         if pinned {
             return Err(CheckoutError::Pinned(local_artifact_id));
         }
-        let row: Option<(String, String)> = tx
-            .query_row(
-                "SELECT local_path, state FROM local_artifacts WHERE local_artifact_id = ?1",
-                params![id_str],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-            )
-            .optional()?;
+        let row = leases::artifact_path_and_state(tx, &id_str)?;
         let Some((local_path, state)) = row else {
             return Err(CheckoutError::NotFound(local_artifact_id));
         };
@@ -720,22 +534,14 @@ impl LocalArtifacts {
         }
         // Shared-path safety gate. The reaper's old plan-time
         // check moved here so DeleteSnapshots gets it too.
-        let path_count: u64 = tx.query_row(
-            "SELECT COUNT(*) FROM local_artifacts WHERE local_path = ?1",
-            params![local_path],
-            |r| Ok(r.get::<_, SqliteU64>(0)?.0),
-        )?;
+        let path_count = leases::count_artifacts_at_path(tx, &local_path)?;
         if path_count != 1 {
             return Err(CheckoutError::SharedLocalPath {
                 id: local_artifact_id,
                 sibling_count: path_count.saturating_sub(1),
             });
         }
-        let changed = tx.execute(
-            "UPDATE local_artifacts SET state = 'deleting'
-             WHERE local_artifact_id = ?1 AND state = 'ready'",
-            params![id_str],
-        )?;
+        let changed = leases::mark_artifact_deleting(tx, &id_str)?;
         if changed == 0 {
             return Err(CheckoutError::NotReady {
                 id: local_artifact_id,
@@ -805,17 +611,8 @@ impl LocalArtifacts {
         let conn = self.db_conn()?;
         let tx =
             rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
-        let restoring_reset = tx.execute(
-            "UPDATE local_artifacts SET state = 'ready' WHERE state = 'restoring'",
-            [],
-        )?;
-        let stuck_deleting: Vec<(String, String)> = tx
-            .prepare(
-                "SELECT local_artifact_id, local_path FROM local_artifacts
-                 WHERE state = 'deleting'",
-            )?
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-            .collect::<rusqlite::Result<_>>()?;
+        let restoring_reset = leases::reset_restoring_artifacts(&tx)?;
+        let stuck_deleting = leases::list_deleting_artifacts(&tx)?;
         let mut deleting_rolled_back = 0usize;
         let mut deleting_finished = 0usize;
         let mut deleting_deferred = 0usize;
@@ -833,32 +630,16 @@ impl LocalArtifacts {
                     continue;
                 }
             };
-            let pinned: bool = tx.query_row(
-                "SELECT EXISTS(
-                     SELECT 1 FROM sandboxes
-                      WHERE current_local_artifact_id = ?1
-                         OR suspend_predecessor_artifact_id = ?1
-                 )",
-                params![id],
-                |r| r.get(0),
-            )?;
+            let pinned = leases::artifact_is_pinned(&tx, &id)?;
             if original_present && !staging_present {
-                tx.execute(
-                    "UPDATE local_artifacts SET state = 'ready'
-                     WHERE local_artifact_id = ?1 AND state = 'deleting'",
-                    params![id],
-                )?;
+                leases::roll_back_deleting_artifact(&tx, &id)?;
                 deleting_rolled_back += 1;
             } else if pinned {
                 tracing::warn!(artifact_id = %id, original_present, staging_present,
                     "retaining pinned deleting artifact evidence; explicit restore or cleanup required");
                 deleting_deferred += 1;
             } else {
-                tx.execute(
-                    "DELETE FROM local_artifacts
-                     WHERE local_artifact_id = ?1 AND state = 'deleting'",
-                    params![id],
-                )?;
+                leases::delete_deleting_artifact(&tx, &id)?;
                 deleting_finished += 1;
             }
         }
@@ -874,15 +655,8 @@ impl LocalArtifacts {
     /// GC staging is disposable only after both its registry and pin are gone.
     /// Retain rows in every state, including historical deletion conflicts.
     pub(crate) fn gc_staging_is_unowned(&self, id: LocalArtifactId) -> rusqlite::Result<bool> {
-        self.db_conn()?.query_row(
-            sql!(
-                "SELECT NOT EXISTS(SELECT 1 FROM local_artifacts WHERE local_artifact_id = ?1)
-                  AND NOT EXISTS(SELECT 1 FROM sandboxes
-                   WHERE current_local_artifact_id = ?1 OR suspend_predecessor_artifact_id = ?1)"
-            ),
-            [id.to_string()],
-            |row| row.get(0),
-        )
+        let conn = self.db_conn()?;
+        leases::gc_staging_is_unowned(&conn, &id.to_string())
     }
 
     /// Examine at most `max_records` raw rows, advancing past owned, present,
@@ -902,34 +676,17 @@ impl LocalArtifacts {
         let tx =
             rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
         if scan.through.is_none() {
-            scan.through =
-                tx.query_row("SELECT MAX(rowid) FROM local_artifacts", [], |r| r.get(0))?;
+            scan.through = leases::max_artifact_rowid(&tx)?;
         }
         let Some(through) = scan.through else {
             return Ok(0);
         };
-        let rows = tx
-            .prepare(
-                "SELECT la.rowid, la.local_artifact_id, la.local_path,
-                    EXISTS (SELECT 1 FROM sandboxes s WHERE s.id = la.sandbox_id)
-               FROM local_artifacts la
-              WHERE la.rowid >= ?1 AND la.rowid <= ?2
-              ORDER BY la.rowid LIMIT ?3",
-            )?
-            .query_map(
-                params![
-                    scan.next,
-                    through,
-                    i64::try_from(max_records).unwrap_or(i64::MAX)
-                ],
-                |row| {
-                    let decoded = (|| -> rusqlite::Result<(String, String, bool)> {
-                        Ok((row.get(1)?, row.get(2)?, row.get(3)?))
-                    })();
-                    Ok((row.get::<_, i64>(0)?, decoded))
-                },
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let rows = leases::orphan_scan_rows(
+            &tx,
+            scan.next,
+            through,
+            i64::try_from(max_records).unwrap_or(i64::MAX),
+        )?;
         let mut deleted = 0usize;
         let examined = rows.len();
         for (rowid, decoded) in rows {
@@ -955,16 +712,7 @@ impl LocalArtifacts {
                     continue;
                 }
             }
-            deleted += tx.execute(
-                "DELETE FROM local_artifacts
-                  WHERE local_artifact_id = ?1
-                    AND NOT EXISTS (
-                        SELECT 1
-                          FROM sandboxes s
-                         WHERE s.id = local_artifacts.sandbox_id
-                    )",
-                params![id],
-            )?;
+            deleted += leases::delete_orphan_artifact_row(&tx, &id)?;
         }
         if examined < max_records {
             scan = OrphanScan::default();
@@ -1046,12 +794,7 @@ impl RestoreLease {
 
     fn release_with_touch(&self) -> rusqlite::Result<()> {
         let conn = lock_db(&self.db)?;
-        conn.execute(
-            "UPDATE local_artifacts
-             SET state = 'ready', last_touched_at = ?1
-             WHERE local_artifact_id = ?2 AND state = 'restoring'",
-            params![crate::db::now()?, self.id.to_string()],
-        )?;
+        leases::release_restoring_artifact_with_touch(&conn, &self.id.to_string())?;
         Ok(())
     }
 
@@ -1062,11 +805,7 @@ impl RestoreLease {
     /// idle clock should reflect that.
     fn release_without_touch(&self) -> rusqlite::Result<()> {
         let conn = lock_db(&self.db)?;
-        conn.execute(
-            "UPDATE local_artifacts SET state = 'ready'
-             WHERE local_artifact_id = ?1 AND state = 'restoring'",
-            params![self.id.to_string()],
-        )?;
+        leases::release_restoring_artifact(&conn, &self.id.to_string())?;
         Ok(())
     }
 }
@@ -1112,11 +851,7 @@ impl DeleteLease {
     /// than a foot-gun.
     pub fn commit(mut self) -> rusqlite::Result<()> {
         let conn = lock_db(&self.db)?;
-        let deleted = conn.execute(
-            "DELETE FROM local_artifacts
-             WHERE local_artifact_id = ?1 AND state = 'deleting'",
-            params![self.id.to_string()],
-        )?;
+        let deleted = leases::delete_deleting_artifact(&conn, &self.id.to_string())?;
         drop(conn);
         if deleted == 0 {
             tracing::warn!(
@@ -1145,11 +880,7 @@ impl Drop for DeleteLease {
                 return;
             }
         };
-        if let Err(error) = conn.execute(
-            "UPDATE local_artifacts SET state = 'ready'
-             WHERE local_artifact_id = ?1 AND state = 'deleting'",
-            params![self.id.to_string()],
-        ) {
+        if let Err(error) = leases::roll_back_deleting_artifact(&conn, &self.id.to_string()) {
             tracing::warn!(
                 local_artifact_id = %self.id,
                 %error,

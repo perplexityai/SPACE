@@ -132,7 +132,7 @@ fn restore_pool_donor(
     conn: &Connection,
     sandbox_id: SandboxId,
     donor: &SandboxRow,
-) -> Result<Option<crate::auto_lifecycle_delete_receipts::db::PendingReceiptSupersession>> {
+) -> Result<Option<auto_lifecycle_delete_receipts::PendingReceiptSupersession>> {
     let id = sandbox_id.to_string();
     set_pool_template(conn, &id, donor.pool_template.as_deref())?;
     update_user(conn, &id, &donor.user)?;
@@ -189,16 +189,12 @@ pub fn restore_pool_donor_if_adopted(
     let receipt_supersession = match restore_pool_donor(&tx, sandbox_id, donor) {
         Ok(receipt_supersession) => receipt_supersession,
         Err(error)
-            if crate::auto_lifecycle_delete_receipts::db::is_pending_receipt_execution_fence(
-                &error,
-            ) =>
+            if auto_lifecycle_delete_receipts::is_pending_receipt_execution_fence(&error) =>
         {
             tx.rollback()?;
             return Ok(PoolDonorRestoreDisposition::ReceiptOwned);
         }
-        Err(error)
-            if crate::auto_lifecycle_delete_receipts::db::is_lifecycle_execution_fence(&error) =>
-        {
+        Err(error) if auto_lifecycle_delete_receipts::is_lifecycle_execution_fence(&error) => {
             tx.rollback()?;
             return Ok(PoolDonorRestoreDisposition::LifecycleOwned);
         }

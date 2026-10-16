@@ -491,7 +491,7 @@ impl SandboxManagerService {
                     return Ok(None);
                 }
                 let receipt =
-                    crate::auto_lifecycle_delete_receipts::db::pending_receipt_for_sandbox(
+                    crate::db::auto_lifecycle_delete_receipts::pending_receipt_for_sandbox(
                         db,
                         work.sandbox_id,
                     )

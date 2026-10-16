@@ -154,7 +154,7 @@ pub(crate) fn insert_sandbox_with_cleanup_episode_and_route_evidence(
     params: InsertSandboxParams<'_>,
     episode: CleanupEpisodeSpec,
     route_evidence: Option<crate::auto_lifecycle_delete_receipts::RouteEvidence>,
-    open_route_activation: Option<&crate::route_activation_claims::OpenRouteActivationClaim>,
+    open_route_activation: Option<&route_activation_claims::OpenRouteActivationClaim>,
     execution: Option<&ExecutionMetadata>,
 ) -> std::result::Result<(), InsertSandboxWithCleanupEpisodeError> {
     if params.state != episode.activation_state {
@@ -172,7 +172,7 @@ pub(crate) fn insert_sandbox_with_cleanup_episode_and_route_evidence(
         upsert_sandbox_execution_metadata_in_transaction(&tx, &sandbox_id, execution)?;
     }
     if let Some(route_evidence) = route_evidence {
-        crate::auto_lifecycle_delete_receipts::db::record_retained_route_evidence(
+        auto_lifecycle_delete_receipts::record_retained_route_evidence(
             &tx,
             sandbox_id
                 .parse()
@@ -181,11 +181,7 @@ pub(crate) fn insert_sandbox_with_cleanup_episode_and_route_evidence(
         )?;
     }
     if let Some(open_route_activation) = open_route_activation {
-        crate::route_activation_claims::insert_create_claim(
-            &tx,
-            &sandbox_id,
-            open_route_activation,
-        )?;
+        route_activation_claims::insert_create_claim(&tx, &sandbox_id, open_route_activation)?;
     }
     insert_cleanup_episode(&tx, &sandbox_id, episode)?;
     tx.commit()?;
@@ -1021,7 +1017,7 @@ pub(crate) fn complete_cleanup_episode_for_job(
         record_execution_delete_receipt(&tx, sandbox_id, execution_generation)?;
         delete_sandbox_child_rows(&tx, sandbox_id)?;
         tx.execute("DELETE FROM sandboxes WHERE id = ?1", params![sandbox_id])
-            .map_err(crate::auto_lifecycle_delete_receipts::db::map_pending_receipt_delete_error)?;
+            .map_err(auto_lifecycle_delete_receipts::map_pending_receipt_delete_error)?;
     } else {
         if !complete_state_cleanup(&tx, sandbox_id, cleanup_id, &episode, recovery.as_ref())? {
             tx.commit()?;
@@ -1034,7 +1030,7 @@ pub(crate) fn complete_cleanup_episode_for_job(
         // completed lifecycle teardown. Keep the exact attempt's continuation
         // claim so a transiently failed RPC can retry after runtime cleanup.
         if episode.completion == CleanupCompletion::Quarantine {
-            crate::route_activation_claims::close_claim(&tx, sandbox_id)?;
+            route_activation_claims::close_claim(&tx, sandbox_id)?;
         }
         tx.execute(
             "DELETE FROM sandbox_cleanup_episodes
@@ -1117,9 +1113,7 @@ pub(crate) enum CompleteRowIntentCleanupError {
     #[error(transparent)]
     Database(#[from] rusqlite::Error),
     #[error(transparent)]
-    ReceiptCompletion(
-        #[from] crate::auto_lifecycle_delete_receipts::db::CompletePendingReceiptError,
-    ),
+    ReceiptCompletion(#[from] auto_lifecycle_delete_receipts::CompletePendingReceiptError),
     #[error(
         "expected auto-lifecycle delete receipt is missing or changed for sandbox {sandbox_id}"
     )]
@@ -1244,7 +1238,7 @@ pub(crate) fn complete_row_intent_cleanup_for_job(
         .transpose()?;
     let pending_delete_receipt = parsed_delete_sandbox_id
         .map(|sandbox_id| {
-            crate::auto_lifecycle_delete_receipts::db::pending_receipt_for_sandbox(&tx, sandbox_id)
+            auto_lifecycle_delete_receipts::pending_receipt_for_sandbox(&tx, sandbox_id)
         })
         .transpose()?
         .flatten();
@@ -1306,7 +1300,7 @@ pub(crate) fn complete_row_intent_cleanup_for_job(
             // A caller-supplied expected receipt was matched by the hoisted
             // ownership check. Startup and operator recovery instead derive
             // ownership from this durable receipt plus the DeleteRow intent.
-            crate::auto_lifecycle_delete_receipts::db::complete_pending_receipt(
+            auto_lifecycle_delete_receipts::complete_pending_receipt(
                 &tx,
                 parsed_sandbox_id,
                 receipt.receipt_id,
@@ -1319,7 +1313,7 @@ pub(crate) fn complete_row_intent_cleanup_for_job(
         )?;
         delete_sandbox_child_rows(&tx, sandbox_id)?;
         tx.execute("DELETE FROM sandboxes WHERE id = ?1", params![sandbox_id])
-            .map_err(crate::auto_lifecycle_delete_receipts::db::map_pending_receipt_delete_error)?;
+            .map_err(auto_lifecycle_delete_receipts::map_pending_receipt_delete_error)?;
         cleanup_jobs::finish_in_transaction(&tx, job_id, &cleanup_jobs::CleanupOutcome::Applied)?;
         tx.commit()?;
         return Ok(CompleteRowIntentCleanupDisposition::Applied);
@@ -1397,7 +1391,7 @@ pub(crate) fn complete_row_intent_cleanup_for_job(
     // `apply_cleanup_state` clears the live identity and fires the retained
     // identity trigger. Close the claim only after that observation, but
     // before this transaction commits.
-    crate::route_activation_claims::close_claim(&tx, sandbox_id)?;
+    route_activation_claims::close_claim(&tx, sandbox_id)?;
     let outcome = if missing_suspend_artifact {
         cleanup_jobs::CleanupOutcome::Quarantined(
             SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE.to_owned(),
@@ -1498,7 +1492,7 @@ pub(crate) fn quarantine_cleanup_episode_for_job(
         ],
     )?;
     if changed == 1 {
-        crate::route_activation_claims::close_claim(&tx, sandbox_id)?;
+        route_activation_claims::close_claim(&tx, sandbox_id)?;
         insert_new_quarantine_episode(
             &tx,
             &QuarantineEpisode {

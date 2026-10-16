@@ -913,10 +913,10 @@ fn persisted_activation_owns_route_identity(
 }
 
 fn map_runtime_fields_update_error(error: rusqlite::Error) -> Status {
-    if crate::auto_lifecycle_delete_receipts::db::is_pending_receipt_execution_fence(&error) {
+    if crate::db::auto_lifecycle_delete_receipts::is_pending_receipt_execution_fence(&error) {
         return Status::aborted("pending auto-lifecycle delete receipt owns the sandbox execution");
     }
-    if crate::auto_lifecycle_delete_receipts::db::is_lifecycle_execution_fence(&error) {
+    if crate::db::auto_lifecycle_delete_receipts::is_lifecycle_execution_fence(&error) {
         return Status::aborted("sandbox lifecycle or cleanup owns the sandbox execution");
     }
     match error {
@@ -930,9 +930,9 @@ fn route_identity_adoption_write_rejection_reason(
     error: &rusqlite::Error,
 ) -> pplx_space_metrics::sandbox::worker::RouteIdentityAdoptionReason {
     use pplx_space_metrics::sandbox::worker::RouteIdentityAdoptionReason;
-    if crate::auto_lifecycle_delete_receipts::db::is_pending_receipt_execution_fence(error) {
+    if crate::db::auto_lifecycle_delete_receipts::is_pending_receipt_execution_fence(error) {
         RouteIdentityAdoptionReason::PendingReceiptOwnsExecution
-    } else if crate::auto_lifecycle_delete_receipts::db::is_lifecycle_execution_fence(error) {
+    } else if crate::db::auto_lifecycle_delete_receipts::is_lifecycle_execution_fence(error) {
         RouteIdentityAdoptionReason::LifecycleOwnsExecution
     } else {
         match error {
@@ -1219,7 +1219,7 @@ impl SandboxManagerService {
             local.current_node_id = local.current_node_id.or(self.local_node_id);
         }
         let merged = merge_authoritative_route_identity(&local, incoming);
-        let metadata = crate::auto_lifecycle_delete_receipts::db::route_identity_adoption_metadata(
+        let metadata = crate::db::auto_lifecycle_delete_receipts::route_identity_adoption_metadata(
             &db, sandbox_id,
         )
         .map_err(|error| Status::internal(format!("inspect route identity metadata: {error}")))
@@ -1258,7 +1258,7 @@ impl SandboxManagerService {
             // provenance and receipt mode are current. Persist an authoritative
             // observation even when it does not advance the stream epoch.
             let pending_receipt =
-                crate::auto_lifecycle_delete_receipts::db::pending_receipt_for_sandbox(
+                crate::db::auto_lifecycle_delete_receipts::pending_receipt_for_sandbox(
                     &db, sandbox_id,
                 )
                 .map_err(|error| {
@@ -1611,7 +1611,7 @@ impl SandboxManagerService {
             .as_ref()
             .map(|bundle| bundle.generation.get());
         if options.node_role != Some(NodeRole::Worker) {
-            match crate::auto_lifecycle_delete_receipts::db::outbox_stats(&conn) {
+            match crate::db::auto_lifecycle_delete_receipts::outbox_stats(&conn) {
                 Ok(stats) if stats.pending_count.saturating_add(stats.completed_count) != 0 => {
                     tracing::warn!(
                         node_role = ?options.node_role,

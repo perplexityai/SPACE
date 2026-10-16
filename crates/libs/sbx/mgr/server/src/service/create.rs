@@ -335,7 +335,7 @@ impl SandboxManagerService {
         let create_route_provenance = normalized_create_route_identity.provenance;
         let open_route_activation =
             (!req.autostart && requested_create_route_identity_can_open_claim).then(|| {
-                crate::route_activation_claims::OpenRouteActivationClaim::for_cluster_fenced_identity(
+                crate::db::route_activation_claims::OpenRouteActivationClaim::for_cluster_fenced_identity(
                     &create_route_identity,
                     create_route_provenance,
                 )
@@ -729,7 +729,7 @@ impl SandboxManagerService {
         .await?;
         let open_route_activation = open_activation_claim_eligible
             .then(|| {
-                crate::route_activation_claims::OpenRouteActivationClaim::for_cluster_fenced_identity(
+                crate::db::route_activation_claims::OpenRouteActivationClaim::for_cluster_fenced_identity(
                     &space_api_route_identity,
                     route_identity_provenance,
                 )

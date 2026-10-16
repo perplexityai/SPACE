@@ -1551,6 +1551,111 @@ fn crate_names_rdjson_and_exit_codes() {
     assert_eq!(document["diagnostics"][0]["severity"], "WARNING");
 }
 
+/// `paths` limits an instance to the files it matches: others are neither
+/// counted nor kept in its table, and `allow` still applies inside them.
+#[test]
+fn pattern_ratchet_paths() {
+    let config = format!(
+        "{}{}",
+        config(ADVISORY),
+        ratchet(
+            "old",
+            &[r"\bold_table\b"],
+            &["crates/a/src/allowed.rs"],
+            ADVISORY
+        ),
+    )
+    .replace(
+        "allow = ['crates/a/src/allowed.rs']\n",
+        "allow = ['crates/a/src/allowed.rs']\npaths = ['crates/a/**']\n",
+    );
+    type Case<'a> = (
+        &'a str,
+        &'a [(&'a str, usize)],
+        &'a [(&'a str, &'a str)],
+        &'a [(&'a str, &'a str)],
+    );
+    let cases: &[Case] = &[
+        (
+            "a file inside the paths is checked",
+            &[],
+            &[("crates/a/src/x.rs", "old_table\n")],
+            &[("no_crossing", "crates/a/src/x.rs: 1 code line matches")],
+        ),
+        (
+            "a file outside the paths is not",
+            &[],
+            &[("crates/b/src/x.rs", "old_table\n")],
+            &[],
+        ),
+        (
+            "allowed paths inside the paths may match",
+            &[],
+            &[("crates/a/src/allowed.rs", "old_table\n")],
+            &[],
+        ),
+        (
+            "an entry for a file outside the paths is stale",
+            &[("crates/b/src/x.rs", 1)],
+            &[("crates/b/src/x.rs", "old_table\n")],
+            &[(
+                "stale_entries",
+                "crates/b/src/x.rs is outside the paths [rules.pattern_ratchet.old] in \
+                 ARCHITECTURE.toml checks. Remove it from [pattern_ratchet.old] in \
+                 architecture-baseline.toml.",
+            )],
+        ),
+    ];
+    for (name, entries, files, expected) in cases {
+        let mut files: Vec<(&str, String)> = files
+            .iter()
+            .map(|(path, text)| (*path, (*text).to_owned()))
+            .collect();
+        files.push(("ARCHITECTURE.toml", config.clone()));
+        files.push((
+            "architecture-baseline.toml",
+            ratchet_baseline(&[("old", entries)]),
+        ));
+        let ws = workspace(&files);
+
+        let found = ratchet_findings(ws.path());
+
+        assert_eq!(found.len(), expected.len(), "{name}: {found:#?}");
+        for ((code, message), (want_behaviour, want_message)) in found.iter().zip(*expected) {
+            assert_eq!(
+                code,
+                &format!("pattern_ratchet.old.{want_behaviour}"),
+                "{name}"
+            );
+            assert!(message.starts_with(want_message), "{name}: {message}");
+        }
+    }
+
+    // An empty `paths` would check nothing, so it is rejected; an empty
+    // `allow` is still legal.
+    let no_allow = config.replace("allow = ['crates/a/src/allowed.rs']", "allow = []");
+    let baseline = ratchet_baseline(&[("old", &[])]);
+    let ws = workspace(&[
+        ("ARCHITECTURE.toml", no_allow.clone()),
+        ("architecture-baseline.toml", baseline.clone()),
+    ]);
+    Context::load(ws.path()).expect("an empty allow list loads");
+    let ws = workspace(&[
+        (
+            "ARCHITECTURE.toml",
+            no_allow.replace("paths = ['crates/a/**']", "paths = []"),
+        ),
+        ("architecture-baseline.toml", baseline),
+    ]);
+    let error = Context::load(ws.path()).expect_err("an empty paths list is rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("paths must list at least one glob; omit it to check every production file"),
+        "{error}"
+    );
+}
+
 /// One finding per behaviour, each reported in its own mode; only required
 /// findings exit 1. Without `--base-baseline`, no_new_entries is skipped and
 /// the summary says so.

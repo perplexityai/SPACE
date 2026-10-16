@@ -1696,7 +1696,7 @@ impl SandboxManagerService {
         let open_route_activation = start_ctx
             .open_activation_claim_eligible
             .then(|| {
-                crate::route_activation_claims::OpenRouteActivationClaim::for_cluster_fenced_identity(
+                crate::db::route_activation_claims::OpenRouteActivationClaim::for_cluster_fenced_identity(
                     &start_ctx.space_api_route_identity,
                     start_ctx.route_identity_provenance,
                 )

@@ -206,7 +206,7 @@ impl SandboxManagerService {
             let Ok(db) = self.db_conn() else {
                 return;
             };
-            match crate::auto_lifecycle_delete_receipts::db::record_receipt_conflict_retry(
+            match crate::db::auto_lifecycle_delete_receipts::record_receipt_conflict_retry(
                 &db, storage_id,
             ) {
                 Ok(true) => emit_sandbox_event(

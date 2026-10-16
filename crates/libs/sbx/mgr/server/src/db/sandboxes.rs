@@ -757,7 +757,7 @@ pub(crate) fn update_space_api_route_identity_in_transaction(
     sandbox_id: SandboxId,
     identity: &SpaceApiRouteIdentity,
     provenance: crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance,
-) -> Result<Option<crate::auto_lifecycle_delete_receipts::db::PendingReceiptSupersession>> {
+) -> Result<Option<auto_lifecycle_delete_receipts::PendingReceiptSupersession>> {
     let sandbox_id_string = sandbox_id.to_string();
     let previous_generation = runtime_execution_generation(conn, &sandbox_id_string)?;
     let updated = conn.execute(
@@ -800,13 +800,11 @@ pub(crate) fn update_space_api_route_identity_in_transaction(
         ],
     )?;
     if updated != 1 {
-        return Err(
-            crate::auto_lifecycle_delete_receipts::db::execution_write_miss_error(
-                conn,
-                sandbox_id,
-                identity.execution_generation,
-            ),
-        );
+        return Err(auto_lifecycle_delete_receipts::execution_write_miss_error(
+            conn,
+            sandbox_id,
+            identity.execution_generation,
+        ));
     }
     reset_access_floor_for_execution_change(
         conn,
@@ -817,15 +815,13 @@ pub(crate) fn update_space_api_route_identity_in_transaction(
     if let Some(evidence) =
         crate::auto_lifecycle_delete_receipts::RouteEvidence::from_identity(identity, provenance)
     {
-        crate::auto_lifecycle_delete_receipts::db::record_retained_route_evidence(
-            conn, sandbox_id, evidence,
-        )?;
+        auto_lifecycle_delete_receipts::record_retained_route_evidence(conn, sandbox_id, evidence)?;
     }
     // Provenance controls whether route evidence may mint a receipt. Once this
     // transaction persists a newer execution generation, an older receipt no
     // longer describes the row, including when the new route is incomplete.
     let receipt_supersession =
-        crate::auto_lifecycle_delete_receipts::db::discard_pending_receipt_for_execution_advance(
+        auto_lifecycle_delete_receipts::discard_pending_receipt_for_execution_advance(
             conn,
             sandbox_id,
             identity.execution_generation,
@@ -954,13 +950,11 @@ fn update_runtime_fields_with_activation_owner(
         ],
     )?;
     if updated != 1 {
-        return Err(
-            crate::auto_lifecycle_delete_receipts::db::execution_write_miss_error(
-                &tx,
-                sandbox_id,
-                space_api_route_execution_generation,
-            ),
-        );
+        return Err(auto_lifecycle_delete_receipts::execution_write_miss_error(
+            &tx,
+            sandbox_id,
+            space_api_route_execution_generation,
+        ));
     }
     reset_access_floor_for_execution_change(&tx, &id, previous_generation, execution_generation)?;
     if let (Some(execution_generation), Some(activation_attempt_id), Some(substrate)) = (
@@ -968,7 +962,7 @@ fn update_runtime_fields_with_activation_owner(
         space_api_route_activation_attempt_id,
         space_api_route_substrate_kind,
     ) {
-        crate::auto_lifecycle_delete_receipts::db::record_retained_route_evidence(
+        auto_lifecycle_delete_receipts::record_retained_route_evidence(
             &tx,
             sandbox_id,
             crate::auto_lifecycle_delete_receipts::RouteEvidence {
@@ -980,7 +974,7 @@ fn update_runtime_fields_with_activation_owner(
         )?;
     }
     let receipt_supersession =
-        crate::auto_lifecycle_delete_receipts::db::discard_pending_receipt_for_execution_advance(
+        auto_lifecycle_delete_receipts::discard_pending_receipt_for_execution_advance(
             &tx,
             sandbox_id,
             space_api_route_execution_generation,
@@ -1408,7 +1402,7 @@ pub fn delete_sandbox(conn: &Connection, id: &str) -> Result<()> {
     let tx = immediate_transaction(conn)?;
     delete_sandbox_child_rows(&tx, id)?;
     tx.execute("DELETE FROM sandboxes WHERE id = ?1", params![id])
-        .map_err(crate::auto_lifecycle_delete_receipts::db::map_pending_receipt_delete_error)?;
+        .map_err(auto_lifecycle_delete_receipts::map_pending_receipt_delete_error)?;
     tx.commit()?;
     Ok(())
 }
@@ -1506,7 +1500,7 @@ pub(crate) fn delete_sandbox_if_inventory_witness_matches(
     delete_sandbox_child_rows(&tx, &observed.id)?;
     let deleted = tx
         .execute("DELETE FROM sandboxes WHERE id = ?1", params![&observed.id])
-        .map_err(crate::auto_lifecycle_delete_receipts::db::map_pending_receipt_delete_error)?;
+        .map_err(auto_lifecycle_delete_receipts::map_pending_receipt_delete_error)?;
     if deleted != 1 {
         return Ok(InventoryStaleRowMutation::WitnessChanged);
     }

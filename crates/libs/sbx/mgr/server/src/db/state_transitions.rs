@@ -229,7 +229,7 @@ pub(crate) struct ActivationRouteAdmission<'a> {
     pub(crate) auto_lifecycle: Option<&'a AutoLifecyclePolicy>,
     pub(crate) operation_activation_attempt_id: Option<SandboxActivationAttemptId>,
     pub(crate) evidence: Option<crate::auto_lifecycle_delete_receipts::RouteEvidence>,
-    pub(crate) open_claim: Option<&'a crate::route_activation_claims::OpenRouteActivationClaim>,
+    pub(crate) open_claim: Option<&'a route_activation_claims::OpenRouteActivationClaim>,
 }
 
 pub(crate) fn begin_activation_with_route_evidence(
@@ -322,28 +322,26 @@ pub(crate) fn begin_activation_with_route_evidence(
         .transpose()?;
     match route_admission.open_claim {
         Some(open_route_activation) => {
-            crate::route_activation_claims::insert_create_claim(&tx, id, open_route_activation)?;
+            route_activation_claims::insert_create_claim(&tx, id, open_route_activation)?;
         }
         None => {
             // Beginning any other activation supersedes an older Kubernetes
             // continuation ticket in the same transaction that claims the row.
-            crate::route_activation_claims::close_claim(&tx, id)?;
+            route_activation_claims::close_claim(&tx, id)?;
         }
     }
     if let Some(route_evidence) = route_admission.evidence {
         let sandbox_id = sandbox_id.ok_or(rusqlite::Error::InvalidQuery)?;
-        crate::auto_lifecycle_delete_receipts::db::record_retained_route_evidence(
+        auto_lifecycle_delete_receipts::record_retained_route_evidence(
             &tx,
             sandbox_id,
             route_evidence,
         )?;
     }
     let receipt_supersession = match sandbox_id {
-        Some(sandbox_id) => crate::auto_lifecycle_delete_receipts::db::discard_pending_receipt_for_execution_advance(
-            &tx,
-            sandbox_id,
-            execution_generation,
-        )?,
+        Some(sandbox_id) => {
+            discard_pending_receipt_for_execution_advance(&tx, sandbox_id, execution_generation)?
+        }
         None => None,
     };
     let cleanup_id = SandboxCleanupEpisodeId::new();
@@ -659,7 +657,7 @@ pub fn mark_start_succeeded(
         arm_auto_lifecycle_after_activation(&tx, id)?;
     }
     if changed == 1 {
-        crate::route_activation_claims::close_claim(&tx, id)?;
+        route_activation_claims::close_claim(&tx, id)?;
     }
     tx.commit()?;
     Ok(changed == 1)
@@ -792,7 +790,7 @@ pub fn mark_restore_succeeded(
         arm_auto_lifecycle_after_activation(&tx, id)?;
     }
     if changed == 1 {
-        crate::route_activation_claims::close_claim(&tx, id)?;
+        route_activation_claims::close_claim(&tx, id)?;
     }
     tx.commit()?;
     if changed == 1 {

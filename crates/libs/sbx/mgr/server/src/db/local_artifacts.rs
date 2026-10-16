@@ -455,7 +455,7 @@ pub fn publish_stopped_artifact(
     }
     // Clear the runtime first so the retention trigger observes its complete
     // identity, then close the exact attempt in the same transaction.
-    crate::route_activation_claims::close_claim(&tx, sandbox_id)?;
+    route_activation_claims::close_claim(&tx, sandbox_id)?;
     tx.commit()?;
     Ok(())
 }
