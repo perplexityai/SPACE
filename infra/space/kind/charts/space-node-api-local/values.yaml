@@ -44,7 +44,7 @@ auth:
     - space-builder-node-api
   # WorkerApiInternal (audience space-node-api-internal): only the api's
   # substrate dials it, from the api and the cluster-controller
-  # (internal_client, substrate/mod.rs;
+  # (internal_client, substrate/node_api_client.rs;
   # substrate/kubernetes/pod_ops/worker_clients.rs).
   SPACE_NODE_API_INTERNAL_AUTH_ALLOWED_SERVICE_ACCOUNTS:
     - space-api
