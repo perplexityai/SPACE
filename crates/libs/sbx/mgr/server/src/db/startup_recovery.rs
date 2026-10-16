@@ -61,7 +61,7 @@ pub(crate) fn settle_startup_resident(
             | SandboxState::Resuming
             | SandboxState::Checkpointing
     ) {
-        return Err(rusqlite::Error::InvalidQuery);
+        return Err(Error::invalid_query());
     }
     let (target, reason, error) = match &settlement {
         StartupResidentSettlement::Started => (
@@ -212,7 +212,7 @@ pub fn recover_interrupted_startup_states(
         if row.state.is_transient() {
             let episode = match cleanup_episode(conn, &row.id) {
                 Ok(episode) => episode,
-                Err(error) if is_row_decode_error(&error) => {
+                Err(error) if is_row_decode_error(error.raw()) => {
                     tracing::warn!(sandbox_id = %row.id, error = %describe_error(&error), "retaining malformed startup cleanup ownership; operator repair required");
                     recovered.push(StartupRecoveryRecord {
                         id: row.id,
@@ -366,7 +366,7 @@ pub fn recover_interrupted_startup_states(
 #[derive(Debug, thiserror::Error)]
 pub enum RecoverStartupStatesError {
     #[error("startup state recovery database operation failed: {0}")]
-    Database(#[from] rusqlite::Error),
+    Database(#[from] Error),
     #[error("failed to hand interrupted activation to cleanup: {0}")]
     CleanupRequest(#[from] RequestCleanupEpisodeError),
     #[error("armed cleanup episode has unsupported activation state {0}")]

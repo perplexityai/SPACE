@@ -99,7 +99,7 @@ async fn teardown_reuses_ready_backup_but_waits_for_active_local_upload() {
                 .unwrap();
             if active_upload {
                 pplx_space_common_jobs::db::insert_job(
-                    &conn,
+                    conn.raw(),
                     pplx_space_common_jobs::db::InsertJob {
                         job_id: &JobId::new(),
                         kind: crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
@@ -159,10 +159,15 @@ async fn teardown_reuses_ready_backup_but_waits_for_active_local_upload() {
                 .unwrap();
             assert!(status.backup_completed);
             assert!(
-                pplx_space_common_jobs::db::list_jobs(&db, Some(&sandbox_id.to_string()), None, 0)
-                    .unwrap()
-                    .iter()
-                    .all(|job| job.kind != crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND)
+                pplx_space_common_jobs::db::list_jobs(
+                    db.raw(),
+                    Some(&sandbox_id.to_string()),
+                    None,
+                    0
+                )
+                .unwrap()
+                .iter()
+                .all(|job| job.kind != crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND)
             );
         }
     }

@@ -186,7 +186,7 @@ pub enum StartupRecoveryError {
     #[error("sandbox database mutex is poisoned")]
     DatabaseMutexPoisoned,
     #[error("startup recovery database operation failed: {0}")]
-    Database(#[from] rusqlite::Error),
+    Database(#[from] crate::db::Error),
     #[error("failed to inspect interrupted suspend snapshot publication: {0}")]
     SuspendSnapshot(#[from] suspend_snapshot_publication::SuspendSnapshotPublicationError),
     #[error("failed to quarantine sandbox during startup recovery: {0}")]
@@ -1188,7 +1188,7 @@ impl SandboxManagerService {
 
     pub(super) fn startup_recovery_db(
         &self,
-    ) -> Result<MutexGuard<'_, rusqlite::Connection>, StartupRecoveryError> {
+    ) -> Result<crate::db::ConnectionGuard<'_>, StartupRecoveryError> {
         self.db_conn()
             .map_err(|_| StartupRecoveryError::DatabaseMutexPoisoned)
     }
@@ -1954,7 +1954,7 @@ impl SandboxManagerService {
     }
 
     pub(super) fn recover_required_cleanup_targets(
-        db: &Arc<Mutex<rusqlite::Connection>>,
+        db: &crate::db::SharedConnection,
         authority: CleanupRecoveryAuthority,
     ) -> Result<Vec<CleanupRecoveryTarget>, StartupRecoveryError> {
         let rows = {
@@ -1968,7 +1968,7 @@ impl SandboxManagerService {
     }
 
     fn recover_required_cleanup_targets_for_ids(
-        db: &Arc<Mutex<rusqlite::Connection>>,
+        db: &crate::db::SharedConnection,
         sandbox_ids: Vec<SandboxId>,
     ) -> Result<Vec<CleanupRecoveryTarget>, StartupRecoveryError> {
         let rows = {
@@ -2050,7 +2050,7 @@ impl SandboxManagerService {
     }
 
     fn recover_required_cleanup_targets_from_rows(
-        db: &Arc<Mutex<rusqlite::Connection>>,
+        db: &crate::db::SharedConnection,
         rows: Vec<crate::db::SandboxRow>,
         authority: CleanupRecoveryAuthority,
     ) -> Result<Vec<CleanupRecoveryTarget>, StartupRecoveryError> {

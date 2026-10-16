@@ -70,7 +70,7 @@ fn sqlite_timestamp(value: &str) -> Option<prost_types::Timestamp> {
 #[derive(Debug, thiserror::Error)]
 enum BuildQuarantineRecoveryObservationError {
     #[error("read quarantine recovery observation: {0}")]
-    Read(#[source] rusqlite::Error),
+    Read(#[source] crate::db::Error),
     #[error("invalid local quarantine id {value:?}: {source}")]
     LocalQuarantineId {
         value: String,

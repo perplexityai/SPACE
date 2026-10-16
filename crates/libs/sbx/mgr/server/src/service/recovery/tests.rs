@@ -59,7 +59,7 @@ fn restore_source(sandbox_id: &str) -> pplx_space_common_core::types::ExactStora
         .unwrap()
 }
 
-fn insert_suspended_test_sandbox(conn: &rusqlite::Connection, id: &str) {
+fn insert_suspended_test_sandbox(conn: &crate::db::Connection, id: &str) {
     let sandbox_id = SandboxId::from_str(id).unwrap();
     let uuid8 = SandboxRuntimeLabel::from_sandbox_id(sandbox_id);
     let user = SandboxOwner::parse("user").unwrap();
@@ -175,7 +175,7 @@ fn cross_node_restore_row_lifecycle_stays_restoring_until_rootfs_stage_succeeds(
     let persisted_storage_uri = conn
         .query_row(
             "SELECT restore_storage_uri FROM sandboxes WHERE id = ?1",
-            rusqlite::params![sandbox_id],
+            crate::db::fixture::params![sandbox_id],
             |row| row.get::<_, Option<String>>(0),
         )
         .unwrap();
@@ -394,7 +394,7 @@ fn orphan_restore_terminal_outcomes_are_reported_distinctly() {
         // storage while this node's SQLite is the thing refusing writes.
         (
             crate::snapshot_restore::RestoreError::RenewQuarantineRecoveryClaim {
-                source: rusqlite::Error::QueryReturnedNoRows,
+                source: crate::db::Error::no_rows(),
             },
             crate::db::QuarantineRecoveryNoProgressReason::ClaimRenewalFailed,
         ),
@@ -465,7 +465,7 @@ fn a_lost_claim_is_reported_without_a_durable_retry_write() {
 // changed lines in this file was 11%.
 // ---------------------------------------------------------------------------
 
-fn recovery_test_service(conn: rusqlite::Connection) -> SandboxManagerService {
+fn recovery_test_service(conn: crate::db::Connection) -> SandboxManagerService {
     crate::service::tests::service_tests::service_with_runtime_probe(conn, false)
 }
 
@@ -483,7 +483,7 @@ fn retry_state(service: &SandboxManagerService, sandbox_id: SandboxId) -> (i64, 
     let db = service.db.lock().unwrap();
     db.query_row(
         "SELECT attempt_count, last_error FROM sandbox_quarantine_state WHERE sandbox_id = ?1",
-        rusqlite::params![sandbox_id.to_string()],
+        crate::db::fixture::params![sandbox_id.to_string()],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )
     .unwrap()
@@ -751,7 +751,7 @@ async fn an_orphan_restore_runs_outside_the_inventory_pass_under_the_node_wide_b
                 SET claim_expires_at = 0,
                     next_action_after = 0
               WHERE sandbox_id = ?1",
-            rusqlite::params![sandbox_id.to_string()],
+            crate::db::fixture::params![sandbox_id.to_string()],
         )
         .unwrap();
     }
@@ -795,12 +795,12 @@ async fn background_dispatch_defers_a_second_orphan_while_the_first_holds_capaci
     let second_id = crate::db::tests::setup_quarantine_recovery_episode(&conn, reason_code);
     conn.execute(
         "UPDATE sandbox_quarantine_state SET entered_at = '1' WHERE sandbox_id = ?1",
-        rusqlite::params![first_id.to_string()],
+        crate::db::fixture::params![first_id.to_string()],
     )
     .unwrap();
     conn.execute(
         "UPDATE sandbox_quarantine_state SET entered_at = '2' WHERE sandbox_id = ?1",
-        rusqlite::params![second_id.to_string()],
+        crate::db::fixture::params![second_id.to_string()],
     )
     .unwrap();
     let service = recovery_test_service(conn);
@@ -924,7 +924,7 @@ async fn the_dispatch_path_supervises_the_task_it_spawns() {
     }
     conn.execute(
         "UPDATE sandbox_quarantine_state SET next_action_after = NULL WHERE sandbox_id = ?1",
-        rusqlite::params![sandbox_id.to_string()],
+        crate::db::fixture::params![sandbox_id.to_string()],
     )
     .unwrap();
     let service = bound_test_service(conn);
@@ -1019,7 +1019,7 @@ async fn the_dispatch_path_supervises_the_task_it_spawns() {
             "UPDATE sandbox_quarantine_state
                 SET claim_expires_at = '1', next_action_after = NULL
               WHERE sandbox_id = ?1",
-            rusqlite::params![sandbox_id.to_string()],
+            crate::db::fixture::params![sandbox_id.to_string()],
         )
         .unwrap();
     service
@@ -1253,13 +1253,13 @@ async fn capacity_deferred_orphans_do_not_consume_attempts_or_admission_budget()
     for sandbox_id in &orphan_ids {
         conn.execute(
             "UPDATE sandbox_quarantine_state SET entered_at = '1' WHERE sandbox_id = ?1",
-            rusqlite::params![sandbox_id.to_string()],
+            crate::db::fixture::params![sandbox_id.to_string()],
         )
         .unwrap();
     }
     conn.execute(
         "UPDATE sandbox_quarantine_state SET entered_at = '2' WHERE sandbox_id = ?1",
-        rusqlite::params![artifact_id.to_string()],
+        crate::db::fixture::params![artifact_id.to_string()],
     )
     .unwrap();
     let service = recovery_test_service(conn);
@@ -1336,7 +1336,7 @@ async fn capacity_released_mid_pass_does_not_leapfrog_an_older_orphan() {
     ] {
         conn.execute(
             "UPDATE sandbox_quarantine_state SET entered_at = ?1 WHERE sandbox_id = ?2",
-            rusqlite::params![entered_at, sandbox_id.to_string()],
+            crate::db::fixture::params![entered_at, sandbox_id.to_string()],
         )
         .unwrap();
     }
@@ -1471,7 +1471,7 @@ async fn a_candidate_that_stops_being_admissible_is_reported_without_a_write() {
     // ordering that reaches the acquire CAS. Inserting it before the pass — as this
     // test used to — excludes the row from the scan instead, so the pass never claims
     // anything and every assertion below holds because nothing ran.
-    let db_for_probe = std::sync::Arc::clone(&service.db);
+    let db_for_probe = service.db.clone();
     let probe = move |window: crate::service::recovery::RecoveryPassWindow| {
         if window != crate::service::recovery::RecoveryPassWindow::Scanned {
             return;
@@ -1482,7 +1482,7 @@ async fn a_candidate_that_stops_being_admissible_is_reported_without_a_write() {
                  sandbox_id, cleanup_id, completion, keep_filesystem, phase,
                  activation_state, created_at
              ) VALUES (?1, ?2, 'mark_suspended', TRUE, 'armed', 'restoring', 0)",
-            rusqlite::params![
+            crate::db::fixture::params![
                 sandbox_id.to_string(),
                 pplx_space_common_core::types::SandboxCleanupEpisodeId::new().to_string()
             ],
@@ -1737,7 +1737,7 @@ async fn a_validated_artifact_is_adopted_into_durable_cleanup() {
         let state: String = db
             .query_row(
                 "SELECT state FROM sandboxes WHERE id = ?1",
-                rusqlite::params![sandbox_id.to_string()],
+                crate::db::fixture::params![sandbox_id.to_string()],
                 |row| row.get(0),
             )
             .unwrap();
@@ -1760,7 +1760,7 @@ async fn a_validated_artifact_is_adopted_into_durable_cleanup() {
             .query_row(
                 "SELECT claim_token, claim_expires_at FROM sandbox_quarantine_state
                   WHERE sandbox_id = ?1",
-                rusqlite::params![sandbox_id.to_string()],
+                crate::db::fixture::params![sandbox_id.to_string()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
@@ -1772,7 +1772,7 @@ async fn a_validated_artifact_is_adopted_into_durable_cleanup() {
         let queued: i64 = db
             .query_row(
                 "SELECT COUNT(*) FROM node_dirty_refs WHERE element_value = ?1",
-                rusqlite::params![sandbox_id.to_string()],
+                crate::db::fixture::params![sandbox_id.to_string()],
                 |row| row.get(0),
             )
             .unwrap();
@@ -2177,7 +2177,7 @@ async fn a_stale_claim_reaches_the_sandbox_event_timeline() {
     // Another claimant takes the episode, so this claim's write will miss.
     conn.execute(
         "UPDATE sandbox_quarantine_state SET claim_token = ?1 WHERE sandbox_id = ?2",
-        rusqlite::params![uuid::Uuid::now_v7().to_string(), sandbox_id.to_string()],
+        crate::db::fixture::params![uuid::Uuid::now_v7().to_string(), sandbox_id.to_string()],
     )
     .unwrap();
 
@@ -2238,7 +2238,7 @@ impl PassAdversary {
         Self::BumpAttemptCount,
     ];
 
-    fn apply(self, conn: &rusqlite::Connection, sandbox_id: SandboxId, token: uuid::Uuid) {
+    fn apply(self, conn: &crate::db::Connection, sandbox_id: SandboxId, token: uuid::Uuid) {
         let id = sandbox_id.to_string();
         match self {
             Self::RotateClaimToken => {
@@ -2247,7 +2247,7 @@ impl PassAdversary {
                         SET claim_token = ?1,
                             claim_expires_at = CAST(strftime('%s','now') AS INTEGER) + 900
                       WHERE sandbox_id = ?2",
-                    rusqlite::params![token.to_string(), id],
+                    crate::db::fixture::params![token.to_string(), id],
                 )
                 .unwrap();
             }
@@ -2257,7 +2257,7 @@ impl PassAdversary {
                          sandbox_id, cleanup_id, completion, keep_filesystem, phase,
                          activation_state, created_at
                      ) VALUES (?1, ?2, 'mark_suspended', TRUE, 'armed', 'restoring', 0)",
-                    rusqlite::params![
+                    crate::db::fixture::params![
                         id,
                         pplx_space_common_core::types::SandboxCleanupEpisodeId::new().to_string()
                     ],
@@ -2267,14 +2267,14 @@ impl PassAdversary {
             Self::LeaveActivatableState => {
                 conn.execute(
                     "UPDATE sandboxes SET state = 'started' WHERE id = ?1",
-                    rusqlite::params![id],
+                    crate::db::fixture::params![id],
                 )
                 .unwrap();
             }
             Self::DeleteQuarantineRow => {
                 conn.execute(
                     "DELETE FROM sandbox_quarantine_state WHERE sandbox_id = ?1",
-                    rusqlite::params![id],
+                    crate::db::fixture::params![id],
                 )
                 .unwrap();
             }
@@ -2283,7 +2283,7 @@ impl PassAdversary {
                     "UPDATE sandbox_quarantine_state
                         SET attempt_count = attempt_count + 7
                       WHERE sandbox_id = ?1",
-                    rusqlite::params![id],
+                    crate::db::fixture::params![id],
                 )
                 .unwrap();
             }
@@ -2440,7 +2440,7 @@ async fn no_interleaving_in_any_named_window_lets_the_pass_write_under_a_moved_f
                 };
 
                 let foreign_token = uuid::Uuid::now_v7();
-                let db_for_probe = std::sync::Arc::clone(&service.db);
+                let db_for_probe = service.db.clone();
                 let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let fired_for_probe = std::sync::Arc::clone(&fired);
                 // The row exactly as the adversary left it. Anything different at the
@@ -2489,7 +2489,7 @@ async fn no_interleaving_in_any_named_window_lets_the_pass_write_under_a_moved_f
                 let state: String = db
                     .query_row(
                         "SELECT state FROM sandboxes WHERE id = ?1",
-                        rusqlite::params![sandbox_id.to_string()],
+                        crate::db::fixture::params![sandbox_id.to_string()],
                         |row| row.get(0),
                     )
                     .unwrap();
@@ -2607,7 +2607,7 @@ struct QuarantineRow {
     failure_reason: Option<String>,
 }
 
-fn quarantine_row(conn: &rusqlite::Connection, sandbox_id: SandboxId) -> Option<QuarantineRow> {
+fn quarantine_row(conn: &crate::db::Connection, sandbox_id: SandboxId) -> Option<QuarantineRow> {
     conn.query_row(
         "SELECT qs.claim_token, qs.claim_expires_at, qs.attempt_count, qs.next_action_after,
                 qs.last_error, qs.next_action_owner, s.space_api_route_execution_generation,
@@ -2615,7 +2615,7 @@ fn quarantine_row(conn: &rusqlite::Connection, sandbox_id: SandboxId) -> Option<
            FROM sandbox_quarantine_state AS qs
            JOIN sandboxes AS s ON s.id = qs.sandbox_id
           WHERE qs.sandbox_id = ?1",
-        rusqlite::params![sandbox_id.to_string()],
+        crate::db::fixture::params![sandbox_id.to_string()],
         |row| {
             Ok(QuarantineRow {
                 claim_token: row.get(0)?,
@@ -2641,11 +2641,11 @@ struct SandboxSideRow {
     failure_reason: Option<String>,
 }
 
-fn sandbox_side_row(conn: &rusqlite::Connection, sandbox_id: SandboxId) -> Option<SandboxSideRow> {
+fn sandbox_side_row(conn: &crate::db::Connection, sandbox_id: SandboxId) -> Option<SandboxSideRow> {
     conn.query_row(
         "SELECT state, space_api_route_execution_generation, failure_reason
            FROM sandboxes WHERE id = ?1",
-        rusqlite::params![sandbox_id.to_string()],
+        crate::db::fixture::params![sandbox_id.to_string()],
         |row| {
             Ok(SandboxSideRow {
                 state: row.get(0)?,
@@ -2695,7 +2695,7 @@ async fn the_interleaving_matrix_fixture_adopts_when_nobody_interferes() {
     let state: String = db
         .query_row(
             "SELECT state FROM sandboxes WHERE id = ?1",
-            rusqlite::params![sandbox_id.to_string()],
+            crate::db::fixture::params![sandbox_id.to_string()],
             |row| row.get(0),
         )
         .unwrap();
@@ -2997,7 +2997,10 @@ async fn the_cleanup_contention_release_reports_only_a_real_loss() {
         if supersede {
             conn.execute(
                 "UPDATE sandbox_quarantine_state SET claim_token = ?1 WHERE sandbox_id = ?2",
-                rusqlite::params![uuid::Uuid::now_v7().to_string(), sandbox_id.to_string()],
+                crate::db::fixture::params![
+                    uuid::Uuid::now_v7().to_string(),
+                    sandbox_id.to_string()
+                ],
             )
             .unwrap();
         }
@@ -3072,7 +3075,7 @@ async fn two_actors_in_two_windows_still_leave_every_fenced_write_missing() {
             let plan = plan_for(Some(artifact_id), reason_code);
 
             let foreign_token = uuid::Uuid::now_v7();
-            let db_for_probe = std::sync::Arc::clone(&service.db);
+            let db_for_probe = service.db.clone();
             // Whatever the most recent actor left behind. Every fenced write from the
             // first move onwards has to miss, so this is what the row must still be.
             let latest: std::sync::Arc<std::sync::Mutex<Option<QuarantineRow>>> =
@@ -3127,7 +3130,7 @@ async fn two_actors_in_two_windows_still_leave_every_fenced_write_missing() {
             let state: String = db
                 .query_row(
                     "SELECT state FROM sandboxes WHERE id = ?1",
-                    rusqlite::params![sandbox_id.to_string()],
+                    crate::db::fixture::params![sandbox_id.to_string()],
                     |row| row.get(0),
                 )
                 .unwrap();
@@ -3215,7 +3218,7 @@ async fn a_claim_lost_during_the_orphan_restore_is_not_written_up() {
     let plan = plan_for(None, reason_code);
 
     let foreign_token = uuid::Uuid::now_v7();
-    let db_for_probe = std::sync::Arc::clone(&service.db);
+    let db_for_probe = service.db.clone();
     let after_rotation: std::sync::Arc<std::sync::Mutex<Option<QuarantineRow>>> =
         std::sync::Arc::new(std::sync::Mutex::new(None));
     let slot = std::sync::Arc::clone(&after_rotation);
@@ -3274,7 +3277,7 @@ async fn closed_capacity_is_read_off_the_semaphore_not_the_walk() {
         "UPDATE sandbox_quarantine_state
             SET entered_at = (SELECT MAX(entered_at) + 60 FROM sandbox_quarantine_state)
           WHERE sandbox_id = ?1",
-        rusqlite::params![orphan_id.to_string()],
+        crate::db::fixture::params![orphan_id.to_string()],
     )
     .unwrap();
     let service = recovery_test_service(conn);
@@ -3335,12 +3338,12 @@ async fn closed_capacity_is_read_off_the_semaphore_not_the_walk() {
     );
 }
 
-fn insert_quarantined_orphan(conn: &rusqlite::Connection, sandbox_id: &str) {
+fn insert_quarantined_orphan(conn: &crate::db::Connection, sandbox_id: &str) {
     insert_suspended_test_sandbox(conn, sandbox_id);
     conn.execute(
         "UPDATE sandboxes SET template = ?1, template_hash = NULL, user = ?2,
          pool_template = NULL, process_env_json = '{}' WHERE id = ?3",
-        rusqlite::params![
+        crate::db::fixture::params![
             pplx_space_common_core::types::ORPHANED_SANDBOX_TEMPLATE,
             pplx_space_common_core::types::ORPHANED_SANDBOX_OWNER.as_str(),
             sandbox_id
@@ -3392,7 +3395,7 @@ fn cross_node_restore_leaves_failed_synthetic_orphan_untouched() {
 // ---------------------------------------------------------------------------
 
 fn discover_cleanup_targets(
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     authority: CleanupRecoveryAuthority,
 ) -> Vec<CleanupRecoveryTarget> {
     SandboxManagerService::recover_required_cleanup_targets(db, authority).unwrap()
@@ -3423,7 +3426,7 @@ fn startup_requests_interrupted_activation_cleanup_with_the_activation_reason() 
         let episode = crate::db::begin_activation(&conn, &id, entered_from, kind, None, None)
             .unwrap()
             .expect("activation arms a cleanup episode");
-        let db = Arc::new(Mutex::new(conn));
+        let db = crate::db::SharedConnection::new(conn);
 
         let targets = discover_cleanup_targets(&db, CleanupRecoveryAuthority::Startup);
 
@@ -3472,7 +3475,7 @@ fn startup_retires_an_armed_cleanup_whose_row_left_the_activation_state() {
         [&id],
     )
     .unwrap();
-    let db = Arc::new(Mutex::new(conn));
+    let db = crate::db::SharedConnection::new(conn);
 
     assert!(discover_cleanup_targets(&db, CleanupRecoveryAuthority::Startup).is_empty());
 
@@ -3498,7 +3501,7 @@ fn startup_persists_the_inferred_cleanup_intent_of_an_interrupted_start() {
         [&id],
     )
     .unwrap();
-    let db = Arc::new(Mutex::new(conn));
+    let db = crate::db::SharedConnection::new(conn);
 
     let [target] = discover_cleanup_targets(&db, CleanupRecoveryAuthority::Startup)
         .try_into()
@@ -3544,7 +3547,7 @@ fn requested_cleanup_discovery_yields_to_an_intent_recorded_after_listing() {
     .unwrap();
     let listed = vec![crate::db::get_sandbox(&conn, &id).unwrap().unwrap()];
     crate::db::set_cleanup_intent(&conn, &id, true, CleanupCompletion::MarkStopped).unwrap();
-    let db = Arc::new(Mutex::new(conn));
+    let db = crate::db::SharedConnection::new(conn);
 
     let targets = SandboxManagerService::recover_required_cleanup_targets_from_rows(
         &db,
@@ -3586,7 +3589,7 @@ fn startup_cleanup_discovery_skips_rows_with_malformed_ids() {
         [sandbox_id.to_string()],
     )
     .unwrap();
-    let db = Arc::new(Mutex::new(conn));
+    let db = crate::db::SharedConnection::new(conn);
 
     let [target] = discover_cleanup_targets(&db, CleanupRecoveryAuthority::Startup)
         .try_into()
@@ -3708,7 +3711,7 @@ async fn pass_with_every_episode_due(
 }
 
 /// Every field explicit, so no fixture reads the host's node identity.
-fn bound_test_service(conn: rusqlite::Connection) -> SandboxManagerService {
+fn bound_test_service(conn: crate::db::Connection) -> SandboxManagerService {
     crate::service::tests::service_tests::service_with_runtime_probe(conn, false)
 }
 

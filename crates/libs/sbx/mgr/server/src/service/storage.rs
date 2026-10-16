@@ -35,7 +35,7 @@ impl SandboxManagerService {
 
     pub(super) async fn storage<T: Send + 'static>(
         &self,
-        operation: impl FnOnce(&rusqlite::Connection) -> Result<T, Status> + Send + 'static,
+        operation: impl FnOnce(&crate::db::Connection) -> Result<T, Status> + Send + 'static,
     ) -> Result<T, Status> {
         self.blocking_io(move |service| {
             let db = service.db_conn()?;

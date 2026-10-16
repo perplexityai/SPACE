@@ -31,7 +31,8 @@ mod worker;
 
 pub use worker::{
     BackgroundWorker, COMPLETED_JOB_RETENTION, DuplicatePolicy, FAILED_JOB_RETENTION, LeaseConfig,
-    PriorityBand, SubjectConcurrency, TERMINAL_JOB_PRUNE_INTERVAL, WorkerConfig,
+    PriorityBand, PruneTerminalJobsError, SubjectConcurrency, TERMINAL_JOB_PRUNE_INTERVAL,
+    WorkerConfig,
 };
 
 /// Caller-selected scheduling priority. Higher values run first within a job kind.

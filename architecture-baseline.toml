@@ -76,16 +76,16 @@
 "crates/libs/object-store/src/lib.rs" = 1810
 "crates/libs/observability/src/lib.rs" = 1063
 "crates/libs/public/api/src/lib.rs" = 1793
-"crates/libs/sbx/mgr/server/src/db/auto_lifecycle_delete_receipts.rs" = 1158
-"crates/libs/sbx/mgr/server/src/db/cleanup_episodes.rs" = 1831
+"crates/libs/sbx/mgr/server/src/db/auto_lifecycle_delete_receipts.rs" = 1149
+"crates/libs/sbx/mgr/server/src/db/cleanup_episodes.rs" = 1825
 "crates/libs/sbx/mgr/server/src/db/quarantine_recovery.rs" = 1042
-"crates/libs/sbx/mgr/server/src/db/sandboxes.rs" = 1547
-"crates/libs/sbx/mgr/server/src/db/state_transitions.rs" = 1016
-"crates/libs/sbx/mgr/server/src/run.rs" = 1101
+"crates/libs/sbx/mgr/server/src/db/sandboxes.rs" = 1541
+"crates/libs/sbx/mgr/server/src/db/state_transitions.rs" = 1012
+"crates/libs/sbx/mgr/server/src/run.rs" = 1091
 "crates/libs/sbx/mgr/server/src/sandbox_eviction.rs" = 1170
 "crates/libs/sbx/mgr/server/src/service/activation_support.rs" = 1574
-"crates/libs/sbx/mgr/server/src/service/auth_lookup.rs" = 1221
-"crates/libs/sbx/mgr/server/src/service/cache_cleanup.rs" = 1455
+"crates/libs/sbx/mgr/server/src/service/auth_lookup.rs" = 1220
+"crates/libs/sbx/mgr/server/src/service/cache_cleanup.rs" = 1452
 "crates/libs/sbx/mgr/server/src/service/cleanup.rs" = 2704
 "crates/libs/sbx/mgr/server/src/service/create.rs" = 1195
 "crates/libs/sbx/mgr/server/src/service/grpc_core.rs" = 1087
@@ -138,50 +138,14 @@
 "crates/libs/template/mgr/src/service.rs" = 3
 "crates/libs/vol/mgr/server/src/staging.rs" = 2
 
-# sbx-mgr code outside its SQLite store that still names rusqlite types, the
-# shared SQLite helpers or the shared job store, or opens a transaction itself.
+# sbx-mgr code outside its SQLite store uses only the store's own handle,
+# transaction and error types, so no file is listed.
 [pattern_ratchet.sbxmgr_sqlite]
-"crates/libs/sbx/mgr/server/src/lifecycle_metrics.rs" = 1
-"crates/libs/sbx/mgr/server/src/local_artifacts.rs" = 28
-"crates/libs/sbx/mgr/server/src/node_state_sync.rs" = 1
-"crates/libs/sbx/mgr/server/src/route_activation_claims.rs" = 2
-"crates/libs/sbx/mgr/server/src/run.rs" = 6
-"crates/libs/sbx/mgr/server/src/runtime_reconciliation.rs" = 1
-"crates/libs/sbx/mgr/server/src/sandbox_eviction.rs" = 5
-"crates/libs/sbx/mgr/server/src/service/activation_support.rs" = 9
-"crates/libs/sbx/mgr/server/src/service/auth_lookup.rs" = 5
-"crates/libs/sbx/mgr/server/src/service/cache_cleanup.rs" = 12
-"crates/libs/sbx/mgr/server/src/service/cleanup.rs" = 15
-"crates/libs/sbx/mgr/server/src/service/cleanup_executor.rs" = 7
-"crates/libs/sbx/mgr/server/src/service/cleanup_support.rs" = 7
-"crates/libs/sbx/mgr/server/src/service/cleanup_targets.rs" = 1
-"crates/libs/sbx/mgr/server/src/service/create_support.rs" = 5
-"crates/libs/sbx/mgr/server/src/service/grpc_lifecycle/pause_resume.rs" = 2
-"crates/libs/sbx/mgr/server/src/service/grpc_lifecycle/teardown_suspend.rs" = 2
-"crates/libs/sbx/mgr/server/src/service/grpc_pool_wait_clone.rs" = 1
-"crates/libs/sbx/mgr/server/src/service/grpc_spaced_process_snapshots/rollback_state.rs" = 1
-"crates/libs/sbx/mgr/server/src/service/grpc_state_snapshot.rs" = 1
-"crates/libs/sbx/mgr/server/src/service/mod.rs" = 13
-"crates/libs/sbx/mgr/server/src/service/network_runtime.rs" = 5
-"crates/libs/sbx/mgr/server/src/service/recovery.rs" = 5
-"crates/libs/sbx/mgr/server/src/service/recovery_cross_node.rs" = 12
-"crates/libs/sbx/mgr/server/src/service/start_support.rs" = 1
-"crates/libs/sbx/mgr/server/src/service/startup_resident.rs" = 1
-"crates/libs/sbx/mgr/server/src/service/storage.rs" = 1
-"crates/libs/sbx/mgr/server/src/service/template_snapshot_support.rs" = 3
-"crates/libs/sbx/mgr/server/src/service/test_options.rs" = 1
-"crates/libs/sbx/mgr/server/src/snapshot_gc.rs" = 1
-"crates/libs/sbx/mgr/server/src/snapshot_restore.rs" = 5
-"crates/libs/sbx/mgr/server/src/snapshot_scheduler.rs" = 3
-"crates/libs/sbx/mgr/server/src/snapshot_upload_jobs.rs" = 19
-"crates/libs/sbx/mgr/server/src/watchdog.rs" = 21
 
 # Code outside the store that still names sbx-mgr's migrations or database
-# path: its open and migration in `run.rs`, and the migrator, until it calls
-# the store.
+# path: the database migrator, until it calls the store.
 [pattern_ratchet.sbxmgr_sqlite_schema]
 "crates/libs/db/migrator/src/lib.rs" = 5
-"crates/libs/sbx/mgr/server/src/run.rs" = 3
 
 # [crate_names] maps each workspace package with a catch-all name (a part such
 # as `common`, `utils` or `core`) to its member path. Only remove entries: a pull

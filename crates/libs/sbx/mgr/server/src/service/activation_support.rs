@@ -397,7 +397,7 @@ impl SandboxManagerService {
                         }
                         Some(provenance)
                     }
-                    Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                    Err(error) if error.is_no_rows() => None,
                     Err(error) => {
                         return Err(Status::internal(format!("db error: {error}")));
                     }
@@ -449,7 +449,7 @@ impl SandboxManagerService {
             let db = self.db_conn()?;
             match crate::db::activation_route_provenance(&db, sandbox_id) {
                 Ok(provenance) => provenance,
-                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                Err(error) if error.is_no_rows() => {
                     return Err(
                         pplx_space_sbx_mgr_client::authoritative_route_identity_required_status(
                             "identity-free activation has no local route provenance; supply an authoritative route identity",
@@ -981,7 +981,7 @@ fn activation_env_matches(
 }
 
 pub(super) async fn configure_process_env_for_activation(
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     sandbox_id: &str,
     process_env: &BTreeMap<String, String>,
     phase: &'static str,
@@ -1096,7 +1096,7 @@ fn activation_completion_lost_status(activation_state: SandboxState) -> Status {
 }
 
 fn activation_failure_status_if_current(
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     sandbox_id: &str,
     activation_state: SandboxState,
     cleanup_id: Option<SandboxCleanupEpisodeId>,
@@ -1142,7 +1142,7 @@ pub(super) fn evaluate_start_gate(
 }
 
 pub(super) async fn wait_ready_and_mark_started(
-    db: Arc<Mutex<rusqlite::Connection>>,
+    db: crate::db::SharedConnection,
     sandbox_id: &str,
     process_env: &BTreeMap<String, String>,
     ready_timeout_secs: u32,
@@ -1184,7 +1184,7 @@ struct StartReadiness<G, P> {
 }
 
 async fn complete_start_after_readiness<G, P>(
-    db: Arc<Mutex<rusqlite::Connection>>,
+    db: crate::db::SharedConnection,
     sandbox_id: &str,
     process_env: &BTreeMap<String, String>,
     ready_timeout_secs: u32,
@@ -1395,7 +1395,7 @@ fn emit_guest_observed_specs(
 /// 30s readiness budget followed by the existing 60s network budget. A paused
 /// restore cannot answer guest RPCs; its guest check runs on resident resume.
 pub(super) async fn complete_restore_and_mark_final(
-    db: Arc<Mutex<rusqlite::Connection>>,
+    db: crate::db::SharedConnection,
     sandbox_id: &str,
     process_env: &BTreeMap<String, String>,
     final_state: SandboxState,
@@ -1460,7 +1460,7 @@ pub(super) async fn complete_restore_and_mark_final(
 }
 
 async fn mark_restore_after_network_ready(
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     sandbox_id: &str,
     final_state: SandboxState,
     cleanup_id: Option<SandboxCleanupEpisodeId>,
@@ -1574,7 +1574,7 @@ pub(super) struct StartStateTransition {
 
 pub(super) fn spawn_wait_ready_state_transition(
     service: &SandboxManagerService,
-    db: Arc<Mutex<rusqlite::Connection>>,
+    db: crate::db::SharedConnection,
     transition: StartStateTransition,
     cleanup_guard: ActivationCleanupGuard,
 ) -> Result<(), Status> {
@@ -1632,7 +1632,7 @@ pub(super) fn spawn_restore_state_transition(
     mut cleanup_guard: ActivationCleanupGuard,
     cleanup_id: SandboxCleanupEpisodeId,
 ) -> Result<(), Status> {
-    let db = Arc::clone(&service.db);
+    let db = service.db.clone();
     let node_manager = service.node_manager.clone();
     let span_sandbox_id = sandbox_id.clone();
     service.spawn_detached_state_writer("RestoreFinalizer", &span_sandbox_id, async move {

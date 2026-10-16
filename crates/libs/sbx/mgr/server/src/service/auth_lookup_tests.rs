@@ -70,7 +70,7 @@ fn fixture_with_claims(
     )
     .unwrap();
     let service = SandboxManagerService::new_with_options(
-        rusqlite::Connection::open_in_memory().unwrap(),
+        crate::db::Connection::open_in_memory(),
         SandboxManagerServiceOptions {
             route_ed25519_verification_bundle: Some(Arc::new(bundle)),
             ..SandboxManagerServiceOptions::for_test()

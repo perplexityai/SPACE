@@ -1,8 +1,8 @@
 //! Bounded local discovery. A batch is never a complete external inventory.
 
-use rusqlite::{Connection, Result};
+use crate::db::{Connection, Result};
 
-use super::{SandboxRow, describe_error, get_sandbox, is_row_decode_error};
+use super::{SandboxRow, describe_error, describe_raw_error, get_sandbox, is_row_decode_error};
 
 pub(crate) const INVENTORY_BATCH_SIZE: usize = 128;
 
@@ -57,15 +57,15 @@ impl SandboxInventoryScan {
             let id = match row.get::<_, String>(1) {
                 Ok(id) => id,
                 Err(error) if is_row_decode_error(&error) => {
-                    tracing::warn!(rowid, error = %describe_error(&error), "preserving undecodable inventory identity");
+                    tracing::warn!(rowid, error = %describe_raw_error(&error), "preserving undecodable inventory identity");
                     continue;
                 }
-                Err(error) => return Err(error),
+                Err(error) => return Err(crate::db::Error::from(error)),
             };
             match get_sandbox(conn, &id) {
                 Ok(Some(row)) => batch.push(row),
                 Ok(None) => {}
-                Err(error) if is_row_decode_error(&error) => {
+                Err(error) if is_row_decode_error(error.raw()) => {
                     tracing::warn!(sandbox_id = %id, error = %describe_error(&error), "preserving undecodable inventory row");
                 }
                 Err(error) => return Err(error),
@@ -136,9 +136,9 @@ impl RestoreTransferScopeScan {
             match decoded {
                 Ok(scope) => batch.push(scope),
                 Err(error) if is_row_decode_error(&error) => {
-                    tracing::warn!(rowid, error = %describe_error(&error), "preserving malformed orphan transfer scope");
+                    tracing::warn!(rowid, error = %describe_raw_error(&error), "preserving malformed orphan transfer scope");
                 }
-                Err(error) => return Err(error),
+                Err(error) => return Err(error.into()),
             }
             if batch.len() == 8 {
                 return Ok(batch);

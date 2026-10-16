@@ -98,7 +98,7 @@ fn interrupted_restore_persists_new_source_for_uri_less_retry() {
              restore_origin, restore_phase, restore_storage_uri
          ) VALUES (?1, 'sandbox1', 'restoring', 'seed', '1785456000', '1785456000',
                    'remote', 'metadata_staging', ?2)",
-        rusqlite::params![sandbox_id.to_string(), persisted.as_wire()],
+        crate::db::fixture::params![sandbox_id.to_string(), persisted.as_wire()],
     )
     .unwrap();
 
@@ -244,7 +244,7 @@ async fn exchanged_restore_cleanup_failure_retains_scope_until_retry() {
         )
         .unwrap()
     );
-    let db = std::sync::Arc::new(std::sync::Mutex::new(conn));
+    let db = crate::db::SharedConnection::new(conn);
 
     let failed = finalize_exchanged_restore_after_cleanup(
         &db,
@@ -741,12 +741,12 @@ fn restore_artifact_as_new_publishes_execution_metadata_for_cold_start() {
 /// lose the claim or fail against SQLite.
 struct RenewalStub {
     calls: std::sync::atomic::AtomicUsize,
-    verdict: Result<bool, rusqlite::Error>,
+    verdict: Result<bool, crate::db::Error>,
     fail_first: u32,
 }
 
 impl RenewalStub {
-    fn new(verdict: Result<bool, rusqlite::Error>) -> Self {
+    fn new(verdict: Result<bool, crate::db::Error>) -> Self {
         Self {
             calls: std::sync::atomic::AtomicUsize::new(0),
             verdict,
@@ -770,7 +770,7 @@ impl RenewalStub {
         if u32::try_from(call).unwrap_or(u32::MAX) < self.fail_first {
             return Err(
                 crate::snapshot_restore::RestoreError::RenewQuarantineRecoveryClaim {
-                    source: rusqlite::Error::QueryReturnedNoRows,
+                    source: crate::db::Error::no_rows(),
                 },
             );
         }
@@ -778,7 +778,7 @@ impl RenewalStub {
             Ok(renewed) => Ok(*renewed),
             Err(_) => Err(
                 crate::snapshot_restore::RestoreError::RenewQuarantineRecoveryClaim {
-                    source: rusqlite::Error::QueryReturnedNoRows,
+                    source: crate::db::Error::no_rows(),
                 },
             ),
         }
@@ -871,7 +871,7 @@ async fn claimed_operation_aborts_when_the_claim_is_lost() {
 #[tokio::test(start_paused = true)]
 async fn claimed_operation_propagates_a_failed_renewal_as_a_typed_error() {
     let sandbox_id = SandboxId::new();
-    let renewal = RenewalStub::new(Err(rusqlite::Error::QueryReturnedNoRows));
+    let renewal = RenewalStub::new(Err(crate::db::Error::no_rows()));
     let error = drive_under_quarantine_recovery_claim(
         async {
             std::future::pending::<()>().await;
@@ -1029,7 +1029,7 @@ fn a_superseded_recovery_claim_leaves_no_adopted_row() {
         "UPDATE sandbox_quarantine_state
             SET claim_token = ?1, claim_expires_at = ?2, next_action_after = NULL
           WHERE sandbox_id = ?3",
-        rusqlite::params![
+        crate::db::fixture::params![
             uuid::Uuid::now_v7().to_string(),
             (std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1145,11 +1145,11 @@ fn an_adoption_inside_the_claim_transaction_commits_the_row() {
 fn an_ordinary_cross_node_retry_takes_no_write_lock() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("sbxmgr.db");
-    let mut conn = rusqlite::Connection::open(&path).unwrap();
+    let mut conn = crate::db::Connection::open_at(&path).unwrap();
     crate::db::create_test_schema(&mut conn);
     conn.busy_timeout(std::time::Duration::ZERO).unwrap();
 
-    let blocker = rusqlite::Connection::open(&path).unwrap();
+    let blocker = crate::db::Connection::open_at(&path).unwrap();
     blocker.busy_timeout(std::time::Duration::ZERO).unwrap();
     blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
 
@@ -1301,7 +1301,7 @@ fn a_superseded_claim_cannot_persist_a_canonical_publication_failure() {
     .expect("claiming a fresh episode should succeed");
     conn.execute(
         "UPDATE sandboxes SET state = 'restoring' WHERE id = ?1",
-        rusqlite::params![sandbox_id.to_string()],
+        crate::db::fixture::params![sandbox_id.to_string()],
     )
     .unwrap();
 
@@ -1318,7 +1318,7 @@ fn a_superseded_claim_cannot_persist_a_canonical_publication_failure() {
     let owned: Option<String> = conn
         .query_row(
             "SELECT failure_reason FROM sandboxes WHERE id = ?1",
-            rusqlite::params![sandbox_id.to_string()],
+            crate::db::fixture::params![sandbox_id.to_string()],
             |row| row.get(0),
         )
         .unwrap();
@@ -1327,7 +1327,7 @@ fn a_superseded_claim_cannot_persist_a_canonical_publication_failure() {
     // The episode moves to another claimant while the transfer is still running.
     conn.execute(
         "UPDATE sandbox_quarantine_state SET claim_token = ?1 WHERE sandbox_id = ?2",
-        rusqlite::params![uuid::Uuid::now_v7().to_string(), sandbox_id.to_string()],
+        crate::db::fixture::params![uuid::Uuid::now_v7().to_string(), sandbox_id.to_string()],
     )
     .unwrap();
     // A different stage, so the two writes are distinguishable. With the same stage the
@@ -1352,7 +1352,7 @@ fn a_superseded_claim_cannot_persist_a_canonical_publication_failure() {
     let after: Option<String> = conn
         .query_row(
             "SELECT failure_reason FROM sandboxes WHERE id = ?1",
-            rusqlite::params![sandbox_id.to_string()],
+            crate::db::fixture::params![sandbox_id.to_string()],
             |row| row.get(0),
         )
         .unwrap();
@@ -1467,7 +1467,7 @@ const UNOWNED_STAGING_DIR: &str = "/space/cache/restore-staging/not-owned-by-thi
 
 /// Persist the row an interrupted remote restore leaves behind: `restoring`,
 /// remote origin, metadata staging, no runtime fields and no artifact.
-fn insert_interrupted_remote_restore(conn: &rusqlite::Connection) -> (String, ExactStorageUri) {
+fn insert_interrupted_remote_restore(conn: &crate::db::Connection) -> (String, ExactStorageUri) {
     let sandbox_id = SandboxId::new().to_string();
     let (mut meta, _) = disk_artifact_meta();
     meta.sandbox_id = sandbox_id.clone();
@@ -1499,10 +1499,10 @@ fn transfer_scope(
 /// Every persisted column of a `sandboxes` row, so "untouched" means the whole
 /// row and not only the fields a test thought to name.
 fn sandbox_columns(
-    conn: &rusqlite::Connection,
+    conn: &crate::db::Connection,
     sandbox_id: &str,
-) -> Option<Vec<rusqlite::types::Value>> {
-    use rusqlite::OptionalExtension as _;
+) -> Option<Vec<crate::db::fixture::Value>> {
+    use crate::db::OptionalExtension as _;
     conn.query_row(
         "SELECT * FROM sandboxes WHERE id = ?1",
         [sandbox_id],
@@ -1919,7 +1919,7 @@ async fn rowless_restore_keeps_a_superseded_scope_it_cannot_retire() {
 }
 
 fn claim_orphan_episode(
-    conn: &rusqlite::Connection,
+    conn: &crate::db::Connection,
 ) -> (SandboxId, crate::db::ClaimedQuarantineRecoveryCandidate) {
     let sandbox_id = crate::db::tests::setup_quarantine_recovery_episode(
         conn,
@@ -2074,7 +2074,7 @@ async fn orphan_restore_declines_a_row_that_now_holds_a_local_artifact() {
                 current_local_artifact_kind = 'full',
                 current_local_artifact_origin = 'suspend'
           WHERE id = ?2",
-        rusqlite::params![LocalArtifactId::new().to_string(), sandbox_id.to_string()],
+        crate::db::fixture::params![LocalArtifactId::new().to_string(), sandbox_id.to_string()],
     )
     .unwrap();
     let service = service_with_runtime_probe(conn, true);

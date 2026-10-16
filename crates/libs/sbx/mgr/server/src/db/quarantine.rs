@@ -43,7 +43,7 @@ pub struct RawSandboxStatePublicationMetadata {
 }
 
 pub type RawSandboxStatePublicationMetadataRead =
-    std::result::Result<RawSandboxStatePublicationMetadata, rusqlite::Error>;
+    std::result::Result<RawSandboxStatePublicationMetadata, Error>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SandboxStatePublicationMetadataField {
@@ -256,7 +256,7 @@ fn parse_published_quarantine_reason(value: String) -> PublishedQuarantineReason
 #[derive(Debug, thiserror::Error)]
 pub enum MarkQuarantinedError {
     #[error(transparent)]
-    Db(#[from] rusqlite::Error),
+    Db(#[from] Error),
     #[error("unknown current sandbox state '{state}'")]
     UnknownCurrentState { state: String },
     #[error("illegal transition into quarantined: {0}")]
@@ -307,7 +307,7 @@ fn insert_quarantine_history(
 /// episodes need an explicit owner outside automatic legacy recovery. Older
 /// binaries already exclude unknown owners from their recovery scans.
 pub(super) fn insert_operator_quarantine_episode(
-    conn: &rusqlite::Transaction<'_>,
+    conn: &Transaction<'_>,
     episode: &QuarantineEpisode<'_>,
 ) -> Result<()> {
     insert_new_quarantine_episode(conn, episode)?;
@@ -554,6 +554,7 @@ pub fn current_quarantine_reason_wire_value(conn: &Connection, id: &str) -> Resu
         Ok(value.to_string())
     })
     .transpose()
+    .map_err(Error::from)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -581,7 +582,7 @@ impl PauseFailedRecoveryTarget {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PauseFailedRecoveryError {
     #[error("pause-failed recovery database operation failed: {0}")]
-    Database(#[from] rusqlite::Error),
+    Database(#[from] Error),
     #[error("pause-failed sandbox state CAS affected {changed} rows for {sandbox_id}")]
     SandboxStateInvariant {
         sandbox_id: SandboxId,
@@ -761,7 +762,7 @@ pub fn sandbox_state_publication_metadata(
             }
             Ok(None) => {}
             Err(error) => {
-                publications.insert(sandbox_id.clone(), Err(error));
+                publications.insert(sandbox_id.clone(), Err(error.into()));
             }
         }
     }
@@ -819,7 +820,7 @@ fn mark_quarantined_inner(
     let starts_new_episode = previous_state.as_deref() != Some(SandboxState::Quarantined.as_str());
     let ts = now()?;
 
-    let tx = conn.unchecked_transaction()?;
+    let tx = Transaction::deferred(conn)?;
     let changed = tx.execute(
         "UPDATE sandboxes
          SET state = 'quarantined',

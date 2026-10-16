@@ -90,7 +90,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use rusqlite::Connection;
+use crate::db::Connection;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -505,7 +505,7 @@ fn query_candidates_after(
     idle_cutoff_epoch_secs: u64,
     cursor: Option<&CandidateCursor>,
     limit: usize,
-) -> rusqlite::Result<Vec<EvictionCandidate>> {
+) -> crate::db::Result<Vec<EvictionCandidate>> {
     let cursor_witness =
         cursor.map(|cursor| i64::try_from(cursor.idle_witness_secs).unwrap_or(i64::MAX));
     let cursor_sandbox_id = cursor.map(|cursor| cursor.sandbox_id.as_str());
@@ -538,7 +538,7 @@ pub(crate) fn list_candidates(
     idle_cutoff_epoch_secs: u64,
     cursor: Option<&CandidateCursor>,
     limit: usize,
-) -> rusqlite::Result<Vec<EvictionCandidate>> {
+) -> crate::db::Result<Vec<EvictionCandidate>> {
     let candidates = query_candidates_after(conn, idle_cutoff_epoch_secs, cursor, limit)?;
     if candidates.is_empty() && cursor.is_some() {
         return query_candidates_after(conn, idle_cutoff_epoch_secs, None, limit);
@@ -555,7 +555,7 @@ pub(crate) fn list_legacy_reupload_candidates(
     conn: &Connection,
     idle_cutoff_epoch_secs: u64,
     limit: usize,
-) -> rusqlite::Result<Vec<String>> {
+) -> crate::db::Result<Vec<String>> {
     crate::db::eviction_scan::legacy_reupload_candidates(conn, idle_cutoff_epoch_secs, limit)
 }
 
@@ -574,7 +574,7 @@ pub(crate) fn list_legacy_reupload_candidates(
 pub(crate) fn gather_local_evidence(
     conn: &Connection,
     sandbox_id: &str,
-) -> rusqlite::Result<Option<(LocalEvidence, u64)>> {
+) -> crate::db::Result<Option<(LocalEvidence, u64)>> {
     let row = crate::db::eviction_scan::artifact_pin_and_updated_at(conn, sandbox_id)?;
     let Some((pin, updated_at)) = row else {
         return Ok(None);

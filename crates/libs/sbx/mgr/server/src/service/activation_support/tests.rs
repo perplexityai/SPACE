@@ -76,7 +76,7 @@ async fn restore_completion_requires_gateway_readiness_only_when_starting() {
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Restoring);
         crate::db::set_pool_template(&conn, &sandbox_id, pool_template).unwrap();
-        let db = Arc::new(Mutex::new(conn));
+        let db = crate::db::SharedConnection::new(conn);
 
         // No gateway exists. A restored snapshot alone must not authorize
         // publishing Started, while a drain restore may remain Paused.
@@ -128,7 +128,7 @@ async fn restore_defers_guest_readiness_only_while_paused() {
         // Exclude the network gate: even a pool restore needs guest support
         // before Started. No guest exists to answer this synthetic sandbox.
         crate::db::set_pool_template(&conn, &id, Some("seed")).unwrap();
-        let db = Arc::new(Mutex::new(conn));
+        let db = crate::db::SharedConnection::new(conn);
         let result =
             complete_restore_and_mark_final(db.clone(), &id, &BTreeMap::new(), final_state, None)
                 .await;
@@ -173,7 +173,7 @@ async fn start_guest_failure_preserves_terminal_status_and_activation_ownership(
                 SandboxState::Starting
             },
         );
-        let db = Arc::new(Mutex::new(conn));
+        let db = crate::db::SharedConnection::new(conn);
         let status = complete_start_after_readiness(
             db.clone(),
             &id,
@@ -232,7 +232,7 @@ async fn restore_publication_waits_for_network_readiness_and_preserves_activatio
         )
         .unwrap()
         .unwrap();
-        let db = Arc::new(Mutex::new(conn));
+        let db = crate::db::SharedConnection::new(conn);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let completion = mark_restore_after_network_ready(
             &db,
@@ -528,7 +528,7 @@ fn locally_built_failures_stay_internal_even_when_terminal_shaped() {
 
 #[tokio::test]
 async fn restore_final_state_db_error_is_propagated() {
-    let db = Arc::new(Mutex::new(rusqlite::Connection::open_in_memory().unwrap()));
+    let db = crate::db::SharedConnection::new(crate::db::Connection::open_in_memory());
 
     let result = complete_restore_and_mark_final(
         db,
@@ -551,7 +551,7 @@ async fn restore_final_state_db_error_is_propagated() {
 #[tokio::test]
 async fn restore_final_state_requires_a_restoring_row() {
     let conn = crate::db::test_conn();
-    let db = Arc::new(Mutex::new(conn));
+    let db = crate::db::SharedConnection::new(conn);
 
     let result = complete_restore_and_mark_final(
         db,
@@ -586,7 +586,7 @@ async fn restore_finalizer_retains_cleanup_until_state_persistence_succeeds() {
             (conn, episode.id)
         } else {
             (
-                rusqlite::Connection::open_in_memory().unwrap(),
+                crate::db::Connection::open_in_memory(),
                 SandboxCleanupEpisodeId::new(),
             )
         };
@@ -717,7 +717,7 @@ async fn activation_env_failure_keeps_setup_context_for_callers_and_cleanup() {
         let cleanup_id = crate::db::cleanup_episode(&conn, &sandbox_id)
             .unwrap()
             .map(|episode| episode.id);
-        let db = Arc::new(Mutex::new(conn));
+        let db = crate::db::SharedConnection::new(conn);
         let (cleanup_tx, cleanup_rx) = std::sync::mpsc::channel();
         let mut cleanup = ActivationCleanupGuard::with_interruption_reason(
             SandboxRuntimeLabel::parse("runtime1").unwrap(),
@@ -865,7 +865,7 @@ async fn activation_env_rejects_requested_or_unowned_cleanup() {
             )
             .unwrap();
         }
-        let db = Arc::new(Mutex::new(conn));
+        let db = crate::db::SharedConnection::new(conn);
         for owner in [None, Some(SandboxCleanupEpisodeId::new()), Some(episode.id)] {
             if !requested && owner == Some(episode.id) {
                 continue; // The setup-context test covers the current owner.

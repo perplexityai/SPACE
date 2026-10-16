@@ -79,7 +79,7 @@ async fn selected_cleanup_rechecks_template_and_owner_after_acquiring_admission_
             insert_test_sandbox(&conn, &id.to_string(), SandboxState::Started);
             conn.execute(
                 "UPDATE sandboxes SET user = ?1 WHERE id = ?2",
-                rusqlite::params![
+                crate::db::fixture::params![
                     SandboxOwnerKind::TemplateManager
                         .reserved_owner_label()
                         .unwrap(),
@@ -260,7 +260,7 @@ fn runtime_probe_does_not_hold_database_mutex() {
     let conn = crate::db::test_conn();
     let id = SandboxId::new().to_string();
     insert_test_sandbox(&conn, &id, SandboxState::Started);
-    let db = Mutex::new(conn);
+    let db = crate::db::SharedConnection::new(conn);
     let cache = tempfile::tempdir().unwrap();
     let targets = resolve_lifecycle_target_blocking(
         &db,
@@ -360,7 +360,7 @@ async fn normalized_selectors_reach_fenced_stop_and_delete_completion() {
 #[test]
 fn exact_requests_use_indexed_lookups_including_disk_only_and_absent_targets() {
     static QUERIES: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    use rusqlite::trace::{TraceEvent, TraceEventCodes};
+    use crate::db::fixture::{TraceEvent, TraceEventCodes};
     fn trace(event: TraceEvent<'_>) {
         if let TraceEvent::Stmt(statement, _) = event {
             QUERIES
@@ -399,7 +399,7 @@ fn exact_requests_use_indexed_lookups_including_disk_only_and_absent_targets() {
             std::fs::create_dir(cache.path().join(&target)).unwrap();
         }
         conn.trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, Some(trace));
-        let db = Mutex::new(conn);
+        let db = crate::db::SharedConnection::new(conn);
         for selector in [&target, &target.to_uppercase(), &target.replace('-', "")] {
             let resolved = resolve_lifecycle_target_blocking(
                 &db,
@@ -413,7 +413,7 @@ fn exact_requests_use_indexed_lookups_including_disk_only_and_absent_targets() {
             .unwrap();
             assert_eq!(resolved.is_some(), metadata || disk);
         }
-        let conn = db.into_inner().unwrap();
+        let conn = db.lock().unwrap();
         conn.trace_v2(TraceEventCodes::empty(), None);
         for sql in QUERIES.lock().unwrap().drain(..) {
             let mut plan = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
@@ -441,7 +441,7 @@ fn exact_cleanup_rejects_target_metadata_damage_and_database_failure() {
             [&broken],
         )
         .unwrap();
-        let db = Mutex::new(conn);
+        let db = crate::db::SharedConnection::new(conn);
         let cache = tempfile::tempdir().unwrap();
         for running in [false, true] {
             let resolve = |id: &str| {
@@ -502,13 +502,13 @@ async fn a_stops_guest_flush_is_decided_from_the_state_it_supersedes() {
         let persisted = {
             let db = service.db_conn().unwrap();
             let job = pplx_space_common_jobs::db::find_active_job(
-                &db,
+                db.raw(),
                 cleanup_jobs::KIND,
                 &id.to_string(),
             )
             .unwrap()
             .expect("the stop's cleanup is persisted");
-            let payload = pplx_space_common_jobs::db::get_job(&db, &job)
+            let payload = pplx_space_common_jobs::db::get_job(db.raw(), &job)
                 .unwrap()
                 .unwrap()
                 .payload;

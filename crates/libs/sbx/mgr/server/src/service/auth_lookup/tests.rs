@@ -9,7 +9,7 @@ async fn gateway_identity_mapping_preserves_exact_pid_and_lifecycle_authority() 
             "INSERT INTO sandboxes (id,uuid8,state,template,user,runtime,created_at,updated_at)
              VALUES (?1,'gateway1','started','seed','deploy','fc','1','1')"
         ),
-        rusqlite::params![id],
+        crate::db::fixture::params![id],
     )
     .unwrap();
     let owner = 10_042;
@@ -63,10 +63,10 @@ fn connection_failure_rolls_back_only_the_admitted_resume() {
         conn.execute(
             "INSERT INTO sandboxes (id,uuid8,state,template,user,runtime,created_at,updated_at)
              VALUES (?1,'sandbox1',?2,'seed','deploy','fc','1','1')",
-            rusqlite::params![id, state.as_str()],
+            crate::db::fixture::params![id, state.as_str()],
         )
         .unwrap();
-        let db = Arc::new(Mutex::new(conn));
+        let db = crate::db::SharedConnection::new(conn);
         let error = resident_resume_connect_error(
             &db,
             &id,

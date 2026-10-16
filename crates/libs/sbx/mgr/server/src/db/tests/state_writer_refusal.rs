@@ -10,12 +10,13 @@ use std::collections::BTreeMap;
 
 use super::database_rows;
 
+use crate::db::Connection;
 use pplx_space_common_core::types::{
     ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, ExactStorageUri, ExecutionGeneration,
     LocalArtifactId, SandboxCleanupEpisodeId, SandboxId, SandboxOwner, SandboxQuarantineNextAction,
     SandboxQuarantineReasonCode, SandboxQuarantineSource, SandboxRuntimeLabel, TransferScopeId,
 };
-use rusqlite::{Connection, params};
+use rusqlite::params;
 
 use crate::db::{
     ActivationKind, CleanupCompletion, CleanupEpisode, CleanupEpisodeRequestOutcome,
@@ -50,9 +51,9 @@ fn assert_unchanged(conn: &Connection, before: &BTreeMap<String, Vec<String>>, c
     );
 }
 
-fn assert_no_rows(result: rusqlite::Result<()>, case: &str) {
+fn assert_no_rows(result: crate::db::Result<()>, case: &str) {
     assert!(
-        matches!(result, Err(rusqlite::Error::QueryReturnedNoRows)),
+        matches!(result, Err(ref error) if error.is_no_rows()),
         "{case}: expected the guarded write to refuse with QueryReturnedNoRows, got {result:?}"
     );
 }
@@ -585,9 +586,7 @@ fn activation_episode_rollback_requires_the_activation_state_and_its_armed_episo
     ));
     assert!(matches!(
         rollback_starting_episode(&conn, &starting, SandboxState::Failed, start_episode.id),
-        Err(RollbackActivationEpisodeError::Db(
-            rusqlite::Error::InvalidQuery
-        ))
+        Err(RollbackActivationEpisodeError::Db(ref error)) if error.is_invalid_query()
     ));
     assert_unchanged(&conn, &before, "rejected rollback target");
 
@@ -658,7 +657,7 @@ fn resident_resume_rollback_settles_only_a_resuming_row() {
         assert!(
             matches!(
                 restore_resident_resume_state(&conn, &resuming, target),
-                Err(rusqlite::Error::InvalidQuery)
+                Err(error) if error.is_invalid_query()
             ),
             "{target}"
         );
@@ -734,7 +733,7 @@ impl RestoredSuspendedPublication {
         conn: &Connection,
         id: &str,
         artifact: LocalArtifactId,
-    ) -> rusqlite::Result<()> {
+    ) -> crate::db::Result<()> {
         match self {
             Self::WithArtifact => {
                 publish_restored_suspended_artifact(conn, id, artifact, &snapshot_path(id))

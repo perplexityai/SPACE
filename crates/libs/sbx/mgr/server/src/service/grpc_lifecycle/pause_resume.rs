@@ -27,7 +27,7 @@ fn superseded(rejected: StateWriteRejected, edge: &Edge) -> bool {
 /// Roll a `pausing` row back to `started`, best effort. Returns the rejection
 /// when another operation moved the row out of `pausing`.
 fn roll_back_pause_best_effort(
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     sandbox_id: &str,
 ) -> Option<StateWriteRejected> {
     let edge = &edges::PAUSE_ROLLBACK;
@@ -125,7 +125,7 @@ async fn reconcile_state_after_unconfirmed_pause(
 pub(super) async fn pause_with_reconciliation(
     node_client: &mut NodeManagerGrpcClient,
     execution_fence: Option<pplx_space_node_mgr_client::proto::ExecutionFence>,
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     sandbox_id: &SandboxId,
     reason_context: &str,
     guest_preparation_budget: GuestSnapshotPreparationBudget,

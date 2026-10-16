@@ -339,7 +339,7 @@ async fn refresh_waits_for_delayed_readiness_but_bounds_pending_and_hung_request
     use super::super::tests::service_tests::insert_test_sandbox;
     use pplx_space_common_core::types::SandboxId;
     use pplx_space_net_gateway_client::proto::{NetworkState, RefreshNetworkPolicyResponse};
-    use std::sync::{Arc, Mutex};
+
     use std::time::Duration;
 
     for (ready_after_secs, request_delay_secs, matching_ref, expect_ready) in [
@@ -356,7 +356,7 @@ async fn refresh_waits_for_delayed_readiness_but_bounds_pending_and_hung_request
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Restoring);
-        let db = Arc::new(Mutex::new(conn));
+        let db = crate::db::SharedConnection::new(conn);
         let expected_ref = format!(
             "cluster:sandbox:{sandbox_id}:generation:1:sha256:{}",
             "a".repeat(64)
@@ -422,14 +422,14 @@ async fn refresh_rechecks_deletion_after_rpc_and_honors_a_shorter_caller_deadlin
     use super::super::tests::service_tests::insert_test_sandbox;
     use pplx_space_common_core::types::SandboxId;
     use pplx_space_net_gateway_client::proto::{NetworkState, RefreshNetworkPolicyResponse};
-    use std::sync::{Arc, Mutex};
+
     use std::time::Duration;
 
     for delete_during_rpc in [false, true] {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Restoring);
-        let db = Arc::new(Mutex::new(conn));
+        let db = crate::db::SharedConnection::new(conn);
         let started = tokio::time::Instant::now();
         let result = tokio::time::timeout(
             super::NETWORK_POLICY_SYNC_REFRESH_TIMEOUT,
@@ -467,7 +467,7 @@ async fn refresh_rechecks_deletion_after_rpc_and_honors_a_shorter_caller_deadlin
 #[tokio::test(start_paused = true)]
 async fn refresh_abandons_schedule_when_sandbox_row_is_gone() {
     let conn = crate::db::test_conn();
-    let db = std::sync::Arc::new(std::sync::Mutex::new(conn));
+    let db = crate::db::SharedConnection::new(conn);
 
     let started = tokio::time::Instant::now();
     let error = super::refresh_network_policy(
@@ -772,13 +772,13 @@ async fn unavailable_interception_dependencies_still_converge_the_start_gate() {
     use pplx_space_net_gateway_client::proto::{
         InterceptionReadiness, NetworkState, RefreshNetworkPolicyResponse,
     };
-    use std::sync::{Arc, Mutex};
+
     use std::time::Duration;
 
     let conn = crate::db::test_conn();
     let sandbox_id = SandboxId::new().to_string();
     insert_test_sandbox(&conn, &sandbox_id, SandboxState::Restoring);
-    let db = Arc::new(Mutex::new(conn));
+    let db = crate::db::SharedConnection::new(conn);
     let expected_ref = format!(
         "cluster:sandbox:{sandbox_id}:generation:1:sha256:{}",
         "a".repeat(64)

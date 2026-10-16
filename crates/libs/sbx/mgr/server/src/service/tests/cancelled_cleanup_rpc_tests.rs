@@ -79,13 +79,13 @@ async fn cancelled_cleanup_rpcs_preserve_admitted_termination_strength() {
         let (job_id, persisted_strength) = {
             let db = service.db.lock().unwrap();
             let job_id = pplx_space_common_jobs::db::find_active_job(
-                &db,
+                db.raw(),
                 crate::db::cleanup_jobs::KIND,
                 &id,
             )
             .unwrap()
             .unwrap();
-            let job = pplx_space_common_jobs::db::get_job(&db, &job_id)
+            let job = pplx_space_common_jobs::db::get_job(db.raw(), &job_id)
                 .unwrap()
                 .unwrap();
             (

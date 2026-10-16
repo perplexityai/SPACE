@@ -96,7 +96,7 @@ fn a_from_set_without_the_row_state_refuses_and_keeps_every_row() {
                                     assert_unchanged(&case, &before, &conn);
                                 }
                             }
-                            (None, Err(rusqlite::Error::InvalidQuery)) => {
+                            (None, Err(error)) if error.is_invalid_query() => {
                                 assert_unchanged(&case, &before, &conn);
                             }
                             (expected, result) => {
@@ -158,7 +158,7 @@ fn insert_and_rejected_target_edges_are_refused() {
         );
         let before = snapshot(&conn);
         match update_state_from(&conn, &id, edge) {
-            Err(rusqlite::Error::InvalidQuery) => assert_unchanged(&case, &before, &conn),
+            Err(error) if error.is_invalid_query() => assert_unchanged(&case, &before, &conn),
             other => panic!("{case}: expected InvalidQuery, got {other:?}"),
         }
     }
@@ -182,7 +182,8 @@ fn a_missed_write_from_a_source_state_is_an_invariant_error() {
     )
     .unwrap();
     let before = snapshot(&conn);
-    match update_state_from(&conn, &id, &edges::PAUSE_ROLLBACK) {
+    match update_state_from(&conn, &id, &edges::PAUSE_ROLLBACK).map_err(crate::db::Error::into_raw)
+    {
         Err(rusqlite::Error::StatementChangedRows(0)) => {}
         other => panic!("expected an invariant error, got {other:?}"),
     }
@@ -207,7 +208,9 @@ fn a_standalone_deletion_rolls_back_when_its_job_failure_does() {
     .unwrap();
     let before = snapshot(&conn);
     assert!(conn.is_autocommit());
-    match update_state_from(&conn, &id, &edges::DELETE_ADMISSION) {
+    match update_state_from(&conn, &id, &edges::DELETE_ADMISSION)
+        .map_err(crate::db::Error::into_raw)
+    {
         Err(rusqlite::Error::SqliteFailure(_, Some(message))) => {
             assert!(message.contains("job update refused"), "{message}");
         }

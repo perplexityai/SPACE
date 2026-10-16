@@ -44,20 +44,27 @@ pub(crate) fn finish(
     conn: &Connection,
     id: &JobId,
     outcome: &CleanupOutcome,
-) -> rusqlite::Result<bool> {
+) -> crate::db::Result<bool> {
     match outcome {
-        CleanupOutcome::Applied | CleanupOutcome::AlreadyApplied => jobs::complete_job(conn, id, 0),
+        CleanupOutcome::Applied | CleanupOutcome::AlreadyApplied => {
+            Ok(jobs::complete_job(conn.raw(), id, 0)?)
+        }
         CleanupOutcome::Superseded => {
-            jobs::request_job_cancellation(conn, id)?;
-            jobs::mark_job_cancelled(conn, id)
+            jobs::request_job_cancellation(conn.raw(), id)?;
+            Ok(jobs::mark_job_cancelled(conn.raw(), id)?)
         }
         CleanupOutcome::Quarantined(message) | CleanupOutcome::Blocked(message) => {
             let error = serde_json::to_string(&CleanupFailure {
                 code: 9, // gRPC FailedPrecondition; decoded at the service boundary.
                 message: message.clone(),
             })
-            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-            jobs::fail_running_job_permanent(conn, id, &error, None)
+            .map_err(Error::to_sql_conversion)?;
+            Ok(jobs::fail_running_job_permanent(
+                conn.raw(),
+                id,
+                &error,
+                None,
+            )?)
         }
     }
 }
@@ -66,11 +73,11 @@ pub(crate) fn finish_in_transaction(
     conn: &Connection,
     id: Option<&JobId>,
     outcome: &CleanupOutcome,
-) -> rusqlite::Result<()> {
+) -> crate::db::Result<()> {
     if let Some(id) = id
         && !finish(conn, id, outcome)?
     {
-        return Err(rusqlite::Error::QueryReturnedNoRows);
+        return Err(Error::no_rows());
     }
     Ok(())
 }
@@ -80,7 +87,7 @@ pub(crate) fn finish_in_transaction(
 pub(crate) fn eligibility(
     conn: &Connection,
     work: &CleanupWork,
-) -> rusqlite::Result<CleanupEligibility> {
+) -> crate::db::Result<CleanupEligibility> {
     let id = work.sandbox_id.to_string();
     let state = current_state_label(conn, &id)?;
     if state.is_none()
@@ -196,7 +203,7 @@ impl CleanupWork {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CleanupJobError {
     #[error("cleanup scheduling database: {0}")]
-    Database(#[from] rusqlite::Error),
+    Database(#[from] Error),
     #[error("cleanup scheduling payload: {0}")]
     Payload(#[from] serde_json::Error),
     #[error("unsupported cleanup scheduling version {0}")]
@@ -220,8 +227,10 @@ pub(crate) fn persist(
     mut work: CleanupWork,
 ) -> std::result::Result<JobId, CleanupJobError> {
     let subject = work.sandbox_id.to_string();
-    if let Some(id) = jobs::find_active_job(conn, KIND, &subject)? {
-        let existing = jobs::get_job(conn, &id)?.ok_or(CleanupJobError::Missing)?;
+    if let Some(id) = jobs::find_active_job(conn.raw(), KIND, &subject).map_err(Error::from)? {
+        let existing = jobs::get_job(conn.raw(), &id)
+            .map_err(Error::from)?
+            .ok_or(CleanupJobError::Missing)?;
         let previous = decode(&existing.payload)?;
         // A recovery hint has no new publication evidence. Keep evidence already
         // attached to this same execution and completion obligation.
@@ -237,21 +246,22 @@ pub(crate) fn persist(
             work.immediate_kill |= previous.immediate_kill;
             work.guest_flush = work.guest_flush.merge(previous.guest_flush);
             jobs::update_active_job_payload(
-                conn,
+                conn.raw(),
                 &id,
                 &serde_json::to_string(&work)?,
                 work.priority(),
-            )?;
+            )
+            .map_err(Error::from)?;
             return Ok(id);
         }
         // The domain fence excludes a mutating attempt. A dispatched attempt
         // still waiting for the fence rechecks status before touching resources.
-        jobs::request_job_cancellation(conn, &id)?;
-        jobs::mark_job_cancelled(conn, &id)?;
+        jobs::request_job_cancellation(conn.raw(), &id).map_err(Error::from)?;
+        jobs::mark_job_cancelled(conn.raw(), &id).map_err(Error::from)?;
     }
     let id = JobId::new();
     jobs::insert_job(
-        conn,
+        conn.raw(),
         jobs::InsertJob {
             job_id: &id,
             kind: KIND,
@@ -262,11 +272,12 @@ pub(crate) fn persist(
             traceparent: None,
             priority: work.priority(),
         },
-    )?;
+    )
+    .map_err(Error::from)?;
     Ok(id)
 }
 
-pub(crate) fn current(conn: &Connection, work: &CleanupWork) -> rusqlite::Result<bool> {
+pub(crate) fn current(conn: &Connection, work: &CleanupWork) -> crate::db::Result<bool> {
     let id = work.sandbox_id.to_string();
     if runtime_execution_generation(conn, &id)? != work.execution_generation {
         return Ok(false);
@@ -285,6 +296,55 @@ pub(crate) fn current(conn: &Connection, work: &CleanupWork) -> rusqlite::Result
     cleanup_intent_current(conn, &id, work.completion)
 }
 
+/// Requeue every running cleanup job: none survives a restart.
+pub(crate) fn reset_running(conn: &Connection) -> Result<usize> {
+    Ok(jobs::reset_running_kind(conn.raw(), KIND)?)
+}
+
+/// Requeue running cleanup jobs whose subject has no active attempt.
+pub(crate) fn reset_inactive_running(
+    conn: &Connection,
+    active_subjects: &[String],
+) -> Result<usize> {
+    Ok(jobs::reset_inactive_running_kind(
+        conn.raw(),
+        KIND,
+        active_subjects,
+    )?)
+}
+
+pub(crate) fn get_job(
+    conn: &Connection,
+    job_id: &JobId,
+) -> Result<Option<pplx_space_common_jobs::Job>> {
+    Ok(jobs::get_job(conn.raw(), job_id)?)
+}
+
+/// Claim a due job; `false` if another claimant won it.
+pub(crate) fn mark_running(conn: &Connection, job_id: &JobId) -> Result<bool> {
+    Ok(jobs::mark_job_running(conn.raw(), job_id)?)
+}
+
+/// Return a running job to the queue without spending an attempt.
+pub(crate) fn yield_running(conn: &Connection, job_id: &JobId) -> Result<bool> {
+    Ok(jobs::yield_running_job(conn.raw(), job_id)?)
+}
+
+/// Schedule a running job's retry after `delay_secs`.
+pub(crate) fn retry_running(
+    conn: &Connection,
+    job_id: &JobId,
+    error: &str,
+    delay_secs: u64,
+) -> Result<bool> {
+    Ok(jobs::retry_running_job(
+        conn.raw(),
+        job_id,
+        error,
+        delay_secs,
+    )?)
+}
+
 /// Indexed retry readiness. Fenced admission coalesces each sandbox to one active
 /// job, so exclusion costs at most the bounded number of active subjects.
 pub(crate) fn due_job_ids(
@@ -292,7 +352,7 @@ pub(crate) fn due_job_ids(
     priority: JobPriority,
     active_subjects: &[String],
     limit: usize,
-) -> rusqlite::Result<Vec<JobId>> {
+) -> crate::db::Result<Vec<JobId>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
@@ -311,7 +371,8 @@ pub(crate) fn due_job_ids(
         .query_map(params![KIND, priority.get(), excluded, limit], |row| {
             row.get(0)
         })?
-        .collect()
+        .collect::<rusqlite::Result<_>>()
+        .map_err(Error::from)
 }
 
 #[cfg(test)]

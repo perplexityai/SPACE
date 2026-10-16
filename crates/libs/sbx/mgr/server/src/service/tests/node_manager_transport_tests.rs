@@ -23,7 +23,7 @@ use pplx_space_node_mgr_client::proto::{
 
 /// A test service whose node-manager clients all come from `node_manager`.
 pub(crate) fn service_with_node_manager(
-    conn: rusqlite::Connection,
+    conn: crate::db::Connection,
     node_manager: NodeManagerConnector,
 ) -> SandboxManagerService {
     SandboxManagerService::new_with_options(

@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::{Arc, MutexGuard};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::Mutex;
@@ -33,7 +33,7 @@ use pplx_space_node_runtime_core::fc_api::FirecrackerVmState;
 
 const TICK_INTERVAL: Duration = Duration::from_secs(60);
 
-fn lock_db(ctx: &CheckpointContext) -> Result<MutexGuard<'_, rusqlite::Connection>, String> {
+fn lock_db(ctx: &CheckpointContext) -> Result<crate::db::ConnectionGuard<'_>, String> {
     ctx.db
         .lock()
         .map_err(|error| format!("database mutex poisoned: {error}"))
@@ -45,7 +45,7 @@ fn lock_db(ctx: &CheckpointContext) -> Result<MutexGuard<'_, rusqlite::Connectio
 /// `SandboxStateWriteNotApplied`, and a from-state refusal reports the state
 /// found; this module's
 /// errors are strings, so it cannot use the service's status mapping.
-fn begin_checkpoint_state(db: &rusqlite::Connection, sandbox_id: &str) -> Result<(), String> {
+fn begin_checkpoint_state(db: &crate::db::Connection, sandbox_id: &str) -> Result<(), String> {
     use crate::db::{SandboxStateWriteNotApplied, StateWriteOutcome, StateWriteRefusal};
     let edge = &crate::db::edges::CHECKPOINT_BEGIN;
     let not_applied = match crate::db::update_state_from(db, sandbox_id, edge)
@@ -248,7 +248,7 @@ impl CheckpointTier {
 
 /// Shared context for checkpoint operations.
 pub struct CheckpointContext {
-    pub db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+    pub db: crate::db::SharedConnection,
     pub auto_lifecycle: crate::auto_lifecycle::AutoLifecycleCoordinator,
     pub health_lifecycle: crate::watchdog::HealthLifecycleEpochs,
     pub node_manager: crate::node_manager_transport::NodeManagerConnector,
@@ -576,7 +576,7 @@ fn publish_named_artifact(
         sandbox_id,
         snapshot_name.as_str(),
     );
-    crate::local_artifacts::LocalArtifacts::new(std::sync::Arc::clone(&ctx.db))
+    crate::local_artifacts::LocalArtifacts::new(ctx.db.clone())
         .publish_named_snapshot(
             sandbox_id,
             local_artifact_id,

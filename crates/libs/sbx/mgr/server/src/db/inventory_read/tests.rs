@@ -21,7 +21,7 @@ fn state_metadata_batches_share_the_callers_budget() {
 
 #[test]
 fn raw_value_limit_precedes_decoding_and_rejects_whole_collection() {
-    let conn = Connection::open_in_memory().unwrap();
+    let conn = Connection::open_in_memory();
     let mut stmt = conn
         .prepare("SELECT 'valid' UNION ALL SELECT zeroblob(6)")
         .unwrap();
@@ -37,8 +37,8 @@ fn raw_value_limit_precedes_decoding_and_rejects_whole_collection() {
 #[test]
 fn unary_list_serves_the_complete_inventory_past_the_item_budget() {
     use crate::service::tests::service_tests::insert_test_sandbox;
-    let mut conn = crate::db::test_conn();
-    let tx = conn.transaction().unwrap();
+    let conn = crate::db::test_conn();
+    let tx = crate::db::Transaction::deferred(&conn).unwrap();
     for _ in 0..=MAX_ITEMS {
         insert_test_sandbox(
             &tx,

@@ -59,12 +59,11 @@
 use std::collections::HashSet;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use pplx_space_common_core::types::LocalArtifactId;
 use pplx_space_common_lru_reaper::{self as lru_reaper, EvictionInput};
-use rusqlite::Connection;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -366,7 +365,7 @@ fn execute_one(
 
 async fn gc_tick(
     artifacts: LocalArtifacts,
-    db: Arc<Mutex<Connection>>,
+    db: crate::db::SharedConnection,
     cfg: GcConfig,
     now: u64,
     disk: crate::disk_usage::DiskUsage,
@@ -384,7 +383,7 @@ async fn gc_tick(
     let need_to_free = disk.bytes_over_target(cfg.target_fraction);
     let idle_secs = cfg.idle.as_secs();
 
-    let db_for_snap = Arc::clone(&db);
+    let db_for_snap = db.clone();
     let mut next_scan = *scan;
     let (next_scan, page) = tokio::task::spawn_blocking(move || {
         let conn = crate::node_state_sync::connection_or_signal_failure(&db_for_snap)?;
@@ -776,7 +775,7 @@ fn gc_pending_is_unowned(artifacts: &LocalArtifacts, path: &Path) -> bool {
 /// `state = 'restoring'`.
 pub(crate) async fn run_loop(
     artifacts: LocalArtifacts,
-    db: Arc<Mutex<Connection>>,
+    db: crate::db::SharedConnection,
     active_fork_copy_operations: Arc<crate::service::fork_artifact::CopyOperationReservations>,
     cfg: GcConfig,
     ownership: GcOwnership,
@@ -847,7 +846,7 @@ pub(crate) async fn run_loop(
                 // or cancellation of this supervising future.
                 gc_tick(
                     artifacts.clone(),
-                    Arc::clone(&db),
+                    db.clone(),
                     cfg,
                     now_secs(),
                     disk,

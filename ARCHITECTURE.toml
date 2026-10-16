@@ -84,10 +84,12 @@ mode = "required"
 # connection or transaction, using the shared SQLite open and migration
 # helpers or the shared job store's SQL functions, binding parameters,
 # executing a statement, or writing an SQL statement literal outside the
-# store is a crossing. Other services' crates use rusqlite for their own
-# databases, so `paths` limits the rule to sbx-mgr's. Existing callers that
-# still name the connection, error and transaction types are baselined
-# until they use the store's own.
+# store is a crossing; callers use the store's own handle, transaction and
+# error types. Other services' crates use rusqlite for their own databases,
+# so `paths` limits the rule to sbx-mgr's. The patterns are a line-based
+# tripwire: aliases, wrapped imports and calls through names imported
+# earlier escape them, so they catch common crossings rather than prove
+# their absence.
 [rules.pattern_ratchet.sbxmgr_sqlite]
 patterns = [
   '\brusqlite\s*::',
@@ -112,9 +114,9 @@ allow = [
 [rules.pattern_ratchet.sbxmgr_sqlite.no_crossing]
 mode = "required"
 
-# Seeding the ratchet reports its initial entries against the base.
+# The baseline is empty: no file outside the store may be added to it.
 [rules.pattern_ratchet.sbxmgr_sqlite.no_new_entries]
-mode = "advisory"
+mode = "required"
 
 [rules.pattern_ratchet.sbxmgr_sqlite.no_raised_caps]
 mode = "required"

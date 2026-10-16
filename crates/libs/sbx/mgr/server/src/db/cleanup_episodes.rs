@@ -18,7 +18,7 @@ pub enum CompleteCleanupEpisodeError {
     #[error("row-deleting cleanup cannot complete as a resident state")]
     DeleteHasNoTargetState,
     #[error(transparent)]
-    Db(#[from] rusqlite::Error),
+    Db(#[from] Error),
     #[error("cleanup episode cannot restore suspended without a registered full suspend artifact")]
     MissingSuspendArtifact,
     #[error("cleanup episode sandbox row disappeared")]
@@ -32,7 +32,7 @@ pub enum CompleteCleanupEpisodeError {
 #[derive(Debug, thiserror::Error)]
 pub enum InsertSandboxWithCleanupEpisodeError {
     #[error(transparent)]
-    Db(#[from] rusqlite::Error),
+    Db(#[from] Error),
     #[error(
         "sandbox state {sandbox_state} does not match cleanup activation state {activation_state}"
     )]
@@ -45,7 +45,7 @@ pub enum InsertSandboxWithCleanupEpisodeError {
 #[derive(Debug, thiserror::Error)]
 pub enum RequestCleanupEpisodeError {
     #[error(transparent)]
-    Db(#[from] rusqlite::Error),
+    Db(#[from] Error),
     #[error("cleanup episode phase update affected {changed} rows instead of one")]
     PhaseUpdateInvariant { changed: usize },
 }
@@ -174,9 +174,7 @@ pub(crate) fn insert_sandbox_with_cleanup_episode_and_route_evidence(
     if let Some(route_evidence) = route_evidence {
         auto_lifecycle_delete_receipts::record_retained_route_evidence(
             &tx,
-            sandbox_id
-                .parse()
-                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?,
+            sandbox_id.parse().map_err(Error::to_sql_conversion)?,
             route_evidence,
         )?;
     }
@@ -633,7 +631,7 @@ enum QuarantineRecoveryMatch {
 }
 
 fn validate_cleanup_completion_artifact(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Transaction<'_>,
     sandbox_id: &str,
     episode: &CleanupEpisode,
 ) -> std::result::Result<(), CompleteCleanupEpisodeError> {
@@ -649,7 +647,7 @@ fn validate_cleanup_completion_artifact(
 }
 
 fn match_quarantine_recovery(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Transaction<'_>,
     sandbox_id: &str,
     cleanup_id: SandboxCleanupEpisodeId,
     episode: &CleanupEpisode,
@@ -755,7 +753,7 @@ fn transition_receipt_for_completion(
 }
 
 fn apply_cleanup_state(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Transaction<'_>,
     sandbox_id: &str,
     target_state: SandboxState,
     receipt: Option<SandboxTransitionReceipt<SandboxQuarantineReasonCode>>,
@@ -878,7 +876,7 @@ fn apply_cleanup_state(
 }
 
 fn complete_state_cleanup(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Transaction<'_>,
     sandbox_id: &str,
     cleanup_id: SandboxCleanupEpisodeId,
     episode: &CleanupEpisode,
@@ -924,7 +922,7 @@ fn complete_state_cleanup(
 }
 
 fn retire_quarantine_recovery(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Transaction<'_>,
     sandbox_id: &str,
     recovery: &QuarantineRecoveryCompletion,
 ) -> std::result::Result<(), CompleteCleanupEpisodeError> {
@@ -1111,7 +1109,7 @@ pub(crate) enum CompleteRowIntentCleanupError {
     #[error("row-deleting cleanup cannot complete as a resident state")]
     DeleteHasNoTargetState,
     #[error(transparent)]
-    Database(#[from] rusqlite::Error),
+    Database(#[from] Error),
     #[error(transparent)]
     ReceiptCompletion(#[from] auto_lifecycle_delete_receipts::CompletePendingReceiptError),
     #[error(
@@ -1226,15 +1224,11 @@ pub(crate) fn complete_row_intent_cleanup_for_job(
     job_id: Option<&JobId>,
 ) -> std::result::Result<CompleteRowIntentCleanupDisposition, CompleteRowIntentCleanupError> {
     if published_suspend_artifact.is_some() && completion != CleanupCompletion::MarkSuspended {
-        return Err(rusqlite::Error::InvalidQuery.into());
+        return Err(Error::invalid_query().into());
     }
     let tx = immediate_transaction(conn)?;
     let parsed_delete_sandbox_id = (completion.deletes_row())
-        .then(|| {
-            sandbox_id
-                .parse()
-                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
-        })
+        .then(|| sandbox_id.parse().map_err(Error::to_sql_conversion))
         .transpose()?;
     let pending_delete_receipt = parsed_delete_sandbox_id
         .map(|sandbox_id| {
@@ -1357,7 +1351,7 @@ pub(crate) fn complete_row_intent_cleanup_for_job(
         failure_reason,
         published_suspend_artifact,
     )? {
-        return Err(rusqlite::Error::QueryReturnedNoRows.into());
+        return Err(Error::no_rows().into());
     }
     if missing_suspend_artifact {
         let timestamp = now()?;
@@ -1899,13 +1893,13 @@ pub(crate) fn cleanup_recovery_page(
             next_cursor: None,
         });
     };
-    let tx = conn.unchecked_transaction()?;
+    let tx = Transaction::deferred(conn)?;
     let mut inventory = tx.prepare(sql!(
         "SELECT rowid FROM sandboxes WHERE rowid >= ?1 ORDER BY rowid LIMIT ?2"
     ))?;
     let range: Vec<i64> = inventory
         .query_map(params![first, sql_limit], |row| row.get(0))?
-        .collect::<Result<_>>()?;
+        .collect::<rusqlite::Result<_>>()?;
     let Some(&last) = range.last() else {
         return Ok(CleanupRecoveryPage {
             ids: Vec::new(),
@@ -1951,7 +1945,7 @@ pub(crate) fn cleanup_recovery_page(
     )?;
     let ids = statement
         .query_map(params![first, last], |row| row.get::<_, String>(0))?
-        .collect::<Result<_>>()?;
+        .collect::<rusqlite::Result<_>>()?;
     let next_cursor = (range.len() == limit).then_some(last);
     drop(statement);
     drop(inventory);

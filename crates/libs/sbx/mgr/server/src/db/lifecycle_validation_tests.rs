@@ -1,8 +1,9 @@
-use rusqlite::{Connection, params, types::Value};
+use crate::db::Connection;
+use rusqlite::{params, types::Value};
 
 use super::{SandboxState, seed_historical_lifecycle_rows, test_conn};
 
-fn insert(conn: &Connection, id: &str, state: &Value) -> rusqlite::Result<usize> {
+fn insert(conn: &Connection, id: &str, state: &Value) -> crate::db::Result<usize> {
     conn.execute(
         "INSERT INTO sandboxes (id, uuid8, state, template, created_at, updated_at)
          VALUES (?1, 'sandbox1', ?2, 'template', '0', '0')",
@@ -10,10 +11,10 @@ fn insert(conn: &Connection, id: &str, state: &Value) -> rusqlite::Result<usize>
     )
 }
 
-fn assert_lifecycle_rejected(result: rusqlite::Result<usize>) {
+fn assert_lifecycle_rejected(result: crate::db::Result<usize>) {
     let error = result.unwrap_err();
     assert_eq!(
-        error.sqlite_error().unwrap().extended_code,
+        error.raw().sqlite_error().unwrap().extended_code,
         rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER,
     );
 }
@@ -126,7 +127,7 @@ fn lifecycle_validation_preserves_native_not_null_conflict_handling() {
         } else {
             let error = result.unwrap_err();
             assert_eq!(
-                error.sqlite_error().unwrap().extended_code,
+                error.raw().sqlite_error().unwrap().extended_code,
                 rusqlite::ffi::SQLITE_CONSTRAINT_NOTNULL,
                 "{sql}"
             );
@@ -144,10 +145,10 @@ fn lifecycle_validation_preserves_native_not_null_conflict_handling() {
 
 #[test]
 fn lifecycle_validation_aborts_the_whole_statement_without_poisoning_the_transaction() {
-    let mut conn = test_conn();
+    let conn = test_conn();
     insert(&conn, "first", &Value::Text("started".into())).unwrap();
     insert(&conn, "second", &Value::Text("started".into())).unwrap();
-    let tx = conn.transaction().unwrap();
+    let tx = crate::db::Transaction::deferred(&conn).unwrap();
     tx.execute("UPDATE sandboxes SET template = 'retained'", [])
         .unwrap();
     assert_lifecycle_rejected(tx.execute(

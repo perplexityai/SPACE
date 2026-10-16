@@ -2,8 +2,8 @@
 //! `sandboxes.state`.
 
 use super::super::cleanup_support::{StateWriteRejected, state_write_result};
+use crate::db::Connection;
 use crate::db::edges;
-use rusqlite::Connection;
 use tonic::Status;
 
 /// Restage a full process-snapshot rollback's `stopped` row as `suspended`, so

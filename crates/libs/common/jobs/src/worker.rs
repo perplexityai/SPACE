@@ -370,6 +370,13 @@ pub enum SubjectConcurrency {
     Serialized,
 }
 
+/// A terminal-job prune that failed in the database. `Display` and `source`
+/// are the SQLite error's; the error itself stays private to this crate, so a
+/// worker's owner gets no database value back.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub struct PruneTerminalJobsError(rusqlite::Error);
+
 /// A background job worker that persists jobs to SQLite and drives execution
 /// with bounded concurrency, exponential-backoff retry, and graceful drain.
 ///
@@ -518,10 +525,14 @@ impl<E: JobExecutor> BackgroundWorker<E> {
 
     /// Preserve database failures so maintenance callers can retry without
     /// treating an unsuccessful pass as a successful zero-deletion pass.
-    pub fn try_prune_terminal_jobs_once(&self, worker_label: &str) -> rusqlite::Result<usize> {
+    pub fn try_prune_terminal_jobs_once(
+        &self,
+        worker_label: &str,
+    ) -> Result<usize, PruneTerminalJobsError> {
         let pruned = {
             let conn = self.lock_db_for_background();
-            db::prune_terminal_jobs(&conn, COMPLETED_JOB_RETENTION, FAILED_JOB_RETENTION)?
+            db::prune_terminal_jobs(&conn, COMPLETED_JOB_RETENTION, FAILED_JOB_RETENTION)
+                .map_err(PruneTerminalJobsError)?
         };
         if pruned > 0 {
             tracing::info!(

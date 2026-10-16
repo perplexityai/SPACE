@@ -469,7 +469,7 @@ pub(super) async fn launch_net_gateway_via_node(
 /// the write, so task cancellation cannot observe a launched-but-unregistered
 /// gateway from this helper.
 pub(super) async fn register_net_gateway_launch<N>(
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     sandbox_id: &str,
     uid: u32,
     launch_netgtw: N,
@@ -493,7 +493,7 @@ where
 /// RPCs and backoff. A shorter caller deadline still wins. Channels are reused
 /// between polls; the gateway owns all configured readiness dependencies.
 pub(super) async fn refresh_network_policy(
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     sandbox_id: &str,
     expected_policy_ref: Option<&EffectiveNetworkPolicyRef>,
     reason: &'static str,
@@ -516,7 +516,7 @@ pub(super) async fn refresh_network_policy(
 }
 
 pub(super) async fn refresh_network_policy_with_request<F, Fut>(
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     sandbox_id: &str,
     expected_policy_ref: Option<&EffectiveNetworkPolicyRef>,
     reason: &'static str,
@@ -713,7 +713,7 @@ pub(super) enum RefreshAbandonReason {
 /// keeps retrying: a transient DB error must not abandon a refresh the gateway
 /// could still confirm.
 fn refresh_abandon_reason(
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     sandbox_id: &str,
 ) -> Result<Option<RefreshAbandonReason>, crate::node_state_sync::DatabaseMutexPoisoned> {
     let db = crate::node_state_sync::connection_or_signal_failure(db)?;
@@ -735,7 +735,7 @@ fn refresh_abandon_reason(
 }
 
 pub(super) fn spawn_network_policy_refresh(
-    db: Arc<Mutex<rusqlite::Connection>>,
+    db: crate::db::SharedConnection,
     sandbox_id: String,
     expected_policy_ref: EffectiveNetworkPolicyRef,
     reason: &'static str,

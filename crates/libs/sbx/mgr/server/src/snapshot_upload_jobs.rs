@@ -61,7 +61,7 @@ const MAX_ATTEMPTS: i32 = 5;
 const TRANSFER_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Build a `BackgroundWorker` configured for the snapshot-upload pipeline.
-/// Caller owns the `rusqlite::Connection` (it lives alongside the rest of
+/// Caller owns the `crate::db::Connection` (it lives alongside the rest of
 /// sbx-mgr's SQLite state) and is responsible for calling
 /// [`BackgroundWorker::recover_and_log`] at startup and
 /// [`BackgroundWorker::yield_for_restart`] at exit.
@@ -70,7 +70,7 @@ const TRANSFER_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// sandbox-manager gives local finalization a bounded deploy-shutdown drain,
 /// while durable remote-upload work can resume after startup recovery.
 pub(crate) fn build_worker(
-    db: std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: crate::db::SharedConnection,
     drain_state: std::sync::Arc<crate::service::drain::DrainState>,
     node_manager: crate::node_manager_transport::NodeManagerConnector,
 ) -> BackgroundWorker<SnapshotUploadExecutor> {
@@ -78,17 +78,19 @@ pub(crate) fn build_worker(
         .with_kind_concurrency(SNAPSHOT_UPLOAD_JOB_KIND, DEFAULT_CONCURRENCY)
         .with_recovery_job_kind(SNAPSHOT_UPLOAD_JOB_KIND);
     let executor = SnapshotUploadExecutor {
-        db: std::sync::Arc::clone(&db),
+        db: db.clone(),
         drain_state,
         retained_source_inspector: std::sync::Arc::new(
             crate::retained_source::NodeManagerSourceInspector(node_manager.clone()),
         ),
         node_manager,
     };
-    BackgroundWorker::new(db, executor, config)
+    db.background_worker(executor, config)
 }
 
-pub fn refund_interrupted_running_attempts(conn: &rusqlite::Connection) -> rusqlite::Result<usize> {
+pub fn refund_interrupted_running_attempts(
+    conn: &crate::db::Connection,
+) -> crate::db::Result<usize> {
     crate::db::snapshot_upload_jobs::refund_interrupted_running_attempts(
         conn,
         SNAPSHOT_UPLOAD_JOB_KIND,
@@ -104,7 +106,7 @@ pub fn refund_interrupted_running_attempts(conn: &rusqlite::Connection) -> rusql
 /// same lock hold.
 #[derive(Clone)]
 pub struct SnapshotUploadExecutor {
-    db: std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: crate::db::SharedConnection,
     drain_state: std::sync::Arc<crate::service::drain::DrainState>,
     /// Sizes a retained source before its stream is reclaimed, so the local
     /// sidecar can switch to counting the image the artifact keeps.
@@ -379,7 +381,7 @@ impl SnapshotUploadExecutor {
             // handle. Failure or panic leaves completed-job repair evidence;
             // maintenance retries the marker, while stream reclaim is optional.
             drop(spawn_backup_bookkeeping(
-                std::sync::Arc::clone(&self.db),
+                self.db.clone(),
                 &self.drain_state,
                 payload,
                 std::sync::Arc::clone(&self.retained_source_inspector),
@@ -420,11 +422,11 @@ async fn retained_image_for_reclaim(
 }
 
 pub(crate) fn spawn_backup_bookkeeping(
-    db: std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: crate::db::SharedConnection,
     drain_state: &std::sync::Arc<crate::service::drain::DrainState>,
     payload: &SnapshotUploadJobs,
     inspector: std::sync::Arc<dyn crate::retained_source::RetainedSourceInspector>,
-) -> Option<tokio::task::JoinHandle<rusqlite::Result<()>>> {
+) -> Option<tokio::task::JoinHandle<crate::db::Result<()>>> {
     // Admission is capped before spawning, so returning the upload worker's
     // slot cannot accumulate unbounded queued writers. Refusal defers repair.
     let writer = match crate::service::drain::acquire_state_writer(
@@ -452,15 +454,15 @@ pub(crate) fn spawn_backup_bookkeeping(
         // writer's last mutation.
         let _writer = writer;
         let join_failed = |join: tokio::task::JoinError| {
-            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(format!(
+            crate::db::Error::to_sql_conversion(std::io::Error::other(format!(
                 "backup bookkeeping writer panicked: {join}"
-            ))))
+            )))
         };
         // The durability marker first, waiting on nothing but the database.
         // Whether a reclaim is due is read in the same hold, so node-manager
         // is asked only when the stream exists and the pin still stands.
         let reclaim_due = {
-            let db = std::sync::Arc::clone(&db);
+            let db = db.clone();
             let payload = payload.clone();
             tokio::task::spawn_blocking(move || {
                 let conn = db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -501,7 +503,7 @@ pub(crate) fn spawn_backup_bookkeeping(
 }
 
 pub(crate) fn persist_submitted_transfer_ids(
-    db: &std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     job_id: &JobId,
     payload: &SnapshotUploadJobs,
 ) -> Result<(), JobError> {
@@ -649,20 +651,20 @@ fn stream_reclaim_applies(meta: &SnapshotMeta) -> bool {
 /// The two bookkeeping steps in one hold, for tests of their combined effect.
 #[cfg(test)]
 fn stamp_backup_completed_and_reclaim_stream(
-    conn: &rusqlite::Connection,
+    conn: &crate::db::Connection,
     payload: &SnapshotUploadJobs,
     backup_attempt_id: &str,
     reclaim_image: Option<u64>,
-) -> Result<(), rusqlite::Error> {
+) -> Result<(), crate::db::Error> {
     stamp_backup_completed(conn, payload)?;
     reclaim_stream(conn, payload, backup_attempt_id, reclaim_image)
 }
 
 /// Stamp the artifact's durability marker. Nothing else waits on this.
 fn stamp_backup_completed(
-    conn: &rusqlite::Connection,
+    conn: &crate::db::Connection,
     payload: &SnapshotUploadJobs,
-) -> Result<(), rusqlite::Error> {
+) -> Result<(), crate::db::Error> {
     let Some(local_artifact_id) = payload.meta.local_artifact_id else {
         return Ok(());
     };
@@ -674,9 +676,9 @@ fn stamp_backup_completed(
 /// reclaimable artifact that fails either check is counted as skipped here,
 /// because no later step sees it.
 fn stream_reclaim_due(
-    conn: &rusqlite::Connection,
+    conn: &crate::db::Connection,
     payload: &SnapshotUploadJobs,
-) -> Result<bool, rusqlite::Error> {
+) -> Result<bool, crate::db::Error> {
     let Some(local_artifact_id) = payload.meta.local_artifact_id else {
         return Ok(false);
     };
@@ -712,11 +714,11 @@ fn stream_reclaim_due(
 /// Reclaim the uploaded stream under the connection hold that rechecks the
 /// pin, so a wake that moved it cannot race the unlink.
 fn reclaim_stream(
-    conn: &rusqlite::Connection,
+    conn: &crate::db::Connection,
     payload: &SnapshotUploadJobs,
     backup_attempt_id: &str,
     reclaim_image: Option<u64>,
-) -> Result<(), rusqlite::Error> {
+) -> Result<(), crate::db::Error> {
     let Some(local_artifact_id) = payload.meta.local_artifact_id else {
         return Ok(());
     };
@@ -1276,9 +1278,9 @@ const BACKUP_MARKER_BATCH: usize = 128;
 /// remain unmarked and unreapable: operators must establish remote durability
 /// or arrange a fresh backup, never infer success from age or sandbox identity.
 pub fn backfill_backup_completed_markers(
-    conn: &rusqlite::Connection,
+    conn: &crate::db::Connection,
     scan: &mut BackupMarkerScan,
-) -> rusqlite::Result<BackupMarkerBackfill> {
+) -> crate::db::Result<BackupMarkerBackfill> {
     let mut report = BackupMarkerBackfill::default();
     let through = match scan.through {
         Some(through) => through,
@@ -1362,7 +1364,7 @@ pub fn backfill_backup_completed_markers(
 /// Each blocking pass is awaited through shutdown so no local writer escapes
 /// the daemon's task drain. The pruning trigger protects unvisited obligations.
 pub(crate) async fn run_maintenance(
-    db: std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: crate::db::SharedConnection,
     worker: BackgroundWorker<SnapshotUploadExecutor>,
     drain: std::sync::Arc<crate::service::drain::DrainState>,
     shutdown: tokio_util::sync::CancellationToken,
@@ -1383,7 +1385,7 @@ pub(crate) async fn run_maintenance(
         else {
             continue;
         };
-        let db = std::sync::Arc::clone(&db);
+        let db = db.clone();
         let worker = worker.clone();
         let prune = last_prune.is_none_or(|last: tokio::time::Instant| {
             last.elapsed() >= pplx_space_common_jobs::TERMINAL_JOB_PRUNE_INTERVAL
@@ -1394,9 +1396,7 @@ pub(crate) async fn run_maintenance(
                 let conn = crate::node_state_sync::connection_or_signal_failure(&db)?;
                 let result = backfill_backup_completed_markers(&conn, &mut scan);
                 let history_result = crate::db::now_epoch_i64().and_then(|now| {
-                    let now = u64::try_from(now).map_err(|error| {
-                        rusqlite::Error::ToSqlConversionFailure(Box::new(error))
-                    })?;
+                    let now = u64::try_from(now).map_err(crate::db::Error::to_sql_conversion)?;
                     history_scan.next_batch(&conn, now)
                 });
                 let timestamp_result = timestamp_scan.next_batch(&conn);

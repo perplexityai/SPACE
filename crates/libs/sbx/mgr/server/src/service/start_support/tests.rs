@@ -251,7 +251,7 @@ async fn activation_cleanup_uses_updated_runtime_label() {
 
 #[tokio::test]
 async fn allocated_runtime_label_owns_cleanup_before_database_persistence() {
-    let db = Arc::new(Mutex::new(rusqlite::Connection::open_in_memory().unwrap()));
+    let db = crate::db::SharedConnection::new(crate::db::Connection::open_in_memory());
     let (cleanup_tx, cleanup_rx) = tokio::sync::oneshot::channel();
     let mut cleanup_guard = ActivationCleanupGuard::with_interruption_reason(
         SandboxRuntimeLabel::parse("runtime1").unwrap(),

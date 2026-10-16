@@ -54,7 +54,7 @@ struct FencedRow {
 }
 
 /// Refuse every new `sandboxes` row, reporting the row in the refusal.
-fn install_insert_fence(conn: &rusqlite::Connection) {
+fn install_insert_fence(conn: &crate::db::Connection) {
     conn.execute_batch(&format!(
         "CREATE TEMP TRIGGER create_after_lookup_insert_fence
          BEFORE INSERT ON main.sandboxes
@@ -162,7 +162,7 @@ impl Fixture {
     /// A service over `conn`, with the insert fence installed, whose template
     /// lookups go to `templates` and whose node-manager is `node_manager`.
     fn new(
-        conn: rusqlite::Connection,
+        conn: crate::db::Connection,
         templates: Arc<FakeTemplateResolver>,
         node_manager: FakeNodeManager,
     ) -> Self {
@@ -238,7 +238,7 @@ fn create_request() -> CreateRequest {
 /// Insert a row the way create writes one, with [`row_env`], before the fence
 /// is installed.
 fn insert_created_row(
-    conn: &rusqlite::Connection,
+    conn: &crate::db::Connection,
     id: &str,
     state: SandboxState,
     template_hash: &str,
@@ -443,7 +443,7 @@ async fn autostart_create_checks_ready_network_slots_before_the_row_insert() {
 }
 
 /// A paused pool donor at `build`, as the pool leaves it for adoption.
-fn insert_pool_donor(conn: &rusqlite::Connection, build: &str) -> String {
+fn insert_pool_donor(conn: &crate::db::Connection, build: &str) -> String {
     let donor = SandboxId::new();
     let id = donor.to_string();
     insert_created_row(
@@ -625,7 +625,7 @@ async fn requested_id_create_reuses_only_a_compatible_settled_row() {
             );
             conn.execute(
                 "UPDATE sandboxes SET state = ?1 WHERE id = ?2",
-                rusqlite::params![case.state.as_str(), &id],
+                crate::db::fixture::params![case.state.as_str(), &id],
             )
             .unwrap();
         });
@@ -824,7 +824,7 @@ async fn selected_create_persists_the_binding_used_by_first_start() {
         let db_path = database.path().join("sandbox.sqlite");
         crate::db::create_test_schema_on_disk(&db_path);
         let mut fixture = Fixture::new(
-            rusqlite::Connection::open(&db_path).unwrap(),
+            crate::db::Connection::open_at(&db_path).unwrap(),
             build.resolver(BUILD),
             node,
         );
@@ -844,7 +844,7 @@ async fn selected_create_persists_the_binding_used_by_first_start() {
             created.environment.as_deref(),
             Some(definition.reference().to_string().as_str())
         );
-        let reopened = rusqlite::Connection::open(&db_path).unwrap();
+        let reopened = crate::db::Connection::open_at(&db_path).unwrap();
         let row = crate::db::get_sandbox(&reopened, &created.sandbox_id)
             .unwrap()
             .unwrap();

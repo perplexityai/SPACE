@@ -17,7 +17,7 @@ fn pin_artifact(
              local_artifact_id, sandbox_id, artifact_kind, artifact_origin,
              snapshot_name, local_path, created_at, backup_completed_at
          ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, '0', ?6)",
-        rusqlite::params![
+        crate::db::fixture::params![
             artifact_id.to_string(),
             sandbox_id,
             kind,
@@ -33,7 +33,7 @@ fn pin_artifact(
                 current_local_artifact_kind = ?2,
                 current_local_artifact_origin = ?3
           WHERE id = ?4",
-        rusqlite::params![artifact_id.to_string(), kind, origin, sandbox_id],
+        crate::db::fixture::params![artifact_id.to_string(), kind, origin, sandbox_id],
     )
     .unwrap();
 }

@@ -19,47 +19,47 @@ fn cleanup_job_admission_is_atomic_deduplicated_and_strength_preserving() {
         published_artifact: Some((LocalArtifactId::new(), "/cache/suspend".to_owned())),
     };
     {
-        let tx = conn.unchecked_transaction().unwrap();
+        let tx = Transaction::deferred(&conn).unwrap();
         persist(&tx, work.clone()).unwrap();
     }
     assert!(
-        jobs::find_active_job(&conn, KIND, &sandbox_id.to_string())
+        jobs::find_active_job(conn.raw(), KIND, &sandbox_id.to_string())
             .unwrap()
             .is_none()
     );
-    let tx = conn.unchecked_transaction().unwrap();
+    let tx = Transaction::deferred(&conn).unwrap();
     let id = persist(&tx, work.clone()).unwrap();
     tx.commit().unwrap();
     let mut kill = work.clone();
     kill.immediate_kill = true;
-    let tx = conn.unchecked_transaction().unwrap();
+    let tx = Transaction::deferred(&conn).unwrap();
     assert_eq!(persist(&tx, kill).unwrap(), id);
     assert_eq!(persist(&tx, work.clone()).unwrap(), id);
     tx.commit().unwrap();
     assert!(
-        decode(&jobs::get_job(&conn, &id).unwrap().unwrap().payload)
+        decode(&jobs::get_job(conn.raw(), &id).unwrap().unwrap().payload)
             .unwrap()
             .immediate_kill
     );
     let mut recovery = work.clone();
     recovery.published_artifact = None;
-    let tx = conn.unchecked_transaction().unwrap();
+    let tx = Transaction::deferred(&conn).unwrap();
     assert_eq!(persist(&tx, recovery).unwrap(), id);
     tx.commit().unwrap();
     assert_eq!(
-        decode(&jobs::get_job(&conn, &id).unwrap().unwrap().payload)
+        decode(&jobs::get_job(conn.raw(), &id).unwrap().unwrap().payload)
             .unwrap()
             .published_artifact,
         work.published_artifact
     );
     let mut replacement = work;
     replacement.execution_generation = Some(ExecutionGeneration::new(2).unwrap());
-    let tx = conn.unchecked_transaction().unwrap();
+    let tx = Transaction::deferred(&conn).unwrap();
     let next = persist(&tx, replacement).unwrap();
     tx.commit().unwrap();
     assert_ne!(next, id);
     assert_eq!(
-        jobs::get_job(&conn, &id).unwrap().unwrap().status,
+        jobs::get_job(conn.raw(), &id).unwrap().unwrap().status,
         JobStatus::Cancelled.as_str()
     );
 }
@@ -84,11 +84,11 @@ fn a_stops_guest_flush_persists_and_a_forced_stop_overrides_it() {
         published_artifact: None,
     };
     let persisted = |id: &JobId| {
-        decode(&jobs::get_job(&conn, id).unwrap().unwrap().payload)
+        decode(&jobs::get_job(conn.raw(), id).unwrap().unwrap().payload)
             .unwrap()
             .guest_flush
     };
-    let tx = conn.unchecked_transaction().unwrap();
+    let tx = Transaction::deferred(&conn).unwrap();
     let id = persist(&tx, stop(GuestFlush::BeforeTermination, false)).unwrap();
     assert_eq!(
         persist(&tx, stop(GuestFlush::Unrequested, false)).unwrap(),
@@ -97,7 +97,7 @@ fn a_stops_guest_flush_persists_and_a_forced_stop_overrides_it() {
     tx.commit().unwrap();
     assert_eq!(persisted(&id), GuestFlush::BeforeTermination);
 
-    let tx = conn.unchecked_transaction().unwrap();
+    let tx = Transaction::deferred(&conn).unwrap();
     assert_eq!(persist(&tx, stop(GuestFlush::Forbidden, true)).unwrap(), id);
     assert_eq!(
         persist(&tx, stop(GuestFlush::BeforeTermination, false)).unwrap(),
@@ -267,7 +267,7 @@ fn bounded_dispatch_preserves_retry_priority_and_other_workers() {
         ),
     ] {
         insert_job(
-            &conn,
+            conn.raw(),
             InsertJob {
                 job_id: &id,
                 kind,
@@ -282,24 +282,24 @@ fn bounded_dispatch_preserves_retry_priority_and_other_workers() {
         .unwrap();
     }
     mark_job_running(
-        &conn,
+        conn.raw(),
         &"019d84bd-280d-7331-99c6-000000000001".parse().unwrap(),
     )
     .unwrap();
     retry_running_job(
-        &conn,
+        conn.raw(),
         &"019d84bd-280d-7331-99c6-000000000001".parse().unwrap(),
         "busy",
         3600,
     )
     .unwrap();
     mark_job_running(
-        &conn,
+        conn.raw(),
         &"019d84bd-280d-7331-99c6-000000000002".parse().unwrap(),
     )
     .unwrap();
     mark_job_running(
-        &conn,
+        conn.raw(),
         &"019d84bd-280d-7331-99c6-000000000005".parse().unwrap(),
     )
     .unwrap();
@@ -315,10 +315,10 @@ fn bounded_dispatch_preserves_retry_priority_and_other_workers() {
             .unwrap()
             .is_empty()
     );
-    reset_inactive_running_kind(&conn, KIND, &active).unwrap();
+    reset_inactive_running_kind(conn.raw(), KIND, &active).unwrap();
     assert_eq!(
         get_job(
-            &conn,
+            conn.raw(),
             &"019d84bd-280d-7331-99c6-000000000002".parse().unwrap()
         )
         .unwrap()
@@ -327,7 +327,7 @@ fn bounded_dispatch_preserves_retry_priority_and_other_workers() {
         "running"
     );
     update_active_job_payload(
-        &conn,
+        conn.raw(),
         &"019d84bd-280d-7331-99c6-000000000001".parse().unwrap(),
         "{\"kill\":true}",
         JobPriority::new(1),
@@ -336,10 +336,10 @@ fn bounded_dispatch_preserves_retry_priority_and_other_workers() {
     let promoted = due_job_ids(&conn, JobPriority::new(1), &[], 2).unwrap();
     assert_eq!(promoted.len(), 2);
     assert!(promoted.contains(&"019d84bd-280d-7331-99c6-000000000001".parse().unwrap()));
-    assert_eq!(reset_running_kind(&conn, KIND).unwrap(), 1);
+    assert_eq!(reset_running_kind(conn.raw(), KIND).unwrap(), 1);
     assert_eq!(
         get_job(
-            &conn,
+            conn.raw(),
             &"019d84bd-280d-7331-99c6-000000000002".parse().unwrap()
         )
         .unwrap()
@@ -349,7 +349,7 @@ fn bounded_dispatch_preserves_retry_priority_and_other_workers() {
     );
     assert_eq!(
         get_job(
-            &conn,
+            conn.raw(),
             &"019d84bd-280d-7331-99c6-000000000005".parse().unwrap()
         )
         .unwrap()

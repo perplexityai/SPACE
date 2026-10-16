@@ -851,7 +851,10 @@ fn cleanup_episode_decoder_rejects_rows_it_cannot_represent() {
 
         let result = cleanup_episode(&conn, "sandbox");
         assert!(
-            matches!(result, Err(rusqlite::Error::FromSqlConversionFailure(..))),
+            matches!(
+                result.as_ref().map_err(Error::raw),
+                Err(rusqlite::Error::FromSqlConversionFailure(..))
+            ),
             "{case}: {result:?}"
         );
     }

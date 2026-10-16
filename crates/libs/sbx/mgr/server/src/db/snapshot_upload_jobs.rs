@@ -1,8 +1,9 @@
 //! `jobs` rows of the snapshot-upload pipeline, and the backup markers its
 //! completed jobs prove.
 
+use crate::db::{Connection, Result};
 use pplx_space_common_core::types::JobId;
-use rusqlite::{Connection, Result, params};
+use rusqlite::params;
 
 /// Give back the attempt a restart interrupted: every running job of `kind`
 /// with attempts left loses one; the number refunded.
@@ -55,7 +56,11 @@ pub(crate) fn visit_completed_upload_payloads(
     let mut rows = statement.query(params![after, through, limit])?;
     let now = crate::db::now()?;
     while let Some(row) = rows.next()? {
-        visit(&now, row.get(0)?, row.get::<_, String>(1))?;
+        visit(
+            &now,
+            row.get(0)?,
+            row.get::<_, String>(1).map_err(crate::db::Error::from),
+        )?;
     }
     Ok(())
 }

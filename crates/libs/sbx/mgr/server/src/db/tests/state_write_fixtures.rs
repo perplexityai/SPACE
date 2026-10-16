@@ -8,13 +8,14 @@
 
 use std::collections::BTreeMap;
 
+use crate::db::Connection;
 use pplx_space_common_core::types::{
     Arch, AutoLifecyclePolicy, ExecutionGeneration, LinuxPid, LinuxUid, LocalArtifactId,
     RuntimeKind, SandboxActivationAttemptId, SandboxCleanupEpisodeId, SandboxId, SandboxOwner,
     SandboxQuarantineReasonCode, SandboxRuntimeLabel, VsockCid,
 };
+use rusqlite::params;
 use rusqlite::types::Value;
-use rusqlite::{Connection, params};
 
 use super::{TestSandboxInsert, insert_test_sandbox};
 use crate::db::{

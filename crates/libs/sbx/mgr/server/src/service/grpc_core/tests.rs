@@ -33,7 +33,7 @@ fn enter_isolated_test_process() -> bool {
 /// A service whose host dependencies all resolve under `scratch`; see
 /// [`SandboxManagerServiceOptions::for_test_in`].
 fn isolated_service(
-    conn: rusqlite::Connection,
+    conn: crate::db::Connection,
     scratch: &std::path::Path,
     node_role: Option<NodeRole>,
 ) -> SandboxManagerService {
@@ -309,12 +309,12 @@ struct CleanupFixture {
 }
 
 impl CleanupFixture {
-    fn new(conn: rusqlite::Connection, dispatch_permits: usize) -> Self {
+    fn new(conn: crate::db::Connection, dispatch_permits: usize) -> Self {
         Self::with_node_role(conn, dispatch_permits, None)
     }
 
     fn with_node_role(
-        conn: rusqlite::Connection,
+        conn: crate::db::Connection,
         dispatch_permits: usize,
         node_role: Option<NodeRole>,
     ) -> Self {
@@ -356,7 +356,7 @@ impl CleanupFixture {
 
     fn active_cleanup_job(&self, id: &str) -> Option<pplx_space_common_core::types::JobId> {
         pplx_space_common_jobs::db::find_active_job(
-            &self.service.db_conn().unwrap(),
+            self.service.db_conn().unwrap().raw(),
             crate::db::cleanup_jobs::KIND,
             id,
         )
@@ -455,7 +455,7 @@ impl CleanupRpc {
     }
 }
 
-fn insert_owned_sandbox(conn: &rusqlite::Connection, id: &str, owner: &str) {
+fn insert_owned_sandbox(conn: &crate::db::Connection, id: &str, owner: &str) {
     let sandbox_id = SandboxId::from_str(id).unwrap();
     crate::db::insert_sandbox(
         conn,
@@ -974,7 +974,7 @@ async fn auto_lifecycle_delete_requires_one_canonical_id_and_the_expected_policy
 /// Insert a pool clone whose publication still owns an armed disposal
 /// episode, as `PoolWaitClone` leaves it before publication completes.
 fn insert_armed_pool_clone(
-    conn: &rusqlite::Connection,
+    conn: &crate::db::Connection,
     owner: &str,
 ) -> (SandboxId, SandboxCleanupEpisodeId) {
     let id = SandboxId::new();
@@ -1308,7 +1308,7 @@ async fn delete_removes_a_quarantine_whose_automatic_recovery_stopped() {
     // Due by its retry time and still not offered: recovery stopped.
     conn.execute(
         "UPDATE sandbox_quarantine_state SET next_action_after = NULL WHERE sandbox_id = ?1",
-        rusqlite::params![id],
+        crate::db::fixture::params![id],
     )
     .unwrap();
     assert!(

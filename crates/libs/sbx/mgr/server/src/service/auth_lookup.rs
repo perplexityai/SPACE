@@ -1009,8 +1009,7 @@ impl SandboxManagerService {
         recompute_runtime_state(&mut runtime_state, &policy);
 
         let db = self.db_conn()?;
-        let transaction = db
-            .unchecked_transaction()
+        let transaction = crate::db::Transaction::deferred(&db)
             .map_err(|e| Status::internal(format!("db transaction failed: {e}")))?;
         crate::db::update_auto_lifecycle_with_state(
             &transaction,
@@ -1229,7 +1228,7 @@ impl SandboxManagerService {
 }
 
 fn resident_resume_connect_error(
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     sandbox_id: &str,
     error: super::tail_support::NodeManagerConnectError,
 ) -> Status {
@@ -1243,7 +1242,7 @@ fn resident_resume_connect_error(
 }
 
 fn restore_resident_resume_prior_state(
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     sandbox_id: &str,
 ) -> Result<(), Status> {
     let restored = {
@@ -1263,7 +1262,7 @@ fn restore_resident_resume_prior_state(
 }
 
 pub(super) fn finish_resident_resume_after_guest_setup(
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     sandbox_id: &str,
     setup_result: Result<(), Status>,
     rollback_vm_state: Option<FirecrackerVmState>,
@@ -1321,7 +1320,7 @@ pub(super) fn finish_resident_resume_after_guest_setup(
 }
 
 pub(super) fn finish_resident_resume_after_rpc_error(
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     sandbox_id: &str,
     status: Status,
     vm_state: Option<FirecrackerVmState>,

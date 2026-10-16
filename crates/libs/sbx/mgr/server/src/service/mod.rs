@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use arc_swap::ArcSwapOption;
@@ -346,7 +346,7 @@ impl Drop for TeardownSuspendDriverSlot {
 
 #[derive(Clone)]
 pub struct SandboxManagerService {
-    db: Arc<Mutex<rusqlite::Connection>>,
+    db: crate::db::SharedConnection,
     local_node_id: Option<NodeId>,
     local_artifacts: crate::local_artifacts::LocalArtifacts,
     watchdog: Arc<crate::watchdog::SandboxWatchdog>,
@@ -886,7 +886,7 @@ fn optional_identity_field_is_enrichment<T: Eq>(current: &Option<T>, incoming: &
 }
 
 fn persisted_activation_owns_route_identity(
-    db: &rusqlite::Connection,
+    db: &crate::db::Connection,
     sandbox_id: SandboxId,
     cleanup_id: SandboxCleanupEpisodeId,
     incoming: &RouteStreamEpochIdentity,
@@ -912,7 +912,7 @@ fn persisted_activation_owns_route_identity(
         && sandbox.cleanup_keep_filesystem == Some(episode.keep_filesystem))
 }
 
-fn map_runtime_fields_update_error(error: rusqlite::Error) -> Status {
+fn map_runtime_fields_update_error(error: crate::db::Error) -> Status {
     if crate::db::auto_lifecycle_delete_receipts::is_pending_receipt_execution_fence(&error) {
         return Status::aborted("pending auto-lifecycle delete receipt owns the sandbox execution");
     }
@@ -920,14 +920,14 @@ fn map_runtime_fields_update_error(error: rusqlite::Error) -> Status {
         return Status::aborted("sandbox lifecycle or cleanup owns the sandbox execution");
     }
     match error {
-        rusqlite::Error::InvalidQuery => Status::aborted("runtime execution generation is stale"),
-        rusqlite::Error::QueryReturnedNoRows => Status::not_found("sandbox not found"),
+        e if e.is_invalid_query() => Status::aborted("runtime execution generation is stale"),
+        e if e.is_no_rows() => Status::not_found("sandbox not found"),
         error => Status::internal(format!("db error: {error}")),
     }
 }
 
 fn route_identity_adoption_write_rejection_reason(
-    error: &rusqlite::Error,
+    error: &crate::db::Error,
 ) -> pplx_space_metrics::sandbox::worker::RouteIdentityAdoptionReason {
     use pplx_space_metrics::sandbox::worker::RouteIdentityAdoptionReason;
     if crate::db::auto_lifecycle_delete_receipts::is_pending_receipt_execution_fence(error) {
@@ -936,8 +936,8 @@ fn route_identity_adoption_write_rejection_reason(
         RouteIdentityAdoptionReason::LifecycleOwnsExecution
     } else {
         match error {
-            rusqlite::Error::InvalidQuery => RouteIdentityAdoptionReason::StaleOrConflict,
-            rusqlite::Error::QueryReturnedNoRows => RouteIdentityAdoptionReason::NotFound,
+            error if error.is_invalid_query() => RouteIdentityAdoptionReason::StaleOrConflict,
+            error if error.is_no_rows() => RouteIdentityAdoptionReason::NotFound,
             _ => RouteIdentityAdoptionReason::Internal,
         }
     }
@@ -1022,11 +1022,11 @@ pub enum RefundInterruptedSnapshotUploadAttemptsError {
     #[error("sandbox database mutex is poisoned")]
     DatabaseMutexPoisoned,
     #[error("failed to refund interrupted snapshot upload attempts: {0}")]
-    Database(#[from] rusqlite::Error),
+    Database(#[from] crate::db::Error),
 }
 
 impl SandboxManagerService {
-    pub(crate) fn db_conn(&self) -> Result<MutexGuard<'_, rusqlite::Connection>, Status> {
+    pub(crate) fn db_conn(&self) -> Result<crate::db::ConnectionGuard<'_>, Status> {
         self.db.lock().map_err(|_| {
             // Poison is not recoverable connection health. Keep ownership
             // through the normal drain and let the supervisor restart us.
@@ -1595,14 +1595,14 @@ impl SandboxManagerService {
     }
 
     pub fn new_with_options(
-        conn: rusqlite::Connection,
+        conn: crate::db::Connection,
         options: SandboxManagerServiceOptions,
     ) -> Self {
         Self::new_with_config(conn, options, crate::config::SandboxConfig::default())
     }
 
     pub fn new_with_config(
-        conn: rusqlite::Connection,
+        conn: crate::db::Connection,
         options: SandboxManagerServiceOptions,
         config: crate::config::SandboxConfig,
     ) -> Self {
@@ -1628,7 +1628,7 @@ impl SandboxManagerService {
                 ),
             }
         }
-        let db = Arc::new(Mutex::new(conn));
+        let db = crate::db::SharedConnection::new(conn);
         let auto_lifecycle = AutoLifecycleCoordinator::default();
         let network_policy_reconcile_queue = NetworkPolicyReconcileQueue::default();
         let feature_flags = pplx_space_feature_flags::FeatureFlagClient::from_env();
@@ -1653,7 +1653,7 @@ impl SandboxManagerService {
             ),
         );
         let watchdog = Arc::new(crate::watchdog::SandboxWatchdog::new(
-            Arc::clone(&db),
+            db.clone(),
             network_policy_reconcile_queue.clone(),
             snapshot_scheduler.clone(),
             auto_lifecycle.clone(),
@@ -1668,11 +1668,11 @@ impl SandboxManagerService {
             watchdog.set_expected_route_verification_key_generation(generation);
         }
         let snapshot_upload_worker = crate::snapshot_upload_jobs::build_worker(
-            Arc::clone(&db),
+            db.clone(),
             Arc::clone(&drain_state),
             options.node_manager.clone(),
         );
-        let local_artifacts = crate::local_artifacts::LocalArtifacts::new(Arc::clone(&db));
+        let local_artifacts = crate::local_artifacts::LocalArtifacts::new(db.clone());
         let teardown_suspend_driver_concurrency = TEARDOWN_SUSPEND_DRIVER_CONCURRENCY;
         pplx_space_metrics::sandbox::worker::teardown_suspend_driver_capacity(
             teardown_suspend_driver_concurrency,
@@ -1790,7 +1790,7 @@ impl SandboxManagerService {
     /// RPC path can acquire a fresh local-artifact lease.
     pub fn recover_local_artifact_stuck_states(
         &self,
-    ) -> rusqlite::Result<crate::local_artifacts::StuckStateRecovery> {
+    ) -> crate::db::Result<crate::local_artifacts::StuckStateRecovery> {
         self.local_artifacts.recover_stuck_states()
     }
 
@@ -1808,7 +1808,7 @@ impl SandboxManagerService {
         shutdown: tokio_util::sync::CancellationToken,
         tracker: &tokio_util::task::TaskTracker,
     ) {
-        let db = Arc::clone(&self.db);
+        let db = self.db.clone();
         let worker = self.snapshot_upload_worker.clone();
         let drain = Arc::clone(&self.drain_state);
         let critical = self.critical_task_guard("snapshot-upload-maintenance", &shutdown);
@@ -1836,7 +1836,7 @@ impl SandboxManagerService {
         shutdown_token: tokio_util::sync::CancellationToken,
         task_tracker: &tokio_util::task::TaskTracker,
     ) {
-        let db = Arc::clone(&self.db);
+        let db = self.db.clone();
         let artifacts = self.local_artifacts.clone();
         let active_fork_copy_operations = Arc::clone(&self.active_fork_copy_operations);
         let cfg = crate::snapshot_gc::GcConfig::from_env();
@@ -1876,7 +1876,7 @@ impl SandboxManagerService {
         task_tracker: &tokio_util::task::TaskTracker,
     ) {
         task_tracker.spawn(crate::lifecycle_metrics::run(
-            Arc::clone(&self.db),
+            self.db.clone(),
             shutdown_token,
         ));
     }

@@ -886,7 +886,7 @@ impl SandboxManagerService {
     ) {
         let guard = self.critical_task_guard("node dirty outbox", &shutdown_token);
         crate::node_state_sync::start_dirty_outbox_worker(
-            Arc::clone(&self.db),
+            self.db.clone(),
             shutdown_token,
             task_tracker,
             guard,

@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use crate::db::{Connection, OptionalExtension};
 use pplx_space_common_core::types::{
     AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleDeleteReceiptId,
     AutoLifecycleIdleAction, AutoLifecyclePolicy, AutoLifecycleStage, AutoLifecycleWakePolicy,
@@ -8,7 +9,6 @@ use pplx_space_common_core::types::{
     SpaceApiRouteIdentity,
 };
 use pplx_space_common_svc::types::AutoLifecyclePolicyFingerprint;
-use rusqlite::{Connection, OptionalExtension};
 
 use super::*;
 use crate::auto_lifecycle_delete_receipts::*;
@@ -989,7 +989,7 @@ fn pending_receipt_guard_aborts_only_the_delete_statement() {
     )
     .unwrap();
 
-    let tx = crate::db::immediate_transaction(&conn).unwrap();
+    let tx = crate::db::Transaction::immediate(&conn).unwrap();
     tx.execute(
         "UPDATE sandboxes SET failure_reason = 'before guarded delete' WHERE id = ?1",
         [sandbox_id.to_string()],
@@ -1002,7 +1002,7 @@ fn pending_receipt_guard_aborts_only_the_delete_statement() {
         )
         .unwrap_err();
     let error = map_pending_receipt_delete_error(error);
-    let rusqlite::Error::ToSqlConversionFailure(error) = error else {
+    let rusqlite::Error::ToSqlConversionFailure(error) = error.raw() else {
         panic!("pending-receipt guard must map to a typed database error")
     };
     assert!(error.downcast_ref::<PendingReceiptOwnsDeletion>().is_some());
@@ -1306,10 +1306,7 @@ fn pending_receipt_fence_is_distinct_from_a_missing_sandbox() {
         RouteIdentityProvenance::ClusterFenced,
     )
     .unwrap_err();
-    assert!(matches!(
-        missing_error,
-        rusqlite::Error::QueryReturnedNoRows
-    ));
+    assert!(missing_error.is_no_rows());
 }
 
 #[test]

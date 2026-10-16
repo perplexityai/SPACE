@@ -330,7 +330,7 @@ enum QuarantineRecoveryArtifactError {
     #[error("database mutex poisoned")]
     DatabaseMutexPoisoned,
     #[error("load cleanup episode failed: {0}")]
-    Database(#[from] rusqlite::Error),
+    Database(#[from] crate::db::Error),
     #[error("quarantine recovery episode is missing its artifact/generation fence")]
     MissingRecoveryFence,
     #[error(transparent)]
@@ -375,7 +375,7 @@ pub(super) enum CleanupCompletionError {
     #[error("database mutex poisoned")]
     DatabaseMutexPoisoned,
     #[error("failed to persist cleanup completion")]
-    Database(#[from] rusqlite::Error),
+    Database(#[from] crate::db::Error),
     #[error(transparent)]
     RowIntent(#[from] crate::db::CompleteRowIntentCleanupError),
 }
@@ -830,7 +830,7 @@ impl SandboxManagerService {
     }
 
     pub(super) fn check_cleanup_selection(
-        db: &rusqlite::Connection,
+        db: &crate::db::Connection,
         sandbox_id: &str,
         expected_template: Option<&str>,
         require_template_owner: bool,
@@ -988,9 +988,9 @@ impl SandboxManagerService {
         })?;
         let transaction = match if mode.requires_immediate_transaction() || require_selection_check
         {
-            crate::db::immediate_transaction(&db)
+            crate::db::Transaction::immediate(&db)
         } else {
-            db.unchecked_transaction()
+            crate::db::Transaction::deferred(&db)
         } {
             Ok(transaction) => transaction,
             Err(error) => {
@@ -1445,7 +1445,7 @@ impl SandboxManagerService {
     }
 
     pub(super) async fn dispatch_cleanup_if_generation_current<F, Fut>(
-        db: &Arc<Mutex<rusqlite::Connection>>,
+        db: &crate::db::SharedConnection,
         sandbox_id: &str,
         expected_execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
         cleanup_fence: &(impl CleanupFenceAuthorization + ?Sized),
@@ -1666,7 +1666,7 @@ impl SandboxManagerService {
     }
 
     pub(super) fn cleanup_attempt_still_current(
-        db: &Arc<Mutex<rusqlite::Connection>>,
+        db: &crate::db::SharedConnection,
         sandbox_id: &str,
         completion: CleanupCompletion,
     ) -> Result<bool, String> {
@@ -1692,7 +1692,7 @@ impl SandboxManagerService {
     }
 
     fn async_cleanup_attempt_still_current(
-        db: &Arc<Mutex<rusqlite::Connection>>,
+        db: &crate::db::SharedConnection,
         sandbox_id: &str,
         completion: CleanupCompletion,
         cleanup_id: Option<SandboxCleanupEpisodeId>,
@@ -1709,7 +1709,7 @@ impl SandboxManagerService {
     }
 
     fn validate_quarantine_recovery_artifact(
-        db: &Arc<Mutex<rusqlite::Connection>>,
+        db: &crate::db::SharedConnection,
         sandbox_id: &str,
         cleanup_id: SandboxCleanupEpisodeId,
         verdicts: &crate::retained_source::RetainedSourceVerdicts,
@@ -1855,7 +1855,7 @@ impl SandboxManagerService {
 
     #[cfg(test)]
     pub(super) fn complete_async_cleanup(
-        db: &Arc<Mutex<rusqlite::Connection>>,
+        db: &crate::db::SharedConnection,
         sandbox_id: &str,
         completion: CleanupCompletion,
         published_artifact: Option<(LocalArtifactId, String)>,
@@ -1875,7 +1875,7 @@ impl SandboxManagerService {
     }
 
     pub(super) fn complete_cleanup_after_node_release(
-        db: &Arc<Mutex<rusqlite::Connection>>,
+        db: &crate::db::SharedConnection,
         sandbox_id: &str,
         completion: CleanupCompletion,
         expected_execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
@@ -1896,7 +1896,7 @@ impl SandboxManagerService {
     }
 
     pub(super) fn complete_cleanup_after_node_release_with_hook(
-        db: &Arc<Mutex<rusqlite::Connection>>,
+        db: &crate::db::SharedConnection,
         sandbox_id: &str,
         completion: CleanupCompletion,
         expected_execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
@@ -1924,7 +1924,7 @@ impl SandboxManagerService {
     }
 
     fn complete_fenced_row_cleanup(
-        conn: &rusqlite::Connection,
+        conn: &crate::db::Connection,
         request: RowCleanupCompletion<'_>,
         after_generation_check: impl FnOnce(),
     ) -> Result<CleanupCompletionDisposition, CleanupCompletionError> {
@@ -1966,7 +1966,7 @@ impl SandboxManagerService {
     }
 
     pub(super) fn mark_async_cleanup_failed(
-        db: &Arc<Mutex<rusqlite::Connection>>,
+        db: &crate::db::SharedConnection,
         sandbox_id: &str,
         keep_filesystem: bool,
         completion: CleanupCompletion,
@@ -2816,7 +2816,7 @@ pub(super) enum StopFlushError {
     #[error("cannot read the execution fence: {0}")]
     Database(#[source] Status),
     #[error("cannot read the execution fence: {0}")]
-    Fence(#[source] rusqlite::Error),
+    Fence(#[source] crate::db::Error),
     #[error("cannot connect to node-manager: {0}")]
     NodeManager(#[source] NodeManagerConnectError),
     #[error("cannot resume the paused VM to flush it: {0}")]

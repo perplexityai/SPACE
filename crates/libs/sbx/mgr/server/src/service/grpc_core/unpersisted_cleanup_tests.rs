@@ -17,7 +17,7 @@ use pplx_space_node_mgr_client::proto::{CleanupSandboxRequest, CleanupSandboxRes
 const CLAIM_REFUSAL: &str = "scripted lifecycle claim refusal";
 
 /// Refuse every write of a sandbox's `stopping` or `deleting` claim.
-fn refuse_lifecycle_claims(conn: &rusqlite::Connection) {
+fn refuse_lifecycle_claims(conn: &crate::db::Connection) {
     conn.execute_batch(&format!(
         "CREATE TEMP TRIGGER unpersisted_cleanup_claim_refusal
          BEFORE UPDATE OF state ON main.sandboxes
@@ -190,7 +190,7 @@ async fn unpersisted_stop_and_delete_clean_up_through_node_manager_and_report_th
                 );
                 assert!(
                     pplx_space_common_jobs::db::find_active_job(
-                        &db,
+                        db.raw(),
                         crate::db::cleanup_jobs::KIND,
                         &id
                     )

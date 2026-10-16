@@ -82,7 +82,7 @@ pub(crate) fn closed_drain_for_test() -> Arc<DrainState> {
 
 #[test]
 fn startup_cleanup_discovery_reports_database_failure_instead_of_empty_inventory() {
-    let db = Arc::new(Mutex::new(crate::db::test_conn()));
+    let db = crate::db::SharedConnection::new(crate::db::test_conn());
     db.lock()
         .unwrap()
         .execute_batch("DROP TABLE sandboxes")
@@ -672,7 +672,7 @@ pub(crate) mod service_tests {
         assert_eq!(adopt.route_identity, Some(route_identity));
     }
 
-    fn insert_pool_donor(conn: &rusqlite::Connection, sandbox_id: SandboxId) {
+    fn insert_pool_donor(conn: &crate::db::Connection, sandbox_id: SandboxId) {
         let sandbox_id_string = sandbox_id.to_string();
         let uuid8 = SandboxRuntimeLabel::from_sandbox_id(sandbox_id);
         crate::db::insert_sandbox(
@@ -1189,7 +1189,7 @@ pub(crate) mod service_tests {
                     last_observed_execution_generation = 7,
                     last_observed_route_generation_substrate_kind = 'space'
               WHERE id = ?1",
-            rusqlite::params![sandbox_id.to_string()],
+            crate::db::fixture::params![sandbox_id.to_string()],
         )
         .unwrap();
         let service = service_for_teardown_test(conn);
@@ -1447,7 +1447,7 @@ pub(crate) mod service_tests {
                     last_observed_execution_generation = 7,
                     last_observed_route_generation_substrate_kind = NULL
               WHERE id = ?1",
-            rusqlite::params![sandbox_id.to_string()],
+            crate::db::fixture::params![sandbox_id.to_string()],
         )
         .unwrap();
         let service = service_for_teardown_test(conn);
@@ -1479,7 +1479,7 @@ pub(crate) mod service_tests {
                     last_observed_execution_generation = 7,
                     last_observed_route_generation_substrate_kind = 'space'
               WHERE id = ?1",
-            rusqlite::params![sandbox_id.to_string()],
+            crate::db::fixture::params![sandbox_id.to_string()],
         )
         .unwrap();
         let service = service_for_teardown_test(conn);
@@ -1512,7 +1512,7 @@ pub(crate) mod service_tests {
                     last_observed_execution_generation = 7,
                     last_observed_route_generation_substrate_kind = NULL
               WHERE id = ?1",
-            rusqlite::params![sandbox_id.to_string()],
+            crate::db::fixture::params![sandbox_id.to_string()],
         )
         .unwrap();
         let service = service_for_teardown_test(conn);
@@ -2080,7 +2080,7 @@ pub(crate) mod service_tests {
         {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("manager.sqlite");
-            let mut conn = rusqlite::Connection::open(&path).unwrap();
+            let mut conn = crate::db::Connection::open_at(&path).unwrap();
             crate::db::create_test_schema(&mut conn);
             let sandbox_id = SandboxId::new();
             let id = sandbox_id.to_string();
@@ -2153,7 +2153,8 @@ pub(crate) mod service_tests {
                     .unwrap();
             }
             drop(service);
-            let recovered = service_for_teardown_test(rusqlite::Connection::open(&path).unwrap());
+            let recovered =
+                service_for_teardown_test(crate::db::Connection::open_at(&path).unwrap());
             recovered
                 .recover_interrupted_startup_states()
                 .await
@@ -2250,7 +2251,7 @@ pub(crate) mod service_tests {
         // makes a rolled-back manager reject the same legitimate route installation.
         conn.execute(
             "UPDATE sandbox_cleanup_episodes SET activation_attempt_id = ?2 WHERE sandbox_id = ?1",
-            rusqlite::params![id, operation_b.to_string()],
+            crate::db::fixture::params![id, operation_b.to_string()],
         )
         .unwrap();
         assert!(
@@ -3675,23 +3676,19 @@ pub(crate) mod service_tests {
         use pplx_space_metrics::sandbox::worker::RouteIdentityAdoptionReason;
 
         assert_eq!(
-            route_identity_adoption_write_rejection_reason(&rusqlite::Error::QueryReturnedNoRows),
+            route_identity_adoption_write_rejection_reason(&crate::db::Error::no_rows()),
             RouteIdentityAdoptionReason::NotFound
         );
         assert_eq!(
-            route_identity_adoption_write_rejection_reason(
-                &rusqlite::Error::ToSqlConversionFailure(Box::new(
-                    crate::db::auto_lifecycle_delete_receipts::PendingReceiptOwnsExecution,
-                )),
-            ),
+            route_identity_adoption_write_rejection_reason(&crate::db::Error::to_sql_conversion(
+                crate::db::auto_lifecycle_delete_receipts::PendingReceiptOwnsExecution,
+            ),),
             RouteIdentityAdoptionReason::PendingReceiptOwnsExecution
         );
         assert_eq!(
-            route_identity_adoption_write_rejection_reason(
-                &rusqlite::Error::ToSqlConversionFailure(Box::new(
-                    crate::db::auto_lifecycle_delete_receipts::LifecycleOwnsExecution,
-                )),
-            ),
+            route_identity_adoption_write_rejection_reason(&crate::db::Error::to_sql_conversion(
+                crate::db::auto_lifecycle_delete_receipts::LifecycleOwnsExecution,
+            ),),
             RouteIdentityAdoptionReason::LifecycleOwnsExecution
         );
     }
@@ -3700,7 +3697,7 @@ pub(crate) mod service_tests {
     async fn list_build_referencing_sandboxes_includes_user_sandboxes_and_scopes_out_deleting() {
         let conn = crate::db::test_conn();
 
-        let insert = |conn: &rusqlite::Connection,
+        let insert = |conn: &crate::db::Connection,
                       id: &str,
                       state: SandboxState,
                       hash: &str,
@@ -3884,7 +3881,7 @@ pub(crate) mod service_tests {
         // are empty for a template-manager peer yet must continue the scan.
         conn.execute(
             "UPDATE sandboxes SET user = ?2 WHERE id = ?1",
-            rusqlite::params![
+            crate::db::fixture::params![
                 ids[4],
                 pplx_space_common_core::types::TEMPLATE_MANAGER_SANDBOX_OWNER.as_str()
             ],
@@ -3944,7 +3941,7 @@ pub(crate) mod service_tests {
         for id in &ids[..2] {
             conn.execute(
                 "UPDATE sandboxes SET template = ?2 WHERE id = ?1",
-                rusqlite::params![id, template],
+                crate::db::fixture::params![id, template],
             )
             .unwrap();
         }
@@ -4299,7 +4296,7 @@ pub(crate) mod service_tests {
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Creating);
         conn.execute(
             "UPDATE sandboxes SET network_policy_override_json = ?1 WHERE id = ?2",
-            rusqlite::params![
+            crate::db::fixture::params![
                 "{\"version\":\"v9\",\"egress\":{\"default_action\":\"deny\"}}",
                 &sandbox_id
             ],
@@ -4327,7 +4324,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Restoring);
-        let db = Arc::new(Mutex::new(conn));
+        let db = crate::db::SharedConnection::new(conn);
 
         let sbx_uid = 10042;
         let netgtw_pid = 4242;
@@ -4347,7 +4344,7 @@ pub(crate) mod service_tests {
         // Fake jailer launch: still in flight when the gateway arm completes.
         // It observes what host-control auth would see for a policy pull
         // issued by the just-launched gateway at this point.
-        let jailer_db = Arc::clone(&db);
+        let jailer_db = db.clone();
         let jailer_arm = async move {
             gateway_arm_done_rx.await.expect("gateway arm dropped");
             let conn = jailer_db.lock().expect("mutex poisoned");
@@ -5109,7 +5106,7 @@ pub(crate) mod service_tests {
             let conn = crate::db::test_conn();
             let sandbox_id = SandboxId::new().to_string();
             insert_test_sandbox(&conn, &sandbox_id, SandboxState::Resuming);
-            let db = Arc::new(std::sync::Mutex::new(conn));
+            let db = crate::db::SharedConnection::new(conn);
 
             let error = super::super::auth_lookup::finish_resident_resume_after_guest_setup(
                 &db,
@@ -5134,7 +5131,7 @@ pub(crate) mod service_tests {
             let conn = crate::db::test_conn();
             let sandbox_id = SandboxId::new().to_string();
             insert_test_sandbox(&conn, &sandbox_id, SandboxState::Resuming);
-            let db = Arc::new(std::sync::Mutex::new(conn));
+            let db = crate::db::SharedConnection::new(conn);
 
             let error = super::super::auth_lookup::finish_resident_resume_after_guest_setup(
                 &db,
@@ -5175,7 +5172,7 @@ pub(crate) mod service_tests {
             let conn = crate::db::test_conn();
             let sandbox_id = SandboxId::new().to_string();
             insert_test_sandbox(&conn, &sandbox_id, SandboxState::Resuming);
-            let db = Arc::new(std::sync::Mutex::new(conn));
+            let db = crate::db::SharedConnection::new(conn);
 
             let result = super::super::auth_lookup::finish_resident_resume_after_rpc_error(
                 &db,
@@ -5386,10 +5383,10 @@ pub(crate) mod service_tests {
             crate::db::CleanupCompletion::DeleteRow,
         )
         .unwrap();
-        let db = Arc::new(Mutex::new(conn));
+        let db = crate::db::SharedConnection::new(conn);
 
         let result = wait_ready_and_mark_started(
-            Arc::clone(&db),
+            db.clone(),
             &sandbox_id,
             &BTreeMap::new(),
             1,
@@ -5493,7 +5490,7 @@ pub(crate) mod service_tests {
                  JOIN sandbox_quarantine_history AS history
                    ON history.quarantine_id = current.quarantine_id
                  WHERE current.sandbox_id = ?1",
-                rusqlite::params![sandbox_id_string],
+                crate::db::fixture::params![sandbox_id_string],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
@@ -6020,7 +6017,7 @@ pub(crate) mod service_tests {
     #[test]
     fn reconcile_inventory_does_not_delete_row_changed_after_inventory_snapshot() {
         struct MutatingInventoryDb {
-            conn: std::cell::RefCell<rusqlite::Connection>,
+            conn: std::cell::RefCell<crate::db::Connection>,
             calls: std::cell::Cell<usize>,
             sandbox_id: String,
         }
@@ -6028,7 +6025,7 @@ pub(crate) mod service_tests {
         impl InventoryDbAccess for MutatingInventoryDb {
             fn with_connection<T>(
                 &self,
-                operation: impl FnOnce(&rusqlite::Connection) -> T,
+                operation: impl FnOnce(&crate::db::Connection) -> T,
             ) -> Result<T, super::super::cache_cleanup::InventoryError> {
                 let call = self.calls.get();
                 self.calls.set(call + 1);
@@ -6038,7 +6035,7 @@ pub(crate) mod service_tests {
                         "UPDATE sandboxes
                          SET state = 'started', uid = 10000, pid = 1234, updated_at = 'new'
                          WHERE id = ?1",
-                        rusqlite::params![&self.sandbox_id],
+                        crate::db::fixture::params![&self.sandbox_id],
                     )?;
                 }
                 Ok(operation(&conn))
@@ -6139,7 +6136,7 @@ pub(crate) mod service_tests {
     #[tokio::test]
     async fn reconcile_inventory_staging_lock_protects_active_and_reclaims_abandoned_restore() {
         let conn = crate::db::test_conn();
-        let db = std::sync::Mutex::new(conn);
+        let db = crate::db::SharedConnection::new(conn);
         let cache_dir = tempfile::tempdir().unwrap();
         let run_dir = tempfile::tempdir().unwrap();
         let sandbox_id = SandboxId::new();
@@ -6471,7 +6468,7 @@ pub(crate) mod service_tests {
             if index == 0 || index == READ_BATCH_ITEMS {
                 conn.execute(
                     "UPDATE sandboxes SET process_env_json = ?2 WHERE id = ?1",
-                    rusqlite::params![id, env],
+                    crate::db::fixture::params![id, env],
                 )
                 .unwrap();
             }
@@ -6518,7 +6515,11 @@ pub(crate) mod service_tests {
                 "INSERT INTO sandbox_cleanup_episodes
                 (sandbox_id,cleanup_id,completion,keep_filesystem,phase,activation_state,created_at)
                 VALUES (?1,?2,?3,0,'armed','creating',1)",
-                rusqlite::params![id, SandboxCleanupEpisodeId::new().to_string(), completion],
+                crate::db::fixture::params![
+                    id,
+                    SandboxCleanupEpisodeId::new().to_string(),
+                    completion
+                ],
             )
             .unwrap();
             let service = service_for_teardown_test(conn);
@@ -6648,25 +6649,28 @@ pub(crate) mod service_tests {
         }
     }
 
-    pub(crate) fn insert_test_sandbox(conn: &rusqlite::Connection, id: &str, state: SandboxState) {
+    pub(crate) fn insert_test_sandbox(conn: &crate::db::Connection, id: &str, state: SandboxState) {
         insert_test_sandbox_with_policy(conn, id, state, &AutoLifecyclePolicy::disabled());
     }
 
-    fn mark_test_remote_restore_artifact_staging(conn: &rusqlite::Connection, id: &str) {
+    fn mark_test_remote_restore_artifact_staging(conn: &crate::db::Connection, id: &str) {
         conn.execute(
             "UPDATE sandboxes
              SET restore_origin = 'remote',
                  restore_phase = 'metadata_staging',
                  restore_storage_uri = ?2
              WHERE id = ?1 AND state = 'restoring'",
-            rusqlite::params![id, format!("s3://snapshots/suspend/{id}?region=us-east-1")],
+            crate::db::fixture::params![
+                id,
+                format!("s3://snapshots/suspend/{id}?region=us-east-1")
+            ],
         )
         .unwrap();
         assert!(crate::db::record_remote_restore_artifact_staging(conn, id).unwrap());
     }
 
     pub(crate) fn insert_test_sandbox_with_runtime(
-        conn: &rusqlite::Connection,
+        conn: &crate::db::Connection,
         id: &str,
         state: SandboxState,
     ) {
@@ -6694,19 +6698,19 @@ pub(crate) mod service_tests {
         if state != SandboxState::Started {
             conn.execute(
                 "UPDATE sandboxes SET state = ?1 WHERE id = ?2",
-                rusqlite::params![state.as_str(), id],
+                crate::db::fixture::params![state.as_str(), id],
             )
             .unwrap();
         }
     }
 
-    fn insert_started_test_sandbox(conn: &rusqlite::Connection, id: &str) {
+    fn insert_started_test_sandbox(conn: &crate::db::Connection, id: &str) {
         insert_test_sandbox_with_runtime(conn, id, SandboxState::Started);
     }
 
     /// Move a live `started` row to `restoring`, keeping its empty restore
     /// columns. No production edge writes this.
-    fn restage_started_as_restoring(conn: &rusqlite::Connection, id: &str) {
+    fn restage_started_as_restoring(conn: &crate::db::Connection, id: &str) {
         assert_eq!(
             crate::db::update_state_from_states(
                 conn,
@@ -6721,13 +6725,13 @@ pub(crate) mod service_tests {
         );
     }
 
-    pub(crate) fn complete_runtime_endpoint_identity(conn: &rusqlite::Connection, id: &str) {
+    pub(crate) fn complete_runtime_endpoint_identity(conn: &crate::db::Connection, id: &str) {
         conn.execute(
             "UPDATE sandboxes
                 SET space_api_route_execution_generation = 1,
                     space_api_route_activation_attempt_id = ?1
               WHERE id = ?2",
-            rusqlite::params![SandboxActivationAttemptId::new().to_string(), id],
+            crate::db::fixture::params![SandboxActivationAttemptId::new().to_string(), id],
         )
         .unwrap();
     }
@@ -6772,7 +6776,7 @@ pub(crate) mod service_tests {
     }
 
     fn insert_platform_owned_sandbox(
-        conn: &rusqlite::Connection,
+        conn: &crate::db::Connection,
         id: &str,
         state: SandboxState,
         pool_template: Option<&str>,
@@ -6992,7 +6996,7 @@ pub(crate) mod service_tests {
         insert_platform_owned_sandbox(&conn, &sandbox_id, SandboxState::Restoring, None);
         conn.execute(
             "UPDATE sandboxes SET updated_at = '0' WHERE id = ?1",
-            rusqlite::params![sandbox_id],
+            crate::db::fixture::params![sandbox_id],
         )
         .unwrap();
         let service = service_with_runtime_probe(conn, false);
@@ -7018,7 +7022,7 @@ pub(crate) mod service_tests {
         );
         conn.execute(
             "UPDATE sandboxes SET updated_at = '0' WHERE id = ?1",
-            rusqlite::params![sandbox_id],
+            crate::db::fixture::params![sandbox_id],
         )
         .unwrap();
         let service = service_with_runtime_probe(conn, false);
@@ -7073,7 +7077,7 @@ pub(crate) mod service_tests {
             }
             conn.execute(
                 "UPDATE sandboxes SET updated_at = '0' WHERE id = ?1",
-                rusqlite::params![sandbox_id],
+                crate::db::fixture::params![sandbox_id],
             )
             .unwrap();
             if state == SandboxState::Quarantined {
@@ -7145,7 +7149,7 @@ pub(crate) mod service_tests {
         insert_platform_owned_sandbox(&conn, &sandbox_id, SandboxState::Stopped, None);
         conn.execute(
             "UPDATE sandboxes SET updated_at = '0' WHERE id = ?1",
-            rusqlite::params![sandbox_id],
+            crate::db::fixture::params![sandbox_id],
         )
         .unwrap();
         let service = service_with_runtime_probe(conn, false);
@@ -7226,7 +7230,7 @@ pub(crate) mod service_tests {
             }
             conn.execute(
                 "UPDATE sandboxes SET updated_at = '0' WHERE id = ?1",
-                rusqlite::params![sandbox_id],
+                crate::db::fixture::params![sandbox_id],
             )
             .unwrap();
             let service = service_with_runtime_probe(conn, false);
@@ -7344,7 +7348,7 @@ pub(crate) mod service_tests {
         conn.execute(
             "UPDATE sandboxes SET updated_at = ?1, restore_origin = 'remote', \
              restore_phase = 'metadata_staging', restore_storage_uri = ?3 WHERE id = ?2",
-            rusqlite::params![
+            crate::db::fixture::params![
                 decided_version,
                 sandbox_id,
                 format!("s3://snapshots/suspend/{sandbox_id}?region=us-east-1")
@@ -7387,7 +7391,7 @@ pub(crate) mod service_tests {
     /// Assembled out of the production writers rather than raw SQL so the
     /// fixture cannot drift from the shape those writers actually produce.
     pub(crate) fn insert_stranded_teardown_suspend_sandbox(
-        conn: &rusqlite::Connection,
+        conn: &crate::db::Connection,
         sandbox_id: SandboxId,
         execution_generation: ExecutionGeneration,
     ) -> LocalArtifactId {
@@ -7423,22 +7427,22 @@ pub(crate) mod service_tests {
         local_artifact_id
     }
 
-    fn set_test_row_version(conn: &rusqlite::Connection, sandbox_id: &str, updated_at: &str) {
+    fn set_test_row_version(conn: &crate::db::Connection, sandbox_id: &str, updated_at: &str) {
         conn.execute(
             "UPDATE sandboxes SET updated_at = ?1 WHERE id = ?2",
-            rusqlite::params![updated_at, sandbox_id],
+            crate::db::fixture::params![updated_at, sandbox_id],
         )
         .unwrap();
     }
 
     fn set_test_state_changed_at(
-        conn: &rusqlite::Connection,
+        conn: &crate::db::Connection,
         sandbox_id: &str,
         state_changed_at: &str,
     ) {
         conn.execute(
             "UPDATE sandboxes SET state_changed_at = ?1 WHERE id = ?2",
-            rusqlite::params![state_changed_at, sandbox_id],
+            crate::db::fixture::params![state_changed_at, sandbox_id],
         )
         .unwrap();
     }
@@ -7537,10 +7541,7 @@ pub(crate) mod service_tests {
 
     impl RowToucher {
         /// Start touching; returns once the first touch has landed.
-        async fn start(
-            db: Arc<std::sync::Mutex<rusqlite::Connection>>,
-            sandbox_id: String,
-        ) -> Self {
+        async fn start(db: crate::db::SharedConnection, sandbox_id: String) -> Self {
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let flag = Arc::clone(&stop);
             let (landed, first_touch) = tokio::sync::oneshot::channel();
@@ -7553,7 +7554,7 @@ pub(crate) mod service_tests {
                         touches += db
                             .execute(
                                 "UPDATE sandboxes SET updated_at = ?1 WHERE id = ?2",
-                                rusqlite::params![
+                                crate::db::fixture::params![
                                     crate::sandbox_eviction::now_secs().to_string(),
                                     sandbox_id
                                 ],
@@ -7657,7 +7658,7 @@ pub(crate) mod service_tests {
         // above and may move again at any point during the RPC. Nothing here
         // forces a write into the gap between the decision and the claim;
         // the claim must commit whether or not one lands there.
-        let toucher = RowToucher::start(Arc::clone(&service.db), sandbox_id_string.clone()).await;
+        let toucher = RowToucher::start(service.db.clone(), sandbox_id_string.clone()).await;
         let evicted = tokio::time::timeout(
             Duration::from_secs(5),
             service.evict_cluster_deleted_sandbox(root_peer_request(&sandbox_id_string)),
@@ -7810,7 +7811,7 @@ pub(crate) mod service_tests {
                  current_local_artifact_kind = NULL,
                  current_local_artifact_origin = NULL
              WHERE id = ?1",
-            rusqlite::params![sandbox_id_string],
+            crate::db::fixture::params![sandbox_id_string],
         )
         .unwrap();
         set_test_state_changed_at(&conn, &sandbox_id_string, "1000000000");
@@ -7849,7 +7850,7 @@ pub(crate) mod service_tests {
             if let Some(reason) = failure_reason {
                 conn.execute(
                     "UPDATE sandboxes SET failure_reason = ?1 WHERE id = ?2",
-                    rusqlite::params![reason, sandbox_id_string],
+                    crate::db::fixture::params![reason, sandbox_id_string],
                 )
                 .unwrap();
             }
@@ -7870,7 +7871,7 @@ pub(crate) mod service_tests {
                     .unwrap()
                     .query_row(
                         "SELECT current_local_artifact_id IS NOT NULL FROM sandboxes WHERE id = ?1",
-                        rusqlite::params![sandbox_id_string],
+                        crate::db::fixture::params![sandbox_id_string],
                         |row| row.get::<_, bool>(0),
                     )
                     .unwrap(),
@@ -7969,7 +7970,7 @@ pub(crate) mod service_tests {
         );
     }
 
-    fn state_changed_at(conn: &rusqlite::Connection, sandbox_id: &str) -> String {
+    fn state_changed_at(conn: &crate::db::Connection, sandbox_id: &str) -> String {
         crate::db::sandbox_state_changed_at_witness(conn, sandbox_id)
             .unwrap()
             .unwrap()
@@ -7985,7 +7986,7 @@ pub(crate) mod service_tests {
         // artifact, and `state_changed_at` — a tuple nothing can leave intact
         // while moving the sandbox on.
         let execution_generation = ExecutionGeneration::new(7).unwrap();
-        let claim_after = |mutate: &dyn Fn(&rusqlite::Connection, &str, LocalArtifactId)| {
+        let claim_after = |mutate: &dyn Fn(&crate::db::Connection, &str, LocalArtifactId)| {
             let conn = crate::db::test_conn();
             let sandbox_id = SandboxId::new();
             let sandbox_id_string = sandbox_id.to_string();
@@ -8023,7 +8024,7 @@ pub(crate) mod service_tests {
             !claim_after(&|conn, id, _| {
                 conn.execute(
                     "UPDATE sandboxes SET current_local_artifact_id = ?1 WHERE id = ?2",
-                    rusqlite::params![LocalArtifactId::new().to_string(), id],
+                    crate::db::fixture::params![LocalArtifactId::new().to_string(), id],
                 )
                 .unwrap();
             }),
@@ -8033,7 +8034,7 @@ pub(crate) mod service_tests {
             !claim_after(&|conn, id, _| {
                 conn.execute(
                     "UPDATE sandboxes SET failure_reason = NULL WHERE id = ?1",
-                    rusqlite::params![id],
+                    crate::db::fixture::params![id],
                 )
                 .unwrap();
             }),
@@ -8043,7 +8044,7 @@ pub(crate) mod service_tests {
             !claim_after(&|conn, id, _| {
                 conn.execute(
                     "UPDATE sandboxes SET state = 'suspended' WHERE id = ?1",
-                    rusqlite::params![id],
+                    crate::db::fixture::params![id],
                 )
                 .unwrap();
             }),
@@ -8156,7 +8157,7 @@ pub(crate) mod service_tests {
         insert_platform_owned_sandbox(&conn, &sandbox_id, SandboxState::Suspended, None);
         conn.execute(
             "UPDATE sandboxes SET updated_at = 'not-a-timestamp' WHERE id = ?1",
-            rusqlite::params![sandbox_id],
+            crate::db::fixture::params![sandbox_id],
         )
         .unwrap();
         let service = service_with_runtime_probe(conn, false);
@@ -8177,7 +8178,7 @@ pub(crate) mod service_tests {
         insert_platform_owned_sandbox(&conn, &sandbox_id, SandboxState::Suspended, None);
         conn.execute(
             "UPDATE sandboxes SET updated_at = '0' WHERE id = ?1",
-            rusqlite::params![sandbox_id],
+            crate::db::fixture::params![sandbox_id],
         )
         .unwrap();
         let service = service_with_runtime_probe(conn, false);
@@ -8327,7 +8328,7 @@ pub(crate) mod service_tests {
 
         assert!(
             !SandboxManagerService::cleanup_attempt_still_current(
-                &std::sync::Arc::new(std::sync::Mutex::new(conn)),
+                &crate::db::SharedConnection::new(conn),
                 &sandbox_id.to_string(),
                 CleanupCompletion::DeleteRow,
             )
@@ -8384,7 +8385,7 @@ pub(crate) mod service_tests {
                 SET cleanup_completion = 'mark_failed',
                     cleanup_keep_filesystem = TRUE
               WHERE id = ?1",
-            rusqlite::params![sandbox_id],
+            crate::db::fixture::params![sandbox_id],
         )
         .unwrap();
         conn.execute(
@@ -8394,7 +8395,7 @@ pub(crate) mod service_tests {
                  quarantine_reason_code, failure_message, created_at
              ) VALUES (?1, ?2, 'mark_failed', TRUE, 'requested', 'restoring',
                        'restoring', 1, 'restore_prepare_failed', 'cleanup requested', 1)",
-            rusqlite::params![sandbox_id, cleanup_id.to_string()],
+            crate::db::fixture::params![sandbox_id, cleanup_id.to_string()],
         )
         .unwrap();
         let capture = SandboxEventCapture::default();
@@ -8534,7 +8535,7 @@ pub(crate) mod service_tests {
     /// A service whose runtime probe answers `runtime_live` for every sandbox
     /// instead of reading the host's run directory.
     pub(crate) fn service_with_runtime_probe(
-        conn: rusqlite::Connection,
+        conn: crate::db::Connection,
         runtime_live: bool,
     ) -> SandboxManagerService {
         SandboxManagerService::new_with_options(
@@ -8548,7 +8549,7 @@ pub(crate) mod service_tests {
 
     /// Teardown tests compare route identities against this node's identity,
     /// [`crate::service::test_options::test_node_id`].
-    pub(crate) fn service_for_teardown_test(conn: rusqlite::Connection) -> SandboxManagerService {
+    pub(crate) fn service_for_teardown_test(conn: crate::db::Connection) -> SandboxManagerService {
         SandboxManagerService::for_test(conn)
     }
 
@@ -8968,7 +8969,7 @@ pub(crate) mod service_tests {
                      current_local_artifact_kind = NULL,
                      current_local_artifact_origin = NULL
                  WHERE id = ?1",
-                rusqlite::params![sandbox_id.to_string()],
+                crate::db::fixture::params![sandbox_id.to_string()],
             )
             .unwrap();
             let legacy = crate::db::get_sandbox(&conn, &sandbox_id.to_string())
@@ -9085,7 +9086,7 @@ pub(crate) mod service_tests {
             // the actual recovery writers before attempting runtime publication.
             conn.execute(
                 "UPDATE sandboxes SET state = 'restoring' WHERE id = ?1",
-                rusqlite::params![sandbox_id.to_string()],
+                crate::db::fixture::params![sandbox_id.to_string()],
             )
             .unwrap();
             let producing_generation = ExecutionGeneration::new(7).unwrap();
@@ -9166,7 +9167,7 @@ pub(crate) mod service_tests {
                         "UPDATE sandboxes SET current_local_artifact_id = NULL,
                          current_local_artifact_kind = NULL, current_local_artifact_origin = NULL
                          WHERE id = ?1",
-                        rusqlite::params![sandbox_id.to_string()],
+                        crate::db::fixture::params![sandbox_id.to_string()],
                     )
                     .unwrap();
                     Some(tonic::Code::FailedPrecondition)
@@ -9174,7 +9175,10 @@ pub(crate) mod service_tests {
                 Case::PriorNodeIdentity => {
                     conn.execute(
                         "UPDATE sandboxes SET space_api_route_node_id = ?1 WHERE id = ?2",
-                        rusqlite::params![NodeId::new().to_string(), sandbox_id.to_string()],
+                        crate::db::fixture::params![
+                            NodeId::new().to_string(),
+                            sandbox_id.to_string()
+                        ],
                     )
                     .unwrap();
                     Some(tonic::Code::FailedPrecondition)
@@ -9683,7 +9687,7 @@ pub(crate) mod service_tests {
         let current_generation = ExecutionGeneration::new(2).unwrap();
 
         {
-            let mut conn = rusqlite::Connection::open(&db_path).unwrap();
+            let mut conn = crate::db::Connection::open_at(&db_path).unwrap();
             crate::db::create_test_schema(&mut conn);
             insert_test_sandbox(&conn, &sandbox_id.to_string(), SandboxState::Paused);
             let service = service_for_teardown_test(conn);
@@ -9692,7 +9696,7 @@ pub(crate) mod service_tests {
                 .unwrap();
         }
 
-        let service = service_for_teardown_test(rusqlite::Connection::open(&db_path).unwrap());
+        let service = service_for_teardown_test(crate::db::Connection::open_at(&db_path).unwrap());
         let response = service
             .prepare_teardown_suspend(internal_request(prepare_teardown_suspend_request(
                 sandbox_id.to_string(),
@@ -9855,7 +9859,7 @@ pub(crate) mod service_tests {
               WHERE sandbox_id = ?1
                 AND state = 'pending'
                 AND execution_generation < ?2",
-            rusqlite::params![sandbox_id.to_string(), 5],
+            crate::db::fixture::params![sandbox_id.to_string(), 5],
         )
         .unwrap();
         let service = service_for_teardown_test(conn);
@@ -10880,8 +10884,7 @@ pub(crate) mod service_tests {
 
     #[tokio::test]
     async fn unpersisted_delete_clears_activity_without_replacing_live_lock_identity() {
-        let service =
-            SandboxManagerService::for_test(rusqlite::Connection::open_in_memory().unwrap());
+        let service = SandboxManagerService::for_test(crate::db::Connection::open_in_memory());
         let sandbox_id = "sbx-delete-persistence-failure";
         let wake_before = service.auto_lifecycle.wake_lock(sandbox_id);
         service.auto_lifecycle.record_wake_completed(sandbox_id);
@@ -10941,7 +10944,7 @@ pub(crate) mod service_tests {
         {
             let conn = service.db.lock().unwrap();
             let bookkeeping = crate::snapshot_upload_jobs::spawn_backup_bookkeeping(
-                Arc::clone(&service.db),
+                service.db.clone(),
                 &service.drain_state,
                 &payloads[0],
                 Arc::new(crate::retained_source::FakeInspector::new(
@@ -10963,7 +10966,7 @@ pub(crate) mod service_tests {
         .expect("blocking bookkeeping must release ownership when it completes");
         assert!(
             crate::snapshot_upload_jobs::spawn_backup_bookkeeping(
-                Arc::clone(&service.db),
+                service.db.clone(),
                 &service.drain_state,
                 &payloads[1],
                 Arc::new(crate::retained_source::FakeInspector::new(
@@ -10986,14 +10989,14 @@ pub(crate) mod service_tests {
             assert_eq!(stamped, completed);
         }
         pplx_space_common_jobs::db::prune_terminal_jobs(
-            &conn,
+            conn.raw(),
             pplx_space_common_jobs::COMPLETED_JOB_RETENTION,
             pplx_space_common_jobs::FAILED_JOB_RETENTION,
         )
         .unwrap();
         assert!(
             pplx_space_common_jobs::db::get_job(
-                &conn,
+                conn.raw(),
                 &"019d84bd-280d-7331-99c6-b63377f3a3a2".parse().unwrap()
             )
             .unwrap()
@@ -11113,7 +11116,7 @@ pub(crate) mod service_tests {
             db.execute(
                 "UPDATE local_artifacts SET backup_completed_at = NULL
                  WHERE local_artifact_id = ?1",
-                rusqlite::params![local_artifact_id.to_string()],
+                crate::db::fixture::params![local_artifact_id.to_string()],
             )
             .unwrap();
         }
@@ -11134,7 +11137,7 @@ pub(crate) mod service_tests {
     }
 
     fn delete_sandbox_with_generation_receipt(
-        conn: &rusqlite::Connection,
+        conn: &crate::db::Connection,
         sandbox_id: &str,
         deleted_generation: ExecutionGeneration,
     ) {
@@ -11250,7 +11253,7 @@ pub(crate) mod service_tests {
                     let generation = ExecutionGeneration::new(7).unwrap();
                     {
                         crate::db::create_test_schema_on_disk(&db_path);
-                        let conn = rusqlite::Connection::open(&db_path).unwrap();
+                        let conn = crate::db::Connection::open_at(&db_path).unwrap();
                         insert_test_sandbox(&conn, &id, target);
                         let fields = runtime_fields(generation, 7);
                         let episode = crate::db::begin_activation(
@@ -11304,7 +11307,7 @@ pub(crate) mod service_tests {
                                     .operation
                                     .unwrap();
                                 pplx_space_common_jobs::db::fail_job_permanent(
-                                    &conn,
+                                    conn.raw(),
                                     &operation.job_id,
                                     "suspend publication failed",
                                     None,
@@ -11344,7 +11347,7 @@ pub(crate) mod service_tests {
                             .unwrap();
                             if case == "cleanup_episode" {
                                 // A conflicting episode must block even with a dormant row.
-                                conn.execute("UPDATE sandboxes SET state = ?2, cleanup_completion = NULL, cleanup_keep_filesystem = NULL WHERE id = ?1", rusqlite::params![id, target.as_str()]).unwrap();
+                                conn.execute("UPDATE sandboxes SET state = ?2, cleanup_completion = NULL, cleanup_keep_filesystem = NULL WHERE id = ?1", crate::db::fixture::params![id, target.as_str()]).unwrap();
                             } else {
                                 crate::db::update_runtime_fields_for_activation(
                                     &conn,
@@ -11365,11 +11368,12 @@ pub(crate) mod service_tests {
                                 }
                             }
                             // A retained historical receipt must not override a new owner.
-                            conn.execute("UPDATE sandboxes SET transition_receipt_id = ?2, transition_receipt_kind = ?3, transition_receipt_target_state = ?4, transition_receipt_execution_generation = ?5, transition_receipt_reason_code = ?6, transition_receipt_activation_attempt_id = ?7 WHERE id = ?1", rusqlite::params![id, old_receipt.transition_receipt_id, old_receipt.transition_receipt_kind, old_receipt.transition_receipt_target_state, old_receipt.transition_receipt_execution_generation, old_receipt.transition_receipt_reason_code, old_receipt.transition_receipt_activation_attempt_id]).unwrap();
+                            conn.execute("UPDATE sandboxes SET transition_receipt_id = ?2, transition_receipt_kind = ?3, transition_receipt_target_state = ?4, transition_receipt_execution_generation = ?5, transition_receipt_reason_code = ?6, transition_receipt_activation_attempt_id = ?7 WHERE id = ?1", crate::db::fixture::params![id, old_receipt.transition_receipt_id, old_receipt.transition_receipt_kind, old_receipt.transition_receipt_target_state, old_receipt.transition_receipt_execution_generation, old_receipt.transition_receipt_reason_code, old_receipt.transition_receipt_activation_attempt_id]).unwrap();
                         }
                     }
-                    let service =
-                        service_for_teardown_test(rusqlite::Connection::open(&db_path).unwrap());
+                    let service = service_for_teardown_test(
+                        crate::db::Connection::open_at(&db_path).unwrap(),
+                    );
                     let before = crate::db::get_sandbox(&service.db.lock().unwrap(), &id)
                         .unwrap()
                         .unwrap();
@@ -11487,11 +11491,11 @@ pub(crate) mod service_tests {
         let sandbox_id = SandboxId::new().to_string();
         let deleted_generation = ExecutionGeneration::new(2).unwrap();
         {
-            let mut conn = rusqlite::Connection::open(&db_path).unwrap();
+            let mut conn = crate::db::Connection::open_at(&db_path).unwrap();
             crate::db::create_test_schema(&mut conn);
             delete_sandbox_with_generation_receipt(&conn, &sandbox_id, deleted_generation);
         }
-        let service = service_for_teardown_test(rusqlite::Connection::open(&db_path).unwrap());
+        let service = service_for_teardown_test(crate::db::Connection::open_at(&db_path).unwrap());
 
         let deleted = service
             .prepare_teardown_suspend(internal_request(prepare_teardown_suspend_request(
@@ -11536,12 +11540,12 @@ pub(crate) mod service_tests {
             .as_secs() as i64;
         conn.execute(
             "UPDATE sandbox_execution_delete_receipts SET deleted_at = ?1 WHERE sandbox_id = ?2",
-            rusqlite::params![now - 7 * 24 * 60 * 60 + 60, retained_sandbox_id],
+            crate::db::fixture::params![now - 7 * 24 * 60 * 60 + 60, retained_sandbox_id],
         )
         .unwrap();
         conn.execute(
             "UPDATE sandbox_execution_delete_receipts SET deleted_at = ?1 WHERE sandbox_id = ?2",
-            rusqlite::params![now - 7 * 24 * 60 * 60 - 1, expired_sandbox_id],
+            crate::db::fixture::params![now - 7 * 24 * 60 * 60 - 1, expired_sandbox_id],
         )
         .unwrap();
         let service = service_for_teardown_test(conn);
@@ -12289,7 +12293,7 @@ pub(crate) mod service_tests {
     /// [`service_with_runtime_probe`] with its host dependencies under the
     /// caller's `sockets` directory.
     pub(crate) fn service_with_runtime_liveness_and_absent_sockets(
-        conn: rusqlite::Connection,
+        conn: crate::db::Connection,
         runtime_live: bool,
         sockets: &std::path::Path,
     ) -> SandboxManagerService {
@@ -12302,7 +12306,7 @@ pub(crate) mod service_tests {
         )
     }
 
-    fn insert_suspending_resuspend(conn: &rusqlite::Connection, id: &str) -> LocalArtifactId {
+    fn insert_suspending_resuspend(conn: &crate::db::Connection, id: &str) -> LocalArtifactId {
         insert_test_sandbox(conn, id, SandboxState::Paused);
         let predecessor = LocalArtifactId::new();
         conn.execute(
@@ -12311,7 +12315,7 @@ pub(crate) mod service_tests {
                     current_local_artifact_kind = 'full',
                     current_local_artifact_origin = 'suspend'
               WHERE id = ?2",
-            rusqlite::params![predecessor.to_string(), id],
+            crate::db::fixture::params![predecessor.to_string(), id],
         )
         .unwrap();
         assert!(crate::db::begin_suspend(conn, id).unwrap());
@@ -12956,7 +12960,7 @@ pub(crate) mod service_tests {
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Suspending);
         conn.execute(
             "UPDATE sandboxes SET uid = ?1, spaced_host_pid = ?2, netgtw_pid = ?3 WHERE id = ?4",
-            rusqlite::params![20_001, 30_001, 30_002, sandbox_id],
+            crate::db::fixture::params![20_001, 30_001, 30_002, sandbox_id],
         )
         .unwrap();
 
@@ -12973,7 +12977,7 @@ pub(crate) mod service_tests {
             let db = service.db.lock().expect("mutex poisoned");
             db.execute(
                 "UPDATE sandboxes SET spaced_host_pid = ?1, netgtw_pid = ?2 WHERE id = ?3",
-                rusqlite::params![40_001, 40_002, sandbox_id],
+                crate::db::fixture::params![40_001, 40_002, sandbox_id],
             )
             .unwrap();
         }
@@ -13149,7 +13153,7 @@ pub(crate) mod service_tests {
         assert!(row.failure_reason.is_none());
     }
 
-    fn insert_orphaned_test_sandbox(conn: &rusqlite::Connection, id: &str, state: SandboxState) {
+    fn insert_orphaned_test_sandbox(conn: &crate::db::Connection, id: &str, state: SandboxState) {
         let sandbox_id = SandboxId::from_str(id).unwrap();
         let uuid8 = SandboxRuntimeLabel::from_sandbox_id(sandbox_id);
         crate::db::insert_sandbox(
@@ -13179,7 +13183,7 @@ pub(crate) mod service_tests {
     }
 
     pub(crate) fn insert_test_sandbox_with_policy(
-        conn: &rusqlite::Connection,
+        conn: &crate::db::Connection,
         id: &str,
         state: SandboxState,
         auto_lifecycle: &AutoLifecyclePolicy,
@@ -13278,8 +13282,8 @@ pub(crate) mod service_tests {
 
     #[tokio::test]
     async fn dependency_drain_after_cleanup_commit_releases_rpc_and_recovers_job() {
+        use crate::db::OptionalExtension as _;
         use pplx_space_common_jobs::db as jobs;
-        use rusqlite::OptionalExtension as _;
 
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
@@ -13358,7 +13362,7 @@ pub(crate) mod service_tests {
         .unwrap();
         let work_file = locks.open_work();
         try_lock_exclusive(&work_file).expect("replacement must acquire the work gate");
-        let job = jobs::get_job(&service.db.lock().unwrap(), &job_id)
+        let job = jobs::get_job(service.db.lock().unwrap().raw(), &job_id)
             .unwrap()
             .unwrap();
         assert_eq!(job.status, "pending");
@@ -13371,7 +13375,7 @@ pub(crate) mod service_tests {
         drop(admission);
         // Advance the persisted retry deadline without waiting for backoff.
         jobs::retry_job(
-            &service.db.lock().unwrap(),
+            service.db.lock().unwrap().raw(),
             &job_id,
             job.error.as_deref().unwrap(),
             0,
@@ -13380,7 +13384,7 @@ pub(crate) mod service_tests {
         service.ensure_cleanup_executor();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if jobs::get_job(&service.db.lock().unwrap(), &job_id)
+                if jobs::get_job(service.db.lock().unwrap().raw(), &job_id)
                     .unwrap()
                     .unwrap()
                     .status
@@ -14031,7 +14035,7 @@ pub(crate) mod service_tests {
             conn.execute("INSERT INTO sandbox_cleanup_episodes (sandbox_id, cleanup_id, completion, keep_filesystem, phase, activation_state, created_at) VALUES (?1, ?1, 'mark_stopped', 1, 'armed', 'starting', 0)", [id]).unwrap();
             conn.execute(
                 "UPDATE sandbox_cleanup_episodes SET cleanup_id = ?1 WHERE sandbox_id = ?2",
-                rusqlite::params![format!("malformed-{id}"), id],
+                crate::db::fixture::params![format!("malformed-{id}"), id],
             )
             .unwrap();
         }
@@ -14093,7 +14097,7 @@ pub(crate) mod service_tests {
         for (position, candidate) in cohort.iter().enumerate() {
             conn.execute(
                 "UPDATE sandboxes SET created_at = ?1 WHERE id = ?2",
-                rusqlite::params![format!("{position:03}"), candidate],
+                crate::db::fixture::params![format!("{position:03}"), candidate],
             )
             .unwrap();
         }
@@ -14469,7 +14473,7 @@ pub(crate) mod service_tests {
         insert_test_sandbox(&conn, &original_id, SandboxState::Pausing);
         conn.execute(
             "UPDATE sandboxes SET id = ?1, pid = ?2 WHERE id = ?3",
-            rusqlite::params![malformed_id, std::process::id(), original_id],
+            crate::db::fixture::params![malformed_id, std::process::id(), original_id],
         )
         .unwrap();
         let stopping_id = SandboxId::new().to_string();
@@ -14768,7 +14772,7 @@ pub(crate) mod service_tests {
         for id in [&bad, &good] {
             insert_test_sandbox(&conn, id, SandboxState::Suspending);
         }
-        conn.execute("INSERT INTO jobs (job_id, kind, subject_id, payload) VALUES (?1, 'teardown_suspend', ?2, 'malformed')", rusqlite::params![uuid::Uuid::now_v7().to_string(), bad]).unwrap();
+        conn.execute("INSERT INTO jobs (job_id, kind, subject_id, payload) VALUES (?1, 'teardown_suspend', ?2, 'malformed')", crate::db::fixture::params![uuid::Uuid::now_v7().to_string(), bad]).unwrap();
         let cache = tempfile::tempdir().unwrap();
         let artifact = LocalArtifactId::new();
         let staging = suspend_snapshot_staging_dir(&cache.path().join(&good), artifact);
@@ -15570,7 +15574,7 @@ pub(crate) mod service_tests {
     }
 
     fn seed_due_access_idle_sandbox(
-        conn: &rusqlite::Connection,
+        conn: &crate::db::Connection,
         sandbox_id: &str,
         timeout_secs: u64,
         idle_for_secs: u64,
@@ -15676,14 +15680,14 @@ pub(crate) mod service_tests {
     }
 
     fn route_authorized_service(
-        conn: rusqlite::Connection,
+        conn: crate::db::Connection,
         sandbox_id: SandboxId,
     ) -> (SandboxManagerService, SpaceApiRouteEd25519Token) {
         route_authorized_service_for_port(conn, sandbox_id, None)
     }
 
     fn route_authorized_service_for_port(
-        conn: rusqlite::Connection,
+        conn: crate::db::Connection,
         sandbox_id: SandboxId,
         port: Option<pplx_space_common_core::types::GuestPort>,
     ) -> (SandboxManagerService, SpaceApiRouteEd25519Token) {
@@ -15950,7 +15954,7 @@ pub(crate) mod service_tests {
             .unwrap()
             .execute(
                 "UPDATE sandboxes SET state = 'suspended' WHERE id = ?1",
-                rusqlite::params![sandbox_id],
+                crate::db::fixture::params![sandbox_id],
             )
             .unwrap();
         service.begin_draining_for_restart();
@@ -16813,7 +16817,7 @@ pub(crate) mod service_tests {
             "UPDATE sandboxes SET state = 'restoring', \
              failure_reason = 'cross-node restore artifact staging failed: test', \
              updated_at = ?1 WHERE id = ?2",
-            rusqlite::params![stale_updated_at, sandbox_id],
+            crate::db::fixture::params![stale_updated_at, sandbox_id],
         )
         .unwrap();
         let service = SandboxManagerService::for_test(conn);
@@ -16900,7 +16904,7 @@ pub(crate) mod service_tests {
             "UPDATE sandboxes SET state = 'restoring', \
              failure_reason = 'cross-node restore artifact staging failed: test', \
              next_auto_event_at = 1, updated_at = ?1 WHERE id = ?2",
-            rusqlite::params![stale_updated_at, sandbox_id],
+            crate::db::fixture::params![stale_updated_at, sandbox_id],
         )
         .unwrap();
         let service = SandboxManagerService::for_test(conn);
@@ -17341,7 +17345,7 @@ pub(crate) mod service_tests {
         )
         .unwrap()
         .unwrap();
-        let db = Arc::new(Mutex::new(conn));
+        let db = crate::db::SharedConnection::new(conn);
 
         let targets = SandboxManagerService::recover_required_cleanup_targets(
             &db,
@@ -17414,7 +17418,7 @@ pub(crate) mod service_tests {
                 [&sandbox_id],
             )
             .unwrap();
-            let db = Arc::new(Mutex::new(conn));
+            let db = crate::db::SharedConnection::new(conn);
             for authority in [
                 CleanupRecoveryAuthority::Startup,
                 CleanupRecoveryAuthority::RequestedOnly,
@@ -17487,7 +17491,7 @@ pub(crate) mod service_tests {
                     current_local_artifact_kind = 'full',
                     current_local_artifact_origin = 'suspend'
               WHERE id = ?2",
-            rusqlite::params![Uuid::now_v7().to_string(), &sandbox_id_string],
+            crate::db::fixture::params![Uuid::now_v7().to_string(), &sandbox_id_string],
         )
         .unwrap();
         let service = SandboxManagerService::for_test(conn);
@@ -17817,7 +17821,7 @@ pub(crate) mod service_tests {
     }
 
     pub(in crate::service) fn register_full_suspend_artifact(
-        conn: &rusqlite::Connection,
+        conn: &crate::db::Connection,
         sandbox_id: &str,
     ) {
         // `adopt_suspended_local_artifact` registers-and-pins exactly the
@@ -18047,7 +18051,7 @@ pub(crate) mod service_tests {
                  current_local_artifact_kind = 'full',
                  current_local_artifact_origin = 'suspend'
              WHERE id = ?2",
-            rusqlite::params![LocalArtifactId::new().to_string(), &sandbox_id],
+            crate::db::fixture::params![LocalArtifactId::new().to_string(), &sandbox_id],
         )
         .unwrap();
         // The test service's node-manager refuses every dial, so the
@@ -18258,7 +18262,7 @@ pub(crate) mod service_tests {
         let staging_failure = "cross-node restore artifact staging failed: test";
         conn.execute(
             "UPDATE sandboxes SET failure_reason = ?1 WHERE id = ?2",
-            rusqlite::params![staging_failure, sandbox_id],
+            crate::db::fixture::params![staging_failure, sandbox_id],
         )
         .unwrap();
         let restoring = crate::db::get_sandbox(&conn, &sandbox_id)
@@ -18276,7 +18280,7 @@ pub(crate) mod service_tests {
             "UPDATE sandboxes
              SET cleanup_completion = 'delete_row', cleanup_keep_filesystem = 0
              WHERE id = ?1",
-            rusqlite::params![sandbox_id],
+            crate::db::fixture::params![sandbox_id],
         )
         .unwrap();
         let pending_delete = crate::db::get_sandbox(&conn, &sandbox_id)
@@ -19482,13 +19486,13 @@ pub(crate) mod service_tests {
         insert_test_sandbox(&conn, &failed_runtime_id, SandboxState::Failed);
         conn.execute(
             "UPDATE sandboxes SET uid = 10000, slot = 0 WHERE id = ?1",
-            rusqlite::params![&failed_runtime_id],
+            crate::db::fixture::params![&failed_runtime_id],
         )
         .unwrap();
         insert_test_sandbox(&conn, &started_runtime_id, SandboxState::Started);
         conn.execute(
             "UPDATE sandboxes SET uid = 10001, slot = 1, pid = ?1 WHERE id = ?2",
-            rusqlite::params![std::process::id(), &started_runtime_id],
+            crate::db::fixture::params![std::process::id(), &started_runtime_id],
         )
         .unwrap();
         insert_test_sandbox(&conn, &started_stale_intent_id, SandboxState::Started);
@@ -19509,7 +19513,7 @@ pub(crate) mod service_tests {
             .unwrap();
         });
 
-        let db = Arc::new(Mutex::new(conn));
+        let db = crate::db::SharedConnection::new(conn);
         let mut targets = SandboxManagerService::recover_required_cleanup_targets(
             &db,
             super::recovery::CleanupRecoveryAuthority::RequestedOnly,
@@ -19639,7 +19643,7 @@ pub(crate) mod service_tests {
                     transition_receipt_reason_code = 'cold_activation_interrupted',
                     transition_receipt_activation_attempt_id = ?2
               WHERE id = ?3",
-            rusqlite::params![&receipt_id, Uuid::now_v7().to_string(), &stop_id],
+            crate::db::fixture::params![&receipt_id, Uuid::now_v7().to_string(), &stop_id],
         )
         .unwrap();
         insert_test_sandbox(&conn, &delete_id, SandboxState::Created);
@@ -19661,7 +19665,7 @@ pub(crate) mod service_tests {
         )
         .unwrap();
 
-        let db = Arc::new(Mutex::new(conn));
+        let db = crate::db::SharedConnection::new(conn);
         SandboxManagerService::complete_async_cleanup(
             &db,
             &stop_id,
@@ -19696,7 +19700,7 @@ pub(crate) mod service_tests {
             let retained_receipt = db
                 .query_row(
                     "SELECT transition_receipt_id FROM sandboxes WHERE id = ?1",
-                    rusqlite::params![&stop_id],
+                    crate::db::fixture::params![&stop_id],
                     |row| row.get::<_, Option<String>>(0),
                 )
                 .unwrap();
@@ -19742,7 +19746,7 @@ pub(crate) mod service_tests {
         )
         .unwrap();
 
-        let db = Arc::new(Mutex::new(conn));
+        let db = crate::db::SharedConnection::new(conn);
         SandboxManagerService::complete_async_cleanup(
             &db,
             &sandbox_id,
@@ -19781,7 +19785,7 @@ pub(crate) mod service_tests {
                     current_local_artifact_kind = 'full',
                     current_local_artifact_origin = 'suspend'
               WHERE id = ?2",
-            rusqlite::params![local_artifact_id.to_string(), &sandbox_id],
+            crate::db::fixture::params![local_artifact_id.to_string(), &sandbox_id],
         )
         .unwrap();
         crate::db::set_cleanup_intent(
@@ -19792,7 +19796,7 @@ pub(crate) mod service_tests {
         )
         .unwrap();
 
-        let db = Arc::new(Mutex::new(conn));
+        let db = crate::db::SharedConnection::new(conn);
         SandboxManagerService::complete_async_cleanup(
             &db,
             &sandbox_id,
@@ -19837,7 +19841,7 @@ pub(crate) mod service_tests {
         )
         .unwrap();
 
-        let db = Arc::new(Mutex::new(conn));
+        let db = crate::db::SharedConnection::new(conn);
         let local_artifact_id = LocalArtifactId::new();
         let local_path = format!("/space/cache/{sandbox_id}/snapshot");
         SandboxManagerService::complete_async_cleanup(

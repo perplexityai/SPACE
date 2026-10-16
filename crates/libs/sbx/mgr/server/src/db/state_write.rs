@@ -540,7 +540,7 @@ pub fn update_state_from(
     edge: &'static Edge,
 ) -> Result<StateWriteOutcome> {
     if edge.from.is_empty() {
-        return Err(rusqlite::Error::InvalidQuery);
+        return Err(Error::invalid_query());
     }
     write_state_from(conn, id, edge.from, edge.to)
 }
@@ -571,7 +571,7 @@ pub(super) fn write_cleanup_admission_state(
     target: SandboxState,
 ) -> Result<std::result::Result<(), SandboxStateWriteNotApplied>> {
     if !matches!(target, SandboxState::Stopping | SandboxState::Deleting) {
-        return Err(rusqlite::Error::InvalidQuery);
+        return Err(Error::invalid_query());
     }
     match write_state_from(conn, id, StateSet::ALL, target)? {
         StateWriteOutcome::Applied { .. } => Ok(Ok(())),
@@ -598,7 +598,7 @@ pub(super) fn write_cleanup_admission_state(
         StateWriteOutcome::Refused {
             refusal: StateWriteRefusal::FromState,
             ..
-        } => Err(rusqlite::Error::StatementChangedRows(0)),
+        } => Err(Error::from(rusqlite::Error::StatementChangedRows(0))),
         StateWriteOutcome::Missing => Ok(Err(SandboxStateWriteNotApplied::Missing)),
     }
 }
@@ -610,7 +610,7 @@ fn write_state_from(
     to: SandboxState,
 ) -> Result<StateWriteOutcome> {
     if matches!(to, SandboxState::Quarantined | SandboxState::Failed) {
-        return Err(rusqlite::Error::InvalidQuery);
+        return Err(Error::invalid_query());
     }
     if conn.is_autocommit() {
         let tx = immediate_transaction(conn)?;
@@ -683,7 +683,7 @@ fn write_state_from_in_transaction(
         // The row was read as `found` in this transaction, so only a source
         // set that excludes it can miss.
         if from.contains(found) {
-            return Err(rusqlite::Error::StatementChangedRows(0));
+            return Err(Error::from(rusqlite::Error::StatementChangedRows(0)));
         }
         return Ok(StateWriteOutcome::Refused {
             found,

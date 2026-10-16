@@ -261,7 +261,7 @@ async fn sweep_owns_the_hold_of_a_rolled_back_publication() {
              current_local_artifact_kind = 'full',
              current_local_artifact_origin = 'suspend'
          WHERE id = ?1",
-        rusqlite::params![pinned, old_id.to_string()],
+        crate::db::fixture::params![pinned, old_id.to_string()],
     )
     .unwrap();
 
@@ -306,7 +306,7 @@ async fn sweep_owns_the_hold_of_a_rolled_back_publication() {
              current_local_artifact_kind = 'full',
              current_local_artifact_origin = 'suspend'
          WHERE id = ?1",
-        rusqlite::params![interrupted, old_id.to_string()],
+        crate::db::fixture::params![interrupted, old_id.to_string()],
     )
     .unwrap();
     let interrupted_dir = cache.path().join(&interrupted);
@@ -370,7 +370,7 @@ async fn sweep_keeps_holds_without_durable_supersession() {
                  current_local_artifact_kind = 'full',
                  current_local_artifact_origin = 'suspend'
              WHERE id = ?1",
-            rusqlite::params![id, a.to_string()],
+            crate::db::fixture::params![id, a.to_string()],
         )
         .unwrap();
     }
@@ -428,7 +428,7 @@ async fn sweep_leaves_holds_alone_while_a_publication_may_be_in_flight() {
              current_local_artifact_kind = 'full',
              current_local_artifact_origin = 'suspend'
          WHERE id = ?1",
-        rusqlite::params![id, new_id.to_string()],
+        crate::db::fixture::params![id, new_id.to_string()],
     )
     .unwrap();
     suspend_snapshot_publication::write_full_suspend_artifact(
@@ -493,7 +493,7 @@ async fn sweep_releases_holds_once_a_canonical_snapshot_exists() {
              current_local_artifact_kind = 'full',
              current_local_artifact_origin = 'suspend'
          WHERE id = ?1",
-        rusqlite::params![committed, c.to_string()],
+        crate::db::fixture::params![committed, c.to_string()],
     )
     .unwrap();
     let committed_dir = cache.path().join(&committed);

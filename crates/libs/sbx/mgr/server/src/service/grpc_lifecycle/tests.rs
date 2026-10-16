@@ -175,7 +175,7 @@ async fn template_notification_matches_inherited_sandboxes_of_both_authorities()
             conn.execute(
                 "UPDATE sandboxes SET template = ?1, pool_template = ?2,
                     network_policy_override_json = ?3, network_policy_authority = ?4 WHERE id = ?5",
-                rusqlite::params![template, pool, override_policy, authority, id],
+                crate::db::fixture::params![template, pool, override_policy, authority, id],
             )
             .unwrap();
         }
@@ -724,7 +724,7 @@ async fn retained_source_backup_precondition_follows_node_manager() {
     assert!(!retry.message().contains(REUPLOAD_ARTIFACT_MISSING_MARKER));
 }
 
-fn insert_suspended_test_sandbox(conn: &rusqlite::Connection, sandbox_id: &str) {
+fn insert_suspended_test_sandbox(conn: &crate::db::Connection, sandbox_id: &str) {
     let uuid8 = SandboxRuntimeLabel::parse("sandbox1").unwrap();
     let owner = SandboxOwner::parse("user").unwrap();
     let process_env = BTreeMap::new();
@@ -1170,7 +1170,7 @@ async fn permanently_refused_teardown_backup_marks_the_suspending_row_terminal()
             insert_stranded_teardown_suspend_sandbox(&conn, sandbox_id, execution_generation);
         let backup_job_id = JobId::new();
         pplx_space_common_jobs::db::insert_job(
-            &conn,
+            conn.raw(),
             pplx_space_common_jobs::db::InsertJob {
                 job_id: &backup_job_id,
                 kind: crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
@@ -1186,7 +1186,7 @@ async fn permanently_refused_teardown_backup_marks_the_suspending_row_terminal()
         match failure {
             pplx_space_common_jobs::JobFailure::Permanent { reason } => {
                 pplx_space_common_jobs::db::fail_job_permanent(
-                    &conn,
+                    conn.raw(),
                     &backup_job_id,
                     "cluster-api rejected BeginArtifactBackup (NotFound): sandbox not found",
                     reason,
@@ -1195,7 +1195,7 @@ async fn permanently_refused_teardown_backup_marks_the_suspending_row_terminal()
             }
             pplx_space_common_jobs::JobFailure::Retriable => {
                 pplx_space_common_jobs::db::fail_job_retriable_exhausted(
-                    &conn,
+                    conn.raw(),
                     &backup_job_id,
                     "cluster-api BeginArtifactBackup (Unavailable): connection refused",
                 )
@@ -1316,7 +1316,7 @@ async fn teardown_suspend_terminal_driver_failures_stop_polling_without_release_
         if let Some(state) = state {
             conn.execute(
                 "UPDATE sandboxes SET state = ?1 WHERE id = ?2",
-                rusqlite::params![state.as_str(), id],
+                crate::db::fixture::params![state.as_str(), id],
             )
             .unwrap();
         } else {
@@ -1357,7 +1357,7 @@ async fn teardown_suspend_terminal_driver_failures_stop_polling_without_release_
 /// A started sandbox whose generation-7 suspend job is running, moved to
 /// Deleting by the production transition, which closes that job.
 fn deleting_sandbox_with_closed_teardown_suspend(
-    conn: &rusqlite::Connection,
+    conn: &crate::db::Connection,
 ) -> (String, pplx_space_common_core::types::ExecutionGeneration) {
     use crate::service::tests::service_tests::insert_test_sandbox;
     use pplx_space_common_core::types::ExecutionGeneration;
@@ -1402,7 +1402,7 @@ fn deleting_sandbox_with_closed_teardown_suspend(
 
 /// The production delete: it commits the receipt and removes the row in one
 /// transaction.
-fn commit_sandbox_delete(conn: &rusqlite::Connection, id: &str) {
+fn commit_sandbox_delete(conn: &crate::db::Connection, id: &str) {
     crate::db::set_cleanup_intent(conn, id, false, crate::db::CleanupCompletion::DeleteRow)
         .unwrap();
     crate::db::complete_row_intent_cleanup(conn, id, crate::db::CleanupCompletion::DeleteRow, None)
@@ -1845,14 +1845,14 @@ async fn teardown_suspend_pause_failure_recovery_allows_same_generation_retry() 
         for observed_generation in [None, Some(6), Some(8)] {
             db.execute(
                 "UPDATE sandboxes SET space_api_route_execution_generation = ?1 WHERE id = ?2",
-                rusqlite::params![observed_generation, id],
+                crate::db::fixture::params![observed_generation, id],
             )
             .unwrap();
             crate::db::begin_teardown_suspend_operation(&db, &id, generation).unwrap_err();
         }
         db.execute(
             "UPDATE sandboxes SET space_api_route_execution_generation = ?1 WHERE id = ?2",
-            rusqlite::params![generation.get(), id],
+            crate::db::fixture::params![generation.get(), id],
         )
         .unwrap();
         crate::db::begin_teardown_suspend_operation(&db, &id, generation).unwrap();
@@ -1866,7 +1866,7 @@ async fn teardown_suspend_pause_failure_recovery_allows_same_generation_retry() 
         );
         assert_ne!(retry.job_id, original.job_id);
         assert_eq!(
-            pplx_space_common_jobs::db::get_job(&db, &original.job_id)
+            pplx_space_common_jobs::db::get_job(db.raw(), &original.job_id)
                 .unwrap()
                 .unwrap()
                 .status,
@@ -1885,7 +1885,7 @@ fn stored_sandbox(service: &SandboxManagerService, id: &str) -> Option<crate::db
 
 /// Suspend admission skips its plaintext-COW probe, which inspects the host
 /// cache directory, for a sandbox with an encrypted volume.
-fn insert_encrypted_test_sandbox(conn: &rusqlite::Connection, id: &str, state: SandboxState) {
+fn insert_encrypted_test_sandbox(conn: &crate::db::Connection, id: &str, state: SandboxState) {
     crate::service::tests::service_tests::insert_test_sandbox(conn, id, state);
     conn.execute(
         "UPDATE sandboxes SET volume_encryption = 1 WHERE id = ?1",
@@ -1972,7 +1972,7 @@ async fn confirmed_node_pause_reports_paused_and_carries_the_execution_fence() {
     use pplx_space_node_mgr_client::proto::ExecutionFence;
 
     let sandbox_id = SandboxId::new();
-    let db = std::sync::Arc::new(std::sync::Mutex::new(crate::db::test_conn()));
+    let db = crate::db::SharedConnection::new(crate::db::test_conn());
 
     let node_manager = PauseConfirmingNodeManager::default();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2346,7 +2346,7 @@ async fn suspend_completion_refuses_a_superseded_row_before_runtime_cleanup() {
             .unwrap()
             .query_row(
                 "SELECT COUNT(*) FROM jobs WHERE kind = ?1 AND subject_id = ?2",
-                rusqlite::params![crate::db::cleanup_jobs::KIND, id],
+                crate::db::fixture::params![crate::db::cleanup_jobs::KIND, id],
                 |row| row.get(0),
             )
             .unwrap();
@@ -2364,7 +2364,7 @@ async fn suspend_publication_failure_persists_only_against_the_suspending_row() 
     use crate::service::tests::service_tests::insert_test_sandbox;
     use pplx_space_common_core::types::SandboxQuarantineReasonCode;
 
-    let reject_state = |conn: &rusqlite::Connection, state: SandboxState| {
+    let reject_state = |conn: &crate::db::Connection, state: SandboxState| {
         conn.execute_batch(&format!(
             "CREATE TRIGGER reject_{state} BEFORE UPDATE OF state ON sandboxes
              WHEN NEW.state = '{state}'
@@ -2548,7 +2548,7 @@ async fn suspend_publication_failure_after_staging_preserves_only_owned_evidence
             conn.execute(
                 "INSERT INTO jobs (job_id, kind, subject_id, payload)
                  VALUES (?1, ?2, ?3, 'malformed')",
-                rusqlite::params![
+                crate::db::fixture::params![
                     uuid::Uuid::now_v7().to_string(),
                     crate::db::TEARDOWN_SUSPEND_JOB_KIND,
                     id

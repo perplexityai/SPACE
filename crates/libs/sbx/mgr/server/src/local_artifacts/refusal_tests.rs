@@ -3,7 +3,8 @@
 
 use std::sync::PoisonError;
 
-use rusqlite::{OptionalExtension, params};
+use crate::db::fixture::params;
+use crate::db::{Connection, OptionalExtension};
 
 use super::*;
 
@@ -21,9 +22,9 @@ fn artifact_id(id: &str) -> LocalArtifactId {
     id.parse().unwrap()
 }
 
-fn shared(conn: Connection) -> (Arc<Mutex<Connection>>, LocalArtifacts) {
-    let db = Arc::new(Mutex::new(conn));
-    let store = LocalArtifacts::new(Arc::clone(&db));
+fn shared(conn: Connection) -> (crate::db::SharedConnection, LocalArtifacts) {
+    let db = crate::db::SharedConnection::new(conn);
+    let store = LocalArtifacts::new(db.clone());
     (db, store)
 }
 
@@ -42,7 +43,7 @@ fn insert_row(conn: &Connection, id: &str, sandbox_id: &str, local_path: &str) {
 }
 
 /// Reads through a poisoned mutex too, so failure tests can inspect the row.
-fn row_state(db: &Arc<Mutex<Connection>>, id: &str) -> Option<String> {
+fn row_state(db: &crate::db::SharedConnection, id: &str) -> Option<String> {
     db.lock()
         .unwrap_or_else(PoisonError::into_inner)
         .query_row(
@@ -54,7 +55,7 @@ fn row_state(db: &Arc<Mutex<Connection>>, id: &str) -> Option<String> {
         .unwrap()
 }
 
-fn last_touched_at(db: &Arc<Mutex<Connection>>, id: &str) -> String {
+fn last_touched_at(db: &crate::db::SharedConnection, id: &str) -> String {
     db.lock()
         .unwrap()
         .query_row(
@@ -336,7 +337,7 @@ fn lease_resolution_failure_is_reported_and_leaves_the_row_held() {
             .unwrap();
         match failure {
             ResolutionFailure::PoisonedConnection => {
-                let poisoner = Arc::clone(&db);
+                let poisoner = db.clone();
                 std::thread::spawn(move || {
                     let _held = poisoner.lock().unwrap();
                     panic!("poison the shared connection");
@@ -377,8 +378,7 @@ fn lease_resolution_failure_is_reported_and_leaves_the_row_held() {
 }
 
 fn insert_named_rows(conn: &Connection, sandbox_id: &str, count: usize) {
-    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
-        .unwrap();
+    let tx = crate::db::Transaction::immediate(conn).unwrap();
     for index in 0..count {
         crate::db::publish_named_local_artifact(
             &tx,

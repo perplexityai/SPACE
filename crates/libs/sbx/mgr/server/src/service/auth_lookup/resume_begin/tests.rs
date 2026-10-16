@@ -90,7 +90,7 @@ fn expected(found: Found) -> Expected {
 /// A paused warm-pool member whose runtime columns are populated: the test
 /// process's pid, route generation 3 and execution generation 7. Nothing in
 /// the resume path probes them before its write.
-fn insert_paused_pool_member(conn: &rusqlite::Connection, sandbox_id: SandboxId, scratch: &str) {
+fn insert_paused_pool_member(conn: &crate::db::Connection, sandbox_id: SandboxId, scratch: &str) {
     let id = sandbox_id.to_string();
     crate::db::insert_sandbox(
         conn,
@@ -145,7 +145,7 @@ fn insert_paused_pool_member(conn: &rusqlite::Connection, sandbox_id: SandboxId,
 /// the writers Stop runs, which take neither the wake nor the artifact lock: a
 /// non-blocking Stop's admission of the paused VM, then its completion. Every
 /// other state is written directly, and `Missing` deletes the row.
-fn move_row(conn: &rusqlite::Connection, id: &str, found: Found) {
+fn move_row(conn: &crate::db::Connection, id: &str, found: Found) {
     let state = match found {
         Found::Missing => {
             crate::db::delete_sandbox(conn, id).unwrap();
@@ -165,7 +165,7 @@ fn move_row(conn: &rusqlite::Connection, id: &str, found: Found) {
                         restore_origin = CASE WHEN ?1 = 'restoring' THEN 'local' END,
                         restore_phase = CASE WHEN ?1 = 'restoring' THEN 'activation' END
                   WHERE id = ?2",
-                rusqlite::params![state.as_str(), id],
+                crate::db::fixture::params![state.as_str(), id],
             )
             .unwrap();
         }

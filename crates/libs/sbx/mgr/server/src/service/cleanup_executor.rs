@@ -9,7 +9,7 @@ use super::*;
 use crate::db::cleanup_jobs::{
     self, CleanupEligibility, CleanupFailure, CleanupOutcome, CleanupWork,
 };
-use pplx_space_common_jobs::{JobPriority, JobStatus, db as jobs};
+use pplx_space_common_jobs::{JobPriority, JobStatus};
 
 type AttemptResult = Result<(), Status>;
 type CleanupResult = Result<CleanupOutcome, Status>;
@@ -136,7 +136,7 @@ impl SandboxManagerService {
             .db
             .lock()
             .map_err(|_| Status::internal("cleanup database poisoned"))?;
-        let tx = db.unchecked_transaction().map_err(storage_status)?;
+        let tx = crate::db::Transaction::deferred(&db).map_err(storage_status)?;
         if request.persist_intent
             && !crate::db::set_cleanup_intent(&tx, &id, request.keep_filesystem, request.completion)
                 .map_err(storage_status)?
@@ -217,7 +217,7 @@ impl SandboxManagerService {
             .storage(move |db| {
                 let _admission = admission;
                 let _fence = fence;
-                let tx = db.unchecked_transaction().map_err(storage_status)?;
+                let tx = crate::db::Transaction::deferred(db).map_err(storage_status)?;
                 let generation =
                     crate::db::runtime_execution_generation(&tx, &sandbox_id.to_string())
                         .map_err(storage_status)?;
@@ -284,7 +284,7 @@ impl SandboxManagerService {
         loop {
             match self
                 .storage(|db| {
-                    jobs::reset_running_kind(db, cleanup_jobs::KIND)
+                    cleanup_jobs::reset_running(db)
                         .map_err(|error| Status::internal(error.to_string()))
                 })
                 .await
@@ -364,10 +364,9 @@ impl SandboxManagerService {
             foreground_first = !foreground_first;
             let jobs = self
                 .storage(move |db| {
-                    let tx = db.unchecked_transaction().map_err(storage_status)?;
+                    let tx = crate::db::Transaction::deferred(db).map_err(storage_status)?;
                     let mut subjects: Vec<_> = active.into_iter().map(|(id, _)| id).collect();
-                    jobs::reset_inactive_running_kind(&tx, cleanup_jobs::KIND, &subjects)
-                        .map_err(storage_status)?;
+                    cleanup_jobs::reset_inactive_running(&tx, &subjects).map_err(storage_status)?;
                     let mut selected = Vec::new();
                     // Neither class can occupy the other's final slot.
                     for (priority, count) in classes {
@@ -383,7 +382,9 @@ impl SandboxManagerService {
                         )
                         .map_err(storage_status)?
                         {
-                            let Some(job) = jobs::get_job(&tx, &id).map_err(storage_status)? else {
+                            let Some(job) =
+                                cleanup_jobs::get_job(&tx, &id).map_err(storage_status)?
+                            else {
                                 continue;
                             };
                             let Some(subject) = job.subject_id.clone() else {
@@ -392,7 +393,7 @@ impl SandboxManagerService {
                             if subjects.contains(&subject) {
                                 continue;
                             }
-                            if jobs::mark_job_running(&tx, &id).map_err(storage_status)? {
+                            if cleanup_jobs::mark_running(&tx, &id).map_err(storage_status)? {
                                 subjects.push(subject.clone());
                                 selected.push((id, subject, priority == 1));
                             }
@@ -474,7 +475,7 @@ impl SandboxManagerService {
         let job_id = id.to_owned();
         let selected = self
             .storage(move |db| {
-                let job = jobs::get_job(db, &job_id)
+                let job = cleanup_jobs::get_job(db, &job_id)
                     .map_err(storage_status)?
                     .ok_or_else(|| Status::internal("cleanup job disappeared"))?;
                 if job.status != JobStatus::Running.as_str() {
@@ -485,7 +486,7 @@ impl SandboxManagerService {
                 if let CleanupEligibility::Finished(outcome) =
                     cleanup_jobs::eligibility(db, &work).map_err(storage_status)?
                 {
-                    let tx = db.unchecked_transaction().map_err(storage_status)?;
+                    let tx = crate::db::Transaction::deferred(db).map_err(storage_status)?;
                     cleanup_jobs::finish(&tx, &job_id, &outcome).map_err(storage_status)?;
                     tx.commit().map_err(storage_status)?;
                     return Ok(None);
@@ -508,7 +509,7 @@ impl SandboxManagerService {
                     // a failed attempt or a completion notification to callers.
                     let job_id = id.to_owned();
                     self.storage(move |db| {
-                        jobs::yield_running_job(db, &job_id).map_err(storage_status)?;
+                        cleanup_jobs::yield_running(db, &job_id).map_err(storage_status)?;
                         Ok(())
                     })
                     .await?;
@@ -562,11 +563,11 @@ impl SandboxManagerService {
                     // outcome must already share the lifecycle transaction;
                     // completing it here would reopen the crash ambiguity.
                     if matches!(outcome, CleanupOutcome::Superseded) {
-                        let tx = db.unchecked_transaction().map_err(storage_status)?;
+                        let tx = crate::db::Transaction::deferred(db).map_err(storage_status)?;
                         cleanup_jobs::finish(&tx, &id, outcome).map_err(storage_status)?;
                         tx.commit().map_err(storage_status)?;
                     } else {
-                        let stored = jobs::get_job(db, &id)
+                        let stored = cleanup_jobs::get_job(db, &id)
                             .map_err(storage_status)?
                             .ok_or_else(|| Status::internal("cleanup job disappeared"))?;
                         if stored.status != outcome.job_status().as_str() {
@@ -577,7 +578,7 @@ impl SandboxManagerService {
                     }
                 }
                 Err(error) => {
-                    let attempts = jobs::get_job(db, &id)
+                    let attempts = cleanup_jobs::get_job(db, &id)
                         .map_err(storage_status)?
                         .map_or(1, |job| job.attempts);
                     let delay = CLEANUP_RETRY_INITIAL_DELAY_SECS
@@ -595,7 +596,8 @@ impl SandboxManagerService {
                         message: error.message().to_owned(),
                     })
                     .map_err(|error| Status::internal(format!("encode cleanup result: {error}")))?;
-                    jobs::retry_running_job(db, &id, &failure, delay).map_err(storage_status)?;
+                    cleanup_jobs::retry_running(db, &id, &failure, delay)
+                        .map_err(storage_status)?;
                     pplx_space_metrics::sandbox::worker::cleanup_retry();
                 }
             }
@@ -660,7 +662,7 @@ impl SandboxManagerService {
         loop {
             let read_id = id;
             let stored = self
-                .storage(move |db| jobs::get_job(db, &read_id).map_err(storage_status))
+                .storage(move |db| cleanup_jobs::get_job(db, &read_id).map_err(storage_status))
                 .await?
                 .ok_or_else(|| Status::internal("cleanup job disappeared"))?;
             #[cfg(test)]
@@ -721,7 +723,7 @@ impl SandboxManagerService {
     }
 }
 
-fn storage_status(error: rusqlite::Error) -> Status {
+fn storage_status(error: crate::db::Error) -> Status {
     Status::internal(format!("cleanup storage: {error}"))
 }
 

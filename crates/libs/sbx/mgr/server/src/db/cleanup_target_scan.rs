@@ -1,9 +1,10 @@
 //! Bounded identity discovery for operator selection, not mutation authority.
 
 use super::inventory_read::{InventoryReadError, check_row};
+use crate::db::Connection;
 use pplx_space_common_core::inventory::{InventoryBudget, MAX_ENCODED_BYTES};
 use pplx_space_common_core::types::{SandboxId, SandboxOwner, SandboxRuntimeLabel};
-use rusqlite::{Connection, types::Type};
+use rusqlite::types::Type;
 
 use super::CleanupTarget;
 

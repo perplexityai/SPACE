@@ -154,7 +154,7 @@ impl Drop for ActivationCleanupGuard {
 }
 
 pub(super) fn persist_allocated_runtime_label(
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     sandbox_id: &str,
     current: &mut SandboxRuntimeLabel,
     cleanup: &mut ActivationCleanupGuard,

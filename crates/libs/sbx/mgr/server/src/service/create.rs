@@ -1346,7 +1346,7 @@ impl SandboxManagerService {
         let final_state = target_state;
         if blocking {
             if let Err(error) = complete_restore_and_mark_final(
-                Arc::clone(&self.db),
+                self.db.clone(),
                 id,
                 &sandbox.process_env,
                 final_state,

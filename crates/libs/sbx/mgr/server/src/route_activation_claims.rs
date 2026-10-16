@@ -1,11 +1,11 @@
-use rusqlite::Connection;
+use crate::db::Connection;
 
 use crate::db::route_activation_claims::{OpenRouteActivationClaim, claim_matches};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum OpenRouteActivationAdmissionError {
     #[error(transparent)]
-    Database(#[from] rusqlite::Error),
+    Database(#[from] crate::db::Error),
     #[error(
         "runtime activation identity generation is not newer than retained generation {retained}"
     )]

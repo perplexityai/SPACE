@@ -63,7 +63,7 @@ const STATIC_TOKEN: &str = "characterization-token";
 
 fn snapshot_upload_jobs(service: &SandboxManagerService, sandbox_id: &str) -> usize {
     let db = service.db_conn().unwrap();
-    pplx_space_common_jobs::db::list_jobs(&db, Some(sandbox_id), None, 0)
+    pplx_space_common_jobs::db::list_jobs(db.raw(), Some(sandbox_id), None, 0)
         .unwrap()
         .into_iter()
         .filter(|job| job.kind == crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND)
@@ -659,7 +659,7 @@ fn wire_authority(authority: PolicyAuthority) -> i32 {
 /// from template-manager. Callers pause the clock so the entry cannot reach
 /// its refresh deadline mid-test.
 async fn service_with_template_policy(
-    conn: rusqlite::Connection,
+    conn: crate::db::Connection,
     egress: Egress,
     generation: u64,
 ) -> SandboxManagerService {
@@ -938,7 +938,7 @@ async fn get_network_policy_reports_each_sandbox_policy_source() {
     );
     conn.execute(
         "UPDATE sandboxes SET template = ?1 WHERE id = ?2",
-        rusqlite::params![
+        crate::db::fixture::params![
             pplx_space_common_core::types::ORPHANED_SANDBOX_TEMPLATE,
             orphaned
         ],
@@ -1067,9 +1067,13 @@ async fn kill_refuses_signals_it_cannot_deliver_before_cleanup_admission() {
         let row = crate::db::get_sandbox(&db, id).unwrap();
         assert_eq!(row.map(|row| row.state), state, "{case}");
         assert!(
-            pplx_space_common_jobs::db::find_active_job(&db, crate::db::cleanup_jobs::KIND, id)
-                .unwrap()
-                .is_none(),
+            pplx_space_common_jobs::db::find_active_job(
+                db.raw(),
+                crate::db::cleanup_jobs::KIND,
+                id
+            )
+            .unwrap()
+            .is_none(),
             "{case}"
         );
         assert!(

@@ -303,8 +303,7 @@ impl SandboxManagerService {
                 let route_identity_changed = sandbox.space_api_route_identity != route_identity;
                 self.apply_route_identity_mutation(sandbox_id, "pool_adoption", || {
                     let db = self.db_conn()?;
-                    let transaction = db
-                        .unchecked_transaction()
+                    let transaction = crate::db::Transaction::deferred(&db)
                         .map_err(|e| Status::internal(format!("db transaction failed: {e}")))?;
                     crate::db::update_auto_lifecycle(
                         &transaction,

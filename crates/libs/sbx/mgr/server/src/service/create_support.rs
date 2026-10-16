@@ -298,7 +298,7 @@ pub(super) fn template_create_hash(
 /// `creating → created`. Create holds no lock between its insert and this
 /// write, so a row a Stop moved to `stopping` refuses it, and the Stop keeps
 /// the row.
-pub(super) fn write_create_completed(db: &rusqlite::Connection, id: &str) -> Result<(), Status> {
+pub(super) fn write_create_completed(db: &crate::db::Connection, id: &str) -> Result<(), Status> {
     let edge = &crate::db::edges::CREATE_COMPLETE;
     require_state_write_from(
         crate::db::update_state_from(db, id, edge),
@@ -310,7 +310,7 @@ pub(super) fn write_create_completed(db: &rusqlite::Connection, id: &str) -> Res
 /// own `created` write, `created → suspended`, refused like
 /// [`write_create_completed`].
 pub(super) fn write_base_snapshot_create_completed(
-    db: &rusqlite::Connection,
+    db: &crate::db::Connection,
     id: &str,
 ) -> Result<(), Status> {
     let edge = &crate::db::edges::CREATE_BASE_SNAPSHOT_COMPLETE;
@@ -356,7 +356,10 @@ pub(super) fn admit_warm_start(sandbox: &crate::db::SandboxRow) -> Result<(), St
 /// A transient row answers `FailedPrecondition`, where a cold Start answers
 /// `Unavailable`, deliberately: warm start does not wait out a transition, it
 /// refuses a row it cannot restage.
-pub(super) fn write_warm_start_restaged(db: &rusqlite::Connection, id: &str) -> Result<(), Status> {
+pub(super) fn write_warm_start_restaged(
+    db: &crate::db::Connection,
+    id: &str,
+) -> Result<(), Status> {
     const CONTEXT: &str = "prepare recovered sandbox restore";
     let outcome = crate::db::update_state_from(db, id, &crate::db::edges::WARM_START_RESTAGE)
         .map_err(|error| Status::internal(format!("{CONTEXT}: {error}")))?;
@@ -491,7 +494,7 @@ pub(super) fn requested_sandbox_create_auto_lifecycle_changed(
 }
 
 pub(super) fn update_existing_sandbox_create_auto_lifecycle(
-    conn: &rusqlite::Connection,
+    conn: &crate::db::Connection,
     sandbox_id: &str,
     state: SandboxState,
     policy: &AutoLifecyclePolicy,
@@ -503,8 +506,7 @@ pub(super) fn update_existing_sandbox_create_auto_lifecycle(
     };
     recompute_runtime_state(&mut runtime_state, policy);
 
-    let transaction = conn
-        .unchecked_transaction()
+    let transaction = crate::db::Transaction::deferred(conn)
         .map_err(|e| Status::internal(format!("db transaction failed: {e}")))?;
     crate::db::update_auto_lifecycle_with_state(
         &transaction,

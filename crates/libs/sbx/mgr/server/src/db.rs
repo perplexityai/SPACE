@@ -30,7 +30,11 @@ use pplx_space_net_common::{NetworkPolicy, proto::NetworkPolicySource};
 use rusqlite::types::Type;
 
 use pplx_space_common_core::sql;
-use rusqlite::{Connection, OptionalExtension, Result, params};
+use rusqlite::{OptionalExtension as _, params};
+
+mod handle;
+pub(crate) use handle::OptionalExtension;
+pub use handle::{Connection, ConnectionGuard, Error, Result, SharedConnection, Transaction};
 
 pub(crate) mod auto_lifecycle_delete_receipts;
 pub(crate) mod cleanup_jobs;
@@ -109,7 +113,7 @@ pub use pplx_space_common_core::types::QuarantineRecoveryNoProgressReason;
 
 const EXECUTION_DELETE_RECEIPT_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 
-fn parse_policy_authority(value: &str, column: usize) -> Result<PolicyAuthority> {
+fn parse_policy_authority(value: &str, column: usize) -> rusqlite::Result<PolicyAuthority> {
     value.parse().map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(error))
     })
@@ -218,16 +222,47 @@ impl CleanupCompletion {
 /// background loops evict them.
 const STATEMENT_CACHE_CAPACITY: usize = 128;
 
-pub fn open() -> Result<Connection, pplx_space_common_svc::sql::sqlite::SqliteError> {
+/// Opening or migrating the database failed. `Display` and `source` are the
+/// shared SQLite helpers' error's, unchanged.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub struct OpenError(#[from] pplx_space_common_svc::sql::sqlite::SqliteError);
+
+/// Apply the service and common schema migrations to the database.
+pub async fn migrate() -> Result<(), OpenError> {
+    migrate_at(Path::new(DB_PATH)).await
+}
+
+/// [`migrate`] for the database at `db_path`.
+pub async fn migrate_at(db_path: &Path) -> Result<(), OpenError> {
+    use pplx_space_sbxmgr_migrations::{COMMON_SCHEMA_MIGRATOR, SANDBOX_MANAGER_MIGRATOR};
+    Ok(pplx_space_common_svc::sql::sqlite::migrate_embedded(
+        "sandbox-manager",
+        db_path,
+        pplx_space_common_svc::sql::sqlite::EmbeddedMigrators {
+            service: &SANDBOX_MANAGER_MIGRATOR,
+            common: Some(&COMMON_SCHEMA_MIGRATOR),
+        },
+    )
+    .await?)
+}
+
+/// Open the migrated database, with the connection settings every store
+/// operation assumes.
+pub fn open() -> Result<Connection, OpenError> {
     let conn = pplx_space_common_svc::sql::sqlite::open_rusqlite(
         Path::new(DB_PATH),
         pplx_space_common_svc::sql::sqlite::RusqliteOpenOptions::default(),
     )?;
     conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
-    Ok(conn)
+    Ok(Connection::from_raw(conn))
 }
 
-pub(crate) fn describe_error(error: &rusqlite::Error) -> String {
+pub(crate) fn describe_error(error: &Error) -> String {
+    describe_raw_error(error.raw())
+}
+
+fn describe_raw_error(error: &rusqlite::Error) -> String {
     match error.sqlite_error() {
         Some(sqlite) => format!(
             "{error} (sqlite_code={:?}, sqlite_extended_code={})",
@@ -237,8 +272,8 @@ pub(crate) fn describe_error(error: &rusqlite::Error) -> String {
     }
 }
 
-pub(crate) fn immediate_transaction(conn: &Connection) -> Result<rusqlite::Transaction<'_>> {
-    rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+pub(crate) fn immediate_transaction(conn: &Connection) -> Result<Transaction<'_>> {
+    Transaction::immediate(conn)
 }
 
 pub(crate) fn now() -> Result<String> {
@@ -257,9 +292,7 @@ struct PersistedClockBeforeEpoch;
 
 fn persisted_epoch_seconds(timestamp: jiff::Timestamp) -> Result<i64> {
     if timestamp < jiff::Timestamp::UNIX_EPOCH {
-        return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-            PersistedClockBeforeEpoch,
-        )));
+        return Err(Error::to_sql_conversion(PersistedClockBeforeEpoch));
     }
     Ok(timestamp.as_second())
 }
@@ -480,9 +513,9 @@ fn test_schema_image() -> &'static [u8] {
         if let Some(image) = cache.as_ref().and_then(|cache| cache.read()) {
             return image;
         }
-        let mut conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::from_raw(rusqlite::Connection::open_in_memory().unwrap());
         create_test_schema(&mut conn);
-        let image = conn.serialize(rusqlite::MAIN_DB).unwrap().to_vec();
+        let image = conn.raw().serialize(rusqlite::MAIN_DB).unwrap().to_vec();
         if let Some(cache) = &cache {
             cache.write(&image);
         }
@@ -511,10 +544,10 @@ pub(crate) fn create_test_schema_on_disk(db_path: &std::path::Path) {
 #[cfg(test)]
 pub(crate) fn test_conn() -> Connection {
     let image = test_schema_image();
-    let mut conn = Connection::open_in_memory().unwrap();
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
     conn.deserialize_read_exact(rusqlite::MAIN_DB, image, image.len(), false)
         .unwrap();
-    conn
+    Connection::from_raw(conn)
 }
 
 /// Seed pre-validation lifecycle evidence without weakening subsequent writes.
@@ -529,7 +562,7 @@ pub(crate) fn seed_historical_lifecycle_rows<T>(
     conn: &Connection,
     seed: impl FnOnce(&Connection) -> T,
 ) -> T {
-    let tx = conn.unchecked_transaction().unwrap();
+    let tx = Transaction::deferred(conn).unwrap();
     let validators: Vec<(String, String)> = tx
         .prepare(
             "SELECT name, sql FROM sqlite_master
@@ -541,7 +574,7 @@ pub(crate) fn seed_historical_lifecycle_rows<T>(
         .unwrap()
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
         .unwrap()
-        .collect::<Result<_>>()
+        .collect::<rusqlite::Result<_>>()
         .unwrap();
     assert!(
         !validators.is_empty(),
@@ -556,6 +589,15 @@ pub(crate) fn seed_historical_lifecycle_rows<T>(
     }
     tx.commit().unwrap();
     result
+}
+
+/// What tests outside the store need for raw SQL fixtures and tripwires,
+/// besides the statement methods of [`Connection`].
+#[cfg(test)]
+pub(crate) mod fixture {
+    pub(crate) use rusqlite::trace::{TraceEvent, TraceEventCodes};
+    pub(crate) use rusqlite::types::{Type, Value};
+    pub(crate) use rusqlite::{StatementStatus, params};
 }
 
 #[cfg(test)]

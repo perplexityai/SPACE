@@ -59,10 +59,9 @@
 //! gate with explicit deletion, whose semantics do not require idle time.
 
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
 use pplx_space_common_core::types::{ArtifactKind, LocalArtifactId, SnapshotName};
-use rusqlite::Connection;
 
 use crate::db::LocalArtifactRow;
 use crate::db::local_artifact_leases as leases;
@@ -111,7 +110,7 @@ pub enum CheckoutError {
         raw_state: String,
     },
     #[error("database error: {0}")]
-    Db(#[from] rusqlite::Error),
+    Db(#[from] crate::db::Error),
 }
 
 #[derive(Clone, Copy)]
@@ -129,13 +128,13 @@ pub(crate) enum GcDeleteCheckout {
 }
 
 /// All `local_artifacts` operations route through this handle. The
-/// underlying connection is the same `Arc<Mutex<rusqlite::Connection>>`
+/// underlying connection is the same `crate::db::SharedConnection`
 /// that drives the rest of sbx-mgr's SQLite state, so transactions
 /// here serialize against every other path that touches that
 /// connection.
 #[derive(Clone)]
 pub struct LocalArtifacts {
-    db: Arc<Mutex<Connection>>,
+    db: crate::db::SharedConnection,
     orphan_scan: Arc<Mutex<OrphanScan>>,
 }
 
@@ -155,7 +154,7 @@ impl Default for OrphanScan {
 }
 
 impl LocalArtifacts {
-    pub fn new(db: Arc<Mutex<Connection>>) -> Self {
+    pub fn new(db: crate::db::SharedConnection) -> Self {
         Self {
             db,
             orphan_scan: Arc::new(Mutex::new(OrphanScan::default())),
@@ -169,7 +168,7 @@ impl LocalArtifacts {
     pub fn get(
         &self,
         local_artifact_id: LocalArtifactId,
-    ) -> rusqlite::Result<Option<LocalArtifactRow>> {
+    ) -> crate::db::Result<Option<LocalArtifactRow>> {
         let conn = self.db_conn()?;
         crate::db::get_local_artifact(&conn, local_artifact_id)
     }
@@ -180,7 +179,7 @@ impl LocalArtifacts {
         &self,
         sandbox_id: &str,
         snapshot_name: &SnapshotName,
-    ) -> rusqlite::Result<Option<LocalArtifactRow>> {
+    ) -> crate::db::Result<Option<LocalArtifactRow>> {
         let conn = self.db_conn()?;
         crate::db::get_named_local_artifact(&conn, sandbox_id, snapshot_name)
     }
@@ -292,7 +291,7 @@ impl LocalArtifacts {
     /// hand the caller a set that looks complete and is short by exactly
     /// the artifact nobody can name; a failure instead leaves the caller
     /// with no report, which every consumer already has to handle.
-    pub fn list_pending_backups(&self) -> rusqlite::Result<Vec<PendingBackup>> {
+    pub fn list_pending_backups(&self) -> crate::db::Result<Vec<PendingBackup>> {
         let conn = self.db_conn()?;
         leases::list_pending_backups(&conn)
     }
@@ -313,7 +312,7 @@ impl LocalArtifacts {
     pub fn mark_backup_completed(
         &self,
         local_artifact_id: LocalArtifactId,
-    ) -> rusqlite::Result<()> {
+    ) -> crate::db::Result<()> {
         let conn = self.db_conn()?;
         crate::db::mark_local_artifact_backup_completed(&conn, &local_artifact_id.to_string())
     }
@@ -326,7 +325,7 @@ impl LocalArtifacts {
         sandbox_id: &str,
         local_artifact_id: LocalArtifactId,
         local_path: &str,
-    ) -> rusqlite::Result<()> {
+    ) -> crate::db::Result<()> {
         let conn = self.db_conn()?;
         crate::db::publish_stopped_artifact(&conn, sandbox_id, local_artifact_id, local_path)
     }
@@ -341,7 +340,7 @@ impl LocalArtifacts {
         artifact_kind: ArtifactKind,
         snapshot_name: &SnapshotName,
         local_path: &str,
-    ) -> rusqlite::Result<()> {
+    ) -> crate::db::Result<()> {
         let conn = self.db_conn()?;
         crate::db::publish_named_local_artifact(
             &conn,
@@ -363,7 +362,7 @@ impl LocalArtifacts {
         sandbox_id: &str,
         local_artifact_id: LocalArtifactId,
         local_path: &str,
-    ) -> rusqlite::Result<bool> {
+    ) -> crate::db::Result<bool> {
         let conn = self.db_conn()?;
         crate::db::adopt_suspended_local_artifact(&conn, sandbox_id, local_artifact_id, local_path)
     }
@@ -375,7 +374,7 @@ impl LocalArtifacts {
         sandbox_id: &str,
         local_artifact_id: LocalArtifactId,
         local_path: &str,
-    ) -> rusqlite::Result<bool> {
+    ) -> crate::db::Result<bool> {
         let conn = self.db_conn()?;
         crate::db::adopt_suspended_local_artifact_preserving_updated_at(
             &conn,
@@ -398,8 +397,7 @@ impl LocalArtifacts {
         local_artifact_id: LocalArtifactId,
     ) -> Result<RestoreLease, CheckoutError> {
         let conn = self.db_conn()?;
-        let tx =
-            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        let tx = crate::db::Transaction::immediate(&conn)?;
         let id_str = local_artifact_id.to_string();
         let row = leases::artifact_path_and_state(&tx, &id_str)?;
         let Some((local_path, state)) = row else {
@@ -432,7 +430,7 @@ impl LocalArtifacts {
         Ok(RestoreLease {
             id: local_artifact_id,
             local_path,
-            db: Arc::clone(&self.db),
+            db: self.db.clone(),
             released: false,
         })
     }
@@ -450,15 +448,14 @@ impl LocalArtifacts {
         local_artifact_id: LocalArtifactId,
     ) -> Result<DeleteLease, CheckoutError> {
         let conn = self.db_conn()?;
-        let tx =
-            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        let tx = crate::db::Transaction::immediate(&conn)?;
         let local_path = Self::checkout_delete_in_transaction(&tx, local_artifact_id)?;
         tx.commit()?;
         drop(conn);
         Ok(DeleteLease {
             id: local_artifact_id,
             local_path,
-            db: Arc::clone(&self.db),
+            db: self.db.clone(),
             committed: false,
         })
     }
@@ -472,8 +469,7 @@ impl LocalArtifacts {
         eligibility: GcEligibility,
     ) -> Result<GcDeleteCheckout, CheckoutError> {
         let conn = self.db_conn()?;
-        let tx =
-            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        let tx = crate::db::Transaction::immediate(&conn)?;
         let row = leases::gc_checkout_evidence(&tx, &local_artifact_id.to_string(), sandbox_id)?;
         let Some((created_at, touched_at, pinned, backed_up)) = row else {
             return Err(CheckoutError::NotFound(local_artifact_id));
@@ -500,13 +496,13 @@ impl LocalArtifacts {
         Ok(GcDeleteCheckout::Leased(DeleteLease {
             id: local_artifact_id,
             local_path,
-            db: Arc::clone(&self.db),
+            db: self.db.clone(),
             committed: false,
         }))
     }
 
     fn checkout_delete_in_transaction(
-        tx: &rusqlite::Transaction<'_>,
+        tx: &crate::db::Transaction<'_>,
         local_artifact_id: LocalArtifactId,
     ) -> Result<String, CheckoutError> {
         let id_str = local_artifact_id.to_string();
@@ -607,10 +603,9 @@ impl LocalArtifacts {
     ///       from a pin: adoption can reuse an existing artifact ID.
     ///       Explicit restore or cleanup owns progress; this recovery
     ///       does not promise an automatic repair deadline.
-    pub fn recover_stuck_states(&self) -> rusqlite::Result<StuckStateRecovery> {
+    pub fn recover_stuck_states(&self) -> crate::db::Result<StuckStateRecovery> {
         let conn = self.db_conn()?;
-        let tx =
-            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        let tx = crate::db::Transaction::immediate(&conn)?;
         let restoring_reset = leases::reset_restoring_artifacts(&tx)?;
         let stuck_deleting = leases::list_deleting_artifacts(&tx)?;
         let mut deleting_rolled_back = 0usize;
@@ -654,7 +649,7 @@ impl LocalArtifacts {
 
     /// GC staging is disposable only after both its registry and pin are gone.
     /// Retain rows in every state, including historical deletion conflicts.
-    pub(crate) fn gc_staging_is_unowned(&self, id: LocalArtifactId) -> rusqlite::Result<bool> {
+    pub(crate) fn gc_staging_is_unowned(&self, id: LocalArtifactId) -> crate::db::Result<bool> {
         let conn = self.db_conn()?;
         leases::gc_staging_is_unowned(&conn, &id.to_string())
     }
@@ -663,18 +658,17 @@ impl LocalArtifacts {
     /// malformed, or unreadable entries. A fixed rowid ceiling makes each sweep
     /// finite under insertion churn; retained rows are reconsidered after wrap.
     /// Probes and guarded deletion retain the same immediate transaction.
-    pub fn prune_missing_orphan_rows(&self, max_records: usize) -> rusqlite::Result<usize> {
+    pub fn prune_missing_orphan_rows(&self, max_records: usize) -> crate::db::Result<usize> {
         if max_records == 0 {
             return Ok(0);
         }
 
         let conn = self.db_conn()?;
         let mut cursor = self.orphan_scan.lock().map_err(|error| {
-            rusqlite::Error::InvalidParameterName(format!("artifact scan mutex poisoned: {error}"))
+            crate::db::Error::poisoned(format!("artifact scan mutex poisoned: {error}"))
         })?;
         let mut scan = *cursor;
-        let tx =
-            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        let tx = crate::db::Transaction::immediate(&conn)?;
         if scan.through.is_none() {
             scan.through = leases::max_artifact_rowid(&tx)?;
         }
@@ -722,9 +716,9 @@ impl LocalArtifacts {
         Ok(deleted)
     }
 
-    fn db_conn(&self) -> rusqlite::Result<MutexGuard<'_, Connection>> {
+    fn db_conn(&self) -> crate::db::Result<crate::db::ConnectionGuard<'_>> {
         self.db.lock().map_err(|error| {
-            rusqlite::Error::InvalidParameterName(format!("database mutex poisoned: {error}"))
+            crate::db::Error::poisoned(format!("database mutex poisoned: {error}"))
         })
     }
 }
@@ -765,7 +759,7 @@ impl StuckStateRecovery {
 pub struct RestoreLease {
     id: LocalArtifactId,
     local_path: String,
-    db: Arc<Mutex<Connection>>,
+    db: crate::db::SharedConnection,
     released: bool,
 }
 
@@ -786,13 +780,13 @@ impl RestoreLease {
     /// this point. Prefer this over relying on `Drop` so failures
     /// surface as `Result` instead of being swallowed, and so the
     /// idle-clock reset actually happens.
-    pub fn release(mut self) -> rusqlite::Result<()> {
+    pub fn release(mut self) -> crate::db::Result<()> {
         let result = self.release_with_touch();
         self.released = true;
         result
     }
 
-    fn release_with_touch(&self) -> rusqlite::Result<()> {
+    fn release_with_touch(&self) -> crate::db::Result<()> {
         let conn = lock_db(&self.db)?;
         leases::release_restoring_artifact_with_touch(&conn, &self.id.to_string())?;
         Ok(())
@@ -803,7 +797,7 @@ impl RestoreLease {
     /// early `?` or panic before `release()`), and the caller may
     /// not have actually read the artifact's bytes. The reaper's
     /// idle clock should reflect that.
-    fn release_without_touch(&self) -> rusqlite::Result<()> {
+    fn release_without_touch(&self) -> crate::db::Result<()> {
         let conn = lock_db(&self.db)?;
         leases::release_restoring_artifact(&conn, &self.id.to_string())?;
         Ok(())
@@ -832,7 +826,7 @@ impl Drop for RestoreLease {
 pub struct DeleteLease {
     id: LocalArtifactId,
     local_path: String,
-    db: Arc<Mutex<Connection>>,
+    db: crate::db::SharedConnection,
     committed: bool,
 }
 
@@ -849,7 +843,7 @@ impl DeleteLease {
     /// `AND state = 'deleting'` makes this idempotent: a second
     /// commit (e.g. after rollback already ran) is a no-op rather
     /// than a foot-gun.
-    pub fn commit(mut self) -> rusqlite::Result<()> {
+    pub fn commit(mut self) -> crate::db::Result<()> {
         let conn = lock_db(&self.db)?;
         let deleted = leases::delete_deleting_artifact(&conn, &self.id.to_string())?;
         drop(conn);
@@ -890,10 +884,9 @@ impl Drop for DeleteLease {
     }
 }
 
-fn lock_db(db: &Arc<Mutex<Connection>>) -> rusqlite::Result<MutexGuard<'_, Connection>> {
-    db.lock().map_err(|error| {
-        rusqlite::Error::InvalidParameterName(format!("database mutex poisoned: {error}"))
-    })
+fn lock_db(db: &crate::db::SharedConnection) -> crate::db::Result<crate::db::ConnectionGuard<'_>> {
+    db.lock()
+        .map_err(|error| crate::db::Error::poisoned(format!("database mutex poisoned: {error}")))
 }
 
 #[cfg(test)]

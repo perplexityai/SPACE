@@ -406,7 +406,7 @@ fn log_interrupted_restore_completion(canonical_id: &str, storage_uri: &str) {
 /// stamp `failure_reason` onto a row whose new owner is mid-restore — the state guard
 /// alone does not stop it, because the new owner has put the row back in `restoring`.
 fn persist_cross_node_staging_failure(
-    conn: &rusqlite::Connection,
+    conn: &crate::db::Connection,
     sandbox_id: SandboxId,
     stage: &'static str,
     error: &crate::snapshot_restore::RestoreError,
@@ -465,7 +465,7 @@ fn select_interrupted_restore_source(
 }
 
 fn persist_selected_interrupted_restore_source(
-    conn: &rusqlite::Connection,
+    conn: &crate::db::Connection,
     sandbox_id: SandboxId,
     persisted_source: &ExactStorageUri,
     selected_source: &ExactStorageUri,
@@ -650,7 +650,7 @@ impl<'a> RestoringRowInput<'a> {
 /// episode. The two are one transaction now, so a refused CAS rolls the adoption
 /// back with it and a stale task leaves no trace.
 fn adopt_restoring_row_under_recovery_claim(
-    conn: &rusqlite::Connection,
+    conn: &crate::db::Connection,
     sandbox_id: SandboxId,
     canonical_id: &str,
     row: RestoringRowInput<'_>,
@@ -679,7 +679,7 @@ fn adopt_restoring_row_under_recovery_claim(
             )
         };
     }
-    let tx = crate::db::immediate_transaction(conn)
+    let tx = crate::db::Transaction::immediate(conn)
         .map_err(|source| crate::snapshot_restore::RestoreError::AdvanceRestorePhase { source })?;
     // Check recovery authority against the state observed before the upsert.
     // The generation CAS below sees the newly written Restoring state, so it
@@ -769,7 +769,7 @@ fn adopt_restoring_row_under_recovery_claim(
 /// advances the recovery generation together, so this uses the in-transaction
 /// variant rather than opening and committing its own.
 pub(super) fn insert_restoring_sandbox_row_from_snapshot(
-    conn: &rusqlite::Connection,
+    conn: &crate::db::Connection,
     canonical_id: &str,
     meta: &crate::snapshot_upload::SnapshotMeta,
     restore_source: &pplx_space_common_core::types::ExactStorageUri,
@@ -817,7 +817,7 @@ pub(super) fn insert_restoring_sandbox_row_from_snapshot(
 }
 
 pub(super) fn transition_restored_sandbox_to_suspended(
-    conn: &rusqlite::Connection,
+    conn: &crate::db::Connection,
     canonical_id: &str,
     meta: &crate::snapshot_upload::SnapshotMeta,
 ) -> Result<(), crate::snapshot_restore::RestoreError> {
@@ -831,7 +831,7 @@ pub(super) fn transition_restored_sandbox_to_suspended(
 }
 
 fn transition_restored_sandbox_to_suspended_parts(
-    conn: &rusqlite::Connection,
+    conn: &crate::db::Connection,
     canonical_id: &str,
     local_artifact_id: Option<LocalArtifactId>,
     artifact_kind: Option<pplx_space_common_core::types::ArtifactKind>,
@@ -867,7 +867,7 @@ fn transition_restored_sandbox_to_suspended_parts(
 }
 
 fn finalize_recovered_published_restore(
-    conn: &rusqlite::Connection,
+    conn: &crate::db::Connection,
     canonical_id: &str,
     sandbox_dir: &std::path::Path,
     meta: &crate::snapshot_upload::SnapshotMeta,
@@ -886,9 +886,9 @@ fn finalize_recovered_published_restore(
 }
 
 async fn finalize_exchanged_restore_after_cleanup<T>(
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     cleanup: impl std::future::Future<Output = Result<(), crate::snapshot_restore::RestoreError>>,
-    finalize: impl FnOnce(&rusqlite::Connection) -> Result<T, crate::snapshot_restore::RestoreError>,
+    finalize: impl FnOnce(&crate::db::Connection) -> Result<T, crate::snapshot_restore::RestoreError>,
 ) -> Result<T, crate::snapshot_restore::RestoreError> {
     // Finalization retires the transfer scope. Keep that durable cleanup owner
     // until every fallible external and filesystem cleanup step has succeeded.
@@ -900,7 +900,7 @@ async fn finalize_exchanged_restore_after_cleanup<T>(
 }
 
 fn claim_exchanged_restore_cleanup(
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     sandbox_id: &str,
     existing: &crate::db::RestoreTransferScopeRow,
     execution_generation: pplx_space_common_core::types::ExecutionGeneration,
@@ -2004,7 +2004,7 @@ impl SandboxManagerService {
             ),
         );
 
-        let finalize_restore = |db: &rusqlite::Connection| {
+        let finalize_restore = |db: &crate::db::Connection| {
             if let Some(recovery) = recovery {
                 let local_artifact_id = validate_quarantine_recovery_artifact_identity(
                     &canonical_id,
@@ -2022,7 +2022,7 @@ impl SandboxManagerService {
                 .map_err(|source| RestoreError::PersistOrphanQuarantineRecovery { source })?
                 {
                     // Same class as the generation CAS above, and the typed
-                    // rusqlite error is preserved rather than formatted away.
+                    // SQLite error is preserved rather than formatted away.
                     //
                     // This one refuses on strictly more than a lost claim: also on
                     // an execution-generation mismatch, on the sandbox no longer

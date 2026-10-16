@@ -35,7 +35,7 @@ async fn upload_executor_converges_unstaged_metadata_failure() {
     payload.includes_metadata_job = false;
     payload.metadata_staging_dir = Some(metadata_dir.clone());
     let executor = SnapshotUploadExecutor {
-        db: std::sync::Arc::new(std::sync::Mutex::new(open_backfill_test_db())),
+        db: crate::db::SharedConnection::new(open_backfill_test_db()),
         drain_state: crate::service::tests::closed_drain_for_test(),
         node_manager: crate::node_manager_transport::fake::unbound_in_absent_dir(),
         retained_source_inspector: std::sync::Arc::new(crate::retained_source::FakeInspector::new(
@@ -130,7 +130,7 @@ async fn stalled_transfer_probe_is_bounded_without_cancelling_remote_work() {
 
 #[test]
 fn refund_interrupted_running_attempts_only_touches_running_snapshot_upload_jobs() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    let conn = crate::db::Connection::open_in_memory();
     conn.execute_batch(
         "CREATE TABLE jobs (
              job_id          TEXT PRIMARY KEY,
@@ -167,7 +167,7 @@ fn refund_interrupted_running_attempts_only_touches_running_snapshot_upload_jobs
     let attempts = |job_id: &str| -> i32 {
         conn.query_row(
             "SELECT attempts FROM jobs WHERE job_id = ?1",
-            rusqlite::params![job_id],
+            crate::db::fixture::params![job_id],
             |row| row.get(0),
         )
         .unwrap()
@@ -181,9 +181,7 @@ fn refund_interrupted_running_attempts_only_touches_running_snapshot_upload_jobs
 #[tokio::test]
 async fn executor_rejects_non_snapshot_upload_job_kind() {
     let executor = SnapshotUploadExecutor {
-        db: std::sync::Arc::new(std::sync::Mutex::new(
-            rusqlite::Connection::open_in_memory().unwrap(),
-        )),
+        db: crate::db::SharedConnection::new(crate::db::Connection::open_in_memory()),
         drain_state: std::sync::Arc::new(crate::service::drain::DrainState::default()),
         node_manager: crate::node_manager_transport::fake::unbound_in_absent_dir(),
         retained_source_inspector: std::sync::Arc::new(crate::retained_source::FakeInspector::new(
@@ -214,9 +212,7 @@ async fn executor_requires_begin_before_volume_staging() {
         return;
     }
     let executor = SnapshotUploadExecutor {
-        db: std::sync::Arc::new(std::sync::Mutex::new(
-            rusqlite::Connection::open_in_memory().unwrap(),
-        )),
+        db: crate::db::SharedConnection::new(crate::db::Connection::open_in_memory()),
         drain_state: std::sync::Arc::new(crate::service::drain::DrainState::default()),
         node_manager: crate::node_manager_transport::fake::unbound_in_absent_dir(),
         retained_source_inspector: std::sync::Arc::new(crate::retained_source::FakeInspector::new(
@@ -307,7 +303,7 @@ fn finalise_total_saturates_instead_of_overflowing() {
     assert_eq!(vm_artifact_total_bytes(&polled, 2), u64::MAX);
 }
 
-fn open_backfill_test_db() -> rusqlite::Connection {
+fn open_backfill_test_db() -> crate::db::Connection {
     crate::db::test_conn()
 }
 
@@ -339,7 +335,7 @@ fn ready_backup_keeps_completed_evidence_when_bookkeeping_misses_execution_deadl
     let artifact = "01939e3e-aaaa-7000-8000-000000000003";
     let conn = open_backfill_test_db();
     insert_artifact(&conn, artifact, None);
-    let db = std::sync::Arc::new(std::sync::Mutex::new(conn));
+    let db = crate::db::SharedConnection::new(conn);
     let payload = reclaim_fixture_payload(artifact, "/unused".into());
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -358,11 +354,10 @@ fn ready_backup_keeps_completed_evidence_when_bookkeeping_misses_execution_deadl
         });
         ready.await.unwrap();
         let phase = std::sync::Arc::new(tokio::sync::Notify::new());
-        let worker = BackgroundWorker::new(
-            std::sync::Arc::clone(&db),
+        let worker = db.background_worker(
             ReadyBackupExecutor {
                 executor: SnapshotUploadExecutor {
-                    db: std::sync::Arc::clone(&db),
+                    db: db.clone(),
                     drain_state: std::sync::Arc::new(crate::service::drain::DrainState::default()),
                     node_manager: crate::node_manager_transport::fake::unbound_in_absent_dir(),
                     retained_source_inspector: std::sync::Arc::new(
@@ -400,12 +395,12 @@ fn ready_backup_keeps_completed_evidence_when_bookkeeping_misses_execution_deadl
             )
             .unwrap();
             let pruned = pplx_space_common_jobs::db::prune_terminal_jobs(
-                &conn,
+                conn.raw(),
                 Duration::from_secs(1),
                 Duration::from_secs(1),
             )
             .unwrap();
-            let retained = pplx_space_common_jobs::db::get_job(&conn, &id)
+            let retained = pplx_space_common_jobs::db::get_job(conn.raw(), &id)
                 .unwrap()
                 .is_some();
             (job, marker_missing, pruned, retained)
@@ -451,20 +446,15 @@ async fn maintenance_retries_failed_pruning_on_the_next_tick() {
          END;",
     )
     .unwrap();
-    let db = std::sync::Arc::new(std::sync::Mutex::new(conn));
+    let db = crate::db::SharedConnection::new(conn);
     let drain = std::sync::Arc::new(crate::service::drain::DrainState::default());
     let worker = build_worker(
-        std::sync::Arc::clone(&db),
+        db.clone(),
         std::sync::Arc::clone(&drain),
         crate::node_manager_transport::fake::unbound_in_absent_dir(),
     );
     let shutdown = tokio_util::sync::CancellationToken::new();
-    let maintenance = tokio::spawn(run_maintenance(
-        std::sync::Arc::clone(&db),
-        worker,
-        drain,
-        shutdown.clone(),
-    ));
+    let maintenance = tokio::spawn(run_maintenance(db.clone(), worker, drain, shutdown.clone()));
 
     // RAISE(FAIL) preserves the trigger's attempt witness, but not the delete.
     // Yield without advancing virtual time while the blocking pass finishes.
@@ -489,7 +479,7 @@ async fn maintenance_retries_failed_pruning_on_the_next_tick() {
     let deadline = Instant::now() + Duration::from_secs(5);
     let deleted = loop {
         if pplx_space_common_jobs::db::get_job(
-            &db.lock().unwrap(),
+            db.lock().unwrap().raw(),
             &"019d84bd-280d-7331-99c6-000000000002".parse().unwrap(),
         )
         .unwrap()
@@ -533,7 +523,7 @@ fn pruning_retains_failed_backup_marker_evidence_until_repaired() {
         .unwrap();
     let prune = || {
         pplx_space_common_jobs::db::prune_terminal_jobs(
-            &conn,
+            conn.raw(),
             Duration::from_secs(1),
             Duration::from_secs(1),
         )
@@ -617,22 +607,22 @@ fn backup_marker_repair_bounds_discovery_and_advances_past_retained_evidence() {
     assert!(backup_marker(&conn, inserted_later).is_some());
 }
 
-fn insert_artifact(conn: &rusqlite::Connection, id: &str, backup_completed_at: Option<&str>) {
+fn insert_artifact(conn: &crate::db::Connection, id: &str, backup_completed_at: Option<&str>) {
     conn.execute(
         "INSERT INTO local_artifacts (
              local_artifact_id, sandbox_id, artifact_kind, artifact_origin,
              snapshot_name, local_path, created_at, backup_completed_at
          ) VALUES (?1, ?1, 'full', 'suspend', NULL, ?1, '0', ?2)",
-        rusqlite::params![id, backup_completed_at],
+        crate::db::fixture::params![id, backup_completed_at],
     )
     .unwrap();
 }
 
-fn insert_job(conn: &rusqlite::Connection, job_id: &str, status: &str, payload: &str) {
+fn insert_job(conn: &crate::db::Connection, job_id: &str, status: &str, payload: &str) {
     conn.execute(
         "INSERT INTO jobs (job_id, kind, status, payload, subject_id)
          VALUES (?1, ?2, ?3, ?4, 'some-sandbox-id')",
-        rusqlite::params![job_id, SNAPSHOT_UPLOAD_JOB_KIND, status, payload],
+        crate::db::fixture::params![job_id, SNAPSHOT_UPLOAD_JOB_KIND, status, payload],
     )
     .unwrap();
 }
@@ -727,11 +717,11 @@ fn stream_reclaim_applies_only_to_pinned_btrfs_send_suspend_artifacts() {
     )));
 }
 
-fn open_reclaim_test_db() -> rusqlite::Connection {
+fn open_reclaim_test_db() -> crate::db::Connection {
     crate::db::test_conn()
 }
 
-fn insert_reclaim_sandbox(conn: &rusqlite::Connection, id: &str, state: &str, pin: &str) {
+fn insert_reclaim_sandbox(conn: &crate::db::Connection, id: &str, state: &str, pin: &str) {
     conn.execute(
         "INSERT INTO sandboxes (
              id, uuid8, state, template, user, runtime, created_at, updated_at,
@@ -740,7 +730,7 @@ fn insert_reclaim_sandbox(conn: &rusqlite::Connection, id: &str, state: &str, pi
              current_local_artifact_origin
          ) VALUES (?1, 'uuid8', ?2, 'seed', 'u', 'fc', '0', '0',
                    '{}', '{}', '{}', ?3, 'full', 'suspend')",
-        rusqlite::params![id, state, pin],
+        crate::db::fixture::params![id, state, pin],
     )
     .unwrap();
 }
@@ -802,7 +792,7 @@ fn submitted_transfer_ids_replace_the_durable_prepared_intent() {
     payload.deferred_metadata = true;
     payload.meta.rootfs_send_source_id = Some(uuid::Uuid::now_v7());
     payload.job_ids = vec![JobId::new(), JobId::new(), JobId::new()];
-    let db = std::sync::Arc::new(std::sync::Mutex::new(conn));
+    let db = crate::db::SharedConnection::new(conn);
 
     for job_id in [
         "019d84bd-280d-7331-99c6-000000000003",
@@ -866,10 +856,10 @@ fn only_exact_prepared_intents_begin_in_the_worker() {
     assert!(!prepared_upload_requires_begin(&legacy));
 }
 
-fn backup_marker(conn: &rusqlite::Connection, artifact_id: &str) -> Option<String> {
+fn backup_marker(conn: &crate::db::Connection, artifact_id: &str) -> Option<String> {
     conn.query_row(
         "SELECT backup_completed_at FROM local_artifacts WHERE local_artifact_id = ?1",
-        rusqlite::params![artifact_id],
+        crate::db::fixture::params![artifact_id],
         |r| r.get(0),
     )
     .unwrap()
@@ -1012,7 +1002,7 @@ fn backfill_stamps_unmarked_artifacts_and_buckets_the_rest() {
     let stamped_at: Option<String> = conn
         .query_row(
             "SELECT backup_completed_at FROM local_artifacts WHERE local_artifact_id = ?1",
-            rusqlite::params![unmarked],
+            crate::db::fixture::params![unmarked],
             |r| r.get(0),
         )
         .unwrap();
@@ -1022,7 +1012,7 @@ fn backfill_stamps_unmarked_artifacts_and_buckets_the_rest() {
     let preserved: String = conn
         .query_row(
             "SELECT backup_completed_at FROM local_artifacts WHERE local_artifact_id = ?1",
-            rusqlite::params![marked],
+            crate::db::fixture::params![marked],
             |r| r.get(0),
         )
         .unwrap();
@@ -1032,7 +1022,7 @@ fn backfill_stamps_unmarked_artifacts_and_buckets_the_rest() {
     let untouched: Option<String> = conn
         .query_row(
             "SELECT backup_completed_at FROM local_artifacts WHERE local_artifact_id = ?1",
-            rusqlite::params![pending_only],
+            crate::db::fixture::params![pending_only],
             |r| r.get(0),
         )
         .unwrap();
@@ -1132,10 +1122,10 @@ fn ready_backup_returns_before_the_retained_source_is_inspected() {
     let vm = crate::snapshot_upload::vm_artifacts_for_format(SuspendSnapshotFormat::BtrfsSend);
     crate::snapshot_upload::write_snapshot_metadata(&payload.meta, &snapshot_dir, &vm, None)
         .unwrap();
-    let db = std::sync::Arc::new(std::sync::Mutex::new(conn));
+    let db = crate::db::SharedConnection::new(conn);
     let gate = std::sync::Arc::new(tokio::sync::Notify::new());
     let executor = SnapshotUploadExecutor {
-        db: std::sync::Arc::clone(&db),
+        db: db.clone(),
         drain_state: std::sync::Arc::new(crate::service::drain::DrainState::default()),
         node_manager: crate::node_manager_transport::fake::unbound_in_absent_dir(),
         retained_source_inspector: std::sync::Arc::new(GatedInspector {

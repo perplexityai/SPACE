@@ -7,7 +7,7 @@ use pplx_space_events::{
 };
 
 pub(super) async fn cleanup_sandbox_via_node(
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     node_client: &mut NodeManagerGrpcClient,
     sandbox_id: &str,
     keep_filesystem: bool,
@@ -26,7 +26,7 @@ pub(super) async fn cleanup_sandbox_via_node(
 }
 
 pub(super) async fn cleanup_sandbox_via_node_with_options(
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     node_client: &mut NodeManagerGrpcClient,
     sandbox_id: &str,
     keep_filesystem: bool,
@@ -92,7 +92,7 @@ pub(super) async fn cleanup_sandbox_via_node_with_options(
 }
 
 pub(super) fn read_node_execution_fence(
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     sandbox_id: &str,
 ) -> Result<Option<pplx_space_node_mgr_client::execution_fence::ExecutionFence>, Status> {
     let db = db
@@ -103,7 +103,7 @@ pub(super) fn read_node_execution_fence(
 }
 
 pub(super) fn admit_prepared_clone_disposal_attempt(
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     id: &str,
     job_id: Option<&JobId>,
 ) -> Result<(), Status> {
@@ -150,7 +150,7 @@ pub(super) struct NodeCleanupOptions<'a> {
 /// cleanup after persistence errors. Losing the lookup is not permission to
 /// fall back to ordinary pathname-based cleanup.
 pub(super) async fn service_cleanup_via_node_with_options(
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     node_client: &mut NodeManagerGrpcClient,
     sandbox_id: &str,
     options: NodeCleanupOptions<'_>,
@@ -229,7 +229,7 @@ pub(super) use crate::db::CleanupCompletion;
 /// reports the state another transition left the row in, and a generic-guard
 /// refusal or a missing row renders [`crate::db::SandboxStateWriteNotApplied`].
 pub(super) fn require_state_write_from(
-    result: rusqlite::Result<crate::db::StateWriteOutcome>,
+    result: crate::db::Result<crate::db::StateWriteOutcome>,
     context: &str,
 ) -> Result<(), Status> {
     let outcome = result.map_err(|error| Status::internal(format!("{context}: {error}")))?;
@@ -295,7 +295,7 @@ impl StateWriteRejected {
 /// marks the sandbox dirty. `None` is a poisoned connection or a
 /// database error.
 pub(super) fn update_state_from_best_effort(
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     sandbox_id: &str,
     edge: &'static crate::db::Edge,
 ) -> Option<crate::db::StateWriteOutcome> {

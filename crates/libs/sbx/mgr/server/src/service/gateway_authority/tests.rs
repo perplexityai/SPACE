@@ -91,7 +91,7 @@ impl Fixture {
             .unwrap()
             .execute(
                 "UPDATE sandboxes SET state = ?1 WHERE id = ?2",
-                rusqlite::params![state.as_str(), self.sandbox_id.to_string()],
+                crate::db::fixture::params![state.as_str(), self.sandbox_id.to_string()],
             )
             .unwrap();
     }
@@ -111,7 +111,7 @@ impl Fixture {
                      space_api_route_activation_attempt_id = ?6,
                      space_api_route_identity_provenance = 'unfenced'
                  WHERE id = ?7",
-                rusqlite::params![
+                crate::db::fixture::params![
                     identity
                         .route_generation
                         .and_then(|generation| i64::try_from(generation.get()).ok()),

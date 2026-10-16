@@ -304,7 +304,7 @@ impl SandboxManagerService {
                 execution_generation,
             ) {
                 Ok(_) => {}
-                Err(rusqlite::Error::InvalidQuery) => {
+                Err(error) if error.is_invalid_query() => {
                     return Ok(teardown_suspend_prepare_response(
                         TeardownSuspendOutcome::Superseded,
                         Some("a newer local execution owns generation suspend".to_string()),
@@ -339,7 +339,7 @@ impl SandboxManagerService {
                 execution_generation,
             ) {
                 Ok(_) => {}
-                Err(rusqlite::Error::InvalidQuery) => {
+                Err(error) if error.is_invalid_query() => {
                     return Ok(teardown_suspend_prepare_response(
                         TeardownSuspendOutcome::Superseded,
                         Some("a newer local execution owns generation suspend".to_string()),

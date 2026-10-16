@@ -133,7 +133,7 @@ pub fn bind_suspended_teardown_operation(
         |row| row.get::<_, bool>(0),
     )?;
     if !has_suspended_artifact {
-        return Err(rusqlite::Error::QueryReturnedNoRows);
+        return Err(Error::no_rows());
     }
     let claim = ensure_teardown_suspend_operation(&tx, id, execution_generation)?;
     mark_teardown_suspend_operation_running(&tx, id, execution_generation)?;
@@ -149,29 +149,29 @@ pub(super) fn ensure_teardown_suspend_operation(
 ) -> Result<SupersededTeardownGeneration> {
     if runtime_execution_generation(conn, id)?.is_some_and(|current| current > execution_generation)
     {
-        return Err(rusqlite::Error::InvalidQuery);
+        return Err(Error::invalid_query());
     }
     if latest_teardown_suspend_operation(conn, id)?
         .is_some_and(|latest| latest.execution_generation > execution_generation)
     {
-        return Err(rusqlite::Error::InvalidQuery);
+        return Err(Error::invalid_query());
     }
     if latest_teardown_suspend_operation(conn, id)?.is_some_and(|latest| {
         latest.execution_generation == execution_generation
             && latest.status == TeardownSuspendOperationStatus::Failed
     }) && !teardown_suspend_retry_admissible(conn, id, execution_generation)?
     {
-        return Err(rusqlite::Error::QueryReturnedNoRows);
+        return Err(Error::no_rows());
     }
     let mut superseded_generation = None;
     if let Some(active) = active_teardown_suspend_operation(conn, id)? {
         if active.execution_generation > execution_generation {
-            return Err(rusqlite::Error::InvalidQuery);
+            return Err(Error::invalid_query());
         }
         if active.execution_generation < execution_generation {
             superseded_generation = Some(active.execution_generation);
             pplx_space_common_jobs::db::fail_job_permanent(
-                conn,
+                conn.raw(),
                 &active.job_id,
                 TEARDOWN_SUSPEND_SUPERSEDED_REASON,
                 None,
@@ -187,7 +187,7 @@ pub(super) fn ensure_teardown_suspend_operation(
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         let dedup_key = format!("{id}:{execution_generation}");
         pplx_space_common_jobs::db::insert_job(
-            conn,
+            conn.raw(),
             pplx_space_common_jobs::db::InsertJob {
                 job_id: &job_id,
                 kind: TEARDOWN_SUSPEND_JOB_KIND,
@@ -259,10 +259,10 @@ pub(super) fn mark_teardown_suspend_operation_running(
     let operation =
         active_teardown_suspend_operation(conn, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
     if operation.execution_generation != execution_generation {
-        return Err(rusqlite::Error::InvalidQuery);
+        return Err(Error::invalid_query());
     }
     if operation.status == TeardownSuspendOperationStatus::Pending {
-        pplx_space_common_jobs::db::mark_job_running(conn, &operation.job_id)?;
+        pplx_space_common_jobs::db::mark_job_running(conn.raw(), &operation.job_id)?;
     }
     Ok(())
 }
@@ -278,7 +278,7 @@ pub fn stage_teardown_suspend_artifact(
     let operation =
         active_teardown_suspend_operation(&tx, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
     if operation.execution_generation != execution_generation {
-        return Err(rusqlite::Error::QueryReturnedNoRows);
+        return Err(Error::no_rows());
     }
     upsert_suspend_local_artifact(&tx, id, local_artifact_id, local_path)?;
     let changed = tx.execute(
@@ -293,7 +293,7 @@ pub fn stage_teardown_suspend_artifact(
         params![local_artifact_id.to_string(), now()?, id],
     )?;
     if changed != 1 {
-        return Err(rusqlite::Error::QueryReturnedNoRows);
+        return Err(Error::no_rows());
     }
     tx.commit()?;
     Ok(())
@@ -307,14 +307,14 @@ pub(super) fn advance_teardown_suspend_lease(
     if runtime_execution_generation(conn, sandbox_id)?
         .is_some_and(|current| current > execution_generation)
     {
-        return Err(rusqlite::Error::InvalidQuery);
+        return Err(Error::invalid_query());
     }
     if latest_teardown_suspend_operation(conn, sandbox_id)?.is_some_and(|latest| {
         latest.execution_generation > execution_generation
             || (latest.execution_generation == execution_generation
                 && latest.status == TeardownSuspendOperationStatus::Completed)
     }) {
-        return Err(rusqlite::Error::InvalidQuery);
+        return Err(Error::invalid_query());
     }
 
     let mut superseded_generation = None;
@@ -324,7 +324,7 @@ pub(super) fn advance_teardown_suspend_lease(
         }
         superseded_generation = Some(active.execution_generation);
         pplx_space_common_jobs::db::fail_job_permanent(
-            conn,
+            conn.raw(),
             &active.job_id,
             TEARDOWN_SUSPEND_SUPERSEDED_REASON,
             None,
@@ -355,21 +355,22 @@ pub(super) fn active_teardown_suspend_operation(
                 row.get::<_, String>(2)?,
             ))
         })?
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     if rows.len() > 1 {
-        return Err(rusqlite::Error::FromSqlConversionFailure(
+        return Err(Error::from(rusqlite::Error::FromSqlConversionFailure(
             0,
             Type::Text,
             Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("multiple active teardown suspend jobs for sandbox {sandbox_id}"),
             )),
-        ));
+        )));
     }
     rows.into_iter()
         .next()
         .map(|(job_id, payload, status)| parse_teardown_suspend_operation(job_id, payload, status))
         .transpose()
+        .map_err(Error::from)
 }
 
 pub(crate) fn latest_teardown_suspend_operation(
@@ -393,7 +394,7 @@ fn parse_teardown_suspend_operation(
     job_id: JobId,
     payload: String,
     status: String,
-) -> Result<TeardownSuspendOperation> {
+) -> rusqlite::Result<TeardownSuspendOperation> {
     let payload: TeardownSuspendJobPayload = serde_json::from_str(&payload).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(1, Type::Text, Box::new(error))
     })?;
@@ -422,7 +423,7 @@ pub(crate) fn teardown_release_evidence(
     sandbox_id: &str,
     execution_generation: ExecutionGeneration,
 ) -> Result<TeardownReleaseEvidence> {
-    let tx = conn.unchecked_transaction()?;
+    let tx = Transaction::deferred(conn)?;
     let runtime_generation = runtime_execution_generation(&tx, sandbox_id)?;
     let suspend = teardown_suspend_status(&tx, sandbox_id)?;
     let deleted = execution_delete_receipt_covers(&tx, sandbox_id, execution_generation)?;
@@ -641,8 +642,8 @@ pub fn complete_teardown_suspend(
         )?;
     }
     mark_teardown_suspend_operation_running(&tx, sandbox_id, execution_generation)?;
-    if !pplx_space_common_jobs::db::complete_job(&tx, &operation.job_id, 0)? {
-        return Err(rusqlite::Error::QueryReturnedNoRows);
+    if !pplx_space_common_jobs::db::complete_job(tx.raw(), &operation.job_id, 0)? {
+        return Err(Error::no_rows());
     }
     tx.commit()?;
     Ok(true)
@@ -715,7 +716,7 @@ fn bind_teardown_suspend_artifact(
         params![payload, job_id],
     )? != 1
     {
-        return Err(rusqlite::Error::QueryReturnedNoRows);
+        return Err(Error::no_rows());
     }
     Ok(())
 }

@@ -147,7 +147,7 @@ async fn candidate_snapshot_admission_uses_durable_execution_before_checkpointin
     insert_test_sandbox(&conn, &id, SandboxState::Paused);
     conn.execute(
         "UPDATE sandboxes SET user = ?1 WHERE id = ?2",
-        rusqlite::params![
+        crate::db::fixture::params![
             SandboxOwnerKind::TemplateManager
                 .reserved_owner_label()
                 .unwrap(),
@@ -189,11 +189,11 @@ async fn candidate_snapshot_admission_uses_durable_execution_before_checkpointin
     );
 }
 
-fn sandbox_state(conn: &rusqlite::Connection, id: &str) -> SandboxState {
+fn sandbox_state(conn: &crate::db::Connection, id: &str) -> SandboxState {
     crate::db::get_sandbox(conn, id).unwrap().unwrap().state
 }
 
-fn sandbox_inventory_dirty(conn: &rusqlite::Connection, id: &str) -> bool {
+fn sandbox_inventory_dirty(conn: &crate::db::Connection, id: &str) -> bool {
     crate::db::list_node_dirty_refs(conn, 1000)
         .unwrap()
         .iter()
@@ -221,7 +221,7 @@ fn template_base_snapshot_writes_leave_a_stop_that_completed_during_capture_stop
         crate::db::tests::state_write_fixtures::stop(&conn, &id);
         assert_eq!(sandbox_state(&conn, &id), SandboxState::Stopped);
         let before = crate::db::tests::database_rows(&conn);
-        let db = Arc::new(Mutex::new(conn));
+        let db = crate::db::SharedConnection::new(conn);
 
         if completion {
             let error = complete_template_base_snapshot_state(&db.lock().unwrap(), &id)
@@ -291,7 +291,7 @@ fn template_base_snapshot_writes_return_only_a_checkpointing_row_to_paused() {
             );
             crate::db::tests::state_write_fixtures::decorate(&conn, &id, SandboxState::Started);
             let before = crate::db::tests::database_rows(&conn);
-            let db = Arc::new(Mutex::new(conn));
+            let db = crate::db::SharedConnection::new(conn);
 
             let result = if completion {
                 complete_template_base_snapshot_state(&db.lock().unwrap(), &id)

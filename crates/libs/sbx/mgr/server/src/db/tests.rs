@@ -145,7 +145,7 @@ fn persisted_clock_rejects_pre_epoch_instead_of_fabricating_zero() {
     for timestamp in ["1969-12-31T23:59:59Z", "1969-12-31T23:59:59.999999999Z"] {
         let error = persisted_epoch_seconds(timestamp.parse().unwrap()).unwrap_err();
         assert!(matches!(
-            error,
+            error.raw(),
             rusqlite::Error::ToSqlConversionFailure(cause)
                 if cause.is::<PersistedClockBeforeEpoch>()
         ));
@@ -841,7 +841,7 @@ fn a_type_mismatched_column_makes_one_row_malformed_not_the_whole_scan() {
 fn quarantine_recovery_candidate_scan_propagates_statement_failures() {
     let directory = tempfile::tempdir().unwrap();
     let database_path = directory.path().join("sandbox-manager.db");
-    let mut conn = Connection::open(&database_path).unwrap();
+    let mut conn = Connection::open_at(&database_path).unwrap();
     create_test_schema(&mut conn);
     setup_quarantine_recovery_episode(
         &conn,
@@ -850,13 +850,13 @@ fn quarantine_recovery_candidate_scan_propagates_statement_failures() {
     // A real SQLITE_BUSY, which is what a contended node-local database
     // produces. Reported as an empty or partial candidate list it makes a pass
     // that saw none of the backlog indistinguishable from an empty backlog.
-    let blocker = Connection::open(&database_path).unwrap();
+    let blocker = Connection::open_at(&database_path).unwrap();
     blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
     conn.busy_timeout(std::time::Duration::ZERO).unwrap();
 
     let error = scan_quarantine_recovery_candidates(&conn)
         .expect_err("a statement-level SQLite failure must abort the pass");
-    let rusqlite::Error::SqliteFailure(failure, _) = &error else {
+    let rusqlite::Error::SqliteFailure(failure, _) = error.raw() else {
         panic!("expected the underlying SQLite failure, got {error:?}");
     };
     assert_eq!(failure.code, rusqlite::ErrorCode::DatabaseBusy);
@@ -2203,7 +2203,7 @@ fn runtime_attachment_rejects_a_missing_sandbox() {
     )
     .expect_err("runtime ownership cannot attach to a missing sandbox");
 
-    assert!(matches!(error, rusqlite::Error::QueryReturnedNoRows));
+    assert!(error.is_no_rows());
 }
 
 #[test]
@@ -2228,7 +2228,7 @@ fn terminal_teardown_generation_rejects_stale_runtime_attachment() {
         runtime_fields(ExecutionGeneration::new(1).unwrap()),
     )
     .expect_err("a terminal newer lease is a durable generation high-water mark");
-    assert!(matches!(error, rusqlite::Error::InvalidQuery));
+    assert!(error.is_invalid_query());
 
     let latest = latest_teardown_suspend_operation(&conn, &sandbox_id_string)
         .unwrap()
@@ -2253,7 +2253,7 @@ fn failed_teardown_generation_allows_same_runtime_reattachment() {
         .unwrap()
         .expect("the teardown operation must exist");
     pplx_space_common_jobs::db::fail_job_permanent(
-        &conn,
+        conn.raw(),
         &operation.job_id,
         "injected teardown failure",
         None,
@@ -6671,7 +6671,7 @@ fn start_arms_access_idle_only_after_guest_readiness() {
 fn legacy_equal_route_and_operation_receipt_survives_restart_without_split_field() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("manager.sqlite");
-    let mut conn = Connection::open(&path).unwrap();
+    let mut conn = Connection::open_at(&path).unwrap();
     create_test_schema(&mut conn);
     let sandbox_id = SandboxId::new().to_string();
     insert_test_sandbox(
@@ -6694,7 +6694,7 @@ fn legacy_equal_route_and_operation_receipt_survives_restart_without_split_field
     assert_eq!(episode.activation_attempt_id, Some(route_and_operation));
 
     drop(conn);
-    let conn = Connection::open(&path).unwrap();
+    let conn = Connection::open_at(&path).unwrap();
     assert!(mark_start_succeeded(&conn, &sandbox_id, Some(episode.id)).unwrap());
     let metadata = sandbox_state_publication_metadata(&conn, std::slice::from_ref(&sandbox_id))
         .unwrap()
@@ -6717,7 +6717,7 @@ fn split_operation_receipts_survive_restart_and_preserve_route_ownership() {
     for (joined, rollback) in [(false, false), (true, false), (false, true), (true, true)] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("manager.sqlite");
-        let mut conn = Connection::open(&path).unwrap();
+        let mut conn = Connection::open_at(&path).unwrap();
         create_test_schema(&mut conn);
         let id = uuid::Uuid::now_v7().to_string();
         insert_test_sandbox(
@@ -6762,7 +6762,7 @@ fn split_operation_receipts_survive_restart_and_preserve_route_ownership() {
             ));
         }
         drop(conn); // No request future or in-memory owner survives this restart.
-        let conn = Connection::open(&path).unwrap();
+        let conn = Connection::open_at(&path).unwrap();
         let stored = cleanup_episode(&conn, &id).unwrap().unwrap();
         assert_eq!(stored.id, episode.id);
         assert_eq!(stored.activation_attempt_id, Some(route_attempt));
@@ -6844,7 +6844,7 @@ fn generic_lifecycle_writers_reject_failed_targets() {
     );
     assert!(matches!(
         rollback_starting(&conn, "starting", SandboxState::Failed),
-        Err(rusqlite::Error::InvalidQuery)
+        Err(error) if error.is_invalid_query()
     ));
     assert_eq!(
         get_sandbox(&conn, "starting").unwrap().unwrap().state,
@@ -7219,7 +7219,7 @@ fn update_netgtw_pid_errors_when_sandbox_row_is_missing() {
 
     let error = update_netgtw_pid(&conn, "missing-sandbox", 10_042, 4_242)
         .expect_err("registration write for a deleted sandbox must error, not no-op");
-    assert!(matches!(error, rusqlite::Error::QueryReturnedNoRows));
+    assert!(error.is_no_rows());
 }
 
 #[test]
@@ -7252,7 +7252,7 @@ fn replace_netgtw_pid_rejects_stale_restart_authority() {
         .expect("a stale observer may confirm the already-committed replacement");
     let error = replace_netgtw_pid(&conn, "sandbox-live", 10_042, Some(4_242), 4_244)
         .expect_err("stale restart must not overwrite the committed replacement");
-    assert!(matches!(error, rusqlite::Error::QueryReturnedNoRows));
+    assert!(error.is_no_rows());
     assert_eq!(
         get_sandbox(&conn, "sandbox-live")
             .unwrap()
@@ -7291,7 +7291,7 @@ fn update_spaced_host_pid_is_guarded_by_persisted_owner() {
 
     let error = update_spaced_host_pid(&conn, "sandbox-live", 10_043, Some(4_243), 4_244)
         .expect_err("stale owner must not replace endpoint authority");
-    assert!(matches!(error, rusqlite::Error::QueryReturnedNoRows));
+    assert!(error.is_no_rows());
     let row = get_sandbox(&conn, "sandbox-live").unwrap().unwrap();
     assert_eq!(row.spaced_host_pid, Some(4_243));
 }
@@ -7316,7 +7316,7 @@ fn update_spaced_host_pid_rejects_stale_restart_for_same_owner() {
     .unwrap();
     let error = update_spaced_host_pid(&conn, "sandbox-live", 10_042, Some(4_242), 4_243)
         .expect_err("stale restart must not overwrite a newer activation for the same uid");
-    assert!(matches!(error, rusqlite::Error::QueryReturnedNoRows));
+    assert!(error.is_no_rows());
     let row = get_sandbox(&conn, "sandbox-live").unwrap().unwrap();
     assert_eq!(row.spaced_host_pid, Some(5_000));
 }
@@ -7434,7 +7434,7 @@ fn startup_resident_settlement_keeps_only_current_receipts_atomically() {
                 |row| {
                     (0..6)
                         .map(|column| row.get::<_, rusqlite::types::Value>(column))
-                        .collect::<Result<Vec<_>>>()
+                        .collect::<rusqlite::Result<Vec<_>>>()
                 },
             )
             .unwrap()
@@ -9930,7 +9930,7 @@ fn teardown_suspend_reconciliation_skips_healthy_and_retained_jobs_and_bounds_cl
     let generation = ExecutionGeneration::new(7).unwrap();
     let unrelated_job = JobId::new();
     pplx_space_common_jobs::db::insert_job(
-        &conn,
+        conn.raw(),
         pplx_space_common_jobs::db::InsertJob {
             job_id: &unrelated_job,
             kind: "synthetic_other_job",
@@ -9969,7 +9969,7 @@ fn teardown_suspend_reconciliation_skips_healthy_and_retained_jobs_and_bounds_cl
         .unwrap()
         .unwrap();
     pplx_space_common_jobs::db::fail_job_permanent(
-        &conn,
+        conn.raw(),
         &retained.job_id,
         "synthetic retained failure",
         None,
@@ -9987,7 +9987,7 @@ fn teardown_suspend_reconciliation_skips_healthy_and_retained_jobs_and_bounds_cl
     assert_eq!(reconcile_terminal_teardown_suspend_jobs(&conn).unwrap(), 5);
     assert_eq!(reconcile_terminal_teardown_suspend_jobs(&conn).unwrap(), 0);
     assert_eq!(
-        pplx_space_common_jobs::db::get_job(&conn, &retained.job_id)
+        pplx_space_common_jobs::db::get_job(conn.raw(), &retained.job_id)
             .unwrap()
             .unwrap()
             .error
@@ -9995,7 +9995,7 @@ fn teardown_suspend_reconciliation_skips_healthy_and_retained_jobs_and_bounds_cl
         Some("synthetic retained failure")
     );
     assert!(
-        !pplx_space_common_jobs::db::get_job(&conn, &unrelated_job)
+        !pplx_space_common_jobs::db::get_job(conn.raw(), &unrelated_job)
             .unwrap()
             .unwrap()
             .is_terminal()
@@ -10011,7 +10011,7 @@ fn teardown_suspend_reconciliation_skips_healthy_and_retained_jobs_and_bounds_cl
         let operation = latest_teardown_suspend_operation(&conn, &format!("sandbox-{index}"))
             .unwrap()
             .unwrap();
-        let job = pplx_space_common_jobs::db::get_job(&conn, &operation.job_id)
+        let job = pplx_space_common_jobs::db::get_job(conn.raw(), &operation.job_id)
             .unwrap()
             .unwrap();
         assert_eq!(

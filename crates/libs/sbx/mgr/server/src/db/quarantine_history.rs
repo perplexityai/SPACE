@@ -2,7 +2,8 @@
 
 use pplx_space_common_core::types::SandboxId;
 
-use rusqlite::{Connection, Result, params, types::Value};
+use crate::db::{Connection, Result};
+use rusqlite::{params, types::Value};
 
 const ROWS_PER_BATCH: usize = 128;
 const RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
@@ -63,7 +64,7 @@ impl QuarantineHistoryPruner {
                         row.get::<_, Value>(2)?,
                     ))
                 })?
-                .collect::<Result<Vec<_>>>()?
+                .collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut report = HistoryPruneBatch {
             examined: rows.len(),

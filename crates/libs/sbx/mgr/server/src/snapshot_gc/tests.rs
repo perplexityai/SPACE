@@ -1,7 +1,9 @@
 use super::*;
-use rusqlite::params;
+use crate::db::Connection;
+use crate::db::fixture::params;
 use std::fs;
 use std::io::Write as _;
+use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 
 fn open_test_db() -> Connection {
@@ -138,8 +140,8 @@ async fn malformed_artifact_times_are_retained_without_blocking_valid_siblings()
         [TEST_ART_ID],
     )
     .unwrap();
-    let db = Arc::new(Mutex::new(conn));
-    let artifacts = LocalArtifacts::new(Arc::clone(&db));
+    let db = crate::db::SharedConnection::new(conn);
+    let artifacts = LocalArtifacts::new(db.clone());
     // A timestamp corrupted between planning and execution must also fail closed.
     execute_one(
         &artifacts,
@@ -218,8 +220,8 @@ async fn reaps_idle_uploaded_unpinned_artifact() {
         })
         .serve();
 
-    let db = Arc::new(Mutex::new(conn));
-    let artifacts = LocalArtifacts::new(Arc::clone(&db));
+    let db = crate::db::SharedConnection::new(conn);
+    let artifacts = LocalArtifacts::new(db.clone());
     let ownership = GcOwnership {
         node_manager: node_manager.connector(),
         ..test_ownership()
@@ -227,7 +229,7 @@ async fn reaps_idle_uploaded_unpinned_artifact() {
     let mut scan = ArtifactScan::default();
     let report = within_node_manager_wait(gc_tick(
         artifacts,
-        Arc::clone(&db),
+        db.clone(),
         test_cfg(),
         now_secs(),
         full_disk(),
@@ -264,8 +266,8 @@ async fn does_not_reap_below_engage_fraction() {
     insert_artifact_row(&conn, TEST_ART_ID, "sbx1", &path, 0, 0, Some(0));
     insert_sandbox_row(&conn, "sbx1", None);
 
-    let db = Arc::new(Mutex::new(conn));
-    let artifacts = LocalArtifacts::new(Arc::clone(&db));
+    let db = crate::db::SharedConnection::new(conn);
+    let artifacts = LocalArtifacts::new(db.clone());
     let mut cfg = test_cfg();
     cfg.engage_fraction = 0.50;
     cfg.target_fraction = 0.40;
@@ -275,7 +277,7 @@ async fn does_not_reap_below_engage_fraction() {
     };
     let report = gc_tick(
         artifacts,
-        Arc::clone(&db),
+        db.clone(),
         cfg,
         now_secs(),
         disk,
@@ -302,11 +304,11 @@ async fn does_not_reap_when_backup_not_completed() {
     insert_artifact_row(&conn, "art1", "sbx1", &path, 0, 0, None);
     insert_sandbox_row(&conn, "sbx1", None);
 
-    let db = Arc::new(Mutex::new(conn));
-    let artifacts = LocalArtifacts::new(Arc::clone(&db));
+    let db = crate::db::SharedConnection::new(conn);
+    let artifacts = LocalArtifacts::new(db.clone());
     let report = gc_tick(
         artifacts,
-        Arc::clone(&db),
+        db.clone(),
         test_cfg(),
         now_secs(),
         full_disk(),
@@ -329,11 +331,11 @@ async fn does_not_reap_committed_or_suspend_predecessor_pin() {
     insert_artifact_row(&conn, TEST_ART_ID, "sbx1", &path, 0, 0, Some(0));
     insert_sandbox_row(&conn, "sbx1", Some(TEST_ART_ID));
 
-    let db = Arc::new(Mutex::new(conn));
-    let artifacts = LocalArtifacts::new(Arc::clone(&db));
+    let db = crate::db::SharedConnection::new(conn);
+    let artifacts = LocalArtifacts::new(db.clone());
     let report = gc_tick(
         artifacts,
-        Arc::clone(&db),
+        db.clone(),
         test_cfg(),
         now_secs(),
         full_disk(),
@@ -362,10 +364,10 @@ async fn does_not_reap_committed_or_suspend_predecessor_pin() {
         .unwrap();
     assert_eq!(page.artifacts.len(), 1);
     assert!(page.artifacts[0].pinned_current);
-    let artifacts = LocalArtifacts::new(Arc::clone(&db));
+    let artifacts = LocalArtifacts::new(db.clone());
     let report = gc_tick(
         artifacts,
-        Arc::clone(&db),
+        db.clone(),
         test_cfg(),
         now_secs(),
         full_disk(),
@@ -389,13 +391,13 @@ async fn does_not_reap_when_not_idle() {
     insert_artifact_row(&conn, "art1", "sbx1", &path, now, now, Some(now));
     insert_sandbox_row(&conn, "sbx1", None);
 
-    let db = Arc::new(Mutex::new(conn));
-    let artifacts = LocalArtifacts::new(Arc::clone(&db));
+    let db = crate::db::SharedConnection::new(conn);
+    let artifacts = LocalArtifacts::new(db.clone());
     let mut cfg = test_cfg();
     cfg.idle = Duration::from_secs(3600);
     let report = gc_tick(
         artifacts,
-        Arc::clone(&db),
+        db.clone(),
         cfg,
         now,
         full_disk(),
@@ -422,8 +424,8 @@ async fn run_loop_startup_does_not_reset_live_restore_lease() {
     insert_artifact_row(&conn, TEST_ART_ID, "sbx1", &path, 0, 0, Some(0));
     insert_sandbox_row(&conn, "sbx1", Some(TEST_ART_ID));
 
-    let db = Arc::new(Mutex::new(conn));
-    let artifacts = LocalArtifacts::new(Arc::clone(&db));
+    let db = crate::db::SharedConnection::new(conn);
+    let artifacts = LocalArtifacts::new(db.clone());
     let artifact_id = TEST_ART_ID.parse::<LocalArtifactId>().unwrap();
     let lease = artifacts.check_out_for_restore(artifact_id).unwrap();
 
@@ -433,7 +435,7 @@ async fn run_loop_startup_does_not_reset_live_restore_lease() {
     let shutdown = ownership.shutdown.clone();
     let reaper = run_loop(
         artifacts.clone(),
-        Arc::clone(&db),
+        db.clone(),
         Arc::new(crate::service::fork_artifact::CopyOperationReservations::default()),
         cfg,
         ownership,
@@ -512,8 +514,8 @@ fn sweep_discovers_gc_pending_orphans_and_skips_unrelated() {
 
 #[test]
 fn gc_pending_reaping_requires_absent_registry_and_pin() {
-    let db = Arc::new(Mutex::new(open_test_db()));
-    let artifacts = LocalArtifacts::new(Arc::clone(&db));
+    let db = crate::db::SharedConnection::new(open_test_db());
+    let artifacts = LocalArtifacts::new(db.clone());
     let root = TempDir::new().unwrap();
     let path = root
         .path()
@@ -643,8 +645,8 @@ async fn completed_restore_after_planning_still_honors_grace_when_idle_is_zero()
     let now = now_secs();
     let observed = ArtifactScan::default().next_page(&conn).unwrap();
     assert_eq!(observed.artifacts[0].last_touched_at_secs, 0);
-    let db = Arc::new(Mutex::new(conn));
-    let artifacts = LocalArtifacts::new(Arc::clone(&db));
+    let db = crate::db::SharedConnection::new(conn);
+    let artifacts = LocalArtifacts::new(db.clone());
     artifacts
         .check_out_for_restore(TEST_ART_ID.parse().unwrap())
         .unwrap()
@@ -672,8 +674,8 @@ async fn gc_defers_to_publication_staging_drain_and_shutdown_ownership() {
     let tmp = TempDir::new().unwrap();
     let path = make_artifact_dir(&tmp, "artifact", 4096);
     insert_artifact_row(&conn, TEST_ART_ID, "sbx1", &path, 0, 0, Some(0));
-    let db = Arc::new(Mutex::new(conn));
-    let artifacts = LocalArtifacts::new(Arc::clone(&db));
+    let db = crate::db::SharedConnection::new(conn);
+    let artifacts = LocalArtifacts::new(db.clone());
     let ownership = test_ownership();
     for lock in [
         ownership.coordinator.artifact_lock("sbx1"),
@@ -682,7 +684,7 @@ async fn gc_defers_to_publication_staging_drain_and_shutdown_ownership() {
         let guard = lock.lock_owned().await;
         let report = gc_tick(
             artifacts.clone(),
-            Arc::clone(&db),
+            db.clone(),
             test_cfg(),
             now_secs(),
             full_disk(),
@@ -704,7 +706,7 @@ async fn gc_defers_to_publication_staging_drain_and_shutdown_ownership() {
     };
     let report = gc_tick(
         artifacts.clone(),
-        Arc::clone(&db),
+        db.clone(),
         test_cfg(),
         now_secs(),
         full_disk(),
@@ -718,7 +720,7 @@ async fn gc_defers_to_publication_staging_drain_and_shutdown_ownership() {
     ownership.shutdown.cancel();
     let report = gc_tick(
         artifacts.clone(),
-        Arc::clone(&db),
+        db.clone(),
         test_cfg(),
         now_secs(),
         full_disk(),

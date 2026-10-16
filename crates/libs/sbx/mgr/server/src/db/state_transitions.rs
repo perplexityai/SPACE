@@ -20,7 +20,7 @@ impl ActivationKind {
 #[derive(Debug, thiserror::Error)]
 pub enum BeginActivationError {
     #[error(transparent)]
-    Db(#[from] rusqlite::Error),
+    Db(#[from] Error),
     #[error("sandbox state {state} cannot begin a {kind:?} activation")]
     UnsupportedState {
         kind: ActivationKind,
@@ -31,7 +31,7 @@ pub enum BeginActivationError {
 #[derive(Debug, thiserror::Error)]
 pub enum RollbackActivationEpisodeError {
     #[error(transparent)]
-    Db(#[from] rusqlite::Error),
+    Db(#[from] Error),
     #[error("sandbox state {state} is not an activation state")]
     UnsupportedActivationState { state: SandboxState },
     #[error("an activation episode cannot roll back to quarantined")]
@@ -41,7 +41,7 @@ pub enum RollbackActivationEpisodeError {
 #[derive(Debug, thiserror::Error)]
 pub enum SupersedeActivationError {
     #[error(transparent)]
-    Db(#[from] rusqlite::Error),
+    Db(#[from] Error),
     #[error("sandbox quarantine recovery is already in progress")]
     QuarantineRecoveryInProgress,
     #[error(transparent)]
@@ -54,7 +54,7 @@ pub(crate) fn restore_checkpoint_state(
     stable_state: SandboxState,
 ) -> Result<bool> {
     if !matches!(stable_state, SandboxState::Started | SandboxState::Paused) {
-        return Err(rusqlite::Error::InvalidQuery);
+        return Err(Error::invalid_query());
     }
     let changed = conn.execute(
         "UPDATE sandboxes
@@ -101,7 +101,7 @@ pub(crate) fn restore_resident_resume_state(
     stable_state: SandboxState,
 ) -> Result<bool> {
     if !matches!(stable_state, SandboxState::Started | SandboxState::Paused) {
-        return Err(rusqlite::Error::InvalidQuery);
+        return Err(Error::invalid_query());
     }
     let tx = immediate_transaction(conn)?;
     let changed = rollback_activation_state(&tx, id, SandboxState::Resuming, stable_state)?;
@@ -315,10 +315,7 @@ pub(crate) fn begin_activation_with_route_evidence(
         install_activation_auto_lifecycle(&tx, id, policy)?;
     }
     let sandbox_id = (route_admission.evidence.is_some() || execution_generation.is_some())
-        .then(|| {
-            id.parse::<SandboxId>()
-                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
-        })
+        .then(|| id.parse::<SandboxId>().map_err(Error::to_sql_conversion))
         .transpose()?;
     match route_admission.open_claim {
         Some(open_route_activation) => {
@@ -331,7 +328,7 @@ pub(crate) fn begin_activation_with_route_evidence(
         }
     }
     if let Some(route_evidence) = route_admission.evidence {
-        let sandbox_id = sandbox_id.ok_or(rusqlite::Error::InvalidQuery)?;
+        let sandbox_id = sandbox_id.ok_or_else(Error::invalid_query)?;
         auto_lifecycle_delete_receipts::record_retained_route_evidence(
             &tx,
             sandbox_id,
@@ -426,7 +423,7 @@ pub fn mark_cross_node_restore_staging_failed(
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ActivationOperationError {
     #[error("activation receipt database operation failed: {0}")]
-    Database(#[from] rusqlite::Error),
+    Database(#[from] Error),
     #[error("sandbox no longer exists")]
     MissingSandbox,
     #[error("activation route evidence does not match the selected execution")]
@@ -516,10 +513,9 @@ pub(crate) fn complete_resident_wake_operation(
     if previous.0 == Some(generation.get())
         && let Some(previous_id) = previous.1
     {
-        let previous_operation: SandboxActivationAttemptId =
-            previous_id.parse().map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(1, Type::Text, Box::new(error))
-            })?;
+        let previous_operation: SandboxActivationAttemptId = previous_id
+            .parse()
+            .map_err(|error| Error::decode(1, Type::Text, error))?;
         if previous_operation > operation {
             // Do not replace a potentially newer completion. UUID ordering is
             // only a conservative receipt-retention policy: PostgreSQL clears
@@ -570,7 +566,7 @@ fn activation_completed_target(state: SandboxState) -> Option<SandboxTransitionT
 /// eagerly, but this receipt closes the crash window between node success and
 /// that best-effort control-plane write.
 fn persist_activation_completed_receipt(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Transaction<'_>,
     sandbox_id: &str,
     cleanup_id: SandboxCleanupEpisodeId,
     target_state: SandboxState,
@@ -747,7 +743,7 @@ pub fn mark_restore_succeeded(
     cleanup_id: Option<SandboxCleanupEpisodeId>,
 ) -> Result<bool> {
     if !matches!(final_state, SandboxState::Started | SandboxState::Paused) {
-        return Err(rusqlite::Error::InvalidQuery);
+        return Err(Error::invalid_query());
     }
     let tx = immediate_transaction(conn)?;
     let changed = tx.execute(
@@ -888,7 +884,7 @@ pub fn begin_teardown_suspend(
         params![now()?, id],
     )?;
     if changed != 1 {
-        return Err(rusqlite::Error::QueryReturnedNoRows);
+        return Err(Error::no_rows());
     }
     tx.commit()?;
     emit_teardown_suspend_lease_claim(id, execution_generation, claim);
@@ -1015,7 +1011,7 @@ fn rollback_activation_episode(
         });
     }
     if restored_state == SandboxState::Failed {
-        return Err(rusqlite::Error::InvalidQuery.into());
+        return Err(Error::invalid_query().into());
     }
     if restored_state == SandboxState::Quarantined {
         return Err(RollbackActivationEpisodeError::QuarantinedTarget);
@@ -1069,7 +1065,7 @@ fn rollback_activation_state(
         restored_state,
         SandboxState::Quarantined | SandboxState::Failed
     ) {
-        return Err(rusqlite::Error::InvalidQuery);
+        return Err(Error::invalid_query());
     }
     let changed = conn.execute(
         "UPDATE sandboxes

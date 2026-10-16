@@ -3,8 +3,9 @@
 
 use std::fmt;
 
+use crate::db::{Connection, Result};
+use rusqlite::params;
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, Value, ValueRef};
-use rusqlite::{Connection, Result, params};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct EpochSeconds(i64);
@@ -31,7 +32,7 @@ impl EpochSeconds {
             .ok_or(InvalidTimestamp)
     }
 
-    pub(crate) fn decode(value: &Value) -> FromSqlResult<Self> {
+    pub(in crate::db) fn decode(value: &Value) -> FromSqlResult<Self> {
         Self::column_result(ValueRef::from(value))
     }
 
@@ -65,7 +66,7 @@ impl fmt::Display for EpochSeconds {
 
 /// Diagnostic paths preserve corrupt text for degraded reporting instead of
 /// making a malformed timestamp hide the sandbox's raw lifecycle state.
-pub(crate) fn diagnostic_text(value: Value) -> Option<String> {
+pub(in crate::db) fn diagnostic_text(value: Value) -> Option<String> {
     match EpochSeconds::decode(&value) {
         Ok(value) => Some(value.to_string()),
         Err(_) => match value {
@@ -76,7 +77,7 @@ pub(crate) fn diagnostic_text(value: Value) -> Option<String> {
     }
 }
 
-pub(super) fn diagnostic_column(row: &rusqlite::Row<'_>, index: usize) -> Result<String> {
+pub(super) fn diagnostic_column(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<String> {
     let value: Value = row.get(index)?;
     let data_type = value.data_type();
     diagnostic_text(value).ok_or_else(|| {
@@ -132,7 +133,7 @@ impl RestoreScopeTimestampScan {
                 .query_map(params![self.next, through], |row| {
                     Ok((row.get::<_, i64>(0)?, row.get::<_, Value>(1)?))
                 })?
-                .collect::<Result<Vec<_>>>()?
+                .collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut changed = 0;
         for (rowid, raw) in &rows {

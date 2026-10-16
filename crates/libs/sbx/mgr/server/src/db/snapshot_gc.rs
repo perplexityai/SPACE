@@ -1,8 +1,9 @@
 //! Bounded, progressing artifact discovery; deletion authority stays with its lease.
 
+use crate::db::{Connection, Result};
 use pplx_space_common_core::inventory::{InventoryBudget, MAX_RAW_BYTES};
 use pplx_space_common_core::sql;
-use rusqlite::{Connection, Result, params};
+use rusqlite::params;
 
 use super::inventory_read::{InventoryReadError, check_row};
 use super::timestamps::EpochSeconds;

@@ -6,11 +6,12 @@
 //! active teardown jobs per tick, excluding unrelated and retained job history.
 
 use super::{active_teardown_suspend_operation, immediate_transaction};
+use crate::db::{Connection, Result};
 use pplx_space_common_core::{
     sql,
     types::{ExecutionGeneration, JobId, LocalArtifactId},
 };
-use rusqlite::{Connection, Result, params};
+use rusqlite::params;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TeardownSuspendFailure {
@@ -115,7 +116,7 @@ fn fail_operation(
                 super::mark_teardown_suspend_backup_permanently_failed(&tx, id, failed_artifact)?;
             }
             pplx_space_common_jobs::db::fail_job_permanent(
-                &tx,
+                tx.raw(),
                 &operation.job_id,
                 reason.as_str(),
                 None,
@@ -139,7 +140,7 @@ pub(super) fn fail_active(
 ) -> Result<()> {
     if let Some(operation) = active_teardown_suspend_operation(conn, id)? {
         pplx_space_common_jobs::db::fail_job_permanent(
-            conn,
+            conn.raw(),
             &operation.job_id,
             reason.as_str(),
             None,
@@ -181,11 +182,11 @@ pub(crate) fn reconcile_terminal_teardown_suspend_jobs(conn: &Connection) -> Res
         .query_map(params![super::TEARDOWN_SUSPEND_JOB_KIND], |row| {
             row.get::<_, JobId>(0)
         })?
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(statement);
     for job in &jobs {
         pplx_space_common_jobs::db::fail_job_permanent(
-            &tx,
+            tx.raw(),
             job,
             TeardownSuspendFailure::Reconciled.as_str(),
             None,

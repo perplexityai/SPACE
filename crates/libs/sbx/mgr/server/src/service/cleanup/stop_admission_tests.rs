@@ -40,7 +40,7 @@ const WAIT: Duration = Duration::from_secs(30);
 /// A test service whose host dependencies resolve under `scratch`, with node
 /// cleanup held by a test dispatch.
 fn isolated_service(
-    conn: rusqlite::Connection,
+    conn: crate::db::Connection,
     scratch: &std::path::Path,
 ) -> SandboxManagerService {
     let service = SandboxManagerService::new_with_options(
@@ -69,7 +69,7 @@ async fn shutdown(service: SandboxManagerService) {
 }
 
 /// A row in `state`, with a local restore's columns when it is `restoring`.
-fn insert_row(conn: &rusqlite::Connection, state: SandboxState) -> SandboxId {
+fn insert_row(conn: &crate::db::Connection, state: SandboxState) -> SandboxId {
     let sandbox_id = SandboxId::new();
     let id = sandbox_id.to_string();
     insert_test_sandbox(conn, &id, state);
@@ -292,7 +292,7 @@ async fn sweep_every_source_state(cleanup: Cleanup) {
                     );
                     assert!(
                         pplx_space_common_jobs::db::find_active_job(
-                            &db,
+                            db.raw(),
                             crate::db::cleanup_jobs::KIND,
                             &id
                         )

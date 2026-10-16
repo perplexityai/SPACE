@@ -97,7 +97,7 @@ pub fn pin_suspended_artifact_for_cleanup(
         ],
     )?;
     if changed != 1 {
-        return Err(rusqlite::Error::QueryReturnedNoRows);
+        return Err(Error::no_rows());
     }
     tx.commit()?;
     Ok(())
@@ -234,7 +234,7 @@ pub fn publish_restored_suspended_artifact(
         ],
     )?;
     if changed != 1 {
-        return Err(rusqlite::Error::QueryReturnedNoRows);
+        return Err(Error::no_rows());
     }
     retire_restore_transfer_scope(&tx, id)?;
     tx.commit()?;
@@ -261,7 +261,7 @@ pub fn publish_restored_suspended_without_artifact(conn: &Connection, id: &str) 
         params![now()?, id],
     )?;
     if changed != 1 {
-        return Err(rusqlite::Error::QueryReturnedNoRows);
+        return Err(Error::no_rows());
     }
     retire_restore_transfer_scope(&tx, id)?;
     tx.commit()?;
@@ -286,7 +286,7 @@ pub fn publish_restored_disk_as_new(conn: &Connection, id: &str) -> Result<()> {
         params![now()?, id],
     )?;
     if changed != 1 {
-        return Err(rusqlite::Error::QueryReturnedNoRows);
+        return Err(Error::no_rows());
     }
     clear_runtime_fields(&tx, id)?;
     retire_restore_transfer_scope(&tx, id)?;
@@ -451,7 +451,7 @@ pub fn publish_stopped_artifact(
         ],
     )?;
     if changed != 1 {
-        return Err(rusqlite::Error::QueryReturnedNoRows);
+        return Err(Error::no_rows());
     }
     // Clear the runtime first so the retention trigger observes its complete
     // identity, then close the exact attempt in the same transaction.
@@ -503,7 +503,7 @@ pub fn delete_named_local_artifact(
     Ok(())
 }
 
-fn row_to_local_artifact(row: &rusqlite::Row<'_>) -> Result<LocalArtifactRow> {
+fn row_to_local_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocalArtifactRow> {
     Ok(LocalArtifactRow {
         local_artifact_id: row.get::<_, String>(0)?.parse().map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error))

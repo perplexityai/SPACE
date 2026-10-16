@@ -2058,7 +2058,7 @@ impl SandboxManagerService {
         );
         let route_identity = normalized_route_identity.identity;
         let netgtw_route_identity = route_identity.clone();
-        let netgtw_db = Arc::clone(&self.db);
+        let netgtw_db = self.db.clone();
         let netgtw_launch_config =
             net_gateway_launch_config(&self.feature_flags, &netgtw_sandbox_id);
         let netgtw_task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
@@ -2483,7 +2483,7 @@ impl SandboxManagerService {
         let apply_network_policy = !Self::sandbox_is_pool_member(&sandbox);
         if req.blocking {
             if let Err(error) = wait_ready_and_mark_started(
-                Arc::clone(&self.db),
+                self.db.clone(),
                 id,
                 &sandbox.process_env,
                 ready_timeout_secs,
@@ -2499,7 +2499,7 @@ impl SandboxManagerService {
         } else {
             spawn_wait_ready_state_transition(
                 self,
-                Arc::clone(&self.db),
+                self.db.clone(),
                 StartStateTransition {
                     sandbox_id: id.clone(),
                     process_env: sandbox.process_env.clone(),

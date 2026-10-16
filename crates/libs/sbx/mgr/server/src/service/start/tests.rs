@@ -662,7 +662,7 @@ async fn restore_releases_artifact_lock_while_waiting_for_cleanup_completion() {
     conn.execute("INSERT INTO sandbox_cleanup_episodes
         (sandbox_id, cleanup_id, completion, keep_filesystem, phase, activation_state, created_at, requested_at, quarantine_reason_code)
         VALUES (?1, ?2, 'mark_suspended', TRUE, 'requested', 'restoring', 0, 0, ?3)",
-        rusqlite::params![id, cleanup_id.to_string(), SandboxQuarantineReasonCode::RestoreActivationInterrupted.as_str()]).unwrap();
+        crate::db::fixture::params![id, cleanup_id.to_string(), SandboxQuarantineReasonCode::RestoreActivationInterrupted.as_str()]).unwrap();
     let service = service_for_teardown_test(conn);
     *service.cleanup_executor.dispatch.lock().unwrap() =
         Some(Arc::new(|_, _| Box::pin(async { Ok(()) })));

@@ -142,7 +142,7 @@ pub(super) fn publish_template_base_snapshot_dir(
 /// `sandboxes.state` from `paused` to `checkpointing`. The caller checks the
 /// row under the same connection guard.
 pub(super) fn begin_template_base_snapshot_state(
-    db: &rusqlite::Connection,
+    db: &crate::db::Connection,
     sandbox_id: &str,
 ) -> Result<(), Status> {
     require_state_write_from(
@@ -157,7 +157,7 @@ pub(super) fn begin_template_base_snapshot_state(
 /// moved it to; the completion reports that it was superseded instead of
 /// overwriting the row.
 pub(super) fn complete_template_base_snapshot_state(
-    db: &rusqlite::Connection,
+    db: &crate::db::Connection,
     sandbox_id: &str,
 ) -> Result<(), Status> {
     require_state_write_from(
@@ -174,7 +174,7 @@ pub(super) fn complete_template_base_snapshot_state(
 /// on a best-effort basis. A row another transition moved, such as a Stop,
 /// keeps its state.
 pub(super) fn rollback_template_base_snapshot_state(
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     sandbox_id: &str,
 ) {
     update_state_from_best_effort(
