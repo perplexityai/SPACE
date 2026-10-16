@@ -145,11 +145,16 @@ pub(super) async fn resolve_ecw_route_uncached(
         .sandbox_id
         .parse::<SandboxId>()
         .map_err(|_| EcwProxyError::internal("Invalid sandbox route"))?;
+    let org_id = route
+        .org_id
+        .parse::<OrgId>()
+        .map_err(|_| EcwProxyError::internal("Invalid sandbox route"))?;
 
     let resolved = EcwResolvedRoute {
         cache_epoch: state.route_cache.next_cache_epoch(),
         origin: origin.clone(),
         sandbox_id,
+        org_id,
         template_id: route.template_id,
         route_generation: route.route_generation,
         current_node_id: route

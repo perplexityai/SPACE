@@ -1,8 +1,11 @@
 //! Ingress preparation emits outcome/count and duration before forwarding; waiter
 //! rejection and completion inactivity timeouts have separate counters. Established
 //! stream lifetime is excluded from preparation latency. No sandbox ID labels.
-//! `data_plane.upload.rejected{reason}` counts `POST /files` requests the
-//! per-pod upload admission limiter answered with 429.
+//! `data_plane.upload.rejected{scope,reason}` counts `POST /files` requests the
+//! upload admission limiter answered with 429, by the budget that ran out.
+//! `data_plane.upload.stalled` counts admitted uploads ended for arriving below
+//! the minimum body rate. `data_plane.transfer.throttled_ms{direction}` sums the
+//! time file transfers spent waiting on their org's byte-rate bucket.
 use std::{fmt, time::Instant};
 
 use crate::emit::{counter, elapsed_ms, gauge, tag, timing_ms};
@@ -272,7 +275,19 @@ impl fmt::Display for SpaceApiRouteTokenDropReason {
 }
 
 metric_vocabulary!(
-    /// Which per-pod upload admission budget a rejected upload waited on.
+    /// Which share of the upload admission budget a rejected upload waited on.
+    UploadAdmissionScope {
+        /// The replica's whole budget.
+        Pod => "pod",
+        /// The upload's org's share of the replica's budget.
+        Org => "org",
+        /// The upload's sandbox's share of the replica's budget.
+        Sandbox => "sandbox",
+    }
+);
+
+metric_vocabulary!(
+    /// Which part of an upload admission budget a rejected upload waited on.
     UploadRejectReason {
         /// No concurrent-upload slot freed within the admission wait.
         Concurrency => "concurrency",
@@ -281,11 +296,33 @@ metric_vocabulary!(
     }
 );
 
-pub fn upload_rejected(reason: UploadRejectReason) {
+metric_vocabulary!(
+    /// Which way a throttled file transfer was moving.
+    TransferDirection {
+        /// A `POST /files` request body.
+        Upload => "upload",
+        /// A `GET /files` response body.
+        Download => "download",
+    }
+);
+
+pub fn upload_rejected(scope: UploadAdmissionScope, reason: UploadRejectReason) {
     counter(
         "data_plane.upload.rejected",
         1,
-        &[tag("reason", reason.as_str())],
+        &[tag("scope", scope.as_str()), tag("reason", reason.as_str())],
+    );
+}
+
+pub fn upload_body_stalled() {
+    counter("data_plane.upload.stalled", 1, &[]);
+}
+
+pub fn transfer_throttled(direction: TransferDirection, delay: std::time::Duration) {
+    counter(
+        "data_plane.transfer.throttled_ms",
+        u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+        &[tag("direction", direction.as_str())],
     );
 }
 

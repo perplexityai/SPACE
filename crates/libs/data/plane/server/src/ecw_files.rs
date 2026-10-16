@@ -44,6 +44,7 @@ use crate::runtime_route::{
     EcwRouteAttemptError, bounded_ecw_route_transfer, bounded_node_api_unary,
     retryable_bounded_node_api_unary,
 };
+use crate::upload_admission::{AdmittedUpload, UploadTenant};
 use multipart::{multipart_boundary, resolve_multipart_uploads, spool_multipart_uploads};
 
 const E2B_FILE_CONTENT_LIMIT_BYTES: usize = 256 * 1024 * 1024;
@@ -227,6 +228,7 @@ pub(super) async fn read_file(
     Query(query): Query<FileReadQueryE2b>,
 ) -> Result<Response, EcwProxyError> {
     let route = resolve_ecw_envd_route(&state, &headers).await?;
+    let org_id = route.org_id;
     let user = extract_query_user(query.username.as_deref())?;
     let message = SpacedReadRequest {
         sandbox_id: route.sandbox_id.to_string(),
@@ -259,12 +261,12 @@ pub(super) async fn read_file(
             .map_err(|err| std::io::Error::other(err.message))?;
         Ok::<Bytes, std::io::Error>(chunk.data)
     });
+    let mut body = Body::from_stream(stream);
+    if let Some(uploads) = &state.uploads {
+        body = uploads.govern_download(org_id, body);
+    }
 
-    Ok((
-        [(header::CONTENT_TYPE, "application/octet-stream")],
-        Body::from_stream(stream),
-    )
-        .into_response())
+    Ok(([(header::CONTENT_TYPE, "application/octet-stream")], body).into_response())
 }
 
 pub(super) async fn write_file(
@@ -326,32 +328,60 @@ pub(super) async fn write_file(
     // Admit after authentication so unauthenticated requests can't queue for
     // upload slots, and before the body is read so a rejected upload costs
     // the pod no body bytes.
-    let _upload_permit = match &state.uploads {
-        Some(uploads) => {
-            // Every write path stops reading at its limit, so an undeclared
-            // length reserves the whole of it.
-            let reserve = declared_len.unwrap_or_else(|| write_body.body_limit());
-            Some(uploads.admit(reserve as u64).await?)
-        }
-        None => None,
+    let Some(uploads) = &state.uploads else {
+        return write_body_to_guest(&state, route, &headers, query.path, user, write_body, body)
+            .await;
     };
+    // Every write path stops reading at its limit, so an undeclared length
+    // reserves the whole of it.
+    let reserve = declared_len.unwrap_or_else(|| write_body.body_limit());
+    let tenant = UploadTenant {
+        org_id: route.org_id,
+        sandbox_id: route.sandbox_id,
+    };
+    let AdmittedUpload {
+        permit: _permit,
+        body,
+        stalled,
+    } = uploads.admit_upload(tenant, reserve as u64, body).await?;
+    write_body_to_guest(&state, route, &headers, query.path, user, write_body, body)
+        .await
+        .map_err(|error| {
+            if stalled.is_stalled() {
+                EcwProxyError::upload_body_stalled()
+            } else {
+                error
+            }
+        })
+}
 
+/// The body phase of `POST /files`: reads `body` the way `write_body` says
+/// and writes the result to the guest.
+async fn write_body_to_guest(
+    state: &DataPlaneState,
+    route: EcwResolvedRoute,
+    headers: &HeaderMap,
+    query_path: Option<String>,
+    user: Option<GuestUserName>,
+    write_body: WriteBody<'_>,
+    body: Body,
+) -> Result<Json<Vec<FileWriteInfoE2b>>, EcwProxyError> {
     match write_body {
         WriteBody::OctetStream(path) => {
             // Create the parent before reading the body, so a destination whose
             // parent can't be created fails without spooling the upload. Other
             // write failures still surface after spooling.
-            let route = ensure_parent_dir(&state, route, &path, user.clone()).await?;
+            let route = ensure_parent_dir(state, route, &path, user.clone()).await?;
             let mut spool = SpoolFiles::default();
             let upload = spool_body_upload(body, &mut spool).await?;
-            spaced_write_spooled(&state, route, path.clone(), &upload, user).await?;
+            spaced_write_spooled(state, route, path.clone(), &upload, user).await?;
             Ok(Json(vec![file_write_info(path)]))
         }
         WriteBody::Json => {
-            let request = read_json_file_write_request(&headers, body).await?;
+            let request = read_json_file_write_request(headers, body).await?;
             let path = e2b_request_root(&request.path, user.as_ref())?;
             spaced_write_bytes(
-                &state,
+                state,
                 route,
                 path.clone(),
                 file_write_content_to_bytes(request.content)?,
@@ -364,14 +394,14 @@ pub(super) async fn write_file(
             // Owns every staged file until the request ends, however it ends.
             let mut spool = SpoolFiles::default();
             let uploads =
-                spool_multipart_uploads(body, boundary, query.path.is_none(), &mut spool).await?;
-            let writes = resolve_multipart_uploads(uploads, query.path, user.as_ref())?;
+                spool_multipart_uploads(body, boundary, query_path.is_none(), &mut spool).await?;
+            let writes = resolve_multipart_uploads(uploads, query_path, user.as_ref())?;
             let mut written = Vec::with_capacity(writes.len());
             let mut route = route;
             for (path, upload) in writes {
-                route = ensure_parent_dir(&state, route, &path, user.clone()).await?;
-                route = spaced_write_spooled(&state, route, path.clone(), &upload, user.clone())
-                    .await?;
+                route = ensure_parent_dir(state, route, &path, user.clone()).await?;
+                route =
+                    spaced_write_spooled(state, route, path.clone(), &upload, user.clone()).await?;
                 written.push(file_write_info(path));
             }
             Ok(Json(written))
@@ -1702,6 +1732,8 @@ fn raw_file_write_error(status: tonic::Status) -> EcwProxyError {
     raw_file_read_error(status)
 }
 
+#[cfg(test)]
+mod admission_tests;
 mod multipart;
 #[cfg(test)]
 mod tests;

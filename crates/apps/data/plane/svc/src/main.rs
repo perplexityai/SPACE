@@ -3,12 +3,13 @@ use std::time::Duration;
 
 use clap::Parser;
 use pplx_space_data_plane_server::{
-    DEFAULT_ATTACH_DEADLINE_MS, DEFAULT_BACKEND_CHANNEL_POOL_SIZE, DEFAULT_LISTEN,
+    ByteRateConfig, DEFAULT_ATTACH_DEADLINE_MS, DEFAULT_BACKEND_CHANNEL_POOL_SIZE, DEFAULT_LISTEN,
     DEFAULT_MAX_ATTACHED_STREAMS, DEFAULT_MAX_ATTACHED_STREAMS_PER_ORG,
     DEFAULT_MAX_ATTACHED_STREAMS_PER_SANDBOX, DEFAULT_MAX_CONCURRENT_UPLOADS,
     DEFAULT_MAX_IN_FLIGHT_UPLOAD_BYTES, DEFAULT_REVOCATION_CHECK_INTERVAL_MS,
     DEFAULT_ROUTE_CACHE_TTL_MS, DEFAULT_UNAUTHENTICATED_UPGRADE_CAP_PER_IP,
-    DEFAULT_UPLOAD_ADMISSION_WAIT, DataPlaneConfig, UploadAdmissionConfig,
+    DEFAULT_UPLOAD_ADMISSION_WAIT, DataPlaneConfig, LimitOrOff, MinBodyRateConfig,
+    UploadAdmissionConfig, UploadShareConfig,
 };
 
 // Same allocator choice as space-api-svc: glibc arenas keep the peak of an
@@ -123,6 +124,73 @@ struct Cli {
         default_value_t = DEFAULT_UPLOAD_ADMISSION_WAIT.as_millis() as u64
     )]
     upload_admission_wait_ms: u64,
+
+    /// Maximum concurrent uploads per org on this replica.
+    #[arg(
+        long,
+        env = "SPACE_DATA_PLANE_MAX_CONCURRENT_UPLOADS_PER_ORG",
+        default_value_t = pplx_space_data_plane_server::DEFAULT_MAX_CONCURRENT_UPLOADS_PER_ORG
+    )]
+    max_concurrent_uploads_per_org: NonZeroUsize,
+
+    /// In-flight upload bytes per org on this replica, reserved as for the
+    /// replica's budget.
+    #[arg(
+        long,
+        env = "SPACE_DATA_PLANE_MAX_IN_FLIGHT_UPLOAD_BYTES_PER_ORG",
+        default_value_t = pplx_space_data_plane_server::DEFAULT_MAX_IN_FLIGHT_UPLOAD_BYTES_PER_ORG
+    )]
+    max_in_flight_upload_bytes_per_org: NonZeroU64,
+
+    /// Maximum concurrent uploads per sandbox on this replica.
+    #[arg(
+        long,
+        env = "SPACE_DATA_PLANE_MAX_CONCURRENT_UPLOADS_PER_SANDBOX",
+        default_value_t = pplx_space_data_plane_server::DEFAULT_MAX_CONCURRENT_UPLOADS_PER_SANDBOX
+    )]
+    max_concurrent_uploads_per_sandbox: NonZeroUsize,
+
+    /// In-flight upload bytes per sandbox on this replica.
+    #[arg(
+        long,
+        env = "SPACE_DATA_PLANE_MAX_IN_FLIGHT_UPLOAD_BYTES_PER_SANDBOX",
+        default_value_t = pplx_space_data_plane_server::DEFAULT_MAX_IN_FLIGHT_UPLOAD_BYTES_PER_SANDBOX
+    )]
+    max_in_flight_upload_bytes_per_sandbox: NonZeroU64,
+
+    /// Sustained bytes per second each org's file transfers, uploads and
+    /// downloads together, may move through this replica, or `off`.
+    #[arg(
+        long,
+        env = "SPACE_DATA_PLANE_ORG_TRANSFER_BYTES_PER_SECOND",
+        default_value_t = LimitOrOff(Some(pplx_space_data_plane_server::DEFAULT_ORG_TRANSFER_RATE.bytes_per_second))
+    )]
+    org_transfer_bytes_per_second: LimitOrOff,
+
+    /// Bytes an org may move at once before its transfer rate applies.
+    #[arg(
+        long,
+        env = "SPACE_DATA_PLANE_ORG_TRANSFER_BURST_BYTES",
+        default_value_t = pplx_space_data_plane_server::DEFAULT_ORG_TRANSFER_RATE.burst_bytes
+    )]
+    org_transfer_burst_bytes: NonZeroU64,
+
+    /// Slowest an admitted upload's body may arrive, in bytes per second of
+    /// waiting on the client, before it's ended with 408, or `off`.
+    #[arg(
+        long,
+        env = "SPACE_DATA_PLANE_UPLOAD_MIN_BODY_BYTES_PER_SECOND",
+        default_value_t = LimitOrOff(Some(pplx_space_data_plane_server::DEFAULT_UPLOAD_MIN_BODY_RATE.bytes_per_second))
+    )]
+    upload_min_body_bytes_per_second: LimitOrOff,
+
+    /// The span of client waiting the minimum body rate is judged over.
+    #[arg(
+        long,
+        env = "SPACE_DATA_PLANE_UPLOAD_MIN_BODY_RATE_WINDOW_MS",
+        default_value_t = NonZeroU64::new(pplx_space_data_plane_server::DEFAULT_UPLOAD_MIN_BODY_RATE.window.as_millis() as u64).unwrap()
+    )]
+    upload_min_body_rate_window_ms: NonZeroU64,
 }
 
 impl From<Cli> for DataPlaneConfig {
@@ -143,6 +211,22 @@ impl From<Cli> for DataPlaneConfig {
                 max_concurrent_uploads: cli.max_concurrent_uploads,
                 max_in_flight_bytes: cli.max_in_flight_upload_bytes,
                 wait: Duration::from_millis(cli.upload_admission_wait_ms),
+                per_org: UploadShareConfig::new(
+                    cli.max_concurrent_uploads_per_org,
+                    cli.max_in_flight_upload_bytes_per_org,
+                ),
+                per_sandbox: UploadShareConfig::new(
+                    cli.max_concurrent_uploads_per_sandbox,
+                    cli.max_in_flight_upload_bytes_per_sandbox,
+                ),
+                org_transfer_rate: ByteRateConfig::unless_off(
+                    cli.org_transfer_bytes_per_second,
+                    cli.org_transfer_burst_bytes,
+                ),
+                min_body_rate: MinBodyRateConfig::unless_off(
+                    cli.upload_min_body_bytes_per_second,
+                    Duration::from_millis(cli.upload_min_body_rate_window_ms.get()),
+                ),
             }),
         }
     }

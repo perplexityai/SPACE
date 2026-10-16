@@ -2,7 +2,7 @@ use super::*;
 use crate::ECW_ENVD_PORT;
 use crate::state::{EcwRouteOrigin, EcwSandboxHost};
 use axum::http::{HeaderValue, StatusCode};
-use pplx_space_common_core::types::{IdempotencyKey, NodeId, SandboxId};
+use pplx_space_common_core::types::{IdempotencyKey, NodeId, OrgId, SandboxId};
 use pplx_space_sbx_mgr_client::restart_retry_on_successor_status;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -22,6 +22,7 @@ fn test_ecw_route(route_generation: u64) -> EcwResolvedRoute {
             api_key_sha256: None,
         },
         sandbox_id,
+        org_id: OrgId::new(),
         template_id: None,
         route_generation,
         current_node_id: NodeId::new(),

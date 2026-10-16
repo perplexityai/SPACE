@@ -26,6 +26,7 @@ dashmap = { workspace = true }
 form_urlencoded = { workspace = true }
 futures-util = { workspace = true }
 hex = { workspace = true }
+http-body = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true, features = ["client", "http1"] }
 hyper-util = { workspace = true, features = ["client-legacy", "http1", "tokio"] }

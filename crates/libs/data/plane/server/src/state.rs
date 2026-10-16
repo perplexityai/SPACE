@@ -785,6 +785,8 @@ pub(super) struct EcwResolvedRoute {
     pub(super) cache_epoch: u64,
     pub(super) origin: EcwRouteOrigin,
     pub(super) sandbox_id: SandboxId,
+    /// The sandbox's owner; upload admission and transfer rates key on it.
+    pub(super) org_id: OrgId,
     pub(super) template_id: Option<String>,
     pub(super) route_generation: u64,
     pub(super) current_node_id: NodeId,
@@ -1573,6 +1575,17 @@ impl EcwProxyError {
             ResponseKind::Admission,
         )
         .with_retry_after(retry_after)
+    }
+
+    /// An admitted upload whose body arrived below the minimum body rate. 408,
+    /// since the client, not the pod, ran out of time.
+    pub(super) fn upload_body_stalled() -> Self {
+        Self::new(
+            StatusCode::REQUEST_TIMEOUT,
+            "Upload body arrived too slowly",
+            ResponseOrigin::DataPlane,
+            ResponseKind::Timeout,
+        )
     }
 
     pub(super) fn internal(message: impl Into<String>) -> Self {
