@@ -31,6 +31,10 @@ spec:
                     values: {{ toJson .Values.pools }}
       automountServiceAccountToken: false
       enableServiceLinks: false
+      # Host PID: an operator's root shell on the node sees the node services'
+      # processes; the restarted-send smoke stops and continues node-manager
+      # and volume-manager from here.
+      hostPID: true
       terminationGracePeriodSeconds: 5
       containers:
         - name: shell

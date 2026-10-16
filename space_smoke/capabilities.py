@@ -1810,6 +1810,21 @@ class CompletedTransfer:
 
 
 @dataclass(frozen=True)
+class FailedTransfer:
+    """One volume-manager transfer attempt that failed, from its log line.
+
+    `error_kind` is volume-manager's retry class (`retriable` or `permanent`);
+    `error` is the message that failed the attempt.
+    """
+
+    node_name: str
+    kind: str
+    local_path: str
+    error_kind: str
+    error: str
+
+
+@dataclass(frozen=True)
 class SnapshotRowFacts:
     """The immutable facts of one cluster `snapshots` row, in row order."""
 
@@ -1870,9 +1885,10 @@ class SuspendCodecControl(CrossNodeRestoreControl, Protocol):
     activation events) with the reads and faults those scenarios need:
     the codec fact from sbx-manager's own event, the parent template's
     presence and subvolume identity on a worker, the daemon's failure lines,
-    and two kind-only faults — withholding a template release's storage
-    rows and corrupting one object of a durable snapshot. Every fault is a
-    named operation with its compensation owned by the fixture.
+    and three kind-only faults — withholding a template release's storage
+    rows, corrupting one object of a durable snapshot, and stopping
+    node-manager while its btrfs send blocks on a full pipe. Every fault is
+    a named operation with its compensation owned by the fixture.
     """
 
     def other_sandbox_worker_node(self, excluding_node: str) -> str:
@@ -1893,6 +1909,31 @@ class SuspendCodecControl(CrossNodeRestoreControl, Protocol):
         self, sandbox_id: str, node_name: str, *, since_time: str
     ) -> list[CompletedTransfer]:
         """volume-manager's completed transfer jobs under the sandbox's cache directory on `node_name` since `since_time`."""
+        ...
+
+    def failed_transfers(
+        self, sandbox_id: str, node_name: str, *, since_time: str
+    ) -> list[FailedTransfer]:
+        """volume-manager's failed transfer attempts under the sandbox's cache directory on `node_name` since `since_time`."""
+        ...
+
+    def interrupt_btrfs_send(
+        self, node_name: str, *, token: str, pulses: int, window_seconds: int
+    ) -> list[str]:
+        """Kind-only fault: stop and continue node-manager while its send blocks.
+
+        Blocks for up to `window_seconds`. Each time a btrfs send is in flight
+        on the worker, at most `pulses` times, volume-manager is stopped so
+        the send pipe fills, then node-manager is stopped and continued, then
+        volume-manager is continued. Ends early once
+        `end_btrfs_send_interrupt` is called with the same `token`. Returns
+        the interrupter's output lines (`pulse <n>` per pulse, then
+        `pulses <n>`).
+        """
+        ...
+
+    def end_btrfs_send_interrupt(self, node_name: str, *, token: str) -> None:
+        """Stop the interrupter and continue node-manager and volume-manager; idempotent."""
         ...
 
     def backup_queued_events(self, sandbox_id: str, *, since_time: str) -> list[BackupQueued]:

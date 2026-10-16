@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import secrets
 import shlex
 import time
 from datetime import UTC, datetime, timedelta
@@ -43,6 +44,7 @@ from space_smoke.capabilities import (
     BackupQueued,
     BtrfsSendCapture,
     CompletedTransfer,
+    FailedTransfer,
     ReleaseStorageRow,
     RestoreFailure,
     SnapshotRowFacts,
@@ -118,6 +120,7 @@ from space_smoke.runtime import (
     ScenarioContext,
     ScenarioTimedOut,
     SmokeConfigurationError,
+    background,
 )
 
 if TYPE_CHECKING:
@@ -3430,6 +3433,92 @@ class SuspendCodecAssertions:
         transfer = transfers[-1]
         self._fixture.record("streamed_upload", asdict(transfer))
         return transfer
+
+    @contextmanager
+    def interrupting_btrfs_send(
+        self, node_name: str, *, pulses: int = 1, window_seconds: int = 900
+    ) -> Iterator[None]:
+        """Stop and continue node-manager while a send on `node_name` blocks.
+
+        The interrupter runs in the node's operator shell for the body (see
+        `SuspendCodecControl.interrupt_btrfs_send`). Ending it, which also
+        continues both daemons, is armed as a compensation before it starts,
+        and runs eagerly when the body exits. A body that completes requires
+        at least one pulse: without one, nothing was interrupted.
+
+        Scenarios on one bench run in turn, so the send in flight is this
+        sandbox's. A concurrent smoke's send that took the pulse instead can
+        only fail this scenario's rejection check, never pass it.
+        """
+
+        token = secrets.token_hex(8)
+        lines: list[str] = []
+        end = self._scope.defer(
+            f"end the btrfs-send interrupter on {node_name}",
+            lambda: self._control.end_btrfs_send_interrupt(node_name, token=token),
+            critical=True,
+        )
+        work = background(
+            f"btrfs-send interrupter on {node_name}",
+            lambda: lines.extend(
+                self._control.interrupt_btrfs_send(
+                    node_name, token=token, pulses=pulses, window_seconds=window_seconds
+                )
+            ),
+        )
+        try:
+            yield
+        finally:
+            end.release()
+            work.join(timeout=60)
+        self._fixture.record("send_interrupt", lines)
+        fired = [line for line in lines if line.startswith("pulse ")]
+        self._fixture.verify(
+            len(fired) >= 1,
+            "the interrupter never found a btrfs send in flight to interrupt",
+            worker_node=node_name,
+            interrupter_output=lines,
+        )
+
+    def expect_rejected_send_stream(self, node_name: str, *, since_time: str) -> FailedTransfer:
+        """node-manager refused the restarted stream and volume-manager retried.
+
+        The record is volume-manager's failed `push_btrfs_send` attempt for
+        the sandbox's send stream, failed as retriable with node-manager's
+        rejection. Unlike sbx-manager's bounded restore error kinds, a
+        transfer's retry class does not name the cause, so the message is
+        matched.
+        """
+
+        from space_smoke.adapters import BTRFS_SEND_REJECTED_ERROR, ROOTFS_SEND_FILE
+
+        failures = self._control.failed_transfers(
+            self._fixture.sandbox.sandbox_id, node_name, since_time=since_time
+        )
+        rejected = [
+            failure
+            for failure in failures
+            if failure.kind == "push_btrfs_send"
+            and PurePosixPath(failure.local_path).name == ROOTFS_SEND_FILE
+            and BTRFS_SEND_REJECTED_ERROR in failure.error
+        ]
+        self._fixture.verify(
+            len(rejected) >= 1,
+            "no streamed upload attempt failed on node-manager's rejection of a "
+            "restarted send; the interrupted stream was forwarded",
+            sandbox_id=self._fixture.sandbox.sandbox_id,
+            worker_node=node_name,
+            failed_attempts=[asdict(failure) for failure in failures],
+        )
+        failure = rejected[0]
+        self._fixture.verify(
+            failure.error_kind == "retriable",
+            "the rejected send failed its upload permanently instead of retrying",
+            sandbox_id=self._fixture.sandbox.sandbox_id,
+            failed_attempt=asdict(failure),
+        )
+        self._fixture.record("rejected_send", asdict(failure))
+        return failure
 
     def expect_retained_source_without_send_file(self, node_name: str) -> tuple[str, ...]:
         """The canonical snapshot holds the retained bundle and no send file."""

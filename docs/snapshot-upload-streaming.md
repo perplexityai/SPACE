@@ -403,7 +403,11 @@ Kind runs this path in CI: its volume-manager carries the separate
 credential-manager serves it on the volume socket, sandbox-manager sets the
 flag, and `local.deferred_btrfs_send_capture_restores_cross_node` requires a
 deferred capture with no send file before and after upload and a cross-node
-restore from object storage.
+restore from object storage. `local.restarted_btrfs_send_is_rejected_and_retried`
+stops volume-manager until the send blocks on its pipe, then stops and
+continues node-manager. It requires the restarted stream's upload attempt to
+fail retriable with node-manager's rejection, and the retried upload to restore
+cross-node with the payload's digest intact.
 
 Before widening enablement, use a small canary and matched controls to verify:
 

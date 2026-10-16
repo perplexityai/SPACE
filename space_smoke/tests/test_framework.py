@@ -150,6 +150,7 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "local.private_template_build_isolation",
                 "local.quarantine_recovery_backs_off",
                 "local.rate_limiters_enforce_and_fail_open",
+                "local.restarted_btrfs_send_is_rejected_and_retried",
                 "local.retention_claim_finish_forward",
                 "local.retention_restore_source_guard",
                 "local.sandbox_network_isolation_holds",

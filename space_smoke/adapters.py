@@ -87,6 +87,7 @@ from space_smoke.capabilities import (
     BackupQueued,
     BtrfsSendCapture,
     CompletedTransfer,
+    FailedTransfer,
     ReleaseStorageRow,
     RestoreFailure,
     TemplatePullLine,
@@ -541,6 +542,61 @@ ROOTFS_SEND_FILE = "rootfs.btrfs-send"
 # volume-manager's line for every single-file transfer job, the streamed
 # `push_btrfs_send` included (crates/libs/vol/mgr/server/src/executor.rs).
 TRANSFER_JOB_COMPLETED_MESSAGE = "transfer job completed"
+TRANSFER_JOB_FAILED_MESSAGE = "transfer job failed"
+# node-manager's relay refuses a send stream whose framing breaks, as a kernel
+# send restarted mid-pipe does, before forwarding it; volume-manager's failed
+# attempt carries the status message
+# (crates/libs/node/mgr/server/src/service/btrfs_send_transport.rs).
+BTRFS_SEND_REJECTED_ERROR = "btrfs send stream rejected"
+# node-manager stages each send lease here; a lease's `.send-*` wire clone
+# exists only while its kernel send runs.
+BTRFS_SEND_STAGING_ROOT = "/space/cache/.btrfs-send-staging"
+# Runs in the node's operator shell. While a send is in flight, at most
+# `max` times: stop volume-manager, so the send fills the pipe and blocks;
+# stop and continue node-manager, which makes the blocked `pipe_write` return
+# -ERESTARTSYS and the kernel restart the send ioctl; continue
+# volume-manager. Both daemons are continued however the script ends.
+_BTRFS_SEND_INTERRUPTER = r"""
+set -u
+stop={stop}; max={pulses}; deadline=$(( $(date +%s) + {window} )); n=0
+pid_of() {{ for d in /proc/[0-9]*; do [ "$(cat "$d/comm" 2>/dev/null)" = "$1" ] && echo "${{d#/proc/}}"; done; }}
+nm=$(pid_of space-nodemgr-s); vol=$(pid_of space-volmgr-sv)
+case "$nm $vol" in
+  *[!0-9\ ]* | " "* | *" ")
+    echo "expected one node-manager and one volume-manager, found [$nm] [$vol]" >&2
+    exit 3 ;;
+esac
+is() {{ [ "$(cat "/proc/$1/comm" 2>/dev/null)" = "$2" ]; }}
+resume() {{ kill -CONT "$nm" "$vol" 2>/dev/null; rm -f "$stop"; echo "pulses $n"; }}
+trap resume EXIT
+trap 'exit 0' HUP INT TERM
+while [ ! -e "$stop" ] && [ "$(date +%s)" -lt "$deadline" ]; do
+  if ! is "$nm" space-nodemgr-s || ! is "$vol" space-volmgr-sv; then
+    echo "node-manager or volume-manager restarted" >&2
+    exit 4
+  fi
+  if [ "$n" -lt "$max" ] && [ -n "$(find {staging} -maxdepth 3 -type d -name '.send-*' -print -quit 2>/dev/null)" ]; then
+    kill -STOP "$vol"; sleep 0.3
+    kill -STOP "$nm"; sleep 0.1
+    kill -CONT "$nm"; kill -CONT "$vol"
+    n=$((n + 1)); echo "pulse $n"
+  else
+    sleep 0.01
+  fi
+done
+"""
+_BTRFS_SEND_INTERRUPT_END = r"""
+stop={stop}
+touch "$stop"
+for _ in $(seq 50); do [ -e "$stop" ] || break; sleep 0.1; done
+rm -f "$stop"
+for d in /proc/[0-9]*; do
+  case "$(cat "$d/comm" 2>/dev/null)" in
+    space-nodemgr-s | space-volmgr-sv) kill -CONT "${{d#/proc/}}" ;;
+  esac
+done
+true
+"""
 # `SPACE_TEMPLATE_RECEIVED_UUID_NS` (crates/libs/common/core/src/host/btrfs.rs):
 # a template installed from `(name, content_hash)` is stamped with
 # `UUIDv5(NS, "name@content_hash")` so a btrfs-send stream produced against
@@ -1979,6 +2035,38 @@ ON CONFLICT (key_hash) DO NOTHING;
         logs = self._node_service_logs(node_name, NODE_VOLUME_MANAGER, since_time=since_time)
         return _completed_transfers_from_logs(
             logs, f"{SANDBOX_CACHE_ROOT}/{_sql_uuid(sandbox_id)}/", node_name
+        )
+
+    def failed_transfers(
+        self, sandbox_id: str, node_name: str, *, since_time: str
+    ) -> list[FailedTransfer]:
+        logs = self._node_service_logs(node_name, NODE_VOLUME_MANAGER, since_time=since_time)
+        return _failed_transfers_from_logs(
+            logs, f"{SANDBOX_CACHE_ROOT}/{_sql_uuid(sandbox_id)}/", node_name
+        )
+
+    def interrupt_btrfs_send(
+        self, node_name: str, *, token: str, pulses: int, window_seconds: int
+    ) -> list[str]:
+        if pulses < 1 or not 0 < window_seconds <= 3600:
+            raise ValueError(f"refusing {pulses} pulses over {window_seconds} s")
+        script = _BTRFS_SEND_INTERRUPTER.format(
+            stop=shlex.quote(_btrfs_send_interrupt_stop_file(token)),
+            pulses=int(pulses),
+            window=int(window_seconds),
+            staging=shlex.quote(BTRFS_SEND_STAGING_ROOT),
+        )
+        result = self._node_shell_exec(node_name, script, timeout=window_seconds + 60)
+        output = _require_ok(result, f"interrupt btrfs sends on {node_name}")
+        return [line.strip() for line in output.splitlines() if line.strip()]
+
+    def end_btrfs_send_interrupt(self, node_name: str, *, token: str) -> None:
+        script = _BTRFS_SEND_INTERRUPT_END.format(
+            stop=shlex.quote(_btrfs_send_interrupt_stop_file(token))
+        )
+        _require_ok(
+            self._node_shell_exec(node_name, script, timeout=60),
+            f"end the btrfs-send interrupter on {node_name}",
         )
 
     def sandbox_snapshot_dirs(self, node_name: str, sandbox_id: str) -> tuple[str, ...]:
@@ -5221,6 +5309,39 @@ def _completed_transfers_from_logs(
             )
         )
     return transfers
+
+
+def _failed_transfers_from_logs(
+    logs: str, path_prefix: str, node_name: str
+) -> list[FailedTransfer]:
+    """Failed transfer attempts in `logs` whose local path is under `path_prefix`."""
+
+    failures: list[FailedTransfer] = []
+    for line in logs.splitlines():
+        if TRANSFER_JOB_FAILED_MESSAGE not in line:
+            continue
+        fields = _tracing_fields(line)
+        if fields is None or fields.get("message") != TRANSFER_JOB_FAILED_MESSAGE:
+            continue
+        local_path = str(fields.get("local_path", ""))
+        if not local_path.startswith(path_prefix):
+            continue
+        failures.append(
+            FailedTransfer(
+                node_name=node_name,
+                kind=str(fields.get("kind", "")),
+                local_path=local_path,
+                error_kind=str(fields.get("error_kind", "")),
+                error=str(fields.get("error", "")),
+            )
+        )
+    return failures
+
+
+def _btrfs_send_interrupt_stop_file(token: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{8,64}", token):
+        raise ValueError(f"refusing interrupter token {token!r}")
+    return f"/tmp/space-smoke-send-interrupt-{token}"
 
 
 def _tracing_fields(line: str) -> dict[str, Any] | None:
