@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import json
 import unittest
+from typing import Any, cast
+from unittest import mock
 
 from space_smoke.adapters import (
     TEMPLATE_RECEIVED_UUID_NAMESPACE,
@@ -23,7 +25,8 @@ from space_smoke.adapters import (
     _tracing_fields,
     template_received_uuid,
 )
-from space_smoke.runtime import CommandResult
+from space_smoke.fixtures import SuspendCodecAssertions
+from space_smoke.runtime import CommandResult, InvariantViolation, ResourceScope
 
 
 class TracingFieldMerge(unittest.TestCase):
@@ -176,3 +179,60 @@ class InstanceProbesFailClosed(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _EvictionFixture:
+    def __init__(self) -> None:
+        self.records: dict[str, object] = {}
+        self.waited: list[float] = []
+
+    def sandbox_template_name(self) -> str:
+        return "seed"
+
+    def verify(self, condition: bool, message: str, **_evidence: object) -> None:
+        if not condition:
+            raise InvariantViolation(message)
+
+    def record(self, key: str, value: object) -> None:
+        self.records[key] = value
+
+    def wait(self, seconds: float) -> None:
+        self.waited.append(seconds)
+
+
+class _RacingPrefetchControl:
+    """A worker whose prefetch lands the digest directory after the first deletes."""
+
+    def __init__(self, landings_after_delete: int) -> None:
+        self.landings_after_delete = landings_after_delete
+        self.deletes = 0
+
+    def evict_template_from_worker(self, node_name: str, template: str) -> list[str]:
+        self.deletes += 1
+        return []
+
+    def template_digest_dirs(self, node_name: str, template: str) -> tuple[str, ...]:
+        return ("sha256:abc",) if self.deletes <= self.landings_after_delete else ()
+
+
+class TemplateEvictionSettles(unittest.TestCase):
+    def _evict(self, control: _RacingPrefetchControl) -> _EvictionFixture:
+        fixture = _EvictionFixture()
+        assertions = SuspendCodecAssertions(
+            cast(Any, fixture), cast(Any, control), ResourceScope()
+        )
+        assertions.evict_template("worker-b", "seed")
+        return fixture
+
+    def test_a_prefetch_pull_landing_after_the_delete_is_removed_again(self) -> None:
+        control = _RacingPrefetchControl(landings_after_delete=1)
+        fixture = self._evict(control)
+        self.assertEqual(control.deletes, 2)
+        self.assertEqual(fixture.records["template_eviction_rounds_worker-b"], 2)
+
+    def test_a_template_that_never_settles_fails_closed(self) -> None:
+        control = _RacingPrefetchControl(landings_after_delete=10**6)
+        with mock.patch("space_smoke.fixtures.TEMPLATE_EVICTION_SETTLE_SECONDS", 0.0):
+            with self.assertRaisesRegex(InvariantViolation, "still has digest directories"):
+                self._evict(control)
+        self.assertEqual(control.deletes, 1)

@@ -3304,6 +3304,13 @@ class TemplateCacheAssertions:
             digests_missing=missing,
         )
 
+# A prefetch pull that resolved its release before `delete-template` lands
+# its ~460 MiB seed within a few seconds on a bench; the eviction re-deletes
+# once it has, and gives up well inside one prefetch interval.
+TEMPLATE_EVICTION_SETTLE_SECONDS = 30.0
+TEMPLATE_EVICTION_RETRY_SECONDS = 3.0
+
+
 class SuspendCodecAssertions:
     """Prove the production suspend codec's failure matrix on a real bench.
 
@@ -3523,6 +3530,43 @@ class SuspendCodecAssertions:
             "refusing to remove a template other than the fixture sandbox's own",
             template=template,
         )
+        # The worker's template prefetch is not fenced against
+        # `delete-template`: a tick that resolved the release before the
+        # delete keeps staging its digest directory afterwards (an earlier
+        # scenario that withheld the release's storage leaves the worker
+        # primed for exactly that tick once it is restored). Removal is
+        # therefore proven by the worker's filesystem settling empty, with
+        # the delete repeated once that in-flight pull has landed. A finished
+        # pull is the last one for a full prefetch interval, so the caller's
+        # restore still finds the worker cold.
+        deadline = time.monotonic() + TEMPLATE_EVICTION_SETTLE_SECONDS
+        rounds = 0
+        while True:
+            rounds += 1
+            try:
+                self._delete_template_reclaiming_dead_rows(node_name, template)
+            except SmokeConfigurationError:
+                raise
+            except RuntimeError:
+                # A delete that raced the in-flight pull's staging; the
+                # settled pull is removed by the next round.
+                if rounds == 1 or time.monotonic() >= deadline:
+                    raise
+            remaining = self._control.template_digest_dirs(node_name, template)
+            if not remaining or time.monotonic() >= deadline:
+                break
+            self._fixture.wait(TEMPLATE_EVICTION_RETRY_SECONDS)
+        self._fixture.record(f"template_eviction_rounds_{node_name}", rounds)
+        self._fixture.verify(
+            remaining == (),
+            "the template still has digest directories on the worker after removal",
+            template=template,
+            digest_dirs=list(remaining),
+            eviction_rounds=rounds,
+            settle_timeout_seconds=TEMPLATE_EVICTION_SETTLE_SECONDS,
+        )
+
+    def _delete_template_reclaiming_dead_rows(self, node_name: str, template: str) -> None:
         # template-manager refuses while a local sandbox row on that worker
         # was created from the template. Privileged scenarios reclaim their
         # own rows at teardown, so on a bench these are the retained suspend
@@ -3537,21 +3581,13 @@ class SuspendCodecAssertions:
         for _ in range(4):
             referencing = self._control.evict_template_from_worker(node_name, template)
             if not referencing:
-                break
+                return
             self._fixture.record(f"reclaimed_local_rows_{node_name}", sorted(referencing))
             for sandbox_id in referencing:
                 self._control.reclaim_cluster_deleted_local_sandbox(node_name, sandbox_id)
-        else:
-            raise SmokeConfigurationError(
-                f"worker {node_name} kept reporting local sandbox rows created from "
-                f"{template} after reclaiming cluster-deleted ones: {sorted(referencing)}"
-            )
-        remaining = self._control.template_digest_dirs(node_name, template)
-        self._fixture.verify(
-            remaining == (),
-            "the template still has digest directories on the worker after removal",
-            template=template,
-            digest_dirs=list(remaining),
+        raise SmokeConfigurationError(
+            f"worker {node_name} kept reporting local sandbox rows created from "
+            f"{template} after reclaiming cluster-deleted ones: {sorted(referencing)}"
         )
 
     def expect_template_absent(self, node_name: str, template: str) -> None:
