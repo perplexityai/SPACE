@@ -31,7 +31,10 @@ comes from state instead.
   loses it while still running. The holder's `lease_lost` reaches Prometheus
   stamped before the Lease's last `renewTime` plus its duration, the earliest
   instant a standby could take over; its tick count does not grow between two
-  samples stamped after that instant; and its container ends within the bound
+  samples stamped after that instant and before the apiserver is restored
+  (nothing can acquire the Lease in that window, so every tick in it is the
+  expired holder's; a restarted container that keeps the pod name may win a
+  fresh Lease afterwards); and its container ends within the bound
   the controller's own deadlines give its exit
   (`HOLDER_EXIT_AFTER_EXPIRY_SECONDS`).
   The last `renewTime` is the newest one seen by a read just before the park,
@@ -55,7 +58,8 @@ path (they share one client). The refused contender's NotReady is an outcome
 only: it never wrote a marker, so it cannot show the marker being cleared;
 the outage's marker check is what shows that.
 
-If a run is killed with the apiserver parked, put it back with
+Ctrl-C and SIGTERM still run the restore. If a run is killed outright with
+the apiserver parked, put it back with
 `docker exec space-local-control-plane mv
 /etc/kubernetes/kube-apiserver.yaml.space-smoke-parked
 /etc/kubernetes/manifests/kube-apiserver.yaml`.
@@ -132,6 +136,8 @@ class LeaderElectionAssertions:
         self._remove_contender: Compensation | None = None
         self._restore_apiserver: Compensation | None = None
         self._outage_started = 0.0
+        # When the restore was requested: no Lease can be acquired before it.
+        self._restore_requested = 0.0
         self._lease_before_outage: ControllerLease | None = None
         self._budget_exit: tuple[str, NodeContainer] | None = None
         # Pod name -> node, for reading container state and logs while the
@@ -562,6 +568,8 @@ class LeaderElectionAssertions:
         )
 
     def bring_the_apiserver_back(self) -> None:
+        self._restore_requested = time.time()
+        self._fixture.record("restore_requested_at", self._restore_requested)
         self._control.restore_apiserver(self._control_plane)
         self._poll("the apiserver to answer again", self._control.apiserver_answers, bool, timeout=300)
         # The localhost forwards to Prometheus restart once kubectl can reach
@@ -618,17 +626,23 @@ class LeaderElectionAssertions:
         )
 
         # Two samples stamped after expiry with a higher count between them
-        # are a tick that finished after a standby could have taken over.
+        # are a tick that finished after a standby could have taken over. Only
+        # samples before the restore are judged: until then nothing can hold
+        # the Lease, so a tick is the expired holder's, and after it a
+        # restarted container with the holder's pod name may lead again.
+        cutoff = self._restore_requested
+        self._fixture.record("holder_ticks_judged", {"from": expiry, "until": cutoff})
         late = self._poll(
             "Prometheus to answer for the holder's ticks after expiry",
-            lambda: self._ticks_after(holder, after=expiry),
+            lambda: self._ticks_between(holder, after=expiry, until=cutoff),
             lambda _: True,
             timeout=120,
             tolerate_errors=True,
         )
         self._fixture.verify(
             late is None,
-            f"the holder's reconciler ticks grew after its Lease expired: {late}",
+            f"the holder's reconciler ticks grew after its Lease expired and before the "
+            f"apiserver was restored: {late}",
             failure_evidence=self._log_evidence,
         )
 
@@ -673,8 +687,8 @@ class LeaderElectionAssertions:
             for sample in self._prometheus(f"histogram_count({RECONCILER_TICKS}{selector})", at=at)
         }
 
-    def _ticks_after(self, pod: str, *, after: float) -> tuple[float, float] | None:
-        """Two samples stamped at or after `after` with the count grown between them."""
+    def _ticks_between(self, pod: str, *, after: float, until: float) -> tuple[float, float] | None:
+        """Two samples stamped in `[after, until)` with the count grown between them."""
 
         now = time.time()
         window = int(now - after) + 60
@@ -682,7 +696,7 @@ class LeaderElectionAssertions:
             samples = sorted(
                 (float(stamp), float(histogram["count"]))
                 for stamp, histogram in series.get("histograms") or []
-                if float(stamp) >= after
+                if after <= float(stamp) < until
             )
             for (earlier, before), (later, count) in zip(samples, samples[1:]):
                 if count > before:
