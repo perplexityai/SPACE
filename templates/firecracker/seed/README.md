@@ -214,7 +214,7 @@ reads these installation commands from the recipe. The digest sources are:
 - uv [aarch64 checksum](https://github.com/astral-sh/uv/releases/download/0.12.18/uv-aarch64-unknown-linux-gnu.tar.gz.sha256) and [x86_64 checksum](https://github.com/astral-sh/uv/releases/download/0.12.18/uv-x86_64-unknown-linux-gnu.tar.gz.sha256)
 
 The recipe's Python packages are pinned, with every transitive dependency, to
-wheel hashes that pip enforces; an artifact outside the locked set fails the
+wheel hashes that uv enforces; an artifact outside the locked set fails the
 build. On x86_64 its APT packages come from a dated
 [Ubuntu archive snapshot](https://snapshot.ubuntu.com/), and the build fails if
 any package would download from outside it. Ubuntu publishes no snapshot of
