@@ -57,16 +57,22 @@ Every pattern must match at least one item and every item at most one module.
 
 Refused, to be done by hand (the tool stops rather than guess):
 * moving `use`, `mod x;`, `extern` blocks or `macro_rules!` items (macros stay in the
-  parent, above the new `mod` lines, so children still see them);
+  parent, above the new `mod` lines, so children still see them), and any split of a
+  parent with a `#[macro_use]` item;
 * a parent file loaded through `#[path]`, or a `#[path]` inside moved code;
-* moved code that invokes a parent macro emitting `pub(super)`/`pub(self)` (directly or
-  through another macro), or a macro name defined twice;
-* relative visibility the edits cannot remap: `pub(in super::..)`, a `pub(super)`
-  nested inside a moved item, an inline module naming `super`, `self::super`;
-* a `super::` path inside a string literal (e.g. an attribute argument), and include
-  arguments other than a plain string literal;
-* a module name that is a keyword or collides with an item or import in the parent;
-* an attribute on the same line as its item (so items are never mis-split).
+* moved code reaching a macro whose expansion names `super`/`self` paths or emits
+  `pub(super)`/`pub(self)`: any macro_rules! in the crate, directly, through other macros,
+  path-qualified or through a `use .. as` alias; a macro invoked before the parent defines
+  it, or defined twice; `super` passed in a user macro's arguments (format/tracing-style
+  macros are fine); `stringify!` of `super`; `include!`;
+* top-level or impl-member macro invocations, unless the module sets allow_macro_items;
+* relative visibility the edits cannot remap: `pub(in super::..)`, a `pub(super)` nested
+  inside a moved item, an inline module naming `super`, `self::super`, a `super::` path
+  inside a string literal, include arguments other than a plain string literal;
+* a module name that is a keyword, collides with an item or import of the parent, or is
+  already used as a path in the parent or its child modules;
+* an attribute sharing a line with its item or impl member; a carriage return; a
+  `src/bin/<name>.rs` crate root; a code block in a module doc.
 """
 from __future__ import annotations
 
@@ -543,6 +549,13 @@ def super_path_positions(mt: str) -> list[int]:
     return out
 
 
+# Macros whose arguments are ordinary expressions, paths or format arguments: a deeper
+# `super::` path inside them means what it meant before.
+KNOWN_MACROS = set("""format format_args print println eprint eprintln write writeln vec assert assert_eq
+assert_ne debug_assert debug_assert_eq debug_assert_ne matches panic unreachable todo unimplemented dbg
+trace debug info warn error event trace_span debug_span info_span warn_span error_span span anyhow bail
+ensure sql json""".split())
+
 REL_VIS = re.compile(r"\bpub\s*\(\s*(?:super|self|in\s+(?:super|self)\b)")
 INCLUDE = re.compile(r"\binclude_(?:str|bytes)\s*!\s*[(\[{]")
 PLAIN_INCLUDE = re.compile(r"(\binclude_(?:str|bytes)\s*!\s*[(\[{]\s*)\"([^\"\\]*)\"\s*[)\]}]")
@@ -620,6 +633,13 @@ def transform_item(text: str, kind: str, parent_path: list[str], deeper_dir: boo
     if re.search(r"\bmod\s+(?:r#)?\w+\s*\{", mt) and re.search(r"\bsuper\b", mt):
         raise SystemExit("moved code has an inline module and names `super`; which module each `super` "
                          "means depends on nesting the tool does not track. Edit by hand.")
+    for m in re.finditer(r"(?<![\w:])(\w+)\s*!\s*(?=[(\[{])", mt):
+        if m.group(1) in KNOWN_MACROS:
+            continue
+        g = macro_group(mt, m.end())
+        if g and re.search(r"\bsuper\b", mt[g[0]:g[1]]):
+            raise SystemExit(f"moved code passes `super` to {m.group(1)}!; a macro can match or stringify those "
+                             "tokens, so deepening them may change what it expands to. Edit by hand.")
     if re.search(r"\binclude\s*!\s*[(\[{]", mt):
         raise SystemExit("moved code uses include!; the included Rust code resolves its paths from the module "
                          "it is expanded in, which the tool cannot rewrite. Edit by hand.")
@@ -975,8 +995,12 @@ def apply(spec_path: str, repo: str, dry: bool, report: str | None) -> int:
                                    for k, mi in massign)
 
     def invokes(text: str, name: str) -> bool:
-        return re.search(r"(?<![\w:])" + re.escape(name) + r"\s*!", text) is not None
+        return re.search(r"(?<!\w)" + re.escape(name) + r"\s*!", text) is not None
 
+    if (assign or massign) and any(re.match(r"#\[\s*macro_use\b", a) for it in items
+                                   for a in attrs_of(lines, it.lead, it.start)):
+        raise SystemExit("the parent has a #[macro_use] item; the new mod lines would change which macros moved "
+                         "code sees by textual order. Edit by hand.")
     for name in {n for n in macro_names if macro_names.count(n) > 1}:
         if invokes(moved_text, name):
             raise SystemExit(f"macro_rules! {name} is defined more than once in the parent and moved code "
@@ -991,25 +1015,31 @@ def apply(spec_path: str, repo: str, dry: bool, report: str | None) -> int:
         if not more:
             break
         relative |= more
-    # Macros defined elsewhere in the crate expand in the moved code's module too.
+    # Macros defined anywhere in the crate expand in the moved code's module too. A macro is
+    # relative if its body names a super/self path or a relative visibility, or invokes a
+    # relative macro (transitively); a `use x as y` of one, anywhere in the crate, is one too.
     crate_src = os.path.join(repo, rel.replace(os.sep, "/").split("/src/", 1)[0], "src")
+    all_bodies: dict[str, str] = dict(bodies)
+    aliases: list[tuple[str, str]] = []
     for d, _, files in os.walk(crate_src):
         for fn in files:
-            fp = os.path.join(d, fn)
-            if not fn.endswith(".rs") or os.path.realpath(fp) == os.path.realpath(path):
+            if not fn.endswith(".rs"):
                 continue
+            fp = os.path.join(d, fn)
             other = mask(open(fp, encoding="utf-8", errors="replace").read())
             for m in re.finditer(r"\bmacro_rules!\s*(?:r#)?(\w+)", other):
                 g = macro_group(other, m.end())
-                body = other[g[0]:g[1]] if g else ""
-                if REL_VIS.search(body) or super_path_positions(body) or re.search(r"\bself\s*::", body):
-                    relative.add(m.group(1))
-    for it in items:
-        if it.kind == "use":
-            body = mask("\n".join(lines[it.start:it.end + 1]))
-            for src_name, alias in re.findall(r"\b(\w+)\s+as\s+(\w+)", body):
-                if src_name in relative:
-                    relative.add(alias)
+                all_bodies[m.group(1)] = all_bodies.get(m.group(1), "") + "\n" + (other[g[0]:g[1]] if g else "")
+            for m in re.finditer(r"\buse\b[^;]*;", other):
+                aliases += re.findall(r"\b(\w+)\s+as\s+(\w+)", m.group(0))
+    relative |= {n for n, b in all_bodies.items()
+                 if REL_VIS.search(b) or super_path_positions(b) or re.search(r"\bself\s*::", b)}
+    while True:
+        more = {n for n, b in all_bodies.items() if n not in relative and any(invokes(b, r) for r in relative)}
+        more |= {alias for src_name, alias in aliases if src_name in relative and alias not in relative}
+        if not more:
+            break
+        relative |= more
     for name in sorted(relative):
         if invokes(moved_text, name):
             raise SystemExit(f"moved code invokes macro_rules! {name}, whose expansion names `super`/`self` "
@@ -1067,9 +1097,10 @@ def apply(spec_path: str, repo: str, dry: bool, report: str | None) -> int:
             raise SystemExit(f"module name {n!r} collides with a name the parent imports")
         siblings = ""
         if os.path.isdir(child_dir):
-            for fn in sorted(os.listdir(child_dir)):
-                if fn.endswith(".rs"):
-                    siblings += mask(open(os.path.join(child_dir, fn), encoding="utf-8", errors="replace").read())
+            for d, _, files in os.walk(child_dir):
+                for fn in sorted(files):
+                    if fn.endswith(".rs"):
+                        siblings += mask(open(os.path.join(d, fn), encoding="utf-8", errors="replace").read())
         if re.search(r"(?<![\w:])" + re.escape(n) + r"\s*::", masked_src + "\n" + siblings):
             raise SystemExit(f"module name {n!r} is already used as a path in the parent (a crate or a glob-imported "
                              "module?); a new module of that name would shadow it")

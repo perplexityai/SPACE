@@ -988,7 +988,6 @@ def test_a_commented_attribute_is_not_copied_onto_split_impl_blocks(repo):
     [
         # an impl-member macro needs the opt-in
         ("struct S;\n\nimpl S {\n    describe!();\n\n    fn stay() {}\n}\n", "", '["impl S :: macro describe"]', "allow_macro_items"),
-        # super passed as a macro argument is deepened, not skipped: refuse via crate macro check is not needed;
         # a raw-identifier inline module with super inside a moved fn
         ("fn f() -> u8 {\n    mod r#i {\n        pub fn g() -> u8 {\n            super::super::V\n        }\n    }\n    r#i::g()\n}\n",
          "", '["fn f"]', "inline module"),
@@ -1001,11 +1000,16 @@ def test_round_three_claude_refusals(repo, text, spec_extra, items, message):
     assert r.returncode != 0 and message in r.stderr, r.stderr
 
 
-def test_super_passed_to_a_macro_is_deepened(repo):
+def test_super_passed_to_a_user_macro_is_refused_and_to_format_is_deepened(repo):
     r = write_parent(repo, "fn f() -> u8 {\n    call!(super)\n}\n",
                      'file = "crate/src/a/foo.rs"\n[[module]]\nname = "x"\nitems = ["fn f"]\n')
-    assert r.returncode == 0, r.stderr
-    assert "call!(super::super)" in (repo / "crate/src/a/foo/x.rs").read_text()
+    assert r.returncode != 0 and "passes `super` to call!" in r.stderr, r.stderr
+    git(repo, "reset", "-q", "--hard", "HEAD")
+    git(repo, "clean", "-qfd")
+    ok = write_parent(repo, "fn f() -> String {\n    format!(\"{}\", super::V)\n}\n",
+                      'file = "crate/src/a/foo.rs"\n[[module]]\nname = "y"\nitems = ["fn f"]\n')
+    assert ok.returncode == 0, ok.stderr
+    assert 'format!("{}", super::super::V)' in (repo / "crate/src/a/foo/y.rs").read_text()
 
 
 def test_a_crate_macro_whose_body_names_super_is_refused(repo):
@@ -1015,12 +1019,36 @@ def test_a_crate_macro_whose_body_names_super_is_refused(repo):
     assert r.returncode != 0 and "macro_rules! up" in r.stderr, r.stderr
 
 
-def test_macro_use_modules_are_declared_before_new_children(repo):
+def test_a_parent_with_macro_use_is_refused(repo):
     r = write_parent(repo, "fn early() {}\n\n#[macro_use]\nmod inner {\n    macro_rules! answer {\n        () => {\n            1\n        };\n    }\n}\n\nfn f() -> u8 {\n    answer!()\n}\n",
                      'file = "crate/src/a/foo.rs"\n[[module]]\nname = "x"\nitems = ["fn f"]\n')
-    assert r.returncode == 0, r.stderr
-    parent = (repo / "crate/src/a/foo.rs").read_text()
-    assert parent.index("mod inner") < parent.index("mod x;")
+    assert r.returncode != 0 and "macro_use" in r.stderr, r.stderr
+
+
+@pytest.mark.parametrize(
+    ("root", "call"),
+    [
+        # a relay macro elsewhere in the crate that reaches a macro naming super
+        ("macro_rules! up {\n    () => {\n        super::which()\n    };\n}\n\nmacro_rules! relay {\n    () => {\n        up!()\n    };\n}\n", "relay!()"),
+        # a path-qualified call to a crate macro naming super
+        ("macro_rules! up {\n    () => {\n        super::which()\n    };\n}\n\npub(crate) use up;\n", "crate::up!()"),
+        # an alias, defined in another file, of a macro naming super
+        ("macro_rules! up {\n    () => {\n        super::which()\n    };\n}\n\npub(crate) use up as lifted;\n", "lifted!()"),
+    ],
+)
+def test_crate_macros_that_expand_relative_paths_are_refused(repo, root, call):
+    (repo / "crate/src/lib.rs").write_text(root)
+    r = write_parent(repo, f"fn f() {{\n    {call};\n}}\n",
+                     'file = "crate/src/a/foo.rs"\n[[module]]\nname = "x"\nitems = ["fn f"]\n')
+    assert r.returncode != 0 and "expansion names" in r.stderr, r.stderr
+
+
+def test_the_shadowing_scan_covers_nested_children(repo):
+    (repo / "crate/src/a/foo/other").mkdir(parents=True, exist_ok=True)
+    (repo / "crate/src/a/foo/other/mod.rs").write_text("use super::*;\n\nfn g() -> u8 {\n    util::one()\n}\n")
+    r = write_parent(repo, "mod other;\n\nfn f() {}\n",
+                     'file = "crate/src/a/foo.rs"\n[[module]]\nname = "util"\nitems = ["fn f"]\n')
+    assert r.returncode != 0 and "already used as a path" in r.stderr
 
 
 def test_a_module_name_used_as_a_path_in_an_existing_child_is_refused(repo):
