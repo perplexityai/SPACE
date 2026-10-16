@@ -11777,6 +11777,119 @@ pub(crate) mod service_tests {
         }
     }
 
+    #[test]
+    fn new_activation_attempt_for_rolled_back_generation_is_admitted() {
+        // The rollback refusal is exact: it retires one generation/activation
+        // attempt pair. A new attempt for the same generation is a legitimate
+        // retry and restores from the retained original artifact.
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        let generation = ExecutionGeneration::new(2).unwrap();
+        let rolled_back_attempt = SandboxActivationAttemptId::new();
+        let original_artifact = LocalArtifactId::new();
+        suspended_sandbox_after_restore_rollback(
+            &conn,
+            &id,
+            original_artifact,
+            true,
+            generation,
+            rolled_back_attempt,
+        );
+
+        let new_attempt = SandboxActivationAttemptId::new();
+        let admitted = crate::db::begin_activation(
+            &conn,
+            &id,
+            SandboxState::Suspended,
+            crate::db::ActivationKind::Restore,
+            Some(generation),
+            Some(new_attempt),
+        );
+        assert!(matches!(admitted, Ok(Some(_))), "{admitted:?}");
+        let row = crate::db::get_sandbox(&conn, &id).unwrap().unwrap();
+        assert_eq!(row.state, SandboxState::Restoring);
+        assert_eq!(row.current_local_artifact_id, Some(original_artifact));
+    }
+
+    #[test]
+    fn eviction_after_rollback_keeps_the_rolled_back_generation_fenced() {
+        // Eviction deletes the row and its rollback receipt. A later retry of
+        // the rolled-back attempt can rebuild the row from the remote
+        // snapshot, so the delete receipt must carry the retired generation.
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        let generation = ExecutionGeneration::new(2).unwrap();
+        let attempt = SandboxActivationAttemptId::new();
+        let original_artifact = LocalArtifactId::new();
+        suspended_sandbox_after_restore_rollback(
+            &conn,
+            &id,
+            original_artifact,
+            true,
+            generation,
+            attempt,
+        );
+
+        assert!(
+            crate::db::claim_suspended_sandbox_for_eviction(
+                &conn,
+                &id,
+                Some(&original_artifact.to_string()),
+                None,
+            )
+            .unwrap()
+        );
+        crate::db::set_cleanup_intent(&conn, &id, false, crate::db::CleanupCompletion::DeleteRow)
+            .unwrap();
+        crate::db::complete_row_intent_cleanup(
+            &conn,
+            &id,
+            crate::db::CleanupCompletion::DeleteRow,
+            None,
+        )
+        .unwrap();
+        assert!(crate::db::get_sandbox(&conn, &id).unwrap().is_none());
+        assert!(crate::db::execution_delete_receipt_covers(&conn, &id, generation).unwrap());
+
+        // A cross-node restore rebuilds a suspended row without any receipt.
+        insert_test_sandbox(&conn, &id, SandboxState::Suspended);
+        let late = crate::db::begin_activation(
+            &conn,
+            &id,
+            SandboxState::Suspended,
+            crate::db::ActivationKind::Restore,
+            Some(generation),
+            Some(attempt),
+        );
+        assert!(
+            matches!(
+                late,
+                Err(crate::db::BeginActivationError::RetiredGeneration {
+                    execution_generation,
+                }) if execution_generation == generation
+            ),
+            "{late:?}"
+        );
+        let row = crate::db::get_sandbox(&conn, &id).unwrap().unwrap();
+        assert_eq!(row.state, SandboxState::Suspended);
+
+        let successor = ExecutionGeneration::new(3).unwrap();
+        assert!(
+            matches!(
+                crate::db::begin_activation(
+                    &conn,
+                    &id,
+                    SandboxState::Suspended,
+                    crate::db::ActivationKind::Restore,
+                    Some(successor),
+                    Some(SandboxActivationAttemptId::new()),
+                ),
+                Ok(Some(_))
+            ),
+            "a newer generation restores normally"
+        );
+    }
+
     #[tokio::test]
     async fn delete_receipt_is_generation_fenced() {
         let conn = crate::db::test_conn();

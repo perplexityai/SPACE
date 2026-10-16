@@ -761,7 +761,8 @@ impl SandboxManagerService {
             )
             .map_err(|error| match error {
                 // Not retryable as-is: the caller must mint a new attempt.
-                error @ crate::db::BeginActivationError::RolledBackAttempt { .. } => {
+                error @ (crate::db::BeginActivationError::RolledBackAttempt { .. }
+                | crate::db::BeginActivationError::RetiredGeneration { .. }) => {
                     Status::failed_precondition(error.to_string())
                 }
                 error => Status::internal(format!(
