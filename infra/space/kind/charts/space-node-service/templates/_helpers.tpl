@@ -429,7 +429,7 @@ Rolling-update strategy. `surge` starts the replacement beside the old pod:
 for services that hold a node-wide service mutex (/space/run/<svc>/service.mutex)
 the successor waits passively, reports ready while passive, and takes over
 when the predecessor drains and releases the lock, with its sockets replaced
-by rename (crates/libs/common/svc/src/service_mutex.rs, bootstrap.rs).
+by rename (crates/libs/common/svc/src/service_mutex.rs, bootstrap/unix_socket.rs).
 `deleteFirst` stops the old pod before the new one starts, for services that
 cannot run twice on a node.
 */}}
