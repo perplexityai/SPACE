@@ -213,6 +213,15 @@ reads these installation commands from the recipe. The digest sources are:
 - [GitHub CLI release checksums](https://github.com/cli/cli/releases/download/v2.101.0/gh_2.101.0_checksums.txt)
 - uv [aarch64 checksum](https://github.com/astral-sh/uv/releases/download/0.12.18/uv-aarch64-unknown-linux-gnu.tar.gz.sha256) and [x86_64 checksum](https://github.com/astral-sh/uv/releases/download/0.12.18/uv-x86_64-unknown-linux-gnu.tar.gz.sha256)
 
+The recipe's Python packages are pinned, with every transitive dependency, to
+wheel hashes that pip enforces; an artifact outside the locked set fails the
+build. On x86_64 its APT packages come from a dated
+[Ubuntu archive snapshot](https://snapshot.ubuntu.com/), and the build fails if
+any package would download from outside it. Ubuntu publishes no snapshot of
+the ports archive, so other architectures install APT packages from the live
+mirror. To move both sets forward, run
+`scripts/lock-code-runtime-deps.sh YYYY-MM-DD` and review the recipe diff.
+
 When updating a tool, review the upstream release and update its version and
 both digest pins together. When updating Ubuntu, choose a dated release with
 both squashfs architectures and signed checksum metadata. Other Ubuntu release
