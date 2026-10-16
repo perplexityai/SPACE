@@ -172,7 +172,8 @@ RUST_ARTIFACT_DEPS = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo
                       "infra/space/identity/node-identities.sh",
                       "templates/firecracker/seed/rootfs-builder.sh",
                       "templates/firecracker/recipes/seed.toml",
-                      "templates/firecracker/recipes/code-runtime.toml"]
+                      "templates/firecracker/recipes/code-runtime.toml",
+                      "templates/firecracker/recipes/code-runtime"]
 
 RUST_ARTIFACT_BUILD = "bash infra/space/kind/scripts/build-rust-artifacts.sh"
 

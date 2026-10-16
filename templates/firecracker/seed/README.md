@@ -213,14 +213,18 @@ reads these installation commands from the recipe. The digest sources are:
 - [GitHub CLI release checksums](https://github.com/cli/cli/releases/download/v2.101.0/gh_2.101.0_checksums.txt)
 - uv [aarch64 checksum](https://github.com/astral-sh/uv/releases/download/0.12.18/uv-aarch64-unknown-linux-gnu.tar.gz.sha256) and [x86_64 checksum](https://github.com/astral-sh/uv/releases/download/0.12.18/uv-x86_64-unknown-linux-gnu.tar.gz.sha256)
 
-The recipe's Python packages are pinned, with every transitive dependency, to
-wheel hashes that uv enforces; an artifact outside the locked set fails the
-build. On x86_64 its APT packages come from a dated
-[Ubuntu archive snapshot](https://snapshot.ubuntu.com/), and the build fails if
-any package would download from outside it. Ubuntu publishes no snapshot of
-the ports archive, so other architectures install APT packages from the live
-mirror. To move both sets forward, run
-`scripts/lock-code-runtime-deps.sh YYYY-MM-DD` and review the recipe diff.
+The recipe's Python packages are listed in `recipes/code-runtime/pyproject.toml`
+and pinned, with every transitive dependency, to wheel hashes in
+`recipes/code-runtime/uv.lock`. uv installs exactly that set, and an artifact
+outside it fails the build. The lock takes only releases at least a week old.
+After editing the package list, run `uv lock` in that directory; `uv lock
+--upgrade` moves every package to its newest eligible release.
+
+On x86_64 the recipe's APT packages come from the dated
+[Ubuntu archive snapshot](https://snapshot.ubuntu.com/) in its `APT_SNAPSHOT`,
+and the build fails if any package would download from outside it. Ubuntu
+publishes no snapshot of the ports archive, so other architectures install APT
+packages from the live mirror.
 
 When updating a tool, review the upstream release and update its version and
 both digest pins together. When updating Ubuntu, choose a dated release with

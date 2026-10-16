@@ -1,0 +1,53 @@
+# Python packages for the code-runtime recipe. The build installs exactly the
+# wheels recorded in uv.lock. After editing this file, run `uv lock` in this
+# directory; `uv lock --upgrade` moves every package to its newest release.
+[project]
+name = "code-runtime-python"
+version = "0"
+# Must match the seed's python3: the build installs only locked wheels, so a
+# different interpreter fails the build until the lock is regenerated.
+requires-python = "==3.14.*"
+dependencies = [
+    # Jupyter
+    "jupyter",
+    "ipython",
+    "jupyterlab",
+    # Data visualization
+    "bokeh",
+    "kaleido",
+    # NLP
+    "nltk",
+    "spacy",
+    # JIT compiler
+    "numba",
+    # Data science
+    "numpy",
+    "pandas",
+    "scipy",
+    "pillow",
+    # Image I/O
+    "imageio",
+    # Utilities
+    "send2trash",
+    "pygments",
+    "jsonschema",
+]
+
+[tool.uv]
+package = false
+# The build installs with --only-binary :all:, so lock wheels only.
+no-build = true
+# Lock only releases at least a week old, so new releases settle before a
+# rebuild picks them up.
+exclude-newer = "7 days"
+# Builders run x86_64 or aarch64 Linux; locking only those keeps uv.lock small.
+environments = [
+    "sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+]
+
+# Lock against public PyPI whatever index a local uv configuration names, so
+# uv.lock records the canonical download URLs.
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true

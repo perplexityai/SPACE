@@ -100,15 +100,20 @@ def build_template_definition(base_template: str) -> Template:
         for step in recipe["steps"]
         if step["type"] == "run"
     }
-    return (
-        Template()
+    template = (
+        Template(file_context_path=recipe_path.parent)
         .from_template(base_template)
         .run_cmd(commands["Install system packages"], user="root")
         .run_cmd(VALIDATE_PYTHON, user="root")
         .run_cmd(commands["Install Node.js v20"], user="root")
         .run_cmd(commands["Install GitHub CLI"], user="root")
         .run_cmd(commands["Install uv package manager"], user="root")
-        .run_cmd(
+    )
+    for step in recipe["steps"]:
+        if step["type"] == "copy":
+            template = template.copy(step["source"], step["dest"], user="root")
+    return (
+        template.run_cmd(
             commands["Install code interpreter packages (Jupyter, data science, NLP)"],
             user="root",
         )

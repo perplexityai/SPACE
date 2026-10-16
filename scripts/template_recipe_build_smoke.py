@@ -4,13 +4,11 @@
 from __future__ import annotations
 
 import base64
-import io
 import json
 import os
 import re
 import socket
 import sys
-import tarfile
 import time
 import tomllib
 import urllib.error
@@ -164,15 +162,16 @@ def resolve_env_refs(value: str) -> str:
     return "".join(result)
 
 
-def archive_copy_source(recipe_path: Path, source: str) -> bytes:
+def read_copy_source(recipe_path: Path, source: str) -> bytes:
     source_path = Path(source)
     if not source_path.is_absolute():
         source_path = recipe_path.parent / source_path
     source_path = source_path.resolve(strict=True)
-    archive = io.BytesIO()
-    with tarfile.open(fileobj=archive, mode="w") as tar:
-        tar.add(source_path, arcname=source_path.name, recursive=True)
-    return archive.getvalue()
+    # The builder writes inline bytes to dest as one file; only an uploaded
+    # blob can carry a directory.
+    if not source_path.is_file():
+        raise SmokeFailure("render_recipe", f"copy source {source} is not a file")
+    return source_path.read_bytes()
 
 
 def render_step(
@@ -203,7 +202,7 @@ def render_step(
     elif kind == "copy":
         rendered["copy"] = {
             "inline_bytes_base64": base64.b64encode(
-                archive_copy_source(recipe_path, step["source"])
+                read_copy_source(recipe_path, step["source"])
             ).decode("ascii"),
             "dest": step["dest"],
         }
