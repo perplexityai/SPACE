@@ -12,11 +12,11 @@ use std::time::Duration;
 
 use pplx_space_common_core::host::linux::identities::group_names;
 use pplx_space_common_svc::bootstrap::BindUnixSocketError;
-use pplx_space_common_svc::sql::sqlite::SqliteError;
 use pplx_space_common_svc::{
     AcquireOutcome, LocalHealthLiveness, LocalHealthServer, SERVICE_MUTEX_POLL_INTERVAL,
     ServiceMutex, ServiceMutexAcquireError, UnixSocketOptions,
 };
+use pplx_space_sqlite::SqliteError;
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio_util::sync::CancellationToken;
 
@@ -37,10 +37,10 @@ static VOLUME_MANAGER_MIGRATOR: sqlx::migrate::Migrator =
 static COMMON_SCHEMA_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../../../../db/common");
 
 pub(crate) async fn migrate_volume_manager_db(path: &Path) -> Result<(), SqliteError> {
-    pplx_space_common_svc::sql::sqlite::migrate_embedded(
+    pplx_space_sqlite::migrate_embedded(
         "volume-manager",
         path,
-        pplx_space_common_svc::sql::sqlite::EmbeddedMigrators {
+        pplx_space_sqlite::EmbeddedMigrators {
             service: &VOLUME_MANAGER_MIGRATOR,
             common: Some(&COMMON_SCHEMA_MIGRATOR),
         },

@@ -240,6 +240,36 @@ run_fmt_check() {
     cargo fmt --all -- --check
 }
 
+# The direct dependents of package $1 in the normal dependency graph of
+# sbx-mgr's server and service, built with the feature arguments that follow
+# up to `--`, must all be among the packages after `--`. `dependency_fence`
+# checks only sbx-mgr's own manifests; this catches a crate elsewhere in the
+# graph that starts depending on the package and re-exports it.
+sbxmgr_assert_direct_dependents() {
+    local package="$1"
+    shift
+    local feature_args=()
+    while [ "$1" != "--" ]; do
+        feature_args+=("$1")
+        shift
+    done
+    shift
+    local allowed=" $* "
+    local graph dependent
+    local unexpected=()
+    graph="$(cargo tree --locked -p pplx-space-sbx-mgr -p pplx-space-sbxmgr-svc \
+        "${feature_args[@]}" -e normal -i "${package}" --depth 1 --prefix none)"
+    while read -r dependent; do
+        if [[ "${allowed}" != *" ${dependent} "* ]]; then
+            unexpected+=("${dependent}")
+        fi
+    done < <(awk 'NR > 1 { print $1 }' <<<"${graph}" | sort -u)
+    if [ "${#unexpected[@]}" -gt 0 ]; then
+        echo "${package} enters sbx-mgr's production graph (${feature_args[*]:-no features}) through ${unexpected[*]}; only $* may depend on it" >&2
+        return 1
+    fi
+}
+
 # sbx-mgr's SQLite store makes its raw connection and statement methods
 # public only under its `test-support` feature, which the workspace pass's
 # `--all-features` turns on. Lint sbx-mgr's production libraries and
@@ -283,6 +313,16 @@ run_sbxmgr_production_checks() {
             echo "sbx-mgr's production graph (features: ${sbxmgr_features:-none}) must not enable the store's test-support" >&2
             return 1
         fi
+        # The shared SQLite helpers open, migrate and delete a database by
+        # path; only the store may bring them into the server's graph.
+        sbxmgr_assert_direct_dependents pplx-space-sqlite "${sbxmgr_feature_args[@]}" -- \
+            pplx-space-sbx-mgr-store
+        # rusqlite enters only through the store, the helpers it depends on,
+        # and two shared crates whose rusqlite use hands no connection out:
+        # common-jobs' functions take a connection in, and common-core only
+        # implements rusqlite's value conversion traits for its types.
+        sbxmgr_assert_direct_dependents rusqlite "${sbxmgr_feature_args[@]}" -- \
+            pplx-space-sbx-mgr-store pplx-space-sqlite pplx-space-common-jobs pplx-space-common-core
     done
 }
 
@@ -319,6 +359,23 @@ run_clippy_checks() {
         --locked \
         -p pplx-space-common-svc \
         --no-default-features \
+        -- \
+        -D warnings
+
+    # Built alone, so a sqlx or common-svc feature these crates need but only
+    # get through unification with the rest of the workspace fails here.
+    echo "--- :rust: Running isolated SQLite helper clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-sqlite \
+        --lib \
+        -- \
+        -D warnings
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-common-svc \
+        --no-default-features \
+        --features migration-checksums \
         -- \
         -D warnings
 

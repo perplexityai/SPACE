@@ -10,10 +10,10 @@ use pplx_space_net_common::NetworkPolicyV1;
 
 pub const DB_PATH: &str = pplx_space_common_core::host::linux::paths::TEMPLATE_MANAGER_DB;
 
-pub fn open() -> Result<Connection, pplx_space_common_svc::sql::sqlite::SqliteError> {
-    pplx_space_common_svc::sql::sqlite::open_rusqlite(
+pub fn open() -> Result<Connection, pplx_space_sqlite::SqliteError> {
+    pplx_space_sqlite::open_rusqlite(
         Path::new(DB_PATH),
-        pplx_space_common_svc::sql::sqlite::RusqliteOpenOptions::default(),
+        pplx_space_sqlite::RusqliteOpenOptions::default(),
     )
 }
 

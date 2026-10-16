@@ -240,9 +240,9 @@ pub enum RunNodeCtlError {
     #[error("failed to acquire the node-ctl service mutex: {0}")]
     ServiceMutex(#[source] pplx_space_common_svc::service_mutex::AcquireError),
     #[error("failed to migrate node-ctl's SQLite database: {0}")]
-    Migrate(#[source] pplx_space_common_svc::sql::sqlite::SqliteError),
+    Migrate(#[source] pplx_space_sqlite::SqliteError),
     #[error("failed to open node-ctl's SQLite database: {0}")]
-    OpenDatabase(#[source] pplx_space_common_svc::sql::sqlite::SqliteError),
+    OpenDatabase(#[source] pplx_space_sqlite::SqliteError),
     #[error("failed to seed reconciliation status rows: {0}")]
     InitReconciliationStatus(#[source] rusqlite::Error),
     #[error("failed to bind the node-ctl socket: {0}")]
@@ -485,12 +485,12 @@ pub async fn run(
     );
     health_server.mark_starting();
 
-    pplx_space_common_svc::sql::sqlite::migrate("node-ctl", &cli.db_path, &NODE_CTL_MIGRATOR)
+    pplx_space_sqlite::migrate("node-ctl", &cli.db_path, &NODE_CTL_MIGRATOR)
         .await
         .map_err(RunNodeCtlError::Migrate)?;
-    let db = pplx_space_common_svc::sql::sqlite::open_rusqlite(
+    let db = pplx_space_sqlite::open_rusqlite(
         &cli.db_path,
-        pplx_space_common_svc::sql::sqlite::RusqliteOpenOptions::default(),
+        pplx_space_sqlite::RusqliteOpenOptions::default(),
     )
     .map_err(RunNodeCtlError::OpenDatabase)?;
     init_reconciliation_status(&db, poll_interval_secs)

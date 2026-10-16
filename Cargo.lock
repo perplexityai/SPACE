@@ -5466,7 +5466,6 @@ dependencies = [
  "pplx-space-test-env",
  "rand 0.10.2",
  "redis",
- "rusqlite",
  "rustls",
  "serde",
  "serde_json",
@@ -5724,6 +5723,7 @@ dependencies = [
  "pplx-space-common-svc",
  "pplx-space-db-test-fixtures",
  "pplx-space-sbx-mgr-store",
+ "pplx-space-sqlite",
  "pplx-space-test-env",
  "rusqlite",
  "sqlx",
@@ -6244,6 +6244,7 @@ dependencies = [
  "pplx-space-node-api-client",
  "pplx-space-node-mgr-client",
  "pplx-space-sbx-mgr-client",
+ "pplx-space-sqlite",
  "pplx-space-template-mgr-client",
  "prost-types",
  "rand 0.10.2",
@@ -6299,6 +6300,7 @@ dependencies = [
  "pplx-space-node-mgr-client",
  "pplx-space-node-runtime-core",
  "pplx-space-observability",
+ "pplx-space-sqlite",
  "pplx-space-test-env",
  "reqwest 0.13.5",
  "rstest",
@@ -6425,6 +6427,7 @@ dependencies = [
  "pplx-space-node-runtime-core",
  "pplx-space-node-runtime-manager-client",
  "pplx-space-s3-http-client",
+ "pplx-space-sqlite",
  "reqwest 0.13.5",
  "rusqlite",
  "rustix",
@@ -6795,6 +6798,7 @@ dependencies = [
  "pplx-space-node-runtime-core",
  "pplx-space-sbx-mgr-client",
  "pplx-space-sbxmgr-migrations",
+ "pplx-space-sqlite",
  "prost-types",
  "ref-cast",
  "rusqlite",
@@ -7082,6 +7086,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-sqlite"
+version = "0.8.0"
+dependencies = [
+ "hex",
+ "pplx-space-common-core",
+ "pplx-space-common-svc",
+ "pplx-space-observability",
+ "rusqlite",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "pplx-space-ssh-cli"
 version = "0.8.0"
 dependencies = [
@@ -7116,6 +7137,7 @@ dependencies = [
  "pplx-space-node-mgr-client",
  "pplx-space-observability",
  "pplx-space-sbx-mgr-client",
+ "pplx-space-sqlite",
  "pplx-space-template-mgr-client",
  "pplx-space-test-env",
  "pplx-space-volmgr-client",
@@ -7241,6 +7263,7 @@ dependencies = [
  "pplx-space-metrics",
  "pplx-space-node-mgr-client",
  "pplx-space-object-store",
+ "pplx-space-sqlite",
  "pplx-space-volmgr-client",
  "rusqlite",
  "serde",

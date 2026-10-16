@@ -178,10 +178,10 @@ async fn prior_database(dir: &Path, prototype: bool) -> Connection {
         ..Migrator::DEFAULT
     };
     let path = dir.join(DATABASE_FILE);
-    pplx_space_common_svc::sql::sqlite::migrate_embedded(
+    pplx_space_sqlite::migrate_embedded(
         DATABASE_NAME,
         &path,
-        pplx_space_common_svc::sql::sqlite::EmbeddedMigrators {
+        pplx_space_sqlite::EmbeddedMigrators {
             service: &migrator,
             common: Some(&COMMON_SCHEMA_MIGRATOR),
         },

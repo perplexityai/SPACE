@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) use pplx_space_common_svc::sql::sqlite::SqliteU64;
+pub(super) use pplx_space_sqlite::SqliteU64;
 
 const SLOT_COLUMNS: &str = "slot_id, generation, state, health, sandbox_id, sandbox_uid,
                             pod_netns_path, lease_kind, pid, last_error, memory_reservation_mib";

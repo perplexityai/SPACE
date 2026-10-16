@@ -317,7 +317,7 @@ pub enum PoolOpenError {
         source: std::io::Error,
     },
     #[error("cannot open network pool database: {0}")]
-    Open(#[from] pplx_space_common_svc::sql::sqlite::SqliteError),
+    Open(#[from] pplx_space_sqlite::SqliteError),
     #[error(transparent)]
     Store(#[from] SlotStoreError),
     #[error("cannot install guest L2 ingress policy in namespace {namespace}: {source}")]
@@ -704,9 +704,9 @@ impl NetworkPool {
                 source,
             })?;
         }
-        let mut conn = pplx_space_common_svc::sql::sqlite::open_rusqlite(
+        let mut conn = pplx_space_sqlite::open_rusqlite(
             Path::new(db_path),
-            pplx_space_common_svc::sql::sqlite::RusqliteOpenOptions {
+            pplx_space_sqlite::RusqliteOpenOptions {
                 foreign_keys: true,
                 ..Default::default()
             },

@@ -3,7 +3,9 @@
 sbx-mgr's node-local SQLite store: `sandboxes` and every other sbx-mgr table,
 not the control-plane Postgres. Only this crate opens, migrates or queries that
 database. `dependency_fence.sbxmgr_rusqlite` in `ARCHITECTURE.toml` keeps
-rusqlite out of every other sbx-mgr crate.
+rusqlite and the shared path-taking helpers in `pplx-space-sqlite` out of
+every other sbx-mgr crate, and CI's `run_sbxmgr_production_checks` asserts
+that nothing else in the server's production graph brings them in.
 
 ## Changes
 

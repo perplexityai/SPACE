@@ -207,7 +207,7 @@ member directories:
 
 ```toml
 [rules.dependency_fence.sbxmgr_rusqlite]
-packages = ["libsqlite3-sys", "rusqlite"]
+packages = ["libsqlite3-sys", "pplx-space-sqlite", "rusqlite"]
 members = ["crates/libs/sbx/mgr/**", "crates/apps/sbx/**"]
 allow = ["crates/libs/sbx/mgr/store"]
 
@@ -223,6 +223,12 @@ how a manifest is written. Each finding points at the manifest line that
 declares the dependency. There is no baseline: an existing dependency is
 removed or its member allowed. An empty `packages` or `members`, or a
 `members` or `allow` glob that matches no workspace member, exits 2.
+
+A fence reads only the checked members' own dependencies, not what those
+dependencies depend on. For sbx-mgr, `run_sbxmgr_production_checks` in
+`ci/scripts/run-rust-checks.sh` covers the transitive side: with `cargo
+tree -i`, it asserts which crates may bring rusqlite and `pplx-space-sqlite`
+into the server's production graph.
 
 ## Configuration and modes
 

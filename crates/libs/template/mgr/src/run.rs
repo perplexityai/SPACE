@@ -64,9 +64,9 @@ pub enum RunTemplateMgrError {
     #[error("failed to acquire the template-manager service mutex: {0}")]
     ServiceMutex(#[source] pplx_space_common_svc::service_mutex::AcquireError),
     #[error("failed to migrate the template-manager SQLite database: {0}")]
-    Migrate(#[source] pplx_space_common_svc::sql::sqlite::SqliteError),
+    Migrate(#[source] pplx_space_sqlite::SqliteError),
     #[error("failed to open the template-manager SQLite database: {0}")]
-    OpenDatabase(#[source] pplx_space_common_svc::sql::sqlite::SqliteError),
+    OpenDatabase(#[source] pplx_space_sqlite::SqliteError),
     #[error("failed to initialize template-manager service state: {0}")]
     InitializeService(#[source] rusqlite::Error),
     #[error("failed to bind the template-manager socket: {0}")]
@@ -159,10 +159,10 @@ async fn run_service(
             .map_err(RunTemplateMgrError::RootfsBackingFilesystem)?;
     }
 
-    pplx_space_common_svc::sql::sqlite::migrate_embedded(
+    pplx_space_sqlite::migrate_embedded(
         "template-manager",
         std::path::Path::new(DB_PATH),
-        pplx_space_common_svc::sql::sqlite::EmbeddedMigrators {
+        pplx_space_sqlite::EmbeddedMigrators {
             service: &TEMPLATE_MANAGER_MIGRATOR,
             common: Some(&COMMON_SCHEMA_MIGRATOR),
         },
