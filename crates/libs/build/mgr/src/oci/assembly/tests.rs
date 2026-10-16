@@ -204,3 +204,40 @@ fn run_fixture_command(command: &mut Command, accepted_codes: &[i32]) {
         "fixture command exited with {status}"
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires root and loop mounts"]
+fn formatted_rootfs_keeps_small_directories_inline() {
+    let fixture = tempfile::tempdir().unwrap();
+    let source = fixture.path().join("source");
+    fs::create_dir_all(source.join("directory")).unwrap();
+    fs::write(source.join("directory/file"), b"synthetic payload").unwrap();
+    let image = fixture.path().join("rootfs.ext4");
+    fs::File::create(&image)
+        .unwrap()
+        .set_len(1024 * 1024 * 1024)
+        .unwrap();
+    let mountpoint = fixture.path().join("mount");
+    fs::create_dir(&mountpoint).unwrap();
+
+    format_ext4(&image).unwrap();
+
+    with_mounted_ext4(
+        &image,
+        &mountpoint,
+        false,
+        RootfsAssemblyOperation::MountRootfs,
+        RootfsAssemblyOperation::UnmountRootfs,
+        |root| {
+            copy_tree(&source, root)?;
+            assert_eq!(
+                fs::read(root.join("directory/file")).unwrap(),
+                b"synthetic payload"
+            );
+            assert_eq!(fs::metadata(root.join("directory")).unwrap().blocks(), 0);
+            Ok(())
+        },
+    )
+    .unwrap();
+}
