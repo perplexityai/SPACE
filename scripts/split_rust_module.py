@@ -528,7 +528,7 @@ def macro_group(mt: str, pos: int) -> tuple[int, int] | None:
 
 # `super` that starts a path or a use tree (`super::x`, `use super as y`, `use super;`), not
 # the `super` of a `pub(super)` / `pub(in super..)` visibility.
-SUPER_PATH = re.compile(r"(?<![\w:])super\b(?!\s*\))")
+SUPER_PATH = re.compile(r"(?<![\w:])super\b")
 
 
 def super_path_positions(mt: str) -> list[int]:
@@ -615,7 +615,7 @@ def transform_item(text: str, kind: str, parent_path: list[str], deeper_dir: boo
         g = macro_group(mt, m.end())
         if g and re.search(r"\bsuper\b", mt[g[0]:g[1]]):
             raise SystemExit("moved code stringifies a `super` path; its text would change. Edit by hand.")
-    if re.search(r"\bmod\s+\w+\s*\{", mt) and re.search(r"\bsuper\b", mt):
+    if re.search(r"\bmod\s+(?:r#)?\w+\s*\{", mt) and re.search(r"\bsuper\b", mt):
         raise SystemExit("moved code has an inline module and names `super`; which module each `super` "
                          "means depends on nesting the tool does not track. Edit by hand.")
     if re.search(r"\binclude\s*!\s*[(\[{]", mt):
@@ -804,6 +804,9 @@ def doc_comment(doc: str) -> str:
     """`//!` lines for a module doc, paragraphs separated by blank lines, wrapped at 100 columns."""
     import textwrap
 
+    if "```" in doc or "~~~" in doc:
+        raise SystemExit("a module doc may not contain a code block (rustdoc would run it as a doctest)")
+
     paras = [" ".join(p.split()) for p in doc.strip().split("\n\n") if p.strip()]
     if not paras:
         return ""
@@ -986,6 +989,25 @@ def apply(spec_path: str, repo: str, dry: bool, report: str | None) -> int:
         if not more:
             break
         relative |= more
+    # Macros defined elsewhere in the crate expand in the moved code's module too.
+    crate_src = os.path.join(repo, rel.replace(os.sep, "/").split("/src/", 1)[0], "src")
+    for d, _, files in os.walk(crate_src):
+        for fn in files:
+            fp = os.path.join(d, fn)
+            if not fn.endswith(".rs") or os.path.realpath(fp) == os.path.realpath(path):
+                continue
+            other = mask(open(fp, encoding="utf-8", errors="replace").read())
+            for m in re.finditer(r"\bmacro_rules!\s*(?:r#)?(\w+)", other):
+                g = macro_group(other, m.end())
+                body = other[g[0]:g[1]] if g else ""
+                if REL_VIS.search(body) or super_path_positions(body) or re.search(r"\bself\s*::", body):
+                    relative.add(m.group(1))
+    for it in items:
+        if it.kind == "use":
+            body = mask("\n".join(lines[it.start:it.end + 1]))
+            for src_name, alias in re.findall(r"\b(\w+)\s+as\s+(\w+)", body):
+                if src_name in relative:
+                    relative.add(alias)
     for name in sorted(relative):
         if invokes(moved_text, name):
             raise SystemExit(f"moved code invokes macro_rules! {name}, whose expansion names `super`/`self` "
@@ -1041,7 +1063,12 @@ def apply(spec_path: str, repo: str, dry: bool, report: str | None) -> int:
     for n in names:
         if n in imported:
             raise SystemExit(f"module name {n!r} collides with a name the parent imports")
-        if re.search(r"(?<![\w:])" + re.escape(n) + r"\s*::", masked_src):
+        siblings = ""
+        if os.path.isdir(child_dir):
+            for fn in sorted(os.listdir(child_dir)):
+                if fn.endswith(".rs"):
+                    siblings += mask(open(os.path.join(child_dir, fn), encoding="utf-8", errors="replace").read())
+        if re.search(r"(?<![\w:])" + re.escape(n) + r"\s*::", masked_src + "\n" + siblings):
             raise SystemExit(f"module name {n!r} is already used as a path in the parent (a crate or a glob-imported "
                              "module?); a new module of that name would shadow it")
 
@@ -1090,6 +1117,9 @@ def apply(spec_path: str, repo: str, dry: bool, report: str | None) -> int:
                               else attr_lines(lines, it.lead, it.start))
                 while lead_lines and not lead_lines[0].strip():
                     lead_lines = lead_lines[1:]
+                if any(lay.members[mi].kind == "macro" for mi in mids) and not mod.get("allow_macro_items", False):
+                    raise SystemExit(f"{it.selector}: a macro invocation inside the impl emits members whose visibility "
+                                     "the tool cannot remap; set allow_macro_items = true on the module to move it")
                 block = impl_block(lines, it, lay, mids, lead_lines, True, lead_owner[k] == name,
                                    parent_path, deeper, counts)
                 for mi in mids:
@@ -1146,7 +1176,8 @@ def apply(spec_path: str, repo: str, dry: bool, report: str | None) -> int:
     for idx, k in enumerate(keep):
         if k < first_def and items[k].kind in ("use", "extern crate", "mod-decl"):
             decl_after = idx
-        if items[k].kind == "macro_rules!":
+        if items[k].kind == "macro_rules!" or any(re.match(r"#\[\s*macro_use\b", a) for a in attrs_of(
+                lines, items[k].lead, items[k].start)):
             decl_after = max(decl_after, idx)
     out = lines[:header_end]
     while out and not out[-1].strip():
@@ -1276,13 +1307,6 @@ def git_show(repo: str, rev: str, path: str) -> str | None:
     return r.stdout.decode("utf-8") if r.returncode == 0 else None
 
 
-def parent_candidates(child: str) -> list[str]:
-    d = os.path.dirname(child)
-    if os.path.basename(d) == "src":
-        return [os.path.join(d, "lib.rs"), os.path.join(d, "main.rs")]
-    return [d + ".rs", os.path.join(d, "mod.rs")]
-
-
 def crate_edition(repo: str, rev: str, rel: str) -> str:
     d = os.path.dirname(rel)
     while d:
@@ -1323,7 +1347,6 @@ def derive_spec(repo: str, base: str, head: str, parent: str, children: list[str
     base_lines, base_mlines = base_src.split("\n"), mask(base_src).split("\n")
     head_parent = git_show(repo, head, parent) or ""
     hp_items = parse_items(head_parent)[0]
-    hp_lines = head_parent.split("\n")
     order = [it.name for it in hp_items if it.kind == "mod-decl"]
     names = sorted(children, key=lambda n: order.index(n) if n in order else len(order))
     out = [f"file = {json.dumps(parent, ensure_ascii=False)}"]

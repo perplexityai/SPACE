@@ -981,3 +981,51 @@ def test_a_commented_attribute_is_not_copied_onto_split_impl_blocks(repo):
     assert r.returncode == 0, r.stderr
     child = (repo / "crate/src/a/foo/x.rs").read_text()
     assert "#[cfg(any())]" not in child.split("impl S {")[0].split("use super::*;")[1]
+
+
+@pytest.mark.parametrize(
+    ("text", "spec_extra", "items", "message"),
+    [
+        # an impl-member macro needs the opt-in
+        ("struct S;\n\nimpl S {\n    describe!();\n\n    fn stay() {}\n}\n", "", '["impl S :: macro describe"]', "allow_macro_items"),
+        # super passed as a macro argument is deepened, not skipped: refuse via crate macro check is not needed;
+        # a raw-identifier inline module with super inside a moved fn
+        ("fn f() -> u8 {\n    mod r#i {\n        pub fn g() -> u8 {\n            super::super::V\n        }\n    }\n    r#i::g()\n}\n",
+         "", '["fn f"]', "inline module"),
+        # a fenced code block in a module doc would become a doctest
+        ("fn f() {}\n", 'doc = "Example:\\n\\n```\\nassert!(false);\\n```"\n', '["fn f"]', "code block"),
+    ],
+)
+def test_round_three_claude_refusals(repo, text, spec_extra, items, message):
+    r = write_parent(repo, text, f'file = "crate/src/a/foo.rs"\n[[module]]\nname = "x"\n{spec_extra}items = {items}\n')
+    assert r.returncode != 0 and message in r.stderr, r.stderr
+
+
+def test_super_passed_to_a_macro_is_deepened(repo):
+    r = write_parent(repo, "fn f() -> u8 {\n    call!(super)\n}\n",
+                     'file = "crate/src/a/foo.rs"\n[[module]]\nname = "x"\nitems = ["fn f"]\n')
+    assert r.returncode == 0, r.stderr
+    assert "call!(super::super)" in (repo / "crate/src/a/foo/x.rs").read_text()
+
+
+def test_a_crate_macro_whose_body_names_super_is_refused(repo):
+    (repo / "crate/src/lib.rs").write_text("macro_rules! up {\n    () => {\n        super::which()\n    };\n}\n")
+    r = write_parent(repo, "fn f() {\n    up!();\n}\n",
+                     'file = "crate/src/a/foo.rs"\n[[module]]\nname = "x"\nitems = ["fn f"]\n')
+    assert r.returncode != 0 and "macro_rules! up" in r.stderr, r.stderr
+
+
+def test_macro_use_modules_are_declared_before_new_children(repo):
+    r = write_parent(repo, "fn early() {}\n\n#[macro_use]\nmod inner {\n    macro_rules! answer {\n        () => {\n            1\n        };\n    }\n}\n\nfn f() -> u8 {\n    answer!()\n}\n",
+                     'file = "crate/src/a/foo.rs"\n[[module]]\nname = "x"\nitems = ["fn f"]\n')
+    assert r.returncode == 0, r.stderr
+    parent = (repo / "crate/src/a/foo.rs").read_text()
+    assert parent.index("mod inner") < parent.index("mod x;")
+
+
+def test_a_module_name_used_as_a_path_in_an_existing_child_is_refused(repo):
+    (repo / "crate/src/a/foo").mkdir(parents=True, exist_ok=True)
+    (repo / "crate/src/a/foo/existing.rs").write_text("use super::*;\n\nfn g() -> u8 {\n    util::one()\n}\n")
+    r = write_parent(repo, "mod existing;\n\nfn f() {}\n",
+                     'file = "crate/src/a/foo.rs"\n[[module]]\nname = "util"\nitems = ["fn f"]\n')
+    assert r.returncode != 0 and "already used as a path" in r.stderr
