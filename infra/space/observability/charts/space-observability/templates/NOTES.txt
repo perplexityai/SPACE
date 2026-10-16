@@ -7,7 +7,11 @@ Datadog Agent DaemonSet: DogStatsD on host port {{ .Values.global.observability.
 Check: kubectl -n {{ .Release.Namespace }} rollout status daemonset/datadog-agent
 {{- else }}
 OTLP/gRPC gateway: collector.{{ .Release.Namespace }}.svc:4317 (from namespaces {{ join ", " .Values.spaceNamespaces }}).
-SPACE producers send to the node-local Collector on http://<node IP>:{{ .Values.global.observability.otlp.nodeLocalPort }}, which this chart does not install yet; until it does, otlp producers cannot export.
+{{- if .Values.nodeLocal.enabled }}
+Node-local Collector: <node IP>:{{ .Values.global.observability.otlp.nodeLocalPort }} on every node; SPACE producers send to status.hostIP.
+{{- else }}
+nodeLocal.enabled is false: SPACE producers send to http://<node IP>:{{ .Values.global.observability.otlp.nodeLocalPort }}, so something else must listen there or otlp producers cannot export.
+{{- end }}
 {{- if .Values.grafana.enabled }}
 Grafana: kubectl -n {{ .Release.Namespace }} port-forward --address 127.0.0.1 service/grafana 13000:3000
 {{- if eq .Values.grafana.auth.existingSecret (include "space-observability.grafanaAdminSecret" .) }}

@@ -4,6 +4,7 @@
 {{- if ne (toString $obs.otlp.protocol) "grpc" }}
 {{- fail (printf "global.observability.otlp.protocol must be grpc: SPACE producers export OTLP/gRPC only, got %q" (toString $obs.otlp.protocol)) }}
 {{- end }}
+{{- $_ := include "space-observability.port" (dict "value" $obs.otlp.nodeLocalPort "key" "global.observability.otlp.nodeLocalPort") }}
 {{- if not .Values.spaceNamespaces }}
 {{- fail "spaceNamespaces must name at least one SPACE namespace" }}
 {{- end }}
