@@ -304,7 +304,6 @@ async fn drop_invalid_digest_dir(
         reason = %rejection,
         "dropping invalid digest dir during startup recovery"
     );
-    eprintln!("[template-mgr] removing invalid digest dir: {name}/{hash_name} ({rejection})");
     remove_digest_dir_from_disk(digest_dir).await;
     if let Err(error) = delete_stale_build_row(db, name, hash_name).await {
         tracing::warn!(
@@ -368,7 +367,6 @@ async fn reconcile_digest_dir_against_db(
             content_hash = %hash_name,
             "digest dir confirmed against existing catalog row during startup recovery"
         );
-        eprintln!("[template-mgr] confirmed build: {name}/{hash_name}");
         return;
     }
 
@@ -428,7 +426,6 @@ async fn reconcile_digest_dir_against_db(
                 rootfs_size = bootable_size,
                 "digest dir validated via hashing and inserted into catalog during startup recovery"
             );
-            eprintln!("[template-mgr] registered build: {name}/{hash_name}");
         }
         Err(error) => {
             tracing::warn!(
@@ -455,10 +452,18 @@ fn cleanup_transient_template_name_dirs() {
         };
         let final_dir = format!("{TEMPLATE_DIR}/{base}");
         if !Path::new(&final_dir).exists() {
-            eprintln!("[template-mgr] restoring {name} -> {base}");
+            tracing::info!(
+                dir = %entry.path().display(),
+                template = %base,
+                "restoring leftover .old template dir during startup recovery"
+            );
             let _ = std::fs::rename(entry.path(), &final_dir);
         } else {
-            eprintln!("[template-mgr] removing stale dir: {name}");
+            tracing::info!(
+                dir = %entry.path().display(),
+                template = %base,
+                "removing leftover .old template dir during startup recovery"
+            );
             let _ = std::fs::remove_dir_all(entry.path());
         }
     }
@@ -482,7 +487,11 @@ fn cleanup_transient_digest_staging_dirs() {
         for sub in sub_entries.flatten() {
             let sub_name = sub.file_name().to_string_lossy().to_string();
             if is_import_staging_dir(&sub_name) || is_republish_staging_dir(&sub_name) {
-                eprintln!("[template-mgr] removing stale staging dir: {name}/{sub_name}");
+                tracing::info!(
+                    template = %name,
+                    dir = %sub.path().display(),
+                    "removing stale import or republish staging dir during startup recovery"
+                );
                 let _ = std::fs::remove_dir_all(sub.path());
             } else if is_build_staging_dir(&sub_name) {
                 // Build staging dirs belong to build-manager, a separate
@@ -490,17 +499,28 @@ fn cleanup_transient_digest_staging_dirs() {
                 // restarts (every deploy restarts this DaemonSet). Only reap
                 // dirs old enough that no live build can still own them.
                 if build_staging_dir_is_stale(&sub.path()) {
-                    eprintln!("[template-mgr] removing stale build staging dir: {name}/{sub_name}");
+                    tracing::info!(
+                        template = %name,
+                        dir = %sub.path().display(),
+                        "removing stale build staging dir during startup recovery"
+                    );
                     let _ = std::fs::remove_dir_all(sub.path());
                 }
             } else if let Some(base_name) = replaced_digest_base(&sub_name) {
                 let final_path = entry.path().join(base_name);
                 if final_path.exists() {
-                    eprintln!("[template-mgr] removing stale replaced dir: {name}/{sub_name}");
+                    tracing::info!(
+                        template = %name,
+                        dir = %sub.path().display(),
+                        "removing stale replaced digest dir during startup recovery"
+                    );
                     let _ = std::fs::remove_dir_all(sub.path());
                 } else {
-                    eprintln!(
-                        "[template-mgr] restoring interrupted template build replacement: {name}/{sub_name} -> {base_name}"
+                    tracing::info!(
+                        template = %name,
+                        dir = %sub.path().display(),
+                        content_hash = %base_name,
+                        "restoring interrupted template build replacement during startup recovery"
                     );
                     let _ = std::fs::rename(sub.path(), final_path);
                 }
@@ -658,9 +678,10 @@ async fn prune_catalog_rows_missing_on_disk(
         let builds = crate::db::list_builds(&conn).unwrap_or_default();
         for build in &builds {
             if artifact_store.build_artifacts_missing(&build.name, &build.content_hash) {
-                eprintln!(
-                    "[template-mgr] pruning stale build: {}/{}",
-                    build.name, build.content_hash
+                tracing::warn!(
+                    template = %build.name,
+                    content_hash = %build.content_hash,
+                    "pruning catalog build row whose artifacts are missing on disk"
                 );
                 let _ = crate::db::delete_build(&conn, &build.name, &build.content_hash);
             }
@@ -677,9 +698,12 @@ async fn prune_catalog_rows_missing_on_disk(
                     snap.vcpu,
                     snap.memory_mib,
                 ) {
-                    eprintln!(
-                        "[template-mgr] pruning stale snapshot: {}/{} {}vcpu-{}mib",
-                        snap.name, snap.content_hash, snap.vcpu, snap.memory_mib
+                    tracing::warn!(
+                        template = %snap.name,
+                        content_hash = %snap.content_hash,
+                        vcpu = snap.vcpu,
+                        memory_mib = snap.memory_mib,
+                        "pruning catalog snapshot row whose artifacts are missing on disk"
                     );
                     let _ = conn.execute(
                         "DELETE FROM template_snapshots WHERE name = ?1 AND content_hash = ?2 AND vcpu = ?3 AND memory_mib = ?4",
@@ -782,8 +806,10 @@ impl TemplateManagerService {
                     for digest_entry in digest_entries.flatten() {
                         let hash_name = digest_entry.file_name().to_string_lossy().to_string();
                         if hash_name == "runtime-rootfs" {
-                            eprintln!(
-                                "[template-mgr] removing obsolete runtime-rootfs cache dir: {name}/{hash_name}"
+                            tracing::info!(
+                                template = %name,
+                                dir = %digest_entry.path().display(),
+                                "removing obsolete runtime-rootfs cache dir during startup recovery"
                             );
                             let _ = std::fs::remove_dir_all(digest_entry.path());
                             continue;
@@ -817,7 +843,7 @@ impl TemplateManagerService {
             if handle.is_none() {
                 let db = Arc::clone(&self.db);
                 *handle = Some(tokio::spawn(crate::pool_manager::pool_loop(db)));
-                eprintln!("[template-mgr] pool manager loop started");
+                tracing::debug!("pool manager loop started");
             }
         }
     }

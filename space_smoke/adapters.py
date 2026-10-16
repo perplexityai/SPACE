@@ -461,8 +461,8 @@ TEMPLATE_CACHE_OWNER = "space-tmplmgr"
 TEMPLATE_CACHE_GROUP = "space-cache-rw"
 TEMPLATE_GC_TICK_MESSAGE = "template GC tick complete"
 # template-manager's startup recovery pass (`service/startup_recovery.rs`).
-# The four structured lines are tracing events; the prune is an `eprintln!`
-# breadcrumb that reaches the container log as raw text.
+# Every verdict is a tracing event. Older images reported the prune as a raw
+# `[template-mgr] pruning stale build: ` stderr line, which is still accepted.
 TEMPLATE_RECOVERY_FINISHED_MESSAGE = "template-manager startup recovery finished"
 TEMPLATE_RECOVERY_CONFIRMED_MESSAGE = (
     "digest dir confirmed against existing catalog row during startup recovery"
@@ -471,7 +471,8 @@ TEMPLATE_RECOVERY_REGISTERED_MESSAGE = (
     "digest dir validated via hashing and inserted into catalog during startup recovery"
 )
 TEMPLATE_RECOVERY_REJECTED_MESSAGE = "dropping invalid digest dir during startup recovery"
-TEMPLATE_RECOVERY_PRUNED_PREFIX = "[template-mgr] pruning stale build: "
+TEMPLATE_RECOVERY_PRUNED_MESSAGE = "pruning catalog build row whose artifacts are missing on disk"
+TEMPLATE_RECOVERY_LEGACY_PRUNED_PREFIX = "[template-mgr] pruning stale build: "
 KIND_SANDBOX_NODE_SELECTOR = "space.pplx.net/node-pool=sandbox"
 # The query API of each local observability backend, on the localhost port
 # both bring-up paths forward to it in `otel` mode.
@@ -5001,9 +5002,14 @@ def _template_stash_dir(name: str) -> str:
 def _parse_startup_recovery(node: str, pod: str, log: str) -> StartupRecoveryReport:
     """Read the first recovery pass from one template-manager pod's log.
 
-    Structured verdicts are tracing events keyed on `template` and
-    `content_hash`; the stale-row prune is a raw `eprintln!` breadcrumb, so
-    it is matched as text with the same `name/hash` join.
+    Verdicts are tracing events keyed on `template` and `content_hash`. An
+    older image's prune is a raw stderr line, matched as text with the same
+    `name/hash` join.
+
+    The container runtime captures stdout and stderr separately, so that raw
+    line can land after "finished" even though the prune ran before it.
+    Prunes are therefore still read after "finished", up to the next
+    "started"; every other verdict ends at "finished".
 
     A container retry can run recovery again before the pod becomes Ready.
     That second pass only sees survivors; do not replace the original verdicts
@@ -5014,24 +5020,27 @@ def _parse_startup_recovery(node: str, pod: str, log: str) -> StartupRecoveryRep
         TEMPLATE_RECOVERY_CONFIRMED_MESSAGE: "confirmed",
         TEMPLATE_RECOVERY_REGISTERED_MESSAGE: "registered",
         TEMPLATE_RECOVERY_REJECTED_MESSAGE: "rejected",
+        TEMPLATE_RECOVERY_PRUNED_MESSAGE: "pruned",
     }
     finished = False
     started = False
     verdicts: list[TemplateRecoveryVerdict] = []
     for line in log.splitlines():
-        if TEMPLATE_RECOVERY_PRUNED_PREFIX in line:
-            _, _, tail = line.partition(TEMPLATE_RECOVERY_PRUNED_PREFIX)
+        if TEMPLATE_RECOVERY_LEGACY_PRUNED_PREFIX in line:
+            _, _, tail = line.partition(TEMPLATE_RECOVERY_LEGACY_PRUNED_PREFIX)
             name, sep, digest = tail.strip().partition("/")
             if sep and digest.startswith("sha256:"):
                 verdicts.append(TemplateRecoveryVerdict(name, digest.split()[0], "pruned"))
             continue
-        if "startup recovery" not in line:
+        if "startup recovery" not in line and TEMPLATE_RECOVERY_PRUNED_MESSAGE not in line:
             continue
         fields = _tracing_fields(line)
         if fields is None:
             continue
         message = fields.get("message")
         if message == "template-manager startup recovery started":
+            if finished:
+                break
             if started:
                 raise RuntimeError(
                     f"template-manager restarted before its first startup recovery "
@@ -5041,8 +5050,10 @@ def _parse_startup_recovery(node: str, pod: str, log: str) -> StartupRecoveryRep
             continue
         if message == TEMPLATE_RECOVERY_FINISHED_MESSAGE:
             finished = True
-            break
+            continue
         outcome = outcomes.get(str(message))
+        if finished and outcome != "pruned":
+            continue
         if outcome is None:
             continue
         template = str(fields.get("template", ""))
