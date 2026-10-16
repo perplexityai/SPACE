@@ -452,8 +452,8 @@ def transform_item(text: str, kind: str, parent_path: list[str], deeper_dir: boo
 
     # 1. the item's own visibility: first code offset after attributes
     p0 = skip_ws_attrs(mt, 0)
-    if kind not in ("impl", "macro"):
-        vis_edit(p0)
+    if kind not in ("impl", "macro") and not re.compile(VIS + r"const\s+_\s*:").match(mt, p0):
+        vis_edit(p0)  # `const _` takes no visibility
     # 2. members
     if kind in ("struct", "union"):
         km = re.compile(VIS + QUAL + r"(struct|union)\s+").match(mt, p0)
@@ -768,6 +768,19 @@ def apply(spec_path: str, repo: str, dry: bool, report: str | None) -> int:
                 if k in assign and assign[k] != name:
                     raise SystemExit(f"{it.selector} matched by {assign[k]} and {name}")
                 assign[k] = name
+    # A macro_rules! that stays in the parent and emits a relative visibility (`pub(super)`)
+    # would mean something else when expanded one module deeper.
+    rel_vis_macros = [it.name for it in items if it.kind == "macro_rules!" and re.search(
+        r"\bpub\s*\(\s*(?:super|self|in\s+(?:super|self))\b", mask("\n".join(lines[it.start:it.end + 1])))]
+    if rel_vis_macros:
+        moved_text = "\n".join("\n".join(mlines[items[k].start:items[k].end + 1]) for k in assign)
+        moved_text += "\n".join("\n".join(mlines[layout(k).members[mi].start:layout(k).members[mi].end + 1])
+                                for k, mi in massign)
+        for name in rel_vis_macros:
+            if re.search(r"(?<![\w:])" + re.escape(name) + r"\s*!", moved_text):
+                raise SystemExit(f"moved code invokes macro_rules! {name}, which emits a relative visibility "
+                                 "(pub(super)/pub(self)); its expansion would change reach. Keep its callers "
+                                 "in the parent or edit the macro by hand.")
     split_impls = sorted({k for k, _ in massign})
     for k in split_impls:
         if k in assign:
@@ -960,7 +973,11 @@ def path_attribute_users(path: str) -> str:
             if not f.endswith(".rs"):
                 continue
             fp = os.path.join(d, f)
-            for m in re.finditer(r'#\s*\[\s*path\s*=\s*"([^"]+)"\s*\]', open(fp, encoding="utf-8").read()):
+            text = open(fp, encoding="utf-8").read()
+            masked = mask(text)
+            for m in re.finditer(r'#\s*\[\s*path\s*=\s*"([^"]+)"\s*\]', text):
+                if masked[m.start()] != "#":
+                    continue  # inside a comment
                 if os.path.realpath(os.path.join(d, m.group(1))) == target:
                     return os.path.relpath(fp, crate_src)
     return ""
@@ -996,7 +1013,7 @@ def normalize(text: str) -> str:
         elif ch.isspace():
             continue
         else:
-            if mk != "c" and ch in CLOSE and out and out[-1] == ",":
+            if mk != "c" and (ch in CLOSE or ch == ">") and out and out[-1] == ",":
                 out.pop()
             out.append(ch)
     return "".join(out)

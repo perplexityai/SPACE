@@ -365,3 +365,34 @@ def test_a_file_loaded_through_a_path_attribute_is_refused(repo):
     (repo / "spec.toml").write_text('file = "crate/src/a/foo.rs"\n[[module]]\nname = "m"\nitems = ["fn stays"]\n')
     r = run("apply", "spec.toml", "--dry-run", cwd=repo)
     assert r.returncode != 0 and "#[path]" in r.stderr
+
+
+def test_const_underscore_takes_no_visibility(repo):
+    src = repo / "crate/src/a/foo.rs"
+    src.write_text(src.read_text() + "\nconst _: () = assert!(1 < 2);\n")
+    git(repo, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qam", "assert")
+    (repo / "spec.toml").write_text('file = "crate/src/a/foo.rs"\n[[module]]\nname = "m"\nitems = ["const _", "fn stays"]\n')
+    apply_and_commit(repo)
+    m = (repo / "crate/src/a/foo/m.rs").read_text()
+    assert "\nconst _: () = assert!(1 < 2);" in m and "pub(super) fn stays" in m
+    assert run("verify", "HEAD~1", cwd=repo).returncode == 0
+
+
+def test_moved_callers_of_a_macro_that_emits_relative_visibility_are_refused(repo):
+    src = repo / "crate/src/a/foo.rs"
+    src.write_text(src.read_text().replace(
+        "macro_rules! noop {\n    () => {};\n}",
+        "macro_rules! noop {\n    () => {};\n}\n\nmacro_rules! helper {\n    ($n:ident) => {\n        pub(super) fn $n() {}\n    };\n}\n"
+    ) + "\nimpl Holder<u8> {\n    helper!(made);\n}\n")
+    git(repo, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qam", "macro")
+    (repo / "spec.toml").write_text('file = "crate/src/a/foo.rs"\n[[module]]\nname = "m"\nitems = ["impl Holder<u8>"]\n')
+    r = run("apply", "spec.toml", "--dry-run", cwd=repo)
+    assert r.returncode != 0 and "macro_rules! helper" in r.stderr
+
+
+def test_verify_ignores_a_trailing_comma_rustfmt_adds_in_generics(repo):
+    apply_and_commit(repo)
+    parsing = repo / "crate/src/a/foo/parsing.rs"
+    parsing.write_text(parsing.read_text().replace("impl<F> Holder<F>", "impl<\n    F,\n> Holder<F>"))
+    git(repo, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qam", "fmt")
+    assert run("verify", "HEAD~2", cwd=repo).returncode == 0
