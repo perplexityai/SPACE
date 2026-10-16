@@ -677,6 +677,20 @@ async fn queued_native_create_grant_renewal_is_monotone_and_terminal_payload_is_
 
 /// Every statement the request sends to Postgres, by `sql!` locator (or the
 /// leading SQL keyword for unlocated ones such as `BEGIN`), in order.
+/// Keep `sqlx::query` events enabled for the whole test process.
+///
+/// Scoped subscribers on other test threads come and go concurrently, and a
+/// callsite-interest rebuild racing ours can compute the global max level (and
+/// cached interest) from a dispatcher set that no longer includes ours, which
+/// silently drops every event we meant to count. One process-lifetime
+/// dispatcher that accepts everything keeps each rebuild's answer "enabled";
+/// events still reach only the subscriber in scope on this thread.
+fn keep_query_events_enabled() {
+    static ALWAYS_ENABLED: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    ALWAYS_ENABLED.get_or_init(|| tracing::Dispatch::new(tracing_subscriber::registry()));
+    tracing::callsite::rebuild_interest_cache();
+}
+
 async fn statements_during(
     request: impl std::future::Future<Output = TestDbResult<(StatusCode, Value)>>,
 ) -> TestDbResult<(StatusCode, Value, Vec<String>)> {
@@ -686,6 +700,7 @@ async fn statements_during(
     let layer = CapturedEventsLayer::new().with_target("sqlx::query");
     let events = layer.events();
     let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+    keep_query_events_enabled();
     let (status, body) = request.await?;
     let statements = events
         .events()
