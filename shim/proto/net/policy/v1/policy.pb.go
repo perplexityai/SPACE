@@ -324,6 +324,7 @@ const (
 	NetworkCredentialHttpMethodV1_NETWORK_CREDENTIAL_HTTP_METHOD_V1_UNSPECIFIED NetworkCredentialHttpMethodV1 = 0
 	NetworkCredentialHttpMethodV1_NETWORK_CREDENTIAL_HTTP_METHOD_V1_GET         NetworkCredentialHttpMethodV1 = 1
 	NetworkCredentialHttpMethodV1_NETWORK_CREDENTIAL_HTTP_METHOD_V1_POST        NetworkCredentialHttpMethodV1 = 2
+	NetworkCredentialHttpMethodV1_NETWORK_CREDENTIAL_HTTP_METHOD_V1_HEAD        NetworkCredentialHttpMethodV1 = 3
 )
 
 // Enum value maps for NetworkCredentialHttpMethodV1.
@@ -332,11 +333,13 @@ var (
 		0: "NETWORK_CREDENTIAL_HTTP_METHOD_V1_UNSPECIFIED",
 		1: "NETWORK_CREDENTIAL_HTTP_METHOD_V1_GET",
 		2: "NETWORK_CREDENTIAL_HTTP_METHOD_V1_POST",
+		3: "NETWORK_CREDENTIAL_HTTP_METHOD_V1_HEAD",
 	}
 	NetworkCredentialHttpMethodV1_value = map[string]int32{
 		"NETWORK_CREDENTIAL_HTTP_METHOD_V1_UNSPECIFIED": 0,
 		"NETWORK_CREDENTIAL_HTTP_METHOD_V1_GET":         1,
 		"NETWORK_CREDENTIAL_HTTP_METHOD_V1_POST":        2,
+		"NETWORK_CREDENTIAL_HTTP_METHOD_V1_HEAD":        3,
 	}
 )
 
@@ -471,7 +474,7 @@ type NetworkCredentialRuleV1 struct {
 	// name after validating each opaque credential-reference UUID.
 	CredentialHeaderBindings []*CredentialHeaderBindingV1 `protobuf:"bytes,3,rep,name=credential_header_bindings,json=credentialHeaderBindings,proto3" json:"credential_header_bindings,omitempty"`
 	// Admission requires a non-empty, duplicate-free set. Version one supports
-	// only GET and POST; every other method fails closed.
+	// only GET, POST and HEAD; every other method fails closed.
 	SupportedHttpMethods []NetworkCredentialHttpMethodV1 `protobuf:"varint,4,rep,packed,name=supported_http_methods,json=supportedHttpMethods,proto3,enum=space.net.policy.v1.NetworkCredentialHttpMethodV1" json:"supported_http_methods,omitempty"`
 	unknownFields        protoimpl.UnknownFields
 	sizeCache            protoimpl.SizeCache
@@ -824,11 +827,12 @@ const file_net_policy_v1_policy_proto_rawDesc = "" +
 	"\x0fTlsInterception\x12 \n" +
 	"\x1cTLS_INTERCEPTION_UNSPECIFIED\x10\x00\x12\x18\n" +
 	"\x14TLS_INTERCEPTION_OFF\x10\x01\x12\x17\n" +
-	"\x13TLS_INTERCEPTION_ON\x10\x02*\xa9\x01\n" +
+	"\x13TLS_INTERCEPTION_ON\x10\x02*\xd5\x01\n" +
 	"\x1dNetworkCredentialHttpMethodV1\x121\n" +
 	"-NETWORK_CREDENTIAL_HTTP_METHOD_V1_UNSPECIFIED\x10\x00\x12)\n" +
 	"%NETWORK_CREDENTIAL_HTTP_METHOD_V1_GET\x10\x01\x12*\n" +
-	"&NETWORK_CREDENTIAL_HTTP_METHOD_V1_POST\x10\x02BAZ?github.com/perplexityai/SPACE/shim/proto/net/policy/v1;policyv1b\x06proto3"
+	"&NETWORK_CREDENTIAL_HTTP_METHOD_V1_POST\x10\x02\x12*\n" +
+	"&NETWORK_CREDENTIAL_HTTP_METHOD_V1_HEAD\x10\x03BAZ?github.com/perplexityai/SPACE/shim/proto/net/policy/v1;policyv1b\x06proto3"
 
 var (
 	file_net_policy_v1_policy_proto_rawDescOnce sync.Once
