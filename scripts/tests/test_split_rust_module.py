@@ -1065,3 +1065,86 @@ def test_an_unused_reexport_is_kept_under_an_allowance_and_round_trips(repo):
     parent = (repo / "crate/src/a/foo.rs").read_text()
     assert '#[allow(unused_imports)]\nuse k8s::*;' in parent
     assert run("verify", "HEAD~1", cwd=repo).returncode == 0
+
+
+# --- Upstream review cases. ---
+
+
+@pytest.mark.parametrize(
+    ("root", "call", "name"),
+    [
+        # a path-qualified user macro
+        ("macro_rules! call {\n    ($e:path) => {\n        $e()\n    };\n}\n\npub(crate) use call;\n", "crate::call!(super::g)", "call"),
+        # a crate macro that shares a name with a known std/tracing/anyhow macro
+        ("macro_rules! ensure {\n    ($e:expr) => {\n        assert!($e)\n    };\n}\n", "ensure!(super::ok())", "ensure"),
+    ],
+)
+def test_super_passed_to_a_qualified_or_shadowing_macro_is_refused(repo, root, call, name):
+    (repo / "crate/src/lib.rs").write_text(root)
+    r = write_parent(repo, f"fn f() {{\n    {call};\n}}\n",
+                     'file = "crate/src/a/foo.rs"\n[[module]]\nname = "x"\nitems = ["fn f"]\n')
+    assert r.returncode != 0 and f"passes `super` to {name}!" in r.stderr, r.stderr
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "// SPDX-License-Identifier: Apache-2.0\n\n//! Docs.\n",
+        "// Copyright notice.\n/*!\n * Block docs.\n */\n",
+    ],
+)
+def test_comments_above_inner_docs_stay_in_the_parent_header(repo, header):
+    r = write_parent(repo, header + "\nstruct S;\n\nfn stay() {}\n",
+                     'file = "crate/src/a/foo.rs"\n[[module]]\nname = "x"\nitems = ["struct S"]\n')
+    assert r.returncode == 0, r.stderr
+    assert (repo / "crate/src/a/foo.rs").read_text().startswith(header)
+    child = (repo / "crate/src/a/foo/x.rs").read_text()
+    assert "Docs" not in child and "notice" not in child and "SPDX" not in child
+    rustfmt_all(repo)
+    commit_all(repo, "split")
+    v = run("verify", "HEAD~1", cwd=repo)
+    assert v.returncode == 0, v.stdout
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "/// See [`super::V`].\nfn f() {}\n",
+        "/** Calls [`self::g`]. */\nfn f() {}\n\nfn g() {}\n",
+        '#[doc = "Reads [`super::V`]."]\nfn f() {}\n',
+    ],
+)
+def test_doc_links_through_relative_paths_are_refused(repo, text):
+    r = write_parent(repo, text, 'file = "crate/src/a/foo.rs"\n[[module]]\nname = "x"\nitems = ["fn f"]\n')
+    assert r.returncode != 0 and "doc comment" in r.stderr, r.stderr
+
+
+def test_relative_paths_in_code_and_plain_comments_are_not_doc_links(repo):
+    r = write_parent(repo, "fn f() -> u8 {\n    // Scales super::V.\n    3\n        * super::V\n}\n",
+                     'file = "crate/src/a/foo.rs"\n[[module]]\nname = "x"\nitems = ["fn f"]\n')
+    assert r.returncode == 0, r.stderr
+    assert "* super::super::V" in (repo / "crate/src/a/foo/x.rs").read_text()
+
+
+def test_declarations_go_above_the_first_fn_when_the_parent_has_no_types(repo):
+    r = write_parent(repo, "use std::fmt;\n\nfn a() {}\n\nfn b() {}\n\n#[cfg(test)]\nmod tests;\n",
+                     'file = "crate/src/a/foo.rs"\n[[module]]\nname = "x"\nitems = ["fn b"]\n')
+    assert r.returncode == 0, r.stderr
+    parent = (repo / "crate/src/a/foo.rs").read_text()
+    assert parent.index("use std::fmt;") < parent.index("mod x;") < parent.index("fn a()") < parent.index("mod tests;")
+
+
+def test_verify_rejects_non_rust_changes_inside_the_split_crate(repo):
+    apply_and_commit(repo)
+    (repo / "crate/Cargo.toml").write_text('[package]\nname = "c"\n')
+    (repo / "NOTES.md").write_text("Outside the crate.\n")
+    commit_all(repo, "manifest")
+    bad = run("verify", "HEAD~2", cwd=repo)
+    assert bad.returncode == 1 and "crate/Cargo.toml" in bad.stdout and "inside the split crate" in bad.stdout
+    assert "NOTES.md" not in bad.stdout.split("not checked by verify")[0]
+    ok = run("verify", "HEAD~2", "--allow-non-rust", cwd=repo)
+    assert ok.returncode == 0, ok.stdout
+    git(repo, "reset", "-q", "--hard", "HEAD~1")
+    (repo / "NOTES.md").write_text("Outside the crate.\n")
+    commit_all(repo, "notes")
+    assert run("verify", "HEAD~2", cwd=repo).returncode == 0

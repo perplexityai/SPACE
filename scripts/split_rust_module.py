@@ -22,13 +22,15 @@ instead of rebasing a split by hand.
 Usage:
   split_rust_module.py list FILE                       # items, impl members and their selectors
   split_rust_module.py apply SPEC.toml [--repo ROOT] [--report OUT.md] [--dry-run]
-  split_rust_module.py verify [BASE] [--head REV] [--print-spec]
+  split_rust_module.py verify [BASE] [--head REV] [--print-spec] [--allow-non-rust]
 
 `verify` proves that BASE...HEAD's Rust changes are exactly what `apply` generates: it
 derives the spec from the diff (which items each new child module holds), regenerates
 from the merge base, and compares every parent and child file byte for byte after
 rustfmt. Any other Rust change, a missing or altered `mod`/`use` line, a dropped item, an
-edit inside a moved item or a comment, or a symlink fails it. It checks the generator,
+edit inside a moved item or a comment, or a symlink fails it, and so does a non-Rust change
+inside the split crate (a manifest, data or build input) unless `--allow-non-rust` is
+given; non-Rust changes elsewhere are listed, not checked. It checks the generator,
 not the generator's semantics: those rest on the edits listed above, the refusals below,
 and compiling and testing the result.
 
@@ -63,9 +65,12 @@ Refused, to be done by hand (the tool stops rather than guess):
 * moved code reaching a macro whose expansion names `super`/`self` paths or emits
   `pub(super)`/`pub(self)`: any macro_rules! in the crate, directly, through other macros,
   path-qualified or through a `use .. as` alias; a macro invoked before the parent defines
-  it, or defined twice; `super` passed in a user macro's arguments (format/tracing-style
-  macros are fine); `stringify!` of `super`; `include!`;
+  it, or defined twice; `super` passed in a user macro's arguments, path-qualified or not
+  (format/tracing-style macros are fine unless the crate defines a macro of the same
+  name); `stringify!` of `super`; `include!`;
 * top-level or impl-member macro invocations, unless the module sets allow_macro_items;
+* a doc comment in moved code naming a super::/self:: path (an intra-doc link would point
+  one module off);
 * relative visibility the edits cannot remap: `pub(in super::..)`, a `pub(super)` nested
   inside a moved item, an inline module naming `super`, `self::super`, a `super::` path
   inside a string literal, include arguments other than a plain string literal;
@@ -73,6 +78,10 @@ Refused, to be done by hand (the tool stops rather than guess):
   already used as a path in the parent or its child modules;
 * an attribute sharing a line with its item or impl member; a carriage return; a
   `src/bin/<name>.rs` crate root; a code block in a module doc.
+
+Not analyzed: macros defined outside the crate being split (other workspace crates,
+dependencies, proc and attribute macros). One that emits `pub(super)` or a `super::` path
+expands one module deeper without a refusal; compiling and testing the result is the check.
 """
 from __future__ import annotations
 
@@ -229,16 +238,30 @@ def parse_items(src: str) -> tuple[list[Item], int]:
     lines = src.split("\n")
     mlines = mask(src).split("\n")
     n = len(lines)
-    # Header: leading //! docs, #![...] inner attributes, and blank lines.
+    # Header: everything up to the last inner doc (`//!`, `/*! */`) or inner attribute
+    # (`#![...]`) that precedes the first item, including plain comments and blank lines
+    # before it (a license line above the module docs stays with the parent).
     i = 0
     header_end = 0
     depth = 0
+    in_inner_block = False
     while i < n:
-        s = lines[i].strip()
-        if s.startswith("//!") or s == "":
+        raw = lines[i]
+        s = raw.strip()
+        if in_inner_block:
+            if "*/" in s:
+                in_inner_block = False
             i += 1
-            if s:
-                header_end = i
+            header_end = i
+            continue
+        if s.startswith("//!"):
+            i += 1
+            header_end = i
+            continue
+        if s.startswith("/*!"):
+            in_inner_block = "*/" not in s[3:]
+            i += 1
+            header_end = i
             continue
         if s.startswith("#!["):
             d = line_depth_delta(mlines[i])
@@ -247,6 +270,9 @@ def parse_items(src: str) -> tuple[list[Item], int]:
                 d += line_depth_delta(mlines[i])
                 i += 1
             header_end = i
+            continue
+        if s == "" or mlines[i].strip() == "":
+            i += 1  # blank or plain comment: header only if an inner doc/attribute follows
             continue
         break
     items: list[Item] = []
@@ -556,9 +582,41 @@ assert_ne debug_assert debug_assert_eq debug_assert_ne matches panic unreachable
 trace debug info warn error event trace_span debug_span info_span warn_span error_span span anyhow bail
 ensure sql json""".split())
 
+# macro_rules! names defined in the crate being split (set by apply): a crate macro that
+# shares a name with a KNOWN_MACROS entry gets no exemption.
+CRATE_MACROS: set[str] = set()
+
 REL_VIS = re.compile(r"\bpub\s*\(\s*(?:super|self|in\s+(?:super|self)\b)")
 INCLUDE = re.compile(r"\binclude_(?:str|bytes)\s*!\s*[(\[{]")
 PLAIN_INCLUDE = re.compile(r"(\binclude_(?:str|bytes)\s*!\s*[(\[{]\s*)\"([^\"\\]*)\"\s*[)\]}]")
+
+
+def doc_texts(text: str, mt: str) -> list[str]:
+    """The doc comments (`///`, `//!`, `/** */`, `/*! */`) and `#[doc ..]` attributes in text."""
+    mc = mask(text, "\0")
+    out = []
+    for m in re.finditer(r"/[/*]", text):
+        p = m.start()
+        if mc[p] != "\0" or (p and mc[p - 1] == "\0"):
+            continue  # not a comment, or inside one
+        if text[p + 1] == "/":
+            e = text.find("\n", p)
+            body = text[p:len(text) if e < 0 else e]
+            doc = re.match(r"///(?!/)|//!", body)
+        else:
+            depth, e = 1, p + 2
+            while e < len(text) and depth:
+                depth += 1 if text.startswith("/*", e) else -1 if text.startswith("*/", e) else 0
+                e += 2 if text.startswith(("/*", "*/"), e) else 1
+            body = text[p:e]
+            doc = re.match(r"/\*\*(?![*/])|/\*!", body)
+        if doc:
+            out.append(body)
+    for m in re.finditer(r"#\s*!?\s*\[\s*doc\b", mt):
+        g = macro_group(mt, m.start() + mt[m.start():].index("["))
+        if g:
+            out.append(text[g[0]:g[1]])
+    return out
 
 
 def transform_item(text: str, kind: str, parent_path: list[str], deeper_dir: bool) -> tuple[str, dict]:
@@ -633,13 +691,16 @@ def transform_item(text: str, kind: str, parent_path: list[str], deeper_dir: boo
     if re.search(r"\bmod\s+(?:r#)?\w+\s*\{", mt) and re.search(r"\bsuper\b", mt):
         raise SystemExit("moved code has an inline module and names `super`; which module each `super` "
                          "means depends on nesting the tool does not track. Edit by hand.")
-    for m in re.finditer(r"(?<![\w:])(\w+)\s*!\s*(?=[(\[{])", mt):
-        if m.group(1) in KNOWN_MACROS:
+    for m in re.finditer(r"(?<![\w$:])(?:\$?\w+\s*::\s*)*(\w+)\s*!\s*(?=[(\[{])", mt):
+        if m.group(1) in KNOWN_MACROS and m.group(1) not in CRATE_MACROS:
             continue
         g = macro_group(mt, m.end())
         if g and re.search(r"\bsuper\b", mt[g[0]:g[1]]):
             raise SystemExit(f"moved code passes `super` to {m.group(1)}!; a macro can match or stringify those "
                              "tokens, so deepening them may change what it expands to. Edit by hand.")
+    if any(re.search(r"\b(?:super|self)\s*::", d) for d in doc_texts(text, mt)):
+        raise SystemExit("a doc comment in moved code names a super::/self:: path (an intra-doc link?); "
+                             "one module deeper it would point elsewhere. Edit by hand.")
     if re.search(r"\binclude\s*!\s*[(\[{]", mt):
         raise SystemExit("moved code uses include!; the included Rust code resolves its paths from the module "
                          "it is expanded in, which the tool cannot rewrite. Edit by hand.")
@@ -1032,6 +1093,8 @@ def apply(spec_path: str, repo: str, dry: bool, report: str | None) -> int:
                 all_bodies[m.group(1)] = all_bodies.get(m.group(1), "") + "\n" + (other[g[0]:g[1]] if g else "")
             for m in re.finditer(r"\buse\b[^;]*;", other):
                 aliases += re.findall(r"\b(\w+)\s+as\s+(\w+)", m.group(0))
+    CRATE_MACROS.clear()
+    CRATE_MACROS.update(all_bodies)
     relative |= {n for n, b in all_bodies.items()
                  if REL_VIS.search(b) or super_path_positions(b) or re.search(r"\bself\s*::", b)}
     while True:
@@ -1106,7 +1169,7 @@ def apply(spec_path: str, repo: str, dry: bool, report: str | None) -> int:
                              "module?); a new module of that name would shadow it")
 
     # Where a split impl's doc comments go: with the members the parent keeps, else with the
-    # first module (in spec order) that receives members.
+    # module that receives the impl's first (lowest-indexed) moved member.
     lead_owner: dict[int, str | None] = {}
     for k in split_impls:
         lay = layout(k)
@@ -1209,7 +1272,8 @@ def apply(spec_path: str, repo: str, dry: bool, report: str | None) -> int:
         if k in split_impls and lead_owner[k] is not None:
             continue  # every member moved
         keep.append(k)
-    first_def = next((k for k, it in enumerate(items) if it.kind in DEFS), len(items))
+    first_def = next((k for k, it in enumerate(items) if it.kind in DEFS),
+                     next((k for k, it in enumerate(items) if it.kind in ("fn", "mod")), len(items)))
     decl_after = -1
     for idx, k in enumerate(keep):
         if k < first_def and items[k].kind in ("use", "extern crate", "mod-decl"):
@@ -1433,7 +1497,7 @@ def derive_spec(repo: str, base: str, head: str, parent: str, children: list[str
     return "\n".join(out) + "\n"
 
 
-def verify(repo: str, base: str, head: str, print_spec: bool = False) -> int:
+def verify(repo: str, base: str, head: str, print_spec: bool = False, allow_non_rust: bool = False) -> int:
     """Prove BASE...HEAD's Rust changes are exactly what `apply` generates: derive the spec from
     the diff, regenerate from the merge base, and compare byte for byte after rustfmt."""
     import contextlib
@@ -1514,6 +1578,11 @@ def verify(repo: str, base: str, head: str, print_spec: bool = False) -> int:
             shutil.rmtree(tmp, ignore_errors=True)
     if not groups and not problems:
         problems.append("no split found: no new child module next to a changed parent")
+    crates = {g.split("/src/", 1)[0] + "/" for g in groups}
+    inside = [p for p in other if any(p.startswith(c) for c in crates)]
+    if inside and not allow_non_rust:
+        problems.append("non-Rust files changed inside the split crate (manifest, data, build inputs); "
+                        "a pure move changes none. Pass --allow-non-rust if they are intended: " + ", ".join(inside))
     print(f"regenerated and compared {checked} files from {len(groups)} split parents: "
           f"{'identical' if not problems else str(len(problems)) + ' problems'}")
     for p in problems:
@@ -1570,11 +1639,13 @@ def main() -> int:
     c.add_argument("--head", default="HEAD")
     c.add_argument("--repo", default=".")
     c.add_argument("--print-spec", action="store_true", help="print the spec derived from the diff")
+    c.add_argument("--allow-non-rust", action="store_true",
+                   help="accept non-Rust changes inside the split crate (they are listed, not checked)")
     args = ap.parse_args()
     if args.cmd == "list":
         return list_items(args.file)
     if args.cmd == "verify":
-        return verify(args.repo, args.base, args.head, args.print_spec)
+        return verify(args.repo, args.base, args.head, args.print_spec, args.allow_non_rust)
     return apply(args.spec, args.repo, args.dry_run, args.report)
 
 
