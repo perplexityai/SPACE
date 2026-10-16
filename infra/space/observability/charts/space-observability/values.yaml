@@ -1,0 +1,154 @@
+# One switch selects what this release installs:
+#   off     - nothing.
+#   datadog - a Datadog Agent DaemonSet (DogStatsD and APM on host ports, pod
+#             log collection) using an API key Secret you create first.
+#   otlp    - a gateway OTLP Collector, Prometheus, Tempo, Alloy and Loki, and
+#             Grafana with its datasources wired to them.
+# The same global keys configure the SPACE services charts, so one values file
+# can drive both. Install this release before switching the services.
+global:
+  observability:
+    # Quoted: YAML 1.1 reads a bare `off` as boolean false. The chart accepts
+    # either, and fails on any value other than off, datadog or otlp.
+    mode: "off"
+    # deployment.environment.name / DD_ENV for the Agent.
+    environment: ""
+    # k8s.cluster.name / DD_CLUSTER_NAME, and the Loki `cluster` label.
+    # Required in otlp mode.
+    cluster: ""
+    otlp:
+      # SPACE producers export OTLP/gRPC only; any other value fails.
+      protocol: grpc
+      # Host port of the node-local Collector, when one is installed.
+      nodeLocalPort: 4317
+      traceSampler: ""
+    datadog:
+      dogstatsdPort: 8125
+      apmPort: 8126
+      # An existing Secret in this release's namespace holding the Datadog API
+      # key. Create it before installing; the chart never stores the key.
+      apiKeySecret: {name: "", key: api-key}
+
+# Namespaces that run SPACE producers. The gateway Collector accepts OTLP
+# only from these, and the Datadog Agent collects pod logs only from these.
+# The logs.collection.podTargets globs must cover the same namespaces.
+spaceNamespaces: [space]
+
+# --- datadog mode -----------------------------------------------------------
+datadog:
+  site: datadoghq.com
+  # Pinned multi-platform digest; version verified 2026-10-13.
+  image: gcr.io/datadoghq/agent:7.81.1@sha256:31627c7285eaf76471b8f86d122aa07146adb47b0c86c889d5c8bf553b9eb3c4
+  # Verify the kubelet's serving certificate. Some local clusters (Kind) serve
+  # a self-signed certificate that does not cover the node IP; set false there.
+  kubeletTLSVerify: true
+  # Use the Kubernetes node name as the Agent hostname, which is stable where
+  # cloud metadata is unavailable.
+  hostnameFromNodeName: true
+  # The container runtime socket on the host, for container metadata.
+  criSocketPath: /var/run/containerd/containerd.sock
+  # Host directory for the Agent's DogStatsD and APM Unix sockets, for
+  # producers that run on the host rather than in a pod.
+  socketDir: /var/run/datadog
+  # Host directory for log tailing positions.
+  logsPositionsDir: /var/lib/datadog-agent/logs
+  nodeSelector: {kubernetes.io/os: linux}
+  # The Agent must run on every node with SPACE producers, including tainted
+  # worker and builder nodes: producers send to the Agent on their own node.
+  # The default tolerates every taint; narrow it to your nodes' taints if
+  # needed.
+  tolerations: [{operator: Exists}]
+  # Extra NetworkPolicy peers, beyond spaceNamespaces, allowed to send to
+  # DogStatsD and APM, for host-network producers the CNI does not exempt
+  # (kindnet exempts root processes only). Node addresses here admit anything
+  # the CNI source-NATs to a node address, so add them only where the sandbox
+  # egress policy denies the node range. Never add sandbox ranges.
+  hostPeers: []
+  resources:
+    requests: {cpu: 200m, memory: 256Mi}
+    limits: {memory: 512Mi}
+
+# --- otlp mode --------------------------------------------------------------
+# The single gateway Collector behind the node-local Collector:
+# collector.<release-namespace>.svc:4317. SPACE producers do not send to it
+# directly; they send to http://<node IP>:<otlp.nodeLocalPort>. It converts
+# delta metrics to cumulative for Prometheus (the Rust services already export
+# cumulative in otlp mode; the containerd shim exports delta), so it runs
+# exactly one replica. Every component
+# in otlp mode gets a NetworkPolicy; rendering a policy does not prove the CNI
+# enforces it, so verify an allowed and a denied producer before relying on it.
+gateway:
+  # Additional NetworkPolicy peers allowed to send OTLP, beyond
+  # spaceNamespaces.
+  receiverPeers: []
+  maxStreams: 10000
+  maxStale: 2m
+  nodeSelector: {}
+  tolerations: []
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
+    limits: {cpu: 500m, memory: 512Mi, ephemeral-storage: 256Mi}
+  # Empty uses the Collector pinned in charts/common.
+  image: ""
+
+# Grafana admin credentials. With the default existingSecret name below and
+# no such Secret, this chart generates one with a random password and keeps
+# it across upgrades. To bring your own, set grafana.auth.existingSecret to
+# another Secret holding admin-user and admin-password.
+grafanaAdmin:
+  user: admin
+
+# Per-signal charts. Each is the standalone chart in ../<name>; see its
+# values.yaml for every option. Storage defaults to a PVC from the cluster's
+# default StorageClass. Without one, either name a class
+# (storage.storageClassName) or set storage.ephemeral=true for an emptyDir that
+# loses data whenever the pod moves.
+metrics:
+  enabled: true
+  storage: {useDefaultStorageClass: true}
+  # The gateway replaces this chart's own Collector.
+  collector: {enabled: false}
+  networkPolicy:
+    queryPeers:
+      - podSelector: {matchLabels: {app: grafana}}
+traces:
+  enabled: true
+  storage: {useDefaultStorageClass: true}
+  collector: {enabled: false}
+  networkPolicy:
+    queryPeers:
+      - podSelector: {matchLabels: {app: grafana}}
+logs:
+  enabled: true
+  storage: {useDefaultStorageClass: true}
+  # Loki's port also takes writes: the gateway pushes OTLP logs there.
+  networkPolicy:
+    queryPeers:
+      - podSelector: {matchLabels: {app: grafana}}
+      - podSelector: {matchLabels: {app: collector}}
+  collection:
+    # Keep the builder exclusion independent of the producer namespace.
+    excludedPodSources:
+      - podNamePrefix: space-builder-build-manager-
+        container: build-manager
+    podTargets:
+      - {path: "/var/log/pods/space_*/*/*.log", namespace: space}
+    # Off by default: hosts without a persistent journal at this path would
+    # leave Alloy pending. Enable after checking the node image.
+    journal: {enabled: false}
+grafana:
+  enabled: true
+  auth:
+    existingSecret: space-observability-grafana-admin
+  datasources:
+    prometheus: {enabled: true, url: "http://prometheus:9090"}
+    loki: {enabled: true, url: "http://loki:3100"}
+    tempo: {enabled: true, url: "http://tempo:3200"}
+  networkPolicy:
+    backendEgress:
+      - to: [{podSelector: {matchLabels: {app: prometheus}}}]
+        ports: [{protocol: TCP, port: 9090}]
+      - to: [{podSelector: {matchLabels: {app: loki}}}]
+        ports: [{protocol: TCP, port: 3100}]
+      - to: [{podSelector: {matchLabels: {app: tempo}}}]
+        ports: [{protocol: TCP, port: 3200}]

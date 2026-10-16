@@ -1,0 +1,79 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        max_recv_msg_size_mib: 4
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+    spike_limit_mib: 64
+  {{- if .Values.metrics.enabled }}
+  # Alpha; state is memory-only. One replica, no autoscaling or durable claim.
+  delta_to_cumulative:
+    max_stale: {{ .Values.gateway.maxStale }}
+    max_streams: {{ .Values.gateway.maxStreams }}
+  {{- end }}
+  batch:
+    timeout: 1s
+    send_batch_size: 256
+    send_batch_max_size: 512
+exporters:
+  {{- $queue := dict "enabled" true "num_consumers" 1 "queue_size" 128 }}
+  {{- $retry := dict "enabled" true "initial_interval" "1s" "max_interval" "5s" "max_elapsed_time" "30s" }}
+  {{- if .Values.metrics.enabled }}
+  otlp_http/prometheus:
+    metrics_endpoint: http://prometheus:9090/api/v1/otlp/v1/metrics
+    timeout: 3s
+    sending_queue: {{ toJson $queue }}
+    retry_on_failure: {{ toJson $retry }}
+  {{- end }}
+  {{- if .Values.traces.enabled }}
+  otlp_grpc/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+    timeout: 3s
+    sending_queue: {{ toJson $queue }}
+    retry_on_failure: {{ toJson $retry }}
+  {{- end }}
+  {{- if .Values.logs.enabled }}
+  otlp_http/loki:
+    logs_endpoint: http://loki:3100/otlp/v1/logs
+    timeout: 5s
+    sending_queue: {{ toJson $queue }}
+    retry_on_failure: {{ toJson $retry }}
+  {{- end }}
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+service:
+  extensions: [health_check]
+  telemetry:
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888
+  pipelines:
+    {{- if .Values.metrics.enabled }}
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, delta_to_cumulative, batch]
+      exporters: [otlp_http/prometheus]
+    {{- end }}
+    {{- if .Values.traces.enabled }}
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_grpc/tempo]
+    {{- end }}
+    {{- if .Values.logs.enabled }}
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_http/loki]
+    {{- end }}

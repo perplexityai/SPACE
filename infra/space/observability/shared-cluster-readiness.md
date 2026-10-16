@@ -20,8 +20,10 @@ Promote validated chart configuration through the operator's normal shared Helm
 deployment process. The charts' `shared` profile requires explicit storage,
 network peers and, for Grafana, real credentials; it does not
 supply per-environment values, namespace and release ownership, or deployment
-approval. Do not make the local helpers accept arbitrary contexts, or introduce
-a universal enable switch in shared SPACE defaults. "Any context" must mean a reviewed profile for that
+approval. Do not make the local helpers accept arbitrary contexts. The
+[`space-observability`](charts/space-observability/README.md) mode switch gives
+working defaults for a new cluster; it does not replace this checklist for an
+existing shared one. "Any context" must mean a reviewed profile for that
 cluster, not silent reliance on kubectl's current context. Context alone is not
 identity: record account, cluster ARN/UID, nodes, namespace and release.
 

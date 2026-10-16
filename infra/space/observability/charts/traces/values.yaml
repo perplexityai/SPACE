@@ -5,6 +5,12 @@ storage:
   storageClassName: null
   existingClaim: ""
   retain: true
+  # Explicit opt-in to the cluster's default StorageClass (storageClassName
+  # left null). Shared installs otherwise require a named class or claim.
+  useDefaultStorageClass: false
+  # emptyDir instead of a claim, for clusters without a usable StorageClass.
+  # All stored data is lost whenever the pod leaves its node.
+  ephemeral: false
 scheduling:
   nodeSelector: {}
   tolerations: []
@@ -20,6 +26,9 @@ networkPolicy:
   monitoringPeers: []
   additionalEgress: []
 collector:
+  # false runs only the backend, fed by an external Collector labelled
+  # app=collector in this namespace (the space-observability gateway).
+  enabled: true
   # Fixed Service ClusterIP. Empty lets Kubernetes allocate one; only the Kind
   # profile sets it, for the node-hosted shim, which has no cluster DNS.
   clusterIP: ""

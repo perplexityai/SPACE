@@ -1,0 +1,125 @@
+{{- if eq (include "space-observability.mode" .) "otlp" }}
+{{- /*
+The gateway Collector. Its Service and pod label are both `collector`, the
+name the per-signal charts expect of the Collector feeding their backend: the
+Prometheus and Tempo policies already admit app=collector, and Prometheus
+scrapes collector:8888.
+*/}}
+{{- $config := tpl (.Files.Get "config/gateway.yaml") . }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gateway-config
+  labels:
+    {{- include "space-observability.labels" . | nindent 4 }}
+data:
+  collector.yaml: |
+{{ $config | indent 4 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: collector
+  labels:
+    {{- include "space-observability.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+spec:
+  type: ClusterIP
+  selector: {app: collector}
+  ports:
+    - {name: otlp-grpc, port: 4317, targetPort: 4317}
+    - {name: internal-metrics, port: 8888, targetPort: 8888}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: collector
+  labels:
+    {{- include "space-observability.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+spec:
+  # delta_to_cumulative keeps per-stream state in memory: one writer only.
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: collector}
+  template:
+    metadata:
+      labels:
+        app: collector
+        app.kubernetes.io/part-of: space-observability
+        app.kubernetes.io/component: gateway
+      annotations:
+        checksum/config: {{ $config | sha256sum }}
+    spec:
+{{- include "common.scheduling" .Values.gateway | nindent 6 }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 15
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: collector
+          image: {{ .Values.gateway.image | default .Values.common.images.collector | quote }}
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            {{- include "common.containerSecurityContext" . | nindent 12 }}
+            readOnlyRootFilesystem: true
+          args: ["--config=/etc/space/collector.yaml"]
+          env:
+            - {name: GOMEMLIMIT, value: 205MiB}
+          ports:
+            - {name: otlp-grpc, containerPort: 4317}
+            - {name: metrics, containerPort: 8888}
+          resources:
+            {{- toYaml .Values.gateway.resources | nindent 12 }}
+          readinessProbe:
+            httpGet: {path: /, port: 13133}
+            periodSeconds: 2
+          livenessProbe:
+            httpGet: {path: /, port: 13133}
+            initialDelaySeconds: 15
+          volumeMounts:
+            - {name: config, mountPath: /etc/space, readOnly: true}
+      volumes:
+        - name: config
+          configMap: {name: gateway-config}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-collector
+  labels:
+    {{- include "space-observability.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {app: collector}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - ports: [{protocol: TCP, port: 4317}]
+      from:
+        - {{- include "space-observability.spaceNamespaceSelector" . | nindent 10 }}
+        {{- with .Values.gateway.receiverPeers }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    {{- if .Values.metrics.enabled }}
+    - ports: [{protocol: TCP, port: 8888}]
+      from:
+        - podSelector: {matchLabels: {app: prometheus}}
+    {{- end }}
+  egress:
+    {{- if .Values.metrics.enabled }}
+    - to: [{podSelector: {matchLabels: {app: prometheus}}}]
+      ports: [{protocol: TCP, port: 9090}]
+    {{- end }}
+    {{- if .Values.traces.enabled }}
+    - to: [{podSelector: {matchLabels: {app: tempo}}}]
+      ports: [{protocol: TCP, port: 4317}]
+    {{- end }}
+    {{- if .Values.logs.enabled }}
+    - to: [{podSelector: {matchLabels: {app: loki}}}]
+      ports: [{protocol: TCP, port: 3100}]
+    {{- end }}
+    {{- include "common.dnsEgress" . | nindent 4 }}
+{{- end }}

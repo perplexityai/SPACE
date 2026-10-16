@@ -13,7 +13,7 @@ alloy:
   tolerations: [] # Add the taints of every node whose logs must be collected.
 networkPolicy:
   queryPeers: [] # Explicit namespaceSelector AND podSelector for Grafana, if used.
-  additionalEgress: [] # NodeLocal DNS, if needed; do not add unrestricted egress.
+  additionalEgress: [] # Do not add unrestricted egress. DNS peers: global.networkPolicy.dns.
 collection:
   podTargets: [] # Verify the real CRI namespace_pod directory names first.
   # Replace with all excluded builder containers for this deployment. This

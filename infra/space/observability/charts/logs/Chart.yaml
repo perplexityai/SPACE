@@ -2,7 +2,7 @@ apiVersion: v2
 name: space-logs
 description: Opt-in private SPACE log collection canary (Alloy and Loki)
 type: application
-version: 0.2.0
+version: 0.3.0
 dependencies:
   - name: common
     version: 0.1.0

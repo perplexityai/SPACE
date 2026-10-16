@@ -1,3 +1,4 @@
+{{- if include "common.otlpSelected" . }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -7,3 +8,4 @@ data:
 {{ tpl (.Files.Get "config/config.alloy") . | indent 4 }}
   loki.yaml: |
 {{ tpl (.Files.Get "config/loki.yaml") . | indent 4 }}
+{{- end }}

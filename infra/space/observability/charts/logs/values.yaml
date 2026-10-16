@@ -9,6 +9,12 @@ storage:
   storageClassName: null
   existingClaim: ""
   retain: true
+  # Explicit opt-in to the cluster's default StorageClass (storageClassName
+  # left null). Shared installs otherwise require a named class or claim.
+  useDefaultStorageClass: false
+  # emptyDir instead of a claim, for clusters without a usable StorageClass.
+  # All stored data is lost whenever the pod leaves its node.
+  ephemeral: false
 # Applies to the Loki backend Deployment only; the collector is a DaemonSet.
 scheduling:
   nodeSelector: {}
@@ -27,7 +33,8 @@ collection:
   # List every builder release; a build-manager pod is
   # <release>-build-manager-<suffix>, and its container logs recipe command
   # output. These exclusions apply to every podTargets glob, before files are
-  # tailed.
+  # tailed. Omit namespace to apply an exclusion across the selected
+  # namespaces; supplied identities are literal, not globs or regexes.
   excludedPodSources:
     - {namespace: space, podNamePrefix: space-builder-build-manager-, container: build-manager}
   journal:

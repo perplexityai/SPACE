@@ -1,3 +1,4 @@
+{{- if include "common.otlpSelected" . }}
 {{- if .Values.networkPolicy.enabled }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -37,6 +38,7 @@ spec:
 {{- include "common.dnsEgress" . | nindent 4 }}
 {{- with .Values.networkPolicy.additionalEgress }}
 {{ toYaml . | indent 4 }}
+{{- end }}
 {{- end }}
 {{- end }}
 {{- end }}

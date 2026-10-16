@@ -1,0 +1,18 @@
+dependencies:
+- name: common
+  repository: file://../common
+  version: 0.1.0
+- name: space-metrics
+  repository: file://../metrics
+  version: 0.3.0
+- name: space-logs
+  repository: file://../logs
+  version: 0.3.0
+- name: space-traces
+  repository: file://../traces
+  version: 0.3.0
+- name: space-grafana
+  repository: file://../grafana
+  version: 0.3.0
+digest: sha256:30c10004d7107fd57e712ad07a35cc40a96f649a6427cf3cd4c8802c22285799
+generated: "2026-10-13T17:15:31.848132972Z"

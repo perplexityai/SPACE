@@ -1,5 +1,6 @@
+{{- if include "common.otlpSelected" . }}
 {{- if .Values.networkPolicy.enabled }}
-{{- range $name := list "collector" "prometheus" }}
+{{- range $name := include "metrics.components" . | fromJsonArray }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -35,5 +36,6 @@ spec:
 {{ toYaml . | indent 4 }}
 {{- end }}
 ---
+{{- end }}
 {{- end }}
 {{- end }}

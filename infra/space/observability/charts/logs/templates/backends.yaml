@@ -1,4 +1,5 @@
-{{- if not .Values.storage.existingClaim }}
+{{- if include "common.otlpSelected" . }}
+{{- if not (or .Values.storage.existingClaim .Values.storage.ephemeral) }}
 {{ include "common.pvc" (dict "name" "loki-data" "storage" .Values.storage) }}
 ---
 {{- end }}
@@ -53,4 +54,5 @@ spec:
       volumes:
         - {name: config, configMap: {name: logs-config}}
         - name: data
-          persistentVolumeClaim: {claimName: {{ include "common.claimName" (dict "name" "loki-data" "storage" .Values.storage) | quote }}}
+          {{- include "common.dataVolumeSource" (dict "name" "loki-data" "storage" .Values.storage) | nindent 10 }}
+{{- end }}

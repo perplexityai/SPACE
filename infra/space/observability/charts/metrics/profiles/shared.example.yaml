@@ -10,4 +10,4 @@ scheduling:
 networkPolicy:
   receiverPeers: [] # Explicit namespaceSelector AND podSelector for canary producers.
   queryPeers: [] # Explicit namespaceSelector AND podSelector for Grafana, if used.
-  additionalEgress: [] # NodeLocal DNS, if needed; do not add unrestricted egress.
+  additionalEgress: [] # Do not add unrestricted egress. DNS peers: global.networkPolicy.dns.

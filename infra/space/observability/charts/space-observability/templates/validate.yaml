@@ -1,0 +1,58 @@
+{{- /* Renders nothing; fails the release on an unusable configuration. */ -}}
+{{- $mode := include "space-observability.mode" . -}}
+{{- $obs := .Values.global.observability -}}
+{{- if ne (toString $obs.otlp.protocol) "grpc" }}
+{{- fail (printf "global.observability.otlp.protocol must be grpc: SPACE producers export OTLP/gRPC only, got %q" (toString $obs.otlp.protocol)) }}
+{{- end }}
+{{- if not .Values.spaceNamespaces }}
+{{- fail "spaceNamespaces must name at least one SPACE namespace" }}
+{{- end }}
+{{- if has .Release.Namespace .Values.spaceNamespaces }}
+{{- fail "Install space-observability in its own namespace, not a SPACE namespace" }}
+{{- end }}
+{{- if eq $mode "datadog" }}
+{{- $secret := $obs.datadog.apiKeySecret | default dict }}
+{{- if not $secret.name }}
+{{- fail "datadog mode requires global.observability.datadog.apiKeySecret.name: create a Secret holding the Datadog API key in this namespace first, e.g. kubectl create secret generic datadog-api-key --from-literal=api-key=<key>" }}
+{{- end }}
+{{- if not $secret.key }}
+{{- fail "global.observability.datadog.apiKeySecret.key must name the key holding the API key" }}
+{{- end }}
+{{- /* lookup is empty under `helm template` and client-side dry runs, so the
+existence check runs only against a live cluster (install, upgrade, or
+--dry-run=server). A reachable cluster always returns this namespace. */}}
+{{- if lookup "v1" "Namespace" "" .Release.Namespace }}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace $secret.name }}
+{{- if not $existing }}
+{{- fail (printf "datadog mode: Secret %s/%s does not exist; create it with the Datadog API key under key %q before installing" .Release.Namespace $secret.name $secret.key) }}
+{{- end }}
+{{- if not (hasKey ($existing.data | default dict) $secret.key) }}
+{{- fail (printf "datadog mode: Secret %s/%s has no key %q" .Release.Namespace $secret.name $secret.key) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if eq $mode "otlp" }}
+{{- if not $obs.cluster }}
+{{- fail "otlp mode requires global.observability.cluster: it labels every log stream and metric resource" }}
+{{- end }}
+{{- if not (or .Values.metrics.enabled .Values.traces.enabled .Values.logs.enabled) }}
+{{- fail "otlp mode needs at least one of metrics, traces or logs enabled" }}
+{{- end }}
+{{- if .Values.grafana.enabled }}
+{{- range $signal := list "metrics" "logs" "traces" }}
+{{- $source := ternary "prometheus" (ternary "loki" "tempo" (eq $signal "logs")) (eq $signal "metrics") }}
+{{- if and (index $.Values.grafana.datasources $source).enabled (not (index $.Values $signal).enabled) }}
+{{- fail (printf "grafana.datasources.%s.enabled requires %s.enabled; disable the datasource with the backend" $source $signal) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if .Values.logs.enabled }}
+{{- $covered := list }}
+{{- range .Values.logs.collection.podTargets }}{{ $covered = append $covered .namespace }}{{ end }}
+{{- range .Values.spaceNamespaces }}
+{{- if not (has . $covered) }}
+{{- fail (printf "spaceNamespaces includes %q but logs.collection.podTargets does not collect it; add a target such as {path: \"/var/log/pods/%s_*/*/*.log\", namespace: %s}" . . .) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

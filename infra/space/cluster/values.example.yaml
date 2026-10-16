@@ -16,10 +16,31 @@ global:
     datadog:
       dogstatsdPort: 8125
       apmPort: 8126
+      # Create this Secret in the observability namespace before using datadog.
+      # Store the key in Kubernetes, not in this values file.
+      apiKeySecret: {name: space-datadog-api-key, key: api-key}
     otlp:
       nodeLocalPort: 4317
       protocol: grpc
       traceSampler: ""
+
+# Receiver configuration uses the same values file. If --namespace changes,
+# update both spaceNamespaces and the log path/namespace below. Never admit
+# the sandbox namespace. Node-local OTLP collection must be included in the
+# installed observability chart; install.sh refuses an incomplete live path.
+spaceNamespaces: [space]
+logs:
+  collection:
+    podTargets:
+      - {path: "/var/log/pods/space_*/*/*.log", namespace: space}
+
+# Host-network admission depends on the cluster CNI. Configure node-only
+# peers for both modes where required, after verifying that sandbox egress
+# blocks those addresses. Do not use a CIDR containing sandbox or pod IPs.
+datadog:
+  hostPeers: []
+nodeLocal:
+  hostPeers: []
 
 x-cluster-id: &clusterId example-cluster
 

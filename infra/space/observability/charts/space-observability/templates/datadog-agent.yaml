@@ -1,0 +1,193 @@
+{{- if eq (include "space-observability.mode" .) "datadog" }}
+{{- $obs := .Values.global.observability }}
+{{- $dd := .Values.datadog }}
+{{- $name := "datadog-agent" }}
+{{- $dogstatsdPort := include "space-observability.port" (dict "value" $obs.datadog.dogstatsdPort "key" "global.observability.datadog.dogstatsdPort") }}
+{{- $apmPort := include "space-observability.port" (dict "value" $obs.datadog.apmPort "key" "global.observability.datadog.apmPort") }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "space-observability.labels" . | nindent 4 }}
+---
+# Read-only access the node Agent needs for kubelet checks and pod tagging.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ printf "%s-%s" .Release.Namespace $name }}
+  labels:
+    {{- include "space-observability.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [nodes/metrics, nodes/spec, nodes/proxy, nodes/stats]
+    verbs: [get]
+  - apiGroups: [""]
+    resources: [nodes, pods, namespaces, services, endpoints]
+    verbs: [get, list, watch]
+  - nonResourceURLs: [/version, /healthz, /metrics]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ printf "%s-%s" .Release.Namespace $name }}
+  labels:
+    {{- include "space-observability.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ printf "%s-%s" .Release.Namespace $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "space-observability.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels: {app: {{ $name }}}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate: {maxUnavailable: 1}
+  template:
+    metadata:
+      labels:
+        app: {{ $name }}
+        app.kubernetes.io/part-of: space-observability
+    spec:
+      serviceAccountName: {{ $name }}
+      {{- with $dd.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $dd.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: agent
+          image: {{ $dd.image | quote }}
+          imagePullPolicy: IfNotPresent
+          ports:
+            # SPACE pods send to status.hostIP; host-network services and the
+            # worker shim use the same node address or the Unix sockets.
+            - {name: dogstatsd, containerPort: {{ $dogstatsdPort }}, hostPort: {{ $dogstatsdPort }}, protocol: UDP}
+            - {name: apm, containerPort: {{ $apmPort }}, hostPort: {{ $apmPort }}, protocol: TCP}
+          env:
+            - name: DD_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $obs.datadog.apiKeySecret.name | quote }}
+                  key: {{ $obs.datadog.apiKeySecret.key | quote }}
+            - {name: DD_SITE, value: {{ $dd.site | quote }}}
+            {{- with $obs.environment }}
+            - {name: DD_ENV, value: {{ . | quote }}}
+            {{- end }}
+            {{- with $obs.cluster }}
+            - {name: DD_CLUSTER_NAME, value: {{ . | quote }}}
+            {{- end }}
+            {{- if $dd.hostnameFromNodeName }}
+            - name: DD_HOSTNAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            {{- end }}
+            - name: DD_KUBERNETES_KUBELET_HOST
+              valueFrom: {fieldRef: {fieldPath: status.hostIP}}
+            - name: DD_KUBERNETES_KUBELET_NODENAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            - {name: DD_KUBELET_TLS_VERIFY, value: {{ $dd.kubeletTLSVerify | quote }}}
+            - {name: DD_CRI_SOCKET_PATH, value: {{ printf "/host%s" $dd.criSocketPath | quote }}}
+            # DogStatsD and APM over the host ports and the shared sockets.
+            - {name: DD_DOGSTATSD_PORT, value: {{ $dogstatsdPort | quote }}}
+            - {name: DD_DOGSTATSD_NON_LOCAL_TRAFFIC, value: "true"}
+            - {name: DD_DOGSTATSD_SOCKET, value: /var/run/datadog/dsd.socket}
+            - {name: DD_APM_ENABLED, value: "true"}
+            - {name: DD_APM_NON_LOCAL_TRAFFIC, value: "true"}
+            - {name: DD_APM_RECEIVER_PORT, value: {{ $apmPort | quote }}}
+            - {name: DD_APM_RECEIVER_SOCKET, value: /var/run/datadog/apm.socket}
+            # Pod logs from SPACE namespaces only. Inclusion outranks a name or
+            # image exclusion, so a SPACE pod whose output must not be
+            # collected opts out with an ad.datadoghq.com/<container>.logs_exclude
+            # annotation, which outranks inclusion.
+            - {name: DD_LOGS_ENABLED, value: "true"}
+            - {name: DD_LOGS_CONFIG_CONTAINER_COLLECT_ALL, value: "true"}
+            - {name: DD_LOGS_CONFIG_K8S_CONTAINER_USE_FILE, value: "true"}
+            - {name: DD_LOGS_CONFIG_RUN_PATH, value: /opt/datadog-agent/run}
+            - name: DD_CONTAINER_INCLUDE_LOGS
+              value: {{ include "space-observability.datadogNamespaceFilter" . | quote }}
+            - {name: DD_CONTAINER_EXCLUDE_LOGS, value: "kube_namespace:.*"}
+            # A node Agent only: no leader election, events, process or
+            # orchestrator collection, and no remote configuration.
+            - {name: DD_LEADER_ELECTION, value: "false"}
+            - {name: DD_COLLECT_KUBERNETES_EVENTS, value: "false"}
+            - {name: DD_PROCESS_AGENT_ENABLED, value: "false"}
+            # Keeps the eBPF service-discovery probe off the node, which also
+            # runs Firecracker guests and their network policy.
+            - {name: DD_DISCOVERY_ENABLED, value: "false"}
+            - {name: DD_ORCHESTRATOR_EXPLORER_ENABLED, value: "false"}
+            - {name: DD_REMOTE_CONFIGURATION_ENABLED, value: "false"}
+            - {name: DD_HEALTH_PORT, value: "5555"}
+          resources:
+            {{- toYaml $dd.resources | nindent 12 }}
+          livenessProbe:
+            httpGet: {path: /live, port: 5555}
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            httpGet: {path: /ready, port: 5555}
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
+          volumeMounts:
+            - {name: cri-socket-dir, mountPath: {{ printf "/host%s" (dir $dd.criSocketPath) | quote }}, readOnly: true}
+            - {name: procdir, mountPath: /host/proc, readOnly: true}
+            - {name: cgroups, mountPath: /host/sys/fs/cgroup, readOnly: true}
+            - {name: pod-logs, mountPath: /var/log/pods, readOnly: true}
+            - {name: container-logs, mountPath: /var/log/containers, readOnly: true}
+            - {name: positions, mountPath: /opt/datadog-agent/run}
+            - {name: sockets, mountPath: /var/run/datadog}
+      volumes:
+        - name: cri-socket-dir
+          hostPath: {path: {{ dir $dd.criSocketPath | quote }}}
+        - {name: procdir, hostPath: {path: /proc}}
+        - {name: cgroups, hostPath: {path: /sys/fs/cgroup}}
+        - {name: pod-logs, hostPath: {path: /var/log/pods}}
+        - {name: container-logs, hostPath: {path: /var/log/containers}}
+        - name: positions
+          hostPath: {path: {{ $dd.logsPositionsDir | quote }}, type: DirectoryOrCreate}
+        - name: sockets
+          hostPath: {path: {{ $dd.socketDir | quote }}, type: DirectoryOrCreate}
+---
+# The Agent's DogStatsD and APM ports are reachable at every node address
+# through host ports, so admit only SPACE pods and the configured host peers.
+# Sandbox pods are in no SPACE namespace: a guest that reaches a node address
+# is refused here. Egress stays open for the Datadog intake and the kubelet.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "space-observability.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {app: {{ $name }}}
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        - {protocol: UDP, port: {{ $dogstatsdPort }}}
+        - {protocol: TCP, port: {{ $apmPort }}}
+      from:
+        - {{- include "space-observability.spaceNamespaceSelector" . | nindent 10 }}
+        {{- with $dd.hostPeers }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+{{- end }}

@@ -116,7 +116,12 @@ must exist). Before changing anything it checks:
 - for `otlp`, that the render includes the node-local collector DaemonSet.
 
 It passes the same values file, so the file also carries that chart's
-settings, such as the producer namespaces it serves (that chart's README).
+settings. The example includes `spaceNamespaces`, the corresponding
+`logs.collection.podTargets`, and a Datadog API-key Secret reference. If you
+change `--namespace`, update both the producer namespace list and the log
+path/namespace; never add the sandbox namespace. Configure the node-only
+host peers required by your CNI before relying on host-network telemetry
+(see the observability chart's README).
 
 Without the chart:
 
@@ -125,9 +130,10 @@ Without the chart:
   only the tree that installed it can reconcile;
 - `--template` warns and prints only the producers.
 
-Changing modes therefore means editing `mode` plus whatever those receivers
-need. The receivers' own caveats about data retention and mode switches
-apply.
+After provisioning these receiver prerequisites once, change
+`global.observability.mode` in that same file and rerun the installer. The
+receivers' own caveats about data retention and mode switches apply; mode
+`off` reconciles the managed release even when its chart renders no resources.
 
 ## Secrets
 

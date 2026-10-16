@@ -1,3 +1,4 @@
+{{- if include "common.otlpSelected" . }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,11 +9,11 @@ data:
   prometheus.yaml: |
 {{ .Files.Get "config/prometheus.yaml" | indent 4 }}
 ---
-{{- if not .Values.storage.existingClaim }}
+{{- if not (or .Values.storage.existingClaim .Values.storage.ephemeral) }}
 {{ include "common.pvc" (dict "name" "prometheus-data" "storage" .Values.storage) }}
 ---
 {{- end }}
-{{- range $name := list "collector" "prometheus" }}
+{{- range $name := include "metrics.components" . | fromJsonArray }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -105,7 +106,8 @@ spec:
           configMap: {name: metrics-config}
         {{- if eq $name "prometheus" }}
         - name: data
-          persistentVolumeClaim: {claimName: {{ include "common.claimName" (dict "name" "prometheus-data" "storage" $.Values.storage) | quote }}}
+          {{- include "common.dataVolumeSource" (dict "name" "prometheus-data" "storage" $.Values.storage) | nindent 10 }}
         {{- end }}
 ---
+{{- end }}
 {{- end }}
