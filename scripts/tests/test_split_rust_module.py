@@ -396,3 +396,19 @@ def test_verify_ignores_a_trailing_comma_rustfmt_adds_in_generics(repo):
     parsing.write_text(parsing.read_text().replace("impl<F> Holder<F>", "impl<\n    F,\n> Holder<F>"))
     git(repo, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qam", "fmt")
     assert run("verify", "HEAD~2", cwd=repo).returncode == 0
+
+
+@pytest.mark.parametrize(
+    ("path", "old", "new"),
+    [
+        ("crate/src/a/foo.rs", "//! Parent docs.\n", "//! Parent docs.\n#![allow(dead_code)]\n"),
+        ("crate/src/a/foo/config.rs", "//! The configuration type.\n", "#![cfg(test)]\n"),
+    ],
+)
+def test_verify_rejects_header_edits(repo, path, old, new):
+    apply_and_commit(repo)
+    f = repo / path
+    f.write_text(f.read_text().replace(old, new, 1))
+    git(repo, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qam", "header")
+    bad = run("verify", "HEAD~2", cwd=repo)
+    assert bad.returncode == 1 and "header" in bad.stdout

@@ -1092,6 +1092,18 @@ def verify(repo: str, base: str, head: str) -> int:
                 return True
         return False
 
+    # File headers (`//!` docs, `#![...]` inner attributes) are not items, so compare them
+    # directly: unchanged in modified files, docs only in new ones.
+    for p in sorted(modified):
+        b_src, h_src = git_show(repo, merge_base, p) or "", git_show(repo, head, p) or ""
+        b_end, h_end = parse_items(b_src)[1], parse_items(h_src)[1]
+        if normalize("\n".join(b_src.split("\n")[:b_end])) != normalize("\n".join(h_src.split("\n")[:h_end])):
+            residual_added.append(f"{p}: file header (//! docs or #![...] attributes) changed")
+    for p in sorted(added):
+        h_src = git_show(repo, head, p) or ""
+        h_end = parse_items(h_src)[1]
+        if any(ln.strip() and not ln.strip().startswith("//!") for ln in h_src.split("\n")[:h_end]):
+            residual_added.append(f"{p}: new file header has more than //! docs")
     trivia_head: list[tuple[str, Record]] = []
     for p in sorted(modified):
         for rec in records(git_show(repo, head, p) or ""):
