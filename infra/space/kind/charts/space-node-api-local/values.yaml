@@ -75,11 +75,13 @@ auth:
   # auth on, only these accounts get it (AuthPolicy::authenticated_caller,
   # auth/k8s.rs), and an empty list refuses every transfer. A pull is started
   # on the target as the api's account: its only in-tree caller, admin-api's
-  # pull_node_template (crates/libs/api/src/routes/admin/node_maintenance.rs),
-  # answers 501 on the Kubernetes substrate (require_admin_node_registry), so
-  # here a pull is an operator's direct PullTemplate call with a space-api
-  # token. The target's node-api, of either role, then asks the source for the
-  # export with its own token (connect_remote, transfer.rs).
+  # pull_node_template
+  # (crates/libs/api/src/routes/admin/node_maintenance/node_templates.rs),
+  # answers 501 on the Kubernetes substrate (require_admin_node_registry,
+  # node_maintenance.rs), so here a pull is an operator's direct PullTemplate
+  # call with a space-api token. The target's node-api, of either role, then
+  # asks the source for the export with its own token (connect_remote,
+  # transfer.rs).
   SPACE_NODE_API_AUTH_TEMPLATE_TRANSFER_SERVICE_ACCOUNTS:
     - space-api
     - space-node-api
