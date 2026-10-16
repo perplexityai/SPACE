@@ -62,3 +62,45 @@ fn broken_token_source_errors_classify_as_token_source() {
         ));
     }
 }
+
+#[test]
+fn endpoint_resolution_accepts_the_legacy_env_name() {
+    let mut env = pplx_space_test_env::TestEnv::default();
+    env.set(
+        CLUSTER_API_ENDPOINT_ENV_LEGACY,
+        "http://legacy.example:9800",
+    );
+    assert_eq!(
+        cluster_api_endpoint_from_environment(&env).as_deref(),
+        Some("http://legacy.example:9800"),
+    );
+}
+
+#[test]
+fn endpoint_resolution_prefers_the_primary_env_name() {
+    let mut env = pplx_space_test_env::TestEnv::default();
+    env.set(CLUSTER_API_ENDPOINT_ENV, "http://primary.example:9800");
+    env.set(
+        CLUSTER_API_ENDPOINT_ENV_LEGACY,
+        "http://legacy.example:9800",
+    );
+    assert_eq!(
+        cluster_api_endpoint_from_environment(&env).as_deref(),
+        Some("http://primary.example:9800"),
+    );
+}
+
+#[test]
+fn endpoint_resolution_treats_empty_values_as_unset() {
+    let mut env = pplx_space_test_env::TestEnv::default();
+    env.set(CLUSTER_API_ENDPOINT_ENV, "");
+    assert_eq!(cluster_api_endpoint_from_environment(&env), None);
+    env.set(
+        CLUSTER_API_ENDPOINT_ENV_LEGACY,
+        "http://legacy.example:9800",
+    );
+    assert_eq!(
+        cluster_api_endpoint_from_environment(&env).as_deref(),
+        Some("http://legacy.example:9800"),
+    );
+}

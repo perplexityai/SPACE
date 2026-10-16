@@ -191,9 +191,9 @@ pub async fn connect_from_env() -> Result<AuthenticatedClusterApiClient, Connect
 pub async fn connect_from_env_with_discovery(
     discovery: EndpointDiscovery,
 ) -> Result<AuthenticatedClusterApiClient, ConnectClusterApiError> {
-    let endpoint = required_env(CLUSTER_API_ENDPOINT_ENV)
-        .or_else(|| required_env(CLUSTER_API_ENDPOINT_ENV_LEGACY))
-        .ok_or(ConnectClusterApiError::MissingEndpoint)?;
+    let endpoint =
+        cluster_api_endpoint_from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+            .ok_or(ConnectClusterApiError::MissingEndpoint)?;
     // Probe the cluster-api credential once at connect time so callers can
     // classify the failure: `MissingToken` (genuinely unconfigured → local
     // fallback leg) vs `TokenSource` (configured but broken → retriable/error
@@ -379,8 +379,20 @@ fn client_with_interceptor(
     ClusterApiClient::new(wrap_grpc_client_channel(intercepted))
 }
 
-fn required_env(name: &str) -> Option<String> {
-    match std::env::var(name) {
+/// The cluster-api endpoint [`connect_from_env`] would dial, if any.
+///
+/// Callers that need to know up front whether a node is wired to cluster-api
+/// (for example admission checks that would otherwise enqueue work the durable
+/// worker cannot finish) should ask this instead of re-checking env names.
+pub fn cluster_api_endpoint_from_environment(
+    env: &dyn pplx_space_common_core::env::Environment,
+) -> Option<String> {
+    non_empty_env(env, CLUSTER_API_ENDPOINT_ENV)
+        .or_else(|| non_empty_env(env, CLUSTER_API_ENDPOINT_ENV_LEGACY))
+}
+
+fn non_empty_env(env: &dyn pplx_space_common_core::env::Environment, name: &str) -> Option<String> {
+    match env.var(name) {
         Ok(value) if !value.is_empty() => Some(value),
         _ => None,
     }
