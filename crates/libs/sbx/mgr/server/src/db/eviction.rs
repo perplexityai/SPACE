@@ -308,7 +308,7 @@ pub fn claim_retired_teardown_execution_for_release(
 fn cancel_live_upload_job(conn: &Connection, artifact: LocalArtifactId) -> Result<()> {
     use pplx_space_common_jobs::{JobStatus, db as jobs};
     let Some(job) = jobs::find_job_by_dedup_key(
-        conn,
+        conn.raw(),
         super::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
         &artifact.to_string(),
     )?
@@ -318,9 +318,9 @@ fn cancel_live_upload_job(conn: &Connection, artifact: LocalArtifactId) -> Resul
     if job.is_terminal() {
         return Ok(());
     }
-    jobs::request_job_cancellation(conn, &job.job_id)?;
+    jobs::request_job_cancellation(conn.raw(), &job.job_id)?;
     if job.status == JobStatus::Pending.as_str() {
-        jobs::mark_job_cancelled(conn, &job.job_id)?;
+        jobs::mark_job_cancelled(conn.raw(), &job.job_id)?;
     }
     Ok(())
 }
@@ -343,12 +343,12 @@ pub fn other_local_artifacts_awaiting_backup(
             AND backup_completed_at IS NULL
           ORDER BY local_artifact_id",
     )?;
-    statement
+    Ok(statement
         .query_map(
             params![id, staged_artifact.to_string()],
             row_to_local_artifact,
         )?
-        .collect()
+        .collect::<rusqlite::Result<_>>()?)
 }
 
 /// Whether this generation's teardown-suspend job is still running: the other

@@ -1,7 +1,8 @@
 //! Sandbox rows the watchdog's guest-health and probe passes read.
 
+use crate::db::{Connection, Error, Result};
+use rusqlite::OptionalExtension as _;
 use rusqlite::types::Type;
-use rusqlite::{Connection, OptionalExtension, Result};
 
 use pplx_space_common_core::sql;
 
@@ -37,7 +38,7 @@ pub(crate) fn list_guest_health_rows(conn: &Connection) -> Result<Vec<SandboxGue
             template_content_hash: row.get(2)?,
         })
     })?;
-    rows.collect()
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// One sandbox's `state` label, `None` without a row.
@@ -56,7 +57,8 @@ pub(crate) fn state_labels_for_ids<'a>(
         .map(|sandbox_id| {
             let label = statement
                 .query_row([sandbox_id], |row| row.get::<_, String>(0))
-                .optional();
+                .optional()
+                .map_err(Error::from);
             (sandbox_id, label)
         })
         .collect())

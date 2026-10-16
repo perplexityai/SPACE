@@ -7,7 +7,7 @@ use pplx_space_common_svc::space_api_route::{
 };
 
 fn service() -> SandboxManagerService {
-    SandboxManagerService::for_test(rusqlite::Connection::open_in_memory().unwrap())
+    SandboxManagerService::for_test(crate::db::Connection::open_in_memory())
 }
 
 fn node_api_peer() -> AuthorizedUdsPeer {

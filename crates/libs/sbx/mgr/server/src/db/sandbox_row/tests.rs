@@ -1,4 +1,5 @@
 use super::*;
+use crate::db::Connection;
 use crate::db::{InsertSandboxParams, insert_sandbox, test_conn};
 
 #[test]
@@ -165,7 +166,7 @@ fn absent_or_malformed_counters_fail_closed_instead_of_decoding_zero() {
 /// Test-only projection builder. Production queries keep their own complete
 /// statements; this exists to drop exactly one column from an otherwise whole
 /// projection.
-fn sandbox_projection(conn: &rusqlite::Connection, omitted: Option<&str>) -> String {
+fn sandbox_projection(conn: &Connection, omitted: Option<&str>) -> String {
     let mut statement = conn
         .prepare("SELECT name FROM pragma_table_info('sandboxes')")
         .unwrap();

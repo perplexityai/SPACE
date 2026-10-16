@@ -1,8 +1,6 @@
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rusqlite::Connection;
 use tokio_util::sync::CancellationToken;
 
 use crate::db::SandboxLifecycleCount;
@@ -49,7 +47,7 @@ impl LifecycleGaugeSampler {
     }
 }
 
-pub(crate) async fn run(db: Arc<Mutex<Connection>>, shutdown_token: CancellationToken) {
+pub(crate) async fn run(db: crate::db::SharedConnection, shutdown_token: CancellationToken) {
     let mut sampler = LifecycleGaugeSampler::default();
     let mut interval = tokio::time::interval(SAMPLE_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

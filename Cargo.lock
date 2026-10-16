@@ -6700,6 +6700,7 @@ dependencies = [
  "prost",
  "prost-types",
  "rcgen",
+ "ref-cast",
  "rstest",
  "rusqlite",
  "rustix",

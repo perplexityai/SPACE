@@ -607,7 +607,7 @@ impl SandboxManagerService {
             .acquire_owned()
             .await
             .map_err(|_| Status::unavailable("sandbox storage is shutting down"))?;
-        let db = Arc::clone(&self.db);
+        let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let db = db

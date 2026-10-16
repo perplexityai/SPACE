@@ -1,5 +1,3 @@
-use std::sync::{Arc, Mutex};
-
 use pplx_space_common_core::types::{
     SandboxId, SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
 };
@@ -105,7 +103,7 @@ pub(crate) async fn observe_firecracker_vm_state(
 }
 
 pub(crate) fn mark_quarantined_best_effort(
-    db: &Arc<Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     sandbox_id: &str,
     expected_state: SandboxState,
     reason_code: SandboxQuarantineReasonCode,

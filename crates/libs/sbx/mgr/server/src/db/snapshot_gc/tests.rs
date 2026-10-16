@@ -77,7 +77,7 @@ fn pin_projection_uses_indexed_lookup_instead_of_scanning_sandboxes() {
             row.get::<_, String>(3)
         })
         .unwrap()
-        .collect::<Result<Vec<_>>>()
+        .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
     assert!(
         plan.iter().any(|step| step

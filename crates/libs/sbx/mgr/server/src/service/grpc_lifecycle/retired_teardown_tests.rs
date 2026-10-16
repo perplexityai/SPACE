@@ -29,14 +29,14 @@ fn generation(value: i64) -> ExecutionGeneration {
 }
 
 fn insert_upload_job(
-    conn: &rusqlite::Connection,
+    conn: &crate::db::Connection,
     sandbox_id: &str,
     staged: LocalArtifactId,
     payload: &str,
 ) -> JobId {
     let job_id = JobId::new();
     pplx_space_common_jobs::db::insert_job(
-        conn,
+        conn.raw(),
         pplx_space_common_jobs::db::InsertJob {
             job_id: &job_id,
             kind: crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
@@ -78,7 +78,7 @@ async fn refused_teardown_with(payload: impl FnOnce(LocalArtifactId) -> String) 
         insert_stranded_teardown_suspend_sandbox(&conn, sandbox_id, generation(GENERATION));
     let job_id = insert_upload_job(&conn, &sandbox_id_string, staged, &payload(staged));
     pplx_space_common_jobs::db::fail_job_permanent(
-        &conn,
+        conn.raw(),
         &job_id,
         "cluster-api rejected begin_artifact_backup (FailedPrecondition): execution retired",
         None,
@@ -121,7 +121,7 @@ async fn refused_teardown_with(payload: impl FnOnce(LocalArtifactId) -> String) 
 type Dispatched = Arc<std::sync::Mutex<Vec<(String, bool)>>>;
 
 /// A service whose cleanup dispatcher records each runtime teardown.
-fn service_recording_cleanup(conn: rusqlite::Connection) -> (SandboxManagerService, Dispatched) {
+fn service_recording_cleanup(conn: crate::db::Connection) -> (SandboxManagerService, Dispatched) {
     let service = service_with_runtime_probe(conn, false);
     let dispatched = Dispatched::default();
     let observed = Arc::clone(&dispatched);
@@ -284,7 +284,7 @@ async fn release_for_a_row_that_moved_on_records_the_drive_failure() {
         .unwrap()
         .execute(
             "UPDATE sandboxes SET state = 'quarantined' WHERE id = ?1",
-            rusqlite::params![sandbox_id_string],
+            crate::db::fixture::params![sandbox_id_string],
         )
         .unwrap();
 
@@ -389,7 +389,7 @@ fn insert_unstamped_checkpoint(
                  local_artifact_id, sandbox_id, artifact_kind, artifact_origin,
                  snapshot_name, local_path, created_at
              ) VALUES (?1, ?2, 'full', 'snapshot', 'checkpoint', ?3, '0')",
-            rusqlite::params![
+            crate::db::fixture::params![
                 named.to_string(),
                 sandbox_id_string,
                 format!("/var/lib/space/sandboxes/{sandbox_id_string}/snapshots/checkpoint"),
@@ -407,7 +407,7 @@ fn checkpoint_stamped(service: &SandboxManagerService, artifact: LocalArtifactId
         .query_row(
             "SELECT backup_completed_at IS NOT NULL FROM local_artifacts
               WHERE local_artifact_id = ?1",
-            rusqlite::params![artifact.to_string()],
+            crate::db::fixture::params![artifact.to_string()],
             |row| row.get(0),
         )
         .unwrap()
@@ -553,7 +553,7 @@ fn release_claim_marks_a_running_upload_to_finish_cancelled() {
     let staged =
         insert_stranded_teardown_suspend_sandbox(&conn, sandbox_id, generation(GENERATION));
     let job_id = insert_upload_job(&conn, &sandbox_id_string, staged, "{}");
-    assert!(pplx_space_common_jobs::db::mark_job_running(&conn, &job_id).unwrap());
+    assert!(pplx_space_common_jobs::db::mark_job_running(conn.raw(), &job_id).unwrap());
 
     assert!(
         crate::db::claim_retired_teardown_execution_for_release(
@@ -564,7 +564,7 @@ fn release_claim_marks_a_running_upload_to_finish_cancelled() {
         )
         .unwrap()
     );
-    let job = pplx_space_common_jobs::db::get_job(&conn, &job_id)
+    let job = pplx_space_common_jobs::db::get_job(conn.raw(), &job_id)
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -681,7 +681,7 @@ async fn only_an_upload_bound_to_the_generation_is_probed() {
             );
         }
         pplx_space_common_jobs::db::fail_job_permanent(
-            &service.db.lock().unwrap(),
+            service.db.lock().unwrap().raw(),
             &job_id,
             "refused",
             None,
@@ -720,7 +720,7 @@ fn release_claim_waits_for_other_local_artifacts_to_back_up() {
              local_artifact_id, sandbox_id, artifact_kind, artifact_origin,
              snapshot_name, local_path, created_at
          ) VALUES (?1, ?2, 'full', 'snapshot', 'checkpoint', ?3, '0')",
-        rusqlite::params![
+        crate::db::fixture::params![
             named.to_string(),
             sandbox_id_string,
             format!("/var/lib/space/sandboxes/{sandbox_id_string}/snapshots/checkpoint"),
@@ -1157,7 +1157,7 @@ async fn direct_refusal_off_its_node_releases_on_the_first_drive() {
         );
         let upload = {
             let db = service.db.lock().unwrap();
-            pplx_space_common_jobs::db::get_job(&db, &upload_job)
+            pplx_space_common_jobs::db::get_job(db.raw(), &upload_job)
                 .unwrap()
                 .unwrap()
         };
@@ -1224,7 +1224,7 @@ async fn node_local_suspend_of_a_superseded_execution_rolls_back() {
             .unwrap()
             .query_row(
                 "SELECT payload FROM jobs WHERE kind = ?1 AND subject_id = ?2",
-                rusqlite::params![
+                crate::db::fixture::params![
                     crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
                     sandbox_id
                 ],
@@ -1278,7 +1278,10 @@ async fn backup_rerequested_by_artifact_keeps_its_execution_generation() {
                 .unwrap()
                 .execute(
                     "UPDATE local_artifacts SET local_path = ?1 WHERE local_artifact_id = ?2",
-                    rusqlite::params![snapshot_dir.to_str().unwrap(), refused.staged.to_string()],
+                    crate::db::fixture::params![
+                        snapshot_dir.to_str().unwrap(),
+                        refused.staged.to_string()
+                    ],
                 )
                 .unwrap();
 
@@ -1359,7 +1362,10 @@ async fn rerequested_admitted_backup_keeps_its_execution_generation() {
                 .unwrap()
                 .execute(
                     "UPDATE local_artifacts SET local_path = ?1 WHERE local_artifact_id = ?2",
-                    rusqlite::params![snapshot_dir.to_str().unwrap(), refused.staged.to_string()],
+                    crate::db::fixture::params![
+                        snapshot_dir.to_str().unwrap(),
+                        refused.staged.to_string()
+                    ],
                 )
                 .unwrap();
 
@@ -1441,7 +1447,7 @@ async fn first_request_of_a_staged_capture_carries_the_teardown_generation() {
                 );
                 conn.execute(
                     "UPDATE local_artifacts SET local_path = ?1 WHERE local_artifact_id = ?2",
-                    rusqlite::params![snapshot_dir.to_str().unwrap(), staged.to_string()],
+                    crate::db::fixture::params![snapshot_dir.to_str().unwrap(), staged.to_string()],
                 )
                 .unwrap();
                 // The route names another generation, so only the teardown's
@@ -1450,7 +1456,7 @@ async fn first_request_of_a_staged_capture_carries_the_teardown_generation() {
                     "UPDATE sandboxes
                         SET state = ?1, space_api_route_execution_generation = ?2
                       WHERE id = ?3",
-                    rusqlite::params![state, GENERATION + 92, sandbox_id_string],
+                    crate::db::fixture::params![state, GENERATION + 92, sandbox_id_string],
                 )
                 .unwrap();
                 let (service, _dispatched) = service_recording_cleanup(conn);

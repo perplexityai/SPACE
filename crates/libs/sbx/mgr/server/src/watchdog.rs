@@ -129,7 +129,7 @@ enum NetGatewayRelaunchArgsError {
     LoadSandbox {
         sandbox_id: String,
         #[source]
-        source: rusqlite::Error,
+        source: crate::db::Error,
     },
     #[error("sandbox {0} missing from local DB")]
     MissingSandbox(String),
@@ -158,7 +158,7 @@ enum SpacedHostRestartError {
     #[error("sandbox database mutex poisoned")]
     DatabaseMutexPoisoned,
     #[error("persist spaced-host replacement pid: {0}")]
-    Persist(#[source] rusqlite::Error),
+    Persist(#[source] crate::db::Error),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -672,7 +672,7 @@ impl HealthComponents {
 pub struct SandboxWatchdog {
     state: Arc<Mutex<HashMap<String, SandboxHealth>>>,
     sidecars: Arc<Mutex<HashMap<String, SidecarInfo>>>,
-    db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: crate::db::SharedConnection,
     network_policy_reconcile_queue: NetworkPolicyReconcileQueue,
     expected_route_verification_key_generation: Arc<AtomicU64>,
     feature_flags: pplx_space_feature_flags::FeatureFlagClient,
@@ -711,7 +711,7 @@ impl SandboxWatchdog {
         reason = "the constructor names each long-lived watchdog dependency explicitly"
     )]
     pub(crate) fn new(
-        db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+        db: crate::db::SharedConnection,
         network_policy_reconcile_queue: NetworkPolicyReconcileQueue,
         snapshot_scheduler: Arc<SnapshotScheduler>,
         auto_lifecycle: AutoLifecycleCoordinator,
@@ -793,7 +793,7 @@ impl SandboxWatchdog {
 
     #[cfg(test)]
     fn new_for_tests(
-        db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+        db: crate::db::SharedConnection,
         network_policy_reconcile_queue: NetworkPolicyReconcileQueue,
         shutdown_token: CancellationToken,
         task_tracker: &TaskTracker,
@@ -1265,7 +1265,7 @@ fn system_time_to_timestamp(value: SystemTime) -> Option<prost_types::Timestamp>
 async fn sidecar_loop(
     state: Arc<Mutex<HashMap<String, SandboxHealth>>>,
     sidecars: Arc<Mutex<HashMap<String, SidecarInfo>>>,
-    db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: crate::db::SharedConnection,
     network_policy_reconcile_queue: NetworkPolicyReconcileQueue,
     expected_route_verification_key_generation: Arc<AtomicU64>,
     feature_flags: pplx_space_feature_flags::FeatureFlagClient,
@@ -1455,7 +1455,7 @@ async fn fill_sidecar_restart_slots(
     queue: &mut SidecarRestartQueue,
     futures: &mut FuturesUnordered<SidecarRestartFuture>,
     sidecars: &Arc<Mutex<HashMap<String, SidecarInfo>>>,
-    db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     network_policy_reconcile_queue: &NetworkPolicyReconcileQueue,
     state: &Arc<Mutex<HashMap<String, SandboxHealth>>>,
     feature_flags: &pplx_space_feature_flags::FeatureFlagClient,
@@ -1483,7 +1483,7 @@ async fn fill_sidecar_restart_slots(
 
         let sandbox_id = request.sandbox_id().to_string();
         let operation = request.operation();
-        let db = Arc::clone(db);
+        let db = db.clone();
         let sidecars = Arc::clone(sidecars);
         let network_policy_reconcile_queue = network_policy_reconcile_queue.clone();
         let state = Arc::clone(state);
@@ -1546,7 +1546,7 @@ fn finish_sidecar_restart(queue: &mut SidecarRestartQueue, outcome: SidecarResta
     }
 }
 
-fn emit_auto_lifecycle_delete_gauges(db: &Arc<std::sync::Mutex<rusqlite::Connection>>) {
+fn emit_auto_lifecycle_delete_gauges(db: &crate::db::SharedConnection) {
     use pplx_space_metrics::sandbox::worker::AutoLifecycleDeleteOutboxState;
 
     let (outbox, blocked) = {
@@ -1603,9 +1603,7 @@ fn emit_auto_lifecycle_delete_gauges(db: &Arc<std::sync::Mutex<rusqlite::Connect
     }
 }
 
-fn load_guest_health_rows(
-    db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
-) -> Option<Vec<SandboxGuestHealthRow>> {
+fn load_guest_health_rows(db: &crate::db::SharedConnection) -> Option<Vec<SandboxGuestHealthRow>> {
     let db = match db.lock() {
         Ok(db) => db,
         Err(error) => {
@@ -1886,7 +1884,7 @@ async fn emit_net_gateway_route_verification_gauges(
 }
 
 fn sandbox_states_for_ids(
-    db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     sandbox_ids: &[String],
 ) -> Option<HashMap<String, crate::state::SandboxState>> {
     let db = match db.lock() {
@@ -2018,7 +2016,7 @@ async fn spawn_net_gateway_stats_probe(
     sandbox_id: String,
     netgtw_pid: u32,
     state: Arc<Mutex<HashMap<String, SandboxHealth>>>,
-    db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: crate::db::SharedConnection,
 ) {
     if pending.len() >= NET_GATEWAY_STATS_CONCURRENCY {
         drain_net_gateway_stats_probe(pending).await;
@@ -2053,7 +2051,7 @@ async fn probe_net_gateway_stats(
     sandbox_id: &str,
     netgtw_pid: u32,
     state: &Arc<Mutex<HashMap<String, SandboxHealth>>>,
-    db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
 ) {
     // Every registered sandbox has the UUID id create assigned it; an id that
     // does not parse fails the probe as an absent gateway socket would.
@@ -2143,7 +2141,7 @@ async fn probe_net_gateway_stats(
 async fn composed_health_loop(
     state: Arc<Mutex<HashMap<String, SandboxHealth>>>,
     sidecars: Arc<Mutex<HashMap<String, SidecarInfo>>>,
-    db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: crate::db::SharedConnection,
     snapshot_scheduler: Arc<SnapshotScheduler>,
     auto_lifecycle: AutoLifecycleCoordinator,
     lifecycle_epochs: HealthLifecycleEpochs,
@@ -2587,7 +2585,7 @@ fn update_legacy_health_fields(
 
 async fn apply_and_reconcile_composed_health_result(
     state: &Arc<Mutex<HashMap<String, SandboxHealth>>>,
-    db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     snapshot_scheduler: &SnapshotScheduler,
     auto_lifecycle: &AutoLifecycleCoordinator,
     lifecycle_epochs: &HealthLifecycleEpochs,
@@ -2622,7 +2620,7 @@ async fn apply_and_reconcile_composed_health_result(
 
 async fn apply_composed_health_result(
     state: &Arc<Mutex<HashMap<String, SandboxHealth>>>,
-    db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     result: Option<CompletedHealthProbe>,
 ) -> Option<diagnostics::HealthTransition> {
     let Some(Ok((sandbox_id, lifecycle, lifecycle_epoch, result))) = result else {
@@ -2711,7 +2709,7 @@ async fn apply_composed_health_result(
 }
 
 async fn reconcile_pause_failed_quarantine(
-    db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     snapshot_scheduler: &SnapshotScheduler,
     auto_lifecycle: &AutoLifecycleCoordinator,
     lifecycle_epochs: &HealthLifecycleEpochs,
@@ -2877,7 +2875,7 @@ fn classify_composed_health(
 
 async fn restart_spaced_host(
     info: &SidecarInfo,
-    db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: crate::db::SharedConnection,
     sidecars: Arc<Mutex<HashMap<String, SidecarInfo>>>,
     node_manager: &NodeManagerConnector,
 ) -> Result<(), SpacedHostRestartError> {
@@ -2975,7 +2973,7 @@ fn spaced_host_restart_args(sandbox_id: &str, vsock_uds_path: String) -> Vec<Str
 
 async fn restart_netgtw(
     info: &SidecarInfo,
-    db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: crate::db::SharedConnection,
     sidecars: Arc<Mutex<HashMap<String, SidecarInfo>>>,
     network_policy_reconcile_queue: NetworkPolicyReconcileQueue,
     state: &Arc<Mutex<HashMap<String, SandboxHealth>>>,
@@ -3006,7 +3004,7 @@ async fn restart_netgtw(
 /// forking a duplicate.
 async fn relaunch_netgtw(
     info: &SidecarInfo,
-    db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     sidecars: &Arc<Mutex<HashMap<String, SidecarInfo>>>,
     network_policy_reconcile_queue: &NetworkPolicyReconcileQueue,
     state: &Arc<Mutex<HashMap<String, SandboxHealth>>>,
@@ -3056,7 +3054,7 @@ async fn commit_netgtw_replacement(
     uid: u32,
     observed_netgtw_pid: Option<u32>,
     pid: u32,
-    db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     sidecars: &Arc<Mutex<HashMap<String, SidecarInfo>>>,
     state: &Arc<Mutex<HashMap<String, SandboxHealth>>>,
 ) -> Result<(), String> {
@@ -3086,7 +3084,7 @@ async fn commit_netgtw_replacement(
 }
 
 fn net_gateway_relaunch_args(
-    db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     sandbox_id: &str,
     feature_flags: &pplx_space_feature_flags::FeatureFlagClient,
 ) -> Result<Vec<String>, NetGatewayRelaunchArgsError> {

@@ -135,12 +135,12 @@ fn checkpoint_context(state: SandboxState) -> (CheckpointContext, String) {
         "INSERT INTO sandboxes (id, uuid8, state, template, user, created_at, updated_at)
          VALUES (?1, 'runtime1', ?2, 'seed',
                  'user:00000000-0000-0000-0000-000000000001', '1', '1')",
-        rusqlite::params![sandbox_id, state.as_str()],
+        crate::db::fixture::params![sandbox_id, state.as_str()],
     )
     .unwrap();
     (
         CheckpointContext {
-            db: Arc::new(std::sync::Mutex::new(conn)),
+            db: crate::db::SharedConnection::new(conn),
             auto_lifecycle: crate::auto_lifecycle::AutoLifecycleCoordinator::default(),
             health_lifecycle: crate::watchdog::HealthLifecycleEpochs::default(),
             node_manager: crate::node_manager_transport::fake::unbound_in_absent_dir(),

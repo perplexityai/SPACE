@@ -221,7 +221,7 @@ impl SandboxManagerService {
         let report = self.apply_route_identity_mutations("periodic_inventory_reconcile", || {
             let observe_execution = self.orphan_execution_observer();
             let report = reconcile_inventory_batch(
-                self.db.as_ref(),
+                &self.db,
                 paths,
                 discovery,
                 ReconcileSource::Periodic,

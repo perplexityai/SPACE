@@ -186,7 +186,8 @@ async fn pool_clone_restart_preserves_disposal_ownership() {
         .execute("VACUUM INTO ?1", [database.to_str().unwrap()])
         .unwrap();
     drop(service);
-    let service = SandboxManagerService::for_test(rusqlite::Connection::open(database).unwrap());
+    let service =
+        SandboxManagerService::for_test(crate::db::Connection::open_at(database).unwrap());
     let cache = tempfile::tempdir().unwrap();
     service
         .recover_prelaunch_startup_states_in(cache.path(), &Default::default())
@@ -504,7 +505,7 @@ async fn pool_clone_cleanup_never_falls_back_and_holds_unsafe_or_exhausted_dispo
         }
         let job_id = {
             let db = service.db.lock().unwrap();
-            let tx = db.unchecked_transaction().unwrap();
+            let tx = crate::db::Transaction::deferred(&db).unwrap();
             let sandbox_id = id.parse().unwrap();
             let job_id = crate::db::cleanup_jobs::persist(
                 &tx,
@@ -522,7 +523,7 @@ async fn pool_clone_cleanup_never_falls_back_and_holds_unsafe_or_exhausted_dispo
                 },
             )
             .unwrap();
-            assert!(pplx_space_common_jobs::db::mark_job_running(&tx, &job_id).unwrap());
+            assert!(pplx_space_common_jobs::db::mark_job_running(tx.raw(), &job_id).unwrap());
             tx.commit().unwrap();
             job_id
         };
@@ -591,7 +592,7 @@ async fn pool_clone_cleanup_never_falls_back_and_holds_unsafe_or_exhausted_dispo
         );
         {
             let db = service.db.lock().unwrap();
-            let job = pplx_space_common_jobs::db::get_job(&db, &job_id)
+            let job = pplx_space_common_jobs::db::get_job(db.raw(), &job_id)
                 .unwrap()
                 .unwrap();
             assert_eq!(job.status, if held { "failed" } else { "running" });

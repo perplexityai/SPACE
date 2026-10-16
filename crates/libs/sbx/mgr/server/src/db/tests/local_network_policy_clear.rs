@@ -139,6 +139,6 @@ fn clearing_a_local_network_policy_hands_authority_back_to_the_cluster() {
     let conn = test_conn();
     assert!(matches!(
         clear_local_network_policy(&conn, "missing", true, true),
-        Err(rusqlite::Error::QueryReturnedNoRows)
+        Err(ref error) if error.is_no_rows()
     ));
 }

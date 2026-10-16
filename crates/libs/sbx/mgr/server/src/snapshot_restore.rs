@@ -200,7 +200,7 @@ pub enum RestoreError {
     #[error("read sandbox row before remote restore: {source}")]
     ReadSandboxRow {
         #[source]
-        source: rusqlite::Error,
+        source: crate::db::Error,
     },
     #[error("persist restoring sandbox row: {source}")]
     PersistRestoringRow {
@@ -215,7 +215,7 @@ pub enum RestoreError {
     #[error("advance remote restore to artifact staging: {source}")]
     AdvanceRestorePhase {
         #[source]
-        source: rusqlite::Error,
+        source: crate::db::Error,
     },
     #[error("sandbox {sandbox_id} left restoring before artifact staging was recorded")]
     RestorePhaseTransitionLost { sandbox_id: SandboxId },
@@ -224,17 +224,17 @@ pub enum RestoreError {
     #[error("read quarantine recovery claim: {source}")]
     ReadQuarantineRecoveryClaim {
         #[source]
-        source: rusqlite::Error,
+        source: crate::db::Error,
     },
     #[error("renew quarantine recovery claim: {source}")]
     RenewQuarantineRecoveryClaim {
         #[source]
-        source: rusqlite::Error,
+        source: crate::db::Error,
     },
     #[error("persist orphan quarantine recovery: {source}")]
     PersistOrphanQuarantineRecovery {
         #[source]
-        source: rusqlite::Error,
+        source: crate::db::Error,
     },
     /// A `GetQuarantineRecoveryPlan` call failed with a status this release does
     /// not map. The code and the server's message are separate fields on purpose:
@@ -396,7 +396,7 @@ impl RestoreError {
                 Some(format!("plan_rpc_status={code:?}"))
             }
             // Safe: payloads this process built — typed ids, generations,
-            // timeouts, paths it constructed, and wrapped rusqlite/io sources.
+            // timeouts, paths it constructed, and wrapped SQLite/io sources.
             // Nothing here holds a string supplied by a caller, a peer, or
             // downloaded metadata.
             Self::SnapshotNotRegistered(..)

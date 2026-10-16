@@ -9,11 +9,12 @@
 //! column-identical. Auto-lifecycle is disabled on every seeded row, so
 //! arming after activation writes nothing here; other tests cover arming.
 
+use crate::db::Connection;
 use pplx_space_common_core::types::{
     LocalArtifactId, SandboxActivationAttemptId, SandboxCleanupEpisodeId,
     SandboxQuarantineReasonCode,
 };
-use rusqlite::{Connection, params};
+use rusqlite::params;
 
 use super::state_write_fixtures::{
     Cell, ExpectedDiff, NULL, apply_edge, assert_accepts, backdate, decorate, generation,

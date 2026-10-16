@@ -143,7 +143,7 @@ fn expected(exit: Exit, found: SandboxState) -> Expected {
 
 /// Move the row to `state` with no other column changed, and install the
 /// tripwire. The state the auto-pause left at the exit is left as it is.
-fn interleave(conn: &rusqlite::Connection, id: &str, exit: Exit, state: SandboxState) -> Snapshot {
+fn interleave(conn: &crate::db::Connection, id: &str, exit: Exit, state: SandboxState) -> Snapshot {
     let left = match exit {
         Exit::Begin => SandboxState::Started,
         Exit::Rollback | Exit::Complete => SandboxState::Pausing,
@@ -197,7 +197,7 @@ async fn check_suspend(exit: Exit, state: SandboxState) {
     let interleaved = Arc::new(Mutex::new(None::<Snapshot>));
     let prepare: GuestPreparation = {
         let (calls, interleaved) = (Arc::clone(&calls), Arc::clone(&interleaved));
-        let db = Arc::clone(&service.db);
+        let db = service.db.clone();
         Arc::new(move |sandbox_id| {
             calls.fetch_add(1, Ordering::SeqCst);
             if !matches!(exit, Exit::Begin) {

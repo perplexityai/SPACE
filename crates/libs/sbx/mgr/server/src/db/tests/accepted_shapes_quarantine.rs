@@ -8,12 +8,13 @@
 //! shared helper must stay column-identical. `thin_writer_coverage` covers the
 //! adoption statement itself.
 
+use crate::db::Connection;
 use pplx_space_common_core::types::{
     ArtifactKind, ArtifactOrigin, LocalArtifactId, SandboxCleanupEpisodeId, SandboxId,
     SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
     TransferScopeId,
 };
-use rusqlite::{Connection, params};
+use rusqlite::params;
 
 use super::state_write_fixtures::{
     Cell, ExpectedDiff, NULL, as_synthetic_orphan, assert_accepts, backdate, decorate,

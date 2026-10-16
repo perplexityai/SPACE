@@ -80,7 +80,7 @@ impl SandboxManagerServiceOptions {
 
 impl SandboxManagerService {
     /// A service built from [`SandboxManagerServiceOptions::for_test`].
-    pub(crate) fn for_test(conn: rusqlite::Connection) -> Self {
+    pub(crate) fn for_test(conn: crate::db::Connection) -> Self {
         Self::new_with_options(conn, SandboxManagerServiceOptions::for_test())
     }
 }

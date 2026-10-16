@@ -4,7 +4,7 @@
 //! listed by a match without a wildcard, so a new outcome or refusal does not
 //! compile until it has a status here.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use pplx_space_common_core::types::{
     SandboxId, SandboxQuarantineNextAction, SandboxQuarantineReasonCode, SandboxQuarantineSource,
@@ -134,7 +134,7 @@ fn every_state_write_outcome_has_its_rejection_and_status() {
 fn a_database_error_is_internal() {
     assert_eq!(
         code_and_message(require_state_write_from(
-            Err(rusqlite::Error::InvalidQuery),
+            Err(crate::db::Error::invalid_query()),
             CONTEXT,
         )),
         Err((
@@ -147,7 +147,7 @@ fn a_database_error_is_internal() {
 /// A row each generic guard refuses `target` over, or no row.
 struct GuardedRow {
     name: &'static str,
-    seed: fn(&rusqlite::Connection, &str),
+    seed: fn(&crate::db::Connection, &str),
     target: SandboxState,
     rejected: fn(SandboxState) -> StateWriteRejected,
     message: &'static str,
@@ -247,7 +247,7 @@ fn guard_refusals_and_a_missing_row_keep_their_statuses() {
     }
 }
 
-fn dirty_sandboxes(conn: &rusqlite::Connection) -> Vec<String> {
+fn dirty_sandboxes(conn: &crate::db::Connection) -> Vec<String> {
     crate::db::list_node_dirty_refs(conn, 100)
         .unwrap()
         .into_iter()
@@ -258,7 +258,7 @@ fn dirty_sandboxes(conn: &rusqlite::Connection) -> Vec<String> {
 
 #[test]
 fn best_effort_write_applies_and_marks_only_that_sandbox_dirty() {
-    let db = Arc::new(Mutex::new(crate::db::test_conn()));
+    let db = crate::db::SharedConnection::new(crate::db::test_conn());
     let id = SandboxId::new().to_string();
     insert_test_sandbox(&db.lock().unwrap(), &id, SandboxState::Pausing);
     let before = dirty_sandboxes(&db.lock().unwrap());
@@ -301,7 +301,7 @@ fn best_effort_refusals_change_nothing() {
         ),
         ("missing row", None, StateWriteOutcome::Missing),
     ] {
-        let db = Arc::new(Mutex::new(crate::db::test_conn()));
+        let db = crate::db::SharedConnection::new(crate::db::test_conn());
         let id = SandboxId::new().to_string();
         if let Some(state) = state {
             insert_test_sandbox(&db.lock().unwrap(), &id, state);
@@ -320,7 +320,7 @@ fn best_effort_refusals_change_nothing() {
 #[test]
 fn best_effort_database_error_is_none_and_changes_nothing() {
     let edge: &'static Edge = &edges::ORPHAN_SUSPENDED_INSERT;
-    let db = Arc::new(Mutex::new(crate::db::test_conn()));
+    let db = crate::db::SharedConnection::new(crate::db::test_conn());
     let id = SandboxId::new().to_string();
     insert_test_sandbox(&db.lock().unwrap(), &id, SandboxState::Stopped);
     let before = snapshot(&db.lock().unwrap());
@@ -337,7 +337,7 @@ fn best_effort_database_error_is_none_and_changes_nothing() {
 /// does.
 #[tokio::test(start_paused = true)]
 async fn best_effort_write_over_a_poisoned_connection_signals_the_failure() {
-    let db = Arc::new(Mutex::new(crate::db::test_conn()));
+    let db = crate::db::SharedConnection::new(crate::db::test_conn());
     let id = SandboxId::new().to_string();
     insert_test_sandbox(&db.lock().unwrap(), &id, SandboxState::Pausing);
     let before = snapshot(&db.lock().unwrap());
@@ -345,7 +345,7 @@ async fn best_effort_write_over_a_poisoned_connection_signals_the_failure() {
     let worker_failed = CancellationToken::new();
     let tracker = TaskTracker::new();
     crate::node_state_sync::start_dirty_outbox_worker(
-        Arc::clone(&db),
+        db.clone(),
         shutdown.clone(),
         &tracker,
         CriticalTaskGuard::new(
@@ -356,7 +356,7 @@ async fn best_effort_write_over_a_poisoned_connection_signals_the_failure() {
         ),
     );
     tokio::task::yield_now().await;
-    let poisoner = Arc::clone(&db);
+    let poisoner = db.clone();
     std::thread::spawn(move || {
         let _conn = poisoner.lock().unwrap();
         panic!("synthetic panic while holding the database");

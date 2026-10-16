@@ -1,12 +1,13 @@
 //! Persistence of open Kubernetes route activation claims
 //! (`sandbox_open_route_activations`).
 
+use crate::db::Connection;
 use pplx_space_common_core::types::{
     ExecutionGeneration, NodeId, NodeManagedBy, PodUid, RouteGeneration,
     SandboxActivationAttemptId, SpaceApiRouteIdentity,
 };
 use pplx_space_common_svc::sql::sqlite::SqliteU64;
-use rusqlite::{Connection, params};
+use rusqlite::params;
 
 use crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance;
 
@@ -55,7 +56,7 @@ fn write_claim(
     conn: &Connection,
     sandbox_id: &str,
     claim: &OpenRouteActivationClaim,
-) -> rusqlite::Result<()> {
+) -> crate::db::Result<()> {
     conn.execute(
         "INSERT INTO sandbox_open_route_activations (
              sandbox_id, route_generation, node_id, execution_generation,
@@ -88,7 +89,7 @@ pub(crate) fn insert_create_claim(
     conn: &Connection,
     sandbox_id: &str,
     claim: &OpenRouteActivationClaim,
-) -> rusqlite::Result<()> {
+) -> crate::db::Result<()> {
     write_claim(conn, sandbox_id, claim)
 }
 
@@ -96,7 +97,7 @@ pub(crate) fn claim_matches(
     conn: &Connection,
     sandbox_id: &str,
     claim: &OpenRouteActivationClaim,
-) -> rusqlite::Result<bool> {
+) -> crate::db::Result<bool> {
     conn.query_row(
         "SELECT EXISTS (
              SELECT 1
@@ -123,7 +124,7 @@ pub(crate) fn claim_matches(
     )
 }
 
-pub(crate) fn close_claim(conn: &Connection, sandbox_id: &str) -> rusqlite::Result<bool> {
+pub(crate) fn close_claim(conn: &Connection, sandbox_id: &str) -> crate::db::Result<bool> {
     Ok(conn.execute(
         "DELETE FROM sandbox_open_route_activations WHERE sandbox_id = ?1",
         [sandbox_id],
@@ -131,7 +132,7 @@ pub(crate) fn close_claim(conn: &Connection, sandbox_id: &str) -> rusqlite::Resu
 }
 
 #[cfg(test)]
-pub(crate) fn claim_exists(conn: &Connection, sandbox_id: &str) -> rusqlite::Result<bool> {
+pub(crate) fn claim_exists(conn: &Connection, sandbox_id: &str) -> crate::db::Result<bool> {
     conn.query_row(
         "SELECT EXISTS (
              SELECT 1 FROM sandbox_open_route_activations WHERE sandbox_id = ?1

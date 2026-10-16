@@ -2,19 +2,26 @@
 //! Unpaged ListBuildReferencingSandboxes is the exception: it reports overruns
 //! instead.
 
+use crate::db::{Connection, Error};
 use pplx_space_common_core::inventory::{
     InventoryBudget, InventoryLimitExceeded, MAX_ITEMS, MAX_RAW_BYTES,
 };
-use rusqlite::{Connection, Row, types::ValueRef};
+use rusqlite::{Row, types::ValueRef};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum InventoryReadError {
     #[error(transparent)]
-    Database(#[from] rusqlite::Error),
+    Database(#[from] Error),
     #[error(transparent)]
     Limit(#[from] InventoryLimitExceeded),
     #[error("ambiguous sandbox selector")]
     Ambiguous,
+}
+
+impl From<rusqlite::Error> for InventoryReadError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Database(error.into())
+    }
 }
 
 impl InventoryReadError {
@@ -40,10 +47,10 @@ fn row_raw_bytes(row: &Row<'_>) -> rusqlite::Result<usize> {
     Ok(bytes)
 }
 
-pub(crate) fn check_row(
+pub(in crate::db) fn check_row(
     row: &Row<'_>,
     budget: &mut InventoryBudget,
-) -> Result<(), InventoryReadError> {
+) -> rusqlite::Result<(), InventoryReadError> {
     budget.charge(row_raw_bytes(row)?)?;
     Ok(())
 }
@@ -114,7 +121,7 @@ pub(crate) enum ListPageRow {
     Undecodable {
         id: String,
         state: Option<String>,
-        error: rusqlite::Error,
+        error: Error,
     },
 }
 
@@ -165,7 +172,7 @@ pub(crate) fn list_page(
             Err(error) => ListPageRow::Undecodable {
                 id: row.get("id")?,
                 state: row.get::<_, String>("state").ok(),
-                error,
+                error: error.into(),
             },
         });
     }

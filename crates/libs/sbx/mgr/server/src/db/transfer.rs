@@ -11,7 +11,7 @@ use super::*;
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ReserveImportError {
     #[error("reserve sandbox import: {0}")]
-    Database(#[from] rusqlite::Error),
+    Database(#[from] Error),
     #[error("claim sandbox cache: {0}")]
     Claim(#[from] std::io::Error),
 }

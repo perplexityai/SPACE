@@ -31,7 +31,7 @@ pub fn find_pool_sandbox(
         ],
         row_to_sandbox,
     )?;
-    rows.next().transpose()
+    rows.next().transpose().map_err(Error::from)
 }
 
 pub fn claim_pool_sandbox(

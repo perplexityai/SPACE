@@ -210,7 +210,7 @@ impl SandboxManagerService {
             .clone()
             .unwrap_or_else(|| PathBuf::from(RUN_DIR));
         let cache_dir = self.sandbox_cache_root();
-        let db = Arc::clone(&self.db);
+        let db = self.db.clone();
         let template = template.map(str::to_owned);
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
@@ -234,7 +234,7 @@ impl SandboxManagerService {
 }
 
 fn resolve_lifecycle_target_blocking(
-    db: &Mutex<rusqlite::Connection>,
+    db: &crate::db::SharedConnection,
     cache_dir: &Path,
     sandbox_id: SandboxId,
     template: Option<&str>,

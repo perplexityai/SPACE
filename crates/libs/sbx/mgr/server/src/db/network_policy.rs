@@ -317,7 +317,7 @@ pub fn enqueue_network_policy_reconcile_if_live(
 }
 
 fn enqueue_network_policy_reconcile_if_live_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Transaction<'_>,
     sandbox_id: &str,
 ) -> Result<bool> {
     let ts = now()?;
@@ -339,7 +339,7 @@ fn enqueue_network_policy_reconcile_if_live_tx(
 }
 
 fn enqueue_node_dirty_network_policy_sandbox_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Transaction<'_>,
     sandbox_id: &str,
 ) -> Result<bool> {
     enqueue_node_dirty_ref_tx(
@@ -357,10 +357,7 @@ pub fn enqueue_node_dirty_sandbox_inventory(conn: &Connection, sandbox_id: &str)
     Ok(queued)
 }
 
-fn enqueue_node_dirty_sandbox_inventory_tx(
-    tx: &rusqlite::Transaction<'_>,
-    sandbox_id: &str,
-) -> Result<bool> {
+fn enqueue_node_dirty_sandbox_inventory_tx(tx: &Transaction<'_>, sandbox_id: &str) -> Result<bool> {
     enqueue_node_dirty_ref_tx(
         tx,
         RECONCILE_FACET_SANDBOX_INVENTORY,
@@ -370,7 +367,7 @@ fn enqueue_node_dirty_sandbox_inventory_tx(
 }
 
 fn enqueue_node_dirty_ref_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Transaction<'_>,
     facet: i32,
     element_kind: &str,
     element_value: &str,
@@ -412,7 +409,7 @@ pub fn list_node_dirty_refs(conn: &Connection, limit: usize) -> Result<Vec<NodeD
             revision: row.get(3)?,
         })
     })?;
-    rows.collect()
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// Acknowledge only the obligations read before sending. A newer enqueue, even

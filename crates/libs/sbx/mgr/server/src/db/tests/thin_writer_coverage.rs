@@ -2,11 +2,12 @@
 //! thin coverage: each one's accepting case and each refusing predicate in its
 //! own case, every refusal starting from a row the write would otherwise change.
 
+use crate::db::Connection;
 use pplx_space_common_core::types::{
     LocalArtifactId, RuntimeKind, SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineNextAction,
     SandboxQuarantineReasonCode, SandboxQuarantineSource, TransferScopeId,
 };
-use rusqlite::{Connection, params};
+use rusqlite::params;
 
 use super::accepted_shapes_quarantine::{adoptable, insert_claimed_adoptable};
 use super::state_write_fixtures::{
@@ -68,7 +69,7 @@ fn checkpoint_rollback_requires_a_checkpointing_row_and_a_resident_target() {
                 &case,
                 &conn,
                 || restore_checkpoint_state(&conn, &id, target),
-                |result| matches!(result, Err(rusqlite::Error::InvalidQuery)),
+                |result| matches!(result, Err(error) if error.is_invalid_query()),
             );
         }
     }
@@ -388,7 +389,7 @@ fn startup_resident_settlement_refuses_any_change_to_the_observed_row() {
             &format!("observed {state}"),
             &conn,
             || settle_startup_resident(&conn, &observed, StartupResidentSettlement::Started),
-            |result| matches!(result, Err(rusqlite::Error::InvalidQuery)),
+            |result| matches!(result, Err(error) if error.is_invalid_query()),
         );
     }
 

@@ -9,17 +9,16 @@
 use pplx_space_common_core::types::{
     ArtifactKind, ArtifactOrigin, LocalArtifactId, SandboxQuarantineReasonCode,
 };
-use rusqlite::Connection;
 
 use super::state_write_fixtures::{
     Cell, ExpectedDiff, admit_stop, assert_accepts, backdate, begin_cold_start, complete_stop,
     force_state, insert_row, insert_suspended_with_artifact, seed_runtime, text, unpinned,
 };
 use crate::db::{
-    StateWriteOutcome, complete_cleanup_episode, drop_stopped_artifact_pin, get_local_artifact,
-    get_sandbox, mark_restore_succeeded, publish_stopped_artifact, request_cleanup_episode,
-    restage_for_warm_start, rollback_starting_episode, stop_suspended_for_auto_lifecycle,
-    test_conn,
+    Connection, StateWriteOutcome, complete_cleanup_episode, drop_stopped_artifact_pin,
+    get_local_artifact, get_sandbox, mark_restore_succeeded, publish_stopped_artifact,
+    request_cleanup_episode, restage_for_warm_start, rollback_starting_episode,
+    stop_suspended_for_auto_lifecycle, test_conn,
 };
 use crate::state::SandboxState;
 

@@ -1,11 +1,12 @@
 use std::str::FromStr;
 
+use crate::db::{Connection, Error, OptionalExtension};
 use pplx_space_common_core::types::{
     AutoLifecycleDeleteReceiptId, ExecutionGeneration, NodeManagedBy, NodeRole, PolicyAuthority,
     SandboxActivationAttemptId, SandboxId,
 };
 use pplx_space_common_svc::{sql::sqlite::SqliteU64, types::AutoLifecyclePolicyFingerprint};
-use rusqlite::{Connection, OptionalExtension, params, types::Type};
+use rusqlite::{params, types::Type};
 
 use crate::auto_lifecycle_delete_receipts::{
     AutoLifecycleDeleteAdmission, AutoLifecycleDeleteBlockReason, AutoLifecycleDeleteBlockedStats,
@@ -78,7 +79,7 @@ pub(crate) fn execution_write_miss_error(
     conn: &Connection,
     sandbox_id: SandboxId,
     incoming_generation: Option<ExecutionGeneration>,
-) -> rusqlite::Error {
+) -> Error {
     match conn.query_row(
         "SELECT
              EXISTS (SELECT 1 FROM sandboxes WHERE id = ?1),
@@ -95,39 +96,35 @@ pub(crate) fn execution_write_miss_error(
         ],
         |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
     ) {
-        Ok((false, _)) => rusqlite::Error::QueryReturnedNoRows,
-        Ok((true, true)) => {
-            rusqlite::Error::ToSqlConversionFailure(Box::new(PendingReceiptOwnsExecution))
-        }
-        Ok((true, false)) => {
-            rusqlite::Error::ToSqlConversionFailure(Box::new(LifecycleOwnsExecution))
-        }
+        Ok((false, _)) => Error::no_rows(),
+        Ok((true, true)) => Error::to_sql_conversion(PendingReceiptOwnsExecution),
+        Ok((true, false)) => Error::to_sql_conversion(LifecycleOwnsExecution),
         Err(error) => error,
     }
 }
 
-pub(crate) fn is_pending_receipt_execution_fence(error: &rusqlite::Error) -> bool {
+pub(crate) fn is_pending_receipt_execution_fence(error: &Error) -> bool {
     matches!(
-        error,
+        error.raw(),
         rusqlite::Error::ToSqlConversionFailure(source)
             if source.downcast_ref::<PendingReceiptOwnsExecution>().is_some()
     )
 }
 
-pub(crate) fn is_lifecycle_execution_fence(error: &rusqlite::Error) -> bool {
+pub(crate) fn is_lifecycle_execution_fence(error: &Error) -> bool {
     matches!(
-        error,
+        error.raw(),
         rusqlite::Error::ToSqlConversionFailure(source)
             if source.downcast_ref::<LifecycleOwnsExecution>().is_some()
     )
 }
 
-pub(crate) fn map_pending_receipt_delete_error(error: rusqlite::Error) -> rusqlite::Error {
-    match &error {
+pub(crate) fn map_pending_receipt_delete_error(error: Error) -> Error {
+    match error.raw() {
         rusqlite::Error::SqliteFailure(_, Some(message))
             if message == PendingReceiptOwnsDeletion::DIAGNOSTIC =>
         {
-            rusqlite::Error::ToSqlConversionFailure(Box::new(PendingReceiptOwnsDeletion))
+            Error::to_sql_conversion(PendingReceiptOwnsDeletion)
         }
         _ => error,
     }
@@ -142,7 +139,7 @@ pub(crate) struct ReceiptEvidenceConflict {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum InsertPendingReceiptError {
     #[error(transparent)]
-    Database(#[from] rusqlite::Error),
+    Database(#[from] Error),
     #[error(transparent)]
     Conflict(#[from] ReceiptEvidenceConflict),
 }
@@ -150,7 +147,7 @@ pub(crate) enum InsertPendingReceiptError {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CompletePendingReceiptError {
     #[error(transparent)]
-    Database(#[from] rusqlite::Error),
+    Database(#[from] Error),
     #[error(transparent)]
     Conflict(#[from] ReceiptEvidenceConflict),
 }
@@ -158,7 +155,7 @@ pub(crate) enum CompletePendingReceiptError {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AutoLifecycleDeleteEvidenceError {
     #[error(transparent)]
-    Database(#[from] rusqlite::Error),
+    Database(#[from] Error),
     #[error("auto-lifecycle policy changed before delete admission")]
     PolicyChanged,
     #[error("auto-lifecycle authority changed from {expected} to {actual} before delete admission")]
@@ -239,19 +236,16 @@ pub(crate) fn classify_and_record_admission(
         retained_generation_substrate,
     )) = values
     else {
-        return Err(AutoLifecycleDeleteEvidenceError::Database(
-            rusqlite::Error::QueryReturnedNoRows,
-        ));
+        return Err(AutoLifecycleDeleteEvidenceError::Database(Error::no_rows()));
     };
 
     let policy: pplx_space_common_core::types::AutoLifecyclePolicy =
-        serde_json::from_str(&policy_json).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(1, Type::Text, Box::new(error))
-        })?;
+        serde_json::from_str(&policy_json)
+            .map_err(|error| crate::db::Error::decode(1, Type::Text, error))?;
     if AutoLifecyclePolicyFingerprint::for_policy(&policy) != expectation.policy_fingerprint {
         return Err(AutoLifecycleDeleteEvidenceError::PolicyChanged);
     }
-    let authority: PolicyAuthority = parse_text(&authority, 0)?;
+    let authority: PolicyAuthority = parse_text(&authority, 0).map_err(crate::db::Error::from)?;
     if authority != expectation.authority {
         return Err(AutoLifecycleDeleteEvidenceError::AuthorityChanged {
             expected: expectation.authority,
@@ -554,7 +548,7 @@ pub(crate) fn record_retained_route_evidence(
     conn: &Connection,
     sandbox_id: SandboxId,
     evidence: RouteEvidence,
-) -> rusqlite::Result<bool> {
+) -> crate::db::Result<bool> {
     // Activation attempts are UUIDv7. Their canonical text order therefore
     // prevents a delayed same-generation write from replacing a later dispatch.
     let updated = conn.execute(
@@ -603,7 +597,7 @@ pub(crate) fn record_retained_route_evidence(
 pub(crate) fn route_identity_adoption_metadata(
     conn: &Connection,
     sandbox_id: SandboxId,
-) -> rusqlite::Result<RouteIdentityAdoptionMetadata> {
+) -> crate::db::Result<RouteIdentityAdoptionMetadata> {
     conn.query_row(
         "SELECT space_api_route_identity_provenance,
                 last_observed_execution_generation,
@@ -649,7 +643,7 @@ pub(crate) fn route_identity_adoption_metadata(
     )
 }
 
-fn clear_route_evidence_block(conn: &Connection, sandbox_id: SandboxId) -> rusqlite::Result<()> {
+fn clear_route_evidence_block(conn: &Connection, sandbox_id: SandboxId) -> crate::db::Result<()> {
     let reason = conn
         .query_row(
             "SELECT auto_lifecycle_delete_block_reason
@@ -674,7 +668,7 @@ pub(super) fn discard_pending_receipt_superseded_by_generation(
     conn: &Connection,
     sandbox_id: SandboxId,
     current_generation: ExecutionGeneration,
-) -> rusqlite::Result<Option<SupersededPendingReceipt>> {
+) -> crate::db::Result<Option<SupersededPendingReceipt>> {
     conn.query_row(
         "DELETE FROM auto_lifecycle_delete_outbox
           WHERE sandbox_id = ?1
@@ -703,7 +697,7 @@ pub(crate) fn discard_pending_receipt_for_execution_advance(
     conn: &Connection,
     sandbox_id: SandboxId,
     superseding_generation: Option<ExecutionGeneration>,
-) -> rusqlite::Result<Option<PendingReceiptSupersession>> {
+) -> crate::db::Result<Option<PendingReceiptSupersession>> {
     let Some(superseding_generation) = superseding_generation else {
         return Ok(None);
     };
@@ -726,7 +720,7 @@ pub(crate) fn discard_pending_receipt_for_execution_advance(
 pub(crate) fn pending_receipt_matches_observed_execution(
     conn: &Connection,
     sandbox_id: SandboxId,
-) -> rusqlite::Result<bool> {
+) -> crate::db::Result<bool> {
     conn.query_row(
         "SELECT NOT EXISTS (
              SELECT 1
@@ -780,27 +774,23 @@ fn record_block(
         [sandbox_id.to_string()],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    let policy = serde_json::from_str(&policy_json).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error))
-    })?;
+    let policy = serde_json::from_str(&policy_json)
+        .map_err(|error| crate::db::Error::decode(0, Type::Text, error))?;
     let mut runtime_state: pplx_space_common_core::types::AutoLifecycleRuntimeState =
-        serde_json::from_str(&runtime_state_json).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(1, Type::Text, Box::new(error))
-        })?;
+        serde_json::from_str(&runtime_state_json)
+            .map_err(|error| crate::db::Error::decode(1, Type::Text, error))?;
     let retry_delay = i64::try_from(AUTO_LIFECYCLE_DELETE_RETRY_DELAY.as_secs())
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        .map_err(crate::db::Error::to_sql_conversion)?;
     let retry_at = crate::db::now_epoch_i64()?.saturating_add(retry_delay);
     crate::auto_lifecycle::mark_error(
         &mut runtime_state,
         &policy,
         format!("auto-lifecycle delete blocked: {reason}"),
     );
-    runtime_state.next_auto_event_at = Some(
-        u64::try_from(retry_at)
-            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?,
-    );
-    let runtime_state_json = serde_json::to_string(&runtime_state)
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    runtime_state.next_auto_event_at =
+        Some(u64::try_from(retry_at).map_err(crate::db::Error::to_sql_conversion)?);
+    let runtime_state_json =
+        serde_json::to_string(&runtime_state).map_err(crate::db::Error::to_sql_conversion)?;
     conn.execute(
         "UPDATE sandboxes
             SET auto_lifecycle_delete_block_reason = ?1,
@@ -826,8 +816,8 @@ fn record_block(
 pub(crate) fn record_receipt_conflict_retry(
     conn: &Connection,
     storage_id: &str,
-) -> rusqlite::Result<bool> {
-    let transaction = crate::db::immediate_transaction(conn)?;
+) -> crate::db::Result<bool> {
+    let transaction = crate::db::Transaction::immediate(conn)?;
     clear_block_by_storage_id(&transaction, storage_id)?;
     let (policy_json, runtime_state_json): (String, String) = transaction.query_row(
         "SELECT auto_lifecycle_json, auto_lifecycle_state_json
@@ -866,11 +856,11 @@ pub(crate) fn record_receipt_conflict_retry(
     Ok(changed)
 }
 
-fn clear_block(conn: &Connection, sandbox_id: SandboxId) -> rusqlite::Result<()> {
+fn clear_block(conn: &Connection, sandbox_id: SandboxId) -> crate::db::Result<()> {
     clear_block_by_storage_id(conn, &sandbox_id.to_string())
 }
 
-fn clear_block_by_storage_id(conn: &Connection, storage_id: &str) -> rusqlite::Result<()> {
+fn clear_block_by_storage_id(conn: &Connection, storage_id: &str) -> crate::db::Result<()> {
     let values = conn
         .query_row(
             "SELECT auto_lifecycle_json, auto_lifecycle_state_json
@@ -933,7 +923,7 @@ pub(crate) fn insert_pending_receipt(
     }
 
     let (existing, existing_state) = receipt_record_for_sandbox(conn, receipt.sandbox_id)?
-        .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        .ok_or_else(crate::db::Error::no_rows)?;
     if existing_state == AutoLifecycleDeleteOutboxState::Pending
         && existing.execution_generation == receipt.execution_generation
         && existing.route_activation_id == receipt.route_activation_id
@@ -1004,10 +994,10 @@ pub(crate) fn complete_pending_receipt(
 
 pub(crate) fn list_completed_receipts(
     conn: &Connection,
-) -> rusqlite::Result<Vec<AutoLifecycleDeleteReceipt>> {
+) -> crate::db::Result<Vec<AutoLifecycleDeleteReceipt>> {
     let batch_size = i64::try_from(RECEIPT_BATCH_SIZE)
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-    let transaction = crate::db::immediate_transaction(conn)?;
+    let transaction = crate::db::Transaction::immediate(conn)?;
     let rows = {
         // Interleave fresh and retried receipts by rank within each class.
         // Fresh completions cannot starve deferred evidence, and a repeatedly
@@ -1083,8 +1073,8 @@ pub(crate) fn list_completed_receipts(
 pub(crate) fn acknowledge_completed_receipts(
     conn: &Connection,
     receipt_ids: &[AutoLifecycleDeleteReceiptId],
-) -> rusqlite::Result<Vec<AutoLifecycleDeleteReceiptId>> {
-    let transaction = crate::db::immediate_transaction(conn)?;
+) -> crate::db::Result<Vec<AutoLifecycleDeleteReceiptId>> {
+    let transaction = crate::db::Transaction::immediate(conn)?;
     let mut acknowledged = Vec::new();
     for receipt_id in receipt_ids {
         if transaction.execute(
@@ -1100,7 +1090,7 @@ pub(crate) fn acknowledge_completed_receipts(
     Ok(acknowledged)
 }
 
-pub(crate) fn outbox_stats(conn: &Connection) -> rusqlite::Result<AutoLifecycleDeleteOutboxStats> {
+pub(crate) fn outbox_stats(conn: &Connection) -> crate::db::Result<AutoLifecycleDeleteOutboxStats> {
     let now = crate::db::now_epoch_i64()?;
     let (pending, completed, attempts, oldest_pending, oldest_completed) = conn.query_row(
         "SELECT
@@ -1143,7 +1133,7 @@ pub(crate) fn outbox_stats(conn: &Connection) -> rusqlite::Result<AutoLifecycleD
 
 pub(crate) fn blocked_stats(
     conn: &Connection,
-) -> rusqlite::Result<Vec<AutoLifecycleDeleteBlockedStats>> {
+) -> crate::db::Result<Vec<AutoLifecycleDeleteBlockedStats>> {
     let now = crate::db::now_epoch_i64()?;
     let mut statement = conn.prepare(
         "SELECT auto_lifecycle_delete_block_reason,
@@ -1170,13 +1160,14 @@ pub(crate) fn blocked_stats(
                 oldest_age_secs,
             })
         })?
-        .collect()
+        .collect::<rusqlite::Result<_>>()
+        .map_err(crate::db::Error::from)
 }
 
 pub(crate) fn pending_receipt_for_sandbox(
     conn: &Connection,
     sandbox_id: SandboxId,
-) -> rusqlite::Result<Option<AutoLifecycleDeleteReceipt>> {
+) -> crate::db::Result<Option<AutoLifecycleDeleteReceipt>> {
     Ok(
         receipt_record_for_sandbox(conn, sandbox_id)?.and_then(|(receipt, state)| {
             (state == AutoLifecycleDeleteOutboxState::Pending).then_some(receipt)
@@ -1187,7 +1178,7 @@ pub(crate) fn pending_receipt_for_sandbox(
 fn receipt_record_for_sandbox(
     conn: &Connection,
     sandbox_id: SandboxId,
-) -> rusqlite::Result<Option<(AutoLifecycleDeleteReceipt, AutoLifecycleDeleteOutboxState)>> {
+) -> crate::db::Result<Option<(AutoLifecycleDeleteReceipt, AutoLifecycleDeleteOutboxState)>> {
     conn.query_row(
         "SELECT receipt_id, execution_generation, route_activation_id,
                 auto_lifecycle_policy_fingerprint, state

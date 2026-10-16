@@ -10,7 +10,7 @@ use super::*;
 
 async fn apply_guest_outcome(
     state: &Arc<Mutex<HashMap<String, SandboxHealth>>>,
-    db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: &crate::db::SharedConnection,
     sandbox_id: &str,
     guest: HealthProbeOutcome,
 ) -> Option<HealthTransition> {
@@ -44,7 +44,7 @@ async fn only_degrading_transitions_gather_evidence_and_console_tails_are_rate_l
         sandbox_id.clone(),
         test_health(),
     )])));
-    let db = Arc::new(std::sync::Mutex::new(crate::db::test_conn()));
+    let db = crate::db::SharedConnection::new(crate::db::test_conn());
     let mut transitions = Vec::new();
     for guest in [
         HealthProbeOutcome::Success,

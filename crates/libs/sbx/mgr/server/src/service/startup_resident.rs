@@ -130,7 +130,7 @@ impl SandboxManagerService {
             SandboxState::Paused => SandboxQuarantineReasonCode::RuntimeProbeInconsistent,
             SandboxState::Resuming => SandboxQuarantineReasonCode::ResidentResumeFailed,
             SandboxState::Checkpointing => SandboxQuarantineReasonCode::CheckpointResumeFailed,
-            _ => return Err(rusqlite::Error::InvalidQuery.into()),
+            _ => return Err(crate::db::Error::invalid_query().into()),
         };
         // Resume uses the wake lock; teardown/activation uses the cleanup
         // fence. Hold both through setup so a stale recovery cannot configure

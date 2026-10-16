@@ -18,11 +18,11 @@ use crate::db::{
     CompleteRowIntentCleanupDisposition,
 };
 
-fn state(conn: &rusqlite::Connection, id: &str) -> SandboxState {
+fn state(conn: &crate::db::Connection, id: &str) -> SandboxState {
     crate::db::get_sandbox(conn, id).unwrap().unwrap().state
 }
 
-type Write = fn(&rusqlite::Connection, &str) -> Result<(), Status>;
+type Write = fn(&crate::db::Connection, &str) -> Result<(), Status>;
 
 /// A writer's expected answer for the row with an id in each source state.
 type Outcomes = fn(&str, SandboxState) -> Expected;
@@ -229,7 +229,7 @@ fn warm_start_restaged(id: &str, state: SandboxState) -> Expected {
     }
 }
 
-fn check(case: &str, conn: &rusqlite::Connection, id: &str, write: Write, expected: Expected) {
+fn check(case: &str, conn: &crate::db::Connection, id: &str, write: Write, expected: Expected) {
     let before = snapshot(conn);
     let result = write(conn, id);
     match expected {

@@ -198,7 +198,7 @@ async fn storage_waits_off_runtime_and_preserves_transaction_rollback_and_poison
 
     let error = service
         .storage(|db| {
-            let tx = db.unchecked_transaction().unwrap();
+            let tx = crate::db::Transaction::deferred(db).unwrap();
             insert_test_sandbox(&tx, ID, crate::state::SandboxState::Created);
             Err::<(), _>(Status::aborted("abort transaction"))
         })

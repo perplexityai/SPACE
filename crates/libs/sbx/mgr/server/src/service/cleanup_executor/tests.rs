@@ -5,8 +5,9 @@ use crate::service::cleanup_support::{
     CleanupCompletion, CleanupLockGuard, CleanupLockTryResult, DEFAULT_CLEANUP_CONCURRENCY_CAP,
 };
 use crate::service::tests::service_tests::{insert_test_sandbox, service_for_teardown_test};
+use pplx_space_common_jobs::db as jobs;
 
-fn work(conn: &rusqlite::Connection, kill: bool) -> (JobId, CleanupWork) {
+fn work(conn: &crate::db::Connection, kill: bool) -> (JobId, CleanupWork) {
     let sandbox_id = SandboxId::new();
     insert_test_sandbox(conn, &sandbox_id.to_string(), SandboxState::Deleting);
     let work = CleanupWork {
@@ -21,7 +22,7 @@ fn work(conn: &rusqlite::Connection, kill: bool) -> (JobId, CleanupWork) {
         guest_flush: crate::db::cleanup_jobs::GuestFlush::Unrequested,
         published_artifact: None,
     };
-    let tx = conn.unchecked_transaction().unwrap();
+    let tx = crate::db::Transaction::deferred(conn).unwrap();
     let id = cleanup_jobs::persist(&tx, work.clone()).unwrap();
     tx.commit().unwrap();
     (id, work)
@@ -129,7 +130,7 @@ async fn stop_waiter_bounds_retries_without_losing_the_durable_job() {
     ] {
         let conn = crate::db::test_conn();
         let (id, _) = work(&conn, true);
-        jobs::mark_job_running(&conn, &id).unwrap();
+        jobs::mark_job_running(conn.raw(), &id).unwrap();
         let failure = if code == Code::Unknown {
             "legacy cleanup failure".to_owned()
         } else {
@@ -141,14 +142,14 @@ async fn stop_waiter_bounds_retries_without_losing_the_durable_job() {
         };
         match state {
             JobStatus::Pending => {
-                jobs::retry_running_job(&conn, &id, &failure, 30).unwrap();
+                jobs::retry_running_job(conn.raw(), &id, &failure, 30).unwrap();
             }
             JobStatus::Failed => {
-                jobs::fail_job_permanent(&conn, &id, &failure, None).unwrap();
+                jobs::fail_job_permanent(conn.raw(), &id, &failure, None).unwrap();
             }
             JobStatus::Cancelled => {
-                jobs::request_job_cancellation(&conn, &id).unwrap();
-                jobs::mark_job_cancelled(&conn, &id).unwrap();
+                jobs::request_job_cancellation(conn.raw(), &id).unwrap();
+                jobs::mark_job_cancelled(conn.raw(), &id).unwrap();
             }
             _ => unreachable!(),
         }
@@ -168,7 +169,7 @@ async fn stop_waiter_bounds_retries_without_losing_the_durable_job() {
             assert_eq!(original.message(), failure);
         }
         assert_eq!(
-            jobs::get_job(&service.db.lock().unwrap(), &id)
+            jobs::get_job(service.db.lock().unwrap().raw(), &id)
                 .unwrap()
                 .unwrap()
                 .status,
@@ -276,7 +277,7 @@ async fn restarted_claim_retries_without_blocking_other_completions() {
     let conn = crate::db::test_conn();
     let (failed_id, failed) = work(&conn, false);
     let (successful_id, _) = work(&conn, true);
-    jobs::mark_job_running(&conn, &failed_id).unwrap();
+    jobs::mark_job_running(conn.raw(), &failed_id).unwrap();
     let service = service_for_teardown_test(conn);
     let failed_subject = failed.sandbox_id.to_string();
     let (attempted, mut attempts) = tokio::sync::mpsc::channel(2);
@@ -304,7 +305,7 @@ async fn restarted_claim_retries_without_blocking_other_completions() {
         loop {
             let done = {
                 let db = service.db.lock().unwrap();
-                jobs::get_job(&db, &failed_id).unwrap().unwrap().status
+                jobs::get_job(db.raw(), &failed_id).unwrap().unwrap().status
                     == JobStatus::Pending.as_str()
             };
             if done {
@@ -414,10 +415,10 @@ async fn lifecycle_and_job_completion_commit_together_and_recover(
         .unwrap()
         .unwrap()
         .state;
-    let tx = conn.unchecked_transaction().unwrap();
+    let tx = crate::db::Transaction::deferred(&conn).unwrap();
     let id = cleanup_jobs::persist(&tx, work).unwrap();
     tx.commit().unwrap();
-    jobs::mark_job_running(&conn, &id).unwrap();
+    jobs::mark_job_running(conn.raw(), &id).unwrap();
     conn.execute_batch("CREATE TRIGGER reject_cleanup_completion BEFORE UPDATE ON jobs
         WHEN NEW.status IN ('completed', 'failed') BEGIN SELECT RAISE(FAIL, 'completion storage unavailable'); END;").unwrap();
     let service = service_for_teardown_test(conn);
@@ -470,7 +471,7 @@ async fn lifecycle_and_job_completion_commit_together_and_recover(
             episode
         );
         assert_eq!(
-            jobs::get_job(&db, &id).unwrap().unwrap().status,
+            jobs::get_job(db.raw(), &id).unwrap().unwrap().status,
             JobStatus::Pending.as_str()
         );
         db.execute_batch("DROP TRIGGER reject_cleanup_completion")
@@ -500,7 +501,7 @@ async fn lifecycle_and_job_completion_commit_together_and_recover(
     };
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if jobs::get_job(&service.db.lock().unwrap(), &id)
+            if jobs::get_job(service.db.lock().unwrap().raw(), &id)
                 .unwrap()
                 .unwrap()
                 .status
@@ -760,7 +761,7 @@ async fn failed_job_admission_rolls_back_claim_and_preserves_emergency_teardown(
     );
     assert!(
         jobs::find_active_job(
-            &service.db.lock().unwrap(),
+            service.db.lock().unwrap().raw(),
             cleanup_jobs::KIND,
             &sandbox_id.to_string()
         )
@@ -820,7 +821,7 @@ async fn promoted_selected_job_requeues_without_stealing_graceful_capacity() {
     promoted.immediate_kill = true;
     {
         let db = service.db.lock().unwrap();
-        let tx = db.unchecked_transaction().unwrap();
+        let tx = crate::db::Transaction::deferred(&db).unwrap();
         assert_eq!(cleanup_jobs::persist(&tx, promoted).unwrap(), promoted_id);
         tx.commit().unwrap();
     }
@@ -841,7 +842,7 @@ async fn promoted_selected_job_requeues_without_stealing_graceful_capacity() {
     assert!(!waiter.is_finished(), "requeue is not caller completion");
     {
         let db = service.db.lock().unwrap();
-        let job = jobs::get_job(&db, &promoted_id).unwrap().unwrap();
+        let job = jobs::get_job(db.raw(), &promoted_id).unwrap().unwrap();
         assert_eq!(job.status, JobStatus::Pending.as_str());
         assert_eq!(
             job.attempts, 0,
@@ -895,14 +896,14 @@ async fn non_execution_outcomes_preserve_durable_authority() {
             )
             .unwrap();
             jobs::update_active_job_payload(
-                &conn,
+                conn.raw(),
                 &id,
                 &serde_json::to_string(&work).unwrap(),
                 work.priority(),
             )
             .unwrap();
         }
-        jobs::mark_job_running(&conn, &id).unwrap();
+        jobs::mark_job_running(conn.raw(), &id).unwrap();
         let service = service_for_teardown_test(conn);
         let subject = work.sandbox_id.to_string();
         let fence = CleanupLockGuard::new(
@@ -927,8 +928,8 @@ async fn non_execution_outcomes_preserve_durable_authority() {
             let conn = service.db.lock().unwrap();
             match case {
                 "cancelled" => {
-                    jobs::request_job_cancellation(&conn, &id).unwrap();
-                    jobs::mark_job_cancelled(&conn, &id).unwrap();
+                    jobs::request_job_cancellation(conn.raw(), &id).unwrap();
+                    jobs::mark_job_cancelled(conn.raw(), &id).unwrap();
                 }
                 "replacement_generation" => {
                     conn.execute("UPDATE sandboxes SET space_api_route_execution_generation = 2 WHERE id = ?1", [&subject]).unwrap();
@@ -939,7 +940,7 @@ async fn non_execution_outcomes_preserve_durable_authority() {
                     } else {
                         "quarantined"
                     };
-                    let update = |conn: &rusqlite::Connection| {
+                    let update = |conn: &crate::db::Connection| {
                         conn.execute(
                             "UPDATE sandboxes SET state = ?1 WHERE id = ?2",
                             [state, &subject],
@@ -973,7 +974,7 @@ async fn non_execution_outcomes_preserve_durable_authority() {
             expected_code,
             "{case}"
         );
-        let status = jobs::get_job(&service.db.lock().unwrap(), &id)
+        let status = jobs::get_job(service.db.lock().unwrap().raw(), &id)
             .unwrap()
             .unwrap()
             .status;
@@ -984,7 +985,7 @@ async fn non_execution_outcomes_preserve_durable_authority() {
             .await
             .unwrap();
         assert_eq!(
-            jobs::get_job(&service.db.lock().unwrap(), &id)
+            jobs::get_job(service.db.lock().unwrap().raw(), &id)
                 .unwrap()
                 .unwrap()
                 .status,
@@ -1007,7 +1008,7 @@ async fn selected_cancellation_cannot_publish_success_after_a_stale_waiter_read(
     )
     .unwrap();
     jobs::update_active_job_payload(
-        &conn,
+        conn.raw(),
         &id,
         &serde_json::to_string(&work).unwrap(),
         work.priority(),
@@ -1048,7 +1049,7 @@ async fn selected_cancellation_cannot_publish_success_after_a_stale_waiter_read(
         .unwrap();
     let replacement_id = {
         let db = service.db.lock().unwrap();
-        let tx = db.unchecked_transaction().unwrap();
+        let tx = crate::db::Transaction::deferred(&db).unwrap();
         // A different obligation replaces the selected job under its fence.
         let mut replacement = work;
         replacement.completion = CleanupCompletion::DeleteRow;
@@ -1085,7 +1086,7 @@ async fn selected_cancellation_cannot_publish_success_after_a_stale_waiter_read(
     service.task_tracker.close();
     service.task_tracker.wait().await;
     assert_eq!(
-        jobs::get_job(&service.db.lock().unwrap(), &id)
+        jobs::get_job(service.db.lock().unwrap().raw(), &id)
             .unwrap()
             .unwrap()
             .status,

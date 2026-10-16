@@ -9,10 +9,10 @@
 //! derived from `SandboxState::can_transition_to`: the grids record which
 //! writes the guards admit, including edges the state machine forbids.
 
+use crate::db::{Connection, Transaction};
 use pplx_space_common_core::types::{
     SandboxCleanupEpisodeId, SandboxId, SandboxQuarantineReasonCode,
 };
-use rusqlite::Connection;
 
 use super::state_write_fixtures::{
     Cell, ExpectedDiff, NULL, Snapshot, assert_diff, assert_unchanged, backdate, force_state,
@@ -378,7 +378,7 @@ impl Writer {
                     refusal: StateWriteRefusal::FromState,
                 }) => panic!("{case}: every state is expected, yet {found} was refused"),
                 Ok(StateWriteOutcome::Missing) => (None, Expected::Missing),
-                Err(rusqlite::Error::InvalidQuery) => return Expected::Rejected,
+                Err(error) if error.is_invalid_query() => return Expected::Rejected,
                 Err(error) => panic!("{case}: {error}"),
             };
         assert_eq!(observed, seeded, "{case}: the outcome names the seeded row");
@@ -394,11 +394,11 @@ pub(super) fn write_from(
     from: StateSet,
     to: SandboxState,
     in_transaction: bool,
-) -> rusqlite::Result<StateWriteOutcome> {
+) -> crate::db::Result<StateWriteOutcome> {
     if !in_transaction {
         return update_state_from_states(conn, id, from, to);
     }
-    let tx = conn.unchecked_transaction()?;
+    let tx = Transaction::deferred(conn)?;
     let outcome = update_state_from_states(&tx, id, from, to)?;
     tx.commit()?;
     Ok(outcome)

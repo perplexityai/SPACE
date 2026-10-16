@@ -38,8 +38,6 @@ use tonic::service::interceptor::InterceptedService;
 use tonic::{Request, Status, service::Interceptor};
 use tower::{BoxError, Layer, Service};
 
-use pplx_space_sbxmgr_migrations::{COMMON_SCHEMA_MIGRATOR, SANDBOX_MANAGER_MIGRATOR};
-
 use crate::proto::sandbox_manager_server::SandboxManagerServer;
 use crate::service::{
     EnableDependencyRestartDrainError, ReleaseDependencyRestartDrainError, SandboxManagerService,
@@ -76,20 +74,6 @@ const PRE_HANDOFF_DRAIN_TIMEOUT: Duration = DEFAULT_DRAIN_TIMEOUT;
 const POST_HANDOFF_RPC_DRAIN_TIMEOUT: Duration = DEFAULT_DRAIN_TIMEOUT;
 const DRAIN_BLOCKER_WARNING_THRESHOLD: Duration = Duration::from_secs(10);
 const STARTUP_RECOVERY_ADMISSION_TIMEOUT: Duration = DEFAULT_SERVICE_MUTEX_TIMEOUT;
-
-async fn migrate_sandbox_manager_db(
-    db_path: &std::path::Path,
-) -> Result<(), pplx_space_common_svc::sql::sqlite::SqliteError> {
-    pplx_space_common_svc::sql::sqlite::migrate_embedded(
-        "sandbox-manager",
-        db_path,
-        pplx_space_common_svc::sql::sqlite::EmbeddedMigrators {
-            service: &SANDBOX_MANAGER_MIGRATOR,
-            common: Some(&COMMON_SCHEMA_MIGRATOR),
-        },
-    )
-    .await
-}
 
 type GrpcServerHandle = JoinHandle<Result<(), tonic::transport::Error>>;
 type GrpcServerJoinResult = Result<Result<(), tonic::transport::Error>, tokio::task::JoinError>;
@@ -584,9 +568,9 @@ pub enum RunSbxMgrError {
     #[error("failed to acquire the sandbox-manager service mutex: {0}")]
     ServiceMutex(#[source] pplx_space_common_svc::service_mutex::AcquireError),
     #[error("failed to migrate the sandbox-manager database: {0}")]
-    Migrate(#[source] pplx_space_common_svc::sql::sqlite::SqliteError),
+    Migrate(#[source] crate::db::OpenError),
     #[error("failed to open the sandbox-manager database: {0}")]
-    OpenDatabase(#[source] pplx_space_common_svc::sql::sqlite::SqliteError),
+    OpenDatabase(#[source] crate::db::OpenError),
     #[error("invalid {SPACE_NODE_ROLE_ENV} {role:?}: {source}")]
     NodeRole {
         role: String,
@@ -610,7 +594,7 @@ pub enum RunSbxMgrError {
     #[error("failed to persist sandbox startup recovery: {0}")]
     StartupRecovery(#[source] StartupRecoveryError),
     #[error("failed to recover local_artifacts lease states: {0}")]
-    LocalArtifactRecovery(#[source] rusqlite::Error),
+    LocalArtifactRecovery(#[source] crate::db::Error),
     #[error("failed to refund interrupted snapshot upload attempts: {0}")]
     RefundSnapshotUploadAttempts(
         #[source] crate::service::RefundInterruptedSnapshotUploadAttemptsError,
@@ -815,11 +799,9 @@ pub async fn run(
     );
     health_server.mark_starting();
 
-    migrate_sandbox_manager_db(std::path::Path::new(
-        pplx_space_common_core::host::linux::paths::SANDBOX_MANAGER_DB,
-    ))
-    .await
-    .map_err(RunSbxMgrError::Migrate)?;
+    crate::db::migrate()
+        .await
+        .map_err(RunSbxMgrError::Migrate)?;
 
     let conn = crate::db::open().map_err(RunSbxMgrError::OpenDatabase)?;
     let node_role = match std::env::var(SPACE_NODE_ROLE_ENV) {

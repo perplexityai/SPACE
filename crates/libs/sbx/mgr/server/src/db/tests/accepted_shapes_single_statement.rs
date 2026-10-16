@@ -10,11 +10,11 @@
 //! writes nothing here; `started_transition_arms_disarmed_lifecycle_for_rollback_writers`
 //! and `start_arms_access_idle_only_after_guest_readiness` cover arming.
 
+use crate::db::Connection;
 use pplx_space_common_core::types::{
     ArtifactKind, ArtifactOrigin, LocalArtifactId, SandboxId, SandboxQuarantineNextAction,
     SandboxQuarantineReasonCode, SandboxQuarantineSource, TransferScopeId,
 };
-use rusqlite::Connection;
 
 use super::state_write_fixtures::{
     Cell, ExpectedDiff, NULL, assert_accepts, backdate, decorate, generation, insert_row,

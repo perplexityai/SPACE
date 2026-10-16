@@ -24,7 +24,7 @@ async fn gateway_metric_registry_forgets_retired_builds() {
     assert!(published.is_empty());
 }
 
-fn insert_test_sandbox(conn: &rusqlite::Connection, id: &str, state: crate::state::SandboxState) {
+fn insert_test_sandbox(conn: &crate::db::Connection, id: &str, state: crate::state::SandboxState) {
     let uuid8 = id
         .parse::<SandboxId>()
         .map(SandboxRuntimeLabel::from_sandbox_id)
@@ -102,7 +102,7 @@ fn test_route_identity() -> SpaceApiRouteIdentity {
 }
 
 fn set_runtime_fields(
-    conn: &rusqlite::Connection,
+    conn: &crate::db::Connection,
     id: &str,
     space_api_route_identity: SpaceApiRouteIdentity,
 ) {
@@ -224,7 +224,7 @@ fn net_gateway_relaunch_args_include_current_route_identity() {
     let identity = test_route_identity();
     set_runtime_fields(&conn, id, identity.clone());
 
-    let db = Arc::new(std::sync::Mutex::new(conn));
+    let db = crate::db::SharedConnection::new(conn);
     let flags = pplx_space_feature_flags::FeatureFlagClient::disabled();
     let args = net_gateway_relaunch_args(&db, id, &flags).expect("relaunch args build");
 
@@ -249,12 +249,12 @@ fn net_gateway_relaunch_args_keep_pool_gateway_no_identity() {
     insert_test_sandbox(&conn, id, crate::state::SandboxState::Started);
     conn.execute(
         "UPDATE sandboxes SET pool_template = 'seed' WHERE id = ?1",
-        rusqlite::params![id],
+        crate::db::fixture::params![id],
     )
     .expect("pool template update");
     set_runtime_fields(&conn, id, test_route_identity());
 
-    let db = Arc::new(std::sync::Mutex::new(conn));
+    let db = crate::db::SharedConnection::new(conn);
     let flags = pplx_space_feature_flags::FeatureFlagClient::disabled();
     let args = net_gateway_relaunch_args(&db, id, &flags).expect("relaunch args build");
 
@@ -281,7 +281,7 @@ fn net_gateway_relaunch_args_keep_pool_gateway_no_identity() {
 async fn clear_netgtw_probe_state_drops_cached_process_observations() {
     let conn = crate::db::test_conn();
     let watchdog = SandboxWatchdog::new_for_tests(
-        Arc::new(std::sync::Mutex::new(conn)),
+        crate::db::SharedConnection::new(conn),
         NetworkPolicyReconcileQueue::default(),
         CancellationToken::new(),
         &TaskTracker::new(),
@@ -342,10 +342,10 @@ async fn watchdog_with_committed_gateway(
     let conn = crate::db::test_conn();
     insert_test_sandbox(&conn, sandbox_id, crate::state::SandboxState::Started);
     set_runtime_fields(&conn, sandbox_id, test_route_identity());
-    let db = Arc::new(std::sync::Mutex::new(conn));
+    let db = crate::db::SharedConnection::new(conn);
     let tracker = tokio_util::task::TaskTracker::new();
     let watchdog = SandboxWatchdog::new_for_tests(
-        Arc::clone(&db),
+        db.clone(),
         NetworkPolicyReconcileQueue::default(),
         CancellationToken::new(),
         &tracker,
@@ -453,7 +453,7 @@ async fn rejected_gateway_commit_preserves_probe_state() {
         .unwrap()
         .execute(
             "UPDATE sandboxes SET netgtw_pid = ?1 WHERE id = ?2",
-            rusqlite::params![50_003, sandbox_id],
+            crate::db::fixture::params![50_003, sandbox_id],
         )
         .unwrap();
 
@@ -484,7 +484,7 @@ fn test_watchdog_with_row(sandbox_id: &str, state: crate::state::SandboxState) -
     let conn = crate::db::test_conn();
     insert_test_sandbox(&conn, sandbox_id, state);
     SandboxWatchdog::new_for_tests(
-        Arc::new(std::sync::Mutex::new(conn)),
+        crate::db::SharedConnection::new(conn),
         NetworkPolicyReconcileQueue::default(),
         CancellationToken::new(),
         &TaskTracker::new(),
@@ -546,7 +546,7 @@ async fn recover_all_skips_running_vm_without_db_row() {
     let sandbox_id = SandboxId::new().to_string();
     let conn = crate::db::test_conn();
     let watchdog = SandboxWatchdog::new_for_tests(
-        Arc::new(std::sync::Mutex::new(conn)),
+        crate::db::SharedConnection::new(conn),
         NetworkPolicyReconcileQueue::default(),
         CancellationToken::new(),
         &TaskTracker::new(),
@@ -1069,7 +1069,7 @@ fn pause_failed_recovery_requires_two_matching_firecracker_states() {
 async fn pause_failed_recovery_fixture(
     firecracker_state: FirecrackerVmState,
 ) -> (
-    Arc<std::sync::Mutex<rusqlite::Connection>>,
+    crate::db::SharedConnection,
     Arc<SnapshotScheduler>,
     AutoLifecycleCoordinator,
     HealthLifecycleEpochs,
@@ -1095,7 +1095,7 @@ async fn pause_failed_recovery_fixture(
         )
         .expect("pause-failed quarantine must be recorded")
     );
-    let db = Arc::new(std::sync::Mutex::new(conn));
+    let db = crate::db::SharedConnection::new(conn);
     let auto_lifecycle = AutoLifecycleCoordinator::default();
     let lifecycle_epochs = HealthLifecycleEpochs::default();
     let snapshot_scheduler = Arc::new(SnapshotScheduler::new(Arc::new(
@@ -1275,7 +1275,7 @@ async fn lifecycle_edge_preserves_status_and_discards_in_flight_probe() {
     }
 
     let conn = crate::db::test_conn();
-    let db = Arc::new(std::sync::Mutex::new(conn));
+    let db = crate::db::SharedConnection::new(conn);
     let observations = std::array::from_fn(|_| sample(HealthProbeOutcome::Success));
     apply_composed_health_result(
         &state,
@@ -1315,7 +1315,7 @@ async fn missing_guest_uptime_preserves_last_observation() {
     let conn = crate::db::test_conn();
     insert_test_sandbox(&conn, &sandbox_id, crate::state::SandboxState::Started);
     crate::db::update_guest_uptime(&conn, &sandbox_id, 10).expect("initial uptime persists");
-    let db = Arc::new(std::sync::Mutex::new(conn));
+    let db = crate::db::SharedConnection::new(conn);
 
     apply_composed_health_result(
         &state,
@@ -1408,13 +1408,13 @@ async fn successful_health_probes_leave_failed_lifecycle_unchanged() {
     insert_test_sandbox(&conn, &sandbox_id, crate::state::SandboxState::Failed);
     conn.execute(
         "UPDATE sandboxes SET failure_reason = ?1 WHERE id = ?2",
-        rusqlite::params![
+        crate::db::fixture::params![
             "guest bridge health probe failed after 3 consecutive failures: timeout",
             &sandbox_id
         ],
     )
     .unwrap();
-    let db = Arc::new(std::sync::Mutex::new(conn));
+    let db = crate::db::SharedConnection::new(conn);
     let state = Arc::new(Mutex::new(HashMap::from([(
         sandbox_id.clone(),
         test_health(),

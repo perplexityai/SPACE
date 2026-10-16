@@ -4,7 +4,7 @@ use super::*;
 
 #[test]
 fn poisoned_inventory_connection_returns_error_without_running_the_mutation() {
-    let db = std::sync::Arc::new(std::sync::Mutex::new(crate::db::test_conn()));
+    let db = crate::db::SharedConnection::new(crate::db::test_conn());
     let poison = db.clone();
     assert!(
         std::thread::spawn(move || {
@@ -46,7 +46,7 @@ fn orphan_materialization_requires_observed_authority_without_overwriting_a_new_
         (false, inventory_execution_for_test(SandboxId::new()), false),
         (false, inventory_execution_for_test(SandboxId::new()), true),
     ] {
-        let db = Mutex::new(crate::db::test_conn());
+        let db = crate::db::SharedConnection::new(crate::db::test_conn());
         let cache = tempfile::tempdir().unwrap();
         let run = tempfile::tempdir().unwrap();
         let id = SandboxId::new();
@@ -128,7 +128,7 @@ async fn orphan_authority_reaches_cleanup_and_is_never_refreshed_on_rejection() 
     std::fs::create_dir(&cache).unwrap();
     std::fs::create_dir_all(run.join(id.to_string())).unwrap();
     std::os::unix::fs::symlink(&cache, run.join(id.to_string()).join("fc.pid")).unwrap();
-    let db = Arc::new(Mutex::new(crate::db::test_conn()));
+    let db = crate::db::SharedConnection::new(crate::db::test_conn());
     let receiver = Arc::new(Mutex::new(Err(Status::unavailable("receiver restarting"))));
     let inspections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let inspect = tower::service_fn({
@@ -203,7 +203,7 @@ async fn orphan_authority_reaches_cleanup_and_is_never_refreshed_on_rejection() 
         tokio::task::spawn_blocking(move || {
             let observe = orphan_execution_observer(client, CancellationToken::new());
             reconcile_sandbox_inventory_ids(
-                db.as_ref(),
+                &db,
                 SandboxInventoryPaths::new(&cache, &run),
                 Vec::new(),
                 vec![id],
@@ -315,18 +315,18 @@ fn inventory_does_not_treat_an_unreadable_cache_path_as_absence() {
 }
 
 struct SecondCallMutatingInventoryDb<Mutation> {
-    conn: std::cell::RefCell<rusqlite::Connection>,
+    conn: std::cell::RefCell<crate::db::Connection>,
     calls: std::cell::Cell<usize>,
     mutation: Mutation,
 }
 
 impl<Mutation> InventoryDbAccess for SecondCallMutatingInventoryDb<Mutation>
 where
-    Mutation: Fn(&rusqlite::Connection),
+    Mutation: Fn(&crate::db::Connection),
 {
     fn with_connection<T>(
         &self,
-        operation: impl FnOnce(&rusqlite::Connection) -> T,
+        operation: impl FnOnce(&crate::db::Connection) -> T,
     ) -> Result<T, InventoryError> {
         let call = self.calls.get();
         self.calls.set(call + 1);
@@ -483,7 +483,7 @@ async fn inventory_retires_registries_atomically_and_retries_busy_registrations(
     let wake_guard = wake.lock().await;
     let reconcile = || {
         reconcile_sandbox_inventory_ids(
-            service.db.as_ref(),
+            &service.db,
             SandboxInventoryPaths::new(cache.path(), run.path()),
             Vec::new(),
             Vec::new(),
@@ -599,7 +599,7 @@ fn orphan_materialization_rechecks_filesystem_after_acquiring_database_mutex() {
     let db = SecondCallMutatingInventoryDb {
         conn: std::cell::RefCell::new(conn),
         calls: std::cell::Cell::new(0),
-        mutation: move |_: &rusqlite::Connection| {
+        mutation: move |_: &crate::db::Connection| {
             std::fs::remove_dir_all(&sandbox_root).expect("remove stale filesystem evidence");
         },
     };
@@ -640,7 +640,7 @@ fn stale_row_rechecks_filesystem_after_acquiring_database_mutex() {
     let db = SecondCallMutatingInventoryDb {
         conn: std::cell::RefCell::new(conn),
         calls: std::cell::Cell::new(0),
-        mutation: move |_: &rusqlite::Connection| {
+        mutation: move |_: &crate::db::Connection| {
             std::fs::create_dir_all(&sandbox_root).expect("restore filesystem evidence");
         },
     };
@@ -686,7 +686,7 @@ fn nested_materialization_database_failure_is_classified_as_database_error() {
     let db = SecondCallMutatingInventoryDb {
         conn: std::cell::RefCell::new(conn),
         calls: std::cell::Cell::new(0),
-        mutation: |conn: &rusqlite::Connection| {
+        mutation: |conn: &crate::db::Connection| {
             conn.execute_batch("DROP TABLE local_artifacts")
                 .expect("break nested artifact registration");
         },
@@ -975,7 +975,7 @@ fn inventory_keeps_a_quarantined_row_without_local_evidence() {
     // the candidates: skipping the hold before the fence is what keeps a pass
     // from contending for it.
     let fenced = std::sync::Mutex::new(Vec::new());
-    let reconcile = |conn: &rusqlite::Connection| {
+    let reconcile = |conn: &crate::db::Connection| {
         reconcile_sandbox_inventory_ids(
             conn,
             paths,

@@ -121,10 +121,10 @@ pub(crate) fn due_auto_lifecycle_batch(
         let (id, deadline) = match (row.get::<_, String>(1), row.get::<_, Option<i64>>(2)) {
             (Ok(id), Ok(deadline)) => (id, deadline),
             (Err(error), _) | (_, Err(error)) if is_row_decode_error(&error) => {
-                tracing::warn!(rowid = row.get::<_, i64>(0)?, error = %describe_error(&error), "skipping malformed auto lifecycle discovery row");
+                tracing::warn!(rowid = row.get::<_, i64>(0)?, error = %describe_raw_error(&error), "skipping malformed auto lifecycle discovery row");
                 return Ok(None);
             }
-            (Err(error), _) | (_, Err(error)) => return Err(error),
+            (Err(error), _) | (_, Err(error)) => return Err(Error::from(error)),
         };
         let Some(deadline) = deadline else {
             return Ok(None);
@@ -140,10 +140,10 @@ pub(crate) fn due_auto_lifecycle_batch(
         let state = match row.get::<_, String>(3) {
             Ok(state) => state,
             Err(error) if is_row_decode_error(&error) => {
-                tracing::warn!(rowid = row.get::<_, i64>(0)?, error = %describe_error(&error), "skipping malformed auto lifecycle discovery row");
+                tracing::warn!(rowid = row.get::<_, i64>(0)?, error = %describe_raw_error(&error), "skipping malformed auto lifecycle discovery row");
                 return Ok(None);
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(Error::from(error)),
         };
         if state.parse::<SandboxState>().ok() == Some(SandboxState::Deleting) {
             return Ok(None);

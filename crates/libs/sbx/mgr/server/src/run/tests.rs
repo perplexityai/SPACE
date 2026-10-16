@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use super::*;
 use async_trait::async_trait;
-use pplx_space_common_jobs::{BackgroundWorker, Job, JobError, JobExecutor, WorkerConfig};
+use pplx_space_common_jobs::{Job, JobError, JobExecutor, WorkerConfig};
 use pplx_space_common_svc::{ServiceMutex, UnixSocketOptions};
 use tonic::codegen::Bytes;
 use tonic::transport::Channel;
@@ -369,25 +369,13 @@ impl JobExecutor for SuspendFinalizationExecutor {
     }
 }
 
-fn create_jobs_schema(connection: &rusqlite::Connection) {
-    for migration in COMMON_SCHEMA_MIGRATOR
-        .iter()
-        .filter(|migration| migration.migration_type.is_up_migration())
-    {
-        connection.execute_batch(migration.sql.as_ref()).unwrap();
-    }
-}
-
 #[tokio::test(start_paused = true)]
 async fn snapshot_worker_restart_yield_allows_inflight_suspend_finalization_to_finish() {
     assert!(SNAPSHOT_WORKER_DRAIN_TIMEOUT < PRE_HANDOFF_DRAIN_TIMEOUT);
 
-    let connection = rusqlite::Connection::open_in_memory().expect("open jobs database");
-    create_jobs_schema(&connection);
     let started = Arc::new(tokio::sync::Notify::new());
     let completed = Arc::new(AtomicBool::new(false));
-    let worker = BackgroundWorker::new(
-        Arc::new(Mutex::new(connection)),
+    let worker = crate::db::SharedConnection::new(crate::db::test_conn()).background_worker(
         SuspendFinalizationExecutor {
             started: Arc::clone(&started),
             completed: Arc::clone(&completed),
@@ -774,7 +762,7 @@ async fn grpc_writer_during_pre_handoff_drain_returns_retry_on_successor() {
     let listener =
         pplx_space_common_svc::bind_unix_socket(&socket_path, UnixSocketOptions::new(0o600))
             .unwrap();
-    let service = SandboxManagerService::for_test(rusqlite::Connection::open_in_memory().unwrap());
+    let service = SandboxManagerService::for_test(crate::db::Connection::open_in_memory());
     let rpc_drain_token = CancellationToken::new();
     let shutdown_token = CancellationToken::new();
     let server_shutdown = shutdown_token.clone();
@@ -821,7 +809,7 @@ async fn grpc_in_flight_request_interrupted_at_handoff_is_not_marked_replayable(
     let listener =
         pplx_space_common_svc::bind_unix_socket(&socket_path, UnixSocketOptions::new(0o600))
             .unwrap();
-    let service = SandboxManagerService::for_test(rusqlite::Connection::open_in_memory().unwrap());
+    let service = SandboxManagerService::for_test(crate::db::Connection::open_in_memory());
     let rpc_drain_token = CancellationToken::new();
     let shutdown_token = CancellationToken::new();
     let server_shutdown = shutdown_token.clone();
@@ -1270,10 +1258,10 @@ async fn daemon_migrations_converge_jobs_from_each_supported_schema() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sandbox-manager.db");
         if schema != "fresh" {
-            migrate_sandbox_manager_db(&path).await.unwrap();
-            let conn = rusqlite::Connection::open(&path).unwrap();
+            crate::db::migrate_at(&path).await.unwrap();
+            let conn = crate::db::Connection::open_at(&path).unwrap();
             jobs::insert_job(
-                &conn,
+                conn.raw(),
                 jobs::InsertJob {
                     job_id: &"019d84bd-280d-7331-99c6-000000000001".parse().unwrap(),
                     kind: "sandbox_cleanup",
@@ -1287,13 +1275,13 @@ async fn daemon_migrations_converge_jobs_from_each_supported_schema() {
             )
             .unwrap();
             jobs::mark_job_running(
-                &conn,
+                conn.raw(),
                 &"019d84bd-280d-7331-99c6-000000000001".parse().unwrap(),
             )
             .unwrap();
         }
-        migrate_sandbox_manager_db(&path).await.unwrap();
-        let conn = rusqlite::Connection::open(&path).unwrap();
+        crate::db::migrate_at(&path).await.unwrap();
+        let conn = crate::db::Connection::open_at(&path).unwrap();
         conn.prepare("SELECT activation_attempt_id, operation_activation_attempt_id FROM sandbox_cleanup_episodes")
             .expect("real daemon migrations install independent operation ownership");
         assert_eq!(
@@ -1307,7 +1295,7 @@ async fn daemon_migrations_converge_jobs_from_each_supported_schema() {
 
         if schema != "fresh" {
             let retained = jobs::get_job(
-                &conn,
+                conn.raw(),
                 &"019d84bd-280d-7331-99c6-000000000001".parse().unwrap(),
             )
             .unwrap()
@@ -1317,7 +1305,7 @@ async fn daemon_migrations_converge_jobs_from_each_supported_schema() {
             assert_eq!(retained.attempts, 1, "{schema}");
         }
         jobs::insert_job(
-            &conn,
+            conn.raw(),
             jobs::InsertJob {
                 job_id: &"019d84bd-280d-7331-99c6-000000000002".parse().unwrap(),
                 kind: "sandbox_cleanup",
@@ -1331,25 +1319,25 @@ async fn daemon_migrations_converge_jobs_from_each_supported_schema() {
         )
         .unwrap();
         jobs::mark_job_running(
-            &conn,
+            conn.raw(),
             &"019d84bd-280d-7331-99c6-000000000002".parse().unwrap(),
         )
         .unwrap();
         jobs::request_job_cancellation(
-            &conn,
+            conn.raw(),
             &"019d84bd-280d-7331-99c6-000000000002".parse().unwrap(),
         )
         .unwrap();
         assert!(
             jobs::mark_job_cancelled(
-                &conn,
+                conn.raw(),
                 &"019d84bd-280d-7331-99c6-000000000002".parse().unwrap()
             )
             .unwrap()
         );
         assert_eq!(
             jobs::get_job(
-                &conn,
+                conn.raw(),
                 &"019d84bd-280d-7331-99c6-000000000002".parse().unwrap()
             )
             .unwrap()
@@ -1359,8 +1347,8 @@ async fn daemon_migrations_converge_jobs_from_each_supported_schema() {
             "{schema}"
         );
         drop(conn);
-        migrate_sandbox_manager_db(&path).await.unwrap();
-        let conn = rusqlite::Connection::open(&path).unwrap();
+        crate::db::migrate_at(&path).await.unwrap();
+        let conn = crate::db::Connection::open_at(&path).unwrap();
         assert_eq!(
             conn.query_row(
                 "SELECT count(*) FROM sqlite_schema WHERE type = 'index' AND name = ?1",
@@ -1373,7 +1361,7 @@ async fn daemon_migrations_converge_jobs_from_each_supported_schema() {
         );
         assert_eq!(
             jobs::get_job(
-                &conn,
+                conn.raw(),
                 &"019d84bd-280d-7331-99c6-000000000002".parse().unwrap()
             )
             .unwrap()
@@ -1392,11 +1380,11 @@ async fn daemon_migration_failure_preserves_durable_jobs() {
     for history in ["_sqlx_migrations", "_space_common_schema_migrations"] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sandbox-manager.db");
-        migrate_sandbox_manager_db(&path).await.unwrap();
-        let conn = rusqlite::Connection::open(&path).unwrap();
+        crate::db::migrate_at(&path).await.unwrap();
+        let conn = crate::db::Connection::open_at(&path).unwrap();
 
         jobs::insert_job(
-            &conn,
+            conn.raw(),
             jobs::InsertJob {
                 job_id: &"019d84bd-280d-7331-99c6-000000000001".parse().unwrap(),
                 kind: "sandbox_cleanup",
@@ -1413,14 +1401,11 @@ async fn daemon_migration_failure_preserves_durable_jobs() {
             .unwrap();
         drop(conn);
 
-        assert!(
-            migrate_sandbox_manager_db(&path).await.is_err(),
-            "{history}"
-        );
-        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert!(crate::db::migrate_at(&path).await.is_err(), "{history}");
+        let conn = crate::db::Connection::open_at(&path).unwrap();
         assert_eq!(
             jobs::get_job(
-                &conn,
+                conn.raw(),
                 &"019d84bd-280d-7331-99c6-000000000001".parse().unwrap()
             )
             .unwrap()

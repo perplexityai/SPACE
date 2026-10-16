@@ -1,5 +1,6 @@
+use crate::db::Connection;
+use crate::db::fixture::params;
 use pplx_space_common_core::types::SandboxId;
-use rusqlite::params;
 
 use super::*;
 
@@ -12,8 +13,8 @@ thread_local! {
     static GC_READ_RACE: std::cell::RefCell<Option<GcReadRace>> = const { std::cell::RefCell::new(None) };
 }
 
-fn race_restore_release_at_gc_read(event: rusqlite::trace::TraceEvent<'_>) {
-    if let rusqlite::trace::TraceEvent::Row(statement) = event
+fn race_restore_release_at_gc_read(event: crate::db::fixture::TraceEvent<'_>) {
+    if let crate::db::fixture::TraceEvent::Row(statement) = event
         && statement
             .sql()
             .starts_with("SELECT created_at, COALESCE(last_touched_at, created_at)")
@@ -52,7 +53,7 @@ fn artifact_id(s: &str) -> LocalArtifactId {
 fn gc_checkout_serializes_eligibility_with_a_concurrent_restore_release() {
     let root = tempfile::TempDir::new().unwrap();
     let path = root.path().join("artifacts.db");
-    let mut conn = Connection::open(&path).unwrap();
+    let mut conn = Connection::open_at(&path).unwrap();
     crate::db::create_test_schema(&mut conn);
     conn.pragma_update(None, "journal_mode", "WAL").unwrap();
     let id = "01939e3e-1111-7000-8000-000000000001";
@@ -62,9 +63,9 @@ fn gc_checkout_serializes_eligibility_with_a_concurrent_restore_release() {
         [id],
     )
     .unwrap();
-    let competing = Connection::open(&path).unwrap();
+    let competing = Connection::open_at(&path).unwrap();
     competing.busy_timeout(std::time::Duration::ZERO).unwrap();
-    let competing_store = LocalArtifacts::new(Arc::new(Mutex::new(competing)));
+    let competing_store = LocalArtifacts::new(crate::db::SharedConnection::new(competing));
     let restore = competing_store
         .check_out_for_restore(artifact_id(id))
         .unwrap();
@@ -77,10 +78,10 @@ fn gc_checkout_serializes_eligibility_with_a_concurrent_restore_release() {
         })
     });
     conn.trace_v2(
-        rusqlite::trace::TraceEventCodes::SQLITE_TRACE_ROW,
+        crate::db::fixture::TraceEventCodes::SQLITE_TRACE_ROW,
         Some(race_restore_release_at_gc_read),
     );
-    let store = LocalArtifacts::new(Arc::new(Mutex::new(conn)));
+    let store = LocalArtifacts::new(crate::db::SharedConnection::new(conn));
     let writer = std::thread::spawn(move || {
         start_rx
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -105,9 +106,7 @@ fn gc_checkout_serializes_eligibility_with_a_concurrent_restore_release() {
             ..
         })
     ));
-    assert!(
-        matches!(writer.join().unwrap(), Err(rusqlite::Error::SqliteFailure(error, _)) if error.code == rusqlite::ErrorCode::DatabaseBusy)
-    );
+    assert!(matches!(writer.join().unwrap(), Err(error) if error.is_database_busy()));
     assert!(
         GC_READ_RACE.with(|race| race.borrow().is_none()),
         "the competing writer must run at the eligibility read"
@@ -119,8 +118,8 @@ fn gc_checkout_requires_current_backup_pin_and_time_evidence() {
     let conn = open_test_db();
     let id = "01939e3e-1111-7000-8000-000000000001";
     insert_row(&conn, id, "sbx", "/artifact");
-    let shared = Arc::new(Mutex::new(conn));
-    let store = LocalArtifacts::new(Arc::clone(&shared));
+    let shared = crate::db::SharedConnection::new(conn);
+    let store = LocalArtifacts::new(shared.clone());
     let eligibility = GcEligibility {
         now_secs: 100,
         idle_secs: 0,
@@ -231,7 +230,7 @@ fn named_publication_inventory_reports_state_without_taking_a_lease() {
         "other",
         "/tmp/other",
     );
-    let store = LocalArtifacts::new(Arc::new(Mutex::new(conn)));
+    let store = LocalArtifacts::new(crate::db::SharedConnection::new(conn));
     let check = |state| {
         let publications = store.list_named_publications("sbx").unwrap();
         assert_eq!(publications.len(), 1);
@@ -256,7 +255,7 @@ fn check_out_for_restore_flips_state_and_releases_back() {
     let conn = open_test_db();
     let id = "01939e3e-1111-7000-8000-000000000001";
     insert_row(&conn, id, "sbx-1", "/tmp/art");
-    let store = LocalArtifacts::new(Arc::new(Mutex::new(conn)));
+    let store = LocalArtifacts::new(crate::db::SharedConnection::new(conn));
 
     let lease = store.check_out_for_restore(artifact_id(id)).unwrap();
     // While the lease is held, a second checkout (restore or
@@ -281,7 +280,7 @@ fn check_out_for_delete_blocks_concurrent_restore_and_vice_versa() {
     let conn = open_test_db();
     let id = "01939e3e-2222-7000-8000-000000000001";
     insert_row(&conn, id, "sbx-2", "/tmp/art2");
-    let store = LocalArtifacts::new(Arc::new(Mutex::new(conn)));
+    let store = LocalArtifacts::new(crate::db::SharedConnection::new(conn));
 
     let del = store.check_out_for_delete(artifact_id(id)).unwrap();
     let restore_attempt = store.check_out_for_restore(artifact_id(id));
@@ -304,7 +303,7 @@ fn check_out_for_delete_refuses_shared_local_path() {
     let id_b = "01939e3e-3333-7000-8000-000000000002";
     insert_row(&conn, id_a, "sbx-3", "/tmp/shared");
     insert_row(&conn, id_b, "sbx-3", "/tmp/shared");
-    let store = LocalArtifacts::new(Arc::new(Mutex::new(conn)));
+    let store = LocalArtifacts::new(crate::db::SharedConnection::new(conn));
 
     let attempt = store.check_out_for_delete(artifact_id(id_a));
     assert!(matches!(
@@ -321,7 +320,7 @@ fn delete_lease_commit_removes_row() {
     let conn = open_test_db();
     let id = "01939e3e-4444-7000-8000-000000000001";
     insert_row(&conn, id, "sbx-4", "/tmp/art4");
-    let store = LocalArtifacts::new(Arc::new(Mutex::new(conn)));
+    let store = LocalArtifacts::new(crate::db::SharedConnection::new(conn));
 
     let lease = store.check_out_for_delete(artifact_id(id)).unwrap();
     lease.commit().unwrap();
@@ -335,7 +334,7 @@ fn restore_lease_drop_without_release_rolls_back_to_ready() {
     let conn = open_test_db();
     let id = "01939e3e-5555-7000-8000-000000000001";
     insert_row(&conn, id, "sbx-5", "/tmp/art5");
-    let store = LocalArtifacts::new(Arc::new(Mutex::new(conn)));
+    let store = LocalArtifacts::new(crate::db::SharedConnection::new(conn));
 
     {
         let _lease = store.check_out_for_restore(artifact_id(id)).unwrap();
@@ -369,7 +368,7 @@ fn restore_lease_release_bumps_last_touched_at_but_drop_does_not() {
     .unwrap();
     // Two distinct sandboxes so the dedupe in publish_suspended doesn't apply
     // — these are direct-SQL inserts so dedupe never fires anyway. Fine.
-    let store = LocalArtifacts::new(Arc::new(Mutex::new(conn)));
+    let store = LocalArtifacts::new(crate::db::SharedConnection::new(conn));
 
     // Path A: release() — must bump last_touched_at.
     let lease_a = store.check_out_for_restore(artifact_id(id_a)).unwrap();
@@ -413,7 +412,7 @@ fn restore_lease_release_bumps_last_touched_at_but_drop_does_not() {
 #[test]
 fn check_out_returns_not_found_for_missing_row() {
     let conn = open_test_db();
-    let store = LocalArtifacts::new(Arc::new(Mutex::new(conn)));
+    let store = LocalArtifacts::new(crate::db::SharedConnection::new(conn));
     let attempt = store.check_out_for_restore(artifact_id("01939e3e-6666-7000-8000-000000000001"));
     assert!(matches!(attempt, Err(CheckoutError::NotFound(_))));
 }
@@ -432,7 +431,7 @@ fn artifact_state_round_trips_via_from_str() {
         .expect_err("bogus artifact state must fail to parse");
 }
 
-fn force_state(conn: &Arc<Mutex<Connection>>, id: &str, state: &str) {
+fn force_state(conn: &crate::db::SharedConnection, id: &str, state: &str) {
     conn.lock()
         .unwrap()
         .execute(
@@ -450,8 +449,8 @@ fn recover_resets_restoring_rows_to_ready() {
     let conn = open_test_db();
     let id = "01939e3e-8881-7000-8000-000000000001";
     insert_row(&conn, id, "sbx-r1", "/tmp/recover-restoring");
-    let db = Arc::new(Mutex::new(conn));
-    let store = LocalArtifacts::new(Arc::clone(&db));
+    let db = crate::db::SharedConnection::new(conn);
+    let store = LocalArtifacts::new(db.clone());
     force_state(&db, id, "restoring");
 
     let report = store.recover_stuck_states().unwrap();
@@ -474,8 +473,8 @@ fn recover_rolls_back_deleting_when_original_bytes_intact() {
 
     let id = "01939e3e-8882-7000-8000-000000000001";
     insert_row(&conn, id, "sbx-r2", &local_path);
-    let db = Arc::new(Mutex::new(conn));
-    let store = LocalArtifacts::new(Arc::clone(&db));
+    let db = crate::db::SharedConnection::new(conn);
+    let store = LocalArtifacts::new(db.clone());
     force_state(&db, id, "deleting");
 
     let report = store.recover_stuck_states().unwrap();
@@ -499,8 +498,8 @@ fn recover_finishes_delete_when_staging_dir_present() {
     std::fs::create_dir_all(format!("{local_path}.gc-pending-{id}")).unwrap();
 
     insert_row(&conn, id, "sbx-r3", &local_path);
-    let db = Arc::new(Mutex::new(conn));
-    let store = LocalArtifacts::new(Arc::clone(&db));
+    let db = crate::db::SharedConnection::new(conn);
+    let store = LocalArtifacts::new(db.clone());
     force_state(&db, id, "deleting");
 
     let report = store.recover_stuck_states().unwrap();
@@ -525,8 +524,8 @@ fn recover_finishes_delete_when_neither_path_present() {
     let id = "01939e3e-8884-7000-8000-000000000001";
 
     insert_row(&conn, id, "sbx-r4", &local_path);
-    let db = Arc::new(Mutex::new(conn));
-    let store = LocalArtifacts::new(Arc::clone(&db));
+    let db = crate::db::SharedConnection::new(conn);
+    let store = LocalArtifacts::new(db.clone());
     force_state(&db, id, "deleting");
 
     let report = store.recover_stuck_states().unwrap();
@@ -567,8 +566,8 @@ fn prune_missing_orphan_rows_deletes_only_missing_unowned_rows() {
         [],
     )
     .unwrap();
-    let db = Arc::new(Mutex::new(conn));
-    let store = LocalArtifacts::new(Arc::clone(&db));
+    let db = crate::db::SharedConnection::new(conn);
+    let store = LocalArtifacts::new(db.clone());
 
     let pruned = store.prune_missing_orphan_rows(10).unwrap();
 
@@ -585,8 +584,8 @@ fn prune_missing_orphan_rows_obeys_batch_limit() {
     let second = "01939e3e-8891-7000-8000-000000000002";
     insert_row(&conn, first, "sbx-orphan-1", "/tmp/space-orphan-1");
     insert_row(&conn, second, "sbx-orphan-2", "/tmp/space-orphan-2");
-    let db = Arc::new(Mutex::new(conn));
-    let store = LocalArtifacts::new(Arc::clone(&db));
+    let db = crate::db::SharedConnection::new(conn);
+    let store = LocalArtifacts::new(db.clone());
 
     assert_eq!(store.prune_missing_orphan_rows(1).unwrap(), 1);
     assert_eq!(store.prune_missing_orphan_rows(1).unwrap(), 1);
@@ -629,8 +628,8 @@ fn prune_missing_orphan_rows_advances_past_preserved_rows_and_wraps() {
         "missing",
         tmp.path().join("missing").to_str().unwrap(),
     );
-    let db = Arc::new(Mutex::new(conn));
-    let store = LocalArtifacts::new(Arc::clone(&db));
+    let db = crate::db::SharedConnection::new(conn);
+    let store = LocalArtifacts::new(db.clone());
 
     assert_eq!(store.prune_missing_orphan_rows(1).unwrap(), 0);
     insert_row(
@@ -665,7 +664,7 @@ fn prune_missing_orphan_rows_preserves_unreadable_paths() {
     loop_path.try_exists().unwrap_err();
     let id = "01939e3e-8893-7000-8000-000000000001";
     insert_row(&conn, id, "unreadable", loop_path.to_str().unwrap());
-    let store = LocalArtifacts::new(Arc::new(Mutex::new(conn)));
+    let store = LocalArtifacts::new(crate::db::SharedConnection::new(conn));
     assert_eq!(store.prune_missing_orphan_rows(1).unwrap(), 0);
     assert!(store.get(artifact_id(id)).unwrap().is_some());
 }
@@ -705,8 +704,8 @@ fn recover_pinned_deletion_requires_unambiguous_original_bytes() {
             params![id],
         )
         .unwrap();
-        let db = Arc::new(Mutex::new(conn));
-        let store = LocalArtifacts::new(Arc::clone(&db));
+        let db = crate::db::SharedConnection::new(conn);
+        let store = LocalArtifacts::new(db.clone());
         force_state(&db, id, "deleting");
 
         let report = store.recover_stuck_states().unwrap();
@@ -923,7 +922,7 @@ fn list_pending_backups_returns_exactly_the_unbacked_pinned_artifacts() {
     // A running sandbox pins nothing and holds nothing.
     insert_pinned_sandbox(&conn, "sbx-running", None);
 
-    let store = LocalArtifacts::new(Arc::new(Mutex::new(conn)));
+    let store = LocalArtifacts::new(crate::db::SharedConnection::new(conn));
 
     let pending = store.list_pending_backups().unwrap();
 
@@ -956,8 +955,8 @@ fn list_pending_backups_follows_the_pin_not_the_sandbox_id() {
         Some("2026-09-19T00:00:00Z"),
     );
     insert_pinned_sandbox(&conn, "sbx-repin", Some((pinned, "full", "suspend")));
-    let db = Arc::new(Mutex::new(conn));
-    let store = LocalArtifacts::new(Arc::clone(&db));
+    let db = crate::db::SharedConnection::new(conn);
+    let store = LocalArtifacts::new(db.clone());
 
     assert_eq!(store.list_pending_backups().unwrap(), Vec::new());
 
@@ -1005,7 +1004,7 @@ fn list_pending_backups_reports_a_pin_owned_by_another_sandbox() {
         "sbx-borrower",
         Some((owned_by_other, "full", "suspend")),
     );
-    let store = LocalArtifacts::new(Arc::new(Mutex::new(conn)));
+    let store = LocalArtifacts::new(crate::db::SharedConnection::new(conn));
 
     assert_eq!(
         store.list_pending_backups().unwrap(),
@@ -1040,7 +1039,7 @@ fn list_pending_backups_reports_a_pin_whose_artifact_row_is_gone() {
         Some("2026-09-19T00:00:00Z"),
     );
     insert_pinned_sandbox(&conn, "sbx-healthy", Some((healthy, "full", "suspend")));
-    let store = LocalArtifacts::new(Arc::new(Mutex::new(conn)));
+    let store = LocalArtifacts::new(crate::db::SharedConnection::new(conn));
 
     assert_eq!(
         store.list_pending_backups().unwrap(),
@@ -1085,12 +1084,12 @@ fn list_pending_backups_fails_rather_than_dropping_an_undecodable_row() {
     );
     conn.pragma_update(None, "ignore_check_constraints", false)
         .unwrap();
-    let store = LocalArtifacts::new(Arc::new(Mutex::new(conn)));
+    let store = LocalArtifacts::new(crate::db::SharedConnection::new(conn));
 
     let error = store.list_pending_backups().unwrap_err();
 
     assert!(
-        matches!(error, rusqlite::Error::FromSqlConversionFailure(..)),
+        error.conversion_failure().is_some(),
         "expected a decode failure, got {error:?}"
     );
 }

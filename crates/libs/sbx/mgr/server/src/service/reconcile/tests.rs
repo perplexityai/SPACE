@@ -12,7 +12,7 @@ async fn dirty_outbox_poison_requests_fatal_service_drain_without_unwinding_call
             ..SandboxManagerServiceOptions::for_test()
         },
     );
-    let db = Arc::clone(&service.db);
+    let db = service.db.clone();
     assert!(
         std::thread::spawn(move || {
             let _guard = db.lock().unwrap();
@@ -283,13 +283,14 @@ async fn auto_lifecycle_error_takes_the_storage_keyed_wake_lock() {
 
 #[tokio::test]
 async fn auto_lifecycle_error_after_row_removal_does_not_scan_inventory() {
-    use rusqlite::trace::{TraceEvent, TraceEventCodes};
+    use crate::db::fixture::{TraceEvent, TraceEventCodes};
     use std::sync::atomic::{AtomicUsize, Ordering};
     static STEPS: AtomicUsize = AtomicUsize::new(0);
     fn trace(event: TraceEvent<'_>) {
         if let TraceEvent::Profile(statement, _) = event {
             STEPS.fetch_add(
-                usize::try_from(statement.get_status(rusqlite::StatementStatus::VmStep)).unwrap(),
+                usize::try_from(statement.get_status(crate::db::fixture::StatementStatus::VmStep))
+                    .unwrap(),
                 Ordering::Relaxed,
             );
         }
@@ -805,7 +806,7 @@ const STOP_WRITE_WAIT: Duration = Duration::from_secs(30);
 async fn stop_suspended_with_concurrent_write(
     service: &SandboxManagerService,
     id: &str,
-    move_row: impl FnOnce(&rusqlite::Connection),
+    move_row: impl FnOnce(&crate::db::Connection),
 ) -> (
     Result<(), Status>,
     crate::db::tests::state_write_fixtures::Snapshot,
@@ -917,7 +918,7 @@ async fn stop_admitted_during_auto_lifecycle_stop_keeps_its_completion() {
 
     let (result, before) = stop_suspended_with_concurrent_write(&service, &id, |db| {
         // Stop admission's state write. A blocking Stop persists no intent.
-        let admission = crate::db::immediate_transaction(db).unwrap();
+        let admission = crate::db::Transaction::immediate(db).unwrap();
         crate::db::update_state_superseding_activation_in_transaction(
             &admission,
             &id,
@@ -967,7 +968,7 @@ async fn delete_admitted_during_auto_lifecycle_stop_keeps_its_row() {
 
     let (result, before) = stop_suspended_with_concurrent_write(&service, &id, |db| {
         // A non-blocking Delete's admission transaction.
-        let admission = crate::db::immediate_transaction(db).unwrap();
+        let admission = crate::db::Transaction::immediate(db).unwrap();
         crate::db::update_state_superseding_activation_in_transaction(
             &admission,
             &id,

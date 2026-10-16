@@ -244,7 +244,7 @@ pub(super) enum OrphanedSandboxRowMaterializationError {
     #[error("cannot inspect sandbox filesystem evidence: {0}")]
     Filesystem(#[from] std::io::Error),
     #[error(transparent)]
-    Sqlite(#[from] rusqlite::Error),
+    Sqlite(#[from] crate::db::Error),
     #[error(transparent)]
     Quarantine(#[from] crate::db::MarkQuarantinedError),
     #[error(transparent)]
@@ -498,7 +498,7 @@ impl CommittedOrphanRowMaterialization {
 }
 
 fn insert_orphaned_sandbox_row_in_transaction(
-    conn: &rusqlite::Connection,
+    conn: &crate::db::Connection,
     sandbox_id: SandboxId,
     has_cache_root: bool,
     has_live_runtime: bool,
@@ -707,7 +707,7 @@ pub(super) fn reclaim_abandoned_restore_metadata_staging<StagingGuard>(
 pub(super) trait InventoryDbAccess {
     fn with_connection<T>(
         &self,
-        operation: impl FnOnce(&rusqlite::Connection) -> T,
+        operation: impl FnOnce(&crate::db::Connection) -> T,
     ) -> Result<T, InventoryError>;
 }
 
@@ -716,7 +716,7 @@ pub enum InventoryError {
     #[error("inventory database mutex is poisoned")]
     DatabaseMutexPoisoned,
     #[error(transparent)]
-    Database(#[from] rusqlite::Error),
+    Database(#[from] crate::db::Error),
 }
 
 enum OrphanRowMaterialization {
@@ -732,19 +732,19 @@ enum StaleRowInventoryMutation {
     Database(crate::db::InventoryStaleRowMutation),
 }
 
-impl InventoryDbAccess for rusqlite::Connection {
+impl InventoryDbAccess for crate::db::Connection {
     fn with_connection<T>(
         &self,
-        operation: impl FnOnce(&rusqlite::Connection) -> T,
+        operation: impl FnOnce(&crate::db::Connection) -> T,
     ) -> Result<T, InventoryError> {
         Ok(operation(self))
     }
 }
 
-impl InventoryDbAccess for Mutex<rusqlite::Connection> {
+impl InventoryDbAccess for crate::db::SharedConnection {
     fn with_connection<T>(
         &self,
-        operation: impl FnOnce(&rusqlite::Connection) -> T,
+        operation: impl FnOnce(&crate::db::Connection) -> T,
     ) -> Result<T, InventoryError> {
         let conn = self
             .lock()
@@ -1230,7 +1230,7 @@ where
                 if SandboxInventoryPresence::inspect(paths, *sandbox_id)? != observed_presence {
                     return Ok(OrphanRowMaterialization::InventoryChanged);
                 }
-                let tx = crate::db::immediate_transaction(conn)?;
+                let tx = crate::db::Transaction::immediate(conn)?;
                 if crate::db::get_sandbox(&tx, &sandbox_id_string)?.is_some() {
                     return Ok(OrphanRowMaterialization::DatabaseRowAppeared);
                 }
@@ -1357,7 +1357,7 @@ pub(super) fn inventory_execution_for_test(_: SandboxId) -> Result<Option<Execut
 
 #[cfg(test)]
 pub(super) fn reconcile_sandbox_inventory_in(
-    conn: &rusqlite::Connection,
+    conn: &crate::db::Connection,
     cache_dir: &Path,
     run_dir: &Path,
     source: ReconcileSource,
@@ -1405,7 +1405,7 @@ impl SandboxManagerService {
         let reconcile_result = self.apply_route_identity_mutations("inventory_reconcile", || {
             let observe_execution = self.orphan_execution_observer();
             let report = reconcile_sandbox_inventory_ids(
-                self.db.as_ref(),
+                &self.db,
                 SandboxInventoryPaths::new(Path::new(CACHE_DIR), Path::new(RUN_DIR)),
                 disk_ids,
                 live_ids,
@@ -1468,9 +1468,9 @@ impl SandboxManagerService {
 
     pub(super) fn retire_absent_sandbox_policy(
         &self,
-        db: &rusqlite::Connection,
+        db: &crate::db::Connection,
         sandbox_id: &str,
-    ) -> rusqlite::Result<()> {
+    ) -> crate::db::Result<()> {
         // The caller keeps SQLite locked through retirement, excluding a
         // same-ID insertion and its new policy obligation.
         if !crate::db::sandbox_exists(db, sandbox_id)? {

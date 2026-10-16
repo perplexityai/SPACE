@@ -379,7 +379,7 @@ fn snapshot_retry_handles_either_retained_half_without_replacing_published_files
 
 struct ImportFixture {
     _root: tempfile::TempDir,
-    db: rusqlite::Connection,
+    db: crate::db::Connection,
     id: String,
     binding: TransferBinding,
     staging: PathBuf,
@@ -470,7 +470,7 @@ impl ImportFixture {
                 ))
             })
             .unwrap()
-            .collect::<rusqlite::Result<_>>()
+            .collect::<Result<_, _>>()
             .unwrap()
     }
 
@@ -642,7 +642,7 @@ fn snapshot_publication_refuses_a_catalog_entry_it_does_not_own() {
             .db
             .execute(
                 "UPDATE local_artifacts SET state = ?1 WHERE sandbox_id = ?2",
-                rusqlite::params![state.as_str(), fixture.id],
+                crate::db::fixture::params![state.as_str(), fixture.id],
             )
             .unwrap();
 

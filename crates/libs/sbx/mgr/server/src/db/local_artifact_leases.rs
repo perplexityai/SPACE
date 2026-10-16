@@ -2,10 +2,11 @@
 //! restore and delete leases. Each runs on the connection or transaction its
 //! caller holds, so a checkout's reads and its CAS share one transaction.
 
+use crate::db::{Connection, Error, OptionalExtension, Result};
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{ArtifactKind, LocalArtifactId, SnapshotName};
 use pplx_space_common_svc::sql::sqlite::SqliteU64;
-use rusqlite::{Connection, OptionalExtension, Result, params};
+use rusqlite::params;
 
 use crate::db::timestamps::EpochSeconds;
 
@@ -120,7 +121,8 @@ pub(crate) fn list_pending_backups(conn: &Connection) -> Result<Vec<PendingBacku
             })?,
         })
     })?
-    .collect()
+    .collect::<rusqlite::Result<_>>()
+    .map_err(crate::db::Error::from)
 }
 
 /// A sandbox's named-snapshot artifacts, within the inventory read budget.
@@ -260,12 +262,13 @@ pub(crate) fn reset_restoring_artifacts(conn: &Connection) -> Result<usize> {
 
 /// `(local_artifact_id, local_path)` of every `deleting` row.
 pub(crate) fn list_deleting_artifacts(conn: &Connection) -> Result<Vec<(String, String)>> {
-    conn.prepare(
-        "SELECT local_artifact_id, local_path FROM local_artifacts
+    Ok(conn
+        .prepare(
+            "SELECT local_artifact_id, local_path FROM local_artifacts
          WHERE state = 'deleting'",
-    )?
-    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-    .collect::<Result<_>>()
+        )?
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<_>>()?)
 }
 
 /// CAS `deleting` → `ready`; the number of rows changed.
@@ -348,20 +351,22 @@ pub(crate) fn orphan_scan_rows(
     through: i64,
     limit: i64,
 ) -> Result<Vec<(i64, OrphanScanRow)>> {
-    conn.prepare(
-        "SELECT la.rowid, la.local_artifact_id, la.local_path,
+    Ok(conn
+        .prepare(
+            "SELECT la.rowid, la.local_artifact_id, la.local_path,
                 EXISTS (SELECT 1 FROM sandboxes s WHERE s.id = la.sandbox_id)
            FROM local_artifacts la
           WHERE la.rowid >= ?1 AND la.rowid <= ?2
           ORDER BY la.rowid LIMIT ?3",
-    )?
-    .query_map(params![next, through, limit], |row| {
-        let decoded = (|| -> rusqlite::Result<(String, String, bool)> {
-            Ok((row.get(1)?, row.get(2)?, row.get(3)?))
-        })();
-        Ok((row.get::<_, i64>(0)?, decoded))
-    })?
-    .collect::<Result<Vec<_>>>()
+        )?
+        .query_map(params![next, through, limit], |row| {
+            let decoded = (|| -> rusqlite::Result<(String, String, bool)> {
+                Ok((row.get(1)?, row.get(2)?, row.get(3)?))
+            })()
+            .map_err(Error::from);
+            Ok((row.get::<_, i64>(0)?, decoded))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// Delete the artifact row if its sandbox row is gone; the number deleted.

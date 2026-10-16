@@ -82,10 +82,10 @@ pub fn rowless_restore_transfer_scopes(
             Ok(scope) => scopes.push(scope),
             Err(error) if is_row_decode_error(&error) => tracing::warn!(
                 sandbox_id = ?row.get_ref(0)?,
-                error = %describe_error(&error),
+                error = %describe_raw_error(&error),
                 "retaining malformed rowless restore scope; operator repair required"
             ),
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         }
     }
     Ok(scopes)

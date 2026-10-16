@@ -66,7 +66,7 @@ struct RouteTestService {
 }
 
 impl RouteTestService {
-    fn new(conn: rusqlite::Connection) -> Self {
+    fn new(conn: crate::db::Connection) -> Self {
         let sockets = tempfile::tempdir().unwrap();
         let shutdown = CancellationToken::new();
         let tasks = TaskTracker::new();
@@ -102,7 +102,7 @@ impl std::ops::Deref for RouteTestService {
 }
 
 fn insert_sandbox(
-    conn: &rusqlite::Connection,
+    conn: &crate::db::Connection,
     sandbox_id: SandboxId,
     state: SandboxState,
     pool_template: Option<&str>,
@@ -166,7 +166,7 @@ fn kubernetes_identity(sandbox_id: SandboxId, generation: u64) -> SpaceApiRouteI
 
 /// A started Kubernetes row whose complete route identity was recorded
 /// without cluster fencing.
-fn started_unfenced_sandbox(conn: &rusqlite::Connection) -> (SandboxId, SpaceApiRouteIdentity) {
+fn started_unfenced_sandbox(conn: &crate::db::Connection) -> (SandboxId, SpaceApiRouteIdentity) {
     let sandbox_id = SandboxId::new();
     insert_sandbox(
         conn,
@@ -684,7 +684,7 @@ async fn resident_resume_refusal_status_for_every_state() {
         .unwrap();
         conn.execute(
             "UPDATE sandboxes SET state = ?1 WHERE id = ?2",
-            rusqlite::params![state.as_str(), sandbox_id.to_string()],
+            crate::db::fixture::params![state.as_str(), sandbox_id.to_string()],
         )
         .unwrap();
         let service = RouteTestService::new(conn);

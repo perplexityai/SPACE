@@ -171,7 +171,7 @@ pub struct RawQuarantineRecoveryObservation {
 }
 
 pub type RawQuarantineRecoveryObservationRead =
-    std::result::Result<RawQuarantineRecoveryObservation, rusqlite::Error>;
+    std::result::Result<RawQuarantineRecoveryObservation, Error>;
 
 pub fn is_orphan_quarantine_recovery_state(
     conn: &Connection,
@@ -319,7 +319,7 @@ pub fn quarantine_recovery_observations(
             }
             Ok(Some((_, None)) | None) => {}
             Err(error) => {
-                observations.insert(sandbox_id.clone(), Err(error));
+                observations.insert(sandbox_id.clone(), Err(error.into()));
             }
         }
     }
@@ -419,7 +419,7 @@ pub fn scan_quarantine_recovery_candidates(conn: &Connection) -> Result<Quaranti
 pub(super) fn decode_quarantine_recovery_row(
     row: &rusqlite::Row<'_>,
     current_epoch: i64,
-) -> Result<QuarantineRecoveryRow> {
+) -> rusqlite::Result<QuarantineRecoveryRow> {
     // Read beside the decoded columns rather than among them: `last_error` is
     // diagnostic text with no validation, so a value it cannot parse only
     // means no stop is recorded, never a malformed row.
@@ -740,7 +740,7 @@ pub fn rearm_stopped_quarantine_recoveries(conn: &Connection) -> Result<usize> {
                 ))
             },
         )?;
-        rows.collect::<Result<Vec<_>>>()?
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
     let updated_at = now_epoch_i64()?;
     let mut rearmed = 0;
@@ -1108,8 +1108,8 @@ pub fn quarantine_recovery_claim_is_current(
         fence.quarantine_row_predicate("qs."),
         fence.sandbox_guards("qs.sandbox_id"),
     );
-    conn.prepare_cached(&sql)?
-        .query_row(&fence.binds()[..], |row| row.get(0))
+    let mut statement = conn.prepare_cached(&sql)?;
+    Ok(statement.query_row(&fence.binds()[..], |row| row.get(0))?)
 }
 
 fn quarantine_recovery_backoff(local_quarantine_id: uuid::Uuid, attempt_count: u32) -> Duration {

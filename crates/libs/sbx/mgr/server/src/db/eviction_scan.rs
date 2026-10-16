@@ -1,8 +1,9 @@
 //! Suspended-sandbox reads behind `crate::sandbox_eviction`'s candidate
 //! scans and local eviction evidence.
 
+use crate::db::{Connection, OptionalExtension, Result};
 use pplx_space_common_svc::sql::sqlite::SqliteU64;
-use rusqlite::{Connection, OptionalExtension, Result, params};
+use rusqlite::params;
 
 use crate::db::timestamps::EpochSeconds;
 
@@ -107,7 +108,7 @@ pub(crate) fn idle_suspended_candidates(
                 Ok((sandbox_id, idle_witness_secs))
             },
         )?
-        .collect::<Result<_>>()?;
+        .collect::<rusqlite::Result<_>>()?;
     Ok(rows)
 }
 
@@ -145,7 +146,7 @@ pub(crate) fn legacy_reupload_candidates(
             params![SqliteU64(idle_cutoff_epoch_secs), limit as i64],
             |r| r.get(0),
         )?
-        .collect::<Result<_>>()?;
+        .collect::<rusqlite::Result<_>>()?;
     Ok(rows)
 }
 

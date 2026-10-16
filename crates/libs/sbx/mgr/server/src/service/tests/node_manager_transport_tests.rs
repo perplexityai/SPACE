@@ -23,7 +23,7 @@ use pplx_space_node_mgr_client::proto::{
 
 /// A test service whose node-manager clients all come from `node_manager`.
 pub(crate) fn service_with_node_manager(
-    conn: rusqlite::Connection,
+    conn: crate::db::Connection,
     node_manager: NodeManagerConnector,
 ) -> SandboxManagerService {
     SandboxManagerService::new_with_options(
@@ -124,7 +124,7 @@ async fn fatal_kill_signal_failure_still_schedules_admitted_cleanup() {
 /// A suspending encrypted row whose capture was recorded `age` ago and never
 /// sealed: its staging holds only the record, built from real metadata.
 fn record_encrypted_capture(
-    conn: &rusqlite::Connection,
+    conn: &crate::db::Connection,
     cache: &Path,
     id: &str,
     age: std::time::Duration,
@@ -454,7 +454,7 @@ async fn stats_answers_without_cgroup_figures_while_node_manager_is_down() {
         "UPDATE sandboxes
          SET uid = 10000, slot = 7, network_tx_bytes = 1234, network_rx_bytes = 5678
          WHERE id = ?1",
-        rusqlite::params![sandbox_id],
+        crate::db::fixture::params![sandbox_id],
     )
     .unwrap();
     let service = service_with_node_manager(
@@ -520,7 +520,7 @@ async fn stats_answers_without_cgroup_figures_when_node_manager_stalls() {
     insert_test_sandbox(&conn, &sandbox_id, SandboxState::Started);
     conn.execute(
         "UPDATE sandboxes SET uid = 10000, slot = 7 WHERE id = ?1",
-        rusqlite::params![sandbox_id],
+        crate::db::fixture::params![sandbox_id],
     )
     .unwrap();
     let node_manager = StalledNodeManager::bind();

@@ -345,7 +345,7 @@ fn rollback_replaces_optional_sidecars_or_reports_unremovable_stale_evidence() {
     }
 }
 
-fn sandbox_state(conn: &rusqlite::Connection, id: &str) -> SandboxState {
+fn sandbox_state(conn: &crate::db::Connection, id: &str) -> SandboxState {
     crate::db::get_sandbox(conn, id).unwrap().unwrap().state
 }
 

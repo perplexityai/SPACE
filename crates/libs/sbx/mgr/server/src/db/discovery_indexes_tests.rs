@@ -42,7 +42,7 @@ fn host_process_and_artifact_path_lookups_use_nonunique_indexes() {
             .unwrap()
             .query_map([], |row| row.get::<_, String>(3))
             .unwrap()
-            .collect::<Result<Vec<_>>>()
+            .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert!(
             details

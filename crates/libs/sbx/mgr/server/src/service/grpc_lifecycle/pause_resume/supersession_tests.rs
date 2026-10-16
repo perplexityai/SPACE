@@ -151,7 +151,7 @@ enum Interleave {
 }
 
 impl Interleave {
-    fn apply(self, conn: &rusqlite::Connection, id: &str) {
+    fn apply(self, conn: &crate::db::Connection, id: &str) {
         match self {
             Self::Stop => stop(conn, id),
             Self::Force(SandboxState::Pausing) => {}
@@ -281,7 +281,7 @@ async fn check_pause(exit: Exit, interleave: Interleave, found: SandboxState) {
     let interleaved = Arc::new(Mutex::new(None::<Snapshot>));
     let prepare: GuestPreparation = {
         let (calls, interleaved) = (Arc::clone(&calls), Arc::clone(&interleaved));
-        let db = Arc::clone(&service.db);
+        let db = service.db.clone();
         Arc::new(move |sandbox_id| {
             let call = calls.fetch_add(1, Ordering::SeqCst) + 1;
             let last = call == exit.interleaved_preparation();
@@ -347,7 +347,7 @@ fn assert_outcome(
     case: &str,
     expected: Expected,
     result: Result<Response<PauseResponse>, Status>,
-    db: &rusqlite::Connection,
+    db: &crate::db::Connection,
     id: &str,
     interleaved: &Snapshot,
 ) {

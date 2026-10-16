@@ -71,7 +71,7 @@ pub struct InsertSandboxParams<'a> {
 #[derive(Debug, thiserror::Error)]
 pub enum RestoreAdoptOrphanInsertError {
     #[error(transparent)]
-    Sqlite(#[from] rusqlite::Error),
+    Sqlite(#[from] Error),
     #[error("restore sandbox row state must be restoring, got {state}")]
     NonRestoringState { state: SandboxState },
     #[error("existing sandbox row for id {id} is not a recoverable synthetic orphan")]
@@ -81,7 +81,7 @@ pub enum RestoreAdoptOrphanInsertError {
 #[derive(Debug, thiserror::Error)]
 pub enum InsertRecoveredSuspendedSandboxError {
     #[error(transparent)]
-    Db(#[from] rusqlite::Error),
+    Db(#[from] Error),
     #[error("recovered suspended sandbox insert must use suspended state, got {state}")]
     NonSuspendedInsert { state: SandboxState },
     #[error("recovered suspended sandbox artifact pin updated {changed} rows instead of one")]
@@ -110,7 +110,7 @@ pub(crate) fn sandbox_lifecycle_counts(conn: &Connection) -> Result<Vec<SandboxL
         let count = row.get::<_, SqliteU64>(1)?.0;
         Ok(SandboxLifecycleCount { state, count })
     })?;
-    rows.collect()
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 pub(crate) fn current_state_label(conn: &Connection, id: &str) -> Result<Option<String>> {
@@ -275,7 +275,7 @@ pub(crate) fn node_execution_fence(
             previous.map(parse).transpose()?,
         ))),
         None if previous.is_none() => Ok(None),
-        None => Err(rusqlite::Error::InvalidQuery),
+        None => Err(Error::invalid_query()),
     }
 }
 
@@ -288,14 +288,15 @@ pub(crate) fn unbound_node_executions(conn: &Connection) -> Result<Vec<String>> 
             [pplx_space_node_mgr_client::execution_fence::EXECUTION_PREFLIGHT_LIMIT as i64],
             |row| row.get(0),
         )?
-        .collect()
+        .collect::<rusqlite::Result<_>>()
+        .map_err(Error::from)
 }
 
 /// Import receiver authority only while inserting a previously absent orphan
 /// row in this transaction. Never use inspection to re-authorize a rejected
 /// cleanup of an existing row: the receiver may own a successor execution.
 pub(crate) fn inherit_orphan_node_execution(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Transaction<'_>,
     sandbox_id: &str,
     fence: pplx_space_node_mgr_client::execution_fence::ExecutionFence,
 ) -> Result<()> {
@@ -310,7 +311,7 @@ pub(crate) fn inherit_orphan_node_execution(
         ],
     )?;
     if changed != 1 {
-        return Err(rusqlite::Error::QueryReturnedNoRows);
+        return Err(Error::no_rows());
     }
     Ok(())
 }
@@ -324,7 +325,7 @@ pub(crate) fn acknowledge_node_cleanup(
     retained: Option<SandboxActivationAttemptId>,
 ) -> Result<bool> {
     if retained.is_some_and(|id| !expected.owns(id)) {
-        return Err(rusqlite::Error::InvalidQuery);
+        return Err(Error::invalid_query());
     }
     Ok(conn.execute(
         "UPDATE sandboxes SET node_execution_id = ?4, previous_node_execution_id = NULL,
@@ -365,11 +366,9 @@ pub(super) fn upsert_sandbox_execution_metadata_in_transaction(
         .parse::<RuntimeKind>()
         .is_ok_and(|runtime| runtime == execution.runtime().kind);
     if !runtime_matches {
-        return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "sandbox runtime column disagrees with execution metadata",
-            ),
+        return Err(Error::to_sql_conversion(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "sandbox runtime column disagrees with execution metadata",
         )));
     }
 
@@ -472,19 +471,18 @@ pub(crate) fn restore_adopt_orphan_or_insert_sandbox_in_transaction(
         return Err(RestoreAdoptOrphanInsertError::NonRestoringState { state });
     }
     let ts = now()?;
-    let process_env_json = serde_json::to_string(process_env)
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-    let auto_lifecycle_json = serde_json::to_string(auto_lifecycle)
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    let process_env_json = serde_json::to_string(process_env).map_err(Error::to_sql_conversion)?;
+    let auto_lifecycle_json =
+        serde_json::to_string(auto_lifecycle).map_err(Error::to_sql_conversion)?;
     let auto_lifecycle_state = initial_auto_lifecycle_state(auto_lifecycle, state);
-    let auto_lifecycle_state_json = serde_json::to_string(&auto_lifecycle_state)
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    let auto_lifecycle_state_json =
+        serde_json::to_string(&auto_lifecycle_state).map_err(Error::to_sql_conversion)?;
     let network_policy_override_json = network_policy_override
         .map(serde_json::to_string)
         .transpose()
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        .map_err(Error::to_sql_conversion)?;
     let orphan_auto_lifecycle_json = serde_json::to_string(&AutoLifecyclePolicy::disabled())
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        .map_err(Error::to_sql_conversion)?;
 
     let rows_affected = conn.execute(
         "INSERT INTO sandboxes (id, uuid8, state, template, template_hash, user, runtime, snapshots_enabled, rootfs_size_mb, pool_template, process_env_json, auto_lifecycle_json, auto_lifecycle_state_json, next_auto_event_at, network_policy_override_json, network_policy_generation, network_policy_authority, auto_lifecycle_authority, volume_encryption, created_at, updated_at, state_changed_at, restore_origin, restore_phase, restore_storage_uri, disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec, node_execution_id, node_execution_retired)
@@ -682,7 +680,7 @@ pub fn sandbox_state_changed_at(
     let rows = statement.query_map(rusqlite::params_from_iter(sandbox_ids), |row| {
         Ok((row.get(0)?, timestamps::diagnostic_column(row, 1)?))
     })?;
-    rows.collect()
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// Read one row's `state_changed_at` exactly as stored.
@@ -1024,9 +1022,7 @@ pub fn runtime_execution_generation(
     generation
         .map(ExecutionGeneration::new)
         .transpose()
-        .map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(0, Type::Integer, Box::new(error))
-        })
+        .map_err(|error| Error::decode(0, Type::Integer, error))
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1042,7 +1038,7 @@ pub struct ActivationRouteProvenance {
 fn activation_route_provenance_from_row(
     row: &rusqlite::Row<'_>,
     offset: usize,
-) -> Result<ActivationRouteProvenance> {
+) -> rusqlite::Result<ActivationRouteProvenance> {
     let values = (
         row.get::<_, Option<SqliteU64>>(offset)?
             .map(|value| value.0),
@@ -1145,10 +1141,10 @@ pub fn activation_route_provenance_for_sandboxes(
     let rows = statement.query_map(rusqlite::params_from_iter(sandbox_ids), |row| {
         Ok((
             row.get::<_, String>(0)?,
-            activation_route_provenance_from_row(row, 1),
+            activation_route_provenance_from_row(row, 1).map_err(Error::from),
         ))
     })?;
-    rows.collect()
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 pub fn clear_runtime_fields(conn: &Connection, id: &str) -> Result<()> {
@@ -1185,7 +1181,7 @@ pub fn get_sandbox(conn: &Connection, id: &str) -> Result<Option<SandboxRow>> {
     // SELECT each time dominated that work.
     let mut stmt = conn.prepare_cached(GET_SANDBOX_SQL)?;
     let mut rows = stmt.query_map(params![id], row_to_sandbox)?;
-    rows.next().transpose()
+    rows.next().transpose().map_err(Error::from)
 }
 
 /// Select at most two identities: two matches prove ambiguity without decoding
@@ -1214,7 +1210,7 @@ const LIST_SANDBOXES_SQL: &str =
 pub fn list_sandboxes(conn: &Connection) -> Result<Vec<SandboxRow>> {
     let mut stmt = conn.prepare(LIST_SANDBOXES_SQL)?;
     let rows = stmt.query_map([], row_to_sandbox)?;
-    rows.collect()
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 pub fn list_sandboxes_for_recovery(conn: &Connection) -> Result<Vec<SandboxRow>> {
@@ -1226,10 +1222,10 @@ pub fn list_sandboxes_for_recovery(conn: &Connection) -> Result<Vec<SandboxRow>>
             Ok(row) => valid.push(row),
             Err(error) if is_row_decode_error(&error) => tracing::warn!(
                 sandbox_id = ?row.get_ref(0)?,
-                error = %describe_error(&error),
+                error = %describe_raw_error(&error),
                 "skipping undecodable sandbox row during local recovery"
             ),
-            Err(error) => return Err(error),
+            Err(error) => return Err(Error::from(error)),
         }
     }
     Ok(valid)
@@ -1296,7 +1292,7 @@ pub(crate) fn periodic_lifecycle_recovery_batch(
             (Err(error), _) | (_, Err(error)) => {
                 tracing::warn!(
                     rowid,
-                    error = %describe_error(&error),
+                    error = %describe_raw_error(&error),
                     "skipping undecodable sandbox key/state during periodic recovery"
                 );
                 continue;
@@ -1331,7 +1327,7 @@ pub(crate) fn periodic_lifecycle_recovery_batch(
 pub fn list_sandbox_id_states(conn: &Connection) -> Result<Vec<(String, String)>> {
     let mut statement = conn.prepare("SELECT id, state FROM sandboxes ORDER BY created_at")?;
     let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
-    rows.collect()
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// Host-control net-gateway auth lookup: rows whose registered
@@ -1359,7 +1355,7 @@ pub fn list_by_netgtw_pid_uid(
          LIMIT 2",
     )?;
     let rows = stmt.query_map(params![netgtw_pid, uid], row_to_sandbox)?;
-    rows.collect()
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// Host-control spaced-host auth lookup: rows whose registered
@@ -1377,14 +1373,12 @@ pub fn list_by_spaced_host_pid_uid(
     )?;
     let sandbox_ids = stmt
         .query_map(params![spaced_host_pid, uid], |row| row.get::<_, String>(0))?
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
 
     sandbox_ids
         .into_iter()
-        .map(|sandbox_id| {
-            get_sandbox(conn, &sandbox_id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
-        })
+        .map(|sandbox_id| get_sandbox(conn, &sandbox_id)?.ok_or(Error::no_rows()))
         .collect()
 }
 
@@ -1395,7 +1389,7 @@ pub fn list_by_state(conn: &Connection, state: SandboxState) -> Result<Vec<Sandb
          FROM sandboxes WHERE state = ?1",
     )?;
     let rows = stmt.query_map(params![state.as_str()], row_to_sandbox)?;
-    rows.collect()
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 pub fn delete_sandbox(conn: &Connection, id: &str) -> Result<()> {
@@ -1626,7 +1620,7 @@ pub fn update_netgtw_pid(conn: &Connection, id: &str, uid: u32, netgtw_pid: u32)
         params![uid, netgtw_pid, now()?, id],
     )?;
     if changed != 1 {
-        return Err(rusqlite::Error::QueryReturnedNoRows);
+        return Err(Error::no_rows());
     }
     Ok(())
 }
@@ -1651,7 +1645,7 @@ pub fn replace_netgtw_pid(
         params![netgtw_pid, now()?, id, uid, expected_netgtw_pid],
     )?;
     if changed != 1 {
-        return Err(rusqlite::Error::QueryReturnedNoRows);
+        return Err(Error::no_rows());
     }
     Ok(())
 }
@@ -1677,7 +1671,7 @@ pub fn update_spaced_host_pid(
         params![spaced_host_pid, now()?, id, uid, expected_spaced_host_pid],
     )?;
     if changed != 1 {
-        return Err(rusqlite::Error::QueryReturnedNoRows);
+        return Err(Error::no_rows());
     }
     Ok(())
 }

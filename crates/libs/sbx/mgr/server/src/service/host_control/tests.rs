@@ -83,7 +83,7 @@ fn policy_request() -> Request<GetNetworkPolicyRequest> {
     Request::new(GetNetworkPolicyRequest {})
 }
 
-fn set_generation(conn: &rusqlite::Connection, sandbox_id: SandboxId, generation: Option<i64>) {
+fn set_generation(conn: &crate::db::Connection, sandbox_id: SandboxId, generation: Option<i64>) {
     crate::db::update_space_api_route_identity(
         conn,
         sandbox_id,

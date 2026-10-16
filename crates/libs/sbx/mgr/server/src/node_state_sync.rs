@@ -6,10 +6,9 @@ use pplx_space_node_api_client::proto::{
     FacetRef, MarkFacetDirtyRequest, NetworkPolicyTargetRef, ReconcileFacet, facet_ref,
     network_policy_target_ref,
 };
-use rusqlite::Connection;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::OnceLock;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -30,8 +29,8 @@ pub(crate) struct DatabaseMutexPoisoned;
 /// supervised outbox worker, which observes the same poisoned connection and
 /// terminates the process through the normal ownership-preserving drain.
 pub(crate) fn connection_or_signal_failure(
-    db: &Mutex<Connection>,
-) -> Result<MutexGuard<'_, Connection>, DatabaseMutexPoisoned> {
+    db: &crate::db::SharedConnection,
+) -> Result<crate::db::ConnectionGuard<'_>, DatabaseMutexPoisoned> {
     db.lock().map_err(|_| {
         tracing::error!("sandbox database mutex poisoned; notifying supervised outbox worker");
         database_poison_notify().notify_one();
@@ -47,7 +46,7 @@ pub(crate) fn should_skip_node_publish<T>(request: &Request<T>) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case("true") || value == "1")
 }
 
-pub(crate) fn mark_sandbox_dirty(db: &Arc<Mutex<Connection>>, sandbox_id: &str) {
+pub(crate) fn mark_sandbox_dirty(db: &crate::db::SharedConnection, sandbox_id: &str) {
     if sandbox_id.trim().is_empty() {
         return;
     }
@@ -56,7 +55,7 @@ pub(crate) fn mark_sandbox_dirty(db: &Arc<Mutex<Connection>>, sandbox_id: &str) 
     }
 }
 
-pub(crate) fn mark_sandboxes_dirty<I>(db: &Arc<Mutex<Connection>>, sandbox_ids: I)
+pub(crate) fn mark_sandboxes_dirty<I>(db: &crate::db::SharedConnection, sandbox_ids: I)
 where
     I: IntoIterator<Item = String>,
 {
@@ -92,7 +91,7 @@ where
     }
 }
 
-fn enqueue_sandbox_inventory_dirty(db: &Arc<Mutex<Connection>>, sandbox_id: &str) -> bool {
+fn enqueue_sandbox_inventory_dirty(db: &crate::db::SharedConnection, sandbox_id: &str) -> bool {
     let Ok(db) = connection_or_signal_failure(db) else {
         return false;
     };
@@ -120,7 +119,7 @@ fn database_poison_notify() -> &'static Notify {
 }
 
 pub(crate) fn start_dirty_outbox_worker(
-    db: Arc<Mutex<Connection>>,
+    db: crate::db::SharedConnection,
     shutdown_token: CancellationToken,
     task_tracker: &TaskTracker,
     critical: crate::service::drain::CriticalTaskGuard,

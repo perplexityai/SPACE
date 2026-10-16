@@ -2,7 +2,8 @@
 
 use std::time::{Duration, Instant};
 
-use rusqlite::{Connection, Result, params};
+use crate::db::{Connection, Result};
+use rusqlite::params;
 
 use super::{
     QuarantineRecoveryCandidate, QuarantineRecoveryOwner, QuarantineRecoveryRow,

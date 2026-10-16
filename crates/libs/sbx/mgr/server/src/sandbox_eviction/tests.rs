@@ -1,5 +1,5 @@
+use crate::db::fixture::params;
 use pplx_space_common_core::types::{LocalArtifactId, SnapshotId};
-use rusqlite::params;
 
 use super::*;
 
@@ -1297,10 +1297,10 @@ fn gather_evidence_rejects_malformed_updated_at() {
 
     let error = gather_local_evidence(&conn, "sbx-malformed").unwrap_err();
 
-    assert!(matches!(
-        error,
-        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, _)
-    ));
+    assert_eq!(
+        error.conversion_failure(),
+        Some((1, crate::db::fixture::Type::Text))
+    );
 }
 
 /// The version-bound claim used by the cluster-deleted eviction RPC:
