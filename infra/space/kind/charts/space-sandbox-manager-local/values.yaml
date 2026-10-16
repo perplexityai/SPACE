@@ -151,6 +151,17 @@ snapshotReaper:
   graceSecs: "60"
   idleSecs: "120"
 
+# Test hook: one-shot restore-prepare faults for smoke scenarios. Every Kind
+# binary is built with `test-hooks`; release builds are not, and read no such
+# variable. A file in this directory named exactly after a sandbox id fails
+# that sandbox's next restore prepare once, after its activation claim, and is
+# removed when it fires (crates/libs/sbx/mgr/server/src/service/
+# restore_prepare_fault.rs). The directory is under the container's private
+# /tmp, so a marker never outlives its pod. The smoke fault operation
+# `arm_restore_prepare_fault` writes the markers. Empty renders no hook.
+testHooks:
+  restorePrepareFaultDir: /tmp/space-test-hooks/restore-prepare-fault
+
 # On SIGTERM sandbox-manager drains for up to 25 s before handing its mutex to
 # the successor, then spends up to another 25 s on in-flight RPCs
 # (crates/libs/sbx/mgr/server/src/run.rs): about 50 s, inside the shared

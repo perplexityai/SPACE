@@ -65,6 +65,9 @@ _DURATION_SECONDS = {
         # One Kind run: 16 s of phases (8.5 s suspend with the retried upload)
         # plus sandbox cleanup.
         "local.restarted_btrfs_send_is_rejected_and_retried": 30,
+        # Measured 165 s: the API holds the faulted connect 120 s before it
+        # answers, then the faulted pod is held 30 s for kubelet's late retries.
+        "local.restore_rollback_late_retry_keeps_original_snapshot": 170,
         "local.retention_claim_finish_forward": 80,
         "local.retention_restore_source_guard": 107,
         "local.snapshot_reaper_reclaims_backed_fork_snapshot": 147,

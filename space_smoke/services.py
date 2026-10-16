@@ -311,6 +311,7 @@ class SmokeServices:
             fixture._cold_create_observer = cast(Any, kind)
             fixture._cross_node_control = cast(Any, kind)
             fixture._concurrent_restore_control = cast(Any, kind)
+            fixture._restore_rollback_control = cast(Any, kind)
             fixture._rate_limiter_control = cast(Any, kind)
             fixture._node_group_control = cast(Any, kind)
             fixture._node_selector_extras_control = cast(Any, kind)

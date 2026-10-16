@@ -20,6 +20,7 @@ from urllib.request import Request, urlopen
 
 from space_smoke.capabilities import (
     ConcurrentRestoreControl,
+    RestoreRollbackControl,
     NodeDrainControl,
     NodeGroupControl,
     NodeFenceControl,
@@ -94,6 +95,7 @@ from space_smoke.adapters import (
     template_received_uuid,
 )
 from space_smoke.concurrent_restore import ConcurrentRestoreAssertions
+from space_smoke.restore_rollback import RestoreRollbackAssertions
 from space_smoke.node_drain import NodeDrainAssertions
 from space_smoke.node_groups import NodeGroupAssertions
 from space_smoke.node_fence import NodeFenceAssertions
@@ -2646,6 +2648,23 @@ class KindEcw(Ecw):
                 self, self._concurrent_restore_control, self._context.scope
             )
         return self._concurrent_restore_assertions
+
+    _restore_rollback_control: RestoreRollbackControl | None = None
+    _restore_rollback_assertions: RestoreRollbackAssertions | None = None
+
+    @property
+    def restore_rollback(self) -> RestoreRollbackAssertions:
+        """Privileged assertions for a rolled-back restore and its late kubelet retry."""
+
+        if self._restore_rollback_control is None:
+            raise SmokeConfigurationError(
+                "restore rollback control is only available on the kind backend"
+            )
+        if self._restore_rollback_assertions is None:
+            self._restore_rollback_assertions = RestoreRollbackAssertions(
+                self, self._restore_rollback_control, self._context.scope
+            )
+        return self._restore_rollback_assertions
 
     _node_drain_control: NodeDrainControl | None = None
     _node_drain_assertions: NodeDrainAssertions | None = None

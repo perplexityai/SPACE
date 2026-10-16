@@ -1246,6 +1246,8 @@ class RestoreActivation:
     restore_provenance: str
     restore_storage_uri_present: bool
     execution_generation: str
+    # The suspend artifact a snapshot restore activated; empty for a fresh boot.
+    local_artifact_id: str = ""
 
 
 class NodeFaultControl(Protocol):
@@ -1531,6 +1533,64 @@ class ConcurrentRestoreControl(Protocol):
 
     def delete_sandbox_pod(self, pod_name: str) -> None:
         """Delete one sandbox execution pod out from under the API (kind-only fault)."""
+        ...
+
+
+@dataclass(frozen=True)
+class SnapshotArtifactRow:
+    """One cluster `snapshots` row of any type, with the artifact it published."""
+
+    snapshot_id: str
+    snapshot_type: str
+    state: str
+    local_artifact_id: str
+
+
+class RestoreRollbackControl(RestoreStateRead, RestorePodRead, Protocol):
+    """Kind-only operations for the restore-rollback late-retry scenario.
+
+    The one fault is sandbox-manager's restore-prepare test hook
+    (`service/restore_prepare_fault.rs`, compiled only with `test-hooks`): a
+    marker file named after the sandbox id, in the directory the kind chart
+    passes to sandbox-manager, fails that sandbox's next restore prepare once,
+    after its activation claim, and is removed when it fires. Everything else
+    here is a read, except the deletion of one sandbox execution pod. The
+    marker file, the catalog rows and the pods are state; the pod events and
+    the sandbox-manager log are failure evidence only.
+    """
+
+    def arm_restore_prepare_fault(self, sandbox_id: str) -> tuple[str, ...]:
+        """Plant the marker on every sandbox worker; returns the workers armed.
+
+        Every worker, because the restore's placement is the API's choice. The
+        first prepare to reach its marker consumes it; the scenario disarms the
+        rest. Refuses with a configuration error when a worker's running
+        sandbox-manager has no hook directory (a chart or image without it).
+        """
+        ...
+
+    def armed_restore_prepare_faults(self, sandbox_id: str) -> tuple[str, ...]:
+        """The sandbox workers whose marker for `sandbox_id` is still present."""
+        ...
+
+    def disarm_restore_prepare_fault(self, sandbox_id: str) -> None:
+        """Remove the marker on every sandbox worker; idempotent."""
+        ...
+
+    def sandbox_pods(self, sandbox_id: str) -> list[SandboxPodView]:
+        """The sandbox's execution pods by label, including terminating ones."""
+        ...
+
+    def delete_sandbox_pod(self, pod_name: str) -> None:
+        """Delete one sandbox execution pod out from under the API (kind-only fault)."""
+        ...
+
+    def snapshot_artifact_rows(self, sandbox_id: str) -> list[SnapshotArtifactRow]:
+        """Every `snapshots` row of the sandbox, in any state, oldest first."""
+        ...
+
+    def sandbox_start_failures(self, pod_name: str) -> list[str]:
+        """Messages of the pod's `FailedCreatePodSandBox` events: failure evidence only."""
         ...
 
 

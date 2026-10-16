@@ -136,6 +136,10 @@ spec:
               value: {{ .idleSecs | quote }}
             {{- end }}
             {{- end }}
+            {{- with (.Values.testHooks | default dict).restorePrepareFaultDir }}
+            - name: SPACE_SBXMGR_TEST_RESTORE_PREPARE_FAULT_DIR
+              value: {{ . | quote }}
+            {{- end }}
             {{- if .Values.eppo.secretName }}
             - name: EPPO_SDK_KEY
               valueFrom:

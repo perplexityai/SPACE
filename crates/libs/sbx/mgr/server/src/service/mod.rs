@@ -76,6 +76,7 @@ pub(crate) mod fork_artifact;
 mod gateway_authority;
 pub(crate) mod network_policy;
 mod restart_admission;
+mod restore_prepare_fault;
 mod suspend_snapshot_publication;
 mod template_apps;
 

@@ -91,6 +91,7 @@ from space_smoke.capabilities import (
     RestoreActivation,
     RestoreFailure,
     TransferJobView,
+    SnapshotArtifactRow,
     SnapshotRowFacts,
     StartupRecoveryReport,
     TemplateCacheGcConfig,
@@ -631,6 +632,17 @@ _STORAGE_URI = re.compile(r"s3://[^\s\"',}\]]*")
 # it on one node can be received against an independently installed copy
 # on another. Pinned forever on the Rust side; mirrored here to check it.
 TEMPLATE_RECEIVED_UUID_NAMESPACE = uuid.UUID("1f3a9c44-5e6b-47d8-b9c1-2a0f8e517d36")
+SNAPSHOT_ARTIFACT_ROWS_SQL = """\
+SELECT id, type, state, COALESCE(local_artifact_id::text, '')
+  FROM snapshots
+ WHERE sandbox_id = '{sandbox_id}'
+ ORDER BY "timestamp" ASC, id ASC;
+"""
+# sandbox-manager's restore-prepare fault hook (test-hooks builds only); the
+# kind chart sets it on sandbox workers. See `RestoreRollbackControl`.
+RESTORE_PREPARE_FAULT_DIR_ENV = "SPACE_SBXMGR_TEST_RESTORE_PREPARE_FAULT_DIR"
+SANDBOX_START_FAILED_REASON = "FailedCreatePodSandBox"
+
 SNAPSHOT_ROW_FACTS_SQL = """\
 SELECT s.id,
        s.state,
@@ -1933,6 +1945,7 @@ ON CONFLICT (key_hash) DO NOTHING;
                     event.get("restore_storage_uri_present", False)
                 ),
                 execution_generation=str(event.get("execution_generation", "")),
+                local_artifact_id=str(event.get("local_artifact_id", "")),
             )
             for node_name, event in self._sandbox_events(
                 canonical, "runtime_activated", node_names=node_names, since_time=since_time
@@ -4495,6 +4508,106 @@ ON CONFLICT (key_hash) DO NOTHING;
             ),
             f"delete sandbox pod {pod}",
         )
+
+    # --- restore-prepare fault (restore rollback late retry) -----------------
+    #
+    # The marker lives in sandbox-manager's own container, under its private
+    # /tmp, and is written by kubectl exec as sandbox-manager's user, so the
+    # daemon can remove it when the fault fires and nothing outlives the pod.
+
+    def _restore_prepare_fault_dir(self, node_name: str) -> str:
+        directory = self._node_service_env(node_name, NODE_SANDBOX_MANAGER).get(
+            RESTORE_PREPARE_FAULT_DIR_ENV
+        )
+        if not directory or not directory.startswith("/"):
+            raise SmokeConfigurationError(
+                f"sandbox-manager on {node_name} has no {RESTORE_PREPARE_FAULT_DIR_ENV}; "
+                "the bench's chart or image predates the restore-prepare fault hook"
+            )
+        return directory
+
+    def _sandbox_manager_sh(
+        self, node_name: str, script: str, *args: str, action: str
+    ) -> str:
+        pod = self._node_service_pod(node_name, NODE_SANDBOX_MANAGER)
+        result = self.kubectl(
+            "exec", pod, "-c", NODE_SANDBOX_MANAGER, "--", "sh", "-c", script, "sh", *args,
+            timeout=30,
+        )
+        return _require_ok(result, f"{action} on {node_name}")
+
+    def arm_restore_prepare_fault(self, sandbox_id: str) -> tuple[str, ...]:
+        self._require_isolated_kind("restore-prepare fault injection")
+        canonical = _sql_uuid(sandbox_id)
+        armed: list[str] = []
+        for node in self.sandbox_pool_nodes():
+            directory = self._restore_prepare_fault_dir(node)
+            self._sandbox_manager_sh(
+                node, 'mkdir -p "$1" && : > "$1/$2"', directory, canonical,
+                action="arm the restore-prepare fault",
+            )
+            armed.append(node)
+        return tuple(armed)
+
+    def armed_restore_prepare_faults(self, sandbox_id: str) -> tuple[str, ...]:
+        canonical = _sql_uuid(sandbox_id)
+        present: list[str] = []
+        for node in self.sandbox_pool_nodes():
+            directory = self._restore_prepare_fault_dir(node)
+            answer = self._sandbox_manager_sh(
+                node, 'if [ -e "$1/$2" ]; then echo yes; else echo no; fi', directory, canonical,
+                action="read the restore-prepare fault marker",
+            )
+            if answer.strip() == "yes":
+                present.append(node)
+        return tuple(present)
+
+    def disarm_restore_prepare_fault(self, sandbox_id: str) -> None:
+        self._require_isolated_kind("restore-prepare fault injection")
+        canonical = _sql_uuid(sandbox_id)
+        for node in self.sandbox_pool_nodes():
+            directory = self._restore_prepare_fault_dir(node)
+            self._sandbox_manager_sh(
+                node, 'rm -f "$1/$2"', directory, canonical,
+                action="disarm the restore-prepare fault",
+            )
+
+    def snapshot_artifact_rows(self, sandbox_id: str) -> list[SnapshotArtifactRow]:
+        rows = self._psql(
+            SNAPSHOT_ARTIFACT_ROWS_SQL.format(sandbox_id=_sql_uuid(sandbox_id)),
+            action="list snapshot artifact rows",
+        )
+        parsed: list[SnapshotArtifactRow] = []
+        for line in rows.splitlines():
+            if not line.strip():
+                continue
+            snapshot_id, snapshot_type, state, local_artifact_id = line.split("|", 3)
+            parsed.append(
+                SnapshotArtifactRow(
+                    snapshot_id=snapshot_id,
+                    snapshot_type=snapshot_type,
+                    state=state,
+                    local_artifact_id=local_artifact_id.strip(),
+                )
+            )
+        return parsed
+
+    def sandbox_start_failures(self, pod_name: str) -> list[str]:
+        result = self.kubectl(
+            "get", "events",
+            "--field-selector",
+            f"involvedObject.name={_kube_pod_name(pod_name)},reason={SANDBOX_START_FAILED_REASON}",
+            "-o", "json", timeout=15,
+            namespace=KIND_SANDBOX_NAMESPACE,
+        )
+        _require_ok(result, f"list start failures of {pod_name}")
+        events = json.loads(result.stdout or "{}").get("items", [])
+        events.sort(key=lambda e: str(e.get("firstTimestamp") or e.get("eventTime") or ""))
+        messages: list[str] = []
+        for event in events:
+            count = (event.get("series") or {}).get("count") or event.get("count") or 1
+            messages.extend([str(event.get("message", ""))] * max(int(count), 1))
+        return messages
 
     # --- orphaned-restore-pod GC ---------------------------------------------
     #

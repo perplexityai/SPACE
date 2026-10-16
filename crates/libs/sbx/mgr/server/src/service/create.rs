@@ -886,30 +886,36 @@ impl SandboxManagerService {
         // enforce the slot UID. If this sandbox was only logically created,
         // this call also performs the first rootfs clone.
         let prepare_rootfs_size_mb = prepare_template.as_ref().and(sandbox.rootfs_size_mb);
-        let prepare_response = match node_client
-            .prepare_sandbox(PrepareSandboxRequest {
-                execution_fence: Some(execution_fence.into()),
-                sandbox_id: id.clone(),
-                template: prepare_template,
-                uid: sbx_uid,
-                vm_config_json: Some(vm_config),
-                metadata_json,
-                runtime: sandbox.runtime.clone(),
-                template_dir: prepare_template_dir,
-                snapshot_dir: None,
-                rootfs_size_mb: prepare_rootfs_size_mb,
-                requested_execution: Some((&requested_execution).into()),
-                execution_selection_mode: pplx_space_execution_common::proto::ExecutionSelectionMode::PersistedStateRestore
-                    as i32,
-                artifact_template: Some(sandbox.template.clone()),
-                content_hash: sandbox.template_hash.clone(),
-            })
-            .instrument(tracing::info_span!(
-                "sbxmgr.restore.node.prepare_sandbox",
-                sandbox_id = %id
-            ))
-            .await
-        {
+        // A Kind smoke can fail this one prepare after the claim, so the
+        // attempt rolls back as it does for a real refusal. Release builds
+        // compile no hook (`restore_prepare_fault`).
+        let prepare_result = match super::restore_prepare_fault::take_restore_prepare_fault(id) {
+            Some(injected) => Err(injected),
+            None => node_client
+                .prepare_sandbox(PrepareSandboxRequest {
+                    execution_fence: Some(execution_fence.into()),
+                    sandbox_id: id.clone(),
+                    template: prepare_template,
+                    uid: sbx_uid,
+                    vm_config_json: Some(vm_config),
+                    metadata_json,
+                    runtime: sandbox.runtime.clone(),
+                    template_dir: prepare_template_dir,
+                    snapshot_dir: None,
+                    rootfs_size_mb: prepare_rootfs_size_mb,
+                    requested_execution: Some((&requested_execution).into()),
+                    execution_selection_mode: pplx_space_execution_common::proto::ExecutionSelectionMode::PersistedStateRestore
+                        as i32,
+                    artifact_template: Some(sandbox.template.clone()),
+                    content_hash: sandbox.template_hash.clone(),
+                })
+                .instrument(tracing::info_span!(
+                    "sbxmgr.restore.node.prepare_sandbox",
+                    sandbox_id = %id
+                ))
+                .await,
+        };
+        let prepare_response = match prepare_result {
             Ok(response) => response.into_inner(),
             Err(e) => {
                 let reason = format!("prepare failed: {e}");
