@@ -16,12 +16,12 @@ use zeroize::Zeroizing;
 use super::state::{NetworkPolicyResolutionCandidate, ResolutionStateError, ResolutionStateReader};
 use super::*;
 use crate::aws_secrets_manager::ResolvedAwsSecret;
-use crate::credential_injection_bundle::{
-    CredentialInjectionBundleMaterializer, CredentialProviderDispatcher,
-};
 use crate::credential_provider::{
     CredentialFetch, CredentialProviderResolver, PreparedCredential, ResolutionContext,
     ResolutionError,
+};
+use crate::network_credential_materializer::{
+    CredentialProviderDispatcher, NetworkCredentialMaterializer,
 };
 
 const GENERATION: i64 = 3;
@@ -32,8 +32,8 @@ fn caller(node_id: NodeId) -> ResolutionCaller {
     ResolutionCaller::new(node_id, K8sNodeUid::parse(NODE_UID).unwrap())
 }
 
-fn request() -> BundleResolutionRequest {
-    BundleResolutionRequest::new(
+fn request() -> ExecutionResolutionRequest {
+    ExecutionResolutionRequest::new(
         SandboxId::new(),
         ExecutionGeneration::new(GENERATION).unwrap(),
     )
@@ -148,7 +148,7 @@ fn network_resolution_request_requires_canonical_policy_identity() {
             expected_generation.get(),
             "none"
         ),
-        Err(InvalidBundleResolutionRequest::EffectiveNetworkPolicyRef)
+        Err(InvalidResolutionRequest::EffectiveNetworkPolicyRef)
     ));
     assert!(matches!(
         NetworkCredentialResolutionRequest::parse(
@@ -156,7 +156,7 @@ fn network_resolution_request_requires_canonical_policy_identity() {
             expected_generation.get(),
             "cluster:sandbox:not-canonical"
         ),
-        Err(InvalidBundleResolutionRequest::EffectiveNetworkPolicyRef)
+        Err(InvalidResolutionRequest::EffectiveNetworkPolicyRef)
     ));
 }
 
@@ -212,7 +212,7 @@ fn network_policy_authority(
         Arc::new(ScriptedNetworkPolicyStateReader {
             candidates: Mutex::new(candidates.into_iter().collect()),
         }),
-        CredentialInjectionBundleMaterializer::new(providers),
+        NetworkCredentialMaterializer::new(providers),
     )
 }
 
@@ -227,23 +227,23 @@ fn candidate_authorization_fences_node_and_execution() {
     authorize_candidate(&candidate.state, &caller(node_id), current_request).unwrap();
     assert!(matches!(
         authorize_candidate(&candidate.state, &caller(NodeId::new()), current_request),
-        Err(BundleResolutionError::CandidateUnavailableOrUnauthorized)
+        Err(NetworkCredentialResolutionError::CandidateUnavailableOrUnauthorized)
     ));
 
     let replaced_node =
         ResolutionCaller::new(node_id, K8sNodeUid::parse("replacement-node-uid").unwrap());
     assert!(matches!(
         authorize_candidate(&candidate.state, &replaced_node, current_request),
-        Err(BundleResolutionError::CandidateUnavailableOrUnauthorized)
+        Err(NetworkCredentialResolutionError::CandidateUnavailableOrUnauthorized)
     ));
 
-    let stale_generation = BundleResolutionRequest::new(
+    let stale_generation = ExecutionResolutionRequest::new(
         current_request.sandbox_id,
         ExecutionGeneration::new(GENERATION + 1).unwrap(),
     );
     assert!(matches!(
         authorize_candidate(&candidate.state, &caller(node_id), stale_generation),
-        Err(BundleResolutionError::StaleCandidate)
+        Err(NetworkCredentialResolutionError::StaleCandidate)
     ));
 }
 
@@ -275,7 +275,7 @@ async fn network_policy_resolution_rejects_execution_changed_between_reads() {
             authority
                 .resolve_network_credentials(&caller(node_id), network_request(&first))
                 .await,
-            Err(BundleResolutionError::StaleCandidate)
+            Err(NetworkCredentialResolutionError::StaleCandidate)
         ));
     }
 }
@@ -317,7 +317,7 @@ async fn network_policy_resolution_omits_retired_and_rejects_changed_authority_s
         missing
             .resolve_network_credentials(&caller(node_id), request)
             .await,
-        Err(BundleResolutionError::CandidateUnavailableOrUnauthorized)
+        Err(NetworkCredentialResolutionError::CandidateUnavailableOrUnauthorized)
     ));
 
     let mut changed = first.clone();
@@ -328,7 +328,7 @@ async fn network_policy_resolution_omits_retired_and_rejects_changed_authority_s
         stale
             .resolve_network_credentials(&caller(node_id), request)
             .await,
-        Err(BundleResolutionError::StaleCandidate)
+        Err(NetworkCredentialResolutionError::StaleCandidate)
     ));
 
     let mut retired = network_policy_candidate(organization_id, node_id, reference_id);
@@ -370,7 +370,7 @@ async fn network_policy_resolution_omits_permanent_provider_denials_but_aborts_t
                 Some(candidate.clone()),
             ])),
         }),
-        CredentialInjectionBundleMaterializer::new(permanent_providers),
+        NetworkCredentialMaterializer::new(permanent_providers),
     );
     let resolved = permanent
         .resolve_network_credentials(&caller(node_id), network_request(&candidate))
@@ -386,14 +386,14 @@ async fn network_policy_resolution_omits_permanent_provider_denials_but_aborts_t
         Arc::new(ScriptedNetworkPolicyStateReader {
             candidates: Mutex::new(VecDeque::from([Some(candidate.clone())])),
         }),
-        CredentialInjectionBundleMaterializer::new(transient_providers),
+        NetworkCredentialMaterializer::new(transient_providers),
     );
     assert!(matches!(
         transient
             .resolve_network_credentials(&caller(node_id), network_request(&candidate))
             .await,
-        Err(BundleResolutionError::Materialize(
-            BundleMaterializationError::Provider(ResolutionError::ProviderUnavailable)
+        Err(NetworkCredentialResolutionError::Materialize(
+            NetworkCredentialMaterializationError::Provider(ResolutionError::ProviderUnavailable)
         ))
     ));
 }
@@ -425,6 +425,6 @@ async fn network_policy_resolution_rejects_request_policy_mismatch() {
                 ),
             )
             .await,
-        Err(BundleResolutionError::StaleCandidate)
+        Err(NetworkCredentialResolutionError::StaleCandidate)
     ));
 }

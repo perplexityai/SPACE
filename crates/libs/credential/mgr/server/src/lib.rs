@@ -1,7 +1,6 @@
 pub mod auth;
 pub mod aws_secrets_manager;
 pub mod credential_injection_authority;
-pub mod credential_injection_bundle;
 mod credential_injection_rpc;
 pub mod credential_provider;
 pub mod credential_store;
@@ -16,6 +15,7 @@ pub mod k8s_identity;
 pub mod kek_provisioning;
 pub mod kek_store;
 pub mod key_wrapper;
+pub mod network_credential_materializer;
 pub mod node_ca;
 pub mod node_service;
 mod run;

@@ -14,11 +14,11 @@ use tonic::Status;
 
 use crate::auth::{ClientService, ResolvedCaller};
 use crate::credential_injection_authority::{
-    BundleResolutionError, CredentialInjectionAuthority, NetworkCredentialResolutionRequest,
-    ResolutionCaller,
+    CredentialInjectionAuthority, NetworkCredentialResolutionError,
+    NetworkCredentialResolutionRequest, ResolutionCaller,
 };
-use crate::credential_injection_bundle::BundleMaterializationError;
 use crate::credential_provider::ResolutionError as CredentialResolutionError;
+use crate::network_credential_materializer::NetworkCredentialMaterializationError;
 use crate::proto::{ResolveNetworkCredentialsRequest, ResolveNetworkCredentialsResponse};
 
 // The PoC admits 32 concurrent resolutions per authority process; production
@@ -62,7 +62,7 @@ impl CredentialInjectionRpc {
         )
         .await
         .map_err(|_| Status::deadline_exceeded("credential resolution timed out"))?
-        .map_err(bundle_resolution_error_to_status)?;
+        .map_err(network_credential_resolution_error_to_status)?;
 
         Ok(ResolveNetworkCredentialsResponse {
             effective_network_policy_ref: resolved.effective_network_policy_ref,
@@ -98,33 +98,37 @@ fn resolution_caller(caller: &ResolvedCaller) -> Result<ResolutionCaller, Status
     }
 }
 
-fn bundle_resolution_error_to_status(error: BundleResolutionError) -> Status {
+fn network_credential_resolution_error_to_status(
+    error: NetworkCredentialResolutionError,
+) -> Status {
     match error {
-        BundleResolutionError::CandidateUnavailableOrUnauthorized => {
+        NetworkCredentialResolutionError::CandidateUnavailableOrUnauthorized => {
             Status::permission_denied(error.to_string())
         }
-        BundleResolutionError::StaleCandidate => Status::aborted(error.to_string()),
-        BundleResolutionError::StateUnavailable(state_error) => {
+        NetworkCredentialResolutionError::StaleCandidate => Status::aborted(error.to_string()),
+        NetworkCredentialResolutionError::StateUnavailable(state_error) => {
             tracing::warn!(error = %state_error, "credential-injection resolution state unavailable");
             Status::unavailable("credential-injection resolution state unavailable")
         }
-        BundleResolutionError::InvalidState(state_error) => {
+        NetworkCredentialResolutionError::InvalidState(state_error) => {
             tracing::error!(error = %state_error, "credential-injection resolution state is invalid");
             Status::internal("credential-injection resolution state is invalid")
         }
-        BundleResolutionError::Materialize(BundleMaterializationError::InvalidRules(error)) => {
+        NetworkCredentialResolutionError::Materialize(
+            NetworkCredentialMaterializationError::InvalidRules(error),
+        ) => {
             tracing::error!(error, "stored credential-injection rules are invalid");
             Status::internal("stored credential-injection rules are invalid")
         }
-        BundleResolutionError::Materialize(
-            BundleMaterializationError::InvalidResolvedCredential(error),
+        NetworkCredentialResolutionError::Materialize(
+            NetworkCredentialMaterializationError::InvalidResolvedCredential(error),
         ) => {
             tracing::warn!(error, "resolved credential cannot be injected");
             Status::failed_precondition("resolved credential cannot be injected")
         }
-        BundleResolutionError::Materialize(BundleMaterializationError::Provider(error)) => {
-            provider_error_to_status(error)
-        }
+        NetworkCredentialResolutionError::Materialize(
+            NetworkCredentialMaterializationError::Provider(error),
+        ) => provider_error_to_status(error),
     }
 }
 

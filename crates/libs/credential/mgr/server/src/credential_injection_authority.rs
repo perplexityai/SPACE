@@ -23,11 +23,11 @@ use pplx_space_credential_injection_core::proto::ResolvedNetworkCredential;
 use pplx_space_credential_injection_store::references::ReferenceState;
 use pplx_space_net_common::EffectiveNetworkPolicyRef;
 
-use crate::credential_injection_bundle::{
-    BundleMaterializationError, CredentialInjectionBundleMaterializer,
-    NetworkCredentialMaterialization,
-};
 use crate::credential_provider::DestinationMatcher;
+use crate::network_credential_materializer::{
+    NetworkCredentialMaterialization, NetworkCredentialMaterializationError,
+    NetworkCredentialMaterializer,
+};
 
 use self::state::{
     PgResolutionStateReader, ResolutionState, ResolutionStateError, ResolutionStateReader,
@@ -37,21 +37,21 @@ mod state;
 
 /// The sandbox execution whose credentials are requested by a node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BundleResolutionRequest {
+pub(crate) struct ExecutionResolutionRequest {
     sandbox_id: SandboxId,
     execution_generation: ExecutionGeneration,
 }
 
-impl BundleResolutionRequest {
+impl ExecutionResolutionRequest {
     pub(crate) fn parse(
         sandbox_id: &str,
         execution_generation: i64,
-    ) -> Result<Self, InvalidBundleResolutionRequest> {
+    ) -> Result<Self, InvalidResolutionRequest> {
         let sandbox_id = sandbox_id
             .parse::<SandboxId>()
-            .map_err(|_| InvalidBundleResolutionRequest::SandboxId)?;
+            .map_err(|_| InvalidResolutionRequest::SandboxId)?;
         let execution_generation = ExecutionGeneration::new(execution_generation)
-            .map_err(|_| InvalidBundleResolutionRequest::ExecutionGeneration)?;
+            .map_err(|_| InvalidResolutionRequest::ExecutionGeneration)?;
         Ok(Self {
             sandbox_id,
             execution_generation,
@@ -78,13 +78,13 @@ impl NetworkCredentialResolutionRequest {
         sandbox_id: &str,
         execution_generation: i64,
         effective_network_policy_ref: &str,
-    ) -> Result<Self, InvalidBundleResolutionRequest> {
-        let base = BundleResolutionRequest::parse(sandbox_id, execution_generation)?;
+    ) -> Result<Self, InvalidResolutionRequest> {
+        let base = ExecutionResolutionRequest::parse(sandbox_id, execution_generation)?;
         let parsed = effective_network_policy_ref
             .parse::<EffectiveNetworkPolicyRef>()
-            .map_err(|_| InvalidBundleResolutionRequest::EffectiveNetworkPolicyRef)?;
+            .map_err(|_| InvalidResolutionRequest::EffectiveNetworkPolicyRef)?;
         if parsed.is_no_identity() || parsed.to_string() != effective_network_policy_ref {
-            return Err(InvalidBundleResolutionRequest::EffectiveNetworkPolicyRef);
+            return Err(InvalidResolutionRequest::EffectiveNetworkPolicyRef);
         }
         Ok(Self {
             sandbox_id: base.sandbox_id,
@@ -106,8 +106,8 @@ impl NetworkCredentialResolutionRequest {
         }
     }
 
-    fn execution(&self) -> BundleResolutionRequest {
-        BundleResolutionRequest {
+    fn execution(&self) -> ExecutionResolutionRequest {
+        ExecutionResolutionRequest {
             sandbox_id: self.sandbox_id,
             execution_generation: self.execution_generation,
         }
@@ -120,7 +120,7 @@ pub(crate) struct ResolvedNetworkCredentials {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum InvalidBundleResolutionRequest {
+pub(crate) enum InvalidResolutionRequest {
     #[error("sandbox_id is malformed")]
     SandboxId,
     #[error("execution_generation is invalid")]
@@ -150,18 +150,18 @@ impl ResolutionCaller {
 #[derive(Clone)]
 pub struct CredentialInjectionAuthority {
     state_reader: Arc<dyn ResolutionStateReader>,
-    materializer: CredentialInjectionBundleMaterializer,
+    materializer: NetworkCredentialMaterializer,
 }
 
 impl CredentialInjectionAuthority {
     /// Construct the production Postgres-backed authority.
-    pub fn new(pool: sqlx::PgPool, materializer: CredentialInjectionBundleMaterializer) -> Self {
+    pub fn new(pool: sqlx::PgPool, materializer: NetworkCredentialMaterializer) -> Self {
         Self::from_state_reader(Arc::new(PgResolutionStateReader::new(pool)), materializer)
     }
 
     fn from_state_reader(
         state_reader: Arc<dyn ResolutionStateReader>,
-        materializer: CredentialInjectionBundleMaterializer,
+        materializer: NetworkCredentialMaterializer,
     ) -> Self {
         Self {
             state_reader,
@@ -176,15 +176,15 @@ impl CredentialInjectionAuthority {
         &self,
         caller: &ResolutionCaller,
         request: NetworkCredentialResolutionRequest,
-    ) -> Result<ResolvedNetworkCredentials, BundleResolutionError> {
+    ) -> Result<ResolvedNetworkCredentials, NetworkCredentialResolutionError> {
         let candidate = self
             .state_reader
             .load_network_policy_candidate(request.sandbox_id)
             .await?
-            .ok_or(BundleResolutionError::CandidateUnavailableOrUnauthorized)?;
+            .ok_or(NetworkCredentialResolutionError::CandidateUnavailableOrUnauthorized)?;
         authorize_candidate(&candidate.state, caller, request.execution())?;
         if candidate.effective_network_policy_ref != request.effective_network_policy_ref {
-            return Err(BundleResolutionError::StaleCandidate);
+            return Err(NetworkCredentialResolutionError::StaleCandidate);
         }
 
         let mut destinations = BTreeMap::<CredentialReferenceId, BTreeSet<(String, u16)>>::new();
@@ -206,16 +206,15 @@ impl CredentialInjectionAuthority {
             .iter()
             .filter(|reference| reference.state == ReferenceState::Active)
             .map(|reference| {
-                let destinations =
-                    destinations
-                        .get(&reference.id)
-                        .ok_or(BundleResolutionError::InvalidState(
-                            "network policy reference snapshot is inconsistent",
-                        ))?;
-                let reference_config = reference
-                    .config
-                    .to_validated_reference()
-                    .map_err(|error| BundleMaterializationError::InvalidRules(error.0))?;
+                let destinations = destinations.get(&reference.id).ok_or(
+                    NetworkCredentialResolutionError::InvalidState(
+                        "network policy reference snapshot is inconsistent",
+                    ),
+                )?;
+                let reference_config =
+                    reference.config.to_validated_reference().map_err(|error| {
+                        NetworkCredentialMaterializationError::InvalidRules(error.0)
+                    })?;
                 Ok(NetworkCredentialMaterialization {
                     reference_id: reference.id,
                     reference: reference_config,
@@ -228,7 +227,7 @@ impl CredentialInjectionAuthority {
                         .collect(),
                 })
             })
-            .collect::<Result<Vec<_>, BundleResolutionError>>()?;
+            .collect::<Result<Vec<_>, NetworkCredentialResolutionError>>()?;
         let credentials = self
             .materializer
             .materialize_network_credentials(candidate.state.organization_id, materialization)
@@ -238,9 +237,9 @@ impl CredentialInjectionAuthority {
             .state_reader
             .load_network_policy_candidate(request.sandbox_id)
             .await?
-            .ok_or(BundleResolutionError::StaleCandidate)?;
+            .ok_or(NetworkCredentialResolutionError::StaleCandidate)?;
         if current != candidate {
-            return Err(BundleResolutionError::StaleCandidate);
+            return Err(NetworkCredentialResolutionError::StaleCandidate);
         }
         Ok(ResolvedNetworkCredentials {
             effective_network_policy_ref: candidate.effective_network_policy_ref,
@@ -250,7 +249,7 @@ impl CredentialInjectionAuthority {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum BundleResolutionError {
+pub(crate) enum NetworkCredentialResolutionError {
     /// Missing and foreign candidates intentionally share one error so a
     /// compromised node agent cannot probe sandbox or policy existence.
     #[error("credential-injection resolution is unavailable or unauthorized")]
@@ -262,10 +261,10 @@ pub(crate) enum BundleResolutionError {
     #[error("credential-injection resolution state is invalid: {0}")]
     InvalidState(&'static str),
     #[error(transparent)]
-    Materialize(#[from] BundleMaterializationError),
+    Materialize(#[from] NetworkCredentialMaterializationError),
 }
 
-impl From<ResolutionStateError> for BundleResolutionError {
+impl From<ResolutionStateError> for NetworkCredentialResolutionError {
     fn from(error: ResolutionStateError) -> Self {
         match error {
             ResolutionStateError::Query(error) => Self::StateUnavailable(error),
@@ -277,13 +276,13 @@ impl From<ResolutionStateError> for BundleResolutionError {
 fn authorize_candidate(
     candidate: &ResolutionState,
     caller: &ResolutionCaller,
-    request: BundleResolutionRequest,
-) -> Result<(), BundleResolutionError> {
+    request: ExecutionResolutionRequest,
+) -> Result<(), NetworkCredentialResolutionError> {
     if candidate.node_id != caller.node_id || candidate.k8s_node_uid != caller.k8s_node_uid {
-        return Err(BundleResolutionError::CandidateUnavailableOrUnauthorized);
+        return Err(NetworkCredentialResolutionError::CandidateUnavailableOrUnauthorized);
     }
     if candidate.execution_generation != request.execution_generation {
-        return Err(BundleResolutionError::StaleCandidate);
+        return Err(NetworkCredentialResolutionError::StaleCandidate);
     }
     Ok(())
 }

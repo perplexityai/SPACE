@@ -25,20 +25,19 @@ fn insert_credential_reference_paths(paths: &mut Map<String, Value>) {
         ),
         (
             routes::DELETE_CREDENTIAL_REFERENCE,
-            "Retire an unused reference; preserve its tombstone",
+            "Retire a reference; preserve its tombstone",
             "",
         ),
     ] {
         let mut value = json!({
             "summary": summary,
-            "description": "Experimental, organization-scoped metadata only. Registration neither fetches values nor grants provider access. Only configured AWS Secrets Manager current-value locators are supported; unknown providers, options and raw secret fields are rejected. Source changes and retirement of attached references are not supported.",
+            "description": "Experimental, organization-scoped metadata only. Registration neither fetches values nor grants provider access. Only configured AWS Secrets Manager current-value locators are supported; unknown providers, options and raw secret fields are rejected. Source changes are not supported. A retired reference is no longer resolved for any network policy that still binds it.",
             "responses": {
                 "400":{"description":"Invalid identifier or locator"},
                 "401":{"description":"Authentication required"},
                 "403":{"description":"Provider reference is unauthorized"},
                 "404":{"description":"Resource not found in the authenticated organization"},
                 "409":{"description":"Idempotency conflict"},
-                "412":{"description":"Reference remains attached"},
                 "422":{"description":"Request contains unknown fields or unsupported locator variants"},
                 "500":{"description":"Metadata operation failed"},
                 "503":{"description":"Database contention; retry"}

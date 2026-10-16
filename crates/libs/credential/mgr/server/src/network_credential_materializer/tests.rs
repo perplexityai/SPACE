@@ -42,7 +42,7 @@ impl CredentialFetch<ResolvedAwsSecret> for TestFetch {
 
 fn materializer_returning(
     value: &'static str,
-) -> (CredentialInjectionBundleMaterializer, Arc<AtomicUsize>) {
+) -> (NetworkCredentialMaterializer, Arc<AtomicUsize>) {
     let reads = Arc::new(AtomicUsize::new(0));
     let providers = CredentialProviderDispatcher::default().with_aws_secrets_manager(Arc::new(
         TestAwsProvider {
@@ -50,7 +50,7 @@ fn materializer_returning(
             reads: reads.clone(),
         },
     ));
-    (CredentialInjectionBundleMaterializer::new(providers), reads)
+    (NetworkCredentialMaterializer::new(providers), reads)
 }
 
 fn reference(destinations: Vec<DestinationMatcher>) -> NetworkCredentialMaterialization {
@@ -113,8 +113,7 @@ async fn omits_permanently_unusable_credentials() {
 
 #[tokio::test]
 async fn unconfigured_provider_omits_the_credential() {
-    let materializer =
-        CredentialInjectionBundleMaterializer::new(CredentialProviderDispatcher::default());
+    let materializer = NetworkCredentialMaterializer::new(CredentialProviderDispatcher::default());
 
     assert!(
         materializer

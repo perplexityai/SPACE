@@ -2,8 +2,8 @@ use pplx_space_common_svc::core::types::{K8sNodeUid, NodeRole};
 
 use super::*;
 use crate::auth::{ClientService, K8sIdentity};
-use crate::credential_injection_bundle::BundleMaterializationError;
 use crate::credential_provider::ResolutionError;
+use crate::network_credential_materializer::NetworkCredentialMaterializationError;
 
 #[test]
 fn node_agent_identity_maps_to_the_worker_node_incarnation() {
@@ -49,23 +49,31 @@ fn non_agent_kubernetes_identity_cannot_resolve_for_a_node() {
 fn domain_failures_keep_the_security_and_retry_status_contract() {
     for (error, expected) in [
         (
-            BundleResolutionError::CandidateUnavailableOrUnauthorized,
+            NetworkCredentialResolutionError::CandidateUnavailableOrUnauthorized,
             tonic::Code::PermissionDenied,
         ),
-        (BundleResolutionError::StaleCandidate, tonic::Code::Aborted),
         (
-            BundleResolutionError::Materialize(BundleMaterializationError::InvalidRules(
-                "malformed",
-            )),
+            NetworkCredentialResolutionError::StaleCandidate,
+            tonic::Code::Aborted,
+        ),
+        (
+            NetworkCredentialResolutionError::Materialize(
+                NetworkCredentialMaterializationError::InvalidRules("malformed"),
+            ),
             tonic::Code::Internal,
         ),
         (
-            BundleResolutionError::Materialize(BundleMaterializationError::Provider(
-                ResolutionError::ProviderUnavailable,
-            )),
+            NetworkCredentialResolutionError::Materialize(
+                NetworkCredentialMaterializationError::Provider(
+                    ResolutionError::ProviderUnavailable,
+                ),
+            ),
             tonic::Code::Unavailable,
         ),
     ] {
-        assert_eq!(bundle_resolution_error_to_status(error).code(), expected);
+        assert_eq!(
+            network_credential_resolution_error_to_status(error).code(),
+            expected
+        );
     }
 }

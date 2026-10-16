@@ -27,9 +27,6 @@ use tonic::transport::ServerTlsConfig;
 use crate::auth::CredentialUdsAccess;
 use crate::aws_secrets_manager::AwsSecretsManagerResolver;
 use crate::credential_injection_authority::CredentialInjectionAuthority;
-use crate::credential_injection_bundle::{
-    CredentialInjectionBundleMaterializer, CredentialProviderDispatcher,
-};
 use crate::credential_store::{CredentialStore, PgCredentialStore};
 use crate::in_memory::InMemoryKeyWrapper;
 use crate::intermediate_ca;
@@ -43,6 +40,9 @@ use crate::intermediate_key_store::PgWrappedIntermediateKeyStore;
 use crate::kek_provisioning::{InMemoryKekProvisioner, IntermediateKeyProvisioner, KekProvisioner};
 use crate::kek_store::{KekStore, PgKekStore};
 use crate::key_wrapper::CompositeKeyWrapper;
+use crate::network_credential_materializer::{
+    CredentialProviderDispatcher, NetworkCredentialMaterializer,
+};
 use crate::node_ca::NodeCa;
 use crate::node_service::NodeCredentialManager;
 use crate::proto::credential_manager_server::{CredentialManager, CredentialManagerServer};
@@ -715,7 +715,7 @@ async fn initialize_authority_service(
                 Arc::new(PgCredentialStore::new(pool.clone()));
             let credential_injection_authority = CredentialInjectionAuthority::new(
                 pool.clone(),
-                CredentialInjectionBundleMaterializer::new(providers),
+                NetworkCredentialMaterializer::new(providers),
             );
             if storage_exchange_enabled {
                 let storage_vend_store: Arc<dyn StorageVendStore> =
