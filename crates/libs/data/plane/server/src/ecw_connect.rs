@@ -16,7 +16,10 @@ use pplx_space_sbx_mgr_client::proto::{
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use super::{EcwProxyError, ResponseKind, ResponseOrigin, backend_transport_reset_reason};
+use super::{
+    EcwProxyError, ResponseKind, ResponseOrigin, TooManyRequestsReason,
+    backend_transport_reset_reason,
+};
 
 pub(super) const E2B_CONNECT_JSON_BODY_LIMIT_BYTES: usize = 1024 * 1024;
 const ECW_BACKEND_BUSY_RETRY_AFTER: Duration = Duration::from_secs(1);
@@ -468,6 +471,7 @@ pub(super) fn tonic_status_to_ecw_error(status: tonic::Status) -> EcwProxyError 
             ResponseKind::Admission,
         )
         .with_retry_after(ECW_BACKEND_BUSY_RETRY_AFTER)
+        .with_too_many_requests_reason(TooManyRequestsReason::NodeSandboxLimit)
         .with_backend_status(status);
     }
     // The guest refused before starting anything: say when to come back.
@@ -491,6 +495,7 @@ pub(super) fn tonic_status_to_ecw_error(status: tonic::Status) -> EcwProxyError 
             ResponseKind::Admission,
         )
         .with_retry_after(try_again)
+        .with_too_many_requests_reason(TooManyRequestsReason::SandboxAtCapacity)
         .with_backend_status(status);
     }
 
@@ -518,12 +523,15 @@ pub(super) fn tonic_status_to_ecw_error(status: tonic::Status) -> EcwProxyError 
         status.message().to_string()
     };
 
-    let error = EcwProxyError::new(http_status, message, origin, kind);
-    match refusal_retry_after {
-        Some(try_again) => error.with_retry_after(try_again),
-        None => error,
+    let mut error = EcwProxyError::new(http_status, message, origin, kind);
+    if let Some(try_again) = refusal_retry_after {
+        error = error.with_retry_after(try_again);
     }
-    .with_backend_status(status)
+    if http_status == StatusCode::TOO_MANY_REQUESTS {
+        error =
+            error.with_too_many_requests_reason(TooManyRequestsReason::BackendResourceExhausted);
+    }
+    error.with_backend_status(status)
 }
 
 fn tonic_status_needs_ecw_not_running_shape(status: &tonic::Status) -> bool {

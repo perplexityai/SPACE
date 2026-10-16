@@ -314,6 +314,32 @@ async fn an_unread_pong_closes_the_client_at_its_deadline() {
 // A refusal the guest made before starting anything is retryable on both
 // the SSE and WebSocket openings, with the guest's hint as Retry-After and
 // none of its wording in the public body.
+// The node's per-sandbox request limiter also refuses before start; its 429
+// names that limit, not the guest's own capacity.
+#[test]
+fn native_refusals_name_the_node_limiter_apart_from_guest_capacity() {
+    for (status, expected) in [
+        (
+            pplx_space_common_grpc::uds_per_sandbox_limit_exceeded_status("busy"),
+            TooManyRequestsReason::NodeSandboxLimit,
+        ),
+        (
+            pplx_space_common_grpc::refused_before_start(
+                tonic::Status::resource_exhausted("full"),
+                std::time::Duration::from_secs(1),
+            ),
+            TooManyRequestsReason::SandboxAtCapacity,
+        ),
+    ] {
+        let response = process_stream_start_http_error(&StreamBridgeError::BackendStatus(status));
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response.extensions().get::<TooManyRequestsReason>(),
+            Some(&expected),
+        );
+    }
+}
+
 #[tokio::test]
 async fn refusals_before_start_are_retryable_with_retry_after() {
     use http_body_util::BodyExt;
@@ -337,6 +363,15 @@ async fn refusals_before_start_are_retryable_with_retry_after() {
         let error = StreamBridgeError::BackendStatus(status);
         let response = process_stream_start_http_error(&error);
         assert_eq!(response.status(), expected_status, "{code:?}");
+        assert_eq!(
+            response
+                .extensions()
+                .get::<TooManyRequestsReason>()
+                .copied(),
+            (expected_status == StatusCode::TOO_MANY_REQUESTS)
+                .then_some(TooManyRequestsReason::SandboxAtCapacity),
+            "{code:?}",
+        );
         assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "2");
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();

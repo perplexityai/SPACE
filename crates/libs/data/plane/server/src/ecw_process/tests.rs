@@ -22,6 +22,7 @@ fn test_ecw_route(route_generation: u64) -> EcwResolvedRoute {
             api_key_sha256: None,
         },
         sandbox_id,
+        org_id: None,
         template_id: None,
         route_generation,
         current_node_id: NodeId::new(),

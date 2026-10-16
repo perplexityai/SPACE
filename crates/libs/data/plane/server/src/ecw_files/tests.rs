@@ -1174,8 +1174,22 @@ async fn multipart_epilogue_within_the_whole_body_limit_is_accepted() {
 /// /files` reaches admission without ClusterApi, and whose limiter has one
 /// slot and a 50 ms wait.
 async fn upload_router(sandbox_id: SandboxId) -> (axum::Router, Arc<UploadAdmission>) {
+    let (router, uploads, _) = upload_router_with_tracker(sandbox_id).await;
+    (router, uploads)
+}
+
+/// [`upload_router`], also returning the in-flight upload tracker it wires in.
+async fn upload_router_with_tracker(
+    sandbox_id: SandboxId,
+) -> (
+    axum::Router,
+    Arc<UploadAdmission>,
+    Arc<crate::http_traffic::UploadTracker>,
+) {
     let mut state = crate::tests::test_data_plane_state().await;
-    state.ecw_hosts = EcwHostConfig::from_env_value(Some(r#"[{"host":"ecw.test"}]"#));
+    state.ecw_hosts = Arc::new(EcwHostConfig::from_env_value(Some(
+        r#"[{"host":"ecw.test"}]"#,
+    )));
     state.route_cache.remember_ecw(
         crate::tests::test_ecw_route_origin(sandbox_id).cache_key(),
         crate::tests::ecw_resolved_route(
@@ -1191,7 +1205,8 @@ async fn upload_router(sandbox_id: SandboxId) -> (axum::Router, Arc<UploadAdmiss
         ..UploadAdmissionConfig::default()
     }));
     state.uploads = Some(uploads.clone());
-    (crate::router(state), uploads)
+    let tracker = Arc::clone(&state.upload_tracker);
+    (crate::router(state), uploads, tracker)
 }
 
 fn upload_request(
@@ -1415,4 +1430,65 @@ async fn an_admitted_upload_holds_its_permit_while_reading_the_body() {
             "the bytes return afterwards"
         );
     }
+}
+
+/// Through the production router: an admitted upload is in flight with the
+/// budget admission actually holds while its body is read and leaves however
+/// its write ends, and an upload the saturated limiter turns away gets a 429
+/// that names the limit and never enters the in-flight count.
+#[tokio::test]
+async fn admitted_uploads_are_tracked_with_their_reservation_and_rejections_name_the_limit() {
+    if !pplx_space_test_env::enter_test_process(&[(
+        "SPACE_INTERNAL_RPC_INSECURE_DEV",
+        Some(std::ffi::OsStr::new("true")),
+    )]) {
+        return;
+    }
+
+    let sandbox_id = SandboxId::new();
+    let (app, uploads, tracker) = upload_router_with_tracker(sandbox_id).await;
+
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let body = {
+        let tracker = Arc::clone(&tracker);
+        let seen = Arc::clone(&seen);
+        observed_body(move || *seen.lock().unwrap() = Some(tracker.snapshot()))
+    };
+    // A JSON write reads its body before calling the guest, so the observer
+    // runs mid-upload. The empty body then fails to parse, which ends it.
+    let response = app
+        .clone()
+        .oneshot(upload_request(
+            sandbox_id,
+            "/files",
+            "application/json",
+            "5",
+            body,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    // Five declared bytes take one whole 1 KiB budget permit.
+    assert_eq!(*seen.lock().unwrap(), Some((1, 1024)));
+    assert_eq!(tracker.snapshot(), (0, 0));
+
+    let _held = uploads.admit(1).await.unwrap();
+    let response = app
+        .oneshot(upload_request(
+            sandbox_id,
+            "/files",
+            "application/json",
+            "5",
+            Body::from("hello"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response
+            .extensions()
+            .get::<pplx_space_metrics::data_plane::TooManyRequestsReason>(),
+        Some(&pplx_space_metrics::data_plane::TooManyRequestsReason::UploadConcurrency),
+    );
+    assert_eq!(tracker.snapshot(), (0, 0));
 }

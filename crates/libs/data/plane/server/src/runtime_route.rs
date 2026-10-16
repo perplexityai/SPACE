@@ -150,6 +150,7 @@ pub(super) async fn resolve_ecw_route_uncached(
         cache_epoch: state.route_cache.next_cache_epoch(),
         origin: origin.clone(),
         sandbox_id,
+        org_id: route.org_id.parse().ok(),
         template_id: route.template_id,
         route_generation: route.route_generation,
         current_node_id: route
@@ -662,7 +663,9 @@ pub(super) fn acquire_ecw_stream_permit(
         }
         Err(()) => {
             pplx_space_metrics::data_plane::attach(kind, "too_many_attached_streams");
-            Err(EcwProxyError::too_many_attached_streams())
+            Err(EcwProxyError::too_many_attached_streams(
+                TooManyRequestsReason::AttachedStreams,
+            ))
         }
     }
 }

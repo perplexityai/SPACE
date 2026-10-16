@@ -207,14 +207,7 @@ pub(super) async fn session_events(
                 session_id.kind().as_str(),
                 limit.metric_label(),
             );
-            return data_plane_http_error(
-                StatusCode::TOO_MANY_REQUESTS,
-                DataPlaneHttpErrorCode::RateLimited,
-                "too many attached streams",
-                true,
-                ResponseOrigin::DataPlane,
-                ResponseKind::Admission,
-            );
+            return too_many_attached_streams_response(limit);
         }
     };
     let stream_state = match attached.kind {
@@ -810,14 +803,7 @@ pub(super) async fn proxy_session(
             Ok(permit) => Some(permit),
             Err(limit) => {
                 pplx_space_metrics::data_plane::attach(kind, limit.metric_label());
-                return Ok(data_plane_http_error(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    DataPlaneHttpErrorCode::RateLimited,
-                    "too many attached streams",
-                    true,
-                    ResponseOrigin::DataPlane,
-                    ResponseKind::Admission,
-                ));
+                return Ok(too_many_attached_streams_response(limit));
             }
         }
     } else {
@@ -910,6 +896,7 @@ pub(super) async fn proxy_session(
     }
 
     record_native_proxied_response(response.status());
+    mark_sandbox_service_response(&mut response);
 
     let response = response.map(|body| completion.body(Body::new(body)));
     if let (Some(downstream_upgrade), Some(upstream_upgrade), Some(stream_permit)) =
@@ -1684,17 +1671,27 @@ fn backend_refusal_http_error(error: &StreamBridgeError) -> Option<Response> {
     if !pplx_space_common_grpc::is_refused_before_start(status) {
         return None;
     }
-    let (http, code, message) = if status.code() == tonic::Code::ResourceExhausted {
+    let (http, code, message, reason) = if status.code() == tonic::Code::ResourceExhausted {
+        // The node's per-sandbox request limiter refuses before start too;
+        // name it apart from the guest's own capacity refusal.
+        let reason =
+            if pplx_space_common_grpc::UdsPerSandboxLimitExceeded::from_status(status).is_some() {
+                TooManyRequestsReason::NodeSandboxLimit
+            } else {
+                TooManyRequestsReason::SandboxAtCapacity
+            };
         (
             StatusCode::TOO_MANY_REQUESTS,
             DataPlaneHttpErrorCode::RateLimited,
             "sandbox is at capacity; this request was refused",
+            Some(reason),
         )
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             DataPlaneHttpErrorCode::ServiceUnavailable,
             "sandbox is not accepting requests right now; this request was refused",
+            None,
         )
     };
     let mut response = data_plane_http_error(
@@ -1706,6 +1703,9 @@ fn backend_refusal_http_error(error: &StreamBridgeError) -> Option<Response> {
         ResponseKind::Admission,
     );
     insert_retry_after(&mut response, pplx_space_common_grpc::retry_after(status));
+    if let Some(reason) = reason {
+        response.extensions_mut().insert(reason);
+    }
     Some(response)
 }
 

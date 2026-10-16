@@ -165,6 +165,7 @@ pub(crate) fn ecw_resolved_route(
         cache_epoch: route_generation,
         origin: test_ecw_route_origin(sandbox_id),
         sandbox_id,
+        org_id: None,
         template_id: Some("seed".to_string()),
         route_generation,
         current_node_id: NodeId::new(),
@@ -881,13 +882,14 @@ pub(crate) async fn test_data_plane_state() -> DataPlaneState {
         unauthenticated: Arc::new(UnauthenticatedUpgradeLimiter::new(1)),
         attached_streams: Arc::new(AttachedStreamLimiter::new(4, 4, 4)),
         uploads: None,
+        upload_tracker: Arc::default(),
         native_sessions: Arc::new(NativeSessionAttachLimiter::default()),
         backend_channels: Arc::new(BackendChannelPool::new(1)),
         revocation_cache: Arc::new(RevocationCache::default()),
         route_cache: Arc::new(RouteCache::default()),
         ecw_route_repairs: Arc::new(DashMap::new()),
         ecw_process_input_locks: Arc::new(EcwProcessInputLocks::default()),
-        ecw_hosts: EcwHostConfig::default(),
+        ecw_hosts: Arc::default(),
         revocation_check_interval: Duration::from_secs(1),
         route_cache_ttl: Duration::from_secs(60),
         shutdown_token: CancellationToken::new(),
@@ -1312,6 +1314,61 @@ fn ecw_backend_status_round_trip_preserves_grpc_code_and_metadata() {
     let not_found = ecw_connect::tonic_status_to_ecw_error(tonic::Status::not_found("gone"))
         .into_tonic_status();
     assert_eq!(not_found.code(), tonic::Code::NotFound);
+}
+
+/// Every 429 a producer builds names its limit, so
+/// `data_plane.http.too_many_requests` never has to fall back to `unclassified`
+/// for a data-plane rejection.
+#[test]
+fn data_plane_429s_carry_their_limit_as_a_response_extension() {
+    let reason = |response: Response| {
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        response
+            .extensions()
+            .get::<TooManyRequestsReason>()
+            .copied()
+    };
+    for (status, expected) in [
+        (
+            pplx_space_common_grpc::uds_per_sandbox_limit_exceeded_status("busy"),
+            TooManyRequestsReason::NodeSandboxLimit,
+        ),
+        (
+            pplx_space_common_grpc::refused_before_start(
+                tonic::Status::resource_exhausted("full"),
+                Duration::from_secs(2),
+            ),
+            TooManyRequestsReason::SandboxAtCapacity,
+        ),
+        (
+            tonic::Status::resource_exhausted("quota"),
+            TooManyRequestsReason::BackendResourceExhausted,
+        ),
+    ] {
+        assert_eq!(
+            reason(ecw_connect::tonic_status_to_ecw_error(status).into_response()),
+            Some(expected),
+        );
+    }
+    for (limit, expected) in [
+        (
+            AttachedStreamLimit::Total,
+            TooManyRequestsReason::AttachedStreams,
+        ),
+        (
+            AttachedStreamLimit::Org,
+            TooManyRequestsReason::AttachedStreamsPerOrg,
+        ),
+        (
+            AttachedStreamLimit::Sandbox,
+            TooManyRequestsReason::AttachedStreamsPerSandbox,
+        ),
+    ] {
+        assert_eq!(
+            reason(native::too_many_attached_streams_response(limit)),
+            Some(expected)
+        );
+    }
 }
 
 #[tokio::test]
@@ -2446,7 +2503,7 @@ fn ecw_sandbox_service_port_requests_use_service_proxy_path() {
 fn data_plane_http_span_metadata_redacts_ecw_proxy_paths() {
     let sandbox_id = SandboxId::new();
     let config = EcwHostConfig::from_env_value(Some(r#"[{"host":"ecw.test"}]"#));
-    let metadata = DataPlaneHttpSpanMetadata::new(config);
+    let metadata = DataPlaneHttpSpanMetadata::new(Arc::new(config));
     let mut headers = HeaderMap::new();
     headers.insert(
         header::HOST,
@@ -2473,7 +2530,7 @@ fn data_plane_http_span_metadata_redacts_ecw_proxy_paths() {
 
 #[test]
 fn data_plane_http_span_metadata_extracts_native_session_id() {
-    let metadata = DataPlaneHttpSpanMetadata::new(EcwHostConfig::default());
+    let metadata = DataPlaneHttpSpanMetadata::new(Arc::default());
 
     assert_eq!(
         metadata.session_id_from_path("/v1/sessions/proc_0193a8f0000070008000000000000000/attach"),
@@ -3812,6 +3869,56 @@ async fn ecw_ingress_does_not_replay_after_upstream_accepts_request_bytes() {
     assert!(done.is_cancelled());
 }
 
+/// A 429 from the sandbox's own service is relayed, not a data-plane limit, so
+/// it must not land in `data_plane.http.too_many_requests` as `unclassified`.
+#[tokio::test]
+async fn ecw_ingress_marks_relayed_sandbox_429_as_sandbox_service() {
+    if !pplx_space_test_env::enter_test_process(&[(
+        "SPACE_INTERNAL_RPC_INSECURE_DEV",
+        Some(std::ffi::OsStr::new("true")),
+    )]) {
+        return;
+    }
+    let state = test_data_plane_state().await;
+    let target = EcwSandboxHost {
+        sandbox_id: SandboxId::new(),
+        port: 8080,
+    };
+    let route = ecw_resolved_route(target.sandbox_id, 1, backend_endpoint("192.0.2.1:9800"));
+    let (client, mut upstream) = tokio::io::duplex(4096);
+    let io = IngressIo::new(
+        client,
+        Completion::new(CancellationToken::new(), Progress::new()),
+    );
+    let sandbox = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        let mut buf = [0; 1024];
+        while !bytes.ends_with(b"\r\n\r\n") {
+            let count = upstream.read(&mut buf).await.unwrap();
+            assert_ne!(count, 0);
+            bytes.extend_from_slice(&buf[..count]);
+        }
+        upstream
+            .write_all(b"HTTP/1.1 429 Too Many Requests\r\ncontent-length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        upstream
+    });
+    let request = Request::get("/").body(Body::empty()).unwrap();
+    let response = ecw_service_ingress_proxy_with_io(state.clone(), target, route, request, io)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response.extensions().get::<TooManyRequestsReason>(),
+        Some(&TooManyRequestsReason::SandboxService),
+    );
+    drop(response);
+    drop(sandbox.await.unwrap());
+    state.upgrade_tasks.close();
+    state.upgrade_tasks.wait().await;
+}
+
 #[tokio::test]
 async fn legacy_ingress_eof_delivers_buffered_body_without_completion_frames() {
     let (io, mut client) = tokio::io::duplex(8);
@@ -4016,7 +4123,9 @@ async fn cached_ingress_refreshes_replaced_execution_but_not_denied_access() {
                 .await
                 .unwrap(),
         );
-        state.ecw_hosts = EcwHostConfig::from_env_value(Some(r#"[{"host":"example.test"}]"#));
+        state.ecw_hosts = Arc::new(EcwHostConfig::from_env_value(Some(
+            r#"[{"host":"example.test"}]"#,
+        )));
         let result = if native {
             let key = native_route_cache_key(
                 session_id,

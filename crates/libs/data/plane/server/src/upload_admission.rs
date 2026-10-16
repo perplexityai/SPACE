@@ -16,7 +16,7 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 use std::time::Duration;
 
-use pplx_space_metrics::data_plane::UploadRejectReason;
+use pplx_space_metrics::data_plane::{TooManyRequestsReason, UploadRejectReason};
 use rand::RngExt as _;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
@@ -69,6 +69,15 @@ pub(crate) struct UploadAdmission {
 pub(crate) struct UploadPermit {
     _upload: OwnedSemaphorePermit,
     _bytes: OwnedSemaphorePermit,
+    reserved_bytes: u64,
+}
+
+impl UploadPermit {
+    /// Budget bytes this permit holds: the reservation rounded up to whole
+    /// permits and capped at the budget, which can differ from what was asked.
+    pub(crate) fn reserved_bytes(&self) -> u64 {
+        self.reserved_bytes
+    }
 }
 
 impl UploadAdmission {
@@ -111,6 +120,7 @@ impl UploadAdmission {
         Ok(UploadPermit {
             _upload: upload,
             _bytes: bytes,
+            reserved_bytes: u64::from(permits) * BYTES_PER_PERMIT,
         })
     }
 
@@ -143,7 +153,10 @@ fn upload_rejected(reason: UploadRejectReason) -> EcwProxyError {
     let retry_after = Duration::from_secs(
         rand::rng().random_range(RETRY_AFTER_MIN.as_secs()..=RETRY_AFTER_MAX.as_secs()),
     );
-    EcwProxyError::too_many_uploads(retry_after)
+    EcwProxyError::too_many_uploads(retry_after).with_too_many_requests_reason(match reason {
+        UploadRejectReason::Concurrency => TooManyRequestsReason::UploadConcurrency,
+        UploadRejectReason::Bytes => TooManyRequestsReason::UploadBytes,
+    })
 }
 
 #[cfg(test)]

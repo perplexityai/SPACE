@@ -3,6 +3,26 @@
 //! stream lifetime is excluded from preparation latency. No sandbox ID labels.
 //! `data_plane.upload.rejected{reason}` counts `POST /files` requests the
 //! per-pod upload admission limiter answered with 429.
+//!
+//! HTTP traffic: `data_plane.http.bytes{direction,route_class}` counts request
+//! body bytes read and response body bytes sent; bytes sent to a client that
+//! then disconnects may not have been delivered. Upgraded connections
+//! (WebSocket, CDP) leave the HTTP body path, so their payload is counted by
+//! `data_plane.stream.bytes_in`/`bytes_out` instead. Streams delivered as HTTP
+//! response bodies (ECW process output and watch, native SSE events) are
+//! counted in both metrics, so don't sum the two.
+//! `data_plane.http.too_many_requests{route_class,reason}` counts every HTTP 429
+//! status the data plane returns. A Connect stream that fails after its first
+//! frame ends inside an HTTP 200 and isn't counted. `reason:sandbox_service`
+//! marks a 429 relayed from a sandbox service rather than produced by a
+//! data-plane limit.
+//! `data_plane.upload.in_flight` and `data_plane.upload.in_flight_bytes` are
+//! per-pod gauges of ECW `POST /files` uploads that resolved their route,
+//! passed request validation, and passed upload admission when it's on, with
+//! the budget bytes admission holds for them (or their declared length or
+//! body limit, when admission is off). An upload without a `Content-Length` reserves the full
+//! body limit, so chunked uploads inflate `in_flight_bytes`. Org attribution
+//! is a per-upload log event, not a tag: org IDs are an unbounded set.
 use std::{fmt, time::Instant};
 
 use crate::emit::{counter, elapsed_ms, gauge, tag, timing_ms};
@@ -691,4 +711,108 @@ pub fn ingress_completion_timeout() {
 }
 pub fn ingress_waiter_rejected() {
     counter("data_plane.ingress.waiter_rejected", 1, &[]);
+}
+
+metric_vocabulary! {
+    /// Which side of an HTTP exchange a body byte count measures.
+    HttpBodyDirection {
+        /// Request body bytes the data plane read from the client.
+        In => "in",
+        /// Response body bytes the data plane wrote to the client.
+        Out => "out",
+    }
+}
+
+metric_vocabulary! {
+    /// Bounded classification of a data-plane HTTP request by the surface it
+    /// reaches, so byte and rejection counters can tell uploads apart from
+    /// process RPCs and sandbox service traffic.
+    HttpRouteClass {
+        /// ECW `GET`/`POST /files`: file downloads and uploads.
+        Files => "files",
+        /// ECW `filesystem.Filesystem/*` Connect RPCs.
+        Filesystem => "filesystem",
+        /// ECW `process.Process/*` Connect RPCs.
+        Process => "process",
+        /// Native `/v1/sessions/*` attach, events, and proxy.
+        NativeSession => "native_session",
+        /// ECW traffic addressed to a sandbox service port rather than envd.
+        ServicePort => "service_port",
+        /// Liveness and readiness probes, and the envd `/health` check.
+        Health => "health",
+        /// Anything else, including unsupported envd endpoints.
+        Other => "other",
+    }
+}
+
+metric_vocabulary! {
+    /// Why the data plane answered 429. Producers attach the reason to the
+    /// response; a 429 without one is counted as `unclassified`, so a new
+    /// producer that forgets to name itself is still visible.
+    TooManyRequestsReason {
+        /// The pod's attached-stream cap.
+        AttachedStreams => "attached_streams",
+        /// The per-org attached-stream cap.
+        AttachedStreamsPerOrg => "attached_streams_per_org",
+        /// The per-sandbox attached-stream cap.
+        AttachedStreamsPerSandbox => "attached_streams_per_sandbox",
+        /// A service-port ingress preparation waiter cap: process-wide or
+        /// per-sandbox. The permit does not say which one rejected.
+        IngressPreparation => "ingress_preparation",
+        /// The node's per-sandbox request limiter rejected the backend call.
+        NodeSandboxLimit => "node_sandbox_limit",
+        /// The sandbox refused before starting anything because it's at
+        /// capacity.
+        SandboxAtCapacity => "sandbox_at_capacity",
+        /// No concurrent-upload slot freed within the upload admission wait.
+        UploadConcurrency => "upload_concurrency",
+        /// The upload in-flight byte budget couldn't cover the reservation in
+        /// time.
+        UploadBytes => "upload_bytes",
+        /// A backend returned `RESOURCE_EXHAUSTED` with no more specific shape.
+        BackendResourceExhausted => "backend_resource_exhausted",
+        /// Not a data-plane limit: a relay marker on responses from the
+        /// sandbox's own service, so a 429 it returned isn't miscounted.
+        SandboxService => "sandbox_service",
+        /// A 429 whose producer did not name a reason.
+        Unclassified => "unclassified",
+    }
+}
+
+/// Records HTTP body bytes moved for one route class. Callers batch, so one
+/// call can cover many frames of a single body.
+pub fn http_bytes(direction: HttpBodyDirection, route_class: HttpRouteClass, bytes: u64) {
+    if bytes == 0 {
+        return;
+    }
+    counter(
+        "data_plane.http.bytes",
+        bytes,
+        &[
+            tag("direction", direction.as_str()),
+            tag("route_class", route_class.as_str()),
+        ],
+    );
+}
+
+/// Records one 429 response.
+pub fn http_too_many_requests(route_class: HttpRouteClass, reason: TooManyRequestsReason) {
+    counter(
+        "data_plane.http.too_many_requests",
+        1,
+        &[
+            tag("route_class", route_class.as_str()),
+            tag("reason", reason.as_str()),
+        ],
+    );
+}
+
+/// Reports the pod's in-flight ECW uploads and the bytes they reserve.
+pub fn upload_in_flight(count: usize, reserved_bytes: u64) {
+    gauge("data_plane.upload.in_flight", count as f64, &[]);
+    gauge(
+        "data_plane.upload.in_flight_bytes",
+        reserved_bytes as f64,
+        &[],
+    );
 }
