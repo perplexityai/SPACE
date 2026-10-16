@@ -40,6 +40,8 @@ Spec (TOML):
   items = ["fn parse_*", "struct Config", "impl Config", "impl Display for Config"]
   # optional: allow_unused_glob = true   (the module needs nothing from its parent: keep
   #           `use super::*;` under #[allow(unused_imports)], which -D warnings would reject)
+  # optional: allow_unused_reexport = true   (the parent's `use child::*;` is kept, under
+  #           #[allow(unused_imports)], when nothing outside the module names its items)
   # optional: allow_macro_items = true   (move top-level macro invocations; their emitted
   #           items keep the visibility the macro gives them)
 
@@ -1159,6 +1161,11 @@ def apply(spec_path: str, repo: str, dry: bool, report: str | None) -> int:
         if r["reexport"] == "none":
             continue
         gate = "".join(c + "\n" for c in r["cfg"])
+        allow = mod.get("allow_unused_reexport", False)
+        if not isinstance(allow, bool):
+            raise SystemExit(f"module {mod['name']}: allow_unused_reexport must be true or false")
+        if allow:
+            gate += "#[allow(unused_imports)]\n"
         uses.append(f"{gate}{r['use_vis']}use {mod['name']}::*;")
     decl_text = "\n".join(decls) + ("\n\n" + "\n".join(uses) if uses else "")
 
@@ -1385,6 +1392,10 @@ def derive_spec(repo: str, base: str, head: str, parent: str, children: list[str
             out.append(f"doc = {json.dumps(doc, ensure_ascii=False)}")
         if "allow(unused_imports)" in glob_lead:
             out.append("allow_unused_glob = true")
+        for k, it in enumerate(hp_items):
+            if it.kind == "use" and re.search(r"\buse\s+" + re.escape(name) + r"::\*;", it.name) and \
+                    "allow(unused_imports)" in "\n".join(head_parent.split("\n")[it.lead:it.start]):
+                out.append("allow_unused_reexport = true")
         if any(it.kind == "macro" for it in items):
             out.append("allow_macro_items = true")
         out.append("items = [\n" + "".join(f"  {json.dumps(x, ensure_ascii=False)},\n" for x in dict.fromkeys(sels)) + "]")

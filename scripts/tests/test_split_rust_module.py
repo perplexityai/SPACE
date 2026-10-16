@@ -1029,3 +1029,11 @@ def test_a_module_name_used_as_a_path_in_an_existing_child_is_refused(repo):
     r = write_parent(repo, "mod existing;\n\nfn f() {}\n",
                      'file = "crate/src/a/foo.rs"\n[[module]]\nname = "util"\nitems = ["fn f"]\n')
     assert r.returncode != 0 and "already used as a path" in r.stderr
+
+
+def test_an_unused_reexport_is_kept_under_an_allowance_and_round_trips(repo):
+    (repo / "spec.toml").write_text(SPEC.replace('name = "k8s"\n', 'name = "k8s"\nallow_unused_reexport = true\n'))
+    apply_and_commit(repo)
+    parent = (repo / "crate/src/a/foo.rs").read_text()
+    assert '#[allow(unused_imports)]\nuse k8s::*;' in parent
+    assert run("verify", "HEAD~1", cwd=repo).returncode == 0
