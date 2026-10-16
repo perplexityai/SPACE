@@ -1,6 +1,7 @@
+use crate::host_command::Command;
 use pplx_space_common_core::types::LinuxNetworkSlot;
 use std::io;
-use std::process::{Command, ExitStatus, Output};
+use std::process::{ExitStatus, Output};
 use std::sync::OnceLock;
 
 pub use native::NAMESPACE_ICMP_RATEMASK;

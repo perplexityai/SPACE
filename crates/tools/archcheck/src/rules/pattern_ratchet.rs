@@ -63,7 +63,13 @@ impl CountRatchet for Instance<'_> {
     /// `file`'s code lines that match the patterns, unless its path is
     /// allowed or none do. Findings about them are shown on the first.
     fn measure(&self, file: &ProductionFile) -> Option<Count> {
-        if self.config.allow.is_match(&file.path) {
+        if self
+            .config
+            .include
+            .as_ref()
+            .is_some_and(|scope| !scope.is_match(&file.path))
+            || self.config.allow.is_match(&file.path)
+        {
             return None;
         }
         let mut lines = code_lines(&file.text)

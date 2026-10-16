@@ -16,6 +16,8 @@ pub mod loop_devices;
 pub mod memory_admission;
 pub mod net;
 mod node_state_sync;
+#[cfg(target_os = "linux")]
+pub mod process_signals;
 mod rootfs_dmcrypt;
 mod run;
 pub mod runtime_paths;

@@ -138,6 +138,13 @@
 "crates/libs/template/mgr/src/service.rs" = 3
 "crates/libs/vol/mgr/server/src/staging.rs" = 2
 
+[pattern_ratchet.node_manager_commands]
+# The namespace runner's std::Command parameter is the bounded fork exception.
+"crates/libs/node/mgr/server/src/host_command.rs" = 1
+"crates/libs/node/mgr/server/src/host_command/spawn.rs" = 2
+"crates/libs/node/mgr/server/src/service/artifact_fs/receive.rs" = 4
+"crates/libs/node/mgr/server/src/net/fallback.rs" = 1
+
 # [crate_names] maps each workspace package with a catch-all name (a part such
 # as `common`, `utils` or `core`) to its member path. Only remove entries: a pull
 # request that adds one is reported, and fails the check.

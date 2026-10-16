@@ -78,6 +78,38 @@ mode = "required"
 [rules.pattern_ratchet.rootfs_copy.stale_entries]
 mode = "required"
 
+# Node-manager host tools need the runner's child signal policy and ownership.
+# Tests are excluded by the production-file inventory. Namespace setup, the
+# spawn owner and the existing non-Linux fallback are capped in the baseline.
+[rules.pattern_ratchet.node_manager_commands]
+include = [
+  "crates/libs/node/mgr/server/src/**",
+  "crates/apps/node/mgr/svc/src/**",
+]
+patterns = [
+  '\b(?:std\s*::\s*)?process\s*::\s*(?:Command\b|\{[^}]*\bCommand\b)',
+  '\buse\s+std\s*::\s*process\s*(?:as\s+\w+\s*)?;',
+  '\buse\s+std\s*::\s*\{[^}]*\bprocess\b',
+  '\b(?:std\s*::\s*)?process\s*::\s*\{\s*$',
+]
+allow = []
+
+[rules.pattern_ratchet.node_manager_commands.no_crossing]
+mode = "required"
+
+# Seeded exceptions are review findings; new matches and cap growth fail.
+[rules.pattern_ratchet.node_manager_commands.no_new_entries]
+mode = "advisory"
+
+[rules.pattern_ratchet.node_manager_commands.no_raised_caps]
+mode = "required"
+
+[rules.pattern_ratchet.node_manager_commands.listed_no_growth]
+mode = "required"
+
+[rules.pattern_ratchet.node_manager_commands.stale_entries]
+mode = "required"
+
 [rules.crate_names]
 # A crate matches if a part of its package or library name, lowercased and
 # split on `-` and `_`, is one of these.

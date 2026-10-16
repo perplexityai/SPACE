@@ -190,6 +190,38 @@ restarted send appends a new stream after the partial one and still reports
 success, and `btrfs receive` later rejects the result with "crc32 mismatch in
 command". The check fails such an attempt with `Aborted`, so the upload aborts
 and the job retries with a fresh send.
+
+On Linux, the node-manager binary blocks SIGINT/SIGTERM before constructing its
+runtime or telemetry. One dedicated thread consumes these process-directed
+signals with `sigtimedwait` and cancels the service's shutdown token. Runtime,
+blocking-pool and library threads inherit the mask, so stop signals cannot
+interrupt their non-repeatable kernel operations. Host tools and the runtime
+supervisor activator use `posix_spawn` with explicit signal attributes. Their
+mask comes from startup, with SIGINT/SIGTERM unblocked, rather than from a
+worker's temporary send mask. SIGINT, SIGTERM and SIGPIPE dispositions reset to
+default. The command API accepts only program and arguments and inherits the
+environment; it cannot silently discard cwd, credentials or process-group setup.
+Plain child processes own pidfds for termination and retain their exit status
+after reaping. Linux pidfd support (5.3 or later) and permission to use those
+syscalls are required; failure to acquire a pidfd kills and reaps the child
+before returning an error.
+
+Btrfs receive's pinned mount namespace setup remains the explicit fork/pre-exec
+exception. It uses the same child signal policy, and retains bounded command I/O,
+cancellation and kill/reap ownership. A failure in the signal receiver starts
+shutdown; ordinary exit stops and joins the receiver before restoring the startup
+thread's mask. This routing selects stop signals only: it does not redirect
+profiler signals or thread-directed delivery.
+
+For non-regular output, the dedicated sending thread blocks asynchronous
+application signals around the send ioctl and restores its previous mask before
+returning to the blocking pool. Fault signals remain deliverable to crash handlers;
+sends to regular files keep their normal signal handling. Profiler timer signals
+on the sending thread are delayed until the ioctl finishes. Other threads
+continue handling shutdown. The streaming pipe producer cancels by closing its
+reader to unblock the send. Unmaskable stops and cgroup freezes can still
+restart the ioctl, so the framing check remains necessary.
+
 Retries start a new send and multipart upload; regenerated streams need not be
 byte-identical. The remote zstd/btrfs-send format and restore decoder do not change.
 This removes one uncompressed send-file write and its compression read. It does

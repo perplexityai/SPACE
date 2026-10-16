@@ -27,7 +27,7 @@ h2 = { workspace = true }
 hyper = { workspace = true }
 jiff = { workspace = true }
 libc = { workspace = true }
-rustix = { workspace = true, features = ["fs", "mount"] }
+rustix = { workspace = true, features = ["fs", "mount", "process"] }
 nix = { workspace = true, features = ["dir", "fs", "mount", "sched", "process", "resource", "signal", "user"] }
 rusqlite = { workspace = true }
 socket2 = { workspace = true }

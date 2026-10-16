@@ -57,6 +57,9 @@ pub struct FileSizeConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PatternRatchetConfig {
+    /// Optional repository-relative scope; absent means all production files.
+    #[serde(default)]
+    pub include: Option<AllowList>,
     /// A code line matching any of these regexes is restricted.
     pub patterns: Patterns,
     /// Repository-relative path globs whose files may match freely.

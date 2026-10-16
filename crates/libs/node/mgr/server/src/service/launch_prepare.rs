@@ -958,11 +958,11 @@ fn resize_ext4_rootfs(rootfs_path: &str, rootfs_size_mb: u32) -> Result<(), Stat
     let device = crate::device_backing::LoopDevice::attach(&backing, false)
         .map_err(super::artifact_fs::error)?;
 
-    let mut fsck = std::process::Command::new("e2fsck");
+    let mut fsck = crate::host_command::Command::new("e2fsck");
     fsck.arg("-fy").arg(device.path());
     run_rootfs_resize_command("e2fsck", &mut fsck, |code| code == Some(1))?;
 
-    let mut resize = std::process::Command::new("resize2fs");
+    let mut resize = crate::host_command::Command::new("resize2fs");
     resize.arg(device.path());
     run_rootfs_resize_command("resize2fs", &mut resize, |_| false)
 }
@@ -991,7 +991,7 @@ fn open_instance_rootfs(instance_dir: &Path) -> Result<std::fs::File, Status> {
 
 fn run_rootfs_resize_command(
     operation: &'static str,
-    command: &mut std::process::Command,
+    command: &mut crate::host_command::Command,
     success_code: impl FnOnce(Option<i32>) -> bool,
 ) -> Result<(), Status> {
     let status = crate::host_command::output(command, crate::host_command::MUTATION_BUDGET, &[])

@@ -4188,3 +4188,40 @@ fn pattern_ratchet_errors_point_at_the_line() {
         assert!(error.contains(problem), "{key}: {error}");
     }
 }
+
+#[test]
+fn pattern_ratchet_include_scopes_measurement_without_changing_default() {
+    for (include, expected) in [
+        (None, vec!["crates/a/src/lib.rs", "crates/b/src/lib.rs"]),
+        (Some("['crates/a/src/**']"), vec!["crates/a/src/lib.rs"]),
+        (Some("[]"), vec![]),
+    ] {
+        let mut rule = ratchet(
+            "scoped",
+            &[r"\bold_table\b"],
+            &["crates/a/src/owner.rs"],
+            REQUIRED,
+        );
+        if let Some(include) = include {
+            rule = rule.replace("patterns =", &format!("include = {include}\npatterns ="));
+        }
+        let ws = workspace(&[
+            ("ARCHITECTURE.toml", format!("{}{rule}", config(ADVISORY))),
+            (
+                "architecture-baseline.toml",
+                ratchet_baseline(&[("scoped", &[])]),
+            ),
+            ("crates/a/src/lib.rs", "old_table\n".to_owned()),
+            ("crates/a/src/owner.rs", "old_table\n".to_owned()),
+            ("crates/a/src/tests.rs", "old_table\n".to_owned()),
+            ("crates/b/src/lib.rs", "old_table\n".to_owned()),
+        ]);
+        let ctx = Context::load(ws.path()).unwrap();
+        let paths: Vec<_> = check(&ctx)
+            .into_iter()
+            .filter(|finding| finding.code() == "pattern_ratchet.scoped.no_crossing")
+            .map(|finding| finding.path)
+            .collect();
+        assert_eq!(paths, expected, "include={include:?}");
+    }
+}

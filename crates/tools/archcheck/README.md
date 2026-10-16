@@ -66,6 +66,7 @@ table:
 ```toml
 [rules.pattern_ratchet.<instance>]
 patterns = ['\bsome_name\b']     # regexes, matched against each code line
+include = ["crates/x/src/**"]  # optional; omitted means all production files
 allow = ["crates/x/src/owner.rs", "crates/x/src/owner/**"]
 
 [rules.pattern_ratchet.<instance>.no_crossing]
@@ -73,6 +74,10 @@ mode = "advisory"
 # ...and no_new_entries, no_raised_caps, listed_no_growth and stale_entries,
 # as for file_size
 ```
+
+Only production files matching `include` are measured when it is present; an
+empty list measures none. `allow` exempts files within that scope. Existing
+instances without `include` retain their repository-wide scope.
 
 It counts mentions, not uses. A code line matches if any pattern matches
 anywhere in it, so a string literal, an error message, a log line or a
