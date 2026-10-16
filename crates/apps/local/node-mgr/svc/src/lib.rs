@@ -7,6 +7,7 @@
 //! CI box with no KVM, no btrfs, and no `NET_ADMIN`.
 
 pub mod config;
+mod ext4_lengths;
 pub mod paths;
 pub mod process;
 pub mod service;

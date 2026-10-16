@@ -103,6 +103,7 @@ or (package(pplx-space-template-mgr) and test(=rootfs_backing::tests::materializ
 or (package(pplx-space-node-mgr) and test(=contained_copy::tests::staging_preserves_nocow_sparse_files_and_clone_isolation))
 or (package(pplx-space-node-mgr) and test(=service::node_disk_metrics::rootfs_backing::tests::backing_inspection_reads_actual_btrfs_inode_policy))
 or (package(pplx-space-node-mgr) and test(=clone_tree::tests::private_clone_blocks_foreign_uid_grafts_and_shared_clone_is_held))
+or (package(pplx-space-local-node-mgr-svc) and test(=inline_rootfs_extraction_preserves_file_contents_and_names))
 or (package(pplx-space-node-mgr) and test(=loop_devices::tests::ensure_capacity_creates_attachable_devices_past_max_loop))
 or (package(pplx-space-node-mgr) and test(=service::gateway_isolation::tests::isolated_gateway_cannot_access_vm_resources))
 or (package(pplx-space-node-mgr) and test(=service::encrypted_volumes::tests::ciphertext_publication_is_readable_without_exposing_private_backings))

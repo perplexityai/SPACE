@@ -50,7 +50,9 @@ pub fn extract_ext4_to_dir(image: &Path, dir: &Path) -> std::io::Result<()> {
             image.display()
         )));
     }
-    Ok(())
+    // debugfs can emit the inline storage capacity instead of the file length.
+    // Inode sizes remain authoritative, including for empty inline files.
+    super::ext4_lengths::restore_file_lengths(image, dir)
 }
 
 /// Build an ext4 image from a directory tree without loop-mounting it.
