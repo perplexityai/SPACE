@@ -4,7 +4,9 @@ use std::time::Duration;
 use anyhow::Context as _;
 use clap::Parser;
 use pplx_space_common_svc::DEFAULT_SERVICE_MUTEX_TIMEOUT;
-use pplx_space_node_ctl_server::{DEFAULT_NODE_CTL_CONFIG_PATH, NodeCtlRunConfig, SERVICE_NAME};
+use pplx_space_node_ctl_server::{
+    DEFAULT_NODE_CTL_CONFIG_PATH, DEFAULT_NODE_CTL_SOCKET_GROUP, NodeCtlRunConfig, SERVICE_NAME,
+};
 
 #[derive(Parser)]
 #[command(
@@ -23,7 +25,7 @@ struct Cli {
     config: PathBuf,
 
     /// Production node-ctl Unix socket. Bound only after the service mutex
-    /// is acquired.
+    /// beside it, `service.mutex` in the same directory, is acquired.
     #[arg(long, default_value = pplx_space_common_core::host::linux::paths::NODE_CTL_SOCKET)]
     socket: PathBuf,
 
@@ -41,6 +43,12 @@ struct Cli {
     /// visible failure instead of an indefinitely-passive process.
     #[arg(long, default_value_t = DEFAULT_SERVICE_MUTEX_TIMEOUT.as_secs())]
     service_mutex_timeout_secs: u64,
+
+    /// The group the production socket is given, so a test can name a group
+    /// it belongs to. Test builds only.
+    #[cfg(feature = "test-hooks")]
+    #[arg(long, default_value = DEFAULT_NODE_CTL_SOCKET_GROUP)]
+    socket_group: String,
 
     #[arg(long, default_value = pplx_space_common_core::host::linux::paths::NODE_CTL_DB)]
     db: PathBuf,
@@ -60,6 +68,12 @@ impl From<Cli> for NodeCtlRunConfig {
             socket_path: cli.socket,
             health_socket_path: cli.health_socket,
             service_mutex_timeout: Duration::from_secs(cli.service_mutex_timeout_secs),
+            // Parsed once per process, and the socket options take a
+            // `&'static str`.
+            #[cfg(feature = "test-hooks")]
+            socket_group: cli.socket_group.leak(),
+            #[cfg(not(feature = "test-hooks"))]
+            socket_group: DEFAULT_NODE_CTL_SOCKET_GROUP,
             db_path: cli.db,
             poll_interval_secs: cli.poll_interval_secs,
             role: cli.role,

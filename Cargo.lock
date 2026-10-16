@@ -6267,9 +6267,16 @@ version = "0.8.0"
 dependencies = [
  "anyhow",
  "clap",
+ "hyper-util",
+ "nix 0.31.3",
  "pplx-space-common-core",
  "pplx-space-common-svc",
  "pplx-space-node-ctl-server",
+ "tempfile",
+ "tokio",
+ "tonic",
+ "tonic-health",
+ "tower",
 ]
 
 [[package]]
