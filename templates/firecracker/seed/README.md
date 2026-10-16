@@ -185,6 +185,9 @@ notification path.
 
 The seed builder downloads an Ubuntu Minimal Cloud squashfs, verifies it,
 chroots into it, installs minimal packages, and packs it into an ext4 image.
+The filesystem uses `inline_data` to keep small directories and files in their
+inodes, with a 4 MiB journal and 1% reserved blocks. Existing templates need a
+rebuild to adopt this layout.
 The Docker and node-local containerd launchers use the same rootfs builder.
 
 ### Download verification
