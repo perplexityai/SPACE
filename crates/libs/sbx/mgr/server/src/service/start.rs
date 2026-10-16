@@ -184,6 +184,21 @@ fn interrupted_restore_action(
     }
 }
 
+/// gRPC status for a failed activation claim. A retired attempt or generation
+/// is not retryable as-is: the caller must start a newer execution.
+pub(super) fn begin_activation_status(
+    error: crate::db::BeginActivationError,
+    context: &str,
+) -> Status {
+    match error {
+        error @ (crate::db::BeginActivationError::RolledBackAttempt { .. }
+        | crate::db::BeginActivationError::RetiredGeneration { .. }) => {
+            Status::failed_precondition(error.to_string())
+        }
+        error => Status::internal(format!("{context}: {error}")),
+    }
+}
+
 impl StartSandboxContext {
     fn from_request(req: &StartRequest) -> Result<Self, Status> {
         let checkpoint = req.checkpoint.clone().unwrap_or_default();
@@ -660,6 +675,33 @@ where
 }
 
 impl SandboxManagerService {
+    /// Refuse an activation this node already retired, before any restore or
+    /// start work, using the identity the request carries.
+    /// `begin_activation_with_route_evidence` repeats the check atomically
+    /// with the claim, after the identity is resolved.
+    fn refuse_retired_activation(
+        &self,
+        sandbox_id: &str,
+        expected_state: SandboxState,
+        ctx: &StartSandboxContext,
+    ) -> Result<(), Status> {
+        let db = self.db_conn()?;
+        match crate::db::retired_activation(
+            &db,
+            sandbox_id,
+            expected_state,
+            ctx.execution_generation,
+            ctx.space_api_route_identity.activation_attempt_id,
+            ctx.operation_activation_attempt_id,
+        ) {
+            Ok(None) => Ok(()),
+            Ok(Some(error)) | Err(error) => Err(begin_activation_status(
+                error,
+                "failed to check activation retirement",
+            )),
+        }
+    }
+
     fn resolve_start_context_route_identity(
         &self,
         sandbox: &crate::db::SandboxRow,
@@ -1537,6 +1579,14 @@ impl SandboxManagerService {
             StartSandboxTarget::MissingCheckpointRestore {
                 sandbox_id: restore_sandbox_id,
             } => {
+                // An evicted row takes its rollback receipt with it; the
+                // delete receipt still fences the generation. Refuse before
+                // rebuilding the row from the remote snapshot.
+                self.refuse_retired_activation(
+                    &restore_sandbox_id,
+                    SandboxState::Suspended,
+                    &start_ctx,
+                )?;
                 match self
                     .materialize_missing_checkpoint_restore(&restore_sandbox_id, &mut start_ctx)
                     .instrument(tracing::info_span!(
@@ -1567,6 +1617,8 @@ impl SandboxManagerService {
                 .await?;
         }
         let sandbox = start_lookup.sandbox;
+        // A late retry of a retired activation does no restore or start work.
+        self.refuse_retired_activation(&sandbox.id, sandbox.state, &start_ctx)?;
         let restore_cleanup_id = if checkpoint == SUSPEND_CHECKPOINT {
             self.checkpoint_restore_cleanup_episode_id(&sandbox)?
         } else {
@@ -1757,15 +1809,11 @@ impl SandboxManagerService {
                     open_claim: open_route_activation.as_ref(),
                 },
             )
-            .map_err(|error| match error {
-                // Not retryable as-is: the caller must mint a new attempt.
-                error @ (crate::db::BeginActivationError::RolledBackAttempt { .. }
-                | crate::db::BeginActivationError::RetiredGeneration { .. }) => {
-                    Status::failed_precondition(error.to_string())
-                }
-                error => Status::internal(format!(
-                    "failed to claim starting state before cold activation: {error}"
-                )),
+            .map_err(|error| {
+                begin_activation_status(
+                    error,
+                    "failed to claim starting state before cold activation",
+                )
             })
         };
         let cleanup_episode = match cleanup_episode {
