@@ -132,9 +132,25 @@ fn sandbox_lifecycle_to_wake_target_proto(
     lifecycle: SandboxLifecycle,
 ) -> Result<i32, SubstrateError> {
     use pplx_space_sbx_mgr_client::proto::WakeTargetState;
+    match restore_transition_target_state(lifecycle)? {
+        SandboxTransitionTargetState::Started => Ok(WakeTargetState::Started as i32),
+        SandboxTransitionTargetState::Paused => Ok(WakeTargetState::Paused as i32),
+        other => Err(SubstrateError::Conflict {
+            message: format!("restore target {other:?} has no wake target state"),
+        }),
+    }
+}
+
+/// The activation-attempt target a restore to `lifecycle` records, and the one
+/// definition of which restore targets exist.
+/// [`sandbox_lifecycle_to_wake_target_proto`] maps through it, and
+/// [`KubernetesSubstrate::restore_execution_inner`] calls that before claiming.
+fn restore_transition_target_state(
+    lifecycle: SandboxLifecycle,
+) -> Result<SandboxTransitionTargetState, SubstrateError> {
     match lifecycle {
-        SandboxLifecycle::Started => Ok(WakeTargetState::Started as i32),
-        SandboxLifecycle::Paused => Ok(WakeTargetState::Paused as i32),
+        SandboxLifecycle::Started => Ok(SandboxTransitionTargetState::Started),
+        SandboxLifecycle::Paused => Ok(SandboxTransitionTargetState::Paused),
         other => Err(SubstrateError::Conflict {
             message: format!("restore target_state must be Started or Paused, got {other}"),
         }),
@@ -375,7 +391,13 @@ impl KubernetesSubstrate {
                     .release_user_restore_lease(sandbox_id, token)
                     .await
             }
-            RestoreClaim::RedroveRestoring {
+            // Unreachable as written: only the evacuation claim produces this
+            // variant, and evacuation restores are `RecoveryCharge::Exempt`,
+            // so no deferred charge can reject one. If it ever is, leaving
+            // the row `restoring` is the release, for the reason
+            // `RestoreClaim::FreshFromStopped` gives.
+            RestoreClaim::FreshFromStopped
+            | RestoreClaim::RedroveRestoring {
                 restore_lease_token: None,
             } => Ok(()),
         };
@@ -918,8 +940,13 @@ impl KubernetesSubstrate {
                 message: "kubernetes substrate requires blocking=true for restore".to_string(),
             });
         }
+        // Refuse a target the wake can't express before claiming. Past the
+        // claim the row is already `restoring`, and a refusal there depends on
+        // the failure cleanup to undo it — which a fresh stopped claim
+        // deliberately doesn't do.
+        sandbox_lifecycle_to_wake_target_proto(target_state)?;
         // Evacuation restore (`evacuation_placement` outer `Some`) claims the
-        // suspended → restoring transition atomically on the
+        // suspended (or released stopped) → restoring transition atomically on the
         // `evacuation_restore_target` marker, so it can't restore a sandbox a
         // concurrent user restore just cleared the marker on. The user
         // restore path (`None`) claims without the marker — it's allowed to
@@ -1473,11 +1500,7 @@ impl KubernetesSubstrate {
         let requested_attempt_id = pplx_space_common_core::types::SandboxActivationAttemptId::new();
         let activation_assignment = ActivationAttemptAssignment::new(
             requested_attempt_id,
-            match target_state {
-                SandboxLifecycle::Started => SandboxTransitionTargetState::Started,
-                SandboxLifecycle::Paused => SandboxTransitionTargetState::Paused,
-                _ => unreachable!("restore target was validated above"),
-            },
+            restore_transition_target_state(target_state)?,
         );
         // Error variants alone cannot prove whether runtime work exists. Keep
         // dispatch evidence outside the timed future so outer cancellation,
@@ -1544,11 +1567,7 @@ impl KubernetesSubstrate {
                     sandbox_id,
                     activation_attempt_id,
                     joined_attempt_id,
-                    match target_state {
-                        SandboxLifecycle::Started => SandboxTransitionTargetState::Started,
-                        SandboxLifecycle::Paused => SandboxTransitionTargetState::Paused,
-                        _ => unreachable!("restore target was validated above"),
-                    },
+                    restore_transition_target_state(target_state)?,
                 )
                 .await?;
             let fence_ownership = fence.ownership();

@@ -4687,6 +4687,65 @@ mod kubernetes_tests {
         Ok(())
     }
 
+    /// An evacuation restore whose target the wake can't express yet — `Stopped`,
+    /// the only target a stopped evacuation asks for — is refused before the
+    /// claim. A sandbox that is on no node keeps its marker, its retry
+    /// bookkeeping and its `stopped` lifecycle, and no pod is created. The
+    /// refusal is a `Conflict`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unservable_evacuation_restore_target_is_refused_before_the_claim()
+    -> Result<(), BoxError> {
+        // Arrange: the shape a stopped evacuation's teardown leaves, which
+        // the evacuation claim would otherwise take.
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        insert_test_sandbox_row(&pool, sandbox_id, "stopped").await?;
+        sqlx::query(
+            "UPDATE sandboxes
+                SET evacuation_restore_target = 'stopped',
+                    placement = 'unplaced',
+                    active_node_id = NULL,
+                    restore_attempt_count = 3
+              WHERE id = $1",
+        )
+        .bind(sandbox_id)
+        .execute(&pool)
+        .await?;
+        let (substrate, request_count) = substrate_with_failed_pod_creates(pool.clone());
+
+        // Act.
+        let error = substrate
+            .restore_evacuated_execution(
+                SandboxApiMetricIdentity::native("node_drain.evacuate"),
+                sandbox_id,
+                crate::controllers::substrate::ActivationOptions {
+                    blocking: true,
+                    ready_timeout: Duration::from_secs(2),
+                },
+                None,
+                SandboxLifecycle::Stopped,
+            )
+            .await
+            .expect_err("the wake can't express a stopped target yet");
+
+        // Assert.
+        assert!(
+            matches!(error, SubstrateError::Conflict { .. }),
+            "got {error:?}"
+        );
+        let row: (String, Option<String>, i32) = sqlx::query_as(
+            "SELECT lifecycle, evacuation_restore_target, restore_attempt_count
+               FROM sandboxes WHERE id = $1",
+        )
+        .bind(sandbox_id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(row, ("stopped".to_string(), Some("stopped".to_string()), 3));
+        assert_eq!(request_count.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn wake_losing_restore_lease_joins_owner_binding_without_pod_create()
     -> Result<(), BoxError> {

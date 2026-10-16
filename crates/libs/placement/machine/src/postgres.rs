@@ -122,6 +122,7 @@ fn completion_sql(generation_pin: Option<&str>, ownership_predicate: &str) -> St
                                AND e.pod_ip IS NOT NULL
                        ) placed
                       WHERE sandboxes.id = placed.sandbox_id
+                        AND sandboxes.evacuation_restore_target IS DISTINCT FROM 'stopped'
                         AND {ownership_predicate}"
     )
 }
@@ -134,7 +135,8 @@ fn completion_sql(generation_pin: Option<&str>, ownership_predicate: &str) -> St
 const USER_RESTORE_CLAIM_SQL: &str = include_str!("postgres/sql/user_restore_claim.sql");
 
 /// Evacuation-path claim, atomic on the node-drain `evacuation_restore_target`
-/// marker: `suspended -> restoring` only while the marker is set. Adapted from
+/// marker: `suspended` (or a released stopped evacuation's `stopped`) ->
+/// `restoring` only while the marker is set. Adapted from
 /// the marker-required branch of `begin_restore_lifecycle`; guards commented
 /// in the SQL.
 ///
@@ -260,7 +262,7 @@ impl PostgresPlacementStore {
         sandbox: SandboxId,
         kind: ClaimKind,
     ) -> Result<ClaimOutcome, PlacementError> {
-        let snapshot = sqlx::query_as::<_, (String, i64, i64, Option<i64>, bool)>(
+        let snapshot = sqlx::query_as::<_, (String, i64, i64, Option<i64>, bool, bool, bool)>(
             sqlx::AssertSqlSafe(sql!(CLAIM_MISS_SNAPSHOT_SQL)),
         )
         .bind(sandbox)
@@ -273,6 +275,8 @@ impl PostgresPlacementStore {
             execution_owned_until_ms,
             backoff_until_ms,
             marker_present,
+            stopped_marker,
+            resident,
         )) = snapshot
         else {
             return Err(PlacementError::SandboxNotFound(sandbox));
@@ -300,6 +304,23 @@ impl PostgresPlacementStore {
                 } else {
                     lease_expires_at_ms.max(execution_owned_until_ms)
                 }
+            }
+            // `stopped` is in the evacuation claim's window only. A markerless
+            // row reaches the superseded check below; a stopped evacuation's
+            // own marker on a row still on its node is a teardown in progress.
+            Some(SandboxLifecycle::Stopped) if kind == ClaimKind::EvacuationRestore => {
+                match (marker_present, stopped_marker, resident) {
+                    (true, true, true) => {
+                        return Ok(ClaimOutcome::Blocked(
+                            BlockedReason::StoppedEvacuationNotReleased,
+                        ));
+                    }
+                    (true, false, _) => {
+                        return Ok(ClaimOutcome::Blocked(BlockedReason::Lifecycle(lifecycle)));
+                    }
+                    _ => {}
+                }
+                lease_expires_at_ms
             }
             _ => return Ok(ClaimOutcome::Blocked(BlockedReason::Lifecycle(lifecycle))),
         };
@@ -339,10 +360,12 @@ impl PostgresPlacementStore {
                 value: attempt_count.to_string(),
                 reason: err.to_string(),
             })?;
-        // The candidate WHERE admits exactly two shapes, so anything else
-        // decoding here means the guard and this vocabulary have drifted.
+        // The candidate WHEREs admit exactly these three shapes (`stopped`
+        // through the evacuation claim only), so anything else decoding here
+        // means a guard and this vocabulary have drifted.
         let origin = match parse_stored_lifecycle(sandbox, claimed_from_raw.trim())?.live() {
             Some(SandboxLifecycle::Suspended) => ClaimOrigin::FreshFromSuspended,
+            Some(SandboxLifecycle::Stopped) => ClaimOrigin::FreshFromStopped,
             Some(SandboxLifecycle::Restoring) => ClaimOrigin::RedroveRestoring,
             _ => {
                 return Err(PlacementError::UndecodableRow {
@@ -485,9 +508,13 @@ impl PlacementStore for PostgresPlacementStore {
     /// execution on an unregistered or non-worker node cannot complete.
     ///
     /// Evacuation completions are lifecycle-preserving: the completion
-    /// stamps back the `evacuation_restore_target` marker (CHECK-pinned to
-    /// `'started'`/`'paused'`) and consumes it. The user claim cleared the
-    /// marker, so a user completion finalizes `started`.
+    /// stamps back the `evacuation_restore_target` marker and consumes it.
+    /// The user claim cleared the marker, so a user completion finalizes
+    /// `started`. A stopped evacuation (marker `'stopped'`) can't complete
+    /// here: its re-placement has no finalization yet, and stamping the
+    /// marker back over a `running` execution would leave a running pod on a
+    /// `stopped` sandbox. The CAS excludes the marker, so such an attempt
+    /// writes nothing and reports [`PlacementOutcome::CasLost`].
     async fn complete_placement(
         &self,
         proof: PlacementProof<'_>,

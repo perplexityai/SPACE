@@ -2,6 +2,8 @@
 //! re-drives, the evacuation marker protocol, backoff, and miss
 //! classification.
 
+use pplx_space_common_core::types::NodeId;
+
 use super::*;
 
 #[tokio::test(flavor = "current_thread")]
@@ -561,7 +563,10 @@ async fn claims_outside_the_restore_window_are_blocked() -> TestResult {
     let store = store_for(&db);
     // Every stored lifecycle except the two claimable ones (`suspended` and
     // the re-drivable `restoring`) must classify as Blocked for both fenced
-    // claim kinds.
+    // claim kinds. The one exception is a markerless `stopped` row under the
+    // evacuation claim: `stopped` is inside that claim's window, so the miss
+    // reports the missing marker instead (see
+    // `evacuation_claim_takes_only_a_released_stopped_evacuation`).
     const OUTSIDE_WINDOW: [StoredSandboxLifecycle; 16] = [
         StoredSandboxLifecycle::Live(SandboxLifecycle::Created),
         StoredSandboxLifecycle::Live(SandboxLifecycle::Creating),
@@ -585,9 +590,16 @@ async fn claims_outside_the_restore_window_are_blocked() -> TestResult {
         let sandbox = insert_sandbox(pool, lifecycle.as_str()).await?;
         for kind in [ClaimKind::UserRestore, ClaimKind::EvacuationRestore] {
             let outcome = store.claim_placement(sandbox, kind).await?;
+            let expected = if kind == ClaimKind::EvacuationRestore
+                && lifecycle == StoredSandboxLifecycle::Live(SandboxLifecycle::Stopped)
+            {
+                BlockedReason::EvacuationSuperseded
+            } else {
+                BlockedReason::Lifecycle(lifecycle)
+            };
             assert_eq!(
                 outcome,
-                ClaimOutcome::Blocked(BlockedReason::Lifecycle(lifecycle)),
+                ClaimOutcome::Blocked(expected),
                 "a {kind} claim on a {lifecycle} row must be blocked"
             );
         }
@@ -912,5 +924,170 @@ async fn lease_expiry_is_inclusive_at_the_exact_deadline_instant() -> TestResult
         );
         tx.rollback().await?;
     }
+    Ok(())
+}
+
+/// The evacuation claim admits one `stopped` shape — a stopped evacuation its
+/// teardown has released — and mints the same fence for it as for a
+/// suspended row. Every near miss sits beside that claimed row, so a refusal
+/// can't pass because no `stopped` row is claimable at all, and each leaves
+/// its row untouched.
+#[tokio::test(flavor = "current_thread")]
+async fn evacuation_claim_takes_only_a_released_stopped_evacuation() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let store = store_for(&db);
+    let released = insert_sandbox(pool, "stopped").await?;
+    set_evacuation_marker(pool, released, "stopped").await?;
+    let markerless = insert_sandbox(pool, "stopped").await?;
+    let still_on_node = insert_sandbox(pool, "stopped").await?;
+    set_evacuation_marker(pool, still_on_node, "stopped").await?;
+    set_active_node(pool, still_on_node, Some(NodeId::new())).await?;
+    let foreign_marker = insert_sandbox(pool, "stopped").await?;
+    set_evacuation_marker(pool, foreign_marker, "started").await?;
+
+    let attempt = expect_claimed(
+        store
+            .claim_placement(released, ClaimKind::EvacuationRestore)
+            .await?,
+    );
+    assert_eq!(attempt.origin, ClaimOrigin::FreshFromStopped);
+    assert_eq!(
+        lifecycle_and_placement(pool, released).await?.0,
+        "restoring"
+    );
+    assert_eq!(
+        evacuation_marker(pool, released).await?.as_deref(),
+        Some("stopped"),
+        "the marker survives the claim, which re-drives on it"
+    );
+    assert_eq!(
+        lease_token(pool, released).await?,
+        Some(attempt.fence.lease.as_uuid())
+    );
+
+    let stopped = StoredSandboxLifecycle::Live(SandboxLifecycle::Stopped);
+    for (sandbox, expected, why) in [
+        (
+            markerless,
+            ClaimOutcome::Blocked(BlockedReason::EvacuationSuperseded),
+            "a markerless stopped row is user-owned",
+        ),
+        (
+            still_on_node,
+            ClaimOutcome::Blocked(BlockedReason::StoppedEvacuationNotReleased),
+            "a stopped evacuation still on its node would be placed twice",
+        ),
+        (
+            foreign_marker,
+            ClaimOutcome::Blocked(BlockedReason::Lifecycle(stopped)),
+            "only the stopped evacuation's own marker admits a stopped row",
+        ),
+    ] {
+        let outcome = store
+            .claim_placement(sandbox, ClaimKind::EvacuationRestore)
+            .await?;
+        assert_eq!(outcome, expected, "{why}");
+        assert_eq!(lifecycle_and_placement(pool, sandbox).await?.0, "stopped");
+        assert_eq!(lease_token(pool, sandbox).await?, None);
+    }
+
+    // The user claim never serves a stopped row, marked or not.
+    let user_target = insert_sandbox(pool, "stopped").await?;
+    set_evacuation_marker(pool, user_target, "stopped").await?;
+    assert_eq!(
+        store
+            .claim_placement(user_target, ClaimKind::UserRestore)
+            .await?,
+        ClaimOutcome::Blocked(BlockedReason::Lifecycle(stopped))
+    );
+    assert_eq!(
+        evacuation_marker(pool, user_target).await?.as_deref(),
+        Some("stopped")
+    );
+
+    // Once its lease lapses, the claimed row re-drives as `restoring`.
+    expire_lease(pool, released).await?;
+    let redrive = expect_claimed(
+        store
+            .claim_placement(released, ClaimKind::EvacuationRestore)
+            .await?,
+    );
+    assert_eq!(redrive.origin, ClaimOrigin::RedroveRestoring);
+    Ok(())
+}
+
+/// The two conjuncts the machine adds over the api claim, the restore lease
+/// and the cohort backoff, gate a stopped evacuation exactly as they gate a
+/// suspended one: the same outcome, carrying the same stored deadline.
+#[tokio::test(flavor = "current_thread")]
+async fn stopped_evacuation_claim_honors_the_lease_and_backoff_gates() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let store = store_for(&db);
+
+    // Backoff: inside the window it reports the stored instant; past it the
+    // same row is claimed.
+    let backed_off = insert_sandbox(pool, "stopped").await?;
+    set_evacuation_marker(pool, backed_off, "stopped").await?;
+    set_restore_backoff(pool, backed_off, 60).await?;
+    let deadline = expect_backoff(
+        store
+            .claim_placement(backed_off, ClaimKind::EvacuationRestore)
+            .await?,
+    );
+    assert_eq!(deadline, stored_backoff_deadline(pool, backed_off).await?);
+    assert_eq!(
+        lifecycle_and_placement(pool, backed_off).await?.0,
+        "stopped"
+    );
+    set_restore_backoff(pool, backed_off, -1).await?;
+    let attempt = expect_claimed(
+        store
+            .claim_placement(backed_off, ClaimKind::EvacuationRestore)
+            .await?,
+    );
+    assert_eq!(attempt.origin, ClaimOrigin::FreshFromStopped);
+
+    // Lease: no ordinary write leaves an unexpired lease on a `stopped` row —
+    // the clear-lease trigger drops it, and leaving `restoring` for `stopped`
+    // also clears the marker. So claim the row, then put it back to `stopped`
+    // with both triggers bypassed. The claim must wait the lease out rather
+    // than steal it.
+    let leased = insert_sandbox(pool, "stopped").await?;
+    set_evacuation_marker(pool, leased, "stopped").await?;
+    expect_claimed(
+        store
+            .claim_placement(leased, ClaimKind::EvacuationRestore)
+            .await?,
+    );
+    let token = lease_token(pool, leased).await?;
+    set_lifecycle_bypassing_lease_and_marker_triggers(pool, leased, "stopped").await?;
+    assert_eq!(
+        evacuation_marker(pool, leased).await?.as_deref(),
+        Some("stopped")
+    );
+    let owned_until = expect_already_owned(
+        store
+            .claim_placement(leased, ClaimKind::EvacuationRestore)
+            .await?,
+    );
+    assert_eq!(owned_until, stored_lease_deadline(pool, leased).await?);
+    assert_eq!(
+        lease_token(pool, leased).await?,
+        token,
+        "a live lease must not be replaced"
+    );
+    expire_lease(pool, leased).await?;
+    let attempt = expect_claimed(
+        store
+            .claim_placement(leased, ClaimKind::EvacuationRestore)
+            .await?,
+    );
+    assert_eq!(attempt.origin, ClaimOrigin::FreshFromStopped);
     Ok(())
 }

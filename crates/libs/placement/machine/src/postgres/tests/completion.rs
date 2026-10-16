@@ -895,3 +895,75 @@ async fn from_held_lease_fence_with_a_foreign_token_cas_loses_completion() -> Te
     );
     Ok(())
 }
+
+/// A stopped evacuation's re-placement has no finalization yet, so its
+/// attempt can't complete under either proof, even with a routable execution
+/// that would satisfy the rest of the CAS. A `paused` evacuation with the
+/// same evidence completes beside it, so the refusal is the marker's.
+#[tokio::test(flavor = "current_thread")]
+async fn a_stopped_evacuation_attempt_cannot_complete_under_either_proof() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let store = store_for(&db);
+    let claim = |target: &'static str| {
+        let store = store.clone();
+        async move {
+            let lifecycle = if target == "stopped" {
+                "stopped"
+            } else {
+                "suspended"
+            };
+            let sandbox = insert_sandbox(pool, lifecycle).await?;
+            set_evacuation_marker(pool, sandbox, target).await?;
+            let attempt = expect_claimed(
+                store
+                    .claim_placement(sandbox, ClaimKind::EvacuationRestore)
+                    .await?,
+            );
+            mark_execution_routable(pool, sandbox).await?;
+            TestResult::Ok((sandbox, attempt))
+        }
+    };
+
+    let (control, control_attempt) = claim("paused").await?;
+    assert_eq!(
+        store
+            .complete_placement(PlacementProof::Fence(&control_attempt.fence))
+            .await?,
+        PlacementOutcome::Completed
+    );
+    assert_eq!(lifecycle_and_placement(pool, control).await?.0, "paused");
+
+    let (fenced, fenced_attempt) = claim("stopped").await?;
+    assert_eq!(fenced_attempt.origin, ClaimOrigin::FreshFromStopped);
+    assert_eq!(
+        store
+            .complete_placement(PlacementProof::Fence(&fenced_attempt.fence))
+            .await?,
+        PlacementOutcome::CasLost
+    );
+
+    let (lapsed, _) = claim("stopped").await?;
+    expire_lease(pool, lapsed).await?;
+    assert_eq!(
+        store
+            .complete_placement(PlacementProof::LapsedClaim { sandbox: lapsed })
+            .await?,
+        PlacementOutcome::CasLost
+    );
+
+    for sandbox in [fenced, lapsed] {
+        assert_eq!(
+            lifecycle_and_placement(pool, sandbox).await?.0,
+            "restoring",
+            "nothing was written"
+        );
+        assert_eq!(
+            evacuation_marker(pool, sandbox).await?.as_deref(),
+            Some("stopped")
+        );
+    }
+    Ok(())
+}

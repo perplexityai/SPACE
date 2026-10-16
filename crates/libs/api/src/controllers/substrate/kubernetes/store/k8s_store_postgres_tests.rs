@@ -10,8 +10,13 @@ use super::*;
 
 use pplx_space_test_env::TestResult;
 
+mod stopped_evacuation_claim_tests;
 mod stopped_restore_selector_tests;
 mod substrate_scope_tests;
+use stopped_evacuation_claim_tests::{
+    a_fresh_stopped_claim_is_not_rolled_back_on_a_clean_failure,
+    evacuation_claim_takes_only_a_released_stopped_evacuation,
+};
 use stopped_restore_selector_tests::{
     stopped_disk_selector_agrees_with_the_retention_never_prune_guard,
     stopped_disk_selector_ignores_a_full_artifact_and_a_foreign_disk_artifact,
@@ -1291,6 +1296,8 @@ async fn k8s_store_postgres_behaviors() -> TestResult {
     forget_pod_tracking_keeps_started_when_suspend_backup_is_unsafe(&fixture).await?;
     forget_pod_tracking_preserve_keeps_markerless_snapshot_selectable(&fixture).await?;
     begin_restore_lifecycle_preserves_retry_and_marker_claim_rules(&fixture).await?;
+    evacuation_claim_takes_only_a_released_stopped_evacuation(&fixture).await?;
+    a_fresh_stopped_claim_is_not_rolled_back_on_a_clean_failure(&fixture).await?;
     user_restore_lease_blocks_concurrent_redrive_until_expiry(&fixture).await?;
     expired_restore_lease_with_live_execution_stays_in_flight(&fixture).await?;
     clean_redrive_failure_releases_restore_lease_for_immediate_retry(&fixture).await?;

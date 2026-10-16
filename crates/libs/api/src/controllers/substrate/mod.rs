@@ -1680,13 +1680,15 @@ pub enum SubstrateError {
     #[error("{message}")]
     NodeTombstoned { message: String },
     /// A marker-guarded evacuation restore claim
-    /// (`begin_restore_lifecycle(require_evacuation_marker = true)`) lost its
-    /// CAS because the `evacuation_restore_target` marker was cleared by a
-    /// concurrent user restore/takeover. Distinct from [`Self::Conflict`] so
-    /// the node-drain cohort restore can treat it as a clean deferral (the
-    /// user owns the sandbox now) rather than a restore failure — without
-    /// swallowing genuine `Conflict`s (e.g. a real wake-RPC failure on the
-    /// rebuilt pod) that must stay visible to `node_drain.failures`.
+    /// (`begin_restore_lifecycle(require_evacuation_marker = true)`) found
+    /// nothing it may take on this attempt: the `evacuation_restore_target`
+    /// marker was cleared by a concurrent user restore/takeover, or a `stopped`
+    /// row carrying a stopped evacuation's own `'stopped'` marker isn't
+    /// released yet. Distinct from
+    /// [`Self::Conflict`] so the node-drain cohort restore can treat it as a
+    /// clean deferral rather than a restore failure — without swallowing
+    /// genuine `Conflict`s (e.g. a real wake-RPC failure on the rebuilt pod)
+    /// that must stay visible to `node_drain.failures`.
     #[error("{message}")]
     EvacuationClaimLost { message: String },
     /// A database statement lost a race for a lock: `40001`
