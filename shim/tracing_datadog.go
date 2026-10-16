@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/DataDog/dd-trace-go/v2/ddtrace/tracer"
@@ -29,7 +31,7 @@ func newDatadogTracePipeline() tracePipeline {
 		opts = append(opts, tracer.WithServiceVersion(version))
 	}
 	if host := os.Getenv("DD_AGENT_HOST"); host != "" {
-		opts = append(opts, tracer.WithAgentAddr(host+":8126"))
+		opts = append(opts, tracer.WithAgentAddr(datadogTraceAgentAddr(host, os.Getenv("DD_TRACE_AGENT_PORT"))))
 	}
 	opts = append(opts, originSamplingRules()...)
 	tracer.Start(opts...)
@@ -70,6 +72,23 @@ func originSamplingRules() []tracer.StartOption {
 	_ = os.Unsetenv("DD_TRACE_SAMPLING_RULES")
 	_ = os.Unsetenv("DD_TRACE_SAMPLING_RULES_FILE")
 	return []tracer.StartOption{tracer.WithSamplingRules(rules)}
+}
+
+const defaultDatadogTraceAgentPort = 8126
+
+// Preserve the configured APM port when an explicit agent host overrides the
+// tracer's environment configuration. Invalid ports retain the default intake.
+func datadogTraceAgentAddr(host, rawPort string) string {
+	port := defaultDatadogTraceAgentPort
+	if parsed, err := strconv.Atoi(strings.TrimSpace(rawPort)); err == nil && parsed > 0 && parsed <= 65535 {
+		port = parsed
+	} else if strings.TrimSpace(rawPort) != "" {
+		logShim("ignoring invalid DD_TRACE_AGENT_PORT %q; using %d", rawPort, defaultDatadogTraceAgentPort)
+	}
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = host[1 : len(host)-1]
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port))
 }
 
 func (datadogTracePipeline) start(ctx context.Context, name string, attrs ...attribute.KeyValue) (shimSpan, context.Context) {

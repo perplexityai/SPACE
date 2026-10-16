@@ -128,6 +128,7 @@ fn sidecar_names_respect_explicit_identity_and_legacy_suffix_rules() {
     const TRANSPORT: &[(&str, &str)] = &[
         ("DD_AGENT_HOST", "127.0.0.2"),
         ("DD_DOGSTATSD_PORT", "18125"),
+        ("DD_TRACE_AGENT_PORT", "18126"),
         ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.2:14317"),
     ];
     if std::env::var_os(CHILD).is_some() {
