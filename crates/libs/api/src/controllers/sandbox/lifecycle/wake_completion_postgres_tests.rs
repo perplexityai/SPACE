@@ -40,22 +40,53 @@ async fn lifecycle_and_placement(
     .await?)
 }
 
-/// Every stored lifecycle against both published-suspend fences. A completion
-/// writes `started` / `on_node`; a stale completion behind a newer suspend
-/// claim defers to it, and every other refusal is a lost CAS. Refusals leave
-/// both `lifecycle` and `placement` untouched.
+/// Every stored lifecycle against the fence each substrate's capabilities
+/// select. A completion writes `started` / `on_node`; a stale completion behind
+/// a newer suspend claim defers to it, and every other refusal is a lost CAS.
+/// Refusals leave both `lifecycle` and `placement` untouched.
 #[tokio::test(flavor = "current_thread")]
 async fn wake_completion_cas_outcome_for_every_prior_lifecycle() -> TestResult {
+    use crate::controllers::substrate::{
+        Substrate, SubstrateCapabilities, direct::DirectSubstrate,
+    };
     use WakeLifecycleCompletion::{Completed, Lost, SupersededBySuspend};
 
     let db = pg_test_db().await?;
     let pool = &db.pool;
 
-    let mut cases: Vec<(String, PublishedSuspendFence, WakeLifecycleCompletion)> = Vec::new();
-    for fence in [
-        PublishedSuspendFence::Enforced,
-        PublishedSuspendFence::DirectRestoreBaseline,
-    ] {
+    // The Wake and Restore arms pick the fence from the running substrate's
+    // capabilities; the table below runs those constants. Direct's side of
+    // the Wake arm's choice is pinned by the controller-level
+    // `wake_completion_outcome_maps_to_the_wake_response`; the Kubernetes
+    // side, like the Restore arm, is observable only in the race.
+    assert_eq!(
+        Substrate::Direct(Box::new(DirectSubstrate::new(pool.clone()))).capabilities(),
+        SubstrateCapabilities::DIRECT
+    );
+    #[cfg(feature = "kubernetes")]
+    assert_eq!(
+        Substrate::Kubernetes(Box::new(
+            crate::controllers::substrate::kubernetes::tests::substrate_with_store(pool.clone()),
+        ))
+        .capabilities(),
+        SubstrateCapabilities::KUBERNETES
+    );
+
+    let mut cases: Vec<(String, &str, PublishedSuspendFence, WakeLifecycleCompletion)> = Vec::new();
+    // A row still `suspended` at completion: Kubernetes, whose restore leaves
+    // `restoring -> started` to this CAS, fences it as a finalized suspend;
+    // Direct's worker-local wake keeps `suspended` as the baseline it advances
+    // from.
+    let substrates = [
+        ("direct", SubstrateCapabilities::DIRECT, Completed),
+        (
+            "kubernetes",
+            SubstrateCapabilities::KUBERNETES,
+            SupersededBySuspend,
+        ),
+    ];
+    for (substrate, capabilities, suspended_outcome) in substrates {
+        let fence = PublishedSuspendFence::for_capabilities(capabilities);
         for lifecycle in SandboxLifecycle::all() {
             let expected = match lifecycle {
                 SandboxLifecycle::Created
@@ -68,30 +99,30 @@ async fn wake_completion_cas_outcome_for_every_prior_lifecycle() -> TestResult {
                 | SandboxLifecycle::Resuming
                 | SandboxLifecycle::Checkpointing => Completed,
                 SandboxLifecycle::Suspending => SupersededBySuspend,
-                // Kubernetes fences a finalized suspend; a direct restore
-                // keeps `suspended` as the baseline it advances from.
-                SandboxLifecycle::Suspended => match fence {
-                    PublishedSuspendFence::Enforced => SupersededBySuspend,
-                    PublishedSuspendFence::DirectRestoreBaseline => Completed,
-                },
+                SandboxLifecycle::Suspended => suspended_outcome,
                 SandboxLifecycle::Stopping
                 | SandboxLifecycle::Stopped
                 | SandboxLifecycle::Deleting
                 | SandboxLifecycle::Quarantined
                 | SandboxLifecycle::Failed => Lost,
             };
-            cases.push((lifecycle.as_str().to_owned(), fence, expected));
+            cases.push((lifecycle.as_str().to_owned(), substrate, fence, expected));
         }
         // Stored values that are not `SandboxLifecycle` variants.
         for lifecycle in ["deleted", "cleanup_required"] {
-            cases.push((lifecycle.to_owned(), fence, Lost));
+            cases.push((lifecycle.to_owned(), substrate, fence, Lost));
         }
         // The guard compares a trimmed, lower-cased lifecycle.
-        cases.push((" Failed ".to_owned(), fence, Lost));
-        cases.push(("SUSPENDING".to_owned(), fence, SupersededBySuspend));
+        cases.push((" Failed ".to_owned(), substrate, fence, Lost));
+        cases.push((
+            "SUSPENDING".to_owned(),
+            substrate,
+            fence,
+            SupersededBySuspend,
+        ));
     }
 
-    for (lifecycle, fence, expected) in cases {
+    for (lifecycle, substrate, fence, expected) in cases {
         let sandbox_id = SandboxId::new();
         insert_sandbox(pool, sandbox_id, &lifecycle).await?;
 
@@ -99,7 +130,7 @@ async fn wake_completion_cas_outcome_for_every_prior_lifecycle() -> TestResult {
 
         assert_eq!(
             outcome, expected,
-            "prior lifecycle {lifecycle:?}, {fence:?}"
+            "prior lifecycle {lifecycle:?}, {substrate} substrate ({fence:?})"
         );
         let expected_row = if expected == Completed {
             ("started".to_owned(), "on_node".to_owned())
@@ -109,63 +140,18 @@ async fn wake_completion_cas_outcome_for_every_prior_lifecycle() -> TestResult {
         assert_eq!(
             lifecycle_and_placement(pool, sandbox_id).await?,
             Some(expected_row),
-            "prior lifecycle {lifecycle:?}, {fence:?}"
+            "prior lifecycle {lifecycle:?}, {substrate} substrate ({fence:?})"
         );
     }
 
     // A row deleted while the wake was in flight is a lost CAS, not a
     // completion.
-    for fence in [
-        PublishedSuspendFence::Enforced,
-        PublishedSuspendFence::DirectRestoreBaseline,
-    ] {
+    for (substrate, capabilities, _) in substrates {
+        let fence = PublishedSuspendFence::for_capabilities(capabilities);
         assert_eq!(
             complete_wake_lifecycle(pool, SandboxId::new(), fence).await?,
-            Lost
-        );
-    }
-    Ok(())
-}
-
-/// The wake and restore arms pick the fence from the running substrate. On a
-/// row still `suspended` at completion, Kubernetes, whose restore leaves
-/// `restoring -> started` to this CAS, defers to it as a newer suspend; Direct,
-/// whose worker-local wake keeps `suspended` as its baseline, advances it.
-#[tokio::test(flavor = "current_thread")]
-async fn wake_completion_fence_follows_the_running_substrate() -> TestResult {
-    use crate::controllers::substrate::{Substrate, direct::DirectSubstrate};
-
-    let db = pg_test_db().await?;
-    let pool = &db.pool;
-
-    #[cfg_attr(not(feature = "kubernetes"), allow(unused_mut))]
-    let mut cases = vec![(
-        Substrate::Direct(Box::new(DirectSubstrate::new(pool.clone()))),
-        "started",
-    )];
-    #[cfg(feature = "kubernetes")]
-    cases.push((
-        Substrate::Kubernetes(Box::new(
-            crate::controllers::substrate::kubernetes::tests::substrate_with_store(pool.clone()),
-        )),
-        "suspended",
-    ));
-
-    for (substrate, expected) in cases {
-        let sandbox_id = SandboxId::new();
-        insert_sandbox(pool, sandbox_id, "suspended").await?;
-
-        let fence = PublishedSuspendFence::for_capabilities(substrate.capabilities());
-        complete_wake_lifecycle(pool, sandbox_id, fence).await?;
-
-        let lifecycle = lifecycle_and_placement(pool, sandbox_id)
-            .await?
-            .map(|(lifecycle, _)| lifecycle);
-        assert_eq!(
-            lifecycle.as_deref(),
-            Some(expected),
-            "{} substrate",
-            substrate.managed_by()
+            Lost,
+            "{substrate} substrate"
         );
     }
     Ok(())

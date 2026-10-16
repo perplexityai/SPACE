@@ -456,6 +456,11 @@ async fn unreachable_runtime_fails_actions_without_writing_lifecycle() -> TestRe
 /// moved after the handler read it, which is the race the CAS exists for:
 /// a newer suspend claim is a silent success that keeps the claim, and a
 /// teardown or terminal lifecycle is a 500 that keeps that lifecycle.
+///
+/// A wake from `suspended` is a worker-local restore that leaves the row
+/// `suspended` for the CAS to advance, so it reaches `started` only because
+/// the handler takes its fence from Direct's capabilities, which do not fence
+/// `suspended`.
 #[tokio::test(flavor = "current_thread")]
 async fn wake_completion_outcome_maps_to_the_wake_response() -> TestResult {
     if !crate::test_support::enter_sim_worker_process() {
@@ -466,19 +471,30 @@ async fn wake_completion_outcome_maps_to_the_wake_response() -> TestResult {
     let controller = direct_controller(pool);
     let (worker, node_id) = start_sim_worker(pool).await?;
 
-    for moved_to in [
-        None,
-        Some("suspending"),
-        Some("stopping"),
-        Some("stopped"),
-        Some("deleting"),
-        Some("quarantined"),
-        Some("failed"),
-    ] {
+    for (prior, moved_to) in ["paused", "suspended"].into_iter().flat_map(|prior| {
+        [
+            None,
+            Some("suspending"),
+            Some("stopping"),
+            Some("stopped"),
+            Some("deleting"),
+            Some("quarantined"),
+            Some("failed"),
+        ]
+        .map(|moved_to| (prior, moved_to))
+    }) {
         let sandbox_id = SandboxId::new();
-        insert_sandbox(pool, sandbox_id, "paused", "space").await?;
+        insert_sandbox(pool, sandbox_id, prior, "space").await?;
         place_on_node(pool, sandbox_id, node_id).await?;
-        insert_resident(worker.state(), sandbox_id, "paused").await?;
+        if prior == "suspended" {
+            insert_resident(worker.state(), sandbox_id, "running").await?;
+            worker
+                .state()
+                .suspend_to_shared_dir(&sandbox_id.to_string())
+                .await?;
+        } else {
+            insert_resident(worker.state(), sandbox_id, prior).await?;
+        }
         let sandbox = tracked(pool, sandbox_id).await?;
         if let Some(lifecycle) = moved_to {
             set_lifecycle(pool, sandbox_id, lifecycle).await?;
@@ -501,20 +517,22 @@ async fn wake_completion_outcome_maps_to_the_wake_response() -> TestResult {
         });
         match moved_to {
             None => {
-                assert_eq!(result?, ok_body);
+                assert_eq!(result?, ok_body, "woken from {prior}");
                 assert_eq!(
                     row(pool, sandbox_id).await?,
-                    Some(Row::new("started", "on_node"))
+                    Some(Row::new("started", "on_node")),
+                    "woken from {prior}"
                 );
             }
             Some("suspending") => {
                 assert_eq!(
                     result?, ok_body,
-                    "a newer suspend claim is not a wake failure"
+                    "woken from {prior}: a newer suspend claim is not a wake failure"
                 );
                 assert_eq!(
                     row(pool, sandbox_id).await?,
-                    Some(Row::new("suspending", "on_node"))
+                    Some(Row::new("suspending", "on_node")),
+                    "woken from {prior}"
                 );
             }
             Some(lifecycle) => {
@@ -522,17 +540,18 @@ async fn wake_completion_outcome_maps_to_the_wake_response() -> TestResult {
                 assert_eq!(
                     error.status(),
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "{lifecycle}"
+                    "woken from {prior}, moved to {lifecycle}"
                 );
                 assert!(
                     error
                         .to_string()
                         .starts_with("sandbox wake lost the lifecycle CAS"),
-                    "{lifecycle}: {error}"
+                    "woken from {prior}, moved to {lifecycle}: {error}"
                 );
                 assert_eq!(
                     row(pool, sandbox_id).await?,
-                    Some(Row::new(lifecycle, "on_node"))
+                    Some(Row::new(lifecycle, "on_node")),
+                    "woken from {prior}, moved to {lifecycle}"
                 );
             }
         }

@@ -1229,6 +1229,9 @@ impl SandboxController {
             .ok_or_else(|| ControllerError::not_found("Sandbox not found"))?;
 
         let target = NodeApiTarget {
+            // Missing or unparseable defaults to `Space`. Harmless: neither
+            // substrate's delete path reads it, only `role` and the address
+            // fields below.
             managed_by: observed
                 .node_managed_by
                 .as_deref()
@@ -1908,6 +1911,18 @@ impl SandboxController {
                     // substrates. On race-loss we surface a 5xx so the caller
                     // re-issues rather than silently observing a `started` row
                     // pointing at a deleted execution.
+                    //
+                    // Known gap on Direct (also the Wake arm's lease-restore
+                    // fallback): this CAS runs with `DirectRestoreBaseline`,
+                    // which does not fence `suspended`. Direct's suspend writes
+                    // no `suspending` claim, only `suspended` after its node
+                    // call, so a suspend whose `suspended` write lands after
+                    // the lease restore's `started` write and before this CAS
+                    // is overwritten back to `started`. The lease write is not
+                    // guarded on lifecycle either, so a `suspended` written
+                    // after the restore placed the row `on_node` (for a remote
+                    // restore, that span includes the source cleanup call) is
+                    // overwritten by that write.
                     let published_suspend_fence =
                         PublishedSuspendFence::for_capabilities(self.substrate.capabilities());
                     let cas_result =

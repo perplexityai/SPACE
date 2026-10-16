@@ -694,6 +694,79 @@ async fn node_drain_capability_matches_set_node_schedulability() {
     }
 }
 
+/// The fork executor reads `node_addressing` to decide which node-api target
+/// field an active copy must carry. If it named a field the substrate's
+/// `resolve_node_api_endpoint` does not read, a target the executor accepts
+/// would fail to resolve, and one that resolves would be judged incomplete, so
+/// the copy waits on a fallback-worker lookup (retrying when no worker is
+/// ready) that fills only the missing field.
+#[tokio::test(flavor = "current_thread")]
+async fn node_addressing_names_the_field_endpoint_resolution_reads() {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_millis(1))
+        .connect_lazy("postgres://postgres@127.0.0.1:1/postgres")
+        .expect("lazy pool should parse");
+    let stored_endpoint = "192.0.2.10:50051";
+    let k8s_node_name = "node-a";
+    #[cfg_attr(not(feature = "kubernetes"), allow(unused_mut))]
+    let mut cases = vec![(
+        Substrate::Direct(Box::new(direct::DirectSubstrate::new(pool.clone()))),
+        NodeManagedBy::Space,
+        stored_endpoint.to_string(),
+    )];
+    #[cfg(feature = "kubernetes")]
+    {
+        let mut node_api_pod =
+            kubernetes::tests::node_api_pod_on_node("space-worker-node-a", k8s_node_name);
+        node_api_pod
+            .status
+            .as_mut()
+            .expect("fixture pod has a status")
+            .pod_ip = Some("192.0.2.20".to_string());
+        let substrate = kubernetes::tests::substrate_with_inventory_caches_and_pool(
+            vec![node_api_pod],
+            Vec::new(),
+            pool,
+        );
+        let pod_endpoint = format!("192.0.2.20:{}", substrate.k8s.node_api_port);
+        cases.push((
+            Substrate::Kubernetes(Box::new(substrate)),
+            NodeManagedBy::Kubernetes,
+            pod_endpoint,
+        ));
+    }
+
+    for (substrate, managed_by, expected) in cases {
+        let target = |direct_endpoint, substrate_node_id| NodeApiTarget {
+            managed_by,
+            role: NodeRole::Worker,
+            direct_endpoint,
+            substrate_node_id,
+        };
+        let endpoint_only = target(Some(stored_endpoint), None);
+        let node_id_only = target(None, Some(k8s_node_name));
+        let (declared_only, other_only) = match substrate.capabilities().node_addressing {
+            NodeAddressing::DirectEndpoint => (endpoint_only, node_id_only),
+            NodeAddressing::SubstrateNodeId => (node_id_only, endpoint_only),
+        };
+
+        let resolved = substrate.resolve_node_api_endpoint(&declared_only).await;
+        assert_eq!(
+            resolved.as_ref().ok(),
+            Some(&expected),
+            "{} substrate, declared field only: {resolved:?}",
+            substrate.managed_by()
+        );
+        let refused = substrate.resolve_node_api_endpoint(&other_only).await;
+        assert!(
+            matches!(refused, Err(SubstrateError::NotFound { .. })),
+            "{} substrate, declared field missing: {refused:?}",
+            substrate.managed_by()
+        );
+    }
+}
+
 /// **Three dispositions, and two of them refuse.**
 ///
 /// The wire type is `optional string`, so "no pin", "empty string" and
