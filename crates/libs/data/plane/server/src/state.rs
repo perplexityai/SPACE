@@ -1832,7 +1832,6 @@ impl AttachedStreamLimiter {
         Ok(())
     }
 
-    #[cfg(test)]
     pub(super) fn active_total(&self) -> usize {
         self.total.load(Ordering::Acquire)
     }

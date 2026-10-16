@@ -316,6 +316,7 @@ class SmokeServices:
             fixture._node_selector_extras_control = cast(Any, kind)
             fixture._node_fence_control = cast(Any, kind)
             fixture._pending_backup_control = cast(Any, kind)
+            fixture._data_plane_deletion_cost_observer = cast(Any, kind)
             fixture._quarantine_recovery_control = cast(Any, kind)
             fixture._orphaned_restore_pod_gc_control = cast(Any, kind)
             fixture._template_build_control = cast(Any, kind)

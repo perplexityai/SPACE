@@ -1,0 +1,39 @@
+flowchart LR
+    client["Clients<br/>(ECW / native streams)"]:::ext
+    alb["Public Service / ALB<br/>port http"]:::ext
+
+    subgraph dp["data-plane pod (×N, ReplicaSet)"]
+        direction TB
+        permits["AttachedStreamLimiter<br/>counts attached streams"]:::dp
+        report["internal listener<br/>flag: internal-listen<br/>container port 'internal', not on the Service<br/>GET /internal/v1/stream-load<br/>{active_streams: every attached stream}"]:::dp
+        sup["supervisor: listener task ends early<br/>→ logged; replica keeps serving<br/>(controller ranks it busy)"]:::dp
+        permits --> report
+        report -.-> sup
+    end
+
+    subgraph cc["cluster-controller (leader only)"]
+        direction TB
+        refl["label-scoped pod reflector<br/>app.kubernetes.io/name=space-data-plane"]:::cc
+        tick["every 10s: probe Ready pods (2s timeout, 8 at once)"]:::cc
+        bucket["bucket attached streams → cost<br/>0 streams → 0<br/>1–9 → 10<br/>10–99 → 100<br/>100+ → 1000"]:::cc
+        decide{"bucket changed?<br/>raise: write now<br/>lower: ≥30s since last write?"}:::gate
+        stale["probe failed: count as 'unknown'<br/>3 failures in a row → rank busy (1000)<br/>warn at start and at the switch"]:::warn
+        refl --> tick --> bucket --> decide
+        tick -. failure .-> stale
+    end
+
+    api["kube-apiserver<br/>merge patch (uid precondition)<br/>controller.kubernetes.io/pod-deletion-cost"]:::k8s
+    rs["ReplicaSet scale-down<br/>removes lowest cost first<br/>(among Ready pods)"]:::k8s
+
+    client --> alb --> permits
+    report -- "pod IP : internal" --> tick
+    decide -- yes --> api
+    stale -. "busy write" .-> api
+    api --> rs
+
+    classDef ext fill:#eeeeee,stroke:#777,color:#222
+    classDef dp fill:#dbeafe,stroke:#1d4ed8,color:#111
+    classDef cc fill:#dcfce7,stroke:#15803d,color:#111
+    classDef gate fill:#fef9c3,stroke:#a16207,color:#111
+    classDef warn fill:#fee2e2,stroke:#b91c1c,color:#111
+    classDef k8s fill:#ede9fe,stroke:#6d28d9,color:#111

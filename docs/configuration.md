@@ -73,6 +73,8 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_CLUSTER_CONTROLLER_DRAIN_EVACUATION_COHORT_VALUE` | unset | Unset disables the rollout-cohort feature. |
 | `SPACE_NODE_GROUP_LABELER_ENABLED`, `SPACE_NODE_GROUP_MIRROR_ENABLED` | off | |
 | `SPACE_NODE_SERVICE_READINESS_ENABLED` | off | |
+| `SPACE_DATA_PLANE_DELETION_COST_ENABLED` | off | Writes `controller.kubernetes.io/pod-deletion-cost` on Ready data-plane pods from their attached streams (native sessions, ECW process and file-watch streams, upgraded ECW port connections; 0, 1–9, 10–99, 100+ → 0/10/100/1000), so scale-in removes the replicas with the fewest streams first. A pod whose load can't be read keeps its value for a few failed probes, then ranks as busy (`1000`) until it can be read. Turning it off leaves the last values in place. Needs the data plane's `--internal-listen`, declared as a container port named `internal`, and `list`, `watch` and `patch` on pods in the data-plane namespace. |
+| `SPACE_DATA_PLANE_DELETION_COST_NAMESPACE`, `SPACE_DATA_PLANE_DELETION_COST_POD_SELECTOR` | `POD_NAMESPACE` then `space`, `app.kubernetes.io/name=space-data-plane` | Where the data-plane pods are. Each pod is probed on its container port named `internal`; pods without one are skipped. |
 | `SPACE_SNAPSHOT_RETENTION_SWEEPER_ENABLED` | off | |
 | `SPACE_SNAPSHOT_RETENTION_SWEEPER_KEEP_N`, `SPACE_SNAPSHOT_RETENTION_SWEEPER_MAX_PER_TICK` | built-in | |
 | `SPACE_ADMIN_AUDIT_RETENTION_GRACE_SECS` | 30 days | The retention loops themselves always run. |

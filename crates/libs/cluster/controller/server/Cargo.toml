@@ -49,6 +49,7 @@ jiff = { workspace = true }
 k8s-openapi = { workspace = true, features = ["v1_32"], optional = true }
 kube = { workspace = true, default-features = false, features = ["client"], optional = true }
 prost-types = { workspace = true }
+reqwest = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-aws-lc-rs"] }
 time = { workspace = true }

@@ -24,6 +24,7 @@ pub mod types;
 #[cfg(feature = "archive")]
 pub mod archive;
 
+pub mod data_plane_load;
 pub mod env;
 pub mod guest;
 pub mod host;

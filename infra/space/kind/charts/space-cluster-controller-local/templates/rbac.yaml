@@ -93,6 +93,44 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: {{ .Release.Name }}-cluster-controller-lease
+{{- /* Same truthy set the binary accepts, so the grant never lags the flag. */}}
+{{- if has (toString (.Values.reconcilers.dataPlaneDeletionCost.env.SPACE_DATA_PLANE_DELETION_COST_ENABLED | default "false")) (list "1" "true" "True" "TRUE") }}
+---
+# Data-plane deletion cost: the controller watches data-plane pods and writes
+# one annotation on them, in its own namespace. The reconciler's namespace
+# defaults to the same one; overriding SPACE_DATA_PLANE_DELETION_COST_NAMESPACE
+# needs a matching Role there. Granted here rather than on the api Role so the
+# api server does not gain pod `patch`; the data plane itself gets none.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-cluster-controller-data-plane-deletion-cost
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: space-cluster-controller
+    app.kubernetes.io/instance: {{ .Release.Name }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list", "watch", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-cluster-controller-data-plane-deletion-cost
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: space-cluster-controller
+    app.kubernetes.io/instance: {{ .Release.Name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.serviceAccount.name }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Release.Name }}-cluster-controller-data-plane-deletion-cost
+{{- end }}
 {{- if eq (.Values.reconcilers.nodeDrain.env.SPACE_NODE_DRAIN_TERMINATOR_KIND | default "aws") "kube-delete" }}
 ---
 # kube-delete terminator backend: cluster-controller-only delete on

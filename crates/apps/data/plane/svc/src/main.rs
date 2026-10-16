@@ -53,6 +53,12 @@ struct Cli {
     #[arg(long, default_value = DEFAULT_LISTEN)]
     listen: String,
 
+    /// Internal stream-load listen address, read by the cluster controller to
+    /// order scale-in. Unset serves no internal listener. Keep this port off
+    /// the public Service.
+    #[arg(long)]
+    internal_listen: Option<String>,
+
     /// First-frame attach deadline for upgraded sockets without a header token.
     #[arg(long, default_value_t = DEFAULT_ATTACH_DEADLINE_MS)]
     attach_deadline_ms: u64,
@@ -129,6 +135,7 @@ impl From<Cli> for DataPlaneConfig {
     fn from(cli: Cli) -> Self {
         Self {
             listen: cli.listen,
+            internal_listen: cli.internal_listen,
             attach_deadline: Duration::from_millis(cli.attach_deadline_ms),
             unauthenticated_upgrade_cap_per_ip: cli.unauthenticated_upgrade_cap_per_ip,
             max_attached_streams: cli.max_attached_streams,

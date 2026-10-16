@@ -18,6 +18,7 @@ from urllib.request import Request, urlopen
 
 from space_smoke.capabilities import (
     ConcurrentRestoreControl,
+    DataPlaneDeletionCostObserver,
     NodeDrainControl,
     NodeGroupControl,
     NodeFenceControl,
@@ -101,6 +102,7 @@ from space_smoke.node_groups import NodeGroupAssertions
 from space_smoke.node_fence import NodeFenceAssertions
 from space_smoke.node_selector_extras import NodeSelectorExtrasAssertions
 from space_smoke.orphaned_restore_pod_gc import OrphanedRestorePodGcAssertions
+from space_smoke.data_plane_deletion_cost import DataPlaneDeletionCostAssertions
 from space_smoke.pending_backup import PendingBackupAssertions
 from space_smoke.quarantine_recovery import QuarantineRecoveryAssertions
 from space_smoke.template_build import TemplateBuildAssertions
@@ -2760,6 +2762,18 @@ class KindEcw(Ecw):
                 self, self._template_build_control, self._template_builder, self._context.scope
             )
         return self._template_build_assertions
+
+    _data_plane_deletion_cost_observer: DataPlaneDeletionCostObserver | None = None
+
+    @property
+    def data_plane_deletion_cost(self) -> DataPlaneDeletionCostAssertions:
+        """Read-only assertions on the deletion cost the cluster controller writes on data-plane pods."""
+
+        if self._data_plane_deletion_cost_observer is None:
+            raise SmokeConfigurationError(
+                "data-plane deletion-cost observation is only available on the kind backend"
+            )
+        return DataPlaneDeletionCostAssertions(self, self._data_plane_deletion_cost_observer)
 
     _pending_backup_control: PendingBackupControl | None = None
     _pending_backup_assertions: PendingBackupAssertions | None = None

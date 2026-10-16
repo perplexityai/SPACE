@@ -76,6 +76,11 @@ startupProbe:
 # periods Ready.
 minReadySeconds: 10
 
+# Internal stream-load listener the cluster controller reads to order scale-in
+# (`controller.kubernetes.io/pod-deletion-cost`). Deliberately not a Service
+# port: only the controller, dialing pod IPs, should reach it. Empty disables it.
+internalPort: 8091
+
 internal:
   secretName: space-internal
   apiEndpoint: https://space-internal-api:9800

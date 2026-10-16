@@ -226,6 +226,14 @@ reconcilers:
   suspendedExecutionReaper:
     env:
       SPACE_SUSPENDED_EXECUTION_REAPER_ENABLED: "false"
+  # Data-plane deletion cost: annotates Ready data-plane pods with
+  # `controller.kubernetes.io/pod-deletion-cost` from each pod's internal
+  # stream-load listener (`internalPort` in space-data-plane-local). On here so
+  # kind exercises the probe and the patch; the RBAC template grants the pod
+  # `patch` only while this is enabled.
+  dataPlaneDeletionCost:
+    env:
+      SPACE_DATA_PLANE_DELETION_COST_ENABLED: "true"
   # Orphaned-restore-pod GC: reaps restore pods their owning row has provably
   # superseded (row deleted, no active execution on a reverted row, or a
   # strictly-older generation). Ships off and dry-run; deployments enable it
