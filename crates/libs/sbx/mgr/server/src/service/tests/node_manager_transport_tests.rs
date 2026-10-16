@@ -253,13 +253,16 @@ async fn unsealed_encrypted_capture_survives_restart_and_publishes_once_sealed()
     assert_eq!(row.state, SandboxState::Suspending);
     assert!(staging.join(publication::ENCRYPTED_CAPTURE_RECORD).exists());
 
-    // Once the holder exits, the next pass seals it and the one after
-    // publishes that capture.
+    // Once the holder exits, the next pass seals it. That pass's own
+    // classification skips the row while the seal task holds its locks, but
+    // can run after a fast seal finishes and publish the capture at once;
+    // otherwise the pass after it does.
     recover_batch(&service, cache.path(), &id).await;
     assert_eq!(
-        service.lookup_sandbox(&id).unwrap().state,
-        SandboxState::Suspending
+        node_manager.calls(),
+        ["ReleaseEncryptedVolume", "ReleaseEncryptedVolume"]
     );
+    assert!(!staging.join(publication::ENCRYPTED_CAPTURE_RECORD).exists());
     recover_batch(&service, cache.path(), &id).await;
     assert_eq!(
         node_manager.calls(),
