@@ -441,6 +441,25 @@ pub(crate) fn teardown_release_evidence(
                 execution_generation,
             )?
         }
+        // A rollback back to `suspended` keeps the predecessor's artifact pin
+        // and may retain the predecessor's generation as its release witness.
+        // Only the exact rolled-back generation is retired here; an older
+        // generation keeps its durable answer for the retained artifact.
+        Some(status)
+            if status.state == SandboxState::Suspended
+                && runtime_generation
+                    .is_none_or(|generation| generation < execution_generation)
+                && status.operation.as_ref().is_none_or(|operation| {
+                    operation.execution_generation < execution_generation
+                }) =>
+        {
+            completed_activation_rollback_covers(
+                &tx,
+                sandbox_id,
+                status.state,
+                execution_generation,
+            )?
+        }
         _ => false,
     };
     tx.commit()?;
@@ -464,8 +483,13 @@ fn completed_activation_rollback_covers(
                      transition_receipt_reason_code, transition_receipt_activation_attempt_id
                 FROM sandboxes s
                WHERE s.id = ?1
-                 AND s.state IN ('created', 'stopped')
-                 AND s.space_api_route_execution_generation IS NULL
+                 AND (
+                     (s.state IN ('created', 'stopped')
+                      AND s.space_api_route_execution_generation IS NULL)
+                     OR (s.state = 'suspended'
+                         AND (s.space_api_route_execution_generation IS NULL
+                              OR s.space_api_route_execution_generation < ?2))
+                 )
                  AND s.uid IS NULL AND s.slot IS NULL AND s.guest_cid IS NULL
                  AND s.pid IS NULL AND s.spaced_host_pid IS NULL AND s.netgtw_pid IS NULL
                  AND s.vsock_uds_path IS NULL AND s.api_socket_path IS NULL
@@ -476,7 +500,7 @@ fn completed_activation_rollback_covers(
                  AND s.space_api_route_activation_attempt_id IS NULL
                  AND s.cleanup_completion IS NULL AND s.cleanup_keep_filesystem IS NULL
                  AND NOT EXISTS (SELECT 1 FROM sandbox_cleanup_episodes e WHERE e.sandbox_id = s.id)"),
-        [sandbox_id],
+        params![sandbox_id, execution_generation.get()],
         |row| Ok(RawSandboxStatePublicationMetadata {
             quarantine_reason_code: None,
             transition_receipt_id: row.get(0)?,
@@ -494,7 +518,11 @@ fn completed_activation_rollback_covers(
             receipt.decode(state),
             Ok(SandboxStatePublicationMetadata::TransitionReceipt(receipt))
                 if receipt.kind() == SandboxTransitionReceiptKind::ActivationRollback
-                    && receipt.execution_generation() >= execution_generation
+                    && if state == SandboxState::Suspended {
+                        receipt.execution_generation() == execution_generation
+                    } else {
+                        receipt.execution_generation() >= execution_generation
+                    }
         )
     }))
 }

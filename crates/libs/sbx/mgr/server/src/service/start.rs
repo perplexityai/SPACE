@@ -1757,10 +1757,14 @@ impl SandboxManagerService {
                     open_claim: open_route_activation.as_ref(),
                 },
             )
-            .map_err(|error| {
-                Status::internal(format!(
+            .map_err(|error| match error {
+                // Not retryable as-is: the caller must mint a new attempt.
+                error @ crate::db::BeginActivationError::RolledBackAttempt { .. } => {
+                    Status::failed_precondition(error.to_string())
+                }
+                error => Status::internal(format!(
                     "failed to claim starting state before cold activation: {error}"
-                ))
+                )),
             })
         };
         let cleanup_episode = match cleanup_episode {

@@ -26,6 +26,16 @@ pub enum BeginActivationError {
         kind: ActivationKind,
         state: SandboxState,
     },
+    /// The exact generation/activation attempt was already rolled back. Its
+    /// retry must use a new activation attempt from the retained artifact.
+    #[error(
+        "activation attempt {activation_attempt_id} for execution generation \
+         {execution_generation} was rolled back"
+    )]
+    RolledBackAttempt {
+        execution_generation: ExecutionGeneration,
+        activation_attempt_id: SandboxActivationAttemptId,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -259,6 +269,19 @@ pub(crate) fn begin_activation_with_route_evidence(
         tx.commit()?;
         return Ok(None);
     }
+    if let Some(rolled_back) = rolled_back_activation_attempt(
+        &tx,
+        id,
+        expected_state,
+        execution_generation,
+        activation_attempt_id,
+        route_admission.operation_activation_attempt_id,
+    )? {
+        // Leave the row, its rollback receipt and its artifact pin untouched:
+        // a late request for a retired attempt must not revive that execution.
+        tx.commit()?;
+        return Err(rolled_back);
+    }
     let keep_filesystem = true;
     // Only activation authorizes node allocation. Filesystem-only staging keeps
     // an unbound request identity and must not become an allocation predecessor.
@@ -377,6 +400,93 @@ pub(crate) fn begin_activation_with_route_evidence(
         emit_auto_lifecycle_delete_receipt_superseded_if_present(sandbox_id, receipt_supersession);
     }
     Ok(episode)
+}
+
+/// Returns the refusal for an activation that repeats the exact
+/// generation/activation attempt a completed activation rollback retired.
+///
+/// The rollback receipt names the operation attempt when one was supplied and
+/// the route attempt otherwise, so either incoming identity can match it. The
+/// retained route evidence also names the route attempt the rolled-back
+/// activation dispatched, which covers a repeat that carries a different
+/// operation attempt for the same route attempt. A new attempt for the same
+/// generation is a legitimate retry and is not refused.
+fn rolled_back_activation_attempt(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+    expected_state: SandboxState,
+    execution_generation: Option<ExecutionGeneration>,
+    activation_attempt_id: Option<SandboxActivationAttemptId>,
+    operation_activation_attempt_id: Option<SandboxActivationAttemptId>,
+) -> std::result::Result<Option<BeginActivationError>, BeginActivationError> {
+    let Some(execution_generation) = execution_generation else {
+        return Ok(None);
+    };
+    if activation_attempt_id.is_none() && operation_activation_attempt_id.is_none() {
+        return Ok(None);
+    }
+    let row = tx
+        .query_row(
+            "SELECT transition_receipt_id, transition_receipt_kind,
+                    transition_receipt_target_state, transition_receipt_execution_generation,
+                    transition_receipt_reason_code, transition_receipt_activation_attempt_id,
+                    last_observed_execution_generation, last_observed_route_activation_id
+               FROM sandboxes
+              WHERE id = ?1 AND state = ?2 AND transition_receipt_id IS NOT NULL",
+            params![id, expected_state.as_str()],
+            |row| {
+                Ok((
+                    RawSandboxStatePublicationMetadata {
+                        quarantine_reason_code: None,
+                        transition_receipt_id: row.get(0)?,
+                        transition_receipt_kind: row.get(1)?,
+                        transition_receipt_target_state: row.get(2)?,
+                        transition_receipt_execution_generation: row.get(3)?,
+                        transition_receipt_reason_code: row.get(4)?,
+                        transition_receipt_activation_attempt_id: row.get(5)?,
+                    },
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((receipt, observed_generation, observed_route_attempt)) = row else {
+        return Ok(None);
+    };
+    // A malformed receipt carries no rollback authority; admission proceeds
+    // exactly as it did before this guard existed.
+    let Ok(SandboxStatePublicationMetadata::TransitionReceipt(receipt)) =
+        receipt.decode(expected_state)
+    else {
+        return Ok(None);
+    };
+    if receipt.kind() != SandboxTransitionReceiptKind::ActivationRollback
+        || receipt.execution_generation() != execution_generation
+    {
+        return Ok(None);
+    }
+    let receipt_attempt = receipt.activation_attempt_id();
+    let matches_receipt = |attempt: Option<SandboxActivationAttemptId>| {
+        attempt.is_some() && attempt == receipt_attempt
+    };
+    let matches_route_evidence = activation_attempt_id.is_some_and(|attempt| {
+        observed_generation == Some(execution_generation.get())
+            && observed_route_attempt.as_deref() == Some(attempt.to_string().as_str())
+    });
+    let refused_attempt = if matches_receipt(activation_attempt_id) || matches_route_evidence {
+        activation_attempt_id
+    } else if matches_receipt(operation_activation_attempt_id) {
+        operation_activation_attempt_id
+    } else {
+        None
+    };
+    Ok(refused_attempt.map(
+        |activation_attempt_id| BeginActivationError::RolledBackAttempt {
+            execution_generation,
+            activation_attempt_id,
+        },
+    ))
 }
 
 /// Stamp the terminal-teardown-suspend marker on a `suspending` row whose
