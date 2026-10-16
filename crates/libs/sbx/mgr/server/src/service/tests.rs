@@ -5223,9 +5223,19 @@ pub(crate) mod service_tests {
             Status::not_found("orphaned sandboxes must not look up templates"),
         );
 
-        let error = template_source_for_sandbox_prepare(&templates, &row)
-            .await
-            .expect_err("orphaned sandbox without rootfs is not startable");
+        let error = template_source_for_sandbox_prepare(
+            &crate::node_manager_transport::fake::unbound(
+                tempfile::tempdir()
+                    .unwrap()
+                    .path()
+                    .join("unused.sock")
+                    .as_path(),
+            ),
+            &templates,
+            &row,
+        )
+        .await
+        .expect_err("orphaned sandbox without rootfs is not startable");
         assert!(templates.requests().is_empty());
 
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
@@ -9708,8 +9718,140 @@ pub(crate) mod service_tests {
         );
     }
 
+    #[test]
+    fn stopped_provenance_requires_new_generation_and_owned_reconstruction() {
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new();
+        insert_test_sandbox(&conn, &sandbox_id.to_string(), SandboxState::Stopped);
+        let mut row = crate::db::get_sandbox(&conn, &sandbox_id.to_string())
+            .unwrap()
+            .unwrap();
+        row.space_api_route_identity = SpaceApiRouteIdentity {
+            execution_generation: Some(ExecutionGeneration::new(2).unwrap()),
+            ..Default::default()
+        };
+        use SandboxState::*;
+        for state in [
+            Creating,
+            Created,
+            Starting,
+            Started,
+            Stopping,
+            Stopped,
+            Deleting,
+            Pausing,
+            Paused,
+            Resuming,
+            Checkpointing,
+            Suspending,
+            Suspended,
+            Restoring,
+            CleanupRequired,
+            CleanupFailed,
+            Quarantined,
+            Failed,
+        ] {
+            row.state = state;
+            for generation in [1, 2, 3] {
+                let incoming = RouteStreamEpochIdentity::from_runtime_update(
+                    sandbox_id,
+                    runtime_fields(ExecutionGeneration::new(generation).unwrap(), 8)
+                        .space_api_route_identity,
+                )
+                .unwrap()
+                .unwrap();
+                let newer = state != SandboxState::Starting || generation > 2;
+                assert_eq!(
+                    validate_cold_start_provenance(&row, &incoming).is_ok(),
+                    newer,
+                    "{state:?} {generation}"
+                );
+                for authority in [
+                    ActivationRouteReplacementAuthority::PersistedOwner,
+                    ActivationRouteReplacementAuthority::Unowned,
+                ] {
+                    let reconstructed = validate_cold_start_provenance(&row, &incoming)
+                        .and_then(|()| persisted_route_stream_epoch(sandbox_id, &row, authority));
+                    let allowed = state == SandboxState::Starting
+                        && generation > 2
+                        && authority == ActivationRouteReplacementAuthority::PersistedOwner;
+                    assert_eq!(
+                        reconstructed.is_ok(),
+                        allowed,
+                        "{state:?} {generation} {authority:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reconstructed_cold_activation_cannot_reuse_stopped_generation() {
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new();
+        insert_test_sandbox(&conn, &sandbox_id.to_string(), SandboxState::Paused);
+        let service = service_for_teardown_test(conn);
+        let generation = ExecutionGeneration::new(2).unwrap();
+        service
+            .update_runtime_fields(sandbox_id, runtime_fields(generation, 7))
+            .unwrap();
+        {
+            let db = service.db_conn().unwrap();
+            crate::db::mark_cleanup_required(
+                &db,
+                &sandbox_id.to_string(),
+                true,
+                CleanupCompletion::MarkStopped,
+                "stopped execution",
+            )
+            .unwrap();
+            crate::db::complete_row_intent_cleanup(
+                &db,
+                &sandbox_id.to_string(),
+                CleanupCompletion::MarkStopped,
+                None,
+            )
+            .unwrap();
+        }
+        service.route_stream_epochs.lock().unwrap().clear();
+        let replacement = runtime_fields(generation, 8);
+        let cleanup_id = {
+            let db = service.db_conn().unwrap();
+            crate::db::begin_activation(
+                &db,
+                &sandbox_id.to_string(),
+                SandboxState::Stopped,
+                crate::db::ActivationKind::ColdStart,
+                Some(generation),
+                replacement.space_api_route_identity.activation_attempt_id,
+            )
+            .unwrap()
+            .unwrap()
+            .id
+        };
+        let before = service.lookup_sandbox(&sandbox_id.to_string()).unwrap();
+        let error = service
+            .update_runtime_fields_for_activation(sandbox_id, cleanup_id, replacement)
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Aborted);
+        let after = service.lookup_sandbox(&sandbox_id.to_string()).unwrap();
+        assert_eq!(
+            after.space_api_route_identity,
+            before.space_api_route_identity
+        );
+        assert_eq!(after.pid, before.pid);
+        assert_eq!(after.state, before.state);
+        assert!(service.route_stream_epochs.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn delayed_cleanup_cannot_remove_a_newer_runtime_generation() {
+        for cached_epoch in [true, false] {
+            assert_delayed_cleanup_preserves_replacement(cached_epoch).await;
+        }
+    }
+
+    async fn assert_delayed_cleanup_preserves_replacement(cached_epoch: bool) {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new();
         insert_test_sandbox(&conn, &sandbox_id.to_string(), SandboxState::Paused);
@@ -9739,6 +9881,11 @@ pub(crate) mod service_tests {
             )
             .unwrap();
         }
+        // A restarted manager has no route epoch for the stopped execution.
+        if !cached_epoch {
+            service.route_stream_epochs.lock().unwrap().clear();
+        }
+        let replacement = runtime_fields(ExecutionGeneration::new(2).unwrap(), 8);
         let cleanup_id = {
             let db = service.db.lock().expect("mutex poisoned");
             crate::db::begin_activation(
@@ -9747,18 +9894,18 @@ pub(crate) mod service_tests {
                 SandboxState::Stopped,
                 crate::db::ActivationKind::ColdStart,
                 Some(ExecutionGeneration::new(2).unwrap()),
-                Some(SandboxActivationAttemptId::new()),
+                if cached_epoch {
+                    Some(SandboxActivationAttemptId::new())
+                } else {
+                    replacement.space_api_route_identity.activation_attempt_id
+                },
             )
             .unwrap()
             .expect("a stopped row may begin a replacement activation")
             .id
         };
         service
-            .update_runtime_fields_for_activation(
-                sandbox_id,
-                cleanup_id,
-                runtime_fields(ExecutionGeneration::new(2).unwrap(), 8),
-            )
+            .update_runtime_fields_for_activation(sandbox_id, cleanup_id, replacement)
             .unwrap();
 
         // Model generation 1 node cleanup completing after generation 2

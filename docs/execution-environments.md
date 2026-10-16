@@ -215,11 +215,18 @@ schema redesign.
 
 The compiled execution catalog approves complete runtime, kernel and
 compatibility bindings independently of downloadable artifact pins. It includes
-E0 (Firecracker 1.15.1 / Linux 6.1.155) and a second Linux/x86_64 binding
-(Firecracker 1.17.0 / Linux 6.18.44):
+three Linux/x86_64 bindings: E0 (Firecracker 1.15.1 / Linux 6.1.155),
+Firecracker 1.17.0 / Linux 6.1.155, and Firecracker 1.17.0 / Linux 6.18.44.
+The 1.17.0 / 6.18.44 binding has reference:
 
 ```text
 sha256:959f1181ac69f0dde7125fbc81be6fcd75b64e9e06e7a393f067b96eb6fb2ac4
+```
+
+The 1.17.0 / 6.1.155 binding has reference:
+
+```text
+sha256:6e97c03b2523af6cc7b8e67bcde3fd89cf756c1958b10c24472aeadd68a32e0a
 ```
 
 Installation does not select an environment. Node-manager uses the existing
@@ -239,7 +246,19 @@ Node-manager verifies each environment's release and kernel from the managed
 store and stages its kernel into the execution cache. Cache loss triggers
 reconstruction. Missing or corrupt non-default artifacts cannot replace or
 withdraw E0. Each compiled binding records its qualified lifecycle support; the
-1.17.0 / 6.18.44 binding currently supports cold execution only.
+1.17.0 / 6.18.44 and 1.17.0 / 6.1.155 bindings support cold execution and
+same-environment memory snapshots. Restoring across environment identities is
+not an upgrade path: each snapshot retains its original VMM and kernel binding.
+The 6.1.155 kernel keeps its existing artifact identity when paired with 1.17.0.
+Non-default snapshot capture carries an environment-bound sandbox identity on
+`CreateSnapshot`, with the legacy sandbox ID omitted. Old node-managers reject
+that request before capture or encrypted teardown. New nodes verify the running
+sandbox's metadata and resolve its exact binding for restore before capture.
+This enforces qualification on the serving node even if it restarts between a
+preflight and the mutation. During mixed rollouts non-default suspend can fail
+and leave a resident paused VM; upgrade the node and retry or resume it. E0 and
+legacy capture keep their existing wire shape. Retain qualified node versions
+while their snapshots exist: downgrading a loader is not a retirement operation.
 
 `StartBuild` and `Create` accept an additive environment input. It contains the
 reference and recipe or template; the environment determines the runtime. Legacy
@@ -271,6 +290,43 @@ binding with the sandbox and cleanup intent before acknowledging success. First
 Start, service restarts, and later starts preserve it; conflicting or missing
 artifact evidence fails closed. Without a selection, a bound template retains
 that environment, including its exact runtime on new cold boot and stop/start.
+
+Retained instance directories grant sandbox-manager traversal without group write.
+Normal Start repairs old traversal permissions through node-manager before choosing
+an execution source; inspection errors never imply an absent disk. If an interrupted
+Start has no runtime and retained-rootfs inspection fails during startup recovery,
+only that row is deferred, with a warning; sibling recovery and service admission
+continue. Database failures still fail startup admission. The row stays Starting
+until an operator repairs the reported filesystem condition and restarts
+sandbox-manager to rerun startup recovery. This case has no periodic recovery owner.
+
+For an approved traversal-permission repair, run the following on the affected node
+with an updated node-manager. Set `space_checkout` to a matching SPACE source tree
+and `sandbox_id` to the full UUID from the warning. Node-manager has no reflection
+service, so `grpcurl` needs the explicit proto and its imports. The RPC pins the
+existing instance directory and sets its group and traversal mode; a bare
+`chmod 2710` does not repair the group.
+
+```bash
+space_checkout=/path/to/SPACE
+sandbox_id='<full-sandbox-uuid>'
+sudo grpcurl -plaintext -unix -max-time 30 \
+  -import-path "$space_checkout/proto" -proto node/v1/node.proto \
+  -d "{\"sandbox_id\":\"$sandbox_id\"}" \
+  /space/run/node-manager/node-manager.sock \
+  space.node.v1.NodeManager/PrepareSandboxArtifactDir &&
+  sudo systemctl restart space-sbxmgr.service &&
+  sudo /space/bin/space-sbxmgr list
+```
+
+This uses the standard systemd unit; use the deployment's equivalent restart on
+other installations. Only restart after the RPC succeeds. Verify that the row
+recovers to Stopped, its retained `instance/rootfs.ext4` is present, and a later
+Start preserves its recorded execution binding. If the RPC fails, inspect that
+error before restarting. It repairs permissions on a valid directory, not a
+regular-file instance, symlink loop, or storage I/O fault; those conditions need
+filesystem repair without discarding the retained disk or rewriting its binding.
+
 Unbound derived builds keep the legacy request path regardless of runtime version.
 Ordinary builds inheriting the immutable E0 binding also retain that compatible
 path; explicit E0 requests and every inherited non-default binding require exact
@@ -279,11 +335,11 @@ never the runtime version alone. No kernel-only or runtime-only substitution is
 allowed. Local selected creation is cold-only, without pool adoption, snapshots,
 or cluster-owned identities. This creation restriction also covers explicit E0
 requests; later snapshot and suspend operations independently check memory-state
-qualification, which E0 already has. Unqualified memory-state operations are refused.
+qualification. Unqualified memory-state operations are refused.
 Managed non-default bindings are omitted from the legacy cluster placement
 projection. Historical external runtime and kernel installations remain available
 to legacy execution and placement. Fleet placement for complete environments,
-policy distribution, snapshot compatibility and mixed-environment pools are later
+policy distribution, cross-environment snapshot compatibility and mixed-environment pools are later
 integrations. Use the node-local clients for explicit non-default selection.
 
 See the [runtime benchmark procedure](../scripts/benchmarks/README.md#runtime-environment-benchmark)

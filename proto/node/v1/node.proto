@@ -895,8 +895,16 @@ message CreateSnapshotRequest {
   // plaintext copy and `dest_dir` is ignored.
   optional string snapshot_volume_mount_dir = 5;
   ExecutionFence execution_fence = 6;
+  // Bound non-default captures leave sandbox_id empty. Older nodes must reject
+  // the missing legacy identity before capture, including encrypted teardown.
+  EnvironmentSnapshotInput environment = 7;
 }
 message CreateSnapshotResponse {}
+
+message EnvironmentSnapshotInput {
+  string sandbox_id = 1;
+  string reference = 2;
+}
 
 message LoadSnapshotRequest {
   string sandbox_id = 1;

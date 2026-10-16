@@ -798,7 +798,7 @@ pub async fn do_checkpoint(
         .parse::<SandboxId>()
         .map_err(|error| format!("invalid sandbox ID: {error}"))?;
     // 1. Read sandbox, check state, and transition to Checkpointing atomically
-    let (previous_state, execution_fence) = {
+    let (previous_state, execution_fence, execution) = {
         let db = lock_db(ctx)?;
         let sandbox =
             crate::db::get_sandbox(&db, sandbox_id).map_err(|e| format!("db error: {e}"))?;
@@ -854,7 +854,11 @@ pub async fn do_checkpoint(
 
         // Transition to Checkpointing while still holding the lock
         begin_checkpoint_state(&db, sandbox_id)?;
-        (previous_state, sandbox.node_execution_fence())
+        (
+            previous_state,
+            sandbox.node_execution_fence(),
+            sandbox.execution_metadata.clone(),
+        )
     };
     if previous_state == SandboxState::Started {
         ctx.health_lifecycle.record_edge(sandbox_id).await;
@@ -964,14 +968,18 @@ pub async fn do_checkpoint(
         .await);
     }
     if let Err(e) = node_client
-        .create_snapshot(CreateSnapshotRequest {
-            execution_fence: execution_fence.clone(),
-            sandbox_id: sandbox_id.to_string(),
-            snapshot_path: "/vmstate".to_string(),
-            mem_file_path: "/memory".to_string(),
-            dest_dir: Some(snapshot_dir.clone()),
-            snapshot_volume_mount_dir: None,
-        })
+        .create_snapshot(crate::service::snapshot_capture::bind(
+            CreateSnapshotRequest {
+                execution_fence: execution_fence.clone(),
+                sandbox_id: sandbox_id.to_string(),
+                snapshot_path: "/vmstate".to_string(),
+                mem_file_path: "/memory".to_string(),
+                dest_dir: Some(snapshot_dir.clone()),
+                snapshot_volume_mount_dir: None,
+                environment: None,
+            },
+            execution.as_ref(),
+        ))
         .await
     {
         return Err(rollback_checkpoint_failure(

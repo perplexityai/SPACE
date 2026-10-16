@@ -1,5 +1,6 @@
 use super::activation_support::space_api_route_identity_to_wire;
 use super::cleanup_support::{StateWriteRejected, require_state_write_from, state_write_result};
+use super::tail_support::connect_node;
 use super::template_snapshot_support::compute_partial_sha256;
 use super::validation::{
     TemplateRuntimeDefaults, reject_incompatible_template_arch,
@@ -830,32 +831,58 @@ pub(super) async fn template_runtime_defaults_for_sandbox_start(
     }
 }
 
-pub(super) fn sandbox_rootfs_exists(sandbox_id: &str) -> bool {
-    sandbox_rootfs_exists_in(std::path::Path::new(CACHE_DIR), sandbox_id)
-}
-
-pub(super) fn sandbox_rootfs_exists_in(cache_dir: &std::path::Path, sandbox_id: &str) -> bool {
+pub(super) fn sandbox_rootfs_exists_in(
+    cache_dir: &std::path::Path,
+    sandbox_id: &str,
+) -> std::io::Result<bool> {
     cache_dir
         .join(sandbox_id)
         .join("instance")
         .join("rootfs.ext4")
-        .exists()
+        .try_exists()
 }
 
 pub(super) async fn template_source_for_sandbox_prepare(
+    node_manager: &crate::node_manager_transport::NodeManagerConnector,
     templates: &dyn crate::template_resolver::TemplateResolver,
     sandbox: &crate::db::SandboxRow,
 ) -> Result<SandboxPrepareSource, Status> {
-    template_source_for_sandbox_prepare_in(templates, sandbox, std::path::Path::new(CACHE_DIR))
-        .await
+    template_source_for_sandbox_prepare_in(
+        node_manager,
+        templates,
+        sandbox,
+        std::path::Path::new(CACHE_DIR),
+    )
+    .await
 }
 
 pub(super) async fn template_source_for_sandbox_prepare_in(
+    node_manager: &crate::node_manager_transport::NodeManagerConnector,
     templates: &dyn crate::template_resolver::TemplateResolver,
     sandbox: &crate::db::SandboxRow,
     cache_dir: &std::path::Path,
 ) -> Result<SandboxPrepareSource, Status> {
-    if sandbox_rootfs_exists_in(cache_dir, &sandbox.id) {
+    if sandbox_rootfs_exists_in(cache_dir, &sandbox.id)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+    {
+        // Older node-managers left instance/ private to the VM owner. The
+        // privileged publisher repairs traversal before selecting any template.
+        connect_node(node_manager)
+            .await
+            .map_err(|error| Status::unavailable(format!("repair retained instance: {error}")))?
+            .prepare_sandbox_artifact_dir(
+                pplx_space_node_mgr_client::proto::PrepareSandboxArtifactDirRequest {
+                    sandbox_id: sandbox.id.clone(),
+                },
+            )
+            .await?;
+    }
+    if sandbox_rootfs_exists_in(cache_dir, &sandbox.id).map_err(|error| {
+        Status::failed_precondition(format!(
+            "inspect retained rootfs for {}: {error}",
+            sandbox.id
+        ))
+    })? {
         let execution = super::tail_support::sandbox_execution_metadata_in(cache_dir, &sandbox.id)
             .map_err(|error| Status::failed_precondition(error.to_string()))?;
         return Ok(SandboxPrepareSource {

@@ -1157,7 +1157,25 @@ impl SandboxManagerService {
                 outcome: crate::db::StartupRecoveryOutcome::Deferred,
             });
         }
-        let edge = if sandbox_rootfs_exists_in(cache_dir, &row.id) {
+        let has_rootfs = match sandbox_rootfs_exists_in(cache_dir, &row.id) {
+            Ok(exists) => exists,
+            Err(error) => {
+                // Inspection failure is not evidence of an absent disk.
+                // Preserve this row and its artifacts for filesystem repair;
+                // one unreadable instance must not block sibling admission.
+                tracing::warn!(
+                    sandbox_id = %row.id,
+                    %error,
+                    "deferred interrupted start recovery; repair the reported filesystem condition and retry startup recovery"
+                );
+                return Ok(crate::db::StartupRecoveryRecord {
+                    id: row.id,
+                    previous_state: row.state,
+                    outcome: crate::db::StartupRecoveryOutcome::Deferred,
+                });
+            }
+        };
+        let edge = if has_rootfs {
             &edges::UNLAUNCHED_START_RECOVERY_STOPPED
         } else {
             if let Err(error) = ensure_sandbox_cache_root_in(cache_dir, &row.id) {

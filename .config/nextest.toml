@@ -105,6 +105,7 @@ or (package(pplx-space-node-mgr) and test(=service::node_disk_metrics::rootfs_ba
 or (package(pplx-space-node-mgr) and test(=clone_tree::tests::private_clone_blocks_foreign_uid_grafts_and_shared_clone_is_held))
 or (package(pplx-space-node-mgr) and test(=loop_devices::tests::ensure_capacity_creates_attachable_devices_past_max_loop))
 or (package(pplx-space-node-mgr) and test(=service::gateway_isolation::tests::isolated_gateway_cannot_access_vm_resources))
+or (package(pplx-space-node-mgr) and test(=service::launch_prepare::tests::retained_instance_repair_grants_traversal_without_write_and_preserves_files))
 or (package(pplx-space-node-mgr) and test(=service::encrypted_volumes::tests::ciphertext_publication_is_readable_without_exposing_private_backings))
 or (package(pplx-space-node-mgr) and test(=service::permission_tree::tests::owned_walk_prunes_snapshots_and_never_mutates_link_targets))
 or (package(pplx-space-node-mgr) and test(=device_backing::tests::pinned_devices_survive_replacement_and_encrypted_reopen))

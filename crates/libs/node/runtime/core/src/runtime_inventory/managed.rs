@@ -198,11 +198,30 @@ impl RuntimeInventory {
     ) -> Result<(), RuntimeInventoryError> {
         let release = environment.release();
         let kernel = environment.kernel();
+        let release_root = store.releases_root().join(managed_release_directory(
+            &release.release,
+            release.digest(),
+        ));
         let shared_runtime = self
             .runtimes
             .iter()
             .find(|entry| {
                 entry.runtime == release.release && self.defaults.contains(&entry.runtime)
+            })
+            .or_else(|| {
+                // Reuse only a verified managed copy of this exact release.
+                // External installations share version keys but lack digest evidence.
+                self.environments
+                    .values()
+                    .filter_map(|entry| entry.as_ref().ok())
+                    .map(|entry| &entry.runtime)
+                    .find(|entry| {
+                        entry.runtime == release.release
+                            && entry
+                                .files
+                                .paths()
+                                .all(|path| path.starts_with(&release_root))
+                    })
             })
             .cloned();
         let shared_kernel = self
@@ -210,10 +229,6 @@ impl RuntimeInventory {
             .iter()
             .find(|entry| entry.default_for_new && entry.metadata.digest == Some(kernel.sha256))
             .cloned();
-        let release_root = store.releases_root().join(managed_release_directory(
-            &release.release,
-            release.digest(),
-        ));
         let kernel_root = store
             .kernels_root()
             .join(managed_kernel_directory(&kernel.version, kernel.sha256));

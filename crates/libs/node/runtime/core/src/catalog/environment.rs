@@ -138,7 +138,8 @@ impl CompiledEnvironment {
                 INITIAL_FIRECRACKER_STATE_FORMAT_VERSION,
                 true,
             ),
-            ("1.17.0", "6.18.44", "12.0.0", false),
+            ("1.17.0", "6.18.44", "12.0.0", true),
+            ("1.17.0", "6.1.155", "12.0.0", true),
         ]
         .into_iter()
         .map(|(runtime, kernel, state_version, memory_state)| {

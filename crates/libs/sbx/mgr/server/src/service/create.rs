@@ -650,7 +650,11 @@ impl SandboxManagerService {
             "restore.template_prepare_source",
             START_TEMPLATE_RESOLUTION_TIMEOUT,
             id,
-            template_source_for_sandbox_prepare(self.template_resolver.as_ref(), sandbox),
+            template_source_for_sandbox_prepare(
+                &self.node_manager,
+                self.template_resolver.as_ref(),
+                sandbox,
+            ),
         )
         .await?;
         let prepare_template = prepare_source.template;

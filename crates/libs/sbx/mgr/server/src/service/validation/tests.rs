@@ -145,6 +145,10 @@ fn memory_state_support_follows_complete_environment_identity() {
         .definition()
         .execution_requirements()
         .unwrap();
+    let same_kernel = environments[2]
+        .definition()
+        .execution_requirements()
+        .unwrap();
     let unknown_with_same_runtime = e0
         .clone()
         .with_environment(EnvironmentReference::new(Digest::sha256([9; 32])));
@@ -154,7 +158,8 @@ fn memory_state_support_follows_complete_environment_identity() {
             false,
         ),
         (e0, false),
-        (other, true),
+        (other, false),
+        (same_kernel, false),
         (unknown_with_same_runtime, true),
     ] {
         assert_eq!(super::requires_cold_creation(&execution), cold_only);

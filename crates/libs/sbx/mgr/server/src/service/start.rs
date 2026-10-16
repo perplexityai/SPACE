@@ -17,7 +17,7 @@ use super::create_support::{
     CheckpointRestoreRetryAction, GUEST_GATEWAY, GUEST_IP, RestoredSnapshotProvenance,
     RuntimeActivatedEvent, SUSPEND_CHECKPOINT, admit_warm_start, checkpoint_restore_retry_action,
     checkpoint_start_response_for_existing_started_sandbox, emit_runtime_activated_event,
-    guest_console_logs_enabled, resolve_template_paths_for_start, sandbox_rootfs_exists,
+    guest_console_logs_enabled, resolve_template_paths_for_start,
     stage_base_snapshot_runtime_metadata, template_runtime_defaults_for_sandbox_start,
     template_source_for_sandbox_prepare, write_warm_start_restaged,
 };
@@ -1549,7 +1549,6 @@ impl SandboxManagerService {
         );
         span.record("runtime", tracing::field::display(&sandbox.runtime));
         span.record("initial_state", tracing::field::display(sandbox.state));
-        span.record("has_rootfs", sandbox_rootfs_exists(&sandbox.id));
         let sandbox_dir = std::path::PathBuf::from(format!("{CACHE_DIR}/{}", sandbox.id));
         let snapshot_vmstate_path = canonical_suspend_snapshot_dir(&sandbox_dir).join("vmstate");
         span.record("has_snapshot", snapshot_vmstate_path.exists());
@@ -1643,9 +1642,14 @@ impl SandboxManagerService {
             "fresh.template_prepare_source",
             START_TEMPLATE_RESOLUTION_TIMEOUT,
             &sandbox.id,
-            template_source_for_sandbox_prepare(self.template_resolver.as_ref(), &sandbox),
+            template_source_for_sandbox_prepare(
+                &self.node_manager,
+                self.template_resolver.as_ref(),
+                &sandbox,
+            ),
         )
         .await?;
+        span.record("has_rootfs", prepare_source.existing_artifact);
         let selection_mode = if prepare_source.existing_artifact {
             pplx_space_execution_common::proto::ExecutionSelectionMode::ExistingColdBoot
         } else {

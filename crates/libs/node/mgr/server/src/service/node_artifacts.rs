@@ -31,7 +31,7 @@ use pplx_space_node_runtime_core::runtime_inventory::{
 };
 
 impl NodeManagerService {
-    fn allowed_definition(
+    pub(super) fn allowed_definition(
         &self,
         reference: Option<pplx_space_common_core::types::EnvironmentReference>,
         mode: ExecutionSelectionMode,

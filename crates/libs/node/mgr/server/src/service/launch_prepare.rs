@@ -870,6 +870,9 @@ impl NodeManagerService {
                 // create subdirs (e.g., snapshot/) for base-snapshot files.
                 {
                     ensure_sandbox_artifact_dir_permissions(&sandbox_cache_dir_b)?;
+                    // Discovery of a retained rootfs runs as sandbox-manager,
+                    // independently of the VM's per-sandbox owner.
+                    ensure_sandbox_instance_traversal(&cache_dir_b)?;
                     ensure_sandbox_artifact_dir_permissions(&snapshots_dir_b)?;
                 }
 
@@ -913,6 +916,9 @@ impl NodeManagerService {
 
         spawn_lifecycle_blocking(&_lifecycle_permit, move || -> Result<(), Status> {
             ensure_sandbox_artifact_dir(&sandbox_cache_dir)?;
+            // Retained instances can predate traversal permissions. Repair only
+            // an existing, pinned directory; never create or replace its files.
+            ensure_sandbox_instance_traversal(sandbox_cache_dir.join("instance"))?;
             ensure_sandbox_artifact_dir(&snapshots_dir)
         })
         .await

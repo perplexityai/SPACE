@@ -26,7 +26,7 @@
 # 17. create+resume (pool)        — (E2E)
 #
 # Usage:
-#   ./scripts/benchmarks/bench-sbx-lifecycle.sh [<host>] [--template <tpl>] [--iterations <n>] [--only <ops>]
+#   ./scripts/benchmarks/bench-sbx-lifecycle.sh [<host>] [--template <tpl>] [--iterations <n>] [--environment <reference>] [--only <ops>]
 #
 # Remote SSH user defaults to deploy; override with SSH_USER=dev if needed.
 #
@@ -41,6 +41,7 @@ SSH_USER="${SSH_USER:-deploy}"
 NODE_IP="utm-space-worker"
 TEMPLATE="seed"
 ITERATIONS=5
+ENVIRONMENT_REFERENCE=""
 BIN="/space/bin"
 HAS_MEMFILE=0
 HAS_POOL=0
@@ -76,11 +77,25 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --template)   TEMPLATE="$2"; shift 2 ;;
     --iterations) ITERATIONS="$2"; shift 2 ;;
+    --environment) ENVIRONMENT_REFERENCE="$2"; shift 2 ;;
     --only)       ONLY="$2"; shift 2 ;;
     --*)          echo "Unknown option: $1"; exit 1 ;;
     *)            NODE_IP="$1"; shift ;;
   esac
 done
+
+# Use one selection protocol for every measured environment, including E0.
+# Only the legacy path supplies a runtime selector alongside the template.
+if [[ -n "$ENVIRONMENT_REFERENCE" ]]; then
+  if [[ ! "$ENVIRONMENT_REFERENCE" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    echo "ERROR: --environment requires a SHA-256 environment reference" >&2
+    exit 2
+  fi
+  CREATE_RUNTIME_ARGS=(--environment "$ENVIRONMENT_REFERENCE")
+else
+  CREATE_RUNTIME_ARGS=(--runtime fc)
+fi
+CREATE_RUNTIME_FLAGS="${CREATE_RUNTIME_ARGS[*]}"
 
 # Check if a benchmark should run based on --only filter.
 # Usage: should_run "resume_pool" || return
@@ -203,8 +218,13 @@ begin_iter() {
 
 create_sandbox() {
   local flags="${1:-}"
+  # Explicit selection admits cold creation; memory-state operations are
+  # requested separately against the resulting bound sandbox.
+  if [[ -n "$ENVIRONMENT_REFERENCE" && "$flags" == "--snapshots" ]]; then
+    flags=""
+  fi
   local out id
-  out=$(remote "$BIN/space-sbxmgr" create --runtime fc --template "$TEMPLATE" --blocking $flags 2>&1)
+  out=$(remote "$BIN/space-sbxmgr" create "${CREATE_RUNTIME_ARGS[@]}" --template "$TEMPLATE" --blocking $flags 2>&1)
   id=$(require_sandbox_id "create output" "$out")
   track_sandbox "$id"
   echo "$id"
@@ -216,8 +236,35 @@ start_sandbox_blocking() {
   remote "$BIN/space-sbxmgr" start "$id" --blocking "$@" >/dev/null 2>&1
 }
 
-stop_sandbox()   { remote "$BIN/space-sbxmgr" stop "$1" --blocking >/dev/null 2>&1; }
-delete_sandbox() { remote "$BIN/space-sbxmgr" delete "$1" --blocking >/dev/null 2>&1; }
+stop_sandbox() {
+  local output
+  if output=$(remote "$BIN/space-sbxmgr" stop "$1" --blocking 2>&1); then
+    return 0
+  else
+    local rc=$?
+    echo "$output" >&2
+    return "$rc"
+  fi
+}
+delete_sandbox() {
+  local attempt output rc=0
+  # Stop and suspend can finish before the node releases its cleanup lock.
+  # This untimed, idempotent cleanup must settle before the next sample.
+  # Missing targets already succeed in the CLI; never guess success from errors.
+  for attempt in $(seq 1 10); do
+    if output=$(remote "$BIN/space-sbxmgr" delete "$1" --blocking 2>&1); then
+      return 0
+    else
+      rc=$?
+    fi
+    echo "WARN: cleanup attempt $attempt/10 for $1 (rc=$rc): $output" >&2
+    if [[ "$attempt" -lt 10 ]]; then
+      sleep 0.2
+    fi
+  done
+  echo "ERROR: cleanup did not settle for $1 after 10 attempts" >&2
+  return "$rc"
+}
 
 wait_sandbox_state() {
   local id="$1" want="$2" timeout="${3:-120}" short
@@ -393,7 +440,7 @@ bench_create_cold() {
   for i in $(seq 1 "$ITERATIONS"); do
     begin_iter "$i"
     local out ms id
-    out=$(remote_timed "$BIN/space-sbxmgr create --runtime fc --template $TEMPLATE --blocking")
+    out=$(remote_timed "$BIN/space-sbxmgr create $CREATE_RUNTIME_FLAGS --template $TEMPLATE --blocking")
     ms=$(first_line "$out")
     id=$(require_sandbox_id "create (cold) output" "$out")
     record "create_cold" "$ms"
@@ -408,7 +455,7 @@ bench_create_base_snap() {
   for i in $(seq 1 "$ITERATIONS"); do
     begin_iter "$i"
     local out ms id
-    out=$(remote_timed "$BIN/space-sbxmgr create --runtime fc --template $TEMPLATE --boot-mode base-snapshot --blocking")
+    out=$(remote_timed "$BIN/space-sbxmgr create $CREATE_RUNTIME_FLAGS --template $TEMPLATE --boot-mode base-snapshot --blocking")
     ms=$(first_line "$out")
     id=$(require_sandbox_id "create (base-snapshot) output" "$out")
     record "create_base_snap" "$ms"
@@ -424,7 +471,7 @@ bench_create_pool() {
     begin_iter "$i"
     wait_pool_ready "$i" || { echo "  [$i/$ITERATIONS] SKIP: no pool"; continue; }
     local out ms id
-    out=$(remote_timed "$BIN/space-sbxmgr create --runtime fc --template $TEMPLATE --boot-mode pool --blocking")
+    out=$(remote_timed "$BIN/space-sbxmgr create $CREATE_RUNTIME_FLAGS --template $TEMPLATE --boot-mode pool --blocking")
     ms=$(first_line "$out")
     id=$(require_sandbox_id "create (pool) output" "$out")
     record "create_pool" "$ms"
@@ -455,7 +502,13 @@ bench_start_base_snap() {
   for i in $(seq 1 "$ITERATIONS"); do
     begin_iter "$i"
     local id
-    id=$(create_sandbox "--boot-mode base-snapshot")
+    if [[ -n "$ENVIRONMENT_REFERENCE" ]]; then
+      # Selected Create allocates a cold record; Start owns the qualified
+      # template-snapshot restore and its exact execution binding.
+      id=$(create_sandbox)
+    else
+      id=$(create_sandbox "--boot-mode base-snapshot")
+    fi
     local out ms
     out=$(remote_timed "$BIN/space-sbxmgr start $id --from-warm --blocking")
     ms=$(first_line "$out")
@@ -557,7 +610,7 @@ bench_resume_pool() {
     wait_pool_ready "$i" || { echo "  [$i/$ITERATIONS] SKIP: no pool"; continue; }
     local out ms id
     # Adopt without autostart → paused sandbox
-    out=$(remote "$BIN/space-sbxmgr" create --runtime fc --template "$TEMPLATE" --boot-mode pool --blocking 2>&1)
+    out=$(remote "$BIN/space-sbxmgr" create "${CREATE_RUNTIME_ARGS[@]}" --template "$TEMPLATE" --boot-mode pool --blocking 2>&1)
     id=$(printf '%s\n' "$out" | parse_sandbox_id)
     [[ -z "$id" ]] && { echo "  [$i/$ITERATIONS] ERROR: adopt failed"; continue; }
     track_sandbox "$id"
@@ -629,7 +682,7 @@ bench_e2e_cold() {
   for i in $(seq 1 "$ITERATIONS"); do
     begin_iter "$i"
     local out ms id
-    out=$(remote_timed "$BIN/space-sbxmgr create --runtime fc --template $TEMPLATE --autostart --boot-mode cold --blocking")
+    out=$(remote_timed "$BIN/space-sbxmgr create $CREATE_RUNTIME_FLAGS --template $TEMPLATE --autostart --boot-mode cold --blocking")
     ms=$(first_line "$out")
     id=$(require_sandbox_id "create+start (cold) output" "$out")
     record "e2e_cold" "$ms"
@@ -644,7 +697,7 @@ bench_e2e_base_snap() {
   for i in $(seq 1 "$ITERATIONS"); do
     begin_iter "$i"
     local out ms id
-    out=$(remote_timed "$BIN/space-sbxmgr create --runtime fc --template $TEMPLATE --autostart --boot-mode base-snapshot --blocking")
+    out=$(remote_timed "$BIN/space-sbxmgr create $CREATE_RUNTIME_FLAGS --template $TEMPLATE --autostart --boot-mode base-snapshot --blocking")
     ms=$(first_line "$out")
     id=$(require_sandbox_id "create+start (base-snapshot) output" "$out")
     record "e2e_base_snap" "$ms"
@@ -660,7 +713,7 @@ bench_e2e_pool() {
     begin_iter "$i"
     wait_pool_ready "$i" || { echo "  [$i/$ITERATIONS] SKIP: no pool"; continue; }
     local out ms id
-    out=$(remote_timed "$BIN/space-sbxmgr create --runtime fc --template $TEMPLATE --autostart --boot-mode pool --blocking")
+    out=$(remote_timed "$BIN/space-sbxmgr create $CREATE_RUNTIME_FLAGS --template $TEMPLATE --autostart --boot-mode pool --blocking")
     ms=$(first_line "$out")
     id=$(require_sandbox_id "create+resume (pool) output" "$out")
     record "e2e_pool" "$ms"
@@ -713,6 +766,7 @@ main() {
   echo "=== Sandbox Lifecycle Benchmark ==="
   echo "Host:       $NODE_IP"
   echo "Template:   $TEMPLATE"
+  echo "Environment: ${ENVIRONMENT_REFERENCE:-legacy selection}"
   echo "Iterations: $ITERATIONS"
   echo "Started:    $(date '+%Y-%m-%dT%H:%M:%S%z')"
   echo "State log:  $STATE_FILE"
@@ -723,8 +777,8 @@ main() {
 
   # Create variants
   if should_run create_cold; then bench_create_cold; fi
-  if should_run create_base_snap && [[ "$HAS_MEMFILE" -gt 0 ]]; then bench_create_base_snap; fi
-  if should_run create_pool && [[ "$HAS_POOL" -gt 0 ]]; then bench_create_pool; fi
+  if should_run create_base_snap && [[ "$HAS_MEMFILE" -gt 0 && -z "$ENVIRONMENT_REFERENCE" ]]; then bench_create_base_snap; fi
+  if should_run create_pool && [[ "$HAS_POOL" -gt 0 && -z "$ENVIRONMENT_REFERENCE" ]]; then bench_create_pool; fi
 
   # Start variants
   if should_run start_cold; then bench_start_cold; fi
@@ -738,7 +792,7 @@ main() {
 
   # Resume variants
   if should_run resume_paused; then bench_resume_paused; fi
-  if should_run resume_pool && [[ "$HAS_POOL" -gt 0 ]]; then bench_resume_pool; fi
+  if should_run resume_pool && [[ "$HAS_POOL" -gt 0 && -z "$ENVIRONMENT_REFERENCE" ]]; then bench_resume_pool; fi
 
   # Suspend / restore
   if should_run suspend; then bench_suspend; fi
@@ -747,8 +801,8 @@ main() {
 
   # End-to-end
   if should_run e2e_cold; then bench_e2e_cold; fi
-  if should_run e2e_base_snap && [[ "$HAS_MEMFILE" -gt 0 ]]; then bench_e2e_base_snap; fi
-  if should_run e2e_pool && [[ "$HAS_POOL" -gt 0 ]]; then bench_e2e_pool; fi
+  if should_run e2e_base_snap && [[ "$HAS_MEMFILE" -gt 0 && -z "$ENVIRONMENT_REFERENCE" ]]; then bench_e2e_base_snap; fi
+  if should_run e2e_pool && [[ "$HAS_POOL" -gt 0 && -z "$ENVIRONMENT_REFERENCE" ]]; then bench_e2e_pool; fi
 
   CURRENT_PHASE="results"
   print_results

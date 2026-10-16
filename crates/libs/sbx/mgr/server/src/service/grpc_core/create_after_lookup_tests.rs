@@ -850,10 +850,14 @@ async fn selected_create_persists_the_binding_used_by_first_start() {
             .unwrap();
         assert_eq!(row.state, SandboxState::Created);
         assert_eq!(row.execution_metadata.as_ref(), Some(&bound));
-        let prepared =
-            template_source_for_sandbox_prepare_in(fixture.templates.as_ref(), &row, cache.path())
-                .await
-                .unwrap();
+        let prepared = template_source_for_sandbox_prepare_in(
+            &fixture.service.node_manager,
+            fixture.templates.as_ref(),
+            &row,
+            cache.path(),
+        )
+        .await
+        .unwrap();
         assert!(!prepared.existing_artifact);
         assert_eq!(prepared.execution, bound);
         assert_eq!(
@@ -870,10 +874,15 @@ async fn selected_create_persists_the_binding_used_by_first_start() {
         )
         .unwrap();
         assert_eq!(
-            template_source_for_sandbox_prepare_in(fixture.templates.as_ref(), &row, cache.path())
-                .await
-                .unwrap_err()
-                .code(),
+            template_source_for_sandbox_prepare_in(
+                &fixture.service.node_manager,
+                fixture.templates.as_ref(),
+                &row,
+                cache.path()
+            )
+            .await
+            .unwrap_err()
+            .code(),
             tonic::Code::FailedPrecondition,
         );
         std::fs::write(build.dir.path().join("metadata.json"), &metadata_bytes).unwrap();
@@ -928,6 +937,7 @@ async fn selected_create_persists_the_binding_used_by_first_start() {
                 std::fs::write(path, serde_json::to_vec(&artifact).unwrap()).unwrap();
             }
             let source = template_source_for_sandbox_prepare_in(
+                &fixture.service.node_manager,
                 fixture.templates.as_ref(),
                 &row,
                 cache.path(),

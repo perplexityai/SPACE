@@ -118,6 +118,21 @@ fn ensure_sandbox_artifact_dir_permissions(path: impl AsRef<Path>) -> Result<(),
     trusted_paths::set_permissions(&directory, Some(gids::SPACE_CACHE_RW), 0o2770)
 }
 
+fn ensure_sandbox_instance_traversal(path: impl AsRef<Path>) -> Result<(), Status> {
+    let path = path.as_ref();
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(Status::internal(format!(
+                "inspect retained instance: {error}"
+            )));
+        }
+        Ok(_) => {}
+    }
+    let directory = trusted_paths::open_directory(path)?;
+    trusted_paths::set_permissions(&directory, Some(gids::SPACE_CACHE_RW), 0o2710)
+}
+
 fn ensure_sidecar_run_dir_permissions(path: &str) -> Result<(), Status> {
     cleanup_helpers::chgrp_path_blocking(path, gids::SPACE_SIDECARCLIENTS)?;
     cleanup_helpers::chmod_path_blocking(path, 0o2770)

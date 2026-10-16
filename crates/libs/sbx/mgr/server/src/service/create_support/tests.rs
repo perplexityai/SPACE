@@ -496,3 +496,249 @@ async fn existing_sandbox_cannot_resolve_a_missing_artifact_by_latest_alias() {
     assert!(error.message().contains("saved template hash"));
     assert!(templates.requests().is_empty());
 }
+
+#[tokio::test]
+async fn retained_rootfs_inspection_errors_defer_recovery_without_selecting_template() {
+    use crate::node_manager_transport::fake;
+    use crate::state::SandboxState;
+    use crate::template_resolver::fake::FakeTemplateResolver;
+    #[derive(Clone, Copy, Debug)]
+    enum Failure {
+        NotDirectory,
+        SymlinkLoop,
+    }
+    for failure in [Failure::NotDirectory, Failure::SymlinkLoop] {
+        let cache = tempfile::tempdir().unwrap();
+        let id = SandboxId::new().to_string();
+        let sibling = SandboxId::new().to_string();
+        let conn = crate::db::test_conn();
+        for sandbox in [&id, &sibling] {
+            super::super::tests::service_tests::insert_test_sandbox(
+                &conn,
+                sandbox,
+                SandboxState::Starting,
+            );
+        }
+        let row = crate::db::get_sandbox(&conn, &id).unwrap().unwrap();
+        assert!(
+            row.execution_metadata.is_none(),
+            "legacy record must remain unbound"
+        );
+        let root = cache.path().join(&id);
+        std::fs::create_dir(&root).unwrap();
+        let instance = root.join("instance");
+        match failure {
+            Failure::NotDirectory => std::fs::write(&instance, b"invalid instance").unwrap(),
+            Failure::SymlinkLoop => std::os::unix::fs::symlink("instance", &instance).unwrap(),
+        }
+        sandbox_rootfs_exists_in(cache.path(), &id)
+            .expect_err("an invalid instance must remain an inspection error");
+        let sibling_instance = cache.path().join(&sibling).join("instance");
+        std::fs::create_dir_all(&sibling_instance).unwrap();
+        std::fs::write(sibling_instance.join("rootfs.ext4"), b"sibling disk").unwrap();
+        let templates =
+            FakeTemplateResolver::refusing(Status::not_found("must not consult template"));
+        let node = fake::unbound(cache.path().join("unused.sock").as_path());
+        let error = template_source_for_sandbox_prepare_in(&node, &templates, &row, cache.path())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(templates.requests().is_empty());
+        let service = super::super::SandboxManagerService::for_test(conn);
+        let records = service
+            .recover_prelaunch_startup_states_in(cache.path(), &Default::default())
+            .unwrap_or_else(|error| panic!("{failure:?}: {error}"));
+        assert_eq!(records.len(), 2);
+        for record in records {
+            let expected = if record.id == id {
+                crate::db::StartupRecoveryOutcome::Deferred
+            } else {
+                assert_eq!(record.id, sibling);
+                crate::db::StartupRecoveryOutcome::State(SandboxState::Stopped)
+            };
+            assert_eq!(record.outcome, expected, "{failure:?}");
+        }
+        let deferred = service.lookup_sandbox(&id).unwrap();
+        assert_eq!(deferred.state, SandboxState::Starting);
+        assert_eq!(deferred.execution_metadata, row.execution_metadata);
+        // Repair only the invalid fixture, then retry the same startup pass.
+        std::fs::remove_file(&instance).unwrap();
+        std::fs::create_dir(&instance).unwrap();
+        std::fs::write(instance.join("rootfs.ext4"), b"retained disk").unwrap();
+        let records = service
+            .recover_prelaunch_startup_states_in(cache.path(), &Default::default())
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].outcome,
+            crate::db::StartupRecoveryOutcome::State(SandboxState::Stopped)
+        );
+        assert_eq!(
+            std::fs::read(instance.join("rootfs.ext4")).unwrap(),
+            b"retained disk"
+        );
+    }
+}
+
+#[tokio::test]
+async fn retained_instance_permission_recovery_and_repair_preserve_disk() {
+    use crate::node_manager_transport::fake::FakeNodeManager;
+    use crate::template_resolver::fake::FakeTemplateResolver;
+    use pplx_space_common_core::types::{Arch, SandboxArtifactMetadata};
+    use pplx_space_node_mgr_client::proto::{
+        PrepareSandboxArtifactDirRequest, PrepareSandboxArtifactDirResponse,
+    };
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
+
+    // EACCES must be exercised without root's DAC override. The child creates
+    // all fixtures itself and dials only its own fake node-manager socket.
+    if nix::unistd::geteuid().is_root() {
+        let test = std::thread::current().name().unwrap().to_owned();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(test)
+            .arg("--nocapture")
+            .uid(65534)
+            .gid(65534)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
+    struct RestoreTraversal(std::path::PathBuf);
+    impl Drop for RestoreTraversal {
+        fn drop(&mut self) {
+            if let Err(error) =
+                std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700))
+            {
+                eprintln!("restore test fixture traversal: {error}");
+            }
+        }
+    }
+    let execution =
+        pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(Arch::X86_64)
+            .unwrap()[1]
+            .definition()
+            .execution_requirements()
+            .unwrap();
+    for bound_record in [false, true] {
+        for repairs in [false, true] {
+            let cache = tempfile::tempdir().unwrap();
+            let id = SandboxId::new().to_string();
+            let conn = crate::db::test_conn();
+            super::super::tests::service_tests::insert_test_sandbox(
+                &conn,
+                &id,
+                crate::state::SandboxState::Starting,
+            );
+            if bound_record {
+                crate::db::upsert_sandbox_execution_metadata(&conn, &id, &execution).unwrap();
+            }
+            let row = crate::db::get_sandbox(&conn, &id).unwrap().unwrap();
+            let sibling = SandboxId::new().to_string();
+            super::super::tests::service_tests::insert_test_sandbox(
+                &conn,
+                &sibling,
+                crate::state::SandboxState::Starting,
+            );
+            let sibling_instance = cache.path().join(&sibling).join("instance");
+            std::fs::create_dir_all(&sibling_instance).unwrap();
+            std::fs::write(sibling_instance.join("rootfs.ext4"), b"sibling disk").unwrap();
+            let service = super::super::SandboxManagerService::for_test(conn);
+            let root = cache.path().join(&id);
+            let instance = root.join("instance");
+            std::fs::create_dir_all(&instance).unwrap();
+            std::fs::write(instance.join("rootfs.ext4"), b"retained disk").unwrap();
+            let metadata = SandboxArtifactMetadata::new(
+                id.parse().unwrap(),
+                execution.clone(),
+                "seed".parse().unwrap(),
+                None,
+            );
+            std::fs::write(
+                root.join("metadata.json"),
+                serde_json::to_vec(&metadata).unwrap(),
+            )
+            .unwrap();
+            std::fs::set_permissions(&instance, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let _restore_traversal = RestoreTraversal(instance.clone());
+            assert_eq!(
+                sandbox_rootfs_exists_in(cache.path(), &id)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            let recover = || {
+                service
+                    .recover_prelaunch_startup_states_in(cache.path(), &Default::default())
+                    .unwrap()
+            };
+            let records = recover();
+            assert_eq!(records.len(), 2);
+            for record in records {
+                let expected = if record.id == id {
+                    crate::db::StartupRecoveryOutcome::Deferred
+                } else {
+                    assert_eq!(record.id, sibling);
+                    crate::db::StartupRecoveryOutcome::State(crate::state::SandboxState::Stopped)
+                };
+                assert_eq!(record.outcome, expected);
+            }
+            let deferred = service.lookup_sandbox(&id).unwrap();
+            assert_eq!(deferred.state, crate::state::SandboxState::Starting);
+            assert_eq!(deferred.execution_metadata, row.execution_metadata);
+            let repair_dir = instance.clone();
+            let expected_id = id.clone();
+            let node = FakeNodeManager::default()
+                .unary(
+                    "PrepareSandboxArtifactDir",
+                    move |request: PrepareSandboxArtifactDirRequest| {
+                        assert_eq!(request.sandbox_id, expected_id);
+                        if repairs {
+                            std::fs::set_permissions(
+                                &repair_dir,
+                                std::fs::Permissions::from_mode(0o2710),
+                            )
+                            .unwrap();
+                        }
+                        Ok(PrepareSandboxArtifactDirResponse {})
+                    },
+                )
+                .serve();
+            let templates = FakeTemplateResolver::refusing(Status::not_found(
+                "changed template must not be consulted",
+            ));
+            let result = template_source_for_sandbox_prepare_in(
+                &node.connector(),
+                &templates,
+                &row,
+                cache.path(),
+            )
+            .await;
+            let records = recover();
+            assert_eq!(records.len(), 1);
+            let expected = if repairs {
+                crate::db::StartupRecoveryOutcome::State(crate::state::SandboxState::Stopped)
+            } else {
+                crate::db::StartupRecoveryOutcome::Deferred
+            };
+            assert_eq!(records[0].outcome, expected);
+            // Restore fixture ownership access even when an old node did not repair it.
+            std::fs::set_permissions(&instance, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(node.calls(), ["PrepareSandboxArtifactDir"]);
+            assert!(templates.requests().is_empty());
+            if repairs {
+                let source = result.unwrap();
+                assert!(source.existing_artifact);
+                assert_eq!(source.execution, execution);
+                assert_eq!(
+                    std::fs::read(instance.join("rootfs.ext4")).unwrap(),
+                    b"retained disk"
+                );
+            } else {
+                assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
+            }
+        }
+    }
+}

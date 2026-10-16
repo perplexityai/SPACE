@@ -402,7 +402,7 @@ async fn e0_failures_preserve_unrelated_external_execution() {
         // Repair only the failed input: unrelated writes must not be needed
         // to invalidate a cached negative observation.
         match failure {
-            Failure::Binary => std::fs::write(baked.join("firecracker"), binary(1)).unwrap(),
+            Failure::Binary => replace_bytes(&baked.join("firecracker"), &binary(1)),
             Failure::MissingKernel => std::fs::write(&image, binary(42)).unwrap(),
             Failure::KernelMode => {
                 std::fs::set_permissions(&image, std::fs::Permissions::from_mode(0o644)).unwrap()
@@ -695,6 +695,25 @@ fn nondefault_inventory_preserves_e0_and_recovers_only_the_exact_pair() {
             .unwrap();
         assert_default(&shared);
     }
+    let different_digest = CompiledEnvironment::for_test(
+        pin("1.17.0", 99),
+        environment.kernel().clone(),
+        "12.0.0",
+        false,
+    );
+    shared
+        .include_environment(&fixture.store, &different_digest, &cache.join("kernels"))
+        .unwrap();
+    let request = requested
+        .clone()
+        .with_environment(different_digest.definition().reference());
+    shared
+        .resolve(
+            Some(&request),
+            RuntimeKind::Firecracker,
+            ExecutionSelectionMode::NewColdBoot,
+        )
+        .expect_err("another digest of the same runtime version must not borrow verified bytes");
     std::fs::remove_dir_all(cache.join("managed")).unwrap();
     assert!(!ready.check_files_unchanged());
     let recovered = discover();
@@ -711,7 +730,7 @@ fn nondefault_inventory_preserves_e0_and_recovers_only_the_exact_pair() {
     assert!(!bad_kernel.unavailable.iter().any(|artifact| {
         matches!(artifact, UnavailableArtifact::Runtime { identity, .. } if identity == &environment.release().release)
     }));
-    std::fs::write(&image, binary(44)).unwrap();
+    replace_bytes(&image, &binary(44));
     assert!(
         !bad_kernel.check_files_unchanged(),
         "repairing cached bytes must invalidate the failure"
@@ -729,4 +748,16 @@ fn nondefault_inventory_preserves_e0_and_recovers_only_the_exact_pair() {
         resolve(&invalid).is_err(),
         "corrupt candidate cannot disable or substitute E0"
     );
+}
+
+/// Model atomic repair without depending on sub-tick mtime changes for same-size writes.
+fn replace_bytes(path: &Path, bytes: &[u8]) {
+    let replacement = tempfile::NamedTempFile::new_in(path.parent().unwrap()).unwrap();
+    std::fs::write(replacement.path(), bytes).unwrap();
+    std::fs::set_permissions(
+        replacement.path(),
+        std::fs::metadata(path).unwrap().permissions(),
+    )
+    .unwrap();
+    replacement.persist(path).unwrap();
 }
