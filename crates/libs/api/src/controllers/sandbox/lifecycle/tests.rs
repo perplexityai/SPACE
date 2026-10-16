@@ -9,6 +9,9 @@ use super::*;
 
 use pplx_space_test_env::TestResult;
 
+#[cfg(feature = "kubernetes")]
+mod kubernetes;
+
 #[test]
 fn cluster_delete_miss_reason_classifies_by_substrate_error() {
     assert_eq!(

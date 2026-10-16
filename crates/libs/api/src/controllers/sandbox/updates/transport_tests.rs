@@ -22,6 +22,9 @@ use axum::response::IntoResponse;
 
 use super::*;
 
+#[cfg(feature = "kubernetes")]
+mod kubernetes;
+
 const GENERATION: i64 = 7;
 const HTTP2_PREFACE_LEN: usize = 24;
 const HTTP2_FRAME_HEADER_LEN: usize = 9;

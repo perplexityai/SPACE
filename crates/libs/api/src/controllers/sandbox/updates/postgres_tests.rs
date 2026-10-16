@@ -5,8 +5,10 @@
 //! Scope note: only the `metadata` branch is reachable here. The resources
 //! branch calls `control_runtime_client` and drives the guest before it
 //! persists, so it needs a live runtime or a substrate mock — its column
-//! behaviour is covered at the store verb instead. `auto_lifecycle` and
-//! `network_policy` are untouched by this migration and keep their own SQL.
+//! behaviour is covered at the store verb instead, and its vCPU allocation
+//! across a cold restart in the `kubernetes` submodule, against a simulated
+//! worker. `auto_lifecycle` and `network_policy` are untouched by this
+//! migration and keep their own SQL.
 
 use pplx_space_common_core::types::SandboxId;
 use pplx_space_common_core::types::{OrgId, UserId};
@@ -69,6 +71,9 @@ fn metadata_request(metadata: Option<SandboxMetadata>) -> UpdateSandboxRequest {
         network_policy: None,
     }
 }
+
+#[cfg(feature = "kubernetes")]
+mod kubernetes;
 
 // Direct is only a placeholder: the tests using this never reach the substrate.
 fn direct_sandbox_controller(pool: &PgPool) -> SandboxController {

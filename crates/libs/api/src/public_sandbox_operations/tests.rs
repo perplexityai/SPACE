@@ -15,6 +15,9 @@ use super::*;
 
 use pplx_space_test_env::TestResult;
 
+#[cfg(feature = "kubernetes")]
+mod kubernetes;
+
 fn claimed_create_operation() -> ClaimedPublicOperation {
     ClaimedPublicOperation {
         id: OperationId::new(),
@@ -60,11 +63,8 @@ fn claimed_create_operation_for(
 }
 
 // Direct is only a placeholder for the existing-row tests, which never reach the
-// substrate. The admitted re-execution test differs on Kubernetes in two places:
-// its `sandbox_k8s_executions` check can only fail there, and its pool claim makes
-// the executor ask `admitted_pool_cleanup_pending`, which Direct answers with the
-// trait default `false` while Kubernetes reads the reserved slot, so a slot whose
-// cleanup is pending yields workflow progress instead of `Succeeded`.
+// substrate. The admitted re-execution test differs on Kubernetes; its twin in the
+// `kubernetes` submodule pins how.
 fn direct_sandbox_controller(pool: &PgPool) -> SandboxController {
     SandboxController::new(crate::controllers::substrate::Substrate::from_direct(
         crate::controllers::substrate::direct::DirectSubstrate::new(pool.clone()),
@@ -686,9 +686,9 @@ fn generic_429_is_not_marked_admission_backpressure() {
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn create_executor_retries_unpinned_transient_substrate_failure() {
-    let db = pg_test_db().await.expect("Postgres fixture");
+/// A create operation for a fresh sandbox of an org, user and `seed` release
+/// seeded in `pool`, unpinned to any node.
+async fn seed_unpinned_create_operation(pool: &PgPool) -> ClaimedPublicOperation {
     let org_id = OrgId::new();
     let actor_user_id = UserId::new();
     sqlx::query(sql!(
@@ -697,7 +697,7 @@ async fn create_executor_retries_unpinned_transient_substrate_failure() {
     ))
     .bind(org_id)
     .bind(format!("create-operation-retry-{org_id}"))
-    .execute(&db.pool)
+    .execute(pool)
     .await
     .expect("organization insert");
     sqlx::query(sql!(
@@ -709,7 +709,7 @@ async fn create_executor_retries_unpinned_transient_substrate_failure() {
         "create-operation-retry-{actor_user_id}@example.com"
     ))
     .bind(org_id)
-    .execute(&db.pool)
+    .execute(pool)
     .await
     .expect("user insert");
 
@@ -720,7 +720,7 @@ async fn create_executor_retries_unpinned_transient_substrate_failure() {
          ON CONFLICT (name) DO NOTHING"
     ))
     .bind(Uuid::now_v7())
-    .execute(&db.pool)
+    .execute(pool)
     .await
     .expect("template insert");
     sqlx::query(sql!(
@@ -728,7 +728,7 @@ async fn create_executor_retries_unpinned_transient_substrate_failure() {
          VALUES ($1, 'seed', 'fc', 'sha256:create-operation-retry')"
     ))
     .bind(template_release_id)
-    .execute(&db.pool)
+    .execute(pool)
     .await
     .expect("template release insert");
     sqlx::query(sql!(
@@ -736,12 +736,12 @@ async fn create_executor_retries_unpinned_transient_substrate_failure() {
          VALUES ($1, 'seed', 'latest')"
     ))
     .bind(template_release_id)
-    .execute(&db.pool)
+    .execute(pool)
     .await
     .expect("template release tag insert");
 
     let sandbox_id = PublicSandboxId::new();
-    let operation = ClaimedPublicOperation {
+    ClaimedPublicOperation {
         id: OperationId::new(),
         org_id,
         actor_user_id: Some(actor_user_id),
@@ -760,7 +760,13 @@ async fn create_executor_retries_unpinned_transient_substrate_failure() {
         attempts: 1,
         claim_generation: 1,
         traceparent: None,
-    };
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn create_executor_retries_unpinned_transient_substrate_failure() {
+    let db = pg_test_db().await.expect("Postgres fixture");
+    let operation = seed_unpinned_create_operation(&db.pool).await;
     let controller = SandboxController::new(crate::controllers::substrate::Substrate::from_direct(
         crate::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),
     ));

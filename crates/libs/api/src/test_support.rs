@@ -7,6 +7,9 @@ use sqlx::PgPool;
 use crate::cluster_admission::ClusterSandboxAdmissionConfig;
 use crate::controllers::substrate::{Substrate, direct::DirectSubstrate};
 
+#[cfg(feature = "kubernetes")]
+pub(crate) mod kubernetes;
+
 const SIM_WORKER_TOKEN: &str = "sim-worker-test-token";
 const SIM_WORKER_CONTROL_TOKEN: &str = "sim-worker-test-control-token";
 

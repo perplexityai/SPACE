@@ -5,11 +5,12 @@
 //! completion CAS itself (`complete_wake_lifecycle`) is swept in
 //! `wake_completion_postgres_tests`.
 //!
-//! Every case runs against the direct substrate. Paths that only the
-//! Kubernetes substrate can reach (the redrive's kube hydration probe, the
-//! drain-path `reachable_runtime_client == None` refusal) are not yet
-//! covered: reaching them needs a fake kube API or an injectable substrate
-//! seam.
+//! Every case here runs against the direct substrate. The cases whose path
+//! differs by substrate also run against the Kubernetes substrate in the
+//! `kubernetes` submodule, whose doc names the three twins it renames; each
+//! twin's doc says whether its outcome differs. That module also covers the
+//! drain path's `reachable_runtime_client == None` refusal of stop and kill,
+//! which only Kubernetes reaches.
 
 use axum::http::StatusCode;
 use pplx_space_common_core::types::{NodeId, NodeManagedBy, SandboxId};
@@ -21,6 +22,9 @@ use pplx_space_test_env::TestResult;
 use super::*;
 use crate::controllers::sandbox::wake_completion::wake_completion_redrive;
 use crate::test_support::direct_substrate;
+
+#[cfg(feature = "kubernetes")]
+mod kubernetes;
 
 /// Values `sandboxes.lifecycle` can hold that are not `SandboxLifecycle`
 /// variants (see `SandboxLifecycle::all`).
@@ -776,6 +780,9 @@ async fn native_start_overwrites_a_stopped_written_mid_flight_without_a_retry() 
 /// (`persist_optional_current_local_artifact`), which conflicts with
 /// `FOR KEY SHARE`. It waits on that lock while the child insert is open and
 /// completes once the insert ends.
+///
+/// This holds on direct only: on Kubernetes, start and wake wait too
+/// (`kubernetes::activations_and_suspend_wait_for_a_key_share_lock`).
 #[tokio::test(flavor = "current_thread")]
 async fn completed_actions_do_not_wait_for_a_key_share_lock() -> TestResult {
     use std::time::Duration;

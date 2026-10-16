@@ -5,6 +5,9 @@ use std::sync::{
 };
 use tokio::sync::Notify;
 
+#[cfg(feature = "kubernetes")]
+mod kubernetes;
+
 struct Backend {
     state: Mutex<Observation>,
     calls: AtomicUsize,

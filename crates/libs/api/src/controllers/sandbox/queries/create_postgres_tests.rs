@@ -10,6 +10,9 @@ use crate::federated_identity::{
 };
 use pplx_space_common_core::types::PodUid;
 
+#[cfg(feature = "kubernetes")]
+mod kubernetes;
+
 type InsertedPooledSandboxRow = (
     Option<String>,
     UserId,
