@@ -796,6 +796,53 @@ class EcwCommandRoundTripTests(unittest.TestCase):
         )
         context.scope.close()
 
+    def test_fixture_opts_into_tls_interception_only_with_concrete_policy(
+        self,
+    ) -> None:
+        cases = [
+            (smoke.SandboxConfig(), None),
+            (smoke.SandboxConfig(allow_internet_access=True), "on"),
+            (smoke.SandboxConfig(allow_internet_access=False), "on"),
+            (
+                smoke.SandboxConfig(
+                    network=smoke.NetworkConfig(
+                        allow_public_traffic=None, allow_out=("example.com",)
+                    )
+                ),
+                "on",
+            ),
+            (
+                smoke.SandboxConfig(
+                    network=smoke.NetworkConfig(allow_public_traffic=True)
+                ),
+                None,
+            ),
+        ]
+        for sandbox_config, expected in cases:
+            with self.subTest(sandbox_config=sandbox_config):
+                trace: list[str] = []
+                ecw = _Ecw(trace, EcwCommandResult(0, MARKER, ""))
+                services = SmokeServices(
+                    kind=_Kind(trace),
+                    ecw=cast(EcwSandboxes, ecw),
+                    api_key="run-key",
+                    owns_api_key=False,
+                )
+                context = ScenarioContext(ResourceScope(), {})
+
+                services.fixture(
+                    Ecw,
+                    context,
+                    scenario_id="kind.tls_interception_opt_in",
+                    sandbox=sandbox_config,
+                )
+
+                assert ecw.last_metadata is not None
+                self.assertEqual(
+                    ecw.last_metadata.get("network.tls_interception"), expected
+                )
+                context.scope.close()
+
     def test_additional_sandboxes_share_run_identity_and_get_own_cleanup(
         self,
     ) -> None:
