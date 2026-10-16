@@ -736,11 +736,14 @@ def impl_layout(lines: list[str], mlines: list[str], it: Item) -> ImplLayout | N
             raise SystemExit(f"line {i + 1}: an attribute and an impl member share a line; put the member on its own line")
         if s.startswith("#["):
             lead = i if lead is None else lead
+            first_attr = i
             d = line_depth_delta(m)
             i += 1
             while d > 0 and i < it.end:
                 d += line_depth_delta(mlines[i])
                 i += 1
+            if d == 0 and i - 1 > first_attr and not mlines[i - 1].rstrip().endswith("]"):
+                raise SystemExit(f"line {i}: an attribute and an impl member share a line; put the member on its own line")
             continue
         start, d = i, 0
         while True:
@@ -774,11 +777,12 @@ def rewrite_super(text: str) -> str:
 
 
 def attr_lines(lines: list[str], lead: int, start: int) -> list[str]:
-    """The attribute lines (whole multi-line attributes) in an item's leading trivia."""
+    """The attribute lines (whole multi-line attributes) in an item's leading trivia; an
+    attribute written inside a comment is not one."""
     out, k = [], lead
     mlines = mask("\n".join(lines[lead:start])).split("\n")
     while k < start:
-        s = lines[k].strip()
+        s = mlines[k - lead].strip()
         if s.startswith("#["):
             d = line_depth_delta(mlines[k - lead])
             out.append(lines[k])
@@ -975,7 +979,8 @@ def apply(spec_path: str, repo: str, dry: bool, report: str | None) -> int:
     bodies = {it.name: "\n".join(mlines[it.start:it.end + 1]) for it in macro_defs}
     # A macro whose expansion names `super`/`self` (a path or a visibility) resolves from the
     # module it is expanded in, so its meaning changes one module deeper.
-    relative = {n for n, b in bodies.items() if REL_VIS.search(b) or re.search(r"\b(?:super|self)\s*::", b)}
+    relative = {n for n, b in bodies.items()
+                if REL_VIS.search(b) or super_path_positions(b) or re.search(r"\bself\s*::", b)}
     while True:
         more = {n for n, b in bodies.items() if n not in relative and any(invokes(b, r) for r in relative)}
         if not more:
@@ -996,9 +1001,26 @@ def apply(spec_path: str, repo: str, dry: bool, report: str | None) -> int:
     moved_units += [(layout(k).members[mi].start,
                      "\n".join(mlines[layout(k).members[mi].start:layout(k).members[mi].end + 1]))
                     for k, mi in massign]
+    def reaches(text: str) -> set[str]:
+        """Parent macros a moved unit invokes, directly or through other parent macros."""
+        seen: set[str] = set()
+        todo = [n for n in first_def if invokes(text, n)]
+        while todo:
+            n = todo.pop()
+            if n in seen:
+                continue
+            seen.add(n)
+            todo += [m for m in first_def if m not in seen and invokes(bodies.get(n, ""), m)]
+        return seen
+
+    dup = {n for n in macro_names if macro_names.count(n) > 1}
     for start, text in moved_units:
+        used = reaches(text)
+        for name in sorted(used & dup):
+            raise SystemExit(f"moved code at line {start + 1} reaches macro_rules! {name}, which the parent defines "
+                             "more than once; which definition it binds to would change. Edit by hand.")
         for name, line in first_def.items():
-            if line > start and invokes(text, name):
+            if line > start and name in used:
                 raise SystemExit(f"moved code at line {start + 1} invokes {name}! before the parent defines it "
                                  f"(line {line + 1}); its binding would change. Edit by hand.")
     split_impls = sorted({k for k, _ in massign})

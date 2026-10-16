@@ -951,3 +951,33 @@ def test_verify_round_trips_tricky_but_valid_splits(repo):
     assert "impl super::super::Marker for S {}" in (repo / "crate/src/a/foo/impls.rs").read_text()
     v = run("verify", "HEAD~1", cwd=repo)
     assert v.returncode == 0, v.stdout
+
+
+# --- Round-3 review cases. ---
+
+
+@pytest.mark.parametrize(
+    ("text", "items", "message"),
+    [
+        # a moved function reaches a later-defined macro through another parent macro
+        ("macro_rules! relay {\n    () => {\n        value!()\n    };\n}\n\npub fn answer() -> u8 {\n    relay!()\n}\n\n"
+         "macro_rules! value {\n    () => {\n        2\n    };\n}\n", '["fn answer"]', "before the parent defines it"),
+        # a parent macro whose body names a terminal `super`
+        ("const V: u8 = 2;\n\nmacro_rules! value {\n    () => {{\n        use super as outer;\n        outer::V\n    }};\n}\n\n"
+         "pub fn answer() -> u8 {\n    value!()\n}\n", '["fn answer"]', "expansion names"),
+        # a multi-line member attribute ending on the member's line
+        ("struct S;\n\n#[rustfmt::skip]\nimpl S {\n    #[\n        cfg(all())\n    ] fn answer() -> u8 { 1 }\n    fn stay() {}\n    fn kept() {}\n}\n",
+         '["impl S :: fn stay"]', "share a line"),
+    ],
+)
+def test_round_three_refusals(repo, text, items, message):
+    r = write_parent(repo, text, f'file = "crate/src/a/foo.rs"\n[[module]]\nname = "x"\nitems = {items}\n')
+    assert r.returncode != 0 and message in r.stderr, r.stderr
+
+
+def test_a_commented_attribute_is_not_copied_onto_split_impl_blocks(repo):
+    r = write_parent(repo, "struct S;\n\n/*\n#[cfg(any())]\n*/\nimpl S {\n    fn answer() -> u8 {\n        1\n    }\n\n    fn stay() {}\n}\n",
+                     'file = "crate/src/a/foo.rs"\n[[module]]\nname = "x"\nitems = ["impl S :: fn answer"]\n')
+    assert r.returncode == 0, r.stderr
+    child = (repo / "crate/src/a/foo/x.rs").read_text()
+    assert "#[cfg(any())]" not in child.split("impl S {")[0].split("use super::*;")[1]
