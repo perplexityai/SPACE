@@ -164,7 +164,7 @@ impl KubernetesSubstrate {
         .await
     }
 
-    pub(super) async fn k8s_blocking_delete_sandbox_pod_for_operation(
+    pub(in crate::controllers::substrate::kubernetes) async fn k8s_blocking_delete_sandbox_pod_for_operation(
         &self,
         pod_name: &str,
         metric_operation: &'static str,

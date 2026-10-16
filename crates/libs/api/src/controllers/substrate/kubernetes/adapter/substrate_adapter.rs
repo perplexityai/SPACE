@@ -174,20 +174,77 @@ impl SubstrateAdapter for KubernetesSubstrate {
                 .ok_or_else(|| SubstrateError::Unavailable {
                     message: "joined create reached readiness but its pod disappeared".to_string(),
                 })?;
-                let active_node_id = self
+                let joined_pod_uid = joined_pod
+                    .uid()
+                    .ok_or_else(|| SubstrateError::Failed {
+                        message: "joined create pod has no Kubernetes UID".to_string(),
+                    })
+                    .and_then(|uid| {
+                        PodUid::parse(uid).map_err(|error| SubstrateError::Failed {
+                            message: format!(
+                                "joined create pod has invalid Kubernetes UID: {error}"
+                            ),
+                        })
+                    })?;
+                let active_node_id = match self
                     .remember_pod_node_placement(
                         sandbox_uuid,
                         &joined_pod,
                         PlacementRetryDisposition::RetryDuplicatesExecution,
                     )
-                    .await?
-                    .ok_or_else(|| SubstrateError::Unavailable {
-                        message: "joined create pod has no registered node placement".to_string(),
-                    })?;
+                    .await
+                {
+                    Ok(node_id) => node_id,
+                    Err(err) => {
+                        // A redrive that joined an abandoned activation has no
+                        // CancelGuard of its own. If placement fails after the
+                        // pod becomes ready, make that redrive the durable
+                        // cleanup owner so a crashed original request cannot
+                        // leave `creating` + Present forever.
+                        let claim = self
+                            .store
+                            .mark_cancelled_create_cleanup_pending_if_attempt(
+                                sandbox_id,
+                                execution.generation,
+                                owner_attempt_id,
+                                &joined_pod_uid,
+                            )
+                            .await;
+                        match &claim {
+                            Ok(CancelledCreateCleanupClaim::DeleteClaimed) => tracing::info!(
+                                sandbox_id = %sandbox_id,
+                                pod_name = %execution.pod_name,
+                                "joined create recorded durable cleanup after pod-placement failure"
+                            ),
+                            Ok(CancelledCreateCleanupClaim::NotOwned | CancelledCreateCleanupClaim::NotCovered) => {}
+                            Err(claim_err) => tracing::error!(
+                                sandbox_id = %sandbox_id,
+                                pod_name = %execution.pod_name,
+                                error = %claim_err,
+                                "joined create failed to record durable cleanup after pod-placement failure"
+                            ),
+                        }
+                        return Err(retain_row_unless_cleanup_claimed(err, &claim));
+                    }
+                }
+                .ok_or_else(|| SubstrateError::Unavailable {
+                    message: "joined create pod has no registered node placement".to_string(),
+                })?;
                 return Ok(CreateExecutionOutcome {
                     lease_completion: None,
                     sandbox_id,
                     binding: Some(binding),
+                    rollback_fence: CreateRollbackExecutionFence::Kubernetes {
+                        pod_name: PodName::parse(&execution.pod_name).map_err(|error| {
+                            SubstrateError::Failed {
+                                message: format!("joined create pod has invalid name: {error}"),
+                            }
+                        })?,
+                        generation: execution.generation,
+                        activation_attempt_id: Some(owner_attempt_id),
+                        route_activation_id: owner_attempt_id,
+                        pod_uid: joined_pod_uid,
+                    },
                     initial_lifecycle: "started",
                     initial_placement: "on_node",
                     active_node_id: Some(active_node_id),
@@ -333,7 +390,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
         // From here until the response, the apiserver may accept a pod this
         // call never learns, so the guard keeps the claim that names it.
         cancel_guard.begin_pod_create();
-        let pod = match create_sandbox_pod(&self.k8s, pod_request)
+        let (pod, created_pod_uid) = match create_sandbox_pod(&self.k8s, pod_request)
             .instrument(tracing::info_span!(
                 "substrate.k8s.create_pod",
                 sandbox_id = %sandbox_id,
@@ -346,8 +403,18 @@ impl SubstrateAdapter for KubernetesSubstrate {
             Ok(pod) => {
                 // Pod exists — arm the guard so cancellation triggers cleanup.
                 let pod_uid = pod.uid().and_then(|uid| PodUid::parse(uid).ok());
-                cancel_guard.arm(self.k8s.clone(), self.store.clone(), pod_uid);
-                pod
+                cancel_guard.arm(self.k8s.clone(), self.store.clone(), pod_uid.clone());
+                // The rollback fence needs the pod's identity. Without one the
+                // pod is accepted but can't be named for a fenced delete, so keep
+                // the row and its execution claim — `RestoreInFlight`, which
+                // create cleanup retains — and leave the pod to reconciliation,
+                // as the guard does for a pod with no UID.
+                let Some(pod_uid) = pod_uid else {
+                    return Err(SubstrateError::restore_in_flight(
+                        "created sandbox pod has no valid Kubernetes UID; leaving it to reconciliation",
+                    ));
+                };
+                (pod, pod_uid)
             }
             Err(err) => {
                 pplx_space_metrics::sandbox::api::create_step_error(
@@ -399,13 +466,51 @@ impl SubstrateAdapter for KubernetesSubstrate {
             },
         );
 
-        let mut active_node_id = self
+        let mut active_node_id = match self
             .remember_pod_node_placement(
                 sandbox_uuid,
                 &pod,
                 PlacementRetryDisposition::RetryDuplicatesExecution,
             )
-            .await?;
+            .await
+        {
+            Ok(node_id) => node_id,
+            Err(err) => {
+                // Placement failure drops the request's ownership while a pod
+                // may already be live. Persist cold-create delete intent before
+                // returning: the Drop task below is useful for prompt cleanup,
+                // but cannot be the only owner across process shutdown.
+                let claim = cancel_guard.establish_durable_cleanup().await;
+                match &claim {
+                    Ok(CancelledCreateCleanupClaim::DeleteClaimed) => tracing::info!(
+                        sandbox_id = %sandbox_id,
+                        pod_name = %pod_name,
+                        "recorded durable create cleanup before returning pod-placement failure"
+                    ),
+                    Ok(
+                        CancelledCreateCleanupClaim::NotOwned
+                        | CancelledCreateCleanupClaim::NotCovered,
+                    ) => tracing::info!(
+                        sandbox_id = %sandbox_id,
+                        pod_name = %pod_name,
+                        "pod-placement failure lost cleanup ownership to a completed lifecycle or successor"
+                    ),
+                    Err(claim_err) => tracing::error!(
+                        sandbox_id = %sandbox_id,
+                        pod_name = %pod_name,
+                        error = %claim_err,
+                        "failed to record durable create cleanup before returning pod-placement failure"
+                    ),
+                }
+                if matches!(claim, Ok(CancelledCreateCleanupClaim::NotCovered)) {
+                    // A fork restore: run its ordinary cleanup before returning, so
+                    // create cleanup sees the execution already retired and deletes
+                    // the shell instead of keeping a `restoring` row nothing converges.
+                    cancel_guard.release_now().await;
+                }
+                return Err(retain_row_unless_cleanup_claimed(err, &claim));
+            }
+        };
         let pod_uid = pod.uid().map(str::to_owned);
         let pod_ip = assigned_pod_ip(&pod)?;
         let phase = normalize_pod_phase(pod.phase().map(str::to_owned), "pending");
@@ -544,6 +649,19 @@ impl SubstrateAdapter for KubernetesSubstrate {
                         lease_completion: None,
                         sandbox_id,
                         binding: None,
+                        rollback_fence: CreateRollbackExecutionFence::Kubernetes {
+                            pod_name: PodName::parse(&pod_name).map_err(|error| {
+                                SubstrateError::Failed {
+                                    message: format!(
+                                        "created sandbox pod has invalid name: {error}"
+                                    ),
+                                }
+                            })?,
+                            generation: execution.generation,
+                            activation_attempt_id: Some(activation_attempt_id),
+                            route_activation_id: activation_attempt_id,
+                            pod_uid: created_pod_uid.clone(),
+                        },
                         initial_lifecycle: "started",
                         initial_placement: "on_node",
                         active_node_id: Some(node_id),
@@ -667,16 +785,45 @@ impl SubstrateAdapter for KubernetesSubstrate {
                     message: format!("failed to query created sandbox pod placement: {err}"),
                 })?,
         };
-        if let Some(pod) = post_create_pod
-            && let Some(node_id) = self
+        if let Some(pod) = post_create_pod {
+            match self
                 .remember_pod_node_placement(
                     sandbox_uuid,
                     &pod,
                     PlacementRetryDisposition::RetryDuplicatesExecution,
                 )
-                .await?
-        {
-            active_node_id = Some(node_id);
+                .await
+            {
+                Ok(Some(node_id)) => active_node_id = Some(node_id),
+                Ok(None) => {}
+                Err(err) => {
+                    let claim = cancel_guard.establish_durable_cleanup().await;
+                    match &claim {
+                        Ok(CancelledCreateCleanupClaim::DeleteClaimed) => tracing::info!(
+                            sandbox_id = %sandbox_id,
+                            pod_name = %pod_name,
+                            "recorded durable create cleanup after final pod-placement refusal"
+                        ),
+                        Ok(
+                            CancelledCreateCleanupClaim::NotOwned
+                            | CancelledCreateCleanupClaim::NotCovered,
+                        ) => {}
+                        Err(claim_err) => tracing::error!(
+                            sandbox_id = %sandbox_id,
+                            pod_name = %pod_name,
+                            error = %claim_err,
+                            "failed to record durable cleanup after final pod-placement refusal"
+                        ),
+                    }
+                    if matches!(claim, Ok(CancelledCreateCleanupClaim::NotCovered)) {
+                        // A fork restore: run its ordinary cleanup before returning, so
+                        // create cleanup sees the execution already retired and deletes
+                        // the shell instead of keeping a `restoring` row nothing converges.
+                        cancel_guard.release_now().await;
+                    }
+                    return Err(retain_row_unless_cleanup_claimed(err, &claim));
+                }
+            }
         }
 
         cancel_guard.defuse();
@@ -694,6 +841,15 @@ impl SubstrateAdapter for KubernetesSubstrate {
             }),
             sandbox_id,
             binding: Some(binding),
+            rollback_fence: CreateRollbackExecutionFence::Kubernetes {
+                pod_name: PodName::parse(&pod_name).map_err(|error| SubstrateError::Failed {
+                    message: format!("created sandbox pod has invalid name: {error}"),
+                })?,
+                generation: execution.generation,
+                activation_attempt_id: Some(activation_attempt_id),
+                route_activation_id: activation_attempt_id,
+                pod_uid: created_pod_uid,
+            },
             initial_lifecycle,
             initial_placement,
             active_node_id,
@@ -728,6 +884,54 @@ impl SubstrateAdapter for KubernetesSubstrate {
         )
         .await
         .map(|_| ())
+    }
+
+    async fn delete_created_execution(
+        &self,
+        sandbox_id: SandboxId,
+        fence: &CreateRollbackExecutionFence,
+    ) -> Result<(), SubstrateError> {
+        let CreateRollbackExecutionFence::Kubernetes {
+            pod_name,
+            generation,
+            activation_attempt_id,
+            route_activation_id,
+            pod_uid,
+        } = fence
+        else {
+            return Err(SubstrateError::Conflict {
+                message: format!(
+                    "create rollback fence does not describe a Kubernetes execution for sandbox {sandbox_id}"
+                ),
+            });
+        };
+        let mut pod_fence = PodIdentityFence::new(pod_name.clone())
+            .with_generation(*generation)
+            .with_recorded(RecordedExecution::Read {
+                pod_uid: Some(pod_uid.clone()),
+                route_activation_id: Some(*route_activation_id),
+            })
+            .with_pod_uid(pod_uid.clone());
+        if let Some(activation_attempt_id) = activation_attempt_id {
+            pod_fence = pod_fence.with_activation_attempt(*activation_attempt_id);
+        }
+        match self
+            .teardown_execution(
+                sandbox_id,
+                ExecutionTeardown::CompensateCreate,
+                &RetireFence::Pod(pod_fence),
+            )
+            .await?
+        {
+            RetireExecutionOutcome::Retired => Ok(()),
+            RetireExecutionOutcome::PodIdentityChanged { mismatch, .. } => {
+                Err(SubstrateError::Conflict {
+                    message: format!(
+                        "Kubernetes execution changed before create rollback for sandbox {sandbox_id}: {mismatch}"
+                    ),
+                })
+            }
+        }
     }
 
     /// Answered entirely from the sandbox-pod reflector — the same cache every
@@ -3141,5 +3345,35 @@ pub(super) fn create_ready_timeout_error(create_ready: Duration) -> SubstrateErr
     SubstrateError::Timeout {
         message: format!("sandbox create did not reach readiness within {create_ready:?}"),
         phase: None,
+    }
+}
+
+/// The error a create returns after its placement failed with `err` and its
+/// durable cleanup claim answered `claim`.
+///
+/// Create cleanup deletes the sandbox row on most errors, which cascades the
+/// execution record a pod's cleanup goes through. That is only safe once the
+/// claim is confirmed: the row is then `deleting`, which create cleanup leaves
+/// alone, and the cancel guard deletes the pod and then the row. A fork restore
+/// the claim doesn't cover (`NotCovered`) keeps the original error too, and
+/// gets the ordinary cleanup it would have had without the claim; the guarded
+/// callers run it before returning (`CancelGuard::release_now`).
+/// Otherwise the row has to outlive the error — whether the execution moved on
+/// to another owner or the claim's own write failed — so the error becomes
+/// `RestoreInFlight`, which create cleanup retains.
+pub(super) fn retain_row_unless_cleanup_claimed(
+    err: SubstrateError,
+    claim: &Result<CancelledCreateCleanupClaim, SubstrateError>,
+) -> SubstrateError {
+    match (claim, err) {
+        (
+            Ok(
+                CancelledCreateCleanupClaim::DeleteClaimed
+                | CancelledCreateCleanupClaim::NotCovered,
+            ),
+            err,
+        ) => err,
+        (_, err @ SubstrateError::RestoreInFlight { .. }) => err,
+        (_, err) => SubstrateError::restore_in_flight(err.to_string()),
     }
 }

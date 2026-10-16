@@ -564,7 +564,7 @@ async fn existing_rows_are_classified_exhaustively_through_executor() -> TestRes
         (
             SandboxLifecycle::Creating,
             SeedSandboxPlacement::OnNode(NodeId::new()),
-            OperationState::Succeeded,
+            OperationState::Queued,
         ),
         (
             SandboxLifecycle::Starting,
@@ -866,6 +866,44 @@ fn create_operation_payload_is_wire_compatible_with_old_shape() {
     assert_eq!(
         pinned_value.get("node_pool").and_then(|v| v.as_str()),
         Some("isolated-test-pool")
+    );
+}
+
+#[test]
+fn lifecycle_operation_payload_is_wire_compatible_with_old_shape() {
+    let sandbox_id = PublicSandboxId::new();
+    let ordinary = SandboxLifecycleOperationPayload {
+        sandbox_id,
+        action: SandboxLifecycleAction::Delete,
+        rollback: None,
+        create_rollback_fence: None,
+    };
+    let ordinary_value = ordinary.into_json();
+    assert!(
+        ordinary_value.get("create_rollback_fence").is_none(),
+        "user DELETE payloads must remain byte-compatible with old consumers"
+    );
+
+    let old_shape = serde_json::json!({
+        "sandbox_id": sandbox_id,
+        "action": "delete"
+    });
+    let decoded: SandboxLifecycleOperationPayload = serde_json::from_value(old_shape).unwrap();
+    assert!(decoded.create_rollback_fence.is_none());
+
+    let compensation = SandboxLifecycleOperationPayload {
+        sandbox_id,
+        action: SandboxLifecycleAction::Delete,
+        rollback: None,
+        create_rollback_fence: Some(CreateRollbackExecutionFence::Direct {
+            node_id: NodeId::new(),
+            route_identity: None,
+        }),
+    }
+    .into_json();
+    assert!(
+        compensation.get("create_rollback_fence").is_some(),
+        "create compensation must persist the execution fence it re-proves on every attempt"
     );
 }
 
@@ -1212,5 +1250,65 @@ async fn admitted_create_re_execution_after_success_does_not_create_again() -> T
         executions, 0,
         "re-execution must not start another execution"
     );
+    Ok(())
+}
+
+/// Create compensation whose sandbox row is already gone still has to reach the
+/// node. A best-effort user DELETE retires the row even when its node call
+/// failed, so "the row is gone" says nothing about the guest; on the direct
+/// substrate nothing else would ever tear it down. The fence here names a node
+/// with no row, so reaching it fails, and the operation must not report success.
+///
+/// The control: an ordinary user DELETE of a missing row is still an idempotent
+/// success, so the compensation result above is not just a broken executor.
+#[tokio::test]
+async fn compensation_for_a_missing_row_does_not_report_done_without_the_node() -> TestResult {
+    let db = pg_test_db().await?;
+    let org_id = seed_org(&db.pool).await?;
+    let sandbox_id = PublicSandboxId::from(SandboxId::new());
+    let executor = SandboxLifecycleOperationExecutor::new(
+        db.pool.clone(),
+        direct_sandbox_controller(&db.pool),
+    );
+    let operation = |kind, fence| ClaimedPublicOperation {
+        id: OperationId::new(),
+        org_id,
+        actor_user_id: None,
+        api_product: ApiProduct::Native,
+        kind,
+        target_type: Some(OperationTargetType::Sandbox),
+        target_id: Some(sandbox_id.to_string()),
+        payload: SandboxLifecycleOperationPayload {
+            sandbox_id,
+            action: SandboxLifecycleAction::Delete,
+            rollback: None,
+            create_rollback_fence: fence,
+        }
+        .into_json(),
+        attempts: 1,
+        claim_generation: 1,
+        traceparent: None,
+    };
+
+    let compensation = executor
+        .execute(&operation(
+            OperationKind::CompensateCreateSandbox,
+            Some(CreateRollbackExecutionFence::Direct {
+                node_id: NodeId::new(),
+                route_identity: None,
+            }),
+        ))
+        .await;
+    assert_ne!(
+        compensation.state,
+        OperationState::Succeeded,
+        "compensation reported a teardown it never confirmed: {}",
+        compensation.progress_message
+    );
+
+    let user_delete = executor
+        .execute(&operation(OperationKind::DeleteSandbox, None))
+        .await;
+    assert_eq!(user_delete.state, OperationState::Succeeded);
     Ok(())
 }

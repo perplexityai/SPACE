@@ -96,7 +96,10 @@ const UNMODELLED_LIFECYCLES: &[(&str, CountedBy)] = &[
 /// `live_residents_tests` fixture does: otherwise the stale-heartbeat cases
 /// would withhold the discount for two reasons at once and prove neither, and
 /// the discount-expected cases would fail for a reason the test is not about.
-async fn insert_draining_node(pool: &PgPool, heartbeat: Heartbeat) -> TestResult<NodeId> {
+pub(super) async fn insert_draining_node(
+    pool: &PgPool,
+    heartbeat: Heartbeat,
+) -> TestResult<NodeId> {
     let node_id = NodeId::new();
     sqlx::query(sql!(
         "INSERT INTO nodes (id, address, role, managed_by, state, drain_phase, drain_started_at)
@@ -127,7 +130,7 @@ async fn insert_draining_node(pool: &PgPool, heartbeat: Heartbeat) -> TestResult
 /// these tests need; `residency_tests` carries the full four-way version for the
 /// resident scan, and the unreachable/expired variants are its business.
 #[derive(Debug, Clone, Copy)]
-enum Heartbeat {
+pub(super) enum Heartbeat {
     /// Reachable and unexpired: the node's census answer counts.
     Fresh,
     /// No `node_status_snapshots` row — the control plane cannot see the node,
@@ -138,7 +141,11 @@ enum Heartbeat {
 /// Pinned through `active_node_id` (the column both residency definitions
 /// read) and placed well outside [`CENSUS_PLACEMENT_SETTLE`], so a missing
 /// census row would be readable as absence if the mode allowed it.
-async fn insert_sandbox(pool: &PgPool, node_id: NodeId, lifecycle: &str) -> TestResult<SandboxId> {
+pub(super) async fn insert_sandbox(
+    pool: &PgPool,
+    node_id: NodeId,
+    lifecycle: &str,
+) -> TestResult<SandboxId> {
     let sandbox_id = SandboxId::new();
     sqlx::query(sql!(
         "INSERT INTO sandboxes (
@@ -185,11 +192,15 @@ async fn observe_sandbox(
     Ok(())
 }
 
-fn sink(pool: PgPool, residency: ResidencyEvidence) -> SubstrateSink {
+pub(super) fn sink(pool: PgPool, residency: ResidencyEvidence) -> SubstrateSink {
     sink_with_gate(pool, residency, true)
 }
 
-fn sink_with_gate(pool: PgPool, residency: ResidencyEvidence, gate: bool) -> SubstrateSink {
+pub(super) fn sink_with_gate(
+    pool: PgPool,
+    residency: ResidencyEvidence,
+    gate: bool,
+) -> SubstrateSink {
     let mut sink = SubstrateSink::with_suspend_execution(pool, |_| async move {
         unreachable!("the gate scans never suspend");
     });
@@ -488,7 +499,7 @@ async fn the_phase_write_refuses_a_node_that_gained_a_sandbox_after_the_pre_chec
 /// `try_pg_test_db` caps the pool at 2, the holder has one and the racing task
 /// needs the other, so a pool query here would starve and take the racing task's
 /// slot with it.
-async fn wait_until_blocked(
+pub(super) async fn wait_until_blocked(
     holder: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> TestResult<bool> {
     let deadline = DRAIN_COMPLETION_LOCK_TIMEOUT / 2;
@@ -510,7 +521,7 @@ async fn wait_until_blocked(
     Ok(false)
 }
 
-async fn drain_phase(pool: &PgPool, node_id: NodeId) -> TestResult<Option<String>> {
+pub(super) async fn drain_phase(pool: &PgPool, node_id: NodeId) -> TestResult<Option<String>> {
     Ok(
         sqlx::query_scalar::<_, Option<String>>(sql!(
             "SELECT drain_phase FROM nodes WHERE id = $1"

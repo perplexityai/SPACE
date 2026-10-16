@@ -78,14 +78,15 @@ use uuid::Uuid;
 
 use super::{
     ActivationCompletion, ActivationOptions, BuilderClient, CreateBootMode, CreateExecutionOutcome,
-    CreateExecutionRequest, DbContext, ExecutionActivation, ExecutionActivityKind,
-    ExecutionBinding, NodeApiTarget, NodeInventoryEntry, OwnedNodeApiTarget, PooledExecutionClaim,
-    PooledExecutionClaimAttempt, PooledExecutionClaimRequest, PooledExecutionPoolShape,
-    RetireExecutionOutcome, RetireExecutionRequest, RuntimeClient, SandboxResources,
-    SubstrateAdapter, SubstrateCapabilities, SubstrateError, connect_builder, connect_worker,
-    node_api_endpoint, substrate_db_error,
+    CreateExecutionRequest, CreateRollbackExecutionFence, DbContext, ExecutionActivation,
+    ExecutionActivityKind, ExecutionBinding, NodeApiTarget, NodeInventoryEntry, OwnedNodeApiTarget,
+    PooledExecutionClaim, PooledExecutionClaimAttempt, PooledExecutionClaimRequest,
+    PooledExecutionPoolShape, RetireExecutionOutcome, RetireExecutionRequest, RuntimeClient,
+    SandboxResources, SubstrateAdapter, SubstrateCapabilities, SubstrateError, connect_builder,
+    connect_worker, node_api_endpoint, substrate_db_error,
 };
 use crate::controllers::auto_lifecycle::policy_to_proto;
+use crate::controllers::placement_fence::{Writer, check_placement_fence, fence_refusal_message};
 use crate::controllers::{ControllerError, db_contention_error};
 use crate::models::Sandbox;
 
@@ -691,6 +692,17 @@ fn direct_create_start_status_error(status: tonic::Status) -> SubstrateError {
     direct_status_error(status, message)
 }
 
+/// What [`DirectSubstrate::clear_direct_route_identity_if_current`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteReceiptClear {
+    /// The checked receipt was still current and is now cleared.
+    Cleared,
+    /// No receipt: nothing to clear.
+    Absent,
+    /// A newer receipt replaced the checked one; a successor owns the sandbox.
+    Successor,
+}
+
 impl DirectSubstrate {
     async fn activation_auto_lifecycle(
         &self,
@@ -916,6 +928,30 @@ impl DirectSubstrate {
             .begin()
             .await
             .db_context("failed to begin owned direct restore transaction")?;
+        // Termination fence, before the `sandboxes` row lock below. The
+        // node-then-sandbox order is deliberate and shared with every other
+        // fenced writer (`persist_pod_node_placement` already used it): two
+        // transactions that take the same two rows in the same order cannot
+        // deadlock on each other, and the reverse order here would be the only
+        // cycle in the set.
+        //
+        // The restore has already completed on the node by this point, so a
+        // refusal loses it. That is the better half of the trade: recording the
+        // placement instead would leave a row calling the sandbox `started` on
+        // an instance the ASG is about to stop, and the sandbox's snapshot is
+        // still on the node either way. `RestoreInFlight` is the existing
+        // retry-this-sandbox signal, and this is exactly that — the restore did
+        // not take, retry it — so the caller needs no new arm to converge.
+        let node_id = expected_node_id;
+        let fence =
+            check_placement_fence(&mut transaction, node_id, sandbox_id, Writer::DirectRestore)
+                .await
+                .db_context("failed to check the direct-restore placement fence")?;
+        if fence.refuses() {
+            return Err(SubstrateError::restore_in_flight(fence_refusal_message(
+                node_id, fence,
+            )));
+        }
         let owns_restore = sqlx::query_scalar::<_, bool>(sql!(
             "SELECT TRUE
                FROM sandboxes
@@ -1490,6 +1526,70 @@ impl DirectSubstrate {
         Ok(())
     }
 
+    /// [`Self::clear_direct_route_identity`], but only while the receipt is
+    /// still `expected`, compared as the check before the node RPC compares it. A create's compensation checks the
+    /// receipt before its node RPC and clears it after; a successor activation
+    /// that persisted its own receipt in between must keep it. The caller decides
+    /// what an absent receipt means: on a retry that found none before its node
+    /// call, the teardown is finished; if one was there before the call, it was
+    /// cleared during the teardown. The comparison skips `substrate_kind`, which
+    /// the table's CHECK constraints pin for every direct receipt.
+    async fn clear_direct_route_identity_if_current(
+        &self,
+        sandbox_id: SandboxId,
+        expected: &SandboxRouteIdentity,
+    ) -> Result<RouteReceiptClear, SubstrateError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .db_context("failed to begin direct route identity clear")?;
+        let still_expected: Option<bool> = sqlx::query_scalar(sql!(
+            "SELECT route_generation = $2
+                    AND current_node_id = $3
+                    AND execution_generation = $4
+                    AND activation_attempt_id = $5
+                    AND pod_uid IS NOT DISTINCT FROM $6
+               FROM sandbox_direct_route_identities
+              WHERE sandbox_id = $1
+              FOR UPDATE"
+        ))
+        .bind(sandbox_id.as_uuid())
+        .bind(expected.route_generation())
+        .bind(expected.current_node_id().as_uuid())
+        .bind(expected.execution_generation())
+        .bind(expected.activation_attempt_id().as_uuid())
+        .bind(expected.pod_uid().map(ToString::to_string))
+        .fetch_optional(&mut *transaction)
+        .await
+        .db_context("failed to lock direct route identity")?;
+        if still_expected != Some(true) {
+            transaction
+                .commit()
+                .await
+                .db_context("failed to commit direct route identity check")?;
+            return Ok(match still_expected {
+                Some(_) => RouteReceiptClear::Successor,
+                None => RouteReceiptClear::Absent,
+            });
+        }
+        self.retain_active_direct_route_provenance(&mut transaction, sandbox_id)
+            .await?;
+        sqlx::query(sql!(
+            "DELETE FROM sandbox_direct_route_identities
+             WHERE sandbox_id = $1"
+        ))
+        .bind(sandbox_id.as_uuid())
+        .execute(&mut *transaction)
+        .await
+        .db_context("failed to clear direct route identity")?;
+        transaction
+            .commit()
+            .await
+            .db_context("failed to commit direct route identity clear")?;
+        Ok(RouteReceiptClear::Cleared)
+    }
+
     async fn clear_direct_route_identity_then_fail<T>(
         &self,
         sandbox_id: SandboxId,
@@ -1968,6 +2068,35 @@ impl DirectSubstrate {
         .db_context_with(|| format!("failed to load worker placement for sandbox {sandbox_id}"))?
         .ok_or_else(|| SubstrateError::Unavailable {
             message: format!("sandbox {sandbox_id} is not assigned to an active worker node"),
+        })
+    }
+
+    async fn sandbox_node_for_delete(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<DirectNode, SubstrateError> {
+        sqlx::query_as::<_, DirectNode>(sql!(
+            "SELECT n.id, nd.node_api_endpoint
+             FROM sandboxes s
+             LEFT JOIN sandbox_direct_route_identities sri ON sri.sandbox_id = s.id
+             JOIN nodes n ON n.id = COALESCE(s.active_node_id, sri.current_node_id)
+             JOIN node_direct nd ON nd.node_id = n.id
+             WHERE s.id = $1
+               AND n.managed_by = 'space'
+               AND n.role = 'worker'
+               AND nd.deleted_at IS NULL
+             LIMIT 1"
+        ))
+        .bind(sandbox_id.as_uuid())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| SubstrateError::Failed {
+            message: format!(
+                "failed to load worker deletion route for sandbox {sandbox_id}: {err}"
+            ),
+        })?
+        .ok_or_else(|| SubstrateError::Unavailable {
+            message: format!("sandbox {sandbox_id} has no active worker deletion route"),
         })
     }
 
@@ -3609,6 +3738,10 @@ impl SubstrateAdapter for DirectSubstrate {
                     runtime_endpoint: endpoint,
                     execution_generation,
                 }),
+                rollback_fence: CreateRollbackExecutionFence::Direct {
+                    node_id: node.id,
+                    route_identity,
+                },
                 initial_lifecycle: "started",
                 initial_placement: "on_node",
                 active_node_id: Some(node.id),
@@ -3668,6 +3801,10 @@ impl SubstrateAdapter for DirectSubstrate {
                     runtime_endpoint: endpoint,
                     execution_generation,
                 }),
+                rollback_fence: CreateRollbackExecutionFence::Direct {
+                    node_id: node.id,
+                    route_identity,
+                },
                 initial_lifecycle: "started",
                 initial_placement: "on_node",
                 active_node_id: Some(node.id),
@@ -3790,6 +3927,10 @@ impl SubstrateAdapter for DirectSubstrate {
                 runtime_endpoint: endpoint,
                 execution_generation,
             }),
+            rollback_fence: CreateRollbackExecutionFence::Direct {
+                node_id,
+                route_identity,
+            },
             initial_lifecycle: "started",
             initial_placement: "on_node",
             active_node_id: Some(node.id),
@@ -3798,7 +3939,11 @@ impl SubstrateAdapter for DirectSubstrate {
     }
 
     async fn delete_execution(&self, sandbox_id: SandboxId) -> Result<(), SubstrateError> {
-        let (_, _, mut client) = self.worker_client_for_sandbox(sandbox_id).await?;
+        // A create persists its route receipt before the API transaction commits
+        // `active_node_id`. If that transaction is fenced or fails, rollback still
+        // has to reach the live VM through the receipt rather than orphaning it.
+        let node = self.sandbox_node_for_delete(sandbox_id).await?;
+        let (_, mut client) = self.worker_client_for_node(&node).await?;
 
         // Delete must reach sbx-mgr's suspend-publication fence directly. A
         // pre-delete Stop would change an in-flight `Suspending` row to
@@ -3813,6 +3958,222 @@ impl SubstrateAdapter for DirectSubstrate {
             .map_err(|err| direct_delete_error(sandbox_id, err))?;
         self.clear_direct_route_identity(sandbox_id).await?;
 
+        Ok(())
+    }
+
+    async fn delete_created_execution(
+        &self,
+        sandbox_id: SandboxId,
+        fence: &CreateRollbackExecutionFence,
+    ) -> Result<(), SubstrateError> {
+        let CreateRollbackExecutionFence::Direct {
+            node_id,
+            route_identity,
+        } = fence
+        else {
+            return Err(SubstrateError::Conflict {
+                message: format!(
+                    "create rollback fence does not describe a direct execution for sandbox {sandbox_id}"
+                ),
+            });
+        };
+
+        // Whether the receipt this compensation expected was still in place
+        // before the node call. If it was and is gone afterwards, something
+        // cleared it during the teardown — an activation or a retire. That is
+        // treated as a conflict: it can strand a `deleting` row whose guest is
+        // gone (a retire), but reporting success could leave a live guest with
+        // no row (an activation), and only the first is visible.
+        let mut receipt_matched_before = false;
+        match route_identity {
+            Some(expected) => {
+                let current = self
+                    .load_active_direct_route_identity(sandbox_id, *node_id)
+                    .await?;
+                match current.as_ref() {
+                    // The identity we were asked to tear down. Proceed.
+                    Some(found) if found == expected => receipt_matched_before = true,
+                    // **Receipt gone: confirm absence, do not assume it.**
+                    //
+                    // A retry after a successful teardown lands here, and returning
+                    // `Conflict` for it made the retry terminal — stranding the row
+                    // in `deleting` forever, a delete that fails because the thing
+                    // is already deleted. But an absent receipt does *not* uniquely
+                    // mean "this teardown finished": `retire_execution` clears it
+                    // after a stop, `suspend_execution` after a suspend, and
+                    // `persist_route_identity_receipt` on a *successful* activation
+                    // through an older sbx-mgr. In all three the on-node sandbox is
+                    // still there. Returning `Ok(())` here would report a completed
+                    // teardown without issuing the delete, and the caller then
+                    // retires the `sandboxes` row — live guest, no control-plane
+                    // row, and on this substrate no reconciler to find it. That is
+                    // the leak this fence exists to prevent, reached through the
+                    // fence.
+                    //
+                    // So fall through to the delete RPC instead. `delete_sandbox`
+                    // is idempotent and its `NotFound` is treated as success below,
+                    // which makes the retry terminate cleanly *because absence was
+                    // confirmed on the node* rather than inferred from a missing row.
+                    //
+                    // Guarded the same way as the legacy no-receipt arm below: a
+                    // sandbox whose `active_node_id` has moved to another node has a
+                    // successor somewhere else, and this fence must not delete it.
+                    None => {
+                        let active_node_id: Option<Option<Uuid>> = sqlx::query_scalar(sql!(
+                            "SELECT active_node_id FROM sandboxes WHERE id = $1"
+                        ))
+                        .bind(sandbox_id.as_uuid())
+                        .fetch_optional(&self.pool)
+                        .await
+                        .map_err(|error| SubstrateError::Failed {
+                            message: format!(
+                                "failed to re-check placement before create rollback: {error}"
+                            ),
+                        })?;
+                        if active_node_id
+                            .flatten()
+                            .is_some_and(|active| active != node_id.as_uuid())
+                        {
+                            return Err(SubstrateError::Conflict {
+                                message: format!(
+                                    "direct execution moved to another node before create rollback for sandbox {sandbox_id}"
+                                ),
+                            });
+                        }
+                    }
+                    // A *different* identity is active: a successor execution
+                    // reused the sandbox id. Refusing is the point of the fence —
+                    // deleting here would destroy a live successor.
+                    Some(_) => {
+                        return Err(SubstrateError::Conflict {
+                            message: format!(
+                                "direct execution identity changed before create rollback for sandbox {sandbox_id}"
+                            ),
+                        });
+                    }
+                }
+            }
+            None => {
+                // Older sandbox-manager versions return no route receipt. The
+                // selected node is still an immutable part of this create
+                // result; refuse if a strict receipt or another placement has
+                // appeared since the compensation operation was persisted.
+                let state: Option<(Option<Uuid>, bool)> = sqlx::query_as(sql!(
+                    "SELECT s.active_node_id,
+                            EXISTS (
+                                SELECT 1
+                                  FROM sandbox_direct_route_identities r
+                                 WHERE r.sandbox_id = s.id
+                            )
+                       FROM sandboxes s
+                      WHERE s.id = $1"
+                ))
+                .bind(sandbox_id.as_uuid())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|error| SubstrateError::Failed {
+                    message: format!(
+                        "failed to validate legacy direct create rollback identity: {error}"
+                    ),
+                })?;
+                // A missing row names no successor to protect, and says nothing
+                // about the guest: a best-effort user DELETE retires the row even
+                // when its node call failed. So go on to the node, which is the
+                // only thing that can confirm the teardown.
+                if let Some((active_node_id, has_route_identity)) = state
+                    && (has_route_identity
+                        || active_node_id.is_some_and(|active| active != node_id.as_uuid()))
+                {
+                    return Err(SubstrateError::Conflict {
+                        message: format!(
+                            "direct execution changed before legacy create rollback for sandbox {sandbox_id}"
+                        ),
+                    });
+                }
+            }
+        }
+
+        // **Known residual: a `MissingNode` refusal cannot be compensated here.**
+        //
+        // `direct_node_by_id` joins `node_direct`, which is `ON DELETE CASCADE`
+        // from `nodes`, so once the drain loop has deleted the node row this
+        // returns `Unavailable "not registered"` and there is no route left to the
+        // worker. A create refused by the fence's `MissingNode` verdict is exactly
+        // that state by definition, so its durable rollback can never contact the
+        // node: it retries to budget exhaustion and leaves the row in `deleting`.
+        //
+        // Deliberately not "fixed" by treating an absent node row as a completed
+        // teardown. That inference is unsound in general — an operator's hard
+        // delete of a direct node removes its row with no check for live
+        // sandboxes, so a row can disappear while a guest is still live — and it
+        // is the same "absence implies done" shortcut that
+        // already produced two defects on this path. Carrying the node's route in
+        // the rollback fence would let the teardown reach a node whose row is
+        // gone; this change does not do that.
+        //
+        // What it costs: no wrong deletion, but a stranded `deleting` row, and
+        // not only on the `MissingNode` arm. Any direct compensation whose node
+        // row is deleted before an attempt reaches it ends the same way once its
+        // retry budget is spent. When the row went because the node was
+        // terminated (a `terminating` refusal, or termination mid-retry) the guest
+        // went with its instance; when an operator hard-deleted the node row while
+        // the guest was live, the guest is stranded too. Closing it needs either a
+        // direct-substrate `deleting` reconciler or a route resolved from
+        // provider state.
+        let node = self.direct_node_by_id(*node_id).await?;
+        let (_, mut client) = self.worker_client_for_node(&node).await?;
+        match client
+            .delete_sandbox(pplx_space_sbx_mgr_client::proto::DeleteRequest {
+                sandbox_id: sandbox_id.to_string(),
+                template_filter: None,
+                blocking: true,
+            })
+            .await
+        {
+            Ok(_) => {}
+            // **Already gone is success — this is where the retry terminates.**
+            //
+            // The absent-receipt arm above deliberately falls through to this RPC
+            // so absence is *confirmed on the node* rather than assumed. That only
+            // completes the story if the node's "already gone" answer reads as
+            // success: sbx-mgr returns gRPC `NotFound`, and `direct_delete_error`
+            // has no arm for it, so it would become `SubstrateError::Failed` and
+            // never match `delete_created_sandbox_for_rollback`'s
+            // `Err(SubstrateError::NotFound)` success arm. The durable operation
+            // would then retry until its budget ran out with the row still in
+            // `deleting` — the same stranding the fall-through was meant to end.
+            //
+            // Handled here rather than inside `direct_delete_error` because that
+            // mapper is shared with the user-facing `delete_execution`, whose
+            // callers in `lifecycle`, `warm_pool` and `node_drain` would all start
+            // seeing a different error for an already-absent sandbox. This is
+            // create compensation: for it, absent is precisely the goal state.
+            Err(status) if status.code() == tonic::Code::NotFound => {}
+            Err(status) => return Err(direct_delete_error(sandbox_id, status)),
+        }
+        let cleared = match route_identity {
+            Some(expected) => Some(
+                self.clear_direct_route_identity_if_current(sandbox_id, expected)
+                    .await?,
+            ),
+            None => None,
+        };
+        if cleared == Some(RouteReceiptClear::Successor)
+            || (cleared == Some(RouteReceiptClear::Absent) && receipt_matched_before)
+        {
+            // A successor activation replaced the receipt while this teardown
+            // ran, or something cleared the one this teardown checked. Either
+            // way the sandbox moved on. Its receipt and row are left alone;
+            // report the conflict rather than let the caller delete the row.
+            // Its guest is not protected the same way: the delete RPC above
+            // names the sandbox, not the execution, so a successor that had
+            // already landed on this node was deleted by it.
+            return Err(SubstrateError::Conflict {
+                message: format!(
+                    "the route receipt of sandbox {sandbox_id} changed during its create rollback"
+                ),
+            });
+        }
         Ok(())
     }
 

@@ -69,9 +69,10 @@ pub use caches::K8sCaches;
 use cancel_rate_tracker::CancelRateTracker;
 use restore_waiters::RestoreWaiters;
 use store::{
-    ActiveExecutionState, K8sStore, NodeLifecycleState, NodeStateWrite, PlacementClock,
-    PreparedWakeSandbox, RestoreClaim, SandboxExecutionRow, StartedRecoveryClaim,
-    StartedRecoveryCompletion, StartedRecoveryObservation, UserRestoreObservation,
+    ActiveExecutionState, CancelledCreateCleanupClaim, K8sStore, NodeLifecycleState,
+    NodeStateWrite, PlacementClock, PreparedWakeSandbox, RestoreClaim, SandboxExecutionRow,
+    StartedRecoveryClaim, StartedRecoveryCompletion, StartedRecoveryObservation,
+    UserRestoreObservation,
 };
 
 use crate::{
@@ -80,12 +81,13 @@ use crate::{
 
 use super::{
     ActivationCompletion, ActivationOptions, BuilderClient, CreateExecutionOutcome,
-    CreateExecutionRequest, ExecutionActivation, ExecutionActivityKind, ExecutionBinding,
-    ExecutionIdentity, ExecutionRoutabilityCheck, NODE_RPC_TIMEOUT, NodeApiTarget,
-    NodeInventoryEntry, ObservedPod, ObservedPodIdentity, OwnedNodeApiTarget, PodFenceMismatch,
-    PodIdentityFence, RecordedExecution, RetireExecutionOutcome, RetireExecutionRequest,
-    RetireFence, RuntimeClient, SubstrateAdapter, SubstrateCapabilities, SubstrateError,
-    TeardownProgress, WaitReadyTimeoutPhase, connect_worker, node_api_endpoint,
+    CreateExecutionRequest, CreateRollbackExecutionFence, ExecutionActivation,
+    ExecutionActivityKind, ExecutionBinding, ExecutionIdentity, ExecutionRoutabilityCheck,
+    NODE_RPC_TIMEOUT, NodeApiTarget, NodeInventoryEntry, ObservedPod, ObservedPodIdentity,
+    OwnedNodeApiTarget, PodFenceMismatch, PodIdentityFence, RecordedExecution,
+    RetireExecutionOutcome, RetireExecutionRequest, RetireFence, RuntimeClient, SubstrateAdapter,
+    SubstrateCapabilities, SubstrateError, TeardownProgress, WaitReadyTimeoutPhase, connect_worker,
+    node_api_endpoint,
 };
 
 const START_WAIT_FAST_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -686,11 +688,70 @@ async fn delete_sandbox_pod_if_uid(
     k8s: &KubernetesState,
     pod_name: &str,
     pod_uid: &PodUid,
-) -> Result<(), KubeError> {
+) -> Result<FencedPodDeleteOutcome, KubeError> {
     let pods: Api<Pod> = Api::namespaced(k8s.client.clone(), &k8s.sandbox_namespace);
     let params = pod_delete_params(pod_uid, None);
-    let _ = pods.delete(pod_name, &params).await?;
-    Ok(())
+    match pods.delete(pod_name, &params).await {
+        Ok(_) => Ok(FencedPodDeleteOutcome::Deleted),
+        Err(err) => match classify_fenced_pod_delete_error(&err) {
+            Some(outcome) => Ok(outcome),
+            None => Err(err),
+        },
+    }
+}
+
+/// How [`delete_sandbox_pod_if_uid_confirmed`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfirmedPodDelete {
+    /// The apiserver no longer has a pod with this UID.
+    Gone,
+    /// A different pod holds the name.
+    PreconditionFailed,
+    /// The delete was accepted, but the pod was still there at the deadline:
+    /// held by a finalizer, or waiting on a kubelet that hasn't reported back.
+    StillPresent,
+}
+
+const CONFIRMED_POD_DELETE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// [`delete_sandbox_pod_if_uid`], then poll the apiserver until no pod with
+/// this UID is left, bounded by `k8s_blocking_delete_timeout`.
+///
+/// For a caller with only a [`KubernetesState`] that is about to release the
+/// only record naming the pod. The substrate's reflector-driven
+/// `k8s_blocking_delete_sandbox_pod_for_operation` needs the substrate itself.
+async fn delete_sandbox_pod_if_uid_confirmed(
+    k8s: &KubernetesState,
+    pod_name: &str,
+    pod_uid: &PodUid,
+) -> Result<ConfirmedPodDelete, KubeError> {
+    match delete_sandbox_pod_if_uid(k8s, pod_name, pod_uid).await? {
+        FencedPodDeleteOutcome::NotFound => return Ok(ConfirmedPodDelete::Gone),
+        FencedPodDeleteOutcome::PreconditionFailed => {
+            return Ok(ConfirmedPodDelete::PreconditionFailed);
+        }
+        FencedPodDeleteOutcome::Deleted => {}
+    }
+    let deadline = Instant::now() + k8s.k8s_blocking_delete_timeout;
+    loop {
+        // A read that times out proves nothing, so it counts as present.
+        let present = match timeout(
+            K8S_BLOCKING_DELETE_FALLBACK_GET_TIMEOUT,
+            fetch_sandbox_pod_uncached(k8s, pod_name),
+        )
+        .await
+        {
+            Ok(pod) => pod?.is_some_and(|pod| pod.uid() == Some(pod_uid.as_str())),
+            Err(_) => true,
+        };
+        if !present {
+            return Ok(ConfirmedPodDelete::Gone);
+        }
+        if Instant::now() >= deadline {
+            return Ok(ConfirmedPodDelete::StillPresent);
+        }
+        sleep(CONFIRMED_POD_DELETE_POLL_INTERVAL).await;
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]

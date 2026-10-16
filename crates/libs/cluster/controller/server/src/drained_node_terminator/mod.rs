@@ -33,7 +33,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pplx_space_metrics::node_drain as node_drain_metrics;
+use pplx_space_metrics::{
+    node_drain as node_drain_metrics, placement_fence as placement_fence_metrics,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::env_config;
@@ -377,6 +379,15 @@ pub struct TickReport {
     pub flipped: usize,
     pub lookup_errors: usize,
     pub drift_skips: usize,
+    /// Nodes whose `drained → terminating` flip gave up waiting for the `nodes`
+    /// row lock ([`store::MARK_TERMINATING_LOCK_TIMEOUT`]) and deferred to the
+    /// next tick. Separate from [`Self::drift_skips`] because nothing drifted
+    /// and separate from [`Self::lookup_errors`] because nothing failed: some
+    /// conflicting nodes-row writer held the row. Placement fences,
+    /// registration/heartbeat, inventory upserts, and node-drain completion can
+    /// all be that holder. A sustained nonzero value here reports contention,
+    /// not a broken operation.
+    pub contention_defers: usize,
     /// Nodes skipped because they still hold local-disk suspended
     /// snapshots. See [`DrainedNodeTerminatorSink::count_local_snapshots`].
     pub snapshot_holds: usize,
@@ -575,6 +586,24 @@ impl<S: DrainedNodeTerminatorSink, A: DrainKeepAnnotationLookup> Reconciler<S, A
                 );
                 report.drift_skips += 1;
             }
+            Err(err) if crate::node_drain::store::is_lock_timeout(&err) => {
+                // The flip's bounded `nodes`-row lock wait fired, not a database
+                // problem: another transaction holds the row — a placement
+                // writer inside the fence, or the node-drain reconciler's own
+                // completion write. Debug, not warn, for the same reason
+                // node-drain demotes it: a node whose row is held by a long
+                // writer would otherwise emit one WARN per tick, forever, and
+                // read identically to an outage. Not counted as a lookup error
+                // either — nothing failed to be looked up, and the next tick
+                // re-asks.
+                tracing::debug!(
+                    node_id = %node_id,
+                    timeout_ms = store::MARK_TERMINATING_LOCK_TIMEOUT.as_millis() as u64,
+                    "drained_node_terminator: flip deferred; nodes row contended"
+                );
+                placement_fence_metrics::termination_contention_deferral();
+                report.contention_defers += 1;
+            }
             Err(err) => {
                 tracing::warn!(
                     node_id = %node_id,
@@ -657,6 +686,27 @@ impl<S: DrainedNodeTerminatorSink, A: DrainKeepAnnotationLookup> Reconciler<S, A
                             .await;
                         report.sandboxes_marked_lost += marked_lost;
                         self.log_delete_refusal(node_id, &refusal, marked_lost);
+                        report.kube_node_gone_parked += 1;
+                    }
+                    Err(err) if crate::node_drain::store::is_lock_timeout(&err) => {
+                        // Same classification `mark_terminating` gets, and for the
+                        // same reason: the reap's bounded `nodes`-row lock wait
+                        // fired because a conflicting writer holds the row. This
+                        // can be placement, registration/heartbeat, inventory, or
+                        // another lifecycle write. Not a `lookup_error` — that
+                        // counter's own doc says contention must not read as an
+                        // error, since nothing failed to be looked up — and debug
+                        // rather than warn, because a row held by a long writer
+                        // would otherwise emit one WARN per tick forever.
+                        //
+                        // Still counted as parked: the row did not reach terminal
+                        // this tick, which is what that gauge reports.
+                        tracing::debug!(
+                            node_id = %node_id,
+                            "drained_node_terminator: reap deferred; nodes row contended"
+                        );
+                        placement_fence_metrics::termination_contention_deferral();
+                        report.contention_defers += 1;
                         report.kube_node_gone_parked += 1;
                     }
                     Err(err) => {

@@ -16,6 +16,7 @@ pub mod federated_service_grants;
 pub mod identity;
 #[cfg(feature = "sqlite")]
 pub mod migration_checksums;
+pub mod node_placement_fence;
 pub mod node_registration;
 pub mod sandbox_quarantine;
 pub mod sandbox_residency;

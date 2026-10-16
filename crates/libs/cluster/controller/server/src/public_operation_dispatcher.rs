@@ -240,6 +240,7 @@ const NATIVE_PUBLIC_OPERATION_KINDS: &[OperationKind] = &[
     OperationKind::RollbackSandbox,
     OperationKind::DeleteTemplate,
     OperationKind::ForkSandbox,
+    OperationKind::CompensateCreateSandbox,
 ];
 
 #[async_trait]
@@ -263,6 +264,7 @@ impl PublicOperationExecutor for NativePublicOperationExecutor {
                 .await
                 .into(),
             OperationKind::DeleteSandbox
+            | OperationKind::CompensateCreateSandbox
             | OperationKind::StartSandbox
             | OperationKind::StopSandbox
             | OperationKind::PauseSandbox

@@ -867,7 +867,7 @@ pub enum ObservePublicOperationIdempotency {
 /// [`PublicOperationStore::claim_operations`] would: `running`, one attempt,
 /// a fresh claim token and generation, and a `claimed` event. Committed with
 /// the create, so no other claimant ever sees the operation queued.
-async fn claim_created_operation_tx(
+pub(crate) async fn claim_created_operation_tx(
     tx: &mut Transaction<'_, Postgres>,
     operation_id: OperationId,
 ) -> Result<(String, ClaimedPublicOperation), PublicOperationStoreError> {

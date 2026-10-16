@@ -303,6 +303,177 @@ impl K8sStore {
         .await
     }
 
+    pub(in crate::controllers::substrate::kubernetes) async fn mark_cancelled_create_cleanup_pending_if_attempt(
+        &self,
+        sandbox_id: SandboxId,
+        generation: i64,
+        activation_attempt_id: pplx_space_common_core::types::SandboxActivationAttemptId,
+        pod_uid: &pplx_space_common_core::types::PodUid,
+    ) -> Result<CancelledCreateCleanupClaim, SubstrateError> {
+        // A cold create has no useful parent to preserve after its pod-placement
+        // fence refuses. Claim durable delete intent before the external call so
+        // the deleting-row reconciler retries a pod that survives this process.
+        // Restore lifecycles and a successor execution match no rows.
+        //
+        // Lock first, in a separate statement, for the same reason as
+        // `delete_cancelled_create_sandbox_if_cleaned`: execution creation takes
+        // this row lock, and the UPDATE must read a fresh snapshot after any
+        // concurrent successor commits.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|err| SubstrateError::Failed {
+                message: format!("failed to begin cancelled-create cleanup claim: {err}"),
+            })?;
+        if !Self::lock_sandbox_for_execution_mutation_in(&mut tx, sandbox_id).await? {
+            return Ok(CancelledCreateCleanupClaim::NotOwned);
+        }
+        let recorded: Option<(String, Option<String>)> = sqlx::query_as(sql!(
+            "SELECT s.lifecycle, NULLIF(BTRIM(e.pod_uid), '')
+               FROM sandbox_k8s_executions AS e
+               JOIN sandboxes AS s ON s.id = e.sandbox_id
+              WHERE s.id = $1
+                AND s.lifecycle IN ('creating', 'deleting', 'restoring')
+                AND e.active
+                AND e.generation = $2
+                AND e.activation_attempt_id = $3
+              FOR UPDATE OF e"
+        ))
+        .bind(sandbox_id)
+        .bind(generation)
+        .bind(activation_attempt_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|err| SubstrateError::Failed {
+            message: format!("failed to inspect cancelled-create cleanup ownership: {err}"),
+        })?;
+        let Some((lifecycle, recorded_pod_uid)) = recorded else {
+            return Ok(CancelledCreateCleanupClaim::NotOwned);
+        };
+        if recorded_pod_uid
+            .as_deref()
+            .is_some_and(|recorded| recorded != pod_uid.as_str())
+        {
+            return Ok(CancelledCreateCleanupClaim::NotOwned);
+        }
+        if lifecycle == "restoring" {
+            // A fork restored as a new sandbox starts `restoring` and runs the
+            // same create path. Its execution is still this attempt's, so the
+            // pod is not someone else's, but the cold-create claim does not
+            // take a restore over.
+            return Ok(CancelledCreateCleanupClaim::NotCovered);
+        }
+        if recorded_pod_uid.is_none() {
+            let persisted = sqlx::query(sql!(
+                "UPDATE sandbox_k8s_executions
+                    SET pod_uid = $4,
+                        updated_at = NOW()
+                  WHERE sandbox_id = $1
+                    AND active
+                    AND generation = $2
+                    AND activation_attempt_id = $3
+                    AND NULLIF(BTRIM(pod_uid), '') IS NULL"
+            ))
+            .bind(sandbox_id)
+            .bind(generation)
+            .bind(activation_attempt_id)
+            .bind(pod_uid.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| SubstrateError::Failed {
+                message: format!("failed to persist cancelled-create pod UID: {err}"),
+            })?;
+            if persisted.rows_affected() != 1 {
+                return Ok(CancelledCreateCleanupClaim::NotOwned);
+            }
+        }
+        let updated = sqlx::query(sql!(
+            "UPDATE sandboxes
+                SET lifecycle = 'deleting'
+              WHERE id = $1
+                AND lifecycle IN ('creating', 'deleting')"
+        ))
+        .bind(sandbox_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|err| SubstrateError::Failed {
+            message: format!("failed to claim cancelled-create cleanup: {err}"),
+        })?;
+        tx.commit().await.map_err(|err| SubstrateError::Failed {
+            message: format!("failed to commit cancelled-create cleanup claim: {err}"),
+        })?;
+        Ok(if updated.rows_affected() > 0 {
+            CancelledCreateCleanupClaim::DeleteClaimed
+        } else {
+            CancelledCreateCleanupClaim::NotOwned
+        })
+    }
+
+    pub(in crate::controllers::substrate::kubernetes) async fn delete_cancelled_create_sandbox_if_cleaned(
+        &self,
+        sandbox_id: SandboxId,
+        generation: i64,
+        activation_attempt_id: pplx_space_common_core::types::SandboxActivationAttemptId,
+    ) -> Result<bool, SubstrateError> {
+        // The caller invokes this only after it retired this exact execution
+        // and the apiserver reported the UID-fenced pod gone. Keep those facts
+        // in the DELETE predicate anyway: a restore must retain its parent, and
+        // a concurrent successor must make an old guard harmless.
+        //
+        // Lock first, in its own statement. Active-execution creation takes the
+        // same sandbox-row lock, and READ COMMITTED gives the DELETE below a
+        // fresh snapshot after this wait. A single DELETE statement could take
+        // its snapshot before a concurrent successor commits, then cascade that
+        // successor after waiting on its FK key-share lock.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|err| SubstrateError::Failed {
+                message: format!("failed to begin cancelled-create cleanup: {err}"),
+            })?;
+        sqlx::query(sql!("SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE"))
+            .bind(sandbox_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|err| SubstrateError::Failed {
+                message: format!("failed to lock cancelled create for cleanup: {err}"),
+            })?;
+        let result = sqlx::query(sql!(
+            "DELETE FROM sandboxes AS s
+             USING sandbox_k8s_executions AS cleaned
+             WHERE s.id = $1
+               AND s.lifecycle IN ('creating', 'deleting')
+               AND s.placement = 'unplaced'
+               AND s.active_node_id IS NULL
+               AND s.target_node_id IS NULL
+               AND cleaned.sandbox_id = s.id
+               AND cleaned.generation = $2
+               AND cleaned.activation_attempt_id = $3
+               AND NOT cleaned.active
+               AND cleaned.state = 'forgotten'
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM sandbox_k8s_executions AS active
+                   WHERE active.sandbox_id = s.id
+                     AND active.active
+               )"
+        ))
+        .bind(sandbox_id)
+        .bind(generation)
+        .bind(activation_attempt_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|err| SubstrateError::Failed {
+            message: format!("failed to delete cancelled create after pod cleanup: {err}"),
+        })?;
+        tx.commit().await.map_err(|err| SubstrateError::Failed {
+            message: format!("failed to commit cancelled-create cleanup: {err}"),
+        })?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub(in crate::controllers::substrate::kubernetes) async fn cleanup_replaced_pod_tracking_if_generation(
         &self,
         sandbox_id: SandboxId,

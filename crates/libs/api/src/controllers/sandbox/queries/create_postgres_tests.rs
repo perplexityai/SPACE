@@ -54,7 +54,7 @@ use std::{
 
 use pplx_space_test_env::TestResult;
 
-async fn insert_actor(pool: &PgPool) -> TestResult<User> {
+pub(super) async fn insert_actor(pool: &PgPool) -> TestResult<User> {
     let org_id = OrgId::new();
     let user_id = UserId::new();
 
@@ -80,8 +80,229 @@ async fn insert_actor(pool: &PgPool) -> TestResult<User> {
     .await?)
 }
 
-async fn insert_node(pool: &PgPool, node_id: NodeId) -> TestResult {
+pub(super) async fn insert_node(pool: &PgPool, node_id: NodeId) -> TestResult {
     insert_ready_worker_node(pool, node_id).await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn create_rollback_keeps_db_ownership_when_substrate_delete_fails() -> TestResult {
+    let db = pg_test_db().await?;
+    let actor = insert_actor(&db.pool).await?;
+    let sandbox_id = SandboxId::new();
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (
+             id, user_id, org_id, managed_by, lifecycle, placement,
+             network_policy_generation
+         )
+         VALUES ($1, $2, $3, 'space', 'creating', 'unplaced', 1)"
+    ))
+    .bind(sandbox_id.as_uuid())
+    .bind(actor.id)
+    .bind(actor.org_id)
+    .execute(&db.pool)
+    .await?;
+
+    // With no active-node or durable route receipt, direct substrate deletion
+    // fails. That stands in for any transient routing/RPC failure after a real
+    // create persisted its cleanup identity.
+    let rollback_node_id = NodeId::new();
+    let outcome = crate::controllers::substrate::CreateExecutionOutcome {
+        sandbox_id,
+        binding: None,
+        rollback_fence: crate::controllers::substrate::CreateRollbackExecutionFence::Direct {
+            node_id: rollback_node_id,
+            route_identity: None,
+        },
+        initial_lifecycle: "started",
+        initial_placement: "on_node",
+        active_node_id: None,
+        command_ready: true,
+        lease_completion: None,
+    };
+    direct_sandbox_controller(&db.pool)
+        .rollback_created_sandbox(&db.pool, &outcome)
+        .await;
+
+    let sandbox_exists: bool = sqlx::query_scalar(sql!(
+        "SELECT EXISTS (SELECT 1 FROM sandboxes WHERE id = $1)"
+    ))
+    .bind(sandbox_id.as_uuid())
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(
+        sandbox_exists,
+        "failed substrate teardown must retain the row that carries cleanup ownership"
+    );
+    let lifecycle: String =
+        sqlx::query_scalar(sql!("SELECT lifecycle FROM sandboxes WHERE id = $1"))
+            .bind(sandbox_id.as_uuid())
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        lifecycle, "deleting",
+        "rollback intent and the durable delete operation must claim the sandbox atomically"
+    );
+    // (kind, state, api_product, target_id, create_rollback_fence)
+    type CompensationRow = (
+        String,
+        String,
+        String,
+        Option<String>,
+        sqlx::types::Json<serde_json::Value>,
+    );
+    let durable_delete_operations: Vec<CompensationRow> = sqlx::query_as(sql!(
+        "SELECT kind, state, api_product, target_id,
+                payload_json->'create_rollback_fence'
+           FROM public_operations
+          WHERE target_type = 'sandbox'"
+    ))
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(
+        durable_delete_operations,
+        vec![(
+            // The kind, not a payload bit, is what marks this as internal
+            // compensation: claims select by kind, so a controller that predates
+            // it never claims one.
+            "compensate_create_sandbox".to_string(),
+            "queued".to_string(),
+            // `native`: a distinct `api_product` would stall a pre-upgrade
+            // dispatcher's entire claim batch, because its claim query has no
+            // product filter and its batch conversion aborts the transaction on
+            // an unknown product.
+            "native".to_string(),
+            Some(
+                pplx_space_public_api::PublicSandboxId::from_uuid(sandbox_id.as_uuid()).to_string()
+            ),
+            sqlx::types::Json(serde_json::json!({
+                "substrate": "direct",
+                "node_id": rollback_node_id,
+                "route_identity": null
+            }))
+        )],
+        "a failed inline teardown must leave one dispatcher-owned delete retry"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn create_rollback_fence_refuses_a_replacement_direct_execution() -> TestResult {
+    let db = pg_test_db().await?;
+    let actor = insert_actor(&db.pool).await?;
+    let sandbox_id = SandboxId::new();
+    let original_node_id = NodeId::new();
+    let replacement_node_id = NodeId::new();
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (
+             id, user_id, org_id, managed_by, lifecycle, placement,
+             network_policy_generation
+         )
+         VALUES ($1, $2, $3, 'space', 'deleting', 'unplaced', 1)"
+    ))
+    .bind(sandbox_id.as_uuid())
+    .bind(actor.id)
+    .bind(actor.org_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_direct_route_identities (
+             sandbox_id, route_generation, current_node_id, substrate_kind,
+             execution_generation, activation_attempt_id
+         )
+         VALUES ($1, 2, $2, 'space', 2, $3)"
+    ))
+    .bind(sandbox_id.as_uuid())
+    .bind(replacement_node_id.as_uuid())
+    .bind(Uuid::now_v7())
+    .execute(&db.pool)
+    .await?;
+
+    let fence = crate::controllers::substrate::CreateRollbackExecutionFence::Direct {
+        node_id: original_node_id,
+        route_identity: None,
+    };
+    let error = direct_sandbox_controller(&db.pool)
+        .delete_created_sandbox_for_rollback(&db.pool, sandbox_id, &fence)
+        .await
+        .expect_err("a delayed create rollback must refuse a replacement route identity");
+    assert!(error.to_string().contains("execution changed"));
+    let sandbox_exists: bool = sqlx::query_scalar(sql!(
+        "SELECT EXISTS (SELECT 1 FROM sandboxes WHERE id = $1)"
+    ))
+    .bind(sandbox_id.as_uuid())
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(sandbox_exists);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn restore_in_flight_create_failure_keeps_pod_ownership_until_cleanup() -> TestResult {
+    let db = pg_test_db().await?;
+    let actor = insert_actor(&db.pool).await?;
+    let sandbox_id = SandboxId::new();
+    sqlx::query(
+        "INSERT INTO sandboxes (
+             id, user_id, org_id, managed_by, lifecycle, placement,
+             network_policy_generation
+         )
+         VALUES ($1, $2, $3, 'k8s', 'creating', 'unplaced', 1)",
+    )
+    .bind(sandbox_id.as_uuid())
+    .bind(actor.id)
+    .bind(actor.org_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO sandbox_k8s_executions (
+             sandbox_id, generation, pod_name, pod_namespace, pod_uid, state, active
+         )
+         VALUES ($1, 1, $2, 'sandboxes', $3, 'creating', TRUE)",
+    )
+    .bind(sandbox_id.as_uuid())
+    .bind(format!("space-sbx-{}-g1", sandbox_id.as_uuid().simple()))
+    .bind(format!("{}-uid", sandbox_id.as_uuid().simple()))
+    .execute(&db.pool)
+    .await?;
+
+    let disposition = clean_up_substrate_create_failure(
+        &db.pool,
+        sandbox_id,
+        &SubstrateError::RestoreInFlight {
+            message: "pod placement lost the termination-fence race".to_string(),
+            lease_remaining: None,
+        },
+    )
+    .await?;
+
+    assert_eq!(
+        disposition,
+        SubstrateCreateFailureDisposition::RetainedForRetry,
+        "retryable fence refusal must keep the row until pod cleanup owns the execution"
+    );
+    let sandbox_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM sandboxes WHERE id = $1)")
+            .bind(sandbox_id.as_uuid())
+            .fetch_one(&db.pool)
+            .await?;
+    let execution_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM sandbox_k8s_executions
+             WHERE sandbox_id = $1 AND active AND pod_uid IS NOT NULL
+         )",
+    )
+    .bind(sandbox_id.as_uuid())
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(
+        sandbox_exists,
+        "the cleanup owner still needs the sandbox row"
+    );
+    assert!(
+        execution_exists,
+        "the cleanup owner still needs the exact pod identity"
+    );
+    Ok(())
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -117,7 +338,7 @@ async fn create_finalization_accepts_receipt_converged_started_state() -> TestRe
     .await?;
 
     assert!(
-        finalized,
+        finalized.is_finalized(),
         "a matching activation-completion receipt must not lose create ownership"
     );
     let command_ready_pending: bool = sqlx::query_scalar(sql!(
@@ -170,7 +391,7 @@ async fn create_finalization_accepts_operation_leased_restoring_state() -> TestR
     )
     .await?;
     assert!(
-        !wrong_owner_finalized,
+        !wrong_owner_finalized.is_finalized(),
         "a different operation lease must not finalize the restoring row"
     );
 
@@ -186,7 +407,7 @@ async fn create_finalization_accepts_operation_leased_restoring_state() -> TestR
     .await?;
 
     assert!(
-        finalized,
+        finalized.is_finalized(),
         "the fork operation lease must finalize its restoring row"
     );
     let (
@@ -305,7 +526,12 @@ async fn restore_finalization_requires_the_receipt_converged_node_binding() -> T
         Some(OperationId::new()),
     )
     .await?;
-    assert!(!mismatched, "a different node receipt must lose the CAS");
+    assert_eq!(
+        mismatched,
+        FinalizeOutcome::CasLost,
+        "a different node receipt must lose the CAS — and must lose it there, not \
+         at the termination fence, which this fixture's node does not trip"
+    );
     let placement_changed_at: Option<time::OffsetDateTime> = sqlx::query_scalar(sql!(
         "SELECT placement_changed_at FROM sandboxes WHERE id = $1"
     ))
@@ -327,7 +553,10 @@ async fn restore_finalization_requires_the_receipt_converged_node_binding() -> T
         Some(OperationId::new()),
     )
     .await?;
-    assert!(finalized, "the converged node receipt is idempotent");
+    assert!(
+        finalized.is_finalized(),
+        "the converged node receipt is idempotent"
+    );
 
     let (active_node_id, placement_changed_at): (Option<NodeId>, Option<time::OffsetDateTime>) =
         sqlx::query_as(sql!(
@@ -379,7 +608,7 @@ async fn create_finalization_records_operation_leased_restore_failure() -> TestR
     )
     .await?;
     assert!(
-        finalized,
+        finalized.is_finalized(),
         "the lease owner must record terminal restore failure"
     );
     let lifecycle: String =
@@ -525,7 +754,7 @@ async fn install_failing_federated_grant_triggers(pool: &PgPool) -> TestResult {
     Ok(())
 }
 
-fn pooled_create_request(
+pub(super) fn pooled_create_request(
     name: &str,
     network_policy: Option<NetworkPolicyV1>,
 ) -> CreateSandboxRequest {
@@ -547,7 +776,7 @@ fn pooled_create_request(
     }
 }
 
-fn pooled_create_input<'a>(
+pub(super) fn pooled_create_input<'a>(
     pool: &'a PgPool,
     req: &'a CreateSandboxRequest,
     requested_template: &'a TemplateReference,
@@ -604,7 +833,7 @@ fn pooled_claim_with_pod(
     }
 }
 
-fn pooled_claim(sandbox_id: SandboxId, node_id: NodeId) -> PooledExecutionClaim {
+pub(super) fn pooled_claim(sandbox_id: SandboxId, node_id: NodeId) -> PooledExecutionClaim {
     pooled_claim_with_pod(sandbox_id, node_id, "space-sbx-pooled-g1")
 }
 
@@ -730,6 +959,14 @@ impl SubstrateAdapter for RetryingPoolSubstrate {
     }
 
     async fn delete_execution(&self, _sandbox_id: SandboxId) -> Result<(), SubstrateError> {
+        panic!("unused")
+    }
+
+    async fn delete_created_execution(
+        &self,
+        _sandbox_id: SandboxId,
+        _fence: &crate::controllers::substrate::CreateRollbackExecutionFence,
+    ) -> Result<(), SubstrateError> {
         panic!("unused")
     }
 
@@ -1069,6 +1306,14 @@ impl SubstrateAdapter for NodeRpcStubbedKubernetes {
         panic!("unused")
     }
 
+    async fn delete_created_execution(
+        &self,
+        _sandbox_id: SandboxId,
+        _fence: &crate::controllers::substrate::CreateRollbackExecutionFence,
+    ) -> Result<(), SubstrateError> {
+        panic!("unused")
+    }
+
     async fn retire_execution(
         &self,
         _request: crate::controllers::substrate::RetireExecutionRequest,
@@ -1277,6 +1522,7 @@ async fn postgres_insert_pooled_sandbox_writes_api_row() -> TestResult {
     let actor = insert_actor(&db.pool).await?;
     let sandbox_id = SandboxId::new();
     let node_id = NodeId::new();
+    insert_node(&db.pool, node_id).await?;
     let auto_lifecycle = AutoLifecyclePolicy::disabled();
     let mut env = std::collections::BTreeMap::new();
     env.insert("HELLO".to_string(), "world".to_string());
@@ -1390,6 +1636,7 @@ async fn postgres_insert_pooled_sandbox_can_write_federated_owner_row() -> TestR
     let db = pg_test_db().await?;
     let sandbox_id = SandboxId::new();
     let node_id = NodeId::new();
+    insert_node(&db.pool, node_id).await?;
     let auto_lifecycle = AutoLifecyclePolicy::disabled();
     let req = pooled_create_request("federated-pooled-sandbox", None);
     let template_network_policy = NetworkPolicyV1::deny_all();
@@ -1462,6 +1709,7 @@ async fn postgres_pooled_federated_sandbox_persists_service_grant() -> TestResul
     let db = pg_test_db().await?;
     let sandbox_id = SandboxId::new();
     let node_id = NodeId::new();
+    insert_node(&db.pool, node_id).await?;
     let auto_lifecycle = AutoLifecyclePolicy::disabled();
     let req = pooled_create_request("federated-pooled-sandbox", None);
     let template_network_policy = NetworkPolicyV1::deny_all();
@@ -2053,6 +2301,7 @@ async fn postgres_failed_pooled_create_finalizes_after_claim_cleanup() -> TestRe
     let actor = insert_actor(&db.pool).await?;
     let sandbox_id = SandboxId::new();
     let node_id = NodeId::new();
+    insert_node(&db.pool, node_id).await?;
     let auto_lifecycle = AutoLifecyclePolicy::disabled();
     let req = pooled_create_request("pooled-sandbox-cleanup", None);
     let template_network_policy = NetworkPolicyV1::deny_all();

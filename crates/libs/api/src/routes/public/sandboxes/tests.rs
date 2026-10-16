@@ -519,6 +519,7 @@ async fn delete_replay_survives_target_removal_without_crossing_tenant_or_reques
                 sandbox_id,
                 action,
                 rollback: None,
+                create_rollback_fence: None,
             }
             .into_json(),
             idempotency: Some(CreatePublicOperationIdempotency {

@@ -777,6 +777,50 @@ async fn postgres_fixture() -> TestResult<Option<PostgresFixture>> {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn direct_delete_uses_route_identity_before_active_placement_is_committed() -> TestResult {
+    if !crate::test_support::enter_sim_worker_process() {
+        return Ok(());
+    }
+    let Some(fixture) = postgres_fixture().await? else {
+        return Ok(());
+    };
+    let sandbox_id = SandboxId::from_uuid(Uuid::now_v7());
+    let node_id = NodeId::new();
+    let activation_attempt_id = Uuid::now_v7();
+    let (server, state) = start_sim_worker(node_id).await?;
+    insert_sandbox(&fixture.pool, sandbox_id, None).await?;
+    insert_ready_worker(&fixture.pool, node_id, server.endpoint(), "9.0.0").await?;
+    state
+        .insert_new(creating_record(sandbox_id).with_route_identity_provenance(1, 1, None))
+        .await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_direct_route_identities (
+             sandbox_id,
+             route_generation,
+             current_node_id,
+             substrate_kind,
+             execution_generation,
+             activation_attempt_id
+         )
+         VALUES ($1, 1, $2, 'space', 1, $3)"
+    ))
+    .bind(sandbox_id.as_uuid())
+    .bind(node_id)
+    .bind(activation_attempt_id)
+    .execute(&fixture.pool)
+    .await?;
+
+    fixture.substrate.delete_execution(sandbox_id).await?;
+
+    assert!(
+        state.get(&sandbox_id.to_string()).await.is_err(),
+        "create rollback must delete a direct execution before active_node_id is committed"
+    );
+    drop(server);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn direct_create_rejects_node_pool_placement() -> TestResult {
     let Some(fixture) = postgres_fixture().await? else {
         return Ok(());
@@ -863,6 +907,29 @@ async fn insert_sandbox(
     ))
     .bind(sandbox_id)
     .bind(source_node_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Seed the bare `nodes` row the termination fence requires.
+///
+/// The fence refuses a placement whose destination has no `nodes` row at all
+/// (see `node_placement_fence`'s "A missing `nodes` row refuses"), and it runs
+/// before the lease and provenance checks. A test that names a destination node
+/// without creating one therefore gets a `RestoreInFlight` from the fence rather
+/// than from the thing it meant to exercise — which is invisible in a test that
+/// only asserts *that* an error occurred.
+///
+/// Lighter than [`insert_ready_worker`] on purpose: these callers need the row to
+/// exist, not the node to be schedulable, and seeding `node_direct` plus a status
+/// snapshot would imply the test depends on readiness when it does not.
+async fn insert_fenceable_node(pool: &PgPool, node_id: Uuid) -> TestResult {
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role, managed_by, state)
+         VALUES ($1, '127.0.0.1', 'worker', 'space', 'registered')"
+    ))
+    .bind(node_id)
     .execute(pool)
     .await?;
     Ok(())
@@ -4075,6 +4142,12 @@ async fn stale_cross_node_restore_receipt_cannot_overwrite_newer_placement() -> 
     let stale_attempt_node_id = NodeId::new();
     let newer_attempt_node_id = NodeId::new();
     insert_sandbox(&fixture.pool, sandbox_id, Some(source_node_id)).await?;
+    // Both attempt nodes get rows so the rejection this test asserts is the
+    // expired-owner one it is named for. Without them the fence refuses first,
+    // for a missing node row, and raises the *same* `RestoreInFlight` variant —
+    // so the assertion below held while the lease check went unexercised.
+    insert_fenceable_node(&fixture.pool, stale_attempt_node_id.as_uuid()).await?;
+    insert_fenceable_node(&fixture.pool, newer_attempt_node_id.as_uuid()).await?;
 
     let stale_lease = fixture
         .substrate
@@ -4156,6 +4229,7 @@ async fn owned_restore_persists_the_supplied_identity_when_legacy_manager_omits_
     let source_node_id = NodeId::new();
     let destination_node_id = NodeId::new();
     insert_sandbox(&fixture.pool, sandbox_id, Some(source_node_id)).await?;
+    insert_fenceable_node(&fixture.pool, destination_node_id.as_uuid()).await?;
     let lease = fixture
         .substrate
         .claim_direct_restore_lease(sandbox_id)
@@ -4196,6 +4270,88 @@ async fn owned_restore_persists_the_supplied_identity_when_legacy_manager_omits_
     .await?;
     assert_eq!(active_node_id, Some(destination_node_id));
     assert_eq!(target_node_id, Some(destination_node_id));
+    fixture
+        .substrate
+        .release_direct_restore_lease(sandbox_id, lease)
+        .await?;
+    Ok(())
+}
+
+/// A restore whose termination-fence read loses the `nodes` row lock to a
+/// phase write must be told to retry, not that it failed. The fence is the first lock this transaction
+/// takes, so a phase write that holds the row is exactly what it waits on.
+/// The control is the identical call once the phase write releases the row.
+#[tokio::test(flavor = "current_thread")]
+async fn owned_restore_fence_contention_is_retryable() -> TestResult {
+    let Some(fixture) = postgres_fixture().await? else {
+        return Ok(());
+    };
+    let sandbox_id = SandboxId::new();
+    let destination_node_id = NodeId::new();
+    insert_sandbox(&fixture.pool, sandbox_id, Some(NodeId::new())).await?;
+    insert_fenceable_node(&fixture.pool, destination_node_id.as_uuid()).await?;
+    let lease = fixture
+        .substrate
+        .claim_direct_restore_lease(sandbox_id)
+        .await?;
+    let identity = pplx_space_sbx_mgr_client::proto::SpaceApiRouteIdentity {
+        route_generation: Some(2),
+        current_node_id: Some(destination_node_id.to_string()),
+        substrate_kind: pplx_space_sbx_mgr_client::proto::SandboxSubstrateKind::Direct as i32,
+        execution_generation: Some(2),
+        activation_attempt_id: Some(Uuid::now_v7().to_string()),
+        ..Default::default()
+    };
+    let response = pplx_space_sbx_mgr_client::proto::StartResponse {
+        sandbox_id: sandbox_id.to_string(),
+        route_identity: Some(identity.clone()),
+        ..Default::default()
+    };
+    // Bounded, so the fence aborts on the held lock instead of waiting it out.
+    let bounded = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                sqlx::query("SET lock_timeout = '150ms'")
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&fixture._db.database_url)
+        .await?;
+    let bounded_substrate = DirectSubstrate::new(bounded);
+
+    let mut phase_write = fixture.pool.begin().await?;
+    sqlx::query(sql!("SELECT 1 FROM nodes WHERE id = $1 FOR UPDATE"))
+        .bind(destination_node_id)
+        .fetch_one(&mut *phase_write)
+        .await?;
+    let error = bounded_substrate
+        .persist_owned_restore_route_identity_receipt(
+            sandbox_id,
+            destination_node_id,
+            &response,
+            identity.clone(),
+            lease,
+        )
+        .await
+        .expect_err("the fence must abort on the held node row");
+    assert!(
+        matches!(error, SubstrateError::LockContention { .. }),
+        "a lost fence lock race must classify as contention, got {error:?}"
+    );
+
+    phase_write.rollback().await?;
+    bounded_substrate
+        .persist_owned_restore_route_identity_receipt(
+            sandbox_id,
+            destination_node_id,
+            &response,
+            identity,
+            lease,
+        )
+        .await?;
     fixture
         .substrate
         .release_direct_restore_lease(sandbox_id, lease)
@@ -4603,6 +4759,153 @@ async fn wake_keeps_generation_observed_during_resident_transition(
     assert_eq!(
         resumed.access_idle_policy,
         policy_to_proto(&policy).encode_to_vec()
+    );
+    Ok(())
+}
+
+/// An absent rollback receipt must be **confirmed** on the node, not assumed.
+///
+/// This pins the middle between two failures, which is why it asserts on *where*
+/// the call got to rather than on success or failure:
+///
+/// * Returning `Conflict` (the original behavior) made a retry after a successful
+///   teardown terminal — `controller_error_result` does not requeue it — stranding
+///   the row in `deleting` forever.
+/// * Returning `Ok(())` (the first attempt at fixing that) was worse. An absent
+///   receipt does not uniquely mean this teardown finished: `retire_execution`
+///   clears it after a stop, `suspend_execution` after a suspend, and
+///   `persist_route_identity_receipt` on a *successful* activation through an older
+///   sbx-mgr. In each the guest is still running, so reporting a completed teardown
+///   let the caller retire the `sandboxes` row and leak live on-node state with no
+///   control-plane row — the very thing this fence exists to prevent.
+///
+/// So the contract is: fall through to the delete RPC. The fixture registers no
+/// worker, so reaching node resolution is the observable proof it did. A `Conflict`
+/// here would mean the stranding is back; an `Ok` would mean absence was assumed.
+#[tokio::test(flavor = "current_thread")]
+async fn create_rollback_confirms_an_absent_receipt_against_the_node() -> TestResult {
+    let Some(fixture) = postgres_fixture().await? else {
+        return Ok(());
+    };
+    let sandbox_id = SandboxId::from_uuid(Uuid::now_v7());
+    let node_id = NodeId::new();
+    insert_sandbox(&fixture.pool, sandbox_id, Some(node_id)).await?;
+
+    let expected = SandboxRouteIdentity::try_new(
+        sandbox_id,
+        RouteGeneration::new(2)?,
+        node_id,
+        NodeManagedBy::Space,
+        ExecutionGeneration::try_from(2i64)?,
+        SandboxActivationAttemptId::from_uuid(Uuid::now_v7()),
+        None,
+    )?;
+    let fence = CreateRollbackExecutionFence::Direct {
+        node_id,
+        route_identity: Some(expected),
+    };
+
+    let error = fixture
+        .substrate
+        .delete_created_execution(sandbox_id, &fence)
+        .await
+        .expect_err("the fixture registers no worker, so the delete cannot complete");
+    assert!(
+        !matches!(error, SubstrateError::Conflict { .. }),
+        "an absent receipt must not be refused as a conflict — that is what made \
+         the retry terminal and stranded the row in `deleting`: {error}"
+    );
+    assert!(
+        error.to_string().contains("is not registered"),
+        "the call must reach node resolution, which is the proof it attempted the \
+         delete instead of assuming absence: {error}"
+    );
+    Ok(())
+}
+
+/// A create's compensation checks the route receipt before its node RPC and
+/// clears it after. A successor activation that persisted its own receipt in
+/// between owns the sandbox, so the clear must leave that receipt alone and say
+/// so; the matching receipt is still cleared, so the guard is not just a no-op;
+/// and an absent receipt is not mistaken for a successor.
+#[tokio::test(flavor = "current_thread")]
+async fn a_compensations_route_clear_spares_a_successors_receipt() -> TestResult {
+    let Some(fixture) = postgres_fixture().await? else {
+        return Ok(());
+    };
+    let sandbox_id = SandboxId::from_uuid(Uuid::now_v7());
+    let node_id = NodeId::new();
+    insert_sandbox(&fixture.pool, sandbox_id, Some(node_id)).await?;
+    let attempt = SandboxActivationAttemptId::from_uuid(Uuid::now_v7());
+    let identity = |route_generation: u64, attempt| -> TestResult<SandboxRouteIdentity> {
+        Ok(SandboxRouteIdentity::try_new(
+            sandbox_id,
+            RouteGeneration::new(route_generation)?,
+            node_id,
+            NodeManagedBy::Space,
+            ExecutionGeneration::try_from(3i64)?,
+            attempt,
+            None,
+        )?)
+    };
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_direct_route_identities (
+             sandbox_id,
+             route_generation,
+             current_node_id,
+             substrate_kind,
+             execution_generation,
+             activation_attempt_id
+         )
+         VALUES ($1, 3, $2, 'space', 3, $3)"
+    ))
+    .bind(sandbox_id.as_uuid())
+    .bind(node_id)
+    .bind(attempt.as_uuid())
+    .execute(&fixture.pool)
+    .await?;
+    let receipt_present = || async {
+        sqlx::query_scalar::<_, bool>(sql!(
+            "SELECT EXISTS (SELECT 1 FROM sandbox_direct_route_identities WHERE sandbox_id = $1)"
+        ))
+        .bind(sandbox_id.as_uuid())
+        .fetch_one(&fixture.pool)
+        .await
+    };
+    let clear = |expected: SandboxRouteIdentity| {
+        let substrate = &fixture.substrate;
+        async move {
+            substrate
+                .clear_direct_route_identity_if_current(sandbox_id, &expected)
+                .await
+        }
+    };
+
+    // The compensation checked an older generation; a successor wrote 3.
+    assert_eq!(
+        clear(identity(2, attempt)?).await?,
+        RouteReceiptClear::Successor
+    );
+    // Same generation, different activation: still a successor, not a match.
+    let other_attempt = SandboxActivationAttemptId::from_uuid(Uuid::now_v7());
+    assert_eq!(
+        clear(identity(3, other_attempt)?).await?,
+        RouteReceiptClear::Successor
+    );
+    assert!(receipt_present().await?, "the successor's receipt survives");
+
+    assert_eq!(
+        clear(identity(3, attempt)?).await?,
+        RouteReceiptClear::Cleared
+    );
+    assert!(!receipt_present().await?, "the checked receipt is cleared");
+
+    // With no receipt at all (a stop or suspend cleared it) there is no
+    // successor, so a compensation that just confirmed the delete on the node
+    // must be allowed to finish rather than report a conflict on every retry.
+    assert_eq!(
+        clear(identity(3, attempt)?).await?,
+        RouteReceiptClear::Absent
     );
     Ok(())
 }

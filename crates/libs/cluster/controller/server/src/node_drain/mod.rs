@@ -162,7 +162,9 @@ use std::time::{Duration, Instant};
 use pplx_space_api::controllers::substrate::NODE_RPC_BLOCKING_BUDGET;
 use pplx_space_common_core::kubernetes::EvacuationPlacement;
 use pplx_space_common_core::types::{NodeDrainMode, PositiveDuration, SandboxLifecycle};
-use pplx_space_metrics::node_drain as node_drain_metrics;
+use pplx_space_metrics::{
+    node_drain as node_drain_metrics, placement_fence as placement_fence_metrics,
+};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -2322,6 +2324,7 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
                         timeout_ms = store::DRAIN_COMPLETION_LOCK_TIMEOUT.as_millis() as u64,
                         "node_drain: drained transition deferred; nodes row contended"
                     );
+                    placement_fence_metrics::termination_contention_deferral();
                     return;
                 }
                 Err(err) => {
@@ -2956,19 +2959,25 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
         // node *was* empty when something wrote `terminating`; the ASG call is
         // irreversible, so ask once more here.
         //
-        // **This narrows the window; it does not close it.** Between this count
-        // and the terminate call a placement writer can still attach, because
-        // the writers that set `sandboxes.active_node_id` on the pooled
-        // post-wake, post-create, pooled-create, and direct-restore paths take
-        // no lock on the `nodes` row and so cannot be ordered against this
-        // read. Closing it needs a fence every placement writer and this path
-        // both honour, which is its own change (see the RFC's reverse-lock-order
-        // section). What this does buy: the window shrinks
-        // from "any time after the phase write" (which for an operator-driven
-        // `:terminate` can be minutes, since the next tick is up to 5 s away and
-        // the phase write is not the terminate) to the microseconds between this
-        // statement and the ASG call, and a sandbox that attached in that longer
-        // window now parks the node instead of dying with it.
+        // **This is now the backstop, not the guard.** The guard is the
+        // termination fence in
+        // `pplx_space_common_svc::sql::node_placement_fence`: every writer that
+        // commits `sandboxes.active_node_id` and has a production caller takes
+        // `FOR KEY SHARE` on the `nodes` row and refuses when the committed
+        // `drain_phase` is `drained` or `terminating`, and both routes into
+        // `terminating` take `FOR UPDATE` in their own statement first. So those
+        // two are ordered, and a placement through them cannot land after the
+        // phase write at all.
+        //
+        // This count stays because the fence is an enumeration of writers rather
+        // than a schema constraint, and because it covers what the fence by
+        // construction cannot: a sandbox that was already resident when
+        // something wrote `terminating` past its own guard, the one dormant
+        // `active_node_id` writer the fence module names as still unfenced, and
+        // any future writer that does not call the fence. Before the
+        // fence it was the *only* thing between an attach and a destroy, and it
+        // could not close the window — a standalone count orders nothing, and
+        // the microseconds between it and the ASG call were exposed.
         //
         // Counted with the terminator's own predicate, so a node this refuses is
         // exactly a node the `drained → terminating` gate would have refused.

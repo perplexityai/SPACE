@@ -350,7 +350,10 @@ where
                 }
                 updated
             } else if !preserve_retry_budget
-                && retry_budget_exhausted(attempts, config.max_retry_attempts)
+                && retry_budget_exhausted(
+                    attempts,
+                    effective_max_retry_attempts(kind, config.max_retry_attempts),
+                )
             {
                 let terminal_error_code = result
                     .terminal_error_code
@@ -362,7 +365,11 @@ where
                         "reason": "retry_attempts_exhausted",
                         "retry_reason": retry_reason,
                         "attempts": attempts,
-                            "max_retry_attempts": config.max_retry_attempts.max(1),
+                            "max_retry_attempts": effective_max_retry_attempts(
+                                kind,
+                                config.max_retry_attempts,
+                            )
+                            .max(1),
                     })
                 });
                 let updated = store
@@ -430,6 +437,24 @@ where
     }
 
     Ok(report)
+}
+
+/// How much longer internal create-compensation gets than a user-facing
+/// operation before its retries are declared exhausted.
+///
+/// It is the only owner of a `managed_by = 'space'` teardown, so giving up
+/// strands a live guest; but an unbounded budget grows `public_operation_events`
+/// forever and starves the claim queue. This multiplier is the middle.
+const INTERNAL_CLEANUP_RETRY_MULTIPLIER: i32 = 16;
+
+/// The retry budget for `kind`: [`INTERNAL_CLEANUP_RETRY_MULTIPLIER`] times the
+/// configured one for create compensation, the configured one otherwise.
+fn effective_max_retry_attempts(kind: OperationKind, max_retry_attempts: i32) -> i32 {
+    if kind == OperationKind::CompensateCreateSandbox {
+        max_retry_attempts.saturating_mul(INTERNAL_CLEANUP_RETRY_MULTIPLIER)
+    } else {
+        max_retry_attempts
+    }
 }
 
 fn retry_budget_exhausted(attempts: i32, max_retry_attempts: i32) -> bool {

@@ -6,6 +6,7 @@ use pplx_space_common_core::sql;
 use std::time::Duration;
 
 use pplx_space_common_core::types::SandboxId;
+use pplx_space_common_svc::sql::node_placement_fence::lock_node_for_phase_write;
 use pplx_space_common_svc::sql::sandbox_residency::{self, ResidencyEvidence};
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
@@ -50,6 +51,16 @@ use super::{
 fn snapshot_blockers_for_node() -> String {
     drain_gate_blockers_for_node("$1")
 }
+
+/// How long the `drained → terminating` flip waits for the `nodes` row lock
+/// before deferring to the next tick.
+///
+/// Deliberately the same value as `node_drain::store::DRAIN_COMPLETION_LOCK_TIMEOUT`
+/// and for the same reason, but a separate constant rather than a shared one:
+/// the two reconcilers have different tick budgets and different candidate-list
+/// sizes, so a future change to one's patience should not silently move the
+/// other's. If they are ever unified, unify the tick loops first.
+pub(crate) const MARK_TERMINATING_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `$1` = node id. Inner predicate (over the bare `sandboxes` table) of the
 /// resident guard, shared by [`resident_blocking_clause`] (the guard form) and
@@ -422,13 +433,30 @@ impl DrainedNodeTerminatorSink for NodeDbStore {
         //
         // `drain_last_error` is explicitly cleared so a stale error from
         // a prior phase doesn't carry into the new state.
+        //
+        // **The `FOR UPDATE` in its own statement is what makes those guards mean
+        // anything against a concurrent placement**, and it is the terminate half
+        // of the fence in `node_placement_fence`. Both reasons — the READ
+        // COMMITTED rule that leaves a blocked UPDATE's `NOT EXISTS` over *other*
+        // rows stale, and `FOR NO KEY UPDATE` not conflicting with the placement
+        // writers' `FOR KEY SHARE` — live on
+        // [`lock_node_for_phase_write`] rather than being restated here.
+        //
+        // The first of those was a live defect, not a precaution: before this,
+        // `mark_terminating` was a bare pooled `UPDATE nodes`, so a placement that
+        // committed while it waited was invisible to the guard and the node
+        // advanced to `terminating` holding it.
+        let mut tx = self.pool.begin().await?;
+        lock_node_for_phase_write(&mut tx, node_id.as_uuid(), MARK_TERMINATING_LOCK_TIMEOUT)
+            .await?;
         let query = mark_terminating_query(self.residency_evidence);
         let result = sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
             .bind(node_id)
             .bind(PHASE_TERMINATING)
             .bind(PHASE_DRAINED)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -437,13 +465,33 @@ impl DrainedNodeTerminatorSink for NodeDbStore {
         node_id: NodeId,
         expected_uid: Option<String>,
     ) -> Result<OrphanDeleteOutcome, sqlx::Error> {
+        // Same `FOR UPDATE` preamble as `mark_terminating`, and it became
+        // necessary *because* of the placement fence rather than in spite of it.
+        // This is a hard `DELETE FROM nodes`, which takes `FOR UPDATE` on the row
+        // — a mode the placement writers' new `FOR KEY SHARE` conflicts with. So
+        // this statement can now block on a placement transaction where it never
+        // could before, and a blocked statement's `NOT EXISTS` over `sandboxes`
+        // is evaluated on the pre-wait snapshot (the READ COMMITTED rule
+        // [`lock_node_for_phase_write`] documents). Measured: the DELETE waited
+        // ~5s on a placement holding `FOR KEY SHARE`, then reported `DELETE 1`,
+        // hard-deleting the `nodes` row while `sandboxes.active_node_id` had just
+        // been committed pointing at it.
+        //
+        // The harm is a phantom row rather than a destroyed sandbox — this path
+        // runs only after an EC2 cross-check confirmed the instance terminated,
+        // so the guest is already gone — but a phantom created by a guard that
+        // *looked* atomic is exactly what this feature exists to stop.
+        let mut tx = self.pool.begin().await?;
+        lock_node_for_phase_write(&mut tx, node_id.as_uuid(), MARK_TERMINATING_LOCK_TIMEOUT)
+            .await?;
         let query = delete_drained_node_if_orphan_query(self.residency_evidence);
         let result = sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
             .bind(node_id)
             .bind(expected_uid.clone())
             .bind(SubstrateKind::Kubernetes)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         if result.rows_affected() > 0 {
             return Ok(OrphanDeleteOutcome::Deleted);
         }

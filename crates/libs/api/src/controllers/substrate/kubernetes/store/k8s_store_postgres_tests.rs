@@ -9331,3 +9331,617 @@ async fn retired_pool_reserved_generation_moves_cold_create_past_the_pool_pod() 
     );
     Ok(())
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancelled_create_cleanup_deletes_parent_after_exact_execution_is_retired() -> TestResult {
+    let fixture = postgres_store().await?;
+    let sandbox_id = SandboxId::new();
+    let activation_attempt_id = SandboxActivationAttemptId::new();
+    let pod_uid = PodUid::parse("cancelled-create-pod-uid")?;
+    insert_sandbox(&fixture.pool, sandbox_id, "creating").await?;
+    let execution = fixture
+        .store
+        .ensure_active_execution_row(sandbox_id)
+        .await?;
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions
+            SET activation_attempt_id = $2,
+                activation_attempt_expires_at = NOW() + INTERVAL '5 minutes',
+                activation_attempt_target_state = 'started',
+                pod_uid = $3
+          WHERE sandbox_id = $1 AND active"
+    ))
+    .bind(sandbox_id)
+    .bind(activation_attempt_id)
+    .bind(pod_uid.as_str())
+    .execute(&fixture.pool)
+    .await?;
+
+    assert_eq!(
+        fixture
+            .store
+            .mark_cancelled_create_cleanup_pending_if_attempt(
+                sandbox_id,
+                execution.generation,
+                activation_attempt_id,
+                &pod_uid,
+            )
+            .await?,
+        CancelledCreateCleanupClaim::DeleteClaimed,
+        "cold-create cleanup must be retryable before the pod delete starts"
+    );
+    assert_eq!(
+        fixture
+            .store
+            .mark_cancelled_create_cleanup_pending_if_attempt(
+                sandbox_id,
+                execution.generation,
+                activation_attempt_id,
+                &pod_uid,
+            )
+            .await?,
+        CancelledCreateCleanupClaim::DeleteClaimed,
+        "an awaited claim followed by drop cleanup must remain idempotently owned"
+    );
+    assert!(
+        fixture
+            .store
+            .forget_pod_tracking_if_generation_and_attempt(
+                sandbox_id,
+                execution.generation,
+                activation_attempt_id,
+            )
+            .await?,
+        "the exact cancelled execution must be retired after its pod is deleted"
+    );
+    assert!(
+        fixture
+            .store
+            .delete_cancelled_create_sandbox_if_cleaned(
+                sandbox_id,
+                execution.generation,
+                activation_attempt_id,
+            )
+            .await?,
+        "a never-succeeded create should be removed after UID-fenced pod cleanup"
+    );
+    let sandbox_exists: bool = sqlx::query_scalar(sql!(
+        "SELECT EXISTS (SELECT 1 FROM sandboxes WHERE id = $1)"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(&fixture.pool)
+    .await?;
+    assert!(!sandbox_exists);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancelled_create_cleanup_preserves_restore_and_successor() -> TestResult {
+    let fixture = postgres_store().await?;
+
+    let restoring_id = SandboxId::new();
+    let restoring_attempt = SandboxActivationAttemptId::new();
+    let restoring_pod_uid = PodUid::parse("cancelled-restore-pod-uid")?;
+    insert_sandbox(&fixture.pool, restoring_id, "creating").await?;
+    let restoring_execution = fixture
+        .store
+        .ensure_active_execution_row(restoring_id)
+        .await?;
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions
+            SET activation_attempt_id = $2,
+                pod_uid = $3
+          WHERE sandbox_id = $1 AND active"
+    ))
+    .bind(restoring_id)
+    .bind(restoring_attempt)
+    .bind(restoring_pod_uid.as_str())
+    .execute(&fixture.pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET lifecycle = 'restoring' WHERE id = $1"
+    ))
+    .bind(restoring_id)
+    .execute(&fixture.pool)
+    .await?;
+    assert_eq!(
+        fixture
+            .store
+            .mark_cancelled_create_cleanup_pending_if_attempt(
+                restoring_id,
+                restoring_execution.generation,
+                restoring_attempt,
+                &restoring_pod_uid,
+            )
+            .await?,
+        CancelledCreateCleanupClaim::NotCovered,
+        "restore cleanup must not turn the parent into a delete claim"
+    );
+    let restoring_lifecycle: String =
+        sqlx::query_scalar(sql!("SELECT lifecycle FROM sandboxes WHERE id = $1"))
+            .bind(restoring_id)
+            .fetch_one(&fixture.pool)
+            .await?;
+    assert_eq!(
+        restoring_lifecycle, "restoring",
+        "`NotCovered` writes nothing: the restore keeps its lifecycle"
+    );
+    assert!(
+        fixture
+            .store
+            .forget_pod_tracking_if_generation_and_attempt(
+                restoring_id,
+                restoring_execution.generation,
+                restoring_attempt,
+            )
+            .await?
+    );
+    assert!(
+        !fixture
+            .store
+            .delete_cancelled_create_sandbox_if_cleaned(
+                restoring_id,
+                restoring_execution.generation,
+                restoring_attempt,
+            )
+            .await?,
+        "restore cleanup must preserve its parent sandbox"
+    );
+
+    let successor_id = SandboxId::new();
+    let cancelled_attempt = SandboxActivationAttemptId::new();
+    let cancelled_pod_uid = PodUid::parse("cancelled-successor-pod-uid")?;
+    insert_sandbox(&fixture.pool, successor_id, "creating").await?;
+    let cancelled_execution = fixture
+        .store
+        .ensure_active_execution_row(successor_id)
+        .await?;
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions
+            SET activation_attempt_id = $2,
+                pod_uid = $3
+          WHERE sandbox_id = $1 AND active"
+    ))
+    .bind(successor_id)
+    .bind(cancelled_attempt)
+    .bind(cancelled_pod_uid.as_str())
+    .execute(&fixture.pool)
+    .await?;
+    assert!(
+        fixture
+            .store
+            .forget_pod_tracking_if_generation_and_attempt(
+                successor_id,
+                cancelled_execution.generation,
+                cancelled_attempt,
+            )
+            .await?
+    );
+    let successor_execution = fixture
+        .store
+        .ensure_active_execution_row(successor_id)
+        .await?;
+    assert_ne!(
+        successor_execution.generation,
+        cancelled_execution.generation
+    );
+    assert_eq!(
+        fixture
+            .store
+            .mark_cancelled_create_cleanup_pending_if_attempt(
+                successor_id,
+                cancelled_execution.generation,
+                cancelled_attempt,
+                &cancelled_pod_uid,
+            )
+            .await?,
+        CancelledCreateCleanupClaim::NotOwned,
+        "an old cancel guard must not claim a successor parent for deletion"
+    );
+    assert!(
+        !fixture
+            .store
+            .delete_cancelled_create_sandbox_if_cleaned(
+                successor_id,
+                cancelled_execution.generation,
+                cancelled_attempt,
+            )
+            .await?,
+        "an old cancel guard must not delete a successor execution"
+    );
+
+    let retained: i64 = sqlx::query_scalar(sql!(
+        "SELECT COUNT(*) FROM sandboxes WHERE id = ANY($1::UUID[])"
+    ))
+    .bind(&[restoring_id, successor_id][..])
+    .fetch_one(&fixture.pool)
+    .await?;
+    assert_eq!(retained, 2);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_create_cleanup_claim_observes_concurrent_successor() -> TestResult {
+    let fixture = postgres_store_with_max_connections(5).await?;
+    let sandbox_id = SandboxId::new();
+    let cancelled_attempt = SandboxActivationAttemptId::new();
+    let cancelled_pod_uid = PodUid::parse("cancelled-concurrent-successor-pod-uid")?;
+    insert_sandbox(&fixture.pool, sandbox_id, "creating").await?;
+    let cancelled_execution = fixture
+        .store
+        .ensure_active_execution_row(sandbox_id)
+        .await?;
+    let cancelled_generation = cancelled_execution.generation;
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions
+            SET activation_attempt_id = $2,
+                pod_uid = $3
+          WHERE sandbox_id = $1 AND active"
+    ))
+    .bind(sandbox_id)
+    .bind(cancelled_attempt)
+    .bind(cancelled_pod_uid.as_str())
+    .execute(&fixture.pool)
+    .await?;
+
+    // Hold the same parent lock used by execution creation, then commit a
+    // successor while the old guard is waiting. The cleanup claim must take a
+    // fresh snapshot after the lock wait; otherwise it can match the old
+    // execution from its pre-wait snapshot and turn the successor's parent
+    // into a delete claim.
+    let mut successor = fixture.pool.begin().await?;
+    sqlx::query(sql!("SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE"))
+        .bind(sandbox_id)
+        .fetch_one(&mut *successor)
+        .await?;
+    let claim_store = fixture.store.clone();
+    let claim = tokio::spawn(async move {
+        claim_store
+            .mark_cancelled_create_cleanup_pending_if_attempt(
+                sandbox_id,
+                cancelled_generation,
+                cancelled_attempt,
+                &cancelled_pod_uid,
+            )
+            .await
+    });
+    wait_for_blocked_query(
+        &fixture.pool,
+        "%SELECT id FROM sandboxes WHERE id = $1 FOR UPDATE%",
+        Some("%UPDATE sandboxes AS s%SET lifecycle = 'deleting'%"),
+    )
+    .await?;
+
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions
+            SET active = FALSE,
+                state = 'forgotten'
+          WHERE sandbox_id = $1 AND generation = $2"
+    ))
+    .bind(sandbox_id)
+    .bind(cancelled_generation)
+    .execute(&mut *successor)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_k8s_executions (
+             sandbox_id, generation, pod_name, pod_namespace, state, active
+         ) VALUES ($1, $2, $3, 'space', 'creating', TRUE)"
+    ))
+    .bind(sandbox_id)
+    .bind(cancelled_generation + 1)
+    .bind(format!(
+        "space-sbx-{}-g{}",
+        sandbox_id.as_uuid().simple(),
+        cancelled_generation + 1
+    ))
+    .execute(&mut *successor)
+    .await?;
+    successor.commit().await?;
+
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), claim).await???,
+        CancelledCreateCleanupClaim::NotOwned,
+        "a stale cancel guard must not claim a concurrently committed successor"
+    );
+    let lifecycle: String =
+        sqlx::query_scalar(sql!("SELECT lifecycle FROM sandboxes WHERE id = $1"))
+            .bind(sandbox_id)
+            .fetch_one(&fixture.pool)
+            .await?;
+    assert_eq!(lifecycle, "creating");
+    Ok(())
+}
+
+/// Pod placement honours the termination fence.
+///
+/// This writer was already *ordered* against the terminate path — its `nodes`
+/// upsert takes a lock that conflicts with the phase writers' `FOR UPDATE` — and
+/// until the fence it never read the answer, so a phase write that won the lock
+/// left this transaction free to attach a `started` sandbox to a node on its way
+/// out of the fleet. Ordering without a check buys nothing, and that is what
+/// this pins.
+///
+/// The interleaving itself is proved in the cluster-controller, next to the
+/// phase writers; what can only be checked here is that this call site consults
+/// the fence at all. Paired with an open-node case so a writer that had simply
+/// stopped working could not pass.
+#[tokio::test(flavor = "current_thread")]
+async fn pod_placement_refuses_a_terminating_node() -> TestResult {
+    let fixture = postgres_store().await?;
+    let node_id = NodeId::new();
+    let node_name = format!("space-test-fenced-node-{}", node_id.as_uuid().simple());
+    let sandbox_id = SandboxId::new();
+    insert_sandbox(&fixture.pool, sandbox_id, "starting").await?;
+    // An *active* execution row: `persist_pod_node_placement` writes
+    // `active_node_id` only when the node-name update matched one, so without
+    // this the open-node half of this test would assert nothing.
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_k8s_executions
+             (sandbox_id, generation, pod_name, pod_namespace, pod_ip, state, active)
+         VALUES ($1, 1, 'space-sbx-fenced-g1', 'space', '10.90.0.9', 'running', TRUE)"
+    ))
+    .bind(sandbox_id)
+    .execute(&fixture.pool)
+    .await?;
+
+    // The node exists and is live, then the operator terminates it. Ordering
+    // matters: `persist_pod_node_placement` upserts `nodes`, so a node that did
+    // not exist yet would be created with a NULL `drain_phase` and the fence
+    // would correctly let it through.
+    fixture
+        .store
+        .persist_k8s_node_inventory(
+            &node_name,
+            "uid-fenced",
+            node_id,
+            NodeRole::Worker,
+            Some("10.0.0.41"),
+            NodeStateWrite::Manage(NodeLifecycleState::Ready),
+        )
+        .await?;
+    sqlx::query(sql!(
+        "UPDATE nodes SET drain_phase = 'terminating', drain_started_at = NOW() WHERE id = $1"
+    ))
+    .bind(node_id)
+    .execute(&fixture.pool)
+    .await?;
+
+    let err = fixture
+        .store
+        .persist_pod_node_placement(
+            sandbox_id,
+            &node_name,
+            "uid-fenced",
+            node_id,
+            NodeRole::Worker,
+            Some("10.0.0.41"),
+        )
+        .await
+        .expect_err("pod placement onto a `terminating` node must be refused");
+    assert!(
+        err.to_string().contains("leaving the fleet"),
+        "the error must name the fence rather than read as a generic failure: {err}",
+    );
+
+    let active_node_id: Option<NodeId> =
+        sqlx::query_scalar(sql!("SELECT active_node_id FROM sandboxes WHERE id = $1"))
+            .bind(sandbox_id)
+            .fetch_one(&fixture.pool)
+            .await?;
+    assert_eq!(
+        active_node_id, None,
+        "the whole placement transaction must roll back, leaving no attachment"
+    );
+
+    // The pair: undrain the same node and the same call lands.
+    sqlx::query(sql!("UPDATE nodes SET drain_phase = NULL WHERE id = $1"))
+        .bind(node_id)
+        .execute(&fixture.pool)
+        .await?;
+    fixture
+        .store
+        .persist_pod_node_placement(
+            sandbox_id,
+            &node_name,
+            "uid-fenced",
+            node_id,
+            NodeRole::Worker,
+            Some("10.0.0.41"),
+        )
+        .await?;
+    let active_node_id: Option<NodeId> =
+        sqlx::query_scalar(sql!("SELECT active_node_id FROM sandboxes WHERE id = $1"))
+            .bind(sandbox_id)
+            .fetch_one(&fixture.pool)
+            .await?;
+    assert_eq!(active_node_id, Some(node_id));
+    Ok(())
+}
+
+/// The re-affirmation carve-out is keyed on the *execution*, not just the node.
+///
+/// A `started` sandbox keeps `active_node_id` across an execution replacement, so
+/// a carve-out that fired on a node-id match alone would read a fresh recovery
+/// execution landing on the old node as a re-statement of a placement that
+/// belonged to its predecessor. The consequence is not only a placement onto a
+/// node leaving the fleet: `persist_pod_node_placement`'s `UPDATE` no-ops when
+/// `active_node_id`, `target_node_id` and `placement` all already match, so
+/// nothing would refresh `placement_changed_at` — and a stale
+/// `placement_changed_at` is exactly what lets the census discount the sandbox and
+/// the drain complete in the first place. The row would keep pointing at a node
+/// about to be destroyed with the successor running on it.
+///
+/// Both halves run against the same fixture and differ only in whether the active
+/// execution names the node, because that difference *is* the fix. The
+/// re-affirming half is not decoration: it is what stops the fix from being a
+/// blanket refusal, which would make every re-fired pod watch event tear down a
+/// live sandbox.
+#[tokio::test(flavor = "current_thread")]
+async fn pod_placement_carve_out_requires_the_active_execution_to_name_the_node() -> TestResult {
+    for execution_already_here in [false, true] {
+        let fixture = postgres_store().await?;
+        let node_id = NodeId::new();
+        let node_name = format!("space-test-carveout-{}", node_id.as_uuid().simple());
+        let sandbox_id = SandboxId::new();
+
+        insert_sandbox(&fixture.pool, sandbox_id, "started").await?;
+        fixture
+            .store
+            .persist_k8s_node_inventory(
+                &node_name,
+                "uid-carveout",
+                node_id,
+                NodeRole::Worker,
+                Some("10.0.0.52"),
+                NodeStateWrite::Manage(NodeLifecycleState::Ready),
+            )
+            .await?;
+
+        // The sandbox already names the node — the inherited placement. Its
+        // `placement_changed_at` is old, which is the state that let the census
+        // discount it and the drain reach `drained`.
+        sqlx::query(sql!(
+            "UPDATE sandboxes
+                SET active_node_id = $2, target_node_id = $2, placement = 'on_node',
+                    placement_changed_at = NOW() - INTERVAL '2 hours'
+              WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .bind(node_id)
+        .execute(&fixture.pool)
+        .await?;
+
+        // The active execution: naming this node makes the next write a genuine
+        // re-statement; naming another makes it a replacement that merely
+        // inherited the row's node id.
+        let execution_node: Option<String> = if execution_already_here {
+            Some(node_name.clone())
+        } else {
+            Some("space-test-carveout-elsewhere".to_string())
+        };
+        sqlx::query(sql!(
+            "INSERT INTO sandbox_k8s_executions
+                 (sandbox_id, generation, pod_name, pod_namespace, pod_ip, state, active,
+                  k8s_node_name)
+             VALUES ($1, 2, 'space-sbx-carveout-g2', 'space', '10.90.0.12', 'running', TRUE, $2)"
+        ))
+        .bind(sandbox_id)
+        .bind(execution_node)
+        .execute(&fixture.pool)
+        .await?;
+
+        sqlx::query(sql!(
+            "UPDATE nodes SET drain_phase = 'drained', drain_started_at = NOW() WHERE id = $1"
+        ))
+        .bind(node_id)
+        .execute(&fixture.pool)
+        .await?;
+
+        let result = fixture
+            .store
+            .persist_pod_node_placement(
+                sandbox_id,
+                &node_name,
+                "uid-carveout",
+                node_id,
+                NodeRole::Worker,
+                Some("10.0.0.52"),
+            )
+            .await;
+
+        if execution_already_here {
+            result.map_err(|err| {
+                format!(
+                    "a re-statement by the execution already on this node must take the \
+                     carve-out, or every re-fired pod watch event would tear down a live \
+                     sandbox: {err}"
+                )
+            })?;
+        } else {
+            let err = result.expect_err(
+                "a fresh execution that merely inherited `active_node_id` must be refused \
+                 on a `drained` node",
+            );
+            assert!(
+                matches!(err, SubstrateError::RestoreInFlight { .. }),
+                "the refusal must preserve restore cleanup ownership instead of returning a \
+                 clean failure that can hide the live pod: {err}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_new_execution_on_the_same_draining_node_refreshes_the_placement_clock() -> TestResult {
+    let fixture = postgres_store().await?;
+    let node_id = NodeId::new();
+    let node_name = format!("space-test-clock-refresh-{}", node_id.as_uuid().simple());
+    let sandbox_id = SandboxId::new();
+
+    insert_sandbox(&fixture.pool, sandbox_id, "started").await?;
+    fixture
+        .store
+        .persist_k8s_node_inventory(
+            &node_name,
+            "uid-clock-refresh",
+            node_id,
+            NodeRole::Worker,
+            Some("10.0.0.53"),
+            NodeStateWrite::Manage(NodeLifecycleState::Ready),
+        )
+        .await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET active_node_id = $2, target_node_id = $2, placement = 'on_node',
+                placement_changed_at = NOW() - INTERVAL '2 hours'
+          WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(node_id)
+    .execute(&fixture.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_k8s_executions
+             (sandbox_id, generation, pod_name, pod_namespace, pod_ip, state, active,
+              k8s_node_name)
+         VALUES ($1, 2, 'space-sbx-clock-refresh-g2', 'space', '10.90.0.13', 'running', TRUE,
+                 'space-test-previous-execution-node')"
+    ))
+    .bind(sandbox_id)
+    .execute(&fixture.pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE nodes SET drain_phase = 'draining', drain_started_at = NOW() WHERE id = $1"
+    ))
+    .bind(node_id)
+    .execute(&fixture.pool)
+    .await?;
+
+    fixture
+        .store
+        .persist_pod_node_placement(
+            sandbox_id,
+            &node_name,
+            "uid-clock-refresh",
+            node_id,
+            NodeRole::Worker,
+            Some("10.0.0.53"),
+        )
+        .await?;
+
+    let placement_clock_is_fresh: bool = sqlx::query_scalar(sql!(
+        "SELECT placement_changed_at > NOW() - INTERVAL '1 minute'
+           FROM sandboxes
+          WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(&fixture.pool)
+    .await?;
+    assert!(
+        placement_clock_is_fresh,
+        "a replacement assignment must re-arm the census settle window even when the sandbox's \
+         placement columns already name the same node"
+    );
+    Ok(())
+}

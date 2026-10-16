@@ -305,6 +305,26 @@ impl KubernetesSubstrate {
                 .await?
             {
                 PodFenceCheck::AlreadyRetired => {
+                    // No active execution names the pod, but create compensation
+                    // still holds its UID, and the execution rows can be gone for
+                    // a reason that proves nothing about the pod: a best-effort
+                    // user DELETE can remove the sandbox row, and its executions
+                    // cascade with it, when its own pod delete failed. The
+                    // UID precondition makes this delete unable to touch any
+                    // other pod.
+                    if mode.confirms_pod_absence()
+                        && let Some(pod_uid) = pod_fence.pod_uid.as_ref()
+                    {
+                        match self
+                            .delete_fenced_pod_confirmed(&pod_fence.pod_name, pod_uid, None)
+                            .await?
+                        {
+                            FencedPodDeleteOutcome::Deleted
+                            | FencedPodDeleteOutcome::NotFound
+                            // Another pod holds the name, so the fenced one is gone.
+                            | FencedPodDeleteOutcome::PreconditionFailed => {}
+                        }
+                    }
                     return self.retire_with_no_active_execution(sandbox_id, mode).await;
                 }
                 PodFenceCheck::Mismatch(mismatch) => {
@@ -491,16 +511,26 @@ impl KubernetesSubstrate {
                 ));
             }
             if let Some(pod_uid) = fenced.verified_pod_uid.as_ref() {
-                match delete_sandbox_pod_fenced(
-                    &self.k8s,
-                    &fence.pod_name,
-                    pod_uid,
-                    fence.resource_version.as_ref(),
-                )
-                .await
-                .map_err(|err| SubstrateError::Failed {
-                    message: format!("failed to delete fenced sandbox pod: {err}"),
-                })? {
+                let deleted = if mode.confirms_pod_absence() {
+                    self.delete_fenced_pod_confirmed(
+                        &fence.pod_name,
+                        pod_uid,
+                        fence.resource_version.as_ref(),
+                    )
+                    .await?
+                } else {
+                    delete_sandbox_pod_fenced(
+                        &self.k8s,
+                        &fence.pod_name,
+                        pod_uid,
+                        fence.resource_version.as_ref(),
+                    )
+                    .await
+                    .map_err(|err| SubstrateError::Failed {
+                        message: format!("failed to delete fenced sandbox pod: {err}"),
+                    })?
+                };
+                match deleted {
                     // A delete that removed the object is destructive too, so
                     // a refusal from here on must not report otherwise. Never
                     // downgrades a stop that already ran.
@@ -599,6 +629,49 @@ impl KubernetesSubstrate {
                 PodFenceMismatch::ExecutionSuperseded,
                 progress,
             )),
+        }
+    }
+
+    /// [`delete_sandbox_pod_fenced`], then wait until the apiserver no longer
+    /// has the pod, bounded by `k8s_blocking_delete_timeout`. A delete that is
+    /// accepted but not yet complete is an error, so the caller keeps the
+    /// tracking a retry needs to find the pod again.
+    async fn delete_fenced_pod_confirmed(
+        &self,
+        pod_name: &PodName,
+        pod_uid: &PodUid,
+        resource_version: Option<&PodResourceVersion>,
+    ) -> Result<FencedPodDeleteOutcome, SubstrateError> {
+        let resource_version = resource_version.map(PodResourceVersion::to_string);
+        match self
+            .k8s_blocking_delete_sandbox_pod_for_operation(
+                pod_name.as_str(),
+                "create_compensation",
+                Some((pod_uid.as_str(), resource_version.as_deref())),
+            )
+            .await
+        {
+            Ok(K8sBlockingDeleteOutcome::Deleted) => Ok(FencedPodDeleteOutcome::Deleted),
+            Ok(K8sBlockingDeleteOutcome::NotFound) => Ok(FencedPodDeleteOutcome::NotFound),
+            Ok(K8sBlockingDeleteOutcome::PreconditionFailed) => {
+                Ok(FencedPodDeleteOutcome::PreconditionFailed)
+            }
+            Ok(K8sBlockingDeleteOutcome::TimedOut) => Err(SubstrateError::Timeout {
+                message: format!(
+                    "fenced sandbox pod {pod_name} was not confirmed gone after its delete \
+                     was accepted; keeping execution tracking"
+                ),
+                phase: None,
+            }),
+            Ok(K8sBlockingDeleteOutcome::ObserveError) => Err(SubstrateError::Unavailable {
+                message: format!(
+                    "could not confirm fenced sandbox pod {pod_name} deletion; keeping \
+                     execution tracking"
+                ),
+            }),
+            Err(err) => Err(SubstrateError::Failed {
+                message: format!("failed to delete fenced sandbox pod: {err}"),
+            }),
         }
     }
 

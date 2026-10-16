@@ -337,6 +337,27 @@ pub struct ExecutionBinding {
     pub execution_generation: u64,
 }
 
+/// Exact substrate object created by one create attempt.
+///
+/// Create compensation persists this value before teardown and re-proves it
+/// on every retry. A stable sandbox id alone is not enough: restore and wake
+/// can replace the execution object while a delayed delete is queued.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "substrate", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CreateRollbackExecutionFence {
+    Direct {
+        node_id: NodeId,
+        route_identity: Option<SandboxRouteIdentity>,
+    },
+    Kubernetes {
+        pod_name: PodName,
+        generation: i64,
+        activation_attempt_id: Option<SandboxActivationAttemptId>,
+        route_activation_id: SandboxActivationAttemptId,
+        pod_uid: PodUid,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivationCompletion {
     Owned,
@@ -1267,6 +1288,7 @@ pub struct CreateExecutionOutcome {
     pub lease_completion: Option<ActivationLeaseCompletion>,
     pub sandbox_id: SandboxId,
     pub binding: Option<ExecutionBinding>,
+    pub rollback_fence: CreateRollbackExecutionFence,
     pub initial_lifecycle: &'static str,
     pub initial_placement: &'static str,
     pub active_node_id: Option<NodeId>,
@@ -2291,6 +2313,16 @@ pub trait SubstrateAdapter: Send + Sync {
     /// This removes substrate-owned runtime state and any substrate-owned
     /// binding/cache rows. The stable sandbox row is deleted by the controller.
     async fn delete_execution(&self, sandbox_id: SandboxId) -> Result<(), SubstrateError>;
+
+    /// Delete only the execution object returned by the create attempt.
+    ///
+    /// Unlike user DELETE, compensation is delayed and must refuse a successor
+    /// that reused the stable sandbox id after the operation was enqueued.
+    async fn delete_created_execution(
+        &self,
+        sandbox_id: SandboxId,
+        fence: &CreateRollbackExecutionFence,
+    ) -> Result<(), SubstrateError>;
 
     /// Retire the active execution object for a sandbox while preserving
     /// node-local sandbox state.
@@ -3448,6 +3480,20 @@ impl SubstrateAdapter for Substrate {
             Self::Direct(substrate) => substrate.delete_execution(sandbox_id).await,
             #[cfg(feature = "kubernetes")]
             Self::Kubernetes(substrate) => substrate.delete_execution(sandbox_id).await,
+        }
+    }
+
+    async fn delete_created_execution(
+        &self,
+        sandbox_id: SandboxId,
+        fence: &CreateRollbackExecutionFence,
+    ) -> Result<(), SubstrateError> {
+        match self {
+            Self::Direct(substrate) => substrate.delete_created_execution(sandbox_id, fence).await,
+            #[cfg(feature = "kubernetes")]
+            Self::Kubernetes(substrate) => {
+                substrate.delete_created_execution(sandbox_id, fence).await
+            }
         }
     }
 

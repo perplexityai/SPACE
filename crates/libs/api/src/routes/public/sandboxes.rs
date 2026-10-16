@@ -846,6 +846,7 @@ async fn enqueue_lifecycle_operation(
         sandbox_id,
         action,
         rollback,
+        create_rollback_fence: None,
     }
     .into_json();
     let result = admission

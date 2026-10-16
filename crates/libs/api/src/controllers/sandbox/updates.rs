@@ -1,12 +1,31 @@
 use super::*;
 use crate::controllers::db_contention_error;
+use crate::controllers::internal_error;
 use crate::controllers::substrate::RuntimeRpcError;
+use crate::controllers::substrate::{
+    CreateExecutionOutcome, CreateRollbackExecutionFence, SubstrateAdapter,
+};
+use crate::public_operation_driver::{
+    OperationExecutionConfig, OperationExecutor, drive_claimed_operation, execution_span,
+};
+use crate::public_operations::{
+    ApiProduct, ClaimedPublicOperation, CreatePublicOperation, CreatePublicOperationResult,
+    PublicOperationStore, claim_created_operation_tx, create_operation_tx,
+};
+use crate::public_sandbox_operations::{
+    SandboxLifecycleOperationExecutor, SandboxLifecycleOperationPayload,
+};
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{ExecutionGeneration, SandboxId};
+use pplx_space_common_core::types::{ExecutionGeneration, OrgId, SandboxId};
 use pplx_space_common_svc::types::ReconcileReason;
 use pplx_space_events::{SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventType};
+use pplx_space_public_api::{
+    OperationKind, OperationTargetType, PublicSandboxId,
+    SandboxLifecycleAction as PublicSandboxLifecycleAction,
+};
 use pplx_space_sandbox_store::{self as sandbox_store, FieldPatch};
 use pplx_space_sbx_mgr_client::proto::access_idle_update::Operation as AccessIdleOperation;
+use tracing::Instrument as _;
 
 /// `UpdateSandboxRequest` has no spelling for "clear this override and
 /// inherit the template default", so an absent field means *unchanged*.
@@ -1032,59 +1051,341 @@ impl SandboxController {
         }))
     }
 
-    pub(super) async fn rollback_created_sandbox(&self, pool: &PgPool, sandbox_id: SandboxId) {
-        // Let the delete complete — it is NOT response-margin-critical: the
-        // binding upstream cut is the node-RPC channel timeout (which bounds the
-        // individual worker stop/delete RPCs), and the ALB idle timeout is far
-        // higher (see `ALB_IDLE_TIMEOUT_SECS`). Cancelling a slow delete would
-        // leak the backing instance (on direct, with no orphan GC, a running VM
-        // invisibly), so the unbounded delete is the safe choice.
-        if let Err(err) = self.substrate.delete_execution(sandbox_id).await {
-            tracing::warn!(
-                sandbox_id = %sandbox_id,
-                error = %err,
-                "failed to delete substrate backing instance during create rollback"
-            );
-        }
-        let cleanup_refs = sandbox_reconcile_cleanup_refs(sandbox_id);
-        match pool.begin().await {
-            Ok(mut tx) => {
-                let result = async {
-                    delete_reconcile_state_for_elements(&mut tx, &cleanup_refs).await?;
-                    sqlx::query("DELETE FROM sandboxes WHERE id = $1")
-                        .bind(sandbox_id.as_uuid())
-                        .execute(&mut *tx)
-                        .await?;
-                    tx.commit().await
+    pub(super) async fn rollback_created_sandbox(
+        &self,
+        pool: &PgPool,
+        outcome: &CreateExecutionOutcome,
+    ) {
+        // Persist delete intent before touching the substrate. Direct VMs have
+        // no orphan-runtime reconciler, and the Kubernetes orphan cleanup
+        // preserves a `creating` execution while its activation lease is live or
+        // it was updated within the create-age threshold. The compensation
+        // operation is therefore the durable retry owner after an RPC error,
+        // request cancellation, or process death.
+        //
+        // The operation is queued already claimed by this request, which runs
+        // the first attempt itself through the driver and executor the
+        // dispatcher uses. So the teardown doesn't wait for a dispatcher, and
+        // it still runs where none is consuming operations
+        // (`SPACE_PUBLIC_OPERATION_DISPATCHER_ENABLED=false`). A failed attempt
+        // is released for the dispatcher to retry, and an attempt whose process
+        // dies leaves its claim to go stale for the dispatcher to reclaim. With
+        // no dispatcher, only the inline attempt runs.
+        let sandbox_id = outcome.sandbox_id;
+        let public_sandbox_id = PublicSandboxId::from_uuid(sandbox_id.as_uuid());
+        let target_id = public_sandbox_id.to_string();
+        let queued = async {
+            let mut tx = pool.begin().await?;
+            let Some((org_id, persisted_fence)) =
+                claim_created_sandbox_for_compensation(&mut tx, outcome).await?
+            else {
+                return Ok(None);
+            };
+            let created = create_operation_tx(
+                &mut tx,
+                CreatePublicOperation {
+                    org_id: OrgId::from_uuid(org_id),
+                    actor_user_id: None,
+                    // `native`: what keeps this away from a controller that
+                    // predates it is the kind, because claims select by kind. A
+                    // new product would not: a pre-upgrade claim query has no
+                    // product filter and aborts its batch on a value it cannot
+                    // decode.
+                    api_product: ApiProduct::Native,
+                    kind: OperationKind::CompensateCreateSandbox,
+                    target_type: Some(OperationTargetType::Sandbox),
+                    target_id: Some(&target_id),
+                    payload_json: SandboxLifecycleOperationPayload {
+                        sandbox_id: public_sandbox_id,
+                        action: PublicSandboxLifecycleAction::Delete,
+                        rollback: None,
+                        create_rollback_fence: Some(persisted_fence),
+                    }
+                    .into_json(),
+                    idempotency: None,
+                    traceparent: crate::public_operations::request_traceparent(),
+                },
+            )
+            .await?;
+            let claimed = match created {
+                CreatePublicOperationResult::Created(operation_id) => {
+                    Some(claim_created_operation_tx(&mut tx, operation_id).await?)
                 }
-                .await;
-                if let Err(err) = result {
-                    tracing::warn!(
+                other => {
+                    tracing::error!(
                         sandbox_id = %sandbox_id,
-                        error = %err,
-                        "failed to clean sandbox reconcile state during create rollback"
+                        outcome = ?other,
+                        "durable create compensation returned an impossible operation result"
                     );
+                    None
                 }
+            };
+            tx.commit().await?;
+            Ok::<_, crate::public_operations::PublicOperationStoreError>(Some(claimed))
+        }
+        .await;
+        match queued {
+            Ok(Some(Some((claim_token, operation)))) => {
+                pplx_space_metrics::operations::created(
+                    ApiProduct::Native.as_str(),
+                    OperationKind::CompensateCreateSandbox.as_str(),
+                    OperationTargetType::Sandbox.as_str(),
+                );
+                pplx_space_metrics::operations::claimed(
+                    ApiProduct::Native.as_str(),
+                    OperationKind::CompensateCreateSandbox.as_str(),
+                );
+                tracing::info!(
+                    sandbox_id = %sandbox_id,
+                    operation_id = %operation.id,
+                    "queued durable create compensation; running its first attempt inline"
+                );
+                self.run_claimed_compensation(pool, claim_token, operation)
+                    .await;
             }
+            Ok(Some(None) | None) => {}
             Err(err) => {
-                tracing::warn!(
+                tracing::error!(
                     sandbox_id = %sandbox_id,
                     error = %err,
-                    "failed to begin sandbox create rollback cleanup transaction"
+                    "failed to queue durable create compensation; falling back \
+                     to an immediate fenced teardown"
                 );
-                if let Err(delete_err) = sqlx::query("DELETE FROM sandboxes WHERE id = $1")
-                    .bind(sandbox_id.as_uuid())
-                    .execute(pool)
+                // **Never return ownership-free.** By here `create_execution` has
+                // succeeded, so a guest is running. In the common failure the
+                // queueing transaction never committed, so the `deleting` write
+                // rolled back with it and no durable operation exists, and nothing
+                // else would pick the guest up: the transient-lifecycle sweeper
+                // answers `AliveOnNode` on a `creating` row with `Defer`, and
+                // `orphaned_sandboxes` scans `managed_by = 'k8s'` only, so a direct
+                // VM has no reconciler at all.
+                //
+                // **A failed `tx.commit()` does not prove the server did not
+                // commit.** A connection reset after the server committed lands
+                // here with the `deleting` write and the queued operation both
+                // durable. The claim below then declines (the row is already
+                // `deleting`), leaving the teardown to the dispatcher.
+                //
+                // So fall back to an immediate, best-effort teardown. Weaker than
+                // the queued operation — a process death mid-call still loses it —
+                // but better than no owner.
+                //
+                // **The fallback claims the row before it touches the substrate**,
+                // with the same claim the queued path makes, in a transaction of
+                // its own: the row lock, the lifecycle check, and the check that
+                // the execution the create recorded is still the active one.
+                // Create compensation owns only a
+                // `creating|created|starting|started|restoring|failed` sandbox; a
+                // `stopped` or `suspended` one belongs to the user, and a
+                // successor that took the row over between the failed transaction
+                // and this one owns it too. A user lifecycle makes the claim
+                // decline, and so does a successor whose receipt or placement
+                // differs from the create's, so the teardown only runs on a row
+                // this claim moved to `deleting`.
+                //
+                // **What the claim still does not rule out.** On the direct
+                // substrate it refuses a successor whose route receipt is present
+                // and different, or whose `active_node_id` moved. A successor
+                // activation on the same node whose receipt has not been persisted
+                // yet presents as an absent receipt with an unchanged
+                // `active_node_id`, which the claim accepts. It narrows the target;
+                // it does not eliminate it.
+                //
+                // If the claim cannot be made, do nothing. A leaked instance is
+                // recoverable by an operator; a deleted sandbox the user still owns
+                // is not.
+                let claimed = async {
+                    let mut tx = pool.begin().await?;
+                    let claimed = claim_created_sandbox_for_compensation(&mut tx, outcome).await?;
+                    tx.commit().await?;
+                    Ok::<_, sqlx::Error>(claimed)
+                }
+                .await;
+                let fence = match claimed {
+                    Ok(Some((_, fence))) => fence,
+                    Ok(None) => {
+                        tracing::warn!(
+                            sandbox_id = %sandbox_id,
+                            "fallback teardown declined: the sandbox is gone, no longer \
+                             in a lifecycle create compensation owns, or backed by another \
+                             execution"
+                        );
+                        return;
+                    }
+                    Err(claim_err) => {
+                        tracing::error!(
+                            sandbox_id = %sandbox_id,
+                            error = %claim_err,
+                            "could not claim the sandbox for a fallback teardown; \
+                             declining to touch the substrate"
+                        );
+                        return;
+                    }
+                };
+                if let Err(delete_err) = self
+                    .delete_created_sandbox_for_rollback(pool, sandbox_id, &fence)
                     .await
                 {
-                    tracing::warn!(
+                    tracing::error!(
                         sandbox_id = %sandbox_id,
                         error = %delete_err,
-                        "best-effort sandbox row cleanup failed after rollback transaction begin failure"
+                        "immediate fenced teardown also failed after the durable \
+                         operation could not be queued; a substrate instance may be \
+                         orphaned"
                     );
                 }
             }
         }
+    }
+
+    /// Run the first attempt of a compensation this request queued claimed,
+    /// in a task of its own so a cancelled request doesn't abandon it midway.
+    /// The request waits for it, as it waited for the teardown before
+    /// compensation was durable.
+    async fn run_claimed_compensation(
+        &self,
+        pool: &PgPool,
+        claim_token: String,
+        operation: ClaimedPublicOperation,
+    ) {
+        let operation_id = operation.id;
+        let span = execution_span(&operation);
+        let executor = SandboxLifecycleOperationExecutor::new(pool.clone(), self.clone());
+        let store = PublicOperationStore::new(pool.clone());
+        let task = tokio::spawn(
+            async move {
+                let execution = {
+                    let operation = operation.clone();
+                    async move { executor.execute(&operation).await.into() }
+                };
+                drive_claimed_operation(
+                    store,
+                    claim_token,
+                    OperationExecutionConfig::default(),
+                    operation,
+                    OperationExecutor::Inline,
+                    execution,
+                )
+                .await
+            }
+            .instrument(span),
+        );
+        match task.await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => tracing::warn!(
+                operation_id = %operation_id,
+                %error,
+                "inline create compensation could not record its outcome; the dispatcher \
+                 reclaims it once its claim is stale"
+            ),
+            Err(error) => tracing::error!(
+                operation_id = %operation_id,
+                %error,
+                "inline create compensation task failed; the dispatcher reclaims it once \
+                 its claim is stale"
+            ),
+        }
+    }
+
+    /// Delete a just-created execution without applying the user-facing
+    /// best-effort DELETE rule. Create compensation cannot retire the only
+    /// durable route to a VM or pod until substrate absence is confirmed.
+    pub(crate) async fn delete_created_sandbox_for_rollback(
+        &self,
+        pool: &PgPool,
+        sandbox_id: SandboxId,
+        fence: &CreateRollbackExecutionFence,
+    ) -> Result<CreateCompensation, ControllerError> {
+        // **Ownership before the teardown, not after it.** Compensation owns a
+        // row it moved to `deleting`, and a row that's gone: the fence names
+        // the execution on its own, and a best-effort user DELETE can retire the
+        // row while the guest still runs. A row in any other lifecycle was taken
+        // over after the compensation was queued, for instance by an action
+        // already in flight whose result overwrote `deleting`. A stop is the dangerous
+        // one: it clears the direct route receipt and leaves `active_node_id`
+        // unchanged, which is exactly the shape the direct fence's
+        // absent-receipt arm proceeds on, so a teardown here would delete the
+        // state the stop retained.
+        //
+        // This is an unlocked read, so it narrows the window rather than
+        // closing it: a result that commits between this read and the node
+        // call, or during the call, still overwrites `deleting`; that
+        // post-result write replaces cross-intent lifecycles in general (see
+        // `lifecycle/characterization_tests.rs`), and the check after the call
+        // then leaves the row and its reconcile state to it.
+        let lifecycle: Option<String> =
+            sqlx::query_scalar(sql!("SELECT lifecycle FROM sandboxes WHERE id = $1"))
+                .bind(sandbox_id.as_uuid())
+                .fetch_optional(pool)
+                .await
+                .map_err(|err| internal_error("failed to read rolled-back sandbox row", err))?;
+        if let Some(lifecycle) = lifecycle
+            .as_deref()
+            .filter(|lifecycle| *lifecycle != "deleting")
+        {
+            tracing::warn!(
+                sandbox_id = %sandbox_id,
+                %lifecycle,
+                "create rollback declined before its teardown: the row left `deleting`, \
+                 so the sandbox belongs to whatever took it over"
+            );
+            return Ok(CreateCompensation::Declined);
+        }
+
+        match self
+            .substrate
+            .delete_created_execution(sandbox_id, fence)
+            .await
+        {
+            Ok(()) | Err(SubstrateError::NotFound { .. }) => {}
+            Err(err) => return Err(ControllerError::from(err)),
+        }
+
+        let cleanup_refs = sandbox_reconcile_cleanup_refs(sandbox_id);
+        let mut tx = pool.begin().await.map_err(|err| {
+            internal_error("failed to begin durable create rollback cleanup", err)
+        })?;
+        // Only the row this compensation claimed: one that left `deleting` was
+        // taken over (an action already in flight can overwrite the lifecycle),
+        // and its reconcile state is still that action's. Decide under the row
+        // lock, before touching either. A row already gone leaves orphaned
+        // reconcile state, which is the compensation's to clear.
+        let lifecycle: Option<String> = sqlx::query_scalar(sql!(
+            "SELECT lifecycle FROM sandboxes WHERE id = $1 FOR UPDATE"
+        ))
+        .bind(sandbox_id.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|err| internal_error("failed to lock rolled-back sandbox row", err))?;
+        if let Some(lifecycle) = lifecycle
+            .as_deref()
+            .filter(|lifecycle| *lifecycle != "deleting")
+        {
+            tracing::warn!(
+                sandbox_id = %sandbox_id,
+                %lifecycle,
+                "create rollback finished its teardown but the row left `deleting`; \
+                 leaving the row and its reconcile state to whatever took it over"
+            );
+            tx.rollback().await.map_err(|err| {
+                internal_error("failed to release rolled-back sandbox row lock", err)
+            })?;
+            return Ok(CreateCompensation::TornDown);
+        }
+        delete_reconcile_state_for_elements(&mut tx, &cleanup_refs)
+            .await
+            .map_err(|err| internal_error("failed to delete sandbox reconcile state", err))?;
+        sqlx::query(sql!(
+            "DELETE FROM sandboxes WHERE id = $1 AND lifecycle = 'deleting'"
+        ))
+        .bind(sandbox_id.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .map_err(|err| internal_error("failed to delete rolled-back sandbox row", err))?;
+        tx.commit().await.map_err(|err| {
+            internal_error("failed to commit durable create rollback cleanup", err)
+        })?;
+        Ok(CreateCompensation::TornDown)
     }
 }
 
@@ -1113,6 +1414,189 @@ fn snapshots_response_json(
         .collect()
 }
 
+/// What [`SandboxController::delete_created_sandbox_for_rollback`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CreateCompensation {
+    /// The execution is confirmed gone.
+    TornDown,
+    /// The row left `deleting` before the teardown started, so the substrate
+    /// was not touched.
+    Declined,
+}
+
+/// Claim a just-created sandbox for create compensation: lock the row, check
+/// that it's still in a lifecycle compensation owns and that the execution the
+/// create recorded is still the active one, then move the row to `deleting`.
+/// Returns the row's org and the fence to persist, or `None` when the row is
+/// gone or something else owns it now. Run inside the caller's transaction, so
+/// a successor that took the row over before the lock was taken, and whose
+/// receipt or placement shows it, makes this decline instead of leaving the
+/// successor in `deleting`. A direct successor on the same node that hasn't
+/// persisted its receipt yet looks like the create's own execution and is
+/// claimed.
+async fn claim_created_sandbox_for_compensation(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    outcome: &CreateExecutionOutcome,
+) -> Result<Option<(Uuid, CreateRollbackExecutionFence)>, sqlx::Error> {
+    let sandbox_id = outcome.sandbox_id;
+    let sandbox: Option<(Uuid, String, String, Option<Uuid>)> = sqlx::query_as(sql!(
+        "SELECT org_id, lifecycle, managed_by, active_node_id
+           FROM sandboxes
+          WHERE id = $1
+          FOR UPDATE"
+    ))
+    .bind(sandbox_id.as_uuid())
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((org_id, lifecycle, managed_by, active_node_id)) = sandbox else {
+        return Ok(None);
+    };
+    if !matches!(
+        lifecycle.as_str(),
+        "creating" | "created" | "starting" | "started" | "restoring" | "failed"
+    ) {
+        tracing::warn!(
+            sandbox_id = %sandbox_id,
+            %lifecycle,
+            "create rollback no longer owns a compensatable lifecycle"
+        );
+        return Ok(None);
+    }
+    let persisted_fence = match &outcome.rollback_fence {
+        CreateRollbackExecutionFence::Direct {
+            node_id,
+            route_identity,
+        } if managed_by == "space" => match route_identity {
+            Some(identity) => {
+                let matches = identity.sandbox_id() == sandbox_id
+                    && identity.current_node_id() == *node_id
+                    && sqlx::query_scalar::<_, bool>(sql!(
+                        "SELECT EXISTS (
+                             SELECT 1
+                               FROM sandbox_direct_route_identities
+                              WHERE sandbox_id = $1
+                                AND route_generation = $2
+                                AND current_node_id = $3
+                                AND substrate_kind = $4
+                                AND execution_generation = $5
+                                AND activation_attempt_id = $6
+                                AND pod_uid IS NOT DISTINCT FROM $7
+                         )"
+                    ))
+                    .bind(sandbox_id.as_uuid())
+                    .bind(identity.route_generation())
+                    .bind(node_id.as_uuid())
+                    .bind(identity.substrate_kind().as_str())
+                    .bind(identity.execution_generation())
+                    .bind(identity.activation_attempt_id().as_uuid())
+                    .bind(identity.pod_uid().map(ToString::to_string))
+                    .fetch_one(&mut **tx)
+                    .await?;
+                matches.then(|| outcome.rollback_fence.clone())
+            }
+            None => {
+                let matches = active_node_id.is_none_or(|active| active == node_id.as_uuid())
+                    && !sqlx::query_scalar::<_, bool>(sql!(
+                        "SELECT EXISTS (
+                             SELECT 1
+                               FROM sandbox_direct_route_identities
+                              WHERE sandbox_id = $1
+                         )"
+                    ))
+                    .bind(sandbox_id.as_uuid())
+                    .fetch_one(&mut **tx)
+                    .await?;
+                matches.then(|| outcome.rollback_fence.clone())
+            }
+        },
+        CreateRollbackExecutionFence::Kubernetes {
+            pod_name,
+            generation,
+            activation_attempt_id,
+            route_activation_id,
+            pod_uid,
+        } if managed_by == "k8s" => {
+            let recorded: Option<(Option<Uuid>, Option<String>)> = sqlx::query_as(sql!(
+                "SELECT activation_attempt_id,
+                        NULLIF(BTRIM(pod_uid), '')
+                   FROM sandbox_k8s_executions
+                  WHERE sandbox_id = $1
+                    AND active
+                    AND generation = $2
+                    AND pod_name = $3
+                    AND route_activation_id = $4
+                  FOR UPDATE"
+            ))
+            .bind(sandbox_id.as_uuid())
+            .bind(*generation)
+            .bind(pod_name.as_str())
+            .bind(*route_activation_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+            let Some((current_attempt, recorded_uid)) = recorded else {
+                return Ok(None);
+            };
+            let attempt_matches = activation_attempt_id.is_none_or(|expected| {
+                current_attempt == Some(expected.as_uuid()) || current_attempt.is_none()
+            });
+            if !attempt_matches {
+                return Ok(None);
+            }
+            let uid_matches = match recorded_uid {
+                Some(recorded_uid) => recorded_uid == pod_uid.as_str(),
+                None => {
+                    sqlx::query(sql!(
+                        "UPDATE sandbox_k8s_executions
+                            SET pod_uid = $5,
+                                updated_at = NOW()
+                          WHERE sandbox_id = $1
+                            AND active
+                            AND generation = $2
+                            AND pod_name = $3
+                            AND route_activation_id = $4
+                            AND NULLIF(BTRIM(pod_uid), '') IS NULL"
+                    ))
+                    .bind(sandbox_id.as_uuid())
+                    .bind(*generation)
+                    .bind(pod_name.as_str())
+                    .bind(*route_activation_id)
+                    .bind(pod_uid.as_str())
+                    .execute(&mut **tx)
+                    .await?
+                    .rows_affected()
+                        == 1
+                }
+            };
+            uid_matches.then(|| CreateRollbackExecutionFence::Kubernetes {
+                pod_name: pod_name.clone(),
+                generation: *generation,
+                activation_attempt_id: current_attempt
+                    .map(pplx_space_common_core::types::SandboxActivationAttemptId::from_uuid),
+                route_activation_id: *route_activation_id,
+                pod_uid: pod_uid.clone(),
+            })
+        }
+        _ => None,
+    };
+    let Some(persisted_fence) = persisted_fence else {
+        tracing::warn!(
+            sandbox_id = %sandbox_id,
+            fence = ?outcome.rollback_fence,
+            "create rollback fence no longer matches the active execution"
+        );
+        return Ok(None);
+    };
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET lifecycle = 'deleting' WHERE id = $1"
+    ))
+    .bind(sandbox_id.as_uuid())
+    .execute(&mut **tx)
+    .await?;
+    Ok(Some((org_id, persisted_fence)))
+}
+
+#[cfg(test)]
+mod compensation_tests;
 #[cfg(test)]
 mod postgres_tests;
 #[cfg(test)]

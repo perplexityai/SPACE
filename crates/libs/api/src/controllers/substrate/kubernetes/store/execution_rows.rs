@@ -206,8 +206,8 @@ impl K8sStore {
         conn: &mut PgConnection,
         sandbox_id: SandboxId,
         node_name: &str,
-    ) -> Result<bool, SubstrateError> {
-        sqlx::query_scalar::<_, bool>(sql!(
+    ) -> Result<ActiveExecutionNodeNameWrite, SubstrateError> {
+        sqlx::query_as::<_, ActiveExecutionNodeNameWrite>(sql!(
             "WITH updated AS (
                 UPDATE sandbox_k8s_executions
                 SET k8s_node_name = $1::TEXT,
@@ -220,7 +220,8 @@ impl K8sStore {
                 SELECT 1
                 FROM sandbox_k8s_executions
                 WHERE sandbox_id = $2 AND active
-             )"
+             ) AS active_execution,
+             EXISTS (SELECT 1 FROM updated) AS node_name_changed"
         ))
         .bind(node_name)
         .bind(sandbox_id)

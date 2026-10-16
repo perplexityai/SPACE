@@ -798,6 +798,7 @@ async fn enqueue_admin_lifecycle_operation(
         sandbox_id: target.public_id,
         action,
         rollback: None,
+        create_rollback_fence: None,
     }
     .into_json();
     let store = PublicOperationStore::new(pool.clone());

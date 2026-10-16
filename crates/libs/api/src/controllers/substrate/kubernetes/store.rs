@@ -11,6 +11,9 @@
 use std::{collections::HashMap, time::Duration};
 
 use super::PodIp;
+use crate::controllers::placement_fence::{
+    Writer, check_placement_fence_for_execution, fence_refusal_message,
+};
 use crate::controllers::substrate::ExecutionIdentity;
 use pplx_space_cluster_pool::WarmPoolStore;
 use pplx_space_common_core::sql;
@@ -88,6 +91,20 @@ pub(super) enum PlacementRetryDisposition {
     /// a retry re-drives that same row and converges. Contention here stays a
     /// retryable 503.
     RetryConverges,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CancelledCreateCleanupClaim {
+    /// The row was a cold create's and is now `deleting`: the claimant owns the
+    /// pod and row teardown.
+    DeleteClaimed,
+    /// The execution is still this attempt's, but the row is a fork restore's
+    /// `restoring`, which a cold-create claim doesn't take over. The ordinary
+    /// claim retirement applies, as it would without the claim.
+    NotCovered,
+    /// The lifecycle or execution moved on from this attempt; whoever moved it
+    /// owns the pod now.
+    NotOwned,
 }
 
 struct CommittedSuspendArtifactRow {
@@ -260,6 +277,12 @@ struct K8sNodeRoleUpsert<'a> {
     role: NodeRole,
     address: Option<&'a str>,
     state: NodeStateWrite,
+}
+
+#[derive(sqlx::FromRow)]
+struct ActiveExecutionNodeNameWrite {
+    active_execution: bool,
+    node_name_changed: bool,
 }
 
 #[derive(sqlx::FromRow)]

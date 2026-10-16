@@ -201,14 +201,70 @@ impl K8sStore {
         )
         .await?;
 
+        // Termination fence. This writer was the one already *ordered* against
+        // the terminate path — the `nodes` upsert above locks the same row — and
+        // the one that never looked at the answer, so a phase write that won the
+        // lock left this transaction free to attach a `started` sandbox to a
+        // `drained` or `terminating` node. Ordering without a check buys nothing.
+        //
+        // It sits after the upsert on purpose: the upsert already holds this
+        // row's lock, so the fence is a read of the committed phase rather than
+        // a second lock acquisition, and it still precedes the `sandboxes` lock
+        // below — the node-then-sandbox order every fenced writer shares.
+        //
+        // The whole transaction rolls back. The retryable error is
+        // load-bearing: the pod may already be running, so a fresh restore must
+        // stay `restoring` until its retry or the existing cleanup machinery
+        // confirms that pod is gone. A terminal conflict would revert the row to
+        // `suspended`, which no pod sweeper owns, and hide the live execution.
+        // Through the shared helper, not `fence_node_for_placement` directly, for
+        // its already-attached carve-out. This writer re-runs over already-placed
+        // rows on every pod watch event, and refusing one of those would make the
+        // caller tear down a live sandbox that some earlier placement legitimately
+        // put there.
+        //
+        // The node name is passed, not just the sandbox id, and that is what
+        // keeps this carve-out sound. A `started` sandbox keeps `active_node_id`
+        // across an execution replacement, so a node-id match alone would read a
+        // *fresh* recovery execution landing on the old node as a re-statement of
+        // a placement that belonged to its predecessor — and because the `UPDATE`
+        // below no-ops when all three columns already match, nothing would
+        // refresh `placement_changed_at` to re-arm the census discount that let
+        // the drain complete in the first place. Requiring the sandbox's active
+        // `sandbox_k8s_executions` row to already name this node distinguishes
+        // the two: a re-fired watch event for the running execution matches, a
+        // replacement does not.
+        //
+        // Note what the carve-out still does *not* promise: the `UPDATE` below
+        // no-ops only when `active_node_id`, `target_node_id` and `placement` all
+        // already match, while the fence's subject is `active_node_id` alone. So a
+        // row whose `active_node_id` matches — with the execution agreeing — takes
+        // the carve-out even though this statement may still set `target_node_id`
+        // and `placement`. The effect is to pin an already-resident sandbox
+        // slightly harder to a node it is already on, not to place a new one.
+        let fence = check_placement_fence_for_execution(
+            &mut tx,
+            node_id,
+            sandbox_id,
+            Writer::PodPlacement,
+            Some(node_name),
+        )
+        .await
+        .db_context("failed to check the pod-placement fence")?;
+        if fence.refuses() {
+            return Err(SubstrateError::restore_in_flight(fence_refusal_message(
+                node_id, fence,
+            )));
+        }
+
         let sandbox_exists =
             Self::lock_sandbox_for_execution_mutation_in(&mut tx, sandbox_id).await?;
         if sandbox_exists {
-            let active_execution = self
+            let execution_node = self
                 .update_active_execution_node_name(&mut tx, sandbox_id, node_name)
                 .await?;
 
-            if active_execution {
+            if execution_node.active_execution {
                 sqlx::query(sql!(
                     "UPDATE sandboxes
                      SET active_node_id = $1,
@@ -217,13 +273,19 @@ impl K8sStore {
                          placement_changed_at = NOW()
                      WHERE id = $2
                        AND (
-                         active_node_id IS DISTINCT FROM $1
+                         $3::BOOL
+                         OR active_node_id IS DISTINCT FROM $1
                          OR target_node_id IS DISTINCT FROM $1
                          OR placement IS DISTINCT FROM 'on_node'
                        )"
                 ))
                 .bind(node_id)
                 .bind(sandbox_id)
+                // A replacement can land on the same node all three placement
+                // columns already name. Refreshing the clock in that case keeps
+                // the node census from treating the new execution as an old,
+                // absent one while drain completion waits on this transaction.
+                .bind(execution_node.node_name_changed)
                 .execute(&mut *tx)
                 .await
                 // Classified like every sibling in this transaction; the

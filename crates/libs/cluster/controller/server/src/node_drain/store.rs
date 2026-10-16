@@ -37,6 +37,7 @@ use pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity;
 use pplx_space_node_api_client::NodeApiClient;
 use sqlx::PgPool;
 
+use pplx_space_common_svc::sql::node_placement_fence::lock_node_for_phase_write;
 use pplx_space_common_svc::sql::sandbox_residency::{
     active_resident_predicate, occupies_node_predicate, resident_lifecycle, resident_lifecycle_strs,
 };
@@ -264,20 +265,10 @@ fn termination_blocking_residents_query(residency: ResidencyEvidence) -> String 
 /// `55P03` on the `?`.
 pub(crate) const DRAIN_COMPLETION_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// True iff `error` is Postgres `55P03` (`lock_not_available`) — the
-/// [`DRAIN_COMPLETION_LOCK_TIMEOUT`] firing rather than a database problem.
-///
-/// Load-bearing for log volume, not just tidiness: without it a node whose
-/// `nodes` row is held by a long transaction produces one
-/// `set_drain_phase failed` WARN every [`super::DEFAULT_TICK`] — ~720 an hour,
-/// in the same channel this reconciler's pacer exists to protect — and it reads
-/// identical to a real outage for anyone alerting on it.
-pub(crate) fn is_lock_timeout(error: &sqlx::Error) -> bool {
-    error
-        .as_database_error()
-        .and_then(|error| error.code())
-        .is_some_and(|code| code == "55P03")
-}
+/// Re-exported so this module's callers keep one import for the pair. The
+/// definition lives beside [`lock_node_for_phase_write`], whose timeout it
+/// classifies — the two are one contract and were previously two copies.
+pub(crate) use pplx_space_common_svc::sql::node_placement_fence::is_lock_timeout;
 
 /// `$1` = node id, `$2` = new phase, `$3` = last error, `$4` = expected phase.
 ///
@@ -3101,14 +3092,17 @@ impl NodeDrainSink for SubstrateSink {
             // is ours that transaction has committed, and the UPDATE below takes
             // a fresh statement snapshot including its rows.
             //
-            // **The lock orders the two transactions; it does not decide the
+            // **The lock orders the two transactions; the fence decides the
             // outcome.** If this write wins the lock instead, its guard sees an
-            // empty node, commits `drained`, and the blocked placement then
-            // attaches a `started` sandbox to a `drained` node —
-            // `persist_pod_node_placement` never re-checks `drain_phase`. So this
-            // halves the window rather than closing it, and the paragraph below
-            // about NULL `active_node_id` is a *second*, independent open case,
-            // not the same one restated.
+            // empty node and commits `drained` — and the blocked placement then
+            // re-reads the row and refuses, because
+            // `persist_pod_node_placement` now checks `drain_phase` under the
+            // lock it already held. Both orders are therefore closed for the
+            // writers the fence covers. The paragraph below about NULL
+            // `active_node_id` is a *second*, independent case, not the same one
+            // restated — and the fence closes that one too, from the other side:
+            // a writer that cannot be seen by any occupancy term can still see
+            // the node's phase.
             //
             // Both routes into `terminating` must guard residency:
             // `mark_terminating_query` and the admin `POST :terminate` driven
@@ -3116,36 +3110,55 @@ impl NodeDrainSink for SubstrateSink {
             // and local snapshots with the same census policy, so a node
             // gaining a resident in either window parks instead of terminating.
             //
-            // **Scoped to that one writer, deliberately narrowly.** There is no
-            // FK from `sandboxes.active_node_id` to `nodes(id)`, so attaching a
-            // sandbox takes no lock on the node row and nothing here can be
-            // inferred from the write alone. The pooled post-wake, post-create
-            // placement, pooled create, and direct-substrate restore writers all
-            // set `active_node_id` without touching `nodes`, and stay
-            // pre-check-only. What normally keeps them off a draining node is
-            // the API drain guard (`drain_phase.is_some()`), which is itself an
-            // unlocked read of this row and carries the same window — so it is
-            // a mitigation, not a closure.
+            // **No longer scoped to that one writer.** There is still no FK from
+            // `sandboxes.active_node_id` to `nodes(id)`, so attaching a sandbox
+            // takes no lock on the node row *by itself* — but every writer that
+            // commits that column and has a production caller now takes one
+            // explicitly, through
+            // `pplx_space_common_svc::sql::node_placement_fence`, at
+            // `FOR KEY SHARE`. (That module's docs name the one dormant
+            // exception and why it needs its own change.) That mode conflicts with this transaction's
+            // `FOR UPDATE` and with nothing else on this row, so the pooled
+            // post-wake, post-create placement, pooled create, and
+            // direct-substrate restore writers are ordered against this write
+            // without paying contention against the heartbeat, the kube
+            // inventory reflector, or each other.
             //
-            // The reverse order is **not** closed, and it does not need a lost
-            // cordon to reach. A pod scheduled before the drain started keeps
-            // running; cordon only stops new scheduling. Until its placement is
-            // persisted the `sandboxes` row carries a NULL `active_node_id` and
-            // no `target_node_id`, so it is invisible to every term of this
-            // gate — the resident scan, this guard, the snapshot blockers, and
-            // the in-flight evacuation set alike. The drain can complete and the
-            // placement then attaches, with the same outcome as above: a park
-            // at both routes into `terminating`, visible to an operator, rather
-            // than a destroyed sandbox.
+            // Which resolves the paragraph above: the loser of the lock race no
+            // longer commits blindly. If this write wins, the blocked placement
+            // re-reads the row, sees `drained`, and abandons its `active_node_id`
+            // write rather than attaching a `started` sandbox to a node nothing
+            // will schedule to. The API drain guard (`drain_phase.is_some()`)
+            // remains an unlocked read taken at admission — still a mitigation,
+            // not the closure; the fence is the closure.
             //
-            // That sequence predates this guard (the attach lands as `started`,
-            // which the terminator's resident guard has always refused), and
-            // closing it belongs to whichever writer can see a scheduled-but-
-            // unattached pod. Counting `sandbox_k8s_executions` here is the
-            // obvious move and the wrong one: historical execution rows can
-            // outnumber real residents and hold drains open indefinitely.
-            // Re-checking `drain_phase` in the attach path instead strands a
-            // running pod with no sandbox row. Both need a separate design.
+            // **The reverse order is closed by the fence, not by this gate.** A
+            // pod scheduled before the drain started keeps running — cordon only
+            // stops new scheduling — and until its placement is persisted the
+            // `sandboxes` row carries a NULL `active_node_id` and no
+            // `target_node_id`, so it is invisible to every term of this gate:
+            // the resident scan, this guard, the snapshot blockers, and the
+            // in-flight evacuation set alike. No occupancy term can be made to
+            // see it. The drain therefore still completes.
+            //
+            // What changed is what happens next. The fence does not ask "is
+            // anything here"; it asks "is this node still placeable", so a writer
+            // invisible to every count still reads the phase this write
+            // committed, and refuses. The pod is lost either way — it is on that
+            // node — but the row does not end up calling it a healthy sandbox on
+            // an instance that is about to stop existing, and the writer's own
+            // teardown runs.
+            //
+            // Which is why the two options this comment used to reject stayed
+            // rejected. Counting `sandbox_k8s_executions` as a gate term is still
+            // wrong: historical execution rows can outnumber real residents, so
+            // the term would hold drains open indefinitely. And "re-check `drain_phase` in the attach path" is
+            // *not* what the fence does, despite reading like it: it re-checks in
+            // the transaction that **persists the placement**, which is a
+            // different statement from the one that admits the pod, and the
+            // refusal fails an operation whose caller tears the pod down rather
+            // than leaving a running pod with no sandbox row.
+            //
             // Two costs, and the second is not what the previous shape had.
             //
             // *Waiting*: bounded by the `lock_timeout` set below. `run_tick`
@@ -3165,18 +3178,13 @@ impl NodeDrainSink for SubstrateSink {
             // and once per node at drain completion, so tens to low hundreds of
             // milliseconds rather than seconds — but not one round trip.
             let mut tx = self.pool.begin().await?;
-            // Transaction-local bound on the lock wait, from a typed value
-            // ([`DRAIN_COMPLETION_LOCK_TIMEOUT`]) rather than a SQL literal.
-            // `sandbox_delete`'s bounded lock is the pattern, and its contract is
-            // two halves — bound the wait *and* classify the resulting `55P03` as
-            // retryable. The caller does the second via [`is_lock_timeout`].
-            sqlx::query(sql!("SELECT set_config('lock_timeout', $1, TRUE)"))
-                .bind(DRAIN_COMPLETION_LOCK_TIMEOUT.as_millis().to_string())
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query(sql!("SELECT 1 FROM nodes WHERE id = $1 FOR UPDATE"))
-                .bind(node_id)
-                .execute(&mut *tx)
+            // The shared terminate-half preamble: a transaction-local bound on
+            // the lock wait plus the `FOR UPDATE` in its own statement. Both
+            // halves of its contract — bound the wait, and classify the resulting
+            // `55P03` as retryable — are documented on
+            // [`lock_node_for_phase_write`]; the caller does the second via
+            // [`is_lock_timeout`].
+            lock_node_for_phase_write(&mut tx, node_id.as_uuid(), DRAIN_COMPLETION_LOCK_TIMEOUT)
                 .await?;
             let result = sqlx::query(sqlx::AssertSqlSafe(sql!(query.as_str())))
                 .bind(node_id)
@@ -3514,3 +3522,9 @@ mod residency_tests;
 /// each answers something plausible.
 #[cfg(test)]
 mod termination_gate_tests;
+
+/// Postgres-backed coverage for the termination fence: the `nodes` row lock that
+/// orders a placement writer against the provider-terminate path, driven as two
+/// real concurrent transactions in both interleavings.
+#[cfg(test)]
+mod placement_fence_tests;

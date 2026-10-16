@@ -1,6 +1,7 @@
 use pplx_space_common_core::types::{OrgId, SandboxId, UserId};
 
 use super::*;
+use crate::controllers::placement_fence::{Writer, check_placement_fence, fence_refusal_message};
 use crate::controllers::substrate::{
     AdmissionPoolClaim, AdmittedPoolClaim, AdmittedPoolClaimLookup, CreateBootMode,
     PooledClaimRefusal, PooledExecutionClaim, PooledExecutionClaimRequest,
@@ -13,6 +14,7 @@ use pplx_space_cluster_pool::WarmPoolStore;
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{DiskIoLimits, NodeId};
 use pplx_space_common_svc::space_api_route::wait_ready_lifecycle_request;
+use pplx_space_common_svc::sql::node_placement_fence::PlacementFence;
 use pplx_space_common_svc::types::ReconcileReason;
 use pplx_space_events::{
     CreateShapeSource, SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger,
@@ -46,6 +48,149 @@ const POOLED_PREPARE_RECLAIMABLE_ERROR_FRAGMENTS: &[&str] = &[
     "transport is closing",
 ];
 
+/// What [`finalize_created_sandbox`] did.
+///
+/// Three outcomes rather than a `bool` because the two failures want different
+/// words at the call site: a lost CAS means another supervisor owns the row, and
+/// a fenced node means the placement itself must not be recorded. Both roll the
+/// create back, and reporting them as one would put the CAS message —
+/// "abandoned while in flight (node likely draining)" — on an event whose cause
+/// is known exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalizeOutcome {
+    Finalized,
+    /// The lifecycle CAS matched no row.
+    CasLost,
+    /// The termination fence refused the node this create landed on.
+    Fenced(PlacementFence),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubstrateCreateFailureDisposition {
+    Deleted,
+    RetainedForRetry,
+}
+
+async fn clean_up_substrate_create_failure(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+    error: &SubstrateError,
+) -> Result<SubstrateCreateFailureDisposition, sqlx::Error> {
+    // `RestoreInFlight` usually means substrate work still owns convergence. On
+    // the Kubernetes pod-placement fence path an armed `CancelGuard` that
+    // recorded durable delete intent UID-deletes the pod before retiring the
+    // exact execution, then conditionally removes the never-succeeded parent. Deleting the sandbox here would
+    // cascade that ownership record before the guard can lock it, leaving the
+    // pod live and untracked. An ordinary restore collision retains its parent
+    // for retry; an ownerless joined create remains visible to reconciliation.
+    if matches!(error, SubstrateError::RestoreInFlight { .. }) {
+        // Unless the row is already claimed for deletion — by the cancel guard
+        // or a concurrent delete: it is retained only until that cleanup
+        // removes it, so the caller must not be told to retry this sandbox.
+        //
+        // The lifecycle is read in the statement that takes the row lock, so a
+        // delete committing while this waits is seen: a plain read before the
+        // lock would decide on the pre-delete lifecycle. The same lock also
+        // serves the shell delete below. Execution creation takes this row lock,
+        // and a `NOT EXISTS` folded into a `DELETE` that waited on it would be
+        // evaluated against the pre-wait snapshot, so it could miss an execution
+        // committed during the wait and cascade it away; the `DELETE` runs as a
+        // later statement instead.
+        let mut tx = pool.begin().await?;
+        let lifecycle: Option<String> = sqlx::query_scalar(sql!(
+            "SELECT lifecycle FROM sandboxes WHERE id = $1 FOR UPDATE"
+        ))
+        .bind(sandbox_id.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await?;
+        match lifecycle.as_deref() {
+            Some("deleting") | None => {
+                tx.commit().await?;
+                return Ok(SubstrateCreateFailureDisposition::Deleted);
+            }
+            Some("creating" | "restoring") => {}
+            Some(_) => {
+                tx.commit().await?;
+                return Ok(SubstrateCreateFailureDisposition::RetainedForRetry);
+            }
+        }
+        // A create whose substrate already let go of it. The readiness wait
+        // deletes the pod and forgets the tracking itself before returning a
+        // fence refusal, so no active execution is left for a retry to converge,
+        // and a fork's executor would wait on a `restoring` row rather than
+        // re-create it. Delete the shell, as for any other failed create; a row
+        // that still has an active execution belongs to substrate work and stays.
+        //
+        // A fork restore refused at placement doesn't race this: its claim
+        // answers `NotCovered`, and the adapter runs the ordinary cleanup inline
+        // (`CancelGuard::release_now`) before returning, so the execution is
+        // normally retired when this looks. An active execution remains, and
+        // the row is kept, in three cases:
+        //
+        // * the pod had no UID: the claim then answers `NotOwned`, not
+        //   `NotCovered` (`kubernetes/support.rs:1177`), so `release_now` never
+        //   runs, and the guard's `Drop` task leaves the pod to reconciliation
+        //   (`kubernetes/support.rs:1364`);
+        // * the retirement's own write failed (`kubernetes/support.rs:1533`, in
+        //   `release_claim_with_pod`);
+        // * the retirement's generation-and-attempt fence lost to a newer
+        //   execution, which is then the active one (`kubernetes/support.rs:1538`,
+        //   same function).
+        //
+        // The joined-redrive path has no guard and keeps its row with an active
+        // execution.
+        //
+        // Only on Kubernetes: a direct row has no execution rows, so their
+        // absence proves nothing there.
+        let deleted = sqlx::query(sql!(
+            "DELETE FROM sandboxes s
+              WHERE s.id = $1
+                AND s.lifecycle IN ('creating', 'restoring')
+                AND s.managed_by = 'k8s'
+                AND NOT EXISTS (
+                    SELECT 1 FROM sandbox_k8s_executions e
+                     WHERE e.sandbox_id = s.id AND e.active
+                )"
+        ))
+        .bind(sandbox_id.as_uuid())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        return Ok(if deleted.rows_affected() > 0 {
+            SubstrateCreateFailureDisposition::Deleted
+        } else {
+            SubstrateCreateFailureDisposition::RetainedForRetry
+        });
+    }
+    // Every other error leaves the row alone once it is `deleting`. A Kubernetes
+    // create whose placement failed after its pod existed has already recorded
+    // durable delete intent (`CancelGuard::establish_durable_cleanup`), and the
+    // guard's cleanup deletes the row after its pod delete. Deleting it here first
+    // would cascade the execution record that cleanup claims ownership through,
+    // and the pod would be left live with nothing tracking it — whichever error
+    // the placement failed with.
+    sqlx::query(sql!(
+        "DELETE FROM sandboxes WHERE id = $1 AND lifecycle <> 'deleting'"
+    ))
+    .bind(sandbox_id.as_uuid())
+    .execute(pool)
+    .await?;
+    Ok(SubstrateCreateFailureDisposition::Deleted)
+}
+
+#[cfg(test)]
+impl FinalizeOutcome {
+    /// True only for [`Self::Finalized`], so a test cannot spell "succeeded" as
+    /// "not `CasLost`" and pass on a fenced create.
+    ///
+    /// Test-only on purpose: production matches all three variants exhaustively,
+    /// which is what makes adding a fourth outcome a compile error at the call
+    /// site rather than a silently-mishandled one.
+    const fn is_finalized(self) -> bool {
+        matches!(self, Self::Finalized)
+    }
+}
+
 async fn finalize_created_sandbox(
     pool: &PgPool,
     sandbox_id: SandboxId,
@@ -54,7 +199,35 @@ async fn finalize_created_sandbox(
     active_node_id: Option<NodeId>,
     command_ready: bool,
     restore_operation_id: Option<OperationId>,
-) -> Result<bool, sqlx::Error> {
+) -> Result<FinalizeOutcome, sqlx::Error> {
+    // Termination fence. This writer is easy to miss and was: the
+    // placement-only `UPDATE` further down `create_sandbox` is the obvious one,
+    // but on the **restore** path (`restore_operation_id.is_some()`) that update
+    // is skipped, leaving this statement as the only controller-level write of
+    // `active_node_id`. So the fence has to be here too, and in the same
+    // transaction as the write. (On the Kubernetes substrate the column is also
+    // written earlier by `persist_pod_node_placement`, off the pod-IP watch —
+    // separately fenced, and not a substitute for this one, which is the write
+    // the direct substrate's restore actually goes through.)
+    //
+    // The transaction is opened unconditionally, which costs a BEGIN and a COMMIT
+    // on the terminal-finalize path (`lifecycle = 'failed'`, no node) that has
+    // nothing to lock. That was measured and then deliberately kept: avoiding it
+    // means extracting the `UPDATE` into its own executor-generic function so the
+    // node-less path can run it on the pool — which moves the write out of the
+    // function that fences it. The fence and the write being visibly adjacent is
+    // what makes this auditable and what
+    // `scripts/source_guards/placement_fence_writers.py` checks, and the path in
+    // question is a failed restore, not a hot one. Two round trips is the right
+    // price for that.
+    let mut tx = pool.begin().await?;
+    if let Some(node_id) = active_node_id {
+        let fence =
+            check_placement_fence(&mut tx, node_id, sandbox_id, Writer::CreateFinalize).await?;
+        if fence.refuses() {
+            return Ok(FinalizeOutcome::Fenced(fence));
+        }
+    }
     let result = sqlx::query(sql!(
         "UPDATE sandboxes
          SET lifecycle = CASE
@@ -123,10 +296,15 @@ async fn finalize_created_sandbox(
     .bind(sandbox_id.as_uuid())
     .bind(!command_ready)
     .bind(restore_operation_id.map(|operation_id| operation_id.as_uuid()))
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
 
-    Ok(result.rows_affected() == 1)
+    Ok(if result.rows_affected() == 1 {
+        FinalizeOutcome::Finalized
+    } else {
+        FinalizeOutcome::CasLost
+    })
 }
 
 struct PooledCreateInput<'a> {
@@ -1539,35 +1717,36 @@ impl SandboxController {
                     SandboxEventType::CreateFailed,
                     create_event_details().error(err.to_string()),
                 );
-                let row_removal_confirmed = match sqlx::query("DELETE FROM sandboxes WHERE id = $1")
-                    .bind(sandbox_uuid)
-                    .execute(pool)
-                    .await
-                {
-                    Ok(_) => true,
-                    Err(delete_err) => {
-                        tracing::warn!(
-                            sandbox_id = %sandbox_id,
-                            error = %delete_err,
-                            "failed to delete sandbox row after substrate create failure"
-                        );
-                        false
-                    }
-                };
-                // With the row gone, this create did NOT leave node work
-                // converging (a timeout here failed the substrate's preserve
-                // check, e.g. the pod never scheduled), so strip any retry
-                // marker — ECW/native clients must not retry/resume a deleted
-                // sandbox. When the delete itself failed the row survives in
-                // `creating`, and stripping the marker is not enough: it leaves
-                // `kind` set, which the surface translators rebuild a retryable
-                // answer from. Demote instead, so a `create` retry cannot add a
-                // second row alongside the one still awaiting the sweeper.
+                let disposition =
+                    match clean_up_substrate_create_failure(pool, sandbox_id, &err).await {
+                        Ok(disposition) => Some(disposition),
+                        Err(delete_err) => {
+                            tracing::warn!(
+                                sandbox_id = %sandbox_id,
+                                error = %delete_err,
+                                "failed to delete sandbox row after substrate create failure"
+                            );
+                            None
+                        }
+                    };
                 let surfaced = ControllerError::from(err);
-                return Err(if row_removal_confirmed {
-                    surfaced.without_retry_after()
-                } else {
-                    surfaced.demoted_after_side_effect()
+                return Err(match disposition {
+                    Some(SubstrateCreateFailureDisposition::RetainedForRetry) => surfaced,
+                    // With the row gone, this create did NOT leave node work
+                    // converging (a timeout here failed the substrate's
+                    // preserve check, e.g. the pod never scheduled), so strip
+                    // any retry marker — ECW/native clients must not
+                    // retry/resume a deleted sandbox.
+                    Some(SubstrateCreateFailureDisposition::Deleted) => {
+                        surfaced.without_retry_after()
+                    }
+                    // When the delete itself failed the row survives in
+                    // `creating`, and stripping the marker is not enough: it
+                    // leaves `kind` set, which the surface translators rebuild a
+                    // retryable answer from. Demote instead, so a `create` retry
+                    // cannot add a second row alongside the one still awaiting
+                    // the sweeper.
+                    None => surfaced.demoted_after_side_effect(),
                 });
             }
         };
@@ -1579,25 +1758,79 @@ impl SandboxController {
         if restore_operation_id.is_none()
             && let Some(active_node_id) = outcome.active_node_id
         {
-            sqlx::query(sql!(
-                "UPDATE sandboxes
-                 SET active_node_id = $1,
-                     placement_changed_at = NOW()
-                 WHERE id = $2"
-            ))
-            .bind(active_node_id)
-            .bind(outcome_sandbox_uuid)
-            .execute(pool)
-            .await
-            .map_err(|err| {
-                // Not classified, deliberately: the sandbox is already
-                // started. `create` mints a fresh `SandboxId::new()` per
-                // request with no idempotency key, so telling the caller to
-                // retry provisions a *second* sandbox while this one stays
-                // live and unknown to them. A 500 is the correct answer after
-                // irreversible work — see `db_contention_error`'s exception.
-                internal_error("Sandbox started but DB placement update failed", err)
-            })?;
+            // Termination fence. This write used to run straight against the
+            // pool, which made it one of the writers that touched `nodes` not at
+            // all and so could not be ordered against the provider-terminate
+            // path. It runs in a transaction now purely so the fence's row lock
+            // is still held when the `UPDATE` commits.
+            //
+            // **A refusal has to tear the sandbox down, not just decline the
+            // write.** By here the substrate create has *succeeded* and a guest
+            // is running on the node. Returning an error while leaving the row
+            // would strand a sandbox whose `active_node_id` is NULL against a
+            // running pod — the state that is invisible to every term of the
+            // drain gate. So `rollback_created_sandbox` deletes the execution and
+            // the row, and the client is told to retry onto a node that is not
+            // leaving. `finalize_created_sandbox` below reaches the same rollback
+            // for the same reason; the pooled create is the one that can simply
+            // roll its transaction back, because nothing has been recorded yet.
+            let fenced = async {
+                let mut tx = pool.begin().await?;
+                let fence = check_placement_fence(
+                    &mut tx,
+                    active_node_id,
+                    outcome.sandbox_id,
+                    Writer::PostCreatePlacement,
+                )
+                .await?;
+                if fence.refuses() {
+                    return Ok(Some(fence));
+                }
+                sqlx::query(sql!(
+                    "UPDATE sandboxes
+                     SET active_node_id = $1,
+                         placement_changed_at = NOW()
+                     WHERE id = $2"
+                ))
+                .bind(active_node_id)
+                .bind(outcome_sandbox_uuid)
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                Ok::<_, sqlx::Error>(None)
+            }
+            .await;
+            // **An error here needs the same teardown as a refusal.** By this
+            // point the substrate create has succeeded and a guest is running on
+            // the node; returning the error straight up leaves that guest with a
+            // sandbox row that records no node — the state invisible to every
+            // term of the drain gate. The refusal path below always rolled back,
+            // but the error path reached the `?` first, and the fence's added
+            // transaction gave it new ways to fail (a `55P03` on the row lock, a
+            // cancelled wait).
+            let fenced = match fenced {
+                Ok(fenced) => fenced,
+                Err(err) => {
+                    let message = "Sandbox started but DB placement update failed";
+                    emit_create_sandbox_event(
+                        outcome.sandbox_id,
+                        SandboxEventType::CreateFailed,
+                        create_event_details().error(format!("{message}: {err}")),
+                    );
+                    self.rollback_created_sandbox(pool, &outcome).await;
+                    return Err(internal_error(message, err));
+                }
+            };
+            if let Some(fence) = fenced {
+                let message = fence_refusal_message(active_node_id, fence);
+                emit_create_sandbox_event(
+                    outcome.sandbox_id,
+                    SandboxEventType::CreateFailed,
+                    create_event_details().error(message.clone()),
+                );
+                self.rollback_created_sandbox(pool, &outcome).await;
+                return Err(ControllerError::service_unavailable(message));
+            }
         }
 
         // A budget-exhausted slow create is preserved before the guest is
@@ -1623,8 +1856,7 @@ impl SandboxController {
                      could be enabled",
                 ),
             );
-            self.rollback_created_sandbox(pool, outcome.sandbox_id)
-                .await;
+            self.rollback_created_sandbox(pool, &outcome).await;
             return Err(ControllerError::service_unavailable(
                 "sandbox create exceeded its readiness budget before file-change tracking \
                  could be enabled; retry",
@@ -1687,8 +1919,7 @@ impl SandboxController {
                         SandboxEventType::CreateFailed,
                         create_event_details().error(err.to_string()),
                     );
-                    self.rollback_created_sandbox(pool, outcome.sandbox_id)
-                        .await;
+                    self.rollback_created_sandbox(pool, &outcome).await;
                     // Rolled back (sandbox deleted) — never hand the client a
                     // "retry the same sandbox" marker for a sandbox that's gone.
                     return Err(err.without_retry_after());
@@ -1706,8 +1937,7 @@ impl SandboxController {
                     SandboxEventType::CreateFailed,
                     create_event_details().error(err.to_string()),
                 );
-                self.rollback_created_sandbox(pool, outcome.sandbox_id)
-                    .await;
+                self.rollback_created_sandbox(pool, &outcome).await;
                 return Err(ControllerError::internal(format!(
                     "sandbox file-change tracking could not wait for readiness: {err}"
                 )));
@@ -1731,8 +1961,7 @@ impl SandboxController {
                     SandboxEventType::CreateFailed,
                     create_event_details().error(err.to_string()),
                 );
-                self.rollback_created_sandbox(pool, outcome.sandbox_id)
-                    .await;
+                self.rollback_created_sandbox(pool, &outcome).await;
                 return Err(ControllerError::internal(format!(
                     "sandbox file-change tracking could not be enabled: {err}"
                 )));
@@ -1750,7 +1979,7 @@ impl SandboxController {
         // slow create (`command_ready == false`). The access path confirms and
         // clears it on first use; until then data-plane ops get the
         // SDK-recoverable `sandbox_timeout`.
-        let finalized = finalize_created_sandbox(
+        let finalized = match finalize_created_sandbox(
             pool,
             outcome.sandbox_id,
             lifecycle,
@@ -1760,28 +1989,69 @@ impl SandboxController {
             restore_operation_id,
         )
         .await
-        // Not classified: post-side-effect, as above.
-        .map_err(|err| internal_error("Sandbox started but DB update failed", err))?;
+        {
+            Ok(finalized) => finalized,
+            // Same reasoning as the placement update above: the guest is running
+            // by now, so an error has to tear it down rather than leave it with a
+            // row that records no node. `finalize_created_sandbox` became
+            // transactional to hold the fence's row lock, which added `55P03` and
+            // cancelled-wait to the ways this can fail.
+            Err(err) => {
+                let message = "Sandbox started but DB update failed";
+                emit_create_sandbox_event(
+                    outcome.sandbox_id,
+                    SandboxEventType::CreateFailed,
+                    create_event_details().error(format!("{message}: {err}")),
+                );
+                self.rollback_created_sandbox(pool, &outcome).await;
+                return Err(internal_error(message, err));
+            }
+        };
 
-        if !finalized {
-            tracing::warn!(
-                sandbox_id = %outcome.sandbox_id,
-                "sandbox create lost the lifecycle CAS — the drain abandon-stuck-creating \
-                 sweep (or another supervisor) flipped the row out of 'creating' while \
-                 this create was in flight; rolling back substrate-side state"
-            );
-            emit_create_sandbox_event(
-                outcome.sandbox_id,
-                SandboxEventType::CreateFailed,
-                create_event_details()
-                    .error("lifecycle CAS lost during create")
-                    .logged_by_caller(),
-            );
-            self.rollback_created_sandbox(pool, outcome.sandbox_id)
-                .await;
-            return Err(ControllerError::service_unavailable(
-                "sandbox create was abandoned while in flight (node likely draining); retry",
-            ));
+        // Both failures land on the same rollback and the same retryable 503, and
+        // differ only in what they say — see [`FinalizeOutcome`]. The fenced arm
+        // is not reachable through the placement update above on the restore
+        // path, which skips it, so this is the fence for that path.
+        match finalized {
+            FinalizeOutcome::Finalized => {}
+            FinalizeOutcome::CasLost => {
+                tracing::warn!(
+                    sandbox_id = %outcome.sandbox_id,
+                    "sandbox create lost the lifecycle CAS — the drain abandon-stuck-creating \
+                     sweep (or another supervisor) flipped the row out of 'creating' while \
+                     this create was in flight; rolling back substrate-side state"
+                );
+                emit_create_sandbox_event(
+                    outcome.sandbox_id,
+                    SandboxEventType::CreateFailed,
+                    create_event_details()
+                        .error("lifecycle CAS lost during create")
+                        .logged_by_caller(),
+                );
+                self.rollback_created_sandbox(pool, &outcome).await;
+                return Err(ControllerError::service_unavailable(
+                    "sandbox create was abandoned while in flight (node likely draining); retry",
+                ));
+            }
+            FinalizeOutcome::Fenced(fence) => {
+                let message = outcome
+                    .active_node_id
+                    .map(|node_id| fence_refusal_message(node_id, fence))
+                    .unwrap_or_else(|| {
+                        // Unreachable: the fence is only consulted when there is
+                        // a node. Kept as a message rather than an `expect` so a
+                        // future refactor that widens the fence degrades into a
+                        // vaguer error instead of panicking on the create path.
+                        "the node this sandbox landed on is leaving the fleet; retry".to_string()
+                    });
+                emit_create_sandbox_event(
+                    outcome.sandbox_id,
+                    SandboxEventType::CreateFailed,
+                    create_event_details().error(message.clone()),
+                );
+                self.rollback_created_sandbox(pool, &outcome).await;
+                return Err(ControllerError::service_unavailable(message));
+            }
         }
 
         // The substrate's readiness return precedes lifecycle publication.
@@ -2279,8 +2549,43 @@ impl SandboxController {
             }
 
             let sandbox = if input.req.wait_until_ready {
-                update_and_fetch_post_wake_sandbox(input.pool, sandbox_uuid, claim.active_node_id)
-                    .await?
+                // The claim is committed and the guest prepared by now, so a
+                // failure here has to hand the warm slot back and drop the row —
+                // the same cleanup a prepare failure gets. Before the fence this
+                // call could only fail on the lifecycle CAS; it can now also
+                // refuse (the node started leaving) or error on the row lock, and
+                // propagating either straight up left the slot adopted and the
+                // sandbox row behind after the request had already failed.
+                match post_wake_update(input.pool, sandbox_uuid, claim.active_node_id).await {
+                    Ok(PostWakeUpdate::Updated(sandbox)) => *sandbox,
+                    // Another supervisor owns the row now; rolling it back would
+                    // delete their sandbox.
+                    Ok(PostWakeUpdate::LifecycleCasLost) => return Err(post_wake_cas_lost()),
+                    Err(error) => {
+                        // Same mapping as this path's prepare-failure arm: only a
+                        // `FinalizeSandboxDbDelete` cleanup counts as releasing the claim.
+                        let released = match Self::rollback_failed_pooled_create_with_substrate(
+                            substrate, input.pool, &claim,
+                        )
+                        .await
+                        {
+                            Ok(cleanup) => {
+                                cleanup == PooledPrepareFailureCleanup::FinalizeSandboxDbDelete
+                            }
+                            Err(rollback_error) => {
+                                tracing::warn!(
+                                    sandbox_id = %claim.sandbox_id,
+                                    claim_id = %claim.claim_id,
+                                    error = %error,
+                                    %rollback_error,
+                                    "pooled post-wake failed and its claim rollback also failed"
+                                );
+                                false
+                            }
+                        };
+                        return Err(pooled_create_terminal_error(error, released));
+                    }
+                }
             } else {
                 fetch_sandbox(input.pool, sandbox_uuid)
                     .await
@@ -2549,9 +2854,39 @@ impl SandboxController {
             }
         };
 
-        let sandbox =
-            update_and_fetch_post_wake_sandbox(input.pool, sandbox_uuid, claim.active_node_id)
-                .await?;
+        // Same cleanup as `try_create_from_pool_with_substrate`'s post-wake: the
+        // slot is claimed and the guest prepared, and the fence can now refuse
+        // or error on the node-row lock here, so a failure has to hand the slot
+        // back and drop the row rather than leave both behind.
+        let sandbox = match post_wake_update(input.pool, sandbox_uuid, claim.active_node_id).await {
+            Ok(PostWakeUpdate::Updated(sandbox)) => *sandbox,
+            // Another supervisor owns the row now; rolling it back would delete
+            // their sandbox.
+            Ok(PostWakeUpdate::LifecycleCasLost) => return Err(post_wake_cas_lost()),
+            Err(error) => {
+                // Same mapping as this path's prepare failure: a completed rollback
+                // either removed the row or left it to the pool's cleanup, so the
+                // retry builds cold once the slot is released; a failed rollback
+                // may leave the claim live, so stop here.
+                return match Self::rollback_failed_pooled_create_with_substrate(
+                    substrate, input.pool, &claim,
+                )
+                .await
+                {
+                    Ok(_) => Err(admitted_pool_slot_release_pending()),
+                    Err(rollback_error) => {
+                        tracing::warn!(
+                            sandbox_id = %claim.sandbox_id,
+                            claim_id = %claim.claim_id,
+                            error = %error,
+                            %rollback_error,
+                            "admitted pooled post-wake failed and its claim rollback also failed"
+                        );
+                        Err(pooled_create_terminal_error(error, false))
+                    }
+                };
+            }
+        };
         emit_create_sandbox_event(
             sandbox.id,
             SandboxEventType::CreateCompleted,
@@ -2813,6 +3148,35 @@ async fn insert_pooled_sandbox(
     claim: &PooledExecutionClaim,
     managed_by: &str,
 ) -> Result<SandboxId, ControllerError> {
+    // Termination fence: the first statement of the transaction whose `INSERT`
+    // below commits `active_node_id`, so the lock it takes is held for that
+    // write. Taken here rather than after the insert because a lock acquired
+    // once the row is already written orders nothing.
+    //
+    // Of the six fenced writers this is the cleanest refusal. Nothing has been
+    // recorded yet, so the error rolls the whole transaction back, and
+    // `rollback_pooled_execution_claim` at the call site hands the warm slot
+    // back — the claimed pod is on a node that is about to stop existing, and
+    // releasing the slot is the only useful thing left to do with it. 503 rather
+    // than 409: the client's create is fine, this node is not, and a retry gets
+    // a different one.
+    //
+    // A claim with no node attaches nothing, so there is nothing to order.
+    if let Some(node_id) = claim.active_node_id {
+        let fence = check_placement_fence(tx, node_id, claim.sandbox_id, Writer::PooledCreate)
+            .await
+            .map_err(|err| {
+                ControllerError::internal(format!(
+                    "failed to check the pooled-create placement fence: {err}"
+                ))
+            })?;
+        if fence.refuses() {
+            return Err(ControllerError::service_unavailable(fence_refusal_message(
+                node_id, fence,
+            )));
+        }
+    }
+
     let vcpu_i32 = claim.vcpu.map(i32::try_from).transpose().map_err(|err| {
         ControllerError::bad_request(format!("vcpu is too large for pool: {err}"))
     })?;
@@ -2997,6 +3361,8 @@ async fn enqueue_pooled_network_policy_reconcile_if_needed(
 mod create_env_tests;
 #[cfg(test)]
 mod create_postgres_tests;
+#[cfg(test)]
+mod placement_fence_tests;
 #[cfg(test)]
 mod pooled_create_fallback_tests;
 #[cfg(test)]
