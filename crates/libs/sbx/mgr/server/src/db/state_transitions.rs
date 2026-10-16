@@ -276,7 +276,7 @@ pub(crate) fn begin_activation_with_route_evidence(
         tx.commit()?;
         return Ok(None);
     }
-    if let Some(rolled_back) = rolled_back_activation_attempt(
+    if let Some(refusal) = retired_activation(
         &tx,
         id,
         expected_state,
@@ -287,17 +287,7 @@ pub(crate) fn begin_activation_with_route_evidence(
         // Leave the row, its rollback receipt and its artifact pin untouched:
         // a late request for a retired attempt must not revive that execution.
         tx.commit()?;
-        return Err(rolled_back);
-    }
-    if let Some(execution_generation) = execution_generation
-        && super::execution_delete_receipt_covers(&tx, id, execution_generation)?
-    {
-        // The row was rebuilt after a delete or eviction, which drops any
-        // rollback receipt. The delete receipt keeps the generation fence.
-        tx.commit()?;
-        return Err(BeginActivationError::RetiredGeneration {
-            execution_generation,
-        });
+        return Err(refusal);
     }
     let keep_filesystem = true;
     // Only activation authorizes node allocation. Filesystem-only staging keeps
@@ -422,6 +412,44 @@ pub(crate) fn begin_activation_with_route_evidence(
 /// Returns the refusal for an activation that repeats the exact
 /// generation/activation attempt a completed activation rollback retired.
 ///
+/// Whether activation of this generation/attempt is retired on this node.
+///
+/// Returns `RolledBackAttempt` when a confirmed rollback retired the exact
+/// attempt, and `RetiredGeneration` when a delete or eviction receipt covers
+/// the generation (the row, and any rollback receipt, may have been rebuilt).
+/// `begin_activation_with_route_evidence` runs this inside its transaction;
+/// start paths also call it before any staging work so a refused retry does
+/// no restore work at all.
+pub(crate) fn retired_activation(
+    conn: &Connection,
+    id: &str,
+    expected_state: SandboxState,
+    execution_generation: Option<ExecutionGeneration>,
+    activation_attempt_id: Option<SandboxActivationAttemptId>,
+    operation_activation_attempt_id: Option<SandboxActivationAttemptId>,
+) -> std::result::Result<Option<BeginActivationError>, BeginActivationError> {
+    if let Some(rolled_back) = rolled_back_activation_attempt(
+        conn,
+        id,
+        expected_state,
+        execution_generation,
+        activation_attempt_id,
+        operation_activation_attempt_id,
+    )? {
+        return Ok(Some(rolled_back));
+    }
+    if let Some(execution_generation) = execution_generation
+        && super::execution_delete_receipt_covers(conn, id, execution_generation)?
+    {
+        // The row was rebuilt after a delete or eviction, which drops any
+        // rollback receipt. The delete receipt keeps the generation fence.
+        return Ok(Some(BeginActivationError::RetiredGeneration {
+            execution_generation,
+        }));
+    }
+    Ok(None)
+}
+
 /// The rollback receipt names the operation attempt when one was supplied and
 /// the route attempt otherwise, so either incoming identity can match it. The
 /// retained route evidence also names the route attempt the rolled-back
@@ -429,7 +457,7 @@ pub(crate) fn begin_activation_with_route_evidence(
 /// operation attempt for the same route attempt. A new attempt for the same
 /// generation is a legitimate retry and is not refused.
 fn rolled_back_activation_attempt(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &Connection,
     id: &str,
     expected_state: SandboxState,
     execution_generation: Option<ExecutionGeneration>,

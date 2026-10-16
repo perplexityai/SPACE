@@ -11886,6 +11886,308 @@ pub(crate) mod service_tests {
         );
     }
 
+    /// The fields a refused activation must leave untouched: lifecycle state,
+    /// rollback receipt, artifact pin, retained route evidence and the row's
+    /// write stamp.
+    fn rollback_row_witness(conn: &rusqlite::Connection, id: &str) -> Vec<Option<String>> {
+        conn.query_row(
+            "SELECT state, current_local_artifact_id, transition_receipt_id,
+                    transition_receipt_kind, CAST(transition_receipt_execution_generation AS TEXT),
+                    transition_receipt_activation_attempt_id,
+                    CAST(last_observed_execution_generation AS TEXT),
+                    last_observed_route_activation_id, CAST(updated_at AS TEXT)
+               FROM sandboxes WHERE id = ?1",
+            [id],
+            |row| (0..9).map(|index| row.get(index)).collect(),
+        )
+        .unwrap()
+    }
+
+    fn local_artifact_count(conn: &rusqlite::Connection, id: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM local_artifacts WHERE sandbox_id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn restore_route_identity_proto(
+        generation: ExecutionGeneration,
+        attempt: SandboxActivationAttemptId,
+    ) -> crate::proto::SpaceApiRouteIdentity {
+        crate::proto::SpaceApiRouteIdentity {
+            activation_attempt_id: Some(attempt.to_string()),
+            ..direct_route_identity_proto(generation.get())
+        }
+    }
+
+    #[tokio::test]
+    async fn start_rpc_refuses_late_restore_of_rolled_back_attempt() {
+        // The late same-attempt retry reaches Start as a suspend-checkpoint
+        // restore. It must fail with FAILED_PRECONDITION before any restore
+        // work, leave the rollback state intact, and the retired execution's
+        // teardown must then publish nothing.
+        for original_backed in [true, false] {
+            let case = format!("backed={original_backed}");
+            let directory = tempfile::tempdir().unwrap();
+            let db_path = directory.path().join("manager.sqlite");
+            let sandbox_id = SandboxId::new();
+            let id = sandbox_id.to_string();
+            let generation = ExecutionGeneration::new(2).unwrap();
+            let attempt = SandboxActivationAttemptId::new();
+            let original_artifact = LocalArtifactId::new();
+            crate::db::create_test_schema_on_disk(&db_path);
+            {
+                let conn = rusqlite::Connection::open(&db_path).unwrap();
+                suspended_sandbox_after_restore_rollback(
+                    &conn,
+                    &id,
+                    original_artifact,
+                    original_backed,
+                    generation,
+                    attempt,
+                );
+            }
+            let service = service_for_teardown_test(rusqlite::Connection::open(&db_path).unwrap());
+            let (witness, jobs) = {
+                let db = service.db.lock().unwrap();
+                (rollback_row_witness(&db, &id), job_snapshot(&db))
+            };
+
+            let status = service
+                .start_sandbox(
+                    checkpoint_start_request(
+                        id.clone(),
+                        "suspend",
+                        Some(restore_route_identity_proto(generation, attempt)),
+                    ),
+                    false,
+                )
+                .await
+                .expect_err("the rolled-back attempt must not restore");
+            assert_eq!(
+                status.code(),
+                tonic::Code::FailedPrecondition,
+                "{case}: {status:?}"
+            );
+            assert!(
+                status.message().contains("was rolled back"),
+                "{case}: {status:?}"
+            );
+
+            {
+                let db = service.db.lock().unwrap();
+                assert_eq!(rollback_row_witness(&db, &id), witness, "{case}");
+                assert_eq!(job_snapshot(&db), jobs, "{case}: no snapshot or backup job");
+                assert_eq!(local_artifact_count(&db, &id), 1, "{case}: no new artifact");
+                let row = crate::db::get_sandbox(&db, &id).unwrap().unwrap();
+                assert_eq!(
+                    row.current_local_artifact_id,
+                    Some(original_artifact),
+                    "{case}"
+                );
+            }
+
+            let response = service
+                .prepare_teardown_suspend(internal_request(prepare_teardown_suspend_request(
+                    id.clone(),
+                    generation.get(),
+                    TeardownSuspendAction::BeginOrJoin,
+                )))
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(response.published_artifact.is_none(), "{case}");
+            assert!(service.teardown_suspend_drivers.is_empty(), "{case}");
+            let db = service.db.lock().unwrap();
+            assert_eq!(job_snapshot(&db), jobs, "{case}: teardown queues nothing");
+            assert_eq!(local_artifact_count(&db, &id), 1, "{case}");
+            assert_eq!(
+                crate::db::get_sandbox(&db, &id)
+                    .unwrap()
+                    .unwrap()
+                    .current_local_artifact_id,
+                Some(original_artifact),
+                "{case}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn start_rpc_refuses_restore_of_generation_retired_by_eviction() {
+        // Eviction deleted the row and its rollback receipt. The late retry
+        // reaches Start with no local row; it must be refused before the row
+        // is rebuilt from the remote snapshot.
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new();
+        let id = sandbox_id.to_string();
+        let generation = ExecutionGeneration::new(2).unwrap();
+        let attempt = SandboxActivationAttemptId::new();
+        let original_artifact = LocalArtifactId::new();
+        suspended_sandbox_after_restore_rollback(
+            &conn,
+            &id,
+            original_artifact,
+            true,
+            generation,
+            attempt,
+        );
+        assert!(
+            crate::db::claim_suspended_sandbox_for_eviction(
+                &conn,
+                &id,
+                Some(&original_artifact.to_string()),
+                None,
+            )
+            .unwrap()
+        );
+        crate::db::set_cleanup_intent(&conn, &id, false, crate::db::CleanupCompletion::DeleteRow)
+            .unwrap();
+        crate::db::complete_row_intent_cleanup(
+            &conn,
+            &id,
+            crate::db::CleanupCompletion::DeleteRow,
+            None,
+        )
+        .unwrap();
+        let jobs = job_snapshot(&conn);
+        let service = service_for_teardown_test(conn);
+
+        let status = service
+            .start_sandbox(
+                checkpoint_start_request(
+                    id.clone(),
+                    "suspend",
+                    Some(restore_route_identity_proto(generation, attempt)),
+                ),
+                false,
+            )
+            .await
+            .expect_err("the retired generation must not restore");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status:?}");
+        assert!(
+            status.message().contains("was retired on this node"),
+            "{status:?}"
+        );
+
+        let db = service.db.lock().unwrap();
+        assert!(
+            crate::db::get_sandbox(&db, &id).unwrap().is_none(),
+            "no row rebuilt"
+        );
+        assert_eq!(local_artifact_count(&db, &id), 0);
+        assert_eq!(job_snapshot(&db), jobs, "no snapshot or backup job");
+    }
+
+    #[tokio::test]
+    async fn start_rpc_refuses_late_cold_start_of_rolled_back_attempt() {
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        let generation = ExecutionGeneration::new(2).unwrap();
+        let attempt = SandboxActivationAttemptId::new();
+        insert_test_sandbox(&conn, &id, SandboxState::Stopped);
+        let episode = crate::db::begin_activation(
+            &conn,
+            &id,
+            SandboxState::Stopped,
+            crate::db::ActivationKind::ColdStart,
+            Some(generation),
+            Some(attempt),
+        )
+        .unwrap()
+        .unwrap();
+        crate::db::request_cleanup_episode(
+            &conn,
+            &id,
+            episode.id,
+            SandboxQuarantineReasonCode::RestorePrepareFailed,
+            "start prepare failed",
+        )
+        .unwrap();
+        assert!(
+            crate::db::complete_cleanup_episode(&conn, &id, episode.id)
+                .unwrap()
+                .is_some()
+        );
+        let witness = rollback_row_witness(&conn, &id);
+        assert_eq!(witness[0].as_deref(), Some("stopped"));
+        assert_eq!(witness[3].as_deref(), Some("activation_rollback"));
+        let jobs = job_snapshot(&conn);
+        let service = service_for_teardown_test(conn);
+        let mut request = checkpoint_start_request(
+            id.clone(),
+            "",
+            Some(restore_route_identity_proto(generation, attempt)),
+        );
+        request.checkpoint = None;
+
+        let status = service
+            .start_sandbox(request, false)
+            .await
+            .expect_err("the rolled-back attempt must not start");
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status:?}");
+        assert!(status.message().contains("was rolled back"), "{status:?}");
+        let db = service.db.lock().unwrap();
+        assert_eq!(rollback_row_witness(&db, &id), witness);
+        assert_eq!(job_snapshot(&db), jobs);
+    }
+
+    #[test]
+    fn inventory_stale_row_delete_after_rollback_keeps_the_rolled_back_generation_fenced() {
+        // Inventory reconciliation removes a stale row directly, without a
+        // cleanup episode. Its delete receipt must still retire the
+        // rolled-back generation.
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        let generation = ExecutionGeneration::new(2).unwrap();
+        let attempt = SandboxActivationAttemptId::new();
+        suspended_sandbox_after_restore_rollback(
+            &conn,
+            &id,
+            LocalArtifactId::new(),
+            true,
+            generation,
+            attempt,
+        );
+        let observed = crate::db::get_sandbox(&conn, &id).unwrap().unwrap();
+        assert!(matches!(
+            crate::db::delete_sandbox_if_inventory_witness_matches(&conn, &observed).unwrap(),
+            crate::db::InventoryStaleRowMutation::Removed
+        ));
+        assert!(crate::db::execution_delete_receipt_covers(&conn, &id, generation).unwrap());
+
+        insert_test_sandbox(&conn, &id, SandboxState::Suspended);
+        let late = crate::db::begin_activation(
+            &conn,
+            &id,
+            SandboxState::Suspended,
+            crate::db::ActivationKind::Restore,
+            Some(generation),
+            Some(attempt),
+        );
+        assert!(
+            matches!(
+                late,
+                Err(crate::db::BeginActivationError::RetiredGeneration {
+                    execution_generation,
+                }) if execution_generation == generation
+            ),
+            "{late:?}"
+        );
+        assert!(matches!(
+            crate::db::begin_activation(
+                &conn,
+                &id,
+                SandboxState::Suspended,
+                crate::db::ActivationKind::Restore,
+                Some(ExecutionGeneration::new(3).unwrap()),
+                Some(SandboxActivationAttemptId::new()),
+            ),
+            Ok(Some(_))
+        ));
+    }
+
     #[tokio::test]
     async fn delete_receipt_is_generation_fenced() {
         let conn = crate::db::test_conn();
