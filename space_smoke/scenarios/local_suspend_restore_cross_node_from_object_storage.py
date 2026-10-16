@@ -14,11 +14,11 @@ MARKER = "space-smoke-cross-node-restore-ok"
 # so a restore left to itself reuses the local artifact and never exercises the
 # S3 copy. `ecw.pause_connect` already proves that same-node path. This
 # scenario proves the durable one: it makes the source worker unschedulable for
-# exactly the restore window, then requires sbx-manager's own
-# `runtime_activated` event for the landed execution to report a healthy
-# `remote_*` provenance with the storage URI present — a restore that merely
-# changed nodes but was served from some other local copy would fail that
-# check. Kubernetes exposes no per-sandbox "restore elsewhere" hint (only
+# exactly the restore window, then requires the landed pod on the other worker
+# to be the sandbox's one active execution, planned from the snapshot's
+# storage URI, and the state written before the suspend to read back — the
+# other worker never held the suspend bytes, so they came from object
+# storage. Kubernetes exposes no per-sandbox "restore elsewhere" hint (only
 # cordon and drain move placement), and cordoning a worker is not something to
 # do to a shared cluster, which is why the fixture type pins this to kind.
 #
@@ -27,7 +27,7 @@ MARKER = "space-smoke-cross-node-restore-ok"
 # ready full snapshot with a storage location exists the API planner has only a
 # source node and pre-binds the pod with `spec.nodeName` — which bypasses
 # kube-scheduler, so the cordon would do nothing and the restore would land
-# back on the source with `local_only` provenance. That false negative reads
+# back on the source from its local copy. That false negative reads
 # exactly like a product bug. The legacy shell suite guarded it the same way.
 @smoke.scenario(
     "local.suspend_restore_cross_node_from_object_storage",

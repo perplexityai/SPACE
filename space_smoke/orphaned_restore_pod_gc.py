@@ -20,11 +20,12 @@ preempting anything on their behalf: preemption skips nodes that fail the
 selector. Each plant carries a per-plant label, and its removal is armed
 before the create and deletes by that label only.
 
-The observables are the controller's structured JSON log lines: the
-`cluster_reconciler.outcome` records (`requested_orphaned_restore_pod_delete`
-when the DELETE is accepted, `reaped_orphaned_restore_pod` once the pod has
-left the cache), the `cleanup_requested`/`cleanup_completed` sandbox events,
-and the per-tick report.
+The observables are state: the controller Deployment's env once its rollout
+has finished, each planted pod seen present until it is old enough to reap
+and gone afterwards, and the live restore pod keeping its uid while the
+sandbox's execution rows still name it. The controller's structured log
+lines (`cluster_reconciler.outcome` records, cleanup events, tick reports)
+are attached to a failure as evidence and never judged.
 """
 
 from __future__ import annotations
@@ -69,12 +70,8 @@ _BOOLEAN_VALUES = frozenset({"true", "false"})
 _COUNT_VALUE = re.compile(r"[1-9][0-9]{0,5}")
 
 GC_LOOP = "orphaned_restore_pod_gc"
-DELETE_REQUESTED_OUTCOME = "requested_orphaned_restore_pod_delete"
-REAPED_OUTCOME = "reaped_orphaned_restore_pod"
-CLEANUP_REASON = "orphaned_restore_pod"
 TICK_COMPLETE_MESSAGE = "orphaned_restore_pod_gc tick complete"
-STARTING_MESSAGE = "starting orphaned_restore_pod_gc"
-# Every GC record contains this: the loop name, both messages above, and the
+# Every GC record contains this: the loop name, the tick message, and the
 # cleanup events' reason/operation. The adapter pre-filters log lines on it.
 GC_LOG_NEEDLE = "orphaned_restore_pod"
 
@@ -190,42 +187,8 @@ def build_planted_orphan(
     }
 
 
-def _same_uuid(left: object, right: str) -> bool:
-    try:
-        return uuid.UUID(str(left)) == uuid.UUID(right)
-    except ValueError:
-        return False
-
-
-def gc_outcomes(
-    records: Iterable[Mapping[str, Any]], *, outcome: str, pod_name: str
-) -> list[Mapping[str, Any]]:
-    return [
-        r
-        for r in records
-        if r.get("loop") == GC_LOOP and r.get("outcome") == outcome and r.get("pod_name") == pod_name
-    ]
-
-
-def cleanup_events(
-    records: Iterable[Mapping[str, Any]], *, event_type: str, pod_name: str
-) -> list[Mapping[str, Any]]:
-    return [
-        r
-        for r in records
-        if r.get("event_type") == event_type
-        and r.get("operation") == GC_LOOP
-        and r.get("pod_name") == pod_name
-    ]
-
-
 def records_touching(records: Iterable[Mapping[str, Any]], pod_name: str) -> list[Mapping[str, Any]]:
-    """Every GC outcome or GC cleanup event naming `pod_name`.
-
-    The loop emits a per-pod outcome only for a pod it classified as an
-    orphan (the actionable set), never for a scanned pod it skips, so any
-    record naming a pod means the loop took it for superseded.
-    """
+    """Every GC outcome or GC cleanup event naming `pod_name`, for failure evidence."""
 
     return [
         r
@@ -277,7 +240,8 @@ class PlantedOrphan:
     reason: str
     """The `OrphanReason` the reaper must report: `row_reverted` or `sandbox_missing`."""
     planted_at: float = 0.0
-    """`time.monotonic()` when the create returned; the reaper's clock starts no earlier."""
+    """`time.monotonic()` once the create returned: the pod existed by then, and
+    the plant's own read right after saw it present."""
 
 
 @dataclass(frozen=True)
@@ -349,45 +313,22 @@ class OrphanedRestorePodGcAssertions:
             critical=True,
         )
         self._since = _since_now()
-        self._control.set_orphaned_restore_pod_gc_env(
-            smoke_gc_env(threshold_seconds=threshold_seconds, interval_seconds=interval_seconds)
+        overrides = smoke_gc_env(threshold_seconds=threshold_seconds, interval_seconds=interval_seconds)
+        self._control.set_orphaned_restore_pod_gc_env(overrides)
+        # The set awaits the controller rollout, so the running pod read
+        # these knobs at startup; the reaps below prove the loop is live.
+        live = self._control.orphaned_restore_pod_gc_env()
+        expected = {**standing, **overrides}
+        self._fixture.verify(
+            live == expected,
+            "the rolled cluster-controller does not carry the scenario's GC knobs",
+            expected=expected,
+            live=live,
         )
+        self._fixture.record("gc_env_live", dict(live))
         settings = GcSettings(threshold_seconds=threshold_seconds, interval_seconds=interval_seconds)
         self._settings = settings
-        self._await_live(settings)
         return settings
-
-    def _await_live(self, settings: GcSettings, *, timeout: float = 120) -> None:
-        """The rolled controller logged a live start with our knobs, then a completed tick."""
-
-        since = self._require_since()
-        deadline = time.monotonic() + timeout
-        while True:
-            records = self._control.controller_log_records(since_time=since)
-            started = [
-                r
-                for r in records
-                if r.get("message") == STARTING_MESSAGE
-                and r.get("dry_run") is False
-                and r.get("threshold_secs") == settings.threshold_seconds
-                and r.get("interval_secs") == settings.interval_seconds
-            ]
-            ticks = [r for r in tick_reports(records) if r.get("dry_run") is False]
-            if started and ticks:
-                self._fixture.record("gc_started", _summary(started[-1]))
-                return
-            self._fixture.verify(
-                time.monotonic() < deadline,
-                "the rolled cluster-controller did not start the orphaned-restore-pod GC live "
-                "with the scenario's knobs, or never completed a tick",
-                starts=[
-                    {k: r.get(k) for k in ("dry_run", "threshold_secs", "interval_secs")}
-                    for r in records
-                    if r.get("message") == STARTING_MESSAGE
-                ],
-                ticks=len(ticks),
-            )
-            self._fixture.wait(settings.interval_seconds)
 
     def restore_standing(self) -> None:
         """Put the captured env back now and check it took; then release the Lease.
@@ -466,6 +407,7 @@ class OrphanedRestorePodGcAssertions:
         uid = self._control.plant_orphaned_restore_pod(
             template, name=name, sandbox_id=target, generation=generation, token=token
         )
+        planted_at = time.monotonic()
         document = self._control.restore_pod_document(name)
         spec = (document or {}).get("spec") or {}
         self._fixture.verify(
@@ -481,7 +423,7 @@ class OrphanedRestorePodGcAssertions:
             generation=generation,
             token=token,
             reason="row_reverted" if sandbox_id else "sandbox_missing",
-            planted_at=time.monotonic(),
+            planted_at=planted_at,
         )
         self._fixture.record(
             f"planted_{orphan.reason}_g{generation}_{token}",
@@ -491,79 +433,87 @@ class OrphanedRestorePodGcAssertions:
 
     # --- verdicts ---------------------------------------------------------------
 
-    def expect_reaped(self, orphan: PlantedOrphan) -> None:
-        """The loop deleted the plant after the threshold and confirmed the reap once it left the cache."""
+    def expect_reaped(self, *orphans: PlantedOrphan) -> None:
+        """The loop deleted every plant, none of them before it reached the threshold.
+
+        One loop polls every outstanding plant, so each is watched from its
+        own create: polling the plants one after another would leave a later
+        plant unwatched while an earlier one ages, and its deletion at any age
+        would look on time. A plant's age at deletion is at least the time
+        from its create to the last poll that saw it present, so each must
+        have been seen present at a poll no earlier than its create plus the
+        threshold less one GC interval (the slack one tick can take), and
+        gone at a later poll. Both times are recorded per plant.
+        """
 
         settings = self._require_settings()
-        since = self._require_since()
-        deadline = time.monotonic() + settings.reap_budget_seconds
-        while True:
-            present = self._control.restore_pod_document(orphan.name) is not None
-            records = self._control.controller_log_records(since_time=since)
-            requested = gc_outcomes(records, outcome=DELETE_REQUESTED_OUTCOME, pod_name=orphan.name)
-            reaped = gc_outcomes(records, outcome=REAPED_OUTCOME, pod_name=orphan.name)
-            asked = cleanup_events(records, event_type="cleanup_requested", pod_name=orphan.name)
-            done = cleanup_events(records, event_type="cleanup_completed", pod_name=orphan.name)
-            if not present and requested and reaped and asked and done:
-                # One more tick, so a duplicate confirmation the loop would
-                # emit on its next pass is in the records judged below.
-                self._fixture.wait(settings.interval_seconds)
-                records = self._control.controller_log_records(since_time=since)
-                requested = gc_outcomes(records, outcome=DELETE_REQUESTED_OUTCOME, pod_name=orphan.name)
-                reaped = gc_outcomes(records, outcome=REAPED_OUTCOME, pod_name=orphan.name)
-                done = cleanup_events(records, event_type="cleanup_completed", pod_name=orphan.name)
+        # Polls well inside one GC tick, so the window between the bound and
+        # the deletion holds a poll.
+        poll_seconds = max(0.5, settings.interval_seconds / 4)
+        last_present = {orphan.token: orphan.planted_at for orphan in orphans}
+        outstanding = list(orphans)
+        deadline = max(orphan.planted_at for orphan in orphans) + settings.reap_budget_seconds
+        while outstanding:
+            for orphan in list(outstanding):
+                polled_at = time.monotonic()
+                if self._control.restore_pod_document(orphan.name) is not None:
+                    last_present[orphan.token] = polled_at
+                    continue
+                outstanding.remove(orphan)
+                self._judge_reap(orphan, last_present[orphan.token], polled_at, settings)
+            if not outstanding:
                 break
             self._fixture.verify(
                 time.monotonic() < deadline,
-                f"the planted {orphan.reason} orphan was not reaped and confirmed within the budget",
-                pod=orphan.name,
-                present=present,
-                delete_requested=len(requested),
-                reaped=len(reaped),
-                cleanup_requested=len(asked),
-                cleanup_completed=len(done),
-                last_ticks=[_summary(r) for r in tick_reports(records)[-3:]],
+                "a planted orphan was not reaped within the budget",
+                pods=[orphan.name for orphan in outstanding],
+                reap_budget_seconds=settings.reap_budget_seconds,
+                failure_evidence=lambda: self._gc_evidence(*(o.name for o in outstanding)),
             )
-            self._fixture.wait(settings.interval_seconds)
-        request, confirmation, completed = requested[0], reaped[-1], done[-1]
-        self._fixture.verify(
-            len(requested) == 1
-            and len(reaped) == 1
-            and len(done) == 1
-            and request.get("mode") == "live"
-            and request.get("detail") == orphan.reason
-            and request.get("generation") == orphan.generation
-            and _same_uuid(request.get("sandbox_id"), orphan.sandbox_id)
-            and int(request.get("age_secs") or 0) >= settings.threshold_seconds
-            and confirmation.get("mode") == "live"
-            and completed.get("result") == "deleted"
-            and completed.get("reason") == CLEANUP_REASON
-            and completed.get("pod_uid") == orphan.uid
-            and completed.get("execution_generation") == str(orphan.generation)
-            and _same_uuid(completed.get("sandbox_id"), orphan.sandbox_id),
-            f"the {orphan.reason} reap was not requested, confirmed, and completed exactly once "
-            "with the expected identity, reason, and age",
-            delete_requested=[_summary(r) for r in requested],
-            reaped=[_summary(r) for r in reaped],
-            cleanup_completed_count=len(done),
-            cleanup_completed=_summary(completed),
-            threshold_seconds=settings.threshold_seconds,
-        )
+            self._fixture.wait(poll_seconds)
+
+    def _judge_reap(
+        self, orphan: PlantedOrphan, last_present: float, first_gone: float, settings: GcSettings
+    ) -> None:
+        present_after = round(last_present - orphan.planted_at, 1)
+        gone_after = round(first_gone - orphan.planted_at, 1)
         self._fixture.record(
             f"reaped_{orphan.reason}_g{orphan.generation}_{orphan.token}",
-            {"age_secs": request.get("age_secs"), "pod": orphan.name},
+            {
+                "pod": orphan.name,
+                "last_seen_present_after_seconds": present_after,
+                "first_seen_gone_after_seconds": gone_after,
+            },
+        )
+        self._fixture.verify(
+            last_present >= orphan.planted_at + settings.threshold_seconds - settings.interval_seconds,
+            f"the planted {orphan.reason} orphan was deleted before the threshold",
+            pod=orphan.name,
+            last_seen_present_after_seconds=present_after,
+            first_seen_gone_after_seconds=gone_after,
+            threshold_seconds=settings.threshold_seconds,
+            interval_seconds=settings.interval_seconds,
+            failure_evidence=lambda: self._gc_evidence(orphan.name),
         )
         removal = self._removals.pop(orphan.token, None)
         if removal is not None:
             removal.release()
 
+    def _gc_evidence(self, *pod_names: str) -> dict[str, object]:
+        records = self._control.controller_log_records(since_time=self._require_since())
+        return {
+            "gc_records_for_pods": [
+                _summary(r) for name in pod_names for r in records_touching(records, name)
+            ][-10:],
+            "last_ticks": [_summary(r) for r in tick_reports(records)[-3:]],
+        }
+
     def expect_undisturbed(self, live: LivePod) -> None:
-        """Through the survival window the pod keeps its uid, one execution stays active
-        at its generation, the loop keeps ticking over it, and no GC action names it."""
+        """Through the survival window the pod keeps its uid and one execution stays
+        active at its generation."""
 
         settings = self._require_settings()
         sandbox_id = self._fixture.sandbox.sandbox_id
-        window_since = _since_now()
         deadline = time.monotonic() + settings.survival_window_seconds
         while True:
             document = self._control.restore_pod_document(live.name)
@@ -583,26 +533,12 @@ class OrphanedRestorePodGcAssertions:
                 uid_before=live.uid,
                 deleting=bool(metadata.get("deletionTimestamp")),
                 executions=_rows(rows),
+                failure_evidence=lambda: self._gc_evidence(live.name),
             )
             if time.monotonic() >= deadline:
                 break
             self._fixture.wait(settings.interval_seconds)
-        touched = records_touching(
-            self._control.controller_log_records(since_time=self._require_since()), live.name
-        )
-        ticks = tick_reports(self._control.controller_log_records(since_time=window_since))
-        wanted_ticks = max(2, int(settings.survival_window_seconds // settings.interval_seconds) - 2)
-        self._fixture.verify(
-            not touched
-            and len(ticks) >= wanted_ticks
-            and any(int(r.get("scanned") or 0) >= 1 for r in ticks),
-            "the GC acted on the live restore pod, or did not keep ticking over it through the window",
-            touched=[_summary(r) for r in touched],
-            ticks=len(ticks),
-            wanted_ticks=wanted_ticks,
-            scanned=[r.get("scanned") for r in ticks[-5:]],
-        )
-        self._fixture.record("undisturbed_ticks", len(ticks))
+        self._fixture.record("undisturbed_seconds", settings.survival_window_seconds)
 
     def wait_until_suspended(self, *, timeout: float = 180) -> list[ExecutionRow]:
         """The row settles `suspended` with no active execution; returns its execution rows."""

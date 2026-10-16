@@ -78,9 +78,9 @@ def restarted_btrfs_send_is_rejected_and_retried(test: smoke.KindEcw) -> None:
         suspended_at = codec.mark_since()
         with codec.interrupting_btrfs_send(source.node_name):
             test.pause()
-            codec.expect_deferred_capture(source.node_name, since_time=suspended_at)
+            codec.expect_retained_source_without_send_file(source.node_name)
             restore.wait_until_restore_portable(timeout=900)
-            codec.expect_streamed_upload(source.node_name, since_time=suspended_at)
+            codec.expect_streamed_upload(source.node_name)
 
     with test.phase("node-manager rejected the restarted stream and the upload retried"):
         codec.expect_rejected_send_stream(source.node_name, since_time=suspended_at)

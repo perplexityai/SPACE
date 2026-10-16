@@ -591,8 +591,9 @@ class PendingBackupControl(Protocol):
 
     The object store fault is the kind `space-object-store` Deployment scaled to
     zero with its scale-back armed first; the observables are the cluster's
-    `node_local_backup_pending` queue, space-internal-api's census publication
-    log, the sandbox's snapshot rows and the backed-artifact predicate.
+    `node_local_backup_pending` queue, the sandbox's snapshot rows, the
+    backed-artifact predicate and the suspend operation's state.
+    space-internal-api's census publication log is failure evidence only.
     """
 
     def object_store_replicas(self) -> int: ...
@@ -683,7 +684,9 @@ class OrphanedRestorePodGcControl(Protocol):
     clones of a real restore pod renamed to a retired generation and pinned
     to a nodeSelector no node carries, so they stay Pending and never boot a
     VM; each is created with a per-plant label its deletion selects on. The
-    observables are the controller's structured log lines.
+    observables are the pods themselves, the sandbox's execution rows and
+    the controller Deployment's env; the controller's structured log lines
+    are failure evidence only.
     """
 
     def acquire_controller_mutation(self) -> Callable[[], None]:
@@ -703,7 +706,10 @@ class OrphanedRestorePodGcControl(Protocol):
         ...
 
     def controller_log_records(self, *, since_time: str) -> list[dict[str, Any]]:
-        """GC-related structured records from every live controller pod since `since_time`."""
+        """GC-related structured records from every live controller pod since `since_time`.
+
+        Failure evidence only: no assertion reads it.
+        """
         ...
 
     def restore_pod_document(self, pod_name: str) -> dict[str, Any] | None:
@@ -1245,9 +1251,8 @@ class SandboxPodPlacement:
     """Where a sandbox's execution pod is bound right now.
 
     `execution_generation` is the pod's `space.pplx.net/execution-generation`
-    annotation — the same value sbx-manager stamps on that execution's
-    `runtime_activated` event, so the two can be joined without a log-derived
-    baseline.
+    annotation — the generation of the `sandbox_k8s_executions` row the pod
+    runs, so the two can be joined.
     """
 
     sandbox_id: str
@@ -1259,7 +1264,8 @@ class SandboxPodPlacement:
 
 @dataclass(frozen=True)
 class RestoreActivation:
-    """One `runtime_activated` sandbox event, read from sandbox-manager's log.
+    """One `runtime_activated` sandbox event: a documented contract
+    (`crates/libs/events/README.md`).
 
     `restore_provenance` is sbx-manager's own classification of where the
     restored bytes came from (`local_only`, `remote_matches_local`,
@@ -1418,8 +1424,31 @@ class EncryptedResuspendControl(RestoreStateRead, Protocol):
         ...
 
 
-class SandboxEventRead(Protocol):
-    """Read sbx-manager's structured sandbox events from its pods' logs."""
+class RestorePodRead(Protocol):
+    """The landed execution of a restore, read from the apiserver and the cluster rows."""
+
+    def restore_pod_document(self, pod_name: str) -> dict[str, Any] | None:
+        """The apiserver's JSON for one sandbox pod, None when it does not exist."""
+        ...
+
+    def sandbox_executions(self, sandbox_id: str) -> list[ExecutionRow]:
+        """The sandbox's `sandbox_k8s_executions` rows."""
+        ...
+
+    def sandbox_manager_log(
+        self,
+        sandbox_id: str,
+        *,
+        node_names: Collection[str] | None = None,
+        since_time: str,
+    ) -> list[str]:
+        """The worker sandbox-managers' recent lines naming the sandbox.
+
+        Failure evidence only: no assertion reads it. `node_names` restricts
+        the read to specific workers; the default reads every worker. Storage
+        URIs are redacted.
+        """
+        ...
 
     def restore_activations(
         self,
@@ -1428,17 +1457,15 @@ class SandboxEventRead(Protocol):
         node_names: Collection[str] | None = None,
         since_time: str | None = None,
     ) -> list[RestoreActivation]:
-        """`runtime_activated` events for the sandbox.
+        """`runtime_activated` events for the sandbox, from worker sandbox-manager logs.
 
-        `node_names` restricts the read to specific workers' sandbox-managers;
-        the default reads every worker. `since_time` is an RFC 3339 lower bound
-        passed to the log read so a long-lived bench does not scan history.
+        `since_time` is an RFC 3339 lower bound passed to the log read.
         """
         ...
 
 
 class CrossNodeRestoreControl(
-    NodeFaultControl, RestoreStateRead, SandboxEventRead, Protocol
+    NodeFaultControl, RestoreStateRead, RestorePodRead, Protocol
 ):
     """Everything the cross-node durable-restore scenario is allowed to do."""
 
@@ -1561,17 +1588,6 @@ class TemplateCacheGcConfig:
     prefetch_latest_n: int
 
 
-@dataclass(frozen=True)
-class TemplateGcTick:
-    """One `template GC tick complete` log line from a worker's template-manager."""
-
-    node_name: str
-    candidates: int
-    deleted: int
-    bytes_before: int
-    bytes_freed: int
-
-
 class TemplateCacheControl(RestoreStateRead, Protocol):
     """Privileged on-node template-cache operations for the eviction scenario.
 
@@ -1580,7 +1596,7 @@ class TemplateCacheControl(RestoreStateRead, Protocol):
     from its template-manager pod. There is deliberately no SQLite surface: the
     worker image ships no `sqlite3`, and the point is to prove the loop through
     the same interfaces an operator has — the `space-tmplmgr` CLI and the
-    daemon's own structured log line.
+    digest directories on disk. The daemon's log is failure evidence only.
     """
 
     def template_cache_gc_config(self, node_name: str) -> TemplateCacheGcConfig:
@@ -1641,10 +1657,8 @@ class TemplateCacheControl(RestoreStateRead, Protocol):
         """
         ...
 
-    def template_gc_ticks(
-        self, node_name: str, *, since_time: str
-    ) -> list[TemplateGcTick]:
-        """Completed eviction ticks logged by that worker since `since_time`."""
+    def template_gc_log(self, node_name: str, *, since_time: str) -> list[str]:
+        """template-manager's own GC lines on that worker, for a timeout's evidence."""
         ...
 
 
@@ -1767,46 +1781,39 @@ class StartupRecoveryControl(RestoreStateRead, Protocol):
 
 
 @dataclass(frozen=True)
-class BackupQueued:
-    """One `artifact_backup_queued` sandbox event: the suspend's sealed facts.
-
-    `rootfs_diff_format` is the codec the suspend actually used, as recorded
-    in the sidecar sbx-manager published (`btrfs-send-v1`, or `full`).
-    """
-
-    node_name: str
-    snapshot_id: str
-    rootfs_diff_format: str
-    object_uri: str
-
-
-@dataclass(frozen=True)
-class BtrfsSendCapture:
-    """One btrfs-send capture, from sandbox-manager's encode line.
-
-    `deferred` is true when the capture retained its source for a streamed
-    upload instead of writing `rootfs.btrfs-send`; `stream_bytes` is then 0.
-    """
-
-    node_name: str
-    sandbox_id: str
-    stream_bytes: int
-    deferred: bool
-
-
-@dataclass(frozen=True)
-class CompletedTransfer:
-    """One volume-manager transfer job that completed, from its log line.
+class TransferJobView:
+    """One volume-manager transfer job, as `space-volmgr job` reports it.
 
     `kind` is the job kind: `push_btrfs_send` streams a rootfs from a retained
     btrfs source, while a materialized send file uploads under another kind
     with the same `local_path`.
     """
 
-    node_name: str
+    job_id: str
     kind: str
+    status: str
     local_path: str
-    bytes: int
+
+
+@dataclass(frozen=True)
+class RestoreFailure:
+    """One `snapshot_restore_failed` sandbox event: a documented contract
+    (`crates/libs/events/README.md`).
+
+    `reason` is the stage that failed (`ensure_template`, `pull_rootfs`, ...),
+    `error_kind` the bounded name sbx-manager gives the failure
+    (`parent_template_lookup`, `btrfs_receive`, ...), `error` the daemon's own
+    message for humans (storage URIs redacted), `restore_codec` the codec it
+    was restoring with. Match on `reason` and `error_kind`, never on `error`:
+    its wording is free to change.
+    """
+
+    node_name: str
+    operation: str
+    reason: str
+    error_kind: str
+    error: str
+    restore_codec: str
 
 
 @dataclass(frozen=True)
@@ -1836,25 +1843,6 @@ class SnapshotRowFacts:
 
 
 @dataclass(frozen=True)
-class RestoreFailure:
-    """One `snapshot_restore_failed` sandbox event from a worker's sbx-manager.
-
-    `reason` is the stage that failed (`ensure_template`, `pull_rootfs`, ...),
-    `error_kind` the bounded name sbx-manager gives the failure
-    (`parent_template_lookup`, `btrfs_receive`, ...), `error` the daemon's own
-    message for humans, `restore_codec` the codec it was restoring with. Match
-    on `reason` and `error_kind`, never on `error`: its wording is free to change.
-    """
-
-    node_name: str
-    operation: str
-    reason: str
-    error_kind: str
-    error: str
-    restore_codec: str
-
-
-@dataclass(frozen=True)
 class ReleaseStorageRow:
     """One `template_release_storage_locations` row, whole, held for a compensation.
 
@@ -1870,45 +1858,36 @@ class ReleaseStorageRow:
     created_at: str
 
 
-@dataclass(frozen=True)
-class TemplatePullLine:
-    """One template-manager log line inside a pull span: its trigger and message."""
-
-    trigger: str
-    message: str
-
-
 class SuspendCodecControl(CrossNodeRestoreControl, Protocol):
     """Privileged operations for the btrfs-send codec failure matrix.
 
-    Builds on the cross-node control (cordon, placement, portability,
-    activation events) with the reads and faults those scenarios need:
-    the codec fact from sbx-manager's own event, the parent template's
-    presence and subvolume identity on a worker, the daemon's failure lines,
-    and three kind-only faults — withholding a template release's storage
-    rows, corrupting one object of a durable snapshot, and stopping
-    node-manager while its btrfs send blocks on a full pipe. Every fault is
-    a named operation with its compensation owned by the fixture.
+    Builds on the cross-node control (cordon, placement, portability, the
+    landed restore pod) with the reads and faults those scenarios need: the
+    snapshot rows and the objects under a snapshot's storage prefix (the
+    codec fact), volume-manager's transfer jobs, sbx-manager's
+    `snapshot_restore_failed` events, template-manager's pull metric, the
+    parent template's presence and subvolume identity on a worker, and three
+    kind-only faults — withholding a template release's storage rows,
+    corrupting one object of a durable snapshot, and stopping node-manager
+    while its btrfs send blocks on a full pipe. Every fault is a named
+    operation with its compensation owned by the fixture.
     """
 
     def other_sandbox_worker_node(self, excluding_node: str) -> str:
         """A sandbox-pool kube node other than `excluding_node`, or a configuration error."""
         ...
 
-    def btrfs_send_captures(
-        self, sandbox_id: str, node_name: str, *, since_time: str
-    ) -> list[BtrfsSendCapture]:
-        """sandbox-manager's btrfs-send encode lines for the sandbox on `node_name` since `since_time`."""
-        ...
-
     def sandbox_canonical_snapshot_entries(self, node_name: str, sandbox_id: str) -> tuple[str, ...]:
         """Entries of the sandbox's canonical suspend snapshot directory on `node_name`."""
         ...
 
-    def completed_transfers(
-        self, sandbox_id: str, node_name: str, *, since_time: str
-    ) -> list[CompletedTransfer]:
-        """volume-manager's completed transfer jobs under the sandbox's cache directory on `node_name` since `since_time`."""
+    def transfer_jobs(self, node_name: str, sandbox_id: str) -> list[TransferJobView]:
+        """The sandbox's volume-manager transfer jobs on `node_name`.
+
+        `space-volmgr jobs --subject sandbox:<id>` in the node's operator
+        shell, then `space-volmgr job <id>` for each, so every field comes
+        from the daemon's own job record.
+        """
         ...
 
     def failed_transfers(
@@ -1936,8 +1915,16 @@ class SuspendCodecControl(CrossNodeRestoreControl, Protocol):
         """Stop the interrupter and continue node-manager and volume-manager; idempotent."""
         ...
 
-    def backup_queued_events(self, sandbox_id: str, *, since_time: str) -> list[BackupQueued]:
-        """`artifact_backup_queued` events for the sandbox since `since_time`."""
+    def restore_failures(self, sandbox_id: str, *, since_time: str) -> list[RestoreFailure]:
+        """`snapshot_restore_failed` events for the sandbox since `since_time`."""
+        ...
+
+    def telemetry_mode(self) -> str:
+        """The Kind telemetry mode (`datadog`, `otel` or `off`) the bench runs."""
+        ...
+
+    def telemetry_query(self, backend: str, path: str, params: Mapping[str, str]) -> Any:
+        """The decoded JSON body of `GET <path>?<params>` on a local telemetry backend."""
         ...
 
     def suspend_snapshot_template_hash(self, sandbox_id: str) -> str:
@@ -1993,12 +1980,6 @@ class SuspendCodecControl(CrossNodeRestoreControl, Protocol):
         """
         ...
 
-    def template_pulls(
-        self, node_name: str, template: str, *, since_time: str
-    ) -> list[TemplatePullLine]:
-        """template-manager lines inside pull spans for the template since `since_time`."""
-        ...
-
     def template_subvolume_received_uuid(
         self, node_name: str, template: str, digest: str
     ) -> str | None:
@@ -2013,16 +1994,16 @@ class SuspendCodecControl(CrossNodeRestoreControl, Protocol):
         """Whether the sandbox's `instance` on that worker is a btrfs subvolume."""
         ...
 
-    def restore_failures(self, sandbox_id: str, *, since_time: str) -> list[RestoreFailure]:
-        """`snapshot_restore_failed` events for the sandbox since `since_time`."""
-        ...
-
     def ready_full_snapshots(self, sandbox_id: str) -> list[SnapshotRecord]:
         """The sandbox's `ready` full snapshot rows with their storage locations."""
         ...
 
     def snapshot_row_facts(self, sandbox_id: str) -> list[SnapshotRowFacts]:
         """Every full `snapshots` row of the sandbox, oldest first."""
+        ...
+
+    def snapshot_object_names(self, snapshot: SnapshotRowFacts) -> tuple[str, ...]:
+        """Names of the objects directly under the snapshot's storage prefix."""
         ...
 
     def withhold_template_release_storage(self, template: str) -> list[ReleaseStorageRow]:
@@ -2057,27 +2038,14 @@ class ColdEvictionConfig:
     interval_seconds: int
 
 
-@dataclass(frozen=True)
-class LocalEviction:
-    """One `local_eviction_completed` or `local_eviction_failed` sandbox event
-    from a worker's sbx-manager."""
-
-    sandbox_id: str
-    node_name: str
-    reason: str
-    snapshot_id: str
-    # The failed event's `error`; empty for completed evictions.
-    error: str = ""
-
-
-class ColdEvictionControl(RestoreStateRead, SandboxEventRead, Protocol):
+class ColdEvictionControl(RestoreStateRead, RestorePodRead, Protocol):
     """Privileged reads for the cold-sandbox eviction scenario.
 
     Nothing here mutates anything: the loop's knobs are chart values read
     once at daemon start (see `sandboxEviction` in the kind sandbox-manager
     chart), and the scenario's only forcing device is time. The reads are the
     knobs on the very pod that will do the evicting, the on-disk cache
-    directory, and sbx-manager's own eviction event.
+    directory, and the landed pod and execution rows of the wake.
     """
 
     def sandbox_pods(self, sandbox_id: str) -> list[SandboxPodView]:
@@ -2093,34 +2061,6 @@ class ColdEvictionControl(RestoreStateRead, SandboxEventRead, Protocol):
 
         Fails closed: an exec that could not run raises rather than reading
         as "gone".
-        """
-        ...
-
-    def local_evictions(
-        self,
-        sandbox_id: str,
-        *,
-        node_names: Collection[str] | None = None,
-        since_time: str | None = None,
-    ) -> list[LocalEviction]:
-        """`local_eviction_completed` events for the sandbox, from sandbox-manager logs."""
-        ...
-
-    def local_eviction_failures(
-        self,
-        sandbox_id: str,
-        *,
-        node_names: Collection[str] | None = None,
-        since_time: str | None = None,
-    ) -> list[LocalEviction]:
-        """`local_eviction_failed` events for the sandbox, from sandbox-manager logs.
-
-        The event alone does not prove the eviction claimed the local row:
-        sbx-manager emits it, with the same reason, for refusals before the
-        claim (an active cleanup fence, a live restore staging pull, a storage
-        error) as well as for a failed cleanup after it. The `error` tells
-        them apart. A claimed eviction leaves a durable cleanup job, and the
-        recovery that finishes that job emits no further eviction event.
         """
         ...
 
@@ -2149,23 +2089,13 @@ class SnapshotReaperConfig:
     idle_seconds: int
 
 
-@dataclass(frozen=True)
-class ReapedArtifact:
-    """One `snapshot reaper: deleted cache artifact via node-mgr` line."""
-
-    node_name: str
-    local_artifact_id: str
-    staging_path: str
-
-
 class SnapshotReaperControl(RestoreStateRead, Protocol):
     """Privileged reads for the snapshot reaper scenario. Nothing here mutates.
 
     The knobs are chart values read once at daemon start; the forcing device
     is a public fork plus time. The reads are the knobs on the worker the
-    source sandbox lives on, its on-disk snapshots directory, the reaper's own
-    per-candidate log line, and the cluster's record that the reaped artifact
-    had a ready remote copy.
+    source sandbox lives on, its on-disk snapshots directory, and the
+    cluster's record of which of its local artifacts have a ready remote copy.
     """
 
     def snapshot_reaper_config(self, node_name: str) -> SnapshotReaperConfig: ...
@@ -2178,21 +2108,13 @@ class SnapshotReaperControl(RestoreStateRead, Protocol):
         """
         ...
 
-    def reaped_artifacts(
-        self, node_name: str, sandbox_id: str, *, since_time: str
-    ) -> list[ReapedArtifact]:
-        """The reaper's per-candidate deletion lines for artifacts under this
-        sandbox's snapshots directory on that worker, since `since_time`.
-
-        The adapter owns the staging-path convention and the canonical id
-        form; orphan-sweep lines (no artifact id) are excluded.
-        """
+    def backed_local_artifacts(self, sandbox_id: str) -> tuple[str, ...]:
+        """Local artifact ids of the sandbox's `ready` snapshot rows with a live storage location."""
         ...
 
     def artifact_backed(self, sandbox_id: str, local_artifact_id: str) -> bool:
         """The cluster holds a `ready` snapshot row for exactly this local artifact
-        with a storage location — the reaper's "backup completed" precondition,
-        read from the control plane after the fact."""
+        with a storage location — the reaper's "backup completed" precondition."""
         ...
 
     def reaper_loop_log(self, node_name: str, *, since_time: str) -> list[str]:

@@ -77,24 +77,18 @@ from space_smoke.capabilities import (
     NetworkConfig,
     ProcessInfo,
     RetentionSweeperConfig,
-    RestoreActivation,
     ColdEvictionConfig,
-    LocalEviction,
-    ReapedArtifact,
     SnapshotReaperConfig,
     SandboxPodPlacement,
     SnapshotRecord,
-    BackupQueued,
-    BtrfsSendCapture,
-    CompletedTransfer,
     FailedTransfer,
     ReleaseStorageRow,
+    RestoreActivation,
     RestoreFailure,
-    TemplatePullLine,
+    TransferJobView,
     SnapshotRowFacts,
     StartupRecoveryReport,
     TemplateCacheGcConfig,
-    TemplateGcTick,
     TemplateRecoveryVerdict,
     WarmPoolCandidate,
     WarmPoolSelection,
@@ -460,7 +454,6 @@ EXECUTION_GENERATION_ANNOTATION = "space.pplx.net/execution-generation"
 TEMPLATE_CACHE_ROOT = "/space/cache/firecracker/templates"
 TEMPLATE_CACHE_OWNER = "space-tmplmgr"
 TEMPLATE_CACHE_GROUP = "space-cache-rw"
-TEMPLATE_GC_TICK_MESSAGE = "template GC tick complete"
 # template-manager's startup recovery pass (`service/startup_recovery.rs`).
 # Every verdict is a tracing event. Older images reported the prune as a raw
 # `[template-mgr] pruning stale build: ` stderr line, which is still accepted.
@@ -489,10 +482,6 @@ KIND_TELEMETRY_MODES = {
     ("otlp", "otlp"): "otel",
     ("off", "off"): "off",
 }
-# The suspend codec facts sbx-manager seals into the published sidecar and
-# reports on its own `artifact_backup_queued` event.
-BACKUP_QUEUED_EVENT = "artifact_backup_queued"
-RESTORE_FAILED_EVENT = "snapshot_restore_failed"
 # A local row is dead only when neither the cluster row nor a warm-pool slot
 # claims the id (a pool clone has a local row before any `sandboxes` row).
 SANDBOX_LIVE_SQL = """\
@@ -523,8 +512,6 @@ _LOCAL_DELETE_RETRY_MARKERS = (
 )
 _LOCAL_DELETE_STUCK_SUSPEND_MARKER = "suspend completion has not reached the cluster"
 _TERMINAL_POD_PHASES = frozenset({"Succeeded", "Failed"})
-TEMPLATE_PULL_PLAN_MESSAGE = "vol-mgr pull plan resolved from manifest"
-TEMPLATE_PULL_START_MESSAGE = "resolved template release; starting pull"
 SUSPEND_SNAPSHOT_TEMPLATE_HASH_SQL = """\
 SELECT content_hash
   FROM snapshots
@@ -534,15 +521,10 @@ SELECT content_hash
 """
 _TEMPLATE_IN_USE_MARKER = "sandbox(es) were created from"
 BTRFS_SEND_V1 = "btrfs-send-v1"
-# sandbox-manager's encode line for the stream codec; `deferred=true` means
-# the capture retained its source and wrote no `rootfs.btrfs-send`
-# (crates/libs/sbx/mgr/server/src/service/grpc_lifecycle/suspend_snapshot.rs).
-BTRFS_SEND_ENCODED_MESSAGE = "btrfs-send codec: rootfs encoded as btrfs send -p stream (via nodemgr)"
 RETAINED_SOURCE_BUNDLE = "rootfs.btrfs-source"
 ROOTFS_SEND_FILE = "rootfs.btrfs-send"
-# volume-manager's line for every single-file transfer job, the streamed
-# `push_btrfs_send` included (crates/libs/vol/mgr/server/src/executor.rs).
-TRANSFER_JOB_COMPLETED_MESSAGE = "transfer job completed"
+# volume-manager's line for every failed single-file transfer attempt, the
+# streamed `push_btrfs_send` included (crates/libs/vol/mgr/server/src/executor.rs).
 TRANSFER_JOB_FAILED_MESSAGE = "transfer job failed"
 # node-manager's relay refuses a send stream whose framing breaks, as a kernel
 # send restarted mid-pipe does, before forwarding it; volume-manager's failed
@@ -598,6 +580,17 @@ for d in /proc/[0-9]*; do
 done
 true
 """
+# The rootfs object each suspend codec publishes under the snapshot's storage
+# prefix (`SnapshotArtifact` in crates/libs/common/core/src/types/object_store.rs).
+SUSPEND_ROOTFS_OBJECTS = {BTRFS_SEND_V1: ROOTFS_SEND_FILE, "full": "rootfs"}
+# The AWS CLI's refusal when nothing listens on the endpoint.
+_OBJECT_STORE_UNREACHABLE = "Could not connect to the endpoint URL"
+RESTORE_FAILED_EVENT = "snapshot_restore_failed"
+# `space-volmgr jobs` prints a comfy-table: `│ <id> ┆ <status> ┆ ...`.
+_TRANSFER_JOB_ROW = re.compile(r"│\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\s*┆")
+# A storage URI's query can carry endpoint credentials; log evidence keeps the
+# scheme and drops the rest.
+_STORAGE_URI = re.compile(r"s3://[^\s\"',}\]]*")
 # `SPACE_TEMPLATE_RECEIVED_UUID_NS` (crates/libs/common/core/src/host/btrfs.rs):
 # a template installed from `(name, content_hash)` is stamped with
 # `UUIDv5(NS, "name@content_hash")` so a btrfs-send stream produced against
@@ -655,7 +648,6 @@ _COLD_EVICTION_DEFAULT_ENGAGE = 0.75
 _COLD_EVICTION_DEFAULT_TARGET = 0.70
 _COLD_EVICTION_DEFAULT_MIN_IDLE_SECONDS = 25 * 60 * 60
 _COLD_EVICTION_DEFAULT_INTERVAL_SECONDS = 600
-REAPER_DELETED_MESSAGE = "snapshot reaper: deleted cache artifact via node-mgr"
 _REAPER_DEFAULT_ENGAGE = 0.50
 _REAPER_DEFAULT_INTERVAL_SECONDS = 300
 _REAPER_DEFAULT_GRACE_SECONDS = 1800
@@ -664,6 +656,16 @@ _REAPER_DEFAULT_IDLE_SECONDS = 86_400
 # The reaper's own precondition, read from the control plane: a `ready`
 # snapshot row for exactly this local artifact that has a live (not orphaned)
 # storage location — the same predicate the fork store waits on.
+BACKED_LOCAL_ARTIFACTS_SQL = """\
+SELECT DISTINCT s.local_artifact_id
+  FROM snapshots s
+  JOIN snapshot_storage_locations l ON l.snapshot_id = s.id
+ WHERE s.sandbox_id = '{sandbox_id}'::uuid
+   AND s.local_artifact_id IS NOT NULL
+   AND s.state = 'ready'
+   AND l.orphaned_at IS NULL
+ ORDER BY 1;
+"""
 ARTIFACT_BACKED_SQL = """\
 SELECT EXISTS (
   SELECT 1
@@ -1607,7 +1609,7 @@ class KindHarness:
         _require_ok(result, "inject a crash after snapshot byte deletion")
 
     def _snapshot_storage_target(
-        self, record: SnapshotRecord
+        self, record: SnapshotRecord | SnapshotRowFacts
     ) -> tuple[str, str, str, dict[str, str | None]]:
         parsed = urlsplit(record.storage_uri)
         raw_prefix = parsed.path.lstrip("/").rstrip("/")
@@ -1677,7 +1679,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             action="delete run-scoped ECW API key",
         )
 
-    # ----- NodeFaultControl / RestoreStateRead / SandboxEventRead ----------------
+    # ----- NodeFaultControl / RestoreStateRead / RestorePodRead -----------------
     #
     # The cross-node durable-restore scenario forces a restore off the node
     # that holds the suspended bytes. Kubernetes offers no per-sandbox "restore
@@ -1795,6 +1797,41 @@ ON CONFLICT (key_hash) DO NOTHING;
             )
         return value == "t"
 
+    def _worker_sandbox_lines(
+        self,
+        canonical_sandbox_id: str,
+        *,
+        node_names: Collection[str] | None,
+        since_time: str | None,
+    ) -> list[tuple[str, str]]:
+        """(node, line) for every worker sandbox-manager log line naming the sandbox.
+
+        `since_time` bounds the read so a long-lived bench does not scan history.
+        """
+
+        listing = self.kubectl(
+            "get", "pods", "-l", _node_service_selector(NODE_SANDBOX_MANAGER),
+            "-o", "json", timeout=15,
+        )
+        _require_ok(listing, "list worker sandbox-manager pods")
+        wanted = set(node_names) if node_names is not None else None
+        lines: list[tuple[str, str]] = []
+        for pod in json.loads(listing.stdout or "{}").get("items", []):
+            pod_name = pod.get("metadata", {}).get("name", "")
+            node_name = pod.get("spec", {}).get("nodeName", "")
+            if not pod_name or (wanted is not None and node_name not in wanted):
+                continue
+            args = ["logs", pod_name, "-c", NODE_SANDBOX_MANAGER]
+            args += ["--since-time", since_time] if since_time else ["--tail=50000"]
+            logs = self.kubectl(*args, timeout=60)
+            _require_ok(logs, f"read sandbox-manager logs on {node_name or pod_name}")
+            lines += [
+                (node_name, line)
+                for line in logs.stdout.splitlines()
+                if canonical_sandbox_id in line
+            ]
+        return lines
+
     def _sandbox_events(
         self,
         canonical_sandbox_id: str,
@@ -1805,41 +1842,42 @@ ON CONFLICT (key_hash) DO NOTHING;
     ) -> list[tuple[str, dict[str, Any]]]:
         """(node, event) for every structured sandbox event of one type.
 
-        Read from the worker sandbox-managers' logs; `since_time` bounds the
-        read so a long-lived bench does not scan history.
+        Sandbox events are a documented contract (`crates/libs/events/README.md`);
+        callers poll for one and judge its fields, never its absence or count.
         """
 
-        listing = self.kubectl(
-            "get", "pods", "-l", _node_service_selector(NODE_SANDBOX_MANAGER),
-            "-o", "json", timeout=15,
-        )
-        _require_ok(listing, "list worker sandbox-manager pods")
-        wanted = set(node_names) if node_names is not None else None
         needle = f'"{event_type}"'
         events: list[tuple[str, dict[str, Any]]] = []
-        for pod in json.loads(listing.stdout or "{}").get("items", []):
-            pod_name = pod.get("metadata", {}).get("name", "")
-            node_name = pod.get("spec", {}).get("nodeName", "")
-            if not pod_name or (wanted is not None and node_name not in wanted):
+        for node_name, line in self._worker_sandbox_lines(
+            canonical_sandbox_id, node_names=node_names, since_time=since_time
+        ):
+            if needle not in line:
                 continue
-            args = ["logs", pod_name, "-c", NODE_SANDBOX_MANAGER]
-            args += ["--since-time", since_time] if since_time else ["--tail=50000"]
-            logs = self.kubectl(*args, timeout=60)
-            _require_ok(logs, f"read sandbox-manager logs on {node_name or pod_name}")
-            for line in logs.stdout.splitlines():
-                if needle not in line or canonical_sandbox_id not in line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except ValueError:
-                    continue
-                if (
-                    isinstance(event, dict)
-                    and event.get("event_type") == event_type
-                    and event.get("sandbox_id") == canonical_sandbox_id
-                ):
-                    events.append((node_name, event))
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if (
+                isinstance(event, dict)
+                and event.get("event_type") == event_type
+                and event.get("sandbox_id") == canonical_sandbox_id
+            ):
+                events.append((node_name, event))
         return events
+
+    def sandbox_manager_log(
+        self,
+        sandbox_id: str,
+        *,
+        node_names: Collection[str] | None = None,
+        since_time: str,
+    ) -> list[str]:
+        """The worker sandbox-managers' lines naming the sandbox, for failure evidence."""
+
+        lines = self._worker_sandbox_lines(
+            _sql_uuid(sandbox_id), node_names=node_names, since_time=since_time
+        )
+        return [f"{node}: {_redact_storage_uris(line)[:400]}" for node, line in lines][-40:]
 
     def restore_activations(
         self,
@@ -1864,6 +1902,22 @@ ON CONFLICT (key_hash) DO NOTHING;
             )
             for node_name, event in self._sandbox_events(
                 canonical, "runtime_activated", node_names=node_names, since_time=since_time
+            )
+        ]
+
+    def restore_failures(self, sandbox_id: str, *, since_time: str) -> list[RestoreFailure]:
+        canonical = _sql_uuid(sandbox_id)
+        return [
+            RestoreFailure(
+                node_name=node,
+                operation=str(event.get("operation", "")),
+                reason=str(event.get("reason", "")),
+                error_kind=str(event.get("error_kind", "")),
+                error=_redact_storage_uris(str(event.get("error", ""))),
+                restore_codec=str(event.get("restore_codec", "")),
+            )
+            for node, event in self._sandbox_events(
+                canonical, RESTORE_FAILED_EVENT, node_names=None, since_time=since_time
             )
         ]
 
@@ -2024,19 +2078,37 @@ ON CONFLICT (key_hash) DO NOTHING;
             )
         return tuple(line.strip() for line in result.stdout.splitlines() if line.strip())
 
-    def btrfs_send_captures(
-        self, sandbox_id: str, node_name: str, *, since_time: str
-    ) -> list[BtrfsSendCapture]:
-        logs = self._node_service_logs(node_name, NODE_SANDBOX_MANAGER, since_time=since_time)
-        return _btrfs_send_captures_from_logs(logs, _sql_uuid(sandbox_id), node_name)
-
-    def completed_transfers(
-        self, sandbox_id: str, node_name: str, *, since_time: str
-    ) -> list[CompletedTransfer]:
-        logs = self._node_service_logs(node_name, NODE_VOLUME_MANAGER, since_time=since_time)
-        return _completed_transfers_from_logs(
-            logs, f"{SANDBOX_CACHE_ROOT}/{_sql_uuid(sandbox_id)}/", node_name
+    def transfer_jobs(self, node_name: str, sandbox_id: str) -> list[TransferJobView]:
+        subject = shlex.quote(f"sandbox:{_sql_uuid(sandbox_id)}")
+        listing = _require_ok(
+            self._node_shell_exec(node_name, f"space-volmgr jobs --subject {subject}", timeout=30),
+            f"list volume-manager transfer jobs on {node_name}",
         )
+        # A row's first cell is the job id; the header and borders hold none.
+        job_ids = [
+            match.group(1)
+            for match in (_TRANSFER_JOB_ROW.match(line.strip()) for line in listing.splitlines())
+            if match
+        ]
+        jobs: list[TransferJobView] = []
+        for job_id in job_ids:
+            shown = _require_ok(
+                self._node_shell_exec(node_name, f"space-volmgr job {shlex.quote(job_id)}", timeout=30),
+                f"show volume-manager transfer job {job_id} on {node_name}",
+            )
+            fields = {
+                key.strip(): value.strip()
+                for key, _, value in (line.partition(":") for line in shown.splitlines())
+            }
+            jobs.append(
+                TransferJobView(
+                    job_id=fields.get("id", job_id),
+                    kind=fields.get("kind", ""),
+                    status=fields.get("status", ""),
+                    local_path=fields.get("local_path", ""),
+                )
+            )
+        return jobs
 
     def failed_transfers(
         self, sandbox_id: str, node_name: str, *, since_time: str
@@ -2087,43 +2159,6 @@ ON CONFLICT (key_hash) DO NOTHING;
             )
         return tuple(line.strip() for line in result.stdout.splitlines() if line.strip())
 
-    def reaped_artifacts(
-        self, node_name: str, sandbox_id: str, *, since_time: str
-    ) -> list[ReapedArtifact]:
-        # The staging-path convention (`<cache>/<canonical uuid>/snapshots/…`)
-        # is the adapter's to know; the caller hands over whatever id form the
-        # SDK gave it and the join uses the same canonical form the reaper
-        # itself writes.
-        prefix = f"{SANDBOX_CACHE_ROOT}/{_sql_uuid(sandbox_id)}/snapshots/"
-        logs = self._node_service_logs(
-            node_name, NODE_SANDBOX_MANAGER, since_time=since_time
-        )
-        reaped: list[ReapedArtifact] = []
-        for line in logs.splitlines():
-            if REAPER_DELETED_MESSAGE not in line:
-                continue
-            fields = _tracing_fields(line)
-            if fields is None or fields.get("message") != REAPER_DELETED_MESSAGE:
-                continue
-            # The orphan sweep logs the same message with `candidate` set to
-            # "tick-sweep" / "startup-sweep". That is a *previous* reap whose
-            # node-mgr delete failed and left a `.gc-pending-*` directory —
-            # evidence of a failure, not of the reap under test. Only a
-            # per-candidate line names an artifact id.
-            if not _looks_like_uuid(str(fields.get("candidate", ""))):
-                continue
-            staging_path = str(fields.get("staging_path", ""))
-            if not staging_path.startswith(prefix):
-                continue
-            reaped.append(
-                ReapedArtifact(
-                    node_name=node_name,
-                    local_artifact_id=str(fields.get("candidate", "")),
-                    staging_path=staging_path,
-                )
-            )
-        return reaped
-
     def artifact_backed(self, sandbox_id: str, local_artifact_id: str) -> bool:
         value = self._psql(
             ARTIFACT_BACKED_SQL.format(
@@ -2136,74 +2171,38 @@ ON CONFLICT (key_hash) DO NOTHING;
             raise SmokeConfigurationError(f"unexpected artifact backup query result: {value!r}")
         return value == "t"
 
+    def backed_local_artifacts(self, sandbox_id: str) -> tuple[str, ...]:
+        rows = self._psql(
+            BACKED_LOCAL_ARTIFACTS_SQL.format(sandbox_id=_sql_uuid(sandbox_id)),
+            action="list the sandbox's backed local artifacts",
+        )
+        return tuple(line.strip() for line in rows.splitlines() if line.strip())
+
     def reaper_loop_log(self, node_name: str, *, since_time: str) -> list[str]:
         logs = self._node_service_logs(
             node_name, NODE_SANDBOX_MANAGER, since_time=since_time
         )
-        return [line[:400] for line in logs.splitlines() if "snapshot reaper" in line][-40:]
+        return [
+            _redact_storage_uris(line)[:400] for line in logs.splitlines() if "snapshot reaper" in line
+        ][-40:]
 
     def eviction_loop_log(self, node_name: str, *, since_time: str) -> list[str]:
         logs = self._node_service_logs(
             node_name, NODE_SANDBOX_MANAGER, since_time=since_time
         )
         return [
-            line[:400]
+            _redact_storage_uris(line)[:400]
             for line in logs.splitlines()
             if "sandbox eviction" in line and "tick complete" not in line
         ][-40:]
 
-    def local_evictions(
-        self,
-        sandbox_id: str,
-        *,
-        node_names: Collection[str] | None = None,
-        since_time: str | None = None,
-    ) -> list[LocalEviction]:
-        return self._local_eviction_events(
-            sandbox_id,
-            "local_eviction_completed",
-            node_names=node_names,
-            since_time=since_time,
+    def template_gc_log(self, node_name: str, *, since_time: str) -> list[str]:
+        logs = self._node_service_logs(
+            node_name, NODE_TEMPLATE_MANAGER, since_time=since_time
         )
-
-    def local_eviction_failures(
-        self,
-        sandbox_id: str,
-        *,
-        node_names: Collection[str] | None = None,
-        since_time: str | None = None,
-    ) -> list[LocalEviction]:
-        return self._local_eviction_events(
-            sandbox_id,
-            "local_eviction_failed",
-            node_names=node_names,
-            since_time=since_time,
-        )
-
-    def _local_eviction_events(
-        self,
-        sandbox_id: str,
-        event_type: str,
-        *,
-        node_names: Collection[str] | None,
-        since_time: str | None,
-    ) -> list[LocalEviction]:
-        canonical = _sql_uuid(sandbox_id)
         return [
-            LocalEviction(
-                sandbox_id=canonical,
-                node_name=node_name,
-                reason=str(event.get("reason", "")),
-                snapshot_id=str(event.get("snapshot_id", "")),
-                error=str(event.get("error", "")),
-            )
-            for node_name, event in self._sandbox_events(
-                canonical,
-                event_type,
-                node_names=node_names,
-                since_time=since_time,
-            )
-        ]
+            _redact_storage_uris(line)[:400] for line in logs.splitlines() if "template GC" in line
+        ][-40:]
 
     def require_encrypted_volume_support(self) -> None:
         """Reject missing host targets before creating an owned BYOK identity."""
@@ -2539,20 +2538,6 @@ ON CONFLICT (key_hash) DO NOTHING;
 
     # --- btrfs-send codec failure matrix ---------------------------------
 
-    def backup_queued_events(self, sandbox_id: str, *, since_time: str) -> list[BackupQueued]:
-        canonical = _sql_uuid(sandbox_id)
-        return [
-            BackupQueued(
-                node_name=node,
-                snapshot_id=str(event.get("snapshot_id", "")),
-                rootfs_diff_format=str(event.get("rootfs_diff_format", "")),
-                object_uri=str(event.get("object_uri", "")),
-            )
-            for node, event in self._sandbox_events(
-                canonical, BACKUP_QUEUED_EVENT, node_names=None, since_time=since_time
-            )
-        ]
-
     def suspend_snapshot_template_hash(self, sandbox_id: str) -> str:
         digest = self._psql(
             SUSPEND_SNAPSHOT_TEMPLATE_HASH_SQL.format(sandbox_id=_sql_uuid(sandbox_id)),
@@ -2700,31 +2685,6 @@ ON CONFLICT (key_hash) DO NOTHING;
             raise SmokeConfigurationError("the bench has no sandbox-pool nodes")
         return nodes
 
-    def template_pulls(
-        self, node_name: str, template: str, *, since_time: str
-    ) -> list[TemplatePullLine]:
-        name = _template_name(template)
-        logs = self._node_service_logs(
-            node_name, NODE_TEMPLATE_MANAGER, since_time=since_time
-        )
-        # The pull-span `trigger` rides on the lines template-manager writes
-        # inside the span ("starting pull", "already present", "joining
-        # in-flight"); the vol-mgr plan line runs in a task outside it and
-        # carries none. Keep both: the trigger says which lookup initiated a
-        # pull, the plan line says bytes actually came in.
-        lines: list[TemplatePullLine] = []
-        for line in logs.splitlines():
-            if name not in line or "pull" not in line:
-                continue
-            fields = _tracing_fields(line)
-            if fields is None or str(fields.get("template", "")) != name:
-                continue
-            message = str(fields.get("message", ""))
-            if "pull" not in message:
-                continue
-            lines.append(TemplatePullLine(str(fields.get("trigger") or ""), message))
-        return lines
-
     def template_subvolume_received_uuid(
         self, node_name: str, template: str, digest: str
     ) -> str | None:
@@ -2772,21 +2732,38 @@ ON CONFLICT (key_hash) DO NOTHING;
             raise RuntimeError(f"sandbox {sandbox_id} has no instance on {node_name}")
         return _require_ok(result, f"inspect instance on {node_name}").strip() == "yes"
 
-    def restore_failures(self, sandbox_id: str, *, since_time: str) -> list[RestoreFailure]:
-        canonical = _sql_uuid(sandbox_id)
-        return [
-            RestoreFailure(
-                node_name=node,
-                operation=str(event.get("operation", "")),
-                reason=str(event.get("reason", "")),
-                error_kind=str(event.get("error_kind", "")),
-                error=str(event.get("error", "")),
-                restore_codec=str(event.get("restore_codec", "")),
+    def snapshot_object_names(self, snapshot: SnapshotRowFacts) -> tuple[str, ...]:
+        bucket, prefix, endpoint, environment = self._snapshot_storage_target(snapshot)
+        # The localhost forward to the object store exits on the first request
+        # after its pod was replaced (a scenario that scaled the store down)
+        # and its supervisor reconnects within seconds; only that refusal is
+        # retried.
+        deadline = time.monotonic() + 30
+        while True:
+            result = self.executor.run(
+                [
+                    "aws", "--no-cli-pager", "--endpoint-url", endpoint,
+                    "s3api", "list-objects-v2", "--bucket", bucket, "--prefix", prefix,
+                    "--delimiter", "/", "--output", "json",
+                ],
+                env=environment,
+                timeout=30,
             )
-            for node, event in self._sandbox_events(
-                canonical, RESTORE_FAILED_EVENT, node_names=None, since_time=since_time
-            )
-        ]
+            if (
+                result.returncode == 0
+                or _OBJECT_STORE_UNREACHABLE not in result.detail()
+                or time.monotonic() >= deadline
+            ):
+                break
+            time.sleep(2)
+        output = _require_ok(result, "list the snapshot's objects")
+        try:
+            contents = (json.loads(output or "{}") or {}).get("Contents") or []
+            return tuple(sorted(str(item["Key"])[len(prefix):] for item in contents))
+        except (AttributeError, KeyError, TypeError, ValueError) as error:
+            raise RuntimeError(
+                f"object-store listing returned an invalid document: snapshot_id={snapshot.snapshot_id}"
+            ) from error
 
     def snapshot_row_facts(self, sandbox_id: str) -> list[SnapshotRowFacts]:
         rows = self._psql(
@@ -4792,30 +4769,6 @@ ON CONFLICT (key_hash) DO NOTHING;
             log = previous.stdout + log
         return _parse_startup_recovery(node_name, pod, log)
 
-    def template_gc_ticks(
-        self, node_name: str, *, since_time: str
-    ) -> list[TemplateGcTick]:
-        logs = self._node_service_logs(
-            node_name, NODE_TEMPLATE_MANAGER, since_time=since_time
-        )
-        ticks: list[TemplateGcTick] = []
-        for line in logs.splitlines():
-            if TEMPLATE_GC_TICK_MESSAGE not in line:
-                continue
-            fields = _tracing_fields(line)
-            if fields is None or fields.get("message") != TEMPLATE_GC_TICK_MESSAGE:
-                continue
-            ticks.append(
-                TemplateGcTick(
-                    node_name=node_name,
-                    candidates=_int_field(fields, "candidates"),
-                    deleted=_int_field(fields, "deleted"),
-                    bytes_before=_int_field(fields, "bytes_before"),
-                    bytes_freed=_int_field(fields, "bytes_freed"),
-                )
-            )
-        return ticks
-
     def telemetry_query(self, backend: str, path: str, params: Mapping[str, str]) -> Any:
         base = KIND_TELEMETRY_BACKENDS[backend]
         url = base + path
@@ -5262,64 +5215,12 @@ def _snapshot_reaper_config_from_env(env: Mapping[str, str | None]) -> SnapshotR
     )
 
 
-def _btrfs_send_captures_from_logs(
-    logs: str, canonical_sandbox_id: str, node_name: str
-) -> list[BtrfsSendCapture]:
-    """The sandbox's btrfs-send captures in `logs`, in log order."""
-
-    captures: list[BtrfsSendCapture] = []
-    for line in logs.splitlines():
-        if BTRFS_SEND_ENCODED_MESSAGE not in line:
-            continue
-        fields = _tracing_fields(line)
-        if fields is None or fields.get("message") != BTRFS_SEND_ENCODED_MESSAGE:
-            continue
-        if str(fields.get("sandbox_id", "")) != canonical_sandbox_id:
-            continue
-        deferred = str(fields.get("deferred", "false")).lower() == "true"
-        try:
-            stream_bytes = int(fields.get("stream_bytes", 0) or 0)
-        except (TypeError, ValueError):
-            stream_bytes = 0
-        captures.append(
-            BtrfsSendCapture(
-                node_name=node_name,
-                sandbox_id=canonical_sandbox_id,
-                stream_bytes=stream_bytes,
-                deferred=deferred,
-            )
-        )
-    return captures
 
 
-def _completed_transfers_from_logs(
-    logs: str, path_prefix: str, node_name: str
-) -> list[CompletedTransfer]:
-    """Completed transfer jobs in `logs` whose local path is under `path_prefix`."""
+def _redact_storage_uris(text: str) -> str:
+    """`text` with every storage URI replaced by its scheme, for attached evidence."""
 
-    transfers: list[CompletedTransfer] = []
-    for line in logs.splitlines():
-        if TRANSFER_JOB_COMPLETED_MESSAGE not in line:
-            continue
-        fields = _tracing_fields(line)
-        if fields is None or fields.get("message") != TRANSFER_JOB_COMPLETED_MESSAGE:
-            continue
-        local_path = str(fields.get("local_path", ""))
-        if not local_path.startswith(path_prefix):
-            continue
-        try:
-            transferred = int(fields.get("bytes", 0) or 0)
-        except (TypeError, ValueError):
-            transferred = 0
-        transfers.append(
-            CompletedTransfer(
-                node_name=node_name,
-                kind=str(fields.get("kind", "")),
-                local_path=local_path,
-                bytes=transferred,
-            )
-        )
-    return transfers
+    return _STORAGE_URI.sub("s3://<redacted>", text)
 
 
 def _failed_transfers_from_logs(
@@ -5601,17 +5502,6 @@ def _newest_pod_render(pod_list_json: str) -> SandboxPodRender | None:
     )
 
 
-def _int_field(fields: Mapping[str, Any], key: str) -> int:
-    value = fields.get(key, 0)
-    if isinstance(value, bool):
-        return int(value)
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and value.isdigit():
-        return int(value)
-    return 0
-
-
 def _smoke_template_name(value: str) -> str:
     """Only the scenarios' own throwaway names reach the on-node shell."""
 
@@ -5640,10 +5530,6 @@ def _template_name(value: str) -> str:
 
 
 _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-
-
-def _looks_like_uuid(value: str) -> bool:
-    return _UUID_RE.fullmatch(value.strip().lower()) is not None
 
 
 def _ecw_sandbox_id(value: str) -> str:

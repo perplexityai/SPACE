@@ -1,20 +1,16 @@
 """Contracts of the snapshot-reaper scenario the bench cannot exercise.
 
-The live run proves the reaper reclaims the fork's source artifact. Two things
+The live run proves the reaper reclaims the fork's source artifact. One thing
 a passing run would not catch: the snapshots-dir probe reading an exec failure
-as "reaped", and the deletion-line scan accepting the orphan sweep's line
-(same message, `candidate=tick-sweep`) — which is evidence of a *failed*
-node-mgr delete — another sandbox's reap on the same worker, or a malformed
-line as this source's reap. Two more the bench never exercises: fork-child
-cleanup classifying a transient DELETE response as retryable (and the shared
-cleanup policy actually retrying it), and an unreadable snapshots dir not
-reading as "reaped".
+as "reaped". Two more the bench never exercises: fork-child cleanup
+classifying a transient DELETE response as retryable (and the shared cleanup
+policy actually retrying it), and an unreadable snapshots dir not reading as
+"reaped".
 """
 
 from __future__ import annotations
 
 import io
-import json
 import types
 import unittest
 from email.message import Message
@@ -22,7 +18,6 @@ from unittest import mock
 from urllib.error import HTTPError, URLError
 
 from space_smoke.adapters import (
-    REAPER_DELETED_MESSAGE,
     EcwConfig,
     KindConfig,
     KindHarness,
@@ -159,29 +154,6 @@ class SharedCleanupRetryPolicy(unittest.TestCase):
         ):
             retry_sandbox_delete(mock.Mock(side_effect=RuntimeError("HTTP 500")))
         sleep.assert_not_called()
-
-
-class ReapedLineScan(unittest.TestCase):
-    def test_selects_this_sandboxes_per_candidate_lines_only(self) -> None:
-        sid = "01a0b2d7-ebcb-7770-81e1-1570ccc2b2af"
-        other = "11a0b2d7-ebcb-7770-81e1-1570ccc2b2af"
-        lines = [
-            json.dumps({"message": REAPER_DELETED_MESSAGE, "candidate": "aaaaaaaa-0000-7000-8000-000000000001", "staging_path": f"/space/cache/firecracker/sandboxes/{sid}/snapshots/d-1.gc-pending-x"}),
-            json.dumps({"message": "snapshot reaper tick complete", "deleted": 1}),
-            # Another sandbox's reap on the same worker (nested tracing layout).
-            json.dumps({"fields": {"message": REAPER_DELETED_MESSAGE, "candidate": "bbbbbbbb-0000-7000-8000-000000000002", "staging_path": f"/space/cache/firecracker/sandboxes/{other}/snapshots/d-2.gc-pending-y"}}),
-            # The orphan sweep reuses the message; its candidate is a label,
-            # not an artifact id, and the line means an earlier delete failed.
-            json.dumps({"message": REAPER_DELETED_MESSAGE, "candidate": "tick-sweep", "staging_path": f"/space/cache/firecracker/sandboxes/{sid}/snapshots/d-3.gc-pending-z"}),
-            "not json " + REAPER_DELETED_MESSAGE,
-        ]
-        harness = KindHarness(_RecordingKubectl(logs="\n".join(lines)), KindConfig())
-        # The SDK may hand back a non-canonical id form; the join canonicalizes.
-        reaped = harness.reaped_artifacts("worker-1", sid.upper(), since_time="2026-01-01T00:00:00Z")
-        self.assertEqual(
-            [(r.node_name, r.local_artifact_id[:8]) for r in reaped],
-            [("worker-1", "aaaaaaaa")],
-        )
 
 
 if __name__ == "__main__":

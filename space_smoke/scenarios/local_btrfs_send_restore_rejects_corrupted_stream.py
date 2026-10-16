@@ -27,8 +27,8 @@ def btrfs_send_restore_rejects_corrupted_stream(test: smoke.KindEcw) -> None:
     """A sandbox suspended with the production stream codec whose durable
     stream is corrupted in object storage fails to restore onto another worker:
     the client sees the failure, sbx-manager reports the restore failed at the
-    receive with node-manager's aborted `btrfs receive`,
-    and the target holds no instance or partial receive."""
+    receive with node-manager's aborted `btrfs receive`, and the target holds
+    no instance or partial receive."""
 
     codec = test.suspend_codec
     restore = test.cross_node_restore
@@ -43,11 +43,10 @@ def btrfs_send_restore_rejects_corrupted_stream(test: smoke.KindEcw) -> None:
         codec.require_btrfs_send_default(source_worker)
 
     with test.phase("suspend without naming a format"):
-        suspended_at = codec.mark_since()
         test.pause()
 
     with test.phase("the suspend was sealed as btrfs-send-v1"):
-        codec.expect_suspend_codec(since_time=suspended_at)
+        codec.expect_suspend_codec()
 
     with test.phase("wait until the durable snapshot is what a restore would select"):
         restore.wait_until_restore_portable()
