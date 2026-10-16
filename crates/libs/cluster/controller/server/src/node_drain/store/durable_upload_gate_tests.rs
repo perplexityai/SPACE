@@ -1692,13 +1692,11 @@ async fn mark_failed_on_node(
     sandbox_id: SandboxId,
     source_node_id: NodeId,
 ) -> TestResult<Vec<String>> {
-    let evacuable_strs: Vec<&'static str> =
-        EVACUABLE_LIFECYCLES.iter().map(|lc| lc.as_str()).collect();
     Ok(
         sqlx::query_scalar::<_, String>(mark_sandbox_failed_on_node_query())
             .bind(sandbox_id)
             .bind(source_node_id)
-            .bind(&evacuable_strs)
+            .bind(mark_sandbox_failed_on_node_lifecycles())
             .fetch_all(pool)
             .await?,
     )
@@ -1715,8 +1713,8 @@ async fn evacuation_marker_of(pool: &PgPool, sandbox_id: SandboxId) -> TestResul
 
 /// The failed-on-node give-up flip. A sandbox `started`/`paused`
 /// and active on the draining node is flipped to `failed` with its
-/// evacuation marker cleared; a sandbox that drifted to another node or is
-/// in a non-evacuable lifecycle is left untouched (the CAS misses).
+/// evacuation marker cleared; a sandbox that drifted to another node, is in a
+/// non-evacuable lifecycle, or is `stopped` is left untouched (the CAS misses).
 #[tokio::test(flavor = "current_thread")]
 async fn mark_failed_on_node_flips_evacuable_active_rows_only() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
@@ -1749,6 +1747,14 @@ async fn mark_failed_on_node_flips_evacuable_active_rows_only() -> TestResult {
     insert_sandbox(pool, suspended, "suspended", Some(node)).await?;
     pin_active_and_age(pool, suspended, node, None, 0).await?;
 
+    // (E) stopped + active on node → CAS misses. `stopped` is evacuable, but
+    //     not by the suspend pipeline whose refusal this flip answers, and its
+    //     rootfs is the sandbox's only copy: a user stopping the sandbox
+    //     between the refused suspend and this write must not lose it.
+    let stopped = SandboxId::new();
+    insert_sandbox(pool, stopped, "stopped", Some(node)).await?;
+    pin_active_and_age(pool, stopped, node, None, 0).await?;
+
     assert_eq!(
         mark_failed_on_node(pool, started, node).await?,
         vec!["started".to_string()],
@@ -1778,6 +1784,13 @@ async fn mark_failed_on_node_flips_evacuable_active_rows_only() -> TestResult {
         "a non-evacuable lifecycle must not be flipped"
     );
     assert_eq!(lifecycle_of(pool, suspended).await?, "suspended");
+
+    assert!(
+        mark_failed_on_node(pool, stopped, node).await?.is_empty(),
+        "a stopped sandbox must not be flipped to failed: the flip deletes its execution, \
+         and a stopped rootfs is the only copy"
+    );
+    assert_eq!(lifecycle_of(pool, stopped).await?, "stopped");
     Ok(())
 }
 

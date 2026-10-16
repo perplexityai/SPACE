@@ -912,6 +912,141 @@ mod stopped_restore_plan_tests {
 
         Ok(())
     }
+
+    /// The plan a `start` gets for a stopped sandbox a forced drain is
+    /// evacuating. The operator-visible properties, in the order a sandbox
+    /// passes through them:
+    ///
+    /// * claimed but not yet torn down, it still restarts on its own node —
+    ///   its rootfs is there, and nothing ever clears a stale marker, so
+    ///   refusing on the claim would strand a sandbox that is fine;
+    /// * torn down, `start` is told to retry, **even once its disk is durable
+    ///   in S3** — the drained node has no bytes, and sandbox-manager cannot
+    ///   yet boot a same-id disk artifact, so planning either would hand the
+    ///   caller a pod that never comes up instead of a 503.
+    ///
+    /// The last phase clears the marker on the same row, and the plan then
+    /// resolves both sources. That proves the marker is what refuses: the
+    /// fixture had a resolvable node name and a durable artifact all along.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_start_is_refused_while_a_stopped_evacuation_has_unplaced_the_sandbox() -> TestResult
+    {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let substrate = substrate_with_store_and_client(
+            pool.clone(),
+            mock_kubernetes_client(Arc::new(Mutex::new(Vec::new()))),
+        );
+        let uri = "s3://space-test/evacuated-stopped-disk?region=us-east-1";
+
+        let sandbox_id = SandboxId::new();
+        insert_stopped_sandbox(&pool, sandbox_id).await?;
+        let node_id = NodeId::new();
+        insert_ready_worker_node(&pool, node_id).await?;
+        substrate
+            .store
+            .ensure_active_execution_row(sandbox_id)
+            .await?;
+        substrate
+            .store
+            .persist_pod_node_placement(
+                sandbox_id,
+                "drained-node",
+                "drained-node-uid",
+                node_id,
+                NodeRole::Worker,
+                None,
+            )
+            .await?;
+        sqlx::query("UPDATE sandboxes SET evacuation_restore_target = 'stopped' WHERE id = $1")
+            .bind(sandbox_id)
+            .execute(&pool)
+            .await?;
+
+        // Claimed, not torn down: still placed, so still its own node's.
+        let sandbox = fetch_sandbox(&pool, sandbox_id)
+            .await?
+            .expect("the fixture just inserted this sandbox");
+        let plan = substrate.stopped_restore_plan(&sandbox).await?;
+        assert_eq!(
+            plan.source_node_name.as_deref(),
+            Some("drained-node"),
+            "a claimed-but-placed sandbox still has its rootfs on its node and must \
+             restart there"
+        );
+
+        // Torn down: the teardown clears both placement columns.
+        sqlx::query(
+            "UPDATE sandboxes
+                SET active_node_id = NULL, target_node_id = NULL, placement = 'unplaced'
+              WHERE id = $1",
+        )
+        .bind(sandbox_id)
+        .execute(&pool)
+        .await?;
+        let sandbox = fetch_sandbox(&pool, sandbox_id)
+            .await?
+            .expect("the fixture just inserted this sandbox");
+        let error = match substrate.stopped_restore_plan(&sandbox).await {
+            Err(error) => error,
+            Ok(plan) => panic!(
+                "a torn-down evacuation with no resolvable copy must not plan a pod, but it \
+                 planned one on {:?}",
+                plan.source_node_name
+            ),
+        };
+        let SubstrateError::Timeout { ref message, .. } = error else {
+            panic!("the window before the copy resolves must be a retryable 503, got {error:?}");
+        };
+        // The execution row still names `drained-node`, so the generic
+        // neither-source arm cannot produce this.
+        assert!(
+            message.contains("being migrated off a"),
+            "the 503 must come from the evacuation arm, got {message:?}"
+        );
+
+        // Durable: still refused.
+        publish_ready_disk_artifact(&pool, sandbox_id, LocalArtifactId::new(), uri).await?;
+        let sandbox = fetch_sandbox(&pool, sandbox_id)
+            .await?
+            .expect("the fixture just inserted this sandbox");
+        let error = match substrate.stopped_restore_plan(&sandbox).await {
+            Err(error) => error,
+            Ok(plan) => panic!(
+                "a durable disk artifact must not lift the refusal — sandbox-manager cannot \
+                 boot it as the same sandbox — but it planned {:?} / {:?}",
+                plan.source_node_name, plan.storage_uri
+            ),
+        };
+        let SubstrateError::Timeout { ref message, .. } = error else {
+            panic!("the refusal must stay a retryable 503, got {error:?}");
+        };
+        assert!(
+            message.contains("being migrated off a"),
+            "the 503 must come from the evacuation arm, got {message:?}"
+        );
+
+        // Same row, marker cleared: both sources resolve.
+        sqlx::query("UPDATE sandboxes SET evacuation_restore_target = NULL WHERE id = $1")
+            .bind(sandbox_id)
+            .execute(&pool)
+            .await?;
+        let sandbox = fetch_sandbox(&pool, sandbox_id)
+            .await?
+            .expect("the fixture just inserted this sandbox");
+        let plan = substrate.stopped_restore_plan(&sandbox).await?;
+        assert_eq!(
+            (
+                plan.source_node_name.as_deref(),
+                plan.storage_uri.as_deref()
+            ),
+            (Some("drained-node"), Some(uri)),
+            "without the marker the same row plans both sources, so the marker is what \
+             refused above"
+        );
+
+        Ok(())
+    }
 }
 
 #[tokio::test]

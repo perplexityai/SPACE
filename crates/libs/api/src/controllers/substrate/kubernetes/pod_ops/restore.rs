@@ -293,17 +293,51 @@ impl KubernetesSubstrate {
     /// builder stamps both annotations whenever the plan carries them — so on
     /// a retry against a pod a prior attempt already created for this
     /// generation, the two attempts can resolve different URIs if the pin
-    /// advanced in between. That window is unreachable today: nothing writes a
-    /// disk pin to the cluster, so `storage_uri` is always `None` here.
-    /// Wiring the read-back belongs with the change that makes the URI half
-    /// live, because doing it now would also change how an existing stopped
-    /// restart resolves its *node* on retry — live behaviour this change
-    /// deliberately leaves alone.
+    /// advanced in between. The stopped evacuation's pin write
+    /// (`record_stopped_evacuation_artifact` in the cluster controller's node
+    /// drain) lands before its teardown and refuses to replace a pin with a
+    /// different id, so it does not advance the pin mid-evacuation; the
+    /// read-back is still not wired.
+    ///
+    /// ## A stopped evacuation in flight is refused
+    ///
+    /// Once a drain has evacuated the sandbox and released the node holding its
+    /// local copy, neither source is usable yet:
+    ///
+    /// * the node name `restore_source_node_name` would return is not a
+    ///   source — its executions fallback still names the drained node,
+    ///   because retiring an execution marks the row inactive without deleting
+    ///   it, and that node is cordoned, about to disappear, and has no bytes;
+    /// * the URI cannot boot it either. sandbox-manager restores a URI-only
+    ///   `stopped` start through its cross-node checkpoint path, whose
+    ///   finalize accepts only a full artifact
+    ///   (`transition_restored_sandbox_to_suspended_parts`), so a disk
+    ///   artifact stages and then fails, and the readiness wait re-drives a
+    ///   pod that never comes up. That qualifies the S3 fallback described
+    ///   above too: until sandbox-manager can boot a same-id disk artifact,
+    ///   it cannot complete on a node other than the source.
+    ///
+    /// So the plan answers [`SubstrateError::Timeout`] — 503 with
+    /// `Retry-After` — for as long as the evacuation leaves the sandbox
+    /// unplaced. The drain's restore sweep is meant to place it again, after
+    /// which the row has a node and this refusal no longer applies; until the
+    /// restore claim admits a `stopped` row and sandbox-manager can
+    /// materialize one back to `stopped`, that sweep cannot, and the refusal
+    /// stands.
     pub(super) async fn stopped_restore_plan(
         &self,
         sandbox: &Sandbox,
     ) -> Result<SuspendRestorePlan, SubstrateError> {
-        let source_node_name = self.store.restore_source_node_name(sandbox).await?;
+        let source = self.store.restore_source_plan(sandbox.id).await?;
+        if source.stopped_evacuation_unplaced {
+            return Err(SubstrateError::Timeout {
+                message: "cannot restart stopped sandbox while it is being migrated off a \
+                          draining node; its disk is durable and re-placement is pending"
+                    .to_string(),
+                phase: None,
+            });
+        }
+        let source_node_name = source.node_name;
         let storage_uri = self
             .store
             .selected_stopped_restore_storage_uri(sandbox)

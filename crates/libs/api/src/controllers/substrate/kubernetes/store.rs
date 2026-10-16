@@ -90,6 +90,18 @@ pub(super) enum PlacementRetryDisposition {
     RetryConverges,
 }
 
+/// The restore source for a stopped sandbox: the node name a pod would be
+/// pinned to, and whether a stopped evacuation is why the row has no placement.
+///
+/// Defaults to "no node, not evacuating" so a vanished row gives the safe answer
+/// on both counts: nothing to bind a pod to, and no refusal for a sandbox that
+/// no longer exists.
+#[derive(Debug, Clone, Default)]
+pub(super) struct UnplacedRestoreSource {
+    pub(super) node_name: Option<String>,
+    pub(super) stopped_evacuation_unplaced: bool,
+}
+
 struct CommittedSuspendArtifactRow {
     execution_state: ActiveExecutionState,
     artifact_id: Option<LocalArtifactId>,

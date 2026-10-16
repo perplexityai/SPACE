@@ -75,7 +75,11 @@
 //! - **Forced** is the original behavior: evacuate every resident
 //!   `started`/`paused` sandbox immediately, with the 409 gates closed for the
 //!   whole drain window so users cannot race the pipeline. Per-node disruption
-//!   is proportional to resident live-sandbox count.
+//!   is proportional to resident live-sandbox count. Where
+//!   [`ReconcilerConfig::evacuate_stopped_residents`] is on, forced mode also
+//!   evacuates resident `stopped` sandboxes — no VM to suspend, so that path
+//!   publishes the disk artifact, waits for it to be durable in S3, and then
+//!   releases the node, giving up the node-local copy.
 //!
 //! That escalation is one UPDATE in the admin endpoint's transaction. It moves
 //! `drain_mode` to `'forced'` and clears `drain_last_error` — including an error
@@ -114,8 +118,9 @@
 //! ## Design note: reusing [`SandboxLifecycle`] for the evacuable subset
 //!
 //! The "lifecycles the pipeline can service while preserving user-visible
-//! semantics" set has two members today (`Started` and `Paused`) and is
-//! a proper subset of the canonical [`SandboxLifecycle`] enum. An earlier
+//! semantics" set has three members today (`Started`, `Paused` and
+//! `Stopped`) and is a proper subset of the canonical [`SandboxLifecycle`]
+//! enum. An earlier
 //! revision of this module modeled that subset as its own enum (with a
 //! `TryFrom<SandboxLifecycle>` bridge) so consumer `match` arms were
 //! exhaustive at the type level.
@@ -132,19 +137,27 @@
 //!   surface for marginal type-system gain.
 //! - **Validity is a runtime contract.** [`NodeDrainSink::evacuate_sandbox`]
 //!   accepts any [`SandboxLifecycle`] and checks
-//!   [`is_evacuable_lifecycle`] at entry. A non-evacuable value returns
-//!   [`EvacuateError::Lookup`] rather than failing to type-check. The
-//!   SQL filter on [`NodeDrainSink::list_evacuatable_sandboxes_on_node`]
-//!   makes this unreachable in production; the predicate is defense in
-//!   depth, not the load-bearing check.
+//!   [`is_suspend_evacuable_lifecycle`] at entry. A value it refuses returns
+//!   [`EvacuateError::Lookup`] rather than failing to type-check. It checks
+//!   that, **not** the wider
+//!   [`EVACUABLE_LIFECYCLES`], because that constant is also the source of
+//!   truth for the `evacuation_restore_target` CHECK and so includes `Stopped`,
+//!   which the suspend path must refuse.
+//!
+//!   The SQL filter on [`NodeDrainSink::list_evacuatable_sandboxes_on_node`]
+//!   does **not** make this unreachable, and used to: it now returns `stopped`
+//!   rows deliberately, and its in-flight disjunct returns them whatever the
+//!   feature flag says. So this predicate is load-bearing for one variant
+//!   rather than defense in depth for all of them.
 //! - **Lose compile-time exhaustiveness at consumer match sites.**
-//!   Branches on `pre_lifecycle` use the two valid variants
-//!   (`SandboxLifecycle::Started` / `SandboxLifecycle::Paused`) and
+//!   Branches on `pre_lifecycle` use the three valid variants
+//!   (`SandboxLifecycle::Started` / `SandboxLifecycle::Paused` /
+//!   `SandboxLifecycle::Stopped`) and
 //!   either fall through to a defensive default or return an error
-//!   for the other 13 variants. Adding a new evacuable variant
+//!   for the other 13 (`SandboxLifecycle` has 16). Adding a new evacuable variant
 //!   requires updating both [`EVACUABLE_LIFECYCLES`] and each match
 //!   arm; the lockstep test
-//!   `evacuable_lifecycle_set_contains_started_and_paused` is the
+//!   `evacuable_lifecycle_set_contains_started_paused_and_stopped` is the
 //!   tripwire.
 //!
 //! The same shape applies to the wake/restore `target_state` plumbed
@@ -197,7 +210,10 @@ pub use aws::{Ec2InstanceTerminator, TerminateError};
 pub use kube_delete::KubeNodeDeleteTerminator;
 pub use noop::NoopInstanceTerminator;
 #[cfg(feature = "kubernetes")]
-pub use store::{CordonError, CordonOutcome, EvacuateError, RestoreOutcome, SubstrateSink};
+pub use store::{
+    CordonError, CordonOutcome, EvacuateError, RestoreOutcome, StoppedEvacuationOutcome,
+    StoppedEvacuationStall, SubstrateSink,
+};
 
 pub(crate) const PHASE_DRAINING: &str = "draining";
 pub(crate) const PHASE_DRAINED: &str = "drained";
@@ -225,18 +241,44 @@ pub(crate) const PHASE_TERMINATING: &str = "terminating";
 #[cfg(test)]
 pub(crate) use pplx_space_common_svc::sql::sandbox_residency::RESIDENT_LIFECYCLES;
 
-/// [`SandboxLifecycle`] values the suspend → restore pipeline can service
-/// while preserving user-visible semantics. Single source of truth for
-/// the SQL `lifecycle = ANY($1)` filter used by
-/// [`NodeDrainSink::list_evacuatable_sandboxes_on_node`] and the
-/// runtime validity check on [`NodeDrainSink::evacuate_sandbox`]'s
-/// `pre_lifecycle` parameter.
+/// [`SandboxLifecycle`] values the evacuation pipeline can service while
+/// preserving user-visible semantics. Source of the SQL `lifecycle = ANY($1)`
+/// filter used by [`NodeDrainSink::list_evacuatable_sandboxes_on_node`] and of
+/// the restore sweep's marker validation, and kept in step by hand with the
+/// `evacuation_restore_target` CHECK, which its migration spells out.
 ///
 /// - `Started` round-trips through suspend → restore and stays `started`.
 /// - `Paused` round-trips through suspend → restore with the substrate's
 ///   restore RPC carrying `target_state = paused`, so the VM never
 ///   leaves the paused state — preserving the user-visible lifecycle
 ///   without an additional post-restore RPC.
+/// - `Stopped` does **not** go through suspend at all: there is no VM to
+///   snapshot. It publishes the sandbox's disk artifact to S3, waits for those
+///   bytes to be durable, and releases the node, giving up the node-local copy —
+///   [`NodeDrainSink::evacuate_stopped_sandbox`], a sibling of
+///   [`NodeDrainSink::evacuate_sandbox`] rather than a branch inside it. The
+///   row is then handed to the cluster-wide restore sweep to be placed
+///   `stopped` on another node.
+///
+///   **That last leg does not work yet, and this constant is why the flag
+///   guarding it is off.** Three separate refusals stand between the sweep and
+///   a placed sandbox, and none of them is in this crate:
+///   `begin_restore_lifecycle`'s claim admits only `('suspended','restoring')`,
+///   `sandbox_lifecycle_to_wake_target_proto` accepts only `Started`/`Paused`,
+///   and the evacuation restore's source selector
+///   (`selected_suspend_restore_storage_uri`) requires a `full` snapshot — a
+///   disk-only selector exists, but only a user `start` of a `stopped` row
+///   reaches it. Until all three admit a stopped evacuation, a torn-down
+///   sandbox retries, backs off, and escalates to an operator — visible and
+///   recoverable, since the bytes are in S3, but not converged.
+///
+/// **Membership is validity, not enablement.** The stopped path is gated per
+/// environment by [`ReconcilerConfig::evacuate_stopped_residents`], and the
+/// per-node listing binds only the enabled subset
+/// ([`enabled_evacuable_lifecycles`]). This constant stays the full set on
+/// both sides of that flag so a marker written while the flag was on is still
+/// honoured after it is turned off — the alternative strands a half-evacuated
+/// sandbox with no reconciler willing to finish it.
 ///
 /// Other lifecycles in `RESIDENT_LIFECYCLES` continue to
 /// count against the "drain complete?" check but are intentionally
@@ -244,19 +286,86 @@ pub(crate) use pplx_space_common_svc::sql::sandbox_residency::RESIDENT_LIFECYCLE
 /// undo a user request, and transient states (`creating`, `starting`,
 /// `resuming`, `suspending`, `restoring`, `checkpointing`) settle on
 /// subsequent ticks into one of the evacuable lifecycles.
-pub const EVACUABLE_LIFECYCLES: &[SandboxLifecycle] =
+pub const EVACUABLE_LIFECYCLES: &[SandboxLifecycle] = &[
+    SandboxLifecycle::Started,
+    SandboxLifecycle::Paused,
+    SandboxLifecycle::Stopped,
+];
+
+/// Has an evacuated `stopped` sandbox's re-placement failed often enough that
+/// a responder should be handed its id?
+///
+/// Scoped to `Stopped` on purpose. A `started`/`paused` evacuation that keeps
+/// failing to restore is visible and bounded — its snapshot is durable and the
+/// sweep keeps retrying — but the user is not waiting on a sandbox that exists
+/// nowhere. A stopped one is: its node was released, giving up the local copy,
+/// so until the re-placement lands there is no node that can serve a `start`.
+///
+/// A predicate rather than an inline condition so both directions are testable;
+/// the log line it guards is not.
+pub(crate) fn stopped_replacement_needs_escalation(
+    target_lifecycle: SandboxLifecycle,
+    attempts: i32,
+) -> bool {
+    target_lifecycle == SandboxLifecycle::Stopped
+        && attempts >= STOPPED_REPLACEMENT_ESCALATE_ATTEMPTS
+}
+
+/// [`EVACUABLE_LIFECYCLES`] minus the lifecycles this environment has not
+/// enabled — what the per-node listing binds as its `lifecycle = ANY($2)`
+/// parameter.
+///
+/// Only `Stopped` is conditional, and the condition is
+/// [`ReconcilerConfig::evacuate_stopped_residents`] resolved against the
+/// fourth-term gate; see [`ReconcilerConfig::evacuates_stopped_residents`] for
+/// why the two are one decision.
+///
+/// Two constants rather than a filter, because there are only two answers and
+/// the disabled one is worth being able to point at. `the_enabled_subset_narrows_only_stopped`
+/// pins them against each other so the pair cannot drift — the failure that
+/// would otherwise matter is a live lifecycle silently dropping out of the
+/// disabled set, which would stop evacuating running VMs.
+pub(crate) fn enabled_evacuable_lifecycles(evacuate_stopped: bool) -> &'static [SandboxLifecycle] {
+    if evacuate_stopped {
+        EVACUABLE_LIFECYCLES
+    } else {
+        SUSPEND_EVACUABLE_LIFECYCLES
+    }
+}
+
+/// [`EVACUABLE_LIFECYCLES`] without `Stopped`: the set a cluster that has not
+/// enabled stopped-resident evacuation offers its drain.
+const SUSPEND_EVACUABLE_LIFECYCLES: &[SandboxLifecycle] =
     &[SandboxLifecycle::Started, SandboxLifecycle::Paused];
 
 /// Runtime check: is this lifecycle one the drain pipeline can evacuate
-/// while preserving semantics? Used at the entry of
-/// [`NodeDrainSink::evacuate_sandbox`] to defend against a caller
-/// passing a non-evacuable lifecycle. The SQL filter on
-/// [`NodeDrainSink::list_evacuatable_sandboxes_on_node`] makes this
-/// unreachable in production, but the predicate is the price for
-/// reusing [`SandboxLifecycle`] instead of introducing a new subset
-/// enum.
+/// while preserving semantics, by either path? Checked on the rows
+/// [`NodeDrainSink::list_evacuatable_sandboxes_on_node`] returns, on a parsed
+/// restore marker, and at the entry of the restore. Each SQL filter upstream of
+/// those already restricts the value, so the check is defence in depth: the
+/// price for reusing [`SandboxLifecycle`] instead of introducing a new subset
+/// enum. [`NodeDrainSink::evacuate_sandbox`] guards with the narrower
+/// [`is_suspend_evacuable_lifecycle`] instead, because it must refuse `Stopped`.
 pub fn is_evacuable_lifecycle(lifecycle: SandboxLifecycle) -> bool {
     EVACUABLE_LIFECYCLES.contains(&lifecycle)
+}
+
+/// Can the **suspend** pipeline service this lifecycle?
+///
+/// Distinct from [`is_evacuable_lifecycle`] because [`EVACUABLE_LIFECYCLES`]
+/// serves two sets with opposite requirements. It mirrors the
+/// `evacuation_restore_target` CHECK (hand-written in its migration; nothing
+/// ties the two together), so it had to gain `Stopped` — and it
+/// is also what [`NodeDrainSink::evacuate_sandbox`]'s entry guard read, where
+/// `Stopped` must never be accepted: that path CASes into `'suspending'` and
+/// asks sbx-mgr to snapshot a VM that does not exist.
+///
+/// Widening the constant therefore removed a guard silently, and removed the
+/// widened CHECK's backstop with it, leaving one bare early-return in
+/// `spawn_evacuations` as the only thing keeping the two paths apart. This
+/// restores the property without touching the CHECK's mirror.
+pub(crate) fn is_suspend_evacuable_lifecycle(lifecycle: SandboxLifecycle) -> bool {
+    SUSPEND_EVACUABLE_LIFECYCLES.contains(&lifecycle)
 }
 
 /// Resident lifecycles the suspend → restore pipeline cannot service —
@@ -412,6 +521,19 @@ pub(crate) const DEFAULT_RESTORE_BACKOFF_BASE_SECS: u64 = 60;
 /// permanently-failing sandbox down to ~2 attempts/hr of budget use.
 pub(crate) const DEFAULT_RESTORE_BACKOFF_CAP_SECS: u64 = 1800;
 const DRAIN_EVACUATION_COHORT_KEY: &str = "space.pplx.net/rollout-cohort";
+/// Consecutive failed re-placement attempts after which an evacuated `stopped`
+/// sandbox is named at ERROR rather than left to the backoff.
+///
+/// Five, because that is where the exponential schedule stops being consistent
+/// with a transient fault: with the 60 s default base, attempts 1–4 have
+/// already spent 60 + 120 + 240 + 480 s ≈ 15 minutes, which comfortably
+/// outlasts a cordon flapping, a target-cohort node coming up, or a
+/// kube-scheduler backoff. Lower re-reports ordinary slow placement as an
+/// incident; much higher leaves a sandbox nobody can start unnamed for an hour.
+/// The countable signal is `node_drain.stopped_replacement_pending`, which is
+/// what an alert should read — this constant only decides when the log names
+/// the sandbox.
+pub(crate) const STOPPED_REPLACEMENT_ESCALATE_ATTEMPTS: i32 = 5;
 
 #[derive(Debug, Clone)]
 pub struct ReconcilerConfig {
@@ -487,6 +609,45 @@ pub struct ReconcilerConfig {
     /// gate-on adds is the one exit that keeps the sandbox: starting it. That
     /// predicate's docs carry the per-lifecycle detail.
     pub termination_blocking_gate: bool,
+    /// Whether a forced drain evacuates resident `stopped` sandboxes: publish
+    /// the disk artifact to S3, wait for it to be durable, release the node
+    /// holding the local copy, and hand the row to the restore sweep to be placed `stopped`
+    /// elsewhere. Defaults to `false`, and the substrate cannot yet serve that
+    /// last leg — see [`EVACUABLE_LIFECYCLES`] for the three refusals in its
+    /// way.
+    ///
+    /// Read through [`Self::evacuates_stopped_residents`], never directly —
+    /// the path only turns on together with
+    /// [`Self::termination_blocking_gate`]. That is a rollout policy, not a
+    /// mechanical dependency: [`Reconciler::handle_draining_node`] spawns
+    /// evacuations before it evaluates the `drained` gate, and a spawned
+    /// evacuation alone keeps the node in `draining` (`spawned_this_tick`).
+    /// What the conjunction buys is ordering. A `stopped` resident parks its
+    /// node either way (see the module docs); the fourth term decides *where*,
+    /// holding it in `draining` instead of at the terminator, and it is rolled
+    /// out and verified per environment on its own. Requiring it here means
+    /// this flag can only ever take effect in a cluster that already holds such
+    /// nodes in `draining`, where this reconciler is still looking at them, and
+    /// a cluster that has not taken that step keeps exactly its existing
+    /// behaviour whatever this flag says.
+    ///
+    /// So the two flags are enabled in a specific order: the fourth term
+    /// first, then this one. Turning this on alone does nothing, and the
+    /// wiring warns when it is set that way round.
+    ///
+    /// **Forced drains only**, like every other evacuation. Gentle mode's whole
+    /// promise is that it does not touch residents, and a stopped evacuation
+    /// does touch one: it gives up the node-local copy, after which a `start`
+    /// is a retryable 503 until the re-placement lands. Under forced that
+    /// window costs nothing new — `NodeDrainState::blocks_placement` already
+    /// 409s a `start` on a forced-draining node for the whole drain — while
+    /// under gentle it would be the first disruption the mode has ever caused.
+    /// It also covers the motivating case as-is: a managed node group rollout
+    /// drains with `"mode": "forced"`, so the parked node that slows it is a
+    /// forced one. A gentle drain parked on a stopped resident
+    /// still has its existing exits — the owner starting or deleting the
+    /// sandbox, or [`Self::gentle_escalate`] rewriting the mode.
+    pub evacuate_stopped_residents: bool,
     pub tick: Duration,
     pub max_per_node: usize,
     /// Cluster-wide budget on concurrent drain-driven substrate operations.
@@ -568,6 +729,7 @@ impl Default for ReconcilerConfig {
         Self {
             enabled: false,
             termination_blocking_gate: false,
+            evacuate_stopped_residents: false,
             tick: DEFAULT_TICK,
             max_per_node: DEFAULT_MAX_PER_NODE,
             max_per_cluster: DEFAULT_MAX_PER_CLUSTER,
@@ -605,6 +767,10 @@ impl ReconcilerConfig {
                 "SPACE_NODE_DRAIN_TERMINATION_BLOCKING_GATE",
                 default.termination_blocking_gate,
             ),
+            evacuate_stopped_residents: config.truthy_default(
+                "SPACE_NODE_DRAIN_EVACUATE_STOPPED_RESIDENTS",
+                default.evacuate_stopped_residents,
+            ),
             tick: default.tick,
             max_per_node: default.max_per_node,
             max_per_cluster: default.max_per_cluster,
@@ -618,6 +784,17 @@ impl ReconcilerConfig {
                 "SPACE_CLUSTER_CONTROLLER_DRAIN_EVACUATION_COHORT_VALUE",
             ),
         }
+    }
+
+    /// Whether this configuration actually evacuates `stopped` residents.
+    ///
+    /// The conjunction, not the raw flag: see
+    /// [`Self::evacuate_stopped_residents`] for why the fourth-term gate is a
+    /// precondition rather than a companion. Every consumer reads this so the
+    /// resolution lives in one place, and the wiring warns once at startup
+    /// when the pair is set the ineffective way round.
+    pub fn evacuates_stopped_residents(&self) -> bool {
+        self.evacuate_stopped_residents && self.termination_blocking_gate
     }
 }
 
@@ -1022,6 +1199,35 @@ pub trait NodeDrainSink: Send + Sync + 'static {
         source_node_id: NodeId,
         pre_lifecycle: SandboxLifecycle,
     ) -> impl std::future::Future<Output = Result<(), EvacuateError>> + Send;
+    /// Advance one `stopped` resident's evacuation by a single step, and
+    /// report which step it reached. Sibling of
+    /// [`Self::evacuate_sandbox`], not a mode of it: a stopped sandbox has no
+    /// VM, so none of that pipeline's three load-bearing steps (CAS to
+    /// `'suspending'`, `suspend_execution`, commit `'suspended'`) apply. The
+    /// resting lifecycle stays `stopped` throughout.
+    ///
+    /// Idempotent and re-entrant by construction, because it is driven by
+    /// re-listing rather than by holding a task across the S3 upload: each
+    /// call re-claims (a no-op if already claimed), re-enqueues the disk
+    /// backup (sbx-mgr dedups on the artifact id and joins the in-flight
+    /// attempt), and re-tests durability. A controller restart mid-evacuation
+    /// resumes from whatever step the persisted state proves, with no
+    /// in-memory continuation.
+    ///
+    /// **The durability test is the only check that the bytes exist off the
+    /// node.** The node re-check before the release confirms the node still
+    /// holds the copy that was published, and the no-active-execution fence
+    /// that nothing has started it since.
+    /// The teardown releases the node, which the drain then terminates with the
+    /// rootfs on it; unlike the suspend path there is no node-side refusal to
+    /// fall back on, because a `stopped` row's erase-safety verdict is `Safe`.
+    /// See
+    /// [`store::SubstrateSink::evacuate_stopped_sandbox`].
+    fn evacuate_stopped_sandbox(
+        &self,
+        sandbox_id: SandboxId,
+        source_node_id: NodeId,
+    ) -> impl std::future::Future<Output = Result<StoppedEvacuationOutcome, EvacuateError>> + Send;
     /// `(sandbox_id, restore_target_lifecycle)` for sandboxes anywhere in
     /// the cluster that were suspended mid-drain-evacuation and are now
     /// ready to be restored onto a target-cohort node: `lifecycle =
@@ -1062,6 +1268,30 @@ pub trait NodeDrainSink: Send + Sync + 'static {
         &self,
         honor_backoff_windows: bool,
     ) -> impl std::future::Future<Output = Result<Vec<(SandboxId, SandboxLifecycle)>, sqlx::Error>> + Send;
+    /// How many evacuated `stopped` sandboxes are currently on no node.
+    ///
+    /// Not derivable from [`Self::list_restore_pending_evacuations`], which is
+    /// a *work list*: it honours the retry backoff, so a re-placement that
+    /// keeps failing leaves it for up to the backoff cap. Deriving the gauge
+    /// from that list would make the alert go quiet exactly as the incident got
+    /// worse. See [`store::stopped_replacements_pending_query`].
+    fn count_stopped_replacements_pending(
+        &self,
+    ) -> impl std::future::Future<Output = Result<u64, sqlx::Error>> + Send;
+    /// How long the longest-stalled stopped evacuation has been waiting for its
+    /// bytes, in seconds — `0` when none is.
+    ///
+    /// The companion to [`Self::count_stopped_replacements_pending`], covering
+    /// the half that one cannot see: a stall *before* the teardown still has
+    /// its node, so it never enters the unplaced population. Both are needed
+    /// for "a stopped evacuation is wedged" to be alertable at all — see
+    /// [`store::stopped_evacuation_stall_secs_query`].
+    /// `None` when nothing is waiting, which the caller publishes as `0` — the
+    /// gauge has to be emitted every sweep, including zero, or an alert on it
+    /// goes stale rather than quiet.
+    fn stopped_evacuation_stall(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Option<StoppedEvacuationStall>, sqlx::Error>> + Send;
     /// Record one failed cohort-restore attempt for `sandbox_id`: bump its
     /// `restore_attempt_count` and schedule the earliest next attempt
     /// `min(backoff_base * 2^(previous count), backoff_cap)` from now, so
@@ -1496,14 +1726,89 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
         // mid-evacuation only after their published artifact has a ready
         // backup, regardless of whether the source node is still draining.
         // The periodic run catches controller restarts and lost notifications.
-        report.spawned_restores = self.run_restore_sweep().await;
+        report.spawned_restores = self.run_restore_sweep(true).await;
 
         report
     }
 
     /// List restore-pending evacuations cluster-wide and spawn bounded cohort
     /// restores for any not already in flight. Returns the number spawned.
-    async fn run_restore_sweep(&self) -> usize {
+    /// `emit_gauges` is false on the signal-driven path. The `NOTIFY` that drives
+    /// it fires on **every** snapshot finalize reaching `ready` cluster-wide —
+    /// its own emitter calls itself best-effort and unconditional — not only on
+    /// evacuation snapshots. So an ordinary user suspend anywhere in the cluster
+    /// would otherwise charge two extra cluster-wide `sandboxes` scans, to
+    /// publish last-value-wins gauges the periodic sweep is already emitting at
+    /// a fixed cadence. The restores themselves still run on both paths; that
+    /// latency win is the reason the signal exists.
+    async fn run_restore_sweep(&self, emit_gauges: bool) -> usize {
+        // Gauges first, before anything that can return early. They are
+        // cluster-wide reads that depend on nothing this function computes,
+        // and their docs promise a value on every periodic sweep *including
+        // zero* — which is an alerting contract, because a series that goes
+        // absent instead of zero stops evaluating. Emitting them after the
+        // listing meant a listing failure silenced both, exactly when a
+        // responder most wants them.
+        if emit_gauges {
+            match self.sink.count_stopped_replacements_pending().await {
+                Ok(count) => node_drain_metrics::stopped_replacement_pending(count),
+                Err(err) => tracing::warn!(
+                    error = %err,
+                    "node_drain: count_stopped_replacements_pending failed; the \
+                     stopped-replacement backlog gauge is unreported this sweep"
+                ),
+            }
+            // The other half of the same question. The gauge above sees only
+            // evacuations that finished their teardown; one wedged *before* it
+            // still holds its node and would otherwise show up nowhere — not in
+            // that gauge, and not distinguishably in
+            // `node_drain.stopped_evacuation{outcome}`, where a stall and a healthy
+            // multi-gigabyte upload look the same. Emitted from the sweep rather
+            // than per node because the question is cluster-wide and the answer is
+            // one row.
+            match self.sink.stopped_evacuation_stall().await {
+                Ok(stall) => {
+                    node_drain_metrics::stopped_evacuation_stall(
+                        stall.map_or(0, |stall| stall.age.as_secs()),
+                    );
+                    // The gauge is what an alert evaluates; this line is what the
+                    // responder it wakes actually needs. Neither substitutes for the
+                    // other: a tagged gauge would appear and vanish per node and
+                    // could not publish the zero, and the per-tick `debug` lines on
+                    // the evacuation path are not emitted in production.
+                    //
+                    // Paced per node, because the value is an age: a genuine wedge
+                    // is a condition that persists for hours, and one line per
+                    // 5-second sweep would be ~17k lines a day saying the same
+                    // thing.
+                    if let Some(stall) = stall
+                        && self
+                            .warn_pacer
+                            .due(stall.node_id, "stopped_evacuation_stall")
+                    {
+                        tracing::warn!(
+                            node_id = %stall.node_id,
+                            sandbox_id = %stall.sandbox_id,
+                            stall_secs = stall.age.as_secs(),
+                            "node_drain: a stopped resident's evacuation is the oldest one \
+                             waiting on this cluster — it holds a claim and has not been torn \
+                             down: its disk upload is not durable yet, its node keeps declining \
+                             the teardown (node_drain.stopped_evacuation{{outcome=deferred}}), or \
+                             the teardown keeps failing (node_drain.failures{{phase=local_teardown}} \
+                             or {{phase=lookup}}). A sandbox \
+                             the drain could not claim at all is a different signal: \
+                             node_drain.stopped_evacuation{{outcome=unattributable_artifact}}. \
+                             Paced to one line per node per hour"
+                        );
+                    }
+                }
+                Err(err) => tracing::warn!(
+                    error = %err,
+                    "node_drain: stopped_evacuation_stall failed; the stalled-evacuation \
+                     age gauge is unreported this sweep"
+                ),
+            }
+        }
         // Recover crash-stranded `suspending` evacuations first. An
         // identity-backed local publication advances to `suspended` so backup
         // can be enqueued; legacy nullable rows wait for their durable snapshot.
@@ -1680,6 +1985,31 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
                                         attempts,
                                         "node_drain: cohort restore retry backed off"
                                     );
+                                    // An evacuated `stopped` sandbox that keeps
+                                    // failing to place is the one restore
+                                    // failure with nowhere to fall back to: its
+                                    // source node is gone or emptied, so unlike
+                                    // a `started`/`paused` restore there is no
+                                    // live copy still serving the user while the
+                                    // retries run. Name it at ERROR once the
+                                    // retries stop looking transient, so the
+                                    // responder the pending gauge pages has the
+                                    // sandbox id without a log dig.
+                                    if stopped_replacement_needs_escalation(
+                                        target_lifecycle,
+                                        attempts,
+                                    ) {
+                                        tracing::error!(
+                                            sandbox_id = %sandbox,
+                                            attempts,
+                                            "node_drain: evacuated stopped sandbox has failed \
+                                             re-placement on every attempt so far; its disk \
+                                             artifact is durable in S3 but the sandbox is on no \
+                                             node and cannot be started until it is placed. \
+                                             This needs an operator: check target-cohort \
+                                             capacity and placement admission"
+                                        );
+                                    }
                                 }
                                 Ok(None) => {
                                     // Marker cleared mid-attempt: a user
@@ -2852,6 +3182,18 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
     ) -> usize {
         self.spawn_bounded(node_id, sandboxes, move |sink, sandbox, pre_lifecycle| async move {
             let started = Instant::now();
+            // `Stopped` takes the sibling path, not a mode of the suspend one:
+            // no VM to snapshot, no `suspending` claim, no `suspended` commit.
+            //
+            // Reachable with the feature *off*, deliberately: the listing keeps
+            // offering a row that already carries the marker (see
+            // `evacuatable_sandbox_rows_query`'s third disjunct), so an
+            // evacuation opened before the flag was turned off can still be
+            // finished. The flag bites on the claim, not here.
+            if pre_lifecycle == SandboxLifecycle::Stopped {
+                Self::run_stopped_evacuation(&sink, sandbox, node_id).await;
+                return;
+            }
             let result = sink.evacuate_sandbox(sandbox, node_id, pre_lifecycle).await;
             let pre_lifecycle_tag = pre_lifecycle.as_str();
             match result {
@@ -2931,6 +3273,103 @@ impl<S: NodeDrainSink, T: InstanceTerminator> Reconciler<S, T> {
             }
         })
         .await
+    }
+
+    /// One tick's worth of work on a `stopped` resident's evacuation, plus the
+    /// reporting for whichever step it reached.
+    ///
+    /// The step function is the sink's; this is only the telemetry, which is
+    /// why it is an associated function rather than a method — the spawned
+    /// task owns an `Arc<S>` and nothing else from the reconciler.
+    ///
+    /// **No duration is recorded.** `node_drain.sandbox_suspend_duration_ms`
+    /// would be the obvious place, and it would be a lie twice over: there is
+    /// no suspend on this path, and a stopped evacuation spans as many ticks as
+    /// its S3 upload takes, so the only interval any single call could time is
+    /// the teardown's — which is not the number anyone reading a
+    /// suspend-duration series wants. How long an evacuation takes is legible
+    /// instead from `node_drain.stopped_evacuation{outcome}`: the ratio of
+    /// `awaiting_durable_disk` to `released`, at a known tick rate.
+    async fn run_stopped_evacuation(sink: &Arc<S>, sandbox_id: SandboxId, node_id: NodeId) {
+        let node_label = node_id.to_string();
+        match sink.evacuate_stopped_sandbox(sandbox_id, node_id).await {
+            Ok(StoppedEvacuationOutcome::Released { local_artifact_id }) => {
+                node_drain_metrics::stopped_evacuation(&node_label, "released");
+                tracing::info!(
+                    node_id = %node_id,
+                    sandbox_id = %sandbox_id,
+                    local_artifact_id = ?local_artifact_id,
+                    "node_drain: stopped resident's disk artifact is durable in S3 and its \
+                     node hold is released — retired pods deleted, placement cleared; the \
+                     rootfs stays on the node until it terminates; the row is unplaced and \
+                     awaiting re-placement by the cluster-wide restore sweep"
+                );
+            }
+            Ok(StoppedEvacuationOutcome::AwaitingDurableDisk { local_artifact_id }) => {
+                node_drain_metrics::stopped_evacuation(&node_label, "awaiting_durable_disk");
+                // Debug, not info: this is the steady state for the whole
+                // upload, re-reported every tick per sandbox. The countable
+                // signal is the metric above.
+                tracing::debug!(
+                    node_id = %node_id,
+                    sandbox_id = %sandbox_id,
+                    local_artifact_id = ?local_artifact_id,
+                    "node_drain: stopped resident's disk artifact backup is enqueued but not \
+                     yet durable; the node is held until it is"
+                );
+            }
+            Ok(StoppedEvacuationOutcome::UnattributableArtifact { local_artifact_id }) => {
+                node_drain_metrics::stopped_evacuation(&node_label, "unattributable_artifact");
+                // `debug`, with the counter carrying the alert. This repeats
+                // every tick for as long as the sandbox sits there, and it sits
+                // there until someone intervenes — a WARN per tick per sandbox
+                // would be thousands of lines a day saying the same thing, in
+                // the channel the drain's real warnings live in. The hold is
+                // counted on
+                // `node_drain.stopped_evacuation{outcome=unattributable_artifact}`;
+                // the store layer logs the refusal at `debug` too, or at `warn`
+                // when the node's pin was unreadable. It
+                // does **not** appear on
+                // `node_drain.stopped_evacuation_stall_secs`: that series
+                // selects on the evacuation marker, and this refusal returns
+                // before the claim writes one.
+                tracing::debug!(
+                    node_id = %node_id,
+                    sandbox_id = %sandbox_id,
+                    local_artifact_id = ?local_artifact_id,
+                    "node_drain: stopped resident already carries a disk artifact this drain \
+                     did not mint, so nothing can be attributed to its current rootfs; \
+                     refusing to evacuate it rather than publish bytes that may predate the \
+                     user's work"
+                );
+            }
+            Ok(StoppedEvacuationOutcome::Deferred { reason }) => {
+                node_drain_metrics::stopped_evacuation(&node_label, "deferred");
+                // `debug`, like the refusal: some deferrals repeat every tick
+                // (a node with no row for the sandbox), and the counter is the
+                // signal.
+                tracing::debug!(
+                    node_id = %node_id,
+                    sandbox_id = %sandbox_id,
+                    reason = %reason,
+                    "node_drain: stopped resident evacuation deferred; next tick re-evaluates"
+                );
+            }
+            Err(err) => {
+                node_drain_metrics::failure(
+                    &node_label,
+                    err.phase(),
+                    SandboxLifecycle::Stopped.as_str(),
+                );
+                tracing::warn!(
+                    node_id = %node_id,
+                    sandbox_id = %sandbox_id,
+                    phase = err.phase(),
+                    error = %err,
+                    "node_drain: stopped resident evacuation failed; will retry on next tick"
+                );
+            }
+        }
     }
 
     /// Returns `true` if the node row reached `deleted` this tick;
@@ -3393,7 +3832,7 @@ pub async fn run<S: NodeDrainSink, T: InstanceTerminator>(
             // The periodic tick above remains the correctness fallback, so a
             // missed signal only costs latency, not correctness.
             _ = reconciler.sink.wait_for_restore_signal() => {
-                let spawned = reconciler.run_restore_sweep().await;
+                let spawned = reconciler.run_restore_sweep(false).await;
                 if spawned > 0 {
                     tracing::info!(
                         spawned,

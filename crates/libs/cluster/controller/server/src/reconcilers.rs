@@ -604,6 +604,35 @@ pub async fn run_reconcilers(
             // the spawn arms below and re-read by the drained-node
             // terminator gate that follows the match.
             let node_drain_enabled = node_drain_config.enabled;
+            // Resolved once, here, because the sink and the reconciler have to
+            // agree on it — except that only one of them ends up reading it.
+            // The sink decides whether `stopped` rows are listed at all. The
+            // reconciler does **not** gate dispatch on the flag: it routes on
+            // `pre_lifecycle == SandboxLifecycle::Stopped` alone, deliberately,
+            // so an evacuation opened before the flag was turned off still
+            // finishes (see the dispatch site). Resolving here anyway keeps the
+            // WARN below and the sink's value derived from one expression; the
+            // WARN is the one place that also reads the raw flag, to tell the
+            // operator which half of the pair is missing.
+            let evacuates_stopped_residents = node_drain_config.evacuates_stopped_residents();
+            if node_drain_config.evacuate_stopped_residents && !evacuates_stopped_residents {
+                // Worth a WARN rather than silence: the operator asked for a
+                // behaviour they are not getting, and the reason is a second
+                // flag rather than anything they can see in this one. Left
+                // unstated, the symptom is a fleet where nothing changes and
+                // no log says why.
+                tracing::warn!(
+                    "SPACE_NODE_DRAIN_EVACUATE_STOPPED_RESIDENTS is set but \
+                     SPACE_NODE_DRAIN_TERMINATION_BLOCKING_GATE is not; stopped-resident \
+                     evacuation stays off. It only takes effect in a cluster that already holds \
+                     draining nodes for stopped residents, so enable the termination-blocking \
+                     gate first"
+                );
+            }
+            tracing::info!(
+                evacuate_stopped_residents = evacuates_stopped_residents,
+                "resolved stopped-resident evacuation for the node-drain reconciler"
+            );
             if node_drain_enabled {
                 let kind = TerminatorKind::from_env()?;
                 tracing::info!(
@@ -619,6 +648,7 @@ pub async fn run_reconcilers(
                     kube.clone(),
                     residency_evidence,
                     node_drain_config.termination_blocking_gate,
+                    evacuates_stopped_residents,
                 );
                 match kind {
                     TerminatorKind::Aws => {

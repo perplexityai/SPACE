@@ -116,6 +116,22 @@ use pplx_space_common_core::types::{ArtifactOrigin, SandboxLifecycle};
 /// query — pass the bare table name (`"sandboxes"`) when no alias is set.
 /// The fragment is safe to compose with `NOT`, `AND`, `OR`, etc.
 fn matching_ready_backup_exists(sandbox_alias: &str) -> String {
+    matching_ready_backup_of_type_exists(sandbox_alias, "full")
+}
+
+/// The kind-parameterized body behind [`matching_ready_backup_exists`] and
+/// [`current_disk_artifact_backup_ready`].
+///
+/// Only `snapshots.type` differs between the suspend path's durability proof
+/// and the stopped-evacuation path's, and both are the predicate that
+/// authorizes releasing a node — one after a memory snapshot, one after a disk
+/// artifact. Keeping them as one body means a correction to the shared shape
+/// (an extra `ssl` condition, a change to how orphaned locations count) cannot
+/// land on one and miss the other, which two visually identical copies invite:
+/// a diff touching either would read as complete.
+///
+/// `snapshot_type` is an in-crate literal, never caller data.
+fn matching_ready_backup_of_type_exists(sandbox_alias: &str, snapshot_type: &str) -> String {
     let pinned = snapshot_is_current_local_artifact(sandbox_alias, "sn");
     format!(
         "EXISTS (\n\
@@ -125,7 +141,7 @@ fn matching_ready_backup_exists(sandbox_alias: &str) -> String {
               WHERE sn.sandbox_id = {sandbox_alias}.id\n\
                 AND ssl.orphaned_at IS NULL\n\
                 AND {pinned}\n\
-                AND sn.type = 'full'\n\
+                AND sn.type = '{snapshot_type}'\n\
                 AND sn.state = 'ready'\n\
          )"
     )
@@ -1883,6 +1899,11 @@ fn inflight_snapshot_matches_current_suspend(sandbox_alias: &str) -> String {
 ///
 /// ## Reaches nothing today
 ///
+/// One writer outside the suspend paths below now produces a `'stop'` marker:
+/// node drain's `record_stopped_evacuation_artifact`, on a Kubernetes row it
+/// has claimed for evacuation. Both callers of this fragment filter
+/// `managed_by` to the Space substrate, so neither reaches those rows.
+///
 /// Every current Postgres writer of a non-NULL marker is a suspend path, and
 /// four write `'suspend'` whenever they write an origin at all: `kubernetes/store/suspend.rs`'s
 /// suspend-commit `UPDATE` and the cluster controller's quarantine recovery to
@@ -1917,6 +1938,63 @@ pub fn stopped_artifact_durable(sandbox_alias: &str) -> String {
              AND {durable}\n\
          )"
     )
+}
+
+/// Returns a self-contained `EXISTS(...)` SQL fragment evaluating to TRUE iff
+/// the **disk** artifact the sandbox row aliased as `sandbox_alias` currently
+/// pins has a non-orphaned `state='ready'` backup in the catalog.
+///
+/// This is the durability proof a `stopped` evacuation releases its source node
+/// on: the drain publishes the sandbox's disk artifact, waits for this to hold,
+/// and only then releases the node, which the drain then terminates with the
+/// rootfs on it. Nothing on the node objects — a `stopped` row's
+/// `sandbox_erase_safety` is `Safe` (`crates/libs/sbx/mgr/server/src/db/
+/// cleanup_episodes.rs`). This predicate is the drain's only check that the
+/// bytes exist off the node; the drain's other checks before releasing the node
+/// confirm the node still holds the copy that was published and that nothing
+/// has started it since.
+///
+/// The row shape it matches is exactly the one `GetArtifactBackupLocation`
+/// returns — same `(sandbox_id, local_artifact_id, artifact_kind, state =
+/// 'ready')` key, via [`snapshot_is_current_local_artifact`] — so "the drain
+/// believes the bytes are durable" and "a restore can resolve them to a URI"
+/// cannot disagree. The `snapshot_storage_locations` join with
+/// `orphaned_at IS NULL` is what makes the second half true rather than
+/// assumed: a `ready` snapshot whose only storage location has been orphaned
+/// has no URI left to restore from.
+///
+/// **No freshness term here, and that is a scoping decision rather than a
+/// claim that the identity cannot go stale.** It can. `current_local_artifact_id`
+/// names an immutable artifact, but a start that boots the guest and then
+/// fails is rolled back to `stopped` keeping whatever pin was already on the
+/// row — sandbox-manager's `apply_cleanup_state` only overwrites it when
+/// publishing a suspend artifact, and only a successful start clears it — so
+/// after `stop → mint → failed start that writes` the pin describes the disk as
+/// it was before the failed start while the rootfs has moved on.
+///
+/// That matters to exactly one caller: the teardown, which gives up the rootfs
+/// and must not do so on the strength of an artifact describing different
+/// bytes. It cannot be fixed with a freshness term here, or anywhere —
+/// `snapshots.timestamp` is *registration* time, the pin is reused rather than
+/// re-minted, and an already-`ready` backup produces no new row at all, so no
+/// timestamp the cluster holds is a proxy for when the snapshot was taken.
+/// `node_drain::store`'s `claim_stopped_evacuation` instead establishes
+/// **provenance**: it will only open an evacuation on a row with no pin, so the
+/// artifact it goes on to publish is one it caused to be minted from the
+/// current rootfs.
+///
+/// So read this as "the pinned disk artifact is durably restorable", not as
+/// "the pinned disk artifact describes the current rootfs". A caller for which
+/// those differ owns the difference.
+///
+/// The kind is pinned twice on purpose. `snapshot_is_current_local_artifact`
+/// matches `sn.artifact_kind` against the sandbox's pinned kind, so a `full`
+/// pin cannot satisfy this; `sn.type = 'disk'` additionally pins the catalog
+/// row's own kind, which is what the disk-only restore-source selector reads.
+/// A row where the two disagree is a catalog bug, and this refuses it rather
+/// than releasing a node on it.
+pub fn current_disk_artifact_backup_ready(sandbox_alias: &str) -> String {
+    matching_ready_backup_of_type_exists(sandbox_alias, "disk")
 }
 
 /// Returns a self-contained `EXISTS(...)` SQL fragment evaluating to TRUE iff

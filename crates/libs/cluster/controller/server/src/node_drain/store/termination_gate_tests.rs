@@ -488,7 +488,11 @@ async fn the_phase_write_refuses_a_node_that_gained_a_sandbox_after_the_pre_chec
 /// `try_pg_test_db` caps the pool at 2, the holder has one and the racing task
 /// needs the other, so a pool query here would starve and take the racing task's
 /// slot with it.
-async fn wait_until_blocked(
+///
+/// `pub(super)` so the sibling test module that needs the same interleaving can
+/// reuse it — the polling discipline in this doc comment is the whole value, and
+/// a second copy of it would drift.
+pub(super) async fn wait_until_blocked(
     holder: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> TestResult<bool> {
     let deadline = DRAIN_COMPLETION_LOCK_TIMEOUT / 2;

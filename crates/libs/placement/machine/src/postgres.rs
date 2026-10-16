@@ -485,9 +485,18 @@ impl PlacementStore for PostgresPlacementStore {
     /// execution on an unregistered or non-worker node cannot complete.
     ///
     /// Evacuation completions are lifecycle-preserving: the completion
-    /// stamps back the `evacuation_restore_target` marker (CHECK-pinned to
-    /// `'started'`/`'paused'`) and consumes it. The user claim cleared the
-    /// marker, so a user completion finalizes `started`.
+    /// stamps back the `evacuation_restore_target` marker and consumes it.
+    /// The user claim cleared the marker, so a user completion finalizes
+    /// `started`.
+    ///
+    /// The CHECK admits `'started'`, `'paused'` and `'stopped'`, but only the
+    /// first two reach this statement. The evacuation claim that feeds it
+    /// (`postgres/sql/evacuation_restore_claim.sql`) requires
+    /// `suspended`/`restoring`, and a stopped evacuation's row stays `stopped`,
+    /// so it is never claimed here. It also could not complete
+    /// here: the placed-node join requires a `running` execution with a pod
+    /// IP, which a sandbox materialized to `stopped` does not have. A stopped
+    /// re-placement needs its own claim and its own finalize.
     async fn complete_placement(
         &self,
         proof: PlacementProof<'_>,

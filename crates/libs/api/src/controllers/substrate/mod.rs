@@ -1558,9 +1558,10 @@ pub struct NodeInventoryEntry {
 }
 
 /// Which readiness wait a substrate timeout fired in. Carried on
-/// [`SubstrateError::Timeout`] so consumers (timeout messages, the
-/// `node_drain.failures{phase}` metric) attribute the timeout to the step
-/// that actually stalled instead of a blanket "node-mgr unavailable" label —
+/// [`SubstrateError::Timeout`] so consumers (timeout messages, and the
+/// `phase` tag of `node_drain.restore_converging`, where node-drain's cohort
+/// restore counts these timeouts rather than on `node_drain.failures`)
+/// attribute the timeout to the step that actually stalled instead of a blanket "node-mgr unavailable" label —
 /// node-mgr is named only when a probe really returned gRPC `Unavailable`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitReadyTimeoutPhase {
@@ -3332,6 +3333,16 @@ async fn enqueue_artifact_backup_via_retrying_node_api(
     .await
 }
 
+/// **Known cost, deliberately left.** Both callers resolve a `NodeApiTarget`
+/// from a three-table join before calling in, and the cached client is returned
+/// before that target is read — so on every call after the first for a node, the
+/// join was paid for nothing. Making the target lazy would fix it, and would
+/// also route the lookup's failure through one channel instead of the two the
+/// callers classify it into today (`Publish` vs `Lookup`, which is the `phase`
+/// tag on `node_drain.failures`). Left because the cost is three primary-key
+/// lookups on small tables, incurred only while a drain is in flight, and the
+/// fix touches every caller including the pre-existing suspend path. Revisit if
+/// the lookup ever grows anything that is not a PK read.
 pub async fn enqueue_artifact_backup_with_node_api(
     client: &mut NodeApiClient,
     endpoint_addr: &str,
@@ -3371,6 +3382,194 @@ pub async fn enqueue_artifact_backup_with_node_api(
         })?
         .into_inner();
     parse_enqueued_artifact_backup(response, expected_kind)
+}
+
+/// What the node itself reports for one sandbox: its status, and the artifact
+/// its own row currently pins.
+///
+/// The pin is the part that matters. sbx-mgr decides whether to mint a fresh
+/// disk artifact or reuse an existing one from *this* value, and nothing keeps
+/// it in step with Postgres' column of the same name for a `stopped` sandbox —
+/// the projection that would carry it up is gated to the suspend population.
+/// So a caller that needs to know "will the next enqueue mint, or reuse?" has to
+/// ask the node.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NodeReportedArtifact {
+    /// The node has a row for this sandbox at all. `false` means its local
+    /// state is already gone, so there is nothing to publish or tear down.
+    pub present: bool,
+    /// The node's own `current_local_artifact_id`, if it holds one and it could
+    /// be read. `None` with [`Self::pin_unreadable`] set is *not* "pinless".
+    pub pinned_artifact: Option<LocalArtifactId>,
+    /// The node reported a pin, and it could not be parsed.
+    ///
+    /// Separate from [`Self::pinned_artifact`] so an unreadable value never
+    /// travels as a nil UUID: that would reach a refusal's outcome and log line
+    /// looking like a real artifact id, which is the objection
+    /// `tear_down_stopped_local_copy` already raises for its own impossible
+    /// case. A caller must treat this exactly as it treats a readable pin —
+    /// refuse — because the whole point is that the bytes cannot be attributed.
+    pub pin_unreadable: bool,
+    /// The node reports the sandbox's lifecycle as `stopped`.
+    ///
+    /// **Not sufficient on its own** — see [`Self::vm_alive`]. The node's status
+    /// classifier only overrides a persisted state when it can report `paused`
+    /// (`pid_alive && vm_state == Paused`); every other combination returns the
+    /// SQLite state as-is. So a row that says `stopped` while its Firecracker
+    /// process is running reports `STOPPED` here.
+    pub reports_stopped: bool,
+    /// The Firecracker process is alive.
+    ///
+    /// This outranks [`Self::reports_stopped`], and the existing observation
+    /// path treats it the same way — `sandbox_states_with_client` classifies
+    /// `VmAlive` before it looks at the status or the artifact at all. A caller
+    /// that acts on "the node says stopped" without checking this can capture
+    /// and then destroy a rootfs that a running guest is still writing to.
+    ///
+    /// **Two node-side signals feed it, and either one is enough.** The node
+    /// reports `firecracker_alive` from the watchdog's cached health record,
+    /// falling back to a live `is_sandbox_running(id)` probe only when the
+    /// watchdog has no record, and it sets `namespace` only when that same
+    /// live probe succeeds (`live_sandbox_namespace` in
+    /// `sbx/mgr/server/src/service/grpc_state_snapshot.rs`). A stale-`false`
+    /// health record would otherwise read as `reports_stopped = true, vm_alive
+    /// = false` while the process runs, so this is the OR of the two. `pid`
+    /// would not do: the node reports it only when the row also holds one,
+    /// and a row that went through a stop path that clears it holds none.
+    pub vm_alive: bool,
+    /// The node flagged its answer as degraded. Three paths set it
+    /// (`grpc_state_snapshot.rs`): the node couldn't read its row, or couldn't
+    /// build an answer from it, and published a stub carrying the raw
+    /// lifecycle with the pin and liveness at their defaults; or the row was
+    /// fine but its route provenance wasn't. In the stub an absent pin, a dead
+    /// VM and `reports_stopped` aren't answers, and read literally they're the
+    /// one shape a fresh evacuation may open on: present, stopped, pinless, not
+    /// alive. A caller must treat any of the three as the node disagreeing and
+    /// defer. That's fail-closed, and for the
+    /// provenance case it holds the node for as long as the provenance stays
+    /// unreadable.
+    pub state_degraded: bool,
+    /// When the node's row last stamped its state. The writers in
+    /// `local_artifacts.rs`, `cleanup_episodes.rs` and `state_write.rs` that
+    /// move a row into `stopped` stamp it only on a state change, and
+    /// `transfer.rs` reaches `stopped` only from `creating`, so for a row one
+    /// of them stopped it is the current stopped episode's start rather than a
+    /// last-touch. Not every writer of the column is guarded that way: startup
+    /// recovery restamps it without a state change.
+    ///
+    /// For a stopped sandbox this is the instant its rootfs froze, which makes
+    /// it half of the only sound test for whether a pinned artifact describes
+    /// the current bytes: an artifact captured at or after it does. The other
+    /// half — the artifact's own capture time — is write-once on the node and
+    /// not exposed yet. Carried now because the response already contains it
+    /// and a caller that has to refuse can at least say when the sandbox
+    /// stopped.
+    pub stopped_since: Option<prost_types::Timestamp>,
+}
+
+/// Which of three things the node's `current_local_artifact_id` says, given that
+/// the wire type is an `optional string` and two of the three are unreadable.
+///
+/// **The empty string belongs with the malformed value, not with the absent
+/// one.** `None` means the node reported no pin — a real answer, and the only
+/// one a fresh evacuation may proceed on. Anything present but unreadable, `""`
+/// included, is a pin we cannot identify, and reporting *that* as pinless would
+/// let a teardown run on evidence nobody could read.
+///
+/// Unreadable is signalled by the returned flag rather than by a nil UUID. A nil
+/// id would travel into the refusal's outcome and its log line in a form
+/// indistinguishable from a real artifact — the exact objection
+/// `tear_down_stopped_local_copy` raises for its own impossible case, and it
+/// would be inconsistent to accept the shape here after rejecting it there.
+///
+/// Extracted from the RPC so the table above is testable without a node.
+fn parse_reported_pin(raw: Option<&str>, sandbox_id: SandboxId) -> (Option<LocalArtifactId>, bool) {
+    // Matching the `Option` rather than flattening it, because that is the whole
+    // distinction: `unwrap_or_default()` turns an absent field and an empty
+    // string into the same `""`, which forces empty to be read as pinless to
+    // keep absent working — reintroducing exactly the asymmetry this function
+    // exists to remove.
+    let Some(raw) = raw else {
+        return (None, false);
+    };
+    match raw.parse::<LocalArtifactId>() {
+        Ok(id) => (Some(id), false),
+        Err(_) => {
+            tracing::warn!(
+                sandbox_id = %sandbox_id,
+                raw,
+                "node reported an unreadable current local artifact id; treating the \
+                 sandbox as pinned so nothing is destroyed on evidence we cannot read"
+            );
+            (None, true)
+        }
+    }
+}
+
+/// Read one sandbox's node-local state through the same connection the publish
+/// uses. `SandboxState` returns `SandboxInfo`, which carries the node's artifact
+/// identity; a sandbox the node does not know about comes back in `missing_ids`.
+pub async fn sandbox_state_with_node_api(
+    client: &mut NodeApiClient,
+    endpoint_addr: &str,
+    sandbox_id: SandboxId,
+) -> Result<NodeReportedArtifact, SubstrateError> {
+    let mut client = RetryingWorkerApiClient::new(client);
+    let response = client
+        .sandbox_state(
+            pplx_space_sbx_mgr_client::proto::StateRequest {
+                sandbox_ids: vec![sandbox_id.to_string()],
+            },
+            Duration::from_secs(30),
+        )
+        .await
+        .map_err(|err| match err.code() {
+            tonic::Code::NotFound => SubstrateError::NotFound {
+                message: format!("sandbox {sandbox_id} not present on node-api at {endpoint_addr}"),
+            },
+            _ => SubstrateError::Failed {
+                message: format!("node-api sandbox state error: {err}"),
+            },
+        })?
+        .into_inner();
+    let Some(info) = response
+        .sandboxes
+        .into_iter()
+        .find(|info| info.sandbox_id == sandbox_id.to_string())
+    else {
+        // Either explicitly in `missing_ids` or simply absent. Both mean the
+        // node has no row, which is a refusal rather than a pinless yes: a
+        // sandbox the node does not know about has no rootfs there to publish.
+        return Ok(NodeReportedArtifact::default());
+    };
+    Ok(node_reported_artifact_from_info(info, sandbox_id))
+}
+
+/// What the node's `SandboxInfo` says about the evacuation guard's inputs.
+/// Extracted from the RPC so the mapping is testable without a node.
+fn node_reported_artifact_from_info(
+    info: pplx_space_sbx_mgr_client::proto::SandboxInfo,
+    sandbox_id: SandboxId,
+) -> NodeReportedArtifact {
+    let (pinned_artifact, pin_unreadable) =
+        parse_reported_pin(info.current_local_artifact_id.as_deref(), sandbox_id);
+    NodeReportedArtifact {
+        present: true,
+        pinned_artifact,
+        pin_unreadable,
+        // An undecodable lifecycle reads as not stopped, which the caller
+        // treats as the node disagreeing: a deferral, never a teardown.
+        reports_stopped: matches!(
+            info.observed_lifecycle(),
+            Ok(pplx_space_sbx_mgr_client::proto::SandboxLifecycleState::Stopped)
+        ),
+        // `namespace`, not `pid`: the node sets `namespace` from its live
+        // process probe alone, while `pid` also needs the row's persisted pid,
+        // which every write into `stopped` clears.
+        vm_alive: info.firecracker_alive || info.namespace.is_some(),
+        state_degraded: info.state_degraded,
+        stopped_since: info.state_changed_at,
+    }
 }
 
 fn backup_source_to_proto(

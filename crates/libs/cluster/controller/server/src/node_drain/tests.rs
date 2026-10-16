@@ -125,7 +125,7 @@
 //! - RP13 `rp13_backoff_disabled_schedules_no_retry` — base `0` disables the
 //!   backoff: no attempt state written, and the sweep bypasses stale windows
 
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_common_core::types::{LocalArtifactId, NodeId, SandboxId};
 
 use super::*;
 use crate::drained_node_terminator::InstanceLookupError;
@@ -210,6 +210,35 @@ struct FakeSink {
     // recorded in `restored_evacuations`.)
     evacuated: StdMutex<Vec<(SandboxId, NodeId, SandboxLifecycle)>>,
     evacuate_failures: StdMutex<HashMap<SandboxId, EvacuateError>>,
+    // Stopped-resident evacuation recording + per-sandbox outcome injection.
+    // Records `(sandbox_id, source_node_id)` per call; the default outcome is
+    // `Released`, since most tests care that the sibling path was taken at all
+    // rather than which step it stopped at.
+    stopped_evacuated: StdMutex<Vec<(SandboxId, NodeId)>>,
+    stopped_evacuate_results:
+        StdMutex<HashMap<SandboxId, Result<StoppedEvacuationOutcome, EvacuateError>>>,
+    /// What `count_stopped_replacements_pending` reports. Independent of
+    /// `restore_pending_listings` on purpose — production counts it with its
+    /// own query precisely because the two populations differ.
+    stopped_replacements_pending: StdMutex<u64>,
+    /// What `stopped_evacuation_stall` reports, and how many times each of the
+    /// two gauge reads was asked.
+    ///
+    /// The counters exist because "emitted every sweep, including zero" is a
+    /// documented alerting contract — an alert on a series that goes *absent*
+    /// instead of zero evaluates stale — and nothing else can observe it: the
+    /// values go to the metrics recorder, which this module cannot read.
+    stopped_evacuation_stall: StdMutex<Option<StoppedEvacuationStall>>,
+    stall_reads: StdMutex<u32>,
+    pending_reads: StdMutex<u32>,
+    /// Injected failures for the two gauge reads, so the warn-and-continue arms
+    /// are exercised. A gauge that cannot be read must not abandon the sweep it
+    /// is reported from — the restores are the work, the gauges are commentary.
+    stall_read_fails: StdMutex<bool>,
+    pending_read_fails: StdMutex<bool>,
+    /// Injected failure for the restore-pending listing, so the sweep's own
+    /// early return can be exercised — the gauges must survive it.
+    restore_listing_fails: StdMutex<bool>,
     // None = no gating (instant return). Some(sem) = each call
     // acquires a permit (test must add permits to release).
     evacuation_permits: StdMutex<Option<Arc<tokio::sync::Semaphore>>>,
@@ -539,6 +568,24 @@ impl FakeSink {
         self.state_updates.lock().unwrap().clone()
     }
 
+    /// `(sandbox_id, source_node_id)` recorded for every
+    /// `evacuate_stopped_sandbox` call.
+    fn stopped_evacuated(&self) -> Vec<(SandboxId, NodeId)> {
+        self.stopped_evacuated.lock().unwrap().clone()
+    }
+
+    /// Override the outcome `evacuate_stopped_sandbox` reports for `sandbox`.
+    fn set_stopped_evacuation_result(
+        &self,
+        sandbox: SandboxId,
+        result: Result<StoppedEvacuationOutcome, EvacuateError>,
+    ) {
+        self.stopped_evacuate_results
+            .lock()
+            .unwrap()
+            .insert(sandbox, result);
+    }
+
     fn evacuated_ids(&self) -> Vec<SandboxId> {
         self.evacuated
             .lock()
@@ -724,6 +771,31 @@ impl FakeSink {
     /// Enqueue one tick's worth of cluster-wide restore-pending `(sandbox,
     /// target)` entries. Push an empty vec to model a tick where the snapshot
     /// upload is still in flight (nothing ready to restore yet).
+    fn set_stopped_replacements_pending(&self, count: u64) {
+        *self.stopped_replacements_pending.lock().unwrap() = count;
+    }
+
+    fn set_stopped_evacuation_stall(&self, stall: Option<StoppedEvacuationStall>) {
+        *self.stopped_evacuation_stall.lock().unwrap() = stall;
+    }
+
+    fn fail_restore_listing(&self) {
+        *self.restore_listing_fails.lock().unwrap() = true;
+    }
+
+    fn fail_gauge_reads(&self, stall: bool, pending: bool) {
+        *self.stall_read_fails.lock().unwrap() = stall;
+        *self.pending_read_fails.lock().unwrap() = pending;
+    }
+
+    /// `(stall reads, pending reads)` since construction.
+    fn gauge_reads(&self) -> (u32, u32) {
+        (
+            *self.stall_reads.lock().unwrap(),
+            *self.pending_reads.lock().unwrap(),
+        )
+    }
+
     fn enqueue_restore_pending(&self, entries: Vec<(SandboxId, SandboxLifecycle)>) {
         self.restore_pending_listings.lock().unwrap().push(entries);
     }
@@ -1082,6 +1154,37 @@ impl NodeDrainSink for FakeSink {
         Ok(())
     }
 
+    async fn evacuate_stopped_sandbox(
+        &self,
+        sandbox_id: SandboxId,
+        source_node_id: NodeId,
+    ) -> Result<StoppedEvacuationOutcome, EvacuateError> {
+        // Shares the evacuation permit gate with `evacuate_sandbox`: both draw
+        // on the same per-node/per-cluster budget in production, so a test
+        // that pins concurrency has to be able to pin this path too.
+        let permit_holder = self.evacuation_permits.lock().unwrap().clone();
+        if let Some(sem) = permit_holder {
+            let permit = sem.acquire().await.unwrap();
+            permit.forget();
+        }
+        self.stopped_evacuated
+            .lock()
+            .unwrap()
+            .push((sandbox_id, source_node_id));
+        // Cloned rather than removed: the production path is re-entered on
+        // every tick until it reports `Released`, so an injected outcome has
+        // to survive being read more than once or a multi-tick test would
+        // silently fall back to the default on its second pass.
+        self.stopped_evacuate_results
+            .lock()
+            .unwrap()
+            .get(&sandbox_id)
+            .cloned()
+            .unwrap_or(Ok(StoppedEvacuationOutcome::Released {
+                local_artifact_id: Some(LocalArtifactId::new()),
+            }))
+    }
+
     async fn list_restore_pending_evacuations(
         &self,
         honor_backoff_windows: bool,
@@ -1090,12 +1193,33 @@ impl NodeDrainSink for FakeSink {
             .lock()
             .unwrap()
             .push(honor_backoff_windows);
+        if *self.restore_listing_fails.lock().unwrap() {
+            return Err(sqlx::Error::RowNotFound);
+        }
         let mut guard = self.restore_pending_listings.lock().unwrap();
         Ok(if guard.is_empty() {
             Vec::new()
         } else {
             guard.remove(0)
         })
+    }
+
+    async fn count_stopped_replacements_pending(&self) -> Result<u64, sqlx::Error> {
+        *self.pending_reads.lock().unwrap() += 1;
+        if *self.pending_read_fails.lock().unwrap() {
+            return Err(sqlx::Error::RowNotFound);
+        }
+        Ok(*self.stopped_replacements_pending.lock().unwrap())
+    }
+
+    async fn stopped_evacuation_stall(
+        &self,
+    ) -> Result<Option<StoppedEvacuationStall>, sqlx::Error> {
+        *self.stall_reads.lock().unwrap() += 1;
+        if *self.stall_read_fails.lock().unwrap() {
+            return Err(sqlx::Error::RowNotFound);
+        }
+        Ok(*self.stopped_evacuation_stall.lock().unwrap())
     }
 
     async fn schedule_restore_retry(
@@ -1416,6 +1540,17 @@ fn config_enabled(max_per_node: usize, max_per_cluster: usize) -> ReconcilerConf
         // false directly: `tb4_gate_off_advances_and_still_measures` and
         // `t2d_pre_terminate_recheck_aborts_with_the_gate_off`.
         termination_blocking_gate: true,
+        // Set for realism, not for reach: nothing inside `Reconciler` reads
+        // this field. Production wires it into `SubstrateSink`, which gates the
+        // *listing query* on it, so the enable/disable behaviour is only
+        // observable against Postgres — `store::stopped_evacuation_tests` owns
+        // it, in `the_evacuation_queue_offers_a_stopped_resident_only_where_it_is_enabled`
+        // and `disabling_the_feature_stops_new_claims_without_abandoning_in_flight_ones`.
+        // The `se*` tests reach the stopped path by handing `FakeSink` a
+        // `(sandbox, Stopped)` listing directly, so flipping this to `false`
+        // here changes nothing — which is why it says so rather than implying
+        // a gate that is not here.
+        evacuate_stopped_residents: true,
         tick: Duration::from_millis(1),
         max_per_node,
         max_per_cluster,
@@ -1502,6 +1637,31 @@ fn c1_defaults_when_env_unset() {
         Duration::from_secs(DEFAULT_RESTORE_BACKOFF_CAP_SECS),
     );
     assert!(cfg.drain_evacuation_placement.is_none());
+}
+
+/// An operator turns stopped-resident evacuation on with its env var, and it
+/// takes effect only alongside the termination-blocking gate. Read from the
+/// environment the config is built from, like its siblings, so the default,
+/// the flag alone and the pair each resolve as documented.
+#[test]
+fn c6_stopped_evacuation_flag_is_read_from_the_config_environment() {
+    let unset = ReconcilerConfig::from_environment(&pplx_space_test_env::TestEnv::default());
+    assert!(!unset.evacuate_stopped_residents);
+    assert!(!unset.evacuates_stopped_residents());
+
+    let mut flag_only = pplx_space_test_env::TestEnv::default();
+    flag_only.set("SPACE_NODE_DRAIN_EVACUATE_STOPPED_RESIDENTS", "true");
+    let flag_only = ReconcilerConfig::from_environment(&flag_only);
+    assert!(flag_only.evacuate_stopped_residents);
+    assert!(
+        !flag_only.evacuates_stopped_residents(),
+        "without the termination-blocking gate the flag stays off"
+    );
+
+    let mut both = pplx_space_test_env::TestEnv::default();
+    both.set("SPACE_NODE_DRAIN_EVACUATE_STOPPED_RESIDENTS", "true");
+    both.set("SPACE_NODE_DRAIN_TERMINATION_BLOCKING_GATE", "true");
+    assert!(ReconcilerConfig::from_environment(&both).evacuates_stopped_residents());
 }
 
 #[test]
@@ -1669,6 +1829,13 @@ impl NodeDrainSink for ArcSink {
     ) -> Result<(), EvacuateError> {
         self.0.evacuate_sandbox(s, source, pre_lifecycle).await
     }
+    async fn evacuate_stopped_sandbox(
+        &self,
+        s: SandboxId,
+        source: NodeId,
+    ) -> Result<StoppedEvacuationOutcome, EvacuateError> {
+        self.0.evacuate_stopped_sandbox(s, source).await
+    }
     async fn list_restore_pending_evacuations(
         &self,
         honor_backoff_windows: bool,
@@ -1676,6 +1843,14 @@ impl NodeDrainSink for ArcSink {
         self.0
             .list_restore_pending_evacuations(honor_backoff_windows)
             .await
+    }
+    async fn count_stopped_replacements_pending(&self) -> Result<u64, sqlx::Error> {
+        self.0.count_stopped_replacements_pending().await
+    }
+    async fn stopped_evacuation_stall(
+        &self,
+    ) -> Result<Option<StoppedEvacuationStall>, sqlx::Error> {
+        self.0.stopped_evacuation_stall().await
     }
     async fn schedule_restore_retry(
         &self,
@@ -4223,19 +4398,6 @@ async fn w6_paused_evacuate_failure_clears_in_flight_for_retry() {
 }
 
 #[test]
-fn evacuable_lifecycle_set_contains_started_and_paused() {
-    // The single source of truth for which lifecycles the drain
-    // pipeline can service. If a future change adds another
-    // evacuable lifecycle, this assertion fails loudly and the
-    // author has to update the test alongside the const.
-    let want: HashSet<SandboxLifecycle> = [SandboxLifecycle::Started, SandboxLifecycle::Paused]
-        .into_iter()
-        .collect();
-    let got: HashSet<SandboxLifecycle> = EVACUABLE_LIFECYCLES.iter().copied().collect();
-    assert_eq!(got, want);
-}
-
-#[test]
 fn non_evacuatable_set_is_the_stale_abandon_sweep_set() {
     // `NON_EVACUATABLE_RESIDENT_LIFECYCLES` is the single source of truth
     // for which resident transient lifecycles the stale-abandon sweep ages
@@ -4284,7 +4446,7 @@ fn non_evacuatable_set_is_the_stale_abandon_sweep_set() {
 }
 
 #[test]
-fn is_evacuable_lifecycle_accepts_only_started_and_paused() {
+fn is_evacuable_lifecycle_accepts_only_started_paused_and_stopped() {
     // Every variant of SandboxLifecycle is tested explicitly so a new
     // variant added to common-core forces an explicit "evacuable or
     // not" decision (the match below becomes non-exhaustive at
@@ -4302,7 +4464,7 @@ fn is_evacuable_lifecycle_accepts_only_started_and_paused() {
         (L::Suspending, false),
         (L::Suspended, false),
         (L::Stopping, false),
-        (L::Stopped, false),
+        (L::Stopped, true),
         (L::Deleting, false),
         (L::Checkpointing, false),
         (L::Quarantined, false),
@@ -4321,7 +4483,7 @@ fn is_evacuable_lifecycle_accepts_only_started_and_paused() {
     // forcing the author to extend the cases table above.
     fn _assert_exhaustive(lifecycle: SandboxLifecycle) -> bool {
         match lifecycle {
-            L::Started | L::Paused => true,
+            L::Started | L::Paused | L::Stopped => true,
             L::Created
             | L::Creating
             | L::Starting
@@ -4331,7 +4493,6 @@ fn is_evacuable_lifecycle_accepts_only_started_and_paused() {
             | L::Suspending
             | L::Suspended
             | L::Stopping
-            | L::Stopped
             | L::Deleting
             | L::Checkpointing
             | L::Quarantined
@@ -5299,4 +5460,389 @@ async fn p4_a_tick_that_spawns_an_evacuation_cannot_also_reach_drained() {
         reconciler.sink.current_state(node).as_deref(),
         Some(PHASE_DRAINING),
     );
+}
+
+// =================================================================
+// SE — Evacuating a `stopped` resident
+//
+// The user-visible property the whole group serves: **a stopped sandbox
+// survives its node being drained, and stops parking that node.** These cover
+// the reconciler's half — which path a listed `stopped` row is dispatched to,
+// what keeps the node in `draining` long enough for that to happen, and what
+// must never happen to the sandbox when a step fails. The SQL half (the claim,
+// the durability gate, the re-placement scan) is in
+// `store::stopped_evacuation_tests`.
+// =================================================================
+
+/// A node held only by a stopped resident gets worked on, and through the disk
+/// path rather than the suspend one.
+///
+/// The `evacuated_ids()` half is the load-bearing assertion, not decoration:
+/// dispatching a `stopped` row to `evacuate_sandbox` would compile, would look
+/// like progress in the logs, and would ask sandbox-manager to suspend a
+/// sandbox with no VM — a refusal retried forever.
+#[tokio::test]
+async fn se1_a_stopped_resident_is_evacuated_through_the_disk_path() {
+    let node = NodeId::new();
+    let sandbox = SandboxId::new();
+    let sink = FakeSink::new();
+    sink.set_initial_state(node, PHASE_DRAINING);
+    sink.set_draining_list(vec![node]);
+    sink.set_forced(node);
+    // `stopped` is not a resident lifecycle, so the first three gate terms are
+    // all zero — exactly the production shape. The fourth term is what holds
+    // the node.
+    sink.enqueue_resident(node, vec![]);
+    sink.enqueue_evacuatable_typed(node, vec![(sandbox, SandboxLifecycle::Stopped)]);
+    sink.enqueue_termination_blockers(node, vec![("stopped", 1)]);
+
+    let reconciler = Reconciler::new(config_enabled(4, 8), sink, FakeTerminator::default());
+    reconciler.tick().await;
+    reconciler.drain_evacuations(Duration::from_secs(2)).await;
+
+    assert_eq!(
+        reconciler.sink.stopped_evacuated(),
+        vec![(sandbox, node)],
+        "a stopped resident of a forced drain must be evacuated"
+    );
+    assert!(
+        reconciler.sink.evacuated_ids().is_empty(),
+        "a stopped sandbox has no VM to suspend; routing it through the suspend pipeline \
+         would be a refusal retried on every tick"
+    );
+}
+
+/// A stopped evacuation the queue lists is serviced, and holds its node, even
+/// with the fourth gate term off.
+///
+/// With the pair resolved off, the sink stops listing *new* stopped residents —
+/// that half is the store's, covered where the listing is. What it keeps
+/// listing is an evacuation already carrying the marker, so turning the flags
+/// off mid-drain lets in-flight work finish. This is the reconciler's half of
+/// that promise: it routes on the row's lifecycle, not on either flag, and the
+/// spawn it makes is what keeps the node out of `drained` while the work runs —
+/// not the fourth term. Advancing here would strand a sandbox whose disk is
+/// published and whose local copy is still on the node.
+#[tokio::test]
+async fn se2_a_listed_stopped_evacuation_runs_and_holds_the_node_without_the_fourth_term() {
+    let node = NodeId::new();
+    let sandbox = SandboxId::new();
+    let sink = FakeSink::new();
+    sink.set_initial_state(node, PHASE_DRAINING);
+    sink.set_draining_list(vec![node]);
+    sink.set_forced(node);
+    sink.set_stopped_evacuation_result(
+        sandbox,
+        Ok(StoppedEvacuationOutcome::AwaitingDurableDisk {
+            local_artifact_id: LocalArtifactId::new(),
+        }),
+    );
+    sink.enqueue_resident(node, vec![]);
+    sink.enqueue_evacuatable_typed(node, vec![(sandbox, SandboxLifecycle::Stopped)]);
+    sink.enqueue_termination_blockers(node, vec![("stopped", 1)]);
+
+    let mut config = config_enabled(4, 8);
+    config.termination_blocking_gate = false;
+    config.evacuate_stopped_residents = false;
+    let reconciler = Reconciler::new(config, sink, FakeTerminator::default());
+    reconciler.tick().await;
+    reconciler.drain_evacuations(Duration::from_secs(2)).await;
+
+    assert_eq!(
+        reconciler.sink.stopped_evacuated(),
+        vec![(sandbox, node)],
+        "a listed stopped evacuation must be serviced whatever the flags say, or turning \
+         them off strands the ones already under way"
+    );
+    assert_eq!(
+        reconciler.sink.current_state(node).as_deref(),
+        Some(PHASE_DRAINING),
+        "and the node must stay draining while it runs, with the fourth term off"
+    );
+}
+
+/// The evacuation is driven by re-listing, not by a task parked across the S3
+/// upload. An attempt that reports the bytes are not durable yet must be
+/// re-attempted on the next tick — a spawn-once implementation would leave the
+/// sandbox published but never torn down, and the node parked forever with the
+/// upload long finished.
+#[tokio::test]
+async fn se3_an_evacuation_awaiting_its_upload_is_re_attempted_next_tick() {
+    let node = NodeId::new();
+    let sandbox = SandboxId::new();
+    let sink = FakeSink::new();
+    sink.set_initial_state(node, PHASE_DRAINING);
+    sink.set_draining_list(vec![node]);
+    sink.set_forced(node);
+    sink.set_stopped_evacuation_result(
+        sandbox,
+        Ok(StoppedEvacuationOutcome::AwaitingDurableDisk {
+            local_artifact_id: LocalArtifactId::new(),
+        }),
+    );
+    for _ in 0..2 {
+        sink.enqueue_resident(node, vec![]);
+        sink.enqueue_evacuatable_typed(node, vec![(sandbox, SandboxLifecycle::Stopped)]);
+        sink.enqueue_termination_blockers(node, vec![("stopped", 1)]);
+    }
+
+    let reconciler = Reconciler::new(config_enabled(4, 8), sink, FakeTerminator::default());
+    reconciler.tick().await;
+    reconciler.drain_evacuations(Duration::from_secs(2)).await;
+    reconciler.tick().await;
+    reconciler.drain_evacuations(Duration::from_secs(2)).await;
+
+    assert_eq!(
+        reconciler.sink.stopped_evacuated(),
+        vec![(sandbox, node), (sandbox, node)],
+        "each tick must re-drive the evacuation until it reports the local copy destroyed"
+    );
+    assert_eq!(
+        reconciler.sink.current_state(node).as_deref(),
+        Some(PHASE_DRAINING),
+        "and the node must stay in `draining` for as long as that takes"
+    );
+}
+
+/// A failing stopped evacuation must never cost the user their sandbox.
+///
+/// The suspend path has a terminal give-up — `mark_sandbox_failed_on_node`,
+/// for a sandbox the node reports `failed` — and reaching it from here would be
+/// a data-loss bug rather than a slow drain: nothing about a publish or
+/// teardown failure says the disk is gone. Both failure phases are checked
+/// because they fail on opposite sides of the durability gate, and only one of
+/// them leaves an S3 copy behind.
+///
+/// **This is a forward guard, not a test of present behaviour, and the
+/// difference is worth stating.** `run_stopped_evacuation` has no
+/// `mark_sandbox_failed_on_node` call on any arm, so as the code stands no
+/// injected error could produce a mark and the assertion cannot fail. Its value
+/// is that adding that give-up later — the natural thing to reach for when this
+/// path starts wedging nodes — fails here instead of silently destroying a
+/// recoverable sandbox. That is exactly what mutation-checking it demonstrated:
+/// inserting the call into the error arm fails this test.
+#[tokio::test]
+async fn se4_a_failed_stopped_evacuation_never_marks_the_sandbox_failed() {
+    for failure in [
+        EvacuateError::Publish("node-api unreachable".to_string()),
+        EvacuateError::LocalTeardown("pod delete rejected".to_string()),
+    ] {
+        let node = NodeId::new();
+        let sandbox = SandboxId::new();
+        let sink = FakeSink::new();
+        sink.set_initial_state(node, PHASE_DRAINING);
+        sink.set_draining_list(vec![node]);
+        sink.set_forced(node);
+        sink.enqueue_resident(node, vec![]);
+        sink.enqueue_evacuatable_typed(node, vec![(sandbox, SandboxLifecycle::Stopped)]);
+        sink.enqueue_termination_blockers(node, vec![("stopped", 1)]);
+        sink.set_stopped_evacuation_result(sandbox, Err(failure.clone()));
+
+        let reconciler = Reconciler::new(config_enabled(4, 8), sink, FakeTerminator::default());
+        reconciler.tick().await;
+        reconciler.drain_evacuations(Duration::from_secs(2)).await;
+
+        assert!(
+            reconciler.sink.marked_failed_on_node().is_empty(),
+            "a {} failure must leave the sandbox alone; it is recoverable from at least one \
+             copy either way",
+            failure.phase()
+        );
+        assert_eq!(
+            reconciler.sink.current_state(node).as_deref(),
+            Some(PHASE_DRAINING),
+            "and the node must stay held rather than advance past an unfinished evacuation"
+        );
+    }
+}
+
+/// An evacuated stopped sandbox is *dispatched* by the same cluster-wide sweep
+/// that places a suspended one, carrying `stopped` as its restore target.
+///
+/// Scope, stated because the fake sink hides it: this asserts the reconciler's
+/// half — that the sweep selects the row and threads the target through — and
+/// nothing about whether the substrate can serve it. It cannot, today; three
+/// refusals outside this crate stand in the way (see `EVACUABLE_LIFECYCLES`).
+/// The target still has to be carried faithfully, because restoring to
+/// `started` instead would boot the guest and mutate a rootfs that is supposed
+/// to be inert — a silent corruption rather than the visible refusal the
+/// wrong-target case produces today.
+#[tokio::test]
+async fn se5_a_stopped_target_is_placed_by_the_cluster_wide_restore_sweep() {
+    let sandbox = SandboxId::new();
+    let sink = FakeSink::new();
+    sink.enqueue_restore_pending(vec![(sandbox, SandboxLifecycle::Stopped)]);
+
+    let reconciler = Reconciler::new(config_enabled(4, 8), sink, FakeTerminator::default());
+    reconciler.tick().await;
+    reconciler.drain_evacuations(Duration::from_secs(2)).await;
+
+    let restored = reconciler.sink.restored_evacuations();
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].0, sandbox);
+    assert_eq!(
+        restored[0].1,
+        SandboxLifecycle::Stopped,
+        "the sweep must carry `stopped` through as the restore target; restoring to \
+         `started` would boot the guest and mutate a rootfs that is supposed to be inert. \
+         This is the reconciler's half only — the substrate refuses a `stopped` target \
+         today, which is why the feature ships disabled"
+    );
+}
+
+/// **Both stopped-evacuation gauges must be reported on every sweep, including
+/// the sweeps that find nothing — and a gauge that cannot be read must not take
+/// the sweep down with it.**
+///
+/// The metrics catalog tells an operator to alert on both series. An alert
+/// on a series that goes *absent* rather than zero evaluates stale, so "emitted
+/// every sweep including zero" is part of the contract and not an
+/// implementation detail. Nothing else could observe it: the values go to the
+/// metrics recorder, which this module cannot read, so the fake counts the
+/// reads instead.
+///
+/// The error arms matter for the same reason from the other side. The restores
+/// are the sweep's work and the gauges are commentary; a failed gauge read that
+/// returned early would silently stop re-placing evacuated sandboxes, which is
+/// the incident the gauges exist to report.
+#[tokio::test(flavor = "current_thread")]
+async fn se8_both_stopped_gauges_are_reported_every_sweep_and_survive_a_failed_read() {
+    // A sweep with nothing pending: the zero still has to be published.
+    let sink = FakeSink::new();
+    sink.enqueue_restore_pending(vec![]);
+    let reconciler = Reconciler::new(config_enabled(4, 8), sink, FakeTerminator::default());
+    reconciler.tick().await;
+    assert_eq!(
+        reconciler.sink.gauge_reads(),
+        (1, 1),
+        "an empty sweep must still read both gauges — an alert on a series that goes          absent instead of zero stops evaluating, which is worse than no alert"
+    );
+
+    // A sweep with work, and both gauges reporting something.
+    let sandbox = SandboxId::new();
+    let sink = FakeSink::new();
+    sink.enqueue_restore_pending(vec![(sandbox, SandboxLifecycle::Stopped)]);
+    sink.set_stopped_replacements_pending(3);
+    sink.set_stopped_evacuation_stall(Some(StoppedEvacuationStall {
+        age: Duration::from_secs(7200),
+        sandbox_id: sandbox,
+        node_id: NodeId::new(),
+    }));
+    let reconciler = Reconciler::new(config_enabled(4, 8), sink, FakeTerminator::default());
+    reconciler.tick().await;
+    reconciler.drain_evacuations(Duration::from_secs(2)).await;
+    assert_eq!(
+        reconciler.sink.gauge_reads(),
+        (1, 1),
+        "and exactly once per sweep, not once per pending sandbox — these are cluster-wide          questions with one-row answers"
+    );
+    assert_eq!(
+        reconciler.sink.restored_evacuations().len(),
+        1,
+        "fixture precondition: the sweep did its actual work, so the next case can show          that a failed gauge read is what stops it"
+    );
+
+    // A failing *listing* must not silence the gauges. They are cluster-wide
+    // reads that depend on nothing the listing produces, and a series that goes
+    // absent rather than zero stops evaluating — precisely when the sweep is
+    // broken and a responder needs it. Emitting them after the listing meant a
+    // listing failure took both down with it.
+    let sink = FakeSink::new();
+    sink.fail_restore_listing();
+    let reconciler = Reconciler::new(config_enabled(4, 8), sink, FakeTerminator::default());
+    reconciler.tick().await;
+    assert_eq!(
+        reconciler.sink.gauge_reads(),
+        (1, 1),
+        "a sweep whose listing fails must still publish both gauges: they answer \
+         cluster-wide questions the listing has no part in, and going absent on the \
+         failing sweep is the one time the alert has to hold"
+    );
+
+    // Both gauge reads failing: the sweep must still re-place the sandbox.
+    let sink = FakeSink::new();
+    sink.enqueue_restore_pending(vec![(sandbox, SandboxLifecycle::Stopped)]);
+    sink.fail_gauge_reads(true, true);
+    let reconciler = Reconciler::new(config_enabled(4, 8), sink, FakeTerminator::default());
+    reconciler.tick().await;
+    reconciler.drain_evacuations(Duration::from_secs(2)).await;
+    assert_eq!(
+        reconciler.sink.gauge_reads(),
+        (1, 1),
+        "both reads must be attempted even when the first one fails — reporting one gauge          and skipping the other would make them disagree about the same incident"
+    );
+    let restored = reconciler.sink.restored_evacuations();
+    assert_eq!(
+        restored.len(),
+        1,
+        "and the re-placement must still happen: the gauges are commentary on the sweep,          so a failed read that returned early would stop the work it reports on"
+    );
+    assert_eq!(restored[0].0, sandbox);
+
+    // The signal-driven sweep does the work and emits nothing. Its trigger is
+    // every snapshot finalize cluster-wide, so gauges here would be charged to
+    // unrelated user suspends.
+    let sink = FakeSink::new();
+    sink.enqueue_restore_pending(vec![(sandbox, SandboxLifecycle::Stopped)]);
+    let reconciler = Reconciler::new(config_enabled(4, 8), sink, FakeTerminator::default());
+    let spawned = reconciler.run_restore_sweep(false).await;
+    reconciler.drain_evacuations(Duration::from_secs(2)).await;
+    assert_eq!(
+        spawned, 1,
+        "the signal-driven sweep must still do its work — the latency win is why the \
+         signal exists at all"
+    );
+    assert_eq!(
+        reconciler.sink.gauge_reads(),
+        (0, 0),
+        "and it must read neither gauge: its trigger is any snapshot finalize in the \
+         cluster, so an ordinary user suspend would otherwise pay two cluster-wide scans \
+         to re-publish a value the periodic sweep already emits"
+    );
+}
+
+/// When a re-placement stops looking transient, the responder gets the sandbox
+/// id — and an ordinary restore failure does not manufacture a page.
+#[test]
+fn se6_only_a_persistently_unplaceable_stopped_sandbox_escalates() {
+    use SandboxLifecycle as L;
+    assert!(
+        !stopped_replacement_needs_escalation(
+            L::Stopped,
+            STOPPED_REPLACEMENT_ESCALATE_ATTEMPTS - 1
+        ),
+        "a stopped re-placement still inside the transient window must not escalate"
+    );
+    assert!(
+        stopped_replacement_needs_escalation(L::Stopped, STOPPED_REPLACEMENT_ESCALATE_ATTEMPTS),
+        "past the window it must, or a sandbox on no node stays an unnamed backlog entry"
+    );
+    for target in [L::Started, L::Paused] {
+        assert!(
+            !stopped_replacement_needs_escalation(
+                target,
+                STOPPED_REPLACEMENT_ESCALATE_ATTEMPTS * 4
+            ),
+            "a {target} evacuation's snapshot is durable and its user is not waiting on a \
+             sandbox that exists nowhere; it must not escalate at any attempt count"
+        );
+    }
+}
+
+#[test]
+fn se7_evacuable_lifecycle_set_contains_started_paused_and_stopped() {
+    // The lockstep tripwire from the two-member era, updated. If a future
+    // change adds another evacuable lifecycle, this fails loudly and the
+    // author has to audit every `match` on `pre_lifecycle` alongside the const
+    // — the tradeoff the module doc-comment accepts for reusing
+    // `SandboxLifecycle` instead of a closed-subset enum.
+    let want: HashSet<SandboxLifecycle> = [
+        SandboxLifecycle::Started,
+        SandboxLifecycle::Paused,
+        SandboxLifecycle::Stopped,
+    ]
+    .into_iter()
+    .collect();
+    let got: HashSet<SandboxLifecycle> = EVACUABLE_LIFECYCLES.iter().copied().collect();
+    assert_eq!(got, want);
 }

@@ -886,8 +886,8 @@ impl SweepSink for SubstrateSweepSink {
                             Ok(target) => Some(target),
                             Err(err) => {
                                 // The column CHECK pins values to
-                                // 'started'/'paused'; reaching this means
-                                // schema/enum drift. Treat as unset (the
+                                // 'started'/'paused'/'stopped'; reaching this
+                                // means schema/enum drift. Treat as unset (the
                                 // converge target then defaults to started).
                                 tracing::warn!(
                                     sandbox_id = %row.id,

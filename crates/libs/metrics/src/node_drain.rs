@@ -123,7 +123,12 @@ pub fn drain_blockers(node_id: &str, count: u64) {
 /// Not a work queue that drains down like `sandboxes_remaining`: the evacuation
 /// pipeline never services these rows (`created`, `stopped`, `deleting`,
 /// `quarantined`), so it falls only when the sandbox is deleted, its `deleting`
-/// completes, or quarantine resolution releases it.
+/// completes, or quarantine resolution releases it. The exception is `stopped`
+/// on a forced drain with stopped-resident evacuation in effect: the drain then
+/// dispatches those rows every tick, refused ones included, and a tick that
+/// dispatched anything isn't otherwise-ready, so this reads `0` on such a node
+/// on most ticks while stopped residents hold it. Read
+/// [`stopped_evacuation`]'s outcomes there instead.
 pub fn termination_blocking_residents(node_id: &str, count: u64) {
     gauge(
         "node_drain.termination_blocking_residents",
@@ -225,13 +230,15 @@ pub fn failure(node_id: &str, phase: &str, pre_lifecycle: &str) {
     );
 }
 
-/// A cohort-restore attempt whose blocking wake wait exhausted the API-side
-/// node-RPC budget while the node was still restoring. Not a failure (see
-/// [`failure`]): the next sweep re-drives the same sandbox until it
-/// converges. `phase` names the readiness step the wait stalled in —
-/// `pod_never_ready` / `proxy_unreachable` / `guest_not_ready` — or `budget`
-/// when the outer wake budget fired without entering a specific readiness
-/// wait. `pre_lifecycle` matches the [`failure`] tag of the same name.
+/// A cohort-restore attempt that has not finished but is still progressing:
+/// its blocking wake wait timed out while the node was still restoring, or the
+/// substrate reported a restore or suspend already in flight, or a restore
+/// source not yet available. Not a failure (see [`failure`]): the next sweep
+/// re-drives the same sandbox until it converges. `phase` names the readiness
+/// step a timed-out wait stalled in — `pod_never_ready` /
+/// `proxy_unreachable` / `guest_not_ready` — or `budget` for every other case:
+/// a timeout that fired without entering a specific readiness wait, and all
+/// three in-flight or pending outcomes. `pre_lifecycle` matches the [`failure`] tag of the same name.
 /// A sustained high rate with no matching
 /// `node_drain.sandbox_restore_duration_ms` completions means restores are
 /// wedged rather than slow — the `phase` tag says where.
@@ -256,6 +263,137 @@ pub fn sandbox_failed_on_node(node_id: &str, pre_lifecycle: &str) {
         1,
         &[tag("node", node_id), tag("pre_lifecycle", pre_lifecycle)],
     );
+}
+
+/// One tick's worth of work on a `stopped` resident's evacuation, tagged with
+/// the step it reached. `outcome` is one of:
+///
+/// - `"awaiting_durable_disk"` — the disk artifact's backup is enqueued (or
+///   already in flight) but the catalog does not yet carry a ready row for that
+///   exact artifact. The node stays held. This is the steady state for the
+///   whole S3 upload, so it is re-counted once per sandbox per tick and its
+///   rate says how long uploads are taking, not how often something is wrong.
+/// - `"released"` — the bytes are durable and the node's hold is released
+///   (retired pods deleted, placement cleared); the row is unplaced. Once per
+///   evacuated sandbox. Nothing on the node is deleted: the rootfs stays there
+///   until the node is terminated, so this outcome is **not** evidence that
+///   the local copy is gone.
+/// - `"deferred"` — not this tick, for a reason that can usually clear by itself
+///   (a node with no row for a sandbox the cluster still calls stopped is the
+///   exception: it's deferred every tick until node-census residency proves the
+///   sandbox absent, which needs its placement settled and a fresh heartbeat
+///   and census from the node, and forever with that residency off): the
+///   claim stopped holding (a user took the sandbox over, its placement
+///   drifted, or the node stopped being force-drained); the node disagrees
+///   about the sandbox (no row there, not stopped, its VM alive, or an answer it
+///   could only publish degraded); or an
+///   execution appeared before the teardown. Nothing was destroyed, though a
+///   backup may already have been enqueued.
+/// - `"unattributable_artifact"` — the sandbox carries an artifact pin this
+///   drain did not mint, so the next publish would reuse those bytes rather
+///   than capture the rootfs as it stands, and the evacuation refused to start.
+///   Almost always read from sbx-mgr over the same connection the publish
+///   uses, because that is the row the mint decision is made against; the
+///   cluster's column of the same name is checked first, but it is NULL for
+///   almost every stopped sandbox. **The one outcome that never
+///   self-resolves**, and today it is the **expected** outcome rather than an
+///   exception. The execution retire enqueues a disk backup on every ordinary
+///   stop and a pinless row mints, so nearly every stopped resident's node row
+///   carries a pin; the pin is usually current, but a start that fails after
+///   the guest ran keeps an older one, and the guard cannot tell the two
+///   apart. So until the node side changes, every ordinarily-stopped resident
+///   reports this and parks its node.
+///
+///   **Do not alert on its rate at enablement.** It will fire immediately, on
+///   correct fail-closed behaviour. What is worth alerting on is this outcome
+///   persisting *after* the node-side change lands, which is when it goes back
+///   to meaning "a sandbox nobody can evacuate". **This counter is the whole
+///   signal for it** — `node_drain.stopped_evacuation_stall_secs` selects on the
+///   evacuation marker, and this refusal returns before the claim writes one, so
+///   it does not appear there at all. The per-sandbox log line is at `debug`
+///   (a `warn` only when the node's pin could not be read), because the refusal
+///   repeats every tick; a responder finds the sandboxes by listing the node's
+///   `stopped` residents.
+///
+/// A failed attempt is **not** here: it counts on `node_drain.failures` with
+/// `pre_lifecycle = "stopped"`, alongside every other evacuation failure.
+///
+/// `awaiting_durable_disk` rising with no matching `released` means uploads are
+/// not finalizing, which is a catalog question rather than a drain one: the
+/// gate is waiting for a `snapshots` row for the pinned artifact to reach
+/// `state = 'ready'`. Read `node_drain.stopped_evacuation_stall_secs` for how
+/// long it has been waiting, then look at the upload worker for that sandbox —
+/// the drain only observes that row, it does not write it.
+pub fn stopped_evacuation(node_id: &str, outcome: &str) {
+    counter(
+        "node_drain.stopped_evacuation",
+        1,
+        &[tag("node", node_id), tag("outcome", outcome)],
+    );
+}
+
+/// Evacuated `stopped` sandboxes waiting to be re-placed onto a node —
+/// cluster-wide, emitted on every periodic restore sweep including zero.
+///
+/// Each counted row carries the `'stopped'` marker, reads `stopped` (or
+/// `restoring`, which nothing reaches yet), and has no `active_node_id`, so no
+/// node can serve its `start`. The drain's
+/// teardown leaves a row in that shape after proving its disk artifact durable
+/// in S3; the query doesn't check how a row got there, so a marked row unplaced
+/// some other way counts too. That makes a sustained nonzero value an
+/// availability incident in the usual case, which is the condition worth
+/// paging on. Durability is deliberately not re-checked here: a row whose
+/// backup stopped resolving after the teardown is still counted, because
+/// nothing recovers it automatically. Alert on `> 0` sustained over a window
+/// comfortably longer than a normal re-placement — a drain legitimately puts
+/// rows here for as long as one restore takes.
+///
+/// Deliberately a gauge over the pending set rather than a counter of failed
+/// attempts: attempts fail transiently and back off, and counting them pages on
+/// noise. The per-sandbox identity for a responder is in the ERROR log emitted
+/// on each failed attempt once a row's attempt count reaches the escalation
+/// threshold.
+pub fn stopped_replacement_pending(count: u64) {
+    gauge("node_drain.stopped_replacement_pending", count as f64, &[]);
+}
+
+/// Age, in seconds, of the longest stopped evacuation still claimed on a
+/// force-draining node — `0` when there is none. That covers an upload not yet
+/// durable and a durable one whose teardown the node keeps declining or that
+/// keeps failing; the query doesn't tell them apart, so check
+/// `node_drain.stopped_evacuation{outcome}` and `node_drain.failures{phase}`
+/// for which. Cluster-wide, emitted on every periodic restore sweep.
+///
+/// The companion to [`stopped_replacement_pending`], and the two do not
+/// overlap: that one counts evacuations whose teardown is *done* and which are
+/// waiting to be placed, this one covers the stretch before the teardown, when
+/// the sandbox still has its node. An evacuation wedged there shows up in
+/// neither the pending gauge (it is not unplaced) nor usefully in
+/// `node_drain.stopped_evacuation` (where a stall and a healthy multi-gigabyte
+/// upload are the same `awaiting_durable_disk` tick), so without this series a
+/// node can park indefinitely with every alert flat at zero.
+///
+/// **Alert on it.** A stopped evacuation has no give-up: the drain cannot ask
+/// the node for a fresher artifact, so a durability gate that will never open
+/// holds the node until a human intervenes. Pick a window comfortably longer
+/// than the largest legitimate rootfs upload in the environment — an hour is a
+/// reasonable start — and expect a steady climb rather than a spike, since the
+/// value is an age.
+///
+/// Measured from the pinned artifact's earliest catalog registration, falling
+/// back to the node's `drain_started_at` for a row that has not published, and
+/// then to when the sandbox became `stopped` for a draining node with no start
+/// time. Scoped to *claimed* evacuations on *forced* drains: a claim can only be
+/// opened on one, and the refusal that returns before the claim writes no marker
+/// and so is not visible here — see `node_drain.stopped_evacuation`'s
+/// `unattributable_artifact` for that one.
+///
+/// Three clocks so the value can never be NULL — which would publish as a
+/// reassuring `0` for the node nobody is watching. The first, the artifact's
+/// earliest catalog registration, comes after the claim, so it can
+/// under-report, and the value drops when it first appears.
+pub fn stopped_evacuation_stall(secs: u64) {
+    gauge("node_drain.stopped_evacuation_stall_secs", secs as f64, &[]);
 }
 
 /// ASG `TerminateInstanceInAutoScalingGroup` failure.

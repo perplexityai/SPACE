@@ -133,6 +133,40 @@ pub(super) enum PodFenceCheck {
 }
 
 impl KubernetesSubstrate {
+    /// Delete-mode teardown for a sandbox the caller observed with no active
+    /// execution, refusing if one exists by the time it runs.
+    ///
+    /// [`SubstrateAdapter::delete_execution`] is unfenced: it resolves whatever
+    /// pod currently backs the sandbox, sends the in-VM delete to it and sweeps
+    /// every tracked pod name. That is right for a caller asking for the
+    /// sandbox to be gone, and wrong for one tearing down a `stopped` sandbox
+    /// on the strength of an earlier read — if a `start` creates an execution
+    /// in between, the unfenced path deletes the new pod and erases the rootfs
+    /// along with every write since the start.
+    ///
+    /// This takes the [`RetireFence::NoExecution`] path in delete mode: only
+    /// inactive executions' pods are deleted, no in-VM request is sent, and the
+    /// placement clear re-proves the absence inside the lock execution creation
+    /// also takes. Delete mode keeps the placement clock bump that
+    /// `delete_execution` makes.
+    ///
+    /// `Ok(true)` when the sandbox was torn down (or had nothing left to tear
+    /// down), `Ok(false)` when an active execution appeared and nothing was
+    /// changed.
+    pub async fn delete_execution_with_no_active_execution(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<bool, SubstrateError> {
+        let outcome = self
+            .teardown_execution(
+                sandbox_id,
+                ExecutionTeardown::Delete,
+                &RetireFence::NoExecution,
+            )
+            .await?;
+        Ok(matches!(outcome, RetireExecutionOutcome::Retired))
+    }
+
     /// Check a caller's pod-identity fence before anything destructive runs.
     ///
     /// Two questions, two authorities. The control plane answers "is the

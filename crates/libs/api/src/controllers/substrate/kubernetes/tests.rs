@@ -14053,6 +14053,138 @@ mod kubernetes_tests {
         Ok(())
     }
 
+    /// Place a sandbox on a fresh worker node, with a placement clock an hour
+    /// old so a bump is observable.
+    async fn place_on_fresh_node(pool: &PgPool, sandbox_id: SandboxId) -> Result<NodeId, BoxError> {
+        let node_id = NodeId::new();
+        sqlx::query(
+            "INSERT INTO nodes (id, address, role, managed_by, state)
+             VALUES ($1, '10.0.0.78'::inet, 'worker', 'k8s', 'registered')",
+        )
+        .bind(node_id)
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "UPDATE sandboxes
+                SET active_node_id = $2, placement = 'on_node',
+                    placement_changed_at = NOW() - INTERVAL '1 hour'
+              WHERE id = $1",
+        )
+        .bind(sandbox_id)
+        .bind(node_id)
+        .execute(pool)
+        .await?;
+        Ok(node_id)
+    }
+
+    /// `(active_node_id, placement_changed_at is within the last minute)`.
+    async fn placement_of(pool: &PgPool, sandbox_id: SandboxId) -> (Option<NodeId>, bool) {
+        sqlx::query_as(
+            "SELECT active_node_id, placement_changed_at > NOW() - INTERVAL '1 minute'
+               FROM sandboxes WHERE id = $1",
+        )
+        .bind(sandbox_id)
+        .fetch_one(pool)
+        .await
+        .expect("placement must be queryable")
+    }
+
+    /// A drain tearing down an evacuated `stopped` sandbox must not touch one
+    /// its owner has started since the teardown was authorized. The start's
+    /// execution is the only trace of it the teardown can see, and the
+    /// unfenced delete would send that pod the in-VM delete — erasing the
+    /// rootfs and every write since the start — then clear its placement.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stopped_teardown_leaves_alone_a_sandbox_a_start_gave_an_execution()
+    -> Result<(), BoxError> {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        let pod_name = format!("space-sbx-{}-g2", sandbox_id.as_uuid().simple());
+        insert_test_sandbox_row(&pool, sandbox_id, "starting").await?;
+        let node_id = place_on_fresh_node(&pool, sandbox_id).await?;
+        insert_k8s_execution(&pool, sandbox_id, 2, &pod_name, "uid-start", None, true).await?;
+        let captured_deletes = Arc::new(Mutex::new(Vec::new()));
+        let substrate = substrate_with_store_client_proxy_port_and_pod(
+            pool.clone(),
+            delete_capturing_kubernetes_client(Arc::clone(&captured_deletes), None),
+            DEFAULT_SANDBOX_PROXY_PORT,
+            None,
+        );
+
+        let torn_down = substrate
+            .delete_execution_with_no_active_execution(sandbox_id)
+            .await?;
+
+        assert!(!torn_down, "the teardown must report that it did nothing");
+        assert!(
+            captured_deletes
+                .lock()
+                .expect("capture mutex poisoned")
+                .is_empty(),
+            "the started sandbox's pod must survive"
+        );
+        assert_eq!(
+            active_execution_generations(&pool, sandbox_id).await,
+            vec![2],
+            "and so must its execution"
+        );
+        assert_eq!(
+            placement_of(&pool, sandbox_id).await,
+            (Some(node_id), false),
+            "and its placement, clock included"
+        );
+        Ok(())
+    }
+
+    /// The other half: with no active execution, the same call releases the
+    /// node the way `delete_execution` does — the stopped sandbox's retired
+    /// pods deleted, its placement cleared, and the placement clock bumped,
+    /// which the restore sweep's stopped arm orders on.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stopped_teardown_releases_the_node_when_nothing_is_running() -> Result<(), BoxError>
+    {
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        let pod_name = format!("space-sbx-{}-g1", sandbox_id.as_uuid().simple());
+        insert_test_sandbox_row(&pool, sandbox_id, "stopped").await?;
+        let node_id = place_on_fresh_node(&pool, sandbox_id).await?;
+        insert_k8s_execution(&pool, sandbox_id, 1, &pod_name, "uid-retired", None, false).await?;
+        assert_eq!(
+            placement_of(&pool, sandbox_id).await,
+            (Some(node_id), false),
+            "fixture precondition: placed, with an old clock"
+        );
+        let captured_deletes = Arc::new(Mutex::new(Vec::new()));
+        let substrate = substrate_with_store_client_proxy_port_and_pod(
+            pool.clone(),
+            delete_capturing_kubernetes_client(Arc::clone(&captured_deletes), None),
+            DEFAULT_SANDBOX_PROXY_PORT,
+            None,
+        );
+
+        let torn_down = substrate
+            .delete_execution_with_no_active_execution(sandbox_id)
+            .await?;
+
+        assert!(torn_down, "with nothing running the teardown must proceed");
+        assert_eq!(
+            placement_of(&pool, sandbox_id).await,
+            (None, true),
+            "the node must be released and the placement clock bumped"
+        );
+        assert!(
+            captured_deletes
+                .lock()
+                .expect("capture mutex poisoned")
+                .iter()
+                .any(|(path, _)| path.ends_with(&pod_name)),
+            "the retired execution's pod must be deleted"
+        );
+        Ok(())
+    }
+
     /// The absence check and the tracking clear have to be the same
     /// transaction. Checking, then falling into the unfenced tail, re-creates
     /// the race the variant exists to close: an execution created in between

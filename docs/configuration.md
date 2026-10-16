@@ -67,6 +67,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_NODE_DRAIN_ENABLED` | off | |
 | `SPACE_NODE_DRAIN_NODE_CENSUS_RESIDENCY` | off | |
 | `SPACE_NODE_DRAIN_TERMINATION_BLOCKING_GATE` | off | Parks nodes that still hold stopped, created, deleting or quarantined residents in `draining` instead of advancing them to `drained`. |
+| `SPACE_NODE_DRAIN_EVACUATE_STOPPED_RESIDENTS` | off | On a forced drain, publishes a resident `stopped` sandbox's disk to S3, waits for it to be durable, then releases the node (the node-local copy goes when the node terminates) and hands the sandbox to the restore sweep. Has no effect unless `SPACE_NODE_DRAIN_TERMINATION_BLOCKING_GATE` is also on. Turning it off stops new evacuations; ones already claimed, including a claim an `:undrain` left behind, still proceed when a forced drain next reaches them. The restore sweep cannot yet re-place a `stopped` sandbox, so with this on an evacuated sandbox answers `start` with a retryable 503 until it can. |
 | `SPACE_NODE_DRAIN_TERMINATOR_KIND` | `aws` | `aws`, `kube-delete` or `noop`. |
 | `SPACE_DRAINED_NODE_TERMINATOR_ENABLED` | off | |
 | `SPACE_CLUSTER_CONTROLLER_DRAIN_EVACUATION_COHORT_VALUE` | unset | Unset disables the rollout-cohort feature. |

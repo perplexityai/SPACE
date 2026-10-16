@@ -693,3 +693,106 @@ async fn node_drain_capability_matches_set_node_schedulability() {
         );
     }
 }
+
+/// **Three dispositions, and two of them refuse.**
+///
+/// The wire type is `optional string`, so "no pin", "empty string" and
+/// "malformed" all arrive through one field. Only the first is a real "no": the
+/// other two are pins we cannot identify, and reporting either as pinless would
+/// let a stopped evacuation open on a row whose next publish reuses bytes
+/// nobody can attribute — then destroy the rootfs on the strength of them.
+///
+/// An earlier revision split them, treating `""` as pinless and a malformed id
+/// as pinned. The table is asserted here rather than through the RPC because
+/// the tests that could reach it before injected the *result*, which left the
+/// dispositions themselves unexercised — a mutation swapping either arm passed.
+#[test]
+fn a_reported_pin_is_pinless_only_when_genuinely_absent() {
+    let sandbox_id = SandboxId::from_uuid(Uuid::now_v7());
+    let real = Uuid::now_v7();
+
+    assert_eq!(
+        parse_reported_pin(Some(&real.to_string()), sandbox_id),
+        (Some(LocalArtifactId::from_uuid(real)), false),
+        "a readable id is the pin, and is not flagged unreadable"
+    );
+    assert_eq!(
+        parse_reported_pin(None, sandbox_id),
+        (None, false),
+        "an absent field is the only real `no pin` — the one answer a fresh evacuation \
+         may proceed on"
+    );
+    assert_eq!(
+        parse_reported_pin(Some(""), sandbox_id),
+        (None, true),
+        "an empty string is a pin we cannot identify, not an absent one: treating it as \
+         pinless would let a teardown run on evidence nobody could read"
+    );
+    assert_eq!(
+        parse_reported_pin(Some("not-a-uuid"), sandbox_id),
+        (None, true),
+        "and so is a malformed id — the two are equally unreadable and must not get \
+         opposite dispositions"
+    );
+    assert_eq!(
+        parse_reported_pin(Some("  "), sandbox_id),
+        (None, true),
+        "whitespace is present-but-unreadable too; only a genuinely missing field is a no"
+    );
+}
+
+/// The property: the node's answer never reads as "stopped, pinless, no live
+/// VM" unless the node actually said all three. A process the node's live probe
+/// sees running marks the VM alive whatever the watchdog's cached flag says,
+/// and a degraded stub — the node's raw lifecycle with every other field at
+/// its default — is flagged rather than passed off as a full answer.
+#[test]
+fn the_node_answer_is_never_a_false_all_clear() {
+    use pplx_space_sbx_mgr_client::proto::{SandboxInfo, SandboxLifecycleState};
+    let sandbox_id = SandboxId::from_uuid(Uuid::now_v7());
+    let stopped = |info: SandboxInfo| SandboxInfo {
+        sandbox_id: sandbox_id.to_string(),
+        lifecycle: Some(SandboxLifecycleState::Stopped as i32),
+        ..info
+    };
+
+    let quiet = node_reported_artifact_from_info(stopped(SandboxInfo::default()), sandbox_id);
+    assert!(quiet.present && quiet.reports_stopped);
+    assert!(!quiet.vm_alive, "no signal of a live process");
+    assert!(!quiet.state_degraded);
+
+    let watchdog = node_reported_artifact_from_info(
+        stopped(SandboxInfo {
+            firecracker_alive: true,
+            ..SandboxInfo::default()
+        }),
+        sandbox_id,
+    );
+    assert!(watchdog.vm_alive, "the watchdog's flag alone is enough");
+
+    let probed = node_reported_artifact_from_info(
+        stopped(SandboxInfo {
+            namespace: Some("sns-live".to_owned()),
+            ..SandboxInfo::default()
+        }),
+        sandbox_id,
+    );
+    assert!(
+        probed.vm_alive,
+        "the node sets `namespace` only from a successful live probe, so it outranks a \
+         stale-false watchdog flag"
+    );
+
+    let degraded = node_reported_artifact_from_info(
+        stopped(SandboxInfo {
+            state_degraded: true,
+            ..SandboxInfo::default()
+        }),
+        sandbox_id,
+    );
+    assert!(
+        degraded.state_degraded,
+        "a stub whose pin, liveness and lifecycle are defaults must be marked, or it reads as \
+         the one shape an evacuation may open on"
+    );
+}
