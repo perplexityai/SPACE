@@ -6,7 +6,7 @@ data:
   collector.yaml: |
 {{ tpl (.Files.Get "config/collector.yaml") . | indent 4 }}
   prometheus.yaml: |
-{{ .Files.Get "config/prometheus.yaml" | indent 4 }}
+{{ tpl (.Files.Get "config/prometheus.yaml") . | indent 4 }}
 ---
 {{- if not .Values.storage.existingClaim }}
 {{ include "common.pvc" (dict "name" "prometheus-data" "storage" .Values.storage) }}
