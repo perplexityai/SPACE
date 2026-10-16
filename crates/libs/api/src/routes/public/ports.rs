@@ -19,7 +19,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
 use crate::{
-    controllers::{ControllerError, sandbox::fetch_sandbox},
+    controllers::ControllerError,
     middleware::auth::AuthOrg,
     models::{
         Sandbox, SandboxPortExposure as ControllerPortExposure,
@@ -33,7 +33,10 @@ use crate::{
     routes::AppState,
 };
 
-use super::error::{PublicApiError, with_retry_after_hint};
+use super::{
+    error::{PublicApiError, with_retry_after_hint},
+    owner_scope::{AuthorizedSandbox, authorized_sandbox},
+};
 
 const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 const OPEN_PORT_PATH_TEMPLATE: &str = pplx_space_public_api::routes::OPEN_PORT.path();
@@ -42,9 +45,10 @@ const CLOSE_PORT_PATH_TEMPLATE: &str = pplx_space_public_api::routes::CLOSE_PORT
 pub async fn list_ports(
     State(state): State<AppState>,
     Extension(AuthOrg(org)): Extension<AuthOrg>,
+    authorized: Option<Extension<AuthorizedSandbox>>,
     Path(sandbox_id): Path<String>,
 ) -> Result<Json<ListPortExposuresResponse>, PublicApiError> {
-    let sandbox = ensure_sandbox_owner(&state, org.id, &sandbox_id).await?;
+    let sandbox = ensure_sandbox_owner(authorized, &state, org.id, &sandbox_id).await?;
     let exposures = state
         .sandbox_controller
         .list_sandbox_port_exposures(&state.pool, &sandbox)
@@ -59,6 +63,7 @@ pub async fn list_ports(
 pub async fn open_port(
     State(state): State<AppState>,
     Extension(AuthOrg(org)): Extension<AuthOrg>,
+    authorized: Option<Extension<AuthorizedSandbox>>,
     headers: HeaderMap,
     Path((sandbox_id, port)): Path<(String, u16)>,
     body: Option<Json<serde_json::Value>>,
@@ -73,6 +78,7 @@ pub async fn open_port(
         });
     apply_port_action(
         state,
+        authorized,
         org.id,
         headers,
         sandbox_id,
@@ -86,6 +92,7 @@ pub async fn open_port(
 pub async fn close_port(
     State(state): State<AppState>,
     Extension(AuthOrg(org)): Extension<AuthOrg>,
+    authorized: Option<Extension<AuthorizedSandbox>>,
     headers: HeaderMap,
     Path((sandbox_id, port)): Path<(String, u16)>,
     body: Option<Json<serde_json::Value>>,
@@ -97,6 +104,7 @@ pub async fn close_port(
         .unwrap_or(ClosePortExposureRequest { protocol: None });
     apply_port_action(
         state,
+        authorized,
         org.id,
         headers,
         sandbox_id,
@@ -109,6 +117,7 @@ pub async fn close_port(
 
 async fn apply_port_action(
     state: AppState,
+    authorized: Option<Extension<AuthorizedSandbox>>,
     org_id: OrgId,
     headers: HeaderMap,
     sandbox_id: String,
@@ -131,7 +140,7 @@ async fn apply_port_action(
         return Ok(response);
     }
 
-    let sandbox = ensure_sandbox_owner(&state, org_id, &sandbox_id).await?;
+    let sandbox = ensure_sandbox_owner(authorized, &state, org_id, &sandbox_id).await?;
     let exposure = match &action {
         PortAction::Open(request) => {
             state
@@ -196,6 +205,7 @@ impl PortAction {
 }
 
 async fn ensure_sandbox_owner(
+    authorized: Option<Extension<AuthorizedSandbox>>,
     state: &AppState,
     org_id: OrgId,
     sandbox_id: &str,
@@ -203,13 +213,7 @@ async fn ensure_sandbox_owner(
     let sandbox_id = sandbox_id
         .parse::<PublicSandboxId>()
         .map_err(|_| PublicApiError::bad_request("invalid sandbox id"))?;
-    let Some(sandbox) = fetch_sandbox(&state.pool, sandbox_id.into()).await? else {
-        return Err(PublicApiError::not_found("sandbox not found"));
-    };
-    if sandbox.org_id != org_id {
-        return Err(PublicApiError::not_found("sandbox not found"));
-    }
-    Ok(sandbox)
+    authorized_sandbox(authorized, &state.pool, org_id, sandbox_id).await
 }
 
 fn validate_port(port: u16) -> Result<(), PublicApiError> {

@@ -19,15 +19,13 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
-    controllers::{ControllerError, sandbox::fetch_sandbox},
-    middleware::auth::AuthOrg,
-    models::Sandbox,
-    routes::AppState,
+    controllers::ControllerError, middleware::auth::AuthOrg, models::Sandbox, routes::AppState,
 };
 
 use super::{
     cursors::{CursorKind, decode_cursor, encode_cursor},
     error::{PublicApiError, with_retry_after_hint},
+    owner_scope::{AuthorizedSandbox, authorized_sandbox},
 };
 
 const DEFAULT_PROCESS_LIST_LIMIT: u16 = 100;
@@ -54,12 +52,13 @@ impl FromStr for ProcessAction {
 pub async fn list_processes(
     State(state): State<AppState>,
     Extension(AuthOrg(org)): Extension<AuthOrg>,
+    authorized: Option<Extension<AuthorizedSandbox>>,
     Path(sandbox_id): Path<String>,
     Query(query): Query<ListProcessesQuery>,
 ) -> Result<Json<PublicPage<PublicProcess>>, PublicApiError> {
     let cursor = query.cursor()?;
     let limit = query.limit();
-    let processes = fetch_public_processes(&state, org.id, &sandbox_id).await?;
+    let processes = fetch_public_processes(authorized, &state, org.id, &sandbox_id).await?;
 
     Ok(Json(process_page(processes, cursor.as_ref(), limit)?))
 }
@@ -95,11 +94,12 @@ impl ListProcessesQuery {
 pub async fn get_process(
     State(state): State<AppState>,
     Extension(AuthOrg(org)): Extension<AuthOrg>,
+    authorized: Option<Extension<AuthorizedSandbox>>,
     Path((sandbox_id, process_id)): Path<(String, String)>,
 ) -> Result<Json<PublicProcess>, PublicApiError> {
     let process_id = ProcessId::parse(process_id)
         .map_err(|_| PublicApiError::bad_request("invalid process id"))?;
-    let processes = fetch_public_processes(&state, org.id, &sandbox_id).await?;
+    let processes = fetch_public_processes(authorized, &state, org.id, &sandbox_id).await?;
     let Some(process) = processes
         .into_iter()
         .find(|process| process.process_id == process_id)
@@ -113,6 +113,7 @@ pub async fn get_process(
 pub async fn apply_process_action(
     State(state): State<AppState>,
     Extension(AuthOrg(org)): Extension<AuthOrg>,
+    authorized: Option<Extension<AuthorizedSandbox>>,
     Path((sandbox_id, process_id_and_action)): Path<(String, String)>,
     body: Option<Json<Value>>,
 ) -> Result<Json<ProcessMutationResponse>, PublicApiError> {
@@ -126,20 +127,23 @@ pub async fn apply_process_action(
                 .ok_or_else(|| PublicApiError::bad_request("signal request body is required"))?;
             let signal = ProcessSignal::try_from_i32(request.signal)
                 .map_err(|error| PublicApiError::bad_request(error.to_string()))?;
-            apply_process_signal(state, org.id, sandbox_id, process_id, signal).await
+            apply_process_signal(state, authorized, org.id, sandbox_id, process_id, signal).await
         }
-        ProcessAction::Kill => apply_process_kill(state, org.id, sandbox_id, process_id).await,
+        ProcessAction::Kill => {
+            apply_process_kill(state, authorized, org.id, sandbox_id, process_id).await
+        }
     }
 }
 
 async fn apply_process_signal(
     state: AppState,
+    authorized: Option<Extension<AuthorizedSandbox>>,
     org_id: OrgId,
     sandbox_id: String,
     process_id: ProcessId,
     signal: ProcessSignal,
 ) -> Result<Json<ProcessMutationResponse>, PublicApiError> {
-    let sandbox = ensure_sandbox_owner(&state, org_id, &sandbox_id).await?;
+    let sandbox = ensure_sandbox_owner(authorized, &state, org_id, &sandbox_id).await?;
     state
         .sandbox_controller
         .spaced_send_signal(
@@ -161,11 +165,12 @@ async fn apply_process_signal(
 
 async fn apply_process_kill(
     state: AppState,
+    authorized: Option<Extension<AuthorizedSandbox>>,
     org_id: OrgId,
     sandbox_id: String,
     process_id: ProcessId,
 ) -> Result<Json<ProcessMutationResponse>, PublicApiError> {
-    let sandbox = ensure_sandbox_owner(&state, org_id, &sandbox_id).await?;
+    let sandbox = ensure_sandbox_owner(authorized, &state, org_id, &sandbox_id).await?;
     state
         .sandbox_controller
         .spaced_kill_process(
@@ -202,11 +207,12 @@ fn parse_process_action_segment(value: &str) -> Result<(ProcessId, ProcessAction
 }
 
 async fn fetch_public_processes(
+    authorized: Option<Extension<AuthorizedSandbox>>,
     state: &AppState,
     org_id: OrgId,
     sandbox_id: &str,
 ) -> Result<Vec<PublicProcess>, PublicApiError> {
-    let sandbox = ensure_sandbox_owner(state, org_id, sandbox_id).await?;
+    let sandbox = ensure_sandbox_owner(authorized, state, org_id, sandbox_id).await?;
     let sandbox_id = PublicSandboxId::from(sandbox.id);
 
     let response = state
@@ -224,18 +230,13 @@ async fn fetch_public_processes(
 }
 
 async fn ensure_sandbox_owner(
+    authorized: Option<Extension<AuthorizedSandbox>>,
     state: &AppState,
     org_id: OrgId,
     sandbox_id: &str,
 ) -> Result<Sandbox, PublicApiError> {
     let sandbox_id = parse_public_sandbox_id(sandbox_id)?;
-    let Some(sandbox) = fetch_sandbox(&state.pool, sandbox_id.into()).await? else {
-        return Err(PublicApiError::not_found("sandbox not found"));
-    };
-    if sandbox.org_id != org_id {
-        return Err(PublicApiError::not_found("sandbox not found"));
-    }
-    Ok(sandbox)
+    authorized_sandbox(authorized, &state.pool, org_id, sandbox_id).await
 }
 
 fn parse_public_sandbox_id(value: &str) -> Result<PublicSandboxId, PublicApiError> {

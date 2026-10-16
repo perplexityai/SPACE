@@ -674,3 +674,113 @@ async fn queued_native_create_grant_renewal_is_monotone_and_terminal_payload_is_
     );
     Ok(())
 }
+
+/// Every statement the request sends to Postgres, by `sql!` locator (or the
+/// leading SQL keyword for unlocated ones such as `BEGIN`), in order.
+async fn statements_during(
+    request: impl std::future::Future<Output = TestDbResult<(StatusCode, Value)>>,
+) -> TestDbResult<(StatusCode, Value, Vec<String>)> {
+    use pplx_space_observability::test_capture::{CapturedEventsLayer, field_value};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let layer = CapturedEventsLayer::new().with_target("sqlx::query");
+    let events = layer.events();
+    let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+    let (status, body) = request.await?;
+    let statements = events
+        .events()
+        .iter()
+        .map(|event| {
+            let summary = field_value(event, "summary").unwrap_or_default();
+            let statement = field_value(event, "db.statement").unwrap_or_default();
+            let sql = if statement.is_empty() {
+                summary
+            } else {
+                statement
+            };
+            match sql
+                .trim_start()
+                .strip_prefix("/*")
+                .and_then(|rest| rest.split_once("*/"))
+            {
+                Some((locator, _)) => locator.to_string(),
+                None => sql
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string(),
+            }
+        })
+        .collect();
+    Ok((status, body, statements))
+}
+
+fn sandbox_row_loads(statements: &[String]) -> usize {
+    statements
+        .iter()
+        .filter(|locator| locator.starts_with("pplx_space_api::controllers::sandbox::responses:"))
+        .count()
+}
+
+#[tokio::test]
+async fn sandbox_scoped_requests_load_owner_and_row_once() -> TestDbResult<()> {
+    let fixture = fixture().await?;
+    let first = create(&fixture, ORG, "101").await?;
+    let second = create(&fixture, ORG, "102").await?;
+    let sandbox = seed_target(&fixture, &first).await?;
+    let other = seed_target(&fixture, &second).await?;
+
+    let (status, body, statements) = statements_during(send(
+        &fixture.app,
+        Method::POST,
+        &format!("/v1/sandboxes/{sandbox}/commands"),
+        owner_headers(ORG, "101"),
+        json!({"command": ["echo", "hello"]}),
+    ))
+    .await?;
+    eprintln!(
+        "POST /commands statements ({}): {statements:#?}",
+        statements.len()
+    );
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(sandbox_row_loads(&statements), 1, "{statements:#?}");
+    // An already-materialized owner resolves in one read.
+    assert_eq!(
+        statements
+            .iter()
+            .filter(|locator| locator.starts_with("pplx_space_api::federated_identity::store:"))
+            .count(),
+        1,
+        "{statements:#?}"
+    );
+
+    // Data-plane handlers stop at the runtime here, but the row is still
+    // loaded once, by the authorization layer.
+    let (_, _, statements) = statements_during(send(
+        &fixture.app,
+        Method::POST,
+        &format!("/v1/sandboxes/{sandbox}/files:stat"),
+        owner_headers(ORG, "101"),
+        json!({"path": "/tmp"}),
+    ))
+    .await?;
+    eprintln!(
+        "POST files:stat statements ({}): {statements:#?}",
+        statements.len()
+    );
+    assert_eq!(sandbox_row_loads(&statements), 1, "{statements:#?}");
+
+    // The shared row does not widen scope: another subject's sandbox is still
+    // the authorization layer's 404, and nothing reaches the handler.
+    let (status, _, statements) = statements_during(send(
+        &fixture.app,
+        Method::POST,
+        &format!("/v1/sandboxes/{other}/commands"),
+        owner_headers(ORG, "101"),
+        json!({"command": ["echo", "hello"]}),
+    ))
+    .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(sandbox_row_loads(&statements), 1, "{statements:#?}");
+    Ok(())
+}
