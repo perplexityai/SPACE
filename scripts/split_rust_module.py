@@ -265,6 +265,9 @@ def parse_items(src: str) -> tuple[list[Item], int]:
             while d > 0 and i < n:
                 d += line_depth_delta(mlines[i])
                 i += 1
+            if d == 0 and i - 1 > lead and re.search(r"\][^\]]*\S", mlines[i - 1]) and \
+                    not mlines[i - 1].rstrip().endswith("]"):
+                raise SystemExit(f"line {i}: an attribute and an item share a line; put the item on its own line")
             continue
         if s.startswith("#["):
             raise SystemExit(f"line {i + 1}: an attribute and an item share a line; put the item on its own line")
@@ -309,7 +312,7 @@ def attrs_of(lines: list[str], lead: int, start: int) -> list[str]:
     out, k = [], lead
     mlines = mask("\n".join(lines[lead:start])).split("\n")
     while k < start:
-        if lines[k].strip().startswith("#["):
+        if mlines[k - lead].strip().startswith("#["):
             d = line_depth_delta(mlines[k - lead])
             group = [lines[k]]
             k += 1
@@ -537,8 +540,8 @@ def super_path_positions(mt: str) -> list[int]:
 
 
 REL_VIS = re.compile(r"\bpub\s*\(\s*(?:super|self|in\s+(?:super|self)\b)")
-INCLUDE = re.compile(r"\binclude(?:_str|_bytes)?\s*!\s*[(\[{]")
-PLAIN_INCLUDE = re.compile(r"(\binclude(?:_str|_bytes)?\s*!\s*[(\[{]\s*)\"([^\"\\]*)\"\s*[)\]}]")
+INCLUDE = re.compile(r"\binclude_(?:str|bytes)\s*!\s*[(\[{]")
+PLAIN_INCLUDE = re.compile(r"(\binclude_(?:str|bytes)\s*!\s*[(\[{]\s*)\"([^\"\\]*)\"\s*[)\]}]")
 
 
 def transform_item(text: str, kind: str, parent_path: list[str], deeper_dir: bool) -> tuple[str, dict]:
@@ -613,6 +616,9 @@ def transform_item(text: str, kind: str, parent_path: list[str], deeper_dir: boo
     if re.search(r"\bmod\s+\w+\s*\{", mt) and re.search(r"\bsuper\b", mt):
         raise SystemExit("moved code has an inline module and names `super`; which module each `super` "
                          "means depends on nesting the tool does not track. Edit by hand.")
+    if re.search(r"\binclude\s*!\s*[(\[{]", mt):
+        raise SystemExit("moved code uses include!; the included Rust code resolves its paths from the module "
+                         "it is expanded in, which the tool cannot rewrite. Edit by hand.")
     if re.search(r"\bself\s*::\s*super\b", mt):
         raise SystemExit("`self::super` in moved code changes meaning one module deeper; edit by hand")
     for m in re.finditer(r"\bsuper\s*::", text):
@@ -784,7 +790,6 @@ def attr_lines(lines: list[str], lead: int, start: int) -> list[str]:
     return out
 
 
-RANK = {"none": -1, "private": 0, "in": 1, "crate": 2, "pub": 3}
 TYPE_NS = {"struct", "enum", "union", "trait", "type", "mod", "mod-decl"}
 DEFS = {"struct", "enum", "union", "trait", "impl", "type", "const", "static", "macro"}
 
@@ -841,20 +846,6 @@ def reexport_vis(reach: set[str]) -> str:
     return "pub(crate) " if not common else f"pub(in crate::{'::'.join(common)}) "
 
 
-def new_vis_rank(orig_vis: str, parent_path: list[str]) -> tuple[int, str]:
-    """Rank of an item's visibility after the move, for choosing the re-export."""
-    v = collapse(orig_vis)
-    mapped = map_vis(v, parent_path)
-    v = collapse(mapped) if mapped is not None else v
-    if v == "pub":
-        return RANK["pub"], ""
-    if v == "pub(crate)":
-        return RANK["crate"], ""
-    if v.startswith("pub(in "):
-        return RANK["in"], v
-    return RANK["private"], ""  # pub(super): reaches the parent only
-
-
 def code_lines(text: str) -> int:
     return sum(1 for ln in mask(text).split("\n") if ln.strip())
 
@@ -898,11 +889,18 @@ def apply(spec_path: str, repo: str, dry: bool, report: str | None) -> int:
     spec = tomllib.load(open(spec_path, "rb"))
     rel = spec["file"]
     path = os.path.join(repo, rel)
-    src = open(path, encoding="utf-8").read()
+    with open(path, encoding="utf-8", newline="") as fh:
+        src = fh.read()
+    if "\r" in src:
+        raise SystemExit(f"{rel} contains a carriage return; rustc treats a lone CR differently from a newline. "
+                         "Normalize line endings first.")
     items, header_end = parse_items(src)
     lines = src.split("\n")
     mlines = mask(src).split("\n")
     parent_path, beside = file_layout(rel)
+    if beside and re.search(r"/src/bin/[^/]+\.rs$", rel.replace(os.sep, "/")):
+        raise SystemExit(f"{rel}: children of a src/bin/*.rs crate root would sit in src/bin/, where Cargo builds "
+                         "every file as its own binary. Move it to src/bin/<name>/main.rs first.")
     deeper = not beside
     child_dir = os.path.join(os.path.dirname(path), os.path.basename(rel)[:-3]) if deeper else os.path.dirname(path)
     loaded_by_path = path_attribute_users(repo, rel)
@@ -1015,9 +1013,13 @@ def apply(spec_path: str, repo: str, dry: bool, report: str | None) -> int:
     for it in items:
         if it.kind in TYPE_NS and it.name in names:
             raise SystemExit(f"module name {it.name!r} collides with {it.selector}")
+    masked_src = mask(src)
     for n in names:
         if n in imported:
             raise SystemExit(f"module name {n!r} collides with a name the parent imports")
+        if re.search(r"(?<![\w:])" + re.escape(n) + r"\s*::", masked_src):
+            raise SystemExit(f"module name {n!r} is already used as a path in the parent (a crate or a glob-imported "
+                             "module?); a new module of that name would shadow it")
 
     # Where a split impl's doc comments go: with the members the parent keeps, else with the
     # first module (in spec order) that receives members.
@@ -1053,7 +1055,7 @@ def apply(spec_path: str, repo: str, dry: bool, report: str | None) -> int:
                                          "every item it emits is pub or used only inside the module")
                     counts["macro_items"] = counts.get("macro_items", 0) + 1
                     reach.add("pub")
-                elif it.kind != "impl":
+                elif it.kind != "impl" and not (it.kind == "const" and it.name == "_"):
                     reach.add(new_reach(it.vis, parent_path))
             elif k in split_impls:
                 lay = layout(k)
@@ -1245,8 +1247,9 @@ def git(repo: str, *args: str) -> str:
 
 
 def git_show(repo: str, rev: str, path: str) -> str | None:
-    r = subprocess.run(["git", "-C", repo, "show", f"{rev}:{path}"], capture_output=True, text=True)
-    return r.stdout if r.returncode == 0 else None
+    """A file's bytes at a revision, decoded without newline translation (a lone CR stays a CR)."""
+    r = subprocess.run(["git", "-C", repo, "show", f"{rev}:{path}"], capture_output=True)
+    return r.stdout.decode("utf-8") if r.returncode == 0 else None
 
 
 def parent_candidates(child: str) -> list[str]:
@@ -1291,13 +1294,15 @@ def escape_glob(sel: str) -> str:
 
 def derive_spec(repo: str, base: str, head: str, parent: str, children: list[str]) -> str:
     """The spec `apply` would need to turn the base parent into the head files."""
-    base_items = parse_items(git_show(repo, base, parent) or "")[0]
+    base_src = git_show(repo, base, parent) or ""
+    base_items = parse_items(base_src)[0]
+    base_lines, base_mlines = base_src.split("\n"), mask(base_src).split("\n")
     head_parent = git_show(repo, head, parent) or ""
     hp_items = parse_items(head_parent)[0]
     hp_lines = head_parent.split("\n")
     order = [it.name for it in hp_items if it.kind == "mod-decl"]
     names = sorted(children, key=lambda n: order.index(n) if n in order else len(order))
-    out = [f"file = {json.dumps(parent)}"]
+    out = [f"file = {json.dumps(parent, ensure_ascii=False)}"]
     for name in names:
         child = os.path.join(os.path.dirname(parent), os.path.basename(parent)[:-3], f"{name}.rs") \
             if not file_layout(parent)[1] else os.path.join(os.path.dirname(parent), f"{name}.rs")
@@ -1310,23 +1315,32 @@ def derive_spec(repo: str, base: str, head: str, parent: str, children: list[str
         for it in items:
             if it.kind == "use" and collapse("\n".join(lines[it.start:it.end + 1])) == "use super::*;":
                 continue
-            lay = impl_layout(lines, mlines, it) if it.kind == "impl" else None
-            if lay and lay.members:
-                base_sel = next((b.selector for b in base_items if b.kind == "impl"
-                                 and header_key(b.selector) == header_key(it.selector)), it.selector)
-                sels += [f"{escape_glob(base_sel)} :: {escape_glob(m.selector)}" for m in lay.members]
-            else:
+            if it.kind != "impl":
                 sels.append(escape_glob(it.selector))
+                continue
+            base = [b for b in base_items if b.kind == "impl" and header_key(b.selector) == header_key(it.selector)]
+            base_sel = base[0].selector if base else it.selector
+            lay = impl_layout(lines, mlines, it)
+            if not (lay and lay.members):
+                sels.append(escape_glob(base_sel))
+                continue
+            moved = [m.selector for m in lay.members]
+            whole = any(sorted(m.selector for m in (impl_layout(base_lines, base_mlines, b) or ImplLayout(0, [], 0)).members)
+                        == sorted(moved) for b in base)
+            if whole and len(base) == 1:
+                sels.append(escape_glob(base_sel))
+            else:
+                sels += [f"{escape_glob(base_sel)} :: {escape_glob(m)}" for m in moved]
         glob_lead = next(("\n".join(lines[it.lead:it.start]) for it in items if it.kind == "use"
                           and collapse("\n".join(lines[it.start:it.end + 1])) == "use super::*;"), "")
         out.append(f"\n[[module]]\nname = {json.dumps(name)}")
         if doc:
-            out.append(f"doc = {json.dumps(doc)}")
+            out.append(f"doc = {json.dumps(doc, ensure_ascii=False)}")
         if "allow(unused_imports)" in glob_lead:
             out.append("allow_unused_glob = true")
         if any(it.kind == "macro" for it in items):
             out.append("allow_macro_items = true")
-        out.append("items = [\n" + "".join(f"  {json.dumps(s)},\n" for s in dict.fromkeys(sels)) + "]")
+        out.append("items = [\n" + "".join(f"  {json.dumps(x, ensure_ascii=False)},\n" for x in dict.fromkeys(sels)) + "]")
     return "\n".join(out) + "\n"
 
 
@@ -1339,8 +1353,11 @@ def verify(repo: str, base: str, head: str, print_spec: bool = False) -> int:
     import shutil
     import tempfile
 
+    repo = git(repo, "rev-parse", "--show-toplevel").strip()
     merge_base = git(repo, "merge-base", base, head).strip()
     raw = git(repo, "diff", "--raw", "-z", "--no-renames", "--no-abbrev", f"{merge_base}..{head}", "--", "*.rs")
+    other = [p for p in git(repo, "diff", "--name-only", "--no-renames", f"{merge_base}..{head}").splitlines()
+             if not p.endswith(".rs")]
     fields = raw.split("\0")
     status, modes = [], {}
     for k in range(0, len(fields) - 1, 2):
@@ -1367,6 +1384,9 @@ def verify(repo: str, base: str, head: str, print_spec: bool = False) -> int:
         groups.setdefault(owners[0], []).append(os.path.splitext(os.path.basename(p))[0])
     for p in sorted(modified - set(groups)):
         problems.append(f"{p}: changed, but no child module was split out of it")
+    for p in sorted(set(added) | modified):
+        if "\r" in (git_show(repo, head, p) or ""):
+            problems.append(f"{p}: contains a carriage return")
     checked = 0
     for parent, children in groups.items():
         spec = derive_spec(repo, merge_base, head, parent, children)
@@ -1409,6 +1429,8 @@ def verify(repo: str, base: str, head: str, print_spec: bool = False) -> int:
           f"{'identical' if not problems else str(len(problems)) + ' problems'}")
     for p in problems:
         print("  " + p)
+    if other:
+        print("not checked by verify (not Rust): " + ", ".join(other))
     return 1 if problems else 0
 
 

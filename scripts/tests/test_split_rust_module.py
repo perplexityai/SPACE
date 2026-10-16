@@ -244,7 +244,8 @@ def test_verify_rejects_a_head_that_is_not_rustfmt_formatted(repo):
     parsing.write_text(parsing.read_text().replace("pub(super) fn parse(x: &str) -> u32 {",
                                                    "pub(super) fn parse(\n    x: &str,\n) -> u32 {"))
     git(repo, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qam", "fmt")
-    assert run("verify", "HEAD~2", cwd=repo).returncode == 1
+    bad = run("verify", "HEAD~2", cwd=repo)
+    assert bad.returncode == 1 and "parsing.rs: differs from what apply generates" in bad.stdout
 
 
 def test_verify_rejects_a_token_edit_rustfmt_would_erase(repo):
@@ -252,7 +253,8 @@ def test_verify_rejects_a_token_edit_rustfmt_would_erase(repo):
     parsing = repo / "crate/src/a/foo/parsing.rs"
     parsing.write_text(parsing.read_text().replace("x.len() as u32", "vec![x.len() as u32,][0]"))
     git(repo, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qam", "edit")
-    assert run("verify", "HEAD~2", cwd=repo).returncode == 1
+    bad = run("verify", "HEAD~2", cwd=repo)
+    assert bad.returncode == 1 and "parsing.rs: differs from what apply generates" in bad.stdout
 
 
 def test_verify_sees_edits_inside_string_literals(repo):
@@ -455,7 +457,8 @@ def test_verify_rejects_edits_a_loose_comparison_would_miss(repo, path, old, new
     assert old in f.read_text()
     f.write_text(f.read_text().replace(old, new, 1))
     commit_all(repo, "edit")
-    assert run("verify", "HEAD~2", cwd=repo).returncode == 1
+    bad = run("verify", "HEAD~2", cwd=repo)
+    assert bad.returncode == 1 and ("differs from what apply generates" in bad.stdout or "regenerating" in bad.stdout), bad.stdout + bad.stderr
 
 
 def test_verify_rejects_doc_comments_swapped_between_impls(repo):
@@ -469,7 +472,8 @@ def test_verify_rejects_doc_comments_swapped_between_impls(repo):
     src.write_text(text.replace("/// Config docs.", "/// TMP").replace("/// Holder docs.", "/// Config docs.")
                    .replace("/// TMP", "/// Holder docs."))
     commit_all(repo, "swap")
-    assert run("verify", "HEAD~2", cwd=repo).returncode == 1
+    bad = run("verify", "HEAD~2", cwd=repo)
+    assert bad.returncode == 1 and "differs from what apply generates" in bad.stdout
 
 
 def write_parent(repo: Path, text: str, spec: str) -> subprocess.CompletedProcess:
@@ -580,27 +584,22 @@ def test_file_layout(rel, segments, beside):
     assert srm.file_layout(rel) == (segments, beside)
 
 
-def test_include_paths_are_rebased_or_refused(repo):
+def test_include_str_paths_are_rebased_and_include_is_refused(repo):
     ok = write_parent(repo, """\
         fn data() -> &'static str {
             include_str!("data.txt")
         }
-
-        fn items() {
-            include!("gen.rs");
-        }
-        """, 'file = "crate/src/a/foo.rs"\n[[module]]\nname = "x"\nitems = ["fn data", "fn items"]\n')
+        """, 'file = "crate/src/a/foo.rs"\n[[module]]\nname = "x"\nitems = ["fn data"]\n')
     assert ok.returncode == 0, ok.stderr
-    child = (repo / "crate/src/a/foo/x.rs").read_text()
-    assert 'include_str!("../data.txt")' in child and 'include!("../gen.rs")' in child
-    git(repo, "reset", "-q", "--hard", "HEAD")
-    git(repo, "clean", "-qfd")
-    bad = write_parent(repo, """\
-        fn raw() -> &'static str {
-            include_str!(r"data.txt")
-        }
-        """, 'file = "crate/src/a/foo.rs"\n[[module]]\nname = "y"\nitems = ["fn raw"]\n')
-    assert bad.returncode != 0 and "cannot rebase" in bad.stderr
+    assert 'include_str!("../data.txt")' in (repo / "crate/src/a/foo/x.rs").read_text()
+    for text, message in [
+        ("fn items() {\n    include!(\"gen.rs\");\n}\n", "include!"),
+        ("fn raw() -> &'static str {\n    include_str!(r\"data.txt\")\n}\n", "cannot rebase"),
+    ]:
+        git(repo, "reset", "-q", "--hard", "HEAD")
+        git(repo, "clean", "-qfd")
+        bad = write_parent(repo, text, 'file = "crate/src/a/foo.rs"\n[[module]]\nname = "y"\nitems = ["fn *"]\n')
+        assert bad.returncode != 0 and message in bad.stderr, bad.stderr
 
 
 def test_split_impl_attributes_follow_the_header_rewrite(repo):
@@ -805,7 +804,8 @@ def test_verify_rejects_a_removed_glob_import(repo):
     child = repo / "crate/src/a/foo/k8s.rs"
     child.write_text(child.read_text().replace("use super::*;\n\n", ""))
     commit_all(repo, "drop glob")
-    assert run("verify", "HEAD~2", cwd=repo).returncode == 1
+    bad = run("verify", "HEAD~2", cwd=repo)
+    assert bad.returncode == 1 and "k8s.rs: differs from what apply generates" in bad.stdout
 
 
 @pytest.mark.parametrize(
@@ -867,18 +867,87 @@ def test_module_docs_wrap_at_100_columns_and_verify_round_trips(repo):
     assert run("verify", "HEAD~1", cwd=repo).returncode == 0
 
 
-def test_a_binary_crate_root_round_trips_through_verify(tmp_path):
+def bin_repo(tmp_path: Path, rel: str) -> Path:
     root = tmp_path / "r"
-    (root / "c/src/bin").mkdir(parents=True)
-    (root / "c/src/bin/tool.rs").write_text("fn helper() -> u8 {\n    1\n}\n\nfn main() {\n    helper();\n}\n")
+    (root / rel).parent.mkdir(parents=True)
+    (root / rel).write_text("fn helper() -> u8 {\n    1\n}\n\nfn main() {\n    helper();\n}\n")
     git(root, "init", "-q")
     commit_all(root, "base")
-    (root / "spec.toml").write_text('file = "c/src/bin/tool.rs"\n[[module]]\nname = "helpers"\nitems = ["fn helper"]\n')
+    (root / "spec.toml").write_text(f'file = "{rel}"\n[[module]]\nname = "helpers"\nitems = ["fn helper"]\n')
+    return root
+
+
+def test_a_src_bin_file_root_is_refused(tmp_path):
+    root = bin_repo(tmp_path, "c/src/bin/tool.rs")
+    r = run("apply", "spec.toml", cwd=root)
+    assert r.returncode != 0 and "own binary" in r.stderr
+
+
+def test_a_src_bin_directory_root_round_trips_through_verify(tmp_path):
+    root = bin_repo(tmp_path, "c/src/bin/tool/main.rs")
     assert run("apply", "spec.toml", cwd=root).returncode == 0
-    assert (root / "c/src/bin/helpers.rs").exists()
+    assert (root / "c/src/bin/tool/helpers.rs").exists()
     for f in (root / "c").rglob("*.rs"):
         f.write_text(subprocess.run(["rustfmt", "--edition", "2024", "--emit", "stdout", "--quiet"],
                                     input=f.read_text(), capture_output=True, text=True, check=True).stdout)
     commit_all(root, "split")
     v = run("verify", "HEAD~1", cwd=root)
+    assert v.returncode == 0, v.stdout
+
+
+def test_a_carriage_return_is_refused_and_rejected(repo):
+    src = repo / "crate/src/a/foo.rs"
+    src.write_bytes(src.read_bytes().replace(b"// Parsing.\n", b"// Parsing.\r\n"))
+    commit_all(repo, "cr")
+    r = run("apply", "spec.toml", cwd=repo)
+    assert r.returncode != 0 and "carriage return" in r.stderr
+    git(repo, "reset", "-q", "--hard", "HEAD~1")
+    (repo / "spec.toml").write_text(SPEC)
+    apply_and_commit(repo)
+    child = repo / "crate/src/a/foo/parsing.rs"
+    child.write_bytes(child.read_bytes().replace(b"// Parsing.\n", b"// Parsing.\r"))
+    commit_all(repo, "cr edit")
+    bad = run("verify", "HEAD~2", cwd=repo)
+    assert bad.returncode == 1 and "carriage return" in bad.stdout
+
+
+def test_an_attribute_inside_a_block_comment_is_not_an_attribute(repo):
+    r = write_parent(repo, "/*\n#[cfg(any())]\n*/\nfn f() {}\n",
+                     'file = "crate/src/a/foo.rs"\n[[module]]\nname = "x"\nitems = ["fn f"]\n')
+    assert r.returncode == 0, r.stderr
+    assert "#[cfg(any())]\nmod x;" not in (repo / "crate/src/a/foo.rs").read_text()
+
+
+def test_a_module_name_already_used_as_a_path_is_refused(repo):
+    r = write_parent(repo, "use crate::prelude::*;\n\nfn f() -> u8 {\n    util::one()\n}\n",
+                     'file = "crate/src/a/foo.rs"\n[[module]]\nname = "util"\nitems = ["fn f"]\n')
+    assert r.returncode != 0 and "already used as a path" in r.stderr
+
+
+def test_verify_round_trips_tricky_but_valid_splits(repo):
+    (repo / "crate/src/a/foo.rs").write_text(textwrap.dedent("""\
+        trait T {}
+
+        struct S;
+
+        impl super::Marker for S {}
+
+        #[doc = include_str!("doc.md")]
+        impl S {
+            fn a() {}
+        }
+
+        const _: () = ();
+        """))
+    commit_all(repo, "tricky")
+    (repo / "spec.toml").write_text(
+        'file = "crate/src/a/foo.rs"\n'
+        '[[module]]\nname = "impls"\ndoc = "Impls \u2014 with a non-ASCII dash."\n'
+        'items = ["impl super::Marker for S", "impl S", "const _"]\n'
+    )
+    apply_and_commit(repo)
+    parent = (repo / "crate/src/a/foo.rs").read_text()
+    assert "mod impls;" in parent and "use impls::*;" not in parent  # nothing nameable to re-export
+    assert "impl super::super::Marker for S {}" in (repo / "crate/src/a/foo/impls.rs").read_text()
+    v = run("verify", "HEAD~1", cwd=repo)
     assert v.returncode == 0, v.stdout
