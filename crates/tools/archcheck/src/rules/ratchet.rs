@@ -13,6 +13,13 @@
 //! are separate so that requiring no growth does not also fail the change
 //! that shrinks a file.
 //!
+//! A file renamed in the pull request, as `--renames` gives it from git, is
+//! the same file under a new path: its entry is compared with its old path's
+//! entry in the base branch's copy, so moving the entry with it is neither a
+//! new entry nor, at or below the old cap, a raised one. Only git's pairing
+//! counts, not a gone entry and a new one with a cap that fits, so that an
+//! unrelated new file can't take over a deleted file's entry.
+//!
 //! [`CountRule`] is all a rule implements: its measurement and its wording,
 //! one [`CountRatchet`] per table. This module owns the behaviours, where
 //! findings point, the comparisons with the base branch's copy, and
@@ -62,7 +69,8 @@ pub trait CountRatchet {
     fn wording(&self) -> Wording;
 
     /// The `no_crossing` detail for a file outside the table, such as `": 1200
-    /// code lines, over the 1,000-line limit…"`.
+    /// code lines, over the 1,000-line limit…"`. It ends with a full
+    /// sentence, which advice about a renamed file may follow.
     fn crossing(&self, count: Count) -> String;
 
     /// Why a listed file that no longer violates is fine, such as `" is down
@@ -212,47 +220,94 @@ fn check(ctx: &Context, rule: &'static str, ratchet: &dyn CountRatchet) -> Vec<F
     };
     let mut findings = Vec::new();
 
+    let base = ctx.base_baseline.table(&table).ok();
+    // The base entry an entry is compared with: its own, or, for a file
+    // renamed from a listed one, the old path's, with that path. Git renames
+    // a file once, so no base entry is taken over twice.
+    let base_entry = |path: &str| {
+        let base = base?;
+        match base.get(path) {
+            Some(&cap) => Some((cap, None)),
+            None => {
+                let old = ctx.renames.as_ref()?.source(path)?;
+                Some((*base.get(old)?, Some(old)))
+            }
+        }
+    };
     let mut measured = BTreeMap::new();
     for file in &ctx.files {
         let Some(count) = ratchet.measure(file) else {
             continue;
         };
         if !caps.contains_key(&file.path) {
+            let renamed = match &ctx.renames {
+                // Without the renames, any file may have been renamed.
+                None => format!(
+                    " If the file was renamed, move its entry in {place} to the new path; with \
+                     --renames, {NO_NEW_ENTRIES} accepts the moved entry at or below its old cap."
+                ),
+                Some(renames) => {
+                    // The cap a new entry would be compared with, and whose.
+                    let bound = base_entry(&file.path).map(|(cap, listed)| {
+                        let whose =
+                            listed.map_or_else(|| "its".to_owned(), |old| format!("{old}'s"));
+                        format!("{whose} cap of {cap} in the base branch's copy")
+                    });
+                    match (renames.source(&file.path), bound) {
+                        (Some(old), bound) if caps.contains_key(old) => format!(
+                            " It was renamed from {old}: move that entry in {place} to the new \
+                             path{}.",
+                            bound
+                                .map_or_else(String::new, |bound| format!(", at or below {bound}"))
+                        ),
+                        // Such as after --write-baseline, which removes the
+                        // entry of a file that is gone and adds none.
+                        (Some(old), Some(bound)) => format!(
+                            " It was renamed from {old}: give it an entry in {place} at or below \
+                             {bound}."
+                        ),
+                        _ => String::new(),
+                    }
+                }
+            };
             findings.push(finding(
                 NO_CROSSING,
                 modes.no_crossing,
                 &file.path,
-                ratchet.crossing(count),
+                format!("{}{renamed}", ratchet.crossing(count)),
                 count.first_line,
             ));
         }
         measured.insert(file.path.as_str(), count);
     }
 
-    if let Ok(base) = ctx.base_baseline.table(&table) {
-        for path in caps.keys().filter(|path| !base.contains_key(*path)) {
+    if base.is_some() {
+        for path in caps.keys().filter(|path| base_entry(path).is_none()) {
             findings.push(entry_finding(
                 NO_NEW_ENTRIES,
                 modes.no_new_entries,
                 path,
                 format!(
                     " is in {place} but not in the base branch's copy; {} can't be added (a \
-                     renamed file counts as added). {} instead.",
+                     renamed file counts as added unless --renames pairs it with an old path \
+                     the base branch's copy lists). {} instead.",
                     wording.violators, wording.fix,
                 ),
             ));
         }
         for (path, &cap) in caps {
-            if let Some(&base_cap) = base.get(path)
+            if let Some((base_cap, old)) = base_entry(path)
                 && cap > base_cap
             {
+                let renamed =
+                    old.map_or_else(String::new, |old| format!(" renamed from {old}, with"));
                 findings.push(entry_finding(
                     NO_RAISED_CAPS,
                     modes.no_raised_caps,
                     path,
                     format!(
-                        ": cap raised from {base_cap} to {cap} in {place}; caps should only go \
-                         down. {} instead.",
+                        ":{renamed} cap raised from {base_cap} to {cap} in {place}; caps should \
+                         only go down. {} instead.",
                         wording.fix,
                     ),
                 ));

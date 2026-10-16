@@ -5,7 +5,7 @@
 use std::{fs, path::Path, process::Command};
 
 use pplx_space_archcheck::{
-    BaseBaseline, Baseline, Context, check,
+    BaseBaseline, Baseline, Context, Renames, check,
     config::CrateNamesPolicy,
     context::count_code_lines,
     report::{Format, render},
@@ -183,7 +183,18 @@ fn findings(root: &Path) -> Vec<(&'static str, String)> {
 }
 
 fn findings_against(root: &Path, base: Option<&str>) -> Vec<(&'static str, String)> {
-    check(&load(root, base))
+    findings_with_renames(root, base, None)
+}
+
+/// [`findings_against`], with `renames` as `--renames` gives them.
+fn findings_with_renames(
+    root: &Path,
+    base: Option<&str>,
+    renames: Option<&[u8]>,
+) -> Vec<(&'static str, String)> {
+    let mut ctx = load(root, base);
+    ctx.renames = renames.map(|renames| Renames::parse(renames).expect("the renames parse"));
+    check(&ctx)
         .into_iter()
         .map(|finding| (finding.behaviour, finding.message()))
         .collect()
@@ -415,7 +426,8 @@ fn behaviours() {
                 "no_new_entries",
                 "crates/b/src/new.rs is in architecture-baseline.toml but not in the base branch's \
                  copy; files over the 5-line limit can't be added (a renamed file counts as \
-                 added). Split the file instead.",
+                 added unless --renames pairs it with an old path the base branch's copy lists). \
+                 Split the file instead.",
             )],
         ),
         (
@@ -504,6 +516,347 @@ fn behaviours() {
             assert!(message.starts_with(want_message), "{name}: {message}");
         }
     }
+}
+
+/// An entry moved with a file `--renames` says was renamed is compared with
+/// the old path's entry in the base branch's copy: at or below its cap it is
+/// neither new nor raised. Each row changes one thing from the first: the
+/// base lists `old.rs` (cap 8), which became `new.rs` (8 code lines), and the
+/// baseline lists `new.rs` (cap 8).
+#[test]
+fn renames() {
+    const OLD: &str = "crates/a/src/old.rs";
+    const NEW: &str = "crates/b/src/new.rs";
+    const OLD2: &str = "crates/a/src/old2.rs";
+    const NEW2: &str = "crates/b/src/new2.rs";
+    const RENAMED: &[u8] = b"R097\0crates/a/src/old.rs\0crates/b/src/new.rs\0";
+    let crossing = |path: &str, lines: usize, advice: &str| {
+        (
+            "no_crossing",
+            format!(
+                "{path}: {lines} code lines, over the 5-line limit (comments and blank lines are \
+                 not counted). Split it into submodules by responsibility.{advice}"
+            ),
+        )
+    };
+    let new_entry = |path: &str| {
+        (
+            "no_new_entries",
+            format!(
+                "{path} is in architecture-baseline.toml but not in the base branch's copy; files \
+                 over the 5-line limit can't be added (a renamed file counts as added unless \
+                 --renames pairs it with an old path the base branch's copy lists). Split the \
+                 file instead."
+            ),
+        )
+    };
+    let raised = |path: &str, renamed: &str, from: usize, to: usize| {
+        (
+            "no_raised_caps",
+            format!(
+                "{path}:{renamed} cap raised from {from} to {to} in architecture-baseline.toml; \
+                 caps should only go down. Split the file instead."
+            ),
+        )
+    };
+    type Sizes<'a> = &'a [(&'a str, usize)];
+    // Name, base entries, entries, file sizes, renames and the expected
+    // `(behaviour, message)` of each finding.
+    type Case<'a> = (
+        &'a str,
+        Sizes<'a>,
+        Sizes<'a>,
+        Sizes<'a>,
+        Option<&'a [u8]>,
+        Vec<(&'a str, String)>,
+    );
+    let cases: Vec<Case> = vec![
+        (
+            "renamed at the same cap",
+            &[(OLD, 8)],
+            &[(NEW, 8)],
+            &[(NEW, 8)],
+            Some(RENAMED),
+            vec![],
+        ),
+        (
+            "renamed with a lower cap",
+            &[(OLD, 8)],
+            &[(NEW, 7)],
+            &[(NEW, 7)],
+            Some(RENAMED),
+            vec![],
+        ),
+        (
+            "renamed with a raised cap",
+            &[(OLD, 8)],
+            &[(NEW, 9)],
+            &[(NEW, 9)],
+            Some(RENAMED),
+            vec![raised(NEW, " renamed from crates/a/src/old.rs, with", 8, 9)],
+        ),
+        (
+            "renamed without --renames",
+            &[(OLD, 8)],
+            &[(NEW, 8)],
+            &[(NEW, 8)],
+            None,
+            vec![new_entry(NEW)],
+        ),
+        (
+            "a deleted file and an unrelated new file",
+            &[(OLD, 8)],
+            &[(NEW, 8)],
+            &[(NEW, 8)],
+            Some(b"D\0crates/a/src/old.rs\0A\0crates/b/src/new.rs\0"),
+            vec![new_entry(NEW)],
+        ),
+        (
+            "a copy, not a rename",
+            &[(OLD, 8)],
+            &[(OLD, 8), (NEW, 8)],
+            &[(OLD, 8), (NEW, 8)],
+            Some(b"C100\0crates/a/src/old.rs\0crates/b/src/new.rs\0"),
+            vec![new_entry(NEW)],
+        ),
+        (
+            "renamed from a file the base does not list",
+            &[],
+            &[(NEW, 8)],
+            &[(NEW, 8)],
+            Some(RENAMED),
+            vec![new_entry(NEW)],
+        ),
+        // A path the base lists is compared with its own entry, renamed or
+        // not, as without --renames.
+        (
+            "the base lists the new path too",
+            &[(OLD, 8), (NEW, 5)],
+            &[(NEW, 8)],
+            &[(NEW, 8)],
+            Some(RENAMED),
+            vec![raised(NEW, "", 5, 8)],
+        ),
+        (
+            "renamed, and the entry not moved",
+            &[(OLD, 8)],
+            &[(OLD, 8)],
+            &[(NEW, 8)],
+            Some(RENAMED),
+            vec![
+                crossing(
+                    NEW,
+                    8,
+                    " It was renamed from crates/a/src/old.rs: move that entry in \
+                     architecture-baseline.toml to the new path, at or below \
+                     crates/a/src/old.rs's cap of 8 in the base branch's copy.",
+                ),
+                (
+                    "stale_entries",
+                    "crates/a/src/old.rs: listed in architecture-baseline.toml but no longer a \
+                     production Rust file. Remove the entry; a renamed file is checked under its \
+                     new path."
+                        .to_owned(),
+                ),
+            ],
+        ),
+        (
+            "renamed, and the entry removed",
+            &[(OLD, 8)],
+            &[],
+            &[(NEW, 8)],
+            Some(RENAMED),
+            vec![crossing(
+                NEW,
+                8,
+                " It was renamed from crates/a/src/old.rs: give it an entry in \
+                 architecture-baseline.toml at or below crates/a/src/old.rs's cap of 8 in the base \
+                 branch's copy.",
+            )],
+        ),
+        // The advice names the cap the new entry would be compared with.
+        (
+            "renamed, the entry removed, and the base lists the new path",
+            &[(OLD, 8), (NEW, 5)],
+            &[],
+            &[(NEW, 8)],
+            Some(RENAMED),
+            vec![crossing(
+                NEW,
+                8,
+                " It was renamed from crates/a/src/old.rs: give it an entry in \
+                 architecture-baseline.toml at or below its cap of 5 in the base branch's copy.",
+            )],
+        ),
+        (
+            "renamed from a file neither lists",
+            &[],
+            &[],
+            &[(NEW, 8)],
+            Some(RENAMED),
+            vec![crossing(NEW, 8, "")],
+        ),
+        (
+            "a file over the limit that was not renamed",
+            &[(OLD, 8)],
+            &[(NEW, 8)],
+            &[(NEW, 8), ("crates/a/src/big.rs", 6)],
+            Some(RENAMED),
+            vec![crossing("crates/a/src/big.rs", 6, "")],
+        ),
+        // Git, not the caps, pairs old paths with new ones.
+        (
+            "two renames",
+            &[(OLD, 8), (OLD2, 6)],
+            &[(NEW, 8), (NEW2, 6)],
+            &[(NEW, 8), (NEW2, 6)],
+            Some(
+                b"R090\0crates/a/src/old.rs\0crates/b/src/new.rs\0\
+                  R080\0crates/a/src/old2.rs\0crates/b/src/new2.rs\0",
+            ),
+            vec![],
+        ),
+        (
+            "two renames, paired the other way",
+            &[(OLD, 8), (OLD2, 6)],
+            &[(NEW, 8), (NEW2, 6)],
+            &[(NEW, 8), (NEW2, 6)],
+            Some(
+                b"R090\0crates/a/src/old.rs\0crates/b/src/new2.rs\0\
+                  R080\0crates/a/src/old2.rs\0crates/b/src/new.rs\0",
+            ),
+            vec![raised(
+                NEW,
+                " renamed from crates/a/src/old2.rs, with",
+                6,
+                8,
+            )],
+        ),
+    ];
+    for (name, base, entries, sizes, renames, expected) in cases {
+        let mut files: Vec<(&str, String)> = sizes
+            .iter()
+            .map(|(path, lines)| (*path, code(*lines)))
+            .collect();
+        files.push(("architecture-baseline.toml", baseline(entries)));
+        let ws = workspace(&files);
+
+        let found = findings_with_renames(ws.path(), Some(&baseline(base)), renames);
+
+        assert_eq!(found, expected, "{name}");
+    }
+}
+
+/// From the binary, `--renames` takes git's own output, and a file that
+/// can't be read or isn't that output exits 2.
+#[test]
+fn renames_from_git() {
+    const OLD: &str = "crates/a/src/old.rs";
+    let ws = workspace(&[
+        ("architecture-baseline.toml", baseline(&[(OLD, 8)])),
+        (OLD, code(8)),
+    ]);
+    // Git acts on the temporary repository alone, even when the test runs
+    // under a git hook or `git rebase -x`, which set GIT_DIR, GIT_INDEX_FILE
+    // and the like for the outer checkout: no GIT_* variable is inherited, no
+    // configuration but the test's own is read, and discovery stops at the
+    // workspace.
+    let git = |args: &[&str]| {
+        let mut command = Command::new("git");
+        for (name, _) in std::env::vars_os() {
+            if name.to_string_lossy().starts_with("GIT_") {
+                command.env_remove(name);
+            }
+        }
+        let output = command
+            .current_dir(ws.path())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env(
+                "GIT_CEILING_DIRECTORIES",
+                ws.path().parent().expect("a parent directory"),
+            )
+            .args([
+                "-c",
+                "user.name=archcheck",
+                "-c",
+                "user.email=archcheck@example.com",
+            ])
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+        output.stdout
+    };
+    let base = ws.path().join("base-baseline.toml");
+    fs::write(&base, baseline(&[(OLD, 8)])).unwrap();
+    // An empty template copies no hooks.
+    git(&["init", "-q", "--template="]);
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "base"]);
+    git(&["mv", OLD, "crates/a/src/new.rs"]);
+    fs::write(
+        ws.path().join("architecture-baseline.toml"),
+        baseline(&[("crates/a/src/new.rs", 8)]),
+    )
+    .unwrap();
+    let renames = ws.path().join("renames");
+    fs::write(
+        &renames,
+        git(&["diff", "-z", "--name-status", "--find-renames", "HEAD"]),
+    )
+    .unwrap();
+    let base = base.to_str().unwrap();
+    let run_with = |renames: &Path| {
+        let renames = renames.to_str().unwrap();
+        run(ws.path(), &["--base-baseline", base, "--renames", renames])
+    };
+
+    let renamed = run_with(&renames);
+    assert_eq!(renamed.code, 0, "{}", renamed.stderr);
+    assert!(
+        renamed.stdout.starts_with("archcheck: no findings"),
+        "{}",
+        renamed.stdout
+    );
+    let unpaired = run(ws.path(), &["--base-baseline", base]);
+    assert!(
+        unpaired
+            .stdout
+            .starts_with("file_size.no_new_entries (advisory):\n  crates/a/src/new.rs is in"),
+        "{}",
+        unpaired.stdout
+    );
+
+    let missing = run_with(&ws.path().join("missing"));
+    assert_eq!(missing.code, 2);
+    assert!(
+        missing
+            .stderr
+            .starts_with("archcheck: error: could not read ")
+            && missing.stderr.contains("missing"),
+        "{}",
+        missing.stderr
+    );
+
+    // Without -z, git quotes and separates paths differently, and ends
+    // records with a newline, not a NUL.
+    let text = ws.path().join("renames.txt");
+    fs::write(
+        &text,
+        git(&["diff", "--name-status", "--find-renames", "HEAD"]),
+    )
+    .unwrap();
+    let not_z = run_with(&text);
+    assert_eq!(not_z.code, 2);
+    assert!(
+        not_z.stderr.contains(
+            "renames.txt as renames: the last record does not end with a NUL; give the complete \
+             output of git diff -z --name-status --find-renames"
+        ),
+        "{}",
+        not_z.stderr
+    );
 }
 
 /// The base branch's copy is read leniently: only `[file_size]` matters, and
@@ -1683,7 +2036,9 @@ fn human_report() {
         run.stdout,
         "file_size.no_crossing (advisory):\n  \
          crates/b/src/new.rs: 6 code lines, over the 5-line limit (comments and blank lines are \
-         not counted). Split it into submodules by responsibility.\n\
+         not counted). Split it into submodules by responsibility. If the file was renamed, \
+         move its entry in architecture-baseline.toml to the new path; with --renames, \
+         no_new_entries accepts the moved entry at or below its old cap.\n\
          file_size.listed_no_growth (advisory):\n  \
          crates/a/src/grew.rs grew from 6 to 7 code lines. Once this rule is required, split \
          the file before adding to it.\n\
@@ -1716,7 +2071,10 @@ fn messages_group_the_limit() {
             (
                 "no_crossing",
                 "crates/b/src/new.rs: 1001 code lines, over the 1,000-line limit (comments and \
-                 blank lines are not counted). Split it into submodules by responsibility."
+                 blank lines are not counted). Split it into submodules by responsibility. If \
+                 the file was renamed, move its entry in architecture-baseline.toml to the new \
+                 path; with --renames, no_new_entries accepts the moved entry at or below its old \
+                 cap."
                     .to_owned()
             ),
             (
@@ -2229,13 +2587,17 @@ fn rdjson_document() {
             "diagnostics": [
                 diagnostic(
                     "crates/b/src/new.rs: 6 code lines, over the 5-line limit (comments and blank \
-                     lines are not counted). Split it into submodules by responsibility.",
+                     lines are not counted). Split it into submodules by responsibility. If the \
+                     file was renamed, move its entry in architecture-baseline.toml to the new \
+                     path; with --renames, no_new_entries accepts the moved entry at or below its \
+                     old cap.",
                     "crates/b/src/new.rs", 1, "ERROR", "no_crossing",
                 ),
                 diagnostic(
                     "crates/a/src/added.rs is in architecture-baseline.toml but not in the base \
                      branch's copy; files over the 5-line limit can't be added (a renamed file \
-                     counts as added). Split the file instead.",
+                     counts as added unless --renames pairs it with an old path the base \
+                     branch's copy lists). Split the file instead.",
                     "architecture-baseline.toml", 7, "WARNING", "no_new_entries",
                 ),
                 diagnostic(
@@ -2351,6 +2713,18 @@ fn arguments() {
             &["--base-architecture"],
             2,
             "archcheck: --base-architecture needs a value",
+        ),
+        (&["--renames"], 2, "archcheck: --renames needs a value"),
+        (
+            &["--renames", "renames"],
+            2,
+            "archcheck: --renames needs --base-baseline, whose entries it pairs renamed files \
+             with",
+        ),
+        (
+            &["--write-baseline", "--renames", "renames"],
+            2,
+            "archcheck: --renames cannot be combined with --write-baseline",
         ),
         (
             &["--bogus"],
@@ -2624,8 +2998,8 @@ fn pattern_ratchet_behaviours() {
                 "crates/b/src/sub/new.rs: 2 code lines match the old patterns, first on line 2, \
                  outside the paths [rules.pattern_ratchet.old] in ARCHITECTURE.toml allows. Move \
                  that code behind an allowed path. If the file was renamed, move its entry in \
-                 [pattern_ratchet.old] in architecture-baseline.toml to the new path; \
-                 no_new_entries reports the moved entry as new, for a reviewer to accept.",
+                 [pattern_ratchet.old] in architecture-baseline.toml to the new path; with \
+                 --renames, no_new_entries accepts the moved entry at or below its old cap.",
             )],
         ),
         (
@@ -3090,7 +3464,8 @@ fn pattern_ratchet_base_baseline() {
                 "crates/a/src/kept.rs is in [pattern_ratchet.old] in architecture-baseline.toml \
                  but not in the base branch's copy; files outside the paths \
                  [rules.pattern_ratchet.old] in ARCHITECTURE.toml allows can't be added (a \
-                 renamed file counts as added). Move that code behind an allowed path instead."
+                 renamed file counts as added unless --renames pairs it with an old path the base \
+                 branch's copy lists). Move that code behind an allowed path instead."
                     .to_owned()
             ),
             (
@@ -3117,6 +3492,69 @@ fn instances_config(instances: &[&str]) -> String {
         ));
     }
     text
+}
+
+/// An instance's table gets the same rename handling as `[file_size]`
+/// (see `renames`). The base's `[pattern_ratchet.old]` lists `old.rs` (cap
+/// 2), which became `new.rs`; the baseline lists `new.rs`, at its count.
+#[test]
+fn pattern_ratchet_renames() {
+    const NEW: &str = "crates/b/src/sub/new.rs";
+    const RENAMED: &[u8] = b"R100\0crates/a/src/old.rs\0crates/b/src/sub/new.rs\0";
+    // Name, the text of new.rs, renames and the expected `(behaviour,
+    // message)` of each finding.
+    type Case<'a> = (&'a str, &'a str, &'a [u8], &'a [(&'a str, &'a str)]);
+    let cases: &[Case] = &[
+        (
+            "renamed at the same cap",
+            "old_table\nold_log\n",
+            RENAMED,
+            &[],
+        ),
+        (
+            "renamed with a raised cap",
+            "old_table\nold_log\nold_table\n",
+            RENAMED,
+            &[(
+                "no_raised_caps",
+                "crates/b/src/sub/new.rs: renamed from crates/a/src/old.rs, with cap raised from \
+                 2 to 3 in [pattern_ratchet.old] in architecture-baseline.toml; caps should only \
+                 go down. Move that code behind an allowed path instead.",
+            )],
+        ),
+        (
+            "a deleted file and an unrelated new file",
+            "old_table\nold_log\n",
+            b"D\0crates/a/src/old.rs\0A\0crates/b/src/sub/new.rs\0",
+            &[(
+                "no_new_entries",
+                "crates/b/src/sub/new.rs is in [pattern_ratchet.old] in",
+            )],
+        ),
+    ];
+    for (name, text, renames, expected) in cases {
+        let count = text.lines().count();
+        let ws = workspace(&[
+            ("ARCHITECTURE.toml", old_tables_config(ADVISORY)),
+            (
+                "architecture-baseline.toml",
+                ratchet_baseline(&[("old", &[(NEW, count)])]),
+            ),
+            (NEW, (*text).to_owned()),
+        ]);
+
+        let found = findings_with_renames(
+            ws.path(),
+            Some("[pattern_ratchet.old]\n\"crates/a/src/old.rs\" = 2\n"),
+            Some(renames),
+        );
+
+        assert_eq!(found.len(), expected.len(), "{name}: {found:#?}");
+        for ((behaviour, message), (want_behaviour, want_message)) in found.iter().zip(*expected) {
+            assert_eq!(behaviour, want_behaviour, "{name}");
+            assert!(message.starts_with(want_message), "{name}: {message}");
+        }
+    }
 }
 
 /// A base table that does not parse skips its own instance's comparisons

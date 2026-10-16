@@ -56,7 +56,7 @@ impl CountRatchet for Hits {
     }
 
     fn crossing(&self, count: Count) -> String {
-        format!(": {} hits", count.count)
+        format!(": {} hits.", count.count)
     }
 
     fn cleared(&self, _file: &ProductionFile) -> String {
@@ -92,6 +92,7 @@ fn context(baseline: Baseline, files: &[(&str, &str)]) -> Context {
         config: toml::from_str(config).expect("the configuration parses"),
         baseline,
         base_baseline: BaseBaseline::NotGiven,
+        renames: None,
         crate_names_policy: CrateNamesPolicy::default(),
         base_architecture: BaseArchitecture::NotGiven,
         files,
@@ -120,7 +121,9 @@ fn a_rule_without_instances_or_a_table() {
         findings(&ctx),
         [(
             "hits.no_crossing".to_owned(),
-            "a.rs: 2 hits".to_owned(),
+            "a.rs: 2 hits. If the file was renamed, move its entry in [hits] to the new path; \
+             with --renames, no_new_entries accepts the moved entry at or below its old cap."
+                .to_owned(),
             Location {
                 path: "a.rs".to_owned(),
                 line: 2,

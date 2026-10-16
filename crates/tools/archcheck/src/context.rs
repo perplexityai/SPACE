@@ -15,6 +15,7 @@ use toml::Spanned;
 use crate::{
     baseline::{BASELINE_FILE, BaseBaseline, Baseline, line_of},
     config::{ArchitectureConfig, BaseArchitecture, CONFIG_FILE, CrateNamesPolicy},
+    renames::{Renames, RenamesError},
     rules,
 };
 
@@ -76,6 +77,12 @@ pub enum LoadError {
          the instance was renamed"
     )]
     UnknownBaselineTable { path: PathBuf, table: String },
+    #[error("could not read {path} as renames: {source}")]
+    Renames {
+        path: PathBuf,
+        #[source]
+        source: RenamesError,
+    },
     /// A rule's tables must be read from a base baseline, or every entry of
     /// them would compare as new.
     #[error(
@@ -130,6 +137,10 @@ pub struct Context {
     /// unless it is [`BaseBaseline::Loaded`]; `crate_names.no_new` is limited
     /// instead.
     pub base_baseline: BaseBaseline,
+    /// The files the pull request renamed, given with `--renames`: an entry
+    /// for one is compared with its old path's entry in the base branch's
+    /// baseline. `None` when not given, when any file may have been renamed.
+    pub renames: Option<Renames>,
     /// `[rules.crate_names]` of `ARCHITECTURE.toml`, with the line of each
     /// part.
     pub crate_names_policy: CrateNamesPolicy,
@@ -184,6 +195,7 @@ impl Context {
             config,
             baseline,
             base_baseline: BaseBaseline::default(),
+            renames: None,
             crate_names_policy,
             base_architecture: BaseArchitecture::NotGiven,
             files,

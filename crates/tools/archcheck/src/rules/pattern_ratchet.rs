@@ -11,7 +11,7 @@ use crate::{
     baseline::BASELINE_FILE,
     config::{InstanceName, PatternRatchetConfig, RulesConfig},
     context::{ProductionFile, code_lines},
-    rules::ratchet::{Count, CountRatchet, CountRule, Modes, NO_NEW_ENTRIES, Wording},
+    rules::ratchet::{Count, CountRatchet, CountRule, Modes, Wording},
 };
 
 pub struct PatternRatchet;
@@ -95,11 +95,9 @@ impl CountRatchet for Instance<'_> {
         format!(
             ": {} the {instance} patterns, first on line {}, outside the paths \
              [rules.{RULE}.{instance}] in ARCHITECTURE.toml allows. Move that code behind an \
-             allowed path. If the file was renamed, move its entry in {} to the new path; \
-             {NO_NEW_ENTRIES} reports the moved entry as new, for a reviewer to accept.",
+             allowed path.",
             match_count(count.count),
             count.first_line,
-            self.table(),
         )
     }
 
