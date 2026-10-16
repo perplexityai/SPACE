@@ -55,7 +55,9 @@ or suites.
   `scripts/internal-rpc-tls.sh` owns the cluster's CA and listener Secrets;
   keep it run before workloads in both bring-up paths. The one plaintext hop is
   the authority's call to the Kind-only `space-kind-key-broker` fixture, which
-  has no TLS listener; never ship that fixture outside Kind.
+  has no TLS listener. The authority reaches the Kind-only STS bridge
+  (`space-kind-sts-bridge`), and the bridge the object store's IAM service,
+  over TLS from that CA. Never ship either fixture outside Kind.
 - Node services run one DaemonSet per service and role from
   `charts/space-<service>-local` on the `space-node-service` library, listed in
   `lib/node-services.sh` for every bring-up path. Each pod runs the unmodified

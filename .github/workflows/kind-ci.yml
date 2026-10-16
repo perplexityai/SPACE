@@ -369,12 +369,20 @@ jobs:
             k 45s -n space logs "${pod}" --all-containers=true --timestamps \
               >"${dir}/${pod#pod/}.log" 2>&1 || true
           done
-          # The credential-manager authority every node agent forwards to.
-          k 45s -n space logs deployment/space-credmgr-authority --all-containers=true --timestamps \
-            >"${dir}/space-credmgr-authority.log" 2>&1 || true
-          # Its Kind key broker fixture.
+          # The credential-manager authority every node agent forwards to, each
+          # replica: its storage exchange decisions are spread over both.
+          for pod in $(k 30s -n space get pods -l app.kubernetes.io/name=space-credmgr-authority -o name); do
+            k 45s -n space logs "${pod}" --all-containers=true --timestamps \
+              >"${dir}/${pod#pod/}.log" 2>&1 || true
+          done
+          # Its Kind fixtures: the key broker, and the STS bridge with the
+          # object store's IAM service behind it.
           k 45s -n space logs deployment/space-kind-key-broker --all-containers=true --timestamps \
             >"${dir}/space-kind-key-broker.log" 2>&1 || true
+          k 45s -n space logs deployment/space-kind-sts-bridge --all-containers=true --timestamps \
+            >"${dir}/space-kind-sts-bridge.log" 2>&1 || true
+          k 45s -n space logs deployment/space-object-store-iam --timestamps \
+            >"${dir}/space-object-store-iam.log" 2>&1 || true
           for node in $(timeout 30s kind get nodes --name space-local 2>/dev/null); do
             timeout 45s docker exec "${node}" journalctl -u kubelet -u containerd --no-pager -o short-iso \
               >"${dir}/${node}.journal.log" 2>&1 || true

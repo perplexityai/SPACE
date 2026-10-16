@@ -40,6 +40,7 @@ public.ecr.aws/docker/library/python:3.14-slim      sha256:7bf6c3111fe094f8ee1a1
 public.ecr.aws/docker/library/node:22-bookworm      sha256:17b7fd60fd812617654c64b95f9b2dde94f103313073b672bc40fdad6dccbaa2 ghcr.io/perplexityai/space-ci-mirror:node-22-bookworm docker.io/library/node
 public.ecr.aws/docker/library/node:22-bookworm-slim sha256:25330af3531fb5e23318554a0aa911125b6e91b1b777edf7655501d207c067a2 ghcr.io/perplexityai/space-ci-mirror:node-22-bookworm-slim docker.io/library/node
 public.ecr.aws/ubuntu/ubuntu:24.04                  sha256:f610ab94648195aa356059f5b41d6085c9d4d903c072430cdd1af7bdb646106b ghcr.io/perplexityai/space-ci-mirror:ubuntu-24.04
+public.ecr.aws/docker/library/golang:1.25-bookworm sha256:c268a04d59aea0b180ed9946a658cfab9e7b3391dc90eed6e4969ccff98c851f ghcr.io/perplexityai/space-ci-mirror:golang-1.25-bookworm docker.io/library/golang
 public.ecr.aws/aws-cli/aws-cli:2.27.41              sha256:7637f1a9537dd19b1f74fa69d2000c8affd0a2229a55f493d21a10cb6cbd5f1f ghcr.io/perplexityai/space-ci-mirror:aws-cli-2.27.41 docker.io/amazon/aws-cli
 
 # BuildKit daemon of the Artifact CI bundle builds

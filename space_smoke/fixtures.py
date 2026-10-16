@@ -47,6 +47,7 @@ from space_smoke.capabilities import (
     StartupRecoveryReport,
     SuspendCodecControl,
     SandboxNetworkIsolationControl,
+    StorageExchangeControl,
     TelemetryBackendControl,
     LeaderElectionControl,
     RestoreFailure,
@@ -103,6 +104,7 @@ from space_smoke.pending_backup import PendingBackupAssertions
 from space_smoke.template_build import TemplateBuildAssertions
 from space_smoke.rate_limiters import RateLimiterAssertions
 from space_smoke.sandbox_network_isolation import SandboxNetworkIsolationAssertions
+from space_smoke.storage_exchange import StorageExchangeScopingAssertions
 from space_smoke.telemetry_delivery import TelemetryDeliveryAssertions
 from space_smoke.leader_election import LeaderElectionAssertions
 from space_smoke.config import DEFAULT_SANDBOX_TIMEOUT_SECONDS
@@ -2837,6 +2839,23 @@ class KindEcw(Ecw):
                 self, self._sandbox_network_isolation_control, self._context.scope
             )
         return self._sandbox_network_isolation_assertions
+
+    _storage_exchange_control: StorageExchangeControl | None = None
+    _storage_exchange_assertions: StorageExchangeScopingAssertions | None = None
+
+    @property
+    def storage_exchange(self) -> StorageExchangeScopingAssertions:
+        """credential-manager's storage exchange, asked as volume-manager, against the store."""
+
+        if self._storage_exchange_control is None:
+            raise SmokeConfigurationError(
+                "storage exchange probes are only available on the kind backend"
+            )
+        if self._storage_exchange_assertions is None:
+            self._storage_exchange_assertions = StorageExchangeScopingAssertions(
+                self, self._storage_exchange_control, self._context.scope
+            )
+        return self._storage_exchange_assertions
 
     _telemetry_control: TelemetryBackendControl | None = None
     _telemetry_assertions: TelemetryDeliveryAssertions | None = None

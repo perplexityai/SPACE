@@ -31,7 +31,14 @@
 #   API_URL           — health-check URL (e.g. http://localhost:8080)
 #   DATA_PLANE_URL    — optional data-plane health-check URL (e.g. http://localhost:8090)
 #   KIND_CLUSTER      — kind cluster name (e.g. space-local)
-#   SKIP_BOOTSTRAP=1  — skip everything; caller asserts stack is up
+#   SKIP_BOOTSTRAP=1  — skip everything; caller asserts stack is up. The
+#                       cluster's storage credentials mode is still compared
+#                       with SPACE_KIND_STORAGE_CREDENTIALS, and a mismatch
+#                       refused (`__storage_mode_mismatch`,
+#                       `__worker_storage_keys_mismatch`)
+#   SPACE_KIND_STORAGE_CREDENTIALS — exchange (default) or static
+#                       (infra/space/kind/lib/storage-credentials.sh); a live
+#                       Tilt running the other mode is restarted in this one
 #   BOOTSTRAP_TIMEOUT — per-stage seconds for blocking initialization/readiness
 #   SPACE_TILT_DETACH_TIMEOUT — registration wait for a detached start (default
 #                       60 seconds, at most 240). A timeout leaves the detached
@@ -54,6 +61,12 @@
 # start Tilt whenever it isn't actively running, even if the
 # api-server is reachable, then wait for the cluster-controller
 # rollout to settle on the latest generation.
+
+# space_kind_storage_credentials, the requested storage credentials mode. The
+# bring-up compares it with the cluster's before its SKIP_BOOTSTRAP=1 return,
+# where callers need not set REPO_ROOT, so it is found beside this file.
+# shellcheck source=../../../infra/space/kind/lib/storage-credentials.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../../../infra/space/kind/lib/storage-credentials.sh"
 
 # Assert the suites' prerequisites here, at the entry point every kind suite
 # already sources, so callers cannot accidentally omit the prerequisite gate.
@@ -1003,13 +1016,85 @@ bootstrap_kind_stack__prepare_cluster() {
     fi
 }
 
+# Prints the storage credentials mode the cluster runs when it differs from
+# the requested SPACE_KIND_STORAGE_CREDENTIALS, and nothing when they match or
+# there is nothing to compare yet. The authority's Deployment records the mode
+# its chart was rendered with; one without the label predates the modes,
+# which ran static keys. Fails on an invalid request or an unreadable cluster.
+bootstrap_kind_stack__storage_mode_mismatch() {
+    local requested deployed
+    requested="$(space_kind_storage_credentials)" || return 1
+    kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER" || return 0
+    if ! deployed="$(kubectl --context "kind-${KIND_CLUSTER}" -n space get deployments \
+            -l app.kubernetes.io/name=space-credmgr-authority \
+            -o jsonpath='{range .items[*]}{.metadata.labels.space\.pplx\.net/kind-storage-credentials}{"|"}{end}' 2>&1)"; then
+        echo "ERROR: cannot read the storage credentials mode of kind cluster $KIND_CLUSTER: $deployed" >&2
+        return 1
+    fi
+    [[ -n "$deployed" ]] || return 0
+    deployed="${deployed%%|*}"
+    deployed="${deployed:-static}"
+    [[ "$deployed" == "$requested" ]] || printf '%s\n' "$deployed"
+}
+
+# Prints what the worker volume-manager holds when it contradicts the
+# requested mode: "static keys" in exchange mode, "no static keys" in static
+# mode; nothing when it agrees or there is no DaemonSet yet. The label above
+# records how the authority's chart was rendered; a failed apply or a stale
+# Tilt resource can leave the workers on the other side of it. Fails on an
+# invalid request or an unreadable cluster.
+bootstrap_kind_stack__worker_storage_keys_mismatch() {
+    local requested found
+    requested="$(space_kind_storage_credentials)" || return 1
+    kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER" || return 0
+    if ! found="$(kubectl --context "kind-${KIND_CLUSTER}" -n space get daemonset space-volume-manager \
+            --ignore-not-found -o jsonpath='{.metadata.name}|{.spec.template.spec.containers[*].env[*].name}' 2>&1)"; then
+        echo "ERROR: cannot read the worker volume-manager of kind cluster $KIND_CLUSTER: $found" >&2
+        return 1
+    fi
+    [[ -n "$found" ]] || return 0
+    if [[ " ${found#*|} " == *" SPACE_OBJECT_STORE_STATIC_"* ]]; then
+        [[ "$requested" == static ]] || echo "static keys"
+    else
+        [[ "$requested" == exchange ]] || echo "no static keys"
+    fi
+}
+
+# Neither a running nor a restarted Tilt removes a field added to the
+# DaemonSet out of band (apply keeps fields it never owned), so the remedy
+# recreates it from its render.
+bootstrap_kind_stack__worker_reapply_hint() {
+    echo "       Recreate it from its render: kubectl --context kind-${KIND_CLUSTER} -n space delete" >&2
+    echo "       daemonset space-volume-manager, then tilt trigger space-volume-manager." >&2
+}
+
 bootstrap_kind_stack__bring_up() {
     # Always run the port-owner guard, even under SKIP_BOOTSTRAP — the
     # whole point is that the smoke test is destructive against
     # whatever cluster `$API_URL` points at.
     bootstrap_kind_stack__assert_port_owner
 
+    # Before the SKIP_BOOTSTRAP return: suites pick scenarios and expectations
+    # by the requested mode, so running them against a cluster in the other
+    # one would test what was not asked for.
+    local deployed_mode worker_keys
+    deployed_mode="$(bootstrap_kind_stack__storage_mode_mismatch)" || exit 1
     if [[ "${SKIP_BOOTSTRAP:-0}" == "1" ]]; then
+        if [[ -n "$deployed_mode" ]]; then
+            echo "ERROR: kind cluster $KIND_CLUSTER runs SPACE_KIND_STORAGE_CREDENTIALS=$deployed_mode," >&2
+            echo "       and this run asks for ${SPACE_KIND_STORAGE_CREDENTIALS:-exchange} (the default is exchange)." >&2
+            echo "       Set SPACE_KIND_STORAGE_CREDENTIALS=$deployed_mode, or switch the cluster by" >&2
+            echo "       running once without SKIP_BOOTSTRAP=1, which restarts Tilt in the requested" >&2
+            echo "       mode; both modes share one object store, so nothing is recreated." >&2
+            exit 1
+        fi
+        worker_keys="$(bootstrap_kind_stack__worker_storage_keys_mismatch)" || exit 1
+        if [[ -n "$worker_keys" ]]; then
+            echo "ERROR: kind cluster $KIND_CLUSTER runs SPACE_KIND_STORAGE_CREDENTIALS=${SPACE_KIND_STORAGE_CREDENTIALS:-exchange}," >&2
+            echo "       but its worker volume-manager DaemonSet holds $worker_keys." >&2
+            bootstrap_kind_stack__worker_reapply_hint
+            exit 1
+        fi
         echo "[bootstrap] SKIP_BOOTSTRAP=1; assuming kind+tilt are already running"
         return
     fi
@@ -1047,6 +1132,9 @@ bootstrap_kind_stack__bring_up() {
             tilt_state=stale
         elif bootstrap_kind_stack__tilt_watches_other_checkout; then
             tilt_state=elsewhere
+        elif [[ -n "$deployed_mode" ]]; then
+            # Tilt reads the mode once, from the environment it started with.
+            tilt_state=mode
         fi
     elif orphan_pid="$(bootstrap_kind_stack__tilt_orphaned)"; then
         # Ours, responsive, never connected: restart it rather than refuse the
@@ -1073,6 +1161,9 @@ bootstrap_kind_stack__bring_up() {
             bootstrap_kind_stack__stop_stale_tilt || exit 1
         elif [[ "$tilt_state" == "elsewhere" ]]; then
             echo "[bootstrap] restarting tilt from this checkout so its code is what gets built and deployed"
+            bootstrap_kind_stack__stop_stale_tilt || exit 1
+        elif [[ "$tilt_state" == "mode" ]]; then
+            echo "[bootstrap] restarting tilt to switch storage credentials from $deployed_mode to ${SPACE_KIND_STORAGE_CREDENTIALS:-exchange}"
             bootstrap_kind_stack__stop_stale_tilt || exit 1
         elif [[ "$tilt_state" == "orphaned" ]]; then
             bootstrap_kind_stack__stop_stale_tilt "$orphan_pid" || exit 1
@@ -1183,6 +1274,19 @@ bootstrap_kind_stack__bring_up() {
     fi
 
     bootstrap_kind_stack__wait_for_tilt_quiet
+
+    deployed_mode="$(bootstrap_kind_stack__storage_mode_mismatch)" || exit 1
+    if [[ -n "$deployed_mode" ]]; then
+        echo "ERROR: the bring-up finished with the cluster still in storage credentials mode $deployed_mode" >&2
+        exit 1
+    fi
+    worker_keys="$(bootstrap_kind_stack__worker_storage_keys_mismatch)" || exit 1
+    if [[ -n "$worker_keys" ]]; then
+        echo "ERROR: the bring-up finished in storage credentials mode ${SPACE_KIND_STORAGE_CREDENTIALS:-exchange}" >&2
+        echo "       with the worker volume-manager DaemonSet holding $worker_keys" >&2
+        bootstrap_kind_stack__worker_reapply_hint
+        exit 1
+    fi
 
     if [[ -n "${DATA_PLANE_URL:-}" ]]; then
         echo "[bootstrap] waiting up to ${BOOTSTRAP_TIMEOUT}s for $DATA_PLANE_URL/healthz"

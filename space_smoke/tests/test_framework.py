@@ -155,6 +155,7 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "local.retention_restore_source_guard",
                 "local.sandbox_network_isolation_holds",
                 "local.snapshot_reaper_reclaims_backed_fork_snapshot",
+                "local.storage_exchange_scoping",
                 "local.suspend_restore_cross_node_from_object_storage",
                 "local.suspend_snapshot_rows_are_per_attempt",
                 "local.telemetry_reaches_local_backends",

@@ -22,6 +22,7 @@ on:
       - docker/Dockerfile.seed-publish
       - docker/Dockerfile.ui
       - docker/Dockerfile.kind-key-broker
+      - docker/Dockerfile.kind-sts-bridge
       - templates/firecracker/seed/**
       - templates/firecracker/recipes/seed.toml
       - crates/libs/sbx/mgr/server/src/service/activation_support.rs
