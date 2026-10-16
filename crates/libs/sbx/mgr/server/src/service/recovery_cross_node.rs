@@ -685,17 +685,10 @@ fn adopt_restoring_row_under_recovery_claim(
     // The generation CAS below sees the newly written Restoring state, so it
     // cannot independently prove the prior row was still eligible for recovery.
     if recovery.is_some() {
-        use rusqlite::OptionalExtension;
-        let existing_state: Option<String> = tx
-            .query_row(
-                pplx_space_common_core::sql!("SELECT state FROM sandboxes WHERE id = ?1"),
-                rusqlite::params![canonical_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(
-                |source| crate::snapshot_restore::RestoreError::AdvanceRestorePhase { source },
-            )?;
+        let existing_state =
+            crate::db::current_state_label(&tx, canonical_id).map_err(|source| {
+                crate::snapshot_restore::RestoreError::AdvanceRestorePhase { source }
+            })?;
         // An absent row is the orphan case this path exists for; the upsert
         // inserts it. Only an existing row in an unexpected state is a refusal.
         //

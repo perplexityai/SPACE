@@ -190,7 +190,7 @@ fn route_identity_provenance(
     service: &SandboxManagerService,
     sandbox_id: SandboxId,
 ) -> Option<RouteIdentityProvenance> {
-    crate::auto_lifecycle_delete_receipts::db::route_identity_adoption_metadata(
+    crate::db::auto_lifecycle_delete_receipts::route_identity_adoption_metadata(
         &service.db_conn().unwrap(),
         sandbox_id,
     )
@@ -315,7 +315,7 @@ async fn identity_equal_adoption_does_not_overwrite_an_owned_execution() {
                 SandboxState::Stopping
             }
             ExecutionOwner::PendingDeleteReceipt => {
-                crate::auto_lifecycle_delete_receipts::db::insert_pending_receipt(
+                crate::db::auto_lifecycle_delete_receipts::insert_pending_receipt(
                     &conn,
                     crate::auto_lifecycle_delete_receipts::AutoLifecycleDeleteReceipt {
                         receipt_id:

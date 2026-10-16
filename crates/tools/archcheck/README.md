@@ -68,8 +68,9 @@ table:
 ```toml
 [rules.pattern_ratchet.<instance>]
 patterns = ['\bsome_name\b']     # regexes, matched against each code line
-include = ["crates/x/src/**"]  # optional; omitted means all production files
+include = ["crates/x/src/**"]    # optional; omitted means all production files
 allow = ["crates/x/src/owner.rs", "crates/x/src/owner/**"]
+paths = ["crates/x/**"]          # optional: the files checked; all when absent
 
 [rules.pattern_ratchet.<instance>.no_crossing]
 mode = "advisory"
@@ -97,6 +98,12 @@ name so that longer identifiers containing it do not match. Patterns are
 case-sensitive unless they use an inline `(?i)` flag. `allow` globs match
 repository-relative paths: `*` and `?` stay within one path component and
 `**` spans any number. Files they match are never counted.
+`paths`, when given, takes globs of the same form and limits the instance to
+the production files they match, for a name that other crates use for their
+own purposes; files outside them are never counted, and an entry for one is
+stale. An empty `paths` would check nothing and exits 2; omit it to check
+every production file. An empty `allow` is fine. An instance may give both
+`include` and `paths`; it then checks only the files that match both.
 
 - `no_crossing`: a file outside the allowed paths and the instance's baseline
   table has a matching line;
@@ -259,11 +266,11 @@ becomes `support.rs`) without changing what the module holds.
 Each behaviour has a `mode`: `advisory` findings are reported, `required` ones
 also fail the check, so behaviours can graduate one at a time. Unknown keys,
 sections or modes, a missing file, bad TOML, an invalid regex, glob or instance
-name, an empty `patterns` list, a baseline table for an instance that is not
-configured, and a failing `cargo metadata` exit 2. So does a `--base-baseline`,
-`--renames` or `--base-architecture` that can't be read, or one combined with
-`--write-baseline`, and `--renames` input that is not git's (see [Renamed
-files](#renamed-files)).
+name, an empty `patterns` or `paths` list, a baseline table for an instance
+that is not configured, and a failing `cargo metadata` exit 2. So does a
+`--base-baseline`, `--renames` or `--base-architecture` that can't be read, or
+one combined with `--write-baseline`, and `--renames` input that is not git's
+(see [Renamed files](#renamed-files)).
 
 ## Baseline
 

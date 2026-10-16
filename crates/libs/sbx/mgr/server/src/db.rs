@@ -32,12 +32,18 @@ use rusqlite::types::Type;
 use pplx_space_common_core::sql;
 use rusqlite::{Connection, OptionalExtension, Result, params};
 
+pub(crate) mod auto_lifecycle_delete_receipts;
 pub(crate) mod cleanup_jobs;
 pub(crate) mod cleanup_target_scan;
+pub(crate) mod eviction_scan;
+pub(crate) mod guest_health_scan;
 pub(crate) mod inventory;
 pub(crate) mod inventory_read;
+pub(crate) mod local_artifact_leases;
 pub(crate) mod quarantine_history;
+pub(crate) mod route_activation_claims;
 pub(crate) mod snapshot_gc;
+pub(crate) mod snapshot_upload_jobs;
 pub(crate) mod timestamps;
 pub(crate) mod transfer;
 
@@ -51,6 +57,7 @@ const DB_PATH: &str = pplx_space_common_core::host::linux::paths::SANDBOX_MANAGE
 mod quarantine_scan;
 mod sandbox_row;
 mod teardown_jobs;
+use auto_lifecycle_delete_receipts::discard_pending_receipt_for_execution_advance;
 pub(crate) use teardown_jobs::{
     TeardownSuspendFailure, defer_teardown_suspend_retry, fail_teardown_suspend_backup_operation,
     fail_teardown_suspend_operation, reconcile_terminal_teardown_suspend_jobs,
@@ -307,7 +314,7 @@ fn emit_sandbox_quarantined_event(
 
 fn emit_auto_lifecycle_delete_receipt_superseded(
     sandbox_id: SandboxId,
-    superseded_receipt: crate::auto_lifecycle_delete_receipts::db::SupersededPendingReceipt,
+    superseded_receipt: crate::db::auto_lifecycle_delete_receipts::SupersededPendingReceipt,
     current_generation: ExecutionGeneration,
 ) {
     emit_sandbox_event(
@@ -328,7 +335,7 @@ fn emit_auto_lifecycle_delete_receipt_superseded(
 
 pub(crate) fn emit_auto_lifecycle_delete_receipt_superseded_if_present(
     sandbox_id: SandboxId,
-    supersession: Option<crate::auto_lifecycle_delete_receipts::db::PendingReceiptSupersession>,
+    supersession: Option<crate::db::auto_lifecycle_delete_receipts::PendingReceiptSupersession>,
 ) {
     if let Some(supersession) = supersession {
         emit_auto_lifecycle_delete_receipt_superseded(
@@ -345,7 +352,7 @@ pub(crate) fn emit_auto_lifecycle_delete_receipt_superseded_if_present(
 /// add new child tables here, not at the individual delete call sites.
 fn delete_sandbox_child_rows(tx: &Connection, id: &str) -> Result<()> {
     teardown_jobs::fail_active(tx, id, TeardownSuspendFailure::Deleted)?;
-    crate::route_activation_claims::close_claim(tx, id)?;
+    crate::db::route_activation_claims::close_claim(tx, id)?;
     tx.execute(
         "DELETE FROM sandbox_cleanup_episodes WHERE sandbox_id = ?1",
         params![id],

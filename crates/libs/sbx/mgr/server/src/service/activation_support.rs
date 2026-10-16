@@ -360,7 +360,7 @@ impl SandboxManagerService {
                 match crate::db::activation_route_provenance(&db, sandbox_id) {
                     Ok(provenance) => {
                         if requested_can_open_claim
-                            && let Some(claim) = crate::route_activation_claims::OpenRouteActivationClaim::for_cluster_fenced_identity(
+                            && let Some(claim) = crate::db::route_activation_claims::OpenRouteActivationClaim::for_cluster_fenced_identity(
                                 &identity.identity,
                                 identity.provenance,
                             )

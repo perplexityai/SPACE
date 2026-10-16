@@ -125,7 +125,7 @@ pub(crate) fn settle_startup_resident(
         message,
     } = settlement
     {
-        crate::route_activation_claims::close_claim(&tx, &observed.id)?;
+        route_activation_claims::close_claim(&tx, &observed.id)?;
         insert_new_quarantine_episode(
             &tx,
             &QuarantineEpisode {

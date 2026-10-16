@@ -947,7 +947,7 @@ async fn auto_lifecycle_delete_requires_one_canonical_id_and_the_expected_policy
                 );
                 fixture.assert_untouched(&id, SandboxState::Started, case.name);
                 assert_eq!(
-                    crate::auto_lifecycle_delete_receipts::db::pending_receipt_for_sandbox(
+                    crate::db::auto_lifecycle_delete_receipts::pending_receipt_for_sandbox(
                         &fixture.service.db_conn().unwrap(),
                         sandbox_id,
                     )

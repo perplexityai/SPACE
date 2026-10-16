@@ -7,7 +7,6 @@ use pplx_space_common_core::types::{
 };
 use pplx_space_common_svc::types::AutoLifecyclePolicyFingerprint;
 
-pub(crate) mod db;
 #[cfg(test)]
 mod tests;
 

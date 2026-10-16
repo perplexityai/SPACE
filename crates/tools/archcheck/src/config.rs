@@ -59,11 +59,15 @@ pub struct FileSizeConfig {
 pub struct PatternRatchetConfig {
     /// Optional repository-relative scope; absent means all production files.
     #[serde(default)]
-    pub include: Option<AllowList>,
+    pub include: Option<PathGlobs>,
     /// A code line matching any of these regexes is restricted.
     pub patterns: Patterns,
+    /// Repository-relative path globs of the files the instance checks;
+    /// every production file when absent.
+    #[serde(default)]
+    pub paths: Option<CheckedPaths>,
     /// Repository-relative path globs whose files may match freely.
-    pub allow: AllowList,
+    pub allow: PathGlobs,
     pub no_crossing: BehaviourConfig,
     pub no_new_entries: BehaviourConfig,
     pub no_raised_caps: BehaviourConfig,
@@ -152,15 +156,15 @@ impl TryFrom<Vec<String>> for Patterns {
 /// within one path component; `**` spans any number of them.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(try_from = "Vec<String>")]
-pub struct AllowList(GlobSet);
+pub struct PathGlobs(GlobSet);
 
-impl AllowList {
+impl PathGlobs {
     pub fn is_match(&self, path: &str) -> bool {
         self.0.is_match(path)
     }
 }
 
-impl TryFrom<Vec<String>> for AllowList {
+impl TryFrom<Vec<String>> for PathGlobs {
     type Error = globset::Error;
 
     fn try_from(globs: Vec<String>) -> Result<Self, Self::Error> {
@@ -169,6 +173,37 @@ impl TryFrom<Vec<String>> for AllowList {
             set.add(GlobBuilder::new(&glob).literal_separator(true).build()?);
         }
         Ok(Self(set.build()?))
+    }
+}
+
+/// An instance's `paths`: [`PathGlobs`] with at least one glob, since an
+/// empty list would check nothing.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(try_from = "Vec<String>")]
+pub struct CheckedPaths(PathGlobs);
+
+#[derive(Debug, Error)]
+pub enum CheckedPathsError {
+    #[error("paths must list at least one glob; omit it to check every production file")]
+    Empty,
+    #[error(transparent)]
+    Glob(#[from] globset::Error),
+}
+
+impl CheckedPaths {
+    pub fn is_match(&self, path: &str) -> bool {
+        self.0.is_match(path)
+    }
+}
+
+impl TryFrom<Vec<String>> for CheckedPaths {
+    type Error = CheckedPathsError;
+
+    fn try_from(globs: Vec<String>) -> Result<Self, Self::Error> {
+        if globs.is_empty() {
+            return Err(CheckedPathsError::Empty);
+        }
+        Ok(Self(PathGlobs::try_from(globs)?))
     }
 }
 

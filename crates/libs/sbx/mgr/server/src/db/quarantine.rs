@@ -849,7 +849,7 @@ fn mark_quarantined_inner(
         );
     }
     if changed != 0 {
-        crate::route_activation_claims::close_claim(&tx, id)?;
+        route_activation_claims::close_claim(&tx, id)?;
         let episode = QuarantineEpisode {
             sandbox_id: id,
             entered_from_state: previous_state.as_deref(),
