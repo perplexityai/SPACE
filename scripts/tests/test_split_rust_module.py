@@ -8,6 +8,7 @@ every item's reach exactly what it was in the parent.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -134,9 +135,18 @@ def repo(tmp_path: Path) -> Path:
     return tmp_path
 
 
+def rustfmt_all(repo: Path) -> None:
+    """What `cargo fmt` does to a real split before it is committed."""
+    for f in sorted((repo / "crate").rglob("*.rs")):
+        out = subprocess.run(["rustfmt", "--edition", "2024", "--emit", "stdout", "--quiet"],
+                             input=f.read_text(), capture_output=True, text=True, check=True).stdout
+        f.write_text(out)
+
+
 def apply_and_commit(repo: Path) -> None:
     r = run("apply", "spec.toml", cwd=repo)
     assert r.returncode == 0, r.stderr
+    rustfmt_all(repo)
     git(repo, "add", "crate")
     git(repo, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qm", "split")
 
@@ -197,7 +207,8 @@ def test_apply_writes_children_and_keeps_parent_paths(repo):
     # Fields and inherent-impl members keep the parent's reach; trait impls are untouched.
     assert "    pub name: String,\n    pub(super) inner: u32,\n    pub(in crate::a) shared: bool," in config
     assert "    pub(super) routes: HashMap<String, Vec<u8>>," in config
-    assert "pub(super) struct Tuple(pub(super) u32, pub String, #[allow(dead_code)] pub(super) Box<dyn Fn(u8) -> u8>);" in config
+    tuple = re.sub(r"\s+", " ", config[config.index("pub(super) struct Tuple("):])
+    assert tuple.startswith("pub(super) struct Tuple( pub(super) u32, pub String, #[allow(dead_code)] pub(super) Box<dyn Fn(u8) -> u8>, );")
     assert "    pub(super) fn private_helper(&self) -> u32 {" in config
     assert '        let s = "fn not_a_member() {}";' in config
     assert "    pub(in crate::a) const LIMIT: u32 = 5;" in config
@@ -227,13 +238,21 @@ def test_verify_accepts_the_move_and_rejects_an_edit(repo):
     assert "foo/config.rs: differs from what apply generates" in bad.stdout and "self.inner + 1" in bad.stdout
 
 
-def test_verify_ignores_rustfmt_rewraps(repo):
+def test_verify_rejects_a_head_that_is_not_rustfmt_formatted(repo):
     apply_and_commit(repo)
     parsing = repo / "crate/src/a/foo/parsing.rs"
     parsing.write_text(parsing.read_text().replace("pub(super) fn parse(x: &str) -> u32 {",
                                                    "pub(super) fn parse(\n    x: &str,\n) -> u32 {"))
     git(repo, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qam", "fmt")
-    assert run("verify", "HEAD~2", cwd=repo).returncode == 0
+    assert run("verify", "HEAD~2", cwd=repo).returncode == 1
+
+
+def test_verify_rejects_a_token_edit_rustfmt_would_erase(repo):
+    apply_and_commit(repo)
+    parsing = repo / "crate/src/a/foo/parsing.rs"
+    parsing.write_text(parsing.read_text().replace("x.len() as u32", "vec![x.len() as u32,][0]"))
+    git(repo, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qam", "edit")
+    assert run("verify", "HEAD~2", cwd=repo).returncode == 1
 
 
 def test_verify_sees_edits_inside_string_literals(repo):
@@ -389,14 +408,6 @@ def test_moved_callers_of_a_macro_that_emits_relative_visibility_are_refused(rep
     (repo / "spec.toml").write_text('file = "crate/src/a/foo.rs"\n[[module]]\nname = "m"\nitems = ["impl Holder<u8>"]\n')
     r = run("apply", "spec.toml", "--dry-run", cwd=repo)
     assert r.returncode != 0 and "macro_rules! helper" in r.stderr
-
-
-def test_verify_ignores_a_trailing_comma_rustfmt_adds_in_generics(repo):
-    apply_and_commit(repo)
-    parsing = repo / "crate/src/a/foo/parsing.rs"
-    parsing.write_text(parsing.read_text().replace("impl<F> Holder<F>", "impl<\n    F,\n> Holder<F>"))
-    git(repo, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qam", "fmt")
-    assert run("verify", "HEAD~2", cwd=repo).returncode == 0
 
 
 @pytest.mark.parametrize(
@@ -724,8 +735,8 @@ def test_split_crate_compiles_and_keeps_behavior(tmp_path):
     assert build_and_test(tmp_path / "oracle").returncode == 0
     (tmp_path / "spec.toml").write_text(
         'file = "oracle/src/a/foo.rs"\n'
-        '[[module]]\nname = "pair"\nglob_import = false\nitems = ["struct Pair", "impl Pair :: fn narrow"]\n'
-        '[[module]]\nname = "helpers"\nglob_import = false\nitems = ["fn shared", "fn private_helper"]\n'
+        '[[module]]\nname = "pair"\nallow_unused_glob = true\nitems = ["struct Pair", "impl Pair :: fn narrow"]\n'
+        '[[module]]\nname = "helpers"\nallow_unused_glob = true\nitems = ["fn shared", "fn private_helper"]\n'
     )
     r = run("apply", "spec.toml", cwd=tmp_path)
     assert r.returncode == 0, r.stderr
@@ -784,3 +795,90 @@ def test_the_path_attribute_scan_stays_inside_the_crate(tmp_path):
     (tmp_path / "repo/c/src").mkdir(parents=True)
     (tmp_path / "repo/c/src/a.rs").write_text("fn f() {}\n")
     assert srm.path_attribute_users(str(tmp_path / "repo"), "c/src/a.rs") == ""
+
+
+# --- Round-2 review cases. ---
+
+
+def test_verify_rejects_a_removed_glob_import(repo):
+    apply_and_commit(repo)
+    child = repo / "crate/src/a/foo/k8s.rs"
+    child.write_text(child.read_text().replace("use super::*;\n\n", ""))
+    commit_all(repo, "drop glob")
+    assert run("verify", "HEAD~2", cwd=repo).returncode == 1
+
+
+@pytest.mark.parametrize(
+    ("text", "items", "message"),
+    [
+        # a parent macro whose expansion names a super:: path
+        ("macro_rules! m {\n    () => {\n        super::V\n    };\n}\n\nfn f() -> u8 {\n    m!()\n}\n",
+         '["fn f"]', "expansion names"),
+        # an ancestor macro of the same name would be shadowed by the later local definition
+        ("fn f() -> u8 {\n    m!()\n}\n\nmacro_rules! m {\n    () => {\n        2\n    };\n}\n",
+         '["fn f"]', "before the parent defines it"),
+        # a top-level macro invocation without opt-in
+        ("make!();\n\nfn g() {}\n", '["macro make"]', "allow_macro_items"),
+        # an inline module nested inside a moved function, with super
+        ("fn f() -> u8 {\n    mod i {\n        pub fn g() -> u8 {\n            super::super::V\n        }\n    }\n    i::g()\n}\n",
+         '["fn f"]', "inline module"),
+        # stringify with braces
+        ("fn f() -> &'static str {\n    stringify! {super::hello}\n}\n", '["fn f"]', "stringifies"),
+        # an include in a split impl's header
+        ("struct S<const N: usize>;\n\nimpl S<{ include_str!(\"size.txt\").len() }> {\n    fn a() {}\n\n    fn b() {}\n}\n",
+         '["impl S<* :: fn b"]', "include"),
+        # one-line attribute on an impl member
+        ("struct S;\n\nimpl S {\n    #[inline] fn a() {}\n\n    fn b() {}\n}\n", '["impl S :: fn b"]', "share a line"),
+    ],
+)
+def test_round_two_refusals(repo, text, items, message):
+    r = write_parent(repo, text, f'file = "crate/src/a/foo.rs"\n[[module]]\nname = "x"\nitems = {items}\n')
+    assert r.returncode != 0 and message in r.stderr, r.stderr
+
+
+def test_terminal_super_in_use_trees_is_deepened(repo):
+    r = write_parent(repo, "fn f() -> u8 {\n    use super as outer;\n    outer::V\n}\n",
+                     'file = "crate/src/a/foo.rs"\n[[module]]\nname = "x"\nitems = ["fn f"]\n')
+    assert r.returncode == 0, r.stderr
+    assert "use super::super as outer;" in (repo / "crate/src/a/foo/x.rs").read_text()
+
+
+def test_include_with_brace_delimiters_is_rebased(repo):
+    r = write_parent(repo, "fn f() -> &'static str {\n    include_str! {\"data.txt\"}\n}\n",
+                     'file = "crate/src/a/foo.rs"\n[[module]]\nname = "x"\nitems = ["fn f"]\n')
+    assert r.returncode == 0, r.stderr
+    assert 'include_str! {"../data.txt"}' in (repo / "crate/src/a/foo/x.rs").read_text()
+
+
+def test_macro_items_move_with_opt_in(repo):
+    r = write_parent(repo, "make!();\n\nfn g() {}\n",
+                     'file = "crate/src/a/foo.rs"\n[[module]]\nname = "x"\nallow_macro_items = true\nitems = ["macro make"]\n')
+    assert r.returncode == 0, r.stderr
+    assert "pub use x::*;" in (repo / "crate/src/a/foo.rs").read_text()
+
+
+def test_module_docs_wrap_at_100_columns_and_verify_round_trips(repo):
+    long = "A long module description " * 8
+    (repo / "spec.toml").write_text(SPEC.replace('doc = "The configuration type."', f'doc = "{long.strip()}"'))
+    apply_and_commit(repo)
+    config = (repo / "crate/src/a/foo/config.rs").read_text()
+    header = [ln for ln in config.split("\n") if ln.startswith("//!")]
+    assert len(header) > 1 and all(len(ln) <= 100 for ln in header)
+    assert run("verify", "HEAD~1", cwd=repo).returncode == 0
+
+
+def test_a_binary_crate_root_round_trips_through_verify(tmp_path):
+    root = tmp_path / "r"
+    (root / "c/src/bin").mkdir(parents=True)
+    (root / "c/src/bin/tool.rs").write_text("fn helper() -> u8 {\n    1\n}\n\nfn main() {\n    helper();\n}\n")
+    git(root, "init", "-q")
+    commit_all(root, "base")
+    (root / "spec.toml").write_text('file = "c/src/bin/tool.rs"\n[[module]]\nname = "helpers"\nitems = ["fn helper"]\n')
+    assert run("apply", "spec.toml", cwd=root).returncode == 0
+    assert (root / "c/src/bin/helpers.rs").exists()
+    for f in (root / "c").rglob("*.rs"):
+        f.write_text(subprocess.run(["rustfmt", "--edition", "2024", "--emit", "stdout", "--quiet"],
+                                    input=f.read_text(), capture_output=True, text=True, check=True).stdout)
+    commit_all(root, "split")
+    v = run("verify", "HEAD~1", cwd=root)
+    assert v.returncode == 0, v.stdout

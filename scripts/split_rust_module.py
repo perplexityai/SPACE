@@ -504,9 +504,41 @@ def split_top(mt: str, open_pos: int) -> list[tuple[int, int]]:
 MEMBER_RE = re.compile(r"(" + VIS + r")" + QUAL + r"(fn|const|type)\b")
 
 
+def macro_group(mt: str, pos: int) -> tuple[int, int] | None:
+    """The span of the delimited token group starting at the first (, [ or { at or after pos."""
+    m = re.compile(r"\s*([(\[{])").match(mt, pos)
+    if not m:
+        return None
+    depth, p = 0, m.start(1)
+    while p < len(mt):
+        if mt[p] in OPEN:
+            depth += 1
+        elif mt[p] in CLOSE:
+            depth -= 1
+            if depth == 0:
+                return m.start(1), p + 1
+        p += 1
+    return None
+
+
+# `super` that starts a path or a use tree (`super::x`, `use super as y`, `use super;`), not
+# the `super` of a `pub(super)` / `pub(in super..)` visibility.
+SUPER_PATH = re.compile(r"(?<![\w:])super\b(?!\s*\))")
+
+
+def super_path_positions(mt: str) -> list[int]:
+    out = []
+    for m in SUPER_PATH.finditer(mt):
+        before = mt[max(0, m.start() - 12):m.start()]
+        if re.search(r"pub\s*\(\s*(?:in\s+)?$", before):
+            continue
+        out.append(m.start())
+    return out
+
+
 REL_VIS = re.compile(r"\bpub\s*\(\s*(?:super|self|in\s+(?:super|self)\b)")
-INCLUDE = re.compile(r"\binclude(?:_str|_bytes)?\s*!\s*\(")
-PLAIN_INCLUDE = re.compile(r"(\binclude(?:_str|_bytes)?\s*!\s*\(\s*)\"([^\"\\]*)\"\s*\)")
+INCLUDE = re.compile(r"\binclude(?:_str|_bytes)?\s*!\s*[(\[{]")
+PLAIN_INCLUDE = re.compile(r"(\binclude(?:_str|_bytes)?\s*!\s*[(\[{]\s*)\"([^\"\\]*)\"\s*[)\]}]")
 
 
 def transform_item(text: str, kind: str, parent_path: list[str], deeper_dir: bool) -> tuple[str, dict]:
@@ -523,6 +555,8 @@ def transform_item(text: str, kind: str, parent_path: list[str], deeper_dir: boo
         if new is not None:
             edits.append((pos, len(old), new))
             counts["vis"] = counts.get("vis", 0) + 1
+            kind_key = "vis_super" if collapse(old) == "pub(super)" else "vis_private"
+            counts[kind_key] = counts.get(kind_key, 0) + 1
             if old:
                 edited_rel.add(pos)
 
@@ -572,8 +606,13 @@ def transform_item(text: str, kind: str, parent_path: list[str], deeper_dir: boo
     for m in REL_VIS.finditer(mt):
         if m.start() not in edited_rel:
             raise SystemExit("moved code has a nested pub(super)/pub(self) the tool cannot remap; edit by hand")
-    if re.search(r"\b(?:stringify|concat_idents)\s*!\s*\([^()]*\bsuper\b", mt):
-        raise SystemExit("moved code stringifies a `super` path; its text would change. Edit by hand.")
+    for m in re.finditer(r"\b(?:stringify|concat_idents)\s*!", mt):
+        g = macro_group(mt, m.end())
+        if g and re.search(r"\bsuper\b", mt[g[0]:g[1]]):
+            raise SystemExit("moved code stringifies a `super` path; its text would change. Edit by hand.")
+    if re.search(r"\bmod\s+\w+\s*\{", mt) and re.search(r"\bsuper\b", mt):
+        raise SystemExit("moved code has an inline module and names `super`; which module each `super` "
+                         "means depends on nesting the tool does not track. Edit by hand.")
     if re.search(r"\bself\s*::\s*super\b", mt):
         raise SystemExit("`self::super` in moved code changes meaning one module deeper; edit by hand")
     for m in re.finditer(r"\bsuper\s*::", text):
@@ -581,8 +620,8 @@ def transform_item(text: str, kind: str, parent_path: list[str], deeper_dir: boo
             raise SystemExit("a string literal in moved code names a `super::` path (an attribute argument?); "
                              "the tool cannot tell whether it resolves relative to the module. Edit by hand.")
     # 3. super:: paths (code only)
-    for m in re.finditer(r"(?<![\w:])super(?=\s*::)", mt):
-        edits.append((m.start(), 0, "super::"))
+    for pos in super_path_positions(mt):
+        edits.append((pos, 0, "super::"))
         counts["super"] = counts.get("super", 0) + 1
     if re.search(r"\bpub\s*\(\s*in\s+(?!crate\b)", mt):
         raise SystemExit("relative pub(in ...) inside a moved item; edit by hand")
@@ -685,6 +724,8 @@ def impl_layout(lines: list[str], mlines: list[str], it: Item) -> ImplLayout | N
             lead = i if lead is None else lead
             i += 1
             continue
+        if s.startswith("#[") and attr_then_code(m):
+            raise SystemExit(f"line {i + 1}: an attribute and an impl member share a line; put the member on its own line")
         if s.startswith("#["):
             lead = i if lead is None else lead
             d = line_depth_delta(m)
@@ -719,8 +760,8 @@ def impl_layout(lines: list[str], mlines: list[str], it: Item) -> ImplLayout | N
 
 def rewrite_super(text: str) -> str:
     mt = mask(text)
-    for m in reversed(list(re.finditer(r"(?<![\w:])super(?=\s*::)", mt))):
-        text = text[:m.start()] + "super::" + text[m.start():]
+    for pos in reversed(super_path_positions(mt)):
+        text = text[:pos] + "super::" + text[pos:]
     return text
 
 
@@ -746,6 +787,22 @@ def attr_lines(lines: list[str], lead: int, start: int) -> list[str]:
 RANK = {"none": -1, "private": 0, "in": 1, "crate": 2, "pub": 3}
 TYPE_NS = {"struct", "enum", "union", "trait", "type", "mod", "mod-decl"}
 DEFS = {"struct", "enum", "union", "trait", "impl", "type", "const", "static", "macro"}
+
+
+def doc_comment(doc: str) -> str:
+    """`//!` lines for a module doc, paragraphs separated by blank lines, wrapped at 100 columns."""
+    import textwrap
+
+    paras = [" ".join(p.split()) for p in doc.strip().split("\n\n") if p.strip()]
+    if not paras:
+        return ""
+    out = []
+    for k, para in enumerate(paras):
+        if k:
+            out.append("//!")
+        out += textwrap.wrap(para, width=100, initial_indent="//! ", subsequent_indent="//! ",
+                             break_long_words=False, break_on_hyphens=False)
+    return "\n".join(out) + "\n\n"
 
 
 def new_reach(orig_vis: str, parent_path: list[str]) -> str:
@@ -811,6 +868,9 @@ def impl_block(lines: list[str], it: Item, lay: ImplLayout, mids: list[int], lea
     """An impl block holding the members `mids` (indices into lay.members), in order."""
     header = "\n".join(lines[it.start:lay.body_open + 1])
     lead = "\n".join(lead_lines)
+    if child and deeper and INCLUDE.search(mask(lead + "\n" + header)):
+        raise SystemExit(f"{it.selector}: an include in a split impl's header or attributes would resolve "
+                         "from a different directory. Edit by hand.")
     out = (rewrite_super(lead) if child else lead).split("\n") if lead_lines else []
     out.extend((rewrite_super(header) if child else header).split("\n"))
     prev = None
@@ -913,7 +973,9 @@ def apply(spec_path: str, repo: str, dry: bool, report: str | None) -> int:
             raise SystemExit(f"macro_rules! {name} is defined more than once in the parent and moved code "
                              "invokes it; which definition it binds to would change. Edit by hand.")
     bodies = {it.name: "\n".join(mlines[it.start:it.end + 1]) for it in macro_defs}
-    relative = {n for n, b in bodies.items() if REL_VIS.search(b)}
+    # A macro whose expansion names `super`/`self` (a path or a visibility) resolves from the
+    # module it is expanded in, so its meaning changes one module deeper.
+    relative = {n for n, b in bodies.items() if REL_VIS.search(b) or re.search(r"\b(?:super|self)\s*::", b)}
     while True:
         more = {n for n, b in bodies.items() if n not in relative and any(invokes(b, r) for r in relative)}
         if not more:
@@ -921,9 +983,24 @@ def apply(spec_path: str, repo: str, dry: bool, report: str | None) -> int:
         relative |= more
     for name in sorted(relative):
         if invokes(moved_text, name):
-            raise SystemExit(f"moved code invokes macro_rules! {name}, which emits a relative visibility "
-                             "(pub(super)/pub(self)), directly or through another macro; its expansion would "
-                             "change reach. Keep its callers in the parent or edit the macro by hand.")
+            raise SystemExit(f"moved code invokes macro_rules! {name}, whose expansion names `super`/`self` "
+                             "(a path or pub(super)/pub(self)), directly or through another macro; it would "
+                             "resolve differently one module deeper. Keep its callers in the parent or edit by hand.")
+    # Children are declared after every parent macro. A moved item that invokes a macro the
+    # parent defines only later bound to an outer macro of that name; in the child it would
+    # bind to the parent's definition instead.
+    first_def = {}
+    for it in macro_defs:
+        first_def.setdefault(it.name, it.start)
+    moved_units = [(items[k].start, "\n".join(mlines[items[k].start:items[k].end + 1])) for k in assign]
+    moved_units += [(layout(k).members[mi].start,
+                     "\n".join(mlines[layout(k).members[mi].start:layout(k).members[mi].end + 1]))
+                    for k, mi in massign]
+    for start, text in moved_units:
+        for name, line in first_def.items():
+            if line > start and invokes(text, name):
+                raise SystemExit(f"moved code at line {start + 1} invokes {name}! before the parent defines it "
+                                 f"(line {line + 1}); its binding would change. Edit by hand.")
     split_impls = sorted({k for k, _ in massign})
     for k in split_impls:
         if k in assign:
@@ -967,8 +1044,13 @@ def apply(spec_path: str, repo: str, dry: bool, report: str | None) -> int:
                 chunks.append(new)
                 sels.append(it.selector)
                 if it.kind == "macro":
-                    # What a macro invocation emits is unknown: re-export at most `pub`, which a
-                    # glob clamps to each emitted item's own visibility, so nothing widens.
+                    # What a macro invocation emits is unknown: its items keep the visibility the
+                    # macro gives them, which the tool cannot remap. Moving one needs an explicit
+                    # opt-in; re-export at most `pub`, which a glob clamps, so nothing widens.
+                    if not mod.get("allow_macro_items", False):
+                        raise SystemExit(f"{it.selector}: a top-level macro invocation emits items whose visibility "
+                                         "the tool cannot remap; set allow_macro_items = true on the module if "
+                                         "every item it emits is pub or used only inside the module")
                     counts["macro_items"] = counts.get("macro_items", 0) + 1
                     reach.add("pub")
                 elif it.kind != "impl":
@@ -993,14 +1075,13 @@ def apply(spec_path: str, repo: str, dry: bool, report: str | None) -> int:
                 sels.append(it.selector)
         if not chunks:
             raise SystemExit(f"module {name}: no items")
-        doc = mod.get("doc", "").strip()
-        body = ""
-        if doc:
-            body += "".join(f"//! {d}\n" if d.strip() else "//!\n" for d in doc.split("\n")) + "\n"
-        glob = mod.get("glob_import", True)
-        if not isinstance(glob, bool):
-            raise SystemExit(f"module {name}: glob_import must be true or false")
-        body += ("use super::*;\n\n" if glob else "") + "\n\n".join(chunks) + "\n"
+        body = doc_comment(mod.get("doc", ""))
+        allow_unused = mod.get("allow_unused_glob", False)
+        if "glob_import" in mod or not isinstance(allow_unused, bool):
+            raise SystemExit(f"module {name}: the parent glob import is always kept; use "
+                             "allow_unused_glob = true for a module that needs nothing from its parent")
+        glob = "#[allow(unused_imports)]\nuse super::*;\n\n" if allow_unused else "use super::*;\n\n"
+        body += glob + "\n\n".join(chunks) + "\n"
         ks = [k for k in range(len(items)) if assign.get(k) == name or
               (k in split_impls and any(massign.get((k, mi)) == name for mi in range(len(layout(k).members))))]
         cfgs = [set(items[k].cfg) for k in ks]
@@ -1223,7 +1304,8 @@ def derive_spec(repo: str, base: str, head: str, parent: str, children: list[str
         src = git_show(repo, head, child) or ""
         items, hdr = parse_items(src)
         lines, mlines = src.split("\n"), mask(src).split("\n")
-        doc = "\n".join(re.sub(r"^//! ?", "", ln.strip()) for ln in lines[:hdr] if ln.strip().startswith("//!"))
+        doc_lines = [re.sub(r"^//! ?", "", ln.strip()) for ln in lines[:hdr] if ln.strip().startswith("//!")]
+        doc = "\n".join(doc_lines).replace("\n\n", "\0").replace("\n", " ").replace("\0", "\n\n")
         sels: list[str] = []
         for it in items:
             if it.kind == "use" and collapse("\n".join(lines[it.start:it.end + 1])) == "use super::*;":
@@ -1235,13 +1317,15 @@ def derive_spec(repo: str, base: str, head: str, parent: str, children: list[str
                 sels += [f"{escape_glob(base_sel)} :: {escape_glob(m.selector)}" for m in lay.members]
             else:
                 sels.append(escape_glob(it.selector))
-        has_glob = any(it.kind == "use" and collapse("\n".join(lines[it.start:it.end + 1])) == "use super::*;"
-                       for it in items)
+        glob_lead = next(("\n".join(lines[it.lead:it.start]) for it in items if it.kind == "use"
+                          and collapse("\n".join(lines[it.start:it.end + 1])) == "use super::*;"), "")
         out.append(f"\n[[module]]\nname = {json.dumps(name)}")
         if doc:
             out.append(f"doc = {json.dumps(doc)}")
-        if not has_glob:
-            out.append("glob_import = false")
+        if "allow(unused_imports)" in glob_lead:
+            out.append("allow_unused_glob = true")
+        if any(it.kind == "macro" for it in items):
+            out.append("allow_macro_items = true")
         out.append("items = [\n" + "".join(f"  {json.dumps(s)},\n" for s in dict.fromkeys(sels)) + "]")
     return "\n".join(out) + "\n"
 
@@ -1270,13 +1354,17 @@ def verify(repo: str, base: str, head: str, print_spec: bool = False) -> int:
     problems: list[str] = [f"{p}: deleted" for st, p in status if st == "D"]
     problems += [f"{p}: {st}" for st, p in status if st not in ("A", "M", "D")]
     problems += [f"{p}: not a regular file (mode {modes[p][0]} -> {modes[p][1]})" for p in sorted(irregular)]
+    def children_dir(parent: str) -> str:
+        return os.path.dirname(parent) if file_layout(parent)[1] else parent[:-3]
+
     groups: dict[str, list[str]] = {}
     for p in added:
-        parent = next((c for c in parent_candidates(p) if c in modified), None)
-        if parent is None:
-            problems.append(f"{p}: new file whose parent module is not part of the change")
+        owners = [m for m in sorted(modified) if "/src/" in m and children_dir(m) == os.path.dirname(p)]
+        if len(owners) != 1:
+            problems.append(f"{p}: new file whose parent module is not part of the change" if not owners
+                            else f"{p}: more than one changed file could own it: {owners}")
             continue
-        groups.setdefault(parent, []).append(os.path.splitext(os.path.basename(p))[0])
+        groups.setdefault(owners[0], []).append(os.path.splitext(os.path.basename(p))[0])
     for p in sorted(modified - set(groups)):
         problems.append(f"{p}: changed, but no child module was split out of it")
     checked = 0
@@ -1304,8 +1392,10 @@ def verify(repo: str, base: str, head: str, print_spec: bool = False) -> int:
             beside = file_layout(parent)[1]
             cdir = os.path.dirname(parent) if beside else parent[:-3]
             for rel in [parent] + [f"{cdir}/{c}.rs" for c in children]:
+                # Format only the regenerated side: head must be exactly `apply` + rustfmt, so an
+                # edit rustfmt would erase (a trailing comma inside a macro call) still differs.
                 want = rustfmt(repo, open(os.path.join(tmp, rel), encoding="utf-8").read(), edition)
-                got = rustfmt(repo, git_show(repo, head, rel) or "", edition)
+                got = git_show(repo, head, rel) or ""
                 checked += 1
                 if want != got:
                     diff = list(difflib.unified_diff(want.split("\n"), got.split("\n"), "regenerated/" + rel,
