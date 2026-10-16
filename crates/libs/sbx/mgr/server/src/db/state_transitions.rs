@@ -36,6 +36,13 @@ pub enum BeginActivationError {
         execution_generation: ExecutionGeneration,
         activation_attempt_id: SandboxActivationAttemptId,
     },
+    /// This node already deleted or evicted the row for this generation (or a
+    /// newer one), possibly together with its rollback receipt. The
+    /// generation is retired here; a retry must use a newer generation.
+    #[error("execution generation {execution_generation} was retired on this node")]
+    RetiredGeneration {
+        execution_generation: ExecutionGeneration,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -281,6 +288,16 @@ pub(crate) fn begin_activation_with_route_evidence(
         // a late request for a retired attempt must not revive that execution.
         tx.commit()?;
         return Err(rolled_back);
+    }
+    if let Some(execution_generation) = execution_generation
+        && super::execution_delete_receipt_covers(&tx, id, execution_generation)?
+    {
+        // The row was rebuilt after a delete or eviction, which drops any
+        // rollback receipt. The delete receipt keeps the generation fence.
+        tx.commit()?;
+        return Err(BeginActivationError::RetiredGeneration {
+            execution_generation,
+        });
     }
     let keep_filesystem = true;
     // Only activation authorizes node allocation. Filesystem-only staging keeps
