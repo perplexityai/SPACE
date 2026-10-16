@@ -11,6 +11,8 @@ use uuid::Uuid;
 use super::{NodeManagerService, artifact_fs, btrfs_send_source, trusted_paths};
 use crate::proto::*;
 
+#[cfg(any(target_os = "linux", test))]
+mod framing;
 #[cfg(all(test, target_os = "linux"))]
 mod tests;
 
@@ -35,6 +37,14 @@ const CAPABILITIES_ALLOWED: &[UdsPeerPrincipal] = &[
     ),
 ];
 type Body = Pin<Box<dyn tokio_stream::Stream<Item = Result<BtrfsSendChunk, Status>> + Send>>;
+
+/// `Aborted`: the stream was produced, but cannot be trusted; volume-manager
+/// retries the whole transfer with a fresh send.
+#[cfg(target_os = "linux")]
+fn framing_status(error: framing::FramingError) -> Status {
+    tracing::warn!(%error, "rejected btrfs send stream before forwarding it");
+    Status::aborted(format!("btrfs send stream rejected: {error}"))
+}
 
 fn lease_id(raw: &str) -> Result<Uuid, Status> {
     let id = raw
@@ -180,6 +190,9 @@ impl NodeManagerService {
             let (tx, rx) = tokio::sync::mpsc::channel(4);
             self.device_op_tasks.spawn(async move {
                 let mut total = 0_u64;
+                // Forward only bytes that frame one valid stream: a send the
+                // kernel restarted mid-pipe must fail the upload, not store it.
+                let mut framing = framing::SendStreamFraming::new();
                 let result = async {
                     loop {
                         let mut data = Vec::with_capacity(256 * 1024);
@@ -192,7 +205,10 @@ impl NodeManagerService {
                         };
                         if count == 0 { break; }
                         }
-                        if data.is_empty() { return Ok(()); }
+                        if data.is_empty() {
+                            return framing.finish().map_err(framing_status);
+                        }
+                        framing.feed(&data).map_err(framing_status)?;
                         total += data.len() as u64;
                         tokio::select! {
                             biased;

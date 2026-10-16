@@ -187,6 +187,14 @@ memory. Volume-manager retains its existing codec reserve and producer limit.
 
 Completion requires a successful kernel send, an exact terminal byte count,
 successful gRPC trailers, encoder finalization, and an S3 HEAD length check.
+Node-manager also checks the stream before relaying each frame: one stream
+header, every command's CRC-32C, an `END` command last and nothing after it.
+A send blocked on a full pipe is restarted by the kernel when its thread is
+interrupted (a signal with `SA_RESTART`, a stop, or a cgroup freeze): the
+restarted send appends a new stream after the partial one and still reports
+success, and `btrfs receive` later rejects the result with "crc32 mismatch in
+command". The check fails such an attempt with `Aborted`, so the upload aborts
+and the job retries with a fresh send.
 Retries start a new send and multipart upload; regenerated streams need not be
 byte-identical. The remote zstd/btrfs-send format and restore decoder do not change.
 This removes one uncompressed send-file write and its compression read. It does
@@ -205,6 +213,7 @@ the actual logical upload total and omits that node-local identity.
 | Staging succeeds but job insertion/reply fails | Submission and the orphan census serialize. A retry rejoins the same durable job when present; an unreferenced lease is reclaimed by the next census. |
 | Upload pending, running, or cancelling | The persisted volume job retains its lease. Retries reopen and verify immutable inputs. |
 | Resubmit the same source and destination | Pending/running/cancelling jobs and completed uploads are reused without staging another lease. Failed/cancelled jobs get a new job and a fresh lease; their old leases remain eligible for terminal cleanup. |
+| Kernel send restarted mid-pipe, or any stream that fails framing | Node-manager stops relaying, closes the pipe and ends the read with `Aborted`. The multipart upload aborts and the job retries with a fresh send. |
 | Reader disconnect, timeout, or daemon shutdown | Close the pipe read end, join the kernel writer, then release its lease lock and reader slot. A retry generates a fresh stream. |
 | Job commits completed, failed, or cancelled | The one-minute orphan sweep can release its lease. It cannot race an active kernel reader because deletion takes the same lease lock. |
 | Census incomplete or malformed payload | Delete nothing; log and retry next minute. Each sweep is bounded to 30 seconds. |

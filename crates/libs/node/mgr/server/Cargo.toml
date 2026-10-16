@@ -21,6 +21,7 @@ test-hooks = ["pplx-space-common-core/test-hooks"]
 
 [dependencies]
 arc-swap = { workspace = true }
+crc = { workspace = true }
 dashmap = { workspace = true }
 h2 = { workspace = true }
 hyper = { workspace = true }
