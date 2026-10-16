@@ -519,6 +519,97 @@ async fn policy_change_during_origin_setup_never_reaches_origin() {
     }
 }
 
+#[tokio::test]
+async fn policy_change_while_waiting_for_sender_never_reaches_origin() {
+    use tokio::io::AsyncReadExt;
+
+    for request in [
+        credential_request(http::Method::GET, "/v1/items"),
+        Request::connect("allowed.test:443")
+            .header(header::HOST, "allowed.test:443")
+            .body(())
+            .unwrap(),
+    ] {
+        let method = request.method().clone();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (state, provider) = credential_provider(true).await;
+            let lease = provider
+                .get("allowed.test".parse().unwrap(), 443)
+                .await
+                .unwrap();
+            let binding =
+                HostBinding::new("test", "93.184.216.34:443".parse().unwrap(), state.clone());
+            let (origin, mut origin_peer) = tokio::io::duplex(4096);
+            let shutdown = CancellationToken::new();
+            let draining = CancellationToken::new();
+            let session = Arc::new(Session {
+                binding,
+                lease,
+                upstream: Upstream::new(
+                    move |_| async move { Ok((origin, HttpProtocol::Http1)) },
+                    shutdown.clone(),
+                    draining.clone(),
+                ),
+                upgrades: TaskTracker::new(),
+                shutdown,
+                draining,
+            });
+            // Hold the real HTTP/1 sender permit, as another in-flight request
+            // would. Origin setup has completed; only sender readiness can wait.
+            let sender = session.upstream.sender(HttpProtocol::Http1).await.unwrap();
+            let permit = sender.ready().await.unwrap();
+            let (waiting, mut reached) = tokio::sync::mpsc::channel(1);
+            let serving = session.clone();
+            let service = service_fn(move |request: Request<Incoming>| {
+                let session = serving.clone();
+                let waiting = waiting.clone();
+                async move {
+                    let forwarded = session.forward(request.try_into().unwrap());
+                    tokio::pin!(forwarded);
+                    assert!(futures_util::poll!(forwarded.as_mut()).is_pending());
+                    waiting.send(()).await.unwrap();
+                    Ok::<_, Infallible>(forwarded.await)
+                }
+            });
+            let (guest, guest_peer) = tokio::io::duplex(4096);
+            let gateway = tokio::spawn(async move {
+                hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(guest), service)
+                    .with_upgrades()
+                    .await
+                    .unwrap();
+            });
+            let (mut client, connection) =
+                http1::handshake(TokioIo::new(guest_peer)).await.unwrap();
+            let driver = tokio::spawn(connection.with_upgrades());
+            let response = tokio::spawn(async move {
+                client
+                    .send_request(request.map(|_| Empty::<Bytes>::new()))
+                    .await
+                    .unwrap()
+            });
+
+            reached.recv().await.unwrap();
+            state
+                .set_no_identity(crate::state::NetworkStateReason::NoIdentity)
+                .await;
+            drop(permit);
+            assert_eq!(response.await.unwrap().status(), StatusCode::FORBIDDEN);
+            driver.await.unwrap().unwrap();
+            gateway.await.unwrap();
+            session.upstream.shutdown().await;
+            let mut byte = [0];
+            assert_eq!(
+                origin_peer.read(&mut byte).await.unwrap(),
+                0,
+                "the invalidated {method} must not send request bytes after sender readiness"
+            );
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{method} did not finish after sender-readiness invalidation"));
+    }
+}
+
 async fn fixture() -> (
     HostBinding,
     Arc<CertificateLease>,
