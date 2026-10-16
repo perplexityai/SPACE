@@ -38,8 +38,10 @@ Spec (TOML):
   name = "bar"
   doc = "What bar holds."            # one `//!` line at the top of the new file
   items = ["fn parse_*", "struct Config", "impl Config", "impl Display for Config"]
-  # optional: glob_import = false   (omit `use super::*;` when the module needs nothing
-  #           from its parent, which `-D warnings` would otherwise reject as unused)
+  # optional: allow_unused_glob = true   (the module needs nothing from its parent: keep
+  #           `use super::*;` under #[allow(unused_imports)], which -D warnings would reject)
+  # optional: allow_macro_items = true   (move top-level macro invocations; their emitted
+  #           items keep the visibility the macro gives them)
 
 Selectors are fnmatch patterns over `<kind> <name>`; impl blocks are
 `impl <header>` with whitespace collapsed (e.g. `impl<T> From<T> for Foo`).
