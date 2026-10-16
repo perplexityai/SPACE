@@ -28,7 +28,6 @@ PAIRS: tuple[tuple[str, type], ...] = tuple(
         ("PendingBackupControl", adapters.KindHarness),
         ("NodeSelectorExtrasControl", adapters.KindHarness),
         ("NodeFenceControl", adapters.KindHarness),
-        ("QuarantineRecoveryControl", adapters.KindHarness),
         ("OrphanedRestorePodGcControl", adapters.KindHarness),
         ("TemplateBuildControl", adapters.KindHarness),
         ("SandboxNetworkIsolationControl", adapters.KindHarness),

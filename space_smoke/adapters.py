@@ -40,8 +40,8 @@ from space_smoke.capabilities import (
     PendingBackupRow,
     SaWriteOutcome,
     WhoAmI,
-    RecoveryAttempt,
     GuestMetadata,
+    TemplateBuildJob,
     TemplateBuildResult,
     TemplateRecipe,
     SandboxPodRender,
@@ -379,7 +379,6 @@ NODE_TEMPLATE_MANAGER = "template-manager"
 NODE_VOLUME_MANAGER = "volume-manager"
 NODE_CTL = "node-ctl"
 NODE_API = "node-api"
-NODE_BUILD_MANAGER = "build-manager"
 # The Kind-only operator shell on every sandbox worker and builder
 # (infra/space/kind/charts/space-node-debug): the stand-in for the node host's
 # root shell, where the on-node CLIs, btrfs, dmsetup, cryptsetup and ctr run
@@ -435,6 +434,15 @@ KIND_INTERNAL_API_SELECTOR = "app.kubernetes.io/name=space-internal-api"
 PENDING_BACKUP_QUEUE_SQL = """\
 SELECT artifact_id::text, artifact_kind FROM node_local_backup_pending
  WHERE sandbox_id = '{sandbox_id}'::uuid ORDER BY artifact_id;
+"""
+# The E2B route records the build under its template id, the lowercased alias,
+# once a builder has accepted it (`record_accepted_build`).
+TEMPLATE_BUILD_JOB_SQL = """\
+SELECT coalesce(j.daemon_job_id, ''), coalesce(j.builder_node_id::text, ''),
+       coalesce(nk.k8s_node_name, '')
+  FROM template_build_jobs j LEFT JOIN node_k8s nk ON nk.node_id = j.builder_node_id
+ WHERE j.template_id = '{template_id}' AND j.daemon_job_id IS NOT NULL
+ ORDER BY j.created_at DESC LIMIT 1;
 """
 SNAPSHOT_STATES_SQL = """\
 SELECT state FROM snapshots WHERE sandbox_id = '{sandbox_id}'::uuid AND type = 'full' ORDER BY "timestamp";
@@ -3726,82 +3734,6 @@ ON CONFLICT (key_hash) DO NOTHING;
             )
         return publications
 
-    # --- quarantine recovery ----------------------------------------------
-
-    def sandbox_manager_for_sandbox(self, sandbox_id: str) -> tuple[str, str, str]:
-        """(node, sandbox-manager pod, pod uid) of the sandbox's worker."""
-
-        placement = self.sandbox_pod_placement(sandbox_id)
-        if placement is None:
-            raise SmokeConfigurationError(
-                f"sandbox {sandbox_id} has no execution pod; cannot pick its worker"
-            )
-        pod = self._node_service_pod(placement.node_name, NODE_SANDBOX_MANAGER)
-        uid = self.pod_uid(pod)
-        if not uid:
-            raise SmokeConfigurationError(f"sandbox-manager pod {pod} has no uid")
-        return placement.node_name, pod, uid
-
-    def pod_uid(self, pod_name: str) -> str | None:
-        result = self.kubectl(
-            "get", "pod", _kube_pod_name(pod_name), "-o", "jsonpath={.metadata.uid}", timeout=15,
-        )
-        if result.returncode != 0:
-            return None
-        return result.stdout.strip() or None
-
-    def _orphan_root(self, sandbox_id: str) -> str:
-        return f"{SANDBOX_CACHE_ROOT}/{_sql_uuid(sandbox_id)}"
-
-    def plant_orphan_staging(self, node_name: str, sandbox_id: str) -> None:
-        self._require_isolated_kind("orphan staging plant")
-        staging = shlex.quote(
-            f"{self._orphan_root(sandbox_id)}/snapshots/.suspend-publish-{uuid.uuid4()}"
-        )
-        _require_ok(
-            self._node_shell_exec(node_name, f"mkdir -p {staging} && ls -d {staging}", timeout=60),
-            f"plant an interrupted suspend publication for {sandbox_id} on {node_name}",
-        )
-
-    def remove_orphan_sandbox(self, node_name: str, sandbox_id: str) -> None:
-        self._require_isolated_kind("orphan retirement")
-        canonical = _sql_uuid(sandbox_id)
-        root = shlex.quote(self._orphan_root(sandbox_id))
-        # The row first, through the production on-node path (it may not
-        # exist yet if the reconciler never adopted the plant), then the
-        # directory; leaving either would quarantine-poison the next smoke.
-        _require_ok(
-            self._node_shell_exec(
-                node_name,
-                f"space-sbxmgr delete {canonical} >/dev/null 2>&1 || true; rm -rf {root}",
-                timeout=180,
-            ),
-            f"retire the induced orphan {sandbox_id} on {node_name}",
-        )
-
-    def orphan_absent(self, node_name: str, sandbox_id: str) -> bool:
-        root = shlex.quote(self._orphan_root(sandbox_id))
-        result = self._node_shell_exec(node_name, f"! ls -d {root} >/dev/null 2>&1", timeout=60)
-        return result.returncode == 0
-
-    def _sandbox_manager_lines(self, pod_name: str, sandbox_id: str) -> list[str]:
-        canonical = _sql_uuid(sandbox_id)
-        result = self.kubectl(
-            "logs", _kube_pod_name(pod_name), "-c", NODE_SANDBOX_MANAGER, timeout=60
-        )
-        logs = _require_ok(result, f"read the sandbox-manager log of {pod_name}")
-        return [line for line in logs.splitlines() if canonical in line]
-
-    def orphan_quarantined(self, pod_name: str, sandbox_id: str) -> bool:
-        return any(
-            "orphaned_sandbox_row_missing" in line
-            for line in self._sandbox_manager_lines(pod_name, sandbox_id)
-        )
-
-    def recovery_attempts(self, pod_name: str, sandbox_id: str) -> list[RecoveryAttempt]:
-        return _parse_recovery_attempts(
-            self._sandbox_manager_lines(pod_name, sandbox_id), _sql_uuid(sandbox_id)
-        )
     # --- template build (builders) ------------------------------------------
 
     def builder_nodes(self) -> list[str]:
@@ -3868,12 +3800,19 @@ ON CONFLICT (key_hash) DO NOTHING;
             return []
         return _endpoint_target_pods(result.stdout)
 
-    def builder_logged_alias(self, node_name: str, alias: str) -> bool:
-        pod = self._node_service_pod(node_name, NODE_BUILD_MANAGER, role=KIND_BUILDER_ROLE)
-        result = self.kubectl(
-            "logs", pod, "-c", NODE_BUILD_MANAGER, "--since=5m", "--tail=-1", timeout=60,
+    def template_build_job(self, alias: str) -> TemplateBuildJob | None:
+        row = self._psql(
+            TEMPLATE_BUILD_JOB_SQL.format(template_id=_template_alias(alias)),
+            action=f"read the build job of {alias}",
         )
-        return result.returncode == 0 and _template_alias(alias) in result.stdout
+        if not row:
+            return None
+        job_id, node_id, node = (row.split("|") + ["", ""])[:3]
+        return TemplateBuildJob(
+            daemon_job_id=job_id.strip(),
+            builder_node_id=node_id.strip() or None,
+            builder_node=node.strip() or None,
+        )
 
     def prepared_rootfs_handoff(self, node_name: str, *, window_seconds: int = 60) -> str | None:
         if window_seconds <= 0:
@@ -5249,52 +5188,6 @@ def _tracing_fields(line: str) -> dict[str, Any] | None:
     return merged
 
 
-RECOVERY_NO_PROGRESS_EVENT = "recorded bounded quarantine recovery no-progress result"
-_ATTEMPT_COUNT = re.compile(r"attempt_count:\s*(\d+)")
-_LOG_TIMESTAMP = re.compile(
-    r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?)(Z|[+-]\d{2}:\d{2})?"
-)
-
-
-def _log_line_epoch(line: str, fields: Mapping[str, Any] | None) -> float | None:
-    stamp = fields.get("timestamp") if fields else None
-    match = _LOG_TIMESTAMP.search(str(stamp) if isinstance(stamp, str) else line)
-    if match is None:
-        return None
-    text = match.group(1) + ("+00:00" if match.group(2) in (None, "Z") else match.group(2))
-    try:
-        return datetime.fromisoformat(text).timestamp()
-    except ValueError:
-        return None
-
-
-def _parse_recovery_attempts(lines: Sequence[str], sandbox_id: str) -> list[RecoveryAttempt]:
-    """`RetryScheduled` no-progress records for one sandbox, whichever log layout.
-
-    Only a `RetryScheduled` outcome carries `attempt_count`; a `StaleClaim` is a
-    unit variant and prints none, and that is a normal production outcome (a
-    cleanup owner, a lapsed lease), so its absence is not drift. Drift is the
-    outcome that does carry the field having stopped printing it.
-    """
-
-    attempts: list[RecoveryAttempt] = []
-    for line in lines:
-        if RECOVERY_NO_PROGRESS_EVENT not in line or sandbox_id not in line:
-            continue
-        count = _ATTEMPT_COUNT.search(line)
-        if count is None:
-            if "RetryScheduled" in line:
-                raise RuntimeError(
-                    "the no-progress log line is present but carries no attempt_count field; "
-                    "this scenario's oracle no longer matches the log site and cannot judge the build"
-                )
-            continue
-        at = _log_line_epoch(line, _tracing_fields(line))
-        if at is None:
-            raise RuntimeError(f"could not parse a timestamp out of an attempt line: {line[:200]}")
-        attempts.append(RecoveryAttempt(sandbox_id, int(count.group(1)), at))
-    attempts.sort(key=lambda a: a.at)
-    return attempts
 def _routing_value(value: str) -> str:
     if not re.fullmatch(r"[a-z][a-z0-9-]{0,30}", value):
         raise ValueError(f"refusing routing label value {value!r}")

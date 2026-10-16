@@ -24,7 +24,6 @@ from space_smoke.capabilities import (
     NodeSelectorExtrasControl,
     PendingBackupControl,
     OrphanedRestorePodGcControl,
-    QuarantineRecoveryControl,
     TemplateBuildControl,
     TemplateBuilder,
     RateLimiterControl,
@@ -102,7 +101,6 @@ from space_smoke.node_fence import NodeFenceAssertions
 from space_smoke.node_selector_extras import NodeSelectorExtrasAssertions
 from space_smoke.orphaned_restore_pod_gc import OrphanedRestorePodGcAssertions
 from space_smoke.pending_backup import PendingBackupAssertions
-from space_smoke.quarantine_recovery import QuarantineRecoveryAssertions
 from space_smoke.template_build import TemplateBuildAssertions
 from space_smoke.rate_limiters import RateLimiterAssertions
 from space_smoke.sandbox_network_isolation import SandboxNetworkIsolationAssertions
@@ -2777,23 +2775,6 @@ class KindEcw(Ecw):
                 self, self._pending_backup_control, self._context.scope
             )
         return self._pending_backup_assertions
-
-    _quarantine_recovery_control: QuarantineRecoveryControl | None = None
-    _quarantine_recovery_assertions: QuarantineRecoveryAssertions | None = None
-
-    @property
-    def quarantine_recovery(self) -> QuarantineRecoveryAssertions:
-        """Privileged assertions for the bounded quarantine recovery loop."""
-
-        if self._quarantine_recovery_control is None:
-            raise SmokeConfigurationError(
-                "quarantine recovery control is only available on the kind backend"
-            )
-        if self._quarantine_recovery_assertions is None:
-            self._quarantine_recovery_assertions = QuarantineRecoveryAssertions(
-                self, self._quarantine_recovery_control, self._context.scope
-            )
-        return self._quarantine_recovery_assertions
 
     _orphaned_restore_pod_gc_control: OrphanedRestorePodGcControl | None = None
     _orphaned_restore_pod_gc_assertions: OrphanedRestorePodGcAssertions | None = None

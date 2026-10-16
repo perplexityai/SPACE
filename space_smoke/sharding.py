@@ -61,7 +61,6 @@ _DURATION_SECONDS = {
         "local.private_template_build_isolation": 87,
         # Two episodes share passes: measured 255 s including initial
         # quarantine discovery and the real 60 s / 120 s retry gaps.
-        "local.quarantine_recovery_backs_off": 260,
         "local.rate_limiters_enforce_and_fail_open": 60,
         "local.retention_claim_finish_forward": 80,
         "local.retention_restore_source_guard": 107,

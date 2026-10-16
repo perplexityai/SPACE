@@ -4435,6 +4435,65 @@ fn quarantine_recovery_no_progress_remains_retryable_at_a_capped_rate() {
     );
 }
 
+/// The no-progress retry schedule is the recovery contract: 60 s, doubling per
+/// attempt, capped at 15 min, less at most a fifth of the delay as jitter. A
+/// halved base or a flat schedule leaves this window. The clock is the real one,
+/// so each retry is bracketed by reads taken either side of its write, and
+/// clearing the retry makes the next attempt due without waiting for it.
+#[test]
+fn quarantine_recovery_no_progress_schedules_the_capped_doubling_backoff() {
+    let conn = crate::db::test_conn();
+    let (sandbox_id, _) = setup_quarantine_recovery_candidate(&conn);
+
+    for (attempt, full_delay) in [(1, 60), (2, 120), (3, 240), (4, 480), (5, 900), (6, 900)] {
+        let [candidate] = scan_quarantine_recovery_candidates(&conn)
+            .unwrap()
+            .candidates
+            .try_into()
+            .unwrap();
+        let claimed =
+            claim_quarantine_recovery_candidate(&conn, &candidate, PlanRejectionRunEffect::Leaves)
+                .unwrap()
+                .expect("due episode should be claimable");
+        let before = now_epoch_i64().unwrap();
+        let outcome = record_quarantine_recovery_no_progress(
+            &conn,
+            &claimed,
+            QuarantineRecoveryNoProgressReason::PlanLookupTimedOut,
+        )
+        .unwrap();
+        let after = now_epoch_i64().unwrap();
+        let QuarantineRecoveryNoProgressOutcome::RetryScheduled {
+            attempt_count,
+            next_attempt_at,
+        } = outcome
+        else {
+            panic!("attempt {attempt}: the claim unexpectedly became stale");
+        };
+        assert_eq!(attempt_count, attempt);
+        let (_, _, stored, _, _) = quarantine_claim_state(&conn, sandbox_id);
+        assert_eq!(
+            stored,
+            Some(next_attempt_at.to_string()),
+            "attempt {attempt}: the stored retry is the one reported"
+        );
+        let min_delay = full_delay - full_delay / 5;
+        assert!(
+            next_attempt_at - before >= min_delay && next_attempt_at - after <= full_delay,
+            "attempt {attempt}: the retry must land {min_delay}..={full_delay}s after the \
+             write (written between {before} and {after}, scheduled {next_attempt_at})"
+        );
+
+        conn.execute(
+            "UPDATE sandbox_quarantine_state
+                SET next_action_after = NULL
+              WHERE sandbox_id = ?1",
+            params![sandbox_id.to_string()],
+        )
+        .unwrap();
+    }
+}
+
 /// Claim the episode's due candidate and record `reason` against the claim,
 /// as one recovery pass does: the claim carries the reason's effect on the run
 /// of plan rejections, and the no-progress write records the reason.

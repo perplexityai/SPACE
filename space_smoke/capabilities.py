@@ -626,52 +626,6 @@ class PendingBackupControl(Protocol):
     def artifact_backed(self, sandbox_id: str, local_artifact_id: str) -> bool: ...
 
 
-@dataclass(frozen=True)
-class RecoveryAttempt:
-    """One `RetryScheduled` no-progress record of the bounded quarantine recovery loop."""
-
-    sandbox_id: str
-    attempt: int
-    at: float
-    """Epoch seconds of the log line."""
-
-
-class QuarantineRecoveryControl(Protocol):
-    """Kind-only operations for the quarantine-recovery pacing scenario.
-
-    The fault is a planted `snapshots/.suspend-publish-*` staging directory under
-    a sandbox cache directory with no metadata row, on the worker running the
-    fixture sandbox; the observables are that worker's sandbox-manager log,
-    which lives and dies with its pod (hence the uid pin).
-    """
-
-    def sandbox_manager_for_sandbox(self, sandbox_id: str) -> tuple[str, str, str]:
-        """The sandbox's worker node, its sandbox-manager pod and that pod's uid."""
-        ...
-
-    def pod_uid(self, pod_name: str) -> str | None: ...
-
-    def plant_orphan_staging(self, node_name: str, sandbox_id: str) -> None: ...
-
-    def remove_orphan_sandbox(self, node_name: str, sandbox_id: str) -> None:
-        """`space-sbxmgr delete` the induced row, then remove its directory."""
-        ...
-
-    def orphan_absent(self, node_name: str, sandbox_id: str) -> bool: ...
-
-    def orphan_quarantined(self, pod_name: str, sandbox_id: str) -> bool:
-        """The log names the sandbox with reason `orphaned_sandbox_row_missing`."""
-        ...
-
-    def recovery_attempts(self, pod_name: str, sandbox_id: str) -> list[RecoveryAttempt]:
-        """`RetryScheduled` no-progress records for the sandbox, oldest first.
-
-        Raises when a `RetryScheduled` record carries no `attempt_count`: the
-        oracle no longer matches the log site and cannot judge the build.
-        """
-        ...
-
-
 class OrphanedRestorePodGcControl(Protocol):
     """Kind-only operations for the orphaned-restore-pod GC scenario.
 
@@ -781,6 +735,16 @@ class TemplateBuilder(Protocol):
 
 
 @dataclass(frozen=True)
+class TemplateBuildJob:
+    """The API's record of an accepted build: `template_build_jobs` for the alias."""
+
+    daemon_job_id: str
+    builder_node_id: str | None
+    builder_node: str | None
+    """The accepting builder's Kubernetes node, through `node_k8s`; `None` when unpinned."""
+
+
+@dataclass(frozen=True)
 class GuestMetadata:
     """What the published template says about its guest versus what its rootfs holds."""
 
@@ -794,8 +758,8 @@ class TemplateBuildControl(Protocol):
 
     The two builders' node-apis sit behind one Service; pinning it to one
     builder's node-api pod by a routing label is what makes the handoff
-    observable. A builder is named by its node: build-manager's log there says
-    whether it accepted the build, and artefact reads run in that node's
+    observable. A builder is named by its node: the API's build job row names
+    the builder that accepted the build, and artefact reads run in that node's
     operator shell.
     """
 
@@ -809,7 +773,9 @@ class TemplateBuildControl(Protocol):
 
     def clear_builder_service_route(self) -> None: ...
 
-    def builder_logged_alias(self, node_name: str, alias: str) -> bool: ...
+    def template_build_job(self, alias: str) -> TemplateBuildJob | None:
+        """The newest accepted build job for the alias; `None` until the API records one."""
+        ...
 
     def prepared_rootfs_handoff(self, node_name: str, *, window_seconds: int = 60) -> str | None:
         """None once the builder committed a prepared rootfs for its build; else, after

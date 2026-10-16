@@ -14,9 +14,10 @@ The scenario verifies three cross-service contracts:
    `builder_client_for_node`, which resolves the accepting builder's own
    node-api directly (`controllers/template.rs`,
    `substrate/kubernetes/adapter/substrate_adapter.rs`). The scenario submits
-   with the Service pinned to one builder, then, once a builder has accepted
-   the alias and committed the prepared rootfs, moves the Service to the
-   *other* builder for the rest of the build. A build that still completes
+   with the Service pinned to one builder, then, once the API has recorded
+   the accepting builder on the build's `template_build_jobs` row and that
+   builder has committed the prepared rootfs, moves the Service to the *other*
+   builder for the rest of the build. A build that still completes
    shows the polls did not depend on where the Service pointed, which is the
    owner-pinned routing working; `service_routed_to` records where the Service
    pointed, not who answered the polls (that is not observable from outside
@@ -53,6 +54,7 @@ from space_smoke.capabilities import (
     EcwSandbox,
     GuestMetadata,
     TemplateBuildControl,
+    TemplateBuildJob,
     TemplateBuildResult,
     TemplateBuilder,
     TemplateRecipe,
@@ -326,13 +328,10 @@ class TemplateBuildAssertions:
             critical=True,
         )
         deadline = time.monotonic() + accept_timeout
-        accepted: str | None = None
-        while accepted is None:
-            accepted = next(
-                (b for b in (submit, peer) if self._control.builder_logged_alias(b, self.alias)),
-                None,
-            )
-            if accepted is not None:
+        job: TemplateBuildJob | None = None
+        while job is None:
+            job = self._control.template_build_job(self.alias)
+            if job is not None:
                 break
             if not work.running:
                 # A build that already ended never reached a builder; join
@@ -346,6 +345,19 @@ class TemplateBuildAssertions:
                 alias=self.alias,
             )
             self._fixture.wait(0.5)
+        self._fixture.record("build_job_id", job.daemon_job_id)
+        self._fixture.record("builder_node_id", job.builder_node_id)
+        accepted = job.builder_node
+        # The API pins status polls to the builder it recorded; with none
+        # recorded the polls follow the Service and there is no handoff to prove.
+        self._fixture.verify(
+            accepted in (submit, peer),
+            "the accepted build job does not name one of the two builders",
+            builder_node_id=job.builder_node_id,
+            builder_node=accepted,
+            builder_nodes=[submit, peer],
+        )
+        assert accepted is not None
         # The Service pin is best effort: the API keeps its connections to the
         # builder Service alive across requests, so a build can land on the
         # builder a previous run left it talking to (bench 2026-09-23, once in

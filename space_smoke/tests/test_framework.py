@@ -148,7 +148,6 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "local.orphaned_restore_pod_gc_reaps_only_superseded",
                 "local.pending_backup_census_reports_blocked_upload",
                 "local.private_template_build_isolation",
-                "local.quarantine_recovery_backs_off",
                 "local.rate_limiters_enforce_and_fail_open",
                 "local.retention_claim_finish_forward",
                 "local.retention_restore_source_guard",
