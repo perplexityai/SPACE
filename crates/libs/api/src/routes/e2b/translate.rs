@@ -1,5 +1,7 @@
 use super::*;
-use pplx_space_common_core::types::{SandboxId, TemplateReference, TemplateSelector};
+use pplx_space_common_core::types::{
+    AutoLifecyclePolicy, SandboxId, TemplateReference, TemplateSelector,
+};
 use pplx_space_metrics::response::{ResponseKind, ResponseOrigin};
 use pplx_space_metrics::sandbox::api::{
     SandboxApiMetricIdentity, TemplateSelectorKind, TemplateSelectorRequest, TemplateTagShape,
@@ -813,15 +815,24 @@ pub(super) fn sandbox_end_at(sandbox: &Sandbox, native: &SandboxResponse) -> Off
         return next_auto_event_at;
     }
 
-    let timeout_secs = native
-        .auto_lifecycle
-        .as_ref()
-        .and_then(e2b_lifecycle_config_from_policy)
-        .or_else(|| e2b_lifecycle_config_from_policy(&sandbox.auto_lifecycle.0))
-        .map(|config| config.timeout_secs)
-        .unwrap_or(ECW_RESPONSE_DEFAULT_TIMEOUT_SECS);
+    let timeout_secs =
+        end_at_fallback_timeout_secs(native.auto_lifecycle.as_ref(), &sandbox.auto_lifecycle.0);
 
     sandbox_started_at(sandbox, native) + Duration::seconds(i64::from(timeout_secs))
+}
+
+/// How long after start ECW reports `endAt` when no lifecycle event is scheduled:
+/// the policy's earliest idle stage, which for an ECW policy is its timeout.
+pub(super) fn end_at_fallback_timeout_secs(
+    native: Option<&AutoLifecyclePolicy>,
+    stored: &AutoLifecyclePolicy,
+) -> u32 {
+    [native, Some(stored)]
+        .into_iter()
+        .flatten()
+        .find_map(|policy| policy.stages.iter().map(|stage| stage.at).min())
+        .map(|at| at.min(u64::from(u32::MAX)) as u32)
+        .unwrap_or(ECW_RESPONSE_DEFAULT_TIMEOUT_SECS)
 }
 
 pub(super) fn sandbox_metadata(sandbox: &Sandbox, native: &SandboxResponse) -> StringMap {

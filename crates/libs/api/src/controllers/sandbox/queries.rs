@@ -318,17 +318,17 @@ fn create_template_reference(req: &CreateSandboxRequest) -> TemplateReference {
 }
 
 /// The auto-lifecycle policy a create runs with: the request's, or the
-/// resolved template's default.
+/// resolved template's default, as [`resolve_create_auto_lifecycle`] decides.
 fn effective_create_auto_lifecycle(
     req: &CreateSandboxRequest,
+    origin: RequestAutoLifecycleOrigin,
     resolved_template: &ResolvedCreateTemplate,
 ) -> Result<AutoLifecyclePolicy, ControllerError> {
-    match req.auto_lifecycle.as_ref() {
-        Some(policy) => create_auto_lifecycle_policy(Some(policy.clone())),
-        None => {
-            create_auto_lifecycle_policy(Some(resolved_template.default_auto_lifecycle.clone()))
-        }
-    }
+    resolve_create_auto_lifecycle(
+        req.auto_lifecycle.as_ref(),
+        origin,
+        &resolved_template.default_auto_lifecycle,
+    )
 }
 
 fn create_runtime_from_request(
@@ -897,6 +897,9 @@ struct SandboxCreateExecutionMode<'a> {
     restore_from: Option<crate::controllers::substrate::SnapshotRef<'a>>,
     restore_operation_id: Option<OperationId>,
     restore_lease_seconds: u32,
+    /// Whether `req.auto_lifecycle` is the caller's choice or one the ECW
+    /// create boundary synthesized from a request timeout.
+    auto_lifecycle_origin: RequestAutoLifecycleOrigin,
 }
 
 fn pool_attempt_resources(pool_shape: Option<PooledExecutionPoolShape>) -> SandboxResources {
@@ -969,6 +972,7 @@ impl SandboxController {
         pool: &PgPool,
         actor: &User,
         req: &CreateSandboxRequest,
+        auto_lifecycle_origin: RequestAutoLifecycleOrigin,
         metric_identity: SandboxApiMetricIdentity,
         federated: FederatedSandboxCreateContext<'_>,
     ) -> Result<SandboxResponse, ControllerError> {
@@ -985,6 +989,7 @@ impl SandboxController {
                 restore_from: None,
                 restore_operation_id: None,
                 restore_lease_seconds: 0,
+                auto_lifecycle_origin,
             },
         )
         .await
@@ -1012,6 +1017,7 @@ impl SandboxController {
                 restore_from: None,
                 restore_operation_id: None,
                 restore_lease_seconds: 0,
+                auto_lifecycle_origin: RequestAutoLifecycleOrigin::Explicit,
             },
         )
         .await
@@ -1048,6 +1054,7 @@ impl SandboxController {
                 restore_from: None,
                 restore_operation_id: None,
                 restore_lease_seconds: 0,
+                auto_lifecycle_origin: RequestAutoLifecycleOrigin::Explicit,
             },
         )
         .await
@@ -1113,7 +1120,11 @@ impl SandboxController {
         else {
             return AdmissionPoolPlan::TemplateMiss;
         };
-        let Ok(auto_lifecycle) = effective_create_auto_lifecycle(req, &resolved_template) else {
+        let Ok(auto_lifecycle) = effective_create_auto_lifecycle(
+            req,
+            RequestAutoLifecycleOrigin::Explicit,
+            &resolved_template,
+        ) else {
             return AdmissionPoolPlan::Ineligible;
         };
         if !self.admitted_pool_adoption_eligible(req, &auto_lifecycle, boot_mode, backend) {
@@ -1158,6 +1169,7 @@ impl SandboxController {
                 restore_from: Some(restore.snapshot),
                 restore_operation_id: Some(restore.operation_id),
                 restore_lease_seconds: restore.restore_lease_seconds,
+                auto_lifecycle_origin: RequestAutoLifecycleOrigin::Explicit,
             },
         )
         .await
@@ -1183,6 +1195,7 @@ impl SandboxController {
             restore_from,
             restore_operation_id,
             restore_lease_seconds,
+            auto_lifecycle_origin,
         } = mode;
         let egress_profiles = if let Some(selected) = federated.egress_profiles {
             selected.clone()
@@ -1236,7 +1249,8 @@ impl SandboxController {
             claim_duration_nanos: Arc::clone(&create_path_claim_duration_nanos),
             request_succeeded: false,
         };
-        let auto_lifecycle = effective_create_auto_lifecycle(req, &resolved_template)?;
+        let auto_lifecycle =
+            effective_create_auto_lifecycle(req, auto_lifecycle_origin, &resolved_template)?;
         let template_network_policy = resolved_template.default_network_policy;
         // Fork restoration reuses the source's saved effective policy. Re-resolving
         // names here would add new destinations without removing old profile allows.

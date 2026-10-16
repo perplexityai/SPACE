@@ -88,6 +88,8 @@ pub(super) fn observed_access_idle_generation(
 pub(crate) enum AccessIdleTimeoutOutcome {
     StoredOnly,
     Applied,
+    /// The stored policy isn't ECW-managed, so the timeout left it and the runtime untouched.
+    Unmanaged,
 }
 
 enum DeadlineExecutionReadiness {
@@ -668,6 +670,9 @@ impl SandboxController {
                 return Err(
                     tonic::Status::failed_precondition("sandbox lifecycle policy changed").into(),
                 );
+            }
+            if !crate::e2b::is_ecw_managed(&current_policy) {
+                return Ok(AccessIdleTimeoutOutcome::Unmanaged);
             }
             let policy =
                 crate::e2b::policy_for_timeout_update(&current_policy, timeout_secs).normalized();

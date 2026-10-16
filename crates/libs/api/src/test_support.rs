@@ -72,3 +72,30 @@ pub(crate) fn enabled_config() -> ClusterSandboxAdmissionConfig {
         redis_url: None,
     }
 }
+
+/// A single-stage `CommandIdle + Suspend` policy, as a template default would set.
+/// Command submission resets its idle clock; access keepalives don't.
+pub(crate) fn command_idle_suspend_policy(
+    timeout_secs: u64,
+) -> pplx_space_common_core::types::AutoLifecyclePolicy {
+    use pplx_space_common_core::types::{
+        AutoLifecycleConditionSet, AutoLifecycleConditionSetId, AutoLifecycleIdleAction,
+        AutoLifecyclePolicy, AutoLifecycleStage, AutoLifecycleWakePolicy, AutoLifecycleWakeSource,
+    };
+
+    AutoLifecyclePolicy {
+        wake: AutoLifecycleWakePolicy {
+            on: vec![AutoLifecycleWakeSource::Command],
+        },
+        condition_sets: std::collections::BTreeMap::from([(
+            AutoLifecycleConditionSetId::CommandIdle,
+            AutoLifecycleConditionSet::command_idle(),
+        )]),
+        stages: vec![AutoLifecycleStage {
+            condition_set: AutoLifecycleConditionSetId::CommandIdle,
+            at: timeout_secs,
+            action: AutoLifecycleIdleAction::Suspend,
+        }],
+    }
+    .normalized()
+}

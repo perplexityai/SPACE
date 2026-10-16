@@ -1573,10 +1573,14 @@ fn create_request(
         memory_mib: config.memory_mib,
         disk_mib: config.disk_mib,
         file_changes: None,
-        auto_lifecycle: Some(crate::e2b::policy_for_timeout_update(
-            &config.auto_lifecycle,
-            requested_timeout.get(),
-        )),
+        // The fork timeout reshapes only an ECW-managed source policy. Any other
+        // (such as a CommandIdle template default) carries over, so the child keeps
+        // its idle clock and action instead of becoming an access-idle delete.
+        auto_lifecycle: Some(if crate::e2b::is_ecw_managed(&config.auto_lifecycle) {
+            crate::e2b::policy_for_timeout_update(&config.auto_lifecycle, requested_timeout.get())
+        } else {
+            config.auto_lifecycle.clone()
+        }),
         wait_until_ready: true,
         network_policy: config.network_policy.clone(),
         node_pool: None,

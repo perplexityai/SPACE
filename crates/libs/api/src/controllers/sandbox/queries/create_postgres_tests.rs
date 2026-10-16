@@ -1527,6 +1527,7 @@ async fn postgres_cold_federated_create_is_atomic_with_grant_upsert() -> TestRes
             &db.pool,
             &actor,
             &req,
+            crate::controllers::sandbox::RequestAutoLifecycleOrigin::Explicit,
             SandboxApiMetricIdentity::native("create"),
             FederatedSandboxCreateContext::new(
                 Some(&federated_owner),
@@ -1582,6 +1583,7 @@ async fn postgres_federated_create_denies_api_key_org_specific_template() -> Tes
             &db.pool,
             &actor,
             &req,
+            crate::controllers::sandbox::RequestAutoLifecycleOrigin::Explicit,
             SandboxApiMetricIdentity::native("create"),
             FederatedSandboxCreateContext::new(
                 Some(&federated_owner),
@@ -1631,6 +1633,7 @@ async fn postgres_federated_create_allows_mapped_org_specific_template() -> Test
             &db.pool,
             &actor,
             &req,
+            crate::controllers::sandbox::RequestAutoLifecycleOrigin::Explicit,
             SandboxApiMetricIdentity::native("create"),
             FederatedSandboxCreateContext::new(
                 Some(&federated_owner),
