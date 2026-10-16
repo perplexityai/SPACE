@@ -68,6 +68,50 @@ def record(directory: Path) -> None:
     )
 
 
+def artifact_attempt(prefix: str, revision: str, current: int, deadline: float) -> int:
+    """The newest attempt in this run that uploaded the producer image."""
+
+    for attempt in range(current, 0, -1):
+        name = f"kind-rust-{revision}-{attempt}"
+        for lookup in range(3):
+            result = subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    "--paginate",
+                    "--slurp",
+                    f"{prefix}/artifacts?name={name}&per_page=100",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if not result.returncode:
+                break
+            # Never echo a remote error body or authentication diagnostics.
+            if lookup == 2 or any(
+                status in result.stderr for status in ("HTTP 401", "HTTP 403")
+            ):
+                raise RuntimeError(
+                    "cannot read Rust producer artifacts; Actions read access is required"
+                )
+            print(
+                "Retrying producer artifact lookup after a transport failure",
+                flush=True,
+            )
+            time.sleep(min(5, max(0, deadline - time.monotonic())))
+        if any(
+            artifact["name"] == name and not artifact["expired"]
+            for page in json.loads(result.stdout)
+            for artifact in page["artifacts"]
+        ):
+            return attempt
+    raise RuntimeError(
+        "Rust producer succeeded but no attempt in this run uploaded its image"
+    )
+
+
 def wait(timeout: int) -> None:
     identity = context()
     prefix = f"repos/{identity['repository']}/actions/runs/{identity['run_id']}"
@@ -131,14 +175,13 @@ def wait(timeout: int) -> None:
                 raise RuntimeError(
                     "Rust producer did not succeed; refusing local compilation fallback"
                 )
-            # Some rerun responses retain successful jobs from an older
-            # attempt. Use the job's actual producer attempt, not the query's.
-            producer_attempt = jobs[0]["run_attempt"]
-            if (
-                not isinstance(producer_attempt, int)
-                or not 1 <= producer_attempt <= attempt
-            ):
-                raise ValueError("invalid producer job attempt")
+            # A failed-jobs-only rerun carries the successful producer into
+            # the new attempt and reports it with the new `run_attempt`, but
+            # its upload stays named for the attempt that actually ran. The
+            # upload is the handoff, so select the attempt from it.
+            producer_attempt = artifact_attempt(
+                prefix, identity["source_sha"], current_attempt, deadline
+            )
             with Path(os.environ["GITHUB_ENV"]).open("a") as output:
                 output.write(f"SPACE_KIND_RUST_PRODUCER_ATTEMPT={producer_attempt}\n")
             print(
