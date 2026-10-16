@@ -63,9 +63,9 @@ _DURATION_SECONDS = {
         # quarantine discovery and the real 60 s / 120 s retry gaps.
         "local.quarantine_recovery_backs_off": 260,
         "local.rate_limiters_enforce_and_fail_open": 60,
-        # Estimate until a bench run refreshes it: one suspend with a retried
-        # upload of a 64 MiB payload, then a cross-node restore.
-        "local.restarted_btrfs_send_is_rejected_and_retried": 150,
+        # One Kind run: 16 s of phases (8.5 s suspend with the retried upload)
+        # plus sandbox cleanup.
+        "local.restarted_btrfs_send_is_rejected_and_retried": 30,
         "local.retention_claim_finish_forward": 80,
         "local.retention_restore_source_guard": 107,
         "local.snapshot_reaper_reclaims_backed_fork_snapshot": 147,
