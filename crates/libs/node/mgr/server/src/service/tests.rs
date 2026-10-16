@@ -636,6 +636,7 @@ pub(super) mod service_tests {
             pool: NetworkPool::open_in_memory_for_test(NetworkPoolConfig::new(1)),
             peer_authorizer: node_peer_authorizer(),
             sandbox_cgroup_config: SandboxCgroupConfig::default(),
+            disk_io_ceiling: Default::default(),
             memory_admission_config: MemoryAdmissionConfig::default(),
             memory_admission_sources: MemoryAdmissionSources::new(
                 vacant.join("meminfo"),

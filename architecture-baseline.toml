@@ -132,7 +132,6 @@
 "crates/apps/local/node-mgr/svc/src/snapshot.rs" = 2
 "crates/libs/build/mgr/src/lib.rs" = 1
 # Network configuration and process-snapshot payloads are not rootfs images.
-"crates/libs/node/mgr/server/src/service/launch_prepare.rs" = 1
 "crates/libs/sbx/mgr/server/src/service/grpc_spaced_process_snapshots.rs" = 1
 # Non-Linux fallbacks; Linux paths use common-io's reflink helper.
 "crates/libs/node/runtime/core/src/lib.rs" = 2

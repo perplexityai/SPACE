@@ -589,6 +589,8 @@ impl NodeManagerService {
             .rootfs_rate_limit
             .as_ref()
             .map(drive_rate_limiter)
+            .transpose()?
+            .map(|limiter| self.disk_io_ceiling.clamp_limiter(limiter))
             .transpose()?;
         let jail_root = format!("{JAIL_DIR}/firecracker/{}/root", req.sandbox_id);
         let _lifecycle_permit = self
@@ -742,6 +744,14 @@ impl NodeManagerService {
                 .await;
             return Err(status);
         }
+        // The snapshot's limiter and the saved assignment may both exceed
+        // this worker's operator ceiling. Enforce it before adopting/resuming.
+        self.disk_io_ceiling
+            .enforce_before_adoption(&client, |status| async move {
+                self.rollback_loaded_snapshot(sandbox_id, "rootfs IOPS ceiling", &status)
+                    .await;
+            })
+            .await?;
         self.adopt_validated_lease(sandbox_id, lease)?;
 
         // Fix v.sock permissions so sbx-manager can connect for health checks.

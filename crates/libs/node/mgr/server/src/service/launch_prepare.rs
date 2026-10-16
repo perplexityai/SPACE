@@ -348,6 +348,12 @@ impl NodeManagerService {
                 .map_err(|error| {
                     Status::unavailable(format!("persist existing VM pid: {error}"))
                 })?;
+            // Reusing a pre-existing runtime bypasses cold-boot configuration.
+            // Keep its PID discoverable by the sweep even if verification fails.
+            let client = crate::fc_api::FcApiClient::new(format!("{jail_root}/firecracker.sock"));
+            self.disk_io_ceiling
+                .enforce_launch_adoption(&client, req.snapshot_restore)
+                .await?;
             return Ok(Response::new(LaunchSandboxResponse {
                 pid: pid.get().get(),
                 api_socket_path: format!("{jail_root}/firecracker.sock"),
@@ -439,8 +445,11 @@ impl NodeManagerService {
         if !req.snapshot_restore {
             let config_src = format!("{RUN_DIR}/{sandbox_id}/vm-config.json");
             let config_dst = format!("{jail_root}/vm-config.json");
+            let ceiling = self.disk_io_ceiling;
             spawn_lifecycle_blocking(&_lifecycle_permit, move || {
-                std::fs::copy(&config_src, &config_dst)
+                ceiling
+                    .stage_cold_boot_config(Path::new(&config_src), Path::new(&config_dst))
+                    .map_err(std::io::Error::other)
             })
             .await
             .map_err(|e| Status::internal(format!("copy config task failed: {e}")))?

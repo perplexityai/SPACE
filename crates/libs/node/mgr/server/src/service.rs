@@ -208,6 +208,7 @@ pub struct NodeManagerService {
     disk_admission: std::sync::Arc<DiskAdmission>,
     prepared_rootfs_reservations: prepared_rootfs::PreparedRootfsReservations,
     disk_usage_cache: node_disk_metrics::SandboxDiskUsageCache,
+    disk_io_ceiling: disk_io_ceiling::DiskIoCeiling,
     cleanup_operations: cleanup_inspect::CleanupOperationRegistry,
     orphan_inventory: orphan_inventory::OrphanInventory,
     snapshot_inventory: snapshot_inventory::SnapshotInventory,
@@ -391,6 +392,7 @@ impl NodeManagerService {
             disk_admission,
             prepared_rootfs_reservations,
             disk_usage_cache: node_disk_metrics::SandboxDiskUsageCache::default(),
+            disk_io_ceiling: disk_io_ceiling::DiskIoCeiling::default(),
             cleanup_operations: cleanup_inspect::CleanupOperationRegistry::new(task_tracker),
             orphan_inventory: orphan_inventory::OrphanInventory::default(),
             snapshot_inventory: snapshot_inventory::SnapshotInventory::default(),
@@ -684,6 +686,7 @@ mod cleanup_helpers;
 mod cleanup_inspect;
 mod control;
 mod disk;
+pub(crate) mod disk_io_ceiling;
 mod encrypted_volumes;
 mod endpoint_attestation;
 mod execution_fence;

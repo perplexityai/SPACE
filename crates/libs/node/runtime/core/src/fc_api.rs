@@ -143,6 +143,29 @@ impl FcApiClient {
             .await
     }
 
+    /// Read the effective device configuration, including installed bucket sizes.
+    pub async fn configuration(&self) -> Result<serde_json::Value, FcApiError> {
+        self.get_json("/vm/config").await
+    }
+
+    /// Replace only the operations bucket; preserve the drive's bandwidth bucket.
+    pub async fn update_drive_operations(
+        &self,
+        drive_id: &str,
+        operations: TokenBucket,
+    ) -> Result<(), FcApiError> {
+        self.request(
+            "PATCH",
+            &format!("/drives/{drive_id}"),
+            &serde_json::json!({"drive_id": drive_id, "rate_limiter": {"ops": {
+                "size": operations.size,
+                "refill_time": operations.refill_time_ms,
+                "one_time_burst": 0
+            }}}),
+        )
+        .await
+    }
+
     /// Query the VM state.
     pub async fn get_vm_state(&self) -> Result<FirecrackerVmState, FcApiError> {
         let v = self.get_json("/").await?;

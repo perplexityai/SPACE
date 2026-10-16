@@ -241,6 +241,13 @@ spec:
           env:
             {{- include "space-node-service.env.identity" . | nindent 12 }}
             {{- include "space-node-service.env.diskAdmission" . | nindent 12 }}
+            {{- if ne (toString .Values.diskIoMaxOperationsPerSec) "" }}
+            {{- if not (regexMatch "^[1-9][0-9]*$" (toString .Values.diskIoMaxOperationsPerSec)) }}
+            {{- fail "diskIoMaxOperationsPerSec must be a positive integer or empty" }}
+            {{- end }}
+            - name: SPACE_NODEMGR_DISK_IO_MAX_OPERATIONS_PER_SEC
+              value: {{ .Values.diskIoMaxOperationsPerSec | quote }}
+            {{- end }}
             # The node image stages a protected copy of the developer-owned
             # vendor downloads on this hostPath before kubelet starts.
             - name: SPACE_FIRECRACKER_VENDOR_DIR

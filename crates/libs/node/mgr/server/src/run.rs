@@ -118,6 +118,8 @@ pub struct NodeMgrRunConfig {
 /// variable, or value that was misread.
 #[derive(Debug, thiserror::Error)]
 pub enum RunNodeMgrError {
+    #[error(transparent)]
+    DiskIoCeiling(#[from] crate::service::disk_io_ceiling::InvalidCeiling),
     #[error("failed to read node config {path}: {source}")]
     ReadConfig {
         path: PathBuf,
@@ -577,6 +579,11 @@ pub async fn run(
     let mut disk_io_reservation_config =
         resolve_disk_io_reservation_config(file.disk_io_reservation)?;
     let service_settings = crate::config::ServiceSettings::from_env();
+    let disk_io_ceiling = crate::service::disk_io_ceiling::DiskIoCeiling::from_env()?;
+    tracing::info!(
+        maximum_iops = disk_io_ceiling.configured(),
+        "operator rootfs disk IOPS ceiling resolved; unset leaves assignments unchanged"
+    );
     let disk_metrics_config = crate::service::node_disk_metrics::NodeDiskMetricsConfig::default();
     let cgroup_reclaim_interval = crate::service::cgroup_reclaim::RECLAIM_INTERVAL;
     let btrfs_balance_enabled = crate::service::btrfs_balance::enabled_from_env();
@@ -762,7 +769,7 @@ pub async fn run(
             service_mutex.clone(),
         )
         .await {
-            Ok(service) => service,
+            Ok(service) => service.with_disk_io_ceiling(disk_io_ceiling),
             Err(crate::slot_pool::PoolOpenError::StartupCancelled) => return Ok(()),
             Err(error) => return Err(RunNodeMgrError::NodeManagerService(error)),
         };
@@ -839,6 +846,7 @@ pub async fn run(
             .disk_admission()
             .start_refresh_loop(shutdown_token.child_token(), &task_tracker);
         service.start_prepared_rootfs_reaper(shutdown_token.child_token(), &task_tracker);
+        service.start_disk_io_ceiling_reconciler(shutdown_token.child_token(), &task_tracker);
         crate::service::cgroup_reclaim::start_orphan_cgroup_reclaim(
             service.pool(),
             cgroup_reclaim_interval,

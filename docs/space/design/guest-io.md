@@ -59,6 +59,71 @@ make a dense node fair: at hundreds of sandboxes each one's fair share is far
 below its limit. That takes a host-level backstop, such as cgroup I/O
 weights, which SPACE does not configure.
 
+## Operator ceiling
+
+Node-manager accepts `SPACE_NODEMGR_DISK_IO_MAX_OPERATIONS_PER_SEC`, a positive
+integer maximum for each VM's root-drive operations/s. Unset means no operator
+ceiling; the assigned default remains 10,000 operations/s. For example, setting
+it to `1000` bounds a 10,000 operations/s assignment at 1,000 while leaving a
+500 operations/s assignment unchanged. Bandwidth and additional drives are
+unchanged. The ceiling also covers builder VMs on nodes where it is configured.
+An empty, zero, malformed or out-of-range value prevents node-manager startup.
+To leave builds exempt, configure worker node-manager workloads rather than
+shared worker/builder values.
+
+The value is read at startup. Apply it to every affected node-manager and
+restart those services; running VMs need not be restarted. Cold boots receive
+the ceiling in their jail configuration. Configuration is published through a
+pinned source and temporary-file rename, with no file or directory fsync,
+whether or not a ceiling is set. The unset case preserves the original bytes.
+Snapshot loads clamp the saved assignment before applying it, then verify the
+loaded drive before adoption or resume. Reusing an existing cold-boot VM also
+verifies the ceiling before returning its launch response. An idle restore
+launch skips that check until `LoadSnapshot` installs the drives. The sweep
+keeps a VM with no drives pending, without a failure or a verified-cache entry.
+A background sweep also lowers running VMs, starting immediately and
+repeating every ten seconds, with at most four targets in flight and a
+two-second deadline per target. Once verified, a VM is skipped until its
+sandbox identity, slot, generation or PID changes; departed entries are
+pruned on the next successful inventory. Discovery continues, but verified
+VMs cause no lifecycle-lock or Firecracker API traffic. Busy or unreachable
+targets log a warning and retry on later sweeps. A VM that never answers can
+remain above the ceiling indefinitely: enforcement of existing VMs is best
+effort and does not stop them or block node readiness. An old node-manager
+does not enforce this setting.
+
+Node metrics under `space.node_disk.io_ceiling` report `enabled`,
+`maximum_iops`, `verified_vms`, `pending_vms`, `inventory_success` and
+`last_inventory_timestamp_seconds`. Pending includes idle restore VMs and
+failed, busy or superseded targets: it means unverified, not known
+above-limit, and can be nonzero during normal restores. Only interpret
+counts with a successful, fresh inventory. The `updates` counter counts
+sweep-applied changes; `update_failures` counts failed sweep attempts with a
+bounded `timeout` tag, and `inventory_failures` counts discovery errors.
+Inventory errors emit `inventory_success=0` without resending counts or
+their timestamp; consumers must not assume retained samples. Treat counts as
+unavailable until a successful inventory. For individual confirmation,
+inspect Firecracker's `GET /vm/config`; node-manager logs identify failed
+targets. Configuration gauges are refreshed every ten seconds, including on
+disabled nodes; disabled nodes perform no VM inventory or Firecracker API
+checks.
+
+Reducing the operations rate retains the installed refill interval and reduces
+its token budget proportionally, including burst credit. A missing or disabled
+limiter receives a 30-second bucket. Unchanged buckets are not patched, so
+reconciliation does not repeatedly replenish their credit.
+
+This is a lowering control: raising or removing the ceiling does not raise an
+already-lowered running VM's allowance. Its next normal start or restore uses
+the saved assignment, subject to the receiving node's ceiling. Saved sandbox
+limits, warm-pool policies, pool configurations and API-reported assignments
+are unchanged, so changing the ceiling does not invalidate warm slots. The
+operator ceiling is separate from admission ceilings and aggregate host I/O
+controls; it does not reserve management capacity or bound combined host load.
+
+The Kind node-manager chart exposes the setting as
+`diskIoMaxOperationsPerSec`, empty by default.
+
 ## Uploads
 
 Uploads reach the guest's filesystem service as a stream of frames on a gRPC

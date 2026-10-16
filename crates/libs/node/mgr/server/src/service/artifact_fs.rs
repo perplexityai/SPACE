@@ -54,6 +54,29 @@ pub(super) fn write_atomic_at(
     name: &OsStr,
     write: impl FnOnce(&File) -> Result<(), Status>,
 ) -> Result<File, Status> {
+    write_atomic_at_with_durability(parent, name, write, Durability::Durable)
+}
+
+/// Rebuilt before launch; atomic visibility is required, crash durability is not.
+pub(super) fn write_ephemeral_atomic(
+    path: &Path,
+    write: impl FnOnce(&File) -> Result<(), Status>,
+) -> Result<File, Status> {
+    let (parent, name) = parent(path)?;
+    write_atomic_at_with_durability(&parent, name, write, Durability::Ephemeral)
+}
+
+enum Durability {
+    Durable,
+    Ephemeral,
+}
+
+fn write_atomic_at_with_durability(
+    parent: &File,
+    name: &OsStr,
+    write: impl FnOnce(&File) -> Result<(), Status>,
+    durability: Durability,
+) -> Result<File, Status> {
     let temporary = format!(".artifact-{}.tmp", uuid::Uuid::now_v7());
     let output = File::from(
         openat(
@@ -66,9 +89,14 @@ pub(super) fn write_atomic_at(
     );
     let result = (|| {
         write(&output)?;
-        output.sync_all().map_err(error)?;
+        if matches!(durability, Durability::Durable) {
+            output.sync_all().map_err(error)?;
+        }
         nix::fcntl::renameat(parent, temporary.as_str(), parent, name).map_err(error)?;
-        parent.sync_all().map_err(error)
+        if matches!(durability, Durability::Durable) {
+            parent.sync_all().map_err(error)?;
+        }
+        Ok(())
     })();
     if let Err(error) = result {
         let _ = unlinkat(parent, temporary.as_str(), UnlinkatFlags::NoRemoveDir);
