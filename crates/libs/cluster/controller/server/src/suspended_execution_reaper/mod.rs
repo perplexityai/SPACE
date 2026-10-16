@@ -12,18 +12,23 @@
 //! `placement = 'unplaced', active_node_id = NULL`
 //! (leaving `target_node_id` pinned as the local-snapshot affinity hint).
 //!
-//! The node-side idle auto-suspend path performs none of that bookkeeping:
-//! the node suspends the VM locally and publishes `status = 'suspended'`,
-//! and the internal API's published-state convergence promotes
-//! `sandboxes.lifecycle` to `'suspended'` — and stops there. The execution
-//! row stays `active = TRUE, state = 'running'` with a recorded pod IP,
-//! the sandbox stays `placement = 'on_node'` with `active_node_id` set,
-//! and the pod's container exits (`Succeeded`) and is later deleted by pod
-//! cleanup. The control plane is left claiming a live execution on a pod
-//! that no longer exists, indefinitely. The stale bookkeeping feeds the
-//! wake/reattach path a long-dead pod name and stale pod IP, and makes
-//! forensics/operator queries keyed on `active_node_id` see thousands of
-//! "active" sandboxes pinned to long-gone nodes.
+//! Node-side idle auto-suspend reaches the same end state through internal
+//! API's suspended projections, which retire the active execution in the
+//! statement that moves the row to `suspended`. A row can still be left
+//! `suspended` with an active execution by a writer that doesn't do that
+//! bookkeeping, and nothing else revisits a dormant row. Its pod's container
+//! exits (`Succeeded`) and is later deleted by pod cleanup, while the control
+//! plane keeps claiming a live execution on a pod that no longer exists. The
+//! stale bookkeeping feeds the wake/reattach path a long-dead pod name and
+//! stale pod IP, and makes forensics/operator queries keyed on
+//! `active_node_id` see "active" sandboxes pinned to long-gone nodes.
+//!
+//! A *present* pod on such a row is out of scope. A same-generation restore
+//! pod there may be an abandoned restore's leftover or a live sandbox a racing
+//! suspend write put back to `suspended`, and only the latter's pod holds the
+//! sandbox's state. The restore reverts record abandonment durably instead, by
+//! retiring their claim's execution as `replaced`, which leaves the pod to the
+//! orphaned-restore-pod GC.
 //!
 //! ## Safety contract with the wake path
 //!

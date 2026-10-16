@@ -28,10 +28,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use pplx_space_api::controllers::substrate::Substrate;
 use pplx_space_api::controllers::substrate::direct::DirectSubstrate;
+use pplx_space_api::controllers::substrate::{
+    PodIdentityFence, RecordedExecution, RetireFence, Substrate,
+};
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{NodeId, PositiveDuration, SandboxId, SandboxLifecycle};
+use pplx_space_common_core::types::{
+    NodeId, PodName, PodUid, PositiveDuration, SandboxActivationAttemptId, SandboxId,
+    SandboxLifecycle,
+};
 use pplx_space_db_test_fixtures::{pg_test_db, pg_test_db_with_max_connections};
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
@@ -39,7 +44,8 @@ use sqlx::PgPool;
 use super::{SWEEPABLE_LIFECYCLES, SubstrateSweepSink, SweepSink};
 use crate::lifecycle_writer_test_support::{
     ExecutionSeed, SandboxSeed, bounded, insert_execution, insert_sandbox, insert_snapshot,
-    pin_local_artifact, single_backend_pool, stored_lifecycles, wait_until_blocked,
+    pin_local_artifact, pod_name, pod_uid, single_backend_pool, stored_lifecycles,
+    wait_until_blocked,
 };
 
 fn age() -> PositiveDuration {
@@ -523,7 +529,12 @@ async fn revert_cas_moves_only_restoring_rows() -> TestResult {
         insert_snapshot(pool, sandbox_id, "ready", -60).await?;
 
         let claimed = sink
-            .revert_to_suspended(sandbox_id, SandboxLifecycle::Restoring, age())
+            .revert_to_suspended(
+                sandbox_id,
+                SandboxLifecycle::Restoring,
+                age(),
+                &RetireFence::NoExecution,
+            )
             .await?
             .is_some();
 
@@ -564,7 +575,12 @@ async fn revert_cas_moves_only_restoring_rows() -> TestResult {
             .await?;
         }
         let claimed = sink
-            .revert_to_suspended(sandbox_id, SandboxLifecycle::Restoring, age())
+            .revert_to_suspended(
+                sandbox_id,
+                SandboxLifecycle::Restoring,
+                age(),
+                &RetireFence::NoExecution,
+            )
             .await?;
         assert!(claimed.is_none(), "{case}");
         assert_eq!(
@@ -573,6 +589,137 @@ async fn revert_cas_moves_only_restoring_rows() -> TestResult {
             "{case}"
         );
     }
+    Ok(())
+}
+
+/// The revert CAS retires the restore's execution as `replaced` in its own
+/// transaction, and claims nothing unless the execution still matches every
+/// part of the identity the candidate select recorded: a revert that can't
+/// record the abandonment on the right execution would strand that execution
+/// active on a `suspended` row. A candidate observed with no execution reverts
+/// only while none exists, and one that observed nothing never reverts.
+///
+/// The execution row sits under the direct sink's `space` row (see the
+/// module doc): the retirement matches the execution by sandbox and identity,
+/// whatever substrate labels the row.
+#[tokio::test(flavor = "current_thread")]
+async fn revert_cas_retires_only_the_observed_execution() -> TestResult {
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+    let sink = direct_sink(pool);
+
+    let observed = |sandbox_id: SandboxId| {
+        PodIdentityFence::new(PodName::parse(pod_name(sandbox_id, 1)).expect("pod name"))
+            .with_recorded(RecordedExecution::Read {
+                pod_uid: Some(PodUid::parse(pod_uid(sandbox_id, 1)).expect("pod uid")),
+                route_activation_id: None,
+            })
+            .with_generation(1)
+    };
+    struct Case {
+        name: &'static str,
+        retires: bool,
+        fence: fn(PodIdentityFence) -> RetireFence,
+        /// Whether the execution row records its pod UID. One that records
+        /// none is what only the unread-fence refusal can tell apart.
+        records_pod_uid: bool,
+    }
+    fn case(name: &'static str, retires: bool, fence: fn(PodIdentityFence) -> RetireFence) -> Case {
+        Case {
+            name,
+            retires,
+            fence,
+            records_pod_uid: true,
+        }
+    }
+    let cases = [
+        case("the observed execution", true, RetireFence::Pod),
+        case("another generation", false, |fence| {
+            RetireFence::Pod(fence.with_generation(2))
+        }),
+        case("another pod", false, |fence| {
+            let mut fence = fence;
+            fence.pod_name = PodName::parse("space-sbx-elsewhere-g1").expect("pod name");
+            RetireFence::Pod(fence)
+        }),
+        case("another pod uid", false, |fence| {
+            RetireFence::Pod(fence.with_recorded(RecordedExecution::Read {
+                pod_uid: Some(PodUid::parse("uid-of-a-replacement").expect("pod uid")),
+                route_activation_id: None,
+            }))
+        }),
+        case("another activation attempt", false, |fence| {
+            RetireFence::Pod(fence.with_activation_attempt(SandboxActivationAttemptId::new()))
+        }),
+        case("another route activation", false, |fence| {
+            let pod_uid = fence.recorded.pod_uid().cloned();
+            RetireFence::Pod(fence.with_recorded(RecordedExecution::Read {
+                pod_uid,
+                route_activation_id: Some(SandboxActivationAttemptId::new()),
+            }))
+        }),
+        Case {
+            records_pod_uid: false,
+            ..case("an unread row", false, |fence| {
+                RetireFence::Pod(fence.with_recorded(RecordedExecution::Unread))
+            })
+        },
+        case("no execution observed", false, |_| RetireFence::NoExecution),
+        case("nothing observed", false, |_| RetireFence::Unobserved),
+    ];
+
+    let mut mismatches = Vec::new();
+    for Case {
+        name,
+        retires,
+        fence,
+        records_pod_uid,
+    } in cases
+    {
+        let sandbox_id = SandboxId::new();
+        insert_row(pool, sandbox_id, &Row::bare("restoring")).await?;
+        insert_snapshot(pool, sandbox_id, "ready", -60).await?;
+        insert_execution(pool, sandbox_id, ExecutionSeed::RUNNING).await?;
+        if !records_pod_uid {
+            sqlx::query(sql!(
+                "UPDATE sandbox_k8s_executions SET pod_uid = NULL WHERE sandbox_id = $1"
+            ))
+            .bind(sandbox_id)
+            .execute(pool)
+            .await?;
+        }
+
+        let claimed = sink
+            .revert_to_suspended(
+                sandbox_id,
+                SandboxLifecycle::Restoring,
+                age(),
+                &fence(observed(sandbox_id)),
+            )
+            .await?
+            .is_some();
+
+        let (lifecycle, active, state): (String, bool, String) = sqlx::query_as(sql!(
+            "SELECT s.lifecycle, e.active, e.state
+               FROM sandboxes s
+               JOIN sandbox_k8s_executions e ON e.sandbox_id = s.id
+              WHERE s.id = $1"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(pool)
+        .await?;
+        let expected = if retires {
+            ("suspended", false, "replaced")
+        } else {
+            ("restoring", true, "running")
+        };
+        if claimed != retires || (lifecycle.as_str(), active, state.as_str()) != expected {
+            mismatches.push(format!(
+                "{name}: claimed {claimed}, row ({lifecycle}, {active}, {state})"
+            ));
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
     Ok(())
 }
 
@@ -596,7 +743,12 @@ async fn revert_undo_reverts_only_its_own_suspended_write() -> TestResult {
         .await?;
         insert_snapshot(pool, sandbox_id, "ready", -60).await?;
         let token = sink
-            .revert_to_suspended(sandbox_id, SandboxLifecycle::Restoring, age())
+            .revert_to_suspended(
+                sandbox_id,
+                SandboxLifecycle::Restoring,
+                age(),
+                &RetireFence::NoExecution,
+            )
             .await?
             .expect("the accepting revert CAS claims");
         relabel_keeping_write_token(pool, sandbox_id, stored).await?;

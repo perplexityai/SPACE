@@ -617,6 +617,38 @@ impl RestoreClaim {
     }
 }
 
+/// What [`K8sStore::revert_restore_claim_to_suspended`] did with a failed
+/// fresh restore claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum RestoreClaimRevert {
+    /// The row reverted to `suspended` and the execution the claim created
+    /// was retired as `replaced`, so its pod, `pod_name`, is unadoptable.
+    ExecutionRetired { pod_name: String },
+    /// The row reverted to `suspended`; there was no execution it could show
+    /// this claim created, so nothing was retired.
+    LifecycleOnly,
+    /// The row reverted to `suspended`, but the claim's execution stays
+    /// active: restore selection isn't proven to choose a durable pre-restore
+    /// source, so its pod may hold state nothing else does.
+    ExecutionLeftActive,
+    /// The row is no longer this claim's `restoring` row; nothing changed.
+    NotReverted,
+}
+
+impl RestoreClaimRevert {
+    pub(super) const fn metric_outcome(
+        &self,
+    ) -> pplx_space_metrics::sandbox::restore::RevertOutcome {
+        use pplx_space_metrics::sandbox::restore::RevertOutcome;
+        match self {
+            Self::ExecutionRetired { .. } => RevertOutcome::ExecutionRetired,
+            Self::LifecycleOnly => RevertOutcome::LifecycleOnly,
+            Self::ExecutionLeftActive => RevertOutcome::ExecutionLeftActive,
+            Self::NotReverted => RevertOutcome::NotReverted,
+        }
+    }
+}
+
 #[derive(sqlx::FromRow)]
 struct RestoreClaimRow {
     lifecycle: String,

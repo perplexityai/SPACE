@@ -901,7 +901,7 @@ impl K8sStore {
     /// The activation-attempt identity fences retries that reuse a generation.
     /// `restore_lease_token` additionally ownership-fences restore takeover
     /// (with the same `None`-is-unguarded contract as
-    /// [`Self::revert_lifecycle_after_rollback_best_effort`]). A dropped leader
+    /// [`Self::revert_restore_claim_to_suspended`]). A dropped leader
     /// can outlive its lease; once a follower adopts the still-`creating`
     /// generation, either changed fence makes the delayed retirement a no-op.
     ///

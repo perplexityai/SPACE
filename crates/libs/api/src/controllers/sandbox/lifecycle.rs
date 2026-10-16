@@ -2153,7 +2153,11 @@ impl SandboxController {
             }
         };
         if let Some(status) = status {
-            maybe_update_sandbox_lifecycle(pool, id, status.as_str()).await;
+            if !(status == SandboxLifecycleStatus::Suspended
+                && self.substrate.capabilities().suspend_commits_lifecycle)
+            {
+                maybe_update_sandbox_lifecycle(pool, id, status.as_str()).await;
+            }
             if status == SandboxLifecycleStatus::Started {
                 record_dormant_activation_if_needed(sandbox, metric_identity, action);
                 self.reconcile_open_sandbox_port_exposures_best_effort(pool, id)
@@ -2392,6 +2396,9 @@ mod wake_completion_postgres_tests;
 
 #[cfg(test)]
 mod characterization_tests;
+
+#[cfg(all(test, feature = "kubernetes"))]
+mod kubernetes_suspend_tests;
 
 // Coverage-gap acknowledgment: `SandboxController::control_runtime_client`'s
 // ordering invariant (drain check must run before any substrate call that can

@@ -70,8 +70,9 @@ use cancel_rate_tracker::CancelRateTracker;
 use restore_waiters::RestoreWaiters;
 use store::{
     ActiveExecutionState, K8sStore, NodeLifecycleState, NodeStateWrite, PlacementClock,
-    PreparedWakeSandbox, RestoreClaim, SandboxExecutionRow, StartedRecoveryClaim,
-    StartedRecoveryCompletion, StartedRecoveryObservation, UserRestoreObservation,
+    PreparedWakeSandbox, RestoreClaim, RestoreClaimRevert, SandboxExecutionRow,
+    StartedRecoveryClaim, StartedRecoveryCompletion, StartedRecoveryObservation,
+    UserRestoreObservation,
 };
 
 use crate::{

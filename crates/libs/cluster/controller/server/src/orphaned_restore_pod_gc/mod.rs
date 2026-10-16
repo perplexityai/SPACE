@@ -86,16 +86,19 @@
 //!
 //! ## The one orphan this loop deliberately does NOT handle
 //!
-//! A same-generation pod on a `suspended` row — the revert's `retire_execution`
-//! teardown failed before clearing `active` — is left to the suspend subsystem.
-//! Reaping it safely means retiring the stale execution first (to defeat the
-//! adoption race) *and* proving the pod holds no committed state that exists
-//! only locally: a restored sandbox that later idle-auto-suspends presents
-//! identically, and its carrier pod may hold the only copy of the suspended VM
-//! state. That proof needs suspend-domain snapshot-recency and marker
-//! machinery, not a pod GC, and is tracked as a separate follow-up. Until then
-//! such a pod is cleaned by the next restore, or reaped here once the
-//! generation advances past it.
+//! A same-generation pod on a `suspended` row whose execution is still active
+//! is left alone. Both restore reverts (the API's rollback and the
+//! transient-lifecycle sweeper's) retire their claim's execution as `replaced`
+//! in the same transaction, once restore selection is proven to choose a
+//! durable pre-restore source, which turns their leftover pod into the
+//! no-active-execution orphan this loop reaps. What remains in this shape is
+//! left by a revert that predates that, or couldn't prove the source, or by a
+//! suspend write that raced a wake and put a live, routed sandbox back to
+//! `suspended`. The row can't tell them apart, and in the last case the pod
+//! holds the only copy of the sandbox's state, so this loop only tallies them
+//! (`SkipClass::SuspendedSameGeneration`). The next restore of the sandbox
+//! clears such a pod, or this loop reaps it once the generation advances past
+//! it.
 //!
 //! Safeguards, in order:
 //! - **Restore-only.** Only pods carrying a restore annotation are considered;

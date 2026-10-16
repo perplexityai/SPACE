@@ -3,6 +3,24 @@ use crate::artifact_store::test_support::*;
 use crate::catalog::PinnedKernel;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
+/// Overwrite `path` in place with same-length `bytes`, as a repair does, and
+/// move its mtime past the one any earlier observation recorded. The rewrite
+/// keeps the inode and the length, and a filesystem that stamps file times at
+/// timer-tick granularity (ext4 on Linux, unlike APFS) often gives two writes
+/// in quick succession the same mtime and ctime, so the metadata fingerprint
+/// would see nothing to invalidate. A real repair lands long after the
+/// observation it invalidates.
+fn rewrite_in_place(path: &std::path::Path, bytes: &[u8]) {
+    let observed = std::fs::metadata(path).unwrap().modified().unwrap();
+    std::fs::write(path, bytes).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(observed + std::time::Duration::from_secs(1))
+        .unwrap();
+}
+
 #[test]
 fn managed_e0_survives_cache_loss_without_selecting_other_installs() {
     use crate::runtime_inventory::{ExecutionSelectionMode, RuntimeFileRole, RuntimeInventory};
@@ -402,7 +420,7 @@ async fn e0_failures_preserve_unrelated_external_execution() {
         // Repair only the failed input: unrelated writes must not be needed
         // to invalidate a cached negative observation.
         match failure {
-            Failure::Binary => std::fs::write(baked.join("firecracker"), binary(1)).unwrap(),
+            Failure::Binary => rewrite_in_place(&baked.join("firecracker"), &binary(1)),
             Failure::MissingKernel => std::fs::write(&image, binary(42)).unwrap(),
             Failure::KernelMode => {
                 std::fs::set_permissions(&image, std::fs::Permissions::from_mode(0o644)).unwrap()
@@ -711,7 +729,7 @@ fn nondefault_inventory_preserves_e0_and_recovers_only_the_exact_pair() {
     assert!(!bad_kernel.unavailable.iter().any(|artifact| {
         matches!(artifact, UnavailableArtifact::Runtime { identity, .. } if identity == &environment.release().release)
     }));
-    std::fs::write(&image, binary(44)).unwrap();
+    rewrite_in_place(&image, &binary(44));
     assert!(
         !bad_kernel.check_files_unchanged(),
         "repairing cached bytes must invalidate the failure"

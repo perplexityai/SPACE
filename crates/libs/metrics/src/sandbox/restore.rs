@@ -20,6 +20,11 @@
 //! request emits a placement sample, so this counter is that request's only
 //! record of the re-drive.
 //!
+//! [`claim_reverted`] fires once per failed fresh restore claim the API
+//! rolls back toward `suspended`, tagged with what happened to the
+//! execution the claim created. `execution_left_active` is the case that
+//! still leaves an adoptable same-generation pod on a `suspended` row.
+//!
 //! End-to-end restore duration stays on the existing
 //! `snapshot.restore.duration_ms` distribution (node side); this module owns
 //! only the placement decision and its re-drive.
@@ -202,4 +207,45 @@ impl std::fmt::Display for RedriveOutcome {
 pub fn cross_node_redrive(path: RedrivePath, outcome: RedriveOutcome) {
     let tags = [tag("path", path.as_str()), tag("outcome", outcome.as_str())];
     counter("sandbox.restore.redrive", 1, &tags);
+}
+
+/// What a failed fresh restore claim's rollback did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RevertOutcome {
+    /// Reverted to `suspended`, and the claim's execution was retired as
+    /// abandoned.
+    ExecutionRetired,
+    /// Reverted to `suspended`; the claim had no execution of its own.
+    LifecycleOnly,
+    /// Reverted to `suspended`, but the claim's execution stays active
+    /// because restore selection isn't proven to pick a durable source.
+    ExecutionLeftActive,
+    /// The row had moved on from the claim; nothing was reverted.
+    NotReverted,
+}
+
+impl RevertOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExecutionRetired => "execution_retired",
+            Self::LifecycleOnly => "lifecycle_only",
+            Self::ExecutionLeftActive => "execution_left_active",
+            Self::NotReverted => "not_reverted",
+        }
+    }
+}
+
+impl std::fmt::Display for RevertOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Emit one failed fresh restore claim's rollback outcome.
+pub fn claim_reverted(outcome: RevertOutcome) {
+    counter(
+        "sandbox.restore.claim_revert",
+        1,
+        &[tag("outcome", outcome.as_str())],
+    );
 }

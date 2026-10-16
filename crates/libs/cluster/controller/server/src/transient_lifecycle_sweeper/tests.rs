@@ -524,6 +524,7 @@ impl SweepSink for FakeSink {
         sandbox_id: SandboxId,
         _lifecycle: SandboxLifecycle,
         _age: PositiveDuration,
+        _fence: &RetireFence,
     ) -> Result<Option<String>, sqlx::Error> {
         let mut state = self.0.lock().unwrap();
         state.revert_calls.push(sandbox_id);

@@ -618,6 +618,68 @@ pub(crate) fn revert_to_suspended_query() -> String {
     )
 }
 
+/// Retire the reverted restore's execution as `replaced` inside the revert
+/// CAS's transaction, matching the identity the candidate select recorded
+/// (see [`SweepSink::revert_to_suspended`]). A crash, error or refusal
+/// between a revert and a separate retire would leave a `suspended` row with
+/// its same-generation execution still active, which nothing revisits.
+///
+/// Returns `false`, and the caller rolls the revert back, when the active
+/// execution is no longer the one the candidate observed.
+async fn retire_reverted_restore_execution(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    sandbox_id: SandboxId,
+    fence: &PodIdentityFence,
+) -> Result<bool, sqlx::Error> {
+    if fence.recorded == RecordedExecution::Unread {
+        return Ok(false);
+    }
+    let retired = sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions
+            SET active = FALSE,
+                state = 'replaced',
+                pod_ip = NULL,
+                terminated_at = COALESCE(terminated_at, NOW()),
+                updated_at = NOW()
+          WHERE sandbox_id = $1
+            AND active
+            AND pod_name = $2
+            AND generation IS NOT DISTINCT FROM $3
+            AND activation_attempt_id IS NOT DISTINCT FROM $4
+            AND NULLIF(BTRIM(pod_uid), '') IS NOT DISTINCT FROM $5::TEXT
+            AND route_activation_id IS NOT DISTINCT FROM $6"
+    ))
+    .bind(sandbox_id)
+    .bind(fence.pod_name.as_str())
+    .bind(fence.generation)
+    .bind(fence.activation_attempt_id)
+    .bind(fence.recorded.pod_uid().map(PodUid::as_str))
+    .bind(fence.recorded.route_activation_id())
+    .execute(&mut **tx)
+    .await?
+    .rows_affected()
+        == 1;
+    if retired {
+        // The node state the open exposures described died with the runtime.
+        sqlx::query(sql!(
+            "UPDATE sandbox_port_exposures
+                SET apply_state = 'pending',
+                    last_applied_node_id = NULL,
+                    last_error = NULL,
+                    last_bridge_status = NULL,
+                    last_applied_bridge_generation = NULL,
+                    last_observed_at = NULL,
+                    updated_at = NOW()
+              WHERE sandbox_id = $1
+                AND desired_state = 'open'"
+        ))
+        .bind(sandbox_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(retired)
+}
+
 /// Shared predicate for the unrestorable-`restoring` sweep: a markerless
 /// `restoring` row that the restore planner **provably cannot restore from
 /// anywhere** — the exact wedge the aged-transient sweep above cannot reach,
@@ -1083,17 +1145,51 @@ impl SweepSink for SubstrateSweepSink {
         sandbox_id: SandboxId,
         lifecycle: SandboxLifecycle,
         age: PositiveDuration,
+        fence: &RetireFence,
     ) -> Result<Option<String>, sqlx::Error> {
         let managed_by = self.substrate.managed_by();
+        let mut tx = self.pool.begin().await?;
+        // The CAS takes the sandbox row lock that every execution claim also
+        // takes, so the execution check below can't race a new claim.
         let claimed =
             sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql!(revert_to_suspended_query())))
                 .bind(managed_by)
                 .bind(lifecycle.to_string())
                 .bind(Self::age_secs_bind(age))
                 .bind(sandbox_id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *tx)
                 .await?;
-        Ok(claimed)
+        let Some(write_token) = claimed else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let execution_settled = match fence {
+            RetireFence::Pod(pod_fence) => {
+                retire_reverted_restore_execution(&mut tx, sandbox_id, pod_fence).await?
+            }
+            RetireFence::NoExecution => {
+                !sqlx::query_scalar::<_, bool>(sql!(
+                    "SELECT EXISTS (
+                     SELECT 1
+                       FROM sandbox_k8s_executions
+                      WHERE sandbox_id = $1
+                        AND active
+                 )"
+                ))
+                .bind(sandbox_id)
+                .fetch_one(&mut *tx)
+                .await?
+            }
+            // The candidate select always observes one of the two above; a
+            // caller that observed nothing can't name the execution to retire.
+            RetireFence::Unobserved => false,
+        };
+        if !execution_settled {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        tx.commit().await?;
+        Ok(Some(write_token))
     }
 
     async fn fail_aged_candidate(

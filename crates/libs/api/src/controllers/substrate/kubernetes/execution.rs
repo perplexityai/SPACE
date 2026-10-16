@@ -349,6 +349,60 @@ impl KubernetesSubstrate {
         }
     }
 
+    /// Best-effort rollback of a failed fresh restore claim to `suspended`
+    /// (see [`K8sStore::revert_restore_claim_to_suspended`]). When the
+    /// rollback retired the claim's execution, its pod is deleted here too.
+    /// That delete is best-effort: a pod it misses belongs to no active
+    /// execution, so the orphaned-restore-pod GC and the next restore's
+    /// lingering-pod sweep both reap it.
+    async fn revert_failed_restore_claim(
+        &self,
+        sandbox_id: SandboxId,
+        restore_claim: RestoreClaim,
+        activation_attempt: Option<(SandboxActivationAttemptId, i64)>,
+    ) {
+        let outcome = match self
+            .store
+            .revert_restore_claim_to_suspended(
+                sandbox_id,
+                restore_claim.restore_lease_token(),
+                activation_attempt,
+            )
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %err,
+                    "failed to restore suspended lifecycle after Kubernetes restore failure"
+                );
+                return;
+            }
+        };
+        pplx_space_metrics::sandbox::restore::claim_reverted(outcome.metric_outcome());
+        match outcome {
+            RestoreClaimRevert::ExecutionRetired { pod_name } => {
+                // A retired generation is never reused, so the name can't
+                // belong to a successor.
+                if let Err(err) = self.delete_tracked_pods(vec![pod_name]).await {
+                    tracing::warn!(
+                        sandbox_id = %sandbox_id,
+                        error = %err,
+                        "failed to delete the pod of an abandoned restore; it has no active \
+                         execution, so orphan GC or the next restore removes it"
+                    );
+                }
+            }
+            RestoreClaimRevert::ExecutionLeftActive => tracing::warn!(
+                sandbox_id = %sandbox_id,
+                "reverted a failed restore without retiring its execution: restore selection \
+                 isn't proven to choose a durable pre-restore source"
+            ),
+            RestoreClaimRevert::LifecycleOnly | RestoreClaimRevert::NotReverted => {}
+        }
+    }
+
     /// Best-effort release of a restore claim whose deferred admission
     /// charge was rejected: a fresh suspended claim rolls back to
     /// `suspended`; a redrive keeps the row `restoring` and only frees the
@@ -360,13 +414,9 @@ impl KubernetesSubstrate {
     ) {
         let result = match restore_claim {
             RestoreClaim::FreshFromSuspended { .. } => {
-                self.store
-                    .revert_lifecycle_after_rollback_best_effort(
-                        sandbox_id,
-                        "suspended",
-                        restore_claim.restore_lease_token(),
-                    )
-                    .await
+                return self
+                    .revert_failed_restore_claim(sandbox_id, restore_claim, None)
+                    .await;
             }
             RestoreClaim::RedroveRestoring {
                 restore_lease_token: Some(token),
@@ -1856,22 +1906,14 @@ impl KubernetesSubstrate {
                 result.as_ref().err(),
                 wake_dispatch,
             )
-            && let Err(update_err) = self
-                .store
-                .revert_lifecycle_after_rollback_best_effort(
-                    sandbox_id,
-                    "suspended",
-                    prepared
-                        .restore_claim
-                        .and_then(RestoreClaim::restore_lease_token),
-                )
-                .await
+            && let Some(restore_claim) = prepared.restore_claim
         {
-            tracing::warn!(
-                sandbox_id = %sandbox_id,
-                error = %update_err,
-                "failed to restore suspended lifecycle after Kubernetes wake failure"
-            );
+            self.revert_failed_restore_claim(
+                sandbox_id,
+                restore_claim,
+                activation_assignment.assigned(),
+            )
+            .await;
         }
         if cleanup_on_failure
             && !restore_failure_should_revert_to_suspended(

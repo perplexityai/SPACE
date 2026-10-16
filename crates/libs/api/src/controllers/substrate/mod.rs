@@ -2208,6 +2208,15 @@ pub struct SubstrateCapabilities {
     /// and force-upload actions refuse before reading the node, except
     /// `:undrain`, which only clears a `drain_phase` an earlier drain left.
     pub supports_node_drain: bool,
+    /// A successful [`SubstrateAdapter::suspend_execution`] has already
+    /// committed `lifecycle = 'suspended'`, under the fence of the execution
+    /// it suspended. The caller then writes no lifecycle of its own: an
+    /// unfenced trailing `suspended` write would land after a wake that
+    /// claimed the row in between and put a live, routed sandbox back to
+    /// `suspended` with its execution still active.
+    ///
+    /// Direct's suspend leaves the lifecycle to that caller write.
+    pub suspend_commits_lifecycle: bool,
 }
 
 impl SubstrateCapabilities {
@@ -2218,6 +2227,7 @@ impl SubstrateCapabilities {
         resolves_cold_create_shape: false,
         supports_node_pool_placement: false,
         supports_node_drain: false,
+        suspend_commits_lifecycle: false,
     };
 
     pub const KUBERNETES: Self = Self {
@@ -2227,6 +2237,7 @@ impl SubstrateCapabilities {
         resolves_cold_create_shape: true,
         supports_node_pool_placement: true,
         supports_node_drain: true,
+        suspend_commits_lifecycle: true,
     };
 }
 

@@ -597,7 +597,10 @@ impl KubernetesSubstrate {
 
     /// Idempotent best-effort delete of each tracked pod name. An already-gone
     /// pod is the expected case, not a failure.
-    async fn delete_tracked_pods(&self, pod_names: Vec<String>) -> Result<(), SubstrateError> {
+    pub(in crate::controllers::substrate::kubernetes) async fn delete_tracked_pods(
+        &self,
+        pod_names: Vec<String>,
+    ) -> Result<(), SubstrateError> {
         for pod_name in pod_names {
             if let Err(err) = delete_sandbox_pod(&self.k8s, &pod_name).await
                 && !is_not_found_error(&err)
