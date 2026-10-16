@@ -2,7 +2,7 @@
 //! scans and local eviction evidence.
 
 use crate::db::{Connection, OptionalExtension, Result};
-use pplx_space_common_svc::sql::sqlite::SqliteU64;
+use pplx_space_sqlite::SqliteU64;
 use rusqlite::params;
 
 use crate::db::timestamps::EpochSeconds;

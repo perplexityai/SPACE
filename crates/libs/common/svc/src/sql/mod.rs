@@ -10,18 +10,15 @@ use sqlx::ConnectOptions as _;
 use sqlx::PgPool;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
-pub mod baselines;
 pub mod contention;
 pub mod federated_service_grants;
 pub mod identity;
-#[cfg(feature = "sqlite")]
+#[cfg(feature = "migration-checksums")]
 pub mod migration_checksums;
 pub mod node_registration;
 pub mod sandbox_quarantine;
 pub mod sandbox_residency;
 pub mod sandbox_routability;
-#[cfg(feature = "sqlite")]
-pub mod sqlite;
 
 const POOL_METRICS_INTERVAL: Duration = Duration::from_secs(10);
 

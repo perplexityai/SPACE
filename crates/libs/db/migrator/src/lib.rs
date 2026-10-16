@@ -13,7 +13,7 @@
 //! carry that weight, and no long-running service links this.
 
 use pplx_space_common_svc::sql;
-use pplx_space_common_svc::sql::sqlite::runtime_manager::MIGRATOR as RUNTIME_MANAGER_MIGRATOR;
+use pplx_space_sqlite::runtime_manager::MIGRATOR as RUNTIME_MANAGER_MIGRATOR;
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -25,7 +25,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{PgConnection, PgPool, SqlitePool};
 
-use pplx_space_common_svc::sql::sqlite::{self, SqliteError};
+use pplx_space_sqlite::{self as sqlite, SqliteError};
 
 pub mod bootstrap_roles;
 pub mod migration_retry;
@@ -577,7 +577,7 @@ async fn rollback_last_sqlite_database(
             .last()
             .copied();
         if common_version.is_some_and(|version| {
-            version > pplx_space_common_svc::sql::baselines::PUBLIC_SQLITE_BASELINE
+            version > pplx_space_sqlite::baselines::PUBLIC_SQLITE_BASELINE
                 && Some(version) > service_version
         }) {
             return rollback_last_sqlite(&pool, &common).await;

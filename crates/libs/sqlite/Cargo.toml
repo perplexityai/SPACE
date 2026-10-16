@@ -1,0 +1,28 @@
+[package]
+name = "pplx-space-sqlite"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rusqlite = { workspace = true }
+sqlx = { workspace = true, features = ["derive", "macros", "migrate", "runtime-tokio", "sqlite-bundled", "tls-rustls-aws-lc-rs"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# internal
+pplx-space-common-core = { workspace = true }
+pplx-space-common-svc = { workspace = true, features = ["migration-checksums"] }
+
+[dev-dependencies]
+hex = { workspace = true }
+pplx-space-observability = { workspace = true, features = ["test-capture"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = { workspace = true }

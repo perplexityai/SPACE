@@ -19,7 +19,6 @@ use pplx_space_common_core::types::{
     SandboxTransitionReceipt, SandboxTransitionReceiptInvariantError, SandboxTransitionReceiptKind,
     SandboxTransitionTargetState, SnapshotName,
 };
-use pplx_space_common_svc::sql::sqlite::SqliteU64;
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
     emit_sandbox_event,
@@ -27,6 +26,7 @@ use pplx_space_events::{
 #[cfg(test)]
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_net_common::{NetworkPolicy, proto::NetworkPolicySource};
+use pplx_space_sqlite::SqliteU64;
 use rusqlite::types::Type;
 
 use pplx_space_common_core::sql;
@@ -227,7 +227,7 @@ const STATEMENT_CACHE_CAPACITY: usize = 128;
 /// shared SQLite helpers' error's, unchanged.
 #[derive(Debug, thiserror::Error)]
 #[error(transparent)]
-pub struct OpenError(#[from] pplx_space_common_svc::sql::sqlite::SqliteError);
+pub struct OpenError(#[from] pplx_space_sqlite::SqliteError);
 
 /// Apply the service and common schema migrations to the database.
 pub async fn migrate() -> Result<(), OpenError> {
@@ -238,10 +238,10 @@ pub async fn migrate() -> Result<(), OpenError> {
 pub async fn migrate_at(db_path: &Path) -> Result<(), OpenError> {
     use pplx_space_sbxmgr_migrations::COMMON_SCHEMA_MIGRATOR;
     let target = migration::target();
-    Ok(pplx_space_common_svc::sql::sqlite::migrate_embedded(
+    Ok(pplx_space_sqlite::migrate_embedded(
         target.name,
         db_path,
-        pplx_space_common_svc::sql::sqlite::EmbeddedMigrators {
+        pplx_space_sqlite::EmbeddedMigrators {
             service: target.service,
             common: Some(&COMMON_SCHEMA_MIGRATOR),
         },
@@ -252,9 +252,9 @@ pub async fn migrate_at(db_path: &Path) -> Result<(), OpenError> {
 /// Open the migrated database, with the connection settings every store
 /// operation assumes.
 pub fn open() -> Result<Connection, OpenError> {
-    let conn = pplx_space_common_svc::sql::sqlite::open_rusqlite(
+    let conn = pplx_space_sqlite::open_rusqlite(
         Path::new(DB_PATH),
-        pplx_space_common_svc::sql::sqlite::RusqliteOpenOptions::default(),
+        pplx_space_sqlite::RusqliteOpenOptions::default(),
     )?;
     conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
     Ok(Connection::from_raw(conn))

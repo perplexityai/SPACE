@@ -61,7 +61,7 @@ fn embedded_migrations_have_unique_versions_and_public_baselines() {
         let baseline = if *name == "postgres" {
             20261002070625
         } else {
-            pplx_space_common_svc::sql::baselines::PUBLIC_SQLITE_BASELINE
+            pplx_space_sqlite::baselines::PUBLIC_SQLITE_BASELINE
         };
         assert_eq!(
             migrator

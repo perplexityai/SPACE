@@ -1,7 +1,17 @@
+//! Shared helpers that open, migrate and maintain a service-owned SQLite
+//! database by path, for the node services and the migrator that own one.
+//!
+//! They live apart from `pplx-space-common-svc` so that a crate that must not
+//! touch a service's database can leave them out of its dependencies; Cargo
+//! feature unification would otherwise expose them to every crate that
+//! depends on common-svc. `cargo arch`'s `dependency_fence` keeps this crate
+//! out of sbx-mgr's crates other than its store.
+
+pub mod baselines;
 pub mod runtime_manager;
 
-use super::migration_checksums::AcceptedChecksums;
 use pplx_space_common_core::sql;
+use pplx_space_common_svc::sql::migration_checksums::AcceptedChecksums;
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt::Display;

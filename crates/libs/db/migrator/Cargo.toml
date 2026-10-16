@@ -20,7 +20,8 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 tracing = { workspace = true }
 
 # internal
-pplx-space-common-svc = { workspace = true, features = ["sqlite"] }
+pplx-space-common-svc = { workspace = true, features = ["migration-checksums"] }
+pplx-space-sqlite = { workspace = true }
 pplx-space-sbx-mgr-store = { workspace = true }
 
 [dev-dependencies]

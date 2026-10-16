@@ -50,7 +50,8 @@ tracing = { workspace = true }
 # internal
 pplx-space-common-core = { workspace = true, features = ["rusqlite", "serde"] }
 pplx-space-common-jobs = { workspace = true }
-pplx-space-common-svc = { workspace = true, features = ["sqlite"] }
+pplx-space-common-svc = { workspace = true }
+pplx-space-sqlite = { workspace = true }
 pplx-space-execution-common = { workspace = true }
 pplx-space-node-mgr-client = { workspace = true }
 pplx-space-node-runtime-core = { workspace = true, features = ["artifact-store"] }

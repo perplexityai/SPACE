@@ -5,7 +5,8 @@ use pplx_space_common_core::types::{
     AutoLifecycleDeleteReceiptId, ExecutionGeneration, NodeManagedBy, NodeRole, PolicyAuthority,
     SandboxActivationAttemptId, SandboxId,
 };
-use pplx_space_common_svc::{sql::sqlite::SqliteU64, types::AutoLifecyclePolicyFingerprint};
+use pplx_space_common_svc::types::AutoLifecyclePolicyFingerprint;
+use pplx_space_sqlite::SqliteU64;
 use rusqlite::{params, types::Type};
 
 use crate::auto_lifecycle_delete_receipts::{

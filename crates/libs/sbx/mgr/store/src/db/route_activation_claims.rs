@@ -6,7 +6,7 @@ use pplx_space_common_core::types::{
     ExecutionGeneration, NodeId, NodeManagedBy, PodUid, RouteGeneration,
     SandboxActivationAttemptId, SpaceApiRouteIdentity,
 };
-use pplx_space_common_svc::sql::sqlite::SqliteU64;
+use pplx_space_sqlite::SqliteU64;
 use rusqlite::params;
 
 use crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance;

@@ -91,7 +91,7 @@ async fn node_manager_migration_chain_preserves_leases_on_history_failure() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("node-manager.db");
     let migrator =
-        Migrator::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../db/node-manager"))
+        Migrator::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../db/node-manager"))
             .await
             .unwrap();
 
@@ -377,7 +377,7 @@ fn write_table_migration(migrations_dir: &Path, version: i64, name: &str) {
 
 #[tokio::test]
 async fn public_baseline_preserves_rejected_history() {
-    let version = super::super::baselines::PUBLIC_SQLITE_BASELINE;
+    let version = crate::baselines::PUBLIC_SQLITE_BASELINE;
     for damage in [
         "UPDATE _sqlx_migrations SET checksum = x'00'",
         "UPDATE _sqlx_migrations SET success = FALSE",
@@ -442,7 +442,7 @@ fn public_test_migrators() -> (&'static Migrator, &'static Migrator) {
 
         let migration = |sql: &'static str| {
             Migrator::with_migrations(vec![Migration::new(
-                super::super::baselines::PUBLIC_SQLITE_BASELINE,
+                crate::baselines::PUBLIC_SQLITE_BASELINE,
                 Cow::Borrowed("baseline"),
                 MigrationType::Simple,
                 sql.into_sql_str(),
@@ -550,7 +550,7 @@ async fn public_embedded_migrations_reject_both_histories_before_writes() {
         service,
         common: Some(common),
     };
-    let pending_version = super::super::baselines::PUBLIC_SQLITE_BASELINE + 1;
+    let pending_version = crate::baselines::PUBLIC_SQLITE_BASELINE + 1;
     let mut common_migrations = common.iter().cloned().collect::<Vec<_>>();
     common_migrations.push(Migration::new(
         pending_version,

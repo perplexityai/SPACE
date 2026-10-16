@@ -31,15 +31,10 @@ async fn mark_refs_revives_backed_off_dirty_row() -> anyhow::Result<()> {
     let temp = tempfile::tempdir()?;
     let db_path = temp.path().join("node-ctl.db");
 
-    pplx_space_common_svc::sql::sqlite::migrate(
-        "node-ctl-test",
+    pplx_space_sqlite::migrate("node-ctl-test", &db_path, &crate::NODE_CTL_MIGRATOR).await?;
+    let conn = pplx_space_sqlite::open_rusqlite(
         &db_path,
-        &crate::NODE_CTL_MIGRATOR,
-    )
-    .await?;
-    let conn = pplx_space_common_svc::sql::sqlite::open_rusqlite(
-        &db_path,
-        pplx_space_common_svc::sql::sqlite::RusqliteOpenOptions::default(),
+        pplx_space_sqlite::RusqliteOpenOptions::default(),
     )?;
     let old_now = crate::now_secs().saturating_sub(10);
     let old_next_attempt = old_now.saturating_add(300);
@@ -53,15 +48,10 @@ async fn mark_refs_revives_backed_off_dirty_row() -> anyhow::Result<()> {
     )?;
 
     drop(conn);
-    pplx_space_common_svc::sql::sqlite::migrate(
-        "node-ctl-test",
+    pplx_space_sqlite::migrate("node-ctl-test", &db_path, &crate::NODE_CTL_MIGRATOR).await?;
+    let mut conn = pplx_space_sqlite::open_rusqlite(
         &db_path,
-        &crate::NODE_CTL_MIGRATOR,
-    )
-    .await?;
-    let mut conn = pplx_space_common_svc::sql::sqlite::open_rusqlite(
-        &db_path,
-        pplx_space_common_svc::sql::sqlite::RusqliteOpenOptions::default(),
+        pplx_space_sqlite::RusqliteOpenOptions::default(),
     )?;
 
     let marked_at = crate::now_secs();
@@ -116,13 +106,9 @@ async fn mark_refs_revives_backed_off_dirty_row() -> anyhow::Result<()> {
     )?;
     drop(conn);
 
-    let error = pplx_space_common_svc::sql::sqlite::migrate(
-        "node-ctl-test",
-        &db_path,
-        &crate::NODE_CTL_MIGRATOR,
-    )
-    .await
-    .unwrap_err();
+    let error = pplx_space_sqlite::migrate("node-ctl-test", &db_path, &crate::NODE_CTL_MIGRATOR)
+        .await
+        .unwrap_err();
     assert!(error.to_string().contains("db/README.md"));
 
     let conn = rusqlite::Connection::open(&db_path)?;

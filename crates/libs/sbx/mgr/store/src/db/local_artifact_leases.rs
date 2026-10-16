@@ -5,7 +5,7 @@
 use crate::db::{Connection, Error, OptionalExtension, Result};
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{ArtifactKind, LocalArtifactId, SnapshotName};
-use pplx_space_common_svc::sql::sqlite::SqliteU64;
+use pplx_space_sqlite::SqliteU64;
 use rusqlite::params;
 
 use crate::db::timestamps::EpochSeconds;

@@ -130,9 +130,9 @@ pub enum StoreError {
     #[error("runtime-manager database")]
     Sqlite(#[from] rusqlite::Error),
     #[error("runtime-manager database migration")]
-    Migrate(#[source] pplx_space_common_svc::sql::sqlite::SqliteError),
+    Migrate(#[source] pplx_space_sqlite::SqliteError),
     #[error("cannot open the runtime-manager database")]
-    Open(#[source] pplx_space_common_svc::sql::sqlite::SqliteError),
+    Open(#[source] pplx_space_sqlite::SqliteError),
     #[error("runtime-manager database holds an unreadable {column} value '{value}'")]
     Corrupt { column: &'static str, value: String },
 }
@@ -141,22 +141,19 @@ pub enum StoreError {
 /// The database is restricted to 0600 inside the already private directory.
 pub(crate) async fn open(state_dir: &Path) -> Result<Connection, StoreError> {
     let path = state_dir.join(DATABASE_FILE);
-    pplx_space_common_svc::sql::sqlite::migrate_embedded(
+    pplx_space_sqlite::migrate_embedded(
         DATABASE_NAME,
         &path,
-        pplx_space_common_svc::sql::sqlite::EmbeddedMigrators {
-            service: pplx_space_common_svc::sql::sqlite::runtime_manager::catalog(&path)
+        pplx_space_sqlite::EmbeddedMigrators {
+            service: pplx_space_sqlite::runtime_manager::catalog(&path)
                 .map_err(StoreError::Migrate)?,
             common: Some(&COMMON_SCHEMA_MIGRATOR),
         },
     )
     .await
     .map_err(StoreError::Migrate)?;
-    pplx_space_common_svc::sql::sqlite::open_rusqlite(
-        &path,
-        pplx_space_common_svc::sql::sqlite::RusqliteOpenOptions::default(),
-    )
-    .map_err(StoreError::Open)
+    pplx_space_sqlite::open_rusqlite(&path, pplx_space_sqlite::RusqliteOpenOptions::default())
+        .map_err(StoreError::Open)
 }
 
 fn parsed<T: FromStr>(column: &'static str, value: &str) -> Result<T, StoreError> {

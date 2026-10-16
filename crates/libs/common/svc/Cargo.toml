@@ -17,7 +17,9 @@ datadog = ["otel", "pplx-space-observability/datadog"]
 # Deprecated for one release; use otel and datadog.
 datadog-otel = ["otel", "datadog"]
 k8s = ["dep:k8s-openapi", "dep:kube"]
-sqlite = ["dep:rusqlite", "dep:toml", "sqlx/migrate", "sqlx/runtime-tokio", "sqlx/sqlite-bundled", "sqlx/tls-rustls-aws-lc-rs"]
+# Exposes `sql::migration_checksums`, the accepted-checksums adapter every
+# migration runner embeds.
+migration-checksums = ["dep:toml", "sqlx/migrate"]
 # Exposes shared route and authentication test helpers to other crates.
 # Unit tests get them under `cfg(test)`; external test suites opt in through
 # a dev-dependency. Mirrors `pplx-space-metrics`'s `test-capture`.
@@ -43,7 +45,6 @@ nix = { workspace = true, features = ["fs", "user"] }
 pin-project-lite = { workspace = true }
 redis = { workspace = true }
 rand = { workspace = true }
-rusqlite = { workspace = true, optional = true }
 rustls = { workspace = true, default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -70,6 +71,8 @@ pplx-space-metrics = { workspace = true }
 pplx-space-observability = { workspace = true }
 
 [dev-dependencies]
+# The accepted-checksums tests migrate in-memory SQLite databases.
+sqlx = { workspace = true, features = ["sqlite-bundled"] }
 insta = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["test-hooks"] }
 nix = { workspace = true, features = ["signal"] }

@@ -11,10 +11,10 @@ use sqlx::migrate::{Migration, MigrationType};
 
 use super::*;
 
-pub static MIGRATOR: Migrator = sqlx::migrate!("../../../../db/runtime-manager");
-const BASELINE: i64 = super::super::baselines::PUBLIC_SQLITE_BASELINE;
+pub static MIGRATOR: Migrator = sqlx::migrate!("../../../db/runtime-manager");
+const BASELINE: i64 = crate::baselines::PUBLIC_SQLITE_BASELINE;
 const PROTOTYPE_SQL: &str =
-    include_str!("../../../../../../../db/runtime-manager/history/prototype-baseline.sql");
+    include_str!("../../../../db/runtime-manager/history/prototype-baseline.sql");
 
 static PROTOTYPE_MIGRATOR: LazyLock<Migrator> = LazyLock::new(|| {
     let mut migrations = MIGRATOR.migrations.to_vec();

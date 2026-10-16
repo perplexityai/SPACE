@@ -1,7 +1,7 @@
 use std::{borrow::Cow, sync::LazyLock};
 
 use super::*;
-use pplx_space_common_svc::sql::baselines;
+use pplx_space_sqlite::baselines;
 use sqlx::SqlSafeStr as _;
 use sqlx::migrate::{Migration, MigrationType};
 
