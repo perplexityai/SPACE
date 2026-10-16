@@ -23,6 +23,7 @@ use tracing::Instrument;
 
 use super::accounting::{Attempt, Outcome};
 use super::http_host::HostBinding;
+use super::observation::{Connection, Phase, Side};
 use super::routing_headers::SanitizedRequest;
 #[cfg(test)]
 use super::tls::TlsTransportError;
@@ -36,9 +37,25 @@ mod connect;
 mod credentials;
 mod error;
 mod forward;
+mod request;
 mod upgrade;
 
 type Body = Either<ForwardingBody, Empty<Bytes>>;
+
+/// Every reply carries the owner of its status, including local replacements
+/// of an upstream response. This metadata never enters HTTP headers/extensions.
+struct Reply {
+    response: Response<Body>,
+    source: request::StatusSource,
+}
+impl Reply {
+    fn upstream(response: Response<Body>) -> Self {
+        Self {
+            response,
+            source: request::StatusSource::Upstream,
+        }
+    }
+}
 const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 const H2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const H2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -65,6 +82,7 @@ const GUEST_H2_CONNECTION_WINDOW: u32 = 4 * 1024 * 1024;
 struct ForwardingBody {
     inner: Incoming,
     attempt: Attempt,
+    upload: Option<request::Observer>,
 }
 
 impl ForwardingBody {
@@ -73,7 +91,11 @@ impl ForwardingBody {
         if inner.is_end_stream() {
             attempt.finish(Outcome::Success, "body_complete");
         }
-        Self { inner, attempt }
+        Self {
+            inner,
+            attempt,
+            upload: None,
+        }
     }
 }
 
@@ -87,7 +109,12 @@ impl HttpBody for ForwardingBody {
     ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
         let result = Pin::new(&mut self.inner).poll_frame(context);
         match &result {
-            Poll::Ready(Some(Err(_))) => self.attempt.finish(Outcome::Error, "body_error"),
+            Poll::Ready(Some(Err(error))) => {
+                if let Some(upload) = &self.upload {
+                    upload.failure(Phase::RequestBody, Side::Downstream, error);
+                }
+                self.attempt.finish(Outcome::Error, "body_error");
+            }
             Poll::Ready(None) => self.attempt.finish(Outcome::Success, "body_complete"),
             Poll::Ready(Some(Ok(_))) if self.inner.is_end_stream() => {
                 self.attempt.finish(Outcome::Success, "body_complete");
@@ -108,6 +135,7 @@ impl HttpBody for ForwardingBody {
 
 struct Session<F> {
     binding: HostBinding,
+    observation: Connection,
     lease: Arc<CertificateLease>,
     upstream: Upstream<F, Body>,
     upgrades: TaskTracker,
@@ -130,6 +158,7 @@ pub(super) async fn serve<C, F, Fut, U>(
     binding: HostBinding,
     lease: Arc<CertificateLease>,
     connect: F,
+    observation: Connection,
 ) -> Result<(), HttpError>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -141,10 +170,17 @@ where
     // Dropping this future on revocation also closes every origin socket.
     let _cancel = shutdown.clone().drop_guard();
     let draining = CancellationToken::new();
+    let upstream = Upstream::new(
+        connect,
+        shutdown.clone(),
+        draining.clone(),
+        observation.clone(),
+    );
     let session = Arc::new(Session {
         binding,
+        observation,
         lease,
-        upstream: Upstream::new(connect, shutdown.clone(), draining.clone()),
+        upstream,
         upgrades: TaskTracker::new(),
         shutdown,
         draining,
@@ -153,12 +189,15 @@ where
         let session = session.clone();
         let protocol = HttpProtocol::of(request.version());
         tracing::Span::current().record("protocol", protocol.as_str());
+        session.observation.http_request();
+        let mut observation = request::Request::new(protocol, session.observation.clone());
         let request = SanitizedRequest::try_from(request);
         async move {
-            Ok::<_, Infallible>(match request {
-                Ok(request) => session.forward(request).await,
+            let response = match request {
+                Ok(request) => session.forward(request, &mut observation).await,
                 Err(_) => session.refuse(protocol, "invalid_headers", StatusCode::BAD_REQUEST),
-            })
+            };
+            Ok::<_, Infallible>(observation.response(response))
         }
     });
     let builder = guest_http_builder();
@@ -213,12 +252,7 @@ where
         ForwardingBody::new(body, protocol.as_str(), operation)
     }
 
-    fn refuse(
-        &self,
-        protocol: HttpProtocol,
-        reason: &'static str,
-        status: StatusCode,
-    ) -> Response<Body> {
+    fn refuse(&self, protocol: HttpProtocol, reason: &'static str, status: StatusCode) -> Reply {
         Self::record(protocol, reason, status);
         let mut response = Response::new(Either::Right(Empty::new()));
         *response.status_mut() = status;
@@ -227,7 +261,10 @@ where
                 .headers_mut()
                 .insert(header::CONNECTION, http::HeaderValue::from_static("close"));
         }
-        response
+        Reply {
+            response,
+            source: request::StatusSource::Local,
+        }
     }
 
     fn record(protocol: HttpProtocol, outcome: &'static str, status: StatusCode) {

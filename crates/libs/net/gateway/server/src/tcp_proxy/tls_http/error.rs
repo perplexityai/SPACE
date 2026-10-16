@@ -33,8 +33,8 @@ impl HttpError {
     }
 }
 
-/// Only Hyper's documented predicates are stable; native codes behind its
-/// opaque source chain remain unavailable.
+/// Hyper categories come from its public predicates. The connection observer
+/// additionally extracts native causes when Hyper exposes typed sources.
 pub(in crate::tcp_proxy) fn http_reason(error: &hyper::Error) -> &'static str {
     if error.is_parse() {
         "parse"

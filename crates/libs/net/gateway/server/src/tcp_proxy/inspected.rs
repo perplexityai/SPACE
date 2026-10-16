@@ -1,5 +1,6 @@
 //! Compose certificate-bound TLS transport with inspected HTTP.
 use super::http_host::{HostBinding, MeteredIo};
+use super::observation::{Close, Connection, Phase, Side};
 use super::tls::TlsTransportError;
 use super::tls_http::{HttpError, HttpProtocol};
 use super::{TcpProxy, tls, tls_http, transport};
@@ -27,6 +28,7 @@ impl TcpProxy {
         admitted: AdmittedTcp,
         lease: Arc<CertificateLease>,
         client_alpn: ClientAlpnOffer,
+        observation: Connection,
     ) -> Result<(), HttpError> {
         let span = tracing::info_span!(
             "tls.server",
@@ -48,20 +50,24 @@ impl TcpProxy {
                 return Err(TlsTransportError::Target.into());
             }
             let accounting = WireAccounting::new(self.stats.clone());
+            observation.phase(Phase::DownstreamTls);
             let operation = async {
                 // ALPN is telemetry here. `tls_http::serve` detects the
                 // version from the guest's first bytes and records `protocol`
                 // once the first request arrives.
                 let (downstream, negotiated) =
-                    tls::accept(client, &lease, &self.tls_interception).await?;
+                    tls::accept(client, &lease, &self.tls_interception, observation.clone())
+                        .await?;
                 tracing::Span::current()
                     .record("negotiated", HttpProtocol::from(negotiated).as_str());
+                observation.phase(Phase::HttpHeaders);
                 let binding =
                     HostBinding::new(self.sandbox_id, destination, self.network_state.clone());
                 let interception = self.tls_interception.clone();
                 let upstream_lease = lease.clone();
                 let wire_read = accounting.read.clone();
                 let wire_written = accounting.written.clone();
+                let upstream_observation = observation.clone();
                 let connect = move |guest_protocol| async move {
                     let origin = async {
                         Ok(MeteredIo {
@@ -71,12 +77,25 @@ impl TcpProxy {
                         })
                     };
                     let offer = upstream_alpn_offer(client_alpn, guest_protocol);
-                    tls::connect(origin, &upstream_lease, &interception, offer)
-                        .await
-                        .map(|(io, alpn)| (io, alpn.into()))
-                        .map_err(Into::into)
+                    tls::connect(
+                        origin,
+                        &upstream_lease,
+                        &interception,
+                        offer,
+                        upstream_observation,
+                    )
+                    .await
+                    .map(|(io, alpn)| (io, alpn.into()))
+                    .map_err(Into::into)
                 };
-                tls_http::serve(downstream, binding, lease.clone(), connect).await
+                tls_http::serve(
+                    downstream,
+                    binding,
+                    lease.clone(),
+                    connect,
+                    observation.clone(),
+                )
+                .await
             };
             let result = tokio::select! {
                 biased;
@@ -91,6 +110,16 @@ impl TcpProxy {
             if result.is_ok() {
                 tracing::Span::current().record("otel.status_code", "OK");
             } else if let Err(error) = &result {
+                if matches!(
+                    error,
+                    HttpError::Transport(
+                        TlsTransportError::Invalidated | TlsTransportError::Withdrawn
+                    )
+                ) {
+                    observation.closed(Side::Downstream, Close::Local);
+                } else {
+                    observation.failure(observation.current_phase(), Some(Side::Downstream), error);
+                }
                 error.record("tls_session");
             }
             result

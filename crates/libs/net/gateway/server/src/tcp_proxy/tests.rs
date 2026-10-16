@@ -126,15 +126,20 @@ async fn failed_plaintext_connect() -> FailedPlaintextConnect {
     let relay = tokio::spawn(
         async move {
             proxy
-                .host_bound_http(gateway_guest, destination, |destination| async move {
-                    Err::<DuplexStream, _>(
-                        io::Error::new(
-                            io::ErrorKind::ConnectionRefused,
-                            format!("test connect refusal to {destination}"),
+                .host_bound_http(
+                    gateway_guest,
+                    destination,
+                    |destination| async move {
+                        Err::<DuplexStream, _>(
+                            io::Error::new(
+                                io::ErrorKind::ConnectionRefused,
+                                format!("test connect refusal to {destination}"),
+                            )
+                            .into(),
                         )
-                        .into(),
-                    )
-                })
+                    },
+                    Connection::default(),
+                )
                 .await
         }
         .with_subscriber(subscriber),
@@ -340,7 +345,12 @@ async fn a_flow_refused_before_its_client_hello_arrives_is_reset_not_ended() {
     // The guest never sends its ClientHello, so admission refuses the flow
     // with nothing unread on the socket: a plain close would be a FIN.
     let (_, outcome) = proxy
-        .handle(gateway_guest, destination, &CancellationToken::new())
+        .handle(
+            gateway_guest,
+            destination,
+            &CancellationToken::new(),
+            &Connection::default(),
+        )
         .await;
     assert!(
         matches!(outcome, FlowOutcome::Rejected(Rejection::Admission(_))),
@@ -743,7 +753,12 @@ async fn record_emits_one_connection_metric_and_reports_every_failure_outcome() 
     let hello = crate::tls_sni::test_fixtures::client_hello(Some(host.as_str()));
     client.write_all(&hello).await.unwrap();
     let (observed_host, policy_missing) = proxy
-        .handle(server, destination, &CancellationToken::new())
+        .handle(
+            server,
+            destination,
+            &CancellationToken::new(),
+            &Connection::default(),
+        )
         .await;
     let observed_host = observed_host.expect("known SNI should survive the policy failure");
     assert_eq!(observed_host, host);
@@ -801,7 +816,12 @@ async fn record_emits_one_connection_metric_and_reports_every_failure_outcome() 
             &outcome,
             FlowOutcome::Rejected(_) | FlowOutcome::RelayFailed(_)
         );
-        let reported = proxy.record(destination, Some(&observed_host), outcome);
+        let reported = proxy.record(
+            destination,
+            Some(&observed_host),
+            outcome,
+            &Connection::default(),
+        );
         assert_eq!(reported, failure);
         let connection_metrics = capture
             .finish()
@@ -811,7 +831,6 @@ async fn record_emits_one_connection_metric_and_reports_every_failure_outcome() 
 
         assert_eq!(connection_metrics.len(), 1, "{case}");
         assert_eq!(connection_metrics[0].value, 1, "{case}");
-        assert_eq!(connection_metrics[0].tags.len(), 2, "{case}");
         let mut tags = connection_metrics[0].tags.clone();
         tags.sort_unstable();
         assert!(

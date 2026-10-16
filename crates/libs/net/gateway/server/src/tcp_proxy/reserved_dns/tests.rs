@@ -80,7 +80,12 @@ async fn every_reserved_tcp_frame_is_authorized_independently() {
         outcome,
         FlowOutcome::HandledDns { messages: 2, .. }
     ));
-    proxy.record("8.8.8.8:53".parse().unwrap(), None, outcome);
+    proxy.record(
+        "8.8.8.8:53".parse().unwrap(),
+        None,
+        outcome,
+        &crate::tcp_proxy::observation::Connection::default(),
+    );
     assert_eq!(stats.tcp_total(), 1);
     assert_eq!(
         stats.network_tx_bytes(),

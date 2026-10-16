@@ -28,6 +28,7 @@ use pplx_space_net_common::DomainName;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::Mutex;
 
+use super::observation::Connection;
 use super::routing_headers::SanitizedRequest;
 use super::{
     tls_http::HttpProtocol,
@@ -156,6 +157,7 @@ pub(super) async fn serve<C, F, Fut, U>(
     guest: C,
     binding: HostBinding,
     connect: F,
+    observation: Connection,
 ) -> Result<Served, Failure>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -186,12 +188,14 @@ where
         },
         shutdown,
         CancellationToken::new(),
+        observation.clone(),
     ));
     let tally = Arc::new(Mutex::new(Served::default()));
 
     let serving = server::Builder::new().serve_connection(
         TokioIo::new(guest),
         service_fn(|request: Request<Incoming>| {
+            observation.http_request();
             let request = SanitizedRequest::try_from(request.map(Either::Left));
             let upstream = upstream.clone();
             let tally = tally.clone();
