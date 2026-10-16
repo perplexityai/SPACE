@@ -25,9 +25,10 @@ use super::network_runtime::{
     launch_net_gateway_via_node, net_gateway_launch_config, register_net_gateway_launch,
 };
 use super::recovery_cross_node::{
-    CrossNodeRestoreStagingAdmission, RestoreArtifactAsNewContext, RestoreSourceSelection,
-    SuspendRestoreDecision, SuspendRestorePlacement, codec_from_local_sidecar,
-    decide_suspend_restore, suspend_restore_placement,
+    CrossNodeRestoreRequest, CrossNodeRestoreStagingAdmission, CrossNodeRestoreTarget,
+    RestoreArtifactAsNewContext, RestoreSourceSelection, SuspendRestoreDecision,
+    SuspendRestorePlacement, codec_from_local_sidecar, decide_suspend_restore,
+    suspend_restore_placement,
 };
 use super::restart_admission::wait_for_activation_admission;
 use super::spaced_bridge::{
@@ -105,6 +106,11 @@ struct StartSandboxContext {
     from_warm: bool,
     blocking: bool,
     target_state: SandboxState,
+    /// The cross-node restore finalize arm this request selects. `from_request`
+    /// builds `StoppedDiskArtifact` only for a `Stopped` target and only with
+    /// the artifact id the request names, so a stopped boundary keyed on it
+    /// always has the id it compares.
+    restore_target: CrossNodeRestoreTarget,
     req_vcpu: Option<u32>,
     req_memory_mib: Option<u32>,
     execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
@@ -164,6 +170,68 @@ impl DeferredRestoreStart {
         }
         pplx_space_metrics::snapshot::restore_started(self.kind, self.codec, encrypted);
     }
+}
+
+/// Refuse unless the local row is a `Stopped` materialization of exactly the
+/// artifact this request named.
+///
+/// The lifecycle is not evidence. A sandbox that stopped on this node earlier
+/// and then had its disk published for backup (`EnqueueArtifactBackup` mints
+/// the pin on a stopped row) leaves the identical shape an evacuation does —
+/// `Stopped`, pinning a `disk`/`stop` artifact — so answering "your bytes are here" on the state
+/// match alone would answer for *older* bytes, and the cluster would then be
+/// free to retire the source. That is silent data loss, so the row has to name
+/// the artifact that was asked for.
+///
+/// The comparison is local because the caller already knows the answer: the
+/// cluster hands it `local_artifact_id` and `storage_uri` in one
+/// `GetArtifactBackupLocation` reply, and it forwards the id as
+/// `expected_local_artifact_id`. Reading object storage to re-derive it would
+/// put an S3 dependency on the placement path to learn something the request
+/// could simply carry — the same reasoning that has the fork transport check
+/// `RestoreArtifactAsNewContext.artifact_snapshot_id` against its URI locally.
+///
+/// Run on every stopped-target boundary, including the one that just staged the
+/// bytes: there the check is nearly free and it additionally catches a caller
+/// whose expectation disagrees with the artifact its own URI resolved to.
+fn verify_stopped_materialization(
+    sandbox: &crate::db::SandboxRow,
+    expected: pplx_space_common_core::types::LocalArtifactId,
+) -> Result<(), Status> {
+    if sandbox.state != SandboxState::Stopped {
+        return Err(Status::failed_precondition(format!(
+            "cannot materialize sandbox {} as stopped while local state is {}",
+            sandbox.id, sandbox.state
+        )));
+    }
+    let pinned = sandbox.current_local_artifact_id.ok_or_else(|| {
+        Status::failed_precondition(format!(
+            "sandbox {} is stopped locally but pins no artifact, so it cannot be the \
+             requested materialization",
+            sandbox.id
+        ))
+    })?;
+    if pinned != expected {
+        return Err(Status::failed_precondition(format!(
+            "sandbox {} is stopped locally pinning artifact {pinned}, not the requested \
+             {expected}; refusing to report a stale row as materialized",
+            sandbox.id
+        )));
+    }
+    // The kind and origin the pin carries are what make it an evacuated disk
+    // rather than a suspend checkpoint or a user's named snapshot. Checking
+    // them here rather than trusting the id keeps this the single place that
+    // decides what "is the requested materialization" means.
+    let kind = sandbox.current_local_artifact_kind;
+    let origin = sandbox.current_local_artifact_origin;
+    if !super::recovery_cross_node::is_stop_origin_disk(kind, origin) {
+        return Err(Status::failed_precondition(format!(
+            "sandbox {} pins artifact {pinned} as {kind:?}/{origin:?}, not a stop-origin disk \
+             artifact",
+            sandbox.id
+        )));
+    }
+    Ok(())
 }
 
 fn interrupted_restore_action(
@@ -264,6 +332,54 @@ impl StartSandboxContext {
             }
         }
 
+        let target_state = wake_target_state_from_proto(req.target_state)?;
+        let expected_local_artifact_id = req
+            .expected_local_artifact_id
+            .as_deref()
+            .map(str::parse::<pplx_space_common_core::types::LocalArtifactId>)
+            .transpose()
+            .map_err(|error| {
+                Status::invalid_argument(format!("invalid expected_local_artifact_id: {error}"))
+            })?;
+        if target_state != SandboxState::Stopped && expected_local_artifact_id.is_some() {
+            // The id is evidence only a stopped materialization compares;
+            // accepting it elsewhere would read like a check that never runs.
+            return Err(Status::invalid_argument(
+                "expected_local_artifact_id requires the stopped target state",
+            ));
+        }
+        if target_state == SandboxState::Stopped {
+            // Materializing an evacuated stopped sandbox is a data placement,
+            // and the inputs that describe one are a suspend checkpoint, the
+            // exact URI of its disk artifact, and which artifact that URI is.
+            // The first two say where to read from; the third is what lets the
+            // node tell an already-materialized row from stale residue without
+            // reading object storage. All three are required together, and
+            // parsing them here is the one place that decides a stopped target
+            // is well-formed.
+            if checkpoint != SUSPEND_CHECKPOINT || suspend_restore_storage_uri.is_none() {
+                return Err(Status::invalid_argument(
+                    "stopped target state requires a suspend checkpoint and an exact storage URI",
+                ));
+            }
+            // Nothing more is needed to keep a fork out: the restore-as-new
+            // block above already refuses any checkpoint (`requires a cold
+            // start`) and any target other than `Started`, so the combination
+            // cannot reach here. A second check would read like the one that
+            // closes it and would never run.
+        }
+        let restore_target = match (target_state, expected_local_artifact_id) {
+            (SandboxState::Stopped, Some(expected)) => {
+                CrossNodeRestoreTarget::StoppedDiskArtifact { expected }
+            }
+            (SandboxState::Stopped, None) => {
+                return Err(Status::invalid_argument(
+                    "stopped target state requires expected_local_artifact_id",
+                ));
+            }
+            _ => CrossNodeRestoreTarget::SuspendedCheckpoint,
+        };
+
         Ok(Self {
             activation_auto_lifecycle: req
                 .activation_auto_lifecycle
@@ -281,7 +397,8 @@ impl StartSandboxContext {
             ready_timeout_secs,
             from_warm: req.from_warm,
             blocking: req.blocking,
-            target_state: wake_target_state_from_proto(req.target_state)?,
+            target_state,
+            restore_target,
             req_vcpu: req.vcpu,
             req_memory_mib: req.memory_mib,
             execution_generation: space_api_route_identity.execution_generation,
@@ -824,6 +941,39 @@ impl SandboxManagerService {
             .map(|episode| episode.id))
     }
 
+    /// The stopped-target boundary, shared by both `Start`-side sites.
+    ///
+    /// One place records the span field, checks the row against the artifact
+    /// the request named, and builds the reply — those three steps *are* the
+    /// boundary, and keeping them in one method is what stops the two sites
+    /// drifting apart on any of them. A stopped sandbox has no runtime, so the
+    /// reply carries only the identity it converged.
+    fn materialized_stopped_response(
+        &self,
+        sandbox: &crate::db::SandboxRow,
+        expected: pplx_space_common_core::types::LocalArtifactId,
+    ) -> Result<Response<StartResponse>, Status> {
+        tracing::Span::current().record(
+            "start_execution_path",
+            SandboxStartExecutionPath::DiskMaterialize.as_str(),
+        );
+        verify_stopped_materialization(sandbox, expected)?;
+        // The row and its pin are only identity. Vouching for a placement also
+        // needs the bytes a start would boot from, or the caller could retire
+        // the source over a node that cannot run the sandbox.
+        if !(self.sandbox_rootfs_present)(&sandbox.id) {
+            return Err(Status::failed_precondition(format!(
+                "sandbox {} is stopped locally pinning artifact {expected}, but its rootfs is \
+                 missing; refusing to report it as materialized",
+                sandbox.id
+            )));
+        }
+        Ok(Response::new(StartResponse {
+            sandbox_id: sandbox.id.clone(),
+            ..Default::default()
+        }))
+    }
+
     async fn materialize_missing_checkpoint_restore(
         &self,
         sandbox_id: &str,
@@ -865,14 +1015,16 @@ impl SandboxManagerService {
         // is self-consistent rather than merely provisional.
         let cross_node_start = DeferredRestoreStart::new("cross_node", cross_node_codec_at_start);
         match self
-            .run_cross_node_restore(
+            .run_cross_node_restore(CrossNodeRestoreRequest {
                 sandbox_id,
-                ctx.suspend_restore_storage_uri.as_deref(),
-                ctx.execution_generation,
-                ctx.space_api_route_identity.activation_attempt_id,
-                ctx.restore_artifact_as_new.as_ref(),
-                CrossNodeRestoreStagingAdmission::Foreground,
-            )
+                storage_uri: ctx.suspend_restore_storage_uri.as_deref(),
+                execution_generation: ctx.execution_generation,
+                activation_attempt_id: ctx.space_api_route_identity.activation_attempt_id,
+                recovery: None,
+                restore_artifact_as_new: ctx.restore_artifact_as_new.as_ref(),
+                target: ctx.restore_target,
+                staging_admission: CrossNodeRestoreStagingAdmission::Foreground,
+            })
             .await
         {
             Ok(provenance) => {
@@ -1014,9 +1166,16 @@ impl SandboxManagerService {
                     error.stage_error_kind(),
                     cross_node_started_at,
                 );
-                Err(Status::unavailable(format!(
-                    "cross-node restore stage-in failed: {error}"
-                )))
+                // A caller that named an artifact the staged sidecar does not
+                // match cannot be helped by retrying — `UNAVAILABLE` would have
+                // it re-stage the metadata on every attempt, forever. Everything
+                // else here is a transfer or control-plane failure, which is
+                // retryable.
+                Err(if error.is_stopped_materialization_refusal() {
+                    Status::failed_precondition(error.to_string())
+                } else {
+                    Status::unavailable(format!("cross-node restore stage-in failed: {error}"))
+                })
             }
         }
     }
@@ -1029,10 +1188,15 @@ impl SandboxManagerService {
         mut restored_snapshot: RestoredSnapshotProvenance,
         cleanup_id: Option<SandboxCleanupEpisodeId>,
     ) -> Result<Response<StartResponse>, Status> {
-        tracing::Span::current().record(
-            "start_execution_path",
-            SandboxStartExecutionPath::CheckpointRestore.as_str(),
-        );
+        if ctx.target_state != SandboxState::Stopped {
+            // A stopped target records `disk_materialize` at the boundary
+            // below; recording `checkpoint_restore` here too would leave the
+            // field's value dependent on subscriber last-write semantics.
+            tracing::Span::current().record(
+                "start_execution_path",
+                SandboxStartExecutionPath::CheckpointRestore.as_str(),
+            );
+        }
         let artifact_lock = self.auto_lifecycle.artifact_lock(&sandbox.id);
         let mut artifact_guard = Some(
             start_stage(
@@ -1061,18 +1225,24 @@ impl SandboxManagerService {
                     let provenance = start_stage(
                         "restore.cross_node.retry_stage",
                         &sandbox.id,
-                        self.run_cross_node_restore(
-                            &sandbox.id,
-                            ctx.suspend_restore_storage_uri.as_deref(),
-                            ctx.execution_generation,
-                            ctx.space_api_route_identity.activation_attempt_id,
-                            ctx.restore_artifact_as_new.as_ref(),
+                        self.run_cross_node_restore(CrossNodeRestoreRequest {
+                            sandbox_id: &sandbox.id,
+                            storage_uri: ctx.suspend_restore_storage_uri.as_deref(),
+                            execution_generation: ctx.execution_generation,
+                            activation_attempt_id: ctx
+                                .space_api_route_identity
+                                .activation_attempt_id,
+                            recovery: None,
+                            restore_artifact_as_new: ctx.restore_artifact_as_new.as_ref(),
+                            target: ctx.restore_target,
                             // Zero, not the orphan path's budget: this handler
                             // already peeked the staging lock non-blockingly a few
                             // lines up and answered `unavailable`, so waiting here
                             // would add a stall the caller did not have before.
-                            CrossNodeRestoreStagingAdmission::WaitAtMost(std::time::Duration::ZERO),
-                        ),
+                            staging_admission: CrossNodeRestoreStagingAdmission::WaitAtMost(
+                                std::time::Duration::ZERO,
+                            ),
+                        }),
                     )
                     .await
                     .map_err(|error| match error {
@@ -1086,6 +1256,12 @@ impl SandboxManagerService {
                         error @ crate::snapshot_restore::RestoreError::CanonicalRootConflict {
                             ..
                         } => Status::failed_precondition(error.to_string()),
+                        // A caller that named the wrong artifact cannot be
+                        // helped by retrying: `UNAVAILABLE` would have it retry
+                        // the same refused restore on every attempt, forever.
+                        error if error.is_stopped_materialization_refusal() => {
+                            Status::failed_precondition(error.to_string())
+                        }
                         other => Status::unavailable(format!(
                             "resume interrupted cross-node restore staging failed: {other}"
                         )),
@@ -1200,6 +1376,30 @@ impl SandboxManagerService {
             sandbox = self.lookup_sandbox(&sandbox.id)?;
         }
         let _artifact_guard = artifact_guard;
+
+        // The second half of the stopped materialization's boundary, after the
+        // cleanup above rather than before it.
+        //
+        // After the resume arm above, a resumed materialization leaves the row
+        // `Stopped`, which the `expected suspended` precondition below would
+        // refuse; this is where it gets its success reply. A `CleanupRestoring`
+        // row — residue a stopped materialization never creates — gets the
+        // same filesystem-keeping retirement any checkpoint `Start` drives for
+        // it, and the row that cleanup leaves (`Suspended`) is refused here
+        // rather than launched. `start_from_checkpoint` refuses a stopped target too, so
+        // that refusal is the backstop, not the boundary.
+        //
+        // Keyed on the target alone: `materialized_stopped_response` decides by
+        // row state, answering a `Stopped` row and refusing anything else,
+        // which is exactly the split this position needs.
+        if let CrossNodeRestoreTarget::StoppedDiskArtifact { expected } = ctx.restore_target {
+            // A concurrent fresh materialization can finalize the row between
+            // this request's first look and the re-read above, so the resume
+            // arm's fence may not have run; apply it here before answering.
+            self.resolve_start_context_route_identity(&sandbox, ctx)?;
+            return self.materialized_stopped_response(&sandbox, expected);
+        }
+
         if sandbox.state != SandboxState::Suspended {
             return Err(Status::failed_precondition(format!(
                 "cannot restore sandbox {} while local state is {}; expected suspended",
@@ -1489,7 +1689,7 @@ impl SandboxManagerService {
         let ready_timeout_secs = start_ctx.ready_timeout_secs;
         let start_path = SandboxStartPath::from_request(&req);
         let span = tracing::Span::current();
-        let target_state = wake_target_state_from_proto(req.target_state)?;
+        let target_state = start_ctx.target_state;
         span.record("checkpoint_present", !checkpoint.is_empty());
         span.record("target_state", tracing::field::display(target_state));
 
@@ -1558,6 +1758,34 @@ impl SandboxManagerService {
             return Err(Status::permission_denied(
                 "space-tmplmgr may only call Start for template-owned sandboxes",
             ));
+        }
+        // The hypervisor boundary for an evacuated stopped sandbox. The local
+        // row now carries the materialized disk artifact and its pin, which is
+        // the whole of what `stopped` means on a node: a rootfs and a row, no
+        // VM.
+        //
+        // This is the first of two boundaries, not the only one. It answers
+        // every row state except `Restoring`, which has to keep going so an
+        // interrupted materialization can resume; the second boundary, inside
+        // `restore_suspended_checkpoint_start` after its cleanup, catches that
+        // one. Both are needed — the resume path can reach a launch on its own.
+        //
+        // `Restoring` is the one state that keeps going: it means a previous
+        // materialization was interrupted after adopting the row and before
+        // finalizing it. Its resume is the `ResumeSuspendCheckpoint` branch
+        // just below, which re-stages under the staging lock and then answers
+        // from the second boundary rather than launching — refusing here
+        // instead would strand the row, because nothing else drives it.
+        if let CrossNodeRestoreTarget::StoppedDiskArtifact { expected } = start_ctx.restore_target
+            && sandbox.state != SandboxState::Restoring
+        {
+            // The same route-identity resolution every restore path applies
+            // before it acts — the requested node and activation-claim checks —
+            // so a request fenced elsewhere is not told the sandbox converged.
+            // The artifact-id comparison below is what separates generations
+            // of the bytes themselves.
+            self.resolve_start_context_route_identity(&sandbox, &mut start_ctx)?;
+            return self.materialized_stopped_response(&sandbox, expected);
         }
         // Suspend-checkpoint retries serialize with artifact consumers. A
         // cancelled first attempt may leave either a live Restoring runtime or
@@ -2590,4 +2818,4 @@ fn firecracker_balloon_field(
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

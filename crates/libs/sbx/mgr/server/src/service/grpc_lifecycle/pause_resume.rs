@@ -502,6 +502,7 @@ impl SandboxManagerService {
                 target_state,
                 suspend_restore_storage_uri: start_context.suspend_restore_storage_uri.clone(),
                 suspend_restore_source_node: start_context.suspend_restore_source_node.clone(),
+                expected_local_artifact_id: start_context.expected_local_artifact_id.clone(),
                 requested_space_api_route_identity: Some(space_api_route_identity.clone()),
                 space_api_route_identity,
                 route_identity_provenance,
@@ -531,23 +532,46 @@ impl SandboxManagerService {
             self.lookup_sandbox(&sandbox_id)?;
         }
 
-        // If the sandbox row is absent locally, stage from a checkpoint so
-        // `wake_with_start_config` below sees a `Suspended` row to wake.
+        // For any other target, an absent local row is staged from a checkpoint
+        // so `wake_with_start_config` below sees a `Suspended` row to wake.
         // `blocking: false` here keeps the ready-wait and the user-facing
         // `WakeTransition` reporting on `wake_with_start_config`; a
         // blocking restore here would double-take the wake lock and the
         // outer call would report `Noop`.
-        if let Err(status) = self.lookup_sandbox(&sandbox_id)
-            && status.code() == tonic::Code::NotFound
-        {
+        // A stopped target always delegates to `Start`; otherwise only an absent
+        // row does.
+        //
+        // `Start` already answers every shape a stopped target can meet —
+        // absent row → materialize, `Stopped` → check it against the requested
+        // artifact and return, a retryable `Restoring` → resume the interrupted
+        // materialization, a non-retryable `Restoring` → the same
+        // filesystem-keeping retirement a started `Start` drives, then refuse,
+        // anything else → refuse — and `resolve_start_sandbox_target`
+        // returns `Local` for a present row in any state, so nothing between
+        // here and that boundary refuses one first. Routing the target through
+        // the wake dispatch instead would need `wake_transition_for_state` to
+        // know the target, which it structurally cannot: it maps current state
+        // to transition, and for a stopped target the whole table inverts
+        // (`Stopped` is converged, `Restoring` needs driving, `Started` is a
+        // refusal). Delegating keeps one owner for the rule.
+        let stage_from_checkpoint = target_state == SandboxState::Stopped
+            || matches!(
+                self.lookup_sandbox(&sandbox_id),
+                Err(ref status) if status.code() == tonic::Code::NotFound
+            );
+        if stage_from_checkpoint {
             // `target_state` propagates here too: with `blocking: false`,
             // `start_sandbox` still routes through `start_from_checkpoint`
             // and runs the resume RPC unless we tell it to stop at
             // paused. Without this propagation the staged-in restore
             // would transition through `Started` before
             // `wake_with_start_config` observes the row.
+            // A stopped target only places disk bytes and never launches, so it
+            // has no use for a runtime namespace; requiring one would refuse a
+            // Kubernetes-identity materialization that carries none.
             let netns_path = match start.network_context.netns_path_for_launch() {
                 Ok(netns_path) => netns_path,
+                Err(_) if target_state == SandboxState::Stopped => None,
                 Err(error) => {
                     emit_sandbox_event(
                         &sandbox_id,
@@ -577,6 +601,7 @@ impl SandboxManagerService {
                         target_state: req.target_state,
                         suspend_restore_storage_uri: start.suspend_restore_storage_uri.clone(),
                         suspend_restore_source_node: start.suspend_restore_source_node.clone(),
+                        expected_local_artifact_id: start.expected_local_artifact_id.clone(),
                         route_identity: space_api_route_identity_to_wire(
                             &start.space_api_route_identity,
                         ),
@@ -601,6 +626,38 @@ impl SandboxManagerService {
                 );
                 return Err(error);
             }
+        }
+
+        // The staging `Start` above owns the stopped target end to end — it
+        // verified the row against the requested artifact and refused if it
+        // could not — so all that is left is to report it. Re-deriving any of
+        // that here would put the same rule in two handlers.
+        if target_state == SandboxState::Stopped {
+            let sandbox = self.lookup_sandbox(&sandbox_id)?;
+            emit_sandbox_event(
+                &sandbox_id,
+                SandboxEventType::WakeCompleted,
+                SandboxEventSource::SbxManager,
+                SandboxEventDetails::default().target_state(target_state.to_string()),
+            );
+            if publish_node_state {
+                mark_sandbox_dirty(&self.db, &sandbox_id);
+            }
+            // `Restore` is the least wrong of the five. It is exact when this
+            // call materialized the sandbox, and an overstatement on an
+            // idempotent re-issue, where the delegated `Start` only re-checked
+            // a row that was already here and nothing was pulled. The
+            // alternatives are worse in kind rather than in degree: `Resume`
+            // and `Start` claim a runtime that does not exist, `Wait` says the
+            // call watched someone else's transition, and `Noop` denies the
+            // materialization on the path that actually performed one.
+            // `WakeTransition` has no "already converged" member to say it
+            // properly.
+            return Ok(Response::new(WakeResponse {
+                sandbox_id,
+                transition: WakeTransition::Restore as i32,
+                route_identity: space_api_route_identity_to_wire(&sandbox.space_api_route_identity),
+            }));
         }
 
         // The cold-path artifact-dir permission repair runs in

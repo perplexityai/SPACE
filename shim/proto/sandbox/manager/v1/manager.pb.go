@@ -830,6 +830,18 @@ const (
 	WakeTargetState_WAKE_TARGET_STATE_UNSPECIFIED WakeTargetState = 0
 	WakeTargetState_WAKE_TARGET_STATE_STARTED     WakeTargetState = 1
 	WakeTargetState_WAKE_TARGET_STATE_PAUSED      WakeTargetState = 2
+	// Materialize an evacuated `stopped` sandbox on this node and leave it
+	// stopped. The request must carry the exact storage URI of a `stop`-origin
+	// DISK artifact belonging to this same sandbox id; the node stages the
+	// rootfs, pins the artifact on the local row, and returns. No Firecracker
+	// process is created: booting a microVM only to stop it again would run the
+	// guest's init and mutate the rootfs a stopped sandbox is meant to keep
+	// inert.
+	//
+	// A sandbox-manager that predates this value rejects it as an unknown
+	// target_state with INVALID_ARGUMENT before any mutation, so a mixed fleet
+	// fails closed without pulling the rootfs.
+	WakeTargetState_WAKE_TARGET_STATE_STOPPED WakeTargetState = 3
 )
 
 // Enum value maps for WakeTargetState.
@@ -838,11 +850,13 @@ var (
 		0: "WAKE_TARGET_STATE_UNSPECIFIED",
 		1: "WAKE_TARGET_STATE_STARTED",
 		2: "WAKE_TARGET_STATE_PAUSED",
+		3: "WAKE_TARGET_STATE_STOPPED",
 	}
 	WakeTargetState_value = map[string]int32{
 		"WAKE_TARGET_STATE_UNSPECIFIED": 0,
 		"WAKE_TARGET_STATE_STARTED":     1,
 		"WAKE_TARGET_STATE_PAUSED":      2,
+		"WAKE_TARGET_STATE_STOPPED":     3,
 	}
 )
 
@@ -2092,6 +2106,9 @@ type StartRequest struct {
 	// Unspecified → STARTED. PAUSED skips the post-load resume so the
 	// restored VM stays in the firecracker-paused state. Used by the
 	// cluster-controller's lifecycle-preserving drain evacuation path.
+	// STOPPED materializes an evacuated stopped sandbox's disk artifact and
+	// stops there; it requires `checkpoint = "suspend"` plus an exact
+	// `suspend_restore_storage_uri`, and never launches Firecracker.
 	TargetState WakeTargetState `protobuf:"varint,9,opt,name=target_state,json=targetState,proto3,enum=space.sandbox.manager.v1.WakeTargetState" json:"target_state,omitempty"`
 	// Internal-only exact S3 fallback for `checkpoint = "suspend"`.
 	SuspendRestoreStorageUri *string `protobuf:"bytes,10,opt,name=suspend_restore_storage_uri,json=suspendRestoreStorageUri,proto3,oneof" json:"suspend_restore_storage_uri,omitempty"`
@@ -2114,6 +2131,20 @@ type StartRequest struct {
 	// Callers must check activation-policy capability before sending this field.
 	// Omission preserves the existing policy.
 	ActivationAutoLifecycle *AutoLifecyclePolicy `protobuf:"bytes,19,opt,name=activation_auto_lifecycle,json=activationAutoLifecycle,proto3,oneof" json:"activation_auto_lifecycle,omitempty"`
+	// Required with `target_state = STOPPED`: the local artifact id that
+	// `suspend_restore_storage_uri` identifies. The caller has it — the cluster
+	// hands back `local_artifact_id` and `storage_uri` in the same
+	// `GetArtifactBackupLocation` reply — and naming it lets the node tell "this
+	// row already is that artifact" from "this row is residue from an earlier
+	// life on this node" by comparing ids locally. Without it the two are
+	// indistinguishable: a sandbox stopped here earlier whose disk was then
+	// published for backup leaves the same `stopped` row with the same
+	// `disk`/`stop` pin an evacuation does, so reporting
+	// convergence on the lifecycle alone would answer for older bytes and let
+	// the source be retired. Same shape as
+	// `RestoreArtifactAsNewContext.artifact_snapshot_id`, which the fork
+	// transport already checks against its URI locally.
+	ExpectedLocalArtifactId *string `protobuf:"bytes,20,opt,name=expected_local_artifact_id,json=expectedLocalArtifactId,proto3,oneof" json:"expected_local_artifact_id,omitempty"`
 	unknownFields           protoimpl.UnknownFields
 	sizeCache               protoimpl.SizeCache
 }
@@ -2251,6 +2282,13 @@ func (x *StartRequest) GetActivationAutoLifecycle() *AutoLifecyclePolicy {
 		return x.ActivationAutoLifecycle
 	}
 	return nil
+}
+
+func (x *StartRequest) GetExpectedLocalArtifactId() string {
+	if x != nil && x.ExpectedLocalArtifactId != nil {
+		return *x.ExpectedLocalArtifactId
+	}
+	return ""
 }
 
 type StartResponse struct {
@@ -4713,6 +4751,9 @@ type WakeRequest struct {
 	// suspend snapshot but leaves it in the paused state instead of
 	// issuing the post-load resume — preserving the user-visible
 	// `paused` lifecycle without an additional pause RPC after wake.
+	// STOPPED is the same evacuation for a `stopped` resident: it stages the
+	// disk artifact and returns with the sandbox still stopped, without
+	// waking anything.
 	TargetState WakeTargetState `protobuf:"varint,4,opt,name=target_state,json=targetState,proto3,enum=space.sandbox.manager.v1.WakeTargetState" json:"target_state,omitempty"`
 	// Unspecified is explicit operator wake. Access/command wakes must honor the
 	// worker's effective policy under wake exclusion. Requires blocking STARTED.
@@ -4802,8 +4843,11 @@ type WakeStartContext struct {
 	// Resident-resume fence only; never authority for a fresh activation.
 	// Requires activation_auto_lifecycle. Absent matches only a legacy resident.
 	ExpectedExecutionGeneration *int64 `protobuf:"varint,13,opt,name=expected_execution_generation,json=expectedExecutionGeneration,proto3,oneof" json:"expected_execution_generation,omitempty"`
-	unknownFields               protoimpl.UnknownFields
-	sizeCache                   protoimpl.SizeCache
+	// Required with `target_state = STOPPED`; see
+	// `StartRequest.expected_local_artifact_id`, which this is forwarded to.
+	ExpectedLocalArtifactId *string `protobuf:"bytes,14,opt,name=expected_local_artifact_id,json=expectedLocalArtifactId,proto3,oneof" json:"expected_local_artifact_id,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
 }
 
 func (x *WakeStartContext) Reset() {
@@ -4897,6 +4941,13 @@ func (x *WakeStartContext) GetExpectedExecutionGeneration() int64 {
 		return *x.ExpectedExecutionGeneration
 	}
 	return 0
+}
+
+func (x *WakeStartContext) GetExpectedLocalArtifactId() string {
+	if x != nil && x.ExpectedLocalArtifactId != nil {
+		return *x.ExpectedLocalArtifactId
+	}
+	return ""
 }
 
 type WakeResponse struct {
@@ -12725,7 +12776,7 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"_namespaceB\v\n" +
 	"\t_log_pathB\x11\n" +
 	"\x0f_vsock_uds_pathB\x11\n" +
-	"\x0f_route_identity\"\xfb\b\n" +
+	"\x0f_route_identity\"\xdc\t\n" +
 	"\fStartRequest\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x17\n" +
@@ -12748,7 +12799,8 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\x17restore_artifact_as_new\x18\x11 \x01(\v25.space.sandbox.manager.v1.RestoreArtifactAsNewContextH\bR\x14restoreArtifactAsNew\x88\x01\x01\x12J\n" +
 	"\x1foperation_activation_attempt_id\x18\x12 \x01(\tH\tR\x1coperationActivationAttemptId\x88\x01\x01\x12n\n" +
 	"\x19activation_auto_lifecycle\x18\x13 \x01(\v2-.space.sandbox.manager.v1.AutoLifecyclePolicyH\n" +
-	"R\x17activationAutoLifecycle\x88\x01\x01B\a\n" +
+	"R\x17activationAutoLifecycle\x88\x01\x01\x12@\n" +
+	"\x1aexpected_local_artifact_id\x18\x14 \x01(\tH\vR\x17expectedLocalArtifactId\x88\x01\x01B\a\n" +
 	"\x05_vcpuB\r\n" +
 	"\v_memory_mibB\r\n" +
 	"\v_checkpointB\r\n" +
@@ -12759,7 +12811,8 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\x0f_route_identityB\x1a\n" +
 	"\x18_restore_artifact_as_newB\"\n" +
 	" _operation_activation_attempt_idB\x1c\n" +
-	"\x1a_activation_auto_lifecycle\"\xcb\x02\n" +
+	"\x1a_activation_auto_lifecycleB\x1d\n" +
+	"\x1b_expected_local_artifact_id\"\xcb\x02\n" +
 	"\rStartResponse\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x10\n" +
@@ -13037,7 +13090,7 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\rstart_context\x18\x03 \x01(\v2*.space.sandbox.manager.v1.WakeStartContextH\x00R\fstartContext\x88\x01\x01\x12L\n" +
 	"\ftarget_state\x18\x04 \x01(\x0e2).space.sandbox.manager.v1.WakeTargetStateR\vtargetState\x12c\n" +
 	"\x14implicit_wake_source\x18\x05 \x01(\x0e21.space.sandbox.manager.v1.AutoLifecycleWakeSourceR\x12implicitWakeSourceB\x10\n" +
-	"\x0e_start_context\"\xb7\x06\n" +
+	"\x0e_start_context\"\x98\a\n" +
 	"\x10WakeStartContext\x12\x17\n" +
 	"\x04vcpu\x18\x01 \x01(\rH\x00R\x04vcpu\x88\x01\x01\x12\"\n" +
 	"\n" +
@@ -13050,7 +13103,8 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	" \x01(\v2+.space.net.gateway.v1.SpaceApiRouteIdentityH\x05R\rrouteIdentity\x88\x01\x01\x12J\n" +
 	"\x1foperation_activation_attempt_id\x18\v \x01(\tH\x06R\x1coperationActivationAttemptId\x88\x01\x01\x12n\n" +
 	"\x19activation_auto_lifecycle\x18\f \x01(\v2-.space.sandbox.manager.v1.AutoLifecyclePolicyH\aR\x17activationAutoLifecycle\x88\x01\x01\x12G\n" +
-	"\x1dexpected_execution_generation\x18\r \x01(\x03H\bR\x1bexpectedExecutionGeneration\x88\x01\x01B\a\n" +
+	"\x1dexpected_execution_generation\x18\r \x01(\x03H\bR\x1bexpectedExecutionGeneration\x88\x01\x01\x12@\n" +
+	"\x1aexpected_local_artifact_id\x18\x0e \x01(\tH\tR\x17expectedLocalArtifactId\x88\x01\x01B\a\n" +
 	"\x05_vcpuB\r\n" +
 	"\v_memory_mibB\r\n" +
 	"\v_netns_pathB\x1e\n" +
@@ -13059,7 +13113,8 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\x0f_route_identityB\"\n" +
 	" _operation_activation_attempt_idB\x1c\n" +
 	"\x1a_activation_auto_lifecycleB \n" +
-	"\x1e_expected_execution_generation\"\xe3\x01\n" +
+	"\x1e_expected_execution_generationB\x1d\n" +
+	"\x1b_expected_local_artifact_id\"\xe3\x01\n" +
 	"\fWakeResponse\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12H\n" +
@@ -13841,11 +13896,12 @@ const file_sandbox_manager_v1_manager_proto_rawDesc = "" +
 	"\x16MissingDiskUsageReason\x12)\n" +
 	"%MISSING_DISK_USAGE_REASON_UNSPECIFIED\x10\x00\x12/\n" +
 	"+MISSING_DISK_USAGE_REASON_SANDBOX_NOT_FOUND\x10\x01\x123\n" +
-	"/MISSING_DISK_USAGE_REASON_INSTANCE_PATH_MISSING\x10\x02*q\n" +
+	"/MISSING_DISK_USAGE_REASON_INSTANCE_PATH_MISSING\x10\x02*\x90\x01\n" +
 	"\x0fWakeTargetState\x12!\n" +
 	"\x1dWAKE_TARGET_STATE_UNSPECIFIED\x10\x00\x12\x1d\n" +
 	"\x19WAKE_TARGET_STATE_STARTED\x10\x01\x12\x1c\n" +
-	"\x18WAKE_TARGET_STATE_PAUSED\x10\x02*]\n" +
+	"\x18WAKE_TARGET_STATE_PAUSED\x10\x02\x12\x1d\n" +
+	"\x19WAKE_TARGET_STATE_STOPPED\x10\x03*]\n" +
 	"\fSnapshotType\x12\x1d\n" +
 	"\x19SNAPSHOT_TYPE_UNSPECIFIED\x10\x00\x12\x16\n" +
 	"\x12SNAPSHOT_TYPE_DISK\x10\x01\x12\x16\n" +

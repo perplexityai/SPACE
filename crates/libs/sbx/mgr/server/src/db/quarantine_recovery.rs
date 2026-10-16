@@ -48,7 +48,7 @@ pub struct QuarantineRecoveryCandidate {
 ///
 /// The artifact-free branch is keyed on the reason code, not merely on the
 /// absent artifact: `OrphanedSandboxRowMissing` is the only reason
-/// `run_cross_node_restore_inner` will stage a snapshot for, so any other reason
+/// `run_cross_node_restore` will stage a snapshot for, so any other reason
 /// admitted here would occupy the node-wide restore permit for a plan lookup and
 /// a claim every backoff interval and never progress.
 ///

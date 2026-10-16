@@ -36,6 +36,7 @@ pub(super) fn pooled_wake_request(
             netns_path: None,
             suspend_restore_storage_uri: None,
             suspend_restore_source_node: None,
+            expected_local_artifact_id: None,
             route_identity: Some(pplx_space_sbx_mgr_client::proto::SpaceApiRouteIdentity {
                 sandbox_id: None,
                 route_generation: Some(claim.execution_generation),

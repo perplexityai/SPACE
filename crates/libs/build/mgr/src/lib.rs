@@ -555,6 +555,7 @@ fn build_vm_start_request(sandbox_id: String, vcpu: u32, memory_mib: u32) -> Sta
         activation_auto_lifecycle: None,
         operation_activation_attempt_id: None,
         restore_artifact_as_new: None,
+        expected_local_artifact_id: None,
         sandbox_id,
         vcpu: Some(vcpu),
         memory_mib: Some(memory_mib),

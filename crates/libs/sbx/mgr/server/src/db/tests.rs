@@ -2454,6 +2454,466 @@ fn publish_restored_suspended_artifact_dedupes_prior_suspend_row() {
     assert_eq!(count, 1);
 }
 
+/// The property, in operator terms: after a stopped sandbox is evacuated onto
+/// a new node, the cluster can still find its bytes.
+///
+/// `sandboxes.current_local_artifact_id` is the sandbox's only handle on the
+/// disk it was evacuated with: `GetArtifactBackupLocation` selects a ready
+/// remote copy for one exact `local_artifact_id`
+/// (`proto/node/api/v1/cluster.proto:1236`), which is how eviction proves
+/// durability and how a later restore finds the bytes. A move that lands the
+/// row in `stopped` without it produces a sandbox that looks healthy and whose
+/// durable copy nothing can name.
+#[test]
+fn materializing_a_stopped_sandbox_keeps_the_artifact_pin_it_was_evacuated_with() {
+    let conn = test_conn();
+    insert_test_sandbox(
+        &conn,
+        TestSandboxInsert::new("sandbox-1", "sandbox1", SandboxState::Restoring),
+    );
+    conn.execute(
+        "UPDATE sandboxes
+         SET pid = 42,
+             space_api_route_generation = 9,
+             space_api_route_execution_generation = 7,
+             restore_storage_uri = 's3://bucket/snapshot'
+         WHERE id = 'sandbox-1'",
+        [],
+    )
+    .unwrap();
+    assert!(
+        insert_restore_transfer_scope(
+            &conn,
+            "sandbox-1",
+            pplx_space_common_core::types::TransferScopeId::new(),
+            None,
+            None,
+            "/space/cache/restore-staging/evacuated-stopped",
+        )
+        .unwrap()
+    );
+    let evacuated = LocalArtifactId::new();
+
+    publish_restored_stopped_artifact(&conn, "sandbox-1", evacuated, "/cache/sandbox-1/snapshot")
+        .unwrap();
+
+    let (state, pin, kind, origin): (String, Option<String>, Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT state, current_local_artifact_id, current_local_artifact_kind,
+                    current_local_artifact_origin
+             FROM sandboxes WHERE id = 'sandbox-1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(state, SandboxState::Stopped.as_str());
+    assert_eq!(
+        pin.as_deref(),
+        Some(evacuated.to_string().as_str()),
+        "the materialized row must pin the artifact that was evacuated, not a fresh one"
+    );
+    assert_eq!(kind.as_deref(), Some(ArtifactKind::Disk.as_str()));
+    assert_eq!(origin.as_deref(), Some(ArtifactOrigin::Stop.as_str()));
+
+    // The pin has to name a row that exists: the eviction and backup paths
+    // resolve it through `local_artifacts` to reach the bytes and their
+    // `backup_completed_at` proof, so a dangling id is the same outage as a
+    // null.
+    let row = get_local_artifact(&conn, evacuated)
+        .unwrap()
+        .expect("the pinned artifact must have a local_artifacts row");
+    assert_eq!(row.local_path, "/cache/sandbox-1/snapshot");
+    assert_eq!(row.artifact_kind, ArtifactKind::Disk);
+    assert_eq!(row.artifact_origin, ArtifactOrigin::Stop);
+}
+
+/// The two restore finalizes share one helper, and they disagree about
+/// `failure_reason` — so the disagreement needs an assertion, not a comment.
+///
+/// The suspended publication has never cleared it; the stopped one does, like
+/// every other restore finalize. Unifying them is defensible, but it would
+/// change a path this work does not own, so the asymmetry is preserved. It was
+/// invisible to the suite before this test: extracting the shared helper
+/// silently applied the stopped arm's behaviour to both, and nothing failed.
+#[test]
+fn the_shared_restore_finalize_keeps_each_arms_failure_reason_behaviour() {
+    let reason_after = |state: SandboxState, id: &str, uuid8: &str| -> Option<String> {
+        let conn = test_conn();
+        insert_test_sandbox(
+            &conn,
+            TestSandboxInsert::new(id, uuid8, SandboxState::Restoring),
+        );
+        conn.execute(
+            "UPDATE sandboxes SET failure_reason = 'an earlier attempt failed' WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
+        let pin = LocalArtifactId::new();
+        let path = format!("/cache/{id}/snapshot");
+        match state {
+            SandboxState::Stopped => {
+                publish_restored_stopped_artifact(&conn, id, pin, &path).unwrap()
+            }
+            SandboxState::Suspended => {
+                publish_restored_suspended_artifact(&conn, id, pin, &path).unwrap()
+            }
+            other => panic!("unexpected finalize target {other}"),
+        }
+        conn.query_row(
+            "SELECT failure_reason FROM sandboxes WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+
+    assert_eq!(
+        reason_after(SandboxState::Stopped, "stopped-1", "stopped1"),
+        None,
+        "a materialized stopped sandbox starts clean, like every other restore finalize"
+    );
+    assert_eq!(
+        reason_after(SandboxState::Suspended, "suspend-1", "suspend1"),
+        Some("an earlier attempt failed".to_string()),
+        "the suspended finalize has never cleared it; sharing a helper must not change that"
+    );
+}
+
+/// The contrast that makes the third arm load-bearing rather than duplicative.
+///
+/// Both primitives land the row in `stopped` from `restoring`, so a reader --
+/// or a future simplification pass -- can mistake them for the same operation.
+/// They have opposite postconditions on the pin: the fork arm drops it so the
+/// staged disk stays an immutable source for the child's cold boot, and the
+/// evacuation arm keeps it because it is the sandbox's own disk. Asserting
+/// them side by side is what makes a collapse of the two fail here.
+#[test]
+fn the_fork_arm_drops_the_pin_the_evacuation_arm_keeps() {
+    let read_pin = |conn: &Connection, id: &str| -> Option<String> {
+        conn.query_row(
+            "SELECT current_local_artifact_id FROM sandboxes WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+
+    let conn = test_conn();
+    insert_test_sandbox(
+        &conn,
+        TestSandboxInsert::new("forked", "forked01", SandboxState::Restoring),
+    );
+    insert_test_sandbox(
+        &conn,
+        TestSandboxInsert::new("evacuated", "evacuat1", SandboxState::Restoring),
+    );
+    let evacuated_pin = LocalArtifactId::new();
+
+    publish_restored_disk_as_new(&conn, "forked").unwrap();
+    publish_restored_stopped_artifact(
+        &conn,
+        "evacuated",
+        evacuated_pin,
+        "/cache/evacuated/snapshot",
+    )
+    .unwrap();
+
+    assert_eq!(
+        read_pin(&conn, "forked"),
+        None,
+        "a fork must leave the staged disk unpinned so it cannot become the child's checkpoint"
+    );
+    assert_eq!(
+        read_pin(&conn, "evacuated"),
+        Some(evacuated_pin.to_string()),
+        "an evacuated stopped sandbox must keep the pin its durable copy is found through"
+    );
+}
+
+/// A materialized stopped sandbox was never launched on this node, so the row
+/// must not describe a runtime or a route as if it had been. This mirrors
+/// `publish_stopped_artifact`, which is what publishing a locally stopped
+/// sandbox's disk leaves behind, in the runtime and route columns it clears.
+#[test]
+fn materializing_a_stopped_sandbox_leaves_no_runtime_or_route_identity() {
+    let conn = test_conn();
+    insert_test_sandbox(
+        &conn,
+        TestSandboxInsert::new("sandbox-1", "sandbox1", SandboxState::Restoring),
+    );
+    conn.execute(
+        "UPDATE sandboxes
+         SET pid = 42,
+             guest_cid = 11,
+             space_api_route_generation = 9,
+             space_api_route_execution_generation = 7,
+             restore_storage_uri = 's3://bucket/snapshot',
+             restore_phase = 'artifact_staging'
+         WHERE id = 'sandbox-1'",
+        [],
+    )
+    .unwrap();
+
+    publish_restored_stopped_artifact(
+        &conn,
+        "sandbox-1",
+        LocalArtifactId::new(),
+        "/cache/sandbox-1/snapshot",
+    )
+    .unwrap();
+
+    let nulled = |column: &str| -> bool {
+        conn.query_row(
+            &format!("SELECT {column} IS NULL FROM sandboxes WHERE id = 'sandbox-1'"),
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap()
+    };
+
+    for column in [
+        "pid",
+        "guest_cid",
+        "space_api_route_generation",
+        "space_api_route_execution_generation",
+        "restore_storage_uri",
+        "restore_phase",
+    ] {
+        assert!(
+            nulled(column),
+            "{column} still describes an activation this sandbox never had"
+        );
+    }
+}
+
+/// The dedupe removes what would collide, and only that.
+///
+/// Two things can collide with a materialization: a row already at the path it
+/// claims (two rows sharing a path trip the reaper's `SharedLocalPath` gate,
+/// which then reaps neither), and a row already holding the artifact id being
+/// inserted, which is the table's primary key. A row of the same origin at a
+/// different path owns different bytes and must survive.
+#[test]
+fn materializing_a_stopped_sandbox_removes_only_what_would_collide() {
+    let conn = test_conn();
+    insert_test_sandbox(
+        &conn,
+        TestSandboxInsert::new("sandbox-1", "sandbox1", SandboxState::Restoring),
+    );
+    let evacuated = LocalArtifactId::new();
+    let materialized_path = format!("/cache/sandbox-1/snapshots/d-stop-{evacuated}");
+    let materialized_path = materialized_path.as_str();
+
+    // Collides on the path: any row already naming the path this claims.
+    let stale_suspend = LocalArtifactId::new();
+    insert_local_artifact(
+        &conn,
+        "sandbox-1",
+        stale_suspend,
+        ArtifactKind::Full,
+        ArtifactOrigin::Suspend,
+        None,
+        materialized_path,
+    )
+    .unwrap();
+
+    // Does NOT collide: a locally published stop artifact in its own
+    // subvolume. Deleting it would orphan the subvolume, because the reaper is
+    // the only thing that would ever free it.
+    let local_stop = LocalArtifactId::new();
+    insert_local_artifact(
+        &conn,
+        "sandbox-1",
+        local_stop,
+        ArtifactKind::Disk,
+        ArtifactOrigin::Stop,
+        None,
+        "/cache/sandbox-1/snapshots/d-stop-earlier",
+    )
+    .unwrap();
+
+    publish_restored_stopped_artifact(&conn, "sandbox-1", evacuated, materialized_path).unwrap();
+
+    assert!(
+        get_local_artifact(&conn, stale_suspend).unwrap().is_none(),
+        "the row sharing the materialized path must go, or the reaper reaps neither"
+    );
+    assert!(
+        get_local_artifact(&conn, local_stop).unwrap().is_some(),
+        "a stop artifact in its own subvolume owns different bytes and must survive"
+    );
+    let at_path: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM local_artifacts WHERE local_path = ?1",
+            params![materialized_path],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(at_path, 1);
+}
+
+/// The other collision: the artifact id is the table's primary key, so a row
+/// already holding it — at any path — would fail the insert and roll the whole
+/// publication back, leaving the sandbox `restoring` with every retry failing
+/// the same way. The existing row is where a local publication of that
+/// artifact would put it, `d-stop-{artifact}`, which is also the path the
+/// stopped arm records, so replacing it strands nothing.
+#[test]
+fn materializing_a_stopped_sandbox_replaces_a_row_already_holding_that_artifact() {
+    let conn = test_conn();
+    insert_test_sandbox(
+        &conn,
+        TestSandboxInsert::new("sandbox-1", "sandbox1", SandboxState::Restoring),
+    );
+    let artifact = LocalArtifactId::new();
+    let stop_path = format!("/cache/sandbox-1/snapshots/d-stop-{artifact}");
+    insert_local_artifact(
+        &conn,
+        "sandbox-1",
+        artifact,
+        ArtifactKind::Disk,
+        ArtifactOrigin::Stop,
+        None,
+        &stop_path,
+    )
+    .unwrap();
+
+    publish_restored_stopped_artifact(&conn, "sandbox-1", artifact, &stop_path)
+        .expect("re-materializing the same artifact must not collide on the primary key");
+
+    let row = get_local_artifact(&conn, artifact).unwrap().unwrap();
+    assert_eq!(row.local_path, stop_path);
+    assert_eq!(
+        conn.query_row(
+            "SELECT state FROM sandboxes WHERE id = 'sandbox-1'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap(),
+        SandboxState::Stopped.as_str(),
+    );
+}
+
+/// The id half of the dedupe on its own: a row holding the artifact id at a
+/// different path would collide on the primary key, so it is replaced even
+/// though no row names the claimed path.
+#[test]
+fn materializing_a_stopped_sandbox_replaces_the_id_holder_at_another_path() {
+    let conn = test_conn();
+    insert_test_sandbox(
+        &conn,
+        TestSandboxInsert::new("sandbox-1", "sandbox1", SandboxState::Restoring),
+    );
+    let artifact = LocalArtifactId::new();
+    insert_local_artifact(
+        &conn,
+        "sandbox-1",
+        artifact,
+        ArtifactKind::Disk,
+        ArtifactOrigin::Stop,
+        None,
+        "/cache/sandbox-1/elsewhere",
+    )
+    .unwrap();
+    let stop_path = format!("/cache/sandbox-1/snapshots/d-stop-{artifact}");
+
+    publish_restored_stopped_artifact(&conn, "sandbox-1", artifact, &stop_path)
+        .expect("the id holder at another path must be replaced, not collide");
+
+    assert_eq!(
+        get_local_artifact(&conn, artifact)
+            .unwrap()
+            .unwrap()
+            .local_path,
+        stop_path
+    );
+}
+
+/// Fails closed on a row that is not the restore this finalize owns. The
+/// `restoring` + unpinned guard is what stops a materialization that lost its
+/// claim from overwriting the pin of whatever now holds the row.
+#[test]
+fn materializing_a_stopped_sandbox_refuses_a_row_that_left_restoring() {
+    let conn = test_conn();
+    insert_test_sandbox(
+        &conn,
+        TestSandboxInsert::new("sandbox-1", "sandbox1", SandboxState::Started),
+    );
+
+    let error = publish_restored_stopped_artifact(
+        &conn,
+        "sandbox-1",
+        LocalArtifactId::new(),
+        "/cache/sandbox-1/snapshot",
+    )
+    .expect_err("a row that is no longer restoring must not be republished as stopped");
+
+    assert!(matches!(error, rusqlite::Error::QueryReturnedNoRows));
+    let state: String = conn
+        .query_row(
+            "SELECT state FROM sandboxes WHERE id = 'sandbox-1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        state,
+        SandboxState::Started.as_str(),
+        "the refusal must leave the row it did not own untouched"
+    );
+    let artifacts: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM local_artifacts WHERE sandbox_id = 'sandbox-1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        artifacts, 0,
+        "the whole publish is one transaction; a refused UPDATE must roll back its INSERT"
+    );
+}
+
+/// The other half of the guard: a `restoring` row that already pins an
+/// artifact belongs to a finalize that already ran, so a second one must not
+/// overwrite its pin.
+#[test]
+fn materializing_a_stopped_sandbox_refuses_a_row_that_already_pins() {
+    let conn = test_conn();
+    insert_test_sandbox(
+        &conn,
+        TestSandboxInsert::new("sandbox-1", "sandbox1", SandboxState::Restoring),
+    );
+    let existing = LocalArtifactId::new();
+    conn.execute(
+        "UPDATE sandboxes
+         SET current_local_artifact_id = ?1,
+             current_local_artifact_kind = 'disk',
+             current_local_artifact_origin = 'stop'
+         WHERE id = 'sandbox-1'",
+        params![existing.to_string()],
+    )
+    .unwrap();
+
+    let error = publish_restored_stopped_artifact(
+        &conn,
+        "sandbox-1",
+        LocalArtifactId::new(),
+        "/cache/sandbox-1/snapshot",
+    )
+    .expect_err("a restoring row that already pins must not be republished");
+
+    assert!(matches!(error, rusqlite::Error::QueryReturnedNoRows));
+    let pinned: String = conn
+        .query_row(
+            "SELECT current_local_artifact_id FROM sandboxes WHERE id = 'sandbox-1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pinned, existing.to_string());
+}
+
 #[test]
 fn restored_disk_as_new_becomes_a_stopped_sandbox_without_donor_runtime_identity() {
     let conn = test_conn();

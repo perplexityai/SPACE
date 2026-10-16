@@ -322,18 +322,47 @@ async fn acquire_canonical_reclamation_fences(
     (cleanup_fence, staging_guard)
 }
 
-struct CrossNodeRestoreRequest<'a> {
-    sandbox_id: &'a str,
-    storage_uri: Option<&'a str>,
-    execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
-    activation_attempt_id: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
-    recovery: Option<QuarantineRecoveryContext<'a>>,
-    restore_artifact_as_new: Option<&'a RestoreArtifactAsNewContext>,
-    staging_admission: CrossNodeRestoreStagingAdmission,
+/// Which local-row outcome a plain same-id cross-node restore converges on.
+///
+/// The quarantine-recovery and restore-as-new arms select themselves from
+/// their own context fields, so this only distinguishes the two cases that
+/// otherwise look identical on the wire: both are a `checkpoint = "suspend"`
+/// restore of this sandbox's own bytes from an exact storage URI. What
+/// separates them is the artifact being staged and the lifecycle the caller
+/// asked to land in.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CrossNodeRestoreTarget {
+    /// Stage a full suspend checkpoint and leave the row `Suspended` for the
+    /// caller to resume. Every caller that predates the stopped evacuation.
+    SuspendedCheckpoint,
+    /// Stage an evacuated `stop`-origin disk artifact and leave the row
+    /// `Stopped` with that artifact pinned as its current one. Requested by
+    /// `WAKE_TARGET_STATE_STOPPED`; the sandbox never boots.
+    ///
+    /// Carries the artifact the caller says the URI resolves to. It travels
+    /// with the target rather than being compared afterwards so the check can
+    /// happen *before* the rootfs transfer and before the row is committed —
+    /// a disagreement found after the publication has already written the pin
+    /// costs a multi-gigabyte pull and leaves a row the boundary then refuses.
+    StoppedDiskArtifact {
+        expected: pplx_space_common_core::types::LocalArtifactId,
+    },
+}
+
+pub(super) struct CrossNodeRestoreRequest<'a> {
+    pub(super) sandbox_id: &'a str,
+    pub(super) storage_uri: Option<&'a str>,
+    pub(super) execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+    pub(super) activation_attempt_id:
+        Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
+    pub(super) recovery: Option<QuarantineRecoveryContext<'a>>,
+    pub(super) restore_artifact_as_new: Option<&'a RestoreArtifactAsNewContext>,
+    pub(super) target: CrossNodeRestoreTarget,
+    pub(super) staging_admission: CrossNodeRestoreStagingAdmission,
 }
 
 #[derive(Clone, Copy)]
-struct QuarantineRecoveryContext<'a> {
+pub(super) struct QuarantineRecoveryContext<'a> {
     plan: &'a crate::snapshot_restore::QuarantineRecoveryPlan,
     claim: &'a crate::db::ClaimedQuarantineRecoveryCandidate,
 }
@@ -873,12 +902,113 @@ fn transition_restored_sandbox_to_suspended_parts(
     Ok(())
 }
 
+/// Whether an artifact's kind and origin make it a disk image a stop minted —
+/// the only artifact an evacuated stopped sandbox may be materialized from or
+/// left pinning. Shared by the staged-sidecar check and the local-row check so
+/// the two can't disagree on what "evacuated disk" means.
+pub(super) fn is_stop_origin_disk(
+    kind: Option<pplx_space_common_core::types::ArtifactKind>,
+    origin: Option<pplx_space_common_core::types::ArtifactOrigin>,
+) -> bool {
+    kind == Some(pplx_space_common_core::types::ArtifactKind::Disk)
+        && origin == Some(pplx_space_common_core::types::ArtifactOrigin::Stop)
+}
+
+/// The artifact a same-id stopped materialization is allowed to pin.
+///
+/// Returns the pin rather than a bool so no caller can reach the `UPDATE`
+/// without having proved the three things that make pinning it correct: the
+/// metadata names a local artifact, that artifact is a disk image, and a stop
+/// minted it. A `suspend`-origin full checkpoint, a user's named snapshot, and
+/// a fork's immutable source all fail here — each would leave the sandbox
+/// pinned to bytes that are not the disk it was evacuated with.
+fn stopped_materialization_pin(
+    meta: &crate::snapshot_upload::SnapshotMeta,
+    expected: pplx_space_common_core::types::LocalArtifactId,
+) -> Result<pplx_space_common_core::types::LocalArtifactId, crate::snapshot_restore::RestoreError> {
+    let unsuitable =
+        || crate::snapshot_restore::RestoreError::StoppedMaterializationArtifactUnsuitable {
+            kind: meta.artifact_kind,
+            origin: meta.artifact_origin,
+            local_artifact_id: meta.local_artifact_id,
+        };
+    // An encrypted capture stages only ciphertext under `{id}/snapshot` and no
+    // `instance/rootfs.ext4`, so the stopped boundary could never vouch for it;
+    // refusing here keeps that from surfacing only after the row is committed.
+    if !is_stop_origin_disk(meta.artifact_kind, meta.artifact_origin) || meta.encrypted {
+        return Err(unsuitable());
+    }
+    let pin = meta.local_artifact_id.ok_or_else(unsuitable)?;
+    // The caller named the artifact it believes this URI resolves to. Comparing
+    // it here, not after the finalize, is what keeps a disagreement from
+    // costing a multi-gigabyte transfer and a committed row.
+    if pin != expected {
+        return Err(
+            crate::snapshot_restore::RestoreError::StoppedMaterializationArtifactMismatch {
+                expected,
+                staged: pin,
+            },
+        );
+    }
+    Ok(pin)
+}
+
+/// Finalize an evacuated stopped sandbox at its own identity.
+///
+/// The third arm alongside [`transition_restored_sandbox_to_suspended`] and
+/// the restore-as-new publication. It is a separate arm rather than a relaxed
+/// conditional on either because its postcondition is the opposite of
+/// restore-as-new's: a fork stages the disk as an immutable source and drops
+/// the pin twice over so it cannot become the child's checkpoint — once in the
+/// staged sidecar (`rebind_artifact_snapshot_identity`) and again in the local
+/// row (`publish_restored_disk_as_new`) — while an evacuation needs it — it is
+/// the only name its durable copy has. `GetArtifactBackupLocation` selects a
+/// ready remote copy for one exact `local_artifact_id`, so dropping the pin
+/// leaves the bytes in object storage with nothing on this node able to ask
+/// for them. Nothing is rebound here either: at the same id there is no new
+/// owner to rebind to.
+///
+/// The recorded `local_path` is the `{id}/snapshots/d-stop-{artifact}` name a
+/// locally stopped sandbox's pin uses (`artifact_backup.rs` builds it with
+/// `sandbox_snapshot_dir`), not `{id}/snapshot`, the staging path the restore
+/// wrote. Nothing exists at that name here — the bytes were staged, not
+/// snapshotted — and nothing needs it to: starting a `Stopped` sandbox goes
+/// through `template_source_for_sandbox_prepare`, which keys on
+/// `{id}/instance/rootfs.ext4` — what `restore_pull_rootfs` stages — and never
+/// reads `local_artifacts.local_path`. What the name buys is that the row never
+/// shares a path with the suspend checkpoint, so whatever later stamps or reaps
+/// it can't touch `{id}/snapshot`. The pin's job is identity — naming the
+/// durable copy the cluster holds — not the boot.
+pub(super) fn transition_restored_sandbox_to_stopped(
+    conn: &rusqlite::Connection,
+    canonical_id: &str,
+    meta: &crate::snapshot_upload::SnapshotMeta,
+    expected: pplx_space_common_core::types::LocalArtifactId,
+) -> Result<(), crate::snapshot_restore::RestoreError> {
+    let local_artifact_id = stopped_materialization_pin(meta, expected)?;
+    crate::db::publish_restored_stopped_artifact(
+        conn,
+        canonical_id,
+        local_artifact_id,
+        &pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(
+            canonical_id,
+            &format!("d-stop-{local_artifact_id}"),
+        ),
+    )
+    .map_err(|error| {
+        crate::snapshot_restore::RestoreError::Other(format!(
+            "persist materialized stopped disk artifact identity: {error}"
+        ))
+    })
+}
+
 fn finalize_recovered_published_restore(
     conn: &rusqlite::Connection,
     canonical_id: &str,
     sandbox_dir: &std::path::Path,
     meta: &crate::snapshot_upload::SnapshotMeta,
     restore_artifact_as_new: bool,
+    target: CrossNodeRestoreTarget,
 ) -> Result<(), crate::snapshot_restore::RestoreError> {
     if restore_artifact_as_new {
         publish_rebound_sandbox_artifact_metadata(meta, sandbox_dir)?;
@@ -888,7 +1018,29 @@ fn finalize_recovered_published_restore(
             ))
         })
     } else {
-        transition_restored_sandbox_to_suspended(conn, canonical_id, meta)
+        transition_restored_sandbox(conn, canonical_id, meta, target)
+    }
+}
+
+/// The plain same-id finalize, dispatched on what the request asked to land in.
+///
+/// Both call sites — the interrupted-restore recovery above and the finalize
+/// closure in `run_cross_node_restore` — need exactly this choice, so it
+/// lives once. A third target then has one place to be added rather than two
+/// that must agree.
+fn transition_restored_sandbox(
+    conn: &rusqlite::Connection,
+    canonical_id: &str,
+    meta: &crate::snapshot_upload::SnapshotMeta,
+    target: CrossNodeRestoreTarget,
+) -> Result<(), crate::snapshot_restore::RestoreError> {
+    match target {
+        CrossNodeRestoreTarget::SuspendedCheckpoint => {
+            transition_restored_sandbox_to_suspended(conn, canonical_id, meta)
+        }
+        CrossNodeRestoreTarget::StoppedDiskArtifact { expected } => {
+            transition_restored_sandbox_to_stopped(conn, canonical_id, meta, expected)
+        }
     }
 }
 
@@ -1015,28 +1167,6 @@ impl SandboxManagerService {
         )
     }
 
-    /// Stage a suspend snapshot and insert a local row so the caller can resume the VM.
-    pub(super) async fn run_cross_node_restore(
-        &self,
-        sandbox_id: &str,
-        storage_uri: Option<&str>,
-        execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
-        activation_attempt_id: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
-        restore_artifact_as_new: Option<&RestoreArtifactAsNewContext>,
-        staging_admission: CrossNodeRestoreStagingAdmission,
-    ) -> Result<Option<CrossNodeRestoreProvenance>, crate::snapshot_restore::RestoreError> {
-        self.run_cross_node_restore_inner(CrossNodeRestoreRequest {
-            sandbox_id,
-            storage_uri,
-            execution_generation,
-            activation_attempt_id,
-            recovery: None,
-            restore_artifact_as_new,
-            staging_admission,
-        })
-        .await
-    }
-
     /// Runs one claimed orphan recovery end to end. The eight-hour deadline exceeds
     /// the two sequential three-hour volume-manager wait budgets and bounds a
     /// filesystem stall; the staging-lock wait has its own far tighter bound in
@@ -1047,7 +1177,7 @@ impl SandboxManagerService {
         plan: &crate::snapshot_restore::QuarantineRecoveryPlan,
     ) -> Result<Option<CrossNodeRestoreProvenance>, crate::snapshot_restore::RestoreError> {
         let sandbox_id = claimed.candidate.sandbox_id.to_string();
-        let restore = self.run_cross_node_restore_inner(CrossNodeRestoreRequest {
+        let restore = self.run_cross_node_restore(CrossNodeRestoreRequest {
             sandbox_id: &sandbox_id,
             storage_uri: Some(&plan.storage_uri),
             execution_generation: Some(plan.execution_generation),
@@ -1057,6 +1187,9 @@ impl SandboxManagerService {
                 claim: claimed,
             }),
             restore_artifact_as_new: None,
+            // Orphan recovery re-adopts a suspended sandbox's own full
+            // checkpoint; it never carries a disk artifact.
+            target: CrossNodeRestoreTarget::SuspendedCheckpoint,
             // A busy staging tree is per-sandbox contention, not node-wide I/O, so
             // this attempt gives up after a short bounded wait and releases the sole
             // orphan-restore permit rather than holding it for the operation
@@ -1199,7 +1332,7 @@ impl SandboxManagerService {
         Ok(Some(claimed_scope.transfer_scope_id))
     }
 
-    async fn run_cross_node_restore_inner(
+    pub(super) async fn run_cross_node_restore(
         &self,
         request: CrossNodeRestoreRequest<'_>,
     ) -> Result<Option<CrossNodeRestoreProvenance>, crate::snapshot_restore::RestoreError> {
@@ -1220,6 +1353,7 @@ impl SandboxManagerService {
             activation_attempt_id,
             recovery,
             restore_artifact_as_new,
+            target,
             staging_admission,
         } = request;
         let sandbox_id =
@@ -1501,6 +1635,7 @@ impl SandboxManagerService {
                                 std::path::Path::new(&canonical_dir),
                                 &published.meta,
                                 restore_artifact_as_new.is_some(),
+                                target,
                             )
                         },
                     )
@@ -1515,6 +1650,7 @@ impl SandboxManagerService {
                         std::path::Path::new(&canonical_dir),
                         &published.meta,
                         restore_artifact_as_new.is_some(),
+                        target,
                     )?;
                 }
                 log_interrupted_restore_completion(&canonical_id, &published.storage_uri);
@@ -1669,6 +1805,15 @@ impl SandboxManagerService {
                 &sandbox_id.to_string(),
                 &restore_artifact_as_new.target_owner,
             )?;
+        }
+        if let CrossNodeRestoreTarget::StoppedDiskArtifact { expected } = target {
+            // The same check the finalize runs, hoisted ahead of the rootfs
+            // transfer: the sidecar is already on disk here, and refusing a
+            // wrongly-selected artifact now costs one metadata object instead
+            // of a multi-gigabyte pull. Nothing is rebound and no identity is
+            // reassigned — `restore_pull_metadata_from_source` already pinned
+            // the staged metadata to this same sandbox id.
+            stopped_materialization_pin(&staged.meta, expected)?;
         }
         let restore_source: pplx_space_common_core::types::ExactStorageUri = staged
             .storage_uri
@@ -1858,7 +2003,7 @@ impl SandboxManagerService {
             // touching the canonical root.
             // Both acquisitions below block, and the wait is on the per-sandbox
             // staging lock that another restore of the same sandbox can hold for as
-            // long as its own pull takes. Neither call site into
+            // long as its own pull takes. Neither `Start` call site into
             // `run_cross_node_restore` wraps it in a `tokio::time::timeout`; the
             // bound is the transport's, since sandbox-manager serves this through
             // `pplx_space_common_svc::grpc_server_builder` and tonic applies
@@ -2048,7 +2193,7 @@ impl SandboxManagerService {
                     ))
                 })?;
             } else {
-                transition_restored_sandbox_to_suspended(db, &canonical_id, &staged.meta)?;
+                transition_restored_sandbox(db, &canonical_id, &staged.meta, target)?;
             }
             Ok(())
         };

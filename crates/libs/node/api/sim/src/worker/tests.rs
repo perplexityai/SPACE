@@ -131,6 +131,7 @@ async fn create_then_state_then_start_then_list() {
         suspend_restore_source_node: None,
         route_identity: None,
         restore_artifact_as_new: None,
+        expected_local_artifact_id: None,
     }))
     .await
     .unwrap();
@@ -231,6 +232,7 @@ async fn suspend_on_node_a_then_wake_on_node_b_restores() {
             suspend_restore_source_node: None,
             route_identity: None,
             restore_artifact_as_new: None,
+            expected_local_artifact_id: None,
         }))
         .await
         .unwrap();
@@ -586,6 +588,7 @@ fn start_request(sandbox_id: &str) -> sbx::StartRequest {
         target_state: 0,
         suspend_restore_storage_uri: None,
         suspend_restore_source_node: None,
+        expected_local_artifact_id: None,
         route_identity: None,
         restore_artifact_as_new: None,
     }

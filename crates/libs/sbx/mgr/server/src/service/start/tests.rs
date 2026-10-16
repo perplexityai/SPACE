@@ -2,6 +2,7 @@ use pplx_space_common_core::types::{LocalArtifactId, SandboxId, SnapshotId};
 
 use super::*;
 use crate::db::CleanupCompletion;
+use crate::service::recovery::tests::{insert_suspended_test_sandbox, recovery_test_service};
 use crate::service::suspend_snapshot_publication::LOCAL_SNAPSHOT_DIR;
 use pplx_space_common_core::types::ExecutionGeneration;
 
@@ -999,5 +1000,718 @@ async fn suspend_restore_dir_keeps_a_previous_scope_it_cannot_cancel() {
             .to_string()
             .contains("cancel previous restore transfer scope"),
         "{error:?}"
+    );
+}
+
+/// The shape the cluster-controller sends to materialize an evacuated stopped
+/// sandbox: its own id, a suspend checkpoint, and the exact URI of the disk
+/// artifact the drain published for it.
+fn materialize_stopped_request() -> StartRequest {
+    materialize_stopped_request_for(&SandboxId::new().to_string())
+}
+
+pub(in crate::service) fn materialize_stopped_request_for(sandbox_id: &str) -> StartRequest {
+    let artifact_snapshot_id = pplx_space_common_core::types::SnapshotId::new();
+    StartRequest {
+        sandbox_id: sandbox_id.to_string(),
+        checkpoint: Some(SUSPEND_CHECKPOINT.to_string()),
+        suspend_restore_storage_uri: Some(format!(
+            "s3://snapshots/suspend/{sandbox_id}/{artifact_snapshot_id}?region=us-east-1"
+        )),
+        target_state: crate::proto::WakeTargetState::Stopped as i32,
+        expected_local_artifact_id: Some(
+            pplx_space_common_core::types::LocalArtifactId::new().to_string(),
+        ),
+        route_identity: Some(crate::proto::SpaceApiRouteIdentity {
+            execution_generation: Some(7),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a_stopped_target_carries_through_the_request_boundary() {
+    let context = StartSandboxContext::from_request(&materialize_stopped_request()).unwrap();
+
+    assert_eq!(context.target_state, SandboxState::Stopped);
+}
+
+/// The property, in operator terms: asking for `stopped` can never turn into a
+/// running microVM.
+///
+/// The stopped target is only reachable through the cross-node restore that
+/// stages a disk artifact. Every other request shape that could carry it ends
+/// in a boot — a fresh cold start, a checkpoint restore with no artifact to
+/// stage, or a fork, which cold-boots the child by design. Refusing them at
+/// the wire is the first half of "never reaches the hypervisor"; the
+/// short-circuit in the start path is the second.
+#[test]
+fn a_stopped_target_is_refused_on_every_request_shape_that_would_boot() {
+    let fresh_cold = StartRequest {
+        checkpoint: None,
+        suspend_restore_storage_uri: None,
+        ..materialize_stopped_request()
+    };
+    let checkpoint_without_an_artifact = StartRequest {
+        suspend_restore_storage_uri: None,
+        ..materialize_stopped_request()
+    };
+    let uri_without_a_checkpoint = StartRequest {
+        checkpoint: None,
+        ..materialize_stopped_request()
+    };
+
+    for (description, request) in [
+        ("a fresh cold start", fresh_cold),
+        (
+            "a checkpoint restore naming no artifact",
+            checkpoint_without_an_artifact,
+        ),
+        (
+            "an artifact URI with no checkpoint",
+            uri_without_a_checkpoint,
+        ),
+    ] {
+        let error = StartSandboxContext::from_request(&request)
+            .err()
+            .unwrap_or_else(|| panic!("{description} must not accept a stopped target"));
+        assert_eq!(error.code(), tonic::Code::InvalidArgument, "{description}");
+        assert!(
+            error
+                .message()
+                .contains("stopped target state requires a suspend checkpoint"),
+            "{description} produced the wrong refusal: {error}"
+        );
+    }
+}
+
+/// Fork and evacuation have opposite postconditions on the artifact pin — the
+/// fork arm drops it so the staged disk stays an immutable source, the
+/// evacuation arm keeps it because it is the sandbox's own disk. A request
+/// asking for both would have to satisfy both.
+///
+/// It cannot be asked for, and the two refusals that prevent it both predate
+/// this change: restore-as-new requires an empty checkpoint, and it requires
+/// the `Started` target. The stopped materialization requires the opposite of
+/// each. This asserts the property from both sides rather than adding a third
+/// check, which would name itself as the mechanism and never run.
+#[test]
+fn a_stopped_target_and_a_fork_cannot_be_requested_together() {
+    let source_sandbox_id = SandboxId::new();
+    let artifact_snapshot_id = pplx_space_common_core::types::SnapshotId::new();
+    let fork_context = crate::proto::RestoreArtifactAsNewContext {
+        source_sandbox_id: source_sandbox_id.to_string(),
+        artifact_snapshot_id: artifact_snapshot_id.to_string(),
+        target_owner: format!("user:{}", uuid::Uuid::now_v7()),
+        artifact_kind: crate::proto::ArtifactKind::Disk as i32,
+        disk_io_max_operations_per_sec: None,
+        disk_io_max_bandwidth_mib_per_sec: None,
+    };
+    let fork_storage_uri = format!(
+        "s3://snapshots/suspend/{source_sandbox_id}/{artifact_snapshot_id}?region=us-east-1"
+    );
+
+    // With the checkpoint the stopped target requires, the fork arm refuses on
+    // its cold-start requirement.
+    let with_checkpoint = StartRequest {
+        suspend_restore_storage_uri: Some(fork_storage_uri.clone()),
+        restore_artifact_as_new: Some(fork_context.clone()),
+        ..materialize_stopped_request()
+    };
+    let error = StartSandboxContext::from_request(&with_checkpoint)
+        .err()
+        .expect("a fork carrying a suspend checkpoint must be refused");
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert!(
+        error.message().contains("requires a cold start"),
+        "unexpected refusal: {error}"
+    );
+
+    // Without it, the fork arm refuses on its target: restore-as-new
+    // cold-boots the child, so it cannot land in `stopped`.
+    let without_checkpoint = StartRequest {
+        checkpoint: None,
+        suspend_restore_storage_uri: Some(fork_storage_uri),
+        restore_artifact_as_new: Some(fork_context),
+        ..materialize_stopped_request()
+    };
+    let error = StartSandboxContext::from_request(&without_checkpoint)
+        .err()
+        .expect("a fork asking for a stopped target must be refused");
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert!(
+        error
+            .message()
+            .contains("cold-boots into the started lifecycle"),
+        "unexpected refusal: {error}"
+    );
+}
+
+/// The property, in operator terms: "your bytes are here" must never be
+/// answered for older bytes.
+///
+/// A sandbox that ran and stopped on a node earlier leaves the same shape an
+/// evacuation does — `Stopped`, pinning a `disk`/`stop` artifact — so the
+/// lifecycle cannot distinguish them. If the node reported convergence on the
+/// state match alone, the cluster would be free to retire the source while
+/// this node still held the older rootfs, and the user would silently get it
+/// back.
+///
+/// The request names the artifact it expects, so the decision is a local
+/// comparison. Every way of failing to be that artifact is refused: a
+/// different id, no pin at all, and a pin of the wrong kind or origin — the
+/// last because an id alone does not say the bytes are an evacuated disk
+/// rather than a suspend checkpoint or a user's named snapshot.
+#[test]
+fn only_the_requested_artifact_lets_a_stopped_row_pass() {
+    use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin, LocalArtifactId};
+    let pinned = LocalArtifactId::new();
+    let other = LocalArtifactId::new();
+
+    // Rows are built through the real schema rather than a literal: the
+    // check reads four columns and the CHECK constraints on them are part of
+    // what makes a shape reachable at all.
+    let conn = crate::db::test_conn();
+    let row = |state: SandboxState,
+               pin: Option<LocalArtifactId>,
+               kind: Option<ArtifactKind>,
+               origin: Option<ArtifactOrigin>| {
+        let id = SandboxId::new().to_string();
+        insert_suspended_test_sandbox(&conn, &id);
+        conn.execute(
+            "UPDATE sandboxes
+             SET state = ?1,
+                 current_local_artifact_id = ?2,
+                 current_local_artifact_kind = ?3,
+                 current_local_artifact_origin = ?4
+             WHERE id = ?5",
+            rusqlite::params![
+                state.as_str(),
+                pin.map(|id| id.to_string()),
+                kind.map(|k| k.as_str()),
+                origin.map(|o| o.as_str()),
+                &id
+            ],
+        )
+        .unwrap();
+        crate::db::get_sandbox(&conn, &id).unwrap().unwrap()
+    };
+    let evacuated = row(
+        SandboxState::Stopped,
+        Some(pinned),
+        Some(ArtifactKind::Disk),
+        Some(ArtifactOrigin::Stop),
+    );
+
+    verify_stopped_materialization(&evacuated, pinned)
+        .expect("a row pinning exactly the requested stop-origin disk is the materialization");
+
+    for (description, candidate, expected) in [
+        (
+            "a row pinning a different artifact — residue from an earlier life",
+            row(
+                SandboxState::Stopped,
+                Some(other),
+                Some(ArtifactKind::Disk),
+                Some(ArtifactOrigin::Stop),
+            ),
+            pinned,
+        ),
+        (
+            "a stopped row with no pin at all",
+            row(SandboxState::Stopped, None, None, None),
+            pinned,
+        ),
+        (
+            "a pin of the right id but a suspend checkpoint's kind and origin",
+            row(
+                SandboxState::Stopped,
+                Some(pinned),
+                Some(ArtifactKind::Full),
+                Some(ArtifactOrigin::Suspend),
+            ),
+            pinned,
+        ),
+        (
+            "a row that is not stopped",
+            row(
+                SandboxState::Suspended,
+                Some(pinned),
+                Some(ArtifactKind::Disk),
+                Some(ArtifactOrigin::Stop),
+            ),
+            pinned,
+        ),
+    ] {
+        let error = verify_stopped_materialization(&candidate, expected)
+            .expect_err(&format!("{description} must not pass as materialized"));
+        assert_eq!(
+            error.code(),
+            tonic::Code::FailedPrecondition,
+            "{description}"
+        );
+    }
+}
+
+/// The second stopped boundary sits after the pending cleanup.
+///
+/// Production reaches this point from the `CleanupRestoring` arm; the fixture
+/// is the `cleanup_required` row with a `MarkSuspended` intent that arm leaves,
+/// handed straight to `restore_suspended_checkpoint_start`.
+/// `restore_suspended_checkpoint_start` runs that cleanup synchronously before
+/// the second stopped boundary; in a unit test the cleanup fails for want of a
+/// node-manager, so the error has to come from the cleanup executor rather
+/// than from `verify_stopped_materialization` answering first. The boundary's
+/// own refusal of the row a cleanup leaves is
+/// `a_stopped_target_refuses_a_suspended_row_after_the_cleanup`.
+#[tokio::test]
+async fn the_second_stopped_boundary_sits_after_the_pending_cleanup() {
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new().to_string();
+    insert_suspended_test_sandbox(&conn, &sandbox_id);
+    // The shape the `CleanupRestoring` arm leaves: an intent, and a row that
+    // the cleanup will move to `suspended` — not to `stopped`.
+    conn.execute(
+        "UPDATE sandboxes
+         SET state = 'cleanup_required',
+             cleanup_completion = 'mark_suspended',
+             cleanup_keep_filesystem = 1
+         WHERE id = ?1",
+        rusqlite::params![&sandbox_id],
+    )
+    .unwrap();
+    let service = recovery_test_service(conn);
+    let request = materialize_stopped_request_for(&sandbox_id);
+    let mut ctx = StartSandboxContext::from_request(&request).unwrap();
+    let sandbox = service.lookup_sandbox(&sandbox_id).unwrap();
+
+    let error = service
+        .restore_suspended_checkpoint_start(
+            &request,
+            sandbox,
+            &mut ctx,
+            RestoredSnapshotProvenance::default(),
+            None,
+        )
+        .await
+        .expect_err("a unit test has no node-manager to complete the retirement with");
+
+    // The cleanup was attempted — the boundary did not answer this row. The
+    // synchronous cleanup runs through the durable cleanup executor, whose
+    // context names the failure; a boundary placed above the cleanup would
+    // instead answer with `verify_stopped_materialization`'s refusal.
+    assert!(
+        error.message().contains("durable sandbox cleanup"),
+        "the pending cleanup must be driven, not skipped; got: {error}"
+    );
+    assert!(
+        !error.message().contains("cannot materialize"),
+        "the stopped boundary must not answer before the cleanup; got: {error}"
+    );
+}
+
+/// What a resumed materialization returns once its retry has finished.
+///
+/// The `ResumeRestoring` arm re-stages the disk artifact, finalizes the row,
+/// and re-reads it — leaving `Stopped`, which is the state this drives the
+/// function with. Everything after that point in
+/// `restore_suspended_checkpoint_start` restores and launches a VM, and it
+/// opens with an `expected suspended` precondition that a `Stopped` row fails.
+/// So the resumed materialization has to be answered before it, and this is
+/// the assertion that the answer is placed there: delete the stopped return
+/// and this call comes back `FailedPrecondition … expected suspended` instead.
+///
+/// The sibling tests in `service::tests` cover the entry into this function;
+/// they stop at the staging-lock deferral, so this is the half that reaches
+/// past it without needing object storage.
+#[tokio::test]
+async fn a_resumed_stopped_materialization_is_answered_before_the_launch() {
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new().to_string();
+    insert_suspended_test_sandbox(&conn, &sandbox_id);
+    let pin = pplx_space_common_core::types::LocalArtifactId::new();
+    conn.execute(
+        "UPDATE sandboxes
+         SET state = 'stopped',
+             current_local_artifact_id = ?1,
+             current_local_artifact_kind = 'disk',
+             current_local_artifact_origin = 'stop'
+         WHERE id = ?2",
+        rusqlite::params![pin.to_string(), &sandbox_id],
+    )
+    .unwrap();
+    let service = recovery_test_service(conn);
+    let mut request = materialize_stopped_request_for(&sandbox_id);
+    // The resumed row pins what the retry staged, so the request has to expect
+    // that same artifact — a mismatch here is the stale-row refusal, not this
+    // test's subject.
+    request.expected_local_artifact_id = Some(pin.to_string());
+    let mut ctx = StartSandboxContext::from_request(&request).unwrap();
+    let sandbox = service.lookup_sandbox(&sandbox_id).unwrap();
+
+    let response = service
+        .restore_suspended_checkpoint_start(
+            &request,
+            sandbox,
+            &mut ctx,
+            RestoredSnapshotProvenance::default(),
+            None,
+        )
+        .await
+        .expect("a resumed materialization must be reported, not refused for not being suspended")
+        .into_inner();
+
+    // Only the identity is asserted on the reply: `materialized_stopped_response`
+    // builds it with `..Default::default()`, so `pid == 0` and
+    // `route_identity.is_none()` would hold even with the behaviour they name
+    // removed. What can actually fail is that the call succeeded at all, and
+    // what the row looks like afterwards.
+    assert_eq!(response.sandbox_id, sandbox_id);
+    let row = service.lookup_sandbox(&sandbox_id).unwrap();
+    assert_eq!(row.state, SandboxState::Stopped);
+    assert_eq!(
+        row.current_local_artifact_id,
+        Some(pin),
+        "answering the resume must not disturb the pin the retry just wrote"
+    );
+}
+
+/// Names the branch the stopped short-circuit has to get in front of.
+///
+/// A `Suspended` row under a suspend checkpoint classifies as
+/// `ResumeSuspendCheckpoint`, whose handler restores the VM and launches it.
+/// `a_stopped_target_refuses_a_row_it_did_not_materialize` in
+/// `service::tests` asserts that a stopped target refuses that same row
+/// instead; this is the half that shows the alternative was a launch.
+#[test]
+fn a_suspended_row_under_a_checkpoint_is_a_launching_fixture() {
+    assert_eq!(
+        interrupted_restore_action(SUSPEND_CHECKPOINT, SandboxState::Suspended, None, false),
+        InterruptedRestoreAction::ResumeSuspendCheckpoint
+    );
+}
+
+/// A stopped target with no expected artifact id is refused at the wire, so no
+/// boundary can be reached without the evidence it compares.
+#[test]
+fn a_stopped_target_requires_the_expected_artifact_id() {
+    let mut request = materialize_stopped_request();
+    request.expected_local_artifact_id = None;
+
+    let error = StartSandboxContext::from_request(&request)
+        .err()
+        .expect("a stopped target without the expected artifact id must be refused");
+
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert!(
+        error
+            .message()
+            .contains("requires expected_local_artifact_id"),
+        "unexpected refusal: {error}"
+    );
+}
+
+#[test]
+fn the_stopped_target_selects_the_evacuation_finalize_arm() {
+    let request = materialize_stopped_request();
+    let expected: pplx_space_common_core::types::LocalArtifactId = request
+        .expected_local_artifact_id
+        .as_deref()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let ctx = StartSandboxContext::from_request(&request).unwrap();
+
+    assert_eq!(
+        ctx.restore_target,
+        CrossNodeRestoreTarget::StoppedDiskArtifact { expected },
+        "the target must carry the artifact the finalize compares against"
+    );
+
+    // Every other target keeps taking the historical checkpoint arm.
+    for target_state in [
+        crate::proto::WakeTargetState::Started,
+        crate::proto::WakeTargetState::Paused,
+    ] {
+        let mut other = materialize_stopped_request();
+        other.target_state = target_state as i32;
+        other.expected_local_artifact_id = None;
+        let ctx = StartSandboxContext::from_request(&other).unwrap();
+        assert_eq!(
+            ctx.restore_target,
+            CrossNodeRestoreTarget::SuspendedCheckpoint,
+            "{target_state:?} must keep taking the historical checkpoint arm"
+        );
+    }
+}
+
+/// The checkpoint launch refuses a stopped target on its own, so a path that
+/// reaches it without passing through a `Start` stopped boundary fails rather
+/// than booting. The same row and launch with a `Started` target get past the
+/// refusal, which is what makes the refusal observable here.
+#[tokio::test]
+async fn a_checkpoint_launch_refuses_a_stopped_target() {
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new().to_string();
+    insert_suspended_test_sandbox(&conn, &sandbox_id);
+    let service = recovery_test_service(conn);
+    let sandbox = service.lookup_sandbox(&sandbox_id).unwrap();
+
+    for target_state in [SandboxState::Stopped, SandboxState::Started] {
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            service.start_from_checkpoint(StartFromCheckpointLaunch {
+                vcpu: None,
+                activation_auto_lifecycle: None,
+                operation_activation_attempt_id: None,
+                sandbox: &sandbox,
+                blocking: false,
+                netns_path: None,
+                target_state,
+                execution_generation: None,
+                space_api_route_identity: Default::default(),
+                route_identity_provenance:
+                    crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::Unfenced,
+                open_activation_claim_eligible: false,
+                restored_snapshot: RestoredSnapshotProvenance::default(),
+            }),
+        )
+        .await
+        .expect("the launch must not hang in a unit test");
+        let refused = matches!(
+            &outcome,
+            Err(status) if status.message().contains("a checkpoint launch never runs for it")
+        );
+        assert_eq!(
+            refused,
+            target_state == SandboxState::Stopped,
+            "{target_state:?}: {:?}",
+            outcome.map(|_| ())
+        );
+    }
+}
+
+/// `expected_local_artifact_id` is evidence only a stopped materialization
+/// compares. Sent with any other target it would be silently ignored, so it is
+/// refused at the wire instead; the stopped request it was built from passes.
+#[test]
+fn an_expected_artifact_without_the_stopped_target_is_refused() {
+    let request = materialize_stopped_request();
+    StartSandboxContext::from_request(&request).expect("the stopped request is valid");
+
+    for target_state in [
+        crate::proto::WakeTargetState::Started,
+        crate::proto::WakeTargetState::Paused,
+    ] {
+        let mut other = request.clone();
+        other.target_state = target_state as i32;
+        let error = StartSandboxContext::from_request(&other)
+            .err()
+            .unwrap_or_else(|| {
+                panic!("{target_state:?} with an expected artifact must be refused")
+            });
+        assert_eq!(
+            error.code(),
+            tonic::Code::InvalidArgument,
+            "{target_state:?}"
+        );
+        assert!(
+            error
+                .message()
+                .contains("expected_local_artifact_id requires the stopped target state"),
+            "{target_state:?}: {error}"
+        );
+
+        other.expected_local_artifact_id = None;
+        StartSandboxContext::from_request(&other)
+            .unwrap_or_else(|error| panic!("{target_state:?} without the id stays valid: {error}"));
+    }
+}
+
+/// The second stopped boundary refuses a `Suspended` row — the shape a driven
+/// cleanup leaves — rather than letting the `expected suspended` path carry it
+/// to the launch. The assertion is the boundary's own message, so a refusal
+/// from anywhere past it would fail the test.
+#[tokio::test]
+async fn a_stopped_target_refuses_a_suspended_row_after_the_cleanup() {
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new().to_string();
+    insert_suspended_test_sandbox(&conn, &sandbox_id);
+    let service = recovery_test_service(conn);
+    let request = materialize_stopped_request_for(&sandbox_id);
+    let mut ctx = StartSandboxContext::from_request(&request).unwrap();
+    let sandbox = service.lookup_sandbox(&sandbox_id).unwrap();
+
+    let error = service
+        .restore_suspended_checkpoint_start(
+            &request,
+            sandbox,
+            &mut ctx,
+            RestoredSnapshotProvenance::default(),
+            None,
+        )
+        .await
+        .expect_err("a suspended row is not the requested stopped materialization");
+
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        error
+            .message()
+            .contains("as stopped while local state is suspended"),
+        "the stopped boundary must refuse it, not the launch backstop: {error}"
+    );
+    let row = service.lookup_sandbox(&sandbox_id).unwrap();
+    assert_eq!(row.state, SandboxState::Suspended);
+}
+
+/// The stopped boundary vouches for bytes, not just a row: a `Stopped` row that
+/// pins exactly the requested artifact is still refused when its rootfs is
+/// missing, and the same row with the rootfs present converges.
+#[tokio::test]
+async fn a_stopped_row_without_its_rootfs_is_not_reported_materialized() {
+    for rootfs_present in [false, true] {
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new().to_string();
+        insert_suspended_test_sandbox(&conn, &sandbox_id);
+        let pin = pplx_space_common_core::types::LocalArtifactId::new();
+        conn.execute(
+            "UPDATE sandboxes
+             SET state = 'stopped',
+                 current_local_artifact_id = ?1,
+                 current_local_artifact_kind = 'disk',
+                 current_local_artifact_origin = 'stop'
+             WHERE id = ?2",
+            rusqlite::params![pin.to_string(), &sandbox_id],
+        )
+        .unwrap();
+        let service = SandboxManagerService::new_with_options(
+            conn,
+            crate::service::SandboxManagerServiceOptions {
+                sandbox_runtime_live: std::sync::Arc::new(|_| false),
+                sandbox_rootfs_present: std::sync::Arc::new(move |_| rootfs_present),
+                ..crate::service::SandboxManagerServiceOptions::for_test()
+            },
+        );
+        let mut request = materialize_stopped_request_for(&sandbox_id);
+        request.expected_local_artifact_id = Some(pin.to_string());
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            service.start_sandbox(request, false),
+        )
+        .await
+        .expect("a stopped target must not wait on a launch");
+
+        if rootfs_present {
+            assert_eq!(
+                outcome.expect("bytes present").into_inner().sandbox_id,
+                sandbox_id
+            );
+        } else {
+            let error = outcome.expect_err("a row without its rootfs must not be vouched for");
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+            assert!(
+                error.message().contains("its rootfs is missing"),
+                "unexpected refusal: {error}"
+            );
+        }
+    }
+}
+
+/// The stopped boundary applies the route-identity fence before it vouches for
+/// an existing row: a request aimed at another node is refused, though the row
+/// pins exactly the artifact it names.
+#[tokio::test]
+async fn a_stopped_row_is_not_vouched_for_to_a_request_fenced_elsewhere() {
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new().to_string();
+    insert_suspended_test_sandbox(&conn, &sandbox_id);
+    let pin = pplx_space_common_core::types::LocalArtifactId::new();
+    conn.execute(
+        "UPDATE sandboxes
+         SET state = 'stopped',
+             current_local_artifact_id = ?1,
+             current_local_artifact_kind = 'disk',
+             current_local_artifact_origin = 'stop'
+         WHERE id = ?2",
+        rusqlite::params![pin.to_string(), &sandbox_id],
+    )
+    .unwrap();
+    let service = recovery_test_service(conn);
+    let mut request = materialize_stopped_request_for(&sandbox_id);
+    request.expected_local_artifact_id = Some(pin.to_string());
+    request.route_identity = Some(crate::proto::SpaceApiRouteIdentity {
+        route_generation: Some(7),
+        execution_generation: Some(7),
+        current_node_id: Some("019f8000-0000-7000-8000-0000000000ee".to_string()),
+        ..Default::default()
+    });
+
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        service.start_sandbox(request, false),
+    )
+    .await
+    .expect("a stopped target must not wait on a launch")
+    .expect_err("a request fenced to another node must not be told the sandbox converged");
+
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        error
+            .message()
+            .contains("runtime activation identity targets node"),
+        "the route-identity fence must be what refuses it: {error}"
+    );
+}
+
+/// The second stopped boundary applies the route-identity fence itself: a
+/// `Stopped` row a concurrent materialization finalized reaches it without the
+/// resume arm, so a request fenced to another node must still be refused.
+#[tokio::test]
+async fn the_second_stopped_boundary_fences_the_request_too() {
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new().to_string();
+    insert_suspended_test_sandbox(&conn, &sandbox_id);
+    let pin = pplx_space_common_core::types::LocalArtifactId::new();
+    conn.execute(
+        "UPDATE sandboxes
+         SET state = 'stopped',
+             current_local_artifact_id = ?1,
+             current_local_artifact_kind = 'disk',
+             current_local_artifact_origin = 'stop'
+         WHERE id = ?2",
+        rusqlite::params![pin.to_string(), &sandbox_id],
+    )
+    .unwrap();
+    let service = recovery_test_service(conn);
+    let mut request = materialize_stopped_request_for(&sandbox_id);
+    request.expected_local_artifact_id = Some(pin.to_string());
+    request.route_identity = Some(crate::proto::SpaceApiRouteIdentity {
+        route_generation: Some(7),
+        execution_generation: Some(7),
+        current_node_id: Some("019f8000-0000-7000-8000-0000000000ee".to_string()),
+        ..Default::default()
+    });
+    let mut ctx = StartSandboxContext::from_request(&request).unwrap();
+    let sandbox = service.lookup_sandbox(&sandbox_id).unwrap();
+
+    let error = service
+        .restore_suspended_checkpoint_start(
+            &request,
+            sandbox,
+            &mut ctx,
+            RestoredSnapshotProvenance::default(),
+            None,
+        )
+        .await
+        .expect_err("a request fenced to another node must not be told the sandbox converged");
+
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        error
+            .message()
+            .contains("runtime activation identity targets node"),
+        "the route-identity fence must be what refuses it: {error}"
     );
 }

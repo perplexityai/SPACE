@@ -242,6 +242,7 @@ fn local_start_request(
         activation_auto_lifecycle: None,
         operation_activation_attempt_id: None,
         restore_artifact_as_new: None,
+        expected_local_artifact_id: None,
         sandbox_id,
         vcpu: None,
         memory_mib: None,

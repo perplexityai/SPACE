@@ -434,6 +434,9 @@ message StartRequest {
   // Unspecified → STARTED. PAUSED skips the post-load resume so the
   // restored VM stays in the firecracker-paused state. Used by the
   // cluster-controller's lifecycle-preserving drain evacuation path.
+  // STOPPED materializes an evacuated stopped sandbox's disk artifact and
+  // stops there; it requires `checkpoint = "suspend"` plus an exact
+  // `suspend_restore_storage_uri`, and never launches Firecracker.
   WakeTargetState target_state = 9;
   // Internal-only exact S3 fallback for `checkpoint = "suspend"`.
   optional string suspend_restore_storage_uri = 10;
@@ -456,6 +459,20 @@ message StartRequest {
   // Callers must check activation-policy capability before sending this field.
   // Omission preserves the existing policy.
   optional AutoLifecyclePolicy activation_auto_lifecycle = 19;
+  // Required with `target_state = STOPPED`: the local artifact id that
+  // `suspend_restore_storage_uri` identifies. The caller has it — the cluster
+  // hands back `local_artifact_id` and `storage_uri` in the same
+  // `GetArtifactBackupLocation` reply — and naming it lets the node tell "this
+  // row already is that artifact" from "this row is residue from an earlier
+  // life on this node" by comparing ids locally. Without it the two are
+  // indistinguishable: a sandbox stopped here earlier whose disk was then
+  // published for backup leaves the same `stopped` row with the same
+  // `disk`/`stop` pin an evacuation does, so reporting
+  // convergence on the lifecycle alone would answer for older bytes and let
+  // the source be retired. Same shape as
+  // `RestoreArtifactAsNewContext.artifact_snapshot_id`, which the fork
+  // transport already checks against its URI locally.
+  optional string expected_local_artifact_id = 20;
 }
 
 message StartResponse {
@@ -811,6 +828,9 @@ message WakeRequest {
   // suspend snapshot but leaves it in the paused state instead of
   // issuing the post-load resume — preserving the user-visible
   // `paused` lifecycle without an additional pause RPC after wake.
+  // STOPPED is the same evacuation for a `stopped` resident: it stages the
+  // disk artifact and returns with the sandbox still stopped, without
+  // waking anything.
   WakeTargetState target_state = 4;
   // Unspecified is explicit operator wake. Access/command wakes must honor the
   // worker's effective policy under wake exclusion. Requires blocking STARTED.
@@ -822,6 +842,18 @@ enum WakeTargetState {
   WAKE_TARGET_STATE_UNSPECIFIED = 0;
   WAKE_TARGET_STATE_STARTED = 1;
   WAKE_TARGET_STATE_PAUSED = 2;
+  // Materialize an evacuated `stopped` sandbox on this node and leave it
+  // stopped. The request must carry the exact storage URI of a `stop`-origin
+  // DISK artifact belonging to this same sandbox id; the node stages the
+  // rootfs, pins the artifact on the local row, and returns. No Firecracker
+  // process is created: booting a microVM only to stop it again would run the
+  // guest's init and mutate the rootfs a stopped sandbox is meant to keep
+  // inert.
+  //
+  // A sandbox-manager that predates this value rejects it as an unknown
+  // target_state with INVALID_ARGUMENT before any mutation, so a mixed fleet
+  // fails closed without pulling the rootfs.
+  WAKE_TARGET_STATE_STOPPED = 3;
 }
 message WakeStartContext {
   optional uint32 vcpu = 1;
@@ -838,6 +870,9 @@ message WakeStartContext {
   // Resident-resume fence only; never authority for a fresh activation.
   // Requires activation_auto_lifecycle. Absent matches only a legacy resident.
   optional int64 expected_execution_generation = 13;
+  // Required with `target_state = STOPPED`; see
+  // `StartRequest.expected_local_artifact_id`, which this is forwarded to.
+  optional string expected_local_artifact_id = 14;
 }
 message WakeResponse {
   string sandbox_id = 1;

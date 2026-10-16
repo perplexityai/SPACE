@@ -244,6 +244,9 @@ pub(super) enum SandboxStartExecutionPath {
     WarmSnapshot,
     CheckpointRestore,
     CheckpointReattach,
+    /// An evacuated stopped sandbox's disk artifact was materialized on this
+    /// node and the request returned without launching anything.
+    DiskMaterialize,
 }
 
 impl SandboxStartExecutionPath {
@@ -253,6 +256,7 @@ impl SandboxStartExecutionPath {
             Self::WarmSnapshot => "warm_snapshot",
             Self::CheckpointRestore => "checkpoint_restore",
             Self::CheckpointReattach => "checkpoint_reattach",
+            Self::DiskMaterialize => "disk_materialize",
         }
     }
 }

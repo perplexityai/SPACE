@@ -371,8 +371,14 @@ fn interrupted_restore_as_new_publishes_metadata_and_finalizes_as_stopped() {
     )
     .unwrap();
 
-    let result =
-        finalize_recovered_published_restore(&conn, &sandbox_id, sandbox_dir.path(), &meta, true);
+    let result = finalize_recovered_published_restore(
+        &conn,
+        &sandbox_id,
+        sandbox_dir.path(),
+        &meta,
+        true,
+        CrossNodeRestoreTarget::SuspendedCheckpoint,
+    );
 
     assert!(
         result.is_ok(),
@@ -446,6 +452,309 @@ fn disk_artifact_meta() -> (
         },
         capture_name,
     )
+}
+
+/// A `stop`-origin disk artifact: what a drained node publishes for a stopped
+/// resident, and the only artifact shape a stopped materialization may pin.
+fn evacuated_stop_disk_meta() -> crate::snapshot_upload::SnapshotMeta {
+    let (mut meta, _) = disk_artifact_meta();
+    meta.artifact_origin = Some(pplx_space_common_core::types::ArtifactOrigin::Stop);
+    meta.artifact_snapshot_name = None;
+    meta
+}
+
+fn insert_restoring_row(conn: &rusqlite::Connection, sandbox_id: &str) {
+    conn.execute(
+        "INSERT INTO sandboxes (id, uuid8, state, template, created_at, updated_at)
+         VALUES (?1, 'sandbox1', 'restoring', 'seed', 'now', 'now')",
+        [sandbox_id],
+    )
+    .unwrap();
+}
+
+fn current_pin(conn: &rusqlite::Connection, sandbox_id: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT current_local_artifact_id FROM sandboxes WHERE id = ?1",
+        [sandbox_id],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_stop_origin_disk_artifact_is_the_pin_a_stopped_materialization_takes() {
+    let meta = evacuated_stop_disk_meta();
+
+    assert_eq!(
+        stopped_materialization_pin(&meta, meta.local_artifact_id.unwrap()).unwrap(),
+        meta.local_artifact_id.unwrap()
+    );
+}
+
+/// Every artifact shape that is *not* an evacuated stopped disk, refused.
+///
+/// Each of these is a real artifact the selector could hand this path if it
+/// picked the wrong row, and each would leave the sandbox pinned to bytes that
+/// are not the disk it was evacuated with: a fork's immutable source, a
+/// suspend checkpoint that also carries VM memory, a user's named snapshot, or
+/// a legacy sidecar from before typed artifacts existed.
+#[test]
+fn a_stopped_materialization_refuses_every_artifact_that_is_not_its_own_disk() {
+    use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin};
+
+    type MetaMutation = Box<dyn Fn(&mut crate::snapshot_upload::SnapshotMeta)>;
+    let cases: Vec<(&str, MetaMutation)> = vec![
+        (
+            "a fork's immutable source disk",
+            Box::new(|meta: &mut crate::snapshot_upload::SnapshotMeta| {
+                meta.artifact_origin = Some(ArtifactOrigin::Fork);
+            }),
+        ),
+        (
+            "a named user snapshot",
+            Box::new(|meta: &mut crate::snapshot_upload::SnapshotMeta| {
+                meta.artifact_origin = Some(ArtifactOrigin::Snapshot);
+            }),
+        ),
+        (
+            "a suspend checkpoint carrying VM memory",
+            Box::new(|meta: &mut crate::snapshot_upload::SnapshotMeta| {
+                meta.artifact_kind = Some(ArtifactKind::Full);
+                meta.artifact_origin = Some(ArtifactOrigin::Suspend);
+            }),
+        ),
+        (
+            "a disk artifact whose sidecar names no local artifact",
+            Box::new(|meta: &mut crate::snapshot_upload::SnapshotMeta| {
+                meta.local_artifact_id = None;
+            }),
+        ),
+        (
+            "an encrypted capture, which stages no plaintext rootfs",
+            Box::new(|meta: &mut crate::snapshot_upload::SnapshotMeta| {
+                meta.encrypted = true;
+            }),
+        ),
+        (
+            "a legacy sidecar from before typed artifacts",
+            Box::new(|meta: &mut crate::snapshot_upload::SnapshotMeta| {
+                meta.artifact_kind = None;
+                meta.artifact_origin = None;
+            }),
+        ),
+    ];
+
+    for (description, mutate) in cases {
+        let mut meta = evacuated_stop_disk_meta();
+        mutate(&mut meta);
+        let expected = meta.local_artifact_id.unwrap_or_default();
+        let error = stopped_materialization_pin(&meta, expected).expect_err(&format!(
+            "{description} must not be pinned as an evacuated stopped disk"
+        ));
+        assert!(
+            matches!(
+                error,
+                crate::snapshot_restore::RestoreError::StoppedMaterializationArtifactUnsuitable { .. }
+            ),
+            "{description} produced the wrong refusal: {error:?}"
+        );
+    }
+}
+
+/// `stopped_materialization_pin` refuses a sidecar naming a different artifact
+/// than the caller expects.
+///
+/// It is the check `run_cross_node_restore` runs on the sidecar as soon as it
+/// lands, ahead of the rootfs transfer and ahead of the finalize; that ordering
+/// is only exercised end to end, since driving the restore needs object
+/// storage. This test pins the comparison itself.
+/// Putting the comparison here rather than at the reply is what keeps a
+/// disagreement from costing a multi-gigabyte pull and leaving a committed row
+/// pinned to an artifact the boundary then refuses to vouch for — recoverable
+/// only by a caller that corrects its request.
+#[test]
+fn the_stopped_pin_refuses_an_unexpected_artifact() {
+    let meta = evacuated_stop_disk_meta();
+    let staged = meta.local_artifact_id.unwrap();
+    let asked_for = pplx_space_common_core::types::LocalArtifactId::new();
+
+    let error = stopped_materialization_pin(&meta, asked_for)
+        .expect_err("a sidecar naming a different artifact must not be pinned");
+
+    match error {
+        crate::snapshot_restore::RestoreError::StoppedMaterializationArtifactMismatch {
+            expected,
+            staged: got,
+        } => {
+            assert_eq!(expected, asked_for);
+            assert_eq!(got, staged);
+        }
+        other => panic!("expected a mismatch refusal, got {other:?}"),
+    }
+}
+
+/// The row is left untouched by that refusal — the point of catching it early.
+#[test]
+fn an_unexpected_artifact_leaves_the_row_alone() {
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new().to_string();
+    insert_restoring_row(&conn, &sandbox_id);
+    let meta = evacuated_stop_disk_meta();
+
+    transition_restored_sandbox_to_stopped(
+        &conn,
+        &sandbox_id,
+        &meta,
+        pplx_space_common_core::types::LocalArtifactId::new(),
+    )
+    .expect_err("a mismatch must not publish");
+
+    assert_eq!(
+        conn.query_row(
+            "SELECT state FROM sandboxes WHERE id = ?1",
+            [&sandbox_id],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap(),
+        SandboxState::Restoring.as_str(),
+        "the row must still be restoring, not committed to the wrong artifact"
+    );
+    assert_eq!(
+        current_pin(&conn, &sandbox_id),
+        None,
+        "and it must not have been pinned"
+    );
+}
+
+#[test]
+fn materializing_a_stopped_sandbox_lands_stopped_with_its_pin() {
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new().to_string();
+    insert_restoring_row(&conn, &sandbox_id);
+    let meta = evacuated_stop_disk_meta();
+
+    transition_restored_sandbox_to_stopped(
+        &conn,
+        &sandbox_id,
+        &meta,
+        meta.local_artifact_id.unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        conn.query_row(
+            "SELECT state FROM sandboxes WHERE id = ?1",
+            [&sandbox_id],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap(),
+        SandboxState::Stopped.as_str(),
+    );
+    assert_eq!(
+        current_pin(&conn, &sandbox_id),
+        meta.local_artifact_id.map(|id| id.to_string()),
+    );
+    // The pin row never shares the suspend checkpoint's path, so nothing that
+    // later stamps or reaps it can reach `{id}/snapshot`.
+    let row = crate::db::get_local_artifact(&conn, meta.local_artifact_id.unwrap())
+        .unwrap()
+        .expect("the pin names a local artifact row");
+    assert_eq!(
+        row.local_path,
+        pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(
+            &sandbox_id,
+            &format!("d-stop-{}", meta.local_artifact_id.unwrap()),
+        ),
+    );
+    assert_ne!(
+        row.local_path,
+        format!("{CACHE_DIR}/{sandbox_id}/snapshot"),
+        "the pin must not sit on the suspend checkpoint's path"
+    );
+}
+
+/// The three finalize arms, selected on one fixture.
+///
+/// The same staged disk sidecar reaches all three; what differs is the
+/// request. A fork takes the restore-as-new arm and drops the pin, a stopped
+/// target takes the evacuation arm and keeps it, and the historical
+/// suspend-checkpoint arm refuses the disk outright because a checkpoint
+/// restore has to carry VM memory. Driving them from one fixture is what makes
+/// a mis-wired dispatch visible: pick the wrong arm and the assertion for the
+/// arm you meant fails.
+#[test]
+fn each_finalize_arm_is_selected_by_the_request_not_by_the_artifact() {
+    let conn = crate::db::test_conn();
+    let sandbox_dir = tempfile::tempdir().unwrap();
+    let meta = evacuated_stop_disk_meta();
+
+    let forked = SandboxId::new().to_string();
+    insert_restoring_row(&conn, &forked);
+    let mut forked_meta = meta.clone();
+    rebind_artifact_snapshot_identity(
+        &mut forked_meta,
+        &forked,
+        &"user:019f8000-0000-7000-8000-000000000005".parse().unwrap(),
+    )
+    .unwrap();
+    finalize_recovered_published_restore(
+        &conn,
+        &forked,
+        sandbox_dir.path(),
+        &forked_meta,
+        true,
+        CrossNodeRestoreTarget::SuspendedCheckpoint,
+    )
+    .expect("a fork request must still take the restore-as-new arm");
+    assert_eq!(
+        current_pin(&conn, &forked),
+        None,
+        "the fork arm must leave the staged disk unpinned"
+    );
+
+    let evacuated = SandboxId::new().to_string();
+    insert_restoring_row(&conn, &evacuated);
+    finalize_recovered_published_restore(
+        &conn,
+        &evacuated,
+        sandbox_dir.path(),
+        &meta,
+        false,
+        CrossNodeRestoreTarget::StoppedDiskArtifact {
+            expected: meta.local_artifact_id.unwrap(),
+        },
+    )
+    .expect("a stopped target must take the evacuation arm");
+    assert_eq!(
+        current_pin(&conn, &evacuated),
+        meta.local_artifact_id.map(|id| id.to_string()),
+        "the evacuation arm must keep the pin"
+    );
+
+    let checkpointed = SandboxId::new().to_string();
+    insert_restoring_row(&conn, &checkpointed);
+    let error = finalize_recovered_published_restore(
+        &conn,
+        &checkpointed,
+        sandbox_dir.path(),
+        &meta,
+        false,
+        CrossNodeRestoreTarget::SuspendedCheckpoint,
+    )
+    .expect_err("the checkpoint arm must not accept a disk artifact");
+    assert!(
+        error.to_string().contains("must identify a full artifact"),
+        "unexpected checkpoint-arm refusal: {error}"
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT state FROM sandboxes WHERE id = ?1",
+            [&checkpointed],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap(),
+        SandboxState::Restoring.as_str(),
+    );
 }
 
 #[derive(Clone, Default)]
@@ -1439,7 +1748,7 @@ fn the_only_unfenced_staging_failure_write_is_the_no_claim_arm() {
 }
 
 // ---------------------------------------------------------------------------
-// `run_cross_node_restore_inner` refusal arms.
+// `run_cross_node_restore` refusal arms.
 //
 // Every case below is refused before the restore reads node paths or connects to
 // volume-manager, node-manager or cluster-api. Each asserts the caller-visible
@@ -1535,14 +1844,16 @@ async fn cross_node_restore_rejects_malformed_identity_and_source_before_any_wri
 
     let error = restore_error(
         service
-            .run_cross_node_restore(
-                "not-a-sandbox-id",
-                Some("s3://snapshots/suspend/x?region=us-east-1"),
-                None,
-                None,
-                None,
-                CrossNodeRestoreStagingAdmission::Foreground,
-            )
+            .run_cross_node_restore(CrossNodeRestoreRequest {
+                sandbox_id: "not-a-sandbox-id",
+                storage_uri: Some("s3://snapshots/suspend/x?region=us-east-1"),
+                execution_generation: None,
+                activation_attempt_id: None,
+                recovery: None,
+                restore_artifact_as_new: None,
+                target: CrossNodeRestoreTarget::SuspendedCheckpoint,
+                staging_admission: CrossNodeRestoreStagingAdmission::Foreground,
+            })
             .await,
     );
     assert!(
@@ -1557,14 +1868,16 @@ async fn cross_node_restore_rejects_malformed_identity_and_source_before_any_wri
 
     let error = restore_error(
         service
-            .run_cross_node_restore(
-                &valid_id,
-                Some("not a storage uri"),
-                None,
-                None,
-                None,
-                CrossNodeRestoreStagingAdmission::Foreground,
-            )
+            .run_cross_node_restore(CrossNodeRestoreRequest {
+                sandbox_id: &valid_id,
+                storage_uri: Some("not a storage uri"),
+                execution_generation: None,
+                activation_attempt_id: None,
+                recovery: None,
+                restore_artifact_as_new: None,
+                target: CrossNodeRestoreTarget::SuspendedCheckpoint,
+                staging_admission: CrossNodeRestoreStagingAdmission::Foreground,
+            })
             .await,
     );
     assert!(
@@ -1674,14 +1987,16 @@ async fn cross_node_restore_declines_an_existing_row_that_is_not_an_interrupted_
         let service = service_with_runtime_probe(conn, false);
 
         let outcome = service
-            .run_cross_node_restore(
-                &sandbox_id,
-                Some("s3://snapshots/suspend/x?region=us-east-1"),
-                Some(generation(7)),
-                Some(attempt(3)),
-                None,
-                CrossNodeRestoreStagingAdmission::Foreground,
-            )
+            .run_cross_node_restore(CrossNodeRestoreRequest {
+                sandbox_id: &sandbox_id,
+                storage_uri: Some("s3://snapshots/suspend/x?region=us-east-1"),
+                execution_generation: Some(generation(7)),
+                activation_attempt_id: Some(attempt(3)),
+                recovery: None,
+                restore_artifact_as_new: None,
+                target: CrossNodeRestoreTarget::SuspendedCheckpoint,
+                staging_admission: CrossNodeRestoreStagingAdmission::Foreground,
+            })
             .await;
 
         if !matches!(outcome, Ok(None)) {
@@ -1710,14 +2025,16 @@ async fn foreground_cross_node_restore_refuses_while_staging_is_held() {
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(3600),
-        service.run_cross_node_restore(
-            &sandbox_id,
-            Some("s3://snapshots/suspend/x?region=us-east-1"),
-            Some(generation(7)),
-            Some(attempt(1)),
-            None,
-            CrossNodeRestoreStagingAdmission::Foreground,
-        ),
+        service.run_cross_node_restore(CrossNodeRestoreRequest {
+            sandbox_id: &sandbox_id,
+            storage_uri: Some("s3://snapshots/suspend/x?region=us-east-1"),
+            execution_generation: Some(generation(7)),
+            activation_attempt_id: Some(attempt(1)),
+            recovery: None,
+            restore_artifact_as_new: None,
+            target: CrossNodeRestoreTarget::SuspendedCheckpoint,
+            staging_admission: CrossNodeRestoreStagingAdmission::Foreground,
+        }),
     )
     .await
     .expect("foreground admission must be bounded");
@@ -1895,14 +2212,16 @@ async fn rowless_restore_keeps_a_superseded_scope_it_cannot_retire() {
 
     let error = restore_error(
         service
-            .run_cross_node_restore(
-                &sandbox_id,
-                Some("s3://snapshots/suspend/x?region=us-east-1"),
-                Some(generation(7)),
-                Some(attempt(3)),
-                None,
-                CrossNodeRestoreStagingAdmission::Foreground,
-            )
+            .run_cross_node_restore(CrossNodeRestoreRequest {
+                sandbox_id: &sandbox_id,
+                storage_uri: Some("s3://snapshots/suspend/x?region=us-east-1"),
+                execution_generation: Some(generation(7)),
+                activation_attempt_id: Some(attempt(3)),
+                recovery: None,
+                restore_artifact_as_new: None,
+                target: CrossNodeRestoreTarget::SuspendedCheckpoint,
+                staging_admission: CrossNodeRestoreStagingAdmission::Foreground,
+            })
             .await,
     );
 

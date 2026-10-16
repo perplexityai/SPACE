@@ -140,6 +140,13 @@ fn quarantine_recovery_no_progress_reason(
         | crate::snapshot_restore::RestoreError::ArtifactSourceUriMismatch { .. }
         | crate::snapshot_restore::RestoreError::InvalidRecoveredSandboxRow { .. }
         | crate::snapshot_restore::RestoreError::RootfsPolicy(..)
+        // Orphan recovery always restores a suspended checkpoint, so this one
+        // is unreachable from here. It is still evidence disagreeing with
+        // itself — the staged sidecar does not describe the artifact the
+        // request named — and classifying it any other way would send an
+        // operator somewhere the metric could not have come from.
+        | crate::snapshot_restore::RestoreError::StoppedMaterializationArtifactUnsuitable { .. }
+        | crate::snapshot_restore::RestoreError::StoppedMaterializationArtifactMismatch { .. }
         | crate::snapshot_restore::RestoreError::MissingSandboxOwnershipMetadata => {
             crate::db::QuarantineRecoveryNoProgressReason::RestoreEvidenceMismatch
         }
@@ -1388,7 +1395,7 @@ impl SandboxManagerService {
             // column — would put the choice in a second place, and the two would
             // only agree for as long as nobody changed one of them. What that costs
             // is specific now that the restore branch owns a node-wide permit: a
-            // reason code `run_cross_node_restore_inner` refuses would take the
+            // reason code `run_cross_node_restore` refuses would take the
             // permit, spend a plan lookup and a claim, get `Ok(None)`, and repeat
             // every backoff interval forever while reporting
             // `orphan_restore_deferred`. One decision, carried, cannot drift.
@@ -2439,4 +2446,4 @@ mod orphan_dispatch;
 pub(in crate::service) mod staging_cleanup;
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

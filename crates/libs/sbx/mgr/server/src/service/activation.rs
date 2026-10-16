@@ -132,6 +132,9 @@ impl WakeStartConfig {
             suspend_restore_source_node: restore_from_suspend
                 .then(|| self.suspend_restore_source_node.clone())
                 .flatten(),
+            expected_local_artifact_id: restore_from_suspend
+                .then(|| self.expected_local_artifact_id.clone())
+                .flatten(),
             route_identity: wake_start_route_identity(self),
             operation_activation_attempt_id: self
                 .operation_activation_attempt_id

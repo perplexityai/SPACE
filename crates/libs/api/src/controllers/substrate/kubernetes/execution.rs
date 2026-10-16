@@ -779,6 +779,7 @@ impl KubernetesSubstrate {
                                     suspend_restore_storage_uri: suspend_restore_storage_uri
                                         .map(ToOwned::to_owned),
                                     suspend_restore_source_node: None,
+                                    expected_local_artifact_id: None,
                                     route_identity: Some(wake_request_route_identity(
                                         route_identity,
                                     )),
@@ -1622,6 +1623,7 @@ impl KubernetesSubstrate {
                                     route_identity: Some(wake_request_route_identity(
                                         route_identity,
                                     )),
+                                    expected_local_artifact_id: None,
                                 },
                             ),
                             target_state: wake_target_state,

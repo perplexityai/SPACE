@@ -212,8 +212,9 @@ edge_table! {
     /// `publish_restored_suspended_without_artifact`: cross-node restore
     /// staging published a suspended row.
     CROSS_NODE_RESTORE_PUBLISHED: Completion, of(&[Restoring]) => Suspended;
-    /// `publish_restored_disk_as_new`: a restore-as-new published a stopped
-    /// disk.
+    /// `publish_restored_disk_as_new` and `publish_restored_stopped_artifact`:
+    /// a restore-as-new or an evacuated stopped materialization published a
+    /// stopped disk.
     RESTORED_DISK_AS_NEW: Completion, of(&[Restoring]) => Stopped;
     /// `rollback_starting_episode` to a `created` entry state.
     START_ROLLBACK_CREATED: Compensation, of(&[Starting]) => Created;

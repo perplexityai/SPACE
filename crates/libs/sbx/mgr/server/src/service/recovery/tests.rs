@@ -59,7 +59,7 @@ fn restore_source(sandbox_id: &str) -> pplx_space_common_core::types::ExactStora
         .unwrap()
 }
 
-fn insert_suspended_test_sandbox(conn: &rusqlite::Connection, id: &str) {
+pub(in crate::service) fn insert_suspended_test_sandbox(conn: &rusqlite::Connection, id: &str) {
     let sandbox_id = SandboxId::from_str(id).unwrap();
     let uuid8 = SandboxRuntimeLabel::from_sandbox_id(sandbox_id);
     let user = SandboxOwner::parse("user").unwrap();
@@ -465,7 +465,9 @@ fn a_lost_claim_is_reported_without_a_durable_retry_write() {
 // changed lines in this file was 11%.
 // ---------------------------------------------------------------------------
 
-fn recovery_test_service(conn: rusqlite::Connection) -> SandboxManagerService {
+pub(in crate::service) fn recovery_test_service(
+    conn: rusqlite::Connection,
+) -> SandboxManagerService {
     crate::service::tests::service_tests::service_with_runtime_probe(conn, false)
 }
 

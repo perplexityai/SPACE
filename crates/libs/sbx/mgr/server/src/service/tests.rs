@@ -8613,6 +8613,7 @@ pub(crate) mod service_tests {
             suspend_restore_source_node: None,
             route_identity,
             restore_artifact_as_new: None,
+            expected_local_artifact_id: None,
         }
     }
 
@@ -16203,7 +16204,11 @@ pub(crate) mod service_tests {
     #[test]
     fn wake_start_mapping_preserves_wait_shape_and_restore_context() {
         for populated in [false, true] {
-            for target_state in [SandboxState::Started, SandboxState::Paused] {
+            for target_state in [
+                SandboxState::Started,
+                SandboxState::Paused,
+                SandboxState::Stopped,
+            ] {
                 let start = WakeStartConfig {
                     network_context: WakeNetworkContext::RuntimePath(
                         "/var/run/netns/sns-test".into(),
@@ -16213,6 +16218,8 @@ pub(crate) mod service_tests {
                     memory_mib: populated.then_some(512),
                     suspend_restore_storage_uri: populated.then(|| "s3://bucket/checkpoint".into()),
                     suspend_restore_source_node: populated.then(|| "source-node".into()),
+                    expected_local_artifact_id: populated
+                        .then(|| pplx_space_common_core::types::LocalArtifactId::new().to_string()),
                     operation_activation_attempt_id: populated
                         .then(SandboxActivationAttemptId::new),
                     ..Default::default()
@@ -16227,10 +16234,13 @@ pub(crate) mod service_tests {
                         assert_eq!(request.ready_timeout_secs, timeout);
                         assert_eq!(
                             request.target_state,
-                            if target_state == SandboxState::Paused {
-                                crate::proto::WakeTargetState::Paused as i32
-                            } else {
-                                crate::proto::WakeTargetState::Started as i32
+                            match target_state {
+                                SandboxState::Paused =>
+                                    crate::proto::WakeTargetState::Paused as i32,
+                                SandboxState::Stopped => {
+                                    crate::proto::WakeTargetState::Stopped as i32
+                                }
+                                _ => crate::proto::WakeTargetState::Started as i32,
                             }
                         );
                         assert_eq!(
@@ -16248,6 +16258,15 @@ pub(crate) mod service_tests {
                             request.suspend_restore_source_node,
                             restore
                                 .then(|| start.suspend_restore_source_node.clone())
+                                .flatten()
+                        );
+                        // The artifact id travels with the rest of the restore
+                        // context and only with it: a populated config that is
+                        // not restoring must not forward the id.
+                        assert_eq!(
+                            request.expected_local_artifact_id,
+                            restore
+                                .then(|| start.expected_local_artifact_id.clone())
                                 .flatten()
                         );
                         assert_eq!(
@@ -17143,6 +17162,410 @@ pub(crate) mod service_tests {
         assert_eq!(response.guest_ip, "169.254.0.21");
         assert_eq!(response.guest_gateway, "169.254.0.22");
         assert_eq!(response.namespace, format!("sns-{}", row.uuid8));
+    }
+
+    /// The request the cluster-controller sends to place an evacuated stopped
+    /// sandbox on this node: the sandbox's own id, a suspend checkpoint, and
+    /// the exact URI of the `stop`-origin disk artifact the drain published.
+    /// Exhaust the node's Firecracker launch admission.
+    ///
+    /// Every microVM launch on this node takes a token from this bucket first
+    /// — the cold path in `start_sandbox_with_authority` and the restore path
+    /// in `create.rs`, which share one bucket. Spending the only token with a
+    /// near-zero refill rate leaves the gate shut for the rest of the test, so
+    /// anything that still completes promptly did not attempt a launch.
+    fn shut_the_launch_gate(service: &mut SandboxManagerService) {
+        service.activation_admission_limiter = Arc::new(ActivationAdmissionLimiter::with_config(
+            activation_admission_config(1, 0.001, 1.0),
+        ));
+        let spent = service
+            .activation_admission_limiter
+            .try_acquire(ActivationAdmissionKind::Restore)
+            .expect("test setup should spend the only launch token");
+        drop(spent);
+        assert!(
+            service
+                .activation_admission_limiter
+                .try_acquire(ActivationAdmissionKind::Cold)
+                .is_err(),
+            "the launch gate must actually be shut, or an absence assertion below proves nothing"
+        );
+    }
+
+    /// The property, in operator terms: "your bytes are here" is answered only
+    /// for the artifact that was asked for.
+    ///
+    /// A row that was already `Stopped` on this node is not evidence — a local
+    /// stop whose disk was published for backup leaves the same shape an
+    /// evacuation does. The
+    /// request names the artifact it expects, so the two cases separate on a
+    /// local comparison, and the whole point is that the same row gives
+    /// opposite answers depending on which artifact is asked for.
+    #[tokio::test]
+    async fn a_stopped_row_answers_only_for_the_artifact_it_pins() {
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &sandbox_id, SandboxState::Stopped);
+        let pin = pplx_space_common_core::types::LocalArtifactId::new();
+        conn.execute(
+            "UPDATE sandboxes
+             SET current_local_artifact_id = ?1,
+                 current_local_artifact_kind = 'disk',
+                 current_local_artifact_origin = 'stop'
+             WHERE id = ?2",
+            rusqlite::params![pin.to_string(), &sandbox_id],
+        )
+        .unwrap();
+        let mut service = service_with_runtime_probe(conn, false);
+        shut_the_launch_gate(&mut service);
+
+        // Asked for the artifact it pins: converged, and reported with no
+        // attachment because a stopped sandbox has no runtime.
+        let mut request =
+            crate::service::start::tests::materialize_stopped_request_for(&sandbox_id);
+        request.expected_local_artifact_id = Some(pin.to_string());
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            service.start_sandbox(request, false),
+        )
+        .await
+        .expect("a local comparison must not wait behind the Firecracker launch gate")
+        .expect("the row pins exactly the requested artifact")
+        .into_inner();
+        assert_eq!(response.sandbox_id, sandbox_id);
+
+        // Same row, different artifact asked for: refused rather than vouched
+        // for, and the row is left exactly as found.
+        let mut stale = crate::service::start::tests::materialize_stopped_request_for(&sandbox_id);
+        stale.expected_local_artifact_id =
+            Some(pplx_space_common_core::types::LocalArtifactId::new().to_string());
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            service.start_sandbox(stale, false),
+        )
+        .await
+        .expect("the refusal must not wait behind the Firecracker launch gate")
+        .expect_err("a row pinning a different artifact must not be reported as materialized");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            error.message().contains("refusing to report a stale row"),
+            "unexpected refusal: {error}"
+        );
+
+        let row = service.lookup_sandbox(&sandbox_id).unwrap();
+        assert_eq!(row.state, SandboxState::Stopped);
+        assert_eq!(row.current_local_artifact_id, Some(pin));
+    }
+
+    /// Fails closed on a row that is not the materialization's own result.
+    ///
+    /// The possible presence is real: a `Suspended` row under a suspend
+    /// checkpoint is the input that selects `ResumeSuspendCheckpoint`, whose
+    /// handler restores and launches the VM
+    /// (`a_suspended_row_under_a_checkpoint_is_a_launching_fixture` in
+    /// `service::start::tests` pins that classification). The stopped
+    /// boundaries refuse it rather than report a sandbox they did not
+    /// converge, leaving the row for whoever does own it.
+    #[tokio::test]
+    async fn a_stopped_target_refuses_a_row_it_did_not_materialize() {
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &sandbox_id, SandboxState::Suspended);
+        let mut service = service_with_runtime_probe(conn, false);
+        shut_the_launch_gate(&mut service);
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            service.start_sandbox(
+                crate::service::start::tests::materialize_stopped_request_for(&sandbox_id),
+                false,
+            ),
+        )
+        .await
+        .expect("the refusal must not wait behind the Firecracker launch gate")
+        .expect_err("a suspended row is not a materialized stopped sandbox");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            error.message().contains("while local state is"),
+            "unexpected refusal: {error}"
+        );
+        let row = service.lookup_sandbox(&sandbox_id).unwrap();
+        assert_eq!(
+            row.state,
+            SandboxState::Suspended,
+            "the refusal must leave the row it did not own where it found it"
+        );
+        assert_eq!(
+            row.restore_operation, None,
+            "the refusal must not have opened a restore on it either"
+        );
+    }
+
+    /// The RPC the cluster-controller actually calls. `Wake` is the entry
+    /// point for the drain's lifecycle-preserving evacuation — `Paused` rides
+    /// it today — so the stopped target has to be inert here too, not only on
+    /// the `Start` it delegates staging to.
+    ///
+    /// `Wake` inherits the `Start` boundary's rule because it delegates the
+    /// stopped target to it: a row pinning a different artifact than the one
+    /// asked for is refused, not reported as evacuated.
+    #[tokio::test]
+    async fn waking_a_stale_stopped_row_does_not_report_it_evacuated() {
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &sandbox_id, SandboxState::Stopped);
+        let pin = pplx_space_common_core::types::LocalArtifactId::new();
+        conn.execute(
+            "UPDATE sandboxes
+             SET current_local_artifact_id = ?1,
+                 current_local_artifact_kind = 'disk',
+                 current_local_artifact_origin = 'stop'
+             WHERE id = ?2",
+            rusqlite::params![pin.to_string(), &sandbox_id],
+        )
+        .unwrap();
+        let mut service = service_with_runtime_probe(conn, false);
+        shut_the_launch_gate(&mut service);
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            service.wake(internal_request(WakeRequest {
+                sandbox_id: sandbox_id.clone(),
+                blocking: true,
+                start_context: Some(pplx_space_sbx_mgr_client::proto::WakeStartContext {
+                    netns_path: Some("/var/run/netns/test".to_string()),
+                    expected_local_artifact_id: Some(
+                        pplx_space_common_core::types::LocalArtifactId::new().to_string(),
+                    ),
+                    suspend_restore_storage_uri: Some(format!(
+                        "s3://snapshots/suspend/{sandbox_id}/{}?region=us-east-1",
+                        Uuid::now_v7()
+                    )),
+                    route_identity: Some(pplx_space_sbx_mgr_client::proto::SpaceApiRouteIdentity {
+                        execution_generation: Some(7),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                target_state: crate::proto::WakeTargetState::Stopped as i32,
+                implicit_wake_source: 0,
+            })),
+        )
+        .await
+        .expect("a stopped target must not wait behind the Firecracker launch gate")
+        .expect_err("a stale stopped row must not be reported as evacuated");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            error.message().contains("refusing to report a stale row"),
+            "unexpected refusal: {error}"
+        );
+        let row = service.lookup_sandbox(&sandbox_id).unwrap();
+        assert_eq!(row.state, SandboxState::Stopped);
+        assert_eq!(row.pid, None);
+        assert_eq!(row.current_local_artifact_id, Some(pin));
+    }
+
+    /// A stopped `Wake` from a Kubernetes identity needs no runtime namespace:
+    /// it never launches. The same request without one reaches the stopped
+    /// boundary and is answered there, rather than refused for a missing
+    /// launch namespace.
+    #[tokio::test]
+    async fn waking_to_stopped_needs_no_runtime_namespace() {
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &sandbox_id, SandboxState::Stopped);
+        let pin = pplx_space_common_core::types::LocalArtifactId::new();
+        conn.execute(
+            "UPDATE sandboxes
+             SET current_local_artifact_id = ?1,
+                 current_local_artifact_kind = 'disk',
+                 current_local_artifact_origin = 'stop'
+             WHERE id = ?2",
+            rusqlite::params![pin.to_string(), &sandbox_id],
+        )
+        .unwrap();
+        let mut service = service_with_runtime_probe(conn, false);
+        shut_the_launch_gate(&mut service);
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            service.wake(internal_request(WakeRequest {
+                sandbox_id: sandbox_id.clone(),
+                blocking: true,
+                start_context: Some(pplx_space_sbx_mgr_client::proto::WakeStartContext {
+                    netns_path: None,
+                    expected_local_artifact_id: Some(pin.to_string()),
+                    suspend_restore_storage_uri: Some(format!(
+                        "s3://snapshots/suspend/{sandbox_id}/{}?region=us-east-1",
+                        Uuid::now_v7()
+                    )),
+                    route_identity: Some(pplx_space_sbx_mgr_client::proto::SpaceApiRouteIdentity {
+                        execution_generation: Some(7),
+                        pod_uid: Some("019f8000-0000-7000-8000-0000000000bb".to_string()),
+                        substrate_kind:
+                            pplx_space_sbx_mgr_client::proto::SandboxSubstrateKind::Kubernetes
+                                as i32,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                target_state: crate::proto::WakeTargetState::Stopped as i32,
+                implicit_wake_source: 0,
+            })),
+        )
+        .await
+        .expect("a stopped target must not wait behind the Firecracker launch gate")
+        .expect("a materialized row pinning the requested artifact converges without a namespace")
+        .into_inner();
+
+        assert_eq!(response.sandbox_id, sandbox_id);
+        let row = service.lookup_sandbox(&sandbox_id).unwrap();
+        assert_eq!(row.state, SandboxState::Stopped);
+        assert_eq!(row.current_local_artifact_id, Some(pin));
+    }
+
+    /// A `Wake` asking for the stopped target with no start context carries
+    /// neither the artifact URI nor the expected artifact id, so delegating it
+    /// to `Start` now refuses it at the wire boundary instead of letting it
+    /// reach a row it has no evidence about. Better diagnosis for the same
+    /// fail-closed outcome.
+    #[tokio::test]
+    async fn waking_to_stopped_without_a_start_context_is_refused_at_the_wire() {
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &sandbox_id, SandboxState::Paused);
+        let mut service = service_with_runtime_probe(conn, true);
+        shut_the_launch_gate(&mut service);
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            service.wake(internal_request(WakeRequest {
+                sandbox_id: sandbox_id.clone(),
+                blocking: true,
+                start_context: None,
+                target_state: crate::proto::WakeTargetState::Stopped as i32,
+                implicit_wake_source: 0,
+            })),
+        )
+        .await
+        .expect("the refusal must not wait behind the Firecracker launch gate")
+        .expect_err("a stopped target with no artifact to materialize is malformed");
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(
+            error.message().contains("stopped target state requires"),
+            "unexpected refusal: {error}"
+        );
+        let row = service.lookup_sandbox(&sandbox_id).unwrap();
+        assert_eq!(
+            row.state,
+            SandboxState::Paused,
+            "the refusal must not have resumed it on the way out"
+        );
+    }
+
+    /// An interrupted materialization must stay retryable.
+    ///
+    /// A materialization that dies after adopting the row and before
+    /// finalizing it leaves `Restoring` behind. Nothing else on the node
+    /// drives that row — `wake_transition_for_state` answers `Wait` for it —
+    /// so if the stopped short-circuit answered here, the sandbox would be
+    /// stranded on a node it was only passing through, with its bytes in S3
+    /// and no path back. The resume is Start's `ResumeRestoring` arm, which
+    /// this has to reach rather than pre-empt.
+    ///
+    /// Reaching it is asserted positively rather than by the absence of the
+    /// refusal: with the staging lock held, the first thing that arm does is
+    /// answer `Unavailable`, and only code inside
+    /// `restore_suspended_checkpoint_start` can produce that. Before the
+    /// `Restoring` carve-out this returned `FailedPrecondition` instead.
+    #[tokio::test]
+    async fn an_interrupted_stopped_materialization_reaches_the_restore_retry() {
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &sandbox_id, SandboxState::Restoring);
+        let mut service = service_with_runtime_probe(conn, false);
+        shut_the_launch_gate(&mut service);
+        let staging_lock = service.auto_lifecycle.staging_lock(&sandbox_id);
+        let _held = staging_lock.lock().await;
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            service.start_sandbox(
+                crate::service::start::tests::materialize_stopped_request_for(&sandbox_id),
+                false,
+            ),
+        )
+        .await
+        .expect("the retry must not wait behind the Firecracker launch gate")
+        .expect_err("the staging lock is held, so the resume must defer");
+
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert!(
+            error.message().contains("restore staging is in progress"),
+            "expected the resume arm's staging deferral, got: {error}"
+        );
+        assert_eq!(
+            service.lookup_sandbox(&sandbox_id).unwrap().state,
+            SandboxState::Restoring,
+            "a deferred resume must leave the interrupted row alone"
+        );
+    }
+
+    /// The same carve-out at the RPC the cluster-controller calls. `Wake`
+    /// delegates staging to `Start` only when the row is absent, so without
+    /// widening that condition an interrupted materialization would reach
+    /// `wake_with_start_config`, which answers `Wait` for `Restoring` and
+    /// drives nothing.
+    #[tokio::test]
+    async fn waking_an_interrupted_stopped_materialization_resumes_it() {
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &sandbox_id, SandboxState::Restoring);
+        let mut service = service_with_runtime_probe(conn, false);
+        shut_the_launch_gate(&mut service);
+        let staging_lock = service.auto_lifecycle.staging_lock(&sandbox_id);
+        let _held = staging_lock.lock().await;
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            service.wake(internal_request(WakeRequest {
+                sandbox_id: sandbox_id.clone(),
+                blocking: true,
+                start_context: Some(pplx_space_sbx_mgr_client::proto::WakeStartContext {
+                    netns_path: Some("/var/run/netns/test".to_string()),
+                    expected_local_artifact_id: Some(
+                        pplx_space_common_core::types::LocalArtifactId::new().to_string(),
+                    ),
+                    suspend_restore_storage_uri: Some(format!(
+                        "s3://snapshots/suspend/{sandbox_id}/{}?region=us-east-1",
+                        Uuid::now_v7()
+                    )),
+                    route_identity: Some(pplx_space_sbx_mgr_client::proto::SpaceApiRouteIdentity {
+                        execution_generation: Some(7),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                target_state: crate::proto::WakeTargetState::Stopped as i32,
+                implicit_wake_source: 0,
+            })),
+        )
+        .await
+        .expect("the retry must not wait behind the Firecracker launch gate")
+        .expect_err("the staging lock is held, so the resume must defer");
+
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert!(
+            error.message().contains("restore staging is in progress"),
+            "expected the resume arm's staging deferral, got: {error}"
+        );
+        assert_eq!(
+            service.lookup_sandbox(&sandbox_id).unwrap().state,
+            SandboxState::Restoring
+        );
     }
 
     #[test]
@@ -20160,6 +20583,7 @@ pub(crate) mod service_tests {
             activation_auto_lifecycle: None,
             operation_activation_attempt_id: None,
             restore_artifact_as_new: None,
+            expected_local_artifact_id: None,
             sandbox_id: "sbx".to_string(),
             vcpu: None,
             memory_mib: None,

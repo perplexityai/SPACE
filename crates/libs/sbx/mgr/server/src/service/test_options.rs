@@ -60,6 +60,9 @@ impl SandboxManagerServiceOptions {
             sandbox_runtime_live: Arc::new(move |id| {
                 super::cache_cleanup::is_sandbox_running_in(&run_dir, id)
             }),
+            // Unit tests stage no rootfs under `/space/cache`; a test of the
+            // missing-rootfs refusal overrides this.
+            sandbox_rootfs_present: Arc::new(|_| true),
             shutdown_token: tokio_util::sync::CancellationToken::new(),
             task_tracker: tokio_util::task::TaskTracker::new(),
             local_node_id: Some(test_node_id()),

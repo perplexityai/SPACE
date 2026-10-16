@@ -424,6 +424,12 @@ pub struct SandboxManagerService {
     /// reattach path without a real `fc.pid` symlink on disk. Production uses
     /// [`is_sandbox_running`].
     sandbox_runtime_live: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    /// Probe for "is this sandbox's rootfs on this node's disk". The stopped
+    /// materialization boundary checks it before vouching for a row, so a row
+    /// whose bytes are gone is refused rather than reported as placed.
+    /// Injected so tests can answer it without `/space/cache`. Production uses
+    /// [`create_support::sandbox_rootfs_exists`].
+    sandbox_rootfs_present: Arc<dyn Fn(&str) -> bool + Send + Sync>,
     /// Node-manager's answers about retained btrfs send sources. Injected so
     /// tests can drive recovery without a btrfs node-manager.
     retained_source_inspector: Arc<dyn crate::retained_source::RetainedSourceInspector>,
@@ -967,6 +973,7 @@ pub struct SandboxManagerServiceOptions {
     pub host_control_socket_path: PathBuf,
     pub credential_manager_socket_path: PathBuf,
     pub sandbox_runtime_live: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    pub sandbox_rootfs_present: Arc<dyn Fn(&str) -> bool + Send + Sync>,
     pub shutdown_token: CancellationToken,
     pub task_tracker: TaskTracker,
     /// Stable identity of this node. Tests can inject availability explicitly;
@@ -1001,6 +1008,7 @@ impl Default for SandboxManagerServiceOptions {
                 pplx_space_credmgr_client::CREDMGR_SOCKET,
             ),
             sandbox_runtime_live: Arc::new(is_sandbox_running),
+            sandbox_rootfs_present: Arc::new(create_support::sandbox_rootfs_exists),
             shutdown_token: CancellationToken::new(),
             task_tracker: TaskTracker::new(),
             local_node_id: local_space_node_id(),
@@ -1756,6 +1764,7 @@ impl SandboxManagerService {
             },
             snapshot_upload_worker,
             sandbox_runtime_live: options.sandbox_runtime_live,
+            sandbox_rootfs_present: options.sandbox_rootfs_present,
             retained_source_inspector: Arc::new(
                 crate::retained_source::NodeManagerSourceInspector(options.node_manager.clone()),
             ),

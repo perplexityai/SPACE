@@ -1086,6 +1086,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                                     suspend_restore_source_node: restore_plan
                                         .as_ref()
                                         .and_then(|plan| plan.source_node_name.clone()),
+                                    expected_local_artifact_id: None,
                                     route_identity: Some(wake_request_route_identity(
                                         route_identity,
                                     )),
@@ -1781,6 +1782,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                                         suspend_restore_source_node: restore_plan
                                             .as_ref()
                                             .and_then(|plan| plan.source_node_name.clone()),
+                                        expected_local_artifact_id: None,
                                         route_identity: Some(wake_request_route_identity(
                                             route_identity,
                                         )),

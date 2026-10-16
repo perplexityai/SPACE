@@ -168,6 +168,34 @@ pub enum RestoreError {
         expected: SandboxId,
         storage_uri: String,
     },
+    /// A `WAKE_TARGET_STATE_STOPPED` restore staged metadata that does not
+    /// describe an evacuated stopped sandbox's disk image. Carries all three
+    /// observed fields rather than only the one that failed, because the usual
+    /// cause is that the caller selected the wrong artifact entirely and the
+    /// other two say which one it did select.
+    #[error(
+        "materializing a stopped sandbox requires a stop-origin disk artifact naming its local \
+         artifact; staged metadata has kind {kind:?}, origin {origin:?}, local artifact \
+         {local_artifact_id:?}"
+    )]
+    StoppedMaterializationArtifactUnsuitable {
+        kind: Option<ArtifactKind>,
+        origin: Option<ArtifactOrigin>,
+        local_artifact_id: Option<LocalArtifactId>,
+    },
+    /// The staged artifact is a well-formed evacuated disk, but not the one the
+    /// caller said this URI resolves to. Caught before the rootfs transfer and
+    /// before the row is committed: no rootfs is pulled and no row is written.
+    /// On a fresh materialization the metadata pull's transfer scope has no row
+    /// and is left for the rowless-scope sweep.
+    #[error(
+        "materializing a stopped sandbox expected artifact {expected} but the staged metadata \
+         names {staged}"
+    )]
+    StoppedMaterializationArtifactMismatch {
+        expected: LocalArtifactId,
+        staged: LocalArtifactId,
+    },
     #[error("artifact snapshot is missing sandbox ownership metadata")]
     MissingSandboxOwnershipMetadata,
     #[error("restored rootfs capacity is not permitted: {0}")]
@@ -281,6 +309,18 @@ pub enum RestoreError {
 }
 
 impl RestoreError {
+    /// Whether this is a stopped materialization refused because the staged
+    /// artifact isn't the evacuated disk the caller named. Retrying can't
+    /// help — the same request stages the same artifact — so callers report
+    /// it as `FailedPrecondition` rather than a retryable `Unavailable`.
+    pub(crate) fn is_stopped_materialization_refusal(&self) -> bool {
+        matches!(
+            self,
+            Self::StoppedMaterializationArtifactUnsuitable { .. }
+                | Self::StoppedMaterializationArtifactMismatch { .. }
+        )
+    }
+
     /// What failed, for a stage-in failure reported as `stage_failed`. Every
     /// variant is listed so a new one is classified rather than defaulted.
     /// The variants a restore reports under a reason of their own map to
@@ -294,6 +334,8 @@ impl RestoreError {
             | Self::InvalidRestoreSource { .. }
             | Self::ArtifactSnapshotUriMismatch { .. }
             | Self::ArtifactSourceUriMismatch { .. }
+            | Self::StoppedMaterializationArtifactUnsuitable { .. }
+            | Self::StoppedMaterializationArtifactMismatch { .. }
             | Self::MissingSandboxOwnershipMetadata => Kind::SourceMismatch,
             Self::CreateDirectory { .. }
             | Self::RemoveFile { .. }
@@ -347,7 +389,7 @@ impl RestoreError {
     ///
     /// This is a narrow property, not "every rendering of a `RestoreError` is
     /// classified". Only the two quarantine-recovery log sites in
-    /// `service/recovery.rs` call this. On the same path, `run_cross_node_restore_inner`
+    /// `service/recovery.rs` call this. On the same path, `run_cross_node_restore`
     /// renders the full `Display` three other ways when staging fails: into a
     /// `SnapshotRestoreFailed` sandbox event, into the sandbox row's
     /// `failure_reason` — which the node state snapshot publishes on the wire —
@@ -418,6 +460,8 @@ impl RestoreError {
             | Self::QuarantineRecoveryAbandonedAtShutdown { .. }
             | Self::QuarantineRecoveryTimedOut { .. }
             | Self::SandboxDatabaseMutexPoisoned
+            | Self::StoppedMaterializationArtifactUnsuitable { .. }
+            | Self::StoppedMaterializationArtifactMismatch { .. }
             | Self::CanonicalRootConflict { .. } => Some(self.to_string()),
         }
     }
@@ -467,6 +511,12 @@ impl RestoreError {
             Self::CanonicalRootConflict { .. } => "canonical_root_conflict",
             Self::ParentTemplateLookup { .. } => "parent_template_lookup",
             Self::BtrfsReceive { .. } => "btrfs_receive",
+            Self::StoppedMaterializationArtifactUnsuitable { .. } => {
+                "stopped_materialization_artifact_unsuitable"
+            }
+            Self::StoppedMaterializationArtifactMismatch { .. } => {
+                "stopped_materialization_artifact_mismatch"
+            }
             Self::Other(..) => "other",
         }
     }
