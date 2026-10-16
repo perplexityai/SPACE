@@ -29,4 +29,4 @@ pub use owner::{PoolConfigOwner, PoolConfigOwnerParseError};
 #[cfg(feature = "kubernetes")]
 pub use state::PoolSlotState;
 #[cfg(feature = "kubernetes")]
-pub use store::{BackstopSweepOutcome, WarmPoolStore};
+pub use store::{BackstopSweepOutcome, SlotOwnership, WarmPoolStore};

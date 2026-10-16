@@ -122,6 +122,42 @@ impl BackstopWindow {
     }
 }
 
+/// One slot row's ownership facts, as [`WarmPoolStore::slot_ownership_by_pod_name`]
+/// reports them.
+#[derive(Debug)]
+pub struct SlotOwnership {
+    pub pod_name: String,
+    /// `Err` when the row's `state` isn't in this build's vocabulary; the state
+    /// column is application-owned with no CHECK constraint behind it.
+    pub state: std::result::Result<PoolSlotState, PoolError>,
+    /// Whether a `sandboxes` row exists for the slot's `reserved_sandbox_id`.
+    /// Paired with a `claimed` state this is what marks a legacy bound receipt.
+    pub reserved_sandbox_exists: bool,
+}
+
+impl SlotOwnership {
+    /// Whether the warm-pool reconciler still owns the pod behind this row.
+    ///
+    /// It does for pool inventory, a claim whose bind hasn't committed, and a
+    /// slot it still owes a delete for. The state alone can't decide `claimed`:
+    /// a claimed row whose reserved sandbox exists is a receipt from a bind that
+    /// predates the `bound` stamp, and that pod is alive under its sandbox — the
+    /// same guard [`WarmPoolStore::stale_unbound_claimed_slot_exists`] applies.
+    ///
+    /// `Err` when the row's state isn't in this build's vocabulary, which a
+    /// caller deciding ownership must not read as "released".
+    pub fn pool_owns_pod(&self) -> std::result::Result<bool, &PoolError> {
+        match &self.state {
+            Ok(PoolSlotState::Bound) => Ok(false),
+            Ok(PoolSlotState::Claimed) => Ok(!self.reserved_sandbox_exists),
+            Ok(PoolSlotState::Warming | PoolSlotState::Ready | PoolSlotState::CleanupPending) => {
+                Ok(true)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WarmPoolStore {
     pool: PgPool,
@@ -1717,6 +1753,45 @@ impl WarmPoolStore {
         .await?;
 
         Ok(unowned)
+    }
+
+    /// Ownership facts for each of `pod_names` that still has a slot row, keyed
+    /// by pod name (the table's unique index).
+    ///
+    /// Each row carries both facts [`SlotOwnership::pool_owns_pod`] needs. A row
+    /// whose `state` this build can't interpret comes back as
+    /// `Err(PoolError::InvalidSlotState)` against its pod name rather than
+    /// failing the whole batch: for an ownership decision, "no row" and "a row I
+    /// can't read" must stay distinguishable, since only the first releases the
+    /// pod.
+    pub async fn slot_ownership_by_pod_name(
+        &self,
+        pod_names: &[String],
+    ) -> Result<Vec<SlotOwnership>> {
+        if pod_names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query_as::<_, (String, String, bool)>(sql!(
+            "SELECT s.pod_name,
+                    s.state,
+                    EXISTS (
+                        SELECT 1 FROM sandboxes sb WHERE sb.id = s.reserved_sandbox_id
+                    ) AS reserved_sandbox_exists
+             FROM kubernetes_pool_slots s
+             WHERE s.pod_name = ANY($1)"
+        ))
+        .bind(pod_names)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(pod_name, state, reserved_sandbox_exists)| SlotOwnership {
+                pod_name,
+                state: state.parse(),
+                reserved_sandbox_exists,
+            })
+            .collect())
     }
 
     /// Delete the claimed slot whose pod's execution is being retired, inside

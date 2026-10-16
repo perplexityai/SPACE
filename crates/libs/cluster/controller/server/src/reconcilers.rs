@@ -475,11 +475,13 @@ pub async fn run_reconcilers(
             // Stuck-ContainerCreating pod GC: deletes sandbox pods wedged in
             // `ContainerCreating` past a threshold on an otherwise-healthy
             // node, breaking the kubelet/control-plane/volume-manager retry
-            // storm a large backlog of stuck creates sustains. Pure
-            // reflector-cache + apiserver work, no Postgres. Default-disabled;
-            // starts in dry-run.
+            // storm a large backlog of stuck creates sustains. Reflector-cache +
+            // apiserver work, plus read-only Postgres lookups that tell a live
+            // restore / warm-pool slot apart from a leftover pod marker. Writes
+            // nothing to Postgres. Default-disabled.
             handles.push(tokio::spawn(stuck_container_creating_gc::run(
                 kube.clone(),
+                pool.clone(),
                 stuck_container_creating_gc::ReconcilerConfig::from_env(),
                 shutdown_token.child_token(),
             )));

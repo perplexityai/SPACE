@@ -1,5 +1,5 @@
 use pplx_space_common_core::types::{OrgId, UserId};
-
+use std::collections::HashMap;
 use std::time::Duration;
 
 use pplx_space_common_core::types::{
@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::{
     ManualPoolConfigSpec, NewPoolSlot, OpenPoolSlotDeleteLock, PoolConfigOwner, PoolError,
-    PoolSlot, PoolSlotState, WarmPoolStore,
+    PoolSlot, PoolSlotState, SlotOwnership, WarmPoolStore,
 };
 
 type TestResult<T = ()> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -4213,4 +4213,171 @@ async fn autoscale_merges_hash_spellings_and_default_shapes_into_one_demand_grou
     );
 
     Ok(())
+}
+
+/// The GC-facing ownership lookup must answer per pod name with the three
+/// distinctions a fail-closed caller depends on: a row it can decode, a row it
+/// can't, and no row at all — plus, for a `claimed` row, whether its reserved
+/// sandbox exists. That last flag is what separates an in-flight claim (pool
+/// still owns the pod) from a receipt whose bind predates the `bound` stamp
+/// (a sandbox owns the pod). Collapsing either distinction tells a caller the
+/// pool has released a pod it still owns, or keeps a live-sandbox pod
+/// permanently excluded.
+#[tokio::test]
+async fn store_slot_ownership_by_pod_name_separates_claims_from_legacy_receipts() -> TestResult {
+    let fixture = postgres_fixture().await?;
+    let (template_release_id, config_id, content_hash) =
+        seed_pool_config(&fixture.pool, 0x33).await?;
+    let template = TemplateName::parse("seed")?;
+    let (vcpu, memory) = default_shape()?;
+    let slot = |pod_name| {
+        new_slot(
+            config_id,
+            template_release_id,
+            &template,
+            content_hash,
+            vcpu,
+            memory,
+            pod_name,
+        )
+    };
+
+    let legacy_sandbox_id = SandboxId::new();
+    let warming = fixture
+        .store
+        .insert_warming_slot(slot("space-sbx-warming-g1"))
+        .await?;
+    // A claim whose bind never landed: no sandbox row references the pod.
+    let unbound = fixture
+        .store
+        .insert_warming_slot(slot("space-sbx-unbound-g1"))
+        .await?;
+    // A receipt from a bind that predates the `bound` stamp: still `claimed`,
+    // but its sandbox exists and owns the pod.
+    let legacy = fixture
+        .store
+        .insert_warming_slot(NewPoolSlot {
+            reserved_sandbox_id: legacy_sandbox_id,
+            ..slot("space-sbx-legacy-g1")
+        })
+        .await?;
+    force_slot_claimed(&fixture.pool, unbound.id, "1 minute").await?;
+    force_slot_claimed(&fixture.pool, legacy.id, "1 minute").await?;
+    insert_sandbox_with_lifecycle(&fixture.pool, legacy_sandbox_id, SandboxLifecycle::Started)
+        .await?;
+
+    let rows: HashMap<String, (Option<PoolSlotState>, bool)> = fixture
+        .store
+        .slot_ownership_by_pod_name(&[
+            "space-sbx-warming-g1".to_string(),
+            "space-sbx-unbound-g1".to_string(),
+            "space-sbx-legacy-g1".to_string(),
+            "space-sbx-no-slot-g1".to_string(),
+        ])
+        .await?
+        .into_iter()
+        .map(|row| (row.pod_name, (row.state.ok(), row.reserved_sandbox_exists)))
+        .collect();
+
+    assert_eq!(rows.len(), 3, "a pod with no slot row is simply absent");
+    assert_eq!(
+        rows.get("space-sbx-warming-g1"),
+        Some(&(Some(PoolSlotState::Warming), false))
+    );
+    assert_eq!(
+        rows.get("space-sbx-unbound-g1"),
+        Some(&(Some(PoolSlotState::Claimed), false)),
+        "an in-flight claim has no sandbox row behind it"
+    );
+    assert_eq!(
+        rows.get("space-sbx-legacy-g1"),
+        Some(&(Some(PoolSlotState::Claimed), true)),
+        "a legacy receipt is `claimed` with its sandbox row present"
+    );
+
+    // A state written past the enum comes back as an error against its pod name,
+    // not as a missing row and not as a failed batch. The state vocabulary is
+    // application-owned with no CHECK constraint behind it, so a newer writer
+    // really can land a value this build doesn't know.
+    force_slot_state(
+        &fixture.pool,
+        warming.id,
+        "a_state_from_the_future",
+        "1 minute",
+    )
+    .await?;
+    let rows = fixture
+        .store
+        .slot_ownership_by_pod_name(&["space-sbx-warming-g1".to_string()])
+        .await?;
+    assert!(matches!(
+        rows.as_slice(),
+        [row] if row.pod_name == "space-sbx-warming-g1"
+            && matches!(row.state, Err(PoolError::InvalidSlotState(_)))
+    ));
+
+    // Nothing asked, nothing queried.
+    assert!(
+        fixture
+            .store
+            .slot_ownership_by_pod_name(&[])
+            .await?
+            .is_empty()
+    );
+    Ok(())
+}
+
+/// Which slot states leave the pod with the pool. `bound` is the stamp that a
+/// bind committed, but slots bound before that stamp existed stay `claimed`
+/// forever with their pods alive under the reserved sandbox; reading every
+/// `claimed` row as pool-owned would keep those pods permanently excluded.
+#[test]
+fn slot_ownership_pool_owns_pod_until_a_sandbox_holds_it() {
+    let row = |state, reserved_sandbox_exists| SlotOwnership {
+        pod_name: "p".to_string(),
+        state: Ok(state),
+        reserved_sandbox_exists,
+    };
+
+    assert_eq!(
+        row(PoolSlotState::Bound, true).pool_owns_pod().ok(),
+        Some(false)
+    );
+    assert_eq!(
+        row(PoolSlotState::Bound, false).pool_owns_pod().ok(),
+        Some(false)
+    );
+    // A legacy receipt: `claimed`, but its sandbox exists and owns the pod.
+    assert_eq!(
+        row(PoolSlotState::Claimed, true).pool_owns_pod().ok(),
+        Some(false)
+    );
+    // A claim whose bind never committed: the pool still owns the pod.
+    assert_eq!(
+        row(PoolSlotState::Claimed, false).pool_owns_pod().ok(),
+        Some(true)
+    );
+    for state in [
+        PoolSlotState::Warming,
+        PoolSlotState::Ready,
+        PoolSlotState::CleanupPending,
+    ] {
+        assert_eq!(
+            row(state, false).pool_owns_pod().ok(),
+            Some(true),
+            "{state}"
+        );
+    }
+
+    let unreadable = SlotOwnership {
+        pod_name: "p".to_string(),
+        state: Err(PoolError::InvalidSlotState(
+            "a_state_from_the_future".into(),
+        )),
+        reserved_sandbox_exists: false,
+    };
+    assert!(matches!(
+        unreadable.pool_owns_pod(),
+        Err(PoolError::InvalidSlotState(_))
+    ));
 }

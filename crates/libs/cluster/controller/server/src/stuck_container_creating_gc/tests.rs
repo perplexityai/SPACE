@@ -7,7 +7,12 @@ use pplx_space_common_core::types::{PodUid, SandboxId};
 use serde_json::json;
 use uuid::Uuid;
 
+use pplx_space_cluster_pool::{PoolError, PoolSlotState, SlotOwnership};
+
+use super::reconciler::MARKER_LOOKUP_BUDGET;
+use super::store::warm_pool_owner;
 use super::*;
+use fake_store::FakeStore;
 use pplx_space_api::controllers::substrate::kubernetes::SandboxPodView;
 
 const THRESHOLD_SECS: u64 = 600;
@@ -42,6 +47,7 @@ fn fake_kube_error() -> kube::Error {
 
 /// A controllable monotonic clock the reconciler samples for age and rate-limit
 /// windows.
+#[derive(Clone)]
 struct TestClock(Arc<Mutex<Instant>>);
 
 impl TestClock {
@@ -59,13 +65,28 @@ impl TestClock {
     }
 }
 
+type TestReconciler = Reconciler<FakeBackend, FakeStore>;
+
 /// Build a reconciler over a fixed test clock (starting at `now()`), returning
 /// the clock so multi-tick tests can advance it. Pre-seeds the observation
 /// clock for every backend pod to 20 minutes ago so a single tick treats them
 /// as already past the 10-minute threshold — the common case. Tests that
 /// exercise the observation clock itself use [`build_unprimed`].
-fn build(config: ReconcilerConfig, backend: FakeBackend) -> (Reconciler<FakeBackend>, TestClock) {
-    let (mut reconciler, clock) = build_unprimed(config, backend);
+///
+/// The store is primed so every pod marker still has a live owner behind it
+/// (see [`live_marker_store`]); tests about *stale* markers pass their own via
+/// [`build_with_store`].
+fn build(config: ReconcilerConfig, backend: FakeBackend) -> (TestReconciler, TestClock) {
+    let store = live_marker_store(&backend.pods);
+    build_with_store(config, backend, store)
+}
+
+fn build_with_store(
+    config: ReconcilerConfig,
+    backend: FakeBackend,
+    store: FakeStore,
+) -> (TestReconciler, TestClock) {
+    let (mut reconciler, clock) = build_unprimed_with_store(config, backend, store);
     let uids: Vec<String> = reconciler
         .backend
         .pods
@@ -80,13 +101,38 @@ fn build(config: ReconcilerConfig, backend: FakeBackend) -> (Reconciler<FakeBack
 
 /// Build a reconciler without seeding the observation clock, so pods start as
 /// freshly-observed (age 0).
-fn build_unprimed(
+fn build_unprimed(config: ReconcilerConfig, backend: FakeBackend) -> (TestReconciler, TestClock) {
+    let store = live_marker_store(&backend.pods);
+    build_unprimed_with_store(config, backend, store)
+}
+
+fn build_unprimed_with_store(
     config: ReconcilerConfig,
     backend: FakeBackend,
-) -> (Reconciler<FakeBackend>, TestClock) {
+    store: FakeStore,
+) -> (TestReconciler, TestClock) {
     let clock = TestClock::new(now());
-    let reconciler = Reconciler::new(config, backend).with_clock(clock.clock());
+    let reconciler = Reconciler::new(config, backend, store).with_clock(clock.clock());
     (reconciler, clock)
+}
+
+/// A store in which every marker a pod carries is still backed by a live owner:
+/// restore-annotated pods have a `restoring` sandbox row, pool-labelled pods an
+/// unclaimed (`ready`) slot. This is the state in which both exclusions apply,
+/// so it keeps every test that only cares about the *marker* meaningful.
+fn live_marker_store(pods: &[PodSnapshot]) -> FakeStore {
+    let mut store = FakeStore::default();
+    for pod in pods {
+        if pod.is_restore
+            && let Some(sandbox_id) = pod.sandbox_id
+        {
+            store.restores.insert(sandbox_id, Owner::InFlight);
+        }
+        if pod.is_warm_pool {
+            store.slots.insert(pod.pod_name.clone(), Owner::InFlight);
+        }
+    }
+    store
 }
 
 fn test_config(max_deletes_per_minute: u32) -> ReconcilerConfig {
@@ -901,20 +947,27 @@ async fn tick_skips_when_recheck_uid_changed() {
 }
 
 /// If the cached snapshot missed the restore annotation (stale) but the
-/// authoritative re-read reveals a restore pod, it must not be deleted — the
-/// destructive-eligibility guard is re-applied to the fresh object.
+/// authoritative re-read reveals a restore pod whose sandbox is still
+/// `restoring`, it must not be deleted — the destructive-eligibility guard is
+/// re-applied to the fresh object, and to the live row behind it.
 #[tokio::test]
 async fn tick_skips_when_recheck_shows_restore_pod() {
     let pod = stuck_snapshot("p");
+    let sandbox_id = pod.sandbox_id.expect("fixture sets a sandbox id");
     let mut fresh = pod.clone();
     fresh.is_restore = true;
     let backend =
         FakeBackend::new(vec![pod]).with_fresh_override("p", FreshOverride::Snapshot(fresh));
-    let (mut reconciler, _clock) = build(test_config(60), backend);
+    let store = FakeStore::default().with_restore_owner(sandbox_id, Owner::InFlight);
+    let (mut reconciler, _clock) = build_with_store(test_config(60), backend, store);
     let report = reconciler.tick().await;
     assert_eq!(report.deleted, 0);
     assert_eq!(skip_count(&report, SkipReason::RestorePod), 1);
     assert_eq!(reconciler.backend.delete_count(), 0);
+    // The scan saw no marker, so the batch never asked: this verdict is the
+    // pre-delete re-read's, resolved against the live row.
+    assert_eq!(reconciler.store.lifecycle_query_count(), 2);
+    assert_eq!(reconciler.store.last_lifecycle_query(), vec![sandbox_id]);
 }
 
 /// A warm-pool slot pod (`pool-role=warm`) stuck in `ContainerCreating` is
@@ -935,7 +988,7 @@ async fn warm_pool_pod_is_skipped_before_any_read() {
 
 /// Warm-pool exclusion is re-applied to the authoritative object: a pod whose
 /// pool-role label wasn't in the stale cache but appears on the fresh read is
-/// still skipped, not deleted.
+/// skipped while the pool still owns it.
 #[tokio::test]
 async fn tick_skips_when_recheck_shows_warm_pool() {
     let pod = stuck_snapshot("p");
@@ -943,11 +996,13 @@ async fn tick_skips_when_recheck_shows_warm_pool() {
     fresh.is_warm_pool = true;
     let backend =
         FakeBackend::new(vec![pod]).with_fresh_override("p", FreshOverride::Snapshot(fresh));
-    let (mut reconciler, _clock) = build(test_config(60), backend);
+    let store = FakeStore::default().with_slot_owner("p", Owner::InFlight);
+    let (mut reconciler, _clock) = build_with_store(test_config(60), backend, store);
     let report = reconciler.tick().await;
     assert_eq!(report.deleted, 0);
     assert_eq!(skip_count(&report, SkipReason::WarmPool), 1);
     assert_eq!(reconciler.backend.delete_count(), 0);
+    assert_eq!(reconciler.store.slot_query_count(), 2);
 }
 
 /// The node-state guard is re-applied after the verify GET: if the node cordons
@@ -1310,3 +1365,9 @@ fn from_pod_detects_terminating_and_missing_labels() {
     assert_eq!(snapshot.node_name, None);
     assert!(!is_stuck_shaped(&snapshot));
 }
+
+// Marker-staleness and live-Postgres coverage live in sibling files so this
+// matrix stays readable.
+mod fake_store;
+mod marker_ownership;
+mod store_postgres;
