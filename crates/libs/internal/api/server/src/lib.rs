@@ -25,6 +25,7 @@ mod route_identity;
 mod run;
 mod sandbox_service_ports;
 mod trusted_storage;
+mod visibility_observations;
 
 pub use run::run;
 pub use run::{
@@ -301,6 +302,7 @@ pub struct ClusterApiService {
     /// [`ClusterApiService::with_visibility_pool`]. Tests share one pool because
     /// the isolation is a pool-configuration property, not request logic.
     visibility_pool: sqlx::PgPool,
+    visibility_observations: std::sync::Arc<visibility_observations::Observations>,
     template_releases_store: template_releases_store::TemplateReleasesStore,
     route_ed25519_authority: Option<
         std::sync::Arc<
@@ -575,6 +577,9 @@ impl ClusterApiService {
             reserved_template_names: template_publication::ReservedTemplateNames::default(),
             trusted_template_storage: trusted_storage::TrustedTemplateStorageBuckets::default(),
             visibility_pool: pool.clone(),
+            visibility_observations: std::sync::Arc::new(
+                visibility_observations::Observations::new(),
+            ),
             template_visibility_cache: template_visibility_cache::TemplateVisibilityCache::from_env(
             ),
             pool,
