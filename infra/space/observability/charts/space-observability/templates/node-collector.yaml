@@ -6,7 +6,7 @@ send to status.hostIP:<port>, which works the same from ordinary pods,
 host-network pods and host processes such as the worker shim. It relays to the
 gateway and holds no state of its own.
 */}}
-{{- $port := int .Values.global.observability.otlp.nodeLocalPort }}
+{{- $port := include "space-observability.port" (dict "value" .Values.global.observability.otlp.nodeLocalPort "key" "global.observability.otlp.nodeLocalPort") }}
 {{- $config := tpl (.Files.Get "config/node-collector.yaml") . }}
 apiVersion: v1
 kind: ConfigMap

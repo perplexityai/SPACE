@@ -168,6 +168,8 @@ def install(cluster: Cluster) -> None:
         "traces.storage.useDefaultStorageClass=false",
         "--set",
         "traces.storage.ephemeral=true",
+        "--set",
+        "traces.tempo.resources.limits.ephemeral-storage=5Gi",
         *common,
     )
     log("installing datadog mode (dummy key, unroutable site: nothing leaves the cluster)")
