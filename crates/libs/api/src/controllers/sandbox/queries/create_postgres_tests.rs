@@ -3285,3 +3285,265 @@ async fn admission_claim_executes_and_runs_under_the_claimed_id(
     );
     Ok(())
 }
+
+async fn insert_credential_reference(pool: &PgPool, org_id: OrgId) -> TestResult<Uuid> {
+    let reference = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO credential_references (id, org_id, upstream_provider, upstream_provider_config)
+         VALUES ($1, $2, 'aws_secrets_manager',
+                 '{\"secret_arn\": \"arn:aws:secretsmanager:us-west-2:123456789012:secret:example-AbCdEf\"}')"
+    ))
+    .bind(reference)
+    .bind(org_id)
+    .execute(pool)
+    .await?;
+    Ok(reference)
+}
+
+fn credential_binding_policy(reference: Uuid) -> TestResult<NetworkPolicyV1> {
+    Ok(serde_json::from_value(serde_json::json!({
+        "version": "v1",
+        "egress": {"default_action": "allow"},
+        "tls_interception": "on",
+        "network_credential_rules": [{
+            "rule_id": "example-api",
+            "destination": {"exact_host": "api.example.com"},
+            "credential_header_bindings": [{
+                "header_name": "Authorization",
+                "credential_reference_id": reference.to_string()
+            }],
+            "supported_http_methods": ["GET"]
+        }]
+    }))?)
+}
+
+/// Hold a reference's retirement lock until `create` is seen waiting behind it,
+/// then retire the reference and let the create finish.
+async fn retire_once_blocked<T>(
+    pool: &PgPool,
+    reference: Uuid,
+    create: impl std::future::Future<Output = T>,
+) -> TestResult<T> {
+    let mut retirement = pool.begin().await?;
+    sqlx::query(sql!(
+        "SELECT id FROM credential_references WHERE id = $1 FOR UPDATE"
+    ))
+    .bind(reference)
+    .fetch_one(&mut *retirement)
+    .await?;
+    let release = async {
+        pplx_space_db_test_fixtures::wait_for_lock_waiter(pool).await?;
+        sqlx::query(sql!(
+            "UPDATE credential_references SET state = 'retired' WHERE id = $1"
+        ))
+        .bind(reference)
+        .execute(&mut *retirement)
+        .await?;
+        retirement.commit().await?;
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    };
+    let (created, released) = tokio::join!(create, release);
+    released?;
+    Ok(created)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_pooled_insert_binding_waits_for_credential_reference_retirement() -> TestResult {
+    let db = pplx_space_db_test_fixtures::pg_test_db_with_max_connections(4).await?;
+    let actor = insert_actor(&db.pool).await?;
+    let reference = insert_credential_reference(&db.pool, actor.org_id).await?;
+    let auto_lifecycle = AutoLifecyclePolicy::disabled();
+    let req = pooled_create_request(
+        "pooled-credential-binding",
+        Some(credential_binding_policy(reference)?),
+    );
+    let template_network_policy = NetworkPolicyV1::deny_all();
+    let requested_template = TemplateReference::latest(TemplateName::parse("seed").unwrap());
+    let create_owner = SandboxCreateOwner::local(&actor);
+    let input = pooled_create_input(
+        &db.pool,
+        &req,
+        &requested_template,
+        &auto_lifecycle,
+        &template_network_policy,
+        &create_owner,
+    );
+    let claim = pooled_claim(SandboxId::new(), NodeId::new());
+
+    let mut tx = db.pool.begin().await?;
+    retire_once_blocked(
+        &db.pool,
+        reference,
+        insert_pooled_sandbox(&mut tx, &input, &create_owner, &claim, "space"),
+    )
+    .await??;
+    tx.commit().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_cold_create_inheriting_a_binding_waits_for_credential_reference_retirement()
+-> TestResult {
+    let db = pplx_space_db_test_fixtures::pg_test_db_with_max_connections(4).await?;
+    let actor = insert_actor(&db.pool).await?;
+    let reference = insert_credential_reference(&db.pool, actor.org_id).await?;
+    let release_id = insert_template_release(&db.pool, "seed", "sha256:credential-cold").await?;
+    insert_template_release_tag(&db.pool, release_id, "seed", "latest").await?;
+    // No override: the sandbox inherits its template's binding.
+    sqlx::query(sql!(
+        "UPDATE templates SET network_policy_json = $2 WHERE name = $1"
+    ))
+    .bind("seed")
+    .bind(sqlx::types::Json(credential_binding_policy(reference)?))
+    .execute(&db.pool)
+    .await?;
+    let controller = direct_sandbox_controller(&db.pool);
+    let mut req = pooled_create_request("cold-credential-binding", None);
+    req.boot_mode = Some("cold".to_string());
+    req.template = Some("seed:latest".parse()?);
+
+    // Only the wait matters here; the direct substrate's later execution
+    // outcome is covered elsewhere.
+    let _ = retire_once_blocked(
+        &db.pool,
+        reference,
+        controller.create(
+            &db.pool,
+            &actor,
+            &req,
+            SandboxApiMetricIdentity::native("create"),
+            FederatedSandboxCreateContext::new(None, None),
+        ),
+    )
+    .await?;
+    Ok(())
+}
+
+/// A create inherits the template row's current policy, which resolution also
+/// reads for a deleted template, not the caller's resolved snapshot.
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_pooled_insert_inheriting_a_stale_template_waits_for_retirement() -> TestResult {
+    let db = pplx_space_db_test_fixtures::pg_test_db_with_max_connections(4).await?;
+    let actor = insert_actor(&db.pool).await?;
+    let reference = insert_credential_reference(&db.pool, actor.org_id).await?;
+    sqlx::query(sql!(
+        "INSERT INTO templates (id, name, network_policy_json, desired_state)
+         VALUES ($1, 'seed', $2, 'deleted')
+         ON CONFLICT (name) DO UPDATE
+         SET network_policy_json = EXCLUDED.network_policy_json, desired_state = 'deleted'"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(sqlx::types::Json(credential_binding_policy(reference)?))
+    .execute(&db.pool)
+    .await?;
+    let auto_lifecycle = AutoLifecyclePolicy::disabled();
+    let req = pooled_create_request("pooled-stale-inheritance", None);
+    // The snapshot a create resolves before its transaction: no binding.
+    let template_network_policy = NetworkPolicyV1::deny_all();
+    let requested_template = TemplateReference::latest(TemplateName::parse("seed").unwrap());
+    let create_owner = SandboxCreateOwner::local(&actor);
+    let input = pooled_create_input(
+        &db.pool,
+        &req,
+        &requested_template,
+        &auto_lifecycle,
+        &template_network_policy,
+        &create_owner,
+    );
+    let claim = pooled_claim(SandboxId::new(), NodeId::new());
+
+    let mut tx = db.pool.begin().await?;
+    retire_once_blocked(
+        &db.pool,
+        reference,
+        insert_pooled_sandbox(&mut tx, &input, &create_owner, &claim, "space"),
+    )
+    .await??;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// A cold create resolves its template before its transaction. A template
+/// that gains a binding and is deleted in between must not hide that binding:
+/// the insert inherits the stored policy, so it must lock what it inherits.
+#[tokio::test(flavor = "current_thread")]
+async fn postgres_cold_create_inheriting_a_stale_template_waits_for_retirement() -> TestResult {
+    let db = pplx_space_db_test_fixtures::pg_test_db_with_max_connections(6).await?;
+    let actor = insert_actor(&db.pool).await?;
+    let reference = insert_credential_reference(&db.pool, actor.org_id).await?;
+    let release_id = insert_template_release(&db.pool, "seed", "sha256:stale-cold").await?;
+    insert_template_release_tag(&db.pool, release_id, "seed", "latest").await?;
+    let controller = direct_sandbox_controller(&db.pool);
+    let mut req = pooled_create_request("cold-stale-inheritance", None);
+    req.boot_mode = Some("cold".to_string());
+    req.template = Some("seed:latest".parse()?);
+
+    // The template writer holds the row while it binds the reference and
+    // deletes the template, so the create resolves the old, binding-free
+    // policy before its own transaction.
+    let mut template_write = db.pool.begin().await?;
+    sqlx::query(sql!(
+        "UPDATE templates SET network_policy_json = $2, desired_state = 'deleted' WHERE name = $1"
+    ))
+    .bind("seed")
+    .bind(sqlx::types::Json(credential_binding_policy(reference)?))
+    .execute(&mut *template_write)
+    .await?;
+    let create = controller.create(
+        &db.pool,
+        &actor,
+        &req,
+        SandboxApiMetricIdentity::native("create"),
+        FederatedSandboxCreateContext::new(None, None),
+    );
+    let drive = async {
+        // The create's transaction waits on the template row.
+        pplx_space_db_test_fixtures::wait_for_lock_waiter(&db.pool).await?;
+        let mut retirement = db.pool.begin().await?;
+        sqlx::query(sql!(
+            "SELECT id FROM credential_references WHERE id = $1 FOR UPDATE"
+        ))
+        .bind(reference)
+        .fetch_one(&mut *retirement)
+        .await?;
+        template_write.commit().await?;
+        // The deleted template and the uncommitted sandbox attach nothing yet.
+        let attached = pplx_space_credential_injection_store::references::attached(
+            &mut *retirement,
+            actor.org_id,
+            pplx_space_common_core::types::CredentialReferenceId::from_uuid(reference),
+        )
+        .await?;
+        assert!(!attached, "retirement would proceed");
+        // The create read the committed binding and now waits on the reference.
+        let waiting: bool = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(sql!(
+                    "SELECT EXISTS (
+                         SELECT 1 FROM pg_stat_activity
+                         WHERE datname = current_database() AND wait_event_type = 'Lock'
+                           AND query LIKE '%FROM credential_references%')"
+                ))
+                .fetch_one(&db.pool)
+                .await?;
+                if waiting {
+                    return Ok::<bool, sqlx::Error>(true);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or(Ok(false))?;
+        sqlx::query(sql!(
+            "UPDATE credential_references SET state = 'retired' WHERE id = $1"
+        ))
+        .bind(reference)
+        .execute(&mut *retirement)
+        .await?;
+        retirement.commit().await?;
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(waiting)
+    };
+    let (_, waiting) = tokio::join!(create, drive);
+    assert!(waiting?, "the create must wait for the retirement");
+    Ok(())
+}

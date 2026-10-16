@@ -13,7 +13,9 @@ use pplx_space_common_core::types::{OrgId, UserId};
 
 use super::*;
 use crate::models::{SandboxMetadata, SandboxMetadataValue, User};
-use pplx_space_db_test_fixtures::pg_test_db;
+use pplx_space_db_test_fixtures::{
+    pg_test_db, pg_test_db_with_max_connections, wait_for_lock_waiter,
+};
 use pplx_space_test_env::TestResult;
 
 async fn insert_actor(pool: &PgPool) -> TestResult<User> {
@@ -280,5 +282,214 @@ async fn update_metadata_replaces_the_whole_document() -> TestResult {
         .await?;
     let cleared = fetch_sandbox(&db.pool, sandbox.id).await?.expect("present");
     assert!(cleared.metadata.0.is_empty());
+    Ok(())
+}
+
+/// A policy write serializes with retirement of its own organization's
+/// reference. A foreign reference cannot resolve and must not couple the two
+/// organizations' writes.
+#[rstest::rstest]
+#[case::owned(true)]
+#[case::foreign(false)]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_binding_waits_only_for_owned_reference_retirement(
+    #[case] owned: bool,
+) -> TestResult {
+    // The held retirement, the bind, and the lock probe each need a connection.
+    let db = pg_test_db_with_max_connections(4).await?;
+    let actor = insert_actor(&db.pool).await?;
+    let sandbox = seed_sandbox(&db.pool, &actor).await?;
+    let reference = uuid::Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO credential_references (id, org_id, upstream_provider, upstream_provider_config)
+         VALUES ($1, $2, 'aws_secrets_manager',
+                 '{\"secret_arn\": \"arn:aws:secretsmanager:us-west-2:123456789012:secret:example-AbCdEf\"}')"
+    ))
+    .bind(reference)
+    .bind(if owned {
+        actor.org_id
+    } else {
+        OrgId::from_uuid(pplx_space_db_test_fixtures::SEED_ORG_ID)
+    })
+    .execute(&db.pool)
+    .await?;
+    let policy: pplx_space_net_common::NetworkPolicyV1 =
+        serde_json::from_value(serde_json::json!({
+            "version": "v1",
+            "egress": {"default_action": "allow"},
+            "tls_interception": "on",
+            "network_credential_rules": [{
+                "rule_id": "example-api",
+                "destination": {"exact_host": "api.example.com"},
+                "credential_header_bindings": [{
+                    "header_name": "Authorization",
+                    "credential_reference_id": reference.to_string()
+                }],
+                "supported_http_methods": ["GET"]
+            }]
+        }))?;
+
+    let mut retirement = db.pool.begin().await?;
+    sqlx::query(sql!(
+        "SELECT id FROM credential_references WHERE id = $1 FOR UPDATE"
+    ))
+    .bind(reference)
+    .fetch_one(&mut *retirement)
+    .await?;
+    let mut bind = tokio::spawn({
+        let pool = db.pool.clone();
+        let controller = direct_sandbox_controller(&db.pool);
+        async move {
+            controller
+                .set_network_policy(
+                    &pool,
+                    &sandbox,
+                    SandboxNetworkPolicyPatch::Set { policy },
+                    None,
+                )
+                .await
+        }
+    });
+    if !owned {
+        // Foreign references cannot resolve for this sandbox and must not
+        // couple its policy writes to another organization's retirement.
+        tokio::time::timeout(std::time::Duration::from_secs(5), &mut bind).await???;
+        retirement.rollback().await?;
+        return Ok(());
+    }
+    wait_for_lock_waiter(&db.pool).await?;
+    assert!(!bind.is_finished(), "the bind must wait for the retirement");
+    sqlx::query(sql!(
+        "UPDATE credential_references SET state = 'retired' WHERE id = $1"
+    ))
+    .bind(reference)
+    .execute(&mut *retirement)
+    .await?;
+    retirement.commit().await?;
+    bind.await??;
+    // The bind landed after retirement; resolution never authorizes a retired
+    // reference, so no gateway can hydrate it.
+    Ok(())
+}
+
+/// Inheriting a template default makes the template's *current* policy
+/// effective, not the one in the caller's sandbox snapshot. A binding added
+/// after the snapshot (and kept through template deletion, which resolution
+/// still inherits) must still serialize with an owned reference's retirement.
+#[rstest::rstest]
+#[case::owned(true)]
+#[case::foreign(false)]
+#[tokio::test(flavor = "multi_thread")]
+async fn inheriting_a_stale_template_serializes_only_owned_reference_retirement(
+    #[case] owned: bool,
+) -> TestResult {
+    let db = pg_test_db_with_max_connections(4).await?;
+    let actor = insert_actor(&db.pool).await?;
+    let reference = uuid::Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO credential_references (id, org_id, upstream_provider, upstream_provider_config)
+         VALUES ($1, $2, 'aws_secrets_manager',
+                 '{\"secret_arn\": \"arn:aws:secretsmanager:us-west-2:123456789012:secret:example-AbCdEf\"}')"
+    ))
+    .bind(reference)
+    .bind(if owned {
+        actor.org_id
+    } else {
+        OrgId::from_uuid(pplx_space_db_test_fixtures::SEED_ORG_ID)
+    })
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO templates (id, name) VALUES ($1, 'stale-inheritance')"
+    ))
+    .bind(uuid::Uuid::now_v7())
+    .execute(&db.pool)
+    .await?;
+    let id = SandboxId::new();
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes
+             (id, name, user_id, org_id, managed_by, lifecycle, placement, template_id,
+              network_policy_override_json, network_policy_generation)
+         VALUES ($1, 'stale-inheritance', $2, $3, 'k8s', 'started', 'unplaced',
+                 'stale-inheritance', '{\"version\": \"v1\", \"egress\": {\"default_action\": \"deny\"}}', 1)"
+    ))
+    .bind(id)
+    .bind(actor.id)
+    .bind(actor.org_id)
+    .execute(&db.pool)
+    .await?;
+    let stale = fetch_sandbox(&db.pool, id)
+        .await?
+        .expect("seeded sandbox must be readable");
+
+    sqlx::query(sql!(
+        "UPDATE templates SET network_policy_json = $1, desired_state = 'deleted'
+         WHERE name = 'stale-inheritance'"
+    ))
+    .bind(sqlx::types::Json(serde_json::json!({
+        "version": "v1",
+        "egress": {"default_action": "allow"},
+        "tls_interception": "on",
+        "network_credential_rules": [{
+            "rule_id": "example-api",
+            "destination": {"exact_host": "api.example.com"},
+            "credential_header_bindings": [{
+                "header_name": "Authorization",
+                "credential_reference_id": reference.to_string()
+            }],
+            "supported_http_methods": ["GET"]
+        }]
+    })))
+    .execute(&db.pool)
+    .await?;
+
+    let mut retirement = db.pool.begin().await?;
+    sqlx::query(sql!(
+        "SELECT id FROM credential_references WHERE id = $1 FOR UPDATE"
+    ))
+    .bind(reference)
+    .fetch_one(&mut *retirement)
+    .await?;
+    assert!(
+        !pplx_space_credential_injection_store::references::attached(
+            &mut *retirement,
+            actor.org_id,
+            pplx_space_common_core::types::CredentialReferenceId::from_uuid(reference),
+        )
+        .await?,
+        "the override hides the deleted template's binding, so retirement would proceed"
+    );
+    let mut inherit = tokio::spawn({
+        let pool = db.pool.clone();
+        let controller = direct_sandbox_controller(&db.pool);
+        async move {
+            controller
+                .set_network_policy(
+                    &pool,
+                    &stale,
+                    SandboxNetworkPolicyPatch::InheritTemplateDefault,
+                    None,
+                )
+                .await
+        }
+    });
+    if !owned {
+        tokio::time::timeout(std::time::Duration::from_secs(5), &mut inherit).await???;
+        retirement.rollback().await?;
+        return Ok(());
+    }
+    wait_for_lock_waiter(&db.pool).await?;
+    assert!(
+        !inherit.is_finished(),
+        "the inherit must wait for the retirement"
+    );
+    sqlx::query(sql!(
+        "UPDATE credential_references SET state = 'retired' WHERE id = $1"
+    ))
+    .bind(reference)
+    .execute(&mut *retirement)
+    .await?;
+    retirement.commit().await?;
+    inherit.await??;
     Ok(())
 }

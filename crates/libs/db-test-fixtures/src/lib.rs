@@ -146,6 +146,34 @@ pub async fn raise_sqlstate(pool: &PgPool, sqlstate: &str) -> sqlx::Error {
     .expect_err("RAISE EXCEPTION must fail the statement")
 }
 
+/// Wait until another session of this test database waits on a heavyweight
+/// lock, failing after five seconds.
+///
+/// Concurrency tests use it to prove an operation is blocked behind a lock the
+/// test holds. The pool needs a connection beyond the holder and the waiter.
+pub async fn wait_for_lock_waiter(pool: &PgPool) -> TestDbResult<()> {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let blocked: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                     SELECT 1 FROM pg_stat_activity
+                     WHERE datname = current_database()
+                       AND pid <> pg_backend_pid()
+                       AND wait_event_type = 'Lock')",
+            )
+            .fetch_one(pool)
+            .await?;
+            if blocked {
+                return Ok::<(), sqlx::Error>(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| FixtureError::boxed("no session waited on a lock within five seconds"))??;
+    Ok(())
+}
+
 /// Insert a `ready`, `k8s`-managed worker node row at `127.0.0.1` with the
 /// given id.
 ///

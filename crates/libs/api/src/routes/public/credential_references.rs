@@ -43,6 +43,7 @@ pub(crate) async fn retire(
 fn reference_error(error: ReferenceError) -> PublicApiError {
     match error {
         ReferenceError::NotFound => PublicApiError::not_found(error.to_string()),
+        ReferenceError::Attached => PublicApiError::failed_precondition(error.to_string()),
         ReferenceError::IdempotencyConflict => {
             PublicApiError::idempotency_conflict(error.to_string())
         }

@@ -4,6 +4,7 @@ use crate::controllers::substrate::RuntimeRpcError;
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{ExecutionGeneration, SandboxId};
 use pplx_space_common_svc::types::ReconcileReason;
+use pplx_space_credential_injection_store::references as credential_references;
 use pplx_space_events::{SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventType};
 use pplx_space_sandbox_store::{self as sandbox_store, FieldPatch};
 use pplx_space_sbx_mgr_client::proto::access_idle_update::Operation as AccessIdleOperation;
@@ -395,6 +396,14 @@ impl SandboxController {
         let mut tx = pool.begin().await.map_err(|err| {
             db_contention_error("failed to begin sandbox network policy update", &err)
         })?;
+        credential_references::lock_for_sandbox_binding(
+            &mut tx,
+            sandbox.org_id,
+            policy_override.as_ref(),
+            sandbox.template_id.as_deref(),
+        )
+        .await
+        .map_err(|err| db_contention_error("failed to lock bound credential references", &err))?;
         let generation = sqlx::query_scalar::<_, i64>(sql!(
             "UPDATE sandboxes
              SET network_policy_override_json = $1,

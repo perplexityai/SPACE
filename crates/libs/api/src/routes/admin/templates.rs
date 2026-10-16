@@ -16,6 +16,7 @@ use pplx_space_common_core::types::{
     IdempotencyKey, SubstrateKind, SystemTemplate, TemplateDesiredState, TemplateId, TemplateName,
     TemplateTag,
 };
+use pplx_space_credential_injection_store::references as credential_references;
 use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_public_api::{
     OperationKind, OperationTargetType, PublicErrorCode, PublicErrorDetail, PublicErrorEnvelope,
@@ -643,6 +644,7 @@ pub async fn create_template(
         Err(response) => return response.into_response(),
     };
     let create_result: Result<Option<TemplateRow>, sqlx::Error> = async {
+        credential_references::lock_for_binding(&mut *tx, &request.network_policy).await?;
         let row = sqlx::query_as::<_, TemplateRow>(
             sql!("INSERT INTO templates
                  (id, name, description, org_id, desired_state, network_policy_json, network_policy_generation)
@@ -842,6 +844,9 @@ pub async fn update_template(
         }
 
         if let Some(policy) = &request.network_policy {
+            credential_references::lock_for_binding(&mut *tx, policy)
+                .await
+                .map_err(|error| (ContentionScope::Writing, error))?;
             let updated = sqlx::query_scalar::<_, i64>(sql!(
                 "UPDATE templates
                  SET network_policy_json = $2,

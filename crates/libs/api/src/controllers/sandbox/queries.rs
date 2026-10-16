@@ -14,6 +14,7 @@ use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{DiskIoLimits, NodeId};
 use pplx_space_common_svc::space_api_route::wait_ready_lifecycle_request;
 use pplx_space_common_svc::types::ReconcileReason;
+use pplx_space_credential_injection_store::references as credential_references;
 use pplx_space_events::{
     CreateShapeSource, SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger,
     SandboxEventType,
@@ -1403,57 +1404,50 @@ impl SandboxController {
             network_policy_override_json: network_policy_override_json.as_ref(),
             egress_profiles: &egress_profile_names,
         };
-        match (federated_owner, federated_service_grant) {
-            (None, None) => {
-                pplx_space_sandbox_store::insert_unplaced(
-                    pool,
-                    &insert,
-                    volume_encryption,
-                    restore_operation_id.map(|operation_id| operation_id.as_uuid()),
-                    i64::from(restore_lease_seconds),
-                )
-                .await
-                .map_err(|err| sandbox_insert_error(err.into()))?;
-            }
-            (Some(owner), Some(grant)) => {
-                let mut tx = pool.begin().await.map_err(|err| {
-                    db_contention_error(
-                        "failed to start federated sandbox create transaction",
-                        &err,
-                    )
-                })?;
-                pplx_space_sandbox_store::insert_unplaced(
-                    &mut *tx,
-                    &insert,
-                    volume_encryption,
-                    restore_operation_id.map(|operation_id| operation_id.as_uuid()),
-                    i64::from(restore_lease_seconds),
-                )
-                .await
-                .map_err(|err| sandbox_insert_error(err.into()))?;
-                crate::federated_identity::upsert_sandbox_federated_service_grant_tx(
-                    &mut tx,
-                    sandbox_uuid,
-                    owner,
-                    grant,
-                    self.federated_grant_audience.as_str(),
-                    crate::federated_identity::FEDERATED_OWNER_GRANT_PURPOSE,
-                )
-                .await
-                .map_err(federated_service_grant_store_error)?;
-                tx.commit().await.map_err(|err| {
-                    db_contention_error(
-                        "failed to commit federated sandbox create transaction",
-                        &err,
-                    )
-                })?;
-            }
+        let federated_grant = match (federated_owner, federated_service_grant) {
+            (None, None) => None,
+            (Some(owner), Some(grant)) => Some((owner, grant)),
             _ => {
                 return Err(ControllerError::bad_request(
                     "federated sandbox creates require a federated service grant",
                 ));
             }
         };
+        let mut tx = pool.begin().await.map_err(|err| {
+            db_contention_error("failed to start sandbox create transaction", &err)
+        })?;
+        credential_references::lock_for_sandbox_binding(
+            &mut tx,
+            create_owner.org_id,
+            network_policy_override.as_ref(),
+            Some(template),
+        )
+        .await
+        .map_err(|err| db_contention_error("failed to lock bound credential references", &err))?;
+        pplx_space_sandbox_store::insert_unplaced(
+            &mut *tx,
+            &insert,
+            volume_encryption,
+            restore_operation_id.map(|operation_id| operation_id.as_uuid()),
+            i64::from(restore_lease_seconds),
+        )
+        .await
+        .map_err(|err| sandbox_insert_error(err.into()))?;
+        if let Some((owner, grant)) = federated_grant {
+            crate::federated_identity::upsert_sandbox_federated_service_grant_tx(
+                &mut tx,
+                sandbox_uuid,
+                owner,
+                grant,
+                self.federated_grant_audience.as_str(),
+                crate::federated_identity::FEDERATED_OWNER_GRANT_PURPOSE,
+            )
+            .await
+            .map_err(federated_service_grant_store_error)?;
+        }
+        tx.commit().await.map_err(|err| {
+            db_contention_error("failed to commit sandbox create transaction", &err)
+        })?;
         if skip_pool_reserved_generation
             && let Err(error) = self
                 .substrate
@@ -2837,6 +2831,14 @@ async fn insert_pooled_sandbox(
         .map_err(|error| {
             ControllerError::internal(format!("failed to serialize network policy: {error}"))
         })?;
+    credential_references::lock_for_sandbox_binding(
+        tx,
+        create_owner.org_id,
+        input.network_policy_override,
+        Some(input.template),
+    )
+    .await
+    .map_err(|err| db_contention_error("failed to lock bound credential references", &err))?;
 
     pplx_space_sandbox_store::insert_pooled(
         &mut **tx,

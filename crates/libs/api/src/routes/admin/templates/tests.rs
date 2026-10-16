@@ -1031,3 +1031,81 @@ async fn a_delete_after_a_failed_delete_operation_starts_a_replacement()
     assert_eq!(third_state, "queued", "the third attempt is dispatchable");
     Ok(())
 }
+
+/// A template policy write that binds a credential reference waits for that
+/// reference's in-flight retirement, so retirement cannot report success after
+/// a gateway hydrated the new binding.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_template_policy_bind_waits_for_credential_reference_retirement()
+-> pplx_space_db_test_fixtures::TestDbResult<()> {
+    use pplx_space_db_test_fixtures::SEED_ORG_ID;
+
+    let db = pplx_space_db_test_fixtures::pg_test_db_with_max_connections(4).await?;
+    let template = TemplateName::parse("credential-bind-probe").expect("valid template name");
+    insert_template(&db.pool, &template).await?;
+    let reference = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO credential_references (id, org_id, upstream_provider, upstream_provider_config)
+         VALUES ($1, $2, 'aws_secrets_manager',
+                 '{\"secret_arn\": \"arn:aws:secretsmanager:us-west-2:123456789012:secret:example-AbCdEf\"}')"
+    ))
+    .bind(reference)
+    .bind(SEED_ORG_ID)
+    .execute(&db.pool)
+    .await?;
+    let policy: NetworkPolicyV1 = serde_json::from_value(serde_json::json!({
+        "version": "v1",
+        "egress": {"default_action": "allow"},
+        "tls_interception": "on",
+        "network_credential_rules": [{
+            "rule_id": "example-api",
+            "destination": {"exact_host": "api.example.com"},
+            "credential_header_bindings": [{
+                "header_name": "Authorization",
+                "credential_reference_id": reference.to_string()
+            }],
+            "supported_http_methods": ["GET"]
+        }]
+    }))?;
+    let state = AppState::from_pool(db.pool.clone())
+        .await
+        .expect("app state from the test pool");
+    let actor = User {
+        id: UserId::new(),
+        email: "credential-bind-probe@example.test".to_string(),
+        password_hash: String::new(),
+        display_name: "credential bind probe".to_string(),
+        org_id: OrgId::from_uuid(SEED_ORG_ID),
+        role: crate::user_role::UserRole::OrganizationAdmin,
+        owner_source: pplx_space_common_core::types::SandboxOwnerSource::Local,
+        created_at: OffsetDateTime::now_utc(),
+        updated_at: OffsetDateTime::now_utc(),
+    };
+
+    let mut retirement = db.pool.begin().await?;
+    sqlx::query(sql!(
+        "SELECT id FROM credential_references WHERE id = $1 FOR UPDATE"
+    ))
+    .bind(reference)
+    .fetch_one(&mut *retirement)
+    .await?;
+    let update = tokio::spawn(update_template(
+        State(state),
+        Extension(AuthUser(actor)),
+        Path(template.clone()),
+        HeaderMap::new(),
+        Json(UpdateTemplateRequest {
+            description: None,
+            default_auto_lifecycle: None,
+            network_policy: Some(policy),
+        }),
+    ));
+    pplx_space_db_test_fixtures::wait_for_lock_waiter(&db.pool).await?;
+    assert!(
+        !update.is_finished(),
+        "the bind must wait for the retirement"
+    );
+    retirement.commit().await?;
+    assert_eq!(update.await?.into_response().status(), StatusCode::OK);
+    Ok(())
+}
