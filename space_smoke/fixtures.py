@@ -48,6 +48,7 @@ from space_smoke.capabilities import (
     SuspendCodecControl,
     SandboxNetworkIsolationControl,
     TelemetryBackendControl,
+    LeaderElectionControl,
     RestoreFailure,
     RestorePodRead,
     TransferJobView,
@@ -103,6 +104,7 @@ from space_smoke.template_build import TemplateBuildAssertions
 from space_smoke.rate_limiters import RateLimiterAssertions
 from space_smoke.sandbox_network_isolation import SandboxNetworkIsolationAssertions
 from space_smoke.telemetry_delivery import TelemetryDeliveryAssertions
+from space_smoke.leader_election import LeaderElectionAssertions
 from space_smoke.config import DEFAULT_SANDBOX_TIMEOUT_SECONDS
 from space_smoke.identity import EcwIdentityAssertions
 from space_smoke.invariants.lifecycle import prove_idle_deadline_reset
@@ -2866,6 +2868,23 @@ class KindEcw(Ecw):
                 self, self._telemetry_control, since=since
             )
         return self._telemetry_assertions
+
+    _leader_election_control: LeaderElectionControl | None = None
+    _leader_election_assertions: LeaderElectionAssertions | None = None
+
+    @property
+    def leader_election(self) -> LeaderElectionAssertions:
+        """Privileged faults and reads for the cluster-controller's leader election."""
+
+        if self._leader_election_control is None:
+            raise SmokeConfigurationError(
+                "leader-election control is only available on the kind backend"
+            )
+        if self._leader_election_assertions is None:
+            self._leader_election_assertions = LeaderElectionAssertions(
+                self, self._leader_election_control, self._context.scope
+            )
+        return self._leader_election_assertions
 
     _startup_recovery_control: StartupRecoveryControl | None = None
     _startup_recovery_assertions: StartupRecoveryAssertions | None = None

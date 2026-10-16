@@ -2183,3 +2183,148 @@ class SandboxNetworkIsolationControl(Protocol):
     def remove_unselected_pods(self, token: str) -> None:
         """Delete the pods `start_unselected_pod` created under this token; idempotent."""
         ...
+
+
+@dataclass(frozen=True)
+class ControllerLease:
+    """The cluster-controller's `coordination.k8s.io` Lease, as the apiserver holds it.
+
+    Times are epoch seconds. A holder that dies without releasing keeps its
+    name here until a live replica takes the Lease over after
+    `duration_seconds`, so a holder is only current while `renew_time` is.
+    """
+
+    holder: str
+    renew_time: float
+    acquire_time: float | None
+    duration_seconds: int
+    transitions: int
+
+
+@dataclass(frozen=True)
+class ControllerPod:
+    """One cluster-controller pod and its controller container's status.
+
+    `started_at` is when the current container started; `last_exit_code` and
+    `last_finished_at` describe the previous container, the one kubelet last
+    restarted. Times are epoch seconds.
+    """
+
+    name: str
+    uid: str
+    node: str
+    ready: bool
+    deleting: bool
+    restart_count: int
+    started_at: float | None
+    last_exit_code: int | None
+    last_finished_at: float | None
+
+
+@dataclass(frozen=True)
+class NodeContainer:
+    """A controller container as its node's container runtime records it.
+
+    Read through the CRI on the node itself, so it answers while the
+    apiserver does not. Times are epoch seconds.
+    """
+
+    container_id: str
+    attempt: int
+    running: bool
+    started_at: float | None
+    finished_at: float | None
+    exit_code: int | None
+
+
+class ControllerLeaseWatch(Protocol):
+    """A running watch of the leadership Lease."""
+
+    def latest(self) -> ControllerLease | None:
+        """The delivered Lease with the newest `renewTime`, or None before the first."""
+        ...
+
+    def stop(self) -> None:
+        """End the watch; idempotent."""
+        ...
+
+
+class LeaderElectionControl(TelemetryBackendControl, Protocol):
+    """Kind-only operations for the cluster-controller leader-election scenario.
+
+    The faults are a third contender Deployment that runs the controller's own
+    pod template under a ServiceAccount with no `leases` grant, and the
+    control-plane apiserver's static-pod manifest moved out of kubelet's
+    manifest directory. Everything asserted is read from Kubernetes objects,
+    the node's container runtime, the readiness marker file the controller's
+    probe reads, or Prometheus.
+    """
+
+    def acquire_retention_sweeper_mutation(self) -> Callable[[], None]:
+        """Hold the Kind mutation Lease that serializes cooperating smokes."""
+        ...
+
+    def controller_replicas(self) -> int:
+        """The cluster-controller Deployment's desired replica count."""
+        ...
+
+    def controller_leader_election_enabled(self) -> bool:
+        """The Deployment's leader-election kill switch is on."""
+        ...
+
+    def controller_lease(self) -> ControllerLease | None:
+        """The leadership Lease, or None when it does not exist yet."""
+        ...
+
+    def watch_controller_lease(self) -> ControllerLeaseWatch:
+        """Start watching the leadership Lease; every change it delivers is kept."""
+        ...
+
+    def controller_pods(self, *, refused_contender: bool = False) -> list[ControllerPod]:
+        """The healthy Deployment's pods, or the refused contender's."""
+        ...
+
+    def start_refused_contender(self) -> None:
+        """Run one more replica of the controller's pod template without `leases` RBAC.
+
+        Refuses when the substitute ServiceAccount can read Leases, since every
+        lease call then succeeds and nothing would be refused.
+        """
+        ...
+
+    def remove_refused_contender(self) -> None:
+        """Delete the contender and wait for its pods to be gone; idempotent."""
+        ...
+
+    def control_plane_node(self) -> str:
+        """The Kind node container that runs the apiserver's static pod."""
+        ...
+
+    def apiserver_answers(self) -> bool:
+        """`/readyz` answers through the kube context within a few seconds."""
+        ...
+
+    def park_apiserver(self, node_name: str) -> None:
+        """Move the apiserver's static-pod manifest out of kubelet's directory."""
+        ...
+
+    def restore_apiserver(self, node_name: str) -> None:
+        """Put a parked apiserver manifest back; a no-op when none is parked."""
+        ...
+
+    def node_controller_containers(self, node_name: str, pod_name: str) -> list[NodeContainer]:
+        """Every controller container the node's runtime still holds for the pod."""
+        ...
+
+    def readiness_marker_present(self, node_name: str, container_id: str) -> bool | None:
+        """Whether the container holds the controller's readiness marker file.
+
+        Read by one exec inside the container that answers explicitly. None
+        when that exec fails or answers anything else, which says nothing about
+        the marker.
+        """
+        ...
+
+    def node_container_log_tail(self, node_name: str, container_id: str, *, lines: int) -> str:
+        """The container's last log lines, read on the node: failure evidence only."""
+        ...

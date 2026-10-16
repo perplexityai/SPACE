@@ -40,8 +40,8 @@ apiServiceAccount: space-api
 # other waits as a warm standby, so losing the leader's pod does not stop
 # reconciliation for longer than the lease takes to change hands. The harness
 # reads controller logs from every pod (controller_log_records in
-# space_smoke/adapters.py); the leader-election suite scales to two and back
-# to whatever it found.
+# space_smoke/adapters.py); local.leader_election_brownout_keeps_one_leader
+# requires exactly two.
 replicaCount: 2
 
 # Scheduling priority (infra/space/kind/manifests/priorityclasses.yaml).

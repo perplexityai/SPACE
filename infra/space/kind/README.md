@@ -1208,7 +1208,11 @@ load-balanced entry, scaled on load.
   wait for the Job and bootstrap waits for it before applying the API.
 - **cluster-controller** runs two replicas with leader election on: the Lease
   holder runs every reconciler and the other stands by, Ready, to take over.
-  `smoke-kind-leader-election-brownout.sh` exercises the handoff.
+  The opt-in typed scenario
+  `local.leader_election_brownout_keeps_one_leader` exercises the handoff
+  (about 30 minutes in `otel` mode; run it by name with
+  `uv run --frozen --python 3.11 -m space_smoke run
+  local.leader_election_brownout_keeps_one_leader`).
 - **internal-api** (ClusterApi) runs two replicas behind its ClusterIP
   Service and rolls one at a time. It needs no election: its state is in
   Postgres, written under row locks and claim tokens, its RPCs are unary, and

@@ -83,17 +83,21 @@ def scenario(
     quarantined: str | None = None,
     ignored: str | None = None,
     telemetry_mode: str | None = None,
+    timeout_minutes: int | None = None,
 ) -> Callable[[Callable[[Fixture], None]], Scenario[Fixture]]:
     """Declare a smoke; its typed parameter selects the prepared fixture.
 
     `quarantined` names the reason (a PR or issue) a scenario is withheld from
     implicit selection (`--all`, `--category`). A quarantined scenario still
     runs when named explicitly, so it can be fixed and re-proven in place.
-    `ignored` withholds a proposed contract that is not yet agreed. It stays
+    `ignored` withholds a proposed contract that is not yet agreed, or an
+    opt-in scenario too slow or too invasive for the per-merge set. It stays
     explicitly runnable and visible in suite logs, outside the defect backlog.
     `telemetry_mode` names the Kind telemetry mode whose backends the scenario
     reads; implicit selection skips it, visibly, on a bench running another
     known mode that the runner did not ask for.
+    `timeout_minutes` raises the fixture's wall-clock budget for a scenario
+    whose own waits outlast it; it never lowers it.
     """
 
     if not id or any(part == "" for part in id.split(".")):
@@ -135,6 +139,8 @@ def scenario(
     # Only otel installs backends a scenario can read.
     if telemetry_mode not in (None, "otel"):
         raise ValueError("smoke telemetry mode must be 'otel'")
+    if timeout_minutes is not None and timeout_minutes <= 0:
+        raise ValueError("smoke timeout must be a positive number of minutes")
     supported_surfaces = frozenset(api_surfaces)
     if not supported_surfaces or not supported_surfaces <= {"ecw", "native"}:
         raise ValueError("smoke API surfaces must contain 'ecw' and/or 'native'")
@@ -164,6 +170,10 @@ def scenario(
             raise TypeError("NativeHardeningFixture requires only the native API surface")
         if telemetry_mode is not None and fixture_type is not KindEcw:
             raise TypeError("a telemetry mode requires the KindEcw fixture")
+        if timeout_minutes is not None and timeout_minutes < fixture_type.timeout_minutes:
+            raise ValueError(
+                f"smoke {id} may only raise its fixture's {fixture_type.timeout_minutes}-minute timeout"
+            )
         return Scenario(
             id=id,
             category=id.split(".", 1)[0],
@@ -177,7 +187,7 @@ def scenario(
             rerun_environment=rerun_names,
             required_tools=tool_names,
             api_surfaces=supported_surfaces,
-            timeout_minutes=fixture_type.timeout_minutes,
+            timeout_minutes=timeout_minutes or fixture_type.timeout_minutes,
             backends=FIXTURE_BACKENDS[fixture_type],
             quarantined=quarantined,
             ignored=ignored,

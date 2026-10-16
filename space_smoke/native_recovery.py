@@ -26,6 +26,8 @@ from urllib.parse import urlsplit
 from space_smoke.native_hardening import NativeHardeningFixture, NativeTransportError
 
 from space_smoke.adapters import (
+    LEADER_ELECTION_ENV,
+    LEADER_ELECTION_FALSE_VALUES as FALSE_VALUES,
     KindConfig,
     KindHarness,
     NATIVE_OPERATION_AGE_ENV as M1_AGE_ENV,
@@ -51,11 +53,6 @@ RECOVERY_ENVIRONMENT = (
 # queued behind the stopped controller, so each old pod exits after its 5 s
 # preStop. A scenario that restarts under an open stream needs a longer wait.
 ROLLOUT_TIMEOUT = 90.0
-# The cluster-controller's leader-election kill switch: on unless one of these
-# values turns it off (truthy_default in
-# crates/libs/cluster/controller/server/src/env_config.rs).
-LEADER_ELECTION_ENV = "SPACE_CLUSTER_CONTROLLER_LEADER_ELECTION_ENABLED"
-FALSE_VALUES = frozenset({"0", "false", "False", "FALSE"})
 
 
 @dataclass(frozen=True)

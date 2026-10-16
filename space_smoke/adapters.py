@@ -12,7 +12,9 @@ import os
 import re
 import secrets
 import shlex
+import subprocess
 import tempfile
+import threading
 import socket
 import time
 import uuid
@@ -28,6 +30,9 @@ from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 from space_smoke.capabilities import (
+    ControllerLease,
+    ControllerPod,
+    NodeContainer,
     LimiterProbeOutcome,
     PodNetwork,
     TcpProbe,
@@ -361,6 +366,27 @@ SELECT id FROM snapshots
 """
 
 KIND_CONTROLLER_SELECTOR = "app.kubernetes.io/name=space-cluster-controller"
+# The cluster-controller's leadership Lease, container and readiness marker
+# (crates/libs/cluster/controller/server/src/leader_election/mod.rs and the
+# space-cluster-controller-local chart).
+CONTROLLER_LEASE_NAME = "cluster-controller"
+CONTROLLER_CONTAINER = "cluster-controller"
+CONTROLLER_READINESS_MARKER = "/tmp/space-cluster-controller-ready"
+# The leader-election kill switch: on unless one of these values turns it off
+# (truthy_default in crates/libs/cluster/controller/server/src/env_config.rs).
+LEADER_ELECTION_ENV = "SPACE_CLUSTER_CONTROLLER_LEADER_ELECTION_ENABLED"
+LEADER_ELECTION_FALSE_VALUES = frozenset({"0", "false", "False", "FALSE"})
+# A third contender: the controller's own pod template under the API's
+# ServiceAccount, which carries the substrate's pod and node RBAC but no
+# `leases` grant, so its substrate builds and every lease call is a 403. It
+# gets its own `app.kubernetes.io/name`, so no selector of the healthy
+# Deployment's, nor KIND_CONTROLLER_SELECTOR, overlaps it.
+REFUSED_CONTENDER_NAME = "space-cluster-controller-refused"
+REFUSED_CONTENDER_SELECTOR = f"app.kubernetes.io/name={REFUSED_CONTENDER_NAME}"
+REFUSED_CONTENDER_SERVICE_ACCOUNT = "space-api"
+# Outside kubelet's static-pod directory, which it reads every file of.
+APISERVER_MANIFEST = "/etc/kubernetes/manifests/kube-apiserver.yaml"
+APISERVER_PARKED_MANIFEST = "/etc/kubernetes/kube-apiserver.yaml.space-smoke-parked"
 # Node services run one DaemonSet per service per role, as production's do
 # (infra/space/kind/lib/node-services.sh). Every pod carries its node role as
 # `app.kubernetes.io/name` (space-worker or space-builder) and its service as
@@ -4735,6 +4761,218 @@ ON CONFLICT (key_hash) DO NOTHING;
             )
         return mode
 
+    # --- cluster-controller leader election ------------------------------------
+    #
+    # The two faults behind `local.leader_election_brownout_keeps_one_leader`:
+    # a refused third contender, and the apiserver's static pod taken away. The
+    # node reads go through `docker exec` and the node's CRI rather than
+    # kubectl, because they are the only reads that answer while the apiserver
+    # is down.
+
+    def controller_replicas(self) -> int:
+        result = self.kubectl(
+            "get", "deploy", self._controller_deployment(), "-o", "jsonpath={.spec.replicas}",
+            timeout=15,
+        )
+        return int(_require_ok(result, "read cluster-controller replicas").strip() or "1")
+
+    def controller_leader_election_enabled(self) -> bool:
+        value = self._read_deployment_env(
+            self._controller_deployment(), (LEADER_ELECTION_ENV,)
+        )[LEADER_ELECTION_ENV]
+        return value is None or value not in LEADER_ELECTION_FALSE_VALUES
+
+    def controller_lease(self) -> ControllerLease | None:
+        result = self.kubectl(
+            "get", "lease", CONTROLLER_LEASE_NAME, "-o", "json", timeout=15
+        )
+        if result.returncode != 0 and "notfound" in result.detail().lower().replace(" ", ""):
+            return None
+        return _controller_lease(
+            json.loads(_require_ok(result, "read the cluster-controller Lease") or "{}")
+        )
+
+    def watch_controller_lease(self) -> KubectlLeaseWatch:
+        return KubectlLeaseWatch(
+            [
+                "kubectl", "--context", self.config.context, "-n", KIND_NAMESPACE,
+                "get", "lease", CONTROLLER_LEASE_NAME, "--watch", "-o", "json",
+            ]
+        )
+
+    def controller_pods(self, *, refused_contender: bool = False) -> list[ControllerPod]:
+        selector = REFUSED_CONTENDER_SELECTOR if refused_contender else KIND_CONTROLLER_SELECTOR
+        result = self.kubectl("get", "pods", "-l", selector, "-o", "json", timeout=15)
+        pods = []
+        for item in json.loads(_require_ok(result, "list cluster-controller pods") or "{}").get(
+            "items", []
+        ):
+            metadata, status = item.get("metadata") or {}, item.get("status") or {}
+            container = next(
+                (
+                    entry
+                    for entry in status.get("containerStatuses") or []
+                    if entry.get("name") == CONTROLLER_CONTAINER
+                ),
+                {},
+            )
+            terminated = (container.get("lastState") or {}).get("terminated") or {}
+            pods.append(
+                ControllerPod(
+                    name=str(metadata.get("name", "")),
+                    uid=str(metadata.get("uid", "")),
+                    node=str((item.get("spec") or {}).get("nodeName") or ""),
+                    ready=any(
+                        condition.get("type") == "Ready" and condition.get("status") == "True"
+                        for condition in status.get("conditions") or []
+                    ),
+                    deleting=bool(metadata.get("deletionTimestamp")),
+                    restart_count=int(container.get("restartCount") or 0),
+                    started_at=_kube_epoch(
+                        ((container.get("state") or {}).get("running") or {}).get("startedAt")
+                    ),
+                    last_exit_code=terminated.get("exitCode"),
+                    last_finished_at=_kube_epoch(terminated.get("finishedAt")),
+                )
+            )
+        return sorted(pods, key=lambda pod: pod.name)
+
+    def start_refused_contender(self) -> None:
+        self._require_isolated_kind("starting a refused leader-election contender")
+        account = f"system:serviceaccount:{KIND_NAMESPACE}:{REFUSED_CONTENDER_SERVICE_ACCOUNT}"
+        for verb in ("get", "update"):
+            allowed = self.kubectl(
+                "auth", "can-i", verb, "leases.coordination.k8s.io", "--as", account, timeout=15
+            )
+            if allowed.stdout.strip() != "no":
+                raise SmokeConfigurationError(
+                    f"{REFUSED_CONTENDER_SERVICE_ACCOUNT} may {verb} Leases "
+                    f"({allowed.stdout.strip() or allowed.detail()}); its lease calls would not be refused"
+                )
+        result = self.kubectl(
+            "get", "deploy", self._controller_deployment(), "-o", "json", timeout=15
+        )
+        deployment = json.loads(_require_ok(result, "read the cluster-controller Deployment"))
+        # A contender a killed run left behind would start the budget window
+        # from its own, older container.
+        self.remove_refused_contender()
+        _require_ok(
+            self.kubectl(
+                "create", "-f", "-", input_text=json.dumps(refused_contender_deployment(deployment)),
+                timeout=30,
+            ),
+            "create the refused leader-election contender",
+        )
+
+    def remove_refused_contender(self) -> None:
+        _require_ok(
+            self.kubectl(
+                "delete", "deploy", REFUSED_CONTENDER_NAME, "--ignore-not-found", "--wait=true",
+                timeout=60,
+            ),
+            "delete the refused leader-election contender",
+        )
+        deadline = time.monotonic() + 120
+        while self.controller_pods(refused_contender=True):
+            if time.monotonic() > deadline:
+                raise RuntimeError("the refused contender's pods outlived its Deployment")
+            time.sleep(2)
+
+    def control_plane_node(self) -> str:
+        result = self.kubectl(
+            "get", "nodes", "-l", "node-role.kubernetes.io/control-plane", "-o",
+            "jsonpath={.items[*].metadata.name}", timeout=15,
+        )
+        names = _require_ok(result, "find the Kind control-plane node").split()
+        if len(names) != 1:
+            raise SmokeConfigurationError(
+                f"expected one Kind control-plane node, found {names or 'none'}"
+            )
+        return self._kind_node_container(names[0])
+
+    def apiserver_answers(self) -> bool:
+        result = self.executor.run(
+            ["kubectl", "--context", self.config.context, "get", "--raw", "/readyz",
+             "--request-timeout=3s"],
+            timeout=10,
+        )
+        return result.returncode == 0 and result.stdout.strip() == "ok"
+
+    def park_apiserver(self, node_name: str) -> None:
+        self._require_isolated_kind("taking the Kind apiserver down")
+        _require_ok(
+            self._docker_exec(
+                node_name, "sh", "-c",
+                f"test ! -e {APISERVER_PARKED_MANIFEST} && mv {APISERVER_MANIFEST} {APISERVER_PARKED_MANIFEST}",
+            ),
+            "park the apiserver manifest",
+        )
+
+    def restore_apiserver(self, node_name: str) -> None:
+        _require_ok(
+            self._docker_exec(
+                node_name, "sh", "-c",
+                f"if test -e {APISERVER_PARKED_MANIFEST}; then "
+                f"mv {APISERVER_PARKED_MANIFEST} {APISERVER_MANIFEST}; fi",
+            ),
+            "restore the apiserver manifest",
+        )
+
+    def node_controller_containers(self, node_name: str, pod_name: str) -> list[NodeContainer]:
+        listing = self._docker_exec(
+            node_name, "crictl", "ps", "-a", "-q",
+            "--label", f"io.kubernetes.pod.namespace={KIND_NAMESPACE}",
+            "--label", f"io.kubernetes.pod.name={_kube_pod_name(pod_name)}",
+            "--label", f"io.kubernetes.container.name={CONTROLLER_CONTAINER}",
+        )
+        containers = []
+        for container_id in _require_ok(listing, f"list controller containers on {node_name}").split():
+            inspected = self._docker_exec(node_name, "crictl", "inspect", "-o", "json", container_id)
+            if inspected.returncode != 0:
+                # Removed by kubelet's container GC between the two reads.
+                continue
+            status = json.loads(inspected.stdout).get("status") or {}
+            running = status.get("state") == "CONTAINER_RUNNING"
+            containers.append(
+                NodeContainer(
+                    container_id=container_id,
+                    attempt=int((status.get("metadata") or {}).get("attempt") or 0),
+                    running=running,
+                    started_at=_cri_epoch(status.get("startedAt")),
+                    finished_at=None if running else _cri_epoch(status.get("finishedAt")),
+                    exit_code=None if running else status.get("exitCode"),
+                )
+            )
+        return sorted(containers, key=lambda container: container.attempt)
+
+    def readiness_marker_present(self, node_name: str, container_id: str) -> bool | None:
+        # One exec that names its answer. An exec that fails, including one
+        # into a container that has exited meanwhile, says nothing about the
+        # marker; one that answers ran inside the running container.
+        result = self._docker_exec(
+            node_name, "crictl", "exec", container_id, "sh", "-c",
+            f"if test -f {CONTROLLER_READINESS_MARKER}; then echo present; else echo absent; fi",
+        )
+        if result.returncode != 0:
+            return None
+        return {"present": True, "absent": False}.get(result.stdout.strip())
+
+    def node_container_log_tail(self, node_name: str, container_id: str, *, lines: int) -> str:
+        result = self._docker_exec(node_name, "crictl", "logs", "--tail", str(lines), container_id)
+        return (result.stdout + result.stderr)[-20_000:]
+
+    def _kind_node_container(self, node_name: str) -> str:
+        if not re.fullmatch(
+            rf"{re.escape(self.config.cluster)}-(control-plane|worker[0-9]*)", node_name
+        ):
+            raise ValueError(f"refusing node {node_name!r} outside Kind cluster {self.config.cluster}")
+        return node_name
+
+    def _docker_exec(self, node_name: str, *command: str) -> CommandResult:
+        return self.executor.run(
+            ["docker", "exec", self._kind_node_container(node_name), *command], timeout=30
+        )
+
     # --- sandbox network isolation -------------------------------------------
     #
     # Probes of the sandbox namespace's NetworkPolicies, run in the node's
@@ -5534,6 +5772,136 @@ def _parse_tcp_probes(output: str, targets: Sequence[TcpTarget]) -> list[TcpProb
         for target in targets
     ]
 
+
+
+def _controller_lease(document: Mapping[str, Any]) -> ControllerLease:
+    spec = document.get("spec") or {}
+    renewed = _kube_epoch(spec.get("renewTime"))
+    if renewed is None or not isinstance(spec.get("leaseDurationSeconds"), int):
+        raise RuntimeError("the cluster-controller Lease has no renewTime or duration")
+    return ControllerLease(
+        holder=str(spec.get("holderIdentity") or ""),
+        renew_time=renewed,
+        acquire_time=_kube_epoch(spec.get("acquireTime")),
+        duration_seconds=spec["leaseDurationSeconds"],
+        transitions=int(spec.get("leaseTransitions") or 0),
+    )
+
+
+class KubectlLeaseWatch:
+    """`kubectl get lease --watch`, keeping the newest renewal it delivered.
+
+    The stream is a sequence of JSON documents, one per change; a reader
+    thread decodes them as they arrive. It ends by itself when the apiserver
+    goes away, and `stop` ends it otherwise.
+    """
+
+    def __init__(self, command: Sequence[str]) -> None:
+        self._process = subprocess.Popen(
+            list(command), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+        self._latest: ControllerLease | None = None
+        self._lock = threading.Lock()
+        self._reader = threading.Thread(target=self._read, name="lease-watch", daemon=True)
+        self._reader.start()
+
+    def _read(self) -> None:
+        assert self._process.stdout is not None
+        decoder = json.JSONDecoder()
+        buffer = ""
+        for chunk in iter(lambda: self._process.stdout.read1(65536), b""):  # type: ignore[union-attr]
+            buffer += chunk.decode(errors="replace")
+            while True:
+                buffer = buffer.lstrip()
+                try:
+                    document, end = decoder.raw_decode(buffer)
+                except ValueError:
+                    break
+                buffer = buffer[end:]
+                try:
+                    lease = _controller_lease(document)
+                except (RuntimeError, ValueError, AttributeError):
+                    continue
+                with self._lock:
+                    if self._latest is None or lease.renew_time >= self._latest.renew_time:
+                        self._latest = lease
+
+    def latest(self) -> ControllerLease | None:
+        with self._lock:
+            return self._latest
+
+    def stop(self) -> None:
+        if self._process.poll() is None:
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+                self._process.wait(timeout=5)
+        self._reader.join(timeout=5)
+
+
+def refused_contender_deployment(deployment: Mapping[str, Any]) -> dict[str, Any]:
+    """The live controller Deployment as one refused replica under another identity.
+
+    Derived rather than written out, so the contender runs the image and env
+    of the replicas it is compared against. Only the name, the selector label,
+    the ServiceAccount, the replica count and the strategy change.
+    """
+
+    metadata = deployment.get("metadata") or {}
+    spec = json.loads(json.dumps(deployment.get("spec") or {}))
+    labels = {**(metadata.get("labels") or {}), "app.kubernetes.io/name": REFUSED_CONTENDER_NAME}
+    template = spec.setdefault("template", {})
+    template_metadata = template.setdefault("metadata", {})
+    template_metadata["labels"] = {
+        **(template_metadata.get("labels") or {}),
+        "app.kubernetes.io/name": REFUSED_CONTENDER_NAME,
+    }
+    template.setdefault("spec", {})["serviceAccountName"] = REFUSED_CONTENDER_SERVICE_ACCOUNT
+    template["spec"].pop("serviceAccount", None)
+    spec.update(
+        replicas=1,
+        strategy={"type": "Recreate"},
+        selector={"matchLabels": {"app.kubernetes.io/name": REFUSED_CONTENDER_NAME}},
+    )
+    return {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {
+            "name": REFUSED_CONTENDER_NAME,
+            "namespace": KIND_NAMESPACE,
+            "labels": labels,
+        },
+        "spec": spec,
+    }
+
+
+_RFC3339 = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})")
+
+
+def _kube_epoch(value: object) -> float | None:
+    """Epoch seconds of a Kubernetes or CRI RFC 3339 time, None when absent.
+
+    The CRI reports nanoseconds, which `datetime` cannot hold; the fraction is
+    cut to microseconds.
+    """
+
+    if not isinstance(value, str) or not value:
+        return None
+    match = _RFC3339.fullmatch(value)
+    if match is None:
+        raise ValueError(f"unparseable timestamp {value!r}")
+    whole, fraction, zone = match.groups()
+    parsed = datetime.fromisoformat(whole + ("+00:00" if zone == "Z" else zone))
+    return parsed.timestamp() + (float("0." + fraction[:6]) if fraction else 0.0)
+
+
+def _cri_epoch(value: object) -> float | None:
+    """`_kube_epoch`, with the CRI's zero time (an unset field) read as None."""
+
+    epoch = _kube_epoch(value)
+    return epoch if epoch is not None and epoch > 0 else None
 
 def _kube_pod_name(value: str) -> str:
     if not value or not re.fullmatch(r"[a-z0-9]([-a-z0-9.]*[a-z0-9])?", value):

@@ -142,6 +142,7 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "local.encrypted_resuspend_preserves_cow",
                 "local.forced_drain_evacuates_sandbox",
                 "local.gentle_drain_leaves_sandbox_resident",
+                "local.leader_election_brownout_keeps_one_leader",
                 "local.node_ctl_fence_refuses_and_reconciles",
                 "local.node_group_boundary_schedules",
                 "local.node_selector_extras_render_and_enforce",
