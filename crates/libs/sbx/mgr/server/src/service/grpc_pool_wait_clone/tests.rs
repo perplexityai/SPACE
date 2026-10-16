@@ -340,7 +340,7 @@ async fn pool_clone_and_adoption_keep_donor_ownership_exclusive() {
     {
         let db = service.db.lock().unwrap();
         assert!(crate::db::complete_pool_clone(&db, &id, cleanup_id).unwrap());
-        crate::db::tests::state_write_fixtures::force_state(&db, &id, SandboxState::Paused);
+        crate::db::test_fixtures::state_write_fixtures::force_state(&db, &id, SandboxState::Paused);
         crate::db::update_user(&db, &id, &TEMPLATE_MANAGER_SANDBOX_OWNER).unwrap();
         crate::db::set_pool_template(&db, &id, Some("seed")).unwrap();
     }

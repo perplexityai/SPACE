@@ -307,7 +307,7 @@ async fn identity_equal_adoption_does_not_overwrite_an_owned_execution() {
                 SandboxState::Started
             }
             ExecutionOwner::LifecycleTransition => {
-                crate::db::tests::state_write_fixtures::apply_edge(
+                crate::db::test_fixtures::state_write_fixtures::apply_edge(
                     &conn,
                     &id,
                     &crate::db::edges::STOP_ADMISSION,

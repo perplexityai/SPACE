@@ -1,0 +1,56 @@
+[package]
+name = "pplx-space-sbx-mgr-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Exposes the raw connection and the SQL fixtures (test connections, schema
+# images, `db::fixture`) to sbx-mgr's test suites, which enable it as a
+# dev-dependency. Unit tests in this crate get them under `cfg(test)`.
+# `serialize` provides `sqlite3_serialize`, which the test-schema helpers use
+# to migrate once per test process and stamp the resulting image into each
+# fixture database instead of replaying every migration per connection.
+test-support = ["rusqlite/serialize"]
+
+[dependencies]
+dashmap = { workspace = true }
+jiff = { workspace = true }
+ref-cast = { workspace = true }
+rustix = { workspace = true, features = ["fs"] }
+rusqlite = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sqlx = { workspace = true, features = ["migrate"] }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+tonic = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
+
+# internal
+pplx-space-common-core = { workspace = true, features = ["serde"] }
+pplx-space-common-jobs = { workspace = true }
+pplx-space-common-svc = { workspace = true, features = ["sqlite"] }
+pplx-space-events = { workspace = true }
+pplx-space-metrics = { workspace = true }
+pplx-space-net-common = { workspace = true, features = ["serde"] }
+pplx-space-node-mgr-client = { workspace = true }
+pplx-space-sbx-mgr-client = { workspace = true }
+pplx-space-sbxmgr-migrations = { workspace = true }
+
+[dev-dependencies]
+futures-util = { workspace = true }
+pplx-space-common-core = { workspace = true, features = ["serde", "test-hooks"] }
+pplx-space-node-runtime-core = { workspace = true }
+prost-types = { workspace = true }
+rusqlite = { workspace = true, features = ["serialize"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "test-util", "time"] }

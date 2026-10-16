@@ -51,6 +51,7 @@ members = [
     "crates/libs/sbx/mgr/client",
     "crates/libs/sbx/mgr/migrations",
     "crates/libs/sbx/mgr/server",
+    "crates/libs/sbx/mgr/store",
     "crates/libs/node/api/client",
     "crates/libs/node/api/server",
     "crates/libs/node/ctl/server",
@@ -342,6 +343,7 @@ pplx-space-snapshot-store = { path = "crates/libs/snapshot/store" }
 pplx-space-sbxmgr-migrations = { path = "crates/libs/sbx/mgr/migrations" }
 pplx-space-sbx-mgr = { path = "crates/libs/sbx/mgr/server" }
 pplx-space-sbx-mgr-client = { path = "crates/libs/sbx/mgr/client" }
+pplx-space-sbx-mgr-store = { path = "crates/libs/sbx/mgr/store" }
 pplx-space-spaced-build = { path = "crates/libs/spaced/build" }
 pplx-space-spaced-common = { path = "crates/libs/spaced/common" }
 pplx-space-spaced-guest-client = { path = "crates/libs/spaced/guest/client" }

@@ -198,13 +198,40 @@ history, a module's reach is limited to its crate, `file_size` already bounds
 how much one can hold, and a check on module names is easy to evade (`util.rs`
 becomes `support.rs`) without changing what the module holds.
 
+## Dependency fences
+
+`dependency_fence` keeps packages out of workspace members that must not
+depend on them. Each `[rules.dependency_fence.<instance>]` lists Cargo
+`packages`, the `members` it checks and the members it `allow`s, as globs over
+member directories:
+
+```toml
+[rules.dependency_fence.sbxmgr_rusqlite]
+packages = ["libsqlite3-sys", "rusqlite"]
+members = ["crates/libs/sbx/mgr/**", "crates/apps/sbx/**"]
+allow = ["crates/libs/sbx/mgr/store"]
+
+[rules.dependency_fence.sbxmgr_rusqlite.no_crossing]
+mode = "required"
+```
+
+`no_crossing` reports each dependency a checked member outside `allow`
+declares on a listed package: normal, dev or build, for any target, and under
+any name. The records come from `cargo metadata`, which names the depended-on
+package even when `package = "…"` renames it, so a fence does not depend on
+how a manifest is written. Each finding points at the manifest line that
+declares the dependency. There is no baseline: an existing dependency is
+removed or its member allowed. An empty `packages` or `members`, or a
+`members` or `allow` glob that matches no workspace member, exits 2.
+
 ## Configuration and modes
 
 Each behaviour has a `mode`: `advisory` findings are reported, `required` ones
 also fail the check, so behaviours can graduate one at a time. Unknown keys,
 sections or modes, a missing file, bad TOML, an invalid regex, glob or instance
-name, an empty `patterns` or `paths` list, a baseline table for an instance
-that is not configured, and a failing `cargo metadata` exit 2. So does a `--base-baseline`
+name, an empty `patterns`, `paths`, `packages` or `members` list, a baseline
+table for an instance that is not configured, and a failing `cargo metadata`
+exit 2. So does a `--base-baseline`
 or `--base-architecture` that can't be read, or one combined with
 `--write-baseline`.
 

@@ -1656,6 +1656,151 @@ fn pattern_ratchet_paths() {
     );
 }
 
+/// A fenced member may not depend on a listed package by any name, of any
+/// kind or for any target; an allowed or unchecked member may, and a package
+/// whose name only starts with a listed one is not listed.
+#[test]
+fn dependency_fence() {
+    let fence = "[rules.dependency_fence.driver]\n\
+                 packages = [\"rusqlite\"]\n\
+                 members = [\"crates/a\", \"crates/store\"]\n\
+                 allow = [\"crates/store\"]\n\
+                 [rules.dependency_fence.driver.no_crossing]\nmode = \"required\"\n";
+    let manifest = |name: &str, dependencies: &str| format!("{}{dependencies}", package(name));
+    type Case<'a> = (&'a str, &'a str, &'a [(&'a str, usize)]);
+    let cases: &[Case] = &[
+        (
+            "a normal dependency",
+            "[dependencies]\nrusqlite = \"0.39\"\n",
+            &[("a depends on rusqlite (a normal dependency), which only", 6)],
+        ),
+        (
+            "a renamed dependency",
+            "[dependencies]\nsqlite = { package = \"rusqlite\", version = \"0.39\" }\n",
+            &[(
+                "a depends on rusqlite (renamed sqlite, a normal dependency)",
+                6,
+            )],
+        ),
+        (
+            "a dev-dependency in a table of its own",
+            "[dev-dependencies.rusqlite]\nversion = \"0.39\"\n",
+            &[("a depends on rusqlite (a dev-dependency)", 5)],
+        ),
+        (
+            "a build-dependency",
+            "[build-dependencies]\nrusqlite = \"0.39\"\n",
+            &[("a depends on rusqlite (a build-dependency)", 6)],
+        ),
+        (
+            "a target's dependency",
+            "[target.'cfg(unix)'.dependencies]\nrusqlite = \"0.39\"\n",
+            &[(
+                "a depends on rusqlite (a normal dependency, for target cfg(unix))",
+                6,
+            )],
+        ),
+        (
+            "a renamed dev-dependency for one target",
+            "[target.'cfg(unix)'.dev-dependencies]\nsqlite = { package = \"rusqlite\", version = \"0.39\" }\n",
+            &[(
+                "a depends on rusqlite (renamed sqlite, a dev-dependency, for target cfg(unix))",
+                6,
+            )],
+        ),
+        (
+            "another package with a similar name",
+            "[dependencies]\nrusqlite-macros = \"0.1\"\n",
+            &[],
+        ),
+    ];
+    for (name, dependencies, expected) in cases {
+        let ws = crate_workspace(
+            &[("crates/store", "store")],
+            &[
+                ("crates/a/Cargo.toml", manifest("a", dependencies)),
+                ("crates/b/Cargo.toml", manifest("b", dependencies)),
+                ("crates/store/Cargo.toml", manifest("store", dependencies)),
+                ("ARCHITECTURE.toml", format!("{}{fence}", config(ADVISORY))),
+            ],
+        );
+        let found: Vec<_> = check(&load(ws.path(), None))
+            .into_iter()
+            .filter(|finding| finding.rule == "dependency_fence")
+            .collect();
+        assert_eq!(found.len(), expected.len(), "{name}: {found:#?}");
+        for (finding, (message, line)) in found.iter().zip(*expected) {
+            assert_eq!(
+                finding.code(),
+                "dependency_fence.driver.no_crossing",
+                "{name}"
+            );
+            assert!(finding.mode.is_required(), "{name}");
+            assert!(
+                finding
+                    .message()
+                    .starts_with(&format!("crates/a/Cargo.toml: {message}")),
+                "{name}: {}",
+                finding.message()
+            );
+            assert_eq!(finding.location.path, "crates/a/Cargo.toml", "{name}");
+            assert_eq!(finding.location.line, *line, "{name}");
+        }
+    }
+
+    // Each list must name something, or the instance would check nothing.
+    for (key, error) in [
+        ("packages", "packages must list at least one package name"),
+        ("members", "members must list at least one glob"),
+    ] {
+        let line = fence
+            .lines()
+            .find(|line| line.starts_with(&format!("{key} = ")))
+            .expect("the fence has the key");
+        let ws = workspace(&[(
+            "ARCHITECTURE.toml",
+            format!(
+                "{}{}",
+                config(ADVISORY),
+                fence.replace(line, &format!("{key} = []"))
+            ),
+        )]);
+        let found = Context::load(ws.path()).expect_err("an empty list is rejected");
+        assert!(found.to_string().contains(error), "{key}: {found}");
+    }
+
+    // A glob that matches no workspace member checks or allows nothing, so it
+    // is rejected; here `crates/store` is not a member.
+    let matching = fence
+        .replace(
+            "members = [\"crates/a\", \"crates/store\"]",
+            "members = [\"crates/a\"]",
+        )
+        .replace("allow = [\"crates/store\"]", "allow = [\"crates/a\"]");
+    for key in ["members", "allow"] {
+        let line = matching
+            .lines()
+            .find(|line| line.starts_with(&format!("{key} = ")))
+            .expect("the fence has the key");
+        let ws = workspace(&[(
+            "ARCHITECTURE.toml",
+            format!(
+                "{}{}",
+                config(ADVISORY),
+                matching.replace(line, &format!("{key} = [\"crates/a\", \"crates/store\"]"))
+            ),
+        )]);
+        let found = Context::load(ws.path()).expect_err("an unmatched glob is rejected");
+        assert!(
+            found.to_string().contains(&format!(
+                "[rules.dependency_fence.driver] {key} in ARCHITECTURE.toml has \"crates/store\", \
+                 which matches no workspace member"
+            )),
+            "{key}: {found}"
+        );
+    }
+}
+
 /// One finding per behaviour, each reported in its own mode; only required
 /// findings exit 1. Without `--base-baseline`, no_new_entries is skipped and
 /// the summary says so.

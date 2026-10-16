@@ -16,7 +16,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::super::pause_resume::{GUEST_PREPARATION, GuestPreparation};
 use super::*;
-use crate::db::tests::state_write_fixtures::{Snapshot, assert_unchanged, force_state, snapshot};
+use crate::db::test_fixtures::state_write_fixtures::{
+    Snapshot, assert_unchanged, force_state, snapshot,
+};
 use crate::guest_filesystem_flush::GuestFlushError;
 use crate::node_manager_transport::fake::FakeNodeManager;
 use crate::node_manager_transport::{

@@ -41,12 +41,9 @@ jiff = { workspace = true }
 libc = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
-ref-cast = { workspace = true }
-rusqlite = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-sqlx = { workspace = true, features = ["macros", "migrate"] }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt", "sync", "time"] }
@@ -64,7 +61,7 @@ pplx-space-common-core = { workspace = true, features = ["serde"] }
 pplx-space-common-grpc = { workspace = true }
 pplx-space-common-jobs = { workspace = true }
 pplx-space-common-lru-reaper = { workspace = true }
-pplx-space-common-svc = { workspace = true, features = ["sqlite"] }
+pplx-space-common-svc = { workspace = true }
 pplx-space-credential-injection-core = { workspace = true }
 pplx-space-credmgr-client = { workspace = true }
 pplx-space-events = { workspace = true }
@@ -81,21 +78,17 @@ pplx-space-spaced-common = { workspace = true }
 pplx-space-spaced-host-client = { workspace = true }
 pplx-space-observability = { workspace = true, default-features = false }
 pplx-space-sbx-mgr-client = { workspace = true }
-pplx-space-sbxmgr-migrations = { workspace = true }
+pplx-space-sbx-mgr-store = { workspace = true }
 pplx-space-template-mgr-client = { workspace = true }
 
 [dev-dependencies]
 pplx-space-common-core = { workspace = true, features = ["serde", "test-hooks"] }
-# `serialize` exposes `sqlite3_serialize`, which the test-schema helpers use to
-# migrate once per test process and stamp the resulting image into each fixture
-# database instead of replaying every migration per connection.
-rusqlite = { workspace = true, features = ["serialize"] }
+pplx-space-sbx-mgr-store = { workspace = true, features = ["test-support"] }
 pplx-space-net-gateway = { workspace = true, features = ["test-support"] }
 opentelemetry-proto = { workspace = true, features = ["gen-tonic", "metrics"] }
 pplx-space-credmgr = { workspace = true }
 rcgen = { workspace = true, features = ["aws_lc_rs", "x509-parser"] }
 rustls = { workspace = true, features = ["aws_lc_rs", "std", "tls12"] }
-pplx-space-sbxmgr-migrations = { workspace = true }
 # `test-util` enables `#[tokio::test(start_paused = true)]` so retry-backoff
 # loops auto-advance virtual time instead of sleeping in real time.
 # `rt-multi-thread` lets lock-ordering regression tests run waiters in real

@@ -16,7 +16,7 @@ use tonic::Code;
 use super::{
     StateWriteRejected, require_state_write_from, state_write_result, update_state_from_best_effort,
 };
-use crate::db::tests::state_write_fixtures::{assert_unchanged, snapshot};
+use crate::db::test_fixtures::state_write_fixtures::{assert_unchanged, snapshot};
 use crate::db::{Edge, StateSet, StateWriteGuard, StateWriteOutcome, StateWriteRefusal, edges};
 use crate::service::drain::{CriticalTaskGuard, DrainState};
 use crate::service::tests::service_tests::insert_test_sandbox;

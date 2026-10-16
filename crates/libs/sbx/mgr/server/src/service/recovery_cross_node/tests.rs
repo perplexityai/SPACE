@@ -1008,7 +1008,8 @@ fn a_superseded_recovery_claim_leaves_no_adopted_row() {
     let conn = crate::db::test_conn();
     let reason_code =
         pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
-    let sandbox_id = crate::db::tests::setup_quarantine_recovery_episode(&conn, reason_code);
+    let sandbox_id =
+        crate::db::test_fixtures::setup_quarantine_recovery_episode(&conn, reason_code);
     let candidate = crate::db::scan_quarantine_recovery_candidates(&conn)
         .unwrap()
         .candidates
@@ -1187,7 +1188,8 @@ fn a_sandbox_that_left_an_activatable_state_is_refused_before_adoption() {
     let conn = crate::db::test_conn();
     let reason_code =
         pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing;
-    let sandbox_id = crate::db::tests::setup_quarantine_recovery_episode(&conn, reason_code);
+    let sandbox_id =
+        crate::db::test_fixtures::setup_quarantine_recovery_episode(&conn, reason_code);
     let candidate = crate::db::scan_quarantine_recovery_candidates(&conn)
         .unwrap()
         .candidates
@@ -1291,7 +1293,8 @@ fn the_renewal_budget_aborts_a_full_heartbeat_inside_the_lease() {
 #[test]
 fn a_superseded_claim_cannot_persist_a_canonical_publication_failure() {
     let conn = crate::db::test_conn();
-    let (sandbox_id, candidate) = crate::db::tests::setup_quarantine_recovery_candidate(&conn);
+    let (sandbox_id, candidate) =
+        crate::db::test_fixtures::setup_quarantine_recovery_candidate(&conn);
     let claimed = crate::db::claim_quarantine_recovery_candidate(
         &conn,
         &candidate,
@@ -1921,7 +1924,7 @@ async fn rowless_restore_keeps_a_superseded_scope_it_cannot_retire() {
 fn claim_orphan_episode(
     conn: &crate::db::Connection,
 ) -> (SandboxId, crate::db::ClaimedQuarantineRecoveryCandidate) {
-    let sandbox_id = crate::db::tests::setup_quarantine_recovery_episode(
+    let sandbox_id = crate::db::test_fixtures::setup_quarantine_recovery_episode(
         conn,
         pplx_space_common_core::types::SandboxQuarantineReasonCode::OrphanedSandboxRowMissing,
     );

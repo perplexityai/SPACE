@@ -5,7 +5,10 @@ use super::*;
 static ALL_MIGRATORS: &[(&str, &Migrator)] = &[
     ("common", &COMMON_SCHEMA_MIGRATOR),
     ("postgres", &POSTGRES_MIGRATOR),
-    ("sandbox-manager", &SANDBOX_MANAGER_MIGRATOR),
+    (
+        "sandbox-manager",
+        pplx_space_sbx_mgr_store::db::migration::target().service,
+    ),
     ("template-manager", &TEMPLATE_MANAGER_MIGRATOR),
     ("node-manager", &NODE_MANAGER_MIGRATOR),
     ("node-ctl", &NODE_CTL_MIGRATOR),
@@ -18,7 +21,7 @@ static ALL_MIGRATORS: &[(&str, &Migrator)] = &[
 async fn sandbox_baseline_refuses_down_without_changing_shared_jobs_or_history() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("sandbox.sqlite");
-    let database = sqlite_sandbox_manager();
+    let database = SqliteDatabase::from(pplx_space_sbx_mgr_store::db::migration::target());
     migrate_sqlite_up(database, &path).await.unwrap();
     let conn = Connection::open(&path).unwrap();
     conn.execute(
@@ -135,7 +138,7 @@ async fn common_schema_converges_on_fresh_consumer_databases() {
 
 fn sqlite_databases_with_common_schema() -> [SqliteDatabase; 5] {
     [
-        sqlite_sandbox_manager(),
+        SqliteDatabase::from(pplx_space_sbx_mgr_store::db::migration::target()),
         sqlite_template_manager(),
         sqlite_volume_manager(),
         sqlite_build_manager(),

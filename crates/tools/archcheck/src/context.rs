@@ -66,6 +66,17 @@ pub enum LoadError {
     /// Debug-formatted, so the invalid bytes are shown escaped.
     #[error("{path:?} is not valid UTF-8")]
     NonUtf8Path { path: PathBuf },
+    /// A glob that matches no member checks nothing, so it is a typo or a
+    /// member that moved.
+    #[error(
+        "[rules.dependency_fence.{instance}] {key} in {CONFIG_FILE} has {glob:?}, which matches \
+         no workspace member; fix or remove it"
+    )]
+    UnmatchedMemberGlob {
+        instance: String,
+        key: &'static str,
+        glob: String,
+    },
     #[error("no Cargo.toml with a [workspace] table found at or above {start}")]
     NoWorkspaceRoot { start: PathBuf },
     /// The wording is for a rule with instances: every other rule's
@@ -109,6 +120,24 @@ pub struct Crate {
     pub name_line: usize,
     /// The 1-based line of `[lib] name`, when the manifest sets it.
     pub lib_name_line: Option<usize>,
+    /// Every dependency its manifest declares, of any kind and target.
+    pub dependencies: Vec<Dependency>,
+}
+
+/// A dependency a member's manifest declares, as `cargo metadata` reports
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dependency {
+    /// The depended-on package's name, whatever the manifest calls it.
+    pub package: String,
+    /// The name the manifest gives it with `package = "…"`, if it renames it.
+    pub rename: Option<String>,
+    /// `None` for `[dependencies]`; `dev` or `build` otherwise.
+    pub kind: Option<String>,
+    /// The `cfg(…)` or target triple of a `[target.<target>.…]` table.
+    pub target: Option<String>,
+    /// The 1-based line that names it in the manifest, or 1 if none does.
+    pub line: usize,
 }
 
 impl Crate {
@@ -179,6 +208,18 @@ impl Context {
             return Err(LoadError::AllowedAndListed { name: name.clone() });
         }
         let crates = workspace_crates(root)?;
+        let members = crates.iter().map(|krate| krate.member.as_str());
+        for (instance, fence) in &config.rules.dependency_fence {
+            for (key, globs) in [("members", fence.members.globs()), ("allow", &fence.allow)] {
+                if let Some(glob) = globs.unmatched(members.clone()) {
+                    return Err(LoadError::UnmatchedMemberGlob {
+                        instance: instance.to_string(),
+                        key,
+                        glob: glob.to_owned(),
+                    });
+                }
+            }
+        }
         let files = production_files(root, &crates)?;
         Ok(Self {
             config,
@@ -287,6 +328,15 @@ struct MetadataPackage {
     name: String,
     manifest_path: PathBuf,
     targets: Vec<MetadataTarget>,
+    dependencies: Vec<MetadataDependency>,
+}
+
+#[derive(Deserialize)]
+struct MetadataDependency {
+    name: String,
+    rename: Option<String>,
+    kind: Option<String>,
+    target: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -378,13 +428,53 @@ fn load_crate(workspace_root: &Path, package: MetadataPackage) -> Result<Crate, 
                 .any(|kind| LIB_KINDS.contains(&kind.as_str()))
         })
         .map(|target| target.name);
+    let dependencies = package
+        .dependencies
+        .into_iter()
+        .map(|dependency| Dependency {
+            line: dependency_line(
+                &text,
+                dependency.rename.as_deref().unwrap_or(&dependency.name),
+            ),
+            package: dependency.name,
+            rename: dependency.rename,
+            kind: dependency.kind,
+            target: dependency.target,
+        })
+        .collect();
     Ok(Crate {
         name: package.name,
         lib,
         member,
         name_line: line(parsed.package).unwrap_or(1),
         lib_name_line: line(parsed.lib),
+        dependencies,
     })
+}
+
+/// The first line of `manifest` that declares a dependency called `key`:
+/// `key = …`, `key.workspace = …` or a `[….dependencies.key]` header, with
+/// the key bare or quoted. 1 if none does, since the line only places the
+/// finding.
+fn dependency_line(manifest: &str, key: &str) -> usize {
+    let quoted = format!("\"{key}\"");
+    let names_key = |rest: &str| {
+        [key, quoted.as_str()].iter().any(|name| {
+            rest.strip_prefix(name)
+                .is_some_and(|after| after.trim_start().starts_with(['=', '.', ']']))
+        })
+    };
+    manifest
+        .lines()
+        .position(|line| {
+            let line = line.trim_start();
+            names_key(line)
+                || line.starts_with('[')
+                    && line
+                        .split_once("dependencies.")
+                        .is_some_and(|(_, rest)| names_key(rest))
+        })
+        .map_or(1, |index| index + 1)
 }
 
 fn production_files(root: &Path, crates: &[Crate]) -> Result<Vec<ProductionFile>, LoadError> {

@@ -79,17 +79,20 @@ mode = "required"
 mode = "required"
 
 # sbx-mgr's node-local SQLite database (`sandboxes` and every other sbx-mgr
-# table) is opened, migrated and queried only by its store, `src/db` of the
-# server crate. Within sbx-mgr's crates, naming rusqlite, opening a
-# connection or transaction, using the shared SQLite open and migration
-# helpers or the shared job store's SQL functions, binding parameters,
-# executing a statement, or writing an SQL statement literal outside the
-# store is a crossing; callers use the store's own handle, transaction and
-# error types. Other services' crates use rusqlite for their own databases,
-# so `paths` limits the rule to sbx-mgr's. The patterns are a line-based
-# tripwire: aliases, wrapped imports and calls through names imported
-# earlier escape them, so they catch common crossings rather than prove
-# their absence.
+# table) is opened, migrated and queried only by its store, the
+# `pplx-space-sbx-mgr-store` crate. The guarantee is that crate's boundary:
+# `dependency_fence.sbxmgr_rusqlite` below keeps rusqlite out of every other
+# sbx-mgr crate, and outside its `test-support` feature the store's API hands
+# out no rusqlite connection, transaction, statement or row. (Its `FromSql`
+# impl for a column type can return rusqlite's `FromSqlError`, an error type
+# rather than a database capability, to a caller holding a rusqlite value.)
+# This ratchet is a line-based tripwire on top of it, within sbx-mgr's
+# crates: naming rusqlite, opening a connection or transaction, using the
+# shared SQLite open and migration helpers or the shared job store's SQL
+# functions, binding parameters, executing a statement, or writing an SQL
+# statement literal outside the store is a crossing. Aliases, wrapped
+# imports and calls through names imported earlier escape it. Other services' crates use rusqlite for their own databases, so
+# `paths` limits the rule to sbx-mgr's.
 [rules.pattern_ratchet.sbxmgr_sqlite]
 patterns = [
   '\brusqlite\s*::',
@@ -106,10 +109,7 @@ patterns = [
   '^\s*(?:SELECT\s|INSERT\s+(?:OR\s+[A-Z]+\s+)?INTO\s|UPDATE\s+(?:OR\s+[A-Z]+\s+)?\w+(?:\s+SET\s|\s*$)|DELETE\s+FROM\s|WITH\s+(?:RECURSIVE\s+)?\w+\s+AS\b)',
 ]
 paths = ["crates/libs/sbx/mgr/**", "crates/apps/sbx/**"]
-allow = [
-  "crates/libs/sbx/mgr/server/src/db.rs",
-  "crates/libs/sbx/mgr/server/src/db/**",
-]
+allow = ["crates/libs/sbx/mgr/store/src/**"]
 
 [rules.pattern_ratchet.sbxmgr_sqlite.no_crossing]
 mode = "required"
@@ -128,8 +128,9 @@ mode = "required"
 mode = "required"
 
 # The same database's schema and location, in any crate: its migrations, its
-# path and file name, and the migrator's default-path helper for it belong to
-# the store, which opens and migrates it. The migrations crate defines the
+# path and file name, and a default-path helper for it belong to the store,
+# which opens and migrates it; the database migrator takes them from the
+# store's `db::migration::target()`. The migrations crate defines the
 # migrators and common-core the path. These names are
 # specific enough to check workspace-wide, unlike `sbxmgr_sqlite`'s patterns,
 # which other services' crates match for their own databases.
@@ -142,8 +143,7 @@ patterns = [
   '\bdb/sandbox-manager\b',
 ]
 allow = [
-  "crates/libs/sbx/mgr/server/src/db.rs",
-  "crates/libs/sbx/mgr/server/src/db/**",
+  "crates/libs/sbx/mgr/store/src/**",
   "crates/libs/sbx/mgr/migrations/src/**",
   "crates/libs/common/core/src/host/linux.rs",
 ]
@@ -151,9 +151,9 @@ allow = [
 [rules.pattern_ratchet.sbxmgr_sqlite_schema.no_crossing]
 mode = "required"
 
-# Seeding the ratchet reports its initial entries against the base.
+# The baseline is empty: no file outside the store may be added to it.
 [rules.pattern_ratchet.sbxmgr_sqlite_schema.no_new_entries]
-mode = "advisory"
+mode = "required"
 
 [rules.pattern_ratchet.sbxmgr_sqlite_schema.no_raised_caps]
 mode = "required"
@@ -162,6 +162,28 @@ mode = "required"
 mode = "required"
 
 [rules.pattern_ratchet.sbxmgr_sqlite_schema.stale_entries]
+mode = "required"
+
+# Only the store may depend on the SQLite drivers that can open sbx-mgr's
+# database, so no other sbx-mgr crate can name rusqlite: no normal, dev or
+# build dependency, for any target, under any name.
+[rules.dependency_fence.sbxmgr_rusqlite]
+packages = ["libsqlite3-sys", "rusqlite"]
+members = ["crates/libs/sbx/mgr/**", "crates/apps/sbx/**"]
+allow = ["crates/libs/sbx/mgr/store"]
+
+[rules.dependency_fence.sbxmgr_rusqlite.no_crossing]
+mode = "required"
+
+# sqlx opens SQLite too, directly or through its core and SQLite driver
+# crates. The migrations crate embeds the migrations with it, and the store
+# names their `Migrator` type.
+[rules.dependency_fence.sbxmgr_sqlx]
+packages = ["sqlx", "sqlx-core", "sqlx-sqlite"]
+members = ["crates/libs/sbx/mgr/**", "crates/apps/sbx/**"]
+allow = ["crates/libs/sbx/mgr/store", "crates/libs/sbx/mgr/migrations"]
+
+[rules.dependency_fence.sbxmgr_sqlx.no_crossing]
 mode = "required"
 
 [rules.crate_names]

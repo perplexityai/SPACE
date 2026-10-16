@@ -76,11 +76,6 @@
 "crates/libs/object-store/src/lib.rs" = 1810
 "crates/libs/observability/src/lib.rs" = 1063
 "crates/libs/public/api/src/lib.rs" = 1793
-"crates/libs/sbx/mgr/server/src/db/auto_lifecycle_delete_receipts.rs" = 1149
-"crates/libs/sbx/mgr/server/src/db/cleanup_episodes.rs" = 1825
-"crates/libs/sbx/mgr/server/src/db/quarantine_recovery.rs" = 1042
-"crates/libs/sbx/mgr/server/src/db/sandboxes.rs" = 1541
-"crates/libs/sbx/mgr/server/src/db/state_transitions.rs" = 1012
 "crates/libs/sbx/mgr/server/src/run.rs" = 1091
 "crates/libs/sbx/mgr/server/src/sandbox_eviction.rs" = 1170
 "crates/libs/sbx/mgr/server/src/service/activation_support.rs" = 1574
@@ -102,6 +97,11 @@
 "crates/libs/sbx/mgr/server/src/snapshot_restore.rs" = 2150
 "crates/libs/sbx/mgr/server/src/snapshot_upload_jobs.rs" = 1203
 "crates/libs/sbx/mgr/server/src/watchdog.rs" = 2767
+"crates/libs/sbx/mgr/store/src/db/auto_lifecycle_delete_receipts.rs" = 1147
+"crates/libs/sbx/mgr/store/src/db/cleanup_episodes.rs" = 1822
+"crates/libs/sbx/mgr/store/src/db/quarantine_recovery.rs" = 1042
+"crates/libs/sbx/mgr/store/src/db/sandboxes.rs" = 1535
+"crates/libs/sbx/mgr/store/src/db/state_transitions.rs" = 1012
 "crates/libs/spaced/guest/server/src/filesystem/router.rs" = 1242
 "crates/libs/spaced/guest/server/src/process.rs" = 2021
 "crates/libs/spaced/host/client/src/lib.rs" = 1040
@@ -142,10 +142,9 @@
 # transaction and error types, so no file is listed.
 [pattern_ratchet.sbxmgr_sqlite]
 
-# Code outside the store that still names sbx-mgr's migrations or database
-# path: the database migrator, until it calls the store.
+# No code outside the store names sbx-mgr's migrations or database path; the
+# database migrator takes them from the store.
 [pattern_ratchet.sbxmgr_sqlite_schema]
-"crates/libs/db/migrator/src/lib.rs" = 5
 
 # [crate_names] maps each workspace package with a catch-all name (a part such
 # as `common`, `utils` or `core`) to its member path. Only remove entries: a pull

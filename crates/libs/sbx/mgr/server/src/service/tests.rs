@@ -1907,12 +1907,12 @@ pub(crate) mod service_tests {
                 None,
             )
             .unwrap();
-            crate::db::tests::state_write_fixtures::apply_edge(
+            crate::db::test_fixtures::state_write_fixtures::apply_edge(
                 &db,
                 &sandbox_id_string,
                 &crate::db::edges::CREATE_COMPLETE,
             );
-            crate::db::tests::state_write_fixtures::apply_edge(
+            crate::db::test_fixtures::state_write_fixtures::apply_edge(
                 &db,
                 &sandbox_id_string,
                 &crate::db::edges::CREATE_BASE_SNAPSHOT_COMPLETE,
@@ -5371,7 +5371,7 @@ pub(crate) mod service_tests {
         let conn = crate::db::test_conn();
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Starting);
-        crate::db::tests::state_write_fixtures::apply_edge(
+        crate::db::test_fixtures::state_write_fixtures::apply_edge(
             &conn,
             &sandbox_id,
             &crate::db::edges::DELETE_ADMISSION,
@@ -6649,9 +6649,7 @@ pub(crate) mod service_tests {
         }
     }
 
-    pub(crate) fn insert_test_sandbox(conn: &crate::db::Connection, id: &str, state: SandboxState) {
-        insert_test_sandbox_with_policy(conn, id, state, &AutoLifecyclePolicy::disabled());
-    }
+    pub(crate) use crate::db::fixture::{insert_test_sandbox, insert_test_sandbox_with_policy};
 
     fn mark_test_remote_restore_artifact_staging(conn: &crate::db::Connection, id: &str) {
         conn.execute(
@@ -9065,7 +9063,7 @@ pub(crate) mod service_tests {
             Case::PriorNodeIdentity,
         ] {
             let conn = crate::db::test_conn();
-            let sandbox_id = crate::db::tests::setup_quarantine_recovery_episode(
+            let sandbox_id = crate::db::test_fixtures::setup_quarantine_recovery_episode(
                 &conn,
                 SandboxQuarantineReasonCode::OrphanedSandboxRowMissing,
             );
@@ -10326,7 +10324,7 @@ pub(crate) mod service_tests {
         .expect("delete must reach the cleanup claim");
         {
             let db = service.db.lock().expect("mutex poisoned");
-            crate::db::tests::state_write_fixtures::force_state(
+            crate::db::test_fixtures::state_write_fixtures::force_state(
                 &db,
                 &sandbox_id_string,
                 SandboxState::Suspending,
@@ -10800,7 +10798,7 @@ pub(crate) mod service_tests {
         let sandbox_id = SandboxId::new();
         let sandbox_id_string = sandbox_id.to_string();
         insert_test_sandbox(&conn, &sandbox_id_string, SandboxState::Started);
-        crate::db::tests::state_write_fixtures::force_state(
+        crate::db::test_fixtures::state_write_fixtures::force_state(
             &conn,
             &sandbox_id_string,
             SandboxState::Paused,
@@ -11021,7 +11019,7 @@ pub(crate) mod service_tests {
                 runtime_fields(ExecutionGeneration::new(2).unwrap(), 7),
             )
             .unwrap();
-            crate::db::tests::state_write_fixtures::apply_edge(
+            crate::db::test_fixtures::state_write_fixtures::apply_edge(
                 &conn,
                 &sandbox_id,
                 &crate::db::edges::STOP_ADMISSION,
@@ -11148,7 +11146,7 @@ pub(crate) mod service_tests {
             runtime_fields(deleted_generation, 7),
         )
         .unwrap();
-        crate::db::tests::state_write_fixtures::apply_edge(
+        crate::db::test_fixtures::state_write_fixtures::apply_edge(
             conn,
             sandbox_id,
             &crate::db::edges::DELETE_ADMISSION,
@@ -11864,7 +11862,7 @@ pub(crate) mod service_tests {
             ExecutionGeneration::new(1).unwrap(),
         )
         .unwrap();
-        crate::db::tests::state_write_fixtures::apply_edge(
+        crate::db::test_fixtures::state_write_fixtures::apply_edge(
             &conn,
             &sandbox_id.to_string(),
             &crate::db::edges::SUSPEND_ROLLBACK,
@@ -12347,6 +12345,37 @@ pub(crate) mod service_tests {
         assert!(
             !crate::snapshot_encryption::capture_volume_is_fresh(&row),
             "the retry must reuse the restored encrypted memory base"
+        );
+    }
+
+    #[test]
+    fn a_successful_cold_start_captures_a_fresh_memory_volume() {
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &sandbox_id, SandboxState::Starting);
+        conn.execute(
+            "UPDATE sandboxes
+                SET current_local_artifact_id = ?1,
+                    current_local_artifact_kind = 'full',
+                    current_local_artifact_origin = 'suspend'
+              WHERE id = ?2",
+            crate::db::fixture::params![
+                pplx_space_common_core::types::LocalArtifactId::new().to_string(),
+                sandbox_id
+            ],
+        )
+        .unwrap();
+        let before = crate::db::get_sandbox(&conn, &sandbox_id).unwrap().unwrap();
+        assert!(!crate::snapshot_encryption::capture_volume_is_fresh(
+            &before
+        ));
+
+        assert!(crate::db::mark_start_succeeded(&conn, &sandbox_id, None).unwrap());
+
+        let started = crate::db::get_sandbox(&conn, &sandbox_id).unwrap().unwrap();
+        assert!(
+            crate::snapshot_encryption::capture_volume_is_fresh(&started),
+            "a successful cold start must not reuse an older suspend memory image"
         );
     }
 
@@ -13173,41 +13202,6 @@ pub(crate) mod service_tests {
                 volume_encryption: false,
                 process_env: &BTreeMap::new(),
                 auto_lifecycle: &AutoLifecyclePolicy::disabled(),
-                network_policy_override: None,
-                network_policy_generation: 0,
-                network_policy_authority: crate::db::PolicyAuthority::Cluster,
-                auto_lifecycle_authority: crate::db::PolicyAuthority::Cluster,
-            },
-        )
-        .unwrap();
-    }
-
-    pub(crate) fn insert_test_sandbox_with_policy(
-        conn: &crate::db::Connection,
-        id: &str,
-        state: SandboxState,
-        auto_lifecycle: &AutoLifecyclePolicy,
-    ) {
-        let sandbox_id = SandboxId::from_str(id).unwrap();
-        let uuid8 = SandboxRuntimeLabel::from_sandbox_id(sandbox_id);
-        let user = SandboxOwner::parse("user").unwrap();
-        crate::db::insert_sandbox(
-            conn,
-            crate::db::InsertSandboxParams {
-                id,
-                uuid8: &uuid8,
-                state,
-                template: "seed",
-                template_hash: Some("hash"),
-                user: &user,
-                runtime: "fc",
-                snapshots_enabled: false,
-                rootfs_size_mb: None,
-                disk_io_limits: Default::default(),
-                pool_template: None,
-                volume_encryption: false,
-                process_env: &BTreeMap::new(),
-                auto_lifecycle,
                 network_policy_override: None,
                 network_policy_generation: 0,
                 network_policy_authority: crate::db::PolicyAuthority::Cluster,
@@ -14972,7 +14966,7 @@ pub(crate) mod service_tests {
         };
         {
             let db = service.db.lock().expect("mutex poisoned");
-            crate::db::tests::state_write_fixtures::apply_edge(
+            crate::db::test_fixtures::state_write_fixtures::apply_edge(
                 &db,
                 &sandbox_id,
                 &crate::db::edges::SUSPEND_ROLLBACK,
@@ -16591,7 +16585,7 @@ pub(crate) mod service_tests {
         let service = SandboxManagerService::for_test(conn);
         {
             let db = service.db.lock().expect("mutex poisoned");
-            crate::db::tests::state_write_fixtures::force_state(
+            crate::db::test_fixtures::state_write_fixtures::force_state(
                 &db,
                 &sandbox_id,
                 SandboxState::Suspended,
@@ -17916,7 +17910,7 @@ pub(crate) mod service_tests {
         let sandbox_id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &sandbox_id, SandboxState::Suspended);
         register_full_suspend_artifact(&conn, &sandbox_id);
-        crate::db::tests::state_write_fixtures::apply_edge(
+        crate::db::test_fixtures::state_write_fixtures::apply_edge(
             &conn,
             &sandbox_id,
             &crate::db::edges::RESTORE_BEGIN,

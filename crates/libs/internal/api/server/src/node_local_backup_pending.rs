@@ -335,7 +335,7 @@ pub(super) enum PendingLocalBackupCensus {
 /// hand, and the set of node-side states that end up publishing a marker is
 /// wider than the obvious two — sandbox-manager pins its own artifact while
 /// setting `cleanup_required`
-/// (`sbx/mgr/server/src/db/local_artifacts.rs`'s `pin_suspended_artifact_for_cleanup`, a
+/// (`sbx/mgr/store/src/db/local_artifacts.rs`'s `pin_suspended_artifact_for_cleanup`, a
 /// SQLite writer), and the teardown-suspend path pins one mid-transition,
 /// and each of those eventually reaches this column through
 /// `publish_clear_or_preserve_current_local_artifact_marker_assignments`. A

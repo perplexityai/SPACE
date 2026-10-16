@@ -11,7 +11,7 @@ use std::{
     path::Path,
 };
 
-use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
+use globset::{GlobBuilder, GlobMatcher, GlobSet, GlobSetBuilder};
 use regex::RegexSet;
 use serde::Deserialize;
 use thiserror::Error;
@@ -39,6 +39,9 @@ pub struct RulesConfig {
     #[serde(default)]
     pub pattern_ratchet: BTreeMap<InstanceName, PatternRatchetConfig>,
     pub crate_names: CrateNamesConfig,
+    /// `[rules.dependency_fence.<instance>]` tables; none when absent.
+    #[serde(default)]
+    pub dependency_fence: BTreeMap<InstanceName, DependencyFenceConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -70,6 +73,119 @@ pub struct PatternRatchetConfig {
     pub no_raised_caps: BehaviourConfig,
     pub listed_no_growth: BehaviourConfig,
     pub stale_entries: BehaviourConfig,
+}
+
+/// One named instance of `dependency_fence`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DependencyFenceConfig {
+    /// Cargo package names the fenced members may not depend on.
+    pub packages: Packages,
+    /// Globs over workspace member directories, repository-relative: the
+    /// members the instance checks.
+    pub members: MemberGlobs,
+    /// Globs over member directories that may depend on the packages.
+    pub allow: MemberGlobList,
+    pub no_crossing: BehaviourConfig,
+}
+
+/// Package names, at least one.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(try_from = "Vec<String>")]
+pub struct Packages(BTreeSet<String>);
+
+#[derive(Debug, Error)]
+#[error("packages must list at least one package name")]
+pub struct PackagesError;
+
+impl Packages {
+    pub fn contains(&self, package: &str) -> bool {
+        self.0.contains(package)
+    }
+}
+
+impl TryFrom<Vec<String>> for Packages {
+    type Error = PackagesError;
+
+    fn try_from(packages: Vec<String>) -> Result<Self, Self::Error> {
+        if packages.is_empty() {
+            return Err(PackagesError);
+        }
+        Ok(Self(packages.into_iter().collect()))
+    }
+}
+
+/// Globs over workspace member directories, each kept with its text so that
+/// one matching no member can be named.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(try_from = "Vec<String>")]
+pub struct MemberGlobList(Vec<(String, GlobMatcher)>);
+
+impl MemberGlobList {
+    pub fn is_match(&self, member: &str) -> bool {
+        self.0.iter().any(|(_, glob)| glob.is_match(member))
+    }
+
+    /// The first glob that matches none of `members`.
+    pub fn unmatched<'a>(&self, members: impl Iterator<Item = &'a str> + Clone) -> Option<&str> {
+        self.0
+            .iter()
+            .find(|(_, glob)| !members.clone().any(|member| glob.is_match(member)))
+            .map(|(text, _)| text.as_str())
+    }
+}
+
+impl TryFrom<Vec<String>> for MemberGlobList {
+    type Error = globset::Error;
+
+    fn try_from(globs: Vec<String>) -> Result<Self, Self::Error> {
+        globs
+            .into_iter()
+            .map(|text| {
+                let glob = GlobBuilder::new(&text)
+                    .literal_separator(true)
+                    .build()?
+                    .compile_matcher();
+                Ok((text, glob))
+            })
+            .collect::<Result<_, _>>()
+            .map(Self)
+    }
+}
+
+/// A `dependency_fence` instance's `members`: a [`MemberGlobList`] with at
+/// least one glob, since an empty list would check nothing.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(try_from = "Vec<String>")]
+pub struct MemberGlobs(MemberGlobList);
+
+#[derive(Debug, Error)]
+pub enum MemberGlobsError {
+    #[error("members must list at least one glob")]
+    Empty,
+    #[error(transparent)]
+    Glob(#[from] globset::Error),
+}
+
+impl MemberGlobs {
+    pub fn is_match(&self, member: &str) -> bool {
+        self.0.is_match(member)
+    }
+
+    pub fn globs(&self) -> &MemberGlobList {
+        &self.0
+    }
+}
+
+impl TryFrom<Vec<String>> for MemberGlobs {
+    type Error = MemberGlobsError;
+
+    fn try_from(globs: Vec<String>) -> Result<Self, Self::Error> {
+        if globs.is_empty() {
+            return Err(MemberGlobsError::Empty);
+        }
+        Ok(Self(MemberGlobList::try_from(globs)?))
+    }
 }
 
 /// The name of a rule instance, as it appears in finding codes and baseline

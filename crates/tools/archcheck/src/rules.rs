@@ -1,11 +1,13 @@
 //! The rule interface and the registry every check runs from.
 
 mod crate_names;
+mod dependency_fence;
 mod file_size;
 mod pattern_ratchet;
 mod ratchet;
 
 pub(crate) use crate_names::CrateNames;
+pub(crate) use dependency_fence::DependencyFence;
 pub(crate) use file_size::FileSize;
 pub(crate) use pattern_ratchet::PatternRatchet;
 pub(crate) use ratchet::CountRule;
@@ -92,5 +94,6 @@ pub fn registered() -> Vec<Box<dyn Rule>> {
         Box::new(FileSize),
         Box::new(PatternRatchet),
         Box::new(CrateNames),
+        Box::new(DependencyFence),
     ]
 }

@@ -140,7 +140,7 @@ async fn staging_cleanup_rediscovery_survives_rollback_failed_deletion_and_resta
         SandboxState::Started,
         SandboxState::Paused,
     ] {
-        crate::db::tests::state_write_fixtures::force_state(
+        crate::db::test_fixtures::state_write_fixtures::force_state(
             &service.db.lock().unwrap(),
             &id,
             state,
@@ -166,7 +166,7 @@ async fn staging_cleanup_rediscovery_survives_rollback_failed_deletion_and_resta
         fresh_id,
         b"new attempt",
     );
-    crate::db::tests::state_write_fixtures::force_state(
+    crate::db::test_fixtures::state_write_fixtures::force_state(
         &service.db.lock().unwrap(),
         &id,
         SandboxState::Suspending,

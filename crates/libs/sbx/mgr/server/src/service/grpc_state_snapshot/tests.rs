@@ -218,9 +218,9 @@ fn template_base_snapshot_writes_leave_a_stop_that_completed_during_capture_stop
         );
         begin_template_base_snapshot_state(&conn, &id).unwrap();
         assert_eq!(sandbox_state(&conn, &id), SandboxState::Checkpointing);
-        crate::db::tests::state_write_fixtures::stop(&conn, &id);
+        crate::db::test_fixtures::state_write_fixtures::stop(&conn, &id);
         assert_eq!(sandbox_state(&conn, &id), SandboxState::Stopped);
-        let before = crate::db::tests::database_rows(&conn);
+        let before = crate::db::test_fixtures::database_rows(&conn);
         let db = crate::db::SharedConnection::new(conn);
 
         if completion {
@@ -236,7 +236,7 @@ fn template_base_snapshot_writes_leave_a_stop_that_completed_during_capture_stop
         }
 
         assert_eq!(
-            crate::db::tests::database_rows(&db.lock().unwrap()),
+            crate::db::test_fixtures::database_rows(&db.lock().unwrap()),
             before,
             "completion={completion}"
         );
@@ -289,8 +289,12 @@ fn template_base_snapshot_writes_return_only_a_checkpointing_row_to_paused() {
             crate::service::tests::service_tests::insert_test_sandbox_with_runtime(
                 &conn, &id, state,
             );
-            crate::db::tests::state_write_fixtures::decorate(&conn, &id, SandboxState::Started);
-            let before = crate::db::tests::database_rows(&conn);
+            crate::db::test_fixtures::state_write_fixtures::decorate(
+                &conn,
+                &id,
+                SandboxState::Started,
+            );
+            let before = crate::db::test_fixtures::database_rows(&conn);
             let db = crate::db::SharedConnection::new(conn);
 
             let result = if completion {
@@ -318,7 +322,7 @@ fn template_base_snapshot_writes_return_only_a_checkpointing_row_to_paused() {
                         assert_eq!(error.message(), message, "{state}");
                     }
                     assert_eq!(
-                        crate::db::tests::database_rows(&conn),
+                        crate::db::test_fixtures::database_rows(&conn),
                         before,
                         "{state}, completion={completion}"
                     );
@@ -369,7 +373,7 @@ fn template_base_snapshot_admission_writes_only_over_a_paused_row() {
         let conn = crate::db::test_conn();
         let id = SandboxId::new().to_string();
         crate::service::tests::service_tests::insert_test_sandbox_with_runtime(&conn, &id, state);
-        let before = crate::db::tests::database_rows(&conn);
+        let before = crate::db::test_fixtures::database_rows(&conn);
 
         let result = begin_template_base_snapshot_state(&conn, &id);
 
@@ -382,7 +386,11 @@ fn template_base_snapshot_admission_writes_only_over_a_paused_row() {
                 let error = result.expect_err("a refused admission must fail");
                 assert_eq!(error.code(), tonic::Code::Aborted, "{state}");
                 assert_eq!(error.message(), message, "{state}");
-                assert_eq!(crate::db::tests::database_rows(&conn), before, "{state}");
+                assert_eq!(
+                    crate::db::test_fixtures::database_rows(&conn),
+                    before,
+                    "{state}"
+                );
             }
         }
     }

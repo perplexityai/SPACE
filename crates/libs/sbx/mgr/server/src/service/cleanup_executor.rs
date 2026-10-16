@@ -21,14 +21,12 @@ pub(super) enum CleanupWait {
     Stop,
 }
 
-impl CleanupOutcome {
-    fn into_caller_result(self) -> AttemptResult {
-        match self {
-            Self::Applied | Self::AlreadyApplied => Ok(()),
-            Self::Superseded => Err(Status::aborted("cleanup superseded")),
-            Self::Quarantined(message) | Self::Blocked(message) => {
-                Err(Status::failed_precondition(message))
-            }
+fn caller_result(outcome: CleanupOutcome) -> AttemptResult {
+    match outcome {
+        CleanupOutcome::Applied | CleanupOutcome::AlreadyApplied => Ok(()),
+        CleanupOutcome::Superseded => Err(Status::aborted("cleanup superseded")),
+        CleanupOutcome::Quarantined(message) | CleanupOutcome::Blocked(message) => {
+            Err(Status::failed_precondition(message))
         }
     }
 }
@@ -228,7 +226,7 @@ impl SandboxManagerService {
                 if let CleanupEligibility::Finished(outcome) =
                     cleanup_jobs::eligibility(&tx, &work).map_err(storage_status)?
                 {
-                    outcome.into_caller_result()?;
+                    caller_result(outcome)?;
                     return Ok(None);
                 }
                 let job = cleanup_jobs::persist(&tx, work)

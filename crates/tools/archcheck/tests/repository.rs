@@ -54,6 +54,12 @@ fn ratchet_findings(
         .and_then(toml::Value::as_table_mut)
         .expect("ARCHITECTURE.toml has [rules.pattern_ratchet]")
         .retain(|name, _| name == instance);
+    // The fences name members this one-crate workspace does not have.
+    config
+        .get_mut("rules")
+        .and_then(toml::Value::as_table_mut)
+        .expect("ARCHITECTURE.toml has [rules]")
+        .remove("dependency_fence");
 
     let dir = tempfile::tempdir().expect("create a temporary workspace");
     let member = src.trim_end_matches("/src");

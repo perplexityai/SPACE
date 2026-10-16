@@ -210,7 +210,7 @@ async fn artifact_alias_waits_on_canonical_lock_and_rereads_after_admission() {
     let pending = service.lock_artifact_for_sandbox("01939e3e1111");
     tokio::pin!(pending);
     assert!(futures_util::poll!(&mut pending).is_pending());
-    crate::db::tests::state_write_fixtures::apply_edge(
+    crate::db::test_fixtures::state_write_fixtures::apply_edge(
         &service.db_conn().unwrap(),
         id,
         &crate::db::edges::AUTO_LIFECYCLE_STOP_SUSPENDED,
@@ -1384,7 +1384,7 @@ fn deleting_sandbox_with_closed_teardown_suspend(
             .status,
         crate::db::TeardownSuspendOperationStatus::Running
     );
-    crate::db::tests::state_write_fixtures::apply_edge(
+    crate::db::test_fixtures::state_write_fixtures::apply_edge(
         conn,
         &id,
         &crate::db::edges::DELETE_ADMISSION,
@@ -1798,7 +1798,7 @@ async fn teardown_suspend_pause_failure_recovery_allows_same_generation_retry() 
         let original = crate::db::latest_teardown_suspend_operation(&conn, &id)
             .unwrap()
             .unwrap();
-        crate::db::tests::state_write_fixtures::apply_edge(
+        crate::db::test_fixtures::state_write_fixtures::apply_edge(
             &conn,
             &id,
             &crate::db::edges::PAUSE_BEGIN,
@@ -2267,7 +2267,7 @@ async fn suspend_completion_refuses_a_superseded_row_before_runtime_cleanup() {
         match supersession {
             Supersession::CleanupActive => {}
             Supersession::Deleted => {
-                crate::db::tests::state_write_fixtures::apply_edge(
+                crate::db::test_fixtures::state_write_fixtures::apply_edge(
                     &conn,
                     &id,
                     &crate::db::edges::DELETE_ADMISSION,
