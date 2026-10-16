@@ -300,7 +300,7 @@ export interface NetworkCredentialRuleV1 {
     path_prefix?: string;
   };
   credential_header_bindings: CredentialHeaderBindingV1[];
-  supported_http_methods: Array<'GET' | 'POST'>;
+  supported_http_methods: Array<'GET' | 'POST' | 'HEAD'>;
 }
 
 export interface NetworkPolicyV1 {
