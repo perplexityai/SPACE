@@ -172,6 +172,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use pplx_space_api::controllers::substrate::SubstrateCapabilities;
 use pplx_space_common_core::types::PositiveDuration;
 use tokio::sync::watch;
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until, timeout};
@@ -431,6 +432,14 @@ pub struct LeaderElectionConfig {
 }
 
 impl LeaderElectionConfig {
+    /// Whether this replica contends for the leader lease before running the
+    /// reconcilers: only on a substrate whose
+    /// [`contends_for_leader_lease`](SubstrateCapabilities::contends_for_leader_lease)
+    /// is set, and only while the kill-switch leaves election enabled.
+    pub fn contends(&self, capabilities: SubstrateCapabilities) -> bool {
+        self.enabled && capabilities.contends_for_leader_lease
+    }
+
     pub fn from_env() -> Self {
         let identity = election_identity();
         let timings = Timings::derive(

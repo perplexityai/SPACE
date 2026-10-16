@@ -259,9 +259,9 @@ impl Fixture {
         .execute(&db.pool)
         .await?;
         let controller =
-            SandboxController::new(crate::controllers::substrate::Substrate::Direct(Box::new(
+            SandboxController::new(crate::controllers::substrate::Substrate::from_direct(
                 crate::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),
-            )));
+            ));
         Ok(Self {
             db,
             controller,

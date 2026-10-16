@@ -57,30 +57,52 @@ For new work:
   arm give both substrates the default and skip the Kubernetes override. Only
   a hook shared code calls on every path may default to "nothing to do", as
   `retire_fence_mismatch` does, and it still needs its arm.
-- Where shared code needs a static fact about the substrate, add a
-  `SubstrateCapabilities` field, set it in both `SubstrateCapabilities::DIRECT`
-  and `::KUBERNETES`, and read it through `capabilities()`; where the
-  substrate must act, add a required method (above). Don't match
-  `Substrate::Direct` or branch behavior on `managed_by()`. Matching
-  `Substrate::Kubernetes(k)` to reach Kubernetes-only state is fine.
+- `Substrate`'s variants are private to this module (`Inner` in
+  `mod.rs`), so shared code cannot match them; it builds one with
+  `Substrate::from_direct` or `Substrate::from_kubernetes`. Where shared code
+  needs a static fact about the substrate, add a `SubstrateCapabilities`
+  field with a doc comment stating what it means, set it in both
+  `SubstrateCapabilities::DIRECT` and `::KUBERNETES`, and read it through
+  `capabilities()`; where the substrate must act, add a required method
+  (above). Don't widen the variants' visibility.
+- Code that needs Kubernetes-only state (its client, caches, or a reconciler
+  typed on `KubernetesSubstrate`) uses `as_kubernetes()` and binds and uses
+  the payload. A presence test on it (`Some(_)`, `if let Some(_)`,
+  `.is_some()`, `.is_none()` and the like) only asks which substrate is
+  running: add a capability instead, as the cluster controller's leader
+  election reads `contends_for_leader_lease`. Comparing `capabilities()` with
+  `SubstrateCapabilities::DIRECT` or `::KUBERNETES` asks the same and is
+  equally off limits. archcheck enforces two line counts over production code
+  (tests are outside them). `pattern_ratchet.kubernetes_access` counts every
+  `as_kubernetes(` call outside this module, in any form, against its
+  `architecture-baseline.toml` entry, so a new caller needs a reviewed
+  baseline entry. `pattern_ratchet.capability_identity` rejects any mention
+  of the two consts outside `direct.rs` and
+  `kubernetes/adapter/substrate_adapter.rs`.
+- `managed_by()` names the running substrate for SQL row scope and wire
+  labels. Never parse it to decide behavior. The only parse is
+  `failed_active_execution_scope` in `transient_lifecycle_sweeper/store.rs`,
+  which turns the running label into the fixed SQL scope of the sweeper's
+  failed-active-execution cleanup; don't add another.
 - Scoping a query to the rows a substrate owns is required, not debt. In new
   SQL, bind the substrate value instead of a `'k8s'`/`'space'` literal:
   `managed_by = $n` with `.bind(substrate.managed_by())` for the running
   substrate's rows, as the transient-lifecycle sweeper does, or a fixed
   `SubstrateKind::Kubernetes`/`::Space` where code targets one substrate's
   rows. When a fixed-scope statement may run under another substrate, return
-  early in Rust instead of also ANDing the running substrate's value, as the
-  sweeper's failed-active-execution cleanup does. Existing literals, such as
-  the shared `routable_execution_or_non_k8s` fragment, are debt. Never choose
-  a runtime endpoint from a row's label.
+  early in Rust instead of also ANDing the running substrate's value: read a
+  capability, or reuse `failed_active_execution_scope` where its scope fits,
+  as the sweeper's failed-active-execution cleanup does. Existing literals,
+  such as the shared `routable_execution_or_non_k8s` fragment, are debt.
+  Never choose a runtime endpoint from a row's label.
 - `node_direct`, `sandbox_direct_route_identities` and
   `sandbox_direct_route_provenance` belong to Direct. Outside tests, write
   them only from `direct.rs` and the Direct node registry; read them through
   an existing query that already joins them rather than adding a join.
   archcheck's `pattern_ratchet.direct_tables` rule enforces this (advisory
   today).
-- Other existing substrate matches, Direct-table joins in shared code and
-  `Unsupported` trait defaults (`list_pool_configs`, `upsert_pool_config`,
+- Existing Direct-table joins in shared code and `Unsupported` trait
+  defaults (`list_pool_configs`, `upsert_pool_config`,
   `disable_pool_config`) are debt, not precedent.
 
 ## Tests
@@ -93,11 +115,12 @@ restore, and pooled manifests in one place.
 Keep narrow tests only for behavior that is hard to express clearly in the broad
 YAML contract test.
 
-Use `Substrate::Direct` only to test Direct behavior (tests under `direct/`) or
-behavior that genuinely doesn't depend on the substrate. Test shared lifecycle
-behavior Kubernetes deployments depend on against a `Substrate::Kubernetes`
-built with the `kubernetes::tests` helpers (`substrate_with_store` and its
-variants), as `routes/public/sandboxes/admission_test_fixture.rs` does.
+Use `Substrate::from_direct` only to test Direct behavior (tests under
+`direct/`) or behavior that genuinely doesn't depend on the substrate. Test
+shared lifecycle behavior Kubernetes deployments depend on against a
+`Substrate::from_kubernetes` built with the `kubernetes::tests` helpers
+(`substrate_with_store` and its variants), as
+`routes/public/sandboxes/admission_test_fixture.rs` does.
 Adapter tests inside `kubernetes/` use `scripted_test_doubles.rs`, as
 `adapter_characterization_tests/` does. Both compile only with
 `--features kubernetes`: CI's `--workspace --all-features` run includes them,

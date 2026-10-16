@@ -59,7 +59,7 @@ fn enter_sim_worker_process_with_token_paths(
 
 /// A Direct substrate over the test database; it needs no apiserver.
 pub(crate) fn direct_substrate(pool: &PgPool) -> Substrate {
-    Substrate::Direct(Box::new(DirectSubstrate::new(pool.clone())))
+    Substrate::from_direct(DirectSubstrate::new(pool.clone()))
 }
 
 /// An enabled cluster-admission config with no Redis URL, so the admission

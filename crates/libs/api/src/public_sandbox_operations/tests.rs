@@ -66,9 +66,9 @@ fn claimed_create_operation_for(
 // trait default `false` while Kubernetes reads the reserved slot, so a slot whose
 // cleanup is pending yields workflow progress instead of `Succeeded`.
 fn direct_sandbox_controller(pool: &PgPool) -> SandboxController {
-    SandboxController::new(crate::controllers::substrate::Substrate::Direct(Box::new(
+    SandboxController::new(crate::controllers::substrate::Substrate::from_direct(
         crate::controllers::substrate::direct::DirectSubstrate::new(pool.clone()),
-    )))
+    ))
 }
 
 #[cfg(feature = "kubernetes")]
@@ -151,14 +151,14 @@ async fn native_create_executor_preserves_operator_policy_across_replacements() 
         (true, true, false), // Legacy federated payload: no saved selection.
         (true, true, true),
     ] {
-        let substrate = crate::controllers::substrate::Substrate::Kubernetes(Box::new(
+        let substrate = crate::controllers::substrate::Substrate::from_kubernetes(
             substrate_with_store_client_proxy_port_and_pod(
                 db.pool.clone(),
                 running_pod_kubernetes_client(Arc::clone(&captured_pods), "127.0.0.1"),
                 pod_listener.local_addr()?.port(),
                 None,
             ),
-        ));
+        );
         let controller = SandboxController::new(substrate)
             .with_egress_profiles(profiles.clone())
             .with_tls_interception_exemptions(configured.then(|| exemptions.clone()));
@@ -761,10 +761,9 @@ async fn create_executor_retries_unpinned_transient_substrate_failure() {
         claim_generation: 1,
         traceparent: None,
     };
-    let controller =
-        SandboxController::new(crate::controllers::substrate::Substrate::Direct(Box::new(
-            crate::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),
-        )));
+    let controller = SandboxController::new(crate::controllers::substrate::Substrate::from_direct(
+        crate::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),
+    ));
     let executor = CreateSandboxOperationExecutor::new(db.pool.clone(), controller);
 
     let result = executor.execute(&operation).await;

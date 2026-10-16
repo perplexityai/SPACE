@@ -377,7 +377,7 @@ pub async fn run_reconcilers(
     // already marked failed but still carrying active execution rows. Runs for
     // both substrates because a stuck row outside any drain context still
     // wedges future operations on the row, and the sink only needs DB access +
-    // `SubstrateAdapter` methods, which the `Substrate` enum exposes
+    // `SubstrateAdapter` methods, which `Substrate` exposes
     // uniformly. Transient lifecycle aging remains default-disabled,
     // while failed-sandbox cleanup runs unless
     // `SPACE_FAILED_SANDBOX_CLEANUP_ENABLED=false`.

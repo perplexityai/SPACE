@@ -1065,6 +1065,13 @@ pub struct SubstrateCapabilities {
     /// and force-upload actions refuse before reading the node, except
     /// `:undrain`, which only clears a `drain_phase` an earlier drain left.
     pub supports_node_drain: bool,
+    /// The cluster controller may run as several replicas, so each one
+    /// contends for a leader `Lease` on the apiserver and only the holder runs
+    /// the reconcilers (unless the leader-election kill-switch is off). When
+    /// false, the controller is a single local process and runs the
+    /// reconcilers unconditionally. The lease client comes from the process
+    /// environment, not from the substrate.
+    pub contends_for_leader_lease: bool,
 }
 
 impl SubstrateCapabilities {
@@ -1075,6 +1082,7 @@ impl SubstrateCapabilities {
         resolves_cold_create_shape: false,
         supports_node_pool_placement: false,
         supports_node_drain: false,
+        contends_for_leader_lease: false,
     };
 
     pub const KUBERNETES: Self = Self {
@@ -1084,6 +1092,7 @@ impl SubstrateCapabilities {
         resolves_cold_create_shape: true,
         supports_node_pool_placement: true,
         supports_node_drain: true,
+        contends_for_leader_lease: true,
     };
 }
 
@@ -1681,31 +1690,58 @@ where
     }
 }
 
+/// The running substrate. Shared code asks it what it supports
+/// ([`SubstrateAdapter::capabilities`]) and asks it to act (the
+/// [`SubstrateAdapter`] and inherent methods) rather than branching on which
+/// substrate it is; [`SubstrateAdapter::managed_by`] still names it, for SQL
+/// row scope and wire labels. The variants live in the private `Inner`, so
+/// only this module can match them; code outside it builds a `Substrate` with
+/// `from_direct` or `from_kubernetes`.
 #[derive(Clone)]
-pub enum Substrate {
+pub struct Substrate {
+    inner: Inner,
+}
+
+#[derive(Clone)]
+enum Inner {
     Direct(Box<direct::DirectSubstrate>),
     #[cfg(feature = "kubernetes")]
     Kubernetes(Box<kubernetes::KubernetesSubstrate>),
 }
 
 impl Substrate {
+    /// Run on the Direct substrate.
+    pub fn from_direct(substrate: direct::DirectSubstrate) -> Self {
+        Self {
+            inner: Inner::Direct(Box::new(substrate)),
+        }
+    }
+
+    /// Run on the Kubernetes substrate.
+    #[cfg(feature = "kubernetes")]
+    pub fn from_kubernetes(substrate: kubernetes::KubernetesSubstrate) -> Self {
+        Self {
+            inner: Inner::Kubernetes(Box::new(substrate)),
+        }
+    }
+
     /// The Kubernetes substrate, for code that needs Kubernetes-only state
     /// (its client, caches, or reconcilers typed on it). Behavior shared code
     /// asks a substrate to perform belongs on [`SubstrateAdapter`], and static
     /// facts on [`SubstrateCapabilities`].
     #[cfg(feature = "kubernetes")]
     pub fn as_kubernetes(&self) -> Option<&kubernetes::KubernetesSubstrate> {
-        match self {
-            Self::Direct(_) => None,
-            Self::Kubernetes(substrate) => Some(substrate),
+        match &self.inner {
+            Inner::Direct(_) => None,
+            Inner::Kubernetes(substrate) => Some(substrate),
         }
     }
 
     pub fn live_node_names(&self) -> Option<std::collections::HashSet<String>> {
-        match self {
-            Self::Direct(_) => None,
+        match &self.inner {
+            Inner::Direct(_) => None,
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => substrate.live_node_names(),
+            Inner::Kubernetes(substrate) => substrate.live_node_names(),
         }
     }
 
@@ -1713,10 +1749,10 @@ impl Substrate {
         &self,
         target: &NodeApiTarget<'_>,
     ) -> Result<String, SubstrateError> {
-        match self {
-            Self::Direct(substrate) => substrate.resolve_node_api_endpoint(target).await,
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.resolve_node_api_endpoint(target).await,
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => substrate.try_resolve_node_api_endpoint(target),
+            Inner::Kubernetes(substrate) => substrate.try_resolve_node_api_endpoint(target),
         }
     }
 
@@ -1734,7 +1770,7 @@ impl Substrate {
             match kubernetes::KubernetesSubstrate::try_from_env(pool, shutdown_token, task_tracker)
                 .await
             {
-                Ok(Some(substrate)) => return Ok(Self::Kubernetes(Box::new(substrate))),
+                Ok(Some(substrate)) => return Ok(Self::from_kubernetes(substrate)),
                 Ok(None) => {}
                 Err(err) => return Err(err),
             }
@@ -1742,9 +1778,9 @@ impl Substrate {
         #[cfg(not(feature = "kubernetes"))]
         drop((shutdown_token, task_tracker));
 
-        Ok(Self::Direct(Box::new(direct::DirectSubstrate::new(
+        Ok(Self::from_direct(direct::DirectSubstrate::new(
             pool.clone(),
-        ))))
+        )))
     }
 
     pub(crate) async fn reserve_rollback_route_identity(
@@ -1752,13 +1788,13 @@ impl Substrate {
         sandbox_id: SandboxId,
     ) -> Result<Option<pplx_space_sbx_mgr_client::proto::SpaceApiRouteIdentity>, SubstrateError>
     {
-        match self {
-            Self::Direct(substrate) => substrate
+        match &self.inner {
+            Inner::Direct(substrate) => substrate
                 .reserve_rollback_route_identity(sandbox_id)
                 .await
                 .map(Some),
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(_) => Ok(None),
+            Inner::Kubernetes(_) => Ok(None),
         }
     }
 
@@ -1767,14 +1803,14 @@ impl Substrate {
         sandbox_id: SandboxId,
         route_identity: Option<pplx_space_sbx_mgr_client::proto::SpaceApiRouteIdentity>,
     ) -> Result<(), SubstrateError> {
-        match self {
-            Self::Direct(substrate) => {
+        match &self.inner {
+            Inner::Direct(substrate) => {
                 substrate
                     .persist_rollback_route_identity(sandbox_id, route_identity)
                     .await
             }
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(_) => Ok(()),
+            Inner::Kubernetes(_) => Ok(()),
         }
     }
 
@@ -1850,10 +1886,10 @@ impl Substrate {
     /// traffic before its cache is warm. The direct substrate has no such
     /// cache and is always ready.
     pub fn readiness(&self) -> ReflectorReady {
-        match self {
-            Self::Direct(_) => ReflectorReady::always_ready(),
+        match &self.inner {
+            Inner::Direct(_) => ReflectorReady::always_ready(),
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => substrate.readiness(),
+            Inner::Kubernetes(substrate) => substrate.readiness(),
         }
     }
 
@@ -1872,10 +1908,10 @@ impl Substrate {
     /// the caller can fail open rather than treating an unknown as an empty
     /// cluster. `Some(0)` is a confident "no start-capable nodes".
     pub async fn eligible_start_node_count(&self) -> Result<Option<u64>, SubstrateError> {
-        match self {
-            Self::Direct(substrate) => Ok(Some(substrate.eligible_start_node_count().await?)),
+        match &self.inner {
+            Inner::Direct(substrate) => Ok(Some(substrate.eligible_start_node_count().await?)),
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => Ok(substrate.eligible_start_node_count()),
+            Inner::Kubernetes(substrate) => Ok(substrate.eligible_start_node_count()),
         }
     }
 
@@ -1897,13 +1933,13 @@ impl Substrate {
         _request: NodeSchedulabilityRequest<'_>,
         _desired: NodeSchedulability,
     ) -> Result<(), SubstrateError> {
-        match self {
-            Self::Direct(_) => Err(SubstrateError::Unsupported {
+        match &self.inner {
+            Inner::Direct(_) => Err(SubstrateError::Unsupported {
                 message: "the active substrate does not support setting node schedulability"
                     .to_string(),
             }),
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => {
+            Inner::Kubernetes(substrate) => {
                 substrate.set_node_schedulability(_request, _desired).await
             }
         }
@@ -2289,18 +2325,18 @@ fn backup_source_to_proto(
 
 impl SubstrateAdapter for Substrate {
     fn managed_by(&self) -> &'static str {
-        match self {
-            Self::Direct(substrate) => substrate.managed_by(),
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.managed_by(),
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => substrate.managed_by(),
+            Inner::Kubernetes(substrate) => substrate.managed_by(),
         }
     }
 
     fn capabilities(&self) -> SubstrateCapabilities {
-        match self {
-            Self::Direct(substrate) => substrate.capabilities(),
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.capabilities(),
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => substrate.capabilities(),
+            Inner::Kubernetes(substrate) => substrate.capabilities(),
         }
     }
 
@@ -2308,10 +2344,10 @@ impl SubstrateAdapter for Substrate {
         &self,
         request: CreateExecutionRequest<'_>,
     ) -> Result<CreateExecutionOutcome, SubstrateError> {
-        match self {
-            Self::Direct(substrate) => substrate.create_execution(request).await,
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.create_execution(request).await,
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => substrate.create_execution(request).await,
+            Inner::Kubernetes(substrate) => substrate.create_execution(request).await,
         }
     }
 
@@ -2320,14 +2356,14 @@ impl SubstrateAdapter for Substrate {
         sandbox_id: SandboxId,
         completion: Option<ActivationLeaseCompletion>,
     ) {
-        match self {
-            Self::Direct(substrate) => {
+        match &self.inner {
+            Inner::Direct(substrate) => {
                 substrate
                     .complete_activation_lease(sandbox_id, completion)
                     .await
             }
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => {
+            Inner::Kubernetes(substrate) => {
                 substrate
                     .complete_activation_lease(sandbox_id, completion)
                     .await
@@ -2336,10 +2372,10 @@ impl SubstrateAdapter for Substrate {
     }
 
     async fn delete_execution(&self, sandbox_id: SandboxId) -> Result<(), SubstrateError> {
-        match self {
-            Self::Direct(substrate) => substrate.delete_execution(sandbox_id).await,
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.delete_execution(sandbox_id).await,
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => substrate.delete_execution(sandbox_id).await,
+            Inner::Kubernetes(substrate) => substrate.delete_execution(sandbox_id).await,
         }
     }
 
@@ -2347,10 +2383,10 @@ impl SubstrateAdapter for Substrate {
         &self,
         request: RetireExecutionRequest,
     ) -> Result<RetireExecutionOutcome, SubstrateError> {
-        match self {
-            Self::Direct(substrate) => substrate.retire_execution(request).await,
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.retire_execution(request).await,
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => substrate.retire_execution(request).await,
+            Inner::Kubernetes(substrate) => substrate.retire_execution(request).await,
         }
     }
 
@@ -2359,10 +2395,12 @@ impl SubstrateAdapter for Substrate {
         sandbox_id: SandboxId,
         fence: &RetireFence,
     ) -> Result<Option<PodFenceMismatch>, SubstrateError> {
-        match self {
-            Self::Direct(substrate) => substrate.retire_fence_mismatch(sandbox_id, fence).await,
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.retire_fence_mismatch(sandbox_id, fence).await,
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => substrate.retire_fence_mismatch(sandbox_id, fence).await,
+            Inner::Kubernetes(substrate) => {
+                substrate.retire_fence_mismatch(sandbox_id, fence).await
+            }
         }
     }
 
@@ -2370,10 +2408,10 @@ impl SubstrateAdapter for Substrate {
         &self,
         pod_names: &[PodName],
     ) -> HashMap<PodName, ObservedPodIdentity> {
-        match self {
-            Self::Direct(substrate) => substrate.observe_pod_identities(pod_names).await,
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.observe_pod_identities(pod_names).await,
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => substrate.observe_pod_identities(pod_names).await,
+            Inner::Kubernetes(substrate) => substrate.observe_pod_identities(pod_names).await,
         }
     }
 
@@ -2382,14 +2420,14 @@ impl SubstrateAdapter for Substrate {
         sandbox_id: SandboxId,
         target: &NodeApiTarget<'_>,
     ) -> Result<(), SubstrateError> {
-        match self {
-            Self::Direct(substrate) => {
+        match &self.inner {
+            Inner::Direct(substrate) => {
                 substrate
                     .delete_observed_execution(sandbox_id, target)
                     .await
             }
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => {
+            Inner::Kubernetes(substrate) => {
                 substrate
                     .delete_observed_execution(sandbox_id, target)
                     .await
@@ -2404,14 +2442,14 @@ impl SubstrateAdapter for Substrate {
         options: ActivationOptions,
         charge: RecoveryCharge,
     ) -> Result<ExecutionActivation, SubstrateError> {
-        match self {
-            Self::Direct(substrate) => {
+        match &self.inner {
+            Inner::Direct(substrate) => {
                 substrate
                     .start_execution(metric_identity, sandbox_id, options, charge)
                     .await
             }
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => {
+            Inner::Kubernetes(substrate) => {
                 substrate
                     .start_execution(metric_identity, sandbox_id, options, charge)
                     .await
@@ -2426,14 +2464,14 @@ impl SubstrateAdapter for Substrate {
         options: ActivationOptions,
         charge: RecoveryCharge,
     ) -> Result<ActivationCompletion, SubstrateError> {
-        match self {
-            Self::Direct(substrate) => {
+        match &self.inner {
+            Inner::Direct(substrate) => {
                 substrate
                     .restore_execution(metric_identity, sandbox_id, options, charge)
                     .await
             }
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => {
+            Inner::Kubernetes(substrate) => {
                 substrate
                     .restore_execution(metric_identity, sandbox_id, options, charge)
                     .await
@@ -2446,14 +2484,14 @@ impl SubstrateAdapter for Substrate {
         sandbox_id: SandboxId,
         budget: Duration,
     ) -> Result<ExecutionRoutabilityCheck, SubstrateError> {
-        match self {
-            Self::Direct(substrate) => {
+        match &self.inner {
+            Inner::Direct(substrate) => {
                 substrate
                     .ensure_routable_execution(sandbox_id, budget)
                     .await
             }
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => {
+            Inner::Kubernetes(substrate) => {
                 substrate
                     .ensure_routable_execution(sandbox_id, budget)
                     .await
@@ -2465,10 +2503,10 @@ impl SubstrateAdapter for Substrate {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Option<PublishedLocalArtifact>, SubstrateError> {
-        match self {
-            Self::Direct(substrate) => substrate.suspend_execution(sandbox_id).await,
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.suspend_execution(sandbox_id).await,
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => substrate.suspend_execution_tracked(sandbox_id).await,
+            Inner::Kubernetes(substrate) => substrate.suspend_execution_tracked(sandbox_id).await,
         }
     }
 
@@ -2479,14 +2517,14 @@ impl SubstrateAdapter for Substrate {
         source: BackupSource,
         target: &NodeApiTarget<'_>,
     ) -> Result<EnqueuedArtifactBackup, SubstrateError> {
-        match self {
-            Self::Direct(substrate) => {
+        match &self.inner {
+            Inner::Direct(substrate) => {
                 substrate
                     .enqueue_artifact_backup(sandbox_id, expected_kind, source, target)
                     .await
             }
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => {
+            Inner::Kubernetes(substrate) => {
                 substrate
                     .enqueue_artifact_backup(sandbox_id, expected_kind, source, target)
                     .await
@@ -2503,8 +2541,8 @@ impl SubstrateAdapter for Substrate {
         source_storage_uri: String,
         destination_storage_uri: String,
     ) -> Result<PublishedDurableSnapshot, SubstrateError> {
-        match self {
-            Self::Direct(substrate) => {
+        match &self.inner {
+            Inner::Direct(substrate) => {
                 SubstrateAdapter::create_snapshot_from_durable_artifact(
                     substrate.as_ref(),
                     target,
@@ -2517,7 +2555,7 @@ impl SubstrateAdapter for Substrate {
                 .await
             }
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => {
+            Inner::Kubernetes(substrate) => {
                 SubstrateAdapter::create_snapshot_from_durable_artifact(
                     substrate.as_ref(),
                     target,
@@ -2540,14 +2578,14 @@ impl SubstrateAdapter for Substrate {
         wake_activity: Option<ExecutionActivityKind>,
         charge: RecoveryCharge,
     ) -> Result<ExecutionActivation, SubstrateError> {
-        match self {
-            Self::Direct(substrate) => {
+        match &self.inner {
+            Inner::Direct(substrate) => {
                 substrate
                     .wake_execution(metric_identity, sandbox, timeout, wake_activity, charge)
                     .await
             }
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => {
+            Inner::Kubernetes(substrate) => {
                 substrate
                     .wake_execution(metric_identity, sandbox, timeout, wake_activity, charge)
                     .await
@@ -2560,10 +2598,10 @@ impl SubstrateAdapter for Substrate {
         sandbox_id: SandboxId,
         charge: RecoveryCharge,
     ) -> Result<RuntimeClient, ControllerError> {
-        match self {
-            Self::Direct(substrate) => substrate.runtime_client(sandbox_id, charge).await,
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.runtime_client(sandbox_id, charge).await,
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => substrate.runtime_client(sandbox_id, charge).await,
+            Inner::Kubernetes(substrate) => substrate.runtime_client(sandbox_id, charge).await,
         }
     }
 
@@ -2571,10 +2609,10 @@ impl SubstrateAdapter for Substrate {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Option<RuntimeClient>, ControllerError> {
-        match self {
-            Self::Direct(substrate) => substrate.reachable_runtime_client(sandbox_id).await,
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.reachable_runtime_client(sandbox_id).await,
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => substrate.reachable_runtime_client(sandbox_id).await,
+            Inner::Kubernetes(substrate) => substrate.reachable_runtime_client(sandbox_id).await,
         }
     }
 
@@ -2582,10 +2620,10 @@ impl SubstrateAdapter for Substrate {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Option<RuntimeClient>, ControllerError> {
-        match self {
-            Self::Direct(substrate) => substrate.probe_runtime_client(sandbox_id).await,
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.probe_runtime_client(sandbox_id).await,
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => substrate.probe_runtime_client(sandbox_id).await,
+            Inner::Kubernetes(substrate) => substrate.probe_runtime_client(sandbox_id).await,
         }
     }
 
@@ -2597,14 +2635,14 @@ impl SubstrateAdapter for Substrate {
         timeout: Duration,
         charge: RecoveryCharge,
     ) -> Result<RuntimeClient, ControllerError> {
-        match self {
-            Self::Direct(substrate) => {
+        match &self.inner {
+            Inner::Direct(substrate) => {
                 substrate
                     .access_runtime_client(metric_identity, sandbox, activity, timeout, charge)
                     .await
             }
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => {
+            Inner::Kubernetes(substrate) => {
                 substrate
                     .access_runtime_client(metric_identity, sandbox, activity, timeout, charge)
                     .await
@@ -2613,10 +2651,10 @@ impl SubstrateAdapter for Substrate {
     }
 
     async fn sandbox_ip(&self, sandbox_id: SandboxId) -> Result<Option<String>, ControllerError> {
-        match self {
-            Self::Direct(substrate) => substrate.sandbox_ip(sandbox_id).await,
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.sandbox_ip(sandbox_id).await,
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => substrate.sandbox_ip(sandbox_id).await,
+            Inner::Kubernetes(substrate) => substrate.sandbox_ip(sandbox_id).await,
         }
     }
 
@@ -2627,14 +2665,14 @@ impl SubstrateAdapter for Substrate {
         timeout: Duration,
         charge: RecoveryCharge,
     ) -> Result<Option<String>, ControllerError> {
-        match self {
-            Self::Direct(substrate) => {
+        match &self.inner {
+            Inner::Direct(substrate) => {
                 substrate
                     .access_sandbox_ip(metric_identity, sandbox, timeout, charge)
                     .await
             }
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => {
+            Inner::Kubernetes(substrate) => {
                 substrate
                     .access_sandbox_ip(metric_identity, sandbox, timeout, charge)
                     .await
@@ -2643,10 +2681,10 @@ impl SubstrateAdapter for Substrate {
     }
 
     async fn builder_client(&self) -> Result<BuilderClient, ControllerError> {
-        match self {
-            Self::Direct(substrate) => substrate.builder_client().await,
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.builder_client().await,
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => substrate.builder_client().await,
+            Inner::Kubernetes(substrate) => substrate.builder_client().await,
         }
     }
 
@@ -2654,10 +2692,10 @@ impl SubstrateAdapter for Substrate {
         &self,
         node_id: NodeId,
     ) -> Result<BuilderClient, ControllerError> {
-        match self {
-            Self::Direct(substrate) => substrate.builder_client_for_node(node_id).await,
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.builder_client_for_node(node_id).await,
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => substrate.builder_client_for_node(node_id).await,
+            Inner::Kubernetes(substrate) => substrate.builder_client_for_node(node_id).await,
         }
     }
 
@@ -2670,8 +2708,8 @@ impl SubstrateAdapter for Substrate {
         file_changes_enabled: bool,
         implicit_wake_enabled: bool,
     ) -> bool {
-        match self {
-            Self::Direct(substrate) => substrate.pool_eligible_for_request(
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.pool_eligible_for_request(
                 boot_mode,
                 backend,
                 wait_until_ready,
@@ -2680,7 +2718,7 @@ impl SubstrateAdapter for Substrate {
                 implicit_wake_enabled,
             ),
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => substrate.pool_eligible_for_request(
+            Inner::Kubernetes(substrate) => substrate.pool_eligible_for_request(
                 boot_mode,
                 backend,
                 wait_until_ready,
@@ -2692,10 +2730,10 @@ impl SubstrateAdapter for Substrate {
     }
 
     fn pool_supports_request_env(&self) -> bool {
-        match self {
-            Self::Direct(substrate) => substrate.pool_supports_request_env(),
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.pool_supports_request_env(),
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => substrate.pool_supports_request_env(),
+            Inner::Kubernetes(substrate) => substrate.pool_supports_request_env(),
         }
     }
 
@@ -2703,10 +2741,10 @@ impl SubstrateAdapter for Substrate {
         &self,
         request: &PooledExecutionClaimRequest<'_>,
     ) -> Result<PooledExecutionClaimAttempt, ControllerError> {
-        match self {
-            Self::Direct(substrate) => substrate.claim_pooled_execution(request).await,
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.claim_pooled_execution(request).await,
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => substrate.claim_pooled_execution(request).await,
+            Inner::Kubernetes(substrate) => substrate.claim_pooled_execution(request).await,
         }
     }
 
@@ -2716,14 +2754,14 @@ impl SubstrateAdapter for Substrate {
         admitted: AdmittedPoolClaim,
         sandbox_id: SandboxId,
     ) -> Result<AdmittedPoolClaimLookup, ControllerError> {
-        match self {
-            Self::Direct(substrate) => {
+        match &self.inner {
+            Inner::Direct(substrate) => {
                 substrate
                     .lookup_admitted_pooled_execution(request, admitted, sandbox_id)
                     .await
             }
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => {
+            Inner::Kubernetes(substrate) => {
                 substrate
                     .lookup_admitted_pooled_execution(request, admitted, sandbox_id)
                     .await
@@ -2735,10 +2773,10 @@ impl SubstrateAdapter for Substrate {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<(), ControllerError> {
-        match self {
-            Self::Direct(substrate) => substrate.skip_admitted_pool_generation(sandbox_id).await,
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.skip_admitted_pool_generation(sandbox_id).await,
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => {
+            Inner::Kubernetes(substrate) => {
                 substrate.skip_admitted_pool_generation(sandbox_id).await
             }
         }
@@ -2748,10 +2786,10 @@ impl SubstrateAdapter for Substrate {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<bool, ControllerError> {
-        match self {
-            Self::Direct(substrate) => substrate.admitted_pool_cleanup_pending(sandbox_id).await,
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.admitted_pool_cleanup_pending(sandbox_id).await,
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => {
+            Inner::Kubernetes(substrate) => {
                 substrate.admitted_pool_cleanup_pending(sandbox_id).await
             }
         }
@@ -2762,14 +2800,14 @@ impl SubstrateAdapter for Substrate {
         tx: &mut Transaction<'_, Postgres>,
         template_release_id: Uuid,
     ) -> Result<Option<AdmissionPoolClaim>, ControllerError> {
-        match self {
-            Self::Direct(substrate) => {
+        match &self.inner {
+            Inner::Direct(substrate) => {
                 substrate
                     .claim_admission_pool_slot(tx, template_release_id)
                     .await
             }
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => {
+            Inner::Kubernetes(substrate) => {
                 substrate
                     .claim_admission_pool_slot(tx, template_release_id)
                     .await
@@ -2783,14 +2821,14 @@ impl SubstrateAdapter for Substrate {
         request: &PooledExecutionClaimRequest<'_>,
         claim: &PooledExecutionClaim,
     ) -> Result<(), ControllerError> {
-        match self {
-            Self::Direct(substrate) => {
+        match &self.inner {
+            Inner::Direct(substrate) => {
                 substrate
                     .persist_pooled_execution_claim(tx, request, claim)
                     .await
             }
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => {
+            Inner::Kubernetes(substrate) => {
                 substrate
                     .persist_pooled_execution_claim(tx, request, claim)
                     .await
@@ -2802,10 +2840,10 @@ impl SubstrateAdapter for Substrate {
         &self,
         claim: &PooledExecutionClaim,
     ) -> Result<(), ControllerError> {
-        match self {
-            Self::Direct(substrate) => substrate.rollback_pooled_execution_claim(claim).await,
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.rollback_pooled_execution_claim(claim).await,
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => substrate.rollback_pooled_execution_claim(claim).await,
+            Inner::Kubernetes(substrate) => substrate.rollback_pooled_execution_claim(claim).await,
         }
     }
 
@@ -2813,10 +2851,10 @@ impl SubstrateAdapter for Substrate {
         &self,
         claim: &PooledExecutionClaim,
     ) -> Result<PooledPrepareFailureCleanup, ControllerError> {
-        match self {
-            Self::Direct(substrate) => substrate.cleanup_failed_pooled_prepare(claim).await,
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.cleanup_failed_pooled_prepare(claim).await,
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => substrate.cleanup_failed_pooled_prepare(claim).await,
+            Inner::Kubernetes(substrate) => substrate.cleanup_failed_pooled_prepare(claim).await,
         }
     }
 
@@ -2825,14 +2863,14 @@ impl SubstrateAdapter for Substrate {
         claim: &PooledExecutionClaim,
         policy: &AutoLifecyclePolicy,
     ) -> Result<(), ControllerError> {
-        match self {
-            Self::Direct(substrate) => {
+        match &self.inner {
+            Inner::Direct(substrate) => {
                 substrate
                     .apply_pooled_execution_auto_lifecycle(claim, policy)
                     .await
             }
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => {
+            Inner::Kubernetes(substrate) => {
                 substrate
                     .apply_pooled_execution_auto_lifecycle(claim, policy)
                     .await
@@ -2849,8 +2887,8 @@ impl SubstrateAdapter for Substrate {
         wait_until_ready: bool,
         timeout: Duration,
     ) -> Result<(), ControllerError> {
-        match self {
-            Self::Direct(substrate) => {
+        match &self.inner {
+            Inner::Direct(substrate) => {
                 substrate
                     .prepare_pooled_execution(
                         metric_identity,
@@ -2863,7 +2901,7 @@ impl SubstrateAdapter for Substrate {
                     .await
             }
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => {
+            Inner::Kubernetes(substrate) => {
                 substrate
                     .prepare_pooled_execution(
                         metric_identity,
@@ -2879,10 +2917,10 @@ impl SubstrateAdapter for Substrate {
     }
 
     async fn list_pool_configs(&self) -> Result<Vec<ClusterPoolConfigResponse>, ControllerError> {
-        match self {
-            Self::Direct(substrate) => substrate.list_pool_configs().await,
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.list_pool_configs().await,
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => substrate.list_pool_configs().await,
+            Inner::Kubernetes(substrate) => substrate.list_pool_configs().await,
         }
     }
 
@@ -2890,10 +2928,10 @@ impl SubstrateAdapter for Substrate {
         &self,
         request: ClusterPoolConfigRequest,
     ) -> Result<ClusterPoolConfigResponse, ControllerError> {
-        match self {
-            Self::Direct(substrate) => substrate.upsert_pool_config(request).await,
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.upsert_pool_config(request).await,
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => substrate.upsert_pool_config(request).await,
+            Inner::Kubernetes(substrate) => substrate.upsert_pool_config(request).await,
         }
     }
 
@@ -2901,10 +2939,10 @@ impl SubstrateAdapter for Substrate {
         &self,
         id: Uuid,
     ) -> Result<ClusterPoolConfigResponse, ControllerError> {
-        match self {
-            Self::Direct(substrate) => substrate.disable_pool_config(id).await,
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.disable_pool_config(id).await,
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => substrate.disable_pool_config(id).await,
+            Inner::Kubernetes(substrate) => substrate.disable_pool_config(id).await,
         }
     }
 
@@ -2912,20 +2950,20 @@ impl SubstrateAdapter for Substrate {
         &self,
         target: &NodeApiTarget<'_>,
     ) -> Result<String, SubstrateError> {
-        match self {
-            Self::Direct(substrate) => substrate.resolve_node_api_endpoint(target).await,
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.resolve_node_api_endpoint(target).await,
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => substrate.resolve_node_api_endpoint(target).await,
+            Inner::Kubernetes(substrate) => substrate.resolve_node_api_endpoint(target).await,
         }
     }
 
     async fn select_ready_worker_node_api_target(
         &self,
     ) -> Result<OwnedNodeApiTarget, SubstrateError> {
-        match self {
-            Self::Direct(substrate) => substrate.select_ready_worker_node_api_target().await,
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.select_ready_worker_node_api_target().await,
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => substrate.select_ready_worker_node_api_target().await,
+            Inner::Kubernetes(substrate) => substrate.select_ready_worker_node_api_target().await,
         }
     }
 
@@ -2933,10 +2971,10 @@ impl SubstrateAdapter for Substrate {
         &self,
         role_filter: Option<&str>,
     ) -> Result<Option<Vec<NodeInventoryEntry>>, SubstrateError> {
-        match self {
-            Self::Direct(substrate) => substrate.list_inventory_nodes(role_filter).await,
+        match &self.inner {
+            Inner::Direct(substrate) => substrate.list_inventory_nodes(role_filter).await,
             #[cfg(feature = "kubernetes")]
-            Self::Kubernetes(substrate) => substrate.list_inventory_nodes(role_filter).await,
+            Inner::Kubernetes(substrate) => substrate.list_inventory_nodes(role_filter).await,
         }
     }
 }

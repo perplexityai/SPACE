@@ -34,15 +34,15 @@ async fn control_runtime_client_wakes_only_kubernetes_rows_after_an_unreachable_
             .expect("sandbox row");
 
         let captured_pod_creates = Arc::new(Mutex::new(Vec::new()));
-        let substrate = Substrate::Kubernetes(Box::new(substrate_with_store_and_client(
+        let substrate = Substrate::from_kubernetes(substrate_with_store_and_client(
             pool.clone(),
             mock_kubernetes_client(Arc::clone(&captured_pod_creates)),
-        )));
+        ));
         let admission = crate::cluster_admission::ClusterSandboxAdmission::with_config(
             // Direct is only a placeholder capacity source: it reports zero
             // eligible nodes, as a synced, empty Kubernetes node cache would.
-            Substrate::Direct(Box::new(
-                crate::controllers::substrate::direct::DirectSubstrate::new(pool.clone()),
+            Substrate::from_direct(crate::controllers::substrate::direct::DirectSubstrate::new(
+                pool.clone(),
             )),
             crate::cluster_admission::ClusterSandboxAdmissionConfig {
                 enabled: true,

@@ -127,6 +127,10 @@
 "crates/libs/internal/api/server/src/lib.rs" = 1
 "crates/libs/internal/api/server/src/published_state.rs" = 4
 "crates/libs/sandbox/store/src/lib.rs" = 2
+
+[pattern_ratchet.kubernetes_access]
+# Spawns the Kubernetes-only reconcilers from the bound `KubernetesSubstrate`.
+"crates/libs/cluster/controller/server/src/reconcilers.rs" = 1
 [pattern_ratchet.rootfs_copy]
 # Local nspawn and privileged builder copies are deferred; builders stay CoW.
 "crates/apps/local/node-mgr/svc/src/snapshot.rs" = 2

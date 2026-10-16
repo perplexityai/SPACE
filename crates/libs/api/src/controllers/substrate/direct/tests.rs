@@ -2751,7 +2751,7 @@ async fn direct_create_fixture() -> TestResult<Option<DirectCreateFixture>> {
     .fetch_one(&postgres.pool)
     .await?;
     let controller = crate::controllers::sandbox::SandboxController::new(
-        super::super::Substrate::Direct(Box::new(DirectSubstrate::new(postgres.pool.clone()))),
+        super::super::Substrate::from_direct(DirectSubstrate::new(postgres.pool.clone())),
     );
     Ok(Some(DirectCreateFixture {
         postgres,
@@ -2953,7 +2953,7 @@ async fn live_cpu_update_preserves_allocation_across_cold_restart() -> TestResul
     .execute(&fixture.pool)
     .await?;
     let controller = crate::controllers::sandbox::SandboxController::new(
-        super::super::Substrate::Direct(Box::new(DirectSubstrate::new(fixture.pool.clone()))),
+        super::super::Substrate::from_direct(DirectSubstrate::new(fixture.pool.clone())),
     );
     for quota in [2, 8] {
         let sandbox = crate::controllers::sandbox::fetch_sandbox(&fixture.pool, sandbox_id)

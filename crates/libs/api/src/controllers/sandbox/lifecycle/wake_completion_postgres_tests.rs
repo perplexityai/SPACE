@@ -60,14 +60,14 @@ async fn wake_completion_cas_outcome_for_every_prior_lifecycle() -> TestResult {
     // `wake_completion_outcome_maps_to_the_wake_response`; the Kubernetes
     // side, like the Restore arm, is observable only in the race.
     assert_eq!(
-        Substrate::Direct(Box::new(DirectSubstrate::new(pool.clone()))).capabilities(),
+        Substrate::from_direct(DirectSubstrate::new(pool.clone())).capabilities(),
         SubstrateCapabilities::DIRECT
     );
     #[cfg(feature = "kubernetes")]
     assert_eq!(
-        Substrate::Kubernetes(Box::new(
+        Substrate::from_kubernetes(
             crate::controllers::substrate::kubernetes::tests::substrate_with_store(pool.clone()),
-        ))
+        )
         .capabilities(),
         SubstrateCapabilities::KUBERNETES
     );
@@ -208,10 +208,8 @@ async fn wake_completion_redrive_on_kubernetes_hydrates_before_completing() -> T
                 kube_status(StatusCode::NOT_FOUND, "NotFound")
             }
         });
-        let substrate = Substrate::Kubernetes(Box::new(substrate_with_store_and_client(
-            pool.clone(),
-            client,
-        )));
+        let substrate =
+            Substrate::from_kubernetes(substrate_with_store_and_client(pool.clone(), client));
 
         // A zero budget makes exactly one attempt: read, routability check,
         // fenced CAS.

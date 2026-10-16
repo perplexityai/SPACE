@@ -11,7 +11,7 @@ async fn fixture() -> (RuntimeClient, Substrate) {
     pool.close().await;
     (
         RuntimeClient::new(channel),
-        Substrate::Direct(Box::new(DirectSubstrate::new(pool))),
+        Substrate::from_direct(DirectSubstrate::new(pool)),
     )
 }
 

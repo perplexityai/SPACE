@@ -52,9 +52,7 @@ fn age() -> PositiveDuration {
 fn direct_sink(pool: &PgPool) -> SubstrateSweepSink {
     SubstrateSweepSink::new(
         pool.clone(),
-        Arc::new(Substrate::Direct(Box::new(DirectSubstrate::new(
-            pool.clone(),
-        )))),
+        Arc::new(Substrate::from_direct(DirectSubstrate::new(pool.clone()))),
     )
 }
 

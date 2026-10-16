@@ -668,13 +668,13 @@ async fn node_drain_capability_matches_set_node_schedulability() {
         .connect_lazy("postgres://postgres@127.0.0.1:1/postgres")
         .expect("lazy pool should parse");
     #[cfg_attr(not(feature = "kubernetes"), allow(unused_mut))]
-    let mut substrates = vec![Substrate::Direct(Box::new(direct::DirectSubstrate::new(
+    let mut substrates = vec![Substrate::from_direct(direct::DirectSubstrate::new(
         pool.clone(),
-    )))];
+    ))];
     #[cfg(feature = "kubernetes")]
-    substrates.push(Substrate::Kubernetes(Box::new(
+    substrates.push(Substrate::from_kubernetes(
         kubernetes::tests::substrate_with_store(pool),
-    )));
+    ));
 
     for substrate in substrates {
         let result = substrate
@@ -711,7 +711,7 @@ async fn node_addressing_names_the_field_endpoint_resolution_reads() {
     let k8s_node_name = "node-a";
     #[cfg_attr(not(feature = "kubernetes"), allow(unused_mut))]
     let mut cases = vec![(
-        Substrate::Direct(Box::new(direct::DirectSubstrate::new(pool.clone()))),
+        Substrate::from_direct(direct::DirectSubstrate::new(pool.clone())),
         NodeManagedBy::Space,
         stored_endpoint.to_string(),
     )];
@@ -731,7 +731,7 @@ async fn node_addressing_names_the_field_endpoint_resolution_reads() {
         );
         let pod_endpoint = format!("192.0.2.20:{}", substrate.k8s.node_api_port);
         cases.push((
-            Substrate::Kubernetes(Box::new(substrate)),
+            Substrate::from_kubernetes(substrate),
             NodeManagedBy::Kubernetes,
             pod_endpoint,
         ));

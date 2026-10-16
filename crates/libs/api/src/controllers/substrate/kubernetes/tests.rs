@@ -3044,7 +3044,7 @@ mod kubernetes_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn substrate_enum_forwards_observed_delete_to_kubernetes_override() {
-        let substrate = Substrate::Kubernetes(Box::new(substrate_with_unreachable_store()));
+        let substrate = Substrate::from_kubernetes(substrate_with_unreachable_store());
         let target = NodeApiTarget {
             managed_by: SpaceNodeManagedBy::Kubernetes,
             role: SpaceNodeRole::Worker,
@@ -3090,13 +3090,13 @@ mod kubernetes_tests {
 
         let sim_worker = start_sim_worker().await?;
         let captured_pod_creates = Arc::new(Mutex::new(Vec::new()));
-        let controller = SandboxController::new(Substrate::Kubernetes(Box::new(
+        let controller = SandboxController::new(Substrate::from_kubernetes(
             substrate_with_store_client_and_proxy_port(
                 pool.clone(),
                 running_pod_kubernetes_client(Arc::clone(&captured_pod_creates), "127.0.0.1"),
                 sim_worker.port(),
             ),
-        )))
+        ))
         .with_route_ed25519_authority(Some(test_route_ed25519_authority()));
         let sandbox = fetch_sandbox(&pool, sandbox_id)
             .await?
@@ -5607,7 +5607,7 @@ mod kubernetes_tests {
         );
         publish_completed_restore(&pool, sandbox_id).await?;
         let (substrate, request_count) = substrate_with_failed_pod_creates(pool.clone());
-        let controller = SandboxController::new(Substrate::Kubernetes(Box::new(substrate)));
+        let controller = SandboxController::new(Substrate::from_kubernetes(substrate));
 
         // Hold the row lock so the joined follower pauses after observing the
         // owner's binding but before its controller completion write lands.
@@ -5817,7 +5817,7 @@ mod kubernetes_tests {
         let release_request = Arc::new(Semaphore::new(0));
         let captured_pod_creates = Arc::new(Mutex::new(Vec::new()));
         let sim_worker = start_sim_worker().await?;
-        let controller = SandboxController::new(Substrate::Kubernetes(Box::new(
+        let controller = SandboxController::new(Substrate::from_kubernetes(
             substrate_with_store_client_and_proxy_port(
                 pool.clone(),
                 blocking_running_pod_kubernetes_client(
@@ -5828,7 +5828,7 @@ mod kubernetes_tests {
                 ),
                 sim_worker.port(),
             ),
-        )));
+        ));
 
         // Act: once Restore has claimed ownership and reached Pod creation,
         // queue Delete behind the materialization fence, then let it retire
@@ -5938,9 +5938,9 @@ mod kubernetes_tests {
         crate::cluster_admission::ClusterSandboxAdmission::with_config(
             // Direct is only a placeholder capacity source: it reports zero eligible nodes,
             // as a synced, empty Kubernetes node cache would.
-            crate::controllers::substrate::Substrate::Direct(Box::new(
+            crate::controllers::substrate::Substrate::from_direct(
                 crate::controllers::substrate::direct::DirectSubstrate::new(pool.clone()),
-            )),
+            ),
             crate::cluster_admission::ClusterSandboxAdmissionConfig {
                 enabled: true,
                 refill_rps: 1.0,
@@ -5967,10 +5967,10 @@ mod kubernetes_tests {
             .execute(&pool)
             .await?;
         let captured_pod_creates = Arc::new(Mutex::new(Vec::new()));
-        let substrate = Substrate::Kubernetes(Box::new(substrate_with_store_and_client(
+        let substrate = Substrate::from_kubernetes(substrate_with_store_and_client(
             pool.clone(),
             mock_kubernetes_client(Arc::clone(&captured_pod_creates)),
-        )));
+        ));
         let controller =
             SandboxController::with_cluster_admission(substrate, rejecting_admission(&pool));
 
@@ -6010,10 +6010,10 @@ mod kubernetes_tests {
             .await?
             .expect("inserted sandbox must be visible");
         let captured_pod_creates = Arc::new(Mutex::new(Vec::new()));
-        let substrate = Substrate::Kubernetes(Box::new(substrate_with_store_and_client(
+        let substrate = Substrate::from_kubernetes(substrate_with_store_and_client(
             pool.clone(),
             mock_kubernetes_client(Arc::clone(&captured_pod_creates)),
-        )));
+        ));
         let controller =
             SandboxController::with_cluster_admission(substrate, rejecting_admission(&pool));
 
@@ -6067,14 +6067,14 @@ mod kubernetes_tests {
         let request_count = Arc::new(AtomicUsize::new(0));
         let request_started = Arc::new(Semaphore::new(0));
         let release_request = Arc::new(Semaphore::new(0));
-        let substrate = Substrate::Kubernetes(Box::new(substrate_with_store_and_client(
+        let substrate = Substrate::from_kubernetes(substrate_with_store_and_client(
             pool.clone(),
             blocking_failed_pod_create_kubernetes_client(
                 Arc::clone(&request_count),
                 Arc::clone(&request_started),
                 Arc::clone(&release_request),
             ),
-        )));
+        ));
         let controller = SandboxController::with_cluster_admission(substrate, admission);
 
         // Act.
@@ -6132,14 +6132,14 @@ mod kubernetes_tests {
         let request_count = Arc::new(AtomicUsize::new(0));
         let request_started = Arc::new(Semaphore::new(0));
         let release_request = Arc::new(Semaphore::new(0));
-        let substrate = Substrate::Kubernetes(Box::new(substrate_with_store_and_client(
+        let substrate = Substrate::from_kubernetes(substrate_with_store_and_client(
             pool.clone(),
             blocking_failed_pod_create_kubernetes_client(
                 Arc::clone(&request_count),
                 Arc::clone(&request_started),
                 Arc::clone(&release_request),
             ),
-        )));
+        ));
         let controller =
             SandboxController::with_cluster_admission(substrate, rejecting_admission(&pool));
 
@@ -6196,14 +6196,14 @@ mod kubernetes_tests {
         let request_count = Arc::new(AtomicUsize::new(0));
         let request_started = Arc::new(Semaphore::new(0));
         let release_request = Arc::new(Semaphore::new(0));
-        let substrate = Substrate::Kubernetes(Box::new(substrate_with_store_and_client(
+        let substrate = Substrate::from_kubernetes(substrate_with_store_and_client(
             pool.clone(),
             blocking_failed_pod_create_kubernetes_client(
                 Arc::clone(&request_count),
                 Arc::clone(&request_started),
                 Arc::clone(&release_request),
             ),
-        )));
+        ));
         let controller =
             SandboxController::with_cluster_admission(substrate, rejecting_admission(&pool));
 
@@ -6770,13 +6770,13 @@ mod kubernetes_tests {
 
         let sim_worker = start_sim_worker().await?;
         let captured_pod_creates = Arc::new(Mutex::new(Vec::new()));
-        let controller = SandboxController::new(Substrate::Kubernetes(Box::new(
+        let controller = SandboxController::new(Substrate::from_kubernetes(
             substrate_with_store_client_and_proxy_port(
                 pool.clone(),
                 running_pod_kubernetes_client(Arc::clone(&captured_pod_creates), "127.0.0.1"),
                 sim_worker.port(),
             ),
-        )));
+        ));
         let sandbox = fetch_sandbox(&pool, sandbox_id)
             .await?
             .expect("inserted sandbox must be visible");
@@ -9412,9 +9412,9 @@ mod kubernetes_tests {
             crate::cluster_admission::ClusterSandboxAdmission::with_config(
                 // Direct is only a placeholder capacity source: it reports zero eligible nodes,
                 // as a synced, empty Kubernetes node cache would.
-                Substrate::Direct(Box::new(
+                Substrate::from_direct(
                     crate::controllers::substrate::direct::DirectSubstrate::new(pool),
-                )),
+                ),
                 crate::cluster_admission::ClusterSandboxAdmissionConfig {
                     enabled: true,
                     refill_rps: 6.0,
@@ -9476,9 +9476,9 @@ mod kubernetes_tests {
             crate::cluster_admission::ClusterSandboxAdmission::with_config(
                 // Direct is only a placeholder capacity source: it reports zero eligible nodes,
                 // as a synced, empty Kubernetes node cache would.
-                Substrate::Direct(Box::new(
+                Substrate::from_direct(
                     crate::controllers::substrate::direct::DirectSubstrate::new(pool.clone()),
-                )),
+                ),
                 crate::cluster_admission::ClusterSandboxAdmissionConfig {
                     enabled: true,
                     refill_rps: 6.0,
@@ -9554,9 +9554,9 @@ mod kubernetes_tests {
                 // Direct is only a placeholder capacity source: its empty nodes inventory reports
                 // zero eligible nodes, as a synced, empty Kubernetes node cache would, so admission
                 // rejects with EmptyCluster (no Redis needed).
-                Substrate::Direct(Box::new(
+                Substrate::from_direct(
                     crate::controllers::substrate::direct::DirectSubstrate::new(pool.clone()),
-                )),
+                ),
                 crate::cluster_admission::ClusterSandboxAdmissionConfig {
                     enabled: true,
                     refill_rps: 6.0,
@@ -9613,17 +9613,17 @@ mod kubernetes_tests {
         insert_test_sandbox_row(&pool, sandbox_id, "started").await?;
 
         let captured_pod_creates = Arc::new(Mutex::new(Vec::new()));
-        let substrate = Substrate::Kubernetes(Box::new(substrate_with_store_and_client(
+        let substrate = Substrate::from_kubernetes(substrate_with_store_and_client(
             pool.clone(),
             mock_kubernetes_client(Arc::clone(&captured_pod_creates)),
-        )));
+        ));
         let admission = std::sync::Arc::new(
             crate::cluster_admission::ClusterSandboxAdmission::with_config(
                 // Direct is only a placeholder capacity source: it reports zero eligible nodes,
                 // as a synced, empty Kubernetes node cache would.
-                Substrate::Direct(Box::new(
+                Substrate::from_direct(
                     crate::controllers::substrate::direct::DirectSubstrate::new(pool.clone()),
-                )),
+                ),
                 crate::cluster_admission::ClusterSandboxAdmissionConfig {
                     enabled: true,
                     refill_rps: 6.0,
@@ -9677,15 +9677,15 @@ mod kubernetes_tests {
         insert_test_sandbox_row(&pool, sandbox_id, "started").await?;
 
         let captured_pod_creates = Arc::new(Mutex::new(Vec::new()));
-        let substrate = Substrate::Kubernetes(Box::new(substrate_with_store_and_client(
+        let substrate = Substrate::from_kubernetes(substrate_with_store_and_client(
             pool.clone(),
             mock_kubernetes_client(Arc::clone(&captured_pod_creates)),
-        )));
+        ));
         let admission = crate::cluster_admission::ClusterSandboxAdmission::with_config(
             // Direct is only a placeholder capacity source: it reports zero eligible nodes,
             // as a synced, empty Kubernetes node cache would.
-            Substrate::Direct(Box::new(
-                crate::controllers::substrate::direct::DirectSubstrate::new(pool.clone()),
+            Substrate::from_direct(crate::controllers::substrate::direct::DirectSubstrate::new(
+                pool.clone(),
             )),
             crate::cluster_admission::ClusterSandboxAdmissionConfig {
                 enabled: true,

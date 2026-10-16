@@ -341,7 +341,7 @@ async fn build_kubernetes_app_state_fixture(
             worker.port(),
             initial_pod,
         );
-    let substrate = crate::controllers::substrate::Substrate::Kubernetes(Box::new(kubernetes));
+    let substrate = crate::controllers::substrate::Substrate::from_kubernetes(kubernetes);
     let mut state = AppState::from_pool(pool.clone()).await?;
     configure_test_ecw_credential_keyring(&mut state);
     state.sandbox_controller =
@@ -385,7 +385,7 @@ async fn missing_recovery_app_state_fixture() -> TestResult<MissingRecoveryAppSt
                 &pod_creates,
             )),
         );
-    let substrate = crate::controllers::substrate::Substrate::Kubernetes(Box::new(kubernetes));
+    let substrate = crate::controllers::substrate::Substrate::from_kubernetes(kubernetes);
     let mut state = AppState::from_pool(pool.clone()).await?;
     state.sandbox_controller =
         crate::controllers::sandbox::SandboxController::new(substrate.clone());
@@ -4020,7 +4020,7 @@ async fn connect_route_recovers_interrupted_source_pin_after_flag_rollback() -> 
     );
     let mut state = fixture.state.clone();
     state.sandbox_controller = crate::controllers::sandbox::SandboxController::new(
-        crate::controllers::substrate::Substrate::Kubernetes(Box::new(kubernetes)),
+        crate::controllers::substrate::Substrate::from_kubernetes(kubernetes),
     );
     let org = fetch_local_org(&fixture.pool).await?;
     let app = e2b_api_routes()

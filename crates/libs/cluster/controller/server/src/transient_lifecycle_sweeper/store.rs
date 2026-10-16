@@ -1,4 +1,4 @@
-//! Production [`SweepSink`] backed by Postgres and the `Substrate` enum.
+//! Production [`SweepSink`] backed by Postgres and the substrate.
 
 use pplx_space_common_core::sql;
 use std::collections::HashMap;

@@ -67,9 +67,9 @@ async fn kubernetes_state(pool: &PgPool) -> TestResult<AppState> {
     )
     .build();
     let mut state = AppState::from_pool(pool.clone()).await?;
-    state.sandbox_controller = SandboxController::new(Substrate::Kubernetes(Box::new(
+    state.sandbox_controller = SandboxController::new(Substrate::from_kubernetes(
         substrate_with_store_and_client(pool.clone(), client),
-    )));
+    ));
     Ok(state)
 }
 

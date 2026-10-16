@@ -47,6 +47,57 @@ mode = "advisory"
 [rules.pattern_ratchet.direct_tables.stale_entries]     # entries with fewer matches, none, or gone
 mode = "advisory"
 
+# Shared code reaches Kubernetes-only state through `Substrate::as_kubernetes()`,
+# binding and using the payload. A presence test on it, in any form, only asks
+# which substrate is running, which belongs in a `SubstrateCapabilities` field
+# (crates/libs/api/src/controllers/substrate/AGENTS.md). A line matcher cannot
+# tell the two apart, so every call outside the substrate module counts, and a
+# new caller needs a reviewed baseline entry.
+[rules.pattern_ratchet.kubernetes_access]
+patterns = ['\bas_kubernetes\s*\(']
+allow = ["crates/libs/api/src/controllers/substrate/**"]
+
+[rules.pattern_ratchet.kubernetes_access.no_crossing]
+mode = "required"
+
+[rules.pattern_ratchet.kubernetes_access.no_new_entries]
+mode = "advisory"
+
+[rules.pattern_ratchet.kubernetes_access.no_raised_caps]
+mode = "advisory"
+
+[rules.pattern_ratchet.kubernetes_access.listed_no_growth]
+mode = "required"
+
+[rules.pattern_ratchet.kubernetes_access.stale_entries]
+mode = "required"
+
+# `SubstrateCapabilities` derives `PartialEq` and its per-substrate consts are
+# public, so comparing `capabilities()` with one of them is another way to ask
+# which substrate is running. Only the two substrates' `capabilities()` name
+# them in production code; tests are outside the inventory.
+[rules.pattern_ratchet.capability_identity]
+patterns = ['\bSubstrateCapabilities\s*::\s*(?:DIRECT|KUBERNETES)\b']
+allow = [
+  "crates/libs/api/src/controllers/substrate/direct.rs",
+  "crates/libs/api/src/controllers/substrate/kubernetes/adapter/substrate_adapter.rs",
+]
+
+[rules.pattern_ratchet.capability_identity.no_crossing]
+mode = "required"
+
+[rules.pattern_ratchet.capability_identity.no_new_entries]
+mode = "advisory"
+
+[rules.pattern_ratchet.capability_identity.no_raised_caps]
+mode = "advisory"
+
+[rules.pattern_ratchet.capability_identity.listed_no_growth]
+mode = "required"
+
+[rules.pattern_ratchet.capability_identity.stale_entries]
+mode = "required"
+
 # Rootfs copies must preserve NoCoW and sparse extents through common-io's
 # reflink helper. A line matcher cannot infer a path variable's contents, so
 # conservatively fence all new plain filesystem copies and cp launches.
