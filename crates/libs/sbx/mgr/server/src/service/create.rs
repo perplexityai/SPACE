@@ -756,9 +756,10 @@ impl SandboxManagerService {
                 },
             )
             .map_err(|error| {
-                Status::internal(format!(
-                    "failed to claim restoring state before restore prepare: {error}"
-                ))
+                super::start::begin_activation_status(
+                    error,
+                    "failed to claim restoring state before restore prepare",
+                )
             })?
         };
         let Some(cleanup_episode) = cleanup_episode else {

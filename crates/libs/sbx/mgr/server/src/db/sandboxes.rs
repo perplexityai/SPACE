@@ -1503,6 +1503,9 @@ pub(crate) fn delete_sandbox_if_inventory_witness_matches(
         ));
     }
     let execution_generation = current.space_api_route_identity.execution_generation;
+    // Record before the row delete: the receipt also fences a generation the
+    // row's rollback receipt retired. A lost witness drops the transaction.
+    record_execution_delete_receipt(&tx, &observed.id, execution_generation)?;
     delete_sandbox_child_rows(&tx, &observed.id)?;
     let deleted = tx
         .execute("DELETE FROM sandboxes WHERE id = ?1", params![&observed.id])
@@ -1510,7 +1513,6 @@ pub(crate) fn delete_sandbox_if_inventory_witness_matches(
     if deleted != 1 {
         return Ok(InventoryStaleRowMutation::WitnessChanged);
     }
-    record_execution_delete_receipt(&tx, &observed.id, execution_generation)?;
     tx.commit()?;
     Ok(InventoryStaleRowMutation::Removed)
 }

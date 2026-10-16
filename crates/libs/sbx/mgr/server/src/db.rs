@@ -387,7 +387,25 @@ fn record_execution_delete_receipt(
     sandbox_id: &str,
     execution_generation: Option<ExecutionGeneration>,
 ) -> Result<()> {
-    let Some(execution_generation) = execution_generation else {
+    // A completed activation rollback retires a newer generation than the
+    // row's route identity may name. Fence that generation too, so a late
+    // retry of the rolled-back attempt cannot revive it after the row (and
+    // its rollback receipt) is gone, for example after local eviction.
+    let rolled_back_generation = conn
+        .query_row(
+            "SELECT transition_receipt_execution_generation
+               FROM sandboxes
+              WHERE id = ?1 AND transition_receipt_kind = ?2",
+            params![
+                sandbox_id,
+                SandboxTransitionReceiptKind::ActivationRollback.as_str()
+            ],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()?
+        .flatten()
+        .and_then(|generation| ExecutionGeneration::new(generation).ok());
+    let Some(execution_generation) = execution_generation.max(rolled_back_generation) else {
         return Ok(());
     };
     let deleted_at = now_epoch_i64()?;
