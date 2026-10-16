@@ -572,6 +572,8 @@ def transform_item(text: str, kind: str, parent_path: list[str], deeper_dir: boo
     for m in REL_VIS.finditer(mt):
         if m.start() not in edited_rel:
             raise SystemExit("moved code has a nested pub(super)/pub(self) the tool cannot remap; edit by hand")
+    if re.search(r"\b(?:stringify|concat_idents)\s*!\s*\([^()]*\bsuper\b", mt):
+        raise SystemExit("moved code stringifies a `super` path; its text would change. Edit by hand.")
     if re.search(r"\bself\s*::\s*super\b", mt):
         raise SystemExit("`self::super` in moved code changes meaning one module deeper; edit by hand")
     for m in re.finditer(r"\bsuper\s*::", text):

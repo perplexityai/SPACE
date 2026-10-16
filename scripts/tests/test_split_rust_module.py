@@ -738,6 +738,7 @@ def test_split_crate_compiles_and_keeps_behavior(tmp_path):
     [
         ('#[derive(Default)]\nstruct D {\n    #[serde(default = "super::f")]\n    a: u8,\n}\n', "string literal"),
         ("fn f() {\n    self::super::g();\n}\n", "self::super"),
+        ('fn f() -> &\'static str {\n    stringify!(super::g)\n}\n', "stringifies"),
     ],
 )
 def test_paths_the_tool_cannot_rewrite_are_refused(repo, text, message):
