@@ -216,7 +216,7 @@ def test_verify_accepts_the_move_and_rejects_an_edit(repo):
     apply_and_commit(repo)
     ok = run("verify", "HEAD~1", cwd=repo)
     assert ok.returncode == 0, ok.stdout
-    assert "moved items: 9" in ok.stdout
+    assert "moved: 11   unmatched at base: 0   unmatched at head: 0" in ok.stdout
 
     config = repo / "crate/src/a/foo/config.rs"
     config.write_text(config.read_text().replace("        self.inner\n", "        self.inner + 1\n"))
@@ -276,3 +276,92 @@ def test_module_name_may_not_shadow_an_existing_module(repo):
     (repo / "spec.toml").write_text('file = "crate/src/a/foo.rs"\n[[module]]\nname = "existing"\nitems = ["fn stays"]\n')
     r = run("apply", "spec.toml", "--dry-run", cwd=repo)
     assert r.returncode != 0 and "collides" in r.stderr
+
+
+MEMBER_SPEC = textwrap.dedent(
+    """\
+    file = "crate/src/a/foo.rs"
+    [[module]]
+    name = "helpers"
+    doc = "Config helpers."
+    items = ["impl Config :: fn private_helper", "impl Config :: const LIMIT"]
+    """
+)
+
+
+def test_members_of_an_inherent_impl_move_into_their_own_impl_block(repo):
+    (repo / "spec.toml").write_text(MEMBER_SPEC)
+    apply_and_commit(repo)
+    parent = (repo / "crate/src/a/foo.rs").read_text()
+    helpers = (repo / "crate/src/a/foo/helpers.rs").read_text()
+    assert "impl Config {\n    pub fn new() -> Self {" in parent
+    assert "private_helper" not in parent and "LIMIT" not in parent
+    assert helpers == textwrap.dedent(
+        """\
+        //! Config helpers.
+
+        use super::*;
+
+        impl Config {
+            pub(super) fn private_helper(&self) -> u32 {
+                let s = "fn not_a_member() {}";
+                self.inner
+            }
+
+            pub(in crate::a) const LIMIT: u32 = 5;
+        }
+        """
+    )
+    # No re-export: an impl block has nothing to name.
+    assert "use helpers::*;" not in parent and "mod helpers;" in parent
+    ok = run("verify", "HEAD~1", cwd=repo)
+    assert ok.returncode == 0, ok.stdout
+
+
+def test_an_impl_split_across_modules_keeps_its_attributes_on_every_block(repo):
+    (repo / "crate/src/a/foo.rs").write_text(PARENT.replace(
+        "impl Config {", "/// Config methods.\n#[allow(dead_code)]\nimpl Config {"))
+    git(repo, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qam", "attrs")
+    (repo / "spec.toml").write_text(textwrap.dedent(
+        """\
+        file = "crate/src/a/foo.rs"
+        [[module]]
+        name = "one"
+        items = ["impl Config :: fn new"]
+        [[module]]
+        name = "two"
+        items = ["impl Config :: *"]
+        """
+    ).replace('"impl Config :: *"', '"impl Config :: fn private_helper", "impl Config :: const LIMIT"'))
+    apply_and_commit(repo)
+    one = (repo / "crate/src/a/foo/one.rs").read_text()
+    two = (repo / "crate/src/a/foo/two.rs").read_text()
+    parent = (repo / "crate/src/a/foo.rs").read_text()
+    assert "impl Config" not in parent.replace("impl fmt::Display for Config", "")
+    assert "/// Config methods.\n#[allow(dead_code)]\nimpl Config {" in one
+    assert "#[allow(dead_code)]\nimpl Config {" in two and "/// Config methods." not in two
+    assert run("verify", "HEAD~1", cwd=repo).returncode == 0
+
+
+def test_trait_impl_members_cannot_be_split(repo):
+    (repo / "spec.toml").write_text(
+        'file = "crate/src/a/foo.rs"\n[[module]]\nname = "m"\nitems = ["impl fmt::Display for Config :: fn fmt"]\n')
+    r = run("apply", "spec.toml", "--dry-run", cwd=repo)
+    assert r.returncode != 0 and "only inherent impls" in r.stderr
+
+
+def test_verify_rejects_a_member_edited_in_its_new_block(repo):
+    (repo / "spec.toml").write_text(MEMBER_SPEC)
+    apply_and_commit(repo)
+    helpers = repo / "crate/src/a/foo/helpers.rs"
+    helpers.write_text(helpers.read_text().replace("const LIMIT: u32 = 5;", "const LIMIT: u32 = 6;"))
+    git(repo, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qam", "edit")
+    bad = run("verify", "HEAD~2", cwd=repo)
+    assert bad.returncode == 1 and "LIMIT" in bad.stdout
+
+
+def test_a_file_loaded_through_a_path_attribute_is_refused(repo):
+    (repo / "crate/src/lib.rs").write_text('#[path = "a/foo.rs"]\nmod renamed;\n')
+    (repo / "spec.toml").write_text('file = "crate/src/a/foo.rs"\n[[module]]\nname = "m"\nitems = ["fn stays"]\n')
+    r = run("apply", "spec.toml", "--dry-run", cwd=repo)
+    assert r.returncode != 0 and "#[path]" in r.stderr

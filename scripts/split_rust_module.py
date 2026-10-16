@@ -37,7 +37,15 @@ Spec (TOML):
 
 Selectors are fnmatch patterns over `<kind> <name>`; impl blocks are
 `impl <header>` with whitespace collapsed (e.g. `impl<T> From<T> for Foo`).
+`impl <header> :: <kind> <name>` selects members of an inherent impl: they move into
+an impl block with the same attributes and header in the child, and the parent's
+block keeps the rest (or disappears when none are left). Trait impls move whole.
 Every pattern must match at least one item and every item at most one module.
+
+Refused, to be done by hand: moving `use`, `mod x;` or `macro_rules!` items (they
+stay in the parent, above the new `mod` lines, so children see the macros), relative
+`pub(in super::..)` visibility, `#[path]` inside moved items, and a parent file that
+is itself loaded through `#[path]`.
 """
 from __future__ import annotations
 
@@ -529,8 +537,124 @@ def observables(text: str) -> dict:
 
 # ------------------------------------------------------------------ apply
 
+@dataclass
+class Member:
+    kind: str
+    name: str
+    lead: int  # absolute line indices
+    start: int
+    end: int
+
+    @property
+    def selector(self) -> str:
+        return f"{self.kind} {self.name}"
+
+
+@dataclass
+class ImplLayout:
+    body_open: int  # line holding the impl's opening `{`
+    members: list[Member]
+    close: int  # line holding the closing `}`
+
+
+MEMBER_LINE_RE = re.compile(r"^\s+(?P<vis>" + VIS + r")" + QUAL + r"(?P<kind>fn|const|type)\b")
+MEMBER_MACRO_RE = re.compile(r"^\s+(?P<path>[A-Za-z_][A-Za-z0-9_:]*)\s*!")
+
+
+def is_inherent_header(mheader: str) -> bool:
+    header = re.sub(r"\bfor\s*<[^<>]*>", "", mheader)
+    while re.search(r"<[^<>]*>", header):
+        header = re.sub(r"<[^<>]*>", "", header)
+    return not re.search(r"\bfor\s+(?!<)", header)
+
+
+def impl_layout(lines: list[str], mlines: list[str], it: Item) -> ImplLayout | None:
+    """Members of an inherent impl item; None for a trait impl or a one-line impl."""
+    body_open, header = None, ""
+    for i in range(it.start, it.end + 1):
+        pos = mlines[i].find("{")
+        if pos >= 0:
+            header += mlines[i][:pos]
+            body_open = i
+            break
+        header += mlines[i] + "\n"
+    if body_open is None or not is_inherent_header(header):
+        return None
+    if body_open == it.end or not mlines[body_open].rstrip().endswith("{"):
+        return None
+    members: list[Member] = []
+    i, lead = body_open + 1, None
+    while i < it.end:
+        raw, m = lines[i], mlines[i]
+        s = raw.strip()
+        if s == "":
+            i += 1
+            continue
+        if m.strip() == "":
+            lead = i if lead is None else lead
+            i += 1
+            continue
+        if s.startswith("#["):
+            lead = i if lead is None else lead
+            d = line_depth_delta(m)
+            i += 1
+            while d > 0 and i < it.end:
+                d += line_depth_delta(mlines[i])
+                i += 1
+            continue
+        start, d = i, 0
+        while True:
+            d += line_depth_delta(mlines[i])
+            tail = mlines[i].rstrip()
+            if d == 0 and (tail.endswith("}") or tail.endswith(";")):
+                break
+            i += 1
+            if i >= it.end:
+                raise SystemExit(f"line {start + 1}: impl member never ends")
+        mm = MEMBER_LINE_RE.match(raw)
+        if mm:
+            nm = NAME_RE.match(raw[mm.end():])
+            kind, name = mm.group("kind"), (nm.group(1) if nm else "?")
+        else:
+            mc = MEMBER_MACRO_RE.match(raw)
+            if not mc:
+                raise SystemExit(f"line {start + 1}: cannot classify impl member: {raw.strip()[:80]!r}")
+            kind, name = "macro", mc.group("path")
+        members.append(Member(kind, name, lead if lead is not None else start, start, i))
+        lead = None
+        i += 1
+    return ImplLayout(body_open, members, it.end)
+
+
+def rewrite_super(text: str) -> str:
+    mt = mask(text)
+    for m in reversed(list(re.finditer(r"(?<![\w:])super(?=\s*::)", mt))):
+        text = text[:m.start()] + "super::" + text[m.start():]
+    return text
+
+
+def attr_lines(lines: list[str], lead: int, start: int) -> list[str]:
+    """The attribute lines (whole multi-line attributes) in an item's leading trivia."""
+    out, k = [], lead
+    mlines = mask("\n".join(lines[lead:start])).split("\n")
+    while k < start:
+        s = lines[k].strip()
+        if s.startswith("#["):
+            d = line_depth_delta(mlines[k - lead])
+            out.append(lines[k])
+            k += 1
+            while d > 0 and k < start:
+                d += line_depth_delta(mlines[k - lead])
+                out.append(lines[k])
+                k += 1
+            continue
+        k += 1
+    return out
+
+
 RANK = {"none": -1, "private": 0, "in": 1, "crate": 2, "pub": 3}
 TYPE_NS = {"struct", "enum", "union", "trait", "type", "mod", "mod-decl"}
+DEFS = {"struct", "enum", "union", "trait", "impl", "type", "const", "static", "macro"}
 
 
 def new_vis_rank(orig_vis: str, parent_path: list[str]) -> tuple[int, str]:
@@ -555,6 +679,33 @@ def strip_super(sel: str) -> str:
     return re.sub(r"\bsuper::", "", collapse(sel))
 
 
+def impl_block(lines: list[str], it: Item, lay: ImplLayout, mids: list[int], lead_lines: list[str],
+               child: bool, trailing: bool, parent_path: list[str], deeper: bool, counts: dict) -> str:
+    """An impl block holding the members `mids` (indices into lay.members), in order."""
+    header = "\n".join(lines[it.start:lay.body_open + 1])
+    out = list(lead_lines)
+    out.extend((rewrite_super(header) if child else header).split("\n"))
+    prev = None
+    for mi in mids:
+        m = lay.members[mi]
+        if prev is not None:
+            if prev == mi - 1:
+                out.extend(lines[lay.members[prev].end + 1:m.lead])
+            else:
+                out.append("")
+        text = "\n".join(lines[m.lead:m.end + 1])
+        if child:
+            text, c = transform_item(text, "macro" if m.kind == "macro" else "fn", parent_path, deeper)
+            for key, v in c.items():
+                counts[key] = counts.get(key, 0) + v
+        out.extend(text.split("\n"))
+        prev = mi
+    if trailing:
+        out.extend(lines[lay.members[-1].end + 1:lay.close])  # trailing comments in the body
+    out.append(lines[lay.close])
+    return "\n".join(out)
+
+
 def apply(spec_path: str, repo: str, dry: bool, report: str | None) -> int:
     spec = tomllib.load(open(spec_path, "rb"))
     rel = spec["file"]
@@ -562,21 +713,49 @@ def apply(spec_path: str, repo: str, dry: bool, report: str | None) -> int:
     src = open(path, encoding="utf-8").read()
     items, header_end = parse_items(src)
     lines = src.split("\n")
+    mlines = mask(src).split("\n")
     parent_path = module_path_of(rel)
     base = os.path.basename(rel)
     deeper = base not in ("lib.rs", "main.rs", "mod.rs")
     child_dir = os.path.join(os.path.dirname(path), base[:-3]) if deeper else os.path.dirname(path)
+    loaded_by_path = path_attribute_users(path)
+    if loaded_by_path:
+        raise SystemExit(f"{rel} is loaded through #[path] ({loaded_by_path}); its child modules would "
+                         "not resolve under the directory this tool writes. Remove the attribute first.")
     mods = spec["module"]
     names = [m["name"] for m in mods]
     if len(set(names)) != len(names):
         raise SystemExit("duplicate module names in spec")
+    layouts: dict[int, ImplLayout | None] = {}
+
+    def layout(k: int) -> ImplLayout | None:
+        if k not in layouts:
+            layouts[k] = impl_layout(lines, mlines, items[k]) if items[k].kind == "impl" else None
+        return layouts[k]
 
     assign: dict[int, str] = {}
+    massign: dict[tuple[int, int], str] = {}
     for mod in mods:
         name = mod["name"]
         if not re.fullmatch(r"[a-z][a-z0-9_]*", name):
             raise SystemExit(f"bad module name {name!r}")
         for pat in mod["items"]:
+            if " :: " in pat:
+                ipat, mpat = pat.split(" :: ", 1)
+                hits = []
+                for k, it in enumerate(items):
+                    if it.kind == "impl" and fnmatch.fnmatchcase(it.selector, ipat):
+                        lay = layout(k)
+                        if lay is None:
+                            raise SystemExit(f"{it.selector}: only inherent impls can be split by member")
+                        hits += [(k, mi) for mi, m in enumerate(lay.members) if fnmatch.fnmatchcase(m.selector, mpat)]
+                if not hits:
+                    raise SystemExit(f"module {name}: pattern {pat!r} matches no impl member")
+                for km in hits:
+                    if km in massign and massign[km] != name:
+                        raise SystemExit(f"{pat}: member matched by {massign[km]} and {name}")
+                    massign[km] = name
+                continue
             hits = [k for k, it in enumerate(items) if fnmatch.fnmatchcase(it.selector, pat)]
             if not hits:
                 raise SystemExit(f"module {name}: pattern {pat!r} matches no item")
@@ -589,43 +768,76 @@ def apply(spec_path: str, repo: str, dry: bool, report: str | None) -> int:
                 if k in assign and assign[k] != name:
                     raise SystemExit(f"{it.selector} matched by {assign[k]} and {name}")
                 assign[k] = name
+    split_impls = sorted({k for k, _ in massign})
+    for k in split_impls:
+        if k in assign:
+            raise SystemExit(f"{items[k].selector}: selected whole and by member")
     for it in items:
         if it.kind in TYPE_NS and it.name in names:
             raise SystemExit(f"module name {it.name!r} collides with {it.selector}")
 
+    # Where a split impl's doc comments go: with the members the parent keeps, else with the
+    # first module (in spec order) that receives members.
+    lead_owner: dict[int, str | None] = {}
+    for k in split_impls:
+        lay = layout(k)
+        kept = [mi for mi in range(len(lay.members)) if (k, mi) not in massign]
+        lead_owner[k] = None if kept else next(n for n in names if any(massign.get((k, mi)) == n
+                                                                         for mi in range(len(lay.members))))
+
     results = {}
     for mod in mods:
         name = mod["name"]
-        ks = [k for k in range(len(items)) if assign.get(k) == name]
-        if not ks:
+        chunks, counts, obs, best, sels = [], {}, {k: 0 for k in OBS}, (RANK["none"], ""), []
+        for k, it in enumerate(items):
+            if assign.get(k) == name:
+                text = "\n".join(lines[it.lead:it.end + 1]).lstrip("\n")
+                new, c = transform_item(text, it.kind, parent_path, deeper)
+                for key, v in c.items():
+                    counts[key] = counts.get(key, 0) + v
+                for key, v in observables(text).items():
+                    obs[key] += v
+                chunks.append(new)
+                sels.append(it.selector)
+                if it.kind == "macro":
+                    counts["macro_items"] = counts.get("macro_items", 0) + 1
+                    best = max(best, (RANK["private"], ""))
+                elif it.kind != "impl":
+                    best = max(best, new_vis_rank(it.vis, parent_path))
+            elif k in split_impls:
+                lay = layout(k)
+                mids = [mi for mi in range(len(lay.members)) if massign.get((k, mi)) == name]
+                if not mids:
+                    continue
+                lead_lines = (lines[it.lead:it.start] if lead_owner[k] == name
+                              else attr_lines(lines, it.lead, it.start))
+                while lead_lines and not lead_lines[0].strip():
+                    lead_lines = lead_lines[1:]
+                block = impl_block(lines, it, lay, mids, lead_lines, True, lead_owner[k] == name,
+                                   parent_path, deeper, counts)
+                for mi in mids:
+                    m = lay.members[mi]
+                    for key, v in observables("\n".join(lines[m.lead:m.end + 1])).items():
+                        obs[key] += v
+                counts["members"] = counts.get("members", 0) + len(mids)
+                chunks.append(block)
+                sels.append(it.selector)
+        if not chunks:
             raise SystemExit(f"module {name}: no items")
-        chunks, counts, obs, best = [], {}, {k: 0 for k in OBS}, (RANK["none"], "")
-        for k in ks:
-            it = items[k]
-            text = "\n".join(lines[it.lead:it.end + 1]).lstrip("\n")
-            new, c = transform_item(text, it.kind, parent_path, deeper)
-            for key, v in c.items():
-                counts[key] = counts.get(key, 0) + v
-            for key, v in observables(text).items():
-                obs[key] += v
-            chunks.append(new)
-            if it.kind == "macro":
-                counts["macro_items"] = counts.get("macro_items", 0) + 1
-                best = max(best, (RANK["private"], ""))
-            elif it.kind != "impl":
-                best = max(best, new_vis_rank(it.vis, parent_path))
         doc = mod.get("doc", "").strip()
         body = ""
         if doc:
             body += "".join(f"//! {d}\n" if d.strip() else "//!\n" for d in doc.split("\n")) + "\n"
         body += "use super::*;\n\n" + "\n\n".join(chunks) + "\n"
+        ks = [k for k in range(len(items)) if assign.get(k) == name or
+              (k in split_impls and any(massign.get((k, mi)) == name for mi in range(len(layout(k).members))))]
         cfgs = [set(items[k].cfg) for k in ks]
-        common_cfg = sorted(set.intersection(*cfgs))
+        common_cfg = sorted(set.intersection(*cfgs)) if cfgs else []
         reexport = mod.get("reexport", "auto")
         if best[0] == RANK["none"]:
             reexport = "none"  # only impl blocks: nothing to name
         use_vis = {RANK["pub"]: "pub ", RANK["crate"]: "pub(crate) ", RANK["in"]: best[1] + " "}.get(best[0], "")
-        results[name] = dict(items=[items[k].selector for k in ks], text=body, counts=counts, obs=obs,
+        results[name] = dict(items=sels, text=body, counts=counts, obs=obs,
                              cfg=common_cfg, use_vis=use_vis, reexport=reexport,
                              code=code_lines(body), path=os.path.join(child_dir, name + ".rs"))
 
@@ -643,17 +855,22 @@ def apply(spec_path: str, repo: str, dry: bool, report: str | None) -> int:
         uses.append(f"{gate}{r['use_vis']}use {mod['name']}::*;")
     decl_text = "\n".join(decls) + ("\n\n" + "\n".join(uses) if uses else "")
 
-    # parent remainder: kept items in order; keep original spacing between items
-    # that were adjacent, one blank line where moved items were removed.
-    keep = [k for k in range(len(items)) if k not in assign]
-    lead_end = -1
+    # parent remainder: kept items in order; keep original spacing between items that were
+    # adjacent, one blank line where moved items were removed.
+    keep = []
+    for k in range(len(items)):
+        if k in assign:
+            continue
+        if k in split_impls and lead_owner[k] is not None:
+            continue  # every member moved
+        keep.append(k)
+    first_def = next((k for k, it in enumerate(items) if it.kind in DEFS), len(items))
+    decl_after = -1
     for idx, k in enumerate(keep):
-        if items[k].kind in ("use", "extern crate", "mod-decl"):
-            lead_end = idx
-        else:
-            break
-    macro_last = max([idx for idx, k in enumerate(keep) if items[k].kind == "macro_rules!"], default=-1)
-    decl_after = max(lead_end, macro_last)
+        if k < first_def and items[k].kind in ("use", "extern crate", "mod-decl"):
+            decl_after = idx
+        if items[k].kind == "macro_rules!":
+            decl_after = max(decl_after, idx)
     out = lines[:header_end]
     while out and not out[-1].strip():
         out.pop()
@@ -672,7 +889,13 @@ def apply(spec_path: str, repo: str, dry: bool, report: str | None) -> int:
             out.extend(lines[items[prev].end + 1:it.lead])  # original gap (blank lines)
         else:
             sep()
-        out.extend(lines[it.lead:it.end + 1])
+        if k in split_impls:
+            lay = layout(k)
+            kept_m = [mi for mi in range(len(lay.members)) if (k, mi) not in massign]
+            out.extend(impl_block(lines, it, lay, kept_m, lines[it.lead:it.start], False, True,
+                                  parent_path, deeper, {}).split("\n"))
+        else:
+            out.extend(lines[it.lead:it.end + 1])
         if idx == decl_after:
             sep()
             out.extend(decl_text.split("\n"))
@@ -684,7 +907,7 @@ def apply(spec_path: str, repo: str, dry: bool, report: str | None) -> int:
         trailing.pop()
     if trailing:
         sep()
-        out.extend(t for t in trailing)
+        out.extend(trailing)
     parent_text = "\n".join(out).rstrip("\n") + "\n"
 
     # self-check: re-parse everything and compare item sequences
@@ -703,11 +926,13 @@ def apply(spec_path: str, repo: str, dry: bool, report: str | None) -> int:
         extra = set(got) - set(want)
         raise SystemExit(f"self-check failed for parent: missing {missing}, extra {extra}")
 
+    ratchets = ratchet_hits(repo, results)
     summary = {
         "file": rel,
         "parent_code_before": code_lines(src),
         "parent_code_after": code_lines(parent_text),
         "modules": {n: {k: v for k, v in r.items() if k != "text"} for n, r in results.items()},
+        "pattern_ratchet_lines_moved": ratchets,
         "kept": [items[k].selector for k in keep if items[k].kind not in ("use", "mod-decl")],
     }
     if not dry:
@@ -726,11 +951,43 @@ def apply(spec_path: str, repo: str, dry: bool, report: str | None) -> int:
     return 0
 
 
+def path_attribute_users(path: str) -> str:
+    """A `#[path = "..."]` in the crate that names this file, if any."""
+    crate_src = path.split(os.sep + "src" + os.sep, 1)[0] + os.sep + "src"
+    target = os.path.realpath(path)
+    for d, _, files in os.walk(crate_src):
+        for f in files:
+            if not f.endswith(".rs"):
+                continue
+            fp = os.path.join(d, f)
+            for m in re.finditer(r'#\s*\[\s*path\s*=\s*"([^"]+)"\s*\]', open(fp, encoding="utf-8").read()):
+                if os.path.realpath(os.path.join(d, m.group(1))) == target:
+                    return os.path.relpath(fp, crate_src)
+    return ""
+
+
+def ratchet_hits(repo: str, results: dict) -> dict:
+    """Lines matching an archcheck pattern_ratchet that a module would now hold. A ratchet
+    counts lines per file, so a moved match needs its baseline entry moved too."""
+    arch = os.path.join(repo, "ARCHITECTURE.toml")
+    if not os.path.exists(arch):
+        return {}
+    rules = tomllib.load(open(arch, "rb")).get("rules", {}).get("pattern_ratchet", {})
+    hits: dict = {}
+    for inst, cfg in rules.items():
+        pats = [re.compile(p) for p in cfg.get("patterns", [])]
+        for name, r in results.items():
+            n = sum(1 for ln in r["text"].split("\n") if any(p.search(ln) for p in pats))
+            if n:
+                hits.setdefault(inst, {})[name] = n
+    return hits
+
+
 # ------------------------------------------------------------------ verify
 
 def normalize(text: str) -> str:
-    """Whitespace- and trailing-comma-insensitive form of an item, for comparing a move
-    across a rustfmt run. String and char literals are kept byte for byte."""
+    """Whitespace- and trailing-comma-insensitive form of code, for comparing a move across a
+    rustfmt run. String and char literals are kept byte for byte."""
     m = mask(text, comment="c")
     out: list[str] = []
     for ch, mk in zip(text, m):
@@ -754,10 +1011,39 @@ def git_show(repo: str, rev: str, path: str) -> str | None:
     return r.stdout if r.returncode == 0 else None
 
 
-def item_records(src: str) -> list[tuple[Item, str]]:
+@dataclass
+class Record:
+    """One unit a move must conserve: a whole item, one member of an inherent impl (keyed by
+    the impl's attributes and header), or the non-attribute trivia of an inherent impl."""
+    kind: str  # "item" | "member" | "impl-trivia"
+    item_kind: str
+    selector: str
+    key: str  # normalized impl attrs + header for members, else ""
+    text: str
+    line: int
+
+
+def records(src: str) -> list[Record]:
     items, _ = parse_items(src)
     lines = src.split("\n")
-    return [(it, "\n".join(lines[it.lead:it.end + 1]).lstrip("\n")) for it in items]
+    mlines = mask(src).split("\n")
+    out: list[Record] = []
+    for it in items:
+        lay = impl_layout(lines, mlines, it) if it.kind == "impl" else None
+        if lay is None or not lay.members:
+            text = "\n".join(lines[it.lead:it.end + 1]).lstrip("\n")
+            out.append(Record("item", it.kind, it.selector, "", text, it.start))
+            continue
+        attrs = attr_lines(lines, it.lead, it.start)
+        header = "\n".join(attrs + lines[it.start:lay.body_open + 1])
+        trivia = [ln for ln in lines[it.lead:it.start] if ln.strip() and ln not in attrs]
+        trivia += lines[lay.members[-1].end + 1:lay.close]
+        if any(t.strip() for t in trivia):
+            out.append(Record("impl-trivia", "impl", it.selector, "", "\n".join(trivia), it.start))
+        for m in lay.members:
+            out.append(Record("member", m.kind, f"{it.selector} :: {m.selector}", header,
+                              "\n".join(lines[m.lead:m.end + 1]), m.start))
+    return out
 
 
 def parent_candidates(child: str) -> list[str]:
@@ -769,67 +1055,79 @@ def parent_candidates(child: str) -> list[str]:
 
 
 def verify(repo: str, base: str, head: str) -> int:
-    """Prove BASE...HEAD only moves top-level items into child modules the way `apply` does."""
+    """Prove BASE...HEAD only moves items (or inherent-impl members) into child modules the
+    way `apply` does, plus the `mod`/`use` declarations `apply` writes."""
     merge_base = git(repo, "merge-base", base, head).strip()
     status = [ln.split("\t") for ln in git(repo, "diff", "--name-status", "--no-renames",
                                               f"{merge_base}..{head}", "--", "*.rs").splitlines()]
     added = {p for st, p in status if st == "A"}
     modified = {p for st, p in status if st == "M"}
     deleted = {p for st, p in status if st == "D"}
-    pool: dict[str, list[tuple[Item, str]]] = {}
-    for p in modified | deleted:
-        pool[p] = item_records(git_show(repo, merge_base, p) or "")
-    unmatched_base = {p: list(v) for p, v in pool.items()}
+    pool = {p: records(git_show(repo, merge_base, p) or "") for p in modified | deleted}
+    new_mods = {os.path.splitext(os.path.basename(p))[0] for p in added}
     residual_added: list[str] = []
     moved = 0
-    new_mods = {os.path.splitext(os.path.basename(p))[0] for p in added}
 
-    def take(p: str, want: str) -> bool:
-        for idx, (it, text) in enumerate(unmatched_base.get(p, [])):
-            if normalize(text) == want:
-                unmatched_base[p].pop(idx)
+    def take(p: str, rec: Record, want: str, key: str) -> bool:
+        for idx, b in enumerate(pool.get(p, [])):
+            if b.kind == rec.kind and normalize(b.key) == key and normalize(b.text) == want:
+                pool[p].pop(idx)
                 return True
         return False
 
+    trivia_head: list[tuple[str, Record]] = []
     for p in sorted(modified):
-        for it, text in item_records(git_show(repo, head, p) or ""):
-            if take(p, normalize(text)):
+        for rec in records(git_show(repo, head, p) or ""):
+            if rec.kind == "impl-trivia":
+                trivia_head.append((p, rec))
                 continue
-            if it.kind == "mod-decl" and it.name in new_mods:
+            if take(p, rec, normalize(rec.text), normalize(rec.key)):
                 continue
-            if it.kind == "use" and re.search(r"\buse\s+(" + "|".join(map(re.escape, new_mods)) + r")::\*;", it.name):
+            if rec.item_kind == "mod-decl" and rec.selector.split(" ", 1)[1] in new_mods:
                 continue
-            residual_added.append(f"{p}: {it.selector} (line {it.start + 1})")
+            if rec.item_kind == "use" and new_mods and re.search(
+                    r"\buse\s+(" + "|".join(map(re.escape, new_mods)) + r")::\*;", rec.text):
+                continue
+            residual_added.append(f"{p}: {rec.selector} (line {rec.line + 1})")
     for p in sorted(added):
         parent = next((c for c in parent_candidates(p) if c in pool), None)
-        recs = item_records(git_show(repo, head, p) or "")
-        for it, text in recs:
-            if it.kind == "use" and collapse(text) == "use super::*;":
+        for rec in records(git_show(repo, head, p) or ""):
+            if rec.kind == "item" and rec.item_kind == "use" and collapse(rec.text) == "use super::*;":
+                continue
+            if rec.kind == "impl-trivia":
+                trivia_head.append((p, rec))
                 continue
             if parent is None:
-                residual_added.append(f"{p}: {it.selector} (new file with no changed parent module)")
+                residual_added.append(f"{p}: {rec.selector} (new file with no changed parent module)")
                 continue
             ppath = module_path_of(parent)
             deeper = os.path.basename(parent) not in ("lib.rs", "main.rs", "mod.rs")
-            want = normalize(text)
+            want, key = normalize(rec.text), normalize(rec.key)
             hit = False
-            for idx, (bit, btext) in enumerate(unmatched_base[parent]):
-                if bit.kind != it.kind:
+            for idx, b in enumerate(pool[parent]):
+                if b.kind != rec.kind or b.item_kind != rec.item_kind:
+                    continue
+                if b.kind == "member" and normalize(rewrite_super(b.key)) != key:
                     continue
                 try:
-                    exp, _ = transform_item(btext, bit.kind, ppath, deeper)
+                    tkind = b.item_kind if b.kind == "item" else ("macro" if b.item_kind == "macro" else "fn")
+                    exp, _ = transform_item(b.text, tkind, ppath, deeper)
                 except SystemExit:
                     continue
                 if normalize(exp) == want:
-                    unmatched_base[parent].pop(idx)
+                    pool[parent].pop(idx)
                     hit = True
                     moved += 1
                     break
             if not hit:
-                residual_added.append(f"{p}: {it.selector} (line {it.start + 1})")
-    residual_removed = [f"{p}: {it.selector} (base line {it.start + 1})"
-                        for p, v in unmatched_base.items() for it, _ in v]
-    print(f"moved items: {moved}   unmatched at base: {len(residual_removed)}   unmatched at head: {len(residual_added)}")
+                residual_added.append(f"{p}: {rec.selector} (line {rec.line + 1})")
+    for p, rec in trivia_head:  # an impl's doc comments may land with any of its blocks
+        src_p = next((c for c in [p] + parent_candidates(p) if c in pool), None)
+        cands = [c for c in ([src_p] if src_p else []) + list(pool) if c]
+        if not any(take(c, rec, normalize(rec.text), "") for c in dict.fromkeys(cands)):
+            residual_added.append(f"{p}: doc/comments of {rec.selector} (line {rec.line + 1})")
+    residual_removed = [f"{p}: {b.selector} (base line {b.line + 1})" for p, v in pool.items() for b in v]
+    print(f"moved: {moved}   unmatched at base: {len(residual_removed)}   unmatched at head: {len(residual_added)}")
     for title, rows in (("Base items not found at head (removed or edited):", residual_removed),
                         ("Head items that are not a move (added or edited):", residual_added)):
         if rows:
