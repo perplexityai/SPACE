@@ -43,7 +43,11 @@ async fn gateway_identity_mapping_preserves_exact_pid_and_lifecycle_authority() 
             crate::db::get_sandbox(&conn, &id).unwrap().unwrap().uid,
             Some(owner)
         );
-        crate::db::tests::state_write_fixtures::force_state(&conn, &id, SandboxState::Stopped);
+        crate::db::test_fixtures::state_write_fixtures::force_state(
+            &conn,
+            &id,
+            SandboxState::Stopped,
+        );
     }
     service
         .lookup_sandbox_by_net_gateway_process(4242, isolated)

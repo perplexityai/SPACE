@@ -9,7 +9,7 @@
 use pplx_space_common_core::types::SandboxQuarantineReasonCode;
 
 use super::*;
-use crate::db::tests::state_write_fixtures::{
+use crate::db::test_fixtures::state_write_fixtures::{
     admit_stop, assert_unchanged, backdate, force_state, insert_creating, insert_row, seed_receipt,
     set_failure_reason, snapshot,
 };

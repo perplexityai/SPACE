@@ -1,5 +1,5 @@
 use super::*;
-use crate::db::tests::database_rows;
+use crate::db::test_fixtures::database_rows;
 use crate::service::tests::service_tests::insert_test_sandbox;
 
 #[tokio::test]

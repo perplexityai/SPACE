@@ -16,7 +16,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
-use crate::db::tests::state_write_fixtures::{
+use crate::db::test_fixtures::state_write_fixtures::{
     Snapshot, assert_unchanged, force_state, snapshot, stop,
 };
 use crate::guest_filesystem_flush::GuestFlushError;

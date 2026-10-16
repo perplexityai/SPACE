@@ -2,20 +2,13 @@
 
 ## Changes
 
-- Write the node-local SQLite `sandboxes.state` only through `src/db`: every
-  persisted write goes through `update_state_from` with an explicit edge, or
-  through a named specialized writer. A new edge in `src/db/state_write.rs`
-  needs a kind and a doc comment naming its writer; add any new disagreement
-  with `can_transition_to`, with a reason, to `ALLOWLIST` in
-  `src/db/tests/state_write_table.rs`. Nothing checks the table against the
-  writers; the `&'static Edge` argument does that at call sites. A refused
-  write must leave every row unchanged. Map an `update_state_from` outcome to
-  a status with `require_state_write_from`, or write it best effort with
+- The node-local SQLite database belongs to `pplx-space-sbx-mgr-store`
+  (`../store`); its `AGENTS.md` has the state-write and child-table rules.
+  Map an `update_state_from` outcome to a status with
+  `require_state_write_from`, or write it best effort with
   `update_state_from_best_effort` (`src/service/cleanup_support.rs`); a caller
   that answers one case differently matches `state_write_result` and passes
   the rest to `into_status`.
-- Foreign keys are off: register a new sandbox child table in
-  `delete_sandbox_child_rows` (`src/db.rs`).
 - `src/service/adapter.rs` implements the gRPC trait; most handler bodies live
   in `src/service/grpc_core.rs`, `src/service/grpc_lifecycle/` and the other
   `src/service/grpc_*.rs` modules.

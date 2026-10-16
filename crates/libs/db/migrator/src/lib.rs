@@ -34,7 +34,6 @@ mod pg_test_support;
 pub mod user_password;
 
 static POSTGRES_MIGRATOR: Migrator = sqlx::migrate!("../../../../db/postgres");
-use pplx_space_sbxmgr_migrations::SANDBOX_MANAGER_MIGRATOR;
 static TEMPLATE_MANAGER_MIGRATOR: Migrator = sqlx::migrate!("../../../../db/template-manager");
 static NODE_MANAGER_MIGRATOR: Migrator = sqlx::migrate!("../../../../db/node-manager");
 static NODE_CTL_MIGRATOR: Migrator = sqlx::migrate!("../../../../db/node-ctl");
@@ -218,7 +217,13 @@ pub async fn run(config: DbMigrateRunConfig) -> Result<(), RunDbMigrateError> {
         Database::ControlPlane(args) => run_control_plane(args).await,
         Database::BootstrapRoles(args) => Ok(bootstrap_roles::run(args).await?),
         Database::SetUserPassword(args) => Ok(user_password::run(args).await?),
-        Database::SandboxManager(args) => run_sqlite(sqlite_sandbox_manager(), args).await,
+        Database::SandboxManager(args) => {
+            run_sqlite(
+                pplx_space_sbx_mgr_store::db::migration::target().into(),
+                args,
+            )
+            .await
+        }
         Database::TemplateManager(args) => run_sqlite(sqlite_template_manager(), args).await,
         Database::NodeManager(args) => run_sqlite(sqlite_node_manager(), args).await,
         Database::NodeCtl(args) => run_sqlite(sqlite_node_ctl(), args).await,
@@ -228,12 +233,16 @@ pub async fn run(config: DbMigrateRunConfig) -> Result<(), RunDbMigrateError> {
     }
 }
 
-fn sqlite_sandbox_manager() -> SqliteDatabase {
-    SqliteDatabase {
-        name: "sandbox-manager",
-        default_path: pplx_space_common_svc::core::host::linux::paths::SANDBOX_MANAGER_DB,
-        migrator: &SANDBOX_MANAGER_MIGRATOR,
-        common_schema: true,
+/// sbx-mgr's database, as its store describes it. It carries the shared
+/// schema, which `run_sqlite` applies from [`COMMON_SCHEMA_MIGRATOR`].
+impl From<pplx_space_sbx_mgr_store::db::migration::MigrationTarget> for SqliteDatabase {
+    fn from(target: pplx_space_sbx_mgr_store::db::migration::MigrationTarget) -> Self {
+        Self {
+            name: target.name,
+            default_path: target.default_path,
+            migrator: target.service,
+            common_schema: true,
+        }
     }
 }
 

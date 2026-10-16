@@ -3,7 +3,6 @@ fn main() {
     // also invalidate the embedded schema.
     watch("../../../../db/postgres");
     watch("../../../../db/common");
-    watch("../../../../db/sandbox-manager");
     watch("../../../../db/template-manager");
     watch("../../../../db/node-manager");
     watch("../../../../db/node-ctl");

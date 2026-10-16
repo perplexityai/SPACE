@@ -77,7 +77,7 @@ async fn legacy_delete_after_durable_delete_does_not_dispatch_node_cleanup() {
     );
     {
         let db = service.db.lock().unwrap();
-        crate::db::tests::state_write_fixtures::apply_edge(
+        crate::db::test_fixtures::state_write_fixtures::apply_edge(
             &db,
             &id,
             &crate::db::edges::DELETE_ADMISSION,
@@ -1293,13 +1293,13 @@ async fn delete_removes_a_quarantine_whose_automatic_recovery_stopped() {
         return;
     }
     let conn = crate::db::test_conn();
-    let sandbox_id = crate::db::tests::setup_quarantine_recovery_episode(
+    let sandbox_id = crate::db::test_fixtures::setup_quarantine_recovery_episode(
         &conn,
         SandboxQuarantineReasonCode::OrphanedSandboxRowMissing,
     );
     let id = sandbox_id.to_string();
     for _ in 0..crate::db::QUARANTINE_RECOVERY_PLAN_REJECTION_BOUND {
-        crate::db::tests::record_quarantine_recovery_attempt(
+        crate::db::test_fixtures::record_quarantine_recovery_attempt(
             &conn,
             sandbox_id,
             crate::db::QuarantineRecoveryNoProgressReason::PlanIneligible,

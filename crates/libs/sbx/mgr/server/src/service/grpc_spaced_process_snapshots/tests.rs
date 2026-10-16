@@ -1,5 +1,5 @@
 use super::*;
-use crate::db::tests::state_write_fixtures::{admit_stop, complete_stop};
+use crate::db::test_fixtures::state_write_fixtures::{admit_stop, complete_stop};
 
 #[test]
 fn snapshot_inventory_does_not_return_partial_success_for_oversized_sidecars() {
@@ -367,7 +367,7 @@ fn full_rollback_restage_leaves_a_stop_admitted_after_its_own_stop() {
     complete_stop(&conn, &id);
     assert_eq!(sandbox_state(&conn, &id), SandboxState::Stopped);
     admit_stop(&conn, &id);
-    let before = crate::db::tests::database_rows(&conn);
+    let before = crate::db::test_fixtures::database_rows(&conn);
 
     let error = restage_rolled_back_full_snapshot(&conn, &id)
         .expect_err("the restage must not overwrite a concurrent Stop");
@@ -377,7 +377,7 @@ fn full_rollback_restage_leaves_a_stop_admitted_after_its_own_stop() {
         error.message(),
         "complete process snapshot suspension: sandbox state write was superseded: sandbox is stopping"
     );
-    assert_eq!(crate::db::tests::database_rows(&conn), before);
+    assert_eq!(crate::db::test_fixtures::database_rows(&conn), before);
     complete_stop(&conn, &id);
     let row = crate::db::get_sandbox(&conn, &id).unwrap().unwrap();
     assert_eq!(row.state, SandboxState::Stopped);
@@ -432,8 +432,8 @@ fn full_rollback_restage_writes_only_over_a_stopped_row() {
         let conn = crate::db::test_conn();
         let id = SandboxId::new().to_string();
         crate::service::tests::service_tests::insert_test_sandbox_with_runtime(&conn, &id, state);
-        crate::db::tests::state_write_fixtures::decorate(&conn, &id, SandboxState::Started);
-        let before = crate::db::tests::database_rows(&conn);
+        crate::db::test_fixtures::state_write_fixtures::decorate(&conn, &id, SandboxState::Started);
+        let before = crate::db::test_fixtures::database_rows(&conn);
 
         let result = restage_rolled_back_full_snapshot(&conn, &id);
 
@@ -444,13 +444,21 @@ fn full_rollback_restage_writes_only_over_a_stopped_row() {
             }
             Expected::AlreadySuspended => {
                 result.unwrap();
-                assert_eq!(crate::db::tests::database_rows(&conn), before, "{state}");
+                assert_eq!(
+                    crate::db::test_fixtures::database_rows(&conn),
+                    before,
+                    "{state}"
+                );
             }
             Expected::Refused(message) => {
                 let error = result.expect_err("a refused restage must fail");
                 assert_eq!(error.code(), tonic::Code::Aborted, "{state}");
                 assert_eq!(error.message(), message, "{state}");
-                assert_eq!(crate::db::tests::database_rows(&conn), before, "{state}");
+                assert_eq!(
+                    crate::db::test_fixtures::database_rows(&conn),
+                    before,
+                    "{state}"
+                );
             }
         }
     }

@@ -809,7 +809,7 @@ async fn stop_suspended_with_concurrent_write(
     move_row: impl FnOnce(&crate::db::Connection),
 ) -> (
     Result<(), Status>,
-    crate::db::tests::state_write_fixtures::Snapshot,
+    crate::db::test_fixtures::state_write_fixtures::Snapshot,
 ) {
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
     *service
@@ -828,7 +828,7 @@ async fn stop_suspended_with_concurrent_write(
     let before = {
         let db = service.db.lock().unwrap();
         move_row(&db);
-        crate::db::tests::state_write_fixtures::snapshot(&db)
+        crate::db::test_fixtures::state_write_fixtures::snapshot(&db)
     };
     tokio::time::timeout(STOP_WRITE_WAIT, barrier.wait())
         .await
@@ -884,7 +884,7 @@ async fn auto_lifecycle_stop_writes_only_over_a_still_suspended_row() {
         insert_due_suspended_sandbox(&service, &id, 10);
 
         let (result, before) = stop_suspended_with_concurrent_write(&service, &id, |db| {
-            crate::db::tests::state_write_fixtures::force_state(db, &id, moved_to);
+            crate::db::test_fixtures::state_write_fixtures::force_state(db, &id, moved_to);
         })
         .await;
 
@@ -898,7 +898,7 @@ async fn auto_lifecycle_stop_writes_only_over_a_still_suspended_row() {
                 "{case}: the Stop stage is recorded as fired"
             );
         } else {
-            crate::db::tests::state_write_fixtures::assert_unchanged(&case, &before, &db);
+            crate::db::test_fixtures::state_write_fixtures::assert_unchanged(&case, &before, &db);
         }
     }
 }
@@ -914,7 +914,7 @@ async fn stop_admitted_during_auto_lifecycle_stop_keeps_its_completion() {
     let service = isolated_service(scratch.path());
     let id = SandboxId::new().to_string();
     insert_due_suspended_sandbox(&service, &id, 10);
-    crate::db::tests::state_write_fixtures::seed_runtime(&service.db.lock().unwrap(), &id);
+    crate::db::test_fixtures::state_write_fixtures::seed_runtime(&service.db.lock().unwrap(), &id);
 
     let (result, before) = stop_suspended_with_concurrent_write(&service, &id, |db| {
         // Stop admission's state write. A blocking Stop persists no intent.
@@ -931,7 +931,7 @@ async fn stop_admitted_during_auto_lifecycle_stop_keeps_its_completion() {
 
     assert!(result.is_ok(), "{result:?}");
     let db = service.db.lock().unwrap();
-    crate::db::tests::state_write_fixtures::assert_unchanged(
+    crate::db::test_fixtures::state_write_fixtures::assert_unchanged(
         "auto-lifecycle Stop after Stop admission",
         &before,
         &db,
@@ -990,7 +990,7 @@ async fn delete_admitted_during_auto_lifecycle_stop_keeps_its_row() {
 
     assert!(result.is_ok(), "{result:?}");
     let db = service.db.lock().unwrap();
-    crate::db::tests::state_write_fixtures::assert_unchanged(
+    crate::db::test_fixtures::state_write_fixtures::assert_unchanged(
         "auto-lifecycle Stop after Delete admission",
         &before,
         &db,

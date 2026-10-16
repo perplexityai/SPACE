@@ -184,7 +184,7 @@ fn checkpoint_admission_writes_only_over_a_started_or_paused_row() {
         };
         let (ctx, sandbox_id) = checkpoint_context(state);
         let db = ctx.db.lock().unwrap();
-        let before = crate::db::tests::database_rows(&db);
+        let before = crate::db::test_fixtures::database_rows(&db);
 
         let result = begin_checkpoint_state(&db, &sandbox_id);
 
@@ -196,7 +196,11 @@ fn checkpoint_admission_writes_only_over_a_started_or_paused_row() {
             }
             Some(message) => {
                 assert_eq!(result.unwrap_err(), message, "{state}");
-                assert_eq!(crate::db::tests::database_rows(&db), before, "{state}");
+                assert_eq!(
+                    crate::db::test_fixtures::database_rows(&db),
+                    before,
+                    "{state}"
+                );
             }
         }
     }
@@ -206,13 +210,13 @@ fn checkpoint_admission_writes_only_over_a_started_or_paused_row() {
 #[test]
 fn checkpoint_admission_of_a_missing_row_reports_it() {
     let db = crate::db::test_conn();
-    let before = crate::db::tests::database_rows(&db);
+    let before = crate::db::test_fixtures::database_rows(&db);
 
     assert_eq!(
         begin_checkpoint_state(&db, &SandboxId::new().to_string()).unwrap_err(),
         "sandbox state write was not applied: missing"
     );
-    assert_eq!(crate::db::tests::database_rows(&db), before);
+    assert_eq!(crate::db::test_fixtures::database_rows(&db), before);
 }
 
 #[tokio::test]

@@ -31,7 +31,7 @@ use super::{
     StopRequest,
 };
 use crate::db::CleanupCompletion;
-use crate::db::tests::state_write_fixtures::{assert_unchanged, snapshot};
+use crate::db::test_fixtures::state_write_fixtures::{assert_unchanged, snapshot};
 use crate::service::tests::service_tests::insert_test_sandbox;
 use crate::state::SandboxState;
 

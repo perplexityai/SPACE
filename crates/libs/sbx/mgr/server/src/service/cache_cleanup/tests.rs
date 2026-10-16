@@ -951,7 +951,7 @@ fn inventory_keeps_a_quarantined_row_without_local_evidence() {
     // A quarantine is held for operator or cluster disposition, so missing
     // cache and runtime evidence is not proof that its row is stale.
     let conn = crate::db::test_conn();
-    let sandbox_id = crate::db::tests::setup_quarantine_recovery_episode(
+    let sandbox_id = crate::db::test_fixtures::setup_quarantine_recovery_episode(
         &conn,
         SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
     );
@@ -967,7 +967,7 @@ fn inventory_keeps_a_quarantined_row_without_local_evidence() {
             .as_deref(),
         Some(SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed.as_str())
     );
-    let before = crate::db::tests::database_rows(&conn);
+    let before = crate::db::test_fixtures::database_rows(&conn);
     let cache_dir = tempfile::tempdir().expect("create cache directory");
     let run_dir = tempfile::tempdir().expect("create run directory");
     let paths = SandboxInventoryPaths::new(cache_dir.path(), run_dir.path());
@@ -1003,7 +1003,7 @@ fn inventory_keeps_a_quarantined_row_without_local_evidence() {
         "inventory must not take the quarantined row's cleanup fence"
     );
     assert_eq!(
-        crate::db::tests::database_rows(&conn),
+        crate::db::test_fixtures::database_rows(&conn),
         before,
         "inventory must keep the quarantined row, its hold, history and artifact pin"
     );
@@ -1016,7 +1016,7 @@ fn inventory_keeps_a_quarantined_row_without_local_evidence() {
             crate::db::InventoryOwnershipReason::LifecycleOwned
         )
     );
-    assert_eq!(crate::db::tests::database_rows(&conn), before);
+    assert_eq!(crate::db::test_fixtures::database_rows(&conn), before);
     // The control: a stale row beside it is fenced and removed.
     let stale = SandboxId::new();
     crate::service::tests::service_tests::insert_test_sandbox(

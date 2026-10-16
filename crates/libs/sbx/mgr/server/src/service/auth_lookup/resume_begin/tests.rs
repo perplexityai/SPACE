@@ -19,7 +19,7 @@ use pplx_space_node_mgr_client::proto::{ResumeSandboxRequest, ResumeSandboxRespo
 use tonic::{Code, Status};
 
 use super::BEGIN_BARRIER;
-use crate::db::tests::state_write_fixtures::snapshot;
+use crate::db::test_fixtures::state_write_fixtures::snapshot;
 use crate::node_manager_transport::fake::FakeNodeManager;
 use crate::proto::ResumeRequest;
 use crate::service::activation_support::internal_request;
@@ -156,7 +156,7 @@ fn move_row(conn: &crate::db::Connection, id: &str, found: Found) {
     };
     match state {
         SandboxState::Paused => {}
-        SandboxState::Stopped => crate::db::tests::state_write_fixtures::stop(conn, id),
+        SandboxState::Stopped => crate::db::test_fixtures::state_write_fixtures::stop(conn, id),
         state => {
             // The schema ties the restore columns to `restoring`.
             conn.execute(

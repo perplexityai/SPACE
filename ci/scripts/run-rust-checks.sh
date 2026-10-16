@@ -240,6 +240,52 @@ run_fmt_check() {
     cargo fmt --all -- --check
 }
 
+# sbx-mgr's SQLite store makes its raw connection and statement methods
+# public only under its `test-support` feature, which the workspace pass's
+# `--all-features` turns on. Lint sbx-mgr's production libraries and
+# binaries without dev targets in every feature configuration its images
+# are built with, so production code that calls a gated store method fails
+# before merge, even behind a feature such as `otel`: no features, the
+# release images' set (docker/Dockerfile.rust-build-common) and the Kind
+# images' set (docker/Dockerfile.rust-build-kind). The migrator has no
+# features of its own.
+run_sbxmgr_production_checks() {
+    local target_dir="$1"
+    local sbxmgr_feature_sets=(
+        ""
+        "pplx-space-sbxmgr-svc/otel,pplx-space-sbxmgr-svc/datadog"
+        "pplx-space-sbxmgr-svc/otel,pplx-space-sbxmgr-svc/datadog,pplx-space-sbxmgr-svc/test-hooks"
+    )
+    local sbxmgr_features sbxmgr_feature_args sbxmgr_graph
+    for sbxmgr_features in "${sbxmgr_feature_sets[@]}"; do
+        sbxmgr_feature_args=()
+        if [ -n "${sbxmgr_features}" ]; then
+            sbxmgr_feature_args=(--features "${sbxmgr_features}")
+        fi
+        echo "--- :rust: Running sbx-mgr production clippy without test-support (features: ${sbxmgr_features:-none})"
+        CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+            --locked \
+            -p pplx-space-sbx-mgr-store \
+            -p pplx-space-sbx-mgr \
+            -p pplx-space-sbxmgr-svc \
+            -p pplx-space-db-migrate \
+            -p pplx-space-db-migrator \
+            "${sbxmgr_feature_args[@]}" \
+            --lib --bins \
+            -- \
+            -D warnings
+        sbxmgr_graph="$(cargo tree --locked \
+            -p pplx-space-sbx-mgr -p pplx-space-sbxmgr-svc \
+            -p pplx-space-db-migrate -p pplx-space-db-migrator \
+            "${sbxmgr_feature_args[@]}" \
+            -e normal,features --prefix none)"
+        if grep -q '^pplx-space-sbx-mgr-store feature "test-support"' <<<"${sbxmgr_graph}"; then
+            echo "sbx-mgr's production graph (features: ${sbxmgr_features:-none}) must not enable the store's test-support" >&2
+            return 1
+        fi
+    done
+}
+
 run_clippy_checks() {
     local target_dir="target/buildkite-lint"
 
@@ -275,6 +321,8 @@ run_clippy_checks() {
         --no-default-features \
         -- \
         -D warnings
+
+    run_sbxmgr_production_checks "${target_dir}"
 
     # feature-flags must lint clean with no vendor SDK compiled in; the matching
     # dependency-graph assertion lives in run_feature_isolation_checks.
