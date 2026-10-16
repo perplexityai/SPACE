@@ -184,9 +184,11 @@ internal RPC TLS configuration. Other node services must not receive the
 publisher secret.
 
 Build-manager attaches the dedicated proof only to template and release
-registration. The shared node bearer alone cannot publish. This grants tenant
-publication authority and system publication authority **only with the existing
-per-build grant** issued by the API. It cannot issue system grants itself, and
+registration. The shared node bearer alone cannot publish. Both tenant and
+system publication require the corresponding **per-build grant** issued by the
+API. A tenant grant must match the template, organization, and registered builder
+at the connection’s source address; no Kubernetes identity is required. The
+publisher credential cannot issue system grants itself, and
 does not enable ungranted system builds from the operator CLI. Kubernetes
 publication continues using projected tokens; combining Kubernetes auth with
 the direct receiver credential fails startup.

@@ -169,7 +169,8 @@ impl BuildAuthenticator {
             ));
         }
         Ok(Some(BuildAuthenticatedCaller {
-            can_assert_org: true,
+            node: None,
+            tenant: TenantTemplateAuthority::Granted,
             system: SystemTemplateAuthority::Granted,
         }))
     }
