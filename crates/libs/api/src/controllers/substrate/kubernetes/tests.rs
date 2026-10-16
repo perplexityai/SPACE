@@ -3656,14 +3656,18 @@ mod kubernetes_tests {
     }
 
     #[rstest::rstest]
-    #[case::first_suspend_finalizes(true, false)]
-    #[case::first_suspend_remains_pending(false, false)]
-    #[case::prior_marker_finalizes(true, true)]
-    #[case::prior_marker_remains_pending(false, true)]
+    #[case::first_suspend_finalizes(true, false, "creating")]
+    #[case::first_suspend_remains_pending(false, false, "creating")]
+    #[case::prior_marker_finalizes(true, true, "creating")]
+    #[case::prior_marker_remains_pending(false, true, "creating")]
+    #[case::failed_upload(false, false, "failed")]
+    #[case::failed_upload_with_prior_marker(false, true, "failed")]
+    #[case::registration_pending(false, false, "missing")]
     #[tokio::test(flavor = "current_thread")]
-    async fn reconnect_waits_for_local_suspend_backup(
+    async fn reconnect_returns_retryable_while_local_suspend_is_not_durable(
         #[case] finalize: bool,
         #[case] prior_marker: bool,
+        #[case] snapshot_state: &str,
     ) -> Result<(), BoxError> {
         if !crate::test_support::enter_sim_worker_process() {
             return Ok(());
@@ -3713,6 +3717,24 @@ mod kubernetes_tests {
         .bind(storage_uri)
         .execute(&pool)
         .await?;
+        if snapshot_state == "missing" {
+            sqlx::query(sql!(
+                "DELETE FROM snapshot_storage_locations WHERE snapshot_id = $1"
+            ))
+            .bind(snapshot_id)
+            .execute(&pool)
+            .await?;
+            sqlx::query(sql!("DELETE FROM snapshots WHERE id = $1"))
+                .bind(snapshot_id)
+                .execute(&pool)
+                .await?;
+        } else {
+            sqlx::query(sql!("UPDATE snapshots SET state = $2 WHERE id = $1"))
+                .bind(snapshot_id)
+                .bind(snapshot_state)
+                .execute(&pool)
+                .await?;
+        }
         if let Some(prior_artifact_id) = prior_artifact_id {
             let prior_snapshot_id = SnapshotId::new();
             sqlx::query(sql!(
@@ -3797,32 +3819,39 @@ mod kubernetes_tests {
             worker.port(),
             Some(initial_pod),
         );
-        let wake_substrate = substrate.clone();
-        let budget = if finalize {
-            Duration::from_secs(5)
-        } else {
-            Duration::from_millis(500)
-        };
-        let started_at = StdInstant::now();
-        let mut wake = tokio::spawn(async move {
-            wake_substrate
-                .wake_execution_with_metric_identity(
+        // Use the real wake path and persisted node publication. A caller's
+        // long readiness budget must not turn a non-durable suspend into a
+        // readiness poll until its deadline. Repeat with an in-flight recovery
+        // owner to cover subsequent connects as well as the first one.
+        for execution_state in ["running", "recovering"] {
+            sqlx::query(sql!(
+                "UPDATE sandbox_k8s_executions SET state = $2, updated_at = NOW()
+                 WHERE sandbox_id = $1 AND active"
+            ))
+            .bind(sandbox_id)
+            .bind(execution_state)
+            .execute(&pool)
+            .await?;
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                substrate.wake_execution_with_metric_identity(
                     &sandbox,
-                    budget,
+                    Duration::from_secs(300),
                     SandboxApiMetricIdentity::ecw("connect"),
                     crate::controllers::substrate::RecoveryCharge::Exempt,
-                )
-                .await
-        });
-        tokio::time::timeout(Duration::from_secs(2), terminal_observed.acquire())
-            .await??
-            .forget();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), &mut wake)
-                .await
-                .is_err(),
-            "connect must wait for backup finalization after observing the old terminal Pod"
-        );
+                ),
+            )
+            .await
+            .expect("non-durable suspend must return before the caller's readiness deadline");
+            let error = result.expect_err("unpublished suspend must not report a successful wake");
+            assert!(
+                matches!(error, SubstrateError::RestoreSourcePending { .. }),
+                "{error:?}"
+            );
+            let error = ControllerError::from(error);
+            assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(error.retry_after_header().is_some());
+        }
         assert!(
             pod_creates.lock().unwrap().is_empty(),
             "no replacement before finalization"
@@ -3838,7 +3867,15 @@ mod kubernetes_tests {
                 .await?;
             publish_sandbox_states(&mut tx, node_id, &[published]).await?;
             tx.commit().await?;
-            let activation = tokio::time::timeout(Duration::from_secs(5), wake).await???;
+            let sandbox = fetch_sandbox(&pool, sandbox_id).await?.unwrap();
+            let activation = substrate
+                .wake_execution_with_metric_identity(
+                    &sandbox,
+                    Duration::from_secs(5),
+                    SandboxApiMetricIdentity::ecw("connect"),
+                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                )
+                .await?;
             assert_eq!(activation.binding.execution_generation, 2);
             let creates = pod_creates.lock().unwrap();
             assert_eq!(creates.len(), 1);
@@ -3850,15 +3887,6 @@ mod kubernetes_tests {
                 Some(storage_uri)
             );
         } else {
-            let error = tokio::time::timeout(Duration::from_secs(2), wake)
-                .await??
-                .unwrap_err();
-            assert!(
-                matches!(error, SubstrateError::SuspendInFlight { .. }),
-                "{error:?}"
-            );
-            assert!(started_at.elapsed() >= budget);
-            assert!(started_at.elapsed() < Duration::from_secs(2));
             let state: String = sqlx::query_scalar(sql!(
                 "SELECT state FROM sandbox_k8s_executions WHERE sandbox_id = $1 AND active"
             ))
@@ -3867,7 +3895,7 @@ mod kubernetes_tests {
             .await?;
             assert_eq!(
                 state, "recovering",
-                "deadline must not fail the pending suspend owner"
+                "returning a retryable error must not fail the pending suspend owner"
             );
             assert!(pod_creates.lock().unwrap().is_empty());
         }
@@ -12586,6 +12614,14 @@ mod kubernetes_tests {
         .execute(&db.pool)
         .await?;
         sqlx::query(sql!(
+            "INSERT INTO snapshot_storage_locations (snapshot_id, storage_connection_string, org_id)
+             VALUES ($1, 's3://space-test/suspend-snapshots/evidence?region=us-east-1',
+                 '00000000-0000-0000-0000-000000000001')"
+        ))
+        .bind(snapshot_id)
+        .execute(&db.pool)
+        .await?;
+        sqlx::query(sql!(
             "INSERT INTO sandbox_k8s_executions (sandbox_id, generation, pod_name, pod_namespace,
                  pod_uid, pod_ip, state, active, activation_attempt_id, route_activation_id)
              VALUES ($1, 1, 'selected-suspend-pod', 'space', 'selected-pod-uid',
@@ -12702,6 +12738,37 @@ mod kubernetes_tests {
             .await?
             .unwrap();
         let expected = k8s_execution_route_identity(&execution)?;
+        // The admission guard may only defer recovery for the exact persisted
+        // suspend. Failure/missing registration is retryable, whereas a Ready
+        // source or superseding execution/activity must leave recovery alone.
+        let pending = match case {
+            SuspendEvidenceCase::Current
+            | SuspendEvidenceCase::OtherArtifact
+            | SuspendEvidenceCase::FailedBackup
+            | SuspendEvidenceCase::ReplacementPod
+            | SuspendEvidenceCase::MismatchedPublisherCannotClear => true,
+            SuspendEvidenceCase::CompletedBackup
+            | SuspendEvidenceCase::MismatchedPublishedGeneration
+            | SuspendEvidenceCase::OldPublishedUid
+            | SuspendEvidenceCase::OtherNode
+            | SuspendEvidenceCase::MissingPublication
+            | SuspendEvidenceCase::NewerActivity
+            | SuspendEvidenceCase::ReplacedExecution
+            | SuspendEvidenceCase::ReplacedRecordedUid
+            | SuspendEvidenceCase::ClearedByRunning => false,
+        };
+        let admission = substrate
+            .store
+            .ensure_local_suspend_restore_source(sandbox_id)
+            .await;
+        if pending {
+            assert!(
+                matches!(admission, Err(SubstrateError::RestoreSourcePending { .. })),
+                "{admission:?}"
+            );
+        } else {
+            admission?;
+        }
         let result = substrate.selected_wake_pod_ip(sandbox_id, &expected).await;
         if matches!(
             case,

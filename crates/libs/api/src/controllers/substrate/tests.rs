@@ -338,10 +338,14 @@ fn restore_source_pending_is_retryable_restore_work() {
         controller_error.status(),
         axum::http::StatusCode::SERVICE_UNAVAILABLE
     );
-    assert_eq!(controller_error.retry_after(), Some(GATEWAY_RETRY_AFTER));
+    assert_eq!(controller_error.retry_after(), None);
+    assert_eq!(
+        controller_error.retry_after_header(),
+        Some(GATEWAY_RETRY_AFTER)
+    );
     assert_eq!(
         controller_error.retry_after_cause(),
-        Some(ControllerRetryAfterCause::RestoreInFlight)
+        Some(ControllerRetryAfterCause::RestoreSourcePending)
     );
 }
 

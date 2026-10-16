@@ -31,9 +31,9 @@ pub struct ControllerError {
     /// their ALB-aware budget) — not for genuine overload/quota 503s, where a
     /// resume+retry would be wrong.
     retry_after: Option<Duration>,
-    /// Header-only retry hint for overload/quota errors. This renders
-    /// `Retry-After` but does not mark the error as a converging sandbox
-    /// operation for ECW translation.
+    /// Header-only retry hint for overload/quota or unpublished restore
+    /// sources. This renders `Retry-After` but does not assert a converging
+    /// sandbox operation for ECW translation.
     retry_after_header: Option<Duration>,
     retry_after_cause: Option<ControllerRetryAfterCause>,
     /// The backend refused this request before doing any of its work, as its
@@ -58,6 +58,9 @@ enum ControllerErrorKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControllerRetryAfterCause {
     RestoreInFlight,
+    /// Restore cannot start until a source is published or recovered. Unlike
+    /// RestoreInFlight this does not assert an active restore owner.
+    RestoreSourcePending,
     PodNeverReady,
     ProxyUnreachable,
     GuestNotReady,
@@ -163,7 +166,7 @@ impl ControllerError {
         self.retry_after
     }
 
-    /// The HTTP/client retry hint, including header-only overload hints.
+    /// The HTTP/client retry hint, including header-only prerequisite hints.
     pub fn retry_after_header(&self) -> Option<Duration> {
         self.retry_after_header.or(self.retry_after)
     }

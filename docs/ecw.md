@@ -230,6 +230,34 @@ Use ECW when an existing application needs E2B SDK compatibility. New SPACE
 integrations should normally use the [SPACE API](api/index.md), which exposes
 SPACE lifecycle concepts directly and has a generated OpenAPI contract.
 
+### Reconnect while suspend state is not durable
+
+`POST /v2/sandboxes/{id}/connect` and data-plane wake do not spend their
+readiness budget retrying a worker when the control plane has an exact
+generation-and-Pod-UID-fenced observation of a local suspend whose full
+artifact is not yet durable. They return `503 Service Unavailable` with
+`Retry-After`; retry the **same sandbox** after that delay. This is not the
+SDK's `502` readiness-timeout/resume signal and does not authorize falling
+back to a fresh sandbox.
+
+The observation and snapshot registration are read from the existing
+control-plane store, without probing another service. Pending publication,
+an upload in flight, and a failed upload whose retained local artifact may
+still be re-driven all remain retryable. A failed or missing snapshot
+registration alone is **not** proof that recovery is impossible. The API
+does not currently receive an authoritative terminal local-artifact-loss
+verdict; these cases remain `503` until durability is published or recovery
+is otherwise resolved. Absence of the fenced observation is unknown, not
+proof of loss, and retains the existing recovery behavior.
+
+The existing `412 Precondition Failed` no-verified-restore-source contract
+remains distinct: clients may create a fresh sandbox for that response.
+Existing durable-source restore and readiness waits are unchanged.
+Reconnect metrics identify publication waits as
+`outcome:wake_in_progress,terminal_phase:restore,reason:restore_source_pending`,
+not `wake_failed/unavailable` or `exhausted/wait_budget`. “Pending” does not
+assert that an upload is actively running.
+
 ### Reconnect timeout ordering
 
 An explicit connect timeout extends the current execution's effective access-idle

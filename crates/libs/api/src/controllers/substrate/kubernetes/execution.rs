@@ -403,6 +403,9 @@ impl KubernetesSubstrate {
         let join = async {
             let mut backoff = RecoveryJoinBackoff::new(self.recovery_join_backoff);
             loop {
+                self.store
+                    .ensure_local_suspend_restore_source(sandbox_id)
+                    .await?;
                 tokio::time::sleep(backoff.next_delay()).await;
                 match self
                     .store
@@ -451,6 +454,9 @@ impl KubernetesSubstrate {
         sandbox_id: SandboxId,
         timeout: Duration,
     ) -> Result<StartedRecoveryClaimOutcome, SubstrateError> {
+        self.store
+            .ensure_local_suspend_restore_source(sandbox_id)
+            .await?;
         let claim = match self.store.claim_started_recovery(sandbox_id).await {
             Ok(claim) => claim,
             Err(error @ SubstrateError::Conflict { .. }) => {
@@ -1795,26 +1801,18 @@ impl KubernetesSubstrate {
             WakeDispatchStatus::NotDispatched
         };
 
-        if matches!(result, Err(SubstrateError::SuspendInFlight { .. }))
+        let result = if matches!(result, Err(SubstrateError::SuspendInFlight { .. }))
             && !wake_dispatch.was_dispatched()
             && started_recovery_generation.is_some()
             && evacuation_placement.is_none()
         {
-            // The exact old Pod stopped after materialization, while its
-            // local suspend backup is still publishing. Keep recovery owned
-            // and wait for the existing finalizer, not another Wake to that
-            // Pod. The restore below reselects under the original deadline.
-            // On budget expiry retain the retryable SuspendInFlight result;
-            // an ambiguous dispatch must never enter this wait-only path.
-            if let Ok(observation) = tokio::time::timeout_at(
-                phase_deadline,
-                self.wait_for_started_recovery_superseded_by_suspend(sandbox_id),
-            )
-            .await
-            {
-                observation?;
-            }
-        }
+            // Publication raced the pre-dispatch durability check. Nothing
+            // was sent to the stopped Pod: leave the suspend owner intact,
+            // but do not spend the caller's readiness budget on its upload.
+            Err(SubstrateError::restore_source_pending(sandbox_id))
+        } else {
+            result
+        };
 
         if result.is_err()
             && let Some(generation) = started_recovery_generation
