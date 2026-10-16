@@ -1423,7 +1423,7 @@ def derive_spec(repo: str, base: str, head: str, parent: str, children: list[str
             out.append(f"doc = {json.dumps(doc, ensure_ascii=False)}")
         if "allow(unused_imports)" in glob_lead:
             out.append("allow_unused_glob = true")
-        for k, it in enumerate(hp_items):
+        for it in hp_items:
             if it.kind == "use" and re.search(r"\buse\s+" + re.escape(name) + r"::\*;", it.name) and \
                     "allow(unused_imports)" in "\n".join(head_parent.split("\n")[it.lead:it.start]):
                 out.append("allow_unused_reexport = true")
