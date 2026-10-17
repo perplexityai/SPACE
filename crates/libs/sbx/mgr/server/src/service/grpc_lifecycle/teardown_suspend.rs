@@ -1212,10 +1212,13 @@ impl SandboxManagerService {
         backup: TeardownSuspendBackup<'_>,
     ) -> Result<(), Status> {
         let artifact_dedup_key = backup.artifact.local_artifact_id.to_string();
-        let persisted_job = self.snapshot_upload_worker.find_job_by_dedup_key(
+        let persisted_job = match self.snapshot_upload_worker.find_job_by_dedup_key(
             crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
             &artifact_dedup_key,
-        )?;
+        )? {
+            Some(job) => Some(job),
+            None => self.active_unkeyed_artifact_upload(&sandbox.id, backup.artifact)?,
+        };
         // An active local upload still owns its completion. Only probe before
         // enqueueing or joining a terminal job: a restored artifact can already
         // be durable without a local completion marker. A failed probe leaves
@@ -1298,6 +1301,37 @@ impl SandboxManagerService {
         self.verify_teardown_suspend_backup_ownership(sandbox, &backup)
     }
 
+    /// The artifact's active upload that carries no dedup key, as a node-local
+    /// suspend enqueues it. A teardown of that suspended sandbox joins it
+    /// rather than uploading the same artifact again. Once it ends, a later
+    /// attempt that still needs a backup enqueues its own under the key.
+    fn active_unkeyed_artifact_upload(
+        &self,
+        sandbox_id: &str,
+        artifact: &crate::db::LocalArtifactRow,
+    ) -> Result<Option<pplx_space_common_jobs::Job>, Status> {
+        #[derive(serde::Deserialize)]
+        struct UploadArtifact {
+            meta: UploadArtifactMeta,
+        }
+        #[derive(serde::Deserialize)]
+        struct UploadArtifactMeta {
+            local_artifact_id: Option<LocalArtifactId>,
+        }
+        Ok(self
+            .snapshot_upload_worker
+            .list_jobs(Some(sandbox_id), None, 0)?
+            .into_iter()
+            .find(|job| {
+                job.kind == crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND
+                    && job.dedup_key.is_none()
+                    && !job.is_terminal()
+                    && job.payload_as::<UploadArtifact>().is_ok_and(|upload| {
+                        upload.meta.local_artifact_id == Some(artifact.local_artifact_id)
+                    })
+            }))
+    }
+
     fn verify_teardown_suspend_backup_ownership(
         &self,
         sandbox: &crate::db::SandboxRow,
@@ -1308,11 +1342,16 @@ impl SandboxManagerService {
             crate::db::teardown_suspend_status(&db, &sandbox.id)
                 .map_err(|error| Status::internal(format!("db error: {error}")))?
                 .is_some_and(|status| {
+                    // Once the artifact is stamped, the next PrepareTeardownSuspend
+                    // poll can complete this generation before this waiter sees
+                    // its upload finish. That completion is this suspend's.
+                    let completed_here = status.is_durable_for(backup.execution_generation);
                     status.backup_completed
-                        && status.operation.is_some_and(|operation| {
-                            operation.status.is_active()
-                                && operation.execution_generation == backup.execution_generation
-                        })
+                        && (completed_here
+                            || status.operation.as_ref().is_some_and(|operation| {
+                                operation.status.is_active()
+                                    && operation.execution_generation == backup.execution_generation
+                            }))
                         && status.artifact.is_some_and(|artifact| {
                             artifact.local_artifact_id == backup.artifact.local_artifact_id
                         })
