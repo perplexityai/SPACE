@@ -28,6 +28,9 @@ on:
       - crates/libs/api/src/controllers/template.rs
       - crates/libs/api/src/controllers/template/**
       - crates/libs/api/src/template_build_jobs_store.rs
+      - crates/libs/api/src/controllers/substrate/kubernetes/node_sync.rs
+      - crates/libs/api/src/controllers/substrate/kubernetes/node_sync/**
+      - crates/libs/api/src/controllers/substrate/kubernetes/store/node_inventory.rs
       - crates/libs/build/mgr/**
       - crates/libs/common/svc/src/auth/build.rs
       - crates/libs/common/svc/src/auth/build/**
