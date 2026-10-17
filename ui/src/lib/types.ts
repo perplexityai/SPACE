@@ -287,6 +287,9 @@ export type NetworkPolicyDestinationV1 =
   | { domain: string }
   | { wildcard_domain: string };
 
+/** A destination with an optional port; without `port` it covers every port. */
+export type TlsInterceptionExemptionV1 = NetworkPolicyDestinationV1 & { port?: number };
+
 export interface CredentialHeaderBindingV1 {
   header_name: string;
   credential_reference_id: string;
@@ -312,7 +315,7 @@ export interface NetworkPolicyV1 {
   };
   tls_interception?: NetworkPolicyTlsInterception;
   network_credential_rules?: NetworkCredentialRuleV1[];
-  tls_interception_exemptions?: NetworkPolicyDestinationV1[];
+  tls_interception_exemptions?: TlsInterceptionExemptionV1[];
 }
 
 export type NodeRole = 'worker' | 'builder' | 'cluster';

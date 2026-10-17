@@ -1,0 +1,34 @@
+[
+  {
+    "name": "exemptions on every port",
+    "policy": {
+      "version": "v1",
+      "egress": {"default_action": "deny", "allow": [{"domain": "sensor.example.test"}, {"domain": "push.example.test"}], "deny": [{"ip": "192.0.2.20"}]},
+      "tls_interception": "on",
+      "tls_interception_exemptions": [
+        {"ip": "192.0.2.10"},
+        {"cidr": "198.51.100.0/24"},
+        {"domain": "sensor.example.test"},
+        {"wildcard_domain": "*.pinned.example.test"}
+      ]
+    },
+    "protobuf_hex": "080110021a151a1373656e736f722e6578616d706c652e746573741a131a11707573682e6578616d706c652e74657374220c0a0a3139322e302e322e323028023a0c0a0a3139322e302e322e31303a11120f3139382e35312e3130302e302f32343a151a1373656e736f722e6578616d706c652e746573743a1722152a2e70696e6e65642e6578616d706c652e74657374"
+  },
+  {
+    "name": "port-scoped exemptions",
+    "policy": {
+      "version": "v1",
+      "egress": {"default_action": "deny", "allow": [{"domain": "sensor.example.test"}, {"domain": "push.example.test"}], "deny": [{"ip": "192.0.2.20"}]},
+      "tls_interception": "on",
+      "tls_interception_exemptions": [
+        {"domain": "sensor.example.test"},
+        {"domain": "push.example.test", "port": 5228},
+        {"ip": "192.0.2.10"},
+        {"cidr": "198.51.100.0/24", "port": 8443},
+        {"wildcard_domain": "*.pinned.example.test", "port": 443},
+        {"domain": "push.example.test", "port": 5229}
+      ]
+    },
+    "protobuf_hex": "080110021a151a1373656e736f722e6578616d706c652e746573741a131a11707573682e6578616d706c652e74657374220c0a0a3139322e302e322e323028023a151a1373656e736f722e6578616d706c652e746573743a0c0a0a3139322e302e322e313042170a151a1373656e736f722e6578616d706c652e7465737442180a131a11707573682e6578616d706c652e7465737410ec28420e0a0c0a0a3139322e302e322e313042160a11120f3139382e35312e3130302e302f323410fb41421c0a1722152a2e70696e6e65642e6578616d706c652e7465737410bb0342180a131a11707573682e6578616d706c652e7465737410ed28"
+  }
+]

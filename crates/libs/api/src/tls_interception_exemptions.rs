@@ -1,10 +1,10 @@
-use pplx_space_net_common::{EgressDestinationV1, NetworkPolicyV1};
+use pplx_space_net_common::{EgressDestinationV1, NetworkPolicyV1, TlsInterceptionExemptionV1};
 
 const ENV: &str = "SPACE_TLS_INTERCEPTION_EXEMPTIONS";
 
 #[derive(Clone, Debug)]
 pub struct TlsInterceptionExemptions {
-    destinations: Vec<EgressDestinationV1>,
+    exemptions: Vec<TlsInterceptionExemptionV1>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -35,20 +35,20 @@ impl TlsInterceptionExemptions {
     }
 
     pub fn from_config(raw: &str) -> Result<Self, TlsInterceptionExemptionsConfigError> {
-        let destinations: Vec<EgressDestinationV1> =
+        let exemptions: Vec<TlsInterceptionExemptionV1> =
             serde_json::from_str(raw).map_err(TlsInterceptionExemptionsConfigError::Json)?;
-        if destinations.is_empty() {
+        if exemptions.is_empty() {
             return Err(TlsInterceptionExemptionsConfigError::Empty);
         }
-        if destinations.iter().any(|destination| {
+        if exemptions.iter().any(|exemption| {
             !matches!(
-                destination,
+                exemption.destination,
                 EgressDestinationV1::Domain(_) | EgressDestinationV1::WildcardDomain(_)
             )
         }) {
             return Err(TlsInterceptionExemptionsConfigError::UnsupportedDestination);
         }
-        Ok(Self { destinations })
+        Ok(Self { exemptions })
     }
 }
 
@@ -65,16 +65,16 @@ pub(crate) fn compose(
     };
     if base.tls_interception.is_off()
         || configured
-            .destinations
+            .exemptions
             .iter()
-            .all(|destination| base.tls_interception_exemptions.contains(destination))
+            .all(|exemption| base.tls_interception_exemptions.contains(exemption))
     {
         return policy_override;
     }
     let mut policy = base.clone();
-    for destination in &configured.destinations {
-        if !policy.tls_interception_exemptions.contains(destination) {
-            policy.tls_interception_exemptions.push(destination.clone());
+    for exemption in &configured.exemptions {
+        if !policy.tls_interception_exemptions.contains(exemption) {
+            policy.tls_interception_exemptions.push(exemption.clone());
         }
     }
     Some(policy)

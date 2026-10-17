@@ -69,7 +69,7 @@ fn composition_preserves_policy_and_deny_precedence(#[case] exemptions_enabled: 
                     .is_allowed()
             );
             assert_eq!(
-                composed.tls_interception_for(allowed, None),
+                composed.tls_interception_for(std::net::SocketAddr::new(allowed, 443), None),
                 expected_interception
             );
             let outside = outside.parse().unwrap();
@@ -78,7 +78,7 @@ fn composition_preserves_policy_and_deny_precedence(#[case] exemptions_enabled: 
                 default_action == EgressDefaultAction::Allow
             );
             assert_eq!(
-                composed.tls_interception_for(outside, None),
+                composed.tls_interception_for(std::net::SocketAddr::new(outside, 443), None),
                 pplx_space_net_common::TlsInterception::On
             );
         }
@@ -102,25 +102,25 @@ fn composition_preserves_policy_and_deny_precedence(#[case] exemptions_enabled: 
         assert!(!composed.allows_domain("denied.example.test"));
         assert_eq!(composed.tls_interception, base.tls_interception);
         assert_eq!(
-            composed.tls_interception_for("192.0.2.11".parse().unwrap(), None),
+            composed.tls_interception_for("192.0.2.11:443".parse().unwrap(), None),
             expected_interception
         );
         assert_eq!(
             composed.tls_interception_for(
-                "198.51.100.10".parse().unwrap(),
+                "198.51.100.10:443".parse().unwrap(),
                 Some(&"sensor.example.test".parse().unwrap())
             ),
             expected_interception
         );
         assert_eq!(
             composed.tls_interception_for(
-                "198.51.100.10".parse().unwrap(),
+                "198.51.100.10:443".parse().unwrap(),
                 Some(&"user.example".parse().unwrap())
             ),
             pplx_space_net_common::TlsInterception::On
         );
         assert_eq!(
-            composed.tls_interception_for("8.8.8.8".parse().unwrap(), None),
+            composed.tls_interception_for("8.8.8.8:443".parse().unwrap(), None),
             pplx_space_net_common::TlsInterception::On
         );
         assert_eq!(composed.default_action(), default_action);

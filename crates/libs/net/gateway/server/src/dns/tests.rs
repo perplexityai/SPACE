@@ -392,7 +392,7 @@ fn exemption_dns_evidence_never_grants_egress() {
     for mut policy in [NetworkPolicyV1::deny_all(), NetworkPolicyV1::allow_all()] {
         policy
             .tls_interception_exemptions
-            .push(EgressDestinationV1::Domain(host.parse().unwrap()));
+            .push(EgressDestinationV1::Domain(host.parse().unwrap()).into());
         let cache = DnsAllowCache::default();
         assert!(cache.observe_response(&dns_a_response(host, [192, 0, 2, 10], 60), &policy));
         cache.retain_relevant_to_policy(&policy);

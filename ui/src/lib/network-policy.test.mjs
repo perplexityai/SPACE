@@ -64,10 +64,21 @@ test('policy equality includes effective TLS interception mode', () => {
 });
 
 test('policy edits preserve TLS exemptions and equality detects their removal', () => {
-  const loaded = { ...LEGACY_POLICY, tls_interception: 'on', tls_interception_exemptions: [{ domain: 'sensor.example.test' }] };
+  const loaded = {
+    ...LEGACY_POLICY,
+    tls_interception: 'on',
+    tls_interception_exemptions: [{ domain: 'sensor.example.test' }, { domain: 'push.example.test', port: 5228 }],
+  };
   for (const edited of [networkPolicyFromMode('open', loaded), networkPolicyFromDetailed('deny', [], loaded)]) {
     assert.deepEqual(edited.tls_interception_exemptions, loaded.tls_interception_exemptions);
   }
   assert.equal(networkPoliciesEqual(loaded, { ...loaded, tls_interception_exemptions: [] }), false);
+  assert.equal(
+    networkPoliciesEqual(loaded, {
+      ...loaded,
+      tls_interception_exemptions: [{ domain: 'sensor.example.test' }, { domain: 'push.example.test', port: 443 }],
+    }),
+    false,
+  );
   assert.equal(networkPoliciesEqual(LEGACY_POLICY, { ...LEGACY_POLICY, tls_interception_exemptions: [] }), true);
 });

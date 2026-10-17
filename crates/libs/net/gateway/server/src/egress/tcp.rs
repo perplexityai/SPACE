@@ -64,7 +64,7 @@ pub(crate) fn missing_client_hello(
         Some(DenyReason::Default) if dns_allow_cache.allows_ip(destination.ip(), policy) => {
             MissingClientHello::Denied
         }
-        None if !policy.tls_interception_for(destination.ip(), None).is_off() => {
+        None if !policy.tls_interception_for(destination, None).is_off() => {
             MissingClientHello::Denied
         }
         _ => MissingClientHello::Proceeds,
@@ -103,7 +103,7 @@ pub(super) fn revalidate_tcp(
         .admitted_exempt_host
         .as_ref()
         .or_else(|| dns_attributed_host(connection.destination, &connection.scan, dns_allow_cache));
-    let interception = policy.tls_interception_for(connection.destination.ip(), attributed_host);
+    let interception = policy.tls_interception_for(connection.destination, attributed_host);
     // Opaque TLS cannot become inspected on the same transport.
     if connection.scan != ClientHelloScan::NotTls
         && connection.admitted_tls_interception.is_off()
@@ -152,7 +152,7 @@ fn check_tcp(
     attributed_host: Option<&DomainName>,
 ) -> Result<AdmittedTcp, DenyReason> {
     let decision = policy.egress_decision_for_socket(destination, dns_allowed);
-    let interception = policy.tls_interception_for(destination.ip(), attributed_host);
+    let interception = policy.tls_interception_for(destination, attributed_host);
     let explicit_domain_deny = scan
         .server_name()
         .is_some_and(|host| policy.denies_domain(host));

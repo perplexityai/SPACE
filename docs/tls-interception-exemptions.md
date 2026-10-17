@@ -12,12 +12,19 @@ Set `SPACE_TLS_INTERCEPTION_EXEMPTIONS` to the same JSON array on both the API
 service and the cluster-controller process that executes queued operations:
 
 ```json
-[{"domain":"relay.example.test"},{"wildcard_domain":"*.relay.example.test"}]
+[{"domain":"relay.example.test"},{"wildcard_domain":"*.relay.example.test"},
+ {"domain":"push.example.test","port":5228}]
 ```
+
+An entry without `port` exempts every destination port. An entry with `port`
+(1 to 65535) exempts only connections to that destination port; the same host
+on any other port keeps the policy's interception mode. An all-port entry and a
+port-scoped entry for the same host are distinct, not duplicates.
 
 Both processes validate this configuration at initialization, including
 cluster-controller standbys before leader election. Unset means disabled;
-empty, malformed, invalid-domain, and non-hostname destinations fail startup.
+empty, malformed, invalid-domain, invalid-port, and non-hostname destinations
+fail startup.
 There is no built-in destination list. Wildcards match leading-label suffixes,
 not arbitrary patterns, and do not match the suffix's apex domain.
 
@@ -42,7 +49,14 @@ other resolvers, expired attribution, or cached addresses without observed DNS
 can leave interception enabled.
 
 Before enabling, all policy readers and worker gateways must support
-`tls_interception_exemptions`. Removing the environment variable from both
+`tls_interception_exemptions`, and before configuring any `port` they must also
+support port-scoped exemptions, including the SPACE runtime shim that forwards
+a Kubernetes sandbox pod's policy. Older API and cluster-controller processes
+fail startup on a configured `port`, and older Rust JSON policy readers reject a
+policy that contains one. An older runtime shim drops the `port` and forwards an
+exemption for every port, so upgrade it first. Older gateways do not read
+port-scoped exemptions from the protobuf policy, so they keep intercepting those
+destinations rather than exempting every port. Removing the environment variable from both
 processes and rolling their replicas stops future composition but does not
 remove exemptions already persisted in sandbox overrides; remove those
 explicitly to roll back existing sandboxes.

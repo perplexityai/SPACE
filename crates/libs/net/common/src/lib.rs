@@ -20,6 +20,8 @@ const MAX_NETWORK_CREDENTIAL_PATH_PREFIX_BYTES: usize = 2048;
 
 pub mod tls_interception;
 pub use tls_interception::{TlsInterception, TlsInterceptionParseError};
+mod tls_interception_exemption;
+pub use tls_interception_exemption::TlsInterceptionExemptionV1;
 
 /// Host/sidecar transparent-proxy contract.
 pub mod proxy {
@@ -57,6 +59,12 @@ pub enum NetworkPolicyProtoError {
     },
     #[error("network_policy.network_credential_rules[{index}] is invalid: {message}")]
     InvalidNetworkCredentialRule { index: usize, message: String },
+    #[error("network_policy.tls_interception_exemptions_with_ports[{index}].port is invalid")]
+    InvalidTlsInterceptionExemptionPort { index: usize },
+    #[error(
+        "network_policy.tls_interception_exemptions_with_ports must contain a port-scoped exemption, and tls_interception_exemptions must equal its exemptions without a port"
+    )]
+    InconsistentTlsInterceptionExemptions,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -85,6 +93,8 @@ pub enum NetworkPolicyValidationError {
     ReservedNetworkCredentialHeaderName(String),
     #[error("network-credential supported_http_methods must contain GET, POST or HEAD")]
     InvalidNetworkCredentialHttpMethods,
+    #[error("TLS interception exemption port must be between 1 and 65535")]
+    InvalidTlsInterceptionExemptionPort,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -339,7 +349,7 @@ pub struct NetworkPolicyV1 {
         feature = "serde",
         serde(default, skip_serializing_if = "Vec::is_empty")
     )]
-    pub tls_interception_exemptions: Vec<EgressDestinationV1>,
+    pub tls_interception_exemptions: Vec<TlsInterceptionExemptionV1>,
 }
 
 #[cfg(feature = "serde")]
@@ -358,7 +368,7 @@ impl<'de> Deserialize<'de> for NetworkPolicyV1 {
             #[serde(default)]
             network_credential_rules: Vec<NetworkCredentialRuleV1>,
             #[serde(default)]
-            tls_interception_exemptions: Vec<EgressDestinationV1>,
+            tls_interception_exemptions: Vec<TlsInterceptionExemptionV1>,
         }
 
         let mut value = Helper::deserialize(deserializer)?;
@@ -414,15 +424,17 @@ impl NetworkPolicyV1 {
     }
 
     /// Select transport only; an exemption grants no egress permission.
-    /// The caller must verify the hostname is DNS-attributed to this IP.
+    /// The caller must verify the hostname is DNS-attributed to the destination IP.
     pub fn tls_interception_for(
         &self,
-        ip: IpAddr,
+        destination: SocketAddr,
         attributed_host: Option<&DomainName>,
     ) -> TlsInterception {
-        if self.tls_interception_exemptions.iter().any(|destination| {
-            destination.matches_ip(ip)
-                || attributed_host.is_some_and(|host| destination.matches_domain_name(host))
+        if self.tls_interception_exemptions.iter().any(|exemption| {
+            exemption.matches_port(destination.port())
+                && (exemption.destination.matches_ip(destination.ip())
+                    || attributed_host
+                        .is_some_and(|host| exemption.destination.matches_domain_name(host)))
         }) {
             TlsInterception::Off
         } else {
@@ -1062,10 +1074,7 @@ impl TryFrom<&proto::NetworkPolicyV1> for NetworkPolicyV1 {
         };
         let allow = proto_destinations_to_common("allow", &policy.allow)?;
         let deny = proto_destinations_to_common("deny", &policy.deny)?;
-        let tls_interception_exemptions = proto_destinations_to_common(
-            "tls_interception_exemptions",
-            &policy.tls_interception_exemptions,
-        )?;
+        let tls_interception_exemptions = tls_interception_exemption::from_proto(policy)?;
         let tls_interception = match proto::TlsInterception::try_from(policy.tls_interception) {
             Ok(proto::TlsInterception::Unspecified | proto::TlsInterception::Off) => {
                 TlsInterception::Off
@@ -1123,11 +1132,12 @@ impl From<&NetworkPolicyV1> for proto::NetworkPolicyV1 {
                 TlsInterception::On => proto::TlsInterception::On,
             }
             .into(),
-            tls_interception_exemptions: policy
-                .tls_interception_exemptions
-                .iter()
-                .map(Into::into)
-                .collect(),
+            tls_interception_exemptions: tls_interception_exemption::all_port_destinations(
+                &policy.tls_interception_exemptions,
+            ),
+            tls_interception_exemptions_with_ports: tls_interception_exemption::with_ports(
+                &policy.tls_interception_exemptions,
+            ),
             network_credential_rules: policy
                 .network_credential_rules
                 .iter()
@@ -1248,20 +1258,27 @@ fn proto_destinations_to_common(
         .iter()
         .enumerate()
         .map(|(index, value)| {
-            EgressDestinationV1::try_from(value).map_err(|error| match error {
-                ProtoDestinationError::MissingDestination => {
-                    NetworkPolicyProtoError::MissingDestination { field, index }
-                }
-                ProtoDestinationError::Invalid(message) => {
-                    NetworkPolicyProtoError::InvalidDestination {
-                        field,
-                        index,
-                        message,
-                    }
-                }
-            })
+            EgressDestinationV1::try_from(value)
+                .map_err(|error| proto_destination_error(field, index, error))
         })
         .collect()
+}
+
+fn proto_destination_error(
+    field: &'static str,
+    index: usize,
+    error: ProtoDestinationError,
+) -> NetworkPolicyProtoError {
+    match error {
+        ProtoDestinationError::MissingDestination => {
+            NetworkPolicyProtoError::MissingDestination { field, index }
+        }
+        ProtoDestinationError::Invalid(message) => NetworkPolicyProtoError::InvalidDestination {
+            field,
+            index,
+            message,
+        },
+    }
 }
 
 impl Default for NetworkPolicyV1 {

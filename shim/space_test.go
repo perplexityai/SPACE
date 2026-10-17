@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1083,6 +1084,15 @@ func TestSandboxNetworkPolicyTLSInterceptionExemptions(t *testing.T) {
 		{"empty destination", `[{}]`, false},
 		{"ambiguous destination", `[{"ip":"192.0.2.10","domain":"sensor.example.test"}]`, false},
 		{"wrong shape", `"sensor.example.test"`, false},
+		{"not an object", `["sensor.example.test"]`, false},
+		{"port without destination", `[{"port":5228}]`, false},
+		{"port zero", `[{"domain":"push.example.test","port":0}]`, false},
+		{"port too large", `[{"domain":"push.example.test","port":65536}]`, false},
+		{"string port", `[{"domain":"push.example.test","port":"5228"}]`, false},
+		{"null port", `[{"domain":"push.example.test","port":null}]`, false},
+		{"null destination", `[{"domain":null,"ip":"192.0.2.10"}]`, false},
+		{"unknown key", `[{"domain":"push.example.test","ports":[5228]}]`, false},
+		{"repeated key", `[{"domain":"push.example.test","port":5228,"port":443}]`, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			spec := &ociSpec{Annotations: map[string]string{
@@ -1184,6 +1194,45 @@ func TestSandboxNetworkPolicyCredentialRules(t *testing.T) {
 			rules := received.GetNetworkPolicy().GetNetworkCredentialRules()
 			if len(rules) != 1 || !proto.Equal(rules[0], wantRule) {
 				t.Fatalf("credential rules = %v, want %v", rules, wantRule)
+			}
+		})
+	}
+}
+
+// The Rust policy test checks the same fixture, so the shim forwards exactly
+// the bytes the Rust encoder produces, including port-scoped exemptions.
+func TestSandboxNetworkPolicyMatchesRustEncoding(t *testing.T) {
+	fixture, err := os.ReadFile("testdata/network-policy-tls-exemptions.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cases []struct {
+		Name        string          `json:"name"`
+		Policy      json.RawMessage `json:"policy"`
+		ProtobufHex string          `json:"protobuf_hex"`
+	}
+	if err := json.Unmarshal(fixture, &cases); err != nil {
+		t.Fatal(err)
+	}
+	if len(cases) == 0 {
+		t.Fatal("fixture has no cases")
+	}
+	for _, test := range cases {
+		t.Run(test.Name, func(t *testing.T) {
+			spec := &ociSpec{Annotations: map[string]string{
+				sandboxNetworkPolicyAnnotation:           string(test.Policy),
+				sandboxNetworkPolicyGenerationAnnotation: "1",
+			}}
+			config, err := spec.sandboxNetworkPolicy()
+			if err != nil {
+				t.Fatal(err)
+			}
+			wire, err := proto.Marshal(config.Policy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := hex.EncodeToString(wire); got != test.ProtobufHex {
+				t.Fatalf("protobuf = %s, want %s", got, test.ProtobufHex)
 			}
 		})
 	}

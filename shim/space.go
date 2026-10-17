@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/hex"
@@ -2060,11 +2061,11 @@ type autoLifecycleStageJSON struct {
 }
 
 type networkPolicyJSON struct {
-	Version                   *string                 `json:"version"`
-	Egress                    *egressPolicyJSON       `json:"egress"`
-	TLSInterception           json.RawMessage         `json:"tls_interception"`
-	TLSInterceptionExemptions []egressDestinationJSON `json:"tls_interception_exemptions"`
-	NetworkCredentialRules    json.RawMessage         `json:"network_credential_rules"`
+	Version                   *string           `json:"version"`
+	Egress                    *egressPolicyJSON `json:"egress"`
+	TLSInterception           json.RawMessage   `json:"tls_interception"`
+	TLSInterceptionExemptions []json.RawMessage `json:"tls_interception_exemptions"`
+	NetworkCredentialRules    json.RawMessage   `json:"network_credential_rules"`
 }
 
 type sandboxNetworkPolicyConfig struct {
@@ -2481,7 +2482,7 @@ func parseNetworkPolicyJSON(raw string) (*netpb.NetworkPolicyV1, error) {
 	if err != nil {
 		return nil, err
 	}
-	exemptions, err := parseEgressDestinations(decoded.TLSInterceptionExemptions, "tls_interception_exemptions")
+	exemptions, withPorts, err := parseTLSInterceptionExemptions(decoded.TLSInterceptionExemptions)
 	if err != nil {
 		return nil, err
 	}
@@ -2490,13 +2491,14 @@ func parseNetworkPolicyJSON(raw string) (*netpb.NetworkPolicyV1, error) {
 		return nil, fmt.Errorf("network policy network_credential_rules: %w", err)
 	}
 	return &netpb.NetworkPolicyV1{
-		Version:                   netpb.NetworkPolicyVersion_NETWORK_POLICY_VERSION_V1,
-		EgressDefaultAction:       action,
-		Allow:                     allow,
-		Deny:                      deny,
-		TlsInterception:           tlsInterception,
-		TlsInterceptionExemptions: exemptions,
-		NetworkCredentialRules:    credentialRules,
+		Version:                            netpb.NetworkPolicyVersion_NETWORK_POLICY_VERSION_V1,
+		EgressDefaultAction:                action,
+		Allow:                              allow,
+		Deny:                               deny,
+		TlsInterception:                    tlsInterception,
+		TlsInterceptionExemptions:          exemptions,
+		TlsInterceptionExemptionsWithPorts: withPorts,
+		NetworkCredentialRules:             credentialRules,
 	}, nil
 }
 
@@ -2605,6 +2607,90 @@ func parseEgressDestination(destination egressDestinationJSON) (*netpb.EgressDes
 	default:
 		return &netpb.EgressDestinationV1{Destination: &netpb.EgressDestinationV1_WildcardDomain{WildcardDomain: values[3]}}, nil
 	}
+}
+
+// parseTLSInterceptionExemptions encodes exemptions as the Rust policy does:
+// field 7 holds the exemptions that cover every port, and field 8 holds the
+// full ordered list when any exemption names a port. A reader that predates
+// ports therefore intercepts a port-scoped destination instead of exempting
+// all of its ports.
+func parseTLSInterceptionExemptions(raw []json.RawMessage) ([]*netpb.EgressDestinationV1, []*netpb.TlsInterceptionExemptionV1, error) {
+	allPorts := make([]*netpb.EgressDestinationV1, 0, len(raw))
+	ordered := make([]*netpb.TlsInterceptionExemptionV1, 0, len(raw))
+	portScoped := false
+	for index, entry := range raw {
+		exemption, err := parseTLSInterceptionExemption(entry)
+		if err != nil {
+			return nil, nil, fmt.Errorf("network policy tls_interception_exemptions[%d]: %w", index, err)
+		}
+		if exemption.Port == nil {
+			allPorts = append(allPorts, exemption.Destination)
+		} else {
+			portScoped = true
+		}
+		ordered = append(ordered, exemption)
+	}
+	if !portScoped {
+		ordered = nil
+	}
+	return allPorts, ordered, nil
+}
+
+// parseTLSInterceptionExemption reads one destination key and an optional
+// port. Like the Rust reader, it rejects unknown, repeated and null keys
+// instead of ignoring them, so it never drops a restriction it does not know.
+func parseTLSInterceptionExemption(raw json.RawMessage) (*netpb.TlsInterceptionExemptionV1, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	if token, err := decoder.Token(); err != nil || token != json.Delim('{') {
+		return nil, fmt.Errorf("exemption must be an object")
+	}
+	var destination egressDestinationJSON
+	var port *uint32
+	seen := map[string]bool{}
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return nil, err
+		}
+		key, _ := token.(string)
+		if seen[key] {
+			return nil, fmt.Errorf("duplicate key %q", key)
+		}
+		seen[key] = true
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return nil, err
+		}
+		if string(value) == "null" {
+			return nil, fmt.Errorf("%s must not be null", key)
+		}
+		switch key {
+		case "ip":
+			err = json.Unmarshal(value, &destination.IP)
+		case "cidr":
+			err = json.Unmarshal(value, &destination.CIDR)
+		case "domain":
+			err = json.Unmarshal(value, &destination.Domain)
+		case "wildcard_domain":
+			err = json.Unmarshal(value, &destination.WildcardDomain)
+		case "port":
+			var parsed uint32
+			if err = json.Unmarshal(value, &parsed); err == nil && (parsed == 0 || parsed > 65535) {
+				err = fmt.Errorf("must be between 1 and 65535")
+			}
+			port = &parsed
+		default:
+			return nil, fmt.Errorf("unknown key %q", key)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("invalid %s: %w", key, err)
+		}
+	}
+	parsed, err := parseEgressDestination(destination)
+	if err != nil {
+		return nil, err
+	}
+	return &netpb.TlsInterceptionExemptionV1{Destination: parsed, Port: port}, nil
 }
 
 // traceparent returns the W3C context of the Rust operation that materialized

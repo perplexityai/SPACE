@@ -606,6 +606,7 @@ fn wire_policy(egress: Egress) -> policy_proto::NetworkPolicyV1 {
                 ],
             }],
             tls_interception_exemptions: Vec::new(),
+            tls_interception_exemptions_with_ports: Vec::new(),
         },
     }
 }

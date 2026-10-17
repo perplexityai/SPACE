@@ -932,8 +932,8 @@ fn interception_exemptions_round_trip_without_granting_egress() {
     let mut policy = NetworkPolicyV1::deny_all();
     policy.tls_interception = TlsInterception::On;
     policy.tls_interception_exemptions = vec![
-        EgressDestinationV1::Ip("192.0.2.10".parse().unwrap()),
-        EgressDestinationV1::Domain("sensor.example.test".parse().unwrap()),
+        EgressDestinationV1::Ip("192.0.2.10".parse().unwrap()).into(),
+        EgressDestinationV1::Domain("sensor.example.test".parse().unwrap()).into(),
     ];
     let json = serde_json::to_string(&policy).unwrap();
     assert_eq!(
@@ -962,10 +962,10 @@ fn tls_exemptions_select_transport_by_destination() {
     let mut policy = NetworkPolicyV1::allow_all();
     policy.tls_interception = TlsInterception::On;
     policy.tls_interception_exemptions = vec![
-        EgressDestinationV1::Domain("sensor.example.test".parse().unwrap()),
-        EgressDestinationV1::Ip("192.0.2.10".parse().unwrap()),
-        EgressDestinationV1::Cidr("198.51.100.0/24".parse().unwrap()),
-        EgressDestinationV1::WildcardDomain("*.pinned.example.test".parse().unwrap()),
+        EgressDestinationV1::Domain("sensor.example.test".parse().unwrap()).into(),
+        EgressDestinationV1::Ip("192.0.2.10".parse().unwrap()).into(),
+        EgressDestinationV1::Cidr("198.51.100.0/24".parse().unwrap()).into(),
+        EgressDestinationV1::WildcardDomain("*.pinned.example.test".parse().unwrap()).into(),
     ];
     for (ip, host, expected) in [
         (
@@ -998,9 +998,231 @@ fn tls_exemptions_select_transport_by_destination() {
         ("203.0.113.10", None, TlsInterception::On),
     ] {
         let host = host.map(|host| host.parse().unwrap());
+        let ip: IpAddr = ip.parse().unwrap();
+        for port in [443, 5228] {
+            assert_eq!(
+                policy.tls_interception_for(SocketAddr::new(ip, port), host.as_ref()),
+                expected
+            );
+        }
+    }
+}
+
+fn port_scoped(destination: EgressDestinationV1, port: u32) -> TlsInterceptionExemptionV1 {
+    TlsInterceptionExemptionV1::new(destination, Some(port)).unwrap()
+}
+
+fn mixed_exemption_policy() -> NetworkPolicyV1 {
+    let mut policy = NetworkPolicyV1::allow_all();
+    policy.tls_interception = TlsInterception::On;
+    policy.tls_interception_exemptions = vec![
+        EgressDestinationV1::Domain("sensor.example.test".parse().unwrap()).into(),
+        port_scoped(
+            EgressDestinationV1::Domain("push.example.test".parse().unwrap()),
+            5228,
+        ),
+        EgressDestinationV1::Ip("192.0.2.10".parse().unwrap()).into(),
+        port_scoped(
+            EgressDestinationV1::Cidr("198.51.100.0/24".parse().unwrap()),
+            8443,
+        ),
+    ];
+    policy
+}
+
+#[test]
+fn port_scoped_tls_exemptions_apply_only_on_their_port() {
+    let policy = mixed_exemption_policy();
+    let push = "push.example.test".parse().unwrap();
+    let sensor = "sensor.example.test".parse().unwrap();
+    for (destination, host, expected) in [
+        ("203.0.113.10:5228", Some(&push), TlsInterception::Off),
+        ("203.0.113.10:443", Some(&push), TlsInterception::On),
+        ("198.51.100.10:8443", None, TlsInterception::Off),
+        ("198.51.100.10:443", None, TlsInterception::On),
+        ("203.0.113.10:443", Some(&sensor), TlsInterception::Off),
+        ("203.0.113.10:5228", Some(&sensor), TlsInterception::Off),
+        ("192.0.2.10:8443", None, TlsInterception::Off),
+    ] {
         assert_eq!(
-            policy.tls_interception_for(ip.parse().unwrap(), host.as_ref()),
-            expected
+            policy.tls_interception_for(destination.parse().unwrap(), host),
+            expected,
+            "{destination} {host:?}"
         );
     }
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn tls_exemptions_without_ports_keep_their_json_and_hash() {
+    let mut policy = NetworkPolicyV1::deny_all();
+    policy.tls_interception = TlsInterception::On;
+    policy.tls_interception_exemptions = vec![
+        EgressDestinationV1::Ip("192.0.2.10".parse().unwrap()).into(),
+        EgressDestinationV1::Cidr("198.51.100.0/24".parse().unwrap()).into(),
+        EgressDestinationV1::Domain("sensor.example.test".parse().unwrap()).into(),
+        EgressDestinationV1::WildcardDomain("*.pinned.example.test".parse().unwrap()).into(),
+    ];
+    // Produced by the release that stored exemptions as plain destinations.
+    let json = r#"{"version":"v1","egress":{"default_action":"deny","allow":[],"deny":[]},"tls_interception":"on","tls_interception_exemptions":[{"ip":"192.0.2.10"},{"cidr":"198.51.100.0/24"},{"domain":"sensor.example.test"},{"wildcard_domain":"*.pinned.example.test"}]}"#;
+    assert_eq!(serde_json::to_string(&policy).unwrap(), json);
+    assert_eq!(
+        network_policy_hash(&policy),
+        "31544b7b1f2205e1917866086171bdc2c2dca98b0d665c8d1338ebaf95870c98"
+    );
+    assert_eq!(
+        serde_json::from_str::<NetworkPolicyV1>(json).unwrap(),
+        policy
+    );
+    let wire = proto::NetworkPolicyV1::from(&policy);
+    assert!(wire.tls_interception_exemptions_with_ports.is_empty());
+    assert_eq!(wire.tls_interception_exemptions.len(), 4);
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn port_scoped_tls_exemptions_round_trip_in_order() {
+    let policy = mixed_exemption_policy();
+    let json = serde_json::to_value(&policy).unwrap();
+    assert_eq!(
+        json["tls_interception_exemptions"],
+        serde_json::json!([
+            {"domain": "sensor.example.test"},
+            {"domain": "push.example.test", "port": 5228},
+            {"ip": "192.0.2.10"},
+            {"cidr": "198.51.100.0/24", "port": 8443},
+        ])
+    );
+    let decoded = serde_json::from_value::<NetworkPolicyV1>(json).unwrap();
+    assert_eq!(decoded, policy);
+    let wire = proto::NetworkPolicyV1::from(&policy);
+    let from_wire = NetworkPolicyV1::try_from(&wire).unwrap();
+    assert_eq!(from_wire, policy);
+    // Policy producers and the credential store hash different decodings.
+    assert_eq!(
+        network_policy_hash(&from_wire),
+        network_policy_hash(&decoded)
+    );
+}
+
+// The Kubernetes shim re-encodes the policy annotation in Go, and its test
+// checks the same fixture, so both encoders produce these bytes.
+#[cfg(feature = "serde")]
+#[test]
+fn shim_policy_fixture_matches_the_rust_encoding() {
+    use prost::Message as _;
+
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../../shim/testdata/network-policy-tls-exemptions.json"
+    ))
+    .unwrap();
+    for case in fixture.as_array().unwrap() {
+        let name = &case["name"];
+        let policy: NetworkPolicyV1 = serde_json::from_value(case["policy"].clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&policy).unwrap(),
+            case["policy"],
+            "{name}"
+        );
+        let wire = proto::NetworkPolicyV1::from(&policy).encode_to_vec();
+        let hex: String = wire.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(Some(hex.as_str()), case["protobuf_hex"].as_str(), "{name}");
+    }
+}
+
+#[test]
+fn older_protobuf_readers_keep_intercepting_port_scoped_destinations() {
+    let policy = mixed_exemption_policy();
+    let mut wire = proto::NetworkPolicyV1::from(&policy);
+    assert_eq!(wire.tls_interception_exemptions_with_ports.len(), 4);
+    // A reader without field 8 sees only the exemptions that cover every port.
+    wire.tls_interception_exemptions_with_ports.clear();
+    let older = NetworkPolicyV1::try_from(&wire).unwrap();
+    assert_eq!(
+        older.tls_interception_exemptions,
+        vec![
+            EgressDestinationV1::Domain("sensor.example.test".parse().unwrap()).into(),
+            EgressDestinationV1::Ip("192.0.2.10".parse().unwrap()).into(),
+        ]
+    );
+    let push = "push.example.test".parse().unwrap();
+    for port in [443, 5228] {
+        assert_eq!(
+            older.tls_interception_for(
+                SocketAddr::new("203.0.113.10".parse().unwrap(), port),
+                Some(&push)
+            ),
+            TlsInterception::On
+        );
+    }
+}
+
+#[test]
+fn inconsistent_tls_exemption_protobuf_is_rejected() {
+    let policy = mixed_exemption_policy();
+    let wire = proto::NetworkPolicyV1::from(&policy);
+
+    let mut missing_projection = wire.clone();
+    missing_projection.tls_interception_exemptions.pop();
+    let mut reordered_projection = wire.clone();
+    reordered_projection.tls_interception_exemptions.reverse();
+    let mut no_port_scoped_entry = wire.clone();
+    no_port_scoped_entry
+        .tls_interception_exemptions_with_ports
+        .retain(|exemption| exemption.port.is_none());
+    for wire in [
+        missing_projection,
+        reordered_projection,
+        no_port_scoped_entry,
+    ] {
+        assert!(matches!(
+            NetworkPolicyV1::try_from(&wire),
+            Err(NetworkPolicyProtoError::InconsistentTlsInterceptionExemptions)
+        ));
+    }
+
+    for port in [0, 65_536] {
+        let mut invalid_port = wire.clone();
+        invalid_port.tls_interception_exemptions_with_ports[1].port = Some(port);
+        assert!(matches!(
+            NetworkPolicyV1::try_from(&invalid_port),
+            Err(NetworkPolicyProtoError::InvalidTlsInterceptionExemptionPort { index: 1 })
+        ));
+    }
+    let mut missing_destination = wire;
+    missing_destination.tls_interception_exemptions_with_ports[3].destination = None;
+    assert!(matches!(
+        NetworkPolicyV1::try_from(&missing_destination),
+        Err(NetworkPolicyProtoError::MissingDestination {
+            field: "tls_interception_exemptions_with_ports",
+            index: 3
+        })
+    ));
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn invalid_tls_exemption_json_is_rejected() {
+    for exemption in [
+        r#"{"domain":"push.example.test","port":0}"#,
+        r#"{"domain":"push.example.test","port":65536}"#,
+        r#"{"domain":"push.example.test","port":"5228"}"#,
+        r#"{"port":5228}"#,
+        r#"{}"#,
+        r#"{"domain":"push.example.test","ip":"192.0.2.10"}"#,
+        r#"{"domain":"push.example.test","ports":[5228]}"#,
+        r#"{"domain":"bad host","port":5228}"#,
+        r#"{"domain":"push.example.test","port":null}"#,
+        r#"{"domain":null,"ip":"192.0.2.10"}"#,
+    ] {
+        serde_json::from_str::<TlsInterceptionExemptionV1>(exemption).unwrap_err();
+    }
+    // Readers that predate ports parse each exemption as a plain destination,
+    // which rejects a port instead of silently widening the exemption.
+    serde_json::from_str::<EgressDestinationV1>(r#"{"domain":"push.example.test","port":5228}"#)
+        .unwrap_err();
+    serde_json::from_value::<EgressDestinationV1>(
+        serde_json::json!({"domain": "push.example.test", "port": 5228}),
+    )
+    .unwrap_err();
 }
