@@ -1,5 +1,6 @@
 use super::super::{
     BuildAuthenticator, authorize_template_build, system_publication_requires_grant,
+    tenant_publication_requires_grant,
 };
 use super::*;
 use crate::auth::test_support::{TokenReviewStatus, service_account_status, token_review_service};
@@ -160,7 +161,11 @@ async fn build_owner_authority_comes_from_reviewed_identity() {
                 .and_then(|caller| {
                     let mut request = tonic::Request::new(());
                     request.extensions_mut().insert(caller.unwrap());
-                    authorize_template_build(&request, owner)
+                    authorize_template_build(&request, owner)?;
+                    // Submission asserts the requester; only publication of
+                    // the output is bound to a dispatched build.
+                    assert!(!tenant_publication_requires_grant(&request));
+                    Ok(())
                 });
 
             assert_eq!(
@@ -272,33 +277,39 @@ async fn unavailable_token_review_never_grants_build_authority() {
 /// publisher holds system authority alone and needs none.
 #[tokio::test]
 async fn publication_authority_is_method_scoped_and_comes_from_token_review() {
+    // (system grant required, tenant grant required) for an allowed caller.
     for (account, owner, expected, requires_grant) in [
-        ("workers", None, Some(Code::PermissionDenied), false),
+        (
+            "workers",
+            None,
+            Some(Code::PermissionDenied),
+            (false, false),
+        ),
         (
             "workers",
             Some("tenant"),
             Some(Code::PermissionDenied),
-            false,
+            (false, false),
         ),
         (
             "space-api",
             Some("tenant"),
             Some(Code::PermissionDenied),
-            false,
+            (false, false),
         ),
-        ("space-build-manager", None, None, true),
-        ("space-build-manager", Some("tenant"), None, true),
-        ("space-template-publish", None, None, false),
+        ("space-build-manager", None, None, (true, true)),
+        ("space-build-manager", Some("tenant"), None, (true, true)),
+        ("space-template-publish", None, None, (false, false)),
         (
             "space-template-publish",
             Some("tenant"),
             Some(Code::PermissionDenied),
-            false,
+            (false, false),
         ),
     ] {
         for method in ["RegisterTemplate", "RegisterTemplateRelease"] {
             let (mut reviewer, calls) = reviewer(
-                service_account_status(
+                bound_publisher_status(
                     "space-cluster-api",
                     &format!("system:serviceaccount:space:{account}"),
                 ),
@@ -325,7 +336,10 @@ async fn publication_authority_is_method_scoped_and_comes_from_token_review() {
                     let mut request = tonic::Request::new(());
                     request.extensions_mut().insert(caller.unwrap());
                     authorize_template_build(&request, owner)?;
-                    Ok(system_publication_requires_grant(&request))
+                    Ok((
+                        system_publication_requires_grant(&request),
+                        tenant_publication_requires_grant(&request),
+                    ))
                 });
             assert_eq!(
                 result.as_ref().err().map(tonic::Status::code),
@@ -333,7 +347,7 @@ async fn publication_authority_is_method_scoped_and_comes_from_token_review() {
                 "{account}: {method}"
             );
             assert_eq!(
-                result.unwrap_or(false),
+                result.unwrap_or((false, false)),
                 requires_grant,
                 "{account}: {method}"
             );
@@ -348,6 +362,70 @@ async fn publication_authority_is_method_scoped_and_comes_from_token_review() {
                 .is_none()
             );
             assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+    }
+}
+
+fn bound_publisher_status(audience: &str, username: &str) -> TokenReviewStatus {
+    let mut status = service_account_status(audience, username);
+    status.user.as_mut().unwrap().extra = Some(
+        [
+            (
+                "authentication.kubernetes.io/pod-name".into(),
+                vec!["builder-pod".into()],
+            ),
+            (
+                "authentication.kubernetes.io/pod-uid".into(),
+                vec!["builder-pod-uid".into()],
+            ),
+            (
+                "authentication.kubernetes.io/node-name".into(),
+                vec!["builder-node".into()],
+            ),
+            (
+                "authentication.kubernetes.io/node-uid".into(),
+                vec!["builder-node-uid".into()],
+            ),
+        ]
+        .into(),
+    );
+    status
+}
+
+#[tokio::test]
+async fn publication_requires_unambiguous_reviewed_pod_and_node() {
+    for values in [
+        None,
+        Some(vec![]),
+        Some(vec!["first".to_string(), "second".to_string()]),
+    ] {
+        for key in ["pod-name", "pod-uid", "node-name", "node-uid"] {
+            let mut status = bound_publisher_status(
+                "space-cluster-api",
+                "system:serviceaccount:space:space-build-manager",
+            );
+            let extra = status.user.as_mut().unwrap().extra.as_mut().unwrap();
+            let key = format!("authentication.kubernetes.io/{key}");
+            match &values {
+                Some(values) => {
+                    extra.insert(key, values.clone());
+                }
+                None => {
+                    extra.remove(&key);
+                }
+            }
+            let (mut reviewer, _) = reviewer(status, "space-cluster-api");
+            reviewer.policy = BuildPolicy::new(
+                BuildSurface::Publication,
+                "space-cluster-api".into(),
+                accounts(&["space-build-manager"]),
+                BTreeSet::new(),
+                accounts(&["space-build-manager"]),
+            );
+
+            let result = reviewer.authenticate(TOKEN).await;
+
+            assert_eq!(result.unwrap_err().code(), Code::PermissionDenied);
         }
     }
 }

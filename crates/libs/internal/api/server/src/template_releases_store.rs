@@ -100,6 +100,12 @@ impl TemplateReadScope {
     }
 }
 
+pub(super) enum PublicationNode {
+    Registered(NodeId),
+    PendingInventory,
+    Denied,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct TemplateReleasesStore {
     pool: PgPool,
@@ -130,6 +136,31 @@ impl TemplateReleasesStore {
         .fetch_all(&self.pool)
         .await?;
         Ok(TemplateReadScope::NodeScoped { node_ids })
+    }
+
+    /// A bootstrap name is not authority: wait for inventory to supply its UID.
+    pub(super) async fn publisher_node_for_identity(
+        &self,
+        node: &pplx_space_common_svc::auth::build::AuthenticatedBuildNode,
+    ) -> Result<PublicationNode, sqlx::Error> {
+        let rows = sqlx::query_as::<_, (NodeId, Option<bool>)>(sql!(
+            "SELECT n.id, k.k8s_node_uid = $2
+             FROM nodes n JOIN node_k8s k ON k.node_id = n.id
+             WHERE k.k8s_node_name = $1
+               AND n.role = 'builder' AND n.managed_by = 'k8s'
+               AND COALESCE(n.state, 'registered') != 'deleted'"
+        ))
+        .bind(node.name.as_str())
+        .bind(node.uid.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        if let Some((id, _)) = rows.iter().find(|(_, matches)| *matches == Some(true)) {
+            Ok(PublicationNode::Registered(*id))
+        } else if rows.iter().any(|(_, matches)| matches.is_none()) {
+            Ok(PublicationNode::PendingInventory)
+        } else {
+            Ok(PublicationNode::Denied)
+        }
     }
 
     /// Unscoped lookups with no caller organization or generic-only requirement
