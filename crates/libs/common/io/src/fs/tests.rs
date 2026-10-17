@@ -21,6 +21,41 @@ fn read_all(p: &Path) -> Vec<u8> {
 }
 
 #[test]
+fn interrupted_stream_reads_preserve_plaintext() {
+    struct InterruptedReader<R> {
+        inner: R,
+        interrupt: bool,
+    }
+    impl<R: Read> Read for InterruptedReader<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.interrupt = !self.interrupt;
+            if self.interrupt {
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            let length = buf.len().min(8192);
+            self.inner.read(&mut buf[..length])
+        }
+    }
+
+    let multiple_chunks = vec![0xAB; CHUNK_SIZE * 2 + 7];
+    for plaintext in [b"".as_slice(), b"example payload", &multiple_chunks] {
+        let mut source = InterruptedReader {
+            inner: plaintext,
+            interrupt: false,
+        };
+        let mut encrypted = Vec::new();
+        encrypt_stream_blocking(&mut source, &mut encrypted, &key(), &aad()).unwrap();
+        let mut source = InterruptedReader {
+            inner: encrypted.as_slice(),
+            interrupt: false,
+        };
+        let mut recovered = Vec::new();
+        decrypt_stream_blocking(&mut source, &mut recovered, &key(), &aad()).unwrap();
+        assert_eq!(recovered, plaintext);
+    }
+}
+
+#[test]
 fn round_trips_small_input() {
     let dir = tempfile::tempdir().unwrap();
     let pt = b"hello, BYOK";
