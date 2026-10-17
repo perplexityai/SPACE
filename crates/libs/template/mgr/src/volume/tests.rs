@@ -197,20 +197,10 @@ fn lookup_tag_returns_req_tag_or_default() {
     assert_eq!(lookup_tag(""), "latest");
 }
 
-/// `do_pull` must refuse to start when the build's row is in
-/// `state='deleting'`. Without this guard, an
-/// on-demand pull racing eviction would write artifacts the
-/// eviction is about to delete (and its upsert would either
-/// no-op or resurrect the doomed row depending on which fix
-/// is in place).
-#[tokio::test]
-async fn do_pull_aborts_early_when_build_is_marked_deleting() {
-    use std::sync::Mutex;
-
-    let conn = crate::db::test_conn();
-    let hash = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+/// Commits a `ready` build row for template `seed` at `hash`.
+fn seed_ready_build(conn: &rusqlite::Connection, hash: &str) {
     crate::db::upsert_build(
-        &conn,
+        conn,
         &crate::db::BuildUpsert {
             name: "seed",
             content_hash: hash,
@@ -223,6 +213,21 @@ async fn do_pull_aborts_early_when_build_is_marked_deleting() {
         },
     )
     .unwrap();
+}
+
+/// `do_pull` must refuse to start when the build's row is in
+/// `state='deleting'`. Without this guard, an
+/// on-demand pull racing eviction would write artifacts the
+/// eviction is about to delete (and its upsert would either
+/// no-op or resurrect the doomed row depending on which fix
+/// is in place).
+#[tokio::test]
+async fn do_pull_aborts_early_when_build_is_marked_deleting() {
+    use std::sync::Mutex;
+
+    let conn = crate::db::test_conn();
+    let hash = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    seed_ready_build(&conn, hash);
     // Eviction Phase 1: flip to deleting.
     conn.execute(
         "UPDATE template_builds SET state = 'deleting' WHERE name = ?1 AND content_hash = ?2",
@@ -382,6 +387,52 @@ fn coalesced_non_materialized_result_keeps_owner_path() {
         assert!(!result.mark_coalesced_if_materialized());
         assert_eq!(result.path, PullPath::FreshPull);
     }
+}
+
+/// A release resolved before materialization (the caller-scoped
+/// `GetTemplate` path) must still count as an on-demand pull, with the same
+/// tags and outcome labels `pull()` records.
+#[rstest::rstest]
+#[case::db_hit(true, "db_hit")]
+#[case::no_storage_locations(false, "failed_precondition")]
+#[tokio::test]
+async fn materialize_release_records_on_demand_pull_duration(
+    #[case] seed_build: bool,
+    #[case] expected_result: &str,
+) {
+    let conn = crate::db::test_conn();
+    let hash = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    if seed_build {
+        seed_ready_build(&conn, hash);
+    }
+    let db = Arc::new(Mutex::new(conn));
+    let release = ResolvedRelease {
+        authorized_org: None,
+        hash: hash.to_string(),
+        storage_uris: Vec::new(),
+        visibility: TemplateVisibility::Generic,
+    };
+
+    let capture = pplx_space_metrics::test_capture::capture_values_guard();
+    VolumePuller::new()
+        .materialize_release(db, "seed", release)
+        .await;
+    let durations: Vec<_> = capture
+        .finish()
+        .into_iter()
+        .filter(|value| value.name == "template.pull.duration_ms")
+        .map(|value| value.tags)
+        .collect();
+
+    assert_eq!(
+        durations,
+        vec![vec![
+            "template:seed".to_string(),
+            "tag:by_hash".to_string(),
+            "trigger:on_demand".to_string(),
+            format!("result:{expected_result}"),
+        ]]
+    );
 }
 
 #[test]
