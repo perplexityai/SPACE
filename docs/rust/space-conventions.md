@@ -198,6 +198,16 @@ lines elsewhere that compare `managed_by` with a raw `'k8s'` or `'space'`
 (`crates/libs/api/src/controllers/substrate/direct.rs` has about a dozen).
 Convert them when touched; they are not a pattern to copy.
 
+- A decision about one row's substrate, its sandbox or node `managed_by`,
+  calls a `SubstrateKind` method named for the question (for example
+  `proves_execution_absence` or `restores_through_pods`); add one when no
+  method asks it. Rust that repeats a statement's fixed scope compares
+  against the named const the statement binds (for example the admin node
+  registry's `REGISTRY_SUBSTRATE`), and mapping a `SubstrateKind` variant to
+  a value (wire labels, route identity, construction) may match it. A fact
+  about the running substrate reads the api crate's `capabilities()`
+  (`SubstrateCapabilities`). Never compare the label string.
+
 ## Log targets: pin the ones searches select on
 
 A `tracing` event without `target:` takes `module_path!()` as its target, as

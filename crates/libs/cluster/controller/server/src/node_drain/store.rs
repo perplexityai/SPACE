@@ -1198,7 +1198,12 @@ pub(crate) fn stopped_evacuation_stall_secs_query() -> String {
     )
 }
 
-/// `$1` = drain phase (`draining`), `$2` = [`SubstrateKind::Kubernetes`]. The
+/// The substrate whose nodes this reconciler drains: its draining and
+/// terminating listings bind it, and it is the one substrate that
+/// [`has_node_drain_reconciler`](SubstrateKind::has_node_drain_reconciler).
+pub(crate) const DRAIN_RECONCILER_SUBSTRATE: SubstrateKind = SubstrateKind::Kubernetes;
+
+/// `$1` = drain phase (`draining`), `$2` = [`DRAIN_RECONCILER_SUBSTRATE`]. The
 /// reconciler's per-tick work list: every k8s-managed node in that phase, with
 /// the drain mode chosen for it.
 ///
@@ -1212,7 +1217,7 @@ pub(crate) fn draining_nodes_query() -> &'static str {
     )
 }
 
-/// `$1` = drain phase (`terminating`), `$2` = [`SubstrateKind::Kubernetes`].
+/// `$1` = drain phase (`terminating`), `$2` = [`DRAIN_RECONCILER_SUBSTRATE`].
 /// The terminating-node work list, scoped like [`draining_nodes_query`].
 pub(crate) fn terminating_nodes_query() -> &'static str {
     sql!("SELECT id FROM nodes WHERE drain_phase = $1 AND managed_by = $2")
@@ -3456,7 +3461,7 @@ impl NodeDrainSink for SubstrateSink {
         // `from_column_str` resolves both NULL and unrecognized to gentle.
         let rows: Vec<(NodeId, Option<String>)> = sqlx::query_as(draining_nodes_query())
             .bind(PHASE_DRAINING)
-            .bind(SubstrateKind::Kubernetes)
+            .bind(DRAIN_RECONCILER_SUBSTRATE)
             .fetch_all(&self.pool)
             .await?;
         Ok(rows
@@ -3488,7 +3493,7 @@ impl NodeDrainSink for SubstrateSink {
     async fn list_terminating_nodes(&self) -> Result<Vec<NodeId>, sqlx::Error> {
         sqlx::query_scalar::<_, NodeId>(terminating_nodes_query())
             .bind(PHASE_TERMINATING)
-            .bind(SubstrateKind::Kubernetes)
+            .bind(DRAIN_RECONCILER_SUBSTRATE)
             .fetch_all(&self.pool)
             .await
     }

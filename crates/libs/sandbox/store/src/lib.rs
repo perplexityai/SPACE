@@ -514,15 +514,17 @@ pub struct AutoLifecycleExecution {
 }
 
 impl AutoLifecycleExecution {
-    /// Kubernetes publishes activation ownership before launching a runtime;
-    /// direct launch does not provide equivalent durable proof of absence.
-    /// `managed_by` holds the column's text; only a value that parses as
-    /// [`SubstrateKind::Kubernetes`] proves absence.
+    /// A row with no placement, no active or target node, no execution
+    /// generation, no direct route and no activation lease has no execution,
+    /// but only if its substrate
+    /// [proves execution absence](SubstrateKind::proves_execution_absence).
+    /// `managed_by` holds the column's text; a value that does not parse
+    /// proves nothing.
     pub fn proves_no_execution(&self) -> bool {
-        matches!(
-            self.managed_by.parse::<SubstrateKind>(),
-            Ok(SubstrateKind::Kubernetes)
-        ) && self.placement == "unplaced"
+        self.managed_by
+            .parse::<SubstrateKind>()
+            .is_ok_and(SubstrateKind::proves_execution_absence)
+            && self.placement == "unplaced"
             && self.active_node_id.is_none()
             && self.target_node_id.is_none()
             && self.execution_generation.is_none()

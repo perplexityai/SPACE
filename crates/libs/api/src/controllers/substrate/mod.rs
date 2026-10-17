@@ -1064,6 +1064,8 @@ pub struct SubstrateCapabilities {
     /// substrate, not from this field). When false, the admin drain, cordon
     /// and force-upload actions refuse before reading the node, except
     /// `:undrain`, which only clears a `drain_phase` an earlier drain left.
+    /// A node row's counterpart is
+    /// [`SubstrateKind::has_node_drain_reconciler`](pplx_space_common_core::types::SubstrateKind::has_node_drain_reconciler).
     pub supports_node_drain: bool,
     /// The cluster controller may run as several replicas, so each one
     /// contends for a leader `Lease` on the apiserver and only the holder runs
