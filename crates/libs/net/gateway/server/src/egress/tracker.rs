@@ -115,6 +115,11 @@ impl DnsAttributedTcpTracker {
         cancelled
     }
 
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.inner.connections.lock().len()
+    }
+
     fn unregister(&self, id: u64) {
         self.inner.connections.lock().remove(&id);
     }

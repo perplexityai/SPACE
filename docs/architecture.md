@@ -260,6 +260,17 @@ Explicit destination denies and platform guardrails take precedence. Exemptions
 grant no egress permission and bypass HTTP inspection and credential injection.
 Other destinations retain the policy's interception mode.
 
+With `tls_interception` `on`, a connection whose guest sends nothing is normally
+closed, because interception needs the ClientHello's SNI. If the destination
+was admitted without DNS evidence (an IP or CIDR allow, or a default-allow
+policy), the gateway first dials it and waits up to 10 seconds for either side
+to speak. If the destination speaks first, as FTP, SMTP, POP3 and IMAP servers
+do, the connection is relayed without interception, so a later `STARTTLS` is
+not inspected. If the guest speaks first, its bytes are admitted as usual; a
+plain relay of them reuses the probe connection, so a destination that accepts
+one connection, such as an FTP passive data port, still receives them.
+Destinations admitted only by a domain allow still close a silent connection.
+
 The API composes [operator egress profiles](egress-profiles.md) into the tenant's
 policy on authenticated federated creates. A profile independently supplies
 allowances and TLS exemptions. DNS resolver allowances are not exempted.

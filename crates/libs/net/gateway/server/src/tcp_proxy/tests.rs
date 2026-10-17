@@ -12,6 +12,7 @@ use pplx_space_observability::test_capture::{CapturedEvent, CapturedEventsLayer,
 use tracing::instrument::WithSubscriber as _;
 use tracing_subscriber::layer::SubscriberExt as _;
 
+mod server_speaks_first;
 mod tls_interception;
 
 fn dns_attribution_denied(reason: DenyReason) -> TcpAdmissionDenial {
@@ -284,8 +285,8 @@ async fn tls_interception_waits_for_a_late_client_hello_on_an_allowed_destinatio
             destination,
             &with_interception(pplx_space_net_common::TlsInterception::On)
         ),
-        sniff::MissingClientHello::Denied,
-        "interception refuses a flow without SNI, so it must wait out a retransmit"
+        sniff::MissingClientHello::ProbesServer,
+        "interception refuses a flow without SNI unless its destination speaks first"
     );
     assert_eq!(
         proxy.missing_client_hello(

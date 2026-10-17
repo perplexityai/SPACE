@@ -1,7 +1,9 @@
 //! TCP transparent proxy using TPROXY.
 //!
-//! One connection, in order: accept, peek, admit, relay. The peek does not
-//! consume, so nothing before the relay is destructive.
+//! One connection, in order: accept, peek, admit, relay. The peek consumes
+//! nothing from the guest. Under TLS interception, a silent guest may first
+//! be probed for a server greeting, which opens the destination connection
+//! before the guest's bytes are admitted; see [`server_first`].
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -37,6 +39,7 @@ mod inspected;
 mod relay;
 mod reserved_dns;
 mod routing_headers;
+mod server_first;
 pub(crate) mod tls;
 mod tls_http;
 mod transport;
@@ -385,6 +388,24 @@ impl TcpProxy {
         dst: SocketAddr,
         shutdown: &CancellationToken,
     ) -> (Option<DomainName>, FlowOutcome) {
+        self.handle_with(client, dst, shutdown, transport::connect)
+            .await
+    }
+
+    /// [`Self::handle`] with the dialer for pass-through, plaintext HTTP and the
+    /// server-first probe. Tests pass one that needs no socket mark.
+    async fn handle_with<F, Fut, U>(
+        &self,
+        client: TcpStream,
+        dst: SocketAddr,
+        shutdown: &CancellationToken,
+        connect: F,
+    ) -> (Option<DomainName>, FlowOutcome)
+    where
+        F: Fn(SocketAddr) -> Fut + Copy + Send + 'static,
+        Fut: Future<Output = Result<U, transport::Error>> + Send + 'static,
+        U: AsyncRead + AsyncWrite + transport::Close + Unpin + Send + 'static,
+    {
         abort_on_close(&client);
         if let Some(resolver) = self.reserved_dns.resolver_for(dst.ip()) {
             // Take the cancellation token before reading policy. A concurrent
@@ -434,70 +455,196 @@ impl TcpProxy {
         // still gets one bounded, non-consuming peek so its diagnostic can
         // identify a configured TLS destination.
         let missing_client_hello = self.missing_client_hello(dst, &policy);
-        let observation = sniff::client_hello_with_detail(&client, missing_client_hello).await;
-        let peek_elapsed = observation.elapsed;
-        let scan = observation.scan;
-        let client_alpn = observation.client_alpn;
-        let missing_sni_detail = observation.missing_sni_detail;
-        sniff::record(
-            self.sandbox_id,
-            dst,
-            &scan,
-            client_alpn,
-            missing_sni_detail,
-            observation.elapsed,
-            &self.debug_state,
-        );
-        let host = scan.server_name().cloned();
+        let mut observation = sniff::client_hello_with_detail(&client, missing_client_hello).await;
+        // Probe only a guest that sent nothing; any byte or EOF takes the usual path.
+        let mut probe_server_first = missing_client_hello
+            == sniff::MissingClientHello::ProbesServer
+            && observation.missing_sni_detail == Some(sniff::MissingSniDetail::FirstByteTimeout);
+        // A probed flow's scan is recorded once the probe settles it.
+        if !probe_server_first {
+            self.record_scan(dst, &observation);
+        }
 
-        let policy = match policy {
+        let mut policy = match policy {
             TrafficPolicy::Ready(policy) => policy,
             TrafficPolicy::NotReady(reason) => {
-                // Reserve `denied` for an admission decision. Policy readiness failures never
-                // reached evaluation; only lifecycle shutdown is cancellation.
-                let outcome =
-                    if matches!(reason, PolicyNotReady::Draining | PolicyNotReady::Stopped) {
-                        accounting::Outcome::Cancelled
-                    } else {
-                        accounting::Outcome::Error
-                    };
-                inspection.finish(outcome, reason.as_str());
                 return (
-                    host,
-                    FlowOutcome::Rejected(Rejection::PolicyMissing(reason)),
+                    observation.scan.server_name().cloned(),
+                    policy_not_ready(&mut inspection, reason),
                 );
             }
         };
 
-        let admitted = match self.admit(dst, &scan, &policy) {
-            Ok(admitted) => admitted,
-            Err(reason) => {
-                inspection.finish(
-                    accounting::Outcome::Denied,
-                    inspection_admission_reason(&scan, missing_sni_detail, reason),
-                );
-                if missing_client_hello == sniff::MissingClientHello::Denied
-                    && matches!(scan, crate::tls_sni::ClientHelloScan::Incomplete)
-                {
-                    self.warn_client_hello_missing(dst, missing_sni_detail, peek_elapsed);
+        // The unwritten probe connection, kept when the guest spoke first.
+        let mut probed = None;
+        // Runs a second time, on the guest's late bytes, when the guest spoke
+        // first or the destination closed.
+        let (observation, admitted, connection) = loop {
+            let (admitted, mut decision) = if probe_server_first {
+                let (admitted, decision) = self.admit_deferred(dst, &observation.scan, &policy);
+                (admitted, Some(decision))
+            } else {
+                (self.admit(dst, &observation.scan, &policy), None)
+            };
+            let admitted = match admitted {
+                Ok(admitted) => admitted,
+                Err(reason) => {
+                    // A probed flow has no SNI and needs no DNS evidence.
+                    debug_assert!(!probe_server_first, "a probed flow was refused");
+                    inspection.finish(
+                        accounting::Outcome::Denied,
+                        inspection_admission_reason(
+                            &observation.scan,
+                            observation.missing_sni_detail,
+                            reason,
+                        ),
+                    );
+                    if missing_client_hello == sniff::MissingClientHello::Denied
+                        && matches!(
+                            observation.scan,
+                            crate::tls_sni::ClientHelloScan::Incomplete
+                        )
+                    {
+                        self.warn_client_hello_missing(
+                            dst,
+                            observation.missing_sni_detail,
+                            observation.elapsed,
+                        );
+                    }
+                    return (
+                        observation.scan.server_name().cloned(),
+                        FlowOutcome::Rejected(Rejection::Admission(reason)),
+                    );
                 }
-                return (host, FlowOutcome::Rejected(Rejection::Admission(reason)));
+            };
+            // Register before the final current-policy check so a concurrent
+            // update either rejects this handoff or sees the flow in its resweep.
+            let connection = self.network_state.tcp_connections().register(
+                admitted.destination(),
+                observation.scan.clone(),
+                &policy,
+                self.network_state.dns_allow_cache(),
+                shutdown.clone(),
+            );
+            if let Err(reason) = self.validate_admission_policy(&policy) {
+                if probe_server_first {
+                    self.record_scan(dst, &observation);
+                }
+                inspection.finish(accounting::Outcome::Cancelled, reason.label());
+                return (
+                    observation.scan.server_name().cloned(),
+                    FlowOutcome::Rejected(Rejection::Admission(reason)),
+                );
+            }
+            if !std::mem::take(&mut probe_server_first) {
+                break (observation, admitted, connection);
+            }
+            debug_assert!(!connection.interception_mode.is_off());
+            let probe_started_at = Instant::now();
+            let mut probe = server_first::probe(
+                &client,
+                admitted.destination(),
+                connect,
+                server_first::PROBE_WINDOW,
+                shutdown,
+            )
+            .await;
+            let probe_elapsed = probe_started_at.elapsed();
+            if let server_first::Probe::GuestFirst(kept) = &mut probe {
+                probed = kept.take();
+            }
+            let upstream_closed = matches!(probe, server_first::Probe::UpstreamClosed);
+            // A flow whose guest may still speak is admitted again, which
+            // counts its one admission decision.
+            match decision.take() {
+                Some(decision)
+                    if upstream_closed || matches!(probe, server_first::Probe::GuestFirst(_)) =>
+                {
+                    decision.superseded();
+                }
+                decision => drop(decision),
+            }
+            // A greeting ends the wait for a ClientHello, so its delay is not
+            // ClientHello time.
+            if !matches!(probe, server_first::Probe::ServerFirst(_)) {
+                observation.elapsed += probe_elapsed;
+            }
+            match probe {
+                server_first::Probe::ServerFirst(greeted) => {
+                    observation.missing_sni_detail = Some(sniff::MissingSniDetail::ServerFirst);
+                    self.record_scan(dst, &observation);
+                    if let Err(reason) = self.validate_admission_policy(&policy) {
+                        inspection.finish(accounting::Outcome::Cancelled, reason.label());
+                        return (None, FlowOutcome::Rejected(Rejection::Admission(reason)));
+                    }
+                    self.stats.tcp_total.fetch_add(1, Ordering::Relaxed);
+                    close_gracefully(&client);
+                    inspection.finish(accounting::Outcome::Skipped, "server_first");
+                    debug!(
+                        sandbox_id = self.sandbox_id,
+                        destination_port = dst.port(),
+                        waited_ms = probe_elapsed.as_millis(),
+                        "relaying a server-speaks-first TCP flow under TLS interception"
+                    );
+                    let outcome = self.relay_probed(client, greeted).await;
+                    drop(connection);
+                    return (None, outcome);
+                }
+                server_first::Probe::GuestFirst(_) | server_first::Probe::UpstreamClosed => {
+                    drop(connection);
+                    let elapsed = observation.elapsed;
+                    observation =
+                        sniff::client_hello_with_detail(&client, sniff::MissingClientHello::Denied)
+                            .await;
+                    observation.elapsed += elapsed;
+                    if upstream_closed
+                        && observation.missing_sni_detail
+                            == Some(sniff::MissingSniDetail::FirstByteTimeout)
+                    {
+                        observation.missing_sni_detail =
+                            Some(sniff::MissingSniDetail::ServerFirstUpstreamClosed);
+                    }
+                    self.record_scan(dst, &observation);
+                    // Decide the late bytes on the current policy, not the
+                    // snapshot taken before the wait.
+                    let current = self.network_state.wait_for_tcp_policy().await;
+                    policy = match current {
+                        TrafficPolicy::Ready(policy) => policy,
+                        TrafficPolicy::NotReady(reason) => {
+                            return (
+                                observation.scan.server_name().cloned(),
+                                policy_not_ready(&mut inspection, reason),
+                            );
+                        }
+                    };
+                }
+                server_first::Probe::TimedOut => {
+                    observation.missing_sni_detail =
+                        Some(sniff::MissingSniDetail::ServerFirstTimeout);
+                    self.record_scan(dst, &observation);
+                    break (observation, admitted, connection);
+                }
+                server_first::Probe::ConnectFailed(error) => {
+                    self.record_scan(dst, &observation);
+                    self.stats.tcp_total.fetch_add(1, Ordering::Relaxed);
+                    inspection.finish(accounting::Outcome::Error, "server_first_connect");
+                    return (None, FlowOutcome::RelayFailed(RelayFailure::Connect(error)));
+                }
+                server_first::Probe::Cancelled => {
+                    self.record_scan(dst, &observation);
+                    inspection.finish(accounting::Outcome::Cancelled, "server_first_cancelled");
+                    return (None, FlowOutcome::Cancelled);
+                }
             }
         };
-        // Register before the final current-policy check so a concurrent
-        // update either rejects this handoff or sees the flow in its resweep.
-        let connection = self.network_state.tcp_connections().register(
-            admitted.destination(),
-            scan.clone(),
-            &policy,
-            self.network_state.dns_allow_cache(),
-            shutdown.clone(),
-        );
+        let sniff::ClientHelloObservation {
+            scan,
+            client_alpn,
+            missing_sni_detail,
+            ..
+        } = observation;
+        let host = scan.server_name().cloned();
         let interception_mode = connection.interception_mode;
-        if let Err(reason) = self.validate_admission_policy(&policy) {
-            inspection.finish(accounting::Outcome::Cancelled, reason.label());
-            return (host, FlowOutcome::Rejected(Rejection::Admission(reason)));
-        }
         self.stats.tcp_total.fetch_add(1, Ordering::Relaxed);
 
         let action = match self
@@ -530,9 +677,20 @@ impl TcpProxy {
                     pplx_space_net_common::TlsInterception::On => "plaintext",
                 };
                 inspection.finish(accounting::Outcome::Skipped, reason);
-                self.relay(client, admitted).await
+                match (admitted, probed) {
+                    // Some destinations accept one connection only, so the
+                    // guest's bytes go over the probe's rather than a new dial.
+                    (AdmittedTcp::Tunnel(destination), Some(probed)) if destination == dst => {
+                        self.relay_probed(client, probed).await
+                    }
+                    (admitted, probed) => {
+                        drop(probed);
+                        self.relay(client, admitted, connect).await
+                    }
+                }
             }
             crate::tls_interception::InterceptionAction::Terminate(lease) => {
+                drop(probed);
                 inspection.finish(accounting::Outcome::Success, "admitted");
                 match self
                     .terminate_tls(client, admitted, lease, client_alpn)
@@ -545,6 +703,18 @@ impl TcpProxy {
         };
         drop(connection);
         (host, outcome)
+    }
+
+    fn record_scan(&self, dst: SocketAddr, observation: &sniff::ClientHelloObservation) {
+        sniff::record(
+            self.sandbox_id,
+            dst,
+            &observation.scan,
+            observation.client_alpn,
+            observation.missing_sni_detail,
+            observation.elapsed,
+            &self.debug_state,
+        );
     }
 
     /// A flow to a destination the guest resolved through an allowed domain,
@@ -571,26 +741,80 @@ impl TcpProxy {
         }
     }
 
-    async fn relay(&self, client: TcpStream, admitted: AdmittedTcp) -> FlowOutcome {
+    async fn relay<F, Fut, U>(
+        &self,
+        client: TcpStream,
+        admitted: AdmittedTcp,
+        connect: F,
+    ) -> FlowOutcome
+    where
+        F: FnOnce(SocketAddr) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<U, transport::Error>> + Send + 'static,
+        U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         match admitted {
-            AdmittedTcp::Tunnel(destination) => self.pass_through(client, destination).await,
+            AdmittedTcp::Tunnel(destination) => {
+                self.pass_through(client, destination, connect).await
+            }
             AdmittedTcp::HostBoundHttp(destination) => {
-                self.host_bound_http(client, destination, transport::connect)
-                    .await
+                self.host_bound_http(client, destination, connect).await
             }
         }
     }
 
-    async fn pass_through(&self, client: TcpStream, dst: SocketAddr) -> FlowOutcome {
-        let upstream = match transport::connect(dst).await {
+    async fn pass_through<F, Fut, U>(
+        &self,
+        client: TcpStream,
+        dst: SocketAddr,
+        connect: F,
+    ) -> FlowOutcome
+    where
+        F: FnOnce(SocketAddr) -> Fut,
+        Fut: Future<Output = Result<U, transport::Error>>,
+        U: AsyncRead + AsyncWrite + Unpin,
+    {
+        let upstream = match connect(dst).await {
             Ok(upstream) => upstream,
             Err(error) => return FlowOutcome::RelayFailed(RelayFailure::Connect(error)),
         };
+        self.tunnel(client, upstream, 0).await
+    }
+
+    /// Forward what the probe read, then relay as a pass-through over the
+    /// probe connection.
+    async fn relay_probed<U>(
+        &self,
+        mut client: TcpStream,
+        probed: server_first::Probed<U>,
+    ) -> FlowOutcome
+    where
+        U: AsyncRead + AsyncWrite + transport::Close + Unpin,
+    {
+        use tokio::io::AsyncWriteExt as _;
+        let server_first::Probed { upstream, received } = probed;
+        if let Err(error) = client.write_all(&received).await {
+            return FlowOutcome::RelayFailed(RelayFailure::Transfer(error));
+        }
+        // An abortive close at the end of the relay could discard data still
+        // in flight, so refuse the flow rather than relay without an orderly one.
+        if let Err(error) = upstream.set_abortive_close(false) {
+            return FlowOutcome::RelayFailed(RelayFailure::Transfer(error));
+        }
+        let received_len = u64::try_from(received.len()).unwrap_or(u64::MAX);
+        self.tunnel(client, upstream, received_len).await
+    }
+
+    /// Relay opaquely over an established upstream. `already_received` counts
+    /// upstream bytes forwarded to the guest before the relay started.
+    async fn tunnel<U>(&self, client: TcpStream, upstream: U, already_received: u64) -> FlowOutcome
+    where
+        U: AsyncRead + AsyncWrite + Unpin,
+    {
         let report = relay::run(client, upstream, &self.shutdown_token, None).await;
         match report.result {
             Ok(()) => FlowOutcome::Relayed(Relay::Tunnelled {
                 wire_tx: report.written.0,
-                wire_rx: report.written.1,
+                wire_rx: report.written.1.saturating_add(already_received),
             }),
             Err(relay::Error::Io(error)) => FlowOutcome::RelayFailed(RelayFailure::Transfer(error)),
             Err(relay::Error::Cancelled | relay::Error::Idle) => FlowOutcome::Cancelled,
@@ -788,6 +1012,18 @@ fn close_gracefully(client: &TcpStream) {
     if let Err(error) = socket2::SockRef::from(client).set_linger(None) {
         warn!(%error, "could not restore an admitted TCP flow's orderly close");
     }
+}
+
+fn policy_not_ready(inspection: &mut accounting::Attempt, reason: PolicyNotReady) -> FlowOutcome {
+    // Reserve `denied` for an admission decision. Policy readiness failures never
+    // reached evaluation; only lifecycle shutdown is cancellation.
+    let outcome = if matches!(reason, PolicyNotReady::Draining | PolicyNotReady::Stopped) {
+        accounting::Outcome::Cancelled
+    } else {
+        accounting::Outcome::Error
+    };
+    inspection.finish(outcome, reason.as_str());
+    FlowOutcome::Rejected(Rejection::PolicyMissing(reason))
 }
 
 fn inspection_admission_reason(
