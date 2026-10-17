@@ -39,6 +39,9 @@ pub struct ControllerError {
     /// The backend refused this request before doing any of its work, as its
     /// status said (`pplx_space_common_grpc::is_refused_before_start`).
     refused_before_start: bool,
+    /// The guest reported the requested path missing, as its status said
+    /// (`pplx_space_common_grpc::is_guest_path_not_found`).
+    guest_path_not_found: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +87,7 @@ impl ControllerError {
             retry_after_header: None,
             retry_after_cause: None,
             refused_before_start: false,
+            guest_path_not_found: false,
         }
     }
 
@@ -91,6 +95,13 @@ impl ControllerError {
     /// its work. Only a backend status sets it; a retry hint alone does not.
     pub fn is_refused_before_start(&self) -> bool {
         self.refused_before_start
+    }
+
+    /// Whether this 404 is the guest reporting the requested path missing, not
+    /// a sandbox or runtime that could not be found. Only a backend status
+    /// sets it.
+    pub fn is_guest_path_not_found(&self) -> bool {
+        self.guest_path_not_found
     }
 
     fn node_api_transport(
@@ -442,6 +453,7 @@ impl From<tonic::Status> for ControllerError {
             status.message().to_owned(),
         );
         error.refused_before_start = pplx_space_common_grpc::is_refused_before_start(&status);
+        error.guest_path_not_found = pplx_space_common_grpc::is_guest_path_not_found(&status);
         match pplx_space_common_grpc::retry_after(&status) {
             Some(try_again) => error.with_retry_after_header(
                 try_again.clamp(Duration::from_secs(1), Duration::from_secs(60)),

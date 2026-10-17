@@ -694,6 +694,11 @@ pub(in crate::routes::public) fn controller_error(error: ControllerError) -> Pub
     match error.status() {
         StatusCode::BAD_REQUEST => PublicApiError::bad_request(error.to_string()),
         StatusCode::FORBIDDEN => PublicApiError::forbidden(error.to_string()),
+        // Every caller checked ownership before reaching the sandbox, so only
+        // the guest's own missing-path answer is told apart from the rest.
+        StatusCode::NOT_FOUND if error.is_guest_path_not_found() => {
+            PublicApiError::path_not_found(error.to_string())
+        }
         StatusCode::NOT_FOUND => PublicApiError::not_found(error.to_string()),
         StatusCode::CONFLICT => PublicApiError::conflict(error.to_string()),
         StatusCode::PRECONDITION_FAILED => PublicApiError::failed_precondition(error.to_string()),

@@ -799,3 +799,44 @@ async fn sandbox_scoped_requests_load_owner_and_row_once() -> TestDbResult<()> {
     assert_eq!(sandbox_row_loads(&statements), 1, "{statements:#?}");
     Ok(())
 }
+
+/// A missing sandbox and someone else's sandbox answer every file route with
+/// the same bare `not_found`: the path detail that tells a client "the sandbox
+/// is yours, the path is not there" is reserved for after the owner check.
+#[tokio::test]
+async fn file_routes_answer_missing_and_unowned_sandboxes_without_a_path_detail() -> TestDbResult<()>
+{
+    let fixture = fixture().await?;
+    let other_subject = create(&fixture, ORG, "102").await?;
+    let other_subject = seed_target(&fixture, &other_subject).await?;
+    let other_org = create(&fixture, OTHER_ORG, "101").await?;
+    let other_org = seed_target(&fixture, &other_org).await?;
+    let missing = PublicSandboxId::new();
+
+    let mut answers = Vec::new();
+    for sandbox in [missing, other_subject, other_org] {
+        for (route, body) in [
+            ("files:stat", json!({"path": "/tmp/missing"})),
+            ("files:list", json!({"path": "/tmp/missing"})),
+            ("files:read", json!({"path": "/tmp/missing", "length": 1})),
+            ("files:remove", json!({"path": "/tmp/missing"})),
+        ] {
+            let (status, body) = send(
+                &fixture.app,
+                Method::POST,
+                &format!("/v1/sandboxes/{sandbox}/{route}"),
+                owner_headers(ORG, "101"),
+                body,
+            )
+            .await?;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{route}: {body}");
+            assert_eq!(body["code"], "not_found", "{route}: {body}");
+            assert_eq!(body["details"], json!([]), "{route}: {body}");
+            answers.push((body["code"].clone(), body["message"].clone()));
+        }
+    }
+    // Indistinguishable, message included.
+    answers.dedup();
+    assert_eq!(answers.len(), 1, "{answers:#?}");
+    Ok(())
+}

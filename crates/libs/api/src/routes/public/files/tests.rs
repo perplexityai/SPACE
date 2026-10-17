@@ -575,3 +575,53 @@ mod batch_body_limits {
         Ok(())
     }
 }
+
+/// Only the guest's own missing-path answer carries the `resource: path`
+/// detail; a not-found from a hop that could not find the sandbox stays bare.
+/// The code, status, and `retryable` are the same either way.
+#[tokio::test]
+async fn only_a_guest_missing_path_carries_the_path_detail() {
+    use axum::response::IntoResponse;
+    use http_body_util::BodyExt;
+    use pplx_space_public_api::{PublicErrorCode, PublicErrorDetail, PublicErrorEnvelope};
+
+    async fn envelope(error: PublicApiError) -> (StatusCode, PublicErrorEnvelope) {
+        let response = error.into_response();
+        let code = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (code, serde_json::from_slice(&body).unwrap())
+    }
+    let missing_path = || {
+        pplx_space_common_grpc::mark_guest_path_not_found(tonic::Status::not_found(
+            "No such file or directory (os error 2)",
+        ))
+    };
+
+    for public in [
+        controller_error(ControllerError::from(missing_path())),
+        unprotected_mutation_error(ControllerError::from(missing_path())),
+    ] {
+        let (status, path) = envelope(public).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(path.code, PublicErrorCode::NotFound);
+        assert!(!path.retryable);
+        assert_eq!(
+            path.details,
+            vec![PublicErrorDetail {
+                key: "resource".to_string(),
+                value: "path".to_string(),
+            }]
+        );
+    }
+
+    for bare in [
+        ControllerError::from(tonic::Status::not_found("sandbox not found")),
+        ControllerError::new(StatusCode::NOT_FOUND, "sandbox not found"),
+    ] {
+        let (status, envelope) = envelope(controller_error(bare)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(envelope.code, PublicErrorCode::NotFound);
+        assert!(!envelope.retryable);
+        assert!(envelope.details.is_empty(), "{:?}", envelope.details);
+    }
+}

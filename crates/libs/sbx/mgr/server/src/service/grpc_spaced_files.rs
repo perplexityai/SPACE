@@ -406,7 +406,8 @@ impl SandboxManagerService {
         let client = self.connect_spaced_host(&sandbox).await?;
         let response = client
             .stat_as_user(operation.path, parse_operation_user(operation.user)?)
-            .await?;
+            .await
+            .map_err(pplx_space_common_grpc::mark_guest_path_not_found)?;
         Ok(Response::new(stat_to_file_info(response)?))
     }
 
@@ -439,7 +440,13 @@ impl SandboxManagerService {
                 operation.depth,
                 parse_operation_user(operation.user)?,
             )
-            .await?;
+            .await
+            .map_err(pplx_space_common_grpc::mark_guest_path_not_found)?;
+        // A missing directory can surface on the first entry rather than on
+        // open, so entries get the same marking.
+        let stream = futures_util::StreamExt::map(stream, |entry| {
+            entry.map_err(pplx_space_common_grpc::mark_guest_path_not_found)
+        });
         Ok(Response::new(fence_status_stream(
             forward_host_stream(stream, Ok),
             identity_token,
@@ -476,7 +483,8 @@ impl SandboxManagerService {
                 operation.length,
                 parse_operation_user(operation.user)?,
             )
-            .await?;
+            .await
+            .map_err(pplx_space_common_grpc::mark_guest_path_not_found)?;
         Ok(Response::new(fence_status_stream(
             forward_host_stream(stream, |chunk| Ok(SpacedFileChunk { data: chunk.data })),
             identity_token,
@@ -611,7 +619,7 @@ impl SandboxManagerService {
             tokio_stream::wrappers::ReceiverStream::new(rx),
         );
         let response = tokio::select! {
-            response = write => response?,
+            response = write => response.map_err(pplx_space_common_grpc::mark_guest_path_not_found)?,
             _ = identity_token.cancelled() => {
                 return Err(Status::aborted(
                     "sandbox execution identity changed while write was open",
@@ -675,7 +683,8 @@ impl SandboxManagerService {
                 operation.idempotency_key,
                 parse_operation_user(operation.user)?,
             )
-            .await?;
+            .await
+            .map_err(pplx_space_common_grpc::mark_guest_path_not_found)?;
         Ok(Response::new(SpacedWriteBatchResponse {
             files_written: response.files_written,
         }))
@@ -709,7 +718,8 @@ impl SandboxManagerService {
                 operation.exist_ok,
                 parse_operation_user(operation.user)?,
             )
-            .await?;
+            .await
+            .map_err(pplx_space_common_grpc::mark_guest_path_not_found)?;
         Ok(Response::new(SpacedMkdirResponse {}))
     }
 
@@ -741,7 +751,8 @@ impl SandboxManagerService {
                 operation.missing_ok,
                 parse_operation_user(operation.user)?,
             )
-            .await?;
+            .await
+            .map_err(pplx_space_common_grpc::mark_guest_path_not_found)?;
         Ok(Response::new(SpacedRemoveResponse {}))
     }
 
@@ -773,7 +784,8 @@ impl SandboxManagerService {
                 operation.idempotency_key,
                 parse_operation_user(operation.user)?,
             )
-            .await?;
+            .await
+            .map_err(pplx_space_common_grpc::mark_guest_path_not_found)?;
         Ok(Response::new(SpacedRenameResponse {}))
     }
 

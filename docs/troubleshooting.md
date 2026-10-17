@@ -110,6 +110,8 @@ Check a returned operation ID before resending a lifecycle mutation. A new key r
 
 Read the API error's `code`, `message`, `details`, `request_id`, and `retryable` fields. Correct non-retryable errors first, and use bounded backoff for retryable errors without discarding the original key.
 
+A file route's `404` (`not_found`) whose `details` include `{"key": "resource", "value": "path"}` means the sandbox is yours and the path inside it does not exist, so there is no need to look the sandbox up again. Without that detail, the sandbox itself was not found or is not yours; the two answer alike.
+
 A sandbox that is at capacity, or shutting down, can refuse a request before doing any of its work: a retryable `429` (`rate_limited`) or `503` with `Retry-After`. That request did nothing, though an earlier attempt of the same action may have; wait at least that long and resend it with the same body and key, or reattach to the same session. SPACE does not retry these refusals for you. A timeout leaves the outcome unknown, and it is retryable only where the endpoint deduplicates by its key. Lifecycle operations and command creation deduplicate for 24 hours; file writes, batch writes, and renames only for 60 seconds after they complete, and not across a restart of the sandbox's agent, so retry them promptly or check the file first. File `mkdir`, `remove`, and change tracking do not deduplicate: their timeouts are not retryable, so check the sandbox's state before repeating them.
 
 When reporting a problem, include the source revision, failing step, request ID, relevant sandbox/operation/process/session IDs, and sanitized error or event output. Exclude bearer tokens, passwords, private keys, and sensitive command environment values.
