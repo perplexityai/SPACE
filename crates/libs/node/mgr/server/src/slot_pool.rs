@@ -2024,7 +2024,7 @@ mod node_status_tests;
 mod reset;
 mod scheduler;
 mod startup_containment;
-use liveness::{LeaseLiveness, lease_liveness, lease_may_be_live};
+use liveness::{LeaseLiveness, lease_liveness, lease_may_be_live, released_lease_liveness};
 #[cfg(test)]
 mod tests;
 mod time;

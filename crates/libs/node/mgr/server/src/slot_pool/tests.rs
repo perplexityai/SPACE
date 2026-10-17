@@ -2591,6 +2591,65 @@ mod slot_pool_tests {
         let _ = std::fs::remove_dir_all(temp_root);
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn reset_slot_stops_waiting_for_sandbox_runtime_once_it_runs_on_a_newer_slot() {
+        let sandbox_id = SandboxId::new().to_string();
+        // The sandbox's cgroups and fc.pid show a running VM.
+        super::liveness::set_test_sandbox_runtime_evidence(&sandbox_id, LeaseLiveness::Live);
+        // A file owned by the released lease UID stops the reset just after
+        // the runtime check, so `last_error` shows which gate it reached.
+        let cache_root = tempfile::tempdir().unwrap();
+        let retained = cache_root.path().join(&sandbox_id);
+        std::fs::create_dir_all(&retained).unwrap();
+        std::fs::write(retained.join("owned-by-old-uid"), b"stale cache").unwrap();
+        let lease_uid = std::fs::metadata(retained.join("owned-by-old-uid"))
+            .unwrap()
+            .uid();
+        let mut config = NetworkPoolConfig::new(2);
+        config.target_ready_slots = 0;
+        config.retained_ready_slots = 0;
+        config.min_ready_slots = 0;
+        config.sandbox_cache_dir = cache_root.path().to_path_buf();
+        let pool = test_pool(config);
+        pool.db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE network_slots
+                 SET generation = 1, state = 'dirty', health = 'unknown',
+                     sandbox_id = ?1, sandbox_uid = ?2, pid = NULL, lease_kind = ?3
+                 WHERE slot_id = 0",
+                params![sandbox_id, lease_uid, LeaseKind::Ephemeral.as_str()],
+            )
+            .unwrap();
+
+        // With no newer lease that VM may still be the released lease's.
+        reset_slot(pool.clone(), 0).await;
+        let waiting = record(&pool, 0);
+        assert_eq!(waiting.state, SlotState::Dirty);
+        let error = waiting.last_error.as_deref().unwrap();
+        assert!(error.contains("runtime is Live"), "{error}");
+
+        // A wake on this node leases the sandbox a fresh slot, whose VM now
+        // owns the sandbox-wide evidence.
+        let EphemeralSlotClaimResult::Claimed(successor) = pool
+            .claim_ephemeral_slot_for_setup(&sandbox_id, None, memory_admission())
+            .unwrap()
+        else {
+            panic!("expected a fresh claim while the previous slot resets");
+        };
+        assert_eq!(successor.info.slot, 1);
+
+        reset_slot(pool.clone(), 0).await;
+        let error = record(&pool, 0).last_error.unwrap();
+        assert!(
+            error.contains("cleanup required before resetting slot 0 generation 1"),
+            "{error}"
+        );
+        assert_eq!(record(&pool, 1).state, SlotState::Leasing);
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn reset_slot_quarantines_after_cleanup_retry_exhaustion() {

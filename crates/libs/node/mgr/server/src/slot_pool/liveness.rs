@@ -36,10 +36,44 @@ pub(super) fn lease_liveness(info: &SlotInfo) -> LeaseLiveness {
     if info.sandbox_id.is_empty() {
         return tracked;
     }
+    let [sidecar, vm, firecracker] = sandbox_runtime_evidence(&info.sandbox_id);
+    LeaseLiveness::combine([sidecar, vm, tracked, firecracker])
+}
+
+/// Liveness of a released lease whose sandbox may already hold a newer lease
+/// on another slot. The sandbox's cgroups and `fc.pid` are keyed by sandbox
+/// ID, so once that successor runs they describe its runtime, not this slot's.
+/// Only slot-scoped evidence can then hold the reset: the released lease's
+/// own tracked PID, or any process still inside this slot's namespace.
+pub(super) fn released_lease_liveness(
+    info: &SlotInfo,
+    successor: Option<&SlotInfo>,
+) -> LeaseLiveness {
+    let Some(successor) = successor.filter(|successor| successor.slot != info.slot) else {
+        return lease_liveness(info);
+    };
+    // A recycled PID that now belongs to the successor is not this lease's.
+    let tracked = match info.pid {
+        Some(pid) if successor.pid == Some(pid) => LeaseLiveness::Gone,
+        pid => pid_liveness(pid, &info.sandbox_id),
+    };
+    let namespace = netns_occupancy(
+        Path::new("/proc"),
+        Path::new(&NetId::from_slot(info.slot).ns_path()),
+    );
+    LeaseLiveness::combine([tracked, namespace])
+}
+
+/// Sidecar cgroup, VM cgroup and `fc.pid` evidence, all keyed by sandbox ID.
+fn sandbox_runtime_evidence(sandbox_id: &str) -> [LeaseLiveness; 3] {
+    #[cfg(test)]
+    if let Some(evidence) = test_sandbox_runtime_evidence(sandbox_id) {
+        return [evidence; 3];
+    }
     let [sidecar, vm] =
-        crate::cgroup::sandbox_cgroup_occupancy(&info.sandbox_id).map(LeaseLiveness::observed);
+        crate::cgroup::sandbox_cgroup_occupancy(sandbox_id).map(LeaseLiveness::observed);
     let pid_link = Path::new(pplx_space_common_core::host::linux::paths::SANDBOX_RUN_DIR)
-        .join(&info.sandbox_id)
+        .join(sandbox_id)
         .join("fc.pid");
     let firecracker = match std::fs::read_link(pid_link) {
         Ok(target) => match target
@@ -48,12 +82,86 @@ pub(super) fn lease_liveness(info: &SlotInfo) -> LeaseLiveness {
             .and_then(|tail| tail.to_str())
             .and_then(|tail| tail.parse::<u32>().ok())
         {
-            Some(pid) => pid_liveness(Some(pid), &info.sandbox_id),
+            Some(pid) => pid_liveness(Some(pid), sandbox_id),
             None => LeaseLiveness::Unknown,
         },
         Err(error) => LeaseLiveness::observed(Err(error)),
     };
-    LeaseLiveness::combine([sidecar, vm, tracked, firecracker])
+    [sidecar, vm, firecracker]
+}
+
+#[cfg(test)]
+static TEST_SANDBOX_RUNTIME_EVIDENCE: Mutex<Vec<(String, LeaseLiveness)>> = Mutex::new(Vec::new());
+
+/// Stand in for host cgroups and `fc.pid`, which tests cannot create.
+#[cfg(test)]
+pub(super) fn set_test_sandbox_runtime_evidence(sandbox_id: &str, evidence: LeaseLiveness) {
+    let mut overrides = TEST_SANDBOX_RUNTIME_EVIDENCE.lock().unwrap();
+    overrides.retain(|(id, _)| id != sandbox_id);
+    overrides.push((sandbox_id.to_string(), evidence));
+}
+
+#[cfg(test)]
+fn test_sandbox_runtime_evidence(sandbox_id: &str) -> Option<LeaseLiveness> {
+    TEST_SANDBOX_RUNTIME_EVIDENCE
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|(id, evidence)| (id == sandbox_id).then_some(*evidence))
+}
+
+/// Whether any task is a member of the network namespace mounted at
+/// `netns_path`. The VM and the sidecars of a lease run inside its slot's
+/// namespace. An absent mount means no current slot namespace to occupy.
+fn netns_occupancy(proc_root: &Path, netns_path: &Path) -> LeaseLiveness {
+    use std::os::unix::fs::MetadataExt as _;
+    let namespace = match std::fs::metadata(netns_path) {
+        Ok(metadata) => (metadata.dev(), metadata.ino()),
+        Err(error) => return LeaseLiveness::observed(Err(error)),
+    };
+    let membership = |task: &Path| {
+        std::fs::metadata(task.join("ns/net"))
+            .map(|metadata| (metadata.dev(), metadata.ino()) == namespace)
+    };
+    let Ok(entries) = std::fs::read_dir(proc_root) else {
+        return LeaseLiveness::Unknown;
+    };
+    let mut evidence = LeaseLiveness::Gone;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return LeaseLiveness::Unknown;
+        };
+        if !entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()))
+        {
+            continue;
+        }
+        let process = match membership(&entry.path()) {
+            // An exited leader has no namespaces, but a VM's vCPU threads can
+            // outlive it while they finish tearing the guest down.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::read_dir(entry.path().join("task")) {
+                    Ok(tasks) => tasks
+                        .map(|task| {
+                            LeaseLiveness::observed(task.and_then(|task| membership(&task.path())))
+                        })
+                        .fold(LeaseLiveness::Gone, |left, right| {
+                            LeaseLiveness::combine([left, right])
+                        }),
+                    Err(error) => LeaseLiveness::observed(Err(error)),
+                }
+            }
+            result => LeaseLiveness::observed(result),
+        };
+        match process {
+            LeaseLiveness::Live => return LeaseLiveness::Live,
+            LeaseLiveness::Unknown => evidence = LeaseLiveness::Unknown,
+            LeaseLiveness::Gone => {}
+        }
+    }
+    evidence
 }
 
 fn pid_liveness(pid: Option<u32>, sandbox_id: &str) -> LeaseLiveness {

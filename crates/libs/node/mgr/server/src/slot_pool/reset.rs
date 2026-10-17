@@ -184,7 +184,7 @@ pub(super) async fn reset_slot(pool: std::sync::Arc<NetworkPool>, slot_id: u32) 
     };
     let reset_started = Instant::now();
     let config = pool.config();
-    let (record, reset_key, mutation_claim) = {
+    let (record, successor, reset_key, mutation_claim) = {
         let Ok(mut conn) = pool.db.lock() else {
             return;
         };
@@ -215,6 +215,20 @@ pub(super) async fn reset_slot(pool: std::sync::Arc<NetworkPool>, slot_id: u32) 
             };
             Some(mutation_claim)
         };
+        // Allocate may have leased this sandbox a newer slot meanwhile.
+        let successor = if record.info.sandbox_id.is_empty() {
+            None
+        } else {
+            match query_current_lease_by_sandbox(&tx, &record.info.sandbox_id) {
+                Ok(successor) => successor
+                    .map(|successor| successor.info)
+                    .filter(|successor| successor.sandbox_id == record.info.sandbox_id),
+                Err(error) => {
+                    tracing::warn!(slot_id, %error, "reset successor lease unavailable; retry scheduled");
+                    return;
+                }
+            }
+        };
         let reset_key = ResetKey::from_record(&record);
         let changed = match tx.execute(
             "UPDATE network_slots
@@ -240,7 +254,7 @@ pub(super) async fn reset_slot(pool: std::sync::Arc<NetworkPool>, slot_id: u32) 
             tracing::error!(slot_id, error = %error, "failed to commit network slot reset claim");
             return;
         }
-        (record, reset_key, mutation_claim)
+        (record, successor, reset_key, mutation_claim)
     };
     clear_stale_cleanup_reset_db_failures_for_slot(&pool, slot_id, &reset_key);
     clear_stale_transient_reset_failures_for_slot(&pool, slot_id, &reset_key);
@@ -289,7 +303,7 @@ pub(super) async fn reset_slot(pool: std::sync::Arc<NetworkPool>, slot_id: u32) 
     let setup_pool = pool.clone();
     let result = pool.task_tracker.spawn_blocking(move || -> Result<(), SlotResetError> {
         let _claim = blocking_claim;
-        assert_lease_process_stopped(&lease_info)?;
+        assert_lease_process_stopped(&lease_info, successor.as_ref())?;
         neutralize_retained_cache_for_lease(&lease_info)?;
         assert_retained_cache_clean_for_lease(&sandbox_cache_dir, &lease_info)?;
         let net = NetId::from_slot(slot_id);
@@ -771,8 +785,11 @@ pub(super) fn clear_stale_transient_reset_failures_for_slot(
         .retain(|key, _| key.slot_id != slot_id || key == current_key);
 }
 
-pub(super) fn assert_lease_process_stopped(info: &SlotInfo) -> Result<(), SlotResetError> {
-    assert_lease_process_stopped_with(info, lease_liveness(info))
+pub(super) fn assert_lease_process_stopped(
+    info: &SlotInfo,
+    successor: Option<&SlotInfo>,
+) -> Result<(), SlotResetError> {
+    assert_lease_process_stopped_with(info, released_lease_liveness(info, successor))
 }
 
 pub(super) fn assert_lease_process_stopped_with(
