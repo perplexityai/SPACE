@@ -177,6 +177,7 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "native_contract.tenant_isolation",
                 "native_contract.token_scope",
                 "native_contract.zero_vcpu_admission",
+                "native_recovery.attached_stream_drains_through_data_plane_restart",
                 "native_recovery.command_survives_data_plane_restart",
                 "native_recovery.queued_create_survives_api_restart",
                 "native_recovery.slow_operation_does_not_block_later_work",

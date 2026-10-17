@@ -11,7 +11,7 @@ import json
 import threading
 import time
 import uuid
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from http.client import HTTPException, HTTPResponse
 from typing import ClassVar
@@ -380,8 +380,13 @@ class NativeHardeningFixture:
         data_plane_url: str | None = None,
         initial_read_delay_seconds: float = 0,
         event_read_delay_seconds: float = 0,
+        on_event: Callable[[NativeEvent], None] | None = None,
     ) -> NativeEvents:
-        """Read one bounded attachment, retaining SSE IDs for explicit reconnects."""
+        """Read one bounded attachment, retaining SSE IDs for explicit reconnects.
+
+        `on_event`, when given, sees each event as it arrives, on the reading
+        thread, so a caller reading on another thread can act mid-stream.
+        """
         if timeout <= 0 or (max_events is not None and max_events <= 0):
             raise ValueError("Native stream bounds must be positive")
         if initial_read_delay_seconds < 0 or event_read_delay_seconds < 0:
@@ -446,6 +451,8 @@ class NativeHardeningFixture:
                     if not isinstance(frame, dict):
                         raise ValueError("Native stream event was not a JSON object")
                     frames.append(NativeEvent(event_id, frame))
+                    if on_event is not None:
+                        on_event(frames[-1])
                     lines = []
                     if frame.get("type") in {"process_exited", "error"} or (
                         max_events is not None and len(frames) >= max_events

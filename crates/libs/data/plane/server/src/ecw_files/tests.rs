@@ -1416,3 +1416,40 @@ async fn an_admitted_upload_holds_its_permit_while_reading_the_body() {
         );
     }
 }
+
+#[tokio::test]
+async fn watch_stream_ends_unavailable_when_the_drain_deadline_passes() {
+    let limiter = std::sync::Arc::new(crate::state::AttachedStreamLimiter::new(4, 4, 4));
+    let permit = limiter
+        .try_acquire_label(ECW_FILE_WATCH_STREAM_KIND)
+        .expect("stream permit");
+    let shutdown_token = CancellationToken::new();
+    let interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + StdDuration::from_secs(3600),
+        StdDuration::from_secs(3600),
+    );
+    let mut stream = Box::pin(e2b_watch_connect_stream(
+        futures_util::stream::pending::<Result<SpacedFileEvent, tonic::Status>>(),
+        interval,
+        "/tmp".to_string(),
+        permit,
+        shutdown_token.clone(),
+    ));
+    let start = stream.next().await.expect("start message").unwrap();
+    assert_eq!(
+        start,
+        ecw_connect::connect_json_message(json!({ "start": {} }), false)
+    );
+    assert!(
+        futures_util::poll!(stream.next()).is_pending(),
+        "a live watch keeps running until the deadline"
+    );
+
+    shutdown_token.cancel();
+
+    let end = stream.next().await.expect("end-stream message").unwrap();
+    assert_eq!(end, ecw_connect::connect_shutdown_end_stream());
+    assert!(stream.next().await.is_none());
+    drop(stream);
+    assert_eq!(limiter.active_total(), 0);
+}

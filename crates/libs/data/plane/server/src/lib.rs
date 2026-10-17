@@ -85,6 +85,7 @@ use tonic::transport::{Channel, Endpoint};
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
+mod drain;
 mod ecw_connect;
 mod ecw_files;
 mod ecw_process;
@@ -100,6 +101,11 @@ pub use upload_admission::{
     DEFAULT_UPLOAD_ADMISSION_WAIT, UploadAdmissionConfig,
 };
 
+use drain::{
+    BridgeEnd, DRAINING_CLOSE_REASON, DrainLifecycle, SHUTDOWN_CLOSE_REASON,
+    before_stream_deadline, close_draining_http1_connections, mark_draining_response,
+    native_draining_error, native_draining_response, readyz, send_restart_close, serve_and_drain,
+};
 #[cfg(test)]
 use native::{
     CdpProxyBase, HeaderTokenSource, MAX_LAST_EVENT_ID, StreamBridgeError, UpgradedProxyClose,
@@ -118,8 +124,9 @@ use native::{
     revocation_state_is_active, session_events, token_sha256,
 };
 use runtime_route::{
-    EcwRouteTransport, acquire_ecw_stream_permit, ecw_backend_channel, resolve_ecw_envd_route,
-    resolve_ecw_route, validate_ecw_sandbox_headers,
+    EcwRouteTransport, acquire_ecw_stream_permit, ecw_backend_channel,
+    refuse_new_ecw_stream_while_draining, resolve_ecw_envd_route, resolve_ecw_route,
+    validate_ecw_sandbox_headers,
 };
 use state::*;
 
@@ -132,6 +139,12 @@ pub const DEFAULT_MAX_ATTACHED_STREAMS_PER_SANDBOX: usize = 512;
 pub const DEFAULT_BACKEND_CHANNEL_POOL_SIZE: usize = 4;
 pub const DEFAULT_REVOCATION_CHECK_INTERVAL_MS: u64 = 10_000;
 pub const DEFAULT_ROUTE_CACHE_TTL_MS: u64 = 1_000;
+/// The shortest drain deadline the service accepts: the 8-second stream-open
+/// budget, so a `Process.Start` already opening when SIGTERM arrives finishes
+/// opening, and can report whether the command started, before the deadline.
+/// A second stop signal forces the exit without that wait.
+pub const MIN_SHUTDOWN_GRACE: Duration =
+    pplx_space_node_api_client::NodeApiOperationBudget::StreamOpen.timeout();
 const ECW_PROXY_FAILURE_BRIDGE_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const ECW_PROXY_FAILURE_ROUTE_REPAIR_COOLDOWN: Duration = Duration::from_secs(30);
 const ECW_SERVICE_ROUTE_NOT_READY_RETRY_AFTER: Duration = Duration::from_secs(1);
@@ -149,6 +162,7 @@ const ECW_API_KEY_HEADER: &str = "x-api-key";
 const ECW_SANDBOX_ID_HEADER: &str = "e2b-sandbox-id";
 const ECW_SANDBOX_PORT_HEADER: &str = "e2b-sandbox-port";
 const ECW_PROCESS_STREAM_KIND: &str = "ecw_process";
+const ECW_PROCESS_INPUT_STREAM_KIND: &str = "ecw_process_input";
 const ECW_FILE_WATCH_STREAM_KIND: &str = "ecw_file_watch";
 const ECW_SERVICE_STREAM_KIND: &str = "ecw_service";
 const FEDERATED_ORG_ID_HEADER: &str = "x-space-federated-org-id";
@@ -191,6 +205,13 @@ pub struct DataPlaneConfig {
     pub route_cache_ttl: Duration,
     /// `None` leaves `POST /files` unbounded.
     pub upload_admission: Option<UploadAdmissionConfig>,
+    /// How long live streams may keep running after SIGTERM before they are
+    /// cancelled, at least [`MIN_SHUTDOWN_GRACE`]. The pod's termination grace
+    /// period, minus its preStop delay, has to cover it plus the 5-second
+    /// cancel grace, so the deadline rather than SIGKILL ends a stream that
+    /// outlives the drain. `None` sets no deadline: streams run until they end
+    /// or the pod's termination grace period kills the process.
+    pub shutdown_grace: Option<Duration>,
 }
 
 impl Default for DataPlaneConfig {
@@ -206,6 +227,7 @@ impl Default for DataPlaneConfig {
             revocation_check_interval: Duration::from_millis(DEFAULT_REVOCATION_CHECK_INTERVAL_MS),
             route_cache_ttl: Duration::from_millis(DEFAULT_ROUTE_CACHE_TTL_MS),
             upload_admission: None,
+            shutdown_grace: None,
         }
     }
 }
@@ -226,7 +248,18 @@ struct DataPlaneState {
     ecw_hosts: EcwHostConfig,
     revocation_check_interval: Duration,
     route_cache_ttl: Duration,
-    shutdown_token: CancellationToken,
+    /// Cancelled on SIGTERM: a child of the caller's shutdown token. New
+    /// streams are refused once it is cancelled, and sockets still
+    /// authenticating are told to reconnect; streams already attached keep
+    /// running.
+    drain_started: CancellationToken,
+    /// Cancelled only when the drain deadline passes or the server exits.
+    /// Every stream takes a child of this token, never of the SIGTERM token,
+    /// so a shutdown signal alone does not end live streams. It is a second
+    /// root token on purpose, as `drain_before_shutdown`'s service token is in
+    /// the API (`crates/libs/api/src/run.rs`): a child of the SIGTERM token
+    /// would be cancelled by the very signal the drain outlives.
+    stream_shutdown_token: CancellationToken,
     upgrade_tasks: TaskTracker,
 }
 
@@ -337,26 +370,36 @@ pub enum RunDataPlaneError {
     Serve(#[source] std::io::Error),
 }
 
+/// Serve until `stop.shutdown` is cancelled, then drain. `stop.forced`, a
+/// second stop signal, ends the drain the way its deadline does, so a process
+/// waiting on a stream without a deadline can still be stopped.
 pub async fn run(
     config: DataPlaneConfig,
-    shutdown_token: CancellationToken,
+    stop: pplx_space_common_svc::StopTokens,
 ) -> Result<(), RunDataPlaneError> {
+    let pplx_space_common_svc::StopTokens {
+        shutdown: shutdown_token,
+        forced: force_token,
+    } = stop;
     let upgrade_tasks = TaskTracker::new();
+    let drain_started = shutdown_token.child_token();
+    let stream_shutdown_token = CancellationToken::new();
 
     let cluster_api = connect_cluster_api_clients_for_startup(&shutdown_token)
         .await
         .map_err(RunDataPlaneError::ConnectClusterApi)?;
+    let attached_streams = Arc::new(AttachedStreamLimiter::new(
+        config.max_attached_streams,
+        config.max_attached_streams_per_org,
+        config.max_attached_streams_per_sandbox,
+    ));
     let state = DataPlaneState {
         cluster_api,
         attach_deadline: config.attach_deadline,
         unauthenticated: Arc::new(UnauthenticatedUpgradeLimiter::new(
             config.unauthenticated_upgrade_cap_per_ip,
         )),
-        attached_streams: Arc::new(AttachedStreamLimiter::new(
-            config.max_attached_streams,
-            config.max_attached_streams_per_org,
-            config.max_attached_streams_per_sandbox,
-        )),
+        attached_streams: Arc::clone(&attached_streams),
         uploads: config
             .upload_admission
             .as_ref()
@@ -372,7 +415,8 @@ pub async fn run(
             .revocation_check_interval
             .max(Duration::from_millis(1)),
         route_cache_ttl: config.route_cache_ttl.max(Duration::from_millis(1)),
-        shutdown_token: shutdown_token.clone(),
+        drain_started,
+        stream_shutdown_token: stream_shutdown_token.clone(),
         upgrade_tasks: upgrade_tasks.clone(),
     };
 
@@ -384,24 +428,21 @@ pub async fn run(
             source,
         })?;
     tracing::info!(listen = %config.listen, "space-data-plane-svc listening");
-    let shutdown = {
-        let shutdown_token = shutdown_token.clone();
-        async move { shutdown_token.cancelled().await }
-    };
 
-    axum::serve(
+    serve_and_drain(
         pplx_space_common_svc::http_listener::nodelay(listener),
-        app.into_make_service_with_connect_info::<SocketAddr>(),
+        app,
+        DrainLifecycle {
+            shutdown_token,
+            stream_shutdown_token,
+            tasks: upgrade_tasks,
+            attached_streams,
+            shutdown_grace: config.shutdown_grace,
+            force_token,
+        },
     )
-    .with_graceful_shutdown(shutdown)
     .await
-    .map_err(RunDataPlaneError::Serve)?;
-
-    shutdown_token.cancel();
-    upgrade_tasks.close();
-    upgrade_tasks.wait().await;
-
-    Ok(())
+    .map_err(RunDataPlaneError::Serve)
 }
 
 async fn connect_cluster_api_clients_for_startup(
@@ -499,7 +540,7 @@ fn router(state: DataPlaneState) -> Router {
 
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
-        .route("/readyz", get(|| async { "ok" }))
+        .route("/readyz", get(readyz))
         .route(
             native_routes::ATTACH_SESSION.runtime_path(),
             on(
@@ -609,6 +650,7 @@ fn router(state: DataPlaneState) -> Router {
             route_ecw_service_port_requests,
         ))
         .with_state(state)
+        .layer(middleware::from_fn(close_draining_http1_connections))
         .layer(pplx_space_common_svc::http_trace_layer(
             HttpServerMakeSpan::new(http_span_metadata),
         ))
@@ -719,6 +761,9 @@ async fn ecw_service_proxy(
     if target.port == ECW_ENVD_PORT {
         return Err(EcwProxyError::not_found("Endpoint"));
     }
+    if is_upgrade_request(request.headers()) {
+        refuse_new_ecw_stream_while_draining(&state, ECW_SERVICE_STREAM_KIND)?;
+    }
 
     pplx_space_metrics::data_plane::service_route_transport(
         ServiceRouteSurface::Ecw,
@@ -732,53 +777,62 @@ async fn ecw_service_proxy(
     let deadline = tokio::time::Instant::now()
         + pplx_space_common_svc::ingress_admission::preparation_timeout();
     let request_headers = request.headers().clone();
-    let prepared = tokio::time::timeout_at(deadline, async {
-        let mut route = resolve_ecw_route(
-            &state,
-            &target,
-            &request_headers,
-            EcwRouteTransport::ServicePortIngress,
-        )
-        .await?;
-        for attempt in 0..2 {
-            match service_port_ingress_io(&state, &target, &route).await {
-                Ok(io) => {
-                    // Renew authorization after a potentially long implicit wake,
-                    // before the first application byte is sent.
-                    let fresh = runtime_route::resolve_ecw_route_uncached(
-                        &state,
-                        &route.origin,
-                        &route.origin.cache_key(),
-                        deadline.saturating_duration_since(tokio::time::Instant::now()),
-                    )
-                    .await?;
-                    if route.same_ingress_execution(&fresh) {
-                        return Ok((fresh, io));
+    let prepared = before_stream_deadline(
+        &state.stream_shutdown_token,
+        tokio::time::timeout_at(deadline, async {
+            let mut route = resolve_ecw_route(
+                &state,
+                &target,
+                &request_headers,
+                EcwRouteTransport::ServicePortIngress,
+            )
+            .await?;
+            for attempt in 0..2 {
+                match service_port_ingress_io(&state, &target, &route).await {
+                    Ok(io) => {
+                        // Renew authorization after a potentially long implicit wake,
+                        // before the first application byte is sent.
+                        let fresh = runtime_route::resolve_ecw_route_uncached(
+                            &state,
+                            &route.origin,
+                            &route.origin.cache_key(),
+                            deadline.saturating_duration_since(tokio::time::Instant::now()),
+                        )
+                        .await?;
+                        if route.same_ingress_execution(&fresh) {
+                            return Ok((fresh, io));
+                        }
+                        route = fresh;
                     }
-                    route = fresh;
-                }
-                Err(error) => {
-                    let retryable = error
-                        .transport_status
-                        .as_ref()
-                        .is_some_and(crate::runtime_route::retryable_ingress_attachment);
-                    if attempt == 1 || !retryable {
-                        return Err(error.error);
+                    Err(error) => {
+                        let retryable = error
+                            .transport_status
+                            .as_ref()
+                            .is_some_and(crate::runtime_route::retryable_ingress_attachment);
+                        if attempt == 1 || !retryable {
+                            return Err(error.error);
+                        }
+                        route = runtime_route::resolve_ecw_route_uncached(
+                            &state,
+                            &route.origin,
+                            &route.origin.cache_key(),
+                            deadline.saturating_duration_since(tokio::time::Instant::now()),
+                        )
+                        .await?;
                     }
-                    route = runtime_route::resolve_ecw_route_uncached(
-                        &state,
-                        &route.origin,
-                        &route.origin.cache_key(),
-                        deadline.saturating_duration_since(tokio::time::Instant::now()),
-                    )
-                    .await?;
                 }
             }
+            Err(EcwProxyError::sandbox_service_route_not_ready())
+        }),
+    )
+    .await;
+    let Some(prepared) = prepared else {
+        if is_upgrade_request(&request_headers) {
+            pplx_space_metrics::data_plane::attach(ECW_SERVICE_STREAM_KIND, "draining");
         }
-        Err(EcwProxyError::sandbox_service_route_not_ready())
-    })
-    .await
-    .map_err(|_| EcwProxyError::sandbox_service_route_not_ready())?;
+        return Err(EcwProxyError::draining());
+    };
+    let prepared = prepared.map_err(|_| EcwProxyError::sandbox_service_route_not_ready())?;
     drop(_waiter);
     let (route, ingress_io) = prepared?;
     preparation.ready();
@@ -897,7 +951,7 @@ async fn ecw_service_ingress_proxy_with_io(
     if let (Some(downstream_upgrade), Some(upstream_upgrade), Some(stream_permit)) =
         (downstream_upgrade, upstream_upgrade, upgrade_stream_permit)
     {
-        let shutdown_token = state.shutdown_token.child_token();
+        let shutdown_token = state.stream_shutdown_token.child_token();
         let upgrade_tasks = state.upgrade_tasks.clone();
         upgrade_tasks.spawn(async move {
             let _stream_permit = stream_permit;
@@ -1089,7 +1143,7 @@ async fn open_service_port_ingress_io(
         .is_some_and(|value| value == "1");
     let stream = response.into_inner();
     let (client_io, ingress_io) = tokio::io::duplex(64 * 1024);
-    let shutdown_token = state.shutdown_token.child_token();
+    let shutdown_token = state.stream_shutdown_token.child_token();
     let ingress_tasks = state.upgrade_tasks.clone();
     let done = CancellationToken::new();
     let progress = Progress::new();

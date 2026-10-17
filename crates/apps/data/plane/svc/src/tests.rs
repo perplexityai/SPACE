@@ -65,3 +65,41 @@ fn upload_admission_limits_are_overridable_and_reject_zero() {
         Cli::try_parse_from(["space-data-plane-svc", "--max-in-flight-upload-bytes=0"]).is_err()
     );
 }
+
+#[test]
+fn shutdown_grace_parses_from_flag_and_environment() {
+    if !pplx_space_test_env::enter_test_process(&[(
+        "SPACE_DATA_PLANE_SHUTDOWN_GRACE_SECS",
+        Some(std::ffi::OsStr::new("45")),
+    )]) {
+        return;
+    }
+    assert_eq!(config(&[]).shutdown_grace, Some(Duration::from_secs(45)));
+    // The flag wins over the environment.
+    assert_eq!(
+        config(&["--shutdown-grace-secs", "9"]).shutdown_grace,
+        Some(Duration::from_secs(9))
+    );
+}
+
+#[test]
+fn shutdown_grace_is_unset_without_the_flag_or_environment() {
+    if !pplx_space_test_env::enter_test_process(&[("SPACE_DATA_PLANE_SHUTDOWN_GRACE_SECS", None)]) {
+        return;
+    }
+    assert_eq!(config(&[]).shutdown_grace, None);
+}
+
+#[test]
+fn shutdown_grace_below_the_stream_open_budget_is_rejected() {
+    let below = (MIN_SHUTDOWN_GRACE.as_secs() - 1).to_string();
+    assert!(
+        Cli::try_parse_from(["space-data-plane-svc", "--shutdown-grace-secs", &below]).is_err()
+    );
+    assert!(Cli::try_parse_from(["space-data-plane-svc", "--shutdown-grace-secs", "0"]).is_err());
+    let minimum = MIN_SHUTDOWN_GRACE.as_secs().to_string();
+    assert_eq!(
+        config(&["--shutdown-grace-secs", &minimum]).shutdown_grace,
+        Some(MIN_SHUTDOWN_GRACE)
+    );
+}

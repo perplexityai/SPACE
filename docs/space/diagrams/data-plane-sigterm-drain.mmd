@@ -1,0 +1,21 @@
+sequenceDiagram
+    autonumber
+    participant K as Kubelet
+    participant DP as Data plane<br/>serve_and_drain
+    participant N as New stream request<br/>(attach / SSE / ECW / upgrade)
+    participant L as Live streams<br/>(child of stream_shutdown_token)
+
+    K->>DP: SIGTERM (shutdown_token)
+    DP->>DP: drain_started cancelled<br/>listener stops accepting
+    Note over DP: new connections (probes too) refused<br/>idle keep-alive connections close
+    N->>DP: request already in flight
+    DP-->>N: 503 + Retry-After: 1<br/>(+ Connection: close on HTTP/1)<br/>unattached WebSocket: close 1012
+    L-->>L: keep running untouched
+    alt every stream ends before the deadline
+        L->>DP: last connection / tracked task finishes
+        DP->>K: exit early
+    else --shutdown-grace-secs set and passed, or a second stop signal
+        DP->>L: cancel stream_shutdown_token
+        Note over L: native SSE: body ends → reconnect with Last-Event-ID<br/>(live resume, missed output not replayed)<br/>native WebSocket: close 1012<br/>ECW connect: unavailable end-stream → reconnect<br/>(unreported start: unknown, no retry)<br/>streamed StreamInput: 409<br/>other upgrades: closed
+        DP->>K: exit (after ≤ 5s cancel grace)
+    end

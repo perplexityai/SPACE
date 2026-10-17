@@ -112,6 +112,9 @@ _DURATION_SECONDS = {
         "native_concurrency.independent_commands": 7,
         "native_concurrency.lifecycle_contention": 9,
         "native_concurrency.slow_reader": 7,
+        # Estimate until a bench run refreshes it: one data-plane rollout with
+        # the old pod held open by a stream, then its exit.
+        "native_recovery.attached_stream_drains_through_data_plane_restart": 60,
         "native_recovery.command_survives_data_plane_restart": 15,
         "native_recovery.queued_create_survives_api_restart": 25,
     },

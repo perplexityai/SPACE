@@ -8,7 +8,7 @@ use pplx_space_data_plane_server::{
     DEFAULT_MAX_ATTACHED_STREAMS_PER_SANDBOX, DEFAULT_MAX_CONCURRENT_UPLOADS,
     DEFAULT_MAX_IN_FLIGHT_UPLOAD_BYTES, DEFAULT_REVOCATION_CHECK_INTERVAL_MS,
     DEFAULT_ROUTE_CACHE_TTL_MS, DEFAULT_UNAUTHENTICATED_UPGRADE_CAP_PER_IP,
-    DEFAULT_UPLOAD_ADMISSION_WAIT, DataPlaneConfig, UploadAdmissionConfig,
+    DEFAULT_UPLOAD_ADMISSION_WAIT, DataPlaneConfig, MIN_SHUTDOWN_GRACE, UploadAdmissionConfig,
 };
 
 // Same allocator choice as space-api-svc: glibc arenas keep the peak of an
@@ -123,6 +123,18 @@ struct Cli {
         default_value_t = DEFAULT_UPLOAD_ADMISSION_WAIT.as_millis() as u64
     )]
     upload_admission_wait_ms: u64,
+
+    /// Seconds live streams may keep running after SIGTERM before they are
+    /// cancelled; at least 8, the stream-open budget. Keep it plus 5 seconds,
+    /// which cancelled streams get to close, within the pod's termination grace
+    /// period minus its preStop delay. Unset, streams run until they end or the
+    /// termination grace period kills the process.
+    #[arg(
+        long,
+        env = "SPACE_DATA_PLANE_SHUTDOWN_GRACE_SECS",
+        value_parser = clap::value_parser!(u64).range(MIN_SHUTDOWN_GRACE.as_secs()..)
+    )]
+    shutdown_grace_secs: Option<u64>,
 }
 
 impl From<Cli> for DataPlaneConfig {
@@ -144,6 +156,7 @@ impl From<Cli> for DataPlaneConfig {
                 max_in_flight_bytes: cli.max_in_flight_upload_bytes,
                 wait: Duration::from_millis(cli.upload_admission_wait_ms),
             }),
+            shutdown_grace: cli.shutdown_grace_secs.map(Duration::from_secs),
         }
     }
 }
@@ -152,9 +165,9 @@ impl From<Cli> for DataPlaneConfig {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let telemetry = pplx_space_common_svc::init_service(SERVICE_NAME)?;
-    let shutdown_token = pplx_space_common_svc::shutdown_token();
+    let stop = pplx_space_common_svc::stop_tokens();
 
-    let result = pplx_space_data_plane_server::run(cli.into(), shutdown_token).await;
+    let result = pplx_space_data_plane_server::run(cli.into(), stop).await;
     pplx_space_common_svc::shutdown_telemetry(telemetry).await;
     Ok(result?)
 }

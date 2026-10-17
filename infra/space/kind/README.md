@@ -1246,13 +1246,14 @@ too. Each chart's values cite the code behind its numbers.
   in-flight requests, SSE streams and the substrate work it tracks (a
   restore leader, a suspend continuation) within that grace. A 5 s preStop
   sleep keeps the pod serving while it leaves the entry Services' endpoints,
-  and the 180 s termination grace covers both plus exit. The data plane has no
-  drain budget of its own: it stops accepting and waits for plain HTTP
-  streaming responses (native session SSE, ECW process and file streams), so
-  it gets the same preStop delay and a 180 s grace as their bound. Upgraded
-  connections do not drain: service-port proxies and ingress, upgraded HTTP
-  proxies and raw service sessions close at SIGTERM, and the other WebSocket
-  session attaches end with the process. internal-api waits for in-flight ClusterApi calls,
+  and the 180 s termination grace covers both plus exit. The data plane renders
+  its own `--shutdown-grace-secs` at 150 s: on SIGTERM it stops accepting and
+  refuses new streams, keeps attached streams (native SSE and WebSockets, ECW
+  process and file streams, upgraded proxies and ingress) running until they
+  end, and cancels whatever is left at the deadline, giving those streams 5 s
+  to close. It gets the same preStop delay, and its 180 s grace covers the
+  preStop, the drain, those 5 s and exit; the chart refuses a grace that
+  doesn't exceed the first three. internal-api waits for in-flight ClusterApi calls,
   which the server does not bound and every client times out at 30 s, with a
   5 s preStop and a 50 s grace that covers both and the telemetry flush.
   cluster-controller bounds its reconciler drain at 10 s inside its 30 s

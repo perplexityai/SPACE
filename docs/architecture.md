@@ -225,6 +225,41 @@ Firecracker isolates guest execution. Host-side services still require privilege
 
 The API authorizes management requests with a user-session or service bearer token. The data plane authorizes command connections with session-scoped attachment tokens. Management and attachment tokens are not interchangeable.
 
+A data-plane replica that receives SIGTERM drains rather than dropping its
+streams. The listener closes, so new connections, readiness probes included,
+are refused, and idle keep-alive connections close; `/readyz` reports 503 only
+to a probe already in flight on an open connection. Behind a load balancer, use
+a preStop delay so it stops routing to the replica before the listener closes.
+A stream request whose headers had already arrived when the drain started gets
+503 with `Retry-After` (plus `Connection: close` on HTTP/1); that includes a
+streamed ECW `Process.StreamInput`. A native WebSocket that was accepted but
+hadn't attached yet is closed with code 1012 (service restart). Streams that
+were already attached keep running, and the replica exits once none remain and
+in-flight requests finish. With a drain deadline set (`--shutdown-grace-secs`),
+streams still open when it passes are cancelled; without one, they run until
+they end or the pod's termination grace period kills the process. A second stop
+signal ends the drain the way the deadline does, but at once: a `Process.Start`
+still opening is cut the way SIGKILL would cut it. At the deadline: native
+event streams end, and a client that reconnects with `Last-Event-ID` resumes
+the live stream but doesn't get the output it missed; native WebSockets close
+with 1012, including ones still opening their backend stream, and the client
+re-attaches the same session (a process or terminal session doesn't start its
+process again); ECW connect streams end with `unavailable` and need a new
+client request, a process stream after first delivering the output the backend
+has already produced; a `Process.Start` that hasn't reported itself gets up to
+2 seconds to, and otherwise ends with `unknown`, since the command may be
+running and a retried start would run it twice; a streamed
+`Process.StreamInput` gets a 409, since some of its input may already have been
+delivered; other stream requests still opening their backend stream, and
+proxied sandbox-service requests still preparing their route, get the draining
+503; proxied sandbox-service responses and other upgraded connections are cut.
+Other responses still in flight, such as a large file download, end when the
+process exits, at most about 5 seconds after the deadline, unless they finish
+first. Keep the deadline plus those 5 seconds within the pod's termination
+grace period minus its preStop delay; the telemetry flush on exit gets whatever
+time remains. The service rejects a deadline under 8 seconds, the stream-open
+budget.
+
 Continue with [Your first sandbox](first-sandbox.md) for API examples and [recovery steps](first-sandbox.md#troubleshoot-failures).
 
 Internal TCP transport configuration and coordinated rollout requirements are
