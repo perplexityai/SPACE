@@ -13,10 +13,6 @@ clusterId: kind-local
 telemetry: {}
 node: {}
 
-# Empty uses the binary default (NoCoW). Set inherit for a cache that needs
-# data checksums/compression, or does not use btrfs.
-rootfsBackingPolicy: ""
-
 # On-node template cache LRU eviction. `GcConfig::from_env` reads these once at
 # template-manager start: an unset or zero budget means the loop spawns, logs
 # once and exits, so a bench without this block never exercises eviction at

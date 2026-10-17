@@ -4,6 +4,3 @@
 # could reclaim it under the upload. Null renders none of the SPACE_TEMPLATE_*
 # environment.
 templateCache: null
-
-# The builder's elevated rootfs extraction is not yet NoCoW-aware.
-rootfsBackingPolicy: inherit

@@ -1,15 +1,13 @@
-# Template rootfs backing: NoCoW by default
+# Template rootfs backing: opt-in NoCoW
 
 Template-manager accepts `SPACE_TEMPLATE_ROOTFS_BACKING_POLICY=inherit|nocow`.
-Unset selects `nocow` for new materializations. The same service default applies
-to OSS and composed deployments; no deployment-specific rate or storage default
-is embedded in the binary. Explicit `inherit` preserves normal filesystem
-behavior, usually CoW with data checksums on a btrfs cache. Guest I/O limits do
-not change.
+The default, `inherit`, preserves existing filesystem behavior. On a conventional
+btrfs cache this is CoW with data checksums. No deployment or guest I/O limit is
+changed by adding this setting.
 
-`nocow` applies to **newly materialized template rootfs files**
+`nocow` is an experimental choice for **newly materialized template rootfs files**
 on Linux btrfs. Template-manager parses it at startup; unknown values fail
-startup. The resolved `nocow` policy validates the template cache filesystem before
+startup. An explicit `nocow` also validates the template cache filesystem before
 serving requests and fails startup if it is not btrfs. Each materialization still
 verifies the inode flag and fails if it cannot be applied.
 The startup log records the policy and its scope. Configure template-manager,
@@ -53,9 +51,6 @@ Keep builder template-managers on `inherit` with CoW base caches in this phase.
 Build-manager still uses an elevated `cp --reflink=auto` to extract the stopped
 build sandbox rootfs; a NoCoW source can fall back to a full CoW copy there.
 Do not use NoCoW builder bases until that privileged handoff is qualified.
-The Kind builder values set this override. Other deployment compositions must
-set it on their builder template-managers before adopting the default. A worker
-cache on a non-btrfs filesystem also needs explicit `inherit` to start.
 
 Linux shared copies reject symlink sources and non-regular destinations, and
 replace completed outputs atomically. A crash can leave `.reflink-*` temporary
@@ -73,10 +68,9 @@ NoCoW disables btrfs data checksums and filesystem compression for these files.
 Artifact-level compression remains. Corruption detection is lost even on RAID0;
 redundant profiles additionally lose checksum-guided data repair. Corrupt cached
 bytes can propagate into guests and later snapshots. Reverting the setting does
-not recreate checksums on existing NoCoW extents. This default does not detect a
-filesystem's RAID or compression profile. Operators who need data checksums,
-checksum-guided repair on redundant profiles, or filesystem compression must set
-`inherit` before upgrading; existing NoCoW files are not converted by that override.
+not recreate checksums on existing NoCoW extents. Explicit opt-in acknowledges
+these costs; this release makes no automatic choice based on a filesystem's RAID
+or compression profile.
 
 ## First canary and rollback
 
@@ -105,7 +99,7 @@ Finite noisy samples can be inconclusive; a nonsignificant difference is not
 proof of equivalence. Raising guest IOPS is a separate experiment against the
 preceding qualified backing/rate, with the same lifecycle constraint.
 
-Set `inherit` explicitly to stop requesting NoCoW for new
+Unset the variable or set `inherit` to stop requesting NoCoW for new
 materializations. Already cached NoCoW files and descendants remain NoCoW.
 Rollback does not mutate their bytes, UUIDs or parent relationships. Use the
 following one-time recovery procedure, rehearsed in testing before production

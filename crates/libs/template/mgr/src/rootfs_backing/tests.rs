@@ -54,8 +54,9 @@ fn materialization_preserves_bytes_sparsity_and_clone_isolation() {
         return;
     };
     let tmp = tempfile::tempdir_in(root).unwrap();
-    let policy = RootfsBackingPolicy::default();
-    policy.validate_cache(tmp.path()).unwrap();
+    RootfsBackingPolicy::NoCow
+        .validate_cache(tmp.path())
+        .unwrap();
     let mut bytes = vec![0; 16 * 1024 * 1024];
     bytes[1024..1032].copy_from_slice(b"original");
     let expected_hash = format!("sha256:{}", hex::encode(Sha256::digest(&bytes)));
@@ -81,7 +82,7 @@ fn materialization_preserves_bytes_sparsity_and_clone_isolation() {
                     &compressed,
                     &output,
                     Some(&expected_hash),
-                    policy,
+                    RootfsBackingPolicy::NoCow,
                 )
                 .unwrap();
             } else {
@@ -96,7 +97,7 @@ fn materialization_preserves_bytes_sparsity_and_clone_isolation() {
                 } else {
                     std::fs::write(&output, &bytes).unwrap();
                 }
-                policy.prepare_raw(&output).unwrap();
+                RootfsBackingPolicy::NoCow.prepare_raw(&output).unwrap();
             }
             let source = File::open(&output).unwrap();
             assert!(ioctl_getflags(&source).unwrap().contains(IFlags::NOCOW));
@@ -104,7 +105,7 @@ fn materialization_preserves_bytes_sparsity_and_clone_isolation() {
             assert!(source.metadata().unwrap().blocks() * 512 < 1024 * 1024);
             // Re-adoption must retain the existing inode and shared extents,
             // rather than rewriting an image that already has the policy.
-            policy.prepare_raw(&output).unwrap();
+            RootfsBackingPolicy::NoCow.prepare_raw(&output).unwrap();
             assert_eq!(
                 source.metadata().unwrap().ino(),
                 std::fs::metadata(&output).unwrap().ino()
@@ -122,14 +123,17 @@ fn materialization_preserves_bytes_sparsity_and_clone_isolation() {
                 .create_new(true)
                 .open(clone_path)
                 .unwrap();
-            policy.prepare_empty(&clone).unwrap();
+            RootfsBackingPolicy::NoCow.prepare_empty(&clone).unwrap();
             rustix::fs::ioctl_ficlone(&clone, &source).unwrap();
             clone.write_all_at(b"modified", 1024).unwrap();
             let mut actual = [0; 8];
             source.read_exact_at(&mut actual, 1024).unwrap();
             assert_eq!(&actual, b"original");
             assert_eq!(
-                policy.prepare_empty(&source).unwrap_err().kind(),
+                RootfsBackingPolicy::NoCow
+                    .prepare_empty(&source)
+                    .unwrap_err()
+                    .kind(),
                 io::ErrorKind::InvalidInput
             );
         }

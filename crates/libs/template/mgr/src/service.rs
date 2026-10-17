@@ -1517,10 +1517,7 @@ impl TemplateManagerService {
         conn: rusqlite::Connection,
         root: impl Into<PathBuf>,
     ) -> Result<Self, rusqlite::Error> {
-        // These protocol/cache fixtures use the host's temporary filesystem;
-        // explicit NoCoW materialization has its own disposable btrfs coverage.
-        let mut service = Self::new(conn)?
-            .with_rootfs_backing_policy(crate::rootfs_backing::RootfsBackingPolicy::Inherit);
+        let mut service = Self::new(conn)?;
         service.artifact_store = TemplateArtifactStore::new(root);
         Ok(service)
     }
