@@ -44,17 +44,23 @@ pub(in crate::service) fn reupload_precondition_for_cluster_api_env(
     )))
 }
 
-/// "Set" means the env var is present *and* non-empty — matching the
-/// node-api client's `required_env` helper, which `connect_from_env()`
-/// uses to decide between `Ok(client)` and `MissingEndpoint`/
-/// `MissingToken`. An env var present-but-empty (e.g. an unfilled Helm
-/// template that rendered to `""`) must be classified as missing so
-/// this precondition matches the downstream cluster-api connect
-/// behavior; otherwise the RPC would happily enqueue a job that the
-/// durable worker's `register_with_cluster_api` then marks
-/// `JobError::permanent`.
-fn cluster_api_env_var_set(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|v| !v.is_empty())
+/// Whether this node is wired to cluster-api, resolved the way the
+/// cluster-api client resolves it: the endpoint from `connect_from_env`'s own
+/// lookup (primary name, then the deprecated legacy name) and the bearer token
+/// from the token file or the `SPACE_INTERNAL_TOKEN` fallback. Asking the
+/// client's resolution, rather than re-checking env names, keeps admission from
+/// refusing a node whose wiring the durable worker's connect would accept, and
+/// from accepting one it would reject as `MissingEndpoint`/`MissingToken`.
+fn cluster_api_wiring_set() -> (bool, bool) {
+    let endpoint_set = pplx_space_node_api_client::cluster::cluster_api_endpoint_from_environment(
+        &pplx_space_common_core::env::ProcessEnvironment,
+    )
+    .is_some();
+    let token_set = pplx_space_common_svc::bearer_token::space_bearer_token(
+        pplx_space_common_svc::bearer_token::SpaceBearerToken::ClusterApi,
+    )
+    .is_ok();
+    (endpoint_set, token_set)
 }
 
 /// Sniff the local `snapshot.json` sidecar to recover the rootfs codec
@@ -635,10 +641,8 @@ impl SandboxManagerService {
                 ));
             }
         };
-        if let Some(status) = reupload_precondition_for_cluster_api_env(
-            cluster_api_env_var_set(pplx_space_node_api_client::cluster::CLUSTER_API_ENDPOINT_ENV),
-            cluster_api_env_var_set("SPACE_INTERNAL_TOKEN"),
-        ) {
+        let (endpoint_set, token_set) = cluster_api_wiring_set();
+        if let Some(status) = reupload_precondition_for_cluster_api_env(endpoint_set, token_set) {
             return Err(status);
         }
 
@@ -1040,10 +1044,8 @@ impl SandboxManagerService {
         // id for an enqueue that can never close the loop (no `ready`
         // snapshot row would land), so the reconciler would never see
         // promotion progress.
-        if let Some(status) = reupload_precondition_for_cluster_api_env(
-            cluster_api_env_var_set("SPACE_INTERNAL_API_ENDPOINT"),
-            cluster_api_env_var_set("SPACE_INTERNAL_TOKEN"),
-        ) {
+        let (endpoint_set, token_set) = cluster_api_wiring_set();
+        if let Some(status) = reupload_precondition_for_cluster_api_env(endpoint_set, token_set) {
             return Err(status);
         }
         // Re-wrap `NotFound` from the local sqlite lookup as
