@@ -49,7 +49,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_TRANSIENT_LIFECYCLE_SWEEPER_ENABLED` | off | |
 | `SPACE_TRANSIENT_LIFECYCLE_SWEEPER_TICK_SECS` | 60 | |
 | `SPACE_TRANSIENT_LIFECYCLE_SWEEPER_DEFAULT_AGE_SECS` | 600 | Age before a row in a transient lifecycle state is retired, unless a per-state age below applies. |
-| `SPACE_TRANSIENT_LIFECYCLE_SWEEPER_RESTORING_AGE_SECS`, `SPACE_TRANSIENT_LIFECYCLE_SWEEPER_SUSPENDING_AGE_SECS`, `SPACE_TRANSIENT_LIFECYCLE_SWEEPER_CHECKPOINTING_AGE_SECS` | default age | Per-state override; `0` disables that state. |
+| `SPACE_TRANSIENT_LIFECYCLE_SWEEPER_CREATING_AGE_SECS`, `SPACE_TRANSIENT_LIFECYCLE_SWEEPER_RESTORING_AGE_SECS`, `SPACE_TRANSIENT_LIFECYCLE_SWEEPER_SUSPENDING_AGE_SECS`, `SPACE_TRANSIENT_LIFECYCLE_SWEEPER_CHECKPOINTING_AGE_SECS` | default age | Per-state override; `0` disables that state. A `creating` row is left alone while its create's 300 s activation lease is live and for one more `creating` age after it expires; a create still running past both is failed, so keep the `creating` age at the 600 s default or above. |
 | `SPACE_STUCK_SNAPSHOT_REAPER_ENABLED` | off | |
 | `SPACE_SUSPENDED_EXECUTION_REAPER_ENABLED` | off | Runs dry by default. |
 | `SPACE_STUCK_CONTAINER_CREATING_GC_ENABLED` | off | |

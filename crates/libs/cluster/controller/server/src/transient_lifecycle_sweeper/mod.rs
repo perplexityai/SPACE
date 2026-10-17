@@ -53,6 +53,18 @@
 //!   `persist_pod_metadata` write) and the row then converges; no such pod
 //!   defers the row, still `restoring`, until something hydrates it or the
 //!   VM retires into the revert path below.
+//! - **alive + `creating`, owner gone** — a create whose API process died
+//!   after its pod was placed leaves the VM running and the row `creating`.
+//!   The candidate select never lists a `creating` row whose active execution
+//!   holds an activation-attempt lease that hasn't been expired for a full age
+//!   window: until then the request may still be running and finalize the row
+//!   itself. Once it has, the row fails and retires like a dead one rather
+//!   than converging: the client that asked for it usually never got its id,
+//!   and nothing records what else the request asked for. A `creating` row
+//!   whose execution holds no attempt (never assigned, or already released)
+//!   defers. (A crashed create whose
+//!   execution did become routable is usually converged by the node's
+//!   activation-completion receipt before it gets here.)
 //! - **alive + anything else** — defer; a later slice may converge those.
 //! - **`restoring` (dormant / dead / missing) with a ready durable
 //!   snapshot** — revert to `suspended` and retire the leftover execution;
@@ -738,41 +750,50 @@ impl ReconcilerConfig {
     /// Read config from env vars. Helm renders these under
     /// `clusterController.reconcilers.transientLifecycleSweeper.*`.
     pub fn from_env() -> Self {
+        Self::from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+    }
+
+    pub(crate) fn from_environment(env: &dyn pplx_space_common_core::env::Environment) -> Self {
+        let config = env_config::EnvConfig(env);
         let default = Self::default();
         Self {
-            enabled: env_config::truthy_default(
-                "SPACE_TRANSIENT_LIFECYCLE_SWEEPER_ENABLED",
-                default.enabled,
-            ),
-            tick: env_config::duration_secs(
-                "SPACE_TRANSIENT_LIFECYCLE_SWEEPER_TICK_SECS",
-                default.tick,
-            ),
-            default_age: std::env::var("SPACE_TRANSIENT_LIFECYCLE_SWEEPER_DEFAULT_AGE_SECS")
+            enabled: config
+                .truthy_default("SPACE_TRANSIENT_LIFECYCLE_SWEEPER_ENABLED", default.enabled),
+            tick: config.duration_secs("SPACE_TRANSIENT_LIFECYCLE_SWEEPER_TICK_SECS", default.tick),
+            default_age: env
+                .var("SPACE_TRANSIENT_LIFECYCLE_SWEEPER_DEFAULT_AGE_SECS")
                 .ok()
                 .and_then(|raw| raw.parse::<u64>().ok())
                 .and_then(|n| PositiveDuration::new(Duration::from_secs(n)))
                 .unwrap_or(default.default_age),
-            creating_age: default.creating_age,
+            // Unset keeps the default age, as before this knob existed, so a
+            // deployment that ages `creating` out on the default keeps doing
+            // so. A deployment whose default is effectively "never" opts in
+            // here.
+            creating_age: env_lifecycle_age(
+                env,
+                "SPACE_TRANSIENT_LIFECYCLE_SWEEPER_CREATING_AGE_SECS",
+            ),
             starting_age: default.starting_age,
             pausing_age: default.pausing_age,
             resuming_age: default.resuming_age,
             suspending_age: env_lifecycle_age(
+                env,
                 "SPACE_TRANSIENT_LIFECYCLE_SWEEPER_SUSPENDING_AGE_SECS",
             ),
             restoring_age: env_lifecycle_age(
+                env,
                 "SPACE_TRANSIENT_LIFECYCLE_SWEEPER_RESTORING_AGE_SECS",
             ),
             stopping_age: default.stopping_age,
             checkpointing_age: env_lifecycle_age(
+                env,
                 "SPACE_TRANSIENT_LIFECYCLE_SWEEPER_CHECKPOINTING_AGE_SECS",
             ),
             probe_timeout: default.probe_timeout,
             // Ships enabled and retires failed rows, so a malformed value must
             // disable it rather than leave it running.
-            failed_cleanup_enabled: env_config::destructive_gate(
-                "SPACE_FAILED_SANDBOX_CLEANUP_ENABLED",
-            ),
+            failed_cleanup_enabled: config.destructive_gate("SPACE_FAILED_SANDBOX_CLEANUP_ENABLED"),
             failed_cleanup_batch_size: default.failed_cleanup_batch_size,
             command_ready_pending_enabled: false,
             command_ready_pending_age: default.command_ready_pending_age,
@@ -824,11 +845,11 @@ impl ReconcilerConfig {
 /// positive integer -> [`LifecycleAge::Override`]; unset or unparseable ->
 /// [`LifecycleAge::UseDefault`] (so a typo doesn't silently disable a
 /// lifecycle).
-fn env_lifecycle_age(var: &str) -> LifecycleAge {
-    match std::env::var(var)
-        .ok()
-        .and_then(|raw| raw.parse::<u64>().ok())
-    {
+fn env_lifecycle_age(
+    env: &dyn pplx_space_common_core::env::Environment,
+    var: &str,
+) -> LifecycleAge {
+    match env.var(var).ok().and_then(|raw| raw.parse::<u64>().ok()) {
         Some(0) => LifecycleAge::Disabled,
         Some(n) => PositiveDuration::new(Duration::from_secs(n))
             .map(LifecycleAge::Override)
@@ -845,6 +866,11 @@ pub struct FailedCleanupCandidate {
     /// `k8s_node_name` from the active execution row; `None` when the pod
     /// never reached a node.
     pub node_name: Option<String>,
+    /// Whether the execution's first activation (for a cold create, the
+    /// create) never finished: no pod IP, and it still holds the expired
+    /// attempt that published its route. Such a row is retired even with its
+    /// VM alive, never repaired to `started`.
+    pub first_activation_abandoned: bool,
     /// What the listing observed of that execution, so the retire can refuse
     /// if the sandbox moved on before the probe and the retire ran.
     pub pod_fence: RetireFence,
@@ -1713,8 +1739,8 @@ impl<S: SweepSink> Reconciler<S> {
     }
 
     /// The old age-out behavior, now reached only for rows the probe proved
-    /// gone from their node with nothing recoverable: CAS to `failed` and
-    /// retire the execution.
+    /// gone from their node with nothing recoverable, or for an alive
+    /// abandoned create: CAS to `failed` and retire the execution.
     async fn fail_candidate(
         &self,
         candidate: &SweepCandidate,
@@ -2450,7 +2476,14 @@ impl<S: SweepSink> Reconciler<S> {
                 continue;
             }
 
-            if verdict == ProbeVerdict::AliveOnNode
+            // A first activation that never finished is retired even with its
+            // VM alive: the sweep fails such a create on purpose, and
+            // repairing it to `started` would hand out a sandbox its create
+            // request never returned, with no pod IP to reach it at.
+            let retire_alive_create =
+                candidate.first_activation_abandoned && verdict == ProbeVerdict::AliveOnNode;
+            if !retire_alive_create
+                && verdict == ProbeVerdict::AliveOnNode
                 && observation.node_status == Some(SandboxLifecycle::Started)
             {
                 self.repair_failed_active_candidate(sandbox_id, observation, report)
@@ -2458,7 +2491,7 @@ impl<S: SweepSink> Reconciler<S> {
                 continue;
             }
 
-            if !verdict.permits_failed_retire() {
+            if !retire_alive_create && !verdict.permits_failed_retire() {
                 let defer_reason = failed_cleanup_defer_reason(observation);
                 OutcomeEvent::failed_cleanup(FailedCleanupOutcome::Deferred, verdict.as_str())
                     .reason(defer_reason)

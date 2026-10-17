@@ -11,8 +11,9 @@
 //! in `tests.rs` are not repeated here: the fail CAS's age (`r1`) and
 //! substrate scope (`r4`), the marked-`restoring` exemption (`r6`), the
 //! current-cycle snapshot exemption (`r7`), the restore lease and the
-//! converge age (`r10`, `r13`) and the revert's snapshot window (`r11`,
-//! `r15`).
+//! converge age (`r10`, `r13`), the revert's snapshot window (`r11`,
+//! `r15`), and the `creating` fail CAS's activation-owner check
+//! (`tests/crashed_create.rs`).
 //!
 //! The sink runs over the direct substrate, which labels its rows
 //! `managed_by = 'space'` and needs no node or Kubernetes API for these
@@ -42,14 +43,14 @@ use crate::lifecycle_writer_test_support::{
     pin_local_artifact, single_backend_pool, stored_lifecycles, wait_until_blocked,
 };
 
-fn age() -> PositiveDuration {
+pub(super) fn age() -> PositiveDuration {
     PositiveDuration::new(Duration::from_secs(60)).expect("non-zero")
 }
 
 // Direct is only a placeholder: it supplies `managed_by`, and only the converge
 // CAS and the failed-active repair CAS would decide differently for a
 // Kubernetes label (see the module doc).
-fn direct_sink(pool: &PgPool) -> SubstrateSweepSink {
+pub(super) fn direct_sink(pool: &PgPool) -> SubstrateSweepSink {
     SubstrateSweepSink::new(
         pool.clone(),
         Arc::new(Substrate::Direct(Box::new(DirectSubstrate::new(

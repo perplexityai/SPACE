@@ -66,6 +66,23 @@ pub struct CreateSandboxOperationPayload {
     /// release before any producer sets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_claim: Option<CreateSandboxPoolClaim>,
+    /// Set once an attempt finds this create's sandbox row placed on a node
+    /// and still `creating`, and waits for it. A later attempt that finds no
+    /// row then fails the create rather than building the sandbox again under
+    /// the same id: the row was deleted while the create waited. Rows the
+    /// attempt merely retries (an unplaced `creating` row, `deleting`) don't
+    /// set it, since a create rollback can legitimately remove those. A
+    /// rollback can also remove a placed row (a file-change create that missed
+    /// readiness), but its own attempt is the one still running, so another
+    /// attempt only sees the row if the claim stalled and two overlap.
+    ///
+    /// Unlike `node_pool`, nothing switches it on: the executor writes it
+    /// whenever a re-driven create waits. An older executor's
+    /// `deny_unknown_fields` rejects a payload carrying it as invalid, so an
+    /// operation flagged by this release fails if an older replica runs it
+    /// next, whether during a rolling deploy or after a rollback.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sandbox_row_observed: bool,
 }
 
 /// Identifies the warm-pool slot claim recorded on an admitted native create.
@@ -308,15 +325,39 @@ fn operation_sandbox_id(operation: &ClaimedPublicOperation) -> Option<String> {
 pub struct CreateSandboxOperationExecutor {
     pool: PgPool,
     controller: SandboxController,
+    /// Whether the driver recording this executor's results fails a native
+    /// create that outlives its deadline. Only then may a create wait on its
+    /// row as workflow progress, which doesn't spend the retry budget.
+    native_deadline: bool,
 }
 
 impl CreateSandboxOperationExecutor {
+    /// An executor whose results the driver records with its default
+    /// configuration, which applies the native deadline.
     pub fn new(pool: PgPool, controller: SandboxController) -> Self {
-        Self { pool, controller }
+        Self {
+            pool,
+            controller,
+            native_deadline: crate::public_operation_driver::OperationExecutionConfig::default()
+                .m1_max_age
+                .is_some(),
+        }
     }
 
+    /// Match the deadline the driver recording these results applies
+    /// (`OperationExecutionConfig::m1_max_age`). Without one, a create waiting
+    /// on its row is retried against the budget instead, so it still ends.
+    pub fn with_native_deadline(mut self, m1_max_age: Option<Duration>) -> Self {
+        self.native_deadline = m1_max_age.is_some();
+        self
+    }
+
+    /// Execute `operation` under `claim_token`, the claim the caller holds on
+    /// it. The token lets an attempt record progress in the operation's
+    /// payload ([`CreateSandboxOperationPayload::sandbox_row_observed`]).
     pub async fn execute(
         &self,
+        claim_token: &str,
         operation: &ClaimedPublicOperation,
     ) -> PublicOperationExecutionResult {
         let span = tracing::info_span!(
@@ -327,14 +368,19 @@ impl CreateSandboxOperationExecutor {
             target_id = operation.target_id.as_deref().unwrap_or("none"),
             sandbox_id = operation_sandbox_id(operation),
         );
-        match self.execute_inner(operation).instrument(span).await {
+        match self
+            .execute_inner(claim_token, operation)
+            .instrument(span)
+            .await
+        {
             Ok(result) => result,
-            Err(error) => error.into_result(operation),
+            Err(error) => error.into_result(operation, self.native_deadline),
         }
     }
 
     async fn execute_inner(
         &self,
+        claim_token: &str,
         operation: &ClaimedPublicOperation,
     ) -> Result<PublicOperationExecutionResult, CreateSandboxExecutionError> {
         let payload: CreateSandboxOperationPayload =
@@ -388,12 +434,24 @@ impl CreateSandboxOperationExecutor {
                 ));
             }
             let lifecycle = existing.lifecycle.parse::<SandboxLifecycle>()?;
-            ensure_existing_row_confirms_create(existing.active_node_id, lifecycle)?;
+            let confirmed = ensure_existing_row_confirms_create(existing.active_node_id, lifecycle);
+            if matches!(
+                confirmed,
+                Err(CreateSandboxExecutionError::ExistingRowStillCreating)
+            ) && !payload.sandbox_row_observed
+            {
+                self.record_sandbox_row_observed(claim_token, operation, &payload)
+                    .await?;
+            }
+            confirmed?;
             return Ok(create_success_result(
                 payload.sandbox_id,
                 lifecycle,
                 "sandbox already exists for create operation",
             ));
+        }
+        if payload.sandbox_row_observed {
+            return Err(CreateSandboxExecutionError::SandboxRowGone);
         }
 
         let actor_user_id = operation
@@ -470,6 +528,39 @@ impl CreateSandboxOperationExecutor {
             lifecycle,
             "sandbox create dispatched",
         ))
+    }
+
+    /// Record in the operation's payload that this create's sandbox row
+    /// exists, so a later attempt that no longer finds it fails instead of
+    /// creating the sandbox again. A write that matches nothing means this
+    /// attempt lost its claim; whatever it returns is then discarded with it,
+    /// and the attempt that holds the claim reads the row afresh.
+    async fn record_sandbox_row_observed(
+        &self,
+        claim_token: &str,
+        operation: &ClaimedPublicOperation,
+        payload: &CreateSandboxOperationPayload,
+    ) -> Result<(), CreateSandboxExecutionError> {
+        let mut observed = payload.clone();
+        observed.sandbox_row_observed = true;
+        let recorded = crate::public_operations::PublicOperationStore::new(self.pool.clone())
+            .update_claimed_payload(
+                crate::public_operations::UpdateClaimedPublicOperationPayload {
+                    claim_token: claim_token.to_string(),
+                    operation_id: operation.id,
+                    claim_generation: operation.claim_generation,
+                    payload_json: observed.into_json(),
+                },
+            )
+            .await
+            .map_err(|error| CreateSandboxExecutionError::RecordObservedRow(error.to_string()))?;
+        if !recorded {
+            tracing::debug!(
+                operation_id = %operation.id,
+                "create attempt lost its claim before recording its sandbox row"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -746,10 +837,21 @@ pub(crate) fn create_success_result(
 }
 
 /// Accept only existing-row states that prove the sandbox was dispatched or
-/// progressed beyond creation. Ambiguous failure/cleanup states count as
-/// retries so the operation can never claim success for a sandbox that did not
-/// finish creating. The explicit match makes new lifecycle variants fail to
-/// compile until their create-operation disposition is chosen deliberately.
+/// progressed beyond creation. The operation never claims success for a
+/// sandbox that did not finish creating:
+///
+/// * `creating` is unfinished whether or not a node was placed. A create whose
+///   request died after its pod was placed reaches here on the re-drive, and
+///   its row either finalizes or is failed by the transient-lifecycle sweep;
+///   until then a native create waits as workflow progress, which its
+///   deadline bounds, and a create with no deadline (admin, or the deadline
+///   switched off) is retried against the budget. Without a node it is retried against the budget, as
+///   before: that is also the residue of a failed create rollback.
+/// * `failed` is a create that can't finish, so the operation fails.
+/// * `deleting` and `quarantined` are retried.
+///
+/// The explicit match makes new lifecycle variants fail to compile until
+/// their create-operation disposition is chosen deliberately.
 fn ensure_existing_row_confirms_create(
     active_node_id: Option<NodeId>,
     lifecycle: SandboxLifecycle,
@@ -758,13 +860,12 @@ fn ensure_existing_row_confirms_create(
         SandboxLifecycle::Creating if active_node_id.is_none() => Err(
             CreateSandboxExecutionError::ExistingRowNotCreateSuccess(lifecycle),
         ),
-        SandboxLifecycle::Deleting | SandboxLifecycle::Quarantined | SandboxLifecycle::Failed => {
-            Err(CreateSandboxExecutionError::ExistingRowNotCreateSuccess(
-                lifecycle,
-            ))
-        }
+        SandboxLifecycle::Creating => Err(CreateSandboxExecutionError::ExistingRowStillCreating),
+        SandboxLifecycle::Failed => Err(CreateSandboxExecutionError::ExistingRowFailed),
+        SandboxLifecycle::Deleting | SandboxLifecycle::Quarantined => Err(
+            CreateSandboxExecutionError::ExistingRowNotCreateSuccess(lifecycle),
+        ),
         SandboxLifecycle::Created
-        | SandboxLifecycle::Creating
         | SandboxLifecycle::Starting
         | SandboxLifecycle::Started
         | SandboxLifecycle::Restoring
@@ -1001,6 +1102,14 @@ enum CreateSandboxExecutionError {
         "sandbox create's existing row in lifecycle '{0}' does not confirm create success; retrying"
     )]
     ExistingRowNotCreateSuccess(SandboxLifecycle),
+    #[error("waiting for the sandbox create to finish")]
+    ExistingRowStillCreating,
+    #[error("the sandbox failed before its create finished")]
+    ExistingRowFailed,
+    #[error("the sandbox this create made no longer exists")]
+    SandboxRowGone,
+    #[error("could not record the create's sandbox row: {0}")]
+    RecordObservedRow(String),
     #[error("unknown sandbox lifecycle: {0}")]
     UnknownLifecycle(#[from] SandboxLifecycleParseError),
     #[error("database error: {0}")]
@@ -1010,8 +1119,51 @@ enum CreateSandboxExecutionError {
 }
 
 impl CreateSandboxExecutionError {
-    fn into_result(self, operation: &ClaimedPublicOperation) -> PublicOperationExecutionResult {
+    /// `native_deadline`: whether the recording driver applies the native
+    /// operation deadline (see [`CreateSandboxOperationExecutor::native_deadline`]).
+    fn into_result(
+        self,
+        operation: &ClaimedPublicOperation,
+        native_deadline: bool,
+    ) -> PublicOperationExecutionResult {
         match self {
+            // Progress doesn't spend the retry budget, so it's only safe
+            // where the driver's deadline ends the wait. Without one (an
+            // admin create, or the deadline switched off), a row the sweep
+            // never resolves would requeue forever; the budget-bounded retry
+            // fails it instead.
+            Self::ExistingRowStillCreating
+                if native_deadline
+                    && crate::public_operation_driver::is_native_m1_terminalized_kind(
+                        operation.api_product,
+                        operation.kind,
+                    ) =>
+            {
+                PublicOperationExecutionResult::workflow_progress(
+                    Self::ExistingRowStillCreating.to_string(),
+                    CREATE_RETRY_AFTER,
+                )
+            }
+            Self::ExistingRowStillCreating => PublicOperationExecutionResult::retry(
+                Self::ExistingRowStillCreating.to_string(),
+                CREATE_RETRY_AFTER,
+            ),
+            Self::ExistingRowFailed | Self::SandboxRowGone => {
+                PublicOperationExecutionResult::failed(
+                    "sandbox create did not finish",
+                    PublicErrorCode::OperationFailed,
+                    terminal_error_json(operation, self.to_string()),
+                )
+            }
+            Self::RecordObservedRow(_) => {
+                tracing::warn!(
+                    operation_id = %operation.id,
+                    sandbox_id = operation_sandbox_id(operation),
+                    error = %self,
+                    "retrying create_sandbox operation after failing to record its sandbox row"
+                );
+                PublicOperationExecutionResult::retry(self.to_string(), CREATE_RETRY_AFTER)
+            }
             Self::InvalidPayload(_)
             | Self::InvalidFederatedContext(_)
             | Self::MissingTargetId

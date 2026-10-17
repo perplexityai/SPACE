@@ -40,13 +40,13 @@ pub(crate) type InlineExecution = Pin<Box<dyn Future<Output = OperationExecution
 /// Runs one claimed create. Production runs the dispatcher's create
 /// executor; tests substitute the execution.
 pub(crate) trait InlineCreateExecutor: Send + Sync + 'static {
-    fn execute(&self, operation: ClaimedPublicOperation) -> InlineExecution;
+    fn execute(&self, claim_token: String, operation: ClaimedPublicOperation) -> InlineExecution;
 }
 
 impl InlineCreateExecutor for CreateSandboxOperationExecutor {
-    fn execute(&self, operation: ClaimedPublicOperation) -> InlineExecution {
+    fn execute(&self, claim_token: String, operation: ClaimedPublicOperation) -> InlineExecution {
         let executor = self.clone();
-        Box::pin(async move { executor.execute(&operation).await.into() })
+        Box::pin(async move { executor.execute(&claim_token, &operation).await.into() })
     }
 }
 
@@ -111,7 +111,9 @@ impl InlineCreate {
     ) -> tokio::task::JoinHandle<()> {
         let operation_id = operation.id;
         let span = execution_span(&operation);
-        let execution = self.executor.execute(operation.clone());
+        let execution = self
+            .executor
+            .execute(claim_token.clone(), operation.clone());
         tokio::spawn(
             async move {
                 match drive_claimed_operation(

@@ -15,6 +15,10 @@ use super::*;
 
 use pplx_space_test_env::TestResult;
 
+/// A claim token these tests don't hold in the store. An attempt's payload
+/// write under it matches nothing, which the executor treats as a lost claim.
+const UNHELD_CLAIM: &str = "unheld-test-claim";
+
 fn claimed_create_operation() -> ClaimedPublicOperation {
     ClaimedPublicOperation {
         id: OperationId::new(),
@@ -51,6 +55,7 @@ fn claimed_create_operation_for(
             node_pool: None,
             federated_create: None,
             pool_claim: None,
+            sandbox_row_observed: false,
         }
         .into_json(),
         attempts: 1,
@@ -194,6 +199,7 @@ async fn native_create_executor_preserves_operator_policy_across_replacements() 
                 node_pool: None,
                 federated_create: federated.then_some(context),
                 pool_claim: None,
+                sandbox_row_observed: false,
             }
             .into_json();
 
@@ -205,12 +211,12 @@ async fn native_create_executor_preserves_operator_policy_across_replacements() 
                         .clone()
                         .with_egress_profiles(Default::default()),
                 );
-                let result = Box::pin(unconfigured.execute(&operation)).await;
+                let result = Box::pin(unconfigured.execute(UNHELD_CLAIM, &operation)).await;
                 assert_eq!(result.state, OperationState::Queued, "{result:?}");
                 assert_eq!(result.retry_after, Some(CREATE_RETRY_AFTER));
                 assert!(fetch_sandbox(&db.pool, sandbox_id).await?.is_none());
             }
-            let result = Box::pin(executor.execute(&operation)).await;
+            let result = Box::pin(executor.execute(UNHELD_CLAIM, &operation)).await;
             assert_eq!(result.state, OperationState::Succeeded, "{result:?}");
             assert_eq!(
                 crate::egress_profiles::load(&db.pool, sandbox_id)
@@ -411,7 +417,7 @@ async fn unconfirmed_creating_row_retries_through_executor() -> TestResult {
     let executor =
         CreateSandboxOperationExecutor::new(db.pool.clone(), direct_sandbox_controller(&db.pool));
     let operation = claimed_create_operation_for(sandbox_id, org_id, user_id);
-    let result = executor.execute(&operation).await;
+    let result = executor.execute(UNHELD_CLAIM, &operation).await;
 
     assert_eq!(result.state, OperationState::Queued);
     assert_eq!(result.retry_after, Some(CREATE_RETRY_AFTER));
@@ -484,11 +490,12 @@ async fn existing_row_create_persists_the_renewed_grant() -> TestResult {
                 crate::fork_operations::ForkFederatedCreateContext::from_request(&owner, &renewed),
             ),
             pool_claim: None,
+            sandbox_row_observed: false,
         }
         .into_json();
 
         let result = CreateSandboxOperationExecutor::new(db.pool.clone(), controller.clone())
-            .execute(&operation)
+            .execute(UNHELD_CLAIM, &operation)
             .await;
 
         // Both outcomes of the existing-row branch — success, and the retry of
@@ -534,7 +541,7 @@ async fn deleting_row_retries_through_executor() -> TestResult {
     let executor =
         CreateSandboxOperationExecutor::new(db.pool.clone(), direct_sandbox_controller(&db.pool));
     let operation = claimed_create_operation_for(sandbox_id, org_id, user_id);
-    let result = executor.execute(&operation).await;
+    let result = executor.execute(UNHELD_CLAIM, &operation).await;
 
     assert_eq!(result.state, OperationState::Queued);
     assert_eq!(result.retry_after, Some(CREATE_RETRY_AFTER));
@@ -542,103 +549,104 @@ async fn deleting_row_retries_through_executor() -> TestResult {
     Ok(())
 }
 
+/// How a re-driven create answers for an existing row, per lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingRowAnswer {
+    /// The create is reported done.
+    Succeeded,
+    /// Requeued against the transient-error budget.
+    Retried,
+    /// Requeued as progress, outside the budget: the create is still running.
+    Waiting,
+    /// The create is reported failed.
+    Failed,
+}
+
+impl ExistingRowAnswer {
+    fn of(result: &PublicOperationExecutionResult) -> Option<Self> {
+        match (&result.state, result.requeue_reason) {
+            (OperationState::Succeeded, _) => Some(Self::Succeeded),
+            (OperationState::Failed, _) => Some(Self::Failed),
+            (OperationState::Queued, PublicOperationRequeueReason::TransientFailure) => {
+                Some(Self::Retried)
+            }
+            (OperationState::Queued, PublicOperationRequeueReason::WorkflowProgress) => {
+                Some(Self::Waiting)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Every lifecycle an existing row can hold gets a deliberate answer: a
+/// re-driven create reports success only for a sandbox that finished
+/// creating, waits on one whose create is still running on a node, and fails
+/// one that failed.
 #[tokio::test]
 async fn existing_rows_are_classified_exhaustively_through_executor() -> TestResult {
+    use ExistingRowAnswer::{Failed, Retried, Succeeded, Waiting};
+
     let db = pg_test_db().await?;
     let org_id = seed_org(&db.pool).await?;
     let user_id = seed_user(&db.pool, org_id).await?;
     let executor =
         CreateSandboxOperationExecutor::new(db.pool.clone(), direct_sandbox_controller(&db.pool));
+    let on_node = || SeedSandboxPlacement::OnNode(NodeId::new());
 
     let cases = [
         (
             SandboxLifecycle::Created,
             SeedSandboxPlacement::Unplaced,
-            OperationState::Succeeded,
+            Succeeded,
         ),
         (
             SandboxLifecycle::Creating,
             SeedSandboxPlacement::Unplaced,
-            OperationState::Queued,
+            Retried,
         ),
-        (
-            SandboxLifecycle::Creating,
-            SeedSandboxPlacement::OnNode(NodeId::new()),
-            OperationState::Succeeded,
-        ),
-        (
-            SandboxLifecycle::Starting,
-            SeedSandboxPlacement::OnNode(NodeId::new()),
-            OperationState::Succeeded,
-        ),
-        (
-            SandboxLifecycle::Started,
-            SeedSandboxPlacement::OnNode(NodeId::new()),
-            OperationState::Succeeded,
-        ),
-        (
-            SandboxLifecycle::Restoring,
-            SeedSandboxPlacement::OnNode(NodeId::new()),
-            OperationState::Succeeded,
-        ),
-        (
-            SandboxLifecycle::Pausing,
-            SeedSandboxPlacement::OnNode(NodeId::new()),
-            OperationState::Succeeded,
-        ),
-        (
-            SandboxLifecycle::Paused,
-            SeedSandboxPlacement::OnNode(NodeId::new()),
-            OperationState::Succeeded,
-        ),
-        (
-            SandboxLifecycle::Resuming,
-            SeedSandboxPlacement::OnNode(NodeId::new()),
-            OperationState::Succeeded,
-        ),
-        (
-            SandboxLifecycle::Suspending,
-            SeedSandboxPlacement::OnNode(NodeId::new()),
-            OperationState::Succeeded,
-        ),
+        (SandboxLifecycle::Creating, on_node(), Waiting),
+        (SandboxLifecycle::Starting, on_node(), Succeeded),
+        (SandboxLifecycle::Started, on_node(), Succeeded),
+        (SandboxLifecycle::Restoring, on_node(), Succeeded),
+        (SandboxLifecycle::Pausing, on_node(), Succeeded),
+        (SandboxLifecycle::Paused, on_node(), Succeeded),
+        (SandboxLifecycle::Resuming, on_node(), Succeeded),
+        (SandboxLifecycle::Suspending, on_node(), Succeeded),
         (
             SandboxLifecycle::Suspended,
             SeedSandboxPlacement::Unplaced,
-            OperationState::Succeeded,
+            Succeeded,
         ),
-        (
-            SandboxLifecycle::Stopping,
-            SeedSandboxPlacement::OnNode(NodeId::new()),
-            OperationState::Succeeded,
-        ),
+        (SandboxLifecycle::Stopping, on_node(), Succeeded),
         (
             SandboxLifecycle::Stopped,
             SeedSandboxPlacement::Unplaced,
-            OperationState::Succeeded,
+            Succeeded,
         ),
-        (
-            SandboxLifecycle::Deleting,
-            SeedSandboxPlacement::OnNode(NodeId::new()),
-            OperationState::Queued,
-        ),
-        (
-            SandboxLifecycle::Checkpointing,
-            SeedSandboxPlacement::OnNode(NodeId::new()),
-            OperationState::Succeeded,
-        ),
+        (SandboxLifecycle::Deleting, on_node(), Retried),
+        (SandboxLifecycle::Checkpointing, on_node(), Succeeded),
         (
             SandboxLifecycle::Quarantined,
             SeedSandboxPlacement::Unplaced,
-            OperationState::Queued,
+            Retried,
         ),
         (
             SandboxLifecycle::Failed,
             SeedSandboxPlacement::Unplaced,
-            OperationState::Queued,
+            Failed,
         ),
     ];
+    assert_eq!(
+        cases
+            .iter()
+            .map(|(lifecycle, _, _)| *lifecycle)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        SandboxLifecycle::all().len(),
+        "every lifecycle has a case"
+    );
 
-    for (lifecycle, placement, expected_state) in cases {
+    for (lifecycle, placement, expected) in cases {
         let sandbox_id = seed_sandbox(
             &db.pool,
             SandboxSeed {
@@ -650,20 +658,20 @@ async fn existing_rows_are_classified_exhaustively_through_executor() -> TestRes
         )
         .await?;
         let result = executor
-            .execute(&claimed_create_operation_for(sandbox_id, org_id, user_id))
+            .execute(
+                UNHELD_CLAIM,
+                &claimed_create_operation_for(sandbox_id, org_id, user_id),
+            )
             .await;
 
         assert_eq!(
-            result.state, expected_state,
-            "unexpected create-operation disposition for {lifecycle} with placement {placement:?}"
+            ExistingRowAnswer::of(&result),
+            Some(expected),
+            "unexpected create-operation disposition for {lifecycle} with placement {placement:?}: \
+             {result:?}"
         );
-        if expected_state == OperationState::Queued {
+        if matches!(expected, Retried | Waiting) {
             assert_eq!(result.retry_after, Some(CREATE_RETRY_AFTER));
-            assert_eq!(
-                result.requeue_reason,
-                PublicOperationRequeueReason::TransientFailure,
-                "the retry for {lifecycle} must count toward the budget"
-            );
         }
     }
 
@@ -755,6 +763,7 @@ async fn create_executor_retries_unpinned_transient_substrate_failure() {
             node_pool: None,
             federated_create: None,
             pool_claim: None,
+            sandbox_row_observed: false,
         }
         .into_json(),
         attempts: 1,
@@ -767,7 +776,7 @@ async fn create_executor_retries_unpinned_transient_substrate_failure() {
         )));
     let executor = CreateSandboxOperationExecutor::new(db.pool.clone(), controller);
 
-    let result = executor.execute(&operation).await;
+    let result = executor.execute(UNHELD_CLAIM, &operation).await;
 
     assert_eq!(result.state, OperationState::Queued);
     assert_eq!(result.terminal_error_code, None);
@@ -842,6 +851,7 @@ fn create_operation_payload_is_wire_compatible_with_old_shape() {
         node_pool: None,
         federated_create: None,
         pool_claim: None,
+        sandbox_row_observed: false,
     };
     let value = serde_json::to_value(&unpinned).unwrap();
     assert!(
@@ -861,6 +871,7 @@ fn create_operation_payload_is_wire_compatible_with_old_shape() {
         node_pool: Some(NodePoolName::parse("isolated-test-pool").unwrap()),
         federated_create: None,
         pool_claim: None,
+        sandbox_row_observed: false,
     };
     let pinned_value = serde_json::to_value(&pinned).unwrap();
     assert_eq!(
@@ -1117,6 +1128,7 @@ fn create_operation_payload_pool_claim_is_optional_on_the_wire() {
         node_pool: None,
         federated_create: None,
         pool_claim: None,
+        sandbox_row_observed: false,
     };
     let value = serde_json::to_value(&cold).unwrap();
     assert!(
@@ -1134,6 +1146,7 @@ fn create_operation_payload_pool_claim_is_optional_on_the_wire() {
     let claim = admitted_pool_claim();
     let admitted = CreateSandboxOperationPayload {
         pool_claim: Some(claim),
+        sandbox_row_observed: false,
         ..cold
     };
     let admitted_value = serde_json::to_value(&admitted).unwrap();
@@ -1193,7 +1206,7 @@ async fn admitted_create_re_execution_after_success_does_not_create_again() -> T
     operation.payload = payload.into_json();
 
     for _ in 0..2 {
-        let result = executor.execute(&operation).await;
+        let result = executor.execute(UNHELD_CLAIM, &operation).await;
         assert_eq!(result.state, OperationState::Succeeded);
     }
 
@@ -1212,5 +1225,334 @@ async fn admitted_create_re_execution_after_success_does_not_create_again() -> T
         executions, 0,
         "re-execution must not start another execution"
     );
+    Ok(())
+}
+
+/// Create and claim a native create operation for `sandbox_id`, as admission
+/// does, so the executor's payload writes land on a claim it really holds.
+async fn claim_create_operation(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+    org_id: OrgId,
+    user_id: UserId,
+) -> TestResult<(String, ClaimedPublicOperation)> {
+    let target_id = PublicSandboxId::from(sandbox_id).to_string();
+    let payload = claimed_create_operation_for(sandbox_id, org_id, user_id).payload;
+    let created = crate::public_operations::PublicOperationStore::new(pool.clone())
+        .create_claimed_operation(crate::public_operations::CreatePublicOperation {
+            org_id,
+            actor_user_id: Some(user_id),
+            api_product: ApiProduct::Native,
+            kind: OperationKind::CreateSandbox,
+            target_type: Some(OperationTargetType::Sandbox),
+            target_id: Some(&target_id),
+            payload_json: payload,
+            idempotency: None,
+            traceparent: None,
+        })
+        .await?;
+    match created {
+        crate::public_operations::CreateClaimedPublicOperationResult::Claimed {
+            claim_token,
+            operation,
+        } => Ok((claim_token, operation)),
+        other => Err(format!("create operation was not claimed: {other:?}").into()),
+    }
+}
+
+/// The operation as the next attempt sees it: its payload re-read from the
+/// store, where an earlier attempt may have recorded progress.
+async fn redriven(
+    pool: &PgPool,
+    operation: &ClaimedPublicOperation,
+) -> TestResult<ClaimedPublicOperation> {
+    let payload: serde_json::Value = sqlx::query_scalar(sql!(
+        "SELECT payload_json FROM public_operations WHERE operation_id = $1"
+    ))
+    .bind(operation.id.as_uuid())
+    .fetch_one(pool)
+    .await?;
+    Ok(ClaimedPublicOperation {
+        payload,
+        ..operation.clone()
+    })
+}
+
+async fn set_lifecycle(pool: &PgPool, sandbox_id: SandboxId, lifecycle: &str) -> TestResult {
+    sqlx::query(sql!("UPDATE sandboxes SET lifecycle = $2 WHERE id = $1"))
+        .bind(sandbox_id)
+        .bind(lifecycle)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// A create whose request died after its pod was placed leaves the row
+/// `creating` with a node. Re-driving it must not tell the client the
+/// sandbox exists: the operation keeps waiting, as progress that doesn't
+/// spend its retry budget, until the row settles.
+#[tokio::test]
+async fn a_redriven_create_on_a_placed_creating_row_does_not_report_success() -> TestResult {
+    let db = pg_test_db().await?;
+    let org_id = seed_org(&db.pool).await?;
+    let user_id = seed_user(&db.pool, org_id).await?;
+    let sandbox_id = seed_sandbox(
+        &db.pool,
+        SandboxSeed {
+            org_id,
+            user_id,
+            lifecycle: SandboxLifecycle::Creating,
+            placement: SeedSandboxPlacement::OnNode(NodeId::new()),
+        },
+    )
+    .await?;
+    let (claim_token, operation) =
+        claim_create_operation(&db.pool, sandbox_id, org_id, user_id).await?;
+    let executor =
+        CreateSandboxOperationExecutor::new(db.pool.clone(), direct_sandbox_controller(&db.pool));
+
+    let result = executor.execute(&claim_token, &operation).await;
+
+    assert_eq!(result.state, OperationState::Queued, "{result:?}");
+    assert_eq!(
+        result.requeue_reason,
+        PublicOperationRequeueReason::WorkflowProgress
+    );
+    assert!(result.result_json.is_none());
+    Ok(())
+}
+
+/// A create with no operation deadline (an admin create, or a native one
+/// under a driver whose deadline is switched off) would wait forever on a row
+/// the sweep never resolves. It's retried against the budget instead, which
+/// ends it; only a native create under a deadline waits as progress.
+#[tokio::test]
+async fn a_redriven_create_without_a_deadline_retries_against_the_budget() -> TestResult {
+    let db = pg_test_db().await?;
+    let org_id = seed_org(&db.pool).await?;
+    let user_id = seed_user(&db.pool, org_id).await?;
+    let sandbox_id = seed_sandbox(
+        &db.pool,
+        SandboxSeed {
+            org_id,
+            user_id,
+            lifecycle: SandboxLifecycle::Creating,
+            placement: SeedSandboxPlacement::OnNode(NodeId::new()),
+        },
+    )
+    .await?;
+    let with_deadline =
+        CreateSandboxOperationExecutor::new(db.pool.clone(), direct_sandbox_controller(&db.pool));
+    let without_deadline = with_deadline.clone().with_native_deadline(None);
+    for (case, executor, api_product, expected) in [
+        (
+            "admin",
+            &with_deadline,
+            ApiProduct::Admin,
+            PublicOperationRequeueReason::TransientFailure,
+        ),
+        (
+            "native, deadline off",
+            &without_deadline,
+            ApiProduct::Native,
+            PublicOperationRequeueReason::TransientFailure,
+        ),
+        (
+            "native, deadline on",
+            &with_deadline,
+            ApiProduct::Native,
+            PublicOperationRequeueReason::WorkflowProgress,
+        ),
+    ] {
+        let operation = ClaimedPublicOperation {
+            api_product,
+            ..claimed_create_operation_for(sandbox_id, org_id, user_id)
+        };
+
+        let result = executor.execute(UNHELD_CLAIM, &operation).await;
+
+        assert_eq!(result.state, OperationState::Queued, "{case}: {result:?}");
+        assert_eq!(result.requeue_reason, expected, "{case}");
+    }
+    Ok(())
+}
+
+/// The same re-driven create reports failure once the transient-lifecycle
+/// sweep has failed and retired its row: the create can no longer finish.
+#[tokio::test]
+async fn a_redriven_create_fails_once_the_sweep_fails_its_row() -> TestResult {
+    let db = pg_test_db().await?;
+    let org_id = seed_org(&db.pool).await?;
+    let user_id = seed_user(&db.pool, org_id).await?;
+    let sandbox_id = seed_sandbox(
+        &db.pool,
+        SandboxSeed {
+            org_id,
+            user_id,
+            lifecycle: SandboxLifecycle::Creating,
+            placement: SeedSandboxPlacement::OnNode(NodeId::new()),
+        },
+    )
+    .await?;
+    let (claim_token, operation) =
+        claim_create_operation(&db.pool, sandbox_id, org_id, user_id).await?;
+    let executor =
+        CreateSandboxOperationExecutor::new(db.pool.clone(), direct_sandbox_controller(&db.pool));
+    let waiting = executor.execute(&claim_token, &operation).await;
+    assert_eq!(waiting.state, OperationState::Queued, "{waiting:?}");
+
+    set_lifecycle(&db.pool, sandbox_id, "failed").await?;
+    let result = executor
+        .execute(&claim_token, &redriven(&db.pool, &operation).await?)
+        .await;
+
+    assert_eq!(result.state, OperationState::Failed, "{result:?}");
+    assert_eq!(
+        result.terminal_error_code,
+        Some(PublicErrorCode::OperationFailed)
+    );
+    Ok(())
+}
+
+/// A re-driven create whose sandbox finished starting still reports success,
+/// so a client whose create request was lost after it finished gets its
+/// sandbox.
+#[tokio::test]
+async fn a_redriven_create_on_a_started_row_still_reports_success() -> TestResult {
+    let db = pg_test_db().await?;
+    let org_id = seed_org(&db.pool).await?;
+    let user_id = seed_user(&db.pool, org_id).await?;
+    let sandbox_id = seed_sandbox(
+        &db.pool,
+        SandboxSeed {
+            org_id,
+            user_id,
+            lifecycle: SandboxLifecycle::Started,
+            placement: SeedSandboxPlacement::OnNode(NodeId::new()),
+        },
+    )
+    .await?;
+    let (claim_token, operation) =
+        claim_create_operation(&db.pool, sandbox_id, org_id, user_id).await?;
+    let executor =
+        CreateSandboxOperationExecutor::new(db.pool.clone(), direct_sandbox_controller(&db.pool));
+
+    let result = executor.execute(&claim_token, &operation).await;
+
+    assert_eq!(result.state, OperationState::Succeeded, "{result:?}");
+    Ok(())
+}
+
+/// A create waiting on its row fails if the row then disappears (deleted
+/// while it waited), rather than building the sandbox again under the same
+/// id. It's the attempt that saw the row that makes this possible: it
+/// records the sighting in the operation's payload.
+#[tokio::test]
+async fn a_redriven_create_whose_row_was_deleted_fails_instead_of_recreating() -> TestResult {
+    let db = pg_test_db().await?;
+    let org_id = seed_org(&db.pool).await?;
+    let user_id = seed_user(&db.pool, org_id).await?;
+    let sandbox_id = seed_sandbox(
+        &db.pool,
+        SandboxSeed {
+            org_id,
+            user_id,
+            lifecycle: SandboxLifecycle::Creating,
+            placement: SeedSandboxPlacement::OnNode(NodeId::new()),
+        },
+    )
+    .await?;
+    let (claim_token, operation) =
+        claim_create_operation(&db.pool, sandbox_id, org_id, user_id).await?;
+    let executor =
+        CreateSandboxOperationExecutor::new(db.pool.clone(), direct_sandbox_controller(&db.pool));
+    let waiting = executor.execute(&claim_token, &operation).await;
+    assert_eq!(waiting.state, OperationState::Queued, "{waiting:?}");
+    let recorded: CreateSandboxOperationPayload =
+        serde_json::from_value(redriven(&db.pool, &operation).await?.payload)?;
+    assert!(recorded.sandbox_row_observed, "the sighting is recorded");
+
+    sqlx::query(sql!("DELETE FROM sandboxes WHERE id = $1"))
+        .bind(sandbox_id)
+        .execute(&db.pool)
+        .await?;
+    let result = executor
+        .execute(&claim_token, &redriven(&db.pool, &operation).await?)
+        .await;
+
+    assert_eq!(result.state, OperationState::Failed, "{result:?}");
+    assert_eq!(
+        result
+            .terminal_error_json
+            .as_ref()
+            .and_then(|error| error.get("message"))
+            .and_then(serde_json::Value::as_str),
+        Some("the sandbox this create made no longer exists"),
+        "the operation fails because the row is gone, not because a new create failed"
+    );
+    let rows: i64 = sqlx::query_scalar(sql!("SELECT COUNT(*) FROM sandboxes WHERE id = $1"))
+        .bind(sandbox_id)
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(rows, 0, "the create didn't build the sandbox again");
+    Ok(())
+}
+
+/// Only a create waiting on its placed `creating` row records that it saw
+/// the row. A row it merely retries (unplaced `creating`, `deleting`) can be
+/// removed by a create rollback, after which the create should be retried,
+/// not failed as gone.
+#[tokio::test]
+async fn only_a_waiting_create_records_its_sandbox_row() -> TestResult {
+    let db = pg_test_db().await?;
+    let org_id = seed_org(&db.pool).await?;
+    let user_id = seed_user(&db.pool, org_id).await?;
+    let executor =
+        CreateSandboxOperationExecutor::new(db.pool.clone(), direct_sandbox_controller(&db.pool));
+
+    for (lifecycle, placement, recorded) in [
+        (
+            SandboxLifecycle::Creating,
+            SeedSandboxPlacement::OnNode(NodeId::new()),
+            true,
+        ),
+        (
+            SandboxLifecycle::Creating,
+            SeedSandboxPlacement::Unplaced,
+            false,
+        ),
+        (
+            SandboxLifecycle::Deleting,
+            SeedSandboxPlacement::OnNode(NodeId::new()),
+            false,
+        ),
+    ] {
+        let sandbox_id = seed_sandbox(
+            &db.pool,
+            SandboxSeed {
+                org_id,
+                user_id,
+                lifecycle,
+                placement,
+            },
+        )
+        .await?;
+        let (claim_token, operation) =
+            claim_create_operation(&db.pool, sandbox_id, org_id, user_id).await?;
+
+        let result = executor.execute(&claim_token, &operation).await;
+
+        assert_eq!(
+            result.state,
+            OperationState::Queued,
+            "{lifecycle} {placement}"
+        );
+        let payload: CreateSandboxOperationPayload =
+            serde_json::from_value(redriven(&db.pool, &operation).await?.payload)?;
+        assert_eq!(
+            payload.sandbox_row_observed, recorded,
+            "{lifecycle} {placement}"
+        );
+    }
     Ok(())
 }

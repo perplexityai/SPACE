@@ -82,7 +82,11 @@ mod postgres {
     }
 
     impl InlineCreateExecutor for ScriptedCreate {
-        fn execute(&self, operation: ClaimedPublicOperation) -> InlineExecution {
+        fn execute(
+            &self,
+            _claim_token: String,
+            operation: ClaimedPublicOperation,
+        ) -> InlineExecution {
             let state = Arc::clone(&self.0);
             Box::pin(async move {
                 state.calls.fetch_add(1, Ordering::SeqCst);
@@ -397,7 +401,10 @@ mod postgres {
         assert_eq!(operation.id, operation_id);
         let executor =
             CreateSandboxOperationExecutor::new(fixture.db.pool.clone(), controller.clone());
-        let result: OperationExecutionResult = executor.execute(&operation).await.into();
+        let result: OperationExecutionResult = executor
+            .execute(&claim.claim_token, &operation)
+            .await
+            .into();
         drive_claimed_operation(
             PublicOperationStore::new(fixture.db.pool.clone()),
             claim.claim_token,

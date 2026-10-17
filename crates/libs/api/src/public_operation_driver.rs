@@ -436,7 +436,9 @@ fn retry_budget_exhausted(attempts: i32, max_retry_attempts: i32) -> bool {
     attempts >= max_retry_attempts.max(1)
 }
 
-fn is_native_m1_terminalized_kind(api_product: ApiProduct, kind: OperationKind) -> bool {
+/// Whether the driver fails an operation of this product and kind once it
+/// outlives its deadline (`OperationExecutionConfig::m1_max_age`).
+pub(crate) fn is_native_m1_terminalized_kind(api_product: ApiProduct, kind: OperationKind) -> bool {
     api_product == ApiProduct::Native
         && matches!(
             kind,

@@ -46,6 +46,11 @@
 //! - V24 `v24_alive_routable_restoring_skips_routability_consult`
 //! - V25 `v25_routability_check_error_defers_without_converge`
 //!
+//! ## Crashed create — see `tests/crashed_create.rs`
+//! An alive `creating` row whose owner's activation lease expired a full age
+//! window ago fails and retires; one whose lease is live, or expired more
+//! recently, is never listed or failed.
+//!
 //! ## CRP — command-ready-pending reaper (heal vs reap)
 //! - CRP1 `crp1_ready_probe_heals_marker_without_reaping`
 //! - CRP2 `crp2_wedged_probe_reaps_and_cleans_up`
@@ -756,6 +761,7 @@ fn candidate(lifecycle: SandboxLifecycle) -> SweepCandidate {
         fork_restore: false,
         node_name: Some("node-a".to_string()),
         routable_execution: true,
+        activation_abandoned: false,
         pod_fence: pod_fence(),
     }
 }
@@ -775,6 +781,7 @@ fn failed_candidate(sandbox_id: SandboxId) -> FailedCleanupCandidate {
     FailedCleanupCandidate {
         sandbox_id,
         node_name: Some("node-a".to_string()),
+        first_activation_abandoned: false,
         pod_fence: pod_fence(),
     }
 }
@@ -2527,6 +2534,8 @@ fn f5_only_an_observed_pod_yields_a_verifiable_fence() {
 // -----------------------------------------------------------------
 // R — Postgres-backed sink (drift safety + trigger semantics)
 // -----------------------------------------------------------------
+
+mod crashed_create;
 
 mod postgres_backed {
 

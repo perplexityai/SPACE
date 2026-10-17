@@ -156,6 +156,14 @@ pub struct NativePublicOperationExecutor {
 }
 
 impl NativePublicOperationExecutor {
+    /// Match the native deadline the dispatcher's driver applies (its
+    /// `m1_max_age`), so a create waiting on its row knows whether that
+    /// deadline will end the wait.
+    pub fn with_native_deadline(mut self, m1_max_age: Option<Duration>) -> Self {
+        self.create_sandbox = self.create_sandbox.with_native_deadline(m1_max_age);
+        self
+    }
+
     pub fn new(
         pool: PgPool,
         substrate: Substrate,
@@ -254,7 +262,11 @@ impl PublicOperationExecutor for NativePublicOperationExecutor {
         operation: ClaimedPublicOperation,
     ) -> OperationExecutionResult {
         match operation.kind {
-            OperationKind::CreateSandbox => self.create_sandbox.execute(&operation).await.into(),
+            OperationKind::CreateSandbox => self
+                .create_sandbox
+                .execute(claim_token, &operation)
+                .await
+                .into(),
             OperationKind::UpdateSandbox => self.update_sandbox.execute(&operation).await.into(),
             OperationKind::DeleteTemplate => self.delete_template.execute(&operation).await.into(),
             OperationKind::ForkSandbox => self

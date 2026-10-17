@@ -27,6 +27,7 @@ fn candidate(
         fork_restore: false,
         node_name: Some("node-a".to_string()),
         routable_execution: true,
+        activation_abandoned: false,
         pod_fence: RetireFence::NoExecution,
     }
 }
@@ -39,6 +40,64 @@ fn unroutable_candidate(
     SweepCandidate {
         routable_execution: false,
         ..candidate(lifecycle, ready_snapshot, evacuation_restore_target)
+    }
+}
+
+/// A crashed create whose VM came up is failed and retired once its
+/// activation is abandoned, whatever its execution's routability: the sweep
+/// never converges it, and never hydrates it on the way. Without an abandoned
+/// activation the alive create defers.
+#[test]
+fn an_alive_abandoned_create_fails_and_retires() {
+    for routable_execution in [true, false] {
+        let abandoned = SweepCandidate {
+            activation_abandoned: true,
+            routable_execution,
+            ..candidate(SandboxLifecycle::Creating, false, None)
+        };
+        assert_eq!(
+            decide(&abandoned, ProbeVerdict::AliveOnNode),
+            SweepAction::FailAndRetire,
+            "routable {routable_execution}"
+        );
+        let unproven = SweepCandidate {
+            activation_abandoned: false,
+            ..abandoned
+        };
+        assert_eq!(
+            decide(&unproven, ProbeVerdict::AliveOnNode),
+            SweepAction::Defer {
+                reason: DeferReason::AliveNotConvergeable,
+            },
+            "routable {routable_execution}"
+        );
+    }
+}
+
+/// An abandoned activation fails an alive row only when it's `creating`.
+/// Every other lifecycle keeps its own alive-row decision: `restoring`
+/// converges to its wake target and the rest defer.
+#[test]
+fn an_abandoned_activation_fails_only_an_alive_create() {
+    for lifecycle in super::super::SWEEPABLE_LIFECYCLES.iter().copied() {
+        let candidate = SweepCandidate {
+            activation_abandoned: true,
+            ..candidate(lifecycle, false, None)
+        };
+        let expected = match lifecycle {
+            SandboxLifecycle::Creating => SweepAction::FailAndRetire,
+            SandboxLifecycle::Restoring => SweepAction::Converge {
+                target: SandboxLifecycle::Started,
+            },
+            _ => SweepAction::Defer {
+                reason: DeferReason::AliveNotConvergeable,
+            },
+        };
+        assert_eq!(
+            decide(&candidate, ProbeVerdict::AliveOnNode),
+            expected,
+            "lifecycle {lifecycle}"
+        );
     }
 }
 

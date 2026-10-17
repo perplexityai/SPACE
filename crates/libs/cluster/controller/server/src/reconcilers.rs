@@ -219,6 +219,9 @@ pub async fn run_reconcilers(
                 tls_interception_exemptions,
                 egress_profiles,
             )
+            .map(|executor| {
+                executor.with_native_deadline(public_operation_dispatcher_config.m1_max_age)
+            })
             .map_err(ReconcilerRuntimeError::from)
         })?;
     let mut handles = vec![
