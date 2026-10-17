@@ -1533,6 +1533,86 @@ mod postgres {
         Ok(())
     }
 
+    /// Claimed recovery must not scale with the snapshot table. Statistics
+    /// sampled while a tick holds many claims, followed by those claims
+    /// finishing forward, leave a few old (low UUIDv7) claims under a large
+    /// `deleting` estimate. Unfenced, `ORDER BY id DESC LIMIT 1` then walks the
+    /// primary key backward and filters every unclaimed row before it reaches
+    /// one, which is how the epoch query exceeds the statement timeout.
+    #[tokio::test(flavor = "current_thread")]
+    async fn claimed_recovery_reads_claims_not_the_table_under_stale_statistics() -> TestResult {
+        use super::super::store::{CLAIMED_SCAN_EPOCH_SQL, LIST_CLAIMED_SQL};
+        const ROWS: i64 = 50_000;
+        const SAMPLED_CLAIMS: i64 = 1_000;
+        const LIVE_CLAIMS: usize = 10;
+        let Some(db) = try_pg_test_db().await? else {
+            return Ok(());
+        };
+        let pool = &db.pool;
+        let sandbox = insert_sandbox(pool).await?;
+        sqlx::query(sql!(
+            "INSERT INTO snapshots (id, sandbox_id, type, state, timestamp)
+             SELECT ('20000000-0000-7000-8000-' || lpad(to_hex(g), 12, '0'))::uuid,
+                    $1, 'full',
+                    CASE WHEN g <= $3 THEN 'deleting' ELSE 'ready' END,
+                    NOW() - make_interval(secs => ($2 - g + 1)::double precision)
+               FROM generate_series(1, $2) g"
+        ))
+        .bind(sandbox)
+        .bind(ROWS)
+        .bind(SAMPLED_CLAIMS)
+        .execute(pool)
+        .await?;
+        sqlx::query(sql!("ANALYZE snapshots")).execute(pool).await?;
+        let claims: Vec<SnapshotId> = sqlx::query_scalar(sql!(
+            "SELECT id FROM snapshots WHERE state = 'deleting' ORDER BY id LIMIT $1"
+        ))
+        .bind(LIVE_CLAIMS as i64)
+        .fetch_all(pool)
+        .await?;
+        sqlx::query(sql!(
+            "UPDATE snapshots SET state = 'ready' WHERE state = 'deleting' AND id > $1"
+        ))
+        .bind(claims[LIVE_CLAIMS - 1])
+        .execute(pool)
+        .await?;
+
+        let store = SnapshotRetentionDbStore::new(pool.clone());
+        let epoch = store.claimed_scan_epoch().await?.expect("live claims");
+        assert_eq!(epoch.through, claims[LIVE_CLAIMS - 1]);
+        let page = store.list_claimed(ROWS, None, epoch.through).await?;
+        assert_eq!(
+            page.iter().map(|c| c.snapshot_id).collect::<Vec<_>>(),
+            claims
+        );
+
+        let filtered = |plan: Vec<String>| -> i64 {
+            plan.iter()
+                .filter_map(|line| line.split("Rows Removed by Filter: ").nth(1))
+                .map(|n| n.trim().parse::<i64>().expect("filtered row count"))
+                .sum()
+        };
+        let explain = |statement: &str| {
+            format!("EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) {statement}")
+        };
+        let epoch_plan: Vec<String> =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(explain(CLAIMED_SCAN_EPOCH_SQL)))
+                .fetch_all(pool)
+                .await?;
+        let list_plan: Vec<String> =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(explain(LIST_CLAIMED_SQL)))
+                .bind(ROWS)
+                .bind(None::<SnapshotId>)
+                .bind(epoch.through)
+                .fetch_all(pool)
+                .await?;
+        for plan in [epoch_plan, list_plan] {
+            let shown = plan.join("\n");
+            assert!(filtered(plan) < SAMPLED_CLAIMS, "{shown}");
+        }
+        Ok(())
+    }
+
     /// Real store/claims/finalization and production deletion cap coverage,
     /// with optional real backend latency via `benchmark_backend_delay`.
     ///
