@@ -2064,6 +2064,7 @@ type networkPolicyJSON struct {
 	Egress                    *egressPolicyJSON       `json:"egress"`
 	TLSInterception           json.RawMessage         `json:"tls_interception"`
 	TLSInterceptionExemptions []egressDestinationJSON `json:"tls_interception_exemptions"`
+	NetworkCredentialRules    json.RawMessage         `json:"network_credential_rules"`
 }
 
 type sandboxNetworkPolicyConfig struct {
@@ -2484,6 +2485,10 @@ func parseNetworkPolicyJSON(raw string) (*netpb.NetworkPolicyV1, error) {
 	if err != nil {
 		return nil, err
 	}
+	credentialRules, err := parseNetworkCredentialRules(decoded.NetworkCredentialRules)
+	if err != nil {
+		return nil, fmt.Errorf("network policy network_credential_rules: %w", err)
+	}
 	return &netpb.NetworkPolicyV1{
 		Version:                   netpb.NetworkPolicyVersion_NETWORK_POLICY_VERSION_V1,
 		EgressDefaultAction:       action,
@@ -2491,7 +2496,64 @@ func parseNetworkPolicyJSON(raw string) (*netpb.NetworkPolicyV1, error) {
 		Deny:                      deny,
 		TlsInterception:           tlsInterception,
 		TlsInterceptionExemptions: exemptions,
+		NetworkCredentialRules:    credentialRules,
 	}, nil
+}
+
+// The manager owns semantic policy validation. Preserve all credential intent
+// here, rejecting fields or methods the shim cannot represent instead of dropping them.
+func parseNetworkCredentialRules(raw json.RawMessage) ([]*netpb.NetworkCredentialRuleV1, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var decoded []*struct {
+		RuleID                   string                                `json:"rule_id"`
+		Destination              *netpb.NetworkCredentialDestinationV1 `json:"destination"`
+		CredentialHeaderBindings []*netpb.CredentialHeaderBindingV1    `json:"credential_header_bindings"`
+		SupportedHTTPMethods     []string                              `json:"supported_http_methods"`
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decoded); err != nil {
+		return nil, err
+	}
+	if decoded == nil {
+		return nil, errors.New("expected an array")
+	}
+	rules := make([]*netpb.NetworkCredentialRuleV1, 0, len(decoded))
+	for index, rule := range decoded {
+		if rule == nil || rule.Destination == nil || len(rule.CredentialHeaderBindings) == 0 || len(rule.SupportedHTTPMethods) == 0 {
+			return nil, fmt.Errorf("rule %d requires a destination, bindings and methods", index)
+		}
+		for _, binding := range rule.CredentialHeaderBindings {
+			if binding == nil {
+				return nil, fmt.Errorf("rule %d has a null binding", index)
+			}
+			if _, err := uuid.Parse(binding.CredentialReferenceId); err != nil {
+				return nil, fmt.Errorf("rule %d has an invalid credential reference", index)
+			}
+		}
+		methods := make([]netpb.NetworkCredentialHttpMethodV1, 0, len(rule.SupportedHTTPMethods))
+		for _, method := range rule.SupportedHTTPMethods {
+			switch method {
+			case "GET":
+				methods = append(methods, netpb.NetworkCredentialHttpMethodV1_NETWORK_CREDENTIAL_HTTP_METHOD_V1_GET)
+			case "POST":
+				methods = append(methods, netpb.NetworkCredentialHttpMethodV1_NETWORK_CREDENTIAL_HTTP_METHOD_V1_POST)
+			case "HEAD":
+				methods = append(methods, netpb.NetworkCredentialHttpMethodV1_NETWORK_CREDENTIAL_HTTP_METHOD_V1_HEAD)
+			default:
+				return nil, fmt.Errorf("rule %d has an unsupported HTTP method", index)
+			}
+		}
+		rules = append(rules, &netpb.NetworkCredentialRuleV1{
+			RuleId:                   rule.RuleID,
+			Destination:              rule.Destination,
+			CredentialHeaderBindings: rule.CredentialHeaderBindings,
+			SupportedHttpMethods:     methods,
+		})
+	}
+	return rules, nil
 }
 
 func parseEgressDefaultAction(raw string) (netpb.EgressDefaultAction, error) {

@@ -1127,6 +1127,68 @@ func TestSandboxNetworkPolicyTLSInterceptionExemptions(t *testing.T) {
 	}
 }
 
+func TestSandboxNetworkPolicyCredentialRules(t *testing.T) {
+	const rule = `{"rule_id":"artifact-read","destination":{"exact_host":"artifacts.example.test","path_prefix":"/files"},"credential_header_bindings":[{"header_name":"X-Artifact-Key","credential_reference_id":"00000000-0000-4000-8000-000000000001"}],"supported_http_methods":["GET","POST","HEAD"]}`
+	for _, test := range []struct {
+		name  string
+		rules string
+		valid bool
+	}{
+		{"default port", `[` + rule + `]`, true},
+		{"explicit port", `[` + strings.Replace(rule, `"exact_host":`, `"port":8443,"exact_host":`, 1) + `]`, true},
+		{"unknown method", `[` + strings.Replace(rule, `"HEAD"`, `"PUT"`, 1) + `]`, false},
+		{"numeric method", `[` + strings.Replace(rule, `"HEAD"`, `3`, 1) + `]`, false},
+		{"missing methods", `[` + strings.Replace(rule, `["GET","POST","HEAD"]`, `[]`, 1) + `]`, false},
+		{"unknown destination field", `[` + strings.Replace(rule, `"exact_host":`, `"wildcard_host":"*.example.test","exact_host":`, 1) + `]`, false},
+		{"missing destination", `[` + strings.Replace(rule, `{"exact_host":"artifacts.example.test","path_prefix":"/files"}`, `null`, 1) + `]`, false},
+		{"invalid reference", `[` + strings.Replace(rule, `00000000-0000-4000-8000-000000000001`, `invalid`, 1) + `]`, false},
+		{"null rule", `[null]`, false},
+		{"null binding", `[` + strings.Replace(rule, `{"header_name":"X-Artifact-Key","credential_reference_id":"00000000-0000-4000-8000-000000000001"}`, `null`, 1) + `]`, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			spec := &ociSpec{Annotations: map[string]string{
+				sandboxNetworkPolicyAnnotation:           `{"version":"v1","egress":{"default_action":"allow"},"tls_interception":"on","network_credential_rules":` + test.rules + `}`,
+				sandboxNetworkPolicyGenerationAnnotation: "42",
+			}}
+			config, err := spec.sandboxNetworkPolicy()
+			if !test.valid {
+				if err == nil {
+					t.Fatal("malformed credential rules were accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			wire, err := proto.Marshal(&pb.CreateRequest{NetworkPolicy: config.Policy, NetworkPolicyGeneration: config.Generation, NetworkPolicyAuthority: config.Authority})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var received pb.CreateRequest
+			if err := proto.Unmarshal(wire, &received); err != nil {
+				t.Fatal(err)
+			}
+			var port *uint32
+			if test.name == "explicit port" {
+				port = ptr(uint32(8443))
+			}
+			wantRule := &netpb.NetworkCredentialRuleV1{
+				RuleId:                   "artifact-read",
+				Destination:              &netpb.NetworkCredentialDestinationV1{ExactHost: "artifacts.example.test", Port: port, PathPrefix: ptr("/files")},
+				CredentialHeaderBindings: []*netpb.CredentialHeaderBindingV1{{HeaderName: "X-Artifact-Key", CredentialReferenceId: "00000000-0000-4000-8000-000000000001"}},
+				SupportedHttpMethods:     []netpb.NetworkCredentialHttpMethodV1{netpb.NetworkCredentialHttpMethodV1_NETWORK_CREDENTIAL_HTTP_METHOD_V1_GET, netpb.NetworkCredentialHttpMethodV1_NETWORK_CREDENTIAL_HTTP_METHOD_V1_POST, netpb.NetworkCredentialHttpMethodV1_NETWORK_CREDENTIAL_HTTP_METHOD_V1_HEAD},
+			}
+			if received.NetworkPolicyGeneration != 42 || received.NetworkPolicyAuthority != netpb.PolicyAuthority_POLICY_AUTHORITY_CLUSTER {
+				t.Fatalf("policy identity changed: %v", &received)
+			}
+			rules := received.GetNetworkPolicy().GetNetworkCredentialRules()
+			if len(rules) != 1 || !proto.Equal(rules[0], wantRule) {
+				t.Fatalf("credential rules = %v, want %v", rules, wantRule)
+			}
+		})
+	}
+}
+
 func TestSandboxNetworkPolicyRequiresGeneration(t *testing.T) {
 	spec := &ociSpec{
 		Annotations: map[string]string{
