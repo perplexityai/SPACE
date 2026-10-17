@@ -197,6 +197,12 @@ None of these are provisioned here:
   sandbox traffic by default and allows egress to `0.0.0.0/0` except
   `internetExcept`. That list must cover every private range sandboxes must
   not reach, including the cluster's pod, Service and node CIDRs.
+- Build VMs run on builder hosts, outside that NetworkPolicy. Every guest,
+  build VMs included, already drops new connections to `10.0.0.0/8`,
+  `172.16.0.0/12` and `192.168.0.0/16`. `space-build-manager-local.egress`
+  covers the rest: `denyCidrs` must list the cluster's other private ranges,
+  such as pod, Service, node or VPC CIDRs in `100.64.0.0/10`, and
+  `allowCidrs` reopens approved package mirrors and registries inside them.
 
 The credential-manager authority admits callers by TokenReview of their
 projected token. It runs all of these checks on every request, cache hits

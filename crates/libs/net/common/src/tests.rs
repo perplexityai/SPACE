@@ -372,6 +372,44 @@ fn ipv4_mapped_ipv6_host_cidr_normalizes_to_ipv4_host() {
 }
 
 #[test]
+fn ip_cidr_without_leaves_exactly_the_addresses_outside_the_exclusion() {
+    let probes: Vec<IpAddr> = (u32::from(Ipv4Addr::new(192, 0, 1, 0))
+        ..=u32::from(Ipv4Addr::new(192, 0, 3, 255)))
+        .map(|ip| IpAddr::V4(Ipv4Addr::from(ip)))
+        .chain(
+            [
+                "2001:db8::1",
+                "2001:db8:0:1::1",
+                "2001:db8:0:1:ffff:ffff:ffff:ffff",
+                "2001:db8:ffff::1",
+                "2001:db9::1",
+            ]
+            .map(|ip| ip.parse().unwrap()),
+        )
+        .collect();
+    for (network, excluded) in [
+        ("192.0.2.0/24", "192.0.2.64/26"),
+        ("192.0.2.0/24", "192.0.2.77/32"),
+        ("192.0.2.0/24", "192.0.2.0/24"),
+        ("192.0.2.64/26", "192.0.2.0/24"),
+        ("192.0.2.0/25", "192.0.2.128/25"),
+        ("192.0.2.0/24", "2001:db8::/32"),
+        ("2001:db8::/32", "2001:db8:0:1::/64"),
+    ] {
+        let network = network.parse::<IpCidr>().unwrap();
+        let excluded = excluded.parse::<IpCidr>().unwrap();
+        let remaining = network.without(excluded);
+        for &ip in &probes {
+            assert_eq!(
+                remaining.iter().any(|cidr| cidr.contains(ip)),
+                network.contains(ip) && !excluded.contains(ip),
+                "{network} without {excluded} at {ip}"
+            );
+        }
+    }
+}
+
+#[test]
 fn ipv4_mapped_ipv6_cidr_rejects_prefix_before_mapped_space() {
     assert!(matches!(
         "::ffff:1.2.3.4/95".parse::<IpCidr>(),

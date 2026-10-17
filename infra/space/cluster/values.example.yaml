@@ -127,3 +127,10 @@ space-build-manager-local:
   node: *node
   objectStore:
     bucket: templates
+  # Private ranges outside RFC 1918 that build steps must not reach: pod,
+  # Service, node and VPC CIDRs included (README.md, Prerequisites).
+  # allowCidrs lists approved package mirrors and registries inside them.
+  egress:
+    denyCidrs:
+      - 100.64.0.0/10
+    allowCidrs: []

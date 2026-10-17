@@ -64,6 +64,19 @@ objectStore:
   multipartConcurrency: 2
   multipartPartSizeBytes: 67108864
 
+# Build VM egress (build_vm_egress_policy_from_env,
+# crates/libs/build/mgr/src/egress.rs). Recipe steps reach every address
+# except denyCidrs; allowCidrs reopens addresses inside them, such as package
+# mirrors and registries. Every guest, build VMs included, already drops new
+# connections to 10.0.0.0/8, 172.16.0.0/12 and 192.168.0.0/16
+# (docker/space/nftables/sandbox-pre-tproxy-guardrails.json), so denyCidrs is
+# for private ranges outside them, and allowCidrs cannot reopen those.
+# Platform hard-denies (instance metadata, link-local, loopback) also apply.
+# A value that is not a CIDR stops build-manager at startup.
+egress:
+  denyCidrs: []
+  allowCidrs: []
+
 # Per-devbox sandbox SSH keypair Secret, created by bootstrap from
 # ~/.space-devbox/kind/ssh (the local stand-in for the node image's
 # Packer-generated key). build-manager SSHes into each build VM as root.

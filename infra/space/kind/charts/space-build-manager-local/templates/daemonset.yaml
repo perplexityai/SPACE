@@ -153,6 +153,10 @@ spec:
               value: {{ .Values.objectStore.multipartPartSizeBytes | int64 | quote }}
             - name: SPACE_BUILDER_BLOB_MIN_AVAILABLE_BYTES
               value: {{ .Values.blob.minAvailableBytes | quote }}
+            - name: SPACE_BUILDER_EGRESS_DENY_CIDRS
+              value: {{ join "," .Values.egress.denyCidrs | quote }}
+            - name: SPACE_BUILDER_EGRESS_ALLOW_CIDRS
+              value: {{ join "," .Values.egress.allowCidrs | quote }}
           startupProbe:
             exec:
               command: ["/opt/space/bin/grpc_health_probe", "-addr={{ .Values.probeAddr }}", "-tls", "-tls-ca-cert=/etc/space-rpc-ca/ca.crt", "-tls-server-name=space-builder-build-manager", "-service=build.manager.v1.BuildManager", "-connect-timeout=2s"]
