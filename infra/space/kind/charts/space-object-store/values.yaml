@@ -14,14 +14,15 @@
 
 image:
   repository: ghcr.io/versity/versitygw
-  # Bump to the first release that contains versity/versitygw#2415, and
-  # change its ci/mirrored-images.txt line, which pins this tag's
-  # linux/amd64 digest, with it. Through v1.8.0 the gateway commits a
-  # truncated UNSIGNED-PAYLOAD PutObject or UploadPart body as complete when
-  # the client disconnects mid-body (versity/versitygw#2414); the
-  # object-store crate's Content-MD5 on every upload is what rejects those
-  # bodies today, and it stays after the bump as defense in depth.
-  tag: "v1.8.0"
+  # Change this tag and its ci/mirrored-images.txt line, which pins the tag's
+  # linux/amd64 digest, together. v1.9.0 is the first release with
+  # versity/versitygw#2415: the gateway refuses a PutObject or UploadPart
+  # body that ends before its Content-Length. Through v1.8.0 it committed a
+  # truncated UNSIGNED-PAYLOAD body as complete when the client disconnected
+  # mid-body (versity/versitygw#2414). The object-store crate's Content-MD5 on
+  # every upload, which was what rejected those bodies, stays as defense in
+  # depth.
+  tag: "v1.9.0"
   pullPolicy: IfNotPresent
 
 # The bucket-init Job creates the buckets through the S3 API with the aws CLI
