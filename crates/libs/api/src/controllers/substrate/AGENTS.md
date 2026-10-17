@@ -92,9 +92,10 @@ For new work:
   rows. When a fixed-scope statement may run under another substrate, return
   early in Rust instead of also ANDing the running substrate's value: read a
   capability, or reuse `failed_active_execution_scope` where its scope fits,
-  as the sweeper's failed-active-execution cleanup does. Existing literals,
-  such as the shared `routable_execution_or_non_k8s` fragment, are debt.
-  Never choose a runtime endpoint from a row's label.
+  as the sweeper's failed-active-execution cleanup does. archcheck's
+  `pattern_ratchet.substrate_literals` rule catches the common literal forms
+  in production code; its comment lists what it misses. Never choose a
+  runtime endpoint from a row's label.
 - `node_direct`, `sandbox_direct_route_identities` and
   `sandbox_direct_route_provenance` belong to Direct. Outside tests, write
   them only from `direct.rs` and the Direct node registry; read them through

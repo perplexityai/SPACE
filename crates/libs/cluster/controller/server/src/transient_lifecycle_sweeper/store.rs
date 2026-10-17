@@ -447,7 +447,8 @@ fn ready_snapshot_predicate(lifecycle: SandboxLifecycle) -> String {
 
 /// Build the candidate select for `lifecycle`: aged rows listed **without**
 /// flipping anything. Bind order: `$1` = `managed_by`, `$2` = lifecycle
-/// string, `$3` = age threshold seconds (`BIGINT`), `$4` = batch limit.
+/// string, `$3` = age threshold seconds (`BIGINT`), `$4` = batch limit, `$5` =
+/// `SubstrateKind::Kubernetes` (the routability fragment's substrate).
 ///
 /// Carries everything classification needs: the row's actual age, the
 /// evacuation wake target, the per-lifecycle ready-snapshot fact
@@ -477,7 +478,7 @@ pub(crate) fn list_aged_transient_query(lifecycle: SandboxLifecycle) -> String {
     // its own `restoring -> started` convergence on: `started` in the K8s
     // substrate promises an active running execution with a pod IP, so the
     // converge arm needs this fact to avoid asserting it blindly.
-    let routable_execution = routable_execution_or_non_k8s("sandboxes");
+    let routable_execution = routable_execution_or_non_k8s("sandboxes", "$5");
     format!(
         "SELECT sandboxes.id,
                 EXTRACT(EPOCH FROM (NOW() - sandboxes.lifecycle_changed_at))::BIGINT AS age_secs,
@@ -541,7 +542,8 @@ pub(crate) fn undo_fail_aged_candidate_query() -> String {
 /// Lease-guarded converge CAS: flip an aged, probe-verified-alive `restoring`
 /// row to its wake target. Bind order: `$1` = `managed_by`, `$2` = age
 /// threshold seconds (`BIGINT`), `$3` = sandbox id, `$4` = target lifecycle
-/// (`'started'` or `'paused'`).
+/// (`'started'` or `'paused'`), `$5` = `SubstrateKind::Kubernetes` (the
+/// routability fragment's substrate).
 ///
 /// The restore-lease guard mirrors the user-restore claim's semantics. An
 /// unexpired lease means a restore attempt is still actively driving the row.
@@ -562,7 +564,7 @@ pub(crate) fn undo_fail_aged_candidate_query() -> String {
 /// *at flip time*; if the execution changed underneath, the CAS claims
 /// nothing and the in-flight wake keeps ownership of the row.
 pub(crate) fn converge_restoring_query() -> String {
-    let routable_execution = routable_execution_or_non_k8s("sandboxes");
+    let routable_execution = routable_execution_or_non_k8s("sandboxes", "$5");
     format!(
         "UPDATE sandboxes
         SET lifecycle = $4
@@ -870,6 +872,7 @@ impl SweepSink for SubstrateSweepSink {
             .bind(lifecycle.to_string())
             .bind(Self::age_secs_bind(age))
             .bind(SWEEP_CANDIDATE_BATCH)
+            .bind(SubstrateKind::Kubernetes)
             .fetch_all(&self.pool)
             .await?;
         let observed = observe_candidate_pods(
@@ -1048,6 +1051,7 @@ impl SweepSink for SubstrateSweepSink {
         .bind(Self::age_secs_bind(age))
         .bind(sandbox_id)
         .bind(target.as_str())
+        .bind(SubstrateKind::Kubernetes)
         .fetch_optional(&self.pool)
         .await?;
         Ok(claimed.is_some())

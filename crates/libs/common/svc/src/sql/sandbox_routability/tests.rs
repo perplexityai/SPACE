@@ -11,7 +11,7 @@ fn routable_k8s_execution_exists_uses_provided_alias() {
 
 #[test]
 fn routable_execution_or_non_k8s_exempts_other_substrates() {
-    let fragment = routable_execution_or_non_k8s("sandboxes");
-    assert!(fragment.contains("sandboxes.managed_by <> 'k8s'"));
+    let fragment = routable_execution_or_non_k8s("sandboxes", "$5");
+    assert!(fragment.contains("sandboxes.managed_by <> $5"));
     assert!(fragment.contains("rex.sandbox_id = sandboxes.id"));
 }

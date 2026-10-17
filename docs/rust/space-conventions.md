@@ -176,27 +176,38 @@ sqlx::query_scalar::<_, NodeId>(sql!(
 
 The statement stays syntactically whole, as the store rules require: new code
 writes whole statements with bound values, not fragments around the value.
-The started- and failed-restorable repair `row_state_guards` helpers take their
-placeholder as an argument only because they are existing fragment-based sites
-this conversion kept; they are not a pattern for new code. Read a `managed_by`
-column back as `SubstrateKind` rather than comparing strings. Where one bad row
-must not fail the batch, read it as text and parse it per row, as
-`orphaned_restore_pod_gc` does: a typed decode fails the whole `fetch_all` on
-an unrecognized value. Test fixtures may write literal `managed_by` values into
-the rows they set up; the rule covers the statements under test.
+The started- and failed-restorable repair `row_state_guards` helpers and the
+shared `routable_execution_or_non_k8s` routability fragment
+(`crates/libs/common/svc/src/sql/sandbox_routability.rs`) take their
+placeholder as an argument only because they are existing fragments; they are
+not a pattern for new code. Read a `managed_by` column back as `SubstrateKind`
+rather than comparing strings. Where one bad row must not fail the batch, read
+it as text and parse it per row, as `orphaned_restore_pod_gc` does: a typed
+decode fails the whole `fetch_all` on an unrecognized value. Test fixtures may
+write literal `managed_by` values into the rows they set up; the rule covers
+the statements under test.
 
-The production code of the cluster controller, internal-api and the trigger
-queue follows this, except where it embeds `routable_execution_or_non_k8s`
-(`crates/libs/common/svc/src/sql/sandbox_routability.rs`), a shared fragment
-that writes `managed_by <> 'k8s'` into the transient sweeper's aged-transient
-list and restoring convergence, internal-api's restored-state convergence and
-the api crate's wake completion. That fragment is existing debt, as are the
+Every crate's production SQL binds the value, and production Rust doesn't
+compare the label string or parse the running substrate's `managed_by()` to
+decide behavior (the substrate `AGENTS.md` names the one SQL-scope exception).
+archcheck's `pattern_ratchet.substrate_literals` rule (`ARCHITECTURE.toml`)
+catches the common forms in production code: SQL comparisons of `managed_by`
+with `'k8s'` or `'space'`, and Rust comparisons, label-string matches and match
+arms on `"k8s"` or `"space"` beside a substrate name. It is a line matcher and
+can miss a literal; its comment lists what it does not catch. Test files and
+the test-support modules its `allow` list names are exempt. Existing debt: the
 sandbox store's public `SandboxRecord.managed_by` and
 `AutoLifecycleExecution.managed_by` fields, which single-row reads still return
-as text (`proves_no_execution` parses the latter), and a few dozen production
-lines elsewhere that compare `managed_by` with a raw `'k8s'` or `'space'`
-(`crates/libs/api/src/controllers/substrate/direct.rs` has about a dozen).
-Convert them when touched; they are not a pattern to copy.
+as text (`proves_no_execution` parses the latter). Convert them when touched;
+they are not a pattern to copy.
+
+- A decision about one row's substrate, its sandbox or node `managed_by`,
+  calls a `SubstrateKind` method named for the question; add one when no
+  method asks it. Rust that repeats a statement's fixed scope compares
+  against the named `SubstrateKind` const the statement binds, and mapping a
+  variant to a value (wire labels, route identity, construction) may match
+  it. A fact about the running substrate reads the api crate's
+  `capabilities()` (`SubstrateCapabilities`). Never compare the label string.
 
 ## Log targets: pin the ones searches select on
 

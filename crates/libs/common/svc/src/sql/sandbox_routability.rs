@@ -25,8 +25,8 @@
 /// (`state = 'running'` and `pod_ip IS NOT NULL`).
 ///
 /// This is the Kubernetes-substrate contract behind `lifecycle = 'started'`.
-/// Rows on substrates without that contract (`managed_by <> 'k8s'`) should be
-/// handled by the caller — see [`routable_execution_or_non_k8s`].
+/// Rows of other substrates have no such contract and should be handled by
+/// the caller — see [`routable_execution_or_non_k8s`].
 ///
 /// `sandbox_alias` is the SQL alias for the `sandboxes` row in the calling
 /// query — pass the bare table name (`"sandboxes"`) when no alias is set.
@@ -46,19 +46,21 @@ pub fn routable_k8s_execution_exists(sandbox_alias: &str) -> String {
 
 /// Returns a boolean SQL fragment evaluating to TRUE iff the sandbox row
 /// aliased as `sandbox_alias` satisfies the routability contract *or* has no
-/// such contract (`managed_by <> 'k8s'`). The composition callers gate
-/// `started`-convergence on.
+/// such contract (its `managed_by` is not Kubernetes). The composition callers
+/// gate `started`-convergence on.
 ///
-/// The substrate value is still spelled in the fragment rather than bound
-/// (see "Substrate values are bound parameters" in
-/// `docs/rust/space-conventions.md`): binding it means every caller passes the
-/// placeholder its own statement numbers, including the api crate's
-/// wake-completion statement.
-pub fn routable_execution_or_non_k8s(sandbox_alias: &str) -> String {
+/// `kubernetes_placeholder` is a parameter (`"$5"`) used nowhere else in the
+/// calling statement, which binds it to `SubstrateKind::Kubernetes`: the
+/// substrate value is bound rather than spelled in SQL (see "Substrate values
+/// are bound parameters" in `docs/rust/space-conventions.md`), and each caller
+/// numbers its own parameters. Reusing a placeholder that holds another value
+/// (the sweeper's `$1` is the running substrate) would change which rows the
+/// fragment exempts.
+pub fn routable_execution_or_non_k8s(sandbox_alias: &str, kubernetes_placeholder: &str) -> String {
     let routable = routable_k8s_execution_exists(sandbox_alias);
     format!(
         "(\n\
-             {sandbox_alias}.managed_by <> 'k8s'\n\
+             {sandbox_alias}.managed_by <> {kubernetes_placeholder}\n\
              OR {routable}\n\
          )"
     )

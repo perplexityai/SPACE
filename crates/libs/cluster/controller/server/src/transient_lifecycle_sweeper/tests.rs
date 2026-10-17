@@ -2591,6 +2591,7 @@ mod postgres_backed {
                         .bind(lifecycle.to_string())
                         .bind(1_i64)
                         .bind(1000_i64)
+                        .bind(SubstrateKind::Kubernetes)
                         .fetch_all(&db.pool)
                         .await?;
                 assert!(candidates.iter().all(|row| row.id != id));
@@ -2723,6 +2724,7 @@ mod postgres_backed {
                 .bind(lifecycle.to_string())
                 .bind(age_secs)
                 .bind(1000_i64)
+                .bind(SubstrateKind::Kubernetes)
                 .fetch_all(pool)
                 .await?,
         )
@@ -2929,6 +2931,7 @@ mod postgres_backed {
         .bind(SandboxLifecycle::Pausing.to_string())
         .bind(60_i64)
         .bind(1000_i64)
+        .bind(SubstrateKind::Kubernetes)
         .fetch_all(pool)
         .await?;
         let listed_ids: Vec<SandboxId> = listed.into_iter().map(|row| row.id).collect();
@@ -3294,6 +3297,7 @@ mod postgres_backed {
         .bind(SandboxLifecycle::Restoring.to_string())
         .bind(60_i64)
         .bind(1000_i64)
+        .bind(SubstrateKind::Kubernetes)
         .fetch_all(pool)
         .await?;
         let fact = |id: SandboxId| {
@@ -3342,7 +3346,9 @@ mod postgres_backed {
     /// `pod_ip`) while the sandbox row is still `restoring`. Without the
     /// in-CAS predicate, the sweep would flip such a row to `started` with an
     /// unroutable active execution — exactly the started-without-restore-
-    /// context wedge this feature exists to prevent.
+    /// context wedge this feature exists to prevent. An otherwise identical
+    /// Direct (`'space'`) row has no routability contract, so the Direct
+    /// sweeper's CAS converges it.
     #[tokio::test(flavor = "current_thread")]
     async fn r18_converge_cas_requires_routable_execution_at_flip_time() -> TestResult {
         let Some(db) = try_pg_test_db().await? else {
@@ -3350,59 +3356,69 @@ mod postgres_backed {
         };
         let pool = &db.pool;
 
-        let converge = |sandbox_id: SandboxId| async move {
+        let converge = |sandbox_id: SandboxId, managed_by: &'static str| async move {
             sqlx::query_scalar::<_, SandboxId>(sqlx::AssertSqlSafe(converge_restoring_query()))
-                .bind("k8s")
+                .bind(managed_by)
                 .bind(60_i64)
                 .bind(sandbox_id)
                 .bind("started")
+                .bind(SubstrateKind::Kubernetes)
                 .fetch_optional(pool)
                 .await
         };
 
-        // The row the sweeper proved routable at select/hydration time...
         let raced = SandboxId::new();
-        insert_sandbox_with_lifecycle_and_managed_by(
-            pool,
-            raced,
-            SandboxLifecycle::Restoring,
-            300,
-            "k8s",
-        )
-        .await?;
-        insert_execution(pool, raced, true, 300, Some("node-1")).await?;
-        set_execution_pod_state(pool, raced, "running", Some("10.90.0.9")).await?;
+        let direct_raced = SandboxId::new();
+        for (sandbox_id, managed_by) in [(raced, "k8s"), (direct_raced, "space")] {
+            // The row the sweeper proved routable at select/hydration time...
+            insert_sandbox_with_lifecycle_and_managed_by(
+                pool,
+                sandbox_id,
+                SandboxLifecycle::Restoring,
+                300,
+                managed_by,
+            )
+            .await?;
+            insert_execution(pool, sandbox_id, true, 300, Some("node-1")).await?;
+            set_execution_pod_state(pool, sandbox_id, "running", Some("10.90.0.9")).await?;
 
-        // ...then a concurrent wake replaces the active execution before the
-        // converge CAS runs: the routable row is retired and a fresh
-        // generation is inserted `creating` with no pod_ip (the shape
-        // `replace_active_execution_claim_if_generation` produces).
-        sqlx::query(
-            "UPDATE sandbox_k8s_executions
-             SET active = FALSE, state = 'suspended', pod_ip = NULL
-             WHERE sandbox_id = $1 AND active",
-        )
-        .bind(raced)
-        .execute(pool)
-        .await?;
-        sqlx::query(
-            "INSERT INTO sandbox_k8s_executions (
-                 sandbox_id, generation, pod_name, pod_namespace, state, active
-             )
-             VALUES ($1, 2, $2, 'sandboxes', 'creating', TRUE)",
-        )
-        .bind(raced)
-        .bind(format!("sandbox-{raced}-g2"))
-        .execute(pool)
-        .await?;
+            // ...then a concurrent wake replaces the active execution before
+            // the converge CAS runs: the routable row is retired and a fresh
+            // generation is inserted `creating` with no pod_ip (the shape
+            // `replace_active_execution_claim_if_generation` produces).
+            sqlx::query(
+                "UPDATE sandbox_k8s_executions
+                 SET active = FALSE, state = 'suspended', pod_ip = NULL
+                 WHERE sandbox_id = $1 AND active",
+            )
+            .bind(sandbox_id)
+            .execute(pool)
+            .await?;
+            sqlx::query(
+                "INSERT INTO sandbox_k8s_executions (
+                     sandbox_id, generation, pod_name, pod_namespace, state, active
+                 )
+                 VALUES ($1, 2, $2, 'sandboxes', 'creating', TRUE)",
+            )
+            .bind(sandbox_id)
+            .bind(format!("sandbox-{sandbox_id}-g2"))
+            .execute(pool)
+            .await?;
+        }
 
         assert_eq!(
-            converge(raced).await?,
+            converge(raced, "k8s").await?,
             None,
             "the converge CAS must claim nothing once the active execution is \
              no longer routable — the in-flight wake owns the row"
         );
         assert_eq!(lifecycle_of(pool, raced).await?, "restoring");
+        assert_eq!(
+            converge(direct_raced, "space").await?,
+            Some(direct_raced),
+            "a Direct row has no routability contract to wait on"
+        );
+        assert_eq!(lifecycle_of(pool, direct_raced).await?, "started");
 
         // Control: with a routable active execution at flip time, the CAS
         // claims as before.
@@ -3417,7 +3433,7 @@ mod postgres_backed {
         .await?;
         insert_execution(pool, routable, true, 300, Some("node-1")).await?;
         set_execution_pod_state(pool, routable, "running", Some("10.90.0.10")).await?;
-        assert_eq!(converge(routable).await?, Some(routable));
+        assert_eq!(converge(routable, "k8s").await?, Some(routable));
         assert_eq!(lifecycle_of(pool, routable).await?, "started");
         Ok(())
     }
@@ -3967,6 +3983,7 @@ mod postgres_backed {
                 .bind(60_i64)
                 .bind(sandbox_id)
                 .bind(target)
+                .bind(SubstrateKind::Kubernetes)
                 .fetch_optional(pool)
                 .await
         };

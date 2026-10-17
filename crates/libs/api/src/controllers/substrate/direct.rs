@@ -418,6 +418,22 @@ fn parse_direct_route_identity(
     )?)
 }
 
+/// The sbx-mgr substrate of a stored route identity's `substrate_kind` text,
+/// or `None` for text that names no substrate.
+fn route_identity_substrate_kind(
+    substrate_kind: &str,
+) -> Option<pplx_space_sbx_mgr_client::proto::SandboxSubstrateKind> {
+    match substrate_kind.parse::<SubstrateKind>() {
+        Ok(SubstrateKind::Space) => {
+            Some(pplx_space_sbx_mgr_client::proto::SandboxSubstrateKind::Direct)
+        }
+        Ok(SubstrateKind::Kubernetes) => {
+            Some(pplx_space_sbx_mgr_client::proto::SandboxSubstrateKind::Kubernetes)
+        }
+        Err(_) => None,
+    }
+}
+
 const LEGACY_DIRECT_EXECUTION_GENERATION: u64 = 1;
 
 fn receipt_execution_generation(identity: Option<&SandboxRouteIdentity>) -> u64 {
@@ -1023,16 +1039,12 @@ impl DirectSubstrate {
                 ),
             });
         }
-        let substrate_kind = match substrate_kind.as_str() {
-            "space" => pplx_space_sbx_mgr_client::proto::SandboxSubstrateKind::Direct,
-            "k8s" => pplx_space_sbx_mgr_client::proto::SandboxSubstrateKind::Kubernetes,
-            other => {
-                return Err(SubstrateError::Failed {
-                    message: format!(
-                        "current Direct route identity for sandbox {sandbox_id} has invalid substrate {other:?}"
-                    ),
-                });
-            }
+        let Some(substrate_kind) = route_identity_substrate_kind(&substrate_kind) else {
+            return Err(SubstrateError::Failed {
+                message: format!(
+                    "current Direct route identity for sandbox {sandbox_id} has invalid substrate {substrate_kind:?}"
+                ),
+            });
         };
         let route_generation = u64::try_from(route_generation).map_err(|_| {
             SubstrateError::Failed {
@@ -3104,11 +3116,12 @@ impl DirectSubstrate {
     ) -> Result<(), SubstrateError> {
         let claimed = sqlx::query(sql!(
             "UPDATE sandboxes SET target_node_id = $2
-             WHERE id = $1 AND managed_by = 'space' AND lifecycle = 'creating'
+             WHERE id = $1 AND managed_by = $3 AND lifecycle = 'creating'
                AND active_node_id IS NULL AND target_node_id IS NULL"
         ))
         .bind(sandbox_id)
         .bind(node_id)
+        .bind(SubstrateKind::Space)
         .execute(&self.pool)
         .await
         .db_context("claim direct create target")?;
@@ -3127,11 +3140,12 @@ impl DirectSubstrate {
     ) -> Result<(), SubstrateError> {
         sqlx::query(sql!(
             "UPDATE sandboxes SET target_node_id = NULL
-             WHERE id = $1 AND managed_by = 'space' AND lifecycle = 'creating'
+             WHERE id = $1 AND managed_by = $3 AND lifecycle = 'creating'
                AND active_node_id IS NULL AND target_node_id = $2"
         ))
         .bind(sandbox_id)
         .bind(node_id)
+        .bind(SubstrateKind::Space)
         .execute(&self.pool)
         .await
         .db_context("release direct create target")?;

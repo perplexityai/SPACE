@@ -2903,7 +2903,7 @@ pub async fn publish_sandbox_states(
     // Evacuation-marked rows are owned by the node-drain redrive (the same
     // exemption the sweeper makes) and are left alone.
     let routable_execution =
-        pplx_space_common_svc::sql::sandbox_routability::routable_execution_or_non_k8s("s");
+        pplx_space_common_svc::sql::sandbox_routability::routable_execution_or_non_k8s("s", "$4");
     let restored_convergence_query = format!(
         "WITH input AS (
              SELECT *
@@ -2931,6 +2931,7 @@ pub async fn publish_sandbox_states(
     .bind(node_id)
     .bind(rows_json.clone())
     .bind(SandboxTransitionReceiptKind::ActivationCompleted.as_str())
+    .bind(SubstrateKind::Kubernetes)
     .fetch_all(&mut *conn)
     .await
     .map_err(|err| Status::internal(format!("converge restored sandbox lifecycle: {err}")))?;

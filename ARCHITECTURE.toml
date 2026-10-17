@@ -98,6 +98,89 @@ mode = "required"
 [rules.pattern_ratchet.capability_identity.stale_entries]
 mode = "required"
 
+# Control-plane Postgres `sandboxes.managed_by` and `nodes.managed_by` hold the
+# substrate that owns a row. Production code binds it as `SubstrateKind`
+# (`managed_by = $n`) and never compares the 'k8s'/'space' label string. A line
+# matcher catches the common forms, not all of them:
+# - SQL: `managed_by` (any alias, prefix, case or quoting, a `::text` cast or a
+#   wrapping call such as `lower(...)`) compared with a literal by =, <>, != or
+#   IS [NOT] DISTINCT FROM, on either side; `managed_by [NOT] IN (...)` or
+#   `= ANY(...)` with a literal in the list, and `'k8s' [NOT] IN (...)` naming
+#   `managed_by`; `CASE managed_by WHEN '...'` on one line. `SET managed_by =
+#   '...'` counts.
+# - Rust: an identifier containing `managed_by` or `substrate` compared with
+#   "k8s"/"space", raw strings included (==, !=, `Some("...")`, `.eq`,
+#   `.eq_ignore_ascii_case`, `matches!`); any value compared with a
+#   `NODE_MANAGED_BY_*` const or a `SubstrateKind`/`NodeManagedBy` variant's
+#   `.as_str()`/`.to_string()`; a match on a `*managed_by`/`substrate_kind`
+#   label string (`.as_str()`, `.as_deref()`, `.as_ref()`) or on the adapter's
+#   `managed_by()`; a match arm on "k8s"/"space" with a substrate name
+#   (`substrate`, `Substrate`, `ManagedBy`, `managed_by`) on the same line.
+# Not caught: a literal in a VALUES list, split across lines, built with
+# `format!` or held in a non-`.rs` file; `if let "k8s" = ...` and `let ... else`
+# patterns; `["space", "k8s"].contains(...)`; a column read by name
+# (`row.get::<String, _>("managed_by") == "k8s"`); a label under a neutral name
+# (`|m| m == "k8s"`); a case-folded literal (`eq_ignore_ascii_case("K8S")`); a
+# match written `match &*x.managed_by`, `&x.managed_by[..]` or
+# `.as_deref().unwrap_or(...)`, and so its arms; an arm whose substrate name is
+# only on the `match` line, or with any of `;{}=:` between the literal and `=>`
+# (a guard with `==`, `("k8s", NodeRole::Builder)`, a struct pattern).
+# False positives: the same text in a trailing `//` or `/* */` comment, in
+# `#[doc = "..."]`, in a SQL `--` comment or in an ordinary Rust string such as
+# an error message; a non-substrate vocabulary on a line that names a
+# substrate; an `.as_ref()`/`.as_deref()` match on a typed
+# `Option<SubstrateKind>`/`Option<NodeManagedBy>` named `substrate_kind` or
+# `*managed_by`. Test files are filename-based, so `allow` adds the
+# `#[cfg(test)]` support modules and fixtures, which may write literal rows.
+# Production code has no matches, so there is no baseline table; a deliberate
+# exception is a reviewed baseline entry, which `no_new_entries` reports.
+[rules.pattern_ratchet.substrate_literals]
+patterns = [
+  # SQL
+  '''(?i)\b\w*managed_by\b"?\s*(?:::\s*text\s*)?\)?\s*(?:=|<>|!=|\bIS\s+(?:NOT\s+)?DISTINCT\s+FROM\b)\s*'(?:k8s|space)'''',
+  '''(?i)'(?:k8s|space)'\s*(?:::\s*text\s*)?(?:=|<>|!=|\bIS\s+(?:NOT\s+)?DISTINCT\s+FROM\b)\s*(?:\w+\s*\(\s*)?(?:\w+\.)?"?\w*managed_by\b''',
+  '''(?i)\b\w*managed_by\b"?\s*(?:::\s*text\s*)?\)?\s*(?:=\s*ANY|(?:NOT\s+)?IN)\s*\((?:[^()]|\([^()]*\))*?'(?:k8s|space)'''',
+  '''(?i)'(?:k8s|space)'\s*(?:NOT\s+)?IN\s*\([^)]*\bmanaged_by\b''',
+  '''(?i)\bCASE\s+(?:\w+\s*\(\s*)?(?:\w+\.)?"?\w*managed_by\b.*?\bWHEN\s+'(?:k8s|space)'''',
+  # Rust comparisons with the label, a label const or a variant's label
+  '''\b\w*(?:managed_by|substrate)\w*\b[\w.()&*]*\s*(?:==|!=)\s*(?:Some\s*\(\s*)?(?:r#*)?"(?:k8s|space)"''',
+  '''"(?:k8s|space)"#*\s*\)?\s*(?:==|!=)\s*[\w.()&*]*\b\w*(?:managed_by|substrate)\w*\b''',
+  '''\b\w*(?:managed_by|substrate)\w*\b[\w.()&*]*\.eq(?:_ignore_ascii_case)?\s*\(\s*(?:r#*)?"(?:k8s|space)"''',
+  '''\bmatches!\s*\(\s*[^,]*\b\w*(?:managed_by|substrate)\w*\b[^,]*,[^;]*"(?:k8s|space)"''',
+  '''(?:==|!=)\s*&?[\w:]*(?:NODE_MANAGED_BY_(?:K8S|SPACE)\b|(?:SubstrateKind|NodeManagedBy)::\w+\s*\.\s*(?:as_str|to_string)\s*\(\s*\))''',
+  '''(?:\bNODE_MANAGED_BY_(?:K8S|SPACE)\b|\b(?:SubstrateKind|NodeManagedBy)::\w+\s*\.\s*(?:as_str|to_string)\s*\(\s*\))\s*(?:==|!=)''',
+  # Rust matches on the label string, and arms on it beside a substrate name
+  '''\bmatch\s+[\w.&*]*\b(?:\w*managed_by|substrate_kind)\b(?:\s*\(\s*\))?\s*\.\s*(?:as_str|as_deref|as_ref)\s*\(\s*\)\s*\{''',
+  '''\bmatch\s+[\w.&*]*\bmanaged_by\s*\(\s*\)\s*\{''',
+  '''"(?:k8s|space)"[^;{}=:]*=>.*(?:[Ss]ubstrate|ManagedBy|managed_by)''',
+  '''(?:[Ss]ubstrate|ManagedBy|managed_by).*"(?:k8s|space)"[^;{}=:]*=>''',
+]
+allow = [
+  "**/*_tests/**",
+  "**/test_support.rs",
+  "**/test_support/**",
+  "**/*_test_support.rs",
+  "**/test_fixtures.rs",
+  "**/*_test_fixture.rs",
+  "**/scripted_test_doubles.rs",
+  "crates/libs/db-test-fixtures/**",
+]
+
+[rules.pattern_ratchet.substrate_literals.no_crossing]       # only allowed files may match
+mode = "required"
+
+[rules.pattern_ratchet.substrate_literals.no_new_entries]    # a pull request may not add entries to the baseline
+mode = "advisory"
+
+[rules.pattern_ratchet.substrate_literals.no_raised_caps]    # a pull request may not raise a cap in the baseline
+mode = "advisory"
+
+[rules.pattern_ratchet.substrate_literals.listed_no_growth]  # listed files may not gain matching lines
+mode = "required"
+
+[rules.pattern_ratchet.substrate_literals.stale_entries]     # entries with fewer matches, none, or gone
+mode = "required"
+
 # Rootfs copies must preserve NoCoW and sparse extents through common-io's
 # reflink helper. A line matcher cannot infer a path variable's contents, so
 # conservatively fence all new plain filesystem copies and cp launches.

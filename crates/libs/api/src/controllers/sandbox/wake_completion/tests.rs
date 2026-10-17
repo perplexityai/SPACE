@@ -104,18 +104,28 @@ async fn dropping_an_armed_guard_sheds_when_the_redrive_cap_is_full() {
 }
 
 async fn insert_k8s_sandbox(pool: &PgPool, sandbox_id: SandboxId, lifecycle: &str) -> TestResult {
+    insert_sandbox_managed_by(pool, sandbox_id, lifecycle, "k8s").await
+}
+
+async fn insert_sandbox_managed_by(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+    lifecycle: &str,
+    managed_by: &str,
+) -> TestResult {
     sqlx::query(sql!(
         "INSERT INTO sandboxes
             (id, user_id, org_id, managed_by, lifecycle, network_policy_generation)
          VALUES ($1,
                  '00000000-0000-0000-0000-000000000010',
                  '00000000-0000-0000-0000-000000000001',
-                 'k8s',
+                 $3,
                  $2,
                  1)"
     ))
     .bind(sandbox_id)
     .bind(lifecycle)
+    .bind(managed_by)
     .execute(pool)
     .await?;
     Ok(())
@@ -232,35 +242,43 @@ async fn redrive_waits_for_routability_then_completes() -> TestResult {
 /// The fence: hydration claims routable but the execution was replaced
 /// underneath (unroutable at flip time) — the CAS must claim nothing and
 /// the redrive must eventually abandon, leaving `restoring` for the
-/// sweeper rather than manufacturing started-without-routability.
+/// sweeper rather than manufacturing started-without-routability. An
+/// otherwise identical Direct (`'space'`) row has no routability contract,
+/// so the CAS converges it.
 #[tokio::test(flavor = "current_thread")]
 async fn redrive_cas_refuses_unroutable_execution_at_flip_time() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
     let pool = &db.pool;
-    let sandbox_id = SandboxId::new();
-    insert_k8s_sandbox(pool, sandbox_id, "restoring").await?;
-    insert_execution(pool, sandbox_id, "creating", None).await?;
+    for (managed_by, expected_outcome, expected_lifecycle) in [
+        ("k8s", WakeCompletionRedriveOutcome::Abandoned, "restoring"),
+        ("space", WakeCompletionRedriveOutcome::Completed, "started"),
+    ] {
+        let sandbox_id = SandboxId::new();
+        insert_sandbox_managed_by(pool, sandbox_id, "restoring", managed_by).await?;
+        insert_execution(pool, sandbox_id, "creating", None).await?;
 
-    // A hydration stub that lies (stale answer): claims routable while
-    // the DB execution stays creating/no-IP.
-    let outcome = redrive_wake_completion(
-        pool,
-        sandbox_id,
-        WakeCompletionAction::Wake,
-        Duration::from_millis(200),
-        Duration::from_millis(20),
-        REDRIVE_HYDRATE_BUDGET,
-        || async { Ok(true) },
-    )
-    .await;
-    assert_eq!(outcome, WakeCompletionRedriveOutcome::Abandoned);
-    assert_eq!(
-        lifecycle_of(pool, sandbox_id).await?,
-        "restoring",
-        "the fenced CAS must never assert started without a routable execution"
-    );
+        // A hydration stub that lies (stale answer): claims routable while
+        // the DB execution stays creating/no-IP.
+        let outcome = redrive_wake_completion(
+            pool,
+            sandbox_id,
+            WakeCompletionAction::Wake,
+            Duration::from_millis(200),
+            Duration::from_millis(20),
+            REDRIVE_HYDRATE_BUDGET,
+            || async { Ok(true) },
+        )
+        .await;
+        assert_eq!(outcome, expected_outcome, "{managed_by}");
+        assert_eq!(
+            lifecycle_of(pool, sandbox_id).await?,
+            expected_lifecycle,
+            "{managed_by}: the fenced CAS must never assert started without a routable \
+             execution on Kubernetes"
+        );
+    }
     Ok(())
 }
 

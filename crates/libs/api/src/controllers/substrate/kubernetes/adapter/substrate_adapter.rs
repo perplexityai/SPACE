@@ -1,6 +1,7 @@
 //! `SubstrateAdapter` implementation for `KubernetesSubstrate`.
 
 use super::*;
+use pplx_space_common_core::types::SubstrateKind;
 
 impl SubstrateAdapter for KubernetesSubstrate {
     fn managed_by(&self) -> &'static str {
@@ -1899,11 +1900,12 @@ impl SubstrateAdapter for KubernetesSubstrate {
              FROM nodes n
              JOIN node_k8s nk ON nk.node_id = n.id
              WHERE n.id = $1
-               AND n.managed_by = 'k8s'
+               AND n.managed_by = $2
                AND n.role = 'builder'
              LIMIT 1"
         ))
         .bind(node_id.as_uuid())
+        .bind(SubstrateKind::Kubernetes)
         .fetch_optional(self.store.pool())
         .await
         .map_err(|error| {
