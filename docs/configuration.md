@@ -165,7 +165,7 @@ Prefetch requires the catalog to confirm generic-only release resolution from th
 | `SPACE_TEMPLATE_CACHE_BUDGET_BYTES` | 100 GiB | 0 or an invalid value disables cache GC. |
 | `SPACE_TEMPLATE_BUILD_DISK_MIB` | build-manager default | JSON. |
 | `SPACE_TRUSTED_TEMPLATE_STORAGE_BUCKETS` | empty = any bucket | |
-| `SPACE_TEMPLATE_PUBLISH_SYSTEM_SERVICE_ACCOUNTS`, `SPACE_TEMPLATE_PUBLISH_TENANT_SERVICE_ACCOUNTS` | empty | Startup error when the allowed set is empty. An account in both lists (build-manager) must present the grant issued for that system build by the API or a system-only operator; each grant authorizes one release. |
+| `SPACE_TEMPLATE_PUBLISH_SYSTEM_SERVICE_ACCOUNTS`, `SPACE_TEMPLATE_PUBLISH_TENANT_SERVICE_ACCOUNTS` | empty | Startup error when the allowed set is empty. An account in both lists (build-manager) must present the grant issued for that system build by the API or a system-only operator; each grant authorizes one release. A tenant-list account must likewise present the grant the API issued before dispatching that organization's build of that template, from the builder node the grant is bound to; it authorizes one release. |
 | `SPACE_BUILD_AUTH_SYSTEM_SERVICE_ACCOUNTS`, `SPACE_BUILD_AUTH_TENANT_SERVICE_ACCOUNTS` | empty | |
 | `SPACE_TEMPLATE_PUBLICATION_TOKEN_PATH` | unset | Direct deployments only: dedicated publisher credential file shared by ClusterApi and build-manager. Never reuse the shared node token; incompatible with Kubernetes authentication. See below. |
 | `SPACE_BUILD_MANAGER_ENDPOINT` | `127.0.0.1:9900` | |
@@ -186,9 +186,11 @@ internal RPC TLS configuration. Other node services must not receive the
 publisher secret.
 
 Build-manager attaches the dedicated proof only to template and release
-registration. The shared node bearer alone cannot publish. This grants tenant
-publication authority and system publication authority **only with the existing
-per-build grant** issued by the API. It cannot issue system grants itself, and
+registration. The shared node bearer alone cannot publish. Both tenant and
+system publication require the corresponding **per-build grant** issued by the
+API. A tenant grant must match the template, organization, and registered builder
+at the connection’s source address; no Kubernetes identity is required. The
+publisher credential cannot issue system grants itself, and
 does not enable ungranted system builds from the operator CLI. Kubernetes
 publication continues using projected tokens; combining Kubernetes auth with
 the direct receiver credential fails startup.
@@ -228,28 +230,44 @@ jobs that could not be drained: jobs without a grant cannot publish through a
 dual-authority account after the rollout. System-only deployment publishers
 retain their existing publication authority.
 
-Tenant publication grants are in a preparation phase. Before dispatching an
-organization's build, the API records a grant naming the target template and
-organization, sends it with `StartBuild`, and pins it to the accepting builder.
-Failed acceptance revokes that submission's grant. Build-manager persists and
-forwards the optional grant to template and release registration.
+Tenant builds follow the same pattern. Before dispatching an organization's
+build, the API records a tenant publication grant naming the target template
+and that organization, and sends it with `StartBuild`; it withdraws the grant if
+dispatch fails and pins it to the accepting builder node from the response.
+Build-manager forwards the grant to template and release registration.
+ClusterApi accepts a tenant-list account's publication only with a grant that
+names the requested template and organization and that covers the builder node
+identified by freshly reviewed pod-bound node name and UID, matched against
+live Kubernetes builder inventory. A bootstrapped node with no inventory UID
+cannot publish yet; build-manager retries until inventory synchronization
+completes, within its bounded registration backoff. Updated build-managers also
+retry publication failures explicitly marked as uncommitted database
+contention; transport failures with an unknown commit outcome remain terminal.
+Both build-manager and ClusterApi must be upgraded for these retries.
+Standalone trusted deployments retain transport-address identity. A grant
+covers any registered builder for one hour while unpinned, then only the pinned
+builder for seven days. Release registration
+consumes the grant in its transaction. Direct `space-buildmgr build --org-id`
+submissions carry no grant, so their builds cannot publish to a cluster through
+a tenant-list account; submit organization builds through the API.
 
-ClusterApi still uses the existing tenant publisher and ownership checks. It
-accepts publications both with and without the new field and does not consume
-tenant grants yet. Older gateways/builders may drop the field during a rolling
-upgrade; older queued jobs and direct tenant CLI submissions still work.
-System publication grants remain enforced as before.
+Deploy tenant grant enforcement only after the preparation release has fully
+rolled out to every API, ClusterApi, node-api gateway, and build-manager. That
+release produces and forwards grants while still accepting grantless tenant
+publication; the grant-table migration and role bootstrap must already be
+applied. Do not skip directly from an older release to enforcement.
 
-Apply the grant-table migration and role bootstrap before deploying the new
-API. After that prerequisite, the API, ClusterApi, node-api, and build-manager
-can roll in any order. Existing grants expire and are swept on new submissions.
-This preparation release does not complete tenant publication hardening.
+Drain or resubmit every tenant job accepted before preparation finished; an
+older gateway or builder may have dropped its grant. Verify a newly submitted
+tenant build retains the grant through dispatch and publication, and that
+TokenReview returns the pod-bound node identity matched by builder inventory.
+Direct tenant CLI submissions must move to the API before enforcement.
 
-Before deploying a later enforcement release, finish upgrading every API,
-gateway, and builder, then drain or resubmit jobs accepted before that upgrade.
-Verify tenant builds carry grants end to end. Rollback after enforcement must
-preserve grant-producing and forwarding components until enforcement is removed;
-keep the additive schema in place.
+Once these prerequisites hold, enforcement may roll out through the normal
+service order: existing preparation builders already carry grants and understand
+safe retry responses. Roll application components back to the preparation
+release if needed, retaining the additive schema. Remove enforcement from all
+ClusterApi replicas before rolling grant producers or forwarders back further.
 
 ### Template balloon device
 

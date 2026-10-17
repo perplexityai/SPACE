@@ -1,7 +1,10 @@
 use super::{ClusterApiService, adapter::TemplateOrg};
 use pplx_space_common_core::{
     sql,
-    types::{OrgId, SystemPublicationGrantId, TemplateDesiredState, TemplateName},
+    types::{
+        NodeId, OrgId, SystemPublicationGrantId, TemplateDesiredState, TemplateName,
+        TenantPublicationGrantId,
+    },
 };
 use std::collections::BTreeSet;
 use tonic::Status;
@@ -53,6 +56,44 @@ impl ReservedTemplateNames {
 }
 
 impl ClusterApiService {
+    /// Kubernetes uses the reviewed pod binding; standalone callers retain the
+    /// explicitly trusted deployment's transport-address identity.
+    pub(super) async fn publisher_nodes(
+        &self,
+        remote_addr: Option<std::net::SocketAddr>,
+        node: Option<&pplx_space_common_svc::auth::build::AuthenticatedBuildNode>,
+    ) -> Result<Vec<NodeId>, Status> {
+        use super::template_releases_store::TemplateReadScope;
+        if let Some(node) = node {
+            use super::template_releases_store::PublicationNode;
+            return match self
+                .template_releases_store
+                .publisher_node_for_identity(node)
+                .await
+                .map_err(|err| storage_status("resolve publisher node identity", &err))?
+            {
+                PublicationNode::Registered(id) => Ok(vec![id]),
+                PublicationNode::PendingInventory => {
+                    Err(pplx_space_node_api_client::cluster::PublicationNotCommitted
+                        .into_status("publisher node UID is awaiting inventory synchronization"))
+                }
+                PublicationNode::Denied => Ok(Vec::new()),
+            };
+        }
+        let Some(remote_addr) = remote_addr else {
+            return Ok(Vec::new());
+        };
+        match self
+            .template_releases_store
+            .node_scope_for_address(super::normalize_ip(remote_addr.ip()))
+            .await
+            .map_err(|err| storage_status("resolve publisher nodes", &err))?
+        {
+            TemplateReadScope::NodeScoped { node_ids } => Ok(node_ids),
+            TemplateReadScope::Unscoped => Ok(Vec::new()),
+        }
+    }
+
     pub(super) async fn lock_template_for_publication(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -70,7 +111,7 @@ impl ClusterApiService {
             .bind(name.as_str())
             .fetch_optional(&mut **tx)
             .await
-            .map_err(|err| Status::internal(format!("lock publication owner: {err}")))?
+            .map_err(|err| storage_status("lock publication owner", &err))?
             .ok_or_else(|| Status::not_found("template does not exist"))?;
         let allowed = match publisher {
             TemplateOrg::Owned { org_id } => owner == Some(org_id),
@@ -113,4 +154,43 @@ pub(super) fn system_publication_grant(
 
 pub(super) fn missing_system_publication_grant() -> Status {
     Status::permission_denied("system template publication requires a build publication grant")
+}
+
+/// Tenant counterpart of [`system_publication_grant`]: a publisher whose
+/// tenant authority is limited to dispatched builds must name the grant the
+/// API issued for this build.
+pub(super) fn tenant_publication_grant(
+    value: Option<&str>,
+    owner: TemplateOrg,
+    requires_grant: bool,
+) -> Result<Option<TenantPublicationGrantId>, Status> {
+    match (owner, value) {
+        (TemplateOrg::System, Some(_)) => Err(Status::invalid_argument(
+            "system publication cannot carry a tenant publication grant",
+        )),
+        (_, Some(value)) => value
+            .parse()
+            .map(Some)
+            .map_err(|_| Status::invalid_argument("invalid tenant publication grant ID")),
+        (TemplateOrg::Owned { .. }, None) if requires_grant => {
+            Err(missing_tenant_publication_grant())
+        }
+        (_, None) => Ok(None),
+    }
+}
+
+pub(super) fn missing_tenant_publication_grant() -> Status {
+    Status::permission_denied(
+        "tenant template publication requires the dispatched build's publication grant",
+    )
+}
+
+/// Contention aborts the transaction and permits retrying the publication.
+pub(super) fn storage_status(context: &str, error: &sqlx::Error) -> Status {
+    let message = format!("{context}: {error}");
+    if pplx_space_common_svc::sql::contention::is_lock_contention(error) {
+        pplx_space_node_api_client::cluster::PublicationNotCommitted.into_status(message)
+    } else {
+        Status::internal(message)
+    }
 }
