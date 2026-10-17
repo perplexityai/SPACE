@@ -43,12 +43,13 @@ flowchart TB
     application["Application"]
     api["API"]
     postgres[("PostgreSQL")]
-    controller["Cluster controller"]
-    pod["Kubernetes sandbox pod"]
-    shim["SPACE runtime shim"]
+    %% GitHub draws each node label in a 120px nowrap slot. Keep every line shorter than "Worker services".
+    controller["Cluster<br/>controller"]
+    pod["Kubernetes<br/>sandbox pod"]
+    shim["SPACE<br/>runtime shim"]
     workers["Worker services"]
-    storage[("Object storage<br/>templates / snapshots")]
-    vm["Firecracker microVM"]
+    storage[("Object storage<br/>templates /<br/>snapshots")]
+    vm["Firecracker<br/>microVM"]
     data["Data plane"]
     guest["Guest process"]
 
