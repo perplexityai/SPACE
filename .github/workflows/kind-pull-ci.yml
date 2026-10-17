@@ -25,6 +25,15 @@ on:
       - docker/Dockerfile.kind-sts-bridge
       - templates/firecracker/seed/**
       - templates/firecracker/recipes/seed.toml
+      - crates/libs/api/src/controllers/template.rs
+      - crates/libs/api/src/controllers/template/**
+      - crates/libs/api/src/template_build_jobs_store.rs
+      - crates/libs/build/mgr/**
+      - crates/libs/common/svc/src/auth/build.rs
+      - crates/libs/common/svc/src/auth/build/**
+      - crates/libs/internal/api/server/src/adapter.rs
+      - crates/libs/internal/api/server/src/metadata.rs
+      - crates/libs/internal/api/server/src/template_*.rs
       - crates/libs/sbx/mgr/server/src/service/activation_support.rs
       # Emit the template pull metrics that the Kind restore scenarios assert
       # on, and choose the selector and pull path behind them.
