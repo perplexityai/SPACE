@@ -102,8 +102,6 @@
 "crates/libs/sbx/mgr/server/src/snapshot_restore.rs" = 2150
 "crates/libs/sbx/mgr/server/src/snapshot_upload_jobs.rs" = 1210
 "crates/libs/sbx/mgr/server/src/watchdog.rs" = 2767
-"crates/libs/spaced/guest/server/src/filesystem/router.rs" = 1242
-"crates/libs/spaced/guest/server/src/process.rs" = 2021
 "crates/libs/spaced/host/client/src/lib.rs" = 1040
 "crates/libs/spaced/host/server/src/bridge.rs" = 1249
 "crates/libs/template/mgr/src/db.rs" = 1276

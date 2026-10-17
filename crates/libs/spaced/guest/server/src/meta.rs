@@ -260,7 +260,7 @@ impl BridgeGuestMeta for SpacedGuestService {
     ) -> Result<Response<ConfigureProcessEnvResponse>, Status> {
         let env = parse_env(request.into_inner().env);
         let env_len = env.as_map().len();
-        *self.inner.process_env.write().await = env;
+        self.inner.execution.configure_process_env(env).await;
         tracing::info!(
             command = "bridge_guest_configure_process_env",
             env_len,

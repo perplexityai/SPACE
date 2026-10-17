@@ -1,4 +1,5 @@
 use super::*;
+use tokio::sync::Notify;
 
 #[tokio::test]
 async fn listener_failures_preserve_drain_and_initial_error_priority() {
@@ -220,4 +221,35 @@ async fn bridge_host_retries_preserve_generation_and_do_not_retry_overload() {
         .expect_err("host overload remains visible");
     assert_eq!(error.code(), tonic::Code::ResourceExhausted);
     assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn process_adapter_requires_guest_readiness_and_observes_shutdown() {
+    let shutdown = CancellationToken::new();
+    let service = SpacedGuestService::new(shutdown.clone());
+    let request = || Request::new(ListProcessesRequest {});
+    assert_eq!(
+        Process::list_processes(&service, request())
+            .await
+            .err()
+            .unwrap()
+            .code(),
+        tonic::Code::FailedPrecondition,
+    );
+    service.ready();
+    let mut processes = Process::list_processes(&service, request())
+        .await
+        .unwrap()
+        .into_inner();
+    use futures_util::StreamExt;
+    assert!(processes.next().await.is_none());
+    shutdown.cancel();
+    assert_eq!(
+        Process::list_processes(&service, request())
+            .await
+            .err()
+            .unwrap()
+            .code(),
+        tonic::Code::Unavailable,
+    );
 }

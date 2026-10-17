@@ -16,27 +16,10 @@ pub mod proto {
         pub use super::activity::*;
     }
 
-    pub mod worker {
-        include!(concat!(
-            env!("OUT_DIR"),
-            "/worker/space.spaced.worker.v1.rs"
-        ));
-    }
+    pub use pplx_space_spaced_guest_protocol::proto::{bridge_guest, operations, worker};
+
     pub mod activity {
         tonic::include_proto!("space.spaced.activity.v1");
-    }
-
-    pub mod operations {
-        tonic::include_proto!("space.spaced.operations.v1");
-    }
-
-    pub mod bridge_guest {
-        // SPACED_COMPAT_REMOVE_WHEN_MIN_GUEST_0_1_4: also requires MIN_HOST 0.1.4;
-        // remove this allowance with the generated legacy endpoints.
-        #![allow(deprecated)]
-        tonic::include_proto!("space.spaced.bridge.guest.v1");
-
-        pub use super::operations::*;
     }
 
     pub mod bridge_host {
@@ -65,38 +48,29 @@ pub mod proto {
     }
 }
 
-impl std::fmt::Debug for proto::operations::SendInputRequest {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("SendInputRequest")
-            .field("process_id", &self.process_id)
-            .field("data", &"<redacted>")
-            .finish()
-    }
-}
-
 /// HTTP/2 frame size the spaced channels advertise, so a 64 KiB file chunk
 /// travels as one DATA frame instead of five.
 pub const BULK_HTTP2_MAX_FRAME_SIZE: u32 = 256 * 1024;
 
-pub mod admission_queue;
+pub use pplx_space_spaced_guest_protocol::admission_queue;
 mod compatibility;
 mod error;
-pub mod filesystem_limits;
+pub use pplx_space_spaced_guest_protocol::filesystem_limits;
 pub mod lazy_client;
-pub mod process_limits;
+pub use pplx_space_spaced_guest_protocol::process_limits;
 pub mod retry_policy;
 pub mod server;
 pub mod uds;
-pub mod validate;
+pub use pplx_space_spaced_guest_protocol::validate;
 pub mod vsock;
-mod wire;
+use pplx_space_spaced_guest_protocol::wire;
 
 pub use compatibility::{
     GuestCompatibilityError, SUPPORTED_SPACED_GUEST_VERSIONS, validate_spaced_guest_compatibility,
 };
-pub use error::{ConnectError, invalid_argument_status};
+pub use error::ConnectError;
 pub use lazy_client::{LazyClient, LazyClientLease};
+pub use pplx_space_spaced_guest_protocol::invalid_argument_status;
 pub use retry_policy::{
     DEFAULT_COMMAND_RETRY_POLICY, DEFAULT_CONNECT_RETRY_POLICY, REQUEST_DEADLINE_EXCEEDED_MESSAGE,
     RetryContext, RetryPolicy, retry_status, retry_status_with_context,

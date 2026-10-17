@@ -28,28 +28,25 @@ workspace = true
 # that link this crate for its service types or `test-support` -- the in-VM
 # loopback diagnostic, the spaced host test suites -- would otherwise compile
 # `common-svc`'s Postgres, Redis, and TLS stack to reach code they never call.
-service-entrypoint = ["dep:pplx-space-common-svc"]
+service-entrypoint = ["dep:pplx-space-common-svc", "pplx-space-spaced-guest-execution/telemetry"]
 # Compiles in the test-only environment hooks; never enabled for release builds.
-test-hooks = ["pplx-space-common-core/test-hooks"]
+test-hooks = ["pplx-space-common-core/test-hooks", "pplx-space-spaced-guest-execution/test-hooks"]
 # Forwards to `common-svc`'s telemetry pipeline. The entry point is where
 # this crate initializes telemetry, so the gate has to reach it rather than the
 # binary, and it implies the entry point it configures.
-otel = ["service-entrypoint", "pplx-space-common-svc/otel"]
-datadog = ["otel", "service-entrypoint", "pplx-space-common-svc/datadog"]
+otel = ["service-entrypoint", "pplx-space-common-svc/otel", "pplx-space-spaced-guest-execution/otel"]
+datadog = ["otel", "service-entrypoint", "pplx-space-common-svc/datadog", "pplx-space-spaced-guest-execution/datadog"]
 # Deprecated for one release; use otel and datadog.
 datadog-otel = ["otel", "datadog"]
 # Exposes the in-VM loopback diagnostic without stabilizing runtime internals.
 test-support = []
 
 [dependencies]
-dashmap = { workspace = true }
 futures-util = { version = "0.3" }
-globset = { workspace = true }
 hyper-util = { workspace = true, features = ["tokio"] }
-nix = { workspace = true, features = ["signal", "process", "user", "net", "fs", "term", "time", "poll"] }
+nix = { workspace = true, features = ["signal", "process", "user", "net", "fs", "term", "time"] }
 libc = { workspace = true }
-rustix = { workspace = true, features = ["fs", "process", "pty", "termios"] }
-notify = { workspace = true }
+rustix = { workspace = true, features = ["fs"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time", "io-util", "net", "fs", "process", "sync"] }
 tokio-stream = { workspace = true, features = ["net"] }
 tokio-util = { workspace = true, features = ["codec"] }
@@ -61,6 +58,7 @@ tower = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 
 # internal
+pplx-space-spaced-guest-execution = { workspace = true }
 pplx-space-common-connection-admission = { workspace = true }
 pplx-space-common-core = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
