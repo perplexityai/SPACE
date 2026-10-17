@@ -216,9 +216,33 @@ reads these installation commands from the recipe. The digest sources are:
 The recipe's Python packages are listed in `recipes/code-runtime/pyproject.toml`
 and pinned, with every transitive dependency, to wheel hashes in
 `recipes/code-runtime/uv.lock`. uv installs exactly that set, and an artifact
-outside it fails the build. The lock takes only releases at least a week old.
-After editing the package list, run `uv lock` in that directory; `uv lock
---upgrade` moves every package to its newest eligible release.
+outside it fails the build, as does a lock that is out of date with
+`pyproject.toml`. The lock takes only releases at least a week old. After
+editing the package list, run `uv lock` in that directory; `uv lock --upgrade`
+moves every package to its newest eligible release.
+
+Before installing, uv checks the locked versions against
+[OSV](https://osv.dev/) malware advisories. A match stops the build and names
+the package and version; nothing is installed. Replace that version in a pull
+request:
+
+- If a newer release at least a week old exists, run
+  `uv lock --upgrade-package <name>`.
+- Otherwise exclude the flagged version by adding
+  `constraint-dependencies = ["<name>!=<version>"]` under `[tool.uv]` in
+  `pyproject.toml`, then run `uv lock`. uv selects the newest remaining
+  eligible release.
+- To take a release less than a week old, allow it for that package only with
+  `exclude-newer-package = { <name> = "<timestamp>" }`.
+
+Confirm the new lock passes without installing anything, using the recipe's uv
+version, then rebuild. Do not bypass the check with `UV_MALWARE_CHECK=0`.
+
+```bash
+cd templates/firecracker/recipes/code-runtime
+UV_PREVIEW_FEATURES=malware-check UV_MALWARE_CHECK=1 \
+  uv sync --dry-run --locked --no-build --no-install-project
+```
 
 On x86_64 the recipe's APT packages come from the dated
 [Ubuntu archive snapshot](https://snapshot.ubuntu.com/) in its `APT_SNAPSHOT`,

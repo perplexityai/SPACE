@@ -165,7 +165,13 @@ user = "root"
 #
 # code-runtime/pyproject.toml lists the packages and code-runtime/uv.lock pins
 # every transitive dependency to wheel hashes. uv from step 5 installs exactly
-# that set and rejects any artifact outside it.
+# that set and rejects any artifact outside it. UV_PROJECT_ENVIRONMENT=/usr
+# installs into the system Python, where python, pip, and Jupyter find it, and
+# --inexact leaves the Python packages apt installed in place. --locked fails if
+# uv.lock is out of date with pyproject.toml. The malware check stops the
+# install if OSV lists a locked version as malicious and names that version;
+# --quiet would hide the name. The seed README describes how to pick a
+# replacement.
 
 [[steps]]
 name = "Copy code interpreter package manifest"
@@ -185,10 +191,8 @@ type = "run"
 command = """
 set -eu
 cd /tmp/code-runtime-python
-uv export --quiet --frozen --no-cache --no-emit-project --no-header \
-  --output-file requirements.txt
-uv pip install --quiet --system --break-system-packages --no-cache \
-  --require-hashes --no-deps --only-binary :all: -r requirements.txt
+UV_PREVIEW_FEATURES=malware-check UV_MALWARE_CHECK=1 UV_PROJECT_ENVIRONMENT=/usr \
+  uv sync --locked --no-build --no-install-project --inexact --no-cache
 """
 user = "root"
 
