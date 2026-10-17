@@ -215,6 +215,7 @@ async fn derived_vm_requests_keep_unbound_releases_on_the_legacy_protocol() {
             "sha256:legacy-base".into(),
             None,
             binding.as_ref().map(BuildExecutionBinding::reference),
+            &pplx_space_net_common::NetworkPolicyV1::allow_all(),
         );
         assert!(request.environment.is_none(), "unselected {version}");
         assert_eq!(request.runtime, "fc");
@@ -227,6 +228,7 @@ async fn derived_vm_requests_keep_unbound_releases_on_the_legacy_protocol() {
         "sha256:bound-base".into(),
         None,
         binding.create_environment(false),
+        &pplx_space_net_common::NetworkPolicyV1::allow_all(),
     );
     assert!(
         inherited_e0.environment.is_none(),
@@ -238,6 +240,7 @@ async fn derived_vm_requests_keep_unbound_releases_on_the_legacy_protocol() {
         "sha256:bound-base".into(),
         None,
         binding.create_environment(true),
+        &pplx_space_net_common::NetworkPolicyV1::allow_all(),
     );
     assert_eq!(
         explicit_e0.environment.unwrap().reference,

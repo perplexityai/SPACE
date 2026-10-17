@@ -9,9 +9,10 @@ use futures_util::{FutureExt, TryStream, TryStreamExt};
 use prost::Message;
 
 use pplx_space_build_mgr::{
-    BuildError, BuildOutcome, BuildPhase, PublishError, SystemPublicationGrantId,
-    TemplateBuildErrorKind, TemplateBuilder, TemplateOrg, TemplatePublication,
-    TenantPublicationGrantId, blob, publish_build,
+    BuildError, BuildOutcome, BuildPhase, BuildVmEgressPolicyError, NetworkPolicyV1, PublishError,
+    SystemPublicationGrantId, TemplateBuildErrorKind, TemplateBuilder, TemplateOrg,
+    TemplatePublication, TenantPublicationGrantId, blob, build_vm_egress_policy_from_env,
+    publish_build,
     recipe::{CopyPayload, Recipe, Step},
     register_build_template,
 };
@@ -70,10 +71,14 @@ impl BuildManagerDaemonService {
             .map_err(NewServiceError::OciRegistryConfiguration)?;
         let conn = open_db(db_path).map_err(NewServiceError::OpenDb)?;
         let blob_store = blob::BlobStore::from_env().map_err(NewServiceError::BlobStore)?;
+        let build_vm_network_policy =
+            build_vm_egress_policy_from_env().map_err(NewServiceError::BuildVmEgressPolicy)?;
         Ok(Self::from_backend(
             Arc::new(Mutex::new(conn)),
             max_concurrent_builds,
-            Arc::new(RuntimeBuildBackend),
+            Arc::new(RuntimeBuildBackend {
+                build_vm_network_policy,
+            }),
             blob_store,
         ))
     }
@@ -263,6 +268,8 @@ pub enum NewServiceError {
     OpenDb(#[source] rusqlite::Error),
     #[error("configure build input storage: {0}")]
     BlobStore(#[source] blob::BlobError),
+    #[error("configure build VM egress: {0}")]
+    BuildVmEgressPolicy(#[source] BuildVmEgressPolicyError),
 }
 
 #[async_trait]
@@ -297,7 +304,9 @@ trait BuildBackend: Send + Sync {
     async fn prune_replaced_builds(&self, template_id: &str, keep_hash: &str);
 }
 
-struct RuntimeBuildBackend;
+struct RuntimeBuildBackend {
+    build_vm_network_policy: NetworkPolicyV1,
+}
 
 #[async_trait]
 impl BuildBackend for RuntimeBuildBackend {
@@ -321,6 +330,7 @@ impl BuildBackend for RuntimeBuildBackend {
         TemplateBuilder::new()
             .with_environment(environment)
             .with_caller_org(template_org.map(TemplateOrg::org_id))
+            .with_network_policy(self.build_vm_network_policy.clone())
             .build_prepared(recipe_label, recipe, template_id, job_id)
             .await
     }

@@ -4,6 +4,8 @@ use super::{
     oci_source_message, template_guest_runtime_metadata,
 };
 use pplx_space_common_core::types::{ContentHash, TemplateBuildId, TemplateMetadata, TemplateName};
+use pplx_space_net_common::proto::NetworkPolicyV1 as NetworkPolicyV1Proto;
+use pplx_space_net_common::{EgressDestinationV1, NetworkPolicyV1};
 use rstest::{fixture, rstest};
 
 const HASH: &str = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -49,11 +51,14 @@ fn oci_template_metadata_tracks_the_guest_installed_during_assembly(
 
 #[test]
 fn build_vm_create_request_pins_resolved_base_hash() {
+    let mut network_policy = NetworkPolicyV1::allow_all();
+    network_policy.egress.deny = vec![EgressDestinationV1::Cidr("10.0.0.0/8".parse().unwrap())];
     let request = build_vm_create_request(
         "code-runtime".to_string(),
         HASH.to_string(),
         Some(20 * 1024),
         None,
+        &network_policy,
     );
 
     assert_eq!(request.template, "code-runtime");
@@ -61,6 +66,10 @@ fn build_vm_create_request_pins_resolved_base_hash() {
     assert_eq!(request.rootfs_size_mb, Some(20 * 1024));
     assert_eq!(request.owner, BUILDER_SANDBOX_OWNER.as_str());
     assert_eq!(request.route_identity, None);
+    assert_eq!(
+        request.network_policy,
+        Some(NetworkPolicyV1Proto::from(&network_policy))
+    );
 }
 
 #[test]

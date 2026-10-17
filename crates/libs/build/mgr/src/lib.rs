@@ -2,6 +2,7 @@ use pplx_space_common_core::types::{JobId, OrgId};
 
 pub mod blob;
 mod blob_storage;
+mod egress;
 mod environment;
 mod execution_binding;
 pub mod object_store;
@@ -32,7 +33,7 @@ use pplx_space_common_core::{
 };
 use pplx_space_common_svc::page_cache;
 pub use pplx_space_metrics::template::TemplateBuildErrorKind;
-use pplx_space_net_common::NetworkPolicyV1;
+pub use pplx_space_net_common::NetworkPolicyV1;
 use pplx_space_net_common::proto::NetworkPolicyV1 as NetworkPolicyV1Proto;
 use pplx_space_node_mgr_client::proto::{
     CompletePreparedRootfsRequest, PreparedRootfsDisposition, ReservePreparedRootfsRequest,
@@ -45,6 +46,7 @@ use pplx_space_template_mgr_client::proto::{
 use tempfile::TempDir;
 use tracing::Instrument as _;
 
+pub use egress::{BuildVmEgressPolicyError, build_vm_egress_policy_from_env};
 use environment::StepEnvironment;
 pub use environment::{BuildEnvironmentError, PreparedRecipe};
 use execution_binding::BuildExecutionBinding;
@@ -95,6 +97,7 @@ use pplx_space_common_core::types::TemplateMetadata;
 pub struct TemplateBuilder {
     caller_org: Option<OrgId>,
     environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    network_policy: NetworkPolicyV1,
 }
 
 struct ScratchScriptBundle {
@@ -508,6 +511,7 @@ fn build_vm_create_request(
     base_content_hash: String,
     rootfs_size_mb: Option<u32>,
     environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    network_policy: &NetworkPolicyV1,
 ) -> CreateRequest {
     let mut request = CreateRequest {
         environment: None,
@@ -525,11 +529,12 @@ fn build_vm_create_request(
         env: Default::default(),
         auto_lifecycle: None,
         rootfs_size_mb,
-        // Build VMs need unrestricted egress to fetch packages, install
+        // Build VMs need internet egress to fetch packages, install
         // language toolchains, etc. The base template (e.g. seed) has a
         // deny_all default policy meant for end-user sandboxes; without
         // this override, apt-get and curl inside the build VM time out.
-        network_policy: Some(NetworkPolicyV1Proto::from(&NetworkPolicyV1::allow_all())),
+        // The policy is set at create, before any recipe step runs.
+        network_policy: Some(NetworkPolicyV1Proto::from(network_policy)),
         network_policy_generation: 0,
         network_policy_authority: PolicyAuthority::Local.as_proto_i32(),
         auto_lifecycle_authority: PolicyAuthority::Cluster.as_proto_i32(),
@@ -584,7 +589,14 @@ impl TemplateBuilder {
         Self {
             caller_org: None,
             environment: None,
+            network_policy: NetworkPolicyV1::allow_all(),
         }
+    }
+
+    /// Egress policy for the build VM; see [`build_vm_egress_policy_from_env`].
+    pub fn with_network_policy(mut self, network_policy: NetworkPolicyV1) -> Self {
+        self.network_policy = network_policy;
+        self
     }
 
     pub fn with_environment(
@@ -815,6 +827,7 @@ impl TemplateBuilder {
                 execution_binding
                     .as_ref()
                     .and_then(|binding| binding.create_environment(self.environment.is_some())),
+                &self.network_policy,
             );
             Ok::<String, BuildError>(
                 pplx_space_sbx_mgr_client::environment::create(&mut sbx, request)
