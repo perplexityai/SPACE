@@ -778,6 +778,7 @@ pub(crate) fn reclaim_fixture_payload(
         metadata_staging_dir: None,
         includes_metadata_job: true,
         deferred_metadata: false,
+        execution_generation: None,
     }
 }
 

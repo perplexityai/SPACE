@@ -124,6 +124,7 @@ async fn teardown_reuses_ready_backup_but_waits_for_active_local_upload() {
                     },
                     artifact: &artifact,
                     format: SuspendSnapshotFormat::Full,
+                    origin: super::TeardownBackupOrigin::Captured,
                 },
             );
             if active_upload {

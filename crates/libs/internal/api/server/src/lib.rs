@@ -48,9 +48,9 @@ use tonic::{Request, Response, Status};
 use pplx_space_common_core::node_drain_signals::EVACUATION_RESTORE_READY_CHANNEL;
 use pplx_space_common_core::types::{
     ArtifactKind, ArtifactOrigin, AutoLifecyclePolicy, BackupAttemptId, Digest, ExactStorageUri,
-    LocalArtifactId, NodeId, NodeRole as SpaceNodeRole, OrgId, RuntimeKind, SandboxId,
-    SnapshotArtifact as SnapshotArtifactFile, SnapshotContentHash, SnapshotId, SnapshotKind,
-    SnapshotName, SnapshotState, SubstrateKind, TemplateName,
+    ExecutionGeneration, LocalArtifactId, NodeId, NodeRole as SpaceNodeRole, OrgId, RuntimeKind,
+    SandboxId, SnapshotArtifact as SnapshotArtifactFile, SnapshotContentHash, SnapshotId,
+    SnapshotKind, SnapshotName, SnapshotState, SubstrateKind, TemplateName,
 };
 use pplx_space_common_svc::types::{
     FACET_NETWORK_POLICY, FACET_NODE_STATUS, FACET_SANDBOX_DESIRED_STATE, FACET_SANDBOX_INVENTORY,
@@ -430,6 +430,8 @@ enum BackupReadiness {
     Artifact(LocalArtifactId, ArtifactKind),
     /// An unpinned cache's suspend attempt is still the latest ready one.
     LatestReadySuspend(SnapshotId),
+    /// The sandbox is durably restorable from a ready snapshot.
+    DurablyRestorable,
 }
 
 fn parse_artifact_backup_query(
@@ -476,6 +478,10 @@ fn parse_artifact_backup_query(
                     ))
                 },
             )?)
+        }
+        Some(Artifact::DurablyRestorable(true)) => BackupReadiness::DurablyRestorable,
+        Some(Artifact::DurablyRestorable(false)) => {
+            return Err(Status::invalid_argument("durably_restorable must be true"));
         }
         None => {
             return Err(Status::invalid_argument(
@@ -912,6 +918,11 @@ impl ClusterApiService {
             )));
         }
         let execution_metadata = snapshot_execution_metadata(req.execution.as_ref())?;
+        let execution_generation = req
+            .execution_generation
+            .map(ExecutionGeneration::new)
+            .transpose()
+            .map_err(|e| Status::invalid_argument(format!("invalid execution_generation: {e}")))?;
         let sandbox = self.lookup_snapshot_sandbox(sandbox_id).await?;
         let snapshot = sandbox
             .new_snapshot(
@@ -929,9 +940,38 @@ impl ClusterApiService {
             .await
             .map_err(|e| Status::internal(format!("begin tx: {e}")))?;
 
-        let persisted = snapshot_store::insert(&mut tx, &snapshot)
+        let (persisted, outcome) = snapshot_store::insert(&mut tx, &snapshot)
             .await
             .map_err(snapshot_insert_status)?;
+        // Only a capture's first registration is fenced. Refusing a replay
+        // would fail an upload the API's own suspend may be waiting on. A
+        // fresh attempt for bytes an earlier attempt already registered is a
+        // retry of a capture the control plane admitted while its execution
+        // was current, which started recovery may be restoring from, so it
+        // registers too. A row registered before the fence was deployed, or
+        // without a generation, replays unfenced. The fence runs before the
+        // source-node check: a superseded generation is superseded on every
+        // node, so a stale runtime on a node the sandbox has since moved off
+        // still learns so and releases itself instead of retrying a
+        // permission refusal.
+        if outcome == snapshot_store::InsertOutcome::Created
+            && let Some(execution_generation) = execution_generation
+            && !snapshot_store::artifact_registered_by_another_attempt(
+                &mut *tx,
+                sandbox_id,
+                local_artifact_id,
+                persisted.id(),
+            )
+            .await
+            .map_err(|e| Status::internal(format!("backup registration lookup: {e}")))?
+        {
+            backup_generation_fence::refuse_superseded_backup_execution(
+                &mut tx,
+                sandbox_id,
+                execution_generation,
+            )
+            .await?;
+        }
         // Authorize on the persisted row: a replay stays bound to the node
         // that registered the attempt even after retirement or relocation,
         // and a read before the transaction could see a row retention
@@ -1046,7 +1086,9 @@ impl ClusterApiService {
     /// Answer a readiness query with `ready` alone. Former hosts retain local
     /// caches after placement moves, so any registered node may ask about an
     /// identity it already holds; location reads stay placement-scoped, and
-    /// eviction needs no storage credentials.
+    /// eviction needs no storage credentials. The durably-restorable query
+    /// names only the sandbox, so it tells any registered node whether a
+    /// sandbox it names exists and is restorable, and nothing more.
     async fn artifact_backup_readiness(
         &self,
         sandbox_id: SandboxId,
@@ -1056,6 +1098,8 @@ impl ClusterApiService {
         if node_ids.is_empty() {
             return Err(Status::permission_denied("caller is not a registered node"));
         }
+        let readiness_error =
+            |e: &dyn std::fmt::Display| Status::internal(format!("artifact backup readiness: {e}"));
         let ready = match readiness {
             BackupReadiness::Artifact(local_artifact_id, artifact_kind) => {
                 snapshot_store::artifact_backup_ready(
@@ -1065,12 +1109,19 @@ impl ClusterApiService {
                     artifact_kind,
                 )
                 .await
+                .map_err(|e| readiness_error(&e))?
             }
             BackupReadiness::LatestReadySuspend(snapshot_id) => {
-                snapshot_store::is_latest_ready_suspend(&self.pool, sandbox_id, snapshot_id).await
+                snapshot_store::is_latest_ready_suspend(&self.pool, sandbox_id, snapshot_id)
+                    .await
+                    .map_err(|e| readiness_error(&e))?
             }
-        }
-        .map_err(|e| Status::internal(format!("artifact backup readiness: {e}")))?;
+            BackupReadiness::DurablyRestorable => {
+                pplx_space_sandbox_store::durably_restorable(&self.pool, sandbox_id)
+                    .await
+                    .map_err(|e| readiness_error(&e))?
+            }
+        };
         Ok(Response::new(GetArtifactBackupLocationResponse {
             ready: Some(ready),
             ..Default::default()
@@ -1614,6 +1665,7 @@ fn normalize_ip(value: IpAddr) -> IpAddr {
 
 mod adapter;
 mod auto_lifecycle_delete_completions;
+mod backup_generation_fence;
 mod metadata;
 mod node_local_backup_pending;
 mod publish;

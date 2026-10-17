@@ -1,7 +1,8 @@
 use super::{
-    GetSnapshotError, InsertSnapshotError, NewSnapshot, RecordArtifactDigestsError,
-    SnapshotArtifact, SnapshotArtifactDigest, artifact_digests, delete_snapshot_catalog, get,
-    insert, record_artifact_digests,
+    GetSnapshotError, InsertOutcome, InsertSnapshotError, NewSnapshot, RecordArtifactDigestsError,
+    SnapshotArtifact, SnapshotArtifactDigest, artifact_digests,
+    artifact_registered_by_another_attempt, delete_snapshot_catalog, get, insert,
+    record_artifact_digests,
 };
 use jiff::Timestamp;
 use pplx_space_common_core::sql;
@@ -198,7 +199,8 @@ async fn snapshot_catalog_store_contract() -> TestResult {
     };
     let snapshot = make_snapshot(expected_uri.clone());
     let mut insert_tx = db.pool.begin().await?;
-    let inserted = insert(&mut insert_tx, &snapshot).await?;
+    let (inserted, outcome) = insert(&mut insert_tx, &snapshot).await?;
+    assert_eq!(outcome, InsertOutcome::Created);
     assert_eq!(inserted.id(), inserted_snapshot_id);
     assert_eq!(
         inserted
@@ -210,7 +212,8 @@ async fn snapshot_catalog_store_contract() -> TestResult {
     insert_tx.commit().await?;
 
     let mut retry_tx = db.pool.begin().await?;
-    let retried = insert(&mut retry_tx, &snapshot).await?;
+    let (retried, outcome) = insert(&mut retry_tx, &snapshot).await?;
+    assert_eq!(outcome, InsertOutcome::AlreadyRegistered);
     assert_eq!(retried, inserted);
     retry_tx.commit().await?;
 
@@ -436,5 +439,61 @@ async fn artifact_digests_follow_their_snapshot() -> TestResult {
     assert!(delete_snapshot_catalog(&mut tx, snapshot_id).await?);
     tx.commit().await?;
     assert!(artifact_digests(&db.pool, snapshot_id).await?.is_empty());
+    Ok(())
+}
+
+/// A registration of the same bytes by any other attempt counts, whatever its
+/// state; the asking attempt itself and other artifacts of the sandbox don't.
+#[tokio::test(flavor = "current_thread")]
+async fn another_attempts_registration_of_an_artifact_is_found() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let sandbox_id = SandboxId::new();
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (id, user_id, org_id, network_policy_generation)
+         VALUES ($1, $2::UUID, $3::UUID, 1)"
+    ))
+    .bind(sandbox_id)
+    .bind(SEEDED_USER_ID)
+    .bind(SEEDED_ORG_ID)
+    .execute(&db.pool)
+    .await?;
+    let artifact = LocalArtifactId::new();
+    let other_artifact = LocalArtifactId::new();
+    let earlier = SnapshotId::new();
+    let asking = SnapshotId::new();
+    for (id, local_artifact_id, state) in [
+        (earlier, artifact, "failed"),
+        (asking, artifact, "creating"),
+        (SnapshotId::new(), other_artifact, "ready"),
+    ] {
+        sqlx::query(sql!(
+            "INSERT INTO snapshots (
+                 id, sandbox_id, type, state, local_artifact_id, artifact_kind, artifact_origin
+             )
+             VALUES ($1, $2, 'full', $3, $4, 'full', 'suspend')"
+        ))
+        .bind(id.as_uuid())
+        .bind(sandbox_id)
+        .bind(state)
+        .bind(local_artifact_id.as_uuid())
+        .execute(&db.pool)
+        .await?;
+    }
+
+    assert!(artifact_registered_by_another_attempt(&db.pool, sandbox_id, artifact, asking).await?);
+    assert!(
+        artifact_registered_by_another_attempt(&db.pool, sandbox_id, artifact, earlier).await?,
+        "from the earlier attempt's side, the later one counts"
+    );
+    sqlx::query(sql!("DELETE FROM snapshots WHERE id = $1"))
+        .bind(earlier.as_uuid())
+        .execute(&db.pool)
+        .await?;
+    assert!(
+        !artifact_registered_by_another_attempt(&db.pool, sandbox_id, artifact, asking).await?,
+        "neither the asking attempt nor another artifact's row counts"
+    );
     Ok(())
 }

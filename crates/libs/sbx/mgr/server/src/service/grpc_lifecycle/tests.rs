@@ -1222,6 +1222,7 @@ async fn permanently_refused_teardown_backup_marks_the_suspending_row_terminal()
                     execution_generation,
                     artifact: &artifact,
                     format: SuspendSnapshotFormat::Full,
+                    origin: super::TeardownBackupOrigin::Captured,
                 },
             )
             .await
@@ -1588,15 +1589,17 @@ async fn teardown_suspend_registration_failure_closes_only_the_requested_generat
     let failed_artifact = insert_stranded_teardown_suspend_sandbox(&conn, sandbox_id, generation);
     let service = SandboxManagerService::for_test(conn);
     let missing = teardown_artifact_backup_status(
-        ArtifactBackupSubmissionError::Begin(pplx_space_common_jobs::JobError::permanent(
-            "registration refused",
-        )),
+        ArtifactBackupSubmissionError::Begin {
+            error: pplx_space_common_jobs::JobError::permanent("registration refused"),
+            superseded_generation: None,
+        },
         failed_artifact,
     );
     let transient = teardown_artifact_backup_status(
-        ArtifactBackupSubmissionError::Begin(pplx_space_common_jobs::JobError::retriable(
-            "connection unavailable",
-        )),
+        ArtifactBackupSubmissionError::Begin {
+            error: pplx_space_common_jobs::JobError::retriable("connection unavailable"),
+            superseded_generation: None,
+        },
         failed_artifact,
     );
     service

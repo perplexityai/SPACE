@@ -311,7 +311,8 @@ edge_table! {
     /// The eviction claims: `claim_stopped_sandbox_for_eviction`,
     /// `claim_suspended_sandbox_for_eviction`,
     /// `claim_failed_restoring_sandbox_for_eviction`,
-    /// `claim_teardown_suspend_failed_sandbox_for_eviction` and
+    /// `claim_teardown_suspend_failed_sandbox_for_eviction`,
+    /// `claim_retired_teardown_execution_for_release` and
     /// `claim_quarantined_sandbox_for_eviction`.
     EVICTION_CLAIM: Request,
         of(&[Stopped, Suspended, Restoring, Suspending, Quarantined]) => Deleting;

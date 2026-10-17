@@ -237,6 +237,11 @@ pub(crate) enum EvictReason {
     /// regardless of backup state. Driven by node-ctl's desired-state
     /// facet sync, not by this loop.
     ClusterRowAbsent,
+    /// The cluster refused a teardown suspend's backup because it had retired
+    /// the execution that captured it. The capture belongs to a runtime no
+    /// restore can adopt, so it's discarded unpublished. Driven by the
+    /// teardown driver, not by this loop.
+    ExecutionRetired,
 }
 
 impl EvictReason {
@@ -244,6 +249,7 @@ impl EvictReason {
         match self {
             EvictReason::LatestBackedIdle => "latest_backed_idle",
             EvictReason::ClusterRowAbsent => "cluster_row_absent",
+            EvictReason::ExecutionRetired => "execution_retired",
         }
     }
 }
@@ -277,6 +283,15 @@ pub(crate) enum SkipReason {
     /// The cluster dependency is unavailable for the whole scan. Retain the
     /// cursor and retry the same oldest candidate next tick.
     RpcTransportError,
+    /// A retired execution's teardown release is held because another local
+    /// artifact of the sandbox still awaits its backup; the release would
+    /// delete those bytes too. Counted by the teardown driver, not this loop.
+    LocalArtifactAwaitingBackup,
+    /// A retired execution's teardown release is held because the cluster
+    /// can't show the sandbox is durably restorable: the refused capture may
+    /// be its only copy. Counted by the teardown driver,
+    /// not this loop.
+    NoBackedCopy,
 }
 
 impl SkipReason {
@@ -292,6 +307,8 @@ impl SkipReason {
             SkipReason::LocalReadError => "local_read_error",
             SkipReason::RpcError => "rpc_error",
             SkipReason::RpcTransportError => "rpc_transport_error",
+            SkipReason::LocalArtifactAwaitingBackup => "local_artifact_awaiting_backup",
+            SkipReason::NoBackedCopy => "no_backed_copy",
         }
     }
 
@@ -963,6 +980,55 @@ pub(crate) fn emit_eviction_event(
     );
 }
 
+/// Report how a local eviction attempt ended. Success counts it and emits
+/// `LocalEvictionCompleted`; a lost claim race (`FailedPrecondition`,
+/// `NotFound`) changed nothing and reports nothing; any other failure is
+/// counted, logged with the caller's `failure_message` and emitted as
+/// `LocalEvictionFailed`. A failure after the claim leaves the row in
+/// `deleting` for cleanup retry. `details` carries the caller's shared event
+/// fields.
+pub(crate) fn report_eviction_outcome(
+    sandbox_id: &str,
+    reason: EvictReason,
+    details: pplx_space_events::SandboxEventDetails,
+    result: &Result<(), tonic::Status>,
+    failure_message: &'static str,
+) {
+    let details = details.reason(reason.as_str());
+    match result {
+        Ok(()) => {
+            pplx_space_metrics::sandbox_eviction::evicted(reason.as_str());
+            emit_eviction_event(
+                sandbox_id,
+                pplx_space_events::SandboxEventType::LocalEvictionCompleted,
+                details,
+            );
+        }
+        Err(status)
+            if matches!(
+                status.code(),
+                tonic::Code::FailedPrecondition | tonic::Code::NotFound
+            ) => {}
+        Err(status) => {
+            pplx_space_metrics::sandbox_eviction::failed();
+            warn!(
+                sandbox_id,
+                reason = reason.as_str(),
+                code = %status.code(),
+                message = %status.message(),
+                "{failure_message}",
+            );
+            emit_eviction_event(
+                sandbox_id,
+                pplx_space_events::SandboxEventType::LocalEvictionFailed,
+                details
+                    .error(status.message().to_string())
+                    .logged_by_caller(),
+            );
+        }
+    }
+}
+
 /// Check the cluster for a ready backup of **exactly** the pinned
 /// artifact id without reading its storage location. On success the
 /// local `backup_completed_at` marker is stamped best-effort so the
@@ -1035,6 +1101,21 @@ async fn ready_unpinned_suspend_generation(
     let artifact = Artifact::LatestReadySuspendSnapshotId(job.snapshot_id.to_string());
     let ready = backup_ready(cluster, sandbox_id, artifact).await?;
     Ok(ready.then_some(job.snapshot_id))
+}
+
+/// Whether the cluster shows `sandbox_id` is durably restorable from a ready
+/// snapshot the restore would select. A failure to get the answer is the
+/// classified reason, so a caller can tell an unreachable cluster-api from a
+/// sandbox that isn't restorable.
+pub(crate) async fn sandbox_has_backed_copy(sandbox_id: &str) -> Result<bool, SkipReason> {
+    use pplx_space_node_api_client::proto::backup_readiness_query::Artifact;
+    let mut cluster = pplx_space_node_api_client::cluster::connect_from_env()
+        .await
+        .map_err(|error| {
+            warn!(sandbox_id, %error, "backed-copy check could not reach cluster-api");
+            SkipReason::RpcTransportError
+        })?;
+    backup_ready(&mut cluster, sandbox_id, Artifact::DurablyRestorable(true)).await
 }
 
 /// Ask the cluster whether an identity this node already holds is backed

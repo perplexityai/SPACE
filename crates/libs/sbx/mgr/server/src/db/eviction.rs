@@ -243,3 +243,119 @@ pub fn claim_teardown_suspend_failed_sandbox_for_eviction(
     tx.commit()?;
     Ok(changed == 1)
 }
+
+/// Claim a `suspending` row whose teardown suspend the control plane refused
+/// because it had retired the execution, so the runtime and its unpublished
+/// capture can be released.
+///
+/// The CAS re-asserts the identity the refusal was about: still `suspending`,
+/// still pinning the exact artifact that execution staged, and its teardown
+/// job still running for that generation. A newer activation can't satisfy it:
+/// reaching one rewrites the state, the pin and the job together. Unlike the
+/// cluster-deleted claim there is no quiescence window: the refusal names the
+/// generation, so it's authority about this execution, not an inference from
+/// an absent row.
+///
+/// The release deletes the sandbox's whole local presence with no backup
+/// proof, which is right only for the refused capture itself. So the claim
+/// also refuses while any other local artifact of the sandbox is still
+/// awaiting its backup: that row keeps waiting rather than lose bytes nothing
+/// else holds.
+///
+/// A claim that wins also cancels the refused capture's upload job if it's
+/// still live, as it is when the drive met the refusal itself: a pending job
+/// would otherwise register the discarded capture later, should the control
+/// plane stop refusing it. A job already running isn't stopped (see
+/// `cancel_live_upload_job`).
+pub fn claim_retired_teardown_execution_for_release(
+    conn: &Connection,
+    id: &str,
+    execution_generation: ExecutionGeneration,
+    staged_artifact: LocalArtifactId,
+) -> Result<bool> {
+    let tx = immediate_transaction(conn)?;
+    if !teardown_suspend_operation_running_for(&tx, id, execution_generation)? {
+        tx.commit()?;
+        return Ok(false);
+    }
+    let changed = tx.execute(
+        "UPDATE sandboxes
+         SET state = 'deleting',
+             state_changed_at = ?1,
+             updated_at = ?1
+         WHERE id = ?2 AND state = 'suspending'
+           AND current_local_artifact_id = ?3
+           AND NOT EXISTS (
+               SELECT 1 FROM local_artifacts a
+                WHERE a.sandbox_id = ?2
+                  AND a.local_artifact_id <> ?3
+                  AND a.backup_completed_at IS NULL
+           )",
+        params![now()?, id, staged_artifact.to_string()],
+    )?;
+    if changed == 1 {
+        teardown_jobs::fail_active(&tx, id, TeardownSuspendFailure::Deleting)?;
+        cancel_live_upload_job(&tx, staged_artifact)?;
+    }
+    tx.commit()?;
+    Ok(changed == 1)
+}
+
+/// Cancel `artifact`'s snapshot-upload job if it's still live. A pending job
+/// is cancelled outright and never runs. A running one is only marked
+/// `cancelling`: its worker records it cancelled once it returns, but an
+/// attempt already past its registration isn't interrupted.
+fn cancel_live_upload_job(conn: &Connection, artifact: LocalArtifactId) -> Result<()> {
+    use pplx_space_common_jobs::{JobStatus, db as jobs};
+    let Some(job) = jobs::find_job_by_dedup_key(
+        conn,
+        crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
+        &artifact.to_string(),
+    )?
+    else {
+        return Ok(());
+    };
+    if job.is_terminal() {
+        return Ok(());
+    }
+    jobs::request_job_cancellation(conn, &job.job_id)?;
+    if job.status == JobStatus::Pending.as_str() {
+        jobs::mark_job_cancelled(conn, &job.job_id)?;
+    }
+    Ok(())
+}
+
+/// Whether a local artifact of the sandbox other than `staged_artifact` still
+/// awaits its backup: the condition that holds
+/// [`claim_retired_teardown_execution_for_release`] back.
+pub fn other_local_artifact_awaits_backup(
+    conn: &Connection,
+    id: &str,
+    staged_artifact: LocalArtifactId,
+) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS (
+             SELECT 1 FROM local_artifacts
+              WHERE sandbox_id = ?1
+                AND local_artifact_id <> ?2
+                AND backup_completed_at IS NULL
+         )",
+        params![id, staged_artifact.to_string()],
+        |row| row.get(0),
+    )
+}
+
+/// Whether this generation's teardown-suspend job is still running: the other
+/// half of what [`claim_retired_teardown_execution_for_release`] requires.
+pub fn teardown_suspend_operation_running_for(
+    conn: &Connection,
+    id: &str,
+    execution_generation: ExecutionGeneration,
+) -> Result<bool> {
+    Ok(
+        active_teardown_suspend_operation(conn, id)?.is_some_and(|operation| {
+            operation.execution_generation == execution_generation
+                && operation.status == TeardownSuspendOperationStatus::Running
+        }),
+    )
+}

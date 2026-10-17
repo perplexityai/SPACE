@@ -3886,6 +3886,7 @@ async fn placed_sandbox_locations_resolve_for_its_node_only() -> TestResult {
         exact(suspend_artifact, full),
         exact(disk_artifact, disk),
         Artifact::LatestReadySuspendSnapshotId(suspend_attempt.to_string()),
+        Artifact::DurablyRestorable(true),
     ] {
         assert!(check(sandbox_id, artifact.clone(), Some(worker_a_ip)).await?);
         assert!(!check(SandboxId::new(), artifact.clone(), Some(worker_a_ip)).await?);
@@ -3929,6 +3930,7 @@ async fn placed_sandbox_locations_resolve_for_its_node_only() -> TestResult {
                 "invalid".to_string(),
             )),
         ),
+        readiness(sandbox_id, Some(Artifact::DurablyRestorable(false))),
         readiness(
             sandbox_id,
             Some(Artifact::LocalArtifact(LocalArtifactBackupIdentity {
@@ -4721,6 +4723,7 @@ async fn begin_artifact_backup_from_node(
                 artifact_origin: artifact_origin as i32,
                 snapshot_name: None,
                 execution: Some(test_snapshot_execution()),
+                execution_generation: None,
             },
             node_ip,
         ))
@@ -4753,6 +4756,7 @@ async fn begin_artifact_backup_with_storage_uri(
                 artifact_origin: input.artifact_origin as i32,
                 snapshot_name: input.snapshot_name,
                 execution: Some(test_snapshot_execution()),
+                execution_generation: None,
             },
             TEST_WORKER_IP,
         ))
@@ -5543,6 +5547,7 @@ async fn begin_artifact_backup_rejects_missing_execution_metadata() -> TestResul
             artifact_origin: pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Stop as i32,
             snapshot_name: None,
             execution: None,
+            execution_generation: None,
         }))
         .await
         .expect_err("begin without execution metadata must be rejected");
@@ -7164,6 +7169,7 @@ async fn a_missing_templates_table_degrades_end_to_end() -> TestResult {
     Ok(())
 }
 
+mod backup_generation_fence;
 mod publication;
 
 #[tokio::test(flavor = "current_thread")]

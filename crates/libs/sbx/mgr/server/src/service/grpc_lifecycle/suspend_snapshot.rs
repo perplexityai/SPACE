@@ -1093,6 +1093,7 @@ impl SandboxManagerService {
                         execution_generation,
                         artifact: &staged_artifact,
                         format: published_format,
+                        origin: TeardownBackupOrigin::Captured,
                     },
                 )
                 .await?;
@@ -1106,15 +1107,13 @@ impl SandboxManagerService {
             let upload_queue_started_at = std::time::Instant::now();
             if durability == SuspendDurability::NodeLocal {
                 let enqueue_result = self
-                    .enqueue_suspend_artifact_backup(
+                    .enqueue_node_local_suspend_backup(
                         &sandbox,
                         local_artifact_id,
                         &snapshot_dir_string,
                         published_format,
-                        None,
                     )
-                    .await
-                    .map_err(|error| artifact_backup_fence_status(error.to_string()));
+                    .await;
                 self.require_node_local_backup_handoff(&sandbox.id, local_artifact_id, enqueue_result)?;
             }
             pplx_space_metrics::snapshot::create_step(

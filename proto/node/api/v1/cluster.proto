@@ -1042,6 +1042,20 @@ message BeginArtifactBackupRequest {
   // Exact source environment encoded in the artifact metadata sidecar.
   // Required: the server rejects a request without it as INVALID_ARGUMENT.
   space.execution.v1.ExecutionMetadata execution = 8;
+  // Kubernetes execution generation whose runtime captured the artifact: a
+  // teardown suspend's own capture (the API's generation-bound suspend
+  // included), a node-local suspend, or a backup requested again by local
+  // artifact id, which carries the generation of that artifact's earlier
+  // upload. When set, the server refuses the first registration of a local
+  // artifact whose generation was superseded: a newer execution is active or
+  // has materialized a pod, or this generation's execution was retired as
+  // replaced. So a runtime no restore can adopt (e.g. a reaped orphaned
+  // restore pod's VM) can't register a snapshot. The fence covers
+  // registration only: an admitted attempt can still finalize, a replay of an
+  // already-registered attempt isn't re-fenced, and a fresh attempt for bytes
+  // an earlier attempt registered is a retry and isn't fenced either. Unset
+  // for backups that aren't bound to one execution.
+  optional int64 execution_generation = 9;
 }
 
 message BeginArtifactBackupResponse {
@@ -1102,6 +1116,14 @@ message BackupReadinessQuery {
     // An unpinned cache's suspend attempt. Ready only while it is still the
     // latest ready full suspend, not merely an older attempt with a backup.
     string latest_ready_suspend_snapshot_id = 2;
+    // Ready when the sandbox is durably restorable from a ready snapshot the
+    // restore would select: a restoring one needs a source in its retry
+    // window, any other one marked to a local artifact that artifact's ready
+    // backup, and an unmarked one a ready newest full snapshot (fresher than
+    // its last placement change unless it is marked for evacuation). Unlike the
+    // other two, it names no identity the caller holds, so any registered node
+    // learns whether a sandbox it names is restorable. Must be true.
+    bool durably_restorable = 3;
   }
 }
 
