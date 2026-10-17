@@ -58,6 +58,36 @@ pub fn trace_grpc_client_transport<S>(inner: S) -> GrpcClientTrace<S> {
     GrpcClientTraceLayer.layer(inner)
 }
 
+/// One call's answer that its caller handles as a routine outcome, attached as
+/// a request extension when only the caller knows the code is expected, as a
+/// poll that is refused until the callee is ready. That call's client span
+/// records the code as success. Codes that report a platform failure, such as
+/// UNAVAILABLE or INTERNAL, stay errors even when marked.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExpectedGrpcStatus(tonic::Code);
+
+impl ExpectedGrpcStatus {
+    pub fn new(code: tonic::Code) -> Self {
+        Self(code)
+    }
+
+    /// Mark `request` so its client span treats this code as expected.
+    pub fn mark<T>(self, request: &mut tonic::Request<T>) {
+        request.extensions_mut().insert(self);
+    }
+
+    fn honored(self) -> Option<tonic::Code> {
+        (self.0 != tonic::Code::Ok && !grpc_status_is_error(self.0)).then_some(self.0)
+    }
+}
+
+fn expected_status_for<B>(request: &Request<B>) -> Option<tonic::Code> {
+    request
+        .extensions()
+        .get::<ExpectedGrpcStatus>()
+        .and_then(|expected| expected.honored())
+}
+
 const WORKER_API_SPACED_STAT_PATH: &str = "/space.node.api.v1.WorkerApi/SpacedStat";
 const WORKER_API_SPACED_PREFIX: &str = "/space.node.api.v1.WorkerApi/Spaced";
 
@@ -79,6 +109,10 @@ impl MakeClassifier for GrpcClientMakeClassifier {
             GrpcErrorsAsFailures::new().with_success(GrpcCode::NotFound)
         } else {
             GrpcErrorsAsFailures::new()
+        };
+        let inner = match expected_status_for(request) {
+            Some(code) => inner.with_success(GrpcCode::from(code as i32)),
+            None => inner,
         };
         GrpcClientClassifier {
             inner,
@@ -298,8 +332,12 @@ impl<B> MakeSpan<B> for GrpcClientMakeSpan {
             rpc.grpc.status_code = tracing::field::Empty,
             space.grpc.expected_not_found = grpc_client_not_found_is_expected(path),
             space.grpc.expected_application_status = grpc_client_application_statuses_are_expected(path),
+            space.grpc.expected_status = tracing::field::Empty,
             untraced_caller = tracing::field::Empty,
         );
+        if let Some(code) = expected_status_for(request) {
+            span.record("space.grpc.expected_status", tracing::field::debug(code));
+        }
         if !traced_caller {
             // A call no traced request made, such as a periodic poll: recorded
             // for stats and a failure, not sampled, and the server inherits

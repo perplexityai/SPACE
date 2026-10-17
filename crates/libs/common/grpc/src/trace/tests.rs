@@ -327,3 +327,84 @@ fn non_ingress_precondition_conventions_are_unchanged() {
         }
     }
 }
+
+/// A caller that marks a call's refusal as expected gets a success span for
+/// that code, in headers and trailers alike. The same call unmarked, another
+/// code, or a platform failure marked as expected all stay failures.
+#[test]
+fn caller_marked_status_is_expected_only_for_that_call() {
+    let path = "/space.spaced.host.control.v1.HostControl/GetNetworkPolicy";
+    let classify = |expected: Option<tonic::Code>, code: tonic::Code| {
+        let mut request = Request::builder().uri(path).body(()).unwrap();
+        if let Some(expected) = expected {
+            request
+                .extensions_mut()
+                .insert(ExpectedGrpcStatus::new(expected));
+        }
+        let response = tonic::Status::new(code, "refused").into_http::<()>();
+        let ClassifiedResponse::Ready(headers) = GrpcClientMakeClassifier
+            .make_classifier(&request)
+            .classify_response(&response)
+        else {
+            panic!("status in headers must be classified immediately");
+        };
+        let ClassifiedResponse::RequiresEos(eos) = GrpcClientMakeClassifier
+            .make_classifier(&request)
+            .classify_response(&Response::new(()))
+        else {
+            panic!("streaming response must defer classification");
+        };
+        let trailers = eos.classify_eos(Some(response.headers()));
+        assert_eq!(headers.is_ok(), trailers.is_ok());
+        headers.is_ok()
+    };
+    let denied = tonic::Code::PermissionDenied;
+
+    assert!(classify(Some(denied), denied));
+    assert!(!classify(None, denied));
+    assert!(!classify(Some(denied), tonic::Code::FailedPrecondition));
+    assert!(!classify(
+        Some(tonic::Code::Unavailable),
+        tonic::Code::Unavailable
+    ));
+}
+
+/// tonic carries a request's extensions into the HTTP request the trace layer
+/// classifies, which is how a caller's mark reaches it.
+#[tokio::test]
+async fn expected_status_mark_reaches_the_traced_transport() {
+    #[derive(Clone, Default)]
+    struct CaptureExpected(Arc<Mutex<Option<Option<tonic::Code>>>>);
+
+    impl Service<Request<tonic::body::Body>> for CaptureExpected {
+        type Response = Response<tonic::body::Body>;
+        type Error = std::io::Error;
+        type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: Request<tonic::body::Body>) -> Self::Future {
+            *self.0.lock().unwrap() = Some(expected_status_for(&request));
+            let response =
+                tonic::Status::permission_denied("refused").into_http::<tonic::body::Body>();
+            std::future::ready(Ok(response))
+        }
+    }
+
+    let inner = CaptureExpected::default();
+    let mut client = tonic_health::pb::health_client::HealthClient::new(
+        trace_grpc_client_transport(inner.clone()),
+    );
+    let mut request = tonic::Request::new(tonic_health::pb::HealthCheckRequest::default());
+    ExpectedGrpcStatus::new(tonic::Code::PermissionDenied).mark(&mut request);
+
+    let status = client.check(request).await.unwrap_err();
+
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        *inner.0.lock().unwrap(),
+        Some(Some(tonic::Code::PermissionDenied))
+    );
+}

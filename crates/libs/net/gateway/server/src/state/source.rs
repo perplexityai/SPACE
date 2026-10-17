@@ -19,6 +19,7 @@ use pplx_space_spaced_common::proto::host_control::{
 use super::credentials::{InvalidNetworkCredentialSnapshot, NetworkCredentialSnapshot};
 use crate::stats::ProxyStats;
 use pplx_space_common_core::types::SandboxId;
+use pplx_space_common_grpc::ExpectedGrpcStatus;
 
 pub type PolicyLoader = Arc<
     dyn Fn() -> Pin<
@@ -90,9 +91,9 @@ struct InitialNetworkState {
 
 /// How long after launch host-control may not know this gateway yet.
 /// sandbox-manager registers a gateway's process only once its launch returns,
-/// so a pull before then is refused as from an unknown caller. Within the
-/// window, and up to [`MAX_PENDING_ATTEMPTS`] pulls, such a refusal is pending
-/// registration; after either, a refusal is a failure.
+/// so a pull before then is refused as from an unknown caller. A refusal of a
+/// pull sent within the window, and within [`MAX_PENDING_ATTEMPTS`] pulls, is
+/// pending registration; a refusal of a pull sent after either is a failure.
 const REGISTRATION_WINDOW: Duration = Duration::from_secs(10);
 const MAX_PENDING_ATTEMPTS: u32 = 40;
 /// The backoff between pending pulls: doubling from the first to the cap, each
@@ -124,29 +125,54 @@ struct RegistrationWait {
     jitter: fn(Duration) -> Duration,
 }
 
+/// What a refusal of the next pull means, decided once before it is sent so
+/// that the pull's span and the retry after it agree.
+#[derive(Clone, Copy, Debug)]
+struct RefusalOutcome {
+    /// The pull is sent within [`REGISTRATION_WINDOW`] and short of the last
+    /// attempt, so its refusal is retried. A pull sent after either is the
+    /// last, and its refusal is the failure.
+    retried: bool,
+    /// Set only for a retried refusal that the owner's first call has not yet
+    /// ruled out as pending registration. The pull's span records it as
+    /// expected, so a marked refusal is always retried and the refusal that
+    /// ends the wait is never marked.
+    expected: Option<ExpectedGrpcStatus>,
+}
+
+impl RegistrationWait {
+    fn refusal_outcome(&self, attempts: u32) -> RefusalOutcome {
+        let retried =
+            attempts < MAX_PENDING_ATTEMPTS && self.launched_at.elapsed() < REGISTRATION_WINDOW;
+        RefusalOutcome {
+            retried,
+            expected: (retried && !*self.owner_contacted.borrow())
+                .then(|| ExpectedGrpcStatus::new(tonic::Code::PermissionDenied)),
+        }
+    }
+}
+
 /// Run `pull`, retrying while host-control does not know this gateway yet,
-/// within [`REGISTRATION_WINDOW`] and [`MAX_PENDING_ATTEMPTS`]. The first pull
-/// is immediate; later ones back off with jitter, and the owner's first call
-/// cuts the current wait short. Only an error the window does not cover is
-/// returned.
+/// for pulls sent within [`REGISTRATION_WINDOW`] and [`MAX_PENDING_ATTEMPTS`].
+/// The first pull is immediate; later ones back off with jitter, and the
+/// owner's first call cuts the current wait short. Only an error the window
+/// does not cover is returned. Each pull is told whether a refusal is still
+/// pending registration, so the call can mark it expected.
 async fn pull_once_registered<T, F, Fut>(
     mut wait: RegistrationWait,
     mut pull: F,
 ) -> Result<T, HydrateNetworkStateError>
 where
-    F: FnMut() -> Fut,
+    F: FnMut(Option<ExpectedGrpcStatus>) -> Fut,
     Fut: std::future::Future<Output = Result<T, HydrateNetworkStateError>>,
 {
     let mut backoff = PENDING_RETRY_INITIAL;
     let mut attempts = 0_u32;
     loop {
         attempts += 1;
-        match pull().await {
-            Err(error)
-                if error.is_unregistered_caller()
-                    && attempts < MAX_PENDING_ATTEMPTS
-                    && wait.launched_at.elapsed() < REGISTRATION_WINDOW =>
-            {
+        let refusal = wait.refusal_outcome(attempts);
+        match pull(refusal.expected).await {
+            Err(error) if error.is_unregistered_caller() && refusal.retried => {
                 tracing::debug!(target: "pplx_space_net_gateway::run", %error, attempts, "host-control does not know this net-gateway yet; retrying");
                 let pause = (wait.jitter)(backoff);
                 backoff = backoff.saturating_mul(2).min(PENDING_RETRY_CAP);
@@ -178,7 +204,7 @@ async fn pull_initial_network_state(
         sandbox_id,
         wait,
         connect_host_control(sandbox_id),
-        |client| pull_network_state(sandbox_id, client),
+        |client, pending_refusal| pull_network_state(sandbox_id, client, pending_refusal),
     )
     .await
 }
@@ -196,7 +222,7 @@ async fn hydrate_network_state<C, Connect, F, Fut>(
 where
     C: Clone,
     Connect: std::future::Future<Output = Result<C, HydrateNetworkStateError>>,
-    F: FnMut(C) -> Fut,
+    F: FnMut(C, Option<ExpectedGrpcStatus>) -> Fut,
     Fut: std::future::Future<Output = Result<InitialNetworkState, HydrateNetworkStateError>>,
 {
     let details = || SandboxEventDetails::default().operation("initial_policy_hydration");
@@ -207,7 +233,12 @@ where
         details(),
     );
     let result = match connect.await {
-        Ok(client) => pull_once_registered(wait, || pull(client.clone())).await,
+        Ok(client) => {
+            pull_once_registered(wait, |pending_refusal| {
+                pull(client.clone(), pending_refusal)
+            })
+            .await
+        }
         Err(error) => Err(error),
     };
     match &result {
@@ -246,12 +277,26 @@ async fn connect_host_control(
     ))
 }
 
-async fn pull_network_state(
+/// Pull the policy over `client`, marking the request when its refusal is
+/// still pending registration. Generic over the transport so a test can see
+/// the request the client sends.
+async fn pull_network_state<T>(
     sandbox_id: SandboxId,
-    mut client: HostControl,
-) -> Result<InitialNetworkState, HydrateNetworkStateError> {
+    mut client: HostControlClient<T>,
+    pending_refusal: Option<ExpectedGrpcStatus>,
+) -> Result<InitialNetworkState, HydrateNetworkStateError>
+where
+    T: tonic::client::GrpcService<tonic::body::Body>,
+    T::Error: Into<tonic::codegen::StdError>,
+    T::ResponseBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
+    <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
+{
+    let mut request = tonic::Request::new(GetNetworkPolicyRequest {});
+    if let Some(expected) = pending_refusal {
+        expected.mark(&mut request);
+    }
     let response = client
-        .get_network_policy(GetNetworkPolicyRequest {})
+        .get_network_policy(request)
         .await
         .map_err(|source| HydrateNetworkStateError::GetNetworkPolicy { sandbox_id, source })?
         .into_inner();
