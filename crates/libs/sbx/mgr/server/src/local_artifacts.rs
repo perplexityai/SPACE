@@ -461,15 +461,23 @@ impl LocalArtifacts {
 
     /// Publish a stopped-sandbox disk artifact. INSERTs the row in
     /// `Ready` and atomically flips the sandbox row to `Stopped`
-    /// with the new artifact pinned.
+    /// with the new artifact pinned, provided no activation has replaced
+    /// `expected_execution` since the caller read it.
     pub fn publish_stopped(
         &self,
         sandbox_id: &str,
+        expected_execution: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
         local_artifact_id: LocalArtifactId,
         local_path: &str,
     ) -> rusqlite::Result<()> {
         let conn = self.db_conn()?;
-        crate::db::publish_stopped_artifact(&conn, sandbox_id, local_artifact_id, local_path)
+        crate::db::publish_stopped_artifact(
+            &conn,
+            sandbox_id,
+            expected_execution,
+            local_artifact_id,
+            local_path,
+        )
     }
 
     /// Publish a named user snapshot. INSERTs the row in `Ready`;

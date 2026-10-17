@@ -386,9 +386,17 @@ pub fn publish_named_local_artifact(
     )
 }
 
+/// `expected_execution` is the `node_execution_id` the caller read before
+/// minting the artifact. A cold start or restore writes a fresh one when it
+/// begins (`begin_activation_with_route_evidence`), so a publish whose read
+/// predates a start is refused instead of pinning bytes the start may have
+/// overwritten. The one exception is node cleanup writing the earlier id back
+/// (`acknowledge_node_cleanup`), which it does only when the newer execution
+/// never reached the node; a publish that read that earlier id is accepted.
 pub fn publish_stopped_artifact(
     conn: &Connection,
     sandbox_id: &str,
+    expected_execution: Option<SandboxActivationAttemptId>,
     local_artifact_id: LocalArtifactId,
     local_path: &str,
 ) -> Result<()> {
@@ -441,13 +449,15 @@ pub fn publish_stopped_artifact(
                    state = 'stopped'
                    AND current_local_artifact_id IS NULL
                )
-           )",
+           )
+           AND node_execution_id IS ?6",
         params![
             local_artifact_id.to_string(),
             ArtifactKind::Disk.as_str(),
             ArtifactOrigin::Stop.as_str(),
             now()?,
             sandbox_id,
+            expected_execution.map(|id| id.to_string()),
         ],
     )?;
     if changed != 1 {
@@ -458,6 +468,42 @@ pub fn publish_stopped_artifact(
     crate::route_activation_claims::close_claim(&tx, sandbox_id)?;
     tx.commit()?;
     Ok(())
+}
+
+/// The auto-lifecycle Stop of a `suspended` row
+/// ([`edges::AUTO_LIFECYCLE_STOP_SUSPENDED`]), which also drops the row's
+/// artifact pin in the same transaction. A `suspended` row usually pins a full
+/// suspend artifact, which a `stopped` row's current-instance backup refuses,
+/// so carrying it over would block that backup instead of letting it mint a
+/// disk artifact of the rootfs.
+pub fn stop_suspended_for_auto_lifecycle(conn: &Connection, id: &str) -> Result<StateWriteOutcome> {
+    let tx = immediate_transaction(conn)?;
+    let outcome = update_state_from(&tx, id, &edges::AUTO_LIFECYCLE_STOP_SUSPENDED)?;
+    if matches!(outcome, StateWriteOutcome::Applied { .. }) {
+        drop_stopped_artifact_pin(&tx, id)?;
+    }
+    tx.commit()?;
+    Ok(outcome)
+}
+
+/// Drop a `stopped` row's artifact pin: when a writer has just moved the row
+/// to `stopped` from a state whose pin may not describe its rootfs, and before
+/// something rewrites a `stopped` rootfs in place, such as a snapshot rollback.
+/// Returns whether a pin was dropped; a row in any other state is left as it
+/// is.
+pub fn drop_stopped_artifact_pin(conn: &Connection, id: &str) -> Result<bool> {
+    let changed = conn.execute(
+        "UPDATE sandboxes
+            SET current_local_artifact_id = NULL,
+                current_local_artifact_kind = NULL,
+                current_local_artifact_origin = NULL,
+                updated_at = ?1
+          WHERE id = ?2
+            AND state = 'stopped'
+            AND current_local_artifact_id IS NOT NULL",
+        params![now()?, id],
+    )?;
+    Ok(changed == 1)
 }
 
 pub fn get_local_artifact(

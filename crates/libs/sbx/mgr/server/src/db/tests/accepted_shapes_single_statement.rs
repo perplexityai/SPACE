@@ -422,7 +422,19 @@ fn stopped_publication_pins_the_disk_and_clears_the_runtime_from_each_accepted_s
         assert_accepts(
             case,
             &conn,
-            || publish_stopped_artifact(&conn, id, artifact, &path).unwrap(),
+            || {
+                publish_stopped_artifact(
+                    &conn,
+                    id,
+                    crate::db::get_sandbox(&conn, id)
+                        .unwrap()
+                        .unwrap()
+                        .node_execution_id,
+                    artifact,
+                    &path,
+                )
+                .unwrap()
+            },
             ExpectedDiff::new().sandbox(id, cells).inserted(
                 "local_artifacts",
                 local_artifact_inserted(id, artifact, "disk", "stop", &path),

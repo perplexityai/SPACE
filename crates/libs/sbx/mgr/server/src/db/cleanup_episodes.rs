@@ -878,6 +878,16 @@ fn apply_cleanup_state(
             published_artifact_id,
         ],
     )?;
+    // A completion to `stopped` drops the row's artifact pin. A `stopped` row's
+    // pin must name a disk artifact of its rootfs as it now stands, and nothing
+    // here can show that: the row is leaving an activation or a runtime that
+    // may have written the rootfs since the pin was taken, or it pins a full
+    // suspend artifact, which a `stopped` row's current-instance backup
+    // refuses. Dropping a pin that was still accurate costs a re-mint and a
+    // fresh upload of the disk; keeping a stale one republishes old bytes.
+    if changed == 1 && target_state == SandboxState::Stopped {
+        drop_stopped_artifact_pin(tx, sandbox_id)?;
+    }
     Ok(changed == 1)
 }
 

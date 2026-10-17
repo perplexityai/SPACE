@@ -798,7 +798,12 @@ impl SandboxManagerService {
                             "stopped_artifact_adoption",
                             || {
                                 self.local_artifacts
-                                    .publish_stopped(&sandbox.id, id, &local_path)
+                                    .publish_stopped(
+                                        &sandbox.id,
+                                        sandbox.node_execution_id,
+                                        id,
+                                        &local_path,
+                                    )
                                     .map(|()| ((), true))
                             },
                         );
