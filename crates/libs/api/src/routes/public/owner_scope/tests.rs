@@ -7,7 +7,9 @@ use axum::{
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::OrgId;
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, TestDb, TestDbResult, pg_test_db};
+use pplx_space_public_api::OperationId;
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -797,5 +799,187 @@ async fn sandbox_scoped_requests_load_owner_and_row_once() -> TestDbResult<()> {
     .await?;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(sandbox_row_loads(&statements), 1, "{statements:#?}");
+    Ok(())
+}
+
+const REQUEST_ID: &str = "req_owner-scope-test";
+const UNKNOWN_SANDBOX: &str = "sbx_00000000-0000-7000-8000-000000000000";
+const UNKNOWN_OPERATION: &str = "op_00000000-0000-7000-8000-000000000000";
+
+fn request_id_headers(mut headers: HeaderMap) -> HeaderMap {
+    headers.insert("x-request-id", REQUEST_ID.parse().unwrap());
+    headers
+}
+
+fn error_body(code: &str, message: &str) -> Value {
+    json!({
+        "code": code,
+        "message": message,
+        "request_id": REQUEST_ID,
+        "retryable": false,
+        "details": [],
+    })
+}
+
+/// `template` with `{id_param}` replaced by `id` and any other path parameter
+/// by a placeholder: authorization answers before those are read.
+fn concrete_path(template: &str, id_param: &str, id: &str) -> String {
+    let mut path = String::new();
+    let mut rest = template;
+    while let Some((head, tail)) = rest.split_once('{') {
+        let (name, tail) = tail.split_once('}').expect("path parameter should close");
+        path.push_str(head);
+        path.push_str(if name == id_param { id } else { "placeholder" });
+        rest = tail;
+    }
+    path.push_str(rest);
+    path
+}
+
+#[tokio::test]
+async fn every_path_id_route_rejects_a_malformed_id_and_hides_an_unknown_one() -> TestDbResult<()> {
+    let fixture = fixture().await?;
+    let spec = crate::routes::public_docs::openapi_json().await.0;
+    let mut swept = BTreeSet::new();
+    for (operation, _) in super::super::mounted_operations() {
+        let (id_param, malformed, unknown, invalid, not_found) =
+            if operation.path().contains("{sandbox_id}") {
+                (
+                    "sandbox_id",
+                    "not-a-sandbox-id",
+                    UNKNOWN_SANDBOX,
+                    "invalid sandbox id",
+                    "sandbox not found",
+                )
+            } else if operation.path().contains("{operation_id}") {
+                (
+                    "operation_id",
+                    "not-an-operation-id",
+                    UNKNOWN_OPERATION,
+                    "invalid operation id",
+                    "operation not found",
+                )
+            } else {
+                continue;
+            };
+        let method = operation.method().openapi_name();
+        let documented = &spec["paths"][operation.relative_path()][method]["responses"]["400"];
+        assert_eq!(
+            documented["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/PublicErrorEnvelope",
+            "{method} {} does not document its malformed-id 400 envelope",
+            operation.path()
+        );
+        for headers in [HeaderMap::new(), owner_headers(ORG, "101")] {
+            for (id, expected_status, expected_body) in [
+                // The same answer the handler gives an unparseable id.
+                (
+                    malformed,
+                    StatusCode::BAD_REQUEST,
+                    error_body("invalid_request", invalid),
+                ),
+                (
+                    unknown,
+                    StatusCode::NOT_FOUND,
+                    error_body("not_found", not_found),
+                ),
+            ] {
+                let path = concrete_path(operation.path(), id_param, id);
+                let (status, body) = send(
+                    &fixture.app,
+                    Method::from_bytes(method.to_ascii_uppercase().as_bytes())?,
+                    &path,
+                    request_id_headers(headers.clone()),
+                    json!({}),
+                )
+                .await?;
+                assert_eq!(status, expected_status, "{method} {path}: {body}");
+                assert_eq!(body, expected_body, "{method} {path}");
+            }
+        }
+        swept.insert(operation.path());
+    }
+    // Guards the sweep itself: point reads, `:action` suffixes, sub-resources
+    // and both operation routes.
+    for path in [
+        pplx_space_public_api::routes::GET_SANDBOX.path(),
+        pplx_space_public_api::routes::SUSPEND_SANDBOX.path(),
+        pplx_space_public_api::routes::LIST_PROCESSES.path(),
+        pplx_space_public_api::routes::GET_OPERATION.path(),
+        pplx_space_public_api::routes::LIST_OPERATION_EVENTS.path(),
+    ] {
+        assert!(swept.contains(path), "{path} was not swept");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_sandbox_outside_the_callers_scope_is_answered_as_an_unknown_one() -> TestDbResult<()> {
+    let fixture = fixture().await?;
+    let (status, local) = send(
+        &fixture.app,
+        Method::POST,
+        "/v1/sandboxes",
+        HeaderMap::new(),
+        json!({"template":"seed:latest"}),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::ACCEPTED, "{local}");
+    let local_sandbox = seed_target(&fixture, &local).await?;
+    let federated = create(&fixture, ORG, "101").await?;
+    let federated_sandbox = seed_target(&fixture, &federated).await?;
+    // A local credential in the federated sandbox's org, which is not the
+    // local sandbox's org.
+    const OTHER_ORG_KEY: &str = "local-key-in-another-org";
+    sqlx::query(sql!(
+        "INSERT INTO api_keys (id, org_id, name, key_hash, allowed_surfaces)
+         SELECT $1, org_id, 'other-org-scope-test', $2, ARRAY['native']
+         FROM sandboxes WHERE id = $3"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(crate::auth::hash_token(OTHER_ORG_KEY))
+    .bind(federated_sandbox.as_uuid())
+    .execute(&fixture.db.pool)
+    .await?;
+    let mut other_org = HeaderMap::new();
+    other_org.insert("authorization", format!("Bearer {OTHER_ORG_KEY}").parse()?);
+    // Each sandbox is visible to its own caller, so the 404s below come from
+    // the scope check rather than from a row that was never seeded.
+    for (sandbox, headers) in [
+        (local_sandbox, HeaderMap::new()),
+        (federated_sandbox, owner_headers(ORG, "101")),
+    ] {
+        let (status, body) = send(
+            &fixture.app,
+            Method::GET,
+            &format!("/v1/sandboxes/{sandbox}"),
+            headers,
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{sandbox}: {body}");
+    }
+    // The other-org read is also refused by the handler's own org filter; only
+    // the other-subject read depends on the middleware's scope check alone.
+    for (sandbox, headers) in [
+        (UNKNOWN_SANDBOX.to_owned(), HeaderMap::new()),
+        (local_sandbox.to_string(), other_org),
+        (federated_sandbox.to_string(), owner_headers(ORG, "102")),
+    ] {
+        let (status, body) = send(
+            &fixture.app,
+            Method::GET,
+            &format!("/v1/sandboxes/{sandbox}"),
+            request_id_headers(headers),
+            Value::Null,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{sandbox}: {body}");
+        assert_eq!(
+            body,
+            error_body("not_found", "sandbox not found"),
+            "{sandbox}"
+        );
+    }
     Ok(())
 }

@@ -121,7 +121,7 @@ fn public_openapi_value() -> Value {
                     "parameters": [idempotency_key_parameter.clone()],
                     "responses": {
                         "202": { "description": "Sandbox operation" },
-                        "400": { "description": "Unsupported update field" },
+                        "400": { "description": "Invalid sandbox id, or unsupported update field" },
                         "404": { "description": "Sandbox not found" },
                         "409": { "description": "Idempotency conflict" }
                     }
@@ -204,7 +204,7 @@ fn public_openapi_value() -> Value {
                             "description": "File byte stream",
                             "content": { "application/octet-stream": {} }
                         },
-                        "400": { "description": "Missing or oversized length" },
+                        "400": { "description": "Invalid sandbox id, or missing or oversized length" },
                         "404": { "description": "Sandbox or file not found" }
                     }
                 }
@@ -583,7 +583,7 @@ fn insert_file_mutation_paths(paths: &mut Map<String, Value>, idempotency_key_pa
                 "parameters": [idempotency_key_parameter.clone()],
                 "responses": {
                     "200": { "description": "Write result" },
-                    "400": { "description": "Invalid file write request" },
+                    "400": { "description": "Invalid sandbox id, or invalid file write request" },
                     "404": { "description": "Sandbox or parent path not found" },
                     "412": { "description": "The sandbox's disk or quota is full; free space before retrying" },
                     "413": { "description": "The request body exceeds the write limit" }
@@ -606,7 +606,7 @@ fn insert_file_mutation_paths(paths: &mut Map<String, Value>, idempotency_key_pa
                 "parameters": [idempotency_key_parameter.clone()],
                 "responses": {
                     "200": { "description": "Batch write result" },
-                    "400": { "description": "Invalid file write batch request, including a batch over its data and path limit" },
+                    "400": { "description": "Invalid sandbox id, or invalid file write batch request, including a batch over its data and path limit" },
                     "404": { "description": "Sandbox or parent path not found" },
                     "413": { "description": "The request body exceeds the batch limit" }
                 }
@@ -621,7 +621,7 @@ fn insert_file_mutation_paths(paths: &mut Map<String, Value>, idempotency_key_pa
                 "parameters": [idempotency_key_parameter.clone()],
                 "responses": {
                     "200": { "description": "Tracking status" },
-                    "400": { "description": "Invalid change-tracking request" },
+                    "400": { "description": "Invalid sandbox id, or invalid change-tracking request" },
                     "404": { "description": "Sandbox not found" }
                 }
             }
@@ -648,7 +648,7 @@ fn insert_file_mutation_paths(paths: &mut Map<String, Value>, idempotency_key_pa
                 "description": "`window_seconds`, `since`, and `cursor` are mutually exclusive filters.",
                 "responses": {
                     "200": { "description": "Modified file list" },
-                    "400": { "description": "Invalid modified-file filter" },
+                    "400": { "description": "Invalid sandbox id, or invalid modified-file filter" },
                     "404": { "description": "Sandbox not found" }
                 }
             }
@@ -662,7 +662,7 @@ fn insert_file_mutation_paths(paths: &mut Map<String, Value>, idempotency_key_pa
                 "parameters": [idempotency_key_parameter.clone()],
                 "responses": {
                     "200": { "description": "Directory created or already present" },
-                    "400": { "description": "Non-idempotent mkdir modes are rejected" },
+                    "400": { "description": "Invalid sandbox id, or a non-idempotent mkdir mode" },
                     "404": { "description": "Sandbox not found" }
                 }
             }
@@ -676,7 +676,7 @@ fn insert_file_mutation_paths(paths: &mut Map<String, Value>, idempotency_key_pa
                 "parameters": [idempotency_key_parameter.clone()],
                 "responses": {
                     "200": { "description": "Path removed or already absent" },
-                    "400": { "description": "Non-idempotent remove modes are rejected" },
+                    "400": { "description": "Invalid sandbox id, or a non-idempotent remove mode" },
                     "404": { "description": "Sandbox not found" }
                 }
             }

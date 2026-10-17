@@ -547,6 +547,20 @@ pub(super) fn complete_control_plane_responses(spec: &mut Value) {
             responses
                 .entry("500".to_string())
                 .or_insert_with(|| json!({ "description": "Internal server error" }));
+            // Owner-scope authorization rejects an unparseable path id with 400
+            // before any handler runs, so every operation that takes one can.
+            let malformed_id = if path.contains("{sandbox_id}") {
+                Some("Invalid sandbox id or request")
+            } else if path.contains("{operation_id}") {
+                Some("Invalid operation id or request")
+            } else {
+                None
+            };
+            if let Some(description) = malformed_id {
+                responses
+                    .entry("400".to_string())
+                    .or_insert_with(|| json!({ "description": description }));
+            }
             for (status, response) in responses {
                 let response = response
                     .as_object_mut()
