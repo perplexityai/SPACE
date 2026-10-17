@@ -1,0 +1,59 @@
+# The in-repo STS bridge fixture (infra/space/kind/sts-bridge), standing in
+# for the AWS STS and workload identity a deployment's credential-manager
+# authority uses for the storage exchange, as versitygw stands in for S3. The
+# authority calls AssumeRole here, unchanged, signed with the vend identity's
+# static keys; the bridge verifies the signature, mints a five-minute OIDC
+# token for that identity and exchanges it at versitygw's IAM service
+# (AssumeRoleWithWebIdentity), which checks the vend role's trust policy and
+# maximum session duration and stores the session the S3 gateway then
+# enforces. It also serves the token issuer versitygw trusts.
+
+image:
+  repository: space-kind-sts-bridge
+  tag: local
+  pullPolicy: IfNotPresent
+
+datadogTeam: team-space
+
+# Scheduling priority (infra/space/kind/manifests/priorityclasses.yaml).
+priorityClassName: space-control-plane
+
+nodeSelector:
+  space.pplx.net/infra: "true"
+
+service:
+  name: sts-bridge
+  # STS over TLS with the internal RPC CA's leaf for `sts-bridge`
+  # (internal-rpc-tls.sh): the authority's AWS_ENDPOINT_URL_STS.
+  stsPort: 8080
+  # The issuer's discovery document and JWKS over TLS with the issuer CA's
+  # leaf, which versitygw's OIDC provider pins (sts-bridge-secret.sh).
+  issuerPort: 8443
+
+# The secrets sts-bridge-secret.sh and internal-rpc-tls.sh keep.
+secretName: space-kind-sts-bridge
+stsTlsSecretName: space-kind-sts-bridge-tls
+
+# Must match the object store's OIDC provider and the vend role's trust
+# policy (space-object-store's values.yaml, storageExchange).
+issuer: https://sts-bridge.kind.invalid
+audience: kind-sts-bridge
+# versitygw's IAM service (space-object-store's `object-store-iam` Service),
+# over TLS from the internal RPC CA in `upstreamCaSecretName`
+# (internal-rpc-tls.sh): the minted token and the session secrets it buys
+# cross this hop.
+upstream: https://object-store-iam:7070/
+upstreamCaSecretName: space-internal-rpc-ca
+
+# Set by every bring-up path to the checksum sts-bridge-secret.sh prints, so a
+# reissued Secret rolls the bridge.
+storageExchange:
+  secretChecksum: ""
+
+# Stateless: every key is in the Secret. One replica, replaced at will.
+replicas: 1
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 16Mi

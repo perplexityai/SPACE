@@ -94,6 +94,17 @@ build_space_kind_key_broker() {
   build_rust_runtime space-kind-key-broker docker/Dockerfile.kind-key-broker
 }
 
+# Kind-only: the STS bridge fixture the credential-manager authority's storage
+# exchange calls in place of AWS STS (charts/space-kind-sts-bridge). Go, so it
+# needs no Rust artifact.
+build_space_kind_sts_bridge() {
+  log "building runtime image: space-kind-sts-bridge:local (docker/Dockerfile.kind-sts-bridge)"
+  image_build space-kind-sts-bridge --provenance=false --sbom=false -t space-kind-sts-bridge:local \
+    --build-arg "SPACE_GIT_SHA=${KIND_GIT_SHA:-unknown}" \
+    .
+  kind_load space-kind-sts-bridge:local
+}
+
 build_space_cluster_controller() {
   build_rust_runtime space-cluster-controller docker/Dockerfile.cluster-controller
 }
@@ -151,6 +162,7 @@ dispatch() {
     space-worker)                 build_space_worker ;;
     space-seed-publish)           build_space_seed_publish ;;
     space-kind-key-broker)        build_space_kind_key_broker ;;
+    space-kind-sts-bridge)        build_space_kind_sts_bridge ;;
     space-ui)                     build_space_ui ;;
     *)
       printf 'unknown image: %s\nknown: %s\n' "$1" "${ALL_IMAGES[*]}" >&2

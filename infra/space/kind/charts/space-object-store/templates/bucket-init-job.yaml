@@ -11,6 +11,12 @@ spec:
   backoffLimit: 30
   template:
     metadata:
+      annotations:
+        # The one input from outside this template: the bridge Secret, whose
+        # issuer CA thumbprint the provider pins. A reissue makes a new Job
+        # spec, which both bring-up paths rerun, as a changed provider, role
+        # or policy setting below does.
+        checksum/sts-bridge-secret: {{ .Values.storageExchange.secretChecksum | quote }}
       labels:
         app.kubernetes.io/name: space-object-store-bucket-init
         app.kubernetes.io/instance: {{ .Release.Name }}
@@ -44,6 +50,48 @@ spec:
               done
               s3 s3api list-buckets --query 'Buckets[].Name' --output text
               echo "buckets {{ .Values.snapshotBucket }} + {{ .Values.templateBucket }} ready"
+
+              # The storage exchange's OIDC provider and vend role in the IAM
+              # service (values.yaml, storageExchange), converged in place on
+              # every run: re-runs and upgrades update what exists and create
+              # what does not, so live sessions and the role's ARN survive.
+              iam_endpoint="https://{{ .Values.iam.serviceName }}:{{ .Values.iam.port }}"
+              iam() { aws --no-cli-pager --endpoint-url "$iam_endpoint" --ca-bundle /etc/space-rpc-ca/ca.crt iam "$@"; }
+              echo "waiting for the IAM service at $iam_endpoint"
+              until iam list-roles >/dev/null 2>&1; do
+                sleep 2
+              done
+              provider_arn="arn:aws:iam::000000000000:oidc-provider/{{ .Values.storageExchange.issuerHost }}"
+              thumbprint="$(cat /etc/sts-bridge/issuer-ca.sha1)"
+              if iam get-open-id-connect-provider --open-id-connect-provider-arn "$provider_arn" >/dev/null 2>&1; then
+                iam update-open-id-connect-provider-thumbprint \
+                  --open-id-connect-provider-arn "$provider_arn" --thumbprint-list "$thumbprint"
+                iam add-client-id-to-open-id-connect-provider \
+                  --open-id-connect-provider-arn "$provider_arn" --client-id {{ .Values.storageExchange.audience }}
+              else
+                iam create-open-id-connect-provider --url "https://{{ .Values.storageExchange.issuerHost }}" \
+                  --client-id-list {{ .Values.storageExchange.audience }} --thumbprint-list "$thumbprint" >/dev/null
+              fi
+              role={{ .Values.storageExchange.roleName }}
+              max_duration={{ .Values.storageExchange.maxSessionDuration | int }}
+              current="$(iam get-role --role-name "$role" --query Role.MaxSessionDuration --output text 2>/dev/null || true)"
+              # The IAM API has no UpdateRole, so a role with another maximum
+              # duration is replaced.
+              if [ -n "$current" ] && [ "$current" != "$max_duration" ]; then
+                echo "replacing $role (max session duration $current, want $max_duration)"
+                iam delete-role-policy --role-name "$role" --policy-name vend >/dev/null 2>&1 || true
+                iam delete-role --role-name "$role"
+                current=""
+              fi
+              if [ -z "$current" ]; then
+                iam create-role --role-name "$role" --max-session-duration "$max_duration" \
+                  --assume-role-policy-document "$TRUST_POLICY" >/dev/null
+              else
+                iam update-assume-role-policy --role-name "$role" --policy-document "$TRUST_POLICY"
+              fi
+              iam put-role-policy --role-name "$role" --policy-name vend --policy-document "$ROLE_POLICY"
+              iam get-role --role-name "$role" --query 'Role.[Arn,MaxSessionDuration]' --output text
+              echo "OIDC provider $provider_arn (thumbprint $thumbprint) and role $role ready"
           env:
             - name: AWS_ACCESS_KEY_ID
               valueFrom:
@@ -57,3 +105,27 @@ spec:
                   key: SPACE_OBJECT_STORE_STATIC_SECRET_ACCESS_KEY
             - name: AWS_DEFAULT_REGION
               value: {{ .Values.region | quote }}
+            - name: TRUST_POLICY
+              value: {{ include "space-object-store.trustPolicy" . | quote }}
+            - name: ROLE_POLICY
+              value: {{ include "space-object-store.rolePolicy" . | quote }}
+          volumeMounts:
+            - name: bridge-issuer
+              mountPath: /etc/sts-bridge
+              readOnly: true
+            - name: rpc-ca
+              mountPath: /etc/space-rpc-ca
+              readOnly: true
+      volumes:
+        # Only the issuer CA's thumbprint, from the Secret
+        # sts-bridge-secret.sh keeps.
+        - name: bridge-issuer
+          secret:
+            secretName: {{ .Values.storageExchange.bridgeSecretName }}
+            items:
+              - key: issuer-ca.sha1
+                path: issuer-ca.sha1
+        # The CA the IAM service's leaf chains to (internal-rpc-tls.sh).
+        - name: rpc-ca
+          secret:
+            secretName: {{ .Values.iam.caSecretName }}

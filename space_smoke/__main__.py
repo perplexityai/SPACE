@@ -35,6 +35,7 @@ def _describe(scenario_id: str) -> int:
         "quarantined": scenario.quarantined,
         "ignored": scenario.ignored,
         "telemetry_mode": scenario.telemetry_mode,
+        "storage_credentials": scenario.storage_credentials,
         "selected_api_surface": os.environ.get("SPACE_SMOKE_API_SURFACE", "ecw"),
         "sandbox": {
             "count": scenario.sandbox_count,
@@ -364,6 +365,15 @@ def _run_all(
             file=sys.stderr,
         )
         return 2
+    scenarios, storage_error = _apply_storage_credentials(scenarios, services)
+    telemetry_error = telemetry_error or storage_error
+    if not scenarios:
+        print(
+            f"ERROR: no smoke scenarios apply to {selection} on a bench in this "
+            "storage credentials mode.",
+            file=sys.stderr,
+        )
+        return 2
 
     environment = dict(os.environ)
     if environment.get("SPACE_SMOKE_BACKEND", "kind") == "kind":
@@ -436,6 +446,46 @@ def _apply_telemetry_mode(
         if skipped not in runnable:
             print(
                 f"SKIPPED {skipped.id}: needs telemetry mode {skipped.telemetry_mode}; "
+                f"the bench runs {bench_mode}"
+            )
+    return runnable, None
+
+
+def _apply_storage_credentials(
+    scenarios: tuple[Scenario, ...], services: SmokeServices
+) -> tuple[tuple[Scenario, ...], str | None]:
+    """Skip the scenarios that exercise the other storage credentials mode.
+
+    As for the telemetry mode: the bench's mode is read from the cluster, a
+    bench the probe cannot classify keeps the scenarios, and a runner that
+    names a mode the bench does not run fails the suite.
+    """
+
+    declared = tuple(scenario for scenario in scenarios if scenario.storage_credentials is not None)
+    if not declared:
+        return scenarios, None
+    try:
+        bench_mode = services.storage_credentials()
+    except Exception as error:  # noqa: BLE001 - the scenarios report their own reads
+        names = ", ".join(scenario.id for scenario in declared)
+        print(
+            f"WARN: could not read the bench's storage credentials mode, so {names} will run: "
+            f"{type(error).__name__}: {error}",
+            file=sys.stderr,
+        )
+        return scenarios, None
+    requested = os.environ.get("SPACE_KIND_STORAGE_CREDENTIALS") or None
+    if requested is not None and requested != bench_mode:
+        return scenarios, (
+            f"SPACE_KIND_STORAGE_CREDENTIALS={requested}, but the bench runs storage credentials mode {bench_mode}"
+        )
+    runnable = tuple(
+        scenario for scenario in scenarios if scenario.storage_credentials in (None, bench_mode)
+    )
+    for skipped in declared:
+        if skipped not in runnable:
+            print(
+                f"SKIPPED {skipped.id}: needs storage credentials mode {skipped.storage_credentials}; "
                 f"the bench runs {bench_mode}"
             )
     return runnable, None

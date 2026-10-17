@@ -1,0 +1,6 @@
+apiVersion: v2
+name: space-kind-sts-bridge
+description: Kind-only STS bridge fixture that vends versitygw sessions for the KinD SPACE credential-manager authority's storage exchange
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

@@ -53,8 +53,23 @@ allowedServiceAccounts:
 # Credentials for the authority's own AWS integrations (AWS Secrets Manager
 # network-credential references, resolved only where the database pool lives,
 # crates/libs/credential/mgr/server/src/run.rs): the optional
-# `space-aws-creds` Secret bootstrap creates from private.env.
+# `space-aws-creds` Secret bootstrap creates from private.env. Not used when
+# storage credentials are exchanged (below).
 awsRegion: us-east-1
+
+# How node services get object-store credentials, set by every bring-up path
+# from SPACE_KIND_STORAGE_CREDENTIALS (infra/space/kind/lib/storage-credentials.sh).
+# `exchange` enables the storage exchange: the authority assumes the object
+# store's vend role (space-object-store's values.yaml, storageExchange)
+# through the STS bridge, signed with the vend identity from the bridge's
+# Secret. `static` configures no vend role.
+storageCredentials: exchange
+storageExchange:
+  vendRoleArn: arn:aws:iam::000000000000:role/kind-storage-vend
+  stsEndpoint: https://sts-bridge:8080
+  bridgeSecretName: space-kind-sts-bridge
+  # Set by every bring-up path to the checksum sts-bridge-secret.sh prints.
+  secretChecksum: ""
 
 # The external key provider behind the platform KEK: the Kind-only broker
 # fixture (space-kind-key-broker). The tenant namespace is the durable

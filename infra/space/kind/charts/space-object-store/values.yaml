@@ -11,6 +11,11 @@
 #
 # Replaces SeaweedFS: one Go process with no master/volume/filer split, no
 # volume slots to exhaust and no per-collection volume growth.
+#
+# versitygw's standalone IAM service (`versitygw iam`, below) runs as its own
+# Deployment from the same image. It issues and enforces the scoped sessions
+# of credential-manager's storage exchange: the gateway asks it about every
+# request signed with session keys, and keeps checking root keys itself.
 
 image:
   repository: ghcr.io/versity/versitygw
@@ -46,9 +51,12 @@ healthPath: /healthz
 # Signing region the gateway validates (SigV4 is strict about region).
 region: us-east-1
 
-# Dev-only S3 credentials. Handed to volume-manager as static creds
-# (SPACE_OBJECT_STORE_STATIC_*) and used as the gateway's root account, so
-# sigv4 is actually validated. Do NOT put the
+# Dev-only S3 credentials: the gateway's and the IAM service's root account,
+# so sigv4 is actually validated. Handed as static creds
+# (SPACE_OBJECT_STORE_STATIC_*) to whatever does not exchange
+# (README, "Object-store credentials"): the bucket-init and seed-publish
+# Jobs, builders, build-manager and cluster-controller, and worker
+# volume-manager in static mode. Do NOT put the
 # substring "space" (or "minio") anywhere in these values: Tilt redacts secret
 # VALUES from command lines (including docker build-args), so a "space"
 # substring would poison every `docker build … space-rust-build-… …`
@@ -66,6 +74,64 @@ templateBucket: templates
 
 # Object data lives on this node-local hostPath (see templates/deployment.yaml).
 dataHostPath: /var/lib/space-object-store
+
+# versitygw's standalone IAM service, from the same image, in its own
+# Deployment (templates/iam.yaml): its own pod, so an IAM outage refuses
+# session-signed requests while the gateway stays Ready and root keys keep
+# working. Its state (the OIDC provider, the vend role and every live session)
+# is kept in `dirName` under the data hostPath, so sessions survive restarts
+# as the objects do. A dot-directory is no valid bucket name, so the gateway
+# never lists or serves it as one, as with its own `.sgwtmp`. Behind the
+# `serviceName` Service it serves:
+#   port         the IAM and STS API (AssumeRoleWithWebIdentity) over TLS,
+#                for the STS bridge and the bucket-init Job;
+#   privatePort  the private API the gateway asks about sessions, over mTLS:
+#                versitygw requires client certificates on any TCP private
+#                listener, and the gateway signs each call with the root keys.
+# Both use leaves from the cluster's internal RPC CA (internal-rpc-tls.sh):
+# `tlsSecretName` for the service, `clientTlsSecretName` for the gateway, and
+# `caSecretName` to verify either side. templates/iam-networkpolicy.yaml
+# admits only those three callers to the ports.
+iam:
+  port: 7070
+  privatePort: 7071
+  serviceName: object-store-iam
+  dirName: .iam
+  tlsSecretName: space-object-store-iam-tls
+  clientTlsSecretName: space-object-store-iam-client-tls
+  caSecretName: space-internal-rpc-ca
+  resources:
+    requests:
+      cpu: 10m
+      memory: 64Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+# credential-manager's storage exchange against this store
+# (README, "Object-store credentials"). The STS bridge (space-kind-sts-bridge)
+# mints OIDC tokens for the vend identity under `issuer`; the IAM service
+# fetches the issuer's discovery document from the bridge's Service instead
+# of the issuer name, which never resolves, and pins the bridge's issuer CA
+# by the thumbprint in `bridgeSecretName`. The bucket-init Job registers that
+# provider and the vend role, which trusts only tokens for `subject` with
+# `audience`, lives at most `maxSessionDuration` seconds (the authority asks
+# for 3600) and may read and write objects in the two buckets: the ceiling
+# every session's exact-object policy narrows. versitygw's account is fixed
+# at 000000000000, so the role is arn:aws:iam::000000000000:role/<roleName>,
+# the authority's SPACE_CREDMGR_S3_VEND_ROLE_ARN. These must match the
+# bridge's values.
+storageExchange:
+  issuerHost: sts-bridge.kind.invalid
+  discoveryUrl: https://sts-bridge:8443/.well-known/openid-configuration
+  audience: kind-sts-bridge
+  subject: kind-storage-vend
+  roleName: kind-storage-vend
+  maxSessionDuration: 3600
+  bridgeSecretName: space-kind-sts-bridge
+  # Set by every bring-up path to the checksum sts-bridge-secret.sh prints,
+  # so a reissued issuer CA reruns the bucket-init Job (and only it).
+  secretChecksum: ""
 
 # Extra versitygw global flags (before the `posix` backend subcommand).
 # `--pprof` serves Go profiles on loopback only, for stall diagnostics

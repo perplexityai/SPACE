@@ -5,8 +5,9 @@ exactly when that service's chart renders it. These checks render every node
 service, per role, and the control-plane credential-manager authority, and
 assert that the credential database, its password, the AWS credentials and the
 Secrets Manager reader role reach only the authority, and the static
-object-store credentials only volume-manager and build-manager (the services
-that transfer objects with them). Volume-manager's streaming upload budget is
+object-store credentials only the builders' volume-manager and build-manager
+(the services that transfer objects with them; worker volume-manager
+exchanges its credentials by default). Volume-manager's streaming upload budget is
 unset by default, so the service default applies, and renders exactly as set.
 """
 
@@ -41,7 +42,7 @@ OBJECT_STORE_STATIC = {
     "SPACE_OBJECT_STORE_STATIC_ACCESS_KEY_ID",
     "SPACE_OBJECT_STORE_STATIC_SECRET_ACCESS_KEY",
 }
-OBJECT_STORE_CONSUMERS = {"volume-manager", "build-manager"}
+OBJECT_STORE_CONSUMERS = {("builder", "volume-manager"), ("builder", "build-manager")}
 STREAM_BUDGET = "SPACE_VOLUME_STREAM_PUSH_BUFFER_BUDGET_BYTES"
 VOLUME_MANAGER_CHART = KIND_DIR / "charts/space-volume-manager-local"
 
@@ -72,7 +73,7 @@ def test_node_services_receive_no_credential_authority_settings(release, role, s
 @pytest.mark.parametrize(("release", "role", "service"), NODE_RELEASES)
 def test_static_object_store_credentials_reach_only_their_consumers(release, role, service):
     present = _node_service_env(release, role, service) & OBJECT_STORE_STATIC
-    if service in OBJECT_STORE_CONSUMERS:
+    if (role, service) in OBJECT_STORE_CONSUMERS:
         assert present == OBJECT_STORE_STATIC, f"{release} {service} renders {sorted(present)}"
     else:
         assert not present, f"{release} {service} renders {sorted(present)}"
@@ -108,7 +109,9 @@ def test_volume_manager_renders_a_set_stream_upload_budget_exactly(value, expect
 
 
 def test_the_authority_reads_the_secrets_manager_role_from_the_optional_aws_secret():
-    manifests = render(AUTHORITY_CHART, "space")
+    # Only with static storage credentials: exchanged ones take the authority's
+    # one default credential chain and STS endpoint for the vend role.
+    manifests = render(AUTHORITY_CHART, "space", "--set", "storageCredentials=static")
     deployment = next(
         document for document in manifests
         if document.get("kind") == "Deployment" and document["metadata"]["name"] == "space-credmgr-authority"

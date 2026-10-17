@@ -15,3 +15,29 @@ spec:
       port: {{ .Values.service.s3Port }}
       targetPort: s3
       protocol: TCP
+---
+# versitygw's IAM service (templates/iam.yaml): the IAM and STS API over TLS
+# (AssumeRoleWithWebIdentity for the STS bridge, and the IAM API the
+# bucket-init Job registers the OIDC provider and vend role through), and the
+# private API the gateway asks about sessions, over mTLS.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.iam.serviceName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: space-object-store-iam
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  selector:
+    app.kubernetes.io/name: space-object-store-iam
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: iam
+      port: {{ .Values.iam.port }}
+      targetPort: iam
+      protocol: TCP
+    - name: iam-private
+      port: {{ .Values.iam.privatePort }}
+      targetPort: iam-private
+      protocol: TCP

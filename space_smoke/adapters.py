@@ -87,6 +87,10 @@ from space_smoke.capabilities import (
     SandboxPodPlacement,
     SnapshotRecord,
     FailedTransfer,
+    StorageExchangeOutcome,
+    StorageObject,
+    StorageRequestResult,
+    StorageSession,
     ReleaseStorageRow,
     RestoreActivation,
     RestoreFailure,
@@ -98,6 +102,7 @@ from space_smoke.capabilities import (
     WarmPoolCandidate,
     WarmPoolSelection,
 )
+from space_smoke.credmgr_socket import exchange_token, relay_argv
 from space_smoke.orphaned_restore_pod_gc import (
     GC_ENV_KEYS,
     GC_LOG_NEEDLE,
@@ -4987,6 +4992,172 @@ ON CONFLICT (key_hash) DO NOTHING;
     def _docker_exec(self, node_name: str, *command: str) -> CommandResult:
         return self.executor.run(
             ["docker", "exec", self._kind_node_container(node_name), *command], timeout=30
+        )
+
+    # --- storage exchange ----------------------------------------------------
+    #
+    # credential-manager's storage exchange, asked on a sandbox worker's agent
+    # volume socket as the volume-manager account (credmgr_socket.py), and S3
+    # requests against the store with the session it returns or with the
+    # store's root keys. Reads only, except one refused small write.
+
+    def storage_credentials_mode(self) -> str:
+        result = self.kubectl(
+            "get", "deployments", "-l", "app.kubernetes.io/name=space-credmgr-authority",
+            "-o", "jsonpath={.items[*].metadata.labels.space\\.pplx\\.net/kind-storage-credentials}",
+            timeout=15,
+        )
+        modes = set(_require_ok(result, "read the storage credentials mode").split())
+        # An authority rendered before the modes existed ran static keys.
+        mode = modes.pop() if len(modes) == 1 else "static" if not modes else ""
+        if mode not in ("exchange", "static"):
+            raise SmokeConfigurationError(f"the authority runs no known storage credentials mode: {sorted(modes)}")
+        # The label records how the authority's chart was rendered. The worker
+        # volume-manager must agree, holding the store's static keys in
+        # `static` only: a failed apply or a stale Tilt resource can leave the
+        # workers on the other side of it.
+        result = self.kubectl(
+            "get", "daemonset", "space-volume-manager",
+            "-o", "jsonpath={.spec.template.spec.containers[*].env[*].name}", timeout=15,
+        )
+        names = _require_ok(result, "read the worker volume-manager env").split()
+        worker_keys = sorted(name for name in names if name.startswith("SPACE_OBJECT_STORE_STATIC_"))
+        if bool(worker_keys) != (mode == "static"):
+            raise SmokeConfigurationError(
+                f"the authority runs storage credentials mode {mode}, but the worker volume-manager "
+                + (f"holds static keys ({', '.join(worker_keys)})" if worker_keys else "holds no static keys")
+            )
+        return mode
+
+    def sandbox_worker_nodes(self) -> list[str]:
+        result = self.kubectl(
+            "get", "pods", "-l", "app.kubernetes.io/name=space-worker,app.kubernetes.io/component=volume-manager",
+            "-o", "jsonpath={.items[*].spec.nodeName}", timeout=15,
+        )
+        return sorted(set(_require_ok(result, "list worker volume-manager pods").split()))
+
+    def _storage_environment(
+        self, access_key_id: str, secret_access_key: str, session_token: str | None
+    ) -> dict[str, str | None]:
+        return {
+            "AWS_SESSION_TOKEN": session_token,
+            "AWS_SECURITY_TOKEN": None,
+            "AWS_PROFILE": None,
+            "AWS_DEFAULT_PROFILE": None,
+            "AWS_WEB_IDENTITY_TOKEN_FILE": None,
+            "AWS_ROLE_ARN": None,
+            "AWS_ROLE_SESSION_NAME": None,
+            "AWS_SHARED_CREDENTIALS_FILE": os.devnull,
+            "AWS_CONFIG_FILE": os.devnull,
+            "AWS_ACCESS_KEY_ID": access_key_id,
+            "AWS_SECRET_ACCESS_KEY": secret_access_key,
+            "AWS_REGION": "us-east-1",
+            "AWS_DEFAULT_REGION": "us-east-1",
+            "AWS_EC2_METADATA_DISABLED": "true",
+            # A refusal is the answer under test, never a transient to retry.
+            "AWS_MAX_ATTEMPTS": "1",
+        }
+
+    def _root_storage_environment(self) -> dict[str, str | None]:
+        return self._storage_environment(
+            self.environment.get("SPACE_SMOKE_S3_ACCESS_KEY_ID", "localadmin"),
+            self.environment.get("SPACE_SMOKE_S3_SECRET_ACCESS_KEY", "localadmin-dev-secret"),
+            None,
+        )
+
+    def _s3api(self, environment: Mapping[str, str | None], *args: str, timeout: float = 30) -> CommandResult:
+        return self.executor.run(
+            [
+                "aws", "--no-cli-pager", "--endpoint-url",
+                self.environment.get("S3_ENDPOINT", "http://127.0.0.1:8333"), "s3api", *args,
+            ],
+            env=environment,
+            timeout=timeout,
+        )
+
+    def bucket_objects(self, bucket: str, *, limit: int, prefix: str = "") -> list[StorageObject]:
+        args = ["list-objects-v2", "--bucket", bucket, "--max-items", str(limit), "--output", "json"]
+        if prefix:
+            args += ["--prefix", prefix]
+        output = _require_ok(self._s3api(self._root_storage_environment(), *args), f"list {bucket}")
+        contents = (json.loads(output) if output.strip() else {}).get("Contents", [])
+        return [
+            StorageObject(bucket=bucket, key=item["Key"], etag=item.get("ETag", ""), size=int(item.get("Size", 0)))
+            for item in contents
+        ]
+
+    def snapshot_objects(self, record: SnapshotRecord) -> list[StorageObject]:
+        bucket, prefix, _, _ = self._snapshot_storage_target(record)
+        return self.bucket_objects(bucket, limit=100, prefix=prefix)
+
+    def head_object(self, bucket: str, key: str) -> StorageObject | None:
+        result = self._s3api(self._root_storage_environment(), "head-object", "--bucket", bucket, "--key", key)
+        if result.returncode != 0 and ("404" in result.stderr or "Not Found" in result.stderr):
+            return None
+        head = json.loads(_require_ok(result, f"head {bucket}/{key}"))
+        return StorageObject(bucket=bucket, key=key, etag=head.get("ETag", ""), size=int(head.get("ContentLength", 0)))
+
+    def exchange_storage_credentials(
+        self, node_name: str, *, subject: str, resource: str, scope: str
+    ) -> StorageExchangeOutcome:
+        self._require_isolated_kind("on-node operations")
+        argv = relay_argv(
+            ["kubectl", "--context", self.config.context, "-n", KIND_NAMESPACE],
+            self._node_shell_pod(node_name),
+            KIND_NODE_SHELL_CONTAINER,
+            "/space/run/volume-credentials/credmgr.sock",
+            # volume-manager's account; the socket's group admits it
+            # (crates/libs/credential/mgr/server/src/run/volume_socket.rs).
+            user="space-volmgr",
+            groups=("space-volcredclients",),
+        )
+        credentials, status, detail = exchange_token(argv, resource=resource, scope=scope, subject=subject)
+        session = (
+            StorageSession(
+                access_key_id=credentials.access_key_id,
+                secret_access_key=credentials.secret_access_key,
+                session_token=credentials.session_token,
+                expires_at_unix=credentials.expires_at_unix,
+            )
+            if credentials is not None
+            else None
+        )
+        return StorageExchangeOutcome(session=session, status=status, detail=detail[:500])
+
+    def storage_request(
+        self, session: StorageSession, operation: str, bucket: str, key: str, *, body: bytes | None = None
+    ) -> StorageRequestResult:
+        environment = self._storage_environment(
+            session.access_key_id, session.secret_access_key, session.session_token
+        )
+        with tempfile.TemporaryDirectory(prefix="space-smoke-s3-") as directory:
+            if operation == "head":
+                args = ["head-object", "--bucket", bucket, "--key", key]
+            elif operation == "get":
+                args = ["get-object", "--bucket", bucket, "--key", key, os.path.join(directory, "object")]
+            elif operation == "list":
+                args = ["list-objects-v2", "--bucket", bucket, "--prefix", key, "--max-items", "1"]
+            elif operation == "put":
+                if body is None:
+                    raise ValueError("a put needs a body")
+                path = os.path.join(directory, "body")
+                Path(path).write_bytes(body)
+                args = ["put-object", "--bucket", bucket, "--key", key, "--body", path]
+            else:
+                raise ValueError(f"unknown storage operation {operation!r}")
+            result = self._s3api(environment, *args, timeout=60)
+        detail = result.detail()[-500:]
+        # The aws CLI names the S3 status in its error: 403 Forbidden for a
+        # body-less refusal, AccessDenied when the store sent an error body.
+        refused = result.returncode != 0 and any(
+            marker in detail for marker in ("(403)", "AccessDenied", "Forbidden")
+        )
+        return StorageRequestResult(
+            operation=operation,
+            target=f"{bucket}/{key}",
+            succeeded=result.returncode == 0,
+            refused=refused,
+            detail=detail,
         )
 
     # --- sandbox network isolation -------------------------------------------

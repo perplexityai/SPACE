@@ -6,7 +6,9 @@ pause container is hijacked by `containerd-shim-space-v2` into a real
 Firecracker microVM), the production worker service set on every sandbox
 node, a dedicated builder role that runs actual ECW recipes, node registration
 through node-ctl → internal-api, templates distributed through the production
-publish/pull path, and real S3 snapshot transit via an in-cluster versitygw object store. The
+publish/pull path, and real S3 snapshot transit via an in-cluster versitygw object store,
+with sandbox workers' volume-manager holding no object-store keys: like a deployment's, it
+exchanges each transfer's credentials through credential-manager. The
 remaining deviations from production are listed in "How it differs from
 production" below.
 
@@ -1110,6 +1112,8 @@ kind cluster: space-local (kind-cluster.yaml.tmpl — 6 nodes)
 ├── worker3 [pool=infra,    space.pplx.net/infra=true]
 │   ├── space-postgres        (StatefulSet; PostgreSQL 17 serving TLS only, non-superuser master user)
 │   ├── space-object-store    (versitygw S3 gateway + bucket-init Job)
+│   ├── space-object-store-iam (Deployment; versitygw's standalone IAM service: the storage exchange's STS and sessions)
+│   ├── space-kind-sts-bridge (Deployment; Kind-only STS front for the authority's storage exchange, and the token issuer the IAM service trusts)
 │   ├── space-redis           (Deployment; the rate limiters' store, which api, admin-api and cluster-controller reach through SPACE_REDIS_URL)
 │   ├── space-api             (Deployment, 2–3 replicas by HPA; SPACE_K8S_CONTROL_PLANE=true)
 │   ├── space-admin-api       (Deployment; the same binary on the dedicated admin surface)
@@ -1512,7 +1516,10 @@ placed on the node records
 (`crates/libs/api/src/controllers/substrate/kubernetes/node_sync.rs`), so the
 authority refuses builder callers with `node_identity_mismatch`. Kind's
 builders do not need it: their build-manager and volume-manager read the
-object store's static keys instead of exchanging tokens. Each node's
+object store's static keys instead of exchanging tokens, in both storage
+credentials modes ([Object-store credentials](#object-store-credentials)).
+Sandbox workers' volume-manager exchanges tokens through its node agent
+unless the mode is `static`. Each node's
 credential-manager runs `--role=agent`: it holds the node's credential sockets
 under its service mutex and forwards every call upstream as the node credential
 agent, with no database, KEK or AWS credential. node-manager
@@ -1652,12 +1659,13 @@ asks of the hosting deployment.
 | Server logs lock waits; the application roles' `lock_timeout` is off (`SPACE_DB_APP_LOCK_TIMEOUT` `0`) | `log_lock_waits = on`; `SPACE_DB_APP_LOCK_TIMEOUT` is unset, which leaves `lock_timeout` off the same way. Other server parameters are the image's defaults rather than a managed parameter group |
 | The migration Job fails fast: one attempt, no restarts, its deadline passed to the migrator | The same `space-db-migrate` Job shape (`backoffLimit: 0`, `restartPolicy: Never`, `activeDeadlineSeconds` = `SPACE_DB_MIGRATE_JOB_DEADLINE_SECONDS`), bootstrap-roles → migrate → bootstrap-roles. `bootstrap.sh` stops on a failed Job with its logs; rerunning it replaces the Job |
 | S3 for snapshots + template artifacts                     | In-cluster versitygw (real S3 protocol, sigv4, path-style)                    |
+| volume-manager gets each transfer's credentials from its node's credential-manager agent; the authority authorizes the subject and object and assumes the S3 vend role through STS with a session policy for that one object, which S3 enforces on every request | the same path on sandbox workers ([Object-store credentials](#object-store-credentials)): the authority's unchanged `AssumeRole` reaches the Kind-only STS bridge (`space-kind-sts-bridge`), which exchanges it at versitygw's IAM service; that service checks the vend role's trust and maximum duration and stores the session, whose policy the gateway enforces. What stays different: the authority signs `AssumeRole` with the bridge's static vend keys (a Secret `sts-bridge-secret.sh` issues per cluster) where a deployment uses its workload identity, so those keys replace `space-aws-creds` and the authority's AWS Secrets Manager integration is off in this mode; and STS runs beside the store: the IAM service is its own Deployment, so an outage refuses every session-signed request while the gateway stays Ready and root keys keep working, but no AWS account boundary separates STS from S3. `SPACE_KIND_STORAGE_CREDENTIALS=static` opts out: worker volume-manager then reads static `SPACE_OBJECT_STORE_STATIC_*` creds (the documented local escape hatch) and no vend role is configured |
 | Rate limiters (cluster activation admission at the binary defaults, per-client concurrency in `observe`) on a Redis-compatible store reached over TLS (`rediss://`), its URL delivered through the `space-redis` Secret (`app_deploy.tf`) | the same limiters, modes and defaults on the in-cluster `space-redis` Deployment (one in-memory replica on the infra node), reached over plaintext `redis://space-redis:6379` rendered as a literal: the workspace's Redis clients trust only the webpki roots (`tls-rustls-webpki-roots` in `Cargo.toml`), so they would refuse a CA `internal-rpc-tls.sh` could issue, and the `#insecure` URL fragment would be an environment-only switch. `local.rate_limiters_enforce_and_fail_open` shrinks the caps and scales the store to zero for its fail-open half |
 | `SPACE_REDIS_URL` on api, admin-api, cluster-controller and internal-api | on api, admin-api and cluster-controller only: the limiters that read it live in `crates/libs/api` (api and admin-api build both, the cluster-controller's public-operation dispatcher builds the activation limiter), and nothing `space-internal-api-svc` links reads it |
 | `space-credmgr-authority` Deployment whose platform KEK comes from an external intermediate-key broker, with TLS from its own certificate (`credmgr_authority_tls.tf`; the direct KMS backend is gone, `credmgr_authority_kms.tf`) | two replicas on the same broker path against the in-repo broker fixture (`space-kind-key-broker`), which derives keys instead of protecting them; TLS from a self-signed certificate `internal-rpc-tls.sh` issues per cluster |
 | Internal RPC CA and listener leaves issued by Terraform and synced by External Secrets (`internal_rpc_tls.tf`) | the same Secrets issued per cluster by `scripts/internal-rpc-tls.sh`; the ingress activation leaf names `space-api` rather than `space-ingress-activation` |
-| volume-manager credentials via credmgr STS/IRSA           | static `SPACE_OBJECT_STORE_STATIC_*` creds (the documented local escape hatch) |
-| build-manager gets S3 credentials via credential-manager backed by cloud identity | the same directly injected static object-store credentials; credential-manager's storage exchange endpoint is explicitly disabled |
+| Builder volume-manager and build-manager exchange their credentials through credential-manager | the store's static root keys in both modes: the authority refuses builder-node callers with `node_identity_mismatch`, because no registration records a builder node's Kubernetes UID ([Service identities](#service-identities)). The follow-up is that builder-UID fix; with it, Kind can take the builders' keys away and point build-manager at the authority |
+| cluster-controller reaches S3 with its workload identity   | the store's static root keys as `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` in both modes: Kind has no workload identity provider to reproduce |
 | `/dev/kvm` access via the AMI's kvm group                 | `space-kind-devices.service` makes `/dev/kvm`, `/dev/vhost-vsock` and `/dev/vhost-net` mode 0666 on the node (kind-only; never replicate on a worker) |
 | Loop devices from the AMI's `max_loop=10000` on a real devtmpfs | The node's tmpfs `/dev` starts with 8 nodes; `space-loop-nodes.service` mknods the rest before kubelet, pods copy the node's `/dev`, and node-manager raises its pod's pool further. The cache device has autoclear set, so a node stop releases it (`scripts/lib/space-loop-devices.sh`) |
 | vhost-vsock jail nodes provided by the AMI                | the Kind-only `space-kind-vsock-jails.service` mknods them into each jail under `/space/cache/firecracker/jails` as it appears (kind-only) |
@@ -1915,7 +1923,10 @@ SPACE_SMOKE_BACKEND=kind SPACE_SMOKE_API_SURFACE=ecw \
 #    the role reads the task-owned ARN only when the secret's space-org-id tag
 #    equals the smoke organization's ID (docs/configuration.md).
 #    The controlled HTTPS endpoint must return only the lowercase SHA-256 of
-#    the Authorization header it receives.
+#    the Authorization header it receives. Bring the cluster up with
+#    SPACE_KIND_STORAGE_CREDENTIALS=static: with exchanged storage
+#    credentials the authority's AWS credentials and STS endpoint are the
+#    STS bridge's (see "Object-store credentials").
 SPACE_SMOKE_BACKEND=kind SPACE_SMOKE_API_SURFACE=native \
   SPACE_API_URL=http://127.0.0.1:8080 \
   SPACE_DATA_PLANE_URL=http://127.0.0.1:8090 \
@@ -1991,8 +2002,12 @@ never firing) if reintroduced:
 - **Object store layout**: versitygw's POSIX backend stores each bucket as a
   directory and each object as a file under the infra node's
   `/var/lib/space-object-store`, with ETags and user metadata in `user.*`
-  xattrs. kind mounts every node's `/var` as an anonymous Docker volume and
-  no extraMount covers this path, so the data and its xattrs live on the
+  xattrs. Beside the buckets, the IAM service keeps its state in `.iam/`
+  (the OIDC provider, the vend role and every live session), and the gateway
+  its object locks in `.vgwlocks/`; neither is a valid bucket name, so
+  neither is listed or served as a bucket. kind mounts every node's `/var`
+  as an anonymous Docker volume and the infra node's only extraMount is
+  `/var/lib/containerd`, so the data and its xattrs live on the
   filesystem backing that volume (under Docker's data root), not on the
   node's overlay root. There are no
   pre-allocated volumes or volume slots to exhaust (the SeaweedFS chart it
@@ -2009,19 +2024,167 @@ upload). Only reachable after a real restore failure.
 ## Real S3 snapshot + template path (object store + volume-manager)
 
 `space-object-store` runs versitygw, an S3-compatible gateway, on the infra node, with
-a one-shot Job that creates the `snapshots` and `templates` buckets. The S3
+versitygw's standalone IAM service in its own Deployment beside it
+(`space-object-store-iam`) and a one-shot Job that creates the `snapshots` and `templates` buckets. The S3
 API is port-forwarded to [localhost:8333](http://localhost:8333).
 
-`space-volmgr-svc` performs real S3 transfers to the object store with static creds
-from the `space-object-store` Secret — both suspend/restore snapshot artifacts
-(`snapshots` bucket) and template pulls (`templates` bucket, populated by the
-`space-seed-publish` Job). See `crates/libs/vol/mgr/server/src/run.rs`.
+`space-volmgr-svc` performs real S3 transfers to the object store — both
+suspend/restore snapshot artifacts (`snapshots` bucket) and template pulls
+(`templates` bucket, populated by the `space-seed-publish` Job) — with the
+credentials the storage credentials mode gives it (below). See
+`crates/libs/vol/mgr/server/src/run.rs`.
 
 Verify the round-trips with the object-store port-forward:
 
 ```bash
 aws --endpoint-url http://localhost:8333 s3 ls s3://snapshots/ --recursive
 aws --endpoint-url http://localhost:8333 s3 ls s3://templates/ --recursive
+```
+
+### Object-store credentials
+
+`SPACE_KIND_STORAGE_CREDENTIALS` selects how sandbox workers' volume-manager
+authenticates to the object store, for every bring-up path
+([`lib/storage-credentials.sh`](lib/storage-credentials.sh)):
+
+- `exchange` (the default): as deployed, volume-manager holds no keys. For
+  each transfer it asks its node's credential-manager agent, on the volume
+  socket, for a session scoped to the transfer's one object
+  (`exchange_credentials`, `crates/libs/vol/mgr/server/src/credentials.rs`):
+  scope `space.storage.read` for a pull and `space.storage.read
+  space.storage.write` for a push (which verifies its upload with HeadObject),
+  the SPACE subject (`sandbox:<id>` or `template:<name>`) and a one-hour
+  lifetime. The agent forwards the request as itself, with the caller's UDS
+  identity as the actor. The authority checks the caller's pod and node, then
+  the subject against the object (`authorize_exchange`,
+  `crates/libs/credential/mgr/server/src/storage_exchange.rs`): a sandbox may
+  reach only its own `suspend_snapshots/<shard>/<sandbox>/…` keys inside its
+  org's snapshot storage, with writes fenced to the nodes that own it, and a
+  template only `templates/<name>/<hash>/…`, with published releases
+  read-only. It then calls STS `AssumeRole` on the vend role
+  (`SPACE_CREDMGR_S3_VEND_ROLE_ARN`, `arn:aws:iam::000000000000:role/kind-storage-vend`)
+  with a session policy for exactly that object, and logs one
+  `credential_security_audit` event per decision.
+- `static`: the opt-out. Worker volume-manager reads the store's root keys
+  from the `space-object-store` Secret, the authority has no vend role, and
+  its storage exchange is disabled. The authority's optional AWS
+  integrations (`space-aws-creds`, such as the AWS Secrets Manager
+  network-credential scenario) need this mode: in `exchange` its one default
+  credential chain and STS endpoint belong to the vend identity and the
+  bridge.
+
+Kind's STS is two pieces, both running in either mode:
+
+- **versitygw's standalone IAM service**, the `space-object-store-iam`
+  Deployment on the infra node (`versitygw iam`, the same pinned image). It
+  answers `AssumeRoleWithWebIdentity`, checks the role's trust policy and
+  maximum duration (3600 s), and keeps each session and its policy in `.iam/`
+  on the store's hostPath, so sessions survive restarts. The gateway asks it
+  about every request signed with a session's keys, on its private port over
+  mTLS, and enforces the session policy as an intersection with the role's own
+  policy (Get, Put and AbortMultipartUpload on both buckets' objects,
+  ListBucket on both). Root keys are resolved and authorized by the gateway
+  alone, and the gateway only warns at startup when the service is
+  unreachable, so the IAM service has its own pod: an IAM crash or restart
+  refuses session-signed requests while the gateway stays Ready and root-key
+  clients (builders, build-manager, cluster-controller, the Jobs, and
+  static-mode workers) keep working. Both its ports serve TLS with leaves from
+  the internal RPC CA (`internal-rpc-tls.sh`): the IAM and STS API for the
+  bridge and the bucket-init Job, and the private API, which requires the
+  gateway's client leaf. A NetworkPolicy admits only those three callers,
+  since a captured bridge token is all `AssumeRoleWithWebIdentity` needs. The
+  bucket-init Job registers, idempotently on every run, the OIDC
+  provider (the bridge's issuer, pinned by its CA's thumbprint), the vend role
+  with its trust policy, and the role's policy
+  ([charts/space-object-store](charts/space-object-store/values.yaml)).
+- **The STS bridge** (`space-kind-sts-bridge`, source in
+  [`sts-bridge/`](sts-bridge/main.go), Go standard library only). The
+  authority's AWS SDK reaches it as `AWS_ENDPOINT_URL_STS=https://sts-bridge:8080`,
+  over TLS from the internal RPC CA, signing with the vend identity's static
+  keys. The bridge verifies the SigV4 signature, refuses any parameter but
+  `RoleArn`, `RoleSessionName`, `Policy` and `DurationSeconds`, mints a
+  five-minute RS256 token for the vend identity's subject, calls
+  `AssumeRoleWithWebIdentity` with it and the same parameters (over TLS,
+  verifying the IAM service's leaf against the internal RPC CA), and answers in
+  `AssumeRole`'s format; a token the IAM service refuses comes back as
+  `AccessDenied`, as AWS STS reports a role that does not trust its caller.
+  On `:8443` it serves the issuer's discovery document and JWKS, which the IAM
+  service fetches from the bridge's Service with TLS verified against the
+  pinned CA, while tokens name an issuer, `https://sts-bridge.kind.invalid`,
+  that never resolves. The vend identity is no store user, so its keys open
+  nothing on S3 by themselves. [`scripts/sts-bridge-secret.sh`](scripts/sts-bridge-secret.sh)
+  issues the bridge's Secret once per cluster (the vend identity, the signing
+  key, and the issuer's CA and leaf) and keeps it across upgrades; both
+  bring-up paths run it before the charts and pass its checksum to the bridge,
+  the authority and the object store's bucket-init Job, which roll or rerun
+  when it changes. Tilt runs it when the Tiltfile loads, so a smoke bring-up
+  that reuses a running Tilt does not reissue a deleted Secret;
+  `tilt trigger '(Tiltfile)'` does. The IAM service reads nothing from it and needs no restart
+  on a reissue: versitygw keys its cached JWKS on the provider's thumbprints,
+  which the rerun Job updates, and refetches it for an unknown `kid`, which the
+  bridge derives from its signing key. Both bridge listeners bound header,
+  body and response times and their open connections, since they read a
+  request before authenticating it.
+
+The bridge's SigV4 check covers the algorithm, the credential scope (its
+date matching `X-Amz-Date`, service `sts`, `aws4_request`), `X-Amz-Date`
+within 15 minutes, that `host` and `x-amz-date` are signed, the method, path,
+query, every signed header, the body actually received and
+`X-Amz-Content-Sha256` when sent, with a constant-time comparison. It refuses a
+missing signature, a wrong secret, an unknown key, a changed body, an expired
+or future date, and a session token beside the keys or a session's own keys
+(no role chaining). It does not cover presigned or SigV4A requests, chunked
+payload signing, the scope's region, or replay of a captured request within
+the 15-minute window (which AWS accepts too), and it applies no IAM policy to
+its callers: the role's trust policy is the only authorization. Anyone with
+its signing key can mint tokens the IAM service trusts, so that key is as
+sensitive as the vend secret. The unit tests in `sts-bridge/` check it
+against a request botocore signed, and gate the image build.
+
+An out-of-scope write is refused before versitygw reads the body, and it
+closes the connection after a refusal, so a client that writes a large body
+first, such as the AWS SDK for Rust, usually sees a connection reset instead
+of the 403 (with static keys too). Checks of refused writes therefore use
+bodies of at most 64 KiB or assert that the object is unchanged, never the
+status of a large refused PUT.
+
+Both modes run the same store, IAM service and bridge over the same data, so
+an existing cluster switches on its next bring-up, without recreation:
+
+```bash
+SPACE_KIND_STORAGE_CREDENTIALS=static bash scripts/tests/smoke-kind-e2e.sh   # opt out
+bash scripts/tests/smoke-kind-e2e.sh                                         # back to exchange
+```
+
+A switch re-renders the authority and the worker volume-manager DaemonSet,
+which roll; a running Tilt reads the mode once, so the smoke bring-up
+restarts a Tilt that runs the other one, and `tilt up` users restart it
+themselves. The authority's Deployment records the mode in its
+`space.pplx.net/kind-storage-credentials` label, and the worker
+volume-manager DaemonSet must agree (static keys in its env in `static`
+only). A smoke run with `SKIP_BOOTSTRAP=1` refuses a cluster in the other
+mode or with disagreeing workers, the bring-up checks both after Tilt
+settles, and `local.storage_exchange_scoping` fails on a cluster where they
+disagree.
+`local.storage_exchange_scoping` exchanges through a worker's agent socket as
+volume-manager does, then shows the store refusing the session for another
+sandbox's snapshot, the templates bucket and a write under read scope, and
+the authority refusing the subject for another sandbox's object with its
+resource denial; the session and a fresh exchange still read the object
+afterwards.
+
+To see the exchange at work, read the authority's audit events on both
+replicas, the bridge's request log, and confirm that the worker
+volume-manager has no keys:
+
+```bash
+k() { kubectl --context kind-space-local -n space "$@"; }
+k logs -l app.kubernetes.io/name=space-credmgr-authority --prefix --tail=-1 \
+  | grep credential_security_audit | grep ExchangeToken
+k logs deploy/space-kind-sts-bridge
+k logs deploy/space-object-store-iam
+k get ds space-volume-manager \
+  -o jsonpath='{.spec.template.spec.containers[0].env[*].name}'
 ```
 
 ### Object store transition
@@ -2042,7 +2205,10 @@ run `infra/space/kind/scripts/check-object-store-transition.sh` against an
 existing cluster before they apply anything; when it still has resources from
 the `space-seaweedfs` chart, they list those resources and stop without
 changing anything: the two scripts exit with status 1, and Tilt reports a
-Tiltfile load error. Recreating deletes the cluster's sandboxes,
+Tiltfile load error. The same check refuses a cluster whose
+`space-object-store` Deployment itself runs SeaweedFS, as an early prototype
+of [exchanged credentials](#object-store-credentials) did. Switching
+`SPACE_KIND_STORAGE_CREDENTIALS` is not refused. Recreating deletes the cluster's sandboxes,
 snapshots and templates, and keeps the containerd image caches:
 
 ```bash

@@ -100,6 +100,11 @@ TELEMETRY_HELM_ARGS=()
 while IFS= read -r value; do
   TELEMETRY_HELM_ARGS+=(--set-string "$value")
 done <<<"$telemetry_values"
+# How node services get object-store credentials (lib/storage-credentials.sh);
+# helm_apply hands it to every chart, and the charts that read it act on it.
+# shellcheck source=../lib/storage-credentials.sh
+. "$KIND_DIR/lib/storage-credentials.sh"
+STORAGE_CREDENTIALS="$(space_kind_storage_credentials)" || die "invalid SPACE_KIND_STORAGE_CREDENTIALS"
 
 # ── Step 0: prereqs ──────────────────────────────────────────────────────────
 require_bin() {
@@ -294,6 +299,10 @@ kubectl --context "$KCTX" apply -f "$KIND_DIR/manifests/priorityclasses.yaml" >/
 # Internal RPC TLS: the cluster's CA and the listeners' identities as Secrets,
 # before any workload that mounts them (docs/internal-rpc-tls.md).
 SPACE_KIND_CLUSTER="$KIND_CLUSTER" bash "$KIND_DIR/scripts/internal-rpc-tls.sh"
+# The STS bridge's Secret, kept outside Helm. Its checksum goes to every chart
+# whose pods read it (helm_apply), so a reissue rolls them.
+STS_BRIDGE_SECRET_CHECKSUM="$(SPACE_KIND_CLUSTER="$KIND_CLUSTER" bash "$KIND_DIR/scripts/sts-bridge-secret.sh")" \
+  || die "could not provision the STS bridge's Secret"
 
 # ── Step 5: images ───────────────────────────────────────────────────────────
 if (( SKIP_IMAGES )); then
@@ -329,6 +338,8 @@ helm_apply() {
     --namespace "$NAMESPACE" \
     --include-crds \
     ${TELEMETRY_HELM_ARGS[@]+"${TELEMETRY_HELM_ARGS[@]}"} \
+    --set-string "storageCredentials=$STORAGE_CREDENTIALS" \
+    --set-string "storageExchange.secretChecksum=$STS_BRIDGE_SECRET_CHECKSUM" \
     "$@" \
     | kubectl --context "$KCTX" apply --validate=false -f -
 }
@@ -367,11 +378,17 @@ kubectl --context "$KCTX" -n "$NAMESPACE" rollout status sts/space-postgres --ti
 # whole object-store step with `field is immutable` — before anything downstream
 # runs. Pre-delete it, exactly as space-seed-publish is pre-deleted below. The
 # Job is built to be re-run: it waits for the S3 API, then creates whichever
-# bucket is missing.
+# bucket is missing, and converges the storage exchange's OIDC provider and
+# vend role in the IAM service.
 kubectl --context "$KCTX" -n "$NAMESPACE" delete job space-object-store-bucket-init --ignore-not-found >/dev/null
 helm_apply space "$KIND_DIR/charts/space-object-store"
+# Kind-only STS bridge: the authority's AssumeRole in front of the store's IAM
+# service, and the token issuer that service trusts.
+helm_apply space "$KIND_DIR/charts/space-kind-sts-bridge"
 log "waiting for object-store Deployment to be ready"
 kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-object-store --timeout="${TIMEOUT}s"
+log "waiting for object-store IAM Deployment to be ready"
+kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-object-store-iam --timeout="${TIMEOUT}s"
 
 # Redis — shared store for the API rate limiters (cluster activation admission
 # + per-client concurrency), which space-api, space-admin-api and
@@ -491,6 +508,9 @@ kubectl --context "$KCTX" -n kube-system rollout status deploy/metrics-server --
 
 log "waiting for space-internal-api Deployment"
 kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-internal-api --timeout="${TIMEOUT}s"
+
+log "waiting for space-kind-sts-bridge Deployment"
+kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-kind-sts-bridge --timeout="${TIMEOUT}s"
 
 log "waiting for space-kind-key-broker Deployment"
 kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-kind-key-broker --timeout="${TIMEOUT}s"

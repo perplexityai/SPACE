@@ -48,6 +48,7 @@ class Scenario(Generic[Fixture]):
     quarantined: str | None
     ignored: str | None
     telemetry_mode: str | None
+    storage_credentials: str | None
     verify: Callable[[Fixture], None]
     source_module: str
 
@@ -84,6 +85,7 @@ def scenario(
     ignored: str | None = None,
     telemetry_mode: str | None = None,
     timeout_minutes: int | None = None,
+    storage_credentials: str | None = None,
 ) -> Callable[[Callable[[Fixture], None]], Scenario[Fixture]]:
     """Declare a smoke; its typed parameter selects the prepared fixture.
 
@@ -95,7 +97,9 @@ def scenario(
     explicitly runnable and visible in suite logs, outside the defect backlog.
     `telemetry_mode` names the Kind telemetry mode whose backends the scenario
     reads; implicit selection skips it, visibly, on a bench running another
-    known mode that the runner did not ask for.
+    known mode that the runner did not ask for. `storage_credentials` does the
+    same for the Kind storage credentials mode the scenario exercises
+    (SPACE_KIND_STORAGE_CREDENTIALS).
     `timeout_minutes` raises the fixture's wall-clock budget for a scenario
     whose own waits outlast it; it never lowers it.
     """
@@ -141,6 +145,8 @@ def scenario(
         raise ValueError("smoke telemetry mode must be 'otel'")
     if timeout_minutes is not None and timeout_minutes <= 0:
         raise ValueError("smoke timeout must be a positive number of minutes")
+    if storage_credentials not in (None, "exchange", "static"):
+        raise ValueError("smoke storage credentials mode must be 'exchange' or 'static'")
     supported_surfaces = frozenset(api_surfaces)
     if not supported_surfaces or not supported_surfaces <= {"ecw", "native"}:
         raise ValueError("smoke API surfaces must contain 'ecw' and/or 'native'")
@@ -174,6 +180,8 @@ def scenario(
             raise ValueError(
                 f"smoke {id} may only raise its fixture's {fixture_type.timeout_minutes}-minute timeout"
             )
+        if storage_credentials is not None and fixture_type is not KindEcw:
+            raise TypeError("a storage credentials mode requires the KindEcw fixture")
         return Scenario(
             id=id,
             category=id.split(".", 1)[0],
@@ -192,6 +200,7 @@ def scenario(
             quarantined=quarantined,
             ignored=ignored,
             telemetry_mode=telemetry_mode,
+            storage_credentials=storage_credentials,
             verify=verify,
             source_module=verify.__module__,
         )

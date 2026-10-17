@@ -164,6 +164,7 @@ TILT
     API_URL=http://localhost:8080
     KIND_STACK_DETACH=1
     SKIP_BOOTSTRAP=0
+    unset SPACE_KIND_STORAGE_CREDENTIALS
     source "$repo_root/scripts/tests/lib/bootstrap-kind-stack.sh"
 
     pgrep() { return 0; }
@@ -173,7 +174,16 @@ TILT
         [[ "$*" == 'get clusters' ]] || return 1
         printf '%s\n' "$KIND_CLUSTER"
     }
-    kubectl() { return 1; }
+    # The cluster runs the requested storage credentials mode: the authority's
+    # label and the worker volume-manager's env agree with the default. Every
+    # other cluster read fails.
+    kubectl() {
+        case "$*" in
+            *" get deployments -l app.kubernetes.io/name=space-credmgr-authority "*) printf 'exchange|' ;;
+            *" get daemonset space-volume-manager "*) printf 'space-volume-manager|' ;;
+            *) return 1 ;;
+        esac
+    }
     kill() { touch "$work/signaled"; }
     pkill() { touch "$work/signaled"; }
 
