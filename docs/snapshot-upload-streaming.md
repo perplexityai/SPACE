@@ -137,17 +137,20 @@ actual snapshot bucket used by that canary, including non-production buckets.
 
 ## Streaming from retained btrfs sources
 
-`SPACE_SNAPSHOT_STREAM_BTRFS_SEND=true` on sandbox-manager opts new btrfs
-suspend captures into retaining an immutable `rootfs.btrfs-source` bundle. It
-defers send-file creation only when volume-manager advertises streaming support
-(compression enabled, a positive upload buffer budget, and an authorized
-node-manager capability probe) and node-manager advertises source inspection.
-Both answers are reused for thirty seconds (five after a negative or failed
-probe), so captures and backups do not pay a round trip each.
-The default remains the existing materialized path. Named operation snapshots
-always materialize: they have no local sidecar to hold a source identity. LUKS
-artifacts keep their existing upload path; this option changes the btrfs-send
-codec, not encryption policy.
+By default, sandbox-manager retains an immutable `rootfs.btrfs-source` bundle
+for each new btrfs suspend capture instead of writing `rootfs.btrfs-send`;
+`SPACE_SNAPSHOT_STREAM_BTRFS_SEND=false` opts out. A capture defers the send
+file only when volume-manager advertises streaming support (compression
+enabled, a positive upload buffer budget, and an authorized node-manager
+capability probe) and node-manager advertises source inspection. Both answers
+are reused for thirty seconds (five after a negative or failed probe), so
+captures and backups do not pay a round trip each. Without both, the capture
+writes the send file as before. Streamed uploads from a retained source also
+need volume-manager to run its own identity: node-manager grants send-source
+leases to that principal only. Named operation snapshots always materialize:
+they have no local sidecar to hold a source identity. LUKS artifacts keep their
+existing upload path; this option changes the btrfs-send codec, not encryption
+policy.
 
 Each bundle contains private copy-on-write snapshots of the frozen rootfs and
 its template parent, plus a manifest binding their read-only subvolume UUIDs to
