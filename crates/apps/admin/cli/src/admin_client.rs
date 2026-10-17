@@ -26,7 +26,13 @@ pub(crate) struct AdminClient {
 }
 
 pub(crate) fn is_loopback(url: &reqwest::Url) -> bool {
-    matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
+    url.host_str().is_some_and(|host| {
+        host == "localhost"
+            || host
+                .trim_matches(['[', ']'])
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.to_canonical().is_loopback())
+    })
 }
 
 pub(crate) fn http_client(api_url: &str) -> reqwest::ClientBuilder {
