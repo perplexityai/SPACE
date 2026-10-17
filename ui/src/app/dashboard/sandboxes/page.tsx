@@ -1,6 +1,6 @@
 'use client';
 
-import { Suspense, useEffect, useMemo, useRef, useState } from 'react';
+import { Suspense, useEffect, useId, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import styles from './inventory.module.css';
 import { usePathname, useSearchParams } from 'next/navigation';
@@ -20,7 +20,6 @@ import {
 import { adminApi } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import {
-  AutoLifecyclePolicy,
   NetworkPolicyV1,
   Organization,
   PublicSnapshot,
@@ -43,14 +42,14 @@ import NetworkPolicyDesigner, {
 import NetworkPolicyGenerationTag from '@/components/network-policy-generation-tag';
 import {
   AutoLifecycleEditor,
-  disabledAutoLifecycle,
+  type AutoLifecycleFormValue,
   formValueToPolicy,
   formatNextAutoEvent,
   policyToFormValue,
   summarizeAutoLifecycle,
 } from '@/components/auto-lifecycle';
 import {
-  App, Table, Button, Form, Input, Select, Typography, Space, Tag, Popconfirm, Card, Tooltip, Switch, Checkbox, Modal,
+  App, Table, Button, Form, Input, Select, Typography, Space, Tag, Popconfirm, Card, Tooltip, Switch, Checkbox, Modal, Collapse, Alert,
 } from 'antd';
 import {
   PlusOutlined, StopOutlined, PauseCircleOutlined, ThunderboltOutlined,
@@ -558,6 +557,27 @@ export default function SandboxesPageRoute() {
   );
 }
 
+function SandboxReceipt({ sandboxId }: { sandboxId: string }) {
+  return (
+    <Space size={6}>
+      <Link href={`/dashboard/sandboxes/${sandboxId}`}>
+        <code>{sandboxLabelOrId(sandboxId)}</code>
+      </Link>
+      <Button
+        type="text"
+        size="small"
+        icon={<CopyOutlined />}
+        onClick={() => {
+          if (typeof navigator !== 'undefined' && navigator.clipboard) {
+            void navigator.clipboard.writeText(sandboxId);
+          }
+        }}
+        aria-label="Copy sandbox ID"
+      />
+    </Space>
+  );
+}
+
 function SandboxesPage() {
   const { message } = App.useApp();
   const [sandboxes, setSandboxes] = useState<Sandbox[]>([]);
@@ -567,9 +587,15 @@ function SandboxesPage() {
   const [loading, setLoading] = useState(true);
   const loadingRef = useRef(true);
   const [form] = Form.useForm();
-  const [createLifecycleForm] = Form.useForm();
-  const [createLifecycleModalOpen, setCreateLifecycleModalOpen] = useState(false);
-  const [customCreateAutoLifecycle, setCustomCreateAutoLifecycle] = useState<AutoLifecyclePolicy | null>(null);
+  const createFormId = useId();
+  const [createOpen, setCreateOpen] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const createPending = useRef(false);
+  // Closing modal content can still submit before it unmounts.
+  const createDraftActive = useRef(false);
+  const [createLifecycleExpanded, setCreateLifecycleExpanded] = useState(false);
+  const [hasCustomCreateLifecycle, setHasCustomCreateLifecycle] = useState(false);
+  const [creationWarning, setCreationWarning] = useState<{ sandboxId: string; error: string } | null>(null);
   const [lifecycleForm] = Form.useForm();
   const [editingLifecycleSandbox, setEditingLifecycleSandbox] = useState<Sandbox | null>(null);
   const [editingNetworkSandbox, setEditingNetworkSandbox] = useState<Sandbox | null>(null);
@@ -713,6 +739,20 @@ function SandboxesPage() {
     });
   };
 
+  const resetCreateDraft = () => {
+    form.resetFields();
+    form.setFieldsValue({ runtime: 'fc', template: templates[0]?.name });
+    setHasCustomCreateLifecycle(false);
+    setCreateLifecycleExpanded(false);
+  };
+
+  const closeCreate = () => {
+    if (createPending.current) return;
+    createDraftActive.current = false;
+    setCreateOpen(false);
+    resetCreateDraft();
+  };
+
   const handleCreate = async (values: {
     name?: string;
     org_id?: string;
@@ -720,7 +760,11 @@ function SandboxesPage() {
     runtime: string;
     boot_mode?: string;
     snapshots?: boolean;
+    auto_lifecycle?: AutoLifecycleFormValue;
   }) => {
+    if (!createDraftActive.current || createPending.current) return;
+    createPending.current = true;
+    setCreating(true);
     try {
       const payload = {
         name: values.name || null,
@@ -729,7 +773,7 @@ function SandboxesPage() {
         env: {},
         metadata: {},
         resources: null,
-        auto_lifecycle: customCreateAutoLifecycle ?? undefined,
+        auto_lifecycle: hasCustomCreateLifecycle ? formValueToPolicy(values.auto_lifecycle) : undefined,
       };
       // Cross-org creates go through the admin surface; the public path
       // only ever creates under the signed-in admin's own org.
@@ -738,72 +782,44 @@ function SandboxesPage() {
       const sandbox = targetOrgId
         ? await createConsoleSandboxForOrg(targetOrgId, payload)
         : await postPublicOperation('/sandboxes', payload);
-      if (values.snapshots) {
-        if (targetOrgId) {
-          await waitForAdminOperation(sandbox.operation_id);
-          await forceConsoleSandboxAction(sandbox.sandbox_id, 'enable_snapshots');
-        } else {
-          await waitForPublicOperation(sandbox.operation_id);
-          await postPublicOperation(`/sandboxes/${sandbox.sandbox_id}:enable_snapshots`);
+      createDraftActive.current = false;
+      let snapshotFailure: string | undefined;
+      try {
+        if (values.snapshots) {
+          if (targetOrgId) {
+            await waitForAdminOperation(sandbox.operation_id);
+            await forceConsoleSandboxAction(sandbox.sandbox_id, 'enable_snapshots');
+          } else {
+            await waitForPublicOperation(sandbox.operation_id);
+            await postPublicOperation(`/sandboxes/${sandbox.sandbox_id}:enable_snapshots`);
+          }
         }
+      } catch (err: any) {
+        snapshotFailure = err.message || 'Snapshot setup failed';
       }
-      form.resetFields();
-      form.setFieldsValue({
-        runtime: 'fc',
-        template: templates[0]?.name,
-      });
-      setCustomCreateAutoLifecycle(null);
-      createLifecycleForm.resetFields();
+      // An accepted create must not remain available for retry after a follow-up failure.
+      setCreateOpen(false);
+      resetCreateDraft();
       refreshAndReport();
-      const sandboxId = sandbox.sandbox_id;
-      const copyId = () => {
-        if (typeof navigator !== 'undefined' && navigator.clipboard) {
-          void navigator.clipboard.writeText(sandboxId);
-        }
-      };
-      message.success({
-        content: (
-          <Space size={6}>
-            <span>Sandbox created</span>
-            <Link href={`/dashboard/sandboxes/${sandboxId}`}>
-              <code>{sandboxLabelOrId(sandboxId)}</code>
-            </Link>
-            <Button
-              type="text"
-              size="small"
-              icon={<CopyOutlined />}
-              onClick={copyId}
-              aria-label="Copy sandbox ID"
-            />
-          </Space>
-        ),
-        duration: 8,
-      });
+      if (snapshotFailure) {
+        setCreationWarning({ sandboxId: sandbox.sandbox_id, error: snapshotFailure });
+      } else {
+        message.success({
+          content: (
+            <Space size={6}>
+              <span>Sandbox created</span>
+              <SandboxReceipt sandboxId={sandbox.sandbox_id} />
+            </Space>
+          ),
+          duration: 8,
+        });
+      }
     } catch (err: any) {
       message.error(err.message);
+    } finally {
+      createPending.current = false;
+      setCreating(false);
     }
-  };
-
-  const openCreateLifecycleModal = () => {
-    createLifecycleForm.setFieldsValue({
-      auto_lifecycle: policyToFormValue(customCreateAutoLifecycle ?? disabledAutoLifecycle()),
-    });
-    setCreateLifecycleModalOpen(true);
-  };
-
-  const closeCreateLifecycleModal = () => {
-    setCreateLifecycleModalOpen(false);
-    createLifecycleForm.resetFields();
-  };
-
-  const handleCreateLifecycleSave = (values: { auto_lifecycle?: unknown }) => {
-    setCustomCreateAutoLifecycle(formValueToPolicy(values.auto_lifecycle as any));
-    closeCreateLifecycleModal();
-  };
-
-  const handleCreateLifecycleClear = () => {
-    setCustomCreateAutoLifecycle(null);
-    closeCreateLifecycleModal();
   };
 
   const openLifecycleModal = (sandboxId: string) => {
@@ -1116,84 +1132,154 @@ function SandboxesPage() {
 
   return (
     <div className={styles.inventory}>
-      <Space align="center" style={{ width: '100%', justifyContent: 'space-between' }}>
-        <Title level={3} style={{ marginTop: 0 }}>Sandboxes</Title>
-        <Button
-          icon={<ReloadOutlined />}
-          loading={manualRefreshing}
-          disabled={refreshCooldown}
-          onClick={handleManualRefresh}
-        >
-          Refresh
-        </Button>
+      <Space align="center" wrap style={{ width: '100%', justifyContent: 'space-between', marginBottom: 24 }}>
+        <Title level={3} style={{ margin: 0 }}>Sandboxes</Title>
+        <Space wrap>
+          <Button
+            icon={<ReloadOutlined />}
+            loading={manualRefreshing}
+            disabled={refreshCooldown}
+            onClick={handleManualRefresh}
+          >
+            Refresh
+          </Button>
+          <Button
+            type="primary"
+            icon={<PlusOutlined />}
+            disabled={creating}
+            onClick={() => {
+              if (createPending.current) return;
+              resetCreateDraft();
+              createDraftActive.current = true;
+              setCreateOpen(true);
+            }}
+          >
+            Create sandbox
+          </Button>
+        </Space>
       </Space>
 
-      <Card size="small" style={{ marginBottom: 24 }}>
+      {creationWarning ? (
+        <Alert
+          type="warning"
+          showIcon
+          closable
+          onClose={() => setCreationWarning(null)}
+          title="Sandbox creation accepted; snapshot setup incomplete"
+          description={(
+            <Space orientation="vertical" size={4}>
+              <span>{creationWarning.error}</span>
+              <SandboxReceipt sandboxId={creationWarning.sandboxId} />
+            </Space>
+          )}
+          style={{ marginBottom: 16 }}
+        />
+      ) : null}
+
+      <Modal
+        title="Create sandbox"
+        open={createOpen}
+        onCancel={closeCreate}
+        okText="Create sandbox"
+        okButtonProps={{ htmlType: 'submit', form: createFormId }}
+        confirmLoading={creating}
+        cancelButtonProps={{ disabled: creating }}
+        closable={!creating}
+        mask={{ closable: !creating }}
+        keyboard={!creating}
+        destroyOnHidden
+        width={760}
+        styles={{ body: { maxHeight: '70vh', overflowY: 'auto' } }}
+      >
         <Form
+          id={createFormId}
           form={form}
-          layout="inline"
+          layout="vertical"
           onFinish={handleCreate}
-          initialValues={{
-            runtime: 'fc',
+          initialValues={{ runtime: 'fc' }}
+          disabled={creating}
+          preserve={false}
+          onValuesChange={(changed) => {
+            if ('auto_lifecycle' in changed) setHasCustomCreateLifecycle(true);
+          }}
+          onFinishFailed={({ errorFields }) => {
+            if (errorFields.some(({ name }) => name[0] === 'auto_lifecycle')) setCreateLifecycleExpanded(true);
           }}
         >
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', flexWrap: 'wrap' }}>
-            <Text strong>Create sandbox</Text>
-            {orgs.length > 1 && (
-              <Form.Item name="org_id" style={{ marginBottom: 0 }}>
-                <Select
-                  placeholder="Org: mine"
-                  style={{ width: 160 }}
-                  allowClear
-                  options={orgs.map((org) => ({
-                    label: authOrg && org.id === authOrg.id ? `${org.name} (mine)` : org.name,
-                    value: org.id,
-                  }))}
-                />
-              </Form.Item>
-            )}
-            <Form.Item name="name" style={{ marginBottom: 0 }}>
-              <Input placeholder="Name" style={{ width: 150 }} />
+          {orgs.length > 1 && (
+            <Form.Item label="Organization" name="org_id">
+              <Select
+                placeholder="Org: mine"
+                allowClear
+                options={orgs.map((org) => ({
+                  label: authOrg && org.id === authOrg.id ? `${org.name} (mine)` : org.name,
+                  value: org.id,
+                }))}
+              />
             </Form.Item>
-            <Form.Item name="runtime" style={{ marginBottom: 0 }}>
-              <Select style={{ width: 130 }}>
-                <Select.Option value="fc">Firecracker</Select.Option>
-                <Select.Option value="gvisor" disabled>gVisor</Select.Option>
-                <Select.Option value="ch" disabled>Cloud Hypervisor</Select.Option>
-                <Select.Option value="hyperv" disabled>Hyper-V</Select.Option>
-              </Select>
-            </Form.Item>
-            <Form.Item name="template" rules={[{ required: true }]} style={{ marginBottom: 0 }}>
-              <Select placeholder="Template" style={{ width: 150 }}>
-                {templates.map((t) => (
-                  <Select.Option key={t.name} value={t.name}>{t.name}</Select.Option>
-                ))}
-              </Select>
-            </Form.Item>
-            <Form.Item name="boot_mode" style={{ marginBottom: 0 }}>
-              <Select placeholder="Boot mode" style={{ width: 140 }} allowClear>
-                <Select.Option value="cold">Cold boot</Select.Option>
-                <Select.Option value="snapshot">Snapshot</Select.Option>
-                <Select.Option value="pool">Pool</Select.Option>
-              </Select>
-            </Form.Item>
-            <Form.Item name="snapshots" valuePropName="checked" style={{ marginBottom: 0 }}>
-              <Checkbox>Snapshots</Checkbox>
-            </Form.Item>
-            <Space size={4} style={{ marginLeft: 'auto' }}>
-              <Button size="small" onClick={openCreateLifecycleModal}>
-                {customCreateAutoLifecycle ? 'Manage auto lifecycle' : 'Custom auto lifecycle'}
-              </Button>
-              {customCreateAutoLifecycle ? (
-                <Button type="text" size="small" danger onClick={() => setCustomCreateAutoLifecycle(null)}>
-                  Clear
-                </Button>
-              ) : null}
-              <Button type="primary" htmlType="submit" icon={<PlusOutlined />}>Create</Button>
-            </Space>
-          </div>
+          )}
+          <Form.Item label="Name (optional)" name="name">
+            <Input />
+          </Form.Item>
+          <Form.Item label="Runtime" name="runtime">
+            <Select>
+              <Select.Option value="fc">Firecracker</Select.Option>
+              <Select.Option value="gvisor" disabled>gVisor</Select.Option>
+              <Select.Option value="ch" disabled>Cloud Hypervisor</Select.Option>
+              <Select.Option value="hyperv" disabled>Hyper-V</Select.Option>
+            </Select>
+          </Form.Item>
+          <Form.Item label="Template" name="template" rules={[{ required: true }]}>
+            <Select placeholder="Template">
+              {templates.map((t) => (
+                <Select.Option key={t.name} value={t.name}>{t.name}</Select.Option>
+              ))}
+            </Select>
+          </Form.Item>
+          <Form.Item label="Boot mode" name="boot_mode">
+            <Select placeholder="Boot mode" allowClear>
+              <Select.Option value="cold">Cold boot</Select.Option>
+              <Select.Option value="snapshot">Snapshot</Select.Option>
+              <Select.Option value="pool">Pool</Select.Option>
+            </Select>
+          </Form.Item>
+          <Form.Item name="snapshots" valuePropName="checked">
+            <Checkbox>Snapshots</Checkbox>
+          </Form.Item>
+          <Collapse
+            size="small"
+            activeKey={createLifecycleExpanded ? ['lifecycle'] : []}
+            onChange={(keys) => setCreateLifecycleExpanded(keys.includes('lifecycle'))}
+            collapsible={creating ? 'disabled' : undefined}
+            items={[{
+              key: 'lifecycle',
+              label: 'Custom Auto Lifecycle',
+              forceRender: true,
+              children: (
+                <Space orientation="vertical" size={12} style={{ width: '100%' }}>
+                  <Space wrap>
+                    <Text type="secondary">
+                      {hasCustomCreateLifecycle ? 'Custom policy overrides the template.' : 'Uses the template policy until customized.'}
+                    </Text>
+                    <Button
+                      size="small"
+                      danger
+                      disabled={!hasCustomCreateLifecycle || creating}
+                      onClick={() => {
+                        form.resetFields([['auto_lifecycle']]);
+                        setHasCustomCreateLifecycle(false);
+                      }}
+                    >
+                      Clear
+                    </Button>
+                  </Space>
+                  <AutoLifecycleEditor prefix={['auto_lifecycle']} disabled={creating} />
+                </Space>
+              ),
+            }]}
+          />
         </Form>
-      </Card>
+      </Modal>
 
       <Card size="small" style={{ marginBottom: 12 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
@@ -1270,23 +1356,6 @@ function SandboxesPage() {
           rowExpandable: snapshotsPanelAvailable,
         }}
       />
-
-      <Modal
-        title="Custom Auto Lifecycle"
-        open={createLifecycleModalOpen}
-        onCancel={closeCreateLifecycleModal}
-        footer={[
-          <Button key="clear" danger onClick={handleCreateLifecycleClear}>Clear</Button>,
-          <Button key="cancel" onClick={closeCreateLifecycleModal}>Cancel</Button>,
-          <Button key="save" type="primary" onClick={() => createLifecycleForm.submit()}>Save</Button>,
-        ]}
-        destroyOnHidden
-        width={760}
-      >
-        <Form form={createLifecycleForm} layout="vertical" onFinish={handleCreateLifecycleSave}>
-          <AutoLifecycleEditor prefix={['auto_lifecycle']} />
-        </Form>
-      </Modal>
 
       {editingNetworkSandbox ? (
         <NetworkPolicyDesigner
