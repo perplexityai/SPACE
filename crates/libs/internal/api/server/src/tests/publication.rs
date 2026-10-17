@@ -39,5 +39,3 @@ async fn publication_requires_authenticated_authority_before_any_write() -> Test
 
 #[cfg(feature = "kubernetes")]
 mod rpc;
-
-mod direct;

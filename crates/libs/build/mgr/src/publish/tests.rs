@@ -5,8 +5,6 @@ use pplx_space_common_core::types::{
 
 #[cfg(unix)]
 mod republication;
-#[cfg(unix)]
-mod retry;
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()

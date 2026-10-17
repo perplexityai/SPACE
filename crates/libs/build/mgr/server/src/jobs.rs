@@ -69,8 +69,7 @@ pub struct BuildJobPayload {
     pub template_org: Option<TemplateOrg>,
     #[serde(default)]
     pub system_publication_grant_id: Option<SystemPublicationGrantId>,
-    /// Absent for jobs queued before tenant grants existed; ClusterApi then
-    /// refuses their tenant publication.
+    /// Absent for jobs queued before tenant grant preparation.
     #[serde(default)]
     pub tenant_publication_grant_id: Option<TenantPublicationGrantId>,
 }

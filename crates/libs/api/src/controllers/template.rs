@@ -332,11 +332,8 @@ impl TemplateController {
             ),
             None => None,
         };
-        // Build-manager publishes the output, which ClusterApi accepts only
-        // under this submission's grant: for a system build, the system
-        // grant; for an organization's build, a grant naming the target and
-        // the organization authorized above. It lands before dispatch for the
-        // same reason as the base grant.
+        // Record publication authority before dispatch: a build may finish
+        // before the acceptance response is persisted.
         let publication_grant = match &submission.target {
             TemplateBuildTarget::System(_) => PublicationGrant::System(
                 self.build_jobs
@@ -364,9 +361,9 @@ impl TemplateController {
         {
             Ok(response) => response,
             Err(error) => {
-                // An undispatched submission authorizes no publication. If an
-                // ambiguous failure did start the build, its publication is
-                // denied and the build must be resubmitted.
+                // Withdraw this submission's grant even when dispatch failed
+                // ambiguously. System publication already enforces revocation;
+                // tenant publication remains compatible during preparation.
                 if let Err(revoke_error) = self.revoke_publication_grant(publication_grant).await {
                     tracing::warn!(
                         error = %revoke_error,
@@ -451,14 +448,12 @@ impl TemplateController {
             ControllerError::internal(format!("builder returned an invalid build job ID: {error}"))
         })?;
         let builder_node_id = if response.builder_node_id.is_empty() {
-            if grants.tenant_publication.is_none() {
-                pplx_space_metrics::template::build_routing_fallback_missing_identity();
-                tracing::warn!(
-                    %job_id,
-                    %template_name,
-                    "builder response omitted node identity; using unpinned status routing"
-                );
-            }
+            pplx_space_metrics::template::build_routing_fallback_missing_identity();
+            tracing::warn!(
+                %job_id,
+                %template_name,
+                "builder response omitted node identity; using unpinned status routing"
+            );
             None
         } else {
             Some(
