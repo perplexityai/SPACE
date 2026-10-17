@@ -1,6 +1,6 @@
 import { adminApi, api } from './api';
 import { publicSandboxIdFromAny } from './sandbox-id';
-import {
+import type {
   PublicOperationRecord,
   PublicPage,
   PublicSandbox,
@@ -23,8 +23,18 @@ export function idempotencyKey(): string {
 }
 
 export async function getPublicPage<T>(path: string): Promise<T[]> {
-  const page = await api.get<PublicPage<T>>(path);
-  return page.data;
+  const [pathname, query] = path.split('?', 2);
+  const params = new URLSearchParams(query);
+  const items: T[] = [];
+  let nextPath = path;
+
+  while (true) {
+    const page = await api.get<PublicPage<T>>(nextPath);
+    items.push(...page.data);
+    if (!page.next_cursor) return items;
+    params.set('cursor', page.next_cursor);
+    nextPath = `${pathname}?${params}`;
+  }
 }
 
 export async function getPublicSandbox(id: string): Promise<Sandbox> {
