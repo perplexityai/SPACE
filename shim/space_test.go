@@ -2120,6 +2120,9 @@ func TestTeardownFailsClosed(t *testing.T) {
 		wantCode   codes.Code
 		wantCalls  int
 		cancelCall bool
+		// Only a wait that ended after sbx-manager answered PENDING is an
+		// in-progress suspend; every refusal must stay a failure.
+		wantPending bool
 	}{
 		{
 			name:      "missing execution generation fails before the RPC",
@@ -2136,12 +2139,13 @@ func TestTeardownFailsClosed(t *testing.T) {
 			wantCalls: 1,
 		},
 		{
-			name:       "still pending at cancellation",
-			identity:   taskTeardownIdentity{sandboxID: "sbx", executionGeneration: 8},
-			result:     teardownSuspendResult{outcome: pb.TeardownSuspendOutcome_TEARDOWN_SUSPEND_OUTCOME_PENDING},
-			wantCode:   codes.Canceled,
-			wantCalls:  1,
-			cancelCall: true,
+			name:        "still pending at cancellation",
+			identity:    taskTeardownIdentity{sandboxID: "sbx", executionGeneration: 8},
+			result:      teardownSuspendResult{outcome: pb.TeardownSuspendOutcome_TEARDOWN_SUSPEND_OUTCOME_PENDING},
+			wantCode:    codes.Canceled,
+			wantCalls:   1,
+			cancelCall:  true,
+			wantPending: true,
 		},
 		{
 			name:      "unspecified outcome",
@@ -2167,6 +2171,10 @@ func TestTeardownFailsClosed(t *testing.T) {
 			}
 			if len(client.teardownRequests) != tt.wantCalls {
 				t.Fatalf("PrepareTeardownSuspend() calls = %d, want %d", len(client.teardownRequests), tt.wantCalls)
+			}
+			var pending *teardownReleasePendingError
+			if got := errors.As(err, &pending); got != tt.wantPending {
+				t.Fatalf("releaseTaskAfterGenerationTeardown() pending = %v, want %v (error: %v)", got, tt.wantPending, err)
 			}
 			if client.stopCalls != 0 || client.deleteCalls != 0 {
 				t.Fatalf("destructive RPC calls = stop:%d delete:%d, want zero", client.stopCalls, client.deleteCalls)

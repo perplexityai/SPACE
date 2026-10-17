@@ -850,9 +850,16 @@ func releaseTaskAfterGenerationTeardown(ctx context.Context, client pb.SandboxMa
 	}
 	waitCtx, cancel := teardownSuspendWaitContext(ctx)
 	defer cancel()
+	pending := false
+	waitEnded := func(err error) error {
+		if pending {
+			return &teardownReleasePendingError{err: err}
+		}
+		return err
+	}
 	for {
 		if err := waitCtx.Err(); err != nil {
-			return status.FromContextError(err).Err()
+			return waitEnded(status.FromContextError(err).Err())
 		}
 		response, err := client.PrepareTeardownSuspend(waitCtx, &pb.PrepareTeardownSuspendRequest{
 			SandboxId:           identity.sandboxID,
@@ -860,7 +867,11 @@ func releaseTaskAfterGenerationTeardown(ctx context.Context, client pb.SandboxMa
 			Action:              pb.TeardownSuspendAction_TEARDOWN_SUSPEND_ACTION_BEGIN_OR_JOIN,
 		})
 		if err != nil {
-			return annotateStatus("sbx-manager PrepareTeardownSuspend", err)
+			err = annotateStatus("sbx-manager PrepareTeardownSuspend", err)
+			if waitCtx.Err() != nil {
+				return waitEnded(err)
+			}
+			return err
 		}
 		switch response.GetOutcome() {
 		case pb.TeardownSuspendOutcome_TEARDOWN_SUSPEND_OUTCOME_DURABLE,
@@ -868,8 +879,9 @@ func releaseTaskAfterGenerationTeardown(ctx context.Context, client pb.SandboxMa
 			pb.TeardownSuspendOutcome_TEARDOWN_SUSPEND_OUTCOME_DELETED:
 			return nil
 		case pb.TeardownSuspendOutcome_TEARDOWN_SUSPEND_OUTCOME_PENDING:
+			pending = true
 			if err := sleepContext(waitCtx, teardownSuspendPoll); err != nil {
-				return status.FromContextError(err).Err()
+				return waitEnded(status.FromContextError(err).Err())
 			}
 		default:
 			return status.Errorf(
@@ -879,6 +891,36 @@ func releaseTaskAfterGenerationTeardown(ctx context.Context, client pb.SandboxMa
 			)
 		}
 	}
+}
+
+// teardownReleasePendingError reports a release wait that ended while
+// sbx-manager still answered PENDING: the suspend is in progress, possibly for
+// as long as its remote upload takes, and the task keeps running so containerd
+// retries. It carries the wait's own status, which containerd sees unchanged.
+type teardownReleasePendingError struct {
+	err error
+}
+
+func (e *teardownReleasePendingError) Error() string { return e.err.Error() }
+
+func (e *teardownReleasePendingError) Unwrap() error { return e.err }
+
+func (e *teardownReleasePendingError) GRPCStatus() *status.Status {
+	return status.Convert(e.err)
+}
+
+// endTeardownSpan ends a span that waited for sbx-manager's release. A release
+// still pending when the wait ended is the retry containerd needs, not a
+// failure, so the span records it as teardown.release=pending instead of an
+// error. Every other refusal stays an error.
+func endTeardownSpan(span shimSpan, err error) {
+	var pending *teardownReleasePendingError
+	if errors.As(err, &pending) {
+		span.SetAttributes(attribute.String("teardown.release", "pending"))
+		span.End(nil)
+		return
+	}
+	span.End(err)
 }
 
 func teardownSuspendWaitContext(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -1195,7 +1237,7 @@ func (s *spaceTaskService) mutateTaskAfterTeardownRelease(
 			attribute.String("sandbox_id", sandboxID),
 		)
 		detachSandbox, err = s.waitForTaskTeardownRelease(releaseCtx, client, operation, taskID, expected)
-		releaseSpan.End(err)
+		endTeardownSpan(releaseSpan, err)
 		if err != nil {
 			emitShimStepError(operation, "prepare_teardown_suspend", "prepare_teardown_suspend", err)
 			return false, err
@@ -1264,7 +1306,7 @@ func (s *spaceTaskService) Delete(ctx context.Context, r *taskAPI.DeleteRequest)
 			attribute.Bool("needs_teardown", needsTeardown),
 		)
 		ctx = spanCtx
-		defer func() { span.End(retErr) }()
+		defer func() { endTeardownSpan(span, retErr) }()
 	}
 
 	var response *taskAPI.DeleteResponse
@@ -1377,7 +1419,7 @@ func (s *spaceTaskService) Kill(ctx context.Context, r *taskAPI.KillRequest) (_ 
 			attribute.Bool("needs_teardown", needsTeardown),
 		)
 		ctx = spanCtx
-		defer func() { span.End(retErr) }()
+		defer func() { endTeardownSpan(span, retErr) }()
 	}
 
 	// A pod task may stop only after its exact execution has a remotely durable
