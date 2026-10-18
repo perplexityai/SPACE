@@ -20,7 +20,12 @@ SELECT s.lifecycle,
        -- the cohort restore-backoff deadline (NULL when unthrottled)
        CEIL(EXTRACT(EPOCH FROM s.next_restore_attempt_at) * 1000)::BIGINT,
        -- whether the node-drain marker still admits an evacuation claim
-       (s.evacuation_restore_target IS NOT NULL)
+       (s.evacuation_restore_target IS NOT NULL),
+       -- whether the marker is a stopped evacuation's, and whether the row is
+       -- still on a node: together they say whether a `stopped` row is the
+       -- released stopped evacuation the evacuation claim admits
+       (s.evacuation_restore_target IS NOT DISTINCT FROM 'stopped'),
+       (s.active_node_id IS NOT NULL)
 FROM sandboxes s
 -- at most one execution row is active per sandbox
 LEFT JOIN sandbox_k8s_executions e

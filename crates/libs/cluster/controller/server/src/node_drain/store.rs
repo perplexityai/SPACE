@@ -931,11 +931,11 @@ pub(crate) fn drain_blocking_sandboxes_query() -> String {
 /// a later suspend. This predicate matches restore storage-URI selection.
 ///
 /// `restoring` is included for **crash recovery**: if the controller dies
-/// after `begin_restore_lifecycle` claimed `suspended → restoring` but before
+/// after `begin_evacuation_restore_lifecycle` claimed `suspended → restoring` but before
 /// the finalize cleared the marker, the row is left `restoring` with the
 /// marker still set. A live controller's in-memory `restore_in_flight` dedups
 /// the active task so this only re-drives after a restart (when that set is
-/// empty); the evacuation `begin_restore_lifecycle` accepts an already-
+/// empty); `begin_evacuation_restore_lifecycle` accepts an already-
 /// `restoring` row, so the re-drive resumes the wake + finalize idempotently.
 ///
 /// Intentionally **not** scoped to any node: the cohort restore is decoupled
@@ -1055,14 +1055,16 @@ pub(crate) fn restore_pending_evacuations_query(honor_backoff_windows: bool) -> 
                     s.evacuation_restore_target = 'stopped'
                     AND (
                         (s.lifecycle = 'stopped' AND s.active_node_id IS NULL)
-                        -- Unreachable today and kept deliberately: nothing can
-                        -- move a marked `stopped` row to `restoring`, because
-                        -- `begin_restore_lifecycle`'s claim admits only
-                        -- `('suspended','restoring')`. The moment that
-                        -- claim widens, this is the crash-recovery arm — a
-                        -- re-placement whose controller died mid-restore — and
-                        -- omitting it would strand exactly those rows on the
-                        -- deploy that made them possible.
+                        -- Unreachable today and kept deliberately: the claim
+                        -- admits a released stopped evacuation, but
+                        -- `restore_execution_inner` refuses a `Stopped` target
+                        -- before claiming, so nothing moves the row to
+                        -- `restoring` yet. Once that target is accepted, this is
+                        -- the arm a re-placement whose controller died
+                        -- mid-restore, or whose fresh claim failed (it is never
+                        -- rolled back), is re-driven through; omitting it would
+                        -- strand exactly those rows on the deploy that made them
+                        -- possible.
                         OR s.lifecycle = 'restoring'
                     )
                     AND {disk_backup_ready}
@@ -1104,8 +1106,8 @@ pub(crate) fn stopped_replacements_pending_query() -> &'static str {
            FROM sandboxes s
           WHERE s.evacuation_restore_target = 'stopped'
             AND s.active_node_id IS NULL
-            -- `restoring` is unreachable until the restore claim admits a
-            -- `stopped` row; included for the same reason as in
+            -- `restoring` is unreachable until a `Stopped` restore target is
+            -- accepted; included for the same reason as in
             -- `restore_pending_evacuations_query`, so the two populations stay
             -- the same population.
             AND s.lifecycle IN ('stopped', 'restoring')"
@@ -3249,7 +3251,7 @@ impl SubstrateSink {
         // sweep listing this sandbox and this call, a concurrent user restore
         // can clear the marker; if it has, this restore is no longer ours —
         // defer cleanly. The atomic backstop for the residual micro-window is
-        // the marker-guarded `begin_restore_lifecycle` inside
+        // the marker-guarded `begin_evacuation_restore_lifecycle` inside
         // `restore_evacuated_execution`. Uses `latest_full_snapshot_ready` (no
         // placement-freshness gate) to match `restore_pending_evacuations_query`
         // and stay robust to a failed restore's placement bump.
@@ -3323,13 +3325,13 @@ impl SubstrateSink {
         {
             Ok(()) => {}
             // `EvacuationClaimLost` means the marker-atomic
-            // `begin_restore_lifecycle(true)` inside `restore_evacuated_execution`
-            // missed its CAS because a concurrent user restore cleared the
-            // marker in the micro-window after the eligibility check above. That
-            // is the same clean-deferral condition the eligibility gate returns
-            // `Deferred` for — classify it identically so a drain-vs-user race
-            // doesn't fire `node_drain.failures` or log a spurious
-            // restore-failed warning.
+            // `begin_evacuation_restore_lifecycle` inside
+            // `restore_evacuated_execution` found nothing this attempt may take
+            // — for example a concurrent user restore that cleared the marker in
+            // the micro-window after the eligibility check above; the variant's
+            // doc points at where the cases are classified. Each gets the same
+            // clean-deferral outcome the eligibility gate returns: no
+            // `node_drain.failures`, no spurious restore-failed warning.
             Err(SubstrateError::EvacuationClaimLost { .. }) => {
                 return Ok(RestoreOutcome::Deferred);
             }
@@ -3360,7 +3362,7 @@ impl SubstrateSink {
         // and clear the evacuation marker so the sandbox stops blocking the
         // source node's drain and is no longer re-selected by the
         // restore-pending scan. Guarded on the `'restoring'` state
-        // `begin_restore_lifecycle` set inside the restore call.
+        // `begin_evacuation_restore_lifecycle` set inside the restore call.
         //
         // `rows_affected == 0` means the CAS missed — something else moved
         // the row out of `'restoring'` between the restore returning and
@@ -4582,11 +4584,13 @@ impl NodeDrainSink for SubstrateSink {
     ///
     /// Step 5 is where this path's own work ends. Placing the row back on a
     /// node belongs to the restore sweep, and **the substrate cannot serve that
-    /// request today**: `begin_restore_lifecycle`'s marker-required claim
-    /// admits only `('suspended','restoring')`,
-    /// `sandbox_lifecycle_to_wake_target_proto` accepts only `Started`/`Paused`,
-    /// and the evacuation restore's source selector wants a `full` snapshot (the
-    /// disk-only one serves only a user `start` of a `stopped` row). The sweep
+    /// request today**: `begin_evacuation_restore_lifecycle` admits a released
+    /// stopped evacuation for a `Stopped` target, but
+    /// `sandbox_lifecycle_to_wake_target_proto` accepts only `Started`/`Paused`
+    /// (checked before the claim), and the evacuation restore's source selector
+    /// wants a `full` snapshot (the disk-only one serves only a user `start` of a
+    /// `stopped` row, and only while the row is still `stopped`, which the claim
+    /// moves it out of). The sweep
     /// therefore fails, backs off, and escalates. That is the reason the
     /// feature ships disabled, and the reason the sweep's stopped arm is here
     /// at all rather than withheld: once those refusals lift, every
