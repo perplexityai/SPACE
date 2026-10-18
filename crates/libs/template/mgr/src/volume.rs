@@ -63,7 +63,7 @@ use pplx_space_common_svc::template_lookup::TemplateLookupScope;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use pplx_space_common_core::host::linux::paths::{
     TEMPLATE_CACHE_DIR_MODE, TEMPLATE_CACHE_FILE_MODE, normalize_template_cache_tree,
@@ -446,23 +446,44 @@ impl VolumePuller {
         outcome
     }
 
+    /// Materializes a release the caller already resolved through
+    /// ClusterApi in `resolve_elapsed`. Records `template.pull.duration_ms`
+    /// like [`Self::pull`] does: tagged with the caller's original selector
+    /// and trigger, and measuring release resolution plus materialization.
+    /// The caller's own work between the two (local cache probe, snapshot
+    /// policy lookup) is excluded, as it is for [`Self::pull`], so both
+    /// paths report the same interval under the same tags. Resolution
+    /// failures never reach this method, so unlike [`Self::pull`] it records
+    /// no `cluster_metadata_*` outcomes and no `template.pull.find_release_ms`.
     pub(crate) async fn materialize_release(
         &self,
         db: Arc<std::sync::Mutex<rusqlite::Connection>>,
-        name: &str,
+        spec: PullSpec<'_>,
+        resolve_elapsed: Duration,
         release: ResolvedRelease,
     ) -> PullOutcome {
-        let tags = pull_metric_tags(name, &release.hash, "", PullTrigger::OnDemand);
-        self.pull_resolved(
-            db,
-            name.to_string(),
-            release.hash,
-            release.storage_uris,
-            tags,
-        )
-        .await
-        .outcome
-        .into_outcome()
+        let started = Instant::now()
+            .checked_sub(resolve_elapsed)
+            .unwrap_or_else(Instant::now);
+        let tags = pull_metric_tags(spec.name, spec.req_hash, spec.req_tag, spec.trigger);
+        let result = self
+            .pull_resolved(
+                db,
+                spec.name.to_string(),
+                release.hash,
+                release.storage_uris,
+                &tags,
+            )
+            .await;
+        let outcome = result.outcome.into_outcome();
+
+        pplx_space_metrics::template::pull_duration(
+            &tags,
+            outcome_label(&outcome, result.path),
+            started,
+        );
+
+        outcome
     }
 
     async fn pull_resolved(
@@ -471,7 +492,7 @@ impl VolumePuller {
         name: String,
         resolved_hash: String,
         storage_uris: Vec<String>,
-        base_tags: Vec<String>,
+        base_tags: &[String],
     ) -> PullTaskResult {
         let key = PullKey::new(name.clone(), resolved_hash.clone());
         loop {
@@ -486,7 +507,7 @@ impl VolumePuller {
                 let name = name.clone();
                 let resolved_hash = resolved_hash.clone();
                 let storage_uris = storage_uris.clone();
-                let base_tags = base_tags.clone();
+                let base_tags = base_tags.to_vec();
                 let background_worker = self.background_worker.clone();
                 let backing_policy = self.backing_policy;
                 // The caller that starts the pull waits for it below, so the
@@ -518,7 +539,7 @@ impl VolumePuller {
             match flight.wait_for_result().await {
                 Some(mut result) => {
                     if !started && result.mark_coalesced_if_materialized() {
-                        pplx_space_metrics::template::pull_coalesced(&base_tags);
+                        pplx_space_metrics::template::pull_coalesced(base_tags);
                     }
                     return result;
                 }
@@ -738,13 +759,14 @@ enum PullPath {
 /// One pull's identity as the caller specified it: the template name,
 /// the optional digest/tag lookup keys, and which caller class
 /// initiated it. Groups what [`VolumePuller::pull`] receives so the
-/// inner helpers stay within clippy's argument budget.
+/// inner helpers stay within clippy's argument budget, and carries the
+/// original selector into [`VolumePuller::materialize_release`].
 #[derive(Copy, Clone)]
-struct PullSpec<'a> {
-    name: &'a str,
-    req_hash: &'a str,
-    req_tag: &'a str,
-    trigger: PullTrigger,
+pub(crate) struct PullSpec<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) req_hash: &'a str,
+    pub(crate) req_tag: &'a str,
+    pub(crate) trigger: PullTrigger,
 }
 
 async fn pull_inner(
@@ -809,13 +831,7 @@ async fn pull_inner(
     );
 
     let result = puller
-        .pull_resolved(
-            db,
-            name.to_string(),
-            resolved_hash,
-            storage_uris,
-            base_tags.to_vec(),
-        )
+        .pull_resolved(db, name.to_string(), resolved_hash, storage_uris, base_tags)
         .await;
     *path_taken = result.path;
     result.outcome.into_outcome()

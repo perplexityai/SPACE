@@ -1213,12 +1213,12 @@ async fn get_template_authorizes_and_resolves_before_using_cached_builds(
                             pplx_space_node_api_client::proto::TemplateVisibility::OrgSpecific,
                     })
                 },
-                async |name, release| {
-                    assert_eq!(name, "base");
+                async |spec, _, release| {
+                    assert_eq!(spec.name, "base");
                     assert_eq!(release.hash, hash_a);
                     assert!(cold);
                     assert!(!materialized.replace(true));
-                    insert_ready_build(&service.db.lock().unwrap(), name, &release.hash);
+                    insert_ready_build(&service.db.lock().unwrap(), spec.name, &release.hash);
                     PullOutcome::Materialized
                 },
             )
@@ -1280,7 +1280,7 @@ async fn local_cached_lookup_stays_available_without_catalog() {
             .get_template_resolving(
                 legacy_request,
                 async |_, _, _, _| panic!("trusted cache hit must not depend on ClusterApi"),
-                async |_, _| panic!("cached build must not be pulled"),
+                async |_, _, _| panic!("cached build must not be pulled"),
             )
             .await
             .unwrap()
@@ -1327,7 +1327,7 @@ async fn rejected_catalog_lookup_never_falls_back_to_cache() {
             .get_template_resolving(
                 lookup,
                 async |_, _, _, _| Err(crate::volume::FindReleaseError::NotFound),
-                async |_, _| panic!("unresolved release must not be pulled"),
+                async |_, _, _| panic!("unresolved release must not be pulled"),
             )
             .await
             .unwrap_err();

@@ -33,9 +33,9 @@ impl TemplateManagerService {
                     };
                     crate::volume::find_release_in_scope(name, hash, tag, org, catalog_scope).await
                 },
-                async |name, release| {
+                async |spec, resolve_elapsed, release| {
                     self.volume_puller
-                        .materialize_release(Arc::clone(&self.db), name, release)
+                        .materialize_release(Arc::clone(&self.db), spec, resolve_elapsed, release)
                         .await
                 },
             )
@@ -59,7 +59,8 @@ impl TemplateManagerService {
             crate::volume::FindReleaseError,
         >,
         materialize: impl AsyncFnOnce(
-            &str,
+            crate::volume::PullSpec<'_>,
+            std::time::Duration,
             crate::volume::ResolvedRelease,
         ) -> crate::volume::PullOutcome,
     ) -> Result<Response<crate::proto::GetTemplateResponse>, Status> {
@@ -117,6 +118,11 @@ impl TemplateManagerService {
             .map(str::parse::<OrgId>)
             .transpose()
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        // Request metrics (cache, fetch-error, and pull) are tagged with the
+        // caller's selector, not the resolved hash that replaces `req_hash`
+        // below.
+        let requested_hash = req_hash.clone();
+        let resolve_started = std::time::Instant::now();
         // Only authenticated local execution may use unpublished/offline cache entries.
         let release = if !local_execution
             || caller_org.is_some()
@@ -143,6 +149,7 @@ impl TemplateManagerService {
         } else {
             None
         };
+        let resolve_elapsed = resolve_started.elapsed();
         let authorized_org = release.as_ref().and_then(|release| release.authorized_org);
         let req_hash = release
             .as_ref()
@@ -217,7 +224,7 @@ impl TemplateManagerService {
         } else {
             None
         };
-        let cache_tags = get_template_metric_tags(template_id, &req_hash, &req_tag);
+        let cache_tags = get_template_metric_tags(template_id, &requested_hash, &req_tag);
 
         // First attempt: local-only lookup.
         match build_get_template_response(
@@ -248,7 +255,7 @@ impl TemplateManagerService {
                 } else {
                     "local_db_error"
                 };
-                record_fetch_error(template_id, &req_hash, &req_tag, reason);
+                record_fetch_error(template_id, &requested_hash, &req_tag, reason);
                 return Err(status);
             }
             Err(_) => {
@@ -257,7 +264,15 @@ impl TemplateManagerService {
         }
 
         let outcome = match release {
-            Some(release) => materialize(template_id, release).await,
+            Some(release) => {
+                let spec = crate::volume::PullSpec {
+                    name: template_id,
+                    req_hash: &requested_hash,
+                    req_tag: &req_tag,
+                    trigger: crate::volume::PullTrigger::OnDemand,
+                };
+                materialize(spec, resolve_elapsed, release).await
+            }
             None => {
                 self.volume_puller
                     .pull(
@@ -273,7 +288,7 @@ impl TemplateManagerService {
         match outcome {
             crate::volume::PullOutcome::Materialized => {
                 let template_id_owned = template_id.clone();
-                let req_hash_for_err = req_hash.clone();
+                let req_hash_for_err = requested_hash.clone();
                 let req_tag_for_err = req_tag.clone();
                 build_get_template_response(
                     self.artifact_store.root.clone(),
@@ -307,7 +322,12 @@ impl TemplateManagerService {
                 })
             }
             crate::volume::PullOutcome::ClassifiedFailure(failure) => {
-                record_fetch_error(template_id, &req_hash, &req_tag, failure.metric_reason());
+                record_fetch_error(
+                    template_id,
+                    &requested_hash,
+                    &req_tag,
+                    failure.metric_reason(),
+                );
                 let code = pull_failure_code(failure);
                 let lookup = describe_lookup(&req_hash, &req_tag);
                 let message = if code == tonic::Code::NotFound {
@@ -318,15 +338,20 @@ impl TemplateManagerService {
                 Err(Status::new(code, message))
             }
             crate::volume::PullOutcome::Retryable(status) => {
-                record_fetch_error(template_id, &req_hash, &req_tag, "resource_exhausted");
+                record_fetch_error(template_id, &requested_hash, &req_tag, "resource_exhausted");
                 Err(status)
             }
             crate::volume::PullOutcome::DownstreamFailure { failure, status } => {
-                record_fetch_error(template_id, &req_hash, &req_tag, failure.metric_reason());
+                record_fetch_error(
+                    template_id,
+                    &requested_hash,
+                    &req_tag,
+                    failure.metric_reason(),
+                );
                 Err(status)
             }
             crate::volume::PullOutcome::HashMismatch(status) => {
-                record_fetch_error(template_id, &req_hash, &req_tag, "hash_mismatch");
+                record_fetch_error(template_id, &requested_hash, &req_tag, "hash_mismatch");
                 Err(status)
             }
         }

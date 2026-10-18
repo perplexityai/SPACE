@@ -25,6 +25,10 @@ on:
       - templates/firecracker/seed/**
       - templates/firecracker/recipes/seed.toml
       - crates/libs/sbx/mgr/server/src/service/activation_support.rs
+      # Emit the template pull metrics that the Kind restore scenarios assert
+      # on, and choose the selector and pull path behind them.
+      - crates/libs/template/mgr/src/volume.rs
+      - crates/libs/template/mgr/src/service/lookup.rs
       - infra/space/observability/**
       - crates/libs/observability/**
       - shim/otlp.go
