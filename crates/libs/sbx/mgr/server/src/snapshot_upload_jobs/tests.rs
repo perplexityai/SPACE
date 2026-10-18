@@ -778,6 +778,7 @@ pub(crate) fn reclaim_fixture_payload(
         metadata_staging_dir: None,
         includes_metadata_job: true,
         deferred_metadata: false,
+        execution_generation: None,
     }
 }
 
@@ -1199,7 +1200,47 @@ fn begin_request_carries_the_recorded_capture_host_cpu() {
             backup_attempt_id: "01939e3e-eeee-7000-8000-000000000032",
             storage_uri: "s3://space-test/suspend-snapshots/attempt?region=us-east-1",
             execution: &execution,
+            execution_generation: None,
+            fence_verdict_only: false,
         });
         assert_eq!(request.capture_host_cpu.as_deref(), host_cpu);
     }
+}
+
+/// The teardown probe asks for the fence's verdict without registering, and
+/// only a reply that doesn't echo the request, from a server that predates
+/// verdict-only requests, left a row for the probe to close.
+#[test]
+fn verdict_only_begin_is_requested_and_its_echo_read() {
+    use pplx_space_common_core::types::{
+        Arch, ArtifactKind, ArtifactOrigin, ExecutionMetadata, SnapshotExecutionMetadata,
+    };
+
+    let execution = SnapshotExecutionMetadata::new(ExecutionMetadata::initial_firecracker(
+        Arch::X86_64,
+        vec![],
+    ))
+    .unwrap();
+    for fence_verdict_only in [false, true] {
+        let request = begin_artifact_backup_request(&BeginArtifactBackup {
+            sandbox_id: "01939e3e-eeee-7000-8000-000000000040",
+            local_artifact_id: "01939e3e-eeee-7000-8000-000000000041",
+            artifact_kind: ArtifactKind::Full,
+            artifact_origin: ArtifactOrigin::Suspend,
+            snapshot_name: None,
+            backup_attempt_id: "01939e3e-eeee-7000-8000-000000000042",
+            storage_uri: "s3://space-test/suspend-snapshots/attempt?region=us-east-1",
+            execution: &execution,
+            execution_generation: None,
+            fence_verdict_only,
+        });
+        assert_eq!(request.fence_verdict_only, fence_verdict_only);
+    }
+    let reply =
+        |fence_verdict_only| pplx_space_node_api_client::proto::BeginArtifactBackupResponse {
+            fence_verdict_only,
+            ..Default::default()
+        };
+    assert!(!verdict_only_reply_registered(&reply(true)));
+    assert!(verdict_only_reply_registered(&reply(false)));
 }

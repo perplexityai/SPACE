@@ -457,6 +457,7 @@ async fn durable_artifact_backup_persists_the_submitted_artifact_identity() {
                     format: SuspendSnapshotFormat::Full,
                     dedup_key: Some(&dedup_key),
                     handoff: ArtifactBackupHandoff::DurableWorker,
+                    execution_generation: None,
                 },
             )
             .await;

@@ -129,18 +129,50 @@ fn durable_teardown_suspend_prepare_response(
 
 const TEARDOWN_BACKUP_FAILED_ARTIFACT_METADATA: &str =
     "x-space-teardown-backup-failed-artifact-bin";
+const TEARDOWN_BACKUP_SUPERSEDED_GENERATION_METADATA: &str =
+    "x-space-teardown-backup-superseded-generation";
 
 pub(super) fn teardown_artifact_backup_status(
     error: ArtifactBackupSubmissionError,
     artifact: LocalArtifactId,
 ) -> Status {
-    let permanent = matches!(&error, ArtifactBackupSubmissionError::Begin(error)
-        if error.kind() == pplx_space_common_jobs::JobFailureKind::Permanent);
+    let (permanent, superseded_generation) = match &error {
+        ArtifactBackupSubmissionError::Begin {
+            error,
+            superseded_generation,
+        } => (
+            error.kind() == pplx_space_common_jobs::JobFailureKind::Permanent,
+            *superseded_generation,
+        ),
+        _ => (false, None),
+    };
     let mut status = artifact_backup_fence_status(error.to_string());
     if permanent {
         status = teardown_backup_failure_status(status, artifact);
+        // The refusal reached the drive before the upload job failed, so the
+        // driver can't recover the verdict from the job; carry it here.
+        if let Some(generation) = superseded_generation {
+            status.metadata_mut().insert(
+                TEARDOWN_BACKUP_SUPERSEDED_GENERATION_METADATA,
+                tonic::metadata::MetadataValue::from(generation.get()),
+            );
+        }
     }
     status
+}
+
+/// The generation a teardown backup's own registration was refused for as
+/// superseded, when that refusal reached the drive directly.
+fn teardown_backup_superseded_generation(
+    status: &Status,
+) -> Option<pplx_space_common_core::types::ExecutionGeneration> {
+    status
+        .metadata()
+        .get(TEARDOWN_BACKUP_SUPERSEDED_GENERATION_METADATA)?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()
 }
 
 // The shared publication path returns tonic Status. Keep backup provenance on
@@ -591,29 +623,148 @@ impl SandboxManagerService {
                 cache_dir,
             )
             .await;
-        if let Err(error) = &result {
-            // Registration can also return NotFound for its source node. Confirm
-            // sandbox absence with the sandbox-only lookup before making this final.
-            // Legacy persisted failures have no typed reason, so verify every
-            // permanent backup refusal rather than parsing its historical message.
-            let backup_lookup = if teardown_failed_backup_artifact(error).is_some() {
-                Some(
-                    self.resolve_org_snapshot_upload_config(&sandbox_id.to_string())
-                        .await,
-                )
-            } else {
-                None
-            };
-            if let Err(record_error) = self.record_teardown_suspend_driver_failure(
-                sandbox_id,
-                execution_generation,
-                error,
-                backup_lookup.as_ref(),
-            ) {
-                tracing::warn!(%sandbox_id, %execution_generation, %record_error,
-                    "failed to persist teardown suspend driver failure; caller polling will retry");
+        self.settle_teardown_suspend_drive(sandbox_id, execution_generation, result)
+            .await
+    }
+
+    /// Settle a teardown-suspend drive's outcome: a backup refusal is checked
+    /// against the cluster, which may have retired this execution, before
+    /// the failure is recorded.
+    pub(super) async fn settle_teardown_suspend_drive(
+        &self,
+        sandbox_id: SandboxId,
+        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        result: Result<(), Status>,
+    ) -> Result<(), Status> {
+        let Err(error) = &result else {
+            return result;
+        };
+        // Registration can also return NotFound for its source node. Confirm
+        // sandbox absence with the sandbox-only lookup before making this final.
+        // Legacy persisted failures have no typed reason, so verify every
+        // permanent backup refusal rather than parsing its historical message.
+        let failed_artifact = teardown_failed_backup_artifact(error);
+        let backup_lookup = if failed_artifact.is_some() {
+            Some(
+                self.resolve_org_snapshot_upload_config(&sandbox_id.to_string())
+                    .await,
+            )
+        } else {
+            None
+        };
+        // A sandbox that still exists can have refused the backup because the
+        // cluster retired this execution. A refusal the drive met directly
+        // carries that verdict. A permanent job failure no longer says so, so
+        // ask again with the upload's own idempotent registration. Use the
+        // verdict even when the lookup reported the row missing: that lookup
+        // only finds a sandbox placed on this node, so a node the sandbox has
+        // moved off sees it as missing, while registration looks the sandbox
+        // up wherever it is placed.
+        use crate::snapshot_upload_jobs::RegistrationProbe;
+        let verdict = match teardown_backup_superseded_generation(error) {
+            Some(generation) => RegistrationProbe::Superseded(generation),
+            None => match failed_artifact.and_then(|staged| {
+                self.teardown_backup_payload_bound_to(execution_generation, staged)
+            }) {
+                Some(payload) => {
+                    crate::snapshot_upload_jobs::prepared_begin_refused_as_superseded(&payload)
+                        .await
+                }
+                None => RegistrationProbe::NotSuperseded,
+            },
+        };
+        let mut release = None;
+        let mut backup_lookup = backup_lookup;
+        match verdict {
+            RegistrationProbe::Superseded(generation)
+                if failed_artifact.is_some() && generation == execution_generation =>
+            {
+                release = failed_artifact;
+                // The verdict proves the cluster row exists, so a failed
+                // release mustn't be recorded as a backup refused for a
+                // missing sandbox.
+                backup_lookup = None;
             }
-            if let Err(error) = self.db_conn().and_then(|db| {
+            // Without an answer, a lookup that can't see a sandbox placed on
+            // another node doesn't prove the sandbox is gone. Leave the
+            // teardown running so the next drive asks again.
+            RegistrationProbe::Unanswered => backup_lookup = None,
+            // A verdict about another generation still proves the row exists.
+            RegistrationProbe::Superseded(_) => backup_lookup = None,
+            RegistrationProbe::NotSuperseded => {}
+        }
+        self.settle_teardown_suspend_driver_failure(
+            sandbox_id,
+            execution_generation,
+            result,
+            backup_lookup.as_ref(),
+            release,
+        )
+        .await
+    }
+
+    /// Settle a failed teardown-suspend drive. `release` names the staged
+    /// artifact whose backup the cluster refused because it retired exactly
+    /// this generation: the runtime is released and the capture discarded
+    /// unpublished (see [`Self::release_retired_teardown_execution`]).
+    /// Otherwise the failure is recorded for the caller's next poll and the
+    /// drive's error stands.
+    pub(super) async fn settle_teardown_suspend_driver_failure(
+        &self,
+        sandbox_id: SandboxId,
+        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        result: Result<(), Status>,
+        backup_lookup: Option<&OrgSnapshotConfigResolution>,
+        release: Option<LocalArtifactId>,
+    ) -> Result<(), Status> {
+        let Err(error) = &result else {
+            return result;
+        };
+        let released = match release {
+            Some(staged_artifact) => Some(
+                self.release_retired_teardown_execution(
+                    &sandbox_id.to_string(),
+                    execution_generation,
+                    staged_artifact,
+                )
+                .await,
+            ),
+            None => None,
+        };
+        // A completed release leaves nothing to record. Any other outcome,
+        // whether a claim that lost to a row that moved on, a refusal before
+        // the claim, or a cleanup that failed after it, still records the
+        // drive's failure, which is idempotent and closes the job for a row
+        // that is now quarantined, deleting or gone.
+        let result = match released {
+            Some(Ok(())) => Ok(()),
+            released => {
+                if let Err(record_error) = self.record_teardown_suspend_driver_failure(
+                    sandbox_id,
+                    execution_generation,
+                    error,
+                    backup_lookup,
+                ) {
+                    tracing::warn!(%sandbox_id, %execution_generation, %record_error,
+                        "failed to persist teardown suspend driver failure; caller polling will retry");
+                }
+                match released {
+                    Some(Err(status)) => {
+                        // The release's status replaces the drive's, so keep
+                        // the refusal that prompted it in the log.
+                        tracing::warn!(%sandbox_id, %execution_generation,
+                            backup_error = %error.message(), release_error = %status.message(),
+                            "retired execution's teardown release failed");
+                        Err(status)
+                    }
+                    _ => result,
+                }
+            }
+        };
+        // A completed release leaves no active job, so this paces only a drive
+        // that is still failing.
+        if let Err(error) = &result
+            && let Err(error) = self.db_conn().and_then(|db| {
                 crate::db::defer_teardown_suspend_retry(
                     &db,
                     &sandbox_id.to_string(),
@@ -623,11 +774,52 @@ impl SandboxManagerService {
                 .map_err(|error| {
                     Status::internal(format!("persist teardown retry deadline: {error}"))
                 })
-            }) {
-                tracing::warn!(%sandbox_id, %error, "cannot persist teardown retry deadline");
-            }
+            })
+        {
+            tracing::warn!(%sandbox_id, %error, "cannot persist teardown retry deadline");
         }
         result
+    }
+
+    /// The terminal upload job that staged `staged_artifact` for this
+    /// generation's teardown suspend and has no transfer IDs, or `None`.
+    /// Only that payload's registration can carry the cluster's verdict about
+    /// this execution.
+    pub(super) fn teardown_backup_payload_bound_to(
+        &self,
+        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        staged_artifact: LocalArtifactId,
+    ) -> Option<crate::snapshot_upload::SnapshotUploadJobs> {
+        let job = match self.snapshot_upload_worker.find_job_by_dedup_key(
+            crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
+            &staged_artifact.to_string(),
+        ) {
+            // A live job still owns its attempt: its own Begin will meet the
+            // same refusal and make the job terminal, and the next drive probes.
+            Ok(job) => job.filter(|job| job.is_terminal())?,
+            Err(error) => {
+                tracing::warn!(%staged_artifact, %error,
+                    "could not read the refused teardown backup's upload job");
+                return None;
+            }
+        };
+        match job.payload_as::<crate::snapshot_upload::SnapshotUploadJobs>() {
+            // Transfer IDs mean the registration was admitted, so a re-sent
+            // Begin is an unfenced replay that can't carry a refusal. Their
+            // absence doesn't prove the opposite; the probe tolerates a replay.
+            Ok(payload)
+                if payload.execution_generation == Some(execution_generation)
+                    && payload.job_ids.is_empty() =>
+            {
+                Some(payload)
+            }
+            Ok(_) => None,
+            Err(error) => {
+                tracing::warn!(%staged_artifact, %error,
+                    "could not decode the refused teardown backup's upload job");
+                None
+            }
+        }
     }
 
     pub(super) fn record_teardown_suspend_driver_failure(
@@ -773,6 +965,7 @@ impl SandboxManagerService {
                         execution_generation,
                         artifact: &artifact,
                         format,
+                        origin: TeardownBackupOrigin::Captured,
                     },
                 )
                 .await?;
@@ -799,6 +992,7 @@ impl SandboxManagerService {
                         execution_generation,
                         artifact: &artifact,
                         format,
+                        origin: TeardownBackupOrigin::PreviouslySuspended,
                     },
                 )
                 .await
@@ -1050,6 +1244,7 @@ impl SandboxManagerService {
                         &backup.artifact.local_path,
                         backup.format,
                         Some(&artifact_dedup_key),
+                        backup.registration_generation(),
                     )
                     .await
                     .map_err(|error| {

@@ -543,6 +543,121 @@ pub(crate) fn prepared_upload_requires_begin(payload: &SnapshotUploadJobs) -> bo
 }
 
 pub(crate) async fn begin_prepared_upload(payload: &SnapshotUploadJobs) -> Result<(), JobError> {
+    begin_prepared_upload_naming_supersession(payload)
+        .await
+        .map_err(|refusal| refusal.error)
+}
+
+/// A refused prepared `BeginArtifactBackup`: the job error, and the generation
+/// the control plane named when it refused the upload as superseded.
+#[derive(Debug)]
+pub(crate) struct BeginRefusal {
+    pub(crate) error: JobError,
+    pub(crate) superseded_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+}
+
+/// [`begin_prepared_upload`] that keeps the superseded verdict, for a caller
+/// that acts on the refusal at once instead of through the job's failure.
+pub(crate) async fn begin_prepared_upload_naming_supersession(
+    payload: &SnapshotUploadJobs,
+) -> Result<(), BeginRefusal> {
+    let refused = match send_prepared_begin(payload, false).await {
+        Ok(Ok(_)) => return Ok(()),
+        Ok(Err(refused)) => refused,
+        Err(error) => {
+            return Err(BeginRefusal {
+                error,
+                superseded_generation: None,
+            });
+        }
+    };
+    let superseded_generation = match &refused {
+        BeginArtifactBackupError::BeginArtifactBackup {
+            superseded_generation,
+            ..
+        } => *superseded_generation,
+        BeginArtifactBackupError::Connect(_) => None,
+    };
+    Err(BeginRefusal {
+        error: classify_begin_error(refused),
+        superseded_generation,
+    })
+}
+
+/// What the re-sent registration says about the upload's execution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RegistrationProbe {
+    /// The control plane refused the registration because it superseded this
+    /// generation.
+    Superseded(pplx_space_common_core::types::ExecutionGeneration),
+    /// The control plane answered, and didn't name a superseded generation.
+    NotSuperseded,
+    /// No answer: cluster-api couldn't be reached, or failed in a way a retry
+    /// may clear.
+    Unanswered,
+}
+
+/// Re-send a prepared upload's `BeginArtifactBackup` as a verdict-only
+/// request and report whether the control plane refuses it because the
+/// upload's execution generation was retired. The teardown driver uses it to
+/// recover the typed refusal that a permanent job failure no longer carries.
+///
+/// The server answers as the upload's own registration would and persists
+/// nothing, so an admitted probe leaves no row, and in particular no failed
+/// full row newer than the sandbox's ready snapshot, which would hold the
+/// retired execution's release as not durably restorable. A server that
+/// predates verdict-only requests registers the attempt instead; its reply
+/// says so ([`verdict_only_reply_registered`]), and the probe closes that row
+/// `failed`, best effort, so it doesn't gate this node's drain until the
+/// stuck-attempt reaper finds it. A failed close is logged and leaves that
+/// reaper as the backstop. Finalize never moves a `ready` row.
+pub(crate) async fn prepared_begin_refused_as_superseded(
+    payload: &SnapshotUploadJobs,
+) -> RegistrationProbe {
+    match send_prepared_begin(payload, true).await {
+        Ok(Err(BeginArtifactBackupError::BeginArtifactBackup {
+            superseded_generation: Some(generation),
+            ..
+        })) => RegistrationProbe::Superseded(generation),
+        Ok(Ok(reply)) => {
+            if verdict_only_reply_registered(&reply) {
+                finalize_with_cluster_api_failed(
+                    &payload.snapshot_id,
+                    "teardown backup probe re-registered an upload that had already failed",
+                )
+                .await;
+            }
+            RegistrationProbe::NotSuperseded
+        }
+        Ok(Err(refused)) => match classify_begin_error(refused).kind() {
+            pplx_space_common_jobs::JobFailureKind::Permanent => RegistrationProbe::NotSuperseded,
+            _ => RegistrationProbe::Unanswered,
+        },
+        Err(_) => RegistrationProbe::NotSuperseded,
+    }
+}
+
+/// Whether the reply to a verdict-only registration shows the server
+/// registered the attempt anyway: a server that predates `fence_verdict_only`
+/// ignores it and doesn't echo it.
+pub(crate) fn verdict_only_reply_registered(
+    reply: &pplx_space_node_api_client::proto::BeginArtifactBackupResponse,
+) -> bool {
+    !reply.fence_verdict_only
+}
+
+/// The outer error is a malformed payload, which no retry can fix; the inner
+/// result is the cluster-api call.
+async fn send_prepared_begin(
+    payload: &SnapshotUploadJobs,
+    fence_verdict_only: bool,
+) -> Result<
+    Result<
+        pplx_space_node_api_client::proto::BeginArtifactBackupResponse,
+        BeginArtifactBackupError,
+    >,
+    JobError,
+> {
     let local_artifact_id = payload.meta.local_artifact_id.ok_or_else(|| {
         JobError::permanent("prepared snapshot upload is missing local_artifact_id")
     })?;
@@ -559,7 +674,7 @@ pub(crate) async fn begin_prepared_upload(payload: &SnapshotUploadJobs) -> Resul
         .map(|name| name.as_str());
     let local_artifact_id = local_artifact_id.to_string();
 
-    begin_with_cluster_api(BeginArtifactBackup {
+    Ok(begin_with_cluster_api(BeginArtifactBackup {
         sandbox_id: &payload.meta.sandbox_id,
         local_artifact_id: &local_artifact_id,
         artifact_kind: artifact_kind_from_meta(&payload.meta),
@@ -568,9 +683,10 @@ pub(crate) async fn begin_prepared_upload(payload: &SnapshotUploadJobs) -> Resul
         backup_attempt_id: &payload.snapshot_id,
         storage_uri: &payload.storage_uri,
         execution,
+        execution_generation: payload.execution_generation,
+        fence_verdict_only,
     })
-    .await
-    .map_err(classify_begin_error)
+    .await)
 }
 
 fn classify_begin_error(error: BeginArtifactBackupError) -> JobError {
@@ -586,7 +702,7 @@ fn classify_begin_error(error: BeginArtifactBackupError) -> JobError {
                 JobError::retriable(format!("cluster-api connect: {error}"))
             }
         }
-        BeginArtifactBackupError::BeginArtifactBackup { code, message } => {
+        BeginArtifactBackupError::BeginArtifactBackup { code, message, .. } => {
             classify_cluster_status("begin_artifact_backup", tonic::Status::new(code, message))
         }
     }
@@ -1068,6 +1184,9 @@ pub(crate) struct BeginArtifactBackup<'a> {
     pub(crate) backup_attempt_id: &'a str,
     pub(crate) storage_uri: &'a str,
     pub(crate) execution: &'a pplx_space_common_core::types::SnapshotExecutionMetadata,
+    pub(crate) execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+    /// Ask for the registration's verdict without persisting the attempt.
+    pub(crate) fence_verdict_only: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1075,12 +1194,18 @@ pub(crate) enum BeginArtifactBackupError {
     #[error("cluster-api connect: {0}")]
     Connect(#[source] pplx_space_node_api_client::cluster::ConnectClusterApiError),
     #[error("begin_artifact_backup ({code:?}): {message}")]
-    BeginArtifactBackup { code: tonic::Code, message: String },
+    BeginArtifactBackup {
+        code: tonic::Code,
+        message: String,
+        /// The generation a refusal says the control plane retired.
+        superseded_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+    },
 }
 
 pub(crate) async fn begin_with_cluster_api(
     request: BeginArtifactBackup<'_>,
-) -> Result<(), BeginArtifactBackupError> {
+) -> Result<pplx_space_node_api_client::proto::BeginArtifactBackupResponse, BeginArtifactBackupError>
+{
     let mut client = pplx_space_node_api_client::cluster::connect_from_env()
         .await
         .map_err(BeginArtifactBackupError::Connect)?;
@@ -1088,10 +1213,14 @@ pub(crate) async fn begin_with_cluster_api(
     client
         .begin_artifact_backup(begin_artifact_backup_request(&request))
         .await
-        .map(|_| ())
+        .map(tonic::Response::into_inner)
         .map_err(|status| BeginArtifactBackupError::BeginArtifactBackup {
             code: status.code(),
             message: status.message().to_string(),
+            superseded_generation:
+                pplx_space_node_api_client::cluster::backup_execution_superseded_generation(
+                    &status,
+                ),
         })
 }
 
@@ -1131,6 +1260,10 @@ fn begin_artifact_backup_request(
             .execution
             .host_cpu()
             .map(|host_cpu| host_cpu.as_str().to_owned()),
+        execution_generation: request
+            .execution_generation
+            .map(pplx_space_common_core::types::ExecutionGeneration::get),
+        fence_verdict_only: request.fence_verdict_only,
     }
 }
 

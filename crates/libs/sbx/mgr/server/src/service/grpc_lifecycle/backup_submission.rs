@@ -135,6 +135,7 @@ impl SandboxManagerService {
                 } else {
                     ArtifactBackupHandoff::DurableWorker
                 },
+                execution_generation: None,
             },
         )
         .await
@@ -270,6 +271,7 @@ impl SandboxManagerService {
             format,
             dedup_key,
             handoff,
+            execution_generation,
         } = submission;
         let config: &crate::snapshot_upload::SnapshotUploadConfig = match request_override {
             Some(c) => c,
@@ -344,6 +346,7 @@ impl SandboxManagerService {
             retained,
         )
         .map_err(|error| format!("prepare snapshot upload intent failed: {error}"))?;
+        jobs.execution_generation = execution_generation;
         let mut storage_uri = jobs.storage_uri.clone();
         let local_artifact_id = local_artifact_id.to_string();
 
@@ -453,9 +456,12 @@ impl SandboxManagerService {
             .payload_as::<crate::snapshot_upload::SnapshotUploadJobs>()
             .map_err(|error| format!("decode snapshot-upload job {job_id}: {error}"))?;
         if crate::snapshot_upload_jobs::prepared_upload_requires_begin(&payload) {
-            crate::snapshot_upload_jobs::begin_prepared_upload(&payload)
+            crate::snapshot_upload_jobs::begin_prepared_upload_naming_supersession(&payload)
                 .await
-                .map_err(ArtifactBackupSubmissionError::Begin)?;
+                .map_err(|refusal| ArtifactBackupSubmissionError::Begin {
+                    error: refusal.error,
+                    superseded_generation: refusal.superseded_generation,
+                })?;
         }
         if payload.job_ids.is_empty() {
             match crate::snapshot_upload::submit_prepared_snapshot(&payload, &self.node_manager)
@@ -517,6 +523,30 @@ impl SandboxManagerService {
         Ok(payload)
     }
 
+    /// Hand a node-local suspend's capture to a durable upload, registered
+    /// under the sandbox's Kubernetes execution (see
+    /// [`node_local_registration_generation`]). Any failure, a refusal of a
+    /// superseded execution included, is a backup-fence failure, which rolls
+    /// the suspend back and disarms auto-lifecycle.
+    pub(super) async fn enqueue_node_local_suspend_backup(
+        &self,
+        sandbox: &crate::db::SandboxRow,
+        local_artifact_id: LocalArtifactId,
+        snapshot_dir: &str,
+        format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
+    ) -> Result<SubmitSuspendSnapshotOutcome, Status> {
+        self.enqueue_suspend_artifact_backup(
+            sandbox,
+            local_artifact_id,
+            snapshot_dir,
+            format,
+            None,
+            node_local_registration_generation(sandbox),
+        )
+        .await
+        .map_err(|error| artifact_backup_fence_status(error.to_string()))
+    }
+
     pub(super) async fn enqueue_suspend_artifact_backup(
         &self,
         sandbox: &crate::db::SandboxRow,
@@ -524,6 +554,7 @@ impl SandboxManagerService {
         snapshot_dir: &str,
         format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
         dedup_key: Option<&str>,
+        registration_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
     ) -> Result<SubmitSuspendSnapshotOutcome, ArtifactBackupSubmissionError> {
         let request_override = match self.resolve_org_snapshot_upload_config(&sandbox.id).await {
             OrgSnapshotConfigResolution::Resolved(config) => Some(config),
@@ -551,6 +582,7 @@ impl SandboxManagerService {
                 format,
                 dedup_key,
                 handoff: ArtifactBackupHandoff::TeardownFence,
+                execution_generation: registration_generation,
             },
         )
         .await

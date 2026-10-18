@@ -8,7 +8,8 @@ use uuid::Uuid;
 
 use super::{
     AutoLifecycleExecution, FieldPatch, SandboxDesiredStatePatch, SandboxMetadata,
-    SandboxMetadataValue, any_undescribed_artifact_owner, get, update_desired_state,
+    SandboxMetadataValue, any_undescribed_artifact_owner, durably_restorable, get,
+    update_desired_state,
 };
 
 /// The three desired-state columns, read back raw.
@@ -647,5 +648,219 @@ async fn restore_observation_uses_database_lease_expiration() -> TestResult {
         assert_eq!(super::restore_owner_active(&db.pool, id).await?, expected);
     }
     assert!(!super::restore_owner_active(&db.pool, SandboxId::new()).await?);
+    Ok(())
+}
+
+/// Inserts a full suspend snapshot of `sandbox`, `state`, at `timestamp`, for
+/// local artifact `artifact`, with a storage location orphaned when asked.
+async fn insert_full_snapshot(
+    pool: &PgPool,
+    sandbox: Uuid,
+    artifact: Uuid,
+    state: &str,
+    timestamp: &str,
+    orphaned: bool,
+) -> TestResult {
+    let snapshot = Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO snapshots (
+             id, sandbox_id, type, state, timestamp, local_artifact_id, artifact_kind,
+             artifact_origin, org_id
+         )
+         VALUES ($1, $2, 'full', $3, $4::TIMESTAMPTZ, $5, 'full', 'suspend', $6)"
+    ))
+    .bind(snapshot)
+    .bind(sandbox)
+    .bind(state)
+    .bind(timestamp)
+    .bind(artifact)
+    .bind(SEED_ORG)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO snapshot_storage_locations (
+             id, snapshot_id, storage_connection_string, org_id, orphaned_at
+         ) VALUES (
+             $1, $2, 's3://test-bucket/snapshots/restorable?region=us-east-1', $3,
+             CASE WHEN $4 THEN NOW() END
+         )"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(snapshot)
+    .bind(SEED_ORG)
+    .bind(orphaned)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// A sandbox marked to a local artifact is durably restorable only through
+/// that artifact's ready backup with a live location: a stale ready snapshot
+/// of another artifact doesn't count, since the restore wouldn't select it. An
+/// unmarked sandbox needs a ready full snapshot at least as fresh as its last
+/// placement change, with no newer full row in any state; an evacuation-marked
+/// one only a ready newest full snapshot. A restoring row needs a source taken
+/// before the restore started. A missing sandbox isn't restorable.
+#[tokio::test(flavor = "current_thread")]
+async fn durably_restorable_follows_the_marker_and_placement() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+
+    let marked = insert_sandbox(pool, None, "suspended").await?;
+    let pinned = Uuid::now_v7();
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET current_local_artifact_id = $2,
+                current_local_artifact_kind = 'full',
+                current_local_artifact_origin = 'suspend'
+          WHERE id = $1"
+    ))
+    .bind(marked)
+    .bind(pinned)
+    .execute(pool)
+    .await?;
+    let marked_id = SandboxId::from_uuid(marked);
+    insert_full_snapshot(
+        pool,
+        marked,
+        Uuid::now_v7(),
+        "ready",
+        "2026-01-01T00:00:00Z",
+        false,
+    )
+    .await?;
+    assert!(
+        !durably_restorable(pool, marked_id).await?,
+        "another artifact's snapshot"
+    );
+    insert_full_snapshot(pool, marked, pinned, "ready", "2026-01-02T00:00:00Z", true).await?;
+    assert!(
+        !durably_restorable(pool, marked_id).await?,
+        "an orphaned location"
+    );
+    insert_full_snapshot(pool, marked, pinned, "ready", "2026-01-03T00:00:00Z", false).await?;
+    assert!(
+        durably_restorable(pool, marked_id).await?,
+        "the marked artifact's backup"
+    );
+    insert_full_snapshot(
+        pool,
+        marked,
+        Uuid::now_v7(),
+        "failed",
+        "2026-01-04T00:00:00Z",
+        false,
+    )
+    .await?;
+    assert!(
+        durably_restorable(pool, marked_id).await?,
+        "a newer failed row of another artifact doesn't displace the marked one"
+    );
+
+    let unmarked = insert_sandbox(pool, None, "suspended").await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET placement_changed_at = '2026-02-01T00:00:00Z' WHERE id = $1"
+    ))
+    .bind(unmarked)
+    .execute(pool)
+    .await?;
+    let unmarked_id = SandboxId::from_uuid(unmarked);
+    insert_full_snapshot(
+        pool,
+        unmarked,
+        Uuid::now_v7(),
+        "ready",
+        "2026-01-15T00:00:00Z",
+        false,
+    )
+    .await?;
+    assert!(
+        !durably_restorable(pool, unmarked_id).await?,
+        "older than the placement"
+    );
+    insert_full_snapshot(
+        pool,
+        unmarked,
+        Uuid::now_v7(),
+        "ready",
+        "2026-02-02T00:00:00Z",
+        false,
+    )
+    .await?;
+    assert!(
+        durably_restorable(pool, unmarked_id).await?,
+        "fresh after the placement"
+    );
+    insert_full_snapshot(
+        pool,
+        unmarked,
+        Uuid::now_v7(),
+        "failed",
+        "2026-02-03T00:00:00Z",
+        false,
+    )
+    .await?;
+    assert!(
+        !durably_restorable(pool, unmarked_id).await?,
+        "a newer failed full row"
+    );
+
+    // An evacuation-marked row needs only its newest full snapshot ready; its
+    // placement freshness doesn't apply.
+    let evacuating = insert_sandbox(pool, None, "suspended").await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET evacuation_restore_target = 'started',
+                placement_changed_at = '2026-05-01T00:00:00Z'
+          WHERE id = $1"
+    ))
+    .bind(evacuating)
+    .execute(pool)
+    .await?;
+    insert_full_snapshot(
+        pool,
+        evacuating,
+        Uuid::now_v7(),
+        "ready",
+        "2026-04-01T00:00:00Z",
+        false,
+    )
+    .await?;
+    assert!(
+        durably_restorable(pool, SandboxId::from_uuid(evacuating)).await?,
+        "an evacuation's newest ready snapshot"
+    );
+
+    // A restoring row needs a source in its retry window: a snapshot taken
+    // before the restore started.
+    let restoring = insert_sandbox(pool, None, "restoring").await?;
+    let restoring_id = SandboxId::from_uuid(restoring);
+    insert_full_snapshot(
+        pool,
+        restoring,
+        Uuid::now_v7(),
+        "ready",
+        "2026-03-01T00:00:00Z",
+        false,
+    )
+    .await?;
+    assert!(
+        durably_restorable(pool, restoring_id).await?,
+        "a pre-restore source"
+    );
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET lifecycle_changed_at = '2026-01-01T00:00:00Z' WHERE id = $1"
+    ))
+    .bind(restoring)
+    .execute(pool)
+    .await?;
+    assert!(
+        !durably_restorable(pool, restoring_id).await?,
+        "a snapshot from after the restore started isn't its source"
+    );
+
+    assert!(!durably_restorable(pool, SandboxId::new()).await?);
     Ok(())
 }

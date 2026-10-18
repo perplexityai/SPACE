@@ -124,6 +124,24 @@ pub(crate) enum EvictionClaim {
         /// quiescence window and the claim CAS read it.
         state_changed_at: String,
     },
+    /// `suspending → deleting` for a teardown suspend whose backup the cluster
+    /// refused because it had retired the execution (a reaped orphaned
+    /// restore pod's VM, say). The cluster row still exists and stays
+    /// restorable from its remote snapshots; what's released is a runtime no
+    /// restore can adopt and the capture it staged, which must never publish.
+    /// The claim refuses while any other local artifact of the sandbox still
+    /// awaits its backup, since the release deletes those bytes too.
+    ///
+    /// The refusal names `execution_generation`, so it's authority about this
+    /// one execution and needs no quiescence window: the claim re-asserts the
+    /// staged artifact and a running teardown job at that generation, which a
+    /// newer activation can't leave intact. Like
+    /// [`Self::TeardownSuspendPermanentlyFailed`], the runtime may still be
+    /// resident, and the `DeleteRow` cleanup tears it down.
+    TeardownExecutionRetired {
+        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        staged_artifact: LocalArtifactId,
+    },
 }
 
 impl SandboxManagerService {
@@ -167,6 +185,206 @@ impl SandboxManagerService {
             self.evict_local_sandbox_owned(sandbox_id, claim, expected_updated_at),
         )
         .await
+    }
+
+    /// Release a teardown suspend's runtime and its staged capture after the
+    /// cluster refused the backup because it retired `execution_generation`
+    /// (see [`EvictionClaim::TeardownExecutionRetired`]). The `DeleteRow`
+    /// cleanup records the execution delete receipt, so the shim's
+    /// `PrepareTeardownSuspend` for that generation is answered `DELETED` and
+    /// the pod's task is released.
+    ///
+    /// The release first needs the cluster to show the sandbox is durably
+    /// restorable without the capture, by the marker-aware test the node-drain
+    /// source release uses; otherwise it is held, since the refused capture
+    /// may be the sandbox's only copy. Every other local artifact of the
+    /// sandbox must be stamped backed too, since the release deletes it; one
+    /// without the stamp is proven by the cluster's exact-artifact readiness
+    /// check and stamped, and the release is held while any stays unproven.
+    ///
+    /// The cleanup runs under its own state-writer scope, as every eviction
+    /// does, so a shutdown that cancels the teardown driver can't drop the
+    /// lease while the delete is still in flight. It takes a second lease
+    /// rather than inheriting the driver's, which isn't installed as a scope,
+    /// so a drain that has closed admission refuses the release and the next
+    /// drive retries it.
+    pub(super) async fn release_retired_teardown_execution(
+        &self,
+        sandbox_id: &str,
+        execution_generation: pplx_space_common_core::types::ExecutionGeneration,
+        staged_artifact: LocalArtifactId,
+    ) -> Result<(), Status> {
+        // Ask the cluster only for a release the claim could take: one whose
+        // row still holds this teardown's capture. The claim re-checks all of
+        // it.
+        let claimable = self.db_conn().and_then(|db| {
+            let running = crate::db::teardown_suspend_operation_running_for(
+                &db,
+                sandbox_id,
+                execution_generation,
+            )
+            .map_err(|error| Status::internal(format!("teardown job lookup: {error}")))?;
+            let holds_capture = crate::db::get_sandbox(&db, sandbox_id)
+                .map_err(|error| Status::internal(format!("sandbox lookup: {error}")))?
+                .is_some_and(|row| {
+                    row.state == crate::state::SandboxState::Suspending
+                        && row.current_local_artifact_id == Some(staged_artifact)
+                });
+            let awaiting_backup = if running && holds_capture {
+                crate::db::other_local_artifacts_awaiting_backup(&db, sandbox_id, staged_artifact)
+                    .map_err(|error| Status::internal(format!("local artifact lookup: {error}")))?
+            } else {
+                Vec::new()
+            };
+            Ok((running && holds_capture, awaiting_backup))
+        });
+        let (claimable, awaiting_backup) = match claimable {
+            Ok(checks) => checks,
+            Err(status) => {
+                tracing::warn!(sandbox_id, %execution_generation, error = %status.message(),
+                    "cannot read the retired execution's teardown before its release");
+                return Err(status);
+            }
+        };
+        if !claimable {
+            tracing::info!(
+                sandbox_id,
+                %execution_generation,
+                %staged_artifact,
+                "not releasing a retired execution's teardown: the row moved on",
+            );
+            return Err(Status::failed_precondition(
+                "the sandbox no longer holds this teardown's capture",
+            ));
+        }
+        // An unstamped artifact may still be backed: one restored from
+        // another node's backup is never stamped there. Ask the cluster about
+        // each, as eviction does, and hold only for one it can't show backed.
+        let proven = crate::sandbox_eviction::prove_local_artifact_backups(
+            self,
+            sandbox_id,
+            &awaiting_backup,
+        )
+        .await;
+        if proven != Ok(true) {
+            let reason = proven
+                .err()
+                .unwrap_or(crate::sandbox_eviction::SkipReason::LocalArtifactAwaitingBackup);
+            pplx_space_metrics::sandbox_eviction::skipped(reason.as_str());
+            tracing::warn!(
+                sandbox_id,
+                %execution_generation,
+                %staged_artifact,
+                reason = reason.as_str(),
+                "retired execution's runtime stays resident: the cluster can't show another \
+                 local artifact of the sandbox is backed up, and releasing would delete it",
+            );
+            return Err(Status::failed_precondition(
+                "another local artifact of the sandbox awaits its backup",
+            ));
+        }
+        // The release discards the refused capture unpublished. Unless the
+        // cluster shows the sandbox is durably restorable without it, that
+        // capture may be the sandbox's only copy, so keep the runtime and the
+        // capture and leave the teardown failed; the next drive asks again.
+        let backed = crate::sandbox_eviction::sandbox_has_backed_copy(sandbox_id).await;
+        if backed != Ok(true) {
+            let reason = backed
+                .err()
+                .unwrap_or(crate::sandbox_eviction::SkipReason::NoBackedCopy);
+            pplx_space_metrics::sandbox_eviction::skipped(reason.as_str());
+            tracing::warn!(
+                sandbox_id,
+                %execution_generation,
+                %staged_artifact,
+                reason = reason.as_str(),
+                "retired execution's runtime stays resident: the cluster can't show the \
+                 sandbox is durably restorable, so its refused capture may be the only copy",
+            );
+            return Err(Status::failed_precondition(
+                "the sandbox isn't durably restorable without this capture; keeping the \
+                 retired execution's capture",
+            ));
+        }
+        let reason = crate::sandbox_eviction::EvictReason::ExecutionRetired;
+        let result = self
+            .evict_local_sandbox(
+                sandbox_id,
+                EvictionClaim::TeardownExecutionRetired {
+                    execution_generation,
+                    staged_artifact,
+                },
+                None,
+            )
+            .await;
+        match &result {
+            Ok(()) => tracing::info!(
+                sandbox_id,
+                %execution_generation,
+                %staged_artifact,
+                reason = reason.as_str(),
+                "released a teardown suspend the cluster refused for a retired execution; \
+                 its staged capture was discarded unpublished",
+            ),
+            Err(status) if status.code() == tonic::Code::FailedPrecondition => {
+                // Only a claim held back by another artifact's backup is that
+                // case; one that lost because the teardown job moved on is not.
+                let awaiting_backup = self.db_conn().ok().and_then(|db| {
+                    let still_driving = crate::db::teardown_suspend_operation_running_for(
+                        &db,
+                        sandbox_id,
+                        execution_generation,
+                    )
+                    .ok()?
+                        && crate::db::get_sandbox(&db, sandbox_id)
+                            .ok()?
+                            .is_some_and(|row| {
+                                row.state == crate::state::SandboxState::Suspending
+                                    && row.current_local_artifact_id == Some(staged_artifact)
+                            });
+                    let pending = !crate::db::other_local_artifacts_awaiting_backup(
+                        &db,
+                        sandbox_id,
+                        staged_artifact,
+                    )
+                    .ok()?
+                    .is_empty();
+                    Some(still_driving && pending)
+                });
+                if awaiting_backup == Some(true) {
+                    pplx_space_metrics::sandbox_eviction::skipped(
+                        crate::sandbox_eviction::SkipReason::LocalArtifactAwaitingBackup.as_str(),
+                    );
+                    tracing::warn!(
+                        sandbox_id,
+                        %execution_generation,
+                        %staged_artifact,
+                        "retired execution's runtime stays resident: another local artifact of \
+                         the sandbox awaits its backup, and releasing would delete it",
+                    );
+                } else {
+                    tracing::info!(
+                        sandbox_id,
+                        %execution_generation,
+                        %staged_artifact,
+                        refusal = %status.message(),
+                        "not releasing a retired execution's teardown",
+                    );
+                }
+            }
+            Err(_) => {}
+        }
+        crate::sandbox_eviction::report_eviction_outcome(
+            sandbox_id,
+            reason,
+            pplx_space_events::SandboxEventDetails::default()
+                .with_from_state(crate::state::SandboxState::Suspending.as_str())
+                .local_artifact_id(staged_artifact.to_string())
+                .execution_generation(execution_generation.to_string()),
+            &result,
+            "retired-execution teardown release failed",
+        );
+        result
     }
 
     async fn evict_local_sandbox_owned(
@@ -215,7 +433,8 @@ impl SandboxManagerService {
                     })?,
             ),
             EvictionClaim::SuspendedPinned(_)
-            | EvictionClaim::TeardownSuspendPermanentlyFailed { .. } => None,
+            | EvictionClaim::TeardownSuspendPermanentlyFailed { .. }
+            | EvictionClaim::TeardownExecutionRetired { .. } => None,
         };
         let claimed = {
             let db = self.db_conn()?;
@@ -268,6 +487,15 @@ impl SandboxManagerService {
                     *staged_artifact,
                     state_changed_at,
                 ),
+                EvictionClaim::TeardownExecutionRetired {
+                    execution_generation,
+                    staged_artifact,
+                } => crate::db::claim_retired_teardown_execution_for_release(
+                    &db,
+                    sandbox_id,
+                    *execution_generation,
+                    *staged_artifact,
+                ),
             }
             .map_err(|e| Status::internal(format!("eviction claim failed: {e}")))?
         };
@@ -289,6 +517,13 @@ impl SandboxManagerService {
                 EvictionClaim::TeardownSuspendPermanentlyFailed { .. } => format!(
                     "sandbox {sandbox_id} is no longer a terminally failed teardown suspend \
                      with the staged artifact the eviction was decided against"
+                ),
+                EvictionClaim::TeardownExecutionRetired {
+                    execution_generation,
+                    ..
+                } => format!(
+                    "sandbox {sandbox_id} is no longer suspending generation \
+                     {execution_generation} with the artifact the cluster refused"
                 ),
             }));
         }
@@ -491,6 +726,11 @@ impl SandboxManagerService {
             | EvictionClaim::SuspendedPinned(_)
             | EvictionClaim::FailedRestoring
             | EvictionClaim::Quarantined => ("updated_at", row.updated_at.as_str()),
+            EvictionClaim::TeardownExecutionRetired { .. } => {
+                return Err(Status::internal(
+                    "a cluster-deleted eviction never claims a retired teardown execution",
+                ));
+            }
         };
         let quiescent_since_secs = crate::db::timestamps::EpochSeconds::parse(quiescence_since)
             .map_err(|_| {
@@ -595,57 +835,27 @@ impl SandboxManagerService {
                     Some(&checked_updated_at),
                 ) => result,
             };
-            match &result {
-                Ok(()) => {
-                    pplx_space_metrics::sandbox_eviction::evicted(reason.as_str());
-                    pplx_space_metrics::sandbox_eviction::logical_bytes_freed(
-                        reason.as_str(),
-                        bytes,
-                    );
-                    tracing::info!(
-                        sandbox_id = %sandbox_id,
-                        reason = reason.as_str(),
-                        state_before = %state_before,
-                        bytes,
-                        idle_secs,
-                        "cluster-deleted sandbox: local presence evicted",
-                    );
-                    crate::sandbox_eviction::emit_eviction_event(
-                        &sandbox_id,
-                        pplx_space_events::SandboxEventType::LocalEvictionCompleted,
-                        pplx_space_events::SandboxEventDetails::default()
-                            .reason(reason.as_str())
-                            .with_from_state(state_before.as_str())
-                            .local_path(cache_dir),
-                    );
-                }
-                // The CAS lost a race (resume/restore/delete claimed the
-                // row first); nothing was changed and nothing to report.
-                Err(status)
-                    if matches!(
-                        status.code(),
-                        tonic::Code::FailedPrecondition | tonic::Code::NotFound
-                    ) => {}
-                Err(status) => {
-                    pplx_space_metrics::sandbox_eviction::failed();
-                    tracing::warn!(
-                        sandbox_id = %sandbox_id,
-                        code = %status.code(),
-                        message = %status.message(),
-                        "cluster-deleted eviction: local delete failed; row left in deleting \
-                         for cleanup retry",
-                    );
-                    crate::sandbox_eviction::emit_eviction_event(
-                        &sandbox_id,
-                        pplx_space_events::SandboxEventType::LocalEvictionFailed,
-                        pplx_space_events::SandboxEventDetails::default()
-                            .reason(reason.as_str())
-                            .with_from_state(state_before.as_str())
-                            .error(status.message().to_string())
-                            .logged_by_caller(),
-                    );
-                }
+            if result.is_ok() {
+                pplx_space_metrics::sandbox_eviction::logical_bytes_freed(reason.as_str(), bytes);
+                tracing::info!(
+                    sandbox_id = %sandbox_id,
+                    reason = reason.as_str(),
+                    state_before = %state_before,
+                    bytes,
+                    idle_secs,
+                    "cluster-deleted sandbox: local presence evicted",
+                );
             }
+            crate::sandbox_eviction::report_eviction_outcome(
+                &sandbox_id,
+                reason,
+                pplx_space_events::SandboxEventDetails::default()
+                    .with_from_state(state_before.as_str())
+                    .local_path(cache_dir),
+                &result,
+                "cluster-deleted eviction: local delete failed; row left in deleting for \
+                 cleanup retry",
+            );
             result
         };
         let teardown = self.task_tracker.spawn(teardown.instrument(span));

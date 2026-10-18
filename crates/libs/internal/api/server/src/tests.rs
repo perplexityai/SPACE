@@ -4016,6 +4016,7 @@ async fn placed_sandbox_locations_resolve_for_its_node_only() -> TestResult {
         exact(suspend_artifact, full),
         exact(disk_artifact, disk),
         Artifact::LatestReadySuspendSnapshotId(suspend_attempt.to_string()),
+        Artifact::DurablyRestorable(true),
     ] {
         assert!(check(sandbox_id, artifact.clone(), Some(worker_a_ip)).await?);
         assert!(!check(SandboxId::new(), artifact.clone(), Some(worker_a_ip)).await?);
@@ -4059,6 +4060,7 @@ async fn placed_sandbox_locations_resolve_for_its_node_only() -> TestResult {
                 "invalid".to_string(),
             )),
         ),
+        readiness(sandbox_id, Some(Artifact::DurablyRestorable(false))),
         readiness(
             sandbox_id,
             Some(Artifact::LocalArtifact(LocalArtifactBackupIdentity {
@@ -4852,6 +4854,8 @@ async fn begin_artifact_backup_from_node(
                 snapshot_name: None,
                 execution: Some(test_snapshot_execution()),
                 capture_host_cpu: None,
+                execution_generation: None,
+                fence_verdict_only: false,
             },
             node_ip,
         ))
@@ -4885,6 +4889,8 @@ async fn begin_artifact_backup_with_storage_uri(
                 snapshot_name: input.snapshot_name,
                 execution: Some(test_snapshot_execution()),
                 capture_host_cpu: None,
+                execution_generation: None,
+                fence_verdict_only: false,
             },
             TEST_WORKER_IP,
         ))
@@ -5676,6 +5682,8 @@ async fn begin_artifact_backup_rejects_missing_execution_metadata() -> TestResul
             snapshot_name: None,
             execution: None,
             capture_host_cpu: None,
+            execution_generation: None,
+            fence_verdict_only: false,
         }))
         .await
         .expect_err("begin without execution metadata must be rejected");
@@ -5714,6 +5722,8 @@ async fn begin_artifact_backup_persists_capture_host_cpu() -> TestResult {
                 snapshot_name: None,
                 execution: Some(test_snapshot_execution()),
                 capture_host_cpu: capture_host_cpu.map(str::to_owned),
+                execution_generation: None,
+                fence_verdict_only: false,
             },
             TEST_WORKER_IP,
         ))
@@ -7381,6 +7391,7 @@ async fn a_missing_templates_table_degrades_end_to_end() -> TestResult {
     Ok(())
 }
 
+mod backup_generation_fence;
 mod publication;
 
 #[tokio::test(flavor = "current_thread")]

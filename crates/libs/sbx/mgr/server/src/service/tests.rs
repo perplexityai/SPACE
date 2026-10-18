@@ -8221,7 +8221,7 @@ pub(crate) mod service_tests {
         assert!(crate::db::get_sandbox(&db, &sandbox_id).unwrap().is_none());
     }
 
-    pub(super) fn runtime_fields(
+    pub(crate) fn runtime_fields(
         generation: ExecutionGeneration,
         slot: u32,
     ) -> crate::db::RuntimeFields<'static> {

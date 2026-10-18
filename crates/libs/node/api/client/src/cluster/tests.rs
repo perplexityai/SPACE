@@ -62,3 +62,28 @@ fn broken_token_source_errors_classify_as_token_source() {
         ));
     }
 }
+
+#[test]
+fn backup_execution_superseded_marker_round_trips_only_on_failed_precondition() {
+    let generation = ExecutionGeneration::new(7).unwrap();
+    let status = backup_execution_superseded_status("retired", generation);
+    assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        backup_execution_superseded_generation(&status),
+        Some(generation)
+    );
+
+    let mut other_code = tonic::Status::not_found("gone");
+    *other_code.metadata_mut() = status.metadata().clone();
+    assert_eq!(backup_execution_superseded_generation(&other_code), None);
+
+    let unmarked = tonic::Status::failed_precondition("no source node");
+    assert_eq!(backup_execution_superseded_generation(&unmarked), None);
+
+    let mut malformed = tonic::Status::failed_precondition("retired");
+    malformed.metadata_mut().insert(
+        BACKUP_EXECUTION_SUPERSEDED_METADATA,
+        MetadataValue::from_static("0"),
+    );
+    assert_eq!(backup_execution_superseded_generation(&malformed), None);
+}

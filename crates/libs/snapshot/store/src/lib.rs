@@ -784,6 +784,38 @@ pub async fn artifact_backup_ready(
     .await?)
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum CheckArtifactRegistrationError {
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+}
+
+/// Whether an attempt other than `except` already registered the local
+/// artifact `local_artifact_id` of `sandbox_id`, in any state: some other
+/// committed attempt for these bytes was admitted, fenced or not. Only as durable as that
+/// row: once retention deletes it, this answers `false`.
+pub async fn artifact_registered_by_another_attempt(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+    local_artifact_id: LocalArtifactId,
+    except: SnapshotId,
+) -> Result<bool, CheckArtifactRegistrationError> {
+    Ok(sqlx::query_scalar(sql!(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM snapshots
+             WHERE sandbox_id = $1
+               AND local_artifact_id = $2
+               AND id <> $3
+         )"
+    ))
+    .bind(sandbox_id)
+    .bind(local_artifact_id.as_uuid())
+    .bind(except)
+    .fetch_one(executor)
+    .await?)
+}
+
 /// Whether `snapshot_id` is still the latest ready suspend attempt of
 /// `sandbox_id`, with a live storage location. This is the proof an unpinned
 /// local cache needs: a ready backup of an older attempt cannot show which
@@ -1025,16 +1057,28 @@ fn snapshot_artifact(
         .map_err(|_| GetSnapshotError::InvalidArtifactIdentity { snapshot_id })
 }
 
+/// Whether [`insert`] wrote the snapshot row or found the same identity already
+/// registered.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InsertOutcome {
+    /// This call's transaction wrote the row.
+    Created,
+    /// A committed row with the same identity already existed.
+    AlreadyRegistered,
+}
+
 /// Insert one snapshot and its single durable storage location.
 ///
-/// The operation is idempotent for the same durable identity and exact URI.
-/// Reusing the snapshot id for different content or a different location is a
-/// domain conflict. The caller owns the transaction so the two-table mutation
-/// cannot be committed partially.
+/// The operation is idempotent for the same durable identity and exact URI,
+/// and reports which case it took so a caller can admit a new registration
+/// under conditions a replay doesn't have to meet again. Reusing the snapshot
+/// id for different content or a different location is a domain conflict. The
+/// caller owns the transaction so the two-table mutation cannot be committed
+/// partially.
 pub async fn insert(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     snapshot: &NewSnapshot,
-) -> Result<SnapshotRecord, InsertSnapshotError> {
+) -> Result<(SnapshotRecord, InsertOutcome), InsertSnapshotError> {
     let artifact = snapshot.artifact.as_ref();
     let execution = snapshot
         .execution_metadata
@@ -1130,7 +1174,12 @@ pub async fn insert(
             snapshot_id: snapshot.id,
         });
     }
-    Ok(persisted)
+    let outcome = if inserted_id.is_some() {
+        InsertOutcome::Created
+    } else {
+        InsertOutcome::AlreadyRegistered
+    };
+    Ok((persisted, outcome))
 }
 
 async fn load_after_insert(

@@ -317,6 +317,8 @@ struct ArtifactBackupSubmission<'a> {
     format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
     dedup_key: Option<&'a str>,
     handoff: ArtifactBackupHandoff,
+    /// The teardown suspend's execution, for `BeginArtifactBackup`'s fence.
+    execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -337,8 +339,14 @@ pub(super) const AUTO_LIFECYCLE_SUSPEND_BACKUP_FENCE_FAILED_METADATA: &str =
 enum ArtifactBackupSubmissionError {
     #[error("{0}")]
     Other(String),
-    #[error("begin restore-visible snapshot backup: {0}")]
-    Begin(#[source] pplx_space_common_jobs::JobError),
+    /// `superseded_generation` is the generation the control plane named
+    /// when it refused the registration as superseded.
+    #[error("begin restore-visible snapshot backup: {error}")]
+    Begin {
+        #[source]
+        error: pplx_space_common_jobs::JobError,
+        superseded_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+    },
     #[error(transparent)]
     RetainedUpload(#[from] suspend_snapshot::RetainedUploadError),
 }
@@ -362,6 +370,61 @@ struct TeardownSuspendBackup<'a> {
     execution_generation: pplx_space_common_core::types::ExecutionGeneration,
     artifact: &'a crate::db::LocalArtifactRow,
     format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
+    origin: TeardownBackupOrigin,
+}
+
+impl TeardownSuspendBackup<'_> {
+    /// The generation the backup registers under: only this execution's own
+    /// capture carries it to the control plane's fence.
+    fn registration_generation(
+        &self,
+    ) -> Option<pplx_space_common_core::types::ExecutionGeneration> {
+        match self.origin {
+            TeardownBackupOrigin::Captured => Some(self.execution_generation),
+            TeardownBackupOrigin::PreviouslySuspended => None,
+        }
+    }
+}
+
+/// The generation a node-local suspend of `sandbox` registers its backup
+/// under: the Kubernetes execution its runtime belongs to, so the control
+/// plane refuses the capture of a runtime it has superseded (an orphaned
+/// restore pod's VM idling into auto-suspend, say). A legitimate idle suspend
+/// runs while its execution is still the newest. A refusal rolls the suspend back and
+/// disarms auto-lifecycle, and the pod's teardown later releases the runtime.
+/// Runtimes outside Kubernetes have no execution to fence and register
+/// unfenced.
+fn node_local_registration_generation(
+    sandbox: &crate::db::SandboxRow,
+) -> Option<pplx_space_common_core::types::ExecutionGeneration> {
+    let route = &sandbox.space_api_route_identity;
+    (route.effective_substrate_kind()
+        == Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes))
+    .then_some(route.execution_generation)
+    .flatten()
+}
+
+/// Where a teardown suspend's artifact came from, which decides whether its
+/// backup registration is fenced by the execution generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TeardownBackupOrigin {
+    /// This execution's teardown captured it from the resident runtime. The
+    /// control plane refuses it once the generation is superseded, and the
+    /// node releases the runtime.
+    Captured,
+    /// An earlier node-local suspend captured it, and the teardown only binds
+    /// the suspended row to this execution. That suspend registered its
+    /// backup synchronously before finalizing when an upload destination was
+    /// configured (a refusal would have rolled it back), and from an sbx-mgr
+    /// that predates the fence it registered without a generation; with no
+    /// destination configured it registered nothing. The node-local upload
+    /// has no dedup key, so the teardown doesn't join it: it starts its own
+    /// attempt, which carries no generation, since the capture may hold the
+    /// sandbox's latest state and a refusal couldn't release a row that isn't
+    /// `suspending`. Only an upload keyed by this artifact, from an earlier
+    /// drive of this teardown or a backup requested by artifact id, is
+    /// joined, and its registration replays unfenced.
+    PreviouslySuspended,
 }
 
 /// The persisted retained-source identity of a full artifact, if any.
@@ -392,6 +455,8 @@ pub(super) fn sidecar_rootfs_send_source_id(
 
 #[cfg(test)]
 mod backup_policy_tests;
+#[cfg(test)]
+mod retired_teardown_tests;
 #[cfg(test)]
 mod tests;
 
