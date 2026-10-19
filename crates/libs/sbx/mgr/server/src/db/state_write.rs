@@ -196,7 +196,9 @@ edge_table! {
     /// `start_from_checkpoint`.
     RESTORE_BEGIN: Request, of(&[Suspended]) => Restoring;
     /// `try_start_from_warm_snapshot` through `write_warm_start_restaged`
-    /// when the row is not already `suspended`, before the cold path.
+    /// when the row is not already `suspended`, before the cold path. Its db
+    /// writer, `restage_for_warm_start`, drops the row's artifact pin with the
+    /// write.
     WARM_START_RESTAGE: Request, of(&[Created, Stopped]) => Suspended;
     /// `insert_restoring_sandbox_row_from_snapshot` through
     /// `restore_adopt_orphan_or_insert_sandbox_in_transaction`: a
@@ -297,11 +299,12 @@ edge_table! {
             .without(Stopping)
             .without(Deleting)
             .without(Quarantined) => Stopping;
-    /// `complete_row_intent_cleanup_for_job(MarkStopped)` and
-    /// `publish_stopped_artifact`.
+    /// `complete_row_intent_cleanup_for_job(MarkStopped)`, which drops the
+    /// row's artifact pin, and `publish_stopped_artifact`.
     STOP_COMPLETE: Completion, of(&[Stopping]) => Stopped;
     /// `run_due_auto_lifecycle`'s idle Stop of a `suspended` row through
-    /// `stop_suspended_for_auto_lifecycle`, which bypasses every RPC.
+    /// `stop_suspended_for_auto_lifecycle`, which bypasses every RPC. The db
+    /// writer of the same name drops the row's artifact pin with the write.
     AUTO_LIFECYCLE_STOP_SUSPENDED: Request, of(&[Suspended]) => Stopped;
     /// Delete admission: `admit_lifecycle_cleanup_fenced` through
     /// `update_state_superseding_activation_in_transaction(Deleting)` and
@@ -346,8 +349,9 @@ edge_table! {
     /// `complete_row_intent_cleanup_for_job` through `apply_cleanup_state`
     /// for a `mark_created` completion.
     CLEANUP_COMPLETE_CREATED: Recovery, of(&[CleanupRequired, CleanupFailed]) => Created;
-    /// As above for `mark_stopped`, and `publish_stopped_artifact` for a
-    /// cleanup row with a `mark_stopped` intent.
+    /// As above for `mark_stopped`, which drops the row's artifact pin, and
+    /// `publish_stopped_artifact` for a cleanup row with a `mark_stopped`
+    /// intent.
     CLEANUP_COMPLETE_STOPPED: Recovery, of(&[CleanupRequired, CleanupFailed]) => Stopped;
     /// As above for `mark_suspended`.
     CLEANUP_COMPLETE_SUSPENDED: Recovery, of(&[CleanupRequired, CleanupFailed]) => Suspended;

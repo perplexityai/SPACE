@@ -18,9 +18,11 @@ use rusqlite::{Connection, params};
 
 use super::{TestSandboxInsert, insert_test_sandbox};
 use crate::db::{
-    CleanupCompletion, CleanupEpisodeSpec, Edge, InsertSandboxParams, ORPHANED_SANDBOX_OWNER,
-    ORPHANED_SANDBOX_TEMPLATE, PolicyAuthority, StateWriteOutcome, begin_suspend,
-    complete_row_intent_cleanup_for_job, ensure_teardown_suspend_operation, immediate_transaction,
+    ActivationKind, ActivationRouteAdmission, CleanupCompletion, CleanupEpisode,
+    CleanupEpisodeSpec, Edge, InsertSandboxParams, ORPHANED_SANDBOX_OWNER,
+    ORPHANED_SANDBOX_TEMPLATE, PolicyAuthority, StateWriteOutcome,
+    begin_activation_with_route_evidence, begin_suspend, complete_row_intent_cleanup_for_job,
+    ensure_teardown_suspend_operation, immediate_transaction,
     insert_sandbox_with_cleanup_episode_and_route_evidence, set_cleanup_intent, update_state_from,
     update_state_superseding_activation_in_transaction,
 };
@@ -673,6 +675,22 @@ pub(super) fn set_suspend_pin(conn: &Connection, id: &str) -> LocalArtifactId {
     )
     .unwrap();
     pin
+}
+
+/// Arm a cold start of a `stopped` row, as Start admits it, returning the
+/// activation's cleanup episode.
+pub(crate) fn begin_cold_start(conn: &Connection, id: &str) -> CleanupEpisode {
+    begin_activation_with_route_evidence(
+        conn,
+        id,
+        SandboxState::Stopped,
+        ActivationKind::ColdStart,
+        None,
+        None,
+        ActivationRouteAdmission::default(),
+    )
+    .unwrap()
+    .unwrap()
 }
 
 /// A `suspended` row pinning its published suspend artifact.

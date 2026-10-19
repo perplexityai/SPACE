@@ -577,7 +577,7 @@ impl SandboxManagerService {
                 barrier.wait().await;
             }
         }
-        let outcome = crate::db::update_state_from(&*self.db_conn()?, sandbox_id, edge)
+        let outcome = crate::db::stop_suspended_for_auto_lifecycle(&*self.db_conn()?, sandbox_id)
             .map_err(|error| Status::internal(format!("{CONTEXT}: {error}")))?;
         match state_write_result(outcome) {
             Ok(_) => Ok(true),

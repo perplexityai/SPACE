@@ -1605,6 +1605,13 @@ impl SandboxManagerService {
             }
         }
 
+        // The rollback rewrites the rootfs in place, so a `stopped` row's
+        // artifact pin stops naming its bytes. Drop it first, under the
+        // artifact lock a current-instance backup also takes before it mints
+        // or reuses a pin.
+        crate::db::drop_stopped_artifact_pin(&*self.db_conn()?, &id)
+            .map_err(|e| Status::internal(format!("drop stopped artifact pin: {e}")))?;
+
         // Perform disk rollback: replace instance/ with the snapshot's disk state.
         // For d-*: the snapshot IS the disk state (btrfs subvolume).
         // For f-*: local captures are subvolumes; imports are plain directories.

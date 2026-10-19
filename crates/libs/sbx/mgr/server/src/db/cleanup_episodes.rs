@@ -770,6 +770,14 @@ fn apply_cleanup_state(
         upsert_suspend_local_artifact(tx, sandbox_id, local_artifact_id, local_path)?;
     }
     let published_artifact_id = published_suspend_artifact.map(|(id, _)| id.to_string());
+    // A completion to `stopped` drops the row's artifact pin. A `stopped` row's
+    // pin must name a disk artifact of its rootfs as it now stands, and nothing
+    // here can show that: the row is leaving an activation or a runtime that
+    // may have written the rootfs since the pin was taken, or it pins a full
+    // suspend artifact, which a `stopped` row's current-instance backup
+    // refuses. Dropping a pin that was still accurate costs a re-mint and a
+    // fresh upload of the disk; keeping a stale one republishes old bytes.
+    //
     // An ordinary STOP retains only generation/pod identity as teardown proof;
     // routing credentials and live runtime fields are always cleared. Activation
     // rollback instead uses its explicit receipt and must clear the identity.
@@ -853,12 +861,20 @@ fn apply_cleanup_state(
                     ELSE NULL
                 END,
                 failure_reason = ?10,
-                current_local_artifact_id = COALESCE(?11, current_local_artifact_id),
+                current_local_artifact_id = CASE
+                    WHEN ?11 IS NOT NULL THEN ?11
+                    WHEN ?1 = 'stopped' THEN NULL
+                    ELSE current_local_artifact_id
+                END,
                 current_local_artifact_kind = CASE
-                    WHEN ?11 IS NULL THEN current_local_artifact_kind ELSE 'full'
+                    WHEN ?11 IS NOT NULL THEN 'full'
+                    WHEN ?1 = 'stopped' THEN NULL
+                    ELSE current_local_artifact_kind
                 END,
                 current_local_artifact_origin = CASE
-                    WHEN ?11 IS NULL THEN current_local_artifact_origin ELSE 'suspend'
+                    WHEN ?11 IS NOT NULL THEN 'suspend'
+                    WHEN ?1 = 'stopped' THEN NULL
+                    ELSE current_local_artifact_origin
                 END,
                 suspend_predecessor_artifact_id = NULL,
                 state_changed_at = CASE WHEN state IS NOT ?1 THEN ?2 ELSE state_changed_at END,
