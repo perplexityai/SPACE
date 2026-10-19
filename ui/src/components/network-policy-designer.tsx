@@ -94,7 +94,7 @@ const INITIAL_DRAFT_RULES: DraftRule[] = [];
 
 const PLATFORM_GUARDRAILS = [
   { label: 'EC2 IMDS', cidr: '169.254.169.254/32' },
-  { label: 'Link-local infrastructure', cidr: '169.254.0.0/16 except 169.254.0.20/30' },
+  { label: 'Link-local infrastructure', cidr: '169.254.0.0/16 except 169.254.0.21/32' },
   { label: 'SPACE slots', cidr: '10.11.0.0/16' },
   { label: 'SPACE slots', cidr: '10.12.0.0/16' },
   { label: 'Guest loopback', cidr: '127.0.0.0/8' },

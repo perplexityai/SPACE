@@ -144,7 +144,8 @@ pub const PLATFORM_EGRESS_HARD_DENY_CIDRS: &[PlatformEgressHardDenyCidr] = &[
     IPV6_LINK_LOCAL,
 ];
 
-const GUEST_LINK_LOCAL_CARVE_OUT: (Ipv4Addr, u8) = (Ipv4Addr::new(169, 254, 0, 20), 30);
+/// Only the guest's own address is exempt from the link-local guardrail.
+const GUEST_LINK_LOCAL_CARVE_OUT: (Ipv4Addr, u8) = (Ipv4Addr::new(169, 254, 0, 21), 32);
 static PARSED_PLATFORM_EGRESS_HARD_DENY_CIDRS: OnceLock<
     Vec<(&'static PlatformEgressHardDenyCidr, IpCidr)>,
 > = OnceLock::new();
