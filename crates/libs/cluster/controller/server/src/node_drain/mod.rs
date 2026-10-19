@@ -261,15 +261,18 @@ pub(crate) use pplx_space_common_svc::sql::sandbox_residency::RESIDENT_LIFECYCLE
 ///   `stopped` on another node.
 ///
 ///   **That last leg does not work yet, and this constant is why the flag
-///   guarding it is off.** Three separate refusals stand between the sweep and
-///   a placed sandbox, and none of them is in this crate:
-///   `begin_restore_lifecycle`'s claim admits only `('suspended','restoring')`,
-///   `sandbox_lifecycle_to_wake_target_proto` accepts only `Started`/`Paused`,
-///   and the evacuation restore's source selector
+///   guarding it is off.** `begin_evacuation_restore_lifecycle` admits a
+///   released stopped evacuation for a `Stopped` target, but two refusals
+///   still stand between the sweep and a placed sandbox, and neither is in
+///   this crate:
+///   `sandbox_lifecycle_to_wake_target_proto` accepts only `Started`/`Paused`
+///   (and `restore_execution_inner` checks it before claiming, so the row stays
+///   `stopped`), and the evacuation restore's source selector
 ///   (`selected_suspend_restore_storage_uri`) requires a `full` snapshot — a
 ///   disk-only selector exists, but only a user `start` of a `stopped` row
-///   reaches it. Until all three admit a stopped evacuation, a torn-down
-///   sandbox retries, backs off, and escalates to an operator — visible and
+///   reaches it, and it serves only `lifecycle = 'stopped'`, which the claim
+///   moves the row out of. Until both admit a stopped evacuation, a torn-down sandbox
+///   retries, backs off, and escalates to an operator — visible and
 ///   recoverable, since the bytes are in S3, but not converged.
 ///
 /// **Membership is validity, not enablement.** The stopped path is gated per

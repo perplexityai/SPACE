@@ -81,6 +81,69 @@ fn snapshot_cpu_budget_round_trips_without_changing_legacy_shape() {
 
 #[cfg(feature = "serde")]
 #[test]
+fn snapshot_host_cpu_round_trips_without_changing_legacy_shape() {
+    let legacy =
+        serde_json::to_value(ExecutionMetadata::initial_firecracker(Arch::X86_64, vec![])).unwrap();
+
+    // Absent stays absent on the wire, so a legacy row re-serializes to the
+    // same JSON and an older reader never sees the field.
+    let parsed = serde_json::from_value::<SnapshotExecutionMetadata>(legacy.clone()).unwrap();
+    assert_eq!(parsed.host_cpu(), None);
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), legacy);
+
+    let mut recorded = legacy.clone();
+    recorded["host_cpu"] = "genuineintel-6-85-7".into();
+    let parsed = serde_json::from_value::<SnapshotExecutionMetadata>(recorded.clone()).unwrap();
+    assert_eq!(
+        parsed.host_cpu().map(HostCpu::as_str),
+        Some("genuineintel-6-85-7")
+    );
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), recorded);
+
+    // A value this release doesn't accept reads as unknown rather than
+    // failing the whole metadata.
+    for unaccepted in [
+        serde_json::Value::from("Intel(R) Xeon(R)"),
+        serde_json::Value::from(85),
+        serde_json::json!({"vendor": "genuineintel", "model": 85}),
+    ] {
+        let mut invalid = legacy.clone();
+        invalid["host_cpu"] = unaccepted;
+        let parsed = serde_json::from_value::<SnapshotExecutionMetadata>(invalid).unwrap();
+        assert_eq!(parsed.host_cpu(), None);
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), legacy);
+    }
+}
+
+#[test]
+fn snapshot_artifact_identity_ignores_only_the_host_cpu() {
+    let metadata = SnapshotExecutionMetadata::new(ExecutionMetadata::initial_firecracker(
+        Arch::X86_64,
+        vec![],
+    ))
+    .unwrap();
+    let with_host_cpu = metadata
+        .clone()
+        .with_host_cpu(Some(HostCpu::parse("genuineintel-6-85-7").unwrap()));
+    assert!(metadata.same_artifact_identity(&with_host_cpu));
+    assert!(with_host_cpu.same_artifact_identity(&metadata));
+
+    let with_cpu_budget = metadata
+        .clone()
+        .with_cpu_budget(Some(VcpuCount::new(std::num::NonZeroU32::new(2).unwrap())));
+    assert!(!metadata.same_artifact_identity(&with_cpu_budget));
+
+    let other_execution = SnapshotExecutionMetadata::new(ExecutionMetadata::initial_firecracker(
+        Arch::Aarch64,
+        vec![],
+    ))
+    .unwrap()
+    .with_host_cpu(with_host_cpu.host_cpu().cloned());
+    assert!(!with_host_cpu.same_artifact_identity(&other_execution));
+}
+
+#[cfg(feature = "serde")]
+#[test]
 fn execution_metadata_round_trips_canonical_json() {
     let state_format = StateFormatIdentity {
         format: StateFormatName::parse(FIRECRACKER_STATE_FORMAT).unwrap(),

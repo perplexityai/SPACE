@@ -16,6 +16,20 @@
 #   space-ingress-activation-tls tls.crt/tls.key  the api's IngressActivationApi
 #                                                 leaf: space-api, the Service
 #                                                 internal-api dials
+#   space-kind-sts-bridge-tls    tls.crt/tls.key  the Kind-only STS bridge's
+#                                                 STS listener: sts-bridge, the
+#                                                 Service the authority dials
+#   space-object-store-iam-tls   tls.crt/tls.key  the Kind object store's IAM
+#                                                 service, both listeners:
+#                                                 object-store-iam, the Service
+#                                                 the STS bridge, the
+#                                                 bucket-init Job and the
+#                                                 gateway dial
+#   space-object-store-iam-client-tls  tls.crt/tls.key  the object store
+#                                                 gateway's client identity on
+#                                                 that service's mTLS private
+#                                                 port, the only clientAuth
+#                                                 leaf this CA issues
 #   space-credmgr-authority-tls  tls.crt/tls.key  the credential-manager
 #                                                 authority's self-signed
 #                                                 end-entity certificate
@@ -53,11 +67,15 @@ LEAF_DAYS=365
 RENEW_WITHIN_SECS=$((60 * 24 * 3600))
 
 # secret | common name | DNS SANs | workloads that load it at start
+# [| extended key usage, default serverAuth]
 LEAVES=(
   "space-cluster-api-tls|space-cluster-api|space-internal-api,space-cluster-api|deployment/space-internal-api"
   "space-node-api-tls|space-node-api|space-node-api|daemonset/space-node-api daemonset/space-builder-node-api"
   "space-build-manager-tls|space-build-manager|space-builder-build-manager|daemonset/space-builder-build-manager"
   "space-ingress-activation-tls|space-ingress-activation|space-api|deployment/space-api"
+  "space-kind-sts-bridge-tls|sts-bridge|sts-bridge|deployment/space-kind-sts-bridge"
+  "space-object-store-iam-tls|object-store-iam|object-store-iam|deployment/space-object-store-iam"
+  "space-object-store-iam-client-tls|space-object-store||deployment/space-object-store|clientAuth"
 )
 
 log() { printf '[internal-rpc-tls] %s\n' "$*"; }
@@ -126,7 +144,7 @@ fi
 # ── Listener leaves ───────────────────────────────────────────────────────────
 restart=()
 for leaf in "${LEAVES[@]}"; do
-  IFS='|' read -r secret cn sans workloads <<<"$leaf"
+  IFS='|' read -r secret cn sans workloads eku <<<"$leaf"
   if secret_key "$secret" tls.crt "$work/leaf.crt" && secret_key "$secret" tls.key "$work/leaf.key" \
     && fresh "$work/leaf.crt" \
     && openssl verify -CAfile "$work/ca.crt" "$work/leaf.crt" >/dev/null 2>&1; then
@@ -134,11 +152,11 @@ for leaf in "${LEAVES[@]}"; do
   fi
   replaced=false
   k get secret "$secret" >/dev/null 2>&1 && replaced=true
-  log "issuing $secret ($sans)"
+  log "issuing $secret (${sans:-${eku}})"
   openssl ecparam -name prime256v1 -genkey -noout -out "$work/leaf.key"
   openssl pkcs8 -topk8 -nocrypt -in "$work/leaf.key" -out "$work/leaf.p8"
   openssl req -new -key "$work/leaf.p8" -subj "/CN=$cn" -out "$work/leaf.csr"
-  ext_file "$sans" "CA:FALSE" "digitalSignature" "serverAuth"
+  ext_file "$sans" "CA:FALSE" "digitalSignature" "${eku:-serverAuth}"
   openssl x509 -req -in "$work/leaf.csr" -CA "$work/ca.crt" -CAkey "$work/ca.key" \
     -CAcreateserial -sha256 -days "$LEAF_DAYS" -extfile "$work/ext.cnf" \
     -out "$work/leaf.crt" 2>/dev/null

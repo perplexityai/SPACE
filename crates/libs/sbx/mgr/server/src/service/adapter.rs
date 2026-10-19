@@ -33,17 +33,24 @@ impl SandboxManager for SandboxManagerService {
         &self,
         request: Request<CreateRequest>,
     ) -> Result<Response<CreateResponse>, Status> {
-        SandboxManagerService::create(self, request).await
+        if let Some(sandbox_id) = request.get_ref().sandbox_id.as_deref() {
+            record_entry_sandbox_id(sandbox_id);
+        }
+        let response = SandboxManagerService::create(self, request).await?;
+        record_entry_sandbox_id(&response.get_ref().sandbox_id);
+        Ok(response)
     }
 
     async fn start(
         &self,
         request: Request<StartRequest>,
     ) -> Result<Response<StartResponse>, Status> {
+        record_entry_sandbox_id(&request.get_ref().sandbox_id);
         SandboxManagerService::start(self, request).await
     }
 
     async fn stop(&self, request: Request<StopRequest>) -> Result<Response<StopResponse>, Status> {
+        record_entry_sandbox_id(&request.get_ref().sandbox_id);
         SandboxManagerService::stop(self, request).await
     }
 
@@ -51,6 +58,7 @@ impl SandboxManager for SandboxManagerService {
         &self,
         request: Request<DeleteRequest>,
     ) -> Result<Response<DeleteResponse>, Status> {
+        record_entry_sandbox_id(&request.get_ref().sandbox_id);
         SandboxManagerService::delete(self, request).await
     }
 
@@ -118,6 +126,7 @@ impl SandboxManager for SandboxManagerService {
         &self,
         request: Request<PauseRequest>,
     ) -> Result<Response<PauseResponse>, Status> {
+        record_entry_sandbox_id(&request.get_ref().sandbox_id);
         SandboxManagerService::pause(self, request).await
     }
 
@@ -125,10 +134,12 @@ impl SandboxManager for SandboxManagerService {
         &self,
         request: Request<ResumeRequest>,
     ) -> Result<Response<ResumeResponse>, Status> {
+        record_entry_sandbox_id(&request.get_ref().sandbox_id);
         SandboxManagerService::resume(self, request).await
     }
 
     async fn wake(&self, request: Request<WakeRequest>) -> Result<Response<WakeResponse>, Status> {
+        record_entry_sandbox_id(&request.get_ref().sandbox_id);
         SandboxManagerService::wake(self, request).await
     }
 
@@ -178,6 +189,7 @@ impl SandboxManager for SandboxManagerService {
         &self,
         request: Request<SuspendRequest>,
     ) -> Result<Response<SuspendResponse>, Status> {
+        record_entry_sandbox_id(&request.get_ref().sandbox_id);
         SandboxManagerService::suspend(self, request).await
     }
 
@@ -203,6 +215,7 @@ impl SandboxManager for SandboxManagerService {
     }
 
     async fn kill(&self, request: Request<KillRequest>) -> Result<Response<KillResponse>, Status> {
+        record_entry_sandbox_id(&request.get_ref().sandbox_id);
         SandboxManagerService::kill(self, request).await
     }
 
@@ -511,6 +524,7 @@ impl SandboxManager for SandboxManagerService {
         &self,
         request: Request<RollbackRequest>,
     ) -> Result<Response<RollbackResponse>, Status> {
+        record_entry_sandbox_id(&request.get_ref().sandbox_id);
         SandboxManagerService::rollback(self, request).await
     }
 
@@ -518,7 +532,9 @@ impl SandboxManager for SandboxManagerService {
         &self,
         request: Request<AdoptPoolSandboxRequest>,
     ) -> Result<Response<AdoptPoolSandboxResponse>, Status> {
-        SandboxManagerService::adopt_pool_sandbox(self, request).await
+        let response = SandboxManagerService::adopt_pool_sandbox(self, request).await?;
+        record_entry_sandbox_id(&response.get_ref().sandbox_id);
+        Ok(response)
     }
 
     async fn wait(&self, request: Request<WaitRequest>) -> Result<Response<WaitResponse>, Status> {
@@ -559,6 +575,13 @@ impl SandboxManager for SandboxManagerService {
     ) -> Result<Response<ImportSandboxResponse>, Status> {
         SandboxManagerService::import_sandbox(self, request).await
     }
+}
+
+/// Record the sandbox a lifecycle call targets on the call's own `grpc.server`
+/// span, the current span while a handler runs, so a search by `sandbox_id`
+/// finds the request and not only its children.
+fn record_entry_sandbox_id(sandbox_id: &str) {
+    pplx_space_common_svc::record_sandbox_id(&tracing::Span::current(), sandbox_id);
 }
 
 #[cfg(test)]

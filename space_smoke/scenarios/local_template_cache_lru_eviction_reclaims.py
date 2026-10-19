@@ -26,11 +26,10 @@ import space_smoke as smoke
 # `sqlite3`, and the compose harness's habit of asserting on the daemon's
 # private DB was one of the things worth retiring. Here: the plant's digest
 # directory is gone from disk, `space-tmplmgr get` no longer resolves it (it
-# has no cluster release, so a miss cannot re-pull), the daemon's own
-# `template GC tick complete` line on that worker reports freeing at least
-# the plant's bytes, and the selected release and active sandbox digest
-# directories remain — read from disk, because resolving the seed through
-# the daemon would re-pull it on a miss and could never fail.
+# has no cluster release, so a miss cannot re-pull), and the selected release
+# and active sandbox digest directories remain — read from disk, because
+# resolving the seed through the daemon would re-pull it on a miss and could
+# never fail.
 @smoke.scenario(
     "local.template_cache_lru_eviction_reclaims",
     # Write and hash the rendered cache budget, then wait out the 60 s grace

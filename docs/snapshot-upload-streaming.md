@@ -159,17 +159,12 @@ btrfs lists every subvolume carrying a received UUID in one UUID-tree item, and
 `btrfs receive` cannot read that item once it names more than 495 subvolumes.
 A bundle whose private parent keeps the template's deterministic received UUID
 adds one such subvolume, so enough retained suspends of one template build
-break every cross-node restore against it on that node. Each send therefore
-stamps a short-lived clone of the private parent, and node-manager reads a
-parent with or without the stamp.
-
-`SPACE_NODEMGR_BTRFS_SEND_UNSTAMPED_PARENT` selects how capture seals the
-private parent. Unset, capture keeps the stamp and writes manifest version 1,
-which earlier node-manager releases can still read. Set to `true`, capture
-seals the parent without it and writes version 2. Enable it only after every
-node runs a release that reads both versions: earlier releases reject version 2
-bundles and version 1 bundles whose stamp was cleared. Turning it off again is
-always safe.
+break every cross-node restore against it on that node. Capture therefore
+seals the private parent without the stamp and writes manifest version 2; each
+send stamps a short-lived clone of the private parent instead. Bundles captured
+with a stamped parent (manifest version 1) stay readable, with or without the
+stamp, until they retire. Node-manager releases before the version 2 manifest
+reject these bundles, so do not roll node-manager back below that release.
 
 Before acknowledging submission, node-manager creates an independent upload
 lease under `/space/cache/.btrfs-send-staging`. Volume-manager persists that lease
@@ -187,6 +182,46 @@ memory. Volume-manager retains its existing codec reserve and producer limit.
 
 Completion requires a successful kernel send, an exact terminal byte count,
 successful gRPC trailers, encoder finalization, and an S3 HEAD length check.
+Node-manager also checks the stream before relaying each frame: one stream
+header, every command's CRC-32C, an `END` command last and nothing after it.
+A send blocked on a full pipe is restarted by the kernel when its thread is
+interrupted (a signal with `SA_RESTART`, a stop, or a cgroup freeze): the
+restarted send appends a new stream after the partial one and still reports
+success, and `btrfs receive` later rejects the result with "crc32 mismatch in
+command". The check fails such an attempt with `Aborted`, so the upload aborts
+and the job retries with a fresh send.
+
+On Linux, the node-manager binary blocks SIGINT/SIGTERM before constructing its
+runtime or telemetry. One dedicated thread consumes these process-directed
+signals with `sigtimedwait` and cancels the service's shutdown token. Runtime,
+blocking-pool and library threads inherit the mask, so stop signals cannot
+interrupt their non-repeatable kernel operations. Host tools and the runtime
+supervisor activator use `posix_spawn` with explicit signal attributes. Their
+mask comes from startup, with SIGINT/SIGTERM unblocked, rather than from a
+worker's temporary send mask. SIGINT, SIGTERM and SIGPIPE dispositions reset to
+default. The command API accepts only program and arguments and inherits the
+environment; it cannot silently discard cwd, credentials or process-group setup.
+Plain child processes own pidfds for termination and retain their exit status
+after reaping. Linux pidfd support (5.3 or later) and permission to use those
+syscalls are required; failure to acquire a pidfd kills and reaps the child
+before returning an error.
+
+Btrfs receive's pinned mount namespace setup remains the explicit fork/pre-exec
+exception. It uses the same child signal policy, and retains bounded command I/O,
+cancellation and kill/reap ownership. A failure in the signal receiver starts
+shutdown; ordinary exit stops and joins the receiver before restoring the startup
+thread's mask. This routing selects stop signals only: it does not redirect
+profiler signals or thread-directed delivery.
+
+For non-regular output, the dedicated sending thread blocks asynchronous
+application signals around the send ioctl and restores its previous mask before
+returning to the blocking pool. Fault signals remain deliverable to crash handlers;
+sends to regular files keep their normal signal handling. Profiler timer signals
+on the sending thread are delayed until the ioctl finishes. Other threads
+continue handling shutdown. The streaming pipe producer cancels by closing its
+reader to unblock the send. Unmaskable stops and cgroup freezes can still
+restart the ioctl, so the framing check remains necessary.
+
 Retries start a new send and multipart upload; regenerated streams need not be
 byte-identical. The remote zstd/btrfs-send format and restore decoder do not change.
 This removes one uncompressed send-file write and its compression read. It does
@@ -205,6 +240,7 @@ the actual logical upload total and omits that node-local identity.
 | Staging succeeds but job insertion/reply fails | Submission and the orphan census serialize. A retry rejoins the same durable job when present; an unreferenced lease is reclaimed by the next census. |
 | Upload pending, running, or cancelling | The persisted volume job retains its lease. Retries reopen and verify immutable inputs. |
 | Resubmit the same source and destination | Pending/running/cancelling jobs and completed uploads are reused without staging another lease. Failed/cancelled jobs get a new job and a fresh lease; their old leases remain eligible for terminal cleanup. |
+| Kernel send restarted mid-pipe, or any stream that fails framing | Node-manager stops relaying, closes the pipe and ends the read with `Aborted`. The multipart upload aborts and the job retries with a fresh send. |
 | Reader disconnect, timeout, or daemon shutdown | Close the pipe read end, join the kernel writer, then release its lease lock and reader slot. A retry generates a fresh stream. |
 | Job commits completed, failed, or cancelled | The one-minute orphan sweep can release its lease. It cannot race an active kernel reader because deletion takes the same lease lock. |
 | Census incomplete or malformed payload | Delete nothing; log and retry next minute. Each sweep is bounded to 30 seconds. |
@@ -394,7 +430,11 @@ Kind runs this path in CI: its volume-manager carries the separate
 credential-manager serves it on the volume socket, sandbox-manager sets the
 flag, and `local.deferred_btrfs_send_capture_restores_cross_node` requires a
 deferred capture with no send file before and after upload and a cross-node
-restore from object storage.
+restore from object storage. `local.restarted_btrfs_send_is_rejected_and_retried`
+stops volume-manager until the send blocks on its pipe, then stops and
+continues node-manager. It requires the restarted stream's upload attempt to
+fail retriable with node-manager's rejection, and the retried upload to restore
+cross-node with the payload's digest intact.
 
 Before widening enablement, use a small canary and matched controls to verify:
 

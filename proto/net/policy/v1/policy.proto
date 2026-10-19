@@ -61,7 +61,7 @@ message NetworkCredentialRuleV1 {
   // name after validating each opaque credential-reference UUID.
   repeated CredentialHeaderBindingV1 credential_header_bindings = 3;
   // Admission requires a non-empty, duplicate-free set. Version one supports
-  // only GET and POST; every other method fails closed.
+  // only GET, POST and HEAD; every other method fails closed.
   repeated NetworkCredentialHttpMethodV1 supported_http_methods = 4;
 }
 
@@ -74,6 +74,7 @@ enum NetworkCredentialHttpMethodV1 {
   NETWORK_CREDENTIAL_HTTP_METHOD_V1_UNSPECIFIED = 0;
   NETWORK_CREDENTIAL_HTTP_METHOD_V1_GET = 1;
   NETWORK_CREDENTIAL_HTTP_METHOD_V1_POST = 2;
+  NETWORK_CREDENTIAL_HTTP_METHOD_V1_HEAD = 3;
 }
 
 message NetworkCredentialDestinationV1 {

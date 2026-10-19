@@ -24,6 +24,8 @@ const TELEMETRY_ENV_KEYS: &[&str] = &[
     "DD_VERSION",
     "DD_AGENT_HOST",
     "DD_DOGSTATSD_PORT",
+    // Preserve the APM intake port across env_clear alongside its host.
+    "DD_TRACE_AGENT_PORT",
     // Child processes must keep the selected trace transport and sampling
     // policy; an omitted selector would silently restore the native default.
     "SPACE_TRACE_EXPORTER",
@@ -66,6 +68,9 @@ const ROUTE_TOKEN_ENV_KEYS: &[&str] = &[
     SPACE_API_ROUTE_ED25519_VERIFICATION_BUNDLE_PATH_ENV,
 ];
 const SPACE_LOG_FORMAT: &str = "json";
+/// The W3C `traceparent` a traced launch passes to the sidecar it starts, the
+/// name OpenTelemetry's environment carrier uses.
+pub(crate) const LAUNCH_TRACEPARENT_ENV: &str = "TRACEPARENT";
 
 fn insert_non_empty_env_values(
     env: &mut HashMap<String, String>,

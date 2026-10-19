@@ -23,16 +23,16 @@ MARKER = "space-smoke-snapshot-reaper-ok"
 # candidates), every suspended or restored sandbox pins its current suspend
 # artifact, and a re-suspend deletes the previous rows when it publishes.
 #
-# Proof, through operator surfaces only: the source's `snapshots/` directory
-# gains an entry after the fork (positive probe, so the later "gone" is
-# evidence); the reaper's own per-candidate deletion line on that worker names
-# an artifact id and a staging path under that directory (the orphan sweep
-# logs the same message with `candidate=tick-sweep` — that is a previous reap
-# whose node-mgr delete failed, and is excluded); neither the entry nor a
-# `.gc-pending` sibling remains on disk; the cluster holds a `ready` snapshot
-# row for exactly the reaped local artifact id with a live storage location —
-# the precondition the reaper claims, checked after the fact — and the source
-# still executes commands.
+# Proof, through state only: the source's `snapshots/` directory gains an
+# entry after the fork (positive probe, so the later "gone" is evidence) and
+# the cluster holds a `ready` snapshot row with a live storage location for
+# the source's artifact; the reaper then leaves neither the entry nor a
+# `.gc-pending` sibling on disk, while those rows stay `ready` with their
+# storage — the backup the reaper requires before it deletes — and the
+# source still executes commands. sbx-manager exposes no read that names
+# which local artifact backs a snapshot directory, so the scenario does not
+# join the reaped directory to one artifact id: the fork leaves the source
+# exactly the one backed, unpinned artifact the reaper can take.
 #
 # Not reached: the negative gates (below-engage, backup incomplete, still
 # pinned, not idle), the shared-local-path refusal and the startup orphan
@@ -75,14 +75,13 @@ def snapshot_reaper_reclaims_backed_fork_snapshot(test: smoke.KindEcw) -> None:
     with test.phase("fork the sandbox; the source keeps an unpinned backed snapshot"):
         reaper.fork_source()
         before = reaper.expect_source_snapshot_present(worker)
+        backed = reaper.expect_source_snapshot_backed()
 
     with test.phase("the reaper deletes the source snapshot once it is cold"):
-        reaped = reaper.wait_until_reaped(worker)
-        test.record("reaped_local_artifact_id", reaped.local_artifact_id)
-        reaper.expect_snapshot_gone(worker, before=before)
+        reaper.wait_until_reaped(worker, before=before)
 
-    with test.phase("the reaped artifact had a ready remote copy"):
-        reaper.expect_reaped_artifact_was_backed(reaped)
+    with test.phase("the cluster keeps the reaped artifact's ready remote copy"):
+        reaper.expect_durable_copy_kept(backed)
 
     with test.phase("the source still executes"):
         observed = test.run_command_when_ready(f"cat {shlex.quote(PATH)}")

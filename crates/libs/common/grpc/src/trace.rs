@@ -268,9 +268,8 @@ pub struct GrpcClientMakeSpan;
 impl<B> MakeSpan<B> for GrpcClientMakeSpan {
     fn make_span(&mut self, request: &Request<B>) -> tracing::Span {
         let path = request.uri().path();
-        if is_untraced_grpc_path(path)
-            && !pplx_space_observability::trace_propagation::has_traced_current_span()
-        {
+        let traced_caller = pplx_space_observability::trace_propagation::has_traced_current_span();
+        if is_untraced_grpc_path(path) && !traced_caller {
             return tracing::Span::none();
         }
         let (rpc_service, rpc_method) = parse_grpc_path(path);
@@ -299,7 +298,15 @@ impl<B> MakeSpan<B> for GrpcClientMakeSpan {
             rpc.grpc.status_code = tracing::field::Empty,
             space.grpc.expected_not_found = grpc_client_not_found_is_expected(path),
             space.grpc.expected_application_status = grpc_client_application_statuses_are_expected(path),
+            untraced_caller = tracing::field::Empty,
         );
+        if !traced_caller {
+            // A call no traced request made, such as a periodic poll: recorded
+            // for stats and a failure, not sampled, and the server inherits
+            // that. `untraced_caller` says why the parent was never recorded.
+            span.record("untraced_caller", true);
+            pplx_space_observability::trace_propagation::set_unsampled_remote_parent(&span);
+        }
         if let Some(context) = request.extensions().get::<crate::SandboxTraceContext>() {
             context.record(&span);
         }

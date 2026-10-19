@@ -36,12 +36,20 @@ pub enum Placement {
 }
 
 /// Which shape the claim took the row from: a fresh wake of a `suspended`
-/// sandbox, or the re-drive of a `restoring` row whose prior attempt lapsed.
-/// A fresh claim starts substrate work from scratch; a re-drive must first
-/// reconcile whatever the lapsed attempt left behind.
+/// sandbox, a fresh re-placement of a released stopped evacuation, or the
+/// re-drive of a `restoring` row whose prior attempt lapsed. A fresh claim
+/// starts substrate work from scratch; a re-drive must first reconcile
+/// whatever the lapsed attempt left behind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimOrigin {
     FreshFromSuspended,
+    /// Evacuation claims only. Unlike [`Self::FreshFromSuspended`] it can't be
+    /// undone by restoring the prior lifecycle: leaving `restoring` for
+    /// `stopped` clears the marker through its trigger. An undo keeps the row
+    /// `restoring` (the api's rollback does; [`crate::PlacementStore::abandon`]
+    /// must too once ported). [`crate::PlacementStore::complete_placement`]
+    /// can't complete one yet either.
+    FreshFromStopped,
     RedroveRestoring,
 }
 

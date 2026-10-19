@@ -173,11 +173,18 @@ case "$action" in
       docker exec "$node" test -d /var/log/pods
     done <<<"$nodes"
     helm_options "$@"
+    # Builder nodes' sandbox sidecars stay uncollected. The Kind cluster config
+    # labels every node's pool when it creates the node, and a Kind node's
+    # journal hostname is its node name. Set on every install and upgrade, so
+    # a reused list never outlives the cluster's builder set.
+    builders=$("${kube[@]}" get nodes -l space.pplx.net/node-pool=builder \
+      -o jsonpath='{range .items[*]}{.metadata.name}{","}{end}')
+    builders="collection.journal.sidecars.excludedHosts={${builders%,}}"
     if [[ $existing == present && ${#helm_options[@]} == 0 ]]; then
       # A managed chart upgrade is not a collector-only toggle. Retain the
       # caller's saved overrides while taking this checkout's chart updates.
       helm_options=(--reset-then-reuse-values)
-      helm_upgrade 5m --set alloy.enabled=true
+      helm_upgrade 5m --set alloy.enabled=true --set "$builders"
       exit 0
     fi
     # Do not advance source cursors while a brand-new Loki is still starting.
@@ -185,9 +192,10 @@ case "$action" in
       # A concurrent same-name install must fail, not become an adoption.
       helm install "$release" "$chart_dir" --kube-context "$context" \
         --namespace "$namespace" --wait --timeout 5m \
-        -f "$chart_dir/profiles/kind.yaml" "${helm_options[@]}" --set alloy.enabled=false
+        -f "$chart_dir/profiles/kind.yaml" "${helm_options[@]}" --set alloy.enabled=false \
+        --set "$builders"
     fi
-    helm_upgrade 5m
+    helm_upgrade 5m --set "$builders"
     ;;
   pause|resume|check|preflight)
     # These transitions retain Loki and its values/data. Never adopt another

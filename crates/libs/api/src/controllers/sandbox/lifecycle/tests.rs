@@ -9,6 +9,9 @@ use super::*;
 
 use pplx_space_test_env::TestResult;
 
+#[cfg(feature = "kubernetes")]
+mod kubernetes;
+
 #[test]
 fn cluster_delete_miss_reason_classifies_by_substrate_error() {
     assert_eq!(
@@ -213,9 +216,9 @@ async fn rejected_activation_emits_no_orphaned_requested_event() -> TestResult {
     // Direct is only a placeholder capacity source: it reports zero eligible nodes,
     // as a synced, empty Kubernetes node cache would.
     let make_substrate = || {
-        crate::controllers::substrate::Substrate::Direct(Box::new(
+        crate::controllers::substrate::Substrate::from_direct(
             crate::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),
-        ))
+        )
     };
     let admission = crate::cluster_admission::ClusterSandboxAdmission::with_config(
         make_substrate(),
@@ -287,9 +290,9 @@ async fn direct_start_restore_spends_deferred_admission_at_entry() -> TestResult
         .await?
         .expect("sandbox row exists");
     let make_substrate = || {
-        crate::controllers::substrate::Substrate::Direct(Box::new(
+        crate::controllers::substrate::Substrate::from_direct(
             crate::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),
-        ))
+        )
     };
     let admission = crate::cluster_admission::ClusterSandboxAdmission::with_config(
         make_substrate(),
@@ -540,9 +543,9 @@ async fn invalid_activation_options_reject_before_admission_and_requested_event(
     // Direct is only a placeholder capacity source: it reports zero eligible nodes,
     // as a synced, empty Kubernetes node cache would.
     let make_substrate = || {
-        crate::controllers::substrate::Substrate::Direct(Box::new(
+        crate::controllers::substrate::Substrate::from_direct(
             crate::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),
-        ))
+        )
     };
     let admission = crate::cluster_admission::ClusterSandboxAdmission::with_config(
         make_substrate(),
@@ -748,9 +751,9 @@ async fn exhausting_the_finalize_retry_budget_stays_retryable() -> TestResult {
         .await?
         .expect("sandbox row exists");
     let make_substrate = || {
-        crate::controllers::substrate::Substrate::Direct(Box::new(
+        crate::controllers::substrate::Substrate::from_direct(
             crate::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),
-        ))
+        )
     };
     let admission = crate::cluster_admission::ClusterSandboxAdmission::with_config(
         make_substrate(),
@@ -838,10 +841,9 @@ async fn a_contended_delete_precheck_stays_retryable() -> TestResult {
         .execute(&mut *blocker)
         .await?;
 
-    let controller =
-        SandboxController::new(crate::controllers::substrate::Substrate::Direct(Box::new(
-            crate::controllers::substrate::direct::DirectSubstrate::new(bounded.clone()),
-        )));
+    let controller = SandboxController::new(crate::controllers::substrate::Substrate::from_direct(
+        crate::controllers::substrate::direct::DirectSubstrate::new(bounded.clone()),
+    ));
     let error = controller
         .delete_control_plane(&bounded, sandbox_id, Some(&sandbox))
         .await
@@ -921,9 +923,9 @@ async fn resume_uses_resolved_runtime_without_async_observation() -> TestResult 
         record.execution_generation = generation;
         worker.state().insert_new(record).await?;
         let controller =
-            SandboxController::new(crate::controllers::substrate::Substrate::Direct(Box::new(
+            SandboxController::new(crate::controllers::substrate::Substrate::from_direct(
                 crate::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),
-            )));
+            ));
         let mut client = controller
             .substrate
             .runtime_client(id, crate::controllers::substrate::RecoveryCharge::Exempt)

@@ -431,6 +431,17 @@ pub(super) async fn launch_net_gateway_via_node(
 ) -> Result<pplx_space_node_mgr_client::proto::LaunchResponse, Status> {
     let args = netgtw_launch_args(sandbox_id, no_identity, route_identity, config);
     let process_uid = super::gateway_identity::launch_uid(uid)?;
+    let span = tracing::info_span!("sbxmgr.start.node.launch_net_gateway", sandbox_id);
+    let mut env = crate::sidecar_env::net_gateway_env();
+    // The gateway's startup links to this launch; see its `startup_span`.
+    if let Some(traceparent) =
+        pplx_space_observability::trace_propagation::traceparent_for_span(&span)
+    {
+        env.insert(
+            crate::sidecar_env::LAUNCH_TRACEPARENT_ENV.to_string(),
+            traceparent,
+        );
+    }
     node_client
         .launch(LaunchRequest {
             execution_fence: Some(execution_fence.into()),
@@ -439,12 +450,9 @@ pub(super) async fn launch_net_gateway_via_node(
             args,
             uid: process_uid,
             gid: process_uid,
-            env: crate::sidecar_env::net_gateway_env(),
+            env,
         })
-        .instrument(tracing::info_span!(
-            "sbxmgr.start.node.launch_net_gateway",
-            sandbox_id
-        ))
+        .instrument(span)
         .await
         .map(Response::into_inner)
         .map_err(|e| Status::internal(format!("net-gateway launch failed: {e}")))

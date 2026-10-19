@@ -450,7 +450,7 @@ fn operation_event_page(
     })
 }
 
-fn parse_operation_id(value: &str) -> Result<OperationId, PublicApiError> {
+pub(super) fn parse_operation_id(value: &str) -> Result<OperationId, PublicApiError> {
     OperationId::from_str(value).map_err(|_| PublicApiError::bad_request("invalid operation id"))
 }
 

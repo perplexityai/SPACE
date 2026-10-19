@@ -801,3 +801,31 @@ fn instance_rootfs_opens_only_a_single_link_regular_file_without_following_links
     std::fs::hard_link(&elsewhere, hard_linked.join("rootfs.ext4")).unwrap();
     super::open_instance_rootfs(&hard_linked).unwrap_err();
 }
+
+#[test]
+fn retained_instance_repair_grants_traversal_without_write_and_preserves_files() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let root = tempfile::tempdir().unwrap();
+    let instance = root.path().join("instance");
+    std::fs::create_dir(&instance).unwrap();
+    std::fs::write(instance.join("rootfs.ext4"), b"retained disk").unwrap();
+    let before = std::fs::metadata(&instance).unwrap();
+    std::fs::set_permissions(&instance, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // The publisher runs as root; this probe only mutates its own fixture.
+    if !pplx_space_test_env::root_or_skip("repair the shared instance group") {
+        return;
+    }
+    super::super::ensure_sandbox_instance_traversal(&instance).unwrap();
+    let after = std::fs::metadata(&instance).unwrap();
+    assert_eq!(after.mode() & 0o7777, 0o2710);
+    assert_eq!(after.uid(), before.uid());
+    assert_eq!(after.ino(), before.ino());
+    assert_eq!(
+        std::fs::read(instance.join("rootfs.ext4")).unwrap(),
+        b"retained disk"
+    );
+    super::super::ensure_sandbox_instance_traversal(root.path().join("missing")).unwrap();
+    let alias = root.path().join("alias");
+    std::os::unix::fs::symlink(&instance, &alias).unwrap();
+    super::super::ensure_sandbox_instance_traversal(alias).unwrap_err();
+}

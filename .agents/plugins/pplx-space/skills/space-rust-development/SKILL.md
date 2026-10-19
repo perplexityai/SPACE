@@ -44,9 +44,13 @@ Read only the references that match the task:
   macro. Runtime-built SQL uses `sqlx::AssertSqlSafe(sql!(expr))`.
 - Bind a control-plane `managed_by` substrate value as a parameter
   (`managed_by = $n` with `.bind(SubstrateKind::Kubernetes)`) instead of
-  writing `'k8s'`/`'space'` in SQL text. Remaining raw-literal sites,
-  including the shared `routable_execution_or_non_k8s` fragment, are existing
-  debt, not precedent.
+  writing `'k8s'`/`'space'` in SQL text. In Rust, a decision about a row's
+  substrate calls the `SubstrateKind` method named for the question, a fact
+  about the running substrate reads `capabilities()`, and code never compares
+  the label string ("Substrate values are bound parameters" in
+  `docs/rust/space-conventions.md`). archcheck's
+  `pattern_ratchet.substrate_literals` rule catches the common literal forms
+  in production code.
 - Use UUIDv7 for new SPACE-owned durable identifiers: `Uuid::now_v7()` in Rust
   and `space_uuid_v7()` in Postgres. A UUIDv4 exception needs a concrete privacy
   or protocol reason.

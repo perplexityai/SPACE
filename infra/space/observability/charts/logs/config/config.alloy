@@ -52,13 +52,46 @@ loki.process "cri" {
 }
 {{ end }}
 {{- if .Values.collection.journal.enabled }}
+{{- $journal := .Values.collection.journal }}
+{{- /* A release from before sidecars existed reuses values without them. */}}
+{{- $sidecars := $journal.sidecars | default dict }}
 loki.relabel "journal" {
   forward_to = []
+  // A line is kept when keepRegex matches its "unit;identifier". A sandbox's
+  // sidecars have no unit: they run in the sandbox's cgroup and inherit the
+  // runtime supervisor's output, so they are kept by that cgroup instead,
+  // except on excluded hosts. Each match marks the line; the source drops
+  // the `__` mark with the other internal labels.
   rule {
     source_labels = ["__journal__systemd_unit", "__journal_syslog_identifier"]
-    regex = {{ .Values.collection.journal.keepRegex | quote }}
+    regex = {{ $journal.keepRegex | quote }}
+    target_label = "__tmp_journal_keep"
+    replacement = "1"
+  }
+{{- if $sidecars.enabled }}
+  rule {
+    source_labels = ["__journal__systemd_unit", "__journal__systemd_cgroup"]
+    regex = {{ printf ";(?:%s)" $sidecars.cgroupRegex | quote }}
+    target_label = "__tmp_journal_keep"
+    replacement = "1"
+  }
+{{- end }}
+  rule {
+    source_labels = ["__tmp_journal_keep"]
+    regex = "1"
     action = "keep"
   }
+{{- if and $sidecars.enabled $sidecars.excludedHosts }}
+{{- $hosts := list }}
+{{- range $sidecars.excludedHosts }}
+{{- $hosts = append $hosts (regexQuoteMeta .) }}
+{{- end }}
+  rule {
+    source_labels = ["__journal__systemd_unit", "__journal__systemd_cgroup", "__journal__hostname"]
+    regex = {{ printf ";%s;(?:%s)" $sidecars.cgroupRegex (join "|" $hosts) | quote }}
+    action = "drop"
+  }
+{{- end }}
 {{- with .Values.collection.journal.dropRegex }}
   rule {
     source_labels = ["__journal__systemd_unit", "__journal_syslog_identifier"]

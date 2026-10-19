@@ -132,17 +132,31 @@ async fn node_registry_writes_only_direct_nodes() -> TestResult {
     let registered: NodeId = serde_json::from_value(body["id"].clone())?;
     assert_eq!(registration(pool, registered).await?.0, "space");
 
-    // Updates and deletes reach only the Direct twin.
+    // Updates and deletes reach only the Direct twin. A `verify` update reads
+    // the node before it dials the node's endpoint. The Kubernetes twin's is a
+    // closed local port, so an update that wrongly dials it fails at once with
+    // a gateway error instead of the 404.
     let live_direct = NodeId::new();
     let live_kubernetes = NodeId::new();
     insert_registered_node(pool, live_direct, "space", "10.0.0.73:9802", None).await?;
-    insert_registered_node(pool, live_kubernetes, "k8s", "10.0.0.74:9802", None).await?;
-    for (node_id, expected_status, expected_name) in [
-        (live_kubernetes, StatusCode::NOT_FOUND, "registry-node"),
-        (live_direct, StatusCode::OK, "renamed"),
+    insert_registered_node(pool, live_kubernetes, "k8s", "127.0.0.1:1", None).await?;
+    for (node_id, verify, expected_status, expected_name) in [
+        (
+            live_kubernetes,
+            false,
+            StatusCode::NOT_FOUND,
+            "registry-node",
+        ),
+        (
+            live_kubernetes,
+            true,
+            StatusCode::NOT_FOUND,
+            "registry-node",
+        ),
+        (live_direct, false, StatusCode::OK, "renamed"),
     ] {
         let request: UpdateNodeRequest =
-            serde_json::from_value(serde_json::json!({ "name": "renamed" }))?;
+            serde_json::from_value(serde_json::json!({ "name": "renamed", "verify": verify }))?;
         let response = update_node(
             State(state.clone()),
             Extension(AuthUser(actor.clone())),

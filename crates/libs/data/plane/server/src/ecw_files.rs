@@ -33,16 +33,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
 use super::{
     AttachedStreamPermit, DataPlaneState, ECW_FILE_WATCH_STREAM_KIND, EcwProxyError,
-    EcwResolvedRoute, ResponseKind, ResponseOrigin, acquire_ecw_stream_permit, ecw_backend_channel,
-    ecw_connect, node_api_request_with_route_token_state, resolve_ecw_envd_route,
+    EcwResolvedRoute, ResponseKind, ResponseOrigin, acquire_ecw_stream_permit,
+    before_stream_deadline, ecw_backend_channel, ecw_connect,
+    node_api_request_with_route_token_state, resolve_ecw_envd_route,
 };
 use crate::ecw_process::EmptyUnaryConnectResponseE2b;
 use crate::runtime_route::{
     EcwRouteAttemptError, bounded_ecw_route_transfer, bounded_node_api_unary,
-    retryable_bounded_node_api_unary,
+    refuse_new_ecw_stream_while_draining, retryable_bounded_node_api_unary,
 };
 use multipart::{multipart_boundary, resolve_multipart_uploads, spool_multipart_uploads};
 
@@ -1256,6 +1258,9 @@ pub(super) async fn e2b_watch_dir(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    if let Err(error) = refuse_new_ecw_stream_while_draining(&state, ECW_FILE_WATCH_STREAM_KIND) {
+        return error.into_response();
+    }
     let route = match resolve_ecw_envd_route(&state, &headers).await {
         Ok(route) => route,
         Err(error) => return error.into_response(),
@@ -1296,23 +1301,31 @@ pub(super) async fn e2b_watch_dir(
     // Opening the watch is a unary call whose stream has not yielded anything
     // yet, so a superseded-identity rejection can be recovered here the same way
     // as any other unary; only an already-flowing stream cannot.
-    let (stream, _route) = match bounded_node_api_unary(
-        &state,
-        route,
-        "filesystem_watch_open",
-        NodeApiOperationBudget::FilesystemTransferOpen.timeout(),
-        message,
-        |channel, request| async move {
-            WorkerApiClient::new(wrap_grpc_client_channel(channel))
-                .spaced_watch(request)
-                .await
-        },
-        ecw_connect::tonic_status_to_ecw_error,
+    let opened = before_stream_deadline(
+        &state.stream_shutdown_token,
+        bounded_node_api_unary(
+            &state,
+            route,
+            "filesystem_watch_open",
+            NodeApiOperationBudget::FilesystemTransferOpen.timeout(),
+            message,
+            |channel, request| async move {
+                WorkerApiClient::new(wrap_grpc_client_channel(channel))
+                    .spaced_watch(request)
+                    .await
+            },
+            ecw_connect::tonic_status_to_ecw_error,
+        ),
     )
-    .await
-    {
-        Ok(stream) => stream,
-        Err(error) => return error.into_response(),
+    .await;
+    let (stream, _route) = match opened {
+        Some(Ok(stream)) => stream,
+        Some(Err(error)) => return error.into_response(),
+        None => {
+            // The permit above already counted the attach as `ok`.
+            pplx_space_metrics::data_plane::stream_closed(ECW_FILE_WATCH_STREAM_KIND, "shutdown");
+            return EcwProxyError::draining().into_response();
+        }
     };
     let keepalive_secs = headers
         .get("Keepalive-Ping-Interval")
@@ -1326,7 +1339,13 @@ pub(super) async fn e2b_watch_dir(
         keepalive_interval,
     );
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let framed = e2b_watch_connect_stream(stream, interval, root, stream_permit);
+    let framed = e2b_watch_connect_stream(
+        stream,
+        interval,
+        root,
+        stream_permit,
+        state.stream_shutdown_token.child_token(),
+    );
     ecw_connect::connect_json_stream_response(framed)
 }
 
@@ -1335,6 +1354,7 @@ fn e2b_watch_connect_stream<S>(
     interval: tokio::time::Interval,
     root: String,
     stream_permit: AttachedStreamPermit,
+    shutdown_token: CancellationToken,
 ) -> E2bWatchConnectStream<S>
 where
     S: Stream<Item = Result<SpacedFileEvent, tonic::Status>>,
@@ -1346,6 +1366,7 @@ where
         started: false,
         ended: false,
         close_recorded: false,
+        shutdown: Box::pin(shutdown_token.cancelled_owned()),
         _stream_permit: stream_permit,
     }
 }
@@ -1357,6 +1378,7 @@ struct E2bWatchConnectStream<S> {
     started: bool,
     ended: bool,
     close_recorded: bool,
+    shutdown: Pin<Box<WaitForCancellationFutureOwned>>,
     _stream_permit: AttachedStreamPermit,
 }
 
@@ -1391,6 +1413,13 @@ where
         let this = self.get_mut();
         if this.ended {
             return Poll::Ready(None);
+        }
+        if this.shutdown.as_mut().poll(cx).is_ready() {
+            this.ended = true;
+            this.record_close("shutdown");
+            let bytes = ecw_connect::connect_shutdown_end_stream();
+            record_ecw_watch_stream_bytes(&bytes);
+            return Poll::Ready(Some(Ok(bytes)));
         }
 
         if !this.started {

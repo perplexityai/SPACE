@@ -40,7 +40,10 @@ def test_shards_run_every_eligible_scenario_once_and_propagate_failures(surface)
         ),
         mock.patch(
             "space_smoke.__main__.SmokeServices.from_environment",
-            **{"return_value.telemetry_mode.return_value": "otel"},
+            **{
+                "return_value.telemetry_mode.return_value": "otel",
+                "return_value.storage_credentials.return_value": "exchange",
+            },
         ),
         mock.patch("space_smoke.__main__.run_scenarios", side_effect=execute),
         redirect_stdout(StringIO()),

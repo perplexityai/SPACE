@@ -575,11 +575,11 @@ async fn admin_pinned_create_follows_the_running_substrate() -> TestResult {
     {
         let mut kubernetes = AppState::from_pool(db.pool.clone()).await?;
         kubernetes.sandbox_controller = crate::controllers::sandbox::SandboxController::new(
-            crate::controllers::substrate::Substrate::Kubernetes(Box::new(
+            crate::controllers::substrate::Substrate::from_kubernetes(
                 crate::controllers::substrate::kubernetes::tests::substrate_with_store(
                     db.pool.clone(),
                 ),
-            )),
+            ),
         );
         cases.push((kubernetes, StatusCode::ACCEPTED));
     }

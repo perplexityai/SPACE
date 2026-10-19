@@ -4221,7 +4221,8 @@ async fn publishing_failed_sandbox_does_not_override_deleting() -> TestResult {
 
 /// A node-local restore can finish after the API caller timed out, but a
 /// published `started` status cannot safely complete the control-plane row
-/// until the active Kubernetes execution is routable.
+/// until the active Kubernetes execution is routable. An otherwise identical
+/// Direct (`'space'`) row has no such contract and converges.
 #[tokio::test(flavor = "current_thread")]
 async fn publishing_owned_started_sandbox_leaves_unroutable_restoring_lifecycle() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
@@ -4229,20 +4230,31 @@ async fn publishing_owned_started_sandbox_leaves_unroutable_restoring_lifecycle(
     };
     let node_id = NodeId::new();
     let sandbox_id = SandboxId::new();
+    let direct_sandbox_id = SandboxId::new();
     insert_ready_worker_node(&db.pool, node_id).await?;
-    insert_active_sandbox(&db.pool, sandbox_id, node_id, "restoring").await?;
-    insert_k8s_execution(&db.pool, sandbox_id, 7, "creating", None).await?;
+    for (id, managed_by) in [(sandbox_id, "k8s"), (direct_sandbox_id, "space")] {
+        insert_active_sandbox_with_managed_by(&db.pool, id, node_id, "restoring", managed_by)
+            .await?;
+        insert_k8s_execution(&db.pool, id, 7, "creating", None).await?;
+    }
 
     let mut conn = db.pool.acquire().await?;
     publish_sandbox_states(
         &mut conn,
         node_id,
-        &[published_sandbox_state(sandbox_id, "started")],
+        &[
+            published_sandbox_state(sandbox_id, "started"),
+            published_sandbox_state(direct_sandbox_id, "started"),
+        ],
     )
     .await?;
     drop(conn);
 
     assert_eq!(sandbox_lifecycle(&db.pool, sandbox_id).await?, "restoring");
+    assert_eq!(
+        sandbox_lifecycle(&db.pool, direct_sandbox_id).await?,
+        "started"
+    );
     Ok(())
 }
 

@@ -73,9 +73,11 @@ fn compiled_environments_have_complete_distinct_bindings_and_operation_support()
         .map(|entry| entry.definition().reference())
         .collect();
     assert_eq!(references.len(), environments.len());
+    assert_eq!(environments.len(), 3);
     for (environment, (runtime, kernel, state, memory_state)) in environments.iter().zip([
         ("1.15.1", "6.1.155", "9.0.0", true),
-        ("1.17.0", "6.18.44", "12.0.0", false),
+        ("1.17.0", "6.18.44", "12.0.0", true),
+        ("1.17.0", "6.1.155", "12.0.0", true),
     ]) {
         let definition = environment.definition();
         let requirements = definition.execution_requirements().unwrap();

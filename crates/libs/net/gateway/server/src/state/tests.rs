@@ -70,7 +70,7 @@ async fn interception_dependency_gate_blocks_traffic_without_blocking_policy_hyd
     // waiting must neither exhaust the hydration budget nor re-install an
     // already current policy.
     let shutdown = CancellationToken::new();
-    let hydration = state.spawn_hydration(loader.clone(), shutdown.clone());
+    let hydration = state.spawn_hydration(loader.clone(), shutdown.clone(), None);
     for _ in 0..60 {
         tokio::time::advance(Duration::from_secs(1)).await;
         tokio::task::yield_now().await;

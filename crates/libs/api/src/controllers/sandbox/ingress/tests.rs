@@ -5,6 +5,9 @@ use std::sync::{
 };
 use tokio::sync::Notify;
 
+#[cfg(feature = "kubernetes")]
+mod kubernetes;
+
 struct Backend {
     state: Mutex<Observation>,
     calls: AtomicUsize,
@@ -285,9 +288,9 @@ async fn stored_ingress_access_resumes_paused_execution_before_reporting_ready()
     .await?;
     let backend = StoredAccess {
         pool: db.pool.clone(),
-        controller: SandboxController::new(Substrate::Direct(Box::new(
+        controller: SandboxController::new(Substrate::from_direct(
             crate::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),
-        ))),
+        )),
     };
     for (wake_enabled, pause_after_observation, worker_allows_access) in [
         (true, false, true),

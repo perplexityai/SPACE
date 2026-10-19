@@ -149,6 +149,34 @@ pub(crate) fn unbound_in_absent_dir() -> NodeManagerConnector {
     )
 }
 
+/// A node-manager that accepts connections but never answers, as a frozen or
+/// saturated node-manager does: its socket is bound, so a dial completes into
+/// the listen backlog, but nothing ever accepts it, so neither the HTTP/2
+/// handshake nor any call completes.
+pub(crate) struct StalledNodeManager {
+    connector: NodeManagerConnector,
+    _listener: tokio::net::UnixListener,
+    _sockets: tempfile::TempDir,
+}
+
+impl StalledNodeManager {
+    pub(crate) fn bind() -> Self {
+        let sockets = tempfile::tempdir().unwrap();
+        let socket = sockets.path().join("node-manager.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        Self {
+            connector: fixed_client(lazy_client(&socket)),
+            _listener: listener,
+            _sockets: sockets,
+        }
+    }
+
+    /// A connector whose clients all reach this socket.
+    pub(crate) fn connector(&self) -> NodeManagerConnector {
+        self.connector.clone()
+    }
+}
+
 fn lazy_client(socket: &Path) -> NodeManagerGrpcClient {
     let channel = pplx_space_common_grpc::connect_uds_channel_lazy(socket, endpoint());
     client(channel)

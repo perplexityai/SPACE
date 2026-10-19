@@ -320,9 +320,27 @@ filter:
   lost race, not a failure. A tick that acquires or loses leadership records
   `leader_election.change`.
 
-Periodic gRPC polls outside these rules still open a trace per call: dropping
-one end to end needs the caller to propagate a not-sampled context, which is
-the sampler's decision rather than the span layer's.
+Other gRPC calls made while no traced span is current, such as periodic
+polls, keep their spans so APM stats still count them, but start no sampled
+trace. The client span records `untraced_caller` and takes as its parent a
+fresh unsampled context that nothing records, so both samplers record it
+without sampling it, and the call propagates that unsampled context to its
+server, whose spans are recorded unsampled too. The native Datadog sampler
+gives such spans the auto-reject priority; under OTLP the wrapped sampler
+records every span whose parent was not sampled unsampled, whatever
+`OTEL_TRACES_SAMPLER` selects, Kind's `always_on` included. A failed call
+still reaches the backend: the Datadog exporter keeps a rejected chunk that
+contains an error for the Agent's error sampler (a sampling rule's user reject
+would drop it), and under OTLP an unsampled span is exported only when it
+failed. Such a span's parent is the unrecorded context, so it heads its trace.
+The shim does the same for its calls outside any shim operation, such as
+containerd relaying kubelet's stats polls: it sends a fresh unsampled context.
+Both mark that context with the `tracestate` member `space=untraced`, which its
+descendants carry across services. Work that follows such a call, such as a
+job, a reconcile ref or a detached task, does not save it as its origin, since
+no request was sampled out, and is sampled as a root of its own. The member
+counts only on an unsampled context: a sampled one is saved whatever its
+`tracestate` carries.
 
 ## S3 client spans
 
@@ -378,19 +396,30 @@ reaches:
   inside the request's trace. The executor's work and its node calls are
   children of the attempt.
 - Reconciliation is fan-in: one pass applies refs that many writers queued.
-  Each ref saves its latest writer's `traceparent`, and a pass is a root that
-  links to the saved contexts of the refs it claimed.
+  Each ref saves its latest writer's `traceparent`, except that an unsampled
+  writer never replaces a sampled one, and a pass is a root that links to the
+  saved contexts of the refs it claimed.
+- Each `shim.create` attempt is a root linked to the context its Pod's
+  annotation carries: kubelet retries a failed pod sandbox with that
+  annotation unchanged, so joining it would collect every attempt in the one
+  trace. The shim's own teardown spans link to their task's create.
 
 A root that links to the context that caused it records that context's trace
 id as `origin_trace_id`, since a link is not searchable, and whether it was
 sampled as `origin_sampled`. Its sampling follows that origin: it is kept when
 any origin it links to was sampled and dropped when none was, so a kept
-request keeps the work it caused. A root with no origin, and every span with a
-parent, keeps the configured sampler. Under OTLP the sampler that
-`OTEL_TRACES_SAMPLER` selects is wrapped to read the root's links. The native
-Datadog sampler cannot be wrapped and does not read links, so two sampling
-rules on `origin_sampled`, ahead of the ones `DD_TRACE_SAMPLING_RULES`
-configures, keep (`1.0`) or drop (`0.0`) such a root. A root links to at
+request keeps the work it caused. A root with no origin keeps the configured
+sampler. Under OTLP the sampler that `OTEL_TRACES_SAMPLER` selects is wrapped
+to read the links of a root that records `origin_sampled`. The shim's wrapper
+also makes every span with a parent follow it, sampled or recorded unsampled,
+so a sampler that is not parent-based, such as Kind's `always_on`, cannot
+sample the children of a dropped `shim.create` and send their sampled
+`traceparent` on. The native Datadog samplers do not read links, so two
+sampling rules on `origin_sampled`, ahead of the ones
+`DD_TRACE_SAMPLING_RULES` configures, keep (`1.0`) or drop (`0.0`) such a
+root. The Rust services and the shim apply the same rules to their linked
+roots. A root linked without `origin_sampled` keeps the configured sampler on
+both paths. A root links to at
 most eight origins, sampled ones first, so one with any sampled origin always
 links it and is kept. Datadog's rate limit (`DD_TRACE_RATE_LIMIT`) still
 applies to a kept root, and sampling rules sent
@@ -407,11 +436,32 @@ gets no root, unless it fails: whether it fails is known only once it has run,
 so a childless `node_ctl.pass` reports the failure afterward. A tick that
 claims nothing emits nothing.
 
+The cluster-controller's warm-pool reconciler runs each pass, every five
+seconds on the leader, under a `warm_pool.pass` root. No request causes a pass,
+so it links to nothing and the configured sampler decides it. That is one
+root trace per pass, 720 an hour, which under native Datadog counts against
+the Agent's sampling budget with the node's other traces. The root parents the
+pass's Postgres, Kubernetes and sandbox-manager calls and every line it logs,
+records `configs` and `failed_configs`, and is an error when the pass fails or
+any config does not reconcile. The pass logs one summary, `warm pool reconcile
+completed` (`warm pool reconcile failed` at WARN when the pass fails), with
+`reconciled_configs`, `failed_configs` and each per-config stage's
+`<stage>_result`, longest `<stage>_duration_ms` and `<stage>_failed_configs`. The per-stage `warm pool: stage start` and `warm
+pool: stage done` lines are DEBUG; a failed stage still logs `warm pool: stage
+done` at WARN with its config and error.
+
 Every asynchronous root records the `sandbox_id` of the sandbox it works on:
 an operation's target, a job's subject, a detached task's sandbox. A pass
 records `sandbox_id` when its refs name one sandbox, and `sandbox_ids`, a
 comma-separated list of at most sixteen, whenever they name any, with the
 rest counted in `sandbox_ids.dropped`.
+
+Each asynchronous root also names its Datadog operation, so it has its own
+APM series: `public_operation.execute`, `job.<kind>`, `node_ctl.pass`,
+`warm_pool.pass`, `sbxmgr.detached`, `netgtw.startup` and
+`leader_election.change`. An internal span that names
+none falls back to the operation `internal`, shared by every such span of the
+service.
 
 One case remains that SPACE cannot fix. datadog-opentelemetry 0.5.2 counts no
 span whose parent is remote when the process already has that trace open
@@ -458,7 +508,8 @@ configuration does not list is still sent but cannot be grouped or filtered
 on. That applies to tags added after the configuration was written, including
 the `reason` on `template.gc.tick` and `template.gc.tick_duration_ms` errors
 and the `error_kind` on `template.build.latency_ms`,
-`template.build.step.latency_ms` and `snapshot.restore.failed`. Add them to the
+`template.build.step.latency_ms` and `snapshot.restore.failed`, and the
+`fault` on `gateway.tcp.connection`. Add them to the
 metric's tag configuration before relying on them; series without them are
 unaffected.
 
@@ -497,7 +548,11 @@ emit structured records carrying the resolved service name and honor
 `SPACE_LOG_FORMAT`. A JSON record written inside any span with a valid trace
 context, sampled or not, also carries the W3C `trace_id` and `span_id` of the
 nearest such span as lowercase hex, under every trace exporter; the
-Datadog-reserved `dd.trace_id` and `dd.span_id` are not written. The Go shim writes plain `[space-shim]` lines to stderr
+Datadog-reserved `dd.trace_id` and `dd.span_id` are not written. A process
+outside Kubernetes defaults to plain text, so the host runtime-supervisor's
+systemd unit sets `SPACE_LOG_FORMAT=json` and its journal lines are the same
+JSON records; the per-sandbox net-gateway and spaced-host it launches share
+its journal stream and are launched with JSON too. The Go shim writes plain `[space-shim]` lines to stderr
 and the smoke script writes plain lines too; neither attaches a service,
 environment, or version, so a log pipeline that needs those must add them from
 pod metadata.
@@ -529,6 +584,63 @@ that fallback, preserving the historical Datadog-default behavior while allowing
 later OTLP initialization. Legacy is a migration bridge for production Datadog
 continuity; remove it after native Datadog consumers migrate.
 
+## Net-gateway TCP connections
+
+`gateway.tcp.connection` counts one point for every TCP connection that reaches
+the net-gateway's per-connection handler. Every point carries the same three
+tags:
+
+- `status`: `cancelled`, `rejected`, `relayed`, `handled` or `relay_failed`.
+- `detail`: the bounded detail within `status`, such as `connect` or
+  `transfer` under `relay_failed`.
+- `fault`: on `status:relay_failed,detail:transfer`, what failed first: the
+  relay leg and operation, an unattributed relay failure, or a reserved-DNS
+  exchange; `none` on every other point.
+
+| `fault` | Meaning |
+| --- | --- |
+| `guest_read`, `guest_write`, `guest_flush`, `guest_shutdown` | The first failing socket operation in a pass-through relay was on the guest leg. |
+| `origin_read`, `origin_write`, `origin_flush`, `origin_shutdown` | The first failing socket operation in a pass-through relay was on the destination leg. |
+| `relay_io` | A pass-through relay failed without recording a failing leg. Not expected. |
+| `reserved_dns` | A reserved-DNS-over-TCP exchange failed: the resolver returned an empty reply, or writing the reply to the guest failed or timed out. No relay ran, so no leg is named. |
+| `none` | Every other outcome, including connect-phase failures. |
+
+`fault` records the first failing leg and operation the relay observed, not
+which peer caused the failure. A destination that stalls can make the guest
+time out and reset, which reads as `guest_read`. Splitting
+`gateway.tcp.connection{status:relay_failed,detail:transfer}` by `fault`
+separates guest-leg from destination-leg failures. A Datadog organization with
+a restricted tag configuration for this metric must list `fault` before it can
+be grouped or filtered on; see [Restricted tag configurations](#restricted-tag-configurations).
+
+### Known-egress logs
+
+The net-gateway names failed flows to the exact domains it was launched with
+(`--known-egress-domain`). A DNS query matches by its query name and a TCP flow
+by its TLS SNI, so only TLS flows whose SNI names a configured domain are logged.
+Plaintext and host-bound HTTP flows, and reserved DNS over TCP, carry no SNI:
+they are counted only by `gateway.tcp.connection`, not logged here. These
+events use the log target
+`pplx_space_net_gateway::known_egress` and carry `sandbox_id`,
+`original_dst_port`, `destination`, `protocol` and `reason`.
+
+- ERROR `failed to connect to known egress destination`: every failed matched
+  DNS query or TCP flow except a pass-through transfer failure. That covers
+  rejections and failed connects. It also covers inspected TLS/HTTP failures,
+  including those after the upstream connected.
+- INFO `known egress destination failed an established connection`: a
+  pass-through relay that connected and then failed first on the destination
+  leg, or without a recorded leg (`fault:relay_io`).
+- DEBUG `guest side failed an established known egress connection`: a
+  pass-through relay that connected and then failed first on the guest leg.
+  These events are visible only when the gateway's log filter enables DEBUG
+  for that target.
+
+The INFO and DEBUG events add `fault`, with the same pass-through values as
+the metric tag above. Each of these failures is also counted by
+`gateway.tcp.connection{status:relay_failed,detail:transfer}`, with the same
+`fault`, so no log level is needed to count transfer failures.
+
 ## Firecracker and guest diagnostics
 
 Firecracker and the guest's spaced write nowhere a collector reads, so
@@ -552,7 +664,9 @@ The `error` values are listed in `crates/libs/metrics/src/sandbox/vm.rs`.
 Firecracker's flow-control counters (`block` `no_avail_buffer`, `net`
 `no_rx_avail_buffer` and `no_tx_avail_buffer`) are not among them: they count
 times the guest had not yet posted a buffer, which the device retries, not
-failures.
+failures. Nor is `signals` `sigpipe`: Firecracker raises SIGPIPE when it writes
+guest vsock data to a host peer that has gone, and `vsock` `tx_write_fails`
+counts that write once.
 
 Firecracker's ERROR log lines are re-logged by sandbox-manager as
 `firecracker error` with `sandbox_id` and the line in `firecracker_message`, at
@@ -590,6 +704,13 @@ a sandbox subject, and every RPC a sandbox's net-gateway serves. A Rust
 service's JSON log line written inside such a span carries the same field,
 unless the event sets its own.
 
+A lifecycle request's entry span carries it too, not only its children, so a
+search by `sandbox_id` finds the request itself: space-api's `http.server`
+span for a sandbox route or a create, and the `grpc.server` span of
+node-api's and sandbox-manager's lifecycle RPCs (create, start, wake, stop,
+delete, suspend, pause, resume, kill, rollback and pool adoption). A create
+that names no sandbox records the one it allocated when it returns.
+
 Two other spellings remain where they are part of a contract, and convert by
 prefix:
 
@@ -622,6 +743,57 @@ Each HTTP response also carries a W3C `traceparent` header naming its
 made. The header holds only the version, trace ID, span ID and sampled flag;
 it is absent when traces are off, and a proxied sandbox service's own
 `traceparent` is passed through unchanged.
+
+## Sandbox events and traces
+
+A `space sandbox event` line (`event_stream` `space.sandbox`) is written
+synchronously where the transition happens, so it carries `trace_id` and
+`span_id` exactly when that code runs inside a traced span. Work a traced
+request waits for runs in the request's span, so its events carry the
+request's trace ID:
+
+- node-manager's sandbox cleanup, which runs in a task the `CleanupSandbox`
+  call that started it owns;
+- sandbox-manager's lifecycle cleanup admission, which its RPC awaits.
+
+Work that outlives the request runs under a root linked to it, which records
+the request's trace ID as `origin_trace_id` and is sampled as the request was;
+its events carry the root's trace ID:
+
+- a sandbox-manager durable cleanup attempt is a `job.execute` root
+  (`job.sandbox_cleanup`), never a child of its caller, since a caller such as
+  Stop can stop waiting while the attempt runs. It links to the context saved
+  with the job and to the traced caller waiting for it, if any. The first
+  attempt, and one a caller waits for, is sampled as those origins were; a
+  later retry still links to them but takes the configured sampler, through
+  `link_root_to_origins_without_following`, so a job that keeps failing does
+  not keep a trace every retry;
+- sandbox-manager's cluster-deleted eviction teardown runs under
+  `sbxmgr.detached` (`EvictClusterDeletedSandbox`), linked to the
+  `EvictClusterDeletedSandbox` call: node-ctl gives that call a 10-second
+  deadline and treats its expiry as an eviction still in progress, so the
+  teardown can outlive it. A call from an untraced caller gets no root;
+- a network-policy reconcile attempt that a traced request queued runs under
+  `sbxmgr.detached` (`NetworkPolicyReconcile`), linked to the latest traced
+  request that queued it since the previous attempt, except that an unsampled
+  request's context never replaces a sampled one;
+- a net-gateway that sandbox-manager launched from a traced request receives
+  the launch's context as `TRACEPARENT`, and its startup events and first
+  policy pull run under a `netgtw.startup` (`NetGatewayStartup`) root linked
+  to it.
+
+No root is created for events with no request behind them: the
+network-policy reconciler's periodic sweep (every live sandbox once a minute)
+and its retries; startup recovery, the inventory, cache and quarantine
+reconcilers, cold-sandbox eviction and the snapshot scheduler; a cleanup job
+no traced caller persisted, such as one startup recovery schedules; a
+net-gateway the watchdog relaunched, its policy retries and rehydrations, and
+its `network_path_stopped` at shutdown, which a signal causes. Their events
+carry no trace ID, except those a callee writes while serving such work's
+call, which carry the unsampled context of
+[untraced background traffic](#untraced-background-traffic); work that
+follows that context does not save it as its origin. Due auto-lifecycle
+transitions keep their own `AutoLifecycle` root.
 
 ## Cargo features
 

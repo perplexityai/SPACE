@@ -1,10 +1,11 @@
+use crate::host_command::Command;
 use std::cell::Cell;
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::fd::AsRawFd;
 use std::path::Path;
-use std::process::{Command, ExitStatus, Output};
+use std::process::{ExitStatus, Output};
 use std::time::Duration;
 use std::{fs, thread};
 

@@ -55,7 +55,9 @@ pub struct FirecrackerError {
 /// Every Firecracker field exported as `sandbox.firecracker.errors`. The
 /// `error` tag can only take these values. Flow-control counters such as
 /// `no_avail_buffer` are not errors: the guest has not posted a buffer yet, and
-/// the device retries.
+/// the device retries. `signals.sigpipe` is left out: the write that raises
+/// SIGPIPE in Firecracker is a vsock write to a host peer that has gone, which
+/// `vsock` `tx_write_fails` already counts once.
 pub const FIRECRACKER_ERRORS: &[FirecrackerError] = &{
     use FirecrackerComponent::*;
     const fn e(component: FirecrackerComponent, error: &'static str) -> FirecrackerError {
@@ -95,7 +97,6 @@ pub const FIRECRACKER_ERRORS: &[FirecrackerError] = &{
         e(Signal, "sigsegv"),
         e(Signal, "sigxfsz"),
         e(Signal, "sigxcpu"),
-        e(Signal, "sigpipe"),
         e(Signal, "sighup"),
         e(Signal, "sigill"),
     ]

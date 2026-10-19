@@ -25,6 +25,11 @@ log_init() {
 
 . /opt/space/bin/node-manager-runtime-supervisor.sh
 
+# The supervisor runs outside Kubernetes, where SPACE services would default to
+# plain-text logs; SPACE_LOG_FORMAT=json gives its journal lines the same JSON
+# fields and trace IDs as the node services' pod logs. The per-sandbox
+# net-gateway and spaced-host it launches share its journal stream and set
+# their own format. A SPACE_LOG_FORMAT in space.env still takes precedence.
 render_runtime_supervisor_unit() {
   cat <<'EOF'
 [Unit]
@@ -35,6 +40,7 @@ Requires=space-cgroup.service
 
 [Service]
 Type=simple
+Environment=SPACE_LOG_FORMAT=json
 EnvironmentFile=-/space/config/space.env
 ExecStart=/space/bin/space-runtime-supervisor-svc
 Restart=always

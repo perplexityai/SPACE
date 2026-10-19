@@ -3,6 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"strconv"
+	"strings"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -52,9 +55,14 @@ func newOTLPTracePipeline() (tracePipeline, error) {
 	if err != nil {
 		return nil, fmt.Errorf("OTLP trace exporter: %w", err)
 	}
-	// SDK v1.41 reads OTEL_TRACES_SAMPLER[_ARG] and OTEL_BSP_* itself.
+	// SDK v1.41 reads OTEL_BSP_* itself; the sampler OTEL_TRACES_SAMPLER
+	// selects is wrapped to follow a linked root's origin and a span's parent.
 	// The default batch queue is bounded and drops on overflow without blocking.
-	provider := sdktrace.NewTracerProvider(sdktrace.WithBatcher(exporter), sdktrace.WithResource(res))
+	provider := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithResource(res),
+		sdktrace.WithSampler(followOrigin{configured: configuredSampler()}),
+	)
 	return &otlpTracePipeline{tracer: provider.Tracer("pplx-space-shim"), provider: provider}, nil
 }
 func (p *otlpTracePipeline) start(ctx context.Context, name string, attrs ...attribute.KeyValue) (shimSpan, context.Context) {
@@ -83,9 +91,6 @@ func (s otlpSpan) End(err error) {
 	}
 	s.Span.End()
 }
-func (p *otlpTracePipeline) extract(ctx context.Context, carrier propagation.MapCarrier) context.Context {
-	return tracePropagation.Extract(ctx, carrier)
-}
 func (p *otlpTracePipeline) inject(ctx context.Context, carrier propagation.MapCarrier) {
 	tracePropagation.Inject(ctx, carrier)
 }
@@ -94,4 +99,86 @@ func (p *otlpTracePipeline) shutdown(ctx context.Context) error {
 		return nil
 	}
 	return p.provider.Shutdown(ctx)
+}
+
+// followOrigin keeps or drops a root that links to an origin as the origin was
+// sampled, so a kept request keeps the work it caused, as the Rust services'
+// sampler does. A root without a valid link keeps the sampler
+// OTEL_TRACES_SAMPLER selects. A span with a parent follows its parent
+// whatever that sampler is: one that is not parent-based, such as always_on or
+// traceidratio, would otherwise sample the children of a dropped root, which
+// would export without it and propagate a sampled traceparent from an
+// unsampled origin. As in the Rust sampler, a span under an unsampled parent is
+// recorded but not sampled; the shim's only span processor, the batcher,
+// exports sampled spans alone, so none of it leaves the shim.
+type followOrigin struct{ configured sdktrace.Sampler }
+
+func (f followOrigin) ShouldSample(p sdktrace.SamplingParameters) sdktrace.SamplingResult {
+	if parent := trace.SpanContextFromContext(p.ParentContext); parent.IsValid() {
+		decision := sdktrace.RecordOnly
+		if parent.IsSampled() {
+			decision = sdktrace.RecordAndSample
+		}
+		return sdktrace.SamplingResult{Decision: decision, Tracestate: parent.TraceState()}
+	}
+	linked, sampled := false, false
+	for _, link := range p.Links {
+		if link.SpanContext.IsValid() {
+			linked = true
+			sampled = sampled || link.SpanContext.IsSampled()
+		}
+	}
+	if !linked {
+		return f.configured.ShouldSample(p)
+	}
+	decision := sdktrace.Drop
+	if sampled {
+		decision = sdktrace.RecordAndSample
+	}
+	return sdktrace.SamplingResult{Decision: decision}
+}
+
+func (f followOrigin) Description() string {
+	return "FollowOrigin{" + f.configured.Description() + "}"
+}
+
+// configuredSampler is the sampler the SDK would build from
+// OTEL_TRACES_SAMPLER and OTEL_TRACES_SAMPLER_ARG; giving the provider a
+// sampler stops it reading them. As in the SDK, a value it cannot use is
+// reported and the default, parentbased_always_on, applies.
+func configuredSampler() sdktrace.Sampler {
+	fallback := sdktrace.ParentBased(sdktrace.AlwaysSample())
+	name, present := os.LookupEnv("OTEL_TRACES_SAMPLER")
+	if !present {
+		return fallback
+	}
+	arg, hasArg := os.LookupEnv("OTEL_TRACES_SAMPLER_ARG")
+	arg = strings.TrimSpace(arg)
+	ratio := func() (float64, bool) {
+		if !hasArg {
+			return 1, true
+		}
+		value, err := strconv.ParseFloat(arg, 64)
+		return value, err == nil && value >= 0 && value <= 1
+	}
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "always_on":
+		return sdktrace.AlwaysSample()
+	case "always_off":
+		return sdktrace.NeverSample()
+	case "traceidratio":
+		if value, ok := ratio(); ok {
+			return sdktrace.TraceIDRatioBased(value)
+		}
+	case "parentbased_always_on":
+		return fallback
+	case "parentbased_always_off":
+		return sdktrace.ParentBased(sdktrace.NeverSample())
+	case "parentbased_traceidratio":
+		if value, ok := ratio(); ok {
+			return sdktrace.ParentBased(sdktrace.TraceIDRatioBased(value))
+		}
+	}
+	logShim("unusable OTEL_TRACES_SAMPLER %q or argument %q; using parentbased_always_on", name, arg)
+	return fallback
 }

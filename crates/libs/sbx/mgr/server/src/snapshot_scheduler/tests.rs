@@ -478,3 +478,28 @@ fn retention_keeps_newest_per_tier_without_waiting_for_the_whole_census() {
         Some("1m-0000".into())
     );
 }
+
+/// A checkpoint's sidecar, scheduled or requested, carries the capturing host's
+/// CPU, as a suspend snapshot's does. Non-Linux hosts report no CPU, so the
+/// comparison is only meaningful on Linux, where an unidentified CPU fails the
+/// test rather than letting it compare `None` with `None`.
+#[test]
+fn checkpoint_sidecar_execution_metadata_records_the_capturing_host_cpu() {
+    use pplx_space_common_core::types::{Arch, ExecutionMetadata, HostCpu, TemplateName};
+
+    #[cfg(target_os = "linux")]
+    assert!(
+        HostCpu::current().is_some(),
+        "this Linux host's CPU is unidentified"
+    );
+
+    let metadata = SandboxArtifactMetadata::new(
+        SandboxId::new(),
+        ExecutionMetadata::initial_firecracker(Arch::X86_64, vec![]),
+        TemplateName::parse("seed").unwrap(),
+        None,
+    );
+    let execution = checkpoint_sidecar_execution_metadata(metadata).unwrap();
+
+    assert_eq!(execution.host_cpu(), HostCpu::current());
+}

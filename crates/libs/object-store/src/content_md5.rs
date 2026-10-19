@@ -5,10 +5,11 @@
 //! against. When a stalled attempt is abandoned mid-body, the SDK retries on a
 //! new connection, and a store that commits whatever arrived before the
 //! disconnect stores a short object as if it were complete — possibly after
-//! the good retry (versitygw through v1.8.0, versity/versitygw#2414). With a
-//! `Content-MD5` header, S3 and compatible stores must reject any body that
-//! does not match the digest (`BadDigest`), so a truncated attempt fails
-//! instead of committing.
+//! the good retry (versitygw through v1.8.0, versity/versitygw#2414; v1.9.0
+//! refuses a body shorter than its `Content-Length`). With a `Content-MD5`
+//! header, S3 and compatible stores must reject any body that does not match
+//! the digest (`BadDigest`), so a truncated attempt fails instead of
+//! committing, whether or not the store checks the length.
 //!
 //! Every attempt re-reads the same bytes, so one digest covers all retries. A
 //! header rather than an aws-chunked checksum trailer: see `s3_base_config`

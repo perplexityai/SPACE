@@ -50,6 +50,59 @@ fn prune_candidate_from_row(row: PruneCandidateRow) -> Result<PruneCandidate, sq
     })
 }
 
+/// Upper bound of the durable claims present when a recovery epoch starts.
+///
+/// The `OFFSET 0` fence keeps the claim filter on the `(state, type)` index.
+/// Without it, `ORDER BY id DESC LIMIT 1` lets the planner walk the primary
+/// key backward and filter every row, expecting a claim near the newest IDs.
+/// A `deleting` estimate larger than the live claim set, such as statistics
+/// sampled while a tick holds its claims, makes that plan look cheap. Claims
+/// are old snapshots with low UUIDv7 IDs, so the walk reads nearly the whole
+/// table and can exceed the statement timeout while fresh discovery keeps
+/// working. With the fence, the cost scales with the claims, not the table.
+pub(crate) const CLAIMED_SCAN_EPOCH_SQL: &str = sql!(
+    "SELECT claimed.id
+       FROM (
+             SELECT id
+               FROM snapshots
+              WHERE type = 'full'
+                AND state = 'deleting'
+             OFFSET 0
+            ) claimed
+      ORDER BY claimed.id DESC
+      LIMIT 1"
+);
+
+/// One recovery page of durable claims in `($2, $3]`, oldest first.
+///
+/// Same `OFFSET 0` fence as [`CLAIMED_SCAN_EPOCH_SQL`]: the `LIMIT` must not
+/// turn the ID range into a primary-key walk that filters unclaimed rows.
+pub(crate) const LIST_CLAIMED_SQL: &str = sql!(
+    "SELECT
+         s.id AS snapshot_id,
+         s.sandbox_id,
+         ssl.id AS storage_location_id,
+         ssl.storage_connection_string,
+         EXISTS (
+             SELECT 1
+               FROM snapshot_storage_location_encrypted_fields ef
+              WHERE ef.snapshot_storage_location_id = ssl.id
+         ) AS has_encrypted_fields,
+         EXTRACT(EPOCH FROM (NOW() - s.timestamp))::BIGINT AS age_secs
+     FROM (
+           SELECT id, sandbox_id, timestamp
+             FROM snapshots
+            WHERE type = 'full'
+              AND state = 'deleting'
+              AND id > COALESCE($2::UUID, '00000000-0000-0000-0000-000000000000'::UUID)
+              AND id <= $3
+           OFFSET 0
+          ) s
+     LEFT JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = s.id
+     ORDER BY s.id ASC
+     LIMIT $1"
+);
+
 /// SQL fragment for the one usable storage location a snapshot may own.
 ///
 /// All callers pass static aliases from this module. Discovery keeps its SQL
@@ -273,16 +326,9 @@ impl RetentionSink for SnapshotRetentionDbStore {
     }
 
     async fn claimed_scan_epoch(&self) -> Result<Option<ClaimedScanEpoch>, sqlx::Error> {
-        let through: Option<SnapshotId> = sqlx::query_scalar(sql!(
-            "SELECT id
-               FROM snapshots
-              WHERE type = 'full'
-                AND state = 'deleting'
-              ORDER BY id DESC
-              LIMIT 1"
-        ))
-        .fetch_optional(&self.pool)
-        .await?;
+        let through: Option<SnapshotId> = sqlx::query_scalar(CLAIMED_SCAN_EPOCH_SQL)
+            .fetch_optional(&self.pool)
+            .await?;
         Ok(through.map(|through| ClaimedScanEpoch { through }))
     }
 
@@ -293,32 +339,12 @@ impl RetentionSink for SnapshotRetentionDbStore {
         through: SnapshotId,
     ) -> Result<Vec<PruneCandidate>, sqlx::Error> {
         // Claims are already de-advertised; page them separately to finish forward.
-        let rows: Vec<PruneCandidateRow> = sqlx::query_as(sql!(
-            "SELECT
-                 s.id AS snapshot_id,
-                 s.sandbox_id,
-                 ssl.id AS storage_location_id,
-                 ssl.storage_connection_string,
-                 EXISTS (
-                     SELECT 1
-                       FROM snapshot_storage_location_encrypted_fields ef
-                      WHERE ef.snapshot_storage_location_id = ssl.id
-                 ) AS has_encrypted_fields,
-                 EXTRACT(EPOCH FROM (NOW() - s.timestamp))::BIGINT AS age_secs
-             FROM snapshots s
-             LEFT JOIN snapshot_storage_locations ssl ON ssl.snapshot_id = s.id
-             WHERE s.type = 'full'
-               AND s.state = 'deleting'
-               AND s.id > COALESCE($2::UUID, '00000000-0000-0000-0000-000000000000'::UUID)
-               AND s.id <= $3
-             ORDER BY s.id ASC
-             LIMIT $1"
-        ))
-        .bind(limit)
-        .bind(after)
-        .bind(through)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows: Vec<PruneCandidateRow> = sqlx::query_as(LIST_CLAIMED_SQL)
+            .bind(limit)
+            .bind(after)
+            .bind(through)
+            .fetch_all(&self.pool)
+            .await?;
         rows.into_iter().map(prune_candidate_from_row).collect()
     }
 

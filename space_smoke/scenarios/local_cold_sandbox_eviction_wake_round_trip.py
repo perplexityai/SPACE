@@ -21,16 +21,16 @@ MARKER = "space-smoke-cold-eviction-ok"
 # to wait out — and then waits the rendered minimum idle honestly. "Idle" is
 # the loop's activity witness: the newest guest-activity clock (this scenario's
 # marker write sets `last_command_at`), so the clock starts before the pause,
-# and nothing the wait does — cluster Postgres reads, `kubectl logs`, sleeping
-# — touches it. The retired compose suites aged rows in sbx-manager's private
+# and nothing the wait does — cluster Postgres reads, probing the cache
+# directory, sleeping — touches it. The retired compose suites aged rows in sbx-manager's private
 # SQLite instead; the framework has no such surface by design.
 #
-# Proof is through the daemon's own surfaces: its `local_eviction_completed`
-# sandbox event on the sandbox's worker, the cache directory gone from that
-# node's disk, and the wake's `runtime_activated` event reporting a healthy
-# `remote_*` provenance with the storage URI present — a wake served from some
-# surviving local copy reads `local_only` and fails. State written before the
-# suspend must survive the suspend → upload → evict → S3-restore round trip.
+# Proof is state: the cache directory gone from the worker's disk while the
+# sandbox stays suspended (the cluster-deleted reclaim cannot apply), then a
+# wake whose landed pod is the sandbox's one active execution, planned from
+# the snapshot's storage URI. No local copy survived to serve it, so state
+# written before the suspend must come back through the suspend → upload →
+# evict → S3-restore round trip.
 #
 # What this does not reach, and where it lives instead: the never-evict
 # decision table (no ready backup; local bytes newer than the backup; an
@@ -82,8 +82,7 @@ def cold_sandbox_eviction_wake_round_trip(test: smoke.KindEcw) -> None:
         eviction.expect_local_presence_present(worker)
 
     with test.phase("the loop evicts the sandbox once it is past the minimum idle"):
-        evicted = eviction.wait_until_evicted(worker)
-        test.record("eviction_snapshot_id", evicted.snapshot_id)
+        eviction.wait_until_evicted(worker)
         eviction.expect_local_presence_gone(worker)
 
     with test.phase("the sandbox wakes by restoring from object storage"):

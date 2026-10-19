@@ -31,6 +31,151 @@ pub(super) fn suspend_snapshot_staging_dir(
         .join(format!("{SUSPEND_STAGING_PREFIX}{local_artifact_id}"))
 }
 
+/// Written into an encrypted suspend's staging directory once the capture
+/// completed, before its volume is sealed. It carries the sidecar metadata of
+/// that capture, so a later seal publishes exactly it after the runtime is
+/// gone. Its absence means the staging holds no finished encrypted capture.
+pub(super) const ENCRYPTED_CAPTURE_RECORD: &str = "encrypted-capture.json";
+
+/// How long recovery keeps retrying an unsealed encrypted capture. After it,
+/// the staging directory is treated as incomplete and the row quarantines as
+/// an only-copy filesystem, which deletion still retains.
+pub(super) const ENCRYPTED_SEAL_RETRY_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(6 * 60 * 60);
+
+/// The record, written durably before the capture under a name recovery
+/// ignores. [`commit_encrypted_capture_record`] gives it the record's name
+/// once the capture has finished.
+const ENCRYPTED_CAPTURE_INTENT: &str = ".encrypted-capture.json.intent";
+
+/// Write the capture's record before the capture, while a failure can still
+/// roll back to paused. Nothing treats it as a record until it is committed,
+/// so an interrupted capture can never be sealed and published.
+pub(super) fn prepare_encrypted_capture_record(
+    staging_dir: &Path,
+    metadata: &crate::snapshot_upload::SnapshotMeta,
+) -> std::io::Result<()> {
+    let json = serde_json::to_vec_pretty(metadata).map_err(std::io::Error::other)?;
+    crate::snapshot_upload::replace_file_durably(
+        staging_dir,
+        ".encrypted-capture.json.tmp",
+        ENCRYPTED_CAPTURE_INTENT,
+        &json,
+    )?;
+    // The record is the only copy of the capture's identity: make the
+    // staging directory's own entry durable too, up to the sandbox directory.
+    let mut directory = staging_dir.parent();
+    for _ in 0..2 {
+        let Some(parent) = directory else { break };
+        std::fs::File::open(parent)?.sync_all()?;
+        directory = parent.parent();
+    }
+    Ok(())
+}
+
+/// Mark the capture finished: a same-directory rename of the already
+/// durable record, then a directory sync. It writes no data, so it can fail
+/// only if the staging filesystem itself is failing.
+pub(super) fn commit_encrypted_capture_record(staging_dir: &Path) -> std::io::Result<()> {
+    std::fs::rename(
+        staging_dir.join(ENCRYPTED_CAPTURE_INTENT),
+        staging_dir.join(ENCRYPTED_CAPTURE_RECORD),
+    )?;
+    std::fs::File::open(staging_dir)?.sync_all()
+}
+
+pub(super) fn read_encrypted_capture_record(
+    staging_dir: &Path,
+) -> Result<Option<crate::snapshot_upload::SnapshotMeta>, SuspendSnapshotPublicationError> {
+    let error = |source| SuspendSnapshotPublicationError::EncryptedCaptureRecord {
+        staging_dir: path_label(staging_dir),
+        source,
+    };
+    match std::fs::read(staging_dir.join(ENCRYPTED_CAPTURE_RECORD)) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|source| error(std::io::Error::other(source))),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(error(source)),
+    }
+}
+
+/// The sealed artifacts and sidecar are in place; the record has done its job.
+pub(super) fn remove_encrypted_capture_record(staging_dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(staging_dir.join(ENCRYPTED_CAPTURE_RECORD)) {
+        Ok(()) => std::fs::File::open(staging_dir)?.sync_all(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Staging directories of `sandbox_dir` holding a finished encrypted capture
+/// whose volume has not sealed yet and may still be sealed, in name order.
+/// Every seal retry selects through this, so a record past its retry window is
+/// never sealed: classification quarantines it instead.
+pub(super) fn encrypted_captures_awaiting_seal(
+    sandbox_dir: &Path,
+) -> Result<Vec<StagedSuspendSnapshotArtifact>, SuspendSnapshotPublicationError> {
+    let staging_parent = suspend_snapshot_staging_parent_dir(sandbox_dir);
+    let entries = match std::fs::read_dir(&staging_parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(SuspendSnapshotPublicationError::ListStagingParent {
+                staging_parent: path_label(&staging_parent),
+                source,
+            });
+        }
+    };
+    let now = std::time::SystemTime::now();
+    let mut pending = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter_map(|path| {
+            let local_artifact_id = path
+                .file_name()?
+                .to_str()?
+                .strip_prefix(SUSPEND_STAGING_PREFIX)?
+                .parse()
+                .ok()?;
+            encrypted_seal_pending(&path, now).then_some(StagedSuspendSnapshotArtifact {
+                local_artifact_id,
+                staging_dir: path,
+            })
+        })
+        .collect::<Vec<_>>();
+    pending.sort_by(|left, right| left.staging_dir.cmp(&right.staging_dir));
+    Ok(pending)
+}
+
+/// The capture a seal retry should seal: the newest pending record, unless a
+/// complete staged capture already awaits publication, which classification
+/// publishes without a seal.
+pub(super) fn recorded_encrypted_capture_to_seal(
+    sandbox_dir: &Path,
+) -> Result<Option<StagedSuspendSnapshotArtifact>, SuspendSnapshotPublicationError> {
+    match find_complete_suspend_snapshot_staging_dir(
+        sandbox_dir,
+        &RetainedSourceVerdicts::default(),
+    ) {
+        Ok(Some(_)) => return Ok(None),
+        Ok(None) | Err(SuspendSnapshotPublicationError::EncryptedSealPending { .. }) => {}
+        Err(error) => return Err(error),
+    }
+    Ok(encrypted_captures_awaiting_seal(sandbox_dir)?.pop())
+}
+
+/// An unsealed capture is pending evidence while recovery may still seal it.
+fn encrypted_seal_pending(staging_dir: &Path, now: std::time::SystemTime) -> bool {
+    std::fs::metadata(staging_dir.join(ENCRYPTED_CAPTURE_RECORD))
+        .and_then(|metadata| metadata.modified())
+        .is_ok_and(|recorded| match now.duration_since(recorded) {
+            Ok(age) => age < ENCRYPTED_SEAL_RETRY_WINDOW,
+            // Small clock skew keeps a fresh record pending; a record dated
+            // further ahead than the window itself cannot be trusted to expire.
+            Err(ahead) => ahead.duration() < ENCRYPTED_SEAL_RETRY_WINDOW,
+        })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct CanonicalSuspendSnapshotArtifact {
     pub(super) local_artifact_id: LocalArtifactId,
@@ -322,6 +467,25 @@ pub enum SuspendSnapshotPublicationError {
         #[source]
         source: std::io::Error,
     },
+    #[error("encrypted capture in {staging_dir} is waiting for its volume to seal")]
+    EncryptedSealPending { staging_dir: String },
+    #[error("access encrypted capture record in {staging_dir} failed: {source}")]
+    EncryptedCaptureRecord {
+        staging_dir: String,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+impl SuspendSnapshotPublicationError {
+    /// The artifact exists but a step owned elsewhere has not finished.
+    pub(super) fn is_pending(&self) -> bool {
+        match self {
+            Self::EncryptedSealPending { .. } => true,
+            Self::Validation(error) => error.is_pending(),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -777,6 +941,14 @@ pub(super) fn publish_suspend_snapshot_dir(
     local_artifact_id: LocalArtifactId,
     verdicts: &RetainedSourceVerdicts,
 ) -> Result<Vec<PathBuf>, SuspendSnapshotPublicationError> {
+    // A seal interrupted after its sidecar leaves the record behind; it is
+    // not part of the artifact.
+    remove_encrypted_capture_record(staging_dir).map_err(|source| {
+        SuspendSnapshotPublicationError::EncryptedCaptureRecord {
+            staging_dir: path_label(staging_dir),
+            source,
+        }
+    })?;
     let mut garbage = Vec::new();
     let parent =
         snapshot_dir
@@ -919,6 +1091,8 @@ pub(super) fn find_complete_suspend_snapshot_staging_dir(
         })
         .collect::<Vec<_>>();
     paths.sort();
+    let now = std::time::SystemTime::now();
+    let mut awaiting_seal = None;
     for path in paths {
         match validate_complete_suspend_snapshot_dir(&path, verdicts) {
             Ok(local_artifact_id) => {
@@ -930,6 +1104,11 @@ pub(super) fn find_complete_suspend_snapshot_staging_dir(
             // Skipping an unverified staging generation could pick a sibling
             // or conclude that no usable artifact exists.
             Err(error) if error.is_inconclusive() => return Err(error.into()),
+            // A finished capture whose seal can still succeed is not missing,
+            // but a later complete capture supersedes it.
+            Err(_) if encrypted_seal_pending(&path, now) => {
+                awaiting_seal.get_or_insert(path);
+            }
             Err(error) => {
                 tracing::warn!(
                     staging_dir = %path.display(),
@@ -939,7 +1118,12 @@ pub(super) fn find_complete_suspend_snapshot_staging_dir(
             }
         }
     }
-    Ok(None)
+    match awaiting_seal {
+        Some(path) => Err(SuspendSnapshotPublicationError::EncryptedSealPending {
+            staging_dir: path_label(&path),
+        }),
+        None => Ok(None),
+    }
 }
 
 pub(super) fn find_suspend_snapshot_staging_residue(

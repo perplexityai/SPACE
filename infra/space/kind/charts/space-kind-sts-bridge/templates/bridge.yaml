@@ -1,0 +1,154 @@
+{{- $name := "space-kind-sts-bridge" -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    team: {{ .Values.datadogTeam | quote }}
+spec:
+  replicas: {{ .Values.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $name }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      annotations:
+        ad.datadoghq.com/tags: '{"team":"{{ .Values.datadogTeam }}"}'
+        # The Secret is kept by sts-bridge-secret.sh, outside this chart; its
+        # checksum, with the settings below, rolls the bridge when either
+        # changes.
+        checksum/storage-exchange: {{ dict "secret" .Values.storageExchange.secretChecksum "issuer" .Values.issuer "audience" .Values.audience "upstream" .Values.upstream | toJson | sha256sum | trunc 16 | quote }}
+      labels:
+        app.kubernetes.io/name: {{ $name }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        team: {{ .Values.datadogTeam | quote }}
+    spec:
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      priorityClassName: {{ .Values.priorityClassName }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 5
+      # The image's unprivileged account; the fixture needs no host access,
+      # capability or writable root filesystem.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+        - name: sts-bridge
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # The jwks_uri the discovery document names is fetched at the
+          # Service, as the discovery document is (space-object-store's
+          # --oidc-discovery-url), while tokens name the issuer, which never
+          # resolves.
+          args:
+            - -listen=:{{ .Values.service.stsPort }}
+            - -sts-tls-cert=/etc/space-rpc-tls/tls.crt
+            - -sts-tls-key=/etc/space-rpc-tls/tls.key
+            - -issuer-listen=:{{ .Values.service.issuerPort }}
+            - -issuer-tls-cert=/etc/sts-bridge/issuer.crt
+            - -issuer-tls-key=/etc/sts-bridge/issuer.key
+            - -signing-key=/etc/sts-bridge/signing.key
+            - -issuer={{ .Values.issuer }}
+            - -jwks-base=https://{{ .Values.service.name }}:{{ .Values.service.issuerPort }}
+            - -audience={{ .Values.audience }}
+            - -upstream={{ .Values.upstream }}
+            - -upstream-ca=/etc/space-rpc-ca/ca.crt
+          env:
+            # ACCESS_KEY:SECRET:SUBJECT: the vend identity the authority signs
+            # with, and the OIDC subject its tokens carry.
+            - name: BRIDGE_IDENTITIES
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secretName }}
+                  key: identities
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: sts
+              containerPort: {{ .Values.service.stsPort }}
+            - name: issuer
+              containerPort: {{ .Values.service.issuerPort }}
+          # One process serves both listeners and exits if either stops, so
+          # the issuer's answer stands for both; a bare TCP probe of the STS
+          # port would only log a failed TLS handshake each time.
+          readinessProbe:
+            httpGet:
+              scheme: HTTPS
+              path: /.well-known/openid-configuration
+              port: issuer
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              scheme: HTTPS
+              path: /.well-known/openid-configuration
+              port: issuer
+            initialDelaySeconds: 5
+            periodSeconds: 20
+          volumeMounts:
+            - name: bridge
+              mountPath: /etc/sts-bridge
+              readOnly: true
+            - name: sts-tls
+              mountPath: /etc/space-rpc-tls
+              readOnly: true
+            - name: rpc-ca
+              mountPath: /etc/space-rpc-ca
+              readOnly: true
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        # Only what the bridge serves with: not the issuer CA's key, which
+        # stays in the Secret for sts-bridge-secret.sh to reissue the leaf.
+        - name: bridge
+          secret:
+            secretName: {{ .Values.secretName }}
+            defaultMode: 0440
+            items:
+              - key: signing.key
+                path: signing.key
+              - key: issuer.crt
+                path: issuer.crt
+              - key: issuer.key
+                path: issuer.key
+        - name: sts-tls
+          secret:
+            secretName: {{ .Values.stsTlsSecretName }}
+            defaultMode: 0440
+        - name: rpc-ca
+          secret:
+            secretName: {{ .Values.upstreamCaSecretName }}
+            defaultMode: 0444
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.service.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  selector:
+    app.kubernetes.io/name: {{ $name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: sts
+      port: {{ .Values.service.stsPort }}
+      targetPort: sts
+    - name: issuer
+      port: {{ .Values.service.issuerPort }}
+      targetPort: issuer

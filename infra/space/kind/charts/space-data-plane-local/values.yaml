@@ -39,28 +39,29 @@ autoscaling:
 # refreshes it at 80% of that.
 nodeApiTokenExpirationSeconds: 600
 
-# Graceful shutdown, as deployments give the data plane. The process has no
-# drain budget of its own: on SIGTERM its listener stops accepting at once,
-# /readyz keeps answering ok, and axum's graceful shutdown waits without a
-# deadline for plain HTTP responses still streaming (run,
-# crates/libs/data/plane/server/src/lib.rs): native session SSE and ECW
-# process and file streams, which last as long as their commands. Upgraded
-# connections do not drain. Sandbox service-port proxies and ingress and
-# upgraded HTTP proxies watch child tokens of the shutdown token and close at
-# SIGTERM (proxy_upgraded_connection, native/proxy.rs). Native WebSocket
-# session attaches run outside the server's connection tracking: raw service
-# sessions close at SIGTERM (bridge_raw_service_session, native.rs) and the
-# rest end with the process.
+# Graceful shutdown, as deployments give the data plane.
 #
+# On SIGTERM the listener stops accepting and new streams are refused with a
+# retryable 503 (a native WebSocket that has not attached yet gets close 1012),
+# while streams that were already attached keep running; the process exits as
+# soon as none remain (serve_and_drain, crates/libs/data/plane/server/src/drain.rs).
+# Streams still open after --shutdown-grace-secs are cancelled, each in the form
+# docs/architecture.md describes, and then get 5 s (STREAM_CANCEL_GRACE) before
+# the process exits regardless. Sized like the API's 150 s shutdown grace, for
+# the same clients' in-flight work. The chart always sets this deadline; the
+# binary's no-deadline mode is for deployments that rely on the termination
+# grace period alone.
+shutdownGraceSeconds: 150
+
 # Seconds the pod keeps serving after it starts terminating, before SIGTERM,
 # so it leaves the entry Services' endpoints first: kube-proxy drops an
 # endpoint in about a second, and deployments size this for their load
 # balancer instead.
 preStopSleepSeconds: 5
 
-# The only bound on the HTTP streams above. Sized like the API's: its 150 s
-# shutdown grace for the same clients' in-flight work, the preStop delay, and
-# exit.
+# Covers the preStop delay, the shutdown grace, the 5 s the data plane gives
+# cancelled streams to close, and the telemetry flush and exit after it. The
+# template refuses a value that does not exceed the first three.
 terminationGracePeriodSeconds: 180
 
 # The boot budget. The listener binds only once ClusterApi answers: startup

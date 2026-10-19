@@ -7,6 +7,7 @@ use pplx_space_common_core::types::SandboxId;
 use pplx_space_events::{
     SandboxEvent, SandboxEventBoolField, SandboxEventDetails, SandboxEventSource, SandboxEventType,
 };
+use tracing::Instrument as _;
 
 type CleanupOperationResult = Result<CleanupSandboxResponse, Status>;
 const CLEANUP_OPERATION_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -177,6 +178,9 @@ impl CleanupOperationRegistry {
                             .take()
                             .expect("cleanup operation closure is consumed only by its own claim");
                         let operations = std::sync::Arc::clone(&self.operations);
+                        // The owner's request span follows the operation, so
+                        // its cleanup events and calls stay in that request's
+                        // trace, as `run_owned_operation`'s work does.
                         self.task_tracker.spawn(async move {
                             let operation = operation();
                             tokio::pin!(operation);
@@ -209,7 +213,7 @@ impl CleanupOperationRegistry {
                             claim.complete(|| {
                                 result_tx.send_replace(Some(result));
                             });
-                        });
+                        }.in_current_span());
                         (result_rx, true, true)
                     }
                 };

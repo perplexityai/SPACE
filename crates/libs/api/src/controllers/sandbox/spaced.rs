@@ -72,11 +72,14 @@ impl SandboxController {
             // the pod back anyway, re-opening the lost-pod bypass. Only genuine
             // "not assigned / unreachable" errors should reach the wake path.
             Err(err) if err.status() == StatusCode::TOO_MANY_REQUESTS => Err(err),
+            // Any other failure wakes and reconnects only where a wake can
+            // give the row a runtime; otherwise, including for a label that
+            // does not parse, the last arm returns the error.
             Err(_)
-                if matches!(
-                    sandbox.managed_by.parse::<SubstrateKind>(),
-                    Ok(SubstrateKind::Kubernetes)
-                ) =>
+                if sandbox
+                    .managed_by
+                    .parse::<SubstrateKind>()
+                    .is_ok_and(SubstrateKind::wakes_after_failed_control_connect) =>
             {
                 // Fallback wake for a dormant sandbox (the non-recovering
                 // `runtime_client` path errored). `wake_execution` spends a real

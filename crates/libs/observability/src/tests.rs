@@ -62,3 +62,65 @@ fn traceparent_link_preserves_follower_parent_and_rejects_invalid_context() {
         "4444444444444444"
     );
 }
+
+#[test]
+fn only_an_unsampled_context_marked_untraced_is_withheld_as_an_origin() {
+    use opentelemetry::trace::{SpanContext, SpanId, TraceFlags, TraceId, TraceState};
+
+    let context = |flags: TraceFlags, state: &[(&str, &str)]| {
+        SpanContext::new(
+            TraceId::from_hex("0af7651916cd43dd8448eb211c80319c").unwrap(),
+            SpanId::from_hex("b7ad6b7169203331").unwrap(),
+            flags,
+            true,
+            TraceState::from_key_value(state.iter().copied()).unwrap(),
+        )
+    };
+    for (flags, state, untraced) in [
+        (TraceFlags::default(), &[("space", "untraced")][..], true),
+        (
+            TraceFlags::default(),
+            &[("vendor", "x"), ("space", "untraced")][..],
+            true,
+        ),
+        (TraceFlags::SAMPLED, &[("space", "untraced")][..], false),
+        (TraceFlags::default(), &[][..], false),
+        (TraceFlags::default(), &[("space", "other")][..], false),
+        (TraceFlags::SAMPLED, &[][..], false),
+    ] {
+        assert_eq!(
+            super::trace_propagation::is_untraced_span_context(&context(flags, state)),
+            untraced,
+            "flags {flags:?}, tracestate {state:?}"
+        );
+    }
+}
+
+#[test]
+fn a_sampled_caller_context_marked_untraced_is_still_saved_as_an_origin() {
+    use opentelemetry_sdk::trace::SdkTracerProvider;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    opentelemetry::global::set_text_map_propagator(super::text_map_propagator());
+    let provider = SdkTracerProvider::builder().build();
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("origin-test")));
+    let saved = |traceparent: &str| {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("traceparent", traceparent.parse().unwrap());
+        headers.insert("tracestate", "space=untraced".parse().unwrap());
+        let span = tracing::info_span!("request");
+        super::trace_propagation::set_span_parent_from_headers(&span, &headers);
+        super::trace_propagation::traceparent_for_span(&span)
+    };
+    let (sampled, unsampled) = tracing::subscriber::with_default(subscriber, || {
+        (
+            saved("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"),
+            saved("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00"),
+        )
+    });
+    let sampled = sampled.expect("a sampled context is saved");
+    assert!(sampled.starts_with("00-0af7651916cd43dd8448eb211c80319c-"));
+    assert!(sampled.ends_with("-01"));
+    assert_eq!(unsampled, None);
+}

@@ -200,6 +200,8 @@ pub(super) enum SuspendSnapshotPublicationRecoveryOrigin {
     StartupRecovery,
     PeriodicRecovery,
     LivePublishFailure,
+    /// The teardown driver resuming its own interrupted publication.
+    TeardownRetry,
 }
 
 impl SuspendSnapshotPublicationRecoveryOrigin {
@@ -208,6 +210,7 @@ impl SuspendSnapshotPublicationRecoveryOrigin {
             Self::StartupRecovery => "startup_recovery",
             Self::PeriodicRecovery => "periodic_recovery",
             Self::LivePublishFailure => "live_publish_failure_recovery",
+            Self::TeardownRetry => "teardown_retry_recovery",
         }
     }
 
@@ -216,6 +219,7 @@ impl SuspendSnapshotPublicationRecoveryOrigin {
             Self::StartupRecovery => "startup_recovery_runtime_live",
             Self::PeriodicRecovery => "periodic_recovery_runtime_live",
             Self::LivePublishFailure => "live_publish_failure_runtime_live",
+            Self::TeardownRetry => "teardown_retry_runtime_live",
         }
     }
 }
@@ -721,6 +725,12 @@ impl SandboxManagerService {
         schedule: &mut crate::retained_source::InspectionSchedule,
         hold: impl Send + 'static,
     ) -> crate::retained_source::RetainedSourceVerdicts {
+        for row in rows.iter().filter(|row| unowned_publication(row)) {
+            if shutdown.is_cancelled() {
+                break;
+            }
+            self.spawn_encrypted_capture_seal(cache_dir, row);
+        }
         let verdicts = self
             .inspect_retained_sources_in(
                 rows.iter()
@@ -746,6 +756,79 @@ impl SandboxManagerService {
             tracing::warn!(%error, "periodic suspend publication recovery task failed");
             Default::default()
         })
+    }
+
+    /// Retry, in its own task, the seal of an encrypted capture that a suspend
+    /// recorded but could not seal. A refused close can take tens of seconds,
+    /// so it must not hold up this periodic pass. The task keeps the row's
+    /// wake, artifact and cleanup fences until it finishes, so a later pass
+    /// neither starts a second seal nor classifies the row mid-seal. Once the
+    /// seal succeeds, the next pass publishes the staged capture.
+    pub(super) fn spawn_encrypted_capture_seal(
+        &self,
+        cache_dir: &Path,
+        row: &crate::db::SandboxRow,
+    ) {
+        if !row.volume_encryption {
+            return;
+        }
+        match suspend_snapshot_publication::recorded_encrypted_capture_to_seal(
+            &cache_dir.join(&row.id),
+        ) {
+            Ok(Some(_)) => {}
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(sandbox_id = %row.id, %error, "cannot select an unsealed encrypted capture; will retry");
+                return;
+            }
+        }
+        let (Ok(wake), Ok(artifact)) = (
+            self.auto_lifecycle.wake_lock(&row.id).try_lock_owned(),
+            self.auto_lifecycle.artifact_lock(&row.id).try_lock_owned(),
+        ) else {
+            return;
+        };
+        let CleanupLockTryResult::Acquired(cleanup) = self.try_cleanup_fence(&row.id) else {
+            return;
+        };
+        let owned = self.startup_recovery_db().and_then(|db| {
+            if !crate::db::startup_resident_witness_current(&db, row)?
+                || crate::db::teardown_suspend_status(&db, &row.id)?
+                    .and_then(|status| status.operation)
+                    .is_some_and(|operation| operation.status.is_active())
+            {
+                return Ok(None);
+            }
+            Ok(crate::db::get_sandbox(&db, &row.id)?.filter(unowned_publication))
+        });
+        let row = match owned {
+            Ok(Some(row)) => row,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(sandbox_id = %row.id, %error, "cannot confirm unsealed encrypted capture owner; will retry");
+                return;
+            }
+        };
+        let (service, cache_dir) = (self.clone(), cache_dir.to_path_buf());
+        self.task_tracker.spawn(async move {
+            let _fences = (wake, artifact, cleanup);
+            match service
+                .seal_recorded_encrypted_capture(&row, &cache_dir)
+                .await
+            {
+                Ok(Some(capture)) => tracing::info!(
+                    sandbox_id = %row.id,
+                    local_artifact_id = %capture,
+                    "sealed interrupted encrypted suspend capture"
+                ),
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    sandbox_id = %row.id,
+                    %error,
+                    "encrypted suspend capture is still unsealed; recovery will retry"
+                ),
+            }
+        });
     }
 
     /// Retry only unowned publications. Startup's broader recovery is unsafe
@@ -800,7 +883,7 @@ impl SandboxManagerService {
         Ok(())
     }
 
-    fn recover_interrupted_suspend_snapshot_publication(
+    pub(super) fn recover_interrupted_suspend_snapshot_publication(
         &self,
         cache_dir: &Path,
         row: crate::db::SandboxRow,
@@ -1157,7 +1240,25 @@ impl SandboxManagerService {
                 outcome: crate::db::StartupRecoveryOutcome::Deferred,
             });
         }
-        let edge = if sandbox_rootfs_exists_in(cache_dir, &row.id) {
+        let has_rootfs = match sandbox_rootfs_exists_in(cache_dir, &row.id) {
+            Ok(exists) => exists,
+            Err(error) => {
+                // Inspection failure is not evidence of an absent disk.
+                // Preserve this row and its artifacts for filesystem repair;
+                // one unreadable instance must not block sibling admission.
+                tracing::warn!(
+                    sandbox_id = %row.id,
+                    %error,
+                    "deferred interrupted start recovery; repair the reported filesystem condition and retry startup recovery"
+                );
+                return Ok(crate::db::StartupRecoveryRecord {
+                    id: row.id,
+                    previous_state: row.state,
+                    outcome: crate::db::StartupRecoveryOutcome::Deferred,
+                });
+            }
+        };
+        let edge = if has_rootfs {
             &edges::UNLAUNCHED_START_RECOVERY_STOPPED
         } else {
             if let Err(error) = ensure_sandbox_cache_root_in(cache_dir, &row.id) {

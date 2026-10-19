@@ -188,9 +188,9 @@ async fn build_submission_grants_the_base_before_dispatch(
     #[future] base_release_fixture: TestDbResult<BaseReleaseFixture>,
 ) -> TestDbResult<()> {
     let BaseReleaseFixture { db, owner, .. } = base_release_fixture.await?;
-    let substrate = Substrate::Direct(Box::new(
+    let substrate = Substrate::from_direct(
         crate::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),
-    ));
+    );
     let controller = TemplateController::new(substrate, db.pool.clone());
     let submission = base_submission("private-base:stable".into(), OrgId::from_uuid(owner));
 
@@ -396,9 +396,9 @@ async fn template_controller_fixture() -> TestDbResult<TemplateControllerFixture
     .await?;
     let store = TemplateBuildJobsStore::new(db.pool.clone());
     // Direct is only a placeholder: the tests using this fixture never reach the substrate.
-    let substrate = Substrate::Direct(Box::new(
+    let substrate = Substrate::from_direct(
         crate::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),
-    ));
+    );
     let controller = TemplateController::new(substrate, db.pool.clone());
     Ok(TemplateControllerFixture {
         controller,
@@ -675,9 +675,9 @@ fn template_build_status_not_found_is_not_transient() {
 #[tokio::test]
 async fn system_build_withdraws_its_publication_grant_when_dispatch_fails() -> TestDbResult<()> {
     let db = pg_test_db().await?;
-    let substrate = Substrate::Direct(Box::new(
+    let substrate = Substrate::from_direct(
         crate::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),
-    ));
+    );
     let controller = TemplateController::new(substrate, db.pool.clone());
     let insert_stale_grant = || {
         sqlx::query(sql!(

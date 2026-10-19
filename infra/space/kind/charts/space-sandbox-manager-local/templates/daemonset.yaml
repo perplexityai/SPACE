@@ -87,8 +87,8 @@ spec:
               value: {{ .Values.networkCredentials.enabled | quote }}
             # Snapshot upload destination (SnapshotUploadConfig::from_env, the
             # suspend artifact-backup path). volume-manager performs the transfer
-            # with the static object-store credentials, which only volume-manager
-            # and build-manager receive; sandbox-manager gets none.
+            # with the object-store credentials it holds or exchanges;
+            # sandbox-manager gets none.
             - name: SPACE_SNAPSHOT_BUCKET
               value: {{ .Values.snapshots.bucket | quote }}
             - name: SPACE_SNAPSHOT_REGION

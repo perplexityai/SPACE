@@ -17,7 +17,38 @@ use fixtures::{
     expect_lease_unreachable, marker_path, test_config, wait_for_marker,
 };
 
-use super::Campaign;
+use super::{Campaign, LeaderElectionConfig};
+
+/// A replica contends for the lease only on a substrate that runs the
+/// controller as several replicas, and the kill-switch turns contention off
+/// everywhere. Direct is a single local process and runs the reconcilers
+/// unconditionally.
+#[test]
+fn contention_follows_the_substrate_and_the_kill_switch() {
+    use pplx_space_api::controllers::substrate::SubstrateCapabilities;
+
+    for (substrate, capabilities, enabled, expected) in [
+        ("direct", SubstrateCapabilities::DIRECT, true, false),
+        ("direct", SubstrateCapabilities::DIRECT, false, false),
+        ("kubernetes", SubstrateCapabilities::KUBERNETES, true, true),
+        (
+            "kubernetes",
+            SubstrateCapabilities::KUBERNETES,
+            false,
+            false,
+        ),
+    ] {
+        let config = LeaderElectionConfig {
+            enabled,
+            ..test_config("replica-a")
+        };
+        assert_eq!(
+            config.contends(capabilities),
+            expected,
+            "{substrate} substrate, election enabled: {enabled}"
+        );
+    }
+}
 
 /// A free lease is won immediately; the leadership token stays live while held,
 /// and `resign` releases the lease.

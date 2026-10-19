@@ -103,7 +103,6 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_NODEMGR_ACTIVATE_RUNTIME_SUPERVISOR_ON_START` | off | |
 | `SPACE_RTMGR_INSTALL_KERNELS_DIR` | unset | Enables runtime-manager kernel installs in this versioned kernel root, which must exist on the state directory's filesystem. Unset, installs and uninstalls are refused. |
 | `SPACE_NODEMGR_BTRFS_BALANCE_ENABLED` | on | |
-| `SPACE_NODEMGR_BTRFS_SEND_UNSTAMPED_PARENT` | off | Seal retained btrfs send-source parents without the template's received UUID; see [snapshot upload streaming](snapshot-upload-streaming.md). |
 | `SPACE_NODEMGR_DISK_IO_RESERVATION_ENABLED` | off | |
 | `SPACE_NODEMGR_DISK_IO_MAX_OPERATIONS_PER_SEC` | unset | Operator ceiling for each Firecracker root drive. Set a positive integer (for example `1000`) on node-manager and restart it. Applies to new boots, restores and running VMs, independently of saved assignments. See [guest disk I/O](space/design/guest-io.md#operator-ceiling). |
 | `SPACE_DISK_IO_SAFETY_MAX_OPERATIONS_PER_SEC`, `SPACE_DISK_IO_SAFETY_MAX_BANDWIDTH_MIB_PER_SEC` | unset | Set both or neither. Caps explicit warm-pool policy limits; unset, the cap is the platform default of 10,000 operations/s and 100 MiB/s. A value below the default leaves that dimension at the default. |
@@ -152,6 +151,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_DATA_PLANE_UPLOAD_ADMISSION` | off | Data plane: admit ECW `POST /files` uploads under the per-replica limits below; rejected uploads get 429 with a jittered `Retry-After`. Accepts `true`/`1`/`yes`/`on` and their negations. |
 | `SPACE_DATA_PLANE_MAX_CONCURRENT_UPLOADS`, `SPACE_DATA_PLANE_MAX_IN_FLIGHT_UPLOAD_BYTES` | 64, 1 GiB | Per-replica upload slots and byte budget. Each upload reserves its declared `Content-Length` rounded up to a KiB, or its path's body limit (256 MiB, or 1 MiB for JSON) when none is declared, so the 1 GiB default fits four undeclared-length uploads at a time. A reservation is capped at the whole budget: a budget smaller than one upload admits uploads one at a time and is exceeded by that upload. Both must be non-zero. |
 | `SPACE_DATA_PLANE_UPLOAD_ADMISSION_WAIT_MS` | 2000 | How long an upload waits for a slot and its bytes before the 429. |
+| `SPACE_DATA_PLANE_SHUTDOWN_GRACE_SECS` | unset | Data plane: how long live streams keep running after SIGTERM before they're cancelled. Unset, they run until they end or the termination grace period kills the process; a second stop signal ends the drain either way, without waiting for a `Process.Start` that's still opening. Keep it plus 5 seconds within the pod's termination grace period minus its preStop delay. Values under 8 seconds, the stream-open budget, are rejected, so an ECW `Process.Start` already opening at SIGTERM can report itself. See [architecture](architecture.md) for what each stream kind sees. |
 
 ## Templates and builds
 

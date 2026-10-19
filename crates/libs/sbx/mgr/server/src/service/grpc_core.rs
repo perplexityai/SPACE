@@ -249,6 +249,18 @@ impl SandboxManagerService {
             let template = &req.template;
             let runtime = &req.runtime;
 
+            use pplx_space_common_svc::template_lookup::TemplateLookupScope;
+            let mut scope = template_lookup_scope(&sandbox_owner, req.sandbox_id.as_deref())?;
+            if peer.principal() == UdsPeerPrincipal::Service(user_names::SPACE_NODEAPI) {
+                scope = match (scope, TemplateLookupScope::from_request(&request)?) {
+                    (TemplateLookupScope::Sandbox { id, .. }, Some(TemplateLookupScope::Node(address))) =>
+                        TemplateLookupScope::Sandbox { id, caller_node: Some(address) },
+                    (scope @ TemplateLookupScope::Sandbox { .. }, Some(TemplateLookupScope::Cluster)) => scope,
+                    (_, Some(scope @ (TemplateLookupScope::Node(_) | TemplateLookupScope::Cluster))) => scope,
+                    _ => return Err(Status::permission_denied("remote create requires template caller scope")),
+                };
+            }
+
             // Resolve template to content-addressed paths via template-manager.
             // If caller pinned a content_hash, use it; otherwise resolve newest.
             let mut resolved_template = resolve_template_paths(
@@ -258,6 +270,7 @@ impl SandboxManagerService {
                     content_hash: req.content_hash.clone(),
                     tag: None,
                 },
+                scope,
             )
             .await?;
             if let Some(definition) = &verified {

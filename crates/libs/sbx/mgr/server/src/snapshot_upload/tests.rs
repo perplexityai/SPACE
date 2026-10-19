@@ -534,11 +534,42 @@ fn new_payload_round_trips_metadata_job_flag() {
         )),
         includes_metadata_job: true,
         deferred_metadata: false,
+        execution_generation: None,
     };
     let round: SnapshotUploadJobs =
         serde_json::from_str(&serde_json::to_string(&jobs).unwrap()).unwrap();
     assert!(round.includes_metadata_job);
     assert_eq!(round.metadata_staging_dir, jobs.metadata_staging_dir);
+}
+
+/// The teardown fence's generation survives a worker restart, and a payload
+/// persisted before the field existed reads back unfenced.
+#[test]
+fn payload_round_trips_execution_generation() {
+    let generation = pplx_space_common_core::types::ExecutionGeneration::new(7).unwrap();
+    let jobs = SnapshotUploadJobs {
+        meta: fixture_meta(None),
+        snapshot_id: "snap-1".to_string(),
+        snapshot_dir: std::path::PathBuf::from("/space/cache/sbx/snapshot"),
+        config: fixture_config(),
+        storage_uri: "s3://b/x".to_string(),
+        job_ids: Vec::new(),
+        metadata_staging_dir: None,
+        includes_metadata_job: true,
+        deferred_metadata: false,
+        execution_generation: Some(generation),
+    };
+    let encoded = serde_json::to_value(&jobs).unwrap();
+    let round: SnapshotUploadJobs = serde_json::from_value(encoded.clone()).unwrap();
+    assert_eq!(round.execution_generation, Some(generation));
+
+    let mut legacy = encoded;
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("execution_generation");
+    let legacy: SnapshotUploadJobs = serde_json::from_value(legacy).unwrap();
+    assert_eq!(legacy.execution_generation, None);
 }
 
 #[test]
@@ -560,6 +591,7 @@ fn cleanup_metadata_staging_dir_removes_only_owned_staging_dir() {
         metadata_staging_dir: Some(staging_dir.clone()),
         includes_metadata_job: true,
         deferred_metadata: false,
+        execution_generation: None,
     };
 
     cleanup_metadata_staging_dir(&jobs);

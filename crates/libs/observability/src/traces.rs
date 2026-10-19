@@ -3,6 +3,8 @@ use crate::selection::Selection;
 use std::{fmt, str::FromStr};
 
 #[cfg(feature = "otel")]
+mod failed_unsampled;
+#[cfg(feature = "otel")]
 mod operation_names;
 #[cfg(feature = "otel")]
 mod origin_sampling;
@@ -204,12 +206,14 @@ fn build_otlp_provider(
         .map_err(TraceInitError::Exporter)?;
     // The upstream builder honors OTEL_BSP_*; the sampler keeps the one
     // OTEL_TRACES_SAMPLER selects for every span that does not follow an
-    // origin.
+    // origin or an untraced caller.
+    let batch = opentelemetry_sdk::trace::BatchSpanProcessor::builder(
+        status_messages::StatusMessages::new(operation_names::OperationNames::new(exporter)),
+    )
+    .build();
     Ok(SdkTracerProvider::builder()
         .with_sampler(origin_sampling::FollowOrigin::from_env())
-        .with_batch_exporter(status_messages::StatusMessages::new(
-            operation_names::OperationNames::new(exporter),
-        ))
+        .with_span_processor(failed_unsampled::FailedUnsampled(batch))
         .with_resource(identity.trace_resource())
         .build())
 }

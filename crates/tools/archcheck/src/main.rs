@@ -13,7 +13,7 @@ use std::{
 };
 
 use pplx_space_archcheck::{
-    BASELINE_FILE, Baseline, Context, LoadError, WriteBaselineError, check,
+    BASELINE_FILE, Baseline, Context, LoadError, Renames, WriteBaselineError, check,
     config::CrateNamesPolicy,
     context::find_workspace_root,
     report::{Format, UnknownFormatError, render, summary},
@@ -23,7 +23,8 @@ use thiserror::Error;
 
 const USAGE: &str = "\
 usage: archcheck [--root <path>] [--format human|rdjson]
-                 [--base-baseline <path>] [--base-architecture <path>]
+                 [--base-baseline <path> [--renames <path>]]
+                 [--base-architecture <path>]
        archcheck [--root <path>] --write-baseline[=<table>]
 
   --root <path>       repository root (default: the Cargo workspace containing
@@ -36,6 +37,10 @@ usage: archcheck [--root <path>] [--format human|rdjson]
                       without it) and crate_names.no_new (limited to the
                       crates listed when it was added without it) compare
                       with
+  --renames <path>    the output of git diff -z --name-status --find-renames
+                      <base> HEAD: an entry for a file renamed from one the
+                      base baseline lists is compared with that entry, not
+                      counted as new (without it, it is)
   --base-architecture <path>
                       the base branch's ARCHITECTURE.toml, which
                       crate_names.policy_changed compares with (skipped
@@ -64,6 +69,8 @@ enum UsageError {
     WriteBaselineTable(String),
     #[error("{0} cannot be combined with --write-baseline")]
     BaseWithWriteBaseline(&'static str),
+    #[error("--renames needs --base-baseline, whose entries it pairs renamed files with")]
+    RenamesWithoutBase,
     #[error(transparent)]
     Format(#[from] UnknownFormatError),
 }
@@ -86,6 +93,7 @@ struct Options {
     root: Option<PathBuf>,
     format: Format,
     base_baseline: Option<PathBuf>,
+    renames: Option<PathBuf>,
     base_architecture: Option<PathBuf>,
     write_baseline: Option<WriteBaseline>,
 }
@@ -176,6 +184,9 @@ fn run(options: Options) -> Result<ExitCode, RunError> {
     if let Some(path) = &options.base_baseline {
         ctx.base_baseline = Baseline::load_base(path)?;
     }
+    if let Some(path) = &options.renames {
+        ctx.renames = Some(Renames::load(path)?);
+    }
     if let Some(path) = &options.base_architecture {
         ctx.base_architecture = CrateNamesPolicy::load_base(path)?;
     }
@@ -221,6 +232,7 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Option<Options>, U
         root: None,
         format: Format::Human,
         base_baseline: None,
+        renames: None,
         base_architecture: None,
         write_baseline: None,
     };
@@ -244,6 +256,7 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Option<Options>, U
             "--root" => options.root = Some(PathBuf::from(value()?)),
             "--format" => options.format = value()?.parse()?,
             "--base-baseline" => options.base_baseline = Some(PathBuf::from(value()?)),
+            "--renames" => options.renames = Some(PathBuf::from(value()?)),
             "--base-architecture" => options.base_architecture = Some(PathBuf::from(value()?)),
             // A table is only ever given after `=`, so a following argument
             // is never taken as one; after a bare `--write-baseline`, the
@@ -265,9 +278,15 @@ fn parse_args(args: impl Iterator<Item = OsString>) -> Result<Option<Options>, U
         if options.base_baseline.is_some() {
             return Err(UsageError::BaseWithWriteBaseline("--base-baseline"));
         }
+        if options.renames.is_some() {
+            return Err(UsageError::BaseWithWriteBaseline("--renames"));
+        }
         if options.base_architecture.is_some() {
             return Err(UsageError::BaseWithWriteBaseline("--base-architecture"));
         }
+    }
+    if options.renames.is_some() && options.base_baseline.is_none() {
+        return Err(UsageError::RenamesWithoutBase);
     }
     Ok(Some(options))
 }

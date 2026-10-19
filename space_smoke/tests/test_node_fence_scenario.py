@@ -14,6 +14,7 @@ ServiceAccount calls with a token-only kubeconfig.
 from __future__ import annotations
 
 import json
+import re
 import unittest
 from types import SimpleNamespace
 from typing import Any, cast
@@ -23,9 +24,12 @@ from space_smoke.capabilities import FencePolicy, NodeCtlIdentity, SaWriteOutcom
 from space_smoke.node_fence import (
     BOUNDARY_LABEL,
     FOREIGN_CAPACITY_RESOURCE,
+    HOST_CPU_FIELD_MANAGER,
+    HOST_CPU_LABEL,
     OWNED_LABEL,
     PROBE_CONDITION_REASON,
     PROBE_FINALIZER,
+    PROBE_HOST_CPU,
     RULE_LABELS,
     RULE_OWN_NODE,
     SLOTS_RESOURCE,
@@ -36,6 +40,8 @@ from space_smoke.node_fence import (
     slots_repair_action,
 )
 from space_smoke.runtime import CommandResult, InvariantViolation, ResourceScope
+
+NODE_CTL_HOST_CPU = "genuineintel-6-85-7"
 
 SID = "01a0b0c9-b8a3-7473-9c12-3821a701bc28"
 POLICY = "space-node-ctl-node-fence"
@@ -62,10 +68,10 @@ class Pure(unittest.TestCase):
         self.assertEqual(residue(clean), [])
         dirty = {
             "spec": {"unschedulable": True, "taints": [{"key": "space.pplx.net/dedicated-org"}]},
-            "metadata": {"labels": {BOUNDARY_LABEL: "x"}, "finalizers": [PROBE_FINALIZER]},
+            "metadata": {"labels": {BOUNDARY_LABEL: "x", HOST_CPU_LABEL: PROBE_HOST_CPU}, "finalizers": [PROBE_FINALIZER]},
             "status": {"conditions": [{"reason": PROBE_CONDITION_REASON}], "allocatable": {FOREIGN_CAPACITY_RESOURCE: "8"}},
         }
-        self.assertEqual(len(residue(dirty)), 6)
+        self.assertEqual(len(residue(dirty)), 7)
 
     def test_slots_repair_is_keyed_on_the_strip_and_on_absence(self) -> None:
         self.assertEqual(slots_repair_action(armed=True, live=None), "restore")
@@ -92,7 +98,10 @@ class _Fixture:
 
 def _node(name: str, *, labels: dict[str, str] | None = None, capacity: dict[str, str] | None = None) -> dict[str, Any]:
     return {
-        "metadata": {"name": name, "labels": labels if labels is not None else {OWNED_LABEL: "2", "kubernetes.io/os": "linux"}},
+        "metadata": {
+            "name": name,
+            "labels": labels if labels is not None else {OWNED_LABEL: "2", HOST_CPU_LABEL: NODE_CTL_HOST_CPU, "kubernetes.io/os": "linux"},
+        },
         "spec": {},
         "status": {"capacity": capacity if capacity is not None else {SLOTS_RESOURCE: "7"}, "conditions": [{"type": "Ready", "status": "True"}]},
     }
@@ -173,6 +182,11 @@ class _Control:
             self.nodes[OWN]["metadata"]["labels"]["space.pplx.net/template-build-smoke-fence-probe"] = "true"
         elif field_manager == "space-node-ctl-fence-smoke":
             self.nodes[OWN]["metadata"]["labels"].pop("space.pplx.net/template-build-smoke-fence-probe", None)
+        elif field_manager == HOST_CPU_FIELD_MANAGER:
+            labels = self.nodes[OWN]["metadata"]["labels"]
+            match = re.search(rf'{re.escape(HOST_CPU_LABEL)}: "([^"]*)"', manifest)
+            assert match, manifest
+            labels[HOST_CPU_LABEL] = match.group(1)
         if subresource == "status":
             self.nodes[OWN]["status"]["capacity"][SLOTS_RESOURCE] = "7"
         return SaWriteOutcome(0, "applied")
@@ -375,11 +389,61 @@ class Permissive(unittest.TestCase):
     def test_owned_writes_pass_and_the_slots_strip_is_armed_before_the_apply(self) -> None:
         fixture, fence, _, control = _through_credential()
         fence.expect_owned_writes_succeed()
-        self.assertEqual(len(fixture.records["owned_writes"]), 5)
+        self.assertEqual(len(fixture.records["owned_writes"]), 7)
         strip = control.calls.index(f"strip:{OWN}:{SLOTS_RESOURCE}")
         apply_status = control.calls.index("sa-apply:space-node-ctl-network-slots:status")
         self.assertLess(strip, apply_status)
         self.assertEqual(control.nodes[OWN]["status"]["capacity"][SLOTS_RESOURCE], "7")
+
+    def test_the_host_cpu_replay_changes_the_label_and_puts_back_what_node_ctl_had(self) -> None:
+        control = _Control()
+        seen: list[str | None] = []
+        original = control.apply_as
+
+        def record(kubeconfig, manifest, *, field_manager, subresource=None):
+            outcome = original(kubeconfig, manifest, field_manager=field_manager, subresource=subresource)
+            if field_manager == HOST_CPU_FIELD_MANAGER:
+                seen.append(control.nodes[OWN]["metadata"]["labels"].get(HOST_CPU_LABEL))
+            return outcome
+
+        control.apply_as = record  # type: ignore[method-assign]
+        _, fence, _, _ = _through_credential(control)
+        fence.expect_owned_writes_succeed()
+        self.assertEqual(seen, [PROBE_HOST_CPU, NODE_CTL_HOST_CPU])
+
+    def test_an_unlabeled_node_fails_before_the_host_cpu_replay(self) -> None:
+        control = _Control()
+        del control.nodes[OWN]["metadata"]["labels"][HOST_CPU_LABEL]
+        _, fence, _, control = _through_credential(control)
+        with self.assertRaisesRegex(InvariantViolation, "no host-cpu label to begin with"):
+            fence.expect_owned_writes_succeed()
+        self.assertNotIn(f"sa-apply:{HOST_CPU_FIELD_MANAGER}:node", control.calls)
+
+    def test_a_leftover_probe_value_fails_before_the_host_cpu_replay(self) -> None:
+        control = _Control()
+        control.nodes[OWN]["metadata"]["labels"][HOST_CPU_LABEL] = PROBE_HOST_CPU
+        _, fence, _, control = _through_credential(control)
+        with self.assertRaisesRegex(InvariantViolation, "earlier run's probe value"):
+            fence.expect_owned_writes_succeed()
+        self.assertNotIn(f"sa-apply:{HOST_CPU_FIELD_MANAGER}:node", control.calls)
+
+    def test_a_lost_host_cpu_restore_fails_by_name(self) -> None:
+        control = _Control()
+        original = control.apply_as
+        calls = 0
+
+        def drop_the_restore(kubeconfig, manifest, *, field_manager, subresource=None):
+            nonlocal calls
+            if field_manager == HOST_CPU_FIELD_MANAGER:
+                calls += 1
+                if calls == 2:
+                    return SaWriteOutcome(0, "applied")
+            return original(kubeconfig, manifest, field_manager=field_manager, subresource=subresource)
+
+        control.apply_as = drop_the_restore  # type: ignore[method-assign]
+        _, fence, _, _ = _through_credential(control)
+        with self.assertRaisesRegex(InvariantViolation, "host-cpu label was not restored"):
+            fence.expect_owned_writes_succeed()
 
     def test_a_refused_owned_write_fails_by_name(self) -> None:
         control = _Control()
@@ -449,9 +513,11 @@ class _ScriptedKubectl:
     def __init__(self, results) -> None:
         self.results = list(results)
         self.calls: list[tuple[str, ...]] = []
+        self.inputs: list[str | None] = []
 
-    def run(self, command, **_options) -> CommandResult:
+    def run(self, command, *, input_text=None, **_options) -> CommandResult:
         self.calls.append(tuple(command))
+        self.inputs.append(input_text)
         return self.results.pop(0)
 
 
@@ -510,6 +576,28 @@ class HarnessOps(unittest.TestCase):
                 f"removing forged status.allocatable[{FOREIGN_CAPACITY_RESOURCE}]",
             ]),
         )
+
+    def test_revert_from_snapshot_restores_a_lost_host_cpu_restore(self) -> None:
+        snapshot = _node(OWN)
+        live = json.loads(json.dumps(snapshot))
+        live["metadata"]["labels"][HOST_CPU_LABEL] = PROBE_HOST_CPU
+        results = [CommandResult(ARGV, 0, json.dumps(live), "")] + [CommandResult(ARGV, 0, "", "")] * 20
+        kubectl = _ScriptedKubectl(results)
+        repairs = KindHarness(kubectl, KindConfig()).revert_node_from_snapshot(OWN, snapshot)
+        self.assertEqual(repairs, ["restoring the host-cpu label"])
+        restore = [call for call in kubectl.calls if f"--field-manager={HOST_CPU_FIELD_MANAGER}" in call]
+        self.assertEqual(len(restore), 1)
+        self.assertIn("--server-side", restore[0])
+        self.assertIn(f'{HOST_CPU_LABEL}: "{NODE_CTL_HOST_CPU}"', kubectl.inputs[kubectl.calls.index(restore[0])])
+
+    def test_revert_from_snapshot_leaves_node_ctls_host_cpu_label_alone(self) -> None:
+        snapshot = _node(OWN)
+        live = json.loads(json.dumps(snapshot))
+        results = [CommandResult(ARGV, 0, json.dumps(live), "")] + [CommandResult(ARGV, 0, "", "")] * 20
+        kubectl = _ScriptedKubectl(results)
+        KindHarness(kubectl, KindConfig()).revert_node_from_snapshot(OWN, snapshot)
+        self.assertFalse(any(HOST_CPU_LABEL in arg for call in kubectl.calls for arg in call))
+        self.assertFalse(any(HOST_CPU_LABEL in (text or "") for text in kubectl.inputs))
 
 
 if __name__ == "__main__":

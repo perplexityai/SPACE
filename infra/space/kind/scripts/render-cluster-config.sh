@@ -19,7 +19,9 @@
 # bind-mount source is an empty directory rather than an error. Once that
 # passes, it makes the SPACE Kind node image the config names available locally
 # (`kind-node-image.sh ensure`: local, else GHCR, else a local build), so
-# `kind create` never falls back to pulling a tag that was never published.
+# `kind create` never falls back to pulling a tag that was never published,
+# and copies the add-on images each node image preloads into the containerd
+# directories that are still empty (`seed-node-containerd.sh`).
 #
 # `bootstrap.sh` and the smoke suites' `scripts/tests/lib/bootstrap-kind-stack.sh`
 # source the library themselves and do not need this wrapper.
@@ -70,6 +72,8 @@ kind_render_cluster_config "$SCRIPT_DIR/../kind-cluster.yaml.tmpl" "$run_config"
 kind_prepare_host_mounts "$run_config"
 # The reference the render used, made present. stdout is reserved for the path.
 bash "$SCRIPT_DIR/kind-node-image.sh" ensure >/dev/null
+# And the add-on images that reference preloads, in its empty containerd dirs.
+bash "$SCRIPT_DIR/seed-node-containerd.sh" "$run_config"
 # Published only once it has verified, so an operator reusing the documented
 # path from their scrollback never picks up a render that failed its preflight.
 cp -f "$run_config" "$staged"

@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::{JobId, LocalArtifactId};
+use pplx_space_common_core::types::{JobId, LinuxPid, LocalArtifactId};
 
 use super::cleanup_executor::CleanupWait;
 use super::cleanup_support::{
@@ -924,7 +924,11 @@ impl SandboxManagerService {
             .await
             .map_err(|_| Status::unavailable("cleanup storage closed"))?;
         let service = self.clone();
+        // The caller's span, so the admission's events and the cleanup job it
+        // persists belong to the caller's trace, as `run_blocking_io`'s do.
+        let span = tracing::Span::current();
         let result = tokio::task::spawn_blocking(move || {
+            let _entered = span.enter();
             let _permit = permit;
             let _writer = service.state_writer_lease("CleanupAdmission")?;
             // Ownership travels with the transaction if its caller disappears.
@@ -1579,6 +1583,7 @@ impl SandboxManagerService {
         &self,
         sandbox_id: &str,
         probe_net_gateway: bool,
+        gateway_pid: Option<u32>,
         fallback_tx_bytes: u64,
         fallback_rx_bytes: u64,
     ) -> NetGatewayStatsSnapshot {
@@ -1587,8 +1592,17 @@ impl SandboxManagerService {
             return fallback;
         }
 
+        // A sandbox row's id is the UUID create assigned; one that does not
+        // parse fails the probe as an absent gateway socket would.
+        let kept_gateway = sandbox_id.parse::<SandboxId>().map(|id| {
+            (
+                id,
+                gateway_pid.and_then(|pid| LinuxPid::try_from_u32(pid).ok()),
+            )
+        });
         let result = tokio::time::timeout(NET_GATEWAY_FOREGROUND_STATS_TIMEOUT, async {
-            let mut client = pplx_space_net_gateway_client::connect(sandbox_id)
+            let (id, gateway_pid) = kept_gateway.clone().map_err(|error| error.to_string())?;
+            let mut client = crate::net_gateway_clients::client(id, gateway_pid)
                 .await
                 .map_err(|error| error.to_string())?;
             client
@@ -1598,6 +1612,11 @@ impl SandboxManagerService {
                 .map_err(|error| error.to_string())
         })
         .await;
+        if !matches!(result, Ok(Ok(_)))
+            && let Ok((id, gateway_pid)) = kept_gateway
+        {
+            crate::net_gateway_clients::discard(id, gateway_pid);
+        }
 
         let stats = match result {
             Ok(Ok(stats)) => stats,

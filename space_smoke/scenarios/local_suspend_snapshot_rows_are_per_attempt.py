@@ -22,6 +22,8 @@ MARKER_B = "space-smoke-per-attempt-v2"
 # hold deterministically and they are what is asserted.
 @smoke.scenario(
     "local.suspend_snapshot_rows_are_per_attempt",
+    # The codec is read from the snapshot's objects through the AWS CLI.
+    required_tools=("aws",),
     sandbox=smoke.SandboxConfig(timeout=900),
 )
 def suspend_snapshot_rows_are_per_attempt(test: smoke.KindEcw) -> None:
@@ -35,9 +37,8 @@ def suspend_snapshot_rows_are_per_attempt(test: smoke.KindEcw) -> None:
     with test.phase("write v1 state and suspend"):
         written = test.run_command_when_ready(f"printf %s {MARKER_A} > {shlex.quote(PATH)}")
         test.verify(written.exit_code == 0, "failed to write v1 state", command_stderr=written.stderr)
-        first_suspend = codec.mark_since()
         test.pause()
-        codec.expect_suspend_codec(since_time=first_suspend)
+        codec.expect_suspend_codec()
 
     with test.phase("v1 reaches ready with an id-named storage prefix and a size"):
         rows = codec.wait_for_ready_snapshots(1)
@@ -55,9 +56,8 @@ def suspend_snapshot_rows_are_per_attempt(test: smoke.KindEcw) -> None:
         test.reconnect_by_id()
         written = test.run_command_when_ready(f"printf %s {MARKER_B} > {shlex.quote(PATH)}")
         test.verify(written.exit_code == 0, "failed to write v2 state", command_stderr=written.stderr)
-        second_suspend = codec.mark_since()
         test.pause()
-        codec.expect_suspend_codec(since_time=second_suspend)
+        codec.expect_suspend_codec()
 
     with test.phase("v2 is its own ready row and prefix; v1 is untouched"):
         facts = codec.wait_for_ready_snapshots(2)

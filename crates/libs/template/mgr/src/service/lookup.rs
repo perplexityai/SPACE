@@ -1,4 +1,5 @@
 use pplx_space_common_core::types::OrgId;
+use pplx_space_common_svc::template_lookup::TemplateLookupScope;
 
 use super::*;
 
@@ -17,16 +18,32 @@ impl TemplateManagerService {
         &self,
         request: Request<crate::proto::GetTemplateRequest>,
     ) -> Result<Response<crate::proto::GetTemplateResponse>, Status> {
-        self.get_template_resolving(
-            request,
-            crate::volume::find_release_inner,
-            async |name, release| {
-                self.volume_puller
-                    .materialize_release(Arc::clone(&self.db), name, release)
-                    .await
-            },
-        )
-        .await
+        let scope = TemplateLookupScope::from_request(&request)?;
+        let mut response = self
+            .get_template_resolving(
+                request,
+                async |name, hash, tag, org| {
+                    // Local cache authority is not a catalog delegation. Online
+                    // resolution still uses this service's authenticated catalog scope.
+                    let catalog_scope = match scope {
+                        Some(TemplateLookupScope::LocalExecution) => {
+                            Some(TemplateLookupScope::Cluster)
+                        }
+                        scope => scope,
+                    };
+                    crate::volume::find_release_in_scope(name, hash, tag, org, catalog_scope).await
+                },
+                async |spec, resolve_elapsed, release| {
+                    self.volume_puller
+                        .materialize_release(Arc::clone(&self.db), spec, resolve_elapsed, release)
+                        .await
+                },
+            )
+            .await?;
+        if let Some(scope) = scope {
+            scope.acknowledge(&mut response);
+        }
+        Ok(response)
     }
 
     pub(super) async fn get_template_resolving(
@@ -42,11 +59,44 @@ impl TemplateManagerService {
             crate::volume::FindReleaseError,
         >,
         materialize: impl AsyncFnOnce(
-            &str,
+            crate::volume::PullSpec<'_>,
+            std::time::Duration,
             crate::volume::ResolvedRelease,
         ) -> crate::volume::PullOutcome,
     ) -> Result<Response<crate::proto::GetTemplateResponse>, Status> {
-        self.authorize_peer(&request, "GetTemplate", ALLOW_TEMPLATE_OBSERVER)?;
+        let peer = self.authorize_peer(&request, "GetTemplate", ALLOW_TEMPLATE_OBSERVER)?;
+        let scope = TemplateLookupScope::from_request(&request)?;
+        let local_execution = match (scope, peer.principal()) {
+            (
+                Some(TemplateLookupScope::Cluster | TemplateLookupScope::Node(_)),
+                UdsPeerPrincipal::Root
+                | UdsPeerPrincipal::Service(SPACE_NODEAPI_ACCOUNT | SPACE_SBXMGR_ACCOUNT),
+            ) => false,
+            (
+                Some(TemplateLookupScope::Sandbox { .. }),
+                UdsPeerPrincipal::Root | UdsPeerPrincipal::Service(SPACE_SBXMGR_ACCOUNT),
+            ) => false,
+            (
+                Some(TemplateLookupScope::LocalExecution),
+                UdsPeerPrincipal::Root | UdsPeerPrincipal::Service(SPACE_SBXMGR_ACCOUNT),
+            ) => true,
+            (
+                None,
+                UdsPeerPrincipal::Root
+                | UdsPeerPrincipal::Role(LocalRole::Admin | LocalRole::Operator),
+            ) => true,
+            (None, UdsPeerPrincipal::Service(SPACE_NODEAPI_ACCOUNT)) => {
+                return Err(Status::permission_denied(
+                    "forwarded template lookup requires caller scope",
+                ));
+            }
+            (None, _) => false,
+            _ => {
+                return Err(Status::permission_denied(
+                    "peer cannot delegate template lookup scope",
+                ));
+            }
+        };
         let req = request.get_ref();
         let tmpl_ref = req
             .template
@@ -68,9 +118,16 @@ impl TemplateManagerService {
             .map(str::parse::<OrgId>)
             .transpose()
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        // Explicit tags need authoritative resolution even on cache hits. Trusted
-        // name-only policy refreshes and exact-digest reads can still work offline.
-        let release = if caller_org.is_some() || (req_hash.is_empty() && !req_tag.is_empty()) {
+        // Request metrics (cache, fetch-error, and pull) are tagged with the
+        // caller's selector, not the resolved hash that replaces `req_hash`
+        // below.
+        let requested_hash = req_hash.clone();
+        let resolve_started = std::time::Instant::now();
+        // Only authenticated local execution may use unpublished/offline cache entries.
+        let release = if !local_execution
+            || caller_org.is_some()
+            || (req_hash.is_empty() && !req_tag.is_empty())
+        {
             Some(
                 resolve(template_id, &req_hash, &req_tag, caller_org)
                     .await
@@ -92,6 +149,8 @@ impl TemplateManagerService {
         } else {
             None
         };
+        let resolve_elapsed = resolve_started.elapsed();
+        let authorized_org = release.as_ref().and_then(|release| release.authorized_org);
         let req_hash = release
             .as_ref()
             .map(|release| release.hash.clone())
@@ -165,7 +224,7 @@ impl TemplateManagerService {
         } else {
             None
         };
-        let cache_tags = get_template_metric_tags(template_id, &req_hash, &req_tag);
+        let cache_tags = get_template_metric_tags(template_id, &requested_hash, &req_tag);
 
         // First attempt: local-only lookup.
         match build_get_template_response(
@@ -180,7 +239,7 @@ impl TemplateManagerService {
         .await
         {
             Ok(mut resp) => {
-                resp.authorized_org_id = caller_org.map(|org| org.to_string());
+                resp.authorized_org_id = authorized_org.map(|org| org.to_string());
                 pplx_space_metrics::template::get_cache_hit(&cache_tags);
                 if snapshot_selector.is_none() && resp.snapshot_dir.is_none() {
                     self.spawn_desired_base_snapshot_reconcile(
@@ -196,7 +255,7 @@ impl TemplateManagerService {
                 } else {
                     "local_db_error"
                 };
-                record_fetch_error(template_id, &req_hash, &req_tag, reason);
+                record_fetch_error(template_id, &requested_hash, &req_tag, reason);
                 return Err(status);
             }
             Err(_) => {
@@ -205,7 +264,15 @@ impl TemplateManagerService {
         }
 
         let outcome = match release {
-            Some(release) => materialize(template_id, release).await,
+            Some(release) => {
+                let spec = crate::volume::PullSpec {
+                    name: template_id,
+                    req_hash: &requested_hash,
+                    req_tag: &req_tag,
+                    trigger: crate::volume::PullTrigger::OnDemand,
+                };
+                materialize(spec, resolve_elapsed, release).await
+            }
             None => {
                 self.volume_puller
                     .pull(
@@ -221,7 +288,7 @@ impl TemplateManagerService {
         match outcome {
             crate::volume::PullOutcome::Materialized => {
                 let template_id_owned = template_id.clone();
-                let req_hash_for_err = req_hash.clone();
+                let req_hash_for_err = requested_hash.clone();
                 let req_tag_for_err = req_tag.clone();
                 build_get_template_response(
                     self.artifact_store.root.clone(),
@@ -242,7 +309,7 @@ impl TemplateManagerService {
                     }
                 })
                 .map(|mut response| {
-                    response.authorized_org_id = caller_org.map(|org| org.to_string());
+                    response.authorized_org_id = authorized_org.map(|org| org.to_string());
                     Response::new(response)
                 })
                 .inspect_err(|_| {
@@ -255,7 +322,12 @@ impl TemplateManagerService {
                 })
             }
             crate::volume::PullOutcome::ClassifiedFailure(failure) => {
-                record_fetch_error(template_id, &req_hash, &req_tag, failure.metric_reason());
+                record_fetch_error(
+                    template_id,
+                    &requested_hash,
+                    &req_tag,
+                    failure.metric_reason(),
+                );
                 let code = pull_failure_code(failure);
                 let lookup = describe_lookup(&req_hash, &req_tag);
                 let message = if code == tonic::Code::NotFound {
@@ -266,15 +338,20 @@ impl TemplateManagerService {
                 Err(Status::new(code, message))
             }
             crate::volume::PullOutcome::Retryable(status) => {
-                record_fetch_error(template_id, &req_hash, &req_tag, "resource_exhausted");
+                record_fetch_error(template_id, &requested_hash, &req_tag, "resource_exhausted");
                 Err(status)
             }
             crate::volume::PullOutcome::DownstreamFailure { failure, status } => {
-                record_fetch_error(template_id, &req_hash, &req_tag, failure.metric_reason());
+                record_fetch_error(
+                    template_id,
+                    &requested_hash,
+                    &req_tag,
+                    failure.metric_reason(),
+                );
                 Err(status)
             }
             crate::volume::PullOutcome::HashMismatch(status) => {
-                record_fetch_error(template_id, &req_hash, &req_tag, "hash_mismatch");
+                record_fetch_error(template_id, &requested_hash, &req_tag, "hash_mismatch");
                 Err(status)
             }
         }

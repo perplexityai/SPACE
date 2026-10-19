@@ -197,7 +197,7 @@ fn command_output_with_budget(
     stdin: &[u8],
     budget: std::time::Duration,
 ) -> io::Result<Output> {
-    let mut command = Command::new("ip");
+    let mut command = crate::host_command::Command::new("ip");
     command.args(["netns", "exec", ns, program]).args(args);
     crate::host_command::output(&mut command, budget, stdin)
 }

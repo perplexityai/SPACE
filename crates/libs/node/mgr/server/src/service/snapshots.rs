@@ -1,3 +1,5 @@
+mod environment;
+
 use super::cleanup_helpers::*;
 use super::disk::*;
 use super::node_disk_metrics::SandboxDiskUsageLookup;
@@ -278,6 +280,8 @@ impl NodeManagerService {
         request: Request<CreateSnapshotRequest>,
     ) -> Result<Response<CreateSnapshotResponse>, Status> {
         self.authorize_peer(&request, "CreateSnapshot", ALLOW_NODE_ADMIN_OR_SBXMGR)?;
+        let mut request = request;
+        let selected_environment = environment::normalize(request.get_mut())?;
         validate_sandbox_id(&request.get_ref().sandbox_id)?;
         let sandbox_id = request.get_ref().sandbox_id.clone();
         let service = self.clone();
@@ -290,6 +294,33 @@ impl NodeManagerService {
                 request.get_ref().execution_fence.as_ref(),
                 false,
             )?;
+            // Reject malformed paths before any metadata IO, as on legacy nodes.
+            let req = request.get_ref();
+            if let Some(mount) = req
+                .snapshot_volume_mount_dir
+                .as_deref()
+                .filter(|path| !path.is_empty())
+            {
+                trusted_paths::validate_snapshot_volume(&req.sandbox_id, mount)?;
+            } else {
+                crate::runtime_paths::RuntimePaths::firecracker().create_snapshot_paths(
+                    &req.sandbox_id,
+                    &req.snapshot_path,
+                    &req.mem_file_path,
+                    req.dest_dir.as_deref().filter(|path| !path.is_empty()),
+                )?;
+            }
+            if service
+                .pool
+                .get(&req.sandbox_id)
+                .map_err(slot_store_status)?
+                .is_none()
+            {
+                return Err(Status::unavailable("snapshot lease is no longer active"));
+            }
+            service
+                .verify_snapshot_environment(req.sandbox_id.clone(), selected_environment)
+                .await?;
             service.create_snapshot_inner(request).await
         })
         .await

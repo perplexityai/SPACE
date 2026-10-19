@@ -83,7 +83,7 @@ pub enum NetworkPolicyValidationError {
     InvalidNetworkCredentialHeaderName,
     #[error("network-credential header name '{0}' is reserved")]
     ReservedNetworkCredentialHeaderName(String),
-    #[error("network-credential supported_http_methods must contain GET or POST")]
+    #[error("network-credential supported_http_methods must contain GET, POST or HEAD")]
     InvalidNetworkCredentialHttpMethods,
 }
 
@@ -606,6 +606,7 @@ pub struct NetworkCredentialDestinationV1 {
 pub enum NetworkCredentialHttpMethodV1 {
     Get,
     Post,
+    Head,
 }
 
 impl NetworkCredentialHttpMethodV1 {
@@ -613,6 +614,7 @@ impl NetworkCredentialHttpMethodV1 {
         match self {
             Self::Get => "GET",
             Self::Post => "POST",
+            Self::Head => "HEAD",
         }
     }
 
@@ -621,6 +623,8 @@ impl NetworkCredentialHttpMethodV1 {
             Some(Self::Get)
         } else if method == http::Method::POST {
             Some(Self::Post)
+        } else if method == http::Method::HEAD {
+            Some(Self::Head)
         } else {
             None
         }
@@ -640,6 +644,7 @@ impl FromStr for NetworkCredentialHttpMethodV1 {
         match value {
             "GET" => Ok(Self::Get),
             "POST" => Ok(Self::Post),
+            "HEAD" => Ok(Self::Head),
             _ => Err(NetworkPolicyValidationError::InvalidNetworkCredentialHttpMethods),
         }
     }
@@ -1168,6 +1173,9 @@ impl TryFrom<&proto::NetworkCredentialRuleV1> for NetworkCredentialRuleV1 {
                     Ok(proto::NetworkCredentialHttpMethodV1::Post) => {
                         Ok(NetworkCredentialHttpMethodV1::Post)
                     }
+                    Ok(proto::NetworkCredentialHttpMethodV1::Head) => {
+                        Ok(NetworkCredentialHttpMethodV1::Head)
+                    }
                     Ok(proto::NetworkCredentialHttpMethodV1::Unspecified) | Err(_) => {
                         Err(NetworkPolicyValidationError::InvalidNetworkCredentialHttpMethods)
                     }
@@ -1211,6 +1219,9 @@ impl From<&NetworkCredentialRuleV1> for proto::NetworkCredentialRuleV1 {
                         }
                         NetworkCredentialHttpMethodV1::Post => {
                             proto::NetworkCredentialHttpMethodV1::Post
+                        }
+                        NetworkCredentialHttpMethodV1::Head => {
+                            proto::NetworkCredentialHttpMethodV1::Head
                         }
                     }) as i32
                 })

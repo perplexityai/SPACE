@@ -189,13 +189,20 @@ impl RuntimeSupervisorService {
         &self,
         work: impl std::future::Future<Output = Result<T, Status>> + Send + 'static,
     ) -> Result<T, Status> {
+        use tracing::Instrument as _;
         let (permit, ownership) = self.admit_operation().await?;
+        // The handler awaits the work, so it runs in the request's span and
+        // what it logs carries the request's trace, as node-manager's owned
+        // operations do.
         self.operations
-            .spawn(async move {
-                let _ownership = ownership;
-                let _permit = permit;
-                work.await
-            })
+            .spawn(
+                async move {
+                    let _ownership = ownership;
+                    let _permit = permit;
+                    work.await
+                }
+                .in_current_span(),
+            )
             .await
             .map_err(|error| Status::internal(format!("runtime operation task failed: {error}")))?
     }

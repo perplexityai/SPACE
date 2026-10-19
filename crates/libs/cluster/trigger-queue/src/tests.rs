@@ -369,15 +369,23 @@ async fn fetch_targets_requires_live_direct_row_for_space_nodes() -> TestResult 
     )
     .await?;
 
-    let targets = fetch_trigger_targets(
-        &db.pool,
-        &[direct_node_id, missing_direct_node_id, cluster_node_id],
-        None,
-    )
-    .await?;
-    assert_eq!(targets.triggerable.len(), 1);
-    assert_eq!(targets.triggerable[0].id, direct_node_id);
-    assert!(targets.permanently_unavailable.is_empty());
+    // A populated live node inventory never lists Space nodes, so it must not
+    // dead-letter the live Direct worker either.
+    let live_node_names = HashSet::from(["worker-a".to_string()]);
+    for live_node_names in [None, Some(&live_node_names)] {
+        let targets = fetch_trigger_targets(
+            &db.pool,
+            &[direct_node_id, missing_direct_node_id, cluster_node_id],
+            live_node_names,
+        )
+        .await?;
+        assert_eq!(targets.triggerable.len(), 1, "{live_node_names:?}");
+        assert_eq!(targets.triggerable[0].id, direct_node_id);
+        assert!(
+            targets.permanently_unavailable.is_empty(),
+            "{live_node_names:?}"
+        );
+    }
     Ok(())
 }
 

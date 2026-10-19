@@ -18,6 +18,7 @@ SPACE_KIND_LOCAL_IMAGES=(
   space-seed-publish
   space-ui
   space-kind-key-broker
+  space-kind-sts-bridge
 )
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

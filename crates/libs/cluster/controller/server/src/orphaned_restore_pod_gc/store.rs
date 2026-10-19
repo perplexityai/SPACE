@@ -18,14 +18,15 @@ use super::classify::{RowLifecycle, SandboxRestoreState};
 type ClassifyRow = (Uuid, String, String, Option<i64>);
 
 /// Map a raw row's `managed_by` + `lifecycle` to what the classifier may act
-/// on: anything but a Kubernetes-managed row with a known lifecycle is
+/// on: anything but a row with a known lifecycle whose substrate
+/// [restores through pods](SubstrateKind::restores_through_pods) is
 /// [`RowLifecycle::Unrecognized`], which the classifier skips. An unparseable
-/// `managed_by` is not Kubernetes-managed.
+/// `managed_by` does not restore through pods.
 fn row_lifecycle(managed_by: &str, lifecycle: &str) -> RowLifecycle {
-    if !matches!(
-        managed_by.parse::<SubstrateKind>(),
-        Ok(SubstrateKind::Kubernetes)
-    ) {
+    if !managed_by
+        .parse::<SubstrateKind>()
+        .is_ok_and(SubstrateKind::restores_through_pods)
+    {
         return RowLifecycle::Unrecognized;
     }
     lifecycle

@@ -10,6 +10,9 @@ use crate::federated_identity::{
 };
 use pplx_space_common_core::types::PodUid;
 
+#[cfg(feature = "kubernetes")]
+mod kubernetes;
+
 type InsertedPooledSandboxRow = (
     Option<String>,
     UserId,
@@ -496,9 +499,9 @@ fn test_federated_owner(upstream_org_id: &str) -> TestResult<FederatedOwner> {
 
 // Direct is only a placeholder: no test using this depends on substrate behavior.
 fn direct_sandbox_controller(pool: &PgPool) -> SandboxController {
-    SandboxController::new(crate::controllers::substrate::Substrate::Direct(Box::new(
+    SandboxController::new(crate::controllers::substrate::Substrate::from_direct(
         crate::controllers::substrate::direct::DirectSubstrate::new(pool.clone()),
-    )))
+    ))
 }
 
 async fn install_failing_federated_grant_triggers(pool: &PgPool) -> TestResult {

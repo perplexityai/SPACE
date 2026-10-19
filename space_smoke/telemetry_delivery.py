@@ -8,8 +8,9 @@ that cannot write drops, and Alloy's targets are a path glob. A passing
 lifecycle smoke proves none of it, so this reads each backend back for the
 scenario's own sandbox, never for whatever an earlier scenario left behind:
 
-- Tempo holds one trace in which space-api created the sandbox and the shim
-  started it, the shim's spans carrying the sandbox's `sandbox_id`;
+- Tempo holds the shim's create trace for the sandbox, its spans carrying the
+  sandbox's `sandbox_id`, and the space-api trace that created the sandbox,
+  which that create links to: each create attempt roots its own trace;
 - Prometheus holds the shim's create latency from a shim process that started
   after the scenario did, on the node that trace names, and a space-api create
   count that grew after the scenario's start;
@@ -26,6 +27,7 @@ trace is findable no sooner than about 36 s after its spans end.
 
 from __future__ import annotations
 
+import base64
 import time
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
@@ -65,13 +67,16 @@ class TelemetryDeliveryAssertions:
         fixture.record("telemetry_window_start", self._since)
 
     def expect_traces(self) -> None:
-        """One trace has a space-api span and a shim span for this sandbox, and Tempo returns it by ID."""
+        """The shim's create trace for this sandbox links to a space-api trace naming it, and Tempo returns both by ID."""
 
         sandbox_id = self._fixture.sandbox.sandbox_id
-        api_spans = f'{{resource.service.name="{API_SERVICE}"}}'
-        shim_spans = f'{{resource.service.name="{SHIM_SERVICE}" && span.sandbox_id="{sandbox_id}"}}'
+        api_spans = f'{{resource.service.name="{API_SERVICE}" && span.sandbox_id="{sandbox_id}"}}'
+        shim_creates = (
+            f'{{resource.service.name="{SHIM_SERVICE}" && name="shim.create"'
+            f' && span.sandbox_id="{sandbox_id}"}}'
+        )
 
-        def search(query: str) -> list[str]:
+        def search(query: str, limit: int = 5) -> list[str]:
             # The query names this sandbox, so a wider window cannot match
             # another scenario's trace; Tempo rejects one its 30 s cutoff
             # leaves empty.
@@ -82,38 +87,66 @@ class TelemetryDeliveryAssertions:
                     "q": query,
                     "start": str(self._since - TEMPO_SEARCH_CUTOFF_SECONDS),
                     "end": str(int(time.time()) + 60),
-                    "limit": "5",
+                    "limit": str(limit),
                 },
             )
             return [str(trace["traceID"]) for trace in body.get("traces") or ()]
 
-        found = self._poll(lambda: search(f"{api_spans} && {shim_spans}"), bool, budget=TRACE_BUDGET_SECONDS)
+        shim_traces = self._poll(lambda: search(shim_creates), bool, budget=TRACE_BUDGET_SECONDS)
+        self._fixture.record("tempo_shim_trace_ids", shim_traces)
+        self._fixture.verify(
+            bool(shim_traces),
+            f"Tempo found no {SHIM_SERVICE} create trace for {sandbox_id}",
+        )
+        shim_trace = self._trace(shim_traces[0])
+        shim_batches = [attributes for attributes, _ in shim_trace if attributes.get("service.name") == SHIM_SERVICE]
+        # Tempo search may drop a trace ID's leading zeros and fetched spans
+        # spell IDs in base64, so IDs compare as numbers.
+        linked = {
+            int(base64.b64decode(link["traceId"]).hex(), 16)
+            for attributes, spans in shim_trace
+            if attributes.get("service.name") == SHIM_SERVICE
+            for span in spans
+            if span.get("name") == "shim.create"
+            for link in span.get("links") or ()
+        }
+        self._fixture.record("tempo_shim_create_links", sorted(f"{trace:032x}" for trace in linked))
+        self._fixture.verify(
+            bool(shim_batches) and bool(linked),
+            f"Tempo returned trace {shim_traces[0]} without a {SHIM_SERVICE} create that links to its cause",
+        )
+
+        def linked_api_traces() -> list[str]:
+            return [trace for trace in search(api_spans, limit=50) if int(trace, 16) in linked]
+
+        found = self._poll(linked_api_traces, bool, budget=TRACE_BUDGET_SECONDS)
         self._fixture.record("tempo_trace_ids", found)
         self._fixture.verify(
             bool(found),
-            f"Tempo found no trace from {API_SERVICE} to the shim for {sandbox_id}",
-            # Which side of the join is missing.
-            failure_evidence=lambda: {
-                "tempo_api_trace_ids": search(api_spans),
-                "tempo_shim_trace_ids": search(shim_spans),
-            },
+            f"Tempo found no {API_SERVICE} trace for {sandbox_id} that the shim's create links to",
+            failure_evidence=lambda: {"tempo_api_trace_ids": search(api_spans, limit=50)},
         )
-        trace_id = found[0]
+        api_services = {attributes.get("service.name", "") for attributes, _ in self._trace(found[0])}
+        self._fixture.record("tempo_trace_services", sorted(api_services))
+        self._fixture.verify(
+            API_SERVICE in api_services,
+            f"Tempo returned trace {found[0]} without {API_SERVICE} spans",
+        )
+        self._node = shim_batches[0].get("k8s.node.name") or None
+        self._fixture.record("sandbox_node", self._node)
+
+    def _trace(self, trace_id: str) -> list[tuple[Mapping[str, str], list[Mapping[str, Any]]]]:
+        """A trace fetched by ID: each batch's resource attributes and spans."""
         body = self._control.telemetry_query("tempo", f"/api/v2/traces/{trace_id}", {})
-        services: dict[str, Mapping[str, str]] = {}
+        batches = []
         for batch in body.get("trace", {}).get("resourceSpans") or ():
             attributes = {
                 attribute["key"]: str(next(iter(attribute["value"].values()), ""))
                 for attribute in batch.get("resource", {}).get("attributes", ())
             }
-            services[attributes.get("service.name", "")] = attributes
-        self._fixture.record("tempo_trace_services", sorted(services))
-        self._fixture.verify(
-            API_SERVICE in services and SHIM_SERVICE in services,
-            f"Tempo returned trace {trace_id} without both {API_SERVICE} and {SHIM_SERVICE} spans",
-        )
-        self._node = services[SHIM_SERVICE].get("k8s.node.name") or None
-        self._fixture.record("sandbox_node", self._node)
+            spans = [span for scope in batch.get("scopeSpans") or () for span in scope.get("spans") or ()]
+            batches.append((attributes, spans))
+        return batches
 
     def expect_metrics(self) -> None:
         """A shim started after the scenario reported its create latency, and so did space-api."""

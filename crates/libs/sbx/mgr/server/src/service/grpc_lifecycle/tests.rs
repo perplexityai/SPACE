@@ -2,6 +2,10 @@ use pplx_space_common_core::types::JobId;
 
 use tonic::Status;
 
+use super::backup_submission::{
+    artifact_backup_execution, captured_suspend_snapshot_metadata, suspend_artifact_metadata,
+    suspend_snapshot_metadata,
+};
 use super::{
     ArtifactBackupSubmissionError, OrgSnapshotConfigResolution, SuspendRequestContext,
     artifact_backup_format, artifact_backup_lookup_error, current_instance_backup_precondition,
@@ -15,7 +19,7 @@ use crate::service::SandboxManagerService;
 use crate::service::suspend_snapshot_publication::write_full_suspend_artifact;
 use crate::state::SandboxState;
 use pplx_space_common_core::types::{
-    AutoLifecyclePolicy, LocalArtifactId, SandboxId, SandboxOwner, SandboxRuntimeLabel,
+    AutoLifecyclePolicy, HostCpu, LocalArtifactId, SandboxId, SandboxOwner, SandboxRuntimeLabel,
 };
 use pplx_space_events::SandboxEventTrigger;
 use pplx_space_node_runtime_core::fc_api::FirecrackerVmState;
@@ -755,6 +759,88 @@ fn insert_suspended_test_sandbox(conn: &rusqlite::Connection, sandbox_id: &str) 
     .unwrap();
 }
 
+/// A suspend this host captured records this host's CPU; metadata rebuilt for
+/// an artifact whose sidecar is missing records none, because the host
+/// rebuilding it may not be the one that captured it. Non-Linux hosts report
+/// no CPU, so the first comparison is only meaningful on Linux, where an
+/// unidentified CPU fails the test rather than letting it compare `None`
+/// with `None`.
+#[test]
+fn only_a_captured_suspend_records_this_hosts_cpu() {
+    #[cfg(target_os = "linux")]
+    assert!(
+        HostCpu::current().is_some(),
+        "this Linux host's CPU is unidentified"
+    );
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new().to_string();
+    insert_suspended_test_sandbox(&conn, &sandbox_id);
+    let row = crate::db::get_sandbox(&conn, &sandbox_id).unwrap().unwrap();
+
+    for format in [
+        SuspendSnapshotFormat::Full,
+        SuspendSnapshotFormat::BtrfsSend,
+    ] {
+        let host_cpu = |metadata: crate::snapshot_upload::SnapshotMeta| {
+            metadata
+                .execution
+                .and_then(|execution| execution.host_cpu().cloned())
+        };
+        assert_eq!(
+            host_cpu(captured_suspend_snapshot_metadata(&row, format).unwrap()),
+            HostCpu::current().cloned(),
+            "{format:?}"
+        );
+        for encrypted in [false, true] {
+            assert_eq!(
+                host_cpu(
+                    suspend_artifact_metadata(
+                        &row,
+                        format,
+                        LocalArtifactId::new(),
+                        encrypted,
+                        None
+                    )
+                    .unwrap()
+                ),
+                HostCpu::current().cloned(),
+                "{format:?}, encrypted: {encrypted}"
+            );
+        }
+        assert_eq!(
+            host_cpu(suspend_snapshot_metadata(&row, format).unwrap()),
+            None,
+            "{format:?}"
+        );
+    }
+}
+
+/// A disk artifact's backup reaches the cluster API without a capture CPU,
+/// whatever its metadata says; a full artifact keeps the CPU it recorded.
+#[test]
+fn artifact_backup_execution_keeps_a_capture_cpu_only_for_full_artifacts() {
+    use pplx_space_common_core::types::{
+        Arch, ArtifactKind, ExecutionMetadata, SnapshotExecutionMetadata,
+    };
+
+    let host_cpu = HostCpu::parse("genuineintel-6-85-7").unwrap();
+    let execution = SnapshotExecutionMetadata::new(ExecutionMetadata::initial_firecracker(
+        Arch::X86_64,
+        vec![],
+    ))
+    .unwrap()
+    .with_host_cpu(Some(host_cpu.clone()));
+
+    assert_eq!(
+        artifact_backup_execution(execution.clone(), ArtifactKind::Full).host_cpu(),
+        Some(&host_cpu)
+    );
+    assert_eq!(
+        artifact_backup_execution(execution, ArtifactKind::Disk).host_cpu(),
+        None
+    );
+}
+
 #[test]
 fn current_instance_handler_refuses_incomplete_suspend_without_publishing_a_pin() {
     use pplx_space_common_core::node_drain_signals::{
@@ -1222,6 +1308,7 @@ async fn permanently_refused_teardown_backup_marks_the_suspending_row_terminal()
                     execution_generation,
                     artifact: &artifact,
                     format: SuspendSnapshotFormat::Full,
+                    origin: super::TeardownBackupOrigin::Captured,
                 },
             )
             .await
@@ -1588,15 +1675,17 @@ async fn teardown_suspend_registration_failure_closes_only_the_requested_generat
     let failed_artifact = insert_stranded_teardown_suspend_sandbox(&conn, sandbox_id, generation);
     let service = SandboxManagerService::for_test(conn);
     let missing = teardown_artifact_backup_status(
-        ArtifactBackupSubmissionError::Begin(pplx_space_common_jobs::JobError::permanent(
-            "registration refused",
-        )),
+        ArtifactBackupSubmissionError::Begin {
+            error: pplx_space_common_jobs::JobError::permanent("registration refused"),
+            superseded_generation: None,
+        },
         failed_artifact,
     );
     let transient = teardown_artifact_backup_status(
-        ArtifactBackupSubmissionError::Begin(pplx_space_common_jobs::JobError::retriable(
-            "connection unavailable",
-        )),
+        ArtifactBackupSubmissionError::Begin {
+            error: pplx_space_common_jobs::JobError::retriable("connection unavailable"),
+            superseded_generation: None,
+        },
         failed_artifact,
     );
     service
@@ -2668,4 +2757,45 @@ async fn teardown_suspend_driver_completes_a_generation_whose_artifact_is_alread
         assert_eq!(row.current_local_artifact_id, Some(local_artifact_id));
     }
     drain_service_tasks(&service).await;
+}
+
+#[tokio::test]
+async fn teardown_suspend_without_a_capture_quarantines_as_an_only_copy() {
+    use crate::service::tests::service_tests::insert_stranded_teardown_suspend_sandbox;
+    use pplx_space_common_core::types::ExecutionGeneration;
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new();
+    let generation = ExecutionGeneration::new(7).unwrap();
+    insert_stranded_teardown_suspend_sandbox(&conn, sandbox_id, generation);
+    // The publication stopped the runtime before anything was staged.
+    conn.execute(
+        "UPDATE sandboxes SET current_local_artifact_id = NULL,
+             current_local_artifact_kind = NULL, current_local_artifact_origin = NULL
+         WHERE id = ?1",
+        [sandbox_id.to_string()],
+    )
+    .unwrap();
+    let service = SandboxManagerService::for_test(conn);
+
+    service
+        .drive_teardown_suspend(sandbox_id, generation, SandboxEventTrigger::System)
+        .await
+        .unwrap_err();
+
+    let db = service.db.lock().unwrap();
+    let row = crate::db::get_sandbox(&db, &sandbox_id.to_string())
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, SandboxState::Quarantined);
+    assert_eq!(
+        row.failure_reason.as_deref(),
+        Some(crate::db::SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE)
+    );
+    assert_eq!(
+        crate::db::latest_teardown_suspend_operation(&db, &sandbox_id.to_string())
+            .unwrap()
+            .unwrap()
+            .status,
+        crate::db::TeardownSuspendOperationStatus::Failed
+    );
 }

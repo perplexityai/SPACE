@@ -32,3 +32,10 @@ Deploy bridge-capable APIs before enabling callers. Older APIs treat this key
 as ordinary metadata and do not enforce its policy. Requests without the key
 retain the existing E2B translation and legacy opt-in behavior. Callers can later
 switch to native create without changing their policy construction.
+
+Credential rules explicitly list the HTTP methods that receive injected headers:
+`GET`, `POST`, and `HEAD` are supported. A GET grant does not include HEAD. Deploy
+HEAD-capable API and policy consumers, including gateways, before enabling rules
+that list HEAD; older consumers reject the new method. Existing GET/POST rules
+retain their behavior. Remove HEAD from policies before rolling consumers back to
+a version that cannot read it.

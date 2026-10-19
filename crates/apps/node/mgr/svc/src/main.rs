@@ -102,13 +102,20 @@ impl From<Cli> for NodeMgrRunConfig {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    pplx_space_common_svc::tokio_runtime::build_multi_thread_runtime()
-        .context("failed to configure node-manager Tokio runtime")?
-        .block_on(async {
-            let telemetry = pplx_space_common_svc::init_service(SERVICE_NAME)?;
-            let shutdown_token = pplx_space_common_svc::shutdown_token();
-            let result = pplx_space_node_mgr::run(cli.into(), shutdown_token).await;
-            pplx_space_common_svc::shutdown_telemetry(telemetry).await;
-            Ok(result?)
-        })
+    // All runtime, telemetry and library threads must inherit this mask.
+    #[cfg(target_os = "linux")]
+    let signals = pplx_space_node_mgr::process_signals::ProcessShutdownSignals::install()
+        .context("failed to route node-manager shutdown signals")?;
+    let runtime = pplx_space_common_svc::tokio_runtime::build_multi_thread_runtime()
+        .context("failed to configure node-manager Tokio runtime")?;
+    runtime.block_on(async {
+        let telemetry = pplx_space_common_svc::init_service(SERVICE_NAME)?;
+        #[cfg(target_os = "linux")]
+        let shutdown_token = signals.shutdown_token();
+        #[cfg(not(target_os = "linux"))]
+        let shutdown_token = pplx_space_common_svc::shutdown_token();
+        let result = pplx_space_node_mgr::run(cli.into(), shutdown_token).await;
+        pplx_space_common_svc::shutdown_telemetry(telemetry).await;
+        Ok(result?)
+    })
 }

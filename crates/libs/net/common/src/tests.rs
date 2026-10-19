@@ -816,6 +816,23 @@ fn network_credential_policy_allows_disjoint_paths_and_normalizes_method_sets() 
         [NetworkCredentialHttpMethodV1::Get]
     );
 
+    for method in ["GET", "POST", "HEAD"] {
+        policy["network_credential_rules"][1]["supported_http_methods"] =
+            serde_json::json!([method]);
+        let admitted = serde_json::from_value::<NetworkPolicyV1>(policy.clone()).unwrap();
+        for requested in [http::Method::GET, http::Method::POST, http::Method::HEAD] {
+            let expected_bindings = usize::from(requested.as_str() == method);
+            let requested = NetworkCredentialHttpMethodV1::from_http(&requested).unwrap();
+            let bindings = admitted.matching_network_credential_bindings(
+                &"api.example.com".parse().unwrap(),
+                443,
+                "/v2/items",
+                requested,
+            );
+            assert_eq!(bindings.len(), expected_bindings);
+        }
+    }
+
     policy["network_credential_rules"][1]["supported_http_methods"] = serde_json::json!(["TRACE"]);
     serde_json::from_value::<NetworkPolicyV1>(policy).unwrap_err();
 }
@@ -841,7 +858,11 @@ fn network_credential_policy_proto_round_trips_without_changing_legacy_bytes() {
             header_name: "authorization".into(),
             credential_reference_id: "018f1e9d-7b7a-7d3a-8000-000000000001".parse().unwrap(),
         }],
-        supported_http_methods: vec![NetworkCredentialHttpMethodV1::Get],
+        supported_http_methods: vec![
+            NetworkCredentialHttpMethodV1::Get,
+            NetworkCredentialHttpMethodV1::Post,
+            NetworkCredentialHttpMethodV1::Head,
+        ],
     }];
     let proto = proto::NetworkPolicyV1::from(&policy);
     assert_eq!(
@@ -852,7 +873,16 @@ fn network_credential_policy_proto_round_trips_without_changing_legacy_bytes() {
             .port,
         None
     );
+    assert_eq!(
+        proto.network_credential_rules[0].supported_http_methods,
+        [1, 2, 3]
+    );
     assert_eq!(NetworkPolicyV1::try_from(&proto).unwrap(), policy);
+    let mut unknown = proto.clone();
+    unknown.network_credential_rules[0]
+        .supported_http_methods
+        .push(99);
+    NetworkPolicyV1::try_from(&unknown).unwrap_err();
 
     #[derive(Clone, PartialEq, prost::Message)]
     struct LegacyNetworkPolicyV1 {

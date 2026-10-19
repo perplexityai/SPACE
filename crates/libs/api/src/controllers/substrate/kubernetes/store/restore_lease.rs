@@ -268,6 +268,31 @@ impl K8sStore {
         sandbox_id: SandboxId,
         require_evacuation_marker: bool,
     ) -> Result<RestoreClaim, SubstrateError> {
+        self.begin_restore_lifecycle_for(sandbox_id, require_evacuation_marker, None)
+            .await
+    }
+
+    /// The evacuation claim for a caller that has already fixed the lifecycle
+    /// it restores to. Only a `Stopped` target may take the stopped arm: a
+    /// caller holding a stale `Started`/`Paused` target from before the row
+    /// became a stopped evacuation would otherwise claim it and restore it
+    /// toward a lifecycle the user no longer has, and a failure would leave it
+    /// `restoring`, since that claim is never rolled back.
+    pub(in crate::controllers::substrate::kubernetes) async fn begin_evacuation_restore_lifecycle(
+        &self,
+        sandbox_id: SandboxId,
+        target: SandboxLifecycle,
+    ) -> Result<RestoreClaim, SubstrateError> {
+        self.begin_restore_lifecycle_for(sandbox_id, true, Some(target))
+            .await
+    }
+
+    async fn begin_restore_lifecycle_for(
+        &self,
+        sandbox_id: SandboxId,
+        require_evacuation_marker: bool,
+        evacuation_target: Option<SandboxLifecycle>,
+    ) -> Result<RestoreClaim, SubstrateError> {
         // `require_evacuation_marker` makes the restore claim atomic on the
         // node-drain `evacuation_restore_target` marker. The cluster-
         // controller's deferred cohort restore passes `true`: between listing
@@ -290,6 +315,13 @@ impl K8sStore {
         // user path must NOT grab it. (A `suspended` row with a marker is still
         // a clean user takeover: the user wins `suspended → restoring`, clears
         // the marker, and the drain's marker-required claim then loses.)
+        //
+        // The evacuation claim also takes a released stopped evacuation:
+        // marker `'stopped'` and no `active_node_id`, for a `Stopped` target
+        // only ($5; see `begin_evacuation_restore_lifecycle`). A markerless
+        // `stopped` sandbox is user-owned, and one still on its node would get
+        // two homes. It claims to `restoring` like the suspend path; see
+        // `RestoreClaim::FreshFromStopped`.
         let restore_lease_token = (!require_evacuation_marker).then(Uuid::now_v7);
         let restore_claim = if require_evacuation_marker {
             sqlx::query_as::<_, RestoreClaimRow>(sql!(
@@ -297,7 +329,15 @@ impl K8sStore {
                      SELECT id, lifecycle
                        FROM sandboxes
                       WHERE id = $1
-                        AND LOWER(TRIM(lifecycle)) IN ('suspended', 'restoring')
+                        AND (
+                          LOWER(TRIM(lifecycle)) IN ('suspended', 'restoring')
+                          OR (
+                            LOWER(TRIM(lifecycle)) = 'stopped'
+                            AND evacuation_restore_target = 'stopped'
+                            AND active_node_id IS NULL
+                            AND $5::text = 'stopped'
+                          )
+                        )
                         AND evacuation_restore_target IS NOT NULL
                       FOR UPDATE
                  ),
@@ -370,6 +410,7 @@ impl K8sStore {
         .bind(recovery_lease_ttl_secs())
         .bind(restore_lease_token)
         .bind(super::super::RESTORE_EXECUTION_OWNERSHIP_TTL_SECS)
+        .bind(evacuation_target.map(SandboxLifecycle::as_str))
         .fetch_optional(&self.pool)
         .await
         .db_context("failed to begin sandbox restore")?;
@@ -395,6 +436,28 @@ impl K8sStore {
                     ),
                 });
             }
+            // Three of a `stopped` row's misses are deferrals, not restore
+            // failures, and report `EvacuationClaimLost`: its marker is gone, it
+            // carries the `'stopped'` marker but the caller's target isn't
+            // `Stopped`, or the teardown hasn't released its node. A row with any
+            // other marker falls through to `Conflict` below.
+            if require_evacuation_marker && lifecycle == SandboxLifecycle::Stopped {
+                let reason = match marker.as_deref() {
+                    None => Some("evacuation_restore_target cleared while stopped"),
+                    Some("stopped") => {
+                        Some("its stopped evacuation is not claimable by this attempt")
+                    }
+                    Some(_) => None,
+                };
+                if let Some(reason) = reason {
+                    return Err(SubstrateError::EvacuationClaimLost {
+                        message: format!(
+                            "evacuation restore claim unavailable for sandbox {sandbox_id}: \
+                             {reason}"
+                        ),
+                    });
+                }
+            }
             if !require_evacuation_marker
                 && marker.is_none()
                 && ownership_remaining_secs > 0.0
@@ -417,6 +480,7 @@ impl K8sStore {
             "suspended" => Ok(RestoreClaim::FreshFromSuspended {
                 restore_lease_token: restore_claim.restore_lease_token,
             }),
+            "stopped" => Ok(RestoreClaim::FreshFromStopped),
             "restoring" => Ok(RestoreClaim::RedroveRestoring {
                 restore_lease_token: restore_claim.restore_lease_token,
             }),

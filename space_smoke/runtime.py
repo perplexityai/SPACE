@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import signal
 import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -332,6 +333,29 @@ def _scenario_deadline(
         signal.signal(signal.SIGALRM, previous_handler)
 
 
+@contextmanager
+def _sigterm_raises() -> Iterator[None]:
+    """Turn SIGTERM into `SystemExit` on the main thread while the body runs.
+
+    Python's default SIGTERM action ends the process without unwinding, so a
+    CI cancel or `timeout` would skip cleanup. Cleanup itself keeps the
+    default action, so a second SIGTERM still ends a cleanup that hangs.
+    """
+
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def terminate(signal_number: int, _frame: FrameType | None) -> None:
+        raise SystemExit(128 + signal_number)
+
+    previous_handler = signal.signal(signal.SIGTERM, terminate)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous_handler)
+
+
 def execute_scenario(
     *,
     title: str,
@@ -349,7 +373,7 @@ def execute_scenario(
         else None
     )
     try:
-        with _scenario_deadline(execution_timeout, label="scenario execution"):
+        with _sigterm_raises(), _scenario_deadline(execution_timeout, label="scenario execution"):
             body(context)
         result = ScenarioResult(Verdict.PASS, f"{title} passed", dict(context.evidence))
     except InvariantViolation as error:
@@ -369,6 +393,12 @@ def execute_scenario(
             dict(context.evidence),
             diagnostics=(traceback.format_exc(),),
         )
+    except BaseException:
+        # An interrupt still restores what the body changed, then ends the
+        # run without a verdict.
+        for failure in scope.close(timeout_seconds=cleanup_timeout):
+            print(f"CLEANUP FAILED: {failure.name}: {failure.detail}", file=sys.stderr, flush=True)
+        raise
 
     cleanup_failures = scope.close(timeout_seconds=cleanup_timeout)
     if not cleanup_failures:

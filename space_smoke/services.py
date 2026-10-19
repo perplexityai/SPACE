@@ -120,6 +120,15 @@ class SmokeServices:
             )
         return self.kind.telemetry_mode()
 
+    def storage_credentials(self) -> str:
+        """The storage credentials mode of the Kind bench, read from the cluster."""
+
+        if self.kind is None:
+            raise SmokeConfigurationError(
+                "the storage credentials mode is only readable on the kind backend"
+            )
+        return self.kind.storage_credentials_mode()
+
     def fixture(
         self,
         fixture_type: type[Fixture],
@@ -316,7 +325,6 @@ class SmokeServices:
             fixture._node_selector_extras_control = cast(Any, kind)
             fixture._node_fence_control = cast(Any, kind)
             fixture._pending_backup_control = cast(Any, kind)
-            fixture._quarantine_recovery_control = cast(Any, kind)
             fixture._orphaned_restore_pod_gc_control = cast(Any, kind)
             fixture._template_build_control = cast(Any, kind)
             fixture._template_builder = cast(Any, self.ecw)
@@ -328,7 +336,9 @@ class SmokeServices:
             fixture._startup_recovery_control = cast(Any, kind)
             fixture._suspend_codec_control = cast(Any, kind)
             fixture._telemetry_control = cast(Any, kind)
+            fixture._leader_election_control = cast(Any, kind)
             fixture._sandbox_network_isolation_control = cast(Any, kind)
+            fixture._storage_exchange_control = cast(Any, kind)
             fixture._template_selector = template
             fixture._warm_pool_observer = cast(Any, kind)
             fixture._warm_pool_candidate = warm_pool_candidate

@@ -4,29 +4,17 @@
 
 use std::io::{self, Read, Write};
 use std::os::fd::AsFd;
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Output, Stdio};
+
+mod spawn;
+pub(crate) use spawn::Command;
+use spawn::{Child, Input};
 use std::time::{Duration, Instant};
 
 pub(crate) const PROBE_BUDGET: Duration = Duration::from_secs(5);
 pub(crate) const MUTATION_BUDGET: Duration = Duration::from_secs(120);
 const OUTPUT_LIMIT: usize = 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
-
-struct OwnedChild(Child);
-
-impl Drop for OwnedChild {
-    fn drop(&mut self) {
-        // Child::kill is a no-op after this handle has reaped its child, so it
-        // cannot signal a reused PID. Keep the enclosing ownership guard alive
-        // through wait even when SIGKILL is delayed by uninterruptible I/O.
-        if let Err(error) = self.0.kill() {
-            tracing::warn!(%error, "failed to terminate host command; waiting for exit");
-        }
-        if let Err(error) = self.0.wait() {
-            tracing::warn!(%error, "failed to reap host command");
-        }
-    }
-}
 
 fn nonblocking(fd: &impl AsFd) -> io::Result<()> {
     use nix::fcntl::{FcntlArg, OFlag, fcntl};
@@ -66,20 +54,13 @@ fn read_available(pipe: &mut impl Read, output: &mut Vec<u8>) -> io::Result<()> 
 /// obligation, not permission to race the still-running command.
 pub(crate) fn output(command: &mut Command, budget: Duration, input: &[u8]) -> io::Result<Output> {
     let started = Instant::now();
-    let child = OwnedChild(
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?,
-    );
+    let child = spawn::start(command, Input::Captured)?;
     capture(child, started, budget, input, None)
 }
 
-/// Stream a pinned file directly to the child without buffering it in memory.
-/// The same deadline, output bound, kill and reap contract applies.
-pub(crate) fn stream(
-    command: &mut Command,
+/// Only receivers requiring child-local mount setup may use this fork path.
+pub(crate) fn stream_in_namespace(
+    command: &mut std::process::Command,
     budget: Duration,
     input: Stdio,
     output: Stdio,
@@ -87,14 +68,12 @@ pub(crate) fn stream(
 ) -> io::Result<Output> {
     check_cancelled(cancel)?;
     let started = Instant::now();
-    let child = OwnedChild(
-        command
-            .stdin(input)
-            .stdout(output)
-            .stderr(Stdio::piped())
-            .spawn()?,
-    );
+    let child = spawn::in_namespace(command, input, output)?;
     capture(child, started, budget, &[], cancel)
+}
+
+pub(crate) fn status(command: &mut Command) -> io::Result<std::process::ExitStatus> {
+    spawn::start(command, Input::Inherit)?.wait()
 }
 
 fn check_cancelled(cancel: Option<&tokio_util::sync::CancellationToken>) -> io::Result<()> {
@@ -109,15 +88,15 @@ fn check_cancelled(cancel: Option<&tokio_util::sync::CancellationToken>) -> io::
 }
 
 fn capture(
-    mut child: OwnedChild,
+    mut child: Child,
     started: Instant,
     budget: Duration,
     mut input: &[u8],
     cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> io::Result<Output> {
-    let mut stdin = child.0.stdin.take();
-    let mut stdout = child.0.stdout.take();
-    let mut stderr = child.0.stderr.take().expect("stderr configured as piped");
+    let mut stdin = child.stdin.take();
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take().expect("stderr configured as piped");
     if let Some(pipe) = &stdout {
         nonblocking(pipe)?;
     }
@@ -147,7 +126,7 @@ fn capture(
                 Err(error) => return Err(error),
             }
         }
-        if let Some(status) = child.0.try_wait()? {
+        if let Some(status) = child.try_wait()? {
             // All foreground writers have closed their pipes. Drain what
             // remains, including output written just before exit.
             loop {

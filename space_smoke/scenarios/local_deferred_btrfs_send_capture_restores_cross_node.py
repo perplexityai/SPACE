@@ -14,16 +14,20 @@ MARKER = "space-smoke-deferred-capture-ok"
 # node never writes `rootfs.btrfs-send`. That needs volume-manager's own
 # identity (`space-volmgr`), which node-manager's lease RPCs authorize and
 # which the Kind chart now runs, and sandbox-manager never traverses the
-# bundle. The proof is sandbox-manager's own encode line (`deferred=true`,
-# no stream bytes), volume-manager's completed `push_btrfs_send` job for the
-# snapshot (a materialized fallback that bookkeeping later reclaims leaves the
-# same directory behind), the canonical snapshot directory holding the bundle
-# and no send file before and after the upload completes, and the durable path
-# end to end: the same cross-node restore
+# bundle. The proof: the canonical snapshot directory holding the bundle and
+# no send file before and after the upload completes; volume-manager's own
+# job record (`space-volmgr jobs`/`job`) of a completed `push_btrfs_send` for
+# the send stream — sandbox-manager silently falls back to materializing and
+# uploading a file when volume-manager may not lease the retained source,
+# and that fallback leaves the same directory and the same object behind;
+# the durable snapshot holding a `rootfs.btrfs-send` object; and the durable
+# path end to end: the same cross-node restore
 # `local.suspend_restore_cross_node_from_object_storage` proves, now sourced
 # from a stream that was never a file on the source node.
 @smoke.scenario(
     "local.deferred_btrfs_send_capture_restores_cross_node",
+    # The codec is read from the snapshot's objects through the AWS CLI.
+    required_tools=("aws",),
     # A cross-node restore pulls the full snapshot from the object store; give
     # a slow KVM bench room.
     sandbox=smoke.SandboxConfig(timeout=900),
@@ -53,19 +57,19 @@ def deferred_btrfs_send_capture_restores_cross_node(test: smoke.KindEcw) -> None
         codec.require_btrfs_send_default(source.node_name)
 
     with test.phase("suspend without naming a format"):
-        suspended_at = codec.mark_since()
         test.pause()
 
-    with test.phase("the suspend was sealed as btrfs-send-v1 and retained its source"):
-        codec.expect_suspend_codec(since_time=suspended_at)
-        codec.expect_deferred_capture(source.node_name, since_time=suspended_at)
+    with test.phase("the suspend retained its source and wrote no send file"):
         codec.expect_retained_source_without_send_file(source.node_name)
+
+    with test.phase("the durable snapshot was sealed as btrfs-send-v1"):
+        codec.expect_suspend_codec()
 
     with test.phase("wait until the durable snapshot is what a restore would select"):
         restore.wait_until_restore_portable()
 
     with test.phase("volume-manager streamed the backup from the retained source"):
-        codec.expect_streamed_upload(source.node_name, since_time=suspended_at)
+        codec.expect_streamed_upload(source.node_name)
 
     with test.phase("the upload left no send file behind"):
         codec.expect_retained_source_without_send_file(source.node_name)

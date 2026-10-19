@@ -658,7 +658,6 @@ pub(super) mod service_tests {
             sandbox_artifact_locks: Default::default(),
             send_source_locks: Default::default(),
             send_source_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
-            send_parent_seal: super::btrfs_send_source::ParentSeal::Stamped,
             artifact_work: None,
             device_op_tasks: tokio_util::task::TaskTracker::new(),
             blocking_probe_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(

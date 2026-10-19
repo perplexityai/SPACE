@@ -375,7 +375,8 @@ impl OrphanInventory {
 
 fn nft_candidates() -> Result<Vec<String>, Status> {
     let output = crate::host_command::output(
-        std::process::Command::new("nft").args(["list", "chain", "inet", "space", "forward"]),
+        crate::host_command::Command::new("nft")
+            .args(["list", "chain", "inet", "space", "forward"]),
         crate::host_command::PROBE_BUDGET,
         &[],
     )

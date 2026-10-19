@@ -8,7 +8,6 @@
 //! copying any of the service.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 use pplx_space_common_svc::core::host::linux::identities::group_names;
@@ -544,15 +543,15 @@ fn validate_runtime_groups() -> Result<(), RunNodeMgrError> {
 }
 
 fn activate_runtime_supervisor_on_start() -> Result<(), RunNodeMgrError> {
-    let status = Command::new(RUNTIME_SUPERVISOR_ACTIVATOR)
-        .args([
-            "activate",
-            RUNTIME_SUPERVISOR_RESTART_REQUIRED,
-            RUNTIME_SUPERVISOR_WORK_GATE,
-            RUNTIME_SUPERVISOR_HEALTH_SOCKET,
-            GRPC_HEALTH_PROBE,
-        ])
-        .status()
+    let mut command = crate::host_command::Command::new(RUNTIME_SUPERVISOR_ACTIVATOR);
+    command.args([
+        "activate",
+        RUNTIME_SUPERVISOR_RESTART_REQUIRED,
+        RUNTIME_SUPERVISOR_WORK_GATE,
+        RUNTIME_SUPERVISOR_HEALTH_SOCKET,
+        GRPC_HEALTH_PROBE,
+    ]);
+    let status = crate::host_command::status(&mut command)
         .map_err(RunNodeMgrError::RuntimeSupervisorActivator)?;
     if !status.success() {
         return Err(RunNodeMgrError::RuntimeSupervisorActivatorFailed { status });

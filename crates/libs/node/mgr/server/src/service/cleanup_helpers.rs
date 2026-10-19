@@ -124,11 +124,9 @@ impl NodeManagerService {
     }
 }
 
-// Run an external command on the blocking pool so the async lifecycle handlers
-// don't park Tokio worker threads on fork/exec/waitpid. Under load,
-// inline std::process::Command calls in launch_sandbox / prepare_sandbox /
-// cleanup_sandbox were starving the runtime, causing fresh UDS connections and
-// gRPC health probes to time out at 1s.
+// Spawning and waiting for host commands must not occupy Tokio workers.
+// Keep the blocking work and its resource claims owned until the command
+// exits and is reaped, including after cancellation or a deadline.
 pub(super) fn spawn_lifecycle_blocking<F, R>(
     permit: &crate::lifecycle_limiter::LifecyclePermit,
     f: F,
@@ -151,7 +149,7 @@ pub(super) fn run_permission_command_blocking(
     target: &str,
 ) -> Result<(), Status> {
     let output = crate::host_command::output(
-        std::process::Command::new(command).args(args),
+        crate::host_command::Command::new(command).args(args),
         crate::host_command::MUTATION_BUDGET,
         &[],
     )
@@ -398,7 +396,7 @@ impl CleanupCommandRunner for SystemCleanupCommandRunner {
 
     fn run(&mut self, program: &str, args: &[&str]) -> Result<String, CleanupCommandError> {
         let output = crate::host_command::output(
-            std::process::Command::new(program).args(args),
+            crate::host_command::Command::new(program).args(args),
             crate::host_command::MUTATION_BUDGET,
             &[],
         )
@@ -1197,7 +1195,7 @@ fn record_device_release(
     errors: &mut Vec<String>,
     actions: &mut Vec<String>,
     output: impl FnOnce(
-        &mut std::process::Command,
+        &mut crate::host_command::Command,
         Duration,
         &[u8],
     ) -> std::io::Result<std::process::Output>,
@@ -1227,15 +1225,15 @@ fn teardown_encrypted_volumes_blocking(sandbox_id: &str) -> (Vec<String>, Vec<St
 fn teardown_encrypted_volumes_with(
     sandbox_id: &str,
     mut output: impl FnMut(
-        &mut std::process::Command,
+        &mut crate::host_command::Command,
         Duration,
         &[u8],
     ) -> std::io::Result<std::process::Output>,
     mut mountpoints: impl FnMut(&str) -> std::io::Result<Vec<String>>,
 ) -> (Vec<String>, Vec<String>) {
+    use crate::host_command::Command;
     use crate::host_command::{MUTATION_BUDGET, PROBE_BUDGET};
     use crate::rootfs_dmcrypt::checked_output_with;
-    use std::process::Command;
     let mut errors = Vec::new();
     let mut actions = Vec::new();
 

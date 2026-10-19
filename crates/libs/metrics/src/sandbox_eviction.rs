@@ -27,14 +27,18 @@ pub fn tick(result: &str, started_at: Instant, candidates: u64) {
 }
 
 /// One per sandbox whose local presence was fully evicted. `reason` is
-/// the eviction proof that fired — deliberately a single value, since
-/// every eviction must carry a proof tied to the exact bytes deleted:
+/// the eviction proof that fired; every eviction must carry a proof tied
+/// to the exact bytes deleted:
 ///
 /// - `latest_backed_idle` — the bytes on disk are provably backed (the
 ///   pinned artifact's durability confirmed for its exact immutable
 ///   id, or — legacy unpinned rows — the newest local generation
 ///   equals the cluster's latest ready snapshot with the recency
 ///   witness holding), and the sandbox is past the minimum age floor.
+/// - `cluster_row_absent` — the cluster reports no `sandboxes` row, so
+///   nothing can restore the bytes.
+/// - `execution_retired` — the cluster refused a teardown suspend's
+///   backup because it had retired the execution that captured it.
 pub fn evicted(reason: &str) {
     counter("sandbox.evict.evicted", 1, &[tag("reason", reason)]);
 }
@@ -107,6 +111,14 @@ pub fn malformed_updated_at(rows: u64) {
 ///   malformed; that row is backed off while the scan continues.
 /// - `rpc_transport_error` — the cluster dependency is unavailable; the scan
 ///   stops and retries from the same cursor next tick.
+/// - `local_artifact_awaiting_backup` — a retired execution's teardown
+///   release is held because another local artifact of the sandbox still
+///   awaits its backup; the pod keeps terminating until it completes.
+///   Emitted by the teardown driver once per drive.
+/// - `no_backed_copy` — a retired execution's teardown release is held
+///   because the cluster can't show the sandbox is durably restorable, so the
+///   refused capture may be its only copy; the runtime stays resident.
+///   Emitted by the teardown driver once per drive.
 pub fn skipped(reason: &str) {
     counter("sandbox.evict.skipped", 1, &[tag("reason", reason)]);
 }

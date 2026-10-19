@@ -4,8 +4,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
 
 mod leg;
-pub(super) use leg::RelayFault;
 use leg::RelayWitness;
+pub(crate) use leg::{RelayFault, Side};
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum Error {

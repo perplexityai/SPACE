@@ -35,65 +35,110 @@ pub fn shutdown_token_with_drain(drain_signal: crate::lifecycle::DrainSignal) ->
     shutdown_token_with_drain_signal(Some(drain_signal))
 }
 
+/// Stop-signal tokens for a service that drains after a stop signal:
+/// `shutdown` is cancelled by the first stop signal (SIGINT or SIGTERM; Ctrl-C
+/// off Unix), `forced` by the next one, which ends the drain early. The same
+/// handlers see both, so a second signal that arrives while the first is
+/// still being handled is kept rather than lost.
+pub struct StopTokens {
+    pub shutdown: CancellationToken,
+    pub forced: CancellationToken,
+}
+
+pub fn stop_tokens() -> StopTokens {
+    let shutdown = CancellationToken::new();
+    let forced = CancellationToken::new();
+    spawn_stop_signal_task(None, shutdown.clone(), Some(forced.clone()));
+    StopTokens { shutdown, forced }
+}
+
 pub(super) fn shutdown_token_with_drain_signal(
     drain_signal: Option<crate::lifecycle::DrainSignal>,
 ) -> CancellationToken {
     let token = CancellationToken::new();
+    spawn_stop_signal_task(drain_signal, token.clone(), None);
+    token
+}
+
+fn spawn_stop_signal_task(
+    drain_signal: Option<crate::lifecycle::DrainSignal>,
+    token: CancellationToken,
+    forced: Option<CancellationToken>,
+) {
     // Install the handlers before returning, not when the task below is first
     // polled. Callers report readiness right after this, and a stop signal
     // that arrives before its handler exists takes the default action and
     // kills the process without draining.
-    let shutdown_signal = install_shutdown_signal_handlers();
+    let signals = StopSignals::install();
 
-    tokio::spawn({
-        let token = token.clone();
-        async move {
-            match shutdown_signal {
-                Ok(shutdown_signal) => shutdown_signal.await,
-                Err(error) => {
-                    tracing::error!(error = %error, "failed to wait for shutdown signal");
-                }
+    tokio::spawn(async move {
+        let mut signals = match signals {
+            Ok(mut signals) => {
+                signals.recv("shutting down").await;
+                Some(signals)
             }
-            if let Some(drain_signal) = drain_signal {
-                drain_signal.begin();
+            Err(error) => {
+                tracing::error!(error = %error, "failed to wait for shutdown signal");
+                None
             }
-            token.cancel();
+        };
+        if let Some(drain_signal) = drain_signal {
+            drain_signal.begin();
+        }
+        token.cancel();
+        if let (Some(forced), Some(signals)) = (forced, signals.as_mut()) {
+            signals.recv("ending the drain").await;
+            forced.cancel();
         }
     });
-
-    token
 }
 
-/// Registers the stop-signal handlers and returns a future that resolves on
-/// the first stop signal. A signal delivered after this returns is recorded
-/// even if the future has not been polled yet.
-#[cfg(unix)]
-pub(super) fn install_shutdown_signal_handlers()
--> Result<impl Future<Output = ()>, WaitForSignalError> {
-    use tokio::signal::unix::{SignalKind, signal};
+/// The process's stop-signal handlers. A signal delivered after they're
+/// installed is kept for the next [`StopSignals::recv`], even if nothing is
+/// polling yet; signals delivered between two calls count once.
+pub(super) struct StopSignals {
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+    #[cfg(not(unix))]
+    ctrl_c: tokio::signal::windows::CtrlC,
+}
 
-    let mut interrupt = signal(SignalKind::interrupt()).map_err(WaitForSignalError::Sigint)?;
-    let mut terminate = signal(SignalKind::terminate()).map_err(WaitForSignalError::Sigterm)?;
+impl StopSignals {
+    #[cfg(unix)]
+    pub(super) fn install() -> Result<Self, WaitForSignalError> {
+        use tokio::signal::unix::{SignalKind, signal};
 
-    Ok(async move {
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt()).map_err(WaitForSignalError::Sigint)?,
+            terminate: signal(SignalKind::terminate()).map_err(WaitForSignalError::Sigterm)?,
+        })
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn install() -> Result<Self, WaitForSignalError> {
+        Ok(Self {
+            ctrl_c: tokio::signal::windows::ctrl_c().map_err(WaitForSignalError::CtrlC)?,
+        })
+    }
+
+    /// Resolves on the next stop signal and logs it with what happens next.
+    #[cfg(unix)]
+    pub(super) async fn recv(&mut self, action: &str) {
         tokio::select! {
-            _ = interrupt.recv() => {
-                tracing::info!("received SIGINT, shutting down");
+            _ = self.interrupt.recv() => {
+                tracing::info!("received SIGINT, {action}");
             }
-            _ = terminate.recv() => {
-                tracing::info!("received SIGTERM, shutting down");
+            _ = self.terminate.recv() => {
+                tracing::info!("received SIGTERM, {action}");
             }
         }
-    })
-}
+    }
 
-#[cfg(not(unix))]
-pub(super) fn install_shutdown_signal_handlers()
--> Result<impl Future<Output = ()>, WaitForSignalError> {
-    let mut ctrl_c = tokio::signal::windows::ctrl_c().map_err(WaitForSignalError::CtrlC)?;
-
-    Ok(async move {
-        ctrl_c.recv().await;
-        tracing::info!("received Ctrl-C, shutting down");
-    })
+    #[cfg(not(unix))]
+    pub(super) async fn recv(&mut self, action: &str) {
+        self.ctrl_c.recv().await;
+        tracing::info!("received Ctrl-C, {action}");
+    }
 }

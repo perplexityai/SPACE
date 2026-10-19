@@ -22,6 +22,9 @@ use axum::response::IntoResponse;
 
 use super::*;
 
+#[cfg(feature = "kubernetes")]
+mod kubernetes;
+
 const GENERATION: i64 = 7;
 const HTTP2_PREFACE_LEN: usize = 24;
 const HTTP2_FRAME_HEADER_LEN: usize = 9;
@@ -259,9 +262,9 @@ impl Fixture {
         .execute(&db.pool)
         .await?;
         let controller =
-            SandboxController::new(crate::controllers::substrate::Substrate::Direct(Box::new(
+            SandboxController::new(crate::controllers::substrate::Substrate::from_direct(
                 crate::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),
-            )));
+            ));
         Ok(Self {
             db,
             controller,

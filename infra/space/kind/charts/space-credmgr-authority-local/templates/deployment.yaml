@@ -85,6 +85,10 @@ metadata:
     app.kubernetes.io/name: {{ $name }}
     app.kubernetes.io/instance: {{ .Release.Name }}
     team: {{ .Values.datadogTeam | quote }}
+    # The storage credentials mode this cluster runs, which the smoke
+    # bring-up compares with the one it is asked for
+    # (scripts/tests/lib/bootstrap-kind-stack.sh).
+    space.pplx.net/kind-storage-credentials: {{ .Values.storageCredentials | quote }}
 spec:
   replicas: {{ .Values.replicas }}
   selector:
@@ -104,6 +108,11 @@ spec:
       annotations:
         {{- include "space-kind-telemetry.logAnnotations" . | nindent 8 }}
         ad.datadoghq.com/tags: '{"team":"{{ .Values.datadogTeam }}"}'
+        {{- if eq .Values.storageCredentials "exchange" }}
+        # The vend identity comes from a Secret sts-bridge-secret.sh keeps
+        # outside Helm; its checksum rolls the authority when it changes.
+        checksum/storage-exchange: {{ .Values.storageExchange | toJson | sha256sum | trunc 16 | quote }}
+        {{- end }}
       labels:
         app.kubernetes.io/name: {{ $name }}
         app.kubernetes.io/instance: {{ .Release.Name }}
@@ -166,9 +175,7 @@ spec:
             # restarts and every replica serves every org. Kind's broker is
             # the in-repo fixture (space-kind-key-broker), reached over
             # plaintext, which the code allows for local development only:
-            # the fixture has no TLS listener. Credential exchange stays
-            # disabled because no vending role (SPACE_CREDMGR_S3_VEND_ROLE_ARN)
-            # is configured.
+            # the fixture has no TLS listener.
             - name: SPACE_PLATFORM_KEK_PROVIDER
               value: intermediate-key-broker
             - name: SPACE_CREDMGR_INTERMEDIATE_KEY_BROKER_URL
@@ -207,6 +214,44 @@ spec:
               value: {{ join "," .Values.allowedServiceAccounts | quote }}
             - name: AWS_REGION
               value: {{ .Values.awsRegion | quote }}
+            {{- if eq .Values.storageCredentials "exchange" }}
+            # Storage credential exchange, configured with the settings a
+            # deployment uses (crates/libs/credential/mgr/server/src/run.rs):
+            # the vending role enables ExchangeToken, and the authority
+            # assumes it through STS for every exchange, with an exact-object
+            # session policy (assume_s3_vend_role,
+            # crates/libs/credential/mgr/server/src/service.rs). Kind's STS is
+            # the Kind-only bridge (space-kind-sts-bridge) in front of the
+            # object store's IAM service, reached through the AWS SDK's
+            # service endpoint setting over TLS from the internal RPC CA. The
+            # base credentials are the bridge's vend identity, which opens
+            # nothing on S3 by itself; a deployment's come from its workload
+            # identity. They take the place of space-aws-creds: one default
+            # credential chain cannot sign for two accounts, and every STS
+            # call goes to the bridge.
+            - name: SPACE_CREDMGR_S3_VEND_ROLE_ARN
+              value: {{ .Values.storageExchange.vendRoleArn | quote }}
+            - name: AWS_ENDPOINT_URL_STS
+              value: {{ .Values.storageExchange.stsEndpoint | quote }}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.storageExchange.bridgeSecretName }}
+                  key: vend-access-key-id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.storageExchange.bridgeSecretName }}
+                  key: vend-secret-access-key
+            # The SDK's HTTPS client trusts the platform roots
+            # (rustls-native-certs), which read SSL_CERT_DIR: the image's
+            # bundle plus the internal RPC CA that issued the bridge's leaf.
+            - name: SSL_CERT_DIR
+              value: /etc/ssl/certs:/etc/space-rpc-ca
+            {{- else }}
+            # No vending role (SPACE_CREDMGR_S3_VEND_ROLE_ARN), so credential
+            # exchange stays disabled (run.rs) and node services read the
+            # object store's static keys instead.
             {{- range list "AWS_ACCESS_KEY_ID" "AWS_SECRET_ACCESS_KEY" "AWS_SESSION_TOKEN" }}
             - name: {{ . }}
               valueFrom:
@@ -227,6 +272,7 @@ spec:
                   name: space-aws-creds
                   key: SPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN
                   optional: true
+            {{- end }}
           ports:
             - name: grpc
               containerPort: {{ .Values.service.port }}
@@ -255,6 +301,11 @@ spec:
               mountPath: /var/run/space-key-broker-ca
               readOnly: true
             {{- end }}
+            {{- if eq .Values.storageCredentials "exchange" }}
+            - name: rpc-ca
+              mountPath: /etc/space-rpc-ca
+              readOnly: true
+            {{- end }}
           {{- with .Values.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
@@ -274,6 +325,11 @@ spec:
         - name: key-broker-ca
           secret:
             secretName: {{ .Values.keyBroker.caSecretName }}
+        {{- end }}
+        {{- if eq .Values.storageCredentials "exchange" }}
+        - name: rpc-ca
+          secret:
+            secretName: space-internal-rpc-ca
         {{- end }}
 ---
 apiVersion: v1

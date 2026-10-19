@@ -304,11 +304,27 @@ fn production_admission_restricts_selection_without_changing_defaults() {
     let candidate = &environments[1];
     let e0 = initial.definition().unwrap().reference();
     let c = candidate.definition().reference();
+    let same_kernel = environments[2].definition().reference();
     for production in [false, true] {
         for (reference, mode, accepted) in [
             (None, ExecutionSelectionMode::NewColdBoot, true),
             (Some(e0), ExecutionSelectionMode::NewColdBoot, true),
             (Some(c), ExecutionSelectionMode::NewColdBoot, !production),
+            (
+                Some(same_kernel),
+                ExecutionSelectionMode::NewColdBoot,
+                !production,
+            ),
+            (
+                Some(same_kernel),
+                ExecutionSelectionMode::ExistingColdBoot,
+                !production,
+            ),
+            (
+                Some(same_kernel),
+                ExecutionSelectionMode::PersistedStateRestore,
+                !production,
+            ),
             (
                 Some(c),
                 ExecutionSelectionMode::ExistingColdBoot,
@@ -317,7 +333,7 @@ fn production_admission_restricts_selection_without_changing_defaults() {
             (
                 Some(c),
                 ExecutionSelectionMode::PersistedStateRestore,
-                false,
+                !production,
             ),
             (
                 Some(EnvironmentReference::new(Digest::sha256([1; 32]))),

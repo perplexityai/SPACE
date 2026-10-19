@@ -40,8 +40,21 @@
 //! [`classify::classify_disposition`]). Reaping an inert `Unschedulable` pod
 //! closes the window *before* it binds; reaping a bound pod hands the
 //! unrouted VM to the node's generation-fenced pod teardown — the same path
-//! `retire_execution`'s delete and the restore path's lingering-pod sweep
-//! already drive for these pods. A successful DELETE therefore means that
+//! the restore path's lingering-pod sweep already drives for these pods
+//! (`retire_execution` instead stops or deletes the sandbox on the node before
+//! its pod DELETE whenever it can reach the runtime, so it doesn't normally
+//! start a teardown suspend). That teardown suspends a resident VM and
+//! registers the capture with `BeginArtifactBackup`, which refuses it either
+//! way, so a reap can't register a snapshot the sandbox's next restore would
+//! select. A restore whose unmaterialized claim the request abandoned (the
+//! re-drive cancellation guard) retired its execution as `replaced`, and a pod
+//! below the active generation has a newer one, so the refusal says the
+//! execution was superseded and the node releases the VM and discards the
+//! capture. A restore the transient-lifecycle
+//! sweeper reverted cleared the row's node columns instead, so the capture is
+//! refused for having no source node; nothing tells the node to release, and
+//! the pod stays terminating (reported as `teardown_stuck`). A successful
+//! DELETE therefore means that
 //! teardown has begun (the pod is terminating), not that the VM is gone: it's
 //! reported as `requested_orphaned_restore_pod_delete`, and the reap is only
 //! confirmed (`reaped_orphaned_restore_pod`, `cleanup_completed`) once the pod

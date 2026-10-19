@@ -216,7 +216,20 @@ per-VM memory, or disk and btrfs metrics.
 6.1.155) with C (Firecracker 1.17.0 / Linux 6.18.44). It measures create latency,
 cold start to guest readiness, and a stop/start cycle. This is a local Linux/KVM
 operator workflow; it neither deploys services nor launches a VMM directly.
-Arm B (new Firecracker with the old kernel) is not enabled.
+That script measures two arms. The lifecycle harness also accepts any approved
+environment reference, including Firecracker 1.17.0 with Linux 6.1.155:
+
+```bash
+bash scripts/benchmarks/bench-sbx-lifecycle.sh worker.example.com \
+  --template my-template --environment "$ENVIRONMENT_REFERENCE" --iterations 10
+```
+
+Use explicit selection for the baseline too, so each arm pays for the same
+admission protocol. Memory-state operations require a qualified binding;
+selected warm creation and pools have separate admission restrictions. Selected
+creation leaves periodic snapshots disabled; the harness requests suspend and
+checkpoint separately. Legacy `--snapshots` setup enables the scheduler, so do
+not mix legacy and selected invocations in one runtime comparison.
 
 1. Roll out the environment-aware services and clients to the designated builder
    and worker nodes. Ordinary E0 work can continue across mixed revisions. The

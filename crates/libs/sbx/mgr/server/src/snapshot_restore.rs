@@ -1296,6 +1296,7 @@ fn replacement_for_pull(local_path: &Path, s3_uri: &str, adopted: bool) -> PullR
 /// `Restoring` row and publishes that directory before the slow rootfs phase.
 pub async fn prepare_restore_dir(
     sandbox_id: &str,
+    owner: &pplx_space_common_core::types::SandboxOwner,
     execution_fence: pplx_space_node_mgr_client::execution_fence::ExecutionFence,
     transfer_scope_id: pplx_space_common_core::types::TransferScopeId,
     node_manager: &crate::node_manager_transport::NodeManagerConnector,
@@ -1308,7 +1309,7 @@ pub async fn prepare_restore_dir(
         RestoreMetadataDestination::InPlace(transfer_scope_id),
     )
     .await?;
-    restore_pull_rootfs(&staged, execution_fence, node_manager, templates).await?;
+    restore_pull_rootfs(&staged, owner, execution_fence, node_manager, templates).await?;
     Ok(RestorePrepared {
         snapshot_dir: staged.snapshot_dir,
         storage_uri: staged.storage_uri,
@@ -1319,6 +1320,7 @@ pub async fn prepare_restore_dir(
 
 pub async fn prepare_restore_dir_from_uri(
     sandbox_id: &str,
+    owner: &pplx_space_common_core::types::SandboxOwner,
     execution_fence: pplx_space_node_mgr_client::execution_fence::ExecutionFence,
     storage_uri: &str,
     transfer_scope_id: pplx_space_common_core::types::TransferScopeId,
@@ -1336,7 +1338,7 @@ pub async fn prepare_restore_dir_from_uri(
         RestoreMetadataDestination::InPlace(transfer_scope_id),
     )
     .await?;
-    restore_pull_rootfs(&staged, execution_fence, node_manager, templates).await?;
+    restore_pull_rootfs(&staged, owner, execution_fence, node_manager, templates).await?;
     Ok(RestorePrepared {
         snapshot_dir: staged.snapshot_dir,
         storage_uri: staged.storage_uri,
@@ -1894,6 +1896,7 @@ fn preserve_attributed_metadata_retry(
 /// completed, verified files for the next retry.
 pub async fn restore_pull_rootfs(
     stage: &RestoreMetadataStaged,
+    owner: &pplx_space_common_core::types::SandboxOwner,
     execution_fence: pplx_space_node_mgr_client::execution_fence::ExecutionFence,
     node_manager: &crate::node_manager_transport::NodeManagerConnector,
     templates: &dyn crate::template_resolver::TemplateResolver,
@@ -1936,6 +1939,7 @@ pub async fn restore_pull_rootfs(
         RestoreCodec::BtrfsSendV1 => {
             stage_btrfs_send_restore(
                 transfer_identity,
+                owner,
                 &stage.config,
                 &stage.snapshot_dir.join("snapshot.json"),
                 &stage.snapshot_dir,
@@ -2556,6 +2560,7 @@ async fn stage_encrypted_restore(
 )]
 async fn stage_btrfs_send_restore(
     identity: RestoreTransferIdentity<'_>,
+    owner: &pplx_space_common_core::types::SandboxOwner,
     config: &SnapshotUploadConfig,
     sidecar_path: &Path,
     snapshot_dir: &Path,
@@ -2615,7 +2620,7 @@ async fn stage_btrfs_send_restore(
     }
     run_btrfs_staging(
         Box::pin(async {
-            ensure_local_template(templates, sandbox_id, template_name, content_hash)
+            ensure_local_template(templates, sandbox_id, owner, template_name, content_hash)
                 .await
                 .map(drop)
         }),
@@ -2703,24 +2708,28 @@ async fn run_btrfs_staging<'a>(
 async fn ensure_local_template(
     templates: &dyn crate::template_resolver::TemplateResolver,
     sandbox_id: &str,
+    owner: &pplx_space_common_core::types::SandboxOwner,
     template_name: &str,
     content_hash: &str,
 ) -> Result<String, RestoreError> {
     use crate::template_resolver::TemplateLookupError;
     async {
+        let mut request =
+            tonic::Request::new(pplx_space_template_mgr_client::proto::GetTemplateRequest {
+                caller_org_id: None,
+                template: Some(pplx_space_template_mgr_client::proto::TemplateRef {
+                    name: template_name.to_string(),
+                    content_hash: Some(content_hash.to_string()),
+                    tag: None,
+                }),
+                vcpu: None,
+                memory_mib: None,
+            });
+        let scope = crate::service::template_lookup_scope(owner, Some(sandbox_id))
+            .map_err(|error| RestoreError::Other(error.to_string()))?;
+        scope.attach(&mut request);
         let resp = templates
-            .get_template(tonic::Request::new(
-                pplx_space_template_mgr_client::proto::GetTemplateRequest {
-                    caller_org_id: None,
-                    template: Some(pplx_space_template_mgr_client::proto::TemplateRef {
-                        name: template_name.to_string(),
-                        content_hash: Some(content_hash.to_string()),
-                        tag: None,
-                    }),
-                    vcpu: None,
-                    memory_mib: None,
-                },
-            ))
+            .get_template(request)
             .await
             .map_err(|error| match error {
                 TemplateLookupError::Connect(e) => RestoreError::Other(format!(
@@ -2729,8 +2738,11 @@ async fn ensure_local_template(
                 TemplateLookupError::Rpc(error) => {
                     template_pull_error(template_name, content_hash, error)
                 }
-            })?
-            .into_inner();
+            })?;
+        scope
+            .require_acknowledgement(&resp)
+            .map_err(|error| template_pull_error(template_name, content_hash, error))?;
+        let resp = resp.into_inner();
         if resp.template_dir.is_empty() {
             return Err(RestoreError::Other(format!(
                 "tmplmgr returned no local template dir for {template_name}@{content_hash}"

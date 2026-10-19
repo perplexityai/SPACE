@@ -9,6 +9,12 @@ use pplx_space_common_core::host::btrfs::SubvolumeInfo;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 
+#[cfg(target_os = "linux")]
+mod send_signals;
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests;
+
 pub(crate) fn is_subvolume(directory: &File) -> io::Result<bool> {
     #[cfg(target_os = "linux")]
     {
@@ -184,9 +190,17 @@ pub(crate) fn send(parent: &File, source: &File, output: &File) -> io::Result<()
         };
         // Protocol v1 is the existing portable stream, with a complete header
         // and end marker. The sole clone parent remains pinned throughout.
+        let signals = if !output.metadata()?.is_file() {
+            Some(send_signals::BlockedSignals::new()?)
+        } else {
+            None
+        };
         // SAFETY: SendArgs matches SEND's UAPI; its clone pointer references
         // parent_id and all three descriptors stay borrowed through the call.
-        ioctl_result(unsafe { libc::ioctl(source.as_raw_fd(), 0x4048_9426, &args) })
+        let result = ioctl_result(unsafe { libc::ioctl(source.as_raw_fd(), 0x4048_9426, &args) });
+        // Capture errno before restoring the mask can run pending handlers.
+        drop(signals);
+        result
     }
     #[cfg(not(target_os = "linux"))]
     {

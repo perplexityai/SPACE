@@ -44,11 +44,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::OwnedMutexGuard;
+use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
 use super::{
-    AttachedStreamPermit, BackendEndpoint, DataPlaneState, ECW_PROCESS_STREAM_KIND, EcwProxyError,
-    EcwResolvedRoute, acquire_ecw_stream_permit, ecw_backend_channel, ecw_connect,
-    node_api_request_with_route_token_state, optional_header, resolve_ecw_envd_route,
+    AttachedStreamPermit, BackendEndpoint, DataPlaneState, ECW_PROCESS_INPUT_STREAM_KIND,
+    ECW_PROCESS_STREAM_KIND, EcwProxyError, EcwResolvedRoute, acquire_ecw_stream_permit,
+    before_stream_deadline, ecw_backend_channel, ecw_connect,
+    node_api_request_with_route_token_state, optional_header, refuse_new_ecw_stream_while_draining,
+    resolve_ecw_envd_route,
 };
 use crate::runtime_route::{
     EcwRouteAttemptError, bounded_ecw_route_call_with_timeout_observer, bounded_node_api_unary,
@@ -281,6 +284,7 @@ pub(super) async fn process_start(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, EcwProxyError> {
+    refuse_new_ecw_stream_while_draining(&state, ECW_PROCESS_STREAM_KIND)?;
     let route = resolve_ecw_envd_route(&state, &headers).await?;
     let request: ProcessStartConnectRequestE2b =
         ecw_connect::decode_connect_json_request(body).await?;
@@ -302,6 +306,13 @@ pub(super) async fn process_start(
     let stall_after = process_stream_stall_after(command_timeout);
     let open_timeout = process_stream_open_timeout(command_timeout);
     let resume_request = native_request.clone();
+    // Not raced against the drain deadline: the guest may already be running
+    // the command, so the open runs to its own timeout and the stream reports
+    // the start (ProcessConnectJsonStream waits for it after the deadline).
+    // New starts are refused once the drain begins, so an open still running
+    // was admitted before SIGTERM and ends within the 8-second stream-open
+    // budget, before any deadline of at least that long. A second stop signal
+    // doesn't wait for it: forcing the exit cuts it the way SIGKILL would.
     let ((stream, retried_start), route) = open_process_start_stream_with_refresh(
         &state,
         route,
@@ -367,7 +378,10 @@ pub(super) async fn process_start(
         &route,
         stdout_stream,
         stall_after,
-        stream_permit,
+        EcwProcessStreamLease {
+            permit: stream_permit,
+            shutdown_token: state.stream_shutdown_token.child_token(),
+        },
     ))
 }
 
@@ -376,6 +390,7 @@ pub(super) async fn process_connect(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, EcwProxyError> {
+    refuse_new_ecw_stream_while_draining(&state, ECW_PROCESS_STREAM_KIND)?;
     let route = resolve_ecw_envd_route(&state, &headers).await?;
     let request: ProcessConnectRequestE2b = ecw_connect::decode_connect_json_request(body).await?;
     let process = process_for_selector(&state, &route, request.process).await?;
@@ -394,43 +409,55 @@ pub(super) async fn process_connect(
         }),
     };
     let route_state = state.clone();
-    let (stream, route) = bounded_ecw_route_call_with_timeout_observer(
-        &state,
-        route,
-        "process_connect_open",
-        open_timeout,
-        Some(log_process_connect_timeout),
-        move |route, _remaining| {
-            let message = message.clone();
-            let state = route_state.clone();
-            async move {
-                let channel = ecw_backend_channel(&state, &route)
-                    .await
-                    .map_err(EcwRouteAttemptError::Proxy)?;
-                let mut client = WorkerApiClient::new(wrap_grpc_client_channel(channel));
-                let result = client
-                    .spaced_connect_process(node_api_request_with_route_token_state(
-                        message,
-                        route.space_api_route_token.as_ref(),
-                    )?)
-                    .await
-                    .map(|response| response.into_inner());
-                if let Err(status) = &result {
-                    log_process_stream_open_status("Process.Connect", &route, status);
+    let opened = before_stream_deadline(
+        &state.stream_shutdown_token,
+        bounded_ecw_route_call_with_timeout_observer(
+            &state,
+            route,
+            "process_connect_open",
+            open_timeout,
+            Some(log_process_connect_timeout),
+            move |route, _remaining| {
+                let message = message.clone();
+                let state = route_state.clone();
+                async move {
+                    let channel = ecw_backend_channel(&state, &route)
+                        .await
+                        .map_err(EcwRouteAttemptError::Proxy)?;
+                    let mut client = WorkerApiClient::new(wrap_grpc_client_channel(channel));
+                    let result = client
+                        .spaced_connect_process(node_api_request_with_route_token_state(
+                            message,
+                            route.space_api_route_token.as_ref(),
+                        )?)
+                        .await
+                        .map(|response| response.into_inner());
+                    if let Err(status) = &result {
+                        log_process_stream_open_status("Process.Connect", &route, status);
+                    }
+                    result.map_err(EcwRouteAttemptError::Status)
                 }
-                result.map_err(EcwRouteAttemptError::Status)
-            }
-        },
-        ecw_connect::tonic_status_to_ecw_error,
+            },
+            ecw_connect::tonic_status_to_ecw_error,
+        ),
     )
-    .await?;
+    .await;
+    let Some(opened) = opened else {
+        // The permit above already counted the attach as `ok`.
+        pplx_space_metrics::data_plane::stream_closed(ECW_PROCESS_STREAM_KIND, "shutdown");
+        return Err(EcwProxyError::draining());
+    };
+    let (stream, route) = opened?;
 
     Ok(process_connect_json_stream_response(
         stream,
         &route,
         stdout_stream,
         stall_after,
-        stream_permit,
+        EcwProcessStreamLease {
+            permit: stream_permit,
+            shutdown_token: state.stream_shutdown_token.child_token(),
+        },
     ))
 }
 
@@ -527,27 +554,45 @@ pub(super) async fn process_stream_input(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Json<EmptyUnaryConnectResponseE2b>, EcwProxyError> {
+    let streaming = is_connect_json_stream_request(&headers);
+    // A streamed input request stays open as long as its client keeps
+    // sending, so the drain treats it as a stream; the unary form is served.
+    if streaming {
+        refuse_new_ecw_stream_while_draining(&state, ECW_PROCESS_INPUT_STREAM_KIND)?;
+    }
     let mut route = resolve_ecw_envd_route(&state, &headers).await?;
     let mut process_id = None::<String>;
     let mut input_guard = None::<OwnedMutexGuard<()>>;
 
-    if is_connect_json_stream_request(&headers) {
-        let mut body = body;
-        let mut buffer = Vec::new();
-        let mut seen_message = false;
-        while let Some(request) =
-            ecw_connect::decode_next_connect_json_stream_message(&mut body, &mut buffer).await?
-        {
-            seen_message = true;
-            handle_process_stream_input_request(
-                &state,
-                &mut route,
-                &mut process_id,
-                &mut input_guard,
-                request,
-            )
-            .await?;
-        }
+    if streaming {
+        // Again after the route lookup: SIGTERM may have landed while it ran.
+        refuse_new_ecw_stream_while_draining(&state, ECW_PROCESS_INPUT_STREAM_KIND)?;
+        let shutdown_token = state.stream_shutdown_token.child_token();
+        let input = async {
+            let mut body = body;
+            let mut buffer = Vec::new();
+            let mut seen_message = false;
+            while let Some(request) =
+                ecw_connect::decode_next_connect_json_stream_message(&mut body, &mut buffer).await?
+            {
+                seen_message = true;
+                handle_process_stream_input_request(
+                    &state,
+                    &mut route,
+                    &mut process_id,
+                    &mut input_guard,
+                    request,
+                )
+                .await?;
+            }
+            Ok::<_, EcwProxyError>(seen_message)
+        };
+        // The deadline ends the stream whether it is waiting for the client's
+        // next message or for a backend call on the last one.
+        let seen_message = tokio::select! {
+            () = shutdown_token.cancelled() => return Err(EcwProxyError::input_interrupted()),
+            seen_message = input => seen_message?,
+        };
         if !seen_message {
             return Err(EcwProxyError::bad_request("Empty Connect stream"));
         }
@@ -794,787 +839,6 @@ fn ecw_default_workdir_from_environment(
         .then(|| format!("/home/{DEFAULT_GUEST_USER}"))
 }
 
-fn process_connect_json_stream_response<S>(
-    stream: S,
-    route: &EcwResolvedRoute,
-    stdout_stream: ecw_connect::EcwProcessStdoutStream,
-    stall_after: Option<Duration>,
-    stream_permit: AttachedStreamPermit,
-) -> Response
-where
-    S: Stream<Item = Result<SpacedProcessEvent, tonic::Status>> + Send + 'static,
-{
-    ecw_connect::connect_json_stream_response(process_connect_json_stream(
-        stream,
-        "Process.Connect",
-        route,
-        true,
-        stdout_stream,
-        stall_after,
-        stream_permit,
-    ))
-}
-
-fn process_start_json_stream_response<S>(
-    stream: S,
-    route: &EcwResolvedRoute,
-    stdout_stream: ecw_connect::EcwProcessStdoutStream,
-    stall_after: Option<Duration>,
-    stream_permit: AttachedStreamPermit,
-) -> Response
-where
-    S: Stream<Item = Result<SpacedProcessEvent, tonic::Status>> + Send + 'static,
-{
-    ecw_connect::connect_json_stream_response(process_connect_json_stream(
-        stream,
-        "Process.Start",
-        route,
-        false,
-        stdout_stream,
-        stall_after,
-        stream_permit,
-    ))
-}
-
-type BoxedSpacedProcessStream =
-    Pin<Box<dyn Stream<Item = Result<SpacedProcessEvent, tonic::Status>> + Send>>;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum ProcessStartResume {
-    Start,
-    Connect {
-        process_id: ProcessId,
-        output_cursor: u64,
-    },
-}
-
-impl ProcessStartResume {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Start => "retry_start",
-            Self::Connect { .. } => "reattach",
-        }
-    }
-
-    fn is_connect(&self) -> bool {
-        matches!(self, Self::Connect { .. })
-    }
-
-    fn recovery_mode(&self) -> ProcessStartRecoveryMode {
-        match self {
-            Self::Start => ProcessStartRecoveryMode::RetryStart,
-            Self::Connect { .. } => ProcessStartRecoveryMode::Reattach,
-        }
-    }
-}
-
-impl Display for ProcessStartResume {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-struct ResumableProcessStartState<R> {
-    stream: BoxedSpacedProcessStream,
-    reopen: R,
-    process_id: Option<ProcessId>,
-    output_cursor: u64,
-    terminal: bool,
-    ended: bool,
-    reopens_without_progress: usize,
-    reopened_start: bool,
-    replaying: bool,
-}
-
-const PROCESS_START_REOPEN_BACKOFF: [Duration; 2] =
-    [Duration::from_millis(100), Duration::from_millis(200)];
-
-fn process_start_reopen_delay(reopens_without_progress: usize) -> Option<Duration> {
-    PROCESS_START_REOPEN_BACKOFF
-        .get(reopens_without_progress)
-        .copied()
-}
-
-impl<R> ResumableProcessStartState<R> {
-    fn resume(&self) -> ProcessStartResume {
-        match self.process_id.clone() {
-            Some(process_id) => ProcessStartResume::Connect {
-                process_id,
-                output_cursor: self.output_cursor,
-            },
-            None => ProcessStartResume::Start,
-        }
-    }
-
-    fn observe(&mut self, event: &SpacedProcessEvent) -> Result<(), tonic::Status> {
-        match &event.event {
-            Some(
-                spaced_ops::process_event::Event::Started(_)
-                | spaced_ops::process_event::Event::Connected(_),
-            ) => {
-                let first_binding = self.process_id.is_none();
-                let started = matches!(
-                    &event.event,
-                    Some(spaced_ops::process_event::Event::Started(_))
-                );
-                let process_id = parse_backend_process_id(event)?;
-                if self
-                    .process_id
-                    .as_ref()
-                    .is_some_and(|current| current != &process_id)
-                {
-                    return Err(tonic::Status::data_loss(
-                        "backend changed process_id while reconnecting",
-                    ));
-                }
-                self.process_id = Some(process_id);
-                if first_binding && started {
-                    let outcome = if self.reopened_start {
-                        ProcessStartDeliveryOutcome::DeduplicatedRetry
-                    } else {
-                        ProcessStartDeliveryOutcome::NewStart
-                    };
-                    pplx_space_metrics::data_plane::process_start_delivery(outcome);
-                } else if self.replaying
-                    && matches!(
-                        &event.event,
-                        Some(spaced_ops::process_event::Event::Connected(_))
-                    )
-                {
-                    pplx_space_metrics::data_plane::process_start_delivery(
-                        ProcessStartDeliveryOutcome::Reattached,
-                    );
-                }
-            }
-            Some(
-                spaced_ops::process_event::Event::Stdout(_)
-                | spaced_ops::process_event::Event::Stderr(_),
-            ) => {
-                self.ensure_bound_process(event)?;
-                self.output_cursor = self.output_cursor.saturating_add(1);
-                self.reopens_without_progress = 0;
-            }
-            Some(spaced_ops::process_event::Event::Exit(_)) => {
-                self.ensure_bound_process(event)?;
-                self.terminal = true;
-                self.reopens_without_progress = 0;
-            }
-            None => {}
-        }
-        Ok(())
-    }
-
-    fn ensure_bound_process(&self, event: &SpacedProcessEvent) -> Result<(), tonic::Status> {
-        let Some(current) = self.process_id.as_ref() else {
-            return Err(tonic::Status::data_loss(
-                "backend returned a process event before process start",
-            ));
-        };
-        let process_id = parse_backend_process_id(event)?;
-        if current != &process_id {
-            return Err(tonic::Status::data_loss(
-                "backend changed process_id while streaming process events",
-            ));
-        }
-        Ok(())
-    }
-}
-
-fn parse_backend_process_id(event: &SpacedProcessEvent) -> Result<ProcessId, tonic::Status> {
-    ProcessId::parse(event.process_id.clone()).map_err(|error| {
-        tonic::Status::data_loss(format!("backend returned invalid process_id: {error}"))
-    })
-}
-
-fn resumable_process_start_stream<S, R, F>(
-    stream: S,
-    retried_start: bool,
-    reopen: R,
-) -> impl Stream<Item = Result<SpacedProcessEvent, tonic::Status>> + Send
-where
-    S: Stream<Item = Result<SpacedProcessEvent, tonic::Status>> + Send + 'static,
-    R: FnMut(ProcessStartResume) -> F + Send + 'static,
-    F: Future<Output = Result<BoxedSpacedProcessStream, tonic::Status>> + Send + 'static,
-{
-    futures_util::stream::unfold(
-        ResumableProcessStartState {
-            stream: Box::pin(stream),
-            reopen,
-            process_id: None,
-            output_cursor: 0,
-            terminal: false,
-            ended: false,
-            reopens_without_progress: 0,
-            reopened_start: retried_start,
-            replaying: false,
-        },
-        |mut state| async move {
-            if state.ended {
-                return None;
-            }
-
-            loop {
-                if state.terminal {
-                    return None;
-                }
-
-                // Older guests replay Start from the output tail. Once a retried
-                // Start reveals its identity, reconnect at the delivered cursor
-                // so recovery also works across guest versions.
-                if state.reopened_start && state.process_id.is_some() {
-                    let resume = state.resume();
-                    let replaying = resume.is_connect();
-                    match (state.reopen)(resume).await {
-                        Ok(stream) => {
-                            state.stream = stream;
-                            state.reopened_start = false;
-                            state.replaying = replaying;
-                        }
-                        Err(status) => {
-                            state.ended = true;
-                            return Some((Err(status), state));
-                        }
-                    }
-                }
-
-                let reopen_status = match state.stream.next().await {
-                    Some(Ok(event)) => {
-                        if let Err(status) = state.observe(&event) {
-                            state.ended = true;
-                            return Some((Err(status), state));
-                        }
-                        return Some((Ok(event), state));
-                    }
-                    Some(Err(status)) if is_recoverable_process_start_interruption(&status) => {
-                        status
-                    }
-                    Some(Err(status)) => {
-                        if state.replaying
-                            && let Some(outcome) = process_start_delivery_failure(&status)
-                        {
-                            pplx_space_metrics::data_plane::process_start_delivery(outcome);
-                        }
-                        state.ended = true;
-                        return Some((Err(status), state));
-                    }
-                    None if state.terminal => return None,
-                    None => {
-                        tonic::Status::unavailable("process stream closed before a terminal event")
-                    }
-                };
-
-                let Some(reopen_delay) = process_start_reopen_delay(state.reopens_without_progress)
-                else {
-                    state.ended = true;
-                    return Some((
-                        Err(tonic::Status::unavailable(
-                            "process stream repeatedly closed without output or a terminal event",
-                        )),
-                        state,
-                    ));
-                };
-                state.reopens_without_progress = state.reopens_without_progress.saturating_add(1);
-                let resume = state.resume();
-                record_process_start_recovery(&reopen_status, resume.recovery_mode());
-                tokio::time::sleep(reopen_delay).await;
-                let reopened_start = resume == ProcessStartResume::Start;
-                let replaying = resume.is_connect();
-                match (state.reopen)(resume).await {
-                    Ok(stream) => {
-                        state.stream = stream;
-                        state.reopened_start = reopened_start;
-                        state.replaying = replaying;
-                    }
-                    Err(status) => {
-                        state.ended = true;
-                        return Some((Err(status), state));
-                    }
-                }
-                tracing::debug!(
-                    grpc_code = ?reopen_status.code(),
-                    status_class = %process_start_status_class(&reopen_status),
-                    "reopened ECW process start stream after backend interruption",
-                );
-            }
-        },
-    )
-}
-
-fn is_recoverable_process_start_interruption(status: &tonic::Status) -> bool {
-    // Client cancellation drops the handler future, so a Cancelled status
-    // observed here came from the backend while the client was still active.
-    status.code() == tonic::Code::Cancelled || is_temporary_tcp_failure(status)
-}
-
-fn process_start_recovery_interruption(
-    status: &tonic::Status,
-) -> Option<ProcessStartRecoveryInterruption> {
-    match status.code() {
-        tonic::Code::Cancelled => Some(ProcessStartRecoveryInterruption::Cancelled),
-        tonic::Code::Internal => Some(ProcessStartRecoveryInterruption::Internal),
-        tonic::Code::Unavailable => Some(ProcessStartRecoveryInterruption::Unavailable),
-        tonic::Code::Unknown => Some(ProcessStartRecoveryInterruption::Unknown),
-        _ => None,
-    }
-}
-
-fn record_process_start_recovery(status: &tonic::Status, mode: ProcessStartRecoveryMode) {
-    if let Some(interruption) = process_start_recovery_interruption(status) {
-        pplx_space_metrics::data_plane::process_start_recovery(interruption, mode);
-    }
-}
-
-async fn open_process_start_stream(
-    state: DataPlaneState,
-    route: EcwResolvedRoute,
-    start_request: SpacedStartProcessRequest,
-    resume: ProcessStartResume,
-    open_timeout: Duration,
-) -> Result<(BoxedSpacedProcessStream, bool), tonic::Status> {
-    let retrying_start = resume == ProcessStartResume::Start;
-    let result = retry_process_start_open(
-        start_request,
-        resume.recovery_mode(),
-        open_timeout,
-        |start_request, attempt_count| {
-            let evict_cached_channel = attempt_count > 1;
-            let state = state.clone();
-            let route = route.clone();
-            let resume = resume.clone();
-            async move {
-                if evict_cached_channel {
-                    state
-                        .backend_channels
-                        .forget_endpoint(&route.backend_endpoint);
-                }
-                let channel = ecw_backend_channel(&state, &route)
-                    .await
-                    .map_err(EcwProxyError::into_tonic_status)?;
-                let mut client = WorkerApiClient::new(wrap_grpc_client_channel(channel));
-                let response = match resume {
-                    ProcessStartResume::Start => {
-                        client
-                            .spaced_start_process(node_api_request_with_route_token_state(
-                                start_request,
-                                route.space_api_route_token.as_ref(),
-                            )?)
-                            .await
-                    }
-                    ProcessStartResume::Connect {
-                        process_id,
-                        output_cursor,
-                    } => {
-                        client
-                            .spaced_connect_process(node_api_request_with_route_token_state(
-                                build_process_start_resume_request(
-                                    &route,
-                                    &start_request,
-                                    &process_id,
-                                    output_cursor,
-                                ),
-                                route.space_api_route_token.as_ref(),
-                            )?)
-                            .await
-                    }
-                }?;
-                Ok(Box::pin(response.into_inner()) as BoxedSpacedProcessStream)
-            }
-        },
-    )
-    .await;
-    let (stream, attempt_count) = match result {
-        Ok(value) => value,
-        Err(status) => {
-            log_process_stream_open_status("Process.Start", &route, &status);
-            return Err(status);
-        }
-    };
-    Ok((stream, retrying_start && attempt_count > 1))
-}
-
-async fn open_process_start_stream_with_refresh(
-    state: &DataPlaneState,
-    route: EcwResolvedRoute,
-    start_request: SpacedStartProcessRequest,
-    resume: ProcessStartResume,
-    open_timeout: Duration,
-) -> Result<((BoxedSpacedProcessStream, bool), EcwResolvedRoute), EcwProxyError> {
-    bounded_ecw_route_call_with_timeout_observer(
-        state,
-        route,
-        "process_start_open",
-        open_timeout,
-        Some(log_process_start_timeout),
-        move |route, remaining| {
-            let state = state.clone();
-            let start_request = start_request.clone();
-            let resume = resume.clone();
-            async move {
-                open_process_start_stream(state, route, start_request, resume, remaining)
-                    .await
-                    .map_err(EcwRouteAttemptError::Status)
-            }
-        },
-        ecw_connect::tonic_status_to_ecw_error,
-    )
-    .await
-}
-
-fn build_process_start_resume_request(
-    route: &EcwResolvedRoute,
-    start_request: &SpacedStartProcessRequest,
-    process_id: &ProcessId,
-    output_cursor: u64,
-) -> SpacedConnectProcessRequest {
-    SpacedConnectProcessRequest {
-        sandbox_id: route.sandbox_id.to_string(),
-        operation: Some(spaced_ops::ConnectProcessRequest {
-            process_id: process_id.to_string(),
-            timeout: start_request
-                .operation
-                .as_ref()
-                .and_then(|operation| operation.timeout),
-            output_cursor: Some(output_cursor),
-        }),
-    }
-}
-
-async fn retry_process_start_open<T, F, Fut>(
-    start_request: SpacedStartProcessRequest,
-    recovery_mode: ProcessStartRecoveryMode,
-    open_timeout: Duration,
-    mut operation: F,
-) -> Result<(T, u8), tonic::Status>
-where
-    F: FnMut(SpacedStartProcessRequest, u8) -> Fut,
-    Fut: Future<Output = Result<T, tonic::Status>>,
-{
-    let mut attempt_count = 0_u8;
-    let result = retry_grpc_status_with_context_if(
-        "space-node-api",
-        "ecw_process_start_open",
-        DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
-        GrpcRetryContext::with_timeout(open_timeout),
-        is_recoverable_process_start_interruption,
-        || {
-            attempt_count = attempt_count.saturating_add(1);
-            let start_request = start_request.clone();
-            let attempt = operation(start_request, attempt_count);
-            async move {
-                let result = attempt.await;
-                if let Err(status) = &result
-                    && is_recoverable_process_start_interruption(status)
-                {
-                    record_process_start_recovery(status, recovery_mode);
-                }
-                result
-            }
-        },
-    )
-    .await?;
-    Ok((result, attempt_count))
-}
-
-fn is_process_replay_miss(status: &tonic::Status) -> bool {
-    match status.code() {
-        tonic::Code::NotFound | tonic::Code::FailedPrecondition => true,
-        tonic::Code::ResourceExhausted => UdsPerSandboxLimitExceeded::from_status(status).is_none(),
-        _ => false,
-    }
-}
-
-fn process_start_delivery_failure(status: &tonic::Status) -> Option<ProcessStartDeliveryOutcome> {
-    if UdsPerSandboxLimitExceeded::from_status(status).is_some() {
-        Some(ProcessStartDeliveryOutcome::Backpressure)
-    } else if is_process_replay_miss(status) {
-        Some(ProcessStartDeliveryOutcome::ReplayMiss)
-    } else {
-        None
-    }
-}
-
-fn process_start_reopen_status(error: EcwProxyError, resume: &ProcessStartResume) -> tonic::Status {
-    let status = error.into_tonic_status();
-    if resume.is_connect()
-        && let Some(outcome) = process_start_delivery_failure(&status)
-    {
-        pplx_space_metrics::data_plane::process_start_delivery(outcome);
-    }
-    status
-}
-
-fn reset_process_start_stream_channel(state: &DataPlaneState, route: &EcwResolvedRoute) {
-    state
-        .backend_channels
-        .forget_endpoint(&route.backend_endpoint);
-    pplx_space_metrics::data_plane::backend_channel_reset("ecw", "worker_unavailable");
-    pplx_space_metrics::data_plane::backend_affected_streams(ECW_PROCESS_STREAM_KIND, 1);
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProcessStartStatusClass {
-    UdsBackpressure,
-    ReplayMiss,
-    RecoverableInterruption,
-    BackendStatus,
-}
-
-impl ProcessStartStatusClass {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::UdsBackpressure => "uds_backpressure",
-            Self::ReplayMiss => "replay_miss",
-            Self::RecoverableInterruption => "recoverable_interruption",
-            Self::BackendStatus => "backend_status",
-        }
-    }
-}
-
-impl Display for ProcessStartStatusClass {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-fn process_start_status_class(status: &tonic::Status) -> ProcessStartStatusClass {
-    if UdsPerSandboxLimitExceeded::from_status(status).is_some() {
-        ProcessStartStatusClass::UdsBackpressure
-    } else if is_process_replay_miss(status) {
-        ProcessStartStatusClass::ReplayMiss
-    } else if is_recoverable_process_start_interruption(status) {
-        ProcessStartStatusClass::RecoverableInterruption
-    } else {
-        ProcessStartStatusClass::BackendStatus
-    }
-}
-
-const PROCESS_STREAM_STALL_GRACE: Duration = Duration::from_secs(15);
-const PROCESS_STREAM_STALL_MESSAGE: &str =
-    "sandbox runtime became unreachable; process stream stalled";
-const PROCESS_STREAM_STALL_EVENT: &str = "ecw_process_stream_stalled";
-const PROCESS_STREAM_OPEN_TIMEOUT_EVENT: &str = "ecw_process_stream_open_timed_out";
-const PROCESS_STREAM_OPEN_BACKPRESSURE_EVENT: &str = "ecw_process_stream_open_backpressure";
-const PROCESS_STREAM_OPEN_BACKEND_STATUS_EVENT: &str = "ecw_process_stream_open_backend_status";
-
-fn log_process_stream_open_status(
-    operation: &'static str,
-    route: &EcwResolvedRoute,
-    status: &tonic::Status,
-) {
-    if UdsPerSandboxLimitExceeded::from_status(status).is_some() {
-        tracing::info!(
-            event_type = PROCESS_STREAM_OPEN_BACKPRESSURE_EVENT,
-            operation,
-            sandbox_id = %route.sandbox_id,
-            route_generation = route.route_generation,
-            current_node_id = %route.current_node_id,
-            backend_endpoint = %route.backend_endpoint,
-            grpc_code = ?status.code(),
-            status_class = %process_start_status_class(status),
-            "ECW process stream open hit sandbox backpressure"
-        );
-        return;
-    }
-
-    tracing::warn!(
-        event_type = PROCESS_STREAM_OPEN_BACKEND_STATUS_EVENT,
-        operation,
-        sandbox_id = %route.sandbox_id,
-        route_generation = route.route_generation,
-        current_node_id = %route.current_node_id,
-        backend_endpoint = %route.backend_endpoint,
-        grpc_code = ?status.code(),
-        status_class = %process_start_status_class(status),
-        "ECW process stream open returned backend status"
-    );
-}
-
-pub(super) fn log_process_stream_open_timeout(
-    operation: &'static str,
-    route: &EcwResolvedRoute,
-    open_timeout: Duration,
-) {
-    tracing::warn!(
-        event_type = PROCESS_STREAM_OPEN_TIMEOUT_EVENT,
-        operation,
-        sandbox_id = %route.sandbox_id,
-        route_generation = route.route_generation,
-        current_node_id = %route.current_node_id,
-        backend_endpoint = %route.backend_endpoint,
-        open_timeout_ms = open_timeout.as_millis(),
-        "ECW process stream open timed out before receiving a backend stream",
-    );
-}
-
-fn log_process_connect_timeout(route: &EcwResolvedRoute, timeout: Duration) {
-    log_process_stream_open_timeout("Process.Connect", route, timeout);
-}
-
-fn log_process_start_timeout(route: &EcwResolvedRoute, timeout: Duration) {
-    log_process_stream_open_timeout("Process.Start", route, timeout);
-}
-
-fn process_stream_open_timeout(timeout: Option<&prost_types::Duration>) -> Duration {
-    let cap = NodeApiOperationBudget::StreamOpen.timeout();
-    timeout
-        .and_then(process_timeout_duration)
-        .map_or(cap, |timeout| timeout.min(cap))
-}
-
-fn process_stream_stall_after(timeout: Option<&prost_types::Duration>) -> Option<Duration> {
-    let timeout = timeout.and_then(process_timeout_duration)?;
-    Some(timeout + PROCESS_STREAM_STALL_GRACE)
-}
-
-fn process_timeout_duration(timeout: &prost_types::Duration) -> Option<Duration> {
-    let seconds = u64::try_from(timeout.seconds).ok()?;
-    let nanos = u32::try_from(timeout.nanos.max(0)).ok()?;
-    let timeout = Duration::new(seconds, nanos);
-    if timeout.is_zero() {
-        return None;
-    }
-    Some(timeout)
-}
-
-fn process_connect_json_stream<S>(
-    stream: S,
-    operation: &'static str,
-    route: &EcwResolvedRoute,
-    connected_as_start: bool,
-    stdout_stream: ecw_connect::EcwProcessStdoutStream,
-    stall_after: Option<Duration>,
-    stream_permit: AttachedStreamPermit,
-) -> ProcessConnectJsonStream<S>
-where
-    S: Stream<Item = Result<SpacedProcessEvent, tonic::Status>>,
-{
-    ProcessConnectJsonStream {
-        inner: Box::pin(stream),
-        operation,
-        sandbox_id: route.sandbox_id,
-        route_generation: route.route_generation,
-        current_node_id: route.current_node_id,
-        backend_endpoint: route.backend_endpoint.clone(),
-        connected_as_start,
-        stdout_stream,
-        ended: false,
-        close_recorded: false,
-        stall_after,
-        stall_deadline: stall_after.map(|after| Box::pin(tokio::time::sleep(after))),
-        _stream_permit: stream_permit,
-    }
-}
-
-struct ProcessConnectJsonStream<S> {
-    inner: Pin<Box<S>>,
-    operation: &'static str,
-    sandbox_id: SandboxId,
-    route_generation: u64,
-    current_node_id: NodeId,
-    backend_endpoint: BackendEndpoint,
-    connected_as_start: bool,
-    stdout_stream: ecw_connect::EcwProcessStdoutStream,
-    ended: bool,
-    close_recorded: bool,
-    stall_after: Option<Duration>,
-    stall_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
-    _stream_permit: AttachedStreamPermit,
-}
-
-impl<S> ProcessConnectJsonStream<S> {
-    fn record_close(&mut self, result: &'static str) {
-        if self.close_recorded {
-            return;
-        }
-        self.close_recorded = true;
-        pplx_space_metrics::data_plane::stream_closed(ECW_PROCESS_STREAM_KIND, result);
-    }
-}
-
-impl<S> Drop for ProcessConnectJsonStream<S> {
-    fn drop(&mut self) {
-        if !self.close_recorded {
-            pplx_space_metrics::data_plane::stream_closed(ECW_PROCESS_STREAM_KIND, "client_closed");
-        }
-    }
-}
-
-impl<S> Stream for ProcessConnectJsonStream<S>
-where
-    S: Stream<Item = Result<SpacedProcessEvent, tonic::Status>>,
-{
-    type Item = Result<Bytes, Infallible>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        if this.ended {
-            return Poll::Ready(None);
-        }
-
-        loop {
-            match this.inner.as_mut().poll_next(cx) {
-                Poll::Ready(Some(Ok(event))) => {
-                    if let Some(bytes) = ecw_connect::process_event_to_connect_message(
-                        event,
-                        this.connected_as_start,
-                        this.stdout_stream,
-                    ) {
-                        record_ecw_process_stream_bytes(&bytes);
-                        return Poll::Ready(Some(Ok(bytes)));
-                    }
-                }
-                Poll::Ready(Some(Err(status))) => {
-                    this.ended = true;
-                    this.record_close("backend_status");
-                    let bytes =
-                        ecw_connect::connect_error_end_stream(status.code(), status.message());
-                    record_ecw_process_stream_bytes(&bytes);
-                    return Poll::Ready(Some(Ok(bytes)));
-                }
-                Poll::Ready(None) => {
-                    this.ended = true;
-                    this.record_close("ok");
-                    let bytes = ecw_connect::connect_json_message(serde_json::json!({}), true);
-                    record_ecw_process_stream_bytes(&bytes);
-                    return Poll::Ready(Some(Ok(bytes)));
-                }
-                Poll::Pending => {
-                    if let Some(deadline) = this.stall_deadline.as_mut()
-                        && std::future::Future::poll(deadline.as_mut(), cx).is_ready()
-                    {
-                        this.ended = true;
-                        this.record_close("stalled");
-                        tracing::warn!(
-                            event_type = PROCESS_STREAM_STALL_EVENT,
-                            operation = this.operation,
-                            sandbox_id = %this.sandbox_id,
-                            route_generation = this.route_generation,
-                            current_node_id = %this.current_node_id,
-                            backend_endpoint = %this.backend_endpoint,
-                            connected_as_start = this.connected_as_start,
-                            stall_after_ms = this.stall_after.map(|after| after.as_millis() as u64),
-                            stall_grace_secs = PROCESS_STREAM_STALL_GRACE.as_secs(),
-                            "ECW process stream stalled past command timeout; \
-                             closing with recoverable Unavailable",
-                        );
-                        let bytes = ecw_connect::connect_error_end_stream(
-                            tonic::Code::Unavailable,
-                            PROCESS_STREAM_STALL_MESSAGE,
-                        );
-                        record_ecw_process_stream_bytes(&bytes);
-                        return Poll::Ready(Some(Ok(bytes)));
-                    }
-                    return Poll::Pending;
-                }
-            }
-        }
-    }
-}
-
-fn record_ecw_process_stream_bytes(bytes: &Bytes) {
-    pplx_space_metrics::data_plane::stream_bytes_out(ECW_PROCESS_STREAM_KIND, bytes.len() as u64);
-}
-
 fn process_info_to_e2b(info: spaced_ops::ProcessInfo) -> ProcessInfoE2b {
     let mut command = info.command.into_iter();
     let cmd = command.next().unwrap_or_default();
@@ -1765,5 +1029,7 @@ fn process_signal_to_native(signal: ProcessSignalValueE2b) -> Result<i32, EcwPro
         .map_err(|_| EcwProxyError::bad_request("Unsupported process signal"))
 }
 
+mod stream;
+use stream::*;
 #[cfg(test)]
 mod tests;

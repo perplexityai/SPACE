@@ -17,7 +17,7 @@ use super::create_support::{
     CheckpointRestoreRetryAction, GUEST_GATEWAY, GUEST_IP, RestoredSnapshotProvenance,
     RuntimeActivatedEvent, SUSPEND_CHECKPOINT, admit_warm_start, checkpoint_restore_retry_action,
     checkpoint_start_response_for_existing_started_sandbox, emit_runtime_activated_event,
-    guest_console_logs_enabled, resolve_template_paths_for_start, sandbox_rootfs_exists,
+    guest_console_logs_enabled, resolve_template_paths_for_start,
     stage_base_snapshot_runtime_metadata, template_runtime_defaults_for_sandbox_start,
     template_source_for_sandbox_prepare, write_warm_start_restaged,
 };
@@ -429,6 +429,7 @@ pub(super) struct ResolvedSandboxMemoryPolicy {
 
 async fn prepare_suspend_restore_dir(
     service: &SandboxManagerService,
+    owner: &pplx_space_common_core::types::SandboxOwner,
     sandbox_id: String,
     storage_uri: Option<String>,
     execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
@@ -508,6 +509,7 @@ async fn prepare_suspend_restore_dir(
         Some(storage_uri) => {
             crate::snapshot_restore::prepare_restore_dir_from_uri(
                 &sandbox_id,
+                owner,
                 execution_fence,
                 storage_uri,
                 transfer_scope_id,
@@ -519,6 +521,7 @@ async fn prepare_suspend_restore_dir(
         None => {
             crate::snapshot_restore::prepare_restore_dir(
                 &sandbox_id,
+                owner,
                 execution_fence,
                 transfer_scope_id,
                 &service.node_manager,
@@ -680,17 +683,14 @@ impl SandboxManagerService {
         let response = node_client
             .get_network_pool_status(NetworkPoolStatusRequest {})
             .await
-            .map_err(|error| {
-                Status::new(
-                    error.code(),
-                    format!(
-                        "node-manager memory policy lookup failed: {}",
-                        error.message()
-                    ),
-                )
-            })?
+            .map_err(memory_policy_lookup_error)?
             .into_inner();
+        Self::node_sandbox_memory_policy_from(response)
+    }
 
+    fn node_sandbox_memory_policy_from(
+        response: pplx_space_node_mgr_client::proto::NetworkPoolStatusResponse,
+    ) -> Result<NodeSandboxMemoryPolicy, Status> {
         let cgroup_memory_mib = required_node_memory_policy_field(
             response.sandbox_cgroup_memory_mib,
             "sandbox_cgroup_memory_mib",
@@ -751,11 +751,40 @@ impl SandboxManagerService {
     pub(super) async fn resolve_sandbox_memory_policy_for_request(
         &self,
         requested_memory_mib: u32,
+        caller_metadata: &tonic::metadata::MetadataMap,
     ) -> Result<ResolvedSandboxMemoryPolicy, Status> {
-        let mut node_client = connect_node(&self.node_manager)
-            .await
-            .map_err(|e| Status::internal(format!("cannot connect to node-manager: {e}")))?;
-        let node_memory_policy = Self::node_sandbox_memory_policy(&mut node_client).await?;
+        // Template-manager asks for this on every reconcile, so the read shares
+        // the service's kept node-manager channel rather than dialing
+        // node-manager for each call. It keeps the 10 s budget the dial used
+        // to have: template-manager falls back to an unclamped memory size
+        // when this fails, so a node-manager restart must be waited out, not
+        // failed fast. The budget bounds the whole read, not only its retries:
+        // the kept channel dials inside an attempt, and a node-manager that
+        // accepts but never answers would otherwise hold an attempt until the
+        // server's own timeout. The caller's deadline, when it sent one, ends
+        // the read sooner.
+        const POLICY: pplx_space_common_grpc::GrpcRetryPolicy =
+            pplx_space_common_grpc::DEFAULT_GRPC_CONNECT_RETRY_POLICY;
+        let node_manager = self.node_manager.lazy();
+        let response = pplx_space_common_grpc::retry_grpc_status_with_context(
+            "node-manager",
+            "GetNetworkPoolStatus",
+            POLICY,
+            pplx_space_common_grpc::GrpcRetryContext::with_timeout(POLICY.max_elapsed)
+                .with_grpc_timeout_metadata(caller_metadata),
+            || {
+                let mut client = node_manager.clone();
+                async move {
+                    client
+                        .get_network_pool_status(NetworkPoolStatusRequest {})
+                        .await
+                }
+            },
+        )
+        .await
+        .map_err(memory_policy_lookup_error)?
+        .into_inner();
+        let node_memory_policy = Self::node_sandbox_memory_policy_from(response)?;
         Ok(self.resolve_sandbox_memory_policy(requested_memory_mib, node_memory_policy))
     }
 
@@ -1241,6 +1270,7 @@ impl SandboxManagerService {
                     |sandbox_id, storage_uri| {
                         prepare_suspend_restore_dir(
                             self,
+                            &sandbox.user,
                             sandbox_id,
                             storage_uri,
                             ctx.execution_generation,
@@ -1369,6 +1399,7 @@ impl SandboxManagerService {
                     content_hash: sandbox.template_hash.clone(),
                     tag: None,
                 },
+                sandbox,
             )
             .await?;
             reject_incompatible_template_spaced_compatibility(
@@ -1549,7 +1580,6 @@ impl SandboxManagerService {
         );
         span.record("runtime", tracing::field::display(&sandbox.runtime));
         span.record("initial_state", tracing::field::display(sandbox.state));
-        span.record("has_rootfs", sandbox_rootfs_exists(&sandbox.id));
         let sandbox_dir = std::path::PathBuf::from(format!("{CACHE_DIR}/{}", sandbox.id));
         let snapshot_vmstate_path = canonical_suspend_snapshot_dir(&sandbox_dir).join("vmstate");
         span.record("has_snapshot", snapshot_vmstate_path.exists());
@@ -1643,9 +1673,14 @@ impl SandboxManagerService {
             "fresh.template_prepare_source",
             START_TEMPLATE_RESOLUTION_TIMEOUT,
             &sandbox.id,
-            template_source_for_sandbox_prepare(self.template_resolver.as_ref(), &sandbox),
+            template_source_for_sandbox_prepare(
+                &self.node_manager,
+                self.template_resolver.as_ref(),
+                &sandbox,
+            ),
         )
         .await?;
+        span.record("has_rootfs", prepare_source.existing_artifact);
         let selection_mode = if prepare_source.existing_artifact {
             pplx_space_execution_common::proto::ExecutionSelectionMode::ExistingColdBoot
         } else {
@@ -2587,6 +2622,16 @@ fn firecracker_balloon_field(
             pplx_space_node_runtime_core::fc_api::balloon_json(balloon)
         )
     })
+}
+
+fn memory_policy_lookup_error(error: Status) -> Status {
+    Status::new(
+        error.code(),
+        format!(
+            "node-manager memory policy lookup failed: {}",
+            error.message()
+        ),
+    )
 }
 
 #[cfg(test)]

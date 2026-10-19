@@ -52,10 +52,9 @@ mod util;
 
 use cluster_reconcile_trigger::{ClusterReconcileTrigger, trigger_request_reason};
 
-const SOCKET_GROUP: &str = group_names::SPACE_NODECTLCLIENTS;
-// Hard-coded so two instances on the same host cannot be configured to use
-// different mutex files and both acquire concurrently.
-const SERVICE_MUTEX_PATH: &str = "/space/run/node-ctl/service.mutex";
+/// The group node-ctl's clients reach its production socket through.
+pub const DEFAULT_NODE_CTL_SOCKET_GROUP: &str = group_names::SPACE_NODECTLCLIENTS;
+const SERVICE_MUTEX_FILE_NAME: &str = "service.mutex";
 const NETWORK_POLICY_RECONCILER: &str = "network-policies";
 const SANDBOX_DESIRED_STATE_RECONCILER: &str = "sandbox-desired-state";
 const TEMPLATE_BASE_SNAPSHOT_POLICY_RECONCILER: &str = "template-base-snapshot-policy";
@@ -200,6 +199,9 @@ pub struct NodeCtlRunConfig {
     /// How long the passive instance waits for the predecessor to release the
     /// service mutex before exiting non-zero.
     pub service_mutex_timeout: Duration,
+    /// The group the production socket must be given. Production uses
+    /// [`DEFAULT_NODE_CTL_SOCKET_GROUP`]; tests name a group they belong to.
+    pub socket_group: &'static str,
     /// Node-ctl's SQLite database.
     pub db_path: PathBuf,
     /// Reconciliation poll interval; `None` defers to the config file, then
@@ -332,6 +334,8 @@ impl ClusterPass {
         let span = tracing::info_span!(
             parent: None,
             "node_ctl.pass",
+            otel.kind = "internal",
+            "operation.name" = "node_ctl.pass",
             cause,
             node_id = %node_id,
             refs = span_count(refs),
@@ -452,6 +456,7 @@ pub async fn run(
         shutdown_token.clone(),
     )
     .map_err(RunNodeCtlError::HealthSocket)?;
+    let service_mutex_path = service_mutex_path(&cli.socket_path);
     let health_socket = cli
         .health_socket_path
         .as_ref()
@@ -459,12 +464,12 @@ pub async fn run(
 
     tracing::info!(
         health_socket = %health_socket,
-        service_mutex = SERVICE_MUTEX_PATH,
+        service_mutex = %service_mutex_path.display(),
         "space-node-ctl passive; waiting for service mutex"
     );
 
     let service_mutex = match ServiceMutex::acquire_with_timeout(
-        SERVICE_MUTEX_PATH,
+        &service_mutex_path,
         &shutdown_token,
         cli.service_mutex_timeout,
     )
@@ -533,8 +538,9 @@ pub async fn run(
 
     let listener = pplx_space_common_svc::bind_unix_socket(
         &cli.socket_path,
-        pplx_space_common_svc::UnixSocketOptions::new(0o660)
-            .with_group(pplx_space_common_svc::SocketGroup::Required(SOCKET_GROUP)),
+        pplx_space_common_svc::UnixSocketOptions::new(0o660).with_group(
+            pplx_space_common_svc::SocketGroup::Required(cli.socket_group),
+        ),
     )
     .map_err(RunNodeCtlError::BindSocket)?;
     tracing::info!(
@@ -622,6 +628,18 @@ pub async fn run(
     health_server.join().await;
     drop(service_mutex.take());
     Ok(())
+}
+
+/// The service mutex of the instances that publish `socket_path`: a file
+/// beside the socket. Instances that would publish the same socket therefore
+/// contend on the same mutex, so at most one of them serves it.
+///
+/// Every release must derive the same mutex path for the production socket,
+/// `/space/run/node-ctl/service.mutex`. A release that derived another would
+/// not contend with an older node-ctl during a rolling upgrade, and both
+/// would be active.
+fn service_mutex_path(socket_path: &Path) -> PathBuf {
+    socket_path.with_file_name(SERVICE_MUTEX_FILE_NAME)
 }
 
 fn read_node_ctl_config(path: &Path) -> Result<NodeCtlConfig, RunNodeCtlError> {
@@ -1243,9 +1261,10 @@ impl NodeCtlWorker {
             return;
         }
         // The node-local Kubernetes object reconciles (template-presence node
-        // metadata and network-slot status capacity) share this cadence: the
-        // template-inventory facet is pushed on every periodic outbound tick,
-        // so gating on it runs both reconciles each tick and self-heals drift.
+        // metadata, network-slot status capacity, the SSD placement labels, and
+        // the host-CPU label) share this cadence: the template-inventory facet
+        // is pushed on every periodic outbound tick, so gating on it runs each
+        // of these reconciles every tick and self-heals drift.
         #[cfg(feature = "kubernetes")]
         if batch.facets().any(|(facet_name, _)| {
             facets::FacetKind::parse(facet_name) == Some(facets::FacetKind::TemplateInventory)
@@ -1259,6 +1278,9 @@ impl NodeCtlWorker {
             }
             if let Err(error) = controller.reconcile_ssd_headroom_tier().await {
                 tracing::warn!(%error, "local Kubernetes ssd-headroom-tier reconcile failed");
+            }
+            if let Err(error) = controller.reconcile_host_cpu().await {
+                tracing::warn!(%error, "local Kubernetes host-cpu reconcile failed");
             }
         }
 

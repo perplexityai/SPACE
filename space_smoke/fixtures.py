@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import secrets
 import shlex
 import time
 from datetime import UTC, datetime, timedelta
@@ -24,7 +26,6 @@ from space_smoke.capabilities import (
     NodeSelectorExtrasControl,
     PendingBackupControl,
     OrphanedRestorePodGcControl,
-    QuarantineRecoveryControl,
     TemplateBuildControl,
     TemplateBuilder,
     RateLimiterControl,
@@ -37,24 +38,22 @@ from space_smoke.capabilities import (
     ColdEvictionControl,
     CrossNodeRestoreControl,
     ForkableSandbox,
-    ReapedArtifact,
     SnapshotReaperConfig,
     SnapshotReaperControl,
-    BackupQueued,
-    BtrfsSendCapture,
-    CompletedTransfer,
+    FailedTransfer,
     ReleaseStorageRow,
-    RestoreFailure,
     SnapshotRowFacts,
     StartupRecoveryControl,
     StartupRecoveryReport,
     SuspendCodecControl,
     SandboxNetworkIsolationControl,
+    StorageExchangeControl,
     TelemetryBackendControl,
-    LocalEviction,
-    RestoreActivation,
+    LeaderElectionControl,
+    RestoreFailure,
+    RestorePodRead,
+    TransferJobView,
     RestoreStateRead,
-    SandboxEventRead,
     SandboxPodPlacement,
     ColdCreateObserver,
     CommandResult,
@@ -91,8 +90,8 @@ from space_smoke.capabilities import (
 )
 from space_smoke.adapters import (
     BTRFS_SEND_V1,
-    TEMPLATE_PULL_PLAN_MESSAGE,
-    TEMPLATE_PULL_START_MESSAGE,
+    RESTORE_STORAGE_URI_ANNOTATION,
+    SUSPEND_ROOTFS_OBJECTS,
     template_received_uuid,
 )
 from space_smoke.concurrent_restore import ConcurrentRestoreAssertions
@@ -102,11 +101,12 @@ from space_smoke.node_fence import NodeFenceAssertions
 from space_smoke.node_selector_extras import NodeSelectorExtrasAssertions
 from space_smoke.orphaned_restore_pod_gc import OrphanedRestorePodGcAssertions
 from space_smoke.pending_backup import PendingBackupAssertions
-from space_smoke.quarantine_recovery import QuarantineRecoveryAssertions
 from space_smoke.template_build import TemplateBuildAssertions
 from space_smoke.rate_limiters import RateLimiterAssertions
 from space_smoke.sandbox_network_isolation import SandboxNetworkIsolationAssertions
+from space_smoke.storage_exchange import StorageExchangeScopingAssertions
 from space_smoke.telemetry_delivery import TelemetryDeliveryAssertions
+from space_smoke.leader_election import LeaderElectionAssertions
 from space_smoke.config import DEFAULT_SANDBOX_TIMEOUT_SECONDS
 from space_smoke.identity import EcwIdentityAssertions
 from space_smoke.invariants.lifecycle import prove_idle_deadline_reset
@@ -118,6 +118,7 @@ from space_smoke.runtime import (
     ScenarioContext,
     ScenarioTimedOut,
     SmokeConfigurationError,
+    background,
 )
 
 if TYPE_CHECKING:
@@ -1217,50 +1218,25 @@ class CommandSandboxFixture:
         self.wait_until_deleted()
         # Kind configures a 10-second quiescence window; allow normal node
         # reconciliation, its 60-second retry slack and another poll to complete.
+        # The retained rootfs leaving the worker is the outcome, whichever
+        # reclaim path removed it: the eviction itself, or the durable cleanup
+        # that retries an eviction refused while node-manager reset the
+        # network slot the stop released.
         deadline = time.monotonic() + 180
-        while True:
-            evictions = control.local_evictions(
-                sandbox_id, node_names=[worker], since_time=since_time
-            )
-            if any(event.reason == "cluster_row_absent" for event in evictions):
-                reclaimed_by = "node eviction completed"
-                break
-            # The eviction's first cleanup attempt can be refused as retryable,
-            # for example while node-manager resets the network slot the stop
-            # released: the reset holds the sandbox's exclusive host-mutation
-            # claim. sbx-manager then reports the eviction failed once and
-            # durable cleanup recovery finishes the claimed row without another
-            # eviction event. A failed event alone does not prove the claim:
-            # refusals before it carry the same reason. Only the eviction's own
-            # durable cleanup job, created after the claim, prefixes the
-            # node-manager CleanupSandbox error with its context, so that
-            # prefix proves the claim; the removed rootfs proves the retry
-            # finished. Any other failure leaves the wait on the completed
-            # event above.
-            claimed = any(
-                event.reason == "cluster_row_absent"
-                and event.error.startswith(_CLAIMED_EVICTION_CLEANUP_ERROR_PREFIX)
-                for event in control.local_eviction_failures(
-                    sandbox_id, node_names=[worker], since_time=since_time
-                )
-            )
-            if claimed and not control.sandbox_cache_dir_present(worker, sandbox_id):
-                reclaimed_by = "node eviction claimed; durable cleanup retry completed"
-                break
+        while control.sandbox_cache_dir_present(worker, sandbox_id):
             self.verify(
                 time.monotonic() < deadline,
                 "deleted stopped sandbox was not reclaimed by node reconciliation",
                 worker=worker,
                 sandbox_id=sandbox_id,
-                eviction_claimed_but_cleanup_pending=claimed,
+                failure_evidence=lambda: {
+                    "sandbox_manager_log": control.sandbox_manager_log(
+                        sandbox_id, node_names=[worker], since_time=since_time
+                    )
+                },
             )
             self._context.wait(10)
-        self.verify(
-            not control.sandbox_cache_dir_present(worker, sandbox_id),
-            "node cleanup completed but retained rootfs still exists",
-            worker=worker,
-        )
-        self.record("stopped_delete_local_cleanup", f"{reclaimed_by} and rootfs removed")
+        self.record("stopped_delete_local_cleanup", "retained rootfs removed")
 
     def start_background_process(
         self, command: str, *, timeout: int = 60
@@ -2778,23 +2754,6 @@ class KindEcw(Ecw):
             )
         return self._pending_backup_assertions
 
-    _quarantine_recovery_control: QuarantineRecoveryControl | None = None
-    _quarantine_recovery_assertions: QuarantineRecoveryAssertions | None = None
-
-    @property
-    def quarantine_recovery(self) -> QuarantineRecoveryAssertions:
-        """Privileged assertions for the bounded quarantine recovery loop."""
-
-        if self._quarantine_recovery_control is None:
-            raise SmokeConfigurationError(
-                "quarantine recovery control is only available on the kind backend"
-            )
-        if self._quarantine_recovery_assertions is None:
-            self._quarantine_recovery_assertions = QuarantineRecoveryAssertions(
-                self, self._quarantine_recovery_control, self._context.scope
-            )
-        return self._quarantine_recovery_assertions
-
     _orphaned_restore_pod_gc_control: OrphanedRestorePodGcControl | None = None
     _orphaned_restore_pod_gc_assertions: OrphanedRestorePodGcAssertions | None = None
 
@@ -2881,6 +2840,23 @@ class KindEcw(Ecw):
             )
         return self._sandbox_network_isolation_assertions
 
+    _storage_exchange_control: StorageExchangeControl | None = None
+    _storage_exchange_assertions: StorageExchangeScopingAssertions | None = None
+
+    @property
+    def storage_exchange(self) -> StorageExchangeScopingAssertions:
+        """credential-manager's storage exchange, asked as volume-manager, against the store."""
+
+        if self._storage_exchange_control is None:
+            raise SmokeConfigurationError(
+                "storage exchange probes are only available on the kind backend"
+            )
+        if self._storage_exchange_assertions is None:
+            self._storage_exchange_assertions = StorageExchangeScopingAssertions(
+                self, self._storage_exchange_control, self._context.scope
+            )
+        return self._storage_exchange_assertions
+
     _telemetry_control: TelemetryBackendControl | None = None
     _telemetry_assertions: TelemetryDeliveryAssertions | None = None
 
@@ -2911,6 +2887,23 @@ class KindEcw(Ecw):
                 self, self._telemetry_control, since=since
             )
         return self._telemetry_assertions
+
+    _leader_election_control: LeaderElectionControl | None = None
+    _leader_election_assertions: LeaderElectionAssertions | None = None
+
+    @property
+    def leader_election(self) -> LeaderElectionAssertions:
+        """Privileged faults and reads for the cluster-controller's leader election."""
+
+        if self._leader_election_control is None:
+            raise SmokeConfigurationError(
+                "leader-election control is only available on the kind backend"
+            )
+        if self._leader_election_assertions is None:
+            self._leader_election_assertions = LeaderElectionAssertions(
+                self, self._leader_election_control, self._context.scope
+            )
+        return self._leader_election_assertions
 
     _startup_recovery_control: StartupRecoveryControl | None = None
     _startup_recovery_assertions: StartupRecoveryAssertions | None = None
@@ -3040,9 +3033,8 @@ class TemplateCacheAssertions:
     and refuses a bench whose loop is off or too slow to prove anything within
     the sandbox budget. The forcing device is a real, unpinned, unreferenced
     build large enough to put the worker over budget by itself, and the proof
-    is through the
-    surfaces an operator has (`space-tmplmgr`, the digest directory, the
-    daemon's own `template GC tick complete` line), not the daemon's SQLite.
+    is through the surfaces an operator has (`space-tmplmgr` and the digest
+    directory), not the daemon's SQLite or its log.
     """
 
     def __init__(
@@ -3056,7 +3048,6 @@ class TemplateCacheAssertions:
         self._scope = scope
         self._config: TemplateCacheGcConfig | None = None
         self._planted_since: dict[str, str] = {}
-        self._planted_bytes: dict[str, int] = {}
         self._planted_digests: dict[str, str] = {}
 
     def require_smoke_sized_gc(
@@ -3159,7 +3150,6 @@ class TemplateCacheAssertions:
             lambda: self._control.delete_template(node_name, name),
             critical=True,
         )
-        self._planted_bytes[name] = size_bytes
         self._control.register_unpinned_template(node_name, name, size_bytes)
         digests = self._control.template_digest_dirs(node_name, name)
         state = (
@@ -3176,12 +3166,8 @@ class TemplateCacheAssertions:
         )
         self._planted_digests[name] = digests[0]
         # The successful local resolution just refreshed this build's grace.
-        # Kind nodes share the runner's kernel clock. Start the evidence window
-        # here, preserving microseconds, so a prior run's completed GC tick
-        # cannot satisfy this run's aggregate reclamation check.
-        self._planted_since[name] = datetime.now(UTC).isoformat(
-            timespec="microseconds"
-        ).replace("+00:00", "Z")
+        # The failure evidence reads the daemon's GC lines from here on.
+        self._planted_since[name] = _log_since_time()
         return name
 
     def wait_until_evicted(
@@ -3218,13 +3204,25 @@ class TemplateCacheAssertions:
                 budget_bytes=config.budget_bytes,
                 grace_seconds=config.grace_seconds,
                 interval_seconds=config.interval_seconds,
+                failure_evidence=lambda: {
+                    "template_gc_log": self._control.template_gc_log(
+                        node_name, since_time=self._planted_since[name]
+                    )
+                },
             )
             self._fixture.wait(5)
 
     def expect_reclaimed(
         self, node_name: str, name: str, *, timeout: float | None = None
     ) -> None:
-        """Wait for the GC tick to finish, then verify catalog and disk absence."""
+        """Wait for the catalog to stop resolving the build, then verify disk absence.
+
+        Removing the digest directory is the middle of the eviction: the
+        row is marked `deleting` before the disk delete and removed after
+        it. A `deleting` build no longer resolves, so probing it after its
+        directory has gone cannot touch the LRU clock of a ready build, and
+        this local-only plant has no cluster release a miss could re-pull.
+        """
 
         config = self._config
         if config is None:
@@ -3234,50 +3232,29 @@ class TemplateCacheAssertions:
         if timeout is None:
             timeout = 2 * config.interval_seconds + 30
         deadline = time.monotonic() + timeout
-        planted = self._planted_bytes[name]
-        # Removing the digest directory is only the middle of a GC tick. The
-        # catalog delete and remaining candidates finish before the daemon logs
-        # its report; observing filesystem absence does not synchronize with it.
-        # Wait for that completion rather than judging a single early log read.
-        # Tick bytes are aggregate supporting evidence, not per-template
-        # attribution; the exact plant's catalog and disk absence remain required.
         while True:
-            ticks = self._control.template_gc_ticks(
-                node_name, since_time=self._planted_since[name]
+            state = self._control.template_build_state(
+                node_name, name, self._planted_digests[name]
             )
-            if any(t.deleted >= 1 and t.bytes_freed >= planted for t in ticks):
+            if state is None:
                 break
-            remaining = deadline - time.monotonic()
             self._fixture.verify(
-                remaining > 0,
-                "no completed template GC tick on the worker reported reclaiming the planted bytes",
+                time.monotonic() <= deadline,
+                "the planted build's digest directory is gone but the build still resolves",
                 template=name,
-                planted_bytes=planted,
+                build_state=state,
                 completion_timeout_seconds=timeout,
-                ticks_observed=len(ticks),
-                ticks=[
-                    {"deleted": t.deleted, "candidates": t.candidates, "bytes_freed": t.bytes_freed}
-                    for t in ticks
-                ],
+                failure_evidence=lambda: {
+                    "template_gc_log": self._control.template_gc_log(
+                        node_name, since_time=self._planted_since[name]
+                    )
+                },
             )
-            self._fixture.wait(min(1, remaining))
-
-        # Only resolve after GC completion: resolving a still-ready build would
-        # touch its LRU clock. This local-only plant has no cluster release, so
-        # a genuine miss cannot silently re-pull the bytes.
-        state = self._control.template_build_state(
-            node_name, name, self._planted_digests[name]
-        )
-        self._fixture.verify(
-            state is None,
-            "the GC tick completed but the planted build still resolves",
-            template=name,
-            build_state=state,
-        )
+            self._fixture.wait(2)
         digests = self._control.template_digest_dirs(node_name, name)
         self._fixture.verify(
             not digests,
-            "the planted template's digest directory remained after GC completion",
+            "the planted template's digest directory came back after the build was reclaimed",
             template=name,
             digest_dirs=list(digests),
         )
@@ -3307,6 +3284,25 @@ class TemplateCacheAssertions:
 # A prefetch pull that resolved its release before `delete-template` lands
 # its ~460 MiB seed within a few seconds on a bench; the eviction re-deletes
 # once it has, and gives up well inside one prefetch interval.
+# template-manager's pull latency as the bench's Prometheus names it, and the
+# results that leave the build on disk (`outcome_label` in
+# crates/libs/template/mgr/src/volume.rs).
+TEMPLATE_PULL_DURATION_METRIC = "space_template_pull_duration_milliseconds"
+ON_DEMAND_PULL_RESULTS = "materialized|coalesced|recovered"
+# Several of the Kind exporter's ~10 s flushes plus scrape lag.
+ON_DEMAND_PULL_SETTLE_SECONDS = 25.0
+
+
+def _rfc3339(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _promql_string(value: str) -> str:
+    """`value` as a PromQL string literal."""
+
+    return json.dumps(value)
+
+
 TEMPLATE_EVICTION_SETTLE_SECONDS = 30.0
 TEMPLATE_EVICTION_RETRY_SECONDS = 3.0
 
@@ -3315,14 +3311,15 @@ class SuspendCodecAssertions:
     """Prove the production suspend codec's failure matrix on a real bench.
 
     The codec fact is never inferred from local files (they are reclaimed
-    within moments of a fast upload); it is sbx-manager's own
-    `artifact_backup_queued` event, which carries the `rootfs_diff_format`
-    it sealed into the sidecar. Cordoning, placement and the object-storage
-    provenance check are the cross-node scenario's and are reused through
-    `KindEcw.cross_node_restore`; this class adds the parent-template reads
-    on a worker, the daemon's failure lines, and the two kind-only faults
-    (release storage withheld, one snapshot object corrupted), each with
-    its compensation armed before dispatch.
+    within moments of a fast upload); it is the durable snapshot itself: the
+    suspend's new `ready` row and the rootfs object under its storage prefix
+    (`rootfs.btrfs-send` for the stream codec, `rootfs` for Full). Cordoning,
+    placement and the object-storage restore check are the cross-node
+    scenario's and are reused through `KindEcw.cross_node_restore`; this
+    class adds the parent-template reads on a worker, volume-manager's job
+    records, sbx-manager's `snapshot_restore_failed` contract events, and the
+    two kind-only faults (release storage withheld, one snapshot object
+    corrupted), each with its compensation armed before dispatch.
     """
 
     def __init__(
@@ -3338,11 +3335,11 @@ class SuspendCodecAssertions:
         self._withheld: list[ReleaseStorageRow] | None = None
         self._restore_rows: Compensation | None = None
         self._retire_attempted = False
-        self._accepted_backups: set[str] = set()
+        self._accepted_snapshots: set[str] = set()
 
     @staticmethod
     def mark_since() -> str:
-        """A lower bound for a later log read (a minute of skew slack)."""
+        """A lower bound for a later event or metric read (a minute of skew slack)."""
 
         return _log_since_time()
 
@@ -3351,85 +3348,131 @@ class SuspendCodecAssertions:
 
         return self._control.other_sandbox_worker_node(node_name)
 
-    def expect_deferred_capture(
-        self, node_name: str, *, since_time: str, visibility_timeout: float = 60
-    ) -> BtrfsSendCapture:
-        """The capture taken after `since_time` on `node_name` retained its source.
-
-        sandbox-manager's encode line is the record: `deferred=true` with no
-        stream bytes means the source stayed a retained btrfs snapshot and no
-        `rootfs.btrfs-send` was written. Polls because the line reaches the
-        pod log a beat after the public state settles.
-        """
-
-        deadline = time.monotonic() + visibility_timeout
-        while True:
-            captures = self._control.btrfs_send_captures(
-                self._fixture.sandbox.sandbox_id, node_name, since_time=since_time
-            )
-            if captures or time.monotonic() >= deadline:
-                break
-            time.sleep(2)
-        self._fixture.verify(
-            len(captures) >= 1,
-            "sandbox-manager logged no btrfs-send capture for the suspend",
-            sandbox_id=self._fixture.sandbox.sandbox_id,
-            worker_node=node_name,
-            since_time=since_time,
-        )
-        capture = captures[-1]
-        self._fixture.verify(
-            capture.deferred and capture.stream_bytes == 0,
-            "the suspend materialized a send file instead of retaining its source",
-            sandbox_id=self._fixture.sandbox.sandbox_id,
-            worker_node=node_name,
-            deferred=capture.deferred,
-            stream_bytes=capture.stream_bytes,
-        )
-        self._fixture.record("deferred_capture", asdict(capture))
-        return capture
-
-    def expect_streamed_upload(
-        self, node_name: str, *, since_time: str, visibility_timeout: float = 60
-    ) -> CompletedTransfer:
+    def expect_streamed_upload(self, node_name: str, *, timeout: float = 120) -> TransferJobView:
         """volume-manager streamed the backup's rootfs from the retained source.
 
-        A completed `push_btrfs_send` job for the sandbox's send stream is the
-        record. The snapshot directory cannot tell: a fallback that
-        materializes `rootfs.btrfs-send`, uploads it as a file, and lets
-        bookkeeping reclaim it once the backup is durable leaves the same
-        entries behind.
+        Read from volume-manager's own job records (`space-volmgr jobs` and
+        `job`): a completed `push_btrfs_send` job for the snapshot's send
+        stream. The snapshot directory and the uploaded object cannot tell:
+        when volume-manager may not lease the retained source, sandbox-manager
+        falls back to materializing `rootfs.btrfs-send` and uploading it as a
+        file, and bookkeeping reclaims that file once the backup is durable.
         """
 
         from space_smoke.adapters import ROOTFS_SEND_FILE
 
-        def streamed() -> list[CompletedTransfer]:
-            return [
-                transfer
-                for transfer in self._control.completed_transfers(
-                    self._fixture.sandbox.sandbox_id, node_name, since_time=since_time
-                )
-                if transfer.kind == "push_btrfs_send"
-                and PurePosixPath(transfer.local_path).name == ROOTFS_SEND_FILE
-            ]
-
-        deadline = time.monotonic() + visibility_timeout
+        sandbox_id = self._fixture.sandbox.sandbox_id
+        deadline = time.monotonic() + timeout
         while True:
-            transfers = streamed()
-            if transfers or time.monotonic() >= deadline:
+            jobs = self._control.transfer_jobs(node_name, sandbox_id)
+            streamed = [
+                job
+                for job in jobs
+                if job.kind == "push_btrfs_send"
+                and job.status == "completed"
+                and PurePosixPath(job.local_path).name == ROOTFS_SEND_FILE
+            ]
+            if streamed:
                 break
-            time.sleep(2)
+            self._fixture.verify(
+                time.monotonic() <= deadline,
+                "volume-manager completed no push_btrfs_send job for the snapshot; the "
+                "backup did not stream from the retained source",
+                sandbox_id=sandbox_id,
+                worker_node=node_name,
+                jobs=[(job.kind, job.status, PurePosixPath(job.local_path).name) for job in jobs],
+            )
+            self._fixture.wait(2)
+        self._fixture.record(
+            "streamed_upload", {"job_id": streamed[-1].job_id, "kind": streamed[-1].kind}
+        )
+        return streamed[-1]
+
+    @contextmanager
+    def interrupting_btrfs_send(
+        self, node_name: str, *, pulses: int = 1, window_seconds: int = 900
+    ) -> Iterator[None]:
+        """Stop and continue node-manager while a send on `node_name` blocks.
+
+        The interrupter runs in the node's operator shell for the body (see
+        `SuspendCodecControl.interrupt_btrfs_send`). Ending it, which also
+        continues both daemons, is armed as a compensation before it starts,
+        and runs eagerly when the body exits. A body that completes requires
+        at least one pulse: without one, nothing was interrupted.
+
+        Scenarios on one bench run in turn, so the send in flight is this
+        sandbox's. A concurrent smoke's send that took the pulse instead can
+        only fail this scenario's rejection check, never pass it.
+        """
+
+        token = secrets.token_hex(8)
+        lines: list[str] = []
+        end = self._scope.defer(
+            f"end the btrfs-send interrupter on {node_name}",
+            lambda: self._control.end_btrfs_send_interrupt(node_name, token=token),
+            critical=True,
+        )
+        work = background(
+            f"btrfs-send interrupter on {node_name}",
+            lambda: lines.extend(
+                self._control.interrupt_btrfs_send(
+                    node_name, token=token, pulses=pulses, window_seconds=window_seconds
+                )
+            ),
+        )
+        try:
+            yield
+        finally:
+            end.release()
+            work.join(timeout=60)
+        self._fixture.record("send_interrupt", lines)
+        fired = [line for line in lines if line.startswith("pulse ")]
         self._fixture.verify(
-            len(transfers) >= 1,
-            "volume-manager completed no push_btrfs_send for the snapshot; the "
-            "backup did not stream from the retained source",
+            len(fired) >= 1,
+            "the interrupter never found a btrfs send in flight to interrupt",
+            worker_node=node_name,
+            interrupter_output=lines,
+        )
+
+    def expect_rejected_send_stream(self, node_name: str, *, since_time: str) -> FailedTransfer:
+        """node-manager refused the restarted stream and volume-manager retried.
+
+        The record is volume-manager's failed `push_btrfs_send` attempt for
+        the sandbox's send stream, failed as retriable with node-manager's
+        rejection. Unlike sbx-manager's bounded restore error kinds, a
+        transfer's retry class does not name the cause, so the message is
+        matched.
+        """
+
+        from space_smoke.adapters import BTRFS_SEND_REJECTED_ERROR, ROOTFS_SEND_FILE
+
+        failures = self._control.failed_transfers(
+            self._fixture.sandbox.sandbox_id, node_name, since_time=since_time
+        )
+        rejected = [
+            failure
+            for failure in failures
+            if failure.kind == "push_btrfs_send"
+            and PurePosixPath(failure.local_path).name == ROOTFS_SEND_FILE
+            and BTRFS_SEND_REJECTED_ERROR in failure.error
+        ]
+        self._fixture.verify(
+            len(rejected) >= 1,
+            "no streamed upload attempt failed on node-manager's rejection of a "
+            "restarted send; the interrupted stream was forwarded",
             sandbox_id=self._fixture.sandbox.sandbox_id,
             worker_node=node_name,
-            since_time=since_time,
+            failed_attempts=[asdict(failure) for failure in failures],
         )
-        transfer = transfers[-1]
-        self._fixture.record("streamed_upload", asdict(transfer))
-        return transfer
+        failure = rejected[0]
+        self._fixture.verify(
+            failure.error_kind == "retriable",
+            "the rejected send failed its upload permanently instead of retrying",
+            sandbox_id=self._fixture.sandbox.sandbox_id,
+            failed_attempt=asdict(failure),
+        )
+        self._fixture.record("rejected_send", asdict(failure))
+        return failure
 
     def expect_retained_source_without_send_file(self, node_name: str) -> tuple[str, ...]:
         """The canonical snapshot holds the retained bundle and no send file."""
@@ -3466,49 +3509,57 @@ class SuspendCodecAssertions:
         return "btrfs-send"
 
     def expect_suspend_codec(
-        self, codec: str = BTRFS_SEND_V1, *, since_time: str, visibility_timeout: float = 60
-    ) -> BackupQueued:
-        """The suspend taken after `since_time` was sealed with `codec`, per sbx-manager's event.
+        self, codec: str = BTRFS_SEND_V1, *, timeout: float = 300
+    ) -> SnapshotRowFacts:
+        """The suspend just taken published one new `ready` snapshot sealed with `codec`.
 
-        Polls because the event reaches the pod log a beat after the public
-        state settles. `since_time` is a mark taken immediately before the
-        pause; it carries a minute of skew slack, so an earlier suspend's
-        event can sit inside the window — events are keyed on their snapshot
-        id and the ones already accepted are excluded. Exactly one new event
-        is expected.
+        Polls the sandbox's full snapshot rows until one this assertion has
+        not accepted before is `ready` (the upload is asynchronous behind the
+        public paused state), requires exactly one, and reads the codec from
+        the rootfs object under its storage prefix.
         """
 
-        deadline = time.monotonic() + visibility_timeout
+        sandbox_id = self._fixture.sandbox.sandbox_id
+        deadline = time.monotonic() + timeout
         while True:
-            events = [
-                e
-                for e in self._control.backup_queued_events(
-                    self._fixture.sandbox.sandbox_id, since_time=since_time
-                )
-                if e.snapshot_id not in self._accepted_backups
+            rows = self._control.snapshot_row_facts(sandbox_id)
+            new = [
+                row
+                for row in rows
+                if row.state == "ready" and row.snapshot_id not in self._accepted_snapshots
             ]
-            if events or time.monotonic() > deadline:
+            if new:
                 break
-            self._fixture.wait(3)
+            self._fixture.verify(
+                time.monotonic() <= deadline,
+                "the suspend published no new ready snapshot row",
+                sandbox_id=sandbox_id,
+                rows=[(row.snapshot_id, row.state) for row in rows],
+                already_accepted=sorted(self._accepted_snapshots),
+            )
+            self._fixture.wait(2)
         self._fixture.verify(
-            len(events) == 1,
-            "expected exactly one new artifact_backup_queued event for this suspend",
-            sandbox_id=self._fixture.sandbox.sandbox_id,
-            events=[(e.snapshot_id, e.rootfs_diff_format) for e in events],
-            already_accepted=sorted(self._accepted_backups),
+            len(new) == 1,
+            "expected exactly one new ready snapshot row for this suspend",
+            sandbox_id=sandbox_id,
+            new_rows=[row.snapshot_id for row in new],
+            already_accepted=sorted(self._accepted_snapshots),
         )
-        latest = events[0]
-        self._accepted_backups.add(latest.snapshot_id)
+        snapshot = new[0]
+        self._accepted_snapshots.add(snapshot.snapshot_id)
+        objects = self._control.snapshot_object_names(snapshot)
+        rootfs = sorted(set(objects) & set(SUSPEND_ROOTFS_OBJECTS.values()))
         self._fixture.verify(
-            latest.rootfs_diff_format == codec,
+            rootfs == [SUSPEND_ROOTFS_OBJECTS[codec]],
             "the suspend was not sealed with the expected codec",
             expected_codec=codec,
-            rootfs_diff_format=latest.rootfs_diff_format,
-            snapshot_id=latest.snapshot_id,
+            expected_rootfs_object=SUSPEND_ROOTFS_OBJECTS[codec],
+            snapshot_id=snapshot.snapshot_id,
+            snapshot_objects=list(objects),
         )
-        self._fixture.record("suspend_codec", latest.rootfs_diff_format)
-        self._fixture.record("suspend_snapshot_id", latest.snapshot_id)
-        return latest
+        self._fixture.record("suspend_codec", codec)
+        self._fixture.record("suspend_snapshot_id", snapshot.snapshot_id)
+        return snapshot
 
     def template_hash(self, template: str) -> str:
         """The parent build the suspend snapshot names — from the cluster row, not a resolve.
@@ -3599,36 +3650,133 @@ class SuspendCodecAssertions:
             digest_dirs=list(remaining),
         )
 
-    def expect_pulled_on_demand(self, node_name: str, template: str, *, since_time: str) -> None:
-        """The restore's own GetTemplate missed locally and initiated a pull, and bytes came in.
+    def on_demand_pull_counts(self, node_name: str, template: str) -> dict[str, float]:
+        """template-manager's successful on-demand pulls of `template` on `node_name`, per process.
 
-        Two lines, both since the removal: template-manager's "resolved
-        template release; starting pull" tagged `trigger=on_demand` (the
-        restore's lookup found no local build and started a pull — a
-        prefetch tick logs the same line tagged `prefetch_tag`), and a
-        vol-mgr "pull plan resolved from manifest" line (a fresh pull, not a
-        DB hit). The plan line runs outside the pull span and carries no
-        trigger, and a prefetch pull that fires within the same seconds is
-        joined rather than duplicated, so which of the two lookups' pull
-        landed the bytes is not distinguishable from logs — and does not
-        matter to the invariant: the restore found no parent and one was
-        materialized for it before the receive.
+        The cumulative count of `template.pull.duration_ms` tagged
+        `trigger=on_demand` with a result that put the build on disk, read
+        from the bench's Prometheus. Its `trigger` tag exists so dashboards
+        can split caller-driven pulls from prefetch (`request_tags` in
+        `crates/libs/metrics/src/template.rs`); that tag set carries no
+        content hash, so `tag=by_hash` — a lookup by exact build, as the
+        restore asks for its parent — narrows it to that kind of lookup. A
+        pull that joined a prefetch already in flight counts as `coalesced`:
+        the restore's own lookup still asked for the parent and got it.
         """
 
-        pulls = self._control.template_pulls(node_name, template, since_time=since_time)
-        started_on_demand = [
-            p for p in pulls if p.trigger == "on_demand" and p.message == TEMPLATE_PULL_START_MESSAGE
-        ]
-        fresh_pulls = [p for p in pulls if p.message == TEMPLATE_PULL_PLAN_MESSAGE]
-        self._fixture.verify(
-            len(started_on_demand) >= 1 and len(fresh_pulls) >= 1,
-            "the target's template-manager did not miss and pull the parent for the restore",
-            template=template,
-            on_demand_pull_starts=len(started_on_demand),
-            fresh_pulls=len(fresh_pulls),
-            pull_lines=[(p.trigger, p.message[:60]) for p in pulls][:20],
+        query = (
+            "sum by (service_instance_id) (histogram_count("
+            f"{TEMPLATE_PULL_DURATION_METRIC}{{template={_promql_string(template)}, "
+            f"tag=\"by_hash\", trigger=\"on_demand\", result=~\"{ON_DEMAND_PULL_RESULTS}\", "
+            f"k8s_node_name={_promql_string(node_name)}}}))"
         )
-        self._fixture.record("template_pull_triggers", sorted({p.trigger for p in pulls if p.trigger}))
+        body = self._control.telemetry_query(
+            "prometheus", "/api/v1/query", {"query": query, "time": str(time.time())}
+        )
+        return {
+            str(sample["metric"].get("service_instance_id", "")): float(sample["value"][1])
+            for sample in body["data"]["result"]
+        }
+
+    def quiescent_on_demand_pull_counts(
+        self,
+        node_name: str,
+        template: str,
+        *,
+        settle_seconds: float = ON_DEMAND_PULL_SETTLE_SECONDS,
+        timeout: float = 180,
+    ) -> dict[str, float]:
+        """The on-demand pull counts once they have stopped moving: the baseline.
+
+        The exporter flushes every few seconds and Prometheus scrapes after
+        that, so a single read can miss an earlier pull's increment that
+        lands later and would then read as this restore's pull. Polled until
+        unchanged for `settle_seconds`, several export intervals plus scrape
+        lag; the value at that point is the baseline.
+        """
+
+        started = time.time()
+        counts = self.on_demand_pull_counts(node_name, template)
+        unchanged_since = time.monotonic()
+        deadline = unchanged_since + timeout
+        while time.monotonic() - unchanged_since < settle_seconds:
+            self._fixture.verify(
+                time.monotonic() <= deadline,
+                "template-manager's on-demand pull count did not settle before the removal",
+                template=template,
+                worker_node=node_name,
+                on_demand_pulls=counts,
+                settle_seconds=settle_seconds,
+            )
+            self._fixture.wait(5)
+            now = self.on_demand_pull_counts(node_name, template)
+            if now != counts:
+                counts, unchanged_since = now, time.monotonic()
+        self._fixture.record(
+            "on_demand_pulls_baseline",
+            {
+                "counts": counts,
+                "settled_at": _rfc3339(time.time()),
+                "settle_wait_seconds": round(time.time() - started, 1),
+            },
+        )
+        return counts
+
+    def expect_parent_pulled_on_demand(
+        self,
+        node_name: str,
+        template: str,
+        digest: str,
+        *,
+        before: dict[str, float],
+        timeout: float = 120,
+    ) -> None:
+        """The restore's own lookup pulled the parent, and the build is on the worker.
+
+        Presence alone cannot say who pulled it: template-manager's prefetch
+        re-pulls a removed template within a tick, so a broken on-demand
+        pull would be masked by the kubelet retrying the restore pod until
+        prefetch had landed the parent. The on-demand pull count must have
+        moved since `before`, the quiescent baseline read before the removal;
+        the metric reaches Prometheus an export interval after the pull, so
+        it is polled. A count below its start is a restarted process
+        counting from zero.
+        """
+
+        present = self._control.template_digest_dirs(node_name, template)
+        self._fixture.verify(
+            digest in present,
+            "the restore did not materialize the parent template on the worker",
+            template=template,
+            digest=digest,
+            digest_dirs=list(present),
+        )
+
+        def moved(now: dict[str, float]) -> list[str]:
+            return sorted(
+                instance
+                for instance, count in now.items()
+                if count > (before.get(instance, 0.0) if count >= before.get(instance, 0.0) else 0.0)
+            )
+
+        deadline = time.monotonic() + timeout
+        while True:
+            now = self.on_demand_pull_counts(node_name, template)
+            if moved(now):
+                break
+            self._fixture.verify(
+                time.monotonic() <= deadline,
+                "template-manager counted no successful on-demand pull of the parent on the "
+                "worker; the build may have come from prefetch",
+                template=template,
+                worker_node=node_name,
+                on_demand_pulls_before=before,
+                on_demand_pulls_now=now,
+            )
+            self._fixture.wait(5)
+        self._fixture.record(
+            "on_demand_pulls", {"before": before, "after": now, "read_at": _rfc3339(time.time())}
+        )
 
     def expect_template_is_portable_subvolume(
         self, node_name: str, template: str, digest: str
@@ -3690,20 +3838,19 @@ class SuspendCodecAssertions:
         raise AssertionError("unreachable")
 
     def expect_restore_failed(
-        self, *, reason: str, error_kind: str, since_time: str, visibility_timeout: float = 60
+        self, *, reason: str, error_kind: str, since_time: str, visibility_timeout: float = 120
     ) -> RestoreFailure:
-        """sbx-manager's own `snapshot_restore_failed` event names the stage and cause.
+        """sbx-manager's `snapshot_restore_failed` event names the stage and cause the scenario forced.
 
-        The stage (`reason`) and the typed failure name (`error_kind`) are what
-        distinguish "failed for the reason the scenario forced" from "failed at
-        all". Both are bounded names the daemon defines; the free-text `error`
-        is recorded for the reader but never matched.
+        The event is a documented contract (`crates/libs/events/README.md`:
+        consumers match `error_kind`), and the cause is what these scenarios
+        exist to prove: the client sees only that the restore failed, and the
+        node-local row's `failure_reason` is free text. Polled until a
+        failure with the forced stage and cause is visible; other failures
+        the same restore may report (a superseded source, a publication
+        fence) are recorded, not judged, and no count or order is relied on.
         """
 
-        # A cross-node restore can emit `snapshot_restore_failed` from more
-        # than one site (a superseded source, a publication fence), so keep
-        # polling until the failure for the forced stage and cause is
-        # visible, not merely until any failure is.
         deadline = time.monotonic() + visibility_timeout
         while True:
             failures = self._control.restore_failures(
@@ -3712,25 +3859,25 @@ class SuspendCodecAssertions:
             matching = [
                 f for f in failures if f.reason == reason and f.error_kind == error_kind
             ]
-            if matching or time.monotonic() > deadline:
+            if matching:
                 break
+            self._fixture.verify(
+                time.monotonic() <= deadline,
+                "sbx-manager reported no restore failure for the forced stage and cause",
+                expected_reason=reason,
+                expected_error_kind=error_kind,
+                failures=[
+                    {
+                        "node": f.node_name,
+                        "reason": f.reason,
+                        "error_kind": f.error_kind,
+                        "codec": f.restore_codec,
+                        "error": f.error[:200],
+                    }
+                    for f in failures
+                ],
+            )
             self._fixture.wait(3)
-        self._fixture.verify(
-            len(matching) >= 1,
-            "sbx-manager logged no restore failure for the forced stage and cause",
-            expected_reason=reason,
-            expected_error_kind=error_kind,
-            failures=[
-                {
-                    "node": f.node_name,
-                    "reason": f.reason,
-                    "error_kind": f.error_kind,
-                    "codec": f.restore_codec,
-                    "error": f.error[:200],
-                }
-                for f in failures
-            ],
-        )
         failure = matching[0]
         self._fixture.record("restore_failure_reason", failure.reason)
         self._fixture.record("restore_failure_error_kind", failure.error_kind)
@@ -3804,7 +3951,8 @@ class SuspendCodecAssertions:
         )
         record = records[0]
         self._control.corrupt_snapshot_object(record, object_name=object_name, offset=offset)
-        self._fixture.record("corrupted_object", f"{record.storage_uri.rstrip('/')}/{object_name}@{offset}")
+        # The snapshot id names the prefix; its URI can carry endpoint credentials.
+        self._fixture.record("corrupted_object", f"{record.snapshot_id}/{object_name}@{offset}")
         return record
 
     def wait_for_ready_snapshots(self, count: int, *, timeout: float = 300) -> list[SnapshotRowFacts]:
@@ -4101,12 +4249,6 @@ class StartupRecoveryAssertions:
 REMOTE_RESTORE_PROVENANCE = frozenset({"remote_matches_local", "remote_only"})
 
 
-# sbx-manager's durable cleanup job runs with this context and prefixes it to
-# a refused node-manager CleanupSandbox call. A cluster-deleted eviction
-# persists that job only after it has claimed the local row.
-_CLAIMED_EVICTION_CLEANUP_ERROR_PREFIX = "durable sandbox cleanup: "
-
-
 def _log_since_time() -> str:
     """Lower bound for a node-service log read; a minute of slack covers skew."""
 
@@ -4137,33 +4279,78 @@ def _wait_until_restore_portable(
 
 def _expect_snapshot_restore_from_object_storage(
     fixture: KindEcw,
-    control: SandboxEventRead,
+    control: RestorePodRead,
     *,
     since_time: str,
     source: SandboxPodPlacement,
     landed: SandboxPodPlacement,
     must_change_node: bool,
     activation_visibility_timeout: float = 60,
-) -> RestoreActivation:
-    """The landed execution was a snapshot restore served from object storage.
+) -> None:
+    """The landed execution is a restore of the durable snapshot, pulled from object storage.
 
-    Joins the landed pod's `execution-generation` annotation to the
-    `runtime_activated` event with the same generation, read since the
-    scenario began. No log-derived baseline is involved, so log rotation
-    cannot widen the match to a cold boot. `restore_provenance` must be one
-    of the two healthy remote classes with the storage URI present: a
-    restore that reused a local copy reads `local_only` and fails.
+    State first: the landed pod is still the pod the placement named and
+    carries the `suspend-restore-storage-uri` annotation the API stamps when
+    a portable snapshot exists; its execution generation is newer than the
+    source's and is the sandbox's one active execution; a cross-node restore
+    runs on another node. The annotation says what the API planned, not
+    where the bytes came from, so the provenance is read from sbx-manager's
+    `runtime_activated` event for the landed generation — a documented
+    contract (`crates/libs/events/README.md`): polled for, judged on its
+    fields, never on its absence or count. The caller proves the bytes by
+    reading back the state the sandbox wrote before it was suspended.
     """
 
+    def evidence() -> dict[str, object]:
+        return {
+            "sandbox_manager_log": control.sandbox_manager_log(
+                fixture.sandbox.sandbox_id, node_names=None, since_time=since_time
+            )
+        }
+
+    document = control.restore_pod_document(landed.pod_name) or {}
+    metadata = document.get("metadata") or {}
+    annotations = metadata.get("annotations") or {}
+    storage_uri = str(annotations.get(RESTORE_STORAGE_URI_ANNOTATION, ""))
     fixture.verify(
-        landed.execution_generation.isdigit(),
-        "the landed pod carries no execution-generation annotation",
+        bool(document) and str(metadata.get("uid", "")) == landed.pod_uid,
+        "the landed restore pod vanished or was replaced while it was read",
         landed_pod=landed.pod_name,
+        landed_pod_uid=landed.pod_uid,
+        pod_uid_now=metadata.get("uid"),
+        failure_evidence=evidence,
+    )
+    fixture.verify(
+        storage_uri.startswith("s3://"),
+        "the restore was not planned from the durable snapshot in object storage",
+        landed_pod=landed.pod_name,
+        # The URI itself stays out of the evidence: endpoint query parameters
+        # can carry credentials.
+        restore_storage_uri_scheme=storage_uri.partition("://")[0] if storage_uri else "",
+        failure_evidence=evidence,
+    )
+    active = [row for row in control.sandbox_executions(fixture.sandbox.sandbox_id) if row.active]
+    fixture.verify(
+        landed.execution_generation.isdigit()
+        and source.execution_generation.isdigit()
+        and int(landed.execution_generation) > int(source.execution_generation)
+        and len(active) == 1
+        and str(active[0].generation) == landed.execution_generation,
+        "the landed pod is not the sandbox's one active execution, newer than the source's",
+        source_generation=source.execution_generation,
+        landed_generation=landed.execution_generation,
+        active_generations=[row.generation for row in active],
+        failure_evidence=evidence,
+    )
+    fixture.verify(
+        landed.node_name != source.node_name or not must_change_node,
+        "the restore landed back on the cordoned source node",
+        source_node=source.node_name,
+        landed_node=landed.node_name,
+        failure_evidence=evidence,
     )
     # The public wake returns as soon as the API sees the sandbox running;
-    # sbx-manager's event for that activation reaches `kubectl logs` a beat
-    # later. Poll for the landed generation before judging the count — a
-    # first-read miss is a visibility race, not a missing event.
+    # the activation event reaches `kubectl logs` a beat later.
     deadline = time.monotonic() + activation_visibility_timeout
     while True:
         activations = [
@@ -4177,43 +4364,36 @@ def _expect_snapshot_restore_from_object_storage(
             break
         fixture.wait(3)
     fixture.verify(
-        len(activations) == 1,
-        "expected exactly one runtime_activated event for the landed "
-        "execution generation",
+        bool(activations),
+        "sbx-manager reported no runtime_activated event for the landed execution generation",
         landed_pod=landed.pod_name,
-        landed_node=landed.node_name,
         execution_generation=landed.execution_generation,
-        matching_events=len(activations),
-    )
-    activation = activations[0]
-    fixture.verify(
-        activation.boot_type == "snapshot",
-        "the landed execution was not a snapshot restore",
-        boot_type=activation.boot_type,
+        failure_evidence=evidence,
     )
     fixture.verify(
-        activation.node_name == landed.node_name
-        and (landed.node_name != source.node_name or not must_change_node),
-        (
-            "the restore landed back on the cordoned source node"
-            if must_change_node
-            else "the activation event's node does not match the landed pod"
+        all(
+            activation.boot_type == "snapshot"
+            and activation.node_name == landed.node_name
+            and activation.restore_provenance in REMOTE_RESTORE_PROVENANCE
+            and activation.restore_storage_uri_present
+            for activation in activations
         ),
-        source_node=source.node_name,
+        "the landed execution was not a snapshot restore pulled from object storage",
         landed_node=landed.node_name,
-        activation_node=activation.node_name,
-        restore_provenance=activation.restore_provenance,
+        activations=[
+            {
+                "node": activation.node_name,
+                "boot_type": activation.boot_type,
+                "restore_provenance": activation.restore_provenance,
+                "restore_storage_uri_present": activation.restore_storage_uri_present,
+            }
+            for activation in activations
+        ],
+        failure_evidence=evidence,
     )
-    fixture.verify(
-        activation.restore_provenance in REMOTE_RESTORE_PROVENANCE
-        and activation.restore_storage_uri_present,
-        "the restore did not pull its snapshot from object storage",
-        source_node=source.node_name,
-        landed_node=landed.node_name,
-        restore_provenance=activation.restore_provenance,
-        restore_storage_uri_present=activation.restore_storage_uri_present,
-    )
-    return activation
+    fixture.record("restore_storage_uri_present", True)
+    fixture.record("restore_provenance", activations[0].restore_provenance)
+    fixture.record("landed_node", landed.node_name)
 
 
 class SnapshotReaperAssertions:
@@ -4226,12 +4406,11 @@ class SnapshotReaperAssertions:
     leaves it unpinned — the exact artifact class the reaper exists to
     reclaim, produced the way production produces it. Then time: the knobs
     are chart values read once at daemon start, and the scenario waits the
-    rendered idle out. Proof is the reaper's own per-candidate deletion line
-    on that worker naming an artifact id and a staging path under the
-    source's snapshots directory, no trace of the entry (nor a `.gc-pending`
-    sibling) left on disk, and — the precondition the reaper claims — the
-    cluster's `ready` snapshot row for exactly that local artifact id with a
-    live storage location. The source keeps running.
+    rendered idle out. Proof is state: the fork's entry under the source's
+    snapshots directory is gone from disk with no `.gc-pending` sibling left
+    behind, while the cluster still holds the `ready` snapshot rows with live
+    storage locations the source had once the fork published — the backup
+    the reaper requires before it deletes. The source keeps running.
     """
 
     def __init__(
@@ -4322,8 +4501,33 @@ class SnapshotReaperAssertions:
         )
         return entries
 
-    def wait_until_reaped(self, node_name: str, *, timeout: float | None = None) -> ReapedArtifact:
-        """Block until the reaper reports deleting an artifact under the source's snapshots."""
+    def expect_source_snapshot_backed(self) -> tuple[str, ...]:
+        """The local artifacts of the source that the cluster holds a ready remote copy of.
+
+        The fork builds its child from the durable copy, so the copy of the
+        source's fork snapshot is `ready` with a storage location by now. The
+        source is never suspended, so these are the fork's artifacts.
+        """
+
+        backed = self._control.backed_local_artifacts(self._fixture.sandbox.sandbox_id)
+        self._fixture.verify(
+            len(backed) >= 1,
+            "the fork left the source with no ready snapshot row holding a live storage location",
+            sandbox_id=self._fixture.sandbox.sandbox_id,
+        )
+        self._fixture.record("backed_local_artifacts", list(backed))
+        return backed
+
+    def wait_until_reaped(
+        self, node_name: str, *, before: tuple[str, ...], timeout: float | None = None
+    ) -> None:
+        """Block until no trace of the fork's snapshot entries remains on disk.
+
+        The reaper renames the directory to `<name>.gc-pending-<artifact>`
+        before deleting the row, then asks node-mgr to remove it; a failed
+        RPC leaves the sibling behind for the orphan sweep. Waiting on the
+        original name alone would pass over exactly that residue.
+        """
 
         config = self._config
         if config is None:
@@ -4337,67 +4541,51 @@ class SnapshotReaperAssertions:
             timeout = config.idle_seconds + config.grace_seconds + 4 * config.interval_seconds + 180
         deadline = time.monotonic() + timeout
         while True:
-            matches = self._control.reaped_artifacts(
-                node_name, self._fixture.sandbox.sandbox_id, since_time=self._since_time
+            after = self._control.sandbox_snapshot_dirs(node_name, self._fixture.sandbox.sandbox_id)
+            residue = sorted(
+                entry for entry in after if any(entry.startswith(name) for name in before)
             )
-            if matches:
-                return matches[-1]
-            if time.monotonic() > deadline:
-                # The loop log includes the reaper's own warnings: a
-                # `DeleteCacheArtifact RPC failed` or node-mgr connect failure
-                # here means the row was reaped but the bytes were left for
-                # the orphan sweep, which this join deliberately ignores.
-                self._fixture.verify(
-                    False,
-                    "the snapshot reaper did not reclaim the source's backed named snapshot "
-                    "(see reaper_loop_log for a failed node-mgr delete or a skip reason)",
-                    sandbox_id=self._fixture.sandbox.sandbox_id,
-                    worker_node=node_name,
-                    reap_timeout_seconds=timeout,
-                    idle_seconds=config.idle_seconds,
-                    grace_seconds=config.grace_seconds,
-                    interval_seconds=config.interval_seconds,
-                    reaper_loop_log=self._control.reaper_loop_log(
+            if not residue:
+                self._fixture.record("snapshots_after_reap", list(after))
+                return
+            # The loop log includes the reaper's own warnings: a
+            # `DeleteCacheArtifact RPC failed` or node-mgr connect failure
+            # here means the row was reaped but the bytes were left for the
+            # orphan sweep.
+            self._fixture.verify(
+                time.monotonic() <= deadline,
+                "the snapshot reaper did not reclaim the source's backed named snapshot "
+                "(see reaper_loop_log for a failed node-mgr delete or a skip reason)",
+                sandbox_id=self._fixture.sandbox.sandbox_id,
+                worker_node=node_name,
+                snapshots_before=list(before),
+                residue=residue,
+                reap_timeout_seconds=timeout,
+                idle_seconds=config.idle_seconds,
+                grace_seconds=config.grace_seconds,
+                interval_seconds=config.interval_seconds,
+                failure_evidence=lambda: {
+                    "reaper_loop_log": self._control.reaper_loop_log(
                         node_name, since_time=self._since_time
-                    ),
-                )
+                    )
+                },
+            )
             self._fixture.wait(15)
 
-    def expect_reaped_artifact_was_backed(self, reaped: ReapedArtifact) -> None:
-        """The reaper's precondition, checked on the control plane after the fact."""
+    def expect_durable_copy_kept(self, backed: tuple[str, ...]) -> None:
+        """Every artifact that was backed before the reap is still backed after it."""
 
+        lost = [
+            artifact
+            for artifact in backed
+            if not self._control.artifact_backed(self._fixture.sandbox.sandbox_id, artifact)
+        ]
         self._fixture.verify(
-            bool(reaped.local_artifact_id),
-            "the reaper's deletion line names no artifact id",
-            staging_path=reaped.staging_path,
-        )
-        self._fixture.verify(
-            self._control.artifact_backed(self._fixture.sandbox.sandbox_id, reaped.local_artifact_id),
-            "the reaper deleted an artifact the cluster does not hold a ready remote copy of",
+            not lost,
+            "the cluster lost the ready remote copy of an artifact the reaper reclaimed locally",
             sandbox_id=self._fixture.sandbox.sandbox_id,
-            local_artifact_id=reaped.local_artifact_id,
-        )
-
-    def expect_snapshot_gone(self, node_name: str, *, before: tuple[str, ...]) -> None:
-        """No trace of the reaped entry remains — not the name, not a `.gc-pending` sibling.
-
-        The reaper renames the directory to `<name>.gc-pending-<artifact>`
-        before deleting the row, then asks node-mgr to remove it; a failed
-        RPC leaves the sibling behind for the orphan sweep. A check on the
-        original name alone would pass over exactly that residue.
-        """
-
-        after = self._control.sandbox_snapshot_dirs(node_name, self._fixture.sandbox.sandbox_id)
-        residue = sorted(
-            entry for entry in after if any(entry.startswith(name) for name in before)
-        )
-        self._fixture.verify(
-            not residue,
-            "the reaper reported the deletion but the snapshot's bytes are still on disk",
-            sandbox_id=self._fixture.sandbox.sandbox_id,
-            snapshots_before=list(before),
-            snapshots_after=list(after),
-            residue=residue,
+            backed_before=list(backed),
+            lost=lost,
         )
 
 
@@ -4408,11 +4596,11 @@ class ColdEvictionAssertions:
     `sandboxEviction` in the kind sandbox-manager chart); nothing here changes
     them, and the only forcing device is time — the scenario waits out the
     rendered minimum idle instead of aging rows in the daemon's private DB
-    the way the retired compose suites did. The proof is sbx-manager's own
-    `local_eviction_completed` event on the sandbox's worker, the cache
-    directory gone from that node's disk, and — the part that makes eviction
-    safe at all — a wake that restores from object storage (`runtime_activated`
-    with `remote_*` provenance) with the sandbox's state intact.
+    the way the retired compose suites did. The proof is the cache directory
+    gone from the worker's disk while the sandbox is still suspended, and —
+    the part that makes eviction safe at all — a wake that restores from
+    object storage (`runtime_activated` with `remote_*` provenance) and
+    brings the sandbox's state back.
     """
 
     def __init__(
@@ -4498,17 +4686,13 @@ class ColdEvictionAssertions:
             worker_node=node_name,
         )
 
-    def wait_until_evicted(
-        self, node_name: str, *, timeout: float | None = None
-    ) -> LocalEviction:
-        """Block until the eviction LOOP reports it evicted this sandbox on that worker.
+    def wait_until_evicted(self, node_name: str, *, timeout: float | None = None) -> None:
+        """Block until the sandbox's cache directory is gone from that worker.
 
         The wait is the rendered minimum idle plus ticks plus slack for the
-        proof RPC and the cache-dir removal; the event is read from the
-        worker's own logs, so waiting touches nothing the loop measures. The
-        same event type is also emitted with `reason=cluster_row_absent` by
-        the facet-sync path for cluster-deleted sandboxes — not the loop under
-        test — so the reason is asserted, not just recorded.
+        proof RPC and the cache-dir removal; probing the directory touches
+        nothing the loop measures. The sandbox is suspended, not deleted, so
+        the cluster-deleted reclaim cannot be what removed it.
         """
 
         config = self._config
@@ -4519,75 +4703,61 @@ class ColdEvictionAssertions:
         if timeout is None:
             timeout = config.min_idle_seconds + 4 * config.interval_seconds + 300
         deadline = time.monotonic() + timeout
-        while True:
-            evictions = self._control.local_evictions(
-                self._fixture.sandbox.sandbox_id,
-                node_names=[node_name],
-                since_time=self._since_time,
-            )
-            if evictions:
-                evicted = evictions[-1]
-                self._fixture.verify(
-                    evicted.reason == "latest_backed_idle",
-                    "the sandbox was evicted, but not by the cold-eviction loop's "
-                    "backed-idle decision",
-                    sandbox_id=self._fixture.sandbox.sandbox_id,
-                    eviction_reason=evicted.reason,
-                    eviction_snapshot_id=evicted.snapshot_id,
-                )
-                return evicted
-            if time.monotonic() > deadline:
-                # A candidate the loop could not prove is backed off for 30
-                # minutes; the tick/skip lines say which proof failed.
-                self._fixture.verify(
-                    False,
-                    "sbx-manager did not evict the provably backed idle sandbox",
-                    sandbox_id=self._fixture.sandbox.sandbox_id,
-                    worker_node=node_name,
-                    eviction_timeout_seconds=timeout,
-                    min_idle_seconds=config.min_idle_seconds,
-                    interval_seconds=config.interval_seconds,
-                    eviction_loop_log=self._control.eviction_loop_log(
+        sandbox_id = self._fixture.sandbox.sandbox_id
+        while self._control.sandbox_cache_dir_present(node_name, sandbox_id):
+            # A candidate the loop could not prove is backed off for 30
+            # minutes; the tick/skip lines say which proof failed.
+            self._fixture.verify(
+                time.monotonic() <= deadline,
+                "sbx-manager did not evict the provably backed idle sandbox",
+                sandbox_id=sandbox_id,
+                worker_node=node_name,
+                eviction_timeout_seconds=timeout,
+                min_idle_seconds=config.min_idle_seconds,
+                interval_seconds=config.interval_seconds,
+                failure_evidence=lambda: {
+                    "eviction_loop_log": self._control.eviction_loop_log(
                         node_name, since_time=self._since_time
-                    ),
-                )
+                    )
+                },
+            )
             self._fixture.wait(15)
+        self._fixture.record(
+            "evicted_after_seconds", round(timeout - (deadline - time.monotonic()), 1)
+        )
 
     def expect_local_presence_gone(self, node_name: str) -> None:
         self._fixture.verify(
             not self._control.sandbox_cache_dir_present(
                 node_name, self._fixture.sandbox.sandbox_id
             ),
-            "eviction was reported but the sandbox cache directory is still on disk",
+            "the sandbox cache directory is still on disk after eviction",
             sandbox_id=self._fixture.sandbox.sandbox_id,
             worker_node=node_name,
         )
 
-    def expect_woken_from_object_storage(
-        self, *, source: SandboxPodPlacement, visibility_timeout: float = 60
-    ) -> RestoreActivation:
-        """The wake after eviction was a snapshot restore pulled from object storage.
+    def expect_woken_from_object_storage(self, *, source: SandboxPodPlacement) -> None:
+        """The wake after eviction was a restore planned from object storage.
 
         The landing node is recorded, not required: a user restore prefers
         the source node, so this normally exercises the same-node
         orphan-adopt path, but eviction's safety claim is that the sandbox
-        restores from the remote copy wherever it lands.
+        restores from the remote copy wherever it lands. Its local copy is
+        gone, so the state the scenario reads back came from that copy.
         """
 
         landed = self.sandbox_placement()
-        activation = _expect_snapshot_restore_from_object_storage(
+        _expect_snapshot_restore_from_object_storage(
             self._fixture,
             self._control,
             since_time=self._since_time,
             source=source,
             landed=landed,
             must_change_node=False,
-            activation_visibility_timeout=visibility_timeout,
         )
         self._fixture.record(
             "woke_on_source_node", landed.node_name == source.node_name
         )
-        return activation
 
 
 class CrossNodeRestoreAssertions:
@@ -4601,15 +4771,15 @@ class CrossNodeRestoreAssertions:
     unschedulable for the restore window — the only placement lever Kubernetes
     exposes here. That is a fault injection, so it lives behind [`KindEcw`].
 
-    The proof is sbx-manager's own `runtime_activated` event for the landed
-    pod's execution generation: `restore_provenance` reads `local_only` for a
-    same-node artifact reuse and one of the healthy `remote_*` classes with
-    `restore_storage_uri_present` for a pull from object storage. Asserting the
-    event rather than the landing node alone rules out a restore that moved
-    nodes but was served from some other local copy.
+    The proof: the landed pod on another node carries the storage URI the
+    API stamps when a portable snapshot exists and is the sandbox's one
+    active execution, newer than the source's; sbx-manager's
+    `runtime_activated` event for that generation — a documented contract —
+    reports a healthy `remote_*` provenance with the storage URI present,
+    which rules out a restore that moved nodes but was served from some
+    other local copy; and the scenario reads back the state written before
+    the suspend.
     """
-
-    REMOTE_PROVENANCE = REMOTE_RESTORE_PROVENANCE
 
     def __init__(
         self,
@@ -4622,11 +4792,8 @@ class CrossNodeRestoreAssertions:
         self._scope = scope
         self._mutation_lock: Compensation | None = None
         self._uncordon: Compensation | None = None
-        # Lower bound for the sandbox-manager log read. A minute of slack covers
-        # clock skew between this process and the kind nodes.
-        self._since_time = (datetime.now(UTC) - timedelta(minutes=1)).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        )
+        # Lower bound for the failure-evidence log read.
+        self._since_time = _log_since_time()
 
     def current_placement(self) -> SandboxPodPlacement:
         """The running sandbox's bound kube node; fails if it is not placed."""
@@ -4698,16 +4865,14 @@ class CrossNodeRestoreAssertions:
         *,
         source: SandboxPodPlacement,
         landed: SandboxPodPlacement,
-        visibility_timeout: float = 60,
-    ) -> RestoreActivation:
-        """Require the landed pod's activation to be a remote pull off-source."""
+    ) -> None:
+        """Require the landed pod to be a restore from object storage, off-source."""
 
-        return _expect_snapshot_restore_from_object_storage(
+        _expect_snapshot_restore_from_object_storage(
             self._fixture,
             self._control,
             since_time=self._since_time,
             source=source,
             landed=landed,
             must_change_node=True,
-            activation_visibility_timeout=visibility_timeout,
         )

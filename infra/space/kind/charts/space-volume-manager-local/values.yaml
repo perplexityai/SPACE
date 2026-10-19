@@ -12,6 +12,11 @@ clusterId: kind-local
 telemetry: {}
 node: {}
 
+# How this service gets object-store credentials, set by every bring-up path
+# from SPACE_KIND_STORAGE_CREDENTIALS (infra/space/kind/lib/storage-credentials.sh):
+# `exchange` through credential-manager on sandbox workers, or `static` keys.
+storageCredentials: exchange
+
 # On SIGTERM volume-manager closes transfer admission, drains queued
 # transfers for up to --drain-timeout-secs (100 s), then stops its gRPC server
 # within --server-drain-timeout-secs (10 s)

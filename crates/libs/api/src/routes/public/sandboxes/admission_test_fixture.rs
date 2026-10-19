@@ -163,7 +163,7 @@ impl AdmissionPoolFixture {
     }
 
     pub(crate) fn controller_with(substrate: KubernetesSubstrate) -> SandboxController {
-        SandboxController::new(Substrate::Kubernetes(Box::new(substrate)))
+        SandboxController::new(Substrate::from_kubernetes(substrate))
     }
 
     /// A default-shape native create of the fixture template.

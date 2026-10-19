@@ -22,7 +22,9 @@
 #
 #   s3-roundtrip drives the real volume-manager → object-store push/pull (no api needed).
 #   It first ensures the snapshots bucket exists (idempotent), so an object-store pod
-#   recreation that wiped the hostPath-backed bucket can't fail the round-trip.
+#   recreation that wiped the hostPath-backed bucket can't fail the round-trip. It
+#   SKIPs when the worker volume-manager exchanges its credentials
+#   (SPACE_KIND_STORAGE_CREDENTIALS=exchange, the default): see run_s3_roundtrip.
 #
 # Env knobs:
 #   KCTX                 kube context           (default kind-space-local)
@@ -317,6 +319,21 @@ run_s3_roundtrip() {
   if [[ -z "$node" || -z "$pod" ]]; then
     printf 'FAIL  %-14s :: no worker volume-manager with an operator shell (are the node DaemonSets up?)\n' "s3-roundtrip"
     FAILURES=$((FAILURES + 1))
+    return
+  fi
+  # Without static keys the worker volume-manager asks credential-manager for
+  # a session per transfer, and the authority vends one only for an object
+  # its subject owns: a real sandbox's suspend-snapshot key, written from the
+  # node that holds it. This check has no API, so no sandbox, and the
+  # authority rightly refuses its made-up subject and key. The typed
+  # scenarios cover the exchanged path instead: local.storage_exchange_scoping
+  # and every suspend/restore.
+  local static_key
+  static_key="$(kubectl --context "$KCTX" -n "$NS" get daemonset space-volume-manager \
+    -o jsonpath='{.spec.template.spec.containers[?(@.name=="volume-manager")].env[?(@.name=="SPACE_OBJECT_STORE_STATIC_ACCESS_KEY_ID")].name}' \
+    2>/dev/null || true)"
+  if [[ -z "$static_key" ]]; then
+    printf 'SKIP  %-14s :: worker volume-manager exchanges its object-store credentials, which the authority vends only for a real sandbox'"'"'s snapshot keys (run with SPACE_KIND_STORAGE_CREDENTIALS=static, or see local.storage_exchange_scoping)\n' "s3-roundtrip"
     return
   fi
   local sbx="019e9e00-0000-7000-8000-0000000000aa"

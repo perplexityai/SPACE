@@ -22,7 +22,6 @@ import os
 import sys
 import time
 import tomllib
-from collections.abc import Iterable
 from pathlib import Path
 
 from e2b import Sandbox, Template, default_build_logger
@@ -33,47 +32,6 @@ DEFAULT_ALIAS = "code-runtime"
 DEFAULT_BASE_TEMPLATE = "seed"
 DEFAULT_CPU_COUNT = 2
 DEFAULT_MEMORY_MB = 2048
-
-SYSTEM_PACKAGES = [
-    "python3",
-    "python3-venv",
-    "python3-pip",
-    "python-is-python3",
-    "curl",
-    "ca-certificates",
-    "sudo",
-    "git",
-    "git-lfs",
-    "procps",
-    "jq",
-    "wget",
-    "lsof",
-    "sqlite3",
-    "iputils-ping",
-    "libcap2-bin",
-    "python3-dev",
-    "python3-setuptools",
-    "iproute2",
-]
-
-PYTHON_PACKAGES = [
-    "jupyter",
-    "ipython",
-    "jupyterlab",
-    "bokeh",
-    "kaleido",
-    "nltk",
-    "spacy",
-    "numba",
-    "numpy",
-    "pandas",
-    "scipy",
-    "pillow",
-    "imageio",
-    "send2trash",
-    "pygments",
-    "jsonschema",
-]
 
 VALIDATE_PYTHON = r"""
 set -eo pipefail
@@ -130,10 +88,6 @@ def parse_tags(raw: str) -> list[str]:
     return tags or ["latest"]
 
 
-def shell_words(values: Iterable[str]) -> str:
-    return " ".join(values)
-
-
 def build_template_definition(base_template: str) -> Template:
     recipe_path = (
         Path(__file__).resolve().parents[1]
@@ -146,17 +100,21 @@ def build_template_definition(base_template: str) -> Template:
         for step in recipe["steps"]
         if step["type"] == "run"
     }
-    return (
-        Template()
+    template = (
+        Template(file_context_path=recipe_path.parent)
         .from_template(base_template)
-        .apt_install(SYSTEM_PACKAGES)
+        .run_cmd(commands["Install system packages"], user="root")
         .run_cmd(VALIDATE_PYTHON, user="root")
         .run_cmd(commands["Install Node.js v20"], user="root")
         .run_cmd(commands["Install GitHub CLI"], user="root")
         .run_cmd(commands["Install uv package manager"], user="root")
-        .run_cmd(
-            "python3 -m pip install --quiet --break-system-packages "
-            f"--root-user-action=ignore --ignore-installed {shell_words(PYTHON_PACKAGES)}",
+    )
+    for step in recipe["steps"]:
+        if step["type"] == "copy":
+            template = template.copy(step["source"], step["dest"], user="root")
+    return (
+        template.run_cmd(
+            commands["Install code interpreter packages (Jupyter, data science, NLP)"],
             user="root",
         )
         .run_cmd(CONFIGURE_USER, user="root")

@@ -1,8 +1,10 @@
-//! Direct's node reads select only Direct (`'space'`) nodes.
+//! Direct's node reads select only Direct (`'space'`) nodes, its create-target
+//! claim and release touch only Direct sandboxes, and a stored route
+//! identity's substrate is read by its exact label.
 //!
-//! Each test registers a Direct node and an otherwise identical twin whose
-//! `managed_by` is `'k8s'`. The twin keeps its own live `node_direct` row, so
-//! only the `managed_by` predicate can exclude it.
+//! Each node test registers a Direct node and an otherwise identical twin
+//! whose `managed_by` is `'k8s'`. The twin keeps its own live `node_direct`
+//! row, so only the `managed_by` predicate can exclude it.
 
 use std::collections::HashSet;
 
@@ -286,5 +288,91 @@ async fn builder_lookup_reads_only_direct_nodes() -> TestResult {
     if let Some(Err(error)) = outcome? {
         assert!(!error.to_string().contains("is not registered"), "{error}");
     }
+    Ok(())
+}
+
+/// Only the exact labels name a substrate; any other text, including another
+/// spelling of one, is an invalid route identity.
+#[test]
+fn route_identity_substrate_kind_reads_only_the_exact_labels() {
+    use pplx_space_sbx_mgr_client::proto::SandboxSubstrateKind;
+    for (stored, expected) in [
+        ("space", Some(SandboxSubstrateKind::Direct)),
+        ("k8s", Some(SandboxSubstrateKind::Kubernetes)),
+        ("direct", None),
+        ("kubernetes", None),
+        ("SPACE", None),
+        ("K8S", None),
+        (" k8s", None),
+        ("space ", None),
+        ("", None),
+    ] {
+        assert_eq!(
+            route_identity_substrate_kind(stored),
+            expected,
+            "{stored:?}"
+        );
+    }
+}
+
+async fn create_target(pool: &PgPool, sandbox_id: SandboxId) -> TestResult<Option<NodeId>> {
+    Ok(
+        sqlx::query_scalar(sql!("SELECT target_node_id FROM sandboxes WHERE id = $1"))
+            .bind(sandbox_id)
+            .fetch_one(pool)
+            .await?,
+    )
+}
+
+/// Direct claims and releases a create target only on its own rows: an
+/// otherwise identical `'k8s'` row awaiting creation is refused and left as
+/// it was.
+#[tokio::test(flavor = "current_thread")]
+async fn create_target_claims_only_direct_rows() -> TestResult {
+    let Some(fixture) = postgres_fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.pool;
+    let node = NodeId::new();
+    insert_ready_worker(pool, node, "127.0.0.1:1", "9.0.0").await?;
+    let direct = SandboxId::new();
+    let kubernetes = SandboxId::new();
+    for (sandbox_id, managed_by) in [(direct, "space"), (kubernetes, "k8s")] {
+        insert_sandbox(pool, sandbox_id, None).await?;
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET lifecycle = 'creating', managed_by = $2 WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .bind(managed_by)
+        .execute(pool)
+        .await?;
+    }
+
+    fixture.substrate.claim_create_target(direct, node).await?;
+    assert!(matches!(
+        fixture
+            .substrate
+            .claim_create_target(kubernetes, node)
+            .await,
+        Err(SubstrateError::Conflict { .. })
+    ));
+    assert_eq!(create_target(pool, direct).await?, Some(node));
+    assert_eq!(create_target(pool, kubernetes).await?, None);
+
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET target_node_id = $2 WHERE id = $1"
+    ))
+    .bind(kubernetes)
+    .bind(node)
+    .execute(pool)
+    .await?;
+    for sandbox_id in [direct, kubernetes] {
+        fixture
+            .substrate
+            .release_create_target(sandbox_id, node)
+            .await?;
+    }
+    assert_eq!(create_target(pool, direct).await?, None);
+    assert_eq!(create_target(pool, kubernetes).await?, Some(node));
     Ok(())
 }

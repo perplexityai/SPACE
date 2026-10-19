@@ -11,11 +11,12 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
+use pplx_space_metrics::gateway::TcpConnectionFault;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// Which peer of a relay an observation came from.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::tcp_proxy) enum Side {
+pub(crate) enum Side {
     Guest,
     Origin,
 }
@@ -39,27 +40,32 @@ enum Operation {
 
 /// The first I/O failure in a relay, as a bounded `side_operation` label.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::tcp_proxy) struct RelayFault {
+pub(crate) struct RelayFault {
     side: Side,
     operation: Operation,
 }
 
 impl RelayFault {
-    #[cfg(test)]
-    pub(in crate::tcp_proxy) const fn side(self) -> Side {
+    pub(crate) const fn side(self) -> Side {
         self.side
     }
 
-    pub(in crate::tcp_proxy) const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
+        self.metric().as_str()
+    }
+
+    /// The same label as the `fault` tag on `gateway.tcp.connection`, so the
+    /// log field and the metric cannot drift.
+    pub(crate) const fn metric(self) -> TcpConnectionFault {
         match (self.side, self.operation) {
-            (Side::Guest, Operation::Read) => "guest_read",
-            (Side::Guest, Operation::Write) => "guest_write",
-            (Side::Guest, Operation::Flush) => "guest_flush",
-            (Side::Guest, Operation::Shutdown) => "guest_shutdown",
-            (Side::Origin, Operation::Read) => "origin_read",
-            (Side::Origin, Operation::Write) => "origin_write",
-            (Side::Origin, Operation::Flush) => "origin_flush",
-            (Side::Origin, Operation::Shutdown) => "origin_shutdown",
+            (Side::Guest, Operation::Read) => TcpConnectionFault::GuestRead,
+            (Side::Guest, Operation::Write) => TcpConnectionFault::GuestWrite,
+            (Side::Guest, Operation::Flush) => TcpConnectionFault::GuestFlush,
+            (Side::Guest, Operation::Shutdown) => TcpConnectionFault::GuestShutdown,
+            (Side::Origin, Operation::Read) => TcpConnectionFault::OriginRead,
+            (Side::Origin, Operation::Write) => TcpConnectionFault::OriginWrite,
+            (Side::Origin, Operation::Flush) => TcpConnectionFault::OriginFlush,
+            (Side::Origin, Operation::Shutdown) => TcpConnectionFault::OriginShutdown,
         }
     }
 }

@@ -62,7 +62,8 @@ use std::sync::LazyLock;
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{NodeId, SandboxId, SubstrateKind};
 use pplx_space_sandbox_portability::{
-    artifact_has_durable_copy, sandbox_attached_anywhere, sandbox_attached_to_node,
+    artifact_has_durable_copy, latest_full_snapshot_ready, restore_retry_source_snapshot_exists,
+    sandbox_attached_anywhere, sandbox_attached_to_node, snapshot_durable_for_source_release,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::types::JsonValue;
@@ -348,6 +349,50 @@ pub async fn any_undescribed_artifact_owner(
     Ok(holding.map(SandboxId::from_uuid))
 }
 
+/// Whether `sandbox_id` is durably restorable from a ready snapshot the
+/// restore would select. A `restoring` row needs a source in its retry window
+/// ([`restore_retry_source_snapshot_exists`]). Any other row must pass both
+/// the marker-aware test the node-drain source release uses
+/// ([`snapshot_durable_for_source_release`]) and the newest-snapshot test
+/// ([`latest_full_snapshot_ready`]): a sandbox marked to a local artifact
+/// needs that artifact's ready backup, an evacuation-marked one a ready newest
+/// full snapshot, and any other unmarked one a ready full snapshot fresher
+/// than its last placement change with no newer full row in any state. That
+/// last rule is stricter than the user restore selector, which would still
+/// pick the fresh ready snapshot under a newer failed row; erring that way
+/// only holds a release. An older ready snapshot the restore wouldn't select
+/// doesn't count. `false` for a missing sandbox.
+pub async fn durably_restorable(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+) -> Result<bool, SandboxStoreError> {
+    /// Built once: every input is a literal or a bind placeholder.
+    static DURABLY_RESTORABLE: LazyLock<String> = LazyLock::new(|| {
+        let durable = snapshot_durable_for_source_release("s");
+        let newest_ready = latest_full_snapshot_ready("s");
+        let retry_source = restore_retry_source_snapshot_exists("s");
+        sql!(
+            format!(
+                "SELECT COALESCE((
+                     SELECT CASE
+                                WHEN s.lifecycle = 'restoring' THEN {retry_source}
+                                ELSE ({durable}) AND ({newest_ready})
+                            END
+                       FROM sandboxes s
+                      WHERE s.id = $1
+                 ), FALSE)"
+            )
+            .as_str()
+        )
+    });
+    Ok(
+        sqlx::query_scalar(sqlx::AssertSqlSafe(DURABLY_RESTORABLE.as_str()))
+            .bind(sandbox_id)
+            .fetch_one(executor)
+            .await?,
+    )
+}
+
 /// A three-state patch for one column.
 ///
 /// `Option` cannot express this: it collapses "leave the column alone" and
@@ -514,15 +559,17 @@ pub struct AutoLifecycleExecution {
 }
 
 impl AutoLifecycleExecution {
-    /// Kubernetes publishes activation ownership before launching a runtime;
-    /// direct launch does not provide equivalent durable proof of absence.
-    /// `managed_by` holds the column's text; only a value that parses as
-    /// [`SubstrateKind::Kubernetes`] proves absence.
+    /// A row with no placement, no active or target node, no execution
+    /// generation, no direct route and no activation lease has no execution,
+    /// but only if its substrate
+    /// [proves execution absence](SubstrateKind::proves_execution_absence).
+    /// `managed_by` holds the column's text; a value that does not parse
+    /// proves nothing.
     pub fn proves_no_execution(&self) -> bool {
-        matches!(
-            self.managed_by.parse::<SubstrateKind>(),
-            Ok(SubstrateKind::Kubernetes)
-        ) && self.placement == "unplaced"
+        self.managed_by
+            .parse::<SubstrateKind>()
+            .is_ok_and(SubstrateKind::proves_execution_absence)
+            && self.placement == "unplaced"
             && self.active_node_id.is_none()
             && self.target_node_id.is_none()
             && self.execution_generation.is_none()

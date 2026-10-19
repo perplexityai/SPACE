@@ -22,12 +22,12 @@ MARKER = "space-smoke-orphaned-restore-pod-gc-ok"
 )
 def orphaned_restore_pod_gc_reaps_only_superseded(test: smoke.KindEcw) -> None:
     """With the GC live, a restore pod below the started row's active
-    generation and one whose sandbox row does not exist are each deleted
-    only after the threshold and confirmed reaped once gone; a restore done
-    while the GC is live leaves one execution whose pod keeps its uid well
-    past the threshold plus several ticks without the GC ever naming it; and
-    a suspended sandbox with an orphan on its own row at its retired
-    generation has that orphan reaped and still restores with its state."""
+    generation and one whose sandbox row does not exist are each deleted,
+    no sooner than the threshold; a restore done while the GC is live leaves
+    one execution whose pod keeps its uid well past the threshold plus
+    several ticks; and a suspended sandbox with an orphan on its own row at
+    its retired generation has that orphan reaped and still restores with its
+    state."""
 
     marker = f"{MARKER}-{test.sandbox.sandbox_id}"
     gc = test.orphaned_restore_pod_gc
@@ -49,8 +49,8 @@ def orphaned_restore_pod_gc_reaps_only_superseded(test: smoke.KindEcw) -> None:
         with test.phase("superseded: an older generation on the started row and a row-less pod are reaped"):
             superseded = gc.plant(sandbox_id=test.sandbox.sandbox_id, generation=restored.generation - 1)
             rowless = gc.plant(generation=1)
-            gc.expect_reaped(superseded)
-            gc.expect_reaped(rowless)
+            # Watched together, so each plant's age is judged from its own create.
+            gc.expect_reaped(superseded, rowless)
             # The started row's own restore pod sat beside them the whole time.
             current = gc.expect_one_live_execution(above=superseded.generation)
             test.verify(
@@ -65,8 +65,7 @@ def orphaned_restore_pod_gc_reaps_only_superseded(test: smoke.KindEcw) -> None:
             test.pause()
             rows = gc.wait_until_suspended()
             # Restored while the GC ticks. Its current-generation pod on a
-            # started row must outlast the threshold plus several ticks with
-            # no GC action naming it. The skip for an in-flight `restoring`
+            # started row must outlast the threshold plus several ticks. The skip for an in-flight `restoring`
             # row is unit-tested in the reconciler instead: on kind a restore
             # is `restoring` for about a second, far shorter than the
             # threshold a misclassified pod would need to age into a delete.

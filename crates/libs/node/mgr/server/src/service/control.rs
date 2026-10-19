@@ -76,7 +76,8 @@ impl NodeManagerService {
         let status = self
             .off_runtime("sync guest", move || {
                 crate::host_command::output(
-                    std::process::Command::new("sync").args(["--file-system", &instance_dir]),
+                    crate::host_command::Command::new("sync")
+                        .args(["--file-system", &instance_dir]),
                     crate::host_command::MUTATION_BUDGET,
                     &[],
                 )

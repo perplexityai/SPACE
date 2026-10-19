@@ -66,8 +66,8 @@
 //! * The plaintext DEK is fed to cryptsetup over stdin (never written to a
 //!   key-file on disk) and the caller holds it in a `Zeroizing` buffer.
 
+use crate::host_command::Command;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::device_backing::{self, Backing, LoopDevice};
 use pplx_space_common_core::types::SandboxId;

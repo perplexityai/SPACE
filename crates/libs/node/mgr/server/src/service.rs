@@ -118,6 +118,21 @@ fn ensure_sandbox_artifact_dir_permissions(path: impl AsRef<Path>) -> Result<(),
     trusted_paths::set_permissions(&directory, Some(gids::SPACE_CACHE_RW), 0o2770)
 }
 
+fn ensure_sandbox_instance_traversal(path: impl AsRef<Path>) -> Result<(), Status> {
+    let path = path.as_ref();
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(Status::internal(format!(
+                "inspect retained instance: {error}"
+            )));
+        }
+        Ok(_) => {}
+    }
+    let directory = trusted_paths::open_directory(path)?;
+    trusted_paths::set_permissions(&directory, Some(gids::SPACE_CACHE_RW), 0o2710)
+}
+
 fn ensure_sidecar_run_dir_permissions(path: &str) -> Result<(), Status> {
     cleanup_helpers::chgrp_path_blocking(path, gids::SPACE_SIDECARCLIENTS)?;
     cleanup_helpers::chmod_path_blocking(path, 0o2770)
@@ -187,7 +202,6 @@ pub struct NodeManagerService {
     sandbox_artifact_locks: SandboxCgroupFamilyLocks,
     send_source_locks: SandboxCgroupFamilyLocks,
     send_source_slots: std::sync::Arc<tokio::sync::Semaphore>,
-    send_parent_seal: btrfs_send_source::ParentSeal,
     artifact_work: Option<std::sync::Arc<filesystem_work::ArtifactWork>>,
     /// Shared drain ownership for detached mutations and lifecycle permits.
     device_op_tasks: tokio_util::task::TaskTracker,
@@ -366,7 +380,6 @@ impl NodeManagerService {
             sandbox_artifact_locks: Default::default(),
             send_source_locks: Default::default(),
             send_source_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
-            send_parent_seal: btrfs_send_source::ParentSeal::from_env(),
             artifact_work: None,
             blocking_probe_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 MAX_BLOCKING_PROBES,

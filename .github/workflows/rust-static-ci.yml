@@ -173,9 +173,11 @@ jobs:
       # pull request. no_new_entries, no_raised_caps and crate_names.no_new
       # compare with its architecture-baseline.toml, and
       # crate_names.policy_changed with its ARCHITECTURE.toml; an empty file
-      # stands in for one the base lacks. If the base can't be resolved, a
-      # warning: the first two and policy_changed are skipped, and no_new
-      # allows only the crates listed when it was added.
+      # stands in for one the base lacks. The files git detects as renamed
+      # since the base are passed too, so that a baseline entry moved with
+      # its file is not a new one; without them, it is. If the base can't be
+      # resolved, a warning: the first two and policy_changed are skipped,
+      # and no_new allows only the crates listed when it was added.
       - name: Check repository structure
         id: archcheck
         if: >-
@@ -211,6 +213,24 @@ jobs:
               }
               if base="$(bash ci/scripts/resolve-migration-base.sh "" "${PULL_REQUEST_HEAD}")"; then
                 base_copy base-baseline architecture-baseline.toml
+                # --renames needs --base-baseline, which a missing copy leaves out.
+                if ((${#missing[@]} == 0)); then
+                  # Past -l files (diff.renameLimit by default), git skips inexact
+                  # rename detection with only a warning on stderr: allow 20000,
+                  # about 20 s for as many unrelated small files added and
+                  # deleted, and make a skip visible.
+                  if git diff -z --name-status --find-renames -l20000 --diff-filter=R "${base}" HEAD \
+                    >target/archcheck-renames 2>target/archcheck-renames.stderr; then
+                    cat target/archcheck-renames.stderr >&2
+                    base_args+=(--renames target/archcheck-renames)
+                    if grep -q "rename detection was skipped" target/archcheck-renames.stderr; then
+                      echo "::warning title=archcheck::git skipped rename detection since ${base} for too many files; no_new_entries counts an entry moved with its file as new."
+                    fi
+                  else
+                    cat target/archcheck-renames.stderr >&2
+                    echo "::warning title=archcheck::Could not list the renames since ${base}; no_new_entries counts an entry moved with its file as new."
+                  fi
+                fi
                 base_copy base-architecture ARCHITECTURE.toml
               else
                 missing=(architecture-baseline.toml ARCHITECTURE.toml)
@@ -231,9 +251,13 @@ jobs:
         with:
           reviewdog_version: v0.21.2
 
-      # Only findings in changed files, unless the pull request changes the
-      # rules or archcheck itself (old or new names), or its file list can't
-      # be read in full.
+      # Advisory findings only in changed files, unless the pull request
+      # changes the rules or archcheck itself (old or new names), or its file
+      # list can't be read in full. Required findings wherever they are:
+      # -filter-mode=file would drop one on a file renamed without edits, or
+      # on a baseline line the pull request leaves alone, such as a deleted
+      # file's stale entry. tests/repository.rs fails on any required finding
+      # in the tree, so one already on main blocks every pull request anyway.
       # reviewdog fails after 10 annotations of any severity, so advisory
       # findings get a run of their own that never fails the step. GitHub
       # shows a step's first 10 warnings, so that run puts the pull request's
@@ -271,12 +295,12 @@ jobs:
             cp target/archcheck.rdjson "${ordered}"
           fi
           annotate() {
-            jq ".diagnostics |= map(select($1))" "$3" |
-              reviewdog -f=rdjson -name=archcheck -reporter=github-pr-annotations -filter-mode="${mode}" -fail-level="$2"
+            jq ".diagnostics |= map(select($1))" "$4" |
+              reviewdog -f=rdjson -name=archcheck -reporter=github-pr-annotations -filter-mode="$3" -fail-level="$2"
           }
-          annotate '.severity != "ERROR"' none "${ordered}" ||
+          annotate '.severity != "ERROR"' none "${mode}" "${ordered}" ||
             echo "::warning title=archcheck::Not every advisory finding was annotated; run cargo arch."
-          annotate '.severity == "ERROR"' error target/archcheck.rdjson
+          annotate '.severity == "ERROR"' error nofilter target/archcheck.rdjson
 
       - name: Report the Cargo registry
         if: always() && matrix.cargo_registry

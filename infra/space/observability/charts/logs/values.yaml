@@ -41,6 +41,16 @@ collection:
     # Optional deny filter on the same unit;identifier pair, after keepRegex.
     # Configure for builder services when they write to the host journal.
     dropRegex: ""
+    # A sandbox's net-gateway and spaced-host have no systemd unit: they run
+    # in the sandbox's cgroup and write to the output the runtime supervisor
+    # gave them, so keepRegex never matches them. When enabled, lines with no
+    # unit from a cgroup matching cgroupRegex are kept too, except from
+    # excludedHosts (journal hostnames): list every builder node, whose
+    # sandboxes run recipes.
+    sidecars:
+      enabled: false
+      cgroupRegex: "/space/sbx-[^/;]+(?:/[^;]*)?"
+      excludedHosts: []
 loki:
   retentionPeriod: 24h
   resources:

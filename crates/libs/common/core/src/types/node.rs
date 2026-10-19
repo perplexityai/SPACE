@@ -774,6 +774,86 @@ impl TryFrom<String> for NodeManagedBy {
 /// `.bind(SubstrateKind::Kubernetes)`) rather than spelling `'k8s'`.
 pub type SubstrateKind = NodeManagedBy;
 
+/// Facts about one row's substrate, its sandbox or node `managed_by`, which
+/// may differ from the substrate the running service uses. Shared code that
+/// decides something from a row's substrate calls one of these instead of
+/// matching a variant or comparing the label. Two exceptions: Rust that
+/// repeats a statement's fixed substrate scope compares against the named
+/// const the statement binds (such as the admin node registry's
+/// `REGISTRY_SUBSTRATE`), and code that maps a variant to a value (a wire
+/// label, a route identity, a constructed target) may match it. Facts about
+/// the running substrate are the api crate's `SubstrateCapabilities`. Each
+/// caller says what its decision does with the answer and with a label that
+/// does not parse.
+impl SubstrateKind {
+    /// Does the substrate durably publish a sandbox's activation ownership
+    /// before it launches a runtime, so that a row carrying none of that
+    /// ownership has no runtime?
+    ///
+    /// - Kubernetes: yes.
+    /// - Space: no. A direct launch records nothing durable first.
+    pub const fn proves_execution_absence(self) -> bool {
+        match self {
+            Self::Kubernetes => true,
+            Self::Space => false,
+        }
+    }
+
+    /// When the control path cannot connect to a sandbox's runtime, can a
+    /// wake give the sandbox a runtime to connect to?
+    ///
+    /// - Kubernetes: yes. A dormant sandbox (suspended, or created and never
+    ///   started) has no pod until a wake creates one.
+    /// - Space: no. Direct wakes a dormant sandbox on the access path before
+    ///   connecting (`DirectSubstrate::access_runtime_client` in the api
+    ///   crate), not after a failed control connect.
+    pub const fn wakes_after_failed_control_connect(self) -> bool {
+        match self {
+            Self::Kubernetes => true,
+            Self::Space => false,
+        }
+    }
+
+    /// Is a node listed in the live node inventory, the Kubernetes node list?
+    ///
+    /// - Kubernetes: yes.
+    /// - Space: no. Its nodes are registered through the admin API and never
+    ///   appear in that inventory.
+    pub const fn listed_in_live_node_inventory(self) -> bool {
+        match self {
+            Self::Kubernetes => true,
+            Self::Space => false,
+        }
+    }
+
+    /// Does a sandbox restore through a Kubernetes restore pod?
+    ///
+    /// - Kubernetes: yes.
+    /// - Space: no.
+    pub const fn restores_through_pods(self) -> bool {
+        match self {
+            Self::Kubernetes => true,
+            Self::Space => false,
+        }
+    }
+
+    /// Does the cluster controller's node-drain reconciler manage a node?
+    /// Its draining and terminating listings bind the one substrate that
+    /// answers yes (`DRAIN_RECONCILER_SUBSTRATE` in its store). The running
+    /// substrate's counterpart is `SubstrateCapabilities::supports_node_drain`
+    /// in the api crate.
+    ///
+    /// - Kubernetes: yes. The reconciler itself is opt-in, which this cannot
+    ///   see.
+    /// - Space: no.
+    pub const fn has_node_drain_reconciler(self) -> bool {
+        match self {
+            Self::Kubernetes => true,
+            Self::Space => false,
+        }
+    }
+}
+
 /// Stage of a node's drain, as stored in `nodes.drain_phase`. NULL in that
 /// column means no drain is in progress and has no variant here — model it as
 /// `Option<NodeDrainPhase>`.

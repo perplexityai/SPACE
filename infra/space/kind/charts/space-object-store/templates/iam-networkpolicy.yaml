@@ -1,0 +1,46 @@
+# Only the IAM service's three callers reach its ports. Possession of a
+# bridge-minted token is all AssumeRoleWithWebIdentity asks for, so a pod that
+# could reach the STS port with a captured token (valid five minutes) could
+# mint vend-role sessions; and the private port answers only the gateway's
+# client certificate anyway. Kind's kindnet enforces NetworkPolicy (README,
+# "Sandbox namespace and network policy"). Kubelet probes come from the pod's own node,
+# which NetworkPolicy always admits, and `kubectl port-forward` enters the
+# pod's own network namespace, so diagnostics are unaffected.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: space-object-store-iam
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: space-object-store-iam
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: space-object-store-iam
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # The IAM and STS API: the STS bridge's AssumeRoleWithWebIdentity
+    # (charts/space-kind-sts-bridge, -upstream) and the bucket-init Job's IAM
+    # calls (templates/bucket-init-job.yaml).
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: space-kind-sts-bridge
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: space-object-store-bucket-init
+      ports:
+        - protocol: TCP
+          port: {{ .Values.iam.port }}
+    # The private API: the gateway's --iam-standalone-endpoint
+    # (templates/deployment.yaml).
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: space-object-store
+      ports:
+        - protocol: TCP
+          port: {{ .Values.iam.privatePort }}

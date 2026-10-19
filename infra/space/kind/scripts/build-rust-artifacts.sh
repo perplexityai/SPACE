@@ -205,12 +205,23 @@ build_stage() {
   awk '/^FROM cook AS build$/ { s = 1; next } /^FROM / { s = 0 } s' "$KIND_DOCKERFILE"
 }
 
+# The build stage's `RUN cargo build` invocations, numbered from 1: the host
+# services, then the guest's spaced, built on its own feature set.
+cargo_build_block() {
+  build_stage | awk -v n="$1" '/^RUN cargo build/ { b++; on = b == n } on { print } on && /^$/ { on = 0 }'
+}
+
 main_build_features() {
-  build_stage | awk '/^RUN cargo build/,/^$/' | grep -oE -- '-F [^ \\]+' | awk '{print $2}'
+  cargo_build_block 1 | grep -oE -- '-F [^ \\]+' | awk '{print $2}'
 }
 
 main_build_bins() {
-  build_stage | awk '/^RUN cargo build/,/^$/' | grep -oE -- '--bin [^ \\]+' | awk '{print $2}'
+  cargo_build_block 1 | grep -oE -- '--bin [^ \\]+' | awk '{print $2}'
+}
+
+# The guest invocation's package, feature and bin arguments, as given.
+guest_build_args() {
+  cargo_build_block 2 | grep -oE -- '(-p|-F|--bin) [^ \\]+'
 }
 
 supervisor_features() {
@@ -358,6 +369,16 @@ build_incremental() {
   phase_started=$SECONDS
   in_builder bash -c 'rustc --version && exec "$@"' _ "${cargo_args[@]}"
   log "cargo build: $((SECONDS - phase_started))s"
+
+  local guest_args=(cargo build --locked "$(cargo_profile_flag)") arg
+  while read -r arg; do
+    read -ra arg <<<"$arg"
+    guest_args+=("${arg[@]}")
+  done < <(guest_build_args)
+  (( ${#guest_args[@]} > 4 )) || die "could not read the guest build from $KIND_DOCKERFILE build stage"
+  phase_started=$SECONDS
+  in_builder "${guest_args[@]}"
+  log "guest cargo build: $((SECONDS - phase_started))s"
 
   # As the production worker stage does: the supervisor is built through the
   # helper that writes its compatibility hash next to it.

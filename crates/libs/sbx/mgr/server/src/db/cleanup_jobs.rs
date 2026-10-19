@@ -250,6 +250,9 @@ pub(crate) fn persist(
         jobs::mark_job_cancelled(conn, &id)?;
     }
     let id = JobId::new();
+    // The persisting caller's context, which an attempt no caller waits for
+    // links to. A job coalesced into an active one keeps that job's context.
+    let traceparent = pplx_space_observability::trace_propagation::current_traceparent();
     jobs::insert_job(
         conn,
         jobs::InsertJob {
@@ -259,7 +262,7 @@ pub(crate) fn persist(
             subject_id: Some(&subject),
             dedup_key: Some(&subject),
             max_attempts: i32::MAX,
-            traceparent: None,
+            traceparent: traceparent.as_deref(),
             priority: work.priority(),
         },
     )?;

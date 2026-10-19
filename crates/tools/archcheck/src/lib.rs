@@ -9,6 +9,7 @@ pub mod baseline;
 pub mod config;
 pub mod context;
 pub mod finding;
+pub mod renames;
 pub mod report;
 pub mod rules;
 
@@ -16,6 +17,7 @@ pub use baseline::{BASELINE_FILE, BaseBaseline, Baseline, WriteBaselineError};
 pub use config::{ArchitectureConfig, CONFIG_FILE, Mode};
 pub use context::{Context, Crate, LoadError, ProductionFile};
 pub use finding::{Finding, Location};
+pub use renames::Renames;
 
 use std::{collections::BTreeMap, path::Path};
 

@@ -19,6 +19,8 @@ import space_smoke as smoke
 # that can reach the parent again would bring the sandbox back up there.
 @smoke.scenario(
     "local.btrfs_send_restore_fails_closed_without_parent_source",
+    # The codec is read from the snapshot's objects through the AWS CLI.
+    required_tools=("aws",),
     sandbox=smoke.SandboxConfig(timeout=1200),
 )
 def btrfs_send_restore_fails_closed_without_parent_source(test: smoke.KindEcw) -> None:
@@ -42,11 +44,10 @@ def btrfs_send_restore_fails_closed_without_parent_source(test: smoke.KindEcw) -
         codec.require_btrfs_send_default(source_worker)
 
     with test.phase("suspend without naming a format"):
-        suspended_at = codec.mark_since()
         test.pause()
 
     with test.phase("the suspend was sealed as btrfs-send-v1"):
-        codec.expect_suspend_codec(since_time=suspended_at)
+        codec.expect_suspend_codec()
 
     with test.phase("wait until the durable snapshot is what a restore would select"):
         restore.wait_until_restore_portable()

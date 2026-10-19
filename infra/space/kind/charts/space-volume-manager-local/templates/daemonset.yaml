@@ -36,8 +36,9 @@ spec:
       # deferred btrfs-send capture depends on it. Credentials come through
       # credential-manager's volume socket, the only listener that admits this
       # identity (docs/installation.md, "Volume-manager identity and
-      # credentials"); Kind's static object-store credentials bypass
-      # the token exchange, but DEK issue and unwrap still use it.
+      # credentials"): object-store credentials through the token exchange
+      # when the release has no static keys (below), and DEK issue and unwrap
+      # in every mode.
       securityContext:
         {{- include "space-node-service.runAs" (dict "ctx" . "user" "SPACE_VOLMGR" "groups" "SPACE_VOLUME_MANAGER_GROUPS") | nindent 8 }}
       initContainers:
@@ -63,10 +64,20 @@ spec:
             # it (crates/libs/credential/mgr/server/src/run/volume_socket.rs).
             - name: SPACE_CREDMGR_ENDPOINT
               value: unix:///space/run/volume-credentials/credmgr.sock
+            {{- if and (eq .Values.storageCredentials "exchange") (eq .Values.node.role "worker") }}
+            # No object-store keys: every transfer exchanges a session scoped
+            # to its one object through credential-manager
+            # (exchange_credentials, crates/libs/vol/mgr/server/src/credentials.rs),
+            # which the authority vends through STS, as deployed.
+            {{- else }}
             # Static object-store credentials instead of credential-manager's
             # token exchange (the local escape hatch,
-            # crates/libs/vol/mgr/server/src/run.rs).
+            # crates/libs/vol/mgr/server/src/run.rs). Builders keep them in
+            # every mode: the authority refuses callers on builder nodes, whose
+            # Kubernetes UID no registration records (README, "Service
+            # identities").
             {{- include "space-node-service.env.objectStoreCredentials" . | nindent 12 }}
+            {{- end }}
             {{- $budget := .Values.streamPushBufferBudgetBytes }}
             {{- if not (kindIs "invalid" $budget) }}
             # Streaming snapshot upload part budget; null keeps the service

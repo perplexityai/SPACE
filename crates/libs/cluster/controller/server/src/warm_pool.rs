@@ -50,7 +50,10 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use tonic::{Code, transport::Endpoint};
+use tracing::Instrument;
 use uuid::Uuid;
+
+use self::pass::{ConfigStage, PassReport};
 
 use crate::pod::{build_pool_pod, pool_pod_name, ready_pod_metadata};
 
@@ -204,44 +207,56 @@ pub(crate) async fn run(
                 return Ok(());
             }
             _ = reconcile_tick.tick() => {
-                let started_at = Instant::now();
-                let result = reconciler.reconcile_once().await;
-                let result_ok = result.is_ok();
-                pplx_space_metrics::warm_pool::reconcile_tick_duration(started_at);
-                pplx_space_metrics::warm_pool::reconcile_tick(result_ok);
-                let total_duration_ms = started_at.elapsed().as_millis();
-
-                match result {
-                    Ok(summary) => {
-                        summary.emit_metrics();
-                        tracing::info!(
-                            total_duration_ms,
-                            enabled_pool_configs = summary.enabled_pool_configs,
-                            template_write_annotations = summary.template_write_annotations,
-                            created_slots = summary.created_slots,
-                            marked_ready_slots = summary.marked_ready_slots,
-                            deleted_slots = summary.deleted_slots(),
-                            deleted_missing_pods = summary.deleted_missing_pods,
-                            deleted_unready_pods = summary.deleted_unready_pods,
-                            deleted_excess_slots = summary.deleted_excess_slots,
-                            deleted_mismatched_slots = summary.deleted_mismatched_slots,
-                            deleted_stale_claimed_slots = summary.deleted_stale_claimed_slots,
-                            deleted_dead_claimed_slots = summary.deleted_dead_claimed_slots,
-                            deleted_orphaned_receipts = summary.deleted_orphaned_receipts,
-                            deleted_cleanup_pending_slots = summary.deleted_cleanup_pending_slots,
-                            deleted_cordoned_slots = summary.deleted_cordoned_slots,
-                            "warm pool reconcile completed"
-                        );
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            total_duration_ms,
-                            error = %err,
-                            "warm pool reconcile failed"
-                        );
-                    }
-                }
+                run_pass(&reconciler).instrument(pass::span()).await;
             }
+        }
+    }
+}
+
+/// One reconcile pass, run under its [`pass::span`] root: every line it logs
+/// and every span it opens belongs to that pass's trace.
+async fn run_pass(reconciler: &Reconciler) {
+    let started_at = Instant::now();
+    let result = reconciler.reconcile_once().await;
+    let report = reconciler.take_pass_report();
+    let result_ok = result.is_ok();
+    pplx_space_metrics::warm_pool::reconcile_tick_duration(started_at);
+    pplx_space_metrics::warm_pool::reconcile_tick(result_ok);
+    pass::record_outcome(&tracing::Span::current(), &report, result_ok);
+    let total_duration_ms = started_at.elapsed().as_millis();
+
+    match result {
+        Ok(summary) => {
+            summary.emit_metrics();
+            pass::pass_summary!(
+                tracing::Level::INFO,
+                &report,
+                total_duration_ms,
+                enabled_pool_configs = summary.enabled_pool_configs,
+                template_write_annotations = summary.template_write_annotations,
+                created_slots = summary.created_slots,
+                marked_ready_slots = summary.marked_ready_slots,
+                deleted_slots = summary.deleted_slots(),
+                deleted_missing_pods = summary.deleted_missing_pods,
+                deleted_unready_pods = summary.deleted_unready_pods,
+                deleted_excess_slots = summary.deleted_excess_slots,
+                deleted_mismatched_slots = summary.deleted_mismatched_slots,
+                deleted_stale_claimed_slots = summary.deleted_stale_claimed_slots,
+                deleted_dead_claimed_slots = summary.deleted_dead_claimed_slots,
+                deleted_orphaned_receipts = summary.deleted_orphaned_receipts,
+                deleted_cleanup_pending_slots = summary.deleted_cleanup_pending_slots,
+                deleted_cordoned_slots = summary.deleted_cordoned_slots,
+                "warm pool reconcile completed"
+            );
+        }
+        Err(err) => {
+            pass::pass_summary!(
+                tracing::Level::WARN,
+                &report,
+                total_duration_ms,
+                error = %err,
+                "warm pool reconcile failed"
+            );
         }
     }
 }
@@ -370,6 +385,8 @@ struct Reconciler {
     /// key — in which case a warm pod renders no node-group constraints and no
     /// query is issued.
     node_group_placement: NodeGroupPlacementResolver,
+    /// The running pass's stage results, which its summary line reports.
+    pass_report: Mutex<PassReport>,
 }
 
 #[derive(Default)]
@@ -868,7 +885,17 @@ impl Reconciler {
             orphan_sweep_cursor: AtomicUsize::new(0),
             receipt_backstops: Mutex::new(ReceiptBackstopState::default()),
             node_group_placement,
+            pass_report: Mutex::new(PassReport::default()),
         }
+    }
+
+    /// The finished pass's report, leaving an empty one for the next pass.
+    fn take_pass_report(&self) -> PassReport {
+        std::mem::take(&mut *self.pass_report.lock().expect("pass report mutex poisoned"))
+    }
+
+    fn pass_report(&self) -> std::sync::MutexGuard<'_, PassReport> {
+        self.pass_report.lock().expect("pass report mutex poisoned")
     }
 
     async fn timed_postgres<T, E, F>(
@@ -967,6 +994,14 @@ impl Reconciler {
             async move { self.reconcile_config(&config, cordoned).await }
         })
         .await;
+        {
+            let mut report = self.pass_report();
+            report.configs = config_results.len();
+            report.failed_configs = config_results
+                .iter()
+                .filter(|result| !result.succeeded())
+                .count();
+        }
         for config_result in config_results {
             self.emit_config_result(&config_result, Instant::now());
             let (config, result) = config_result.into_parts();
@@ -1078,10 +1113,13 @@ impl Reconciler {
         );
     }
 
+    /// Run one per-config stage, timing it into the stage metric and the
+    /// pass summary. Its start and end are logged at DEBUG, and a failure at
+    /// WARN with the config and the error.
     async fn reconcile_config_stage<T, F>(
         &self,
         config: &PoolConfig,
-        stage: &'static str,
+        stage: ConfigStage,
         future: F,
     ) -> Result<T, WarmPoolError>
     where
@@ -1089,11 +1127,12 @@ impl Reconciler {
     {
         let content_hash = config.content_hash.to_string();
         let template = config.template_name.as_str();
-        tracing::info!(
+        let stage_name = stage.as_str();
+        tracing::debug!(
             config_id = %config.id,
             content_hash = %content_hash,
             template = %template,
-            stage,
+            stage = stage_name,
             duration_ms = 0_u128,
             result = "started",
             "warm pool: stage start"
@@ -1101,23 +1140,26 @@ impl Reconciler {
 
         let started_at = Instant::now();
         let result = future.await;
-        let duration_ms = started_at.elapsed().as_millis();
+        let elapsed = started_at.elapsed();
+        let duration_ms = elapsed.as_millis();
         pplx_space_metrics::warm_pool::reconcile_stage_duration(
-            stage,
+            stage_name,
             &content_hash,
             template,
             config.vcpu.get().get(),
             config.memory.as_mib_floor(),
             started_at,
         );
+        self.pass_report()
+            .record_stage(stage, elapsed, result.is_ok());
 
         match result {
             Ok(value) => {
-                tracing::info!(
+                tracing::debug!(
                     config_id = %config.id,
                     content_hash = %content_hash,
                     template = %template,
-                    stage,
+                    stage = stage_name,
                     duration_ms,
                     result = "ok",
                     "warm pool: stage done"
@@ -1127,9 +1169,10 @@ impl Reconciler {
             Err(err) => {
                 tracing::warn!(
                     config_id = %config.id,
+                    template_release_id = %config.template_release_id,
                     content_hash = %content_hash,
                     template = %template,
-                    stage,
+                    stage = stage_name,
                     duration_ms,
                     result = "err",
                     error = %err,
@@ -1280,21 +1323,21 @@ impl Reconciler {
         summary += self
             .reconcile_config_stage_or_continue(
                 config,
-                "delete_mismatched_open_slots",
+                ConfigStage::DeleteMismatchedOpenSlots,
                 self.delete_mismatched_open_slots(config),
             )
             .await;
         summary += self
             .reconcile_config_stage_or_continue(
                 config,
-                "observe_ready_slots",
+                ConfigStage::ObserveReadySlots,
                 self.observe_ready_slots(config),
             )
             .await;
         summary += self
             .reconcile_config_stage_or_continue(
                 config,
-                "observe_warming_slots",
+                ConfigStage::ObserveWarmingSlots,
                 self.observe_warming_slots(config),
             )
             .await;
@@ -1304,14 +1347,14 @@ impl Reconciler {
         summary += self
             .reconcile_config_stage_or_continue(
                 config,
-                "evict_slots_on_cordoned_nodes",
+                ConfigStage::EvictSlotsOnCordonedNodes,
                 self.evict_slots_on_cordoned_nodes(config, cordoned),
             )
             .await;
         summary += self
             .reconcile_config_stage_or_continue(
                 config,
-                "delete_excess_open_slots",
+                ConfigStage::DeleteExcessOpenSlots,
                 self.delete_excess_open_slots(config),
             )
             .await;
@@ -1319,7 +1362,7 @@ impl Reconciler {
         let counts = self
             .reconcile_config_stage(
                 config,
-                "slot_counts",
+                ConfigStage::SlotCounts,
                 self.timed_postgres("slot-counts", self.store.slot_counts(config.id)),
             )
             .await?;
@@ -1365,7 +1408,7 @@ impl Reconciler {
     async fn reconcile_config_stage_or_continue<F>(
         &self,
         config: &PoolConfig,
-        stage: &'static str,
+        stage: ConfigStage,
         future: F,
     ) -> ReconcileSummary
     where
@@ -2794,6 +2837,8 @@ fn warming_slot_timed_out(created_at: OffsetDateTime, timeout: Duration) -> bool
 
     created_at + timeout <= OffsetDateTime::now_utc()
 }
+
+mod pass;
 
 #[cfg(test)]
 mod tests;

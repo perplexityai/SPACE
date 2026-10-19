@@ -1,3 +1,11 @@
+{{- /* The data plane gives streams cancelled at the drain deadline 5 s to close
+(STREAM_CANCEL_GRACE, crates/libs/data/plane/server/src/drain.rs). */ -}}
+{{- if lt (int .Values.shutdownGraceSeconds) 8 -}}
+{{- fail "shutdownGraceSeconds must be at least 8, the stream-open budget (MIN_SHUTDOWN_GRACE)" -}}
+{{- end -}}
+{{- if le (int .Values.terminationGracePeriodSeconds) (add (int .Values.preStopSleepSeconds) (int .Values.shutdownGraceSeconds) 5) -}}
+{{- fail "terminationGracePeriodSeconds must exceed preStopSleepSeconds + shutdownGraceSeconds + 5" -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -51,6 +59,9 @@ spec:
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["/space/bin/space-data-plane-svc"]
+          args:
+            - --shutdown-grace-secs
+            - {{ .Values.shutdownGraceSeconds | quote }}
           env:
             - name: SPACE_CLUSTER_API_TOKEN_PATH
               value: "/var/run/space-publication/cluster-api.token"

@@ -219,9 +219,10 @@ fn json_group(component: FirecrackerComponent) -> &'static str {
 /// Fields Firecracker stores rather than counts per flush.
 fn is_stored(error: FirecrackerError) -> bool {
     match error.component {
-        FirecrackerComponent::Vmm | FirecrackerComponent::Seccomp => true,
-        // SIGPIPE is survivable and counted; the others end the process.
-        FirecrackerComponent::Signal => error.error != "sigpipe",
+        // Every signal still exported ends the process, so it is stored.
+        FirecrackerComponent::Vmm
+        | FirecrackerComponent::Seccomp
+        | FirecrackerComponent::Signal => true,
         FirecrackerComponent::Block
         | FirecrackerComponent::Net
         | FirecrackerComponent::Vsock

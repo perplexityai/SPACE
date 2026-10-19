@@ -70,7 +70,7 @@ priority = 10
 max-threads = 8
 
 [[profile.default.overrides]]
-# NoCoW tests receive a disposable btrfs filesystem from the privileged CI
+# Shared btrfs tests receive a disposable filesystem from the privileged CI
 # wrapper. Other opt-in tests keep their separate activation requirements.
 #
 # Root alone: clone_tree, transfer_directory, the credmgr volume-socket tests
@@ -89,13 +89,14 @@ max-threads = 8
 # Root only for an incidental step, until the test loses it: the net-gateway
 # exemption test's relay sets SO_MARK (CAP_NET_RAW).
 #
-# The 14 opt-in tests assert root, need kernel capabilities, or escalate once
+# Other opt-in tests assert root, need kernel capabilities, or escalate once
 # opted in, and return early in either half while unset: the loop-device test
 # (it adds devices to the running kernel), the node-mgr btrfs fixtures, the
 # containment benchmark, and build-mgr's real containerd and OCI assembly
 # tests.
 filter = '''
 (package(pplx-space-common-io) and test(=reflink::tests::nocow_preparation_clones_shared_extents_and_rejects_aliases))
+or (package(pplx-space-node-mgr) and test(=btrfs::tests::signal_during_backpressured_send_does_not_replay_the_ioctl))
 or (package(pplx-space-node-runtime-core) and test(=tests::restored_nocow_file_remains_reflink_compatible))
 or (package(pplx-space-volmgr) and test(=staging::tests::nocow_upload_and_shadow_staging_keep_reflinks))
 or (package(pplx-space-template-mgr) and test(=service::tests::template_refresh_preserves_nocow_and_timestamps))
@@ -105,6 +106,7 @@ or (package(pplx-space-node-mgr) and test(=service::node_disk_metrics::rootfs_ba
 or (package(pplx-space-node-mgr) and test(=clone_tree::tests::private_clone_blocks_foreign_uid_grafts_and_shared_clone_is_held))
 or (package(pplx-space-node-mgr) and test(=loop_devices::tests::ensure_capacity_creates_attachable_devices_past_max_loop))
 or (package(pplx-space-node-mgr) and test(=service::gateway_isolation::tests::isolated_gateway_cannot_access_vm_resources))
+or (package(pplx-space-node-mgr) and test(=service::launch_prepare::tests::retained_instance_repair_grants_traversal_without_write_and_preserves_files))
 or (package(pplx-space-node-mgr) and test(=service::encrypted_volumes::tests::ciphertext_publication_is_readable_without_exposing_private_backings))
 or (package(pplx-space-node-mgr) and test(=service::permission_tree::tests::owned_walk_prunes_snapshots_and_never_mutates_link_targets))
 or (package(pplx-space-node-mgr) and test(=device_backing::tests::pinned_devices_survive_replacement_and_encrypted_reopen))

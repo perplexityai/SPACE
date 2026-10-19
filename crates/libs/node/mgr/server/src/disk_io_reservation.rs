@@ -525,8 +525,8 @@ fn emit_metrics(reservation: &ParentDiskIoReservation) {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
+    use crate::host_command::Command;
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
-    use std::process::Command;
 
     pub(super) fn resolve_leaf_devices(target_path: &Path) -> Result<Vec<BlockDevice>, String> {
         let source_devices = resolve_filesystem_devices(target_path)?;
