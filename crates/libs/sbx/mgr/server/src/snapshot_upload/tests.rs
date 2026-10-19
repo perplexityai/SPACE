@@ -47,6 +47,7 @@ fn fixture_meta(rootfs_diff_format: Option<&str>) -> SnapshotMeta {
         execution: None,
         sandbox_id: "019e31d9-79a6-7132-b90f-007f1c62ddea".to_string(),
         size_bytes: 0,
+        rootfs_size_bytes: None,
         created_at: "2026-05-25T00:00:00Z".to_string(),
         source: SnapshotSource {
             runtime: "fc".to_string(),
@@ -175,6 +176,10 @@ fn deferred_send_prepares_from_the_inspected_size_and_keeps_metadata_outside_the
         .unwrap();
     assert!(prepared.deferred_metadata);
     assert_eq!(
+        prepared.meta.rootfs_size_bytes, None,
+        "an image length is not a send-stream length"
+    );
+    assert_eq!(
         prepared.meta.rootfs_send_source_id,
         Some(artifact.source_id)
     );
@@ -239,6 +244,7 @@ fn retained_artifact_with_a_stream_uploads_the_file_and_strips_its_identity_remo
     let vm = (b"memory".len() + b"state".len()) as u64;
     let staged = DeferredArtifact::staged_metadata(&prepared);
     assert_eq!(staged["size_bytes"], 333 + vm);
+    assert_eq!(staged["rootfs_size_bytes"], 333);
     assert!(staged.get("rootfs_send_source_id").is_none(), "{staged}");
     // The artifact's own sidecar counts the stream while it exists and keeps
     // the identity; reclaim switches it to the image when the stream goes.
@@ -396,6 +402,15 @@ fn write_snapshot_metadata_sizes_from_local_artifacts_at_submit_time() {
     assert_eq!(out.size_bytes, 60, "size is the sum of local VM artifacts");
 
     let written = std::fs::read_to_string(dir.join(SNAPSHOT_METADATA_FILENAME)).unwrap();
+    let wire: serde_json::Value = serde_json::from_str(&written).unwrap();
+    assert_eq!(
+        wire["rootfs_size_bytes"], 30,
+        "disk size excludes memory and VM state"
+    );
+    insta::assert_snapshot!(
+        "snapshot_metadata_with_disk_size",
+        serde_json::to_string_pretty(&wire).unwrap()
+    );
     let parsed: SnapshotMeta = serde_json::from_str(&written).unwrap();
     assert_eq!(parsed.size_bytes, 60);
     assert_eq!(parsed.sandbox_id, meta.sandbox_id);
@@ -509,6 +524,7 @@ fn legacy_payload_deserializes_without_metadata_job_flag() {
         ]
     }"#;
     let jobs: SnapshotUploadJobs = serde_json::from_str(legacy).unwrap();
+    assert_eq!(jobs.meta.rootfs_size_bytes, None);
     assert!(
         !jobs.includes_metadata_job,
         "legacy payloads default to no metadata job",

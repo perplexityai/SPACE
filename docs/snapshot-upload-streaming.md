@@ -230,6 +230,12 @@ byte-identical. The remote zstd/btrfs-send format and restore decoder do not cha
 This removes one uncompressed send-file write and its compression read. It does
 not eliminate reads of the source rootfs or reduce S3 bytes.
 
+Snapshot metadata records the logical rootfs payload length separately as
+`rootfs_size_bytes`; `size_bytes` still counts all VM artifacts. The optional
+field is absent on older artifacts and while only a retained image length is
+known. Reclaiming a local stream clears it rather than relabeling image bytes
+as send-stream bytes.
+
 The logical send length is unknown until encoding finishes. Sandbox-manager
 therefore submits remote metadata after all VM artifacts complete, writes it
 outside the reclaimable artifact directory, and persists the metadata job ID

@@ -69,6 +69,7 @@ pub(super) fn suspend_snapshot_metadata(
         execution: Some(snapshot_execution),
         sandbox_id: sandbox.id.clone(),
         size_bytes: 0,
+        rootfs_size_bytes: None,
         created_at: jiff::Timestamp::now().to_string(),
         source: crate::snapshot_upload::SnapshotSource {
             runtime: execution.runtime().kind.alias().to_string(),

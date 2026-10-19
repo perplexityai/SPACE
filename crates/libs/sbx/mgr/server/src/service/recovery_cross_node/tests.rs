@@ -416,6 +416,7 @@ fn disk_artifact_meta() -> (
             execution: Some(execution),
             sandbox_id: "019f8000-0000-7000-8000-000000000002".to_string(),
             size_bytes: 0,
+            rootfs_size_bytes: None,
             created_at: "2026-07-31T00:00:00Z".to_string(),
             source: crate::snapshot_upload::SnapshotSource {
                 runtime: pplx_space_common_core::types::RUNTIME_FIRECRACKER_ALIAS.to_string(),

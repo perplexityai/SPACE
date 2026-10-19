@@ -256,9 +256,23 @@ impl JobExecutor for SnapshotUploadExecutor {
                 .iter()
                 .map(|observation| observation.bytes)
                 .sum();
+            let rootfs_size_bytes = artifacts
+                .iter()
+                .zip(&artifact_results)
+                .find_map(|(artifact, observation)| {
+                    matches!(
+                        artifact.kind,
+                        pplx_space_common_core::types::SnapshotArtifact::RootfsBtrfsSend
+                    )
+                    .then_some(observation.bytes)
+                })
+                .ok_or_else(|| {
+                    JobError::permanent("streamed snapshot is missing its rootfs transfer")
+                })?;
             let metadata_job = crate::snapshot_upload::submit_streamed_metadata(
                 &payload,
                 logical_bytes,
+                rootfs_size_bytes,
                 &self.volume_manager_socket,
             )
             .await
@@ -1724,10 +1738,11 @@ pub(crate) fn rewrite_sidecar_for_reclaim(
             std::io::Error::new(std::io::ErrorKind::InvalidData, "artifact size overflow")
         })?;
     }
-    if meta.size_bytes == size_bytes {
+    if meta.size_bytes == size_bytes && meta.rootfs_size_bytes.is_none() {
         return Ok(());
     }
     meta.size_bytes = size_bytes;
+    meta.rootfs_size_bytes = None;
     let bytes = serde_json::to_vec_pretty(&meta)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     crate::snapshot_upload::replace_file_durably(

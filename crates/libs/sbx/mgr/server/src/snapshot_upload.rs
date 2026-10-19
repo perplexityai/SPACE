@@ -137,6 +137,11 @@ pub struct SnapshotMeta {
     /// ships to S3; this records the on-disk snapshot size, which is what
     /// restore and operators reason about.
     pub size_bytes: u64,
+    /// Logical length of the published rootfs payload, excluding memory and
+    /// VM state. A retained image is not the length of its future send stream;
+    /// streamed uploads fill this only after that stream completes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rootfs_size_bytes: Option<u64>,
     pub created_at: String,
     /// Capture-time description of the VM image stack. Restore must match
     /// these to guarantee a consistent guest environment.
@@ -720,35 +725,43 @@ pub(crate) fn write_snapshot_metadata_to(
             .map_err(|source| SnapshotMetadataWriteError::StatArtifact { path, source })
     };
     let mut size_bytes: u64 = 0;
+    let mut rootfs_size_bytes = None;
     for artifact in vm_artifacts {
         let path = artifact_dir.join(artifact.local_name);
-        let len = if artifact.kind == SnapshotArtifact::RootfsBtrfsSend {
+        let (len, is_rootfs_payload) = if artifact.kind == SnapshotArtifact::RootfsBtrfsSend {
             match crate::retained_source::RootfsArtifact::resolve(
                 &meta.sandbox_id,
                 artifact_dir,
                 rootfs_send_source_id,
             )? {
-                Some(crate::retained_source::RootfsArtifact::SendFile { path }) => stat(path)?,
+                Some(crate::retained_source::RootfsArtifact::SendFile { path }) => {
+                    (stat(path)?, true)
+                }
                 // A deferred upload has no stream yet; its remote metadata is
                 // rewritten from the transfer total once the stream is known.
-                Some(crate::retained_source::RootfsArtifact::RetainedSource(source)) => {
+                Some(crate::retained_source::RootfsArtifact::RetainedSource(source)) => (
                     retained_rootfs_bytes.ok_or(
                         SnapshotMetadataWriteError::UnsizedRetainedSource {
                             artifact_dir: source.artifact_dir,
                             source_id: source.source_id,
                         },
-                    )?
-                }
-                None => stat(path)?,
+                    )?,
+                    false,
+                ),
+                None => (stat(path)?, true),
             }
         } else {
-            stat(path)?
+            (stat(path)?, artifact.kind == SnapshotArtifact::Rootfs)
         };
+        if is_rootfs_payload {
+            rootfs_size_bytes = Some(len);
+        }
         size_bytes = size_bytes.saturating_add(len);
     }
 
     let meta_final = SnapshotMeta {
         size_bytes,
+        rootfs_size_bytes,
         rootfs_send_source_id,
         ..meta.clone()
     };
@@ -1194,6 +1207,7 @@ mod tests;
 pub(crate) async fn submit_streamed_metadata(
     payload: &SnapshotUploadJobs,
     logical_bytes: u64,
+    rootfs_size_bytes: u64,
     volume_manager_socket: &Path,
 ) -> Result<JobId, String> {
     let directory = payload
@@ -1206,6 +1220,7 @@ pub(crate) async fn submit_streamed_metadata(
     let path = directory.join(SNAPSHOT_METADATA_FILENAME);
     let remote = SnapshotMeta {
         size_bytes: logical_bytes,
+        rootfs_size_bytes: Some(rootfs_size_bytes),
         rootfs_send_source_id: None,
         ..payload.meta.clone()
     };

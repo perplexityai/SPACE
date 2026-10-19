@@ -42,6 +42,7 @@ fn suspended_metadata(sandbox_id: SandboxId) -> crate::snapshot_upload::Snapshot
         execution: None,
         sandbox_id: sandbox_id.to_string(),
         size_bytes: 900,
+        rootfs_size_bytes: None,
         created_at: "2026-08-04T00:00:00Z".to_string(),
         source: crate::snapshot_upload::SnapshotSource {
             runtime: "fc".to_string(),

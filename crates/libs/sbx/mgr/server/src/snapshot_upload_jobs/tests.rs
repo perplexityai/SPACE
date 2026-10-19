@@ -652,6 +652,7 @@ fn reclaim_fixture_meta(
         execution: None,
         sandbox_id: "sbx-reclaim".to_string(),
         size_bytes: 0,
+        rootfs_size_bytes: None,
         created_at: "2026-06-11T00:00:00Z".to_string(),
         source: crate::snapshot_upload::SnapshotSource {
             runtime: "fc".to_string(),
@@ -1069,6 +1070,7 @@ fn bookkeeping_switches_a_retained_sidecar_to_the_image_before_reclaiming() {
         crate::snapshot_upload::write_snapshot_metadata(&payload.meta, &snapshot_dir, &vm, None)
             .unwrap();
     assert!(local.size_bytes >= stream_len);
+    assert_eq!(local.rootfs_size_bytes, Some(stream_len));
 
     let sidecar = || -> SnapshotMeta {
         serde_json::from_slice(
@@ -1091,6 +1093,10 @@ fn bookkeeping_switches_a_retained_sidecar_to_the_image_before_reclaiming() {
     stamp_backup_completed_and_reclaim_stream(&conn, &payload, "backup-1", Some(5000)).unwrap();
     assert!(!snapshot_dir.join(ROOTFS_BTRFS_SEND_FILENAME).exists());
     let rewritten = sidecar();
+    assert_eq!(
+        rewritten.rootfs_size_bytes, None,
+        "the retained image is not a published send payload"
+    );
     assert_eq!(
         rewritten.size_bytes, image_counting,
         "repeating the rewrite must not count the image twice"

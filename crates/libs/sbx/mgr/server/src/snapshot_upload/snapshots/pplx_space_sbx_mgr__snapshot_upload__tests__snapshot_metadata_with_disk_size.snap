@@ -1,0 +1,16 @@
+---
+source: crates/libs/sbx/mgr/server/src/snapshot_upload/tests.rs
+assertion_line: 410
+expression: "serde_json::to_string_pretty(&wire).unwrap()"
+---
+{
+  "version": 1,
+  "sandbox_id": "019e31d9-79a6-7132-b90f-007f1c62ddea",
+  "size_bytes": 60,
+  "rootfs_size_bytes": 30,
+  "created_at": "2026-05-25T00:00:00Z",
+  "source": {
+    "runtime": "fc",
+    "template_id": "seed"
+  }
+}
