@@ -3,6 +3,7 @@ pub(crate) mod authz;
 mod debug;
 pub mod e2b;
 mod ecw_credential_epoch;
+mod lifecycle_registration;
 mod metrics;
 pub(crate) mod public;
 mod public_docs;
@@ -203,10 +204,19 @@ fn service_router() -> Router<AppState> {
 }
 
 fn internal_router() -> Router<AppState> {
-    Router::new().route(
-        "/internal/v1/sandboxes/{sandbox_id}/ecw-credential-epoch",
-        axum::routing::post(ecw_credential_epoch::advance_sandbox_ecw_credential_epoch),
-    )
+    Router::new()
+        .route(
+            "/internal/v1/lifecycle/candidates",
+            axum::routing::get(lifecycle_registration::candidates),
+        )
+        .route(
+            "/internal/v1/sandboxes/{sandbox_id}/lifecycle-registration",
+            axum::routing::put(lifecycle_registration::register),
+        )
+        .route(
+            "/internal/v1/sandboxes/{sandbox_id}/ecw-credential-epoch",
+            axum::routing::post(ecw_credential_epoch::advance_sandbox_ecw_credential_epoch),
+        )
 }
 
 pub(crate) const PUBLIC_API_SHARED_ROOT: &str = "/api/v1";
