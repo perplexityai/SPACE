@@ -373,6 +373,9 @@ edge_table! {
     /// `complete_row_intent_cleanup_for_job(MarkSuspended)` without a suspend
     /// artifact.
     SUSPEND_QUARANTINE: Recovery, of(&[Suspending]) => Quarantined;
+    /// `mark_restoring_snapshot_stream_corrupt`: a cross-node restore whose
+    /// stored rootfs stream cannot be received.
+    RESTORE_SNAPSHOT_STREAM_QUARANTINE: Recovery, of(&[Restoring]) => Quarantined;
     /// `settle_startup_resident(Quarantined)`: a `started` row with no live
     /// VM, and resident rows whose VM contradicts or cannot prove the state.
     STARTUP_RESIDENT_QUARANTINE: Recovery,

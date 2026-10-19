@@ -1800,29 +1800,48 @@ impl SandboxManagerService {
             // above is emitted either way: the pull did fail, and dropping that
             // evidence because ownership moved would hide a real failure.
             let claim = recovery.map(|context| context.claim);
+            // A corrupt stored stream fails every retry on every node, so the
+            // row is quarantined instead of retained for one. Under a recovery
+            // claim the episode is already quarantined; its owner records the
+            // failure like any other.
+            let corrupt =
+                claim.is_none() && matches!(e, RestoreError::SnapshotStreamCorrupt { .. });
             let marked = {
                 let db = self.db_conn().map_err(|_| {
                     crate::snapshot_restore::RestoreError::SandboxDatabaseMutexPoisoned
                 })?;
-                match claim {
-                    Some(claimed) => {
-                        crate::db::mark_cross_node_restore_staging_failed_under_recovery_claim(
-                            &db,
-                            &failure_reason,
-                            claimed,
-                        )
-                    }
-                    None => crate::db::mark_cross_node_restore_staging_failed(
+                if corrupt {
+                    crate::db::mark_restoring_snapshot_stream_corrupt(
                         &db,
                         &canonical_id,
                         &failure_reason,
-                    ),
+                    )
+                    .map_err(|error| {
+                        RestoreError::Other(format!(
+                            "quarantine sandbox with a corrupt snapshot stream: {error}"
+                        ))
+                    })?
+                } else {
+                    match claim {
+                        Some(claimed) => {
+                            crate::db::mark_cross_node_restore_staging_failed_under_recovery_claim(
+                                &db,
+                                &failure_reason,
+                                claimed,
+                            )
+                        }
+                        None => crate::db::mark_cross_node_restore_staging_failed(
+                            &db,
+                            &canonical_id,
+                            &failure_reason,
+                        ),
+                    }
+                    .map_err(|error| {
+                        RestoreError::Other(format!(
+                            "persist cross-node restore staging failure: {error}"
+                        ))
+                    })?
                 }
-                .map_err(|error| {
-                    RestoreError::Other(format!(
-                        "persist cross-node restore staging failure: {error}"
-                    ))
-                })?
             };
             if !marked {
                 // Reports which of the two the miss was. Diagnosis only — the fence
@@ -1832,11 +1851,19 @@ impl SandboxManagerService {
                     "cross-node restore row left Restoring before staging failure could be persisted: {canonical_id}"
                 )));
             }
-            tracing::info!(
-                sandbox_id = %canonical_id,
-                error = %e,
-                "cross-node restore staging failed; retaining restoring row for retry"
-            );
+            if corrupt {
+                tracing::warn!(
+                    sandbox_id = %canonical_id,
+                    error = %e,
+                    "cross-node restore found a corrupt snapshot stream; quarantined for repair"
+                );
+            } else {
+                tracing::info!(
+                    sandbox_id = %canonical_id,
+                    error = %e,
+                    "cross-node restore staging failed; retaining restoring row for retry"
+                );
+            }
         }
         phase2_result?;
 

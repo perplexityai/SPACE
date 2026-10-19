@@ -99,7 +99,7 @@ const ALLOWLIST: &[(SandboxState, SandboxState, Disagreement, &str)] = &[
     (Restoring,       Paused,          AllowedNotRequested, COMPLETION_ONLY),
     (Restoring,       Suspended,       WriteForbidden,      "restore rollback, cross-node publication, restore recovery"),
     (Restoring,       CleanupRequired, WriteForbidden,      "an interrupted or ambiguous restore is handed to cleanup"),
-    (Restoring,       Quarantined,     AllowedUnwritten,    NO_QUARANTINE_WRITER),
+    (Restoring,       Quarantined,     AllowedNotRequested, RECOVERY_QUARANTINE),
     (CleanupRequired, Created,         WriteForbidden,      CLEANUP_SETTLES_INTENT),
     (CleanupRequired, Stopping,        RequestForbidden,    STOP_RUNTIME_OWNER),
     (CleanupRequired, Stopped,         WriteForbidden,      CLEANUP_SETTLES_INTENT),

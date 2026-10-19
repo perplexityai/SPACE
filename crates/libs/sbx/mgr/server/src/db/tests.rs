@@ -681,6 +681,7 @@ fn quarantine_recovery_candidates_follow_the_complete_reason_policy() {
         SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
         SandboxQuarantineReasonCode::RestoreNetGatewayLaunchFailed,
         SandboxQuarantineReasonCode::RestoreSnapshotLoadFailed,
+        SandboxQuarantineReasonCode::RestoreSnapshotStreamCorrupt,
         SandboxQuarantineReasonCode::RestoreSpacedHostLaunchFailed,
         SandboxQuarantineReasonCode::RestoreResumeFailed,
         SandboxQuarantineReasonCode::PauseFailed,
@@ -10105,3 +10106,48 @@ mod update_state_from;
 mod update_state_matrix;
 
 mod execution_binding;
+
+#[test]
+fn a_corrupt_snapshot_stream_quarantines_only_a_restoring_row() {
+    let conn = test_conn();
+    insert_test_sandbox(
+        &conn,
+        TestSandboxInsert::new("restore", "restore1", SandboxState::Restoring),
+    );
+    insert_test_sandbox(
+        &conn,
+        TestSandboxInsert::new("suspended", "suspend1", SandboxState::Suspended),
+    );
+
+    assert!(!mark_restoring_snapshot_stream_corrupt(&conn, "suspended", "corrupt stream").unwrap());
+    assert_eq!(
+        get_sandbox(&conn, "suspended").unwrap().unwrap().state,
+        SandboxState::Suspended
+    );
+
+    assert!(mark_restoring_snapshot_stream_corrupt(&conn, "restore", "corrupt stream").unwrap());
+    let row = get_sandbox(&conn, "restore").unwrap().unwrap();
+    assert_eq!(row.state, SandboxState::Quarantined);
+    assert_eq!(row.failure_reason.as_deref(), Some("corrupt stream"));
+    let (reason_code, next_action): (String, String) = conn
+        .query_row(
+            "SELECT reason_code, next_action
+               FROM sandbox_quarantine_state
+              WHERE sandbox_id = 'restore'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(reason_code, "restore_snapshot_stream_corrupt");
+    assert_eq!(
+        next_action,
+        SandboxQuarantineNextAction::RequiresOperatorAttention.as_str()
+    );
+    // Quarantined, the row is never handed back to automatic recovery.
+    assert!(
+        scan_quarantine_recovery_candidates(&conn)
+            .unwrap()
+            .candidates
+            .is_empty()
+    );
+}

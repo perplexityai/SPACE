@@ -3,6 +3,31 @@ use std::io::Write;
 use std::os::unix::fs::{MetadataExt, symlink};
 use std::path::PathBuf;
 
+const STREAM: &[u8] = include_bytes!("../../../fixtures/btrfs_send_v1.stream");
+
+#[test]
+fn only_a_checksum_rejection_of_a_corrupt_stored_stream_is_data_loss() {
+    const CRC: &str = "ERROR: crc32 mismatch in command\n";
+    let stored = |bytes: &[u8]| {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(bytes).unwrap();
+        file
+    };
+    let restarted = [&STREAM[..STREAM.len() / 2], STREAM].concat();
+    assert!(stored_stream_corruption(stored(&restarted), CRC).is_some());
+    // The checker decides: a stream that frames correctly, or one that only
+    // stops early, keeps the receiver's own failure.
+    assert!(stored_stream_corruption(stored(STREAM), CRC).is_none());
+    assert!(stored_stream_corruption(stored(&STREAM[..STREAM.len() - 1]), CRC).is_none());
+    // Any other rejection never rereads the stream.
+    let other = "ERROR: snapshot: cannot find parent subvolume\n";
+    assert!(stored_stream_corruption(stored(&restarted), other).is_none());
+    // A pipe cannot be reread.
+    let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).unwrap();
+    drop(write);
+    assert!(stored_stream_corruption(File::from(read), CRC).is_none());
+}
+
 #[test]
 #[ignore = "requires root and an explicitly supplied disposable btrfs fixture directory"]
 fn receive_keeps_destination_identity_through_scrub_and_publication() {
@@ -68,6 +93,17 @@ fn receive_keeps_destination_identity_through_scrub_and_publication() {
                 .unwrap_err();
             assert!(!destination.join("instance").exists());
             remove_at(&receive.directory, "instance.ro".as_ref()).unwrap();
+            if replacement == "unchanged" {
+                // A restarted send stored whole is rejected for its content.
+                let restarted = [&bytes[..bytes.len() / 2], &bytes[..]].concat();
+                std::fs::write(case.join("restarted"), restarted).unwrap();
+                let rejected = receive
+                    .receive(File::open(case.join("restarted")).unwrap(), None)
+                    .unwrap_err();
+                assert_eq!(rejected.code(), tonic::Code::DataLoss, "{rejected:?}");
+                assert!(!destination.join("instance").exists());
+                remove_at(&receive.directory, "instance.ro".as_ref()).unwrap();
+            }
             let mut original = destination.clone();
             let result = if replacement.starts_with("during-") || replacement == "cancel" {
                 // Stop the real receiver after its first SNAPSHOT command,

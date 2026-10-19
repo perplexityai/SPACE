@@ -648,6 +648,9 @@ where
             Err(error @ RestoreError::RootfsPolicy(..)) => {
                 return Err(Status::failed_precondition(error.to_string()));
             }
+            Err(error @ RestoreError::SnapshotStreamCorrupt { .. }) => {
+                return Err(Status::data_loss(error.to_string()));
+            }
             Err(reason) => {
                 return Err(Status::unavailable(format!(
                     "suspend snapshot stage-in failed: {reason}"
@@ -1027,6 +1030,20 @@ impl SandboxManagerService {
                 );
                 Err(Status::failed_precondition(error.to_string()))
             }
+            Err(error @ crate::snapshot_restore::RestoreError::SnapshotStreamCorrupt { .. }) => {
+                let observed_encrypted =
+                    super::recovery_cross_node::encrypted_from_staged_sidecar(sandbox_id);
+                cross_node_start.emit(observed_encrypted);
+                pplx_space_metrics::snapshot::restore_failed(
+                    "cross_node",
+                    cross_node_codec_at_start,
+                    observed_encrypted,
+                    "stage",
+                    "snapshot_stream_corrupt",
+                    cross_node_started_at,
+                );
+                Err(Status::data_loss(error.to_string()))
+            }
             Err(error) => {
                 tracing::warn!(
                     sandbox_id,
@@ -1115,6 +1132,9 @@ impl SandboxManagerService {
                         error @ crate::snapshot_restore::RestoreError::CanonicalRootConflict {
                             ..
                         } => Status::failed_precondition(error.to_string()),
+                        error @ crate::snapshot_restore::RestoreError::SnapshotStreamCorrupt {
+                            ..
+                        } => Status::data_loss(error.to_string()),
                         other => Status::unavailable(format!(
                             "resume interrupted cross-node restore staging failed: {other}"
                         )),

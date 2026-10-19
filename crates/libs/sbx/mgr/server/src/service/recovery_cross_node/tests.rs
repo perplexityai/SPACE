@@ -1976,6 +1976,7 @@ fn _all_reasons_listed(reason: pplx_space_common_core::types::SandboxQuarantineR
         | Reason::RestoreFirecrackerLaunchFailed
         | Reason::RestoreNetGatewayLaunchFailed
         | Reason::RestoreSnapshotLoadFailed
+        | Reason::RestoreSnapshotStreamCorrupt
         | Reason::RestoreSpacedHostLaunchFailed
         | Reason::RestoreResumeFailed
         | Reason::PauseFailed
@@ -2019,6 +2020,7 @@ async fn orphan_restore_declines_a_plan_for_a_different_quarantine_reason() {
         Reason::RestoreFirecrackerLaunchFailed,
         Reason::RestoreNetGatewayLaunchFailed,
         Reason::RestoreSnapshotLoadFailed,
+        Reason::RestoreSnapshotStreamCorrupt,
         Reason::RestoreSpacedHostLaunchFailed,
         Reason::RestoreResumeFailed,
         Reason::PauseFailed,

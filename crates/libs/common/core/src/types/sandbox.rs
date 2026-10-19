@@ -2407,6 +2407,9 @@ pub enum SandboxQuarantineReasonCode {
     RestoreFirecrackerLaunchFailed,
     RestoreNetGatewayLaunchFailed,
     RestoreSnapshotLoadFailed,
+    /// The stored rootfs send stream of the snapshot being restored is corrupt:
+    /// no node or retry can receive it, so the snapshot needs repair.
+    RestoreSnapshotStreamCorrupt,
     RestoreSpacedHostLaunchFailed,
     RestoreResumeFailed,
     PauseFailed,
@@ -2502,6 +2505,7 @@ impl SandboxQuarantineReasonCode {
             Self::RestoreFirecrackerLaunchFailed => "restore_firecracker_launch_failed",
             Self::RestoreNetGatewayLaunchFailed => "restore_net_gateway_launch_failed",
             Self::RestoreSnapshotLoadFailed => "restore_snapshot_load_failed",
+            Self::RestoreSnapshotStreamCorrupt => "restore_snapshot_stream_corrupt",
             Self::RestoreSpacedHostLaunchFailed => "restore_spaced_host_launch_failed",
             Self::RestoreResumeFailed => "restore_resume_failed",
             Self::PauseFailed => "pause_failed",
@@ -2544,6 +2548,7 @@ impl SandboxQuarantineReasonCode {
             | Self::RestoreEncryptedDevicesPrepareFailed
             | Self::RestoreNetGatewayLaunchFailed
             | Self::RestoreSnapshotLoadFailed
+            | Self::RestoreSnapshotStreamCorrupt
             | Self::RestoreResumeFailed
             | Self::PauseFailed
             | Self::CheckpointResumeFailed
@@ -2591,6 +2596,7 @@ impl FromStr for SandboxQuarantineReasonCode {
             "restore_firecracker_launch_failed" => Ok(Self::RestoreFirecrackerLaunchFailed),
             "restore_net_gateway_launch_failed" => Ok(Self::RestoreNetGatewayLaunchFailed),
             "restore_snapshot_load_failed" => Ok(Self::RestoreSnapshotLoadFailed),
+            "restore_snapshot_stream_corrupt" => Ok(Self::RestoreSnapshotStreamCorrupt),
             "restore_spaced_host_launch_failed" => Ok(Self::RestoreSpacedHostLaunchFailed),
             "restore_resume_failed" => Ok(Self::RestoreResumeFailed),
             "pause_failed" => Ok(Self::PauseFailed),

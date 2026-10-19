@@ -937,6 +937,26 @@ pub fn mark_suspending_quarantined(
     )
 }
 
+/// Quarantine a `restoring` row whose snapshot cannot be received because its
+/// stored rootfs send stream is corrupt. Leaving it `restoring` would let every
+/// wake download and reject the same stream again; quarantine stops that, and
+/// the snapshot needs repair before the sandbox can run.
+pub fn mark_restoring_snapshot_stream_corrupt(
+    conn: &Connection,
+    id: &str,
+    reason: &str,
+) -> std::result::Result<bool, MarkQuarantinedError> {
+    mark_quarantined_from_state(
+        conn,
+        id,
+        SandboxState::Restoring,
+        SandboxQuarantineSource::SbxManager,
+        SandboxQuarantineReasonCode::RestoreSnapshotStreamCorrupt,
+        reason,
+        SandboxQuarantineNextAction::RequiresOperatorAttention,
+    )
+}
+
 #[cfg(test)]
 pub fn mark_starting_quarantined(
     conn: &Connection,

@@ -132,7 +132,8 @@ fn quarantine_recovery_no_progress_reason(
         | crate::snapshot_restore::RestoreError::RenamePath { .. } => {
             crate::db::QuarantineRecoveryNoProgressReason::NodeFilesystemFailure
         }
-        // The restore's own evidence disagreed with itself.
+        // The restore's own evidence disagreed with itself, or the stored
+        // artifact cannot be restored.
         crate::snapshot_restore::RestoreError::SnapshotIdentityMismatch { .. }
         | crate::snapshot_restore::RestoreError::InvalidSandboxId { .. }
         | crate::snapshot_restore::RestoreError::InvalidRestoreSource { .. }
@@ -140,6 +141,7 @@ fn quarantine_recovery_no_progress_reason(
         | crate::snapshot_restore::RestoreError::ArtifactSourceUriMismatch { .. }
         | crate::snapshot_restore::RestoreError::InvalidRecoveredSandboxRow { .. }
         | crate::snapshot_restore::RestoreError::RootfsPolicy(..)
+        | crate::snapshot_restore::RestoreError::SnapshotStreamCorrupt { .. }
         | crate::snapshot_restore::RestoreError::MissingSandboxOwnershipMetadata => {
             crate::db::QuarantineRecoveryNoProgressReason::RestoreEvidenceMismatch
         }

@@ -78,3 +78,22 @@ fn a_corrupted_byte_fails_its_command() {
 fn a_stream_without_the_header_fails() {
     assert_eq!(check(&[&STREAM[1..]]), Err(FramingError::BadMagic));
 }
+
+#[test]
+fn a_stored_stream_is_checked_whole_and_only_a_short_one_is_inconclusive() {
+    let restarted = [&STREAM[..STREAM.len() / 2], STREAM].concat();
+    assert_eq!(check_stream(STREAM).unwrap(), Ok(()));
+    let fault = check_stream(restarted.as_slice()).unwrap().unwrap_err();
+    assert!(matches!(fault, FramingError::Crc { .. }) && fault.is_corrupt());
+    let fault = check_stream(&STREAM[..STREAM.len() - 1])
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(fault, FramingError::Truncated { .. }) && !fault.is_corrupt());
+    let doubled = [STREAM, STREAM].concat();
+    assert!(
+        check_stream(doubled.as_slice())
+            .unwrap()
+            .unwrap_err()
+            .is_corrupt()
+    );
+}

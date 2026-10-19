@@ -41,6 +41,7 @@ fn quarantine_reason_codes_round_trip_through_the_wire_vocabulary() {
         SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
         SandboxQuarantineReasonCode::RestoreNetGatewayLaunchFailed,
         SandboxQuarantineReasonCode::RestoreSnapshotLoadFailed,
+        SandboxQuarantineReasonCode::RestoreSnapshotStreamCorrupt,
         SandboxQuarantineReasonCode::RestoreSpacedHostLaunchFailed,
         SandboxQuarantineReasonCode::RestoreResumeFailed,
         SandboxQuarantineReasonCode::PauseFailed,
@@ -62,6 +63,7 @@ fn direct_failure_quarantine_reasons_have_no_automatic_recovery() {
         SandboxQuarantineReasonCode::CheckpointResumeFailed,
         SandboxQuarantineReasonCode::ResidentResumeFailed,
         SandboxQuarantineReasonCode::SnapshotRollbackCleanupFailed,
+        SandboxQuarantineReasonCode::RestoreSnapshotStreamCorrupt,
     ] {
         assert_eq!(reason.automatic_recovery_policy(), None);
     }

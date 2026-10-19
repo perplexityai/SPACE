@@ -194,6 +194,16 @@ success, and `btrfs receive` later rejects the result with "crc32 mismatch in
 command". The check fails such an attempt with `Aborted`, so the upload aborts
 and the job retries with a fresh send.
 
+Streams stored before this check can still hold such a restarted send, and no
+retry can receive them. When `btrfs receive` reports a checksum failure on a
+downloaded stream, node-manager rereads the stream with the same check. If the
+check finds the stored bytes corrupt, the receive fails with `DataLoss` instead
+of `Internal`; a stream that only ends early keeps `Internal`, since a short
+read is not proof of corrupt storage. Sandbox-manager answers that restore with
+`DataLoss` and quarantines the restoring sandbox with reason
+`restore_snapshot_stream_corrupt`. The reason requires operator attention, so
+no wake downloads the snapshot again until it is repaired.
+
 On Linux, the node-manager binary blocks SIGINT/SIGTERM before constructing its
 runtime or telemetry. One dedicated thread consumes these process-directed
 signals with `sigtimedwait` and cancels the service's shutdown token. Runtime,
