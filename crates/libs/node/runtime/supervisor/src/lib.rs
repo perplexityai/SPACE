@@ -6,6 +6,7 @@ mod process;
 mod run;
 mod service;
 mod sidecar_launcher;
+mod verified_launch;
 
 pub use run::{RunRuntimeSupervisorError, RuntimeSupervisorRunConfig, SERVICE_NAME, run};
 pub use service::RuntimeSupervisorService;

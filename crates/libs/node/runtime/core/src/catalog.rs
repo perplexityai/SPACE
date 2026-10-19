@@ -28,9 +28,11 @@ use sha2::{Digest as _, Sha256};
 use crate::runtime_inventory::diagnostic::ReleaseLayout;
 
 mod environment;
+mod verity;
 pub use environment::{
     CompiledEnvironment, CompiledEnvironmentDefinitionError, ResolveEnvironmentError,
 };
+pub use verity::compiled_verity_digest;
 
 /// The catalog file version this build reads.
 pub const CATALOG_SCHEMA: u32 = 1;

@@ -55,6 +55,35 @@ fn managed_e0_survives_cache_loss_without_selecting_other_installs() {
     let inventory = discover().unwrap();
     let selected = resolve(&inventory).unwrap();
     assert_eq!(selected.execution.runtime(), &initial.release().release);
+    // The synthetic executable is discovered as the test host's architecture.
+    // Qualify its declared guest explicitly to exercise the x86_64 binding even
+    // when these filesystem fixtures run on an ARM development host.
+    let mut qualified = inventory.clone();
+    qualified.runtimes[0].guest.architecture = Arch::X86_64;
+    for (runtime_integrity, kernel_integrity) in [
+        (
+            ExecutionSourceIntegrity::Legacy,
+            ExecutionSourceIntegrity::Legacy,
+        ),
+        (
+            ExecutionSourceIntegrity::FsVerity,
+            ExecutionSourceIntegrity::Legacy,
+        ),
+        (
+            ExecutionSourceIntegrity::FsVerity,
+            ExecutionSourceIntegrity::FsVerity,
+        ),
+    ] {
+        qualified.runtimes[0].files.integrity = runtime_integrity;
+        qualified.components[0].integrity = kernel_integrity;
+        let resolved = resolve(&qualified).unwrap();
+        assert_eq!(
+            resolved.environment,
+            Some(initial.definition().unwrap().reference())
+        );
+        assert_eq!(resolved.runtime_files.integrity(), runtime_integrity);
+        assert_eq!(resolved.components[0].integrity, kernel_integrity);
+    }
     let staged_kernel = &selected.components[0].path;
     assert_eq!(
         selected.components[0].metadata.digest,
@@ -760,4 +789,135 @@ fn replace_bytes(path: &Path, bytes: &[u8]) {
     )
     .unwrap();
     replacement.persist(path).unwrap();
+}
+
+#[test]
+fn cache_repairs_invalidate_a_failed_binding_observation() {
+    enum Repair {
+        File,
+        Ancestor,
+    }
+    for repair in [Repair::File, Repair::Ancestor] {
+        let fixture = Fixture::new();
+        let initial = InitialEnvironment::for_architecture(Arch::X86_64).unwrap();
+        let ancestor = fixture._dir.path().join("cache-parent");
+        let cache = ancestor.join("one/two/three/four/cache/firecracker");
+        let release = ArtifactStore::execution_release_path(&cache, initial.release());
+        std::fs::create_dir_all(release.join("bin")).unwrap();
+        std::fs::write(release.join("bin/firecracker"), b"corrupt cached binary").unwrap();
+        if matches!(repair, Repair::Ancestor) {
+            std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o777)).unwrap();
+        }
+        let inventory = RuntimeInventory::discover_with_store(
+            &fixture.store,
+            &initial,
+            &fixture._dir.path().join("vendor"),
+            &cache.join("assets"),
+            &cache.join("kernels"),
+        )
+        .unwrap();
+        assert!(
+            !inventory.unavailable.is_empty(),
+            "must observe a failed populated binding"
+        );
+        inventory
+            .resolve(
+                None,
+                RuntimeKind::Firecracker,
+                ExecutionSelectionMode::NewColdBoot,
+            )
+            .unwrap_err();
+        assert!(inventory.check_files_unchanged());
+        match repair {
+            Repair::File => std::fs::write(release.join("bin/jailer"), b"partial repair").unwrap(),
+            Repair::Ancestor => {
+                std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o755)).unwrap()
+            }
+        }
+        assert!(!inventory.check_files_unchanged());
+    }
+}
+
+#[test]
+fn empty_compiled_environment_is_absent_not_corrupt() {
+    let fixture = Fixture::new();
+    std::fs::remove_dir_all(fixture.release_path("1.15.1", 1)).unwrap();
+    let initial = InitialEnvironment::for_architecture(Arch::X86_64).unwrap();
+    let vendor = fixture._dir.path().join("external/firecracker");
+    let cache = fixture._dir.path().join("cache/firecracker");
+    std::fs::create_dir_all(&cache).unwrap();
+    let inventory = RuntimeInventory::discover_with_store(
+        &fixture.store,
+        &initial,
+        &vendor,
+        &cache.join("assets"),
+        &cache.join("kernels"),
+    )
+    .unwrap();
+    assert!(inventory.to_proto().runtimes.is_empty());
+    assert!(inventory.to_proto().components.is_empty());
+    assert!(matches!(
+        inventory.resolve(
+            None,
+            RuntimeKind::Firecracker,
+            ExecutionSelectionMode::NewColdBoot
+        ),
+        Err(RuntimeInventoryError::NoInstalledRuntime(
+            RuntimeKind::Firecracker
+        ))
+    ));
+}
+
+#[test]
+fn legacy_cached_kernel_is_verified_without_a_store_source() {
+    let fixture = Fixture::new();
+    let initial = synthetic_initial_environment();
+    std::fs::remove_dir_all(&fixture.kernels).unwrap();
+    let cache = fixture._dir.path().join("cache/firecracker");
+    let image = ArtifactStore::execution_kernel_path(&cache, initial.kernel());
+    std::fs::create_dir_all(image.parent().unwrap()).unwrap();
+    let discover = || {
+        RuntimeInventory::discover_with_store(
+            &fixture.store,
+            &initial,
+            &fixture._dir.path().join("vendor"),
+            &cache.join("assets"),
+            &cache.join("kernels"),
+        )
+        .unwrap()
+    };
+    for (bytes, accepted) in [(binary(42), true), (binary(99), false)] {
+        std::fs::write(&image, bytes).unwrap();
+        let inventory = discover();
+        let kernel = inventory
+            .components
+            .iter()
+            .find(|component| component.metadata.digest == Some(initial.kernel().sha256));
+        assert_eq!(kernel.is_some(), accepted);
+        if let Some(kernel) = kernel {
+            assert_eq!(kernel.path, image);
+            assert_eq!(kernel.integrity, ExecutionSourceIntegrity::Legacy);
+        }
+    }
+}
+
+#[test]
+fn managed_runtime_fallback_checks_store_ancestors() {
+    let fixture = Fixture::new();
+    let pin = pin("1.15.1", 1);
+    let source = fixture.release_path("1.15.1", 1);
+    let cache = fixture._dir.path().join("cache/firecracker");
+    for ancestor in [
+        fixture.releases.parent().unwrap(),
+        fixture.releases.parent().unwrap().parent().unwrap(),
+    ] {
+        std::fs::set_permissions(ancestor, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(
+            runtime_from_source(&fixture.store, &pin, RuntimeSource::Store(&source), &cache)
+                .is_err(),
+            "managed source must reject writable ancestor {}",
+            ancestor.display()
+        );
+        std::fs::set_permissions(ancestor, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 }
