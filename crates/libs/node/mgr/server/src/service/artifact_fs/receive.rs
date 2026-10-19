@@ -34,6 +34,7 @@ impl ReceiveRoot {
         configure_receiver(&mut command, &self.directory).map_err(error)?;
         remove_at(&self.directory, "instance".as_ref())?;
         remove_at(&self.directory, "instance.ro".as_ref())?;
+        let stored = stream.try_clone().map_err(error)?;
         let output = crate::host_command::stream_in_namespace(
             &mut command,
             crate::host_command::MUTATION_BUDGET,
@@ -43,10 +44,16 @@ impl ReceiveRoot {
         )
         .map_err(|error| Status::unavailable(format!("btrfs receive failed: {error}")))?;
         if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if let Some(corruption) = stored_stream_corruption(stored, &stderr) {
+                tracing::warn!(%corruption, "btrfs receive rejected a corrupt stored send stream");
+                return Err(Status::data_loss(format!(
+                    "{SNAPSHOT_STREAM_CORRUPT}: {corruption}"
+                )));
+            }
             return Err(Status::internal(format!(
-                "btrfs receive exited with {}: {}",
+                "btrfs receive exited with {}: {stderr}",
                 output.status,
-                String::from_utf8_lossy(&output.stderr),
             )));
         }
         if cancel.is_some_and(CancellationToken::is_cancelled) {
@@ -64,6 +71,33 @@ impl ReceiveRoot {
         nix::fcntl::renameat(&self.directory, "instance.ro", &self.directory, "instance")
             .map_err(error)?;
         self.directory.sync_all().map_err(error)
+    }
+}
+
+/// Prefix of the `DataLoss` status for a stored stream no retry can receive.
+pub(in crate::service) const SNAPSHOT_STREAM_CORRUPT: &str = "stored btrfs send stream is corrupt";
+
+/// Why the regular file `stored` can never be received, once the receiver
+/// reported a checksum failure. Only that report triggers the full read: a
+/// failure for another reason, such as a missing parent, keeps its status
+/// without rereading a stream that may be tens of gigabytes. The checker's
+/// verdict, not the CLI's wording, decides the classification.
+fn stored_stream_corruption(
+    mut stored: File,
+    stderr: &str,
+) -> Option<crate::service::btrfs_send_transport::framing::FramingError> {
+    use std::io::Seek;
+    if !stderr.contains("crc32 mismatch") || !stored.metadata().ok()?.is_file() {
+        return None;
+    }
+    stored.seek(std::io::SeekFrom::Start(0)).ok()?;
+    match crate::service::btrfs_send_transport::framing::check_stream(stored) {
+        Ok(Err(fault)) if fault.is_corrupt() => Some(fault),
+        Ok(_) => None,
+        Err(error) => {
+            tracing::warn!(%error, "could not reread a rejected send stream");
+            None
+        }
     }
 }
 

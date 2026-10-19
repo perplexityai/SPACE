@@ -11,6 +11,10 @@
 //! header, with the CRC field zeroed, and its payload. Verifying it here, and
 //! requiring exactly one stream that ends with `END`, turns a restarted send
 //! into a failed transfer that volume-manager retries from the start.
+//!
+//! Restore uses the same check on a downloaded stream that `btrfs receive`
+//! rejected, to tell a stored snapshot that can never be received from a
+//! failure of this node.
 
 const MAGIC: &[u8; 13] = b"btrfs-stream\0";
 /// `BTRFS_SEND_C_END`.
@@ -33,7 +37,7 @@ static CRC32C: crc::Crc<u32, crc::Table<16>> = crc::Crc::<u32, crc::Table<16>>::
 type Digest = crc::Digest<'static, u32, crc::Table<16>>;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub(super) enum FramingError {
+pub(in crate::service) enum FramingError {
     #[error("send stream does not start with the btrfs-stream header")]
     BadMagic,
     #[error("send stream version {0} is not supported")]
@@ -197,6 +201,33 @@ impl SendStreamFraming {
             self.start_command();
         }
         Ok(())
+    }
+}
+
+impl FramingError {
+    /// Whether these bytes, complete, can never be received. A stream that
+    /// merely stops early may be a short read rather than its stored content.
+    pub(in crate::service) fn is_corrupt(&self) -> bool {
+        !matches!(self, Self::Truncated { .. })
+    }
+}
+
+/// Check a whole stream read from `input`, stopping at its first fault.
+pub(in crate::service) fn check_stream(
+    mut input: impl std::io::Read,
+) -> std::io::Result<Result<(), FramingError>> {
+    let mut framing = SendStreamFraming::new();
+    let mut buffer = vec![0; 1 << 20];
+    loop {
+        let count = match input.read(&mut buffer) {
+            Ok(0) => return Ok(framing.finish()),
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if let Err(error) = framing.feed(buffer.get(..count).unwrap_or_default()) {
+            return Ok(Err(error));
+        }
     }
 }
 

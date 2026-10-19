@@ -316,6 +316,34 @@ async fn restore_rootfs_policy_failure_is_permanent_not_a_retry_response() {
     assert!(provenance.storage_uri.is_none());
 }
 
+#[tokio::test]
+async fn corrupt_snapshot_stream_is_data_loss_not_a_retry_response() {
+    let directory = tempfile::tempdir().unwrap();
+    let sandbox_id = SandboxId::new().to_string();
+    let mut provenance = RestoredSnapshotProvenance::default();
+    let error = stage_remote_suspend_restore_if_needed(
+        &sandbox_id,
+        directory.path(),
+        SuspendRestorePlacement::RemoteOnly,
+        Some("s3://test/selected-snapshot?region=us-east-1"),
+        &mut provenance,
+        |_, _| async {
+            Err(
+                crate::snapshot_restore::RestoreError::SnapshotStreamCorrupt {
+                    source: crate::btrfs_via_nodemgr::BtrfsViaNodemgrError::Rpc {
+                        rpc: "BtrfsReceiveInstance",
+                        status: tonic::Status::data_loss("stored btrfs send stream is corrupt"),
+                    },
+                },
+            )
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::DataLoss);
+    assert!(provenance.storage_uri.is_none());
+}
+
 async fn run_selected_remote_stage_for_test(
     cache_dir: &std::path::Path,
     sandbox_id: &str,
