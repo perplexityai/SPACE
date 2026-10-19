@@ -221,4 +221,20 @@ impl SpacedHostClient {
         })
         .await
     }
+
+    /// Read-only, so the call is replay-safe like the other metadata reads.
+    pub async fn glob_as_user(
+        &self,
+        request: proto::GlobRequest,
+        user: Option<GuestUserName>,
+    ) -> Result<proto::GlobResponse, tonic::Status> {
+        self.call_filesystem("glob", |mut client| {
+            let request = GlobRequest {
+                user: user.as_ref().map(|user| user.as_str().to_string()),
+                ..request.clone()
+            };
+            async move { client.glob(request).await }
+        })
+        .await
+    }
 }
