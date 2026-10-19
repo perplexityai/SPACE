@@ -476,8 +476,14 @@ type NetworkCredentialRuleV1 struct {
 	// Admission requires a non-empty, duplicate-free set. Version one supports
 	// only GET, POST and HEAD; every other method fails closed.
 	SupportedHttpMethods []NetworkCredentialHttpMethodV1 `protobuf:"varint,4,rep,packed,name=supported_http_methods,json=supportedHttpMethods,proto3,enum=space.net.policy.v1.NetworkCredentialHttpMethodV1" json:"supported_http_methods,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// Unset: the rule applies to every matching request from the sandbox.
+	// Set: the rule applies only to requests on a connection the guest opened
+	// through the gateway's explicit proxy, presenting a Proxy-Authorization
+	// secret that matches, and only before the expiry. Not yet enforced by any
+	// gateway, so admission rejects rules that set it.
+	ProxyAuthorization *NetworkCredentialProxyAuthorizationV1 `protobuf:"bytes,5,opt,name=proxy_authorization,json=proxyAuthorization,proto3" json:"proxy_authorization,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *NetworkCredentialRuleV1) Reset() {
@@ -538,6 +544,71 @@ func (x *NetworkCredentialRuleV1) GetSupportedHttpMethods() []NetworkCredentialH
 	return nil
 }
 
+func (x *NetworkCredentialRuleV1) GetProxyAuthorization() *NetworkCredentialProxyAuthorizationV1 {
+	if x != nil {
+		return x.ProxyAuthorization
+	}
+	return nil
+}
+
+// Binds a credential rule to whoever holds a proxy secret, such as one tool
+// call's HTTPS_PROXY password. Policy carries only the secret's digest.
+type NetworkCredentialProxyAuthorizationV1 struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// SHA-256 of the exact password bytes in the client's Proxy-Authorization
+	// credentials. Exactly 32 bytes.
+	SecretSha256 []byte `protobuf:"bytes,1,opt,name=secret_sha256,json=secretSha256,proto3" json:"secret_sha256,omitempty"`
+	// Wall-clock expiry in Unix milliseconds. Requests at or after this instant
+	// receive no credential from this rule. Required and nonzero.
+	ExpiresAtUnixMs uint64 `protobuf:"varint,2,opt,name=expires_at_unix_ms,json=expiresAtUnixMs,proto3" json:"expires_at_unix_ms,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *NetworkCredentialProxyAuthorizationV1) Reset() {
+	*x = NetworkCredentialProxyAuthorizationV1{}
+	mi := &file_net_policy_v1_policy_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NetworkCredentialProxyAuthorizationV1) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NetworkCredentialProxyAuthorizationV1) ProtoMessage() {}
+
+func (x *NetworkCredentialProxyAuthorizationV1) ProtoReflect() protoreflect.Message {
+	mi := &file_net_policy_v1_policy_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NetworkCredentialProxyAuthorizationV1.ProtoReflect.Descriptor instead.
+func (*NetworkCredentialProxyAuthorizationV1) Descriptor() ([]byte, []int) {
+	return file_net_policy_v1_policy_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *NetworkCredentialProxyAuthorizationV1) GetSecretSha256() []byte {
+	if x != nil {
+		return x.SecretSha256
+	}
+	return nil
+}
+
+func (x *NetworkCredentialProxyAuthorizationV1) GetExpiresAtUnixMs() uint64 {
+	if x != nil {
+		return x.ExpiresAtUnixMs
+	}
+	return 0
+}
+
 type CredentialHeaderBindingV1 struct {
 	state                 protoimpl.MessageState `protogen:"open.v1"`
 	HeaderName            string                 `protobuf:"bytes,1,opt,name=header_name,json=headerName,proto3" json:"header_name,omitempty"`
@@ -548,7 +619,7 @@ type CredentialHeaderBindingV1 struct {
 
 func (x *CredentialHeaderBindingV1) Reset() {
 	*x = CredentialHeaderBindingV1{}
-	mi := &file_net_policy_v1_policy_proto_msgTypes[2]
+	mi := &file_net_policy_v1_policy_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -560,7 +631,7 @@ func (x *CredentialHeaderBindingV1) String() string {
 func (*CredentialHeaderBindingV1) ProtoMessage() {}
 
 func (x *CredentialHeaderBindingV1) ProtoReflect() protoreflect.Message {
-	mi := &file_net_policy_v1_policy_proto_msgTypes[2]
+	mi := &file_net_policy_v1_policy_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -573,7 +644,7 @@ func (x *CredentialHeaderBindingV1) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CredentialHeaderBindingV1.ProtoReflect.Descriptor instead.
 func (*CredentialHeaderBindingV1) Descriptor() ([]byte, []int) {
-	return file_net_policy_v1_policy_proto_rawDescGZIP(), []int{2}
+	return file_net_policy_v1_policy_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *CredentialHeaderBindingV1) GetHeaderName() string {
@@ -604,7 +675,7 @@ type NetworkCredentialDestinationV1 struct {
 
 func (x *NetworkCredentialDestinationV1) Reset() {
 	*x = NetworkCredentialDestinationV1{}
-	mi := &file_net_policy_v1_policy_proto_msgTypes[3]
+	mi := &file_net_policy_v1_policy_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -616,7 +687,7 @@ func (x *NetworkCredentialDestinationV1) String() string {
 func (*NetworkCredentialDestinationV1) ProtoMessage() {}
 
 func (x *NetworkCredentialDestinationV1) ProtoReflect() protoreflect.Message {
-	mi := &file_net_policy_v1_policy_proto_msgTypes[3]
+	mi := &file_net_policy_v1_policy_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -629,7 +700,7 @@ func (x *NetworkCredentialDestinationV1) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NetworkCredentialDestinationV1.ProtoReflect.Descriptor instead.
 func (*NetworkCredentialDestinationV1) Descriptor() ([]byte, []int) {
-	return file_net_policy_v1_policy_proto_rawDescGZIP(), []int{3}
+	return file_net_policy_v1_policy_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *NetworkCredentialDestinationV1) GetExactHost() string {
@@ -668,7 +739,7 @@ type EgressDestinationV1 struct {
 
 func (x *EgressDestinationV1) Reset() {
 	*x = EgressDestinationV1{}
-	mi := &file_net_policy_v1_policy_proto_msgTypes[4]
+	mi := &file_net_policy_v1_policy_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -680,7 +751,7 @@ func (x *EgressDestinationV1) String() string {
 func (*EgressDestinationV1) ProtoMessage() {}
 
 func (x *EgressDestinationV1) ProtoReflect() protoreflect.Message {
-	mi := &file_net_policy_v1_policy_proto_msgTypes[4]
+	mi := &file_net_policy_v1_policy_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -693,7 +764,7 @@ func (x *EgressDestinationV1) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EgressDestinationV1.ProtoReflect.Descriptor instead.
 func (*EgressDestinationV1) Descriptor() ([]byte, []int) {
-	return file_net_policy_v1_policy_proto_rawDescGZIP(), []int{4}
+	return file_net_policy_v1_policy_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *EgressDestinationV1) GetDestination() isEgressDestinationV1_Destination {
@@ -779,12 +850,16 @@ const file_net_policy_v1_policy_proto_rawDesc = "" +
 	"\x04deny\x18\x04 \x03(\v2(.space.net.policy.v1.EgressDestinationV1R\x04deny\x12O\n" +
 	"\x10tls_interception\x18\x05 \x01(\x0e2$.space.net.policy.v1.TlsInterceptionR\x0ftlsInterception\x12f\n" +
 	"\x18network_credential_rules\x18\x06 \x03(\v2,.space.net.policy.v1.NetworkCredentialRuleV1R\x16networkCredentialRules\x12h\n" +
-	"\x1btls_interception_exemptions\x18\a \x03(\v2(.space.net.policy.v1.EgressDestinationV1R\x19tlsInterceptionExemptions\"\xe1\x02\n" +
+	"\x1btls_interception_exemptions\x18\a \x03(\v2(.space.net.policy.v1.EgressDestinationV1R\x19tlsInterceptionExemptions\"\xce\x03\n" +
 	"\x17NetworkCredentialRuleV1\x12\x17\n" +
 	"\arule_id\x18\x01 \x01(\tR\x06ruleId\x12U\n" +
 	"\vdestination\x18\x02 \x01(\v23.space.net.policy.v1.NetworkCredentialDestinationV1R\vdestination\x12l\n" +
 	"\x1acredential_header_bindings\x18\x03 \x03(\v2..space.net.policy.v1.CredentialHeaderBindingV1R\x18credentialHeaderBindings\x12h\n" +
-	"\x16supported_http_methods\x18\x04 \x03(\x0e22.space.net.policy.v1.NetworkCredentialHttpMethodV1R\x14supportedHttpMethods\"t\n" +
+	"\x16supported_http_methods\x18\x04 \x03(\x0e22.space.net.policy.v1.NetworkCredentialHttpMethodV1R\x14supportedHttpMethods\x12k\n" +
+	"\x13proxy_authorization\x18\x05 \x01(\v2:.space.net.policy.v1.NetworkCredentialProxyAuthorizationV1R\x12proxyAuthorization\"y\n" +
+	"%NetworkCredentialProxyAuthorizationV1\x12#\n" +
+	"\rsecret_sha256\x18\x01 \x01(\fR\fsecretSha256\x12+\n" +
+	"\x12expires_at_unix_ms\x18\x02 \x01(\x04R\x0fexpiresAtUnixMs\"t\n" +
 	"\x19CredentialHeaderBindingV1\x12\x1f\n" +
 	"\vheader_name\x18\x01 \x01(\tR\n" +
 	"headerName\x126\n" +
@@ -847,37 +922,39 @@ func file_net_policy_v1_policy_proto_rawDescGZIP() []byte {
 }
 
 var file_net_policy_v1_policy_proto_enumTypes = make([]protoimpl.EnumInfo, 7)
-var file_net_policy_v1_policy_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
+var file_net_policy_v1_policy_proto_msgTypes = make([]protoimpl.MessageInfo, 6)
 var file_net_policy_v1_policy_proto_goTypes = []any{
-	(EgressDefaultAction)(0),               // 0: space.net.policy.v1.EgressDefaultAction
-	(NetworkPolicyVersion)(0),              // 1: space.net.policy.v1.NetworkPolicyVersion
-	(NetworkPolicySource)(0),               // 2: space.net.policy.v1.NetworkPolicySource
-	(PolicyAuthority)(0),                   // 3: space.net.policy.v1.PolicyAuthority
-	(NetworkPolicyApplyDecision)(0),        // 4: space.net.policy.v1.NetworkPolicyApplyDecision
-	(TlsInterception)(0),                   // 5: space.net.policy.v1.TlsInterception
-	(NetworkCredentialHttpMethodV1)(0),     // 6: space.net.policy.v1.NetworkCredentialHttpMethodV1
-	(*NetworkPolicyV1)(nil),                // 7: space.net.policy.v1.NetworkPolicyV1
-	(*NetworkCredentialRuleV1)(nil),        // 8: space.net.policy.v1.NetworkCredentialRuleV1
-	(*CredentialHeaderBindingV1)(nil),      // 9: space.net.policy.v1.CredentialHeaderBindingV1
-	(*NetworkCredentialDestinationV1)(nil), // 10: space.net.policy.v1.NetworkCredentialDestinationV1
-	(*EgressDestinationV1)(nil),            // 11: space.net.policy.v1.EgressDestinationV1
+	(EgressDefaultAction)(0),                      // 0: space.net.policy.v1.EgressDefaultAction
+	(NetworkPolicyVersion)(0),                     // 1: space.net.policy.v1.NetworkPolicyVersion
+	(NetworkPolicySource)(0),                      // 2: space.net.policy.v1.NetworkPolicySource
+	(PolicyAuthority)(0),                          // 3: space.net.policy.v1.PolicyAuthority
+	(NetworkPolicyApplyDecision)(0),               // 4: space.net.policy.v1.NetworkPolicyApplyDecision
+	(TlsInterception)(0),                          // 5: space.net.policy.v1.TlsInterception
+	(NetworkCredentialHttpMethodV1)(0),            // 6: space.net.policy.v1.NetworkCredentialHttpMethodV1
+	(*NetworkPolicyV1)(nil),                       // 7: space.net.policy.v1.NetworkPolicyV1
+	(*NetworkCredentialRuleV1)(nil),               // 8: space.net.policy.v1.NetworkCredentialRuleV1
+	(*NetworkCredentialProxyAuthorizationV1)(nil), // 9: space.net.policy.v1.NetworkCredentialProxyAuthorizationV1
+	(*CredentialHeaderBindingV1)(nil),             // 10: space.net.policy.v1.CredentialHeaderBindingV1
+	(*NetworkCredentialDestinationV1)(nil),        // 11: space.net.policy.v1.NetworkCredentialDestinationV1
+	(*EgressDestinationV1)(nil),                   // 12: space.net.policy.v1.EgressDestinationV1
 }
 var file_net_policy_v1_policy_proto_depIdxs = []int32{
 	1,  // 0: space.net.policy.v1.NetworkPolicyV1.version:type_name -> space.net.policy.v1.NetworkPolicyVersion
 	0,  // 1: space.net.policy.v1.NetworkPolicyV1.egress_default_action:type_name -> space.net.policy.v1.EgressDefaultAction
-	11, // 2: space.net.policy.v1.NetworkPolicyV1.allow:type_name -> space.net.policy.v1.EgressDestinationV1
-	11, // 3: space.net.policy.v1.NetworkPolicyV1.deny:type_name -> space.net.policy.v1.EgressDestinationV1
+	12, // 2: space.net.policy.v1.NetworkPolicyV1.allow:type_name -> space.net.policy.v1.EgressDestinationV1
+	12, // 3: space.net.policy.v1.NetworkPolicyV1.deny:type_name -> space.net.policy.v1.EgressDestinationV1
 	5,  // 4: space.net.policy.v1.NetworkPolicyV1.tls_interception:type_name -> space.net.policy.v1.TlsInterception
 	8,  // 5: space.net.policy.v1.NetworkPolicyV1.network_credential_rules:type_name -> space.net.policy.v1.NetworkCredentialRuleV1
-	11, // 6: space.net.policy.v1.NetworkPolicyV1.tls_interception_exemptions:type_name -> space.net.policy.v1.EgressDestinationV1
-	10, // 7: space.net.policy.v1.NetworkCredentialRuleV1.destination:type_name -> space.net.policy.v1.NetworkCredentialDestinationV1
-	9,  // 8: space.net.policy.v1.NetworkCredentialRuleV1.credential_header_bindings:type_name -> space.net.policy.v1.CredentialHeaderBindingV1
+	12, // 6: space.net.policy.v1.NetworkPolicyV1.tls_interception_exemptions:type_name -> space.net.policy.v1.EgressDestinationV1
+	11, // 7: space.net.policy.v1.NetworkCredentialRuleV1.destination:type_name -> space.net.policy.v1.NetworkCredentialDestinationV1
+	10, // 8: space.net.policy.v1.NetworkCredentialRuleV1.credential_header_bindings:type_name -> space.net.policy.v1.CredentialHeaderBindingV1
 	6,  // 9: space.net.policy.v1.NetworkCredentialRuleV1.supported_http_methods:type_name -> space.net.policy.v1.NetworkCredentialHttpMethodV1
-	10, // [10:10] is the sub-list for method output_type
-	10, // [10:10] is the sub-list for method input_type
-	10, // [10:10] is the sub-list for extension type_name
-	10, // [10:10] is the sub-list for extension extendee
-	0,  // [0:10] is the sub-list for field type_name
+	9,  // 10: space.net.policy.v1.NetworkCredentialRuleV1.proxy_authorization:type_name -> space.net.policy.v1.NetworkCredentialProxyAuthorizationV1
+	11, // [11:11] is the sub-list for method output_type
+	11, // [11:11] is the sub-list for method input_type
+	11, // [11:11] is the sub-list for extension type_name
+	11, // [11:11] is the sub-list for extension extendee
+	0,  // [0:11] is the sub-list for field type_name
 }
 
 func init() { file_net_policy_v1_policy_proto_init() }
@@ -885,8 +962,8 @@ func file_net_policy_v1_policy_proto_init() {
 	if File_net_policy_v1_policy_proto != nil {
 		return
 	}
-	file_net_policy_v1_policy_proto_msgTypes[3].OneofWrappers = []any{}
-	file_net_policy_v1_policy_proto_msgTypes[4].OneofWrappers = []any{
+	file_net_policy_v1_policy_proto_msgTypes[4].OneofWrappers = []any{}
+	file_net_policy_v1_policy_proto_msgTypes[5].OneofWrappers = []any{
 		(*EgressDestinationV1_Ip)(nil),
 		(*EgressDestinationV1_Cidr)(nil),
 		(*EgressDestinationV1_Domain)(nil),
@@ -898,7 +975,7 @@ func file_net_policy_v1_policy_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_net_policy_v1_policy_proto_rawDesc), len(file_net_policy_v1_policy_proto_rawDesc)),
 			NumEnums:      7,
-			NumMessages:   5,
+			NumMessages:   6,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

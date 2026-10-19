@@ -605,6 +605,7 @@ fn wire_policy(egress: Egress) -> policy_proto::NetworkPolicyV1 {
                 supported_http_methods: vec![
                     policy_proto::NetworkCredentialHttpMethodV1::Get as i32,
                 ],
+                proxy_authorization: None,
             }],
             tls_interception_exemptions: Vec::new(),
         },

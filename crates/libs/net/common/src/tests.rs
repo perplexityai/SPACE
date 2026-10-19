@@ -884,6 +884,24 @@ fn network_credential_policy_proto_round_trips_without_changing_legacy_bytes() {
         .push(99);
     NetworkPolicyV1::try_from(&unknown).unwrap_err();
 
+    // No gateway enforces proxy authorization yet, so a rule that asks for it
+    // must be refused rather than installed for the whole sandbox.
+    let mut proxy_bound = proto.clone();
+    proxy_bound.network_credential_rules[0].proxy_authorization =
+        Some(proto::NetworkCredentialProxyAuthorizationV1 {
+            secret_sha256: vec![0; 32],
+            expires_at_unix_ms: 1,
+        });
+    let err = NetworkPolicyV1::try_from(&proxy_bound).unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            NetworkPolicyProtoError::InvalidNetworkCredentialRule { index: 0, message }
+                if message.contains("proxy_authorization")
+        ),
+        "{err}"
+    );
+
     #[derive(Clone, PartialEq, prost::Message)]
     struct LegacyNetworkPolicyV1 {
         #[prost(enumeration = "proto::NetworkPolicyVersion", tag = "1")]

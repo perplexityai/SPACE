@@ -63,6 +63,23 @@ message NetworkCredentialRuleV1 {
   // Admission requires a non-empty, duplicate-free set. Version one supports
   // only GET, POST and HEAD; every other method fails closed.
   repeated NetworkCredentialHttpMethodV1 supported_http_methods = 4;
+  // Unset: the rule applies to every matching request from the sandbox.
+  // Set: the rule applies only to requests on a connection the guest opened
+  // through the gateway's explicit proxy, presenting a Proxy-Authorization
+  // secret that matches, and only before the expiry. Not yet enforced by any
+  // gateway, so admission rejects rules that set it.
+  NetworkCredentialProxyAuthorizationV1 proxy_authorization = 5;
+}
+
+// Binds a credential rule to whoever holds a proxy secret, such as one tool
+// call's HTTPS_PROXY password. Policy carries only the secret's digest.
+message NetworkCredentialProxyAuthorizationV1 {
+  // SHA-256 of the exact password bytes in the client's Proxy-Authorization
+  // credentials. Exactly 32 bytes.
+  bytes secret_sha256 = 1;
+  // Wall-clock expiry in Unix milliseconds. Requests at or after this instant
+  // receive no credential from this rule. Required and nonzero.
+  uint64 expires_at_unix_ms = 2;
 }
 
 message CredentialHeaderBindingV1 {

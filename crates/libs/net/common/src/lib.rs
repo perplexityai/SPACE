@@ -85,6 +85,8 @@ pub enum NetworkPolicyValidationError {
     ReservedNetworkCredentialHeaderName(String),
     #[error("network-credential supported_http_methods must contain GET, POST or HEAD")]
     InvalidNetworkCredentialHttpMethods,
+    #[error("network-credential proxy_authorization is not supported yet")]
+    UnsupportedNetworkCredentialProxyAuthorization,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1141,6 +1143,13 @@ impl TryFrom<&proto::NetworkCredentialRuleV1> for NetworkCredentialRuleV1 {
     type Error = NetworkPolicyValidationError;
 
     fn try_from(rule: &proto::NetworkCredentialRuleV1) -> Result<Self, Self::Error> {
+        // No gateway enforces this yet. Dropping it would install the rule for
+        // the whole sandbox, so refuse it until the gateway honors it.
+        if rule.proxy_authorization.is_some() {
+            return Err(
+                NetworkPolicyValidationError::UnsupportedNetworkCredentialProxyAuthorization,
+            );
+        }
         let destination = rule
             .destination
             .as_ref()
@@ -1226,6 +1235,7 @@ impl From<&NetworkCredentialRuleV1> for proto::NetworkCredentialRuleV1 {
                     }) as i32
                 })
                 .collect(),
+            proxy_authorization: None,
         }
     }
 }
