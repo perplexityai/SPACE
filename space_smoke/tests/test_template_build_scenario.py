@@ -504,9 +504,12 @@ class HarnessOps(unittest.TestCase):
 
 
 class GuestMetadataScript(unittest.TestCase):
-    """Bench round 1 (F2): the sed backreference had been written as a 0x01 byte."""
+    """Published guest metadata agrees with ordinary and inline ext4 files."""
 
-    @unittest.skipUnless(shutil.which("bash") and shutil.which("sed"), "needs bash and sed")
+    @unittest.skipUnless(
+        all(shutil.which(tool) for tool in ("bash", "sed", "mke2fs", "debugfs")),
+        "needs bash, sed and e2fsprogs",
+    )
     def test_the_script_prints_the_two_metadata_fields(self) -> None:
         import subprocess
         import tempfile
@@ -521,12 +524,25 @@ class GuestMetadataScript(unittest.TestCase):
             (digest / "metadata.json").write_text(
                 '{\n  "spaced_version": "0.1.4",\n  "spaced_compatibility_family": "0.1"\n}\n'
             )
+            source = Path(tmp) / "source"
+            (source / "etc/spaced").mkdir(parents=True)
+            (source / "etc/spaced/bundle-version").write_bytes(b"0.1.4\n")
+            image = digest / "rootfs.ext4"
             script = _GUEST_METADATA_SCRIPT.replace("__TEMPLATE_DIR__", f"'{tmp}'")
+            for features in ("^inline_data", "inline_data"):
+                with self.subTest(features=features):
+                    with image.open("wb") as output:
+                        output.truncate(64 * 1024 * 1024)
+                    subprocess.run(
+                        ["mke2fs", "-q", "-F", "-t", "ext4", "-O", features, "-d", str(source), str(image)],
+                        check=True, capture_output=True, timeout=30,
+                    )
+                    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.splitlines(), ["0.1.4", "0.1.4", "0.1"])
+            image.unlink()
             result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        lines = result.stdout.splitlines()
-        # Line 1 is the bundle version from debugfs, empty here (no rootfs).
-        self.assertEqual(lines[1:], ["0.1.4", "0.1"])
+            self.assertNotEqual(result.returncode, 0, "missing rootfs must fail metadata inspection")
 
 
 class SdkBuild(unittest.TestCase):

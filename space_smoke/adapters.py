@@ -5713,7 +5713,19 @@ template_dir=__TEMPLATE_DIR__
 metadata_path="$(find "$template_dir" -mindepth 2 -maxdepth 2 -type f -name metadata.json -print -quit)"
 test -n "$metadata_path"
 rootfs_path="${metadata_path%/metadata.json}/rootfs.ext4"
-debugfs -R 'cat /etc/spaced/bundle-version' "$rootfs_path" 2>/dev/null | tr -d '\r\n'; echo
+# Some debugfs versions return inline storage capacity rather than inode size.
+# Accept only zero padding beyond the logical file, never strip payload bytes.
+export LC_ALL=C
+inode="$(debugfs -R 'stat /etc/spaced/bundle-version' "$rootfs_path" 2>/dev/null)"
+size="$(printf '%s\n' "$inode" | awk '/^User:/ {for (i=1; i<NF; i++) if ($i == "Size:") print $(i+1)}')"
+case "$size" in ''|*[!0-9]*) echo 'missing bundle-version inode size' >&2; exit 1 ;; esac
+test "$size" -gt 0 && test "$size" -le 4096
+scratch="$(mktemp)"
+trap 'rm -f "$scratch"' EXIT HUP INT TERM
+debugfs -R 'cat /etc/spaced/bundle-version' "$rootfs_path" > "$scratch" 2>/dev/null
+test "$(wc -c < "$scratch")" -ge "$size"
+test "$(tail -c +$((size + 1)) "$scratch" | tr -d '\000' | wc -c)" -eq 0
+head -c "$size" "$scratch" | tr -d '\r\n'; echo
 sed -n 's/.*"spaced_version": "\([^"]*\)".*/\1/p' "$metadata_path"
 sed -n 's/.*"spaced_compatibility_family": "\([^"]*\)".*/\1/p' "$metadata_path"
 """
