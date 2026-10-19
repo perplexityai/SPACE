@@ -1,3 +1,4 @@
+pub(crate) mod copy;
 mod decode_admission;
 mod stream_push;
 use decode_admission::{
@@ -1245,6 +1246,7 @@ const fn artifact_pull_existing_policy() -> PullExistingPolicy {
 impl JobExecutor for TransferExecutor {
     async fn execute(&self, job: &Job, cancellation: CancellationToken) -> Result<i64, JobError> {
         match job.kind.as_str() {
+            copy::KIND => self.execute_copy_object(job, cancellation).await,
             // Single-file transfers (template raw pulls, single uploads):
             // one TransferPayload, always plaintext.
             "push" | "pull" => self.execute_single(job, cancellation).await,
@@ -1265,6 +1267,8 @@ impl JobExecutor for TransferExecutor {
 
     async fn cleanup_cancelled(&self, job: &Job) -> Result<(), JobError> {
         match job.kind.as_str() {
+            // The object store owns multipart abort; copies create no local files.
+            copy::KIND => Ok(()),
             "push_btrfs_send" => {
                 let payload: crate::btrfs_push::Payload = job.payload_as()?;
                 let mut client = self

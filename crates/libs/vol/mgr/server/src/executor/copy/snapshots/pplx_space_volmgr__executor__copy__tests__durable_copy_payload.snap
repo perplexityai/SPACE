@@ -1,0 +1,10 @@
+---
+source: crates/libs/vol/mgr/server/src/executor/copy/tests.rs
+assertion_line: 100
+expression: "serde_json::to_string_pretty(&payload).unwrap()"
+---
+{
+  "subject_id": "sandbox:019f8000-0000-7000-8000-000000000002",
+  "source_s3_uri": "s3://example-artifacts/source?endpoint=http://object-store.example:9000&region=us-east-1",
+  "destination_s3_uri": "s3://example-artifacts/destination?region=us-east-1&endpoint=http://object-store.example:9000"
+}

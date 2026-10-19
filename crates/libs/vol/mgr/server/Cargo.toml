@@ -52,6 +52,7 @@ pplx-space-node-mgr-client = { workspace = true }
 tempfile = { workspace = true }
 
 [dev-dependencies]
+insta = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }
 pplx-space-common-grpc = { workspace = true }

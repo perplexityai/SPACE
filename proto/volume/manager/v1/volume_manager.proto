@@ -51,6 +51,10 @@ service VolumeManager {
     // Submit a download job. Returns immediately with a job_id.
     rpc SubmitPullFile(PullFileRequest) returns (SubmitTransferResponse);
 
+    // Copy encoded bytes within one object store without staging or decoding
+    // the payload on this worker. The durable job survives caller disconnect.
+    rpc SubmitCopyObject(CopyObjectRequest) returns (SubmitTransferResponse);
+
     // Query the status of a previously submitted transfer job.
     rpc GetTransferJob(GetTransferJobRequest) returns (GetTransferJobResponse);
 
@@ -401,6 +405,12 @@ message SubmitTransferResponse {
     string job_id = 1;
 }
 
+message CopyObjectRequest {
+    string subject_id = 1;
+    string source_s3_uri = 2;
+    string destination_s3_uri = 3;
+}
+
 enum TransferJobStatus {
     TRANSFER_JOB_STATUS_UNSPECIFIED = 0;
     TRANSFER_JOB_STATUS_PENDING     = 1;
@@ -414,7 +424,7 @@ enum TransferJobStatus {
 message TransferJob {
     string            job_id            = 1;
     TransferJobStatus status            = 2;
-    string            kind              = 3;  // "push" or "pull"
+    string            kind              = 3;  // Transfer kind, e.g. push, pull, copy_object.
     // Principal on whose behalf the transfer runs; see PushFileRequest.
     string            subject_id        = 4;
     string            local_path        = 5;
@@ -450,7 +460,7 @@ message ListTransferJobsResponse {
 
 message CancelTransferRequest {
     oneof selector {
-        // The job must be a pull or pull-artifact transfer.
+        // The job must be a pull, pull-artifact, or server-side copy transfer.
         string job_id = 1;
         // Cancels active pulls owned by this restore-attempt scope.
         string transfer_scope_id = 2;

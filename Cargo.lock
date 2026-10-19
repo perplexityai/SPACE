@@ -7340,6 +7340,7 @@ dependencies = [
  "bytes",
  "dashmap",
  "futures-util",
+ "insta",
  "nix 0.31.3",
  "pplx-space-common-core",
  "pplx-space-common-grpc",

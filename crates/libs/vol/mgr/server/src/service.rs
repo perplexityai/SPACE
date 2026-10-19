@@ -209,6 +209,7 @@ impl VolumeManagerService {
         let staging = StagingDir::ensure(staging_dir)?;
         let worker_config = WorkerConfig::new(1, config.transfer_timeout, config.max_attempts)
             .with_kind_concurrency(PUSH_KIND, config.push_concurrency)
+            .with_kind_concurrency(crate::executor::copy::KIND, config.push_concurrency)
             .with_kind_concurrency(crate::btrfs_push::KIND, config.push_concurrency)
             .with_kind_concurrency(PULL_KIND, config.pull_concurrency)
             .with_kind_active_job_limit(PULL_KIND, config.pull_concurrency)
@@ -619,10 +620,16 @@ fn job_to_proto(job: pplx_space_common_jobs::Job) -> Result<TransferJob, Status>
         .as_ref()
         .map(|p| p.local_path.clone())
         .unwrap_or_default();
-    let s3_uri = payload
+    let mut s3_uri = payload
         .as_ref()
         .map(|p| p.s3_uri.clone())
         .unwrap_or_default();
+    if job.kind == crate::executor::copy::KIND {
+        let copy: crate::executor::copy::CopyPayload = job
+            .payload_as()
+            .map_err(|error| Status::internal(format!("invalid copy job: {error}")))?;
+        s3_uri = copy.destination().as_wire().to_string();
+    }
     let transfer_scope_id = payload
         .as_ref()
         .and_then(|payload| payload.transfer_scope_id)
@@ -1295,6 +1302,34 @@ impl VolumeManager for VolumeManagerService {
         }))
     }
 
+    async fn submit_copy_object(
+        &self,
+        request: Request<crate::proto::CopyObjectRequest>,
+    ) -> Result<Response<SubmitTransferResponse>, Status> {
+        let peer = self.peer_authorizer.authorize_request(
+            &request,
+            "submit_copy_object",
+            SANDBOX_MANAGER_PEERS,
+        )?;
+        let _admission = self.transfer_admission.enter()?;
+        let payload = crate::executor::copy::CopyPayload::try_from(request.into_inner())
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        self.authorize_sandbox_subject(&peer, payload.subject(), "submit_copy_object")?;
+        let json =
+            serde_json::to_string(&payload).map_err(|error| Status::internal(error.to_string()))?;
+        // Reuse live work, but reverify after completion: retention may have
+        // removed a previous destination before this new submission.
+        let job_id = self.worker.submit(
+            crate::executor::copy::KIND,
+            &json,
+            Some(&payload.subject().to_string()),
+            Some(&payload.dedup_key()),
+        )?;
+        Ok(Response::new(SubmitTransferResponse {
+            job_id: job_id.to_string(),
+        }))
+    }
+
     async fn get_transfer_job(
         &self,
         request: Request<GetTransferJobRequest>,
@@ -1398,9 +1433,12 @@ impl VolumeManager for VolumeManagerService {
                     Status::not_found(format!("transfer job not found: {job_id}"))
                 })?;
                 self.authorize_job(&peer, &job, "cancel_transfer")?;
-                if !matches!(job.kind.as_str(), PULL_KIND | PULL_ARTIFACT_KIND) {
+                if !matches!(
+                    job.kind.as_str(),
+                    PULL_KIND | PULL_ARTIFACT_KIND | crate::executor::copy::KIND
+                ) {
                     return Err(Status::failed_precondition(format!(
-                        "transfer job {job_id} is not a pull"
+                        "transfer job {job_id} is not a pull or copy"
                     )));
                 }
                 vec![job_id]

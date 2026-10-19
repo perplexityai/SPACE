@@ -5,7 +5,10 @@ fn main() -> anyhow::Result<()> {
     let vol_dir = proto_root.join("volume/manager/v1");
     let vol_file = vol_dir.join("volume_manager.proto");
     pplx_space_common_proto_build::compile_protos(
-        tonic_prost_build::configure(),
+        tonic_prost_build::configure().type_attribute(
+            ".space.volume.manager.v1.CopyObjectRequest",
+            "#[derive(serde::Serialize, serde::Deserialize)]",
+        ),
         &[vol_file],
         &[vol_dir],
     )?;

@@ -1,5 +1,71 @@
 use super::*;
 
+#[tokio::test]
+async fn copy_jobs_deduplicate_live_work_and_keep_peer_and_cancellation_boundaries() {
+    let temp = tempfile::tempdir().unwrap();
+    let service = test_service(&temp).await;
+    let request = crate::proto::CopyObjectRequest {
+        subject_id: format!(
+            "sandbox:{}",
+            pplx_space_common_core::types::SandboxId::new()
+        ),
+        source_s3_uri: "s3://example-artifacts/source?region=us-east-1".into(),
+        destination_s3_uri: "s3://example-artifacts/destination?region=us-east-1".into(),
+    };
+    let denied = service
+        .submit_copy_object(service_request(request.clone(), users::SPACE_TMPLMGR))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), tonic::Code::PermissionDenied);
+    let mut different_store = request.clone();
+    different_store.source_s3_uri = "s3://example-artifacts/source?region=us-west-2".into();
+    assert_eq!(
+        service
+            .submit_copy_object(root_request(different_store))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    let first = service
+        .submit_copy_object(root_request(request.clone()))
+        .await
+        .unwrap()
+        .into_inner()
+        .job_id;
+    let mut same_source = request.clone();
+    same_source.source_s3_uri.push_str("&path_style=false");
+    let second = service
+        .submit_copy_object(root_request(same_source))
+        .await
+        .unwrap()
+        .into_inner()
+        .job_id;
+    assert_eq!(
+        first, second,
+        "equivalent object-store identities must join live work"
+    );
+    let job_id: JobId = first.parse().unwrap();
+    let job = service.worker.get_job(&job_id).unwrap().unwrap();
+    assert_eq!(
+        job_to_proto(job).unwrap().s3_uri,
+        request.destination_s3_uri
+    );
+    let cancelled = service
+        .cancel_transfer(root_request(CancelTransferRequest {
+            selector: Some(CancelTransferSelector::JobId(first)),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(cancelled.jobs.len(), 1);
+    assert_eq!(
+        cancelled.jobs[0].status,
+        TransferJobStatus::Cancelled as i32
+    );
+    assert_eq!(service.worker.list_jobs(None, None, 100).unwrap().len(), 1);
+}
+
 #[test]
 fn completed_push_reuse_is_limited_to_immutable_snapshot_artifacts() {
     let generic = PushFileRequest::default();

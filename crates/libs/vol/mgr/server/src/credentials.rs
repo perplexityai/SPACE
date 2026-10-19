@@ -19,7 +19,9 @@
 //! store and the filesystem layer respectively, not folded into a
 //! single "encryption" type here.
 
-use pplx_space_common_core::types::{KekProvider, MasterKeyIdentifier, OrgId, SubjectId};
+use pplx_space_common_core::types::{
+    KekProvider, MasterKeyIdentifier, OrgId, StorageUri, SubjectId,
+};
 use pplx_space_credmgr_client::{
     AWS_CREDENTIALS_TOKEN_TYPE, STORAGE_READ_SCOPE, STORAGE_SESSION_TTL_SECONDS,
     STORAGE_TOKEN_AUDIENCE, STORAGE_WRITE_SCOPE, SUBJECT_ID_TOKEN_TYPE, TOKEN_EXCHANGE_GRANT_TYPE,
@@ -60,23 +62,55 @@ pub async fn exchange_credentials(
     } else {
         format!("arn:aws:s3:::{bucket}/{key}")
     };
+    request_credentials(storage_request(resource, subject, access)).await
+}
+
+pub async fn exchange_copy_credentials(
+    source: &StorageUri,
+    destination: &StorageUri,
+    subject: &SubjectId,
+) -> Result<ObjectCredentials, Status> {
+    let mut request = storage_request(
+        format!(
+            "arn:aws:s3:::{}/{}",
+            destination.bucket, destination.key_prefix
+        ),
+        subject,
+        StorageAccess::ReadWrite,
+    );
+    request.copy_source_resource = Some(format!(
+        "arn:aws:s3:::{}/{}",
+        source.bucket, source.key_prefix
+    ));
+    request_credentials(request).await
+}
+
+fn storage_request(
+    resource: String,
+    subject: &SubjectId,
+    access: StorageAccess,
+) -> ExchangeTokenRequest {
+    ExchangeTokenRequest {
+        grant_type: TOKEN_EXCHANGE_GRANT_TYPE.to_string(),
+        resource,
+        audience: Some(STORAGE_TOKEN_AUDIENCE.to_string()),
+        scope: Some(access.scope()),
+        requested_token_type: AWS_CREDENTIALS_TOKEN_TYPE.to_string(),
+        subject_token: Some(subject.to_string()),
+        subject_token_type: Some(SUBJECT_ID_TOKEN_TYPE.to_string()),
+        actor_token: None,
+        actor_token_type: None,
+        requested_expires_in: Some(STORAGE_SESSION_TTL_SECONDS),
+        copy_source_resource: None,
+    }
+}
+
+async fn request_credentials(request: ExchangeTokenRequest) -> Result<ObjectCredentials, Status> {
     let mut client = pplx_space_credmgr_client::connect_from_env()
         .await
         .map_err(|e| Status::internal(format!("credmgr connect failed: {e}")))?;
     let mut resp = client
-        .exchange_token(ExchangeTokenRequest {
-            grant_type: TOKEN_EXCHANGE_GRANT_TYPE.to_string(),
-            resource,
-            audience: Some(STORAGE_TOKEN_AUDIENCE.to_string()),
-            scope: Some(access.scope()),
-            requested_token_type: AWS_CREDENTIALS_TOKEN_TYPE.to_string(),
-            subject_token: Some(subject.to_string()),
-            subject_token_type: Some(SUBJECT_ID_TOKEN_TYPE.to_string()),
-            actor_token: None,
-            actor_token_type: None,
-            requested_expires_in: Some(STORAGE_SESSION_TTL_SECONDS),
-            copy_source_resource: None,
-        })
+        .exchange_token(request)
         .await
         .map_err(|e| Status::internal(format!("credmgr exchange_token failed: {e}")))?
         .into_inner();

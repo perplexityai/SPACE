@@ -41,6 +41,30 @@ more backpressure; an in-flight streaming upload never spills to a temporary
 file when the budget fills. Changing modes requires restart and the existing
 drain/cancel handoff.
 
+## Server-side object copies
+
+Volume-manager's `SubmitCopyObject` registers a durable, sandbox-scoped copy
+job in the existing queue. `GetTransferJob` / `WaitTransferJob` observe it;
+`CancelTransfer` can cancel it by job ID. Copies have their own bounded kind
+concurrency, using the push-concurrency setting, and need no codec slot or
+worker-local payload file. Live equivalent submissions join the same job;
+a submission after completion rechecks the object instead of trusting a
+destination retention may have removed.
+
+The source and destination must be distinct objects in the same bucket,
+region, endpoint, and addressing mode. Credential exchange grants source read
+and destination read/write independently. The backend copies the encoded bytes
+unchanged, choosing its existing single or multipart copy path, then the worker
+verifies the destination length. Reported copy bytes are stored object bytes,
+not logical decompressed bytes or worker network traffic. There is no implicit
+download/upload fallback. The caller retains source ownership and publishes
+artifact metadata only after the copy succeeds; cancellation does not delete
+a possibly completed destination out from under that owner.
+
+Deploy the credential authority and forwarding agents before copy consumers,
+and volume-manager before sandbox-manager begins submitting copies. Roll back
+consumers first. Existing transfers do not submit copy jobs.
+
 ## Memory and scheduling
 
 One service-owned budget caps retained part allocations at the configured
