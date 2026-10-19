@@ -359,21 +359,11 @@ def _run_all(
 
     scenarios, telemetry_error = _apply_telemetry_mode(scenarios, services)
     if not scenarios:
-        print(
-            f"ERROR: no smoke scenarios apply to {selection} on a bench in this "
-            "telemetry mode.",
-            file=sys.stderr,
-        )
-        return 2
+        return _mode_emptied(selection, "telemetry mode", shard)
     scenarios, storage_error = _apply_storage_credentials(scenarios, services)
     telemetry_error = telemetry_error or storage_error
     if not scenarios:
-        print(
-            f"ERROR: no smoke scenarios apply to {selection} on a bench in this "
-            "storage credentials mode.",
-            file=sys.stderr,
-        )
-        return 2
+        return _mode_emptied(selection, "storage credentials mode", shard, telemetry_error)
 
     environment = dict(os.environ)
     if environment.get("SPACE_SMOKE_BACKEND", "kind") == "kind":
@@ -404,6 +394,35 @@ def _run_all(
         if exit_code in (0, 42):
             exit_code = 2
     return exit_code
+
+
+def _mode_emptied(
+    selection: str, mode: str, shard: tuple[int, int] | None, error: str | None = None
+) -> int:
+    """Exit status for a selection that a bench-mode filter left with nothing to run.
+
+    Unsharded (or as the only shard), that's an error: nothing in the
+    selection applies to this bench.
+    A shard is one slice of the inventory, and the balancer can give a long
+    mode-specific scenario a shard of its own, so on a bench in another mode
+    that slice is empty while the other shards still cover everything that
+    applies. Each skipped scenario has already been printed as SKIPPED. An
+    earlier mode filter's error (the bench not running a mode the runner asked
+    for) still fails the run.
+    """
+
+    if error is not None:
+        print(f"ERROR: {error}", file=sys.stderr)
+        return 2
+    if shard is None or shard[1] == 1:
+        print(
+            f"ERROR: no smoke scenarios apply to {selection} on a bench in this {mode}.",
+            file=sys.stderr,
+        )
+        return 2
+    index, count = shard
+    print(f"SHARD {index}/{count}: nothing in it applies to this bench's modes; nothing to run")
+    return 0
 
 
 def _apply_telemetry_mode(

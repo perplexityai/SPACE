@@ -58,6 +58,9 @@ _DURATION_SECONDS = {
         # and cleanup: 23.5 s.
         "local.fork_suspended_cross_node": 25,
         "local.gentle_drain_leaves_sandbox_resident": 39,
+        # Two manual Kind runs in otel mode measured about 27 and 28 minutes:
+        # two liveness-budget windows, one of them with the apiserver down.
+        "local.leader_election_brownout_keeps_one_leader": 1680,
         "local.node_ctl_fence_refuses_and_reconciles": 18,
         "local.node_group_boundary_schedules": 42,
         "local.node_selector_extras_render_and_enforce": 65,

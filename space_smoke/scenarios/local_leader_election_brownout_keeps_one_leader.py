@@ -3,11 +3,13 @@
 import space_smoke as smoke
 
 
-# Opt-in, as the shell suite it replaces was: it waits out the controller's
-# liveness budget twice, once with a refused contender and once with the
-# control-plane apiserver deliberately down. Both faults are captured and
-# undone by this run; the Kind mutation Lease keeps cooperating smokes off the
-# cluster meanwhile. See space_smoke/leader_election.py for what is read where.
+# Runs in the implicit inventory, so Kind CI exercises it on every push to
+# main and on every PR that Kind pull CI's path filter selects. It waits out the
+# controller's liveness budget twice, once with a refused contender and once
+# with the control-plane apiserver deliberately down. Both faults are captured
+# and undone by this run; the Kind mutation Lease keeps cooperating smokes off
+# the cluster meanwhile. See space_smoke/leader_election.py for what is read
+# where.
 @smoke.scenario(
     "local.leader_election_brownout_keeps_one_leader",
     required_tools=("kubectl", "docker"),
@@ -15,10 +17,6 @@ import space_smoke as smoke
     # timeout while the apiserver is down.
     sandbox=smoke.SandboxConfig(timeout=3600),
     telemetry_mode="otel",
-    ignored=(
-        "opt-in: about 30 minutes, 13 of them with the Kind apiserver down; "
-        "run it by name"
-    ),
     # Two liveness-budget ceilings (750 s each) are inherent; the fixture's
     # 30 minutes leave no room for setup, recovery and teardown.
     timeout_minutes=45,

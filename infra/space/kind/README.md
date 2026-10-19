@@ -123,12 +123,18 @@ workflow change; shorter setup steps alone do not prove a faster critical path.
 
 `scripts/tests/smoke-kind-typed.sh all INDEX/COUNT` partitions the eligible ECW
 and native inventories independently, after the normal backend, template, and
-quarantine filters. `space_smoke/sharding.py` assigns longest scenarios first
-to the least-loaded partition, with stable ID/index tie-breaking, then executes
-each partition in ID order. Unsharded runs keep their existing order.
+quarantine filters. The telemetry and storage credentials mode filters read the
+bench and run after partitioning, so on a bench in another mode a shard can be
+left with nothing to run; it prints its skips, says so and exits 0. A runner
+that names a mode the bench doesn't run (CI names `otel`) filters nothing, so
+any shard holding a scenario that declares a mode of that kind fails instead.
+`space_smoke/sharding.py` assigns longest scenarios first to the
+least-loaded partition, with stable ID/index tie-breaking, then executes each
+partition in ID order. Unsharded runs keep their existing order.
 
 The duration hints are rounded scenario wall times (including fixture setup and
-cleanup) from [a successful Kind run](https://github.com/perplexityai/SPACE/actions/runs/36102493553).
+cleanup) from [a successful Kind run](https://github.com/perplexityai/SPACE/actions/runs/36102493553),
+except where a hint's own comment names another source.
 To refresh them, measure matching `=== RUN` / `=== END` timestamps separately
 for each API surface across all shards of a successful run. They are scheduling
 hints only: new or renamed scenarios receive a 30-second estimate and still run;
@@ -1212,11 +1218,12 @@ load-balanced entry, scaled on load.
   wait for the Job and bootstrap waits for it before applying the API.
 - **cluster-controller** runs two replicas with leader election on: the Lease
   holder runs every reconciler and the other stands by, Ready, to take over.
-  The opt-in typed scenario
-  `local.leader_election_brownout_keeps_one_leader` exercises the handoff
-  (about 30 minutes in `otel` mode; run it by name with
+  The typed scenario `local.leader_election_brownout_keeps_one_leader`
+  exercises the handoff. It needs `otel` mode. It takes about 30 minutes, so
+  Kind CI's duration-balanced sharding gives it one shard's ECW pass to itself;
+  that shard's native pass runs after it. Run it alone with
   `uv run --frozen --python 3.11 -m space_smoke run
-  local.leader_election_brownout_keeps_one_leader`).
+  local.leader_election_brownout_keeps_one_leader`.
 - **internal-api** (ClusterApi) runs two replicas behind its ClusterIP
   Service and rolls one at a time. It needs no election: its state is in
   Postgres, written under row locks and claim tokens, its RPCs are unary, and
@@ -1861,10 +1868,11 @@ published templates.
 ## Smoke test
 
 Main CI builds the Kind Rust artifact image once and hands that exact image to
-two isolated runners. Each runner brings up its own Kind/Firecracker stack,
-runs the baseline smoke, then runs one half of the eligible ECW and native
-inventories. Scenarios remain serial within each shard because some mutate
-cluster-wide state. Both shards must pass for `space-ci` to pass.
+four isolated runners. Each runner brings up its own Kind/Firecracker stack,
+runs the baseline smoke, then runs one of four duration-balanced partitions of
+the eligible ECW and native inventories. Scenarios remain serial within each
+shard because some mutate cluster-wide state. Every shard must pass for
+`space-ci` to pass.
 
 The CI-only `SPACE_KIND_RUST_ARTIFACTS=prebuilt` mode checks both
 `SPACE_KIND_PREBUILT_RUST_SHA` against the checkout and
@@ -1872,13 +1880,17 @@ The CI-only `SPACE_KIND_RUST_ARTIFACTS=prebuilt` mode checks both
 or mismatched artifact fails rather than falling back to compilation. Local
 build defaults are unchanged.
 
-To reproduce a shard, use `scripts/tests/smoke-kind-typed.sh all 1/2` (or `2/2`)
-with the same admin-token setup as a full `all` run. The direct CLI equivalent
-is `python -m space_smoke run --all --shard 1/2` for the selected API surface.
-Shards partition sorted eligible scenario IDs after backend, surface, template,
-and quarantine filtering; run every shard from the same checkout. Never run
-shards concurrently against the same cluster. Without a shard argument, the
-full inventory and its existing ordering are unchanged.
+To reproduce a shard, use `scripts/tests/smoke-kind-typed.sh all 1/4` (through
+`4/4`) with the same admin-token setup as a full `all` run, on a bench brought
+up with `SPACE_KIND_TELEMETRY_MODE=otel` and that variable still set, as CI
+does. With the variable set, a bench in another mode fails any shard holding a
+scenario that declares a telemetry mode, the brownout's included; without it,
+each such shard skips those scenarios and can pass. The direct CLI equivalent
+is `python -m space_smoke run --all --shard 1/4` for the selected API surface.
+Shards partition the eligible scenarios by duration hint, as described above;
+run every shard from the same checkout. Never run shards concurrently against
+the same cluster. Without a shard argument, the full inventory and its existing
+ordering are unchanged.
 
 Several smokes target this cluster:
 
