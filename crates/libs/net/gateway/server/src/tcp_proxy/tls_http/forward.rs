@@ -13,9 +13,13 @@ where
     Fut: Future<Output = Result<(U, HttpProtocol), upstream::Error>> + Send + 'static,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    pub(super) async fn forward(&self, mut request: SanitizedRequest<Incoming>) -> Response<Body> {
+    pub(super) async fn forward(
+        &self,
+        mut request: SanitizedRequest<Incoming>,
+        observation: &mut request::Request,
+    ) -> Reply {
         if request.method() == http::Method::CONNECT {
-            return self.connect_request(request).await;
+            return self.connect_request(request, observation).await;
         }
 
         let protocol = HttpProtocol::of(request.version());
@@ -38,6 +42,10 @@ where
         let credential_bearing = match credential_headers(&self.lease, &request) {
             Ok(headers) => !headers.is_empty(),
             Err(error) => {
+                // Lease invalidation cancels the request before injection is attempted.
+                if error != NetworkCredentialAccessError::Stale {
+                    observation.injection(request::Injection::Failed);
+                }
                 authorization.finish(initial_credential_outcome(error), error.as_str());
                 return self.refuse(protocol, error.as_str(), error.status());
             }
@@ -57,7 +65,7 @@ where
         }
         let upgrade = handshake.map(|handshake| (handshake, request.on_upgrade()));
         let mut forwarding = Attempt::forwarding(protocol.as_str(), "request");
-        let response = match self.dispatch(request, &mut forwarding).await {
+        let response = match self.dispatch(request, &mut forwarding, observation).await {
             Ok(response) => response,
             Err(response) => return *response,
         };
@@ -83,18 +91,19 @@ where
                         self.shutdown.clone(),
                         protocol.as_str(),
                         upgrade::Kind::WebSocket,
+                        self.observation.clone(),
                     )
                     .in_current_span(),
                 );
                 forwarding.finish(Outcome::Success, "response_headers");
-                response.map(|_| Either::Right(Empty::new()))
+                Reply::upstream(response.map(|_| Either::Right(Empty::new())))
             }
             response if response.status() != StatusCode::SWITCHING_PROTOCOLS => {
                 Self::record(protocol, "allowed", response.status());
                 forwarding.finish(Outcome::Success, "response_headers");
-                response.map(|body| {
+                Reply::upstream(response.map(|body| {
                     Either::Left(Self::forwarding_body(protocol, body, "response_body"))
-                })
+                }))
             }
             _ => {
                 forwarding.finish(Outcome::Error, "unexpected_upgrade");
@@ -108,13 +117,16 @@ where
         &self,
         mut request: SanitizedRequest<Incoming>,
         forwarding: &mut Attempt,
-    ) -> Result<Response<Incoming>, Box<Response<Body>>> {
+        observation: &mut request::Request,
+    ) -> Result<Response<Incoming>, Box<Reply>> {
         let protocol = HttpProtocol::of(request.version());
         let connect = request.method() == http::Method::CONNECT;
         let refuse = |reason, status| Box::new(self.refuse(protocol, reason, status));
+        observation.phase(Phase::UpstreamConnect);
         let sender = match self.upstream.sender(protocol).await {
             Ok(sender) => sender,
             Err(error) => {
+                observation.failure(Phase::RequestHeaders, Side::Upstream, error.as_ref());
                 forwarding.finish(Outcome::Error, "origin_setup");
                 error.record(if connect {
                     "connect_proxy_setup"
@@ -124,9 +136,11 @@ where
                 return Err(refuse(error.as_str(), StatusCode::BAD_GATEWAY));
             }
         };
+        observation.phase(Phase::RequestHeaders);
         let sender = match sender.ready().await {
             Ok(sender) => sender,
             Err(error) => {
+                observation.failure(Phase::RequestHeaders, Side::Upstream, &error);
                 if !connect {
                     forwarding.finish(Outcome::Error, "upstream_http");
                     self.draining.cancel();
@@ -154,20 +168,32 @@ where
             let headers = match credential_headers(&self.lease, &request) {
                 Ok(headers) => headers,
                 Err(error) => {
+                    // Lease invalidation cancels the request before injection is attempted.
+                    if error != NetworkCredentialAccessError::Stale {
+                        observation.injection(request::Injection::Failed);
+                    }
                     forwarding.finish(Outcome::Cancelled, error.as_str());
                     return Err(refuse(error.as_str(), error.status()));
                 }
             };
+            if !headers.is_empty() {
+                observation.injection(request::Injection::Injected);
+            }
             inject(&mut request, headers);
             if sender.is_http1() {
                 translate_to_http1(&mut request);
             }
         }
-        let request =
-            request.map(|body| Either::Left(Self::forwarding_body(protocol, body, "request_body")));
+        let request = request.map(|body| {
+            let mut body = Self::forwarding_body(protocol, body, "request_body");
+            body.upload = Some(observation.observer());
+            Either::Left(body)
+        });
+        observation.phase(Phase::ResponseHeaders);
         match sender.send(request).await {
             Ok(response) => Ok(response),
             Err(error) => {
+                observation.failure(Phase::ResponseHeaders, Side::Upstream, &error);
                 forwarding.finish(Outcome::Error, "upstream_http");
                 if !connect {
                     self.draining.cancel();

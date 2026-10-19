@@ -12,6 +12,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::Instrument;
 
 use super::accounting::{Attempt, Outcome};
+use super::observation::{Close, Connection, Phase, Side};
 use super::transport;
 use crate::certificates::{CertificateError, CertificateLease};
 use crate::tls_interception::{
@@ -164,6 +165,7 @@ pub(super) async fn accept<S>(
     stream: S,
     lease: &CertificateLease,
     interception: &TlsInterception,
+    observation: Connection,
 ) -> Result<(TlsIo<tokio_rustls::server::TlsStream<S>>, HttpAlpn), TlsTransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -199,12 +201,19 @@ where
         }
         let protocol = negotiated(downstream.get_ref().1.alpn_protocol())?;
         Ok((
-            TlsIo::new(downstream, TlsHandshakeLeg::ClientToNetgw),
+            TlsIo::new(
+                downstream,
+                TlsHandshakeLeg::ClientToNetgw,
+                observation.clone(),
+            ),
             protocol,
         ))
     }
     .await;
     attempt.finish(&result);
+    if let Err(error) = &result {
+        observation.failure(Phase::DownstreamTls, Some(Side::Downstream), error);
+    }
     result
 }
 
@@ -216,11 +225,14 @@ pub(super) async fn connect<S>(
     lease: &CertificateLease,
     interception: &TlsInterception,
     client_alpn: ClientAlpnOffer,
+    observation: Connection,
 ) -> Result<(TlsIo<tokio_rustls::client::TlsStream<S>>, HttpAlpn), TlsTransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    async {
+    let mut phase = Phase::UpstreamConnect;
+    observation.phase(phase);
+    let result = async {
         let deadline = tokio::time::Instant::now() + HANDSHAKE_BUDGET;
         let _permit =
             admit_handshake(interception, TlsHandshakeLeg::NetgwToOrigin, deadline).await?;
@@ -261,6 +273,8 @@ where
         }
         let stream = stream?;
 
+        phase = Phase::UpstreamTls;
+        observation.phase(phase);
         let mut attempt = HandshakeAttempt::new(TlsHandshakeLeg::NetgwToOrigin);
         let result = match tokio::time::timeout_at(deadline, async {
             let name = ServerName::try_from(lease.host().as_str().to_owned())
@@ -277,7 +291,11 @@ where
             }
             tracing::Span::current().record("otel.status_code", "OK");
             Ok((
-                TlsIo::new(upstream, TlsHandshakeLeg::NetgwToOrigin),
+                TlsIo::new(
+                    upstream,
+                    TlsHandshakeLeg::NetgwToOrigin,
+                    observation.clone(),
+                ),
                 upstream_protocol,
             ))
         })
@@ -290,7 +308,19 @@ where
         result
     }
     .instrument(upstream_span(lease.host(), lease.port()))
-    .await
+    .await;
+    if let Err(error) = &result {
+        if matches!(
+            error,
+            TlsTransportError::Invalidated | TlsTransportError::Withdrawn
+        ) {
+            observation.closed(Side::Upstream, Close::Local);
+        } else {
+            observation.failure(phase, Some(Side::Upstream), error);
+        }
+    }
+    observation.phase(Phase::Http);
+    result
 }
 
 /// Admit one handshake into the shared pool. A queued admission is recorded on
@@ -473,14 +503,23 @@ pub(super) struct TlsIo<T> {
     inner: T,
     leg: TlsHandshakeLeg,
     error_reported: bool,
+    observation: Connection,
 }
 
 impl<T> TlsIo<T> {
-    fn new(inner: T, leg: TlsHandshakeLeg) -> Self {
+    fn new(inner: T, leg: TlsHandshakeLeg, observation: Connection) -> Self {
         Self {
             inner,
             leg,
             error_reported: false,
+            observation,
+        }
+    }
+
+    fn side(&self) -> Side {
+        match self.leg {
+            TlsHandshakeLeg::ClientToNetgw => Side::Downstream,
+            TlsHandshakeLeg::NetgwToOrigin => Side::Upstream,
         }
     }
 
@@ -488,6 +527,8 @@ impl<T> TlsIo<T> {
         if self.error_reported {
             return;
         }
+        self.observation
+            .failure(self.observation.current_phase(), Some(self.side()), error);
         let failure = TlsFailure::new("io");
         self.error_reported = true;
         pplx_space_metrics::gateway::tls_connection_error(self.leg.as_str(), failure.reason);
@@ -511,7 +552,12 @@ impl<T: AsyncRead + Unpin> AsyncRead for TlsIo<T> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let has_capacity = buf.remaining() != 0;
         let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(result, Poll::Ready(Ok(()))) && has_capacity && buf.filled().len() == before {
+            self.observation.closed(self.side(), Close::Remote);
+        }
         if let Poll::Ready(Err(error)) = &result {
             self.record_error("read", error);
         }

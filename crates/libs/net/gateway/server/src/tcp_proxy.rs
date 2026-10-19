@@ -34,6 +34,8 @@ mod accounting;
 mod admission;
 mod http_host;
 mod inspected;
+mod observation;
+use observation::{Close, Connection, Phase, Side};
 mod relay;
 mod reserved_dns;
 mod routing_headers;
@@ -364,6 +366,7 @@ impl TcpProxy {
 
         self.stats.tcp_active.fetch_add(1, Ordering::Relaxed);
         let shutdown = self.shutdown_token.child_token();
+        let observation = Connection::default();
         // Biased, with the connection polled first: on shutdown both arms are
         // ready, and an unbiased select would pick between them at random, so
         // the same event could report either this generic cancellation or the
@@ -372,10 +375,10 @@ impl TcpProxy {
         // cancellation itself.
         let (host, outcome) = tokio::select! {
             biased;
-            outcome = self.handle(client, dst, &shutdown) => outcome,
+            outcome = self.handle(client, dst, &shutdown, &observation) => outcome,
             _ = shutdown.cancelled() => (None, FlowOutcome::Cancelled),
         };
-        self.record(dst, host.as_ref(), outcome);
+        self.record(dst, host.as_ref(), outcome, &observation);
         self.stats.tcp_active.fetch_sub(1, Ordering::Relaxed);
     }
 
@@ -384,9 +387,11 @@ impl TcpProxy {
         client: TcpStream,
         dst: SocketAddr,
         shutdown: &CancellationToken,
+        observation: &Connection,
     ) -> (Option<DomainName>, FlowOutcome) {
         abort_on_close(&client);
         if let Some(resolver) = self.reserved_dns.resolver_for(dst.ip()) {
+            observation.phase(Phase::ReservedDns);
             // Take the cancellation token before reading policy. A concurrent
             // install therefore either cancels this connection or precedes
             // the policy snapshot used below.
@@ -434,18 +439,19 @@ impl TcpProxy {
         // still gets one bounded, non-consuming peek so its diagnostic can
         // identify a configured TLS destination.
         let missing_client_hello = self.missing_client_hello(dst, &policy);
-        let observation = sniff::client_hello_with_detail(&client, missing_client_hello).await;
-        let peek_elapsed = observation.elapsed;
-        let scan = observation.scan;
-        let client_alpn = observation.client_alpn;
-        let missing_sni_detail = observation.missing_sni_detail;
+        observation.phase(Phase::ClientHello);
+        let peek = sniff::client_hello_with_detail(&client, missing_client_hello).await;
+        let peek_elapsed = peek.elapsed;
+        let scan = peek.scan;
+        let client_alpn = peek.client_alpn;
+        let missing_sni_detail = peek.missing_sni_detail;
         sniff::record(
             self.sandbox_id,
             dst,
             &scan,
             client_alpn,
             missing_sni_detail,
-            observation.elapsed,
+            peek.elapsed,
             &self.debug_state,
         );
         let host = scan.server_name().cloned();
@@ -453,6 +459,7 @@ impl TcpProxy {
         let policy = match policy {
             TrafficPolicy::Ready(policy) => policy,
             TrafficPolicy::NotReady(reason) => {
+                observation.phase(Phase::Policy);
                 // Reserve `denied` for an admission decision. Policy readiness failures never
                 // reached evaluation; only lifecycle shutdown is cancellation.
                 let outcome =
@@ -469,6 +476,7 @@ impl TcpProxy {
             }
         };
 
+        observation.phase(Phase::Admission);
         let admitted = match self.admit(dst, &scan, &policy) {
             Ok(admitted) => admitted,
             Err(reason) => {
@@ -500,6 +508,7 @@ impl TcpProxy {
         }
         self.stats.tcp_total.fetch_add(1, Ordering::Relaxed);
 
+        observation.phase(Phase::Certificate);
         let action = match self
             .tls_interception
             .before_relay(interception_mode, &scan, missing_sni_detail, dst.port())
@@ -530,12 +539,12 @@ impl TcpProxy {
                     pplx_space_net_common::TlsInterception::On => "plaintext",
                 };
                 inspection.finish(accounting::Outcome::Skipped, reason);
-                self.relay(client, admitted).await
+                self.relay(client, admitted, observation).await
             }
             crate::tls_interception::InterceptionAction::Terminate(lease) => {
                 inspection.finish(accounting::Outcome::Success, "admitted");
                 match self
-                    .terminate_tls(client, admitted, lease, client_alpn)
+                    .terminate_tls(client, admitted, lease, client_alpn, observation.clone())
                     .await
                 {
                     Ok(()) => FlowOutcome::InspectedTls,
@@ -571,22 +580,37 @@ impl TcpProxy {
         }
     }
 
-    async fn relay(&self, client: TcpStream, admitted: AdmittedTcp) -> FlowOutcome {
+    async fn relay(
+        &self,
+        client: TcpStream,
+        admitted: AdmittedTcp,
+        observation: &Connection,
+    ) -> FlowOutcome {
         match admitted {
-            AdmittedTcp::Tunnel(destination) => self.pass_through(client, destination).await,
+            AdmittedTcp::Tunnel(destination) => {
+                self.pass_through(client, destination, observation).await
+            }
             AdmittedTcp::HostBoundHttp(destination) => {
-                self.host_bound_http(client, destination, transport::connect)
+                self.host_bound_http(client, destination, transport::connect, observation.clone())
                     .await
             }
         }
     }
 
-    async fn pass_through(&self, client: TcpStream, dst: SocketAddr) -> FlowOutcome {
+    async fn pass_through(
+        &self,
+        client: TcpStream,
+        dst: SocketAddr,
+        observation: &Connection,
+    ) -> FlowOutcome {
+        observation.phase(Phase::UpstreamConnect);
         let upstream = match transport::connect(dst).await {
             Ok(upstream) => upstream,
             Err(error) => return FlowOutcome::RelayFailed(RelayFailure::Connect(error)),
         };
+        observation.phase(Phase::Relay);
         let report = relay::run(client, upstream, &self.shutdown_token, None).await;
+        report.observe(observation);
         match report.result {
             Ok(()) => FlowOutcome::Relayed(Relay::Tunnelled {
                 wire_tx: report.written.0,
@@ -602,14 +626,16 @@ impl TcpProxy {
         client: TcpStream,
         dst: SocketAddr,
         connect: F,
+        observation: Connection,
     ) -> FlowOutcome
     where
         F: FnOnce(SocketAddr) -> Fut + Send + 'static,
         Fut: Future<Output = Result<U, transport::Error>> + Send + 'static,
         U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        observation.phase(Phase::HttpHeaders);
         let binding = http_host::HostBinding::new(self.sandbox_id, dst, self.network_state.clone());
-        match http_host::serve(client, binding, connect).await {
+        match http_host::serve(client, binding, connect, observation).await {
             Ok(served) => FlowOutcome::Relayed(Relay::HostBoundHttp {
                 requests: served.requests,
                 forwarded: served.forwarded,
@@ -622,9 +648,53 @@ impl TcpProxy {
         }
     }
 
-    fn record(&self, dst: SocketAddr, host: Option<&DomainName>, outcome: FlowOutcome) -> bool {
+    fn record(
+        &self,
+        dst: SocketAddr,
+        host: Option<&DomainName>,
+        outcome: FlowOutcome,
+        observation: &Connection,
+    ) -> bool {
+        match &outcome {
+            FlowOutcome::Rejected(Rejection::TlsInterception(error)) => {
+                observation.note_failure(observation::Facts {
+                    phase: Phase::Certificate,
+                    side: Some(Side::Downstream),
+                    close: Some(Close::Local),
+                    error: observation::NativeError::from_error(error),
+                });
+            }
+            FlowOutcome::RelayFailed(RelayFailure::Inspected(tls_http::HttpError::Transport(
+                tls::TlsTransportError::Invalidated | tls::TlsTransportError::Withdrawn,
+            ))) => observation.closed(Side::Downstream, Close::Local),
+            FlowOutcome::Rejected(_) | FlowOutcome::Cancelled => {
+                observation.closed(Side::Downstream, Close::Local)
+            }
+            FlowOutcome::RelayFailed(RelayFailure::Connect(error)) => {
+                observation.failure(Phase::UpstreamConnect, Some(Side::Upstream), error)
+            }
+            FlowOutcome::RelayFailed(RelayFailure::Transfer(error)) => {
+                observation.failure(observation.current_phase(), None, error)
+            }
+            FlowOutcome::RelayFailed(RelayFailure::Plaintext(error)) => {
+                observation.failure(Phase::Http, None, error)
+            }
+            FlowOutcome::RelayFailed(RelayFailure::Inspected(error)) => {
+                observation.failure(observation.current_phase(), None, error)
+            }
+            _ => {}
+        }
+
         let (status, detail) = outcome.metric_tags();
-        pplx_space_metrics::gateway::tcp_connection(status, detail);
+        observation.record(
+            self.sandbox_id,
+            status,
+            detail,
+            matches!(
+                &outcome,
+                FlowOutcome::Rejected(_) | FlowOutcome::RelayFailed(_)
+            ),
+        );
         let reported = if let (Some(host), Some(reason)) = (host, outcome.failure_reason()) {
             self.known_egress_state
                 .report_tcp_failure(self.sandbox_id, dst, host, reason.as_ref())

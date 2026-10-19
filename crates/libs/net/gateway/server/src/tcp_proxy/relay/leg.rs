@@ -21,7 +21,7 @@ pub(in crate::tcp_proxy) enum Side {
 }
 
 impl Side {
-    const fn as_str(self) -> &'static str {
+    pub(in crate::tcp_proxy) const fn as_str(self) -> &'static str {
         match self {
             Self::Guest => "guest",
             Self::Origin => "origin",
@@ -45,7 +45,6 @@ pub(in crate::tcp_proxy) struct RelayFault {
 }
 
 impl RelayFault {
-    #[cfg(test)]
     pub(in crate::tcp_proxy) const fn side(self) -> Side {
         self.side
     }
@@ -82,10 +81,10 @@ impl RelayWitness {
         self.fault.get().copied()
     }
 
-    /// `none` until one peer reaches end-of-stream, so a relay torn down by
+    /// `None` until one peer reaches end-of-stream, so a relay torn down by
     /// shutdown is not misreported as a peer-initiated close.
-    pub(in crate::tcp_proxy) fn closed_by(&self) -> &'static str {
-        self.closed_by.get().map_or("none", |side| side.as_str())
+    pub(in crate::tcp_proxy) fn closed_by(&self) -> Option<Side> {
+        self.closed_by.get().copied()
     }
 
     pub(in crate::tcp_proxy) fn bytes(&self) -> (u64, u64) {

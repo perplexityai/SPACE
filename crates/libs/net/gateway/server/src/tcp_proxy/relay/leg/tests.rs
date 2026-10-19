@@ -57,7 +57,7 @@ async fn relay_attributes_a_failure_to_the_peer_that_produced_it() {
         assert_eq!(fault.side(), expected, "{name}: wrong peer blamed");
         assert_eq!(
             witness.closed_by(),
-            "none",
+            None,
             "{name}: a failure is not an orderly close"
         );
     }
@@ -95,7 +95,7 @@ async fn relay_records_the_peer_that_closed_first_and_the_bytes_it_sent() {
         b"hello",
         "the relay must forward the guest payload"
     );
-    assert_eq!(witness.closed_by(), "guest");
+    assert_eq!(witness.closed_by(), Some(Side::Guest));
     assert!(witness.fault().is_none(), "an orderly close is not a fault");
     let (guest_bytes, origin_bytes) = witness.bytes();
     assert_eq!(guest_bytes, 5, "bytes the guest sent");

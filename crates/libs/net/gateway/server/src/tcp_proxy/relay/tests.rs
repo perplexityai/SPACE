@@ -20,7 +20,7 @@ async fn a_half_close_still_allows_the_reverse_direction_to_finish() {
     let report = relay.await.unwrap();
     report.result.unwrap();
     assert_eq!(report.written, (7, 8));
-    assert_eq!(report.first_eof, "guest");
+    assert_eq!(report.first_eof, Some(leg::Side::Guest));
 }
 
 #[tokio::test]
@@ -41,6 +41,6 @@ async fn cancellation_retains_partial_writes_without_counting_buffered_bytes_as_
     assert_eq!(received, [42; 4]);
     assert_eq!(report.read.0, 64);
     assert!((4..=8).contains(&report.written.0));
-    assert_eq!(report.first_eof, "none");
+    assert_eq!(report.first_eof, None);
     assert!(report.fault.is_none());
 }

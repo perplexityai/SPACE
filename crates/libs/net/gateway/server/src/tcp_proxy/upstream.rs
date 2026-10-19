@@ -1,4 +1,5 @@
 //! One lazy origin connection per downstream connection. Waiters never own setup.
+use super::observation::{Connection, Phase, Side};
 use super::{
     routing_headers::{SanitizedBody, SanitizedRequest},
     tls::TlsTransportError,
@@ -125,6 +126,7 @@ pub(super) struct Upstream<F, B> {
     tasks: TaskTracker,
     shutdown: CancellationToken,
     draining: CancellationToken,
+    observation: Connection,
 }
 
 impl<F, B> Upstream<F, B> {
@@ -132,6 +134,7 @@ impl<F, B> Upstream<F, B> {
         connect: F,
         shutdown: CancellationToken,
         draining: CancellationToken,
+        observation: Connection,
     ) -> Self {
         Self {
             connect: StdMutex::new(Some(connect)),
@@ -139,6 +142,7 @@ impl<F, B> Upstream<F, B> {
             tasks: TaskTracker::new(),
             shutdown,
             draining,
+            observation,
         }
     }
 
@@ -181,6 +185,7 @@ where
             let tasks = self.tasks.clone();
             let shutdown = self.shutdown.clone();
             let draining = self.draining.clone();
+            let observation = self.observation.clone();
             self.tasks.spawn(async move {
                 let failed = draining.clone().drop_guard();
                 let setup = tokio::select! {
@@ -192,17 +197,23 @@ where
                         match protocol {
                             HttpProtocol::Http1 => {
                                 let (sender, connection) = http1::Builder::new().max_headers(MAX_HEADERS).handshake(io).await?;
-                                drive(&tasks, shutdown.clone(), connection.with_upgrades());
+                                drive(&tasks, shutdown.clone(), observation.clone(), connection.with_upgrades());
                                 Ok(Sender::Http1(Mutex::new(sender)))
                             }
                             HttpProtocol::Http2 => {
                                 let (sender, connection) = http2::Builder::new(TokioExecutor::new()).max_header_list_size(MAX_HEADER_BYTES).max_send_buf_size(64 * 1024).handshake(io).await?;
-                                drive(&tasks, shutdown.clone(), connection);
+                                drive(&tasks, shutdown.clone(), observation.clone(), connection);
                                 Ok(Sender::Http2(sender))
                             }
                         }
                     } => setup,
                 };
+                if let Err(error) = &setup
+                    && !matches!(error, Error::Cancelled | Error::Tls(TlsTransportError::Invalidated | TlsTransportError::Withdrawn))
+                {
+                    let phase = if matches!(error, Error::Connect(_)) { Phase::UpstreamConnect } else { Phase::RequestHeaders };
+                    observation.failure(phase, Some(Side::Upstream), error);
+                }
                 let success = setup.is_ok();
                 result.send_replace(Some(setup.map(Arc::new).map_err(Arc::new)));
                 if success { failed.disarm(); }
@@ -225,6 +236,7 @@ where
 fn drive(
     tasks: &TaskTracker,
     shutdown: CancellationToken,
+    observation: Connection,
     connection: impl Future<Output = Result<(), hyper::Error>> + Send + 'static,
 ) {
     tasks.spawn(async move {
@@ -232,6 +244,7 @@ fn drive(
             biased;
             () = shutdown.cancelled() => {},
             result = connection => if let Err(error) = result {
+                observation.failure(Phase::Http, Some(Side::Upstream), &error);
                 tracing::info!(stage = "upstream_http", http_reason = http_reason(&error), "origin HTTP connection ended");
             }
         }

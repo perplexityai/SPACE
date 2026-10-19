@@ -1,3 +1,61 @@
+//! Gateway connection and request observations are facts for downstream policy.
+//!
+//! `gateway.tcp.connection` has one sample at the end of each accepted handler;
+//! it does not count SYNs, listener admission waits, or still-open connections.
+//! Existing `status`/`detail` describe the terminal handler result. In particular,
+//! `relayed/inspected_tls` can contain a completed local error response or a reset
+//! HTTP/2 stream; use request outcomes and native error fields as well.
+//!
+//! The vocabulary follows [Envoy connection statistics](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_conn_man/stats):
+//! `side=downstream|upstream` identifies the observed socket, and
+//! `close=local|remote` records an explicit local termination or observed remote
+//! EOF/protocol termination. These are dimensions of Envoy's concepts, not an
+//! Envoy wire schema. First EOF does not prove which application initiated the
+//! overall teardown. An errno alone does not establish `close`; unknowns are
+//! omitted. HTTP/2 stream resets do not imply connection termination.
+//!
+//! `phase` is gateway-specific: `policy`, `client_hello`, `admission`,
+//! `certificate`, `downstream_tls`, `http_headers`, `http`, `upstream_connect`,
+//! `upstream_tls`, `request_headers`, `request_body`, `response_headers`,
+//! `response_body`, `upgrade`, `relay`, or `reserved_dns`. Established multiplexed
+//! connections use `http`; request observations identify the failing operation.
+//! A native failure retains its own phase. Otherwise an aborted request's phase
+//! or the first observed close is used. Awaiting response headers can overlap
+//! an upload; only a body error identifies `request_body` precisely.
+//!
+//! Native dimensions are separate: `errno` (OS number), `io_error` (Rust
+//! ErrorKind), `tls_alert` (rustls AlertDescription), `rustls_error` (variant),
+//! `hyper_error` (public predicate category), `http2_error_code` (registered
+//! numeric code), and `http.response.status_code` (request response).
+//! [`error.type`](https://opentelemetry.io/docs/specs/semconv/registry/attributes/error/)
+//! is the deepest recognized canonical error class, or `_OTHER`. No formatted
+//! error message is parsed. Opaque sources leave their native fields absent.
+//!
+//! `gateway.http.request` counts parsed requests on intercepted TLS connections,
+//! including CONNECT handshakes. Framing failures before a parsed request have
+//! only connection observations. Opaque passthrough/CONNECT contents have no HTTP
+//! outcomes. `completed` describes a fully produced response body (including an
+//! empty local reply), not delivery or application consumption. `aborted` means
+//! body error or drop before completion. Status and its `status_source` are
+//! absent until response headers are available. No connection-level active
+//! request count or degradation verdict is emitted.
+//!
+//! The terminal handler emits at most one `gateway_connection_failure` log,
+//! carrying `sandbox_id` and the same connection fields, for a terminal refusal
+//! or failure, an observed native error, an aborted request, or failed injection.
+//! Its `aborted_requests` and `failed_injections` counts explain the latter two
+//! cases without adding metric dimensions. Sandbox identifiers are log fields
+//! only. Correlate these events with session intervals downstream; failure-only
+//! logs cannot provide the denominator of all active sandboxes. Events arrive
+//! when the connection ends; a long-lived connection can report an earlier
+//! request failure at that later time. Request counters emit as requests end.
+//!
+//! Compare counts using the same deployment, time window and connection
+//! population. The log is emitted without application sampling, but collector
+//! filtering, indexing, metric delivery and process termination can still lose
+//! samples. Component warning logs and admission counters have different
+//! denominators and must not be summed as terminal connection failures.
+
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -544,12 +602,106 @@ pub fn tcp_in_flight(active: usize) {
 
 /// Emitted exactly once for every TCP connection that reaches the proxy's
 /// per-connection handler. `detail` is the bounded detail within `status`.
-pub fn tcp_connection(status: &str, detail: &str) {
-    counter(
-        "gateway.tcp.connection",
-        1,
-        &[tag("status", status), tag("detail", detail)],
-    );
+pub fn tcp_connection(status: &str, detail: &str, observation: &ConnectionObservation<'_>) {
+    let mut tags = vec![tag("status", status), tag("detail", detail)];
+    observation.append(&mut tags);
+    counter("gateway.tcp.connection", 1, &tags);
+}
+
+/// Native error vocabularies are separate dimensions. No messages, names of
+/// destinations, sandbox identifiers, or credentials belong in these tags.
+/// `error.type` follows OpenTelemetry; absent facts are omitted, never guessed.
+#[derive(Debug, Default)]
+pub struct NativeError<'a> {
+    pub error_type: Option<&'a str>,
+    pub io_error: Option<&'a str>,
+    pub errno: Option<i32>,
+    pub tls_alert: Option<&'a str>,
+    pub rustls_error: Option<&'a str>,
+    pub hyper_error: Option<&'a str>,
+    /// Only registered HTTP/2 codes (0..=13) are metric dimensions. Unknown
+    /// peer-supplied u32 values remain available in the connection log.
+    pub http2_error_code: Option<u32>,
+}
+
+impl NativeError<'_> {
+    fn append(&self, tags: &mut Vec<String>) {
+        for (key, value) in [
+            ("error.type", self.error_type),
+            ("io_error", self.io_error),
+            ("tls_alert", self.tls_alert),
+            ("rustls_error", self.rustls_error),
+            ("hyper_error", self.hyper_error),
+        ] {
+            if let Some(value) = value {
+                tags.push(tag(key, value));
+            }
+        }
+        if let Some(errno) = self.errno {
+            tags.push(tag("errno", errno.to_string()));
+        }
+        if let Some(code @ 0..=13) = self.http2_error_code {
+            tags.push(tag("http2_error_code", code.to_string()));
+        }
+    }
+}
+
+/// Envoy's downstream/upstream and local/remote refer to the observed leg
+/// and local/remote termination. First EOF is an observation, not proof of
+/// causal ownership. An I/O error alone does not prove who closed.
+/// `phase` is the gateway operation at the first observed failure, or at close
+/// when no failure was observed. Multiplexed HTTP uses per-request outcomes.
+#[derive(Debug)]
+pub struct ConnectionObservation<'a> {
+    pub phase: &'a str,
+    pub side: Option<&'a str>,
+    pub close: Option<&'a str>,
+    pub error: NativeError<'a>,
+}
+
+impl ConnectionObservation<'_> {
+    fn append(&self, tags: &mut Vec<String>) {
+        tags.push(tag("phase", self.phase));
+        if let Some(side) = self.side {
+            tags.push(tag("side", side));
+        }
+        if let Some(close) = self.close {
+            tags.push(tag("close", close));
+        }
+        self.error.append(tags);
+    }
+}
+
+/// One outcome per inspected HTTP request, including dropped service futures
+/// and response bodies. `completed` means the response body was fully produced
+/// for Hyper, not TCP acknowledgement or application consumption. `aborted`
+/// includes body errors and cancellation. A local 403 and an upstream 403
+/// have distinct `status_source` values; neither is graded here.
+///
+/// Injection uses [Envoy's credential-injector semantics](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/credential_injector_filter#statistics): `injected` includes
+/// replacing a header, `failed` is credential resolution failure. Its
+/// `already_exists` requires overwrite=false and is not emitted by SPACE's
+/// mandatory replacement policy. No matching injection emits no injection tag.
+pub fn http_request(
+    protocol: &str,
+    outcome: &str,
+    status: Option<u16>,
+    status_source: Option<&str>,
+    injection: Option<&str>,
+    observation: &ConnectionObservation<'_>,
+) {
+    let mut tags = vec![tag("protocol", protocol), tag("outcome", outcome)];
+    if let Some(status) = status {
+        tags.push(tag("http.response.status_code", status.to_string()));
+    }
+    if let Some(source) = status_source {
+        tags.push(tag("status_source", source));
+    }
+    if let Some(injection) = injection {
+        tags.push(tag("injection", injection));
+    }
+    observation.append(&mut tags);
+    counter("gateway.http.request", 1, &tags);
 }
 
 /// One terminal inspection-admission outcome per accepted non-DNS TCP flow.

@@ -14,6 +14,7 @@ async fn cancelling_the_first_waiter_does_not_cancel_connection_setup() {
         },
         CancellationToken::new(),
         CancellationToken::new(),
+        Connection::default(),
     ));
     let waiting = tokio::spawn({
         let upstream = upstream.clone();
@@ -44,6 +45,7 @@ async fn failed_setup_is_shared_without_retrying_or_losing_the_native_error() {
         },
         CancellationToken::new(),
         CancellationToken::new(),
+        Connection::default(),
     );
     let first = upstream.sender(HttpProtocol::Http2).await.err().unwrap();
     let second = upstream.sender(HttpProtocol::Http2).await.err().unwrap();

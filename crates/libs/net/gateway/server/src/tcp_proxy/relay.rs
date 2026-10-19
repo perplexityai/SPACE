@@ -4,6 +4,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
 
 mod leg;
+use super::observation::{Close, Connection, Phase, Side};
 pub(super) use leg::RelayFault;
 use leg::RelayWitness;
 
@@ -25,7 +26,29 @@ pub(super) struct Report {
     pub written: (u64, u64),
     pub fault: Option<RelayFault>,
     /// First observed EOF, not the initiator of a connection close.
-    pub first_eof: &'static str,
+    pub first_eof: Option<leg::Side>,
+}
+
+impl From<leg::Side> for Side {
+    fn from(side: leg::Side) -> Self {
+        match side {
+            leg::Side::Guest => Self::Downstream,
+            leg::Side::Origin => Self::Upstream,
+        }
+    }
+}
+
+impl Report {
+    pub(super) fn observe(&self, observation: &Connection) {
+        if let Err(Error::Io(error)) = &self.result {
+            let side = self.fault.map(|fault| fault.side().into());
+            observation.failure(Phase::Relay, side, error);
+        } else if matches!(&self.result, Err(Error::Cancelled | Error::Idle)) {
+            observation.closed(Side::Downstream, Close::Local);
+        } else if let Some(side) = self.first_eof {
+            observation.closed(side.into(), Close::Remote);
+        }
+    }
 }
 
 pub(super) async fn run<D, U>(

@@ -11,6 +11,7 @@ use hyper_util::rt::TokioIo;
 use tokio_util::sync::CancellationToken;
 
 use super::super::accounting::{Attempt, Outcome};
+use super::super::observation::{Close, Connection, Phase, Side};
 use super::super::relay::{self, RelayFault};
 use super::SanitizedRequest;
 
@@ -127,6 +128,7 @@ pub(super) fn relay(
     shutdown: CancellationToken,
     protocol: &'static str,
     kind: Kind,
+    observation: Connection,
 ) -> impl std::future::Future<Output = ()> + Send {
     let started_at = tokio::time::Instant::now();
     let (budget, idle, binding) = match kind {
@@ -139,6 +141,7 @@ pub(super) fn relay(
     };
     let deadline = started_at + budget;
     async move {
+        observation.phase(Phase::Upgrade);
         let mut forwarding = Attempt::forwarding(protocol, "relay");
         let handoff = tokio::select! {
             biased;
@@ -152,6 +155,16 @@ pub(super) fn relay(
         };
         let (outcome, first_eof, fault, read) = match handoff {
             Err(error) => {
+                match &error {
+                    HandoffError::Downstream(error) => {
+                        observation.failure(Phase::Upgrade, Some(Side::Downstream), error)
+                    }
+                    HandoffError::Upstream(error) => {
+                        observation.failure(Phase::Upgrade, Some(Side::Upstream), error)
+                    }
+                    HandoffError::Timeout => observation.failure(Phase::Upgrade, None, &error),
+                    HandoffError::Cancelled => observation.closed(Side::Downstream, Close::Local),
+                }
                 let (outcome, status) = match &error {
                     HandoffError::Cancelled => ("session_ended", Outcome::Cancelled),
                     HandoffError::Timeout => ("upgrade_timeout", Outcome::Error),
@@ -169,8 +182,10 @@ pub(super) fn relay(
                 (outcome, "none", None, (0, 0))
             }
             Ok((guest, origin)) => {
+                observation.phase(Phase::Relay);
                 let report =
                     relay::run(TokioIo::new(guest), TokioIo::new(origin), &shutdown, idle).await;
+                report.observe(&observation);
                 let (status, outcome) = match &report.result {
                     Ok(()) => (
                         Outcome::Success,
@@ -190,7 +205,12 @@ pub(super) fn relay(
                     }
                 };
                 forwarding.finish(status, outcome);
-                (outcome, report.first_eof, report.fault, report.read)
+                (
+                    outcome,
+                    report.first_eof.map_or("none", |side| side.as_str()),
+                    report.fault,
+                    report.read,
+                )
             }
         };
         pplx_space_metrics::gateway::domain_binding("tcp", binding, outcome, None);

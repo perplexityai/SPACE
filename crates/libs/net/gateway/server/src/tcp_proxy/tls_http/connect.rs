@@ -83,7 +83,8 @@ where
     pub(super) async fn connect_request(
         &self,
         mut request: SanitizedRequest<Incoming>,
-    ) -> Response<Body> {
+        observation: &mut request::Request,
+    ) -> Reply {
         let protocol = HttpProtocol::of(request.version());
         let mut authorization = Attempt::http_authorization(protocol.as_str());
         let target = match target(&request) {
@@ -107,7 +108,7 @@ where
         request.set_host(authority.parse().expect("validated CONNECT target"));
         let guest = request.on_upgrade();
         let mut forwarding = Attempt::forwarding(protocol.as_str(), "request");
-        let mut response = match self.dispatch(request, &mut forwarding).await {
+        let mut response = match self.dispatch(request, &mut forwarding, observation).await {
             Ok(response) => response,
             Err(response) => return *response,
         };
@@ -118,8 +119,11 @@ where
         if !response.status().is_success() {
             Self::record(protocol, "connect_proxy_refused", response.status());
             forwarding.finish(Outcome::Success, "response_headers");
-            return response
-                .map(|body| Either::Left(Self::forwarding_body(protocol, body, "response_body")));
+            return Reply::upstream(
+                response.map(|body| {
+                    Either::Left(Self::forwarding_body(protocol, body, "response_body"))
+                }),
+            );
         }
         let origin = hyper::upgrade::on(&mut response);
         response.headers_mut().remove(header::CONTENT_LENGTH);
@@ -130,12 +134,13 @@ where
                 self.shutdown.clone(),
                 "http1",
                 upgrade::Kind::Connect,
+                self.observation.clone(),
             )
             .in_current_span(),
         );
         Self::record(protocol, "connect_forwarded", response.status());
         forwarding.finish(Outcome::Success, "response_headers");
-        response.map(|_| Either::Right(Empty::new()))
+        Reply::upstream(response.map(|_| Either::Right(Empty::new())))
     }
 }
 
