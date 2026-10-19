@@ -123,6 +123,25 @@ invalid role ARN is a failed configuration precondition rather than an
 cross-subject resources, and privilege escalation are authorization denials.
 Malformed or unsupported wire values are client errors.
 
+An STS `AssumeRole` failure is `UNAVAILABLE`, with the `sts-unavailable`
+error reason, when an endpoint could not answer: a connection failure,
+timeout or broken response, an HTTP `500`, `502`, `503` or `504`, or a
+throttling or request-timeout error code. The same applies when the SDK
+resolves the authority's own base credentials inside the attempt, such as a
+web-identity `AssumeRoleWithWebIdentity` call that fails this way or cannot
+reach the identity provider, or a container credential endpoint call that
+fails in transport. The container credential provider reduces an error status
+from its endpoint to message text, so a `503` there stays a failed
+precondition. An instance metadata service failure also stays one: while the
+default chain discovers credentials, an unreachable metadata service need not
+mean configured credentials had an outage. From the client side a mistyped or unreachable
+STS host looks the same as an outage, so it is also `UNAVAILABLE`, as it is
+to the SDK's own retry classifiers. A caller that honors the code can retry,
+as build-input materialization does; template publish fails on any exchange
+error. Anything else is a failed precondition, including access denied,
+invalid client credentials, a malformed session policy, another `5xx` such as
+`501`, a missing web-identity token file, or no configured credentials.
+
 ## Authority configuration
 
 `SPACE_CREDMGR_S3_VEND_ROLE_ARN` enables storage credential exchange. The

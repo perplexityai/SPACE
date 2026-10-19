@@ -210,6 +210,24 @@ pub fn status_is_invalid_key_reference(status: &tonic::Status) -> bool {
             == Some(CREDMGR_ERROR_REASON_INVALID_KEY_REFERENCE)
 }
 
+/// Reason value: a storage exchange's `AssumeRole` failed because STS, or the
+/// source of the authority's own base credentials, could not answer. The
+/// status is `UNAVAILABLE`; the authority itself was reached and answered, so
+/// a relaying node agent does not report a lost link.
+pub const CREDMGR_ERROR_REASON_STS_UNAVAILABLE: &str = "sts-unavailable";
+
+/// True when a credmgr error `Status` is the authority's `UNAVAILABLE` answer
+/// that STS could not answer. Checks the machine-readable reason metadata,
+/// never the human-readable message.
+pub fn status_is_sts_unavailable(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::Unavailable
+        && status
+            .metadata()
+            .get(CREDMGR_ERROR_REASON_METADATA_KEY)
+            .and_then(|value| value.to_str().ok())
+            == Some(CREDMGR_ERROR_REASON_STS_UNAVAILABLE)
+}
+
 /// Reason value: a storage write vend named a template release that already
 /// has a registered storage location. Releases are immutable, so the artifacts
 /// are published and only tags remain to register; a builder that meets this

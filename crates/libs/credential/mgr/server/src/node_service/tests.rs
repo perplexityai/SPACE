@@ -48,7 +48,7 @@ fn server_tls_upstream_is_accepted() {
 
 #[test]
 fn ok_call_classifies_as_ok() {
-    assert_eq!(ForwardOutcome::from_code(None), ForwardOutcome::Ok);
+    assert_eq!(ForwardOutcome::from_status(None), ForwardOutcome::Ok);
     assert_eq!(ForwardOutcome::Ok.result_tag(), "ok");
 }
 
@@ -57,10 +57,27 @@ fn only_unavailable_is_a_reachability_failure() {
     // `Unavailable` is the one transport/TLS-level signal: the request
     // never got an answer from the authority.
     assert_eq!(
-        ForwardOutcome::from_code(Some(Code::Unavailable)),
+        ForwardOutcome::from_status(Some(&Status::unavailable("transport error"))),
         ForwardOutcome::Unreachable
     );
     assert_eq!(ForwardOutcome::Unreachable.result_tag(), "unreachable");
+}
+
+#[test]
+fn relayed_sts_unavailable_is_an_upstream_response_not_unreachable() {
+    // The authority was reached; STS behind it could not answer.
+    let mut metadata = tonic::metadata::MetadataMap::new();
+    metadata.insert(
+        pplx_space_credmgr_client::CREDMGR_ERROR_REASON_METADATA_KEY,
+        pplx_space_credmgr_client::CREDMGR_ERROR_REASON_STS_UNAVAILABLE
+            .parse()
+            .unwrap(),
+    );
+    let relayed = Status::with_metadata(Code::Unavailable, "relayed", metadata);
+    assert_eq!(
+        ForwardOutcome::from_status(Some(&relayed)),
+        ForwardOutcome::UpstreamError
+    );
 }
 
 #[test]
@@ -85,7 +102,7 @@ fn non_unavailable_codes_classify_as_upstream_response_not_unreachable() {
         Code::Cancelled,
         Code::DeadlineExceeded,
     ] {
-        let outcome = ForwardOutcome::from_code(Some(code));
+        let outcome = ForwardOutcome::from_status(Some(&Status::new(code, "")));
         assert_eq!(
             outcome,
             ForwardOutcome::UpstreamError,

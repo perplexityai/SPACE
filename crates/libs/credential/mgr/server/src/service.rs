@@ -6,6 +6,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aws_credential_types::provider::ProvideCredentials;
+use aws_credential_types::provider::error::CredentialsError;
+use aws_runtime::retries::classifiers::{THROTTLING_ERRORS, TRANSIENT_ERRORS};
+use aws_sdk_sts::error::{ConnectorError, ProvideErrorMetadata, SdkError};
+use aws_sdk_sts::operation::assume_role::AssumeRoleError;
+use aws_sdk_sts::operation::assume_role_with_web_identity::AssumeRoleWithWebIdentityError;
+use aws_smithy_types::retry::ErrorKind;
 use pplx_space_common_svc::core::host::linux::identities::{user_names, users};
 use pplx_space_common_svc::core::host::linux::paths;
 use pplx_space_common_svc::core::types::{
@@ -418,8 +424,11 @@ impl CredentialManager for CredentialManagerService {
                 return Err(storage_exchange_error_to_status(error));
             }
         };
+        let sdk_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let aws_credentials =
-            match assume_s3_vend_role(role.as_str(), &policy, authorized.ttl_seconds).await {
+            match assume_s3_vend_role(&sdk_config, role.as_str(), &policy, authorized.ttl_seconds)
+                .await
+            {
                 Ok(credentials) => credentials,
                 Err(status) => {
                     audit_exchange_failure(&authorized, status.code());
@@ -1237,12 +1246,12 @@ fn unwrap_error_to_status(e: UnwrapError) -> Status {
 /// TTL. Ambient and static credentials are inputs to STS only, never response
 /// values.
 async fn assume_s3_vend_role(
+    config: &aws_config::SdkConfig,
     role_arn: &str,
     session_policy: &str,
     ttl_seconds: u32,
 ) -> Result<AwsCredentials, Status> {
     use tracing::Instrument as _;
-    let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
     let span = tracing::info_span!(
         "sts.client",
         otel.kind = "client",
@@ -1259,7 +1268,7 @@ async fn assume_s3_vend_role(
             .session_name("space-storage-exchange")
             .session_length(Duration::from_secs(u64::from(ttl_seconds)))
             .policy(session_policy)
-            .configure(&config)
+            .configure(config)
             .build()
             .await
             .provide_credentials()
@@ -1274,18 +1283,10 @@ async fn assume_s3_vend_role(
         // A fixed kind, not the provider's text, which can quote the role ARN.
         Err(error) => {
             let kind = match error {
-                aws_credential_types::provider::error::CredentialsError::CredentialsNotLoaded(
-                    _,
-                ) => "not_loaded",
-                aws_credential_types::provider::error::CredentialsError::ProviderTimedOut(_) => {
-                    "timeout"
-                }
-                aws_credential_types::provider::error::CredentialsError::InvalidConfiguration(
-                    _,
-                ) => "invalid_configuration",
-                aws_credential_types::provider::error::CredentialsError::ProviderError(_) => {
-                    "provider_error"
-                }
+                CredentialsError::CredentialsNotLoaded(_) => "not_loaded",
+                CredentialsError::ProviderTimedOut(_) => "timeout",
+                CredentialsError::InvalidConfiguration(_) => "invalid_configuration",
+                CredentialsError::ProviderError(_) => "provider_error",
                 _ => "other",
             };
             span.record("otel.status_code", "ERROR");
@@ -1297,7 +1298,7 @@ async fn assume_s3_vend_role(
     }
     let creds = assumed.map_err(|e| {
         tracing::warn!(error = %e, "storage role assumption failed");
-        Status::failed_precondition("failed to assume the configured storage role")
+        assume_role_failure_status(&e)
     })?;
     let expires_at_unix = creds
         .expiry()
@@ -1310,6 +1311,128 @@ async fn assume_s3_vend_role(
         session_token: creds.session_token().map(str::to_string),
         expires_at_unix: Some(expires_at_unix),
     })
+}
+
+/// `Unavailable` when an endpoint the exchange depends on could not answer:
+/// STS, or the source of the authority's own base credentials (a web-identity
+/// `AssumeRoleWithWebIdentity`, a chained source role, the container
+/// credential endpoint), which the SDK resolves inside the `AssumeRole`
+/// attempt. The status carries [`CREDMGR_ERROR_REASON_STS_UNAVAILABLE`], so
+/// the node agent relays it as the authority's answer, not a lost link. A
+/// rejection on the request's merits (the role, its trust policy, the session
+/// policy or the authority's own credentials), and any failure the SDK does
+/// not classify as transient, stays `FailedPrecondition`: it recurs until
+/// configuration changes.
+///
+/// [`CREDMGR_ERROR_REASON_STS_UNAVAILABLE`]: pplx_space_credmgr_client::CREDMGR_ERROR_REASON_STS_UNAVAILABLE
+fn assume_role_failure_status(error: &CredentialsError) -> Status {
+    const MESSAGE: &str = "failed to assume the configured storage role";
+    if !credentials_failure_is_transient(error) {
+        return Status::failed_precondition(MESSAGE);
+    }
+    let mut metadata = tonic::metadata::MetadataMap::new();
+    metadata.insert(
+        pplx_space_credmgr_client::CREDMGR_ERROR_REASON_METADATA_KEY,
+        pplx_space_credmgr_client::CREDMGR_ERROR_REASON_STS_UNAVAILABLE
+            .parse()
+            .expect("static ASCII metadata value"),
+    );
+    Status::with_metadata(tonic::Code::Unavailable, MESSAGE, metadata)
+}
+
+/// The HTTP statuses the SDK's status-code retry classifier retries
+/// (`HttpStatusCodeClassifier` in `aws-smithy-runtime`, which does not export
+/// them). Any other 5xx, such as `501 Not Implemented`, recurs until the
+/// endpoint changes.
+const TRANSIENT_STATUS_CODES: [u16; 4] = [500, 502, 503, 504];
+
+fn credentials_failure_is_transient(error: &CredentialsError) -> bool {
+    match error {
+        // No provider had credentials to offer. The default chain also
+        // reports an unreachable instance metadata service this way, at times
+        // with a typed connector error beneath it. During discovery that need
+        // not mean configured credentials had an outage, so it stays
+        // permanent.
+        CredentialsError::CredentialsNotLoaded(_) => false,
+        CredentialsError::ProviderTimedOut(_) => true,
+        _ => std::error::Error::source(error).is_some_and(failure_is_transient),
+    }
+}
+
+/// Classify a provider failure by the typed errors in its source chain, never
+/// by message text.
+fn failure_is_transient(error: &(dyn std::error::Error + 'static)) -> bool {
+    // `AssumeRoleProvider` keeps its STS call's `SdkError` as the source, and
+    // the web-identity provider keeps its own.
+    if let Some(error) = error.downcast_ref::<SdkError<AssumeRoleError>>() {
+        return sts_failure_is_transient(error);
+    }
+    if let Some(error) = error.downcast_ref::<SdkError<AssumeRoleWithWebIdentityError>>() {
+        // STS could not reach the identity provider to validate the token.
+        return sts_failure_is_transient(error)
+            || error
+                .as_service_error()
+                .is_some_and(AssumeRoleWithWebIdentityError::is_idp_communication_error_exception);
+    }
+    // The container credential provider keeps its endpoint call's `SdkError`
+    // for transport failures. It reduces an error status to message text, so
+    // only the transport rules apply.
+    if let Some(error) = error.downcast_ref::<SdkError<CredentialsError>>() {
+        return sdk_transport_failure_is_transient(error);
+    }
+    if let Some(error) = error.downcast_ref::<CredentialsError>() {
+        return credentials_failure_is_transient(error);
+    }
+    // A connector error carries the SDK's transport classification. A bare
+    // `io::Error` is not read as transport: a missing web-identity token file
+    // is one.
+    if error
+        .downcast_ref::<ConnectorError>()
+        .is_some_and(connector_failure_is_transient)
+    {
+        return true;
+    }
+    error.source().is_some_and(failure_is_transient)
+}
+
+/// The same split the SDK's transient-error retry classifier makes, except
+/// that a connector error it labels a client error stays permanent.
+fn connector_failure_is_transient(error: &ConnectorError) -> bool {
+    error.is_io()
+        || error.is_timeout()
+        || matches!(
+            error.as_other(),
+            Some(ErrorKind::TransientError | ErrorKind::ThrottlingError | ErrorKind::ServerError)
+        )
+}
+
+fn sts_failure_is_transient<E: ProvideErrorMetadata>(error: &SdkError<E>) -> bool {
+    match error {
+        // STS answered: a status the SDK's status-code retry classifier
+        // retries, or a code its AWS error-code classifier treats as
+        // throttling or transient.
+        SdkError::ServiceError(context) => {
+            TRANSIENT_STATUS_CODES.contains(&context.raw().status().as_u16())
+                || context.err().code().is_some_and(|code| {
+                    THROTTLING_ERRORS.contains(&code) || TRANSIENT_ERRORS.contains(&code)
+                })
+        }
+        _ => sdk_transport_failure_is_transient(error),
+    }
+}
+
+/// The endpoint never gave a complete answer.
+fn sdk_transport_failure_is_transient<E>(error: &SdkError<E>) -> bool {
+    match error {
+        SdkError::TimeoutError(_) | SdkError::ResponseError(_) => true,
+        // A base-identity failure arrives here too: the SDK reports it as a
+        // dispatch failure whose connector error carries the
+        // `CredentialsError`.
+        SdkError::DispatchFailure(failure) => failure
+            .as_connector_error()
+            .is_some_and(|error| failure_is_transient(error)),
+        _ => false,
+    }
 }
 
 fn credential_expires_in(credentials: &AwsCredentials) -> Result<u32, Status> {

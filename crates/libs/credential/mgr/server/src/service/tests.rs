@@ -11,6 +11,8 @@ use crate::auth::ResolvedCaller;
 use crate::in_memory::InMemoryKeyWrapper;
 use crate::kek_store::KekRecord;
 
+mod assume_role;
+
 /// In-memory KEK-row map standing in for Postgres.
 struct TestKekStore {
     rows: HashMap<(Uuid, OrgId), KekRecord>,

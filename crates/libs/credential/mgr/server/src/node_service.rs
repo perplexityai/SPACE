@@ -105,13 +105,18 @@ enum ForwardOutcome {
 }
 
 impl ForwardOutcome {
-    /// Classify by the forwarded call's gRPC code. `None` is the OK case.
+    /// Classify by the forwarded call's error status. `None` is the OK case.
     /// Only [`Code::Unavailable`] is a reachability failure; every other
     /// non-OK code is a status the authority produced, i.e. it was reached.
-    fn from_code(code: Option<Code>) -> Self {
-        match code {
+    /// So is an `Unavailable` the authority marks as its own answer that STS
+    /// could not answer ([`pplx_space_credmgr_client::status_is_sts_unavailable`]).
+    fn from_status(status: Option<&Status>) -> Self {
+        match status {
             None => Self::Ok,
-            Some(Code::Unavailable) => Self::Unreachable,
+            Some(status) if pplx_space_credmgr_client::status_is_sts_unavailable(status) => {
+                Self::UpstreamError
+            }
+            Some(status) if status.code() == Code::Unavailable => Self::Unreachable,
             Some(_) => Self::UpstreamError,
         }
     }
@@ -240,7 +245,7 @@ impl NodeCredentialManager {
         let started = Instant::now();
         let result = call.await;
         let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
-        let outcome = ForwardOutcome::from_code(result.as_ref().err().map(Status::code));
+        let outcome = ForwardOutcome::from_status(result.as_ref().err());
         match &result {
             Ok(_) => {
                 tracing::debug!(
