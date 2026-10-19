@@ -146,6 +146,37 @@ fn classify_disk_metric_targets_uses_disk_layout() {
 }
 
 #[test]
+fn classify_disk_metric_targets_enumerates_nodes_past_4096_targets() {
+    // A busy node keeps two targets per suspended sandbox. Its inventory must
+    // stay complete, or every byte gauge on the node stops reporting.
+    let tmp = tempfile::tempdir().unwrap();
+    let sandbox_cache = tmp.path().join("sandboxes");
+    let templates = tmp.path().join("templates");
+    mkdir(&templates.join("code-runtime").join("sha256:abc"));
+    write(
+        &templates
+            .join("code-runtime")
+            .join("sha256:abc")
+            .join("rootfs.ext4"),
+    );
+    let suspended = 2_100;
+    for i in 0..suspended {
+        let sandbox_root = sandbox_cache.join(format!("018f6d8d-0000-7000-8000-{i:012}"));
+        mkdir(&sandbox_root.join("instance"));
+        mkdir(&sandbox_root.join("snapshot"));
+        write(&sandbox_root.join("snapshot").join("vmstate"));
+        write(&sandbox_root.join("snapshot").join("memory"));
+    }
+
+    let targets = classify_disk_metric_targets(&sandbox_cache, &templates).unwrap();
+
+    assert_eq!(targets.templates.len(), 1);
+    assert_eq!(targets.snapshotted_sandboxes.len(), suspended);
+    assert_eq!(targets.active_sandboxes.len(), suspended);
+    assert!(targets.all_paths().len() > 4096);
+}
+
+#[test]
 fn build_snapshot_sums_successful_measurements_only() {
     let targets = DiskMetricTargets {
         templates: vec!["/space/cache/t1".to_string(), "/space/cache/t2".to_string()],
@@ -181,6 +212,7 @@ fn build_snapshot_sums_successful_measurements_only() {
             success_count: 4,
             missing_count: 0,
             error_count: 0,
+            ..Default::default()
         }
     );
     assert!(snapshot.should_emit_byte_gauge(DiskUsageCategory::Template));
@@ -214,6 +246,7 @@ fn build_snapshot_tracks_failed_and_missing_measurements() {
             success_count: 3,
             missing_count: 1,
             error_count: 1,
+            ..Default::default()
         }
     );
     assert_eq!(
@@ -224,6 +257,7 @@ fn build_snapshot_tracks_failed_and_missing_measurements() {
             success_count: 1,
             missing_count: 0,
             error_count: 1,
+            ..Default::default()
         })
     );
     assert_eq!(
@@ -234,10 +268,68 @@ fn build_snapshot_tracks_failed_and_missing_measurements() {
             success_count: 0,
             missing_count: 1,
             error_count: 0,
+            ..Default::default()
         })
     );
     assert!(!snapshot.should_emit_byte_gauge(DiskUsageCategory::Template));
     assert!(snapshot.should_emit_byte_gauge(DiskUsageCategory::SuspendCheckpoint));
+    assert!(snapshot.should_emit_byte_gauge(DiskUsageCategory::ActiveInstance));
+    assert!(snapshot.should_emit_byte_gauge(DiskUsageCategory::BtrfsSnapshot));
+}
+
+#[test]
+fn build_snapshot_counts_deadline_skips_apart_from_probe_errors() {
+    let targets = DiskMetricTargets {
+        templates: vec!["/space/cache/t1".to_string(), "/space/cache/t2".to_string()],
+        snapshotted_sandboxes: vec!["/space/cache/s1/snapshot".to_string()],
+        active_sandboxes: vec!["/space/cache/s2/instance".to_string()],
+        btrfs_snapshots: vec!["/space/cache/s1/snapshots/snap-1".to_string()],
+    };
+    let mut measurement = DiskMeasurementReport::default();
+    measurement.record_usage("/space/cache/t1".to_string(), 10);
+    measurement.record_error("/space/cache/t2".to_string());
+    measurement.record(
+        "/space/cache/s1/snapshot".to_string(),
+        DiskMeasurementOutcome::Unmeasured,
+    );
+    measurement.record_usage("/space/cache/s2/instance".to_string(), 30);
+    measurement.record_usage("/space/cache/s1/snapshots/snap-1".to_string(), 40);
+
+    let snapshot = build_snapshot(&targets, &measurement);
+
+    assert_eq!(
+        snapshot.measurement_counts,
+        MeasurementCounts {
+            success_count: 3,
+            missing_count: 0,
+            error_count: 1,
+            unmeasured_count: 1,
+        }
+    );
+    assert_eq!(
+        snapshot
+            .measurement_counts_by_category
+            .get(&DiskUsageCategory::Template),
+        Some(&MeasurementCounts {
+            success_count: 1,
+            missing_count: 0,
+            error_count: 1,
+            ..Default::default()
+        })
+    );
+    assert_eq!(
+        snapshot
+            .measurement_counts_by_category
+            .get(&DiskUsageCategory::SuspendCheckpoint),
+        Some(&MeasurementCounts {
+            success_count: 0,
+            missing_count: 0,
+            error_count: 0,
+            unmeasured_count: 1,
+        })
+    );
+    assert!(!snapshot.should_emit_byte_gauge(DiskUsageCategory::Template));
+    assert!(!snapshot.should_emit_byte_gauge(DiskUsageCategory::SuspendCheckpoint));
     assert!(snapshot.should_emit_byte_gauge(DiskUsageCategory::ActiveInstance));
     assert!(snapshot.should_emit_byte_gauge(DiskUsageCategory::BtrfsSnapshot));
 }

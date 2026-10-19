@@ -204,6 +204,23 @@ pub fn measurement_error_count(count: u64) {
     gauge("node_disk.measurement_error_count", count as f64, &[]);
 }
 
+/// Count of target paths the latest node-manager node disk metrics tick never
+/// started probing because its measurement deadline had passed. A probe still
+/// running at the deadline times out and counts as a measurement error instead.
+/// Byte gauges for affected categories are withheld for that tick, as for
+/// measurement errors.
+pub fn measurement_unmeasured_count(count: u64) {
+    gauge("node_disk.measurement_unmeasured_count", count as f64, &[]);
+}
+
+/// Whether the latest node-manager node disk metrics tick completed. A failed
+/// tick, such as one whose target inventory exceeded its directory budget,
+/// publishes none of the byte, target-count or measurement gauges, so their
+/// previous values go stale. The rootfs backing census reports separately.
+pub fn metrics_tick_success(success: bool) {
+    gauge("node_disk.metrics_tick_success", f64::from(success), &[]);
+}
+
 /// Bytes in the `/space/cache` btrfs unallocated pool — the only space
 /// metadata chunk growth can draw from. Zero here with full metadata chunks
 /// wedges the filesystem (subvolume deletes fail `EROFS`).

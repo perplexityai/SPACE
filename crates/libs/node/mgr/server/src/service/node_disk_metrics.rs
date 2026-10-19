@@ -167,9 +167,10 @@ struct DiskMetricSnapshot {
 
 impl DiskMetricSnapshot {
     fn emit(self) {
-        // If btrfs measurement errors hit a category, that category's sum is
-        // partial. Leave its byte gauge stale rather than publishing a
-        // misleading drop toward zero that looks like reclaimed disk.
+        // If btrfs measurement errors or the measurement deadline hit a
+        // category, that category's sum is partial. Leave its byte gauge stale
+        // rather than publishing a misleading drop toward zero that looks like
+        // reclaimed disk.
         if self.should_emit_byte_gauge(DiskUsageCategory::Template) {
             pplx_space_metrics::node_disk::templates_bytes(self.templates_bytes);
         }
@@ -194,12 +195,15 @@ impl DiskMetricSnapshot {
             self.measurement_counts.missing_count,
         );
         pplx_space_metrics::node_disk::measurement_error_count(self.measurement_counts.error_count);
+        pplx_space_metrics::node_disk::measurement_unmeasured_count(
+            self.measurement_counts.unmeasured_count,
+        );
     }
 
     fn should_emit_byte_gauge(&self, category: DiskUsageCategory) -> bool {
         self.measurement_counts_by_category
             .get(&category)
-            .map(|counts| counts.error_count == 0)
+            .map(MeasurementCounts::is_complete)
             .unwrap_or(true)
     }
 }
@@ -224,16 +228,20 @@ struct MeasurementCounts {
     success_count: u64,
     missing_count: u64,
     error_count: u64,
+    unmeasured_count: u64,
 }
 
 impl MeasurementCounts {
+    fn is_complete(&self) -> bool {
+        self.error_count == 0 && self.unmeasured_count == 0
+    }
+
     fn record(&mut self, outcome: &DiskMeasurementOutcome) {
         match outcome {
             DiskMeasurementOutcome::Usage(_) => self.success_count += 1,
             DiskMeasurementOutcome::Missing => self.missing_count += 1,
-            DiskMeasurementOutcome::Error | DiskMeasurementOutcome::Unmeasured => {
-                self.error_count += 1
-            }
+            DiskMeasurementOutcome::Error => self.error_count += 1,
+            DiskMeasurementOutcome::Unmeasured => self.unmeasured_count += 1,
         }
     }
 }
@@ -331,7 +339,12 @@ async fn run_loop(
             biased;
             _ = shutdown.cancelled() => return,
             _ = interval.tick() => {
-                if let Err(error) = emit_tick(&cfg, &disk_usage_cache, &mut cursor).await {
+                let result = emit_tick(&cfg, &disk_usage_cache, &mut cursor).await;
+                // A failed tick publishes none of the byte, target-count or
+                // measurement gauges, so without this a stale byte gauge looks
+                // like a node that stopped reporting.
+                pplx_space_metrics::node_disk::metrics_tick_success(result.is_ok());
+                if let Err(error) = result {
                     warn!(%error, "node disk metrics tick failed");
                 }
             }
@@ -361,14 +374,15 @@ async fn emit_tick(
     let measurement = measure_paths(targets.all_paths(), cursor).await;
     disk_usage_cache.replace(&targets, &measurement, observed_at);
     let snapshot = build_snapshot(&targets, &measurement);
-    if snapshot.measurement_counts.error_count > 0 {
+    if !snapshot.measurement_counts.is_complete() {
         warn!(
             measurement_success_count = snapshot.measurement_counts.success_count,
             measurement_missing_count = snapshot.measurement_counts.missing_count,
             measurement_error_count = snapshot.measurement_counts.error_count,
+            measurement_unmeasured_count = snapshot.measurement_counts.unmeasured_count,
             measurement_counts_by_category =
                 %json_string(&snapshot.measurement_counts_by_category),
-            "node disk metrics measurement errors; suppressing byte gauges for affected categories",
+            "node disk metrics measurement incomplete; suppressing byte gauges for affected categories",
         );
     }
     emit_disk_usage_diagnostic(&snapshot, &targets, &measurement, cfg);
@@ -567,6 +581,7 @@ fn emit_disk_usage_diagnostic(
         measurement_success_count = snapshot.measurement_counts.success_count,
         measurement_missing_count = snapshot.measurement_counts.missing_count,
         measurement_error_count = snapshot.measurement_counts.error_count,
+        measurement_unmeasured_count = snapshot.measurement_counts.unmeasured_count,
         measurement_counts_by_category = %json_string(&snapshot.measurement_counts_by_category),
         top_consumers = %json_string(&diagnostic.top_consumers),
         top_consumers_by_category = %json_string(&diagnostic.top_consumers_by_category),
@@ -736,7 +751,10 @@ fn classify_disk_metric_targets(
         }
     }
     // Count both resident instances and suspend artifacts; neither proves the
-    // absence of the other. Nested enumeration shares the same hard budget.
+    // absence of the other. Nested enumeration shares the same hard budget,
+    // which bounds the walk. Targets aren't capped separately: a suspended
+    // sandbox yields two of them, and the measurement deadline bounds probe
+    // work, reporting what it skips as unmeasured.
     for sandbox_root in budget.directories(sandbox_cache_dir)? {
         if sandbox_root
             .file_name()
@@ -766,26 +784,6 @@ fn classify_disk_metric_targets(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        if targets.templates.len()
-            + targets.snapshotted_sandboxes.len()
-            + targets.active_sandboxes.len()
-            + targets.btrfs_snapshots.len()
-            > 4096
-        {
-            return Err(std::io::Error::other(
-                "disk target inventory budget exceeded",
-            ));
-        }
-    }
-    if targets.templates.len()
-        + targets.snapshotted_sandboxes.len()
-        + targets.active_sandboxes.len()
-        + targets.btrfs_snapshots.len()
-        > 4096
-    {
-        return Err(std::io::Error::other(
-            "disk target inventory budget exceeded",
-        ));
     }
     targets.templates.sort();
     targets.snapshotted_sandboxes.sort();
