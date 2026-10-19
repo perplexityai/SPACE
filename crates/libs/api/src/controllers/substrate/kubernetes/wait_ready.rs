@@ -16,21 +16,63 @@ pub(super) enum CommandReadyPod<'a> {
 }
 
 impl KubernetesSubstrate {
-    pub(super) async fn worker_client_for_pod_ip(
-        &self,
-        pod_ip: PodIp,
-    ) -> Result<RuntimeClient, ControllerError> {
-        let endpoint = Self::endpoint_for_pod_ip(pod_ip, self.k8s.sandbox_proxy_port)
-            .map_err(ControllerError::from)?;
-        connect_worker(endpoint).await
-    }
-
-    /// [`Self::worker_client_for_pod_ip`] on the channel kept for `pod`'s
-    /// instance while its connection is open; see
-    /// [`super::pod_worker_channels`]. A failed dial fails the same way.
+    /// A runtime client for `pod` on the channel kept for its instance while
+    /// its connection is open; see [`super::pod_worker_channels`].
+    ///
+    /// A miss first dials once within [`POD_WORKER_FIRST_DIAL_TIMEOUT`]. If
+    /// that fails, the sandbox's pod is resolved again: the same instance is
+    /// dialed with the full connect budget, as before; a replacement is
+    /// dialed at its own address; and no pod returns the first dial's error,
+    /// so the caller's recovery path takes over without waiting out retries
+    /// to an address nothing serves.
     pub(super) async fn kept_worker_client(
         &self,
+        sandbox_id: SandboxId,
         pod: &ResolvedPodInstance,
+    ) -> Result<RuntimeClient, ControllerError> {
+        let first = self
+            .kept_worker_client_with(
+                pod,
+                POD_WORKER_FIRST_DIAL_TIMEOUT,
+                POD_WORKER_FIRST_DIAL_POLICY,
+            )
+            .await;
+        let Err(first_error) = first else {
+            return first;
+        };
+        let current = match self.resolve_pod_instance(sandbox_id).await {
+            Ok(Some(current)) => current,
+            Ok(None) => {
+                pplx_space_metrics::grpc::client_channel_cache("worker-node-api", "pod_gone");
+                return Err(first_error);
+            }
+            Err(error) => return Err(ControllerError::from(error)),
+        };
+        if !current.same_instance(pod) {
+            pplx_space_metrics::grpc::client_channel_cache("worker-node-api", "pod_moved");
+        }
+        self.kept_worker_client_full_dial(&current).await
+    }
+
+    /// [`Self::kept_worker_client`] without its first short dial or its
+    /// re-resolution: a miss dials `pod` with the full connect budget.
+    pub(super) async fn kept_worker_client_full_dial(
+        &self,
+        pod: &ResolvedPodInstance,
+    ) -> Result<RuntimeClient, ControllerError> {
+        self.kept_worker_client_with(
+            pod,
+            POD_WORKER_CONNECT_TIMEOUT,
+            pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
+        )
+        .await
+    }
+
+    async fn kept_worker_client_with(
+        &self,
+        pod: &ResolvedPodInstance,
+        connect_timeout: Duration,
+        retry_policy: pplx_space_common_grpc::GrpcRetryPolicy,
     ) -> Result<RuntimeClient, ControllerError> {
         let port = self.k8s.sandbox_proxy_port;
         let key = super::pod_worker_channels::PodWorkerKey {
@@ -41,9 +83,10 @@ impl KubernetesSubstrate {
         let pod_ip = pod.ip;
         self.pod_worker_channels
             .client(key, async move {
-                let endpoint =
-                    Self::endpoint_for_pod_ip(pod_ip, port).map_err(ControllerError::from)?;
-                crate::controllers::substrate::connect_worker_watched(endpoint).await
+                let endpoint = Self::endpoint_for_pod_ip(pod_ip, port)
+                    .map_err(ControllerError::from)?
+                    .connect_timeout(connect_timeout);
+                crate::controllers::substrate::connect_worker_watched(endpoint, retry_policy).await
             })
             .await
     }

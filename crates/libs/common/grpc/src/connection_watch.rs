@@ -24,6 +24,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 #[derive(Clone, Debug, Default)]
 pub struct ConnectionWatch {
     closed: Arc<AtomicBool>,
+    probing: Arc<AtomicBool>,
 }
 
 impl ConnectionWatch {
@@ -35,6 +36,20 @@ impl ConnectionWatch {
     /// stays up for whoever still holds its channel.
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
+    }
+
+    /// Claim the one liveness probe a holder may run at a time, so a burst
+    /// of failed calls on one connection probes it once. `false` while
+    /// another probe runs.
+    pub fn try_begin_probe(&self) -> bool {
+        self.probing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Release the probe claimed by [`Self::try_begin_probe`].
+    pub fn end_probe(&self) {
+        self.probing.store(false, Ordering::Release);
     }
 }
 

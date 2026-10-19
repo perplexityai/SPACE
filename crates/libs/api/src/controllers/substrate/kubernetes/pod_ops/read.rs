@@ -189,10 +189,10 @@ impl KubernetesSubstrate {
     /// Read-only counterpart to the repairing resolver. Missing, terminal, or
     /// replaced pods belong to recovery; a reachability probe cannot delete
     /// them or change execution tracking while its request can be cancelled.
-    pub(in crate::controllers::substrate::kubernetes) async fn resolve_reachable_pod_ip(
+    pub(in crate::controllers::substrate::kubernetes) async fn resolve_reachable_pod_instance(
         &self,
         sandbox_id: SandboxId,
-    ) -> Result<Option<PodIp>, SubstrateError> {
+    ) -> Result<Option<ResolvedPodInstance>, SubstrateError> {
         let Some(row) = self.store.active_execution_status(sandbox_id).await? else {
             return Ok(None);
         };
@@ -224,7 +224,11 @@ impl KubernetesSubstrate {
         {
             return Ok(None);
         }
-        Ok(pod_ip)
+        Ok(pod_ip.map(|ip| ResolvedPodInstance {
+            ip,
+            pod_uid: row.pod_uid.clone(),
+            generation: row.generation,
+        }))
     }
 
     pub(in crate::controllers::substrate::kubernetes) async fn resolve_pod_ip(

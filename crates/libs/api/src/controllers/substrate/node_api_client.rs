@@ -43,6 +43,36 @@ impl RuntimeClient {
         }
     }
 
+    /// Check this client's cached connection after a call that timed out or
+    /// was cancelled, and retire it only if the peer no longer answers.
+    ///
+    /// A timeout or cancellation is usually the call's own outcome (a slow
+    /// guest operation, a node-side deadline, a caller that gave up), not a
+    /// lost peer, and retiring on it alone made every such call cost the
+    /// next caller a dial. A peer that vanished without closing the socket
+    /// fails this probe, and an idle one also fails the connection's HTTP/2
+    /// keepalive. A no-op for an uncached or already retired channel.
+    pub(crate) fn verify_kept_connection(&self) {
+        let Some(watch) = self.kept.clone() else {
+            return;
+        };
+        if watch.is_closed() || !watch.try_begin_probe() {
+            return;
+        }
+        // No bearer token: a rejection proves the peer answered as well as a
+        // health response does, and a local token failure must not read as a
+        // lost peer.
+        let channel = self.channel.clone();
+        tokio::spawn(async move {
+            let answered = kept_connection_answers(channel, KEPT_CONNECTION_PROBE_TIMEOUT).await;
+            if !answered {
+                pplx_space_metrics::grpc::client_channel_cache("worker-node-api", "probe_retired");
+                watch.close();
+            }
+            watch.end_probe();
+        });
+    }
+
     pub(in crate::controllers) async fn require_activation_policy_support(
         &mut self,
         timeout: Duration,
@@ -238,6 +268,34 @@ pub(super) async fn node_api_connect_endpoint(
     .map_err(ControllerError::node_api_transport)
 }
 
+/// How long a kept connection's peer has to answer a liveness probe. An
+/// in-cluster peer answers within milliseconds; one that cannot in a second
+/// is treated as gone.
+pub(super) const KEPT_CONNECTION_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Whether the peer behind `channel` answers a health check within
+/// `timeout`. Any status the server itself returns counts, a rejection
+/// included: it shows the connection carries requests. Transport-level
+/// failures and silence do not.
+pub(super) async fn kept_connection_answers(channel: Channel, timeout: Duration) -> bool {
+    let mut health = tonic_health::pb::health_client::HealthClient::new(channel);
+    let mut request = tonic::Request::new(tonic_health::pb::HealthCheckRequest {
+        service: String::new(),
+    });
+    request.set_timeout(timeout);
+    match tokio::time::timeout(timeout, health.check(request)).await {
+        Ok(Ok(_)) => true,
+        Ok(Err(status)) => !matches!(
+            status.code(),
+            tonic::Code::Unavailable
+                | tonic::Code::Unknown
+                | tonic::Code::Cancelled
+                | tonic::Code::DeadlineExceeded
+        ),
+        Err(_) => false,
+    }
+}
+
 pub(in crate::controllers) async fn require_activation_policy_support(
     transport: RuntimeTransport,
     timeout: Duration,
@@ -291,6 +349,7 @@ pub(super) const KEPT_WORKER_CONNECTION_WINDOW_BYTES: u32 = 32 * 1024 * 1024;
 #[cfg(feature = "kubernetes")]
 pub(super) async fn connect_worker_watched(
     endpoint: Endpoint,
+    retry_policy: pplx_space_common_grpc::GrpcRetryPolicy,
 ) -> Result<(Channel, pplx_space_common_grpc::ConnectionWatch), ControllerError> {
     // A kept connection carries every call to its pod, so it needs its own
     // liveness check: ping it while idle too, so a peer lost without a FIN is
@@ -307,11 +366,7 @@ pub(super) async fn connect_worker_watched(
         .initial_connection_window_size(KEPT_WORKER_CONNECTION_WINDOW_BYTES);
     node_api_connect_endpoint(endpoint)
         .await?
-        .connect_with_retry_watched(
-            "worker-node-api",
-            "worker-node-api",
-            pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
-        )
+        .connect_with_retry_watched("worker-node-api", "worker-node-api", retry_policy)
         .await
         .map_err(|err| {
             ControllerError::service_unavailable(format!("node-api not reachable: {err}"))

@@ -100,6 +100,20 @@ const START_WAIT_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const RESIDENT_WAKE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const START_WAIT_COMMAND_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const POD_WORKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// The first dial to a sandbox pod's kept channel. An in-cluster pod answers a
+/// SYN within milliseconds, so one that has not in a second has most likely
+/// gone, and its address is re-resolved before any longer dial: a replaced
+/// pod is dialed at its new address and a removed one goes straight to
+/// recovery, rather than both redialing the old address for the whole
+/// connect budget. A live pod whose first SYN was lost costs about what the
+/// kernel's own 1s SYN retransmit would.
+const POD_WORKER_FIRST_DIAL_TIMEOUT: Duration = Duration::from_secs(1);
+/// One attempt: the retries belong to the dial after re-resolution.
+const POD_WORKER_FIRST_DIAL_POLICY: pplx_space_common_grpc::GrpcRetryPolicy =
+    pplx_space_common_grpc::GrpcRetryPolicy {
+        max_retries: 0,
+        ..pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY
+    };
 const DEFAULT_CREATE_DATA_PLANE_READY_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_CREATE_COMMAND_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Overall wall-clock budget for the create path's combined readiness wait.
@@ -363,6 +377,12 @@ struct ResolvedPodInstance {
     ip: PodIp,
     pod_uid: Option<PodUid>,
     generation: i64,
+}
+
+impl ResolvedPodInstance {
+    fn same_instance(&self, other: &Self) -> bool {
+        self.ip == other.ip && self.pod_uid == other.pod_uid && self.generation == other.generation
+    }
 }
 
 impl std::fmt::Display for PodIp {

@@ -1498,7 +1498,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
             .resolve_pod_instance(sandbox_id)
             .await
             .map_err(ControllerError::from)?
-            && let Ok(client) = self.kept_worker_client(&pod).await
+            && let Ok(client) = self.kept_worker_client(sandbox_id, &pod).await
         {
             return Ok(client);
         }
@@ -1558,7 +1558,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
             return Ok(None);
         };
 
-        match self.kept_worker_client(&pod).await {
+        match self.kept_worker_client(sandbox_id, &pod).await {
             Ok(client) => Ok(Some(client)),
             Err(_) => Ok(None),
         }
@@ -1568,15 +1568,20 @@ impl SubstrateAdapter for KubernetesSubstrate {
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Option<RuntimeClient>, ControllerError> {
-        let Some(pod_ip) = self
-            .resolve_reachable_pod_ip(sandbox_id)
+        let Some(pod) = self
+            .resolve_reachable_pod_instance(sandbox_id)
             .await
             .map_err(ControllerError::from)?
         else {
             return Ok(None);
         };
 
-        match self.worker_client_for_pod_ip(pod_ip).await {
+        // An open kept connection to this pod instance is the same evidence of
+        // reachability a fresh dial gives, and ingress preparation probes on
+        // every request. A probe must not mutate routing evidence, so a failed
+        // dial is not followed by the repairing re-resolution
+        // `kept_worker_client` makes; it just reports the pod unreachable.
+        match self.kept_worker_client_full_dial(&pod).await {
             Ok(client) => Ok(Some(client)),
             Err(_) => Ok(None),
         }
@@ -1658,7 +1663,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                     }
                 }
             }
-            if let Ok(client) = self.kept_worker_client(&pod).await {
+            if let Ok(client) = self.kept_worker_client(sandbox.id, &pod).await {
                 return Ok(client);
             }
         }

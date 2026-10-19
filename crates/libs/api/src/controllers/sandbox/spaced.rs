@@ -1016,12 +1016,27 @@ fn should_retry_node_api_stream_open(status: &tonic::Status) -> bool {
         || is_tonic_transport_close_status(status)
 }
 
-/// A failure after which later calls should reach the pod over a new
-/// connection: a drain or a closed transport, or a timeout, which is how a
-/// peer lost without closing the socket looks.
-fn should_retire_kept_connection(status: &tonic::Status) -> bool {
-    should_retry_node_api_stream_open(status)
-        || matches!(status.code(), Code::DeadlineExceeded | Code::Cancelled)
+/// What a failed call says about the kept connection it used.
+#[derive(Debug, PartialEq, Eq)]
+enum KeptConnectionVerdict {
+    /// Later calls must reach the pod over a new connection: the node-api
+    /// is draining or the transport closed.
+    Retire,
+    /// A timeout or cancellation: usually the call's own outcome, but also
+    /// how a peer lost without closing the socket looks, so probe it.
+    Verify,
+    /// The peer answered; the connection is fine.
+    Keep,
+}
+
+fn kept_connection_verdict(status: &tonic::Status) -> KeptConnectionVerdict {
+    if should_retry_node_api_stream_open(status) {
+        KeptConnectionVerdict::Retire
+    } else if matches!(status.code(), Code::DeadlineExceeded | Code::Cancelled) {
+        KeptConnectionVerdict::Verify
+    } else {
+        KeptConnectionVerdict::Keep
+    }
 }
 
 fn is_tonic_transport_close_status(status: &tonic::Status) -> bool {
@@ -1051,21 +1066,24 @@ impl SpacedSandboxClient {
     }
 
     /// Stop sharing this request's cached channel after a failure that shows
-    /// later calls need a new connection. The connection usually closed
-    /// already, which retires it anyway; a draining node-api keeps it open.
+    /// later calls need a new connection, or probe it after one that might.
+    /// The connection usually closed already, which retires it anyway; a
+    /// draining node-api keeps it open.
     fn retire_after_transport_failure(&self, status: &tonic::Status) {
-        if should_retire_kept_connection(status) {
-            self.client.retire_kept_connection();
+        match kept_connection_verdict(status) {
+            KeptConnectionVerdict::Retire => self.client.retire_kept_connection(),
+            KeptConnectionVerdict::Verify => self.client.verify_kept_connection(),
+            KeptConnectionVerdict::Keep => {}
         }
     }
 
     /// [`Self::retire_after_transport_failure`], plus a call that ran out its
     /// budget: a peer that vanished without closing the socket shows up as a
-    /// timeout, and the next caller's dial is what notices it is gone.
+    /// timeout, so the connection is probed and retired if it is silent.
     fn retire_after_call_failure(&self, err: &SpacedRuntimeCallError) {
         match err {
             SpacedRuntimeCallError::Status(status) => self.retire_after_transport_failure(status),
-            SpacedRuntimeCallError::Timeout(_) => self.client.retire_kept_connection(),
+            SpacedRuntimeCallError::Timeout(_) => self.client.verify_kept_connection(),
         }
     }
 
