@@ -1,4 +1,5 @@
 use pplx_space_common_core::types::SandboxId;
+use pplx_space_public_api::PublicSandboxId;
 
 use super::*;
 

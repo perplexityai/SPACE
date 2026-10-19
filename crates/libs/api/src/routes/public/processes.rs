@@ -26,6 +26,7 @@ use super::{
     cursors::{CursorKind, decode_cursor, encode_cursor},
     error::{PublicApiError, with_retry_after_hint},
     owner_scope::{AuthorizedSandbox, authorized_sandbox},
+    sandboxes::parse_public_sandbox_id,
 };
 
 const DEFAULT_PROCESS_LIST_LIMIT: u16 = 100;
@@ -237,10 +238,6 @@ async fn ensure_sandbox_owner(
 ) -> Result<Sandbox, PublicApiError> {
     let sandbox_id = parse_public_sandbox_id(sandbox_id)?;
     authorized_sandbox(authorized, &state.pool, org_id, sandbox_id).await
-}
-
-fn parse_public_sandbox_id(value: &str) -> Result<PublicSandboxId, PublicApiError> {
-    PublicSandboxId::from_str(value).map_err(|_| PublicApiError::bad_request("invalid sandbox id"))
 }
 
 pub(in crate::routes::public) fn controller_error(error: ControllerError) -> PublicApiError {

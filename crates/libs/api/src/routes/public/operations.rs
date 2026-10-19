@@ -13,7 +13,7 @@ use axum::{
 };
 use pplx_space_public_api::{
     OperationId, OperationState, PublicErrorCode, PublicOperationEvent, PublicOperationEventType,
-    PublicOperationRecord, PublicPage, PublicSandboxId,
+    PublicOperationRecord, PublicPage,
 };
 use serde::Deserialize;
 
@@ -29,6 +29,7 @@ use crate::{
 use super::{
     cursors::{CursorKind, decode_cursor, encode_cursor},
     error::PublicApiError,
+    sandboxes::parse_public_sandbox_id,
 };
 
 const DEFAULT_OPERATION_EVENT_LIMIT: u16 = 100;
@@ -103,9 +104,7 @@ pub async fn stream_sandbox_lifecycle_events(
     Extension(AuthOrg(org)): Extension<AuthOrg>,
     Path(sandbox_id): Path<String>,
 ) -> Result<Response, PublicApiError> {
-    let sandbox_id = sandbox_id
-        .parse::<PublicSandboxId>()
-        .map_err(|_| PublicApiError::bad_request("invalid sandbox id"))?;
+    let sandbox_id = parse_public_sandbox_id(&sandbox_id)?;
     let Some(sandbox) = fetch_sandbox(&state.pool, sandbox_id.into()).await? else {
         return Err(PublicApiError::not_found("sandbox not found"));
     };

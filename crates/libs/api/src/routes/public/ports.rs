@@ -11,7 +11,7 @@ use pplx_space_metrics::response::{ResponseKind, ResponseOrigin};
 use pplx_space_public_api::{
     ClosePortExposureRequest, ListPortExposuresResponse, OpenPortExposureRequest, PortExposure,
     PortExposureApplyState, PortExposureDesiredState, PortExposureProtocol, PortExposureResponse,
-    PortExposureVisibility, PublicSandboxId, RequestFingerprint,
+    PortExposureVisibility, RequestFingerprint,
 };
 use sha2::{Digest, Sha256};
 use sqlx::types::Json as SqlJson;
@@ -36,6 +36,7 @@ use crate::{
 use super::{
     error::{PublicApiError, with_retry_after_hint},
     owner_scope::{AuthorizedSandbox, authorized_sandbox},
+    sandboxes::parse_public_sandbox_id,
 };
 
 const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
@@ -210,9 +211,7 @@ async fn ensure_sandbox_owner(
     org_id: OrgId,
     sandbox_id: &str,
 ) -> Result<Sandbox, PublicApiError> {
-    let sandbox_id = sandbox_id
-        .parse::<PublicSandboxId>()
-        .map_err(|_| PublicApiError::bad_request("invalid sandbox id"))?;
+    let sandbox_id = parse_public_sandbox_id(sandbox_id)?;
     authorized_sandbox(authorized, &state.pool, org_id, sandbox_id).await
 }
 

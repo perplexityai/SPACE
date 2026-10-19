@@ -20,6 +20,7 @@ use crate::{middleware::auth::AuthOrg, routes::AppState};
 use super::{
     cursors::{CursorKind, decode_cursor, encode_cursor},
     error::PublicApiError,
+    sandboxes::parse_public_sandbox_id,
 };
 
 const DEFAULT_SNAPSHOT_LIST_LIMIT: u16 = 100;
@@ -259,12 +260,6 @@ fn parse_snapshot_cursor(value: &str) -> Result<(OffsetDateTime, SnapshotId), Pu
         .parse::<SnapshotId>()
         .map_err(|_| PublicApiError::bad_request("invalid cursor"))?;
     Ok((created_at, snapshot_id))
-}
-
-fn parse_public_sandbox_id(value: &str) -> Result<PublicSandboxId, PublicApiError> {
-    value
-        .parse()
-        .map_err(|_| PublicApiError::bad_request("invalid sandbox id"))
 }
 
 fn parse_public_snapshot_id(value: &str) -> Result<PublicSnapshotId, PublicApiError> {

@@ -8,7 +8,6 @@
 use pplx_space_common_core::types::OrgId;
 
 use pplx_space_common_core::sql;
-use std::str::FromStr;
 
 use axum::{
     Extension, Json,
@@ -23,7 +22,7 @@ use sqlx::PgPool;
 use crate::middleware::auth::AuthOrg;
 use crate::routes::AppState;
 
-use super::error::PublicApiError;
+use super::{error::PublicApiError, sandboxes::parse_public_sandbox_id};
 
 pub async fn get_sandbox_network_policy(
     State(state): State<AppState>,
@@ -143,10 +142,6 @@ mod document {
             .await?
             .map(|desired| policy_response(&desired)))
     }
-}
-
-fn parse_public_sandbox_id(value: &str) -> Result<PublicSandboxId, PublicApiError> {
-    PublicSandboxId::from_str(value).map_err(|_| PublicApiError::bad_request("invalid sandbox id"))
 }
 
 async fn ensure_sandbox_owner(

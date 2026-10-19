@@ -957,6 +957,73 @@ async fn every_path_id_route_rejects_a_malformed_id_and_hides_an_unknown_one() -
     Ok(())
 }
 
+/// The middleware parses only what precedes the first `:` of `{sandbox_id}`
+/// (the `:action` suffix), so a suffixed id naming an owned sandbox passes it
+/// and the handler's own parse answers. One route per handler module is
+/// enough: the GETs need no body, and changes-enable stands in for `files`,
+/// which has no GET route.
+#[tokio::test]
+async fn a_suffixed_id_of_an_owned_sandbox_gets_the_handlers_malformed_id_answer()
+-> TestDbResult<()> {
+    let fixture = fixture().await?;
+    let (status, created) = send(
+        &fixture.app,
+        Method::POST,
+        "/v1/sandboxes",
+        HeaderMap::new(),
+        json!({"template":"seed:latest"}),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::ACCEPTED, "{created}");
+    let sandbox = seed_target(&fixture, &created).await?;
+    let mut swept = BTreeSet::new();
+    for (operation, _) in super::super::mounted_operations() {
+        if !operation.path().contains("{sandbox_id}")
+            || (operation.method() != pplx_space_public_api::routes::NativeHttpMethod::Get
+                && operation != pplx_space_public_api::routes::ENABLE_FILE_CHANGES)
+        {
+            continue;
+        }
+        let method = operation.method().openapi_name();
+        for suffix in [":x", "%3Ax"] {
+            let path = concrete_path(
+                operation.path(),
+                "sandbox_id",
+                &format!("{sandbox}{suffix}"),
+            );
+            let (status, body) = send(
+                &fixture.app,
+                Method::from_bytes(method.to_ascii_uppercase().as_bytes())?,
+                &path,
+                request_id_headers(HeaderMap::new()),
+                json!({}),
+            )
+            .await?;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {path}: {body}");
+            assert_eq!(
+                body,
+                error_body("invalid_request", "invalid sandbox id"),
+                "{method} {path}"
+            );
+        }
+        swept.insert(operation.path());
+    }
+    // One route per handler module that parses `{sandbox_id}` itself.
+    for path in [
+        pplx_space_public_api::routes::GET_SANDBOX.path(),
+        pplx_space_public_api::routes::GET_SANDBOX_NETWORK_POLICY.path(),
+        pplx_space_public_api::routes::LIST_SESSIONS.path(),
+        pplx_space_public_api::routes::LIST_PROCESSES.path(),
+        pplx_space_public_api::routes::LIST_PORTS.path(),
+        pplx_space_public_api::routes::LIST_SNAPSHOTS.path(),
+        pplx_space_public_api::routes::ENABLE_FILE_CHANGES.path(),
+        pplx_space_public_api::routes::STREAM_SANDBOX_LIFECYCLE_EVENTS.path(),
+    ] {
+        assert!(swept.contains(path), "{path} was not swept");
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_sandbox_outside_the_callers_scope_is_answered_as_an_unknown_one() -> TestDbResult<()> {
     let fixture = fixture().await?;

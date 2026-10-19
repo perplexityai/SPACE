@@ -20,7 +20,7 @@ use pplx_space_public_api::{
     FileListRequest, FileListResponse, FileMkdirRequest, FileModifiedEntry, FileModifiedRequest,
     FileModifiedResponse, FileMutationResponse, FileReadRequest, FileRemoveRequest,
     FileRenameRequest, FileStatRequest, FileStatResponse, FileType, FileWriteBatchRequest,
-    FileWriteBatchResponse, FileWriteRequest, FileWriteResponse, PublicSandboxId,
+    FileWriteBatchResponse, FileWriteRequest, FileWriteResponse,
 };
 use pplx_space_sbx_mgr_client::operations as spaced_ops;
 use pplx_space_sbx_mgr_client::proto::{
@@ -38,6 +38,7 @@ use crate::{
 use super::{
     error::{PublicApiError, with_retry_after_hint},
     owner_scope::{AuthorizedSandbox, authorized_sandbox},
+    sandboxes::parse_public_sandbox_id,
 };
 
 const MAX_FILE_LIST_ENTRIES: usize = 10_000;
@@ -553,9 +554,7 @@ async fn ensure_sandbox_owner(
     org_id: OrgId,
     sandbox_id: &str,
 ) -> Result<Sandbox, PublicApiError> {
-    let sandbox_id = sandbox_id
-        .parse::<PublicSandboxId>()
-        .map_err(|_| PublicApiError::bad_request("invalid sandbox id"))?;
+    let sandbox_id = parse_public_sandbox_id(sandbox_id)?;
     authorized_sandbox(authorized, pool, org_id, sandbox_id).await
 }
 

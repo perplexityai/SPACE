@@ -1258,6 +1258,10 @@ fn lifecycle_path_template(action: SandboxLifecycleAction) -> OperationPathTempl
     })
 }
 
+/// The one `{sandbox_id}` parser for the native API: `owner_scope` and every
+/// handler call it, so a malformed id gets the same 400 whichever rejects it.
+/// `sandbox_operation_response` also parses a stored operation's `target_id`
+/// with it, so a corrupt stored id answers this 400 too.
 pub(super) fn parse_public_sandbox_id(value: &str) -> Result<PublicSandboxId, PublicApiError> {
     PublicSandboxId::from_str(value).map_err(|_| PublicApiError::bad_request("invalid sandbox id"))
 }
