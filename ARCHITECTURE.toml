@@ -184,7 +184,7 @@ mode = "required"
 # Rootfs copies must preserve NoCoW and sparse extents through common-io's
 # reflink helper. A line matcher cannot infer a path variable's contents, so
 # conservatively fence all new plain filesystem copies and cp launches.
-# Existing non-rootfs, non-Linux and deferred builder/local paths are counted
+# Existing non-rootfs, non-Linux and deferred builder paths are counted
 # in the baseline, not freely allowed; their counts may only decrease.
 [rules.pattern_ratchet.rootfs_copy]
 patterns = [

@@ -9,7 +9,6 @@ members = [
     "crates/apps/db/migrator",
     "crates/apps/credential/mgr/svc",
     "crates/apps/data/plane/svc",
-    "crates/apps/local/node-mgr/svc",
     "crates/apps/net/gateway/bench",
     "crates/apps/net/gateway/svc",
     "crates/apps/node/api/svc",

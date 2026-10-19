@@ -42,13 +42,11 @@ EXTRA_SUBJECTS = (
     "crates/apps/template/publish",
 )
 
-# Not services in the sense above: developer tools, the dev-only local node
-# manager (already lib+bin), a benchmark, a guest test. Test doubles under
-# `crates/apps/mock/` are excluded as a directory below, alongside `/cli/`
-# crates: they stand in for external systems in tests and never get a private
-# main.
+# Not services in the sense above: developer tools, a benchmark, a guest test.
+# Test doubles under `crates/apps/mock/` are excluded as a directory below,
+# alongside `/cli/` crates: they stand in for external systems in tests and
+# never get a private main.
 EXCLUDED = (
-    "crates/apps/local/node-mgr/svc",
     "crates/apps/net/gateway/bench",
     "crates/apps/spaced/guest/loopback-test",
 )

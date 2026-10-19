@@ -5869,28 +5869,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pplx-space-local-node-mgr-svc"
-version = "0.8.0"
-dependencies = [
- "anyhow",
- "clap",
- "dashmap",
- "libc",
- "nix 0.31.3",
- "pplx-space-common-svc",
- "pplx-space-execution-common",
- "pplx-space-node-mgr-client",
- "sha2 0.11.0",
- "tempfile",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tonic",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "pplx-space-metrics"
 version = "0.8.0"
 dependencies = [

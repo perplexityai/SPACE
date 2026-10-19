@@ -21,8 +21,7 @@ struct Cli {
     #[arg(long, requires = "vsock_uds")]
     firecracker_uid: Option<u32>,
     /// Reach the guest's bridge over this UDS instead of a Firecracker vsock.
-    /// Ignored when `--vsock-uds` is set. Used by the local (non-Firecracker)
-    /// node-manager so spaced-host talks to an nspawn guest over a shared UDS.
+    /// Ignored when `--vsock-uds` is set.
     #[arg(long)]
     bridge_guest_uds: Option<PathBuf>,
     /// Listen for the guest's host-bound bridge on this UDS instead of a

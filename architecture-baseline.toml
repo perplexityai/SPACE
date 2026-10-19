@@ -9,7 +9,6 @@
 # that adds an entry or raises a cap is reported.
 
 [file_size]
-"crates/apps/local/node-mgr/svc/src/service.rs" = 1258
 "crates/libs/api/src/controllers/sandbox/lifecycle.rs" = 1825
 "crates/libs/api/src/controllers/sandbox/mod.rs" = 1193
 "crates/libs/api/src/controllers/sandbox/queries.rs" = 2571
@@ -132,8 +131,7 @@
 # Spawns the Kubernetes-only reconcilers from the bound `KubernetesSubstrate`.
 "crates/libs/cluster/controller/server/src/reconcilers.rs" = 1
 [pattern_ratchet.rootfs_copy]
-# Local nspawn and privileged builder copies are deferred; builders stay CoW.
-"crates/apps/local/node-mgr/svc/src/snapshot.rs" = 2
+# Privileged builder copies are deferred; builders stay CoW.
 "crates/libs/build/mgr/src/lib.rs" = 1
 # Network configuration and process-snapshot payloads are not rootfs images.
 "crates/libs/sbx/mgr/server/src/service/grpc_spaced_process_snapshots.rs" = 1

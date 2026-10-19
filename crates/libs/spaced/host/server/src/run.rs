@@ -78,8 +78,7 @@ pub struct SpacedHostRunConfig {
     /// UID of the Firecracker process expected on the far end of `vsock_uds`.
     pub firecracker_uid: Option<u32>,
     /// Reach the guest's bridge over this UDS instead of a Firecracker vsock.
-    /// Ignored when `vsock_uds` is set. Used by the local (non-Firecracker)
-    /// node-manager so spaced-host talks to an nspawn guest over a shared UDS.
+    /// Ignored when `vsock_uds` is set.
     pub bridge_guest_uds: Option<PathBuf>,
     /// Listen for the guest's host-bound bridge on this UDS instead of a
     /// Firecracker vsock. Ignored when `vsock_uds` is set.
