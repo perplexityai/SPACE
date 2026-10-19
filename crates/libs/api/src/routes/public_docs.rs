@@ -271,6 +271,16 @@ fn public_openapi_value() -> Value {
                     }
                 }
             },
+            "/sandboxes/{sandbox_id}/process-sessions:attach": {
+                "get": {
+                    "summary": "Create a process session and attach to it over one WebSocket",
+                    "description": "Served by the data plane when it is configured to reach the API; otherwise answers 404, so clients fall back to `createProcessSession` and `attachSession`. Authenticate the upgrade as `createProcessSession` would, with the API key in `Authorization`. The first client frame is `{\"type\":\"create\",\"idempotency_key\":\"...\",\"request\":{...}}`, where `request` is a `createProcessSession` body and `idempotency_key` its `Idempotency-Key`. The server answers with one frame: `session` carries the `createProcessSession` response, after which the socket behaves as `attachSession` for that session and its `attach.token` reattaches there; `create_failed` carries the create's HTTP status and error body; `create_unavailable` means the create could not be completed and is safe to retry with the same idempotency key. The socket closes after either failure.",
+                    "responses": {
+                        "101": { "description": "WebSocket stream: a ProcessSessionCreateServerFrame, then DataPlaneServerFrame" },
+                        "404": { "description": "Create-and-attach is not enabled on this data plane" }
+                    }
+                }
+            },
             "/sessions/{session_id}/attach": {
                 "get": {
                     "summary": "Attach to a terminal, process, or file-watch session over WebSocket",

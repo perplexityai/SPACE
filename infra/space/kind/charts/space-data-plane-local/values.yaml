@@ -85,6 +85,11 @@ grpcClient:
   # Set to "kubernetes" to exercise per-RPC balancing in Kind.
   endpointDiscovery: ""
 
+# SPACE_DATA_PLANE_API_INTERNAL_URL — in-cluster API origin the data plane
+# sends `process-sessions:attach` creates to. Empty answers that endpoint
+# with 404, and clients create and attach in two steps.
+apiInternalUrl: http://space-api:8080
+
 # JSON array of {apiHost, host} pairs (SPACE_ECW_HOSTS).
 ecwHosts: '[{"apiHost":"api.local.e2b.test","host":"local.e2b.test"}]'
 

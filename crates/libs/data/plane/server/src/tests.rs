@@ -917,6 +917,7 @@ pub(crate) async fn test_data_plane_state() -> DataPlaneState {
         ecw_route_repairs: Arc::new(DashMap::new()),
         ecw_process_input_locks: Arc::new(EcwProcessInputLocks::default()),
         ecw_hosts: Arc::default(),
+        session_create: None,
         revocation_check_interval: Duration::from_secs(1),
         revocation_max_staleness: REVOCATION_MAX_STALENESS,
         revocation_check_timeout: REVOCATION_CHECK_TIMEOUT,

@@ -102,6 +102,14 @@ struct Cli {
         value_parser = clap::value_parser!(u64).range(MIN_SHUTDOWN_GRACE.as_secs()..)
     )]
     shutdown_grace_secs: Option<u64>,
+
+    /// The API's in-cluster `http://` origin, for example
+    /// `http://space-api:8080`. Set, the data plane serves
+    /// `GET /v1/sandboxes/{sandbox_id}/process-sessions:attach`, which creates
+    /// a process session through this origin and attaches it on one socket.
+    /// Unset, that endpoint answers 404.
+    #[arg(long, env = "SPACE_DATA_PLANE_API_INTERNAL_URL")]
+    api_internal_url: Option<String>,
 }
 
 impl From<Cli> for DataPlaneConfig {
@@ -120,6 +128,7 @@ impl From<Cli> for DataPlaneConfig {
             route_cache_ttl: Duration::from_millis(cli.route_cache_ttl_ms.max(1)),
             upload_admission: cli.upload.config(),
             shutdown_grace: cli.shutdown_grace_secs.map(Duration::from_secs),
+            api_internal_url: cli.api_internal_url,
         }
     }
 }
