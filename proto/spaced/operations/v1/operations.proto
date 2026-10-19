@@ -194,6 +194,33 @@ message GetModifiedFilesResponse {
   bool overflowed = 6;
 }
 
+// Lists regular files under search_dir whose path relative to it matches
+// pattern. Matching follows gitignore-style globs anchored at search_dir:
+// `*`, `?` and `[...]` never cross `/`, `**` spans directories, and braces
+// are literal. Hidden entries are included and symbolic links are followed.
+message GlobRequest {
+  string search_dir = 1;
+  string pattern = 2;
+  // Directory names whose contents are excluded at any depth.
+  repeated string skip_dirs = 3;
+  // 0 selects the guest's maximum.
+  uint32 max_results = 4;
+  optional string user = 5;
+}
+message GlobMatch {
+  // Relative to search_dir.
+  string path = 1;
+  uint64 size_bytes = 2;
+  optional google.protobuf.Timestamp modified_at = 3;
+}
+message GlobResponse {
+  // In path order, compared component by component.
+  repeated GlobMatch matches = 1;
+  // The result limit or a traversal bound stopped the walk; more matches may
+  // exist.
+  bool truncated = 2;
+}
+
 message StartRequest {
   repeated string command = 1;
   optional string cwd = 2;

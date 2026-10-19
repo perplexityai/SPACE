@@ -62,6 +62,7 @@ service Filesystem {
   rpc EnableFileChanges(space.spaced.operations.v1.EnableFileChangesRequest) returns (space.spaced.operations.v1.EnableFileChangesResponse);
   rpc DisableFileChanges(space.spaced.operations.v1.DisableFileChangesRequest) returns (space.spaced.operations.v1.DisableFileChangesResponse);
   rpc GetModifiedFiles(space.spaced.operations.v1.GetModifiedFilesRequest) returns (space.spaced.operations.v1.GetModifiedFilesResponse);
+  rpc Glob(space.spaced.operations.v1.GlobRequest) returns (space.spaced.operations.v1.GlobResponse);
 }
 
 message PingRequest {}

@@ -15,11 +15,12 @@ use prost::Message as _;
 use proto::{
     ConfigureProcessEnvRequest, ConnectProcessRequest, CreateWatcherRequest,
     DisableFileChangesRequest, EnableFileChangesRequest, FlushGuestFilesystemsRequest,
-    GetModifiedFilesRequest, GetStatusRequest, GetWatcherEventsRequest, IsConnectedRequest,
-    KillRequest, ListProcessesRequest, ListRequest, MkdirRequest, NormalizeWatchRootRequest,
-    NotifyResumeRequest, PingGuestRequest, PingRequest, PrepareSuspendRequest, RemoveRequest,
-    RemoveWatcherRequest, RenameRequest, ResumeReason, SendSignalRequest, StartRequest,
-    StatRequest, WaitReadyRequest, WatchRequest, WriteBatchEntry, WriteBatchRequest, WriteRequest,
+    GetModifiedFilesRequest, GetStatusRequest, GetWatcherEventsRequest, GlobRequest,
+    IsConnectedRequest, KillRequest, ListProcessesRequest, ListRequest, MkdirRequest,
+    NormalizeWatchRootRequest, NotifyResumeRequest, PingGuestRequest, PingRequest,
+    PrepareSuspendRequest, RemoveRequest, RemoveWatcherRequest, RenameRequest, ResumeReason,
+    SendSignalRequest, StartRequest, StatRequest, WaitReadyRequest, WatchRequest, WriteBatchEntry,
+    WriteBatchRequest, WriteRequest,
 };
 use tonic::Response;
 

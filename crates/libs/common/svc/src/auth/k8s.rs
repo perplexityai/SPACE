@@ -766,6 +766,7 @@ fn guest_bridge_method(role: NodeRole, path: &str) -> bool {
             | "SpacedEnableFileChanges"
             | "SpacedDisableFileChanges"
             | "SpacedGetModifiedFiles"
+            | "SpacedGlob"
             | "SpacedStartProcess"
             | "SpacedConnectProcess"
             | "SpacedListProcesses"

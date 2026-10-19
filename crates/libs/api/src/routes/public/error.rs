@@ -231,6 +231,17 @@ impl PublicApiError {
         rejected
     }
 
+    /// A `failed_precondition` naming an operation this sandbox is too old to
+    /// perform, so a client can tell it from other refusals and fall back.
+    pub fn unsupported_operation(message: impl Into<String>, operation: &str) -> Self {
+        let mut error = Self::failed_precondition(message);
+        error.details.push(PublicErrorDetail {
+            key: pplx_space_public_api::UNSUPPORTED_OPERATION_DETAIL_KEY.to_string(),
+            value: operation.to_string(),
+        });
+        error
+    }
+
     pub fn with_retry_after(mut self, retry_after: Duration) -> Self {
         self.retry_after = Some(retry_after);
         self

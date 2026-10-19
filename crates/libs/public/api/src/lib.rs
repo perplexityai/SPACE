@@ -1776,6 +1776,39 @@ pub struct FileListRequest {
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileGlobRequest {
+    /// Directory the pattern is anchored at; relative paths resolve against
+    /// the user's home directory.
+    pub search_dir: String,
+    pub pattern: String,
+    /// Directory names whose contents are excluded at any depth.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub skip_dirs: Vec<String>,
+    /// Defaults to, and is capped at, the guest's maximum.
+    pub max_results: Option<u32>,
+    pub user: Option<String>,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileGlobMatch {
+    /// Relative to `search_dir`.
+    pub path: String,
+    pub size_bytes: u64,
+    pub modified_at: Option<String>,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileGlobResponse {
+    pub matches: Vec<FileGlobMatch>,
+    /// The result limit or a traversal bound stopped the walk; more matches
+    /// may exist.
+    pub truncated: bool,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileReadRequest {
     pub path: String,
     #[cfg_attr(feature = "serde", serde(default))]
@@ -2208,6 +2241,12 @@ pub const CONFLICT_REASON_DETAIL_KEY: &str = "reason";
 /// retained. The replay returns no token; create a new session with a new
 /// idempotency key.
 pub const CONFLICT_REASON_SESSION_ENDED: &str = "session_ended";
+
+/// [`PublicErrorDetail::key`] naming the operation a `failed_precondition`
+/// says this sandbox cannot perform, because its guest or a service between
+/// is older than the operation. The client may fall back to another way of
+/// doing the same work.
+pub const UNSUPPORTED_OPERATION_DETAIL_KEY: &str = "unsupported_operation";
 
 open_wire_enum!(DataPlaneHttpErrorCode, "data-plane HTTP error code", {
     InvalidRequest => "invalid_request",

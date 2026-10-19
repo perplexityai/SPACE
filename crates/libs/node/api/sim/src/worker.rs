@@ -1417,6 +1417,13 @@ impl WorkerApi for SimWorkerApiService {
         unimplemented()
     }
 
+    async fn spaced_glob(
+        &self,
+        _request: Request<sbx::SpacedGlobRequest>,
+    ) -> Result<Response<sbx::SpacedGlobResponse>, Status> {
+        unimplemented()
+    }
+
     async fn spaced_start_process(
         &self,
         request: Request<sbx::SpacedStartProcessRequest>,

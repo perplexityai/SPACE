@@ -674,6 +674,21 @@ fn insert_file_mutation_paths(paths: &mut Map<String, Value>, idempotency_key_pa
         }),
     );
     paths.insert(
+        "/sandboxes/{sandbox_id}/files:glob".to_string(),
+        json!({
+            "post": {
+                "summary": "List guest files whose path matches a glob",
+                "description": "Lists regular files under `search_dir` whose path relative to it matches `pattern`, in one request without starting a process. The pattern is a gitignore-style glob anchored at `search_dir`: `*`, `?` and `[...]` never cross `/`, `**` spans directories, and braces are literal. Hidden entries are included and symbolic links are followed; a link back to an ancestor directory is not entered again. Files beneath any directory named in `skip_dirs` are excluded. Matches come in path order, compared component by component, with paths relative to `search_dir`. A missing `search_dir`, or one that is not a directory, has no matches. `truncated` is set when `max_results` (default and cap 100,000), the response size, or the walk's time and entry bounds stopped the walk; more matches may exist. A sandbox whose guest predates this operation answers 412 with detail `unsupported_operation: files:glob`.",
+                "responses": {
+                    "200": { "description": "Matching files" },
+                    "400": { "description": "Invalid sandbox id, or an invalid pattern or glob request" },
+                    "404": { "description": "Sandbox not found" },
+                    "412": { "description": "The sandbox's guest does not support glob" }
+                }
+            }
+        }),
+    );
+    paths.insert(
         "/sandboxes/{sandbox_id}/files:mkdir".to_string(),
         json!({
             "post": {

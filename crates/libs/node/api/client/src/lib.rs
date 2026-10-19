@@ -490,6 +490,7 @@ impl<'a> WorkerApiClient<'a> {
         spaced_enable_file_changes, proto::worker_api_client::WorkerApiClient::new, pplx_space_sbx_mgr_client::proto::SpacedEnableFileChangesRequest, pplx_space_sbx_mgr_client::operations::EnableFileChangesResponse;
         spaced_disable_file_changes, proto::worker_api_client::WorkerApiClient::new, pplx_space_sbx_mgr_client::proto::SpacedDisableFileChangesRequest, pplx_space_sbx_mgr_client::operations::DisableFileChangesResponse;
         spaced_get_modified_files, proto::worker_api_client::WorkerApiClient::new, pplx_space_sbx_mgr_client::proto::SpacedGetModifiedFilesRequest, pplx_space_sbx_mgr_client::operations::GetModifiedFilesResponse;
+        spaced_glob, proto::worker_api_client::WorkerApiClient::new, pplx_space_sbx_mgr_client::proto::SpacedGlobRequest, pplx_space_sbx_mgr_client::operations::GlobResponse;
         spaced_list_processes, proto::worker_api_client::WorkerApiClient::new, pplx_space_sbx_mgr_client::proto::SpacedListProcessesRequest, pplx_space_sbx_mgr_client::proto::SpacedListProcessesResponse;
         spaced_send_signal, proto::worker_api_client::WorkerApiClient::new, pplx_space_sbx_mgr_client::proto::SpacedSendSignalRequest, pplx_space_sbx_mgr_client::operations::SendSignalResponse;
         spaced_send_input, proto::worker_api_client::WorkerApiClient::new, pplx_space_sbx_mgr_client::proto::SpacedSendInputRequest, pplx_space_sbx_mgr_client::operations::SendInputResponse;
