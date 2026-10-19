@@ -1889,6 +1889,13 @@ impl ClusterApi for ClusterApiService {
         ClusterApiService::touch_artifact_backup(self, request).await
     }
 
+    async fn report_corrupt_snapshot(
+        &self,
+        request: Request<crate::proto::ReportCorruptSnapshotRequest>,
+    ) -> Result<Response<crate::proto::ReportCorruptSnapshotResponse>, Status> {
+        ClusterApiService::report_corrupt_snapshot(self, request).await
+    }
+
     async fn get_artifact_backup_location(
         &self,
         request: Request<GetArtifactBackupLocationRequest>,

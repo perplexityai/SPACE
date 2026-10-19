@@ -33,16 +33,14 @@ static CRC32C: crc::Crc<u32, crc::Table<16>> = crc::Crc::<u32, crc::Table<16>>::
 type Digest = crc::Digest<'static, u32, crc::Table<16>>;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub(super) enum FramingError {
+pub(in crate::service) enum FramingError {
     #[error("send stream does not start with the btrfs-stream header")]
     BadMagic,
     #[error("send stream version {0} is not supported")]
     Version(u32),
     #[error("send command at offset {offset} declares {len} payload bytes")]
     CommandTooLarge { offset: u64, len: u32 },
-    #[error(
-        "send command {cmd} at offset {offset} fails its CRC; the send was interrupted and restarted"
-    )]
+    #[error("send command {cmd} at offset {offset} fails its CRC")]
     Crc { offset: u64, cmd: u16 },
     #[error("send stream continues past its END command at offset {offset}")]
     DataAfterEnd { offset: u64 },
@@ -63,7 +61,7 @@ enum State {
 }
 
 /// Incremental checker over the bytes of one send stream, in order.
-pub(super) struct SendStreamFraming {
+pub(in crate::service) struct SendStreamFraming {
     state: State,
     /// Stream offset where the item being read began.
     item_offset: u64,
@@ -85,7 +83,7 @@ fn fill(header: &mut [u8], filled: &mut usize, data: &mut &[u8], offset: &mut u6
 }
 
 impl SendStreamFraming {
-    pub(super) fn new() -> Self {
+    pub(in crate::service) fn new() -> Self {
         Self {
             state: State::StreamHeader([0; 17], 0),
             item_offset: 0,
@@ -93,7 +91,7 @@ impl SendStreamFraming {
         }
     }
 
-    pub(super) fn feed(&mut self, mut data: &[u8]) -> Result<(), FramingError> {
+    pub(in crate::service) fn feed(&mut self, mut data: &[u8]) -> Result<(), FramingError> {
         while !data.is_empty() {
             match &mut self.state {
                 State::StreamHeader(header, filled) => {
@@ -161,7 +159,7 @@ impl SendStreamFraming {
     }
 
     /// The stream ended: accept it only after its END command.
-    pub(super) fn finish(&self) -> Result<(), FramingError> {
+    pub(in crate::service) fn finish(&self) -> Result<(), FramingError> {
         match self.state {
             State::Ended => Ok(()),
             _ => Err(FramingError::Truncated {

@@ -52,7 +52,7 @@ def btrfs_send_restore_rejects_corrupted_stream(test: smoke.KindEcw) -> None:
         restore.wait_until_restore_portable()
 
     with test.phase("corrupt one byte of the durable stream"):
-        codec.corrupt_stream()
+        corrupted = codec.corrupt_stream()
 
     with restore.cordoned(source.node_name):
         since = codec.mark_since()
@@ -68,3 +68,6 @@ def btrfs_send_restore_rejects_corrupted_stream(test: smoke.KindEcw) -> None:
 
         with test.phase("no instance and no partial receive remain on the target"):
             codec.expect_no_instance(target_node)
+
+        with test.phase("corruption permanently fails the stored snapshot without downloading it again"):
+            codec.expect_corrupt_snapshot_terminal(corrupted, target_node)

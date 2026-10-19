@@ -2035,6 +2035,7 @@ mod ingress_protection;
 mod reconcile;
 mod recovery;
 mod recovery_cross_node;
+mod restore_corruption;
 #[cfg(test)]
 mod route_identity_tests;
 mod spaced_bridge;

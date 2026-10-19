@@ -34,6 +34,7 @@ impl ReceiveRoot {
         configure_receiver(&mut command, &self.directory).map_err(error)?;
         remove_at(&self.directory, "instance".as_ref())?;
         remove_at(&self.directory, "instance.ro".as_ref())?;
+        let mut verification_stream = stream.try_clone().map_err(error)?;
         let output = crate::host_command::stream_in_namespace(
             &mut command,
             crate::host_command::MUTATION_BUDGET,
@@ -43,6 +44,18 @@ impl ReceiveRoot {
         )
         .map_err(|error| Status::unavailable(format!("btrfs receive failed: {error}")))?;
         if !output.status.success() {
+            // A receiver failure alone does not condemn the artifact: disk
+            // pressure and a missing parent can fail a valid stream. Verify
+            // the same pinned bytes before reporting permanent corruption.
+            // Successful receives need no second pass over the stream.
+            if let Some(corruption) = stream_corruption(&mut verification_stream, cancel) {
+                return Err(Status::data_loss(format!(
+                    "corrupt btrfs restore stream: {corruption}"
+                )));
+            }
+            if cancel.is_some_and(CancellationToken::is_cancelled) {
+                return Err(Status::cancelled("btrfs receive validation cancelled"));
+            }
             return Err(Status::internal(format!(
                 "btrfs receive exited with {}: {}",
                 output.status,
@@ -64,6 +77,38 @@ impl ReceiveRoot {
         nix::fcntl::renameat(&self.directory, "instance.ro", &self.directory, "instance")
             .map_err(error)?;
         self.directory.sync_all().map_err(error)
+    }
+}
+
+fn stream_corruption(
+    stream: &mut File,
+    cancel: Option<&CancellationToken>,
+) -> Option<super::super::btrfs_send_transport::framing::FramingError> {
+    use super::super::btrfs_send_transport::framing::{FramingError, SendStreamFraming};
+    use std::io::{Read, Seek};
+
+    // A read/seek failure says nothing about stored bytes. In particular,
+    // test receivers can consume pipes, which cannot be inspected again.
+    stream.rewind().ok()?;
+    let mut framing = SendStreamFraming::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let result = loop {
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            return None;
+        }
+        let count = stream.read(&mut buffer).ok()?;
+        if count == 0 {
+            break framing.finish();
+        }
+        let chunk = buffer.get(..count)?;
+        if let Err(error) = framing.feed(chunk) {
+            break Err(error);
+        }
+    };
+    match result {
+        // A newer stream version is not evidence of corrupt stored bytes.
+        Ok(()) | Err(FramingError::Version(_)) => None,
+        Err(error) => Some(error),
     }
 }
 

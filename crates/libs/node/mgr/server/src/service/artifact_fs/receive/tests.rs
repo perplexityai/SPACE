@@ -29,6 +29,7 @@ fn receive_keeps_destination_identity_through_scrub_and_publication() {
             "during-symlink",
             "during-directory",
             "cancel",
+            "missing-parent",
         ] {
             let case = fixture.join(replacement);
             std::fs::create_dir(&case).unwrap();
@@ -63,12 +64,25 @@ fn receive_keeps_destination_identity_through_scrub_and_publication() {
             // Retrying against the same pinned root scrubs that debt first.
             let bytes = std::fs::read(case.join("stream")).unwrap();
             std::fs::write(case.join("partial"), &bytes[..bytes.len() / 2]).unwrap();
-            receive
+            let partial_error = receive
                 .receive(File::open(case.join("partial")).unwrap(), None)
                 .unwrap_err();
+            assert_eq!(partial_error.code(), tonic::Code::DataLoss);
             assert!(!destination.join("instance").exists());
             remove_at(&receive.directory, "instance.ro".as_ref()).unwrap();
+            let mut corrupt = bytes.clone();
+            // Flip the first command's checksum, leaving framing and payload intact.
+            corrupt[23] ^= 0xff;
+            std::fs::write(case.join("corrupt"), corrupt).unwrap();
+            let corrupt_error = receive
+                .receive(File::open(case.join("corrupt")).unwrap(), None)
+                .unwrap_err();
+            assert_eq!(corrupt_error.code(), tonic::Code::DataLoss);
+            assert!(!destination.join("instance").exists());
             let mut original = destination.clone();
+            if replacement == "missing-parent" {
+                remove_at(&parent, "template".as_ref()).unwrap();
+            }
             let result = if replacement.starts_with("during-") || replacement == "cancel" {
                 // Stop the real receiver after its first SNAPSHOT command,
                 // not merely before exec: realpath-based pseudo-pinning can
@@ -118,7 +132,11 @@ fn receive_keeps_destination_identity_through_scrub_and_publication() {
                     "{replacement}: receive mutated the replacement directory: {result:?}"
                 );
             }
-            if replacement == "cancel" {
+            if replacement == "missing-parent" {
+                assert_eq!(result.unwrap_err().code(), tonic::Code::Internal);
+                assert!(!original.join("instance").exists());
+                continue;
+            } else if replacement == "cancel" {
                 result.unwrap_err();
                 assert!(!original.join("instance").exists());
                 receive
