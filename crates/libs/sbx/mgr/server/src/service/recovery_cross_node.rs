@@ -1345,6 +1345,10 @@ impl SandboxManagerService {
 
         let expected_restore_source =
             select_interrupted_restore_source(storage_uri, interrupted_restore_source.clone())?;
+        if let Some(source) = expected_restore_source.as_ref() {
+            self.reject_corrupt_restore_source(&canonical_id, source)
+                .await?;
+        }
         if retrying_interrupted_restore
             && let (Some(persisted_source), Some(selected_source)) = (
                 interrupted_restore_source.as_ref(),
@@ -1677,6 +1681,8 @@ impl SandboxManagerService {
                 uri: staged.storage_uri.clone(),
                 source,
             })?;
+        self.reject_corrupt_restore_source(&canonical_id, &restore_source)
+            .await?;
         emit_sandbox_event(
             &canonical_id,
             SandboxEventType::SnapshotRestoreStarted,
@@ -1779,6 +1785,8 @@ impl SandboxManagerService {
         .instrument(phase2_span)
         .await;
         if let Err(ref e) = phase2_result {
+            self.record_restore_corruption(&canonical_id, &restore_source, e)
+                .await?;
             emit_sandbox_event(
                 &canonical_id,
                 SandboxEventType::SnapshotRestoreFailed,

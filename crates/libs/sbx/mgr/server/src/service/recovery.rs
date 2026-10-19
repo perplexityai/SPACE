@@ -117,7 +117,8 @@ fn quarantine_recovery_no_progress_reason(
             crate::db::QuarantineRecoveryNoProgressReason::LocalAdoptionFenceChanged
         }
         // This node's database refused a read or a write.
-        crate::snapshot_restore::RestoreError::ReadSandboxRow { .. }
+        crate::snapshot_restore::RestoreError::CorruptionState { .. }
+        | crate::snapshot_restore::RestoreError::ReadSandboxRow { .. }
         | crate::snapshot_restore::RestoreError::PersistRestoringRow { .. }
         | crate::snapshot_restore::RestoreError::AdvanceRestorePhase { .. }
         | crate::snapshot_restore::RestoreError::ReadQuarantineRecoveryClaim { .. }
@@ -133,7 +134,8 @@ fn quarantine_recovery_no_progress_reason(
             crate::db::QuarantineRecoveryNoProgressReason::NodeFilesystemFailure
         }
         // The restore's own evidence disagreed with itself.
-        crate::snapshot_restore::RestoreError::SnapshotIdentityMismatch { .. }
+        crate::snapshot_restore::RestoreError::CorruptArtifact
+        | crate::snapshot_restore::RestoreError::SnapshotIdentityMismatch { .. }
         | crate::snapshot_restore::RestoreError::InvalidSandboxId { .. }
         | crate::snapshot_restore::RestoreError::InvalidRestoreSource { .. }
         | crate::snapshot_restore::RestoreError::ArtifactSnapshotUriMismatch { .. }

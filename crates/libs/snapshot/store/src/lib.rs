@@ -679,6 +679,46 @@ pub struct ReadyArtifactLocation {
     pub size_bytes: Option<i64>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum MarkRestoreSourceCorruptError {
+    #[error("mark corrupt restore source: {0}")]
+    Database(#[from] sqlx::Error),
+}
+
+/// Withdraw a backup after a restoring node has verified corrupt artifact
+/// bytes. Scope the write to the exact registered source, not the sandbox's
+/// newest snapshot: a delayed report must never invalidate a newer backup.
+/// Placement and ownership are checked by the same statement as the write.
+/// Fork artifacts follow the existing organization-scoped read contract.
+pub async fn mark_restore_source_corrupt(
+    executor: impl sqlx::PgExecutor<'_>,
+    sandbox_id: SandboxId,
+    storage_uri: &ExactStorageUri,
+    node_ids: &[NodeId],
+) -> Result<bool, MarkRestoreSourceCorruptError> {
+    let changed = sqlx::query(sql!(
+        "UPDATE snapshots snapshot
+            SET state = 'failed', failure_reason = 'snapshot artifact is corrupt'
+           FROM snapshot_storage_locations location, sandboxes sandbox
+          WHERE sandbox.id = $1
+            AND (sandbox.active_node_id = ANY($3) OR sandbox.target_node_id = ANY($3))
+            AND (snapshot.sandbox_id = sandbox.id
+                 OR (snapshot.artifact_origin = 'fork' AND snapshot.org_id = sandbox.org_id))
+            AND location.snapshot_id = snapshot.id
+            AND location.storage_connection_string = $2
+            AND location.orphaned_at IS NULL
+            AND (snapshot.state = 'ready'
+                 OR (snapshot.state = 'failed'
+                     AND snapshot.failure_reason = 'snapshot artifact is corrupt'))"
+    ))
+    .bind(sandbox_id)
+    .bind(storage_uri.as_wire())
+    .bind(node_ids)
+    .execute(executor)
+    .await?;
+    Ok(changed.rows_affected() > 0)
+}
+
 /// The newest `ready` suspend snapshot of `sandbox_id`, when that sandbox is
 /// placed on one of `node_ids`: active there, or the target of a pending
 /// migration or restore. A sandbox placed elsewhere reads as absent, not as

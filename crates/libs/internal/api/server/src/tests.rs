@@ -4813,6 +4813,79 @@ async fn get_location(
         .map(|r| r.into_inner())
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn corruption_report_withdraws_only_the_exact_backup_on_the_callers_node() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let sandbox_id = seed_sandbox(&fixture.service.pool).await?;
+    let corrupt = SnapshotId::new();
+    let other = SnapshotId::new();
+    for id in [corrupt, other] {
+        seed_suspend_snapshot(&fixture.service, sandbox_id, id).await?;
+        finalize(
+            &fixture.service,
+            id,
+            SuspendSnapshotTerminalState::Ready,
+            123,
+        )
+        .await?;
+    }
+    let request = crate::proto::ReportCorruptSnapshotRequest {
+        sandbox_id: sandbox_id.to_string(),
+        storage_uri: test_storage_uri(sandbox_id, corrupt),
+    };
+    let denied = fixture
+        .service
+        .report_corrupt_snapshot(Request::new(request.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), Code::PermissionDenied);
+    let denied = fixture
+        .service
+        .report_corrupt_snapshot(request_from_node(request.clone(), "192.0.2.99".parse()?))
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), Code::FailedPrecondition);
+    assert_eq!(
+        snapshot_store::get(&fixture.service.pool, corrupt)
+            .await?
+            .unwrap()
+            .state(),
+        SnapshotState::Ready
+    );
+
+    for _ in 0..2 {
+        fixture
+            .service
+            .report_corrupt_snapshot(request_from_node(request.clone(), TEST_WORKER_IP))
+            .await?;
+    }
+    assert_eq!(
+        snapshot_store::get(&fixture.service.pool, corrupt)
+            .await?
+            .unwrap()
+            .state(),
+        SnapshotState::Failed
+    );
+    assert_eq!(
+        get_location(&fixture.service, sandbox_id)
+            .await?
+            .snapshot_id,
+        other.to_string()
+    );
+    let replay = finalize(
+        &fixture.service,
+        corrupt,
+        SuspendSnapshotTerminalState::Ready,
+        123,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(replay.code(), Code::FailedPrecondition);
+    Ok(())
+}
+
 async fn begin_artifact_backup(
     service: &ClusterApiService,
     sandbox_id: SandboxId,

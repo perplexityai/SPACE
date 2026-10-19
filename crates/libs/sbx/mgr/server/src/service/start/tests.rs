@@ -291,29 +291,54 @@ fn write_suspend_snapshot_files(
 }
 
 #[tokio::test]
-async fn restore_rootfs_policy_failure_is_permanent_not_a_retry_response() {
-    let directory = tempfile::tempdir().unwrap();
-    let sandbox_id = SandboxId::new().to_string();
-    let mut provenance = RestoredSnapshotProvenance::default();
-    let error = stage_remote_suspend_restore_if_needed(
-        &sandbox_id,
-        directory.path(),
-        SuspendRestorePlacement::RemoteOnly,
-        Some("s3://test/selected-snapshot?region=us-east-1"),
-        &mut provenance,
-        |_, _| async {
-            Err(crate::snapshot_restore::RestoreError::RootfsPolicy(
+async fn restore_stage_preserves_permanent_and_retryable_failures() {
+    use crate::snapshot_restore::RestoreError;
+    for (failure, expected) in [
+        (
+            RestoreError::RootfsPolicy(
                 pplx_space_common_core::sandbox_storage::RootfsSizeError::TooLarge {
                     requested_bytes: u64::MAX,
                     maximum_bytes: 128 * 1024 * 1024 * 1024,
                 },
-            ))
-        },
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-    assert!(provenance.storage_uri.is_none());
+            ),
+            tonic::Code::FailedPrecondition,
+        ),
+        (RestoreError::CorruptArtifact, tonic::Code::DataLoss),
+        (
+            RestoreError::BtrfsReceive {
+                source: crate::btrfs_via_nodemgr::BtrfsViaNodemgrError::Rpc {
+                    rpc: "BtrfsReceiveInstance",
+                    status: Status::data_loss("invalid stream CRC"),
+                },
+            },
+            tonic::Code::DataLoss,
+        ),
+        (
+            RestoreError::BtrfsReceive {
+                source: crate::btrfs_via_nodemgr::BtrfsViaNodemgrError::Rpc {
+                    rpc: "BtrfsReceiveInstance",
+                    status: Status::unavailable("receiver unavailable"),
+                },
+            },
+            tonic::Code::Unavailable,
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let sandbox_id = SandboxId::new().to_string();
+        let mut provenance = RestoredSnapshotProvenance::default();
+        let error = stage_remote_suspend_restore_if_needed(
+            &sandbox_id,
+            directory.path(),
+            SuspendRestorePlacement::RemoteOnly,
+            Some("s3://test/selected-snapshot?region=us-east-1"),
+            &mut provenance,
+            |_, _| async { Err(failure) },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), expected);
+        assert!(provenance.storage_uri.is_none());
+    }
 }
 
 async fn run_selected_remote_stage_for_test(

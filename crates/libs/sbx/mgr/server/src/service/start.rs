@@ -435,6 +435,23 @@ async fn prepare_suspend_restore_dir(
     execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
     activation_attempt_id: Option<pplx_space_common_core::types::SandboxActivationAttemptId>,
 ) -> Result<crate::snapshot_restore::RestorePrepared, crate::snapshot_restore::RestoreError> {
+    let storage_uri = match storage_uri {
+        Some(uri) => uri,
+        None => {
+            crate::snapshot_restore::get_suspend_snapshot_location(&sandbox_id)
+                .await?
+                .storage_uri
+        }
+    };
+    let restore_source = storage_uri.parse().map_err(|source| {
+        crate::snapshot_restore::RestoreError::InvalidRestoreSource {
+            uri: storage_uri.clone(),
+            source,
+        }
+    })?;
+    service
+        .reject_corrupt_restore_source(&sandbox_id, &restore_source)
+        .await?;
     let retire_scope = |
         transfer_scope_id: pplx_space_common_core::types::TransferScopeId,
     | -> Result<(), crate::snapshot_restore::RestoreError> {
@@ -505,35 +522,23 @@ async fn prepare_suspend_restore_dir(
                 "restore execution identity is missing".into(),
             )
         })?;
-    let prepared = match storage_uri.as_deref() {
-        Some(storage_uri) => {
-            crate::snapshot_restore::prepare_restore_dir_from_uri(
-                &sandbox_id,
-                owner,
-                execution_fence,
-                storage_uri,
-                transfer_scope_id,
-                &service.node_manager,
-                service.template_resolver.as_ref(),
-            )
-            .await
-        }
-        None => {
-            crate::snapshot_restore::prepare_restore_dir(
-                &sandbox_id,
-                owner,
-                execution_fence,
-                transfer_scope_id,
-                &service.node_manager,
-                service.template_resolver.as_ref(),
-            )
-            .await
-        }
-    };
+    let prepared = crate::snapshot_restore::prepare_restore_dir_from_uri(
+        &sandbox_id,
+        owner,
+        execution_fence,
+        &storage_uri,
+        transfer_scope_id,
+        &service.node_manager,
+        service.template_resolver.as_ref(),
+    )
+    .await;
 
     let prepared = match prepared {
         Ok(prepared) => prepared,
         Err(stage_error) => {
+            service
+                .record_restore_corruption(&sandbox_id, &restore_source, &stage_error)
+                .await?;
             service
                 .cancel_restore_transfer_scope_and_remove_staging(&sandbox_id, &scope)
                 .await
@@ -647,6 +652,9 @@ where
             Err(RestoreError::AdmissionRejected(status)) => return Err(status),
             Err(error @ RestoreError::RootfsPolicy(..)) => {
                 return Err(Status::failed_precondition(error.to_string()));
+            }
+            Err(reason) if reason.is_corrupt_artifact() => {
+                return Err(Status::data_loss("snapshot artifact is corrupt"));
             }
             Err(reason) => {
                 return Err(Status::unavailable(format!(
@@ -1031,7 +1039,7 @@ impl SandboxManagerService {
                 tracing::warn!(
                     sandbox_id,
                     %error,
-                    "cross-node restore failed; surfacing Unavailable"
+                    "cross-node restore staging failed"
                 );
                 let observed_encrypted =
                     super::recovery_cross_node::encrypted_from_staged_sidecar(sandbox_id);
@@ -1043,9 +1051,13 @@ impl SandboxManagerService {
                     error.stage_error_kind(),
                     cross_node_started_at,
                 );
-                Err(Status::unavailable(format!(
-                    "cross-node restore stage-in failed: {error}"
-                )))
+                if error.is_corrupt_artifact() {
+                    Err(Status::data_loss("snapshot artifact is corrupt"))
+                } else {
+                    Err(Status::unavailable(format!(
+                        "cross-node restore stage-in failed: {error}"
+                    )))
+                }
             }
         }
     }
@@ -1115,6 +1127,9 @@ impl SandboxManagerService {
                         error @ crate::snapshot_restore::RestoreError::CanonicalRootConflict {
                             ..
                         } => Status::failed_precondition(error.to_string()),
+                        other if other.is_corrupt_artifact() => {
+                            Status::data_loss("snapshot artifact is corrupt")
+                        }
                         other => Status::unavailable(format!(
                             "resume interrupted cross-node restore staging failed: {other}"
                         )),

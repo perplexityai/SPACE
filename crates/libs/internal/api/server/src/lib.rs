@@ -1049,6 +1049,38 @@ impl ClusterApiService {
         Ok(Response::new(TouchArtifactBackupResponse {}))
     }
 
+    pub(crate) async fn report_corrupt_snapshot(
+        &self,
+        request: Request<crate::proto::ReportCorruptSnapshotRequest>,
+    ) -> Result<Response<crate::proto::ReportCorruptSnapshotResponse>, Status> {
+        let node_ids = self.caller_node_ids(&request).await?;
+        let req = request.into_inner();
+        let sandbox_id = req
+            .sandbox_id
+            .parse::<SandboxId>()
+            .map_err(|_| Status::invalid_argument("invalid sandbox id"))?;
+        let storage_uri = req
+            .storage_uri
+            .parse::<pplx_space_common_core::types::ExactStorageUri>()
+            .map_err(|_| Status::invalid_argument("invalid snapshot source"))?;
+        if !snapshot_store::mark_restore_source_corrupt(
+            &self.pool,
+            sandbox_id,
+            &storage_uri,
+            &node_ids,
+        )
+        .await
+        .map_err(|error| Status::internal(format!("withdraw corrupt snapshot: {error}")))?
+        {
+            return Err(Status::failed_precondition(
+                "snapshot source is not reportable by this node",
+            ));
+        }
+        Ok(Response::new(
+            crate::proto::ReportCorruptSnapshotResponse {},
+        ))
+    }
+
     pub(crate) async fn get_artifact_backup_location(
         &self,
         request: Request<GetArtifactBackupLocationRequest>,

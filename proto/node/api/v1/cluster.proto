@@ -170,6 +170,11 @@ service ClusterApi {
   // an identity it already holds is backed up; the reply is only `ready`.
   rpc GetArtifactBackupLocation(GetArtifactBackupLocationRequest) returns (GetArtifactBackupLocationResponse);
 
+  // Withdraw the exact backup whose bytes failed integrity validation during
+  // restore. The authenticated caller must host the restoring sandbox.
+  // Repeating the same corruption report is idempotent.
+  rpc ReportCorruptSnapshot(ReportCorruptSnapshotRequest) returns (ReportCorruptSnapshotResponse);
+
   // Return a read-only, generation-fenced plan for automatic recovery of the
   // caller's currently assigned quarantine episode. The plan identity is the
   // central quarantine episode id; the node echoes it in its transition
@@ -1159,6 +1164,14 @@ message GetArtifactBackupLocationResponse {
   // Set only in reply to a readiness query; every other field is then empty.
   optional bool ready = 7;
 }
+
+message ReportCorruptSnapshotRequest {
+  string sandbox_id = 1;
+  // Exact registered source, including its immutable backup-attempt prefix.
+  string storage_uri = 2;
+}
+
+message ReportCorruptSnapshotResponse {}
 
 message GetQuarantineRecoveryPlanRequest {
   // Authenticated node requesting recovery. The server verifies that the

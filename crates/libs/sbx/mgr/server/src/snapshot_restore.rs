@@ -129,6 +129,13 @@ pub enum RecoveredSandboxRowFieldsError {
 /// Errors returned from [`prepare_restore_dir`].
 #[derive(Debug, thiserror::Error)]
 pub enum RestoreError {
+    #[error("snapshot artifact is corrupt")]
+    CorruptArtifact,
+    #[error("access corrupt restore source state: {source}")]
+    CorruptionState {
+        #[source]
+        source: rusqlite::Error,
+    },
     /// Cluster API is not configured on this node — restore-from-S3 can't
     /// run. Falls through to normal `NotFound` handling for the caller.
     #[error("cluster-api not configured: {0}")]
@@ -281,6 +288,13 @@ pub enum RestoreError {
 }
 
 impl RestoreError {
+    pub(crate) fn is_corrupt_artifact(&self) -> bool {
+        matches!(self, Self::CorruptArtifact)
+            || matches!(self, Self::BtrfsReceive {
+                source: crate::btrfs_via_nodemgr::BtrfsViaNodemgrError::Rpc { status, .. },
+            } if status.code() == tonic::Code::DataLoss)
+    }
+
     /// What failed, for a stage-in failure reported as `stage_failed`. Every
     /// variant is listed so a new one is classified rather than defaulted.
     /// The variants a restore reports under a reason of their own map to
@@ -299,7 +313,8 @@ impl RestoreError {
             | Self::RemoveFile { .. }
             | Self::RemoveDirectory { .. }
             | Self::RenamePath { .. } => Kind::Filesystem,
-            Self::ReadSandboxRow { .. }
+            Self::CorruptionState { .. }
+            | Self::ReadSandboxRow { .. }
             | Self::PersistRestoringRow { .. }
             | Self::InvalidRecoveredSandboxRow { .. }
             | Self::AdvanceRestorePhase { .. }
@@ -313,7 +328,7 @@ impl RestoreError {
             | Self::QuarantineRecoveryAbandonedAtShutdown { .. } => Kind::QuarantineRecovery,
             Self::QuarantineRecoveryTimedOut { .. } => Kind::QuarantineRecoveryTimeout,
             Self::ParentTemplateLookup { .. } => Kind::ParentTemplate,
-            Self::BtrfsReceive { .. } => Kind::BtrfsReceive,
+            Self::BtrfsReceive { .. } | Self::CorruptArtifact => Kind::BtrfsReceive,
             Self::ClusterApiUnconfigured(_)
             | Self::SnapshotNotRegistered(_)
             | Self::AdmissionRejected(_)
@@ -399,7 +414,9 @@ impl RestoreError {
             // timeouts, paths it constructed, and wrapped rusqlite/io sources.
             // Nothing here holds a string supplied by a caller, a peer, or
             // downloaded metadata.
-            Self::SnapshotNotRegistered(..)
+            Self::CorruptArtifact
+            | Self::CorruptionState { .. }
+            | Self::SnapshotNotRegistered(..)
             | Self::RootfsPolicy(..)
             | Self::RestoreOperationBusy { .. }
             | Self::MissingSandboxOwnershipMetadata
@@ -432,6 +449,8 @@ impl RestoreError {
     /// compiles.
     pub fn kind_label(&self) -> &'static str {
         match self {
+            Self::CorruptArtifact => "corrupt_artifact",
+            Self::CorruptionState { .. } => "corruption_state",
             Self::ClusterApiUnconfigured(..) => "cluster_api_unconfigured",
             Self::SnapshotNotRegistered(..) => "snapshot_not_registered",
             Self::AdmissionRejected(..) => "admission_rejected",
@@ -1360,7 +1379,7 @@ fn restore_error_from_cluster_connect(
     }
 }
 
-async fn get_suspend_snapshot_location(
+pub(crate) async fn get_suspend_snapshot_location(
     sandbox_id: &str,
 ) -> Result<pplx_space_node_api_client::proto::GetSuspendSnapshotLocationResponse, RestoreError> {
     let mut cluster = pplx_space_node_api_client::cluster::connect_from_env()

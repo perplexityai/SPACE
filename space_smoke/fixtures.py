@@ -3983,6 +3983,38 @@ class SuspendCodecAssertions:
             )
             self._fixture.wait(2)
 
+    def expect_corrupt_snapshot_terminal(self, snapshot: SnapshotRecord, node_name: str) -> None:
+        """A confirmed corrupt backup is withdrawn and another restore cannot re-pull it."""
+
+        sandbox_id = self._fixture.sandbox.sandbox_id
+        facts = self._control.snapshot_row_facts(sandbox_id)
+        matching = [row for row in facts if row.snapshot_id == snapshot.snapshot_id]
+        jobs = self._control.transfer_jobs(node_name, sandbox_id)
+        rootfs = [job for job in jobs if job.kind == "pull" and "rootfs.btrfs-send" in job.local_path]
+        memory = [job for job in jobs if job.kind == "pull" and job.local_path.endswith("/memory")]
+        self._fixture.record("corrupt_restore_download_jobs", len(rootfs))
+        self._fixture.record("corrupt_restore_memory_download_jobs", len(memory))
+        self._fixture.verify(
+            len(matching) == 1 and matching[0].state == "failed",
+            "the corrupt snapshot remains eligible for restore",
+            snapshot_states=[(row.snapshot_id, row.state) for row in facts],
+            rootfs_download_jobs=len(rootfs),
+        )
+        self._fixture.verify(
+            len(rootfs) == 1 and len(memory) == 1,
+            "a deterministic decode failure caused repeated downloads of the same snapshot",
+            rootfs_download_jobs=len(rootfs),
+            memory_download_jobs=len(memory),
+        )
+        self.expect_reconnect_fails()
+        after = self._control.transfer_jobs(node_name, sandbox_id)
+        self._fixture.verify(
+            {job.job_id for job in after} == {job.job_id for job in jobs},
+            "another restore request downloaded the known-corrupt snapshot again",
+            jobs_before=len(jobs),
+            jobs_after=len(after),
+        )
+
 
 @dataclass(frozen=True)
 class PlantedBuild:
