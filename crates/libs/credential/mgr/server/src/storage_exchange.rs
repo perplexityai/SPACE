@@ -310,6 +310,39 @@ impl AuthorizedExchange {
     }
 }
 
+/// What a request asked for, for auditing a denial with the same actor,
+/// subject, resource and scope an issuance records. Each part is parsed on its
+/// own and is absent when missing or malformed, so the audit carries only
+/// values that passed the issuance parsers' bounded syntax checks; the
+/// resource key is echoed as requested.
+#[derive(Debug)]
+pub(crate) struct RequestedExchange {
+    pub(crate) actor: Option<ClientService>,
+    pub(crate) subject: Option<StorageSubject>,
+    pub(crate) resource: Option<S3Resource>,
+    pub(crate) actions: Option<StorageActions>,
+}
+
+impl RequestedExchange {
+    pub(crate) fn parse(caller: &ResolvedCaller, request: &ExchangeTokenRequest) -> Self {
+        Self {
+            actor: effective_actor(
+                caller,
+                request.actor_token.as_deref(),
+                request.actor_token_type.as_deref(),
+            )
+            .ok(),
+            subject: StorageSubject::parse(
+                request.subject_token.as_deref(),
+                request.subject_token_type.as_deref(),
+            )
+            .ok(),
+            resource: S3Resource::parse(&request.resource).ok(),
+            actions: StorageActions::parse(request.scope.as_deref()).ok(),
+        }
+    }
+}
+
 pub(crate) async fn authorize_exchange(
     store: &dyn StorageVendStore,
     caller: &ResolvedCaller,

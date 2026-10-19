@@ -108,12 +108,21 @@ valid vend role exists, exchange fails closed.
 
 ## Audit and failure behavior
 
-Every authorization denial emits a `credential_security_audit` event with the
-authenticated transport actor and a redacted error class. Successful issuance
-and post-authorization STS failures include actor, derived tenant, subject,
-resource bucket/key, effective scope, decision, outcome, and expiry where
-available. Events never contain subject/actor bearer tokens, access keys,
-secret keys, session tokens, or the inline policy.
+A caller that cannot be resolved, or that the exchange allowlist does not
+admit, is denied with a `credential_security_audit` event carrying only the
+transport label (or `unresolved`) and the status code. Every later
+authorization denial records the effective actor, else the transport label,
+with a redacted error class and the requested subject, resource bucket/key,
+and scope in the fields an issuance uses. The effective actor is the local
+service a node-agent request forwards for, or the service a direct caller's
+identity maps to. When the transport label differs from the actor, the event
+also records it as `caller`. A requested value that fails the issuance
+parsers' bounded syntax checks is omitted; the resource key is echoed as
+requested. Successful issuance and post-authorization STS failures include
+actor, caller, derived tenant, subject, resource bucket/key, effective scope,
+decision, outcome, and expiry where available. Events never contain
+subject/actor bearer tokens, access keys, secret keys, session tokens, or the
+inline policy.
 
 Store failures are server failures and contention is retryable. An invalid
 organization storage URI can still serve an exact historical URI recorded for

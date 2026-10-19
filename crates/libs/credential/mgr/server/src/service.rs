@@ -40,7 +40,8 @@ use crate::proto::{
     UnwrapDekResponse, exchange_token_response,
 };
 use crate::storage_exchange::{
-    AuthorizedExchange, StorageExchangeError, VendRoleArn, authorize_exchange,
+    AuthorizedExchange, RequestedExchange, S3Resource, StorageActions, StorageExchangeError,
+    StorageSubject, VendRoleArn, authorize_exchange,
 };
 use crate::storage_vend_store::{StorageVendStore, StorageVendStoreError};
 use crate::volume_wrap_store::VolumeWrapStore;
@@ -396,25 +397,26 @@ impl CredentialManager for CredentialManagerService {
             return Err(status);
         }
         let request = request.into_inner();
+        let requested = RequestedExchange::parse(&caller, &request);
         let authorized =
             match authorize_exchange(self.storage_vend_store()?.as_ref(), &caller, request).await {
                 Ok(authorized) => authorized,
                 Err(error) => {
-                    audit_exchange_denial(&caller, &error);
+                    audit_exchange_denial(&caller, &requested, &error);
                     return Err(storage_exchange_error_to_status(error));
                 }
             };
         let role = match authorized.vend_role(self.storage_vend_role.as_ref()) {
             Ok(role) => role,
             Err(error) => {
-                audit_exchange_denial(&caller, &error);
+                audit_exchange_denial(&caller, &requested, &error);
                 return Err(storage_exchange_error_to_status(error));
             }
         };
         let policy = match authorized.session_policy() {
             Ok(policy) => policy,
             Err(error) => {
-                audit_exchange_denial(&caller, &error);
+                audit_exchange_denial(&caller, &requested, &error);
                 return Err(storage_exchange_error_to_status(error));
             }
         };
@@ -422,18 +424,18 @@ impl CredentialManager for CredentialManagerService {
             match assume_s3_vend_role(role.as_str(), &policy, authorized.ttl_seconds).await {
                 Ok(credentials) => credentials,
                 Err(status) => {
-                    audit_exchange_failure(&authorized, status.code());
+                    audit_exchange_failure(&caller, &authorized, status.code());
                     return Err(status);
                 }
             };
         let expires_in = match credential_expires_in(&aws_credentials) {
             Ok(expires_in) => expires_in,
             Err(status) => {
-                audit_exchange_failure(&authorized, status.code());
+                audit_exchange_failure(&caller, &authorized, status.code());
                 return Err(status);
             }
         };
-        audit_exchange_issuance(&authorized, expires_in);
+        audit_exchange_issuance(&caller, &authorized, expires_in);
 
         Ok(Response::new(ExchangeTokenResponse {
             issued_token_type: AWS_CREDENTIALS_TOKEN_TYPE.to_string(),
@@ -1381,11 +1383,34 @@ fn audit_exchange_caller_denial(caller: Option<&ResolvedCaller>, code: tonic::Co
     );
 }
 
-fn audit_exchange_denial(caller: &ResolvedCaller, error: &StorageExchangeError) {
+/// The transport caller's label when it differs from the audited actor: the
+/// node agent forwarding for a local service, or a direct node-local caller's
+/// UDS identity, either of which would otherwise read as that service calling.
+fn exchange_audit_caller(caller: &ResolvedCaller, actor: &str) -> Option<String> {
+    let label = caller_audit_label(caller);
+    (label != actor).then_some(label)
+}
+
+/// Records the effective actor when the request resolves one, else the
+/// transport caller's label.
+fn audit_exchange_denial(
+    caller: &ResolvedCaller,
+    requested: &RequestedExchange,
+    error: &StorageExchangeError,
+) {
+    let actor = requested
+        .actor
+        .map_or_else(|| caller_audit_label(caller), |actor| actor.to_string());
     tracing::warn!(
         target: "credential_security_audit",
         operation = "ExchangeToken",
-        actor = %caller_audit_label(caller),
+        actor = %actor,
+        caller = exchange_audit_caller(caller, &actor).as_deref(),
+        subject_kind = requested.subject.as_ref().map(StorageSubject::audit_kind),
+        subject = requested.subject.as_ref().map(StorageSubject::audit_id).as_deref(),
+        resource_bucket = requested.resource.as_ref().map(S3Resource::bucket),
+        resource_key = requested.resource.as_ref().map(S3Resource::key),
+        scope = requested.actions.map(StorageActions::effective_scope).as_deref(),
         decision = "deny",
         outcome = "rejected",
         error_class = error.audit_class(),
@@ -1393,11 +1418,17 @@ fn audit_exchange_denial(caller: &ResolvedCaller, error: &StorageExchangeError) 
     );
 }
 
-fn audit_exchange_failure(exchange: &AuthorizedExchange, code: tonic::Code) {
+fn audit_exchange_failure(
+    caller: &ResolvedCaller,
+    exchange: &AuthorizedExchange,
+    code: tonic::Code,
+) {
+    let actor = exchange.actor.to_string();
     tracing::warn!(
         target: "credential_security_audit",
         operation = "ExchangeToken",
-        actor = %exchange.actor,
+        actor = %actor,
+        caller = exchange_audit_caller(caller, &actor).as_deref(),
         tenant = exchange.organization_id.map(|org| org.to_string()).as_deref(),
         subject_kind = exchange.subject.audit_kind(),
         subject = %exchange.subject.audit_id(),
@@ -1411,11 +1442,17 @@ fn audit_exchange_failure(exchange: &AuthorizedExchange, code: tonic::Code) {
     );
 }
 
-fn audit_exchange_issuance(exchange: &AuthorizedExchange, expires_in: u32) {
+fn audit_exchange_issuance(
+    caller: &ResolvedCaller,
+    exchange: &AuthorizedExchange,
+    expires_in: u32,
+) {
+    let actor = exchange.actor.to_string();
     tracing::info!(
         target: "credential_security_audit",
         operation = "ExchangeToken",
-        actor = %exchange.actor,
+        actor = %actor,
+        caller = exchange_audit_caller(caller, &actor).as_deref(),
         tenant = exchange.organization_id.map(|org| org.to_string()).as_deref(),
         subject_kind = exchange.subject.audit_kind(),
         subject = %exchange.subject.audit_id(),

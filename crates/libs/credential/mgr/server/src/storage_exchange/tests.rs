@@ -536,6 +536,125 @@ fn actor_claims_are_accepted_only_from_the_node_agent() {
     ));
 }
 
+/// A denial is audited with what the request asked for, so each part parses on
+/// its own: a bad part (or a request `parse_request` refuses early) leaves the
+/// others intact, and an actor is recorded only as `effective_actor` resolves
+/// it, never as the caller claims it.
+#[test]
+fn requested_exchange_parses_each_part_independently() {
+    let sandbox = SandboxId::new();
+    let base = sandbox_request(sandbox);
+    let key = base
+        .resource
+        .strip_prefix("arn:aws:s3:::space-snapshots/")
+        .and_then(|resource| resource.strip_suffix("/*"))
+        .unwrap()
+        .to_string();
+    let claiming = |actor: ClientService| {
+        let mut request = base.clone();
+        request.actor_token = Some(actor.to_string());
+        request.actor_token_type = Some(SERVICE_ACTOR_TOKEN_TYPE.to_string());
+        request
+    };
+    let agent = caller(
+        ClientService::NodeCredentialAgent,
+        "worker-a",
+        "worker-a-uid",
+    );
+    let uds =
+        |uid| ResolvedCaller::UdsPeer(pplx_space_common_svc::PeerIdentity::new(uid, uid, None));
+
+    let cases = [
+        (
+            "agent forwarding a volume-manager claim",
+            agent.clone(),
+            claiming(ClientService::VolumeManager),
+            Some(ClientService::VolumeManager),
+            true,
+        ),
+        (
+            "agent forwarding a disallowed actor claim",
+            agent.clone(),
+            claiming(ClientService::BuildManager),
+            None,
+            true,
+        ),
+        (
+            "build-manager naming an actor claim",
+            caller(ClientService::BuildManager, "builder", "builder-uid"),
+            claiming(ClientService::VolumeManager),
+            None,
+            true,
+        ),
+        (
+            "direct volume-manager spoofing an actor claim",
+            uds(users::SPACE_VOLMGR.uid),
+            claiming(ClientService::TemplateManager),
+            None,
+            true,
+        ),
+        (
+            "direct volume-manager",
+            uds(users::SPACE_VOLMGR.uid),
+            base.clone(),
+            Some(ClientService::VolumeManager),
+            true,
+        ),
+        (
+            "UDS uid that is no storage actor",
+            uds(users::SPACE_SBXMGR.uid),
+            base.clone(),
+            None,
+            true,
+        ),
+        (
+            "unsupported audience",
+            agent.clone(),
+            {
+                let mut request = claiming(ClientService::VolumeManager);
+                request.audience = Some("sts.amazonaws.com".into());
+                request
+            },
+            Some(ClientService::VolumeManager),
+            true,
+        ),
+        (
+            "malformed resource",
+            agent.clone(),
+            {
+                let mut request = claiming(ClientService::VolumeManager);
+                request.resource = format!("arn:aws:s3:::space-snapshots/{key}/../*");
+                request
+            },
+            Some(ClientService::VolumeManager),
+            false,
+        ),
+    ];
+
+    for (name, caller, request, actor, resource_parses) in cases {
+        let requested = RequestedExchange::parse(&caller, &request);
+        assert_eq!(requested.actor, actor, "{name}");
+        assert_eq!(
+            requested.subject,
+            Some(StorageSubject::Resource(SubjectId::Sandbox(sandbox))),
+            "{name}"
+        );
+        assert_eq!(
+            requested
+                .resource
+                .as_ref()
+                .map(|resource| (resource.bucket(), resource.key())),
+            resource_parses.then_some(("space-snapshots", key.as_str())),
+            "{name}"
+        );
+        assert_eq!(
+            requested.actions.map(StorageActions::effective_scope),
+            Some(STORAGE_WRITE_SCOPE.to_string()),
+            "{name}"
+        );
+    }
+}
+
 #[test]
 fn session_policy_is_exact_and_enforces_the_sts_size_limit() {
     let template = TemplateName::parse("seed").unwrap();
