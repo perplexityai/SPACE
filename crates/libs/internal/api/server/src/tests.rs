@@ -63,7 +63,7 @@ pub(crate) fn test_route_ed25519_authority() -> std::sync::Arc<SpaceApiRouteEd25
     }
 }
 
-fn verify_proto_route_token(
+pub(crate) fn verify_proto_route_token(
     token: &pplx_space_node_api_client::proto::SpaceApiRouteToken,
 ) -> TestResult<SpaceApiRouteEd25519Claims> {
     Ok(decode_unverified_space_api_route_ed25519_claims(
@@ -3017,7 +3017,7 @@ fn route_credential_proof(
     }
 }
 
-async fn insert_data_plane_worker_node(
+pub(crate) async fn insert_data_plane_worker_node(
     pool: &sqlx::PgPool,
     node_id: NodeId,
     address: &str,
@@ -3076,7 +3076,7 @@ async fn insert_data_plane_k8s_worker_node_without_address(
     Ok(())
 }
 
-async fn insert_data_plane_active_sandbox(
+pub(crate) async fn insert_data_plane_active_sandbox(
     pool: &sqlx::PgPool,
     sandbox_id: SandboxId,
     node_id: NodeId,
@@ -3116,7 +3116,7 @@ async fn mark_sandbox_command_ready_pending(
     Ok(())
 }
 
-async fn insert_active_execution(
+pub(crate) async fn insert_active_execution(
     pool: &sqlx::PgPool,
     sandbox_id: SandboxId,
     pod_ip: &str,
@@ -3200,7 +3200,7 @@ fn sha256_hex(value: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-async fn insert_data_plane_session(
+pub(crate) async fn insert_data_plane_session(
     pool: &sqlx::PgPool,
     session_id: &str,
     sandbox_id: SandboxId,
@@ -7955,5 +7955,349 @@ async fn node_template_and_policy_reads_follow_placement() -> TestResult {
         "retiring sandbox host: desired templates"
     );
     assert_eq!(active.sandboxes, vec![sandbox_id.to_string()]);
+    Ok(())
+}
+
+/// The attach-token digest test sessions store and their attaches present.
+const ATTACH_TOKEN_SHA256: &str = "tokenhash";
+
+async fn give_session_attach_token(
+    pool: &sqlx::PgPool,
+    session_id: &str,
+    scope: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!(
+        "UPDATE data_plane_sessions
+         SET token_hash = $2,
+             token_expires_at = NOW() + INTERVAL '5 minutes',
+             scopes = ARRAY[$3]
+         WHERE session_id = $1"
+    ))
+    .bind(session_id)
+    .bind(ATTACH_TOKEN_SHA256)
+    .bind(scope)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+fn attach_request(
+    session_id: &str,
+    token_sha256: &str,
+    scope: &str,
+) -> Request<ResolveDataPlaneSessionRouteRequest> {
+    data_plane_request(ResolveDataPlaneSessionRouteRequest {
+        session_id: session_id.to_string(),
+        protocol_session_id: None,
+        token_sha256: Some(token_sha256.to_string()),
+        required_scope: Some(scope.to_string()),
+        requested_transport: None,
+    })
+}
+
+#[derive(Debug, PartialEq, Eq, sqlx::FromRow)]
+struct StoredSessionRoute {
+    route_generation: i64,
+    current_node_id: Option<NodeId>,
+    backend_endpoint: Option<String>,
+}
+
+async fn stored_session_route(
+    pool: &sqlx::PgPool,
+    session_id: &str,
+) -> Result<StoredSessionRoute, sqlx::Error> {
+    sqlx::query_as(sql!(
+        "SELECT route_generation, current_node_id, backend_endpoint
+         FROM data_plane_sessions
+         WHERE session_id = $1"
+    ))
+    .bind(session_id)
+    .fetch_one(pool)
+    .await
+}
+
+/// An attach stores the session's route in the statement that reads it, but
+/// only when it would pass the same checks the resolver then applies: a
+/// refused attach must leave the stored route alone.
+#[tokio::test(flavor = "current_thread")]
+async fn data_plane_attach_persists_the_route_only_when_authorized() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.service.pool;
+    let node_id = NodeId::new();
+    let sandbox_id = SandboxId::new();
+    let session_id = format!("term_{}", Uuid::now_v7());
+    insert_data_plane_worker_node(pool, node_id, "10.0.0.51").await?;
+    insert_data_plane_active_sandbox(pool, sandbox_id, node_id).await?;
+    insert_active_execution(pool, sandbox_id, "10.80.0.51", 51).await?;
+    insert_data_plane_session(pool, &session_id, sandbox_id).await?;
+    give_session_attach_token(pool, &session_id, "terminal:connect").await?;
+    let untouched = StoredSessionRoute {
+        route_generation: 1,
+        current_node_id: None,
+        backend_endpoint: None,
+    };
+
+    let wrong_token = fixture
+        .service
+        .resolve_data_plane_session_route(attach_request(&session_id, "wrong", "terminal:connect"))
+        .await
+        .expect_err("a wrong token is refused");
+    assert_eq!(wrong_token.code(), Code::Unauthenticated);
+    assert_eq!(stored_session_route(pool, &session_id).await?, untouched);
+
+    let wrong_scope = fixture
+        .service
+        .resolve_data_plane_session_route(attach_request(
+            &session_id,
+            ATTACH_TOKEN_SHA256,
+            "port:connect",
+        ))
+        .await
+        .expect_err("a scope the token lacks is refused");
+    assert_eq!(wrong_scope.code(), Code::PermissionDenied);
+    assert_eq!(stored_session_route(pool, &session_id).await?, untouched);
+
+    sqlx::query(sql!(
+        "UPDATE data_plane_sessions SET token_expires_at = NOW() - INTERVAL '1 second'
+         WHERE session_id = $1"
+    ))
+    .bind(&session_id)
+    .execute(pool)
+    .await?;
+    let expired = fixture
+        .service
+        .resolve_data_plane_session_route(attach_request(
+            &session_id,
+            ATTACH_TOKEN_SHA256,
+            "terminal:connect",
+        ))
+        .await
+        .expect_err("an expired token is refused");
+    assert_eq!(expired.code(), Code::Unauthenticated);
+    assert_eq!(stored_session_route(pool, &session_id).await?, untouched);
+
+    give_session_attach_token(pool, &session_id, "terminal:connect").await?;
+    let route = fixture
+        .service
+        .resolve_data_plane_session_route(attach_request(
+            &session_id,
+            ATTACH_TOKEN_SHA256,
+            "terminal:connect",
+        ))
+        .await?
+        .into_inner();
+    assert_eq!(route.current_node_id, node_id.to_string());
+    assert_eq!(route.route_generation, 2);
+    assert_eq!(
+        route.backend.expect("backend").endpoint,
+        "https://10.0.0.51:9800"
+    );
+    let persisted = StoredSessionRoute {
+        route_generation: 2,
+        current_node_id: Some(node_id),
+        backend_endpoint: Some("https://10.0.0.51:9800".to_string()),
+    };
+    assert_eq!(stored_session_route(pool, &session_id).await?, persisted);
+
+    // An unchanged route is not written again.
+    let again = fixture
+        .service
+        .resolve_data_plane_session_route(attach_request(
+            &session_id,
+            ATTACH_TOKEN_SHA256,
+            "terminal:connect",
+        ))
+        .await?
+        .into_inner();
+    assert_eq!(again.route_generation, 2);
+    assert_eq!(stored_session_route(pool, &session_id).await?, persisted);
+
+    // Revocation clears the token, so a revoked session's attach is refused
+    // before it can touch the route.
+    sqlx::query(sql!(
+        "UPDATE data_plane_sessions
+         SET revocation_status = 'revoked', state = 'revoked',
+             token_hash = NULL, token_expires_at = NOW()
+         WHERE session_id = $1"
+    ))
+    .bind(&session_id)
+    .execute(pool)
+    .await?;
+    sqlx::query("UPDATE sandboxes SET active_node_id = NULL WHERE id = $1")
+        .bind(sandbox_id)
+        .execute(pool)
+        .await?;
+    let revoked = fixture
+        .service
+        .resolve_data_plane_session_route(attach_request(
+            &session_id,
+            ATTACH_TOKEN_SHA256,
+            "terminal:connect",
+        ))
+        .await
+        .expect_err("a revoked session is refused");
+    assert_eq!(revoked.code(), Code::Unauthenticated);
+    assert_eq!(stored_session_route(pool, &session_id).await?, persisted);
+    Ok(())
+}
+
+/// Every attach reads the sandbox's live placement and execution, so a route
+/// stored by an earlier attach never outlives a migration, restore or suspend.
+#[tokio::test(flavor = "current_thread")]
+async fn data_plane_attach_follows_migration_restore_and_suspend() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.service.pool;
+    let first_node = NodeId::new();
+    let second_node = NodeId::new();
+    let sandbox_id = SandboxId::new();
+    let session_id = format!("proc_{}", Uuid::now_v7());
+    insert_data_plane_worker_node(pool, first_node, "10.0.0.52").await?;
+    insert_data_plane_worker_node(pool, second_node, "10.0.0.53").await?;
+    insert_data_plane_active_sandbox(pool, sandbox_id, first_node).await?;
+    insert_active_execution(pool, sandbox_id, "10.80.0.52", 52).await?;
+    insert_data_plane_session_with_protocol(pool, &session_id, None, sandbox_id, "process").await?;
+    give_session_attach_token(pool, &session_id, "process:connect").await?;
+    let attach = || {
+        fixture
+            .service
+            .resolve_data_plane_session_route(attach_request(
+                &session_id,
+                ATTACH_TOKEN_SHA256,
+                "process:connect",
+            ))
+    };
+
+    let first = attach().await?.into_inner();
+    assert_eq!(first.current_node_id, first_node.to_string());
+    assert_eq!(first.route_generation, 2);
+
+    sqlx::query("UPDATE sandboxes SET active_node_id = $2 WHERE id = $1")
+        .bind(sandbox_id)
+        .bind(second_node)
+        .execute(pool)
+        .await?;
+    let migrated = attach().await?.into_inner();
+    assert_eq!(migrated.current_node_id, second_node.to_string());
+    assert_eq!(migrated.route_generation, 3);
+    assert_eq!(
+        migrated.backend.expect("migrated backend").endpoint,
+        "https://10.0.0.53:9800"
+    );
+    assert_eq!(
+        stored_session_route(pool, &session_id).await?,
+        StoredSessionRoute {
+            route_generation: 3,
+            current_node_id: Some(second_node),
+            backend_endpoint: Some("https://10.0.0.53:9800".to_string()),
+        }
+    );
+
+    // A restore on the same node swaps the execution: the backend route is
+    // unchanged, but the route token names the new execution.
+    sqlx::query("UPDATE sandbox_k8s_executions SET active = false WHERE sandbox_id = $1")
+        .bind(sandbox_id)
+        .execute(pool)
+        .await?;
+    insert_active_execution(pool, sandbox_id, "10.80.0.53", 53).await?;
+    let restored = attach().await?.into_inner();
+    assert_eq!(restored.route_generation, 3);
+    let claims = verify_proto_route_token(
+        restored
+            .space_api_route_token
+            .as_ref()
+            .expect("route token minted"),
+    )?;
+    assert_eq!(
+        claims.route_identity.execution_generation(),
+        ExecutionGeneration::new(53).unwrap()
+    );
+
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET lifecycle = 'suspended', active_node_id = NULL WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(pool)
+    .await?;
+    let suspended = attach()
+        .await
+        .expect_err("a suspended sandbox has no route");
+    assert_eq!(suspended.code(), Code::FailedPrecondition);
+    assert_eq!(
+        stored_session_route(pool, &session_id)
+            .await?
+            .route_generation,
+        3,
+        "a failed resolution writes nothing"
+    );
+    Ok(())
+}
+
+/// The single-statement write derives the endpoint in SQL; the resolver's own
+/// derivation stays authoritative. Where they agree the route is written once
+/// (generation 2); where they could disagree the resolver rewrites it, so the
+/// attach still returns its own derivation.
+#[tokio::test(flavor = "current_thread")]
+async fn data_plane_attach_endpoint_matches_the_resolver_derivation() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.service.pool;
+    for (address, direct, expected) in [
+        ("10.0.0.54", None, "https://10.0.0.54:9800"),
+        ("fd00::54", None, "https://[fd00::54]:9800"),
+        ("fd00:0:0:1::54", None, "https://[fd00:0:0:1::54]:9800"),
+        ("::ffff:10.0.0.54", None, "https://[::ffff:10.0.0.54]:9800"),
+        (
+            "10.0.0.55",
+            Some("https://node-api.example.test:9800"),
+            "https://node-api.example.test:9800",
+        ),
+    ] {
+        let node_id = NodeId::new();
+        let sandbox_id = SandboxId::new();
+        let session_id = format!("term_{}", Uuid::now_v7());
+        insert_data_plane_worker_node(pool, node_id, address).await?;
+        if let Some(direct) = direct {
+            insert_data_plane_direct_node_endpoint(pool, node_id, direct).await?;
+        }
+        insert_data_plane_active_sandbox(pool, sandbox_id, node_id).await?;
+        insert_active_execution(pool, sandbox_id, "10.80.0.54", 54).await?;
+        insert_data_plane_session(pool, &session_id, sandbox_id).await?;
+        give_session_attach_token(pool, &session_id, "terminal:connect").await?;
+
+        let route = fixture
+            .service
+            .resolve_data_plane_session_route(attach_request(
+                &session_id,
+                ATTACH_TOKEN_SHA256,
+                "terminal:connect",
+            ))
+            .await?
+            .into_inner();
+        assert_eq!(
+            route.backend.expect("backend").endpoint,
+            expected,
+            "{address}"
+        );
+        assert_eq!(route.route_generation, 2, "{address}: written once");
+        assert_eq!(
+            stored_session_route(pool, &session_id)
+                .await?
+                .backend_endpoint
+                .as_deref(),
+            Some(expected),
+            "{address}"
+        );
+        if let Some(direct) = direct {
+            sqlx::query("DELETE FROM node_direct WHERE node_api_endpoint = $1")
+                .bind(direct)
+                .execute(pool)
+                .await?;
+        }
+    }
     Ok(())
 }

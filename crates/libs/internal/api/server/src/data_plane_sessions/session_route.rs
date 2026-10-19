@@ -53,7 +53,21 @@ pub(crate) async fn resolve_session_route(
     let deadline = tokio::time::Instant::now() + budget;
     let mut activated = false;
     loop {
-        let mut row = fetch_route_row(pool, &session_id, protocol_session_id.as_deref()).await?;
+        let mut row = match (token_sha256.as_deref(), required_scope.as_deref()) {
+            (Some(token_sha256), Some(required_scope)) => {
+                fetch_and_persist_route_row(
+                    pool,
+                    &session_id,
+                    protocol_session_id.as_deref(),
+                    RoutePersistence {
+                        token_sha256,
+                        required_scope,
+                    },
+                )
+                .await?
+            }
+            _ => fetch_route_row(pool, &session_id, protocol_session_id.as_deref()).await?,
+        };
         validate_attach_authorization(
             &row,
             refresh_authority,

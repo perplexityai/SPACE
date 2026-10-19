@@ -170,3 +170,87 @@ async fn stalled_current_worker_leaves_time_for_delegated_recovery() {
         .await
         .unwrap();
 }
+
+/// The attach statement itself stores the route the resolver derives, so the
+/// resolver finds nothing left to write and skips `update_route_row`; where
+/// the SQL derivation would ever disagree, the resolver's comparison catches
+/// it and rewrites the route.
+#[tokio::test(flavor = "current_thread")]
+async fn attach_statement_stores_the_route_the_resolver_derives() {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db()
+        .await
+        .expect("test database")
+    else {
+        return;
+    };
+    let pool = &db.pool;
+    for address in [
+        "10.0.0.56",
+        "fd00::56",
+        "fd00:0:0:1::56",
+        "::ffff:10.0.0.56",
+    ] {
+        let node_id = NodeId::new();
+        let sandbox_id = SandboxId::new();
+        let session_id = format!("term_{}", uuid::Uuid::now_v7());
+        crate::tests::insert_data_plane_worker_node(pool, node_id, address)
+            .await
+            .unwrap();
+        crate::tests::insert_data_plane_active_sandbox(pool, sandbox_id, node_id)
+            .await
+            .unwrap();
+        crate::tests::insert_data_plane_session(pool, &session_id, sandbox_id)
+            .await
+            .unwrap();
+        sqlx::query(sql!(
+            "UPDATE data_plane_sessions
+             SET token_hash = 'statement-token',
+                 token_expires_at = NOW() + INTERVAL '5 minutes',
+                 scopes = ARRAY['terminal:connect']
+             WHERE session_id = $1"
+        ))
+        .bind(&session_id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let row = fetch_and_persist_route_row(
+            pool,
+            &session_id,
+            None,
+            RoutePersistence {
+                token_sha256: "statement-token",
+                required_scope: "terminal:connect",
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(row.current_node_id, Some(node_id), "{address}");
+        assert_eq!(
+            row.backend_endpoint,
+            resolve_backend_endpoint(&row),
+            "{address}: SQL and Rust derive the same endpoint"
+        );
+        assert_eq!(
+            row.backend_transport.as_deref(),
+            Some(BACKEND_TRANSPORT_GRPC),
+            "{address}"
+        );
+        assert_eq!(row.route_generation.get(), 2, "{address}");
+
+        // A caller without the token only reads.
+        let read = fetch_and_persist_route_row(
+            pool,
+            &session_id,
+            None,
+            RoutePersistence {
+                token_sha256: "other-token",
+                required_scope: "terminal:connect",
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(read.route_generation.get(), 2, "{address}");
+    }
+}
