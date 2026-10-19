@@ -452,17 +452,24 @@ impl VolumePuller {
         name: &str,
         release: ResolvedRelease,
     ) -> PullOutcome {
+        let started = Instant::now();
         let tags = pull_metric_tags(name, &release.hash, "", PullTrigger::OnDemand);
-        self.pull_resolved(
-            db,
-            name.to_string(),
-            release.hash,
-            release.storage_uris,
-            tags,
-        )
-        .await
-        .outcome
-        .into_outcome()
+        let result = self
+            .pull_resolved(
+                db,
+                name.to_string(),
+                release.hash,
+                release.storage_uris,
+                tags.clone(),
+            )
+            .await;
+        let outcome = result.outcome.into_outcome();
+        pplx_space_metrics::template::pull_duration(
+            &tags,
+            outcome_label(&outcome, result.path),
+            started,
+        );
+        outcome
     }
 
     async fn pull_resolved(
