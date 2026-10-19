@@ -173,6 +173,10 @@ impl SpacedHostClient {
         .await
     }
 
+    /// Streams `data` after the open message. Only the end of `data` completes
+    /// the write. An `Err` item fails it with that status: the call is dropped
+    /// while its request body is still open, so the stream is reset rather
+    /// than ended and the guest doesn't commit the bytes it already received.
     pub async fn write_stream_with_idempotency<S>(
         &self,
         path: String,
@@ -182,7 +186,7 @@ impl SpacedHostClient {
         data: S,
     ) -> Result<proto::WriteResponse, tonic::Status>
     where
-        S: futures_util::Stream<Item = Vec<u8>> + Send + 'static,
+        S: futures_util::Stream<Item = Result<Vec<u8>, tonic::Status>> + Send + 'static,
     {
         use futures_util::StreamExt;
 
@@ -196,15 +200,33 @@ impl SpacedHostClient {
                 user: user.map(|user| user.as_str().to_string()),
             })),
         };
-        let messages =
-            futures_util::stream::once(async move { open }).chain(data.map(|chunk| WriteRequest {
-                message: Some(proto::write_request::Message::Data(chunk)),
-            }));
-        self.filesystem
-            .clone()
-            .write(messages)
-            .await
-            .map(Response::into_inner)
+        let (input_failed, input_failure) = tokio::sync::oneshot::channel();
+        let data = futures_util::stream::unfold(
+            (Box::pin(data), input_failed),
+            |(mut data, input_failed)| async move {
+                match data.next().await? {
+                    Ok(chunk) => Some((
+                        WriteRequest {
+                            message: Some(proto::write_request::Message::Data(chunk)),
+                        },
+                        (data, input_failed),
+                    )),
+                    Err(status) => {
+                        // A missing receiver means the write already ended.
+                        let _ = input_failed.send(status);
+                        // Ending here would complete the write.
+                        std::future::pending().await
+                    }
+                }
+            },
+        );
+        let messages = futures_util::stream::iter([open]).chain(data);
+        let mut client = self.filesystem.clone();
+        tokio::select! {
+            response = client.write(messages) => response.map(Response::into_inner),
+            // A sender dropped without a failure disables this arm.
+            Ok(status) = input_failure => Err(status),
+        }
     }
 
     pub async fn mkdir(

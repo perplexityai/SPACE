@@ -12,11 +12,11 @@ workspace = true
 
 [features]
 default = []
-internal-tls = ["tonic/tls-aws-lc", "tokio/fs", "dep:futures-core", "dep:tokio-util"]
+internal-tls = ["tonic/tls-aws-lc", "tokio/fs", "dep:tokio-util"]
 test-support = []
 
 [dependencies]
-futures-core = { workspace = true, optional = true }
+futures-core = { workspace = true }
 tokio-util = { workspace = true, optional = true }
 http = { workspace = true }
 http-body = { workspace = true }

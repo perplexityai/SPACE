@@ -183,7 +183,9 @@ http-body = "1"
 http-body-util = "0.1"
 h2 = "0.4"
 hmac = "0.13"
-hyper = "1"
+# 1.11.1: dropping a client call resets its HTTP/2 stream, even while its
+# request body is still open. Client-streaming uploads rely on that.
+hyper = "1.11.1"
 hyper-util = "0.1"
 insta = "1"
 jiff = "0.2"

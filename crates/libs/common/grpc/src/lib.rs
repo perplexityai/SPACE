@@ -56,6 +56,8 @@ pub use sandbox_trace::{
     record_sandbox_id,
 };
 mod status;
+mod upload_body;
+pub use upload_body::{UploadBody, UploadBodyClosed, UploadSender, upload_channel};
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 mod trace;

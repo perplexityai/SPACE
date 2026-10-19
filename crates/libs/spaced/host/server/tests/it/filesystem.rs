@@ -84,44 +84,66 @@ async fn metadata_fallback_only_on_opening_unimplemented() {
     }
 }
 
+/// A real guest service serving its bridge on `socket`, running filesystem
+/// operations as the current account.
+struct Guest {
+    shutdown: tokio_util::sync::CancellationToken,
+    task: tokio::task::JoinHandle<Result<(), pplx_space_spaced_guest_server::RunGuestServerError>>,
+}
+
+impl Guest {
+    async fn start(directory: &std::path::Path, socket: &std::path::Path) -> Self {
+        use pplx_space_common_core::types::GuestUserName;
+        use pplx_space_spaced_guest_server::{
+            FilesystemExecutionMode, HostConnectorType, SpacedGuestService,
+            SpacedGuestServiceConfig,
+        };
+        let account = tokio::process::Command::new("id")
+            .arg("-un")
+            .output()
+            .await
+            .expect("current account");
+        assert!(account.status.success());
+        let user = GuestUserName::parse(
+            String::from_utf8(account.stdout)
+                .expect("account name")
+                .trim(),
+        )
+        .expect("user");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let guest = SpacedGuestService::with_config(
+            shutdown.clone(),
+            SpacedGuestServiceConfig {
+                default_operation_user: user,
+                filesystem_execution: FilesystemExecutionMode::Direct,
+                host_connector_type: HostConnectorType::Uds(directory.join("unused.sock")),
+                local_socket_path: None,
+                bridge_socket_path: Some(socket.to_path_buf()),
+                ..Default::default()
+            },
+        );
+        guest.ready();
+        let task = tokio::spawn(guest.run());
+        Self { shutdown, task }
+    }
+
+    async fn stop(self) {
+        self.shutdown.cancel();
+        self.task
+            .await
+            .expect("guest joined")
+            .expect("guest stopped");
+    }
+}
+
 #[tokio::test]
 async fn interrupted_upload_through_host_and_guest_is_not_successful_eof() {
-    use pplx_space_common_core::types::GuestUserName;
-    use pplx_space_spaced_guest_server::{
-        FilesystemExecutionMode, HostConnectorType, SpacedGuestService, SpacedGuestServiceConfig,
-    };
     use pplx_space_spaced_host_client::proto::{
         WriteOpen, WriteRequest, filesystem_client::FilesystemClient, write_request::Message,
     };
-    use tokio_util::sync::CancellationToken;
     let directory = tempfile::tempdir().expect("directory");
     let socket = directory.path().join("guest.sock");
-    let account = tokio::process::Command::new("id")
-        .arg("-un")
-        .output()
-        .await
-        .expect("current account");
-    assert!(account.status.success());
-    let user = GuestUserName::parse(
-        String::from_utf8(account.stdout)
-            .expect("account name")
-            .trim(),
-    )
-    .expect("user");
-    let shutdown = CancellationToken::new();
-    let guest = SpacedGuestService::with_config(
-        shutdown.clone(),
-        SpacedGuestServiceConfig {
-            default_operation_user: user,
-            filesystem_execution: FilesystemExecutionMode::Direct,
-            host_connector_type: HostConnectorType::Uds(directory.path().join("unused.sock")),
-            local_socket_path: None,
-            bridge_socket_path: Some(socket.clone()),
-            ..Default::default()
-        },
-    );
-    guest.ready();
-    let guest_task = tokio::spawn(guest.run());
+    let guest = Guest::start(directory.path(), &socket).await;
     let fixture = HostFixture::start(Some(socket.clone())).await;
     fixture.client().await;
     let channel = pplx_space_common_grpc::connect_uds_channel("test host", &fixture.socket_path)
@@ -228,11 +250,100 @@ async fn interrupted_upload_through_host_and_guest_is_not_successful_eof() {
         b"complete"
     );
     fixture.stop().await;
-    shutdown.cancel();
-    guest_task
+    guest.stop().await;
+}
+
+/// A replacing write whose input fails partway, as when the caller upstream
+/// drops its call after a read error, commits nothing in the guest: a new
+/// file isn't created and an existing one keeps its content. The same prefix
+/// with an input that ends normally is committed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_input_mid_stream_commits_nothing_in_the_guest() {
+    use futures_util::StreamExt;
+    let directory = tempfile::tempdir().expect("directory");
+    let socket = directory.path().join("guest.sock");
+    let guest = Guest::start(directory.path(), &socket).await;
+    let fixture = HostFixture::start(Some(socket)).await;
+    let client = fixture.client().await;
+    for (name, existing, input_fails) in [
+        ("new", None, true),
+        ("existing", Some(&b"original"[..]), true),
+        ("completed", Some(&b"original"[..]), false),
+    ] {
+        let target = directory.path().join(name);
+        if let Some(content) = existing {
+            tokio::fs::write(&target, content)
+                .await
+                .expect("existing file");
+        }
+        let staging = format!(".{name}.spaced-");
+        let prefix = futures_util::stream::once(async { Ok(b"prefix".to_vec()) });
+        let data = if input_fails {
+            let (directory, staging) = (directory.path().to_path_buf(), staging.clone());
+            prefix
+                .chain(futures_util::stream::once(async move {
+                    // Fail only once the guest is writing the replacement.
+                    wait_staged(&directory, &staging, true).await;
+                    Err(tonic::Status::internal("Failed to read staged upload"))
+                }))
+                .boxed()
+        } else {
+            prefix.boxed()
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.write_stream_with_idempotency(
+                target.display().to_string(),
+                false,
+                None,
+                None,
+                data,
+            ),
+        )
         .await
-        .expect("guest joined")
-        .expect("guest stopped");
+        .expect("write finished");
+        if input_fails {
+            let error = result.expect_err("failed input must fail the write");
+            assert_eq!(error.code(), tonic::Code::Internal, "{name}");
+            // The write fails as soon as its input does, possibly before the
+            // guest has settled the upload: wait for it to drop the staging
+            // file, then check what it left behind.
+            wait_staged(directory.path(), &staging, false).await;
+            assert_eq!(
+                tokio::fs::read(&target).await.ok().as_deref(),
+                existing,
+                "{name}: nothing committed"
+            );
+        } else {
+            assert_eq!(result.expect("completed write").bytes_written, 6);
+            assert_eq!(
+                tokio::fs::read(&target).await.expect("committed file"),
+                b"prefix"
+            );
+        }
+    }
+    fixture.stop().await;
+    guest.stop().await;
+}
+
+/// Waits until a file whose name starts with `prefix` is `present` in
+/// `directory`, or not.
+async fn wait_staged(directory: &std::path::Path, prefix: &str, present: bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut entries = tokio::fs::read_dir(directory).await.expect("directory");
+            let mut found = false;
+            while let Some(entry) = entries.next_entry().await.expect("entry") {
+                found |= entry.file_name().to_string_lossy().starts_with(prefix);
+            }
+            if found == present {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("staging file present: {present}"));
 }
 
 #[tokio::test]

@@ -282,3 +282,32 @@ async fn empty_blob_upload_retains_admission_through_backend_response() {
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
     servers.shutdown().await;
 }
+
+/// A body the caller has reset.
+struct ResetBody;
+impl http_body::Body for ResetBody {
+    type Data = bytes::Bytes;
+    type Error = Status;
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        Poll::Ready(Some(Err(Status::cancelled("peer reset"))))
+    }
+}
+
+#[tokio::test]
+async fn served_spaced_write_fails_a_reset_body_instead_of_reading_it_as_empty() {
+    let mut service = WorkerApiService::new(clients()).into_grpc_service();
+    let request = http::Request::builder()
+        .uri("/space.node.api.v1.WorkerApi/SpacedWrite")
+        .header("content-type", "application/grpc")
+        .body(tonic::body::Body::new(ResetBody))
+        .unwrap();
+    // Read as the end of the stream, the reset would be an empty upload,
+    // which the handler refuses with InvalidArgument.
+    assert_eq!(
+        response_code(&service.call(request).await.unwrap()),
+        tonic::Code::Aborted
+    );
+}

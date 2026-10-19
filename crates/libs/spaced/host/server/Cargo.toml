@@ -43,7 +43,7 @@ prost-types = { workspace = true }
 [dev-dependencies]
 pplx-space-spaced-host-server = { path = ".", features = ["test-support"] }
 pplx-space-spaced-host-client = { workspace = true }
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
 pplx-space-spaced-guest-server = { workspace = true }
 anyhow = { workspace = true }
 pplx-space-net-common = { workspace = true }

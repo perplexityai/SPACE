@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use futures_util::StreamExt as _;
+
 use super::activation_support::{
     GuestActivityKind, configure_process_env_via_spaced_host, grpc_timeout_budget,
 };
@@ -528,83 +530,28 @@ impl SandboxManagerService {
         route_auth.authorize_sandbox(&sandbox)?;
         let identity_token = self.route_stream_identity_token(&sandbox)?;
         let client = self.connect_spaced_host(&sandbox).await?;
-        let (tx, rx) = tokio::sync::mpsc::channel(32);
-        let (err_tx, err_rx) = tokio::sync::oneshot::channel::<Status>();
         let sandbox_id = first.sandbox_id;
-        let request_identity_token = identity_token.child_token();
-        tokio::spawn(async move {
-            let mut err_tx = Some(err_tx);
-            let send_err = |slot: &mut Option<tokio::sync::oneshot::Sender<Status>>,
-                            status: Status| {
-                if let Some(sender) = slot.take() {
-                    let _ = sender.send(status);
+        // Every failure is an `Err` item rather than the end of the stream:
+        // the host client completes the write only when its input ends, so a
+        // failed input must not end it.
+        let data = request_stream.map(move |message| {
+            let message = message.map_err(|status| {
+                Status::new(
+                    status.code(),
+                    format!("write request stream failed: {}", status.message()),
+                )
+            })?;
+            if message.sandbox_id != sandbox_id {
+                return Err(Status::invalid_argument(
+                    "write stream changed sandbox target",
+                ));
+            }
+            match message.operation.and_then(|operation| operation.message) {
+                Some(spaced_write_request::Message::Data(data)) => Ok(data),
+                Some(spaced_write_request::Message::Open(_)) => {
+                    Err(Status::invalid_argument("write open message must be first"))
                 }
-            };
-            loop {
-                let message = tokio::select! {
-                    message = request_stream.message() => message,
-                    _ = request_identity_token.cancelled() => {
-                        send_err(
-                            &mut err_tx,
-                            Status::aborted(
-                                "sandbox execution identity changed while write was open",
-                            ),
-                        );
-                        break;
-                    }
-                };
-                match message {
-                    Ok(Some(message)) if message.sandbox_id != sandbox_id => {
-                        send_err(
-                            &mut err_tx,
-                            Status::invalid_argument("write stream changed sandbox target"),
-                        );
-                        break;
-                    }
-                    Ok(Some(SpacedWriteRequest {
-                        operation:
-                            Some(pplx_space_sbx_mgr_client::operations::WriteRequest {
-                                message: Some(spaced_write_request::Message::Data(data)),
-                            }),
-                        ..
-                    })) => {
-                        if tx.send(data).await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(Some(SpacedWriteRequest {
-                        operation:
-                            Some(pplx_space_sbx_mgr_client::operations::WriteRequest {
-                                message: Some(spaced_write_request::Message::Open(_)),
-                            }),
-                        ..
-                    })) => {
-                        send_err(
-                            &mut err_tx,
-                            Status::invalid_argument("write open message must be first"),
-                        );
-                        break;
-                    }
-                    Ok(Some(SpacedWriteRequest {
-                        operation:
-                            Some(pplx_space_sbx_mgr_client::operations::WriteRequest { message: None }),
-                        ..
-                    }))
-                    | Ok(Some(SpacedWriteRequest {
-                        operation: None, ..
-                    })) => {
-                        send_err(
-                            &mut err_tx,
-                            Status::invalid_argument("write message is required"),
-                        );
-                        break;
-                    }
-                    Ok(None) => break,
-                    Err(status) => {
-                        send_err(&mut err_tx, status);
-                        break;
-                    }
-                }
+                None => Err(Status::invalid_argument("write message is required")),
             }
         });
         // Parse the wire-shaped user into the typed wrapper at the proto
@@ -616,8 +563,10 @@ impl SandboxManagerService {
             open.append,
             open.idempotency_key,
             user,
-            tokio_stream::wrappers::ReceiverStream::new(rx),
+            data,
         );
+        // Dropping the write on an identity change cancels it, so the guest
+        // doesn't commit what it received.
         let response = tokio::select! {
             response = write => response.map_err(pplx_space_common_grpc::mark_guest_path_not_found)?,
             _ = identity_token.cancelled() => {
@@ -626,16 +575,6 @@ impl SandboxManagerService {
                 ));
             }
         };
-        if let Ok(status) = err_rx.await {
-            return Err(Status::new(
-                status.code(),
-                format!(
-                    "write request stream failed after guest committed {} bytes: {}",
-                    response.bytes_written,
-                    status.message()
-                ),
-            ));
-        }
         Ok(Response::new(SpacedWriteResponse {
             bytes_written: response.bytes_written,
         }))

@@ -179,6 +179,14 @@ guest's page cache, before the write is acknowledged.
   publishes it atomically; the sync puts its bytes on the virtual disk before
   the reply and reports a failed writeback to the writer.
 - **A batch write** follows the same rules for each entry.
+- **An interrupted upload** is never completed: only the end of its stream
+  completes a write, and every hop between the caller and the guest treats a
+  failed or cancelled input as a failure, never as that end. A replacement's
+  temporary file is discarded, so the destination keeps its previous content
+  (or stays absent). A write in place keeps the bytes it received; an
+  overwrite in place has already truncated the destination, so it holds only
+  that prefix. Host services and guests built before these hops and atomic
+  replacement existed can commit the prefix instead.
 
 The public contract (`files:write` in the API reference):
 

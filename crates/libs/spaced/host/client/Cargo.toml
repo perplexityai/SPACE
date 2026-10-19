@@ -15,7 +15,7 @@ futures-util = { version = "0.3" }
 prost = { workspace = true }
 prost-types = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["macros", "sync", "time"] }
 tonic = { workspace = true }
 tonic-prost = { workspace = true }
 tracing = { workspace = true }

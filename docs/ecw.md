@@ -204,7 +204,11 @@ the body is framed and encoded. Only parts named `file` are written. Without a
 `path` query, each `file` part's filename names its destination and may be at
 most 4096 bytes. Such a filename may not contain `\\`: clients encode it as
 either one backslash or two, so the request is rejected instead of guessing.
-With a `path` query, the request may carry only one `file` part. JSON file writes (`{"path": …, "content": …}`,
+With a `path` query, the request may carry only one `file` part. If the data
+plane can't read a spooled file to the end, the request fails with `500` and
+the sandbox doesn't complete that file's write; see
+[Guest file and disk I/O](space/design/guest-io.md#completing-publishing-and-acknowledging)
+for what an interrupted write leaves behind. JSON file writes (`{"path": …, "content": …}`,
 also used when the request has no `Content-Type`) are capped at 1 MiB of
 request body and return `413` above that; send larger files as multipart or
 octet-stream.

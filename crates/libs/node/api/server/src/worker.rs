@@ -124,6 +124,20 @@ impl WorkerApiService {
         }
     }
 
+    /// The served `WorkerApi`. A reset `SpacedWrite` body is an interrupted
+    /// upload, not an empty one: tonic would otherwise decode it as the end of
+    /// the stream and let a partial file through.
+    pub fn into_grpc_service(
+        self,
+    ) -> pplx_space_common_grpc::PreserveInputErrors<
+        crate::proto::worker_api_server::WorkerApiServer<Self>,
+    > {
+        pplx_space_common_grpc::PreserveInputErrors::for_methods(
+            crate::proto::worker_api_server::WorkerApiServer::new(self),
+            &["SpacedWrite"],
+        )
+    }
+
     async fn ensure_disk_allocation_open(&self, method: &'static str) -> Result<(), Status> {
         let status = self
             .resource_status_reader

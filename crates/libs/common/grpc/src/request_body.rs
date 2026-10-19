@@ -10,11 +10,27 @@ use tower::Service;
 /// Client-streaming services that use EOF as a commit boundary need cancellation
 /// to remain an error. This adapter is opt-in per service, not a global policy.
 #[derive(Clone, Debug)]
-pub struct PreserveInputErrors<S>(S);
+pub struct PreserveInputErrors<S> {
+    service: S,
+    /// The methods it applies to, by name; `None` is every method.
+    methods: Option<&'static [&'static str]>,
+}
 
 impl<S> PreserveInputErrors<S> {
     pub fn new(service: S) -> Self {
-        Self(service)
+        Self {
+            service,
+            methods: None,
+        }
+    }
+
+    /// Only for `methods`, so a service whose other streams treat a
+    /// cancelled input as its end keeps doing so.
+    pub fn for_methods(service: S, methods: &'static [&'static str]) -> Self {
+        Self {
+            service,
+            methods: Some(methods),
+        }
     }
 }
 
@@ -31,11 +47,19 @@ where
     type Future = S::Future;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.0.poll_ready(cx)
+        self.service.poll_ready(cx)
     }
 
     fn call(&mut self, request: http::Request<Body>) -> Self::Future {
-        self.0.call(request.map(|body| Body::new(InputBody(body))))
+        let method = request.uri().path().rsplit('/').next().unwrap_or("");
+        if self
+            .methods
+            .is_some_and(|methods| !methods.contains(&method))
+        {
+            return self.service.call(request);
+        }
+        self.service
+            .call(request.map(|body| Body::new(InputBody(body))))
     }
 }
 

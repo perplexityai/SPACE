@@ -19,7 +19,6 @@ use pplx_space_common_svc::types::k8s::space_node_id;
 use pplx_space_node_api_client::proto::NodeRole;
 use pplx_space_node_api_client::proto::node_info_server::NodeInfoServer;
 use pplx_space_node_api_client::proto::worker_api_internal_server::WorkerApiInternalServer;
-use pplx_space_node_api_client::proto::worker_api_server::WorkerApiServer;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::UnixListenerStream;
@@ -835,7 +834,7 @@ pub async fn run(
                 let server = builder
                     .add_service(health_service)
                     .add_service(reflection)
-                    .add_service(WorkerApiServer::new(svc))
+                    .add_service(svc.into_grpc_service())
                     .add_service(WorkerApiInternalServer::new(internal_svc))
                     .add_service(NodeInfoServer::new(node_info));
                 set_local_readiness(health_server.as_ref(), ReporterServingStatus::Serving).await;

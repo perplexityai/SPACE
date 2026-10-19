@@ -1,10 +1,10 @@
 use std::future::Future;
 
 use futures_util::{Stream, StreamExt};
+use pplx_space_common_grpc::{UploadBody, upload_channel};
 use pplx_space_spaced_common::filesystem_limits::{WRITE_BUFFER_FRAMES, WRITE_CHUNK_BYTES};
 use pplx_space_spaced_common::proto::operations::WriteRequest;
 use pplx_space_spaced_common::proto::operations::write_request::Message;
-use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
 
 #[derive(Debug, thiserror::Error)]
@@ -24,16 +24,16 @@ impl RelayError {
 }
 
 /// Keep input errors distinct from successful EOF, including caller cancellation.
-/// The input pump is a child future, never a detached task.
+/// The input pump is a child future, never a detached task. Only a complete
+/// input ends the downstream body; a failed one leaves it open until the
+/// dropped call resets it.
 pub(super) async fn relay<S, F, R, T>(mut input: S, call: F) -> Result<T, RelayError>
 where
     S: Stream<Item = Result<WriteRequest, Status>> + Unpin,
-    F: FnOnce(ReceiverStream<WriteRequest>) -> R,
+    F: FnOnce(UploadBody<WriteRequest>) -> R,
     R: Future<Output = Result<T, Status>>,
 {
-    let (tx, rx) = tokio::sync::mpsc::channel(WRITE_BUFFER_FRAMES);
-    // This sender prevents a failed pump from manufacturing normal EOF.
-    let keep_open = tx.clone();
+    let (tx, body) = upload_channel(WRITE_BUFFER_FRAMES);
     let pump = async move {
         while let Some(message) = input.next().await {
             let message = message?;
@@ -62,26 +62,18 @@ where
                 }
             }
         }
+        // A closed downstream already has its own result.
+        let _closed = tx.finish().await;
         Ok::<_, Status>(())
     };
     tokio::pin!(pump);
-    let mut downstream = Box::pin(call(ReceiverStream::new(rx)));
+    let mut downstream = Box::pin(call(body));
     tokio::select! {
         result = &mut downstream => result.map_err(RelayError::Downstream),
-        result = &mut pump => {
-            match result {
-                Ok(()) => {
-                    drop(keep_open);
-                    downstream.await.map_err(RelayError::Downstream)
-                }
-                Err(error) => {
-                    // Cancel the RPC before closing its outgoing body.
-                    drop(downstream);
-                    drop(keep_open);
-                    Err(RelayError::Input(error))
-                }
-            }
-        }
+        result = &mut pump => match result {
+            Ok(()) => downstream.await.map_err(RelayError::Downstream),
+            Err(error) => Err(RelayError::Input(error)),
+        },
     }
 }
 

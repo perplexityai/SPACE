@@ -835,10 +835,11 @@ async fn spaced_write_spooled(
 /// Runs the write call until it finishes or `spooled_write_requests` reports
 /// a spool read failure. On a read failure the call is dropped and the HTTP
 /// request fails, instead of the stream ending cleanly, which would make the
-/// guest finalize the prefix as a complete write. A dropped call still doesn't
-/// guarantee the guest discards that prefix: it writes the target in place,
-/// and the sandbox manager can end the guest's input cleanly once its own
-/// request stream fails.
+/// guest finalize the prefix as a complete write. Every hop below, the guest
+/// included, treats the dropped call as a failed input, never as its end, so
+/// the guest discards the prefix of a replacing write. A write the guest can't
+/// replace, which it writes in place over the truncated destination, keeps the
+/// bytes it received.
 async fn fail_on_spool_read_failure<W>(
     write: W,
     read_failure: tokio::sync::oneshot::Receiver<()>,

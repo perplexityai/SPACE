@@ -4,25 +4,39 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn only_successful_input_can_finish_the_downstream_body() {
     for fail in [false, true] {
         let saw_eof = Arc::new(AtomicBool::new(false));
         let observed = saw_eof.clone();
-        let mut frames = vec![Ok(WriteRequest { message: None })];
-        if fail {
-            frames.push(Err(Status::aborted("input failed")));
-        }
-        let result = relay(
-            futures_util::stream::iter(frames),
-            move |mut body| async move {
+        // The failure arrives once the downstream is reading its body.
+        let (reading, downstream_reading) = tokio::sync::oneshot::channel::<()>();
+        let failure = futures_util::stream::once(async move {
+            downstream_reading.await.expect("downstream reading");
+            Err(Status::aborted("input failed"))
+        })
+        .filter(move |_| std::future::ready(fail));
+        let input = Box::pin(
+            futures_util::stream::iter([Ok(WriteRequest { message: None })]).chain(failure),
+        );
+        let result = relay(input, move |mut body| async move {
+            // A transport reads the body on a task of its own, which
+            // outlives the call when the call is dropped.
+            let (done, finished) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                body.next().await.expect("first frame");
+                reading.send(()).expect("input waiting");
                 while body.next().await.is_some() {}
                 observed.store(true, Ordering::SeqCst);
-                Ok(())
-            },
-        )
+                let _ = done.send(());
+            });
+            finished.await.expect("reader finished");
+            Ok(())
+        })
         .await;
         assert_eq!(result.is_err(), fail);
+        // The paused clock advances only once every task is idle.
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         assert_eq!(saw_eof.load(Ordering::SeqCst), !fail);
     }
 }

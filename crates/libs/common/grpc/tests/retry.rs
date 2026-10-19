@@ -196,7 +196,9 @@ async fn retries_caller_classified_cancelled_status() {
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
 }
 
-#[tokio::test]
+// The paused clock keeps the 1 ms budget from running out before the first
+// attempt on a loaded machine.
+#[tokio::test(start_paused = true)]
 async fn caller_classified_cancelled_respects_deadline() {
     let attempts = Arc::new(AtomicUsize::new(0));
     let attempts_for_call = Arc::clone(&attempts);

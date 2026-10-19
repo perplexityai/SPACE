@@ -1059,10 +1059,14 @@ pub async fn run(
             .layer(pplx_space_common_svc::grpc_trace_layer())
             .layer(service.restart_admission_layer())
             .add_service(health_service)
-            .add_service(InterceptedService::new(
-                SandboxManagerServer::new(service.clone())
-                    .max_decoding_message_size(SANDBOX_MANAGER_MAX_DECODE_BYTES),
-                HandoffDrainInterceptor::new(rpc_drain_token.clone()),
+            // A reset upload is an error, not a complete file.
+            .add_service(pplx_space_common_grpc::PreserveInputErrors::for_methods(
+                InterceptedService::new(
+                    SandboxManagerServer::new(service.clone())
+                        .max_decoding_message_size(SANDBOX_MANAGER_MAX_DECODE_BYTES),
+                    HandoffDrainInterceptor::new(rpc_drain_token.clone()),
+                ),
+                &["SpacedWrite"],
             ))
             .serve_with_incoming_shutdown(
                 UnixListenerStream::new(sandbox_listener),
