@@ -178,7 +178,11 @@ fn jailer_args_keep_existing_launch_contract() {
 #[test]
 fn direct_jailer_command_runs_jailer_without_systemd_wrapper() {
     let args = vec!["--id".to_string(), "sandbox-a".to_string()];
-    let command = direct_jailer_command("/space/bin/jailer", &args);
+    let command = direct_jailer_command(
+        crate::launch::JailerExecutable::LegacyPath("/space/bin/jailer"),
+        &args,
+    )
+    .unwrap();
     let rendered: Vec<_> = command
         .get_args()
         .map(|arg| arg.to_string_lossy().into_owned())
@@ -196,7 +200,11 @@ fn direct_jailer_preserves_runtime_supervisor_scheduling_priority() {
     } else {
         "/usr/bin/cat"
     };
-    let mut command = direct_jailer_command(cat_path, &["/proc/self/stat".to_string()]);
+    let mut command = direct_jailer_command(
+        crate::launch::JailerExecutable::LegacyPath(cat_path),
+        &["/proc/self/stat".to_string()],
+    )
+    .unwrap();
     let output = command.output().expect("read spawned process stat");
     assert!(output.status.success());
     let stat = String::from_utf8(output.stdout).expect("proc stat is utf8");
@@ -283,4 +291,24 @@ fn sidecar_exec_preserves_pid_arguments_and_explicit_environment() {
             assert_ne!(mask & (1 << (libc::SIGUSR1 - 1)), 0, "{stdout}");
         }
     }
+}
+
+#[test]
+fn jailer_execution_uses_the_opened_inode_after_path_replacement() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("jailer");
+    std::fs::copy("/bin/true", &path).unwrap();
+    let pinned = std::fs::File::open(&path).unwrap();
+    let mut command = std::process::Command::new(&path);
+    command.env_clear();
+    super::bind_jailer_descriptor(&mut command, pinned, path.to_str().unwrap(), &[]).unwrap();
+    std::fs::rename(&path, directory.path().join("original")).unwrap();
+    std::fs::copy("/bin/false", &path).unwrap();
+    assert!(command.status().unwrap().success());
+    assert!(
+        !std::process::Command::new(&path)
+            .status()
+            .unwrap()
+            .success()
+    );
 }

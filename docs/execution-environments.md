@@ -213,6 +213,113 @@ schema redesign.
 
 ## Explicit environment selection
 
+### Execution artifact integrity
+
+Artifact identity, execution approval and host integrity enforcement are separate
+properties. The supervisor's `VerifiedRuntimeLaunch` input names a complete
+environment and requires authenticated, immutable runtime and boot sources.
+It contains no host paths or filesystem mechanism. An adapter must reject unknown
+integrity requirements; a signature check alone does not establish immutability.
+Host and guest platforms retain their independent meanings.
+
+On Linux hosts supporting the fixed fs-verity profile, node-manager creates
+root-owned execution copies of the approved Firecracker, jailer and guest kernel
+under the cache's `managed` namespace. The durable artifact store remains on its
+existing filesystem. Initial copies are checked against their content SHA-256;
+cache files are sealed and measured against independently pinned verity digests.
+The profile uses SHA-256, 4096-byte blocks and no salt. Verity digests are separate
+catalog metadata: E0 and the other environment references do not change.
+
+Existing cache files are sealed in place. Node-manager warms the cache in tracked
+background work at startup; inventory consumers await the same serialized discovery,
+while unrelated lifecycle RPCs can serve. For missing copies, source presence and
+directory protection are checked before cache namespace creation or a support
+probe. Existing sealed copies are measured without probing support
+again or issuing fsyncs. Unsupported hosts do not create
+unused execution copies. Restart validation measures sealed files without hashing
+their entire contents again. An empty protected cache directory, including a
+release with only an empty `bin/` remaining, is republished. Existing files,
+symlinks and unexpected entries are retained for operator repair. Baked kernel
+sources retain the execution cache's sticky-parent protection; durable store
+checks stay strict.
+There are no mutable verification receipts. A mismatch withdraws the affected
+binding and never authorizes another copy with different bytes.
+
+Node-manager supplies locations through the Firecracker adapter's existing binary
+path fields. The portable `VerifiedRuntimeLaunch` envelope remains independent of
+host paths and mechanisms. The supervisor validates that both locations name the
+compiled release layout, checks the same full directory ancestry as staging, and
+authenticates bytes against its own cached catalog. No shared location pointer or independent
+supervisor environment-variable setting is needed.
+
+Resolution carries the selected environment and each boot component's integrity
+into launch preparation. Compiled protected boots reject missing component
+protection. Historical unbound custom-kernel execution remains a deliberate legacy
+path, with a warning sampled once per minute per process and a
+`node_mgr.execution.legacy_source_launch` counter for every successful launch; it does
+not claim complete-environment integrity. Adoption of a resident VM skips cold-launch
+integrity admission and does not count as a legacy launch. An empty node reports
+absent artifacts rather than failed verification.
+At launch, runtime-supervisor opens and measures the jailer, then executes that
+same descriptor. It also authenticates the Firecracker source in the protected
+cache. The stock jailer then copies Firecracker by path; the acknowledgement
+does not attest the copied bytes, and path replacement by host root is outside
+this guarantee. Explicitly tagged protected-launch admission refusals preserve their
+`InvalidArgument` or `FailedPrecondition` status through node-manager and occur
+before recording a CPU launch budget or spawning a process. Transient errors
+opening, measuring or inspecting sources retain retryable `Internal` status and
+carry no admission-refusal tag. Other supervisor failures keep the previous `Internal` mapping. The upstream
+jailer retains its independent per-VM executable copy and isolation behavior. Node-manager authenticates the kernel descriptor and links
+that inode into the jail. Stacked rootfs, memory and encrypted-snapshot directory
+binds are drained in a bounded loop before recursive jail removal;
+unmount failure, exhaustion of the cleanup budget or failed jail removal refuses
+launch. An operator can inspect mounts and retry start after repair. Failed
+cleanup must not permit reuse of an old executable. Mutable rootfs and snapshot
+artifacts are outside this sealing contract.
+
+The privileged Rust CI lane runs the sealing and authenticated-link tests on its
+disposable btrfs filesystem (`SPACE_NOCOW_TEST_BTRFS_DIR`). With
+`SPACE_CI_REQUIRE_TEST_PRIVILEGE` enabled, missing privilege, a missing fixture,
+or unsupported fs-verity fails these tests rather than skipping the assertions.
+
+These protections trust the host kernel, node-manager, supervisor and namespace
+ownership. They do not establish supply-chain provenance, attest an adopted
+running VM, or defend against host-root compromise. Containment and slot-UID
+cleanup remain necessary even when source artifacts are sealed.
+
+Deploy supervisor readers before node-manager writers on capable hosts. Verified
+requests omit the legacy sandbox ID, so an old supervisor rejects
+them before spawning; successful replies acknowledge the environment reference.
+Legacy supervisor requests remain accepted with their existing protection. Unsupported
+host kernels or filesystems emit an explicit warning and retain SHA-256-verified
+legacy execution without claiming the new integrity guarantee. Integrity failures
+on a supported backend do not take this fallback. Staging resource or I/O failures
+also leave the affected binding unavailable instead of downgrading it. Transient
+failures, including disk exhaustion and I/O errors, permit rediscovery on subsequent
+inventory requests after a ten-second backoff. Unsafe directories require repair;
+changes to any execution-cache ancestor invalidate the observation. Fleet-wide
+mandatory enforcement requires a separate capability/admission rollout.
+
+Commissioning must check the running host kernel's `CONFIG_FS_VERITY` and the
+execution-cache filesystem, including the loopback cache used without NVMe.
+Before rollout, inspect the complete configured cache path with `namei -l` on a
+canary of each image type; a symlinked or writable non-sticky ancestor is refused.
+Node-manager must retain `CAP_DAC_READ_SEARCH`: linking the authenticated kernel
+uses [`linkat(AT_EMPTY_PATH)`](https://man7.org/linux/man-pages/man2/linkat.2.html).
+Sealing a kernel binary cannot enable fs-verity in the host running SPACE.
+Keep host filesystem and kernel support while sealed cache files remain in use;
+reverting a node service does not unseal those files.
+Measure warm-cache and cold-cache launches independently; no activation-latency
+guarantee follows from the digest ioctl's constant-time behavior alone.
+
+To author additional trusted measurements, first authenticate the artifact's
+existing SHA-256, then use `fsverity digest --hash-alg sha256 --block-size 4096`
+with no salt. Source/signing changes must preserve existing environment identities
+or introduce separately qualified environments. See the
+[Linux fs-verity documentation](https://docs.kernel.org/filesystems/fsverity.html).
+
+### Selection and lifecycle
+
 The compiled execution catalog approves complete runtime, kernel and
 compatibility bindings independently of downloadable artifact pins. It includes
 three Linux/x86_64 bindings: E0 (Firecracker 1.15.1 / Linux 6.1.155),

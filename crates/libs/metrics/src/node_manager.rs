@@ -229,3 +229,9 @@ pub fn balloon_snapshot_statistics(
         distribution("node_mgr.balloon.guest_free_mib", free_mib as f64, &tags);
     }
 }
+
+/// Successful unbound historical launches whose sealed runtime cannot claim a complete
+/// compiled environment. No sandbox or environment identifiers are tagged.
+pub fn legacy_execution_source_launch() {
+    counter("node_mgr.execution.legacy_source_launch", 1, &[]);
+}

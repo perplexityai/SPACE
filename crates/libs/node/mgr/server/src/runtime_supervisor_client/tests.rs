@@ -256,11 +256,24 @@ pub(crate) type UpdateCgroupReply = Arc<
     dyn Fn(proto::UpdateCgroupRequest) -> Result<proto::UpdateCgroupResponse, Status> + Send + Sync,
 >;
 
+pub(crate) type LaunchReply = Arc<
+    dyn Fn(proto::LaunchFirecrackerRequest) -> Result<proto::LaunchFirecrackerResponse, Status>
+        + Send
+        + Sync,
+>;
+pub(crate) type StopRuntimeReply = Arc<
+    dyn Fn(proto::StopSandboxRuntimeRequest) -> Result<proto::StopSandboxRuntimeResponse, Status>
+        + Send
+        + Sync,
+>;
+
 /// Supervisor replies for node-manager RPC tests; `None` keeps the stub's
-/// default reply. Runtime stop always fails with `Unimplemented`, so a refusal
-/// that regresses past its check ends at the stop instead of host cleanup.
+/// default reply. Without a scripted reply, runtime stop fails with
+/// `Unimplemented`, preventing a refused request from reaching host cleanup.
 #[derive(Clone, Default)]
 pub(crate) struct SupervisorScript {
+    pub(crate) launch: Option<LaunchReply>,
+    pub(crate) stop_runtime: Option<StopRuntimeReply>,
     pub(crate) bind_execution_failure: Option<tonic::Code>,
     pub(crate) stop_process: Option<StopProcessReply>,
     pub(crate) update_cgroup: Option<UpdateCgroupReply>,
@@ -459,9 +472,12 @@ impl proto::runtime_supervisor_server::RuntimeSupervisor for StubRuntimeSupervis
     }
     async fn launch_firecracker(
         &self,
-        _request: Request<proto::LaunchFirecrackerRequest>,
+        request: Request<proto::LaunchFirecrackerRequest>,
     ) -> Result<Response<proto::LaunchFirecrackerResponse>, Status> {
         self.launch_firecracker_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(reply) = &self.script.launch {
+            return reply(request.into_inner()).map(Response::new);
+        }
         if let Some(gate) = &self.launch_gate {
             gate.notified().await;
         }
@@ -469,6 +485,7 @@ impl proto::runtime_supervisor_server::RuntimeSupervisor for StubRuntimeSupervis
             return Err(Status::internal("firecracker launch failed"));
         }
         Ok(Response::new(proto::LaunchFirecrackerResponse {
+            accepted_environment_reference: String::new(),
             pid: STUB_LAUNCH_PID,
         }))
     }
@@ -494,6 +511,9 @@ impl proto::runtime_supervisor_server::RuntimeSupervisor for StubRuntimeSupervis
         &self,
         request: Request<proto::StopSandboxRuntimeRequest>,
     ) -> Result<Response<proto::StopSandboxRuntimeResponse>, Status> {
+        if let Some(reply) = &self.script.stop_runtime {
+            return reply(request.into_inner()).map(Response::new);
+        }
         if request.get_ref().execution_id.is_empty() {
             return Err(Status::invalid_argument(
                 "test stop requires explicit identity",

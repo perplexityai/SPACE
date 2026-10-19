@@ -1121,6 +1121,12 @@ fn cleanup_runtime_artifacts(sandbox_id: &str) -> Result<Vec<String>, RuntimeArt
     )
 }
 
+pub(super) const JAIL_BIND_NAMES: [&str; 3] = [
+    "rootfs.ext4",
+    "memory",
+    super::snapshots::ENC_SNAPSHOT_JAIL_SUBDIR,
+];
+
 fn cleanup_runtime_artifacts_at(
     gateway_dir: &str,
     run_dir: &str,
@@ -1132,11 +1138,7 @@ fn cleanup_runtime_artifacts_at(
     // Each phase is a prerequisite for the next. In particular, never unlink
     // device backing files (or the evidence that selects device teardown) after
     // unknown/failed teardown, and never remove a tree containing a live bind.
-    for name in [
-        "rootfs.ext4",
-        "memory",
-        super::snapshots::ENC_SNAPSHOT_JAIL_SUBDIR,
-    ] {
+    for name in JAIL_BIND_NAMES {
         let bind = format!("{jail_dir}/root/{name}");
         if unmount_if_present(&bind).map_err(|error| RuntimeArtifactCleanupError(vec![error]))? {
             actions.push(format!("Unmounted {bind}"));
