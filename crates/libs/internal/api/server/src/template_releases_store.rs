@@ -147,11 +147,12 @@ impl TemplateReleasesStore {
             "SELECT n.id, k.k8s_node_uid = $2
              FROM nodes n JOIN node_k8s k ON k.node_id = n.id
              WHERE k.k8s_node_name = $1
-               AND n.role = 'builder' AND n.managed_by = 'k8s'
+               AND n.role = 'builder' AND n.managed_by = $3
                AND COALESCE(n.state, 'registered') != 'deleted'"
         ))
         .bind(node.name.as_str())
         .bind(node.uid.as_str())
+        .bind(SubstrateKind::Kubernetes)
         .fetch_all(&self.pool)
         .await?;
         if let Some((id, _)) = rows.iter().find(|(_, matches)| *matches == Some(true)) {
