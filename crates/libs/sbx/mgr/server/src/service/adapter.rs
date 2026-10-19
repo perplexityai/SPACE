@@ -415,6 +415,13 @@ impl SandboxManager for SandboxManagerService {
         SandboxManagerService::spaced_get_modified_files(self, request).await
     }
 
+    async fn spaced_glob(
+        &self,
+        request: Request<SpacedGlobRequest>,
+    ) -> Result<Response<SpacedGlobResponse>, Status> {
+        SandboxManagerService::spaced_glob(self, request).await
+    }
+
     async fn spaced_start_process(
         &self,
         request: Request<SpacedStartProcessRequest>,

@@ -100,6 +100,36 @@ async fn run() {
         .expect("start worker");
     let original_worker = children().await;
     {
+        use pplx_space_spaced_common::proto::bridge_guest::GlobRequest;
+        let root = directory.path().join("glob");
+        tokio::fs::create_dir_all(root.join("src/skip"))
+            .await
+            .expect("glob tree");
+        for file in ["src/a.rs", "src/skip/b.rs", "top.rs"] {
+            tokio::fs::write(root.join(file), "x")
+                .await
+                .expect("glob file");
+        }
+        let response = client
+            .glob(GlobRequest {
+                search_dir: root.display().to_string(),
+                pattern: "**/*.rs".into(),
+                skip_dirs: vec!["skip".into()],
+                max_results: 0,
+                user: None,
+            })
+            .await
+            .expect("glob through the identity worker")
+            .into_inner();
+        let paths: Vec<_> = response
+            .matches
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect();
+        assert_eq!(paths, ["src/a.rs", "top.rs"]);
+        assert!(!response.truncated);
+    }
+    {
         use pplx_space_spaced_common::proto::bridge_guest::{WriteBatchEntry, WriteBatchRequest};
         use prost::Message as _;
         let limit = pplx_space_spaced_common::filesystem_limits::MAX_MESSAGE_BYTES;

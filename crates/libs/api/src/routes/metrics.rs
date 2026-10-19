@@ -99,6 +99,7 @@ fn native_file_metric(file_segment: &str) -> &'static str {
         Some("changes_enable") => "files_changes_enable",
         Some("changes_disable") => "files_changes_disable",
         Some("modified") => "files_modified",
+        Some("glob") => "files_glob",
         Some("mkdir") => "files_mkdir",
         Some("remove") => "files_remove",
         Some("rename") => "files_rename",

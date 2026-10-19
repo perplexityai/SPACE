@@ -18,18 +18,20 @@ use pplx_space_common_core::types::{
 use pplx_space_metrics::response::{ResponseKind, ResponseOrigin};
 use pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity;
 use pplx_space_public_api::{
-    FileChangeTrackingRequest, FileChangeTrackingResponse, FileEventKind, FileInfo,
-    FileListRequest, FileListResponse, FileMkdirRequest, FileModifiedEntry, FileModifiedRequest,
-    FileModifiedResponse, FileMutationResponse, FileReadRequest, FileRemoveRequest,
-    FileRenameRequest, FileStatRequest, FileStatResponse, FileType, FileWriteBatchRequest,
-    FileWriteBatchResponse, FileWriteRequest, FileWriteResponse, PublicSandboxId,
+    FileChangeTrackingRequest, FileChangeTrackingResponse, FileEventKind, FileGlobMatch,
+    FileGlobRequest, FileGlobResponse, FileInfo, FileListRequest, FileListResponse,
+    FileMkdirRequest, FileModifiedEntry, FileModifiedRequest, FileModifiedResponse,
+    FileMutationResponse, FileReadRequest, FileRemoveRequest, FileRenameRequest, FileStatRequest,
+    FileStatResponse, FileType, FileWriteBatchRequest, FileWriteBatchResponse, FileWriteRequest,
+    FileWriteResponse, PublicSandboxId,
 };
 use pplx_space_sbx_mgr_client::operations as spaced_ops;
 use pplx_space_sbx_mgr_client::proto::{
     SpacedDisableFileChangesRequest, SpacedEnableFileChangesRequest, SpacedFileEventKind,
-    SpacedFileInfo, SpacedFileType, SpacedGetModifiedFilesRequest, SpacedMkdirRequest,
-    SpacedReadRequest, SpacedRemoveRequest, SpacedRenameRequest, SpacedWriteBatchEntry,
-    SpacedWriteBatchRequest, SpacedWriteOpen, SpacedWriteRequest, spaced_write_request,
+    SpacedFileInfo, SpacedFileType, SpacedGetModifiedFilesRequest, SpacedGlobRequest,
+    SpacedMkdirRequest, SpacedReadRequest, SpacedRemoveRequest, SpacedRenameRequest,
+    SpacedWriteBatchEntry, SpacedWriteBatchRequest, SpacedWriteOpen, SpacedWriteRequest,
+    spaced_write_request,
 };
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -43,6 +45,7 @@ use super::{
 };
 
 const MAX_FILE_LIST_ENTRIES: usize = 10_000;
+const MAX_GLOB_SKIP_DIRS: usize = 256;
 const MAX_FILE_WRITE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FILE_READ_BYTES: u64 = 16 * 1024 * 1024;
 // Raw bytes per data message. A multiple of 3, so each message decodes from
@@ -594,6 +597,69 @@ pub async fn modified_files(
         monitoring_enabled: response.monitoring_enabled,
         overflowed: response.overflowed,
     }))
+}
+
+pub async fn glob_files(
+    State(state): State<AppState>,
+    Extension(AuthOrg(org)): Extension<AuthOrg>,
+    authorized: Option<Extension<AuthorizedSandbox>>,
+    Path(sandbox_id): Path<String>,
+    Json(request): Json<FileGlobRequest>,
+) -> Result<Json<FileGlobResponse>, PublicApiError> {
+    if request.pattern.is_empty() {
+        return Err(PublicApiError::bad_request("pattern must not be empty"));
+    }
+    if request.skip_dirs.len() > MAX_GLOB_SKIP_DIRS {
+        return Err(PublicApiError::bad_request(format!(
+            "skip_dirs holds at most {MAX_GLOB_SKIP_DIRS} names"
+        )));
+    }
+    let sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, &sandbox_id).await?;
+    let user = parse_guest_user(request.user)?;
+    let search_dir = parse_guest_path(request.search_dir)?;
+    let response = state
+        .sandbox_controller
+        .spaced_glob(
+            &state.pool,
+            &sandbox,
+            SandboxApiMetricIdentity::native("files_glob"),
+            SpacedGlobRequest {
+                sandbox_id: sandbox.id.to_string(),
+                operation: Some(spaced_ops::GlobRequest {
+                    search_dir,
+                    pattern: request.pattern,
+                    skip_dirs: request.skip_dirs,
+                    max_results: request.max_results.unwrap_or(0),
+                    user: user.map(|user| user.as_str().to_string()),
+                }),
+            },
+        )
+        .await
+        .map_err(glob_error)?;
+    Ok(Json(FileGlobResponse {
+        matches: response
+            .matches
+            .into_iter()
+            .map(|entry| FileGlobMatch {
+                path: entry.path,
+                size_bytes: entry.size_bytes,
+                modified_at: entry.modified_at.and_then(timestamp_to_rfc3339),
+            })
+            .collect(),
+        truncated: response.truncated,
+    }))
+}
+
+/// A guest, or a service on the way to it, that predates glob answers with a
+/// named `failed_precondition` so the client can list files another way.
+fn glob_error(error: ControllerError) -> PublicApiError {
+    if error.is_guest_capability_unsupported() || error.status() == StatusCode::NOT_IMPLEMENTED {
+        return PublicApiError::unsupported_operation(
+            "this sandbox does not support files:glob",
+            "files:glob",
+        );
+    }
+    controller_error(error)
 }
 
 async fn ensure_sandbox_owner(
