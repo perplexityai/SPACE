@@ -720,6 +720,72 @@ async fn busy_close_reports_its_holders_and_recovers() {
     );
 }
 
+/// A fresh volume's unwritten plaintext is whatever the new LUKS key decrypts
+/// the backing to: pseudorandom bytes, which can happen to carry a signature
+/// mkfs.btrfs's probe recognizes. Write one through the mapper, as such bytes
+/// would, and the fresh format must still succeed.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires root, loop/dm-crypt and an explicitly supplied disposable btrfs fixture directory"]
+async fn fresh_format_overwrites_a_signature_in_unwritten_plaintext() {
+    use std::os::unix::fs::FileExt;
+
+    // CI includes ignored tests; host mutation still requires explicit opt-in.
+    let Some(root) = std::env::var_os("SPACE_NODEMGR_TEST_BTRFS_DIR") else {
+        eprintln!("not opted in: set SPACE_NODEMGR_TEST_BTRFS_DIR to a disposable btrfs directory");
+        return;
+    };
+    assert!(nix::unistd::geteuid().is_root());
+    let temp = tempfile::tempdir_in(root).unwrap();
+    let backing = Backing::replace(&temp.path().join("snapshot.luks")).unwrap();
+    backing.resize(volume_backing_size_bytes(0)).unwrap();
+    let loop_device = LoopDevice::attach(&backing, false).unwrap();
+    let loop_path = loop_device.path().to_string_lossy();
+    let dek = [42; 32];
+    run_with_stdin("cryptsetup", &luks_format_args(&loop_path), &dek)
+        .await
+        .unwrap();
+    let mapper = mapper_name(&SandboxId::new(), "snapshot");
+    run_with_stdin(
+        "cryptsetup",
+        &["open", "--key-file=-", &loop_path, &mapper],
+        &dek,
+    )
+    .await
+    .unwrap();
+    struct Close(String);
+    impl Drop for Close {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("cryptsetup")
+                .args(["close", &self.0])
+                .status();
+        }
+    }
+    let _close = Close(mapper.clone());
+    let mapper_dev = format!("/dev/mapper/{mapper}");
+
+    // An HFS+ volume header at 1 KiB: its signature and a block size are all
+    // the probe needs.
+    let mut header = [0; 512];
+    header[..2].copy_from_slice(b"H+");
+    header[40..44].copy_from_slice(&4096_u32.to_be_bytes());
+    let device = std::fs::File::options()
+        .write(true)
+        .open(&mapper_dev)
+        .unwrap();
+    device.write_all_at(&header, 1024).unwrap();
+    device.sync_all().unwrap();
+    drop(device);
+
+    format_fresh_mapper(&mapper_dev)
+        .await
+        .expect("a fresh format overwrites whatever the plaintext resembles");
+    let probed = run("blkid", &["-p", "-o", "value", "-s", "TYPE", &mapper_dev])
+        .await
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&probed).trim(), "btrfs");
+}
+
 /// The read-only check reads the superblock options, which a plain
 /// `remount,ro` changes, and judges the visible (last) mount at the point.
 #[test]

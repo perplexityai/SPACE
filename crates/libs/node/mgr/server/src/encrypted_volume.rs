@@ -933,10 +933,26 @@ async fn build_volume(
     }
 
     if fresh {
-        run("mkfs.btrfs", &["-q", &mapper_dev]).await?;
+        format_fresh_mapper(&mapper_dev).await?;
     }
 
     mount_mapper(mapper, mount_dir).await
+}
+
+/// Make the btrfs filesystem on a mapper [`build_volume`] has just
+/// LUKS-formatted and opened.
+///
+/// `-f` is required: the unwritten plaintext is the new backing decrypted
+/// under a new random volume key, so it is pseudorandom and can match a
+/// signature mkfs.btrfs's probe recognizes, which it would refuse to
+/// overwrite. It is safe only here: the mapper sits on a backing file this
+/// build just created and LUKS-formatted, so there is no data to lose. Never
+/// pass `-f` where the device might hold data. mkfs.btrfs still refuses a
+/// mounted device with `-f`.
+async fn format_fresh_mapper(mapper_dev: &str) -> Result<(), DmCryptError> {
+    run("mkfs.btrfs", &["-q", "-f", mapper_dev])
+        .await
+        .map(|_| ())
 }
 
 /// `mount -o remount,ro` the filesystem mounted at `point`, and confirm its
