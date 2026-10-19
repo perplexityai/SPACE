@@ -1,4 +1,5 @@
-//! The Direct node registry reads and writes only Direct (`'space'`) nodes.
+//! The Direct node registry writes, and `verify` proceeds for, only Direct
+//! (`'space'`) nodes.
 //!
 //! Each case pairs a Direct node with an otherwise identical node whose
 //! `managed_by` is `'k8s'`. Both keep a `node_direct` row, so only the

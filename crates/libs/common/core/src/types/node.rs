@@ -804,9 +804,9 @@ impl SubstrateKind {
     ///
     /// - Kubernetes: yes. A dormant sandbox (suspended, or created and never
     ///   started) has no pod until a wake creates one.
-    /// - Space: no. Direct wakes a dormant sandbox on the access path before
-    ///   connecting (`DirectSubstrate::access_runtime_client` in the api
-    ///   crate), not after a failed control connect.
+    /// - Space: no. Direct wakes a suspended or restoring sandbox on the
+    ///   access path before connecting (`DirectSubstrate::access_runtime_client`
+    ///   in the api crate), not after a failed control connect.
     pub const fn wakes_after_failed_control_connect(self) -> bool {
         match self {
             Self::Kubernetes => true,

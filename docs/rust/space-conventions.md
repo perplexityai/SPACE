@@ -202,14 +202,6 @@ as text (`proves_no_execution` parses the latter). Convert them when touched;
 they are not a pattern to copy.
 
 - A decision about one row's substrate, its sandbox or node `managed_by`,
-  calls a `SubstrateKind` method named for the question; add one when no
-  method asks it. Rust that repeats a statement's fixed scope compares
-  against the named `SubstrateKind` const the statement binds, and mapping a
-  variant to a value (wire labels, route identity, construction) may match
-  it. A fact about the running substrate reads the api crate's
-  `capabilities()` (`SubstrateCapabilities`). Never compare the label string.
-
-- A decision about one row's substrate, its sandbox or node `managed_by`,
   calls a `SubstrateKind` method named for the question (for example
   `proves_execution_absence` or `restores_through_pods`); add one when no
   method asks it. Rust that repeats a statement's fixed scope compares

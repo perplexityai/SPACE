@@ -189,9 +189,12 @@ fn node_response(row: NodeRow) -> NodeResponse {
     }
 }
 
-/// The substrate whose nodes this registry owns. Every registry statement
-/// scopes to it, and an update's `verify` reads only a node of it, so the
-/// registry never touches a node another substrate manages.
+/// The substrate whose nodes this registry owns. Every registry write to
+/// `nodes`/`node_direct` binds it, and an update's `verify` proceeds only for
+/// a live node of it, so registration never changes a node another substrate
+/// manages. Its reads (`fetch_node`, `fetch_nodes`) return nodes of every
+/// substrate, and the template pull and delete routes (`node_templates.rs`)
+/// act on any node `fetch_node` returns.
 const REGISTRY_SUBSTRATE: SubstrateKind = SubstrateKind::Space;
 
 fn require_admin_node_registry(
