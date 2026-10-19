@@ -18,7 +18,7 @@ mod postgres {
 
     use pplx_space_common_core::sql;
     use pplx_space_db_test_fixtures::TestDbResult;
-    use pplx_space_public_api::{OperationId, OperationKind, OperationState};
+    use pplx_space_public_api::{OperationId, OperationKind, OperationState, PublicErrorCode};
     use tokio::sync::Notify;
 
     use super::*;
@@ -31,6 +31,8 @@ mod postgres {
     #[derive(Clone, Copy)]
     enum Script {
         Succeed,
+        /// A terminal failure, recorded on the first attempt.
+        Fail,
         /// A pool-slot-release wait: workflow progress, retried later.
         Retry,
         Panic,
@@ -102,6 +104,15 @@ mod postgres {
                         "sandbox created",
                     )
                     .into(),
+                    Script::Fail => OperationExecutionResult {
+                        state: OperationState::Failed,
+                        progress_message: "sandbox create failed".to_string(),
+                        result_json: None,
+                        terminal_error_code: Some(PublicErrorCode::CapacityUnavailable),
+                        terminal_error_json: Some(serde_json::json!({ "message": "no capacity" })),
+                        retry_after: None,
+                        requeue_reason: PublicOperationRequeueReason::TransientFailure,
+                    },
                     Script::Retry => OperationExecutionResult {
                         state: OperationState::Queued,
                         progress_message: "waiting for the pool to collect a slot".to_string(),
@@ -238,6 +249,21 @@ mod postgres {
         let counters = capture.finish();
 
         assert_eq!(script.calls(), 1);
+        // The response carries the finished operation, so the client needs
+        // no poll; it matches what a poll would read.
+        let finished = response
+            .operation
+            .as_ref()
+            .expect("a finished create answers with its record");
+        assert_eq!(finished.id, response.operation_id);
+        assert_eq!(finished.state, OperationState::Succeeded);
+        assert_eq!(
+            Some(finished),
+            PublicOperationStore::new(fixture.db.pool.clone())
+                .fetch_operation(fixture.org_id, response.operation_id)
+                .await?
+                .as_ref()
+        );
         let row = operation_row(&fixture, response.operation_id).await?;
         assert_eq!(
             row,
@@ -279,6 +305,32 @@ mod postgres {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn a_terminal_failure_inline_answers_with_the_failed_record() -> TestDbResult<()> {
+        let fixture = AdmissionPoolFixture::new(1).await?;
+        let controller = fixture.controller();
+        let script = ScriptedCreate::new(Script::Fail);
+        let response = fixture
+            .create_with(
+                claims(&controller, Some(script.inline(Duration::from_secs(5)))),
+                "inline-fail",
+                fixture.request(),
+            )
+            .await
+            .expect("a failed create is still accepted");
+
+        let finished = response
+            .operation
+            .expect("a failed create answers with its record");
+        assert_eq!(finished.id, response.operation_id);
+        assert_eq!(finished.state, OperationState::Failed);
+        assert_eq!(
+            finished.terminal_error_code,
+            Some(PublicErrorCode::CapacityUnavailable)
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn past_the_deadline_the_create_answers_and_finishes_in_the_background()
     -> TestDbResult<()> {
         let fixture = AdmissionPoolFixture::new(1).await?;
@@ -293,7 +345,9 @@ mod postgres {
             .await
             .expect("create answers at the deadline");
 
-        // Answered while the execution still holds its claim.
+        // Answered while the execution still holds its claim, without a
+        // record: the client polls as before.
+        assert_eq!(response.operation, None);
         let row = operation_row(&fixture, response.operation_id).await?;
         assert_eq!(row.state, "running");
         assert!(
@@ -356,6 +410,7 @@ mod postgres {
         let counters = capture.finish();
 
         assert_eq!(script.calls(), 1, "no inline retry loop");
+        assert_eq!(response.operation, None, "a released retry is not finished");
         let row = operation_row(&fixture, response.operation_id).await?;
         assert_eq!(row.state, "queued");
         assert!(
@@ -429,6 +484,7 @@ mod postgres {
             .await
             .expect("a dead inline task still answers");
         assert_eq!(script.calls(), 1);
+        assert_eq!(response.operation, None);
 
         let row = operation_row(&fixture, response.operation_id).await?;
         assert_eq!(row.state, "running");
@@ -535,6 +591,7 @@ mod postgres {
             .create_with(claims(&controller, None), "inline-off", fixture.request())
             .await
             .expect("create is recorded");
+        assert_eq!(off.operation, None);
         let row = operation_row(&fixture, off.operation_id).await?;
         assert_eq!((row.state.as_str(), row.attempts), ("queued", 0));
         assert!(
@@ -554,6 +611,7 @@ mod postgres {
             )
             .await
             .expect("create is recorded");
+        assert_eq!(miss.operation, None);
         let row = operation_row(&fixture, miss.operation_id).await?;
         assert_eq!((row.state.as_str(), row.attempts), ("queued", 0));
         assert!(
@@ -569,6 +627,7 @@ mod postgres {
             .create_with(None, "inline-disabled", fixture.request())
             .await
             .expect("create is recorded");
+        assert_eq!(disabled.operation, None);
         let row = operation_row(&fixture, disabled.operation_id).await?;
         assert_eq!(row.state, "queued");
         assert_eq!(script.calls(), 0);
@@ -621,6 +680,9 @@ mod postgres {
             .await
             .expect("a replay answers");
 
+        assert!(first.operation.is_some());
+        // A replay answers as it always has.
+        assert_eq!(replay.operation, None);
         assert_eq!(replay.operation_id, first.operation_id);
         assert_eq!(replay.sandbox_id, first.sandbox_id);
         assert_eq!(script.calls(), 1);

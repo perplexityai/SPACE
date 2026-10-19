@@ -1389,7 +1389,7 @@ pub struct PortExposureResponse {
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SandboxOperationResponse {
     /// Poll this operation and require success before relying on the action's
     /// outcome. An HTTP 202 response only accepts the work.
@@ -1400,6 +1400,18 @@ pub struct SandboxOperationResponse {
         schemars(schema_with = "schema::public_sandbox_id")
     )]
     pub sandbox_id: PublicSandboxId,
+    /// The operation's record, as `GET /v1/operations/{operation_id}` returns
+    /// it, when the server finished the work before answering. Present only
+    /// with a terminal `state`; when absent, poll `operation_id`.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "schema::optional_incubating_operation_record")
+    )]
+    pub operation: Option<PublicOperationRecord>,
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]

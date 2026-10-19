@@ -78,27 +78,34 @@ impl InlineCreate {
 
     /// Start executing `operation` under `claim_token` in its own task, and
     /// wait for it up to the deadline. Returning (or dropping this future)
-    /// never stops the task.
+    /// never stops the task. True when the task finished within the
+    /// deadline, so whatever it recorded is already durable.
     pub(crate) async fn run(
         &self,
         store: PublicOperationStore,
         claim_token: String,
         operation: ClaimedPublicOperation,
-    ) {
+    ) -> bool {
         let operation_id = operation.id;
         let task = self.spawn(store, claim_token, operation);
         match tokio::time::timeout(self.wait, task).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => tracing::error!(
-                operation_id = %operation_id,
-                %error,
-                "inline native create task failed; the dispatcher reclaims it once its claim is stale"
-            ),
-            Err(_) => tracing::debug!(
-                operation_id = %operation_id,
-                wait_ms = self.wait.as_millis(),
-                "inline native create still running at the deadline; answering queued"
-            ),
+            Ok(Ok(())) => true,
+            Ok(Err(error)) => {
+                tracing::error!(
+                    operation_id = %operation_id,
+                    %error,
+                    "inline native create task failed; the dispatcher reclaims it once its claim is stale"
+                );
+                false
+            }
+            Err(_) => {
+                tracing::debug!(
+                    operation_id = %operation_id,
+                    wait_ms = self.wait.as_millis(),
+                    "inline native create still running at the deadline; answering queued"
+                );
+                false
+            }
         }
     }
 

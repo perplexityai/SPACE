@@ -64,6 +64,15 @@ pub(crate) fn optional_incubating_idle_action_input(generator: &mut SchemaGenera
     }))
 }
 
+// `anyOf` rather than a bare `$ref`: the status extension cannot sit beside a
+// `$ref` in the modeled contract subset.
+pub(crate) fn optional_incubating_operation_record(generator: &mut SchemaGenerator) -> Schema {
+    let record = generator.subschema_for::<crate::PublicOperationRecord>();
+    incubating(schemars::json_schema!({
+        "anyOf": [record, { "type": "null" }]
+    }))
+}
+
 fn string_with_pattern(generator: &mut SchemaGenerator, pattern: impl Into<String>) -> Schema {
     let mut schema = String::json_schema(generator);
     schema.insert("pattern".into(), pattern.into().into());

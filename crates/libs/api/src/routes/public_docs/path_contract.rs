@@ -143,7 +143,7 @@ pub(super) fn insert_sandbox_operation_paths(
         CREATE_SANDBOX,
         json!({
             "summary": "Create a sandbox",
-            "description": "Returns an operation handle while the sandbox is being created.\n\n### Wait for readiness\n\nPoll the operation to detect completion. `GET /sandboxes/{sandbox_id}` can return 404 while creation is pending.\n\n### Idle timeout\n\nIf `auto_lifecycle` is omitted or null, the sandbox suspends after six idle hours. Access and command activity reset the idle clock. An explicit policy, including a disabled one, is preserved.\n\n### Example request\n\nRequires the published `seed:latest` template:\n\n```json\n{\"template\":\"seed:latest\",\"runtime\":\"fc\"}\n```",
+            "description": "Returns an operation handle while the sandbox is being created.\n\n### Wait for readiness\n\nPoll the operation to detect completion. When the server finishes the create before answering, the response also carries the terminal operation record in `operation`, and no poll is needed. `GET /sandboxes/{sandbox_id}` can return 404 while creation is pending.\n\n### Idle timeout\n\nIf `auto_lifecycle` is omitted or null, the sandbox suspends after six idle hours. Access and command activity reset the idle clock. An explicit policy, including a disabled one, is preserved.\n\n### Example request\n\nRequires the published `seed:latest` template:\n\n```json\n{\"template\":\"seed:latest\",\"runtime\":\"fc\"}\n```",
             "parameters": [idempotency_key_parameter.clone()],
             "requestBody": {
                 "required": true,

@@ -23,12 +23,13 @@ use pplx_space_common_svc::types::{
 };
 use pplx_space_metrics::warm_pool::AdmissionClaimOutcome;
 use pplx_space_public_api::{
-    ConditionStatus, CreateSandboxRequest, OperationId, OperationKind, OperationTargetType,
-    PageCursor, PublicErrorCode, PublicPage, PublicSandbox, PublicSandboxId, PublicSandboxMetadata,
-    PublicSandboxMetadataValue, RequestFingerprint, RollbackSandboxRequest, SandboxCondition,
-    SandboxConditionType, SandboxFailureCode, SandboxIdleAction, SandboxLifecycleAction,
-    SandboxLifecycleState, SandboxOperationResponse, SandboxResources, SandboxStatsResponse,
-    UpdateSandboxRequest, routes as native_routes,
+    ConditionStatus, CreateSandboxRequest, OperationId, OperationKind, OperationState,
+    OperationTargetType, PageCursor, PublicErrorCode, PublicOperationRecord, PublicPage,
+    PublicSandbox, PublicSandboxId, PublicSandboxMetadata, PublicSandboxMetadataValue,
+    RequestFingerprint, RollbackSandboxRequest, SandboxCondition, SandboxConditionType,
+    SandboxFailureCode, SandboxIdleAction, SandboxLifecycleAction, SandboxLifecycleState,
+    SandboxOperationResponse, SandboxResources, SandboxStatsResponse, UpdateSandboxRequest,
+    routes as native_routes,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -372,7 +373,7 @@ pub(crate) async fn create_native_sandbox_operation(
         }
     };
 
-    let response = match result {
+    let mut response = match result {
         CreatePublicOperationResult::Created(operation_id) => {
             pplx_space_metrics::warm_pool::admission_claim(outcome);
             // The path names no sandbox yet; the request span learns it here.
@@ -383,6 +384,7 @@ pub(crate) async fn create_native_sandbox_operation(
             SandboxOperationResponse {
                 operation_id,
                 sandbox_id,
+                operation: None,
             }
         }
         CreatePublicOperationResult::Existing(operation_id) => {
@@ -401,11 +403,36 @@ pub(crate) async fn create_native_sandbox_operation(
         CreatePublicOperationResult::AdmissionDenied => return Err(PublicApiError::internal()),
     };
 
-    if let Some((inline, (claim_token, operation))) = inline.zip(inline_claim) {
-        inline.run(store, claim_token, operation).await;
+    if let Some((inline, (claim_token, operation))) = inline.zip(inline_claim)
+        && inline.run(store.clone(), claim_token, operation).await
+    {
+        response.operation = finished_operation(&store, org_id, response.operation_id).await?;
     }
 
     Ok(response)
+}
+
+/// The record of an operation that already reached a terminal state, so the
+/// create can answer with its outcome instead of asking the client to poll.
+/// A retryable outcome released back to the dispatcher is still queued and
+/// answers as before.
+async fn finished_operation(
+    store: &PublicOperationStore,
+    org_id: OrgId,
+    operation_id: OperationId,
+) -> Result<Option<PublicOperationRecord>, PublicApiError> {
+    Ok(store
+        .fetch_operation(org_id, operation_id)
+        .await?
+        .filter(|operation| {
+            matches!(
+                operation.state,
+                OperationState::Succeeded
+                    | OperationState::Failed
+                    | OperationState::Canceled
+                    | OperationState::Expired
+            )
+        }))
 }
 
 /// What admission does about a warm-pool slot for one native create.
@@ -676,6 +703,7 @@ pub async fn update_sandbox(
         CreatePublicOperationResult::Created(operation_id) => SandboxOperationResponse {
             operation_id,
             sandbox_id,
+            operation: None,
         },
         CreatePublicOperationResult::Existing(operation_id) => {
             sandbox_operation_response(&store, org.id, operation_id).await?
@@ -866,6 +894,7 @@ async fn enqueue_lifecycle_operation(
         CreatePublicOperationResult::Created(operation_id) => SandboxOperationResponse {
             operation_id,
             sandbox_id,
+            operation: None,
         },
         CreatePublicOperationResult::Existing(operation_id) => {
             sandbox_operation_response(&store, org_id, operation_id).await?
@@ -1119,6 +1148,7 @@ async fn sandbox_operation_response(
     Ok(SandboxOperationResponse {
         operation_id,
         sandbox_id,
+        operation: None,
     })
 }
 

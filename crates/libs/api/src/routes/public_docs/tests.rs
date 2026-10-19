@@ -599,6 +599,54 @@ fn sandbox_idle_response_fields_are_nullable_incubating_and_extensible() {
 }
 
 #[test]
+fn a_finished_operation_on_an_accepted_mutation_is_optional_and_incubating() {
+    let spec = public_openapi_value();
+    let schema = &spec["components"]["schemas"]["SandboxOperationResponse"];
+    assert_eq!(
+        schema["properties"]["operation"][pplx_space_public_api::routes::M1_STATUS_EXTENSION],
+        "incubating"
+    );
+    assert!(
+        !schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("operation"))
+    );
+    let validator = component_validator(&spec, "SandboxOperationResponse");
+    let accepted = json!({
+        "operation_id": "op_01a0c509-3920-778f-a032-6d1cad5de3df",
+        "sandbox_id": "sbx_01a0c509-3920-778f-a032-6d1cad5de3df",
+    });
+    validator
+        .validate(&accepted)
+        .expect("a response without a record conforms");
+    let mut finished = accepted.clone();
+    finished["operation"] = json!({
+        "id": "op_01a0c509-3920-778f-a032-6d1cad5de3df",
+        "kind": "create_sandbox",
+        "state": "succeeded",
+        "target_type": "sandbox",
+        "target_id": "sbx_01a0c509-3920-778f-a032-6d1cad5de3df",
+        "progress_message": "sandbox created",
+        "terminal_error_code": null,
+        "terminal_error": null,
+        "result": null,
+        "created_at": "2026-01-01T00:00:00Z",
+        "started_at": "2026-01-01T00:00:00Z",
+        "completed_at": "2026-01-01T00:00:01Z",
+        "updated_at": "2026-01-01T00:00:01Z",
+    });
+    validator
+        .validate(&finished)
+        .expect("a response with the finished record conforms");
+    finished["operation"] = json!("succeeded");
+    assert!(
+        validator.validate(&finished).is_err(),
+        "the record is an operation, not a bare state"
+    );
+}
+
+#[test]
 fn sandbox_idle_create_fields_are_optional_and_actions_are_closed_on_input() {
     let spec = public_openapi_value();
     let schema = &spec["components"]["schemas"]["CreateSandboxRequest"];
