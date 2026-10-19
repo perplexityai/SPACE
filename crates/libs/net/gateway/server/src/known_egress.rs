@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use hickory_resolver::proto::op::Message;
+use pplx_space_metrics::gateway::TcpConnectionFault;
 use pplx_space_net_common::DomainName;
 use tracing::{debug, error, info};
 
@@ -57,7 +58,9 @@ impl KnownEgressState {
         };
         let destination = destination.as_str();
         let original_dst_port = original_dst.port();
-        let label = fault.map_or("relay_io", RelayFault::as_str);
+        let label = fault
+            .map_or(TcpConnectionFault::RelayIo, RelayFault::metric)
+            .as_str();
         match fault.map(RelayFault::side) {
             // Clients routinely reset connections they are done with, so a
             // guest-leg failure usually says little about the destination.

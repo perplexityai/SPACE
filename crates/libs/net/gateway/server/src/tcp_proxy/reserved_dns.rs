@@ -74,10 +74,9 @@ where
             ResolveOutcome::Cancelled => return FlowOutcome::Cancelled,
         };
         if reply.is_empty() {
-            return FlowOutcome::RelayFailed(RelayFailure::Transfer {
-                error: io::Error::other("reserved DNS returned an empty reply"),
-                fault: None,
-            });
+            return FlowOutcome::RelayFailed(RelayFailure::ReservedDns(io::Error::other(
+                "reserved DNS returned an empty reply",
+            )));
         }
         if shutdown.is_cancelled() {
             return FlowOutcome::Cancelled;
@@ -100,16 +99,13 @@ where
         match sent {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
-                return FlowOutcome::RelayFailed(RelayFailure::Transfer { error, fault: None });
+                return FlowOutcome::RelayFailed(RelayFailure::ReservedDns(error));
             }
             Err(_) => {
-                return FlowOutcome::RelayFailed(RelayFailure::Transfer {
-                    error: io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "reserved DNS reply write timed out",
-                    ),
-                    fault: None,
-                });
+                return FlowOutcome::RelayFailed(RelayFailure::ReservedDns(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "reserved DNS reply write timed out",
+                )));
             }
         }
         wire_rx = wire_rx.saturating_add(reply_wire_bytes);

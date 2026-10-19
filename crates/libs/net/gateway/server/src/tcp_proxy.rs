@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use pplx_space_common_connection_admission::AcceptErrors;
+use pplx_space_metrics::gateway::TcpConnectionFault;
 use pplx_space_net_common::DomainName;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
@@ -203,7 +204,27 @@ impl FlowOutcome {
             Self::RelayFailed(RelayFailure::Inspected(_)) => ("relay_failed", "inspected_http"),
             Self::RelayFailed(RelayFailure::Connect(_)) => ("relay_failed", "connect"),
             Self::RelayFailed(RelayFailure::Plaintext(error)) => ("relay_failed", error.reason()),
-            Self::RelayFailed(RelayFailure::Transfer { .. }) => ("relay_failed", "transfer"),
+            Self::RelayFailed(RelayFailure::Transfer { .. } | RelayFailure::ReservedDns(_)) => {
+                ("relay_failed", "transfer")
+            }
+        }
+    }
+
+    /// The `fault` metric tag: what failed first in a transfer failure.
+    fn metric_fault(&self) -> TcpConnectionFault {
+        match self {
+            Self::RelayFailed(RelayFailure::Transfer { fault, .. }) => {
+                fault.map_or(TcpConnectionFault::RelayIo, RelayFault::metric)
+            }
+            Self::RelayFailed(RelayFailure::ReservedDns(_)) => TcpConnectionFault::ReservedDns,
+            Self::Cancelled
+            | Self::Rejected(_)
+            | Self::Relayed(_)
+            | Self::HandledDns { .. }
+            | Self::InspectedTls
+            | Self::RelayFailed(
+                RelayFailure::Connect(_) | RelayFailure::Plaintext(_) | RelayFailure::Inspected(_),
+            ) => TcpConnectionFault::None,
         }
     }
 
@@ -212,9 +233,9 @@ impl FlowOutcome {
             Self::RelayFailed(RelayFailure::Connect(error)) => {
                 Some(format!("upstream_connect: {error}").into())
             }
-            Self::RelayFailed(RelayFailure::Transfer { error, .. }) => {
-                Some(format!("transfer: {:?}: {error}", error.kind()).into())
-            }
+            Self::RelayFailed(
+                RelayFailure::Transfer { error, .. } | RelayFailure::ReservedDns(error),
+            ) => Some(format!("transfer: {:?}: {error}", error.kind()).into()),
             Self::Rejected(_) | Self::RelayFailed(_) => Some(self.metric_tags().1.into()),
             Self::Cancelled | Self::Relayed(_) | Self::HandledDns { .. } | Self::InspectedTls => {
                 None
@@ -244,6 +265,10 @@ enum RelayFailure {
         /// necessarily the peer that caused the failure.
         fault: Option<RelayFault>,
     },
+    /// A reserved-DNS-over-TCP exchange failed after admission: the resolver
+    /// returned an empty reply, or writing the reply to the guest failed or
+    /// timed out. No relay ran, so no relay leg is named.
+    ReservedDns(io::Error),
     Inspected(tls_http::HttpError),
 }
 
@@ -633,7 +658,7 @@ impl TcpProxy {
 
     fn record(&self, dst: SocketAddr, host: Option<&DomainName>, outcome: FlowOutcome) -> bool {
         let (status, detail) = outcome.metric_tags();
-        pplx_space_metrics::gateway::tcp_connection(status, detail);
+        pplx_space_metrics::gateway::tcp_connection(status, detail, outcome.metric_fault());
         let reported = host.is_some_and(|host| self.report_known_egress(dst, host, &outcome));
 
         match outcome {
@@ -641,8 +666,11 @@ impl TcpProxy {
             // terminal connection metric emitted above.
             FlowOutcome::Cancelled
             | FlowOutcome::InspectedTls
-            | FlowOutcome::RelayFailed(RelayFailure::Connect(_) | RelayFailure::Transfer { .. }) => {
-            }
+            | FlowOutcome::RelayFailed(
+                RelayFailure::Connect(_)
+                | RelayFailure::Transfer { .. }
+                | RelayFailure::ReservedDns(_),
+            ) => {}
             FlowOutcome::RelayFailed(RelayFailure::Inspected(error)) => {
                 pplx_space_metrics::gateway::domain_binding(
                     "tcp",

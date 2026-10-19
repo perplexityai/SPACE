@@ -508,7 +508,8 @@ configuration does not list is still sent but cannot be grouped or filtered
 on. That applies to tags added after the configuration was written, including
 the `reason` on `template.gc.tick` and `template.gc.tick_duration_ms` errors
 and the `error_kind` on `template.build.latency_ms`,
-`template.build.step.latency_ms` and `snapshot.restore.failed`. Add them to the
+`template.build.step.latency_ms` and `snapshot.restore.failed`, and the
+`fault` on `gateway.tcp.connection`. Add them to the
 metric's tag configuration before relying on them; series without them are
 unaffected.
 
@@ -586,9 +587,31 @@ continuity; remove it after native Datadog consumers migrate.
 ## Net-gateway TCP connections
 
 `gateway.tcp.connection` counts one point for every TCP connection that reaches
-the net-gateway's per-connection handler, tagged with `status` (`cancelled`,
-`rejected`, `relayed`, `handled` or `relay_failed`) and `detail`, the bounded
-detail within `status`, such as `connect` or `transfer` under `relay_failed`.
+the net-gateway's per-connection handler. Every point carries the same three
+tags:
+
+- `status`: `cancelled`, `rejected`, `relayed`, `handled` or `relay_failed`.
+- `detail`: the bounded detail within `status`, such as `connect` or
+  `transfer` under `relay_failed`.
+- `fault`: on `status:relay_failed,detail:transfer`, what failed first: the
+  relay leg and operation, an unattributed relay failure, or a reserved-DNS
+  exchange; `none` on every other point.
+
+| `fault` | Meaning |
+| --- | --- |
+| `guest_read`, `guest_write`, `guest_flush`, `guest_shutdown` | The first failing socket operation in a pass-through relay was on the guest leg. |
+| `origin_read`, `origin_write`, `origin_flush`, `origin_shutdown` | The first failing socket operation in a pass-through relay was on the destination leg. |
+| `relay_io` | A pass-through relay failed without recording a failing leg. Not expected. |
+| `reserved_dns` | A reserved-DNS-over-TCP exchange failed: the resolver returned an empty reply, or writing the reply to the guest failed or timed out. No relay ran, so no leg is named. |
+| `none` | Every other outcome, including connect-phase failures. |
+
+`fault` records the first failing leg and operation the relay observed, not
+which peer caused the failure. A destination that stalls can make the guest
+time out and reset, which reads as `guest_read`. Splitting
+`gateway.tcp.connection{status:relay_failed,detail:transfer}` by `fault`
+separates guest-leg from destination-leg failures. A Datadog organization with
+a restricted tag configuration for this metric must list `fault` before it can
+be grouped or filtered on; see [Restricted tag configurations](#restricted-tag-configurations).
 
 ### Known-egress logs
 
@@ -613,15 +636,10 @@ events use the log target
   These events are visible only when the gateway's log filter enables DEBUG
   for that target.
 
-The INFO and DEBUG events add `fault`: the first relay leg and socket operation
-that failed (`guest_read`, `guest_write`, `guest_flush`, `guest_shutdown`,
-`origin_read`, `origin_write`, `origin_flush` or `origin_shutdown`), or
-`relay_io` when no leg was recorded. That is the first failure the relay
-observed, not proof of which peer caused it: a destination that stalls can make
-the guest time out and reset, which reads as `guest_read`. Each of these
-failures is also counted by
-`gateway.tcp.connection{status:relay_failed,detail:transfer}`, so no log level
-is needed to count transfer failures.
+The INFO and DEBUG events add `fault`, with the same pass-through values as
+the metric tag above. Each of these failures is also counted by
+`gateway.tcp.connection{status:relay_failed,detail:transfer}`, with the same
+`fault`, so no log level is needed to count transfer failures.
 
 ## Firecracker and guest diagnostics
 

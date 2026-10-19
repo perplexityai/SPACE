@@ -812,7 +812,7 @@ async fn record_emits_one_connection_metric_and_reports_every_failure_outcome() 
 
         assert_eq!(connection_metrics.len(), 1, "{case}");
         assert_eq!(connection_metrics[0].value, 1, "{case}");
-        assert_eq!(connection_metrics[0].tags.len(), 2, "{case}");
+        assert_eq!(connection_metrics[0].tags.len(), 3, "{case}");
         let mut tags = connection_metrics[0].tags.clone();
         tags.sort_unstable();
         assert!(

@@ -542,13 +542,47 @@ pub fn tcp_in_flight(active: usize) {
     );
 }
 
+metric_vocabulary!(
+    /// The `fault` tag on `gateway.tcp.connection`. On a pass-through transfer
+    /// failure it names the first relay leg and socket operation that failed.
+    /// That is the first failure the relay observed, not proof of which peer
+    /// caused it: a destination that stalls can make the guest time out and
+    /// reset, which reads as `guest_read`.
+    TcpConnectionFault {
+        /// Not a transfer failure.
+        None => "none",
+        GuestRead => "guest_read",
+        GuestWrite => "guest_write",
+        GuestFlush => "guest_flush",
+        GuestShutdown => "guest_shutdown",
+        OriginRead => "origin_read",
+        OriginWrite => "origin_write",
+        OriginFlush => "origin_flush",
+        OriginShutdown => "origin_shutdown",
+        /// A pass-through relay failed without recording a failing leg.
+        RelayIo => "relay_io",
+        /// A reserved-DNS-over-TCP exchange failed: the resolver returned an
+        /// empty reply, or writing the reply to the guest failed or timed out.
+        /// No relay ran, so no leg is named.
+        ReservedDns => "reserved_dns",
+    }
+);
+
 /// Emitted exactly once for every TCP connection that reaches the proxy's
 /// per-connection handler. `detail` is the bounded detail within `status`.
-pub fn tcp_connection(status: &str, detail: &str) {
+/// `fault` is set on `status:relay_failed,detail:transfer` and is `none` on
+/// every other point, so every point carries the same tag keys. The
+/// known-egress logs that accompany a transfer failure carry the same `fault`;
+/// `docs/observability.md` ("Net-gateway TCP connections") documents both.
+pub fn tcp_connection(status: &str, detail: &str, fault: TcpConnectionFault) {
     counter(
         "gateway.tcp.connection",
         1,
-        &[tag("status", status), tag("detail", detail)],
+        &[
+            tag("status", status),
+            tag("detail", detail),
+            tag("fault", fault.as_str()),
+        ],
     );
 }
 
