@@ -1598,16 +1598,21 @@ ServiceAccount to its client service, and never accepts the static internal
 token. On every request it also requires the token's pod to be current and
 Running in its namespace, with the connection's source address among that
 pod's IPs, and the token's node to be registered under that name and UID; its
-Role lists and watches the namespace's pods for this. internal-api registers
-a node without its UID; the node inventory sync records it for every node
-running a node-api pod, builders included
-(`crates/libs/api/src/controllers/substrate/kubernetes/node_sync.rs`), and
-until it has, the authority refuses that node's callers with
-`node_identity_mismatch`. Unless the storage credentials mode is `static`,
-volume-manager on sandbox workers and builders exchanges its object-store
-credentials through its node agent, and the builders' build-manager exchanges
-its own directly with the authority
-([Object-store credentials](#object-store-credentials)). Each node's
+Role lists and watches the namespace's pods for this. internal-api registers a
+node without its UID. The node inventory sync records it for the
+sandbox-selector nodes and for every node running a node-api pod, builders
+included (`crates/libs/api/src/controllers/substrate/kubernetes/node_sync.rs`);
+a sandbox pod placed on a node records it too, and so does an admin node
+listing (node-status refresh, reconcile or template listing), which upserts
+every node-api pod's node. Until one of these records a new or replaced
+builder's UID, the authority refuses that builder's callers with
+`node_identity_mismatch`, and tenant template publication from it waits. With
+the sync off (`SPACE_KUBE_NODE_SYNC_ENABLED`), only an admin listing or a
+sandbox placement records it; turning the sync off doesn't erase a recorded
+UID. Unless the storage credentials mode is `static`, volume-manager on sandbox
+workers and builders exchanges its object-store credentials through its node
+agent, and the builders' build-manager exchanges its own directly with the
+authority ([Object-store credentials](#object-store-credentials)). Each node's
 credential-manager runs `--role=agent`: it holds the node's credential sockets
 under its service mutex and forwards every call upstream as the node credential
 agent, with no database, KEK or AWS credential. node-manager

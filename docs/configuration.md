@@ -36,7 +36,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_FAILED_SANDBOX_CLEANUP_ENABLED` | on | Part of the transient lifecycle sweeper. |
 | `SPACE_INTERNAL_API_DELETED_PARTITION_ENABLED` | on | |
 | `SPACE_INTERNAL_API_DELETED_SUPPRESS_ABSOLUTE` | 500 | |
-| `SPACE_KUBE_NODE_SYNC_ENABLED` | on | |
+| `SPACE_KUBE_NODE_SYNC_ENABLED` | on | Also records the Kubernetes UID of each node running a node-api pod, builders included. Off, only an admin node listing (node-status refresh, reconcile or template listing) records a new or replaced builder's UID; until then the credential-manager authority refuses its callers and tenant template publication from it waits. Turning it off doesn't erase a recorded UID. |
 | `SPACE_OBSERVED_PROJECTION_GC_ENABLED` | on | |
 | `SPACE_PUBLIC_OPERATION_DISPATCHER_ENABLED` | on | Without it, create requests are accepted and never complete. |
 | `SPACE_SNAPSHOT_STORAGE_SWEEPER_ENABLED` | on | Does nothing without `SPACE_SNAPSHOT_BUCKET`. |

@@ -16,7 +16,8 @@ pub(crate) use kubernetes_tests::{
     mock_kubernetes_client, node_api_pod_on_node, node_with_network_slots,
     running_pod_kubernetes_client, running_pod_kubernetes_client_with_create_barrier,
     sandbox_pod_on_node, substrate_with_inventory_caches_and_pool, substrate_with_store,
-    substrate_with_store_and_client, substrate_with_store_client_proxy_port_and_pod,
+    substrate_with_store_and_client, substrate_with_store_client_pods_and_nodes,
+    substrate_with_store_client_proxy_port_and_pod,
     substrate_with_store_client_proxy_port_and_pods, substrate_with_unreachable_store,
 };
 
@@ -1870,6 +1871,23 @@ mod kubernetes_tests {
             sandbox_proxy_port,
             pods,
             Vec::new(),
+        )
+    }
+
+    /// [`substrate_with_store_and_client`] whose pod and Node reflectors start
+    /// warm with `pods` and `nodes`.
+    pub(crate) fn substrate_with_store_client_pods_and_nodes(
+        pool: PgPool,
+        client: Client,
+        pods: Vec<Pod>,
+        nodes: Vec<Node>,
+    ) -> KubernetesSubstrate {
+        substrate_with_store_client_proxy_port_pods_and_nodes(
+            pool,
+            client,
+            DEFAULT_SANDBOX_PROXY_PORT,
+            pods,
+            nodes,
         )
     }
 
