@@ -20,7 +20,7 @@ default = true
 test = [
     "boto3==1.43.113",
     "cel-python==0.5.0",
-    "pglast==7.10",
+    "pglast==7.21",
     "psycopg[binary]==3.3.6",
     "pytest==8.4.2",
     "python-hcl2==8.1.4",
