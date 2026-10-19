@@ -300,6 +300,7 @@ calls.
 | `SPACE_OBJECT_STORE_POOL_IDLE_TIMEOUT_SECS` | 3 | 1 to 90. How long an idle pooled connection stays eligible for reuse. Keep it below the endpoint's idle close; AWS S3 closes idle HTTPS connections after about 6 s. Applies to object-store transfers; the snapshot-storage sweepers and the kernel fetcher use the 3 s default. |
 | `SPACE_OBJECT_STORE_STATIC_SESSION_TOKEN` | unset | Session token for temporary static credentials. |
 | `SPACE_SNAPSHOT_BUCKET`, `SPACE_SNAPSHOT_REGION`, `SPACE_SNAPSHOT_ENDPOINT` | unset | Unset disables snapshot upload. Give the bucket an abort-incomplete-multipart lifecycle rule; uploads interrupted by process death otherwise keep their parts. |
+| `SPACE_SNAPSHOT_STREAM_BTRFS_SEND` | on | Sandbox-manager retains a read-only source for each btrfs-send suspend and lets volume-manager stream the upload from it instead of writing `rootfs.btrfs-send`; `false` writes the send file. Defers only while volume-manager streams uploads under its own identity. See [snapshot upload streaming](snapshot-upload-streaming.md). |
 | `SPACE_VOLUME_STREAM_PUSH_BUFFER_BUDGET_BYTES` | 1 GiB | Volume-manager streams eligible snapshot uploads with this shared part budget; `0` uploads through temporary files. Whole MiB, at least 64 MiB. See [snapshot upload streaming](snapshot-upload-streaming.md). |
 
 ## Authentication, TLS and credentials

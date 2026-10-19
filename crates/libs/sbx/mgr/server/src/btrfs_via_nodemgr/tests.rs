@@ -81,3 +81,9 @@ async fn capability_cache_reuses_a_fresh_positive_answer_and_reprobes_a_negative
     );
     assert_eq!(probes.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
+
+#[test]
+fn deferred_capture_is_on_unless_a_deployment_opts_out() {
+    assert!(retain_send_sources_from(None));
+    assert!(!retain_send_sources_from(Some("false")));
+}

@@ -263,9 +263,20 @@ pub(crate) async fn delete_sandbox_instance(
 /// prevent an already-published source from being regenerated.
 fn retain_send_sources() -> bool {
     static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var("SPACE_SNAPSHOT_STREAM_BTRFS_SEND").is_ok_and(|value| value == "true")
+        retain_send_sources_from(
+            std::env::var("SPACE_SNAPSHOT_STREAM_BTRFS_SEND")
+                .ok()
+                .as_deref(),
+        )
     });
     *ENABLED
+}
+
+/// Deferred capture is the default; a deployment opts out with a falsy value.
+/// Capture still defers only when volume-manager and node-manager advertise
+/// the capabilities it needs.
+fn retain_send_sources_from(raw: Option<&str>) -> bool {
+    pplx_space_common_core::env::env_flag(raw, true)
 }
 
 pub(crate) async fn materialize_rootfs_send(
