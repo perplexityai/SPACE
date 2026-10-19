@@ -509,6 +509,7 @@ pub(crate) async fn bridge_process_session(
     let mut output_seq = 0_u64;
     let mut process_id = attached.backend_process_id.clone();
     let mut process_bound = attached.backend_process_id.is_some();
+    let mut binding: Option<PendingProcessBinding> = None;
     let mut revocation_tick = revocation_check_interval(&state);
 
     // Raced as a whole, as in `bridge_raw_service_session`, so a stalled
@@ -531,8 +532,10 @@ pub(crate) async fn bridge_process_session(
                         return Ok(BridgeEnd::Completed);
                     }
                 }
+                bound = process_binding_settled(&mut binding) => bound?,
                 event = stream.next() => {
                     let Some(event) = event else {
+                        settle_process_binding(&mut binding).await?;
                         let _ = send_server_frame(
                             &mut sink,
                             &DataPlaneServerFrame::Closed {
@@ -554,11 +557,21 @@ pub(crate) async fn bridge_process_session(
                                     .map_err(|_| StreamBridgeError::RouteState("invalid_backend_process_id"))?;
                                 process_id = Some(event_process_id.clone());
                                 if !process_bound {
-                                    bind_session_process(&state, session_id, &event_process_id).await?;
                                     process_bound = true;
+                                    binding = Some(PendingProcessBinding::spawn(
+                                        &state,
+                                        session_id,
+                                        event_process_id,
+                                        None,
+                                    ));
                                 }
                             }
                             let batch = process_event_frames(event, &mut output_seq);
+                            if batch.frames.iter().any(|frame| {
+                                matches!(frame, DataPlaneServerFrame::ProcessExited { .. })
+                            }) {
+                                settle_process_binding(&mut binding).await?;
+                            }
                             record_process_output_bytes(attached.kind.as_str(), &batch);
                             for frame in batch.frames {
                                 if send_server_frame(&mut sink, &frame).await.is_err() {

@@ -221,6 +221,7 @@ pub(crate) struct ProcessSseState {
     backend_output_cursor: Option<u64>,
     process_id: Option<ProcessId>,
     process_bound: bool,
+    binding: Option<PendingProcessBinding>,
     revocation_tick: tokio::time::Interval,
     pending: VecDeque<Event>,
     finished: bool,
@@ -321,6 +322,7 @@ impl ProcessSseState {
             backend_output_cursor,
             process_id,
             process_bound,
+            binding: None,
             revocation_tick,
             pending,
             finished: false,
@@ -416,8 +418,18 @@ async fn next_process_sse_frame(state: &mut ProcessSseState) -> Option<Event> {
                     }
                 }
             }
+            bound = process_binding_settled(&mut state.binding) => {
+                if let Err(error) = bound {
+                    state.finish_with_error(error);
+                    return state.pending.pop_front();
+                }
+            }
             event = state.stream.next() => {
                 let Some(event) = event else {
+                    if let Err(error) = settle_process_binding(&mut state.binding).await {
+                        state.finish_with_error(error);
+                        return state.pending.pop_front();
+                    }
                     state.finish_with_frame(
                         DataPlaneServerFrame::Closed {
                             reason: StreamCloseReason::BackendClosed,
@@ -444,26 +456,26 @@ async fn next_process_sse_frame(state: &mut ProcessSseState) -> Option<Event> {
                             };
                             state.process_id = Some(event_process_id.clone());
                             if !state.process_bound {
-                                match bind_session_process(
+                                state.process_bound = true;
+                                state.binding = Some(PendingProcessBinding::spawn(
                                     &state.state,
                                     state.session_id,
-                                    &event_process_id,
-                                )
-                                .await
-                                {
-                                    Ok(()) => {
-                                        state.process_bound = true;
-                                        state.start_permit = None;
-                                    }
-                                    Err(error) => {
-                                        state.finish_with_error(error);
-                                        return state.pending.pop_front();
-                                    }
-                                }
+                                    event_process_id,
+                                    state.start_permit.take(),
+                                ));
                             }
                         }
                         let mut output_seq = state.backend_output_cursor.unwrap_or_default();
                         let batch = process_event_frames(event, &mut output_seq);
+                        if batch
+                            .frames
+                            .iter()
+                            .any(|frame| matches!(frame, DataPlaneServerFrame::ProcessExited { .. }))
+                            && let Err(error) = settle_process_binding(&mut state.binding).await
+                        {
+                            state.finish_with_error(error);
+                            return state.pending.pop_front();
+                        }
                         record_process_output_bytes(state.session_id.kind().as_str(), &batch);
                         for frame in batch.frames {
                             let exited =

@@ -947,5 +947,79 @@ pub(super) async fn bind_session_process(
     Ok(())
 }
 
+/// A session's process binding, persisted while the stream keeps forwarding
+/// the process's events.
+///
+/// The binding only tells a later attach to connect to the process instead of
+/// starting it, so the first events need not wait for the cluster API to
+/// commit it. Until it settles, nothing can start the command a second time:
+/// the binding holds the session's start permit, so another attach on this
+/// replica is refused, and a start of the derived process id the guest
+/// already holds connects to it instead (`initial_process_stream`).
+///
+/// The write runs in its own task so a client that disconnects mid-bind does
+/// not cancel it; the cluster API client's RPC timeout bounds it. Streams
+/// await it before reporting that the process ended, so a client that sees
+/// the end can rely on the binding being durable.
+pub(super) struct PendingProcessBinding {
+    task: tokio::task::JoinHandle<Result<(), StreamBridgeError>>,
+}
+
+impl PendingProcessBinding {
+    pub(super) fn spawn(
+        state: &DataPlaneState,
+        session_id: DataPlaneSessionId,
+        process_id: ProcessId,
+        start_permit: Option<NativeSessionAttachPermit>,
+    ) -> Self {
+        let state = state.clone();
+        let task = tokio::spawn(async move {
+            let result = bind_session_process(&state, session_id, &process_id).await;
+            // Released only once the binding settles, never before.
+            drop(start_permit);
+            result
+        });
+        Self { task }
+    }
+}
+
+impl std::future::Future for PendingProcessBinding {
+    type Output = Result<(), StreamBridgeError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.task).poll(cx).map(|joined| {
+            joined
+                .map_err(StreamBridgeError::ProcessBindingTask)
+                .and_then(std::convert::identity)
+        })
+    }
+}
+
+/// Settles a binding the stream started, if any; a no-op once it has settled.
+pub(super) async fn settle_process_binding(
+    binding: &mut Option<PendingProcessBinding>,
+) -> Result<(), StreamBridgeError> {
+    let Some(pending) = binding.as_mut() else {
+        return Ok(());
+    };
+    let result = pending.await;
+    *binding = None;
+    result
+}
+
+/// Resolves with the binding's result once it settles; pending forever when
+/// there is none, so it can sit in a `select!` beside the event stream.
+pub(super) async fn process_binding_settled(
+    binding: &mut Option<PendingProcessBinding>,
+) -> Result<(), StreamBridgeError> {
+    match binding.as_mut() {
+        Some(_) => settle_process_binding(binding).await,
+        None => std::future::pending().await,
+    }
+}
+
 #[cfg(test)]
 mod tests;

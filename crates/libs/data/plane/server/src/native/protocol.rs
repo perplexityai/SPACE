@@ -266,6 +266,8 @@ pub(crate) enum StreamBridgeError {
     InvalidClientFrame,
     #[error("client closed")]
     ClientClosed,
+    #[error("process binding task: {0}")]
+    ProcessBindingTask(#[source] tokio::task::JoinError),
 }
 
 pub(crate) fn stream_bridge_error_label(error: &StreamBridgeError) -> &'static str {
@@ -281,5 +283,6 @@ pub(crate) fn stream_bridge_error_label(error: &StreamBridgeError) -> &'static s
         StreamBridgeError::UnsupportedSessionKind => "unsupported_session_kind",
         StreamBridgeError::InvalidClientFrame => "invalid_client_frame",
         StreamBridgeError::ClientClosed => "client_closed",
+        StreamBridgeError::ProcessBindingTask(_) => "process_binding_task",
     }
 }
