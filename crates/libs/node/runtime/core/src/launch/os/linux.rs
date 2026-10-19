@@ -271,7 +271,7 @@ pub struct PreparedSidecarLaunch {
 
 pub struct JailerLaunch<'a> {
     pub sandbox_id: &'a str,
-    pub jailer_bin: &'a str,
+    pub jailer: crate::launch::JailerExecutable<'a>,
     pub firecracker_bin: &'a str,
     pub chroot_base_dir: &'a str,
     pub ns_path: &'a str,
@@ -507,7 +507,7 @@ fn configure_pre_exec_socket(
 pub fn launch_via_jailer(config: JailerLaunch<'_>) -> Result<u32, String> {
     let JailerLaunch {
         sandbox_id,
-        jailer_bin,
+        jailer,
         firecracker_bin,
         chroot_base_dir,
         ns_path,
@@ -534,7 +534,7 @@ pub fn launch_via_jailer(config: JailerLaunch<'_>) -> Result<u32, String> {
         cgroup_limits,
         daemonize: true,
     });
-    run_jailer_command(sandbox_id, jailer_bin, fc_console_path, &jailer_args)?;
+    run_jailer_command(sandbox_id, jailer, fc_console_path, &jailer_args)?;
 
     // Let jailer daemonize Firecracker, then read the pidfile ourselves. Jailer
     // intentionally moves Firecracker under its own delegated cgroup/chroot
@@ -678,11 +678,73 @@ fn jailer_args(config: JailerArgs<'_>) -> Vec<String> {
     args
 }
 
-fn direct_jailer_command(jailer_bin: &str, jailer_args: &[String]) -> std::process::Command {
-    let mut cmd = std::process::Command::new(jailer_bin);
-    cmd.env_clear().env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
+const JAILER_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
+
+fn direct_jailer_command(
+    jailer: crate::launch::JailerExecutable<'_>,
+    jailer_args: &[String],
+) -> std::io::Result<std::process::Command> {
+    use crate::launch::JailerExecutable;
+    let program = match jailer {
+        JailerExecutable::LegacyPath(path) => path.to_owned(),
+        JailerExecutable::Sealed(file) => format!("/proc/self/fd/{}", file.file().as_raw_fd()),
+    };
+    let mut cmd = std::process::Command::new(&program);
+    cmd.env_clear().env("PATH", JAILER_PATH);
     cmd.args(jailer_args);
-    cmd
+    if let JailerExecutable::Sealed(file) = jailer {
+        bind_jailer_descriptor(&mut cmd, file.file().try_clone()?, &program, jailer_args)?;
+    }
+    Ok(cmd)
+}
+
+fn bind_jailer_descriptor(
+    cmd: &mut std::process::Command,
+    file: std::fs::File,
+    program: &str,
+    jailer_args: &[String],
+) -> std::io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let arguments = std::iter::once(program)
+        .chain(jailer_args.iter().map(String::as_str))
+        .map(std::ffi::CString::new)
+        .collect::<Result<Vec<_>, _>>()?;
+    let environment = [std::ffi::CString::new(format!("PATH={JAILER_PATH}"))?];
+    // Integer pointer representations keep the closure Send + Sync. The
+    // captured CStrings own stable allocations until execveat consumes them.
+    let argv: Vec<usize> = arguments
+        .iter()
+        .map(|arg| arg.as_ptr() as usize)
+        .chain([0])
+        .collect();
+    let envp: Vec<usize> = environment
+        .iter()
+        .map(|arg| arg.as_ptr() as usize)
+        .chain([0])
+        .collect();
+    let before_exec = move || {
+        let _keep_alive = (&arguments, &environment);
+        // SAFETY: argument pointers refer to captured, stable CStrings and
+        // null-terminated arrays. The captured file pins the measured inode.
+        unsafe {
+            libc::syscall(
+                libc::SYS_execveat,
+                file.as_raw_fd(),
+                c"".as_ptr(),
+                argv.as_ptr().cast::<*const libc::c_char>(),
+                envp.as_ptr().cast::<*const libc::c_char>(),
+                libc::AT_EMPTY_PATH,
+            );
+        }
+        Err(std::io::Error::last_os_error())
+    };
+    // SAFETY: the child callback performs only execveat and errno inspection;
+    // all allocation and pointer-array construction happened in the parent.
+    unsafe {
+        cmd.pre_exec(before_exec);
+    }
+
+    Ok(())
 }
 
 fn command_output_with_timeout(
@@ -763,12 +825,13 @@ fn command_status_with_timeout(
 
 fn run_jailer_command(
     sandbox_id: &str,
-    jailer_bin: &str,
+    jailer: crate::launch::JailerExecutable<'_>,
     console_path: &str,
     jailer_args: &[String],
 ) -> Result<(), String> {
     let label = format!("jailer for {sandbox_id}");
-    let mut cmd = direct_jailer_command(jailer_bin, jailer_args);
+    let mut cmd = direct_jailer_command(jailer, jailer_args)
+        .map_err(|error| format!("prepare jailer execution: {error}"))?;
     cmd.stdin(std::process::Stdio::null());
 
     if console_path.is_empty() {

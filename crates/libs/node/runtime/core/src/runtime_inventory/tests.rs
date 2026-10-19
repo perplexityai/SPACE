@@ -216,14 +216,17 @@ fn inventory(runtimes: Vec<RuntimeInstallation>) -> RuntimeInventory {
         #[cfg(feature = "artifact-store")]
         unavailable: Vec::new(),
         retry_after: None,
+        initial_environment: None,
     }
 }
 
 fn selected_kernel_path(selected: &ResolvedExecutionEnvironment) -> &Path {
     let boot_role = boot_component_role();
     selected
-        .component_path(ArtifactComponentKind::Kernel, Some(&boot_role))
+        .component(ArtifactComponentKind::Kernel, Some(&boot_role))
         .unwrap()
+        .path
+        .as_path()
 }
 
 #[test]
@@ -395,6 +398,7 @@ fn pinned_starts_select_the_exact_kernel_digest() {
             #[cfg(feature = "artifact-store")]
             unavailable: Vec::new(),
             retry_after: None,
+            initial_environment: None,
         },
         "1.16.0",
     );
@@ -433,6 +437,7 @@ fn digest_matches_even_when_kernel_labels_differ() {
         #[cfg(feature = "artifact-store")]
         unavailable: Vec::new(),
         retry_after: None,
+        initial_environment: None,
     };
     let requested_kernel = kernel("vmlinux-6.1.158", 0x42, false, false).metadata;
     let requested = requested("1.16.0", "10.0.0", vec![requested_kernel]);
@@ -469,6 +474,7 @@ fn persisted_restore_does_not_require_the_recorded_kernel_to_be_installed() {
         #[cfg(feature = "artifact-store")]
         unavailable: Vec::new(),
         retry_after: None,
+        initial_environment: None,
     };
     let requested_kernel = kernel("vmlinux-6.6.92", 0x43, false, false).metadata;
     let requested = requested("1.16.0", "10.0.0", vec![requested_kernel.clone()]);
@@ -531,6 +537,7 @@ fn runtime_and_component_inventories_are_independent() {
         #[cfg(feature = "artifact-store")]
         unavailable: Vec::new(),
         retry_after: None,
+        initial_environment: None,
     };
 
     let published = inventory.to_proto();
@@ -561,6 +568,7 @@ fn legacy_metadata_uses_the_pinned_legacy_kernel() {
         #[cfg(feature = "artifact-store")]
         unavailable: Vec::new(),
         retry_after: None,
+        initial_environment: None,
     };
     let legacy = requested("1.15.1", "9.0.0", vec![]);
 
