@@ -868,7 +868,10 @@ func releaseTaskAfterGenerationTeardown(ctx context.Context, client pb.SandboxMa
 		})
 		if err != nil {
 			err = annotateStatus("sbx-manager PrepareTeardownSuspend", err)
-			if waitCtx.Err() != nil {
+			// Only the wait ending can leave a release pending. Any other
+			// answer is sbx-manager's own, a refusal that arrives as the
+			// deadline passes included, and stays an error.
+			if waitCtx.Err() != nil && endedByContext(err) {
 				return waitEnded(err)
 			}
 			return err
@@ -891,6 +894,13 @@ func releaseTaskAfterGenerationTeardown(ctx context.Context, client pb.SandboxMa
 			)
 		}
 	}
+}
+
+// endedByContext reports whether an RPC failed because its context ended
+// rather than because the server answered.
+func endedByContext(err error) bool {
+	code := status.Code(err)
+	return code == codes.Canceled || code == codes.DeadlineExceeded
 }
 
 // teardownReleasePendingError reports a release wait that ended while

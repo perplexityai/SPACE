@@ -404,6 +404,20 @@ reaches:
   annotation unchanged, so joining it would collect every attempt in the one
   trace. The shim's own teardown spans link to their task's create.
 
+The shim's teardown spans, `shim.kill` and `shim.delete` with their
+`shim.sbxmgr.teardown_release` child, wait at most 45 seconds for sbx-manager
+to make a generation-fenced execution's suspend durable, remote upload
+included. A wait that ends while sbx-manager still answers `PENDING` is the
+retry containerd needs, not a failure: the task keeps running, and those spans
+end with unset status and `teardown.release=pending`. Every other outcome stays
+an error: a refusal, including one that arrives as the deadline passes, an
+unknown outcome, or a deadline before any `PENDING`. The
+`space.shim.operation.error` counter still counts a pending wait under
+`step:prepare_teardown_suspend`, so it counts every retried release. Watch a
+prolonged suspend through how long one sandbox's teardown spans keep recording
+`teardown.release=pending`, or through pods stuck `Terminating`, rather than
+through span errors.
+
 A root that links to the context that caused it records that context's trace
 id as `origin_trace_id`, since a link is not searchable, and whether it was
 sampled as `origin_sampled`. Its sampling follows that origin: it is kept when

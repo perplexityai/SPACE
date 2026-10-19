@@ -2113,13 +2113,17 @@ func TestTeardownSuspendBudget(t *testing.T) {
 }
 
 func TestTeardownFailsClosed(t *testing.T) {
+	pending := teardownSuspendResult{outcome: pb.TeardownSuspendOutcome_TEARDOWN_SUSPEND_OUTCOME_PENDING}
+	refused := teardownSuspendResult{err: status.Error(codes.FailedPrecondition, "refused")}
 	tests := []struct {
-		name       string
-		identity   taskTeardownIdentity
-		result     teardownSuspendResult
-		wantCode   codes.Code
-		wantCalls  int
-		cancelCall bool
+		name     string
+		identity taskTeardownIdentity
+		results  []teardownSuspendResult
+		wantCode codes.Code
+		// wantCalls PrepareTeardownSuspend calls are made; the wait ends
+		// during call endWaitOnCall, or before any call when it is -1.
+		wantCalls     int
+		endWaitOnCall int
 		// Only a wait that ended after sbx-manager answered PENDING is an
 		// in-progress suspend; every refusal must stay a failure.
 		wantPending bool
@@ -2127,30 +2131,62 @@ func TestTeardownFailsClosed(t *testing.T) {
 		{
 			name:      "missing execution generation fails before the RPC",
 			identity:  taskTeardownIdentity{sandboxID: "sbx"},
-			result:    teardownSuspendResult{outcome: pb.TeardownSuspendOutcome_TEARDOWN_SUSPEND_OUTCOME_DURABLE},
+			results:   []teardownSuspendResult{{outcome: pb.TeardownSuspendOutcome_TEARDOWN_SUSPEND_OUTCOME_DURABLE}},
 			wantCode:  codes.FailedPrecondition,
 			wantCalls: 0,
 		},
 		{
 			name:      "sandbox manager unavailable",
 			identity:  taskTeardownIdentity{sandboxID: "sbx", executionGeneration: 8},
-			result:    teardownSuspendResult{err: status.Error(codes.Unavailable, "unavailable")},
+			results:   []teardownSuspendResult{{err: status.Error(codes.Unavailable, "unavailable")}},
 			wantCode:  codes.Unavailable,
 			wantCalls: 1,
 		},
 		{
-			name:        "still pending at cancellation",
-			identity:    taskTeardownIdentity{sandboxID: "sbx", executionGeneration: 8},
-			result:      teardownSuspendResult{outcome: pb.TeardownSuspendOutcome_TEARDOWN_SUSPEND_OUTCOME_PENDING},
-			wantCode:    codes.Canceled,
-			wantCalls:   1,
-			cancelCall:  true,
-			wantPending: true,
+			name:          "still pending at cancellation",
+			identity:      taskTeardownIdentity{sandboxID: "sbx", executionGeneration: 8},
+			results:       []teardownSuspendResult{pending},
+			wantCode:      codes.Canceled,
+			wantCalls:     1,
+			endWaitOnCall: 1,
+			wantPending:   true,
+		},
+		{
+			name:          "pending until the wait ends during the next call",
+			identity:      taskTeardownIdentity{sandboxID: "sbx", executionGeneration: 8},
+			results:       []teardownSuspendResult{pending, {err: status.Error(codes.Canceled, "context canceled")}},
+			wantCode:      codes.Canceled,
+			wantCalls:     2,
+			endWaitOnCall: 2,
+			wantPending:   true,
+		},
+		{
+			name:      "refused after pending while the wait runs",
+			identity:  taskTeardownIdentity{sandboxID: "sbx", executionGeneration: 8},
+			results:   []teardownSuspendResult{pending, refused},
+			wantCode:  codes.FailedPrecondition,
+			wantCalls: 2,
+		},
+		{
+			name:          "refused after pending as the wait ends",
+			identity:      taskTeardownIdentity{sandboxID: "sbx", executionGeneration: 8},
+			results:       []teardownSuspendResult{pending, refused},
+			wantCode:      codes.FailedPrecondition,
+			wantCalls:     2,
+			endWaitOnCall: 2,
+		},
+		{
+			name:          "wait ended before any pending",
+			identity:      taskTeardownIdentity{sandboxID: "sbx", executionGeneration: 8},
+			results:       []teardownSuspendResult{pending},
+			wantCode:      codes.Canceled,
+			wantCalls:     0,
+			endWaitOnCall: -1,
 		},
 		{
 			name:      "unspecified outcome",
 			identity:  taskTeardownIdentity{sandboxID: "sbx", executionGeneration: 8},
-			result:    teardownSuspendResult{},
+			results:   []teardownSuspendResult{{}},
 			wantCode:  codes.Internal,
 			wantCalls: 1,
 		},
@@ -2160,9 +2196,16 @@ func TestTeardownFailsClosed(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			client := &fakeSandboxManagerClient{teardownResults: []teardownSuspendResult{tt.result}}
-			if tt.cancelCall {
-				client.onTeardownCall = cancel
+			client := &fakeSandboxManagerClient{teardownResults: tt.results}
+			switch {
+			case tt.endWaitOnCall < 0:
+				cancel()
+			case tt.endWaitOnCall > 0:
+				client.onTeardownCall = func() {
+					if len(client.teardownRequests) == tt.endWaitOnCall {
+						cancel()
+					}
+				}
 			}
 
 			err := releaseTaskAfterGenerationTeardown(ctx, client, tt.identity)
