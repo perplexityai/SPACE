@@ -6,6 +6,7 @@ use pplx_space_metrics::data_plane::{
 };
 
 mod auth;
+mod handover;
 mod protocol;
 mod proxy;
 mod sse;
@@ -16,6 +17,7 @@ const NATIVE_ROUTE_CACHE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const NATIVE_ROUTE_CACHE_SWEEP_MAX_ENTRIES: usize = 16 * 1024;
 
 pub(super) use auth::*;
+pub(super) use handover::*;
 pub(super) use protocol::*;
 pub(super) use proxy::*;
 pub(super) use sse::*;

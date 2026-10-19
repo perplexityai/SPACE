@@ -2,8 +2,6 @@
 
 use super::*;
 
-pub(super) const DEFAULT_NODE_API_PORT: u16 = 9800;
-
 pub(super) async fn fetch_route_row(
     pool: &sqlx::PgPool,
     session_id: &str,
@@ -149,17 +147,7 @@ pub(super) fn node_api_backend_endpoint(
     direct: Option<&str>,
     address: Option<&str>,
 ) -> Option<String> {
-    direct
-        .filter(|value| !value.trim().is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            let ip = address?.trim().parse::<std::net::IpAddr>().ok()?;
-            let address = std::net::SocketAddr::new(ip, DEFAULT_NODE_API_PORT);
-            Some(format!(
-                "{}{address}",
-                pplx_space_common_grpc::internal_transport::advertised_endpoint_prefix()
-            ))
-        })
+    pplx_space_common_grpc::internal_transport::node_api_endpoint(direct, address)
 }
 
 pub(super) fn resolve_backend_endpoint(row: &SessionRouteRow) -> Option<String> {

@@ -20,8 +20,13 @@ use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::TokioExecutor,
 };
+use pplx_space_common_svc::space_api_route_ed25519::DATA_PLANE_ROUTE_HANDOVER_HEADER;
 use pplx_space_public_api::{PublicCommand, data_plane_session_events_path};
 use tokio_util::sync::CancellationToken;
+
+mod handover;
+pub use handover::DATA_PLANE_ROUTE_HANDOVER_ENV;
+pub(crate) use handover::RouteHandoverIssuer;
 
 pub const DATA_PLANE_INTERNAL_URL_ENV: &str = "SPACE_DATA_PLANE_INTERNAL_URL";
 
@@ -32,6 +37,9 @@ pub const DATA_PLANE_INTERNAL_URL_ENV: &str = "SPACE_DATA_PLANE_INTERNAL_URL";
 pub const COMMAND_EVENT: &str = "command";
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+// Past this, the data plane resolving the route is faster than waiting on
+// the API's own read.
+const HANDOVER_TIMEOUT: Duration = Duration::from_millis(500);
 // The data plane answers once the process has started. Past this, the client
 // is better served by the handle and its own attach than by a stalled request.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -66,6 +74,7 @@ pub struct CommandStreamProxy {
     client: Client<HttpConnector, Empty<Bytes>>,
     origin: String,
     shutdown: CancellationToken,
+    route_handover: Option<RouteHandoverIssuer>,
 }
 
 impl CommandStreamProxy {
@@ -96,7 +105,31 @@ impl CommandStreamProxy {
             client: Client::builder(TokioExecutor::new()).build(connector),
             origin: format!("http://{authority}"),
             shutdown,
+            route_handover: None,
         })
+    }
+
+    /// Hands the data plane the session's route with each stream it opens, so
+    /// the data plane does not resolve it again.
+    pub(crate) fn with_route_handover(mut self, issuer: RouteHandoverIssuer) -> Self {
+        self.route_handover = Some(issuer);
+        self
+    }
+
+    async fn route_handover(&self, command: &PublicCommand, token: &str) -> Option<String> {
+        let issuer = self.route_handover.as_ref()?;
+        let session_id = command.session_id.to_string();
+        match tokio::time::timeout(HANDOVER_TIMEOUT, issuer.mint(&session_id, token)).await {
+            Ok(Ok(handover)) => Some(handover),
+            Ok(Err(error)) => {
+                tracing::debug!(%session_id, %error, "no route handover for command stream");
+                None
+            }
+            Err(_) => {
+                tracing::debug!(%session_id, "route handover timed out");
+                None
+            }
+        }
     }
 
     /// Returns a `201 text/event-stream` response for `command`, or `None` when
@@ -117,14 +150,17 @@ impl CommandStreamProxy {
 
     async fn open(&self, command: &PublicCommand) -> Result<Response, OpenError> {
         let token = &command.attach.as_ref().ok_or(OpenError::NoAttach)?.token;
-        let request = Request::get(format!(
+        let mut request = Request::get(format!(
             "{}{}",
             self.origin,
             data_plane_session_events_path(command.session_id)
         ))
         .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .header(header::ACCEPT, "text/event-stream")
-        .body(Empty::new())?;
+        .header(header::ACCEPT, "text/event-stream");
+        if let Some(handover) = self.route_handover(command, token).await {
+            request = request.header(DATA_PLANE_ROUTE_HANDOVER_HEADER, handover);
+        }
+        let request = request.body(Empty::new())?;
         let upstream = tokio::time::timeout(OPEN_TIMEOUT, self.client.request(request))
             .await
             .map_err(|_| OpenError::Timeout)??;

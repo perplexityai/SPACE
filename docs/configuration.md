@@ -145,6 +145,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_PUBLIC_CURSOR_SECRET` | **required** | |
 | `SPACE_DATA_PLANE_PUBLIC_URL` | empty | Empty yields relative URLs. |
 | `SPACE_DATA_PLANE_INTERNAL_URL` | unset | `http://` origin of the data plane as the API reaches it. Enables streaming command creation (`Accept: text/event-stream`); unset answers those requests with the JSON handle. Streams relayed this way end when the API shuts down. |
+| `SPACE_DATA_PLANE_ROUTE_HANDOVER` | off | API: with the command stream on, also send the data plane the session's route, signed with the route signing key, so the data plane opens the stream without resolving the route. Turn it on only where `SPACE_DATA_PLANE_INTERNAL_URL` reaches the data plane's internal listener: anywhere else the data plane ignores the route and resolves it anyway. Accepts `true`/`1`/`yes`/`on`. |
 | `SPACE_FEDERATED_GRANT_AUDIENCE`, `SPACE_FEDERATED_IDENTITY_ISSUER`, `SPACE_FEDERATED_REJECTED_SUBJECTS` | `credential-provider`, `space`, `[]` | |
 | `SPACE_E2B_HOME_WORKDIR_TEMPLATES`, `SPACE_ECW_HOSTS` | `code-runtime`, none | E2B routes return 404 without hosts. |
 | `SPACE_CLUSTER_ID` | unset | Required for route signing. |
@@ -152,6 +153,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_DATA_PLANE_UPLOAD_ADMISSION` | off | Data plane: admit ECW `POST /files` uploads under the per-replica limits below; rejected uploads get 429 with a jittered `Retry-After`. Accepts `true`/`1`/`yes`/`on` and their negations. |
 | `SPACE_DATA_PLANE_MAX_CONCURRENT_UPLOADS`, `SPACE_DATA_PLANE_MAX_IN_FLIGHT_UPLOAD_BYTES` | 64, 1 GiB | Per-replica upload slots and byte budget. Each upload reserves its declared `Content-Length` rounded up to a KiB, or its path's body limit (256 MiB, or 1 MiB for JSON) when none is declared, so the 1 GiB default fits four undeclared-length uploads at a time. A reservation is capped at the whole budget: a budget smaller than one upload admits uploads one at a time and is exceeded by that upload. Both must be non-zero. |
 | `SPACE_DATA_PLANE_UPLOAD_ADMISSION_WAIT_MS` | 2000 | How long an upload waits for a slot and its bytes before the 429. |
+| `SPACE_DATA_PLANE_INTERNAL_LISTEN` | unset | Data plane: a second listen address for in-cluster callers. Keep it off public ingress. Only requests on it may carry a route handover from the API, and only if `SPACE_API_ROUTE_ED25519_VERIFICATION_BUNDLE_PATH` (the route verification keys nodes use) and `SPACE_CLUSTER_ID` are set too. A handover that fails any check falls back to resolving the route. |
 | `SPACE_DATA_PLANE_SHUTDOWN_GRACE_SECS` | unset | Data plane: how long live streams keep running after SIGTERM before they're cancelled. Unset, they run until they end or the termination grace period kills the process; a second stop signal ends the drain either way, without waiting for a `Process.Start` that's still opening. Keep it plus 5 seconds within the pod's termination grace period minus its preStop delay. Values under 8 seconds, the stream-open budget, are rejected, so an ECW `Process.Start` already opening at SIGTERM can report itself. See [architecture](architecture.md) for what each stream kind sees. |
 
 ## Templates and builds
@@ -339,7 +341,7 @@ calls.
 | `SPACE_NODE_API_AUTH_TEMPLATE_TRANSFER_SERVICE_ACCOUNTS` | empty | Explicit artifact-transfer accounts for `NodeExportTemplate` and `PullTemplate`; also require normal surface admission. Guest-bridge accounts are always excluded. |
 | `SPACE_NODE_API_NAMESPACE`, `SPACE_NODE_API_TLS_SERVER_NAME`, `SPACE_CLUSTER_API_TLS_SERVER_NAME` | namespace chain, from endpoint | |
 | `SPACE_API_ROUTE_ED25519_ISSUER`, `SPACE_API_ROUTE_ED25519_SIGNING_KEY_ID`, `SPACE_API_ROUTE_ED25519_SIGNING_KEY_PATH` | unset = no signing | Set all three. |
-| `SPACE_API_ROUTE_ED25519_VERIFICATION_BUNDLE_PATH` | required on sandbox managers | |
+| `SPACE_API_ROUTE_ED25519_VERIFICATION_BUNDLE_PATH` | required on sandbox managers | Also verifies route handovers on the data plane's internal listener. |
 | `SPACE_API_ROUTE_GENERATION_FENCE_ENABLED` | on | |
 | `SPACE_ECW_CREDENTIAL_KEY_PATH` | **required** on api and internal-api | |
 | `SPACE_ECW_CREDENTIAL_PREVIOUS_KEY_PATH` | unset | Set only while rotating. |
