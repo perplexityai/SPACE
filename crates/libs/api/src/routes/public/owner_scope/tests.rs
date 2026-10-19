@@ -760,6 +760,9 @@ async fn sandbox_scoped_requests_load_owner_and_row_once() -> TestDbResult<()> {
         statements.len()
     );
     assert_eq!(status, StatusCode::CREATED, "{body}");
+    // Auth (3), the sandbox row, then the session store's lock, lookup,
+    // session, operation with its event, idempotency record, and commit.
+    assert_eq!(statements.len(), 10, "{statements:#?}");
     assert_eq!(sandbox_row_loads(&statements), 1, "{statements:#?}");
     // An already-materialized owner resolves in one read.
     assert_eq!(
