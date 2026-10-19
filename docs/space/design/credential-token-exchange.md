@@ -14,6 +14,15 @@ Every request must provide all of the following. Missing, malformed,
 unknown, or duplicated values are rejected; an authorization or validation
 failure never falls back to broader credentials.
 
+A server-side copy additionally sets `copy_source_resource` to one exact
+source-object ARN. Only Volume Manager with a sandbox subject and read/write
+destination scope may use it; prefix copies are rejected. The authority checks
+the source as a read and the destination as a read/write independently, under
+the same sandbox, organization and vend role. Both objects must be in the same
+bucket and have different keys. The session adds only source `GetObject` and
+exact-key listing permission, never source mutation permission. Destination
+node attribution still applies, including the recorded portable fork-write URI.
+
 | Field | Required value |
 | --- | --- |
 | `grant_type` | `urn:ietf:params:oauth:grant-type:token-exchange` |
@@ -180,3 +189,9 @@ no additional database grant or migration is required.
 Callers and node agents must send the scoped request contract before they
 reach an authority. Rolling a caller back to a build that predates the
 contract makes its storage exchanges fail.
+
+Upgrade the credential authority and forwarding agents before enabling copy
+callers. An older authority ignores the additive source field and cannot grant
+the source access needed by a copy; callers must not substitute broader
+credentials when that fails. Requests omitting the field retain their existing
+policy.

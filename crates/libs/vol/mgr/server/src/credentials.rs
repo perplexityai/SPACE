@@ -75,6 +75,7 @@ pub async fn exchange_credentials(
             actor_token: None,
             actor_token_type: None,
             requested_expires_in: Some(STORAGE_SESSION_TTL_SECONDS),
+            copy_source_resource: None,
         })
         .await
         .map_err(|e| Status::internal(format!("credmgr exchange_token failed: {e}")))?

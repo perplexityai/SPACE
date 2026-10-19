@@ -270,6 +270,7 @@ pub(crate) struct AuthorizedExchange {
     pub(crate) ttl_seconds: u32,
     pub(crate) organization_id: Option<OrgId>,
     role_override: Option<VendRoleArn>,
+    pub(crate) copy_source: Option<S3Resource>,
 }
 
 impl AuthorizedExchange {
@@ -286,21 +287,37 @@ impl AuthorizedExchange {
     }
 
     pub(crate) fn session_policy(&self) -> Result<String, StorageExchangeError> {
-        let policy = serde_json::json!({
-            "Version": "2012-10-17",
-            "Statement": [
-                {
+        let mut statements = vec![
+            serde_json::json!({
+                "Effect": "Allow",
+                "Action": self.actions.iam_actions(),
+                "Resource": self.resource.policy_arn(),
+            }),
+            serde_json::json!({
+                "Effect": "Allow",
+                "Action": "s3:ListBucket",
+                "Resource": self.resource.bucket_policy_arn(),
+                "Condition": self.resource.list_prefix_condition(),
+            }),
+        ];
+        if let Some(source) = &self.copy_source {
+            statements.extend([
+                serde_json::json!({
                     "Effect": "Allow",
-                    "Action": self.actions.iam_actions(),
-                    "Resource": self.resource.policy_arn(),
-                },
-                {
+                    "Action": ["s3:GetObject"],
+                    "Resource": source.policy_arn(),
+                }),
+                serde_json::json!({
                     "Effect": "Allow",
                     "Action": "s3:ListBucket",
-                    "Resource": self.resource.bucket_policy_arn(),
-                    "Condition": self.resource.list_prefix_condition(),
-                },
-            ],
+                    "Resource": source.bucket_policy_arn(),
+                    "Condition": source.list_prefix_condition(),
+                }),
+            ]);
+        }
+        let policy = serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": statements,
         });
         let policy = policy.to_string();
         if policy.len() > MAX_STS_POLICY_BYTES {
@@ -344,6 +361,45 @@ impl RequestedExchange {
 }
 
 pub(crate) async fn authorize_exchange(
+    store: &dyn StorageVendStore,
+    caller: &ResolvedCaller,
+    mut request: ExchangeTokenRequest,
+) -> Result<AuthorizedExchange, StorageExchangeError> {
+    let source = request.copy_source_resource.take();
+    let mut destination = authorize_single_exchange(store, caller, request.clone()).await?;
+    let Some(source) = source else {
+        return Ok(destination);
+    };
+    if destination.actor != ClientService::VolumeManager
+        || !matches!(
+            destination.subject,
+            StorageSubject::Resource(SubjectId::Sandbox(_))
+        )
+        || destination.resource.prefix
+        || destination.actions
+            != (StorageActions {
+                read: true,
+                write: true,
+            })
+    {
+        return Err(StorageExchangeError::UnauthorizedResource);
+    }
+    request.resource = source;
+    request.scope = Some(STORAGE_READ_SCOPE.to_string());
+    let source = authorize_single_exchange(store, caller, request).await?;
+    if source.resource.prefix
+        || source.resource.bucket != destination.resource.bucket
+        || source.resource == destination.resource
+        || source.organization_id != destination.organization_id
+        || source.role_override != destination.role_override
+    {
+        return Err(StorageExchangeError::UnauthorizedResource);
+    }
+    destination.copy_source = Some(source.resource);
+    Ok(destination)
+}
+
+async fn authorize_single_exchange(
     store: &dyn StorageVendStore,
     caller: &ResolvedCaller,
     request: ExchangeTokenRequest,
@@ -438,6 +494,7 @@ pub(crate) async fn authorize_exchange(
         ttl_seconds: parsed.ttl_seconds,
         organization_id,
         role_override,
+        copy_source: None,
     })
 }
 

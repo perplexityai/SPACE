@@ -22,6 +22,7 @@ fn token_exchange_debug_output_is_redacted() {
             actor_token: Some("secret-actor-token".to_string()),
             actor_token_type: Some("actor-token-type".to_string()),
             requested_expires_in: Some(3600),
+            copy_source_resource: Some("source-resource".to_string()),
         },
         "ExchangeTokenRequest",
     );

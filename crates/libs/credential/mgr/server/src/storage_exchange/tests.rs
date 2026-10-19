@@ -83,6 +83,7 @@ fn template_request(template: &TemplateName, scope: &str) -> ExchangeTokenReques
         actor_token: None,
         actor_token_type: None,
         requested_expires_in: Some(STORAGE_SESSION_TTL_SECONDS),
+        copy_source_resource: None,
     }
 }
 
@@ -103,6 +104,7 @@ fn sandbox_request(sandbox_id: SandboxId) -> ExchangeTokenRequest {
         actor_token: None,
         actor_token_type: None,
         requested_expires_in: Some(STORAGE_SESSION_TTL_SECONDS),
+        copy_source_resource: None,
     }
 }
 
@@ -116,6 +118,149 @@ fn sandbox_context(org: OrgId) -> SandboxStorageContext {
         snapshot_storage_configuration_invalid: false,
         portable_snapshot_write: None,
     }
+}
+
+fn copy_request(sandbox: SandboxId) -> ExchangeTokenRequest {
+    let mut request = sandbox_request(sandbox);
+    let prefix = request.resource.trim_end_matches("/*");
+    let source = format!("{prefix}/rootfs.btrfs-send");
+    let destination = format!(
+        "{prefix}/fork/{sandbox}/{}/rootfs.btrfs-send",
+        uuid::Uuid::now_v7()
+    );
+    request.resource = destination;
+    request.copy_source_resource = Some(source);
+    request.scope = Some(format!("{STORAGE_READ_SCOPE} {STORAGE_WRITE_SCOPE}"));
+    request
+}
+
+#[tokio::test]
+async fn copy_exchange_rejects_broader_or_unattributed_resources() {
+    let sandbox = SandboxId::new();
+    let base = copy_request(sandbox);
+    let store = TestStore {
+        sandboxes: HashMap::from([(sandbox, sandbox_context(OrgId::new()))]),
+        ..Default::default()
+    };
+    let peer = caller(ClientService::VolumeManager, "worker-a", "worker-a-uid");
+    let cases = [
+        ("source prefix", {
+            let mut request = base.clone();
+            let source = request.copy_source_resource.as_mut().unwrap();
+            *source = format!("{}/*", source.rsplit_once('/').unwrap().0);
+            request
+        }),
+        ("destination prefix", {
+            let mut request = base.clone();
+            request.resource = format!("{}/*", request.resource.rsplit_once('/').unwrap().0);
+            request
+        }),
+        ("different source subject", {
+            let mut request = base.clone();
+            let source = request.copy_source_resource.as_mut().unwrap();
+            *source = source.replace(&sandbox.to_string(), &SandboxId::new().to_string());
+            request
+        }),
+        ("source outside recorded storage", {
+            let mut request = base.clone();
+            let source = request.copy_source_resource.as_mut().unwrap();
+            *source = source.replace("/tenant/", "/outside/");
+            request
+        }),
+        ("source equals destination", {
+            let mut request = base.clone();
+            request.copy_source_resource = Some(request.resource.clone());
+            request
+        }),
+        ("read-only destination", {
+            let mut request = base.clone();
+            request.scope = Some(STORAGE_READ_SCOPE.to_string());
+            request
+        }),
+        ("write-only destination", {
+            let mut request = base.clone();
+            request.scope = Some(STORAGE_WRITE_SCOPE.to_string());
+            request
+        }),
+    ];
+    for (label, request) in cases {
+        assert!(
+            authorize_exchange(&store, &peer, request).await.is_err(),
+            "{label} must not vend copy credentials"
+        );
+    }
+    let error = authorize_exchange(
+        &store,
+        &caller(ClientService::VolumeManager, "worker-b", "worker-b-uid"),
+        base,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(error, StorageExchangeError::WrongNode),
+        "portable reads must not authorize an unattributed destination write"
+    );
+}
+
+#[tokio::test]
+async fn portable_copy_vends_read_only_source_and_exact_destination_permissions() {
+    let sandbox = SandboxId::new();
+    let mut request = sandbox_request(sandbox);
+    let source_prefix = request.resource.trim_end_matches("/*").to_string();
+    let source = format!("{source_prefix}/rootfs.btrfs-send");
+    let destination_prefix = format!("{source_prefix}/fork/{sandbox}/{}", uuid::Uuid::now_v7());
+    let destination = format!("{destination_prefix}/rootfs.btrfs-send");
+    request.resource = destination.clone();
+    request.copy_source_resource = Some(source.clone());
+    request.scope = Some(format!("{STORAGE_READ_SCOPE} {STORAGE_WRITE_SCOPE}"));
+    let mut context = sandbox_context(OrgId::new());
+    context.portable_snapshot_write = Some(
+        StorageUri::parse(&format!(
+            "s3://{}?region=us-east-1",
+            destination_prefix.trim_start_matches("arn:aws:s3:::")
+        ))
+        .unwrap(),
+    );
+    let store = TestStore {
+        sandboxes: HashMap::from([(sandbox, context)]),
+        ..Default::default()
+    };
+    let authorized = authorize_exchange(
+        &store,
+        &caller(ClientService::VolumeManager, "worker-b", "worker-b-uid"),
+        request,
+    )
+    .await
+    .expect("source reads and prepared destination writes are portable independently");
+    let policy: serde_json::Value =
+        serde_json::from_str(&authorized.session_policy().unwrap()).unwrap();
+    assert_eq!(policy["Statement"].as_array().unwrap().len(), 4);
+    let source_statements: Vec<_> = policy["Statement"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|statement| statement["Resource"] == source)
+        .collect();
+    assert_eq!(
+        source_statements.len(),
+        1,
+        "copy must grant the source object without widening the destination prefix"
+    );
+    assert_eq!(
+        source_statements[0]["Action"],
+        serde_json::json!(["s3:GetObject"])
+    );
+    assert_eq!(
+        policy["Statement"][3]["Condition"],
+        serde_json::json!({
+            "StringEquals": {"s3:prefix": source.strip_prefix("arn:aws:s3:::space-snapshots/").unwrap()}
+        })
+    );
+    assert_eq!(policy["Statement"][0]["Resource"], destination);
+    assert_eq!(
+        policy["Statement"][0]["Action"],
+        serde_json::json!(["s3:GetObject", "s3:PutObject", "s3:AbortMultipartUpload"])
+    );
 }
 
 fn node_identity(name: &str, uid: &str) -> SandboxNodeIdentity {
@@ -674,6 +819,7 @@ fn session_policy_is_exact_and_enforces_the_sts_size_limit() {
         ttl_seconds: parsed.ttl_seconds,
         organization_id: None,
         role_override: None,
+        copy_source: None,
     };
     let policy: serde_json::Value =
         serde_json::from_str(&authorized.session_policy().unwrap()).unwrap();
@@ -738,6 +884,7 @@ fn ambient_or_static_credentials_are_never_a_vend_result() {
         ttl_seconds: parsed.ttl_seconds,
         organization_id: None,
         role_override: None,
+        copy_source: None,
     };
     assert!(matches!(
         authorized.vend_role(None).unwrap_err(),

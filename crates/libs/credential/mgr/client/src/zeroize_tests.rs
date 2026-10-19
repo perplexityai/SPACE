@@ -34,6 +34,7 @@ fn token_exchange_secrets_zeroize() {
         actor_token: Some("secret-actor-token".to_string()),
         actor_token_type: None,
         requested_expires_in: Some(3600),
+        copy_source_resource: Some("source-resource".to_string()),
     };
     request.zeroize();
     assert!(request.subject_token.is_none());
