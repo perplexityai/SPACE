@@ -220,3 +220,17 @@ fn managed_directory_names_retain_labels_and_digests() {
         name.parse::<ManagedDirectoryName>().unwrap_err();
     }
 }
+
+#[test]
+fn every_qualified_environment_has_pinned_verity_sources() {
+    for environment in CompiledEnvironment::for_architecture(Arch::X86_64).unwrap() {
+        for binary in &environment.release().binaries {
+            assert!(compiled_verity_digest(binary.sha256).unwrap().is_some());
+        }
+        assert!(
+            compiled_verity_digest(environment.kernel().sha256)
+                .unwrap()
+                .is_some()
+        );
+    }
+}

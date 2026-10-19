@@ -557,3 +557,32 @@ async fn legacy_runtime_placement_is_not_hidden_by_a_compiled_environment() {
             .is_some_and(|runtime| runtime.version == "1.17.0")
     }));
 }
+
+#[test]
+fn artifact_rpc_status_preserves_missing_paths_and_transient_io() {
+    for (errno, code) in [
+        (libc::ENOENT, tonic::Code::FailedPrecondition),
+        (libc::EACCES, tonic::Code::FailedPrecondition),
+        (libc::EIO, tonic::Code::Internal),
+        (libc::EBUSY, tonic::Code::Internal),
+    ] {
+        assert_eq!(
+            publish_status(PublishError::Io {
+                action: "inspect directory",
+                path: "/synthetic/artifacts".into(),
+                source: std::io::Error::from_raw_os_error(errno)
+            })
+            .code(),
+            code
+        );
+        assert_eq!(
+            remove_status(RemoveError::Io {
+                action: "inspect directory",
+                path: "/synthetic/artifacts".into(),
+                source: std::io::Error::from_raw_os_error(errno)
+            })
+            .code(),
+            code
+        );
+    }
+}
