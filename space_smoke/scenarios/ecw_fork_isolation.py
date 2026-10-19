@@ -22,7 +22,7 @@ def fork_isolation(test: smoke.Ecw) -> None:
 
         def fork(_index: int) -> EcwSandbox:
             gate.wait()
-            return test.sandboxes.fork(test.sandbox)
+            return test.sandboxes.fork(test.sandbox).sandbox
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             left, right = executor.map(fork, range(2))

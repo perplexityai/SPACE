@@ -37,7 +37,7 @@ from space_smoke.capabilities import (
     ColdEvictionConfig,
     ColdEvictionControl,
     CrossNodeRestoreControl,
-    ForkableSandbox,
+    EcwForkResult,
     SnapshotReaperConfig,
     SnapshotReaperControl,
     FailedTransfer,
@@ -826,11 +826,15 @@ class EcwSandboxCollection(SandboxCollection):
             )
 
     def fork(
-        self, source: EcwSandbox, *, idempotency_key: str | None = None
-    ) -> EcwSandbox:
+        self,
+        source: EcwSandbox,
+        *,
+        idempotency_key: str | None = None,
+        timeout: int | None = None,
+    ) -> EcwForkResult:
         """Fork a run-owned source with child cleanup armed before dispatch."""
 
-        return self._sandboxes.fork(source, idempotency_key=idempotency_key)
+        return self._sandboxes.fork(source, idempotency_key=idempotency_key, timeout=timeout)
 
 
 @dataclass(frozen=True)
@@ -4454,26 +4458,11 @@ class SnapshotReaperAssertions:
         return config
 
     def fork_source(self, *, timeout: int = 600) -> str:
-        """Fork the fixture sandbox once; the child is deleted at scope end.
+        """Fork once using the collection's replay-aware, run-scoped cleanup."""
 
-        The delete compensation is armed before the fork is dispatched and
-        keyed on the id the fork returns. A reply lost *after* the child
-        exists leaves an id this ledger never learns; that child is bounded
-        by the fork's own `timeout` — the E2B route creates it with
-        auto-pause off, so expiry kills it. There is no kill-by-metadata
-        backstop for it in the fixture.
-        """
-
-        sandbox = cast(ForkableSandbox, self._fixture.sandbox)
-        children: list[str] = []
-
-        def delete_children() -> None:
-            for child in children:
-                retry_sandbox_delete(lambda: sandbox.delete_forked(child))
-
-        self._scope.defer("delete the fork child", delete_children, critical=True)
-        child = sandbox.fork(timeout=timeout)
-        children.append(child)
+        child = self._fixture.sandboxes.fork(
+            self._fixture.sandbox, timeout=timeout
+        ).sandbox.sandbox_id
         self._fixture.record("fork_child_sandbox_id", child)
         return child
 

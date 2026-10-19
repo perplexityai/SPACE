@@ -6132,22 +6132,30 @@ class _SdkSandbox:
         )
         return _race_request(request, timeout=timeout, gate=gate)
 
-    def fork(self, *, timeout: int = 600) -> str:
-        return str(self.fork_response(timeout=timeout)["sandboxID"])
-
     def fork_response(
         self, *, timeout: int, idempotency_key: str | None = None
     ) -> Mapping[str, Any]:
         # The server accepts exactly one child per request today.
-        results = _ecw_control_plane_json(
-            self._config,
-            "POST",
-            f"/sandboxes/{quote(self.sandbox_id, safe='')}/fork",
-            body={"count": 1, "timeout": timeout},
-            idempotency_key=idempotency_key or f"space-smoke-fork-{secrets.token_hex(8)}",
-            expected_status=201,
-            timeout=timeout + 60,
-        )
+        key = idempotency_key or f"space-smoke-fork-{secrets.token_hex(16)}"
+        deadline = time.monotonic() + timeout + 60
+        for attempt in range(3):
+            try:
+                results = _ecw_control_plane_json(
+                    self._config,
+                    "POST",
+                    f"/sandboxes/{quote(self.sandbox_id, safe='')}/fork",
+                    body={"count": 1, "timeout": timeout},
+                    idempotency_key=key,
+                    expected_status=201,
+                    timeout=max(0.001, deadline - time.monotonic()),
+                )
+                break
+            except EcwControlPlaneHttpError as error:
+                # Admission contention asks the caller to retry this key.
+                # A stuck admission must still fail within a bounded budget.
+                if error.status != 503 or attempt == 2 or time.monotonic() + 1 >= deadline:
+                    raise
+                time.sleep(1)
         if not isinstance(results, list) or len(results) != 1:
             raise RuntimeError(f"fork returned an unexpected body: {results!r}")
         (result,) = results

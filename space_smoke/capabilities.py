@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Collection, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, BinaryIO, Generic, Protocol, TypeVar
 
@@ -974,10 +974,6 @@ class ForkableSandbox(Protocol):
     to reclaim.
     """
 
-    def fork(self, *, timeout: int = 600) -> str:
-        """Fork the sandbox once; returns the child sandbox id. Synchronous."""
-        ...
-
     def fork_response(
         self, *, timeout: int, idempotency_key: str | None = None
     ) -> Mapping[str, Any]:
@@ -1073,6 +1069,14 @@ class EcwSandboxes(Protocol):
     ) -> EcwSandboxPages: ...
 
 
+@dataclass(frozen=True)
+class EcwForkResult:
+    """A tracked child and the complete public reply used to construct its client."""
+
+    sandbox: EcwSandbox
+    response: Mapping[str, Any] = field(repr=False)
+
+
 class EcwScenarioSandboxes(Protocol):
     @property
     def items(self) -> tuple[EcwSandbox, ...]: ...
@@ -1080,8 +1084,12 @@ class EcwScenarioSandboxes(Protocol):
     def create(self, metadata: Mapping[str, str] | None = None) -> EcwSandbox: ...
 
     def fork(
-        self, source: EcwSandbox, *, idempotency_key: str | None = None
-    ) -> EcwSandbox: ...
+        self,
+        source: EcwSandbox,
+        *,
+        idempotency_key: str | None = None,
+        timeout: int | None = None,
+    ) -> EcwForkResult: ...
 
     def attempt_create(
         self,

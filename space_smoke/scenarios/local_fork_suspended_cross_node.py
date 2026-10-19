@@ -1,4 +1,4 @@
-"""A suspended source forks from durable storage onto another worker."""
+"""A suspended source forks onto another worker with intact, independent disk data."""
 
 import space_smoke as smoke
 
@@ -10,7 +10,7 @@ MARKER = "durable-fork-state"
     "local.fork_suspended_cross_node", sandbox=smoke.SandboxConfig(timeout=900)
 )
 def fork_suspended_cross_node(test: smoke.KindEcw) -> None:
-    """A cold source needs no source-node placement to create an independent child."""
+    """Off-source placement preserves disk data without resuming the suspended source."""
 
     restore = test.cross_node_restore
     with test.phase("write state and suspend the source durably"):
@@ -21,7 +21,7 @@ def fork_suspended_cross_node(test: smoke.KindEcw) -> None:
 
     with restore.cordoned(source.node_name):
         with test.phase("fork the suspended source onto another worker"):
-            child = test.sandboxes.fork(test.sandbox)
+            child = test.sandboxes.fork(test.sandbox).sandbox
             landed = restore.current_placement(child)
             test.verify(
                 landed.node_name != source.node_name,

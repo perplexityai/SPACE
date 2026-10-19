@@ -28,6 +28,7 @@ from space_smoke.capabilities import (
     DurableLifecycleSandbox,
     EcwCreateAttempt,
     EcwCreateNotDelivered,
+    EcwForkResult,
     EcwLifecycle,
     EcwSandbox,
     EcwSandboxDeleteRetryable,
@@ -735,45 +736,57 @@ class _ScenarioSandboxes:
         return observed
 
     def fork(
-        self, source: EcwSandbox, *, idempotency_key: str | None = None
-    ) -> EcwSandbox:
+        self,
+        source: EcwSandbox,
+        *,
+        idempotency_key: str | None = None,
+        timeout: int | None = None,
+    ) -> EcwForkResult:
         """Track a fork before attaching its data plane, including replayed children."""
 
         if source not in self._created:
             raise SmokeConfigurationError("fork source must belong to this scenario")
         forkable = cast(ForkableSandbox, source)
+        key = idempotency_key or f"space-smoke-fork-{secrets.token_hex(16)}"
+        lifetime = self._timeout if timeout is None else timeout
         child_ids: list[str] = []
 
+        def record_child(response: Mapping[str, Any]) -> None:
+            child_id = str(response["sandboxID"])
+            self._context.verify(
+                child_id != source.sandbox_id,
+                "fork returned the source sandbox instead of a new identity",
+                fork_source_id=source.sandbox_id,
+                fork_child_id=child_id,
+            )
+            with self._fork_lock:
+                if child_id in self._fork_children:
+                    compensation.disarm()
+                else:
+                    self._fork_children.add(child_id)
+                    child_ids.append(child_id)
+                    sandbox_ids = self._context.evidence.setdefault("sandbox_ids", [])
+                    assert isinstance(sandbox_ids, list)
+                    sandbox_ids.append(child_id)
+
         def cleanup() -> None:
+            if not child_ids:
+                # Replay the original operation, never create a replacement.
+                # Child expiry inherits the source's lifecycle and may pause.
+                record_child(forkable.fork_response(timeout=lifetime, idempotency_key=key))
             for child_id in child_ids:
                 retry_sandbox_delete(lambda: forkable.delete_forked(child_id))
                 if self._after_teardown_delete is not None:
                     self._after_teardown_delete(child_id)
 
-        # Arm before dispatch; a lost reply is additionally bounded by the
-        # fork's kill-on-timeout lifecycle. A client construction failure must
-        # not leak a child whose identity is already known.
+        # A lost response still leaves an operation recoverable by this key.
+        # Record its child before SDK construction, which can also fail.
         compensation = self._context.scope.defer("delete fork child", cleanup, critical=True)
-        response = forkable.fork_response(timeout=self._timeout, idempotency_key=idempotency_key)
-        child_id = str(response["sandboxID"])
-        self._context.verify(
-            child_id != source.sandbox_id,
-            "fork returned the source sandbox instead of a new identity",
-            fork_source_id=source.sandbox_id,
-            fork_child_id=child_id,
-        )
-        with self._fork_lock:
-            if child_id in self._fork_children:
-                compensation.disarm()
-            else:
-                self._fork_children.add(child_id)
-                child_ids.append(child_id)
-                sandbox_ids = self._context.evidence.setdefault("sandbox_ids", [])
-                assert isinstance(sandbox_ids, list)
-                sandbox_ids.append(child_id)
+        response = forkable.fork_response(timeout=lifetime, idempotency_key=key)
+        record_child(response)
         child = self._ecw.attach_fork(response)
         self._created.append(child)
-        return child
+        return EcwForkResult(child, response)
 
     def _create_metadata(
         self,

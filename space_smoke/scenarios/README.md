@@ -31,7 +31,8 @@ The typed suite owns the public fork smoke coverage:
 - `local.fork_suspended_cross_node`: suspend and wait for the durable snapshot,
   cordon the source worker, fork onto another worker, and verify the source
   stays suspended and restores with its original data. Kind-only; the cordon
-  is undone before scenario cleanup.
+  is undone before scenario cleanup. This proves off-source placement and
+  disk isolation, not the provenance of the bytes fetched during restore.
 
 These replace `scripts/tests/smoke-kind-sandbox-fork.py`. Run an individual
 scenario with `uv run --frozen --python 3.11 -m space_smoke run <scenario-id>`
@@ -39,8 +40,14 @@ against a configured bench. Kind CI discovers them through the existing
 `--all` inventory and distributes them across its four isolated shards; no
 additional runner or cluster bootstrap is introduced. Together they create
 three sources and four distinct children, with concurrency capped at two fork
-requests per scenario. All children have cleanup registered before dispatch
-and a bounded kill-on-timeout lifetime if a response is lost.
+requests per scenario. Child cleanup is registered before dispatch with the
+same idempotency key used for the request. If the reply is lost, cleanup
+replays that key to recover and delete the child; replayed children share one
+cleanup owner. Cleanup failures are reported, not treated as passes. A child
+inherits its source's timeout action, so expiry is not a deletion backstop.
+Admission 503s retry the same key at most three times within one request
+budget. Concurrent and completed replay compare the entire public result,
+including the credentials, without writing those credentials into evidence.
 
 Scenario phase timings report runtime without a flaky latency assertion.
 The fork shard-duration hints use local seed measurements; refresh them from

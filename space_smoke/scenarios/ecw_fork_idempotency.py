@@ -5,7 +5,7 @@ import secrets
 from threading import Barrier
 
 import space_smoke as smoke
-from space_smoke.capabilities import EcwSandbox
+from space_smoke.capabilities import EcwForkResult
 
 PATH = "/tmp/space-smoke-fork-replay.txt"
 
@@ -19,25 +19,25 @@ def fork_idempotency(test: smoke.Ecw) -> None:
         test.sandbox.files.write(PATH, "source")
         gate = Barrier(2, timeout=10)
 
-        def fork(_index: int) -> EcwSandbox:
+        def fork(_index: int) -> EcwForkResult:
             gate.wait()
             return test.sandboxes.fork(test.sandbox, idempotency_key=key)
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             first, concurrent = executor.map(fork, range(2))
         test.verify(
-            first.sandbox_id == concurrent.sandbox_id,
-            "same-key concurrent forks created different children",
+            first.response == concurrent.response,
+            "same-key concurrent forks returned different public results",
         )
-        test.verify(first.files.read(PATH) == "source", "fork lost the source disk state")
-        test.verify(concurrent.files.read(PATH) == "source", "concurrent fork is inaccessible")
+        test.verify(first.sandbox.files.read(PATH) == "source", "fork lost the source disk state")
+        test.verify(concurrent.sandbox.files.read(PATH) == "source", "concurrent fork is inaccessible")
 
     with test.phase("replay after child and source have both changed"):
-        first.files.write(PATH, "child-after-fork")
+        first.sandbox.files.write(PATH, "child-after-fork")
         test.sandbox.files.write(PATH, "source-after-fork")
         replay = test.sandboxes.fork(test.sandbox, idempotency_key=key)
-        test.verify(replay.sandbox_id == first.sandbox_id, "completed replay created another child")
+        test.verify(replay.response == first.response, "completed replay changed the public result")
         test.verify(
-            replay.files.read(PATH) == "child-after-fork",
+            replay.sandbox.files.read(PATH) == "child-after-fork",
             "completed replay recaptured the source or reset the existing child",
         )
