@@ -10,6 +10,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use axum::Extension;
 use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, Path, State};
@@ -31,6 +32,7 @@ use pplx_space_common_core::types::cluster::process_cluster_id;
 use pplx_space_common_core::types::{NodeId, OrgId, ProcessId, SandboxId, SimpleDuration};
 use pplx_space_common_svc::bearer_token::{SpaceBearerToken, insert_space_bearer_token};
 use pplx_space_common_svc::bootstrap::{GrpcClientTrace, wrap_grpc_client_channel};
+use pplx_space_common_svc::space_api_route_ed25519::SpaceApiRouteEd25519Verifier;
 use pplx_space_common_svc::{HttpServerMakeSpan, HttpSpanMetadata};
 use pplx_space_feature_flags::{
     Attributes, FeatureFlagClient, SPACE_CLUSTER_API_CLIENT_SIDE_BALANCING_FLAG,
@@ -195,6 +197,9 @@ fn record_ecw_backend_rpc_latency(
 #[derive(Debug, Clone)]
 pub struct DataPlaneConfig {
     pub listen: String,
+    /// A second listener for in-cluster callers, which public ingress must
+    /// not route to. Only requests on it may carry a route handover.
+    pub internal_listen: Option<String>,
     pub attach_deadline: Duration,
     pub unauthenticated_upgrade_cap_per_ip: usize,
     pub max_attached_streams: usize,
@@ -228,6 +233,7 @@ impl Default for DataPlaneConfig {
             route_cache_ttl: Duration::from_millis(DEFAULT_ROUTE_CACHE_TTL_MS),
             upload_admission: None,
             shutdown_grace: None,
+            internal_listen: None,
         }
     }
 }
@@ -261,6 +267,9 @@ struct DataPlaneState {
     /// would be cancelled by the very signal the drain outlives.
     stream_shutdown_token: CancellationToken,
     upgrade_tasks: TaskTracker,
+    /// Verifies routes the API hands over on the internal listener; `None`
+    /// resolves every route.
+    route_handover: Option<Arc<SpaceApiRouteEd25519Verifier>>,
 }
 
 #[derive(Clone)]
@@ -418,8 +427,32 @@ pub async fn run(
         drain_started,
         stream_shutdown_token: stream_shutdown_token.clone(),
         upgrade_tasks: upgrade_tasks.clone(),
+        route_handover: config
+            .internal_listen
+            .as_ref()
+            .and_then(|_| route_handover_verifier()),
     };
 
+    let internal = match &config.internal_listen {
+        Some(listen) => {
+            let listener = tokio::net::TcpListener::bind(listen)
+                .await
+                .map_err(|source| RunDataPlaneError::Bind {
+                    listen: listen.clone(),
+                    source,
+                })?;
+            tracing::info!(
+                listen = %listen,
+                route_handover = state.route_handover.is_some(),
+                "space-data-plane-svc internal listener"
+            );
+            Some((
+                pplx_space_common_svc::http_listener::nodelay(listener),
+                router(state.clone()).layer(Extension(native::InternalListener)),
+            ))
+        }
+        None => None,
+    };
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
@@ -432,6 +465,7 @@ pub async fn run(
     serve_and_drain(
         pplx_space_common_svc::http_listener::nodelay(listener),
         app,
+        internal,
         DrainLifecycle {
             shutdown_token,
             stream_shutdown_token,
@@ -443,6 +477,22 @@ pub async fn run(
     )
     .await
     .map_err(RunDataPlaneError::Serve)
+}
+
+/// Route handovers verify against the keys nodes use for route tokens. Without
+/// them, every route is resolved.
+fn route_handover_verifier() -> Option<Arc<SpaceApiRouteEd25519Verifier>> {
+    match pplx_space_common_svc::space_api_route_ed25519::load_space_api_route_ed25519_verification_bundle() {
+        Ok(Some(bundle)) => Some(Arc::new(bundle.into_verifier())),
+        Ok(None) => {
+            tracing::warn!("no route verification keys configured; route handovers are disabled");
+            None
+        }
+        Err(error) => {
+            tracing::warn!(%error, "route verification keys are invalid; route handovers are disabled");
+            None
+        }
+    }
 }
 
 async fn connect_cluster_api_clients_for_startup(

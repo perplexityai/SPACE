@@ -53,6 +53,11 @@ struct Cli {
     #[arg(long, default_value = DEFAULT_LISTEN)]
     listen: String,
 
+    /// Listen address for in-cluster callers. Keep it off public ingress:
+    /// requests on it may skip route resolution with a route handover.
+    #[arg(long, env = "SPACE_DATA_PLANE_INTERNAL_LISTEN")]
+    internal_listen: Option<String>,
+
     /// First-frame attach deadline for upgraded sockets without a header token.
     #[arg(long, default_value_t = DEFAULT_ATTACH_DEADLINE_MS)]
     attach_deadline_ms: u64,
@@ -141,6 +146,9 @@ impl From<Cli> for DataPlaneConfig {
     fn from(cli: Cli) -> Self {
         Self {
             listen: cli.listen,
+            internal_listen: cli
+                .internal_listen
+                .filter(|listen| !listen.trim().is_empty()),
             attach_deadline: Duration::from_millis(cli.attach_deadline_ms),
             unauthenticated_upgrade_cap_per_ip: cli.unauthenticated_upgrade_cap_per_ip,
             max_attached_streams: cli.max_attached_streams,

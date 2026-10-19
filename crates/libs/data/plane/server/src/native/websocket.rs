@@ -7,6 +7,7 @@ pub(crate) async fn attach_session(
     State(state): State<DataPlaneState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(session_id): Path<String>,
+    internal_listener: Option<Extension<InternalListener>>,
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
     uri: axum::http::Uri,
@@ -16,6 +17,11 @@ pub(crate) async fn attach_session(
         .parse::<DataPlaneSessionId>()
         .map_err(|_| AttachError::BadRequest("invalid session id"))?;
     let header_token = token_from_headers(&headers)?;
+    // A handover vouches for the token it was minted for, so it only rides
+    // along with a header token, never a first-frame one.
+    let handover = header_token.as_ref().and_then(|_| {
+        OfferedRouteHandover::from_request(&headers, internal_listener.map(|Extension(l)| l))
+    });
     if state.drain_started.is_cancelled() {
         return Ok(native_draining_response(session_id.kind().as_str()));
     }
@@ -25,7 +31,7 @@ pub(crate) async fn attach_session(
     let task = state.upgrade_tasks.token();
     Ok(upgrade.on_upgrade(move |socket| async move {
         let _task = task;
-        handle_socket(state, peer.ip(), session_id, header_token, socket).await;
+        handle_socket(state, peer.ip(), session_id, header_token, handover, socket).await;
     }))
 }
 
@@ -34,6 +40,7 @@ pub(crate) async fn handle_socket(
     source_ip: IpAddr,
     session_id: DataPlaneSessionId,
     header_token: Option<String>,
+    handover: Option<OfferedRouteHandover>,
     mut socket: WebSocket,
 ) {
     let Ok(_guard) = state.unauthenticated.try_register(source_ip) else {
@@ -57,7 +64,7 @@ pub(crate) async fn handle_socket(
     let attached = tokio::select! {
         biased;
         () = state.drain_started.cancelled() => None,
-        attached = authenticate_native_socket(&state, session_id, header_token, &mut socket) => {
+        attached = authenticate_native_socket(&state, session_id, header_token, handover, &mut socket) => {
             match attached {
                 Some(attached) => Some(attached),
                 None => return,
@@ -121,6 +128,7 @@ pub(super) async fn authenticate_native_socket(
     state: &DataPlaneState,
     session_id: DataPlaneSessionId,
     header_token: Option<String>,
+    handover: Option<OfferedRouteHandover>,
     socket: &mut WebSocket,
 ) -> Option<AttachedSession> {
     let token = match header_token {
@@ -136,20 +144,21 @@ pub(super) async fn authenticate_native_socket(
         },
     };
 
-    let attached = match resolve_session_route(state, session_id, &token).await {
-        Ok(attached) => attached,
-        Err(error) => {
-            pplx_space_metrics::data_plane::attach(
-                session_id.kind().as_str(),
-                error.metric_label(),
-            );
-            let _ = socket
-                .send(Message::Text(error_json(error.frame_code()).into()))
-                .await;
-            let _ = socket.close().await;
-            return None;
-        }
-    };
+    let attached =
+        match resolve_session_route_with_handover(state, session_id, &token, handover).await {
+            Ok(attached) => attached,
+            Err(error) => {
+                pplx_space_metrics::data_plane::attach(
+                    session_id.kind().as_str(),
+                    error.metric_label(),
+                );
+                let _ = socket
+                    .send(Message::Text(error_json(error.frame_code()).into()))
+                    .await;
+                let _ = socket.close().await;
+                return None;
+            }
+        };
     Some(attached)
 }
 

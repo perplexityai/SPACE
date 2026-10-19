@@ -5,6 +5,7 @@ use super::*;
 pub(crate) async fn session_events(
     State(state): State<DataPlaneState>,
     Path(session_id): Path<String>,
+    internal_listener: Option<Extension<InternalListener>>,
     headers: HeaderMap,
     uri: Uri,
 ) -> Response {
@@ -68,16 +69,19 @@ pub(crate) async fn session_events(
         }
     };
 
-    let attached = match resolve_session_route(&state, session_id, &token).await {
-        Ok(attached) => attached,
-        Err(error) => {
-            pplx_space_metrics::data_plane::attach(
-                session_id.kind().as_str(),
-                error.metric_label(),
-            );
-            return route_resolution_http_error(error);
-        }
-    };
+    let handover =
+        OfferedRouteHandover::from_request(&headers, internal_listener.map(|Extension(l)| l));
+    let attached =
+        match resolve_session_route_with_handover(&state, session_id, &token, handover).await {
+            Ok(attached) => attached,
+            Err(error) => {
+                pplx_space_metrics::data_plane::attach(
+                    session_id.kind().as_str(),
+                    error.metric_label(),
+                );
+                return route_resolution_http_error(error);
+            }
+        };
     // Again after the route lookup: SIGTERM may have landed while it ran.
     if state.drain_started.is_cancelled() {
         return native_draining_response(session_id.kind().as_str());
