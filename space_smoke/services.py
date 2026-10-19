@@ -11,6 +11,7 @@ import uuid
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from functools import partial
+from threading import Lock
 from typing import Any, Protocol, TypeVar, cast
 
 from space_smoke.adapters import (
@@ -32,6 +33,7 @@ from space_smoke.capabilities import (
     EcwSandboxDeleteRetryable,
     EcwSandboxes,
     EcwSandboxPages,
+    ForkableSandbox,
     EncryptedResuspendControl,
     KindEnvironment,
     NetworkConfig,
@@ -660,6 +662,8 @@ class _ScenarioSandboxes:
             "space_smoke_run": uuid.uuid4().hex,
         }
         self._created: list[EcwSandbox] = []
+        self._fork_children: set[str] = set()
+        self._fork_lock = Lock()
 
     @property
     def items(self) -> tuple[EcwSandbox, ...]:
@@ -729,6 +733,47 @@ class _ScenarioSandboxes:
             assert isinstance(sandbox_ids, list)
             sandbox_ids.append(observed.sandbox_id)
         return observed
+
+    def fork(
+        self, source: EcwSandbox, *, idempotency_key: str | None = None
+    ) -> EcwSandbox:
+        """Track a fork before attaching its data plane, including replayed children."""
+
+        if source not in self._created:
+            raise SmokeConfigurationError("fork source must belong to this scenario")
+        forkable = cast(ForkableSandbox, source)
+        child_ids: list[str] = []
+
+        def cleanup() -> None:
+            for child_id in child_ids:
+                retry_sandbox_delete(lambda: forkable.delete_forked(child_id))
+                if self._after_teardown_delete is not None:
+                    self._after_teardown_delete(child_id)
+
+        # Arm before dispatch; a lost reply is additionally bounded by the
+        # fork's kill-on-timeout lifecycle. A client construction failure must
+        # not leak a child whose identity is already known.
+        compensation = self._context.scope.defer("delete fork child", cleanup, critical=True)
+        response = forkable.fork_response(timeout=self._timeout, idempotency_key=idempotency_key)
+        child_id = str(response["sandboxID"])
+        self._context.verify(
+            child_id != source.sandbox_id,
+            "fork returned the source sandbox instead of a new identity",
+            fork_source_id=source.sandbox_id,
+            fork_child_id=child_id,
+        )
+        with self._fork_lock:
+            if child_id in self._fork_children:
+                compensation.disarm()
+            else:
+                self._fork_children.add(child_id)
+                child_ids.append(child_id)
+                sandbox_ids = self._context.evidence.setdefault("sandbox_ids", [])
+                assert isinstance(sandbox_ids, list)
+                sandbox_ids.append(child_id)
+        child = self._ecw.attach_fork(response)
+        self._created.append(child)
+        return child
 
     def _create_metadata(
         self,

@@ -978,6 +978,12 @@ class ForkableSandbox(Protocol):
         """Fork the sandbox once; returns the child sandbox id. Synchronous."""
         ...
 
+    def fork_response(
+        self, *, timeout: int, idempotency_key: str | None = None
+    ) -> Mapping[str, Any]:
+        """The public fork result, including child data-plane credentials."""
+        ...
+
     def delete_forked(self, child_id: str) -> None:
         """Delete one fork child through the public route; idempotent on 404."""
         ...
@@ -1024,6 +1030,10 @@ class EcwSandbox(ProcessSandbox, Protocol):
 
 
 class EcwSandboxes(Protocol):
+    def attach_fork(self, response: Mapping[str, Any]) -> EcwSandbox:
+        """Construct a client from a fork response without waking the child."""
+        ...
+
     def create(
         self,
         *,
@@ -1068,6 +1078,10 @@ class EcwScenarioSandboxes(Protocol):
     def items(self) -> tuple[EcwSandbox, ...]: ...
 
     def create(self, metadata: Mapping[str, str] | None = None) -> EcwSandbox: ...
+
+    def fork(
+        self, source: EcwSandbox, *, idempotency_key: str | None = None
+    ) -> EcwSandbox: ...
 
     def attempt_create(
         self,

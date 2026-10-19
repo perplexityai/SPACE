@@ -825,6 +825,13 @@ class EcwSandboxCollection(SandboxCollection):
                 network=network,
             )
 
+    def fork(
+        self, source: EcwSandbox, *, idempotency_key: str | None = None
+    ) -> EcwSandbox:
+        """Fork a run-owned source with child cleanup armed before dispatch."""
+
+        return self._sandboxes.fork(source, idempotency_key=idempotency_key)
+
 
 @dataclass(frozen=True)
 class CommandSandboxFixture:
@@ -4776,16 +4783,15 @@ class CrossNodeRestoreAssertions:
         # Lower bound for the failure-evidence log read.
         self._since_time = _log_since_time()
 
-    def current_placement(self) -> SandboxPodPlacement:
+    def current_placement(self, sandbox: CommandSandbox | None = None) -> SandboxPodPlacement:
         """The running sandbox's bound kube node; fails if it is not placed."""
 
-        placement = self._control.sandbox_pod_placement(
-            self._fixture.sandbox.sandbox_id
-        )
+        sandbox_id = (sandbox or self._fixture.sandbox).sandbox_id
+        placement = self._control.sandbox_pod_placement(sandbox_id)
         self._fixture.verify(
             placement is not None,
             "sandbox has no single bound execution pod to read placement from",
-            sandbox_id=self._fixture.sandbox.sandbox_id,
+            sandbox_id=sandbox_id,
         )
         assert placement is not None
         return placement

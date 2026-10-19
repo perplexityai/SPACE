@@ -6133,13 +6133,18 @@ class _SdkSandbox:
         return _race_request(request, timeout=timeout, gate=gate)
 
     def fork(self, *, timeout: int = 600) -> str:
+        return str(self.fork_response(timeout=timeout)["sandboxID"])
+
+    def fork_response(
+        self, *, timeout: int, idempotency_key: str | None = None
+    ) -> Mapping[str, Any]:
         # The server accepts exactly one child per request today.
         results = _ecw_control_plane_json(
             self._config,
             "POST",
             f"/sandboxes/{quote(self.sandbox_id, safe='')}/fork",
             body={"count": 1, "timeout": timeout},
-            idempotency_key=f"space-smoke-fork-{secrets.token_hex(8)}",
+            idempotency_key=idempotency_key or f"space-smoke-fork-{secrets.token_hex(8)}",
             expected_status=201,
             timeout=timeout + 60,
         )
@@ -6148,7 +6153,7 @@ class _SdkSandbox:
         (result,) = results
         if not isinstance(result, dict) or "error" in result or "sandboxID" not in result:
             raise RuntimeError(f"fork result is not a child sandbox: {result!r}")
-        return _ecw_sandbox_id(str(result["sandboxID"]))
+        return {**result, "sandboxID": _ecw_sandbox_id(str(result["sandboxID"]))}
 
     def delete_forked(self, child_id: str) -> None:
         # Same lifecycle classification as `_kill_with_sdk`, so the fixture's
@@ -6577,6 +6582,30 @@ def _is_temporary_dns_connect_error(error: BaseException) -> bool:
 class EcwSdk:
     def __init__(self, config: EcwConfig) -> None:
         self.config = config
+
+    def attach_fork(self, response: Mapping[str, Any]) -> EcwSandbox:
+        # SDK connect can wake a stopped child and mask a broken fork startup.
+        # Use only the identity and credentials the fork itself returned.
+        sandbox_type = importlib.import_module("e2b").Sandbox
+        connection_config_type = importlib.import_module("e2b.connection_config").ConnectionConfig
+        version_type = importlib.import_module("packaging.version").Version
+        sandbox_headers = {
+            "E2b-Sandbox-Id": response["sandboxID"],
+            "E2b-Sandbox-Port": str(connection_config_type.envd_port),
+        }
+        if response.get("envdAccessToken") is not None:
+            sandbox_headers["X-Access-Token"] = response["envdAccessToken"]
+        sandbox = sandbox_type(
+            sandbox_id=response["sandboxID"],
+            sandbox_domain=response.get("domain"),
+            envd_version=version_type(response["envdVersion"]),
+            envd_access_token=response.get("envdAccessToken"),
+            traffic_access_token=response.get("trafficAccessToken"),
+            connection_config=connection_config_type(
+                extra_sandbox_headers=sandbox_headers, **self.config.sdk_options()
+            ),
+        )
+        return _SdkSandbox(sandbox, self.config)
 
     def create(
         self,
