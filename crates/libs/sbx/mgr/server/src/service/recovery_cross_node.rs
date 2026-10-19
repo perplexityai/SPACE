@@ -1857,6 +1857,18 @@ impl SandboxManagerService {
                     error = %e,
                     "cross-node restore found a corrupt snapshot stream; quarantined for repair"
                 );
+                // Nothing retries from the downloaded copy, and cache cleanup
+                // leaves quarantined rows alone, so a stream of tens of
+                // gigabytes would stay until the row is repaired or deleted.
+                // Object storage keeps the original. A scoped restore's staging
+                // belongs to its transfer scope's owner instead.
+                if staged.transfer_scope_id.is_none() {
+                    super::spaced_bridge::cleanup_restored_snapshot_dir_async(
+                        &canonical_id,
+                        &staged.snapshot_dir.to_string_lossy(),
+                        &self.node_manager,
+                    );
+                }
             } else {
                 tracing::info!(
                     sandbox_id = %canonical_id,
