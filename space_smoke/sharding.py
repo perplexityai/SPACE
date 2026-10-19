@@ -110,6 +110,9 @@ _DURATION_SECONDS = {
         # Estimate until a bench run refreshes it: two encrypted suspend and
         # restore cycles, each waiting for its upload and pod retirement.
         "native.encrypted_double_restore_retires_prior_pods": 90,
+        # Local Kind runs, with the generator image present or pulled from
+        # Docker Hub: 15-18 s, of which SDK generation is 2-5 s.
+        "native.m1_generated_sdk_conformance": 20,
         "native.resident_pause": 5,
         "native_contract.command_validation": 6,
         "native_contract.idempotency_conflict": 5,

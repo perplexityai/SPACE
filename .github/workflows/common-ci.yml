@@ -543,8 +543,9 @@ jobs:
       # The Rust tests' M1 SDK check runs the OpenAPI generator from Docker Hub,
       # whose anonymous pull limit these runners also share. Pull its
       # linux/amd64 image from the mirror as well. The check runs that copy when
-      # this daemon has it (SPACE_M1_GENERATOR_MIRROR below) and otherwise pulls
-      # from Docker Hub as before; see scripts/check-m1-sdk-generation.sh.
+      # this daemon has it (SPACE_M1_GENERATOR_MIRROR below), and otherwise
+      # tries the mirror itself and then Docker Hub; see
+      # scripts/check-m1-sdk-generation.sh.
       - name: Start pulling the M1 SDK generator's image
         if: matrix.name == 'Rust tests'
         env:

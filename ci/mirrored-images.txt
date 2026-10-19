@@ -29,8 +29,10 @@
 public.ecr.aws/docker/library/postgres:16-alpine    sha256:1a66d744c1b459e13b05a8fca341da84cb63383e99ce262210efee5a319d4551 ghcr.io/perplexityai/space-ci-mirror:postgres-16-alpine docker.io/library/postgres
 public.ecr.aws/docker/library/redis:5.0             sha256:0b2348685ec7cffd590b2d6bdc6d35ffbfd7f0cef90b5fe91591f40418aa0d94 ghcr.io/perplexityai/space-ci-mirror:redis-5.0 docker.io/library/redis
 
-# Generator of the Rust tests' M1 SDK check. scripts/check-m1-sdk-generation.sh
-# pins the index without its tag and runs this copy by its own digest.
+# Generator of the M1 SDK check (the Rust tests and the Kind typed smoke's
+# native.m1_generated_sdk_conformance). scripts/check-m1-sdk-generation.sh
+# pins the index without its tag and runs this copy by its own digest,
+# pulling it from the mirror itself while this line pairs the two.
 openapitools/openapi-generator-cli:v7.25.0@sha256:2ab0a9680222de65dc9d3baf861aa02b99e1b80c211d8221ebf3ae8f8a102524 sha256:d859876eefb0c9ac2b2aac9935a1ff775e6a8af0da175d2a159b05811deff32f ghcr.io/perplexityai/space-ci-mirror:openapi-generator-cli-v7.25.0
 
 # Bases of docker/Dockerfile.* (Artifact CI and the Kind image builds).

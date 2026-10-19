@@ -253,11 +253,15 @@ jobs:
       # logged in as. Two local scenarios need the aws CLI. `all` runs the inventory on the
       # ECW API surface and then the native-capable scenarios on the native /v1 surface, and
       # exits nonzero if either pass did; that second pass is the only typed coverage of the
-      # native API.
+      # native API. native.m1_generated_sdk_conformance generates the M1 SDK with the pinned
+      # OpenAPI Generator; SPACE_M1_GENERATOR_MIRROR makes scripts/check-m1-sdk-generation.sh
+      # pull that image from the GHCR mirror (ci/mirrored-images.txt) this job logged in to,
+      # falling back to Docker Hub.
       - name: Run this shard of the typed Kind smoke
         env:
           SKIP_BOOTSTRAP: "1"
           SMOKE_SHARD: ${{ matrix.shard }}/4
+          SPACE_M1_GENERATOR_MIRROR: ghcr.io/perplexityai/space-ci-mirror
           SPACE_SMOKE_KIND_ADMIN_TOKEN_FILE: ${{ runner.temp }}/space-smoke-admin-token
           SPACE_SMOKE_KIND_COLD_RECEIPTS: ${{ runner.temp }}/space-smoke-cold-receipts
         run: |

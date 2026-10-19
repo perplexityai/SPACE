@@ -49,6 +49,8 @@ on:
       - shim/telemetry*.go
       - shim/tracing*.go
       - ci/mirrored-images.txt
+      # Generates the SDK native.m1_generated_sdk_conformance drives.
+      - scripts/check-m1-sdk-generation.sh
 
 # Includes same-repository PRs: no package write token. The read token reaches
 # the third-party image mirror and the main-produced layer cache; once both

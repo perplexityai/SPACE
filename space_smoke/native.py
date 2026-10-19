@@ -33,6 +33,23 @@ class _NativeTerminalState(RuntimeError):
         self.payload = payload
 
 
+def is_suspend_upload_conflict(operation: Mapping[str, object]) -> bool:
+    """Whether a delete operation failed only because a suspend's snapshot
+    upload is still in flight, which a fresh DELETE retries once it finalizes."""
+
+    detail = operation.get("terminal_error")
+    return (
+        operation.get("state") == "failed"
+        and operation.get("terminal_error_code") == "conflict"
+        and isinstance(detail, dict)
+        and detail.get("message")
+        == (
+            "sandbox has a suspend-snapshot upload in flight; "
+            "retry the DELETE after the snapshot finalizes"
+        )
+    )
+
+
 class _NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, *_args: object, **_kwargs: object) -> None:
         return None
@@ -147,17 +164,7 @@ class NativeSandboxFactory:
                 )
                 return
             except _NativeTerminalState as error:
-                detail = error.payload.get("terminal_error")
-                if not (
-                    error.payload.get("state") == "failed"
-                    and error.payload.get("terminal_error_code") == "conflict"
-                    and isinstance(detail, dict)
-                    and detail.get("message")
-                    == (
-                        "sandbox has a suspend-snapshot upload in flight; "
-                        "retry the DELETE after the snapshot finalizes"
-                    )
-                ):
+                if not is_suspend_upload_conflict(error.payload):
                     raise
                 # The failed operation is immutable. Submit a fresh idempotency
                 # key after the upload advances, retaining the original deadline.

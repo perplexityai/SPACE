@@ -6,6 +6,12 @@ dependencies = [
     "e2b==2.21.1",
     "opentelemetry-exporter-otlp-proto-grpc==1.44.0",
     "opentelemetry-sdk==1.44.0",
+    # The runtime dependencies of the SDK native.m1_generated_sdk_conformance
+    # generates (space_smoke/m1_conformance.py), within the generator's bounds.
+    "pydantic==2.14.1",
+    "python-dateutil==2.9.0.post0",
+    "typing-extensions==4.16.0",
+    "urllib3==2.8.0",
 ]
 
 [[tool.uv.index]]
