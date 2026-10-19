@@ -44,6 +44,7 @@ mod upstream;
 
 use crate::egress::{AdmittedTcp, TcpAdmissionDenial};
 pub use pplx_space_net_gateway_client::TcpDomainAuthorizationMode;
+pub(crate) use relay::{RelayFault, Side as RelaySide};
 
 pub struct TcpProxyConfig {
     pub sandbox_id: &'static str,
@@ -202,7 +203,7 @@ impl FlowOutcome {
             Self::RelayFailed(RelayFailure::Inspected(_)) => ("relay_failed", "inspected_http"),
             Self::RelayFailed(RelayFailure::Connect(_)) => ("relay_failed", "connect"),
             Self::RelayFailed(RelayFailure::Plaintext(error)) => ("relay_failed", error.reason()),
-            Self::RelayFailed(RelayFailure::Transfer(_)) => ("relay_failed", "transfer"),
+            Self::RelayFailed(RelayFailure::Transfer { .. }) => ("relay_failed", "transfer"),
         }
     }
 
@@ -211,7 +212,7 @@ impl FlowOutcome {
             Self::RelayFailed(RelayFailure::Connect(error)) => {
                 Some(format!("upstream_connect: {error}").into())
             }
-            Self::RelayFailed(RelayFailure::Transfer(error)) => {
+            Self::RelayFailed(RelayFailure::Transfer { error, .. }) => {
                 Some(format!("transfer: {:?}: {error}", error.kind()).into())
             }
             Self::Rejected(_) | Self::RelayFailed(_) => Some(self.metric_tags().1.into()),
@@ -237,7 +238,12 @@ enum RelayFailure {
     Connect(transport::Error),
     Plaintext(http_host::Failure),
     /// Connected, then the byte stream failed (e.g. reset, broken pipe).
-    Transfer(io::Error),
+    Transfer {
+        error: io::Error,
+        /// The first relay leg and operation that failed, which is not
+        /// necessarily the peer that caused the failure.
+        fault: Option<RelayFault>,
+    },
     Inspected(tls_http::HttpError),
 }
 
@@ -592,7 +598,10 @@ impl TcpProxy {
                 wire_tx: report.written.0,
                 wire_rx: report.written.1,
             }),
-            Err(relay::Error::Io(error)) => FlowOutcome::RelayFailed(RelayFailure::Transfer(error)),
+            Err(relay::Error::Io(error)) => FlowOutcome::RelayFailed(RelayFailure::Transfer {
+                error,
+                fault: report.fault,
+            }),
             Err(relay::Error::Cancelled | relay::Error::Idle) => FlowOutcome::Cancelled,
         }
     }
@@ -625,19 +634,15 @@ impl TcpProxy {
     fn record(&self, dst: SocketAddr, host: Option<&DomainName>, outcome: FlowOutcome) -> bool {
         let (status, detail) = outcome.metric_tags();
         pplx_space_metrics::gateway::tcp_connection(status, detail);
-        let reported = if let (Some(host), Some(reason)) = (host, outcome.failure_reason()) {
-            self.known_egress_state
-                .report_tcp_failure(self.sandbox_id, dst, host, reason.as_ref())
-        } else {
-            false
-        };
+        let reported = host.is_some_and(|host| self.report_known_egress(dst, host, &outcome));
 
         match outcome {
             // These phases have no branch-specific telemetry beyond the
             // terminal connection metric emitted above.
             FlowOutcome::Cancelled
             | FlowOutcome::InspectedTls
-            | FlowOutcome::RelayFailed(RelayFailure::Connect(_) | RelayFailure::Transfer(_)) => {}
+            | FlowOutcome::RelayFailed(RelayFailure::Connect(_) | RelayFailure::Transfer { .. }) => {
+            }
             FlowOutcome::RelayFailed(RelayFailure::Inspected(error)) => {
                 pplx_space_metrics::gateway::domain_binding(
                     "tcp",
@@ -768,6 +773,32 @@ impl TcpProxy {
             }
         }
         reported
+    }
+
+    fn report_known_egress(
+        &self,
+        dst: SocketAddr,
+        host: &DomainName,
+        outcome: &FlowOutcome,
+    ) -> bool {
+        let Some(reason) = outcome.failure_reason() else {
+            return false;
+        };
+        let FlowOutcome::RelayFailed(RelayFailure::Transfer { fault, .. }) = outcome else {
+            return self.known_egress_state.report_tcp_failure(
+                self.sandbox_id,
+                dst,
+                host,
+                reason.as_ref(),
+            );
+        };
+        self.known_egress_state.report_tcp_transfer_failure(
+            self.sandbox_id,
+            dst,
+            host,
+            *fault,
+            reason.as_ref(),
+        )
     }
 }
 

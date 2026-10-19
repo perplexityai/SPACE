@@ -583,6 +583,46 @@ that fallback, preserving the historical Datadog-default behavior while allowing
 later OTLP initialization. Legacy is a migration bridge for production Datadog
 continuity; remove it after native Datadog consumers migrate.
 
+## Net-gateway TCP connections
+
+`gateway.tcp.connection` counts one point for every TCP connection that reaches
+the net-gateway's per-connection handler, tagged with `status` (`cancelled`,
+`rejected`, `relayed`, `handled` or `relay_failed`) and `detail`, the bounded
+detail within `status`, such as `connect` or `transfer` under `relay_failed`.
+
+### Known-egress logs
+
+The net-gateway names failed flows to the exact domains it was launched with
+(`--known-egress-domain`). A DNS query matches by its query name and a TCP flow
+by its TLS SNI, so only TLS flows whose SNI names a configured domain are logged.
+Plaintext and host-bound HTTP flows, and reserved DNS over TCP, carry no SNI:
+they are counted only by `gateway.tcp.connection`, not logged here. These
+events use the log target
+`pplx_space_net_gateway::known_egress` and carry `sandbox_id`,
+`original_dst_port`, `destination`, `protocol` and `reason`.
+
+- ERROR `failed to connect to known egress destination`: every failed matched
+  DNS query or TCP flow except a pass-through transfer failure. That covers
+  rejections and failed connects. It also covers inspected TLS/HTTP failures,
+  including those after the upstream connected.
+- INFO `known egress destination failed an established connection`: a
+  pass-through relay that connected and then failed first on the destination
+  leg, or without a recorded leg (`fault:relay_io`).
+- DEBUG `guest side failed an established known egress connection`: a
+  pass-through relay that connected and then failed first on the guest leg.
+  These events are visible only when the gateway's log filter enables DEBUG
+  for that target.
+
+The INFO and DEBUG events add `fault`: the first relay leg and socket operation
+that failed (`guest_read`, `guest_write`, `guest_flush`, `guest_shutdown`,
+`origin_read`, `origin_write`, `origin_flush` or `origin_shutdown`), or
+`relay_io` when no leg was recorded. That is the first failure the relay
+observed, not proof of which peer caused it: a destination that stalls can make
+the guest time out and reset, which reads as `guest_read`. Each of these
+failures is also counted by
+`gateway.tcp.connection{status:relay_failed,detail:transfer}`, so no log level
+is needed to count transfer failures.
+
 ## Firecracker and guest diagnostics
 
 Firecracker and the guest's spaced write nowhere a collector reads, so

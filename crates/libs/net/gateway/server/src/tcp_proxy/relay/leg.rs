@@ -15,7 +15,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// Which peer of a relay an observation came from.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::tcp_proxy) enum Side {
+pub(crate) enum Side {
     Guest,
     Origin,
 }
@@ -39,18 +39,17 @@ enum Operation {
 
 /// The first I/O failure in a relay, as a bounded `side_operation` label.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::tcp_proxy) struct RelayFault {
+pub(crate) struct RelayFault {
     side: Side,
     operation: Operation,
 }
 
 impl RelayFault {
-    #[cfg(test)]
-    pub(in crate::tcp_proxy) const fn side(self) -> Side {
+    pub(crate) const fn side(self) -> Side {
         self.side
     }
 
-    pub(in crate::tcp_proxy) const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match (self.side, self.operation) {
             (Side::Guest, Operation::Read) => "guest_read",
             (Side::Guest, Operation::Write) => "guest_write",
