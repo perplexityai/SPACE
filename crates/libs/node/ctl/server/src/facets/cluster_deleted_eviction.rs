@@ -147,6 +147,25 @@ pub(super) fn select_cluster_deleted_evict_candidates<'a>(
     candidates
 }
 
+/// Ids whose local presence the cluster's answer lets this node reclaim:
+/// every deleted id, plus superseded ids whose local row is `suspended`.
+/// A superseded sandbox lives on another node, and restores never read this
+/// node's copy again, so only its parked wake-cache copy is offered. Other
+/// local shapes of a live sandbox stay with their own recovery paths.
+pub(super) fn cluster_reclaimable_sandbox_ids(
+    deleted_sandbox_ids: Vec<String>,
+    superseded_sandbox_ids: Vec<String>,
+    local_states: &BTreeMap<String, SandboxInfo>,
+) -> Vec<String> {
+    use pplx_space_sbx_mgr_client::proto::SandboxLifecycleState;
+    let superseded = superseded_sandbox_ids.into_iter().filter(|sandbox_id| {
+        local_states.get(sandbox_id).is_some_and(|state| {
+            state.observed_lifecycle().ok() == Some(SandboxLifecycleState::Suspended)
+        })
+    });
+    deleted_sandbox_ids.into_iter().chain(superseded).collect()
+}
+
 /// The local row shapes a cluster-deleted report may reclaim: a
 /// stopped rootfs, a suspended wake-cache copy, a failed cross-node restore's retained
 /// `restoring` row (identified by any persisted `failure_reason`; a

@@ -112,6 +112,40 @@ fn local_state_with_owner(sandbox_id: &str, status: &str, owner: &str) -> (Strin
 }
 
 #[test]
+fn superseded_ids_are_reclaimable_only_for_a_parked_suspended_copy() {
+    // The cluster moved these sandboxes to another node. Only a parked
+    // `suspended` copy here is dead weight; any other local shape of a live
+    // sandbox stays with its own recovery path. Deleted ids pass through
+    // unchanged for the existing shape filter.
+    let deleted_id = "019e6370-cfc9-7a43-9337-399c7b51a1e0";
+    let suspended_id = "019e6370-cfc9-7a43-9337-399c7b51a1e1";
+    let stopped_id = "019e6370-cfc9-7a43-9337-399c7b51a1e2";
+    let started_id = "019e6370-cfc9-7a43-9337-399c7b51a1e3";
+    let absent_id = "019e6370-cfc9-7a43-9337-399c7b51a1e4";
+    let local_states = BTreeMap::from([
+        local_state(suspended_id, "suspended"),
+        local_state(stopped_id, "stopped"),
+        local_state(started_id, "started"),
+    ]);
+    let reclaimable = cluster_reclaimable_sandbox_ids(
+        vec![deleted_id.to_string()],
+        [suspended_id, stopped_id, started_id, absent_id]
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        &local_states,
+    );
+    assert_eq!(
+        reclaimable,
+        vec![deleted_id.to_string(), suspended_id.to_string()]
+    );
+    assert_eq!(
+        select_cluster_deleted_evict_candidates(&reclaimable, &local_states, 25, |_| false),
+        vec![suspended_id],
+    );
+}
+
+#[test]
 fn cluster_deleted_evict_selects_suspended_and_quarantined_but_not_started_or_absent() {
     // The first leak shape: cluster row hard-deleted while the node still
     // holds a suspended wake-cache copy — must be selected. A deleted id

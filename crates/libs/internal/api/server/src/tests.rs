@@ -2023,6 +2023,10 @@ async fn sandbox_desired_state_uses_active_node_ownership_for_port_exposures() -
          other-node rows, and unclaimed pool-slot reservations must never \
          be reported deleted"
     );
+    assert!(
+        response.superseded_sandbox_ids.is_empty(),
+        "the superseded partition is off unless explicitly enabled"
+    );
 
     sqlx::query(
         "UPDATE sandboxes
@@ -2067,6 +2071,120 @@ async fn sandbox_desired_state_uses_active_node_ownership_for_port_exposures() -
     assert_eq!(
         response.deleted_sandbox_ids,
         vec![missing_sandbox_id.to_string()],
+    );
+    Ok(())
+}
+
+/// A node holding a parked copy of a sandbox the cluster has since settled on
+/// another node learns that from the superseded partition. Restores read only
+/// the newest execution's node and the newest remote snapshot, so that copy is
+/// never restored again. Rows still moving, unplaced rows, rows on this node and
+/// deleted rows stay out of it.
+#[tokio::test(flavor = "current_thread")]
+async fn sandbox_desired_state_reports_sandboxes_settled_on_another_node_as_superseded()
+-> TestResult {
+    use std::net::{Ipv4Addr, SocketAddr};
+    use tonic::transport::server::TcpConnectInfo;
+
+    if !pplx_space_test_env::enter_test_process(&[(
+        "SPACE_INTERNAL_API_SUPERSEDED_PARTITION_ENABLED",
+        Some(std::ffi::OsStr::new("true")),
+    )]) {
+        return Ok(());
+    }
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    let node_addr = Ipv4Addr::new(10, 0, 1, 9);
+    let other_node_id = NodeId::new();
+    for (id, address) in [(node_id, "10.0.1.9"), (other_node_id, "10.0.1.10")] {
+        sqlx::query(
+            "INSERT INTO nodes (id, address, role, managed_by, state)
+                 VALUES ($1, $2::INET, 'worker', 'k8s', 'registered')",
+        )
+        .bind(id)
+        .bind(address)
+        .execute(&fixture.service.pool)
+        .await?;
+    }
+    let insert = |lifecycle: &'static str, active_node_id: Option<NodeId>| {
+        let pool = fixture.service.pool.clone();
+        async move {
+            let sandbox_id = SandboxId::new();
+            sqlx::query(
+                "INSERT INTO sandboxes (
+                     id, user_id, org_id, managed_by, lifecycle, placement,
+                     active_node_id, network_policy_generation
+                 )
+                 VALUES (
+                     $1,
+                     '00000000-0000-0000-0000-000000000010',
+                     '00000000-0000-0000-0000-000000000001',
+                     'k8s', $2, $3, $4, 1
+                 )",
+            )
+            .bind(sandbox_id)
+            .bind(lifecycle)
+            .bind(if active_node_id.is_some() {
+                "on_node"
+            } else {
+                "unplaced"
+            })
+            .bind(active_node_id)
+            .execute(&pool)
+            .await?;
+            TestResult::Ok(sandbox_id)
+        }
+    };
+    let started_elsewhere = insert("started", Some(other_node_id)).await?;
+    let suspended_elsewhere = insert("suspended", Some(other_node_id)).await?;
+    let restoring_elsewhere = insert("restoring", Some(other_node_id)).await?;
+    let suspended_unplaced = insert("suspended", None).await?;
+    let suspended_here = insert("suspended", Some(node_id)).await?;
+    let missing = SandboxId::new();
+
+    let mut request = Request::new(GetNodeSandboxDesiredStateRequest {
+        node_id: node_id.to_string(),
+        sandbox_ids: [
+            started_elsewhere,
+            suspended_elsewhere,
+            restoring_elsewhere,
+            suspended_unplaced,
+            suspended_here,
+            missing,
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect(),
+        role: Some(ProtoNodeRole::Worker as i32),
+    });
+    request.extensions_mut().insert(TcpConnectInfo {
+        local_addr: None,
+        remote_addr: Some(SocketAddr::from((node_addr, 49000))),
+    });
+    let response = fixture
+        .service
+        .get_node_sandbox_desired_state(request)
+        .await?
+        .into_inner();
+
+    let mut superseded = response.superseded_sandbox_ids.clone();
+    superseded.sort();
+    let mut expected = vec![
+        started_elsewhere.to_string(),
+        suspended_elsewhere.to_string(),
+    ];
+    expected.sort();
+    assert_eq!(superseded, expected);
+    assert_eq!(response.deleted_sandbox_ids, vec![missing.to_string()]);
+    assert_eq!(
+        response
+            .sandboxes
+            .iter()
+            .map(|sandbox| sandbox.sandbox_id.clone())
+            .collect::<Vec<_>>(),
+        vec![suspended_here.to_string()],
     );
     Ok(())
 }

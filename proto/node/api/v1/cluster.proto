@@ -550,6 +550,13 @@ message GetNodeSandboxDesiredStateResponse {
   // list is not a liveness signal, so consumers must only act on explicit
   // membership.
   repeated string deleted_sandbox_ids = 2;
+  // Requested sandbox ids the cluster has moved to another node: the row is
+  // settled (`started`, `paused` or `suspended`) with `active_node_id` set to
+  // a different node. Restores read only the newest execution's node and the
+  // newest remote snapshot, so this node's copy is never restored again.
+  // Consumers may reclaim a local `suspended` copy for these ids. Empty unless
+  // the producer enables it. Act only on explicit membership.
+  repeated string superseded_sandbox_ids = 3;
 }
 
 // ── Data-plane session routes ──────────────────────────────────────────────

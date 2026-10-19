@@ -2052,6 +2052,12 @@ class ColdEvictionControl(RestoreStateRead, RestorePodRead, Protocol):
         """
         ...
 
+    def sandbox_eviction_log(
+        self, node_name: str, sandbox_id: str, *, since_time: str
+    ) -> list[str]:
+        """sbx-manager's eviction lines for one sandbox on that worker."""
+        ...
+
     def eviction_loop_log(self, node_name: str, *, since_time: str) -> list[str]:
         """sbx-manager's own eviction tick/skip lines on that worker, for diagnosis.
 

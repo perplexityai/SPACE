@@ -2225,6 +2225,18 @@ ON CONFLICT (key_hash) DO NOTHING;
             _redact_storage_uris(line)[:400] for line in logs.splitlines() if "snapshot reaper" in line
         ][-40:]
 
+    def sandbox_eviction_log(
+        self, node_name: str, sandbox_id: str, *, since_time: str
+    ) -> list[str]:
+        logs = self._node_service_logs(
+            node_name, NODE_SANDBOX_MANAGER, since_time=since_time
+        )
+        return [
+            _redact_storage_uris(line)[:400]
+            for line in logs.splitlines()
+            if sandbox_id in line and "local presence evicted" in line
+        ][-40:]
+
     def eviction_loop_log(self, node_name: str, *, since_time: str) -> list[str]:
         logs = self._node_service_logs(
             node_name, NODE_SANDBOX_MANAGER, since_time=since_time

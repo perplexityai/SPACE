@@ -4722,6 +4722,43 @@ class ColdEvictionAssertions:
             "evicted_after_seconds", round(timeout - (deadline - time.monotonic()), 1)
         )
 
+    def wait_until_superseded_copy_evicted(
+        self, node_name: str, *, timeout: float = 240
+    ) -> None:
+        """Block until node-ctl's facet sync removes a copy the cluster moved off.
+
+        Two paths can remove a suspended copy: node-ctl's facet sync, through
+        sbx-manager's cluster-deleted eviction RPC, and the cold-eviction loop.
+        Only the first is under test, so the sandbox-manager log must show that
+        RPC evicted this sandbox and must not show the loop doing it.
+        """
+
+        deadline = time.monotonic() + timeout
+        sandbox_id = self._fixture.sandbox.sandbox_id
+        while self._control.sandbox_cache_dir_present(node_name, sandbox_id):
+            self._fixture.verify(
+                time.monotonic() <= deadline,
+                "node-ctl did not evict the copy the cluster moved to another node",
+                sandbox_id=sandbox_id,
+                worker_node=node_name,
+                eviction_timeout_seconds=timeout,
+            )
+            self._fixture.wait(5)
+        self._fixture.record(
+            "evicted_after_seconds", round(timeout - (deadline - time.monotonic()), 1)
+        )
+        lines = self._control.sandbox_eviction_log(
+            node_name, sandbox_id, since_time=self._since_time
+        )
+        self._fixture.verify(
+            any("cluster-deleted sandbox: local presence evicted" in line for line in lines)
+            and not any("sandbox eviction: local presence evicted" in line for line in lines),
+            "the copy is gone, but not through node-ctl's facet-sync eviction",
+            sandbox_id=sandbox_id,
+            worker_node=node_name,
+            eviction_log=lines,
+        )
+
     def expect_local_presence_gone(self, node_name: str) -> None:
         self._fixture.verify(
             not self._control.sandbox_cache_dir_present(

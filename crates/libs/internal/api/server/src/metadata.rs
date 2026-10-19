@@ -117,6 +117,7 @@ pub(super) struct TemplateDesiredStateRow {
 pub(super) struct SandboxDesiredStateRow {
     pub(super) sandbox_id: SandboxId,
     pub(super) assigned_here: bool,
+    pub(super) superseded_here: bool,
     pub(super) snapshots_enabled_desired: Option<bool>,
     pub(super) auto_lifecycle_json: Option<Json<AutoLifecyclePolicy>>,
 }
@@ -162,6 +163,16 @@ pub(super) fn deleted_partition_enabled() -> bool {
     pplx_space_common_core::env::env_destructive_gate_var(
         "SPACE_INTERNAL_API_DELETED_PARTITION_ENABLED",
     )
+}
+
+/// Producer-side switch for the superseded partition. Off unless explicitly
+/// truthy, and off whenever the deleted-partition kill switch is off.
+pub(super) fn superseded_partition_enabled() -> bool {
+    deleted_partition_enabled()
+        && pplx_space_common_core::env::env_flag_var(
+            "SPACE_INTERNAL_API_SUPERSEDED_PARTITION_ENABLED",
+            false,
+        )
 }
 
 /// Plausibility ceiling for the desired-state deleted partition.

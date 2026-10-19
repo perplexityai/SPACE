@@ -59,6 +59,7 @@ pub(super) async fn refresh_sandbox_desired_state(
         .iter()
         .map(|sandbox| sandbox.sandbox_id.clone())
         .chain(response.deleted_sandbox_ids.iter().cloned())
+        .chain(response.superseded_sandbox_ids.iter().cloned())
         .collect::<Vec<_>>();
     let local_sandbox_state_by_id = fetch_local_sandbox_states(&mut sbx, local_state_lookup_ids)
         .await
@@ -172,12 +173,19 @@ pub(super) async fn refresh_sandbox_desired_state(
             }
         }
     }
-    if !response.deleted_sandbox_ids.is_empty() {
+    let deleted_reported = response.deleted_sandbox_ids.len();
+    let superseded_reported = response.superseded_sandbox_ids.len();
+    let reclaimable_sandbox_ids = cluster_reclaimable_sandbox_ids(
+        response.deleted_sandbox_ids,
+        response.superseded_sandbox_ids,
+        &local_sandbox_state_by_id,
+    );
+    if !reclaimable_sandbox_ids.is_empty() {
         let evict_cap = CLUSTER_DELETED_EVICTS_PER_SYNC;
         let now = std::time::Instant::now();
         CLUSTER_DELETED_EVICT_BACKOFF_UNTIL.retain(|_, until| *until > now);
         let candidates = select_cluster_deleted_evict_candidates(
-            &response.deleted_sandbox_ids,
+            &reclaimable_sandbox_ids,
             &local_sandbox_state_by_id,
             CLUSTER_DELETED_CANDIDATE_WINDOW,
             |sandbox_id| CLUSTER_DELETED_EVICT_BACKOFF_UNTIL.contains_key(sandbox_id),
@@ -267,12 +275,13 @@ pub(super) async fn refresh_sandbox_desired_state(
         }
         if evicted > 0 || deferred > 0 || budget_exhausted {
             tracing::info!(
-                deleted_reported = response.deleted_sandbox_ids.len(),
+                deleted_reported,
+                superseded_reported,
                 evicted,
                 deferred,
                 budget_exhausted,
                 per_sync_cap = evict_cap,
-                "evicted local presence of cluster-deleted sandboxes"
+                "evicted local presence of cluster-deleted or superseded sandboxes"
             );
         }
     }

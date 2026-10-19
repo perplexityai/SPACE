@@ -130,6 +130,10 @@ spec:
               value: {{ .staleCeilingSeconds | quote }}
             {{- end }}
             {{- end }}
+            # Report sandboxes settled on another node, so node-ctl reclaims
+            # this node's parked suspended copy. Off by default outside kind.
+            - name: SPACE_INTERNAL_API_SUPERSEDED_PARTITION_ENABLED
+              value: "true"
             # Datadog tracing — see datadog-agent-local chart.
             {{- include "space-kind-telemetry.env" . | nindent 12 }}
             - name: SPACE_K8S_POD_NAME

@@ -1171,6 +1171,7 @@ impl ClusterApi for ClusterApiService {
             return Ok(Response::new(GetNodeSandboxDesiredStateResponse {
                 sandboxes: Vec::new(),
                 deleted_sandbox_ids: Vec::new(),
+                superseded_sandbox_ids: Vec::new(),
             }));
         }
 
@@ -1202,6 +1203,9 @@ impl ClusterApi for ClusterApiService {
         let rows = sqlx::query_as::<_, SandboxDesiredStateRow>(sql!(
             "SELECT id AS sandbox_id,
                     (active_node_id = $2) IS TRUE AS assigned_here,
+                    (active_node_id <> $2
+                     AND lifecycle IN ('started', 'paused', 'suspended')) IS TRUE
+                        AS superseded_here,
                     CASE WHEN active_node_id = $2
                          THEN snapshots_enabled_desired END AS snapshots_enabled_desired,
                     CASE WHEN active_node_id = $2
@@ -1289,6 +1293,7 @@ impl ClusterApi for ClusterApiService {
 
         let requested_count = sandbox_ids.len();
         let mut deleted_sandbox_ids = Vec::new();
+        let mut superseded_sandbox_ids = Vec::new();
         let mut assigned_elsewhere_count = 0_usize;
         let sandboxes = sandbox_ids
             .into_iter()
@@ -1304,6 +1309,9 @@ impl ClusterApi for ClusterApiService {
                 };
                 if !row.assigned_here {
                     assigned_elsewhere_count += 1;
+                    if row.superseded_here {
+                        superseded_sandbox_ids.push(sandbox_id);
+                    }
                     return None;
                 }
                 Some(SandboxDesiredState {
@@ -1362,6 +1370,14 @@ impl ClusterApi for ClusterApiService {
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
+            superseded_sandbox_ids: if superseded_partition_enabled() {
+                superseded_sandbox_ids
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect()
+            } else {
+                Vec::new()
+            },
         }))
     }
 

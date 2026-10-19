@@ -76,6 +76,8 @@ _DURATION_SECONDS = {
         "local.retention_restore_source_guard": 107,
         "local.snapshot_reaper_reclaims_backed_fork_snapshot": 147,
         "local.storage_exchange_scoping": 30,
+        # Estimate: one cross-node restore, one node-ctl sync, one more cycle.
+        "local.superseded_suspended_copy_is_reclaimed": 120,
         "local.suspend_restore_cross_node_from_object_storage": 14,
         "local.suspend_snapshot_rows_are_per_attempt": 21,
         # Measured 37-38 s; Tempo's 30 s search cutoff is most of it.
