@@ -1,6 +1,7 @@
 use pplx_space_common_core::types::OrgId;
 
 use crate::api_surface::ApiSurface;
+use crate::auth::NativeCredential;
 use crate::e2b::errors::E2bApiError;
 use crate::federated_identity::{
     FederatedOwner, federated_owner_from_headers, owner_headers_present,
@@ -256,27 +257,20 @@ pub async fn require_native_auth(
         .into_response();
     };
 
-    match crate::auth::get_session_user(pool, token).await {
-        Ok(Some((user, org))) => {
+    // A backend service has no session, so the same bearer slot also carries a
+    // service credential. One statement resolves the token as either; a
+    // session still takes precedence over a key with the same token.
+    match crate::auth::resolve_native_credential(pool, token).await {
+        Ok(Some(NativeCredential::Session { user, org })) => {
             if owner_headers_present(request.headers()) {
                 return PublicApiError::forbidden("sessions may not assert an owner")
                     .into_response();
             }
             request.extensions_mut().insert(AuthUser(user));
             request.extensions_mut().insert(AuthOrg(org));
-            return next.run(request).await;
+            next.run(request).await
         }
-        Ok(None) => {}
-        Err(error) => {
-            return crate::routes::public::error::PublicApiError::from(error).into_response();
-        }
-    }
-
-    // A backend service has no session, so the same bearer slot also carries a
-    // service credential. Sessions are tried first because they are the common
-    // case; only a miss costs the second lookup.
-    match crate::auth::get_api_key_org(pool, token, ApiSurface::Native).await {
-        Ok(Some(mut context)) => {
+        Ok(Some(NativeCredential::ApiKey(mut context))) => {
             let federated_owner = match native_federated_owner(&state, &context, request.headers())
             {
                 Ok(owner) => owner,
@@ -320,7 +314,7 @@ pub async fn require_native_auth(
         )
         .into_response(),
         Err(error) => {
-            tracing::error!(%error, "native service-credential lookup failed");
+            tracing::error!(%error, "native credential lookup failed");
             crate::routes::public::error::PublicApiError::from(error).into_response()
         }
     }

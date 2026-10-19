@@ -140,6 +140,168 @@ pub async fn get_api_key_org(
     Ok(row.map(ApiKeyAuthRow::into_context))
 }
 
+/// A bearer credential on the Native surface: a console session or a service
+/// credential scoped to Native.
+pub enum NativeCredential {
+    Session { user: User, org: Organization },
+    ApiKey(ApiKeyAuthContext),
+}
+
+/// Resolve a Native bearer token as a session or a Native service credential
+/// in one statement.
+///
+/// Both kinds are 64-hex bearer tokens in the same slot, so the token is
+/// looked up as both at once rather than as a session and then, on the miss
+/// every service caller takes, as a key. The answer is what
+/// [`get_session_user`] then [`get_api_key_org`] with [`ApiSurface::Native`]
+/// would give: a session wins when it resolves, including its expiry and
+/// password-login checks, and otherwise the key decides.
+pub async fn resolve_native_credential(
+    pool: &PgPool,
+    raw_token: &str,
+) -> Result<Option<NativeCredential>, sqlx::Error> {
+    use sqlx::{FromRow as _, Row as _};
+
+    let token_hash = hash_token(raw_token);
+
+    // Each branch matches a unique hash, so this is at most one row of each
+    // kind. The session branch leaves the key's columns NULL; the key branch
+    // is `get_api_key_org`'s query, and comes first so the UNION takes its
+    // column types.
+    let rows = sqlx::query(sql!(
+        "SELECT
+             'api_key'            AS credential_kind,
+             k.id                AS api_key_id,
+             k.org_id             AS api_key_org_id,
+             k.name               AS api_key_name,
+             k.key_hash           AS api_key_key_hash,
+             k.created_by         AS api_key_created_by,
+             k.last_used_at       AS api_key_last_used_at,
+             k.federated_owner_assertions_enabled AS api_key_federated_owner_assertions_enabled,
+             k.allowed_surfaces   AS api_key_allowed_surfaces,
+             k.created_at         AS api_key_created_at,
+             k.updated_at         AS api_key_updated_at,
+             o.id                 AS org_id,
+             o.name               AS org_name,
+             o.slug               AS org_slug,
+             o.parent_id          AS org_parent_id,
+             o.theme_primary      AS org_theme_primary,
+             o.theme_secondary    AS org_theme_secondary,
+             o.logo_url           AS org_logo_url,
+             o.byok_enabled       AS org_byok_enabled,
+             o.snapshot_base_object_storage_uri AS org_snapshot_base_object_storage_uri,
+             o.created_at         AS org_created_at,
+             o.updated_at         AS org_updated_at,
+             u.id                 AS user_id,
+             u.email              AS user_email,
+             u.password_hash      AS user_password_hash,
+             u.display_name       AS user_display_name,
+             u.role               AS user_role,
+             u.owner_source       AS user_owner_source,
+             u.created_at         AS user_created_at,
+             u.updated_at         AS user_updated_at
+         FROM api_keys k
+         JOIN organizations o ON o.id = k.org_id
+         LEFT JOIN LATERAL (
+             SELECT *
+             FROM users
+             WHERE org_id = k.org_id
+               AND (k.created_by IS NULL OR id = k.created_by)
+             ORDER BY created_at ASC
+             LIMIT 1
+         ) u ON TRUE
+         WHERE k.key_hash = $1
+           AND $2 = ANY(k.allowed_surfaces)
+         UNION ALL
+         SELECT
+             'session',
+             NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+             o.id, o.name, o.slug, o.parent_id, o.theme_primary, o.theme_secondary,
+             o.logo_url, o.byok_enabled, o.snapshot_base_object_storage_uri,
+             o.created_at, o.updated_at,
+             u.id, u.email, u.password_hash, u.display_name, u.role, u.owner_source,
+             u.created_at, u.updated_at
+         FROM sessions s
+         JOIN users u ON u.id = s.user_id
+         JOIN organizations o ON o.id = u.org_id
+         WHERE s.token_hash = $1 AND s.expires_at > NOW()"
+    ))
+    .bind(&token_hash)
+    .bind(ApiSurface::Native.as_str())
+    .fetch_all(pool)
+    .await?;
+
+    let mut api_key = None;
+    for row in &rows {
+        match row.try_get::<&str, _>("credential_kind")? {
+            "session" => {
+                let session = SessionAuthRow::from_row(row)?;
+                let (user, org) = session.into_parts();
+                if user.password_login_configured() {
+                    return Ok(Some(NativeCredential::Session { user, org }));
+                }
+            }
+            _ => api_key = Some(ApiKeyAuthRow::from_row(row)?.into_context()),
+        }
+    }
+    Ok(api_key.map(NativeCredential::ApiKey))
+}
+
+/// The session branch of [`resolve_native_credential`]: the session's user
+/// and that user's org, under the key branch's column names.
+#[derive(sqlx::FromRow)]
+struct SessionAuthRow {
+    org_id: OrgId,
+    org_name: String,
+    org_slug: String,
+    org_parent_id: Option<Uuid>,
+    org_theme_primary: Option<String>,
+    org_theme_secondary: Option<String>,
+    org_logo_url: Option<String>,
+    org_byok_enabled: bool,
+    org_snapshot_base_object_storage_uri: Option<String>,
+    org_created_at: OffsetDateTime,
+    org_updated_at: OffsetDateTime,
+    user_id: UserId,
+    user_email: String,
+    user_password_hash: String,
+    user_display_name: String,
+    user_role: UserRole,
+    user_owner_source: SandboxOwnerSource,
+    user_created_at: OffsetDateTime,
+    user_updated_at: OffsetDateTime,
+}
+
+impl SessionAuthRow {
+    fn into_parts(self) -> (User, Organization) {
+        let user = User {
+            id: self.user_id,
+            email: self.user_email,
+            password_hash: self.user_password_hash,
+            display_name: self.user_display_name,
+            org_id: self.org_id,
+            role: self.user_role,
+            owner_source: self.user_owner_source,
+            created_at: self.user_created_at,
+            updated_at: self.user_updated_at,
+        };
+        let org = Organization {
+            id: self.org_id,
+            name: self.org_name,
+            slug: self.org_slug,
+            parent_id: self.org_parent_id,
+            theme_primary: self.org_theme_primary,
+            theme_secondary: self.org_theme_secondary,
+            logo_url: self.org_logo_url,
+            byok_enabled: self.org_byok_enabled,
+            snapshot_base_object_storage_uri: self.org_snapshot_base_object_storage_uri,
+            created_at: self.org_created_at,
+            updated_at: self.org_updated_at,
+        };
+        (user, org)
+    }
+}
+
 pub(crate) async fn org_has_local_owner(pool: &PgPool, org_id: OrgId) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar(sql!(
         "SELECT EXISTS(SELECT 1 FROM organizations WHERE id = $1 AND owner_source = 'local')"
@@ -265,3 +427,7 @@ pub async fn api_key_belongs_to_org(
 #[cfg(test)]
 #[path = "auth/surface_scope_tests.rs"]
 mod surface_scope_tests;
+
+#[cfg(test)]
+#[path = "auth/native_credential_tests.rs"]
+mod native_credential_tests;
