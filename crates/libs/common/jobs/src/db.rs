@@ -141,6 +141,24 @@ pub fn find_job_by_dedup_key(
     .optional()
 }
 
+/// How many jobs with the given `kind` and `dedup_key` have failed with
+/// `failure_kind`. Failed rows remain countable until the shared jobs
+/// retention pruner removes them.
+pub fn count_failed_jobs_by_dedup_key(
+    conn: &Connection,
+    kind: &str,
+    dedup_key: &str,
+    failure_kind: JobFailureKind,
+) -> rusqlite::Result<u64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM jobs
+         WHERE kind = ?1 AND dedup_key = ?2 AND status = 'failed' AND error_kind = ?3",
+        params![kind, dedup_key, failure_kind.as_str()],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(nonnegative_i64_to_u64)
+}
+
 pub struct InsertJob<'a> {
     pub job_id: &'a JobId,
     pub kind: &'a str,

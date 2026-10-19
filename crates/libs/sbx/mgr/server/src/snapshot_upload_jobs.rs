@@ -169,12 +169,24 @@ impl JobExecutor for SnapshotUploadExecutor {
         if prepared_upload_requires_begin(&payload)
             && let Err(refusal) = begin_prepared_upload_naming_supersession(&payload).await
         {
-            if refusal.refuses_artifact {
-                record_failure_scope(
-                    &self.db,
-                    &job.job_id,
-                    crate::snapshot_upload::UploadFailureScope::Artifact,
-                );
+            // Best effort: an unrecorded scope reads as the attempt's, which
+            // costs a later caller one doomed attempt at most.
+            if refusal.refuses_artifact
+                && let Err(error) = self
+                    .db
+                    .lock()
+                    .map_err(|_| "database mutex poisoned".to_string())
+                    .and_then(|conn| {
+                        record_failure_scope(
+                            &conn,
+                            &job.job_id,
+                            crate::snapshot_upload::UploadFailureScope::Artifact,
+                        )
+                        .map_err(|error| error.to_string())
+                    })
+            {
+                tracing::warn!(job_id = %job.job_id, %error,
+                    "could not record a refused snapshot upload's failure scope");
             }
             return Err(refusal.error);
         }
@@ -599,7 +611,10 @@ pub(crate) async fn begin_prepared_upload_naming_supersession(
             superseded_generation,
             code,
             ..
-        } => (*superseded_generation, registration_refusal_is_final(*code)),
+        } => (
+            *superseded_generation,
+            registration_refusal_is_final(*code, *superseded_generation),
+        ),
         BeginArtifactBackupError::Connect(_) => (None, false),
     };
     Err(BeginRefusal {
@@ -610,46 +625,36 @@ pub(crate) async fn begin_prepared_upload_naming_supersession(
 }
 
 /// Whether the control plane refused a registration because of the artifact
-/// itself, so no attempt can register it: the request contradicts the
-/// artifact's identity, the sandbox is gone, or the control plane retired the
-/// execution that captured it. An authentication or authorization refusal
-/// concerns this node's credentials, which can recover, so it fails only the
-/// attempt.
-fn registration_refusal_is_final(code: tonic::Code) -> bool {
-    matches!(
-        code,
-        tonic::Code::InvalidArgument | tonic::Code::NotFound | tonic::Code::FailedPrecondition
-    )
+/// itself, so no attempt can register it: `InvalidArgument`, a request whose
+/// artifact identity or metadata it rejects, or a refusal that names the
+/// retired execution that captured the artifact. Every other refusal fails
+/// only the attempt, since the response carries no typed reason and those
+/// codes also name node- or attempt-level refusals: `NotFound` for a source
+/// node that isn't registered yet, `FailedPrecondition` for a node with no
+/// origin address or an attempt id reused with another identity, and
+/// authentication or authorization refusals. A caller bounds the attempts it
+/// starts after such a failure.
+fn registration_refusal_is_final(
+    code: tonic::Code,
+    superseded_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+) -> bool {
+    code == tonic::Code::InvalidArgument || superseded_generation.is_some()
 }
 
 /// Record on a failing upload's payload what its failure failed, for a later
-/// caller that has to decide whether a new attempt can succeed. Best effort:
-/// an unrecorded scope reads as [`UploadFailureScope::Attempt`], which costs
-/// that caller one doomed attempt at most.
-///
-/// [`UploadFailureScope::Attempt`]: crate::snapshot_upload::UploadFailureScope::Attempt
-fn record_failure_scope(
-    db: &std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>,
+/// caller that has to decide whether a new attempt can succeed. Sets only the
+/// field: a handoff can persist transfer IDs into the same payload while the
+/// attempt runs.
+pub(crate) fn record_failure_scope(
+    conn: &rusqlite::Connection,
     job_id: &JobId,
     scope: crate::snapshot_upload::UploadFailureScope,
-) {
-    // Set only the field: a handoff can persist transfer IDs into the same
-    // payload while this attempt runs.
-    let recorded = db
-        .lock()
-        .map_err(|_| "database mutex poisoned".to_string())
-        .and_then(|conn| {
-            conn.execute(
-                "UPDATE jobs SET payload = json_set(payload, '$.failure_scope', ?1)
-                 WHERE job_id = ?2 AND kind = ?3 AND status IN ('pending', 'running')",
-                rusqlite::params![scope.as_str(), job_id, SNAPSHOT_UPLOAD_JOB_KIND],
-            )
-            .map_err(|error| error.to_string())
-        });
-    if let Err(error) = recorded {
-        tracing::warn!(%job_id, scope = scope.as_str(), %error,
-            "could not record a failed snapshot upload's failure scope");
-    }
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE jobs SET payload = json_set(payload, '$.failure_scope', ?1)
+         WHERE job_id = ?2 AND kind = ?3 AND status IN ('pending', 'running')",
+        rusqlite::params![scope.as_str(), job_id, SNAPSHOT_UPLOAD_JOB_KIND],
+    )
 }
 
 /// What the re-sent registration says about the upload's execution.

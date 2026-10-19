@@ -1019,7 +1019,8 @@ pub struct SandboxManagerServiceOptions {
     /// Every node-manager client the service and its subsystems use.
     pub node_manager: NodeManagerConnector,
     /// The volume-manager socket that snapshot uploads stage their transfers
-    /// with and observe them through.
+    /// with and observe them through. Restore, fork, cleanup and the
+    /// btrfs-send capability probe still dial the fixed volume-manager socket.
     pub volume_manager_socket_path: PathBuf,
     /// Every template-manager `GetTemplate` the service and its subsystems ask.
     pub template_resolver: Arc<dyn crate::template_resolver::TemplateResolver>,

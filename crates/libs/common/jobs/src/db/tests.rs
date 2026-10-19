@@ -489,3 +489,48 @@ fn serialized_listing_skips_blocked_subjects() {
     let parallel = list_due_pending_jobs(&conn, 10, SubjectConcurrency::Parallel).unwrap();
     assert_eq!(parallel.len(), 2);
 }
+
+#[test]
+fn count_failed_jobs_by_dedup_key_counts_one_failure_kind_of_one_key() {
+    let conn = mem_conn();
+    let insert = |name: &str, kind: &str, dedup_key: &str| {
+        let job_id = fixture_job_id(name);
+        insert_job(
+            &conn,
+            InsertJob {
+                job_id: &job_id,
+                kind,
+                payload: "{}",
+                subject_id: None,
+                dedup_key: Some(dedup_key),
+                max_attempts: 1,
+                traceparent: None,
+                priority: JobPriority::default(),
+            },
+        )
+        .unwrap();
+        job_id
+    };
+    let first = insert("upload-1", "upload", "artifact-1");
+    fail_job_permanent(&conn, &first, "transfer failed", None).unwrap();
+    let second = insert("upload-2", "upload", "artifact-1");
+    fail_job_retriable_exhausted(&conn, &second, "unavailable").unwrap();
+    let third = insert("upload-3", "upload", "artifact-1");
+    fail_job_permanent(&conn, &third, "transfer failed", None).unwrap();
+    insert("upload-4", "upload", "artifact-1");
+    let other_key = insert("upload-5", "upload", "artifact-2");
+    fail_job_permanent(&conn, &other_key, "transfer failed", None).unwrap();
+    let other_kind = insert("push-1", "push", "artifact-1");
+    fail_job_permanent(&conn, &other_kind, "transfer failed", None).unwrap();
+
+    let count = |failure_kind| {
+        count_failed_jobs_by_dedup_key(&conn, "upload", "artifact-1", failure_kind).unwrap()
+    };
+    assert_eq!(count(JobFailureKind::Permanent), 2);
+    assert_eq!(count(JobFailureKind::Retriable), 1);
+    assert_eq!(
+        count_failed_jobs_by_dedup_key(&conn, "upload", "artifact-3", JobFailureKind::Permanent)
+            .unwrap(),
+        0
+    );
+}

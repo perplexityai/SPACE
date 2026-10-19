@@ -17,52 +17,48 @@ pub(in crate::service) enum KeyedUploadUse {
     NewAttempt,
 }
 
-/// Who started the newest upload under an artifact's key, as a teardown
-/// suspend sees it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::service) enum KeyedUploadStarter {
-    /// This teardown, or a backup requested while it ran.
-    ThisTeardown,
-    /// Something before this teardown: the node-local suspend that captured
-    /// the artifact, or an earlier execution's teardown.
-    EarlierCaller,
-}
+/// How many of an artifact's uploads may fail permanently before a teardown
+/// stops starting new ones: the original upload, which may have met an outage
+/// such as a transfer vol-mgr gave up on, and one recovery attempt. A failure
+/// that recurs on a fresh attempt is treated as the artifact's own.
+pub(in crate::service) const PERMANENTLY_FAILED_UPLOAD_LIMIT: u64 = 2;
 
 /// The teardown's rule for the newest upload under the artifact's key, in
-/// `status` with `failure` and the `scope` its worker recorded:
+/// `status` with `failure` and the `scope` its worker recorded, given
+/// `permanently_failed` uploads under the key so far, by any caller:
 ///
 /// - an active or completed upload is joined;
 /// - a retriable failure only ran out of attempts, so a new attempt follows;
 /// - a permanent failure of the artifact itself (see
 ///   [`crate::snapshot_upload::UploadFailureScope`]) is final;
-/// - a permanent failure of an earlier caller's attempt, such as a transfer
-///   that vol-mgr gave up on during an outage, gets one new attempt;
-/// - a permanent failure of this teardown's own attempt is final, whatever
-///   its recorded scope.
+/// - a permanent failure of an attempt gets a new attempt while fewer than
+///   [`PERMANENTLY_FAILED_UPLOAD_LIMIT`] uploads have failed permanently, and
+///   is final after that.
 ///
-/// The last rule bounds the one before it: the new attempt is this
-/// teardown's own, so a failure recorded as the attempt's that is really the
-/// artifact's ends after one more upload.
+/// The limit bounds the attempt-scoped rule, so a failure recorded as the
+/// attempt's that is really the artifact's still ends. The failed jobs it
+/// counts persist across restarts until the jobs retention pruner removes
+/// them.
 pub(in crate::service) fn teardown_keyed_upload_use(
     status: pplx_space_common_jobs::JobStatus,
     failure: Option<pplx_space_common_jobs::JobFailure>,
     scope: crate::snapshot_upload::UploadFailureScope,
-    starter: KeyedUploadStarter,
+    permanently_failed: u64,
 ) -> KeyedUploadUse {
     use crate::snapshot_upload::UploadFailureScope;
     use pplx_space_common_jobs::JobFailure;
     if !status.is_terminal() {
         return KeyedUploadUse::Join;
     }
-    match (failure, scope, starter) {
-        (None, _, _) => KeyedUploadUse::Join,
-        (Some(JobFailure::Retriable), _, _) => KeyedUploadUse::NewAttempt,
-        (
-            Some(JobFailure::Permanent { .. }),
-            UploadFailureScope::Attempt,
-            KeyedUploadStarter::EarlierCaller,
-        ) => KeyedUploadUse::NewAttempt,
-        (Some(JobFailure::Permanent { .. }), _, _) => KeyedUploadUse::Join,
+    match (failure, scope) {
+        (None, _) => KeyedUploadUse::Join,
+        (Some(JobFailure::Retriable), _) => KeyedUploadUse::NewAttempt,
+        (Some(JobFailure::Permanent { .. }), UploadFailureScope::Attempt)
+            if permanently_failed < PERMANENTLY_FAILED_UPLOAD_LIMIT =>
+        {
+            KeyedUploadUse::NewAttempt
+        }
+        (Some(JobFailure::Permanent { .. }), _) => KeyedUploadUse::Join,
     }
 }
 
@@ -1286,7 +1282,7 @@ impl SandboxManagerService {
             return self.verify_teardown_suspend_backup_ownership(sandbox, &backup);
         }
         let joined = match persisted_job {
-            Some(job) => match self.teardown_use_of_upload(sandbox, &backup, &job)? {
+            Some(job) => match self.teardown_use_of_upload(&backup, &job)? {
                 KeyedUploadUse::Join => Some(job.job_id),
                 KeyedUploadUse::NewAttempt => None,
             },
@@ -1356,11 +1352,9 @@ impl SandboxManagerService {
     }
 
     /// [`teardown_keyed_upload_use`] for `job`, the newest upload under the
-    /// artifact's key. Jobs are UUIDv7, so an upload created before this
-    /// generation's teardown operation was started by an earlier caller.
+    /// artifact's key.
     fn teardown_use_of_upload(
         &self,
-        sandbox: &crate::db::SandboxRow,
         backup: &TeardownSuspendBackup<'_>,
         job: &pplx_space_common_jobs::Job,
     ) -> Result<KeyedUploadUse, Status> {
@@ -1382,25 +1376,23 @@ impl SandboxManagerService {
         let scope = job
             .payload_as::<RecordedScope>()
             .map_or_else(|_| Default::default(), |recorded| recorded.failure_scope);
-        let operation = {
+        let permanently_failed = {
             let db = self.db_conn()?;
-            crate::db::latest_teardown_suspend_operation(&db, &sandbox.id)
-                .map_err(|error| Status::internal(format!("teardown job lookup: {error}")))?
-        };
-        let starter = match operation {
-            Some(operation)
-                if operation.execution_generation == backup.execution_generation
-                    && job.job_id < operation.job_id =>
-            {
-                KeyedUploadStarter::EarlierCaller
-            }
-            _ => KeyedUploadStarter::ThisTeardown,
+            pplx_space_common_jobs::db::count_failed_jobs_by_dedup_key(
+                &db,
+                crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
+                &crate::snapshot_upload_jobs::artifact_backup_dedup_key(
+                    backup.artifact.local_artifact_id,
+                ),
+                pplx_space_common_jobs::JobFailureKind::Permanent,
+            )
+            .map_err(|error| Status::internal(format!("failed upload count: {error}")))?
         };
         Ok(teardown_keyed_upload_use(
             status,
             job.failure,
             scope,
-            starter,
+            permanently_failed,
         ))
     }
 

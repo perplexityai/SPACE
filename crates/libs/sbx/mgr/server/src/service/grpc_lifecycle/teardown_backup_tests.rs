@@ -347,16 +347,26 @@ where
 }
 
 /// The sandbox whose artifact the control plane refuses to register. The
-/// stub serves from the parent test process, so the refusal is keyed by an
-/// identity both processes know up front.
+/// stub serves from the parent test process, so its refusals are keyed by
+/// identities both processes know up front.
 const REFUSED_SANDBOX: uuid::Uuid =
     uuid::Uuid::from_u128(0x019f_8000_0000_7000_8000_0000_0000_0b0d);
 
-/// A control plane that admits every artifact backup but
-/// [`REFUSED_SANDBOX`]'s, finalizes every attempt, and has no ready backup of
-/// any artifact.
-#[derive(Clone, Copy)]
-struct BackupControlPlane;
+/// The sandbox whose source node the control plane doesn't know until after
+/// its first [`UNREGISTERED_NODE_BEGINS`] registrations.
+const RECOVERING_SANDBOX: uuid::Uuid =
+    uuid::Uuid::from_u128(0x019f_8000_0000_7000_8000_0000_0000_0b0e);
+
+/// The node-local suspend's handoff and its worker each register once.
+const UNREGISTERED_NODE_BEGINS: usize = 2;
+
+/// A control plane that admits every artifact backup but [`REFUSED_SANDBOX`]'s
+/// and [`RECOVERING_SANDBOX`]'s first ones, finalizes every attempt, and has no
+/// ready backup of any artifact.
+#[derive(Clone, Default)]
+struct BackupControlPlane {
+    recovering_begins: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
 
 impl tonic::server::NamedService for BackupControlPlane {
     const NAME: &'static str = "space.node.api.v1.ClusterApi";
@@ -387,14 +397,21 @@ where
             .next()
             .unwrap_or_default()
             .to_owned();
+        let recovering_begins = std::sync::Arc::clone(&self.recovering_begins);
         Box::pin(async move {
             Ok(match method.as_str() {
                 "BeginArtifactBackup" => {
-                    answer(request, |request: api::BeginArtifactBackupRequest| {
+                    answer(request, move |request: api::BeginArtifactBackupRequest| {
                         if request.sandbox_id == REFUSED_SANDBOX.to_string() {
-                            return Err(Status::failed_precondition(
-                                "the artifact's registration conflicts with its identity",
+                            return Err(Status::invalid_argument(
+                                "the artifact's metadata contradicts its identity",
                             ));
+                        }
+                        if request.sandbox_id == RECOVERING_SANDBOX.to_string()
+                            && recovering_begins.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                                < UNREGISTERED_NODE_BEGINS
+                        {
+                            return Err(Status::not_found("source node is not registered"));
                         }
                         Ok(api::BeginArtifactBackupResponse {
                             local_artifact_id: request.local_artifact_id,
@@ -549,6 +566,12 @@ enum NodeLocalUpload {
     TransferFailed,
     /// vol-mgr gave up on its transfer, and on the teardown's new attempt too.
     TransferFailedTwice,
+    /// vol-mgr gave up on its transfer, and on an attempt a backup requested
+    /// by artifact id started before the teardown.
+    TwoFailedAttempts,
+    /// The control plane didn't know the node yet when the node-local suspend
+    /// registered, and does by the teardown.
+    RegistrationRecovers,
     /// The control plane refused the artifact's registration.
     RegistrationRefused,
 }
@@ -576,6 +599,7 @@ async fn suspended_after_node_local_upload(
     let conn = crate::db::test_conn();
     let sandbox_id = match upload {
         NodeLocalUpload::RegistrationRefused => SandboxId::from_uuid(REFUSED_SANDBOX),
+        NodeLocalUpload::RegistrationRecovers => SandboxId::from_uuid(RECOVERING_SANDBOX),
         _ => SandboxId::new(),
     };
     let id = sandbox_id.to_string();
@@ -615,7 +639,7 @@ async fn suspended_after_node_local_upload(
         // The refusal would roll a real suspend back when the handoff meets
         // it; one only the worker meets leaves the suspend published, which
         // is what the rest of this setup records.
-        NodeLocalUpload::RegistrationRefused => {
+        NodeLocalUpload::RegistrationRefused | NodeLocalUpload::RegistrationRecovers => {
             handoff.expect_err("the control plane refuses the registration");
         }
         _ => {
@@ -679,22 +703,26 @@ async fn ended(
 /// published artifact. The teardown and a backup requested by artifact id
 /// share the node-local suspend's upload while it runs, and a joined driver
 /// accepts the poll that completed the generation first. Once that upload has
-/// failed, a transfer vol-mgr gave up on gets exactly one new attempt, which
-/// either makes the suspend durable or fails it for good, and a registration
-/// the control plane refused fails the teardown at once.
+/// failed, an attempt's failure, such as a transfer vol-mgr gave up on or a
+/// registration refused for a node the control plane didn't know yet, gets
+/// one new attempt unless two uploads of the artifact have already failed. A
+/// registration refused for the artifact itself fails the teardown at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn teardown_after_node_local_suspend_shares_its_upload_or_settles_its_failure() {
     use super::retired_teardown_tests::with_cluster_api;
 
-    with_cluster_api(BackupControlPlane, async || {
+    with_cluster_api(BackupControlPlane::default(), async || {
         futures_util::future::join_all(
             [
                 NodeLocalUpload::Running,
                 NodeLocalUpload::TransferFailed,
                 NodeLocalUpload::TransferFailedTwice,
+                NodeLocalUpload::TwoFailedAttempts,
+                NodeLocalUpload::RegistrationRecovers,
                 NodeLocalUpload::RegistrationRefused,
             ]
-            .map(teardown_after_node_local_upload),
+            // Each case's future is large; keep them off the test's stack.
+            .map(|upload| Box::pin(teardown_after_node_local_upload(upload))),
         )
         .await;
     })
@@ -710,8 +738,12 @@ async fn teardown_after_node_local_upload(upload: NodeLocalUpload) {
 
     let generation = ExecutionGeneration::new(GENERATION).unwrap();
     let volume_manager = FakeVolumeManager::serve(match upload {
-        NodeLocalUpload::Running | NodeLocalUpload::RegistrationRefused => Transfers::Running,
-        NodeLocalUpload::TransferFailed | NodeLocalUpload::TransferFailedTwice => Transfers::Failed,
+        NodeLocalUpload::Running
+        | NodeLocalUpload::RegistrationRecovers
+        | NodeLocalUpload::RegistrationRefused => Transfers::Running,
+        NodeLocalUpload::TransferFailed
+        | NodeLocalUpload::TransferFailedTwice
+        | NodeLocalUpload::TwoFailedAttempts => Transfers::Failed,
     });
     let scratch = tempfile::tempdir().unwrap();
     let NodeLocalSuspended {
@@ -789,13 +821,16 @@ async fn teardown_after_node_local_upload(upload: NodeLocalUpload) {
                 .unwrap_or_else(|error| panic!("the joined suspend is durable: {error}"));
             Some(node_local)
         }
-        NodeLocalUpload::TransferFailed | NodeLocalUpload::TransferFailedTwice => {
+        NodeLocalUpload::TransferFailed
+        | NodeLocalUpload::TransferFailedTwice
+        | NodeLocalUpload::RegistrationRecovers => {
             ended(&service, &node_local, JobStatus::Failed).await;
-            if matches!(upload, NodeLocalUpload::TransferFailed) {
+            let recovers = !matches!(upload, NodeLocalUpload::TransferFailedTwice);
+            if recovers {
                 volume_manager.report(Transfers::Running);
             }
             let mut driver = std::pin::pin!(drive());
-            if matches!(upload, NodeLocalUpload::TransferFailed) {
+            if recovers {
                 tokio::time::timeout(waiting, &mut driver)
                     .await
                     .expect_err("the driver waits for its new attempt");
@@ -808,16 +843,16 @@ async fn teardown_after_node_local_upload(upload: NodeLocalUpload) {
                 .expect("a new attempt replaces the failed upload");
             assert_eq!(uploads(&service, &id).len(), 2, "exactly one new attempt");
             match upload {
-                NodeLocalUpload::TransferFailed => {
+                NodeLocalUpload::TransferFailed | NodeLocalUpload::RegistrationRecovers => {
                     result
                         .unwrap_or_else(|error| panic!("the retried suspend is durable: {error}"));
                     Some(retry.job_id)
                 }
                 _ => {
                     result.expect_err("the new attempt fails too");
-                    // The failed attempt is the teardown's own: the next drive
-                    // reports it rather than uploading again.
-                    let error = tokio::time::timeout(waiting, drive())
+                    // Two uploads of the artifact have failed now: the next
+                    // drive reports the failure rather than uploading again.
+                    let error = tokio::time::timeout(ends, drive())
                         .await
                         .expect("the driver must not wait on a dead upload")
                         .expect_err("no further attempt");
@@ -828,9 +863,42 @@ async fn teardown_after_node_local_upload(upload: NodeLocalUpload) {
                 }
             }
         }
+        NodeLocalUpload::TwoFailedAttempts => {
+            ended(&service, &node_local, JobStatus::Failed).await;
+            let response = service
+                .enqueue_artifact_backup(internal_request(
+                    crate::proto::EnqueueArtifactBackupRequest {
+                        sandbox_id: id.clone(),
+                        expected_artifact_kind: crate::proto::ArtifactKind::Full as i32,
+                        source: Some(Source::LocalArtifactId(artifact_id.to_string())),
+                    },
+                ))
+                .await
+                .expect("a backup requested by artifact id starts a new attempt")
+                .into_inner();
+            let requested = uploads(&service, &id)
+                .into_iter()
+                .find(|job| job.job_id != node_local)
+                .expect("the request starts a new attempt");
+            assert_eq!(
+                response.backup_attempt_id,
+                requested
+                    .payload_as::<crate::snapshot_upload::SnapshotUploadJobs>()
+                    .unwrap()
+                    .snapshot_id
+            );
+            let requested = ended(&service, &requested.job_id, JobStatus::Failed).await;
+            let error = tokio::time::timeout(ends, drive())
+                .await
+                .expect("the driver must not wait on a dead upload")
+                .expect_err("no further attempt");
+            assert_eq!(Some(error.message()), requested.error.as_deref());
+            assert_eq!(uploads(&service, &id).len(), 2, "no further attempt");
+            None
+        }
         NodeLocalUpload::RegistrationRefused => {
             let refused = ended(&service, &node_local, JobStatus::Failed).await;
-            let error = tokio::time::timeout(waiting, drive())
+            let error = tokio::time::timeout(ends, drive())
                 .await
                 .expect("the driver must not wait on a dead upload")
                 .expect_err("no new attempt can make the suspend durable");

@@ -1228,9 +1228,10 @@ async fn paused_suspend_serializes_resume_behind_wake_and_artifact_locks() {
 
 #[tokio::test]
 async fn permanently_refused_teardown_backup_marks_the_suspending_row_terminal() {
-    // A permanent job failure ends the artifact's upload: the join below
-    // never mints a new attempt, so the suspend can never publish and the
-    // row can never leave `suspending` on its own. Nothing else on the node
+    // A permanent job failure with no recovery attempt left ends the
+    // artifact's upload: an earlier upload of it has failed permanently too,
+    // so the join below never mints a new attempt, the suspend can never
+    // publish, and the row can never leave `suspending` on its own. Nothing else on the node
     // separates that row from a suspend still uploading, which is the
     // distinction the cluster-deleted eviction needs before it may reclaim
     // anything — so the refusal has to be recorded on the row. A retriable
@@ -1254,6 +1255,31 @@ async fn permanently_refused_teardown_backup_marks_the_suspending_row_terminal()
         let execution_generation = ExecutionGeneration::new(7).unwrap();
         let staged =
             insert_stranded_teardown_suspend_sandbox(&conn, sandbox_id, execution_generation);
+        // The artifact's recovery attempt is the upload this teardown joins.
+        if let pplx_space_common_jobs::JobFailure::Permanent { reason } = failure {
+            let earlier = JobId::new();
+            pplx_space_common_jobs::db::insert_job(
+                &conn,
+                pplx_space_common_jobs::db::InsertJob {
+                    job_id: &earlier,
+                    kind: crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
+                    payload: "{}",
+                    subject_id: Some(&sandbox_id_string),
+                    dedup_key: Some(&staged.to_string()),
+                    max_attempts: 1,
+                    traceparent: None,
+                    priority: pplx_space_common_jobs::JobPriority::default(),
+                },
+            )
+            .unwrap();
+            pplx_space_common_jobs::db::fail_job_permanent(
+                &conn,
+                &earlier,
+                "cluster-api rejected BeginArtifactBackup (NotFound): sandbox not found",
+                reason,
+            )
+            .unwrap();
+        }
         let backup_job_id = JobId::new();
         pplx_space_common_jobs::db::insert_job(
             conn.raw(),

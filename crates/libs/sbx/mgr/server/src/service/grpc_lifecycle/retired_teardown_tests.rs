@@ -77,6 +77,14 @@ async fn refused_teardown_with(payload: impl FnOnce(LocalArtifactId) -> String) 
     let staged =
         insert_stranded_teardown_suspend_sandbox(&conn, sandbox_id, generation(GENERATION));
     let job_id = insert_upload_job(&conn, &sandbox_id_string, staged, &payload(staged));
+    // The worker records a refusal naming a retired execution as the
+    // artifact's own.
+    crate::snapshot_upload_jobs::record_failure_scope(
+        &conn,
+        &job_id,
+        crate::snapshot_upload::UploadFailureScope::Artifact,
+    )
+    .unwrap();
     pplx_space_common_jobs::db::fail_job_permanent(
         conn.raw(),
         &job_id,
@@ -1065,6 +1073,10 @@ where
         ),
         ("SPACE_SNAPSHOT_BUCKET", Some(OsStr::new("test-bucket"))),
         ("SPACE_SNAPSHOT_REGION", Some(OsStr::new("us-east-1"))),
+        // Service construction reads its feature-flag provider from the
+        // environment; keep the child off any provider the host configures.
+        ("EPPO_SDK_KEY", None),
+        ("SPACE_FLAGD_ENABLED", None),
     ]);
     if child {
         test().await;

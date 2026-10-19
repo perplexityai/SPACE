@@ -43,9 +43,14 @@ impl SandboxManagerServiceOptions {
     ///   service's `sandbox_runtime_live` and stop and delete target
     ///   selection. A test makes a runtime live by linking that path to an
     ///   existing file;
-    /// - the credential-manager, node-manager and volume-manager sockets are
-    ///   paths under `scratch` that nothing binds, so every call to any of
-    ///   them fails to connect;
+    /// - the credential-manager and node-manager sockets are paths under
+    ///   `scratch` that nothing binds, so every call to either fails to
+    ///   connect;
+    /// - the volume-manager socket that snapshot uploads stage and observe
+    ///   their transfers through is a path under `scratch` that nothing binds.
+    ///   Only snapshot uploads use it: restore, fork, cleanup and the
+    ///   btrfs-send capability probe still dial the host's fixed
+    ///   volume-manager socket;
     /// - the host-control socket is only passed through to node-manager's
     ///   `Launch`, and also sits under `scratch`, so it names no live host
     ///   service;
