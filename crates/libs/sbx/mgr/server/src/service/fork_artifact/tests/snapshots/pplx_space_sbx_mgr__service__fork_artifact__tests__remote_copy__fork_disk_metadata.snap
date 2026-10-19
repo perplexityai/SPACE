@@ -1,0 +1,20 @@
+---
+source: crates/libs/sbx/mgr/server/src/service/fork_artifact/tests/remote_copy.rs
+expression: "serde_json::to_string_pretty(metadata).unwrap()"
+---
+{
+  "version": 1,
+  "sandbox_id": "019f8000-0000-7000-8000-000000000002",
+  "size_bytes": 4,
+  "rootfs_size_bytes": 4,
+  "created_at": "2026-08-04T00:00:00Z",
+  "source": {
+    "runtime": "fc",
+    "template_id": "seed",
+    "content_hash": "content-hash",
+    "rootfs_size_mib": 1024
+  },
+  "rootfs_diff_format": "btrfs-send-v1",
+  "artifact_kind": "disk",
+  "artifact_origin": "fork"
+}

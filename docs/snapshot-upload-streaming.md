@@ -72,6 +72,36 @@ Deploy the credential authority and forwarding agents before copy consumers,
 and volume-manager before sandbox-manager begins submitting copies. Roll back
 consumers first. Existing transfers do not submit copy jobs.
 
+### Suspended-source forks
+
+The existing `CreateSnapshot` durable-artifact source uses server-side copy
+when the source metadata includes `rootfs_size_bytes`. It reads only the
+small metadata object onto the worker, validates the source identity and
+disk/full artifact kind, copies the encoded rootfs object, and waits for the
+copy job to verify the destination. It then publishes projected metadata
+with the new sandbox identity, disk-only size, and no source-local bundle
+or send-source identifiers. Metadata remains the last publication step.
+Memory and VM state objects are never copied.
+
+The source operation retains its existing exact-artifact pin throughout
+publication and restore. The destination is still an operation-owned copy,
+with independent retention; it does not borrow a source object or add a new
+reference-counting table. Neither `/fork` nor `CreateSnapshot` changes.
+
+Older metadata without a logical disk payload size uses the existing
+disk-only pull/push path, which also writes that size into the new metadata.
+Unsupported copy submission or a terminal copy failure may use the same
+compatibility path, with its existing disk admission and credential checks.
+An interrupted wait, timeout, or malformed job response does not start a
+competing transfer or publish metadata: the durable copy may still be active.
+Encrypted source artifacts remain unsupported.
+
+The existing `snapshot.fork_copy.transfer_duration_ms` metric distinguishes
+`operation:copy` from `operation:pull|push`; its `outcome` values stay
+`success|error|timeout`. The copy duration includes queueing and completion
+verification. Published artifact bytes remain logical disk plus metadata
+bytes, not compressed S3 bytes or worker traffic.
+
 ## Memory and scheduling
 
 One service-owned budget caps retained part allocations at the configured

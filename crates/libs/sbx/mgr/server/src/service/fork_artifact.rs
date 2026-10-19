@@ -1,7 +1,15 @@
-use pplx_space_common_core::types::{ArtifactKind, ArtifactOrigin, SandboxId, SnapshotArtifact};
+use pplx_space_common_core::host::disk_admission::{
+    CacheDiskMeasurement, CacheDiskProbeError, read_cache_disk_measurement,
+};
+use pplx_space_common_core::types::{
+    ArtifactKind, ArtifactOrigin, JobId, SandboxId, SnapshotArtifact, SubjectId,
+};
 use pplx_space_volmgr_client::{
     VOLMGR_SOCKET,
-    proto::{ExistingFilePolicy, PullFileRequest, PushFileRequest},
+    proto::{
+        CopyObjectRequest, ExistingFilePolicy, GetTransferJobRequest, PullFileRequest,
+        PushFileRequest, TransferJobStatus,
+    },
     snapshot_artifact_to_proto,
 };
 use std::os::unix::fs::PermissionsExt;
@@ -199,15 +207,7 @@ pub(super) async fn copy_objects(
     service: &super::SandboxManagerService,
     request: CopyObjectsRequest<'_>,
 ) -> Result<Response<crate::proto::CreateSnapshotResponse>, Status> {
-    let CopyObjectsRequest {
-        operation_id,
-        source_sandbox_id,
-        target_sandbox_id,
-        source,
-        destination,
-        destination_storage_uri,
-        destination_origin,
-    } = request;
+    let operation_id = request.operation_id;
     let _copy_permit = acquire_copy_permit(
         Arc::clone(&service.fork_copy_sem),
         Arc::clone(&service.fork_copy_waiting),
@@ -238,79 +238,9 @@ pub(super) async fn copy_objects(
         let mut volmgr = pplx_space_volmgr_client::connect(VOLMGR_SOCKET)
             .await
             .map_err(|error| Status::unavailable(format!("connect to vol-mgr: {error}")))?;
-        let metadata_path = copy_dir.join(SnapshotArtifact::Metadata.file_name());
-        pull_object(
-            &mut volmgr,
-            operation_id,
-            source_sandbox_id,
-            source,
-            SnapshotArtifact::Metadata,
-            &metadata_path,
-        )
-        .await?;
-        let metadata_bytes = tokio::fs::read(&metadata_path)
+        copy_artifact(&mut volmgr, request, &copy_dir, read_cache_disk_measurement)
             .await
-            .map_err(|error| Status::internal(format!("read fork metadata: {error}")))?;
-        let metadata: crate::snapshot_upload::SnapshotMeta =
-            serde_json::from_slice(&metadata_bytes).map_err(|error| {
-                Status::failed_precondition(format!("parse fork metadata: {error}"))
-            })?;
-        admit_copy_staging(metadata.size_bytes).await?;
-        let rootfs_artifact = rootfs_artifact(&metadata)?;
-        let rootfs_path = copy_dir.join(rootfs_artifact.file_name());
-        pull_object(
-            &mut volmgr,
-            operation_id,
-            source_sandbox_id,
-            source,
-            rootfs_artifact,
-            &rootfs_path,
-        )
-        .await?;
-        let rootfs_bytes = tokio::fs::metadata(&rootfs_path)
-            .await
-            .map_err(|error| Status::internal(format!("stat staged fork rootfs: {error}")))?
-            .len();
-        let projected = project_disk_metadata(
-            metadata,
-            source_sandbox_id,
-            target_sandbox_id,
-            rootfs_bytes,
-            destination_origin,
-        )?;
-        let projected_bytes = serde_json::to_vec_pretty(&projected)
-            .map_err(|error| Status::internal(format!("serialize fork metadata: {error}")))?;
-        write_projected_metadata(&metadata_path, &projected_bytes)
-            .map_err(|error| Status::internal(format!("write fork metadata: {error}")))?;
-
-        let rootfs_uploaded = push_object(
-            &mut volmgr,
-            source_sandbox_id,
-            destination,
-            rootfs_artifact,
-            &rootfs_path,
-        )
-        .await?;
-        // The sidecar is the publication marker and must be visible only after
-        // the disk payload is durable at the destination.
-        let metadata_uploaded = push_object(
-            &mut volmgr,
-            source_sandbox_id,
-            destination,
-            SnapshotArtifact::Metadata,
-            &metadata_path,
-        )
-        .await?;
-
-        Ok(Response::new(crate::proto::CreateSnapshotResponse {
-            snapshot_name: String::new(),
-            r#type: crate::proto::SnapshotType::Disk as i32,
-            published_artifact: None,
-            published_durable_artifact: Some(crate::proto::PublishedDurableArtifact {
-                storage_uri: destination_storage_uri,
-                bytes_published: rootfs_uploaded.saturating_add(metadata_uploaded),
-            }),
-        }))
+            .map(Response::new)
     }
     .await;
 
@@ -339,6 +269,212 @@ pub(super) async fn copy_objects(
     }
 }
 
+async fn copy_artifact<Probe>(
+    volmgr: &mut pplx_space_volmgr_client::ConnectedVolumeManagerClient,
+    request: CopyObjectsRequest<'_>,
+    copy_dir: &Path,
+    measure_disk: Probe,
+) -> Result<crate::proto::CreateSnapshotResponse, Status>
+where
+    Probe: FnOnce() -> Result<CacheDiskMeasurement, CacheDiskProbeError> + Send + 'static,
+{
+    let CopyObjectsRequest {
+        operation_id,
+        source_sandbox_id,
+        target_sandbox_id,
+        source,
+        destination,
+        destination_storage_uri,
+        destination_origin,
+    } = request;
+    let metadata_path = copy_dir.join(SnapshotArtifact::Metadata.file_name());
+    pull_object(
+        volmgr,
+        operation_id,
+        source_sandbox_id,
+        source,
+        SnapshotArtifact::Metadata,
+        &metadata_path,
+    )
+    .await?;
+    let metadata_bytes = tokio::fs::read(&metadata_path)
+        .await
+        .map_err(|error| Status::internal(format!("read fork metadata: {error}")))?;
+    let metadata: crate::snapshot_upload::SnapshotMeta = serde_json::from_slice(&metadata_bytes)
+        .map_err(|error| Status::failed_precondition(format!("parse fork metadata: {error}")))?;
+    if metadata.sandbox_id != source_sandbox_id.to_string() {
+        return Err(Status::failed_precondition(
+            "snapshot metadata belongs to a different source sandbox",
+        ));
+    }
+    let rootfs_artifact = rootfs_artifact(&metadata)?;
+    let copied_disk_size = if let Some(size) = metadata.rootfs_size_bytes {
+        match copy_remote_disk(
+            volmgr,
+            source_sandbox_id,
+            source,
+            destination,
+            rootfs_artifact,
+        )
+        .await
+        {
+            Ok(()) => Some(size),
+            Err(error)
+                if matches!(
+                    error.code(),
+                    tonic::Code::Unimplemented
+                        | tonic::Code::InvalidArgument
+                        | tonic::Code::FailedPrecondition
+                        | tonic::Code::Aborted
+                ) =>
+            {
+                tracing::warn!(%operation_id, %error, "server-side disk copy unavailable; using disk transfer");
+                None
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
+    let rootfs_bytes = if let Some(size) = copied_disk_size {
+        size
+    } else {
+        admit_copy_staging(
+            metadata.rootfs_size_bytes.unwrap_or(metadata.size_bytes),
+            measure_disk,
+        )
+        .await?;
+        let rootfs_path = copy_dir.join(rootfs_artifact.file_name());
+        pull_object(
+            volmgr,
+            operation_id,
+            source_sandbox_id,
+            source,
+            rootfs_artifact,
+            &rootfs_path,
+        )
+        .await?;
+        let size = tokio::fs::metadata(&rootfs_path)
+            .await
+            .map_err(|error| Status::internal(format!("stat staged fork rootfs: {error}")))?
+            .len();
+        if metadata
+            .rootfs_size_bytes
+            .is_some_and(|expected| expected != size)
+        {
+            return Err(Status::failed_precondition(
+                "fork disk length differs from source metadata",
+            ));
+        }
+        push_object(
+            volmgr,
+            source_sandbox_id,
+            destination,
+            rootfs_artifact,
+            &rootfs_path,
+        )
+        .await?;
+        size
+    };
+    let projected = project_disk_metadata(
+        metadata,
+        source_sandbox_id,
+        target_sandbox_id,
+        rootfs_bytes,
+        destination_origin,
+    )?;
+    let projected_bytes = serde_json::to_vec_pretty(&projected)
+        .map_err(|error| Status::internal(format!("serialize fork metadata: {error}")))?;
+    write_projected_metadata(&metadata_path, &projected_bytes)
+        .map_err(|error| Status::internal(format!("write fork metadata: {error}")))?;
+
+    // The sidecar is the publication marker and must be visible only after
+    // the disk payload is durable at the destination.
+    let metadata_uploaded = push_object(
+        volmgr,
+        source_sandbox_id,
+        destination,
+        SnapshotArtifact::Metadata,
+        &metadata_path,
+    )
+    .await?;
+
+    Ok(crate::proto::CreateSnapshotResponse {
+        snapshot_name: String::new(),
+        r#type: crate::proto::SnapshotType::Disk as i32,
+        published_artifact: None,
+        published_durable_artifact: Some(crate::proto::PublishedDurableArtifact {
+            storage_uri: destination_storage_uri,
+            bytes_published: rootfs_bytes.saturating_add(metadata_uploaded),
+        }),
+    })
+}
+
+async fn copy_remote_disk(
+    volmgr: &mut pplx_space_volmgr_client::ConnectedVolumeManagerClient,
+    sandbox_id: SandboxId,
+    source: &crate::snapshot_upload::SnapshotUploadConfig,
+    destination: &crate::snapshot_upload::SnapshotUploadConfig,
+    artifact: SnapshotArtifact,
+) -> Result<(), Status> {
+    bounded_transfer(
+        async {
+            let submitted = volmgr
+                .submit_copy_object(CopyObjectRequest {
+                    subject_id: SubjectId::Sandbox(sandbox_id).to_string(),
+                    source_s3_uri: artifact_uri(source, artifact),
+                    destination_s3_uri: artifact_uri(destination, artifact),
+                })
+                .await
+                .map_err(|error| match error.code() {
+                    tonic::Code::Unimplemented
+                    | tonic::Code::InvalidArgument
+                    | tonic::Code::FailedPrecondition
+                    | tonic::Code::PermissionDenied
+                    | tonic::Code::Unauthenticated => error,
+                    _ => Status::unavailable(format!("submit fork disk copy: {error}")),
+                })?
+                .into_inner();
+            let job_id: JobId = submitted
+                .job_id
+                .parse()
+                .map_err(|error| Status::internal(format!("invalid disk copy job ID: {error}")))?;
+            // A disconnected wait is not proof that the durable writer stopped.
+            // Only a known terminal failure permits a competing disk transfer.
+            let response = volmgr
+                .wait_transfer_job(GetTransferJobRequest {
+                    job_id: job_id.to_string(),
+                })
+                .await
+                .map_err(|error| Status::unavailable(format!("wait for fork disk copy: {error}")))?
+                .into_inner();
+            let job = response
+                .job
+                .ok_or_else(|| Status::internal("disk copy response has no job"))?;
+            if job.job_id != job_id.to_string() {
+                return Err(Status::internal(
+                    "disk copy response has a different job ID",
+                ));
+            }
+            match TransferJobStatus::try_from(job.status).ok() {
+                Some(TransferJobStatus::Completed) => Ok(()),
+                Some(TransferJobStatus::Failed) => {
+                    Err(Status::aborted("server-side disk copy failed"))
+                }
+                Some(TransferJobStatus::Cancelled) => {
+                    Err(Status::cancelled("server-side disk copy cancelled"))
+                }
+                _ => Err(Status::unavailable(
+                    "disk copy has not reached a terminal state",
+                )),
+            }
+        },
+        FORK_COPY_TRANSFER_DEADLINE,
+        "copy",
+    )
+    .await
+}
+
 async fn acquire_copy_permit(
     semaphore: Arc<tokio::sync::Semaphore>,
     waiting_count: Arc<std::sync::atomic::AtomicUsize>,
@@ -364,16 +500,17 @@ async fn acquire_copy_permit(
     })
 }
 
-async fn admit_copy_staging(required_bytes: u64) -> Result<(), Status> {
-    use pplx_space_common_core::host::disk_admission::{
-        CacheDiskAdmissionConfig, read_cache_disk_measurement,
-    };
+async fn admit_copy_staging<Probe>(required_bytes: u64, measure_disk: Probe) -> Result<(), Status>
+where
+    Probe: FnOnce() -> Result<CacheDiskMeasurement, CacheDiskProbeError> + Send + 'static,
+{
+    use pplx_space_common_core::host::disk_admission::CacheDiskAdmissionConfig;
 
     let config = CacheDiskAdmissionConfig::from_env();
     if !config.enabled {
         return Ok(());
     }
-    let measurement = tokio::task::spawn_blocking(read_cache_disk_measurement)
+    let measurement = tokio::task::spawn_blocking(measure_disk)
         .await
         .map_err(|error| Status::unavailable(format!("probe fork copy disk admission: {error}")))?
         .map_err(|error| Status::unavailable(format!("probe fork copy disk admission: {error}")))?;
@@ -420,6 +557,7 @@ fn project_disk_metadata(
     validate_disk_projection_source(&metadata)?;
     metadata.sandbox_id = destination_sandbox_id.to_string();
     metadata.size_bytes = rootfs_bytes;
+    metadata.rootfs_size_bytes = Some(rootfs_bytes);
     // The copy has the stream, never the source's node-local bundle.
     metadata.rootfs_send_source_id = None;
     metadata.local_artifact_id = None;

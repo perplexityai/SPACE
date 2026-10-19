@@ -3,6 +3,8 @@ use pplx_space_common_core::types::LocalArtifactId;
 use super::*;
 use std::time::Duration;
 
+mod remote_copy;
+
 #[tokio::test]
 async fn cancelled_copy_attempt_removes_its_staging_directory() {
     let root = tempfile::tempdir().unwrap();
@@ -82,6 +84,7 @@ fn copied_metadata_keeps_only_portable_disk_identity() {
     .expect("suspended disk is forkable");
     assert_eq!(projected.sandbox_id, destination_sandbox_id.to_string());
     assert_eq!(projected.size_bytes, 42);
+    assert_eq!(projected.rootfs_size_bytes, Some(42));
     assert_eq!(projected.artifact_kind, Some(ArtifactKind::Disk));
     assert_eq!(projected.artifact_origin, Some(ArtifactOrigin::Fork));
     assert_eq!(projected.local_artifact_id, None);

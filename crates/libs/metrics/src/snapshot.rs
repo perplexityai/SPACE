@@ -162,6 +162,9 @@ pub fn fork_copy_queue_wait(started_at: Instant) {
     );
 }
 
+/// Per-transfer fork latency: `operation:pull|push|copy` and
+/// `outcome:success|error|timeout`. Copy includes job admission and waiting
+/// for server-side completion, not worker payload traffic.
 pub fn fork_copy_transfer(operation: &str, outcome: &str, started_at: Instant) {
     timing_ms(
         "snapshot.fork_copy.transfer_duration_ms",
