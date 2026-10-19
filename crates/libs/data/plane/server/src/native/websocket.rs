@@ -34,22 +34,34 @@ pub(crate) async fn handle_socket(
     source_ip: IpAddr,
     session_id: DataPlaneSessionId,
     header_token: Option<String>,
-    mut socket: WebSocket,
+    socket: WebSocket,
 ) {
-    let Ok(_guard) = state.unauthenticated.try_register(source_ip) else {
-        pplx_space_metrics::data_plane::attach(
-            session_id.kind().as_str(),
-            "too_many_unauthenticated_sockets",
-        );
-        let _ = socket
-            .send(Message::Text(
-                error_json(DataPlaneErrorCode::TooManyUnauthenticatedSockets).into(),
-            ))
-            .await;
-        let _ = socket.close().await;
+    let Ok(guard) = state.unauthenticated.try_register(source_ip) else {
+        refuse_unauthenticated_socket(session_id.kind().as_str(), socket).await;
         return;
     };
+    attach_registered_socket(state, guard, session_id, header_token, socket).await;
+}
 
+pub(super) async fn refuse_unauthenticated_socket(kind: &'static str, mut socket: WebSocket) {
+    pplx_space_metrics::data_plane::attach(kind, "too_many_unauthenticated_sockets");
+    let _ = socket
+        .send(Message::Text(
+            error_json(DataPlaneErrorCode::TooManyUnauthenticatedSockets).into(),
+        ))
+        .await;
+    let _ = socket.close().await;
+}
+
+/// Authenticate, attach and bridge a socket that already holds its slot in
+/// the unauthenticated-socket cap, which is released once it attaches.
+pub(super) async fn attach_registered_socket(
+    state: DataPlaneState,
+    unauthenticated_guard: UnauthenticatedUpgradeGuard,
+    session_id: DataPlaneSessionId,
+    header_token: Option<String>,
+    mut socket: WebSocket,
+) {
     // Authenticating and resolving the route can wait on the client's first
     // frame, so race it against the drain: a socket that has not attached by
     // the time the drain starts is told to reconnect at once rather than
@@ -103,7 +115,7 @@ pub(crate) async fn handle_socket(
         }
     };
 
-    drop(_guard);
+    drop(unauthenticated_guard);
     let _ = socket
         .send(Message::Text(attached_json(&attached).into()))
         .await;
