@@ -211,12 +211,66 @@ fn mounted_operations() -> Vec<(NativeOperation, MethodRouter<AppState>)> {
     ]
 }
 
+/// Native operations whose worker calls fail over from a sandbox pod that
+/// does not answer: the data plane (files, processes, sessions, ports) and the
+/// sandbox reads that query the guest. Lifecycle, policy and control-plane
+/// operations keep the default worker behavior; see
+/// [`crate::controllers::substrate::native_access`].
+fn fails_over_from_silent_pods(operation: NativeOperation) -> bool {
+    [
+        native::GET_SANDBOX,
+        native::GET_SANDBOX_STATS,
+        native::STREAM_SANDBOX_METRICS,
+        native::CREATE_TERMINAL_SESSION,
+        native::CREATE_PROCESS_SESSION,
+        native::CREATE_COMMAND,
+        native::CREATE_FILE_WATCH_SESSION,
+        native::CREATE_PORT_SESSION,
+        native::CREATE_PROTOCOL_SESSION,
+        native::LIST_PROCESSES,
+        native::GET_PROCESS,
+        native::SIGNAL_PROCESS,
+        native::KILL_PROCESS,
+        native::LIST_PORTS,
+        native::OPEN_PORT,
+        native::CLOSE_PORT,
+        native::STAT_FILE,
+        native::LIST_FILES,
+        native::READ_FILE,
+        native::WRITE_FILE,
+        native::WRITE_FILE_BATCH,
+        native::ENABLE_FILE_CHANGES,
+        native::DISABLE_FILE_CHANGES,
+        native::LIST_MODIFIED_FILES,
+        native::CREATE_DIRECTORY,
+        native::REMOVE_FILE,
+        native::RENAME_FILE,
+    ]
+    .iter()
+    .any(|candidate| {
+        candidate.relative_runtime_path() == operation.relative_runtime_path()
+            && candidate.method() == operation.method()
+    })
+}
+
+async fn native_data_plane(
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> axum::response::Response {
+    crate::controllers::substrate::native_access::scope(next.run(request)).await
+}
+
 pub fn v1_router(state: AppState) -> Router<AppState> {
     let mut mounted = BTreeSet::new();
     let mut router = Router::new();
     for (operation, method_router) in mounted_operations() {
         let path = operation.relative_runtime_path();
         if mounted.insert((path, operation.method())) {
+            let method_router = if fails_over_from_silent_pods(operation) {
+                method_router.layer(middleware::from_fn(native_data_plane))
+            } else {
+                method_router
+            };
             router = router.route(path, method_router);
         }
     }
@@ -233,3 +287,7 @@ pub fn v1_router(state: AppState) -> Router<AppState> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "native_data_plane_tests.rs"]
+mod native_data_plane_tests;

@@ -81,6 +81,7 @@ use sqlx::{PgPool, Postgres, Transaction};
 
 mod execution_fence;
 mod local_artifact;
+pub(crate) mod native_access;
 mod node_api_client;
 mod pool_claims;
 mod recovery_charge;

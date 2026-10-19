@@ -48,6 +48,102 @@ impl KubernetesSubstrate {
             .await
     }
 
+    /// The kept worker client a runtime or access path hands out for
+    /// `sandbox_id`'s resolved `pod`. A Native data-plane request (see
+    /// [`crate::controllers::substrate::native_access`]) gets
+    /// [`Self::native_kept_worker_client`]; every other caller gets
+    /// [`Self::kept_worker_client`], unchanged.
+    pub(super) async fn access_kept_worker_client(
+        &self,
+        sandbox_id: SandboxId,
+        pod: &ResolvedPodInstance,
+    ) -> Result<RuntimeClient, ControllerError> {
+        if crate::controllers::substrate::native_access::active() {
+            return self.native_kept_worker_client(sandbox_id, pod).await;
+        }
+        self.kept_worker_client(pod).await
+    }
+
+    /// [`Self::kept_worker_client`] for a Native data-plane request, which
+    /// fails over from a pod that does not answer instead of waiting out the
+    /// full connect budget on its address.
+    ///
+    /// A miss first dials once within [`POD_WORKER_FIRST_DIAL_TIMEOUT`]. If
+    /// that fails, the sandbox's pod is resolved again: the same instance is
+    /// dialed with the full connect budget, as every other caller dials it; a
+    /// replacement is dialed at its own address; and no pod returns the first
+    /// dial's error, so the caller's recovery path takes over at once. The
+    /// client also reports how it used its connection if the request holds it
+    /// long; see [`super::super::KeptCallReport`].
+    pub(super) async fn native_kept_worker_client(
+        &self,
+        sandbox_id: SandboxId,
+        pod: &ResolvedPodInstance,
+    ) -> Result<RuntimeClient, ControllerError> {
+        let first = self
+            .kept_worker_client_reported(pod, Some(POD_WORKER_FIRST_DIAL_TIMEOUT))
+            .await;
+        let Err(first_error) = first else {
+            return first;
+        };
+        let current = match self.resolve_pod_instance(sandbox_id).await {
+            Ok(Some(current)) => current,
+            Ok(None) => {
+                pplx_space_metrics::grpc::client_channel_cache("worker-node-api", "pod_gone");
+                return Err(first_error);
+            }
+            Err(_) => return Err(first_error),
+        };
+        if !current.same_instance(pod) {
+            pplx_space_metrics::grpc::client_channel_cache("worker-node-api", "pod_moved");
+        }
+        self.kept_worker_client_reported(&current, None).await
+    }
+
+    /// The kept client for `pod`, its miss dialed with the default policy
+    /// or, given `first_dial`, once within it; reported as
+    /// [`super::super::KeptCallReport`] describes.
+    async fn kept_worker_client_reported(
+        &self,
+        pod: &ResolvedPodInstance,
+        first_dial: Option<Duration>,
+    ) -> Result<RuntimeClient, ControllerError> {
+        let port = self.k8s.sandbox_proxy_port;
+        let key = super::pod_worker_channels::PodWorkerKey {
+            addr: pod.ip.socket_addr(port),
+            pod_uid: pod.pod_uid.clone(),
+            generation: pod.generation,
+        };
+        let pod_ip = pod.ip;
+        let (client, handout) = self
+            .pod_worker_channels
+            .client_with_handout(key, async move {
+                let endpoint =
+                    Self::endpoint_for_pod_ip(pod_ip, port).map_err(ControllerError::from)?;
+                let Some(bound) = first_dial else {
+                    return crate::controllers::substrate::connect_worker_watched(endpoint).await;
+                };
+                // Bounding the attempt from outside, rather than through the
+                // endpoint's connect timeout, leaves the kept channel's own
+                // redials at the bound every other caller's channel has.
+                tokio::time::timeout(
+                    bound,
+                    crate::controllers::substrate::connect_worker_watched_with(
+                        endpoint,
+                        pplx_space_common_grpc::GrpcRetryPolicy::none(),
+                    ),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(ControllerError::service_unavailable(format!(
+                        "node-api not reachable: no connection within {bound:?}"
+                    )))
+                })
+            })
+            .await?;
+        Ok(client.with_report(handout.kept, handout.connection_age, handout.idle))
+    }
+
     pub(super) fn should_allow_access_recovery(
         sandbox: &Sandbox,
         activity: ExecutionActivityKind,

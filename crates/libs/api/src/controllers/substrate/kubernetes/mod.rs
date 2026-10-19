@@ -100,6 +100,13 @@ const START_WAIT_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const RESIDENT_WAKE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const START_WAIT_COMMAND_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 const POD_WORKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// The first dial to a sandbox pod's kept channel from a Native data-plane
+/// request. An in-cluster pod answers a SYN within milliseconds, so one that
+/// has not within a second has most likely gone, or lost the SYN; either
+/// way, the pod is resolved again before a longer dial, rather than waiting
+/// out [`POD_WORKER_CONNECT_TIMEOUT`] on the old address first. A lost SYN
+/// costs about what the kernel's own first retransmit, at one second, would.
+const POD_WORKER_FIRST_DIAL_TIMEOUT: Duration = Duration::from_secs(1);
 const DEFAULT_CREATE_DATA_PLANE_READY_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_CREATE_COMMAND_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Overall wall-clock budget for the create path's combined readiness wait.
@@ -363,6 +370,13 @@ struct ResolvedPodInstance {
     ip: PodIp,
     pod_uid: Option<PodUid>,
     generation: i64,
+}
+
+impl ResolvedPodInstance {
+    /// Whether `other` is the same pod instance at the same address.
+    fn same_instance(&self, other: &Self) -> bool {
+        self.ip == other.ip && self.pod_uid == other.pod_uid && self.generation == other.generation
+    }
 }
 
 impl std::fmt::Display for PodIp {

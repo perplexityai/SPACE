@@ -13,7 +13,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 use hyper_util::rt::TokioIo;
@@ -24,6 +24,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 #[derive(Clone, Debug, Default)]
 pub struct ConnectionWatch {
     closed: Arc<AtomicBool>,
+    connections: Arc<AtomicUsize>,
 }
 
 impl ConnectionWatch {
@@ -35,6 +36,12 @@ impl ConnectionWatch {
     /// stays up for whoever still holds its channel.
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
+    }
+
+    /// How many connections the watched channel has opened: one for its
+    /// dial, plus one for each redial an RPC made after a connection ended.
+    pub fn connections_opened(&self) -> usize {
+        self.connections.load(Ordering::Acquire)
     }
 }
 
@@ -126,6 +133,7 @@ where
         let watch = self.watch.clone();
         Box::pin(async move {
             let stream = connecting.await?.into_inner();
+            watch.connections.fetch_add(1, Ordering::AcqRel);
             Ok(TokioIo::new(WatchedStream {
                 inner: stream,
                 watch,

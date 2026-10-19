@@ -51,6 +51,17 @@ pub(super) struct PodWorkerKey {
     pub(super) generation: i64,
 }
 
+/// How [`PodWorkerChannels::client_with_handout`] produced a client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Handout {
+    /// An already kept channel, rather than a fresh dial.
+    pub(super) kept: bool,
+    /// How long ago the kept channel was dialed.
+    pub(super) connection_age: Duration,
+    /// How long the kept channel went unused before this handout.
+    pub(super) idle: Duration,
+}
+
 #[derive(Default)]
 pub(super) struct PodWorkerChannels {
     // A plain map behind one lock, never held across a dial.
@@ -95,6 +106,53 @@ impl PodWorkerChannels {
         pplx_space_metrics::grpc::client_channel_cache(SERVICE, "miss");
         let (channel, watch) = dial.await?;
         Ok(self.keep(key, channel, watch, Instant::now()))
+    }
+
+    /// [`Self::client`] that also reports how the client was handed out.
+    pub(super) async fn client_with_handout<F>(
+        &self,
+        key: PodWorkerKey,
+        dial: F,
+    ) -> Result<(RuntimeClient, Handout), ControllerError>
+    where
+        F: Future<Output = Result<(Channel, ConnectionWatch), ControllerError>>,
+    {
+        let now = Instant::now();
+        if let Some((client, handout)) = self.live_with_handout(&key, now) {
+            pplx_space_metrics::grpc::client_channel_cache(SERVICE, "hit");
+            return Ok((client, handout));
+        }
+        pplx_space_metrics::grpc::client_channel_cache(SERVICE, "miss");
+        let (channel, watch) = dial.await?;
+        let client = self.keep(key, channel, watch, Instant::now());
+        Ok((
+            client,
+            Handout {
+                kept: false,
+                connection_age: Duration::ZERO,
+                idle: Duration::ZERO,
+            },
+        ))
+    }
+
+    fn live_with_handout(
+        &self,
+        key: &PodWorkerKey,
+        now: Instant,
+    ) -> Option<(RuntimeClient, Handout)> {
+        let mut entries = self.lock();
+        let entry = entries.get_mut(key)?;
+        if !entry.is_live(now) {
+            entries.remove(key);
+            return None;
+        }
+        let handout = Handout {
+            kept: true,
+            connection_age: now.saturating_duration_since(entry.created_at),
+            idle: now.saturating_duration_since(entry.last_used),
+        };
+        entry.last_used = now;
+        Some((entry.client(), handout))
     }
 
     fn live(&self, key: &PodWorkerKey, now: Instant) -> Option<RuntimeClient> {

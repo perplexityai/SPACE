@@ -207,6 +207,54 @@ async fn a_watched_channel_reports_when_its_peer_closes_the_connection() {
     .expect("the watch closes with the connection");
 }
 
+// The watch counts the connections its channel opens, so an RPC that had to
+// redial after the connection ended can be told from one that waited on it.
+#[tokio::test]
+async fn a_watch_counts_the_redials_its_channel_makes() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, server) = serve_tcp_health(listener).await;
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+        .unwrap()
+        .connect_timeout(Duration::from_secs(1));
+    let (channel, watch) = super::connect_tcp_channel_with_retry_watched(
+        "test-backend",
+        address.to_string(),
+        endpoint,
+        None,
+        crate::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
+    )
+    .await
+    .expect("first dial");
+    let mut client = HealthClient::new(channel);
+    client.check(health_request()).await.expect("served");
+    client.check(health_request()).await.expect("served");
+    assert_eq!(
+        watch.connections_opened(),
+        1,
+        "calls share the dialed connection"
+    );
+
+    stop.send(()).unwrap();
+    server.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !watch.is_closed() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the watch closes with the connection");
+    let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+    let (stop, server) = serve_tcp_health(listener).await;
+    client
+        .check(health_request())
+        .await
+        .expect("the channel redials the restarted peer");
+    assert_eq!(watch.connections_opened(), 2, "the redial is counted");
+    stop.send(()).unwrap();
+    server.await.unwrap();
+}
+
 // A holder can retire a connection on its own evidence; every clone sees it.
 #[tokio::test]
 async fn closing_a_watch_is_seen_by_every_clone() {

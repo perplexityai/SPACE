@@ -1498,7 +1498,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
             .resolve_pod_instance(sandbox_id)
             .await
             .map_err(ControllerError::from)?
-            && let Ok(client) = self.kept_worker_client(&pod).await
+            && let Ok(client) = self.access_kept_worker_client(sandbox_id, &pod).await
         {
             return Ok(client);
         }
@@ -1558,7 +1558,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
             return Ok(None);
         };
 
-        match self.kept_worker_client(&pod).await {
+        match self.access_kept_worker_client(sandbox_id, &pod).await {
             Ok(client) => Ok(Some(client)),
             Err(_) => Ok(None),
         }
@@ -1658,7 +1658,7 @@ impl SubstrateAdapter for KubernetesSubstrate {
                     }
                 }
             }
-            if let Ok(client) = self.kept_worker_client(&pod).await {
+            if let Ok(client) = self.access_kept_worker_client(sandbox.id, &pod).await {
                 return Ok(client);
             }
         }

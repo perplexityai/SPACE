@@ -12,6 +12,79 @@ pub struct RuntimeClient {
     pub(super) channel: Channel,
     /// Set when `channel` is a cached channel that other callers share.
     pub(super) kept: Option<pplx_space_common_grpc::ConnectionWatch>,
+    /// Set for a Native data-plane request's client; see [`KeptCallReport`].
+    #[cfg(feature = "kubernetes")]
+    pub(super) report: Option<std::sync::Arc<KeptCallReport>>,
+}
+
+/// How long a Native data-plane request may hold its worker client before
+/// [`KeptCallReport`] describes the connection it used.
+#[cfg(feature = "kubernetes")]
+pub(super) const SLOW_KEPT_CALL: Duration = Duration::from_millis(2500);
+
+/// Describes, once the last clone of a Native request's worker client is
+/// dropped after at least [`SLOW_KEPT_CALL`], the connection the request
+/// used, so a slow call can be attributed. A call that waited on a dialed
+/// connection which then had to be redialed opened a new connection; one on
+/// a connection whose peer went silent ends with it closed (its keepalive
+/// timed out); one that waited on a live connection, behind loss or flow
+/// control, ends with neither.
+#[cfg(feature = "kubernetes")]
+#[derive(Debug)]
+pub(super) struct KeptCallReport {
+    pub(super) handed_out: std::time::Instant,
+    pub(super) kept: bool,
+    pub(super) connection_age: Duration,
+    pub(super) idle: Duration,
+    pub(super) connections_at_handout: usize,
+    pub(super) watch: pplx_space_common_grpc::ConnectionWatch,
+}
+
+#[cfg(feature = "kubernetes")]
+impl KeptCallReport {
+    /// What [`Drop`] reports, if anything: the fields of its event.
+    pub(super) fn slow_call(&self) -> Option<SlowKeptCall> {
+        let held = self.handed_out.elapsed();
+        (held >= SLOW_KEPT_CALL).then(|| SlowKeptCall {
+            held,
+            kept: self.kept,
+            connection_age: self.connection_age,
+            idle: self.idle,
+            redials: self
+                .watch
+                .connections_opened()
+                .saturating_sub(self.connections_at_handout),
+            connection_closed: self.watch.is_closed(),
+        })
+    }
+}
+
+#[cfg(feature = "kubernetes")]
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct SlowKeptCall {
+    pub(super) held: Duration,
+    pub(super) kept: bool,
+    pub(super) connection_age: Duration,
+    pub(super) idle: Duration,
+    pub(super) redials: usize,
+    pub(super) connection_closed: bool,
+}
+
+#[cfg(feature = "kubernetes")]
+impl Drop for KeptCallReport {
+    fn drop(&mut self) {
+        if let Some(slow) = self.slow_call() {
+            tracing::warn!(
+                held_ms = slow.held.as_millis() as u64,
+                kept = slow.kept,
+                connection_age_ms = slow.connection_age.as_millis() as u64,
+                idle_before_ms = slow.idle.as_millis() as u64,
+                redials = slow.redials,
+                connection_closed = slow.connection_closed,
+                "native worker call held its pod connection a long time"
+            );
+        }
+    }
 }
 
 impl RuntimeClient {
@@ -21,6 +94,8 @@ impl RuntimeClient {
             worker: WorkerApiClient::new(transport),
             channel,
             kept: None,
+            #[cfg(feature = "kubernetes")]
+            report: None,
         }
     }
 
@@ -31,6 +106,27 @@ impl RuntimeClient {
             kept: Some(watch),
             ..Self::new(channel)
         }
+    }
+
+    /// This kept client, reporting its use as [`KeptCallReport`] describes.
+    #[cfg(feature = "kubernetes")]
+    pub(super) fn with_report(
+        mut self,
+        kept: bool,
+        connection_age: Duration,
+        idle: Duration,
+    ) -> Self {
+        if let Some(watch) = &self.kept {
+            self.report = Some(std::sync::Arc::new(KeptCallReport {
+                handed_out: std::time::Instant::now(),
+                kept,
+                connection_age,
+                idle,
+                connections_at_handout: watch.connections_opened(),
+                watch: watch.clone(),
+            }));
+        }
+        self
     }
 
     /// Stop handing this client's cached channel to later callers, so the
@@ -292,6 +388,20 @@ pub(super) const KEPT_WORKER_CONNECTION_WINDOW_BYTES: u32 = 32 * 1024 * 1024;
 pub(super) async fn connect_worker_watched(
     endpoint: Endpoint,
 ) -> Result<(Channel, pplx_space_common_grpc::ConnectionWatch), ControllerError> {
+    connect_worker_watched_with(
+        endpoint,
+        pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
+    )
+    .await
+}
+
+/// [`connect_worker_watched`] with its first dial retried under
+/// `retry_policy`.
+#[cfg(feature = "kubernetes")]
+pub(super) async fn connect_worker_watched_with(
+    endpoint: Endpoint,
+    retry_policy: pplx_space_common_grpc::GrpcRetryPolicy,
+) -> Result<(Channel, pplx_space_common_grpc::ConnectionWatch), ControllerError> {
     // A kept connection carries every call to its pod, so it needs its own
     // liveness check: ping it while idle too, so a peer lost without a FIN is
     // torn down before the next caller reuses it, rather than only once a
@@ -307,11 +417,7 @@ pub(super) async fn connect_worker_watched(
         .initial_connection_window_size(KEPT_WORKER_CONNECTION_WINDOW_BYTES);
     node_api_connect_endpoint(endpoint)
         .await?
-        .connect_with_retry_watched(
-            "worker-node-api",
-            "worker-node-api",
-            pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY,
-        )
+        .connect_with_retry_watched("worker-node-api", "worker-node-api", retry_policy)
         .await
         .map_err(|err| {
             ControllerError::service_unavailable(format!("node-api not reachable: {err}"))

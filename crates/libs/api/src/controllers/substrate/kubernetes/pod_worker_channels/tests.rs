@@ -174,3 +174,32 @@ async fn a_new_entry_sweeps_retired_ones_and_the_map_is_bounded() {
     assert_eq!(channels.len(), MAX_ENTRIES);
     assert!(channels.live(&overflow, start).is_none());
 }
+
+#[test]
+fn a_native_client_describes_its_connection_only_after_a_long_hold() {
+    use crate::controllers::substrate::{KeptCallReport, SLOW_KEPT_CALL};
+
+    let watch = ConnectionWatch::default();
+    let report = |held: Duration| KeptCallReport {
+        handed_out: Instant::now() - held,
+        kept: true,
+        connection_age: Duration::from_secs(40),
+        idle: Duration::from_millis(30),
+        connections_at_handout: watch.connections_opened(),
+        watch: watch.clone(),
+    };
+    assert_eq!(report(Duration::ZERO).slow_call(), None);
+
+    watch.close();
+    let slow = report(SLOW_KEPT_CALL + Duration::from_millis(1))
+        .slow_call()
+        .expect("a long hold is described");
+    assert!(slow.kept);
+    assert_eq!(slow.connection_age, Duration::from_secs(40));
+    assert_eq!(slow.idle, Duration::from_millis(30));
+    assert_eq!(slow.redials, 0);
+    assert!(
+        slow.connection_closed,
+        "the connection ended while it was held"
+    );
+}
