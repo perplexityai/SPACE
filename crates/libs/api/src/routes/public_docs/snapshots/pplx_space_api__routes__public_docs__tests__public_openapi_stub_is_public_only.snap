@@ -37,6 +37,9 @@ expression: paths_by_method
   "/sandboxes/{sandbox_id}/files:changes_enable": [
     "post"
   ],
+  "/sandboxes/{sandbox_id}/files:glob": [
+    "post"
+  ],
   "/sandboxes/{sandbox_id}/files:list": [
     "post"
   ],

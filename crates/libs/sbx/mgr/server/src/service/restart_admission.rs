@@ -249,6 +249,7 @@ restart_rpcs! {
     SandboxSpacedEnableFileChanges => ("/space.sandbox.manager.v1.SandboxManager/SpacedEnableFileChanges", StateWriter),
     SandboxSpacedDisableFileChanges => ("/space.sandbox.manager.v1.SandboxManager/SpacedDisableFileChanges", StateWriter),
     SandboxSpacedGetModifiedFiles => ("/space.sandbox.manager.v1.SandboxManager/SpacedGetModifiedFiles", ReadOnlyWithNarrowStateWrites),
+    SandboxSpacedGlob => ("/space.sandbox.manager.v1.SandboxManager/SpacedGlob", ReadOnlyWithNarrowStateWrites),
     SandboxSpacedStartProcess => ("/space.sandbox.manager.v1.SandboxManager/SpacedStartProcess", StateWriter),
     SandboxSpacedConnectProcess => ("/space.sandbox.manager.v1.SandboxManager/SpacedConnectProcess", ReadOnlyWithNarrowStateWrites),
     SandboxSpacedListProcesses => ("/space.sandbox.manager.v1.SandboxManager/SpacedListProcesses", ReadOnlyWithNarrowStateWrites),

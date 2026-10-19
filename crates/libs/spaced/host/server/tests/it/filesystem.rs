@@ -85,6 +85,66 @@ async fn metadata_fallback_only_on_opening_unimplemented() {
 }
 
 #[tokio::test]
+async fn glob_relays_matches_and_names_guests_that_predate_it() {
+    use crate::mock_bridge_guest::{MockBridgeGuest, start_mock_bridge_guest_with_service};
+    use pplx_space_common_grpc::{GuestCapability, GuestCapabilityUnsupported};
+    use tonic::Code;
+
+    for guest_error in [
+        None,
+        Some(Code::Unimplemented),
+        Some(Code::PermissionDenied),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("guest.sock");
+        let bridge = start_mock_bridge_guest_with_service(
+            socket.clone(),
+            MockBridgeGuest {
+                metadata_open_error: guest_error,
+                ..Default::default()
+            },
+        )
+        .await;
+        let fixture = HostFixture::start(Some(socket)).await;
+        let client = fixture.client().await;
+        let result = client
+            .glob_as_user(
+                pplx_space_spaced_host_client::proto::GlobRequest {
+                    search_dir: "/tmp/test-dir".into(),
+                    pattern: "**/*.rs".into(),
+                    skip_dirs: vec!["target".into()],
+                    max_results: 7,
+                    user: None,
+                },
+                None,
+            )
+            .await;
+        match guest_error {
+            None => {
+                let response = result.expect("glob");
+                assert!(response.truncated);
+                let [entry] = response.matches.as_slice() else {
+                    panic!("one match expected: {response:?}");
+                };
+                assert_eq!(entry.path, "/tmp/test-dir:**/*.rs");
+                assert_eq!(entry.size_bytes, 7);
+                assert_eq!(entry.modified_at, Some(timestamp_from_millis(1_000)));
+            }
+            Some(Code::Unimplemented) => {
+                let status = result.expect_err("an older guest cannot glob");
+                assert_eq!(
+                    GuestCapabilityUnsupported::from_status(&status).map(|error| error.capability),
+                    Some(GuestCapability::FileGlob),
+                );
+            }
+            Some(code) => assert_eq!(result.expect_err("guest refusal").code(), code),
+        }
+        fixture.stop().await;
+        bridge.abort();
+    }
+}
+
+#[tokio::test]
 async fn interrupted_upload_through_host_and_guest_is_not_successful_eof() {
     use pplx_space_common_core::types::GuestUserName;
     use pplx_space_spaced_guest_server::{

@@ -61,6 +61,7 @@ service WorkerApi {
   rpc SpacedEnableFileChanges(space.sandbox.manager.v1.SpacedEnableFileChangesRequest) returns (space.spaced.operations.v1.EnableFileChangesResponse);
   rpc SpacedDisableFileChanges(space.sandbox.manager.v1.SpacedDisableFileChangesRequest) returns (space.spaced.operations.v1.DisableFileChangesResponse);
   rpc SpacedGetModifiedFiles(space.sandbox.manager.v1.SpacedGetModifiedFilesRequest) returns (space.spaced.operations.v1.GetModifiedFilesResponse);
+  rpc SpacedGlob(space.sandbox.manager.v1.SpacedGlobRequest) returns (space.spaced.operations.v1.GlobResponse);
   rpc SpacedStartProcess(space.sandbox.manager.v1.SpacedStartProcessRequest) returns (stream space.spaced.operations.v1.ProcessEvent);
   rpc SpacedConnectProcess(space.sandbox.manager.v1.SpacedConnectProcessRequest) returns (stream space.spaced.operations.v1.ProcessEvent);
   rpc SpacedListProcesses(space.sandbox.manager.v1.SpacedListProcessesRequest) returns (space.sandbox.manager.v1.SpacedListProcessesResponse);

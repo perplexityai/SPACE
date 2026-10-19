@@ -13,6 +13,7 @@ const MAX_GUEST_FILE_LIST_METADATA_BYTES: usize = 4 * 1024 * 1024;
 const MAX_GUEST_MODIFIED_FILES: usize = 16_384;
 const MAX_GUEST_MODIFIED_FILE_KINDS: usize = 5;
 const MAX_GUEST_WATCHER_EVENTS: usize = 4_096;
+const MAX_GUEST_GLOB_MATCHES: usize = 100_000;
 
 impl SpacedHostService {
     pub(super) fn filesystem_grpc_service(
@@ -562,6 +563,58 @@ impl Filesystem for SpacedHostService {
             cursor: response.cursor,
             monitoring_enabled: response.monitoring_enabled,
             overflowed: response.overflowed,
+        }))
+    }
+
+    async fn glob(&self, request: Request<GlobRequest>) -> Result<Response<GlobResponse>, Status> {
+        let request = request.into_inner();
+        let user = request
+            .user
+            .clone()
+            .map(pplx_space_common_core::types::GuestUserName::parse)
+            .transpose()
+            .map_err(invalid_argument_status)?;
+        let response = self
+            .call_bridge_guest_filesystem(
+                "bridge_guest_glob",
+                BridgeGuestOperationBudget::FilesystemMetadata,
+                move |mut client| {
+                    let request = request.clone();
+                    let user = user.as_ref().map(|user| user.as_str().to_string());
+                    async move {
+                        client
+                            .glob(BridgeGuestGlobRequest {
+                                search_dir: request.search_dir,
+                                pattern: request.pattern,
+                                skip_dirs: request.skip_dirs,
+                                max_results: request.max_results,
+                                user,
+                            })
+                            .await
+                    }
+                },
+            )
+            .await
+            .map_err(|status| {
+                // Guests older than the RPC answer Unimplemented; callers
+                // fall back to listing files another way.
+                if status.code() == tonic::Code::Unimplemented {
+                    pplx_space_common_grpc::guest_capability_unsupported_status(
+                        pplx_space_common_grpc::GuestCapability::FileGlob,
+                        "the sandbox guest does not support glob; rebuild the template on a newer guest",
+                    )
+                } else {
+                    status
+                }
+            })?;
+        if response.matches.len() > MAX_GUEST_GLOB_MATCHES {
+            return Err(Status::resource_exhausted(
+                "guest returned too many glob matches",
+            ));
+        }
+        Ok(Response::new(GlobResponse {
+            matches: response.matches,
+            truncated: response.truncated,
         }))
     }
 }

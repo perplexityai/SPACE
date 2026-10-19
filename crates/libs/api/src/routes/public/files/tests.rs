@@ -861,3 +861,45 @@ mod write_creating_parents {
         assert_eq!(guest.writes.borrow().len(), 2, "retried once only");
     }
 }
+
+/// A guest or service that predates glob gets a named precondition failure a
+/// client can fall back on; other refusals keep their usual translation.
+#[tokio::test]
+async fn glob_names_an_unsupported_sandbox_for_fallback() {
+    use axum::response::IntoResponse;
+    use http_body_util::BodyExt;
+    use pplx_space_public_api::{
+        PublicErrorCode, PublicErrorEnvelope, UNSUPPORTED_OPERATION_DETAIL_KEY,
+    };
+
+    async fn glob_envelope(status: tonic::Status) -> (StatusCode, PublicErrorEnvelope) {
+        let response = glob_error(ControllerError::from(status)).into_response();
+        let code = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (code, serde_json::from_slice(&body).unwrap())
+    }
+
+    for status in [
+        pplx_space_common_grpc::guest_capability_unsupported_status(
+            pplx_space_common_grpc::GuestCapability::FileGlob,
+            "older guest",
+        ),
+        tonic::Status::unimplemented("unknown method SpacedGlob"),
+    ] {
+        let (code, body) = glob_envelope(status).await;
+        assert_eq!(code, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(body.code, PublicErrorCode::FailedPrecondition);
+        assert!(body.details.iter().any(|detail| {
+            detail.key == UNSUPPORTED_OPERATION_DETAIL_KEY && detail.value == "files:glob"
+        }));
+    }
+
+    let (code, body) = glob_envelope(tonic::Status::failed_precondition(
+        "some other precondition",
+    ))
+    .await;
+    assert_eq!(code, StatusCode::PRECONDITION_FAILED);
+    assert!(body.details.is_empty());
+    let (code, _) = glob_envelope(tonic::Status::permission_denied("denied")).await;
+    assert_eq!(code, StatusCode::FORBIDDEN);
+}

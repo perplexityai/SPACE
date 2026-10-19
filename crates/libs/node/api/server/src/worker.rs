@@ -412,6 +412,7 @@ sandbox_scoped_requests!(
     pplx_space_sbx_mgr_client::proto::SpacedEnableFileChangesRequest,
     pplx_space_sbx_mgr_client::proto::SpacedDisableFileChangesRequest,
     pplx_space_sbx_mgr_client::proto::SpacedGetModifiedFilesRequest,
+    pplx_space_sbx_mgr_client::proto::SpacedGlobRequest,
     pplx_space_sbx_mgr_client::proto::SpacedStartProcessRequest,
     pplx_space_sbx_mgr_client::proto::SpacedConnectProcessRequest,
     pplx_space_sbx_mgr_client::proto::SpacedListProcessesRequest,
@@ -984,6 +985,13 @@ impl WorkerApi for WorkerApiService {
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::SpacedGetModifiedFilesResponse>, Status>
     {
         fwd_sbx!(self, "SpacedGetModifiedFiles", spaced_get_modified_files, r)
+    }
+
+    async fn spaced_glob(
+        &self,
+        r: Request<pplx_space_sbx_mgr_client::proto::SpacedGlobRequest>,
+    ) -> Result<Response<pplx_space_sbx_mgr_client::proto::SpacedGlobResponse>, Status> {
+        fwd_sbx!(self, "SpacedGlob", spaced_glob, r)
     }
 
     async fn spaced_start_process(

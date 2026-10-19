@@ -1,5 +1,6 @@
 mod compat;
 mod error;
+mod glob;
 mod list;
 mod metadata;
 mod ownership;
@@ -23,10 +24,10 @@ use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
     CreateWatcherRequest, CreateWatcherResponse, DisableFileChangesRequest,
     DisableFileChangesResponse, EnableFileChangesRequest, EnableFileChangesResponse, FileInfo,
     GetModifiedFilesRequest, GetModifiedFilesResponse, GetWatcherEventsRequest,
-    GetWatcherEventsResponse, ListRequest, MkdirRequest, MkdirResponse, NormalizeWatchRootRequest,
-    NormalizeWatchRootResponse, ReadRequest, RemoveRequest, RemoveResponse, RemoveWatcherRequest,
-    RemoveWatcherResponse, RenameResponse, StatRequest, StatResponse, WatchRequest,
-    WriteBatchRequest,
+    GetWatcherEventsResponse, GlobRequest, GlobResponse, ListRequest, MkdirRequest, MkdirResponse,
+    NormalizeWatchRootRequest, NormalizeWatchRootResponse, ReadRequest, RemoveRequest,
+    RemoveResponse, RemoveWatcherRequest, RemoveWatcherResponse, RenameResponse, StatRequest,
+    StatResponse, WatchRequest, WriteBatchRequest,
 };
 use pplx_space_spaced_guest_protocol::proto::worker::worker_filesystem_server::WorkerFilesystem;
 use pplx_space_spaced_guest_protocol::proto::worker::{
@@ -61,7 +62,7 @@ pub(super) struct FilesystemWorkerService {
 }
 
 const MAX_CONCURRENT_FILE_OPERATIONS: usize = 8;
-pub(super) const WORKER_PROTOCOL_VERSION: u32 = 3;
+pub(super) const WORKER_PROTOCOL_VERSION: u32 = 4;
 
 impl FilesystemWorkerService {
     pub(super) fn new(default_user: GuestUserName, shutdown: CancellationToken) -> Self {
@@ -549,6 +550,32 @@ impl WorkerFilesystem for FilesystemWorkerService {
     ) -> Result<Response<GetModifiedFilesResponse>, Status> {
         let request = request.into_inner();
         let response = self.watch_manager.get_modified_files(request).await?;
+        Ok(Response::new(response))
+    }
+
+    async fn glob(&self, request: Request<GlobRequest>) -> Result<Response<GlobResponse>, Status> {
+        let request = request.into_inner();
+        let (account, slot) = self.account(request.user, None).await?;
+        let root = guest_path::normalize_for_account(&request.search_dir, &account)?;
+        let query = glob::GlobQuery {
+            root: PathBuf::from(root.expose()),
+            pattern: request.pattern,
+            skip_dirs: request.skip_dirs,
+            max_results: usize::try_from(request.max_results).unwrap_or(usize::MAX),
+            deadline: std::time::Instant::now() + glob::GLOB_WALK_BUDGET,
+        };
+        let response = tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            glob::glob(query)
+        })
+        .await
+        .map_err(|error| Status::internal(format!("glob task failed: {error}")))??;
+        tracing::debug!(
+            command = "bridge_guest_glob",
+            matches = response.matches.len(),
+            truncated = response.truncated,
+            "spaced bridge guest command succeeded"
+        );
         Ok(Response::new(response))
     }
 }

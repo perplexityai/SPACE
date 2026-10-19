@@ -42,6 +42,9 @@ pub struct ControllerError {
     /// The guest reported the requested path missing, as its status said
     /// (`pplx_space_common_grpc::is_guest_path_not_found`).
     guest_path_not_found: bool,
+    /// The guest is older than the requested capability, as its status said
+    /// (`pplx_space_common_grpc::GuestCapabilityUnsupported`).
+    guest_capability_unsupported: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +91,7 @@ impl ControllerError {
             retry_after_cause: None,
             refused_before_start: false,
             guest_path_not_found: false,
+            guest_capability_unsupported: false,
         }
     }
 
@@ -102,6 +106,11 @@ impl ControllerError {
     /// sets it.
     pub fn is_guest_path_not_found(&self) -> bool {
         self.guest_path_not_found
+    }
+
+    /// Whether the guest said it is older than the requested capability.
+    pub fn is_guest_capability_unsupported(&self) -> bool {
+        self.guest_capability_unsupported
     }
 
     fn node_api_transport(
@@ -454,6 +463,8 @@ impl From<tonic::Status> for ControllerError {
         );
         error.refused_before_start = pplx_space_common_grpc::is_refused_before_start(&status);
         error.guest_path_not_found = pplx_space_common_grpc::is_guest_path_not_found(&status);
+        error.guest_capability_unsupported =
+            pplx_space_common_grpc::GuestCapabilityUnsupported::from_status(&status).is_some();
         match pplx_space_common_grpc::retry_after(&status) {
             Some(try_again) => error.with_retry_after_header(
                 try_again.clamp(Duration::from_secs(1), Duration::from_secs(60)),

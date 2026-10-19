@@ -60,6 +60,7 @@ spaced_rpcs! {
     EnableFileChanges => ("SpacedEnableFileChanges", RouteTokenRequired),
     DisableFileChanges => ("SpacedDisableFileChanges", RouteTokenRequired),
     GetModifiedFiles => ("SpacedGetModifiedFiles", RouteTokenRequired),
+    Glob => ("SpacedGlob", RouteTokenRequired),
     StartProcess => ("SpacedStartProcess", RouteTokenRequired),
     ConnectProcess => ("SpacedConnectProcess", RouteTokenRequired),
     ListProcesses => ("SpacedListProcesses", RouteTokenRequired),
