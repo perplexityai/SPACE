@@ -148,7 +148,7 @@ async fn poll_outcome(
     TeardownSuspendOutcome::try_from(response.outcome).unwrap()
 }
 
-async fn drain(service: &SandboxManagerService) {
+pub(super) async fn drain(service: &SandboxManagerService) {
     service.shutdown_token.cancel();
     service.task_tracker.close();
     tokio::time::timeout(Duration::from_secs(5), service.task_tracker.wait())
@@ -853,15 +853,15 @@ fn node_local_suspend_registers_under_its_kubernetes_execution() {
 /// restore from exactly when `backed_copy`. When `refuses_only_verdicts`, it
 /// refuses a generation-bound registration only when it's verdict-only.
 #[derive(Clone, Copy)]
-struct RetiringClusterApi {
-    unavailable: bool,
-    placed: bool,
-    backed_copy: bool,
-    artifact_backed: bool,
-    refuses_only_verdicts: bool,
+pub(super) struct RetiringClusterApi {
+    pub(super) unavailable: bool,
+    pub(super) placed: bool,
+    pub(super) backed_copy: bool,
+    pub(super) artifact_backed: bool,
+    pub(super) refuses_only_verdicts: bool,
 }
 
-const RETIRING: RetiringClusterApi = RetiringClusterApi {
+pub(super) const RETIRING: RetiringClusterApi = RetiringClusterApi {
     unavailable: false,
     placed: false,
     backed_copy: true,
@@ -1019,7 +1019,7 @@ where
 /// Serves `stub` and runs `test` in an isolated child process whose
 /// cluster-api client wiring points at it, with a synthetic snapshot upload
 /// destination configured.
-async fn with_cluster_api(stub: RetiringClusterApi, test: impl AsyncFnOnce()) {
+pub(super) async fn with_cluster_api(stub: RetiringClusterApi, test: impl AsyncFnOnce()) {
     use std::ffi::OsStr;
 
     // The parent serves while the isolated child exercises environment-based

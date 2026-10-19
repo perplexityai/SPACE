@@ -313,117 +313,311 @@ async fn teardown_retry_seals_publishes_backs_up_and_completes_the_same_capture(
     server.await.unwrap().unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn teardown_driver_joins_the_artifact_upload_and_accepts_the_poll_that_completed_it() {
-    // A pod torn down after a node-local suspend binds its generation to the
-    // published artifact, whose upload is still running. The driver joins
-    // that upload, whether teardown keyed it or the node-local suspend
-    // enqueued it unkeyed, rather than uploading the artifact again. The shim
-    // polls throughout, and the first poll after the upload stamps the
-    // artifact completes the generation before the joined driver observes the
-    // upload finish. The driver must accept that completion, not report a
-    // durable suspend as lost.
-    use crate::service::tests::service_tests::{
-        insert_test_sandbox, prepare_teardown_suspend_request,
-    };
+/// How a node-local suspend's upload stands when the pod's teardown suspend
+/// of the suspended sandbox starts.
+#[derive(Clone, Copy, Debug)]
+enum NodeLocalUpload {
+    Running,
+    /// Its retries ran out, which a new attempt can fix.
+    FailedRetriable,
+    /// A failure no new attempt can fix.
+    FailedPermanently,
+}
+
+/// A suspended sandbox whose node-local suspend handed its artifact to an
+/// upload that is in `upload`'s state, with a teardown suspend bound to it.
+/// Returns the service, the sandbox, its artifact, and the upload job.
+async fn suspended_after_node_local_upload(
+    upload: NodeLocalUpload,
+    snapshot_dir: &std::path::Path,
+) -> (SandboxManagerService, SandboxId, LocalArtifactId, JobId) {
+    use crate::service::tests::service_tests::{insert_test_sandbox, runtime_fields};
     use pplx_space_common_core::types::ExecutionGeneration;
 
-    for keyed in [true, false] {
-        let conn = crate::db::test_conn();
-        let sandbox_id = SandboxId::new();
-        let id = sandbox_id.to_string();
-        let generation = ExecutionGeneration::new(7).unwrap();
-        insert_test_sandbox(&conn, &id, SandboxState::Paused);
-        assert!(crate::db::begin_suspend(&conn, &id).unwrap());
-        let artifact_id = LocalArtifactId::new();
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new();
+    let id = sandbox_id.to_string();
+    let generation = ExecutionGeneration::new(7).unwrap();
+    insert_test_sandbox(&conn, &id, SandboxState::Paused);
+    let mut fields = runtime_fields(generation, 7);
+    fields.space_api_route_identity.substrate_kind =
+        Some(pplx_space_common_core::types::NodeManagedBy::Kubernetes);
+    crate::db::update_runtime_fields(&conn, sandbox_id, fields).unwrap();
+    assert!(crate::db::begin_suspend(&conn, &id).unwrap());
+    let service = SandboxManagerService::for_test(conn);
+    let artifact_id = LocalArtifactId::new();
+    crate::service::suspend_snapshot_publication::write_full_suspend_artifact(
+        snapshot_dir,
+        &id,
+        artifact_id,
+        b"node-local-capture",
+    );
+
+    let sandbox = service.lookup_sandbox(&id).unwrap();
+    service
+        .enqueue_node_local_suspend_backup(
+            &sandbox,
+            artifact_id,
+            snapshot_dir.to_str().unwrap(),
+            SuspendSnapshotFormat::Full,
+        )
+        .await
+        .expect_err("staging needs vol-mgr");
+    let job = only_upload(&service, &id);
+    stage_and_run(&service, &job).await;
+    {
+        let db = service.db.lock().unwrap();
+        match upload {
+            NodeLocalUpload::Running => {}
+            NodeLocalUpload::FailedRetriable => {
+                pplx_space_common_jobs::db::fail_job_retriable_exhausted(
+                    &db,
+                    &job.job_id,
+                    "object store unavailable",
+                )
+                .unwrap();
+            }
+            NodeLocalUpload::FailedPermanently => {
+                pplx_space_common_jobs::db::fail_job_permanent(
+                    &db,
+                    &job.job_id,
+                    "artifact source is missing",
+                    None,
+                )
+                .unwrap();
+            }
+        }
         crate::db::complete_row_intent_cleanup_for_job(
-            &conn,
+            &db,
             &id,
             CleanupCompletion::MarkSuspended,
-            Some((
-                artifact_id,
-                &format!("/var/lib/space/sandboxes/{id}/suspend"),
-            )),
+            Some((artifact_id, snapshot_dir.to_str().unwrap())),
             None,
             None,
         )
         .unwrap();
-        crate::db::bind_suspended_teardown_operation(&conn, &id, generation).unwrap();
-        let upload = JobId::new();
-        let artifact_key = artifact_id.to_string();
-        pplx_space_common_jobs::db::insert_job(
-            &conn,
-            pplx_space_common_jobs::db::InsertJob {
-                job_id: &upload,
-                kind: crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
-                payload: &serde_json::json!({ "meta": { "local_artifact_id": artifact_key } })
-                    .to_string(),
-                subject_id: Some(&id),
-                dedup_key: keyed.then_some(artifact_key.as_str()),
-                max_attempts: 1,
-                traceparent: None,
-                priority: Default::default(),
-            },
-        )
-        .unwrap();
-        conn.execute(
-            "UPDATE jobs SET status = 'running' WHERE job_id = ?1",
-            [&upload],
-        )
-        .unwrap();
-        let service = SandboxManagerService::for_test(conn);
+        crate::db::bind_suspended_teardown_operation(&db, &id, generation).unwrap();
+    }
+    (service, sandbox_id, artifact_id, job.job_id)
+}
 
-        let mut driver = std::pin::pin!(service.drive_teardown_suspend(
-            sandbox_id,
-            generation,
-            SandboxEventTrigger::System
-        ));
-        tokio::time::timeout(std::time::Duration::from_millis(250), &mut driver)
-            .await
-            .expect_err("the driver waits for the active upload");
-
-        // The upload's bookkeeping stamps the artifact, then a shim poll arrives.
-        {
-            let db = service.db.lock().unwrap();
-            crate::db::mark_local_artifact_backup_completed(&db, &artifact_key).unwrap();
-        }
-        let response = service
-            .prepare_teardown_suspend(crate::service::activation_support::internal_request(
-                prepare_teardown_suspend_request(
-                    id.clone(),
-                    generation.get(),
-                    crate::proto::TeardownSuspendAction::BeginOrJoin,
-                ),
-            ))
-            .await
+/// Finish the handoff of `upload` as a node with vol-mgr does, which a unit
+/// test has no socket for: run it, and record the transfers it stages. The
+/// worker's own first attempt, which can't stage either, ends first; its
+/// retry then finds the job running and leaves it to the test.
+async fn stage_and_run(service: &SandboxManagerService, upload: &pplx_space_common_jobs::Job) {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while service
+            .db
+            .lock()
             .unwrap()
-            .into_inner();
-        assert_eq!(
-            crate::proto::TeardownSuspendOutcome::try_from(response.outcome).unwrap(),
-            crate::proto::TeardownSuspendOutcome::Durable
-        );
+            .execute(
+                "UPDATE jobs SET status = 'running'
+                 WHERE job_id = ?1 AND status = 'pending' AND attempts > 0",
+                [&upload.job_id],
+            )
+            .unwrap()
+            == 0
         {
-            let db = service.db.lock().unwrap();
-            assert!(pplx_space_common_jobs::db::complete_job(&db, &upload, 0).unwrap());
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+    })
+    .await
+    .expect("the worker's attempt ends");
+    let mut payload = upload
+        .payload_as::<crate::snapshot_upload::SnapshotUploadJobs>()
+        .unwrap();
+    payload.job_ids = vec![JobId::new(), JobId::new(), JobId::new(), JobId::new()];
+    crate::snapshot_upload_jobs::persist_submitted_transfer_ids(
+        &service.db,
+        &upload.job_id,
+        &payload,
+    )
+    .unwrap();
+}
 
-        driver.await.unwrap_or_else(|error| {
-            panic!("keyed={keyed}: the joined suspend is durable: {error}")
-        });
+fn uploads(service: &SandboxManagerService, sandbox_id: &str) -> Vec<pplx_space_common_jobs::Job> {
+    let db = service.db.lock().unwrap();
+    pplx_space_common_jobs::db::list_jobs(&db, Some(sandbox_id), None, 0)
+        .unwrap()
+        .into_iter()
+        .filter(|job| job.kind == crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND)
+        .collect()
+}
+
+fn only_upload(service: &SandboxManagerService, sandbox_id: &str) -> pplx_space_common_jobs::Job {
+    let mut uploads = uploads(service, sandbox_id);
+    assert_eq!(uploads.len(), 1, "the artifact has one upload: {uploads:?}");
+    uploads.remove(0)
+}
+
+/// Finish `upload` as the worker does: stamp the artifact, then complete the
+/// job. The shim polls in between, and that poll completes the generation
+/// before a joined driver observes the upload finish.
+async fn finish_upload(
+    service: &SandboxManagerService,
+    sandbox_id: &str,
+    artifact_id: LocalArtifactId,
+    upload: &JobId,
+) {
+    use crate::service::tests::service_tests::prepare_teardown_suspend_request;
+    {
+        let db = service.db.lock().unwrap();
+        crate::db::mark_local_artifact_backup_completed(&db, &artifact_id.to_string()).unwrap();
+    }
+    let response = service
+        .prepare_teardown_suspend(crate::service::activation_support::internal_request(
+            prepare_teardown_suspend_request(
+                sandbox_id.to_string(),
+                7,
+                crate::proto::TeardownSuspendAction::BeginOrJoin,
+            ),
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        crate::proto::TeardownSuspendOutcome::try_from(response.outcome).unwrap(),
+        crate::proto::TeardownSuspendOutcome::Durable
+    );
+    let db = service.db.lock().unwrap();
+    assert!(pplx_space_common_jobs::db::complete_job(&db, upload, 0).unwrap());
+}
+
+/// A pod torn down after a node-local suspend binds its generation to the
+/// published artifact. The teardown and a backup requested by artifact id
+/// share the node-local suspend's upload while it runs, and a joined driver
+/// accepts the poll that completed the generation first. Once that upload has
+/// failed, a failure a new attempt can fix gets exactly one new attempt, and
+/// one it can't fails the teardown at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn teardown_after_node_local_suspend_shares_its_upload_or_settles_its_failure() {
+    use super::retired_teardown_tests::{RETIRING, RetiringClusterApi, with_cluster_api};
+
+    let stub = RetiringClusterApi {
+        placed: true,
+        refuses_only_verdicts: true,
+        ..RETIRING
+    };
+    with_cluster_api(stub, async || {
+        // Each case waits out vol-mgr connection retries, so run them at once.
+        futures_util::future::join_all(
+            [
+                NodeLocalUpload::Running,
+                NodeLocalUpload::FailedRetriable,
+                NodeLocalUpload::FailedPermanently,
+            ]
+            .map(teardown_after_node_local_upload),
+        )
+        .await;
+    })
+    .await;
+}
+
+async fn teardown_after_node_local_upload(upload: NodeLocalUpload) {
+    use crate::proto::enqueue_artifact_backup_request::Source;
+    use crate::service::activation_support::internal_request;
+    use pplx_space_common_core::types::ExecutionGeneration;
+
+    let generation = ExecutionGeneration::new(7).unwrap();
+    let snapshot_root = tempfile::tempdir().unwrap();
+    let snapshot_dir = snapshot_root.path().join("suspend");
+    let (service, sandbox_id, artifact_id, node_local) =
+        suspended_after_node_local_upload(upload, &snapshot_dir).await;
+    let id = sandbox_id.to_string();
+    let drive =
+        || service.drive_teardown_suspend(sandbox_id, generation, SandboxEventTrigger::System);
+
+    let completed_upload = match upload {
+        NodeLocalUpload::Running => {
+            // The driver holds the artifact lock while it waits, so the
+            // request comes first.
+            let response = service
+                .enqueue_artifact_backup(internal_request(
+                    crate::proto::EnqueueArtifactBackupRequest {
+                        sandbox_id: id.clone(),
+                        expected_artifact_kind: crate::proto::ArtifactKind::Full as i32,
+                        source: Some(Source::LocalArtifactId(artifact_id.to_string())),
+                    },
+                ))
+                .await
+                .expect("a backup requested by artifact id joins the upload")
+                .into_inner();
+            let joined = only_upload(&service, &id);
+            assert_eq!(joined.job_id, node_local);
+            assert_eq!(
+                response.backup_attempt_id,
+                joined
+                    .payload_as::<crate::snapshot_upload::SnapshotUploadJobs>()
+                    .unwrap()
+                    .snapshot_id
+            );
+            let mut driver = std::pin::pin!(drive());
+            tokio::time::timeout(std::time::Duration::from_millis(250), &mut driver)
+                .await
+                .expect_err("the driver waits for the node-local upload");
+            assert_eq!(only_upload(&service, &id).job_id, node_local);
+            finish_upload(&service, &id, artifact_id, &node_local).await;
+            driver
+                .await
+                .unwrap_or_else(|error| panic!("the joined suspend is durable: {error}"));
+            Some(node_local)
+        }
+        NodeLocalUpload::FailedRetriable => {
+            // This drive's own handoff can't stage without vol-mgr; the next
+            // drive joins the attempt once it runs.
+            drive().await.expect_err("staging needs vol-mgr");
+            let retry = uploads(&service, &id)
+                .into_iter()
+                .find(|job| job.job_id != node_local)
+                .expect("a new attempt replaces the failed upload");
+            stage_and_run(&service, &retry).await;
+            let mut driver = std::pin::pin!(drive());
+            tokio::time::timeout(std::time::Duration::from_millis(250), &mut driver)
+                .await
+                .expect_err("the driver waits for the new attempt");
+            finish_upload(&service, &id, artifact_id, &retry.job_id).await;
+            driver
+                .await
+                .unwrap_or_else(|error| panic!("the retried suspend is durable: {error}"));
+            assert_eq!(uploads(&service, &id).len(), 2, "exactly one new attempt");
+            Some(retry.job_id)
+        }
+        NodeLocalUpload::FailedPermanently => {
+            // Without the dead upload's answer the drive would block on a new
+            // attempt's staging instead.
+            let error = tokio::time::timeout(std::time::Duration::from_secs(5), drive())
+                .await
+                .expect("the driver must not wait on a dead upload")
+                .expect_err("no new attempt can make the suspend durable");
+            assert_eq!(error.message(), "artifact source is missing");
+            assert_eq!(only_upload(&service, &id).job_id, node_local);
+            None
+        }
+    };
+    {
         let db = service.db.lock().unwrap();
         let status = crate::db::teardown_suspend_status(&db, &id)
             .unwrap()
             .unwrap();
-        assert!(status.is_durable_for(generation));
         assert_eq!(
-            status.operation.unwrap().published_artifact_id,
-            Some(artifact_id)
+            status.is_durable_for(generation),
+            completed_upload.is_some(),
+            "{upload:?}"
         );
-        let uploads = pplx_space_common_jobs::db::list_jobs(&db, Some(&id), None, 0)
-            .unwrap()
-            .into_iter()
-            .filter(|job| job.kind == crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND)
-            .count();
-        assert_eq!(uploads, 1, "keyed={keyed}: the artifact is uploaded once");
+        if let Some(completed_upload) = completed_upload {
+            assert_eq!(
+                status.operation.unwrap().published_artifact_id,
+                Some(artifact_id)
+            );
+            assert_eq!(
+                pplx_space_common_jobs::db::get_job(&db, &completed_upload)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                pplx_space_common_jobs::JobStatus::Completed.as_str()
+            );
+        }
     }
+    super::retired_teardown_tests::drain(&service).await;
 }

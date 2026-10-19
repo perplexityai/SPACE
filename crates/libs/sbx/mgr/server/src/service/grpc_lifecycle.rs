@@ -73,8 +73,8 @@ pub(super) use self::suspend_snapshot::{
 use self::teardown_suspend::teardown_artifact_backup_status;
 #[cfg(test)]
 pub(super) use self::teardown_suspend::{
-    SUSPEND_TRIGGER_METADATA, TerminalTeardownSuspend,
-    teardown_backup_failure_requires_new_attempt, teardown_suspend_event_trigger,
+    SUSPEND_TRIGGER_METADATA, TerminalTeardownSuspend, failed_artifact_upload_admits_new_attempt,
+    teardown_suspend_event_trigger,
 };
 
 /// Outcome of [`SandboxManagerService::submit_artifact_backup`].
@@ -315,7 +315,6 @@ struct ArtifactBackupSubmission<'a> {
     snapshot_dir: &'a str,
     request_override: Option<&'a crate::snapshot_upload::SnapshotUploadConfig>,
     format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
-    dedup_key: Option<&'a str>,
     handoff: ArtifactBackupHandoff,
     /// The teardown suspend's execution, for `BeginArtifactBackup`'s fence.
     execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
@@ -417,13 +416,12 @@ enum TeardownBackupOrigin {
     /// backup synchronously before finalizing when an upload destination was
     /// configured (a refusal would have rolled it back), and from an sbx-mgr
     /// that predates the fence it registered without a generation; with no
-    /// destination configured it registered nothing. The node-local upload
-    /// has no dedup key, so the teardown doesn't join it: it starts its own
-    /// attempt, which carries no generation, since the capture may hold the
-    /// sandbox's latest state and a refusal couldn't release a row that isn't
-    /// `suspending`. Only an upload keyed by this artifact, from an earlier
-    /// drive of this teardown or a backup requested by artifact id, is
-    /// joined, and its registration replays unfenced.
+    /// destination configured it registered nothing. The teardown joins that
+    /// upload, whose registration replays unfenced. When it needs an attempt
+    /// of its own, after a failure a new attempt can fix or when the suspend
+    /// registered nothing, that attempt carries no generation, since the
+    /// capture may hold the sandbox's latest state and a refusal couldn't
+    /// release a row that isn't `suspending`.
     PreviouslySuspended,
 }
 

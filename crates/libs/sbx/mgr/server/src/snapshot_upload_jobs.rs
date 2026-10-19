@@ -53,7 +53,7 @@ use crate::snapshot_upload::{
     format_from_meta, upload_artifacts_for_meta,
 };
 
-pub use crate::db::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND;
+pub use crate::db::snapshot_upload_jobs::{SNAPSHOT_UPLOAD_JOB_KIND, artifact_backup_dedup_key};
 
 const DEFAULT_CONCURRENCY: usize = 4;
 const JOB_TIMEOUT: Duration = Duration::from_secs(7200);

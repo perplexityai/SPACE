@@ -877,10 +877,9 @@ impl SandboxManagerService {
             return Ok(Response::new(response));
         }
 
-        let artifact_dedup_key = artifact.local_artifact_id.to_string();
         let previous_job = self.snapshot_upload_worker.find_job_by_dedup_key(
             crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
-            &artifact_dedup_key,
+            &crate::snapshot_upload_jobs::artifact_backup_dedup_key(artifact.local_artifact_id),
         )?;
         if let Some(job) = &previous_job {
             let job_status = job
@@ -979,7 +978,8 @@ impl SandboxManagerService {
         // teardown that staged it: the row still pins the capture, in any state
         // the teardown drive treats as its own (a restart mid-teardown leaves it
         // in cleanup). A suspended row's artifact belongs to an earlier
-        // node-local suspend and stays unfenced.
+        // node-local suspend: its upload is the earlier attempt above, and
+        // without one (no destination when it suspended) it stays unfenced.
         let execution_generation = match execution_generation {
             Some(generation) => Some(generation),
             None if matches!(
@@ -1012,7 +1012,6 @@ impl SandboxManagerService {
                     snapshot_dir: &artifact.local_path,
                     request_override: parsed_upload_config.as_ref(),
                     format,
-                    dedup_key: Some(&artifact_dedup_key),
                     handoff: ArtifactBackupHandoff::RestoreVisible,
                     execution_generation,
                 },
@@ -1222,7 +1221,6 @@ impl SandboxManagerService {
                     snapshot_dir: &snapshot_dir,
                     request_override: parsed_upload_config.as_ref(),
                     format: reupload_format,
-                    dedup_key: None,
                     handoff: ArtifactBackupHandoff::DurableWorker,
                     execution_generation: None,
                 },

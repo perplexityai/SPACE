@@ -2,11 +2,20 @@
 //! completed jobs prove.
 
 use crate::db::{Connection, Result};
-use pplx_space_common_core::types::JobId;
+use pplx_space_common_core::types::{JobId, LocalArtifactId};
 use rusqlite::params;
 
 /// The `jobs.kind` of the snapshot-upload pipeline's jobs.
 pub const SNAPSHOT_UPLOAD_JOB_KIND: &str = "snapshot_upload";
+
+/// The dedup key of every upload of the local artifact `local_artifact_id`,
+/// whichever path enqueues it: a node-local suspend, a teardown suspend,
+/// `EnqueueArtifactBackup` or a reupload. A caller that submits under it joins
+/// the artifact's active upload instead of uploading it again, and one that
+/// looks the artifact's upload up finds the newest of them.
+pub fn artifact_backup_dedup_key(local_artifact_id: LocalArtifactId) -> String {
+    local_artifact_id.to_string()
+}
 
 /// Give back the attempt a restart interrupted: every running job of `kind`
 /// with attempts left loses one; the number refunded.

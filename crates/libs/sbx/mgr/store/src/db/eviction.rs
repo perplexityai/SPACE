@@ -310,7 +310,7 @@ fn cancel_live_upload_job(conn: &Connection, artifact: LocalArtifactId) -> Resul
     let Some(job) = jobs::find_job_by_dedup_key(
         conn.raw(),
         super::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
-        &artifact.to_string(),
+        &super::snapshot_upload_jobs::artifact_backup_dedup_key(artifact),
     )?
     else {
         return Ok(());

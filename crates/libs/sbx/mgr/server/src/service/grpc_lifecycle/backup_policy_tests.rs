@@ -441,7 +441,6 @@ async fn durable_artifact_backup_persists_the_submitted_artifact_identity() {
         let request_override = case.request_bucket.map(upload_config);
         let local_artifact_id = LocalArtifactId::new();
         let backup_attempt_id = BackupAttemptId::new();
-        let dedup_key = local_artifact_id.to_string();
 
         let outcome = service
             .submit_artifact_backup(
@@ -455,7 +454,6 @@ async fn durable_artifact_backup_persists_the_submitted_artifact_identity() {
                     snapshot_dir: snapshot_dir.to_str().unwrap(),
                     request_override: request_override.as_ref(),
                     format: SuspendSnapshotFormat::Full,
-                    dedup_key: Some(&dedup_key),
                     handoff: ArtifactBackupHandoff::DurableWorker,
                     execution_generation: None,
                 },
@@ -466,7 +464,7 @@ async fn durable_artifact_backup_persists_the_submitted_artifact_identity() {
             .snapshot_upload_worker()
             .find_job_by_dedup_key(
                 crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
-                &dedup_key,
+                &local_artifact_id.to_string(),
             )
             .unwrap();
         let Some(bucket) = case.persisted_bucket else {

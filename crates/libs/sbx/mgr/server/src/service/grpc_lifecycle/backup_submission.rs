@@ -114,7 +114,6 @@ impl SandboxManagerService {
         ),
         snapshot_dir: &str,
         request_override: &crate::snapshot_upload::SnapshotUploadConfig,
-        dedup_key: &str,
         restore_visible: bool,
     ) -> Result<SubmitSuspendSnapshotOutcome, String> {
         let (local_artifact_id, backup_attempt_id) = artifact_attempt;
@@ -129,7 +128,6 @@ impl SandboxManagerService {
                 snapshot_dir,
                 request_override: Some(request_override),
                 format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat::Full,
-                dedup_key: Some(dedup_key),
                 handoff: if restore_visible {
                     ArtifactBackupHandoff::RestoreVisible
                 } else {
@@ -269,7 +267,6 @@ impl SandboxManagerService {
             snapshot_dir,
             request_override,
             format,
-            dedup_key,
             handoff,
             execution_generation,
         } = submission;
@@ -348,13 +345,14 @@ impl SandboxManagerService {
         .map_err(|error| format!("prepare snapshot upload intent failed: {error}"))?;
         jobs.execution_generation = execution_generation;
         let mut storage_uri = jobs.storage_uri.clone();
+        let dedup_key = crate::snapshot_upload_jobs::artifact_backup_dedup_key(local_artifact_id);
         let local_artifact_id = local_artifact_id.to_string();
 
         let job_id = match self.snapshot_upload_worker.submit_json(
             crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
             &jobs,
             Some(&sandbox.id),
-            dedup_key,
+            Some(&dedup_key),
         ) {
             Ok(id) => id,
             Err(e) => {
@@ -379,8 +377,8 @@ impl SandboxManagerService {
             }
         };
 
-        // `submit_json` may return an existing active job for a caller-supplied
-        // dedup key. That job owns its immutable backup attempt: join its
+        // `submit_json` returns the artifact's active upload when it has one.
+        // That job owns its immutable backup attempt: join its
         // payload instead of replacing it with this caller's newly prepared
         // snapshot ID and transfer set.
         let persisted_after_submit = self
@@ -540,7 +538,6 @@ impl SandboxManagerService {
             local_artifact_id,
             snapshot_dir,
             format,
-            None,
             node_local_registration_generation(sandbox),
         )
         .await
@@ -553,7 +550,6 @@ impl SandboxManagerService {
         local_artifact_id: LocalArtifactId,
         snapshot_dir: &str,
         format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
-        dedup_key: Option<&str>,
         registration_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
     ) -> Result<SubmitSuspendSnapshotOutcome, ArtifactBackupSubmissionError> {
         let request_override = match self.resolve_org_snapshot_upload_config(&sandbox.id).await {
@@ -580,7 +576,6 @@ impl SandboxManagerService {
                 snapshot_dir,
                 request_override: request_override.as_ref(),
                 format,
-                dedup_key,
                 handoff: ArtifactBackupHandoff::TeardownFence,
                 execution_generation: registration_generation,
             },

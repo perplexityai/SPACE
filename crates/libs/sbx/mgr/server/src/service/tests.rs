@@ -257,7 +257,7 @@ pub(crate) mod service_tests {
     };
     use crate::service::grpc_lifecycle::{
         SubmitSuspendSnapshotOutcome, SuspendRequestContext, SuspendSnapshotStagingDisposition,
-        teardown_backup_failure_requires_new_attempt,
+        failed_artifact_upload_admits_new_attempt,
     };
     use crate::service::recovery::SuspendSnapshotPublicationRecoveryOrigin;
     use crate::service::suspend_snapshot_publication::{
@@ -12585,7 +12585,6 @@ pub(crate) mod service_tests {
             "s3://test-bucket/prefix?region=us-east-1",
         )
         .unwrap();
-        let dedup_key = local_artifact_id.to_string();
         let first_attempt = pplx_space_common_core::types::BackupAttemptId::new();
 
         let first = service
@@ -12594,7 +12593,6 @@ pub(crate) mod service_tests {
                 (local_artifact_id, first_attempt),
                 snapshot_dir.to_str().unwrap(),
                 &upload_config,
-                &dedup_key,
                 false,
             )
             .await
@@ -12606,7 +12604,6 @@ pub(crate) mod service_tests {
                 (local_artifact_id, second_attempt),
                 snapshot_dir.to_str().unwrap(),
                 &upload_config,
-                &dedup_key,
                 false,
             )
             .await
@@ -12660,7 +12657,6 @@ pub(crate) mod service_tests {
                 (local_artifact_id, attempt_id),
                 snapshot_dir.to_str().unwrap(),
                 &upload_config,
-                &local_artifact_id.to_string(),
                 true,
             )
             .await
@@ -12690,18 +12686,17 @@ pub(crate) mod service_tests {
     }
 
     #[test]
-    fn teardown_backup_retries_only_retriable_terminal_failures() {
+    fn only_a_retriable_upload_failure_admits_a_new_attempt() {
         let cases = [
-            (None, false),
             (
-                Some(pplx_space_common_jobs::JobFailure::Permanent { reason: None }),
+                pplx_space_common_jobs::JobFailure::Permanent { reason: None },
                 false,
             ),
-            (Some(pplx_space_common_jobs::JobFailure::Retriable), true),
+            (pplx_space_common_jobs::JobFailure::Retriable, true),
         ];
 
         for (failure, expected) in cases {
-            let actual = teardown_backup_failure_requires_new_attempt(failure);
+            let actual = failed_artifact_upload_admits_new_attempt(failure);
 
             assert_eq!(
                 actual, expected,

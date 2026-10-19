@@ -5,10 +5,16 @@ use super::*;
 
 pub(in crate::service) const SUSPEND_TRIGGER_METADATA: &str = "x-space-suspend-trigger";
 
-pub(in crate::service) fn teardown_backup_failure_requires_new_attempt(
-    failure: Option<pplx_space_common_jobs::JobFailure>,
+/// Whether a new upload of an artifact can succeed where its failed upload
+/// ended with `failure`. A retriable failure only ran out of attempts, so a
+/// caller that needs the backup starts a new attempt, which the artifact's
+/// dedup key admits once the failed job is no longer active. A permanent
+/// failure, such as missing artifact files or a refused registration, repeats
+/// for any attempt, so the caller reports it instead.
+pub(in crate::service) fn failed_artifact_upload_admits_new_attempt(
+    failure: pplx_space_common_jobs::JobFailure,
 ) -> bool {
-    matches!(failure, Some(pplx_space_common_jobs::JobFailure::Retriable))
+    matches!(failure, pplx_space_common_jobs::JobFailure::Retriable)
 }
 
 fn teardown_suspend_event_details(
@@ -792,7 +798,7 @@ impl SandboxManagerService {
     ) -> Option<crate::snapshot_upload::SnapshotUploadJobs> {
         let job = match self.snapshot_upload_worker.find_job_by_dedup_key(
             crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
-            &staged_artifact.to_string(),
+            &crate::snapshot_upload_jobs::artifact_backup_dedup_key(staged_artifact),
         ) {
             // A live job still owns its attempt: its own Begin will meet the
             // same refusal and make the job terminal, and the next drive probes.
@@ -1159,7 +1165,7 @@ impl SandboxManagerService {
     /// the shim keeps polling.
     ///
     /// A permanent job failure ends the artifact's upload for good:
-    /// [`teardown_backup_failure_requires_new_attempt`] refuses a fresh
+    /// [`failed_artifact_upload_admits_new_attempt`] refuses a fresh
     /// attempt for it, so every later poll rejoins the same terminal job.
     /// The suspend therefore can never publish, the row can never leave
     /// `suspending`, and nothing on this node distinguishes it from a suspend
@@ -1211,14 +1217,12 @@ impl SandboxManagerService {
         sandbox: &crate::db::SandboxRow,
         backup: TeardownSuspendBackup<'_>,
     ) -> Result<(), Status> {
-        let artifact_dedup_key = backup.artifact.local_artifact_id.to_string();
-        let persisted_job = match self.snapshot_upload_worker.find_job_by_dedup_key(
+        let persisted_job = self.snapshot_upload_worker.find_job_by_dedup_key(
             crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
-            &artifact_dedup_key,
-        )? {
-            Some(job) => Some(job),
-            None => self.active_unkeyed_artifact_upload(&sandbox.id, backup.artifact)?,
-        };
+            &crate::snapshot_upload_jobs::artifact_backup_dedup_key(
+                backup.artifact.local_artifact_id,
+            ),
+        )?;
         // An active local upload still owns its completion. Only probe before
         // enqueueing or joining a terminal job: a restored artifact can already
         // be durable without a local completion marker. A failed probe leaves
@@ -1234,9 +1238,15 @@ impl SandboxManagerService {
         }
         let submission = async {
             match persisted_job {
+                // An active upload owns the artifact's backup, so wait for it.
+                // A completed one, or one whose failure no new attempt can
+                // fix, answers the wait at once. Only a failure a new attempt
+                // can fix starts one.
                 Some(job)
                     if !job.is_terminal()
-                        || !teardown_backup_failure_requires_new_attempt(job.failure) =>
+                        || job.failure.is_none_or(|failure| {
+                            !failed_artifact_upload_admits_new_attempt(failure)
+                        }) =>
                 {
                     Ok(job.job_id)
                 }
@@ -1246,7 +1256,6 @@ impl SandboxManagerService {
                         backup.artifact.local_artifact_id,
                         &backup.artifact.local_path,
                         backup.format,
-                        Some(&artifact_dedup_key),
                         backup.registration_generation(),
                     )
                     .await
@@ -1299,37 +1308,6 @@ impl SandboxManagerService {
             })?;
         }
         self.verify_teardown_suspend_backup_ownership(sandbox, &backup)
-    }
-
-    /// The artifact's active upload that carries no dedup key, as a node-local
-    /// suspend enqueues it. A teardown of that suspended sandbox joins it
-    /// rather than uploading the same artifact again. Once it ends, a later
-    /// attempt that still needs a backup enqueues its own under the key.
-    fn active_unkeyed_artifact_upload(
-        &self,
-        sandbox_id: &str,
-        artifact: &crate::db::LocalArtifactRow,
-    ) -> Result<Option<pplx_space_common_jobs::Job>, Status> {
-        #[derive(serde::Deserialize)]
-        struct UploadArtifact {
-            meta: UploadArtifactMeta,
-        }
-        #[derive(serde::Deserialize)]
-        struct UploadArtifactMeta {
-            local_artifact_id: Option<LocalArtifactId>,
-        }
-        Ok(self
-            .snapshot_upload_worker
-            .list_jobs(Some(sandbox_id), None, 0)?
-            .into_iter()
-            .find(|job| {
-                job.kind == crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND
-                    && job.dedup_key.is_none()
-                    && !job.is_terminal()
-                    && job.payload_as::<UploadArtifact>().is_ok_and(|upload| {
-                        upload.meta.local_artifact_id == Some(artifact.local_artifact_id)
-                    })
-            }))
     }
 
     fn verify_teardown_suspend_backup_ownership(
