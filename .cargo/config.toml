@@ -1,5 +1,10 @@
 [alias]
-lint = "clippy --workspace --locked -- -D warnings"
+# The one workspace lint invocation: CI, the lefthook pre-push hook, and local
+# runs all use it, so a run with these exact flags leaves the target directory
+# fresh for the next. Changing features or targets between runs re-resolves the
+# dependency graph and rebuilds it. Clippy compiles the same graph as
+# `cargo check`, so a separate check adds no coverage.
+lint = "clippy --workspace --locked --all-targets --all-features -- -D warnings"
 # Builds into the workspace target directory from any subdirectory. A caller that
 # must not wait on a concurrent workspace build sets CARGO_TARGET_DIR itself.
 arch = "run -q --locked -p pplx-space-archcheck --"

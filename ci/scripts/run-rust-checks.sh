@@ -243,16 +243,11 @@ run_fmt_check() {
 run_clippy_checks() {
     local target_dir="target/buildkite-lint"
 
-    # Enable every declared feature automatically so newly added production
-    # feature paths and test targets cannot become invisible to CI.
+    # `cargo lint` (.cargo/config.toml, shared with the pre-push hook) enables
+    # every declared feature and target so newly added production feature paths
+    # and test targets cannot become invisible to CI.
     echo "--- :rust: Running workspace clippy"
-    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
-        --workspace \
-        --locked \
-        --all-targets \
-        --all-features \
-        -- \
-        -D warnings
+    CARGO_TARGET_DIR="${target_dir}" cargo lint
 
     echo "--- :rust: Checking neutral observability without native Datadog"
     CARGO_TARGET_DIR="${target_dir}" cargo clippy \

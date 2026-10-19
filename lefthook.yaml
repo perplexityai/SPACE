@@ -28,19 +28,15 @@ pre-push:
         Rust formatting check failed.
         Run `cargo fmt --all` to fix formatting issues.
 
-    rust-check:
+    # `cargo lint` (.cargo/config.toml) is the same invocation CI runs. It
+    # also compiles everything `cargo check` would, and finishes quickly when
+    # an earlier `cargo lint` already built the same tree.
+    rust-lint:
       glob: "*.rs"
-      run: cargo check --workspace --locked
+      run: cargo lint
       fail_text: |
-        Rust compilation check failed.
-        Fix the compilation errors above before pushing.
-
-    rust-clippy:
-      glob: "*.rs"
-      run: cargo clippy --workspace --locked --all-features -- -D warnings
-      fail_text: |
-        Clippy found warnings (treated as errors).
-        Fix the clippy warnings above before pushing.
+        `cargo lint` failed (clippy warnings are errors).
+        Fix the errors above before pushing.
 
     shim-fmt:
       root: "shim/"
