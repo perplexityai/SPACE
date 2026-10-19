@@ -206,6 +206,11 @@ fork:
 # data-plane URL the browser can hit directly.
 dataPlanePublicUrl: ""
 
+# SPACE_DATA_PLANE_INTERNAL_URL — in-cluster data-plane origin the api uses to
+# relay a new command's event stream when the create asks for
+# `text/event-stream`. Empty answers those creates with the JSON handle.
+dataPlaneInternalUrl: http://space-data-plane:8090
+
 # Deploy-time masters for the two space-api guardrails whose dynamic flag the
 # `eppo` block below can only ever *close*. What they add is the ability to
 # turn a guardrail off on a bench with no flag provider.

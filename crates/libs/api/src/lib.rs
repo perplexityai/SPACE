@@ -12,6 +12,7 @@ pub mod auth;
 pub mod client_classification;
 pub mod client_concurrency;
 pub mod cluster_admission;
+pub mod command_stream;
 pub mod controllers;
 pub mod e2b;
 pub mod egress_profiles;

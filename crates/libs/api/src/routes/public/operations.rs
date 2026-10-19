@@ -185,7 +185,7 @@ fn parse_last_event_id(value: &axum::http::HeaderValue) -> Result<i64, PublicApi
     Ok(sequence)
 }
 
-fn accepts_event_stream(headers: &HeaderMap) -> bool {
+pub(super) fn accepts_event_stream(headers: &HeaderMap) -> bool {
     headers
         .get(header::ACCEPT)
         .and_then(|value| value.to_str().ok())

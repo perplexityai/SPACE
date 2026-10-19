@@ -144,6 +144,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_CLUSTER_API_ENDPOINT_DISCOVERY` | `off` | `off` or `kubernetes` (EndpointSlice per-RPC balancing for cluster-api clients; rollout gate). |
 | `SPACE_PUBLIC_CURSOR_SECRET` | **required** | |
 | `SPACE_DATA_PLANE_PUBLIC_URL` | empty | Empty yields relative URLs. |
+| `SPACE_DATA_PLANE_INTERNAL_URL` | unset | `http://` origin of the data plane as the API reaches it. Enables streaming command creation (`Accept: text/event-stream`); unset answers those requests with the JSON handle. Streams relayed this way end when the API shuts down. |
 | `SPACE_FEDERATED_GRANT_AUDIENCE`, `SPACE_FEDERATED_IDENTITY_ISSUER`, `SPACE_FEDERATED_REJECTED_SUBJECTS` | `credential-provider`, `space`, `[]` | |
 | `SPACE_E2B_HOME_WORKDIR_TEMPLATES`, `SPACE_ECW_HOSTS` | `code-runtime`, none | E2B routes return 404 without hosts. |
 | `SPACE_CLUSTER_ID` | unset | Required for route signing. |

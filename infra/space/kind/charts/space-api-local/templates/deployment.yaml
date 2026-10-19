@@ -132,6 +132,8 @@ spec:
             # window.location.origin resolution lands on the UI host → 404.
             - name: SPACE_DATA_PLANE_PUBLIC_URL
               value: {{ .Values.dataPlanePublicUrl | quote }}
+            - name: SPACE_DATA_PLANE_INTERNAL_URL
+              value: {{ .Values.dataPlaneInternalUrl | quote }}
             # BYOK: cluster-wide opt-in for stamping volume_encryption on new
             # sandbox creates (with the owner org's byok_enabled). The bench
             # enables it by default: org enrollment still gates per-org, so

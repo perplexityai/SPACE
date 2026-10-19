@@ -52,6 +52,9 @@ pub struct AppState {
     pub template_build_state: std::sync::Arc<crate::routes::e2b::TemplateBuildState>,
     pub federated_identity: crate::federated_identity::FederatedIdentityConfig,
     pub data_plane_base_url: String,
+    /// Relays a new command's event stream from `POST .../commands` when the
+    /// caller accepts `text/event-stream`; `None` keeps the JSON-only answer.
+    pub command_stream: Option<crate::command_stream::CommandStreamProxy>,
     pub feature_flags: pplx_space_feature_flags::FeatureFlagClient,
     pub ecw_credential_keyring:
         std::sync::Arc<pplx_space_common_svc::ecw_credential::EcwCredentialKeyring>,
@@ -77,6 +80,8 @@ pub enum AppStateError {
     EcwCredentialKeyring(#[from] pplx_space_common_svc::ecw_credential::EcwCredentialError),
     #[error("client classification configuration failed: {0}")]
     ClientClassification(#[from] crate::client_classification::ClientClassificationError),
+    #[error(transparent)]
+    CommandStream(#[from] crate::command_stream::CommandStreamConfigError),
 }
 
 impl AppState {
@@ -153,6 +158,8 @@ impl AppState {
 
         let template_build_state = crate::routes::e2b::TemplateBuildState::new(pool.clone());
         let data_plane_base_url = crate::public_sessions::data_plane_base_url_from_env();
+        let command_stream =
+            crate::command_stream::CommandStreamProxy::from_env(shutdown_token.child_token())?;
         let ecw_credential_keyring = std::sync::Arc::new(
             pplx_space_common_svc::ecw_credential::EcwCredentialKeyring::load_from_env()?,
         );
@@ -169,6 +176,7 @@ impl AppState {
             template_build_state,
             federated_identity,
             data_plane_base_url,
+            command_stream,
             feature_flags,
             ecw_credential_keyring,
         })

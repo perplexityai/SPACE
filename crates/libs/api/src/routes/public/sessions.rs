@@ -4,6 +4,7 @@ use axum::{
     Extension, Json,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
 };
 use pplx_space_common_core::types::{
     GuestUserName, IdempotencyKey, ProcessCommand, validate_linux_guest_path_input,
@@ -33,6 +34,7 @@ use crate::{
 use super::{
     cursors::{CursorKind, decode_cursor, encode_cursor},
     error::{PublicApiError, with_retry_after_hint},
+    operations::accepts_event_stream,
     owner_scope::{AuthorizedSandbox, authorized_sandbox},
 };
 
@@ -144,7 +146,7 @@ pub async fn create_command(
     headers: HeaderMap,
     Path(sandbox_id): Path<String>,
     Json(request): Json<CreateCommandRequest>,
-) -> Result<(StatusCode, Json<PublicCommand>), PublicApiError> {
+) -> Result<Response, PublicApiError> {
     let sandbox_id = parse_public_sandbox_id(&sandbox_id)?;
     let _sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, sandbox_id).await?;
     let idempotency_key = idempotency_key(&headers)?;
@@ -158,7 +160,15 @@ pub async fn create_command(
     )
     .await?;
 
-    Ok((StatusCode::CREATED, Json(command)))
+    // Streaming is negotiated after the create, so validation, owner scope,
+    // idempotency replay, and their errors are identical in both modes.
+    if accepts_event_stream(&headers)
+        && let Some(proxy) = state.command_stream.as_ref()
+        && let Some(response) = proxy.stream(&command).await
+    {
+        return Ok(response);
+    }
+    Ok((StatusCode::CREATED, Json(command)).into_response())
 }
 
 /// Create a command (one-shot process) data-plane session for `sandbox_id`,
