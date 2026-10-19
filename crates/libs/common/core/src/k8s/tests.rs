@@ -827,8 +827,8 @@ fn build_sandbox_pod_source_pinned_restore_skips_node_services_bias() {
         },
     );
 
-    // A shortlisted restore keeps the source preference as the only
-    // NodeAffinity score; readiness is applied by the API when it builds
+    // A shortlisted restore keeps the source preference stronger than cache
+    // locality; readiness is applied by the API when it builds
     // the shortlist, not as a competing weight here.
     assert!(node_services_ready_terms(&pod).is_empty());
 }
@@ -1851,9 +1851,8 @@ fn build_sandbox_pod_source_annotation_without_pin_renders_no_source_affinity() 
 /// Shortlist mode: source + fallbacks render as ORed required
 /// `matchFields: metadata.name` terms (one node per term, each repeating
 /// the hard ssd-placement-block exclusion), the source keeps its
-/// weight-100 **preferred** term so it wins scoring whenever feasible,
-/// and the scoring terms (template-cache, ssd tiers) stay on to rank the
-/// fallbacks.
+/// stronger preferred term, and template locality ranks the fallbacks without
+/// adding the other soft scoring terms to the shortlist.
 #[test]
 fn build_sandbox_pod_shortlist_renders_or_terms_with_preferred_source() {
     let env = BTreeMap::new();
@@ -1923,14 +1922,22 @@ fn build_sandbox_pod_shortlist_renders_or_terms_with_preferred_source() {
             .as_deref(),
         Some(["source-node".to_string()].as_slice())
     );
-    // The source term must be the ONLY NodeAffinity preference: preferred
-    // weights cap at 100, so a fallback matching template-cache + a top
-    // ssd tier would otherwise tie the source and hand the decision to
-    // the resource plugins even when the source fits.
+    assert_eq!(preferred.len(), 2, "source and template preferences only");
+    let template_pref = &preferred[1];
+    let expressions = template_pref.preference.match_expressions.as_ref().unwrap();
+    assert_eq!(expressions.len(), 1);
     assert_eq!(
-        preferred.len(),
-        1,
-        "no competing scoring terms in shortlist mode"
+        expressions[0].key,
+        template_build_presence_label_key("seed", TEST_CONTENT_HASH)
+    );
+    assert_eq!(expressions[0].operator, "In");
+    assert_eq!(
+        expressions[0].values.as_deref(),
+        Some([TEMPLATE_PRESENT_LABEL_VALUE.to_string()].as_slice())
+    );
+    assert!(
+        template_pref.weight > 0 && template_pref.weight < source_pref.weight,
+        "warm fallbacks gain a score without tying a cold source"
     );
 }
 
@@ -2909,7 +2916,7 @@ fn dedicated_rendering_requires_matching_runtime_org() {
 #[test]
 fn restore_shortlist_suppresses_dedicated_preference_but_keeps_toleration() {
     // On a source-aware shortlist the source's weight-100 preference must
-    // be the only NodeAffinity score: an unconditional weight-100
+    // stay stronger than other NodeAffinity scores: an unconditional weight-100
     // dedicated term would let a dedicated fallback tie a feasible
     // source and force an off-source restore. The toleration stays — the
     // restore must still be able to land on a dedicated source.
@@ -3350,11 +3357,9 @@ fn an_empty_preferred_node_name_does_not_drop_the_required_shortlist() {
         );
     }
     // The dedicated preference stays suppressed here — not because the name is
-    // empty, but because a required shortlist exists at all, and within one the
-    // source preference owns the scoring. In this fixture the source name is
-    // empty, so no source preference is rendered either and no affinity
-    // preference orders the two shortlisted nodes; the required terms still
-    // bound the choice to them, which is the property under test.
+    // empty, but because a required shortlist exists at all. Without a usable
+    // source name, only template locality orders the shortlisted nodes; the
+    // required terms still bound the choice to them.
     assert!(dedicated_preferred_terms(&pod).is_empty());
     // The toleration survives, so a dedicated shortlisted node is reachable.
     let tolerations = pod.spec.as_ref().unwrap().tolerations.as_ref().unwrap();

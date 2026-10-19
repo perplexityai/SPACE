@@ -974,15 +974,15 @@ impl KubernetesSubstrate {
     /// (Ready, matching the sandbox node selector, not placement-blocked —
     /// the same filter chain as [`Self::eligible_start_node_count`], plus
     /// nodes whose node-local service pods are not `Ready` when that bias is
-    /// enabled). A shortlisted restore suppresses the soft scoring terms so
-    /// the source preference stays decisive, which is why service readiness
+    /// enabled). A shortlisted restore keeps template locality below the source
+    /// weight and suppresses other soft scores, which is why service readiness
     /// applies here as a candidate filter rather than as a weight. The source
-    /// itself is always kept — it holds the local suspend bytes, and its own
+    /// itself is always kept — it may still hold local suspend bytes, and its own
     /// `Unschedulable` outcome is what the in-request cross-node re-drive
     /// exists for. The
     /// whole list stays under kube-scheduler's 100-node prefilter floor, so
     /// every listed node is *scored* and the weight-100 preferred source term
-    /// decides placement whenever the source is feasible; a busy source lands
+    /// ranks it highest within NodeAffinity; a busy source can land
     /// the pod on a fallback in the same scheduling pass instead of going
     /// `Unschedulable`.
     ///

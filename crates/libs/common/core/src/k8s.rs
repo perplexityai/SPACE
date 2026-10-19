@@ -1180,8 +1180,8 @@ pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodReque
     // only. Source-aware with a shortlist: required ORed `matchFields:
     // metadata.name` terms for source + fallbacks, PLUS the weight-100
     // preferred source term — the scheduler filters within the shortlist and
-    // the preference lands the pod on the source whenever it is feasible,
-    // falling to a fallback in the same pass otherwise. Source-aware without
+    // source ranks highest within NodeAffinity, with other scheduler plugins
+    // also contributing to placement. Source-aware without
     // a shortlist (cold node cache): a bare required source pin, no
     // preference — the in-request watch handles the Unschedulable case.
     // `preferred_node_name` is not filtered for emptiness here, deliberately:
@@ -1201,17 +1201,6 @@ pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodReque
         } else {
             (Vec::new(), preferred_node_name)
         };
-    // Scoring terms are suppressed for every pinned shape. For `spec.nodeName`
-    // (direct) and a bare required pin they are dead weight (one candidate).
-    // For a shortlist they would *compete with the source preference inside
-    // the NodeAffinity score*: preferred weights are capped at 100 by
-    // Kubernetes validation, so a fallback matching template-cache (50) +
-    // best ssd tier (50) would tie the source's weight-100 term and let the
-    // resource-scoring plugins pick a fallback over a feasible source — the
-    // exact off-source placement this feature removes. With them suppressed
-    // the source is the only NodeAffinity preference (fallbacks score 0
-    // there) and fallback choice falls to the scheduler's resource plugins;
-    // the hard ssd-placement-block still excludes unsafe nodes.
     // A direct `spec.nodeName` assignment is preserved even when a node-group
     // placement is present. `nodeName` bypasses kube-scheduler, so the required
     // affinity below is evaluated only by kubelet admission (terminally — see
@@ -1237,8 +1226,15 @@ pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodReque
     // is a migration problem (evict with a portable snapshot, then re-place),
     // and this renderer has no cluster reads with which to tell the two cases
     // apart.
-    let single_target_node = direct_node_name.is_some() || !required_source_node_names.is_empty();
-    let preferred_template_label = if prefer_template_cache && !single_target_node {
+    let source_constrained = direct_node_name.is_some() || !required_source_node_names.is_empty();
+    // A shortlist has multiple candidates, so template locality can rank its
+    // fallbacks. Keep the cache weight below the source weight and suppress
+    // other soft biases: cache + SSD-tier scoring could otherwise tie a cold
+    // source. Direct and single-node pins have no placement choice to score.
+    let preferred_template_label = if prefer_template_cache
+        && direct_node_name.is_none()
+        && required_source_node_names.len() != 1
+    {
         content_hash.map(|content_hash| template_build_presence_label_key(template, content_hash))
     } else {
         None
@@ -1327,7 +1323,7 @@ pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodReque
                 preferred_dedicated_term: node_group_placement
                     .filter(|_| {
                         dedicated_allowed
-                            && !single_target_node
+                            && !source_constrained
                             // Emptiness is checked here, not upstream on
                             // `preferred_node_name`: filtering it before the
                             // hard-pin match below would drop the entire
@@ -1352,18 +1348,13 @@ pub fn build_sandbox_pod(config: &SandboxPodConfig<'_>, request: SandboxPodReque
                 // scope. Worth revisiting with the disk-pressure owners.
                 ssd_placement_block: config.ssd_headroom_tier_affinity
                     && direct_node_name.is_none(),
-                // Soft headroom scoring. Dead weight when a single node is already
-                // the only candidate (direct nodeName or a required source pin).
-                ssd_headroom_tier_bias: config.ssd_headroom_tier_affinity && !single_target_node,
-                // Soft node-local-service readiness bias, suppressed for the
-                // same reason as the headroom scoring: with the candidate set
-                // already pinned to one node (or to a required shortlist whose
-                // scoring must stay owned by the source preference) the term
-                // cannot change the outcome. The API drops not-ready nodes from
-                // the restore shortlist instead, so the signal still applies
-                // there — as a candidate filter rather than a score.
+                // Keep headroom from adding to a cached fallback's score and
+                // tying the source. Single-node pins need no scoring either.
+                ssd_headroom_tier_bias: config.ssd_headroom_tier_affinity && !source_constrained,
+                // Standalone readiness scoring must not compete with the source.
+                // The API filters not-ready fallbacks when building the shortlist.
                 node_services_ready_bias: config.node_services_ready_affinity
-                    && !single_target_node,
+                    && !source_constrained,
             }),
             tolerations,
             containers: vec![Container {

@@ -1,6 +1,6 @@
 ---
-source: crates/libs/common/core/src/k8s.rs
-assertion_line: 1683
+source: crates/libs/common/core/src/k8s/tests.rs
+assertion_line: 838
 expression: pod
 ---
 apiVersion: v1
@@ -46,6 +46,13 @@ spec:
                 values:
                   - space-worker-a
           weight: 100
+        - preference:
+            matchExpressions:
+              - key: space.pplx.net/template-build-seed-5be19f0b8d84ffe93681a4c2
+                operator: In
+                values:
+                  - "true"
+          weight: 50
       requiredDuringSchedulingIgnoredDuringExecution:
         nodeSelectorTerms:
           - matchExpressions:
