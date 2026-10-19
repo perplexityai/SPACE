@@ -5666,6 +5666,7 @@ dependencies = [
  "form_urlencoded",
  "futures-util",
  "hex",
+ "http-body 1.1.0",
  "http-body-util",
  "hyper",
  "hyper-util",

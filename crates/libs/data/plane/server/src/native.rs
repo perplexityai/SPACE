@@ -542,14 +542,7 @@ pub(super) async fn proxy_session(
             Ok(permit) => Some(permit),
             Err(limit) => {
                 pplx_space_metrics::data_plane::attach(kind, limit.metric_label());
-                return Ok(data_plane_http_error(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    DataPlaneHttpErrorCode::RateLimited,
-                    "too many attached streams",
-                    true,
-                    ResponseOrigin::DataPlane,
-                    ResponseKind::Admission,
-                ));
+                return Ok(too_many_attached_streams_response(limit));
             }
         }
     } else {
@@ -657,6 +650,7 @@ pub(super) async fn proxy_session(
     }
 
     record_native_proxied_response(response.status());
+    mark_sandbox_service_response(&mut response);
 
     let response = response.map(|body| completion.body(Body::new(body)));
     if let (Some(downstream_upgrade), Some(upstream_upgrade), Some(stream_permit)) =

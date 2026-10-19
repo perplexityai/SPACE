@@ -87,17 +87,27 @@ pub(super) fn backend_refusal_http_error(error: &StreamBridgeError) -> Option<Re
     if !pplx_space_common_grpc::is_refused_before_start(status) {
         return None;
     }
-    let (http, code, message) = if status.code() == tonic::Code::ResourceExhausted {
+    let (http, code, message, reason) = if status.code() == tonic::Code::ResourceExhausted {
+        // The node's per-sandbox request limiter refuses before start too;
+        // name it apart from the guest's own capacity refusal.
+        let reason =
+            if pplx_space_common_grpc::UdsPerSandboxLimitExceeded::from_status(status).is_some() {
+                TooManyRequestsReason::NodeSandboxLimit
+            } else {
+                TooManyRequestsReason::SandboxAtCapacity
+            };
         (
             StatusCode::TOO_MANY_REQUESTS,
             DataPlaneHttpErrorCode::RateLimited,
             "sandbox is at capacity; this request was refused",
+            Some(reason),
         )
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             DataPlaneHttpErrorCode::ServiceUnavailable,
             "sandbox is not accepting requests right now; this request was refused",
+            None,
         )
     };
     let mut response = data_plane_http_error(
@@ -109,6 +119,9 @@ pub(super) fn backend_refusal_http_error(error: &StreamBridgeError) -> Option<Re
         ResponseKind::Admission,
     );
     insert_retry_after(&mut response, pplx_space_common_grpc::retry_after(status));
+    if let Some(reason) = reason {
+        response.extensions_mut().insert(reason);
+    }
     Some(response)
 }
 

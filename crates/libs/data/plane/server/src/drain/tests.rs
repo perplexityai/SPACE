@@ -508,7 +508,9 @@ async fn ecw_service_upgrade_is_refused_while_draining() {
         return;
     }
     let mut state = test_data_plane_state().await;
-    state.ecw_hosts = EcwHostConfig::from_env_value(Some(r#"[{"host":"example.test"}]"#));
+    state.ecw_hosts = Arc::new(EcwHostConfig::from_env_value(Some(
+        r#"[{"host":"example.test"}]"#,
+    )));
     state.drain_started.cancel();
     let sandbox = SandboxId::new();
 
@@ -968,7 +970,9 @@ async fn streamed_process_input_still_open_at_the_deadline_gets_a_409() {
         return;
     }
     let mut state = test_data_plane_state().await;
-    state.ecw_hosts = EcwHostConfig::from_env_value(Some(r#"[{"host":"example.test"}]"#));
+    state.ecw_hosts = Arc::new(EcwHostConfig::from_env_value(Some(
+        r#"[{"host":"example.test"}]"#,
+    )));
     let sandbox = SandboxId::new();
     let route = crate::tests::ecw_resolved_route(
         sandbox,

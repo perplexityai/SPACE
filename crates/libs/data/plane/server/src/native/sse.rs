@@ -89,14 +89,7 @@ pub(crate) async fn session_events(
                 session_id.kind().as_str(),
                 limit.metric_label(),
             );
-            return data_plane_http_error(
-                StatusCode::TOO_MANY_REQUESTS,
-                DataPlaneHttpErrorCode::RateLimited,
-                "too many attached streams",
-                true,
-                ResponseOrigin::DataPlane,
-                ResponseKind::Admission,
-            );
+            return too_many_attached_streams_response(limit);
         }
     };
     let stream_state = match attached.kind {
