@@ -94,6 +94,24 @@ fn advertised_endpoint_prefix_from_environment(env: &dyn Environment) -> &'stati
     }
 }
 
+/// The node API port a node's registered address implies.
+pub const DEFAULT_NODE_API_PORT: u16 = 9800;
+
+/// A node's node-API endpoint: its explicitly registered endpoint, or else its
+/// registered address on [`DEFAULT_NODE_API_PORT`] behind
+/// [`advertised_endpoint_prefix`]. Database INET host values need IPv6
+/// brackets, which `SocketAddr` formatting adds.
+pub fn node_api_endpoint(direct: Option<&str>, address: Option<&str>) -> Option<String> {
+    direct
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            let ip = address?.trim().parse::<std::net::IpAddr>().ok()?;
+            let address = std::net::SocketAddr::new(ip, DEFAULT_NODE_API_PORT);
+            Some(format!("{}{address}", advertised_endpoint_prefix()))
+        })
+}
+
 /// Add the configured TCP scheme only to bare addresses. Explicit schemes,
 /// including unsupported ones, remain intact for transport validation.
 pub fn qualify_endpoint(address: &str) -> String {
