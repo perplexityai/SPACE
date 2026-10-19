@@ -574,6 +574,34 @@ mod batch_body_limits {
         assert_payload_too_large(status, &body);
         Ok(())
     }
+
+    #[tokio::test]
+    async fn a_parents_batch_refuses_append_entries() -> TestDbResult<()> {
+        let fixture = fixture().await?;
+        let batch = |parents: bool| {
+            serde_json::to_vec(&json!({
+                "entries": [
+                    { "path": "/workspace/a/one", "data_base64": "" },
+                    { "path": "/workspace/a/two", "data_base64": "", "append": true },
+                ],
+                "parents": parents,
+            }))
+            .unwrap()
+        };
+        let (status, body) = post(&fixture, "write_batch", batch(true)).await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("append"),
+            "{body}"
+        );
+        // Without `parents` the same batch passes validation.
+        let (status, body) = post(&fixture, "write_batch", batch(false)).await?;
+        assert_ne!(status, StatusCode::BAD_REQUEST, "{body}");
+        Ok(())
+    }
 }
 
 /// Only the guest's own missing-path answer carries the `resource: path`
@@ -623,5 +651,213 @@ async fn only_a_guest_missing_path_carries_the_path_detail() {
         assert_eq!(envelope.code, PublicErrorCode::NotFound);
         assert!(!envelope.retryable);
         assert!(envelope.details.is_empty(), "{:?}", envelope.details);
+    }
+}
+
+#[test]
+fn a_parents_write_creates_the_directory_its_path_resolves_into() {
+    for (path, expected) in [
+        ("/workspace/a/b/file.txt", Some("/workspace/a/b")),
+        ("/workspace/a/./b//file.txt", Some("/workspace/a/b")),
+        ("/workspace/a/../b/file.txt", Some("/workspace/b")),
+        ("/../workspace/file.txt", Some("/workspace")),
+        ("project/src/main.rs", Some("project/src")),
+        ("project/../src/main.rs", Some("src")),
+        ("../shared/file", Some("../shared")),
+        ("project/../../file", Some("..")),
+        // The root and the user's home always exist.
+        ("/file.txt", None),
+        ("file.txt", None),
+        ("project/../file.txt", None),
+        // No file to write, so no directory to create for it.
+        ("/", None),
+        ("", None),
+        ("/workspace/..", None),
+    ] {
+        assert_eq!(
+            write_parent_directory(path).as_deref(),
+            expected,
+            "{path:?}"
+        );
+    }
+}
+
+#[test]
+fn a_batch_creates_only_its_deepest_distinct_directories() {
+    assert_eq!(
+        deepest_parent_directories([
+            "/workspace/a/one",
+            "/workspace/a/b/two",
+            "/workspace/ab/three",
+            "/top-level",
+            "/workspace/a/b/four",
+            "/workspace/c/five",
+        ]),
+        vec!["/workspace/a/b", "/workspace/ab", "/workspace/c"]
+    );
+}
+
+#[test]
+fn write_requests_create_parents_only_when_asked() {
+    let write: FileWriteRequest = serde_json::from_value(serde_json::json!({
+        "path": "/workspace/a/b", "data_base64": "",
+    }))
+    .unwrap();
+    assert!(
+        !write.parents,
+        "a missing parent stays not found by default"
+    );
+    let write: FileWriteRequest = serde_json::from_value(serde_json::json!({
+        "path": "/workspace/a/b", "data_base64": "", "parents": true,
+    }))
+    .unwrap();
+    assert!(write.parents);
+
+    let batch: FileWriteBatchRequest = serde_json::from_value(serde_json::json!({
+        "entries": [{ "path": "/workspace/a/b", "data_base64": "" }],
+    }))
+    .unwrap();
+    assert!(!batch.parents);
+    let batch: FileWriteBatchRequest = serde_json::from_value(serde_json::json!({
+        "entries": [{ "path": "/workspace/a/b", "data_base64": "" }], "parents": true,
+    }))
+    .unwrap();
+    assert!(batch.parents);
+}
+
+mod write_creating_parents {
+    use std::cell::RefCell;
+
+    use super::*;
+
+    fn missing_path() -> ControllerError {
+        ControllerError::from(pplx_space_common_grpc::mark_guest_path_not_found(
+            tonic::Status::not_found("No such file or directory (os error 2)"),
+        ))
+    }
+
+    fn status_of(result: Result<u64, PublicApiError>) -> StatusCode {
+        use axum::response::IntoResponse;
+        result.unwrap_err().into_response().status()
+    }
+
+    #[derive(Default)]
+    struct Guest {
+        writes: RefCell<Vec<String>>,
+        mkdirs: RefCell<Vec<SpacedMkdirRequest>>,
+    }
+
+    /// Runs a `parents` write of `paths` against a guest whose writes answer
+    /// from `outcomes` in order.
+    async fn run(
+        paths: &[&str],
+        outcomes: Vec<Result<u64, ControllerError>>,
+        mkdir_error: Option<ControllerError>,
+    ) -> (Result<u64, PublicApiError>, Guest) {
+        let guest = Guest::default();
+        let outcomes = RefCell::new(outcomes.into_iter());
+        let mkdir_error = RefCell::new(mkdir_error);
+        let user = GuestUserName::parse("builder").unwrap();
+        let result = write_creating_parents(
+            &IdempotencyKey::parse("client-key").unwrap(),
+            paths.iter().copied(),
+            Some(&user),
+            |key| {
+                guest.writes.borrow_mut().push(key.as_str().to_string());
+                let outcome = outcomes.borrow_mut().next().expect("unexpected write");
+                async move { outcome }
+            },
+            |request| {
+                guest.mkdirs.borrow_mut().push(request);
+                let error = mkdir_error.borrow_mut().take();
+                async move { error.map_or(Ok(()), Err) }
+            },
+            SandboxId::new(),
+        )
+        .await;
+        (result, guest)
+    }
+
+    #[tokio::test]
+    async fn a_missing_parent_is_created_as_files_mkdir_creates_it_then_written() {
+        let (result, guest) = run(
+            &["/workspace/new/deep/file.txt"],
+            vec![Err(missing_path()), Ok(3)],
+            None,
+        )
+        .await;
+        assert_eq!(result.unwrap(), 3);
+        let mkdirs = guest.mkdirs.borrow();
+        assert_eq!(mkdirs.len(), 1);
+        // The same guest request `files:mkdir` sends for this path and user,
+        // so the directories get its permissions and ownership.
+        let expected = spaced_mkdir_request(
+            SandboxId::new(),
+            "/workspace/new/deep".to_string(),
+            true,
+            Some(&GuestUserName::parse("builder").unwrap()),
+        );
+        assert_eq!(mkdirs[0].operation, expected.operation);
+        let op = mkdirs[0].operation.as_ref().unwrap();
+        assert!(op.parents && op.exist_ok);
+        assert_eq!(op.user.as_deref(), Some("builder"));
+        // The guest settled the first key with its not-found answer.
+        assert_eq!(
+            *guest.writes.borrow(),
+            vec!["client-key".to_string(), "client-key:parents".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_that_lands_creates_nothing() {
+        // A write through a symlinked directory lands; mkdir would refuse it.
+        let (result, guest) = run(&["/workspace/link/file.txt"], vec![Ok(5)], None).await;
+        assert_eq!(result.unwrap(), 5);
+        assert!(guest.mkdirs.borrow().is_empty());
+        assert_eq!(guest.writes.borrow().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn only_a_missing_guest_path_is_retried() {
+        for error in [
+            ControllerError::new(StatusCode::NOT_FOUND, "sandbox not found"),
+            ControllerError::new(StatusCode::FORBIDDEN, "permission denied"),
+        ] {
+            let status = error.status();
+            let (result, guest) = run(&["/workspace/a/file"], vec![Err(error)], None).await;
+            assert_eq!(status_of(result), status);
+            assert!(guest.mkdirs.borrow().is_empty());
+        }
+        // Nothing to create for a file at the root: the 404 stands.
+        let (result, guest) = run(&["/file"], vec![Err(missing_path())], None).await;
+        assert_eq!(status_of(result), StatusCode::NOT_FOUND);
+        assert!(guest.mkdirs.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_refused_mkdir_surfaces_and_skips_the_retry() {
+        let (result, guest) = run(
+            &["/root/private/file"],
+            vec![Err(missing_path())],
+            Some(ControllerError::new(
+                StatusCode::FORBIDDEN,
+                "permission denied",
+            )),
+        )
+        .await;
+        assert_eq!(status_of(result), StatusCode::FORBIDDEN);
+        assert_eq!(guest.writes.borrow().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_still_missing_path_after_mkdir_is_not_found() {
+        let (result, guest) = run(
+            &["/workspace/a/file"],
+            vec![Err(missing_path()), Err(missing_path())],
+            None,
+        )
+        .await;
+        assert_eq!(status_of(result), StatusCode::NOT_FOUND);
+        assert_eq!(guest.writes.borrow().len(), 2, "retried once only");
     }
 }

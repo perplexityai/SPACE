@@ -1684,6 +1684,10 @@ pub struct FileWriteRequest {
     #[cfg_attr(feature = "serde", serde(default))]
     pub append: bool,
     pub user: Option<String>,
+    /// Create the path's missing parent directories first, as
+    /// `files:mkdir` does. Off by default: a missing parent is not found.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub parents: bool,
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -1700,6 +1704,10 @@ pub struct FileWriteBatchEntry {
 pub struct FileWriteBatchRequest {
     pub entries: Vec<FileWriteBatchEntry>,
     pub user: Option<String>,
+    /// Create every entry's missing parent directories first, as
+    /// `files:mkdir` does. Off by default: a missing parent is not found.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub parents: bool,
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]

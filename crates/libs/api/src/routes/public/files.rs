@@ -1,5 +1,7 @@
 use pplx_space_common_core::types::{OrgId, SandboxId};
 
+use std::sync::Arc;
+
 use axum::{
     Extension, Json,
     body::Body,
@@ -227,6 +229,7 @@ pub async fn write_file(
         data_base64,
         append,
         user,
+        parents,
     } = request;
     let user = parse_guest_user(user)?;
     let path = parse_guest_path(path)?;
@@ -234,23 +237,55 @@ pub async fn write_file(
     // The decoded chunks are all the RPC needs; don't hold the encoded copy
     // for the rest of the request.
     drop(data_base64);
-    let response = state
-        .sandbox_controller
-        .spaced_write(
+    let metric = SandboxApiMetricIdentity::native("files_write");
+    if !parents {
+        let response = state
+            .sandbox_controller
+            .spaced_write(
+                &state.pool,
+                &sandbox,
+                metric,
+                stream::iter(spaced_write_requests(
+                    sandbox.id,
+                    path,
+                    append,
+                    idempotency_key,
+                    chunks,
+                    user,
+                )),
+            )
+            .await
+            .map_err(controller_error)?;
+        return Ok(Json(FileWriteResponse {
+            bytes_written: response.bytes_written,
+        }));
+    }
+    // Kept for a second attempt; each attempt copies one chunk at a time.
+    let chunks: Arc<[Vec<u8>]> = chunks.into();
+    let attempt = |key: IdempotencyKey| {
+        state.sandbox_controller.spaced_write(
             &state.pool,
             &sandbox,
-            SandboxApiMetricIdentity::native("files_write"),
-            stream::iter(spaced_write_requests(
+            metric,
+            stream::iter(shared_spaced_write_requests(
                 sandbox.id,
-                path,
+                path.clone(),
                 append,
-                idempotency_key,
-                chunks,
-                user,
+                key,
+                Arc::clone(&chunks),
+                user.clone(),
             )),
         )
-        .await
-        .map_err(controller_error)?;
+    };
+    let response = write_creating_parents(
+        &idempotency_key,
+        [path.as_str()],
+        user.as_ref(),
+        |key| attempt(key.clone()),
+        |request| mkdir_parent(&state, &sandbox, request),
+        sandbox.id,
+    )
+    .await?;
     Ok(Json(FileWriteResponse {
         bytes_written: response.bytes_written,
     }))
@@ -271,8 +306,16 @@ pub async fn write_file_batch(
             request.entries.len()
         )));
     }
+    if request.parents && request.entries.iter().any(|entry| entry.append) {
+        // A batch that met a missing directory is written again once it is
+        // created, so the entries that landed first would append twice.
+        return Err(PublicApiError::bad_request(
+            "parents cannot be combined with append entries",
+        ));
+    }
     let sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, &sandbox_id).await?;
     let user = parse_guest_user(request.user)?;
+    let parents = request.parents;
     let mut entries = Vec::with_capacity(request.entries.len());
     let mut batch_bytes = 0usize;
     for entry in request.entries {
@@ -293,9 +336,8 @@ pub async fn write_file_batch(
             append: entry.append,
         });
     }
-    let response = state
-        .sandbox_controller
-        .spaced_write_batch(
+    let attempt = |entries: Vec<SpacedWriteBatchEntry>, key: &IdempotencyKey| {
+        state.sandbox_controller.spaced_write_batch(
             &state.pool,
             &sandbox,
             SandboxApiMetricIdentity::native("files_write_batch"),
@@ -303,13 +345,28 @@ pub async fn write_file_batch(
                 sandbox_id: sandbox.id.to_string(),
                 operation: Some(spaced_ops::WriteBatchRequest {
                     entries,
-                    idempotency_key: Some(idempotency_key.as_str().to_string()),
-                    user: user.map(|user| user.as_str().to_string()),
+                    idempotency_key: Some(key.as_str().to_string()),
+                    user: user.as_ref().map(|user| user.as_str().to_string()),
                 }),
             },
         )
-        .await
-        .map_err(controller_error)?;
+    };
+    let response = if parents {
+        let paths: Vec<String> = entries.iter().map(|entry| entry.path.clone()).collect();
+        write_creating_parents(
+            &idempotency_key,
+            paths.iter().map(String::as_str),
+            user.as_ref(),
+            |key| attempt(entries.clone(), key),
+            |request| mkdir_parent(&state, &sandbox, request),
+            sandbox.id,
+        )
+        .await?
+    } else {
+        attempt(entries, &idempotency_key)
+            .await
+            .map_err(controller_error)?
+    };
     Ok(Json(FileWriteBatchResponse {
         files_written: response.files_written,
     }))
@@ -333,15 +390,7 @@ pub async fn mkdir_file(
             &state.pool,
             &sandbox,
             SandboxApiMetricIdentity::native("files_mkdir"),
-            SpacedMkdirRequest {
-                sandbox_id: sandbox.id.to_string(),
-                operation: Some(spaced_ops::MkdirRequest {
-                    path,
-                    parents: request.parents,
-                    exist_ok: true,
-                    user: user.map(|user| user.as_str().to_string()),
-                }),
-            },
+            spaced_mkdir_request(sandbox.id, path, request.parents, user.as_ref()),
         )
         .await
         .map_err(unprotected_mutation_error)?;
@@ -674,13 +723,187 @@ fn spaced_write_requests(
             })),
         }),
     });
-    requests.extend(chunks.into_iter().map(|chunk| SpacedWriteRequest {
+    requests.extend(
+        chunks
+            .into_iter()
+            .map(|chunk| spaced_write_data(sandbox_id, chunk)),
+    );
+    requests
+}
+
+fn spaced_write_data(sandbox_id: SandboxId, chunk: Vec<u8>) -> SpacedWriteRequest {
+    SpacedWriteRequest {
         sandbox_id: sandbox_id.to_string(),
         operation: Some(spaced_ops::WriteRequest {
             message: Some(spaced_write_request::Message::Data(chunk)),
         }),
-    }));
-    requests
+    }
+}
+
+/// [`spaced_write_requests`] over chunks kept for another attempt: each data
+/// message copies its chunk only when the stream reaches it.
+fn shared_spaced_write_requests(
+    sandbox_id: SandboxId,
+    path: String,
+    append: bool,
+    idempotency_key: IdempotencyKey,
+    chunks: Arc<[Vec<u8>]>,
+    user: Option<GuestUserName>,
+) -> impl Iterator<Item = SpacedWriteRequest> + Send + 'static {
+    let open = spaced_write_requests(sandbox_id, path, append, idempotency_key, Vec::new(), user);
+    open.into_iter()
+        .chain((0..chunks.len()).filter_map(move |index| {
+            chunks
+                .get(index)
+                .map(|chunk| spaced_write_data(sandbox_id, chunk.clone()))
+        }))
+}
+
+/// The guest mkdir `files:mkdir` issues; a `parents` write creates its
+/// directories through the same request, so they match an explicit mkdir.
+fn spaced_mkdir_request(
+    sandbox_id: SandboxId,
+    path: String,
+    parents: bool,
+    user: Option<&GuestUserName>,
+) -> SpacedMkdirRequest {
+    SpacedMkdirRequest {
+        sandbox_id: sandbox_id.to_string(),
+        operation: Some(spaced_ops::MkdirRequest {
+            path,
+            parents,
+            exist_ok: true,
+            user: user.map(|user| user.as_str().to_string()),
+        }),
+    }
+}
+
+async fn mkdir_parent(
+    state: &AppState,
+    sandbox: &Sandbox,
+    request: SpacedMkdirRequest,
+) -> Result<(), ControllerError> {
+    state
+        .sandbox_controller
+        .spaced_mkdir(
+            &state.pool,
+            sandbox,
+            SandboxApiMetricIdentity::native("files_write_parents"),
+            request,
+        )
+        .await
+        .map(drop)
+}
+
+/// A `parents` write: write, and if the guest reports the path missing,
+/// create the missing directories through the mkdir `files:mkdir` issues and
+/// write again. Directories are created only after that answer, never up
+/// front: guest mkdir refuses a path through a symlinked directory that a
+/// plain write follows, so an eager mkdir would fail writes that succeed
+/// today, and costs a request on every write that does not need it.
+async fn write_creating_parents<'a, T, Write, WriteFut, Mkdir, MkdirFut>(
+    idempotency_key: &IdempotencyKey,
+    paths: impl IntoIterator<Item = &'a str>,
+    user: Option<&GuestUserName>,
+    mut write: Write,
+    mut mkdir: Mkdir,
+    sandbox_id: SandboxId,
+) -> Result<T, PublicApiError>
+where
+    Write: FnMut(&IdempotencyKey) -> WriteFut,
+    WriteFut: std::future::Future<Output = Result<T, ControllerError>>,
+    Mkdir: FnMut(SpacedMkdirRequest) -> MkdirFut,
+    MkdirFut: std::future::Future<Output = Result<(), ControllerError>>,
+{
+    let error = match write(idempotency_key).await {
+        Err(error) if error.is_guest_path_not_found() => error,
+        result => return result.map_err(controller_error),
+    };
+    let directories = deepest_parent_directories(paths);
+    let Some(retry_key) = parents_retry_key(idempotency_key).filter(|_| !directories.is_empty())
+    else {
+        return Err(controller_error(error));
+    };
+    for directory in directories {
+        mkdir(spaced_mkdir_request(sandbox_id, directory, true, user))
+            .await
+            .map_err(controller_error)?;
+    }
+    write(&retry_key).await.map_err(controller_error)
+}
+
+/// The key for writing again once the missing directories exist. The guest
+/// settled the first key with its not-found outcome, so the retry needs its
+/// own; deriving it keeps a client's retry of the whole request idempotent.
+/// `None` only when the client's key leaves no room for the suffix.
+fn parents_retry_key(key: &IdempotencyKey) -> Option<IdempotencyKey> {
+    IdempotencyKey::parse(format!("{}:parents", key.as_str())).ok()
+}
+
+/// The directories to create for `paths`, deepest first in path order: one
+/// that is an ancestor of another is created by the deeper mkdir.
+fn deepest_parent_directories<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut directories: Vec<String> = Vec::new();
+    for directory in paths.into_iter().filter_map(write_parent_directory) {
+        if !directories.contains(&directory) {
+            directories.push(directory);
+        }
+    }
+    let covered = |candidate: &String| {
+        directories.iter().any(|other| {
+            other
+                .strip_prefix(candidate.as_str())
+                .is_some_and(|rest| rest.starts_with('/'))
+        })
+    };
+    directories
+        .iter()
+        .filter(|candidate| !covered(candidate))
+        .cloned()
+        .collect()
+}
+
+/// The directory a write of `path` lands in, resolved lexically so a `..`
+/// cannot create a directory the write never uses. `None` when the path names
+/// no file, or its directory is the root or the user's home (a bare relative
+/// name), which always exist. A relative result stays relative, so the guest
+/// resolves it against the same home as the write.
+fn write_parent_directory(path: &str) -> Option<String> {
+    use std::path::{Component, Path};
+    let path = Path::new(path);
+    let absolute = path.is_absolute();
+    let mut parts: Vec<&str> = Vec::new();
+    let mut names_file = false;
+    for component in path.components() {
+        names_file = false;
+        match component {
+            Component::Normal(part) => {
+                parts.push(part.to_str()?);
+                names_file = true;
+            }
+            Component::ParentDir => match parts.last() {
+                Some(&last) if last != ".." => {
+                    parts.pop();
+                }
+                _ if !absolute => parts.push(".."),
+                _ => {}
+            },
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+        }
+    }
+    if !names_file {
+        return None;
+    }
+    parts.pop();
+    if parts.is_empty() {
+        return None;
+    }
+    let directory = parts.join("/");
+    Some(if absolute {
+        format!("/{directory}")
+    } else {
+        directory
+    })
 }
 
 pub(in crate::routes::public) fn controller_error(error: ControllerError) -> PublicApiError {
