@@ -153,6 +153,7 @@ fn cancellation_service() -> ExecutionService {
             ..ExecutionServiceConfig::default()
         },
     )
+    .expect("direct execution service")
 }
 
 #[tokio::test]

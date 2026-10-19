@@ -174,7 +174,7 @@ pub(crate) fn create_guest_service_with(
         ..Default::default()
     };
     adjust(&mut config);
-    let service = SpacedGuestService::with_config(shutdown.clone(), config);
+    let service = SpacedGuestService::with_config(shutdown.clone(), config).expect("guest service");
     (service, shutdown)
 }
 

@@ -5,6 +5,8 @@ use super::*;
 pub struct ExecutionServiceConfig {
     pub default_operation_user: GuestUserName,
     pub filesystem_execution: FilesystemExecutionMode,
+    /// Required on Linux when using identity workers. Never inferred from the host.
+    pub worker_executable: Option<crate::WorkerExecutable>,
     pub cancellation_grace: Duration,
     /// Guest memory used to size retained process output; None uses the fallback budget.
     pub guest_memory_bytes: Option<u64>,
@@ -22,8 +24,17 @@ impl Default for ExecutionServiceConfig {
             },
             cancellation_grace: filesystem::router::DEFAULT_CANCELLATION_GRACE,
             guest_memory_bytes: None,
+            worker_executable: None,
         }
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CreateExecutionServiceError {
+    #[error("identity workers require an explicit worker executable")]
+    MissingWorkerExecutable,
+    #[error("identity workers require Linux")]
+    UnsupportedIdentityWorkers,
 }
 
 #[derive(Clone)]
@@ -47,7 +58,10 @@ pub(super) struct ExecutionServiceInner {
 }
 
 impl ExecutionService {
-    pub fn with_config(shutdown: CancellationToken, config: ExecutionServiceConfig) -> Self {
+    pub fn with_config(
+        shutdown: CancellationToken,
+        config: ExecutionServiceConfig,
+    ) -> Result<Self, CreateExecutionServiceError> {
         Self::with_cgroups(shutdown, config, None)
     }
 
@@ -55,15 +69,16 @@ impl ExecutionService {
         shutdown: CancellationToken,
         config: ExecutionServiceConfig,
         guest_cgroups: Option<Arc<ExecutionCgroups>>,
-    ) -> Self {
+    ) -> Result<Self, CreateExecutionServiceError> {
         let filesystem = filesystem::FilesystemRouter::new(
             config.filesystem_execution,
+            config.worker_executable,
             config.default_operation_user.clone(),
             shutdown.clone(),
             config.cancellation_grace,
             guest_cgroups.clone(),
-        );
-        Self {
+        )?;
+        Ok(Self {
             inner: Arc::new(ExecutionServiceInner {
                 shutdown,
                 process_tasks: tokio_util::task::TaskTracker::new(),
@@ -80,7 +95,7 @@ impl ExecutionService {
                 filesystem,
                 guest_cgroups,
             }),
-        }
+        })
     }
 
     pub(super) fn require_running(&self) -> Result<(), Status> {
@@ -126,3 +141,6 @@ impl ExecutionService {
         self.inner.filesystem.grpc_service()
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -444,6 +444,11 @@ impl FilesystemRouter {
 
     pub(crate) fn new(
         execution: FilesystemExecutionMode,
+        #[cfg_attr(
+            not(target_os = "linux"),
+            expect(unused_variables, reason = "Linux-only workers")
+        )]
+        worker_executable: Option<crate::WorkerExecutable>,
         default_user: GuestUserName,
         shutdown: tokio_util::sync::CancellationToken,
         cancellation_grace: std::time::Duration,
@@ -452,22 +457,27 @@ impl FilesystemRouter {
             expect(unused_variables, reason = "Linux-only workers")
         )]
         guest_cgroups: Option<Arc<crate::ExecutionCgroups>>,
-    ) -> Self {
+    ) -> Result<Self, crate::CreateExecutionServiceError> {
         let backend = match execution {
             FilesystemExecutionMode::Direct => Backend::Direct(FilesystemWorkerService::new(
                 default_user.clone(),
                 shutdown.child_token(),
             )),
             #[cfg(target_os = "linux")]
-            FilesystemExecutionMode::IdentityWorkers => Backend::Workers(
-                super::worker::WorkerPool::new(shutdown.clone(), guest_cgroups),
-            ),
+            FilesystemExecutionMode::IdentityWorkers => {
+                Backend::Workers(super::worker::WorkerPool::new(
+                    shutdown.clone(),
+                    guest_cgroups,
+                    worker_executable
+                        .ok_or(crate::CreateExecutionServiceError::MissingWorkerExecutable)?,
+                ))
+            }
             #[cfg(not(target_os = "linux"))]
-            FilesystemExecutionMode::IdentityWorkers => Backend::Direct(
-                FilesystemWorkerService::new(default_user.clone(), shutdown.child_token()),
-            ),
+            FilesystemExecutionMode::IdentityWorkers => {
+                return Err(crate::CreateExecutionServiceError::UnsupportedIdentityWorkers);
+            }
         };
-        Self {
+        Ok(Self {
             default_user,
             operations: Operations::new(),
             tasks: TaskTracker::new(),
@@ -484,7 +494,7 @@ impl FilesystemRouter {
             #[cfg(target_os = "linux")]
             ledger_evidence: Arc::new(Mutex::new(HashMap::new())),
             cancellation_grace,
-        }
+        })
     }
 
     fn effective_user(&self, requested_user: Option<String>) -> Result<GuestUserName, Status> {

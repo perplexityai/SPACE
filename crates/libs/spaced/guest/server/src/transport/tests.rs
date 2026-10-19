@@ -13,7 +13,8 @@ async fn incomplete_requests_are_bounded_per_connection_and_release_capacity() {
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     let shutdown = CancellationToken::new();
     let service =
-        SpacedGuestService::with_config(shutdown.clone(), SpacedGuestServiceConfig::default());
+        SpacedGuestService::with_config(shutdown.clone(), SpacedGuestServiceConfig::default())
+            .expect("guest service");
     let stop = shutdown.clone();
     let server = tokio::spawn(async move {
         guest_grpc_server_builder(MAX_LOCAL_GUEST_STREAMS)

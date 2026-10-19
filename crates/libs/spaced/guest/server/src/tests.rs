@@ -13,7 +13,8 @@ async fn listener_failures_preserve_drain_and_initial_error_priority() {
             let service = SpacedGuestService::with_config(
                 shutdown.clone(),
                 SpacedGuestServiceConfig::default(),
-            );
+            )
+            .expect("guest service");
             if !initial_failure {
                 shutdown.cancel();
             }
@@ -67,6 +68,7 @@ async fn local_metadata_admission_bounds_rates_and_reserves_health() {
         CancellationToken::new(),
         SpacedGuestServiceConfig::default(),
     )
+    .expect("guest service")
     .local_grpc_service();
     let request = |method| {
         http::Request::builder()
@@ -126,7 +128,8 @@ async fn disabled_listeners_observe_shutdown() {
             bridge_socket_path: None,
             ..Default::default()
         },
-    );
+    )
+    .expect("guest service");
     shutdown.cancel();
     // Test the disabled listeners directly, without unrelated tests' shared
     // process-start gate advancing this runtime's paused clock.
@@ -150,7 +153,8 @@ async fn bridge_host_retries_preserve_generation_and_do_not_retry_overload() {
             host_connector_type: HostConnectorType::Uds(PathBuf::from("unused-test-host.sock")),
             ..Default::default()
         },
-    );
+    )
+    .expect("guest service");
     Arc::get_mut(&mut service.inner)
         .unwrap()
         .bridge_retry_policy
@@ -226,7 +230,7 @@ async fn bridge_host_retries_preserve_generation_and_do_not_retry_overload() {
 #[tokio::test]
 async fn process_adapter_requires_guest_readiness_and_observes_shutdown() {
     let shutdown = CancellationToken::new();
-    let service = SpacedGuestService::new(shutdown.clone());
+    let service = SpacedGuestService::new(shutdown.clone()).expect("guest service");
     let request = || Request::new(ListProcessesRequest {});
     assert_eq!(
         Process::list_processes(&service, request())

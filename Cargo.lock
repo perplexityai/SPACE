@@ -7030,6 +7030,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-spaced-guest-worker"
+version = "0.8.0"
+dependencies = [
+ "futures-util",
+ "nix 0.31.3",
+ "pplx-space-common-core",
+ "pplx-space-spaced-guest-execution",
+ "pplx-space-spaced-guest-protocol",
+ "pplx-space-test-env",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tonic",
+ "tonic-prost",
+]
+
+[[package]]
 name = "pplx-space-spaced-host-cli"
 version = "0.8.0"
 dependencies = [

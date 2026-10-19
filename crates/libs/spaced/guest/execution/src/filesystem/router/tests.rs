@@ -22,11 +22,13 @@ fn current_user() -> GuestUserName {
 fn identity_router() -> FilesystemRouter {
     FilesystemRouter::new(
         FilesystemExecutionMode::IdentityWorkers,
+        Some(crate::WorkerExecutable::open("/proc/self/exe").expect("test executable")),
         current_user(),
         CancellationToken::new(),
         super::DEFAULT_CANCELLATION_GRACE,
         None,
     )
+    .expect("identity router")
 }
 
 async fn connected_worker(

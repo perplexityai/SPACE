@@ -380,7 +380,8 @@ async fn run_case() {
             bridge_socket_path: Some(socket.clone()),
             ..Default::default()
         },
-    );
+    )
+    .expect("guest service");
     service.ready();
     let serving = tokio::spawn(service.clone().run());
     assert!(service.wait_until_listening().await);

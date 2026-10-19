@@ -409,7 +409,8 @@ async fn process_start_honors_configured_default_and_explicit_user_override() {
             default_operation_user: GuestUserName::parse("__space_missing_user__").unwrap(),
             ..Default::default()
         },
-    );
+    )
+    .expect("guest service");
     let request = StartRequest {
         command: vec!["/usr/bin/id".into(), "-un".into()],
         idempotency_key: Some("default-user".into()),

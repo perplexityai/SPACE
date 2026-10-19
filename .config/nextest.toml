@@ -128,6 +128,7 @@ or (package(pplx-space-sbx-mgr) and test(=transfer_directory::tests::distinct_se
 or (package(pplx-space-credmgr) and test(=run::tests::volume_socket::real_peers_obey_volume_listener_policy))
 or (package(pplx-space-credmgr) and test(=run::volume_socket::tests::preflight_checks_real_permissions_without_replacing_live_socket))
 or binary_id(pplx-space-spaced-guest-server::worker_subprocess)
+or binary_id(pplx-space-spaced-guest-worker::embedding)
 or binary_id(pplx-space-spaced-guest-server::worker_telemetry)
 or (package(pplx-space-spaced-guest-execution) and test(=filesystem::router::tests::a_read_streams_from_the_workers_descriptor_without_relaying_through_it))
 or (package(pplx-space-spaced-guest-execution) and test(=filesystem::router::tests::a_read_through_a_workers_descriptor_ends_with_the_worker))

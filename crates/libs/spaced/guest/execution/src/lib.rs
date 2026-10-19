@@ -39,10 +39,12 @@ mod idempotency;
 mod identity;
 mod placement;
 mod process;
-pub use execution::{ExecutionService, ExecutionServiceConfig};
+mod worker_executable;
+pub use execution::{CreateExecutionServiceError, ExecutionService, ExecutionServiceConfig};
 use idempotency::IdempotencyStore;
 pub use placement::ExecutionCgroups;
 use process::ProcessRegistry;
+pub use worker_executable::{OpenWorkerExecutableError, WorkerExecutable};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FilesystemExecutionMode {

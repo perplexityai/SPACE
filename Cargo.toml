@@ -23,6 +23,7 @@ members = [
     "crates/apps/sbx/mgr/svc",
     "crates/apps/admin/cli",
     "crates/apps/spaced/guest/svc",
+    "crates/apps/spaced/guest/worker",
     "crates/apps/spaced/guest/cli",
     "crates/apps/spaced/guest/loopback-test",
     "crates/apps/spaced/host/svc",

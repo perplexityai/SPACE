@@ -1,0 +1,245 @@
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::time::Duration;
+
+use pplx_space_common_core::types::GuestUserName;
+use pplx_space_spaced_guest_execution::{
+    ExecutionService, ExecutionServiceConfig, WorkerExecutable,
+};
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
+    StatRequest, WriteBatchEntry, WriteBatchRequest, filesystem_client::FilesystemClient,
+};
+use tokio_util::sync::CancellationToken;
+use tonic::transport::{Channel, Server};
+
+type ServerTask = tokio::task::JoinHandle<Result<(), tonic::transport::Error>>;
+
+async fn host(
+    executable: WorkerExecutable,
+) -> (
+    ExecutionService,
+    FilesystemClient<Channel>,
+    CancellationToken,
+    ServerTask,
+) {
+    let shutdown = CancellationToken::new();
+    let service = ExecutionService::with_config(
+        shutdown.clone(),
+        ExecutionServiceConfig {
+            default_operation_user: GuestUserName::parse("nobody").expect("account name"),
+            worker_executable: Some(executable),
+            ..Default::default()
+        },
+    )
+    .expect("execution service");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test listener");
+    let address = listener.local_addr().expect("listener address");
+    let grpc = service.filesystem_grpc_service();
+    let stop = shutdown.clone();
+    let server = tokio::spawn(async move {
+        Server::builder()
+            .add_service(grpc)
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                stop.cancelled_owned(),
+            )
+            .await
+    });
+    let client = FilesystemClient::connect(format!("http://{address}"))
+        .await
+        .expect("connect host");
+    (service, client, shutdown, server)
+}
+
+async fn stop(service: ExecutionService, shutdown: CancellationToken, server: ServerTask) {
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(3), service.drain())
+        .await
+        .expect("drain reaps workers promptly");
+    tokio::time::timeout(Duration::from_secs(3), server)
+        .await
+        .expect("server stops")
+        .expect("server task")
+        .expect("server result");
+    assert!(
+        children().is_empty(),
+        "drain must reap owned worker processes"
+    );
+}
+
+fn children() -> Vec<u32> {
+    let mut children = Vec::new();
+    for task in std::fs::read_dir("/proc/self/task").expect("tasks") {
+        let path = task.expect("task").path().join("children");
+        if let Ok(value) = std::fs::read_to_string(path) {
+            children.extend(
+                value
+                    .split_whitespace()
+                    .map(|pid| pid.parse::<u32>().expect("pid")),
+            );
+        }
+    }
+    children.sort_unstable();
+    children.dedup();
+    children
+}
+
+pub(super) async fn run() {
+    let standalone = std::process::Command::new(env!("CARGO_BIN_EXE_spaced-filesystem-worker"))
+        .env_clear()
+        .output()
+        .expect("worker without launch configuration");
+    assert!(
+        !standalone.status.success(),
+        "worker must reject ordinary invocation"
+    );
+    let directory = tempfile::tempdir().expect("fixture directory");
+    // Provisioned system account, not a root-only success path.
+    let account = nix::unistd::User::from_name("nobody")
+        .expect("account lookup")
+        .expect("nobody account");
+    assert!(!account.uid.is_root());
+    nix::unistd::chown(directory.path(), Some(account.uid), Some(account.gid))
+        .expect("fixture ownership");
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("fixture mode");
+    let path = directory.path().join("payload");
+    let artifacts = tempfile::tempdir().expect("artifact directory");
+    let artifact = artifacts.path().join("worker");
+    std::fs::copy(env!("CARGO_BIN_EXE_spaced-filesystem-worker"), &artifact)
+        .expect("worker artifact");
+    let executable = WorkerExecutable::open(&artifact).expect("dedicated worker");
+    let replacement = artifacts.path().join("replacement");
+    std::fs::copy("/bin/true", &replacement).expect("replacement artifact");
+    std::fs::rename(&replacement, &artifact).expect("atomic replacement");
+    let (service, mut client, shutdown, server) = host(executable).await;
+    let write = WriteBatchRequest {
+        entries: vec![WriteBatchEntry {
+            path: path.display().to_string(),
+            data: b"once".to_vec(),
+            append: true,
+        }],
+        idempotency_key: Some("embedding-write".into()),
+        user: None,
+    };
+    for _ in 0..2 {
+        client
+            .write_batch(write.clone())
+            .await
+            .expect("write and replay");
+    }
+    assert_eq!(std::fs::read(&path).expect("file"), b"once");
+    let metadata = std::fs::metadata(&path).expect("metadata");
+    assert_eq!(metadata.uid(), account.uid.as_raw());
+    assert_eq!(metadata.gid(), account.gid.as_raw());
+    assert_eq!(children().len(), 1, "one resident worker");
+    client
+        .stat_info(StatRequest {
+            path: path.display().to_string(),
+            user: Some("root".into()),
+        })
+        .await
+        .expect("second identity");
+    assert_eq!(children().len(), 2, "separate worker per identity");
+    // The executable pin is CLOEXEC; only the worker channel is deliberately inherited.
+    for pid in children() {
+        for entry in std::fs::read_dir(format!("/proc/{pid}/fd")).expect("worker descriptors") {
+            let target =
+                std::fs::read_link(entry.expect("descriptor").path()).expect("descriptor target");
+            assert!(
+                !target.starts_with(artifacts.path()),
+                "executable pin leaked into worker"
+            );
+        }
+    }
+    // Native process calls and filesystem workers share the selected account.
+    use futures_util::StreamExt;
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
+        StartRequest, process_event::Event, process_exit::Outcome, process_server::Process,
+    };
+    let mut events = Process::start(
+        &service,
+        tonic::Request::new(StartRequest {
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "/usr/bin/id -u; exec /bin/cat \"$1\"".into(),
+                "embedding".into(),
+                path.display().to_string(),
+            ],
+            cwd: Some(directory.path().display().to_string()),
+            idempotency_key: Some("embedding-process".into()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("start process")
+    .into_inner();
+    let mut output = Vec::new();
+    let mut exited = false;
+    while let Some(event) = events.next().await {
+        match event.expect("process event").event {
+            Some(Event::Stdout(chunk)) => output.extend(chunk.data),
+            Some(Event::Exit(exit)) => {
+                assert!(matches!(exit.outcome, Some(Outcome::Exited(exit)) if exit.exit_code == 0));
+                exited = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(exited);
+    assert_eq!(output, format!("{}\nonce", account.uid).as_bytes());
+    drop(client);
+    stop(service, shutdown, server).await;
+
+    // Valid executable shape, wrong worker protocol: fail startup and reap.
+    let (service, mut client, shutdown, server) =
+        host(WorkerExecutable::open("/bin/true").expect("wrong artifact")).await;
+    client
+        .stat_info(StatRequest {
+            path: "/".into(),
+            user: None,
+        })
+        .await
+        .expect_err("non-worker must fail startup");
+    drop(client);
+    stop(service, shutdown, server).await;
+
+    let (service, mut client, shutdown, server) =
+        host(WorkerExecutable::open("/proc/self/exe").expect("incompatible artifact")).await;
+    let error = client
+        .stat_info(StatRequest {
+            path: "/".into(),
+            user: Some("root".into()),
+        })
+        .await
+        .expect_err("mismatched protocol must fail before dispatch");
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+    assert_eq!(error.message(), "incompatible filesystem worker protocol");
+    drop(client);
+    stop(service, shutdown, server).await;
+
+    // Caller cancellation must not detach startup ownership. A worker that
+    // never speaks gRPC must be killed and reaped promptly on host shutdown.
+    let (service, mut client, shutdown, server) =
+        host(WorkerExecutable::open("/proc/self/exe").expect("unresponsive artifact")).await;
+    let request = tokio::spawn(async move {
+        client
+            .stat_info(StatRequest {
+                path: "/".into(),
+                user: None,
+            })
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while children().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("worker spawned");
+    request.abort();
+    assert!(request.await.expect_err("caller cancelled").is_cancelled());
+    stop(service, shutdown, server).await;
+}

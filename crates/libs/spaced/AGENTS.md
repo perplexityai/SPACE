@@ -15,8 +15,8 @@ section of `docs/versioning.md` is the policy.
   needs the minimum host version, and its marker says so, as
   `proto/spaced/bridge/guest/v1/legacy.proto` does.
 - `proto/spaced/worker/v1` connects the guest service to a worker spawned
-  from its own executable. Any change to it bumps the protocol version the
-  worker reports in `Ready`, which the parent checks.
+  from the explicitly selected executable. Any change to it bumps the protocol
+  version the worker reports in `Ready`, which the parent checks.
 - A feature that needs a newer guest answers older ones with
   `guest_capability_unsupported_status` (`crates/libs/common/grpc`).
 - Host fallbacks to legacy guest RPCs fall back only on `Unimplemented`; a

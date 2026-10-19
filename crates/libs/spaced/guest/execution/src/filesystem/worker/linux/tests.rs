@@ -2,7 +2,11 @@ use super::*;
 
 #[tokio::test]
 async fn concurrent_invalidation_waits_for_reaping_after_first_caller_cancels() {
-    let pool = WorkerPool::new(CancellationToken::new(), None);
+    let pool = WorkerPool::new(
+        CancellationToken::new(),
+        None,
+        crate::WorkerExecutable::open("/proc/self/exe").expect("test executable"),
+    );
     let user = GuestUserName::parse("root").expect("user");
     let channel = tonic::transport::Endpoint::from_static("http://[::]:50051").connect_lazy();
     pool.insert_test_client(user.clone(), channel)
@@ -38,7 +42,11 @@ use tonic::transport::Endpoint;
 
 #[tokio::test]
 async fn active_client_lease_prevents_idle_worker_eviction() {
-    let pool = WorkerPool::new(CancellationToken::new(), None);
+    let pool = WorkerPool::new(
+        CancellationToken::new(),
+        None,
+        crate::WorkerExecutable::open("/proc/self/exe").expect("test executable"),
+    );
     let root = GuestUserName::parse("root").expect("root");
     let user = GuestUserName::parse("user").expect("user");
     let channel = Endpoint::from_static("http://[::]:50051").connect_lazy();
@@ -269,7 +277,11 @@ async fn worker_names_itself_only_when_it_would_inherit_its_launcher() {
 
 #[tokio::test]
 async fn expired_worker_shutdown_does_not_block_another_resident() {
-    let pool = WorkerPool::new(CancellationToken::new(), None);
+    let pool = WorkerPool::new(
+        CancellationToken::new(),
+        None,
+        crate::WorkerExecutable::open("/proc/self/exe").expect("test executable"),
+    );
     let expired_user = GuestUserName::parse("root").expect("valid user");
     let resident_user = GuestUserName::parse("user").expect("valid user");
     let release_expired_stop = Arc::new(tokio::sync::Notify::new());
@@ -333,7 +345,11 @@ async fn expired_worker_shutdown_does_not_block_another_resident() {
 
 #[tokio::test]
 async fn same_identity_waiters_share_an_in_progress_start() {
-    let pool = WorkerPool::new(CancellationToken::new(), None);
+    let pool = WorkerPool::new(
+        CancellationToken::new(),
+        None,
+        crate::WorkerExecutable::open("/proc/self/exe").expect("test executable"),
+    );
     let user = GuestUserName::parse("user").expect("valid user");
     let startup_id = uuid::Uuid::now_v7();
     let (result_tx, result_rx) = watch::channel(None);
@@ -397,7 +413,11 @@ async fn identity_worker_start_wait_has_a_deadline() {
 
 #[tokio::test]
 async fn failed_start_removes_its_capacity_reservation() {
-    let pool = WorkerPool::new(CancellationToken::new(), None);
+    let pool = WorkerPool::new(
+        CancellationToken::new(),
+        None,
+        crate::WorkerExecutable::open("/proc/self/exe").expect("test executable"),
+    );
     let user = GuestUserName::parse("user").expect("valid user");
     let startup_id = uuid::Uuid::now_v7();
     let (_result_tx, result_rx) = watch::channel(None);
@@ -427,7 +447,11 @@ async fn failed_start_removes_its_capacity_reservation() {
 #[tokio::test]
 async fn invalidating_a_worker_cancels_its_supervisor() {
     let user = GuestUserName::parse("user").expect("valid user");
-    let pool = WorkerPool::new(CancellationToken::new(), None);
+    let pool = WorkerPool::new(
+        CancellationToken::new(),
+        None,
+        crate::WorkerExecutable::open("/proc/self/exe").expect("test executable"),
+    );
     let stop_token = CancellationToken::new();
     let worker = WorkerClient {
         client: FilesystemClient::new(Endpoint::from_static("http://[::]:50051").connect_lazy()),
@@ -482,7 +506,11 @@ async fn cancelled_worker_supervisor_reaps_its_child() {
 // filesystem call ever arrives; a worker kept for the change ledger is not.
 #[tokio::test]
 async fn reaper_stops_an_expired_idle_worker_without_another_acquisition() {
-    let pool = WorkerPool::new(CancellationToken::new(), None);
+    let pool = WorkerPool::new(
+        CancellationToken::new(),
+        None,
+        crate::WorkerExecutable::open("/proc/self/exe").expect("test executable"),
+    );
     let idle = GuestUserName::parse("root").expect("root");
     let ledger = GuestUserName::parse("user").expect("user");
     let channel = Endpoint::from_static("http://[::]:50051").connect_lazy();

@@ -121,7 +121,8 @@ impl Guest {
                 bridge_socket_path: Some(socket.to_path_buf()),
                 ..Default::default()
             },
-        );
+        )
+        .expect("guest service");
         guest.ready();
         let task = tokio::spawn(guest.run());
         Self { shutdown, task }

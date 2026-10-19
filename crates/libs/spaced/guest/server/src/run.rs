@@ -49,6 +49,8 @@ pub enum RunSpacedGuestError {
     Runtime(#[source] std::io::Error),
     #[error(transparent)]
     Serve(#[from] RunGuestServerError),
+    #[error(transparent)]
+    CreateService(#[from] crate::CreateSpacedGuestServiceError),
 }
 
 // With the 10s drain these bound daemon exit; `TimeoutStopSec` in the seed's
@@ -138,7 +140,7 @@ pub async fn serve(
     let service_config = config
         .service_config
         .unwrap_or_else(service_config_from_environment);
-    let service = SpacedGuestService::with_config(shutdown.clone(), service_config);
+    let service = SpacedGuestService::with_config(shutdown.clone(), service_config)?;
     // systemd already ordered spaced.service after local-fs.target. The remaining
     // required readiness edge is binding the bridge-guest command listener; the
     // server marks SPACE-ready immediately after that bind succeeds, and only

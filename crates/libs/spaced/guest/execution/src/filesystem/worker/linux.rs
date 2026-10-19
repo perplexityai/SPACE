@@ -169,6 +169,7 @@ enum ClientAcquisition {
 
 #[derive(Clone)]
 pub(crate) struct WorkerPool {
+    executable: crate::WorkerExecutable,
     guest_cgroups: Option<Arc<crate::ExecutionCgroups>>,
     shutdown: CancellationToken,
     workers: Arc<Mutex<HashMap<GuestUserName, WorkerEntry>>>,
@@ -261,8 +262,10 @@ impl WorkerPool {
     pub(crate) fn new(
         shutdown: CancellationToken,
         guest_cgroups: Option<Arc<crate::ExecutionCgroups>>,
+        executable: crate::WorkerExecutable,
     ) -> Self {
         Self {
+            executable,
             guest_cgroups,
             shutdown,
             workers: Arc::new(Mutex::new(HashMap::new())),
@@ -624,8 +627,8 @@ impl WorkerPool {
         )
         .map_err(|error| worker_io_status(io::Error::from(error)))?;
         let worker_raw_fd = worker_fd.as_raw_fd();
-        let executable = std::env::current_exe().map_err(worker_io_status)?;
-        let mut command = worker_command(&executable, user, worker_raw_fd);
+        let executable = self.executable.clone();
+        let mut command = worker_command(&executable.path(), user, worker_raw_fd);
         // The socketpair is CLOEXEC by default. Clear it only in the forked
         // worker so concurrent user process spawns cannot inherit this fd.
         // SAFETY: `pre_exec` installs a closure that runs in the forked child
@@ -656,6 +659,8 @@ impl WorkerPool {
             let child = command.spawn();
             // Closes this process's copy of the worker's socket.
             drop(command);
+            // Keep the selected inode alive through exec, even if the service is dropped.
+            drop(executable);
             child
         })
         .await

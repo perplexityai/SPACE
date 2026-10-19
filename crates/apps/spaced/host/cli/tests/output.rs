@@ -36,7 +36,8 @@ async fn read_run_and_connect_preserve_bytes_without_waiting_for_process_exit() 
             bridge_socket_path: Some(guest_socket.clone()),
             ..Default::default()
         },
-    );
+    )
+    .expect("guest service");
     let guest_task = tokio::spawn(guest.clone().run());
     assert!(guest.wait_until_listening().await);
     let host = SpacedHostService::new_with_config(

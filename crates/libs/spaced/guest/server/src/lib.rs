@@ -307,12 +307,34 @@ struct SpacedGuestServiceInner {
     execution: ExecutionService,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum CreateSpacedGuestServiceError {
+    #[error(transparent)]
+    WorkerExecutable(#[from] pplx_space_spaced_guest_execution::OpenWorkerExecutableError),
+    #[error(transparent)]
+    Execution(#[from] pplx_space_spaced_guest_execution::CreateExecutionServiceError),
+}
+
 impl SpacedGuestService {
-    pub fn new(shutdown: CancellationToken) -> Self {
+    pub fn new(shutdown: CancellationToken) -> Result<Self, CreateSpacedGuestServiceError> {
         Self::with_config(shutdown, SpacedGuestServiceConfig::default())
     }
 
-    pub fn with_config(shutdown: CancellationToken, config: SpacedGuestServiceConfig) -> Self {
+    pub fn with_config(
+        shutdown: CancellationToken,
+        config: SpacedGuestServiceConfig,
+    ) -> Result<Self, CreateSpacedGuestServiceError> {
+        // Only the daemon chooses to re-enter its own worker-mode entrypoint.
+        // Pin the running inode, including when its on-disk path was replaced.
+        #[cfg(target_os = "linux")]
+        let worker_executable = match config.filesystem_execution {
+            FilesystemExecutionMode::IdentityWorkers => Some(
+                pplx_space_spaced_guest_execution::WorkerExecutable::open("/proc/self/exe")?,
+            ),
+            FilesystemExecutionMode::Direct => None,
+        };
+        #[cfg(not(target_os = "linux"))]
+        let worker_executable = None;
         // Only initialize cgroups inside a Firecracker guest, including custom
         // daemon entrypoints. The execution service receives placement only.
         let guest_cgroups = if native_vsock_available() {
@@ -335,10 +357,11 @@ impl SpacedGuestService {
                 filesystem_execution: config.filesystem_execution,
                 cancellation_grace: config.cancellation_grace,
                 guest_memory_bytes: meta::guest_mem_total_bytes(),
+                worker_executable,
             },
             guest_cgroups.map(|cgroups| Arc::clone(&cgroups.placement)),
-        );
-        Self {
+        )?;
+        Ok(Self {
             inner: Arc::new(SpacedGuestServiceInner {
                 shutdown,
                 filesystem_flush_slots: Arc::new(Semaphore::new(1)),
@@ -356,7 +379,7 @@ impl SpacedGuestService {
                 service_generation,
                 execution,
             }),
-        }
+        })
     }
 
     pub fn ready(&self) {

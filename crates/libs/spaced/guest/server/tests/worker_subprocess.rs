@@ -1,6 +1,7 @@
 //! The test executable is also the real identity-worker child executable.
-//! This exercises current_exe, credential setup, socket inheritance, RPCs,
-//! cancellation and replacement rather than substituting an in-process store.
+//! This exercises the daemon-selected executable, credential setup, socket
+//! inheritance, RPCs, cancellation and replacement rather than substituting an
+//! in-process store.
 #![cfg(test)]
 
 #[cfg(target_os = "linux")]
@@ -63,7 +64,8 @@ async fn run() {
             cancellation_grace: std::time::Duration::from_secs(1),
             ..Default::default()
         },
-    );
+    )
+    .expect("guest service");
     service.ready();
     let task = tokio::spawn(service.clone().run());
     assert!(service.wait_until_listening().await);

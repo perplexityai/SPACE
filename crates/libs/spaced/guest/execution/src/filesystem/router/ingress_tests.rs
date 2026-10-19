@@ -13,11 +13,13 @@ fn router() -> FilesystemRouter {
         .expect("current user");
     FilesystemRouter::new(
         FilesystemExecutionMode::Direct,
+        None,
         GuestUserName::parse(user.name).expect("username"),
         CancellationToken::new(),
         super::DEFAULT_CANCELLATION_GRACE,
         None,
     )
+    .expect("direct router")
 }
 
 /// A router whose file operations are rejected at once when every slot is
