@@ -44,9 +44,9 @@ drain/cancel handoff.
 ## Server-side object copies
 
 Volume-manager's `SubmitCopyObject` registers a durable, sandbox-scoped copy
-job in the existing queue. `GetTransferJob` / `WaitTransferJob` observe it;
-`CancelTransfer` can cancel it by job ID. Copies have their own bounded kind
-concurrency, using the push-concurrency setting, and need no codec slot or
+job in the existing queue. `GetTransferJob` / `WaitTransferJob` observe it.
+Copies have their own bounded kind concurrency, using the push-concurrency
+setting, and need no codec slot or
 worker-local payload file. Live equivalent submissions join the same job;
 a submission after completion rechecks the object instead of trusting a
 destination retention may have removed.
@@ -58,8 +58,10 @@ unchanged, choosing its existing single or multipart copy path, then the worker
 verifies the destination length. Reported copy bytes are stored object bytes,
 not logical decompressed bytes or worker network traffic. There is no implicit
 download/upload fallback. The caller retains source ownership and publishes
-artifact metadata only after the copy succeeds; cancellation does not delete
-a possibly completed destination out from under that owner.
+artifact metadata only after the copy succeeds. `CancelTransfer` remains
+pull-only: an S3 copy already accepted by the server cannot be recalled, so
+copies cannot promise its writer barrier. Disconnecting does not delete a
+possibly completed destination out from under its owner.
 
 Deploy the credential authority and forwarding agents before copy consumers,
 and volume-manager before sandbox-manager begins submitting copies. Roll back

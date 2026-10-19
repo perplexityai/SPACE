@@ -460,7 +460,7 @@ message ListTransferJobsResponse {
 
 message CancelTransferRequest {
     oneof selector {
-        // The job must be a pull, pull-artifact, or server-side copy transfer.
+        // The job must be a pull or pull-artifact transfer.
         string job_id = 1;
         // Cancels active pulls owned by this restore-attempt scope.
         string transfer_scope_id = 2;

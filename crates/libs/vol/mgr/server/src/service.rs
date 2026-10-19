@@ -1433,12 +1433,9 @@ impl VolumeManager for VolumeManagerService {
                     Status::not_found(format!("transfer job not found: {job_id}"))
                 })?;
                 self.authorize_job(&peer, &job, "cancel_transfer")?;
-                if !matches!(
-                    job.kind.as_str(),
-                    PULL_KIND | PULL_ARTIFACT_KIND | crate::executor::copy::KIND
-                ) {
+                if !matches!(job.kind.as_str(), PULL_KIND | PULL_ARTIFACT_KIND) {
                     return Err(Status::failed_precondition(format!(
-                        "transfer job {job_id} is not a pull or copy"
+                        "transfer job {job_id} is not a pull"
                     )));
                 }
                 vec![job_id]

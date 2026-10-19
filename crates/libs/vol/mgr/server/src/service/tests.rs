@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-async fn copy_jobs_deduplicate_live_work_and_keep_peer_and_cancellation_boundaries() {
+async fn copy_jobs_deduplicate_live_work_without_claiming_a_pull_writer_barrier() {
     let temp = tempfile::tempdir().unwrap();
     let service = test_service(&temp).await;
     let request = crate::proto::CopyObjectRequest {
@@ -51,18 +51,13 @@ async fn copy_jobs_deduplicate_live_work_and_keep_peer_and_cancellation_boundari
         job_to_proto(job).unwrap().s3_uri,
         request.destination_s3_uri
     );
-    let cancelled = service
+    let error = service
         .cancel_transfer(root_request(CancelTransferRequest {
             selector: Some(CancelTransferSelector::JobId(first)),
         }))
         .await
-        .unwrap()
-        .into_inner();
-    assert_eq!(cancelled.jobs.len(), 1);
-    assert_eq!(
-        cancelled.jobs[0].status,
-        TransferJobStatus::Cancelled as i32
-    );
+        .expect_err("S3 copies cannot promise the pull cancellation writer barrier");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
     assert_eq!(service.worker.list_jobs(None, None, 100).unwrap().len(), 1);
 }
 
