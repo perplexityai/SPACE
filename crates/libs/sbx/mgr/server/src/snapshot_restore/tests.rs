@@ -1799,3 +1799,35 @@ async fn restore_template_lookup_uses_validated_owner(#[case] owner: &str, #[cas
         Some(expected)
     );
 }
+
+#[test]
+fn only_a_data_loss_receive_is_a_corrupt_snapshot_stream() {
+    let receive = |status| {
+        RestoreError::from_btrfs_receive(crate::btrfs_via_nodemgr::BtrfsViaNodemgrError::Rpc {
+            rpc: "BtrfsReceiveInstance",
+            status,
+        })
+    };
+    let corrupt = receive(tonic::Status::data_loss(
+        "stored btrfs send stream is corrupt",
+    ));
+    assert!(matches!(
+        corrupt,
+        RestoreError::SnapshotStreamCorrupt { .. }
+    ));
+    assert_eq!(corrupt.kind_label(), "snapshot_stream_corrupt");
+    assert_eq!(corrupt.redacted_detail(), None);
+    for status in [
+        tonic::Status::internal("btrfs receive exited with exit status: 1"),
+        tonic::Status::failed_precondition("template received_uuid mismatch"),
+        tonic::Status::unavailable("node-manager restarting"),
+    ] {
+        assert!(matches!(receive(status), RestoreError::BtrfsReceive { .. }));
+    }
+    assert!(matches!(
+        RestoreError::from_btrfs_receive(crate::btrfs_via_nodemgr::BtrfsViaNodemgrError::Connect(
+            "refused".into()
+        )),
+        RestoreError::BtrfsReceive { .. }
+    ));
+}

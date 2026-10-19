@@ -274,6 +274,14 @@ pub enum RestoreError {
         #[source]
         source: crate::btrfs_via_nodemgr::BtrfsViaNodemgrError,
     },
+    /// node-manager found that the downloaded rootfs send stream itself cannot
+    /// be received (`DataLoss`): the stored snapshot is corrupt, so every node
+    /// and every retry fails the same way.
+    #[error("snapshot rootfs stream is corrupt: {source}")]
+    SnapshotStreamCorrupt {
+        #[source]
+        source: crate::btrfs_via_nodemgr::BtrfsViaNodemgrError,
+    },
     /// Anything else — transport blips, S3 read failures, filesystem
     /// errors, malformed registered URIs.
     #[error("{0}")]
@@ -281,6 +289,17 @@ pub enum RestoreError {
 }
 
 impl RestoreError {
+    fn from_btrfs_receive(source: crate::btrfs_via_nodemgr::BtrfsViaNodemgrError) -> Self {
+        match &source {
+            crate::btrfs_via_nodemgr::BtrfsViaNodemgrError::Rpc { status, .. }
+                if status.code() == tonic::Code::DataLoss =>
+            {
+                Self::SnapshotStreamCorrupt { source }
+            }
+            _ => Self::BtrfsReceive { source },
+        }
+    }
+
     /// What failed, for a stage-in failure reported as `stage_failed`. Every
     /// variant is listed so a new one is classified rather than defaulted.
     /// The variants a restore reports under a reason of their own map to
@@ -313,7 +332,7 @@ impl RestoreError {
             | Self::QuarantineRecoveryAbandonedAtShutdown { .. } => Kind::QuarantineRecovery,
             Self::QuarantineRecoveryTimedOut { .. } => Kind::QuarantineRecoveryTimeout,
             Self::ParentTemplateLookup { .. } => Kind::ParentTemplate,
-            Self::BtrfsReceive { .. } => Kind::BtrfsReceive,
+            Self::BtrfsReceive { .. } | Self::SnapshotStreamCorrupt { .. } => Kind::BtrfsReceive,
             Self::ClusterApiUnconfigured(_)
             | Self::SnapshotNotRegistered(_)
             | Self::AdmissionRejected(_)
@@ -388,6 +407,7 @@ impl RestoreError {
             // build, as when these two were rendered through `Other`.
             | Self::ParentTemplateLookup { .. }
             | Self::BtrfsReceive { .. }
+            | Self::SnapshotStreamCorrupt { .. }
             | Self::Other(..) => None,
             // The one place a server-supplied failure is worth reporting: the
             // status code is a bounded vocabulary, so it is logged while the
@@ -467,6 +487,7 @@ impl RestoreError {
             Self::CanonicalRootConflict { .. } => "canonical_root_conflict",
             Self::ParentTemplateLookup { .. } => "parent_template_lookup",
             Self::BtrfsReceive { .. } => "btrfs_receive",
+            Self::SnapshotStreamCorrupt { .. } => "snapshot_stream_corrupt",
             Self::Other(..) => "other",
         }
     }
@@ -2643,7 +2664,7 @@ async fn stage_btrfs_send_restore(
                 codec = RestoreCodec::BtrfsSendV1.as_str(),
             ))
             .await
-            .map_err(|source| RestoreError::BtrfsReceive { source })
+            .map_err(RestoreError::from_btrfs_receive)
         }),
     )
     .await?;
