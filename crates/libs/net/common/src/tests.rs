@@ -383,6 +383,8 @@ fn ip_cidr_without_leaves_exactly_the_addresses_outside_the_exclusion() {
                 "2001:db8:0:1:ffff:ffff:ffff:ffff",
                 "2001:db8:ffff::1",
                 "2001:db9::1",
+                "::fffd:0:1",
+                "::fffe:102:304",
             ]
             .map(|ip| ip.parse().unwrap()),
         )
@@ -395,6 +397,7 @@ fn ip_cidr_without_leaves_exactly_the_addresses_outside_the_exclusion() {
         ("192.0.2.0/25", "192.0.2.128/25"),
         ("192.0.2.0/24", "2001:db8::/32"),
         ("2001:db8::/32", "2001:db8:0:1::/64"),
+        ("::/0", "::fffe:0:0/96"),
     ] {
         let network = network.parse::<IpCidr>().unwrap();
         let excluded = excluded.parse::<IpCidr>().unwrap();
@@ -406,6 +409,17 @@ fn ip_cidr_without_leaves_exactly_the_addresses_outside_the_exclusion() {
                 "{network} without {excluded} at {ip}"
             );
         }
+        // The remainder ships in a policy protobuf, which carries CIDRs as text.
+        let mut policy = NetworkPolicyV1::allow_all();
+        policy.egress.deny = remaining
+            .into_iter()
+            .map(EgressDestinationV1::Cidr)
+            .collect();
+        assert_eq!(
+            NetworkPolicyV1::try_from(&proto::NetworkPolicyV1::from(&policy)).unwrap(),
+            policy,
+            "{network} without {excluded} after a protobuf round trip"
+        );
     }
 }
 

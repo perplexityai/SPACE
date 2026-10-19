@@ -1515,7 +1515,10 @@ impl IpCidr {
 
     /// The addresses of this network outside `excluded`, as CIDRs. An
     /// `excluded` that covers this network leaves nothing, and one that does
-    /// not overlap it leaves it whole.
+    /// not overlap it leaves it whole. IPv6 parts inside the IPv4-mapped range
+    /// (`::ffff:0:0/96`) are left out: an IPv6 network matches no address
+    /// there, but their text form parses as an IPv4 network, so they would
+    /// change meaning in a policy protobuf.
     pub fn without(self, excluded: Self) -> Vec<Self> {
         if excluded.prefix_len <= self.prefix_len && excluded.contains(self.network) {
             return Vec::new();
@@ -1535,6 +1538,9 @@ impl IpCidr {
                 current = upper;
             }
         }
+        remaining.retain(|cidr| {
+            !matches!(cidr.network, IpAddr::V6(network) if network.to_ipv4_mapped().is_some())
+        });
         remaining
     }
 
