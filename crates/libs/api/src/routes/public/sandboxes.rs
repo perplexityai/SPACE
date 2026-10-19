@@ -44,9 +44,9 @@ use crate::{
     middleware::auth::{AuthFederatedOwner, AuthOrg, AuthUser},
     models::{Sandbox, SandboxMetadata as ControllerSandboxMetadata, SandboxMetadataValue},
     public_operations::{
-        ApiProduct, CreatePublicOperation, CreatePublicOperationIdempotency,
-        CreatePublicOperationResult, HttpOperationMethod, ObservePublicOperationIdempotency,
-        OperationPathTemplate, PublicOperationStore,
+        ApiProduct, CreateClaimedPublicOperationResult, CreatePublicOperation,
+        CreatePublicOperationIdempotency, CreatePublicOperationResult, HttpOperationMethod,
+        ObservePublicOperationIdempotency, OperationPathTemplate, PublicOperationStore,
     },
     public_sandbox_operations::{
         CreateSandboxOperationPayload, SandboxLifecycleOperationPayload,
@@ -99,7 +99,10 @@ pub async fn create_sandbox(
         context
     });
     let pool_claims =
-        native_create_pool_claim_enabled(&state.feature_flags).then_some(&state.sandbox_controller);
+        native_create_pool_claim_enabled(&state.feature_flags).then(|| NativeCreatePoolClaims {
+            controller: &state.sandbox_controller,
+            inline: inline_create::InlineCreate::from_env(&state.pool, &state.sandbox_controller),
+        });
     let response = create_native_sandbox_operation(
         &state.pool,
         org.id,
@@ -145,6 +148,15 @@ fn native_create_pool_claim_gate(
     )
 }
 
+/// Admission-time warm-pool claiming for native creates.
+#[derive(Clone)]
+pub(crate) struct NativeCreatePoolClaims<'a> {
+    pub(crate) controller: &'a SandboxController,
+    /// Run a create that won a claim in this process instead of leaving it
+    /// queued for the dispatcher. `None` when the inline kill switch is off.
+    pub(crate) inline: Option<inline_create::InlineCreate>,
+}
+
 /// Record a native create.
 ///
 /// `pool_claims` is `None` when admission-time pool claiming is off, which
@@ -155,6 +167,11 @@ fn native_create_pool_claim_gate(
 /// adopt. Anything else (ineligible, a pool or template miss, a claim
 /// error) records the create with a fresh ID and no claim, as the disabled
 /// path does.
+///
+/// With inline execution on, a create that won a claim is also claimed for
+/// execution in that transaction, and runs here (see [`inline_create`])
+/// before the response, up to a short deadline. Every other create is
+/// recorded queued for the dispatcher, as before.
 pub(crate) async fn create_native_sandbox_operation(
     pool: &PgPool,
     org_id: OrgId,
@@ -162,7 +179,7 @@ pub(crate) async fn create_native_sandbox_operation(
     idempotency_key: &IdempotencyKey,
     request: CreateSandboxRequest,
     federated_create: Option<crate::fork_operations::ForkFederatedCreateContext>,
-    pool_claims: Option<&SandboxController>,
+    pool_claims: Option<NativeCreatePoolClaims<'_>>,
 ) -> Result<SandboxOperationResponse, PublicApiError> {
     let (request, mut fingerprint) = prepare_native_create_request(request)?;
     if let Some(profiles) = federated_create
@@ -175,7 +192,10 @@ pub(crate) async fn create_native_sandbox_operation(
             "request": fingerprint, "egress_profiles": profiles,
         }))?;
     }
-    let plan = match pool_claims {
+    let inline = pool_claims
+        .as_ref()
+        .and_then(|claims| claims.inline.clone());
+    let plan = match pool_claims.as_ref().map(|claims| claims.controller) {
         None => NativeCreatePoolPlan::Unclaimed(AdmissionClaimOutcome::Disabled),
         Some(controller) => {
             let controller_request = controller_create_request(request.clone(), None);
@@ -230,6 +250,8 @@ pub(crate) async fn create_native_sandbox_operation(
             }
         };
 
+    // The claim on a create recorded for inline execution.
+    let mut inline_claim = None;
     let (sandbox_id, outcome, result) = match plan {
         NativeCreatePoolPlan::Unclaimed(outcome) => {
             let sandbox_id_string = fresh_sandbox_id.to_string();
@@ -285,13 +307,34 @@ pub(crate) async fn create_native_sandbox_operation(
                         Ok(Some(claim)) => {
                             let sandbox_id = PublicSandboxId::from(claim.sandbox_id);
                             let sandbox_id_string = sandbox_id.to_string();
-                            let result = admission
-                                .create_or_roll_back(create(
-                                    sandbox_id,
-                                    &sandbox_id_string,
-                                    Some(claim),
-                                ))
-                                .await?;
+                            let input = create(sandbox_id, &sandbox_id_string, Some(claim));
+                            let result = if inline.is_some() {
+                                match admission.create_claimed_or_roll_back(input).await? {
+                                    CreateClaimedPublicOperationResult::Claimed {
+                                        claim_token,
+                                        operation,
+                                    } => {
+                                        let operation_id = operation.id;
+                                        inline_claim = Some((claim_token, operation));
+                                        CreatePublicOperationResult::Created(operation_id)
+                                    }
+                                    CreateClaimedPublicOperationResult::Existing(operation_id) => {
+                                        CreatePublicOperationResult::Existing(operation_id)
+                                    }
+                                    CreateClaimedPublicOperationResult::IdempotencyConflict {
+                                        operation_id,
+                                        expected_fingerprint,
+                                    } => CreatePublicOperationResult::IdempotencyConflict {
+                                        operation_id,
+                                        expected_fingerprint,
+                                    },
+                                    CreateClaimedPublicOperationResult::AdmissionDenied => {
+                                        CreatePublicOperationResult::AdmissionDenied
+                                    }
+                                }
+                            } else {
+                                admission.create_or_roll_back(input).await?
+                            };
                             (sandbox_id, AdmissionClaimOutcome::Hit, result)
                         }
                         Ok(None) => {
@@ -357,6 +400,10 @@ pub(crate) async fn create_native_sandbox_operation(
         }
         CreatePublicOperationResult::AdmissionDenied => return Err(PublicApiError::internal()),
     };
+
+    if let Some((inline, (claim_token, operation))) = inline.zip(inline_claim) {
+        inline.run(store, claim_token, operation).await;
+    }
 
     Ok(response)
 }
@@ -1386,5 +1433,6 @@ fn parse_sandbox_cursor(value: &str) -> Result<(OffsetDateTime, SandboxId), Publ
 
 #[cfg(all(test, feature = "kubernetes"))]
 pub(crate) mod admission_test_fixture;
+mod inline_create;
 #[cfg(test)]
 mod tests;

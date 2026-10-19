@@ -104,7 +104,7 @@ fn admin_openapi_value() -> Value {
                     ],
                     "requestBody": {
                         "required": false,
-                        "description": "Optional drain options. An omitted body means a gentle drain that auto-replaces the instance on termination.",
+                        "description": "Optional drain options. An omitted body means a gentle drain that auto-replaces the instance on termination. Also accepted against a node already draining: gentle -> forced escalates the drain in place and preserves drain_started_at; the same mode leaves the mode alone but still clears drain_last_error; forced -> gentle is refused. A drain's replace_after_terminate is fixed when it starts: on an already-draining node, omit the field to escalate on the existing terms; one that disagrees with the drain in flight is a 409.",
                         "content": {
                             "application/json": {
                                 "schema": {
@@ -115,12 +115,16 @@ fn admin_openapi_value() -> Value {
                                             "type": "string",
                                             "enum": ["gentle", "forced"],
                                             "default": "gentle",
-                                            "description": "gentle: cordon the node and wait for resident sandboxes to leave on their own (auto-suspend on inactivity, user suspend, delete); user calls against them keep working. forced: evacuate every resident started/paused sandbox immediately and reject user calls against them with 409 for the whole drain window."
+                                            "description": "gentle: cordon the node and wait for resident sandboxes to leave on their own (auto-suspend on inactivity, user suspend, delete); user calls against them keep working. forced: evacuate every resident started/paused sandbox immediately and reject user calls against them with 409 for the whole drain window. forced also enables the stale-transient sweep, which flips any resident wedged in a non-evacuable transient lifecycle past the cluster's abandon age to failed, unrecoverably. That age is measured from the sandbox's own last lifecycle change, not from the drain, so a resident already wedged longer than it is flipped on the first tick after the write — escalating a long-parked gentle drain has no grace period. Read both node_drain.sandboxes_remaining and node_drain.drain_blockers first: neither is a superset of what the sweep destroys (they differ in both the lifecycles and the node-pinning column they count), so two zeros is the only reassuring answer."
                                         },
                                         "replace_after_terminate": {
                                             "type": "boolean",
-                                            "default": true,
-                                            "description": "false makes the eventual ASG terminate decrement desired capacity, for a blue/green rollout where the incumbent group must shrink monotonically."
+                                            "description": "false makes the eventual ASG terminate decrement desired capacity, for a blue/green rollout where the incumbent group must shrink monotonically. Omit the field rather than sending null. On the request that starts a drain, omitting it means true (the ASG auto-replaces the instance). On a node already draining the replacement intent is fixed and cannot be changed: omitting the field escalates on the existing terms, and sending one that disagrees with the drain in flight is a 409 — use :undrain and a fresh :drain to change the terms."
+                                        },
+                                        "require_undrained": {
+                                            "type": "boolean",
+                                            "default": false,
+                                            "description": "true makes the request start-only: it is a 409 if the node already has any drain phase, checked under the same row lock as the write, so it can never escalate or repeat a drain somebody else started. For automation that starts drains; leave it false to escalate a drain in place."
                                         }
                                     }
                                 }
@@ -128,8 +132,8 @@ fn admin_openapi_value() -> Value {
                         }
                     },
                     "responses": {
-                        "200": { "description": "Drain accepted" },
-                        "409": { "description": "Node transition conflict" },
+                        "200": { "description": "Drain accepted, escalated in place, or already in the requested mode" },
+                        "409": { "description": "Node transition conflict: the node's drain_phase does not accept :drain, the request asked to downgrade an in-flight forced drain to gentle, it carried a replace_after_terminate disagreeing with the drain already in flight, or it set require_undrained and the node already has a drain phase" },
                         "501": { "description": "Not available on the active substrate" }
                     }
                 }

@@ -101,6 +101,13 @@ curl -fsS http://127.0.0.1:13101/loki/api/v1/labels
   `space-runtime-supervisor.service`, which node-manager's init container
   installs; the per-sandbox sidecars it launches inherit its output. Journal
   collection allows `space-*.service`, and `containerd.service`. The synthetic journal identifier is test-only.
+  The sidecars (net-gateway, spaced-host) have no unit: they run in their
+  sandbox's `/space/sbx-*` cgroup, by which `collection.journal.sidecars`
+  keeps them. Every `local.sh up` lists the nodes labelled
+  `space.pplx.net/node-pool=builder` in `sidecars.excludedHosts`, replacing
+  any saved list, so builder sandboxes' sidecars stay uncollected, as their
+  build-manager is. A release installed before the Kind overlay enabled
+  `sidecars` keeps its saved overlay; pass `profiles/kind.yaml` as above.
   Guest journals and the devbox's journal are not mounted or forwarded here.
 - The collector removes the CRI envelope, then extracts fields for labels and
   the event timestamp. It does **not** rewrite the original message JSON.

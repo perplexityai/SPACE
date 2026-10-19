@@ -56,11 +56,14 @@ struct Cli {
     /// identities the socket group requires.
     #[arg(long, requires = "tcp_listen")]
     no_uds: bool,
-    /// Instance-local health Unix socket. When supplied, it is bound from
-    /// process startup so external readiness checks can pass while this
-    /// instance is still passive waiting on the service mutex. Must be on a
-    /// per-process mount so a coexisting successor does not unlink the
-    /// predecessor's socket file when binding.
+    /// Instance-local health Unix socket. When supplied, the `liveness`
+    /// service answers on it from the moment it is bound, and readiness
+    /// passes while this instance is passive waiting on the service mutex.
+    /// An authority binds it once initialized. The node agent binds it
+    /// before it waits for its upstream authority and withholds readiness
+    /// until the authority answers. Must be on a per-process mount so a
+    /// coexisting successor does not unlink the predecessor's socket file
+    /// when binding.
     #[arg(long)]
     health_socket: Option<PathBuf>,
     /// Maximum time the passive instance waits for the predecessor to

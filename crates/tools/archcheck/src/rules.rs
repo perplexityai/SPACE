@@ -1,9 +1,11 @@
 //! The rule interface and the registry every check runs from.
 
+mod crate_names;
 mod file_size;
 mod pattern_ratchet;
 mod ratchet;
 
+pub(crate) use crate_names::CrateNames;
 pub(crate) use file_size::FileSize;
 pub(crate) use pattern_ratchet::PatternRatchet;
 pub(crate) use ratchet::CountRule;
@@ -45,6 +47,14 @@ pub trait Rule {
         None
     }
 
+    /// Lines like [`Rule::skipped`]'s for inputs other than the base
+    /// branch's baseline, such as `--base-architecture`, which
+    /// [`crate::skipped`] reports however that baseline reads. `skipped`
+    /// does not repeat them.
+    fn other_skips(&self, _ctx: &Context) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Fills this rule's tables for `--write-baseline` from the entries in
     /// `ctx.baseline`, and returns each violation it did not add. It never
     /// adds an entry, and a table of a rule with instances that `ctx.baseline`
@@ -60,9 +70,10 @@ pub trait Rule {
 pub struct NotAdded {
     /// The table it is missing from, as `--write-baseline=<table>` names it.
     pub table: String,
-    /// The entry it would need: its file's path and current count.
-    pub path: String,
-    pub count: usize,
+    /// The entry it would need, its file's path and current count, to add by
+    /// hand; `None` where the table takes no hand-added entry, as for
+    /// `crate_names`, whose `no_new` would fail one.
+    pub entry: Option<(String, usize)>,
     /// `not added: …`, with what to do instead.
     pub line: String,
 }
@@ -77,5 +88,9 @@ pub fn tables(config: &RulesConfig) -> Vec<String> {
 
 /// Every rule, in reporting order. Register a new rule here.
 pub fn registered() -> Vec<Box<dyn Rule>> {
-    vec![Box::new(FileSize), Box::new(PatternRatchet)]
+    vec![
+        Box::new(FileSize),
+        Box::new(PatternRatchet),
+        Box::new(CrateNames),
+    ]
 }

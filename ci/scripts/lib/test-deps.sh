@@ -17,9 +17,34 @@ space_test_dependency_redis_image() {
     printf '%s\n' "${TESTCONTAINERS_REDIS_IMAGE:-public.ecr.aws/docker/library/redis:5.0}"
 }
 
+# Run a command, ending it after the given number of seconds, so a registry
+# transfer that stalls fails over instead of holding the job until its own
+# deadline. In the foreground, so Ctrl-C at a terminal still reaches the
+# command; the commands bounded here are single processes, which is all
+# --foreground bounds. A plain `timeout` without GNU options bounds it from
+# its own process group, and without `timeout` (stock macOS) it is unbounded.
+space_with_deadline() {
+    local seconds="$1"
+    shift
+    if timeout --foreground --kill-after=10 1 true >/dev/null 2>&1; then
+        timeout --foreground --kill-after=10 "${seconds}" "$@"
+    elif command -v timeout >/dev/null 2>&1; then
+        timeout "${seconds}" "$@"
+    else
+        "$@"
+    fi
+}
+
+# Whether an exit status from space_with_deadline means the deadline ended the
+# command: 124 after SIGTERM, 137 when it had to be killed.
+space_deadline_expired() {
+    [ "$1" -eq 124 ] || [ "$1" -eq 137 ]
+}
+
 # Registry throttling is transient and a failed pull may still cache completed
 # layers. Retry the explicit pull before starting a container so callers never
-# trigger a second, implicit registry request through `docker run`.
+# trigger a second, implicit registry request through `docker run`. Each
+# attempt is bounded by SPACE_DOCKER_PULL_TIMEOUT_SECONDS (default 300).
 space_pull_docker_image() {
     local image="$1"
     local max_attempts="${SPACE_DOCKER_PULL_ATTEMPTS:-5}"
@@ -30,7 +55,7 @@ space_pull_docker_image() {
         return 0
     fi
 
-    while ! docker pull "${image}"; do
+    while ! space_with_deadline "${SPACE_DOCKER_PULL_TIMEOUT_SECONDS:-300}" docker pull "${image}"; do
         if [ "${attempt}" -ge "${max_attempts}" ]; then
             echo "Failed to pull ${image} after ${attempt} attempts." >&2
             return 1

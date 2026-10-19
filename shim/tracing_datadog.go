@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"strings"
 
@@ -30,22 +31,51 @@ func newDatadogTracePipeline() tracePipeline {
 	if host := os.Getenv("DD_AGENT_HOST"); host != "" {
 		opts = append(opts, tracer.WithAgentAddr(host+":8126"))
 	}
+	opts = append(opts, originSamplingRules()...)
 	tracer.Start(opts...)
 	return datadogTracePipeline{}
+}
+
+// originSamplingRules keeps or drops a root that links to an origin as the
+// origin was sampled, as the Rust services' rules do: two rules on
+// origin_sampled, which only such roots carry, ahead of the rules
+// DD_TRACE_SAMPLING_RULES configures. The tracer lets those environment rules
+// replace any given in code, so they are read here, appended, and taken out
+// of the environment it reads. Rules it cannot parse are left for the tracer
+// to refuse, as it did before.
+func originSamplingRules() []tracer.StartOption {
+	configured := []tracer.SamplingRule{}
+	raw := os.Getenv("DD_TRACE_SAMPLING_RULES")
+	if strings.TrimSpace(raw) == "" {
+		if path := os.Getenv("DD_TRACE_SAMPLING_RULES_FILE"); path != "" {
+			contents, err := os.ReadFile(path)
+			if err != nil {
+				logShim("trace sampling rules file unreadable: %v", err)
+				return nil
+			}
+			raw = string(contents)
+		}
+	}
+	if strings.TrimSpace(raw) != "" {
+		if err := json.Unmarshal([]byte(raw), &configured); err != nil {
+			logShim("trace sampling rules invalid; origin rules not added: %v", err)
+			return nil
+		}
+	}
+	rules := tracer.TraceSamplingRules(
+		tracer.Rule{Tags: map[string]string{originSampledAttribute: "true"}, Rate: 1},
+		tracer.Rule{Tags: map[string]string{originSampledAttribute: "false"}, Rate: 0},
+	)
+	rules = append(rules, configured...)
+	_ = os.Unsetenv("DD_TRACE_SAMPLING_RULES")
+	_ = os.Unsetenv("DD_TRACE_SAMPLING_RULES_FILE")
+	return []tracer.StartOption{tracer.WithSamplingRules(rules)}
 }
 
 func (datadogTracePipeline) start(ctx context.Context, name string, attrs ...attribute.KeyValue) (shimSpan, context.Context) {
 	opts := make([]tracer.StartSpanOption, 0, len(attrs))
 	for _, attr := range attrs {
 		opts = append(opts, tracer.Tag(string(attr.Key), attr.Value.AsInterface()))
-	}
-	if parent, ok := ctx.Value(datadogParentKey{}).(*tracer.SpanContext); ok {
-		opts = append(opts, tracer.ChildOf(parent))
-		span := tracer.StartSpan(name, opts...)
-		// Consume the remote parent once. Descendants must use this local span,
-		// otherwise every nested operation becomes a sibling of shim.create.
-		ctx = context.WithValue(ctx, datadogParentKey{}, false)
-		return datadogSpan{span}, tracer.ContextWithSpan(ctx, span)
 	}
 	span, ctx := tracer.StartSpanFromContext(ctx, name, opts...)
 	return datadogSpan{span}, ctx
@@ -75,18 +105,6 @@ func (s datadogSpan) SetAttributes(attrs ...attribute.KeyValue) {
 }
 func (s datadogSpan) End(err error) { s.span.Finish(tracer.WithError(err)) }
 
-// A remote parent is represented with ChildOf at start time, not a fabricated
-// live Datadog span. This preserves all 128 trace-ID bits from W3C extraction.
-type datadogParentKey struct{}
-
-func (datadogTracePipeline) extract(ctx context.Context, carrier propagation.MapCarrier) context.Context {
-	ctx = propagation.Baggage{}.Extract(ctx, carrier)
-	parent, err := tracer.Extract(tracer.TextMapCarrier(carrier))
-	if err != nil || parent == nil {
-		return ctx
-	}
-	return context.WithValue(ctx, datadogParentKey{}, parent)
-}
 func (datadogTracePipeline) inject(ctx context.Context, carrier propagation.MapCarrier) {
 	propagation.Baggage{}.Inject(ctx, carrier)
 	if span, ok := tracer.SpanFromContext(ctx); ok {

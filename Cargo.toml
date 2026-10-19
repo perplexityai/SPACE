@@ -162,6 +162,7 @@ bytes = "1"
 bytesize = "2.3.1"
 clap = "4"
 comfy-table = "8"
+crc = "3"
 datadog-opentelemetry = "0.5"
 dashmap = "6"
 deadpool-redis = { version = "0.23", default-features = false, features = ["rt_tokio_1", "script", "tokio-comp", "tokio-rustls-comp", "tls-rustls-webpki-roots"] }

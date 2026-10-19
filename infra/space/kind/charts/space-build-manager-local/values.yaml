@@ -21,6 +21,22 @@ listen: 0.0.0.0:9900
 probeAddr: 127.0.0.1:9900
 # The node-local Service, named as build-manager's TLS leaf.
 serviceName: space-builder-build-manager
+# The ServiceAccounts build-manager admits, rendered as the env vars of the
+# same names (BuildTokenReviewer::from_env,
+# crates/libs/common/svc/src/auth/build/k8s.rs). Only the builder
+# node-api dials it (build_mgr_lazy,
+# crates/libs/node/api/server/src/clients.rs), and it
+# forwards tenant builds (with an org) and system builds alike, so it needs
+# both authorities StartBuild checks (authorize_template_build,
+# crates/libs/build/mgr/server/src/lib.rs).
+auth:
+  SPACE_BUILD_MANAGER_AUTH_ALLOWED_SERVICE_ACCOUNTS:
+    - space-builder-node-api
+  SPACE_BUILD_AUTH_SYSTEM_SERVICE_ACCOUNTS:
+    - space-builder-node-api
+  SPACE_BUILD_AUTH_TENANT_SERVICE_ACCOUNTS:
+    - space-builder-node-api
+
 # Kind sizing: one build at a time fits the 40 GiB local btrfs cache with the
 # 20 GiB default build disk.
 maxConcurrentBuilds: 1

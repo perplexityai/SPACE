@@ -20,8 +20,8 @@ import space_smoke as smoke
 def pending_backup_census_reports_blocked_upload(test: smoke.KindEcw) -> None:
     """With object storage unreachable, a suspend operation leaves a snapshot in
     `creating`, the node's next Full census reports the pinned artifact as
-    pending, and space-internal-api mirrors it into the cluster queue with an
-    applied non-empty publication; once storage returns, the snapshot becomes
+    pending, and space-internal-api mirrors it into the cluster queue; once
+    storage returns, the snapshot becomes
     `ready` with a storage location, the queue row disappears, and the suspend
     operation ends `succeeded`."""
 

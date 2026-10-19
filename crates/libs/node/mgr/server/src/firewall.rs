@@ -6,9 +6,10 @@
 //! Host-level rules live in the "space" table; per-namespace rules live in
 //! a "sandbox" table created inside each network namespace.
 
+use crate::host_command::Command;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
-use std::process::{Command, Output};
+use std::process::Output;
 mod host_cache;
 
 use crate::net::{SANDBOX_SUBNET, SANDBOX_SUBNET_PREFIX_LEN};

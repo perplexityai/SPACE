@@ -295,6 +295,49 @@ async fn a_stalled_tcp_attempt_is_abandoned_at_its_cap_and_redialed() {
     assert_eq!(started.elapsed(), cap + policy.initial_delay);
 }
 
+// The observer hears about every failed attempt that is redialed, with its
+// count and cause, and not about the last one, whose error the call returns.
+#[tokio::test(start_paused = true)]
+async fn the_retry_observer_sees_each_redialed_attempt() {
+    let cap = Duration::from_secs(1);
+    let policy = stalled_tcp_policy(Duration::from_secs(10));
+    let attempts = std::cell::Cell::new(0);
+    let mut observed = Vec::new();
+    let result = super::retry_tcp_connect_observed(
+        "refused",
+        "refused:1",
+        policy,
+        cap,
+        || {
+            let attempt = attempts.get() + 1;
+            attempts.set(attempt);
+            async move {
+                Err::<(), _>(super::TcpConnectError::AttemptTimeout {
+                    service_name: "refused",
+                    target: format!("attempt {attempt}"),
+                    cap,
+                })
+            }
+        },
+        |retry| observed.push((retry.attempts, retry.error.to_string())),
+    )
+    .await;
+    assert!(result.is_err());
+    let made = attempts.get();
+    assert!(made > 1, "the budget allowed redials");
+    let expected: Vec<_> = (1..made)
+        .map(|attempt| {
+            let error = super::TcpConnectError::AttemptTimeout {
+                service_name: "refused",
+                target: format!("attempt {attempt}"),
+                cap,
+            };
+            (attempt, error.to_string())
+        })
+        .collect();
+    assert_eq!(observed, expected);
+}
+
 // Attempts that never finish still end the call within the budget plus the one
 // attempt the budget let start before it ran out.
 #[tokio::test(start_paused = true)]

@@ -123,19 +123,49 @@
 "crates/libs/cluster/controller/server/src/node_drain/store.rs" = 1
 "crates/libs/cluster/controller/server/src/tombstone_retention.rs" = 2
 "crates/libs/cluster/trigger-queue/src/lib.rs" = 1
-"crates/libs/internal/api/server/src/data_plane_sessions.rs" = 7
+"crates/libs/internal/api/server/src/data_plane_sessions/route_rows.rs" = 7
 "crates/libs/internal/api/server/src/lib.rs" = 1
 "crates/libs/internal/api/server/src/published_state.rs" = 4
 "crates/libs/sandbox/store/src/lib.rs" = 2
+
+[pattern_ratchet.kubernetes_access]
+# Spawns the Kubernetes-only reconcilers from the bound `KubernetesSubstrate`.
+"crates/libs/cluster/controller/server/src/reconcilers.rs" = 1
 [pattern_ratchet.rootfs_copy]
 # Local nspawn and privileged builder copies are deferred; builders stay CoW.
 "crates/apps/local/node-mgr/svc/src/snapshot.rs" = 2
 "crates/libs/build/mgr/src/lib.rs" = 1
 # Network configuration and process-snapshot payloads are not rootfs images.
-"crates/libs/node/mgr/server/src/service/launch_prepare.rs" = 1
 "crates/libs/sbx/mgr/server/src/service/grpc_spaced_process_snapshots.rs" = 1
 # Non-Linux fallbacks; Linux paths use common-io's reflink helper.
 "crates/libs/node/runtime/core/src/lib.rs" = 2
 "crates/libs/template/mgr/src/service.rs" = 3
 "crates/libs/vol/mgr/server/src/staging.rs" = 2
 
+[pattern_ratchet.node_manager_commands]
+# The namespace runner's std::Command parameter is the bounded fork exception.
+"crates/libs/node/mgr/server/src/host_command.rs" = 1
+"crates/libs/node/mgr/server/src/host_command/spawn.rs" = 2
+"crates/libs/node/mgr/server/src/service/artifact_fs/receive.rs" = 4
+"crates/libs/node/mgr/server/src/net/fallback.rs" = 1
+
+# [crate_names] maps each workspace package with a catch-all name (a part such
+# as `common`, `utils` or `core`) to its member path. Only remove entries: a pull
+# request that adds one is reported, and fails the check.
+[crate_names]
+pplx-space-common-cli = "crates/libs/common/cli"
+pplx-space-common-connection-admission = "crates/libs/common/connection/admission"
+pplx-space-common-core = "crates/libs/common/core"
+pplx-space-common-grpc = "crates/libs/common/grpc"
+pplx-space-common-grpc-lb = "crates/libs/common/grpc-lb"
+pplx-space-common-io = "crates/libs/common/io"
+pplx-space-common-jobs = "crates/libs/common/jobs"
+pplx-space-common-lru-reaper = "crates/libs/common/lru-reaper"
+pplx-space-common-proto-build = "crates/libs/common/proto-build"
+pplx-space-common-svc = "crates/libs/common/svc"
+pplx-space-common-work-coalescer = "crates/libs/common/work-coalescer"
+pplx-space-credential-injection-core = "crates/libs/credential/injection/core"
+pplx-space-execution-common = "crates/libs/execution/common"
+pplx-space-net-common = "crates/libs/net/common"
+pplx-space-node-runtime-core = "crates/libs/node/runtime/core"
+pplx-space-spaced-common = "crates/libs/spaced/common"

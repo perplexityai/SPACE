@@ -19,8 +19,9 @@ def node_ctl_fence_refuses_and_reconciles(test: smoke.KindEcw) -> None:
     resources, forged conditions, a template-write pull request, and anything
     on another node) is refused by the fence policy and by the named rule,
     leaves no residue, and the boundary label is otherwise writable; every
-    write shape node-ctl has (SSD placement apply, template-presence apply and
-    prune, template-write clear, capacity apply) is admitted; and the running
+    write shape node-ctl has (SSD placement apply, host-CPU label apply,
+    template-presence apply and prune, template-write clear, capacity apply)
+    is admitted; and the running
     node-ctl writes back a stripped owned label and the stripped slot capacity
     through its own credential."""
 

@@ -13,7 +13,9 @@ if [[ ! -f "$KERNEL_IMAGE" ]]; then
   exit 1
 fi
 
-docker build --target smoke --tag "$SMOKE_IMAGE" "$SCRIPT_DIR"
+# KERNEL_DOCKER_BUILD_OPTIONS adds docker build options, as for build.sh.
+# shellcheck disable=SC2086 # one option per word
+docker build --target smoke --tag "$SMOKE_IMAGE" ${KERNEL_DOCKER_BUILD_OPTIONS:-} "$SCRIPT_DIR"
 
 boot_log="$(mktemp)"
 container_id=""

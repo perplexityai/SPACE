@@ -1,18 +1,19 @@
 //! `architecture-baseline.toml`: existing violations a rule tolerates for now.
 //!
-//! Each rule that needs a baseline owns a table: `[file_size]`, and one
-//! `[pattern_ratchet.<instance>]` per configured instance. `cargo arch
-//! --write-baseline` updates and removes the entries of every table, or of one
-//! with `--write-baseline=<table>`, but never adds an entry or creates a
-//! `pattern_ratchet` table: those are hand edits, which the base branch
-//! comparison then reports. (`[file_size]` is always written, empty if the
-//! file had none.) A missing table means the rule tolerates nothing, which can
-//! only make checks stricter. The base branch's copy, which a pull request's baseline is
+//! Each rule that needs a baseline owns a table: `[file_size]`, one
+//! `[pattern_ratchet.<instance>]` per configured instance, and
+//! `[crate_names]`. `cargo arch --write-baseline` updates and removes the
+//! entries of every table, or of one with `--write-baseline=<table>`, but
+//! never adds an entry or creates a `pattern_ratchet` table: those are hand
+//! edits, which the base branch comparison then reports. (`[file_size]` and
+//! `[crate_names]` are always written, empty if the file had none.) A missing
+//! table means the rule tolerates nothing, which can only make checks
+//! stricter. The base branch's copy, which a pull request's baseline is
 //! compared with, is read leniently and table by table, so that a change to
 //! the schema or a renamed instance does not break the comparison.
 
 use std::{
-    collections::{BTreeMap, btree_map},
+    collections::{BTreeMap, BTreeSet, btree_map},
     io,
     path::Path,
     path::PathBuf,
@@ -27,7 +28,7 @@ use toml::{
 
 use crate::{
     context::{LoadError, parse_toml_with_text, read},
-    rules::{self, CountRule, FileSize, PatternRatchet},
+    rules::{self, CountRule, CrateNames, FileSize, PatternRatchet},
 };
 
 #[cfg(test)]
@@ -47,22 +48,46 @@ const HEADER: &str = "\
 # that adds an entry or raises a cap is reported.
 ";
 
-/// Every table, by the name `--write-baseline=<table>` takes: `<rule>`, or
-/// `<rule>.<instance>` for a rule with instances. The default is the
-/// baseline of an empty file: a `[file_size]` table without entries.
+/// Written above `[crate_names]`, which follows the other tables.
+const CRATE_NAMES_COMMENT: &str = "\
+# [crate_names] maps each workspace package with a catch-all name (a part such
+# as `common`, `utils` or `core`) to its member path. Only remove entries: a pull
+# request that adds one is reported, and fails the check.
+";
+
+/// Every table of caps, by the name `--write-baseline=<table>` takes:
+/// `<rule>`, or `<rule>.<instance>` for a rule with instances; and
+/// `[crate_names]`, which maps names to paths. The default is the baseline
+/// of an empty file: a `[file_size]` and a `[crate_names]` table without
+/// entries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Baseline {
     tables: BTreeMap<String, Table>,
+    /// Package name to its member path, as `cargo metadata` reports it.
+    /// Written by [`Baseline::write`] after the other tables.
+    pub crate_names: BTreeMap<String, String>,
+    /// The 1-based line of each `[crate_names]` key in the file the baseline
+    /// was loaded from.
+    pub crate_names_lines: BTreeMap<String, usize>,
 }
 
 /// One table: repository-relative path to the file's cap, its count when it
 /// was listed.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct Table {
-    caps: BTreeMap<String, usize>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Table<V = usize> {
+    caps: BTreeMap<String, V>,
     /// The 1-based line of each key in the file the baseline was loaded
     /// from, where a finding about the entry itself points.
     lines: BTreeMap<String, usize>,
+}
+
+impl<V> Default for Table<V> {
+    fn default() -> Self {
+        Self {
+            caps: BTreeMap::new(),
+            lines: BTreeMap::new(),
+        }
+    }
 }
 
 /// The baseline as written, with the position of each key.
@@ -73,6 +98,8 @@ struct BaselineFile {
     file_size: BTreeMap<Spanned<String>, usize>,
     #[serde(default)]
     pattern_ratchet: BTreeMap<String, BTreeMap<Spanned<String>, usize>>,
+    #[serde(default)]
+    crate_names: BTreeMap<Spanned<String>, String>,
 }
 
 /// The base branch's copy, for `[file_size]`: other tables and keys ignored.
@@ -101,8 +128,12 @@ pub struct BaseTables {
     /// not.
     tables: BTreeMap<String, BaseTable>,
     /// Each rule whose tables were read: `Ok`, or, for a rule with instances
-    /// whose key is not a table of tables, why none of them can be read.
+    /// whose key is not a table of tables, or for `[crate_names]`, why none
+    /// of them can be read.
     rules: BTreeMap<&'static str, Result<(), Box<UnusableBase>>>,
+    /// The package names `[crate_names]` lists; `None` when the copy has no
+    /// such table, as before the rule existed.
+    crate_names: Option<BTreeSet<String>>,
 }
 
 /// One table of the base branch's copy, or why it can't be compared.
@@ -190,6 +221,17 @@ impl BaseBaseline {
             .flat_map(|tables| tables.tables.keys().map(String::as_str))
     }
 
+    /// The package names the base branch's `[crate_names]` lists, or `None`
+    /// if it has no such table.
+    pub fn crate_names(&self) -> Result<Option<&BTreeSet<String>>, BaseSkip<'_>> {
+        let tables = self.tables()?;
+        match tables.rules.get(CrateNames::NAME) {
+            None => Err(BaseSkip::NotRead),
+            Some(Err(unusable)) => Err(BaseSkip::Unusable(unusable)),
+            Some(Ok(())) => Ok(tables.crate_names.as_ref()),
+        }
+    }
+
     fn tables(&self) -> Result<&BaseTables, BaseSkip<'_>> {
         match self {
             Self::NotGiven => Err(BaseSkip::NotGiven),
@@ -239,7 +281,12 @@ impl Baseline {
                 with_lines(text, table),
             );
         }
-        Self { tables }
+        let crate_names = with_lines(text, file.crate_names);
+        Self {
+            tables,
+            crate_names: crate_names.caps,
+            crate_names_lines: crate_names.lines,
+        }
     }
 
     /// The base branch's copy at `path`. Only an unreadable file is an
@@ -267,18 +314,32 @@ impl Baseline {
             .map_err(unusable);
         tables.insert(FileSize::NAME.to_owned(), file_size);
         read.insert(FileSize::NAME, Ok(()));
-        let instances = match document
-            .into_iter()
-            .find(|(key, _)| key.get_ref() == PatternRatchet::NAME)
-        {
-            None => Ok(()),
-            Some((_, value)) => base_instances(value, &unusable).map(|instances| {
-                tables.extend(instances.into_iter().map(|(instance, table)| {
-                    (format!("{}.{instance}", PatternRatchet::NAME), table)
-                }));
-            }),
-        };
+        let mut instances = Ok(());
+        let mut crate_names = Ok(None);
+        for (key, value) in document {
+            match key.get_ref().as_ref() {
+                PatternRatchet::NAME => {
+                    instances = base_instances(value, &unusable).map(|instances| {
+                        tables.extend(instances.into_iter().map(|(instance, table)| {
+                            (format!("{}.{instance}", PatternRatchet::NAME), table)
+                        }));
+                    });
+                }
+                CrateNames::NAME => crate_names = base_crate_names(value).map(Some),
+                _ => {}
+            }
+        }
         read.insert(PatternRatchet::NAME, instances);
+        let crate_names = match crate_names {
+            Ok(names) => {
+                read.insert(CrateNames::NAME, Ok(()));
+                names
+            }
+            Err(error) => {
+                read.insert(CrateNames::NAME, Err(unusable(error)));
+                None
+            }
+        };
         if let Some(rule) = rules::registered()
             .iter()
             .filter_map(|rule| rule.baseline_rule())
@@ -292,19 +353,33 @@ impl Baseline {
         Ok(BaseBaseline::Loaded(BaseTables {
             tables,
             rules: read,
+            crate_names,
         }))
     }
 
     /// Every table, by the name `--write-baseline=<table>` takes, in the
     /// order they are written: `file_size`, then `pattern_ratchet.<instance>`
-    /// for each instance.
+    /// for each instance, then `crate_names`.
     pub fn table_names(&self) -> Vec<String> {
-        self.tables.keys().cloned().collect()
+        let tables = self.tables.keys().cloned();
+        tables
+            .chain(std::iter::once(CrateNames::NAME.to_owned()))
+            .collect()
     }
 
-    /// The table `name` names, if this baseline has it.
+    /// The table of caps `name` names, if this baseline has it. `crate_names`,
+    /// which maps names to paths, is not one.
     pub fn table(&self, name: &str) -> Option<&BTreeMap<String, usize>> {
         self.tables.get(name).map(|table| &table.caps)
+    }
+
+    /// The number of entries in the table `name` names, if this baseline has
+    /// it.
+    pub fn table_len(&self, name: &str) -> Option<usize> {
+        if name == CrateNames::NAME {
+            return Some(self.crate_names.len());
+        }
+        self.table(name).map(BTreeMap::len)
     }
 
     /// The 1-based line of `path`'s entry in table `name` of the file this
@@ -323,6 +398,10 @@ impl Baseline {
     /// table as it is, and says whether it did: if `fresh` lacks the table,
     /// nothing changes.
     pub fn replace_table(&mut self, fresh: &Self, name: &str) -> bool {
+        if name == CrateNames::NAME {
+            self.crate_names = fresh.crate_names.clone();
+            return true;
+        }
         let Some(caps) = fresh.table(name) else {
             return false;
         };
@@ -331,11 +410,16 @@ impl Baseline {
     }
 
     /// Writes the header and every table in generated form: sorted keys, one
-    /// table after another. A baseline loaded from a generated file and
-    /// written back is byte-identical; hand-added comments, quoting or order
-    /// are not kept.
+    /// table after another, `[crate_names]` last after its comment. A
+    /// baseline loaded from a generated file and written back is
+    /// byte-identical; hand-added comments, quoting or order are not kept.
     pub fn write(&self, path: &Path) -> Result<(), WriteBaselineError> {
-        let text = format!("{HEADER}\n{}", toml::to_string(self)?);
+        let crate_names =
+            toml::to_string(&BTreeMap::from([(CrateNames::NAME, &self.crate_names)]))?;
+        let text = format!(
+            "{HEADER}\n{}\n{CRATE_NAMES_COMMENT}{crate_names}",
+            toml::to_string(self)?
+        );
         std::fs::write(path, text).map_err(|source| WriteBaselineError::Write {
             path: path.to_path_buf(),
             source,
@@ -368,13 +452,20 @@ fn base_instances(
         .collect())
 }
 
+/// The package names the base copy's `[crate_names]` lists; its values are
+/// ignored.
+fn base_crate_names(value: Spanned<DeValue<'_>>) -> Result<BTreeSet<String>, toml::de::Error> {
+    BTreeMap::<String, IgnoredAny>::deserialize(ValueDeserializer::from(value))
+        .map(|names| names.into_keys().collect())
+}
+
 /// The rule a table name belongs to: `<rule>` of `<rule>.<instance>`.
 pub(crate) fn rule_of(table: &str) -> &str {
     table.split_once('.').map_or(table, |(rule, _)| rule)
 }
 
-/// A table's caps, and the 1-based line of each key in `text`.
-fn with_lines(text: &str, entries: BTreeMap<Spanned<String>, usize>) -> Table {
+/// A table's values, and the 1-based line of each key in `text`.
+fn with_lines<V>(text: &str, entries: BTreeMap<Spanned<String>, V>) -> Table<V> {
     let mut table = Table::default();
     for (key, cap) in entries {
         let line = line_of(text, key.span().start);
@@ -388,7 +479,8 @@ fn with_lines(text: &str, entries: BTreeMap<Spanned<String>, usize>) -> Table {
 /// The tables as the file has them: `[<rule>]`, then each
 /// `[<rule>.<instance>]` under the rule's key, which is left out if the rule
 /// has no tables. A rule can't have both: TOML could not tell its entries
-/// from its instances.
+/// from its instances. `[crate_names]` is not among them: [`Baseline::write`]
+/// writes it last, after its comment.
 impl Serialize for Baseline {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         #[derive(Serialize)]
@@ -430,6 +522,6 @@ fn both_forms<E: ser::Error>(rule: &str) -> E {
 }
 
 /// The 1-based line of byte `offset` in `text`.
-fn line_of(text: &str, offset: usize) -> usize {
+pub(crate) fn line_of(text: &str, offset: usize) -> usize {
     text.get(..offset).unwrap_or_default().matches('\n').count() + 1
 }

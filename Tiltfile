@@ -55,6 +55,12 @@ local(["bash", "infra/space/kind/scripts/check-object-store-transition.sh", KIND
 # "Upgrading from the node-stack layout" in infra/space/kind/README.md.
 local(["bash", "infra/space/kind/scripts/check-node-layout.sh", KIND_CLUSTER], quiet = True)
 
+# A cluster whose Postgres data directory an earlier space-postgres chart
+# initialized (PostgreSQL 16) cannot run this chart's PostgreSQL 17; refuse it
+# with the database reset rather than crash-loop the pod. See "Recovering from
+# an unbundled migration version" in infra/space/kind/README.md.
+local(["bash", "infra/space/kind/scripts/check-postgres-data.sh", KIND_CLUSTER], quiet = True)
+
 # Select one metrics sink per process. The datadog and otel modes also select
 # the matching trace exporter; off disables both.
 # These local selectors do not activate any deployed environment.
@@ -166,7 +172,8 @@ RUST_ARTIFACT_DEPS = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo
                       "infra/space/identity/node-identities.sh",
                       "templates/firecracker/seed/rootfs-builder.sh",
                       "templates/firecracker/recipes/seed.toml",
-                      "templates/firecracker/recipes/code-runtime.toml"]
+                      "templates/firecracker/recipes/code-runtime.toml",
+                      "templates/firecracker/recipes/code-runtime"]
 
 RUST_ARTIFACT_BUILD = "bash infra/space/kind/scripts/build-rust-artifacts.sh"
 
@@ -323,9 +330,10 @@ custom_build(
 # `KubernetesSubstrate::build_sandbox_pod` pins per-sandbox pods to
 # `runtimeClassName: space` and `nodeSelector: node.kubernetes.io/space-enabled=true`.
 # Neither exists in vanilla KinD, so we materialize them before the charts
-# land. RuntimeClass `space` resolves to containerd-shim-space-v2 once
-# install-shim.sh has wired it into each sandbox worker's containerd (the
-# `install-space-shim` bootstrap resource below, full harness only).
+# land. The SPACE Kind node image registers RuntimeClass `space`'s handler with
+# containerd; it resolves to containerd-shim-space-v2 once install-shim.sh has
+# installed that binary on each sandbox worker (the `install-space-shim`
+# bootstrap resource below, full harness only).
 
 # Namespace + RuntimeClass live in infra/space/kind/manifests/ so the scripted
 # bootstrap (infra/space/kind/scripts/bootstrap.sh) and tilt up share one
@@ -360,31 +368,21 @@ local_resource(
     labels = ["bootstrap"],
 )
 
-# Advertise the network-slot extended resource on sandbox workers. Every
-# sandbox pod requests `space.pplx.net/network-slots: "1"` (see
-# `KubernetesSubstrate::build_sandbox_pod`), so without a node advertising
-# capacity the scheduler leaves every sandbox pod Pending. Node-controller
-# advertises node-manager's `network_pool_max_slots`; locally we advertise a
-# static pool to exercise scheduling. JSON-patch `add` on a map key is idempotent
-# across re-runs.
-local_resource(
-    "advertise-kind-worker-network-slots",
-    cmd = """
-for node in $(kubectl --context kind-{cluster} get nodes -l 'space.pplx.net/node-pool=sandbox' -o name); do
-  kubectl --context kind-{cluster} patch "$node" --subresource=status --type=json \\
-    -p '[{{"op":"add","path":"/status/capacity/space.pplx.net~1network-slots","value":"100"}}]'
-done
-""".format(cluster = KIND_CLUSTER),
-    labels = ["bootstrap"],
-    resource_deps = ["label-kind-workers"],
-)
-
 # Label the infra node so Postgres, space-api, and space-cluster-controller
 # can pin there via nodeSelector. These components must not run on sandbox
-# worker nodes that the drain reconciler can delete.
+# worker nodes that the drain reconciler can delete. Every workload that names
+# a SPACE PriorityClass waits on this resource, and admission rejects a pod
+# whose class does not exist yet, so the classes are applied here too (the
+# k8s_yaml keeps them Tilt-managed, as the Namespace manifest is).
+k8s_yaml("infra/space/kind/manifests/priorityclasses.yaml")
 local_resource(
     "label-kind-infra",
-    cmd = "kubectl --context kind-{cluster} label nodes -l 'space.pplx.net/node-pool=infra' space.pplx.net/infra=true --overwrite".format(cluster = KIND_CLUSTER),
+    cmd = """
+set -eu
+kubectl --context kind-{cluster} apply -f infra/space/kind/manifests/priorityclasses.yaml >/dev/null
+kubectl --context kind-{cluster} label nodes -l 'space.pplx.net/node-pool=infra' space.pplx.net/infra=true --overwrite
+""".format(cluster = KIND_CLUSTER),
+    deps = ["infra/space/kind/manifests/priorityclasses.yaml"],
     labels = ["bootstrap"],
 )
 
@@ -463,9 +461,8 @@ local_resource(
 # required: Tilt runs nothing else beside a serial local resource, and this one
 # runs for minutes. It waits for the serial bootstrap resources because Tilt
 # holds those while anything else is building.
-RUST_ARTIFACTS_AFTER = ["label-kind-workers", "advertise-kind-worker-network-slots",
-                        "label-kind-infra", "sandbox-ssh-secret", "internal-rpc-tls",
-                        "check-kind-node-image", "install-space-shim"]
+RUST_ARTIFACTS_AFTER = ["label-kind-workers", "label-kind-infra", "sandbox-ssh-secret",
+                        "internal-rpc-tls", "check-kind-node-image", "install-space-shim"]
 local_resource(
     "rust-artifacts",
     cmd = RUST_ARTIFACT_BUILD,
@@ -508,10 +505,11 @@ k8s_resource(
 
 # API server.
 # Per-sandbox pods need the shim wired into containerd before the first create
-# lands.
+# lands, and the rate limiters' store should answer before the first create
+# reaches them (they would admit it open, not fail it).
 SPACE_API_DEPS = ["space-postgres", "label-kind-workers", "label-kind-infra",
-                  "advertise-kind-worker-network-slots", "install-space-shim",
-                  "internal-rpc-tls", "space-sandbox-network-policy", "space-db-migrate"]
+                  "install-space-shim", "internal-rpc-tls", "space-sandbox-network-policy",
+                  "space-db-migrate", "space-redis"]
 # No port_forward: localhost:8080 is the cluster's host port mapping onto the
 # space-api-entry NodePort (kind-cluster.yaml.tmpl), which spreads connections
 # across the autoscaled replicas as a deployment's load balancer does.
@@ -639,9 +637,9 @@ k8s_resource(
 )
 
 # Redis: shared store for the two API rate limiters (cluster activation
-# admission + per-client concurrency). Public docker.io image pulled directly by
-# the kind nodes (no `kind load`). Idle unless SPACE_REDIS_URL points at it; the
-# rate-limiter smoke (scripts/tests/smoke-kind-rate-limiters.sh) wires it up.
+# admission + per-client concurrency), which space-api, space-admin-api and
+# space-cluster-controller reach through SPACE_REDIS_URL. Public docker.io image
+# pulled directly by the kind nodes (no `kind load`). space-api waits for it.
 k8s_yaml(helm_release("space", "infra/space/kind/charts/space-redis-local"))
 k8s_resource(
     "space-redis",

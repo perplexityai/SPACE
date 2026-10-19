@@ -108,6 +108,11 @@ impl Cli {
             },
             known_egress_domains: self.known_egress_domains,
             route_identity,
+            // Set by sandbox-manager when a traced request launches the
+            // gateway, as the OpenTelemetry environment carrier names it.
+            launch_traceparent: std::env::var("TRACEPARENT")
+                .ok()
+                .filter(|value| !value.is_empty()),
         })
     }
 

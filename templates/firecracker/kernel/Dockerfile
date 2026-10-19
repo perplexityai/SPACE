@@ -1,4 +1,7 @@
-FROM ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3 AS base
+# The linux/amd64 image, not the multi-platform index: BuildKit keys its cache
+# by the manifest it resolves, and the image mirror (ci/mirrored-images.txt)
+# serves this manifest, so the source and the mirror share cached layers.
+FROM ubuntu:24.04@sha256:496754492fb28b4d3049432f2ca787449331e23fb14f0dd3fffea86bf5a93eb4 AS base
 
 ARG UBUNTU_SNAPSHOT=20260923T000000Z
 
@@ -9,13 +12,9 @@ RUN chmod 0644 /etc/ssl/certs/ca-certificates.crt \
     && sed -i "s|^URIs:.*|URIs: https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/|" \
         /etc/apt/sources.list.d/ubuntu.sources
 
-FROM base AS build
-
-ARG KERNEL_VERSION
-ARG FIRECRACKER_CI_VERSION
-ARG KERNEL_SOURCE_COMMIT
-ARG BASE_CONFIG_SHA256
-ARG CONFIG_FRAGMENT
+# The build toolchain is its own stage so that CI can cache it without the
+# kernel compile (ci.sh).
+FROM base AS toolchain
 
 RUN apt-get -o Acquire::Retries=5 update --error-on=any \
     && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install --yes --no-install-recommends \
@@ -33,6 +32,16 @@ RUN apt-get -o Acquire::Retries=5 update --error-on=any \
         openssl \
         python3 \
     && rm -rf /var/lib/apt/lists/*
+
+FROM toolchain AS build
+
+# Declared after the toolchain: a RUN depends on every ARG declared before it,
+# so a kernel bump would otherwise reinstall the packages.
+ARG KERNEL_VERSION
+ARG FIRECRACKER_CI_VERSION
+ARG KERNEL_SOURCE_COMMIT
+ARG BASE_CONFIG_SHA256
+ARG CONFIG_FRAGMENT
 
 WORKDIR /build
 RUN test -n "${KERNEL_VERSION}" \

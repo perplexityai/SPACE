@@ -1,0 +1,18 @@
+# A voluntary eviction (a node drain, a cluster upgrade) takes at most one of
+# the autoscaled replicas at a time and waits for its replacement to be ready,
+# as deployments budget the data plane. Rollouts follow the Deployment's own
+# strategy instead.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ .Release.Name }}-data-plane
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: space-data-plane
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: space-data-plane
+      app.kubernetes.io/instance: {{ .Release.Name }}

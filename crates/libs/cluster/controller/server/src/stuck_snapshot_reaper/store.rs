@@ -28,10 +28,21 @@ impl ReaperSink for SnapshotDbStore {
     /// on its own give-up — drops out of the `state = 'creating'` predicate
     /// and is left untouched.
     ///
-    /// Scope is `type = 'full'` because that is exactly the set the
-    /// node-drain in-flight gate keys on (`inflight_suspend_upload_exists`);
-    /// disk snapshots have their own (different) lifecycle and are out of
-    /// scope here.
+    /// Scope is `type = 'full'`, which **no longer matches the set the node-drain
+    /// in-flight gates key on.** It was chosen to mirror
+    /// `inflight_suspend_upload_exists`, and that is still the suspend side's
+    /// gate — but the stopped-resident evacuation added a second one, and it
+    /// keys on `creating` **disk** rows (`node_drain::store`'s
+    /// `StoppedEvacuationState::upload_in_flight`, consumed at step 1b of
+    /// `evacuate_stopped_sandbox`).
+    ///
+    /// So a stale `creating` disk row has no reaper: this statement will not
+    /// touch it and the retention sweeper filters `type = 'full'` too. The
+    /// consequence is documented where it bites — that gate parks an evacuation
+    /// instead of retrying it, fails stuck rather than open, and shows up on
+    /// `node_drain.stopped_evacuation_stall_secs`. **Do not read the exclusion
+    /// below as still being sufficient**; whether this scope should widen is an
+    /// open question.
     ///
     /// Ages on `COALESCE(last_attempt_at, timestamp)` — last observed worker
     /// activity, falling back to the immutable creation stamp. `last_attempt_at`

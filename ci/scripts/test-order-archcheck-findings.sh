@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Regression test for ci/scripts/order-archcheck-findings.sh: a pull request's
-# own findings come first, those comparing with the base's baseline leading,
-# each group in report order; a stale baseline entry is its own when it names
-# a changed file; and --own counts only what reviewdog shows.
+# own findings come first, those comparing with the base's baseline or
+# ARCHITECTURE.toml leading, each group in report order; a stale baseline
+# entry is its own when it names a changed file, or a [crate_names] entry the
+# changed Cargo.toml of its member; and --own counts only what reviewdog shows.
 set -euo pipefail
 
 SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/order-archcheck-findings.sh"
@@ -176,6 +177,45 @@ expect "file list" "new name.rs:1 ${B}:2 second.rs:1 third.rs:1 $(numbered tree 
 } >moved.json
 expect "pure rename" "moved.rs:1 edited.rs:1 $(numbered tree 11)" moved.rdjson moved.json
 expect "pure rename, file mode" "edited.rs:1" --own=file moved.rdjson moved.json
+
+# crate_names.policy_changed compares ARCHITECTURE.toml with the base's, so
+# it leads with the other base comparisons; a required no_new finding on a new
+# crate's Cargo.toml is the pull request's, and kept.
+printf '[file_size]\n' >"${B}"
+{
+    tree_findings
+    diagnostic own.rs 1 file_size.listed_no_growth
+    diagnostic crates/new-utils/Cargo.toml 2 crate_names.no_new ERROR
+    diagnostic ARCHITECTURE.toml 80 crate_names.policy_changed
+    diagnostic ARCHITECTURE.toml 81 crate_names.stale_entries
+} | report >policy.rdjson
+pages ARCHITECTURE.toml own.rs crates/new-utils/Cargo.toml >policy.json
+expect "crate_names policy" \
+    "ARCHITECTURE.toml:80 own.rs:1 crates/new-utils/Cargo.toml:2 ARCHITECTURE.toml:81" \
+    --own=nofilter policy.rdjson policy.json
+
+# A stale [crate_names] entry is the pull request's when it changes the
+# Cargo.toml of the member path the entry maps to (old or new name), however
+# the key and path are written; an empty path is the root package.
+cat >"${B}" <<'EOF'
+[file_size]
+"crates/z/src/lib.rs" = 1300
+
+[crate_names]
+pplx-space-x-common = "crates/x"
+"pplx-space-y-utils" = 'crates/y'  # moved
+pplx-space-z-core = "crates/z"
+pplx-space-root-misc = ""
+EOF
+{
+    tree_findings
+    for line in 5 6 7 8; do diagnostic "${B}" "${line}" crate_names.stale_entries; done
+} | report >crates.rdjson
+{
+    printf '[{"filename": "crates/y2/Cargo.toml", "previous_filename": "crates/y/Cargo.toml", "status": "renamed", "changes": 0}]'
+    pages crates/x/Cargo.toml Cargo.toml crates/z/src/lib.rs
+} >crates.json
+expect "crate_names entries" "${B}:5 ${B}:6 ${B}:8 $(numbered tree 11) ${B}:7" crates.rdjson crates.json
 
 if bash "${SCRIPT}" source.rdjson 2>/dev/null; then
     fail "the script accepted a missing <pull-request-files> argument"

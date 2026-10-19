@@ -2,10 +2,10 @@
 
 The live run proves the decision table. These pin what a passing run would not
 catch: the verdict scan joining each line to exactly one `(template, digest)`
-across the two tracing layouts and the raw prune breadcrumb; the shell-word
-guards on the names and digests that reach an on-node `bash -c`; and a bench
-with a single sandbox worker being a configuration error rather than a restart
-of the worker running the fixture sandbox.
+across the two tracing layouts; the shell-word guards on the names and digests
+that reach an on-node `bash -c`; and a bench with a single sandbox worker being
+a configuration error rather than a restart of the worker running the fixture
+sandbox.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import unittest
 from space_smoke.adapters import (
     TEMPLATE_RECOVERY_CONFIRMED_MESSAGE,
     TEMPLATE_RECOVERY_FINISHED_MESSAGE,
+    TEMPLATE_RECOVERY_PRUNED_MESSAGE,
     TEMPLATE_RECOVERY_REGISTERED_MESSAGE,
     TEMPLATE_RECOVERY_REJECTED_MESSAGE,
     KindConfig,
@@ -40,8 +41,7 @@ class RecoveryVerdictScan(unittest.TestCase):
                 # Nested tracing layout.
                 json.dumps({"fields": {"message": TEMPLATE_RECOVERY_REGISTERED_MESSAGE, "template": "smoke-rec-abcdef01-orphan", "content_hash": H2}}),
                 json.dumps({"message": TEMPLATE_RECOVERY_REJECTED_MESSAGE, "template": "smoke-rec-abcdef01-tamper", "content_hash": H1, "reason": 'bootable artifact sha256 "sha256:ff" does not match digest dir name "' + H1 + '"'}),
-                # The prune is a raw eprintln breadcrumb, not JSON.
-                "[template-mgr] pruning stale build: smoke-rec-abcdef01-stale/" + H2,
+                json.dumps({"level": "WARN", "fields": {"message": TEMPLATE_RECOVERY_PRUNED_MESSAGE, "template": "smoke-rec-abcdef01-stale", "content_hash": H2}}),
                 # Same message for another template must not attach to ours.
                 json.dumps({"message": TEMPLATE_RECOVERY_CONFIRMED_MESSAGE, "template": "seed", "content_hash": H1}),
                 "not json startup recovery noise",

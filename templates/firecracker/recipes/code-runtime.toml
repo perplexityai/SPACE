@@ -19,33 +19,57 @@ memory_mib = 2048
 disk_size_mb = 4096
 
 # ── Step 1: Core system packages ─────────────────────────────────────────────
+#
+# x86_64 builds download packages from one dated, signed Ubuntu archive
+# snapshot (APT_SNAPSHOT; move it forward deliberately), so a rebuild installs
+# the same package set. The step fails before installing if
+# any download would come from outside the snapshot, such as from a source that
+# sets "Snapshot: no". Ubuntu publishes no snapshot of the ports archive that
+# serves other architectures; those development builds use the live mirror.
+# The snapshot is passed per command and the final update restores live
+# indexes, so runtime apt behaves as before.
+#
+# iproute2 provides ss/ip/tc for readiness checks even when the base seed
+# predates their inclusion.
 
 [[steps]]
 name = "Install system packages"
-type = "apt-install"
-packages = [
-    "python3",
-    "python3-venv",
-    "python3-pip",
-    "python-is-python3",
-    "curl",
-    "ca-certificates",
-    "sudo",
-    "git",
-    "git-lfs",
-    "procps",
-    "jq",
-    "wget",
-    "lsof",
-    "sqlite3",
-    "iputils-ping",
-    "libcap2-bin",
-    "python3-dev",
-    "python3-setuptools",
-    # Provide ss/ip/tc for readiness checks even when the base seed
-    # predates their inclusion.
-    "iproute2",
-]
+type = "run"
+command = """
+set -eu
+APT_SNAPSHOT="20261016T000000Z"
+PACKAGES="python3 python3-venv python3-pip python-is-python3 python3-dev
+  python3-setuptools curl ca-certificates sudo git git-lfs procps jq wget lsof
+  sqlite3 iputils-ping libcap2-bin iproute2"
+set -- -o Acquire::Retries=5
+pinned=false
+if [ "$(uname -m)" = x86_64 ]; then
+  set -- "$@" -o "APT::Snapshot=${APT_SNAPSHOT}"
+  pinned=true
+else
+  echo "NOTE: no Ubuntu snapshot for $(uname -m); installing from the live mirror" >&2
+fi
+apt-get clean
+rm -rf /var/lib/apt/lists/*
+apt-get "$@" update
+if "$pinned"; then
+  unpinned="$(apt-get "$@" install -y --no-install-recommends --print-uris $PACKAGES |
+    grep "^'" | grep -v "^'https://snapshot.ubuntu.com/" || true)"
+  if [ -n "$unpinned" ]; then
+    printf 'APT downloads outside snapshot %s:\\n%s\\n' "$APT_SNAPSHOT" "$unpinned" >&2
+    exit 1
+  fi
+fi
+DEBIAN_FRONTEND=noninteractive DEBCONF_NOWARNINGS=yes apt-get "$@" install -y \
+  --no-install-recommends \
+  -o Dpkg::Options::=--force-confdef \
+  -o Dpkg::Options::=--force-confold \
+  $PACKAGES
+apt-get clean
+rm -rf /var/lib/apt/lists/*
+apt-get -o Acquire::Retries=5 update
+"""
+user = "root"
 
 # ── Step 2: Python symlinks ──────────────────────────────────────────────────
 
@@ -138,36 +162,39 @@ done
 user = "root"
 
 # ── Step 6: Code interpreter packages (matches E2B code-interpreter-v1) ───────
+#
+# code-runtime/pyproject.toml lists the packages and code-runtime/uv.lock pins
+# every transitive dependency to wheel hashes. uv from step 5 installs exactly
+# that set and rejects any artifact outside it. UV_PROJECT_ENVIRONMENT=/usr
+# installs into the system Python, where python, pip, and Jupyter find it, and
+# --inexact leaves the Python packages apt installed in place. --locked fails if
+# uv.lock is out of date with pyproject.toml. The malware check stops the
+# install if OSV lists a locked version as malicious and names that version;
+# --quiet would hide the name. The seed README describes how to pick a
+# replacement.
+
+[[steps]]
+name = "Copy code interpreter package manifest"
+type = "copy"
+source = "code-runtime/pyproject.toml"
+dest = "/tmp/code-runtime-python/pyproject.toml"
+
+[[steps]]
+name = "Copy code interpreter package lock"
+type = "copy"
+source = "code-runtime/uv.lock"
+dest = "/tmp/code-runtime-python/uv.lock"
 
 [[steps]]
 name = "Install code interpreter packages (Jupyter, data science, NLP)"
-type = "pip-install"
-packages = [
-    # Jupyter
-    "jupyter",
-    "ipython",
-    "jupyterlab",
-    # Data visualization
-    "bokeh",
-    "kaleido",
-    # NLP
-    "nltk",
-    "spacy",
-    # JIT compiler
-    "numba",
-    # Data science
-    "numpy",
-    "pandas",
-    "scipy",
-    "pillow",
-    # Image I/O
-    "imageio",
-    # Utilities
-    "send2trash",
-    "pygments",
-    "jsonschema",
-]
-extra_args = ["--ignore-installed"]
+type = "run"
+command = """
+set -eu
+cd /tmp/code-runtime-python
+UV_PREVIEW_FEATURES=malware-check UV_MALWARE_CHECK=1 UV_PROJECT_ENVIRONMENT=/usr \
+  uv sync --locked --no-build --no-install-project --inexact --no-cache
+"""
+user = "root"
 
 # ── Step 7: User account and workspace ────────────────────────────────────────
 

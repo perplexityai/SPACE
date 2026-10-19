@@ -9,6 +9,7 @@ use crate::template_resolver::TemplateLookupError;
 use crate::template_resolver::fake::{FakeTemplateResolver, LookupChannel};
 use pplx_space_common_core::host::linux::identities::users;
 use pplx_space_common_svc::PeerIdentity;
+use pplx_space_common_svc::template_lookup::TemplateLookupScope;
 use pplx_space_net_common::proto::PolicyAuthority;
 use pplx_space_template_mgr_client::proto::{GetTemplateRequest, TemplateRef};
 
@@ -153,6 +154,12 @@ async fn create_checks_auto_lifecycle_authority_before_template_lookup() {
                 "invalid selection must not dial node-manager"
             );
         }
+        let scope = if case.peer.uid() == users::SPACE_NODEAPI.uid {
+            TemplateLookupScope::Cluster
+        } else {
+            TemplateLookupScope::LocalExecution
+        };
+        scope.attach(&mut request);
         request.extensions_mut().insert(case.peer);
 
         let error = service.create(request).await.expect_err(case.name);
@@ -180,10 +187,16 @@ async fn create_checks_auto_lifecycle_authority_before_template_lookup() {
             Vec::new()
         };
         assert_eq!(templates.requests(), expected_lookups, "{}", case.name);
-        // Create dials template-manager for its lookup and sends no metadata.
         for lookup in &lookups {
             assert_eq!(lookup.channel, LookupChannel::Dialed, "{}", case.name);
-            assert!(lookup.metadata.is_empty(), "{}", case.name);
+            let mut request = Request::new(lookup.request.clone());
+            *request.metadata_mut() = lookup.metadata.clone();
+            assert_eq!(
+                TemplateLookupScope::from_request(&request).unwrap(),
+                Some(scope),
+                "{}",
+                case.name
+            );
         }
         assert!(node_manager.calls().is_empty(), "{}", case.name);
     }

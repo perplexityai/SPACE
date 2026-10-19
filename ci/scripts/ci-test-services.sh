@@ -61,8 +61,13 @@ start() {
     # every statement that took longer than a second. The log prints on every
     # run, so routine lines stay out of it: logging every connection, or the
     # checkpoint each CREATE and DROP DATABASE forces, costs minutes to print.
+    # A slow statement also logs its bind parameters, uncapped by default: a
+    # bulk insert binding thousands of ids becomes a line of several hundred
+    # kilobytes, and the runner takes most of a minute to ingest each one.
+    # Cap each logged parameter so the line stays short.
     space_start_test_postgres --name "${POSTGRES_NAME}" --label "${label}" --network "${network}" \
-        -- -c log_min_duration_statement=1000 -c log_checkpoints=off >/dev/null
+        -- -c log_min_duration_statement=1000 -c log_checkpoints=off \
+        -c log_parameter_max_length=1024 >/dev/null
     docker run --detach --pull=never --name "${REDIS_NAME}" --label "${label}" \
         --network "${network}" "$(space_test_dependency_redis_image)" >/dev/null
 

@@ -408,6 +408,26 @@ pub(super) fn connect_error_end_stream(code: tonic::Code, message: &str) -> Byte
     )
 }
 
+/// The `unavailable` end-stream message a connect stream gets when the drain
+/// deadline passes. E2B clients must open a new stream to continue.
+pub(super) fn connect_shutdown_end_stream() -> Bytes {
+    connect_error_end_stream(
+        tonic::Code::Unavailable,
+        "data plane is shutting down; reconnect",
+    )
+}
+
+/// The end-stream message for a `Process.Start` that reached the deadline
+/// without reporting itself. `unknown` rather than `unavailable`: the guest
+/// may already be running the command, and a client that retried the start
+/// would run it twice.
+pub(super) fn connect_unreported_start_end_stream() -> Bytes {
+    connect_error_end_stream(
+        tonic::Code::Unknown,
+        "data plane shut down before the process start was confirmed; it may be running",
+    )
+}
+
 pub(super) fn connect_json_stream_response<S>(stream: S) -> Response
 where
     S: Stream<Item = Result<Bytes, Infallible>> + Send + 'static,

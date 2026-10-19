@@ -118,6 +118,21 @@ fn ensure_sandbox_artifact_dir_permissions(path: impl AsRef<Path>) -> Result<(),
     trusted_paths::set_permissions(&directory, Some(gids::SPACE_CACHE_RW), 0o2770)
 }
 
+fn ensure_sandbox_instance_traversal(path: impl AsRef<Path>) -> Result<(), Status> {
+    let path = path.as_ref();
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(Status::internal(format!(
+                "inspect retained instance: {error}"
+            )));
+        }
+        Ok(_) => {}
+    }
+    let directory = trusted_paths::open_directory(path)?;
+    trusted_paths::set_permissions(&directory, Some(gids::SPACE_CACHE_RW), 0o2710)
+}
+
 fn ensure_sidecar_run_dir_permissions(path: &str) -> Result<(), Status> {
     cleanup_helpers::chgrp_path_blocking(path, gids::SPACE_SIDECARCLIENTS)?;
     cleanup_helpers::chmod_path_blocking(path, 0o2770)
@@ -187,7 +202,6 @@ pub struct NodeManagerService {
     sandbox_artifact_locks: SandboxCgroupFamilyLocks,
     send_source_locks: SandboxCgroupFamilyLocks,
     send_source_slots: std::sync::Arc<tokio::sync::Semaphore>,
-    send_parent_seal: btrfs_send_source::ParentSeal,
     artifact_work: Option<std::sync::Arc<filesystem_work::ArtifactWork>>,
     /// Shared drain ownership for detached mutations and lifecycle permits.
     device_op_tasks: tokio_util::task::TaskTracker,
@@ -208,6 +222,7 @@ pub struct NodeManagerService {
     disk_admission: std::sync::Arc<DiskAdmission>,
     prepared_rootfs_reservations: prepared_rootfs::PreparedRootfsReservations,
     disk_usage_cache: node_disk_metrics::SandboxDiskUsageCache,
+    disk_io_ceiling: disk_io_ceiling::DiskIoCeiling,
     cleanup_operations: cleanup_inspect::CleanupOperationRegistry,
     orphan_inventory: orphan_inventory::OrphanInventory,
     snapshot_inventory: snapshot_inventory::SnapshotInventory,
@@ -365,7 +380,6 @@ impl NodeManagerService {
             sandbox_artifact_locks: Default::default(),
             send_source_locks: Default::default(),
             send_source_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
-            send_parent_seal: btrfs_send_source::ParentSeal::from_env(),
             artifact_work: None,
             blocking_probe_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 MAX_BLOCKING_PROBES,
@@ -391,6 +405,7 @@ impl NodeManagerService {
             disk_admission,
             prepared_rootfs_reservations,
             disk_usage_cache: node_disk_metrics::SandboxDiskUsageCache::default(),
+            disk_io_ceiling: disk_io_ceiling::DiskIoCeiling::default(),
             cleanup_operations: cleanup_inspect::CleanupOperationRegistry::new(task_tracker),
             orphan_inventory: orphan_inventory::OrphanInventory::default(),
             snapshot_inventory: snapshot_inventory::SnapshotInventory::default(),
@@ -684,6 +699,7 @@ mod cleanup_helpers;
 mod cleanup_inspect;
 mod control;
 mod disk;
+pub(crate) mod disk_io_ceiling;
 mod encrypted_volumes;
 mod endpoint_attestation;
 mod execution_fence;

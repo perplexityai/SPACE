@@ -48,6 +48,18 @@ nodeSelector:
   space.pplx.net/node-pool: {{ index .ctx.Values.node.pools $role | quote }}
 {{- end -}}
 
+{{/*
+Node services carry the built-in system-node-critical class, as deployments
+give their node-service DaemonSets (infra/space/kind/manifests/priorityclasses.yaml
+has the cluster's other classes): a node-service pod that cannot fit preempts
+lower-priority pods rather than leaving the node without it, and the kubelet's
+node-pressure eviction ranks it behind lower-priority pods that exceed their
+requests.
+*/}}
+{{- define "space-node-service.priorityClass" -}}
+priorityClassName: system-node-critical
+{{- end -}}
+
 {{- define "space-node-service.image" -}}
 image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
 imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -308,7 +320,9 @@ pod's own mounts back to the node.
       - serviceAccountToken:
           path: credmgr.token
           audience: space-credential-manager
-          expirationSeconds: 3600
+          # The node services' deployed lifetime, as for the ClusterApi
+          # token below.
+          expirationSeconds: 600
       - secret:
           name: space-credmgr-authority-trust
           items:
@@ -335,6 +349,11 @@ a root listener reads it as owner.
     defaultMode: 0440
 {{- end -}}
 
+{{/*
+The 600 s lifetime is the node services' deployed one; the kubelet refreshes
+the file at 80% of it and the client rereads it (TOKEN_FILE_CACHE_TTL,
+bearer_token.rs).
+*/}}
 {{- define "space-node-service.volume.clusterApiToken" -}}
 - name: cluster-api-token
   projected:
@@ -343,7 +362,7 @@ a root listener reads it as owner.
       - serviceAccountToken:
           path: cluster-api.token
           audience: space-cluster-api
-          expirationSeconds: 3600
+          expirationSeconds: 600
 {{- end -}}
 
 {{- define "space-node-service.volume.routeVerification" -}}
@@ -410,7 +429,7 @@ Rolling-update strategy. `surge` starts the replacement beside the old pod:
 for services that hold a node-wide service mutex (/space/run/<svc>/service.mutex)
 the successor waits passively, reports ready while passive, and takes over
 when the predecessor drains and releases the lock, with its sockets replaced
-by rename (crates/libs/common/svc/src/service_mutex.rs, bootstrap.rs).
+by rename (crates/libs/common/svc/src/service_mutex.rs, bootstrap/unix_socket.rs).
 `deleteFirst` stops the old pod before the new one starts, for services that
 cannot run twice on a node.
 */}}
@@ -448,6 +467,39 @@ dnsPolicy: ClusterFirstWithHostNet
 {{- define "space-node-service.podAnnotations" -}}
 ad.datadoghq.com/tags: '{"team":"{{ .ctx.Values.node.datadogTeam }}"}'
 {{ include "space-kind-telemetry.logAnnotations" .ctx }}
+{{- end -}}
+
+{{/*
+Lets the service's ServiceAccount create TokenReviews, which a listener that
+authenticates its callers' projected tokens issues for each one
+(crates/libs/common/svc/src/auth/k8s.rs, auth/build/k8s.rs). Nothing else.
+*/}}
+{{- define "space-node-service.tokenReviewRbac" -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "space-node-service.name" . }}-token-review
+  labels:
+    {{- include "space-node-service.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "space-node-service.name" . }}-token-review
+  labels:
+    {{- include "space-node-service.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "space-node-service.name" . }}-token-review
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "space-node-service.name" . }}
+    namespace: {{ .ctx.Release.Namespace }}
 {{- end -}}
 
 {{- define "space-node-service.serviceAccount" -}}

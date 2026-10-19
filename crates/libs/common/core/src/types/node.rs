@@ -929,9 +929,9 @@ impl NodeDrainState {
     /// the draining node, adding a resident that has to leave again — accepted,
     /// because the alternative is 409ing a user's sandbox for the whole drain,
     /// and promotion keeps making those snapshots S3-backed, after which restore
-    /// affinity sends them elsewhere. And a gentle drain that escalates to forced
-    /// starts blocking from that moment, because the guards read the live mode
-    /// rather than the mode at drain start.
+    /// affinity sends them elsewhere. And a gentle drain an operator escalates
+    /// to forced starts blocking from that moment, because the guards read the
+    /// live mode rather than the mode at drain start.
     ///
     /// The inverse reading matters too, and is why this is shared: anything whose
     /// safety depends on wakes being refused (the legacy sandbox-id-only snapshot
@@ -984,8 +984,11 @@ impl NodeDrainState {
 ///   so local-only suspended artifacts become S3-backed and their restores
 ///   redirect off the node. Trades drain latency for zero user-visible
 ///   disruption; a node hosting a sandbox that never suspends never converges
-///   on its own, which is what the reconciler's gentle escalation deadline is
-///   for.
+///   on its own, which is what the admin `:drain` endpoint's in-place
+///   escalation is for — a second `:drain` with `mode: forced` against a node
+///   already `draining` rewrites this column without disturbing `drain_phase`
+///   or `drain_started_at`, so the drain becomes destructive without losing
+///   its age.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(try_from = "String", into = "String"))]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]

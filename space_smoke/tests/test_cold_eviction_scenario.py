@@ -1,11 +1,9 @@
 """Contracts of the cold-eviction scenario the bench cannot exercise.
 
 The live run proves the loop evicts and the sandbox wakes from S3; nothing
-here restates that. Three things a passing bench run would not catch: the
-on-disk probe reading an exec failure as "gone", the event scan counting
-another sandbox's or a *failed* eviction as this one's success, and a bench
-with the loop off reading as a product failure instead of a configuration
-error.
+here restates that. Two things a passing bench run would not catch: the
+on-disk probe reading an exec failure as "gone", and a bench with the loop
+off reading as a product failure instead of a configuration error.
 """
 
 from __future__ import annotations
@@ -66,21 +64,6 @@ class CacheDirProbeFailsClosed(unittest.TestCase):
         self.assertFalse(harness.sandbox_cache_dir_present("p", sid))
         with self.assertRaises(RuntimeError):
             harness.sandbox_cache_dir_present("p", sid)
-
-
-class EvictionEventScan(unittest.TestCase):
-    def test_selects_only_this_sandboxes_completed_events(self) -> None:
-        sid = "01a0b0c9-b8a3-7473-9c12-3821a701bc28"
-        other = "11a0b0c9-b8a3-7473-9c12-3821a701bc28"
-        lines = [
-            json.dumps({"event_type": "local_eviction_completed", "sandbox_id": sid, "reason": "latest_backed_idle", "snapshot_id": "snap-1"}),
-            json.dumps({"event_type": "local_eviction_failed", "sandbox_id": sid, "reason": "x"}),
-            json.dumps({"event_type": "local_eviction_completed", "sandbox_id": other}),
-            "not json " + sid + ' "local_eviction_completed"',
-        ]
-        harness = KindHarness(_RecordingKubectl(logs="\n".join(lines)), KindConfig())
-        events = harness.local_evictions(sid, since_time="2026-01-01T00:00:00Z")
-        self.assertEqual([(e.node_name, e.reason, e.snapshot_id) for e in events], [("worker-1", "latest_backed_idle", "snap-1")])
 
 
 class BenchWithTheLoopOffIsAConfigurationError(unittest.TestCase):

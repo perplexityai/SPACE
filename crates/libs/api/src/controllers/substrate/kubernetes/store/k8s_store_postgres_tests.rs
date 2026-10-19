@@ -154,6 +154,132 @@ async fn insert_sandbox(pool: &PgPool, sandbox_id: SandboxId, lifecycle: &str) -
     Ok(())
 }
 
+/// **A stopped evacuation counts as unplaced only once its local copy is gone.**
+///
+/// The flag exists because `restore_source_node_name` does not fail closed
+/// here. After a drain's teardown clears both placement columns, the executions
+/// fallback still answers with the drained node's `k8s_node_name` — retiring an
+/// execution marks the row inactive without deleting it — so the plan builder
+/// needs to be told to refuse rather than trust that name.
+///
+/// The other direction is the one that made an earlier revision wrong: scoping
+/// it to the marker alone would also catch a claimed-but-not-torn-down row,
+/// which still has its copy and whose marker nothing in the fleet ever clears.
+/// Both are asserted on one fixture, differing only in placement.
+#[tokio::test]
+async fn a_stopped_evacuation_counts_as_unplaced_only_once_its_local_copy_is_gone() -> TestResult {
+    let fixture = postgres_store().await?;
+    let sandbox_id = SandboxId::new();
+    let node_id = NodeId::new();
+    insert_sandbox(&fixture.pool, sandbox_id, "stopped").await?;
+
+    // The executions row the fallback answers from, and the drained node it
+    // names — this is the value that would become `spec.nodeName`.
+    sqlx::query(sql!(
+        "INSERT INTO nodes (id, address, role, managed_by, state)
+         VALUES ($1, '10.0.0.51'::inet, 'worker', 'k8s', 'registered')"
+    ))
+    .bind(node_id)
+    .execute(&fixture.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_k8s_executions
+             (sandbox_id, generation, pod_name, pod_namespace, k8s_node_name, state, active)
+         VALUES ($1, 1, $2, 'space', 'ip-10-0-0-51.ec2.internal', 'retired', FALSE)"
+    ))
+    .bind(sandbox_id)
+    .bind(K8sStore::execution_pod_name(sandbox_id, 1))
+    .execute(&fixture.pool)
+    .await?;
+
+    // Claimed but not torn down: still on its node, so a `start` is fine.
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET evacuation_restore_target = 'stopped',
+                active_node_id = $2,
+                placement = 'on_node'
+          WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(node_id)
+    .execute(&fixture.pool)
+    .await?;
+    let plan = fixture.store.restore_source_plan(sandbox_id).await?;
+    assert!(
+        !plan.stopped_evacuation_unplaced,
+        "a claimed-but-placed sandbox still has its rootfs on its node, and nothing clears \
+         the marker, so it must not read as evacuated"
+    );
+
+    // Torn down: placement cleared, marker still set. Now the refusal is right.
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET active_node_id = NULL, target_node_id = NULL, placement = 'unplaced'
+          WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(&fixture.pool)
+    .await?;
+    let plan = fixture.store.restore_source_plan(sandbox_id).await?;
+    assert!(
+        plan.stopped_evacuation_unplaced,
+        "an evacuation that has destroyed the local copy must read as unplaced — otherwise \
+         the start is planned against a node that is about to disappear"
+    );
+    assert_eq!(
+        plan.node_name.as_deref(),
+        Some("ip-10-0-0-51.ec2.internal"),
+        "and the fallback still answers with the drained node, which is exactly why the \
+         flag cannot be left to a missing node name"
+    );
+
+    // Mid-re-placement: `target_node_id` set, `active_node_id` still NULL. This
+    // is the phase that distinguishes `active_node_id IS NULL` from
+    // `COALESCE(target_node_id, active_node_id) IS NULL`, and without it nothing
+    // in the suite does — every other phase moves the two columns together, so
+    // "harmonising" the refusal onto the same `COALESCE` the WARN's
+    // `placement_node_id` uses would look like tidying an oversight and would
+    // leave this test green. It would also stop the refusal firing exactly here,
+    // handing the caller a pod bound to the drained node instead of a 503.
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET active_node_id = NULL, target_node_id = $2, placement = 'unplaced'
+          WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(node_id)
+    .execute(&fixture.pool)
+    .await?;
+    let plan = fixture.store.restore_source_plan(sandbox_id).await?;
+    assert!(
+        plan.stopped_evacuation_unplaced,
+        "a re-placement in flight — target chosen, nothing active yet — must still read as \
+         unplaced: the local copy is gone, and the target is not serving the sandbox yet"
+    );
+    assert_eq!(
+        plan.node_name.as_deref(),
+        Some("ip-10-0-0-51.ec2.internal"),
+        "and the name must resolve through the `node_k8s` mapping for the chosen target \
+         rather than the executions fallback — which also means the missing-mapping WARN \
+         stays silent in this state, since a placement node id is present"
+    );
+
+    // Unmarked and unplaced: not this feature's business.
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET evacuation_restore_target = NULL WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(&fixture.pool)
+    .await?;
+    let plan = fixture.store.restore_source_plan(sandbox_id).await?;
+    assert!(
+        !plan.stopped_evacuation_unplaced,
+        "an unplaced sandbox with no marker is some other path's problem, and flagging it \
+         here would refuse starts this feature never touched"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn started_recovery_handoff_keeps_generation_when_local_source_is_not_allowed() -> TestResult
 {

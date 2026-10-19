@@ -130,8 +130,21 @@ async fn run_network_policy_queue<F, Fut>(
             queue.take_pending(&in_flight, available)
         };
         for attempt in pending {
+            // An attempt a traced request queued runs under a root linked to
+            // it, so its events join that request's work; one the periodic
+            // sweep or a retry queued has no request behind it and no root.
+            let span =
+                queue
+                    .take_origin(&attempt.sandbox_id)
+                    .map_or_else(tracing::Span::none, |origin| {
+                        super::drain::linked_trace_span(
+                            "NetworkPolicyReconcile",
+                            &attempt.sandbox_id,
+                            Some(&origin),
+                        )
+                    });
             let work = reconcile(attempt.sandbox_id.clone());
-            jobs.spawn(attempt, work);
+            jobs.spawn(attempt, work.instrument(span));
         }
         tokio::select! {
             biased;

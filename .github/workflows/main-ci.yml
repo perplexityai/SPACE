@@ -128,64 +128,71 @@ jobs:
     with:
       publish: true
 
-  # Every kernel input is pinned in templates/firecracker/kernel (source
-  # commit, base config digest, Ubuntu base digest and package snapshot) or in
-  # this file, so a build that passed for one hash of them passes again. A
-  # cached marker records each passing hash; main commits that change none of
-  # it skip the ~30-minute rebuild and its dependence on snapshot.ubuntu.com.
-  # A failing change never saves a marker, so it fails every main run until
-  # fixed. An evicted marker only costs one rebuild.
-  guest_kernel:
+  # The hash of the guest kernel inputs, for guest_kernel's concurrency group:
+  # hashFiles() is not available in jobs.<id>.concurrency.
+  guest_kernel_inputs:
     if: github.repository == 'perplexityai/SPACE'
-    name: Build and QEMU-smoke guest kernel
+    name: Hash guest kernel inputs
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 5
+    outputs:
+      hash: ${{ steps.hash.outputs.hash }}
     steps:
       - name: Check out SPACE
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
           persist-credentials: false
 
-      - name: Look for a passing build of these kernel inputs
-        id: kernel_pass
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: .guest-kernel-pass
-          key: guest-kernel-pass-v1-${{ hashFiles('templates/firecracker/kernel/**', '.github/workflows/main-ci.yml') }}
-          lookup-only: true
-
-      - name: Reuse the passing build of these kernel inputs
-        if: steps.kernel_pass.outputs.cache-hit == 'true'
-        run: echo "These kernel inputs already built and smoke-booted on main; skipping the rebuild."
-
-      - name: Build and smoke-boot the guest kernel without publishing
-        if: steps.kernel_pass.outputs.cache-hit != 'true'
+      - name: Hash the guest kernel inputs
+        id: hash
         run: |
-          set -euo pipefail
-          kernel_version=6.1.155
-          output_root="$(mktemp -d)"
-          trap 'rm -rf "${output_root}"' EXIT
+          hash="$(bash templates/firecracker/kernel/ci.sh hash)"
+          echo "hash=${hash}" >> "${GITHUB_OUTPUT}"
 
-          OUTPUT_DIR="${output_root}" KERNEL_VERSION="${kernel_version}" \
-            templates/firecracker/kernel/build.sh
-          artifact_dir="${output_root}/vmlinux-${kernel_version}"
-          test -f "${artifact_dir}/vmlinux.bin"
-          test -f "${artifact_dir}/config"
-          (
-            cd "${artifact_dir}"
-            sha256sum --check --strict vmlinux.bin.sha256
-          )
-          templates/firecracker/kernel/smoke-boot.sh \
-            "${artifact_dir}/vmlinux.bin" "${kernel_version}"
-          echo "${GITHUB_SHA}" > .guest-kernel-pass
-
-      - name: Record the passing build of these kernel inputs
-        if: steps.kernel_pass.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+  # Every kernel input is pinned in templates/firecracker/kernel, so a build
+  # that passed for one hash of it passes again. The script records each
+  # passing hash as a GHCR marker; main commits that change none of it skip the
+  # ~30-minute rebuild and its dependence on snapshot.ubuntu.com. A failing
+  # change never records a marker, so it fails every main run until fixed. A
+  # missing marker costs one rebuild, whose base, toolchain and BuildKit image
+  # come from GHCR (the script's registry cache and the image mirror). When
+  # GHCR is unreachable the rebuild loses those too and takes them from Docker
+  # Hub and snapshot.ubuntu.com, as every rebuild did before.
+  #
+  # Runs for the same inputs queue instead of overlapping, so the later ones
+  # find the earlier one's marker. queue: max keeps every pending run; the
+  # default would cancel all but the newest, and space-ci fails a cancelled
+  # job.
+  guest_kernel:
+    if: github.repository == 'perplexityai/SPACE'
+    name: Build and QEMU-smoke guest kernel
+    needs: guest_kernel_inputs
+    runs-on: ubuntu-24.04
+    # A marker hit takes a minute and a cold build about 30. The worst case
+    # with Docker Hub and snapshot.ubuntu.com working, GHCR answering manifests
+    # but stalling every download, costs about 156 minutes: each deadline in
+    # ci.sh runs out once, then the kernel and smoke images build cold. The
+    # budget is itemized in templates/firecracker/kernel/ci.sh.
+    timeout-minutes: 180
+    concurrency:
+      group: guest-kernel-${{ needs.guest_kernel_inputs.outputs.hash }}
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out SPACE
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          path: .guest-kernel-pass
-          key: ${{ steps.kernel_pass.outputs.cache-primary-key }}
+          persist-credentials: false
+
+      - name: Build and smoke-boot the guest kernel unless these inputs passed
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          # Take the Ubuntu base from the third-party image mirror.
+          SPACE_CI_IMAGE_MIRROR: ghcr
+        run: bash templates/firecracker/kernel/ci.sh publish
 
   kind_smoke:
     if: github.repository == 'perplexityai/SPACE'

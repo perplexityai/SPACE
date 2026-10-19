@@ -189,13 +189,20 @@ impl RuntimeSupervisorService {
         &self,
         work: impl std::future::Future<Output = Result<T, Status>> + Send + 'static,
     ) -> Result<T, Status> {
+        use tracing::Instrument as _;
         let (permit, ownership) = self.admit_operation().await?;
+        // The handler awaits the work, so it runs in the request's span and
+        // what it logs carries the request's trace, as node-manager's owned
+        // operations do.
         self.operations
-            .spawn(async move {
-                let _ownership = ownership;
-                let _permit = permit;
-                work.await
-            })
+            .spawn(
+                async move {
+                    let _ownership = ownership;
+                    let _permit = permit;
+                    work.await
+                }
+                .in_current_span(),
+            )
             .await
             .map_err(|error| Status::internal(format!("runtime operation task failed: {error}")))?
     }
@@ -543,11 +550,56 @@ impl RuntimeSupervisor for RuntimeSupervisorService {
 }
 
 impl RuntimeSupervisorService {
+    async fn prepare_firecracker_launch(
+        &self,
+        sandbox_id: SandboxId,
+        execution: pplx_space_common_core::types::SandboxActivationAttemptId,
+        budget: pplx_space_common_core::types::VcpuCount,
+        sealed_launch: Option<crate::verified_launch::VerifiedLaunch>,
+    ) -> Result<Option<crate::verified_launch::OpenedRuntime>, Status> {
+        self.execution_io(move |store| {
+            // Authentication is a precondition, not an uncertain spawn.
+            let opened = sealed_launch
+                .as_ref()
+                .map(|launch| {
+                    launch
+                        .open()
+                        .map_err(pplx_space_node_runtime_core::launch_admission::admission_refusal)
+                })
+                .transpose()?;
+            let previous = store.cpu_budget(sandbox_id, execution).map_err(|error| {
+                Status::failed_precondition(format!("read CPU launch budget: {error}"))
+            })?;
+            if previous.is_none()
+                && !cgroup::firecracker_is_quiescent(&sandbox_id.to_string()).map_err(|error| {
+                    Status::unavailable(format!("VM occupancy unavailable: {error}"))
+                })?
+            {
+                return Err(Status::failed_precondition(
+                    "cannot establish CPU budget for an unidentified live VM",
+                ));
+            }
+            store
+                .record_cpu_budget(sandbox_id, execution, budget)
+                .map_err(|error| {
+                    Status::failed_precondition(format!("record CPU launch budget: {error}"))
+                })?;
+            Ok(opened)
+        })
+        .await
+    }
+
     async fn launch_firecracker_owned(
         &self,
-        req: LaunchFirecrackerRequest,
+        mut req: LaunchFirecrackerRequest,
         caller: Option<launch::ProcessHandle>,
     ) -> Result<Response<LaunchFirecrackerResponse>, Status> {
+        let sealed_launch = crate::verified_launch::VerifiedLaunch::decode(&mut req)
+            .map_err(pplx_space_node_runtime_core::launch_admission::admission_refusal)?;
+        let accepted_environment_reference = sealed_launch
+            .as_ref()
+            .map(|launch| launch.reference().to_string())
+            .unwrap_or_default();
         let sandbox_id = parse_sandbox_id(&req.sandbox_id)?;
         let launch_key = (sandbox_id, FIRECRACKER_LAUNCH_LOCK.to_string());
         let launch_lock = self.launch_lock(launch_key.clone());
@@ -572,7 +624,7 @@ impl RuntimeSupervisorService {
                     "runtime supervisor found live firecracker"
                 );
                 self.apply_firecracker_cgroup_fixups(sandbox_id, pid).await;
-                return Ok(Response::new(LaunchFirecrackerResponse { pid }));
+                return Ok(Response::new(LaunchFirecrackerResponse { pid, accepted_environment_reference: accepted_environment_reference.clone() }));
             }
             if let Some(pid) = live_firecracker_pidfile(&sandbox_id, &req.chroot_base_dir)? {
                 write_pid_symlink(&sandbox_id, "fc.pid", pid)?;
@@ -583,7 +635,7 @@ impl RuntimeSupervisorService {
                     "runtime supervisor recovered firecracker pid"
                 );
                 self.apply_firecracker_cgroup_fixups(sandbox_id, pid).await;
-                return Ok(Response::new(LaunchFirecrackerResponse { pid }));
+                return Ok(Response::new(LaunchFirecrackerResponse { pid, accepted_environment_reference: accepted_environment_reference.clone() }));
             }
             let launch_sandbox_id = sandbox_id;
             let cgroup_limits = req
@@ -600,24 +652,16 @@ impl RuntimeSupervisorService {
             let budget = cgroup_limits.cpu_budget().map_err(cgroup_update_error_to_status)?;
             // Existing-PID recovery returns above without inventing launch evidence.
             // Publish before spawn and retain it if launch completion is uncertain.
-            self.execution_io(move |store| {
-                let previous = store.cpu_budget(sandbox_id, execution)
-                    .map_err(|error| Status::failed_precondition(format!("read CPU launch budget: {error}")))?;
-                if previous.is_none() && !cgroup::firecracker_is_quiescent(&sandbox_id.to_string())
-                    .map_err(|error| Status::unavailable(format!("VM occupancy unavailable: {error}")))?
-                {
-                    return Err(Status::failed_precondition("cannot establish CPU budget for an unidentified live VM"));
-                }
-                store.record_cpu_budget(sandbox_id, execution, budget)
-                    .map_err(|error| Status::failed_precondition(format!("record CPU launch budget: {error}")))
-            }).await?;
+            let opened = self.prepare_firecracker_launch(
+                sandbox_id, execution, budget, sealed_launch,
+            ).await?;
             let blocking_slot = self.acquire_blocking_slot().await?;
             let launch_result = tokio::task::spawn_blocking(move || {
                 let _blocking_slot = blocking_slot;
                 launch::launch_via_jailer(launch::JailerLaunch {
                     sandbox_id: &launch_sandbox_id.to_string(),
-                    jailer_bin: &req.jailer_bin,
-                    firecracker_bin: &req.firecracker_bin,
+                    jailer: opened.as_ref().map_or(launch::JailerExecutable::LegacyPath(&req.jailer_bin), |files| launch::JailerExecutable::Sealed(&files.jailer)),
+                    firecracker_bin: opened.as_ref().map_or(req.firecracker_bin.as_str(), |files| files.firecracker_path.as_str()),
                     chroot_base_dir: &req.chroot_base_dir,
                     ns_path: &req.ns_path,
                     uid: req.uid,
@@ -668,7 +712,7 @@ impl RuntimeSupervisorService {
                 "runtime supervisor launched firecracker"
             );
 
-            Ok(Response::new(LaunchFirecrackerResponse { pid }))
+            Ok(Response::new(LaunchFirecrackerResponse { pid, accepted_environment_reference: accepted_environment_reference.clone() }))
         }
         .await;
         drop(runtime_guard);

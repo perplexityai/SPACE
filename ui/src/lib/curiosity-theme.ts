@@ -3,20 +3,37 @@ import type { ThemeConfig } from 'antd';
 
 type Tokens = NonNullable<ThemeConfig['token']>;
 
+// Curiosity subtly adjusts accent, status, and neutral hues.
 const palettes = {
   light: {
-    page: '#fbfbfb', surface: '#ffffff', sidebar: '#e9eded', text: '#0b2833',
-    accent: '#016a71', accentHover: '#0c4f54', accentActive: '#0f3639',
-    success: '#016b1d', warning: '#97431a', error: '#a23544',
-    blue: '#006495', purple: '#7a3abb', indigo: '#3053b3', gold: '#825503',
-    fill: '#1c1c1c', mutedOpacity: 0.75, borderOpacity: 0.15, fillOpacity: 0.035,
+    page: '#f8fafb', surface: '#fdfefe', sidebar: '#e8edf0', text: '#172b39',
+    accent: '#007aa6', accentHover: '#006083', accentActive: '#004764', accentText: '#006a92',
+    status: {
+      Success: ['#007748', '#007748'], Warning: ['#a23423', '#a23423'],
+      Error: ['#ae1654', '#ae1654'], Info: ['#006f99', '#006f99'],
+    },
+    tags: {
+      blue: ['#0061b0', '#0061b0'], geekblue: ['#0060b6', '#0060b6'],
+      purple: ['#6741c8', '#6741c8'], gold: ['#7c5c00', '#7c5c00'],
+      green: ['#006f43', '#006f43'], orange: ['#a13625', '#a13625'],
+      red: ['#ae1754', '#ae1754'], cyan: ['#0e6589', '#0e6589'],
+    },
+    fill: '#1d2530', mutedOpacity: 0.75, borderOpacity: 0.15, fillOpacity: 0.035,
   },
   dark: {
-    page: '#161616', surface: '#1d1d1d', sidebar: '#111111', text: '#dedede',
-    accent: '#4e99a3', accentHover: '#22808c', accentActive: '#1a636c',
-    success: '#539e55', warning: '#d57141', error: '#dc6973',
-    blue: '#5691c7', purple: '#a96ee0', indigo: '#7989e7', gold: '#bc811e',
-    fill: '#dedede', mutedOpacity: 0.65, borderOpacity: 0.14, fillOpacity: 0.03,
+    page: '#151719', surface: '#1c1e21', sidebar: '#101214', text: '#dde0e3',
+    accent: '#00a2e4', accentHover: '#007db3', accentActive: '#0070a1', accentText: '#00a4e5',
+    status: {
+      Success: ['#00b96d', '#00a461'], Warning: ['#e3735c', '#da6b54'],
+      Error: ['#ed658d', '#e45d85'], Info: ['#01a4e6', '#0096d4'],
+    },
+    tags: {
+      blue: ['#6a9df3', '#588bde'], geekblue: ['#699cff', '#5b8ff2'],
+      purple: ['#a888ff', '#9773ef'], gold: ['#c39615', '#b28800'],
+      green: ['#02b46b', '#00a461'], orange: ['#eb7d66', '#d86c56'],
+      red: ['#ef638c', '#e65a85'], cyan: ['#529dc8', '#4a94bf'],
+    },
+    fill: '#dde0e3', mutedOpacity: 0.65, borderOpacity: 0.14, fillOpacity: 0.03,
   },
 } as const;
 
@@ -37,6 +54,7 @@ function composite(background: string, foreground: string, opacity: number) {
 
 export interface CuriosityAppearance {
   config: ThemeConfig;
+  buttonClassName: string;
   primaryColor: string;
   surfaces: { page: string; sidebar: string; sidebarBorder: string };
 }
@@ -77,7 +95,7 @@ export function createCuriosityTheme({
     colorTextSecondary: translucent(palette.text, palette.mutedOpacity),
     colorTextTertiary: translucent(palette.text, 0.5),
     colorTextDisabled: translucent(palette.text, 0.2),
-    colorTextPlaceholder: translucent(palette.text, 0.5),
+    colorTextPlaceholder: translucent(palette.text, palette.mutedOpacity),
     colorTextLightSolid: palette.page,
     colorBorder: border,
     colorBorderSecondary: divider,
@@ -89,7 +107,7 @@ export function createCuriosityTheme({
     colorBgContainerDisabled: fill,
     colorBgTextHover: fill,
     colorBgTextActive: strongerFill,
-    colorBgMask: isDark ? translucent(palette.page, 0.7) : 'rgba(212, 212, 212, 0.7)',
+    colorBgMask: isDark ? translucent(palette.page, 0.7) : 'rgba(211, 216, 222, 0.7)',
     colorPrimary: palette.accent,
     colorPrimaryHover: palette.accentHover,
     colorPrimaryActive: palette.accentActive,
@@ -97,12 +115,12 @@ export function createCuriosityTheme({
     colorPrimaryBgHover: translucent(palette.accent, 0.055),
     colorPrimaryBorder: palette.accent,
     colorPrimaryBorderHover: palette.accentHover,
-    colorPrimaryText: palette.accent,
-    colorPrimaryTextHover: palette.accentHover,
-    colorPrimaryTextActive: palette.accentActive,
-    colorLink: palette.accent,
-    colorLinkHover: palette.accentHover,
-    colorLinkActive: palette.accentActive,
+    colorPrimaryText: palette.accentText,
+    colorPrimaryTextHover: palette.accentText,
+    colorPrimaryTextActive: palette.accentText,
+    colorLink: palette.accentText,
+    colorLinkHover: palette.accentText,
+    colorLinkActive: palette.accentText,
     controlOutline: translucent(palette.accent, 0.2),
     boxShadow: '0 4px 20px rgba(0, 0, 0, 0.1)',
     boxShadowSecondary: '0 4px 20px rgba(0, 0, 0, 0.1)',
@@ -124,28 +142,21 @@ export function createCuriosityTheme({
     for (const key of accentKeys) token[key] = derived[key];
   }
 
-  const statusColors = {
-    Success: palette.success, Warning: palette.warning, Error: palette.error, Info: palette.accent,
-  } as const;
-  for (const [name, color] of Object.entries(statusColors)) {
-    const status = name as keyof typeof statusColors;
+  for (const [name, [color, tint]] of Object.entries(palette.status)) {
+    const status = name as keyof typeof palette.status;
     token[`color${status}`] = color;
     token[`color${status}Text`] = color;
-    token[`color${status}Bg`] = translucent(color, 0.09);
-    token[`color${status}Border`] = color;
+    token[`color${status}Bg`] = translucent(tint, 0.09);
+    token[`color${status}Border`] = tint;
   }
 
   // Numbered Tag palettes are independent of semantic success/error tokens.
-  const tagColors = {
-    blue: palette.blue, geekblue: palette.indigo, purple: palette.purple, gold: palette.gold,
-    green: palette.success, orange: palette.warning, red: palette.error, cyan: palette.accent,
-  } as const;
-  for (const name of Object.keys(tagColors) as (keyof typeof tagColors)[]) {
-    const color = tagColors[name];
+  for (const name of Object.keys(palette.tags) as (keyof typeof palette.tags)[]) {
+    const [color, tint] = palette.tags[name];
     token[name] = color;
-    token[`${name}1`] = translucent(color, name === 'red' || name === 'cyan' ? 0.09 : 0.16);
+    token[`${name}1`] = translucent(tint, name === 'red' || name === 'cyan' ? 0.09 : 0.16);
     token[`${name}2`] = token[`${name}1`];
-    token[`${name}3`] = border;
+    token[`${name}3`] = translucent(tint, palette.borderOpacity);
     token[`${name}6`] = color;
     token[`${name}7`] = color;
     // Legacy and current keys serialize to the same CSS variable in Ant Design 6.
@@ -158,6 +169,7 @@ export function createCuriosityTheme({
   const selectedBackground = token.colorPrimaryBg!;
   return {
     primaryColor: primary,
+    buttonClassName: isDark && !override ? 'curiosity-dark-primary' : '',
     surfaces: { page: palette.page, sidebar: palette.sidebar, sidebarBorder: border },
     config: {
       // Derive dimensions and defaults, then preserve the explicit palette in both modes.
@@ -174,7 +186,7 @@ export function createCuriosityTheme({
         },
         Menu: {
           itemBg: 'transparent', itemSelectedBg: selectedBackground,
-          itemSelectedColor: primary, itemHoverBg: fill, itemBorderRadius: 6, itemHeight: 40,
+          itemSelectedColor: token.colorPrimaryText, itemHoverBg: fill, itemBorderRadius: 6, itemHeight: 40,
         },
         Button: {
           primaryShadow: 'none', defaultShadow: 'none', defaultBg: palette.surface,

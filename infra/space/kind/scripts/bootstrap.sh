@@ -200,6 +200,10 @@ if kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER"; then
   # service, and its sandboxes, in one pod per node; stop rather than run both
   # layouts on a node.
   bash "$KIND_DIR/scripts/check-node-layout.sh" "$KIND_CLUSTER" || exit 1
+  # A database an earlier space-postgres chart initialized (PostgreSQL 16)
+  # cannot start under this chart's PostgreSQL 17; stop with the reset before
+  # the chart is applied rather than wait out its rollout.
+  bash "$KIND_DIR/scripts/check-postgres-data.sh" "$KIND_CLUSTER" || exit 1
 else
   # The sandbox workers and builders boot the SPACE Kind node image, which
   # bakes in the node layer a production node image provides (btrfs
@@ -208,6 +212,9 @@ else
   # local build.
   log "providing the SPACE Kind node image"
   bash "$KIND_DIR/scripts/kind-node-image.sh" ensure >/dev/null
+  # The config mounts an empty containerd directory over each node image's
+  # preloaded add-on images; copy them in so the kubelets do not pull them.
+  bash "$KIND_DIR/scripts/seed-node-containerd.sh" "$SPACE_KIND_CONFIG"
   log "creating kind cluster '$KIND_CLUSTER' from $SPACE_KIND_CONFIG"
   kind create cluster --name "$KIND_CLUSTER" --config "$SPACE_KIND_CONFIG"
 fi
@@ -257,26 +264,18 @@ apply_node_labels() {
 }
 apply_node_labels
 
-# ── Step 3: extended resource — network slots ─────────────────────────────────
+# ── Step 3: network-slot capacity ────────────────────────────────────────────
 # Every sandbox pod requests `space.pplx.net/network-slots: "1"` (set by
-# KubernetesSubstrate::build_sandbox_pod). Without a node advertising
-# capacity, the kube scheduler leaves sandbox pods Pending forever. In prod
-# space-node-ctl patches each Node's status.capacity from node-manager's
-# `network_pool_max_slots`; locally we advertise a static pool.
-log "advertising network-slots capacity on sandbox workers"
-for node in $(kubectl --context "$KCTX" get nodes -l space.pplx.net/node-pool=sandbox -o name); do
-  # JSON-patch `add` on a map key is idempotent. ~1 in the json-pointer is
-  # the escape for `/` inside the key `space.pplx.net/network-slots`.
-  kubectl --context "$KCTX" patch "$node" --subresource=status --type=json \
-    -p '[{"op":"add","path":"/status/capacity/space.pplx.net~1network-slots","value":"100"}]' \
-    >/dev/null || true
-done
+# KubernetesSubstrate::build_sandbox_pod). Each node's space-node-ctl advertises
+# its node-manager's `network_pool_max_slots` on the Node's status.capacity, as
+# on a deployed node (crates/libs/node/ctl/server/src/kubernetes_controller/
+# network_slots.rs). Nothing seeds it here, as nothing does on a deployed node.
 
 # ── Step 4: install the SPACE containerd shim on each sandbox worker ─────────
 # Without this, RuntimeClass `space` (handler: space) is unresolvable and
-# every per-sandbox pod fails to start. install-shim.sh is idempotent: it
-# only builds the shim if needed and only edits containerd config.toml if
-# the runtime stanza isn't already present.
+# every per-sandbox pod fails to start. The node image registers the runtime
+# with containerd; install-shim.sh installs the binary containerd runs for it,
+# and is idempotent: it only builds the shim if needed.
 # Reconcile receivers and owned log collection before changing producers.
 # Local node-side endpoints stay at the Kind profiles' fixed ClusterIPs, so
 # already-running exporters can also reconnect after a backend restart.
@@ -285,10 +284,12 @@ bash "$KIND_DIR/scripts/install-observability.sh"
 log "installing containerd-shim-space-v2 on sandbox workers"
 bash "$KIND_DIR/scripts/install-shim.sh"
 
-# ── Step 5: shared manifests (namespace + RuntimeClass) ──────────────────────
-log "applying namespace + RuntimeClass"
+# ── Step 5: shared manifests (namespace, RuntimeClass, PriorityClasses) ──────
+log "applying namespace + RuntimeClass + PriorityClasses"
 kubectl --context "$KCTX" apply -f "$KIND_DIR/manifests/namespace.yaml" >/dev/null
 kubectl --context "$KCTX" apply -f "$KIND_DIR/manifests/runtimeclass.yaml" >/dev/null
+# Before any chart: admission rejects a pod that names a missing class.
+kubectl --context "$KCTX" apply -f "$KIND_DIR/manifests/priorityclasses.yaml" >/dev/null
 
 # Internal RPC TLS: the cluster's CA and the listeners' identities as Secrets,
 # before any workload that mounts them (docs/internal-rpc-tls.md).
@@ -373,8 +374,9 @@ log "waiting for object-store Deployment to be ready"
 kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-object-store --timeout="${TIMEOUT}s"
 
 # Redis — shared store for the API rate limiters (cluster activation admission
-# + per-client concurrency). Idle unless SPACE_REDIS_URL points at it; the
-# rate-limiter smoke (scripts/tests/smoke-kind-rate-limiters.sh) wires that up.
+# + per-client concurrency), which space-api, space-admin-api and
+# space-cluster-controller reach through SPACE_REDIS_URL. Ready before any of
+# them starts, so the first create meets the limiters, not their fail-open arm.
 helm_apply space "$KIND_DIR/charts/space-redis-local"
 log "waiting for redis Deployment to be ready"
 kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-redis --timeout="${TIMEOUT}s"
@@ -390,9 +392,26 @@ kubectl --context "$KCTX" -n "$NAMESPACE" delete job space-db-migrate --ignore-n
 helm template space "$KIND_DIR/charts/space-api-local" --namespace "$NAMESPACE" \
   ${TELEMETRY_HELM_ARGS[@]+"${TELEMETRY_HELM_ARGS[@]}"} --show-only templates/migrate-job.yaml \
   | kubectl --context "$KCTX" apply -n "$NAMESPACE" --validate=false -f -
+# The Job makes one attempt (backoffLimit 0), so a failure is final: stop on
+# it with the Job's logs instead of waiting out the timeout for a completion
+# that cannot come. Rerunning bootstrap.sh replaces the Job above.
 log "waiting for the space-db-migrate Job (control-plane migrations)"
-kubectl --context "$KCTX" -n "$NAMESPACE" wait --for=condition=complete \
-  job/space-db-migrate --timeout="${TIMEOUT}s" >/dev/null
+migrate_deadline=$((SECONDS + TIMEOUT))
+while :; do
+  migrate_conditions="$(kubectl --context "$KCTX" -n "$NAMESPACE" get job space-db-migrate \
+    -o jsonpath='{range .status.conditions[?(@.status=="True")]}{.type}{" "}{end}')" \
+    || migrate_conditions=""
+  case " $migrate_conditions " in
+    *" Complete "*) break ;;
+    *" Failed "*)
+      kubectl --context "$KCTX" -n "$NAMESPACE" logs job/space-db-migrate \
+        --all-containers --prefix --tail=50 >&2 || true
+      die "the space-db-migrate Job failed; its logs are above"
+      ;;
+  esac
+  (( SECONDS < migrate_deadline )) || die "the space-db-migrate Job did not finish within ${TIMEOUT}s"
+  sleep 2
+done
 
 # api-server. The main container is gated on /readyz, which only turns 200
 # after the K8s pod reflector's initial LIST completes (empty list is fine at

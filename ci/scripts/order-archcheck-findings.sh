@@ -16,16 +16,23 @@
 # this a pull request's own findings can be pushed out by the tree's.
 #
 # The pull request's own findings, in this order, each in report order:
-# - no_new_entries and no_raised_caps findings. archcheck reports these only
-#   for entries that differ from the base branch's copy of
-#   architecture-baseline.toml, by table and key, so they include the
-#   entries of a renamed or split table.
+# - Findings that compare with the base branch: no_new_entries and
+#   no_raised_caps, which archcheck reports only for entries that differ from
+#   the base's copy of architecture-baseline.toml, by table and key, so they
+#   include the entries of a renamed or split table; and
+#   crate_names.policy_changed, which it reports only for differences from the
+#   base's ARCHITECTURE.toml.
 # - Findings in a file the pull request changes, under its old or new name.
-#   archcheck's only other findings in architecture-baseline.toml are stale
-#   entries for files that are gone, so one there is the pull request's when
-#   its entry names a file it changes. An entry's key may be indented and a
-#   basic or literal string; a basic string with an escape JSON lacks (\e,
-#   \U) names no file.
+#   archcheck's other findings in architecture-baseline.toml are stale
+#   entries, and crate_names.no_new findings on [crate_names] entries. One
+#   there is the pull request's when its entry names a file it changes: the
+#   key of a file entry, or, in [crate_names], the Cargo.toml of the member
+#   path the entry maps to. A key or path may be indented and a basic or
+#   literal string; a basic string with an escape JSON lacks (\e, \U) names
+#   no file.
+#
+# Required (ERROR) findings are ordered too, but the workflow annotates them
+# from archcheck's own report, in a run of their own that fails the job.
 #
 # reviewdog's -filter-mode=file keeps findings in files whose diff has a
 # +++ line: those with changes, under their new name. A pure rename, a mode
@@ -53,14 +60,26 @@ jq --arg baseline "${baseline}" --arg own "${own}" --arg q "'" \
     [$pages[][]] as $listed
     | ([$listed[] | .filename, .previous_filename // empty] | INDEX(.)) as $files
     | ([$listed[] | select(.changes > 0) | .filename] | INDEX(.)) as $diffed
-    | def entry_path:
-        capture("^\\s*(?:\"(?<basic>(?:[^\"\\\\]|\\\\.)*)\"|\($q)(?<literal>[^\($q)]*)\($q))\\s*=")
-        | if .basic != null then (try ("\"" + .basic + "\"" | fromjson) catch null) else .literal end;
-      ([$head_baseline | split("\n") | to_entries[]
-          | select([.value | entry_path | select(. != null and $files[.] != null)] | length > 0)
-          | .key + 1 | tostring]
+    | def string_value:
+        if .basic != null then (try ("\"" + .basic + "\"" | fromjson) catch null) else .literal end;
+      def quoted: "(?:\"(?<basic>(?:[^\"\\\\]|\\\\.)*)\"|\($q)(?<literal>[^\($q)]*)\($q))";
+      def entry_path: capture("^\\s*\(quoted)\\s*=") | string_value;
+      # The Cargo.toml of the member path a [crate_names] entry maps to.
+      def member_manifest:
+        capture("^[^=]+=\\s*\(quoted)\\s*(?:#.*)?$") | string_value
+        | select(. != null) | if . == "" then "Cargo.toml" else . + "/Cargo.toml" end;
+      def table_header: capture("^\\s*\\[\\s*(?<name>[^\\]\\s]+)\\s*\\]\\s*(?:#.*)?$").name;
+      ([foreach ($head_baseline | split("\n") | to_entries[]) as $line (null;
+          first($line.value | table_header) // .;
+          {table: ., number: ($line.key + 1), text: $line.value})
+          | select(.table as $table
+              | [.text | if $table == "crate_names" then member_manifest else entry_path end
+                  | select(. != null and $files[.] != null)]
+              | length > 0)
+          | .number | tostring]
         | INDEX(.)) as $named_lines
-    | def compares_with_base: (.code.value // "") | test("\\.(no_new_entries|no_raised_caps)$");
+    | def compares_with_base:
+        (.code.value // "") | test("\\.(no_new_entries|no_raised_caps)$|^crate_names\\.policy_changed$");
       def own:
         compares_with_base
         or if .location.path == $baseline then $named_lines[.location.range.start.line // 0 | tostring] != null

@@ -1,0 +1,17 @@
+# A voluntary eviction takes at most one of the two replicas at a time, as
+# deployments budget the controller, so the Lease always has a standby or a
+# holder to hand over to.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ .Release.Name }}-cluster-controller
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: space-cluster-controller
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: space-cluster-controller
+      app.kubernetes.io/instance: {{ .Release.Name }}

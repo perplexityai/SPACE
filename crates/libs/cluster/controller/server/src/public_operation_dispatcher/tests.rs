@@ -2,6 +2,7 @@ use pplx_space_common_core::types::OrgId;
 use pplx_space_common_core::types::UserId;
 
 use super::*;
+use pplx_space_api::public_operations::{ApiProduct, CompleteClaimedPublicOperation};
 use pplx_space_api::public_sandbox_operations::CreateSandboxOperationPayload;
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{RuntimeKind, TemplateId, TemplateReference};
@@ -693,9 +694,9 @@ async fn native_executor_requeues_create_when_cluster_admission_rejects() -> Tes
     };
     // Direct is only a placeholder: admission sees zero eligible nodes, as it would
     // from a synced, empty Kubernetes node cache, and rejects before any create.
-    let substrate = Substrate::Direct(Box::new(
+    let substrate = Substrate::from_direct(
         pplx_space_api::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),
-    ));
+    );
     let executor = NativePublicOperationExecutor::with_cluster_admission(
         db.pool.clone(),
         substrate.clone(),
@@ -806,9 +807,9 @@ async fn native_executor_persists_operator_policy_on_update_and_template_reset()
         .execute(&db.pool)
         .await?;
         // Direct is only a placeholder here: this test never reaches the substrate.
-        let substrate = Substrate::Direct(Box::new(
+        let substrate = Substrate::from_direct(
             pplx_space_api::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),
-        ));
+        );
         let executor = NativePublicOperationExecutor::with_cluster_admission(
             db.pool.clone(),
             substrate.clone(),

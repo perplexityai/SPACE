@@ -465,6 +465,12 @@ pub struct SnapshotUploadJobs {
     /// after all VM jobs, and persist that handle before finalization.
     #[serde(default)]
     pub deferred_metadata: bool,
+    /// Execution generation of the runtime whose teardown or node-local
+    /// suspend captured this artifact, sent with `BeginArtifactBackup` so the
+    /// control plane can refuse a runtime it has superseded. Absent for backups that aren't bound
+    /// to one execution, and in payloads persisted before the fence existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
 }
 
 struct MetadataStagingDirGuard {
@@ -941,6 +947,7 @@ pub(crate) fn prepare_suspend_snapshot(
         metadata_staging_dir: metadata_staging_guard.disarm(),
         includes_metadata_job: true,
         deferred_metadata,
+        execution_generation: None,
     })
 }
 

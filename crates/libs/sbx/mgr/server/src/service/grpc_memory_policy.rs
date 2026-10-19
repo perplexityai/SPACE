@@ -18,7 +18,7 @@ impl SandboxManagerService {
         }
 
         let resolved = self
-            .resolve_sandbox_memory_policy_for_request(requested_memory_mib)
+            .resolve_sandbox_memory_policy_for_request(requested_memory_mib, request.metadata())
             .await?;
         Ok(Response::new(ResolveSandboxMemoryResponse {
             requested_memory_mib: resolved.requested_memory_mib,

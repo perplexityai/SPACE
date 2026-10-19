@@ -1463,8 +1463,8 @@ impl KubernetesSubstrate {
         //
         // The inner readiness waits clamp to `phase_deadline` so their
         // phase-tagged timeouts (pod_never_ready / proxy_unreachable /
-        // guest_not_ready — what `node_drain.failures{phase}` reports for
-        // evacuation restores) fire before the outer budget swallows them
+        // guest_not_ready — what `node_drain.restore_converging{phase}`
+        // reports for evacuation restores) fire before the outer budget swallows them
         // into a generic phase-less `Timeout`. The backstop sits one phase
         // margin above the caller's requested wait (capped at
         // `CREATE_READY_BUDGET`), so the caller's effective readiness wait

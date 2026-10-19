@@ -6,22 +6,27 @@ tolerates for now are listed in
 [`architecture-baseline.toml`](../../../architecture-baseline.toml).
 
 ```sh
-cargo arch                           # human-readable report
-cargo arch --format rdjson           # reviewdog Diagnostic Format, for CI
-cargo arch --base-baseline <path>    # also compare with the base branch's baseline
-cargo arch --write-baseline          # update the baseline's entries; never adds one
-cargo arch --write-baseline=<table>  # update one table's entries, keeping the others
-cargo arch --root <path>             # check another checkout
+cargo arch                             # human-readable report
+cargo arch --format rdjson             # reviewdog Diagnostic Format, for CI
+cargo arch --base-baseline <path>      # also compare with the base branch's baseline
+cargo arch --base-architecture <path>  # ... and with its ARCHITECTURE.toml
+cargo arch --base-baseline <path> --renames <path>  # ... pairing renamed files with their entries
+cargo arch --write-baseline            # update the baseline's entries; never adds one
+cargo arch --write-baseline=<table>    # update one table's entries, keeping the others
+cargo arch --root <path>               # check another checkout
 ```
 
 Without `--root`, it checks the Cargo workspace containing the current
-directory. Exit status: 0 without required findings, 1 with one, 2 for a
-configuration, usage or I/O error.
+directory. The workspace members are the ones `cargo metadata --no-deps
+--offline` reports, run from the root: the root `Cargo.toml`'s `members`, and
+every path dependency inside the workspace, which Cargo makes a member too. If
+`cargo metadata` fails, archcheck exits 2. Exit status: 0 without required
+findings, 1 with one, 2 for a configuration, usage or I/O error.
 
 ## What is checked
 
 - **Production Rust file:** a `.rs` file under `<member>/src/` of a workspace
-  member in the root `Cargo.toml`, except `tests.rs`, `*_tests.rs` and
+  member, except `tests.rs`, `*_tests.rs` and
   anything below a `tests/` directory. Symlinks under `src/` are skipped; a
   member directory or `src` that is itself a symlink is followed. Other files
   may have non-UTF-8 names; a `.rs` file may not (exit 2).
@@ -36,7 +41,8 @@ behaviours:
 
 - `no_crossing`: a file outside the baseline is over the limit;
 - `no_new_entries`: the baseline has an entry that the base branch's copy
-  lacks (a renamed file counts as added);
+  lacks (a renamed file counts as added, unless `--renames` pairs it with
+  its old path; see [Renamed files](#renamed-files));
 - `no_raised_caps`: an entry's cap is higher than in the base branch's copy;
 - `listed_no_growth`: a listed file grew past its cap;
 - `stale_entries`: an entry can be lowered or removed, because its file shrank,
@@ -62,6 +68,7 @@ table:
 ```toml
 [rules.pattern_ratchet.<instance>]
 patterns = ['\bsome_name\b']     # regexes, matched against each code line
+include = ["crates/x/src/**"]  # optional; omitted means all production files
 allow = ["crates/x/src/owner.rs", "crates/x/src/owner/**"]
 
 [rules.pattern_ratchet.<instance>.no_crossing]
@@ -69,6 +76,10 @@ mode = "advisory"
 # ...and no_new_entries, no_raised_caps, listed_no_growth and stale_entries,
 # as for file_size
 ```
+
+Only production files matching `include` are measured when it is present; an
+empty list measures none. `allow` exempts files within that scope. Existing
+instances without `include` retain their repository-wide scope.
 
 It counts mentions, not uses. A code line matches if any pattern matches
 anywhere in it, so a string literal, an error message, a log line or a
@@ -90,7 +101,8 @@ repository-relative paths: `*` and `?` stay within one path component and
 - `no_crossing`: a file outside the allowed paths and the instance's baseline
   table has a matching line;
 - `no_new_entries`: the instance's table has an entry that the base branch's
-  copy of that table lacks (a renamed file counts as added);
+  copy of that table lacks (a renamed file counts as added, unless
+  `--renames` pairs it with its old path);
 - `no_raised_caps`: an entry's cap is higher than in the base branch's copy
   of the table;
 - `listed_no_growth`: a listed file has more matching lines than its cap;
@@ -129,15 +141,129 @@ code changes:
    entry, since the base branch's copy has no table for the instance: that is
    expected for a deliberate new instance.
 
+### Renamed files
+
+A file the pull request renames keeps its entry: under `[file_size]` and in
+every `[pattern_ratchet.<instance>]` table, an entry whose path the base
+branch's copy lacks is compared with the entry of the path it was renamed
+from, so moving the entry to the new path is not a new entry, and at or
+below the old cap not a raised one. Above it, `no_raised_caps` reports
+`<new>: renamed from <old>, with cap raised from <old cap> to <cap> …`.
+
+The renames are git's, given with `--renames <path>`: the output of `git
+diff -z --name-status --find-renames <base> HEAD`, which CI passes (see
+[In CI](#in-ci)). Only renames (`R` records) count: a copy keeps its source,
+and other records, and renames of paths that are not UTF-8, are ignored.
+Input that is not that output, such as the same diff without `-z`, output cut
+off before its last NUL, or a path in two renames, exits 2, as does
+`--renames` without `--base-baseline` or with `--write-baseline`. Without the
+flag, a renamed file's entry counts as added.
+
+To check a branch as CI does, before or after committing, compare the base
+with the working tree, which includes renames staged with `git mv` (a file
+moved without `git mv` or `git add` is untracked, and not seen):
+
+```sh
+git show main:architecture-baseline.toml >/tmp/base-baseline.toml
+git diff -z --name-status --find-renames -l20000 main >/tmp/renames
+cargo arch --base-baseline /tmp/base-baseline.toml --renames /tmp/renames
+```
+
+`-l20000` raises git's limit on inexact rename detection from
+`diff.renameLimit`; past it, git skips the detection with only a warning on
+stderr, and renamed entries count as new.
+
+archcheck does not pair a gone entry with a new one whose cap fits, which
+would let an unrelated new file over the limit take over a deleted file's
+entry: git pairs a deleted file with an added one only when their contents
+are similar (by default, half), so a file deleted and an unrelated one added
+are still a new entry. A rename git does not detect, such as one that also
+rewrites most of the file, is reported as new too.
+
+A renamed file without an entry is reported as a `no_crossing` on its new
+path, and an old entry left behind as stale. With `--renames`, the
+`no_crossing` finding says so: `It was renamed from <old>: move that entry in
+<table> to the new path, at or below <old>'s cap of <cap> in the base
+branch's copy.` while the baseline lists the old path, or, once the entry is
+gone, as after `--write-baseline`, `It was renamed from <old>: give it an
+entry in <table> at or below <old>'s cap of <cap> in the base branch's
+copy.` The cap is the one the new entry would be compared with: the new
+path's own (`its cap`), if the base copy lists it, or the old path's. A file
+that was not renamed gets no rename advice, nor does one renamed from a path
+the baseline does not list when the base copy has no cap for it. Without
+`--renames`, every `no_crossing` finding ends with `If the file was renamed,
+move its entry in <table> to the new path; with --renames, no_new_entries
+accepts the moved entry at or below its old cap.`
+
+## Crate names
+
+`crate_names` keeps new crates from getting catch-all names. For each
+workspace member, it lowercases the package name and the library target's
+name (from `[lib] name`, or Cargo's default from the package name) and splits
+them on `-` and `_`. The crate matches if a part of either is in
+`banned_tokens`: `common`, `shared`, `util`, `utils`, `helper`, `helpers`,
+`misc` and `core`. Only whole parts match, so `pplx-space-common-io`,
+`foo_core` and a library named `utils` do, and `database`, `coreutils` and
+`encore` don't. An empty token list, or a token that is empty, uppercase or
+contains `-` or `_`, can't match anything and exits 2.
+
+`allow` lists exact package names exempt from the rule, such as a
+`pplx-space-shared-memory` whose `shared` is not a catch-all. It starts empty.
+Its names must be lowercase and listed once, and a name both allowed and in the
+baseline exits 2.
+
+The baseline's `[crate_names]` table maps each tolerated crate's package name
+to its member path. An entry covers only the crate at that path: a crate with a
+listed name at another path is reported, until the entry's path is updated,
+so a listed crate that moves needs a one-line baseline edit, and a removed
+crate's name can't be reused elsewhere.
+
+- `no_new` (required): a matching crate the baseline doesn't list at its path,
+  shown on the `name =` line of its `Cargo.toml` (or the `[lib] name` line, if
+  only the library's name matches); and an entry a pull request may not list,
+  shown on the entry's line, so it can't list its own new crate. With
+  `--base-baseline`, entries are compared with the base branch's
+  `[crate_names]`: an entry whose name it lacks is reported, and updating the
+  path of an existing entry is not. Without a copy of that table, because the
+  base predates the rule or wasn't given, only the 16 crates that matched when
+  the rule was added (`BOOTSTRAP` in `src/rules/crate_names.rs`) may be
+  listed. A table that doesn't parse counts as empty, with a warning, as does
+  a copy that isn't TOML at all, under the one warning for that copy.
+- `stale_entries` (advisory): an entry whose crate is gone or renamed, or no
+  longer matches; an `allow` name that no workspace member has, or that
+  doesn't match.
+- `policy_changed` (advisory): every difference in `[rules.crate_names]` from
+  the base branch's `ARCHITECTURE.toml`, given with `--base-architecture`: a
+  token added or removed, an `allow` name added or removed, a mode changed,
+  or the whole table new. Each is shown on its line in `ARCHITECTURE.toml`, so
+  a loosened policy is visible in review. That copy is read leniently: other
+  tables and unknown keys are ignored, and one that can't be parsed skips the
+  behaviour with a warning. Without the flag, it is skipped too, and one line
+  after the summary says so.
+
+`--write-baseline` keeps each entry whose crate still matches at the entry's
+path, removes the other entries, and never adds one: it prints `not added: …`
+for each matching crate without an entry, and `not updated: …` for an entry
+whose crate is at another path, which it leaves for a deliberate edit. Unlike
+for the other tables, it lists no entries to paste: a hand-added entry fails
+`no_new`. It always writes the `[crate_names]` table, even when empty, after
+the other tables; `--write-baseline=crate_names` updates it alone.
+
+Module names aren't checked. Catch-all modules haven't been appearing in the
+history, a module's reach is limited to its crate, `file_size` already bounds
+how much one can hold, and a check on module names is easy to evade (`util.rs`
+becomes `support.rs`) without changing what the module holds.
+
 ## Configuration and modes
 
 Each behaviour has a `mode`: `advisory` findings are reported, `required` ones
 also fail the check, so behaviours can graduate one at a time. Unknown keys,
 sections or modes, a missing file, bad TOML, an invalid regex, glob or instance
 name, an empty `patterns` list, a baseline table for an instance that is not
-configured, and `members` with globs or with empty, `.` or `..` components
-exit 2. So does a `--base-baseline` that can't be read, or one combined with
-`--write-baseline`.
+configured, and a failing `cargo metadata` exit 2. So does a `--base-baseline`,
+`--renames` or `--base-architecture` that can't be read, or one combined with
+`--write-baseline`, and `--renames` input that is not git's (see [Renamed
+files](#renamed-files)).
 
 ## Baseline
 
@@ -145,15 +271,18 @@ Each table maps a repository-relative path to its cap, the count it had when
 listed: under `[file_size]`, each production file over the limit, with its
 code-line count; under `[pattern_ratchet.<instance>]`, each production file
 outside the instance's allowed paths with a matching line, with its count of
-matching lines. Entries should only be removed or lowered.
+matching lines. `[crate_names]`, written last, maps a package name to its
+member path instead (see [Crate names](#crate-names)). Entries should only be
+removed or lowered.
 
 `cargo arch --write-baseline` rewrites `architecture-baseline.toml` from its
 entries and the tree. An entry still in violation gets its current count as
 its cap: under `[file_size]`, a file still over the limit; under
 `[pattern_ratchet.<instance>]`, a file outside the allowed paths that still has
 a matching line. The other entries are removed. It never adds an entry, or a
-`[pattern_ratchet.<instance>]` table the file lacks (`[file_size]` is always
-written, empty if the file had none). It prints `not added: <path> (N code lines); …` for each
+`[pattern_ratchet.<instance>]` table the file lacks (`[file_size]` and
+`[crate_names]` are always written, empty if the file had none; for
+`[crate_names]`, see [Crate names](#crate-names)). It prints `not added: <path> (N code lines); …` for each
 file over the limit without an entry instead, and `not added: <path> (N code
 lines matching the <instance> patterns); …` for each matching file without
 one, then, after its summary line, the entries they would need, as TOML, one
@@ -168,8 +297,9 @@ caps are written too, and `no_raised_caps` reports each of them. It reads the
 existing file with the strict parser, so a missing or invalid baseline exits 2:
 it can't create one from scratch.
 
-`cargo arch --write-baseline=<table>`, with `<table>` either `file_size` or
-`pattern_ratchet.<instance>` for a configured instance, does the same for that
+`cargo arch --write-baseline=<table>`, with `<table>` `file_size`,
+`crate_names` or `pattern_ratchet.<instance>` for a configured instance, does
+the same for that
 table alone and keeps every other table as the existing baseline has it,
 printing only that table's `not added` lines and entries. Use it when adding
 or changing one rule, so that other tables are left alone. If the file has no
@@ -191,47 +321,75 @@ counted too: check `git status` before `--write-baseline`.
 
 On pull requests, the Rust clippy job in
 [`rust-static-ci.yml`](../../../.github/workflows/rust-static-ci.yml) runs
-`cargo arch --format rdjson --base-baseline <file>` and passes the findings to
+`cargo arch --format rdjson --base-baseline <file> --renames <file>
+--base-architecture <file>` and passes the findings to
 [reviewdog](https://github.com/reviewdog/reviewdog) with
-`-reporter=github-pr-annotations`. The file is the baseline of the synthetic
-merge's first parent, the base branch, or an empty file if the base has none.
-If the base can't be resolved, the step warns and runs without the flag. Each
-finding is a diagnostic with code `<rule>.<behaviour>`, or
-`<rule>.<instance>.<behaviour>` for a rule with instances, on line 1 of its
-file, with the path exactly as it is. A new entry, a raised cap, and a stale
-entry for a deleted file point at the entry's line in the baseline instead.
+`-reporter=github-pr-annotations`. The files are the baseline and
+`ARCHITECTURE.toml` of the synthetic merge's first parent, the base branch, or
+an empty file for one the base lacks, and the renames git detects from that
+base to the merge (`git diff -z --name-status --find-renames -l20000
+--diff-filter=R`). If git can't list them, the step warns and runs without
+`--renames`, so a moved entry counts as new; so does a rename git does not
+detect. If git skips rename detection because more files were added and
+deleted than `-l` allows, the step turns git's warning into a workflow
+warning, and moved entries count as new too. If the base can't be resolved,
+the step warns and runs without any of the flags: the `no_new_entries` and
+`no_raised_caps` behaviours and `crate_names.policy_changed` are skipped, and
+`crate_names.no_new` allows only the bootstrap entries. Each finding is a
+diagnostic with code `<rule>.<behaviour>`, or `<rule>.<instance>.<behaviour>`
+for a rule with instances, on line 1 of its file, with the path exactly as it
+is. A new catch-all crate points at the `name =` line of its `Cargo.toml`
+instead, and a new entry, a raised cap, a stale entry for a deleted file and a
+stale `[crate_names]` entry at the entry's line in the baseline.
 `pattern_ratchet`'s `no_crossing`, `listed_no_growth` and shrank
 `stale_entries` findings point at the file's first matching line; one for a
 file with no matches left, at its line 1. Required findings are `ERROR`,
 advisory ones `WARNING`.
 
-- `-filter-mode=file` reports findings in the files the pull request changes,
-  so one on a line of the baseline shows only when the baseline changes.
-- `-filter-mode=nofilter` reports every finding when the pull request changes
-  `ARCHITECTURE.toml`, the baseline, the root `Cargo.toml` or anything under
-  `crates/tools/archcheck/` (by old or new name), or when its file list can't
-  be read in full.
+- `-filter-mode=file` reports advisory findings in the files the pull request
+  changes, so one on a line of the baseline shows only when the baseline
+  changes.
+- `-filter-mode=nofilter` reports every advisory finding when the pull request
+  changes `ARCHITECTURE.toml`, the baseline, the root `Cargo.toml` or anything
+  under `crates/tools/archcheck/` (by old or new name), or when its file list
+  can't be read in full.
 - reviewdog fails once it has written 10 annotations, whatever their severity.
   So advisory findings get one run that never fails the step, and required
-  findings a second run with `-fail-level=error` that does.
+  findings a second run with `-fail-level=error` that does. That run always
+  uses `nofilter`: with `file`, a required finding on a file renamed without
+  edits, or on a baseline line the pull request leaves alone, such as a
+  deleted file's stale entry, would be dropped and the job would pass. A
+  required finding already on the base branch fails it too, as
+  `tests/repository.rs` fails every pull request's tests then.
 - GitHub shows a step's first 10 warning annotations, and the report lists
   every `file_size` finding first. So
   [`order-archcheck-findings.sh`](../../../ci/scripts/order-archcheck-findings.sh)
-  hands the advisory run the pull request's own findings first, then the
-  rest. First come all `no_new_entries` and `no_raised_caps` findings: they
-  compare with the base's copy by table and key, so they include the entries
-  of a renamed or split pattern table even though those lines are unchanged.
+  hands the advisory run the pull request's own findings first, then the rest.
+  First come all `no_new_entries` and `no_raised_caps` findings: they compare
+  with the base's copy by table and key, so they include the entries of a
+  renamed or split pattern table even though those lines are unchanged.
+  `crate_names.policy_changed` findings, which compare with the base's
+  `ARCHITECTURE.toml`, come with them, although the report lists them last.
   Then come findings in the files the pull request changes (old or new name),
   and stale entries in the baseline for files it changes, such as files it
-  deletes. Each group keeps report order. With `file`, this changes nothing
-  that is shown. The step logs how many own advisory findings reviewdog will
-  show under the step's filter mode (with `file`, none in a file renamed
-  without edits); with more than 10, it says in the step summary that at
-  most 10 are annotated. Annotations are not the full inventory: every
-  finding is in the step's log and its rdjson output, or run `cargo arch`.
+  deletes, or, in `[crate_names]`, for a crate whose `Cargo.toml` it changes,
+  at the entry's member path. Each group keeps report order. With `file`, this
+  changes nothing that is shown. Required findings are annotated from the
+  report as it is, in their own run, in every file. The step logs how many own
+  advisory findings reviewdog will show under the step's filter mode (with
+  `file`, none in a file renamed without edits); with more than 10, it says in
+  the step summary that at most 10 are annotated. Annotations are not the full
+  inventory: every finding is in the step's log and its rdjson output, or run
+  `cargo arch`.
 
-Only annotations are filtered. Once a behaviour is `required`,
-`tests/repository.rs` fails on any required finding anywhere in the tree.
+A required finding, such as a new catch-all crate's on its own `Cargo.toml`,
+is annotated wherever it is, and its `ERROR` fails the job, including for a
+listed crate that is only a path dependency, moved without editing its
+manifest.
+
+Only advisory annotations are filtered. Once a behaviour is `required`,
+`tests/repository.rs` also fails on any required finding anywhere in the
+tree.
 
 ## Adding a rule
 
@@ -241,15 +399,15 @@ above). For a new kind of check:
 1. Add a module under `src/rules/`. A rule that caps a count per file in a
    baseline table, as both rules do, implements `CountRule`
    (`src/rules/ratchet.rs`): one `CountRatchet` per table, whose `measure`
-   gives a violating file's count and the line findings about it point at,
-   and whose wording the findings and `not added` lines are built from. The
-   five behaviours, finding locations, the comparisons with the base
-   branch's copy, the skip lines, and `--write-baseline` (update or remove,
+   gives a violating file's count and the line findings about it point at, and
+   whose wording the findings and `not added` lines are built from. The five
+   behaviours, finding locations, the comparisons with the base branch's copy,
+   renamed files, the skip lines, and `--write-baseline` (update or remove,
    never add) come with it. Any other check implements `Rule`; if it has a
    baseline table, it also implements `Rule::tables`, without which the
    baseline's table is rejected as naming no instance, and
-   `Rule::update_baseline`, which never adds an entry; if it compares with
-   the base branch's copy, `Rule::baseline_rule`, `Rule::skipped` and
+   `Rule::update_baseline`, which never adds an entry; if it compares with the
+   base branch's copy, `Rule::baseline_rule`, `Rule::skipped` and
    `Rule::base_comparisons` too: without `Rule::baseline_rule`, a table
    `Baseline::load_base` does not read gets skip lines, not exit 2.
 2. Add its configuration to `RulesConfig` in `src/config.rs`, with one

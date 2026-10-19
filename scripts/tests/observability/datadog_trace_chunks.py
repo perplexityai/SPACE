@@ -29,10 +29,6 @@ from pathlib import Path
 SHIM_SERVICE = "containerd-shim-space-v2"
 SPACE_SERVICES = ("space-", SHIM_SERVICE)
 ENTRY_KINDS = ("server", "consumer")
-# Entry points parented on remote context that are not server or consumer
-# spans, by (service, span name). The shim's create span is parented on the
-# context its pod's annotations carry.
-REMOTE_PARENTED_ENTRIES = {(SHIM_SERVICE, "shim.create")}
 EXAMPLES = 20
 
 
@@ -74,9 +70,7 @@ def span(buf, container):
     # The Rust services stamp host and PID; a container identifies the rest.
     s["process"] = (s["service"], s["meta"].get("service.instance.id") or container)
     s["label"] = f"{s['service']} {s['operation']} {s['name'][:60]}"
-    s["entry"] = s["meta"].get("span.kind") in ENTRY_KINDS or (
-        (s["service"], s["name"]) in REMOTE_PARENTED_ENTRIES
-    )
+    s["entry"] = s["meta"].get("span.kind") in ENTRY_KINDS
     return s
 
 

@@ -1,16 +1,24 @@
 """The two Redis-backed API rate limiters, proven end to end on a real cluster.
 
-`smoke-kind-rate-limiters.sh` pointed the kind `space-api` at Redis, enabled
-both limiters with low caps in enforce mode, and drove real HTTP traffic at
-them: sequential creates until the cluster activation token bucket answered
+Kind runs both limiters against its Redis by default, as deployments do: the
+charts render `SPACE_REDIS_URL` on the API, admin API and cluster-controller,
+with the activation limiter at the binary defaults and per-client concurrency
+in `observe`. This scenario shrinks the caps and switches per-client
+concurrency to enforce on the public API, then drives real HTTP traffic at
+them: sequential creates until the cluster activation token bucket answers
 429 `Server rate limit:`, concurrent creates and connects for one
-`X-Client-ID` until the per-client concurrency limiter answered 429
-`Per-client rate limit:`, then Redis scaled to zero to show both limiters
-admit when their store is unreachable. This module is that suite in typed
-form: the Deployment env override is a named, captured-and-restored, kind-only
-operation behind one cluster Lease; the Redis fault has its compensation
-armed before dispatch; every sandbox the probes admit carries run metadata
-the teardown kills by. The control surface is [`RateLimiterControl`]; the raw
+`X-Client-ID` until the per-client concurrency limiter answers 429
+`Per-client rate limit:`, Redis scaled to zero to show both limiters admit
+when their store is unreachable, and Redis back to show they enforce again.
+
+The Deployment env override is a named, captured-and-restored, kind-only
+operation behind one cluster Lease, which records the standing env and the
+Redis replica count before either changes and clears each record only once
+its restore succeeded. If this run is killed or a restore fails, the next
+Kind scenario puts back what is recorded before it starts (see
+`KindHarness.repair_orphaned_limiter_faults`). The Redis fault has its
+compensation armed before dispatch; every sandbox the probes admit carries
+run metadata the teardown kills by. The control surface is [`RateLimiterControl`]; the raw
 requests go through [`RateLimitProbe`] so a 429's `Retry-After` survives.
 """
 
@@ -37,9 +45,10 @@ SERVER_LIMIT_MESSAGE = "Server rate limit:"
 PER_CLIENT_LIMIT_MESSAGE = "Per-client rate limit:"
 
 # The env this scenario may write on the public API Deployment, and nothing
-# else. `enable` refuses anything outside it before kubectl runs.
+# else. `enable` refuses anything outside it before kubectl runs. The store's
+# URL is not among them: the chart renders it, and the fail-open half takes
+# the store itself away instead.
 LIMITER_ENV_KEYS: tuple[str, ...] = (
-    "SPACE_REDIS_URL",
     "SPACE_CLUSTER_ACTIVATION_ADMISSION_ENABLED",
     "SPACE_CLUSTER_ACTIVATION_ADMISSION_BURST",
     "SPACE_CLUSTER_ACTIVATION_ADMISSION_REFILL_RPS",
@@ -47,7 +56,7 @@ LIMITER_ENV_KEYS: tuple[str, ...] = (
     "SPACE_API_CLIENT_CONCURRENCY_MAX_PER_CLIENT",
     "SPACE_API_CLIENT_CONCURRENCY_KNOWN_CLIENTS",
 )
-KIND_REDIS_URL = "redis://space-redis:6379"
+REDIS_URL_ENV = "SPACE_REDIS_URL"
 
 
 def is_limiter_rejection(outcome: LimiterProbeOutcome, message: str) -> bool:
@@ -118,12 +127,13 @@ class RateLimiterAssertions:
         cluster_refill_rps: str = "0.1",
         rollout_timeout: float = 240,
     ) -> None:
-        """Point the API at Redis and turn both limiters on in enforce mode.
+        """Shrink both limiters' caps and put per-client concurrency in enforce mode.
 
         The standing values are captured first and restored at scope end (or
         eagerly by `restore_limiters`), so a chart or operator value comes
         back rather than being deleted. The Lease serializes cooperating
-        smokes on the same Deployment.
+        smokes on the same Deployment and records the standing values for a
+        successor if this run dies.
         """
 
         if not (1 <= per_client_cap <= 8 and 1 <= cluster_burst <= 8):
@@ -132,6 +142,12 @@ class RateLimiterAssertions:
         self._template = template
         release = self._control.acquire_public_api_mutation()
         self._release_lease = self._scope.defer("release the public API mutation lease", release)
+        store = self._control.public_api_env((REDIS_URL_ENV,))[REDIS_URL_ENV]
+        self._fixture.verify(
+            bool(store),
+            f"the public API has no {REDIS_URL_ENV}; both limiters would fail open, not enforce",
+        )
+        self._fixture.record("limiter_store", store)
         standing = self._control.public_api_env(LIMITER_ENV_KEYS)
         self._fixture.record("limiter_env_before", dict(standing))
 
@@ -142,9 +158,17 @@ class RateLimiterAssertions:
         self._restore_env = self._scope.defer(
             "restore the public API limiter env", restore, critical=True
         )
+        # Only the public API's copy of the activation caps shrinks. The
+        # cluster-controller's `NativePublicOperationExecutor` consumes the
+        # same bucket at the chart's defaults, and the token-bucket script
+        # refills by each caller's own burst and rate, so a native activation
+        # during the drain would top the bucket up. None runs here: this
+        # scenario sends only ECW requests, which the API admits itself, and
+        # the suite runs one scenario at a time. Overriding the controller
+        # too would add a second Deployment rollout and a second record to
+        # restore for a race the suite cannot produce.
         self._control.set_public_api_env(
             {
-                "SPACE_REDIS_URL": KIND_REDIS_URL,
                 "SPACE_CLUSTER_ACTIVATION_ADMISSION_ENABLED": "true",
                 "SPACE_CLUSTER_ACTIVATION_ADMISSION_BURST": str(cluster_burst),
                 "SPACE_CLUSTER_ACTIVATION_ADMISSION_REFILL_RPS": cluster_refill_rps,
@@ -328,6 +352,30 @@ class RateLimiterAssertions:
             release = self._redis_back
             self._redis_back = None
             release.release()
+
+    def expect_enforcing_again(
+        self, sandbox_id: str, *, callers: int = 20, budget: float = 60
+    ) -> None:
+        """Once the store is back, a connect burst draws a per-client 429 again.
+
+        Connects rather than creates: the slot is reserved before the sandbox
+        is fetched, so the verdict costs no VM boots. The API's pooled
+        connections died with the old pod; the pool replaces them on use, so a
+        first burst may still fail open. Bursts repeat until one is limited or
+        the budget runs out, and the number it took is recorded.
+        """
+
+        deadline = self.now() + budget
+        bursts = 0
+        while True:
+            bursts += 1
+            outcomes = self.burst_connects(sandbox_id, callers)
+            limited = any(is_limiter_rejection(o, PER_CLIENT_LIMIT_MESSAGE) for o in outcomes)
+            if limited or self.now() >= deadline:
+                break
+            time.sleep(2)
+        self._fixture.record("recovery_bursts", bursts)
+        self.expect_per_client_limited(outcomes, label="per_client_after_recovery")
 
     def expect_fail_open(self, outcomes: list[LimiterProbeOutcome]) -> None:
         """With the store down neither limiter may reject; other statuses are not judged."""

@@ -1,3 +1,11 @@
+{{- /* The data plane gives streams cancelled at the drain deadline 5 s to close
+(STREAM_CANCEL_GRACE, crates/libs/data/plane/server/src/drain.rs). */ -}}
+{{- if lt (int .Values.shutdownGraceSeconds) 8 -}}
+{{- fail "shutdownGraceSeconds must be at least 8, the stream-open budget (MIN_SHUTDOWN_GRACE)" -}}
+{{- end -}}
+{{- if le (int .Values.terminationGracePeriodSeconds) (add (int .Values.preStopSleepSeconds) (int .Values.shutdownGraceSeconds) 5) -}}
+{{- fail "terminationGracePeriodSeconds must exceed preStopSleepSeconds + shutdownGraceSeconds + 5" -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -13,6 +21,7 @@ spec:
   {{- else }}
   replicas: 1
   {{- end }}
+  minReadySeconds: {{ .Values.minReadySeconds }}
   selector:
     matchLabels:
       app.kubernetes.io/name: space-data-plane
@@ -42,13 +51,17 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      priorityClassName: {{ .Values.priorityClassName }}
       serviceAccountName: {{ .Release.Name }}-data-plane
-      terminationGracePeriodSeconds: 10
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | int }}
       containers:
         - name: data-plane
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["/space/bin/space-data-plane-svc"]
+          args:
+            - --shutdown-grace-secs
+            - {{ .Values.shutdownGraceSeconds | quote }}
           env:
             - name: SPACE_CLUSTER_API_TOKEN_PATH
               value: "/var/run/space-publication/cluster-api.token"
@@ -58,6 +71,12 @@ spec:
               value: /etc/space-rpc-ca/ca.crt
             - name: SPACE_NODE_API_TLS_SERVER_NAME
               value: space-node-api
+            # The guest bridge's NodeApi credential (SpaceBearerToken::NodeApi,
+            # crates/libs/data/plane/server/src/native/protocol.rs); node-api
+            # admits it by TokenReview and confines it to guest calls. The data
+            # plane never calls WorkerApiInternal.
+            - name: SPACE_NODE_API_TOKEN_PATH
+              value: /var/run/space-auth/node-api.token
             # Datadog tracing — see datadog-agent-local chart.
             {{- include "space-kind-telemetry.env" . | nindent 12 }}
             - name: SPACE_K8S_POD_NAME
@@ -85,6 +104,20 @@ spec:
             - name: http
               containerPort: {{ .Values.service.port }}
               protocol: TCP
+          # Leave the entry Services' endpoints before SIGTERM stops the
+          # listener (values.yaml).
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: {{ .Values.preStopSleepSeconds | int }}
+          # The boot budget (values.yaml). Liveness and readiness start once
+          # it passes.
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: {{ .Values.startupProbe.periodSeconds }}
+            failureThreshold: {{ .Values.startupProbe.failureThreshold }}
           readinessProbe:
             httpGet:
               path: /readyz
@@ -95,7 +128,6 @@ spec:
             httpGet:
               path: /healthz
               port: http
-            initialDelaySeconds: 15
             periodSeconds: 15
           {{- with .Values.resources }}
           resources:
@@ -107,6 +139,9 @@ spec:
               readOnly: true
             - name: publication-token
               mountPath: /var/run/space-publication
+              readOnly: true
+            - name: node-api-token
+              mountPath: /var/run/space-auth
               readOnly: true
       volumes:
         - name: rpc-ca
@@ -121,3 +156,11 @@ spec:
                   path: cluster-api.token
                   audience: space-cluster-api
                   expirationSeconds: 3600
+        - name: node-api-token
+          projected:
+            defaultMode: 0444
+            sources:
+              - serviceAccountToken:
+                  path: node-api.token
+                  audience: space-node-api
+                  expirationSeconds: {{ .Values.nodeApiTokenExpirationSeconds | int }}

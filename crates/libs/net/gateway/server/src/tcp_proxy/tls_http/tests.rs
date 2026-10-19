@@ -159,6 +159,7 @@ async fn credential_provider_with_material(
         supported_http_methods: vec![
             NetworkCredentialHttpMethodV1::Get,
             NetworkCredentialHttpMethodV1::Post,
+            NetworkCredentialHttpMethodV1::Head,
         ],
     }];
     let credentials = material
@@ -209,25 +210,27 @@ async fn network_credentials_replace_only_the_configured_header_and_are_sensitiv
             .is_sensitive()
     );
 
-    let mut request = credential_request(http::Method::POST, "/v1/items?tenant=ignored");
-    request.headers_mut().insert(
-        header::AUTHORIZATION,
-        http::HeaderValue::from_static("Bearer guest-value"),
-    );
-    let mut request = SanitizedRequest::try_from(request).unwrap();
-    let headers = credential_headers(&lease, &request).unwrap();
-    inject(&mut request, headers);
-    assert_eq!(
-        request.headers().get(header::AUTHORIZATION).unwrap(),
-        NETWORK_SECRET
-    );
-    assert!(
-        request
-            .headers()
-            .get(header::AUTHORIZATION)
-            .unwrap()
-            .is_sensitive()
-    );
+    for method in [http::Method::POST, http::Method::HEAD] {
+        let mut request = credential_request(method, "/v1/items?tenant=ignored");
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer guest-value"),
+        );
+        let mut request = SanitizedRequest::try_from(request).unwrap();
+        let headers = credential_headers(&lease, &request).unwrap();
+        inject(&mut request, headers);
+        assert_eq!(
+            request.headers().get(header::AUTHORIZATION).unwrap(),
+            NETWORK_SECRET
+        );
+        assert!(
+            request
+                .headers()
+                .get(header::AUTHORIZATION)
+                .unwrap()
+                .is_sensitive()
+        );
+    }
 
     let (_, custom_header_provider) = credential_provider_for_header(true, "x-api-key").await;
     let custom_header_lease = custom_header_provider
@@ -395,7 +398,7 @@ async fn concurrent_http2_streams_keep_credential_decisions_request_local() {
         .unwrap();
     let binding = HostBinding::new("test", "93.184.216.34:443".parse().unwrap(), state);
     let (origin, origin_peer) = tokio::io::duplex(4096);
-    let (observed_tx, mut observed_rx) = tokio::sync::mpsc::channel(2);
+    let (observed_tx, mut observed_rx) = tokio::sync::mpsc::channel(3);
     let origin_server = tokio::spawn(
         hyper::server::conn::http2::Builder::new(TokioExecutor::new()).serve_connection(
             TokioIo::new(origin_peer),
@@ -415,7 +418,12 @@ async fn concurrent_http2_streams_keep_credential_decisions_request_local() {
                         ))
                         .await
                         .unwrap();
-                    Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                    let body = if request.method() == http::Method::HEAD {
+                        Bytes::new()
+                    } else {
+                        Bytes::from_static(b"ok")
+                    };
+                    Ok::<_, Infallible>(Response::new(Full::new(body)))
                 }
             }),
         ),
@@ -429,24 +437,36 @@ async fn concurrent_http2_streams_keep_credential_decisions_request_local() {
         .await
         .unwrap();
     let client = tokio::spawn(connection);
-    let request = |path, authorization| {
+    let request = |method, path, authorization| {
         Request::builder()
-            .method(http::Method::GET)
+            .method(method)
             .uri(format!("https://allowed.test{path}"))
             .header(header::AUTHORIZATION, authorization)
             .body(Empty::<Bytes>::new())
             .unwrap()
     };
     let mut matching = sender.clone();
+    let mut metadata = sender.clone();
     let mut unmatched = sender;
-    let (matching, unmatched) = tokio::join!(
-        matching.send_request(request("/v1/items", "Bearer matching-guest")),
-        unmatched.send_request(request("/public", "Bearer public-guest")),
+    let (matching, unmatched, metadata) = tokio::join!(
+        matching.send_request(request(
+            http::Method::GET,
+            "/v1/items",
+            "Bearer matching-guest"
+        )),
+        unmatched.send_request(request(http::Method::GET, "/public", "Bearer public-guest")),
+        metadata.send_request(request(
+            http::Method::HEAD,
+            "/v1/metadata",
+            "Bearer metadata-guest"
+        )),
     );
     assert_eq!(matching.unwrap().status(), StatusCode::OK);
     assert_eq!(unmatched.unwrap().status(), StatusCode::OK);
+    assert_eq!(metadata.unwrap().status(), StatusCode::OK);
 
     let mut observed = vec![
+        observed_rx.recv().await.unwrap(),
         observed_rx.recv().await.unwrap(),
         observed_rx.recv().await.unwrap(),
     ];
@@ -456,6 +476,7 @@ async fn concurrent_http2_streams_keep_credential_decisions_request_local() {
         [
             ("/public".to_owned(), "Bearer public-guest".to_owned()),
             ("/v1/items".to_owned(), NETWORK_SECRET.to_owned()),
+            ("/v1/metadata".to_owned(), NETWORK_SECRET.to_owned()),
         ]
     );
     client.abort();

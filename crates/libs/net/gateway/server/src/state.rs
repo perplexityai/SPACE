@@ -441,20 +441,35 @@ impl GatewayNetworkState {
         Ok(use_credentials(credentials))
     }
 
+    /// Spawn the self-hydration loop. Its first pass, the startup pull, runs
+    /// under `startup`, the gateway's startup span, which the loop releases
+    /// after that pass whatever it finds: a gateway an external refresh made
+    /// ready first never pulls under it. Retries and later rehydrations are
+    /// the gateway's own and run under no span.
     pub fn spawn_hydration(
         &self,
         loader: PolicyLoader,
         shutdown_token: CancellationToken,
+        startup: Option<tracing::Span>,
     ) -> tokio::task::JoinHandle<()> {
         let state = self.clone();
         tokio::spawn(async move {
-            state.run_hydration_loop(loader, shutdown_token).await;
+            state
+                .run_hydration_loop(loader, shutdown_token, startup)
+                .await;
         })
     }
 
-    async fn run_hydration_loop(self, loader: PolicyLoader, shutdown_token: CancellationToken) {
+    async fn run_hydration_loop(
+        self,
+        loader: PolicyLoader,
+        shutdown_token: CancellationToken,
+        startup: Option<tracing::Span>,
+    ) {
+        use tracing::Instrument as _;
         let mut retry_delay = INITIAL_HYDRATION_RETRY_INTERVAL;
         let mut attempts = 0_u64;
+        let mut startup = startup;
 
         loop {
             if shutdown_token.is_cancelled() {
@@ -462,6 +477,19 @@ impl GatewayNetworkState {
             }
 
             let snapshot = self.policy_snapshot();
+            // The startup span covers the first pass's pull only. A first
+            // pass that finds the gateway ready, waiting on a newer policy or
+            // stopping drops it here, before it waits.
+            let startup_pass = startup.take().filter(|_| match snapshot.mode {
+                NetworkState::PendingPolicy | NetworkState::Unspecified => true,
+                NetworkState::PolicyError => {
+                    snapshot.last_error_kind != NetworkPolicyErrorKind::PolicyRefMismatch
+                }
+                NetworkState::Ready
+                | NetworkState::NoIdentity
+                | NetworkState::Draining
+                | NetworkState::Stopped => false,
+            });
             match snapshot.mode {
                 NetworkState::Ready => {
                     attempts = 0;
@@ -514,6 +542,7 @@ impl GatewayNetworkState {
             );
             let snapshot = self
                 .refresh(loader.clone(), None, NetworkStateReason::SelfRetry)
+                .instrument(startup_pass.unwrap_or_else(tracing::Span::none))
                 .await;
             if self.policy_snapshot().mode == NetworkState::Ready {
                 attempts = 0;

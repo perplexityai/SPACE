@@ -4,6 +4,53 @@
 
 use super::*;
 
+/// Sidecar metadata of the suspend capture `local_artifact_id`, which this
+/// host takes, so it records this host's CPU as the capture CPU.
+pub(super) fn suspend_artifact_metadata(
+    sandbox: &crate::db::SandboxRow,
+    format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
+    local_artifact_id: LocalArtifactId,
+    encrypted: bool,
+    rootfs_send_source_id: Option<uuid::Uuid>,
+) -> Result<crate::snapshot_upload::SnapshotMeta, Status> {
+    let mut metadata = captured_suspend_snapshot_metadata(sandbox, format)?;
+    metadata.local_artifact_id = Some(local_artifact_id);
+    metadata.artifact_kind = Some(ArtifactKind::Full);
+    metadata.artifact_origin = Some(ArtifactOrigin::Suspend);
+    metadata.encrypted = encrypted;
+    metadata.rootfs_send_source_id = rootfs_send_source_id;
+    Ok(metadata)
+}
+
+/// The execution metadata an artifact backup records. A disk artifact carries
+/// no vCPU state, so it has no capture CPU, whatever its metadata says.
+pub(super) fn artifact_backup_execution(
+    execution: pplx_space_common_core::types::SnapshotExecutionMetadata,
+    artifact_kind: pplx_space_common_core::types::ArtifactKind,
+) -> pplx_space_common_core::types::SnapshotExecutionMetadata {
+    match artifact_kind {
+        pplx_space_common_core::types::ArtifactKind::Full => execution,
+        pplx_space_common_core::types::ArtifactKind::Disk => execution.with_host_cpu(None),
+    }
+}
+
+/// [`suspend_snapshot_metadata`] for a suspend this host just captured. The VM
+/// state was captured here, so this host's CPU is recorded as its capture CPU:
+/// a host with a different CPU may not be able to load the vCPU state.
+pub(super) fn captured_suspend_snapshot_metadata(
+    sandbox: &crate::db::SandboxRow,
+    format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
+) -> Result<crate::snapshot_upload::SnapshotMeta, Status> {
+    let mut metadata = suspend_snapshot_metadata(sandbox, format)?;
+    metadata.execution = metadata.execution.map(|execution| {
+        execution.with_host_cpu(pplx_space_common_core::types::HostCpu::current().cloned())
+    });
+    Ok(metadata)
+}
+
+/// Snapshot metadata built from the sandbox's current state. It records no
+/// capture CPU: a caller rebuilding metadata for an artifact captured earlier
+/// can't know which host captured it.
 pub(super) fn suspend_snapshot_metadata(
     sandbox: &crate::db::SandboxRow,
     format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
@@ -88,6 +135,7 @@ impl SandboxManagerService {
                 } else {
                     ArtifactBackupHandoff::DurableWorker
                 },
+                execution_generation: None,
             },
         )
         .await
@@ -223,6 +271,7 @@ impl SandboxManagerService {
             format,
             dedup_key,
             handoff,
+            execution_generation,
         } = submission;
         let config: &crate::snapshot_upload::SnapshotUploadConfig = match request_override {
             Some(c) => c,
@@ -268,10 +317,11 @@ impl SandboxManagerService {
         // worker may execute after this process exits and must not need to
         // rediscover capture-time execution identity from the replacement
         // host.
-        meta.execution = Some(
+        meta.execution = Some(artifact_backup_execution(
             meta.execution_metadata(host_architecture().map_err(|error| error.to_string())?)
                 .map_err(|error| error.to_string())?,
-        );
+            artifact_kind,
+        ));
 
         // Every backup attempt gets a fresh UUIDv7 identity. It names the
         // per-attempt S3 prefix before any vol-mgr submission; the cluster row is
@@ -296,6 +346,7 @@ impl SandboxManagerService {
             retained,
         )
         .map_err(|error| format!("prepare snapshot upload intent failed: {error}"))?;
+        jobs.execution_generation = execution_generation;
         let mut storage_uri = jobs.storage_uri.clone();
         let local_artifact_id = local_artifact_id.to_string();
 
@@ -405,9 +456,12 @@ impl SandboxManagerService {
             .payload_as::<crate::snapshot_upload::SnapshotUploadJobs>()
             .map_err(|error| format!("decode snapshot-upload job {job_id}: {error}"))?;
         if crate::snapshot_upload_jobs::prepared_upload_requires_begin(&payload) {
-            crate::snapshot_upload_jobs::begin_prepared_upload(&payload)
+            crate::snapshot_upload_jobs::begin_prepared_upload_naming_supersession(&payload)
                 .await
-                .map_err(ArtifactBackupSubmissionError::Begin)?;
+                .map_err(|refusal| ArtifactBackupSubmissionError::Begin {
+                    error: refusal.error,
+                    superseded_generation: refusal.superseded_generation,
+                })?;
         }
         if payload.job_ids.is_empty() {
             match crate::snapshot_upload::submit_prepared_snapshot(&payload, &self.node_manager)
@@ -469,6 +523,30 @@ impl SandboxManagerService {
         Ok(payload)
     }
 
+    /// Hand a node-local suspend's capture to a durable upload, registered
+    /// under the sandbox's Kubernetes execution (see
+    /// [`node_local_registration_generation`]). Any failure, a refusal of a
+    /// superseded execution included, is a backup-fence failure, which rolls
+    /// the suspend back and disarms auto-lifecycle.
+    pub(super) async fn enqueue_node_local_suspend_backup(
+        &self,
+        sandbox: &crate::db::SandboxRow,
+        local_artifact_id: LocalArtifactId,
+        snapshot_dir: &str,
+        format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
+    ) -> Result<SubmitSuspendSnapshotOutcome, Status> {
+        self.enqueue_suspend_artifact_backup(
+            sandbox,
+            local_artifact_id,
+            snapshot_dir,
+            format,
+            None,
+            node_local_registration_generation(sandbox),
+        )
+        .await
+        .map_err(|error| artifact_backup_fence_status(error.to_string()))
+    }
+
     pub(super) async fn enqueue_suspend_artifact_backup(
         &self,
         sandbox: &crate::db::SandboxRow,
@@ -476,6 +554,7 @@ impl SandboxManagerService {
         snapshot_dir: &str,
         format: pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat,
         dedup_key: Option<&str>,
+        registration_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
     ) -> Result<SubmitSuspendSnapshotOutcome, ArtifactBackupSubmissionError> {
         let request_override = match self.resolve_org_snapshot_upload_config(&sandbox.id).await {
             OrgSnapshotConfigResolution::Resolved(config) => Some(config),
@@ -503,6 +582,7 @@ impl SandboxManagerService {
                 format,
                 dedup_key,
                 handoff: ArtifactBackupHandoff::TeardownFence,
+                execution_generation: registration_generation,
             },
         )
         .await

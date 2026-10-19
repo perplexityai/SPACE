@@ -21,7 +21,7 @@ use super::{
 };
 
 // The namespace is read from the pod's service account mount. The override is a
-// test hook for in-process tests and kind, which have no such mount.
+// test hook for in-process tests, which have no such mount.
 const SPACE_K8S_TOKEN_AUTH_NAMESPACE_ENV: &str = "SPACE_K8S_TOKEN_AUTH_NAMESPACE";
 const SPACE_K8S_TOKEN_AUTH_REVIEW_RATE_PER_SEC_ENV: &str =
     "SPACE_K8S_TOKEN_AUTH_REVIEW_RATE_PER_SEC";

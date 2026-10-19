@@ -15,6 +15,15 @@ apiUrl: http://space-api:8080
 # /v1/sessions/* requests so the browser doesn't have to cross origins.
 dataPlaneUrl: http://space-data-plane:8090
 
+# The infra node, with the rest of the control plane: a sandbox worker can be
+# drained and its Node deleted (space-cluster-controller-local's nodeDrain).
+nodeSelector:
+  space.pplx.net/infra: "true"
+
+# Replaceable (infra/space/kind/manifests/priorityclasses.yaml): one stateless
+# replica the harness never depends on.
+priorityClassName: space-replaceable
+
 resources:
   requests:
     cpu: 25m

@@ -44,7 +44,7 @@ const menuItems: DashboardMenuItem[] = [
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
   const { user, org, cluster, loading, logout } = useAuth();
   const { mode, setMode, isDark } = useTheme();
-  const { config, primaryColor, surfaces } = useCuriosityTheme(org?.theme_primary);
+  const { config, buttonClassName, primaryColor, surfaces } = useCuriosityTheme(org?.theme_primary);
   const router = useRouter();
   const pathname = usePathname();
   const [logoutConfirmationOpen, setLogoutConfirmationOpen] = useState(false);
@@ -83,7 +83,7 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
     .sort((a, b) => b.key.length - a.key.length)[0]?.key || '/dashboard';
 
   return (
-    <ConfigProvider theme={config}>
+    <ConfigProvider theme={config} button={{ className: buttonClassName }}>
       <App>
         <Layout style={{ minHeight: '100vh' }}>
           <Sider

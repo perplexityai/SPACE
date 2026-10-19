@@ -27,6 +27,7 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      priorityClassName: {{ .Values.priorityClassName }}
       containers:
         - name: seed-publish
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"

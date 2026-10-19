@@ -32,6 +32,8 @@ message CgroupLimits {
 
 message LaunchFirecrackerRequest {
   string sandbox_id = 1;
+  // Adapter-local source locators. Under verified_runtime these must name the
+  // compiled release layout; they never supply identity or expected digests.
   string jailer_bin = 2;
   string firecracker_bin = 3;
   string chroot_base_dir = 4;
@@ -48,10 +50,34 @@ message LaunchFirecrackerRequest {
   // a regular file at a missing path, so the caller sets this only after it has
   // created the FIFO.
   string fc_metrics_path = 13;
+  // A protected launch carries its identity here and leaves sandbox_id empty.
+  // Old supervisors reject the absent legacy
+  // sandbox_id before acquiring execution ownership or spawning anything.
+  VerifiedRuntimeLaunch verified_runtime = 14;
+}
+
+// Host-neutral admission contract. The environment determines the runtime,
+// host/guest requirements and immutable boot inputs. Host paths and integrity
+// mechanisms are implementation details of the serving execution adapter.
+message VerifiedRuntimeLaunch {
+  string sandbox_id = 1;
+  string environment_reference = 2;
+  ArtifactIntegrityRequirement integrity_requirement = 3;
+}
+
+enum ArtifactIntegrityRequirement {
+  ARTIFACT_INTEGRITY_REQUIREMENT_UNSPECIFIED = 0;
+  // Runtime and immutable boot sources are authenticated against the trusted
+  // environment and protected against content mutation while consumed. This
+  // does not attest mutable guest disks or resistance to host-root compromise.
+  ARTIFACT_INTEGRITY_REQUIREMENT_AUTHENTICATED_IMMUTABLE_SOURCES = 1;
 }
 
 message LaunchFirecrackerResponse {
   uint32 pid = 1;
+  // Acknowledges admission under the requested integrity contract. Empty for
+  // legacy requests; not a retroactive attestation of an adopted running VM.
+  string accepted_environment_reference = 2;
 }
 
 message PreExecSocket {

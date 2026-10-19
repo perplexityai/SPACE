@@ -15,8 +15,11 @@
   namespace, as `src/service/artifact_fs/receive.rs` does. Make that
   namespace a slave, not private, so node-manager's unmounts still reach it.
 - Host tools run through `src/host_command.rs`, and `nft` mutations through
-  `src/firewall.rs`. Exceptions: the startup runtime-supervisor activator
-  (`src/run.rs`) and the non-Linux `src/net/fallback.rs`.
+  `src/firewall.rs`. Use `host_command::Command` for ordinary tools, including
+  the runtime-supervisor activator. Direct `std::process::Command` belongs only
+  in the spawn implementation, pinned receive namespace setup, tests, and the
+  existing non-Linux `src/net/fallback.rs`. Archcheck's
+  `node_manager_commands` ratchet enforces this boundary.
 - Supervisor RPCs replay only failures that provably never executed
   (`src/runtime_supervisor_client.rs`): a `get_or_connect` dial error,
   `is_client_connect_failure` and `is_request_refused_before_transmission`.

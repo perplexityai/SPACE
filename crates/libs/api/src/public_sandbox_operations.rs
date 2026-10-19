@@ -729,7 +729,7 @@ async fn fetch_actor(
     actor.ok_or(CreateSandboxExecutionError::ActorNotFound)
 }
 
-fn create_success_result(
+pub(crate) fn create_success_result(
     sandbox_id: PublicSandboxId,
     lifecycle: SandboxLifecycle,
     progress_message: &'static str,

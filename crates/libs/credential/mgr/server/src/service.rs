@@ -51,13 +51,11 @@ const SPACE_TMPLMGR_ACCOUNT: &str = user_names::SPACE_TMPLMGR;
 // ExchangeToken deliberately excludes root: every issuance needs a service
 // actor that can be carried into the authorization matrix and audit record.
 const ALLOW_EXCHANGE_TOKEN: &[UdsPeerPrincipal] = &[
-    UdsPeerPrincipal::Service(SPACE_SBXMGR_ACCOUNT),
     UdsPeerPrincipal::Service(SPACE_TMPLMGR_ACCOUNT),
     UdsPeerPrincipal::Service(user_names::SPACE_VOLMGR),
 ];
-/// Same callers as `ExchangeToken` for now: sandbox-manager and
-/// template-manager are the two on-node services that own data they
-/// might want to envelope-encrypt.
+/// Data-key permissions are independent of storage token exchange: these
+/// node services handle envelope-encrypted data.
 const ALLOW_ISSUE_DEK: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Root,
     UdsPeerPrincipal::Service(SPACE_SBXMGR_ACCOUNT),
@@ -71,11 +69,9 @@ const ALLOW_UNWRAP_DEK: &[UdsPeerPrincipal] = &[
     UdsPeerPrincipal::Service(user_names::SPACE_VOLMGR),
 ];
 
-/// TCP service identities mirroring the UDS allow-lists above. On the
-/// control-plane deployment vol-mgr presents its own projected ServiceAccount
-/// token (resolved to a `ClientService` via TokenReview) rather than sharing
-/// sandbox-manager's Linux uid, so it appears here explicitly even though it
-/// has no separate UDS principal.
+/// TCP service identities for the corresponding UDS callers. Control-plane
+/// calls authenticate projected ServiceAccount tokens as `ClientService`
+/// identities rather than Linux UIDs.
 ///
 /// The node-local agent ([`crate::proxy`]) is in these lists for a different
 /// reason: it re-originates every node-local caller's RPC under its own

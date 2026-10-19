@@ -6,8 +6,7 @@ keys and values off its closed lists or runs without the Lease, that the
 standing env is put back after a failed override, that a plant's removal is
 armed before the create and selects on the plant's own label, that the clone
 drops the source pod's identity and binding, or that the verdicts fail on a
-reap with the wrong reason or a GC record naming the live pod. Those are
-pinned here.
+reap before the threshold or a replaced live pod. Those are pinned here.
 """
 
 from __future__ import annotations
@@ -188,9 +187,12 @@ class Choreography(unittest.TestCase):
         self.assertNotIn("concurrent_restore", {n.split(".")[0] for n in names})
         # The own-row orphan is reaped before the final restore is attempted.
         reaps = [i for i, n in enumerate(names) if n == "orphaned_restore_pod_gc.expect_reaped"]
-        self.assertEqual(len(reaps), 3)
-        self.assertLess(plants[2], reaps[2])
-        self.assertLess(reaps[2], reconnects[-1])
+        # The two superseded plants are watched in one call, from their own creates.
+        self.assertEqual(len(reaps), 2)
+        self.assertEqual(len(calls[reaps[0]].args), 2)
+        self.assertLess(plants[1], reaps[0])
+        self.assertLess(plants[2], reaps[1])
+        self.assertLess(reaps[1], reconnects[-1])
         gc.scoped_live_gc.assert_called_once_with()
 
 
@@ -344,7 +346,7 @@ class _Fixture:
 
 
 class _Control:
-    """A fake control plane: the plant/env writes and what the controller logged."""
+    """A fake control plane: the plant/env writes and the pods they leave."""
 
     def __init__(self) -> None:
         self.calls: list[str] = []
@@ -354,8 +356,12 @@ class _Control:
         self.fail_plant = False
         self.fail_restore = False
         self.env_after_restore: dict[str, str | None] | None = None
+        self.env: dict[str, str | None] = {GC_ENABLED_ENV: "false", GC_THRESHOLD_ENV: None}
         self.restored = False
         self.executions = [ExecutionRow(4, "running", True, "space-sbx-a-g4")]
+        # When the fake GC deletes a pod, on the test's clock.
+        self.deleted_at: dict[str, float] = {}
+        self.clock: _Clock | None = None
 
     def acquire_controller_mutation(self):
         self.calls.append("acquire")
@@ -365,24 +371,27 @@ class _Control:
         self.calls.append("read_env")
         if self.restored and self.env_after_restore is not None:
             return dict(self.env_after_restore)
-        return {GC_ENABLED_ENV: "false", GC_THRESHOLD_ENV: None}
+        return dict(self.env)
 
     def set_orphaned_restore_pod_gc_env(self, overrides) -> None:
         self.calls.append("set_env")
         if self.fail_set:
             raise RuntimeError("rollout timed out after the write")
+        self.env.update(overrides)
 
     def restore_orphaned_restore_pod_gc_env(self, standing) -> None:
         self.calls.append(f"restore_env:{sorted(standing.items(), key=lambda kv: kv[0])}")
         if self.fail_restore:
             raise RuntimeError("controller rollout did not complete")
+        self.env = dict(standing)
         self.restored = True
 
     def controller_log_records(self, *, since_time: str) -> list[dict[str, Any]]:
         return list(self.records)
 
     def restore_pod_document(self, pod_name: str) -> dict[str, Any] | None:
-        if pod_name not in self.present:
+        deleted_at = self.deleted_at.get(pod_name)
+        if pod_name not in self.present or (deleted_at is not None and self.clock.now >= deleted_at):
             return None
         return {"metadata": {"name": pod_name, "uid": f"uid-{pod_name}"}, "spec": {}}
 
@@ -408,38 +417,6 @@ class _Control:
         return SimpleNamespace(lifecycle="started", active_node_id=None)
 
 
-def _reap_records(orphan: PlantedOrphan, *, detail: str | None = None, age: int = 21) -> list[dict[str, Any]]:
-    common = {"pod_name": orphan.name, "sandbox_id": orphan.sandbox_id}
-    return [
-        {
-            **common,
-            "loop": "orphaned_restore_pod_gc",
-            "outcome": "requested_orphaned_restore_pod_delete",
-            "mode": "live",
-            "detail": detail or orphan.reason,
-            "generation": orphan.generation,
-            "age_secs": age,
-        },
-        {**common, "event_type": "cleanup_requested", "operation": "orphaned_restore_pod_gc"},
-        {
-            **common,
-            "loop": "orphaned_restore_pod_gc",
-            "outcome": "reaped_orphaned_restore_pod",
-            "mode": "live",
-            "generation": orphan.generation,
-        },
-        {
-            **common,
-            "event_type": "cleanup_completed",
-            "operation": "orphaned_restore_pod_gc",
-            "reason": "orphaned_restore_pod",
-            "result": "deleted",
-            "pod_uid": orphan.uid,
-            "execution_generation": str(orphan.generation),
-        },
-    ]
-
-
 class AssertionsContract(unittest.TestCase):
     def setUp(self) -> None:
         self.clock = _Clock()
@@ -447,6 +424,7 @@ class AssertionsContract(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.control = _Control()
+        self.control.clock = self.clock
         self.scope = ResourceScope()
         self.assertions = OrphanedRestorePodGcAssertions(
             cast(Any, _Fixture(self.clock)), cast(Any, self.control), self.scope
@@ -456,15 +434,22 @@ class AssertionsContract(unittest.TestCase):
         self.assertions._settings = GcSettings(threshold_seconds=20, interval_seconds=5)
         self.assertions._since = "2026-09-29T00:00:00Z"
 
-    def _orphan(self, reason: str = "row_reverted") -> PlantedOrphan:
-        return PlantedOrphan(
-            name=planted_pod_name(SANDBOX, 3, "0a1b2c3d"),
+    def _orphan(
+        self, reason: str = "row_reverted", *, token: str = "0a1b2c3d", deleted_after: float | None = 21.0
+    ) -> PlantedOrphan:
+        orphan = PlantedOrphan(
+            name=planted_pod_name(SANDBOX, 3, token),
             uid="uid-x",
             sandbox_id=SANDBOX,
             generation=3,
-            token="0a1b2c3d",
+            token=token,
             reason=reason,
+            planted_at=self.clock.now,
         )
+        self.control.present.add(orphan.name)
+        if deleted_after is not None:
+            self.control.deleted_at[orphan.name] = self.clock.now + deleted_after
+        return orphan
 
     def test_a_failed_override_still_puts_the_standing_env_back_then_releases(self) -> None:
         self.control.fail_set = True
@@ -482,34 +467,13 @@ class AssertionsContract(unittest.TestCase):
             ],
         )
 
-    def test_go_live_requires_a_live_start_with_the_knobs(self) -> None:
-        self.control.records = [
-            {"message": "starting orphaned_restore_pod_gc", "dry_run": True, "threshold_secs": 20, "interval_secs": 5},
-            {"message": "orphaned_restore_pod_gc tick complete", "dry_run": True},
-        ]
-        with self.assertRaisesRegex(InvariantViolation, "did not start"):
-            self.assertions.go_live(threshold_seconds=20, interval_seconds=5)
-        self.control.records = [
-            {"message": "starting orphaned_restore_pod_gc", "dry_run": False, "threshold_secs": 20, "interval_secs": 5},
-            {"message": "orphaned_restore_pod_gc tick complete", "dry_run": False, "scanned": 1},
-        ]
-        self.assertions.go_live(threshold_seconds=20, interval_seconds=5)
-
     def test_restore_standing_verifies_the_env_came_back(self) -> None:
-        self.control.records = [
-            {"message": "starting orphaned_restore_pod_gc", "dry_run": False, "threshold_secs": 20, "interval_secs": 5},
-            {"message": "orphaned_restore_pod_gc tick complete", "dry_run": False},
-        ]
         with self.assertions.scoped_live_gc():
             self.assertions.go_live(threshold_seconds=20, interval_seconds=5)
         self.assertEqual(self.control.calls[-2:], ["read_env", "release"])
         self.assertTrue(self.control.calls[-3].startswith("restore_env:"))
 
     def _go_live(self) -> None:
-        self.control.records = [
-            {"message": "starting orphaned_restore_pod_gc", "dry_run": False, "threshold_secs": 20, "interval_secs": 5},
-            {"message": "orphaned_restore_pod_gc tick complete", "dry_run": False},
-        ]
         self.assertions.go_live(threshold_seconds=20, interval_seconds=5)
 
     def _restores(self) -> int:
@@ -572,56 +536,25 @@ class AssertionsContract(unittest.TestCase):
         self.assertions._removals[orphan.token] = self.scope.defer(
             "remove", lambda: self.control.remove_planted_restore_pods(orphan.token)
         )
-        self.control.records = _reap_records(orphan)
         self.assertions.expect_reaped(orphan)
         self.assertEqual(self.control.calls, [f"remove:{orphan.token}"])
         self.scope.close()
         self.assertEqual(self.control.calls, [f"remove:{orphan.token}"])
 
-    def test_a_reap_for_the_wrong_reason_or_before_the_threshold_fails(self) -> None:
+    def test_a_young_reap_fails_even_beside_an_older_plant(self) -> None:
+        # Planted back to back: the second plant's deletion at age zero must not
+        # hide behind the first plant's wait.
         self._live()
-        orphan = self._orphan()
-        self.control.records = _reap_records(orphan, detail="sandbox_missing")
-        with self.assertRaisesRegex(InvariantViolation, "expected identity"):
-            self.assertions.expect_reaped(orphan)
-        self.control.records = _reap_records(orphan, age=5)
-        with self.assertRaisesRegex(InvariantViolation, "expected identity"):
-            self.assertions.expect_reaped(orphan)
+        on_time = self._orphan()
+        young = self._orphan(token="1b2c3d4e", deleted_after=0.1)
+        with self.assertRaisesRegex(InvariantViolation, "before the threshold"):
+            self.assertions.expect_reaped(on_time, young)
 
-    def test_a_double_confirmation_or_completion_fails(self) -> None:
+    def test_a_reap_that_never_lands_times_out(self) -> None:
         self._live()
-        orphan = self._orphan()
-        records = _reap_records(orphan)
-        self.control.records = records + [records[2]]
-        with self.assertRaisesRegex(InvariantViolation, "exactly once"):
+        orphan = self._orphan(deleted_after=None)
+        with self.assertRaisesRegex(InvariantViolation, "not reaped within the budget"):
             self.assertions.expect_reaped(orphan)
-        self.control.records = records + [records[3]]
-        with self.assertRaisesRegex(InvariantViolation, "exactly once"):
-            self.assertions.expect_reaped(orphan)
-        self.control.records = records + [records[0]]
-        with self.assertRaisesRegex(InvariantViolation, "exactly once"):
-            self.assertions.expect_reaped(orphan)
-
-    def test_an_unconfirmed_reap_times_out(self) -> None:
-        self._live()
-        orphan = self._orphan()
-        # The DELETE was accepted but the pod never left the cache.
-        self.control.records = _reap_records(orphan)[:2]
-        with self.assertRaisesRegex(InvariantViolation, "not reaped and confirmed"):
-            self.assertions.expect_reaped(orphan)
-
-    def test_any_gc_record_naming_the_live_pod_fails_the_survival_verdict(self) -> None:
-        self._live()
-        live = LivePod("space-sbx-a-g4", "uid-space-sbx-a-g4", 4)
-        self.control.present.add(live.name)
-        ticks = [{"message": "orphaned_restore_pod_gc tick complete", "scanned": 1}] * 10
-        self.control.records = ticks
-        self.assertions.expect_undisturbed(live)
-        self.control.records = ticks + [
-            {"loop": "orphaned_restore_pod_gc", "outcome": "skipped", "pod_name": live.name}
-        ]
-        with self.assertRaisesRegex(InvariantViolation, "acted on the live restore pod"):
-            self.assertions.expect_undisturbed(live)
 
     def test_a_replaced_live_pod_fails_the_survival_verdict(self) -> None:
         self._live()

@@ -964,6 +964,18 @@ async fn run_stop_or_kill(
     }
 }
 
+/// The drain gate's single read of the sandbox row and its primary node.
+#[derive(sqlx::FromRow)]
+struct DrainGateRow {
+    portable: bool,
+    drain_phase: Option<NodeDrainPhase>,
+    drain_mode: Option<String>,
+    /// Whether `COALESCE(target_node_id, active_node_id)` names a node row.
+    primary_found: bool,
+    /// Whether that node has a `node_k8s` row.
+    mapped: bool,
+}
+
 /// Fetch the `drain_phase` of the node that the next placement-affecting
 /// call would land on. This must mirror `preferred_restore_node_name`'s
 /// resolution priority, otherwise a guard placed in front of the substrate
@@ -1021,21 +1033,27 @@ pub(super) async fn fetch_active_node_drain_state(
     // because the gate is also called from inner paths after
     // `begin_restore_lifecycle` has flipped the row from `suspended →
     // restoring`; the snapshot is still canonical mid-restore.
+    //
+    // The portability check and the primary lookup below read the same
+    // sandbox row, so they are one statement: a snapshot at least as
+    // consistent as the two reads it replaces. `portable` is only consulted
+    // first; the primary columns are ignored when it is true.
     let portable_predicate = portable_for_restore_affinity("s");
-    let portable_query = format!(
-        "SELECT EXISTS (
-             SELECT 1
-               FROM sandboxes s
-              WHERE s.id = $1
-                AND {portable_predicate}
-         )"
+    let gate_query = format!(
+        "SELECT COALESCE(({portable_predicate}), FALSE) AS portable,
+                n.drain_phase,
+                n.drain_mode,
+                n.id IS NOT NULL AS primary_found,
+                EXISTS (SELECT 1 FROM node_k8s nk WHERE nk.node_id = n.id) AS mapped
+           FROM sandboxes s
+           LEFT JOIN nodes n ON n.id = COALESCE(s.target_node_id, s.active_node_id)
+          WHERE s.id = $1"
     );
-    let portable: Option<bool> =
-        sqlx::query_scalar(sqlx::AssertSqlSafe(sql!(portable_query.as_str())))
-            .bind(sandbox_id)
-            .fetch_optional(pool)
-            .await?;
-    if matches!(portable, Some(true)) {
+    let gate: Option<DrainGateRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql!(gate_query.as_str())))
+        .bind(sandbox_id)
+        .fetch_optional(pool)
+        .await?;
+    if gate.as_ref().is_some_and(|row| row.portable) {
         return Ok(None);
     }
 
@@ -1043,19 +1061,12 @@ pub(super) async fn fetch_active_node_drain_state(
     // affecting call would land on. `target_node_id` wins over
     // `active_node_id` so this mirrors `preferred_restore_node_name`.
     // Yields `None` when the sandbox row is missing or both placement
-    // columns are NULL, and `Some((None, _))` when the node exists but is not
-    // draining — both cases fall through to the executions fallback below.
-    let primary: Option<(Option<NodeDrainPhase>, Option<String>, bool)> = sqlx::query_as(sql!(
-        "SELECT n.drain_phase,
-                n.drain_mode,
-                EXISTS (SELECT 1 FROM node_k8s nk WHERE nk.node_id = n.id) AS mapped
-           FROM sandboxes s
-           JOIN nodes n ON n.id = COALESCE(s.target_node_id, s.active_node_id)
-          WHERE s.id = $1"
-    ))
-    .bind(sandbox_id)
-    .fetch_optional(pool)
-    .await?;
+    // columns are NULL (or name no node row), and `Some((None, _))` when the
+    // node exists but is not draining — both cases fall through to the
+    // executions fallback below.
+    let primary: Option<(Option<NodeDrainPhase>, Option<String>, bool)> = gate
+        .filter(|row| row.primary_found)
+        .map(|row| (row.drain_phase, row.drain_mode, row.mapped));
     // `mapped` is whether the primary node has a `node_k8s` row. It decides
     // whether the executions fallback is even reachable: the substrate uses the
     // fallback only when the primary can't be resolved to a k8s node, so for a
@@ -1218,6 +1229,9 @@ impl SandboxController {
             .ok_or_else(|| ControllerError::not_found("Sandbox not found"))?;
 
         let target = NodeApiTarget {
+            // Missing or unparseable defaults to `Space`. Harmless: neither
+            // substrate's delete path reads it, only `role` and the address
+            // fields below.
             managed_by: observed
                 .node_managed_by
                 .as_deref()
@@ -1897,6 +1911,18 @@ impl SandboxController {
                     // substrates. On race-loss we surface a 5xx so the caller
                     // re-issues rather than silently observing a `started` row
                     // pointing at a deleted execution.
+                    //
+                    // Known gap on Direct (also the Wake arm's lease-restore
+                    // fallback): this CAS runs with `DirectRestoreBaseline`,
+                    // which does not fence `suspended`. Direct's suspend writes
+                    // no `suspending` claim, only `suspended` after its node
+                    // call, so a suspend whose `suspended` write lands after
+                    // the lease restore's `started` write and before this CAS
+                    // is overwritten back to `started`. The lease write is not
+                    // guarded on lifecycle either, so a `suspended` written
+                    // after the restore placed the row `on_node` (for a remote
+                    // restore, that span includes the source cleanup call) is
+                    // overwritten by that write.
                     let published_suspend_fence =
                         PublishedSuspendFence::for_capabilities(self.substrate.capabilities());
                     let cas_result =

@@ -1,4 +1,4 @@
-//! Wire types for the `/admin/v1` operator surface.
+//! Wire types for the `/admin/api/v1` operator surface.
 //!
 //! These structs are the shared contract between the api-server
 //! (`crates/libs/api/src/routes/admin/`) and any client that speaks the
@@ -22,8 +22,8 @@ use serde::{Deserialize, Serialize};
 use crate::types::node_group::{NodeGroupName, NodeGroupTemplatePolicy};
 use crate::types::template::{TemplateName, TemplateVisibility};
 
-/// Response shape for `GET /admin/v1/nodes` (each element) and
-/// `GET /admin/v1/nodes/{node}`.
+/// Response shape for `GET /admin/api/v1/nodes` (each element) and
+/// `GET /admin/api/v1/nodes/{node}`.
 ///
 /// Action endpoints (`POST .../{node}:drain`, `:terminate`, `:undrain`) also
 /// return this shape on success so callers can read the post-transition
@@ -399,7 +399,7 @@ pub struct AdminNodeReconciliationStatus {
     pub last_error: String,
 }
 
-/// Optional JSON body for `POST /admin/v1/nodes/{id}:drain`.
+/// Optional JSON body for `POST /admin/api/v1/nodes/{id}:drain`.
 ///
 /// `replace_after_terminate` controls whether the eventual ASG
 /// `TerminateInstanceInAutoScalingGroup` call decrements the desired capacity:
@@ -430,32 +430,69 @@ pub struct AdminNodeReconciliationStatus {
 /// monotonic shrink and got auto-replace instead is the exact failure mode
 /// this flag exists to avoid. The same reasoning covers `mode`: a typo'd
 /// `"mode": "gentel"` is a 400, not a silent forced drain.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DrainRequest {
-    #[serde(default = "default_replace_after_terminate")]
-    pub replace_after_terminate: bool,
+    /// `None` means the request expressed no opinion, which is **not** the same
+    /// as `Some(true)` even though both start a drain that auto-replaces.
+    ///
+    /// `:drain` has two edges, and the distinction is what keeps them both
+    /// honest. On the edge that *starts* a drain, `None` resolves to the default
+    /// `true` (see [`Self::replace_after_terminate_or_default`]). On a node
+    /// already draining the intent is fixed — the terminator may act on it at
+    /// any moment once the node reaches `drained`, so there is no window in
+    /// which changing it has a defined meaning — and `None` is what lets an
+    /// escalation say nothing about it. `Some(v)` disagreeing with the stored
+    /// value is a 409 rather than a silent overwrite.
+    ///
+    /// A bare `bool` cannot express that. With no way to tell an omitted field
+    /// from an explicit `true`, the endpoint has to choose between refusing
+    /// every bodiless repeat against a shrinking node, silently applying a stale
+    /// client's default (every `space-admin-cli` older than this field sends an
+    /// explicit `!no_replace_after_terminate`), and silently dropping a
+    /// deliberate correction. None of those surfaces as an error, which is
+    /// exactly the case [`Option`] exists for.
+    ///
+    /// `skip_serializing_if` is load-bearing, not tidiness. `space-admin-cli` serializes
+    /// this struct whole, and serde's `default` fires only on an **absent** key —
+    /// an explicit `null` against an api-server that still types the field as
+    /// `bool` is `invalid type: null, expected a boolean`, i.e. a 400 on every
+    /// bodiless drain. CLI binaries roll independently of the api-server, so that
+    /// skew window is real; omitting the key keeps the request byte-identical to
+    /// what the previous release accepts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace_after_terminate: Option<bool>,
+    /// `NodeDrainMode`'s own `Default` is gentle, and it is the single statement
+    /// of "a missing mode is gentle" that the NULL-column read also defers to —
+    /// so this does not restate the policy.
     #[serde(default)]
     pub mode: NodeDrainMode,
+    /// `true` makes `:drain` a start-only request: it succeeds only against a
+    /// node with no drain phase, and any existing drain is a 409 instead of
+    /// being escalated or repeated. The check runs under the handler's row
+    /// lock, so it is atomic with the write. That is what an orchestrator
+    /// needs to start drains without ever escalating one somebody else
+    /// started between its read and its POST.
+    ///
+    /// `false` (the default) keeps the escalate-in-place and same-mode edges.
+    /// Skipped when `false`, so a request that doesn't ask for it stays
+    /// byte-identical to what the previous release accepts. One that does ask
+    /// is a 400 from an api-server that predates the field (this struct is
+    /// `deny_unknown_fields`), which fails closed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require_undrained: bool,
 }
 
-fn default_replace_after_terminate() -> bool {
-    true
-}
-
-impl Default for DrainRequest {
-    fn default() -> Self {
-        Self {
-            replace_after_terminate: default_replace_after_terminate(),
-            // `NodeDrainMode`'s own `Default` is gentle, and it is the single
-            // statement of "a missing mode is gentle" that the NULL-column read
-            // also defers to — so this does not restate the policy.
-            mode: NodeDrainMode::default(),
-        }
+impl DrainRequest {
+    /// The replacement intent to persist when *starting* a drain: an unexpressed
+    /// opinion means the ASG auto-replaces the terminated instance, which
+    /// preserves single-node-drain semantics.
+    pub fn replace_after_terminate_or_default(&self) -> bool {
+        self.replace_after_terminate.unwrap_or(true)
     }
 }
 
-/// Response body for `POST /admin/v1/nodes/{id}:force-upload-local-snapshots`.
+/// Response body for `POST /admin/api/v1/nodes/{id}:force-upload-local-snapshots`.
 ///
 /// Lists every local-only suspended sandbox pinned to the node — i.e.
 /// `lifecycle = 'suspended'`, `target_node_id = $node`, no `state='ready'`
@@ -501,7 +538,7 @@ pub struct ForceUploadFailure {
     pub error: String,
 }
 
-/// Query-parameter filters for `GET /admin/v1/nodes`.
+/// Query-parameter filters for `GET /admin/api/v1/nodes`.
 ///
 /// `drain_phase` accepts the canonical phase values (`draining`, `drained`,
 /// `terminating`) or `none` to match rows with no drain in progress
@@ -546,8 +583,8 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-/// Response shape for `GET /admin/v1/node-groups` (each element),
-/// `GET /admin/v1/node-groups/{id}`, and the node-group write endpoints
+/// Response shape for `GET /admin/api/v1/node-groups` (each element),
+/// `GET /admin/api/v1/node-groups/{id}`, and the node-group write endpoints
 /// (which return the post-write state so callers can read it without an
 /// extra round trip).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -572,7 +609,7 @@ pub struct AdminNodeGroupResponse {
     pub compat_templates: Vec<String>,
 }
 
-/// JSON body for `POST /admin/v1/node-groups`.
+/// JSON body for `POST /admin/api/v1/node-groups`.
 ///
 /// The row is created in lockstep with the Terraform/MNG change that
 /// provisions the matching nodes (the `space-node-group` label, and for
@@ -598,7 +635,7 @@ pub struct CreateNodeGroupRequest {
     pub is_default: bool,
 }
 
-/// JSON body for `POST /admin/v1/node-groups/{id}:assign-org`.
+/// JSON body for `POST /admin/api/v1/node-groups/{id}:assign-org`.
 ///
 /// `{"org_id": "<uuid>"}` dedicates the group to that org; `{}` or
 /// `{"org_id": null}` releases it back to generic. `deny_unknown_fields` so
@@ -610,14 +647,14 @@ pub struct AssignOrgRequest {
     pub org_id: Option<crate::types::OrgId>,
 }
 
-/// JSON body for `PUT /admin/v1/node-groups/{id}/template-policy`.
+/// JSON body for `PUT /admin/api/v1/node-groups/{id}/template-policy`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SetTemplatePolicyRequest {
     pub template_policy: NodeGroupTemplatePolicy,
 }
 
-/// JSON body for `PUT /admin/v1/node-groups/{id}/compat`. Full-replace
+/// JSON body for `PUT /admin/api/v1/node-groups/{id}/compat`. Full-replace
 /// semantics: `templates` is the complete allowlist after the call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -625,7 +662,7 @@ pub struct SetCompatRequest {
     pub templates: Vec<TemplateName>,
 }
 
-/// JSON body for `PUT /admin/v1/templates/{name}:visibility`.
+/// JSON body for `PUT /admin/api/v1/templates/{name}:visibility`.
 ///
 /// `org_id` may only accompany `visibility = "org_specific"` and assigns the
 /// owning org in the same write (an org-specific template must have an
@@ -640,7 +677,7 @@ pub struct SetTemplateVisibilityRequest {
     pub org_id: Option<crate::types::OrgId>,
 }
 
-/// Response shape for `PUT /admin/v1/templates/{name}:visibility`.
+/// Response shape for `PUT /admin/api/v1/templates/{name}:visibility`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminTemplateVisibilityResponse {
     pub name: String,

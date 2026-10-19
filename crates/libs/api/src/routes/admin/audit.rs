@@ -133,12 +133,58 @@ pub struct AdminAuditEntry<'a> {
     pub node_name: Option<&'a str>,
     pub from_phase: Option<&'a str>,
     pub to_phase: Option<&'a str>,
-    /// Drain mode the operator asked for, on `:drain` only. Recorded because
-    /// it is what decides whether the node's resident sandboxes were evacuated
-    /// and their users served 409s, and "who forced a drain on this node?" is
+    /// The mode of the drain already in progress, on the actions that
+    /// transition one. Together with [`Self::drain_mode`] this is what
+    /// distinguishes an in-place escalation (`gentle → forced`) from a
+    /// `:drain --forced` that re-asserted a mode the node already had — the two
+    /// are otherwise the same entry, because both sit on a
+    /// `draining → draining` edge and both record `drain_mode: forced`.
+    ///
+    /// `None` when the node has no drain in progress: a NULL `drain_mode`
+    /// column reads as `gentle`, which is the right answer for a draining node
+    /// and an invented one for a node nobody has drained. Also `None` on every
+    /// action that *cannot* move the drain state machine — `:cordon`,
+    /// `:uncordon` and `:force-upload-local-snapshots`. Gated on the action
+    /// class rather than the outcome, so a refused `:drain` or `:terminate` does
+    /// carry a from-mode: that is the state the refusal was measured against,
+    /// and a rejected entry is exactly where an operator wants to see it. The
+    /// one refusal that leaves it `None` is a substrate without node drain,
+    /// which answers before the row is read and so measured no state.
+    ///
+    /// Read as a from/to pair with [`Self::drain_mode`] on `:drain` only, which
+    /// is the only action carrying a *requested* mode. `:terminate` and
+    /// `:undrain` populate this field and leave `drain_mode` empty, because they
+    /// move the phase rather than the mode.
+    pub from_drain_mode: Option<NodeDrainMode>,
+    /// The `replace_after_terminate` the request expressed, on `:drain` only —
+    /// what the operator asked for, not what was stored. `None` covers both
+    /// "this action carries no such flag" and "the request omitted it".
+    ///
+    /// Empty does **not** mean nothing was persisted. On the edge that starts a
+    /// drain an omitted flag still writes the auto-replace default, so for a
+    /// fresh drain the stored value is the default whenever this field is empty.
+    /// It is only on an already-draining node that empty means the column was
+    /// left alone.
+    ///
+    /// Recorded because `nodes.terminate_decrement_capacity` decides whether the
+    /// eventual ASG terminate decrements desired capacity, and the edge that
+    /// *starts* a drain writes it from this field. On an already-draining node
+    /// the column cannot move — a disagreeing request is refused — so what this
+    /// field records there is the refusal's cause: which value was asked for
+    /// against a drain that would not take it.
+    pub replace_after_terminate: Option<bool>,
+    /// Drain mode the operator asked for, on `:drain`. Recorded because it is
+    /// what decides whether the node's resident sandboxes were evacuated and
+    /// their users served 409s, and "who forced a drain on this node?" is
     /// otherwise unanswerable from the audit trail — both modes log the same
-    /// `NULL → draining` transition. `None` on every other action, which does
-    /// not carry a mode.
+    /// `NULL → draining` transition.
+    ///
+    /// One exception, and it is not a requested mode:
+    /// `:force-upload-local-snapshots`' wake-gate-open refusal puts the node's
+    /// *current* mode here, because that refusal is precisely "the gate is open,
+    /// and here is the mode that left it open". Its other two entries leave this
+    /// `None`. So on that action the field is a state snapshot on one path and
+    /// empty on the rest — do not pair it with [`Self::from_drain_mode`] there.
     pub drain_mode: Option<NodeDrainMode>,
     pub success: bool,
     pub error: Option<&'a str>,
@@ -178,6 +224,11 @@ pub fn record(entry: AdminAuditEntry<'_>) {
         node_name = entry.node_name.unwrap_or(""),
         from_phase = entry.from_phase.unwrap_or(""),
         to_phase = entry.to_phase.unwrap_or(""),
+        from_drain_mode = entry.from_drain_mode.map(NodeDrainMode::as_str).unwrap_or(""),
+        replace_after_terminate = entry
+            .replace_after_terminate
+            .map(|value| if value { "true" } else { "false" })
+            .unwrap_or(""),
         drain_mode = entry.drain_mode.map(NodeDrainMode::as_str).unwrap_or(""),
         success = entry.success,
         error = entry.error.unwrap_or(""),

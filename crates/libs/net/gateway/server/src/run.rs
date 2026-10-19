@@ -71,6 +71,41 @@ pub struct NetGatewayRunConfig {
     pub known_egress_domains: Vec<DomainName>,
     /// May be partial while execution identity is being enriched.
     pub route_identity: Option<SpaceApiRouteIdentity>,
+    /// The W3C `traceparent` of the traced launch that started this gateway,
+    /// passed as `TRACEPARENT`; see [`startup_span`].
+    pub launch_traceparent: Option<String>,
+}
+
+/// The root of this gateway's startup, when a traced request launched it.
+///
+/// The gateway outlives the request that launched it, so its startup is a
+/// root linked to that launch and sampled as it was, as other work that
+/// outlives a request is. Its startup events and the policy hydration until
+/// the gateway first settles run under it, so they join the launching
+/// request's work. A gateway launched with no trace context, such as one the
+/// watchdog replaced, starts untraced.
+fn startup_span(sandbox_id: &str, launch_traceparent: Option<&str>) -> Option<tracing::Span> {
+    let launch = launch_traceparent?;
+    let span = tracing::info_span!(
+        parent: None,
+        "netgtw.startup",
+        otel.kind = "internal",
+        otel.name = "NetGatewayStartup",
+        "operation.name" = "netgtw.startup",
+        sandbox_id,
+        origin_trace_id = tracing::field::Empty,
+        origin_sampled = tracing::field::Empty,
+    );
+    pplx_space_observability::trace_propagation::link_root_to_origins(&span, [launch]);
+    Some(span)
+}
+
+/// Run `f` inside the startup span, when there is one.
+fn in_startup(startup: Option<&tracing::Span>, f: impl FnOnce()) {
+    match startup {
+        Some(span) => span.in_scope(f),
+        None => f(),
+    }
 }
 
 /// Why [`run`] returned without a clean shutdown.
@@ -225,6 +260,7 @@ pub async fn run(
     // can carry it as a Copy `&'static str` log field without any per-spawn
     // cloning or refcount machinery.
     let sandbox_id: &'static str = config.sandbox_id.to_string().leak();
+    let startup = startup_span(sandbox_id, config.launch_traceparent.as_deref());
 
     tracing::info!(
         sandbox_id = %config.sandbox_id,
@@ -235,18 +271,20 @@ pub async fn run(
     let stats = Arc::new(ProxyStats::new());
     let reserved_dns = ReservedDnsCore::new().map_err(RunNetGatewayError::ReservedDns)?;
     let network_state = if config.initial_policy_state == InitialPolicyState::NoIdentity {
-        emit_sandbox_event(
-            sandbox_id,
-            SandboxEventType::NetworkPolicyEnforcementCompleted,
-            SandboxEventSource::NetGateway,
-            SandboxEventDetails::default()
-                .operation("initial_policy_hydration")
-                .network_state("no_identity")
-                .installed_network_policy_ref(
-                    pplx_space_net_common::EffectiveNetworkPolicyRef::no_identity().to_string(),
-                )
-                .result("no_identity"),
-        );
+        in_startup(startup.as_ref(), || {
+            emit_sandbox_event(
+                sandbox_id,
+                SandboxEventType::NetworkPolicyEnforcementCompleted,
+                SandboxEventSource::NetGateway,
+                SandboxEventDetails::default()
+                    .operation("initial_policy_hydration")
+                    .network_state("no_identity")
+                    .installed_network_policy_ref(
+                        pplx_space_net_common::EffectiveNetworkPolicyRef::no_identity().to_string(),
+                    )
+                    .result("no_identity"),
+            );
+        });
         GatewayNetworkState::no_identity()
     } else {
         GatewayNetworkState::pending_policy()
@@ -288,7 +326,11 @@ pub async fn run(
     })?;
     let hydration_task =
         (config.initial_policy_state != InitialPolicyState::NoIdentity).then(|| {
-            network_state.spawn_hydration(policy_loader.clone(), proxy_shutdown_token.child_token())
+            network_state.spawn_hydration(
+                policy_loader.clone(),
+                proxy_shutdown_token.child_token(),
+                startup.clone(),
+            )
         });
     let dns_cache_shutdown_token = proxy_shutdown_token.child_token();
     let dns_cache = network_state.dns_allow_cache().clone();
@@ -405,16 +447,20 @@ pub async fn run(
         "net gateway listening"
     );
     let control_ready_snapshot = network_state.snapshot().await;
-    emit_sandbox_event(
-        sandbox_id,
-        SandboxEventType::NetworkPolicyEnforcementCompleted,
-        SandboxEventSource::NetGateway,
-        SandboxEventDetails::default()
-            .operation("control_socket_ready")
-            .network_state(control_ready_snapshot.mode.to_string())
-            .installed_network_policy_ref(control_ready_snapshot.installed_policy_ref)
-            .result("ready_for_refresh"),
-    );
+    in_startup(startup.as_ref(), || {
+        emit_sandbox_event(
+            sandbox_id,
+            SandboxEventType::NetworkPolicyEnforcementCompleted,
+            SandboxEventSource::NetGateway,
+            SandboxEventDetails::default()
+                .operation("control_socket_ready")
+                .network_state(control_ready_snapshot.mode.to_string())
+                .installed_network_policy_ref(control_ready_snapshot.installed_policy_ref)
+                .result("ready_for_refresh"),
+        );
+    });
+    // The hydration task holds the startup span until the gateway settles.
+    drop(startup);
 
     let service = NetGatewayControlService::new(
         stats,

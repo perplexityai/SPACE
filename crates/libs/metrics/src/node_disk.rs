@@ -1,8 +1,73 @@
 //! Node-local `/space/cache` disk occupancy as seen by the node-ctl
 //! SSD-headroom tier reconcile (the signal behind the `ssd-headroom-tier`
 //! Kubernetes node label that biases sandbox placement).
+//! Also owns node-manager's aggregate I/O budget and per-VM IOPS ceiling signals.
 
 use crate::emit::{counter, gauge, tag};
+
+/// Per-VM operations ceiling, not an aggregate host budget. Zero maximum means
+/// disabled. Emit every sweep, including when disabled, for gauge continuity.
+pub fn disk_io_ceiling_config(maximum: Option<u64>) {
+    gauge(
+        "node_disk.io_ceiling.enabled",
+        f64::from(maximum.is_some()),
+        &[],
+    );
+    gauge(
+        "node_disk.io_ceiling.maximum_iops",
+        maximum.unwrap_or(0) as f64,
+        &[],
+    );
+    if maximum.is_none() {
+        gauge("node_disk.io_ceiling.inventory_success", 0.0, &[]);
+        gauge("node_disk.io_ceiling.verified_vms", 0.0, &[]);
+        gauge("node_disk.io_ceiling.pending_vms", 0.0, &[]);
+        gauge(
+            "node_disk.io_ceiling.last_inventory_timestamp_seconds",
+            0.0,
+            &[],
+        );
+    }
+}
+
+/// Current registered VMs verified by the sweep versus not yet verified. Pending
+/// includes idle restore VMs and failed, busy or superseded targets; it does not
+/// mean above-limit and can be nonzero during normal restores.
+/// Counts require inventory_success=1 and a fresh inventory timestamp. Successful
+/// verification is cached only for the same sandbox, slot generation and PID.
+pub fn disk_io_ceiling_inventory(verified: u64, pending: u64, timestamp: f64) {
+    gauge("node_disk.io_ceiling.verified_vms", verified as f64, &[]);
+    gauge("node_disk.io_ceiling.pending_vms", pending as f64, &[]);
+    gauge("node_disk.io_ceiling.inventory_success", 1.0, &[]);
+    gauge(
+        "node_disk.io_ceiling.last_inventory_timestamp_seconds",
+        timestamp,
+        &[],
+    );
+}
+
+/// Publish failed inventory validity without resending counts or their timestamp.
+/// Consumers must not assume that a telemetry sink retains those older samples.
+pub fn disk_io_ceiling_inventory_failed() {
+    gauge("node_disk.io_ceiling.inventory_success", 0.0, &[]);
+    counter("node_disk.io_ceiling.inventory_failures", 1, &[]);
+}
+
+/// Live operations-bucket changes successfully verified by the sweep. Does not
+/// count cold-boot config preparation or synchronous restore/adoption updates.
+pub fn disk_io_ceiling_updated() {
+    counter("node_disk.io_ceiling.updates", 1, &[]);
+}
+
+/// Failed sweep attempts, including lifecycle-lock contention and API failures.
+/// Timeout tags are bounded; a timeout leaves enforcement unknown and retryable.
+pub fn disk_io_ceiling_update_failed(timed_out: bool) {
+    counter(
+        "node_disk.io_ceiling.update_failures",
+        1,
+        &[tag("timeout", if timed_out { "true" } else { "false" })],
+    );
+}
 
 /// Node-manager's five-minute census of canonical local rootfs files, including
 /// retained copies. `kind`: template, instance, suspend_checkpoint, disk_snapshot.

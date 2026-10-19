@@ -345,9 +345,9 @@ async fn routability_check_answers_with_the_hydration_verdict(
         HydrationPod::Forbidden => kube_status(StatusCode::FORBIDDEN, "Forbidden"),
         HydrationPod::PriorGeneration => unreachable!("no case scripts a predecessor's pod"),
     });
-    let substrate = Substrate::Kubernetes(Box::new(substrate_with_stale_cached_pod(
+    let substrate = Substrate::from_kubernetes(substrate_with_stale_cached_pod(
         &db.pool, client, sandbox_id,
-    )));
+    ));
 
     let check = substrate
         .ensure_routable_execution(sandbox_id, Duration::from_secs(5))

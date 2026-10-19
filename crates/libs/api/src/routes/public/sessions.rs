@@ -19,7 +19,7 @@ use serde::Deserialize;
 use time::OffsetDateTime;
 
 use crate::{
-    controllers::{ControllerError, sandbox::fetch_sandbox},
+    controllers::ControllerError,
     middleware::auth::{AuthOrg, AuthUser},
     models::Sandbox,
     public_operations::{HttpOperationMethod, OperationPathTemplate},
@@ -33,6 +33,7 @@ use crate::{
 use super::{
     cursors::{CursorKind, decode_cursor, encode_cursor},
     error::{PublicApiError, with_retry_after_hint},
+    owner_scope::{AuthorizedSandbox, authorized_sandbox},
 };
 
 const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
@@ -48,6 +49,7 @@ const MAX_SESSION_LIST_LIMIT: u16 = 1000;
 pub async fn create_terminal_session(
     State(state): State<AppState>,
     Extension(AuthOrg(org)): Extension<AuthOrg>,
+    authorized: Option<Extension<AuthorizedSandbox>>,
     Extension(AuthUser(actor)): Extension<AuthUser>,
     headers: HeaderMap,
     Path(sandbox_id): Path<String>,
@@ -55,7 +57,7 @@ pub async fn create_terminal_session(
 ) -> Result<(StatusCode, Json<PublicSession>), PublicApiError> {
     validate_terminal_size(request.size.as_ref())?;
     let sandbox_id = parse_public_sandbox_id(&sandbox_id)?;
-    let _sandbox = ensure_sandbox_owner(&state.pool, org.id, sandbox_id).await?;
+    let _sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, sandbox_id).await?;
     let request_json = serde_json::to_value(&request).map_err(|error| {
         tracing::error!(error = %error, "failed to serialize terminal session request");
         PublicApiError::internal()
@@ -92,6 +94,7 @@ pub async fn create_terminal_session(
 pub async fn create_process_session(
     State(state): State<AppState>,
     Extension(AuthOrg(org)): Extension<AuthOrg>,
+    authorized: Option<Extension<AuthorizedSandbox>>,
     Extension(AuthUser(actor)): Extension<AuthUser>,
     headers: HeaderMap,
     Path(sandbox_id): Path<String>,
@@ -99,7 +102,7 @@ pub async fn create_process_session(
 ) -> Result<(StatusCode, Json<PublicSession>), PublicApiError> {
     validate_process_request(&request)?;
     let sandbox_id = parse_public_sandbox_id(&sandbox_id)?;
-    let _sandbox = ensure_sandbox_owner(&state.pool, org.id, sandbox_id).await?;
+    let _sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, sandbox_id).await?;
     let request_json = serde_json::to_value(&request).map_err(|error| {
         tracing::error!(error = %error, "failed to serialize process session request");
         PublicApiError::internal()
@@ -136,13 +139,14 @@ pub async fn create_process_session(
 pub async fn create_command(
     State(state): State<AppState>,
     Extension(AuthOrg(org)): Extension<AuthOrg>,
+    authorized: Option<Extension<AuthorizedSandbox>>,
     Extension(AuthUser(actor)): Extension<AuthUser>,
     headers: HeaderMap,
     Path(sandbox_id): Path<String>,
     Json(request): Json<CreateCommandRequest>,
 ) -> Result<(StatusCode, Json<PublicCommand>), PublicApiError> {
     let sandbox_id = parse_public_sandbox_id(&sandbox_id)?;
-    let _sandbox = ensure_sandbox_owner(&state.pool, org.id, sandbox_id).await?;
+    let _sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, sandbox_id).await?;
     let idempotency_key = idempotency_key(&headers)?;
     let command = create_command_session(
         &state.public_session_store(),
@@ -216,6 +220,7 @@ pub(crate) async fn create_command_session(
 pub async fn create_file_watch_session(
     State(state): State<AppState>,
     Extension(AuthOrg(org)): Extension<AuthOrg>,
+    authorized: Option<Extension<AuthorizedSandbox>>,
     Extension(AuthUser(actor)): Extension<AuthUser>,
     headers: HeaderMap,
     Path(sandbox_id): Path<String>,
@@ -225,7 +230,7 @@ pub async fn create_file_watch_session(
         return Err(PublicApiError::bad_request("path must not be empty"));
     }
     let sandbox_id = parse_public_sandbox_id(&sandbox_id)?;
-    let _sandbox = ensure_sandbox_owner(&state.pool, org.id, sandbox_id).await?;
+    let _sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, sandbox_id).await?;
     let request_json = serde_json::to_value(&request).map_err(|error| {
         tracing::error!(error = %error, "failed to serialize file watch session request");
         PublicApiError::internal()
@@ -262,6 +267,7 @@ pub async fn create_file_watch_session(
 pub async fn create_port_session(
     State(state): State<AppState>,
     Extension(AuthOrg(org)): Extension<AuthOrg>,
+    authorized: Option<Extension<AuthorizedSandbox>>,
     Extension(AuthUser(actor)): Extension<AuthUser>,
     headers: HeaderMap,
     Path(sandbox_id): Path<String>,
@@ -273,7 +279,7 @@ pub async fn create_port_session(
         ));
     }
     let sandbox_id = parse_public_sandbox_id(&sandbox_id)?;
-    let sandbox = ensure_sandbox_owner(&state.pool, org.id, sandbox_id).await?;
+    let sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, sandbox_id).await?;
     state
         .sandbox_controller
         .ensure_sandbox_port_exposure_applied(&state.pool, &sandbox, request.port, "native")
@@ -324,6 +330,7 @@ pub async fn create_port_session(
 pub async fn create_protocol_session(
     State(state): State<AppState>,
     Extension(AuthOrg(org)): Extension<AuthOrg>,
+    authorized: Option<Extension<AuthorizedSandbox>>,
     Extension(AuthUser(actor)): Extension<AuthUser>,
     headers: HeaderMap,
     Path(sandbox_id): Path<String>,
@@ -335,7 +342,7 @@ pub async fn create_protocol_session(
         ));
     }
     let sandbox_id = parse_public_sandbox_id(&sandbox_id)?;
-    let sandbox = ensure_sandbox_owner(&state.pool, org.id, sandbox_id).await?;
+    let sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, sandbox_id).await?;
     state
         .sandbox_controller
         .ensure_sandbox_port_exposure_applied(&state.pool, &sandbox, request.port, "native")
@@ -387,10 +394,11 @@ pub async fn create_protocol_session(
 pub async fn get_session(
     State(state): State<AppState>,
     Extension(AuthOrg(org)): Extension<AuthOrg>,
+    authorized: Option<Extension<AuthorizedSandbox>>,
     Path((sandbox_id, session_id)): Path<(String, String)>,
 ) -> Result<Json<PublicSession>, PublicApiError> {
     let sandbox_id = parse_public_sandbox_id(&sandbox_id)?;
-    let _sandbox = ensure_sandbox_owner(&state.pool, org.id, sandbox_id).await?;
+    let _sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, sandbox_id).await?;
     let session_id = parse_session_id(&session_id)?;
     let store = state.public_session_store();
     let Some(session) = store.fetch_session(org.id, sandbox_id, session_id).await? else {
@@ -402,11 +410,12 @@ pub async fn get_session(
 pub async fn list_sessions(
     State(state): State<AppState>,
     Extension(AuthOrg(org)): Extension<AuthOrg>,
+    authorized: Option<Extension<AuthorizedSandbox>>,
     Path(sandbox_id): Path<String>,
     Query(query): Query<ListSessionsQuery>,
 ) -> Result<Json<PublicPage<PublicSession>>, PublicApiError> {
     let sandbox_id = parse_public_sandbox_id(&sandbox_id)?;
-    let _sandbox = ensure_sandbox_owner(&state.pool, org.id, sandbox_id).await?;
+    let _sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, sandbox_id).await?;
     let limit = query.limit();
     let store = state.public_session_store();
     let mut sessions = store
@@ -441,10 +450,11 @@ pub async fn list_sessions(
 pub async fn revoke_session(
     State(state): State<AppState>,
     Extension(AuthOrg(org)): Extension<AuthOrg>,
+    authorized: Option<Extension<AuthorizedSandbox>>,
     Path((sandbox_id, session_id)): Path<(String, String)>,
 ) -> Result<Json<PublicSession>, PublicApiError> {
     let sandbox_id = parse_public_sandbox_id(&sandbox_id)?;
-    let _sandbox = ensure_sandbox_owner(&state.pool, org.id, sandbox_id).await?;
+    let _sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, sandbox_id).await?;
     let session_id = parse_session_id(&session_id)?;
     let store = state.public_session_store();
     let Some(session) = store
@@ -537,17 +547,12 @@ struct RouteSessionCreate<'a> {
 }
 
 async fn ensure_sandbox_owner(
+    authorized: Option<Extension<AuthorizedSandbox>>,
     pool: &sqlx::PgPool,
     org_id: OrgId,
     sandbox_id: PublicSandboxId,
 ) -> Result<Sandbox, PublicApiError> {
-    let Some(sandbox) = fetch_sandbox(pool, sandbox_id.into()).await? else {
-        return Err(PublicApiError::not_found("sandbox not found"));
-    };
-    if sandbox.org_id != org_id {
-        return Err(PublicApiError::not_found("sandbox not found"));
-    }
-    Ok(sandbox)
+    authorized_sandbox(authorized, pool, org_id, sandbox_id).await
 }
 
 pub(crate) fn idempotency_key(headers: &HeaderMap) -> Result<IdempotencyKey, PublicApiError> {

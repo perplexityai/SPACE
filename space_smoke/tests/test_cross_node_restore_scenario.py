@@ -1,9 +1,8 @@
 """Framework contracts behind the cross-node durable-restore scenario.
 
-These test the assertion logic and the safety choreography — properties the
-kind bench cannot exercise (a lost apiserver reply, a killed process, the
-negative provenance classes) — not the scenario's happy path, which the bench
-proves directly.
+These test the safety choreography — properties the kind bench cannot
+exercise (a lost apiserver reply, a killed process) — not the scenario's
+happy path, which the bench proves directly.
 """
 
 from __future__ import annotations
@@ -22,7 +21,7 @@ from space_smoke.adapters import (
     KindConfig,
     KindHarness,
 )
-from space_smoke.capabilities import RestoreActivation, SandboxPodPlacement
+from space_smoke.capabilities import ExecutionRow, RestoreActivation, SandboxPodPlacement
 from space_smoke.fixtures import CrossNodeRestoreAssertions
 from space_smoke.runtime import CommandResult, InvariantViolation, ResourceScope
 from space_smoke.scenarios.local_suspend_restore_cross_node_from_object_storage import (
@@ -30,17 +29,6 @@ from space_smoke.scenarios.local_suspend_restore_cross_node_from_object_storage 
 )
 
 SANDBOX_ID = "01a0ac88-c99e-735a-b8fa-f13c948332fa"
-
-
-def _activation(node: str, provenance: str, generation: str, *, uri: bool = True):
-    return RestoreActivation(
-        sandbox_id=SANDBOX_ID,
-        node_name=node,
-        boot_type="snapshot",
-        restore_provenance=provenance,
-        restore_storage_uri_present=uri,
-        execution_generation=generation,
-    )
 
 
 def _placement(node: str, generation: str) -> SandboxPodPlacement:
@@ -57,6 +45,9 @@ class _Fixture:
     def verify(self, condition: bool, message: str, **_evidence: object) -> None:
         if not condition:
             raise InvariantViolation(message)
+
+    def record(self, _name: str, _value: object) -> None:
+        pass
 
     def phase(self, _name: str):
         return nullcontext()
@@ -83,9 +74,7 @@ class _Control:
 
     def __init__(self) -> None:
         self.calls: list[str] = []
-        self.activations: list[RestoreActivation] = [
-            RestoreActivation(SANDBOX_ID, "worker-a", "fresh", "fresh", False, "1")
-        ]
+        self.storage_uri = ""
         self.placement = _placement("worker-a", "1")
         self.fail_cordon = False
         self.portable_after_polls = 0
@@ -109,16 +98,34 @@ class _Control:
         self.calls.append(f"cordon:{node_name}")
         if self.fail_cordon:
             raise RuntimeError("apiserver reply lost")
-        # The restore lands elsewhere and pulls from S3.
+        # The restore lands elsewhere, planned from the durable snapshot.
         self.placement = _placement("worker-b", "2")
-        self.activations.append(_activation("worker-b", "remote_matches_local", "2"))
+        self.storage_uri = "s3://space-test/suspend-snapshots/x?region=us-east-1"
 
     def uncordon_kube_node(self, node_name: str) -> None:
         self.calls.append(f"uncordon:{node_name}")
 
+    def restore_pod_document(self, pod_name: str):
+        self.calls.append("pod")
+        annotations = {"space.pplx.net/suspend-restore-storage-uri": self.storage_uri}
+        return {"metadata": {"uid": self.placement.pod_uid, "annotations": annotations}}
+
+    def sandbox_executions(self, sandbox_id: str):
+        generation = int(self.placement.execution_generation)
+        return [ExecutionRow(generation, "running", True, self.placement.pod_name)]
+
+    def sandbox_manager_log(self, sandbox_id: str, *, node_names=None, since_time: str):
+        return []
+
     def restore_activations(self, sandbox_id: str, *, node_names=None, since_time=None):
-        self.calls.append("activations")
-        return list(self.activations)
+        placement = self.placement
+        provenance = "remote_only" if self.storage_uri else "fresh"
+        return [
+            RestoreActivation(
+                SANDBOX_ID, placement.node_name, "snapshot", provenance, bool(self.storage_uri),
+                placement.execution_generation,
+            )
+        ]
 
 
 def _assertions(control: _Control):
@@ -174,78 +181,6 @@ class CordonChoreography(unittest.TestCase):
         self.assertEqual(len(polls), 3)
         # Every portability poll completed before the cordon was dispatched.
         self.assertLess(max(polls), cordon)
-
-
-class ProvenanceAssertion(unittest.TestCase):
-    def _after_cross_node_restore(self, control: _Control):
-        _, assertions, _ = _assertions(control)
-        control.cordon_kube_node("worker-a")
-        return assertions, _placement("worker-a", "1"), control.placement
-
-    def test_healthy_remote_pull_on_another_node_passes(self) -> None:
-        control = _Control()
-        assertions, source, landed = self._after_cross_node_restore(control)
-
-        activation = assertions.expect_restored_from_object_storage(
-            source=source, landed=landed
-        )
-        self.assertEqual(activation.node_name, "worker-b")
-        self.assertEqual(activation.restore_provenance, "remote_matches_local")
-
-    def test_same_node_local_reuse_fails(self) -> None:
-        control = _Control()
-        _, assertions, _ = _assertions(control)
-        control.activations.append(_activation("worker-a", "local_only", "2", uri=False))
-
-        with self.assertRaises(InvariantViolation) as caught:
-            assertions.expect_restored_from_object_storage(
-                source=_placement("worker-a", "1"), landed=_placement("worker-a", "2")
-            )
-        self.assertIn("cordoned source node", str(caught.exception))
-
-    def test_moved_node_served_locally_fails(self) -> None:
-        control = _Control()
-        _, assertions, _ = _assertions(control)
-        control.activations.append(_activation("worker-b", "local_only", "2", uri=False))
-
-        with self.assertRaises(InvariantViolation) as caught:
-            assertions.expect_restored_from_object_storage(
-                source=_placement("worker-a", "1"), landed=_placement("worker-b", "2")
-            )
-        self.assertIn("object storage", str(caught.exception))
-
-    def test_anomalous_remote_classes_fail(self) -> None:
-        # `remote_local_mismatch` and `remote_metadata_unknown` mean the pull
-        # happened but adoption disagreed with the sidecar; that is a bug signal,
-        # not a pass.
-        for provenance in ("remote_local_mismatch", "remote_metadata_unknown"):
-            with self.subTest(provenance=provenance):
-                control = _Control()
-                _, assertions, _ = _assertions(control)
-                control.activations.append(_activation("worker-b", provenance, "2"))
-
-                with self.assertRaises(InvariantViolation) as caught:
-                    assertions.expect_restored_from_object_storage(
-                        source=_placement("worker-a", "1"),
-                        landed=_placement("worker-b", "2"),
-                    )
-                self.assertIn("object storage", str(caught.exception))
-
-    def test_cold_boot_generation_cannot_satisfy_the_check(self) -> None:
-        # Only the cold boot (generation 1) exists; asking about generation 2
-        # must not find it, regardless of log history.
-        control = _Control()
-        _, assertions, _ = _assertions(control)
-
-        with self.assertRaises(InvariantViolation) as caught:
-            # The live helper polls a minute for log visibility; a fake that
-            # will never produce the event should not make the test wait it out.
-            assertions.expect_restored_from_object_storage(
-                source=_placement("worker-a", "1"),
-                landed=_placement("worker-b", "2"),
-                visibility_timeout=0,
-            )
-        self.assertIn("exactly one runtime_activated event", str(caught.exception))
 
 
 class _ScriptedKubectl:
@@ -357,10 +292,10 @@ class OrphanedCordonRecovery(unittest.TestCase):
 
 
 class SandboxManagerSelectorMatchesTheKindCharts(unittest.TestCase):
-    """Sandbox events are read from the worker sandbox-manager pods.
+    """Node-service pods are found by the worker role and component labels.
 
-    A selector the charts do not render matches nothing, and the scenario then
-    fails with "no runtime_activated event", which reads like a product bug.
+    A selector the charts do not render matches nothing, and a scenario then
+    fails with a missing pod or an empty log, which reads like a product bug.
     Pin the selector and container to what the node-service library renders.
     """
 

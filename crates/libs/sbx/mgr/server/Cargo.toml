@@ -84,6 +84,7 @@ pplx-space-sbxmgr-migrations = { workspace = true }
 pplx-space-template-mgr-client = { workspace = true }
 
 [dev-dependencies]
+rstest = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["serde", "test-hooks"] }
 # `serialize` exposes `sqlite3_serialize`, which the test-schema helpers use to
 # migrate once per test process and stamp the resulting image into each fixture

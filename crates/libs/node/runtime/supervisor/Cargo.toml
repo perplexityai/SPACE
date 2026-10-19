@@ -32,7 +32,7 @@ tracing = { workspace = true }
 # internal
 pplx-space-common-core = { workspace = true }
 pplx-space-common-svc = { workspace = true }
-pplx-space-node-runtime-core = { workspace = true, features = ["host-runtime"] }
+pplx-space-node-runtime-core = { workspace = true, features = ["host-runtime", "artifact-store"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

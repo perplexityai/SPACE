@@ -1270,3 +1270,216 @@ fn default_workdir_uses_configured_templates() {
         None
     );
 }
+
+#[tokio::test]
+async fn process_stream_ends_unavailable_when_the_drain_deadline_passes() {
+    let limiter = Arc::new(crate::state::AttachedStreamLimiter::new(4, 4, 4));
+    let permit = limiter
+        .try_acquire_label(ECW_PROCESS_STREAM_KIND)
+        .expect("stream permit");
+    let shutdown_token = CancellationToken::new();
+    let mut stream = Box::pin(process_connect_json_stream(
+        futures_util::stream::pending::<Result<SpacedProcessEvent, tonic::Status>>(),
+        "Process.Connect",
+        &test_ecw_route(1),
+        true,
+        ecw_connect::EcwProcessStdoutStream::Stdout,
+        None,
+        EcwProcessStreamLease {
+            permit,
+            shutdown_token: shutdown_token.clone(),
+        },
+    ));
+    assert!(
+        futures_util::poll!(stream.next()).is_pending(),
+        "a live stream keeps running until the deadline"
+    );
+
+    shutdown_token.cancel();
+
+    let end = stream.next().await.expect("end-stream message").unwrap();
+    assert_eq!(end, ecw_connect::connect_shutdown_end_stream());
+    assert!(stream.next().await.is_none());
+    drop(stream);
+    assert_eq!(limiter.active_total(), 0);
+}
+
+#[tokio::test]
+async fn process_stream_delivers_a_ready_start_before_ending_at_the_deadline() {
+    let limiter = Arc::new(crate::state::AttachedStreamLimiter::new(4, 4, 4));
+    let permit = limiter
+        .try_acquire_label(ECW_PROCESS_STREAM_KIND)
+        .expect("stream permit");
+    let shutdown_token = CancellationToken::new();
+    let process_id = ProcessId::new();
+    let backend = futures_util::stream::iter([Ok(started_process_event(&process_id))])
+        .chain(futures_util::stream::pending());
+    let mut stream = Box::pin(process_connect_json_stream(
+        backend,
+        "Process.Start",
+        &test_ecw_route(1),
+        false,
+        ecw_connect::EcwProcessStdoutStream::Stdout,
+        None,
+        EcwProcessStreamLease {
+            permit,
+            shutdown_token: shutdown_token.clone(),
+        },
+    ));
+    // The start completed just as the deadline passed.
+    shutdown_token.cancel();
+
+    let start = stream.next().await.expect("start message").unwrap();
+    assert_ne!(
+        start,
+        ecw_connect::connect_shutdown_end_stream(),
+        "the client must learn that the command started"
+    );
+    assert_eq!(
+        stream.next().await.expect("end-stream message").unwrap(),
+        ecw_connect::connect_shutdown_end_stream()
+    );
+    assert!(stream.next().await.is_none());
+}
+
+#[tokio::test]
+async fn process_stream_ends_at_the_deadline_even_if_it_never_goes_idle() {
+    let limiter = Arc::new(crate::state::AttachedStreamLimiter::new(4, 4, 4));
+    let permit = limiter
+        .try_acquire_label(ECW_PROCESS_STREAM_KIND)
+        .expect("stream permit");
+    let shutdown_token = CancellationToken::new();
+    let process_id = ProcessId::new();
+    let output = stdout_process_event(&process_id, b"x");
+    let backend = futures_util::stream::repeat_with(move || Ok(output.clone()));
+    let mut stream = Box::pin(process_connect_json_stream(
+        backend,
+        "Process.Connect",
+        &test_ecw_route(1),
+        true,
+        ecw_connect::EcwProcessStdoutStream::Stdout,
+        None,
+        EcwProcessStreamLease {
+            permit,
+            shutdown_token: shutdown_token.clone(),
+        },
+    ));
+    shutdown_token.cancel();
+
+    let mut delivered = 0;
+    loop {
+        let bytes = stream.next().await.expect("message").unwrap();
+        if bytes == ecw_connect::connect_shutdown_end_stream() {
+            break;
+        }
+        delivered += 1;
+        assert!(delivered <= SHUTDOWN_FLUSH_LIMIT, "flush is capped");
+    }
+    assert_eq!(delivered, SHUTDOWN_FLUSH_LIMIT);
+    assert!(stream.next().await.is_none());
+}
+
+fn shutdown_test_stream<S>(
+    backend: S,
+    connected_as_start: bool,
+    shutdown_token: &CancellationToken,
+) -> Pin<Box<ProcessConnectJsonStream<S>>>
+where
+    S: Stream<Item = Result<SpacedProcessEvent, tonic::Status>>,
+{
+    let limiter = Arc::new(crate::state::AttachedStreamLimiter::new(4, 4, 4));
+    let permit = limiter
+        .try_acquire_label(ECW_PROCESS_STREAM_KIND)
+        .expect("stream permit");
+    Box::pin(process_connect_json_stream(
+        backend,
+        if connected_as_start {
+            "Process.Connect"
+        } else {
+            "Process.Start"
+        },
+        &test_ecw_route(1),
+        connected_as_start,
+        ecw_connect::EcwProcessStdoutStream::Stdout,
+        None,
+        EcwProcessStreamLease {
+            permit,
+            shutdown_token: shutdown_token.clone(),
+        },
+    ))
+}
+
+#[tokio::test(start_paused = true)]
+async fn process_start_waits_briefly_for_its_start_after_the_deadline() {
+    let shutdown_token = CancellationToken::new();
+    let process_id = ProcessId::new();
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let mut stream = shutdown_test_stream(
+        tokio_stream::wrappers::ReceiverStream::new(rx),
+        false,
+        &shutdown_token,
+    );
+    // The guest command ran, but its start is still on the way.
+    shutdown_token.cancel();
+    let started = tokio::spawn({
+        let event = started_process_event(&process_id);
+        async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            tx.send(Ok(event)).await.unwrap();
+            // Keep the backend open, as a running command does.
+            std::future::pending::<()>().await;
+        }
+    });
+
+    let start = stream.next().await.expect("start message").unwrap();
+    assert_ne!(start, ecw_connect::connect_shutdown_end_stream());
+    assert_eq!(
+        stream.next().await.expect("end-stream message").unwrap(),
+        ecw_connect::connect_shutdown_end_stream()
+    );
+    started.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn process_start_that_never_reports_ends_after_the_wait() {
+    let shutdown_token = CancellationToken::new();
+    let mut stream = shutdown_test_stream(
+        futures_util::stream::pending::<Result<SpacedProcessEvent, tonic::Status>>(),
+        false,
+        &shutdown_token,
+    );
+    shutdown_token.cancel();
+    let began = tokio::time::Instant::now();
+
+    // Not `unavailable`: the command may be running, so the client mustn't
+    // retry the start.
+    assert_eq!(
+        stream.next().await.expect("end-stream message").unwrap(),
+        ecw_connect::connect_unreported_start_end_stream()
+    );
+    assert_eq!(began.elapsed(), SHUTDOWN_START_WAIT);
+}
+
+#[tokio::test]
+async fn process_stream_flush_after_the_deadline_is_capped_in_bytes() {
+    let shutdown_token = CancellationToken::new();
+    let process_id = ProcessId::new();
+    let output = stdout_process_event(&process_id, &vec![b'x'; 256 * 1024]);
+    let mut stream = shutdown_test_stream(
+        futures_util::stream::repeat_with(move || Ok(output.clone())),
+        true,
+        &shutdown_token,
+    );
+    shutdown_token.cancel();
+
+    let mut delivered = 0;
+    loop {
+        let bytes = stream.next().await.expect("message").unwrap();
+        if bytes == ecw_connect::connect_shutdown_end_stream() {
+            break;
+        }
+        delivered += bytes.len();
+    }
+    assert!(delivered >= SHUTDOWN_FLUSH_BYTES);
+    assert!(delivered < SHUTDOWN_FLUSH_BYTES + 512 * 1024, "{delivered}");
+}

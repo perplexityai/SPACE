@@ -188,7 +188,7 @@ pub struct PreparedSidecarLaunch;
 
 pub struct JailerLaunch<'a> {
     pub sandbox_id: &'a str,
-    pub jailer_bin: &'a str,
+    pub jailer: crate::launch::JailerExecutable<'a>,
     pub firecracker_bin: &'a str,
     pub chroot_base_dir: &'a str,
     pub ns_path: &'a str,

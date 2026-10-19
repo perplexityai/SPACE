@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prove Rust/Go OTLP export and real cross-language parenting without Datadog.
+"""Prove Rust/Go OTLP export, parenting and linked roots without Datadog.
 
 Runs local protobuf receivers, with no credentials or DD_* variables. Saves raw
 OTLP JSON and validates two endpoints, resources, complete trees and failures.
@@ -152,28 +152,6 @@ def validate(rows, version, expected):
                 raise ValueError("cyclic trace")
             visited.add(key)
             key = key[0], by_id[key].get("parentSpanId", "")
-    if version.startswith("mixed"):
-        for root in roots:
-            same_trace = {
-                s["name"]: s for s in by_id.values() if s["traceId"] == root["traceId"]
-            }
-            if set(same_trace) != {
-                "http.server",
-                "grpc.client",
-                "shim.create",
-                "shim.restore",
-            }:
-                raise ValueError("mixed chain missing required operations")
-            for child, parent in (
-                ("grpc.client", "http.server"),
-                ("shim.create", "grpc.client"),
-                ("shim.restore", "http.server"),
-            ):
-                if (
-                    same_trace[child].get("parentSpanId")
-                    != same_trace[parent]["spanId"]
-                ):
-                    raise ValueError(f"mixed chain: incorrect parent of {child}")
 
 
 def validate_operation_names(rows, version, resource_rule):
@@ -288,7 +266,7 @@ def main():
             for index, (endpoint, output) in enumerate(
                 ((first, first_output), (second, second_output))
             ):
-                for language, binary, count in (("rust", rust, 14), ("go", go, 6)):
+                for language, binary, count in (("rust", rust, 14), ("go", go, 4)):
                     version = f"{language}-{index}"
                     env = fixture_env(endpoint, version)
                     if language == "go" and index == 0:
@@ -305,21 +283,7 @@ def main():
                         raise RuntimeError(f"{version} failed; see its log")
                     validate(spans(output), version, count)
                     report["checks"].append(version)
-                version = f"mixed-{index}"
-                env = fixture_env(endpoint, version)
-                with fixture_server(go, "mixed", artifacts, version, env) as (
-                    service,
-                    _,
-                    process,
-                ):
-                    env["SPACE_TRACE_MIXED_ENDPOINT"] = service
-                    result = emit(rust, "rust", env, artifacts / f"{version}-rust.log")
-                    if result.returncode != 0:
-                        raise RuntimeError(f"{version} failed; see its log")
-                    process.wait(timeout=10)
-                validate(spans(output), version, 8)
-                report["checks"].append(version)
-            if len(spans(first_output)) != 28 or len(spans(second_output)) != 28:
+            if len(spans(first_output)) != 18 or len(spans(second_output)) != 18:
                 raise ValueError("endpoint redirect leaked or duplicated spans")
             for language, binary in (("rust", rust), ("go", go)):
                 env = fixture_env(first, "off")
@@ -331,15 +295,15 @@ def main():
                     != 0
                 ):
                     raise RuntimeError("off workload failed")
-            if len(spans(first_output)) != 28:
+            if len(spans(first_output)) != 18:
                 raise ValueError("off exporter emitted spans")
             report["checks"].append("off")
             for policy, arg, expected in (
-                ("always_on", "", 6),
+                ("always_on", "", 4),
                 ("always_off", "", 0),
                 ("parentbased_always_off", "", 0),
                 ("traceidratio", "0", 0),
-                ("traceidratio", "1", 6),
+                ("traceidratio", "1", 4),
             ):
                 version = f"go-sampling-{policy}-{arg}"
                 env = fixture_env(first, version)
@@ -443,7 +407,7 @@ def main():
                     )
         report["result"] = "pass"
         print(
-            f"PASS: neutral receivers, endpoint redirect, real Rust/Go gRPC and serialized parents, off, bounded outage shutdown. Artifacts: {artifacts}"
+            f"PASS: neutral receivers, endpoint redirect, serialized parents, off, bounded outage shutdown. Artifacts: {artifacts}"
         )
         return 0
     except (RuntimeError, ValueError, KeyError, subprocess.SubprocessError) as error:

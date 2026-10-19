@@ -63,6 +63,13 @@ path differs from its unprivileged one (or split it in two); keep such tests
 asserting what they need, so a missing one fails the unprivileged step.
 `tests` and `all` still run the whole inventory in one process.
 
+A targeted local `cargo nextest run -p <crate>` for Postgres-backed tests also
+needs `-p pplx-space-db-test-fixtures`: the run-scoped setup script in
+`.config/nextest.toml` executes that crate's `space-nextest-postgres-setup`
+binary and fails closed when the run didn't build it. Add `--all-features`
+too, as CI does: some test modules rely on dependency features (tokio's
+`test-util`, for one) that only the workspace build unifies.
+
 Pull-request and merge-queue Rust tests reuse the Cargo target directory that
 main's cold build saved, and `ci/scripts/rust-target-cache.sh` stamps source
 mtimes so Cargo rebuilds only what changed since. That makes every compile-time

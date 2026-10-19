@@ -34,7 +34,7 @@ impl ReceiveRoot {
         configure_receiver(&mut command, &self.directory).map_err(error)?;
         remove_at(&self.directory, "instance".as_ref())?;
         remove_at(&self.directory, "instance.ro".as_ref())?;
-        let output = crate::host_command::stream(
+        let output = crate::host_command::stream_in_namespace(
             &mut command,
             crate::host_command::MUTATION_BUDGET,
             std::process::Stdio::from(stream),

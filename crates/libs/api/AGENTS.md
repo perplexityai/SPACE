@@ -1,8 +1,8 @@
 # `pplx-space-api`
 
-Before changing the substrate, or shared code that branches on the substrate
-(`Substrate::Direct`, `managed_by()`) or names a Direct-only table, read
-`src/controllers/substrate/AGENTS.md`.
+Before changing the substrate, or shared code that depends on the substrate
+(`capabilities()`, `as_kubernetes()`, `managed_by()`) or names a Direct-only
+table, read `src/controllers/substrate/AGENTS.md`.
 
 ## Changes
 

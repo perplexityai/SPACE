@@ -304,11 +304,27 @@ fn production_admission_restricts_selection_without_changing_defaults() {
     let candidate = &environments[1];
     let e0 = initial.definition().unwrap().reference();
     let c = candidate.definition().reference();
+    let same_kernel = environments[2].definition().reference();
     for production in [false, true] {
         for (reference, mode, accepted) in [
             (None, ExecutionSelectionMode::NewColdBoot, true),
             (Some(e0), ExecutionSelectionMode::NewColdBoot, true),
             (Some(c), ExecutionSelectionMode::NewColdBoot, !production),
+            (
+                Some(same_kernel),
+                ExecutionSelectionMode::NewColdBoot,
+                !production,
+            ),
+            (
+                Some(same_kernel),
+                ExecutionSelectionMode::ExistingColdBoot,
+                !production,
+            ),
+            (
+                Some(same_kernel),
+                ExecutionSelectionMode::PersistedStateRestore,
+                !production,
+            ),
             (
                 Some(c),
                 ExecutionSelectionMode::ExistingColdBoot,
@@ -317,7 +333,7 @@ fn production_admission_restricts_selection_without_changing_defaults() {
             (
                 Some(c),
                 ExecutionSelectionMode::PersistedStateRestore,
-                false,
+                !production,
             ),
             (
                 Some(EnvironmentReference::new(Digest::sha256([1; 32]))),
@@ -540,4 +556,33 @@ async fn legacy_runtime_placement_is_not_hidden_by_a_compiled_environment() {
             .as_ref()
             .is_some_and(|runtime| runtime.version == "1.17.0")
     }));
+}
+
+#[test]
+fn artifact_rpc_status_preserves_missing_paths_and_transient_io() {
+    for (errno, code) in [
+        (libc::ENOENT, tonic::Code::FailedPrecondition),
+        (libc::EACCES, tonic::Code::FailedPrecondition),
+        (libc::EIO, tonic::Code::Internal),
+        (libc::EBUSY, tonic::Code::Internal),
+    ] {
+        assert_eq!(
+            publish_status(PublishError::Io {
+                action: "inspect directory",
+                path: "/synthetic/artifacts".into(),
+                source: std::io::Error::from_raw_os_error(errno)
+            })
+            .code(),
+            code
+        );
+        assert_eq!(
+            remove_status(RemoveError::Io {
+                action: "inspect directory",
+                path: "/synthetic/artifacts".into(),
+                source: std::io::Error::from_raw_os_error(errno)
+            })
+            .code(),
+            code
+        );
+    }
 }

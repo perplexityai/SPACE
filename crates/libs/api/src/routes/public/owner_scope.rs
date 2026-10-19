@@ -2,7 +2,7 @@
 //! handler can read, mutate, mint a data-plane capability, or replay a response.
 //! ECW's legacy-org bridge is intentionally not part of this contract.
 
-use pplx_space_common_core::types::UserId;
+use pplx_space_common_core::types::{OrgId, UserId};
 
 use axum::{
     extract::{FromRequestParts, Path, Request, State},
@@ -17,16 +17,54 @@ use std::collections::HashMap;
 
 use super::error::PublicApiError;
 use crate::{
-    controllers::sandbox::SandboxAccessScope,
+    controllers::sandbox::{SandboxAccessScope, fetch_sandbox},
     federated_identity::{
         FEDERATED_SERVICE_GRANT_EXPIRES_AT_HEADER, FEDERATED_SERVICE_GRANT_HEADER,
         FEDERATED_SERVICE_GRANT_ISSUED_AT_HEADER, FederatedOwner, FederatedServiceGrant,
         federated_service_grant_from_headers,
     },
     middleware::auth::{AuthFederatedOwner, AuthOrg, AuthUser},
+    models::Sandbox,
     public_operations::PublicOperationStore,
     routes::AppState,
 };
+
+/// The sandbox row [`authorize`] loaded and admitted for this request.
+///
+/// Sandbox-scoped handlers reuse it through [`authorized_sandbox`] instead of
+/// loading the same row again microseconds later. Only the authorization read
+/// is shared: handlers still apply their own org check to it, and controller
+/// paths that need authoritative routing or lifecycle state keep re-reading it.
+#[derive(Debug, Clone)]
+pub(crate) struct AuthorizedSandbox(Sandbox);
+
+/// The handler-side owner check for a sandbox-scoped route.
+///
+/// Uses the row [`authorize`] already admitted when it is for the same sandbox;
+/// otherwise (a handler reached without that layer) loads the row exactly as
+/// the handlers did before. Either way the row must belong to `org_id`, and a
+/// missing or foreign row is the same 404.
+pub(super) async fn authorized_sandbox(
+    authorized: Option<axum::Extension<AuthorizedSandbox>>,
+    pool: &sqlx::PgPool,
+    org_id: OrgId,
+    sandbox_id: PublicSandboxId,
+) -> Result<Sandbox, PublicApiError> {
+    let sandbox = match authorized {
+        Some(axum::Extension(AuthorizedSandbox(sandbox)))
+            if PublicSandboxId::from(sandbox.id) == sandbox_id =>
+        {
+            sandbox
+        }
+        _ => fetch_sandbox(pool, sandbox_id.into())
+            .await?
+            .ok_or_else(|| PublicApiError::not_found("sandbox not found"))?,
+    };
+    if sandbox.org_id != org_id {
+        return Err(PublicApiError::not_found("sandbox not found"));
+    }
+    Ok(sandbox)
+}
 
 pub(super) async fn authorize(
     State(state): State<AppState>,
@@ -150,6 +188,8 @@ async fn authorize_request(state: &AppState, request: Request) -> Result<Request
                 .await
                 .map_err(super::sandboxes::controller_error)?;
         }
+        // The grant lives in its own table, so the row is unchanged by the upsert.
+        parts.extensions.insert(AuthorizedSandbox(sandbox));
     } else if let Some(raw) = params.get("operation_id") {
         let operation_id: OperationId = raw
             .parse()

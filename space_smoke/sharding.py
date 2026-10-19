@@ -61,8 +61,10 @@ _DURATION_SECONDS = {
         "local.private_template_build_isolation": 87,
         # Two episodes share passes: measured 255 s including initial
         # quarantine discovery and the real 60 s / 120 s retry gaps.
-        "local.quarantine_recovery_backs_off": 260,
         "local.rate_limiters_enforce_and_fail_open": 60,
+        # One Kind run: 16 s of phases (8.5 s suspend with the retried upload)
+        # plus sandbox cleanup.
+        "local.restarted_btrfs_send_is_rejected_and_retried": 30,
         "local.retention_claim_finish_forward": 80,
         "local.retention_restore_source_guard": 107,
         "local.snapshot_reaper_reclaims_backed_fork_snapshot": 147,
@@ -110,6 +112,9 @@ _DURATION_SECONDS = {
         "native_concurrency.independent_commands": 7,
         "native_concurrency.lifecycle_contention": 9,
         "native_concurrency.slow_reader": 7,
+        # Estimate until a bench run refreshes it: one data-plane rollout with
+        # the old pod held open by a stream, then its exit.
+        "native_recovery.attached_stream_drains_through_data_plane_restart": 60,
         "native_recovery.command_survives_data_plane_restart": 15,
         "native_recovery.queued_create_survives_api_restart": 25,
     },

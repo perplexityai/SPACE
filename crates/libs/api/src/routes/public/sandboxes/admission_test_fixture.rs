@@ -163,7 +163,7 @@ impl AdmissionPoolFixture {
     }
 
     pub(crate) fn controller_with(substrate: KubernetesSubstrate) -> SandboxController {
-        SandboxController::new(Substrate::Kubernetes(Box::new(substrate)))
+        SandboxController::new(Substrate::from_kubernetes(substrate))
     }
 
     /// A default-shape native create of the fixture template.
@@ -189,6 +189,24 @@ impl AdmissionPoolFixture {
     pub(crate) async fn create(
         &self,
         pool_claims: Option<&SandboxController>,
+        idempotency_key: &str,
+        request: CreateSandboxRequest,
+    ) -> Result<SandboxOperationResponse, PublicApiError> {
+        self.create_with(
+            pool_claims.map(|controller| super::NativeCreatePoolClaims {
+                controller,
+                inline: None,
+            }),
+            idempotency_key,
+            request,
+        )
+        .await
+    }
+
+    /// [`Self::create`] with inline execution configured as given.
+    pub(crate) async fn create_with(
+        &self,
+        pool_claims: Option<super::NativeCreatePoolClaims<'_>>,
         idempotency_key: &str,
         request: CreateSandboxRequest,
     ) -> Result<SandboxOperationResponse, PublicApiError> {

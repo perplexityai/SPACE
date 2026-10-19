@@ -155,10 +155,25 @@ pub struct StartupRecoveryLease {
 /// and the request's trace id as `origin_trace_id` itself; the sandbox's
 /// telemetry queries find it by them. It is sampled as the request was.
 pub(super) fn detached_trace_span(work: &'static str, sandbox_id: &str) -> tracing::Span {
+    let origin = pplx_space_observability::trace_propagation::traceparent_for_span(
+        &tracing::Span::current(),
+    );
+    linked_trace_span(work, sandbox_id, origin.as_deref())
+}
+
+/// A [`detached_trace_span`] linked to a saved `traceparent` rather than the
+/// current span, for work a queue runs after the request that queued it.
+pub(super) fn linked_trace_span(
+    work: &'static str,
+    sandbox_id: &str,
+    origin: Option<&str>,
+) -> tracing::Span {
     let span = tracing::info_span!(
         parent: None,
         "sbxmgr.detached",
+        otel.kind = "internal",
         otel.name = work,
+        "operation.name" = "sbxmgr.detached",
         otel.status_code = tracing::field::Empty,
         otel.status_description = tracing::field::Empty,
         sandbox_id = tracing::field::Empty,
@@ -170,13 +185,8 @@ pub(super) fn detached_trace_span(work: &'static str, sandbox_id: &str) -> traci
     if let Some(request_id) = pplx_space_observability::current_request_id() {
         span.record("request_id", request_id.as_str());
     }
-    if let Some(traceparent) =
-        pplx_space_observability::trace_propagation::traceparent_for_span(&tracing::Span::current())
-    {
-        pplx_space_observability::trace_propagation::link_root_to_origins(
-            &span,
-            [traceparent.as_str()],
-        );
+    if let Some(origin) = origin {
+        pplx_space_observability::trace_propagation::link_root_to_origins(&span, [origin]);
     }
     span
 }

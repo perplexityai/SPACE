@@ -49,12 +49,20 @@ jobs:
         uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
 
       # Reads the third-party image mirror (ci/mirrored-images.txt) and the
-      # layer cache; only main's token can also write the cache.
+      # layer cache; only main's token can also write the cache. Best-effort
+      # and bounded: without it every GHCR read falls back (the mirror to its
+      # sources, the Kind node image to a local build, the layer cache to a
+      # cold build), and main's cache export already ignores a failed push, so
+      # a GHCR outage costs time here, never the job.
       - &ghcr-login
         name: Log in to GHCR
         env:
           GHCR_TOKEN: ${{ github.token }}
-        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+        run: |
+          if ! printf '%s' "$GHCR_TOKEN" |
+            timeout --kill-after=10 60 docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin; then
+            echo "::warning::Could not log in to GHCR; its reads fall back to their sources"
+          fi
 
       - name: Build the Rust artifact image once
         env:

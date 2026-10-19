@@ -7,6 +7,9 @@ the shared Deployment runs the ingress activation listener, and only it is
 behind the space-api Service. Neither runs the migrations: the space-db-migrate
 Job (migrate-job.yaml) does, once, before either starts.
 */ -}}
+{{- if le (int .Values.terminationGracePeriodSeconds) (add (int .Values.preStopSleepSeconds) (int .Values.shutdownGraceSeconds)) -}}
+{{- fail "terminationGracePeriodSeconds must exceed preStopSleepSeconds + shutdownGraceSeconds" -}}
+{{- end -}}
 {{- range $surface := list "shared" "admin" }}
 {{- if or (eq $surface "shared") $.Values.admin.enabled }}
 {{- with $ }}
@@ -30,6 +33,7 @@ spec:
   {{- else }}
   replicas: {{ .Values.admin.replicas }}
   {{- end }}
+  minReadySeconds: {{ .Values.minReadySeconds }}
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ $name }}
@@ -59,8 +63,9 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      priorityClassName: {{ .Values.priorityClassName }}
       serviceAccountName: {{ .Values.serviceAccount.name }}
-      terminationGracePeriodSeconds: 10
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | int }}
       # docker/Dockerfile.api runs the api as space-api (UID and GID 952).
       # Secret files are root-owned, so the ingress activation listener reads
       # its key through this group, with mode 0440 on rpc-identity: the
@@ -77,6 +82,8 @@ spec:
             - {{ $surface }}
             - --listen
             - "0.0.0.0:{{ .Values.service.port }}"
+            - --shutdown-grace-secs
+            - {{ .Values.shutdownGraceSeconds | quote }}
           env:
             {{- if $shared }}
             # IngressActivationApi (docs/internal-rpc-tls.md, "Ingress
@@ -98,6 +105,15 @@ spec:
               value: space-node-api
             - name: SPACE_CLUSTER_API_TOKEN_PATH
               value: "/var/run/space-publication/cluster-api.token"
+            # The substrate's NodeApi credentials (SpaceBearerToken,
+            # crates/libs/common/svc/src/bearer_token.rs): one projected
+            # token per node-api surface, which node-api admits by TokenReview
+            # (space-node-api-local's auth allowlists). An explicit path makes a
+            # missing file an error rather than a fall back to the static token.
+            - name: SPACE_NODE_API_TOKEN_PATH
+              value: /var/run/space-auth/node-api.token
+            - name: SPACE_NODE_API_INTERNAL_TOKEN_PATH
+              value: /var/run/space-auth/node-api-internal.token
             # Datadog tracing: DD_AGENT_HOST routes via
             # status.hostIP to the node-local Agent selected by the backend
             # helper. OTLP comparisons require that receiver to be running.
@@ -148,6 +164,8 @@ spec:
               {{- include "space-cluster.dbPassword" (dict "ctx" . "role" "USER" "value" .Values.postgres.managedUserPassword) | nindent 14 }}
             - name: SPACE_DB_CREDS_PASSWORD
               {{- include "space-cluster.dbPassword" (dict "ctx" . "role" "CREDS" "value" .Values.postgres.managedCredentialsPassword) | nindent 14 }}
+            - name: POSTGRES_POOL_MAX_CONNECTIONS
+              value: {{ .Values.postgres.poolMaxConnections | quote }}
             - name: SPACE_INTERNAL_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -195,6 +213,11 @@ spec:
               value: {{ .Values.clusterActivationAdmission.enabled | quote }}
             - name: SPACE_API_CLIENT_CONCURRENCY_MODE
               value: {{ .Values.clientConcurrency.mode | quote }}
+            {{- if .Values.redis.url }}
+            # Both limiters' shared store; see `redis` in values.yaml.
+            - name: SPACE_REDIS_URL
+              value: {{ .Values.redis.url | quote }}
+            {{- end }}
             {{- if .Values.eppo.secretName }}
             - name: EPPO_SDK_KEY
               valueFrom:
@@ -241,11 +264,11 @@ spec:
             # activation delegation"): TokenReview with audience
             # space-cluster-api, no static fallback, and only the route
             # resolvers that have already authorized the request. No other
-            # api surface reads these settings.
+            # api surface reads these settings. The allowlist's namespace is
+            # the pod's own, read from its ServiceAccount mount
+            # (auth_namespace, crates/libs/common/svc/src/auth/k8s.rs).
             - name: SPACE_K8S_TOKEN_AUTH_ENABLED
               value: "true"
-            - name: SPACE_K8S_TOKEN_AUTH_NAMESPACE
-              value: {{ .Release.Namespace | quote }}
             - name: SPACE_K8S_TOKEN_AUTH_STATIC_FALLBACK_ENABLED
               value: "false"
             - name: SPACE_CLUSTER_API_AUTH_ALLOWED_SERVICE_ACCOUNTS
@@ -260,10 +283,25 @@ spec:
             - name: http
               containerPort: {{ .Values.service.port }}
               protocol: TCP
+          # Leave the entry Services' endpoints before SIGTERM stops the
+          # listener (values.yaml).
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: {{ .Values.preStopSleepSeconds | int }}
+          # The boot budget (values.yaml). Liveness and readiness start once
+          # it passes.
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: {{ .Values.startupProbe.periodSeconds }}
+            failureThreshold: {{ .Values.startupProbe.failureThreshold }}
           readinessProbe:
             # /readyz flips to ok only after KubernetesSubstrate's Pod
             # reflector has completed its initial LIST; this prevents traffic
-            # from hitting an api-server replica with a cold cache.
+            # from hitting an api-server replica with a cold cache. It reports
+            # draining from the moment SIGTERM arrives.
             httpGet:
               path: /readyz
               port: http
@@ -273,7 +311,6 @@ spec:
             httpGet:
               path: /healthz
               port: http
-            initialDelaySeconds: 15
             periodSeconds: 15
           {{- with .Values.resources }}
           resources:
@@ -290,6 +327,9 @@ spec:
               readOnly: true
             - name: publication-token
               mountPath: /var/run/space-publication
+              readOnly: true
+            - name: node-api-token
+              mountPath: /var/run/space-auth
               readOnly: true
             - name: route-signing
               mountPath: /var/run/space-route-signing
@@ -316,6 +356,18 @@ spec:
                   path: cluster-api.token
                   audience: space-cluster-api
                   expirationSeconds: 3600
+        - name: node-api-token
+          projected:
+            defaultMode: 0444
+            sources:
+              - serviceAccountToken:
+                  path: node-api.token
+                  audience: space-node-api
+                  expirationSeconds: {{ .Values.nodeApiTokenExpirationSeconds | int }}
+              - serviceAccountToken:
+                  path: node-api-internal.token
+                  audience: space-node-api-internal
+                  expirationSeconds: {{ .Values.nodeApiTokenExpirationSeconds | int }}
         - name: route-signing
           secret:
             secretName: {{ .Values.spaceApiRouteToken.ed25519.signingSecretName }}

@@ -691,3 +691,136 @@ async fn cpu_updates_require_execution_launch_evidence() {
         tonic::Code::NotFound
     );
 }
+
+#[tokio::test]
+async fn authentication_failure_preserves_status_and_existing_cpu_budget() {
+    use pplx_space_common_core::types::{Arch, SandboxActivationAttemptId, VcpuCount};
+    use pplx_space_node_runtime_core::{
+        artifact_store::managed_release_directory, catalog::CompiledEnvironment,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let service = RuntimeSupervisorService {
+        execution_store: crate::execution_store::ExecutionStore::at(temp.path().join("executions")),
+        ..Default::default()
+    };
+    let sandbox = SandboxId::new();
+    let execution = SandboxActivationAttemptId::new();
+    service.execution_store.write(sandbox, execution).unwrap();
+    let environment = CompiledEnvironment::for_architecture(Arch::X86_64)
+        .unwrap()
+        .remove(0);
+    let count = |value| VcpuCount::try_from_u32(value).unwrap();
+    for previous in [None, Some(count(1))] {
+        if let Some(previous) = previous {
+            service
+                .execution_store
+                .record_cpu_budget(sandbox, execution, previous)
+                .unwrap();
+        }
+        let release = environment.release();
+        let root = temp.path().join(managed_release_directory(
+            &release.release,
+            release.digest(),
+        ));
+        let launch = crate::verified_launch::VerifiedLaunch::from_environment(
+            &environment,
+            &root.join("bin/firecracker"),
+            &root.join("bin/jailer"),
+        )
+        .unwrap();
+        let result = service
+            .prepare_firecracker_launch(sandbox, execution, count(4), Some(launch))
+            .await;
+        let Err(error) = result else {
+            panic!("missing authenticated source was accepted")
+        };
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            service
+                .execution_store
+                .cpu_budget(sandbox, execution)
+                .unwrap(),
+            previous
+        );
+    }
+}
+
+#[tokio::test]
+async fn verified_launch_rejects_ambiguous_and_unsupported_inputs_before_execution() {
+    use pplx_space_node_runtime_core::{
+        launch_admission::supervisor_launch_status,
+        proto::{ArtifactIntegrityRequirement, VerifiedRuntimeLaunch},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let service = RuntimeSupervisorService {
+        execution_store: crate::execution_store::ExecutionStore::at(temp.path().join("executions")),
+        ..Default::default()
+    };
+    enum Invalid {
+        LegacyId,
+        MissingReference,
+        UnknownRequirement,
+        MissingRequirement,
+        UnknownEnvironment,
+        #[cfg(target_arch = "x86_64")]
+        Layout,
+    }
+    for invalid in [
+        Invalid::LegacyId,
+        Invalid::MissingReference,
+        Invalid::UnknownRequirement,
+        Invalid::MissingRequirement,
+        Invalid::UnknownEnvironment,
+        #[cfg(target_arch = "x86_64")]
+        Invalid::Layout,
+    ] {
+        let mut request = LaunchFirecrackerRequest {
+            verified_runtime: Some(VerifiedRuntimeLaunch {
+                sandbox_id: "0198dc20-05be-7000-8000-000000000001".into(),
+                environment_reference: format!("sha256:{}", "00".repeat(32)),
+                integrity_requirement: ArtifactIntegrityRequirement::AuthenticatedImmutableSources
+                    .into(),
+            }),
+            ..Default::default()
+        };
+        let input = request.verified_runtime.as_mut().unwrap();
+        let expected = match invalid {
+            Invalid::LegacyId => {
+                request.sandbox_id = input.sandbox_id.clone();
+                tonic::Code::InvalidArgument
+            }
+            Invalid::MissingReference => {
+                input.environment_reference.clear();
+                tonic::Code::InvalidArgument
+            }
+            Invalid::UnknownRequirement => {
+                input.integrity_requirement = i32::MAX;
+                tonic::Code::FailedPrecondition
+            }
+            Invalid::MissingRequirement => {
+                input.integrity_requirement = 0;
+                tonic::Code::FailedPrecondition
+            }
+            Invalid::UnknownEnvironment => tonic::Code::FailedPrecondition,
+            #[cfg(target_arch = "x86_64")]
+            Invalid::Layout => {
+                input.environment_reference =
+                    pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
+                        pplx_space_common_core::types::Arch::X86_64,
+                    )
+                    .unwrap()[0]
+                        .definition()
+                        .reference()
+                        .to_string();
+                request.firecracker_bin = "/synthetic/invalid-layout".into();
+                tonic::Code::InvalidArgument
+            }
+        };
+        let error = service
+            .launch_firecracker_owned(request, None)
+            .await
+            .unwrap_err();
+        assert_eq!(supervisor_launch_status(error).code(), expected);
+        assert!(!temp.path().join("executions").exists());
+    }
+}

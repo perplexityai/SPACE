@@ -18,9 +18,10 @@ migration. This script does the per-node sequencing:
     Implementation: top-of-loop reconcile to x/x/x, per-wave drop of source
     `min` just before issuing terminates, then re-reconcile on the next
     iteration.
-  * Issues `POST /admin/v1/nodes/{id}:drain
-    {"replace_after_terminate": false, "mode": "forced"}` against the SPACE
-    admin API for up to `--max-concurrent-node-drains` source nodes at a time.
+  * Issues `POST /admin/api/v1/nodes/{id}:drain
+    {"replace_after_terminate": false, "mode": "forced",
+    "require_undrained": true}` against the SPACE admin API for up to
+    `--max-concurrent-node-drains` source nodes at a time.
     `mode` is explicit because the API default is `gentle`, which waits for
     residents to leave on their own and would stall a wave on any long-lived
     sandbox. ASG terminate-with-decrement decrements source
@@ -98,6 +99,10 @@ class Event(enum.StrEnum):
     WAITING_SOURCE_DESIRED_ZERO = "waiting_source_desired_zero"
     EVACUATION_COMPLETE = "evacuation_complete"
     DRAIN_STARTED = "drain_started"
+    DRAIN_SKIPPED_ALREADY_DRAINING = "drain_skipped_already_draining"
+    DRAIN_SKIPPED_PHASE_UNREADABLE = "drain_skipped_phase_unreadable"
+    DRAIN_COMMITTED_SUBSTRATE_PATCH_FAILED = "drain_committed_substrate_patch_failed"
+    DRAIN_WAVE_MADE_NO_PROGRESS = "drain_wave_made_no_progress"
     TERMINATE_STARTED = "terminate_started"
     TERMINATE_BLOCKED_ACTIVE_SANDBOXES = "terminate_blocked_active_sandboxes"
     TERMINATE_BLOCKED_PHASE_DRIFT = "terminate_blocked_phase_drift"
@@ -243,6 +248,63 @@ class Ec2Instance:
     state: str
 
 
+# Every admin route lives under this prefix, spelled once so the four call sites
+# cannot drift apart from each other or from the router.
+#
+# `/admin/api/v1` is the spelling that resolves everywhere: the shared-host
+# api-server mounts it, the dedicated admin host reaches the same tree at `/v1`,
+# and the ingress `/admin` rule is a bare `pathType: Prefix` with no
+# rewrite-target, so the path arrives at the backend intact. `space-admin-cli`
+# picked it for the same reason (`admin_client.rs`, `ADMIN_API_PREFIX`).
+#
+# Getting it wrong is expensive to notice, which is why it is a named constant
+# rather than four literals. `list_nodes` is the first admin call in a tick, so
+# a prefix the router does not mount raises before any of `run_loop`'s exit
+# paths is reachable; the tick handler emits `tick_error`, sleeps
+# `--poll-interval-sec`, and loops. With no deadline and no max-tick count the
+# process retries forever, draining nothing, and never exits with any status.
+ADMIN_API_PREFIX = "/admin/api/v1"
+
+
+def resolved_drain_mode(raw: str | None) -> str:
+    """Resolve a raw `drain_mode` the way the control plane does.
+
+    Mirrors `NodeDrainMode::from_column_str`: NULL and any unrecognized value
+    read as `gentle`, so a mode nobody set — or one this build cannot parse —
+    never selects the evacuating branch. Mirrored rather than referenced because
+    this process has no access to that code, and kept to a single function so
+    there is one place to correct if the closed set ever grows.
+
+    Used only for reporting. Nothing here decides anything on a mode; the
+    endpoint owns that, and duplicating a safety rule for a decision would be
+    the wrong trade.
+    """
+    return raw if raw in ("gentle", "forced") else "gentle"
+
+
+@dataclasses.dataclass(frozen=True)
+class NodeDrainRead:
+    """The drain columns of one node, as the pre-POST re-read in
+    `AdminApi.drain` sees them. No occupancy counts: that read asks the
+    endpoint not to compute them."""
+
+    drain_phase: str | None
+    drain_mode: str | None
+    terminate_decrement_capacity: bool
+
+
+class MalformedAdminResponse(Exception):
+    """A 2xx admin response whose body is not the shape we asked for.
+
+    Distinct from a transport error and from a 404: the request *succeeded* and
+    something answered, but the answer is missing a field the real endpoint
+    always sends. The dangerous reading is a body from somewhere other than the
+    node route — a proxy error page rendered as JSON, a redirect landing
+    elsewhere, a future response shape — because `dict.get` turns every one of
+    those into a plausible-looking default.
+    """
+
+
 @dataclasses.dataclass(frozen=True)
 class AdminNode:
     id: str
@@ -259,6 +321,12 @@ class AdminNode:
     # `replace_after_terminate=false`) means the ASG would auto-replace the
     # terminated node, breaking the rollout invariant.
     terminate_decrement_capacity: bool
+    # The mode of the drain in flight, as the admin API reports it. Carried so a
+    # refusal can name *which* kind of drain it declined to escalate: an
+    # inherited `gentle` one is the destructive case, a `forced` one is our own
+    # after a restart. Last, with a default, so the many fixtures that build this
+    # struct without it keep working — nothing but the skip event reads it.
+    drain_mode: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -431,32 +499,227 @@ class AdminApi:
 
     def list_nodes(self) -> list[AdminNode]:
         resp = self.session.get(
-            f"{self.base_url}/admin/v1/nodes", timeout=self.timeout
+            f"{self.base_url}{ADMIN_API_PREFIX}/nodes", timeout=self.timeout
         )
         resp.raise_for_status()
         rows = resp.json()
         return [parse_admin_node(r) for r in rows]
 
-    def drain(self, node_id: str, replace_after_terminate: bool) -> None:
-        url = f"{self.base_url}/admin/v1/nodes/{node_id}:drain"
+    def get_node(self, node_id: str) -> NodeDrainRead | None:
+        """Read one node's drain state. `None` when the admin row is gone (404).
+
+        Asks for `include_occupancy=false`: the caller needs the drain columns
+        and nothing else, and the occupancy and drainability counts cost a
+        statement per candidate whose failure or timeout would otherwise skip
+        a drain the endpoint would have accepted. The counts come back `null`
+        on that response, which is why this returns a `NodeDrainRead` rather
+        than an `AdminNode`.
+        """
+        resp = self.session.get(
+            f"{self.base_url}{ADMIN_API_PREFIX}/nodes/{node_id}",
+            params={"include_occupancy": "false"},
+            timeout=self.timeout,
+        )
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        row = resp.json()
+        if not isinstance(row, dict) or "drain_phase" not in row:
+            # `AdminNodeResponse.drain_phase` is an `Option<String>` with no
+            # `skip_serializing_if`, so this endpoint always emits the key —
+            # `"drain_phase": null` for an undrained node. Absence therefore
+            # means the body did not come from this route, and `row.get` would
+            # read it as NULL: the exact value that tells the caller's guard the
+            # node is undrained and safe to drain. Refuse instead.
+            raise MalformedAdminResponse(
+                f"admin node response for {node_id} has no drain_phase field"
+            )
+        return NodeDrainRead(
+            drain_phase=row.get("drain_phase"),
+            drain_mode=row.get("drain_mode"),
+            terminate_decrement_capacity=bool(
+                row.get("terminate_decrement_capacity", False)
+            ),
+        )
+
+    def drain(self, node_id: str, replace_after_terminate: bool) -> bool:
+        url = f"{self.base_url}{ADMIN_API_PREFIX}/nodes/{node_id}:drain"
         # `mode` is explicit because the API default is `gentle` — cordon and
         # wait for residents to leave on their own. A blue/green MNG rollout
         # replaces the node, so waiting on a long-lived sandbox would stall the
         # wave indefinitely; the rollout accepts the per-node evacuation
         # disruption in exchange for bounded progress.
+        #
+        # `require_undrained` makes the POST start-only: the endpoint refuses
+        # it with a 409 if the node already has any drain phase, checked under
+        # the same row lock as the write. That is what keeps this request from
+        # ever escalating a drain somebody else started.
         body = {
             "replace_after_terminate": replace_after_terminate,
             "mode": "forced",
+            "require_undrained": True,
         }
+
+        # Re-read the phase immediately before posting, and skip a node whose
+        # drain already exists.
+        #
+        # `pick_drain_candidates` filters on the tick's `list_nodes()` snapshot,
+        # so a drain someone else started inside the snapshot window still looks
+        # like `DrainPhase.NONE` here. The admin `:drain` endpoint accepts a
+        # forced request against a gentle-draining node and escalates it in
+        # place, so posting on that stale read could escalate a human's gentle
+        # drain and arm the stale-transient sweep, with no operator in the loop.
+        #
+        # Safety doesn't rest on this read: `require_undrained` in the body
+        # makes the endpoint refuse the POST under its row lock, which also
+        # covers a drain that lands between this read and the POST. The read
+        # is here so the common case is skipped without a write attempt, and so
+        # the skip event can report the drain it found.
+        try:
+            current = self.get_node(node_id)
+        except MalformedAdminResponse as err:
+            emit_event(
+                Event.DRAIN_SKIPPED_PHASE_UNREADABLE,
+                node_id=node_id,
+                reason=str(err),
+            )
+            return False
+        if current is None:
+            # Fail closed. A 404 here means either the admin row vanished — in
+            # which case the POST would 404 too — or the GET did not reach a
+            # node route at all, e.g. a wrong path prefix. The second is the
+            # dangerous reading: it would make this guard silently inert for
+            # every candidate, forever, with the POSTs proceeding exactly as
+            # they did before it existed. A guard that cannot read the state it
+            # guards has to refuse, not wave the request through.
+            emit_event(
+                Event.DRAIN_SKIPPED_PHASE_UNREADABLE,
+                node_id=node_id,
+                reason="admin row not found",
+            )
+            return False
+        if current.drain_phase is not None:
+            emit_event(
+                Event.DRAIN_SKIPPED_ALREADY_DRAINING,
+                node_id=node_id,
+                drain_phase=current.drain_phase,
+                # Both the raw column and its resolution, because for this
+                # field they carry different information and the operator
+                # needs both. `AdminNodeResponse.drain_mode` is
+                # `skip_serializing_if = "Option::is_none"`, so a node
+                # draining with `drain_mode IS NULL` omits the key entirely
+                # and the raw value here is `None` — and NULL resolves to
+                # *gentle*, which is the destructive case this refusal exists
+                # to name. Reporting only the raw value would print `null` for
+                # exactly the drain worth paging on, while an explicit
+                # `"gentle"` printed normally.
+                drain_mode=current.drain_mode,
+                drain_mode_resolved=resolved_drain_mode(current.drain_mode),
+                terminate_decrement_capacity=current.terminate_decrement_capacity,
+            )
+            return False
+
         if self.dry_run:
             emit_event(
                 Event.DRY_RUN_DRAIN,
                 node_id=node_id,
                 replace_after_terminate=replace_after_terminate,
             )
-            return
+            return True
         resp = self.session.post(url, json=body, timeout=self.timeout)
+        if (
+            resp.status_code == 409
+            and self._response_field(resp, "current_drain_phase") is not None
+        ):
+            # The node gained a drain phase between the read above and this
+            # POST, and `require_undrained` made the endpoint refuse it. Only a
+            # 409 naming the phase means that: the admin API also answers 409
+            # for a retryable serialization or deadlock abort, which started no
+            # drain and falls through to `raise_for_status` below.
+            emit_event(
+                Event.DRAIN_SKIPPED_ALREADY_DRAINING,
+                node_id=node_id,
+                drain_phase=self._response_field(resp, "current_drain_phase"),
+                refused_by="endpoint",
+            )
+            return False
+        if resp.status_code == 502 and self._drain_committed_despite_502(resp):
+            # The endpoint commits the Postgres transition and *then* patches
+            # the substrate, deliberately, so that a failed patch is
+            # recoverable rather than leaving the scheduler and the DB
+            # disagreeing. A 502 from this handler therefore means the drain
+            # started — the row is `draining`, which is what `db_state` above
+            # is checked for.
+            #
+            # Whether the *cordon* is then repaired is a separate and
+            # conditional question, and the endpoint answers it in the same
+            # body: `reconciler_will_retry` is true only for a
+            # `managed_by = 'k8s'` node in `draining` or `terminating`. It holds
+            # for every candidate here, but not because they came out of
+            # `describe-auto-scaling-groups`: `nodes.managed_by` defaults to
+            # `'space'`, and exactly two paths write `'k8s'` — the Kubernetes
+            # substrate's inventory upsert and the node daemon's registration
+            # bootstrap. Both are upserts whose `ON CONFLICT DO UPDATE` arm does
+            # set `managed_by`, so what keeps an existing `'space'` row from
+            # being adopted is the `WHERE nodes.managed_by = 'k8s'` predicate on
+            # each of those arms — not the shape of the statement. The daemon
+            # path surfaces the refusal as a `failed_precondition`. It holds
+            # because these instances join the kube cluster and are registered
+            # by one of those two, whichever runs first. `AdminNode` carries no
+            # `managed_by`, so this process cannot check it — which is why the
+            # value is carried into the event rather than branched on.
+            #
+            # Treating it as a failure was wrong in a way that only showed up
+            # in telemetry: the node would not be booked into `drain_issued`,
+            # no `drain_started` would be emitted, a `tick_error` would be
+            # reported for a request that had in fact succeeded, and a wave of
+            # one such node would report `drain_wave_made_no_progress` while
+            # having made exactly the progress it was asked for. The
+            # concurrency cap self-corrects (`pick_drain_candidates` recounts
+            # `in_progress` from the next tick's snapshot, which now sees the
+            # node as `draining`), so the run stayed correct while its own
+            # record of what it did was wrong.
+            emit_event(
+                Event.DRAIN_COMMITTED_SUBSTRATE_PATCH_FAILED,
+                node_id=node_id,
+                error=self._response_field(resp, "error"),
+                reconciler_will_retry=self._response_field(
+                    resp, "reconciler_will_retry"
+                ),
+            )
+            return True
         resp.raise_for_status()
+        return True
+
+    @staticmethod
+    def _response_field(resp: Any, key: str) -> Any:
+        """One field out of a JSON body, or `None` if the body is not JSON."""
+        try:
+            payload = resp.json()
+        except Exception:  # noqa: BLE001 - a non-JSON body is the case handled
+            return None
+        return payload.get(key) if isinstance(payload, dict) else None
+
+    def _drain_committed_despite_502(self, resp: Any) -> bool:
+        """Did this 502 come from the admin handler *after* its commit?
+
+        Keyed on the body rather than the status, because the two 502s that
+        reach this client mean opposite things. The handler's own carries
+        `db_state` — the re-read row — and a non-NULL `drain_phase` in it is
+        proof the transition committed. A 502 from anything in front of the
+        api-server (load balancer, ingress, service mesh) carries no such body,
+        and for that one the drain did **not** start.
+
+        Getting this backwards in the permissive direction is the worse error:
+        booking a node whose drain never committed removes it from candidacy
+        for the rest of the run, so the rollout would skip a node it never
+        drained. So the default is to raise, and only positive evidence of a
+        committed transition opts out.
+        """
+        db_state = self._response_field(resp, "db_state")
+        if not isinstance(db_state, dict):
+            return False
+        return db_state.get("drain_phase") is not None
 
     def terminate(self, node_id: str) -> dict[str, Any] | None:
         """POST `:terminate`. Returns `None` on success, or the 409 body when the
@@ -470,7 +733,7 @@ class AdminApi:
         terminate wave through the caller's broad-except. Every other status still
         raises."""
 
-        url = f"{self.base_url}/admin/v1/nodes/{node_id}:terminate"
+        url = f"{self.base_url}{ADMIN_API_PREFIX}/nodes/{node_id}:terminate"
         if self.dry_run:
             emit_event(Event.DRY_RUN_TERMINATE, node_id=node_id)
             return None
@@ -490,6 +753,7 @@ def parse_admin_node(row: dict[str, Any]) -> AdminNode:
         k8s_node_name=row.get("k8s_node_name"),
         address=row.get("address"),
         drain_phase=row.get("drain_phase"),
+        drain_mode=row.get("drain_mode"),
         drain_started_at=parse_rfc3339(row.get("drain_started_at")),
         state=row.get("state"),
         sandboxes_active=int(row.get("sandboxes_active", 0)),
@@ -785,10 +1049,35 @@ def pick_drain_candidates(
     deadlock the rest of the wave at concurrency caps of 1.
 
     `already_drained_ids` lists node IDs the orchestrator has POSTed `:drain`
-    to in this process. The admin `:drain` endpoint is not idempotent — it
-    returns 409 when the row is already `draining` — so without this filter
-    a stale `list_nodes()` read between drain commit and the next tick would
-    re-POST and surface as a noisy `tick_error`.
+    to in this process, so a stale `list_nodes()` read between drain commit
+    and the next tick does not re-POST.
+
+    The admin `:drain` endpoint accepts a forced request against a
+    gentle-draining node and escalates it in place, so a POST reaching an
+    inherited drain would be destructive: evacuation plus the stale-transient
+    sweep. This orchestrator never sends one. Every POST carries
+    `require_undrained: true`, which the endpoint checks under its row lock,
+    so a node that has any drain phase by the time the POST is served is a 409
+    and nothing is written.
+
+    `pick_drain_candidates` only ever offers `DrainPhase.NONE` nodes, so a node
+    already draining is excluded on any tick that sees it as such. Two windows
+    get past that, and both end at the endpoint's refusal:
+
+    * **Our own stale read.** A `list_nodes()` snapshot still showing `NONE` for
+      a node whose `:drain` has already committed. In-process
+      `already_drained_ids` closes it, and a restart empties that set — so after
+      one, the first tick *offers* a node this process drained moments earlier.
+      The phase re-read in `drain()` sees `draining` and skips it with
+      `drain_skipped_already_draining`.
+    * **Somebody else's drain, committed inside our snapshot window.** An
+      operator running `space-admin-cli drain-node <node>` by hand during a wave. The
+      phase re-read in `drain()` skips it if the drain is visible by then;
+      if it commits between that read and the POST, the endpoint refuses the
+      POST and `drain()` emits the same event with `refused_by: endpoint`.
+
+    This *filter* closes neither, because the set it tracks is only what this
+    process drained.
 
     Picks are distributed proportionally across AZs so the source ASG's
     per-AZ count shrinks at roughly the same rate. A purely `instance_id`-
@@ -1941,18 +2230,13 @@ def run_loop(cfg: Config, aws: AwsClients, api: AdminApi) -> int:
                     pending_decrements=source_pending_decrements,
                     dry_run=cfg.dry_run,
                 )
-                for ns in to_drain:
-                    assert ns.admin is not None
-                    api.drain(ns.admin.id, replace_after_terminate=False)
-                    drain_issued.add(ns.admin.id)
-                    emit_event(
-                        Event.DRAIN_STARTED,
-                        cohort=cfg.cohort,
-                        node_id=ns.admin.id,
-                        k8s_node_name=ns.admin.k8s_node_name,
-                        instance_id=ns.instance_id,
-                    )
-                    last_phase[ns.admin.id] = DrainPhase.DRAINING
+                issue_drain_wave(
+                    api,
+                    to_drain,
+                    cohort=cfg.cohort,
+                    drain_issued=drain_issued,
+                    last_phase=last_phase,
+                )
 
             # Drive `drained -> terminating` from the orchestrator regardless
             # of whether the cluster's `drained_node_terminator` reconciler
@@ -2222,6 +2506,89 @@ PHASE_TO_EVENT: dict[DrainPhase, Event] = {
     DrainPhase.DRAINED: Event.DRAINED,
     DrainPhase.TERMINATING: Event.TERMINATING,
 }
+
+
+def issue_drain_wave(
+    api: AdminApi,
+    to_drain: list[NodeStatus],
+    *,
+    cohort: str,
+    drain_issued: set[str],
+    # `dict[str, str]`, matching the declaration at the call site and
+    # `emit_phase_transitions`, which shares this dict. `DrainPhase` is a
+    # `StrEnum`, so writing a member in is still a `str`; annotating the
+    # parameter as `dict[str, DrainPhase]` made mypy reject the call outright,
+    # because `dict` is invariant in its value type.
+    last_phase: dict[str, str],
+) -> int:
+    """POST `:drain` for each candidate. Returns how many were actually issued.
+
+    Extracted from the tick so the two decisions here are testable, because both
+    are invisible from `AdminApi.drain`'s own tests and both are silent when
+    wrong:
+
+    * **A refusal must not be booked.** `drain` returns `False` when it declines
+      — somebody else's drain landed inside our snapshot window, or the phase
+      could not be read. Adding such a node to `drain_issued` would remove it
+      from candidacy permanently *and* count it against
+      `--max-concurrent-node-drains` forever, so a wave would quietly lose a
+      slot per refusal until it could no longer drain anything.
+    * **A failure must be contained per node.** `drain` reads before it posts,
+      so it has two ways to raise instead of one, and `pick_drain_candidates`
+      orders deterministically — an uncontained raise on the first candidate
+      would starve every later one *and* skip the terminate phase in the same
+      block, every tick, turning a slow wave into a stalled one.
+
+    A wave that had candidates and issued none of them emits
+    `Event.DRAIN_WAVE_MADE_NO_PROGRESS`. Reported here rather than by the caller
+    because both numbers the decision needs are local: the count of candidates
+    and the count issued. Deciding it from the return value alone conflated an
+    all-refused wave with an empty one, since both give zero.
+    """
+    issued_count = 0
+    for ns in to_drain:
+        assert ns.admin is not None
+        try:
+            issued = api.drain(ns.admin.id, replace_after_terminate=False)
+        except Exception as err:  # noqa: BLE001 - per-node containment
+            emit_event(
+                Event.TICK_ERROR,
+                cohort=cohort,
+                node_id=ns.admin.id,
+                error=str(err),
+                phase="drain",
+            )
+            continue
+        if not issued:
+            continue
+        drain_issued.add(ns.admin.id)
+        issued_count += 1
+        emit_event(
+            Event.DRAIN_STARTED,
+            cohort=cohort,
+            node_id=ns.admin.id,
+            k8s_node_name=ns.admin.k8s_node_name,
+            instance_id=ns.instance_id,
+        )
+        last_phase[ns.admin.id] = DrainPhase.DRAINING
+    if to_drain and issued_count == 0:
+        # Every candidate was refused or errored. Reported because the
+        # alternative is silence: a wave that declines all of them — the shape a
+        # foreign drain on the only slot, or an unreadable phase on every read,
+        # produces — otherwise looks exactly like a wave with nothing to do,
+        # right up to the zero exit code. `drain_skipped_*` says why per node;
+        # this says the wave as a whole is not moving.
+        #
+        # `to_drain and` is load-bearing: `to_drain` is empty on every tick after
+        # the last node is drained, which is the steady state of a finishing
+        # rollout. Without the conjunct this would fire on each of those ticks
+        # and mean the opposite of what it says.
+        emit_event(
+            Event.DRAIN_WAVE_MADE_NO_PROGRESS,
+            cohort=cohort,
+            candidates=len(to_drain),
+        )
+    return issued_count
 
 
 def detect_stuck(

@@ -213,13 +213,124 @@ schema redesign.
 
 ## Explicit environment selection
 
+### Execution artifact integrity
+
+Artifact identity, execution approval and host integrity enforcement are separate
+properties. The supervisor's `VerifiedRuntimeLaunch` input names a complete
+environment and requires authenticated, immutable runtime and boot sources.
+It contains no host paths or filesystem mechanism. An adapter must reject unknown
+integrity requirements; a signature check alone does not establish immutability.
+Host and guest platforms retain their independent meanings.
+
+On Linux hosts supporting the fixed fs-verity profile, node-manager creates
+root-owned execution copies of the approved Firecracker, jailer and guest kernel
+under the cache's `managed` namespace. The durable artifact store remains on its
+existing filesystem. Initial copies are checked against their content SHA-256;
+cache files are sealed and measured against independently pinned verity digests.
+The profile uses SHA-256, 4096-byte blocks and no salt. Verity digests are separate
+catalog metadata: E0 and the other environment references do not change.
+
+Existing cache files are sealed in place. Node-manager warms the cache in tracked
+background work at startup; inventory consumers await the same serialized discovery,
+while unrelated lifecycle RPCs can serve. Missing copies trigger a support probe
+before publication. Existing sealed copies are measured without probing support
+again or issuing fsyncs. Unsupported hosts do not create
+unused execution copies. Restart validation measures sealed files without hashing
+their entire contents again. An empty protected cache directory, including a
+release with only an empty `bin/` remaining, is republished. Existing files,
+symlinks and unexpected entries are retained for operator repair. Baked kernel
+sources retain the execution cache's sticky-parent protection; durable store
+checks stay strict.
+There are no mutable verification receipts. A mismatch withdraws the affected
+binding and never authorizes another copy with different bytes.
+
+Node-manager supplies locations through the Firecracker adapter's existing binary
+path fields. The portable `VerifiedRuntimeLaunch` envelope remains independent of
+host paths and mechanisms. The supervisor validates that both locations name the
+compiled release layout, checks the same full directory ancestry as staging, and
+authenticates bytes against its own cached catalog. No shared location pointer or independent
+supervisor environment-variable setting is needed.
+
+Resolution carries the selected environment and each boot component's integrity
+into launch preparation. Compiled protected boots reject missing component
+protection. Historical unbound custom-kernel execution remains a deliberate legacy
+path, with a warning sampled once per minute per process and a
+`node_mgr.execution.legacy_source_launch` counter for every launch; it does
+not claim complete-environment integrity. Adoption of a resident VM skips cold-launch
+integrity admission and does not count as a legacy launch. An empty node reports
+absent artifacts rather than failed verification.
+At launch, runtime-supervisor opens and measures the jailer, then executes that
+same descriptor. It also authenticates the Firecracker source in the protected
+cache. Explicitly tagged protected-launch admission refusals preserve their
+`InvalidArgument` or `FailedPrecondition` status through node-manager and occur
+before recording a CPU launch budget or spawning a process. Transient errors
+opening, measuring or inspecting sources retain retryable `Internal` status and
+carry no admission-refusal tag. Other supervisor failures keep the previous `Internal` mapping. The upstream
+jailer retains its independent per-VM executable copy and isolation behavior. Node-manager authenticates the kernel descriptor and links
+that inode into the jail. Stacked rootfs, memory and encrypted-snapshot directory
+binds are drained in a bounded loop before recursive jail removal;
+unmount failure, exhaustion of the cleanup budget or failed jail removal refuses
+launch. An operator can inspect mounts and retry start after repair. Failed
+cleanup must not permit reuse of an old executable. Mutable rootfs and snapshot
+artifacts are outside this sealing contract.
+
+The privileged Rust CI lane runs the sealing and authenticated-link tests on its
+disposable btrfs filesystem (`SPACE_NOCOW_TEST_BTRFS_DIR`). With
+`SPACE_CI_REQUIRE_TEST_PRIVILEGE` enabled, missing privilege, a missing fixture,
+or unsupported fs-verity fails these tests rather than skipping the assertions.
+
+These protections trust the host kernel, node-manager, supervisor and namespace
+ownership. They do not establish supply-chain provenance, attest an adopted
+running VM, or defend against host-root compromise. Containment and slot-UID
+cleanup remain necessary even when source artifacts are sealed.
+
+Deploy supervisor readers before node-manager writers on capable hosts. Verified
+requests omit the legacy sandbox ID, so an old supervisor rejects
+them before spawning; successful replies acknowledge the environment reference.
+Legacy supervisor requests remain accepted with their existing protection. Unsupported
+host kernels or filesystems emit an explicit warning and retain SHA-256-verified
+legacy execution without claiming the new integrity guarantee. Integrity failures
+on a supported backend do not take this fallback. Staging resource or I/O failures
+also leave the affected binding unavailable instead of downgrading it. Transient
+failures, including disk exhaustion and I/O errors, permit rediscovery on subsequent
+inventory requests after a ten-second backoff. Unsafe directories require repair;
+changes to any execution-cache ancestor invalidate the observation. Fleet-wide
+mandatory enforcement requires a separate capability/admission rollout.
+
+Commissioning must check the running host kernel's `CONFIG_FS_VERITY` and the
+execution-cache filesystem, including the loopback cache used without NVMe.
+Before rollout, inspect the complete configured cache path with `namei -l` on a
+canary of each image type; a symlinked or writable non-sticky ancestor is refused.
+Node-manager must retain `CAP_DAC_READ_SEARCH`: linking the authenticated kernel
+uses [`linkat(AT_EMPTY_PATH)`](https://man7.org/linux/man-pages/man2/linkat.2.html).
+Sealing a kernel binary cannot enable fs-verity in the host running SPACE.
+Keep host filesystem and kernel support while sealed cache files remain in use;
+reverting a node service does not unseal those files.
+Measure warm-cache and cold-cache launches independently; no activation-latency
+guarantee follows from the digest ioctl's constant-time behavior alone.
+
+To author additional trusted measurements, first authenticate the artifact's
+existing SHA-256, then use `fsverity digest --hash-alg sha256 --block-size 4096`
+with no salt. Source/signing changes must preserve existing environment identities
+or introduce separately qualified environments. See the
+[Linux fs-verity documentation](https://docs.kernel.org/filesystems/fsverity.html).
+
+### Selection and lifecycle
+
 The compiled execution catalog approves complete runtime, kernel and
 compatibility bindings independently of downloadable artifact pins. It includes
-E0 (Firecracker 1.15.1 / Linux 6.1.155) and a second Linux/x86_64 binding
-(Firecracker 1.17.0 / Linux 6.18.44):
+three Linux/x86_64 bindings: E0 (Firecracker 1.15.1 / Linux 6.1.155),
+Firecracker 1.17.0 / Linux 6.1.155, and Firecracker 1.17.0 / Linux 6.18.44.
+The 1.17.0 / 6.18.44 binding has reference:
 
 ```text
 sha256:959f1181ac69f0dde7125fbc81be6fcd75b64e9e06e7a393f067b96eb6fb2ac4
+```
+
+The 1.17.0 / 6.1.155 binding has reference:
+
+```text
+sha256:6e97c03b2523af6cc7b8e67bcde3fd89cf756c1958b10c24472aeadd68a32e0a
 ```
 
 Installation does not select an environment. Node-manager uses the existing
@@ -239,7 +350,19 @@ Node-manager verifies each environment's release and kernel from the managed
 store and stages its kernel into the execution cache. Cache loss triggers
 reconstruction. Missing or corrupt non-default artifacts cannot replace or
 withdraw E0. Each compiled binding records its qualified lifecycle support; the
-1.17.0 / 6.18.44 binding currently supports cold execution only.
+1.17.0 / 6.18.44 and 1.17.0 / 6.1.155 bindings support cold execution and
+same-environment memory snapshots. Restoring across environment identities is
+not an upgrade path: each snapshot retains its original VMM and kernel binding.
+The 6.1.155 kernel keeps its existing artifact identity when paired with 1.17.0.
+Non-default snapshot capture carries an environment-bound sandbox identity on
+`CreateSnapshot`, with the legacy sandbox ID omitted. Old node-managers reject
+that request before capture or encrypted teardown. New nodes verify the running
+sandbox's metadata and resolve its exact binding for restore before capture.
+This enforces qualification on the serving node even if it restarts between a
+preflight and the mutation. During mixed rollouts non-default suspend can fail
+and leave a resident paused VM; upgrade the node and retry or resume it. E0 and
+legacy capture keep their existing wire shape. Retain qualified node versions
+while their snapshots exist: downgrading a loader is not a retirement operation.
 
 `StartBuild` and `Create` accept an additive environment input. It contains the
 reference and recipe or template; the environment determines the runtime. Legacy
@@ -271,6 +394,43 @@ binding with the sandbox and cleanup intent before acknowledging success. First
 Start, service restarts, and later starts preserve it; conflicting or missing
 artifact evidence fails closed. Without a selection, a bound template retains
 that environment, including its exact runtime on new cold boot and stop/start.
+
+Retained instance directories grant sandbox-manager traversal without group write.
+Normal Start repairs old traversal permissions through node-manager before choosing
+an execution source; inspection errors never imply an absent disk. If an interrupted
+Start has no runtime and retained-rootfs inspection fails during startup recovery,
+only that row is deferred, with a warning; sibling recovery and service admission
+continue. Database failures still fail startup admission. The row stays Starting
+until an operator repairs the reported filesystem condition and restarts
+sandbox-manager to rerun startup recovery. This case has no periodic recovery owner.
+
+For an approved traversal-permission repair, run the following on the affected node
+with an updated node-manager. Set `space_checkout` to a matching SPACE source tree
+and `sandbox_id` to the full UUID from the warning. Node-manager has no reflection
+service, so `grpcurl` needs the explicit proto and its imports. The RPC pins the
+existing instance directory and sets its group and traversal mode; a bare
+`chmod 2710` does not repair the group.
+
+```bash
+space_checkout=/path/to/SPACE
+sandbox_id='<full-sandbox-uuid>'
+sudo grpcurl -plaintext -unix -max-time 30 \
+  -import-path "$space_checkout/proto" -proto node/v1/node.proto \
+  -d "{\"sandbox_id\":\"$sandbox_id\"}" \
+  /space/run/node-manager/node-manager.sock \
+  space.node.v1.NodeManager/PrepareSandboxArtifactDir &&
+  sudo systemctl restart space-sbxmgr.service &&
+  sudo /space/bin/space-sbxmgr list
+```
+
+This uses the standard systemd unit; use the deployment's equivalent restart on
+other installations. Only restart after the RPC succeeds. Verify that the row
+recovers to Stopped, its retained `instance/rootfs.ext4` is present, and a later
+Start preserves its recorded execution binding. If the RPC fails, inspect that
+error before restarting. It repairs permissions on a valid directory, not a
+regular-file instance, symlink loop, or storage I/O fault; those conditions need
+filesystem repair without discarding the retained disk or rewriting its binding.
+
 Unbound derived builds keep the legacy request path regardless of runtime version.
 Ordinary builds inheriting the immutable E0 binding also retain that compatible
 path; explicit E0 requests and every inherited non-default binding require exact
@@ -279,11 +439,11 @@ never the runtime version alone. No kernel-only or runtime-only substitution is
 allowed. Local selected creation is cold-only, without pool adoption, snapshots,
 or cluster-owned identities. This creation restriction also covers explicit E0
 requests; later snapshot and suspend operations independently check memory-state
-qualification, which E0 already has. Unqualified memory-state operations are refused.
+qualification. Unqualified memory-state operations are refused.
 Managed non-default bindings are omitted from the legacy cluster placement
 projection. Historical external runtime and kernel installations remain available
 to legacy execution and placement. Fleet placement for complete environments,
-policy distribution, snapshot compatibility and mixed-environment pools are later
+policy distribution, cross-environment snapshot compatibility and mixed-environment pools are later
 integrations. Use the node-local clients for explicit non-default selection.
 
 See the [runtime benchmark procedure](../scripts/benchmarks/README.md#runtime-environment-benchmark)

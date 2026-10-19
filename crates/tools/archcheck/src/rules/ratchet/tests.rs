@@ -7,6 +7,7 @@ use std::{collections::BTreeMap, fs};
 use super::*;
 use crate::{
     baseline::BaseBaseline,
+    config::{BaseArchitecture, CrateNamesPolicy},
     context::{code_lines, count_code_lines},
 };
 
@@ -55,7 +56,7 @@ impl CountRatchet for Hits {
     }
 
     fn crossing(&self, count: Count) -> String {
-        format!(": {} hits", count.count)
+        format!(": {} hits.", count.count)
     }
 
     fn cleared(&self, _file: &ProductionFile) -> String {
@@ -73,7 +74,11 @@ fn context(baseline: Baseline, files: &[(&str, &str)]) -> Context {
                   [rules.file_size.no_new_entries]\nmode = \"advisory\"\n\
                   [rules.file_size.no_raised_caps]\nmode = \"advisory\"\n\
                   [rules.file_size.listed_no_growth]\nmode = \"advisory\"\n\
-                  [rules.file_size.stale_entries]\nmode = \"advisory\"\n";
+                  [rules.file_size.stale_entries]\nmode = \"advisory\"\n\
+                  [rules.crate_names]\nbanned_tokens = [\"common\"]\nallow = []\n\
+                  [rules.crate_names.no_new]\nmode = \"advisory\"\n\
+                  [rules.crate_names.stale_entries]\nmode = \"advisory\"\n\
+                  [rules.crate_names.policy_changed]\nmode = \"advisory\"\n";
     let mut files: Vec<ProductionFile> = files
         .iter()
         .map(|(path, text)| ProductionFile {
@@ -87,7 +92,11 @@ fn context(baseline: Baseline, files: &[(&str, &str)]) -> Context {
         config: toml::from_str(config).expect("the configuration parses"),
         baseline,
         base_baseline: BaseBaseline::NotGiven,
+        renames: None,
+        crate_names_policy: CrateNamesPolicy::default(),
+        base_architecture: BaseArchitecture::NotGiven,
         files,
+        crates: Vec::new(),
     }
 }
 
@@ -112,7 +121,9 @@ fn a_rule_without_instances_or_a_table() {
         findings(&ctx),
         [(
             "hits.no_crossing".to_owned(),
-            "a.rs: 2 hits".to_owned(),
+            "a.rs: 2 hits. If the file was renamed, move its entry in [hits] to the new path; \
+             with --renames, no_new_entries accepts the moved entry at or below its old cap."
+                .to_owned(),
             Location {
                 path: "a.rs".to_owned(),
                 line: 2,

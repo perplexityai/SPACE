@@ -186,7 +186,9 @@ seed_e2b_api_key() {
   local hash; hash="$(sha256_hex "$E2B_API_KEY")"
   log "seeding local-dev E2B api key (hash ${hash:0:12}…)"
   # space-postgres is a single-pod StatefulSet; address the pod directly.
+  # Loopback TLS, as kind_stack_psql connects: the server refuses unencrypted TCP.
   kubectl --context "$KCTX" -n "$NS" exec -i space-postgres-0 -- \
+    env PGHOST=127.0.0.1 PGSSLMODE=require \
     psql -U spaceuser -d spacedb -v ON_ERROR_STOP=1 >/dev/null <<SQL || die "failed to seed E2B api key"
 INSERT INTO api_keys (org_id, name, key_hash, created_by)
 VALUES ('00000000-0000-0000-0000-000000000001', 'local-dev-smoke', '$hash',

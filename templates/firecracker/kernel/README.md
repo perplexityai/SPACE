@@ -16,9 +16,11 @@ the requested version; the base config digest is verified before compilation.
 The build and QEMU smoke images share a digest-pinned Ubuntu base and a dated
 [Ubuntu package snapshot](https://snapshot.ubuntu.com/). Update the base digest
 and `UBUNTU_SNAPSHOT` in `Dockerfile` together to pick up dependency fixes, using
-a snapshot no older than the base image. The checksum-pinned CA bundle bootstraps
-HTTPS for APT; update its URL and checksum when needed. Validate pin updates
-with a kernel build and `smoke-boot.sh` before publishing artifacts.
+a snapshot no older than the base image. The base is pinned by its linux/amd64
+manifest digest, which its line in `ci/mirrored-images.txt` must name too. The
+checksum-pinned CA bundle bootstraps HTTPS for APT; update its URL and checksum
+when needed. Validate pin updates with a kernel build and `smoke-boot.sh` before
+publishing artifacts.
 
 ## Optional BPF/module-signing profile
 
@@ -55,6 +57,20 @@ BASE_CONFIG_SHA256=<firecracker-config-sha256> \
 Only x86_64 is supported; aarch64 snapshot restore remains unvalidated. A kernel
 is separate from the seed root filesystem and is identified by its binary digest.
 A build does not select a fleet default or change an existing template's kernel.
+
+## Main CI
+
+Main CI runs `ci.sh publish`, which builds the default kernel and smoke-boots it
+unless a pass of this directory's exact contents is already recorded in GHCR.
+Any file in this directory, with its executable bit, is part of that record's
+key, so keep everything the check depends on here. While Docker Hub and
+snapshot.ubuntu.com work, a registry problem costs time but not the check:
+lookups and writes have deadlines and only warn, and a build that fails or
+stalls taking layers from the image mirror or the toolchain cache runs once
+more without them, as does the rest of the run. `build.sh` and `smoke-boot.sh` take extra Docker build
+options from `KERNEL_DOCKER_BUILD_OPTIONS`; `ci.sh` uses it for its builder, the
+mirrored Ubuntu base and the toolchain cache. Run `ci.sh check` for the same
+check without writing anything.
 
 ## Publication
 

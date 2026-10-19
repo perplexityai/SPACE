@@ -1,2 +1,39 @@
 serviceName: space-builder-node-api
 buildManagerEndpoint: https://space-builder-build-manager:9900
+
+# The builder's BuilderApi and NodeInfo (audience space-node-api). The api's
+# substrate dials it as space-builder-node-api:9800, from the api, admin-api
+# and the cluster-controller's trigger fan-out; either role's node-api pulls
+# templates it exports (connect_remote, transfer.rs). No data plane or
+# internal-api call reaches a builder, and it serves no WorkerApiInternal and
+# no lifecycle-probe wait.
+auth:
+  SPACE_NODE_API_AUTH_ALLOWED_SERVICE_ACCOUNTS:
+    - space-api
+    - space-cluster-controller
+    - space-node-api
+    - space-builder-node-api
+  SPACE_NODE_API_INTERNAL_AUTH_ALLOWED_SERVICE_ACCOUNTS: []
+  SPACE_NODE_API_AUTH_TRUSTED_WAIT_READY_SERVICE_ACCOUNTS: []
+  # The api's template deletion, settings and pool calls on the builder
+  # (TemplateController, crates/libs/api/src/controllers/template.rs);
+  # required on builders too (validate_for_role, auth/k8s.rs).
+  SPACE_NODE_API_AUTH_TRUSTED_POLICY_SERVICE_ACCOUNTS:
+    - space-api
+  SPACE_NODE_API_AUTH_GUEST_BRIDGE_SERVICE_ACCOUNTS: []
+  # A builder is a transfer target and source like a worker (values.yaml).
+  SPACE_NODE_API_AUTH_TEMPLATE_TRANSFER_SERVICE_ACCOUNTS:
+    - space-api
+    - space-node-api
+    - space-builder-node-api
+  # BuilderApi/BuildTemplate also passes the build reviewer
+  # (BuildSurface::NodeApi, crates/libs/common/svc/src/auth/build/k8s.rs):
+  # these accounts, if also allowed above, may submit builds; tenant builds
+  # (with an org) come from the api's ECW template build route, system
+  # builds from admin-api's template builds, both as space-api.
+  SPACE_NODE_API_AUTH_TEMPLATE_BUILD_SERVICE_ACCOUNTS:
+    - space-api
+  SPACE_BUILD_AUTH_SYSTEM_SERVICE_ACCOUNTS:
+    - space-api
+  SPACE_BUILD_AUTH_TENANT_SERVICE_ACCOUNTS:
+    - space-api

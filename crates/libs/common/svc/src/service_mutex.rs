@@ -6,6 +6,7 @@
 //! releases the mutex — cooperatively on `SIGTERM` drain, or via kernel-level
 //! release on process death.
 
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -75,6 +76,9 @@ impl ServiceMutex {
     /// budget — exit non-zero so the supervisor restarts the process and a
     /// stuck predecessor surfaces as a visible failure instead of an
     /// indefinitely-passive process whose health endpoint still reports OK.
+    ///
+    /// Creates new mutexes owner-only, without changing the process umask.
+    /// Opening an existing mutex preserves its inode, contents and permissions.
     pub async fn acquire(
         path: impl AsRef<Path>,
         shutdown_token: CancellationToken,
@@ -87,6 +91,7 @@ impl ServiceMutex {
             .truncate(false)
             .write(true)
             .read(true)
+            .mode(0o600)
             .open(&path)
             .map_err(|source| AcquireError::Open {
                 path: path.clone(),

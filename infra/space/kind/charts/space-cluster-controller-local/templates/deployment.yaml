@@ -39,6 +39,7 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      priorityClassName: {{ .Values.priorityClassName }}
       serviceAccountName: {{ .Values.serviceAccount.name }}
       terminationGracePeriodSeconds: 30
       containers:
@@ -55,6 +56,15 @@ spec:
               value: space-node-api
             - name: SPACE_CLUSTER_API_TOKEN_PATH
               value: "/var/run/space-publication/cluster-api.token"
+            # NodeApi credentials for the api substrate the operation
+            # dispatcher and warm-pool probe run, and the trigger fan-out
+            # (SpaceBearerToken, crates/libs/common/svc/src/bearer_token.rs):
+            # one projected token per node-api surface, admitted by TokenReview
+            # (space-node-api-local's auth allowlists).
+            - name: SPACE_NODE_API_TOKEN_PATH
+              value: /var/run/space-auth/node-api.token
+            - name: SPACE_NODE_API_INTERNAL_TOKEN_PATH
+              value: /var/run/space-auth/node-api-internal.token
             # Datadog tracing — see datadog-agent-local chart. DD_AGENT_HOST
             # routes to the node-local agent; absent the agent the tracer
             # drops spans silently.
@@ -83,8 +93,6 @@ spec:
             # BYOK switch here too (same value as the api chart).
             - name: SPACE_BYOK_VOLUME_ENCRYPTION
               value: {{ .Values.byokVolumeEncryption | quote }}
-            - name: SPACE_SNAPSHOT_RETENTION_SWEEPER_MIN_AGE_SECS
-              value: {{ .Values.reconcilers.snapshotRetentionSweeper.minAgeSeconds | quote }}
             - name: SPACE_INTERNAL_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -180,12 +188,15 @@ spec:
             # `api.clusterActivationAdmission.enabled`.
             - name: SPACE_CLUSTER_ACTIVATION_ADMISSION_ENABLED
               value: {{ .Values.clusterActivationAdmission.enabled | quote }}
+            {{- if .Values.redis.url }}
+            # The limiter's shared store; see `redis` in values.yaml.
+            - name: SPACE_REDIS_URL
+              value: {{ .Values.redis.url | quote }}
+            {{- end }}
             {{- range $name, $reconciler := .Values.reconcilers }}
             {{- range $key, $value := (default (dict) $reconciler.env) }}
-            {{- if ne $key "SPACE_SNAPSHOT_RETENTION_SWEEPER_MIN_AGE_SECS" }}
             - name: {{ $key }}
               value: {{ $value | quote }}
-            {{- end }}
             {{- end }}
             {{- end }}
           # Ready once the process has reached the Lease (won it, or been validly
@@ -212,6 +223,9 @@ spec:
             - name: publication-token
               mountPath: /var/run/space-publication
               readOnly: true
+            - name: node-api-token
+              mountPath: /var/run/space-auth
+              readOnly: true
             - name: route-signing
               mountPath: /var/run/space-route-signing
               readOnly: true
@@ -231,6 +245,18 @@ spec:
                   path: cluster-api.token
                   audience: space-cluster-api
                   expirationSeconds: 3600
+        - name: node-api-token
+          projected:
+            defaultMode: 0444
+            sources:
+              - serviceAccountToken:
+                  path: node-api.token
+                  audience: space-node-api
+                  expirationSeconds: {{ .Values.nodeApiTokenExpirationSeconds | int }}
+              - serviceAccountToken:
+                  path: node-api-internal.token
+                  audience: space-node-api-internal
+                  expirationSeconds: {{ .Values.nodeApiTokenExpirationSeconds | int }}
         - name: route-signing
           secret:
             secretName: {{ .Values.spaceApiRouteToken.ed25519.signingSecretName }}

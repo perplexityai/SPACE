@@ -325,7 +325,9 @@ fn evaluate_admits_the_content_addressed_systemd_install() {
 }
 
 #[test]
-fn volmgr_exe_is_admitted_during_the_uid_transition() {
+fn volmgr_exe_is_admitted_only_for_its_service_account() {
+    use pplx_space_common_core::host::linux::identities::users;
+
     let volume_checks = PeerProcessChecks {
         binary_paths: pplx_space_common_core::host::linux::paths::SPACE_VOLMGR_SVC_BINARIES,
         ..PeerProcessChecks::EMPTY
@@ -338,9 +340,28 @@ fn volmgr_exe_is_admitted_during_the_uid_transition() {
         "/opt/space/bin/space-volmgr-svc",
         "/space/apps/space-volmgr-svc-1a2b3c4d",
     ] {
-        let snap = snapshot(exe, 1001, 0);
-        evaluate_process_checks(&volume_checks, 1001, &snap, |_| Vec::new()).unwrap();
-        evaluate_process_checks(&sandbox_checks, 1001, &snap, |_| Vec::new()).unwrap();
+        let snap = snapshot(exe, users::SPACE_VOLMGR.uid, 0);
+        evaluate_process_checks(&volume_checks, users::SPACE_VOLMGR.uid, &snap, |_| {
+            Vec::new()
+        })
+        .unwrap();
+        let snap = snapshot(exe, users::SPACE_SBXMGR.uid, 0);
+        let error =
+            evaluate_process_checks(&sandbox_checks, users::SPACE_SBXMGR.uid, &snap, |_| {
+                Vec::new()
+            })
+            .unwrap_err();
+        assert!(matches!(error, ProcessCheckFailure::BinaryNotAllowed(_)));
+    }
+    for exe in [
+        "/opt/space/bin/space-sbxmgr-svc",
+        "/space/apps/space-sbxmgr-svc-1a2b3c4d",
+    ] {
+        let snap = snapshot(exe, users::SPACE_SBXMGR.uid, 0);
+        evaluate_process_checks(&sandbox_checks, users::SPACE_SBXMGR.uid, &snap, |_| {
+            Vec::new()
+        })
+        .unwrap();
     }
 }
 

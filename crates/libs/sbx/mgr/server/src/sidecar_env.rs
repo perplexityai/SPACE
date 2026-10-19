@@ -66,6 +66,9 @@ const ROUTE_TOKEN_ENV_KEYS: &[&str] = &[
     SPACE_API_ROUTE_ED25519_VERIFICATION_BUNDLE_PATH_ENV,
 ];
 const SPACE_LOG_FORMAT: &str = "json";
+/// The W3C `traceparent` a traced launch passes to the sidecar it starts, the
+/// name OpenTelemetry's environment carrier uses.
+pub(crate) const LAUNCH_TRACEPARENT_ENV: &str = "TRACEPARENT";
 
 fn insert_non_empty_env_values(
     env: &mut HashMap<String, String>,

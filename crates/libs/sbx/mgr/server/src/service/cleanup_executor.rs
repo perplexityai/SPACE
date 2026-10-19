@@ -14,6 +14,9 @@ use pplx_space_common_jobs::{JobPriority, JobStatus, db as jobs};
 type AttemptResult = Result<(), Status>;
 type CleanupResult = Result<CleanupOutcome, Status>;
 type CompletionWaiters = BTreeMap<JobId, (tokio::sync::watch::Sender<()>, usize)>;
+/// The operation name of a cleanup attempt's span, as the common jobs worker
+/// names a job of this kind.
+const CLEANUP_ATTEMPT_OPERATION: &str = "job.sandbox_cleanup";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum CleanupWait {
@@ -46,6 +49,9 @@ pub(super) struct CleanupExecutor {
     wake: tokio::sync::Notify,
     pub(super) active: dashmap::DashMap<String, bool>,
     waiters: Mutex<CompletionWaiters>,
+    /// The `traceparent` of the traced caller that persisted each job and
+    /// waits for it.
+    awaiting: Mutex<BTreeMap<JobId, String>>,
     subscriptions: Arc<tokio::sync::Semaphore>,
     admission: Arc<tokio::sync::Semaphore>,
 }
@@ -71,6 +77,7 @@ impl Default for CleanupExecutor {
             wake: tokio::sync::Notify::new(),
             active: dashmap::DashMap::new(),
             waiters: Mutex::new(BTreeMap::new()),
+            awaiting: Mutex::new(BTreeMap::new()),
             subscriptions: Arc::new(tokio::sync::Semaphore::new(128)),
             admission: Arc::new(tokio::sync::Semaphore::new(128)),
         }
@@ -113,7 +120,125 @@ impl Drop for CompletionSubscription {
     }
 }
 
+/// Registers the context of a traced caller waiting for a job, which the
+/// job's attempts link to while it waits. The first traced waiter registers.
+struct AwaitingSubmitter {
+    executor: Arc<CleanupExecutor>,
+    id: JobId,
+    registered: bool,
+}
+
+impl AwaitingSubmitter {
+    fn register(executor: &Arc<CleanupExecutor>, id: JobId) -> Self {
+        let registered = match pplx_space_observability::trace_propagation::current_traceparent() {
+            Some(traceparent) => {
+                #[allow(
+                    clippy::expect_used,
+                    reason = "Private submitter map is modified only by this guard; no caller callback runs under lock"
+                )]
+                let mut awaiting = executor
+                    .awaiting
+                    .lock()
+                    .expect("cleanup submitters poisoned");
+                match awaiting.entry(id) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(traceparent);
+                        true
+                    }
+                    std::collections::btree_map::Entry::Occupied(_) => false,
+                }
+            }
+            None => false,
+        };
+        Self {
+            executor: Arc::clone(executor),
+            id,
+            registered,
+        }
+    }
+}
+
+impl Drop for AwaitingSubmitter {
+    fn drop(&mut self) {
+        if !self.registered {
+            return;
+        }
+        #[allow(
+            clippy::expect_used,
+            reason = "Private submitter map is modified only by this guard; no caller callback runs under lock"
+        )]
+        self.executor
+            .awaiting
+            .lock()
+            .expect("cleanup submitters poisoned")
+            .remove(&self.id);
+    }
+}
+
 impl SandboxManagerService {
+    /// The root one cleanup attempt runs under.
+    ///
+    /// An attempt is never a child of its caller, even one waiting for it: a
+    /// caller can stop waiting while the attempt runs, as Stop does when its
+    /// budget expires, and a child would hold the caller's span open for the
+    /// whole cleanup (see [`super::drain::detached_trace_span`]). It is a root
+    /// linked to the context saved when the job was persisted and to the
+    /// traced caller waiting for it, if any. The first attempt is sampled as
+    /// those origins were, and so is one a caller waits for; a retry no caller
+    /// waits for still links to them but takes the configured sampler, so a
+    /// job that keeps failing does not keep a trace every retry. A job no
+    /// traced caller persisted or waits for, such as one startup recovery
+    /// schedules, runs under no span, as it did before.
+    fn cleanup_attempt_span(
+        &self,
+        id: &JobId,
+        subject: &str,
+        traceparent: Option<&str>,
+        attempt: i32,
+    ) -> tracing::Span {
+        #[allow(
+            clippy::expect_used,
+            reason = "Private submitter map is modified only by AwaitingSubmitter; no caller callback runs under lock"
+        )]
+        let waiting = self
+            .cleanup_executor
+            .awaiting
+            .lock()
+            .expect("cleanup submitters poisoned")
+            .get(id)
+            .cloned();
+        let origins: Vec<&str> = waiting.as_deref().into_iter().chain(traceparent).collect();
+        if origins.is_empty() {
+            return tracing::Span::none();
+        }
+        let span = tracing::info_span!(
+            parent: None,
+            "job.execute",
+            otel.kind = "internal",
+            otel.name = CLEANUP_ATTEMPT_OPERATION,
+            "operation.name" = CLEANUP_ATTEMPT_OPERATION,
+            "resource.name" = cleanup_jobs::KIND,
+            job.id = %id,
+            job.kind = cleanup_jobs::KIND,
+            job.subject_id = subject,
+            job.attempt = attempt,
+            sandbox_id = tracing::field::Empty,
+            otel.status_code = tracing::field::Empty,
+            error = tracing::field::Empty,
+            origin_trace_id = tracing::field::Empty,
+            origin_sampled = tracing::field::Empty,
+        );
+        pplx_space_common_svc::record_sandbox_id(&span, subject);
+        if attempt <= 1 || waiting.is_some() {
+            pplx_space_observability::trace_propagation::link_root_to_origins(&span, origins);
+        } else {
+            pplx_space_observability::trace_propagation::link_root_to_origins_without_following(
+                &span, origins,
+            );
+        }
+        span
+    }
+
     pub(super) fn persist_cleanup_request(
         &self,
         request: AsyncCleanupRequest,
@@ -240,6 +365,9 @@ impl SandboxManagerService {
         let Some(job) = job else {
             return Ok(());
         };
+        // Registered before the executor wakes, so the attempt it dispatches
+        // links to this caller.
+        let _submitter = AwaitingSubmitter::register(&self.cleanup_executor, job);
         self.ensure_cleanup_executor();
         match wait {
             CleanupWait::Attempt => self.wait_cleanup_job(job).await,
@@ -394,7 +522,15 @@ impl SandboxManagerService {
                             }
                             if jobs::mark_job_running(&tx, &id).map_err(storage_status)? {
                                 subjects.push(subject.clone());
-                                selected.push((id, subject, priority == 1));
+                                // `mark_job_running` counted this attempt.
+                                let attempt = job.attempts.saturating_add(1);
+                                selected.push((
+                                    id,
+                                    subject,
+                                    priority == 1,
+                                    job.traceparent,
+                                    attempt,
+                                ));
                             }
                         }
                     }
@@ -404,7 +540,7 @@ impl SandboxManagerService {
                 .await;
             match jobs {
                 Ok(selected) => {
-                    for (id, subject, kill) in selected {
+                    for (id, subject, kill, traceparent, attempt) in selected {
                         let Ok(permit) = Arc::clone(&self.cleanup_sem).try_acquire_owned() else {
                             continue;
                         };
@@ -415,12 +551,21 @@ impl SandboxManagerService {
                             _permit: CleanupPermit::new(permit, Arc::clone(&self.cleanup_metrics)),
                         };
                         let service = self.clone();
+                        let span = self.cleanup_attempt_span(
+                            &id,
+                            &subject,
+                            traceparent.as_deref(),
+                            attempt,
+                        );
                         tasks.spawn(async move {
                             let _guard = guard;
                             if let Err(error) = service
                                 .run_durable_cleanup_attempt(&id, &subject, kill)
                                 .await
                             {
+                                let span = tracing::Span::current();
+                                span.record("otel.status_code", "ERROR");
+                                span.record("error", error.message());
                                 tracing::warn!(job_id = %id, %error, "cleanup attempt could not finish; durable recovery owns retry");
                             }
                             #[allow(clippy::expect_used, reason = "Private waiter map is modified only by bounded subscription accounting and watch notifications; no caller callback runs under lock")]
@@ -432,7 +577,7 @@ impl SandboxManagerService {
                             if let Some((sender, _)) = waiters.get(&id) {
                                 sender.send_replace(());
                             }
-                        });
+                        }.instrument(span));
                     }
                 }
                 Err(error) => tracing::warn!(%error, "cannot dispatch cleanup batch"),

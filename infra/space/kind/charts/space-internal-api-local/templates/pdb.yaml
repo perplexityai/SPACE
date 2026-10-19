@@ -1,0 +1,16 @@
+# A voluntary eviction takes at most one of the replicas at a time, as
+# deployments budget ClusterApi, so node publication always has a listener.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ .Release.Name }}-internal-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: space-internal-api
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: space-internal-api
+      app.kubernetes.io/instance: {{ .Release.Name }}

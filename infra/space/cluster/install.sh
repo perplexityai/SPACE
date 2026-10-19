@@ -160,6 +160,12 @@ missing=()
 # Sandbox pods run with runtimeClassName space (README.md, Prerequisites).
 handler=$(k get runtimeclass space -o 'jsonpath={.handler}' 2>/dev/null || true)
 [[ $handler == space ]] || missing+=("runtimeclass/space with handler space (infra/space/kind/manifests/runtimeclass.yaml)")
+# The control plane and its Jobs name the SPACE PriorityClasses (README.md,
+# Prerequisites); the system-* classes are built in.
+for pc in $( { cat <<<"$worker"; cat <<<"$builder"; cat <<<"$migrate"; } \
+    | sed -n 's/^ *priorityClassName: *"\{0,1\}\([^" ]*\)"\{0,1\} *$/\1/p' | grep -v '^system-' | sort -u); do
+  k get priorityclass "$pc" >/dev/null 2>&1 || missing+=("priorityclass/$pc (infra/space/kind/manifests/priorityclasses.yaml)")
+done
 if [[ $obs_available == false && $mode == off ]] \
     && helm status space-observability --kube-context "$context" --namespace "$obs_namespace" >/dev/null 2>&1; then
   echo "install.sh: release space-observability exists in $obs_namespace, but this tree has no chart to reconcile it for mode off; run from the tree that installed it" >&2

@@ -16,6 +16,7 @@ mod guest_filesystem_flush;
 mod inventory_budget;
 mod lifecycle_metrics;
 pub mod local_artifacts;
+mod net_gateway_clients;
 pub mod node_manager_transport;
 mod node_state_sync;
 pub mod restore_operation;

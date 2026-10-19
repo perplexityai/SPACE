@@ -358,8 +358,10 @@ function SandboxActions({ status, id, resourceType, poolTemplate, onAction }: {
   id: string;
   resourceType: Sandbox['resource_type'];
   poolTemplate?: string | null;
-  onAction: (id: string, action: string) => void;
+  onAction: (id: string, action: string) => Promise<void>;
 }) {
+  const [stopping, setStopping] = useState(false);
+  const stopPending = useRef(false);
   const s = status || '';
   const managedSandbox = resourceType === 'sandbox';
   const poolSlot = resourceType === 'pool_slot';
@@ -371,22 +373,52 @@ function SandboxActions({ status, id, resourceType, poolTemplate, onAction }: {
     actions.suspend = false;
   }
 
-  const btn = (action: string, enabled: boolean, icon: React.ReactNode, label: string, danger = false) => (
-    <Tooltip
-      title={!enabled
-        ? (managedSandbox
-          ? `Cannot ${label.toLowerCase()} in ${s || 'unknown'} state`
-          : poolSlot
-            ? 'Pool slots can only be deleted'
-            : 'Observed local sandboxes only support delete')
-        : label}
-      key={action}
-    >
-      <Button type="text" size="small" className="icon-action-btn" icon={icon} disabled={!enabled} danger={danger}
+  const confirmStop = async () => {
+    if (!actions.stop || stopPending.current) return;
+    stopPending.current = true;
+    setStopping(true);
+    try {
+      await onAction(id, 'stop');
+    } finally {
+      stopPending.current = false;
+      setStopping(false);
+    }
+  };
+
+  const btn = (action: string, enabled: boolean, icon: React.ReactNode, label: string, danger = false) => {
+    const button = (
+      <Button type="text" size="small" className="icon-action-btn" icon={icon} disabled={!enabled || (action === 'stop' && stopping)} danger={danger}
         aria-label={label}
-        onClick={() => enabled && onAction(id, action)} />
-    </Tooltip>
-  );
+        onClick={action === 'stop' ? undefined : () => enabled && onAction(id, action)} />
+    );
+    return (
+      <Tooltip
+        title={!enabled
+          ? (managedSandbox
+            ? `Cannot ${label.toLowerCase()} in ${s || 'unknown'} state`
+            : poolSlot
+              ? 'Pool slots can only be deleted'
+              : 'Observed local sandboxes only support delete')
+          : label}
+        key={action}
+      >
+        {action === 'stop' ? (
+          <Popconfirm
+            title={`Stop sandbox ${sandboxLabelOrId(id)}?`}
+            description="Stopping interrupts current execution without guaranteeing a snapshot."
+            okText="Stop"
+            cancelText="Cancel"
+            okButtonProps={{ danger: true }}
+            cancelButtonProps={{ disabled: stopping }}
+            onConfirm={confirmStop}
+            disabled={!enabled || stopping}
+          >
+            {button}
+          </Popconfirm>
+        ) : button}
+      </Tooltip>
+    );
+  };
 
   return (
     <Space size={0}>

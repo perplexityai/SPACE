@@ -456,11 +456,20 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 	}
 
 	// Pod sandbox task — join pod cgroup, then create + start via sbx-manager.
+	requestedSandboxID := spec.requestedSandboxID()
 	createSpanOpts := []attribute.KeyValue{
 		attribute.String("template", sandboxTemplate),
 		attribute.String("task_id", r.ID),
 	}
-	span, ctx := startSpanWithRemoteParent(
+	if requestedSandboxID != nil {
+		createSpanOpts = append(createSpanOpts, attribute.String("sandbox_id", requestedSandboxID.String()))
+	}
+	// Kubelet retries a failed pod sandbox for the same Pod, so every attempt
+	// carries the same annotation context, and nothing the shim receives says
+	// which attempt it is. Each create therefore roots its own trace, linked to
+	// that context, rather than joining it: a crash-looping create is one trace
+	// per attempt, not one trace collecting every attempt.
+	span, ctx := startLinkedSpan(
 		ctx,
 		"shim.create",
 		spec.traceparent(),
@@ -488,7 +497,6 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 	defer conn.Close()
 
 	// Create the sandbox.
-	requestedSandboxID := spec.requestedSandboxID()
 	sandboxCheckpoint, artifactRestore, useStartRPC, parseErr := spec.sandboxStartIntent()
 	if parseErr != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid sandbox start annotations: %v", parseErr)
@@ -2056,6 +2064,7 @@ type networkPolicyJSON struct {
 	Egress                    *egressPolicyJSON       `json:"egress"`
 	TLSInterception           json.RawMessage         `json:"tls_interception"`
 	TLSInterceptionExemptions []egressDestinationJSON `json:"tls_interception_exemptions"`
+	NetworkCredentialRules    json.RawMessage         `json:"network_credential_rules"`
 }
 
 type sandboxNetworkPolicyConfig struct {
@@ -2476,6 +2485,10 @@ func parseNetworkPolicyJSON(raw string) (*netpb.NetworkPolicyV1, error) {
 	if err != nil {
 		return nil, err
 	}
+	credentialRules, err := parseNetworkCredentialRules(decoded.NetworkCredentialRules)
+	if err != nil {
+		return nil, fmt.Errorf("network policy network_credential_rules: %w", err)
+	}
 	return &netpb.NetworkPolicyV1{
 		Version:                   netpb.NetworkPolicyVersion_NETWORK_POLICY_VERSION_V1,
 		EgressDefaultAction:       action,
@@ -2483,7 +2496,64 @@ func parseNetworkPolicyJSON(raw string) (*netpb.NetworkPolicyV1, error) {
 		Deny:                      deny,
 		TlsInterception:           tlsInterception,
 		TlsInterceptionExemptions: exemptions,
+		NetworkCredentialRules:    credentialRules,
 	}, nil
+}
+
+// The manager owns semantic policy validation. Preserve all credential intent
+// here, rejecting fields or methods the shim cannot represent instead of dropping them.
+func parseNetworkCredentialRules(raw json.RawMessage) ([]*netpb.NetworkCredentialRuleV1, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var decoded []*struct {
+		RuleID                   string                                `json:"rule_id"`
+		Destination              *netpb.NetworkCredentialDestinationV1 `json:"destination"`
+		CredentialHeaderBindings []*netpb.CredentialHeaderBindingV1    `json:"credential_header_bindings"`
+		SupportedHTTPMethods     []string                              `json:"supported_http_methods"`
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decoded); err != nil {
+		return nil, err
+	}
+	if decoded == nil {
+		return nil, errors.New("expected an array")
+	}
+	rules := make([]*netpb.NetworkCredentialRuleV1, 0, len(decoded))
+	for index, rule := range decoded {
+		if rule == nil || rule.Destination == nil || len(rule.CredentialHeaderBindings) == 0 || len(rule.SupportedHTTPMethods) == 0 {
+			return nil, fmt.Errorf("rule %d requires a destination, bindings and methods", index)
+		}
+		for _, binding := range rule.CredentialHeaderBindings {
+			if binding == nil {
+				return nil, fmt.Errorf("rule %d has a null binding", index)
+			}
+			if _, err := uuid.Parse(binding.CredentialReferenceId); err != nil {
+				return nil, fmt.Errorf("rule %d has an invalid credential reference", index)
+			}
+		}
+		methods := make([]netpb.NetworkCredentialHttpMethodV1, 0, len(rule.SupportedHTTPMethods))
+		for _, method := range rule.SupportedHTTPMethods {
+			switch method {
+			case "GET":
+				methods = append(methods, netpb.NetworkCredentialHttpMethodV1_NETWORK_CREDENTIAL_HTTP_METHOD_V1_GET)
+			case "POST":
+				methods = append(methods, netpb.NetworkCredentialHttpMethodV1_NETWORK_CREDENTIAL_HTTP_METHOD_V1_POST)
+			case "HEAD":
+				methods = append(methods, netpb.NetworkCredentialHttpMethodV1_NETWORK_CREDENTIAL_HTTP_METHOD_V1_HEAD)
+			default:
+				return nil, fmt.Errorf("rule %d has an unsupported HTTP method", index)
+			}
+		}
+		rules = append(rules, &netpb.NetworkCredentialRuleV1{
+			RuleId:                   rule.RuleID,
+			Destination:              rule.Destination,
+			CredentialHeaderBindings: rule.CredentialHeaderBindings,
+			SupportedHttpMethods:     methods,
+		})
+	}
+	return rules, nil
 }
 
 func parseEgressDefaultAction(raw string) (netpb.EgressDefaultAction, error) {
@@ -2539,7 +2609,7 @@ func parseEgressDestination(destination egressDestinationJSON) (*netpb.EgressDes
 
 // traceparent returns the W3C context of the Rust operation that materialized
 // the Pod. Containerd copies the annotation into the OCI spec so shim.create
-// can continue that trace after asynchronous scheduling.
+// can link to that trace after asynchronous scheduling.
 func (s *ociSpec) traceparent() string {
 	return s.Annotations["space.pplx.net/traceparent"]
 }

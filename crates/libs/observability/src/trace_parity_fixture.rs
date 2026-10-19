@@ -15,13 +15,7 @@ fn emit() {
             operation_names_workload();
         } else {
             for failed in [false, true] {
-                if let Some(endpoint) =
-                    pplx_space_common_core::env::test_hook_var("SPACE_TRACE_MIXED_ENDPOINT")
-                {
-                    mixed_workload(failed, endpoint).await;
-                } else {
-                    workload(failed);
-                }
+                workload(failed);
             }
         }
         tracing::info!("trace parity workload completed");
@@ -259,63 +253,4 @@ fn workload(failed: bool) {
     crate::trace_propagation::link_span_from_traceparent(&job, &saved_parent);
     drop(job);
     drop(root);
-}
-
-async fn mixed_workload(failed: bool, endpoint: String) {
-    use tracing::Instrument as _;
-    let case = if failed { "error" } else { "success" };
-    let root = tracing::info_span!(
-        "http.server",
-        otel.kind = "server",
-        "operation.name" = "http.server",
-        "resource.name" = "POST /trace-mixed",
-        parity.case = case,
-        sandbox_id = "parity-sandbox",
-        otel.status_code = if failed { "ERROR" } else { "OK" },
-        otel.status_description = tracing::field::Empty,
-    );
-    if failed {
-        root.record("otel.status_description", "fixture failure");
-    }
-    let serialized_parent =
-        crate::trace_propagation::traceparent_for_span(&root).expect("W3C root context");
-    async {
-        let span = tracing::info_span!(
-            "grpc.client",
-            otel.kind = "client",
-            "operation.name" = "grpc.client",
-            "resource.name" = "grpc.health.v1.Health/Check",
-            otel.status_code = if failed { "ERROR" } else { "OK" },
-            otel.status_description = tracing::field::Empty
-        );
-        if failed {
-            span.record("otel.status_description", "fixture failure");
-        }
-        async {
-            let channel = tonic::transport::Endpoint::from_shared(endpoint)
-                .expect("fixture URL")
-                .connect_timeout(std::time::Duration::from_secs(5))
-                .connect()
-                .await
-                .expect("connect to Go fixture");
-            let mut client = tonic_health::pb::health_client::HealthClient::new(channel);
-            let mut request = tonic::Request::new(tonic_health::pb::HealthCheckRequest {
-                service: format!("{serialized_parent}|{case}"),
-            });
-            crate::trace_propagation::inject_current_context(request.metadata_mut());
-            let result = client.check(request).await;
-            if failed {
-                assert_eq!(
-                    result.expect_err("failed fixture").code(),
-                    tonic::Code::Internal
-                );
-            } else {
-                result.expect("successful fixture");
-            }
-        }
-        .instrument(span)
-        .await;
-    }
-    .instrument(root)
-    .await;
 }

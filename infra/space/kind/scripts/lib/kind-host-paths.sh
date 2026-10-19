@@ -32,7 +32,8 @@
 #                         (default: $HOME/.space-devbox/kind/kind-cluster.yaml)
 #   SPACE_KIND_NODE_IMAGE / SPACE_KIND_BASE_NODE_IMAGE
 #                         node images the config names (default: what
-#                         ../kind-node-image.sh prints for `ref` / `base`)
+#                         ../kind-node-image.sh prints for `ref` /
+#                         `cluster-base`)
 
 # The binary a sandbox worker executes through /space/vendor; the mount
 # preflight refuses a vendor root without it. Whether a tree is fully
@@ -296,12 +297,26 @@ kind_host_paths__require() {
 # companion shape test rejects the idioms outright so the failure names the
 # cause rather than a count mismatch.
 kind_config_mounts() {
+  kind_config_node_mounts "$1" | cut -f2,3
+}
+
+# The same pairs, each after the image of the node that mounts it (empty when
+# that node names none): "<image>\t<containerPath>\t<hostPath>". The one
+# parser behind kind_config_mounts, with the same shape limits, plus that a
+# node's `image:` key sits at its own top level, as kind's config has it.
+kind_config_node_mounts() {
   sed -e 's/[[:space:]]\{1,\}#.*$//' "$1" \
     | awk -F': *' '
+        /^[[:space:]]*-[[:space:]]*role:/           { image = "" }
+        /^[[:space:]]*image:/ {
+          # The whole value: an image reference has colons of its own.
+          image = $0
+          sub(/^[[:space:]]*image:[[:space:]]*/, "", image)
+        }
         /^[[:space:]]*-?[[:space:]]*hostPath:/      { host = $2 }
         /^[[:space:]]*-?[[:space:]]*containerPath:/ { container = $2 }
         host != "" && container != "" {
-          print container "\t" host
+          print image "\t" container "\t" host
           host = ""
           container = ""
         }
@@ -341,7 +356,7 @@ kind_render_cluster_config() {
   # Image references, not paths: resolved here rather than at source time so
   # sourcing stays free of a subprocess, and validated as one YAML scalar.
   node_image="${SPACE_KIND_NODE_IMAGE:-$(bash "$KIND_HOST_PATHS_NODE_IMAGE_SCRIPT" ref)}"
-  base_image="${SPACE_KIND_BASE_NODE_IMAGE:-$(bash "$KIND_HOST_PATHS_NODE_IMAGE_SCRIPT" base)}"
+  base_image="${SPACE_KIND_BASE_NODE_IMAGE:-$(bash "$KIND_HOST_PATHS_NODE_IMAGE_SCRIPT" cluster-base)}"
   for name in node_image base_image; do
     value="${!name}"
     [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9._/:@-]*$ ]] \

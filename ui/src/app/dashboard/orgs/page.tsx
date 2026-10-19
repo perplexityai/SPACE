@@ -1,12 +1,12 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { adminApi } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import { Cluster, Organization } from '@/lib/types';
 import { isManagingOrgAdmin } from '@/lib/userRoles';
 import Link from 'next/link';
-import { Table, Button, Form, Input, Select, Typography, Space, Popconfirm, App, Card, Tag } from 'antd';
+import { Table, Button, Form, Input, Select, Typography, Space, Popconfirm, Modal, App, Tag } from 'antd';
 import { PlusOutlined, DeleteOutlined, ClusterOutlined } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
 
@@ -17,8 +17,12 @@ export default function OrgsPage() {
   const { user, cluster, refreshCluster } = useAuth();
   const [orgs, setOrgs] = useState<Organization[]>([]);
   const [loading, setLoading] = useState(false);
+  const [createOpen, setCreateOpen] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const createPending = useRef(false);
   const [updatingManagingOrgId, setUpdatingManagingOrgId] = useState<string | null>(null);
   const [form] = Form.useForm();
+  const createFormId = useId();
 
   const load = () => {
     setLoading(true);
@@ -31,14 +35,27 @@ export default function OrgsPage() {
 
   useEffect(load, []);
 
+  const closeCreate = () => {
+    if (createPending.current) return;
+    setCreateOpen(false);
+    form.resetFields();
+  };
+
   const handleCreate = async (values: { name: string; slug: string; parent_id?: string }) => {
+    if (createPending.current) return;
+    createPending.current = true;
+    setCreating(true);
     try {
       await adminApi.post('/v1/orgs', { ...values, parent_id: values.parent_id || null });
+      setCreateOpen(false);
       form.resetFields();
       load();
       message.success('Organization created');
     } catch (err: any) {
       message.error(err.message);
+    } finally {
+      createPending.current = false;
+      setCreating(false);
     }
   };
 
@@ -118,24 +135,50 @@ export default function OrgsPage() {
 
   return (
     <div>
-      <Title level={3}>Organizations</Title>
+      <Space align="center" wrap style={{ width: '100%', justifyContent: 'space-between', marginBottom: 24 }}>
+        <Title level={3} style={{ margin: 0 }}>Organizations</Title>
+        <Button
+          type="primary"
+          icon={<PlusOutlined />}
+          disabled={creating}
+          onClick={() => {
+            form.resetFields();
+            setCreateOpen(true);
+          }}
+        >
+          Create organization
+        </Button>
+      </Space>
 
-      <Card size="small" style={{ marginBottom: 24 }}>
-        <Form form={form} layout="inline" onFinish={handleCreate}>
-          <Form.Item name="name" rules={[{ required: true, message: 'Name required' }]}>
+      <Modal
+        title="Create organization"
+        open={createOpen}
+        onCancel={closeCreate}
+        okText="Create organization"
+        okButtonProps={{ htmlType: 'submit', form: createFormId }}
+        confirmLoading={creating}
+        cancelButtonProps={{ disabled: creating }}
+        closable={!creating}
+        mask={{ closable: !creating }}
+        keyboard={!creating}
+        destroyOnHidden
+      >
+        <Form id={createFormId} form={form} layout="vertical" onFinish={handleCreate} disabled={creating} preserve={false}>
+          <Form.Item label="Name" name="name" rules={[{ required: true, message: 'Name required' }]}>
             <Input placeholder="Name" />
           </Form.Item>
-          <Form.Item name="slug" rules={[{ required: true, message: 'Slug required' }]}>
+          <Form.Item label="Slug" name="slug" rules={[{ required: true, message: 'Slug required' }]}>
             <Input placeholder="Slug" />
           </Form.Item>
           <Form.Item
+            label={managingOrgAdmin ? 'Parent (optional)' : 'Parent'}
             name="parent_id"
             rules={managingOrgAdmin ? [] : [{ required: true, message: 'Parent required' }]}
           >
             <Select
               placeholder={managingOrgAdmin ? 'Parent (optional)' : 'Parent'}
               allowClear={managingOrgAdmin}
-              style={{ width: 200 }}
+              style={{ width: '100%' }}
             >
               {orgs.map((o) => (
                 <Select.Option key={o.id} value={o.id}>
@@ -144,13 +187,8 @@ export default function OrgsPage() {
               ))}
             </Select>
           </Form.Item>
-          <Form.Item>
-            <Button type="primary" htmlType="submit" icon={<PlusOutlined />}>
-              Create
-            </Button>
-          </Form.Item>
         </Form>
-      </Card>
+      </Modal>
 
       <Table
         columns={columns}

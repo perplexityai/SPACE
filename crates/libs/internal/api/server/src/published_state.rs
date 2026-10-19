@@ -2,6 +2,7 @@ use pplx_space_common_core::types::{NodeId, SnapshotId, SubstrateKind};
 
 use pplx_space_common_core::sql;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::LazyLock;
 
 use sqlx::types::Json;
 use time::format_description::well_known::Rfc3339;
@@ -39,7 +40,7 @@ use pplx_space_net_common::proto::NetworkPolicySource;
 use pplx_space_sandbox_portability::{
     SuspendedTargetNodeAssignment, node_published_execution_identity_matches,
     publish_clear_or_preserve_current_local_artifact_marker_assignments,
-    started_suspend_revert_eligibility, suspended_k8s_finalization_sql,
+    started_suspend_revert_eligibility, stopped_artifact_durable, suspended_k8s_finalization_sql,
     suspended_projection_lifecycle_eligible,
 };
 use pplx_space_sbx_mgr_client::proto::{
@@ -590,6 +591,45 @@ pub(crate) fn snapshot_execution_metadata(
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
     pplx_space_common_core::types::SnapshotExecutionMetadata::new(execution)
         .map_err(|error| Status::invalid_argument(error.to_string()))
+}
+
+/// Longest prefix of an invalid capture host CPU that reaches the log. The
+/// value is node-supplied and the begin request isn't authorized yet when it's
+/// parsed, so the log carries a bounded prefix, not the whole string.
+const MAX_LOGGED_CAPTURE_HOST_CPU_BYTES: usize = 64;
+
+/// Parses the capture host CPU of an artifact backup. The CPU is placement
+/// evidence, not part of the snapshot's identity, so a value that isn't a valid
+/// label is recorded as unknown rather than failing the backup it rides on.
+/// An empty value means unknown too, and isn't worth a warning. A disk artifact
+/// holds no vCPU state, so it has no capture CPU whatever the sender says.
+pub(crate) fn capture_host_cpu(
+    raw: Option<&str>,
+    artifact_kind: ArtifactKind,
+    sandbox_id: SandboxId,
+) -> Option<pplx_space_common_core::types::HostCpu> {
+    if artifact_kind == ArtifactKind::Disk {
+        return None;
+    }
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    pplx_space_common_core::types::HostCpu::parse(raw)
+        .inspect_err(|error| {
+            let logged = pplx_space_common_svc::truncate_utf8_for_log(
+                raw,
+                MAX_LOGGED_CAPTURE_HOST_CPU_BYTES,
+            );
+            tracing::warn!(
+                %sandbox_id,
+                capture_host_cpu = ?logged.value,
+                truncated = logged.truncated,
+                %error,
+                "ignoring invalid capture host CPU on artifact backup"
+            );
+        })
+        .ok()
 }
 
 pub async fn publish_execution_inventory(
@@ -1695,6 +1735,57 @@ fn failure_episode_input(
     })
 }
 
+/// Deletes the stopped Direct sandboxes a node reported absent, and detaches
+/// their snapshots' storage locations.
+///
+/// The delete reads the node's absence as proof that its local rootfs, a
+/// stopped sandbox's only copy, is gone. That doesn't hold for a stopped
+/// sandbox released from the node once its pinned artifact was durable, so
+/// [`stopped_artifact_durable`] exempts it, the same term that keeps the
+/// census prune's `marked_deleted` arm off it.
+///
+/// The candidates are locked (`FOR UPDATE`) before anything is detached or
+/// deleted. Without the lock, a row a concurrent writer moved out of `stopped`
+/// after this statement's snapshot was still selected, and the `DELETE`, which
+/// rechecks only its join to the CTE after waiting on the row, deleted it.
+/// Locking makes Postgres re-evaluate the whole condition against the row that
+/// writer committed; only the durability `EXISTS`'s own table scans keep the
+/// statement's snapshot.
+///
+/// Built once: every input is bound.
+static DELETE_ABSENT_STOPPED_SANDBOXES: LazyLock<String> = LazyLock::new(|| {
+    let released_with_durable_artifact = stopped_artifact_durable("s");
+    sql!(
+        format!(
+            "WITH deleted AS MATERIALIZED (
+                 SELECT s.id
+                 FROM sandboxes s
+                 WHERE s.active_node_id = $1
+                   AND s.managed_by = $3
+                   AND s.lifecycle = 'stopped'
+                   AND s.id = ANY($2)
+                   AND NOT {released_with_durable_artifact}
+                 FOR UPDATE OF s
+             ),
+             detached_storage AS (
+                 UPDATE snapshot_storage_locations ssl
+                 SET snapshot_id = NULL, orphaned_at = NOW()
+                 WHERE ssl.snapshot_id IN (
+                     SELECT snapshots.id
+                     FROM snapshots
+                     JOIN deleted ON deleted.id = snapshots.sandbox_id
+                 )
+                 RETURNING 1
+             )
+             DELETE FROM sandboxes s
+             USING deleted
+             WHERE s.id = deleted.id
+             RETURNING s.id"
+        )
+        .as_str()
+    )
+});
+
 /// Publishes a node's sandbox observations.
 ///
 /// Callers that need atomic lifecycle convergence should run this inside a
@@ -2178,29 +2269,8 @@ pub async fn publish_sandbox_states(
             Status::internal(format!("clear absent sandbox facet observations: {err}"))
         })?;
 
-        let deleted_ids = sqlx::query_scalar::<_, SandboxId>(sql!(
-            "WITH deleted AS MATERIALIZED (
-                 SELECT s.id
-                 FROM sandboxes s
-                 WHERE s.active_node_id = $1
-                   AND s.managed_by = $3
-                   AND s.lifecycle = 'stopped'
-                   AND s.id = ANY($2)
-             ),
-             detached_storage AS (
-                 UPDATE snapshot_storage_locations ssl
-                 SET snapshot_id = NULL, orphaned_at = NOW()
-                 WHERE ssl.snapshot_id IN (
-                     SELECT snapshots.id
-                     FROM snapshots
-                     JOIN deleted ON deleted.id = snapshots.sandbox_id
-                 )
-                 RETURNING 1
-             )
-             DELETE FROM sandboxes s
-             USING deleted
-             WHERE s.id = deleted.id
-             RETURNING s.id"
+        let deleted_ids = sqlx::query_scalar::<_, SandboxId>(sqlx::AssertSqlSafe(
+            DELETE_ABSENT_STOPPED_SANDBOXES.as_str(),
         ))
         .bind(node_id)
         .bind(&absent_ids)
@@ -2833,7 +2903,7 @@ pub async fn publish_sandbox_states(
     // Evacuation-marked rows are owned by the node-drain redrive (the same
     // exemption the sweeper makes) and are left alone.
     let routable_execution =
-        pplx_space_common_svc::sql::sandbox_routability::routable_execution_or_non_k8s("s");
+        pplx_space_common_svc::sql::sandbox_routability::routable_execution_or_non_k8s("s", "$4");
     let restored_convergence_query = format!(
         "WITH input AS (
              SELECT *
@@ -2861,6 +2931,7 @@ pub async fn publish_sandbox_states(
     .bind(node_id)
     .bind(rows_json.clone())
     .bind(SandboxTransitionReceiptKind::ActivationCompleted.as_str())
+    .bind(SubstrateKind::Kubernetes)
     .fetch_all(&mut *conn)
     .await
     .map_err(|err| Status::internal(format!("converge restored sandbox lifecycle: {err}")))?;

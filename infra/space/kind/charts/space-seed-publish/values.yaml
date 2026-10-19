@@ -22,6 +22,10 @@ s3:
   bucket: templates
   credentialsSecretName: space-object-store
 
+# A one-shot, idempotent publish Job: replaceable
+# (infra/space/kind/manifests/priorityclasses.yaml).
+priorityClassName: space-replaceable
+
 nodeSelector:
   space.pplx.net/infra: "true"
 

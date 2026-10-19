@@ -2,6 +2,7 @@ use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
 
+use pplx_space_common_core::types::ExecutionGeneration;
 use pplx_space_common_grpc::RotatingChannel;
 use pplx_space_common_svc::bearer_token::BearerTokenError;
 use pplx_space_common_svc::bootstrap::{GrpcClientTrace, wrap_grpc_client_channel};
@@ -177,6 +178,49 @@ fn classify_token_error(error: BearerTokenError) -> ConnectClusterApiError {
         | BearerTokenError::ReadFile { .. }
         | BearerTokenError::InvalidMetadata(_) => ConnectClusterApiError::TokenSource(error),
     }
+}
+
+/// Metadata key on a `FAILED_PRECONDITION` from `BeginArtifactBackup`: the
+/// control plane superseded the request's `execution_generation` (a newer
+/// execution is active or has materialized a pod, or it was retired as
+/// replaced), so no restore can adopt
+/// the runtime that captured the artifact. The value is that generation. A
+/// teardown suspend then releases the runtime without remote durability; a
+/// node-local suspend rolls back instead of retrying.
+pub const BACKUP_EXECUTION_SUPERSEDED_METADATA: &str = "x-space-backup-execution-superseded";
+
+/// A `BeginArtifactBackup` refusal for a superseded execution, carrying the
+/// refused generation as [`BACKUP_EXECUTION_SUPERSEDED_METADATA`].
+pub fn backup_execution_superseded_status(
+    message: impl Into<String>,
+    execution_generation: ExecutionGeneration,
+) -> tonic::Status {
+    let mut status = tonic::Status::failed_precondition(message);
+    if let Ok(value) = MetadataValue::try_from(execution_generation.to_string()) {
+        status
+            .metadata_mut()
+            .insert(BACKUP_EXECUTION_SUPERSEDED_METADATA, value);
+    }
+    status
+}
+
+/// The execution generation a `BeginArtifactBackup` refusal says the control
+/// plane superseded, or `None` for any other outcome. Only a `FAILED_PRECONDITION`
+/// with a well-formed marker counts, so a status from an older server, or a
+/// marker on an unrelated code, never reads as release authority.
+pub fn backup_execution_superseded_generation(
+    status: &tonic::Status,
+) -> Option<ExecutionGeneration> {
+    if status.code() != tonic::Code::FailedPrecondition {
+        return None;
+    }
+    status
+        .metadata()
+        .get(BACKUP_EXECUTION_SUPERSEDED_METADATA)?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()
 }
 
 pub const CLUSTER_API_ENDPOINT_ENV: &str = "SPACE_INTERNAL_API_ENDPOINT";

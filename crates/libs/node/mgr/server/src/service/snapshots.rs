@@ -1,3 +1,5 @@
+mod environment;
+
 use super::cleanup_helpers::*;
 use super::disk::*;
 use super::node_disk_metrics::SandboxDiskUsageLookup;
@@ -278,6 +280,8 @@ impl NodeManagerService {
         request: Request<CreateSnapshotRequest>,
     ) -> Result<Response<CreateSnapshotResponse>, Status> {
         self.authorize_peer(&request, "CreateSnapshot", ALLOW_NODE_ADMIN_OR_SBXMGR)?;
+        let mut request = request;
+        let selected_environment = environment::normalize(request.get_mut())?;
         validate_sandbox_id(&request.get_ref().sandbox_id)?;
         let sandbox_id = request.get_ref().sandbox_id.clone();
         let service = self.clone();
@@ -290,6 +294,33 @@ impl NodeManagerService {
                 request.get_ref().execution_fence.as_ref(),
                 false,
             )?;
+            // Reject malformed paths before any metadata IO, as on legacy nodes.
+            let req = request.get_ref();
+            if let Some(mount) = req
+                .snapshot_volume_mount_dir
+                .as_deref()
+                .filter(|path| !path.is_empty())
+            {
+                trusted_paths::validate_snapshot_volume(&req.sandbox_id, mount)?;
+            } else {
+                crate::runtime_paths::RuntimePaths::firecracker().create_snapshot_paths(
+                    &req.sandbox_id,
+                    &req.snapshot_path,
+                    &req.mem_file_path,
+                    req.dest_dir.as_deref().filter(|path| !path.is_empty()),
+                )?;
+            }
+            if service
+                .pool
+                .get(&req.sandbox_id)
+                .map_err(slot_store_status)?
+                .is_none()
+            {
+                return Err(Status::unavailable("snapshot lease is no longer active"));
+            }
+            service
+                .verify_snapshot_environment(req.sandbox_id.clone(), selected_environment)
+                .await?;
             service.create_snapshot_inner(request).await
         })
         .await
@@ -589,6 +620,8 @@ impl NodeManagerService {
             .rootfs_rate_limit
             .as_ref()
             .map(drive_rate_limiter)
+            .transpose()?
+            .map(|limiter| self.disk_io_ceiling.clamp_limiter(limiter))
             .transpose()?;
         let jail_root = format!("{JAIL_DIR}/firecracker/{}/root", req.sandbox_id);
         let _lifecycle_permit = self
@@ -742,6 +775,14 @@ impl NodeManagerService {
                 .await;
             return Err(status);
         }
+        // The snapshot's limiter and the saved assignment may both exceed
+        // this worker's operator ceiling. Enforce it before adopting/resuming.
+        self.disk_io_ceiling
+            .enforce_before_adoption(&client, |status| async move {
+                self.rollback_loaded_snapshot(sandbox_id, "rootfs IOPS ceiling", &status)
+                    .await;
+            })
+            .await?;
         self.adopt_validated_lease(sandbox_id, lease)?;
 
         // Fix v.sock permissions so sbx-manager can connect for health checks.

@@ -32,7 +32,7 @@ from space_smoke.adapters import (
     KindHarness,
     _endpoint_target_pods,
 )
-from space_smoke.capabilities import GuestMetadata, TemplateBuildResult, TemplateRecipe
+from space_smoke.capabilities import GuestMetadata, TemplateBuildJob, TemplateBuildResult, TemplateRecipe
 from space_smoke.runtime import CommandResult, InvariantViolation, ResourceScope
 from space_smoke.template_build import (
     OCI_IMAGE,
@@ -146,8 +146,9 @@ class _Control:
     def clear_builder_service_route(self):
         self.calls.append("route:clear")
 
-    def builder_logged_alias(self, node_name, alias):
-        return node_name in self.accepts_on
+    def template_build_job(self, alias):
+        node = next((n for n in self.nodes if n in self.accepts_on), None)
+        return None if node is None else TemplateBuildJob("job-1", f"id-{node}", node)
 
     def prepared_rootfs_handoff(self, node_name, *, window_seconds=60):
         return self.handoff

@@ -220,7 +220,7 @@ fn join_display<T: fmt::Display>(items: &[T]) -> String {
 /// Run a diagnostic tool and keep its exit status and both streams.
 async fn command_output(program: &str, args: &[&str]) -> String {
     let label = format!("{program} {}", args.join(" "));
-    let mut command = std::process::Command::new(program);
+    let mut command = crate::host_command::Command::new(program);
     command.args(args);
     let result = tokio::task::spawn_blocking(move || {
         crate::host_command::output(&mut command, PROBE_BUDGET, &[])

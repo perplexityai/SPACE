@@ -1069,6 +1069,93 @@ pub(super) async fn is_node_wake_gate_closed(
         .is_some_and(NodeDrainState::blocks_placement))
 }
 
+/// The in-place update for a node that is already `draining`: rewrite
+/// `drain_mode` and clear `drain_last_error`, and touch nothing else that
+/// describes *this* drain — including `terminate_decrement_capacity`, which is
+/// fixed for a drain's lifetime.
+///
+/// Also reached by a `:drain` that re-asserts the mode it already had, where the
+/// handler passes `mode: None` — **not** the resolved current mode. That
+/// distinction is load-bearing: writing the resolved mode back would replace a
+/// raw column this build cannot parse with `'gentle'`, disarming a drain the
+/// newer pod that wrote it treats as destructive. The write is still worth
+/// making on that path, because it clears `drain_last_error` — a repeated
+/// request is a fresh operator intent, and the reconciler re-derives the error
+/// on its next tick if the condition persists. Two exceptions, both leaving the
+/// row with no error rather than a stale one: a same-name kube Node replacement
+/// is skipped silently by design, and a cluster with `SPACE_NODE_DRAIN_ENABLED`
+/// off has no tick to re-derive it at all — the conjunct
+/// [`super::nodes`]' cordon-retry predicate names as the one the api-server
+/// cannot see.
+///
+/// A named wrapper rather than an [`update_drain_phase`] call with the right
+/// arguments at the call site, because "the right arguments" is the whole
+/// contract and four of them are silent when wrong.
+///
+/// Start with the one this wrapper exists to pin: `new_phase` binds straight
+/// into `SET drain_phase = $2`, so unlike the two `COALESCE`d arguments below, a
+/// `None` there **clears** the phase rather than preserving it. Passing `None`
+/// from this edge would undrain the node mid-drain while the handler still
+/// answered 200 and audited `to_phase: draining`, because the caller hardcodes
+/// the phase it reports rather than reading back what was written.
+///
+/// `clear_started_at` is the adjacent trap: `true` there NULLs
+/// `drain_started_at` **and** `drain_mode`, disarming the very drain this
+/// function exists to escalate.
+///
+/// The other two:
+///
+/// - `set_started_at: false` preserves `drain_started_at`. An escalation makes a
+///   drain more aggressive; it does not start a new one, and the column is the
+///   drain's only record of when it began. Four readers, and only the last is
+///   not an operator's eyes:
+///   - The admin node response echoes it (`admin_node_response`).
+///   - `space-admin-cli` renders it as `Drain Started` — the age an operator reads to
+///     decide whether a drain has sat too long. Re-stamping resets that reading
+///     to seconds-ago at the exact moment they concluded it had.
+///   - The management dashboard computes the same age for its drain column and
+///     hover tooltip (`ui/src/app/dashboard/nodes/page.tsx`).
+///   - `scripts/space-rollout-mng.py`'s `detect_stuck` computes
+///     `now - drain_started_at` and, past `--stuck-threshold`, flags the node and
+///     emits `NODE_STUCK`. That flag is what stops a stuck node consuming a
+///     drain slot in `pick_drain_candidates`, so re-stamping before the threshold
+///     elapses keeps a wedged node holding a slot and throttles the whole wave.
+///     (The flag is sticky once set, so a re-stamp cannot un-flag a node that was
+///     already caught — the exposure is nodes that had not been caught yet.)
+/// - `terminate_decrement_capacity` is always `None` here: this edge never
+///   moves the replacement intent. A request that expressed one disagreeing
+///   with the stored value is refused before reaching this function
+///   (`in_flight_replace_conflict`), so the choice is between preserving and
+///   409ing, never between preserving and silently overwriting.
+///
+///   Applying an expressed value looks safer and is not. Every `space-admin-cli`
+///   built before `replace_after_terminate` became an `Option` sends an
+///   explicit `!no_replace_after_terminate`, so a plain `--forced` from a stale
+///   binary carries `true` — and CLI binaries roll independently of the
+///   api-server. Honouring it would let a stale client silently re-enable ASG
+///   replacement on a blue-green shrink, which is the failure the `Option` was
+///   introduced to prevent, arriving from the other direction.
+///
+/// The phase is re-asserted at `draining` rather than skipped so the write still
+/// clears `drain_last_error`: a fresh operator intent should not inherit the
+/// previous tick's substrate failure.
+pub(super) async fn update_in_flight_drain(
+    tx: &mut Transaction<'_, Postgres>,
+    node_id: NodeId,
+    mode: Option<NodeDrainMode>,
+) -> Result<(), sqlx::Error> {
+    update_drain_phase(
+        tx,
+        node_id,
+        Some(NodeDrainPhase::Draining.as_str()),
+        false,
+        false,
+        None,
+        mode,
+    )
+    .await
+}
+
 pub(super) async fn update_drain_phase(
     tx: &mut Transaction<'_, Postgres>,
     node_id: NodeId,
@@ -1078,20 +1165,26 @@ pub(super) async fn update_drain_phase(
     terminate_decrement_capacity: Option<bool>,
     drain_mode: Option<NodeDrainMode>,
 ) -> Result<(), sqlx::Error> {
-    // `terminate_decrement_capacity` is only refreshed on the `NULL -> draining`
-    // edge: that is the edge owned by the operator-facing `:drain` POST, which
-    // is the only path that carries the per-drain `replace_after_terminate`
-    // intent. Other transitions (drained -> terminating, undrain) leave the
-    // column at whatever value the initiating drain wrote, so the terminator
-    // honors the original intent regardless of when the ASG call actually runs.
+    // Two callers: the phase-moving edges in `apply_drain_action`, and
+    // [`update_in_flight_drain`] for a `:drain` against a node already
+    // `draining`. Which columns move is a property of the arguments rather than
+    // of the edge, so read this with a caller's arguments in hand.
     //
-    // `drain_mode` follows `drain_started_at` instead: written on the
-    // `NULL -> draining` edge, cleared by `:undrain` alongside the phase, and
-    // left alone by `drained -> terminating`. Clearing it on undrain matters
-    // because the user-API gates read the mode: a stale `gentle` left on an
-    // undrained node would be read by nothing today, but a later drain that
-    // failed to write the column would silently inherit it. The undrained
-    // steady state is "no drain, no mode".
+    // `terminate_decrement_capacity` is refreshed on the `NULL -> draining` edge
+    // only, which is the one that carries an initiating `replace_after_terminate`.
+    // Every other caller — `drained -> terminating`, `:undrain`, and
+    // [`update_in_flight_drain`] — passes `None` and leaves the column at
+    // whatever the initiating drain wrote, so the terminator honors that intent
+    // regardless of when the ASG call actually runs.
+    //
+    // `drain_mode` is written on the `NULL -> draining` edge and by an in-place
+    // escalation (a same-mode repeat passes `None` and leaves it),
+    // cleared by `:undrain` alongside the phase, and left alone by
+    // `drained -> terminating`. Clearing it on undrain matters because the
+    // user-API gates read the mode: a stale `gentle` left on an undrained node
+    // would be read by nothing today, but a later drain that failed to write the
+    // column would silently inherit it. The undrained steady state is "no drain,
+    // no mode".
     sqlx::query(sql!(
         "UPDATE nodes
             SET drain_phase = $2,
@@ -1132,6 +1225,11 @@ mod inflight_upload_occupancy_tests;
 #[cfg(test)]
 mod live_residents_tests;
 
+/// Postgres-backed contract for the in-place `gentle → forced` escalation: the
+/// mode is rewritten, and both `drain_started_at` and the initiating drain's
+/// `terminate_decrement_capacity` survive whatever the request carried.
+#[cfg(test)]
+mod in_flight_drain_tests;
 /// Postgres-backed plan-structure and page-shape regression for the
 /// `:force-upload-local-snapshots` enumeration: the scan stays bounded by the
 /// node's own pinned history rather than the fleet, the in-flight probe runs

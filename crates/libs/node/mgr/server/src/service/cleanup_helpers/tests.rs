@@ -201,8 +201,9 @@ fn rootfs_device_stack_is_detected_for_both_plaintext_and_encrypted_cows() {
 
 #[test]
 fn failed_device_teardown_preserves_artifacts_for_retry() {
+    use crate::host_command::Command;
     use std::os::unix::process::ExitStatusExt;
-    use std::process::{Command, ExitStatus, Output};
+    use std::process::{ExitStatus, Output};
 
     for (backing, failed_command) in ["cow.plain", "cow.luks", "snapshot.luks"]
         .into_iter()

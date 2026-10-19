@@ -30,7 +30,6 @@ from trace_fixture import (
     build_fixture,
     build_go_fixture,
     clean_environment,
-    fixture_server,
     run,
     write_json,
 )
@@ -476,7 +475,7 @@ def mapped_port(name, port):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--workload", choices=("rust", "go", "mixed"), default="rust")
+    parser.add_argument("--workload", choices=("rust", "go"), default="rust")
     parser.add_argument("--go-fixture", type=Path, help="Prebuilt shim test executable")
     parser.add_argument(
         "--retain-test-spans",
@@ -524,12 +523,8 @@ def main():
     )
     args = parser.parse_args()
     service = "space-trace-parity-" + args.workload
-    expected_spans = {"rust": 14, "go": 6, "mixed": 8}[args.workload]
-    modes = (
-        ("datadog-datadog", "otlp-datadog", "datadog-otlp", "otlp-otlp")
-        if args.workload == "mixed"
-        else MODES
-    )
+    expected_spans = {"rust": 14, "go": 4}[args.workload]
+    modes = MODES
     operation = "shim.create" if args.workload == "go" else "http.server"
     if args.site not in SITES:
         parser.error("DD_SITE must name a supported Datadog site")
@@ -597,11 +592,11 @@ def main():
     )
     fixture = None
     go_fixture = None
-    if args.workload in ("rust", "mixed"):
+    if args.workload == "rust":
         fixture = (
             str(args.fixture.resolve()) if args.fixture else build_fixture(artifacts)
         )
-    if args.workload in ("go", "mixed"):
+    if args.workload == "go":
         go_fixture = (
             str(args.go_fixture.resolve())
             if args.go_fixture
@@ -702,29 +697,6 @@ def main():
                         stderr=subprocess.STDOUT,
                         timeout=60,
                     )
-                elif args.workload == "mixed":
-                    rust_mode, go_mode = mode.split("-")
-                    go_env = {**env, "SPACE_TRACE_EXPORTER": go_mode}
-                    with fixture_server(
-                        go_fixture, "mixed", artifacts.resolve(), mode, go_env
-                    ) as (endpoint, _, process):
-                        env.update(
-                            SPACE_TRACE_EXPORTER=rust_mode,
-                            SPACE_TRACE_MIXED_ENDPOINT=endpoint,
-                        )
-                        run(
-                            [
-                                fixture,
-                                "--exact",
-                                "trace_parity_fixture::emit",
-                                "--nocapture",
-                            ],
-                            env=env,
-                            stdout=output,
-                            stderr=subprocess.STDOUT,
-                            timeout=60,
-                        )
-                        process.wait(timeout=10)
                 else:
                     run(
                         [

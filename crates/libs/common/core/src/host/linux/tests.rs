@@ -9,10 +9,7 @@ fn svc_binary_allowlists_derive_from_the_bin_dir_constants() {
     // diverged entry would deny every credmgr RPC from that peer under
     // enforce.
     for (allowlist, names) in [
-        (
-            paths::SPACE_SBXMGR_UID_BINARIES,
-            &["space-sbxmgr-svc", "space-volmgr-svc"][..],
-        ),
+        (paths::SPACE_SBXMGR_UID_BINARIES, &["space-sbxmgr-svc"][..]),
         (paths::SPACE_VOLMGR_SVC_BINARIES, &["space-volmgr-svc"][..]),
         (
             paths::SPACE_TMPLMGR_SVC_BINARIES,

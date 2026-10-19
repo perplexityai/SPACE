@@ -124,6 +124,23 @@ impl CompiledEnvironment {
         }
     }
 
+    /// Shared immutable catalog for execution consumers in this process.
+    pub fn cached_for_architecture(
+        architecture: Arch,
+    ) -> Result<&'static [Self], &'static CatalogError> {
+        static X86: std::sync::OnceLock<Result<Vec<CompiledEnvironment>, CatalogError>> =
+            std::sync::OnceLock::new();
+        static ARM: std::sync::OnceLock<Result<Vec<CompiledEnvironment>, CatalogError>> =
+            std::sync::OnceLock::new();
+        let cache = match architecture {
+            Arch::X86_64 => &X86,
+            Arch::Aarch64 => &ARM,
+        };
+        cache
+            .get_or_init(|| Self::for_architecture(architecture))
+            .as_deref()
+    }
+
     pub fn for_architecture(architecture: Arch) -> Result<Vec<Self>, CatalogError> {
         if architecture != Arch::X86_64 {
             return Ok(Vec::new());
@@ -138,7 +155,8 @@ impl CompiledEnvironment {
                 INITIAL_FIRECRACKER_STATE_FORMAT_VERSION,
                 true,
             ),
-            ("1.17.0", "6.18.44", "12.0.0", false),
+            ("1.17.0", "6.18.44", "12.0.0", true),
+            ("1.17.0", "6.1.155", "12.0.0", true),
         ]
         .into_iter()
         .map(|(runtime, kernel, state_version, memory_state)| {

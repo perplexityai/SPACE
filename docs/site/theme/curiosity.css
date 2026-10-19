@@ -15,43 +15,45 @@
   font-display: swap;
 }
 
+/* Curiosity subtly adjusts accent, status, and neutral hues. */
 :root {
   color-scheme: light;
   --docs-font-body: "Inter", system-ui, sans-serif;
   --docs-font-code: ui-monospace, SFMono-Regular, Consolas, monospace;
-  --docs-color-background: #fbfbfb;
+  --docs-color-background: #f8fafb;
   --docs-color-surface: var(--docs-color-background);
-  --docs-color-raised: #ffffff;
-  --docs-color-text: #0b2833;
-  --docs-color-muted: rgba(11, 40, 51, .75);
-  --docs-color-accent: #016a71;
-  --docs-color-border: rgba(11, 40, 51, .15);
-  --docs-color-soft: rgba(1, 106, 113, .09);
-  --docs-color-inline-code: #eef1f1;
-  --docs-color-nested: #f4f6f6;
-  --docs-color-reading-code-background: #f2f4f4;
-  --docs-color-quote: rgba(11, 40, 51, .035);
-  --docs-color-success: #016b1d;
-  --docs-color-error: #a23544;
-  --docs-color-warning: #97431a;
-  --docs-color-info: var(--docs-color-accent);
-  --docs-color-code-background: #19353d;
+  --docs-color-raised: #fdfefe;
+  --docs-color-text: #172b39;
+  --docs-color-muted: rgba(23, 43, 57, .75);
+  --docs-color-accent: #006a92;
+  --docs-color-border: rgba(23, 43, 57, .15);
+  --docs-color-soft: rgba(0, 122, 166, .09);
+  --docs-color-inline-code: #eef1f2;
+  --docs-color-nested: #f4f6f7;
+  --docs-color-reading-code-background: #f2f4f5;
+  --docs-color-quote: rgba(23, 43, 57, .035);
+  --docs-color-success: #007748;
+  --docs-color-error: #ae1654;
+  --docs-color-warning: #a23423;
+  --docs-color-info: #006f99;
+  --docs-color-code-background: #203342;
   --docs-color-code-text: #ffffff;
   --docs-color-method-text: #ffffff;
   --docs-color-response-success-text: #addec0;
   --docs-color-response-error-text: #f3b5bd;
 
-  --docs-dark-background: #161616;
-  --docs-dark-raised: #1d1d1d;
-  --docs-dark-text: #dedede;
-  --docs-dark-muted: rgba(222, 222, 222, .65);
-  --docs-dark-accent: #4e99a3;
-  --docs-dark-border: rgba(222, 222, 222, .14);
-  --docs-dark-soft: rgba(78, 153, 163, .09);
-  --docs-dark-quote: rgba(222, 222, 222, .07);
-  --docs-dark-success: #539e55;
-  --docs-dark-error: #dc6973;
-  --docs-dark-warning: #d57141;
+  --docs-dark-background: #151719;
+  --docs-dark-raised: #1c1e21;
+  --docs-dark-text: #dde0e3;
+  --docs-dark-muted: rgba(221, 224, 227, .65);
+  --docs-dark-accent: #00a4e5;
+  --docs-dark-border: rgba(221, 224, 227, .14);
+  --docs-dark-soft: rgba(0, 162, 228, .09);
+  --docs-dark-quote: rgba(221, 224, 227, .07);
+  --docs-dark-success: #00b96d;
+  --docs-dark-error: #ed658d;
+  --docs-dark-warning: #e3735c;
+  --docs-dark-info: #01a4e6;
   --docs-header-height: 64px;
   --docs-utility-height: 48px;
   --docs-sidebar-width: 248px;
@@ -127,6 +129,7 @@
   --docs-color-success: var(--docs-dark-success);
   --docs-color-error: var(--docs-dark-error);
   --docs-color-warning: var(--docs-dark-warning);
+  --docs-color-info: var(--docs-dark-info);
   --docs-color-code-background: var(--docs-dark-background);
   --docs-color-code-text: var(--docs-dark-text);
   --docs-color-method-text: var(--docs-dark-background);
@@ -152,6 +155,7 @@
     --docs-color-success: var(--docs-dark-success);
     --docs-color-error: var(--docs-dark-error);
     --docs-color-warning: var(--docs-dark-warning);
+    --docs-color-info: var(--docs-dark-info);
     --docs-color-code-background: var(--docs-dark-background);
     --docs-color-code-text: var(--docs-dark-text);
     --docs-color-method-text: var(--docs-dark-background);

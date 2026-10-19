@@ -19,3 +19,6 @@ collection:
     - {path: "/var/log/pods/space_*/*/*.log", namespace: space}
   journal:
     path: /run/log/journal
+    # local.sh sets excludedHosts to the nodes labelled as builders.
+    sidecars:
+      enabled: true

@@ -19,7 +19,8 @@
         "db",
         "templates/firecracker/seed/rootfs-builder.sh",
         "templates/firecracker/recipes/seed.toml",
-        "templates/firecracker/recipes/code-runtime.toml"
+        "templates/firecracker/recipes/code-runtime.toml",
+        "templates/firecracker/recipes/code-runtime"
       ],
       "packages": [
         "crates/apps/api/svc",
@@ -104,7 +105,8 @@
       "extra": [
         "templates/firecracker/seed/rootfs-builder.sh",
         "templates/firecracker/recipes/seed.toml",
-        "templates/firecracker/recipes/code-runtime.toml"
+        "templates/firecracker/recipes/code-runtime.toml",
+        "templates/firecracker/recipes/code-runtime"
       ],
       "packages": [
         "crates/apps/cluster/controller/svc",

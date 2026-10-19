@@ -890,7 +890,8 @@ pub(crate) async fn test_data_plane_state() -> DataPlaneState {
         ecw_hosts: EcwHostConfig::default(),
         revocation_check_interval: Duration::from_secs(1),
         route_cache_ttl: Duration::from_secs(60),
-        shutdown_token: CancellationToken::new(),
+        drain_started: CancellationToken::new(),
+        stream_shutdown_token: CancellationToken::new(),
         upgrade_tasks: TaskTracker::new(),
     }
 }
@@ -947,7 +948,7 @@ fn proto_space_api_route_token() -> ProtoSpaceApiRouteToken {
     proto_space_api_route_token_with_claims(space_api_route_claims())
 }
 
-fn proto_service_port_route_token() -> ProtoSpaceApiRouteToken {
+pub(crate) fn proto_service_port_route_token() -> ProtoSpaceApiRouteToken {
     let identity = test_route_identity();
     let claims = SpaceApiRouteEd25519Claims::service_port_ingress(
         SpaceApiRouteEd25519Issuer::parse("cluster-api").unwrap(),
@@ -1055,7 +1056,7 @@ fn service_port_ingress_proto_wire_shape_is_pinned() {
     insta::assert_snapshot!("service_port_ingress_proto_wire_shape", snapshot);
 }
 
-fn route_response_with_token(
+pub(crate) fn route_response_with_token(
     session_id: DataPlaneSessionId,
     space_api_route_token: Option<ProtoSpaceApiRouteToken>,
 ) -> ResolveDataPlaneSessionRouteResponse {
@@ -3846,7 +3847,7 @@ async fn legacy_ingress_eof_delivers_buffered_body_without_completion_frames() {
     );
 }
 
-fn grpc_test_response(bytes: Vec<u8>) -> Response {
+pub(crate) fn grpc_test_response(bytes: Vec<u8>) -> Response {
     let mut message = vec![0];
     message.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
     message.extend(bytes);
@@ -4079,7 +4080,7 @@ async fn cached_ingress_refreshes_replaced_execution_but_not_denied_access() {
             assert_eq!(opens.load(Ordering::SeqCst), 1);
             assert_eq!(resolves.load(Ordering::SeqCst), 0);
         }
-        state.shutdown_token.cancel();
+        state.stream_shutdown_token.cancel();
         server.abort();
     }
 }

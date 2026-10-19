@@ -80,8 +80,9 @@ spec:
     # Nothing else dials a sandbox pod. internal-api and the data plane reach
     # the node's host-network node-api at the node's address
     # (node_api_backend_endpoint in
-    # crates/libs/internal/api/server/src/data_plane_sessions.rs, which the
-    # data plane's crates/libs/data/plane/server/src/runtime_route.rs dials),
+    # crates/libs/internal/api/server/src/data_plane_sessions/route_rows.rs,
+    # which the data plane's
+    # crates/libs/data/plane/server/src/runtime_route.rs dials),
     # and service-port ingress rides node-api's ServicePortIngress stream to
     # the gateway's socket (crates/libs/node/api/server/src/worker.rs).
   egress:

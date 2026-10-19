@@ -1,0 +1,28 @@
+# Scheduling priority, as deployments give it: a class for the control plane,
+# a lower one for replaceable work, and the built-in system-node-critical for
+# the node-service DaemonSets (space-node-service's priorityClass helper). Under
+# pressure on a node, the scheduler preempts lower-priority pods to place a
+# higher one, and the kubelet evicts lower-priority pods first.
+#
+# The control-plane class covers the Deployments the API path runs through and
+# the in-cluster stand-ins for the managed services they need (Postgres, the
+# object store, Redis, the key broker): without them no control-plane replica
+# can serve.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: space-control-plane
+value: 1000000
+globalDefault: false
+description: SPACE control-plane workloads and the in-cluster services they depend on.
+---
+# Work that is re-run or replaced rather than relied on: one-shot Jobs and the
+# UI. It never preempts anything to schedule.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: space-replaceable
+value: 1000
+globalDefault: false
+preemptionPolicy: Never
+description: Replaceable SPACE work that never preempts other pods.

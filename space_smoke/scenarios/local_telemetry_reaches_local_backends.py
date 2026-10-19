@@ -9,8 +9,9 @@ MARKER = "space-smoke-telemetry-ok"
 # sets the floor (see space_smoke/telemetry_delivery.py).
 @smoke.scenario("local.telemetry_reaches_local_backends", telemetry_mode="otel")
 def telemetry_reaches_local_backends(test: smoke.KindEcw) -> None:
-    """Once a sandbox has run a command, Tempo returns one trace in which
-    space-api created it and containerd-shim-space-v2 started it, Prometheus
+    """Once a sandbox has run a command, Tempo returns
+    containerd-shim-space-v2's create trace for it, linked to the space-api
+    trace that created it, Prometheus
     holds create latency from that shim and from space-api since the
     scenario began, and Loki holds a SPACE pod log line naming the sandbox."""
 
@@ -19,7 +20,7 @@ def telemetry_reaches_local_backends(test: smoke.KindEcw) -> None:
     test.expect_command(result, stdout=MARKER)
 
     telemetry = test.telemetry
-    with test.phase("Tempo: one trace from space-api to the shim for this sandbox"):
+    with test.phase("Tempo: the shim's create trace links to space-api's for this sandbox"):
         telemetry.expect_traces()
 
     with test.phase("Prometheus: create latency from this sandbox's shim and the API"):

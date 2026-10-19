@@ -1,4 +1,5 @@
 use super::*;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::time::Duration;
 use tempfile::tempdir;
 
@@ -8,6 +9,26 @@ fn mutex_path(dir: &tempfile::TempDir) -> PathBuf {
 
 #[tokio::test]
 async fn acquires_on_fresh_file() {
+    // Umask is process-wide, so exercise it in a child running only this test.
+    if std::env::var_os("SPACE_MUTEX_MODE_TEST_CHILD").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "service_mutex::tests::acquires_on_fresh_file",
+                "--nocapture",
+            ])
+            .env("SPACE_MUTEX_MODE_TEST_CHILD", "1")
+            .output()
+            .expect("run isolated mode test");
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "mode test failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o022));
     let dir = tempdir().unwrap();
     let path = mutex_path(&dir);
 
@@ -16,6 +37,39 @@ async fn acquires_on_fresh_file() {
         .await
         .expect("acquire");
     assert_eq!(lock.path(), path.as_path());
+    assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o7777, 0o600);
+    drop(lock);
+
+    // Opening retained state must neither republish the inode nor normalize it.
+    std::fs::write(&path, b"retained").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660)).unwrap();
+    let before = std::fs::metadata(&path).unwrap();
+    let _lock = ServiceMutex::acquire(
+        &path,
+        CancellationToken::new(),
+        Duration::from_millis(10),
+        None,
+    )
+    .await
+    .expect("reacquire retained file");
+    let after = std::fs::metadata(&path).unwrap();
+    assert_eq!(
+        (
+            after.dev(),
+            after.ino(),
+            after.uid(),
+            after.gid(),
+            after.mode()
+        ),
+        (
+            before.dev(),
+            before.ino(),
+            before.uid(),
+            before.gid(),
+            before.mode(),
+        ),
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), b"retained");
 }
 
 #[tokio::test]

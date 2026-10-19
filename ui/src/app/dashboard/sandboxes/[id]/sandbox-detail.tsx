@@ -824,6 +824,19 @@ function ControlButtons({ sandbox, onAction, busy }: {
     primary = false,
   ) => {
     const allowed = enabled && !observedOnly && !poolSlot;
+    const requiresConfirmation = action === 'kill' || action === 'stop';
+    const button = (
+      <Button
+        size="small"
+        danger={danger}
+        type={primary ? 'primary' : 'default'}
+        icon={icon}
+        disabled={!allowed || busy}
+        onClick={requiresConfirmation ? undefined : () => onAction(action)}
+      >
+        {label}
+      </Button>
+    );
     return (
       <Tooltip
         key={action}
@@ -835,16 +848,22 @@ function ControlButtons({ sandbox, onAction, busy }: {
               : (!enabled ? `Cannot ${label.toLowerCase()} in ${s || 'unknown'} state` : label)
         }
       >
-        <Button
-          size="small"
-          danger={danger}
-          type={primary ? 'primary' : 'default'}
-          icon={icon}
-          disabled={!allowed || busy}
-          onClick={() => onAction(action)}
-        >
-          {label}
-        </Button>
+        {requiresConfirmation ? (
+          <Popconfirm
+            title={action === 'stop' ? `Stop sandbox ${sandboxLabelOrId(sandbox.id)}?` : 'Kill this sandbox?'}
+            description={action === 'stop' ? 'Stopping interrupts current execution without guaranteeing a snapshot.' : undefined}
+            okText={label}
+            cancelText="Cancel"
+            okButtonProps={{ danger: true }}
+            onConfirm={() => {
+              if (action === 'stop' && (!allowed || busy)) return;
+              return onAction(action);
+            }}
+            disabled={!allowed || busy}
+          >
+            {button}
+          </Popconfirm>
+        ) : button}
       </Tooltip>
     );
   };

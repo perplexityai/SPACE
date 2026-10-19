@@ -5,6 +5,23 @@ use pplx_space_common_core::types::{Arch, ExecutionMetadata, RuntimeKind};
 use super::{parse_runtime_request, prepare_sandbox_cache_paths, prepare_sandbox_owned_paths};
 
 #[test]
+fn stale_jail_removal_failure_refuses_reuse() {
+    let root = tempfile::tempdir().unwrap();
+    let stale = root.path().join("jail-root");
+    std::fs::write(&stale, b"must not be reused").unwrap();
+    let error = super::clean_stale_jail(stale.to_str().unwrap(), |_| Ok(false)).unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Internal);
+    assert_eq!(std::fs::read(&stale).unwrap(), b"must not be reused");
+    std::fs::remove_file(&stale).unwrap();
+    std::fs::create_dir(&stale).unwrap();
+    std::fs::write(stale.join("firecracker"), b"stale executable").unwrap();
+    for _ in 0..2 {
+        super::clean_stale_jail(stale.to_str().unwrap(), |_| Ok(false)).unwrap();
+        assert!(!stale.try_exists().unwrap());
+    }
+}
+
+#[test]
 fn oversized_rootfs_resize_is_rejected_before_touching_disk() {
     let directory = tempfile::tempdir().unwrap();
     let rootfs = directory.path().join("rootfs.ext4");
@@ -800,4 +817,248 @@ fn instance_rootfs_opens_only_a_single_link_regular_file_without_following_links
     std::fs::create_dir(&hard_linked).unwrap();
     std::fs::hard_link(&elsewhere, hard_linked.join("rootfs.ext4")).unwrap();
     super::open_instance_rootfs(&hard_linked).unwrap_err();
+}
+
+#[test]
+fn retained_instance_repair_grants_traversal_without_write_and_preserves_files() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let root = tempfile::tempdir().unwrap();
+    let instance = root.path().join("instance");
+    std::fs::create_dir(&instance).unwrap();
+    std::fs::write(instance.join("rootfs.ext4"), b"retained disk").unwrap();
+    let before = std::fs::metadata(&instance).unwrap();
+    std::fs::set_permissions(&instance, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // The publisher runs as root; this probe only mutates its own fixture.
+    if !pplx_space_test_env::root_or_skip("repair the shared instance group") {
+        return;
+    }
+    super::super::ensure_sandbox_instance_traversal(&instance).unwrap();
+    let after = std::fs::metadata(&instance).unwrap();
+    assert_eq!(after.mode() & 0o7777, 0o2710);
+    assert_eq!(after.uid(), before.uid());
+    assert_eq!(after.ino(), before.ino());
+    assert_eq!(
+        std::fs::read(instance.join("rootfs.ext4")).unwrap(),
+        b"retained disk"
+    );
+    super::super::ensure_sandbox_instance_traversal(root.path().join("missing")).unwrap();
+    let alias = root.path().join("alias");
+    std::os::unix::fs::symlink(&instance, &alias).unwrap();
+    super::super::ensure_sandbox_instance_traversal(alias).unwrap_err();
+}
+
+#[test]
+fn stale_mount_cleanup_drains_stacks_and_bounds_failures() {
+    for (layers, fail_at, expected_calls, succeeds) in [
+        (0, None, 1, true),
+        (1, None, 2, true),
+        (3, None, 4, true),
+        (usize::MAX, None, 32, false),
+        (3, Some(2), 2, false),
+    ] {
+        let mut calls = 0;
+        let result =
+            super::drain_stale_mounts(std::path::Path::new("/synthetic/jail/rootfs"), |_| {
+                calls += 1;
+                if fail_at == Some(calls) {
+                    return Err("injected unmount failure".into());
+                }
+                Ok(calls <= layers)
+            });
+        assert_eq!(result.is_ok(), succeeds);
+        assert_eq!(calls, expected_calls);
+    }
+}
+
+#[test]
+fn protected_launch_admission_preserves_binding_and_restore_rules() {
+    use super::ExecutionSourceIntegrity::{FsVerity, Legacy};
+    let reference =
+        pplx_space_node_runtime_core::catalog::InitialEnvironment::for_architecture(Arch::X86_64)
+            .unwrap()
+            .definition()
+            .unwrap()
+            .reference();
+    // Outcome: None is deliberate legacy admission; Some is a protected request.
+    for (runtime, environment, requested, restore, components, expected) in [
+        (
+            FsVerity,
+            Some(reference),
+            Some(reference),
+            false,
+            vec![FsVerity],
+            Ok(Some(reference)),
+        ),
+        (
+            FsVerity,
+            Some(reference),
+            None,
+            false,
+            vec![FsVerity],
+            Ok(Some(reference)),
+        ),
+        (
+            FsVerity,
+            Some(reference),
+            Some(reference),
+            false,
+            vec![FsVerity, Legacy],
+            Err(tonic::Code::FailedPrecondition),
+        ),
+        (
+            FsVerity,
+            Some(reference),
+            Some(reference),
+            true,
+            vec![Legacy],
+            Ok(Some(reference)),
+        ),
+        (
+            FsVerity,
+            None,
+            Some(reference),
+            false,
+            vec![FsVerity],
+            Err(tonic::Code::FailedPrecondition),
+        ),
+        (FsVerity, None, None, false, vec![Legacy], Ok(None)),
+        (
+            Legacy,
+            Some(reference),
+            Some(reference),
+            false,
+            vec![Legacy],
+            Ok(None),
+        ),
+    ] {
+        assert_eq!(
+            super::protected_launch_environment(
+                runtime,
+                environment,
+                requested,
+                restore,
+                components
+            )
+            .map_err(|error| error.code()),
+            expected
+        );
+    }
+}
+
+#[test]
+fn encrypted_bind_failure_preserves_stale_jail_contents() {
+    let root = tempfile::tempdir().unwrap();
+    let jail = root.path().join("jail");
+    std::fs::create_dir_all(jail.join("encsnap")).unwrap();
+    let snapshot = jail.join("encsnap/memory");
+    std::fs::write(&snapshot, b"snapshot retained").unwrap();
+    let mut visited = Vec::new();
+    let error = super::clean_stale_jail(jail.to_str().unwrap(), |path| {
+        let name = path.file_name().unwrap().to_str().unwrap().to_owned();
+        visited.push(name.clone());
+        if name == "encsnap" {
+            Err("injected unmount failure".into())
+        } else {
+            Ok(false)
+        }
+    })
+    .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Internal);
+    assert_eq!(visited, ["rootfs.ext4", "memory", "encsnap"]);
+    assert_eq!(std::fs::read(snapshot).unwrap(), b"snapshot retained");
+    let mut encrypted_layers = 2;
+    super::clean_stale_jail(jail.to_str().unwrap(), |path| {
+        if path.ends_with("encsnap") && encrypted_layers > 0 {
+            encrypted_layers -= 1;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    })
+    .unwrap();
+    assert_eq!(encrypted_layers, 0);
+    assert!(!jail.exists());
+}
+
+#[tokio::test]
+async fn wrong_launch_acknowledgement_refuses_and_stops_the_execution() {
+    use crate::runtime_supervisor_client::tests::{SupervisorScript, scripted_in_process_client};
+    use pplx_space_node_runtime_core::proto;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let reference =
+        pplx_space_node_runtime_core::catalog::InitialEnvironment::for_architecture(Arch::X86_64)
+            .unwrap()
+            .definition()
+            .unwrap()
+            .reference();
+    for accepted in [
+        reference.to_string(),
+        String::new(),
+        format!("sha256:{}", "ff".repeat(32)),
+    ] {
+        let (mut service, lease) = allocated_service().await;
+        let fence =
+            super::super::tests::service_tests::bind_test_execution(&service, &lease.sandbox_id);
+        let stops = Arc::new(AtomicUsize::new(0));
+        let stop_calls = stops.clone();
+        let sandbox_id = lease.sandbox_id.clone();
+        let expected_execution = fence.execution_id.clone();
+        let matches = accepted == reference.to_string();
+        service.runtime_supervisor = scripted_in_process_client(SupervisorScript {
+            launch: Some(Arc::new(move |request| {
+                assert!(request.sandbox_id.is_empty());
+                assert_eq!(
+                    request.verified_runtime.unwrap().environment_reference,
+                    reference.to_string()
+                );
+                Ok(proto::LaunchFirecrackerResponse {
+                    pid: 0,
+                    accepted_environment_reference: accepted.clone(),
+                })
+            })),
+            stop_runtime: Some(Arc::new(move |request| {
+                assert_eq!(request.sandbox_id, sandbox_id);
+                assert_eq!(request.execution_id, expected_execution);
+                assert!(request.immediate_kill);
+                stop_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(proto::StopSandboxRuntimeResponse::default())
+            })),
+            ..Default::default()
+        });
+        let result = service
+            .launch_admitted_runtime(
+                &lease.sandbox_id,
+                Some(reference),
+                proto::LaunchFirecrackerRequest {
+                    execution_id: fence.execution_id,
+                    verified_runtime: Some(proto::VerifiedRuntimeLaunch {
+                        sandbox_id: lease.sandbox_id.clone(),
+                        environment_reference: reference.to_string(),
+                        integrity_requirement:
+                            proto::ArtifactIntegrityRequirement::AuthenticatedImmutableSources
+                                .into(),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await;
+        if matches {
+            result.unwrap();
+        } else {
+            assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
+        }
+        assert_eq!(stops.load(Ordering::SeqCst), usize::from(!matches));
+        assert!(
+            service
+                .pool
+                .get(&lease.sandbox_id)
+                .unwrap()
+                .unwrap()
+                .pid
+                .is_none()
+        );
+    }
 }

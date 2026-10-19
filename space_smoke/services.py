@@ -316,7 +316,6 @@ class SmokeServices:
             fixture._node_selector_extras_control = cast(Any, kind)
             fixture._node_fence_control = cast(Any, kind)
             fixture._pending_backup_control = cast(Any, kind)
-            fixture._quarantine_recovery_control = cast(Any, kind)
             fixture._orphaned_restore_pod_gc_control = cast(Any, kind)
             fixture._template_build_control = cast(Any, kind)
             fixture._template_builder = cast(Any, self.ecw)
@@ -328,6 +327,7 @@ class SmokeServices:
             fixture._startup_recovery_control = cast(Any, kind)
             fixture._suspend_codec_control = cast(Any, kind)
             fixture._telemetry_control = cast(Any, kind)
+            fixture._leader_election_control = cast(Any, kind)
             fixture._sandbox_network_isolation_control = cast(Any, kind)
             fixture._template_selector = template
             fixture._warm_pool_observer = cast(Any, kind)
@@ -587,6 +587,27 @@ class SmokeServices:
             owns_api_key=supplied_key is None,
             template_override=template_override,
         )
+
+
+def repair_orphaned_kind_faults(environment: Mapping[str, str]) -> bool:
+    """On the kind backend, undo a limiter fault an earlier run left, or refuse.
+
+    Runs before every scenario, whatever its fixture: a scenario that takes no
+    Lease would otherwise run against shrunk caps or a store scaled to zero.
+    """
+
+    values = dict(environment)
+    if values.get("SPACE_SMOKE_BACKEND", KIND_BACKEND) != KIND_BACKEND:
+        return False
+    harness = KindHarness(
+        SubprocessExecutor(base_env=values),
+        KindConfig(
+            cluster=values.get("KIND_CLUSTER", "space-local"),
+            api_url=values.get("API_URL", "http://127.0.0.1:8080"),
+        ),
+        environment=values,
+    )
+    return harness.repair_orphaned_limiter_faults()
 
 
 @dataclass(frozen=True)

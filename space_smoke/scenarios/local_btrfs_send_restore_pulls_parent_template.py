@@ -21,13 +21,22 @@ MARKER = "space-smoke-btrfs-send-pull-ok"
 # Forcing: with the source cordoned, the fixture's own template is removed
 # from the other sandbox-pool worker through template-manager's own
 # `delete-template`, immediately before the restore — template-manager's
-# prefetch would otherwise re-pull it within a tick. The proof is then
-# sbx-manager's `remote_*` provenance on the landed node, template-manager's
-# own `on_demand` pull on that node, the installed parent being a subvolume
-# with the expected received UUID, the instance being a received subvolume,
-# and the pre-suspend state intact.
+# prefetch would otherwise re-pull it within a tick. The proof is then the
+# landed pod on that node restoring from object storage, the parent build the
+# snapshot names back on that node as a subvolume with the expected received
+# UUID, the instance being a received subvolume, and the pre-suspend state
+# intact. Prefetch could land the parent too, masking a broken on-demand pull
+# behind the kubelet's retries of the restore pod, and nothing scoped to a
+# scenario keeps prefetch off one template (its tags are DaemonSet env read
+# at daemon start). So template-manager's own pull metric must count a
+# successful by-hash `trigger=on_demand` pull of the parent on that worker
+# above a baseline taken once the count had stopped moving before the
+# removal — read from the bench's Prometheus, which only `otel` mode runs.
 @smoke.scenario(
     "local.btrfs_send_restore_pulls_parent_template",
+    telemetry_mode="otel",
+    # The codec is read from the snapshot's objects through the AWS CLI.
+    required_tools=("aws",),
     # A cross-node restore plus a ~460 MiB template pull on the landing worker.
     sandbox=smoke.SandboxConfig(timeout=1200),
 )
@@ -55,11 +64,10 @@ def btrfs_send_restore_pulls_parent_template(test: smoke.KindEcw) -> None:
         codec.require_btrfs_send_default(source_worker)
 
     with test.phase("suspend without naming a format"):
-        suspended_at = codec.mark_since()
         test.pause()
 
     with test.phase("the suspend was sealed as btrfs-send-v1"):
-        codec.expect_suspend_codec(since_time=suspended_at)
+        codec.expect_suspend_codec()
 
     with test.phase("record the parent build the snapshot names"):
         digest = codec.template_hash(template)
@@ -67,10 +75,12 @@ def btrfs_send_restore_pulls_parent_template(test: smoke.KindEcw) -> None:
     with test.phase("wait until the durable snapshot is what a restore would select"):
         restore.wait_until_restore_portable()
 
+    with test.phase("settle the target's on-demand pull count before removing the parent"):
+        on_demand_before = codec.quiescent_on_demand_pull_counts(target_node, template)
+
     with restore.cordoned(source.node_name):
         with test.phase("remove the parent template from the target worker"):
             codec.evict_template(target_node, template)
-            since = codec.mark_since()
 
         with test.phase("restore while only the cold worker is schedulable"):
             test.reconnect_by_id()
@@ -86,7 +96,7 @@ def btrfs_send_restore_pulls_parent_template(test: smoke.KindEcw) -> None:
             )
 
     with test.phase("the target pulled the parent on demand and installed it as a portable subvolume"):
-        codec.expect_pulled_on_demand(target_node, template, since_time=since)
+        codec.expect_parent_pulled_on_demand(target_node, template, digest, before=on_demand_before)
         codec.expect_template_is_portable_subvolume(target_node, template, digest)
 
     with test.phase("the instance was reconstructed by btrfs receive"):

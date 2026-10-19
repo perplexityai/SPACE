@@ -17,11 +17,10 @@ Tables named here are in volume-manager's own SQLite database.
   job or failing its submit releases it. The periodic census deletes sources
   no pending, running or cancelling job holds, and nothing if it can't parse
   the census.
-- New code must work under both the legacy `space-sbxmgr` account and
-  `space-volmgr`, which Kind runs. Files shared with sandbox-manager rely on
+- Volume-manager runs as `space-volmgr`. Files shared with sandbox-manager rely on
   group `space-cache-rw` and umask `0022`. Node-manager's btrfs send-lease
   RPCs admit `space-volmgr` and no other service account. Operator steps are
-  in "Separating volume-manager's credential identity" in
+  in "Volume-manager identity and credentials" in
   `docs/installation.md`.
 - Give a new RPC one of the peer allowlists in `src/service.rs`;
   socket-group membership grants connection, not authority.

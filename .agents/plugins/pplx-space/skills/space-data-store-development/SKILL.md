@@ -40,6 +40,12 @@ Exemplar: `crates/libs/sandbox/store` (`pplx-space-sandbox-store`, the
   and result-processing code. Use a typed query builder only when the query
   shape is genuinely open-ended; keep identifiers and operators allowlisted
   and values bound as parameters.
+- The one exception is a whole boolean predicate from
+  `pplx_space_sandbox_portability`, the single definition of whether a
+  sandbox's bytes are recoverable elsewhere. Interpolate it rather than
+  re-spelling it: a second copy of that rule is how deletion paths and drain
+  gates drift apart. Build the statement once (a `LazyLock<String>`), bind every
+  value, and keep the rest of the statement whole at its query site.
 - A migration that changes a predicate's shape (`SELECT EXISTS(..)` to
   `get(..).is_some_and(..)`, a hand-rolled probe onto a shared fragment) pins
   the equivalence with a Postgres-backed test before it merges.

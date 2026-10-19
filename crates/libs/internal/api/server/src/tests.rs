@@ -3591,8 +3591,11 @@ async fn node_scoped_lookups_hide_unplaced_private_releases() -> TestResult {
 
 /// A sandbox of the template placed on a node, by active or target
 /// placement, lets that node and only that node resolve the release.
+#[rstest::rstest]
 #[tokio::test(flavor = "current_thread")]
-async fn placed_sandbox_unlocks_private_release_for_its_node_only() -> TestResult {
+async fn placed_sandbox_unlocks_private_release_for_its_node_only(
+    #[values("present", "deleting")] desired_state: &str,
+) -> TestResult {
     let Some(fixture) = cluster_fixture().await? else {
         return Ok(());
     };
@@ -3641,6 +3644,104 @@ async fn placed_sandbox_unlocks_private_release_for_its_node_only() -> TestResul
     );
     assert_eq!(found.authorized_org_id, None);
 
+    sqlx::query(sql!(
+        "UPDATE templates SET desired_state = $1 WHERE name = 'private-base'"
+    ))
+    .bind(desired_state)
+    .execute(pool)
+    .await?;
+
+    // Forwarding must intersect scopes; naming a different node cannot borrow
+    // the receiving node's placement, and a sandbox delegates its stored org.
+    use pplx_space_common_svc::template_lookup::TemplateLookupScope;
+    for (delegation, asserted_org, expected) in [
+        (TemplateLookupScope::Node(worker_a_ip.into()), None, None),
+        (
+            TemplateLookupScope::Node(worker_b_ip.into()),
+            None,
+            Some(tonic::Code::NotFound),
+        ),
+        (
+            TemplateLookupScope::Sandbox {
+                id: SandboxId::from_uuid(sandbox_id),
+                caller_node: Some(worker_a_ip.into()),
+            },
+            None,
+            None,
+        ),
+        (
+            TemplateLookupScope::Sandbox {
+                id: SandboxId::from_uuid(sandbox_id),
+                caller_node: Some(worker_b_ip.into()),
+            },
+            None,
+            Some(tonic::Code::PermissionDenied),
+        ),
+        (
+            TemplateLookupScope::Sandbox {
+                id: SandboxId::from_uuid(sandbox_id),
+                caller_node: None,
+            },
+            None,
+            None,
+        ),
+        (
+            TemplateLookupScope::Sandbox {
+                id: SandboxId::from_uuid(sandbox_id),
+                caller_node: None,
+            },
+            Some(Uuid::nil()),
+            Some(tonic::Code::PermissionDenied),
+        ),
+    ] {
+        let mut request = node_scoped_request(
+            FindTemplateReleaseByHashRequest {
+                generic_only: false,
+                template_name: "private-base".into(),
+                hash: hash.clone(),
+                caller_org_id: asserted_org.map(|org| org.to_string()),
+            },
+            worker_a_ip,
+        );
+        delegation.attach(&mut request);
+
+        let response = fixture.service.find_template_release_by_hash(request).await;
+
+        if let Some(code) = expected {
+            assert_eq!(response.unwrap_err().code(), code);
+        } else {
+            let response = response?;
+            delegation.require_acknowledgement(&response)?;
+            if matches!(delegation, TemplateLookupScope::Sandbox { .. }) {
+                assert_eq!(
+                    response.get_ref().authorized_org_id,
+                    Some(owner.to_string())
+                );
+            }
+        }
+    }
+
+    // Static-only installations retain their operator trust boundary.
+    let mut request = Request::new(FindTemplateReleaseByHashRequest {
+        generic_only: false,
+        template_name: "private-base".into(),
+        hash: hash.clone(),
+        caller_org_id: None,
+    });
+    TemplateLookupScope::Sandbox {
+        id: SandboxId::from_uuid(sandbox_id),
+        caller_node: None,
+    }
+    .attach(&mut request);
+    let response = fixture
+        .service
+        .find_template_release_by_hash(request)
+        .await?;
+    assert_eq!(
+        response.get_ref().authorized_org_id,
+        Some(owner.to_string())
+    );
+
     // A pending migration is a target placement; the destination may pull
     // before it becomes active, and the source keeps access while it still
     // hosts the sandbox.
@@ -3653,6 +3754,35 @@ async fn placed_sandbox_unlocks_private_release_for_its_node_only() -> TestResul
     .await?;
     assert!(release_visible_from(&fixture, "private-base", &hash, worker_a_ip, None).await?);
     assert!(release_visible_from(&fixture, "private-base", &hash, worker_b_ip, None).await?);
+    for delegation in [
+        TemplateLookupScope::Node(worker_b_ip.into()),
+        TemplateLookupScope::Sandbox {
+            id: SandboxId::from_uuid(sandbox_id),
+            caller_node: Some(worker_b_ip.into()),
+        },
+    ] {
+        let mut request = node_scoped_request(
+            FindTemplateReleaseByHashRequest {
+                generic_only: false,
+                template_name: "private-base".into(),
+                hash: hash.clone(),
+                caller_org_id: None,
+            },
+            worker_a_ip,
+        );
+        delegation.attach(&mut request);
+
+        let response = fixture
+            .service
+            .find_template_release_by_hash(request)
+            .await?;
+
+        delegation.require_acknowledgement(&response)?;
+        assert_eq!(
+            response.get_ref().release.as_ref().unwrap().id,
+            release_id.to_string()
+        );
+    }
     sqlx::query(sql!(
         "UPDATE sandboxes SET active_node_id = $2 WHERE id = $1"
     ))
@@ -3886,6 +4016,7 @@ async fn placed_sandbox_locations_resolve_for_its_node_only() -> TestResult {
         exact(suspend_artifact, full),
         exact(disk_artifact, disk),
         Artifact::LatestReadySuspendSnapshotId(suspend_attempt.to_string()),
+        Artifact::DurablyRestorable(true),
     ] {
         assert!(check(sandbox_id, artifact.clone(), Some(worker_a_ip)).await?);
         assert!(!check(SandboxId::new(), artifact.clone(), Some(worker_a_ip)).await?);
@@ -3929,6 +4060,7 @@ async fn placed_sandbox_locations_resolve_for_its_node_only() -> TestResult {
                 "invalid".to_string(),
             )),
         ),
+        readiness(sandbox_id, Some(Artifact::DurablyRestorable(false))),
         readiness(
             sandbox_id,
             Some(Artifact::LocalArtifact(LocalArtifactBackupIdentity {
@@ -4721,6 +4853,9 @@ async fn begin_artifact_backup_from_node(
                 artifact_origin: artifact_origin as i32,
                 snapshot_name: None,
                 execution: Some(test_snapshot_execution()),
+                capture_host_cpu: None,
+                execution_generation: None,
+                fence_verdict_only: false,
             },
             node_ip,
         ))
@@ -4753,6 +4888,9 @@ async fn begin_artifact_backup_with_storage_uri(
                 artifact_origin: input.artifact_origin as i32,
                 snapshot_name: input.snapshot_name,
                 execution: Some(test_snapshot_execution()),
+                capture_host_cpu: None,
+                execution_generation: None,
+                fence_verdict_only: false,
             },
             TEST_WORKER_IP,
         ))
@@ -5543,6 +5681,9 @@ async fn begin_artifact_backup_rejects_missing_execution_metadata() -> TestResul
             artifact_origin: pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Stop as i32,
             snapshot_name: None,
             execution: None,
+            capture_host_cpu: None,
+            execution_generation: None,
+            fence_verdict_only: false,
         }))
         .await
         .expect_err("begin without execution metadata must be rejected");
@@ -5553,6 +5694,92 @@ async fn begin_artifact_backup_rejects_missing_execution_metadata() -> TestResul
         .fetch_one(&fixture.service.pool)
         .await?;
     assert_eq!(inserted, 0, "rejected begin must not insert a snapshot row");
+    Ok(())
+}
+
+/// The begin handler carries the request's capture host CPU into the
+/// persisted `execution_metadata`, where restore placement is meant to read
+/// it. A value that couldn't be a node label is recorded as unknown, and the
+/// backup itself still succeeds.
+#[tokio::test(flavor = "current_thread")]
+async fn begin_artifact_backup_persists_capture_host_cpu() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let sandbox_id = seed_sandbox(&fixture.service.pool).await?;
+    let begin_kind = |backup_attempt_id: SnapshotId,
+                      artifact_kind: pplx_space_sbx_mgr_client::proto::ArtifactKind,
+                      artifact_origin: pplx_space_sbx_mgr_client::proto::ArtifactOrigin,
+                      capture_host_cpu: Option<&str>| {
+        fixture.service.begin_artifact_backup(request_from_node(
+            BeginArtifactBackupRequest {
+                sandbox_id: sandbox_id.to_string(),
+                local_artifact_id: LocalArtifactId::new().to_string(),
+                artifact_kind: artifact_kind as i32,
+                backup_attempt_id: backup_attempt_id.to_string(),
+                storage_uri: test_storage_uri(sandbox_id, backup_attempt_id),
+                artifact_origin: artifact_origin as i32,
+                snapshot_name: None,
+                execution: Some(test_snapshot_execution()),
+                capture_host_cpu: capture_host_cpu.map(str::to_owned),
+                execution_generation: None,
+                fence_verdict_only: false,
+            },
+            TEST_WORKER_IP,
+        ))
+    };
+    let begin = |backup_attempt_id: SnapshotId, capture_host_cpu: Option<&str>| {
+        begin_kind(
+            backup_attempt_id,
+            pplx_space_sbx_mgr_client::proto::ArtifactKind::Full,
+            pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Suspend,
+            capture_host_cpu,
+        )
+    };
+    let recorded_host_cpu = |backup_attempt_id: SnapshotId| {
+        sqlx::query_scalar::<_, Option<String>>(sql!(
+            "SELECT execution_metadata->>'host_cpu' FROM snapshots WHERE id = $1"
+        ))
+        .bind(backup_attempt_id)
+        .fetch_optional(&fixture.service.pool)
+    };
+
+    let recorded = SnapshotId::new();
+    begin(recorded, Some("genuineintel-6-85-7")).await?;
+    assert_eq!(
+        recorded_host_cpu(recorded).await?,
+        Some(Some("genuineintel-6-85-7".to_string()))
+    );
+
+    let padded = SnapshotId::new();
+    begin(padded, Some(" GenuineIntel-6-85-7\n")).await?;
+    assert_eq!(
+        recorded_host_cpu(padded).await?,
+        Some(Some("genuineintel-6-85-7".to_string()))
+    );
+
+    let unknown = SnapshotId::new();
+    begin(unknown, None).await?;
+    assert_eq!(recorded_host_cpu(unknown).await?, Some(None));
+
+    let empty = SnapshotId::new();
+    begin(empty, Some("  ")).await?;
+    assert_eq!(recorded_host_cpu(empty).await?, Some(None));
+
+    let invalid = SnapshotId::new();
+    begin(invalid, Some("Intel(R) Xeon(R) Platinum 8259CL")).await?;
+    assert_eq!(recorded_host_cpu(invalid).await?, Some(None));
+
+    // A disk artifact holds no vCPU state, so a sender's CPU isn't recorded.
+    let disk = SnapshotId::new();
+    begin_kind(
+        disk,
+        pplx_space_sbx_mgr_client::proto::ArtifactKind::Disk,
+        pplx_space_sbx_mgr_client::proto::ArtifactOrigin::Stop,
+        Some("genuineintel-6-85-7"),
+    )
+    .await?;
+    assert_eq!(recorded_host_cpu(disk).await?, Some(None));
     Ok(())
 }
 
@@ -7164,6 +7391,7 @@ async fn a_missing_templates_table_degrades_end_to_end() -> TestResult {
     Ok(())
 }
 
+mod backup_generation_fence;
 mod publication;
 
 #[tokio::test(flavor = "current_thread")]

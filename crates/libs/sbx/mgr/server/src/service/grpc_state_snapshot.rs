@@ -1819,14 +1819,18 @@ impl SandboxManagerService {
                 .map_err(|e| Status::internal(format!("cannot connect to node-manager: {e}")))?;
             let phase = Instant::now();
             node_client
-                .create_snapshot(CreateSnapshotRequest {
-                    execution_fence: sandbox.node_execution_fence(),
-                    sandbox_id: sandbox.id.clone(),
-                    snapshot_path: "vmstate".to_string(),
-                    mem_file_path: "memory".to_string(),
-                    dest_dir: Some(staging_dir.clone()),
-                    snapshot_volume_mount_dir: None,
-                })
+                .create_snapshot(crate::service::snapshot_capture::bind(
+                    CreateSnapshotRequest {
+                        execution_fence: sandbox.node_execution_fence(),
+                        sandbox_id: sandbox.id.clone(),
+                        snapshot_path: "vmstate".to_string(),
+                        mem_file_path: "memory".to_string(),
+                        dest_dir: Some(staging_dir.clone()),
+                        snapshot_volume_mount_dir: None,
+                        environment: None,
+                    },
+                    sandbox.execution_metadata.as_ref(),
+                ))
                 .await
                 .map_err(|error| {
                     Status::internal(format!("create template base snapshot: {error}"))

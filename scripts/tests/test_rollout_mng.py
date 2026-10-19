@@ -29,6 +29,19 @@ sys.modules["space_rollout_mng"] = rollout
 _spec.loader.exec_module(rollout)
 
 
+# Sentinel for "no override" on a fake response body, so a test can pass an
+# explicit `None` body and mean it.
+_KEEP = object()
+
+
+class _StopProbe(Exception):
+    """Aborts a real `AdminApi` call once it has produced its URL.
+
+    Lets a URL be captured without modelling any response, so the assertion
+    cannot accidentally depend on the fake's body shape.
+    """
+
+
 def make_admin_node(
     *,
     node_id: str = "00000000-0000-0000-0000-000000000001",
@@ -2130,7 +2143,26 @@ class TestAdminApiDrainBody:
     """
 
     @staticmethod
-    def _api_with_capture() -> tuple[Any, dict[str, Any]]:
+    def _api_with_capture(
+        drain_phase: str | None = None,
+        get_status: int = 200,
+        get_body: Any = _KEEP,
+        post_status: int = 200,
+        post_body: Any = None,
+    ) -> tuple[Any, dict[str, Any]]:
+        """An `AdminApi` whose session captures the POST.
+
+        `drain_phase` is what the pre-POST re-read reports. The default `None`
+        is an undrained node, which is the only state the rollout may drain.
+        `get_status=404` models a vanished admin row; any other non-200 status
+        raises from `raise_for_status`, the way `requests` does — the guard has
+        three distinguishable outcomes on the read, not two, and collapsing the
+        error case into the 404 case would let a fail-open on a 500 pass.
+        `get_body` replaces the whole response body. `post_status` /
+        `post_body` do the same for the `:drain` POST, so the
+        commit-then-substrate-patch 502 can be modelled — the response that
+        means the drain *did* start.
+        """
         captured: dict[str, Any] = {}
 
         class FakeSession:
@@ -2139,14 +2171,49 @@ class TestAdminApiDrainBody:
             def update(self, *_args: Any, **_kwargs: Any) -> None:
                 pass
 
+            def get(
+                self, url: str, params: Any = None, timeout: Any = None
+            ) -> Any:
+                captured["get_url"] = url
+                captured["get_params"] = params
+
+                class Resp:
+                    status_code = get_status
+
+                    @staticmethod
+                    def raise_for_status() -> None:
+                        if get_status >= 400:
+                            raise RuntimeError(f"HTTP {get_status}")
+
+                    @staticmethod
+                    def json() -> Any:
+                        if get_body is not _KEEP:
+                            return get_body
+                        return {
+                            "id": url.rsplit("/", 1)[-1],
+                            "drain_phase": drain_phase,
+                            "sandboxes_active": 0,
+                            "sandboxes_local_snapshots": 0,
+                            "terminate_decrement_capacity": False,
+                        }
+
+                return Resp()
+
             def post(self, url: str, json: Any = None, timeout: Any = None) -> Any:
                 captured["url"] = url
                 captured["json"] = json
 
                 class Resp:
+                    status_code = post_status
+
                     @staticmethod
                     def raise_for_status() -> None:
-                        pass
+                        if post_status >= 400:
+                            raise RuntimeError(f"HTTP {post_status}")
+
+                    @staticmethod
+                    def json() -> Any:
+                        return post_body
 
                 return Resp()
 
@@ -2167,11 +2234,642 @@ class TestAdminApiDrainBody:
         api.drain("22222222-2222-2222-2222-222222222222", replace_after_terminate=False)
         assert captured["json"]["replace_after_terminate"] is False
         assert captured["url"].endswith(
-            "/admin/v1/nodes/22222222-2222-2222-2222-222222222222:drain"
+            "/admin/api/v1/nodes/22222222-2222-2222-2222-222222222222:drain"
         )
 
     def test_dry_run_does_not_post(self) -> None:
         api, captured = self._api_with_capture()
         api.dry_run = True
-        api.drain("33333333-3333-3333-3333-333333333333", replace_after_terminate=True)
-        assert captured == {}
+        assert api.drain(
+            "33333333-3333-3333-3333-333333333333", replace_after_terminate=True
+        )
+        assert "url" not in captured, "dry run must not POST"
+
+    def test_drain_refuses_a_node_that_is_already_draining(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A drain visible on the pre-POST read is skipped without a POST.
+
+        `pick_drain_candidates` filters on the tick's snapshot, so a drain an
+        operator started inside the snapshot window still reads as
+        `DrainPhase.NONE`. The endpoint would refuse the POST anyway
+        (`require_undrained`), so this read isn't what keeps the drain safe;
+        it skips the node without a write attempt and reports what it found.
+        """
+        for phase in ["draining", "drained", "terminating"]:
+            api, captured = self._api_with_capture(drain_phase=phase)
+            issued = api.drain(
+                "44444444-4444-4444-4444-444444444444",
+                replace_after_terminate=False,
+            )
+            assert not issued, f"{phase}: drain must not be issued"
+            assert "url" not in captured, (
+                f"{phase}: a drain the read can see is skipped without a POST"
+            )
+            events = [
+                json.loads(line)
+                for line in capsys.readouterr().out.splitlines()
+                if line.strip()
+            ]
+            assert [e["event"] for e in events] == ["drain_skipped_already_draining"], (
+                f"{phase}: the skip is the only trace the caller leaves"
+            )
+            assert events[0]["drain_phase"] == phase
+
+    def test_drain_requires_an_undrained_node(self) -> None:
+        """Every POST is start-only, so the endpoint can never escalate a drain
+        this process did not start."""
+        api, captured = self._api_with_capture()
+        api.drain("66666666-6666-6666-6666-666666666666", replace_after_terminate=False)
+        assert captured["json"]["require_undrained"] is True
+
+    def test_a_drain_that_lands_after_the_read_is_skipped_not_failed(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The read sees an undrained node, somebody's drain commits before the
+        POST, and the endpoint refuses it with a 409. That is the same outcome
+        as a drain the read saw, not a tick error."""
+        api, captured = self._api_with_capture(
+            drain_phase=None,
+            post_status=409,
+            post_body={
+                "error": "node is already in a drain phase and the request set require_undrained",
+                "current_drain_phase": "draining",
+            },
+        )
+        issued = api.drain(
+            "77777777-7777-7777-7777-777777777777", replace_after_terminate=False
+        )
+        assert not issued
+        assert "url" in captured, "the read saw no drain, so the POST went out"
+        events = [
+            json.loads(line)
+            for line in capsys.readouterr().out.splitlines()
+            if line.strip()
+        ]
+        assert [e["event"] for e in events] == ["drain_skipped_already_draining"]
+        assert events[0]["drain_phase"] == "draining"
+        assert events[0]["refused_by"] == "endpoint"
+
+    def test_the_pre_post_read_skips_occupancy_and_accepts_null_counts(
+        self,
+    ) -> None:
+        """The re-read asks for the drain columns only, and the response that
+        produces carries `null` occupancy counts, which must not stop the
+        drain."""
+        api, captured = self._api_with_capture(
+            get_body={
+                "id": "88888888-8888-8888-8888-888888888888",
+                "drain_phase": None,
+                "sandboxes_active": None,
+                "sandboxes_local_snapshots": None,
+                "terminate_decrement_capacity": False,
+            }
+        )
+        assert api.drain(
+            "88888888-8888-8888-8888-888888888888", replace_after_terminate=False
+        )
+        assert captured["get_params"] == {"include_occupancy": "false"}
+        assert "url" in captured
+
+    def test_a_contention_409_is_an_error_not_a_skip(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The admin API also answers 409 for a retryable serialization or
+        deadlock abort. That started no drain and names no phase, so it must
+        raise rather than read as somebody else's drain."""
+        api, _ = self._api_with_capture(
+            drain_phase=None,
+            post_status=409,
+            post_body={
+                "error": "operation conflicted with a concurrent admin write; retry the request"
+            },
+        )
+        with pytest.raises(RuntimeError, match="HTTP 409"):
+            api.drain(
+                "99999999-9999-9999-9999-999999999999", replace_after_terminate=False
+            )
+        assert "drain_skipped_already_draining" not in capsys.readouterr().out
+
+    def test_drain_proceeds_when_the_node_is_still_undrained(self) -> None:
+        """The guard must not block the case the rollout exists to drive."""
+        api, captured = self._api_with_capture(drain_phase=None)
+        assert api.drain(
+            "55555555-5555-5555-5555-555555555555", replace_after_terminate=False
+        )
+        assert captured["json"]["mode"] == "forced"
+
+
+class TestAdminApiDrainGuardFailsClosed:
+    """The pre-POST phase guard must refuse when it cannot read the phase.
+
+    A 404 on the read is indistinguishable from "the GET never reached a node
+    route" — a wrong path prefix, an ingress change, a renamed route. Under that
+    reading a guard that treats an unreadable phase as "safe to proceed" is
+    inert for *every* candidate, forever, while still appearing to be there: the
+    POSTs go out exactly as they did before the guard existed, and the wave is
+    back to escalating drains it did not start. So the unreadable case has to
+    refuse, and it needs its own test, because it is the one branch whose
+    failure looks like success.
+    """
+
+    def test_an_unreadable_phase_refuses_the_drain(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        api, captured = TestAdminApiDrainBody._api_with_capture(get_status=404)
+        issued = api.drain(
+            "66666666-6666-6666-6666-666666666666", replace_after_terminate=False
+        )
+        assert not issued, "an unreadable phase must not be treated as undrained"
+        assert "url" not in captured, (
+            "no POST may be sent — reaching the endpoint is what escalates a "
+            "drain the rollout did not start"
+        )
+        # The event is the only trace that a wave declined a node: the caller
+        # just `continue`s. Without it a wave that skips every candidate — the
+        # shape a wrong path prefix produces — looks identical to one with
+        # nothing to do.
+        events = [
+            json.loads(line)
+            for line in capsys.readouterr().out.splitlines()
+            if line.strip()
+        ]
+        assert [e["event"] for e in events] == ["drain_skipped_phase_unreadable"]
+        assert events[0]["node_id"] == "66666666-6666-6666-6666-666666666666"
+
+    def test_a_body_without_the_phase_field_refuses_the_drain(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A 200 whose body has no `drain_phase` key is unreadable, not undrained.
+
+        `AdminNodeResponse.drain_phase` carries no `skip_serializing_if`, so the
+        real endpoint always emits the key — `null` when the node is undrained.
+        Absence means the body came from somewhere else: a proxy error page
+        rendered as JSON, a redirect that landed off the node route, a future
+        response shape. `dict.get` maps every one of those to `None`, which is
+        precisely the value that tells this guard the node is safe to drain — so
+        the fail-open is reached by a *successful* request, which the 404 test
+        above cannot catch.
+        """
+        api, captured = TestAdminApiDrainBody._api_with_capture(
+            get_body={"id": "88888888-8888-8888-8888-888888888888", "state": "ready"}
+        )
+        assert not api.drain(
+            "88888888-8888-8888-8888-888888888888", replace_after_terminate=False
+        )
+        assert "url" not in captured, "no POST may be sent"
+        events = [
+            json.loads(line)
+            for line in capsys.readouterr().out.splitlines()
+            if line.strip()
+        ]
+        assert [e["event"] for e in events] == ["drain_skipped_phase_unreadable"]
+        assert "drain_phase" in events[0]["reason"], (
+            "the reason must name the missing field, since this refusal and the "
+            "404 one share an event"
+        )
+
+    def test_a_read_that_errors_is_not_a_silent_skip(self) -> None:
+        """A 5xx on the read must raise, not refuse quietly.
+
+        The three read outcomes are distinguishable and want different handling:
+        200 decides on the phase, 404 refuses this node, and an error status is a
+        problem with the control plane rather than with this node. Collapsing the
+        third into the second would turn a control-plane outage into a rollout
+        that skips every candidate and exits zero. Raising lets the wave report
+        it as `tick_error` and keep the run's shape honest.
+        """
+        api, captured = TestAdminApiDrainBody._api_with_capture(get_status=500)
+        with pytest.raises(RuntimeError):
+            api.drain(
+                "99999999-9999-9999-9999-999999999999", replace_after_terminate=False
+            )
+        assert "url" not in captured, "and still no POST"
+
+    def test_a_readable_undrained_phase_still_proceeds(self) -> None:
+        """The fail-closed branch must not swallow the case the wave exists for."""
+        api, captured = TestAdminApiDrainBody._api_with_capture(get_status=200)
+        assert api.drain(
+            "77777777-7777-7777-7777-777777777777", replace_after_terminate=False
+        )
+        assert captured["json"]["mode"] == "forced"
+
+
+class TestDrainCommitOrdering:
+    """A 502 from the admin handler means the drain *started*.
+
+    `apply_drain_action` commits the Postgres transition and only then patches
+    the substrate, so that a failed patch is recoverable instead of leaving the
+    scheduler and the database disagreeing. The 502 it answers with therefore
+    reports a drain that is already `draining` in the row, with the reconciler
+    re-asserting cordon every tick.
+
+    Reading that as a failure kept the run correct — `pick_drain_candidates`
+    recounts `in_progress` from the next snapshot, which sees the node as
+    draining — while making the run's own record of itself wrong: no
+    `drain_started`, a `tick_error` for a request that succeeded, and
+    `drain_wave_made_no_progress` on a wave that had made exactly the progress
+    asked of it.
+    """
+
+    HANDLER_502 = {
+        "error": "kube PATCH failed: node not found",
+        "db_state": {"id": "n", "drain_phase": "draining"},
+        "reconciler_will_retry": True,
+    }
+
+    def test_a_handler_502_after_commit_counts_as_started(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        api, captured = TestAdminApiDrainBody._api_with_capture(
+            post_status=502, post_body=self.HANDLER_502
+        )
+        assert api.drain(
+            "cccccccc-cccc-cccc-cccc-cccccccccccc", replace_after_terminate=False
+        ), "the drain committed, so the wave must book it"
+        assert captured["json"]["mode"] == "forced", "and the POST still went out"
+        event = json.loads(capsys.readouterr().out.strip())
+        assert event["event"] == "drain_committed_substrate_patch_failed"
+        assert event["reconciler_will_retry"] is True, (
+            "the operator needs to know a repair is coming, since this path "
+            "reports success on a response that says something failed"
+        )
+        assert "kube PATCH failed" in event["error"]
+
+    def test_a_gateway_502_does_not_count_as_started(self) -> None:
+        """The other 502, which means the opposite, and must still raise.
+
+        A load balancer, ingress or mesh in front of the api-server answers 502
+        with no `db_state`, and for that one the transition never committed.
+        Booking it would drop the node from candidacy for the rest of the run —
+        the rollout would skip a node it never drained — so the default is to
+        raise and only positive evidence of a commit opts out.
+        """
+        for body in (
+            None,
+            "<html>502 Bad Gateway</html>",
+            {"error": "upstream connect error"},
+            {"error": "x", "db_state": None},
+            # The handler's shape, but reporting a row that is *not* draining:
+            # no commit to infer, so no booking.
+            {"error": "x", "db_state": {"id": "n", "drain_phase": None}},
+        ):
+            api, _ = TestAdminApiDrainBody._api_with_capture(
+                post_status=502, post_body=body
+            )
+            with pytest.raises(RuntimeError):
+                api.drain(
+                    "dddddddd-dddd-dddd-dddd-dddddddddddd",
+                    replace_after_terminate=False,
+                )
+
+    def test_a_plain_200_still_needs_no_event(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The ordinary path must not start narrating a failure that did not happen."""
+        api, _ = TestAdminApiDrainBody._api_with_capture()
+        assert api.drain(
+            "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee", replace_after_terminate=False
+        )
+        assert capsys.readouterr().out.strip() == ""
+
+
+class TestResolvedDrainMode:
+    """The refusal event must name the destructive case, not print `null` for it.
+
+    `AdminNodeResponse.drain_mode` is `skip_serializing_if = "Option::is_none"`,
+    so a node draining with `drain_mode IS NULL` omits the key and the raw value
+    is `None`. NULL resolves to **gentle** in the control plane, and an inherited
+    gentle drain is exactly the one whose escalation destroys sandboxes. So the
+    single most important refusal to recognize in the JSONL was the one that
+    printed as unreported, while a routine explicit `"gentle"` printed normally.
+    """
+
+    def test_null_and_unrecognized_both_resolve_to_gentle(self) -> None:
+        """The non-evacuating mode is what a missing or unparseable value means.
+
+        Mirrors `NodeDrainMode::from_column_str`. `"gently"` stands in for a
+        value a newer service could write during a rollout: the column carries
+        no `CHECK`, so it is reachable rather than hypothetical.
+        """
+        assert rollout.resolved_drain_mode(None) == "gentle"
+        assert rollout.resolved_drain_mode("gently") == "gentle"
+        assert rollout.resolved_drain_mode("") == "gentle"
+        # And the two it must pass through unchanged, so the resolution cannot
+        # be satisfied by a function that answers "gentle" to everything.
+        assert rollout.resolved_drain_mode("gentle") == "gentle"
+        assert rollout.resolved_drain_mode("forced") == "forced"
+
+    def test_a_null_mode_is_reported_as_gentle_on_the_refusal(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """End to end: a NULL column reaches the event as a named mode.
+
+        The body omits `drain_mode` entirely, which is what the API sends for a
+        NULL column — not `"drain_mode": null`. Both fields are asserted: the
+        raw one stays `None` so "nobody set a mode" is still distinguishable
+        from "someone chose gentle", and the resolved one names the risk.
+        """
+        api, captured = TestAdminApiDrainBody._api_with_capture(
+            get_body={
+                "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                "drain_phase": "draining",
+                "sandboxes_active": 0,
+                "sandboxes_local_snapshots": 0,
+                "terminate_decrement_capacity": False,
+            }
+        )
+        assert not api.drain(
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", replace_after_terminate=False
+        )
+        assert "url" not in captured, "no POST may reach the escalation edge"
+        event = json.loads(capsys.readouterr().out.strip())
+        assert event["event"] == "drain_skipped_already_draining"
+        assert event["drain_mode"] is None, (
+            "the raw column stays unset, so an operator can still tell "
+            "'nobody set a mode' from 'someone chose gentle'"
+        )
+        assert event["drain_mode_resolved"] == "gentle", (
+            "and the resolution names it as the destructive case"
+        )
+
+    def test_an_explicit_forced_mode_is_reported_as_itself(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The routine case must stay distinguishable from the one above.
+
+        Re-reading our own forced drain after a restart is not worth paging on.
+        If both resolved to the same string the field would carry nothing.
+        """
+        api, _ = TestAdminApiDrainBody._api_with_capture(
+            get_body={
+                "id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                "drain_phase": "draining",
+                "drain_mode": "forced",
+                "sandboxes_active": 0,
+                "sandboxes_local_snapshots": 0,
+                "terminate_decrement_capacity": False,
+            }
+        )
+        assert not api.drain(
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", replace_after_terminate=False
+        )
+        event = json.loads(capsys.readouterr().out.strip())
+        assert event["drain_mode"] == "forced"
+        assert event["drain_mode_resolved"] == "forced"
+
+
+class TestAdminApiPrefix:
+    """Every admin URL this script builds must resolve against the real router.
+
+    A wrong prefix is the one defect class here that a green suite cannot rule
+    out on its own, because the symptom is indistinguishable from a healthy tick
+    with nothing to do: `list_nodes` raises, the tick handler reports
+    `tick_error`, and the run retries forever having drained nothing.
+
+    The assertions below spell `/admin/api/v1` out **as a literal** rather than
+    reading `rollout.ADMIN_API_PREFIX`. Reading the constant would make every one
+    of them pass for whatever the constant happened to say, which is no test of
+    the value at all — the point is to pin it against the router's mount.
+    """
+
+    LITERAL = "/admin/api/v1"
+
+    def test_the_prefix_matches_the_router_mount(self) -> None:
+        """Pinned against `shared_host_router`'s `.nest()` in admin/mod.rs.
+
+        The dedicated admin host reaches the same tree at `/v1`, and the ingress
+        `/admin` rule is a bare `pathType: Prefix` with no rewrite-target, so
+        this is the spelling that resolves on every deployment — the same
+        reasoning `space-admin-cli`'s `ADMIN_API_PREFIX` records.
+        """
+        assert rollout.ADMIN_API_PREFIX == self.LITERAL
+
+    def test_every_call_site_uses_it(self) -> None:
+        """All four routes, and asserted as a set so a duplicate cannot stand in.
+
+        The stale prefix survived because only `drain` had its URL asserted.
+        Three of the four call sites had no coverage at all, and one of those
+        three is `get_node` — the pre-POST guard, whose whole job is to refuse a
+        drain it cannot verify.
+
+        Two constraints make this test cover what it claims, and both are easy
+        to violate in a way that still passes:
+
+        * The GET must answer a real 200. `drain()` calls `get_node` before it
+          posts, so a session that aborts the GET propagates out of `drain()`
+          and the `:drain` POST is never built — leaving the drain route
+          unobserved while the test looks fine.
+        * The assertion must be over the *set* of `(method, suffix)` pairs, not
+          a count. `get_node`'s URL appears twice — once directly, once from
+          inside `drain` — so a length check is satisfied by the duplicate and
+          stays green when a route is missing.
+        """
+        seen: list[tuple[str, str]] = []
+        base = "https://space.example.com"
+
+        class RecordingSession:
+            headers: dict[str, str] = {}
+
+            def update(self, *_a: Any, **_k: Any) -> None:
+                pass
+
+            def get(self, url: str, params: Any = None, timeout: Any = None) -> Any:
+                seen.append(("GET", url))
+
+                class Resp:
+                    status_code = 200
+
+                    @staticmethod
+                    def raise_for_status() -> None:
+                        pass
+
+                    @staticmethod
+                    def json() -> Any:
+                        # A list for the collection route, a row for the detail
+                        # route, so both parse. `drain_phase` must be absent-as-
+                        # NULL rather than missing, or `get_node` refuses and
+                        # `drain` returns before posting.
+                        if url.endswith("/nodes"):
+                            return []
+                        return {
+                            "id": url.rsplit("/", 1)[-1],
+                            "drain_phase": None,
+                            "sandboxes_active": 0,
+                            "sandboxes_local_snapshots": 0,
+                            "terminate_decrement_capacity": False,
+                        }
+
+                return Resp()
+
+            def post(self, url: str, json: Any = None, timeout: Any = None) -> Any:
+                seen.append(("POST", url))
+
+                class Resp:
+                    status_code = 200
+
+                    @staticmethod
+                    def raise_for_status() -> None:
+                        pass
+
+                    @staticmethod
+                    def json() -> Any:
+                        return {}
+
+                return Resp()
+
+        api = rollout.AdminApi(base, "t", dry_run=False)
+        api.session = RecordingSession()  # type: ignore[assignment]
+
+        node = "44444444-4444-4444-4444-444444444444"
+        api.list_nodes()
+        api.get_node(node)
+        api.drain(node, replace_after_terminate=False)
+        api.terminate(node)
+
+        prefix = f"{base}{self.LITERAL}"
+        assert set(seen) >= {
+            ("GET", f"{prefix}/nodes"),
+            ("GET", f"{prefix}/nodes/{node}"),
+            ("POST", f"{prefix}/nodes/{node}:drain"),
+            ("POST", f"{prefix}/nodes/{node}:terminate"),
+        }, f"every route must resolve against the admin mount; saw {sorted(set(seen))}"
+
+
+class TestIssueDrainWave:
+    """The two decisions the drain wave makes about `AdminApi.drain`'s result.
+
+    Both are invisible from `drain`'s own tests — they live at the call site —
+    and both are silent when wrong. Extracted from the tick loop so they can be
+    asserted at all.
+    """
+
+    @staticmethod
+    def _node(node_id: str) -> Any:
+        return make_node_status(
+            instance_id=f"i-{node_id[:4]}",
+            admin=make_admin_node(node_id=node_id),
+        )
+
+    class _Api:
+        """Answers `drain` from a scripted list of outcomes."""
+
+        def __init__(self, outcomes: list[Any]) -> None:
+            self.outcomes = list(outcomes)
+            self.calls: list[str] = []
+
+        def drain(self, node_id: str, replace_after_terminate: bool) -> bool:
+            self.calls.append(node_id)
+            outcome = self.outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+    def test_a_refused_node_is_not_booked_as_drained(self) -> None:
+        """A refusal must not enter `drain_issued`.
+
+        `drain_issued` removes a node from candidacy permanently *and* counts it
+        against `--max-concurrent-node-drains`. Booking a refusal would lose the
+        wave one slot per refusal until it could no longer drain anything —
+        silently, since the refusal itself is expected.
+        """
+        api = self._Api([False, True])
+        drain_issued: set[str] = set()
+        last_phase: dict[str, Any] = {}
+        issued = rollout.issue_drain_wave(
+            api,
+            [self._node("aaaa1111"), self._node("bbbb2222")],
+            cohort="c",
+            drain_issued=drain_issued,
+            last_phase=last_phase,
+        )
+        assert issued == 1
+        assert drain_issued == {"bbbb2222"}, (
+            "only the node that was actually drained may be booked"
+        )
+        assert "aaaa1111" not in last_phase
+
+    def test_a_failing_node_does_not_starve_the_ones_after_it(self) -> None:
+        """A raise must be contained per node.
+
+        `pick_drain_candidates` orders deterministically, so an uncontained
+        raise on the first candidate would starve every later one — and the
+        terminate phase in the same block — on every tick, turning a slow wave
+        into a stalled one.
+        """
+        api = self._Api([RuntimeError("boom"), True])
+        drain_issued: set[str] = set()
+        issued = rollout.issue_drain_wave(
+            api,
+            [self._node("cccc3333"), self._node("dddd4444")],
+            cohort="c",
+            drain_issued=drain_issued,
+            last_phase={},
+        )
+        assert api.calls == ["cccc3333", "dddd4444"], (
+            "the second candidate must still be attempted"
+        )
+        assert issued == 1
+        assert drain_issued == {"dddd4444"}
+
+    def test_a_wave_that_declines_every_candidate_says_so(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A wave that had candidates and issued none must not be silent.
+
+        `drain_skipped_*` says why per node, but nothing says the wave as a whole
+        stopped moving. And a refusal is not an error, so the tick completes
+        normally and the loop keeps ticking with no failure status — a rollout
+        wedged behind a foreign drain on its only slot is indistinguishable, from
+        the outside, from one patiently waiting on something that is progressing.
+        """
+        api = self._Api([False, RuntimeError("boom")])
+        assert (
+            rollout.issue_drain_wave(
+                api,
+                [self._node("eeee5555"), self._node("ffff6666")],
+                cohort="c",
+                drain_issued=set(),
+                last_phase={},
+            )
+            == 0
+        )
+        events = [
+            json.loads(line)
+            for line in capsys.readouterr().out.splitlines()
+            if line.strip()
+        ]
+        assert [e["event"] for e in events] == [
+            "tick_error",
+            "drain_wave_made_no_progress",
+        ], "the raise is reported, then the wave-level stall"
+        assert events[-1]["candidates"] == 2, (
+            "the candidate count is what separates a stalled wave from an "
+            "empty one, so it has to be on the event"
+        )
+
+    def test_a_wave_with_no_candidates_is_not_called_stalled(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """An empty wave issues zero too, and must not report a stall.
+
+        This is the steady state of a *finishing* rollout: once the last node is
+        drained, `pick_drain_candidates` returns nothing on every subsequent
+        tick. Reporting no-progress there would fire the event continuously at
+        exactly the moment the rollout is succeeding — and it would mean the
+        opposite of what it says, which is worse than not emitting it.
+        """
+        api = self._Api([])
+        assert (
+            rollout.issue_drain_wave(
+                api,
+                [],
+                cohort="c",
+                drain_issued=set(),
+                last_phase={},
+            )
+            == 0
+        )
+        assert capsys.readouterr().out.strip() == "", (
+            "an empty wave emits nothing at all"
+        )

@@ -310,7 +310,9 @@ fn current_storable_traceparent() -> Option<String> {
 ///
 /// `traceparent` is saved with each row. A writer without one keeps the
 /// context a row already has, so a background write that coalesces onto a
-/// request's pending ref does not erase the request's context.
+/// request's pending ref does not erase the request's context, and an
+/// unsampled writer's context never replaces a sampled one, so the pass that
+/// applies the ref still follows the sampled request.
 async fn upsert_node_reconcile_refs<'e, E>(
     executor: E,
     node_ids: &[NodeId],
@@ -365,10 +367,14 @@ where
                  dead_at = NULL,
                  dead_reason = '',
                  updated_at = NOW(),
-                 traceparent = COALESCE(
-                     EXCLUDED.traceparent,
-                     node_reconcile_queue.traceparent
-                 )
+                 traceparent = CASE
+                     WHEN EXCLUDED.traceparent IS NULL
+                     THEN node_reconcile_queue.traceparent
+                     WHEN get_byte(decode(right(node_reconcile_queue.traceparent, 2), 'hex'), 0) & 1 = 1
+                          AND get_byte(decode(right(EXCLUDED.traceparent, 2), 'hex'), 0) & 1 = 0
+                     THEN node_reconcile_queue.traceparent
+                     ELSE EXCLUDED.traceparent
+                 END
              RETURNING node_id, facet
          )
          SELECT node_id, facet, COUNT(*)::BIGINT AS queued

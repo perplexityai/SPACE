@@ -26,6 +26,8 @@ from urllib.parse import urlsplit
 from space_smoke.native_hardening import NativeHardeningFixture, NativeTransportError
 
 from space_smoke.adapters import (
+    LEADER_ELECTION_ENV,
+    LEADER_ELECTION_FALSE_VALUES as FALSE_VALUES,
     KindConfig,
     KindHarness,
     NATIVE_OPERATION_AGE_ENV as M1_AGE_ENV,
@@ -44,12 +46,15 @@ RECOVERY_ENVIRONMENT = (
     "SPACE_SMOKE_NATIVE_RECOVERY_CONTEXT",
     "SPACE_SMOKE_NATIVE_RECOVERY_CLUSTER_UID",
 )
+# Also waits for the replaced pods to be gone, so it is shorter than the API's
+# and data plane's 180 s termination grace. That is enough because a restart
+# here holds nothing open: the data-plane scenario closes its command's stream
+# before restarting (max_events), and the API scenario restarts with its create
+# queued behind the stopped controller, so each old pod exits after its 5 s
+# preStop. A scenario that restarts under an open stream waits for the
+# replacements alone (`begin_restart`, `await_replacements`) and then for the
+# old pods' exit once its stream ends (`await_exit`).
 ROLLOUT_TIMEOUT = 90.0
-# The cluster-controller's leader-election kill switch: on unless one of these
-# values turns it off (truthy_default in
-# crates/libs/cluster/controller/server/src/env_config.rs).
-LEADER_ELECTION_ENV = "SPACE_CLUSTER_CONTROLLER_LEADER_ELECTION_ENABLED"
-FALSE_VALUES = frozenset({"0", "false", "False", "FALSE"})
 
 
 @dataclass(frozen=True)
@@ -195,14 +200,7 @@ class NativeRecoveryControl:
             status = deployment.get("status", {})
             pods = self._pods(name)
             current = [pod for pod in pods if not pod["metadata"].get("deletionTimestamp")]
-            ready = all(
-                pod.get("status", {}).get("phase") == "Running"
-                and any(
-                    c.get("type") == "Ready" and c.get("status") == "True"
-                    for c in pod.get("status", {}).get("conditions", [])
-                )
-                for pod in current
-            )
+            ready = all(_pod_ready(pod) for pod in current)
             old_gone = not replaced or not replaced.intersection(p["metadata"]["uid"] for p in pods)
             if (
                 deployment["spec"].get("replicas", 1) == count
@@ -428,6 +426,15 @@ class NativeRecoveryControl:
                 primary.add_note(f"Operation budget restoration also failed: {error}")
 
     def restart(self, name: str) -> None:
+        before = self.begin_restart(name)
+        self._wait(name, self._captures[name].replicas, replaced=before)
+
+    def begin_restart(self, name: str) -> set[str]:
+        """Delete `name`'s pods without waiting for them, returning their UIDs.
+
+        Each deleted pod gets SIGTERM and exits on its own schedule; a data
+        plane serving an open stream keeps running until the stream ends.
+        """
         if name not in {"space-api", "space-data-plane"}:
             raise ValueError("only API and data-plane restarts are supported")
         self._fence()
@@ -442,8 +449,49 @@ class NativeRecoveryControl:
             )
             if result.returncode:
                 raise SmokeConfigurationError(f"failed to restart a captured {name} pod")
-        self._wait(name, self._captures[name].replicas, replaced=before)
         self.context.record(f"{name}_restarted_pods", len(before))
+        return before
+
+    def await_replacements(self, name: str, replaced: set[str]) -> set[str]:
+        """Wait for the captured count of ready pods other than `replaced`.
+
+        Returns the pods of `replaced` that are still terminating then.
+        """
+        count = self._captures[name].replicas
+        deadline = time.monotonic() + ROLLOUT_TIMEOUT
+        while time.monotonic() < deadline:
+            pods = self._pods(name)
+            fresh = [
+                pod for pod in pods
+                if pod["metadata"]["uid"] not in replaced and not pod["metadata"].get("deletionTimestamp")
+            ]
+            if len(fresh) == count and all(_pod_ready(pod) for pod in fresh):
+                return replaced & {pod["metadata"]["uid"] for pod in pods}
+            self._sleep(0.5)
+        raise TimeoutError(f"{name} did not reach {count} ready replacement pods")
+
+    def remaining(self, name: str, uids: set[str]) -> set[str]:
+        """The pods of `uids` that still exist."""
+        return uids & {pod["metadata"]["uid"] for pod in self._pods(name)}
+
+    def await_exit(self, name: str, uids: set[str], *, timeout: float) -> None:
+        """Wait until none of the pods in `uids` exists."""
+        deadline = time.monotonic() + timeout
+        while self.remaining(name, uids):
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"replaced {name} pods did not exit within {timeout:g}s")
+            self._sleep(0.5)
+
+    def data_plane_shutdown_grace(self) -> float:
+        """The data plane's drain deadline in seconds, from its `--shutdown-grace-secs`."""
+        containers = self._deployment("space-data-plane")["spec"]["template"]["spec"]["containers"]
+        for container in containers:
+            args = list(container.get("args", []))
+            if "--shutdown-grace-secs" in args:
+                index = args.index("--shutdown-grace-secs")
+                if index + 1 < len(args):
+                    return float(args[index + 1])
+        raise SmokeConfigurationError("the data plane runs without a drain deadline")
 
     def restore(self) -> None:
         if self._release is None:
@@ -522,6 +570,14 @@ class NativeRecoveryControl:
                     if primary is None:
                         raise
                     primary.add_note(f"Recovery restoration also failed: {error}")
+
+
+def _pod_ready(pod: Mapping) -> bool:
+    status = pod.get("status", {})
+    return status.get("phase") == "Running" and any(
+        condition.get("type") == "Ready" and condition.get("status") == "True"
+        for condition in status.get("conditions", [])
+    )
 
 
 def expect_response(fixture: NativeHardeningFixture, response, status: int) -> dict:

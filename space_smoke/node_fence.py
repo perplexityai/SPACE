@@ -23,7 +23,9 @@ Two halves, and the second is the one that would fail silently:
    keys node-ctl's reconcilers touch; getting them wrong breaks node-ctl on
    every cluster at once and the refusals cannot see it. So every write shape
    node-ctl has is replayed with the same credential — the SSD placement
-   apply, the template-presence apply and its same-manager prune, the merge
+   apply, the host-CPU label apply (a value change; its unknown-CPU removal
+   isn't replayed, since that strips node-ctl's label mid-run), the template-presence
+   apply and its same-manager prune, the merge
    patch clearing a `template-write` annotation, the `nodes/status` capacity
    apply — and then a label and the slot capacity node-ctl owns are stripped
    and the *running binary* has to write both back through its own credential.
@@ -74,10 +76,13 @@ PROBE_FINALIZER = "space.pplx.net/smoke-fence-probe"
 PROBE_CONDITION_REASON = "SmokeFenceProbeForged"
 OWNED_LABEL = "space.pplx.net/ssd-headroom-tier"
 BLOCKED_LABEL = "space.pplx.net/ssd-placement-blocked"
+HOST_CPU_LABEL = "space.pplx.net/host-cpu"
+HOST_CPU_FIELD_MANAGER = "space-node-ctl-host-cpu"
 SLOTS_RESOURCE = "space.pplx.net/network-slots"
 FOREIGN_CAPACITY_RESOURCE = "nvidia.com/gpu"
 PROBE_KEY_MARKER = "smoke-fence-probe"
 PROBE_PRESENCE_KEY = f"space.pplx.net/template-build-{PROBE_KEY_MARKER}"
+PROBE_HOST_CPU = PROBE_KEY_MARKER
 PROBE_WRITE_KEY = f"space.pplx.net/template-write-{PROBE_KEY_MARKER}"
 
 # Rule-message fragments of `node-fence.yaml`; a refusal must carry the policy
@@ -203,6 +208,8 @@ def residue(node: Mapping[str, object]) -> list[str]:
         found.append("dedicated-org taint")
     if BOUNDARY_LABEL in (meta.get("labels") or {}):  # type: ignore[operator]
         found.append("forged boundary label")
+    if (meta.get("labels") or {}).get(HOST_CPU_LABEL) == PROBE_HOST_CPU:  # type: ignore[union-attr]
+        found.append("probe host-cpu label")
     if spec.get("unschedulable"):  # type: ignore[union-attr]
         found.append("cordoned")
     if PROBE_FINALIZER in (meta.get("finalizers") or []):  # type: ignore[operator]
@@ -237,6 +244,15 @@ def owned_labels_manifest(node: str) -> str:
         f"apiVersion: v1\nkind: Node\nmetadata:\n  name: {node}\n  labels:\n"
         f'    {OWNED_LABEL}: "3"\n    {BLOCKED_LABEL}: "false"\n'
     )
+
+
+def host_cpu_manifest(node: str, value: str | None) -> str:
+    """node-ctl's host-CPU apply; `None` omits the key, which drops it from the field manager that owned it."""
+
+    head = f"apiVersion: v1\nkind: Node\nmetadata:\n  name: {node}\n"
+    if value is None:
+        return head
+    return head + f'  labels:\n    {HOST_CPU_LABEL}: "{value}"\n'
 
 
 def presence_manifest(node: str, *, present: bool) -> str:
@@ -441,6 +457,29 @@ class NodeFenceAssertions:
             "the ssd placement labels (server-side apply)",
             self._control.apply_as(kubeconfig, owned_labels_manifest(own), field_manager="space-node-ctl-ssd-headroom-tier"),
         )
+        # The fence only judges keys a write changes, so replaying node-ctl's
+        # current value would pass vacuously: write a probe value, then put
+        # node-ctl's back. Both go through node-ctl's own field manager. The
+        # label must already be present, and node-ctl is its only writer on a
+        # Kind bench, so a node-ctl reconcile racing the replay writes that
+        # same value and can't make the read-back disagree. A probe value a
+        # failed run leaves behind is residue, reverted from the snapshot.
+        host_cpu = self._control.node_label(own, HOST_CPU_LABEL)
+        self._fixture.verify(bool(host_cpu), "the node has no host-cpu label to begin with; node-ctl's host-cpu reconcile is not running")
+        self._fixture.verify(
+            host_cpu != PROBE_HOST_CPU, "the host-cpu label still holds an earlier run's probe value; the replay would change nothing"
+        )
+        assert host_cpu
+        ok(
+            "the host-cpu label (server-side apply)",
+            self._control.apply_as(kubeconfig, host_cpu_manifest(own, PROBE_HOST_CPU), field_manager=HOST_CPU_FIELD_MANAGER),
+        )
+        ok(
+            "restoring the host-cpu label (server-side apply)",
+            self._control.apply_as(kubeconfig, host_cpu_manifest(own, host_cpu), field_manager=HOST_CPU_FIELD_MANAGER),
+        )
+        restored = self._control.node_label(own, HOST_CPU_LABEL)
+        self._fixture.verify(restored == host_cpu, "the host-cpu label was not restored", before=host_cpu, after=restored)
         ok(
             "a template-presence label and annotation (server-side apply)",
             self._control.apply_as(kubeconfig, presence_manifest(own, present=True), field_manager="space-node-ctl-fence-smoke"),

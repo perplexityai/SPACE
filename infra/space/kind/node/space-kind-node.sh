@@ -25,8 +25,9 @@
 #
 # A container's /dev, mounts and cgroups do not survive `docker restart`, which
 # is why these are boot units and not a one-time setup. Each step is
-# idempotent: after a restart the cache image and the directories are already
-# in place, and re-running a unit by hand on a live node is safe.
+# idempotent within a boot, so re-running a unit by hand on a live node is
+# safe. The cache is the one step that does not carry state across boots: as on
+# a deployed node, every boot starts it as a fresh filesystem.
 #
 # Defaults are baked like the rest of the layer; /etc/space/kind-node.env, when
 # present, overrides SPACE_CACHE_SIZE_MB and SPACE_LOOP_DEVICE_TARGET.
@@ -44,9 +45,13 @@ LIB_DIR=/usr/local/lib/space/kind-node
 
 STEP="${1:-}"
 CACHE_DIR=/space/cache
-# On the node's /var, which kind keeps on a volume, so the cache outlives node
-# restarts as well as pod restarts, as the instance-store disk does on EKS.
+# On the node's /var, which kind keeps on a volume. The image file outlives a
+# node restart; its filesystem does not (see cache below).
 CACHE_IMAGE=/var/lib/space-cache.img
+# Marks the cache formatted and mounted for this boot. kind mounts the node's
+# /run as a tmpfs, so a node start finds it absent.
+CACHE_STATE_DIR=/run/space-kind-node
+CACHE_BOOT_MARKER="$CACHE_STATE_DIR/cache.done"
 CACHE_SIZE_MB="${SPACE_CACHE_SIZE_MB:-40960}"
 
 log() { printf '%s\n' "$*"; }
@@ -221,9 +226,12 @@ layout() {
 
 # ── btrfs /space/cache ───────────────────────────────────────────────────────
 # sandbox-manager clones template rootfs into instance dirs with btrfs subvolume
-# snapshots, so the cache must be btrfs. Production formats instance-store NVMe
-# (or a loopback image on nodes without one); here it is a sparse loopback image
-# on the node, formatted once and reused on every later start.
+# snapshots, so the cache must be btrfs. A deployed node formats its
+# instance-store NVMe on every boot (packer 11-nvme-cache.sh), so templates,
+# sandboxes and snapshots on the cache never survive a node restart, and node
+# services re-create what they need on it. Here the cache is a sparse loopback
+# image on the node, reformatted the same way on every start of the node
+# container.
 cache_is_mounted() {
   findmnt -n -t btrfs --mountpoint "$CACHE_DIR" >/dev/null 2>&1
 }
@@ -232,18 +240,32 @@ cache_image_is_btrfs() {
   [[ -s $CACHE_IMAGE ]] && [[ "$(blkid -p -s TYPE -o value "$CACHE_IMAGE" 2>/dev/null)" == btrfs ]]
 }
 
+# A loop device still bound to the image (a crash before autoclear was armed)
+# would keep serving the old filesystem's blocks over the new one. `losetup -j`
+# matches an existing file by device and inode, but a missing one by path, and
+# the host kernel's loop devices are shared by every kind node, each with an
+# image at this path: without the image there is nothing of this node's to
+# release, and matching by path would find the other nodes' caches.
+release_cache_image() {
+  local loopdev
+  [[ -e $CACHE_IMAGE ]] || return 0
+  while read -r loopdev; do
+    [[ -n $loopdev ]] || continue
+    findmnt -n --source "$loopdev" >/dev/null 2>&1 \
+      && die "$loopdev (backing $CACHE_IMAGE) is still mounted; restart the node to start its cache fresh"
+    space_loop_detach "$loopdev" || true
+  done < <(losetup -l -n -O NAME -j "$CACHE_IMAGE" 2>/dev/null | tr -d '[:blank:]')
+  [[ -z "$(losetup -l -n -O NAME -j "$CACHE_IMAGE" 2>/dev/null)" ]] \
+    || die "a loop device still holds $CACHE_IMAGE; restart the node to start its cache fresh"
+}
+
 format_cache_image() {
-  # A populated image that is not btrfs (a format interrupted between truncate
-  # and mkfs, or damage) would fail to mount on every start until someone
-  # deleted it; reformat it like an empty one.
-  if [[ -s $CACHE_IMAGE ]]; then
-    log "backing image $CACHE_IMAGE is not a btrfs filesystem; reformatting it"
-  else
-    log "creating btrfs backing image $CACHE_IMAGE (${CACHE_SIZE_MB}M, sparse)"
-  fi
+  log "formatting btrfs backing image $CACHE_IMAGE (${CACHE_SIZE_MB}M, sparse)"
+  release_cache_image
   # Sparse (truncate, not fallocate): the virtual size gives disk admission
   # production-like headroom while real blocks are only consumed as sandboxes
-  # write.
+  # write. Truncating to zero first also returns the previous boot's blocks to
+  # the host.
   truncate -s 0 "$CACHE_IMAGE"
   truncate -s "${CACHE_SIZE_MB}M" "$CACHE_IMAGE"
   mkfs.btrfs -f -L space-cache "$CACHE_IMAGE" >/dev/null
@@ -268,7 +290,8 @@ mount_cache_image() {
       die "no loop device available for $CACHE_IMAGE"
     fi
   fi
-  if ! mount -o nosuid "$loopdev" "$CACHE_DIR"; then
+  # noatime as deployed nodes mount the cache (packer 11-nvme-cache.sh).
+  if ! mount -o nosuid,noatime "$loopdev" "$CACHE_DIR"; then
     (( reused )) || space_loop_detach "$loopdev" || true
     die "mount $loopdev $CACHE_DIR failed (image $CACHE_IMAGE; if this repeats, delete the image on the node)"
   fi
@@ -298,8 +321,14 @@ cache_skeleton() {
   install -d -m 0755 -o 0 -g 0 "$CACHE_DIR/firecracker/jails"
 }
 
+# The first run in a boot formats the image; a later run in the same boot (the
+# unit re-run by hand) keeps the mounted cache, or remounts the image if it was
+# unmounted, reformatting it only if it is no longer btrfs. The marker is
+# written last, so a run that failed partway formats again.
 cache() {
-  install -d -m 0755 -o 0 -g 0 /space "$CACHE_DIR"
+  install -d -m 0755 -o 0 -g 0 /space "$CACHE_DIR" "$CACHE_STATE_DIR"
+  exec 9>"$CACHE_STATE_DIR/cache.lock"
+  flock 9
   if cache_is_mounted; then
     log "$CACHE_DIR is already btrfs"
   else
@@ -309,7 +338,9 @@ cache() {
     command -v mkfs.btrfs >/dev/null \
       || die "mkfs.btrfs missing; this node is not running the SPACE Kind node image (infra/space/kind/node/Dockerfile)"
     space_loop__losetup_bin >/dev/null || die "losetup missing (util-linux)"
-    cache_image_is_btrfs || format_cache_image
+    if [[ ! -e $CACHE_BOOT_MARKER ]] || ! cache_image_is_btrfs; then
+      format_cache_image
+    fi
     mount_cache_image
   fi
   # Shared, so a pod that receives the cache HostToContainer also receives a
@@ -319,9 +350,10 @@ cache() {
   local img_mb
   img_mb=$(( $(stat -c %s "$CACHE_IMAGE") / 1048576 ))
   if (( img_mb != CACHE_SIZE_MB )); then
-    log "WARNING: the cache size is ${CACHE_SIZE_MB}M (SPACE_CACHE_SIZE_MB) but the reused image is ${img_mb}M; see \"The node layer\" in infra/space/kind/README.md to resize"
+    log "WARNING: the cache size is ${CACHE_SIZE_MB}M (SPACE_CACHE_SIZE_MB) but the image formatted this boot is ${img_mb}M; restart the node to reformat it at the new size"
   fi
   cache_skeleton
+  touch "$CACHE_BOOT_MARKER"
 }
 
 # ── vhost-vsock nodes in Firecracker jails (Kind only) ───────────────────────

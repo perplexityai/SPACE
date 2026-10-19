@@ -14,6 +14,11 @@ workspace = true
 name = "space-nodectl-svc"
 path = "src/main.rs"
 
+[[test]]
+name = "handoff"
+path = "tests/handoff.rs"
+required-features = ["test-hooks"]
+
 [features]
 default = []
 otel = [
@@ -28,6 +33,8 @@ datadog = [
 # Deprecated for one release; use otel and datadog.
 datadog-otel = ["otel", "datadog"]
 kubernetes = ["pplx-space-node-ctl-server/kubernetes"]
+# Compiles in the test-only flags; never enabled for release builds.
+test-hooks = []
 
 [dependencies]
 anyhow = { workspace = true }
@@ -37,3 +44,12 @@ clap = { workspace = true, features = ["derive"] }
 pplx-space-common-core = { workspace = true }
 pplx-space-common-svc = { workspace = true }
 pplx-space-node-ctl-server = { workspace = true }
+
+[dev-dependencies]
+hyper-util = { workspace = true, features = ["tokio"] }
+nix = { workspace = true, features = ["signal", "user"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "net", "rt", "time"] }
+tonic = { workspace = true }
+tonic-health = { workspace = true }
+tower = { workspace = true, features = ["util"] }

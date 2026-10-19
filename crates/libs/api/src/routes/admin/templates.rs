@@ -1626,11 +1626,25 @@ fn system_template_recipe(
         path: path.clone(),
         source,
     })?;
+    // The recipes are compiled in, so the files they copy must be too.
     recipe.into_proto(&path, base, |index, source| {
-        Err(RecipeAdapterError::MissingCopyPayload {
-            index,
-            source_path: source.to_string(),
-        })
+        let bytes: &[u8] = match source {
+            "code-runtime/pyproject.toml" => include_bytes!(
+                "../../../../../../templates/firecracker/recipes/code-runtime/pyproject.toml"
+            ),
+            "code-runtime/uv.lock" => include_bytes!(
+                "../../../../../../templates/firecracker/recipes/code-runtime/uv.lock"
+            ),
+            _ => {
+                return Err(RecipeAdapterError::MissingCopyPayload {
+                    index,
+                    source_path: source.to_string(),
+                });
+            }
+        };
+        Ok(build_proto::recipe::copy::Payload::InlineBytes(
+            bytes.to_vec(),
+        ))
     })
 }
 

@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{SandboxId, SemVer};
+use pplx_space_common_core::types::{LinuxPid, SandboxId, SemVer};
 use pplx_space_metrics::sandbox::worker::{
     NetGatewayRouteVerificationStatus, NetGatewayTlsInterceptionMode,
 };
@@ -962,6 +962,10 @@ impl SandboxWatchdog {
             let mut map = self.sidecars.lock().await;
             map.remove(sandbox_id);
         }
+        // Clients are kept only under ids that parse.
+        if let Ok(sandbox_id) = sandbox_id.parse::<SandboxId>() {
+            crate::net_gateway_clients::forget(sandbox_id);
+        }
         let mut map = self.state.lock().await;
         map.remove(sandbox_id);
     }
@@ -976,12 +980,16 @@ impl SandboxWatchdog {
         let mut sidecars = self.sidecars.try_lock().ok()?;
         let vm_outputs = &self.vm_outputs;
         let restored_guests = &self.restored_guests;
+        let kept_gateway_id = sandbox_id.parse::<SandboxId>().ok();
         let sandbox_id = sandbox_id.to_owned();
         Some(move || {
             health.remove(&sandbox_id);
             sidecars.remove(&sandbox_id);
             vm_outputs.detach(&sandbox_id);
             restored_guests.forget(&sandbox_id);
+            if let Some(sandbox_id) = kept_gateway_id {
+                crate::net_gateway_clients::forget(sandbox_id);
+            }
         })
     }
 
@@ -2085,11 +2093,17 @@ async fn probe_net_gateway_stats(
     state: &Arc<Mutex<HashMap<String, SandboxHealth>>>,
     db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
 ) {
+    // Every registered sandbox has the UUID id create assigned it; an id that
+    // does not parse fails the probe as an absent gateway socket would.
+    let kept_gateway = sandbox_id
+        .parse::<SandboxId>()
+        .map(|id| (id, LinuxPid::try_from_u32(netgtw_pid).ok()));
     let result = watchdog_timeout(
         NET_GATEWAY_BACKGROUND_STATS_TIMEOUT,
         "net-gateway stats probe",
         async {
-            let mut client = pplx_space_net_gateway_client::connect(sandbox_id)
+            let (id, gateway_pid) = kept_gateway.clone().map_err(|error| error.to_string())?;
+            let mut client = crate::net_gateway_clients::client(id, gateway_pid)
                 .await
                 .map_err(|error| error.to_string())?;
             let stats = client
@@ -2114,6 +2128,9 @@ async fn probe_net_gateway_stats(
     let observation = match result {
         Ok(observation) => observation,
         Err(error) => {
+            if let Ok((id, gateway_pid)) = kept_gateway {
+                crate::net_gateway_clients::discard(id, gateway_pid);
+            }
             tracing::debug!(
                 sandbox_id = %sandbox_id,
                 %error,
@@ -2496,6 +2513,9 @@ async fn probe_spaced_guest_health(
     observation_from_probe_result(started, result, "pong")
 }
 
+// The probe dials afresh, unlike the gateway's kept clients: a dial is what
+// shows the gateway still accepts connections, which a kept connection could
+// keep answering past.
 async fn probe_net_gateway_health(sandbox_id: &str) -> HealthObservation {
     let started = Instant::now();
     let result = tokio::time::timeout(NET_GATEWAY_HEALTH_TIMEOUT, async {

@@ -21,7 +21,7 @@ use pplx_space_common_svc::types::{
 };
 use pplx_space_db_test_fixtures::{
     insert_pool_slot_receipt, insert_ready_worker_node, pg_test_db, pool_slot_receipt_state,
-    try_pg_test_db, try_pg_test_db_with_max_connections,
+    publish_ready_disk_artifact, try_pg_test_db, try_pg_test_db_with_max_connections,
 };
 use pplx_space_internal_api_server::{
     ClusterApiService,
@@ -2336,6 +2336,59 @@ async fn publishing_absent_stopped_space_sandbox_deletes_central_row() -> TestRe
     Ok(())
 }
 
+/// A stopped sandbox released from its node once its disk was durable must
+/// survive that node reporting it absent, and keep the storage location that
+/// makes it restorable. A stopped sandbox with no durable copy is still
+/// deleted, so the exemption can't be mistaken for the delete not running.
+#[tokio::test(flavor = "current_thread")]
+async fn publishing_absent_released_stopped_sandbox_keeps_it_and_its_artifact() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    let released_id = SandboxId::new();
+    let lost_id = SandboxId::new();
+    insert_ready_worker_node(&db.pool, node_id).await?;
+    for sandbox_id in [released_id, lost_id] {
+        insert_active_sandbox_with_managed_by(&db.pool, sandbox_id, node_id, "stopped", "space")
+            .await?;
+    }
+    publish_ready_disk_artifact(
+        &db.pool,
+        released_id,
+        LocalArtifactId::new(),
+        &format!("s3://space-test/{released_id}/disk"),
+    )
+    .await?;
+
+    let mut conn = db.pool.acquire().await?;
+    publish_sandbox_states(
+        &mut conn,
+        node_id,
+        &[
+            absent_sandbox_state(released_id),
+            absent_sandbox_state(lost_id),
+        ],
+    )
+    .await?;
+    drop(conn);
+
+    assert_eq!(sandbox_lifecycle(&db.pool, released_id).await?, "stopped");
+    let live_locations: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+           FROM snapshot_storage_locations ssl
+           JOIN snapshots sn ON sn.id = ssl.snapshot_id
+          WHERE sn.sandbox_id = $1
+            AND ssl.orphaned_at IS NULL",
+    )
+    .bind(released_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(live_locations, 1);
+    assert!(!sandbox_exists(&db.pool, lost_id).await?);
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn publish_sandbox_state_updates_central_last_used_at() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
@@ -4168,7 +4221,8 @@ async fn publishing_failed_sandbox_does_not_override_deleting() -> TestResult {
 
 /// A node-local restore can finish after the API caller timed out, but a
 /// published `started` status cannot safely complete the control-plane row
-/// until the active Kubernetes execution is routable.
+/// until the active Kubernetes execution is routable. An otherwise identical
+/// Direct (`'space'`) row has no such contract and converges.
 #[tokio::test(flavor = "current_thread")]
 async fn publishing_owned_started_sandbox_leaves_unroutable_restoring_lifecycle() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
@@ -4176,20 +4230,31 @@ async fn publishing_owned_started_sandbox_leaves_unroutable_restoring_lifecycle(
     };
     let node_id = NodeId::new();
     let sandbox_id = SandboxId::new();
+    let direct_sandbox_id = SandboxId::new();
     insert_ready_worker_node(&db.pool, node_id).await?;
-    insert_active_sandbox(&db.pool, sandbox_id, node_id, "restoring").await?;
-    insert_k8s_execution(&db.pool, sandbox_id, 7, "creating", None).await?;
+    for (id, managed_by) in [(sandbox_id, "k8s"), (direct_sandbox_id, "space")] {
+        insert_active_sandbox_with_managed_by(&db.pool, id, node_id, "restoring", managed_by)
+            .await?;
+        insert_k8s_execution(&db.pool, id, 7, "creating", None).await?;
+    }
 
     let mut conn = db.pool.acquire().await?;
     publish_sandbox_states(
         &mut conn,
         node_id,
-        &[published_sandbox_state(sandbox_id, "started")],
+        &[
+            published_sandbox_state(sandbox_id, "started"),
+            published_sandbox_state(direct_sandbox_id, "started"),
+        ],
     )
     .await?;
     drop(conn);
 
     assert_eq!(sandbox_lifecycle(&db.pool, sandbox_id).await?, "restoring");
+    assert_eq!(
+        sandbox_lifecycle(&db.pool, direct_sandbox_id).await?,
+        "started"
+    );
     Ok(())
 }
 

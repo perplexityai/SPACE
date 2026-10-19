@@ -503,7 +503,7 @@ pub fn delete_named_local_artifact(
     Ok(())
 }
 
-fn row_to_local_artifact(row: &rusqlite::Row<'_>) -> Result<LocalArtifactRow> {
+pub(super) fn row_to_local_artifact(row: &rusqlite::Row<'_>) -> Result<LocalArtifactRow> {
     Ok(LocalArtifactRow {
         local_artifact_id: row.get::<_, String>(0)?.parse().map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error))

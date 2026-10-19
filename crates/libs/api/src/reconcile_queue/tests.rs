@@ -168,13 +168,16 @@ mod postgres_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn queued_ref_keeps_the_latest_writer_traceparent() -> TestResult {
+    async fn queued_ref_keeps_the_latest_writer_traceparent_unless_it_drops_a_sampled_one()
+    -> TestResult {
         let db = pg_test_db().await?;
         let node_id = NodeId::new();
         insert_ready_worker_node(&db.pool, node_id).await?;
         let element = format!("sandbox:{}", SandboxId::new());
-        let first = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
-        let second = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00";
+        let unsampled = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00";
+        let later_unsampled = "00-5bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00";
+        let sampled = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        let later_sampled = "00-1af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
         let node_ids = [node_id];
         let facets = ["network-policy".to_string()];
         let queue = |traceparent: Option<&'static str>| {
@@ -186,29 +189,22 @@ mod postgres_tests {
                 traceparent,
             )
         };
+        let saved = || saved_traceparent(&db.pool, node_id, &element);
 
-        queue(Some(first)).await?;
-        assert_eq!(
-            saved_traceparent(&db.pool, node_id, &element)
-                .await?
-                .as_deref(),
-            Some(first)
-        );
+        queue(Some(unsampled)).await?;
+        assert_eq!(saved().await?.as_deref(), Some(unsampled));
+        queue(Some(later_unsampled)).await?;
+        assert_eq!(saved().await?.as_deref(), Some(later_unsampled));
+        queue(Some(sampled)).await?;
+        assert_eq!(saved().await?.as_deref(), Some(sampled));
         // A writer without trace context coalesces without erasing it.
         queue(None).await?;
-        assert_eq!(
-            saved_traceparent(&db.pool, node_id, &element)
-                .await?
-                .as_deref(),
-            Some(first)
-        );
-        queue(Some(second)).await?;
-        assert_eq!(
-            saved_traceparent(&db.pool, node_id, &element)
-                .await?
-                .as_deref(),
-            Some(second)
-        );
+        assert_eq!(saved().await?.as_deref(), Some(sampled));
+        // An unsampled writer does not replace the sampled request's context.
+        queue(Some(later_unsampled)).await?;
+        assert_eq!(saved().await?.as_deref(), Some(sampled));
+        queue(Some(later_sampled)).await?;
+        assert_eq!(saved().await?.as_deref(), Some(later_sampled));
         Ok(())
     }
 

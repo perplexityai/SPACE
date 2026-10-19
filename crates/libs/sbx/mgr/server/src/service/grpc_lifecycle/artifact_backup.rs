@@ -873,10 +873,11 @@ impl SandboxManagerService {
         }
 
         let artifact_dedup_key = artifact.local_artifact_id.to_string();
-        if let Some(job) = self.snapshot_upload_worker.find_job_by_dedup_key(
+        let previous_job = self.snapshot_upload_worker.find_job_by_dedup_key(
             crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
             &artifact_dedup_key,
-        )? {
+        )?;
+        if let Some(job) = &previous_job {
             let job_status = job
                 .status
                 .parse::<pplx_space_common_jobs::JobStatus>()
@@ -900,9 +901,10 @@ impl SandboxManagerService {
                 self.establish_restore_visible_artifact_backup(&job.job_id)
                     .await
                     .map_err(|error| {
-                        Status::internal(format!(
-                            "establish restore-visible artifact backup: {error}"
-                        ))
+                        artifact_backup_submission_status(
+                            "establish restore-visible artifact backup",
+                            error,
+                        )
                     })?;
                 tracing::info!(
                     sandbox_id = %artifact.sandbox_id,
@@ -946,6 +948,52 @@ impl SandboxManagerService {
                 self.snapshot_upload_config.is_some(),
             )?,
         };
+        // A fresh attempt registers under the execution generation the
+        // artifact's earlier attempt carried, so a teardown capture the
+        // control plane refused stays refused when the backup is requested
+        // again by artifact id. The control plane fences only an artifact's
+        // first registration, so a capture it admitted once registers again.
+        // Every attempt carries the generation forward, so the chain lasts
+        // until the jobs are pruned.
+        // An earlier upload that can't be decoded can't vouch for its
+        // generation, so the re-request is refused rather than sent unfenced.
+        let execution_generation = previous_job
+            .as_ref()
+            .map(|job| job.payload_as::<crate::snapshot_upload::SnapshotUploadJobs>())
+            .transpose()
+            .map_err(|error| {
+                Status::failed_precondition(format!(
+                    "earlier artifact backup payload is invalid for {}, so its execution \
+                     generation is unknown: {error}",
+                    artifact.local_artifact_id
+                ))
+            })?
+            .and_then(|payload| payload.execution_generation);
+        // A teardown capture requested before its own upload job exists has no
+        // earlier attempt to carry the generation, so take it from the running
+        // teardown that staged it: the row still pins the capture, in any state
+        // the teardown drive treats as its own (a restart mid-teardown leaves it
+        // in cleanup). A suspended row's artifact belongs to an earlier
+        // node-local suspend and stays unfenced.
+        let execution_generation = match execution_generation {
+            Some(generation) => Some(generation),
+            None if matches!(
+                sandbox.state,
+                SandboxState::Suspending
+                    | SandboxState::CleanupRequired
+                    | SandboxState::CleanupFailed
+            ) && sandbox.current_local_artifact_id == Some(artifact.local_artifact_id) =>
+            {
+                let db = self.db_conn()?;
+                crate::db::latest_teardown_suspend_operation(&db, &sandbox.id)
+                    .map_err(|error| Status::internal(format!("teardown job lookup: {error}")))?
+                    .filter(|operation| {
+                        operation.status == crate::db::TeardownSuspendOperationStatus::Running
+                    })
+                    .map(|operation| operation.execution_generation)
+            }
+            None => None,
+        };
         let backup_attempt_id = pplx_space_common_core::types::BackupAttemptId::new();
         let backup_attempt_id = match self
             .submit_artifact_backup(
@@ -961,11 +1009,13 @@ impl SandboxManagerService {
                     format,
                     dedup_key: Some(&artifact_dedup_key),
                     handoff: ArtifactBackupHandoff::RestoreVisible,
+                    execution_generation,
                 },
             )
             .await
-            .map_err(|err| Status::internal(format!("artifact backup enqueue failed: {err}")))?
-        {
+            .map_err(|err| {
+                artifact_backup_submission_status("artifact backup enqueue failed", err)
+            })? {
             SubmitSuspendSnapshotOutcome::Enqueued {
                 backup_attempt_id, ..
             } => backup_attempt_id,
@@ -1169,6 +1219,7 @@ impl SandboxManagerService {
                     format: reupload_format,
                     dedup_key: None,
                     handoff: ArtifactBackupHandoff::DurableWorker,
+                    execution_generation: None,
                 },
             )
             .await
@@ -1192,5 +1243,25 @@ impl SandboxManagerService {
             }
         };
         Ok(job_id)
+    }
+}
+
+/// The status an `EnqueueArtifactBackup` submission failure answers with. A
+/// refusal of a superseded execution keeps the control plane's verdict, since
+/// a retry by artifact id is refused again while the capture's earlier upload
+/// is retained; anything else is internal.
+fn artifact_backup_submission_status(
+    context: &str,
+    error: ArtifactBackupSubmissionError,
+) -> Status {
+    match error {
+        ArtifactBackupSubmissionError::Begin {
+            superseded_generation: Some(generation),
+            ref error,
+        } => pplx_space_node_api_client::cluster::backup_execution_superseded_status(
+            format!("{context}: {error}"),
+            generation,
+        ),
+        error => Status::internal(format!("{context}: {error}")),
     }
 }

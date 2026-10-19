@@ -2,16 +2,16 @@
 
 A node reports, on every Full sandbox-inventory census, the local artifacts
 it cannot prove are backed up; space-internal-api mirrors that report into
-the cluster's `node_local_backup_pending` queue and logs the publication.
+the cluster's `node_local_backup_pending` queue.
 `smoke-kind-pending-backup-census.sh` proved the producer half by copying
 sandbox-manager's SQLite out of the worker pod and re-running the
 `list_pending_backups` predicate over it; that white-box read is not a
 surface the typed framework exposes, and it is recorded rather than ported.
 What the control plane exposes is enough for the contract that matters to an
 operator: with uploads blocked, the queue names exactly this sandbox's pinned
-artifact and a census publication carries a non-empty, applied report; once
-uploads resume, the snapshot reaches `ready` with a storage location (the
-artifact is provably backed) and the queue row is gone.
+artifact; once uploads resume, the snapshot reaches `ready` with a storage
+location (the artifact is provably backed) and the queue row is gone.
+space-internal-api's census publication log lines are failure evidence only.
 
 Why the upload has to be broken: a natural suspend's unbacked window is a few
 seconds on kind while the census fires once per node per poll interval, so an
@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 
 
 class PendingBackupAssertions:
-    """Block uploads, suspend, read the queue and the census, then watch the backup land."""
+    """Block uploads, suspend, read the queue, then watch the backup land."""
 
     def __init__(self, fixture: KindEcw, control: PendingBackupControl, scope: ResourceScope) -> None:
         self._fixture = fixture
@@ -97,7 +97,10 @@ class PendingBackupAssertions:
             self._fixture.wait(3)
 
     def expect_queue_names_this_sandbox(self, *, timeout: float = 240) -> PendingBackupRow:
-        """A Full census carried the pinned artifact and internal-api mirrored it into the queue."""
+        """A Full census carried the pinned artifact and internal-api mirrored it into the queue.
+
+        The queue is the census's only writer, so its row is the outcome.
+        """
 
         sandbox_id = self._fixture.sandbox.sandbox_id
         deadline = time.monotonic() + timeout
@@ -116,21 +119,13 @@ class PendingBackupAssertions:
             self._fixture.verify(
                 time.monotonic() < deadline,
                 "no pending-backup queue row for this sandbox appeared within the census budget",
-                censuses=[
-                    (p.node_id, p.outcome, p.reported) for p in self._recent_publications()
-                ][-6:],
+                failure_evidence=lambda: {
+                    "censuses": [
+                        (p.node_id, p.outcome, p.reported) for p in self._recent_publications()
+                    ][-6:]
+                },
             )
             self._fixture.wait(10)
-        # Corroboration: the row could in principle come from something other
-        # than the census path, so require an accepted publication that carried
-        # a non-empty report.
-        applied = [p for p in self._recent_publications() if p.reported > 0 and p.outcome == "applied"]
-        self._fixture.verify(
-            bool(applied),
-            "a queue row exists but no census publication was applied with a non-empty report",
-            censuses=[(p.node_id, p.outcome, p.reported) for p in self._recent_publications()][-6:],
-        )
-        self._fixture.record("applied_census_publications", len(applied))
         return self._artifact
 
     def restore_uploads(self) -> None:

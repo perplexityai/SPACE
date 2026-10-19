@@ -651,10 +651,25 @@ pub(super) async fn ecw_backend_channel(
         })
 }
 
+/// Refuse a new ECW stream while this replica drains. Handlers call it on
+/// entry so a refused request does no backend work; the permit path calls it
+/// again so no stream can attach without passing it.
+pub(super) fn refuse_new_ecw_stream_while_draining(
+    state: &DataPlaneState,
+    kind: &'static str,
+) -> Result<(), EcwProxyError> {
+    if state.drain_started.is_cancelled() {
+        pplx_space_metrics::data_plane::attach(kind, "draining");
+        return Err(EcwProxyError::draining());
+    }
+    Ok(())
+}
+
 pub(super) fn acquire_ecw_stream_permit(
     state: &DataPlaneState,
     kind: &'static str,
 ) -> Result<AttachedStreamPermit, EcwProxyError> {
+    refuse_new_ecw_stream_while_draining(state, kind)?;
     match state.attached_streams.try_acquire_label(kind) {
         Ok(permit) => {
             pplx_space_metrics::data_plane::attach(kind, "ok");

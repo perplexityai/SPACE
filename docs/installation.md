@@ -454,9 +454,9 @@ SPACE_KIND_CLUSTER=space-local \
   kind get clusters
 ```
 
-## Separating volume-manager's credential identity
+## Volume-manager identity and credentials
 
-The worker image provides a separate `space-volmgr` account (UID/GID 964) and
+The worker image provides the `space-volmgr` account (UID/GID 964) and
 credential-client group `space-volcredclients` (GID 965). The Kind
 volume-manager DaemonSet runs volume-manager as `space-volmgr` with
 credential-manager's volume socket, the production shape; node-manager's btrfs
@@ -493,7 +493,7 @@ To prepare the additional listener:
   instance first. A killed preflight can leave a `.p-*` probe socket; remove
   that file only after confirming its creating process has exited.
 - Exercise token exchange and transfer-key issue/unwrap as UID 964, verify
-  privileged methods are denied, and check legacy UID-950 calls still work.
+  privileged methods are denied, and check sandbox-manager's UID-950 calls still work.
   Check the configured peer-process verification mode as well as pod readiness.
 
 Shared restore and fork directories use `space-cache-rw` (GID 952). Run both
@@ -502,72 +502,66 @@ leave restore parents or downloaded files inaccessible across the identities.
 Validate retained transfers, snapshot restore, and fork with the intended image
 and filesystem settings before changing identities.
 
-Changing an existing node's identity requires separate migration tooling and
-deployment orchestration. Stop and drain the predecessor, preserve and acquire
-its existing service-lock inode, and transfer only volume-manager's retained
-state. Change the identity and credential endpoint together; use the same safe
-handoff for rollback. A running volume-manager under UID 964 must use
-`SPACE_CREDMGR_ENDPOINT=unix:///space/run/volume-credentials/credmgr.sock` and is
-denied access to the standard listener.
+Volume-manager uses one account, `space-volmgr`, and
+`SPACE_CREDMGR_ENDPOINT=unix:///space/run/volume-credentials/credmgr.sock`.
+It is denied access to the standard listener. This executable does not migrate
+nodes from another service account: complete any ownership transition with
+compatible earlier tooling before upgrading, preserving the service-lock inode
+and retained data.
 
-### Retained-state migration commands
+If volume-manager still runs as `space-sbxmgr` (UID 950), use a compatible earlier
+executable and follow `docs/installation.md`, section `Retained-state migration
+commands`, from the [pre-removal revision](https://github.com/perplexityai/SPACE/commit/671431592d2a9eb6a6e34236bf24d30601ecdd31).
+Run `--prepare-volume-identity separate` before adopting this release of either
+volume-manager or credential-manager. Stop new transfer admission and drain
+queued pulls whose destinations are writable only by the old account before
+stopping the predecessor. Start and validate the UID-964 service on that earlier
+release, including its restricted endpoint and newly bound UID-964 socket,
+before adopting the new executables.
 
-The volume-manager executable provides two explicit deployment commands:
+On Unix listeners, credential-manager no longer treats UID 950 as a volume-manager
+storage actor: both the node agent and authority deny `ExchangeToken` regardless
+of the optional process-inspection setting. Sandbox-manager's certificate,
+network-resolution, and data-key permissions are unchanged; process-inspection
+enforcement on the authority's Unix listener additionally rejects the
+volume-manager executable under that account.
 
-- `--check-volume-credentials` checks the configured listener using invalid
-  requests under a 20-second timeout. Run it with the target service identity,
-  groups, and endpoint. It verifies privileged-method denial and transfer-key
-  method admission; real token exchange and key round trips remain separate
-  deployment gates.
-- `--prepare-volume-identity legacy|separate` is a Linux, root-only retained-state
-  handoff. It requires `openat2`, acquires the existing volume-manager service
-  lock, and preserves its inode and the database, journals, and staged upload
-  bytes. `--service-mutex-timeout-secs` bounds lock acquisition. Custom database,
-  socket, and staging paths and simultaneous probe mode are rejected.
-  `--expected-volume-identity legacy` additionally refuses a different retained
-  identity or an in-progress identity change while holding the lock.
+### Startup after identity cutover
 
-Neither command runs during normal service startup or changes the launcher's
-selected identity automatically.
+The identity-handoff command and journal engine have been removed.
+`--prepare-volume-identity` and `--expected-volume-identity` are rejected,
+including the bare preparation flag; there is no replacement migration mode.
+Normal startup still acquires the existing service mutex before accessing the
+database and processing transfers. It neither changes its own Unix identity
+nor reassigns retained files to a different account.
 
-The helper records checked inodes and both identities in the root-only
-`/space/run/.volume-manager-identity` directory before changing ownership.
-An interrupted handoff can be retried with either identity. Preserve this
-record, the database and its journals, staging files, and `service.mutex`;
-never delete the lock or use recursive ownership repair. Unknown or unsafe
-entries are rejected before directory access changes. A path replaced during
-handoff fails closed and requires inspection of the retained original.
+Update launchers before adopting this executable: remove the handoff invocation
+entirely, not just its mode argument. On fresh nodes, provision
+`/space/run/volume-manager` as `space-volmgr:space-sbxclients` with mode `0750`.
+The daemon creates its service mutex, database, socket, and missing staging
+directory itself. New service mutexes are owner-only without changing the
+service's normal umask; existing mutex inodes, contents and permissions are
+preserved. If provisioning creates
+`/space/cache/firecracker/.volmgr-staging` in advance, use
+`space-volmgr:space-cache-rw` with mode `0750`.
 
-The installation root may be one administrator-owned symlink with an absolute
-target. Its ancestor chain must be protected from service users and groups;
-additional symlinks and access ACLs are rejected. Private retained paths must
-not cross mounts. Both shared cache parents must be root-owned and protected
-against service renames: if group- or world-writable, they must already have the
-sticky bit. Existing unprotected cache namespaces require a provenance audit or
-node replacement; adding permissions now cannot authenticate retained files.
-Existing root-owned service locks without a recovery record
-require an administrator to verify their provenance and correct ownership
-without replacing their inode.
+Preserve the ownership, bytes, and lock inode of existing state. Do not substitute
+recursive `chown`, recreate `service.mutex`, or attempt to repair retained state
+during ordinary startup.
 
-Deployment preparation must install the compatible executable and ownership
-initializer while the selected identity remains `legacy`. Keep that same
-initializer and helper image in the rollback release; rolling back to recursive
-ownership changes can bypass journal and retained-state checks.
+A privileged deployment preflight must refuse the upgrade if any pending
+identity-handoff record remains at
+`/space/run/.volume-manager-identity/pending.json`. Stop competing initializers
+and complete that handoff with the compatible earlier helper before continuing;
+do not delete or rewrite the record to bypass recovery. The new executable does
+not read, resume, or clear old identity journals, and creates no new ones.
 
-For an identity transition, require all of the following:
+`--check-volume-credentials` remains available. Run it with the actual service
+identity, groups, and endpoint: its invalid requests check privileged-method
+denial and transfer-key admission under a 20-second timeout without minting
+secrets. Real credential operations, retained transfers, encrypted and
+unencrypted restore, and fork remain deployment checks.
 
-1. Verify the restricted listener and compatible sandbox-manager on each target
-   node, including replacement nodes, using real credential calls and file access.
-2. Stop new transfer admission and drain old queued pulls: their destination
-   directories may still be writable only by the legacy identity.
-3. Stop volume-manager before acquiring its preserved service lock. Use a
-   delete-first deployment; a new initializer waiting on a live predecessor can
-   deadlock with a rollout waiting for the new process to become ready.
-4. Change retained-state ownership, service identity, groups, and credential
-   endpoint together. Select the switch explicitly for the prepared pool and
-   validate one canary before widening it.
-5. Exercise retained transfers, encrypted and unencrypted restore, and fork.
-   Verify both services' umask and downloaded-file access.
-6. For rollback, stop the separate-identity process and use the same helper in
-   `legacy` mode under the same lock before starting the old identity. Preserve
-   compatible receiver services throughout the rollback window.
+A software rollback must keep UID/GID 964, its client groups, and the restricted
+credential endpoint. Use an earlier release compatible with that configuration,
+not an ownership transition back to the shared account.

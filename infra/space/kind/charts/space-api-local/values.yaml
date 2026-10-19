@@ -39,6 +39,45 @@ autoscaling:
   targetCPUUtilizationPercentage: 80
   targetMemoryAverageValue: 384Mi
 
+# Graceful shutdown, as deployments run it, for both surfaces (one binary).
+#
+# On SIGTERM the process reports draining on /readyz and stops accepting in the
+# same instant, then gives in-flight work --shutdown-grace-secs to finish
+# (drain_before_shutdown and drain_server, crates/libs/api/src/run.rs): HTTP
+# requests, including operation and sandbox-event SSE streams, the ingress
+# activation listener, and the substrate work its TaskTracker holds, such as
+# a restore leader or a suspend continuation. Rendered at the binary's
+# default, DEFAULT_SHUTDOWN_GRACE_SECS in that file.
+shutdownGraceSeconds: 150
+
+# Seconds the pod keeps serving after it starts terminating, before SIGTERM,
+# so it leaves the Services' endpoints before its listener stops: the process
+# itself has no lame-duck window. Deployments size this for their load
+# balancer's deregistration; Kind's NodePort entry is kube-proxy, which drops
+# the endpoint in about a second, so 5 s (the builder node-api's delay) covers
+# it.
+preStopSleepSeconds: 5
+
+# Covers the preStop delay, the full shutdown grace, and the telemetry flush
+# and exit after it. The template refuses a value that does not exceed the
+# first two.
+terminationGracePeriodSeconds: 180
+
+# The boot budget the Pod reflector leaves to Kubernetes (`start`,
+# crates/libs/api/src/controllers/substrate/kubernetes/pod_reflector.rs): a
+# replica whose reflector never completes its initial LIST stays NotReady
+# until restarted. Startup blocks up to 30 s on the node caches before serving
+# (STORE_READY_TIMEOUT, kubernetes/caches.rs), then the LIST runs; 18 x 5 s
+# gives that three times over before the kubelet restarts the container.
+startupProbe:
+  periodSeconds: 5
+  failureThreshold: 18
+
+# A replacement counts as available only after staying Ready this long, two
+# readiness periods, so one that fails its first probes stops the rollout
+# before an old replica is retired.
+minReadySeconds: 10
+
 # The dedicated admin API (`--surface admin`) in its own Deployment, as a
 # deployment that separates the admin surface from the public one runs it.
 # The harness and the admin CLI keep using the shared surface's
@@ -84,6 +123,13 @@ clusterId: "kind-local"
 # space-db-migrator + space-api-svc).
 migrate:
   enabled: true
+  # activeDeadlineSeconds, also passed to the migrator. The migrator's own
+  # default for an unstated deadline (MIGRATION_JOB_ACTIVE_DEADLINE,
+  # crates/libs/db/migrator/src/migration_retry.rs).
+  jobDeadlineSeconds: 1800
+  # A one-shot Job, re-run by the next rollout: replaceable
+  # (infra/space/kind/manifests/priorityclasses.yaml).
+  priorityClassName: space-replaceable
 
 postgres:
   # Secret holding POSTGRES_CONNECTION_STRING.
@@ -99,6 +145,12 @@ postgres:
   bootstrapSuperadminPassword: space-dev-superadmin
   bootstrapReadOnlyPassword: space-dev-ro
   bootstrapMigratorPassword: space-dev-migrator
+  # POSTGRES_POOL_MAX_CONNECTIONS for space-api and space-admin-api, each of
+  # whose two pools (space_user and space_creds) it sizes
+  # (crates/libs/common/svc/src/sql/mod.rs). The api tier runs a pool far
+  # above the binary's default of 25, as deployed. The space-postgres chart's
+  # max_connections is sized to hold every replica's pools.
+  poolMaxConnections: 100
 
 # K8s control-plane substrate. SPACE_K8S_CONTROL_PLANE=true runs the
 # api-server on the KubernetesSubstrate: it discovers nodes through the Pod
@@ -125,6 +177,9 @@ k8s:
   # labels the KinD workers before bringing the charts up.
   sandboxNodeSelectorKey: node.kubernetes.io/space-enabled
   sandboxNodeSelectorValue: "true"
+
+# Scheduling priority (infra/space/kind/manifests/priorityclasses.yaml).
+priorityClassName: space-control-plane
 
 nodeSelector:
   space.pplx.net/infra: "true"
@@ -160,10 +215,34 @@ dataPlanePublicUrl: ""
 # default the binary ships. Writing a value here would be a copy of a Rust
 # constant with nothing linking the two, and would silently override it the day
 # it changes. The client-concurrency mode accepts `off` as the hard off.
+#
+# The one exception is the client-concurrency mode, which deployments pin to
+# `observe` rather than inherit: it is their configured value, not a copy of
+# the binary's default, and it stays `observe` if that default ever moves.
+# Observe needs no allowlist to classify traffic: an id outside
+# SPACE_API_CLIENT_CONCURRENCY_KNOWN_CLIENTS, or none, lands in the shared
+# `unspecified` bucket, which is metered like any other
+# (`ClientKey::classify` in crates/libs/api/src/client_concurrency), so the
+# allowlist stays at its empty default.
 clusterActivationAdmission:
   enabled: ""
 clientConcurrency:
-  mode: ""
+  mode: "observe"
+
+# The store both limiters keep their state in: the space-redis Deployment
+# (charts/space-redis-local). Each limiter reads SPACE_REDIS_URL when the
+# process builds its state, above the `--surface` branch
+# (`AppState::from_pools_with_lifecycle`), so the admin API reads it too:
+# `ClusterSandboxAdmissionConfig::from_env` and
+# `ClientConcurrencyConfig::from_env`. Without it both fail open as
+# `misconfigured`. Plaintext `redis://`, unlike a deployment's
+# `rediss://`: the clients trust only the webpki roots (the
+# `tls-rustls-webpki-roots` feature in the workspace Cargo.toml), so they
+# would refuse a per-cluster CA. Must equal `redis.url` in the
+# cluster-controller chart, whose copy of the activation limiter shares the
+# bucket.
+redis:
+  url: "redis://space-redis:6379"
 
 eppo:
   secretName: ""
@@ -173,6 +252,10 @@ eppo:
 
 serviceAccount:
   name: space-api
+
+# Lifetime of the projected node-api tokens, as deployed; the kubelet
+# refreshes them at 80% of that.
+nodeApiTokenExpirationSeconds: 600
 
 # ServiceAccounts the ingress activation listener admits: internal-api, the
 # only route resolver that delegates cold wakes (RemoteIngressActivation).

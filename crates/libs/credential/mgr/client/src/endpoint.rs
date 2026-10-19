@@ -151,12 +151,28 @@ impl CredmgrEndpoint {
     /// ServiceAccount token (or static-secret fallback) per request; the UDS
     /// endpoint authorizes by peer credentials and sends no token.
     pub async fn connect(&self) -> Result<CredentialManagerGrpcClient, ConnectError> {
+        self.connect_with_retry(
+            pplx_space_common_grpc::DEFAULT_GRPC_CONNECT_RETRY_POLICY,
+            |_| {},
+        )
+        .await
+    }
+
+    /// [`Self::connect`] with `retry_policy` in place of the standard connect
+    /// retry policy. Each attempt keeps its standard bounds. A TCP or TLS
+    /// endpoint hands `on_retry` every failed attempt it is about to redial;
+    /// the Unix socket endpoint does not report its retries.
+    pub async fn connect_with_retry(
+        &self,
+        retry_policy: pplx_space_common_grpc::GrpcRetryPolicy,
+        on_retry: impl FnMut(&pplx_space_common_grpc::TcpConnectRetry<'_>),
+    ) -> Result<CredentialManagerGrpcClient, ConnectError> {
         let (channel, interceptor) = match self {
             Self::Uds(path) => {
                 let channel = pplx_space_common_grpc::connect_uds_channel_with_retry(
                     SERVICE_NAME,
                     path,
-                    pplx_space_common_grpc::DEFAULT_GRPC_CONNECT_RETRY_POLICY,
+                    retry_policy,
                 )
                 .await?;
                 (channel, CredmgrBearerInterceptor::None)
@@ -164,12 +180,13 @@ impl CredmgrEndpoint {
             Self::Tcp(uri) => {
                 let endpoint =
                     tonic::transport::Endpoint::from(uri.clone()).connect_timeout(CONNECT_TIMEOUT);
-                let channel = pplx_space_common_grpc::connect_tcp_channel_with_retry(
+                let channel = pplx_space_common_grpc::connect_tcp_channel_with_retry_observed(
                     SERVICE_NAME,
                     uri.to_string(),
                     endpoint,
                     None,
-                    pplx_space_common_grpc::DEFAULT_GRPC_CONNECT_RETRY_POLICY,
+                    retry_policy,
+                    on_retry,
                 )
                 .await?;
                 (channel, CredmgrBearerInterceptor::TokenSource)
@@ -179,12 +196,13 @@ impl CredmgrEndpoint {
                 let endpoint = tonic::transport::Endpoint::from(uri.clone())
                     .connect_timeout(CONNECT_TIMEOUT)
                     .tls_config(tls)?;
-                let channel = pplx_space_common_grpc::connect_tcp_channel_with_retry(
+                let channel = pplx_space_common_grpc::connect_tcp_channel_with_retry_observed(
                     SERVICE_NAME,
                     uri.to_string(),
                     endpoint,
                     Some(tls_handshake_timeout),
-                    pplx_space_common_grpc::DEFAULT_GRPC_CONNECT_RETRY_POLICY,
+                    retry_policy,
+                    on_retry,
                 )
                 .await?;
                 (channel, CredmgrBearerInterceptor::TokenSource)

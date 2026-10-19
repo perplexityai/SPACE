@@ -164,6 +164,11 @@ const RESUME_CLOCK_SYNC_TIMEOUT: Duration = Duration::from_secs(5);
 // Foreground Stats should promptly fall back to recorded counters when the
 // gateway is slow. Background observations tolerate a longer 2s probe.
 const NET_GATEWAY_FOREGROUND_STATS_TIMEOUT: Duration = Duration::from_secs(1);
+// Stats' node-manager inspect, its kept channel's dial included, gets as long
+// as the gateway probe in the same call. A merely slow inspect must still
+// answer: without it Stats reports zero CPU time and memory, which kubelet
+// reads as a counter reset and an empty sandbox.
+const STATS_INSPECT_TIMEOUT: Duration = Duration::from_secs(1);
 const NETWORK_POLICY_SYNC_REFRESH_TIMEOUT: Duration = Duration::from_secs(2);
 // End-to-end network-readiness budget, including connection, RPCs and backoff.
 // Startup dependencies may need tens of seconds even after policy hydration.
@@ -495,6 +500,31 @@ impl RouteStreamEpochIdentity {
     }
 }
 
+fn execution_only_provenance(identity: &SpaceApiRouteIdentity) -> bool {
+    identity.execution_generation.is_some()
+        && identity.route_generation.is_none()
+        && identity.current_node_id.is_none()
+        && identity.substrate_kind.is_none()
+        && identity.pod_uid.is_none()
+        && identity.activation_attempt_id.is_none()
+}
+
+fn validate_cold_start_provenance(
+    sandbox: &crate::db::SandboxRow,
+    incoming: &RouteStreamEpochIdentity,
+) -> Result<(), Status> {
+    let retained = &sandbox.space_api_route_identity;
+    if sandbox.state == crate::state::SandboxState::Starting
+        && execution_only_provenance(retained)
+        && incoming.execution_generation() <= retained.execution_generation
+    {
+        return Err(Status::aborted(
+            "cold activation must advance the retained execution generation",
+        ));
+    }
+    Ok(())
+}
+
 fn persisted_route_stream_epoch(
     sandbox_id: SandboxId,
     sandbox: &crate::db::SandboxRow,
@@ -547,13 +577,19 @@ fn persisted_route_stream_epoch(
         == ActivationRouteReplacementAuthority::PersistedOwner
         && sandbox.state == crate::state::SandboxState::Restoring
         && has_suspend_artifact
-        && identity.execution_generation.is_some()
-        && identity.route_generation.is_none()
-        && identity.current_node_id.is_none()
-        && identity.substrate_kind.is_none()
-        && identity.pod_uid.is_none()
-        && identity.activation_attempt_id.is_none();
+        && execution_only_provenance(identity);
     if is_owned_recovered_execution_provenance {
+        return Ok(None);
+    }
+    // Stop clears the live route while retaining the producing execution as
+    // cleanup provenance. An owned cold activation may replace that exact
+    // partial identity after validate_cold_start_provenance requires a newer
+    // execution, independently of the process-local route cache.
+    let is_owned_cold_start_provenance = activation_replacement_authority
+        == ActivationRouteReplacementAuthority::PersistedOwner
+        && sandbox.state == crate::state::SandboxState::Starting
+        && execution_only_provenance(identity);
+    if is_owned_cold_start_provenance {
         return Ok(None);
     }
     RouteStreamEpochIdentity::from_runtime_update(sandbox_id, identity.clone())
@@ -1402,10 +1438,14 @@ impl SandboxManagerService {
                 }
                 _ => ActivationRouteReplacementAuthority::Unowned,
             };
+            let persisted = crate::db::get_sandbox(&db, &sandbox_id.to_string())
+                .map_err(|error| Status::internal(format!("db error: {error}")))?;
+            if let Some(sandbox) = persisted.as_ref() {
+                validate_cold_start_provenance(sandbox, route_identity)?;
+            }
             let current_identity = match epochs.get(&sandbox_id) {
                 Some(current) => Some(current.identity.clone()),
-                None => crate::db::get_sandbox(&db, &sandbox_id.to_string())
-                    .map_err(|error| Status::internal(format!("db error: {error}")))?
+                None => persisted
                     .map(|sandbox| {
                         persisted_route_stream_epoch(
                             sandbox_id,
@@ -1968,8 +2008,10 @@ mod cleanup_support;
 mod cleanup_targets;
 mod create;
 mod create_support;
+pub(crate) use create_support::template_lookup_scope;
 pub(crate) mod drain;
 mod eviction;
+pub(crate) mod snapshot_capture;
 pub(crate) use eviction::EvictionClaim;
 mod grpc_auto_lifecycle_delete_receipts;
 mod grpc_core;

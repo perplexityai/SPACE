@@ -11,7 +11,7 @@ use std::str::FromStr;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Deserializer, Serialize, de};
 
-use super::{Arch, Digest, RuntimeKind, VcpuCount};
+use super::{Arch, Digest, HostCpu, RuntimeKind, VcpuCount};
 
 /// Firecracker release assigned to durable artifacts written before execution metadata existed.
 pub const INITIAL_FIRECRACKER_RUNTIME_VERSION: &str = "1.15.1";
@@ -458,6 +458,13 @@ pub struct SnapshotExecutionMetadata {
         serde(default, skip_serializing_if = "Option::is_none")
     )]
     cpu_budget: Option<VcpuCount>,
+    /// CPU of the host that captured the VM state, if known. Legacy absence
+    /// remains unknown; see [`HostCpu`] for why the instance type isn't enough.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    host_cpu: Option<HostCpu>,
 }
 
 impl SnapshotExecutionMetadata {
@@ -468,6 +475,7 @@ impl SnapshotExecutionMetadata {
         Ok(Self {
             execution: metadata,
             cpu_budget: None,
+            host_cpu: None,
         })
     }
 
@@ -480,8 +488,33 @@ impl SnapshotExecutionMetadata {
         self.cpu_budget
     }
 
+    pub fn with_host_cpu(mut self, host_cpu: Option<HostCpu>) -> Self {
+        self.host_cpu = host_cpu;
+        self
+    }
+
+    pub const fn host_cpu(&self) -> Option<&HostCpu> {
+        self.host_cpu.as_ref()
+    }
+
     pub const fn execution(&self) -> &ExecutionMetadata {
         &self.execution
+    }
+
+    /// Whether `self` and `other` describe the same artifact.
+    ///
+    /// The capture host CPU is placement evidence, not identity: one backup
+    /// attempt can be registered by a cluster API that predates the field
+    /// (and drops it) and replayed after that API is upgraded, and the replay
+    /// isn't a conflict. Every other field is identity; the exhaustive
+    /// destructure makes a new field choose a side.
+    pub fn same_artifact_identity(&self, other: &Self) -> bool {
+        let Self {
+            execution,
+            cpu_budget,
+            host_cpu: _,
+        } = self;
+        *execution == other.execution && *cpu_budget == other.cpu_budget
     }
 
     pub fn into_execution(self) -> ExecutionMetadata {
@@ -496,6 +529,12 @@ struct SnapshotExecutionMetadataWire {
     execution: ExecutionMetadata,
     #[serde(default)]
     cpu_budget: Option<VcpuCount>,
+    /// Read as any value and parsed leniently: the capture CPU is placement
+    /// evidence, so a value this release doesn't accept (written by a newer
+    /// release, then rolled back), whether a string or not, reads as unknown
+    /// instead of making the whole row unreadable.
+    #[serde(default)]
+    host_cpu: Option<serde_json::Value>,
 }
 
 #[cfg(feature = "serde")]
@@ -506,7 +545,14 @@ impl<'de> Deserialize<'de> for SnapshotExecutionMetadata {
     {
         let wire = SnapshotExecutionMetadataWire::deserialize(deserializer)?;
         Self::new(wire.execution)
-            .map(|metadata| metadata.with_cpu_budget(wire.cpu_budget))
+            .map(|metadata| {
+                metadata.with_cpu_budget(wire.cpu_budget).with_host_cpu(
+                    wire.host_cpu
+                        .as_ref()
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|raw| HostCpu::parse(raw).ok()),
+                )
+            })
             .map_err(de::Error::custom)
     }
 }

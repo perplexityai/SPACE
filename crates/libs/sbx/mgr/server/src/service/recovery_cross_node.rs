@@ -1765,8 +1765,13 @@ impl SandboxManagerService {
                 .ok_or_else(|| {
                     RestoreError::Other("restore execution identity is missing".into())
                 })?;
+        let owner = self
+            .lookup_sandbox(&canonical_id)
+            .map_err(|error| RestoreError::Other(error.to_string()))?
+            .user;
         let phase2_result = restore_pull_rootfs(
             &staged,
+            &owner,
             execution_fence,
             &self.node_manager,
             self.template_resolver.as_ref(),

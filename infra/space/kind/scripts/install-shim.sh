@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# install-shim.sh — build `containerd-shim-space-v2` and wire it into each
-# kind worker's containerd, so per-sandbox pods scheduled with
+# install-shim.sh — build `containerd-shim-space-v2` and install it on each
+# kind sandbox worker, so per-sandbox pods scheduled with
 # `runtimeClassName: space` get hijacked by the SPACE shim (which delegates
 # to sandbox-manager → node-manager → guest runtime) instead of running as
-# a plain runc container.
+# a plain runc container. The node image registers the runtime with
+# containerd; this installs the binary containerd runs for it.
 #
-# Without this script, RuntimeClass `space` is unresolvable and every
-# per-sandbox pod fails to start with "runtime handler not configured".
+# Without the shim, every per-sandbox pod that RuntimeClass `space` routes to
+# it fails to start.
 #
 # Idempotent. Safe to re-run after a kind cluster recreate.
 #
@@ -123,61 +124,40 @@ list_workers_fallback() {
       done
 }
 
-# ── 3. Install the shim binary + containerd config on one kind node ───────────
+# ── 3. Install the shim binary on one kind node ─────────────────────────────
+# The `space` runtime itself is registered by the SPACE Kind node image
+# (infra/space/kind/node/containerd/space-runtime.toml), under containerd's CRI
+# v1 runtime plugin as a deployed node registers it, so containerd has it from
+# its first start and is never edited or restarted here. containerd resolves
+# /usr/local/bin/containerd-shim-space-v2 when each sandbox pod starts, so a
+# replaced binary takes effect for the next sandbox.
 install_on_node() {
   local node=$1
   log "installing shim on $node"
-  local prior_config
-  prior_config=$(docker exec "$node" sha256sum /etc/containerd/config.toml)
+  docker exec "$node" containerd config dump 2>/dev/null \
+    | grep -F "[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.space]" >/dev/null \
+    || die "$node's containerd has no 'space' runtime; the node predates the SPACE Kind node image that registers it, so recreate the cluster (scripts/check-kind-node-image.sh)"
 
   docker exec "$node" mkdir -p "$(dirname "$SHIM_REAL_BIN")"
-  docker cp "$SHIM_BIN" "$node:${SHIM_REAL_BIN}.tmp"
-  docker exec "$node" sh -c \
-    "chown root:root '${SHIM_REAL_BIN}.tmp' && chmod 0755 '${SHIM_REAL_BIN}.tmp' && mv -f '${SHIM_REAL_BIN}.tmp' '$SHIM_REAL_BIN'"
-  docker cp "$SHIM_WRAPPER" "$node:/usr/local/bin/.containerd-shim-space-v2.tmp"
-  docker exec "$node" sh -c \
-    "chown root:root /usr/local/bin/.containerd-shim-space-v2.tmp && chmod 0755 /usr/local/bin/.containerd-shim-space-v2.tmp && mv -f /usr/local/bin/.containerd-shim-space-v2.tmp /usr/local/bin/containerd-shim-space-v2"
+  install_file "$node" "$SHIM_BIN" "$SHIM_REAL_BIN"
+  install_file "$node" "$SHIM_WRAPPER" /usr/local/bin/containerd-shim-space-v2
+}
 
-  # Add the `space` CRI runtime to containerd's config if not already there.
-  # The runtime_type is the shim's protocol name — kind's containerd looks for
-  # /usr/local/bin/containerd-shim-<basename-with-dashes>-<version>. The bash
-  # wrapper installed above now occupies that path and execs the compiled
-  # binary from /usr/local/lib/space.
-  # NOTE: heredoc delimiter is QUOTED ('"'"'EOF'"'"') so sh doesn't run command
-  # substitution on backticks inside the comment block (a previous version
-  # without quotes had sh trying to exec the literal word "space").
-  #
-  # pod_annotations is the allowlist containerd uses to decide which K8s pod
-  # annotations get propagated into the OCI runtime spec. The SPACE shim
-  # reads its instructions (sandbox-id, owner, vcpu, memory, template, etc.)
-  # off the OCI spec, so without this allowlist every pod create fails with
-  # "space.pplx.net/sandbox-owner or space.pplx.net/sandbox-user is required".
-  # `space.pplx.net/*` matches every SPACE annotation in one rule.
-  docker exec "$node" sh -c '
-    cfg=/etc/containerd/config.toml
-    grep -q "io.containerd.space.v2" "$cfg" && exit 0
-    cat >>"$cfg" <<'"'"'EOF'"'"'
-
-# Added by infra/space/kind/scripts/install-shim.sh — kind-only.
-# Provides RuntimeClass "space" -> containerd-shim-space-v2, which bridges
-# kubelet pod-start into the per-node sandbox-manager UDS so per-sandbox
-# pods run as real SPACE sandboxes (guest VM via node-manager) instead of
-# plain runc containers.
-[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.space]
-  runtime_type = "io.containerd.space.v2"
-  pod_annotations = ["space.pplx.net/*"]
-EOF
-  '
-
-  # Restart containerd inside the kind node so it picks up the new runtime.
-  # kind nodes run systemd, so the standard systemctl path works. (We
-  # tolerate failure here — on the first install the kubelet briefly loses
-  # the apiserver socket; it reconnects within a few seconds.)
-  if [[ "$(docker exec "$node" sha256sum /etc/containerd/config.toml)" != "$prior_config" ]]; then
-    docker exec "$node" systemctl restart containerd
-  else
-    log "containerd configuration unchanged; new sandbox shims use the updated binary"
+# Copy beside the destination, check the copy against the source's SHA-256 (as
+# a deployed node's bootstrap checks the shim it downloads), then rename it
+# into place.
+install_file() {
+  local node=$1 source=$2 dest=$3 want got
+  local staged
+  staged="$(dirname "$dest")/.$(basename "$dest").tmp"
+  want="$(sha256sum "$source" | cut -d' ' -f1)"
+  docker cp "$source" "$node:$staged"
+  got="$(docker exec "$node" sha256sum "$staged" | cut -d' ' -f1)"
+  if [[ "$got" != "$want" ]]; then
+    docker exec "$node" rm -f "$staged" || true
+    die "$dest on $node: copied file has SHA-256 $got, expected $want"
   fi
+  docker exec "$node" sh -c "chown root:root '$staged' && chmod 0755 '$staged' && mv -f '$staged' '$dest'"
 }
 
 # ── Driver ───────────────────────────────────────────────────────────────────

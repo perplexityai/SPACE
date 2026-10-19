@@ -241,9 +241,9 @@ async fn reconnect_node_api_is_blocked_by_access_drain_gate() -> TestResult {
     let node_api = start_fake_reconnect_node_api().await?;
     let sandbox = insert_direct_sandbox_on_node(&db.pool, node_api.addr, Some("draining")).await?;
     // Direct is only a placeholder here: this test never reaches the substrate.
-    let substrate = Substrate::Direct(Box::new(
+    let substrate = Substrate::from_direct(
         crate::controllers::substrate::direct::DirectSubstrate::new(db.pool.clone()),
-    ));
+    );
     let node_api_addr = node_api.addr.to_string();
     let endpoint = crate::controllers::substrate::node_api_endpoint(
         &node_api_addr,

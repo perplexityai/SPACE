@@ -95,6 +95,7 @@ COPY proto ./proto
 COPY infra/space/identity/node-identities.sh infra/space/identity/node-identities.sh
 COPY templates/firecracker/seed/rootfs-builder.sh templates/firecracker/seed/rootfs-builder.sh
 COPY templates/firecracker/recipes/seed.toml templates/firecracker/recipes/code-runtime.toml templates/firecracker/recipes/
+COPY templates/firecracker/recipes/code-runtime templates/firecracker/recipes/code-runtime
 
 RUN cargo chef prepare --recipe-path recipe.json
 
@@ -182,6 +183,7 @@ COPY db ./db
 COPY infra/space/identity/node-identities.sh infra/space/identity/node-identities.sh
 COPY templates/firecracker/seed/rootfs-builder.sh templates/firecracker/seed/rootfs-builder.sh
 COPY templates/firecracker/recipes/seed.toml templates/firecracker/recipes/code-runtime.toml templates/firecracker/recipes/
+COPY templates/firecracker/recipes/code-runtime templates/firecracker/recipes/code-runtime
 COPY scripts/build-runtime-supervisor.sh scripts/build-runtime-supervisor.sh
 
 FROM build-context AS build-worker

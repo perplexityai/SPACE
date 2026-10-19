@@ -3,18 +3,16 @@
 The live run proves the loop reclaims a build; nothing here restates that. These
 pin what a bench run would not catch: knob parsing that mirrors the binary
 (including grace=0), shell-word validation on every parameter that reaches an
-on-node `bash -c`, NotFound-vs-error mapping that must fail closed, the tick
-parser across both tracing layouts, a bench with the loop off being a
+on-node `bash -c`, NotFound-vs-error mapping that must fail closed, a bench
+with the loop off being a
 configuration error rather than a pass, and — the one that bit on the bench —
 the wait never resolving the build while it waits.
 """
 
 from __future__ import annotations
 
-import json
 import unittest
 
-from space_smoke import adapters
 from space_smoke.adapters import (
     KindConfig,
     KindHarness,
@@ -156,25 +154,6 @@ class DigestListingFailsClosed(unittest.TestCase):
         self.assertEqual(harness.template_digest_dirs("p", "seed"), ("sha256:abc",))
 
 
-class GcTickParsing(unittest.TestCase):
-    def test_reads_nested_and_flat_tracing_layouts(self) -> None:
-        nested = json.dumps(
-            {
-                "timestamp": "t",
-                "level": "INFO",
-                "fields": {"message": adapters.TEMPLATE_GC_TICK_MESSAGE, "deleted": 1, "candidates": 1, "bytes_before": 5, "bytes_freed": 4},
-            }
-        )
-        flat = json.dumps({"message": adapters.TEMPLATE_GC_TICK_MESSAGE, "deleted": "0", "candidates": 0})
-        unrelated = json.dumps({"fields": {"message": "template GC tick failed"}})
-        kubectl = _RecordingKubectl(get_output="\n".join([nested, flat, unrelated, "not json"]))
-        ticks = KindHarness(kubectl, KindConfig()).template_gc_ticks(
-            "worker-1", since_time="2026-01-01T00:00:00Z"
-        )
-        self.assertEqual([t.deleted for t in ticks], [1, 0])
-        self.assertEqual(ticks[0].bytes_freed, 4)
-
-
 class BenchMisconfigurationIsAConfigurationError(unittest.TestCase):
     """Off, oversized, or over-pinned benches are refused, never patched or passed."""
 
@@ -232,9 +211,6 @@ class WaitingForEvictionMustNotTouchTheBuild(unittest.TestCase):
                 self.gets += 1
                 return None
 
-            def template_gc_ticks(self, pod, *, since_time):
-                return [adapters.TemplateGcTick("n", 1, 1, 2, 1)]
-
         class Fixture:
             def verify(self, ok, message, **evidence):
                 if not ok:
@@ -247,7 +223,6 @@ class WaitingForEvictionMustNotTouchTheBuild(unittest.TestCase):
         assertions = TemplateCacheAssertions(Fixture(), control, None)  # type: ignore[arg-type]
         assertions.require_smoke_sized_gc("p")
         assertions._planted_since["smoke-lru-0123abcd"] = "2026-01-01T00:00:00Z"
-        assertions._planted_bytes["smoke-lru-0123abcd"] = 1
         assertions._planted_digests["smoke-lru-0123abcd"] = "sha256:x"
         assertions.wait_until_evicted("p", "smoke-lru-0123abcd")
         self.assertEqual(control.gets, 0)

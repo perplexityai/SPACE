@@ -13,7 +13,7 @@ from typing import Any
 from space_smoke.registry import Scenario
 from space_smoke.runtime import SmokeConfigurationError, execute_scenario
 from space_smoke.scenarios import REGISTRY
-from space_smoke.services import MissingToolError, SmokeServices
+from space_smoke.services import MissingToolError, SmokeServices, repair_orphaned_kind_faults
 from space_smoke.sharding import select_shard
 from space_smoke.suite import (
     RESULT_PREFIX,
@@ -90,6 +90,13 @@ def _run(scenario_id: str) -> int:
         return 1
     except SmokeConfigurationError as error:
         print(f"ERROR: {error}", file=sys.stderr)
+        return 2
+    # Outside the scenario's budget: the repair may wait out two rollouts.
+    try:
+        if repair_orphaned_kind_faults(os.environ):
+            print("REPAIRED: a limiter fault an earlier run left recorded", flush=True)
+    except Exception as error:  # noqa: BLE001 - a fault left up makes any verdict untrustworthy
+        print(f"ERROR: {type(error).__name__}: {error}", file=sys.stderr)
         return 2
     result = execute_scenario(
         title=scenario.title,

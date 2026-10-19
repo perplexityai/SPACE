@@ -5585,6 +5585,7 @@ dependencies = [
  "lru 0.18.4",
  "nix 0.31.3",
  "pplx-space-common-core",
+ "pplx-space-common-grpc",
  "pplx-space-common-svc",
  "pplx-space-credential-injection-core",
  "pplx-space-credential-injection-store",
@@ -5610,6 +5611,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tonic",
+ "tonic-health",
  "tonic-prost",
  "tower",
  "tracing",
@@ -6265,9 +6267,16 @@ version = "0.8.0"
 dependencies = [
  "anyhow",
  "clap",
+ "hyper-util",
+ "nix 0.31.3",
  "pplx-space-common-core",
  "pplx-space-common-svc",
  "pplx-space-node-ctl-server",
+ "tempfile",
+ "tokio",
+ "tonic",
+ "tonic-health",
+ "tower",
 ]
 
 [[package]]
@@ -6275,6 +6284,7 @@ name = "pplx-space-node-mgr"
 version = "0.8.0"
 dependencies = [
  "arc-swap",
+ "crc",
  "dashmap",
  "futures-util",
  "h2",
@@ -6531,7 +6541,6 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
- "tonic-health",
  "tracing",
  "tracing-log",
  "tracing-opentelemetry",
@@ -6713,6 +6722,7 @@ dependencies = [
  "prost",
  "prost-types",
  "rcgen",
+ "rstest",
  "rusqlite",
  "rustix",
  "rustls",
@@ -7269,14 +7279,10 @@ version = "0.8.0"
 dependencies = [
  "anyhow",
  "clap",
- "libc",
  "pplx-space-common-core",
  "pplx-space-common-svc",
  "pplx-space-credmgr-client",
  "pplx-space-volmgr",
- "rusqlite",
- "serde",
- "serde_json",
  "tokio",
  "tokio-stream",
  "tonic",

@@ -67,6 +67,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_NODE_DRAIN_ENABLED` | off | |
 | `SPACE_NODE_DRAIN_NODE_CENSUS_RESIDENCY` | off | |
 | `SPACE_NODE_DRAIN_TERMINATION_BLOCKING_GATE` | off | Parks nodes that still hold stopped, created, deleting or quarantined residents in `draining` instead of advancing them to `drained`. |
+| `SPACE_NODE_DRAIN_EVACUATE_STOPPED_RESIDENTS` | off | On a forced drain, publishes a resident `stopped` sandbox's disk to S3, waits for it to be durable, then releases the node (the node-local copy goes when the node terminates) and hands the sandbox to the restore sweep. Has no effect unless `SPACE_NODE_DRAIN_TERMINATION_BLOCKING_GATE` is also on. Turning it off stops new evacuations; ones already claimed, including a claim an `:undrain` left behind, still proceed when a forced drain next reaches them. The restore sweep cannot yet re-place a `stopped` sandbox, so with this on an evacuated sandbox answers `start` with a retryable 503 until it can. |
 | `SPACE_NODE_DRAIN_TERMINATOR_KIND` | `aws` | `aws`, `kube-delete` or `noop`. |
 | `SPACE_DRAINED_NODE_TERMINATOR_ENABLED` | off | |
 | `SPACE_CLUSTER_CONTROLLER_DRAIN_EVACUATION_COHORT_VALUE` | unset | Unset disables the rollout-cohort feature. |
@@ -102,8 +103,8 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_NODEMGR_ACTIVATE_RUNTIME_SUPERVISOR_ON_START` | off | |
 | `SPACE_RTMGR_INSTALL_KERNELS_DIR` | unset | Enables runtime-manager kernel installs in this versioned kernel root, which must exist on the state directory's filesystem. Unset, installs and uninstalls are refused. |
 | `SPACE_NODEMGR_BTRFS_BALANCE_ENABLED` | on | |
-| `SPACE_NODEMGR_BTRFS_SEND_UNSTAMPED_PARENT` | off | Seal retained btrfs send-source parents without the template's received UUID; see [snapshot upload streaming](snapshot-upload-streaming.md). |
 | `SPACE_NODEMGR_DISK_IO_RESERVATION_ENABLED` | off | |
+| `SPACE_NODEMGR_DISK_IO_MAX_OPERATIONS_PER_SEC` | unset | Operator ceiling for each Firecracker root drive. Set a positive integer (for example `1000`) on node-manager and restart it. Applies to new boots, restores and running VMs, independently of saved assignments. See [guest disk I/O](space/design/guest-io.md#operator-ceiling). |
 | `SPACE_DISK_IO_SAFETY_MAX_OPERATIONS_PER_SEC`, `SPACE_DISK_IO_SAFETY_MAX_BANDWIDTH_MIB_PER_SEC` | unset | Set both or neither. Caps explicit warm-pool policy limits; unset, the cap is the platform default of 10,000 operations/s and 100 MiB/s. A value below the default leaves that dimension at the default. |
 | `SPACE_NODE_DISK_ADMISSION_MIN_AVAILABLE_BYTES` | 50 GiB | Hard free-space floor. Lower it on small disks. |
 | `SPACE_BUILDER_BLOB_MIN_AVAILABLE_BYTES` | 50 GiB | |
@@ -135,6 +136,8 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_CLUSTER_ACTIVATION_ADMISSION_REFILL_RPS` | 60 | |
 | `SPACE_PUBLIC_OPERATION_DISPATCHER_EXECUTION_CONCURRENCY` | 16 | Operations the dispatcher runs at once. A larger value clamps to 128; `0` or a non-number keeps the default without a warning. Each execution holds its slot for the whole operation, and freed slots refill on the next 25 ms claim tick, at most 64 per tick. So throughput is roughly this divided by mean execution time, up to 2,560 operations a second. Executions draw on the cluster controller's `space_user` Postgres pool, which most other reconcilers share (`POSTGRES_POOL_MAX_CONNECTIONS`, default 25). Raising this adds contention for that pool, and an execution whose claim renewal or final status write can't get a connection within the pool's acquire timeout is abandoned and runs again once its claim goes stale, repeating any work it had already done. |
 | `SPACE_NATIVE_CREATE_POOL_CLAIM_ENABLED` | off | Env master for claiming a ready warm-pool slot when `POST /v1/sandboxes` admits a create, under the `space-native-create-pool-claim` flag (falls back off). Every `space-cluster-controller` replica must understand claim-carrying create payloads before this is turned on. |
+| `SPACE_NATIVE_CREATE_INLINE_ENABLED` | on | Kill switch for running a native create that won an admission-time warm-pool claim inside the `POST /v1/sandboxes` request instead of leaving it queued for the dispatcher. Read only while admission-time claiming is on; off keeps those creates queued. The API then runs the create executor itself, so it needs the same create settings as `space-cluster-controller` (for example `SPACE_BYOK_VOLUME_ENCRYPTION`). |
+| `SPACE_NATIVE_CREATE_INLINE_WAIT_MS` | `2000` | How long the create request waits for that inline execution before answering. Past the wait the request answers and the execution continues in the background; a malformed value uses the default, and values above 30000 are capped. |
 | `SPACE_REDIS_URL` | unset | |
 | `SPACE_SHARED_VALKEY_URL` | unset | Unset disables the consumer. |
 | `SPACE_GRPC_CLIENT_MAX_CONNECTION_AGE_SECS` | off | |
@@ -148,6 +151,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_DATA_PLANE_UPLOAD_ADMISSION` | off | Data plane: admit ECW `POST /files` uploads under the per-replica limits below; rejected uploads get 429 with a jittered `Retry-After`. Accepts `true`/`1`/`yes`/`on` and their negations. |
 | `SPACE_DATA_PLANE_MAX_CONCURRENT_UPLOADS`, `SPACE_DATA_PLANE_MAX_IN_FLIGHT_UPLOAD_BYTES` | 64, 1 GiB | Per-replica upload slots and byte budget. Each upload reserves its declared `Content-Length` rounded up to a KiB, or its path's body limit (256 MiB, or 1 MiB for JSON) when none is declared, so the 1 GiB default fits four undeclared-length uploads at a time. A reservation is capped at the whole budget: a budget smaller than one upload admits uploads one at a time and is exceeded by that upload. Both must be non-zero. |
 | `SPACE_DATA_PLANE_UPLOAD_ADMISSION_WAIT_MS` | 2000 | How long an upload waits for a slot and its bytes before the 429. |
+| `SPACE_DATA_PLANE_SHUTDOWN_GRACE_SECS` | unset | Data plane: how long live streams keep running after SIGTERM before they're cancelled. Unset, they run until they end or the termination grace period kills the process; a second stop signal ends the drain either way, without waiting for a `Process.Start` that's still opening. Keep it plus 5 seconds within the pod's termination grace period minus its preStop delay. Values under 8 seconds, the stream-open budget, are rejected, so an ECW `Process.Start` already opening at SIGTERM can report itself. See [architecture](architecture.md) for what each stream kind sees. |
 
 ## Templates and builds
 
@@ -363,10 +367,51 @@ authentication is enabled, static fallback has no transfer authority.
 Missing authentication context is denied. Local root/operator exports remain
 available through template-manager's Unix socket.
 
+A peer transfer has two callers, and each needs the grant and admission by
+`SPACE_NODE_API_AUTH_ALLOWED_SERVICE_ACCOUNTS` on the node it calls. The caller
+of `PullTemplate` on the target node starts it: the admin API's node
+template-pull route, which only the direct substrate serves, or an operator
+calling node-api directly. The target's node-api then calls
+`NodeExportTemplate` on the source node with its own `SPACE_NODE_API_TOKEN_PATH`
+token. List the account that starts pulls and the node-api account of every
+role that can be a target. An empty list disables peer
+transfers and node-api logs a startup warning. A deployment without peer
+transfers may leave it empty.
+
 Exact-digest export can use the local cache offline. An omitted digest resolves
 the requested catalog tag (default `latest`) and exports only that digest; a
 missing tag, unavailable catalog, or uncached resolved digest fails without
 falling back to a newer local build.
+
+### Policy authorization
+
+Before enabling Kubernetes authentication or upgrading an authenticated worker
+or builder, set `SPACE_NODE_API_AUTH_TRUSTED_POLICY_SERVICE_ACCOUNTS` to the
+service accounts that own policy intent. It must be nonempty on both roles or
+node-api refuses to start. These accounts must also be admitted by the normal
+and internal surface allowlists for the RPCs they call. Policy trust is
+independent of the `SpacedWaitReady` trust set. Policy-bearing pool adoption
+uses the internal surface, so its caller needs an internal-audience token.
+
+Shared static-token fallback cannot mutate policy when Kubernetes
+authentication is enabled; static-only deployments retain that authority.
+Policy-bearing cold creation, internal pool adoption, and worker and builder
+template updates require a trusted caller. Cold creation and pool adoption also
+require policy authority for a nonzero sandbox-policy generation, even without
+an override. Requests with no overrides and generation zero remain available to
+otherwise admitted callers and inherit the template's policy. Guest-bridge
+accounts already have separate method restrictions.
+
+`Local` policy is node-administrator-owned, including normal standalone use and
+operator overrides on cluster-managed nodes. It requires a root or Operator Unix
+socket peer. Forwarders such as node-api and node-ctl must run under their
+dedicated non-root identities: UID 0 is classified as Root before the
+service-account lookup.
+
+Forwarded imports carrying `Local` network or auto-lifecycle policy are
+rejected, and retrying does not help. To retain `Local` policy, an operator must
+review its ownership and perform the import through an authorized local peer;
+forwarding never relabels it.
 
 ## Database
 

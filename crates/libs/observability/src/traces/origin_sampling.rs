@@ -5,9 +5,18 @@
 //! ([`crate::trace_propagation::link_root_to_origins`]). Sampled on its own,
 //! such a root would be kept or dropped independently of the request, so a
 //! kept request could lose the work it caused and a dropped request could
-//! keep work that links to nothing. A root that links to an origin therefore
-//! follows the origin's sampled flag; a root with no origin, and every span
-//! with a parent, keeps the configured sampler.
+//! keep work that links to nothing. A root that links to an origin and
+//! records `origin_sampled` therefore follows the origin's sampled flag. A
+//! root linked without it
+//! ([`crate::trace_propagation::link_root_to_origins_without_following`]), a
+//! root with no origin, and every span with a sampled parent keep the
+//! configured sampler.
+//!
+//! Every span under a parent that was not sampled is recorded unsampled, so
+//! APM stats count it and a failure can still be exported. A gRPC call made
+//! with no traced request in scope takes such a parent
+//! ([`crate::trace_propagation::set_unsampled_remote_parent`]), and its server
+//! follows the unsampled context it propagates.
 
 use opentelemetry::{
     Context, KeyValue,
@@ -15,13 +24,17 @@ use opentelemetry::{
 };
 use opentelemetry_sdk::trace::{SamplingDecision, SamplingResult, ShouldSample};
 
-/// The field [`crate::trace_propagation::link_root_to_origins`] records. The
-/// native Datadog sampler never sees links, so its rules match this instead.
-#[cfg(feature = "datadog")]
+/// The field [`crate::trace_propagation::link_root_to_origins`] records on a
+/// root whose sampling follows its origins. The native Datadog sampler never
+/// sees links, so its rules match this instead; the OTLP sampler follows a
+/// root's links only when it carries it, so a root linked with
+/// [`crate::trace_propagation::link_root_to_origins_without_following`] keeps
+/// the configured sampler on both.
 const ORIGIN_SAMPLED_ATTRIBUTE: &str = "origin_sampled";
 
 /// The OTLP pipeline's sampler: the one `OTEL_TRACES_SAMPLER` configures,
-/// except that a root with a valid link follows its links.
+/// except that a root that records `origin_sampled` and has a valid link
+/// follows its links.
 #[derive(Clone, Debug)]
 pub(super) struct FollowOrigin {
     configured: Box<dyn ShouldSample>,
@@ -47,15 +60,36 @@ impl ShouldSample for FollowOrigin {
         attributes: &[KeyValue],
         links: &[Link],
     ) -> SamplingResult {
-        let has_parent = parent_context.is_some_and(|context| {
-            context.has_active_span() && context.span().span_context().is_valid()
-        });
+        let parent = parent_context
+            .filter(|context| context.has_active_span())
+            .map(|context| context.span().span_context().clone())
+            .filter(|parent| parent.is_valid());
+        let has_parent = parent.is_some();
         let mut origins = links
             .iter()
             .map(|link| &link.span_context)
             .filter(|origin| origin.is_valid())
             .peekable();
-        if has_parent || origins.peek().is_none() {
+        // A span under a parent that was not sampled is recorded unsampled
+        // whatever OTEL_TRACES_SAMPLER says, as the native Datadog sampler
+        // does: `always_on` would otherwise sample the server side of a call
+        // its caller left unsampled.
+        if parent.as_ref().is_some_and(|parent| !parent.is_sampled()) {
+            return SamplingResult {
+                decision: SamplingDecision::RecordOnly,
+                attributes: Vec::new(),
+                trace_state: parent
+                    .map(|parent| parent.trace_state().clone())
+                    .unwrap_or_default(),
+            };
+        }
+        // Only a root that records `origin_sampled` follows its links, as
+        // the native Datadog rules do; one linked without it, such as a
+        // retry, keeps the configured sampler.
+        let follows = attributes
+            .iter()
+            .any(|attribute| attribute.key.as_str() == ORIGIN_SAMPLED_ATTRIBUTE);
+        if has_parent || !follows || origins.peek().is_none() {
             return self.configured.should_sample(
                 parent_context,
                 trace_id,

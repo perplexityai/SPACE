@@ -213,6 +213,43 @@ reads these installation commands from the recipe. The digest sources are:
 - [GitHub CLI release checksums](https://github.com/cli/cli/releases/download/v2.101.0/gh_2.101.0_checksums.txt)
 - uv [aarch64 checksum](https://github.com/astral-sh/uv/releases/download/0.12.18/uv-aarch64-unknown-linux-gnu.tar.gz.sha256) and [x86_64 checksum](https://github.com/astral-sh/uv/releases/download/0.12.18/uv-x86_64-unknown-linux-gnu.tar.gz.sha256)
 
+The recipe's Python packages are listed in `recipes/code-runtime/pyproject.toml`
+and pinned, with every transitive dependency, to wheel hashes in
+`recipes/code-runtime/uv.lock`. uv installs exactly that set, and an artifact
+outside it fails the build, as does a lock that is out of date with
+`pyproject.toml`. The lock takes only releases at least a week old. After
+editing the package list, run `uv lock` in that directory; `uv lock --upgrade`
+moves every package to its newest eligible release.
+
+Before installing, uv checks the locked versions against
+[OSV](https://osv.dev/) malware advisories. A match stops the build and names
+the package and version; nothing is installed. Replace that version in a pull
+request:
+
+- If a newer release at least a week old exists, run
+  `uv lock --upgrade-package <name>`.
+- Otherwise exclude the flagged version by adding
+  `constraint-dependencies = ["<name>!=<version>"]` under `[tool.uv]` in
+  `pyproject.toml`, then run `uv lock`. uv selects the newest remaining
+  eligible release.
+- To take a release less than a week old, allow it for that package only with
+  `exclude-newer-package = { <name> = "<timestamp>" }`.
+
+Confirm the new lock passes without installing anything, using the recipe's uv
+version, then rebuild. Do not bypass the check with `UV_MALWARE_CHECK=0`.
+
+```bash
+cd templates/firecracker/recipes/code-runtime
+UV_PREVIEW_FEATURES=malware-check UV_MALWARE_CHECK=1 \
+  uv sync --dry-run --locked --no-build --no-install-project
+```
+
+On x86_64 the recipe's APT packages come from the dated
+[Ubuntu archive snapshot](https://snapshot.ubuntu.com/) in its `APT_SNAPSHOT`,
+and the build fails if any package would download from outside it. Ubuntu
+publishes no snapshot of the ports archive, so other architectures install APT
+packages from the live mirror.
+
 When updating a tool, review the upstream release and update its version and
 both digest pins together. When updating Ubuntu, choose a dated release with
 both squashfs architectures and signed checksum metadata. Other Ubuntu release

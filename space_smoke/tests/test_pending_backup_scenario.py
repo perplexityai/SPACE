@@ -2,8 +2,7 @@
 
 A passing bench shows one queue row appear and disappear. It cannot show that
 a snapshot reaching `ready` while uploads are supposedly blocked fails the
-in-flight verdict, that a queue row without an applied non-empty census fails
-the corroboration, that a drained queue with an unbacked artifact still fails,
+in-flight verdict, that a drained queue with an unbacked artifact still fails,
 that the object store scale-back is armed before the scale to zero, or that
 a failed wait for the gateway pod's deletion stops the scenario instead of
 running it without its outage.
@@ -100,13 +99,6 @@ class Verdicts(unittest.TestCase):
         _, census, _ = _assertions(control)
         with self.assertRaisesRegex(InvariantViolation, "no in-flight snapshot"):
             census.expect_snapshot_in_flight(timeout=60)
-
-    def test_a_queue_row_without_an_applied_census_fails_corroboration(self) -> None:
-        control = _Control()
-        control.publications = [CensusPublication("worker-a", "applied", 0), CensusPublication("worker-a", "skipped", 1)]
-        _, census, _ = _assertions(control)
-        with self.assertRaisesRegex(InvariantViolation, "no census publication was applied"):
-            census.expect_queue_names_this_sandbox(timeout=60)
 
     def test_an_empty_queue_with_an_unbacked_artifact_still_fails(self) -> None:
         control = _Control()

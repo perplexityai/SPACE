@@ -16,6 +16,9 @@ image:
 
 datadogTeam: team-space
 
+# Scheduling priority (infra/space/kind/manifests/priorityclasses.yaml).
+priorityClassName: space-control-plane
+
 nodeSelector:
   space.pplx.net/infra: "true"
 

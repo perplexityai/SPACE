@@ -233,6 +233,19 @@ pub fn occupies_node_predicate(
 ///   predicate's docs carry which refusals, what each of the four lifecycles it
 ///   counts is waiting for, and the one configured case that does clear itself.
 ///
+///   **The exclusion outlived half its reason.** `suspend` still refuses a
+///   `stopped` sandbox, but the drain no longer only knows how to suspend:
+///   where `SPACE_NODE_DRAIN_EVACUATE_STOPPED_RESIDENTS` is on, node-drain
+///   publishes such a sandbox's disk artifact to S3, releases the node holding
+///   its copy once those bytes are durable, and hands the row to the restore sweep
+///   to re-place it `stopped` elsewhere — no suspend anywhere in it. That also
+///   makes the "nor does anything publish the sandbox's disk" above true only
+///   where the flag is off. `stopped` is deliberately still
+///   absent from this list all the same: what holds the node long enough for
+///   that to run is [`active_resident_predicate`] via node-drain's fourth gate
+///   term, not this include-list, and adding it here would hold a node in every
+///   environment that has not enabled the path with nothing to service it.
+///
 /// The node-drain reconciler's residency and evacuation queries read this, and
 /// so must anything that predicts which nodes that reconciler can drain: a
 /// predictor that disagrees with the reconciler is worse than no predictor at

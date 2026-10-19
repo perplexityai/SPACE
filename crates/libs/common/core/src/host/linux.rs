@@ -176,11 +176,7 @@ pub mod paths {
     // there is no `SPACE_CREDMGR_SVC_BINARIES`: nothing verifies credmgr's
     // own exe.
     //
-    // Keep legacy volume-manager peers working while the new credential listener
-    // rolls out. Remove this compatibility entry only after every volume-manager
-    // has moved off the shared UID, including supported rollback versions.
-    pub const SPACE_SBXMGR_UID_BINARIES: &[&str] =
-        space_svc_binaries!("space-sbxmgr-svc", "space-volmgr-svc");
+    pub const SPACE_SBXMGR_UID_BINARIES: &[&str] = space_svc_binaries!("space-sbxmgr-svc");
     pub const SPACE_VOLMGR_SVC_BINARIES: &[&str] = space_svc_binaries!("space-volmgr-svc");
     pub const SPACE_TMPLMGR_SVC_BINARIES: &[&str] = space_svc_binaries!("space-tmplmgr-svc");
 

@@ -1467,6 +1467,9 @@ pub(super) struct EcwProxyError {
     pub(super) message: String,
     pub(super) sandbox_id: Option<SandboxId>,
     pub(super) retry_after: Option<Duration>,
+    /// Refused because the replica is draining; the response carries the
+    /// draining headers.
+    pub(super) draining: bool,
     pub(super) can_use_runtime_access: bool,
     pub(super) origin: ResponseOrigin,
     pub(super) kind: ResponseKind,
@@ -1575,6 +1578,33 @@ impl EcwProxyError {
         .with_retry_after(retry_after)
     }
 
+    /// A new stream refused because this replica is draining. A 503 rather
+    /// than a 429: the refusal says nothing about the caller's load, and the
+    /// retry lands on a replica that is not leaving.
+    pub(super) fn draining() -> Self {
+        let mut error = Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Data plane is draining; retry",
+            ResponseOrigin::DataPlane,
+            ResponseKind::Admission,
+        );
+        error.draining = true;
+        error
+    }
+
+    /// A streamed input cut at the drain deadline. A 409, which Connect clients
+    /// map to a code they don't retry, rather than the retryable 503 of
+    /// [`Self::draining`]: some of the input may already have reached the
+    /// process, so resending the whole stream could duplicate it.
+    pub(super) fn input_interrupted() -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "Data plane shut down mid-stream; input may be partially delivered",
+            ResponseOrigin::DataPlane,
+            ResponseKind::Timeout,
+        )
+    }
+
     pub(super) fn internal(message: impl Into<String>) -> Self {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1619,6 +1649,7 @@ impl EcwProxyError {
             message: message.into(),
             sandbox_id: None,
             retry_after: None,
+            draining: false,
             can_use_runtime_access: true,
             origin,
             kind,
@@ -1706,6 +1737,9 @@ impl IntoResponse for EcwProxyError {
                 header::HeaderValue::from_str(&retry_after.as_secs().max(1).to_string())
         {
             response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        if self.draining {
+            mark_draining_response(&mut response);
         }
         response
     }
@@ -1832,7 +1866,6 @@ impl AttachedStreamLimiter {
         Ok(())
     }
 
-    #[cfg(test)]
     pub(super) fn active_total(&self) -> usize {
         self.total.load(Ordering::Acquire)
     }

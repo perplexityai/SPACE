@@ -369,13 +369,47 @@ pub async fn connect_tcp_channel_with_retry(
     tls_handshake_timeout: Option<std::time::Duration>,
     retry_policy: GrpcRetryPolicy,
 ) -> Result<tonic::transport::Channel, TcpConnectError> {
+    connect_tcp_channel_with_retry_observed(
+        service_name,
+        target,
+        endpoint,
+        tls_handshake_timeout,
+        retry_policy,
+        |_| {},
+    )
+    .await
+}
+
+/// A failed TCP connect attempt that a retrying connect is about to redial.
+#[non_exhaustive]
+pub struct TcpConnectRetry<'a, E = TcpConnectError> {
+    /// Attempts made so far, the failed one included.
+    pub attempts: usize,
+    /// Time since the first attempt started.
+    pub elapsed: std::time::Duration,
+    /// Why the attempt failed.
+    pub error: &'a E,
+}
+
+/// [`connect_tcp_channel_with_retry`] that also hands `on_retry` each failed
+/// attempt it is about to redial, so a caller with a long retry budget can
+/// report progress while it waits. The final failure is returned, not
+/// reported.
+pub async fn connect_tcp_channel_with_retry_observed(
+    service_name: &'static str,
+    target: impl AsRef<str>,
+    endpoint: tonic::transport::Endpoint,
+    tls_handshake_timeout: Option<std::time::Duration>,
+    retry_policy: GrpcRetryPolicy,
+    on_retry: impl FnMut(&TcpConnectRetry<'_>),
+) -> Result<tonic::transport::Channel, TcpConnectError> {
     check_tcp_endpoint(&endpoint, tls_handshake_timeout)?;
     let dial_timeout = endpoint
         .get_connect_timeout()
         .unwrap_or(DEFAULT_TCP_DIAL_TIMEOUT);
     let endpoint = endpoint.connect_timeout(dial_timeout);
     let attempt_cap = tcp_attempt_cap(dial_timeout, tls_handshake_timeout);
-    retry_tcp_connect(
+    retry_tcp_connect_observed(
         service_name,
         target.as_ref(),
         retry_policy,
@@ -388,6 +422,7 @@ pub async fn connect_tcp_channel_with_retry(
                     .map_err(TcpConnectError::from)
             }
         },
+        on_retry,
     )
     .await
 }
@@ -448,7 +483,33 @@ async fn retry_tcp_connect<T, E, F, Fut>(
     target: &str,
     retry_policy: GrpcRetryPolicy,
     attempt_cap: std::time::Duration,
+    attempt: F,
+) -> Result<T, E>
+where
+    E: std::fmt::Display + From<TcpConnectError>,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    retry_tcp_connect_observed(
+        service_name,
+        target,
+        retry_policy,
+        attempt_cap,
+        attempt,
+        |_| {},
+    )
+    .await
+}
+
+/// [`retry_tcp_connect`] that hands `on_retry` each failed attempt before its
+/// redial.
+pub(crate) async fn retry_tcp_connect_observed<T, E, F, Fut>(
+    service_name: &'static str,
+    target: &str,
+    retry_policy: GrpcRetryPolicy,
+    attempt_cap: std::time::Duration,
     mut attempt: F,
+    mut on_retry: impl FnMut(&TcpConnectRetry<'_, E>),
 ) -> Result<T, E>
 where
     E: std::fmt::Display + From<TcpConnectError>,
@@ -491,6 +552,11 @@ where
             log_tcp_connect_exhausted(service_name, target, started_at, retry_index + 1, &error);
             return Err(error);
         };
+        on_retry(&TcpConnectRetry {
+            attempts: retry_index + 1,
+            elapsed,
+            error: &error,
+        });
         retry_index += 1;
         pplx_space_metrics::grpc::client_retry(service_name, "Connect", "connect", "connect_error");
         pplx_space_observability::with_peer_service!(tracing::debug!(

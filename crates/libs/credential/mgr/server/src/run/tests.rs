@@ -395,3 +395,568 @@ fn volume_socket_requires_a_distinct_uds_listener() {
 
 #[cfg(target_os = "linux")]
 mod volume_socket;
+
+/// The longest backoff the standard connect policy waits between attempts,
+/// which the agent's longer wait keeps.
+fn longest_standard_backoff() -> Duration {
+    let standard = pplx_space_common_grpc::DEFAULT_GRPC_CONNECT_RETRY_POLICY;
+    standard.max_delay.mul_f64(1.0 + standard.jitter_factor)
+}
+
+/// The attempt cap the stand-in authority's attempts run under.
+const STAND_IN_ATTEMPT_CAP: Duration = Duration::from_millis(9500);
+
+/// What a stand-in authority's dial does before the authority is reachable.
+#[derive(Clone, Copy)]
+enum Unreachable {
+    /// Fails at once, like a refused dial.
+    Refuses,
+    /// Never finishes, like a SYN no one answers, until the attempt cap.
+    Stalls,
+}
+
+/// A stand-in for the agent's upstream authority whose attempts run through
+/// the real connect retry loop, under the agent's policy, so the timing of
+/// the wait does not depend on when the kernel completes a dial. Attempts
+/// started from `reachable_after` on succeed at once.
+struct StandInAuthority {
+    started: tokio::time::Instant,
+    reachable_after: Option<Duration>,
+    unreachable: Unreachable,
+    attempts: std::sync::Mutex<Vec<Duration>>,
+}
+
+impl StandInAuthority {
+    fn new(reachable_after: Option<Duration>, unreachable: Unreachable) -> Self {
+        Self {
+            started: tokio::time::Instant::now(),
+            reachable_after,
+            unreachable,
+            attempts: std::sync::Mutex::default(),
+        }
+    }
+
+    /// When each attempt started, since the stand-in was created.
+    fn attempt_starts(&self) -> Vec<Duration> {
+        self.attempts.lock().unwrap().clone()
+    }
+}
+
+impl AgentUpstream for StandInAuthority {
+    type Client = Duration;
+
+    /// Connects to "when the attempt that connected started".
+    async fn connect(
+        &self,
+        retry_policy: pplx_space_common_grpc::GrpcRetryPolicy,
+        on_retry: impl FnMut(&pplx_space_common_grpc::TcpConnectRetry<'_>),
+    ) -> Result<Duration, pplx_space_credmgr_client::ConnectError> {
+        pplx_space_common_grpc::test_support::retry_tcp_connect(
+            "stand-in-authority",
+            "stand-in:9810",
+            retry_policy,
+            STAND_IN_ATTEMPT_CAP,
+            || {
+                let started = self.started.elapsed();
+                self.attempts.lock().unwrap().push(started);
+                let reachable = self.reachable_after.is_some_and(|after| started >= after);
+                let unreachable = self.unreachable;
+                async move {
+                    if reachable {
+                        return Ok(started);
+                    }
+                    if let Unreachable::Stalls = unreachable {
+                        std::future::pending::<()>().await;
+                    }
+                    Err(pplx_space_common_grpc::TcpConnectError::AttemptTimeout {
+                        service_name: "stand-in-authority",
+                        target: "stand-in:9810".to_owned(),
+                        cap: Duration::ZERO,
+                    })
+                }
+            },
+            on_retry,
+        )
+        .await
+        .map_err(pplx_space_credmgr_client::ConnectError::from)
+    }
+}
+
+/// Every gap between two consecutive attempt starts, for attempts that
+/// fail at once.
+fn attempt_gaps(starts: &[Duration]) -> Vec<Duration> {
+    starts.windows(2).map(|pair| pair[1] - pair[0]).collect()
+}
+
+// An authority that comes up well past the standard connect budget is still
+// connected, by the first attempt after it comes up, and the agent redials
+// at the standard policy's pace throughout, so it connects within one
+// standard backoff of the authority becoming reachable.
+#[tokio::test(start_paused = true)]
+async fn agent_connects_to_an_authority_that_comes_up_late() {
+    let reachable_after = Duration::from_secs(30);
+    let authority = StandInAuthority::new(Some(reachable_after), Unreachable::Refuses);
+
+    let connected = connect_agent_upstream(&authority, &CancellationToken::new(), |_| {})
+        .await
+        .expect("the agent must keep waiting for the authority")
+        .expect("no shutdown was requested");
+
+    assert!(
+        connected >= reachable_after && connected - reachable_after <= longest_standard_backoff(),
+        "connected by the attempt started at {connected:?}"
+    );
+    let gaps = attempt_gaps(&authority.attempt_starts());
+    assert!(
+        gaps.iter().all(|gap| *gap <= longest_standard_backoff()),
+        "{gaps:?}"
+    );
+}
+
+// A dial already in flight when the authority comes up has to run into its
+// bound before the redial connects, so the agent connects within one attempt
+// cap and one backoff of the authority becoming reachable.
+#[tokio::test(start_paused = true)]
+async fn agent_connects_one_attempt_cap_after_a_dial_in_flight() {
+    let reachable_after = Duration::from_secs(30);
+    let authority = StandInAuthority::new(Some(reachable_after), Unreachable::Stalls);
+
+    let connected = connect_agent_upstream(&authority, &CancellationToken::new(), |_| {})
+        .await
+        .expect("the agent must keep waiting for the authority")
+        .expect("no shutdown was requested");
+
+    assert!(
+        connected >= reachable_after
+            && connected - reachable_after <= STAND_IN_ATTEMPT_CAP + longest_standard_backoff(),
+        "connected by the attempt started at {connected:?}"
+    );
+}
+
+// An authority that never comes up ends the agent's startup with a typed error
+// that names the window. With attempts that fail at once, the last one starts
+// inside the window's last backoff and the call ends with it.
+#[tokio::test(start_paused = true)]
+async fn agent_gives_up_on_an_unreachable_authority_after_the_window() {
+    let authority = StandInAuthority::new(None, Unreachable::Refuses);
+
+    let started = tokio::time::Instant::now();
+    let error = connect_agent_upstream(&authority, &CancellationToken::new(), |_| {})
+        .await
+        .expect_err("an authority that never comes up must not connect");
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(
+            error,
+            RunCredmgrError::AgentUpstreamConnect { window, .. }
+                if window == AGENT_UPSTREAM_CONNECT_WINDOW
+        ),
+        "{error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("{AGENT_UPSTREAM_CONNECT_WINDOW:?}")),
+        "{error}"
+    );
+    assert!(
+        elapsed > AGENT_UPSTREAM_CONNECT_WINDOW - longest_standard_backoff()
+            && elapsed <= AGENT_UPSTREAM_CONNECT_WINDOW,
+        "gave up after {elapsed:?}"
+    );
+    let gaps = attempt_gaps(&authority.attempt_starts());
+    assert!(
+        gaps.iter().all(|gap| *gap <= longest_standard_backoff()),
+        "{gaps:?}"
+    );
+}
+
+// The window bounds when the last attempt starts, not when it ends: an
+// attempt that stalls runs to its cap, so the call ends within the window
+// plus one attempt cap.
+#[tokio::test(start_paused = true)]
+async fn the_last_attempt_starts_within_the_window_and_may_run_to_its_cap() {
+    let authority = StandInAuthority::new(None, Unreachable::Stalls);
+
+    let started = tokio::time::Instant::now();
+    let error = connect_agent_upstream(&authority, &CancellationToken::new(), |_| {})
+        .await
+        .expect_err("an authority that never comes up must not connect");
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(error, RunCredmgrError::AgentUpstreamConnect { .. }),
+        "{error:?}"
+    );
+    let last_start = *authority.attempt_starts().last().unwrap();
+    assert!(last_start < AGENT_UPSTREAM_CONNECT_WINDOW, "{last_start:?}");
+    assert_eq!(elapsed, last_start + STAND_IN_ATTEMPT_CAP);
+}
+
+// A connection that cannot be set up fails before any attempt is redialed
+// and is reported as such, not as attempts that failed within the window.
+#[tokio::test]
+async fn an_unreadable_ca_is_a_setup_error_not_a_window_of_attempts() {
+    let dir = tempdir().unwrap();
+    let endpoint = crate::CredmgrEndpoint::Tls {
+        uri: "https://127.0.0.1:9".parse().unwrap(),
+        files: pplx_space_credmgr_client::TlsFiles::new(dir.path().join("missing-ca.pem")),
+    };
+
+    let error = connect_agent_upstream(&endpoint, &CancellationToken::new(), |_| {})
+        .await
+        .map(|_| ())
+        .expect_err("an unreadable CA must fail");
+
+    assert!(
+        matches!(
+            error,
+            RunCredmgrError::AgentUpstreamSetup(
+                pplx_space_credmgr_client::ConnectError::TlsRead { .. }
+            )
+        ),
+        "{error:?}"
+    );
+}
+
+// Shutdown ends the wait at once and cleanly: an agent that has not connected
+// holds nothing to drain.
+#[tokio::test(start_paused = true)]
+async fn shutdown_ends_the_agents_wait_for_its_authority() {
+    let authority = StandInAuthority::new(None, Unreachable::Refuses);
+    let shutdown_token = CancellationToken::new();
+    let requested_after = Duration::from_secs(30);
+    let cancel = shutdown_token.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(requested_after).await;
+        cancel.cancel();
+    });
+
+    let started = tokio::time::Instant::now();
+    let connected = connect_agent_upstream(&authority, &shutdown_token, |_| {})
+        .await
+        .expect("shutdown is not a connect failure");
+
+    assert!(connected.is_none());
+    assert_eq!(started.elapsed(), requested_after);
+}
+
+// The wait is reported once per interval with the attempts made so far,
+// however often attempts fail: here about once a second for the whole window.
+#[tokio::test(start_paused = true)]
+async fn still_waiting_reports_are_spaced_by_the_interval() {
+    let authority = StandInAuthority::new(None, Unreachable::Refuses);
+    let mut reports = Vec::new();
+
+    let _ = connect_agent_upstream(&authority, &CancellationToken::new(), |waiting| {
+        reports.push((waiting.elapsed, waiting.attempts, waiting.cause.clone()));
+    })
+    .await;
+
+    let attempts = authority.attempt_starts().len();
+    assert!(reports.len() > 1, "{reports:?}");
+    assert!(
+        reports.len() as u32
+            <= AGENT_UPSTREAM_CONNECT_WINDOW.as_secs() as u32
+                / AGENT_UPSTREAM_WAIT_WARNING_INTERVAL.as_secs() as u32,
+        "{reports:?}"
+    );
+    assert!(
+        reports[0].0 >= AGENT_UPSTREAM_WAIT_WARNING_INTERVAL,
+        "{reports:?}"
+    );
+    assert!(
+        reports.windows(2).all(|pair| pair[1].0 - pair[0].0
+            >= AGENT_UPSTREAM_WAIT_WARNING_INTERVAL
+            && pair[1].1 > pair[0].1),
+        "{reports:?}"
+    );
+    assert!(
+        reports
+            .iter()
+            .all(|(_, made, cause)| *made < attempts && cause.contains("stand-in:9810")),
+        "{reports:?}"
+    );
+}
+
+/// A port this test owns that refuses connections: bound, so nothing else can
+/// take it, but not listening until the caller calls `listen`.
+fn refusing_authority() -> (tokio::net::TcpSocket, crate::CredmgrEndpoint) {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let address = socket.local_addr().unwrap();
+    let endpoint = crate::CredmgrEndpoint::Tcp(format!("http://{address}").parse().unwrap());
+    (socket, endpoint)
+}
+
+// Through a real endpoint and real dials: an authority that starts listening
+// after the standard connect budget is connected, and the wait is reported
+// with the cause a refused dial's transport error wraps, each layer's message
+// once. A listening socket completes the TCP and HTTP/2 client handshakes
+// from its accept queue, so it needs no server. How soon the dial completes
+// is the kernel's, so nothing here bounds it.
+#[cfg(target_os = "linux")]
+#[tokio::test(start_paused = true)]
+async fn agent_connects_to_a_real_authority_that_comes_up_late() {
+    let (socket, endpoint) = refusing_authority();
+    let reports = std::sync::Mutex::new(Vec::new());
+    let shutdown_token = CancellationToken::new();
+    let connecting = connect_agent_upstream(&endpoint, &shutdown_token, |waiting| {
+        reports.lock().unwrap().push(waiting.cause.clone());
+    });
+    let listening = async {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        socket.listen(16).unwrap()
+    };
+
+    let (connected, _listener) = tokio::join!(connecting, listening);
+    connected
+        .expect("the agent must connect once the authority listens")
+        .expect("no shutdown was requested");
+
+    let refused =
+        std::io::Error::from_raw_os_error(nix::errno::Errno::ECONNREFUSED as i32).to_string();
+    let reports = reports.into_inner().unwrap();
+    assert!(!reports.is_empty(), "the wait outlasted a report interval");
+    for cause in &reports {
+        let layers: Vec<&str> = cause.split(": ").collect();
+        assert!(cause.ends_with(&refused), "{cause}");
+        assert!(layers.len() > 1, "{cause}");
+        assert!(layers.windows(2).all(|pair| pair[0] != pair[1]), "{cause}");
+    }
+}
+
+use tonic_health::pb::health_check_response::ServingStatus;
+
+/// An authority the test lets answer when it chooses.
+#[derive(Default)]
+struct GatedAuthority {
+    open: tokio::sync::Notify,
+    fails: bool,
+}
+
+impl AgentUpstream for GatedAuthority {
+    type Client = ();
+
+    async fn connect(
+        &self,
+        _retry_policy: pplx_space_common_grpc::GrpcRetryPolicy,
+        _on_retry: impl FnMut(&pplx_space_common_grpc::TcpConnectRetry<'_>),
+    ) -> Result<(), pplx_space_credmgr_client::ConnectError> {
+        if self.fails {
+            return Err(pplx_space_credmgr_client::ConnectError::Config(
+                pplx_space_credmgr_client::EndpointConfigError::EmptyUdsPath,
+            ));
+        }
+        self.open.notified().await;
+        Ok(())
+    }
+}
+
+async fn local_health(socket: &Path, service: &str) -> Result<ServingStatus, String> {
+    let channel = pplx_space_common_grpc::connect_uds_channel("credmgr-health-test", socket)
+        .await
+        .map_err(|error| error.to_string())?;
+    let response = tonic_health::pb::health_client::HealthClient::new(channel)
+        .check(tonic_health::pb::HealthCheckRequest {
+            service: service.to_owned(),
+        })
+        .await
+        .map_err(|status| status.to_string())?;
+    Ok(ServingStatus::try_from(response.into_inner().status).unwrap())
+}
+
+async fn wait_for_path(path: &Path) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while !path.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{} was never bound",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+// While the agent waits for its authority, liveness answers and readiness is
+// withheld, so a liveness probe does not end the wait and the pod is not
+// Ready before it can serve. Readiness passes, as passive readiness, only
+// after the authority answers. A predecessor holding the service mutex keeps
+// the agent passive.
+#[tokio::test]
+async fn agent_withholds_readiness_but_answers_liveness_while_it_waits() {
+    let dir = tempdir().unwrap();
+    let mutex_path = dir.path().join("service.mutex");
+    let health = dir.path().join("health.sock");
+    let predecessor = ServiceMutex::acquire(
+        &mutex_path,
+        CancellationToken::new(),
+        Duration::from_millis(10),
+        None,
+    )
+    .await
+    .unwrap();
+    let config = CredmgrRunConfig {
+        role: CredmgrRole::Agent,
+        health_socket_path: Some(health.clone()),
+        ..node_local_config()
+    };
+    let authority = Arc::new(GatedAuthority::default());
+    let shutdown_token = CancellationToken::new();
+    let starting = tokio::spawn({
+        let authority = Arc::clone(&authority);
+        let shutdown_token = shutdown_token.clone();
+        async move {
+            start_agent(&config, &shutdown_token, &mutex_path, &*authority, |_| {})
+                .await
+                .map(|started| started.is_some())
+        }
+    });
+
+    wait_for_path(&health).await;
+    assert_eq!(
+        local_health(&health, "liveness").await,
+        Ok(ServingStatus::Serving)
+    );
+    assert_eq!(
+        local_health(&health, "readiness").await,
+        Ok(ServingStatus::NotServing)
+    );
+    assert_eq!(
+        local_health(&health, "").await,
+        Ok(ServingStatus::NotServing)
+    );
+
+    authority.open.notify_one();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while local_health(&health, "readiness").await != Ok(ServingStatus::Serving) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "readiness never passed after the authority answered"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    shutdown_token.cancel();
+    drop(predecessor);
+    let activated = tokio::time::timeout(Duration::from_secs(2), starting)
+        .await
+        .expect("a passive agent must observe shutdown")
+        .unwrap()
+        .expect("a passive agent exits cleanly");
+    assert!(!activated, "shutdown while passive does not activate");
+}
+
+// An agent that gives up stops answering on its health socket before it
+// returns, so nothing reports it alive once its startup has failed.
+#[tokio::test]
+async fn an_agent_that_gives_up_stops_its_health_server() {
+    let dir = tempdir().unwrap();
+    let health = dir.path().join("health.sock");
+    let config = CredmgrRunConfig {
+        role: CredmgrRole::Agent,
+        health_socket_path: Some(health.clone()),
+        ..node_local_config()
+    };
+    let authority = GatedAuthority {
+        fails: true,
+        ..GatedAuthority::default()
+    };
+    let shutdown_token = CancellationToken::new();
+
+    let result = start_agent(
+        &config,
+        &shutdown_token,
+        &dir.path().join("service.mutex"),
+        &authority,
+        |_| {},
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(RunCredmgrError::AgentUpstreamSetup(_))),
+        "{:?}",
+        result.map(|started| started.is_some())
+    );
+    assert!(
+        local_health(&health, "liveness").await.is_err(),
+        "the health server must stop with a failed startup"
+    );
+    assert!(!shutdown_token.is_cancelled());
+}
+
+// A startup abandoned while the agent waits, its task aborted while the
+// runtime keeps running, takes its health server with it, rather than
+// leaving liveness answering for an agent that is gone.
+#[tokio::test]
+async fn dropping_a_waiting_agent_stops_its_health_server() {
+    let dir = tempdir().unwrap();
+    let health = dir.path().join("health.sock");
+    let mutex_path = dir.path().join("service.mutex");
+    let config = CredmgrRunConfig {
+        role: CredmgrRole::Agent,
+        health_socket_path: Some(health.clone()),
+        ..node_local_config()
+    };
+    let starting = tokio::spawn(async move {
+        let authority = GatedAuthority::default();
+        let _ = start_agent(
+            &config,
+            &CancellationToken::new(),
+            &mutex_path,
+            &authority,
+            |_| {},
+        )
+        .await;
+    });
+    wait_for_path(&health).await;
+    assert_eq!(
+        local_health(&health, "liveness").await,
+        Ok(ServingStatus::Serving)
+    );
+
+    starting.abort();
+    assert!(starting.await.unwrap_err().is_cancelled());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while local_health(&health, "liveness").await.is_ok() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the health server outlived its dropped startup"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+// Activation takes the early health server over: it keeps answering after
+// the startup future that bound it has returned.
+#[tokio::test]
+async fn an_activated_agent_keeps_its_health_server() {
+    let dir = tempdir().unwrap();
+    let health = dir.path().join("health.sock");
+    let config = CredmgrRunConfig {
+        role: CredmgrRole::Agent,
+        health_socket_path: Some(health.clone()),
+        ..node_local_config()
+    };
+    let authority = GatedAuthority::default();
+    authority.open.notify_one();
+
+    let (_, node_local) = start_agent(
+        &config,
+        &CancellationToken::new(),
+        &dir.path().join("service.mutex"),
+        &authority,
+        |_| {},
+    )
+    .await
+    .expect("the agent starts")
+    .expect("nothing holds the service mutex");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        local_health(&health, "liveness").await,
+        Ok(ServingStatus::Serving)
+    );
+    drop(node_local);
+}

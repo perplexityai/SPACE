@@ -20,7 +20,7 @@ log() { echo "[install-observability] $*"; }
 # (ci/mirrored-images.txt) comes from its source. Never fails the install: an
 # image neither gives is left to the kubelet's own pull of the tag, as before.
 load_pinned_images() {
-  local cluster="${SPACE_KIND_CLUSTER:-space-local}" pinned name tag digest source node
+  local cluster="${SPACE_KIND_CLUSTER:-space-local}" pinned name tag listed digest source node
   local -A digests=() missing=()
   local nodes=()
   # repo:tag@sha256:<index>, exactly as the charts' values pin them.
@@ -32,11 +32,11 @@ load_pinned_images() {
   fi
   for name in "${pinned[@]}"; do
     tag="${name%%@*}"
-    digest="$(awk -v name="$name" '$1 == name { print $2; exit }' "$repo_root/ci/mirrored-images.txt")"
-    if [[ -z "$digest" ]]; then
+    if ! listed="$(bash "$repo_root/ci/scripts/mirror-images.sh" pinned "$name")"; then
       echo "::warning::$name is not listed in ci/mirrored-images.txt; the kubelet pulls $tag itself"
       continue
     fi
+    digest="${listed##*@}"
     if [[ -z "${SPACE_CI_IMAGE_MIRROR:-}" ]]; then
       source="${tag%:*}@$digest"
       if docker image inspect "$source" >/dev/null 2>&1 || docker pull --quiet "$source" >/dev/null; then

@@ -5,3 +5,8 @@ body {
 code, kbd, pre, samp {
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
 }
+
+/* Dark primary interaction fills need light text to maintain contrast. */
+.curiosity-dark-primary.ant-btn-color-primary.ant-btn-variant-solid:not(:disabled):not(.ant-btn-disabled):is(:hover, :active) {
+  color: #fff;
+}

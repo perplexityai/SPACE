@@ -74,7 +74,7 @@ pub(super) fn btrfs_du_exclusive(
     budget: Duration,
 ) -> Result<Option<BtrfsDiskUsage>, String> {
     let output = crate::host_command::output(
-        std::process::Command::new("btrfs").args(["filesystem", "du", "-s", "--raw", path]),
+        crate::host_command::Command::new("btrfs").args(["filesystem", "du", "-s", "--raw", path]),
         budget.min(DISK_MEASUREMENT_BUDGET),
         &[],
     )

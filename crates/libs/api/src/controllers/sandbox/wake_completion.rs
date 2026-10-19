@@ -31,7 +31,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use futures_util::future::BoxFuture;
-use pplx_space_common_core::types::{SandboxId, SandboxLifecycle};
+use pplx_space_common_core::types::{SandboxId, SandboxLifecycle, SubstrateKind};
 use pplx_space_common_svc::sql::sandbox_routability::routable_execution_or_non_k8s;
 use pplx_space_events::{
     SandboxEvent, SandboxEventDetails, SandboxEventSource, SandboxEventTrigger, SandboxEventType,
@@ -221,7 +221,8 @@ impl Drop for WakeCompletionGuard {
 /// only a row still in `restoring`, and only when a routable execution (or a
 /// non-k8s substrate) backs the wake target at flip time. The shared
 /// routability predicate is the same fragment the transient-lifecycle
-/// sweeper's converge CAS and the node published-state convergence use.
+/// sweeper's converge CAS and the node published-state convergence use; `$2`
+/// binds `SubstrateKind::Kubernetes` for it.
 /// The restore-lease guard makes the redrive honor the same ownership
 /// invariant as the sweeper's converge CAS and `begin_restore_lifecycle`:
 /// an unexpired lease means a restore attempt — most likely a client retry
@@ -230,7 +231,7 @@ impl Drop for WakeCompletionGuard {
 /// blocks the CAS until it expires (the lease TTL is the node-RPC timeout),
 /// which is why [`redrive_budget`] must exceed that TTL.
 fn fenced_completion_cas() -> String {
-    let routable = routable_execution_or_non_k8s("sandboxes");
+    let routable = routable_execution_or_non_k8s("sandboxes", "$2");
     format!(
         "UPDATE sandboxes
             SET lifecycle = 'started', placement = 'on_node'
@@ -479,6 +480,7 @@ where
                 Ok(true) => {
                     match sqlx::query(sqlx::AssertSqlSafe(sql!(fenced_completion_cas())))
                         .bind(sandbox_id)
+                        .bind(SubstrateKind::Kubernetes)
                         .execute(pool)
                         .await
                     {

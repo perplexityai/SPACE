@@ -40,15 +40,7 @@ pplx-space-common-svc = { workspace = true }
 pplx-space-credmgr-client = { workspace = true }
 pplx-space-volmgr = { workspace = true }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = { workspace = true }
-serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
-
 [dev-dependencies]
 tokio-stream = { workspace = true, features = ["net"] }
 tower = { workspace = true }
 uuid = { workspace = true }
-
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-rusqlite = { workspace = true }

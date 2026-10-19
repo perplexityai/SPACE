@@ -636,6 +636,7 @@ pub(super) mod service_tests {
             pool: NetworkPool::open_in_memory_for_test(NetworkPoolConfig::new(1)),
             peer_authorizer: node_peer_authorizer(),
             sandbox_cgroup_config: SandboxCgroupConfig::default(),
+            disk_io_ceiling: Default::default(),
             memory_admission_config: MemoryAdmissionConfig::default(),
             memory_admission_sources: MemoryAdmissionSources::new(
                 vacant.join("meminfo"),
@@ -657,7 +658,6 @@ pub(super) mod service_tests {
             sandbox_artifact_locks: Default::default(),
             send_source_locks: Default::default(),
             send_source_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
-            send_parent_seal: super::btrfs_send_source::ParentSeal::Stamped,
             artifact_work: None,
             device_op_tasks: tokio_util::task::TaskTracker::new(),
             blocking_probe_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(

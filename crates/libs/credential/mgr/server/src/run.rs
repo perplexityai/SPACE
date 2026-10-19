@@ -243,8 +243,21 @@ pub enum RunCredmgrError {
     AgentUpstreamEndpoint(#[source] pplx_space_credmgr_client::EndpointConfigError),
     #[error(transparent)]
     AgentUpstream(#[from] crate::node_service::AgentUpstreamError),
-    #[error("node credential agent could not connect to the upstream authority: {0}")]
-    AgentUpstreamConnect(#[source] pplx_space_credmgr_client::ConnectError),
+    /// Every connect attempt the agent started within its window failed.
+    #[error(
+        "node credential agent could not connect to the upstream authority: \
+         every attempt it started within {window:?} failed; the last: {source}"
+    )]
+    AgentUpstreamConnect {
+        window: Duration,
+        #[source]
+        source: pplx_space_credmgr_client::ConnectError,
+    },
+    /// The upstream connection could not be set up, so no attempt was retried:
+    /// the CA could not be read, the TLS configuration or the endpoint was
+    /// refused.
+    #[error("node credential agent could not set up its upstream connection: {0}")]
+    AgentUpstreamSetup(#[source] pplx_space_credmgr_client::ConnectError),
     #[error("could not generate this node's intermediate CA keypair: {0}")]
     NodeCaKeypair(#[source] rcgen::Error),
     /// A gRPC server returned before shutdown was requested.
@@ -897,10 +910,28 @@ where
     F: Future<Output = Result<T, RunCredmgrError>>,
 {
     let initialized = initialize.await?;
+    let Some(node_local) =
+        activate_node_local(config, shutdown_token, service_mutex_path, None).await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((initialized, node_local)))
+}
+
+/// Check the volume socket can be provisioned, publish passive readiness and
+/// wait for the service mutex. `waiting_health` is a health server already
+/// bound with readiness withheld; without one, the health socket is bound
+/// here.
+async fn activate_node_local(
+    config: &CredmgrRunConfig,
+    shutdown_token: &CancellationToken,
+    service_mutex_path: &Path,
+    waiting_health: Option<LocalHealthServer>,
+) -> Result<Option<NodeLocalActivation>, RunCredmgrError> {
     if let Some(path) = config.volume_socket_path.clone() {
         let standard_socket = config.socket_path.clone();
-        // Passive readiness lets the rollout retire the predecessor, so even
-        // publishing health must wait until the new listener can be provisioned.
+        // Passive readiness lets the rollout retire the predecessor, so it is
+        // published only once the new listener can be provisioned.
         tokio::task::spawn_blocking(move || {
             volume_socket::preflight(&path, &standard_socket)
                 .map_err(|source| RunCredmgrError::VolumeSocketPreflight { path, source })
@@ -908,25 +939,28 @@ where
         .await
         .map_err(RunCredmgrError::VolumeSocketPreflightTask)??;
     }
-    let Some(node_local) = prepare_node_local(config, shutdown_token, service_mutex_path).await?
-    else {
-        return Ok(None);
-    };
-    Ok(Some((initialized, node_local)))
+    prepare_node_local(config, shutdown_token, service_mutex_path, waiting_health).await
 }
 
 async fn prepare_node_local(
     config: &CredmgrRunConfig,
     shutdown_token: &CancellationToken,
     service_mutex_path: &Path,
+    waiting_health: Option<LocalHealthServer>,
 ) -> Result<Option<NodeLocalActivation>, RunCredmgrError> {
-    let health_server = LocalHealthServer::spawn_optional(
-        config.health_socket_path.as_deref(),
-        pplx_space_common_svc::UnixSocketOptions::new(0o660),
-        SERVICE_NAME,
-        shutdown_token.clone(),
-    )
-    .map_err(RunCredmgrError::HealthSocket)?;
+    let health_server = match waiting_health {
+        Some(health_server) => {
+            health_server.mark_takeover_ready();
+            health_server
+        }
+        None => LocalHealthServer::spawn_optional(
+            config.health_socket_path.as_deref(),
+            pplx_space_common_svc::UnixSocketOptions::new(0o660),
+            SERVICE_NAME,
+            shutdown_token.clone(),
+        )
+        .map_err(RunCredmgrError::HealthSocket)?,
+    };
     let health_socket = config
         .health_socket_path
         .as_ref()
@@ -1202,6 +1236,207 @@ fn server_join_result(
     }
 }
 
+/// How long the node credential agent keeps starting connect attempts to its
+/// upstream authority at startup before it exits. Agents can start well before
+/// the authority's Service exists on a cluster bring-up, and exiting at the
+/// standard connect budget only trades the wait for kubelet's restart backoff.
+/// The window bounds when the last attempt starts; that attempt may run for
+/// one attempt cap more, 9.5s for TLS (3s name resolution allowance, 3s dial,
+/// 3s handshake, 0.5s margin). Liveness answers throughout the wait while
+/// readiness is withheld.
+const AGENT_UPSTREAM_CONNECT_WINDOW: Duration = Duration::from_secs(60);
+
+/// The standard connect policy, with its per-attempt bounds and its backoff
+/// capped near a second, the window rather than a retry count ending it. A
+/// failed attempt is redialed within about a second, so the agent connects
+/// about a second after the authority becomes reachable, or up to one attempt
+/// cap later when a dial already in flight has to run into its bound first.
+const AGENT_UPSTREAM_CONNECT_POLICY: pplx_space_common_grpc::GrpcRetryPolicy =
+    pplx_space_common_grpc::GrpcRetryPolicy {
+        max_retries: usize::MAX,
+        max_elapsed: AGENT_UPSTREAM_CONNECT_WINDOW,
+        ..pplx_space_common_grpc::DEFAULT_GRPC_CONNECT_RETRY_POLICY
+    };
+
+/// How often the agent reports that it is still waiting for the authority.
+const AGENT_UPSTREAM_WAIT_WARNING_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How the node credential agent reaches its upstream authority: the
+/// configured endpoint, or a stand-in authority in tests.
+trait AgentUpstream {
+    type Client;
+
+    /// Connect with `retry_policy`, handing `on_retry` each failed attempt
+    /// that is about to be redialed.
+    async fn connect(
+        &self,
+        retry_policy: pplx_space_common_grpc::GrpcRetryPolicy,
+        on_retry: impl FnMut(&pplx_space_common_grpc::TcpConnectRetry<'_>),
+    ) -> Result<Self::Client, pplx_space_credmgr_client::ConnectError>;
+}
+
+impl AgentUpstream for crate::CredmgrEndpoint {
+    type Client = pplx_space_credmgr_client::CredentialManagerGrpcClient;
+
+    async fn connect(
+        &self,
+        retry_policy: pplx_space_common_grpc::GrpcRetryPolicy,
+        on_retry: impl FnMut(&pplx_space_common_grpc::TcpConnectRetry<'_>),
+    ) -> Result<Self::Client, pplx_space_credmgr_client::ConnectError> {
+        self.connect_with_retry(retry_policy, on_retry).await
+    }
+}
+
+/// A report that the agent is still waiting for its upstream authority.
+#[derive(Debug)]
+struct StillWaiting {
+    elapsed: Duration,
+    attempts: usize,
+    /// The latest failure with its sources.
+    cause: String,
+}
+
+fn warn_still_waiting(waiting: &StillWaiting) {
+    tracing::warn!(
+        elapsed_ms = waiting.elapsed.as_millis(),
+        attempts = waiting.attempts,
+        window = ?AGENT_UPSTREAM_CONNECT_WINDOW,
+        error = %waiting.cause,
+        "upstream credential authority not reachable yet; still retrying"
+    );
+}
+
+/// Follows the agent's failed attempts: hands `report` one [`StillWaiting`]
+/// per [`AGENT_UPSTREAM_WAIT_WARNING_INTERVAL`] of the wait and counts the
+/// attempts that were redialed.
+struct UpstreamWait<R> {
+    next_report: Duration,
+    redialed: usize,
+    report: R,
+}
+
+impl<R: FnMut(&StillWaiting)> UpstreamWait<R> {
+    fn new(report: R) -> Self {
+        Self {
+            next_report: AGENT_UPSTREAM_WAIT_WARNING_INTERVAL,
+            redialed: 0,
+            report,
+        }
+    }
+
+    fn observe(&mut self, retry: &pplx_space_common_grpc::TcpConnectRetry<'_>) {
+        self.redialed = retry.attempts;
+        if retry.elapsed < self.next_report {
+            return;
+        }
+        self.next_report = retry.elapsed + AGENT_UPSTREAM_WAIT_WARNING_INTERVAL;
+        (self.report)(&StillWaiting {
+            elapsed: retry.elapsed,
+            attempts: retry.attempts,
+            cause: error_chain(retry.error),
+        });
+    }
+}
+
+/// `error` and its sources, outermost first, so a warning names the cause a
+/// transport error wraps. Layers that repeat the message beneath them are
+/// shown once.
+fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut messages: Vec<String> = std::iter::successors(Some(error), |error| error.source())
+        .map(ToString::to_string)
+        .collect();
+    messages.dedup();
+    messages.join(": ")
+}
+
+/// Connect the agent to its upstream authority, starting attempts for up to
+/// [`AGENT_UPSTREAM_CONNECT_WINDOW`] and reporting the wait through `report`.
+/// Returns `None` once shutdown is requested: the wait can outlast the pod's
+/// termination grace period, and an agent that has not connected holds
+/// nothing to drain.
+async fn connect_agent_upstream<U: AgentUpstream>(
+    upstream: &U,
+    shutdown_token: &CancellationToken,
+    report: impl FnMut(&StillWaiting),
+) -> Result<Option<U::Client>, RunCredmgrError> {
+    let mut wait = UpstreamWait::new(report);
+    let outcome = tokio::select! {
+        connected = upstream.connect(AGENT_UPSTREAM_CONNECT_POLICY, |retry| wait.observe(retry)) => {
+            Some(connected)
+        }
+        () = shutdown_token.cancelled() => None,
+    };
+    match outcome {
+        Some(Ok(client)) => Ok(Some(client)),
+        // The window is far longer than an attempt cap, so a failed attempt is
+        // always redialed at least once: a failure with none redialed came
+        // from setting the connection up, before any attempt.
+        Some(Err(source)) if wait.redialed == 0 => Err(RunCredmgrError::AgentUpstreamSetup(source)),
+        Some(Err(source)) => Err(RunCredmgrError::AgentUpstreamConnect {
+            window: AGENT_UPSTREAM_CONNECT_WINDOW,
+            source,
+        }),
+        None => {
+            tracing::warn!("terminated while waiting for the upstream authority; exiting cleanly");
+            Ok(None)
+        }
+    }
+}
+
+/// Bring the agent up to activation. Its health socket is bound first, with
+/// liveness answering and readiness withheld, so a liveness probe passes while
+/// the agent waits for its authority and the pod is not Ready before it can
+/// serve. Once connected, the agent publishes passive readiness and activates
+/// as every node-local service does. A failed or cancelled wait stops the
+/// health server before returning, and so does dropping the future before
+/// activation.
+async fn start_agent<U: AgentUpstream>(
+    config: &CredmgrRunConfig,
+    shutdown_token: &CancellationToken,
+    service_mutex_path: &Path,
+    upstream: &U,
+    report: impl FnMut(&StillWaiting),
+) -> Result<Option<(U::Client, NodeLocalActivation)>, RunCredmgrError> {
+    let health_shutdown = shutdown_token.child_token();
+    let health_server = LocalHealthServer::spawn_optional_waiting(
+        config.health_socket_path.as_deref(),
+        pplx_space_common_svc::UnixSocketOptions::new(0o660),
+        SERVICE_NAME,
+        health_shutdown.clone(),
+    )
+    .map_err(RunCredmgrError::HealthSocket)?;
+    // Until activation takes the health server over, dropping this future
+    // (an aborted task, an elapsed timeout) must stop it too; nothing else
+    // would, and it would keep answering liveness for an agent that is gone.
+    let health_guard = health_shutdown.clone().drop_guard();
+    let client = match connect_agent_upstream(upstream, shutdown_token, report).await {
+        Ok(Some(client)) => client,
+        stopped => {
+            health_shutdown.cancel();
+            health_server.join().await;
+            return stopped.map(|_| None);
+        }
+    };
+    match activate_node_local(
+        config,
+        shutdown_token,
+        service_mutex_path,
+        Some(health_server),
+    )
+    .await
+    {
+        Ok(Some(node_local)) => {
+            health_guard.disarm();
+            Ok(Some((client, node_local)))
+        }
+        Ok(None) => Ok(None),
+        Err(error) => {
+            health_shutdown.cancel();
+            Err(error)
+        }
+    }
+}
+
 /// Run as the node credential agent: bind the node-local Unix socket and
 /// forward every RPC to the upstream authority. Holds no broker credential,
 /// plaintext branching key, or database; those belong to the control-plane
@@ -1224,16 +1459,12 @@ async fn run_agent(
         crate::CredmgrEndpoint::from_env().map_err(RunCredmgrError::AgentUpstreamEndpoint)?;
     crate::node_service::validate_upstream(&endpoint)?;
 
-    let Some((upstream, node_local)) = initialize_node_local(
+    let Some((upstream, node_local)) = start_agent(
         &config,
         &shutdown_token,
         Path::new(SERVICE_MUTEX_PATH),
-        async move {
-            endpoint
-                .connect()
-                .await
-                .map_err(RunCredmgrError::AgentUpstreamConnect)
-        },
+        &endpoint,
+        warn_still_waiting,
     )
     .await?
     else {

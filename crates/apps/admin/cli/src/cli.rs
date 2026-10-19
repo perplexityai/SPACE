@@ -38,6 +38,12 @@ pub(crate) enum Commands {
         /// incumbent ASG must shrink monotonically. Default behavior
         /// (flag omitted) keeps single-node-drain semantics: the ASG
         /// auto-replaces the terminated instance.
+        ///
+        /// Only honoured on the call that *starts* a drain. A drain's
+        /// replacement intent is fixed for its lifetime, so passing this against
+        /// a node that is already draining is a 409 if it disagrees with what
+        /// that drain was started with — omit it to escalate on the existing
+        /// terms, or `undrain-node` and start a fresh drain to change them.
         #[arg(long)]
         no_replace_after_terminate: bool,
         /// Evacuate resident sandboxes immediately instead of waiting for them
@@ -50,6 +56,34 @@ pub(crate) enum Commands {
         /// resident `started`/`paused` sandbox right away and 409s user calls
         /// against them for the whole drain window — faster, but per-node
         /// disruption is proportional to how many live sandboxes it hosts.
+        ///
+        /// Also escalates a drain already in flight. Re-running this against a
+        /// node that is already draining gently switches it to forced in place:
+        /// the node stays cordoned throughout, and the drain keeps the start
+        /// time it already had. Use this rather than `undrain-node` +
+        /// `drain-node --forced`, which uncordons the node between the two
+        /// calls and lets fresh sandboxes land on it. Downgrading the other way
+        /// (`drain-node` without `--forced`, against a forced drain) is refused
+        /// — abort with `undrain-node` instead.
+        ///
+        /// Escalating also re-enables the stale-transient sweep, which is
+        /// forced-only. Any resident wedged in a non-evacuable transient
+        /// lifecycle (creating, starting, resuming, and similar) past the
+        /// cluster's abandon age is flipped to `failed`, unrecoverably.
+        ///
+        /// There is no grace period. The age is measured from the sandbox's own
+        /// last lifecycle change, not from the escalation, so a resident that
+        /// has been wedged for longer than the abandon age while the node
+        /// drained gently is already past it and is flipped on the **first**
+        /// tick after the write.
+        ///
+        /// Before escalating a drain that has been sitting, read **both**
+        /// `node_drain.sandboxes_remaining{node}` and
+        /// `node_drain.drain_blockers{node}`. Neither one is a superset of what
+        /// the sweep destroys — they differ in both the lifecycles and the
+        /// node-pinning column they count — so two zeros is the only
+        /// reassuring answer, and a non-zero in either is a prompt to look at
+        /// the rows rather than proof something will be lost.
         #[arg(long)]
         forced: bool,
     },

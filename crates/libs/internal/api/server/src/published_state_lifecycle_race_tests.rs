@@ -1,4 +1,5 @@
-//! The `failed` node-report projection racing another writer of the same
+//! The `failed` node-report projection, and the delete of a stopped sandbox
+//! reported `present: false`, racing another writer of the same
 //! control-plane Postgres `public.sandboxes` row. Each case holds the other
 //! writer's row lock, proves the projection waits on it (`pg_blocking_pids`),
 //! commits the write, and asserts the row the projection leaves and the
@@ -13,7 +14,8 @@ use pplx_space_test_env::TestResult;
 use sqlx::types::Json;
 use sqlx::{PgPool, Postgres, Transaction};
 
-use super::project_node_published_failed_sandboxes;
+use super::{project_node_published_failed_sandboxes, publish_sandbox_states};
+use crate::proto::PublishedSandboxState;
 
 /// Bounds both the wait for the projection to block and its completion.
 const RACE_BUDGET: Duration = Duration::from_secs(10);
@@ -191,6 +193,223 @@ async fn failed_projection_decides_on_the_row_committed_while_it_waits() -> Test
         if actual != expected {
             mismatches.push(format!(
                 "{race:?}: (lifecycle, active node, reported moves) {actual:?}, expected {expected:?}"
+            ));
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
+    Ok(())
+}
+
+/// The concurrent writer that commits while the `present: false` delete waits.
+#[derive(Clone, Copy, Debug)]
+enum AbsentStoppedRace {
+    /// A start claimed the row: it is no longer `stopped`.
+    Start,
+    /// The row was released from its node: the stop pin naming its
+    /// already-durable disk is committed.
+    Release,
+    /// The release commits a new catalog row and its pin together, in the
+    /// transaction the delete waits on.
+    ReleaseWithCatalog,
+    /// An unrelated write: the row still qualifies for the delete.
+    Touch,
+}
+
+impl AbsentStoppedRace {
+    async fn write(
+        self,
+        holder: &mut Transaction<'_, Postgres>,
+        sandbox_id: SandboxId,
+    ) -> TestResult {
+        match self {
+            Self::Start => sqlx::query(sql!(
+                "UPDATE sandboxes SET lifecycle = 'starting' WHERE id = $1"
+            )),
+            Self::Release => sqlx::query(sql!(
+                "UPDATE sandboxes s
+                    SET current_local_artifact_id = sn.local_artifact_id,
+                        current_local_artifact_kind = sn.artifact_kind,
+                        current_local_artifact_origin = sn.artifact_origin
+                   FROM snapshots sn
+                  WHERE s.id = $1
+                    AND sn.sandbox_id = s.id"
+            )),
+            Self::ReleaseWithCatalog => sqlx::query(sql!(
+                "WITH snapshot AS (
+                     INSERT INTO snapshots (
+                         id, sandbox_id, type, state, org_id,
+                         local_artifact_id, artifact_kind, artifact_origin
+                     )
+                     VALUES (
+                         gen_random_uuid(), $1, 'disk', 'ready',
+                         '00000000-0000-0000-0000-000000000001',
+                         gen_random_uuid(), 'disk', 'stop'
+                     )
+                     RETURNING id, local_artifact_id
+                 ),
+                 location AS (
+                     INSERT INTO snapshot_storage_locations (
+                         snapshot_id, storage_connection_string, org_id
+                     )
+                     SELECT id, 's3://space-test/' || id, '00000000-0000-0000-0000-000000000001'
+                       FROM snapshot
+                 )
+                 UPDATE sandboxes s
+                    SET current_local_artifact_id = snapshot.local_artifact_id,
+                        current_local_artifact_kind = 'disk',
+                        current_local_artifact_origin = 'stop'
+                   FROM snapshot
+                  WHERE s.id = $1"
+            )),
+            Self::Touch => sqlx::query(sql!(
+                "UPDATE sandboxes SET updated_at = NOW() WHERE id = $1"
+            )),
+        }
+        .bind(sandbox_id)
+        .execute(&mut **holder)
+        .await?;
+        Ok(())
+    }
+}
+
+/// A stopped Direct row with no pin, and one `ready` stop-origin disk snapshot
+/// on a live storage location: the catalog a release commits before its pin.
+async fn insert_stopped_space_sandbox_with_snapshot(
+    pool: &PgPool,
+    node_id: NodeId,
+) -> TestResult<SandboxId> {
+    let sandbox_id = SandboxId::new();
+    sqlx::query(sql!(
+        "INSERT INTO sandboxes (
+             id, user_id, org_id, lifecycle, placement, active_node_id,
+             target_node_id, managed_by, network_policy_generation
+         )
+         VALUES (
+             $1,
+             '00000000-0000-0000-0000-000000000010',
+             '00000000-0000-0000-0000-000000000001',
+             'stopped', 'on_node', $2, $2, 'space', 1
+         )"
+    ))
+    .bind(sandbox_id)
+    .bind(node_id)
+    .execute(pool)
+    .await?;
+    let snapshot_id = uuid::Uuid::now_v7();
+    sqlx::query(sql!(
+        "INSERT INTO snapshots (
+             id, sandbox_id, type, state, org_id,
+             local_artifact_id, artifact_kind, artifact_origin
+         )
+         VALUES (
+             $1, $2, 'disk', 'ready', '00000000-0000-0000-0000-000000000001',
+             $3, 'disk', 'stop'
+         )"
+    ))
+    .bind(snapshot_id)
+    .bind(sandbox_id)
+    .bind(uuid::Uuid::now_v7())
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO snapshot_storage_locations (snapshot_id, storage_connection_string, org_id)
+         VALUES ($1, $2, '00000000-0000-0000-0000-000000000001')"
+    ))
+    .bind(snapshot_id)
+    .bind(format!("s3://space-test/{snapshot_id}"))
+    .execute(pool)
+    .await?;
+    Ok(sandbox_id)
+}
+
+/// Whether the row exists, and how many of its snapshots keep a live location.
+async fn absent_delete_outcome(pool: &PgPool, sandbox_id: SandboxId) -> TestResult<(bool, i64)> {
+    Ok(sqlx::query_as(sql!(
+        "SELECT EXISTS (SELECT 1 FROM sandboxes WHERE id = $1),
+                (SELECT COUNT(*)
+                   FROM snapshot_storage_locations ssl
+                   JOIN snapshots sn ON sn.id = ssl.snapshot_id
+                  WHERE sn.sandbox_id = $1
+                    AND ssl.orphaned_at IS NULL)"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// A `present: false` report for a stopped row reaches it while another writer
+/// holds it. The delete decides on what that writer commits: a row a start
+/// claimed survives with its storage location live, a row whose stop pin was
+/// committed over an already-durable disk is spared the same way, and a row
+/// that is still `stopped` and unpinned is deleted and its location detached.
+/// A pin committed together with its catalog rows isn't spared, but the
+/// delete fails rather than removing it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn absent_stopped_delete_decides_on_the_row_committed_while_it_waits() -> TestResult {
+    let db = pg_test_db_with_max_connections(4).await?;
+    let pool = &db.pool;
+    let node_id = NodeId::new();
+    insert_ready_worker_node(pool, node_id).await?;
+
+    let cases = [
+        (AbsentStoppedRace::Start, (true, true, 1)),
+        (AbsentStoppedRace::Release, (true, true, 1)),
+        // The delete can't see the new snapshot's location, so its cascade
+        // into `snapshots` trips that location's `RESTRICT` foreign key and
+        // the whole publication fails, keeping both catalog rows' locations.
+        (AbsentStoppedRace::ReleaseWithCatalog, (false, true, 2)),
+        (AbsentStoppedRace::Touch, (true, false, 0)),
+    ];
+    let mut mismatches = Vec::new();
+    for (race, expected) in cases {
+        let sandbox_id = insert_stopped_space_sandbox_with_snapshot(pool, node_id).await?;
+        let (mut holder, holder_pid) = begin_holder(pool).await?;
+        race.write(&mut holder, sandbox_id).await?;
+
+        let mut publish_tx = pool.begin().await?;
+        let waiter_pid: i32 = sqlx::query_scalar(sql!("SELECT pg_backend_pid()"))
+            .fetch_one(&mut *publish_tx)
+            .await?;
+        let absent = PublishedSandboxState {
+            sandbox_id: sandbox_id.to_string(),
+            present: false,
+            ..PublishedSandboxState::default()
+        };
+        // `Ok(None)` when the publication committed, `Ok(Some(message))` when
+        // `publish_sandbox_states` refused it.
+        let publish = tokio::spawn(async move {
+            if let Err(status) = publish_sandbox_states(&mut publish_tx, node_id, &[absent]).await {
+                return TestResult::Ok(Some(status.message().to_owned()));
+            }
+            publish_tx.commit().await?;
+            TestResult::Ok(None)
+        });
+        wait_until_blocked(pool, waiter_pid, holder_pid).await?;
+        holder.commit().await?;
+        let refusal = tokio::time::timeout(RACE_BUDGET, publish)
+            .await
+            .map_err(|_| format!("{race:?}: publish did not finish"))???;
+        // A refusal counts only if it is the foreign key the case names, so
+        // an unrelated failure can't stand in for it.
+        let published = match refusal {
+            None => true,
+            Some(message)
+                if matches!(race, AbsentStoppedRace::ReleaseWithCatalog)
+                    && message.contains("snapshot_storage_locations_snapshot_id_fkey") =>
+            {
+                false
+            }
+            Some(message) => {
+                mismatches.push(format!("{race:?}: publication refused: {message}"));
+                continue;
+            }
+        };
+
+        let (exists, live_locations) = absent_delete_outcome(pool, sandbox_id).await?;
+        let actual = (published, exists, live_locations);
+        if actual != expected {
+            mismatches.push(format!(
+                "{race:?}: (published, row exists, live locations) {actual:?}, expected {expected:?}"
             ));
         }
     }

@@ -17,7 +17,7 @@
 #
 # Required env (the bootstrap-templates.sh half):
 #   POSTGRES_CONNECTION_STRING — control-plane DB. Defaults to a forwarded
-#                                postgresql://spaceuser:spacepassword@127.0.0.1:5433/spacedb
+#                                postgresql://spaceuser:spacepassword@127.0.0.1:5433/spacedb?sslmode=require
 #                                so callers don't need to know the secret.
 #   AWS_*                      — sandbox creds (read-only suffices); load
 #                                with `set -a; source infra/space/kind/private.env`.
@@ -25,6 +25,13 @@
 #   TEMPLATE_BOOTSTRAP_NAMES   — comma/space-separated. Default: seed.
 #
 # This script is idempotent: re-running it skips work that's already done.
+#
+# Re-run it after a sandbox worker restarts. The staged files live on the
+# worker's /space/cache, which space-cache.service reformats on every boot of
+# the node (infra/space/kind/node/space-kind-node.sh), and nothing else puts
+# them back: template-manager cannot pull them from this bucket. A re-run
+# stages the templates onto the restarted worker again and skips the workers
+# that still have them on their cache.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -58,7 +65,7 @@ aws sts get-caller-identity >/dev/null 2>&1 \
 # ── Postgres port-forward (idempotent) ────────────────────────────────────
 PG_PF_PORT="${PG_PF_PORT:-5433}"
 ensure_pg_forwarded() {
-  if /bin/psql "postgresql://spaceuser:spacepassword@127.0.0.1:${PG_PF_PORT}/spacedb" \
+  if /bin/psql "postgresql://spaceuser:spacepassword@127.0.0.1:${PG_PF_PORT}/spacedb?sslmode=require" \
        -c 'SELECT 1' >/dev/null 2>&1; then
     log "postgres reachable at 127.0.0.1:${PG_PF_PORT}"
     return 0
@@ -70,7 +77,7 @@ ensure_pg_forwarded() {
   local i
   for i in 1 2 3 4 5 6 7 8 9 10; do
     sleep 1
-    if /bin/psql "postgresql://spaceuser:spacepassword@127.0.0.1:${PG_PF_PORT}/spacedb" \
+    if /bin/psql "postgresql://spaceuser:spacepassword@127.0.0.1:${PG_PF_PORT}/spacedb?sslmode=require" \
          -c 'SELECT 1' >/dev/null 2>&1; then
       log "postgres reachable after ${i}s"
       return 0
@@ -82,7 +89,7 @@ ensure_pg_forwarded() {
 # ── Step 1: control-plane registration via the shared bootstrap script ────
 register_control_plane() {
   log "registering templates in control-plane Postgres"
-  PATH=/bin:$PATH POSTGRES_CONNECTION_STRING="postgresql://spaceuser:spacepassword@127.0.0.1:${PG_PF_PORT}/spacedb" \
+  PATH=/bin:$PATH POSTGRES_CONNECTION_STRING="postgresql://spaceuser:spacepassword@127.0.0.1:${PG_PF_PORT}/spacedb?sslmode=require" \
     bash "$REPO_ROOT/scripts/bootstrap-templates.sh"
 }
 
@@ -112,7 +119,7 @@ stage_artifacts_on_workers() {
 
     # Pull manifest + metadata fresh from S3, derive the hash + storage prefix
     # to avoid relying on whatever the prior step persisted.
-    hash="$(/bin/psql "postgresql://spaceuser:spacepassword@127.0.0.1:${PG_PF_PORT}/spacedb" \
+    hash="$(/bin/psql "postgresql://spaceuser:spacepassword@127.0.0.1:${PG_PF_PORT}/spacedb?sslmode=require" \
       -tA -v ON_ERROR_STOP=1 -v name="$name" <<'SQL'
 SELECT tr.hash
 FROM template_release_tags t
@@ -121,7 +128,7 @@ WHERE t.template_name = :'name' AND t.tag = 'latest';
 SQL
 )"
     [[ -n "$hash" ]] || die "no 'latest' release for $name in control-plane"
-    storage_uri="$(/bin/psql "postgresql://spaceuser:spacepassword@127.0.0.1:${PG_PF_PORT}/spacedb" \
+    storage_uri="$(/bin/psql "postgresql://spaceuser:spacepassword@127.0.0.1:${PG_PF_PORT}/spacedb?sslmode=require" \
       -tA -v ON_ERROR_STOP=1 -v name="$name" -v hash="$hash" <<'SQL'
 SELECT l.storage_connection_string
 FROM template_release_storage_locations l
@@ -136,12 +143,15 @@ SQL
     local s3_path="${storage_uri%%\?*}"
     s3_path="${s3_path%/}"
 
-    # If the worker already has this hash registered, skip — idempotency.
-    # `space-tmplmgr list` truncates the hash to ~12 hex chars, so grep on
-    # the bare prefix (post-`sha256:`).
+    # If the worker already has this hash registered and its build directory
+    # is on the cache, skip — idempotency. `space-tmplmgr list` truncates the
+    # hash to ~12 hex chars, so grep on the bare prefix (post-`sha256:`). The
+    # directory check covers a worker restarted moments ago, whose catalog
+    # can still list the build until template-manager's startup recovery
+    # prunes it.
     local hex_prefix="${hash#sha256:}"
     hex_prefix="${hex_prefix:0:12}"
-    if kubectl -n space exec "$pod" -c shell -- bash -c "space-tmplmgr list 2>/dev/null | grep -q $hex_prefix" 2>/dev/null; then
+    if kubectl -n space exec "$pod" -c shell -- bash -c "space-tmplmgr list 2>/dev/null | grep -q $hex_prefix && compgen -G '/space/cache/firecracker/templates/${name}/*${hex_prefix}*' >/dev/null" 2>/dev/null; then
       log "    $name@${hash:0:24}… already staged locally; skip"
       continue
     fi

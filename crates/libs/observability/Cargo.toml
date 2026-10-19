@@ -63,7 +63,6 @@ tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 [dev-dependencies]
 pplx-space-common-core = { workspace = true, features = ["test-hooks"] }
 opentelemetry-proto = { workspace = true, features = ["gen-tonic", "metrics"] }
-tonic-health = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 tokio-stream = { workspace = true, features = ["net"] }

@@ -44,6 +44,115 @@ impl K8sStore {
             .db_context("failed to query Kubernetes restore node preference")
     }
 
+    /// The restore source for a `stopped` sandbox: the node name to pin to, and
+    /// whether a stopped evacuation has left the row unplaced.
+    ///
+    /// ## What the evacuation half means
+    ///
+    /// Only `'stopped'` counts as the marker. The other two values belong to
+    /// the suspend → restore pipeline, which parks its rows in `suspended` and
+    /// resolves them through the storage-URI path; reading them here would
+    /// refuse restores that path already handles.
+    ///
+    /// When it holds, the drain has released the node holding the copy, so the
+    /// node name beside it is not a restore source at all —
+    /// `KubernetesSubstrate::stopped_restore_plan` refuses the `start`.
+    ///
+    /// **`active_node_id IS NULL` is the load-bearing half, not a
+    /// belt-and-braces extra.** The marker alone says an evacuation was
+    /// *claimed*, which is not the same as finished, and a claim can outlive
+    /// the drain that made it: an operator's `:undrain` between the claim and
+    /// the teardown leaves the row `stopped`, marked, and still holding its
+    /// rootfs — and **nothing clears that marker**. Every writer that clears it
+    /// requires a lifecycle change or a lifecycle this row does not have
+    /// (`suspending`, `suspended`, `restoring`), and the drain reconciler never
+    /// visits an undrained node again. Refusing on the marker alone would
+    /// therefore make `start` a permanent 503 for a sandbox whose disk is
+    /// sitting intact on a healthy node, with delete as the owner's only exit.
+    ///
+    /// ## Why one statement
+    ///
+    /// **One statement for both, and it reads placement from the row rather
+    /// than from the caller's `Sandbox`.** Both properties are deliberate.
+    ///
+    /// *One statement*, because asking for the marker separately would cost an
+    /// extra round trip on every `start` of a stopped sandbox, in every cluster
+    /// — including the ones with the drain feature switched off.
+    ///
+    /// *From the row*, because the caller's struct was loaded earlier in the
+    /// request and a teardown can land in between. Short-circuiting on
+    /// `sandbox.active_node_id.is_some()` reads well and is wrong in the
+    /// direction that matters: a struct that says placed against a row that says
+    /// unplaced would skip the refusal and plan a pod against the drained node.
+    /// Reading both facts from one row of one statement also makes them agree
+    /// with each other.
+    ///
+    /// The name resolves the way [`Self::restore_source_node_name`] does: the
+    /// placement's Kubernetes mapping first, then the newest execution that
+    /// named a node. That fallback is why the evacuation flag cannot be left to
+    /// a missing name — retiring an execution marks the row inactive without
+    /// deleting it, so it keeps naming the drained node long after the teardown
+    /// cleared the placement columns.
+    pub(in crate::controllers::substrate::kubernetes) async fn restore_source_plan(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<UnplacedRestoreSource, SubstrateError> {
+        // The two name candidates come back *separately* rather than
+        // pre-`COALESCE`d, and the placement's node id comes back with them, so
+        // the missing-mapping WARN [`Self::restore_source_node_name`] emits can
+        // be emitted here too without a second round trip.
+        type RestoreSourceRow = (Option<String>, Option<String>, Option<NodeId>, bool);
+        let row: Option<RestoreSourceRow> = sqlx::query_as(sql!(
+            "SELECT (
+                 SELECT nk.k8s_node_name
+                   FROM node_k8s nk
+                  WHERE nk.node_id = COALESCE(s.target_node_id, s.active_node_id)
+             ) AS mapped_name,
+             (
+                 SELECT ske.k8s_node_name
+                   FROM sandbox_k8s_executions ske
+                  WHERE ske.sandbox_id = s.id
+                    AND ske.k8s_node_name IS NOT NULL
+                  ORDER BY ske.generation DESC
+                  LIMIT 1
+             ) AS execution_name,
+             COALESCE(s.target_node_id, s.active_node_id) AS placement_node_id,
+             -- `active_node_id` alone, deliberately, and *not* the
+             -- `COALESCE` above: a re-placement with a target chosen and
+             -- nothing active yet still has no local copy anywhere. Pinned by
+             -- the mid-re-placement phase of
+             -- `a_stopped_evacuation_counts_as_unplaced_only_once_its_local_copy_is_gone`.
+             COALESCE(
+                 s.evacuation_restore_target = 'stopped' AND s.active_node_id IS NULL,
+                 FALSE
+             ) AS stopped_evacuation_unplaced
+             FROM sandboxes s
+             WHERE s.id = $1"
+        ))
+        .bind(sandbox_id)
+        .fetch_optional(&self.pool)
+        .await
+        .db_context("failed to query Kubernetes restore node preference")?;
+        let Some((mapped_name, execution_name, placement_node_id, stopped_evacuation_unplaced)) =
+            row
+        else {
+            return Ok(UnplacedRestoreSource::default());
+        };
+        if let Some(node_id) = placement_node_id
+            && mapped_name.is_none()
+        {
+            tracing::warn!(
+                sandbox_id = %sandbox_id,
+                node_id = %node_id,
+                "sandbox restore node id has no Kubernetes node mapping; falling back to pod tracking"
+            );
+        }
+        Ok(UnplacedRestoreSource {
+            node_name: mapped_name.or(execution_name),
+            stopped_evacuation_unplaced,
+        })
+    }
+
     pub(in crate::controllers::substrate::kubernetes) async fn selected_suspend_restore_storage_uri(
         &self,
         sandbox: &Sandbox,
@@ -213,8 +322,11 @@ impl K8sStore {
     ///
     /// (The node-local writer `publish_stopped_artifact` does mint a disk pin,
     /// but in SQLite, in a table this query never reads; the control-plane pin
-    /// is a separate value.) So this selector returns `None` for every row that
-    /// exists today.
+    /// is a separate value.) One cluster writer does produce a disk pin: node
+    /// drain's `record_stopped_evacuation_artifact` writes `('disk', 'stop')` on
+    /// a `stopped` row it has claimed for evacuation, and leaves it in place if
+    /// the evacuation is abandoned before its teardown. Those are the only
+    /// rows this selector can return.
     ///
     /// That is an enumeration of *current* writers, which is weaker than a
     /// schema guarantee: the artifact-identity migration has permitted

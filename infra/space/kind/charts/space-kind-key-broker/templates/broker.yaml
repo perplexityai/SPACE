@@ -41,6 +41,7 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      priorityClassName: {{ .Values.priorityClassName }}
       automountServiceAccountToken: false
       terminationGracePeriodSeconds: 5
       # The image's unprivileged account; the fixture needs no host access,

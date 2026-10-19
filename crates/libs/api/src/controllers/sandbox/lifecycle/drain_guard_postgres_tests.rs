@@ -444,10 +444,20 @@ async fn gentle_drain_still_blocks_once_the_node_is_drained() -> TestResult {
     Ok(())
 }
 
-// Escalation is a plain column rewrite, and the gate reads the column per
-// request, so the same sandbox that was served a moment ago starts 409ing with
-// no api-server state to invalidate. This is the property that lets the
-// cluster controller own escalation while the api-server owns the gate.
+// The operator-visible property: once a gently-draining node's `drain_mode`
+// becomes `forced`, the gate treats it exactly as one drained forced from the
+// start. Nothing on this path reads how the mode came to be `forced` — the gate
+// re-reads the column per request — so the same sandbox that was served a moment
+// ago starts 409ing with no api-server state to invalidate and no coordination
+// with whoever wrote the column.
+//
+// The mode is moved here with a direct UPDATE rather than through the admin
+// endpoint: this file's subject is the gate, and driving `:drain` would need the
+// whole handler. The endpoint-to-column wiring is covered elsewhere rather than
+// here — `node_store::in_flight_drain_tests` covers the write,
+// `routes::admin::nodes::tests` covers the transition table, and
+// `routes::admin::nodes::drain_handler_tests` drives a real `:drain` against an
+// already-draining row. So the direct UPDATE is a scoping choice, not a gap.
 #[tokio::test(flavor = "current_thread")]
 async fn escalating_a_gentle_drain_to_forced_closes_the_gate() -> TestResult {
     let db = pg_test_db().await?;
@@ -688,5 +698,145 @@ async fn drain_gate_blocks_via_sandbox_k8s_executions_fallback() -> TestResult {
         .await
         .expect_err("executions-fallback to a draining node must 409");
     assert_eq!(err.clone().into_response().status(), StatusCode::CONFLICT);
+    Ok(())
+}
+
+/// A fresh ready full snapshot with a storage location, which makes a
+/// `suspended` / `restoring` row portable for restore affinity.
+async fn insert_fresh_ready_snapshot(pool: &PgPool, sandbox_id: SandboxId) -> TestResult {
+    let snapshot_id = pplx_space_common_core::types::SnapshotId::new();
+    sqlx::query(sql!(
+        "INSERT INTO snapshots (id, sandbox_id, type, state, timestamp)
+         VALUES ($1, $2, 'full', 'ready', NOW())"
+    ))
+    .bind(snapshot_id)
+    .bind(sandbox_id)
+    .execute(pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO snapshot_storage_locations (snapshot_id, storage_connection_string)
+         VALUES ($1, $2)"
+    ))
+    .bind(snapshot_id)
+    .bind(format!("s3://test-bucket/{snapshot_id}"))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Keep `sqlx::query` events enabled for the whole test process.
+///
+/// Scoped subscribers on other test threads come and go concurrently, and a
+/// callsite-interest rebuild racing ours can compute the global max level (and
+/// cached interest) from a dispatcher set that no longer includes ours, which
+/// silently drops every event we meant to count. One process-lifetime
+/// dispatcher that accepts everything keeps each rebuild's answer "enabled";
+/// events still reach only the subscriber in scope on this thread.
+fn keep_query_events_enabled() {
+    static ALWAYS_ENABLED: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    ALWAYS_ENABLED.get_or_init(|| tracing::Dispatch::new(tracing_subscriber::registry()));
+    tracing::callsite::rebuild_interest_cache();
+}
+
+/// The `sql!` locators of every statement `fetch_active_node_drain_state`
+/// sends for `sandbox_id`.
+async fn drain_gate_statements(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+) -> TestResult<(Option<NodeDrainState>, Vec<String>)> {
+    use pplx_space_observability::test_capture::{CapturedEventsLayer, field_value};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let layer = CapturedEventsLayer::new().with_target("sqlx::query");
+    let events = layer.events();
+    let state = {
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+        keep_query_events_enabled();
+        fetch_active_node_drain_state(pool, sandbox_id).await?
+    };
+    let statements = events
+        .events()
+        .iter()
+        .map(|event| {
+            let summary = field_value(event, "summary").unwrap_or_default();
+            let statement = field_value(event, "db.statement").unwrap_or_default();
+            let sql = if statement.is_empty() {
+                summary
+            } else {
+                statement
+            };
+            sql.trim_start()
+                .strip_prefix("/*")
+                .and_then(|rest| rest.split_once("*/"))
+                .map_or_else(|| sql.to_string(), |(locator, _)| locator.to_string())
+        })
+        .collect();
+    Ok((state, statements))
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn portable_suspended_sandbox_bypasses_a_forced_drain_in_one_read() -> TestResult {
+    let db = pg_test_db().await?;
+    let node_id = NodeId::new();
+    let sandbox_id = SandboxId::new();
+    insert_node(&db.pool, node_id, Some("terminating")).await?;
+    insert_sandbox(&db.pool, sandbox_id, "suspended", None, Some(node_id)).await?;
+    insert_fresh_ready_snapshot(&db.pool, sandbox_id).await?;
+
+    let (state, statements) = drain_gate_statements(&db.pool, sandbox_id).await?;
+    assert_eq!(state, None);
+    assert_eq!(statements.len(), 1, "{statements:#?}");
+    ensure_resolved_node_not_draining(&db.pool, sandbox_id, SandboxAction::Wake).await?;
+
+    // The same snapshot does not release a live sandbox: its VM memory on the
+    // node, not the snapshot, is canonical.
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET lifecycle = 'started' WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(&db.pool)
+    .await?;
+    let err = ensure_resolved_node_not_draining(&db.pool, sandbox_id, SandboxAction::Wake)
+        .await
+        .expect_err("a live sandbox on a terminating node is blocked");
+    assert_eq!(err.into_response().status(), StatusCode::CONFLICT);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn mapped_primary_drain_state_is_one_read() -> TestResult {
+    let db = pg_test_db().await?;
+    let node_id = NodeId::new();
+    let sandbox_id = SandboxId::new();
+    insert_node(&db.pool, node_id, None).await?;
+    sqlx::query(sql!(
+        "INSERT INTO node_k8s (node_id, k8s_node_name) VALUES ($1, 'worker-a')"
+    ))
+    .bind(node_id)
+    .execute(&db.pool)
+    .await?;
+    insert_sandbox(&db.pool, sandbox_id, "started", Some(node_id), None).await?;
+
+    let (state, statements) = drain_gate_statements(&db.pool, sandbox_id).await?;
+    assert_eq!(state, None);
+    assert_eq!(statements.len(), 1, "{statements:#?}");
+
+    insert_node(&db.pool, node_id, Some("drained")).await?;
+    let (state, statements) = drain_gate_statements(&db.pool, sandbox_id).await?;
+    assert_eq!(
+        state.map(|state| state.phase),
+        Some(NodeDrainPhase::Drained)
+    );
+    assert_eq!(statements.len(), 1, "{statements:#?}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn missing_sandbox_has_no_drain_state() -> TestResult {
+    let db = pg_test_db().await?;
+    let (state, statements) = drain_gate_statements(&db.pool, SandboxId::new()).await?;
+    assert_eq!(state, None);
+    // No row, so no primary; the executions fallback still runs, as before.
+    assert_eq!(statements.len(), 2, "{statements:#?}");
     Ok(())
 }
