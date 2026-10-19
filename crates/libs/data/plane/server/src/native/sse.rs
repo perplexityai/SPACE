@@ -5,6 +5,7 @@ use super::*;
 pub(crate) async fn session_events(
     State(state): State<DataPlaneState>,
     Path(session_id): Path<String>,
+    internal_listener: Option<Extension<InternalListener>>,
     headers: HeaderMap,
     uri: Uri,
 ) -> Response {
@@ -68,7 +69,9 @@ pub(crate) async fn session_events(
         }
     };
 
-    let attached = match resolve_attach_route(&state, session_id, &token).await {
+    let handover =
+        OfferedRouteHandover::from_request(&headers, internal_listener.map(|Extension(l)| l));
+    let attached = match resolve_attach_route(&state, session_id, &token, handover).await {
         Ok(attached) => attached,
         Err(error) => {
             pplx_space_metrics::data_plane::attach(

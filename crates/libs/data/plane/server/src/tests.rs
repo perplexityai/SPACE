@@ -924,6 +924,7 @@ pub(crate) async fn test_data_plane_state() -> DataPlaneState {
         drain_started: CancellationToken::new(),
         stream_shutdown_token: CancellationToken::new(),
         upgrade_tasks: TaskTracker::new(),
+        route_handover: None,
     }
 }
 

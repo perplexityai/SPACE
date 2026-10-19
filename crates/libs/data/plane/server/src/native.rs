@@ -6,6 +6,7 @@ use pplx_space_metrics::data_plane::{
 };
 
 mod auth;
+mod handover;
 mod protocol;
 mod proxy;
 mod sse;
@@ -16,6 +17,7 @@ const NATIVE_ROUTE_CACHE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const NATIVE_ROUTE_CACHE_SWEEP_MAX_ENTRIES: usize = 16 * 1024;
 
 pub(super) use auth::*;
+pub(super) use handover::*;
 pub(super) use protocol::*;
 pub(super) use proxy::*;
 pub(super) use sse::*;
@@ -52,14 +54,16 @@ const SESSION_NOT_READY_POLL: Duration = Duration::from_millis(500);
 /// [`resolve_session_route`] for a client attach, which waits up to the
 /// attach deadline while the session's sandbox has no route: a wake started
 /// with the session, such as the one `createCommand` starts for a sandbox at
-/// rest, places the sandbox again in about that time.
+/// rest, places the sandbox again in about that time. A route `handover` is
+/// offered once; the retries resolve without it.
 pub(super) async fn resolve_attach_route(
     state: &DataPlaneState,
     session_id: DataPlaneSessionId,
     token: &str,
+    mut handover: Option<OfferedRouteHandover>,
 ) -> Result<AttachedSession, RouteResolutionError> {
     retry_not_ready_until(tokio::time::Instant::now() + state.attach_deadline, || {
-        resolve_session_route(state, session_id, token)
+        resolve_session_route_with_handover(state, session_id, token, handover.take())
     })
     .await
 }
