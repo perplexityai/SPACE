@@ -53,18 +53,19 @@ impl MetricsReader {
     /// Wait until the FIFO has data, then read and process what is there.
     /// Pending forever while it is closed; the caller's tick reopens it.
     /// Cancel-safe: nothing is consumed before the readiness wait completes.
+    /// The read buffer is on the stack and exists only after the wait, so no
+    /// VM's reader holds one while it waits, which is nearly always, and a read
+    /// allocates nothing.
     pub(super) async fn read_available(&mut self) {
-        let mut chunk = vec![0; READ_CHUNK_BYTES];
-        let read = {
-            let Some(receiver) = self.receiver.as_ref() else {
-                return std::future::pending().await;
-            };
-            match receiver.readable().await {
-                Ok(()) => receiver.try_read(&mut chunk),
-                Err(error) => Err(error),
-            }
+        let Some(receiver) = self.receiver.as_ref() else {
+            return std::future::pending().await;
         };
-        match read {
+        if receiver.readable().await.is_err() {
+            self.receiver = None;
+            return;
+        }
+        let mut chunk = [0; READ_CHUNK_BYTES];
+        match receiver.try_read(&mut chunk) {
             // No writer: Firecracker has not opened it yet or has exited.
             Ok(0) => self.receiver = None,
             Ok(read) => self.accept(chunk.get(..read).unwrap_or_default()),

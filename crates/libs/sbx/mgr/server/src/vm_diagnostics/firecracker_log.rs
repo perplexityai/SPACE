@@ -3,15 +3,22 @@
 //!
 //! Only ERROR lines are re-logged. Firecracker warns on every snapshot restore,
 //! so WARN lines stay in the file, where the watchdog's failure-time tail of it
-//! still reads them. The file is regular, so reading it never affects the VMM;
-//! each poll reads at most [`MAX_READ_BYTES`].
+//! still reads them. Reading a regular file never affects the VMM; each poll
+//! reads at most [`MAX_READ_BYTES`]. Polls block: they run on the shared log
+//! poll's blocking job, never on the runtime.
+//!
+//! That one job reads every VM's log, and the jail is the sandbox's to write,
+//! so the shared poll reads only regular files. The path is opened without
+//! blocking and without following a final symlink (Firecracker creates the
+//! file itself), and anything that is not a regular file is skipped for that
+//! poll: a FIFO or device there cannot hold up the other VMs' logs.
 
-use std::io::SeekFrom;
+use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
 use pplx_space_metrics::sandbox::vm::{VmDiagnosticLevel, VmDiagnosticOutcome, VmDiagnosticSource};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use super::{LogBudget, sanitized};
 
@@ -19,6 +26,14 @@ const MAX_READ_BYTES: u64 = 64 * 1024;
 /// A partial line longer than this is not Firecracker's and is dropped.
 const MAX_LINE_BYTES: usize = 8 * 1024;
 const MAX_MESSAGE_BYTES: usize = 512;
+
+/// Bytes one poll read from a log, not yet accepted.
+pub(super) struct LogRead {
+    start: u64,
+    /// The file was shorter than what was read of it, so the read restarted at 0.
+    restarted: bool,
+    chunk: Vec<u8>,
+}
 
 pub(super) struct LogTail {
     path: PathBuf,
@@ -38,39 +53,52 @@ impl LogTail {
         }
     }
 
-    pub(super) async fn poll(&mut self, sandbox_id: &str, budget: &mut LogBudget) {
-        let Ok(mut file) = tokio::fs::File::open(&self.path).await else {
-            return;
-        };
-        let Ok(metadata) = file.metadata().await else {
-            return;
-        };
-        let len = metadata.len();
-        let start = match self.offset {
-            Some(offset) if offset <= len => offset,
-            // Shorter than what was read: a new file in a rebuilt jail.
-            Some(_) => {
-                self.partial.clear();
-                0
-            }
-            None if created_since(&metadata, self.readers_started_at) => 0,
-            // A log from before this process: its lines were already handled.
-            None => len,
-        };
-        self.offset = Some(start);
-        if start == len || file.seek(SeekFrom::Start(start)).await.is_err() {
-            return;
+    /// Read what is new in the log, changing nothing: the read is applied by
+    /// [`Self::accept_read`]. `None` when there is no regular file to read.
+    pub(super) fn read(&self) -> Option<LogRead> {
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+            .open(&self.path)
+            .ok()?;
+        let metadata = file.metadata().ok()?;
+        if !metadata.is_file() {
+            return None;
         }
-        let mut chunk = Vec::new();
-        let Ok(read) = (&mut file)
-            .take(MAX_READ_BYTES)
-            .read_to_end(&mut chunk)
-            .await
-        else {
-            return;
+        let len = metadata.len();
+        let (start, restarted) = match self.offset {
+            Some(offset) if offset <= len => (offset, false),
+            // Shorter than what was read: a new file in a rebuilt jail.
+            Some(_) => (0, true),
+            None if created_since(&metadata, self.readers_started_at) => (0, false),
+            // A log from before this process: its lines were already handled.
+            None => (len, false),
         };
-        self.offset = Some(start + read as u64);
-        self.accept(sandbox_id, &chunk, budget);
+        let mut chunk = Vec::new();
+        if start < len && file.seek(SeekFrom::Start(start)).is_ok() {
+            // A failed read leaves nothing to accept; the next poll retries.
+            if (&mut file)
+                .take(MAX_READ_BYTES)
+                .read_to_end(&mut chunk)
+                .is_err()
+            {
+                chunk.clear();
+            }
+        }
+        Some(LogRead {
+            start,
+            restarted,
+            chunk,
+        })
+    }
+
+    /// Advance past `read` and re-log its complete lines.
+    pub(super) fn accept_read(&mut self, read: LogRead, sandbox_id: &str, budget: &mut LogBudget) {
+        if read.restarted {
+            self.partial.clear();
+        }
+        self.offset = Some(read.start + read.chunk.len() as u64);
+        self.accept(sandbox_id, &read.chunk, budget);
     }
 
     fn accept(&mut self, sandbox_id: &str, mut bytes: &[u8], budget: &mut LogBudget) {
