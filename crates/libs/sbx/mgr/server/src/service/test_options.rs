@@ -43,9 +43,9 @@ impl SandboxManagerServiceOptions {
     ///   service's `sandbox_runtime_live` and stop and delete target
     ///   selection. A test makes a runtime live by linking that path to an
     ///   existing file;
-    /// - the credential-manager and node-manager sockets are paths under
-    ///   `scratch` that nothing binds, so every call to either fails to
-    ///   connect;
+    /// - the credential-manager, node-manager and volume-manager sockets are
+    ///   paths under `scratch` that nothing binds, so every call to any of
+    ///   them fails to connect;
     /// - the host-control socket is only passed through to node-manager's
     ///   `Launch`, and also sits under `scratch`, so it names no live host
     ///   service;
@@ -69,6 +69,7 @@ impl SandboxManagerServiceOptions {
             node_manager: crate::node_manager_transport::fake::unbound(
                 &scratch.join("absent-node-manager.sock"),
             ),
+            volume_manager_socket_path: scratch.join("absent-volume-manager.sock"),
             template_resolver: crate::template_resolver::fake::unbound(
                 &scratch.join("absent-template-manager.sock"),
             ),

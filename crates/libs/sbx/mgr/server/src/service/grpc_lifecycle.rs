@@ -73,8 +73,8 @@ pub(super) use self::suspend_snapshot::{
 use self::teardown_suspend::teardown_artifact_backup_status;
 #[cfg(test)]
 pub(super) use self::teardown_suspend::{
-    SUSPEND_TRIGGER_METADATA, TerminalTeardownSuspend, failed_artifact_upload_admits_new_attempt,
-    teardown_suspend_event_trigger,
+    KeyedUploadStarter, KeyedUploadUse, SUSPEND_TRIGGER_METADATA, TerminalTeardownSuspend,
+    teardown_keyed_upload_use, teardown_suspend_event_trigger,
 };
 
 /// Outcome of [`SandboxManagerService::submit_artifact_backup`].

@@ -462,8 +462,12 @@ impl SandboxManagerService {
                 })?;
         }
         if payload.job_ids.is_empty() {
-            match crate::snapshot_upload::submit_prepared_snapshot(&payload, &self.node_manager)
-                .await
+            match crate::snapshot_upload::submit_prepared_snapshot(
+                &payload,
+                &self.node_manager,
+                &self.volume_manager_socket_path,
+            )
+            .await
             {
                 Ok(submitted) => {
                     match crate::snapshot_upload_jobs::persist_submitted_transfer_ids(

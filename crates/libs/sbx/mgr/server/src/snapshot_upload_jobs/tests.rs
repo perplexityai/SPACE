@@ -38,6 +38,7 @@ async fn upload_executor_converges_unstaged_metadata_failure() {
         db: crate::db::SharedConnection::new(open_backfill_test_db()),
         drain_state: crate::service::tests::closed_drain_for_test(),
         node_manager: crate::node_manager_transport::fake::unbound_in_absent_dir(),
+        volume_manager_socket: absent_volume_manager_socket(),
         retained_source_inspector: std::sync::Arc::new(crate::retained_source::FakeInspector::new(
             crate::retained_source::RetainedSourceCheck::Absent,
         )),
@@ -92,9 +93,14 @@ async fn cancelled_transfer_poll_yields_before_connecting() {
     let cancellation = tokio_util::sync::CancellationToken::new();
     cancellation.cancel();
 
-    let error = wait_for_artifact_job("sandbox", &JobId::new(), cancellation)
-        .await
-        .unwrap_err();
+    let error = wait_for_artifact_job(
+        &absent_volume_manager_socket(),
+        "sandbox",
+        &JobId::new(),
+        cancellation,
+    )
+    .await
+    .unwrap_err();
 
     assert!(matches!(error, JobError::YieldedForRestart));
 }
@@ -184,6 +190,7 @@ async fn executor_rejects_non_snapshot_upload_job_kind() {
         db: crate::db::SharedConnection::new(crate::db::Connection::open_in_memory()),
         drain_state: std::sync::Arc::new(crate::service::drain::DrainState::default()),
         node_manager: crate::node_manager_transport::fake::unbound_in_absent_dir(),
+        volume_manager_socket: absent_volume_manager_socket(),
         retained_source_inspector: std::sync::Arc::new(crate::retained_source::FakeInspector::new(
             crate::retained_source::RetainedSourceCheck::Absent,
         )),
@@ -215,6 +222,7 @@ async fn executor_requires_begin_before_volume_staging() {
         db: crate::db::SharedConnection::new(crate::db::Connection::open_in_memory()),
         drain_state: std::sync::Arc::new(crate::service::drain::DrainState::default()),
         node_manager: crate::node_manager_transport::fake::unbound_in_absent_dir(),
+        volume_manager_socket: absent_volume_manager_socket(),
         retained_source_inspector: std::sync::Arc::new(crate::retained_source::FakeInspector::new(
             crate::retained_source::RetainedSourceCheck::Absent,
         )),
@@ -360,6 +368,7 @@ fn ready_backup_keeps_completed_evidence_when_bookkeeping_misses_execution_deadl
                     db: db.clone(),
                     drain_state: std::sync::Arc::new(crate::service::drain::DrainState::default()),
                     node_manager: crate::node_manager_transport::fake::unbound_in_absent_dir(),
+                    volume_manager_socket: absent_volume_manager_socket(),
                     retained_source_inspector: std::sync::Arc::new(
                         crate::retained_source::FakeInspector::new(
                             crate::retained_source::RetainedSourceCheck::Absent,
@@ -452,6 +461,7 @@ async fn maintenance_retries_failed_pruning_on_the_next_tick() {
         db.clone(),
         std::sync::Arc::clone(&drain),
         crate::node_manager_transport::fake::unbound_in_absent_dir(),
+        absent_volume_manager_socket(),
     );
     let shutdown = tokio_util::sync::CancellationToken::new();
     let maintenance = tokio::spawn(run_maintenance(db.clone(), worker, drain, shutdown.clone()));
@@ -769,6 +779,7 @@ pub(crate) fn reclaim_fixture_payload(
         includes_metadata_job: true,
         deferred_metadata: false,
         execution_generation: None,
+        failure_scope: Default::default(),
     }
 }
 
@@ -1129,6 +1140,7 @@ fn ready_backup_returns_before_the_retained_source_is_inspected() {
         db: db.clone(),
         drain_state: std::sync::Arc::new(crate::service::drain::DrainState::default()),
         node_manager: crate::node_manager_transport::fake::unbound_in_absent_dir(),
+        volume_manager_socket: absent_volume_manager_socket(),
         retained_source_inspector: std::sync::Arc::new(GatedInspector {
             gate: std::sync::Arc::clone(&gate),
         }),
@@ -1233,4 +1245,11 @@ fn verdict_only_begin_is_requested_and_its_echo_read() {
         };
     assert!(!verdict_only_reply_registered(&reply(true)));
     assert!(verdict_only_reply_registered(&reply(false)));
+}
+
+/// A volume-manager socket in a fresh directory that nothing creates.
+fn absent_volume_manager_socket() -> std::path::PathBuf {
+    std::env::temp_dir()
+        .join(format!("space-sbx-mgr-test-{}", uuid::Uuid::now_v7()))
+        .join("absent-volume-manager.sock")
 }

@@ -408,6 +408,8 @@ pub struct SandboxManagerService {
         Arc<tokio::sync::OnceCell<pplx_space_credmgr_client::CredentialManagerGrpcClient>>,
     network_credentials_enabled: bool,
     node_manager: NodeManagerConnector,
+    /// See [`SandboxManagerServiceOptions::volume_manager_socket_path`].
+    volume_manager_socket_path: PathBuf,
     template_resolver: Arc<dyn crate::template_resolver::TemplateResolver>,
     /// See [`SandboxManagerServiceOptions::cleanup_run_dir`].
     #[cfg(test)]
@@ -1016,6 +1018,9 @@ pub struct SandboxManagerServiceOptions {
     >,
     /// Every node-manager client the service and its subsystems use.
     pub node_manager: NodeManagerConnector,
+    /// The volume-manager socket that snapshot uploads stage their transfers
+    /// with and observe them through.
+    pub volume_manager_socket_path: PathBuf,
     /// Every template-manager `GetTemplate` the service and its subsystems ask.
     pub template_resolver: Arc<dyn crate::template_resolver::TemplateResolver>,
     /// Run directory whose `fc.pid` links stop and delete target selection
@@ -1044,6 +1049,7 @@ impl Default for SandboxManagerServiceOptions {
             node_managed_by: None,
             route_ed25519_verification_bundle: None,
             node_manager: NodeManagerConnector::host(),
+            volume_manager_socket_path: PathBuf::from(pplx_space_volmgr_client::VOLMGR_SOCKET),
             template_resolver: Arc::new(crate::template_resolver::HostTemplateManager),
             #[cfg(test)]
             cleanup_run_dir: None,
@@ -1711,6 +1717,7 @@ impl SandboxManagerService {
             db.clone(),
             Arc::clone(&drain_state),
             options.node_manager.clone(),
+            options.volume_manager_socket_path.clone(),
         );
         let local_artifacts = crate::local_artifacts::LocalArtifacts::new(db.clone());
         let teardown_suspend_driver_concurrency = TEARDOWN_SUSPEND_DRIVER_CONCURRENCY;
@@ -1800,6 +1807,7 @@ impl SandboxManagerService {
                 crate::retained_source::NodeManagerSourceInspector(options.node_manager.clone()),
             ),
             node_manager: options.node_manager,
+            volume_manager_socket_path: options.volume_manager_socket_path,
             template_resolver: options.template_resolver,
             #[cfg(test)]
             cleanup_run_dir: options.cleanup_run_dir,

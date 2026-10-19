@@ -853,15 +853,15 @@ fn node_local_suspend_registers_under_its_kubernetes_execution() {
 /// restore from exactly when `backed_copy`. When `refuses_only_verdicts`, it
 /// refuses a generation-bound registration only when it's verdict-only.
 #[derive(Clone, Copy)]
-pub(super) struct RetiringClusterApi {
-    pub(super) unavailable: bool,
-    pub(super) placed: bool,
-    pub(super) backed_copy: bool,
-    pub(super) artifact_backed: bool,
-    pub(super) refuses_only_verdicts: bool,
+struct RetiringClusterApi {
+    unavailable: bool,
+    placed: bool,
+    backed_copy: bool,
+    artifact_backed: bool,
+    refuses_only_verdicts: bool,
 }
 
-pub(super) const RETIRING: RetiringClusterApi = RetiringClusterApi {
+const RETIRING: RetiringClusterApi = RetiringClusterApi {
     unavailable: false,
     placed: false,
     backed_copy: true,
@@ -1019,7 +1019,19 @@ where
 /// Serves `stub` and runs `test` in an isolated child process whose
 /// cluster-api client wiring points at it, with a synthetic snapshot upload
 /// destination configured.
-pub(super) async fn with_cluster_api(stub: RetiringClusterApi, test: impl AsyncFnOnce()) {
+pub(super) async fn with_cluster_api<S>(stub: S, test: impl AsyncFnOnce())
+where
+    S: tower::Service<
+            http::Request<tonic::body::Body>,
+            Response = http::Response<tonic::body::Body>,
+            Error = std::convert::Infallible,
+        > + tonic::server::NamedService
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+    S::Future: Send + 'static,
+{
     use std::ffi::OsStr;
 
     // The parent serves while the isolated child exercises environment-based

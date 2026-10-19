@@ -41,10 +41,7 @@ use pplx_space_common_jobs::{BackgroundWorker, Job, JobError, JobExecutor, Worke
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, emit_sandbox_event,
 };
-use pplx_space_volmgr_client::{
-    VOLMGR_SOCKET,
-    proto::{GetTransferJobRequest, TransferJobStatus},
-};
+use pplx_space_volmgr_client::proto::{GetTransferJobRequest, TransferJobStatus};
 
 use pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat;
 
@@ -73,6 +70,7 @@ pub(crate) fn build_worker(
     db: crate::db::SharedConnection,
     drain_state: std::sync::Arc<crate::service::drain::DrainState>,
     node_manager: crate::node_manager_transport::NodeManagerConnector,
+    volume_manager_socket: std::path::PathBuf,
 ) -> BackgroundWorker<SnapshotUploadExecutor> {
     let config = WorkerConfig::new(DEFAULT_CONCURRENCY, JOB_TIMEOUT, MAX_ATTEMPTS)
         .with_kind_concurrency(SNAPSHOT_UPLOAD_JOB_KIND, DEFAULT_CONCURRENCY)
@@ -84,6 +82,7 @@ pub(crate) fn build_worker(
             crate::retained_source::NodeManagerSourceInspector(node_manager.clone()),
         ),
         node_manager,
+        volume_manager_socket,
     };
     db.background_worker(executor, config)
 }
@@ -112,6 +111,8 @@ pub struct SnapshotUploadExecutor {
     /// sidecar can switch to counting the image the artifact keeps.
     retained_source_inspector: std::sync::Arc<dyn crate::retained_source::RetainedSourceInspector>,
     node_manager: crate::node_manager_transport::NodeManagerConnector,
+    /// The vol-mgr every transfer is staged with and observed through.
+    volume_manager_socket: std::path::PathBuf,
 }
 
 #[async_trait::async_trait]
@@ -165,20 +166,32 @@ impl JobExecutor for SnapshotUploadExecutor {
         // required before volume staging so an authoritative rejection cannot
         // create transfer work. Teardown-gated callers perform the same Begin
         // synchronously and retain the runtime if the control plane rejects it.
-        if prepared_upload_requires_begin(&payload) {
-            begin_prepared_upload(&payload).await?;
+        if prepared_upload_requires_begin(&payload)
+            && let Err(refusal) = begin_prepared_upload_naming_supersession(&payload).await
+        {
+            if refusal.refuses_artifact {
+                record_failure_scope(
+                    &self.db,
+                    &job.job_id,
+                    crate::snapshot_upload::UploadFailureScope::Artifact,
+                );
+            }
+            return Err(refusal.error);
         }
 
         // Runtime teardown may remove the source paths, while vol-mgr's staged
         // jobs survive it. Persist the durable transfer handles before allowing
         // a teardown-gated caller to release the runtime.
         if payload.job_ids.is_empty() {
-            payload =
-                crate::snapshot_upload::submit_prepared_snapshot(&payload, &self.node_manager)
-                    .await
-                    .map_err(|error| {
-                        JobError::retriable(format!("vol-mgr submit prepared snapshot: {error}"))
-                    })?;
+            payload = crate::snapshot_upload::submit_prepared_snapshot(
+                &payload,
+                &self.node_manager,
+                &self.volume_manager_socket,
+            )
+            .await
+            .map_err(|error| {
+                JobError::retriable(format!("vol-mgr submit prepared snapshot: {error}"))
+            })?;
             persist_submitted_transfer_ids(&self.db, &job.job_id, &payload)?;
         }
 
@@ -188,12 +201,14 @@ impl JobExecutor for SnapshotUploadExecutor {
         // a failure here is logged and never gates the upload.
         touch_with_cluster_api(&snapshot_id).await;
 
-        let results = join_all(
-            payload
-                .job_ids
-                .iter()
-                .map(|job_id| wait_for_artifact_job(&sandbox_id, job_id, cancellation.clone())),
-        )
+        let results = join_all(payload.job_ids.iter().map(|job_id| {
+            wait_for_artifact_job(
+                &self.volume_manager_socket,
+                &sandbox_id,
+                job_id,
+                cancellation.clone(),
+            )
+        }))
         .await;
 
         // Per-job upload bytes in transfer-submission order: the
@@ -229,13 +244,23 @@ impl JobExecutor for SnapshotUploadExecutor {
                 .iter()
                 .map(|observation| observation.bytes)
                 .sum();
-            let metadata_job =
-                crate::snapshot_upload::submit_streamed_metadata(&payload, logical_bytes)
-                    .await
-                    .map_err(JobError::retriable)?;
+            let metadata_job = crate::snapshot_upload::submit_streamed_metadata(
+                &payload,
+                logical_bytes,
+                &self.volume_manager_socket,
+            )
+            .await
+            .map_err(JobError::retriable)?;
             payload.job_ids.push(metadata_job);
             persist_submitted_transfer_ids(&self.db, &job.job_id, &payload)?;
-            match wait_for_artifact_job(&sandbox_id, &metadata_job, cancellation.clone()).await {
+            match wait_for_artifact_job(
+                &self.volume_manager_socket,
+                &sandbox_id,
+                &metadata_job,
+                cancellation.clone(),
+            )
+            .await
+            {
                 Ok(observation) => artifact_results.push(observation),
                 Err(error) => {
                     if matches!(error, JobError::Permanent(_)) {
@@ -542,22 +567,19 @@ pub(crate) fn prepared_upload_requires_begin(payload: &SnapshotUploadJobs) -> bo
         && payload.meta.execution.is_some()
 }
 
-pub(crate) async fn begin_prepared_upload(payload: &SnapshotUploadJobs) -> Result<(), JobError> {
-    begin_prepared_upload_naming_supersession(payload)
-        .await
-        .map_err(|refusal| refusal.error)
-}
-
-/// A refused prepared `BeginArtifactBackup`: the job error, and the generation
-/// the control plane named when it refused the upload as superseded.
+/// A refused prepared `BeginArtifactBackup`: the job error, the generation
+/// the control plane named when it refused the upload as superseded, and
+/// whether the refusal is about the artifact itself.
 #[derive(Debug)]
 pub(crate) struct BeginRefusal {
     pub(crate) error: JobError,
     pub(crate) superseded_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+    /// See [`registration_refusal_is_final`].
+    pub(crate) refuses_artifact: bool,
 }
 
-/// [`begin_prepared_upload`] that keeps the superseded verdict, for a caller
-/// that acts on the refusal at once instead of through the job's failure.
+/// Send a prepared upload's `BeginArtifactBackup`, keeping the refusal's
+/// verdicts for a caller that acts on them.
 pub(crate) async fn begin_prepared_upload_naming_supersession(
     payload: &SnapshotUploadJobs,
 ) -> Result<(), BeginRefusal> {
@@ -568,20 +590,66 @@ pub(crate) async fn begin_prepared_upload_naming_supersession(
             return Err(BeginRefusal {
                 error,
                 superseded_generation: None,
+                refuses_artifact: false,
             });
         }
     };
-    let superseded_generation = match &refused {
+    let (superseded_generation, refuses_artifact) = match &refused {
         BeginArtifactBackupError::BeginArtifactBackup {
             superseded_generation,
+            code,
             ..
-        } => *superseded_generation,
-        BeginArtifactBackupError::Connect(_) => None,
+        } => (*superseded_generation, registration_refusal_is_final(*code)),
+        BeginArtifactBackupError::Connect(_) => (None, false),
     };
     Err(BeginRefusal {
         error: classify_begin_error(refused),
         superseded_generation,
+        refuses_artifact,
     })
+}
+
+/// Whether the control plane refused a registration because of the artifact
+/// itself, so no attempt can register it: the request contradicts the
+/// artifact's identity, the sandbox is gone, or the control plane retired the
+/// execution that captured it. An authentication or authorization refusal
+/// concerns this node's credentials, which can recover, so it fails only the
+/// attempt.
+fn registration_refusal_is_final(code: tonic::Code) -> bool {
+    matches!(
+        code,
+        tonic::Code::InvalidArgument | tonic::Code::NotFound | tonic::Code::FailedPrecondition
+    )
+}
+
+/// Record on a failing upload's payload what its failure failed, for a later
+/// caller that has to decide whether a new attempt can succeed. Best effort:
+/// an unrecorded scope reads as [`UploadFailureScope::Attempt`], which costs
+/// that caller one doomed attempt at most.
+///
+/// [`UploadFailureScope::Attempt`]: crate::snapshot_upload::UploadFailureScope::Attempt
+fn record_failure_scope(
+    db: &std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>,
+    job_id: &JobId,
+    scope: crate::snapshot_upload::UploadFailureScope,
+) {
+    // Set only the field: a handoff can persist transfer IDs into the same
+    // payload while this attempt runs.
+    let recorded = db
+        .lock()
+        .map_err(|_| "database mutex poisoned".to_string())
+        .and_then(|conn| {
+            conn.execute(
+                "UPDATE jobs SET payload = json_set(payload, '$.failure_scope', ?1)
+                 WHERE job_id = ?2 AND kind = ?3 AND status IN ('pending', 'running')",
+                rusqlite::params![scope.as_str(), job_id, SNAPSHOT_UPLOAD_JOB_KIND],
+            )
+            .map_err(|error| error.to_string())
+        });
+    if let Err(error) = recorded {
+        tracing::warn!(%job_id, scope = scope.as_str(), %error,
+            "could not record a failed snapshot upload's failure scope");
+    }
 }
 
 /// What the re-sent registration says about the upload's execution.
@@ -972,6 +1040,7 @@ struct ArtifactTransferObservation {
 /// transfer failure remains terminal. Cancellation yields without cancelling
 /// remote work, and re-polling terminal transfers is safe.
 async fn wait_for_artifact_job(
+    volume_manager_socket: &std::path::Path,
     sandbox_id: &str,
     job_id: &JobId,
     cancellation: tokio_util::sync::CancellationToken,
@@ -979,10 +1048,14 @@ async fn wait_for_artifact_job(
     // One reconnecting channel per artifact attempt, not a fresh connection
     // on every poll. These are observation-only requests: timing out does not
     // abandon the durable volume-manager transfer or cancel remote mutation.
+    let volume_manager_socket = volume_manager_socket.to_string_lossy();
     let client = tokio::select! {
         biased;
         _ = cancellation.cancelled() => return Err(JobError::YieldedForRestart),
-        result = tokio::time::timeout(TRANSFER_PROBE_TIMEOUT, pplx_space_volmgr_client::connect(VOLMGR_SOCKET)) => {
+        result = tokio::time::timeout(
+            TRANSFER_PROBE_TIMEOUT,
+            pplx_space_volmgr_client::connect(&volume_manager_socket),
+        ) => {
             result.map_err(|_| JobError::retriable(format!("vol-mgr connect timed out ({job_id})")))?
                 .map_err(|e| JobError::retriable(format!("vol-mgr connect ({job_id}): {e}")))?
         }

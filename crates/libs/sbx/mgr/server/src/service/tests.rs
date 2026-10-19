@@ -256,8 +256,8 @@ pub(crate) mod service_tests {
         SynchronousCleanupRequest,
     };
     use crate::service::grpc_lifecycle::{
-        SubmitSuspendSnapshotOutcome, SuspendRequestContext, SuspendSnapshotStagingDisposition,
-        failed_artifact_upload_admits_new_attempt,
+        KeyedUploadStarter, KeyedUploadUse, SubmitSuspendSnapshotOutcome, SuspendRequestContext,
+        SuspendSnapshotStagingDisposition, teardown_keyed_upload_use,
     };
     use crate::service::recovery::SuspendSnapshotPublicationRecoveryOrigin;
     use crate::service::suspend_snapshot_publication::{
@@ -12686,21 +12686,41 @@ pub(crate) mod service_tests {
     }
 
     #[test]
-    fn only_a_retriable_upload_failure_admits_a_new_attempt() {
+    fn teardown_joins_a_keyed_upload_unless_a_new_attempt_can_succeed() {
+        use crate::snapshot_upload::UploadFailureScope::{Artifact, Attempt};
+        use KeyedUploadStarter::{EarlierCaller, ThisTeardown};
+        use KeyedUploadUse::{Join, NewAttempt};
+        use pplx_space_common_jobs::JobStatus::{
+            Cancelled, Cancelling, Completed, Failed, Pending, Running,
+        };
+        let retriable = Some(pplx_space_common_jobs::JobFailure::Retriable);
+        let permanent = Some(pplx_space_common_jobs::JobFailure::Permanent { reason: None });
         let cases = [
-            (
-                pplx_space_common_jobs::JobFailure::Permanent { reason: None },
-                false,
-            ),
-            (pplx_space_common_jobs::JobFailure::Retriable, true),
+            // An active upload owns the backup.
+            (Pending, None, Attempt, EarlierCaller, Join),
+            (Running, None, Artifact, ThisTeardown, Join),
+            (Cancelling, None, Attempt, EarlierCaller, Join),
+            // An upload that ended without a failure answers at once.
+            (Completed, None, Attempt, EarlierCaller, Join),
+            (Completed, None, Attempt, ThisTeardown, Join),
+            (Cancelled, None, Attempt, EarlierCaller, Join),
+            // A retriable failure only ran out of attempts.
+            (Failed, retriable, Attempt, ThisTeardown, NewAttempt),
+            (Failed, retriable, Attempt, EarlierCaller, NewAttempt),
+            // An earlier caller's attempt failing permanently gets one more.
+            (Failed, permanent, Attempt, EarlierCaller, NewAttempt),
+            // This teardown's own permanent failure is final, and so is one
+            // of the artifact itself.
+            (Failed, permanent, Attempt, ThisTeardown, Join),
+            (Failed, permanent, Artifact, EarlierCaller, Join),
+            (Failed, permanent, Artifact, ThisTeardown, Join),
         ];
 
-        for (failure, expected) in cases {
-            let actual = failed_artifact_upload_admits_new_attempt(failure);
-
+        for (status, failure, scope, starter, expected) in cases {
             assert_eq!(
-                actual, expected,
-                "unexpected retry decision for {failure:?}"
+                teardown_keyed_upload_use(status, failure, scope, starter),
+                expected,
+                "{status:?} {failure:?} {scope:?} {starter:?}"
             );
         }
     }

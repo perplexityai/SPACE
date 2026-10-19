@@ -41,7 +41,7 @@ use pplx_space_common_core::types::{
     snapshot_object_key,
 };
 use pplx_space_sbx_mgr_client::proto::SuspendSnapshotFormat;
-use pplx_space_volmgr_client::{VOLMGR_SOCKET, proto::PushFileRequest};
+use pplx_space_volmgr_client::proto::PushFileRequest;
 
 /// Resolved S3 configuration for snapshot uploads.
 ///
@@ -471,6 +471,40 @@ pub struct SnapshotUploadJobs {
     /// to one execution, and in payloads persisted before the fence existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_generation: Option<pplx_space_common_core::types::ExecutionGeneration>,
+    /// What this upload's permanent failure, if it has one, failed. The
+    /// worker records it beside the job's own failure, which says only whether
+    /// the job retries. A payload persisted before this field existed reads as
+    /// [`UploadFailureScope::Attempt`].
+    #[serde(default, skip_serializing_if = "UploadFailureScope::is_attempt")]
+    pub failure_scope: UploadFailureScope,
+}
+
+/// What a permanently failed upload failed: the attempt, or the artifact.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UploadFailureScope {
+    /// Only this attempt failed, so a new attempt may succeed: a transfer
+    /// vol-mgr gave up on during an object-store or credential outage, a
+    /// finalize the control plane refused, or anything the worker can't tell
+    /// apart from those.
+    #[default]
+    Attempt,
+    /// The control plane refused the artifact's registration for good, so no
+    /// attempt can register it.
+    Artifact,
+}
+
+impl UploadFailureScope {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Attempt => "attempt",
+            Self::Artifact => "artifact",
+        }
+    }
+
+    pub const fn is_attempt(&self) -> bool {
+        matches!(self, Self::Attempt)
+    }
 }
 
 struct MetadataStagingDirGuard {
@@ -948,16 +982,18 @@ pub(crate) fn prepare_suspend_snapshot(
         includes_metadata_job: true,
         deferred_metadata,
         execution_generation: None,
+        failure_scope: UploadFailureScope::Attempt,
     })
 }
 
-/// Submit a prepared upload intent to vol-mgr.
+/// Submit a prepared upload intent to the vol-mgr at `volume_manager_socket`.
 ///
 /// The immutable snapshot attempt determines every source and destination, so
 /// replay after a worker restart rejoins vol-mgr's persisted transfer jobs.
 pub async fn submit_prepared_snapshot(
     prepared: &SnapshotUploadJobs,
     node_manager: &crate::node_manager_transport::NodeManagerConnector,
+    volume_manager_socket: &Path,
 ) -> Result<SnapshotUploadJobs, String> {
     let mut prepared = prepared.clone();
     if !prepared.deferred_metadata
@@ -1001,7 +1037,7 @@ pub async fn submit_prepared_snapshot(
         .metadata_staging_dir
         .as_deref()
         .unwrap_or(&prepared.snapshot_dir);
-    let mut client = pplx_space_volmgr_client::connect(VOLMGR_SOCKET)
+    let mut client = pplx_space_volmgr_client::connect(&volume_manager_socket.to_string_lossy())
         .await
         .map_err(|e| format!("vol-mgr connect failed: {e}"))?;
     let mut job_ids = Vec::with_capacity(artifacts.len());
@@ -1158,6 +1194,7 @@ mod tests;
 pub(crate) async fn submit_streamed_metadata(
     payload: &SnapshotUploadJobs,
     logical_bytes: u64,
+    volume_manager_socket: &Path,
 ) -> Result<JobId, String> {
     let directory = payload
         .metadata_staging_dir
@@ -1184,7 +1221,7 @@ pub(crate) async fn submit_streamed_metadata(
         &payload.snapshot_id,
         SnapshotArtifact::Metadata,
     );
-    let mut client = pplx_space_volmgr_client::connect(VOLMGR_SOCKET)
+    let mut client = pplx_space_volmgr_client::connect(&volume_manager_socket.to_string_lossy())
         .await
         .map_err(|error| error.to_string())?;
     let response = client
