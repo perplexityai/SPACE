@@ -214,8 +214,13 @@ fn native_create_rejects_zero_vcpu_before_operation_admission() {
     }
 }
 
+#[rstest::rstest]
+#[case(false)]
+#[case(true)]
 #[tokio::test]
-async fn native_create_persists_default_policy_in_operation_payload() -> TestDbResult<()> {
+async fn native_create_persists_default_policy_in_operation_payload(
+    #[case] federated: bool,
+) -> TestDbResult<()> {
     let db = pg_test_db().await?;
     let context: crate::fork_operations::ForkFederatedCreateContext =
         serde_json::from_value(serde_json::json!({
@@ -228,8 +233,9 @@ async fn native_create_persists_default_policy_in_operation_payload() -> TestDbR
         Some(serde_json::from_value(serde_json::json!(["audit"]))?),
     ];
     for (initial, selection) in selections.iter().enumerate() {
-        let idempotency_key =
-            IdempotencyKey::parse(format!("native-default-policy-persistence-{initial}"))?;
+        let idempotency_key = IdempotencyKey::parse(format!(
+            "native-default-policy-persistence-{federated}-{initial}"
+        ))?;
         let mut admitted = context.clone();
         admitted.egress_profiles = selection.clone();
         let response = create_native_sandbox_operation(
@@ -238,7 +244,10 @@ async fn native_create_persists_default_policy_in_operation_payload() -> TestDbR
             UserId::from_uuid(SEED_USER_ID),
             &idempotency_key,
             create_request_with_auto_lifecycle(None),
-            Some(admitted),
+            NativeCreateContext {
+                egress_profiles: (!federated).then(|| selection.clone()).flatten(),
+                federated_create: federated.then_some(admitted),
+            },
             None,
         )
         .await
@@ -252,7 +261,10 @@ async fn native_create_persists_default_policy_in_operation_payload() -> TestDbR
                 UserId::from_uuid(SEED_USER_ID),
                 &idempotency_key,
                 create_request_with_auto_lifecycle(None),
-                Some(retried),
+                NativeCreateContext {
+                    egress_profiles: (!federated).then(|| selection.clone()).flatten(),
+                    federated_create: federated.then_some(retried),
+                },
                 None,
             )
             .await;
@@ -282,10 +294,15 @@ async fn native_create_persists_default_policy_in_operation_payload() -> TestDbR
         .await?;
         let payload: CreateSandboxOperationPayload = serde_json::from_value(payload)?;
         assert_eq!(
-            &payload
-                .federated_create
-                .expect("federated context is durable")
-                .egress_profiles,
+            &if federated {
+                payload
+                    .federated_create
+                    .expect("federated context is durable")
+                    .egress_profiles
+            } else {
+                assert!(payload.federated_create.is_none());
+                payload.egress_profiles
+            },
             selection,
             "explicitly empty selection must survive serialization and retries",
         );

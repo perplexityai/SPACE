@@ -30,8 +30,11 @@ Authenticated federated native (`POST /v1/sandboxes`) and ECW (`POST /sandboxes`
 creates select profiles with `X-Space-Egress-Profiles: +sensor -audit`.
 An absent header selects defaults only. Tokens are separated by single spaces;
 empty, malformed, repeated, conflicting, and unknown tokens return HTTP 400.
-A non-federated create ignores the header and applies no profiles, including
-defaults, while recording an invalid-request admission.
+A service credential permitted to assert federated owners may also select explicit
+profiles without asserting an owner. These service-owned creates apply only the
+requested profiles, never defaults, and keep their normal ownership and encryption
+policy. Other non-federated creates ignore the header and apply no profiles,
+including defaults, while recording an invalid-request admission.
 
 Composition adds allows and exemptions without duplicates. Default-deny policies
 also receive the ECW DNS resolver allowances. Explicit tenant denies and platform
@@ -65,6 +68,8 @@ use `profile:unknown`; missing saved definitions use the previously admitted nam
 Alert on `failed/unconfigured` for configuration drift.
 
 Upgrade database schemas and queued operation executors before API producers.
+Service-owned native selections use a separate `egress_profiles` payload field;
+older executors reject that field. Existing federated payloads are unchanged.
 Configure every API and cluster-controller replica before callers send selections
 or rely on changed definitions. Different definitions may compose different
 policies; a worker missing a selected name returns 503 and may exhaust retries.

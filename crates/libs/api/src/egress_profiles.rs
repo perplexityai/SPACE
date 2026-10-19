@@ -1,4 +1,4 @@
-//! Operator-owned additions selected only by authenticated federated creates.
+//! Operator-owned additions selected by trusted service or federated creates.
 //! Selected names are durable; fresh policy composition uses current definitions.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -15,7 +15,7 @@ pub struct EgressProfiles(BTreeMap<ProfileName, EgressProfile>);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
-pub(crate) struct EgressProfileSelection {
+pub struct EgressProfileSelection {
     names: BTreeSet<ProfileName>,
 }
 
@@ -123,6 +123,26 @@ pub enum EgressProfileSelectionError {
     Unconfigured(String),
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum EgressProfileAccess {
+    Untrusted,
+    Federated,
+    TrustedService,
+}
+
+impl EgressProfileAccess {
+    pub(crate) fn for_request(federated: bool, key: Option<&crate::models::ApiKey>) -> Self {
+        if federated {
+            Self::Federated
+        } else if key.is_some_and(|key| key.federated_owner_assertions_enabled) {
+            // Reuse the integration's existing trust boundary without asserting an owner.
+            Self::TrustedService
+        } else {
+            Self::Untrusted
+        }
+    }
+}
+
 impl EgressProfiles {
     pub fn from_env() -> Result<Self, EgressProfilesConfigError> {
         match std::env::var(ENV) {
@@ -139,9 +159,9 @@ impl EgressProfiles {
     pub(crate) fn select(
         &self,
         header: Option<&str>,
-        federated: bool,
+        access: EgressProfileAccess,
     ) -> Result<EgressProfileSelection, EgressProfileSelectionError> {
-        if !federated {
+        if matches!(access, EgressProfileAccess::Untrusted) {
             if header.is_some() {
                 invalid_request();
             }
@@ -150,7 +170,9 @@ impl EgressProfiles {
         let mut selected: BTreeSet<_> = self
             .0
             .iter()
-            .filter(|(_, profile)| profile.default)
+            .filter(|(_, profile)| {
+                matches!(access, EgressProfileAccess::Federated) && profile.default
+            })
             .map(|(name, _)| name.clone())
             .collect();
         if let Some(header) = header {
@@ -287,11 +309,11 @@ impl crate::controllers::sandbox::SandboxController {
     pub(crate) fn select_egress_profiles(
         &self,
         headers: &axum::http::HeaderMap,
-        federated: bool,
+        access: EgressProfileAccess,
     ) -> Result<EgressProfileSelection, EgressProfileSelectionError> {
         let mut values = headers.get_all(HEADER).iter();
         let header = values.next();
-        if !federated {
+        if matches!(access, EgressProfileAccess::Untrusted) {
             if header.is_some() {
                 invalid_request();
             }
@@ -303,6 +325,6 @@ impl crate::controllers::sandbox::SandboxController {
         let header = header
             .map(|value| value.to_str().map_err(|_| invalid_request()))
             .transpose()?;
-        self.egress_profiles.select(header, true)
+        self.egress_profiles.select(header, access)
     }
 }

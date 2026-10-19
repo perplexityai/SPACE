@@ -54,6 +54,9 @@ pub struct CreateSandboxOperationPayload {
     /// Consumers must be upgraded before federated native admission is enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub federated_create: Option<crate::fork_operations::ForkFederatedCreateContext>,
+    /// Explicit service-owned selection; upgrade executors before producers send it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_profiles: Option<crate::egress_profiles::EgressProfileSelection>,
     /// The warm-pool slot claimed for this create at admission, whose reserved
     /// ID is `sandbox_id`. The executor adopts that exact slot, or builds cold
     /// under the same ID if the slot can no longer be adopted.
@@ -423,10 +426,16 @@ impl CreateSandboxOperationExecutor {
             federated.as_ref().map(|(_, grant)| grant),
         )
         .with_egress_profiles(Some(
+            // The separate service selection wins; nested selections support older producers.
             payload
-                .federated_create
+                .egress_profiles
                 .as_ref()
-                .and_then(|context| context.egress_profiles.as_ref())
+                .or_else(|| {
+                    payload
+                        .federated_create
+                        .as_ref()
+                        .and_then(|context| context.egress_profiles.as_ref())
+                })
                 .unwrap_or(&empty_profiles),
         ));
         let response = match payload.pool_claim {

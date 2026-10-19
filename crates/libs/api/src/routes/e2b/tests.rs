@@ -1578,7 +1578,7 @@ async fn sdk_v2_create_and_connect_routes_are_mounted() {
 #[cfg(feature = "kubernetes")]
 #[rstest]
 #[tokio::test(flavor = "current_thread")]
-async fn egress_profile_header_applies_only_to_federated_creates(
+async fn egress_profile_header_requires_trusted_service_or_federated_owner(
     #[future] kubernetes_app_state_fixture: TestResult<KubernetesAppStateFixture>,
 ) -> TestResult {
     if !crate::test_support::enter_sim_worker_process() {
@@ -1624,7 +1624,7 @@ async fn egress_profile_header_applies_only_to_federated_creates(
         subject_id: UpstreamSubjectId::parse("example-user")?,
     };
     let materialized = crate::federated_identity::materialize_owner(&fixture.pool, &owner).await?;
-    for federated in [false, true] {
+    for (federated, trusted) in [(false, false), (false, true), (true, true)] {
         let user_id = if federated {
             materialized.user_id
         } else {
@@ -1640,6 +1640,20 @@ async fn egress_profile_header_applies_only_to_federated_creates(
         let mut app = e2b_api_routes()
             .layer(Extension(AuthEcwActor(Some(actor))))
             .layer(Extension(test_ecw_host_config()));
+        app = app.layer(Extension(crate::middleware::auth::AuthApiKey(
+            crate::models::ApiKey {
+                id: Uuid::now_v7(),
+                org_id: OrgId::from_uuid(SEED_ORG_ID),
+                name: "profile-test".into(),
+                key_hash: String::new(),
+                created_by: None,
+                last_used_at: None,
+                federated_owner_assertions_enabled: trusted,
+                allowed_surfaces: vec![crate::api_surface::ApiSurface::Ecw],
+                created_at: OffsetDateTime::now_utc(),
+                updated_at: OffsetDateTime::now_utc(),
+            },
+        )));
         if federated {
             app = app.layer(Extension(crate::middleware::auth::AuthFederatedOwner(
                 owner.clone(),
@@ -1674,14 +1688,26 @@ async fn egress_profile_header_applies_only_to_federated_creates(
         let sandbox = crate::controllers::sandbox::fetch_sandbox(&fixture.pool, sandbox_id)
             .await?
             .expect("created sandbox");
+        assert_eq!(sandbox.user_id, user_id);
+        assert_eq!(
+            sandbox.org_id,
+            if federated {
+                materialized.org_id
+            } else {
+                OrgId::from_uuid(SEED_ORG_ID)
+            }
+        );
         let policy = sandbox.network_policy.expect("resolved policy").0;
-        assert_eq!(policy.allows_domain("sensor.example.test"), federated);
+        assert_eq!(
+            policy.allows_domain("sensor.example.test"),
+            federated || trusted
+        );
         assert!(!policy.allows_domain("unlisted.example.test"));
         assert_eq!(
             crate::egress_profiles::load(&fixture.pool, sandbox_id)
                 .await?
                 .is_empty(),
-            !federated
+            !(federated || trusted)
         );
     }
     Ok(())

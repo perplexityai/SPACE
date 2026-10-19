@@ -216,7 +216,7 @@ impl AdmissionPoolFixture {
             self.user_id,
             &IdempotencyKey::parse(idempotency_key).expect("fixture idempotency key parses"),
             request,
-            None,
+            super::NativeCreateContext::default(),
             pool_claims,
         )
         .await

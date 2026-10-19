@@ -1,3 +1,4 @@
+use super::EgressProfileAccess::{Federated, TrustedService, Untrusted};
 use super::*;
 
 #[rstest::rstest]
@@ -174,18 +175,30 @@ fn selection_preserves_defaults_and_rejects_invalid_requests() {
     let names = |profiles: EgressProfileSelection| {
         profiles.names.into_iter().map(|n| n.0).collect::<Vec<_>>()
     };
-    assert_eq!(names(configured.select(None, true).unwrap()), ["baseline"]);
     assert_eq!(
-        names(configured.select(Some("+sensor -baseline"), true).unwrap()),
+        names(configured.select(None, Federated).unwrap()),
+        ["baseline"]
+    );
+    assert_eq!(
+        names(
+            configured
+                .select(Some("+sensor -baseline"), Federated)
+                .unwrap()
+        ),
         ["sensor"]
     );
     assert_eq!(
-        names(configured.select(Some("+sensor"), true).unwrap()),
+        names(configured.select(Some("+sensor"), Federated).unwrap()),
         ["baseline", "sensor"]
     );
-    assert!(names(configured.select(Some("+sensor"), false).unwrap()).is_empty());
-    assert!(names(configured.select(None, false).unwrap()).is_empty());
-    assert!(names(EgressProfiles::default().select(None, true).unwrap()).is_empty());
+    assert!(names(configured.select(Some("+sensor"), Untrusted).unwrap()).is_empty());
+    assert!(names(configured.select(None, Untrusted).unwrap()).is_empty());
+    assert!(names(EgressProfiles::default().select(None, Federated).unwrap()).is_empty());
+    assert!(names(configured.select(None, TrustedService).unwrap()).is_empty());
+    assert_eq!(
+        names(configured.select(Some("+sensor"), TrustedService).unwrap()),
+        ["sensor"]
+    );
     for header in [
         "",
         "sensor",
@@ -197,6 +210,9 @@ fn selection_preserves_defaults_and_rejects_invalid_requests() {
         "-missing",
         "+sensor\t-baseline",
     ] {
-        assert!(configured.select(Some(header), true).is_err(), "{header}");
+        assert!(
+            configured.select(Some(header), Federated).is_err(),
+            "{header}"
+        );
     }
 }

@@ -1192,7 +1192,13 @@ impl SandboxController {
             ));
         } else {
             self.egress_profiles
-                .select(None, federated.owner.is_some())
+                .select(
+                    None,
+                    crate::egress_profiles::EgressProfileAccess::for_request(
+                        federated.owner.is_some(),
+                        None,
+                    ),
+                )
                 .map_err(|error| ControllerError::bad_request(error.to_string()))?
         };
         if restore_from.is_some() && req.node_pool.is_some() {

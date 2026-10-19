@@ -2801,7 +2801,10 @@ async fn postgres_federated_restore_inserts_restore_ownership() -> TestResult {
     let profiles = crate::egress_profiles::EgressProfiles::from_config(
         r#"{"sensor":{"allow":[{"domain":"sensor.example.test"}]}}"#,
     )?;
-    let selection = profiles.select(Some("+sensor"), true)?;
+    let selection = profiles.select(
+        Some("+sensor"),
+        crate::egress_profiles::EgressProfileAccess::Federated,
+    )?;
     // The source and its configuration may be gone; restore retains the saved policy.
     let controller = direct_sandbox_controller(&db.pool);
     let mut req = pooled_create_request("federated-restore-sandbox", None);

@@ -80,6 +80,7 @@ pub async fn create_sandbox(
     Extension(AuthOrg(org)): Extension<AuthOrg>,
     Extension(AuthUser(actor)): Extension<AuthUser>,
     federated: Option<Extension<AuthFederatedOwner>>,
+    api_key: Option<Extension<crate::middleware::auth::AuthApiKey>>,
     headers: HeaderMap,
     Json(request): Json<CreateSandboxRequest>,
 ) -> Result<impl IntoResponse, PublicApiError> {
@@ -91,12 +92,18 @@ pub async fn create_sandbox(
     let grant = super::owner_scope::required_grant(&headers, owner)?;
     let selected = state
         .sandbox_controller
-        .select_egress_profiles(&headers, owner.is_some())
+        .select_egress_profiles(
+            &headers,
+            crate::egress_profiles::EgressProfileAccess::for_request(
+                owner.is_some(),
+                api_key.as_ref().map(|Extension(key)| &key.0),
+            ),
+        )
         .map_err(|error| PublicApiError::bad_request(error.to_string()))?;
     let federated_create = owner.zip(grant.as_ref()).map(|(owner, grant)| {
         let mut context =
             crate::fork_operations::ForkFederatedCreateContext::from_request(owner, grant);
-        context.egress_profiles = Some(selected);
+        context.egress_profiles = Some(selected.clone());
         context
     });
     let pool_claims =
@@ -110,7 +117,10 @@ pub async fn create_sandbox(
         actor.id,
         &idempotency_key,
         request,
-        federated_create,
+        NativeCreateContext {
+            federated_create,
+            egress_profiles: (owner.is_none() && !selected.is_empty()).then_some(selected),
+        },
         pool_claims,
     )
     .await?;
@@ -158,6 +168,12 @@ pub(crate) struct NativeCreatePoolClaims<'a> {
     pub(crate) inline: Option<inline_create::InlineCreate>,
 }
 
+#[derive(Default)]
+pub(crate) struct NativeCreateContext {
+    pub(crate) federated_create: Option<crate::fork_operations::ForkFederatedCreateContext>,
+    pub(crate) egress_profiles: Option<crate::egress_profiles::EgressProfileSelection>,
+}
+
 /// Record a native create.
 ///
 /// `pool_claims` is `None` when admission-time pool claiming is off, which
@@ -179,13 +195,22 @@ pub(crate) async fn create_native_sandbox_operation(
     actor_user_id: UserId,
     idempotency_key: &IdempotencyKey,
     request: CreateSandboxRequest,
-    federated_create: Option<crate::fork_operations::ForkFederatedCreateContext>,
+    context: NativeCreateContext,
     pool_claims: Option<NativeCreatePoolClaims<'_>>,
 ) -> Result<SandboxOperationResponse, PublicApiError> {
+    let NativeCreateContext {
+        federated_create,
+        egress_profiles,
+    } = context;
     let (request, mut fingerprint) = prepare_native_create_request(request)?;
-    if let Some(profiles) = federated_create
+    // The separate service selection wins; nested selections support federated callers.
+    if let Some(profiles) = egress_profiles
         .as_ref()
-        .and_then(|context| context.egress_profiles.as_ref())
+        .or_else(|| {
+            federated_create
+                .as_ref()
+                .and_then(|context| context.egress_profiles.as_ref())
+        })
         // Preserve pre-profile fingerprints for empty selections without changing the payload.
         .filter(|profiles| !profiles.is_empty())
     {
@@ -243,6 +268,7 @@ pub(crate) async fn create_native_sandbox_operation(
                     // Placement is operator-only (admin surface); the public API never pins.
                     node_pool: None,
                     federated_create: federated_create.clone(),
+                    egress_profiles: egress_profiles.clone(),
                     pool_claim: pool_claim.map(|claim| claim.claim.into()),
                 }
                 .into_json(),

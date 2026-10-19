@@ -324,6 +324,7 @@ pub(super) async fn create_sandbox(
         crate::middleware::auth::AuthEcwActor,
     >,
     federated: Option<Extension<crate::middleware::auth::AuthFederatedOwner>>,
+    api_key: Option<Extension<crate::middleware::auth::AuthApiKey>>,
     headers: HeaderMap,
     crate::e2b::E2bJson(req): crate::e2b::E2bJson<CreateSandboxRequestE2b>,
 ) -> Result<impl IntoResponse, E2bApiError> {
@@ -341,7 +342,13 @@ pub(super) async fn create_sandbox(
     let federated_owner = federated_owner_ref(&federated);
     let egress_profiles = state
         .sandbox_controller
-        .select_egress_profiles(&headers, federated_owner.is_some())
+        .select_egress_profiles(
+            &headers,
+            crate::egress_profiles::EgressProfileAccess::for_request(
+                federated_owner.is_some(),
+                api_key.as_ref().map(|Extension(key)| &key.0),
+            ),
+        )
         .map_err(|error| E2bApiError::bad_request(error.to_string()))?;
     let federated_service_grant = request_federated_service_grant(&headers, federated_owner)?;
     let translated = translate_create_request(req)?;

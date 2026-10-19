@@ -53,6 +53,7 @@ fn claimed_create_operation_for(
             request: public_create_request(),
             node_pool: None,
             federated_create: None,
+            egress_profiles: None,
             pool_claim: None,
         }
         .into_json(),
@@ -148,6 +149,7 @@ async fn native_create_executor_preserves_operator_policy_across_replacements() 
     for (configured, federated, selected) in [
         (false, false, false),
         (true, false, false),
+        (true, false, true),
         (true, true, false), // Legacy federated payload: no saved selection.
         (true, true, true),
     ] {
@@ -182,7 +184,10 @@ async fn native_create_executor_preserves_operator_policy_across_replacements() 
             let mut headers = axum::http::HeaderMap::new();
             headers.insert(crate::egress_profiles::HEADER, "+sensor".parse()?);
             context.egress_profiles = if selected {
-                Some(admission.select_egress_profiles(&headers, true)?)
+                Some(admission.select_egress_profiles(
+                    &headers,
+                    crate::egress_profiles::EgressProfileAccess::TrustedService,
+                )?)
             } else {
                 None
             };
@@ -192,6 +197,9 @@ async fn native_create_executor_preserves_operator_policy_across_replacements() 
                 sandbox_id: sandbox_id.into(),
                 request,
                 node_pool: None,
+                egress_profiles: (!federated)
+                    .then(|| context.egress_profiles.clone())
+                    .flatten(),
                 federated_create: federated.then_some(context),
                 pool_claim: None,
             }
@@ -299,7 +307,7 @@ async fn native_create_executor_preserves_operator_policy_across_replacements() 
     }
     assert_eq!(
         captured_pods.lock().expect("capture mutex poisoned").len(),
-        8
+        10
     );
     Ok(())
 }
@@ -483,6 +491,7 @@ async fn existing_row_create_persists_the_renewed_grant() -> TestResult {
             federated_create: Some(
                 crate::fork_operations::ForkFederatedCreateContext::from_request(&owner, &renewed),
             ),
+            egress_profiles: None,
             pool_claim: None,
         }
         .into_json();
@@ -754,6 +763,7 @@ async fn seed_unpinned_create_operation(pool: &PgPool) -> ClaimedPublicOperation
             request: public_create_request(),
             node_pool: None,
             federated_create: None,
+            egress_profiles: None,
             pool_claim: None,
         }
         .into_json(),
@@ -846,6 +856,7 @@ fn create_operation_payload_is_wire_compatible_with_old_shape() {
         request: public_create_request(),
         node_pool: None,
         federated_create: None,
+        egress_profiles: None,
         pool_claim: None,
     };
     let value = serde_json::to_value(&unpinned).unwrap();
@@ -865,6 +876,7 @@ fn create_operation_payload_is_wire_compatible_with_old_shape() {
         request: public_create_request(),
         node_pool: Some(NodePoolName::parse("isolated-test-pool").unwrap()),
         federated_create: None,
+        egress_profiles: None,
         pool_claim: None,
     };
     let pinned_value = serde_json::to_value(&pinned).unwrap();
@@ -1121,6 +1133,7 @@ fn create_operation_payload_pool_claim_is_optional_on_the_wire() {
         request: public_create_request(),
         node_pool: None,
         federated_create: None,
+        egress_profiles: None,
         pool_claim: None,
     };
     let value = serde_json::to_value(&cold).unwrap();
