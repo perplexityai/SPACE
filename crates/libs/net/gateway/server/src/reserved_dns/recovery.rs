@@ -28,8 +28,9 @@ impl RecoveringResolver {
         config: ResolverConfig,
         options: ResolverOpts,
         runtime: GatewayRuntimeProvider,
+        resolver: ReservedResolver,
     ) -> Result<Self, BuildReservedDnsCoreError> {
-        let provider = LoggingConnectionProvider(runtime);
+        let provider = LoggingConnectionProvider::new(runtime, resolver);
         let builder =
             Resolver::builder_with_config(config.clone(), provider.clone()).with_options(options);
         let resolver =

@@ -998,3 +998,42 @@ or `default`. A partial request reports the fallback that filled the gap. The
 `runtime` and `template`. A non-zero `shape_source:default` count means creates
 fell back to the platform default shape; those events omit `vcpu` and
 `memory_mib`. Direct creates and forks omit `shape_source`.
+
+## Reserved DNS upstream connections
+
+The net-gateway resolves guest queries to the reserved resolver addresses over
+DNS-over-TLS through Hickory. Upstreams close idle connections routinely.
+Hickory would report a send on a closed connection as `Busy`, treat it as
+backpressure, and after a few closed pooled connections fail the lookup with
+`NoConnections`, which makes the gateway rebuild the resolver and drop its
+cache.
+
+The gateway learns when Hickory's task for a connection exits, so such a send
+never reaches Hickory. A request that times out or fails in transport marks its
+connection failed too: a connection can stall without closing, and Hickory
+would otherwise keep every other pooled connection that shares it until each
+timed out in turn. A send on a closed or failed connection moves to the newest
+usable connection to the same upstream, or to the one reconnect that every
+such send shares. The reconnect runs to completion even if those sends are
+cancelled. The connection count shrinks back to one after a burst. Each of
+these sends counts once in `gateway.reserved_dns.upstream_closed`, tagged
+`resolver` and `outcome`: `reused`, `reconnected`, or `failed` when the
+reconnect failed and no connection was usable.
+
+These still warn and count as before:
+
+- `reserved DNS upstream connection failed` for any failed connection,
+  including a failed reconnect;
+- `reserved DNS upstream request failed` for every error Hickory receives,
+  including a failed reconnect and `Busy` from an open connection at its
+  request limit;
+- `reserved DNS resolver replaced after NoConnections`, now reached by real
+  connection failures rather than idle closes;
+- the guest-facing `reserved DNS request failed` warning and
+  `gateway.reserved_dns.request.duration_ms`, both with `reason` `transport`,
+  for lookups that fail with `NoConnections`; Hickory reports exhausted `Busy`
+  as `NoConnections` too, so this path does not produce `resolver_busy`.
+
+`gateway.reserved_dns.upstream_busy.lookup_in_flight` samples only `Busy` that
+reaches Hickory, not sends on closed connections. A send that races the
+connection's exit can still reach Hickory as `Busy`.

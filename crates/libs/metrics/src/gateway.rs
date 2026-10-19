@@ -155,12 +155,43 @@ pub fn reserved_dns_udp_in_flight(active: usize) {
     );
 }
 
-/// SPACE lookup occupancy sampled when Hickory reports Busy.
+/// SPACE lookup occupancy sampled when Hickory reports Busy. A send that finds
+/// its pooled connection closed by the upstream, or failed, does not reach
+/// Hickory as Busy and is counted by [`reserved_dns_upstream_closed`] instead.
 pub fn reserved_dns_upstream_busy_lookup_in_flight(active: usize) {
     distribution(
         "gateway.reserved_dns.upstream_busy.lookup_in_flight",
         active as f64,
         &[tag("git_sha", pplx_space_observability::git_sha())],
+    );
+}
+
+metric_vocabulary!(
+    /// How a reserved-DNS send continued after finding its pooled upstream
+    /// connection closed or failed.
+    ReservedDnsUpstreamClosedOutcome {
+        /// It moved to the newest usable connection to the same upstream.
+        Reused => "reused",
+        /// It used the connection opened by the reconnect that every send
+        /// finding no usable connection shares.
+        Reconnected => "reconnected",
+        /// The reconnect failed and no connection was usable; Hickory sees the
+        /// connection error.
+        Failed => "failed",
+    }
+);
+
+/// `gateway.reserved_dns.upstream_closed`: one reserved-DNS send that found
+/// its pooled upstream connection closed, usually by the upstream's idle
+/// timeout, or failed by an earlier request's timeout or reset, tagged by
+/// `resolver` (`cloudflare` or `google`) and `outcome`.
+/// Routine idle closes count `reused` or `reconnected`; `failed` accompanies
+/// the connection-failed warning.
+pub fn reserved_dns_upstream_closed(resolver: &str, outcome: ReservedDnsUpstreamClosedOutcome) {
+    counter(
+        "gateway.reserved_dns.upstream_closed",
+        1,
+        &[tag("resolver", resolver), tag("outcome", outcome.as_str())],
     );
 }
 

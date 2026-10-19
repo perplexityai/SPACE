@@ -416,8 +416,8 @@ struct HickoryResolverSet {
 impl HickoryResolverSet {
     fn new(lookup_slots: Arc<Semaphore>) -> Result<Self, BuildReservedDnsCoreError> {
         Ok(Self {
-            cloudflare: build_hickory_resolver(CLOUDFLARE_DNS, lookup_slots.clone())?,
-            google: build_hickory_resolver(GOOGLE_DNS, lookup_slots)?,
+            cloudflare: build_hickory_resolver(ReservedResolver::Cloudflare, lookup_slots.clone())?,
+            google: build_hickory_resolver(ReservedResolver::Google, lookup_slots)?,
         })
     }
 
@@ -476,19 +476,17 @@ impl ResolverBackend for HickoryResolverSet {
 }
 
 fn build_hickory_resolver(
-    expected_ip: Ipv4Addr,
+    resolver: ReservedResolver,
     lookup_slots: Arc<Semaphore>,
 ) -> Result<RecoveringResolver, BuildReservedDnsCoreError> {
-    let server = if expected_ip == CLOUDFLARE_DNS {
-        CLOUDFLARE
-            .tls()
-            .find(|server| server.ip == IpAddr::V4(expected_ip))
-    } else {
-        GOOGLE
-            .tls()
-            .find(|server| server.ip == IpAddr::V4(expected_ip))
-    }
-    .expect("Hickory public resolver configuration contains the reviewed IPv4 endpoint");
+    let (expected_ip, servers) = match resolver {
+        ReservedResolver::Cloudflare => (CLOUDFLARE_DNS, &CLOUDFLARE),
+        ReservedResolver::Google => (GOOGLE_DNS, &GOOGLE),
+    };
+    let server = servers
+        .tls()
+        .find(|server| server.ip == IpAddr::V4(expected_ip))
+        .expect("Hickory public resolver configuration contains the reviewed IPv4 endpoint");
     let config = ResolverConfig::from_parts(None, Vec::new(), vec![server]);
     let mut options = ResolverOpts::default();
     options.timeout = ATTEMPT_TIMEOUT;
@@ -507,6 +505,7 @@ fn build_hickory_resolver(
         config,
         options,
         GatewayRuntimeProvider::marked(lookup_slots),
+        resolver,
     )
 }
 
