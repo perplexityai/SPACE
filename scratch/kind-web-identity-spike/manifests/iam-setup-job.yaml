@@ -1,0 +1,79 @@
+# SPIKE: registers the cluster's ServiceAccount issuer with versitygw's IAM
+# service, the two workload roles, and the vend role's new trust. Shortcut:
+# it carries the bucket-init Job's label so the IAM NetworkPolicy admits it.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: spike-web-identity-iam-setup
+  namespace: space
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: space-object-store-bucket-init
+        app.kubernetes.io/instance: space-object-store
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        space.pplx.net/infra: "true"
+      containers:
+        - name: setup
+          image: public.ecr.aws/aws-cli/aws-cli:2.27.41
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              iam() { aws --no-cli-pager --endpoint-url https://object-store-iam:7070 --ca-bundle /etc/space-rpc-ca/ca.crt iam "$@"; }
+              k8s=kubernetes.default.svc.cluster.local
+              arn="arn:aws:iam::000000000000:oidc-provider/$k8s"
+              if iam get-open-id-connect-provider --open-id-connect-provider-arn "$arn" >/dev/null 2>&1; then
+                iam update-open-id-connect-provider-thumbprint --open-id-connect-provider-arn "$arn" --thumbprint-list "$THUMBPRINT"
+              else
+                iam create-open-id-connect-provider --url "https://$k8s" --client-id-list sts.amazonaws.com --thumbprint-list "$THUMBPRINT"
+              fi
+              # The audience EKS Pod Identity tokens carry (podidentity.go).
+              iam add-client-id-to-open-id-connect-provider --open-id-connect-provider-arn "$arn" --client-id pods.eks.amazonaws.com
+              trust() {
+                printf '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Federated":"%s"},"Action":"sts:AssumeRoleWithWebIdentity","Condition":{"StringEquals":{"%s:sub":"system:serviceaccount:%s","%s:aud":["sts.amazonaws.com","pods.eks.amazonaws.com"]}}}]}' "$arn" "$k8s" "$1" "$k8s"
+              }
+              role() {
+                if iam get-role --role-name "$1" >/dev/null 2>&1; then
+                  iam update-assume-role-policy --role-name "$1" --policy-document "$(trust "$2")"
+                else
+                  iam create-role --role-name "$1" --max-session-duration 3600 --assume-role-policy-document "$(trust "$2")" >/dev/null
+                fi
+              }
+              # The authority's base role: no permissions of its own, as the
+              # EKS credential_manager_iam module attaches none.
+              role kind-credmgr-authority space:space-credmgr-authority
+              # A role for the probe pod, to show the vend role refuses it.
+              role kind-spike-probe space:spike-web-identity-probe
+              # cluster-controller: the EKS module's snapshots reap policy.
+              role kind-cluster-controller space:space-cluster-controller
+              iam put-role-policy --role-name kind-cluster-controller --policy-name snapshots-reap --policy-document \
+                '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:ListBucket"],"Resource":["arn:aws:s3:::snapshots"]},{"Effect":"Allow","Action":["s3:DeleteObject"],"Resource":["arn:aws:s3:::snapshots/*"]}]}'
+              # The vend role now trusts the bridge's tokens for the
+              # authority's base role (the bridge mints them only for a
+              # session the store confirmed), and still the static vend
+              # identity so the stock chart keeps working.
+              b=sts-bridge.kind.invalid
+              iam update-assume-role-policy --role-name kind-storage-vend --policy-document \
+                "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Federated\":\"arn:aws:iam::000000000000:oidc-provider/$b\"},\"Action\":\"sts:AssumeRoleWithWebIdentity\",\"Condition\":{\"StringEquals\":{\"$b:sub\":[\"kind-storage-vend\",\"arn:aws:iam::000000000000:role/kind-credmgr-authority\"],\"$b:aud\":\"kind-sts-bridge\"}}}]}"
+              iam list-roles --query 'Roles[].Arn' --output text
+              iam get-open-id-connect-provider --open-id-connect-provider-arn "$arn"
+          env:
+            - name: THUMBPRINT
+              value: "${SPIKE_THUMBPRINT}"
+            - name: AWS_DEFAULT_REGION
+              value: us-east-1
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom: {secretKeyRef: {name: space-object-store, key: SPACE_OBJECT_STORE_STATIC_ACCESS_KEY_ID}}
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom: {secretKeyRef: {name: space-object-store, key: SPACE_OBJECT_STORE_STATIC_SECRET_ACCESS_KEY}}
+          volumeMounts:
+            - {name: rpc-ca, mountPath: /etc/space-rpc-ca, readOnly: true}
+      volumes:
+        - name: rpc-ca
+          secret: {secretName: space-internal-rpc-ca}

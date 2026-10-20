@@ -1,0 +1,17 @@
+# SPIKE: versitygw fetches the issuer's discovery document and JWKS
+# anonymously; kube-apiserver serves them only to the ClusterRole
+# system:service-account-issuer-discovery, which a default cluster binds to
+# system:serviceaccounts. This opens that role (public keys only) to
+# unauthenticated callers, as Kubernetes documents for public discovery.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: space-kind-oidc-discovery-anonymous
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:service-account-issuer-discovery
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: system:unauthenticated

@@ -1,0 +1,46 @@
+# SPIKE: undoes iam-setup-job.yaml: the spike's roles and the cluster issuer's
+# provider go, and the vend role's trust returns to the chart's
+# (TRUST_POLICY, read from the bucket-init Job by spike.sh revert).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: spike-web-identity-iam-cleanup
+  namespace: space
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: space-object-store-bucket-init
+        app.kubernetes.io/instance: space-object-store
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        space.pplx.net/infra: "true"
+      containers:
+        - name: cleanup
+          image: public.ecr.aws/aws-cli/aws-cli:2.27.41
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              iam() { aws --no-cli-pager --endpoint-url https://object-store-iam:7070 --ca-bundle /etc/space-rpc-ca/ca.crt iam "$@"; }
+              iam delete-role-policy --role-name kind-cluster-controller --policy-name snapshots-reap 2>/dev/null || true
+              for r in kind-credmgr-authority kind-spike-probe kind-cluster-controller; do iam delete-role --role-name "$r" 2>/dev/null || true; done
+              iam delete-open-id-connect-provider --open-id-connect-provider-arn arn:aws:iam::000000000000:oidc-provider/kubernetes.default.svc.cluster.local 2>/dev/null || true
+              iam update-assume-role-policy --role-name kind-storage-vend --policy-document "$TRUST_POLICY"
+              iam list-roles --query 'Roles[].Arn' --output text
+              iam list-open-id-connect-providers --output text
+          env:
+            - {name: TRUST_POLICY, value: '${SPIKE_TRUST_POLICY}'}
+            - {name: AWS_DEFAULT_REGION, value: us-east-1}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom: {secretKeyRef: {name: space-object-store, key: SPACE_OBJECT_STORE_STATIC_ACCESS_KEY_ID}}
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom: {secretKeyRef: {name: space-object-store, key: SPACE_OBJECT_STORE_STATIC_SECRET_ACCESS_KEY}}
+          volumeMounts:
+            - {name: rpc-ca, mountPath: /etc/space-rpc-ca, readOnly: true}
+      volumes:
+        - name: rpc-ca
+          secret: {secretName: space-internal-rpc-ca}

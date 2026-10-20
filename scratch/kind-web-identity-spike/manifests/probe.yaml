@@ -1,0 +1,40 @@
+# SPIKE: a pod with a projected ServiceAccount token (audience
+# sts.amazonaws.com, as IRSA projects) and the aws CLI, for the evidence.
+# Shortcut: labelled as the STS bridge so the IAM NetworkPolicy admits it.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spike-web-identity-probe
+  namespace: space
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: spike-web-identity-probe
+  namespace: space
+  labels:
+    app.kubernetes.io/name: space-kind-sts-bridge
+    spike: web-identity-probe
+spec:
+  serviceAccountName: spike-web-identity-probe
+  automountServiceAccountToken: false
+  nodeSelector:
+    space.pplx.net/infra: "true"
+  containers:
+    - name: probe
+      image: public.ecr.aws/aws-cli/aws-cli:2.27.41
+      imagePullPolicy: IfNotPresent
+      command: ["sleep", "infinity"]
+      env:
+        - {name: AWS_DEFAULT_REGION, value: us-east-1}
+        - {name: AWS_CA_BUNDLE, value: /etc/space-rpc-ca/ca.crt}
+      volumeMounts:
+        - {name: token, mountPath: /var/run/secrets/eks.amazonaws.com/serviceaccount, readOnly: true}
+        - {name: rpc-ca, mountPath: /etc/space-rpc-ca, readOnly: true}
+  volumes:
+    - name: token
+      projected:
+        sources:
+          - serviceAccountToken: {audience: sts.amazonaws.com, expirationSeconds: 3600, path: token}
+    - name: rpc-ca
+      secret: {secretName: space-internal-rpc-ca}
