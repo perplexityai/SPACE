@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 pub enum HashAlg {
     /// SHA-256, encoded as 32 bytes / 64 lowercase hex characters.
     Sha256,
+    /// BLAKE3, encoded as 32 bytes / 64 lowercase hex characters.
+    Blake3,
 }
 
 /// Default number of digest hex characters used for short display.
@@ -56,6 +58,7 @@ impl HashAlg {
     pub fn parse(value: &str) -> Result<Self, HashAlgParseError> {
         match value {
             "sha256" => Ok(Self::Sha256),
+            "blake3" => Ok(Self::Blake3),
             other => Err(HashAlgParseError(other.to_string())),
         }
     }
@@ -64,13 +67,14 @@ impl HashAlg {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Sha256 => "sha256",
+            Self::Blake3 => "blake3",
         }
     }
 
     /// Returns the digest byte length for this algorithm.
     pub const fn digest_len_bytes(self) -> usize {
         match self {
-            Self::Sha256 => 32,
+            Self::Sha256 | Self::Blake3 => 32,
         }
     }
 
@@ -274,6 +278,7 @@ impl From<DigestPrefix> for String {
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum Digest {
     Sha256([u8; 32]),
+    Blake3([u8; 32]),
 }
 
 impl Digest {
@@ -290,6 +295,11 @@ impl Digest {
         Self::Sha256(bytes)
     }
 
+    /// Creates a BLAKE3 digest from exactly 32 bytes.
+    pub const fn blake3(bytes: [u8; 32]) -> Self {
+        Self::Blake3(bytes)
+    }
+
     /// Returns the digest algorithm.
     ///
     /// # Examples
@@ -302,6 +312,7 @@ impl Digest {
     pub const fn algorithm(self) -> HashAlg {
         match self {
             Self::Sha256(_) => HashAlg::Sha256,
+            Self::Blake3(_) => HashAlg::Blake3,
         }
     }
 
@@ -309,7 +320,7 @@ impl Digest {
     pub fn hex_string(self) -> String {
         let mut encoded = String::with_capacity(self.algorithm().digest_hex_len());
         match self {
-            Self::Sha256(bytes) => {
+            Self::Sha256(bytes) | Self::Blake3(bytes) => {
                 for byte in bytes {
                     use std::fmt::Write as _;
                     write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
@@ -352,7 +363,7 @@ impl fmt::Debug for Digest {
 impl fmt::Display for Digest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Sha256(bytes) => {
+            Self::Sha256(bytes) | Self::Blake3(bytes) => {
                 write!(f, "{}:", self.algorithm())?;
                 for byte in bytes {
                     write!(f, "{byte:02x}")?;
@@ -389,18 +400,15 @@ impl FromStr for Digest {
             return Err(DigestParseError::InvalidHex);
         }
 
-        match algorithm {
-            HashAlg::Sha256 => {
-                let mut bytes = [0u8; 32];
-                for (byte, chunk) in bytes.iter_mut().zip(hex.as_bytes().as_chunks::<2>().0) {
-                    let chunk =
-                        std::str::from_utf8(chunk).map_err(|_| DigestParseError::InvalidHex)?;
-                    *byte =
-                        u8::from_str_radix(chunk, 16).map_err(|_| DigestParseError::InvalidHex)?;
-                }
-                Ok(Self::Sha256(bytes))
-            }
+        let mut bytes = [0u8; 32];
+        for (byte, chunk) in bytes.iter_mut().zip(hex.as_bytes().as_chunks::<2>().0) {
+            let chunk = std::str::from_utf8(chunk).map_err(|_| DigestParseError::InvalidHex)?;
+            *byte = u8::from_str_radix(chunk, 16).map_err(|_| DigestParseError::InvalidHex)?;
         }
+        Ok(match algorithm {
+            HashAlg::Sha256 => Self::Sha256(bytes),
+            HashAlg::Blake3 => Self::Blake3(bytes),
+        })
     }
 }
 

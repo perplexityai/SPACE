@@ -24,7 +24,7 @@ uv_lock_mode=--frozen
 if [ -n "${CI:-}" ]; then uv_lock_mode=--locked; fi
 # shellcheck source=../../ci/scripts/lib/uv-run.sh
 source "${repo_root}/ci/scripts/lib/uv-run.sh"
-space_uv_run "${uv_bin}" "${uv_lock_mode}" --with pglast==7.10 -- "${partial_index_checker_test}"
+space_uv_run "${uv_bin}" "${uv_lock_mode}" --with pglast==7.21 -- "${partial_index_checker_test}"
 
 write_migration_pair() {
   local repo="$1"

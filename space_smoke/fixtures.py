@@ -37,7 +37,7 @@ from space_smoke.capabilities import (
     ColdEvictionConfig,
     ColdEvictionControl,
     CrossNodeRestoreControl,
-    ForkableSandbox,
+    EcwForkResult,
     SnapshotReaperConfig,
     SnapshotReaperControl,
     FailedTransfer,
@@ -47,6 +47,7 @@ from space_smoke.capabilities import (
     StartupRecoveryReport,
     SuspendCodecControl,
     SandboxNetworkIsolationControl,
+    StorageExchangeControl,
     TelemetryBackendControl,
     LeaderElectionControl,
     RestoreFailure,
@@ -103,6 +104,7 @@ from space_smoke.pending_backup import PendingBackupAssertions
 from space_smoke.template_build import TemplateBuildAssertions
 from space_smoke.rate_limiters import RateLimiterAssertions
 from space_smoke.sandbox_network_isolation import SandboxNetworkIsolationAssertions
+from space_smoke.storage_exchange import StorageExchangeScopingAssertions
 from space_smoke.telemetry_delivery import TelemetryDeliveryAssertions
 from space_smoke.leader_election import LeaderElectionAssertions
 from space_smoke.config import DEFAULT_SANDBOX_TIMEOUT_SECONDS
@@ -824,6 +826,17 @@ class EcwSandboxCollection(SandboxCollection):
                 allow_internet_access=allow_internet_access,
                 network=network,
             )
+
+    def fork(
+        self,
+        source: EcwSandbox,
+        *,
+        idempotency_key: str | None = None,
+        timeout: int | None = None,
+    ) -> EcwForkResult:
+        """Fork a run-owned source with child cleanup armed before dispatch."""
+
+        return self._sandboxes.fork(source, idempotency_key=idempotency_key, timeout=timeout)
 
 
 @dataclass(frozen=True)
@@ -2838,6 +2851,23 @@ class KindEcw(Ecw):
             )
         return self._sandbox_network_isolation_assertions
 
+    _storage_exchange_control: StorageExchangeControl | None = None
+    _storage_exchange_assertions: StorageExchangeScopingAssertions | None = None
+
+    @property
+    def storage_exchange(self) -> StorageExchangeScopingAssertions:
+        """credential-manager's storage exchange, asked as volume-manager, against the store."""
+
+        if self._storage_exchange_control is None:
+            raise SmokeConfigurationError(
+                "storage exchange probes are only available on the kind backend"
+            )
+        if self._storage_exchange_assertions is None:
+            self._storage_exchange_assertions = StorageExchangeScopingAssertions(
+                self, self._storage_exchange_control, self._context.scope
+            )
+        return self._storage_exchange_assertions
+
     _telemetry_control: TelemetryBackendControl | None = None
     _telemetry_assertions: TelemetryDeliveryAssertions | None = None
 
@@ -4447,26 +4477,11 @@ class SnapshotReaperAssertions:
         return config
 
     def fork_source(self, *, timeout: int = 600) -> str:
-        """Fork the fixture sandbox once; the child is deleted at scope end.
+        """Fork once using the collection's replay-aware, run-scoped cleanup."""
 
-        The delete compensation is armed before the fork is dispatched and
-        keyed on the id the fork returns. A reply lost *after* the child
-        exists leaves an id this ledger never learns; that child is bounded
-        by the fork's own `timeout` — the E2B route creates it with
-        auto-pause off, so expiry kills it. There is no kill-by-metadata
-        backstop for it in the fixture.
-        """
-
-        sandbox = cast(ForkableSandbox, self._fixture.sandbox)
-        children: list[str] = []
-
-        def delete_children() -> None:
-            for child in children:
-                retry_sandbox_delete(lambda: sandbox.delete_forked(child))
-
-        self._scope.defer("delete the fork child", delete_children, critical=True)
-        child = sandbox.fork(timeout=timeout)
-        children.append(child)
+        child = self._fixture.sandboxes.fork(
+            self._fixture.sandbox, timeout=timeout
+        ).sandbox.sandbox_id
         self._fixture.record("fork_child_sandbox_id", child)
         return child
 
@@ -4776,16 +4791,15 @@ class CrossNodeRestoreAssertions:
         # Lower bound for the failure-evidence log read.
         self._since_time = _log_since_time()
 
-    def current_placement(self) -> SandboxPodPlacement:
+    def current_placement(self, sandbox: CommandSandbox | None = None) -> SandboxPodPlacement:
         """The running sandbox's bound kube node; fails if it is not placed."""
 
-        placement = self._control.sandbox_pod_placement(
-            self._fixture.sandbox.sandbox_id
-        )
+        sandbox_id = (sandbox or self._fixture.sandbox).sandbox_id
+        placement = self._control.sandbox_pod_placement(sandbox_id)
         self._fixture.verify(
             placement is not None,
             "sandbox has no single bound execution pod to read placement from",
-            sandbox_id=self._fixture.sandbox.sandbox_id,
+            sandbox_id=sandbox_id,
         )
         assert placement is not None
         return placement

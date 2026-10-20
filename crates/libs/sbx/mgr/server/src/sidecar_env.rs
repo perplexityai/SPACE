@@ -24,6 +24,8 @@ const TELEMETRY_ENV_KEYS: &[&str] = &[
     "DD_VERSION",
     "DD_AGENT_HOST",
     "DD_DOGSTATSD_PORT",
+    // Preserve the APM intake port across env_clear alongside its host.
+    "DD_TRACE_AGENT_PORT",
     // Child processes must keep the selected trace transport and sampling
     // policy; an omitted selector would silently restore the native default.
     "SPACE_TRACE_EXPORTER",

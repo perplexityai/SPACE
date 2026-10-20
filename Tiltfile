@@ -1,7 +1,8 @@
 # Tiltfile for the local KinD SPACE stack.
 #
 # Brings up the SPACE control plane on a multi-node KinD cluster:
-#   * postgres + versitygw object store (S3)
+#   * postgres + versitygw object store (S3), with its IAM service and the
+#     Kind-only STS bridge for credential-manager's storage exchange
 #   * space-api-server
 #   * space-internal-api
 #   * space-credmgr-authority, the control-plane credential-manager authority
@@ -76,6 +77,26 @@ TELEMETRY_CONFIG = decode_json(local(["python3", DATADOG_SCRIPT, "preflight", "-
 DATADOG_MODE = TELEMETRY_CONFIG["backend"]
 TELEMETRY_MODE = TELEMETRY_CONFIG["mode"]
 TELEMETRY_SET = TELEMETRY_CONFIG["helm_set"]
+# How node services get object-store credentials: credential-manager's storage
+# exchange (the default) or the store's static keys. Both run the same store,
+# IAM service and STS bridge; see "Object-store credentials" in
+# infra/space/kind/README.md. The STS bridge's Secret is kept outside Helm, so
+# its checksum goes to every chart whose pods read it, and a reissue rolls
+# them. Teardown evaluates this file too and must not create it.
+STORAGE_CREDENTIALS = str(local(["bash", "infra/space/kind/lib/storage-credentials.sh"], quiet = True)).strip()
+watch_file("infra/space/kind/lib/storage-credentials.sh")
+STS_BRIDGE_SECRET_CHECKSUM = ""
+if config.tilt_subcommand != "down":
+    STS_BRIDGE_SECRET_CHECKSUM = str(local(
+        ["bash", "infra/space/kind/scripts/sts-bridge-secret.sh"],
+        env = {"SPACE_KIND_CLUSTER": KIND_CLUSTER},
+        quiet = True,
+    )).strip()
+    watch_file("infra/space/kind/scripts/sts-bridge-secret.sh")
+CHART_SET = TELEMETRY_SET + [
+    "storageCredentials=" + STORAGE_CREDENTIALS,
+    "storageExchange.secretChecksum=" + STS_BRIDGE_SECRET_CHECKSUM,
+]
 # The build SHA every SPACE image records, matching the version the workloads
 # report; see telemetry_config.py.
 KIND_GIT_SHA = TELEMETRY_CONFIG["commit"] or "unknown"
@@ -310,6 +331,20 @@ custom_build(
     skips_local_docker = False,
 )
 
+# Kind-only: the STS bridge fixture the credential-manager authority's storage
+# exchange calls in place of AWS STS. Go, standard library only; the build runs
+# its unit tests.
+custom_build(
+    ref = "space-kind-sts-bridge:local",
+    command = " && ".join([
+        pull_base_images("docker/Dockerfile.kind-sts-bridge"),
+        (image_build("space-kind-sts-bridge") + " --provenance=false --sbom=false -t $EXPECTED_REF " +
+         "--build-arg SPACE_GIT_SHA={} .").format(KIND_GIT_SHA),
+    ]),
+    deps = ["docker/Dockerfile.kind-sts-bridge", "infra/space/kind/sts-bridge"],
+    skips_local_docker = False,
+)
+
 # UI: no rust, single Dockerfile. NEXT_PUBLIC_API_URL must be passed at
 # BUILD time — Next.js evaluates rewrites in next.config.js once at build
 # and freezes the result in .next/required-server-files.json. Runtime env
@@ -475,7 +510,7 @@ local_resource(
 # ── Helm releases (in dependency order) ───────────────────────────────────
 
 def helm_release(name, chart):
-    return helm(chart, name = name, namespace = NAMESPACE, set = TELEMETRY_SET)
+    return helm(chart, name = name, namespace = NAMESPACE, set = CHART_SET)
 
 # Both entry points use a fresh, shared render for backend transitions.
 # Fake mode never consumes SaaS credentials; SaaS uses an existing Secret only.
@@ -619,8 +654,11 @@ k8s_resource(
 #
 # Versity S3 Gateway (versitygw, Apache-2.0; replaced SeaweedFS, which replaced
 # MinIO) is a real S3-compatible object store on the infra node, serving its
-# POSIX backend from a node-local hostPath. The bucket-init Job creates the
-# `snapshots` + `templates` buckets through the S3 API. Both are public
+# POSIX backend from a node-local hostPath, with versitygw's standalone IAM
+# service in its own Deployment for the storage exchange's sessions; both take
+# their TLS leaves from internal-rpc-tls. The bucket-init Job
+# creates the `snapshots` + `templates` buckets through the S3 API and the
+# exchange's OIDC provider and vend role through the IAM API. Both are public
 # registry images the kind nodes pull directly, so no `kind load` step is
 # needed.
 k8s_yaml(helm_release("space", "infra/space/kind/charts/space-object-store"))
@@ -628,12 +666,27 @@ k8s_resource(
     "space-object-store",
     port_forwards = ["8333:8333"],  # S3 API
     labels = ["data"],
-    resource_deps = ["label-kind-infra"],
+    resource_deps = ["label-kind-infra", "internal-rpc-tls"],
+)
+k8s_resource(
+    "space-object-store-iam",
+    objects = ["space-object-store-iam:networkpolicy"],
+    labels = ["data"],
+    resource_deps = ["label-kind-infra", "internal-rpc-tls"],
 )
 k8s_resource(
     "space-object-store-bucket-init",
     labels = ["data"],
-    resource_deps = ["space-object-store"],
+    resource_deps = ["space-object-store", "space-object-store-iam"],
+)
+# Kind-only STS bridge: the authority's AssumeRole in front of the store's IAM
+# service, and the token issuer that service trusts. Its STS listener's leaf
+# comes from internal-rpc-tls.
+k8s_yaml(helm_release("space", "infra/space/kind/charts/space-kind-sts-bridge"))
+k8s_resource(
+    "space-kind-sts-bridge",
+    labels = ["data"],
+    resource_deps = ["label-kind-infra", "internal-rpc-tls"],
 )
 
 # Redis: shared store for the two API rate limiters (cluster activation
@@ -669,7 +722,7 @@ for line in NODE_RELEASES:
     values = []
     if role == "builder" and os.path.exists(chart + "/values-builder.yaml"):
         values = [chart + "/values-builder.yaml"]
-    node_set = TELEMETRY_SET + ["node.role={}".format(role)]
+    node_set = CHART_SET + ["node.role={}".format(role)]
     if service == "node-manager" and LOOP_DEVICE_TARGET:
         node_set.append("loopDeviceTarget={}".format(LOOP_DEVICE_TARGET))
     k8s_yaml(helm(chart, name = release, namespace = NAMESPACE, values = values, set = node_set))

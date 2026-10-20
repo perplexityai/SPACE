@@ -63,6 +63,11 @@ pub enum BlockedReason {
     /// restore finalized. Drop it, don't retry: re-claiming can never
     /// succeed and a deadline would be a hot loop.
     EvacuationSuperseded,
+    /// A stopped evacuation whose teardown hasn't released it: the row is
+    /// still on its node, and placing it would give it two homes. It stops
+    /// blocking once `active_node_id` clears (the lease and backoff gates
+    /// still apply), so a caller should retry it rather than drop it.
+    StoppedEvacuationNotReleased,
 }
 
 /// Outcome of [`crate::PlacementStore::complete_placement`].

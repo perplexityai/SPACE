@@ -17,9 +17,11 @@ local.file_match "pods" {
 discovery.relabel "eligible_pods" {
   targets = local.file_match.pods.targets
 {{- range .Values.collection.excludedPodSources }}
+{{- $namespace := "[^_/]+" }}
+{{- if hasKey . "namespace" }}{{- $namespace = regexQuoteMeta .namespace }}{{- end }}
   rule {
     source_labels = ["__path__"]
-    regex = {{ printf ".*/%s_%s[^/]*_[^/]+/%s/[^/]+" (regexQuoteMeta .namespace) (regexQuoteMeta .podNamePrefix) (regexQuoteMeta .container) | quote }}
+    regex = {{ printf ".*/%s_%s[^/]*_[^/]+/%s/[^/]+" $namespace (regexQuoteMeta .podNamePrefix) (regexQuoteMeta .container) | quote }}
     action = "drop"
   }
 {{- end }}
@@ -42,7 +44,7 @@ loki.process "cri" {
   // The transport is `log_source`, not `source`: SPACE JSON lines carry their
   // own `source` field, which a stream label of that name would shadow.
   stage.static_labels {
-    values = {log_source = "container", node = sys.env("NODE_NAME"), cluster = {{ .Values.clusterLabel | quote }}}
+    values = {log_source = "container", node = sys.env("NODE_NAME"), cluster = {{ include "logs.clusterLabel" . | quote }}}
   }
   // Transport identity is searchable metadata, not an indexed stream label.
   stage.structured_metadata {
@@ -113,7 +115,7 @@ loki.source.journal "host" {
   max_age = {{ .Values.collection.journal.maxAge | quote }}
   format_as_json = false
   relabel_rules = loki.relabel.journal.rules
-  labels = {log_source = "journal", namespace = "host", node = sys.env("NODE_NAME"), cluster = {{ .Values.clusterLabel | quote }}}
+  labels = {log_source = "journal", namespace = "host", node = sys.env("NODE_NAME"), cluster = {{ include "logs.clusterLabel" . | quote }}}
   forward_to = [loki.process.space.receiver]
 }
 {{- end }}

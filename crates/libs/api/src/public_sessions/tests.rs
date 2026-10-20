@@ -287,6 +287,187 @@ async fn create_session_reuses_key_after_idempotency_retention_expires() -> Test
     Ok(())
 }
 
+/// Keep `sqlx::query` events enabled for the whole test process.
+///
+/// Scoped subscribers on other test threads come and go concurrently, and a
+/// callsite-interest rebuild racing ours can compute the global max level (and
+/// cached interest) from a dispatcher set that no longer includes ours, which
+/// silently drops every event we meant to count. One process-lifetime
+/// dispatcher that accepts everything keeps each rebuild's answer "enabled";
+/// events still reach only the subscriber in scope on this thread.
+fn keep_query_events_enabled() {
+    static ALWAYS_ENABLED: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    ALWAYS_ENABLED.get_or_init(|| tracing::Dispatch::new(tracing_subscriber::registry()));
+    tracing::callsite::rebuild_interest_cache();
+}
+
+/// The session and its `sql!` locators (or the leading keyword, such as
+/// `COMMIT`) of every statement one `create_session` sends, in order.
+async fn create_statements(
+    store: &PublicSessionStore,
+    input: CreatePublicSession<'_>,
+) -> Result<(PublicSession, Vec<String>), PublicSessionStoreError> {
+    use pplx_space_observability::test_capture::{CapturedEventsLayer, field_value};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let layer = CapturedEventsLayer::new().with_target("sqlx::query");
+    let events = layer.events();
+    let session = {
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+        keep_query_events_enabled();
+        store.create_session(input).await?
+    };
+    let statements = events
+        .events()
+        .iter()
+        .map(|event| {
+            let summary = field_value(event, "summary").unwrap_or_default();
+            let statement = field_value(event, "db.statement").unwrap_or_default();
+            let sql = if statement.is_empty() {
+                summary
+            } else {
+                statement
+            };
+            match sql
+                .trim_start()
+                .strip_prefix("/*")
+                .and_then(|rest| rest.split_once("*/"))
+            {
+                Some((locator, _)) => locator.to_string(),
+                None => sql
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string(),
+            }
+        })
+        .collect();
+    Ok((session, statements))
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn create_session_sends_one_statement_per_write() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = seed_org(&db.pool).await?;
+    let actor_id = seed_user(&db.pool, OrgId::from_uuid(org_id)).await?;
+    let sandbox_id = seed_sandbox(
+        &db.pool,
+        OrgId::from_uuid(org_id),
+        UserId::from_uuid(actor_id),
+    )
+    .await?;
+    let public_sandbox_id = PublicSandboxId::from_uuid(sandbox_id);
+    let request = serde_json::json!({"command": ["echo", "hello"]});
+    let fingerprint = session_fingerprint_payload(
+        public_sandbox_id,
+        SessionKind::Process,
+        None,
+        None,
+        None,
+        &request,
+    );
+    let key = IdempotencyKey::parse("counted-command-key")?;
+    let store = PublicSessionStore::with_data_plane_base_url(db.pool.clone(), "");
+    let input = CreatePublicSession {
+        org_id: OrgId::from_uuid(org_id),
+        actor_user_id: Some(UserId::from_uuid(actor_id)),
+        sandbox_id: public_sandbox_id,
+        kind: SessionKind::Process,
+        target_port: None,
+        target_protocol: None,
+        target_path: None,
+        adapter_state: request,
+        fingerprint_payload: &fingerprint,
+        idempotency: CreatePublicSessionIdempotency {
+            method: HttpOperationMethod::Post,
+            path_template: OperationPathTemplate::new("/v1/sandboxes/{sandbox_id}/commands"),
+            key: &key,
+        },
+    };
+
+    // Lock, lookup (discarding an expired record), session, operation with
+    // its event, idempotency record, commit. This was nine before the
+    // expired-record delete, the event, and the session re-read were folded.
+    let (first, statements) = create_statements(&store, input.clone()).await?;
+    assert_eq!(statements.len(), 6, "{statements:#?}");
+    assert_eq!(statements.last().map(String::as_str), Some("COMMIT"));
+    assert_eq!(first.kind, SessionKind::Process);
+    assert_eq!(first.state, SessionState::Pending);
+    assert!(first.attach.is_some());
+    let fetched = store
+        .fetch_session(OrgId::from_uuid(org_id), public_sandbox_id, first.id)
+        .await?
+        .expect("created session should be fetchable");
+    assert_eq!(fetched.created_at, first.created_at);
+    assert_eq!(fetched.updated_at, first.updated_at);
+    assert_eq!(fetched.expires_at, first.expires_at);
+
+    // The folded event is still the operation's first and only one.
+    let operation_id = sqlx::query_scalar::<_, Uuid>(sql!(
+        "SELECT operation_id FROM public_operations WHERE org_id = $1 AND target_id = $2"
+    ))
+    .bind(org_id)
+    .bind(first.id.to_string())
+    .fetch_one(&db.pool)
+    .await?;
+    let events = crate::public_operations::PublicOperationStore::new(db.pool.clone())
+        .fetch_operation_events(
+            OrgId::from_uuid(org_id),
+            pplx_space_public_api::OperationId::from_uuid(operation_id),
+            None,
+            10,
+        )
+        .await?
+        .expect("session operation should be tenant-visible");
+    assert_eq!(events.len(), 1, "{events:#?}");
+    let event = events.first().expect("one event");
+    assert_eq!(event.sequence, 1);
+    assert_eq!(event.event_type, PublicOperationEventType::Completed);
+    assert_eq!(
+        event.event.pointer("/state"),
+        Some(&serde_json::json!("succeeded"))
+    );
+    assert_eq!(
+        event.event.pointer("/result/session_id"),
+        Some(&serde_json::json!(first.id.to_string()))
+    );
+
+    // A replay reads the session the record points to; it is unchanged.
+    let (replayed, statements) = create_statements(&store, input.clone()).await?;
+    assert_eq!(replayed.id, first.id);
+    assert_eq!(statements.len(), 6, "{statements:#?}");
+
+    // Past retention the key starts a new session in the same six, and its
+    // record replaces the expired one rather than colliding with it.
+    sqlx::query(sql!(
+        "UPDATE public_idempotency_records
+         SET expires_at = NOW() - INTERVAL '1 second'
+         WHERE org_id = $1 AND idempotency_key = $2"
+    ))
+    .bind(org_id)
+    .bind(key.as_str())
+    .execute(&db.pool)
+    .await?;
+    let (renewed, statements) = create_statements(&store, input).await?;
+    assert_ne!(renewed.id, first.id);
+    assert_eq!(statements.len(), 6, "{statements:#?}");
+    let records: Vec<(Uuid, bool)> = sqlx::query_as(sql!(
+        "SELECT r.operation_id, r.expires_at > NOW()
+         FROM public_idempotency_records r
+         WHERE r.org_id = $1 AND r.idempotency_key = $2"
+    ))
+    .bind(org_id)
+    .bind(key.as_str())
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(records.len(), 1, "{records:#?}");
+    assert_ne!(records.first().map(|r| r.0), Some(operation_id));
+    assert_eq!(records.first().map(|r| r.1), Some(true));
+    Ok(())
+}
+
 #[tokio::test]
 async fn concurrent_idempotent_create_replays_one_session() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {

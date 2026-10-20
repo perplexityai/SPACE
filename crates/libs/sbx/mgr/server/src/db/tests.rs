@@ -2581,6 +2581,10 @@ fn stopped_publication_commits_disk_identity_with_terminal_state() {
     publish_stopped_artifact(
         &conn,
         "sandbox-1",
+        get_sandbox(&conn, "sandbox-1")
+            .unwrap()
+            .unwrap()
+            .node_execution_id,
         local_artifact_id,
         "/cache/sandbox-1/snapshots/d-stop-id",
     )
@@ -2612,6 +2616,10 @@ fn deleting_named_snapshot_identity_does_not_delete_current_instance_artifact() 
     publish_stopped_artifact(
         &conn,
         "sandbox-1",
+        get_sandbox(&conn, "sandbox-1")
+            .unwrap()
+            .unwrap()
+            .node_execution_id,
         current_id,
         "/cache/sandbox-1/snapshots/d-stop-id",
     )
@@ -2646,6 +2654,10 @@ fn delete_sandbox_removes_local_artifacts() {
     publish_stopped_artifact(
         &conn,
         "sandbox-1",
+        get_sandbox(&conn, "sandbox-1")
+            .unwrap()
+            .unwrap()
+            .node_execution_id,
         current_id,
         "/cache/sandbox-1/snapshots/d-stop-id",
     )
@@ -10087,6 +10099,7 @@ mod cleanup_quarantine_refusal;
 mod local_network_policy_clear;
 pub(crate) mod state_write_fixtures;
 mod state_write_table;
+mod stopped_artifact_pin;
 mod thin_writer_coverage;
 mod update_state_from;
 mod update_state_matrix;

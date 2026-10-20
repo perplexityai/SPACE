@@ -87,18 +87,19 @@ spec:
               value: {{ .Values.networkCredentials.enabled | quote }}
             # Snapshot upload destination (SnapshotUploadConfig::from_env, the
             # suspend artifact-backup path). volume-manager performs the transfer
-            # with the static object-store credentials, which only volume-manager
-            # and build-manager receive; sandbox-manager gets none.
+            # with the object-store credentials it holds or exchanges;
+            # sandbox-manager gets none.
             - name: SPACE_SNAPSHOT_BUCKET
               value: {{ .Values.snapshots.bucket | quote }}
             - name: SPACE_SNAPSHOT_REGION
               value: {{ .Values.snapshots.region | quote }}
             - name: SPACE_SNAPSHOT_ENDPOINT
               value: {{ .Values.snapshots.endpoint | quote }}
-            {{- if .Values.snapshotStreamBtrfsSend }}
-            # Deferred btrfs-send capture (values.yaml).
+            {{- if kindIs "bool" .Values.snapshotStreamBtrfsSend }}
+            # Deferred btrfs-send capture (values.yaml); unset keeps the
+            # binary default, which is on.
             - name: SPACE_SNAPSHOT_STREAM_BTRFS_SEND
-              value: "true"
+              value: {{ .Values.snapshotStreamBtrfsSend | quote }}
             {{- end }}
             {{- with .Values.clusterDeletedEvictionQuiescenceSecs }}
             - name: SPACE_SBX_CLUSTER_DELETED_QUIESCENCE_SECS

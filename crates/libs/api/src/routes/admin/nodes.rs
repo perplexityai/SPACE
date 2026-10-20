@@ -1272,7 +1272,7 @@ fn in_flight_replace_conflict(
 ///   node stays schedulable until the terminator destroys it, taking any sandbox
 ///   placed in that window with it.
 fn reconciler_reasserts_cordon(new_phase: Option<&str>, managed_by: NodeManagedBy) -> bool {
-    managed_by == NodeManagedBy::Kubernetes
+    managed_by.has_node_drain_reconciler()
         && matches!(new_phase, Some(PHASE_DRAINING | PHASE_TERMINATING))
 }
 

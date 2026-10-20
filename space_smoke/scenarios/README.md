@@ -20,6 +20,39 @@ Scenario-owned sandboxes default to pause-on-timeout with auto-resume disabled.
 This is the smoke framework's default, not the ECW API's omitted-field default.
 It preserves state for explicit reconnect and cleanup.
 
+## Fork coverage
+
+The typed suite owns the public fork smoke coverage:
+
+- `ecw.fork_isolation`: two concurrent different-key requests, byte-exact disk
+  contents, distinct child identities, and source/child/sibling write isolation.
+- `ecw.fork_idempotency`: concurrent same-key requests and a completed replay
+  retain one child and its post-fork writes, even after the source changes.
+- `local.fork_suspended_cross_node`: suspend and wait for the durable snapshot,
+  cordon the source worker, fork onto another worker, and verify the source
+  stays suspended and restores with its original data. Kind-only; the cordon
+  is undone before scenario cleanup. This proves off-source placement and
+  disk isolation, not the provenance of the bytes fetched during restore.
+
+These replace `scripts/tests/smoke-kind-sandbox-fork.py`. Run an individual
+scenario with `uv run --frozen --python 3.11 -m space_smoke run <scenario-id>`
+against a configured bench. Kind CI discovers them through the existing
+`--all` inventory and distributes them across its four isolated shards; no
+additional runner or cluster bootstrap is introduced. Together they create
+three sources and four distinct children, with concurrency capped at two fork
+requests per scenario. Child cleanup is registered before dispatch with the
+same idempotency key used for the request. If the reply is lost, cleanup
+replays that key to recover and delete the child; replayed children share one
+cleanup owner. Cleanup failures are reported, not treated as passes. A child
+inherits its source's timeout action, so expiry is not a deletion backstop.
+Admission 503s retry the same key at most three times within one request
+budget. Concurrent and completed replay compare the entire public result,
+including the credentials, without writing those credentials into evidence.
+
+Scenario phase timings report runtime without a flaky latency assertion.
+The fork shard-duration hints use local seed measurements; refresh them from
+successful CI runs. Scheduling estimates are not measured CI runtimes.
+
 ## Temporarily omitted lifecycle cases
 
 Auto-kill (both the omitted/default lifecycle and explicit

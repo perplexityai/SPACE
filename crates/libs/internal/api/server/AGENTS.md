@@ -11,10 +11,11 @@ table (`node_direct`, `sandbox_direct_route_*`), read the
 - New ClusterApi and NodeInfo RPCs rely on the auth layers in `src/run.rs`:
   `NodeApiAuthLayer` (`SPACE_INTERNAL_TOKEN` or TokenReview) and, for
   template publication, `BuildAuthLayer`. Health and reflection are exempt.
-  Neither layer identifies the calling node.
+  BuildAuthLayer supplies freshly reviewed pod-bound node name/UID for
+  grant-bound template publication; match both against live builder inventory.
 - A new RPC that acts for a node identifies it as the registered node whose
-  address equals the caller's remote IP, never by a request field alone; one
-  that names a node uses `authenticated_origin_node_id`. Existing exception:
+  address equals the caller's remote IP (except publication above), never by a
+  request field alone; one that names a node uses `authenticated_origin_node_id`. Existing exception:
   `TouchArtifactBackup` binds no node.
 - Destructive work authorized by the caller's role needs a registration that
   existed before the call.

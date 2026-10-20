@@ -137,7 +137,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_PUBLIC_OPERATION_DISPATCHER_EXECUTION_CONCURRENCY` | 16 | Operations the dispatcher runs at once. A larger value clamps to 128; `0` or a non-number keeps the default without a warning. Each execution holds its slot for the whole operation, and freed slots refill on the next 25 ms claim tick, at most 64 per tick. So throughput is roughly this divided by mean execution time, up to 2,560 operations a second. Executions draw on the cluster controller's `space_user` Postgres pool, which most other reconcilers share (`POSTGRES_POOL_MAX_CONNECTIONS`, default 25). Raising this adds contention for that pool, and an execution whose claim renewal or final status write can't get a connection within the pool's acquire timeout is abandoned and runs again once its claim goes stale, repeating any work it had already done. |
 | `SPACE_NATIVE_CREATE_POOL_CLAIM_ENABLED` | off | Env master for claiming a ready warm-pool slot when `POST /v1/sandboxes` admits a create, under the `space-native-create-pool-claim` flag (falls back off). Every `space-cluster-controller` replica must understand claim-carrying create payloads before this is turned on. |
 | `SPACE_NATIVE_CREATE_INLINE_ENABLED` | on | Kill switch for running a native create that won an admission-time warm-pool claim inside the `POST /v1/sandboxes` request instead of leaving it queued for the dispatcher. Read only while admission-time claiming is on; off keeps those creates queued. The API then runs the create executor itself, so it needs the same create settings as `space-cluster-controller` (for example `SPACE_BYOK_VOLUME_ENCRYPTION`). |
-| `SPACE_NATIVE_CREATE_INLINE_WAIT_MS` | `2000` | How long the create request waits for that inline execution before answering. Past the wait the request answers and the execution continues in the background; a malformed value uses the default, and values above 30000 are capped. |
+| `SPACE_NATIVE_CREATE_INLINE_WAIT_MS` | `2000` | How long the create request waits for that inline execution before answering. A create that finishes within the wait answers with its terminal record in the response's `operation` field, so the client need not poll. Past the wait the request answers without it and the execution continues in the background; a malformed value uses the default, and values above 30000 are capped. |
 | `SPACE_REDIS_URL` | unset | |
 | `SPACE_SHARED_VALKEY_URL` | unset | Unset disables the consumer. |
 | `SPACE_GRPC_CLIENT_MAX_CONNECTION_AGE_SECS` | off | |
@@ -165,7 +165,7 @@ Prefetch requires the catalog to confirm generic-only release resolution from th
 | `SPACE_TEMPLATE_CACHE_BUDGET_BYTES` | 100 GiB | 0 or an invalid value disables cache GC. |
 | `SPACE_TEMPLATE_BUILD_DISK_MIB` | build-manager default | JSON. |
 | `SPACE_TRUSTED_TEMPLATE_STORAGE_BUCKETS` | empty = any bucket | |
-| `SPACE_TEMPLATE_PUBLISH_SYSTEM_SERVICE_ACCOUNTS`, `SPACE_TEMPLATE_PUBLISH_TENANT_SERVICE_ACCOUNTS` | empty | Startup error when the allowed set is empty. An account in both lists (build-manager) must present the grant issued for that system build by the API or a system-only operator; each grant authorizes one release. |
+| `SPACE_TEMPLATE_PUBLISH_SYSTEM_SERVICE_ACCOUNTS`, `SPACE_TEMPLATE_PUBLISH_TENANT_SERVICE_ACCOUNTS` | empty | Startup error when the allowed set is empty. An account in both lists (build-manager) must present the grant issued for that system build by the API or a system-only operator; each grant authorizes one release. A tenant-list account must likewise present the grant the API issued before dispatching that organization's build of that template, from the builder node the grant is bound to; it authorizes one release. |
 | `SPACE_BUILD_AUTH_SYSTEM_SERVICE_ACCOUNTS`, `SPACE_BUILD_AUTH_TENANT_SERVICE_ACCOUNTS` | empty | |
 | `SPACE_TEMPLATE_PUBLICATION_TOKEN_PATH` | unset | Direct deployments only: dedicated publisher credential file shared by ClusterApi and build-manager. Never reuse the shared node token; incompatible with Kubernetes authentication. See below. |
 | `SPACE_BUILD_MANAGER_ENDPOINT` | `127.0.0.1:9900` | |
@@ -186,9 +186,11 @@ internal RPC TLS configuration. Other node services must not receive the
 publisher secret.
 
 Build-manager attaches the dedicated proof only to template and release
-registration. The shared node bearer alone cannot publish. This grants tenant
-publication authority and system publication authority **only with the existing
-per-build grant** issued by the API. It cannot issue system grants itself, and
+registration. The shared node bearer alone cannot publish. Both tenant and
+system publication require the corresponding **per-build grant** issued by the
+API. A tenant grant must match the template, organization, and registered builder
+at the connection’s source address; no Kubernetes identity is required. The
+publisher credential cannot issue system grants itself, and
 does not enable ungranted system builds from the operator CLI. Kubernetes
 publication continues using projected tokens; combining Kubernetes auth with
 the direct receiver credential fails startup.
@@ -228,28 +230,44 @@ jobs that could not be drained: jobs without a grant cannot publish through a
 dual-authority account after the rollout. System-only deployment publishers
 retain their existing publication authority.
 
-Tenant publication grants are in a preparation phase. Before dispatching an
-organization's build, the API records a grant naming the target template and
-organization, sends it with `StartBuild`, and pins it to the accepting builder.
-Failed acceptance revokes that submission's grant. Build-manager persists and
-forwards the optional grant to template and release registration.
+Tenant builds follow the same pattern. Before dispatching an organization's
+build, the API records a tenant publication grant naming the target template
+and that organization, and sends it with `StartBuild`; it withdraws the grant if
+dispatch fails and pins it to the accepting builder node from the response.
+Build-manager forwards the grant to template and release registration.
+ClusterApi accepts a tenant-list account's publication only with a grant that
+names the requested template and organization and that covers the builder node
+identified by freshly reviewed pod-bound node name and UID, matched against
+live Kubernetes builder inventory. A bootstrapped node with no inventory UID
+cannot publish yet; build-manager retries until inventory synchronization
+completes, within its bounded registration backoff. Updated build-managers also
+retry publication failures explicitly marked as uncommitted database
+contention; transport failures with an unknown commit outcome remain terminal.
+Both build-manager and ClusterApi must be upgraded for these retries.
+Standalone trusted deployments retain transport-address identity. A grant
+covers any registered builder for one hour while unpinned, then only the pinned
+builder for seven days. Release registration
+consumes the grant in its transaction. Direct `space-buildmgr build --org-id`
+submissions carry no grant, so their builds cannot publish to a cluster through
+a tenant-list account; submit organization builds through the API.
 
-ClusterApi still uses the existing tenant publisher and ownership checks. It
-accepts publications both with and without the new field and does not consume
-tenant grants yet. Older gateways/builders may drop the field during a rolling
-upgrade; older queued jobs and direct tenant CLI submissions still work.
-System publication grants remain enforced as before.
+Deploy tenant grant enforcement only after the preparation release has fully
+rolled out to every API, ClusterApi, node-api gateway, and build-manager. That
+release produces and forwards grants while still accepting grantless tenant
+publication; the grant-table migration and role bootstrap must already be
+applied. Do not skip directly from an older release to enforcement.
 
-Apply the grant-table migration and role bootstrap before deploying the new
-API. After that prerequisite, the API, ClusterApi, node-api, and build-manager
-can roll in any order. Existing grants expire and are swept on new submissions.
-This preparation release does not complete tenant publication hardening.
+Drain or resubmit every tenant job accepted before preparation finished; an
+older gateway or builder may have dropped its grant. Verify a newly submitted
+tenant build retains the grant through dispatch and publication, and that
+TokenReview returns the pod-bound node identity matched by builder inventory.
+Direct tenant CLI submissions must move to the API before enforcement.
 
-Before deploying a later enforcement release, finish upgrading every API,
-gateway, and builder, then drain or resubmit jobs accepted before that upgrade.
-Verify tenant builds carry grants end to end. Rollback after enforcement must
-preserve grant-producing and forwarding components until enforcement is removed;
-keep the additive schema in place.
+Once these prerequisites hold, enforcement may roll out through the normal
+service order: existing preparation builders already carry grants and understand
+safe retry responses. Roll application components back to the preparation
+release if needed, retaining the additive schema. Remove enforcement from all
+ClusterApi replicas before rolling grant producers or forwarders back further.
 
 ### Template balloon device
 
@@ -300,6 +318,7 @@ calls.
 | `SPACE_OBJECT_STORE_POOL_IDLE_TIMEOUT_SECS` | 3 | 1 to 90. How long an idle pooled connection stays eligible for reuse. Keep it below the endpoint's idle close; AWS S3 closes idle HTTPS connections after about 6 s. Applies to object-store transfers; the snapshot-storage sweepers and the kernel fetcher use the 3 s default. |
 | `SPACE_OBJECT_STORE_STATIC_SESSION_TOKEN` | unset | Session token for temporary static credentials. |
 | `SPACE_SNAPSHOT_BUCKET`, `SPACE_SNAPSHOT_REGION`, `SPACE_SNAPSHOT_ENDPOINT` | unset | Unset disables snapshot upload. Give the bucket an abort-incomplete-multipart lifecycle rule; uploads interrupted by process death otherwise keep their parts. |
+| `SPACE_SNAPSHOT_STREAM_BTRFS_SEND` | on | Sandbox-manager retains a read-only source for each btrfs-send suspend and lets volume-manager stream the upload from it instead of writing `rootfs.btrfs-send`; `false` writes the send file. Defers only while volume-manager streams uploads under its own identity. See [snapshot upload streaming](snapshot-upload-streaming.md). |
 | `SPACE_VOLUME_STREAM_PUSH_BUFFER_BUDGET_BYTES` | 1 GiB | Volume-manager streams eligible snapshot uploads with this shared part budget; `0` uploads through temporary files. Whole MiB, at least 64 MiB. See [snapshot upload streaming](snapshot-upload-streaming.md). |
 
 ## Authentication, TLS and credentials

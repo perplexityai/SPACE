@@ -8,11 +8,11 @@ fn inventory_includes_each_generation_and_retained_rootfs_without_following_link
     let sandboxes = root.join("sandboxes");
     let sandbox = sandboxes.join("018f6d8d-0000-7000-8000-000000000001");
     for directory in [
-        templates.join("example/sha256:aaa"),
-        templates.join("example/sha256:bbb"),
-        templates.join(".staging/sha256:ccc"),
-        templates.join("example/sha256:aaa.importing.fixture"),
-        templates.join("example/sha256:bbb.replaced.fixture"),
+        templates.join("example/sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        templates.join("example/blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+        templates.join(".staging/sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
+        templates.join("example/sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.importing.fixture"),
+        templates.join("example/blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.replaced.fixture"),
         sandbox.join("instance"),
         // Checkpoints count even while memory/vmstate are incomplete.
         sandbox.join("snapshot"),
@@ -21,7 +21,8 @@ fn inventory_includes_each_generation_and_retained_rootfs_without_following_link
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(directory.join("rootfs.ext4"), b"fixture").unwrap();
     }
-    let unsafe_entry = templates.join("example/sha256:ddd");
+    let unsafe_entry = templates
+        .join("example/blake3:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd");
     std::fs::create_dir(&unsafe_entry).unwrap();
     std::os::unix::fs::symlink(
         sandbox.join("instance/rootfs.ext4"),

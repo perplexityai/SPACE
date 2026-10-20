@@ -1,5 +1,9 @@
+{{- if include "common.otlpSelected" . }}
 {{- include "common.profileGuard" . }}
 {{- include "common.sharedGuards" . }}
+{{- if .Values.persistence.enabled }}
+{{- include "common.ephemeralStorageGuard" (dict "storage" .Values.persistence "resources" .Values.resources "key" "persistence" "resourcesKey" "resources") }}
+{{- end }}
 {{- if not (or .Values.datasources.prometheus.enabled .Values.datasources.loki.enabled .Values.datasources.tempo.enabled) }}
 {{- fail "Enable at least one datasource" }}
 {{- end }}
@@ -18,5 +22,6 @@
 {{- end }}
 {{- if .Values.persistence.enabled }}
 {{- include "common.sharedStorageGuard" (dict "storage" .Values.persistence "key" "persistence") }}
+{{- end }}
 {{- end }}
 {{- end }}

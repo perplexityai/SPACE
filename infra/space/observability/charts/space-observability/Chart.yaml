@@ -1,0 +1,33 @@
+apiVersion: v2
+name: space-observability
+description: >-
+  Turnkey observability backends for SPACE, selected by
+  global.observability.mode (off, datadog or otlp)
+type: application
+version: 0.1.0
+dependencies:
+  - name: common
+    version: 0.1.0
+    repository: "file://../common"
+  # The OTLP backends. Each renders only when global.observability.mode is
+  # otlp; the condition lets an operator drop one entirely.
+  - name: space-metrics
+    alias: metrics
+    version: 0.3.0
+    repository: "file://../metrics"
+    condition: metrics.enabled
+  - name: space-logs
+    alias: logs
+    version: 0.3.0
+    repository: "file://../logs"
+    condition: logs.enabled
+  - name: space-traces
+    alias: traces
+    version: 0.3.0
+    repository: "file://../traces"
+    condition: traces.enabled
+  - name: space-grafana
+    alias: grafana
+    version: 0.3.0
+    repository: "file://../grafana"
+    condition: grafana.enabled

@@ -153,6 +153,11 @@ pub mod spaced {
     /// admission limits that share the code.
     pub const GUEST_STORAGE_FULL: &str = "guest-storage-full";
 
+    /// [`ERROR_REASON_METADATA_KEY`] value of a NOT_FOUND that is the guest
+    /// filesystem reporting the requested path (or a component of it) missing,
+    /// as opposed to the sandbox or its runtime being unknown to a hop.
+    pub const GUEST_PATH_NOT_FOUND: &str = "guest-path-not-found";
+
     /// [`ERROR_REASON_METADATA_KEY`] value of a request refused before any of
     /// its work started: an admission limit, or a guest or registry shutting
     /// down. This request did nothing, so the caller may retry it, after the

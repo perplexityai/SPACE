@@ -1,3 +1,4 @@
+{{- if include "common.otlpSelected" . }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,11 +9,11 @@ data:
   tempo.yaml: |
 {{ tpl (.Files.Get "config/tempo.yaml") . | indent 4 }}
 ---
-{{- if not .Values.storage.existingClaim }}
+{{- if not (or .Values.storage.existingClaim .Values.storage.ephemeral) }}
 {{ include "common.pvc" (dict "name" "tempo-data" "storage" .Values.storage) }}
 ---
 {{- end }}
-{{- range $name := list "collector" "tempo" }}
+{{- range $name := include "traces.components" . | fromJsonArray }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -97,7 +98,8 @@ spec:
           configMap: {name: traces-config}
         {{- if eq $name "tempo" }}
         - name: data
-          persistentVolumeClaim: {claimName: {{ include "common.claimName" (dict "name" "tempo-data" "storage" $.Values.storage) | quote }}}
+          {{- include "common.dataVolumeSource" (dict "name" "tempo-data" "storage" $.Values.storage) | nindent 10 }}
         {{- end }}
 ---
+{{- end }}
 {{- end }}

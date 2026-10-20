@@ -58,6 +58,104 @@ No source URL, cache/vendor path, environment variable, operator label, observed
 health, enforcement mode, or installation job revision is part of this identity.
 Local source/path configuration cannot become a second selection authority.
 
+## Persisted-state provenance and restore compatibility
+
+Snapshot metadata records the producing runtime, guest platform, environment
+binding when present, and `StateFormatIdentity { format, version }`. This applies
+to sandbox snapshots and template base snapshots. The state format identifies
+the persisted VM state, independently of the runtime's release version. The
+compiled Firecracker catalog currently maps 1.15.1 to format 9.0.0 and 1.17.0 to
+12.0.0; those releases cannot load each other's state under the current adapter.
+
+Producer provenance and loader compatibility are separate facts. Preserve the
+snapshot's original producer when a compatible loader is selected; record the
+runtime that actually executes the restored VM separately. A memory restore
+resumes the snapshotted guest kernel. Selecting another guest kernel requires a
+cold boot, even if another VMM can read the memory-state format.
+
+Today, bound snapshots require their exact qualified environment. The legacy
+Firecracker loader predicate in
+[`runtime_inventory.rs`](../crates/libs/node/runtime/core/src/runtime_inventory.rs)
+requires the same format name and major version, with the snapshot's minor
+version no greater than the loader's; patch versions do not affect that check.
+Passing this predicate alone does not authorize cross-environment restore.
+CPU features, host/KVM requirements, device configuration and attached resources
+also constrain restoration, as described in
+[Firecracker's snapshot compatibility documentation](https://github.com/firecracker-microvm/firecracker/blob/v1.17.0/docs/snapshotting/versioning.md#snapshot-compatibility).
+
+Keep `StateFormatIdentity` as a format identity. Its version is an identifier;
+SemVer interpretation belongs to the Firecracker adapter, not generic SQL or
+protobuf consumers. A future adapter may require an opaque version, a machine
+and device profile, an explicit compatibility set, or an exact build pair. It
+may have no memory-state support. Equal version strings across providers do not
+establish compatibility. Add the concrete profile and evidence with that
+adapter's first restore consumer, without changing existing format meanings.
+
+## Disk images and boot compatibility
+
+Disk compatibility is independent of persisted VM-state compatibility. SPACE's
+current `rootfs.ext4` is a raw block image containing an ext4 filesystem;
+Firecracker exposes the block device, while the guest kernel interprets ext4.
+The filesystem must be supported by that kernel, as described in
+[Firecracker's rootfs setup](https://github.com/firecracker-microvm/firecracker/blob/v1.17.0/docs/rootfs-and-kernel-setup.md).
+An ext4 feature can also constrain guest kernels and host tools that check,
+mount or resize the image; unknown incompatible features cannot simply be
+ignored. See the [ext4 feature rules](https://docs.kernel.org/filesystems/ext4/super.html).
+Neither the filename nor a VMM release number proves bootability across all
+future kernels and adapters.
+
+The first consumer of richer disk metadata must distinguish these requirements:
+
+| Requirement | Meaning and owner |
+|---|---|
+| Representation | Raw block image, a versioned disk container, or a filesystem tree. Template/image metadata owns the representation and required container features; the consuming adapter reports what it can attach. |
+| Dependencies | Backing images and other required disk resources must retain resolvable identities and lifetimes. A digest of the top-level container alone does not establish a complete disk. |
+| Layout and filesystem | Whole-device filesystem versus partitioned disk, filesystem types and required feature flags. Image metadata owns requirements; guest kernels and any host-side image tools must support the operations they perform. |
+| Boot and guest requirements | Guest OS/architecture, direct-kernel versus firmware boot, required devices and guest drivers. The template/image owns guest requirements; the environment and adapter supply compatible boot and device semantics. |
+| Packaging | Compression and transfer encoding remain separate from the representation presented to the VM. Unpacking an image does not establish runtime compatibility. |
+
+Guest distribution/release, such as Ubuntu 22.04, belongs to the image or recipe
+identity in addition to the guest OS family. Mutable per-VM boot state belongs
+to the sandbox or its state artifacts, not immutable runtime installation.
+Runtime-manager provisions runtime components; template/image owners describe
+disk requirements, and execution admission matches them to adapter capabilities.
+Prefer those requirements over a growing image-level allowlist of VMM versions.
+
+These distinctions do not allocate new disk schema variants. Keep existing
+`ArtifactComponentMetadata.format` and manifest fields unchanged; introduce a
+versioned representation with its first implemented consumer and migration.
+Do not reinterpret an old field or add guessed disk/container variants to E0's
+canonical definition.
+
+## Requirements for environment observations and admission
+
+The next environment inventory and placement implementation must:
+
+- Distinguish installation, verified usability, execution approval and qualified
+  operation support. Report snapshot creation and loading independently, including
+  the writer format and supported loader profiles. The legacy inventory's
+  `can_create`/`can_load` projection is not sufficient environment-level evidence.
+- Preserve producer metadata through snapshot publication, upload, restore and
+  template base-snapshot paths. Keep the snapshot's disk dependencies associated
+  with its memory state; a compatible state loader does not prove disk usability.
+- Apply the same adapter compatibility rules at placement and node admission.
+  Direct placement's current major-only state-format comparison is insufficient
+  evidence where node admission also checks minor versions. Preserve the legacy
+  projection for old readers during migration; do not use it to admit new
+  environment-selected work.
+- Treat unknown profiles, absent operation support and stale observations as
+  insufficient evidence. Node admission must recheck usability because published
+  observations are not reservations. An incompatible request must not silently
+  choose another environment or degrade restore into cold boot.
+- Keep cross-environment restore disabled until a separate qualified change
+  covers loader selection, CPU/host/device constraints, disk dependencies,
+  producer-versus-loader recording and mixed-version rejection tests. Include
+  compatible, incompatible, missing-evidence and unsupported-operation cases.
+
+This is guidance for the owning implementations. It adds no policy tables,
+protobuf fields, configuration variables or execution behavior. Concrete disk
+profiles and other runtime adapters remain separate changes with real consumers.
+
 ## Canonical identity and stored representation
 
 The schema-1 canonical encoding is defined by

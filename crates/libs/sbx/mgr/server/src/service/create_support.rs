@@ -360,7 +360,7 @@ pub(super) fn admit_warm_start(sandbox: &crate::db::SandboxRow) -> Result<(), St
 /// refuses a row it cannot restage.
 pub(super) fn write_warm_start_restaged(db: &rusqlite::Connection, id: &str) -> Result<(), Status> {
     const CONTEXT: &str = "prepare recovered sandbox restore";
-    let outcome = crate::db::update_state_from(db, id, &crate::db::edges::WARM_START_RESTAGE)
+    let outcome = crate::db::restage_for_warm_start(db, id)
         .map_err(|error| Status::internal(format!("{CONTEXT}: {error}")))?;
     match state_write_result(outcome) {
         Ok(_)

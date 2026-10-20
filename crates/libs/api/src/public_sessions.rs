@@ -18,10 +18,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::auth::hash_token;
-use crate::public_operations::{
-    ApiProduct, HttpOperationMethod, OperationPathTemplate, append_operation_event_tx,
-    delete_expired_idempotency_record_tx,
-};
+use crate::public_operations::{ApiProduct, HttpOperationMethod, OperationPathTemplate};
 use crate::public_store::{InvalidStoredEnum, parse_stored_enum};
 
 const API_PRODUCT_NATIVE: ApiProduct = ApiProduct::Native;
@@ -122,16 +119,6 @@ impl PublicSessionStore {
                 self.data_plane_base_url.as_str(),
             );
         }
-        delete_expired_idempotency_record_tx(
-            &mut tx,
-            input.org_id,
-            API_PRODUCT_NATIVE,
-            input.idempotency.method,
-            input.idempotency.path_template,
-            input.idempotency.key,
-        )
-        .await?;
-
         let session_id = DataPlaneSessionId::new_for_kind(input.kind);
         let scope = input.kind.connect_scope();
         let token = DataPlaneToken::new();
@@ -142,7 +129,7 @@ impl PublicSessionStore {
         let attach_deadline_at = now + DEFAULT_ATTACH_DEADLINE;
         let expires_at = now + DEFAULT_SESSION_TTL;
 
-        sqlx::query(sql!(
+        let row = sqlx::query_as::<_, PublicSessionRow>(sql!(
             "INSERT INTO data_plane_sessions (
                  session_id,
                  org_id,
@@ -163,7 +150,20 @@ impl PublicSessionStore {
              VALUES (
                  $1, $2, $3, $4, $5, $6, $7,
                  $8, $9, $10, $11, $12, $13, $14, $15
-             )"
+             )
+             RETURNING session_id,
+                       sandbox_id,
+                       kind,
+                       state,
+                       reconnect_count,
+                       last_reconnect_reason,
+                       scopes,
+                       target_port,
+                       target_protocol,
+                       target_path,
+                       created_at,
+                       updated_at,
+                       expires_at"
         ))
         .bind(&session_id_string)
         .bind(input.org_id)
@@ -180,7 +180,7 @@ impl PublicSessionStore {
         .bind(input.target_path)
         .bind(Json(input.adapter_state.clone()))
         .bind(expires_at)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await?;
 
         insert_completed_session_operation_tx(
@@ -201,10 +201,6 @@ impl PublicSessionStore {
             operation_id,
         )
         .await?;
-
-        let row = fetch_session_tx(&mut tx, input.org_id, input.sandbox_id, session_id)
-            .await?
-            .ok_or(PublicSessionStoreError::MissingIdempotencyTarget)?;
         tx.commit().await?;
 
         pplx_space_metrics::operations::created(
@@ -488,8 +484,23 @@ async fn find_idempotency_record(
     org_id: OrgId,
     idempotency: CreatePublicSessionIdempotency<'_>,
 ) -> Result<Option<PublicSessionIdempotencyRecord>, PublicSessionStoreError> {
+    // The lookup ignores an expired record, and the create that follows must
+    // replace it, so it is removed here, in the transaction that inserts its
+    // successor (see `delete_expired_idempotency_record_tx`). The key is
+    // unique, so a live record and an expired one never coexist: this deletes
+    // only when the lookup comes back empty. `NOW()` is the transaction's
+    // start, so the two predicates partition the record exactly.
     let row = sqlx::query_as::<_, PublicSessionIdempotencyRow>(sql!(
-        "SELECT operation_id, request_fingerprint
+        "WITH expired AS (
+             DELETE FROM public_idempotency_records
+             WHERE org_id = $1
+               AND api_product = $2
+               AND method = $3
+               AND path_template = $4
+               AND idempotency_key = $5
+               AND expires_at <= NOW()
+         )
+         SELECT operation_id, request_fingerprint
          FROM public_idempotency_records
          WHERE org_id = $1
            AND api_product = $2
@@ -624,8 +635,12 @@ async fn insert_completed_session_operation_tx(
     });
     let result_json = serde_json::to_value(&result).expect("public session result serializes");
 
+    // The operation is new, so its completion is its first event: sequence 1
+    // is what `append_operation_event_tx` would compute. The event's foreign
+    // key is checked at the end of the statement, after the operation row.
     sqlx::query(sql!(
-        "INSERT INTO public_operations (
+        "WITH operation AS (
+         INSERT INTO public_operations (
              operation_id,
              org_id,
              actor_user_id,
@@ -644,7 +659,17 @@ async fn insert_completed_session_operation_tx(
              $1, $2, $3, $4, $5, $6, $7,
              $8, $9, $10, NOW(), NOW(),
              NOW() + ('7 days')::INTERVAL
-         )"
+         )
+         RETURNING operation_id
+         )
+         INSERT INTO public_operation_events (
+             operation_id,
+             sequence,
+             event_type,
+             event_json
+         )
+         SELECT operation_id, 1, $11, $12
+         FROM operation"
     ))
     .bind(operation_id)
     .bind(org_id)
@@ -656,18 +681,12 @@ async fn insert_completed_session_operation_tx(
     .bind(OperationState::Succeeded.as_str())
     .bind(SESSION_OPERATION_PROGRESS)
     .bind(Json(result_json.clone()))
+    .bind(PublicOperationEventType::Completed.as_str())
+    .bind(Json(serde_json::json!({
+        "state": OperationState::Succeeded.as_str(),
+        "result": result_json,
+    })))
     .execute(&mut **tx)
-    .await?;
-
-    append_operation_event_tx(
-        tx,
-        pplx_space_public_api::OperationId::from_uuid(operation_id),
-        PublicOperationEventType::Completed,
-        serde_json::json!({
-            "state": OperationState::Succeeded.as_str(),
-            "result": result_json,
-        }),
-    )
     .await?;
     Ok(())
 }

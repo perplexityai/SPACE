@@ -1512,6 +1512,59 @@ impl IpCidr {
             _ => false,
         }
     }
+
+    /// The addresses of this network outside `excluded`, as CIDRs. An
+    /// `excluded` that covers this network leaves nothing, and one that does
+    /// not overlap it leaves it whole. IPv6 parts inside the IPv4-mapped range
+    /// (`::ffff:0:0/96`) are left out: an IPv6 network matches no address
+    /// there, but their text form parses as an IPv4 network, so they would
+    /// change meaning in a policy protobuf.
+    pub fn without(self, excluded: Self) -> Vec<Self> {
+        if excluded.prefix_len <= self.prefix_len && excluded.contains(self.network) {
+            return Vec::new();
+        }
+        if !self.contains(excluded.network) {
+            return vec![self];
+        }
+        let mut remaining = Vec::new();
+        let mut current = self;
+        while current.prefix_len < excluded.prefix_len {
+            let (lower, upper) = current.halves();
+            if lower.contains(excluded.network) {
+                remaining.push(upper);
+                current = lower;
+            } else {
+                remaining.push(lower);
+                current = upper;
+            }
+        }
+        remaining.retain(|cidr| {
+            !matches!(cidr.network, IpAddr::V6(network) if network.to_ipv4_mapped().is_some())
+        });
+        remaining
+    }
+
+    fn halves(self) -> (Self, Self) {
+        let prefix_len = self.prefix_len + 1;
+        let upper = match self.network {
+            IpAddr::V4(network) => IpAddr::V4(Ipv4Addr::from(
+                u32::from(network) | (1 << (32 - prefix_len)),
+            )),
+            IpAddr::V6(network) => IpAddr::V6(Ipv6Addr::from(
+                u128::from(network) | (1 << (128 - prefix_len)),
+            )),
+        };
+        (
+            Self {
+                network: self.network,
+                prefix_len,
+            },
+            Self {
+                network: upper,
+                prefix_len,
+            },
+        )
+    }
 }
 
 impl FromStr for IpCidr {

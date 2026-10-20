@@ -189,6 +189,11 @@ fn node_response(row: NodeRow) -> NodeResponse {
     }
 }
 
+/// The substrate whose nodes this registry owns. Every registry statement
+/// scopes to it, and an update's `verify` reads only a node of it, so the
+/// registry never touches a node another substrate manages.
+const REGISTRY_SUBSTRATE: SubstrateKind = SubstrateKind::Space;
+
 fn require_admin_node_registry(
     state: &AppState,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
@@ -444,7 +449,7 @@ pub async fn create_node(
     .bind(sqlx::types::Json(&req.metadata))
     .bind(reuse_deleted_by_endpoint)
     .bind(req.verify)
-    .bind(SubstrateKind::Space)
+    .bind(REGISTRY_SUBSTRATE)
     .fetch_optional(&state.pool)
     .await;
 
@@ -511,7 +516,7 @@ pub async fn create_node(
     .bind(&endpoint)
     .bind(sqlx::types::Json(&req.metadata))
     .bind(req.verify)
-    .bind(SubstrateKind::Space)
+    .bind(REGISTRY_SUBSTRATE)
     .fetch_one(&state.pool)
     .await;
 
@@ -551,7 +556,7 @@ pub async fn update_node(
     let existing = if req.verify {
         match fetch_node(&state.pool, id).await {
             Ok(Some(node))
-                if node.deleted_at.is_none() && node.managed_by == NodeManagedBy::Space =>
+                if node.deleted_at.is_none() && node.managed_by == REGISTRY_SUBSTRATE =>
             {
                 Some(node)
             }
@@ -649,7 +654,7 @@ pub async fn update_node(
     .bind(req.metadata.as_ref().map(sqlx::types::Json))
     .bind(id)
     .bind(req.verify)
-    .bind(SubstrateKind::Space)
+    .bind(REGISTRY_SUBSTRATE)
     .fetch_optional(&state.pool)
     .await;
 
@@ -696,7 +701,7 @@ async fn hard_delete_direct_node(pool: &sqlx::PgPool, id: NodeId) -> Result<u64,
            )"
     ))
     .bind(id)
-    .bind(SubstrateKind::Space)
+    .bind(REGISTRY_SUBSTRATE)
     .execute(pool)
     .await?;
     Ok(result.rows_affected())

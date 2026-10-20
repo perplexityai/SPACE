@@ -643,13 +643,13 @@ pub enum SubstrateError {
     #[error("{message}")]
     NodeTombstoned { message: String },
     /// A marker-guarded evacuation restore claim
-    /// (`begin_restore_lifecycle(require_evacuation_marker = true)`) lost its
-    /// CAS because the `evacuation_restore_target` marker was cleared by a
-    /// concurrent user restore/takeover. Distinct from [`Self::Conflict`] so
-    /// the node-drain cohort restore can treat it as a clean deferral (the
-    /// user owns the sandbox now) rather than a restore failure — without
-    /// swallowing genuine `Conflict`s (e.g. a real wake-RPC failure on the
-    /// rebuilt pod) that must stay visible to `node_drain.failures`.
+    /// (`begin_evacuation_restore_lifecycle`) found nothing it may take on
+    /// this attempt. The cases are listed where the claim's miss is
+    /// classified, in `restore_lease.rs`. Distinct from [`Self::Conflict`] so
+    /// the node-drain cohort restore can treat it as a clean deferral rather
+    /// than a restore failure — without swallowing genuine `Conflict`s (e.g. a
+    /// real wake-RPC failure on the rebuilt pod) that must stay visible to
+    /// `node_drain.failures`.
     #[error("{message}")]
     EvacuationClaimLost { message: String },
     /// A database statement lost a race for a lock: `40001`
@@ -1064,6 +1064,8 @@ pub struct SubstrateCapabilities {
     /// substrate, not from this field). When false, the admin drain, cordon
     /// and force-upload actions refuse before reading the node, except
     /// `:undrain`, which only clears a `drain_phase` an earlier drain left.
+    /// A node row's counterpart is
+    /// [`SubstrateKind::has_node_drain_reconciler`](pplx_space_common_core::types::SubstrateKind::has_node_drain_reconciler).
     pub supports_node_drain: bool,
     /// The cluster controller may run as several replicas, so each one
     /// contends for a leader `Lease` on the apiserver and only the holder runs

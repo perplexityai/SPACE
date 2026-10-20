@@ -1,7 +1,22 @@
-use pplx_space_common_core::types::{NodeId, SandboxId};
+use pplx_space_common_core::types::{NodeId, SandboxId, SubstrateKind};
 use uuid::Uuid;
 
 use super::*;
+
+#[test]
+fn drain_listings_bind_the_only_substrate_with_a_drain_reconciler() {
+    // A new variant fails to compile here until the loop below sweeps it.
+    let _ = |kind: SubstrateKind| match kind {
+        SubstrateKind::Kubernetes | SubstrateKind::Space => (),
+    };
+    for kind in [SubstrateKind::Kubernetes, SubstrateKind::Space] {
+        assert_eq!(
+            kind.has_node_drain_reconciler(),
+            kind == DRAIN_RECONCILER_SUBSTRATE,
+            "{kind}"
+        );
+    }
+}
 
 #[test]
 fn suspend_in_flight_restore_defers_to_the_next_sweep() {

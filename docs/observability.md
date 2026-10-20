@@ -508,7 +508,8 @@ configuration does not list is still sent but cannot be grouped or filtered
 on. That applies to tags added after the configuration was written, including
 the `reason` on `template.gc.tick` and `template.gc.tick_duration_ms` errors
 and the `error_kind` on `template.build.latency_ms`,
-`template.build.step.latency_ms` and `snapshot.restore.failed`. Add them to the
+`template.build.step.latency_ms` and `snapshot.restore.failed`, and the
+`fault` on `gateway.tcp.connection`. Add them to the
 metric's tag configuration before relying on them; series without them are
 unaffected.
 
@@ -582,6 +583,63 @@ Before shared initialization, caller-owned logging uses Legacy without caching
 that fallback, preserving the historical Datadog-default behavior while allowing
 later OTLP initialization. Legacy is a migration bridge for production Datadog
 continuity; remove it after native Datadog consumers migrate.
+
+## Net-gateway TCP connections
+
+`gateway.tcp.connection` counts one point for every TCP connection that reaches
+the net-gateway's per-connection handler. Every point carries the same three
+tags:
+
+- `status`: `cancelled`, `rejected`, `relayed`, `handled` or `relay_failed`.
+- `detail`: the bounded detail within `status`, such as `connect` or
+  `transfer` under `relay_failed`.
+- `fault`: on `status:relay_failed,detail:transfer`, what failed first: the
+  relay leg and operation, an unattributed relay failure, or a reserved-DNS
+  exchange; `none` on every other point.
+
+| `fault` | Meaning |
+| --- | --- |
+| `guest_read`, `guest_write`, `guest_flush`, `guest_shutdown` | The first failing socket operation in a pass-through relay was on the guest leg. |
+| `origin_read`, `origin_write`, `origin_flush`, `origin_shutdown` | The first failing socket operation in a pass-through relay was on the destination leg. |
+| `relay_io` | A pass-through relay failed without recording a failing leg. Not expected. |
+| `reserved_dns` | A reserved-DNS-over-TCP exchange failed: the resolver returned an empty reply, or writing the reply to the guest failed or timed out. No relay ran, so no leg is named. |
+| `none` | Every other outcome, including connect-phase failures. |
+
+`fault` records the first failing leg and operation the relay observed, not
+which peer caused the failure. A destination that stalls can make the guest
+time out and reset, which reads as `guest_read`. Splitting
+`gateway.tcp.connection{status:relay_failed,detail:transfer}` by `fault`
+separates guest-leg from destination-leg failures. A Datadog organization with
+a restricted tag configuration for this metric must list `fault` before it can
+be grouped or filtered on; see [Restricted tag configurations](#restricted-tag-configurations).
+
+### Known-egress logs
+
+The net-gateway names failed flows to the exact domains it was launched with
+(`--known-egress-domain`). A DNS query matches by its query name and a TCP flow
+by its TLS SNI, so only TLS flows whose SNI names a configured domain are logged.
+Plaintext and host-bound HTTP flows, and reserved DNS over TCP, carry no SNI:
+they are counted only by `gateway.tcp.connection`, not logged here. These
+events use the log target
+`pplx_space_net_gateway::known_egress` and carry `sandbox_id`,
+`original_dst_port`, `destination`, `protocol` and `reason`.
+
+- ERROR `failed to connect to known egress destination`: every failed matched
+  DNS query or TCP flow except a pass-through transfer failure. That covers
+  rejections and failed connects. It also covers inspected TLS/HTTP failures,
+  including those after the upstream connected.
+- INFO `known egress destination failed an established connection`: a
+  pass-through relay that connected and then failed first on the destination
+  leg, or without a recorded leg (`fault:relay_io`).
+- DEBUG `guest side failed an established known egress connection`: a
+  pass-through relay that connected and then failed first on the guest leg.
+  These events are visible only when the gateway's log filter enables DEBUG
+  for that target.
+
+The INFO and DEBUG events add `fault`, with the same pass-through values as
+the metric tag above. Each of these failures is also counted by
+`gateway.tcp.connection{status:relay_failed,detail:transfer}`, with the same
+`fault`, so no log level is needed to count transfer failures.
 
 ## Firecracker and guest diagnostics
 

@@ -74,7 +74,7 @@ where
             ResolveOutcome::Cancelled => return FlowOutcome::Cancelled,
         };
         if reply.is_empty() {
-            return FlowOutcome::RelayFailed(RelayFailure::Transfer(io::Error::other(
+            return FlowOutcome::RelayFailed(RelayFailure::ReservedDns(io::Error::other(
                 "reserved DNS returned an empty reply",
             )));
         }
@@ -98,9 +98,11 @@ where
         };
         match sent {
             Ok(Ok(())) => {}
-            Ok(Err(error)) => return FlowOutcome::RelayFailed(RelayFailure::Transfer(error)),
+            Ok(Err(error)) => {
+                return FlowOutcome::RelayFailed(RelayFailure::ReservedDns(error));
+            }
             Err(_) => {
-                return FlowOutcome::RelayFailed(RelayFailure::Transfer(io::Error::new(
+                return FlowOutcome::RelayFailed(RelayFailure::ReservedDns(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "reserved DNS reply write timed out",
                 )));

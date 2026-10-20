@@ -600,8 +600,32 @@ pub(super) struct PreparedWakeSandbox {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RestoreClaim {
-    FreshFromSuspended { restore_lease_token: Option<Uuid> },
-    RedroveRestoring { restore_lease_token: Option<Uuid> },
+    FreshFromSuspended {
+        restore_lease_token: Option<Uuid>,
+    },
+    /// An evacuation claim that took a released `stopped` row (marker
+    /// `'stopped'`, no `active_node_id`) to `restoring`. Evacuation-only, so
+    /// it never carries a lease token.
+    ///
+    /// Its own variant because a clean failure must not roll it back:
+    /// `restore_failure_should_revert_to_suspended` matches only
+    /// `FreshFromSuspended`, so this one stays `restoring`. Reverting to
+    /// `'suspended'` would invent a snapshot the sandbox never had, and
+    /// reverting to `'stopped'` would leave the lifecycle set that
+    /// `sandboxes_clear_evacuation_restore_target` exempts, clearing the
+    /// marker and the restore backoff with it, and the sandbox would sit on no
+    /// node outside the evacuation claim's window. Left `restoring` with the
+    /// marker, it stays inside that window, and the claim's next call takes it
+    /// as `RedroveRestoring`; the drain's restore sweep lists such a row
+    /// (the stopped arm of `restore_pending_evacuations_query` admits
+    /// `restoring`). Re-placing it also needs its restore plan to resolve the
+    /// disk artifact for a `restoring` row, which nothing does yet:
+    /// `selected_stopped_restore_storage_uri` serves only `lifecycle =
+    /// 'stopped'`.
+    FreshFromStopped,
+    RedroveRestoring {
+        restore_lease_token: Option<Uuid>,
+    },
 }
 
 impl RestoreClaim {
@@ -613,6 +637,7 @@ impl RestoreClaim {
             | Self::RedroveRestoring {
                 restore_lease_token,
             } => restore_lease_token,
+            Self::FreshFromStopped => None,
         }
     }
 }

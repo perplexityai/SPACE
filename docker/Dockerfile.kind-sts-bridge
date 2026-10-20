@@ -1,0 +1,35 @@
+# Kind-only: the in-repo STS bridge fixture (infra/space/kind/sts-bridge),
+# which turns the credential-manager authority's STS AssumeRole into
+# versitygw's AssumeRoleWithWebIdentity and serves the token issuer versitygw
+# trusts (infra/space/kind/charts/space-kind-sts-bridge). It stands in for a
+# deployment's workload identity and AWS STS; never deploy it outside a local
+# cluster.
+FROM public.ecr.aws/docker/library/golang:1.25-bookworm AS build
+
+WORKDIR /src
+COPY infra/space/kind/sts-bridge/ ./
+# Standard library only: nothing to download. The bridge's unit tests gate the
+# image, since no other job builds this module.
+RUN test -z "$(gofmt -l .)" \
+    && go vet ./... \
+    && go test -count=1 ./... \
+    && CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/space-kind-sts-bridge .
+
+FROM public.ecr.aws/docker/library/debian:bookworm-slim
+
+RUN groupadd --system --gid 65532 space-sts-bridge \
+    && useradd --system --uid 65532 --gid 65532 --no-create-home --shell /usr/sbin/nologin space-sts-bridge
+
+ARG SPACE_GIT_SHA=unknown
+LABEL org.opencontainers.image.revision="${SPACE_GIT_SHA}"
+RUN mkdir -p /etc/space && printf '%s\n' "${SPACE_GIT_SHA}" > /etc/space/build-git-sha
+
+LABEL org.opencontainers.image.title="space-kind-sts-bridge"
+LABEL org.opencontainers.image.description="Local-only SPACE STS bridge fixture for the kind stack."
+
+COPY --from=build /out/space-kind-sts-bridge /usr/local/bin/space-kind-sts-bridge
+
+USER space-sts-bridge
+
+EXPOSE 8080 8443
+ENTRYPOINT ["/usr/local/bin/space-kind-sts-bridge"]

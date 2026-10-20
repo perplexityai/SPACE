@@ -111,7 +111,8 @@ pub(super) fn insert_success_examples(spec: &mut Value) {
             "SandboxOperationResponse",
             json!(SandboxOperationResponse {
                 operation_id,
-                sandbox_id
+                sandbox_id,
+                operation: None,
             }),
         ),
         (

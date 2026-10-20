@@ -378,6 +378,7 @@ async fn create_sandbox_for_org(
         CreatePublicOperationResult::Created(operation_id) => Ok(SandboxOperationResponse {
             operation_id,
             sandbox_id,
+            operation: None,
         }),
         CreatePublicOperationResult::Existing(operation_id) => {
             sandbox_operation_response(&store, org_id, operation_id).await
@@ -733,6 +734,7 @@ async fn enqueue_admin_update_operation(
         CreatePublicOperationResult::Created(operation_id) => Ok(SandboxOperationResponse {
             operation_id,
             sandbox_id: target.public_id,
+            operation: None,
         }),
         CreatePublicOperationResult::Existing(operation_id) => {
             sandbox_operation_response(&store, org_id, operation_id).await
@@ -838,6 +840,7 @@ async fn enqueue_admin_lifecycle_operation(
         CreatePublicOperationResult::Created(operation_id) => Ok(SandboxOperationResponse {
             operation_id,
             sandbox_id: target.public_id,
+            operation: None,
         }),
         CreatePublicOperationResult::Existing(operation_id) => {
             sandbox_operation_response(&store, org_id, operation_id).await
@@ -881,6 +884,7 @@ async fn sandbox_operation_response(
     Ok(SandboxOperationResponse {
         operation_id,
         sandbox_id,
+        operation: None,
     })
 }
 

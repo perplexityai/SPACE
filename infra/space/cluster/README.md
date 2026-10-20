@@ -116,7 +116,12 @@ must exist). Before changing anything it checks:
 - for `otlp`, that the render includes the node-local collector DaemonSet.
 
 It passes the same values file, so the file also carries that chart's
-settings, such as the producer namespaces it serves (that chart's README).
+settings. The example includes `spaceNamespaces`, the corresponding
+`logs.collection.podTargets`, and a Datadog API-key Secret reference. If you
+change `--namespace`, update both the producer namespace list and the log
+path/namespace; never add the sandbox namespace. Configure the node-only
+host peers required by your CNI before relying on host-network telemetry
+(see the observability chart's README).
 
 Without the chart:
 
@@ -125,9 +130,10 @@ Without the chart:
   only the tree that installed it can reconcile;
 - `--template` warns and prints only the producers.
 
-Changing modes therefore means editing `mode` plus whatever those receivers
-need. The receivers' own caveats about data retention and mode switches
-apply.
+After provisioning these receiver prerequisites once, change
+`global.observability.mode` in that same file and rerun the installer. The
+receivers' own caveats about data retention and mode switches apply; mode
+`off` reconciles the managed release even when its chart renders no resources.
 
 ## Secrets
 
@@ -197,6 +203,12 @@ None of these are provisioned here:
   sandbox traffic by default and allows egress to `0.0.0.0/0` except
   `internetExcept`. That list must cover every private range sandboxes must
   not reach, including the cluster's pod, Service and node CIDRs.
+- Build VMs run on builder hosts, outside that NetworkPolicy. Every guest,
+  build VMs included, already drops new connections to `10.0.0.0/8`,
+  `172.16.0.0/12` and `192.168.0.0/16`. `space-build-manager-local.egress`
+  covers the rest: `denyCidrs` must list the cluster's other private ranges,
+  such as pod, Service, node or VPC CIDRs in `100.64.0.0/10`, and
+  `allowCidrs` reopens approved package mirrors and registries inside them.
 
 The credential-manager authority admits callers by TokenReview of their
 projected token. It runs all of these checks on every request, cache hits

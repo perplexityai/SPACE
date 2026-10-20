@@ -200,3 +200,37 @@ fn refusals_are_not_transport_failures() {
         "transport closed"
     )));
 }
+
+#[test]
+fn only_a_not_found_is_marked_as_a_missing_guest_path() {
+    let marked = mark_guest_path_not_found(Status::not_found("No such file or directory"));
+    assert!(is_guest_path_not_found(&marked));
+    assert_eq!(marked.code(), Code::NotFound);
+    assert_eq!(marked.message(), "No such file or directory");
+
+    // Every other outcome passes through unmarked, including a refusal that
+    // already carries a reason under the same key.
+    for status in [
+        Status::permission_denied("Permission denied"),
+        Status::failed_precondition("Not a directory"),
+        refused_before_start(
+            Status::unavailable("guest shutting down"),
+            Duration::from_secs(1),
+        ),
+    ] {
+        let code = status.code();
+        let passed = mark_guest_path_not_found(status);
+        assert_eq!(passed.code(), code);
+        assert!(!is_guest_path_not_found(&passed), "{code:?}");
+    }
+    assert!(is_refused_before_start(&mark_guest_path_not_found(
+        refused_before_start(
+            Status::unavailable("guest shutting down"),
+            Duration::from_secs(1)
+        )
+    )));
+    // An unmarked NOT_FOUND (a hop that does not know the sandbox) is not one.
+    assert!(!is_guest_path_not_found(&Status::not_found(
+        "sandbox not found"
+    )));
+}

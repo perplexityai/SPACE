@@ -1,0 +1,18 @@
+{{- $mode := include "space-observability.mode" . -}}
+space-observability mode: {{ $mode }}
+{{- if eq $mode "off" }}
+Nothing is installed. SPACE services with mode off export no metrics or traces.
+{{- else if eq $mode "datadog" }}
+Datadog Agent DaemonSet: DogStatsD on host port {{ .Values.global.observability.datadog.dogstatsdPort }}/UDP, APM on {{ .Values.global.observability.datadog.apmPort }}/TCP.
+Check: kubectl -n {{ .Release.Namespace }} rollout status daemonset/datadog-agent
+{{- else }}
+OTLP/gRPC gateway: collector.{{ .Release.Namespace }}.svc:4317 (from namespaces {{ join ", " .Values.spaceNamespaces }}).
+SPACE producers send to the node-local Collector on http://<node IP>:{{ .Values.global.observability.otlp.nodeLocalPort }}, which this chart does not install yet; until it does, otlp producers cannot export.
+{{- if .Values.grafana.enabled }}
+Grafana: kubectl -n {{ .Release.Namespace }} port-forward --address 127.0.0.1 service/grafana 13000:3000
+{{- if eq .Values.grafana.auth.existingSecret (include "space-observability.grafanaAdminSecret" .) }}
+Admin password: kubectl -n {{ .Release.Namespace }} get secret {{ include "space-observability.grafanaAdminSecret" . }} -o jsonpath='{.data.{{ .Values.grafana.auth.passwordKey }}}' | base64 -d
+{{- end }}
+{{- end }}
+{{- end }}
+Install this release before switching SPACE services to the same mode.

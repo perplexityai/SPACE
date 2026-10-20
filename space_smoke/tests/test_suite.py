@@ -53,6 +53,7 @@ class SmokeSuiteTests(unittest.TestCase):
     ) -> None:
         services = mock.Mock()
         services.telemetry_mode.return_value = "otel"
+        services.storage_credentials.return_value = "exchange"
         selected = tuple(
             scenario
             for scenario in REGISTRY
@@ -102,6 +103,7 @@ class SmokeSuiteTests(unittest.TestCase):
         # quarantine list, which is usually empty and would make this vacuous.
         services = mock.Mock()
         services.telemetry_mode.return_value = "otel"
+        services.storage_credentials.return_value = "exchange"
         live = tuple(
             scenario
             for scenario in REGISTRY

@@ -52,6 +52,22 @@ spec:
             {{- range .Values.extraArgs }}
             - {{ . | quote }}
             {{- end }}
+            # Requests signed with session (or IAM user) keys are checked by
+            # the IAM service (templates/iam.yaml) on its private port, which
+            # the gateway reaches over mTLS and signs with the root keys; root
+            # keys are resolved and authorized here alone
+            # (IAMServiceStandalone.DeriveSigningKey in versitygw's
+            # auth/iam_standalone.go; root bypasses policy evaluation), so they
+            # keep working while the IAM service is down. At startup the
+            # gateway only warns if the service is unreachable.
+            - --iam-standalone-endpoint
+            - "{{ .Values.iam.serviceName }}:{{ .Values.iam.privatePort }}"
+            - --iam-standalone-client-cert
+            - /etc/object-store-iam-client/tls.crt
+            - --iam-standalone-client-cert-key
+            - /etc/object-store-iam-client/tls.key
+            - --iam-standalone-server-ca
+            - /etc/space-rpc-ca/ca.crt
             - posix
             - /data
           env:
@@ -91,6 +107,12 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            - name: iam-client-tls
+              mountPath: /etc/object-store-iam-client
+              readOnly: true
+            - name: rpc-ca
+              mountPath: /etc/space-rpc-ca
+              readOnly: true
           {{- with .Values.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
@@ -106,3 +128,13 @@ spec:
           hostPath:
             path: {{ .Values.dataHostPath }}
             type: DirectoryOrCreate
+        # The gateway's client leaf for the IAM service's private port, and
+        # the CA its server leaf chains to (internal-rpc-tls.sh).
+        - name: iam-client-tls
+          secret:
+            secretName: {{ .Values.iam.clientTlsSecretName }}
+            defaultMode: 0440
+        - name: rpc-ca
+          secret:
+            secretName: {{ .Values.iam.caSecretName }}
+            defaultMode: 0444

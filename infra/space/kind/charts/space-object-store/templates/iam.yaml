@@ -1,0 +1,148 @@
+{{- /*
+versitygw's standalone IAM service (values.yaml, iam). It serves
+AssumeRoleWithWebIdentity to the STS bridge: it verifies the bridge's tokens
+against the issuer's keys, fetched through --oidc-discovery-url (TLS verified
+against the provider's pinned thumbprint; the issuer name in tokens never
+resolves, so no private-endpoint or plaintext relaxation is set), checks the
+role's trust policy and maximum duration, and stores each session with its
+policy. The gateway then asks it about every session-signed request.
+
+Its own Deployment, not a container of the gateway's pod: a pod is Ready only
+while every container is, so an IAM crash, OOM kill or restart would take the
+S3 Service's only endpoint away from every root-key client.
+*/ -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: space-object-store-iam
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: space-object-store-iam
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    team: {{ .Values.datadogTeam | quote }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: space-object-store-iam
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  strategy:
+    # One process over its state: the IAM store rewrites iam.json whole
+    # (read, modify, rename) with no lock between processes, so two would
+    # lose each other's writes.
+    type: Recreate
+  template:
+    metadata:
+      annotations:
+        ad.datadoghq.com/tags: '{"team":"{{ .Values.datadogTeam }}"}'
+      labels:
+        app.kubernetes.io/name: space-object-store-iam
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        team: {{ .Values.datadogTeam | quote }}
+    spec:
+      # Its state is on the infra node's hostPath, beside the buckets.
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      priorityClassName: {{ .Values.priorityClassName }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: iam
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Global flags precede the `iam` subcommand; --cert and --key are
+          # the public listener's. The private listener requires the client
+          # CA on a TCP address (newPrivateAPI in versitygw's embedgw/iam.go):
+          # any client leaf of the internal RPC CA with clientAuth passes, and
+          # internal-rpc-tls.sh issues only the gateway's.
+          args:
+            - --port
+            - ":{{ .Values.iam.port }}"
+            - --cert
+            - /etc/object-store-iam-tls/tls.crt
+            - --key
+            - /etc/object-store-iam-tls/tls.key
+            - --health
+            - {{ .Values.healthPath | quote }}
+            - --region
+            - {{ .Values.region | quote }}
+            - iam
+            - --dir
+            - /iam
+            - --private-ports
+            - ":{{ .Values.iam.privatePort }}"
+            - --private-cert
+            - /etc/object-store-iam-tls/tls.crt
+            - --private-cert-key
+            - /etc/object-store-iam-tls/tls.key
+            - --private-client-ca
+            - /etc/space-rpc-ca/ca.crt
+            - --oidc-discovery-url
+            - "https://{{ .Values.storageExchange.issuerHost }}={{ .Values.storageExchange.discoveryUrl }}"
+          # The root account the gateway signs its private calls with and the
+          # bucket-init Job administers IAM as.
+          env:
+            - name: ROOT_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: space-object-store
+                  key: SPACE_OBJECT_STORE_STATIC_ACCESS_KEY_ID
+            - name: ROOT_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: space-object-store
+                  key: SPACE_OBJECT_STORE_STATIC_SECRET_ACCESS_KEY
+          ports:
+            - name: iam
+              containerPort: {{ .Values.iam.port }}
+              protocol: TCP
+            - name: iam-private
+              containerPort: {{ .Values.iam.privatePort }}
+              protocol: TCP
+          # Readiness is this pod's alone: it puts the IAM Service's endpoint
+          # in and out, and nothing of the gateway's.
+          readinessProbe:
+            httpGet:
+              scheme: HTTPS
+              path: {{ .Values.healthPath }}
+              port: iam
+            initialDelaySeconds: 1
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              scheme: HTTPS
+              path: {{ .Values.healthPath }}
+              port: iam
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 6
+          volumeMounts:
+            - name: state
+              mountPath: /iam
+            - name: tls
+              mountPath: /etc/object-store-iam-tls
+              readOnly: true
+            - name: rpc-ca
+              mountPath: /etc/space-rpc-ca
+              readOnly: true
+          {{- with .Values.iam.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        # The IAM state on the store's persistent hostPath, beside the buckets
+        # (values.yaml, iam.dirName).
+        - name: state
+          hostPath:
+            path: {{ printf "%s/%s" .Values.dataHostPath .Values.iam.dirName }}
+            type: DirectoryOrCreate
+        - name: tls
+          secret:
+            secretName: {{ .Values.iam.tlsSecretName }}
+            defaultMode: 0440
+        - name: rpc-ca
+          secret:
+            secretName: {{ .Values.iam.caSecretName }}
+            defaultMode: 0444

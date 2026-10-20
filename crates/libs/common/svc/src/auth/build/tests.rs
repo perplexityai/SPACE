@@ -229,6 +229,7 @@ async fn direct_publication_requires_both_credentials_and_an_independent_build_g
             authorize_template_build(&request, None).unwrap();
             authorize_template_build(&request, Some("example-org")).unwrap();
             assert!(system_publication_requires_grant(&request));
+            assert!(tenant_publication_requires_grant(&request));
             assert_eq!(
                 authorize_system_publication_grant(&request)
                     .unwrap_err()

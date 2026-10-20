@@ -858,7 +858,14 @@ fn stopped_artifact_publication_accepts_only_stop_completions_and_unpinned_stopp
     for (case, id) in &accepted {
         set_runtime_pid(&conn, id);
         let artifact = LocalArtifactId::new();
-        publish_stopped_artifact(&conn, id, artifact, &format!("/cache/{id}/disk")).unwrap();
+        publish_stopped_artifact(
+            &conn,
+            id,
+            get_sandbox(&conn, id).unwrap().unwrap().node_execution_id,
+            artifact,
+            &format!("/cache/{id}/disk"),
+        )
+        .unwrap();
         let published = row(&conn, id);
         assert_eq!(published.state, SandboxState::Stopped, "{case}");
         assert_eq!(
@@ -905,7 +912,13 @@ fn stopped_artifact_publication_accepts_only_stop_completions_and_unpinned_stopp
         let before = database_rows(&conn);
         let artifact = LocalArtifactId::new();
         assert_no_rows(
-            publish_stopped_artifact(&conn, &id, artifact, &format!("/cache/{id}/disk")),
+            publish_stopped_artifact(
+                &conn,
+                &id,
+                get_sandbox(&conn, &id).unwrap().unwrap().node_execution_id,
+                artifact,
+                &format!("/cache/{id}/disk"),
+            ),
             case,
         );
         assert_unchanged(&conn, &before, case);

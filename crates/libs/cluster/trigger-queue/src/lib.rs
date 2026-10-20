@@ -261,9 +261,11 @@ pub async fn fetch_trigger_targets(
             permanently_unavailable: Vec::new(),
         });
     };
+    // A node of a substrate listed in that inventory but missing from it is
+    // gone for good. Other nodes never appear there, so absence says nothing.
     let (permanently_unavailable, triggerable): (Vec<_>, Vec<_>) =
         targets.into_iter().partition(|target| {
-            target.managed_by == NodeManagedBy::Kubernetes
+            target.managed_by.listed_in_live_node_inventory()
                 && !target
                     .node_name
                     .as_ref()

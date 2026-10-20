@@ -234,6 +234,32 @@ pub fn is_refused_before_start(status: &Status) -> bool {
         == Some(pplx_space_common_core::spaced::REQUEST_REFUSED)
 }
 
+/// Mark a NOT_FOUND returned by a guest filesystem call on a path as the path
+/// being missing (see [`pplx_space_common_core::spaced::GUEST_PATH_NOT_FOUND`]).
+///
+/// Only the hop that has already resolved the sandbox to a running guest may
+/// call this: there, a NOT_FOUND from the guest's filesystem service can only
+/// be the path. Any other status passes through unchanged.
+pub fn mark_guest_path_not_found(mut status: Status) -> Status {
+    if status.code() == Code::NotFound {
+        status.metadata_mut().insert(
+            pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+            MetadataValue::from_static(pplx_space_common_core::spaced::GUEST_PATH_NOT_FOUND),
+        );
+    }
+    status
+}
+
+/// Whether `status` was marked by [`mark_guest_path_not_found`].
+pub fn is_guest_path_not_found(status: &Status) -> bool {
+    status.code() == Code::NotFound
+        && status
+            .metadata()
+            .get(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY)
+            .and_then(|value| value.to_str().ok())
+            == Some(pplx_space_common_core::spaced::GUEST_PATH_NOT_FOUND)
+}
+
 /// The retry hint carried by [`RETRY_AFTER_MS_METADATA`], if the server set
 /// one (see [`with_retry_after`]). Metadata only: the message-text fallback
 /// exists solely for the rate-limit status.

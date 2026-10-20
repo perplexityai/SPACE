@@ -32,6 +32,8 @@ persistence:
   size: 1Gi
   storageClassName: null
   existingClaim: ""
+  useDefaultStorageClass: false
+  ephemeral: false
   retain: true
   # Used only when persistence is disabled.
   emptyDirSizeLimit: 256Mi
@@ -43,7 +45,8 @@ networkPolicy:
   # Peers permitted to reach the UI on :3000.
   uiPeers: []
   # Full NetworkPolicy egress rules reaching the backends, which normally live
-  # in other namespaces. DNS to kube-system CoreDNS is always allowed.
+  # in other namespaces. DNS is always allowed (global.networkPolicy.dns,
+  # default kube-system CoreDNS).
   backendEgress: []
   additionalEgress: []
 resources:

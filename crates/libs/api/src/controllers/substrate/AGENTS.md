@@ -84,6 +84,13 @@ For new work:
   `failed_active_execution_scope` in `transient_lifecycle_sweeper/store.rs`,
   which turns the running label into the fixed SQL scope of the sweeper's
   failed-active-execution cleanup; don't add another.
+- A decision about one row's substrate (a sandbox's or node's `managed_by`)
+  calls a `SubstrateKind` method named for the question; add one when no
+  method asks it. Rust that repeats a statement's fixed scope compares
+  against the named const the statement binds (e.g. `REGISTRY_SUBSTRATE`),
+  and mapping a `SubstrateKind` variant to a value (wire labels, route
+  identity, construction) may match it. A fact about the running substrate
+  reads `capabilities()`. Never compare the label string.
 - Scoping a query to the rows a substrate owns is required, not debt. In new
   SQL, bind the substrate value instead of a `'k8s'`/`'space'` literal:
   `managed_by = $n` with `.bind(substrate.managed_by())` for the running

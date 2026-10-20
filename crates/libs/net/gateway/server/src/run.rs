@@ -67,7 +67,8 @@ pub struct NetGatewayRunConfig {
     /// + `IP_RECVORIGDSTADDR`). `None` builds a transparent fallback socket.
     pub udp_fd: Option<i32>,
     pub initial_policy_state: InitialPolicyState,
-    /// Exact domains whose failed DNS or TCP flows should emit an error.
+    /// Exact domains whose failed DNS or TCP flows are logged; see
+    /// [`KnownEgressState`] for which failures are errors.
     pub known_egress_domains: Vec<DomainName>,
     /// May be partial while execution identity is being enriched.
     pub route_identity: Option<SpaceApiRouteIdentity>,

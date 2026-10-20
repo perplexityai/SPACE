@@ -6,11 +6,11 @@
 //! tests) never get that registration, so nodes only appear in the SPACE
 //! UI after the first sandbox pod lands on them.
 //!
-//! `sync_labeled_nodes_to_db` fills that gap: it lists all kube Nodes
-//! carrying the sandbox node-selector label and upserts each one into the
-//! `nodes` + `node_k8s` tables. Missing-node reconciliation compares stale
-//! ready rows with the full watcher-backed Node membership so live builders
-//! and other roles outside the sandbox selector are preserved. Idempotent —
+//! `sync_labeled_nodes_to_db` fills that gap: it lists kube Nodes carrying the
+//! sandbox selector and joins scheduled node-api pods to the watcher-backed
+//! Node inventory for roles outside that selector. Missing-node reconciliation
+//! compares stale ready rows with the full watcher-backed Node membership.
+//! Idempotent —
 //! re-running on a DaemonSet-managed cluster is safe and unchanged rows are
 //! left alone. Called from the cluster-controller's `kube_node_sync`
 //! reconciler.
@@ -43,10 +43,9 @@ pub enum SyncNodeInventoryError {
     ReconcileMissing(#[source] crate::controllers::substrate::SubstrateError),
 }
 
-/// List all kube Nodes with the configured sandbox node-selector label and
-/// upsert each into the SPACE `nodes` + `node_k8s` tables. Then use the full
-/// watcher-backed Node membership to demote stale ready rows that are absent
-/// from Kubernetes, including rows for roles outside the sandbox selector.
+/// Upsert kube Nodes selected for sandboxes or carrying a node-api pod into
+/// the SPACE `nodes` + `node_k8s` tables. Then use the full watcher-backed Node
+/// membership to demote stale ready rows that are absent from Kubernetes.
 ///
 /// Returns the list of node names whose DB inventory changed. Nodes without an
 /// `InternalIP` address are skipped with a warning.
@@ -63,6 +62,9 @@ pub(super) async fn sync_labeled_nodes_to_db(
     let label_selector = format!("{selector_key}={selector_val}");
 
     let nodes_api: Api<k8s_openapi::api::core::v1::Node> = Api::all(substrate.k8s.client.clone());
+    // Keep this selector-bounded LIST as the credible sandbox membership used
+    // by missing-node reconciliation; the shared reflector supplies the
+    // node-api roles that cannot be expressed by that selector.
     let lp = ListParams::default().labels(&label_selector);
     let node_list = nodes_api
         .list(&lp)
@@ -75,7 +77,7 @@ pub(super) async fn sync_labeled_nodes_to_db(
         .collect::<Vec<_>>();
 
     let mut changed = Vec::new();
-    for node in &node_list.items {
+    for (node, role) in inventory_nodes(node_list.items, &substrate.k8s.caches) {
         let name = match node.metadata.name.as_deref() {
             Some(n) => n,
             None => continue,
@@ -84,16 +86,12 @@ pub(super) async fn sync_labeled_nodes_to_db(
             Some(u) => u,
             None => continue,
         };
-        let address = match k8s_node_internal_ip(node) {
+        let address = match k8s_node_internal_ip(&node) {
             Some(a) => a,
             None => {
                 tracing::warn!(node = %name, "kube_node_sync: skipping node with no InternalIP");
                 continue;
             }
-        };
-
-        let Some(role) = node_role_from_labels(name, node.metadata.labels.as_ref()) else {
-            continue;
         };
 
         let node_id = space_k8s_node_id(name, role.as_str());
@@ -163,6 +161,48 @@ pub(super) async fn sync_labeled_nodes_to_db(
     changed.sort_unstable();
     changed.dedup();
     Ok(changed)
+}
+
+fn inventory_nodes(
+    sandbox_nodes: Vec<k8s_openapi::api::core::v1::Node>,
+    caches: &super::K8sCaches,
+) -> Vec<(k8s_openapi::api::core::v1::Node, NodeRole)> {
+    let mut nodes = BTreeMap::new();
+    for node in sandbox_nodes {
+        let Some(name) = node.metadata.name.clone() else {
+            continue;
+        };
+        let Some(role) = node_role_from_labels(&name, node.metadata.labels.as_ref()) else {
+            continue;
+        };
+        nodes.insert((name, role), node);
+    }
+
+    for pod in caches.node_api_pods.state() {
+        if pod.metadata.deletion_timestamp.is_some() {
+            continue;
+        }
+        let Some(name) = pod.spec.as_ref().and_then(|spec| spec.node_name.as_deref()) else {
+            continue;
+        };
+        let Some(role) = super::caches::pod_app_name(&pod)
+            .and_then(super::caches::role_from_app_name)
+            .and_then(|role| NodeRole::parse(role).ok())
+        else {
+            continue;
+        };
+        let Some(node) = caches.node_by_name(name) else {
+            continue;
+        };
+        nodes
+            .entry((name.to_string(), role))
+            .or_insert((*node).clone());
+    }
+
+    nodes
+        .into_iter()
+        .map(|((_, role), node)| (node, role))
+        .collect()
 }
 
 fn demotion_membership_snapshot(

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Collection, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, BinaryIO, Generic, Protocol, TypeVar
 
@@ -974,8 +974,10 @@ class ForkableSandbox(Protocol):
     to reclaim.
     """
 
-    def fork(self, *, timeout: int = 600) -> str:
-        """Fork the sandbox once; returns the child sandbox id. Synchronous."""
+    def fork_response(
+        self, *, timeout: int, idempotency_key: str | None = None
+    ) -> Mapping[str, Any]:
+        """The public fork result, including child data-plane credentials."""
         ...
 
     def delete_forked(self, child_id: str) -> None:
@@ -1024,6 +1026,10 @@ class EcwSandbox(ProcessSandbox, Protocol):
 
 
 class EcwSandboxes(Protocol):
+    def attach_fork(self, response: Mapping[str, Any]) -> EcwSandbox:
+        """Construct a client from a fork response without waking the child."""
+        ...
+
     def create(
         self,
         *,
@@ -1063,11 +1069,27 @@ class EcwSandboxes(Protocol):
     ) -> EcwSandboxPages: ...
 
 
+@dataclass(frozen=True)
+class EcwForkResult:
+    """A tracked child and the complete public reply used to construct its client."""
+
+    sandbox: EcwSandbox
+    response: Mapping[str, Any] = field(repr=False)
+
+
 class EcwScenarioSandboxes(Protocol):
     @property
     def items(self) -> tuple[EcwSandbox, ...]: ...
 
     def create(self, metadata: Mapping[str, str] | None = None) -> EcwSandbox: ...
+
+    def fork(
+        self,
+        source: EcwSandbox,
+        *,
+        idempotency_key: str | None = None,
+        timeout: int | None = None,
+    ) -> EcwForkResult: ...
 
     def attempt_create(
         self,
@@ -2327,4 +2349,93 @@ class LeaderElectionControl(TelemetryBackendControl, Protocol):
 
     def node_container_log_tail(self, node_name: str, container_id: str, *, lines: int) -> str:
         """The container's last log lines, read on the node: failure evidence only."""
+        ...
+
+
+@dataclass(frozen=True)
+class StorageObject:
+    """One object in the Kind object store, as the store's root keys see it."""
+
+    bucket: str
+    key: str
+    etag: str
+    size: int
+
+    @property
+    def arn(self) -> str:
+        return f"arn:aws:s3:::{self.bucket}/{self.key}"
+
+
+@dataclass(frozen=True)
+class StorageSession:
+    """Credentials credential-manager's storage exchange issued."""
+
+    access_key_id: str
+    secret_access_key: str
+    session_token: str
+    expires_at_unix: int
+
+
+@dataclass(frozen=True)
+class StorageExchangeOutcome:
+    """An ExchangeToken answer: a session, or the gRPC refusal."""
+
+    session: StorageSession | None
+    status: str
+    detail: str
+
+
+@dataclass(frozen=True)
+class StorageRequestResult:
+    """One S3 request made with an exchanged session."""
+
+    operation: str
+    target: str
+    succeeded: bool
+    refused: bool
+    detail: str
+
+
+class StorageExchangeControl(Protocol):
+    """Kind-only access to credential-manager's storage exchange and the store.
+
+    The exchange goes through a sandbox worker's credential-manager agent, on
+    the volume socket and as the volume-manager account, exactly as
+    volume-manager asks for a transfer's credentials; the agent forwards it to
+    the authority, which vends a session through STS. S3 requests then use
+    that session against the object store.
+    """
+
+    def storage_credentials_mode(self) -> str:
+        """The mode the cluster runs: `exchange` or `static`."""
+        ...
+
+    def sandbox_worker_nodes(self) -> list[str]:
+        """Nodes running the worker volume-manager DaemonSet, sorted."""
+        ...
+
+    def ready_full_snapshots(self, sandbox_id: str) -> list[SnapshotRecord]: ...
+
+    def snapshot_objects(self, record: SnapshotRecord) -> list[StorageObject]:
+        """The objects under a snapshot's storage prefix, read with root keys."""
+        ...
+
+    def bucket_objects(self, bucket: str, *, limit: int) -> list[StorageObject]:
+        """Up to `limit` objects of a bucket, read with root keys."""
+        ...
+
+    def head_object(self, bucket: str, key: str) -> StorageObject | None:
+        """An object's ETag and size read with root keys; None if absent."""
+        ...
+
+    def exchange_storage_credentials(
+        self, node_name: str, *, subject: str, resource: str, scope: str
+    ) -> StorageExchangeOutcome:
+        """ExchangeToken through the node's agent volume socket."""
+        ...
+
+    def storage_request(
+        self, session: StorageSession, operation: str, bucket: str, key: str, *, body: bytes | None = None
+    ) -> StorageRequestResult:
+        """One S3 request (head, get, list, put) signed with the session."""
         ...

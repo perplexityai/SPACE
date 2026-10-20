@@ -123,12 +123,22 @@ TILT
         # Its own knob rather than SPACE_TILT_PIDFILE, so a value inherited
         # from the box running this test can never name a real pidfile.
         SPACE_TILT_PIDFILE="${TEST_TILT_PIDFILE:-$work/no-such-pidfile}"
+        unset SPACE_KIND_STORAGE_CREDENTIALS
         source "$repo_root/scripts/tests/lib/bootstrap-kind-stack.sh"
 
         pgrep() { return 0; }
         curl() { return 0; }
         lsof() { return 0; }
-        kubectl() { return 1; }
+        # The cluster runs the requested storage credentials mode: the
+        # authority's label and the worker volume-manager's env agree with the
+        # default. Every other cluster read fails.
+        kubectl() {
+            case "$*" in
+                *" get deployments -l app.kubernetes.io/name=space-credmgr-authority "*) printf 'exchange|' ;;
+                *" get daemonset space-volume-manager "*) printf 'space-volume-manager|' ;;
+                *) return 1 ;;
+            esac
+        }
         kill() { touch "$work/signaled"; }
         pkill() { touch "$work/signaled"; }
         kind() {

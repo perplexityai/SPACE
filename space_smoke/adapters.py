@@ -87,6 +87,10 @@ from space_smoke.capabilities import (
     SandboxPodPlacement,
     SnapshotRecord,
     FailedTransfer,
+    StorageExchangeOutcome,
+    StorageObject,
+    StorageRequestResult,
+    StorageSession,
     ReleaseStorageRow,
     RestoreActivation,
     RestoreFailure,
@@ -98,6 +102,7 @@ from space_smoke.capabilities import (
     WarmPoolCandidate,
     WarmPoolSelection,
 )
+from space_smoke.credmgr_socket import exchange_token, relay_argv
 from space_smoke.orphaned_restore_pod_gc import (
     GC_ENV_KEYS,
     GC_LOG_NEEDLE,
@@ -2451,7 +2456,7 @@ ON CONFLICT (key_hash) DO NOTHING;
                 # truncate the rootfs — would be undone by it. The manifest
                 # listing the compressed sibling is the last file write; the
                 # row upsert follows within the same task, so give it a beat.
-                f"d=$(ls -d {shlex.quote(directory)}/sha256:* | head -n1)",
+                f"d=$(ls -d {shlex.quote(directory)}/*:* | head -n1)",
                 "for _ in $(seq 1 360); do "
                 'if grep -q rootfs.ext4.zst "$d/manifest.json" 2>/dev/null; then sleep 2; exit 0; fi; '
                 "sleep 0.5; done",
@@ -2517,7 +2522,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             node_name, f"space-tmplmgr get --template {name} {selector_arg}", timeout=60
         )
         output = _require_ok(resolved, "resolve the selected protected template before planting")
-        hashes = re.findall(r"^content_hash:\s*(sha256:[0-9a-f]{64})\s*$", output, re.MULTILINE)
+        hashes = re.findall(r"^content_hash:\s*((?:sha256|blake3):[0-9a-f]{64})\s*$", output, re.MULTILINE)
         if len(hashes) != 1:
             raise RuntimeError("template resolve did not return one full content hash")
         return tuple(sorted({active, hashes[0]}))
@@ -2556,7 +2561,7 @@ ON CONFLICT (key_hash) DO NOTHING;
         # else (no shell, pod gone, exec refused) must not read as "gone".
         result = self._node_shell_exec(
             node_name,
-            f"out=$(ls -d {TEMPLATE_CACHE_ROOT}/{name}/sha256:* 2>/dev/null); "
+            f"out=$(ls -d {TEMPLATE_CACHE_ROOT}/{name}/*:* 2>/dev/null); "
             'rc=$?; if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then exit "$rc"; fi; '
             'printf "%s\n" "$out"',
             timeout=30,
@@ -4989,6 +4994,172 @@ ON CONFLICT (key_hash) DO NOTHING;
             ["docker", "exec", self._kind_node_container(node_name), *command], timeout=30
         )
 
+    # --- storage exchange ----------------------------------------------------
+    #
+    # credential-manager's storage exchange, asked on a sandbox worker's agent
+    # volume socket as the volume-manager account (credmgr_socket.py), and S3
+    # requests against the store with the session it returns or with the
+    # store's root keys. Reads only, except one refused small write.
+
+    def storage_credentials_mode(self) -> str:
+        result = self.kubectl(
+            "get", "deployments", "-l", "app.kubernetes.io/name=space-credmgr-authority",
+            "-o", "jsonpath={.items[*].metadata.labels.space\\.pplx\\.net/kind-storage-credentials}",
+            timeout=15,
+        )
+        modes = set(_require_ok(result, "read the storage credentials mode").split())
+        # An authority rendered before the modes existed ran static keys.
+        mode = modes.pop() if len(modes) == 1 else "static" if not modes else ""
+        if mode not in ("exchange", "static"):
+            raise SmokeConfigurationError(f"the authority runs no known storage credentials mode: {sorted(modes)}")
+        # The label records how the authority's chart was rendered. The worker
+        # volume-manager must agree, holding the store's static keys in
+        # `static` only: a failed apply or a stale Tilt resource can leave the
+        # workers on the other side of it.
+        result = self.kubectl(
+            "get", "daemonset", "space-volume-manager",
+            "-o", "jsonpath={.spec.template.spec.containers[*].env[*].name}", timeout=15,
+        )
+        names = _require_ok(result, "read the worker volume-manager env").split()
+        worker_keys = sorted(name for name in names if name.startswith("SPACE_OBJECT_STORE_STATIC_"))
+        if bool(worker_keys) != (mode == "static"):
+            raise SmokeConfigurationError(
+                f"the authority runs storage credentials mode {mode}, but the worker volume-manager "
+                + (f"holds static keys ({', '.join(worker_keys)})" if worker_keys else "holds no static keys")
+            )
+        return mode
+
+    def sandbox_worker_nodes(self) -> list[str]:
+        result = self.kubectl(
+            "get", "pods", "-l", "app.kubernetes.io/name=space-worker,app.kubernetes.io/component=volume-manager",
+            "-o", "jsonpath={.items[*].spec.nodeName}", timeout=15,
+        )
+        return sorted(set(_require_ok(result, "list worker volume-manager pods").split()))
+
+    def _storage_environment(
+        self, access_key_id: str, secret_access_key: str, session_token: str | None
+    ) -> dict[str, str | None]:
+        return {
+            "AWS_SESSION_TOKEN": session_token,
+            "AWS_SECURITY_TOKEN": None,
+            "AWS_PROFILE": None,
+            "AWS_DEFAULT_PROFILE": None,
+            "AWS_WEB_IDENTITY_TOKEN_FILE": None,
+            "AWS_ROLE_ARN": None,
+            "AWS_ROLE_SESSION_NAME": None,
+            "AWS_SHARED_CREDENTIALS_FILE": os.devnull,
+            "AWS_CONFIG_FILE": os.devnull,
+            "AWS_ACCESS_KEY_ID": access_key_id,
+            "AWS_SECRET_ACCESS_KEY": secret_access_key,
+            "AWS_REGION": "us-east-1",
+            "AWS_DEFAULT_REGION": "us-east-1",
+            "AWS_EC2_METADATA_DISABLED": "true",
+            # A refusal is the answer under test, never a transient to retry.
+            "AWS_MAX_ATTEMPTS": "1",
+        }
+
+    def _root_storage_environment(self) -> dict[str, str | None]:
+        return self._storage_environment(
+            self.environment.get("SPACE_SMOKE_S3_ACCESS_KEY_ID", "localadmin"),
+            self.environment.get("SPACE_SMOKE_S3_SECRET_ACCESS_KEY", "localadmin-dev-secret"),
+            None,
+        )
+
+    def _s3api(self, environment: Mapping[str, str | None], *args: str, timeout: float = 30) -> CommandResult:
+        return self.executor.run(
+            [
+                "aws", "--no-cli-pager", "--endpoint-url",
+                self.environment.get("S3_ENDPOINT", "http://127.0.0.1:8333"), "s3api", *args,
+            ],
+            env=environment,
+            timeout=timeout,
+        )
+
+    def bucket_objects(self, bucket: str, *, limit: int, prefix: str = "") -> list[StorageObject]:
+        args = ["list-objects-v2", "--bucket", bucket, "--max-items", str(limit), "--output", "json"]
+        if prefix:
+            args += ["--prefix", prefix]
+        output = _require_ok(self._s3api(self._root_storage_environment(), *args), f"list {bucket}")
+        contents = (json.loads(output) if output.strip() else {}).get("Contents", [])
+        return [
+            StorageObject(bucket=bucket, key=item["Key"], etag=item.get("ETag", ""), size=int(item.get("Size", 0)))
+            for item in contents
+        ]
+
+    def snapshot_objects(self, record: SnapshotRecord) -> list[StorageObject]:
+        bucket, prefix, _, _ = self._snapshot_storage_target(record)
+        return self.bucket_objects(bucket, limit=100, prefix=prefix)
+
+    def head_object(self, bucket: str, key: str) -> StorageObject | None:
+        result = self._s3api(self._root_storage_environment(), "head-object", "--bucket", bucket, "--key", key)
+        if result.returncode != 0 and ("404" in result.stderr or "Not Found" in result.stderr):
+            return None
+        head = json.loads(_require_ok(result, f"head {bucket}/{key}"))
+        return StorageObject(bucket=bucket, key=key, etag=head.get("ETag", ""), size=int(head.get("ContentLength", 0)))
+
+    def exchange_storage_credentials(
+        self, node_name: str, *, subject: str, resource: str, scope: str
+    ) -> StorageExchangeOutcome:
+        self._require_isolated_kind("on-node operations")
+        argv = relay_argv(
+            ["kubectl", "--context", self.config.context, "-n", KIND_NAMESPACE],
+            self._node_shell_pod(node_name),
+            KIND_NODE_SHELL_CONTAINER,
+            "/space/run/volume-credentials/credmgr.sock",
+            # volume-manager's account; the socket's group admits it
+            # (crates/libs/credential/mgr/server/src/run/volume_socket.rs).
+            user="space-volmgr",
+            groups=("space-volcredclients",),
+        )
+        credentials, status, detail = exchange_token(argv, resource=resource, scope=scope, subject=subject)
+        session = (
+            StorageSession(
+                access_key_id=credentials.access_key_id,
+                secret_access_key=credentials.secret_access_key,
+                session_token=credentials.session_token,
+                expires_at_unix=credentials.expires_at_unix,
+            )
+            if credentials is not None
+            else None
+        )
+        return StorageExchangeOutcome(session=session, status=status, detail=detail[:500])
+
+    def storage_request(
+        self, session: StorageSession, operation: str, bucket: str, key: str, *, body: bytes | None = None
+    ) -> StorageRequestResult:
+        environment = self._storage_environment(
+            session.access_key_id, session.secret_access_key, session.session_token
+        )
+        with tempfile.TemporaryDirectory(prefix="space-smoke-s3-") as directory:
+            if operation == "head":
+                args = ["head-object", "--bucket", bucket, "--key", key]
+            elif operation == "get":
+                args = ["get-object", "--bucket", bucket, "--key", key, os.path.join(directory, "object")]
+            elif operation == "list":
+                args = ["list-objects-v2", "--bucket", bucket, "--prefix", key, "--max-items", "1"]
+            elif operation == "put":
+                if body is None:
+                    raise ValueError("a put needs a body")
+                path = os.path.join(directory, "body")
+                Path(path).write_bytes(body)
+                args = ["put-object", "--bucket", bucket, "--key", key, "--body", path]
+            else:
+                raise ValueError(f"unknown storage operation {operation!r}")
+            result = self._s3api(environment, *args, timeout=60)
+        detail = result.detail()[-500:]
+        # The aws CLI names the S3 status in its error: 403 Forbidden for a
+        # body-less refusal, AccessDenied when the store sent an error body.
+        refused = result.returncode != 0 and any(
+            marker in detail for marker in ("(403)", "AccessDenied", "Forbidden")
+        )
+        return StorageRequestResult(
+            operation=operation,
+            target=f"{bucket}/{key}",
+            succeeded=result.returncode == 0,
+            refused=refused,
+            detail=detail,
+        )
+
     # --- sandbox network isolation -------------------------------------------
     #
     # Probes of the sandbox namespace's NetworkPolicies, run in the node's
@@ -5263,7 +5434,7 @@ def _parse_startup_recovery(node: str, pod: str, log: str) -> StartupRecoveryRep
         if TEMPLATE_RECOVERY_LEGACY_PRUNED_PREFIX in line:
             _, _, tail = line.partition(TEMPLATE_RECOVERY_LEGACY_PRUNED_PREFIX)
             name, sep, digest = tail.strip().partition("/")
-            if sep and digest.startswith("sha256:"):
+            if sep and digest.startswith(("sha256:", "blake3:")):
                 verdicts.append(TemplateRecoveryVerdict(name, digest.split()[0], "pruned"))
             continue
         if "startup recovery" not in line and TEMPLATE_RECOVERY_PRUNED_MESSAGE not in line:
@@ -5292,7 +5463,7 @@ def _parse_startup_recovery(node: str, pod: str, log: str) -> StartupRecoveryRep
             continue
         template = str(fields.get("template", ""))
         content_hash = str(fields.get("content_hash", ""))
-        if not template or not content_hash.startswith("sha256:"):
+        if not template or not content_hash.startswith(("sha256:", "blake3:")):
             continue
         verdicts.append(
             TemplateRecoveryVerdict(
@@ -5670,7 +5841,7 @@ def _smoke_template_name(value: str) -> str:
 def _template_digest(value: str) -> str:
     """A digest directory name as a single safe shell word."""
 
-    if not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
+    if not re.fullmatch(r"(?:sha256|blake3):[0-9a-f]{64}", value):
         raise ValueError(f"refusing template digest {value!r}")
     return value
 
@@ -6132,23 +6303,36 @@ class _SdkSandbox:
         )
         return _race_request(request, timeout=timeout, gate=gate)
 
-    def fork(self, *, timeout: int = 600) -> str:
+    def fork_response(
+        self, *, timeout: int, idempotency_key: str | None = None
+    ) -> Mapping[str, Any]:
         # The server accepts exactly one child per request today.
-        results = _ecw_control_plane_json(
-            self._config,
-            "POST",
-            f"/sandboxes/{quote(self.sandbox_id, safe='')}/fork",
-            body={"count": 1, "timeout": timeout},
-            idempotency_key=f"space-smoke-fork-{secrets.token_hex(8)}",
-            expected_status=201,
-            timeout=timeout + 60,
-        )
+        key = idempotency_key or f"space-smoke-fork-{secrets.token_hex(16)}"
+        deadline = time.monotonic() + timeout + 60
+        for attempt in range(3):
+            try:
+                results = _ecw_control_plane_json(
+                    self._config,
+                    "POST",
+                    f"/sandboxes/{quote(self.sandbox_id, safe='')}/fork",
+                    body={"count": 1, "timeout": timeout},
+                    idempotency_key=key,
+                    expected_status=201,
+                    timeout=max(0.001, deadline - time.monotonic()),
+                )
+                break
+            except EcwControlPlaneHttpError as error:
+                # Admission contention asks the caller to retry this key.
+                # A stuck admission must still fail within a bounded budget.
+                if error.status != 503 or attempt == 2 or time.monotonic() + 1 >= deadline:
+                    raise
+                time.sleep(1)
         if not isinstance(results, list) or len(results) != 1:
             raise RuntimeError(f"fork returned an unexpected body: {results!r}")
         (result,) = results
         if not isinstance(result, dict) or "error" in result or "sandboxID" not in result:
             raise RuntimeError(f"fork result is not a child sandbox: {result!r}")
-        return _ecw_sandbox_id(str(result["sandboxID"]))
+        return {**result, "sandboxID": _ecw_sandbox_id(str(result["sandboxID"]))}
 
     def delete_forked(self, child_id: str) -> None:
         # Same lifecycle classification as `_kill_with_sdk`, so the fixture's
@@ -6577,6 +6761,30 @@ def _is_temporary_dns_connect_error(error: BaseException) -> bool:
 class EcwSdk:
     def __init__(self, config: EcwConfig) -> None:
         self.config = config
+
+    def attach_fork(self, response: Mapping[str, Any]) -> EcwSandbox:
+        # SDK connect can wake a stopped child and mask a broken fork startup.
+        # Use only the identity and credentials the fork itself returned.
+        sandbox_type = importlib.import_module("e2b").Sandbox
+        connection_config_type = importlib.import_module("e2b.connection_config").ConnectionConfig
+        version_type = importlib.import_module("packaging.version").Version
+        sandbox_headers = {
+            "E2b-Sandbox-Id": response["sandboxID"],
+            "E2b-Sandbox-Port": str(connection_config_type.envd_port),
+        }
+        if response.get("envdAccessToken") is not None:
+            sandbox_headers["X-Access-Token"] = response["envdAccessToken"]
+        sandbox = sandbox_type(
+            sandbox_id=response["sandboxID"],
+            sandbox_domain=response.get("domain"),
+            envd_version=version_type(response["envdVersion"]),
+            envd_access_token=response.get("envdAccessToken"),
+            traffic_access_token=response.get("trafficAccessToken"),
+            connection_config=connection_config_type(
+                extra_sandbox_headers=sandbox_headers, **self.config.sdk_options()
+            ),
+        )
+        return _SdkSandbox(sandbox, self.config)
 
     def create(
         self,

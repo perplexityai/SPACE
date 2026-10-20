@@ -24,6 +24,10 @@ _DURATION_SECONDS = {
         "ecw.filesystem_round_trip": 4,
         "ecw.filesystem_watcher": 4,
         "ecw.filesystem_write_identity": 5,
+        # Local seed run including fixture setup and cleanup: 18.0 / 18.8 s.
+        # Refresh these scheduling hints from successful CI runs.
+        "ecw.fork_idempotency": 20,
+        "ecw.fork_isolation": 20,
         "ecw.immediate_egress": 4,
         "ecw.internet_access_allowed": 5,
         "ecw.internet_access_denied": 28,
@@ -50,6 +54,9 @@ _DURATION_SECONDS = {
         "local.cold_sandbox_eviction_wake_round_trip": 137,
         "local.concurrent_restore_converges_to_one_execution": 87,
         "local.encrypted_resuspend_preserves_cow": 60,
+        # Local seed run including durable suspend, cross-node fork, restore
+        # and cleanup: 23.5 s.
+        "local.fork_suspended_cross_node": 25,
         "local.gentle_drain_leaves_sandbox_resident": 39,
         "local.node_ctl_fence_refuses_and_reconciles": 18,
         "local.node_group_boundary_schedules": 42,
@@ -68,6 +75,7 @@ _DURATION_SECONDS = {
         "local.retention_claim_finish_forward": 80,
         "local.retention_restore_source_guard": 107,
         "local.snapshot_reaper_reclaims_backed_fork_snapshot": 147,
+        "local.storage_exchange_scoping": 30,
         "local.suspend_restore_cross_node_from_object_storage": 14,
         "local.suspend_snapshot_rows_are_per_attempt": 21,
         # Measured 37-38 s; Tempo's 30 s search cutoff is most of it.

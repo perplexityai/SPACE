@@ -1,17 +1,20 @@
+{{- if include "common.otlpSelected" . }}
 {{- include "common.profileGuard" . }}
 {{- include "common.sharedGuards" . }}
+{{- include "common.ephemeralStorageGuard" (dict "storage" .Values.storage "resources" .Values.loki.resources "key" "storage" "resourcesKey" "loki.resources") }}
 {{- if not (or .Values.collection.podTargets .Values.collection.journal.enabled) }}
 {{- fail "Enable at least one of collection.podTargets or collection.journal" }}
 {{- end }}
 {{- if eq .Values.profile "shared" }}
 {{- include "common.sharedStorageGuard" (dict "storage" .Values.storage "key" "storage") }}
-{{- if not .Values.clusterLabel }}
-{{- fail "Shared installs must set clusterLabel so records are attributable" }}
+{{- if not (include "logs.clusterLabel" .) }}
+{{- fail "Shared installs must set clusterLabel (or global.observability.cluster) so records are attributable" }}
 {{- end }}
 {{- if .Values.validationEcho }}
 {{- fail "Diagnostic log echo is Kind-only; it duplicates collected records" }}
 {{- end }}
 {{- if eq .Values.collection.journal.path "/run/log/journal" }}
 {{- fail "/run/log/journal is Kind's volatile journal; set a real host journal path" }}
+{{- end }}
 {{- end }}
 {{- end }}

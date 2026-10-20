@@ -279,23 +279,72 @@ pub(crate) async fn set_lifecycle_bypassing_lease_trigger(
     sandbox: SandboxId,
     lifecycle: &str,
 ) -> TestResult {
+    set_lifecycle_bypassing_triggers(pool, sandbox, lifecycle, false).await
+}
+
+/// [`set_lifecycle_bypassing_lease_trigger`] that also keeps the evacuation
+/// marker, which `sandboxes_clear_evacuation_restore_target` drops when the
+/// row leaves the suspend/restore lifecycles.
+pub(crate) async fn set_lifecycle_bypassing_lease_and_marker_triggers(
+    pool: &PgPool,
+    sandbox: SandboxId,
+    lifecycle: &str,
+) -> TestResult {
+    set_lifecycle_bypassing_triggers(pool, sandbox, lifecycle, true).await
+}
+
+async fn set_lifecycle_bypassing_triggers(
+    pool: &PgPool,
+    sandbox: SandboxId,
+    lifecycle: &str,
+    keep_marker: bool,
+) -> TestResult {
     let mut tx = pool.begin().await?;
     sqlx::query(sql!(
         "ALTER TABLE sandboxes DISABLE TRIGGER sandboxes_clear_restore_lease"
     ))
     .execute(&mut *tx)
     .await?;
+    if keep_marker {
+        sqlx::query(sql!(
+            "ALTER TABLE sandboxes DISABLE TRIGGER sandboxes_clear_evacuation_restore_target"
+        ))
+        .execute(&mut *tx)
+        .await?;
+    }
     sqlx::query(sql!("UPDATE sandboxes SET lifecycle = $2 WHERE id = $1"))
         .bind(sandbox)
         .bind(lifecycle)
         .execute(&mut *tx)
         .await?;
+    if keep_marker {
+        sqlx::query(sql!(
+            "ALTER TABLE sandboxes ENABLE TRIGGER sandboxes_clear_evacuation_restore_target"
+        ))
+        .execute(&mut *tx)
+        .await?;
+    }
     sqlx::query(sql!(
         "ALTER TABLE sandboxes ENABLE TRIGGER sandboxes_clear_restore_lease"
     ))
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
+    Ok(())
+}
+
+pub(crate) async fn set_active_node(
+    pool: &PgPool,
+    sandbox: SandboxId,
+    node: Option<NodeId>,
+) -> TestResult {
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET active_node_id = $2 WHERE id = $1"
+    ))
+    .bind(sandbox)
+    .bind(node)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

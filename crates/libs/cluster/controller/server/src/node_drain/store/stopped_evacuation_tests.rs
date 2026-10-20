@@ -1548,12 +1548,13 @@ async fn the_suspend_population_is_dispatched_before_stopped_residents() -> Test
 /// the argument rests on the *conjunction* of marker and `lifecycle = 'stopped'`,
 /// not on the marker alone.
 ///
-/// `stopped → restoring` is unreachable today: the restore claim admits only
-/// `('suspended','restoring')`, which is a tracked follow-up. Two of this
-/// module's queries carry `restoring` for that future and assert nothing about
-/// it, so this seeds the state directly and pins the behaviour before the
-/// refusal lifts — otherwise the day it lifts, the trigger stops covering this
-/// path and nothing says whether anything else does.
+/// `stopped → restoring` is unreachable from the sweep today: the restore claim
+/// admits a released stopped evacuation, but `restore_execution_inner` refuses
+/// the `Stopped` target before claiming. Two of this module's queries carry
+/// `restoring` for when that lifts and assert nothing about it, so this seeds
+/// the state directly and pins the behaviour before the refusal lifts —
+/// otherwise the day it lifts, the trigger stops covering this path and nothing
+/// says whether anything else does.
 #[tokio::test(flavor = "current_thread")]
 async fn a_marker_surviving_into_restoring_is_not_a_held_claim() -> TestResult {
     let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {

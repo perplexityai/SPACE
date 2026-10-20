@@ -169,7 +169,8 @@ impl BuildAuthenticator {
             ));
         }
         Ok(Some(BuildAuthenticatedCaller {
-            can_assert_org: true,
+            node: None,
+            tenant: TenantTemplateAuthority::Granted,
             system: SystemTemplateAuthority::Granted,
         }))
     }
@@ -264,16 +265,44 @@ enum SystemTemplateAuthority {
     Unconditional,
 }
 
+/// What a caller may do with organization-owned templates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TenantTemplateAuthority {
+    Denied,
+    /// Tenant publication only for a build the control plane dispatched:
+    /// ClusterApi requires that build's `template_tenant_publication_grants`
+    /// row, bound to its target, owner, and builder.
+    Granted,
+    Unconditional,
+}
+
 #[derive(Clone, Debug)]
 pub struct BuildAuthenticatedCaller {
-    can_assert_org: bool,
+    node: Option<AuthenticatedBuildNode>,
+    tenant: TenantTemplateAuthority,
     system: SystemTemplateAuthority,
+}
+
+/// Node identity from a freshly reviewed pod-bound Kubernetes token.
+#[derive(Clone, Debug)]
+pub struct AuthenticatedBuildNode {
+    pub name: pplx_space_common_core::types::K8sNodeName,
+    pub uid: pplx_space_common_core::types::K8sNodeUid,
+}
+
+pub fn publication_node<T>(request: &Request<T>) -> Option<&AuthenticatedBuildNode> {
+    request
+        .extensions()
+        .get::<BuildAuthenticatedCaller>()?
+        .node
+        .as_ref()
 }
 
 impl BuildAuthenticatedCaller {
     const fn trusted_deployment() -> Self {
         Self {
-            can_assert_org: true,
+            node: None,
+            tenant: TenantTemplateAuthority::Unconditional,
             system: SystemTemplateAuthority::Unconditional,
         }
     }
@@ -296,9 +325,9 @@ pub fn authorize_template_build<T>(
             Status::permission_denied("template build requires authenticated authority")
         })?;
     match org_id {
-        Some(_) if !caller.can_assert_org => Err(Status::permission_denied(
-            "tenant build requires organization assertion authority",
-        )),
+        Some(_) if caller.tenant == TenantTemplateAuthority::Denied => Err(
+            Status::permission_denied("tenant build requires organization assertion authority"),
+        ),
         None if caller.system == SystemTemplateAuthority::Denied => Err(Status::permission_denied(
             "system build requires system publisher authority",
         )),
@@ -329,6 +358,15 @@ pub fn system_publication_requires_grant<T>(request: &Request<T>) -> bool {
         .extensions()
         .get::<BuildAuthenticatedCaller>()
         .is_some_and(|caller| caller.system == SystemTemplateAuthority::Granted)
+}
+
+/// Whether a tenant publication by the caller needs the dispatched build's
+/// grant. An unauthenticated caller is rejected by [`authorize_template_build`].
+pub fn tenant_publication_requires_grant<T>(request: &Request<T>) -> bool {
+    request
+        .extensions()
+        .get::<BuildAuthenticatedCaller>()
+        .is_some_and(|caller| caller.tenant == TenantTemplateAuthority::Granted)
 }
 
 impl<S> Layer<S> for BuildAuthLayer {

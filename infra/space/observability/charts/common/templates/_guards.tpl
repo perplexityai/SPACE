@@ -27,13 +27,17 @@ runbook's preflight still applies.
 {{- end -}}
 
 {{/*
-Shared storage must be an explicitly named class or a pre-provisioned claim;
-the cluster default is never assumed. Call with a dict: "storage" is the
-storage map and "key" names it for the message.
+Shared storage is never chosen silently: it must be an explicitly named class,
+a pre-provisioned claim, an explicit opt-in to the cluster's default
+StorageClass (useDefaultStorageClass), or explicitly ephemeral storage. Call
+with a dict: "storage" is the storage map and "key" names it for the message.
 */}}
 {{- define "common.sharedStorageGuard" -}}
 {{- $storage := .storage -}}
-{{- if not (or $storage.storageClassName $storage.existingClaim) }}
-{{- fail (printf "Shared storage requires %s.storageClassName or %s.existingClaim" .key .key) }}
+{{- if not (or $storage.storageClassName $storage.existingClaim $storage.useDefaultStorageClass $storage.ephemeral) }}
+{{- fail (printf "Shared storage requires %s.storageClassName, %s.existingClaim, %s.useDefaultStorageClass or %s.ephemeral" .key .key .key .key) }}
+{{- end }}
+{{- if and $storage.ephemeral (or $storage.storageClassName $storage.existingClaim $storage.useDefaultStorageClass) }}
+{{- fail (printf "%s.ephemeral cannot be combined with a storage class or claim" .key) }}
 {{- end }}
 {{- end -}}

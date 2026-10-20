@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
-#   "pglast==7.10",
+#   "pglast==7.21",
 # ]
 # ///
 

@@ -40,6 +40,7 @@ public.ecr.aws/docker/library/python:3.14-slim      sha256:7bf6c3111fe094f8ee1a1
 public.ecr.aws/docker/library/node:22-bookworm      sha256:17b7fd60fd812617654c64b95f9b2dde94f103313073b672bc40fdad6dccbaa2 ghcr.io/perplexityai/space-ci-mirror:node-22-bookworm docker.io/library/node
 public.ecr.aws/docker/library/node:22-bookworm-slim sha256:25330af3531fb5e23318554a0aa911125b6e91b1b777edf7655501d207c067a2 ghcr.io/perplexityai/space-ci-mirror:node-22-bookworm-slim docker.io/library/node
 public.ecr.aws/ubuntu/ubuntu:24.04                  sha256:f610ab94648195aa356059f5b41d6085c9d4d903c072430cdd1af7bdb646106b ghcr.io/perplexityai/space-ci-mirror:ubuntu-24.04
+public.ecr.aws/docker/library/golang:1.25-bookworm sha256:c268a04d59aea0b180ed9946a658cfab9e7b3391dc90eed6e4969ccff98c851f ghcr.io/perplexityai/space-ci-mirror:golang-1.25-bookworm docker.io/library/golang
 public.ecr.aws/aws-cli/aws-cli:2.27.41              sha256:7637f1a9537dd19b1f74fa69d2000c8affd0a2229a55f493d21a10cb6cbd5f1f ghcr.io/perplexityai/space-ci-mirror:aws-cli-2.27.41 docker.io/amazon/aws-cli
 
 # BuildKit daemon of the Artifact CI bundle builds
@@ -66,9 +67,7 @@ kindest/node:v1.34.0@sha256:7416a61b42b1662ca6ca89f02028ac133a309a2a30ba309614e8
 # scripts/tests/lib/bootstrap-kind-stack.sh loads into the cluster.
 postgres:17              sha256:3cec7eb015ba8adb28139fa5c83b8489cdf0e666e53dfdf20f598ae0cc8739e3 ghcr.io/perplexityai/space-ci-mirror:postgres-17
 redis:7-alpine           sha256:ca0acbb137c1dc3339c8b147a58fd6f42775d4599327b50e7b116c23de501af2 ghcr.io/perplexityai/space-ci-mirror:redis-7-alpine
-# Bump versitygw to the first release that contains versity/versitygw#2415
-# (see the space-object-store chart's values); Content-MD5 stays.
-ghcr.io/versity/versitygw:v1.8.0 sha256:97e7d5a35ab758eb1761a9e717644fafc614c5f6026c05482bd1fb77205193a1 ghcr.io/perplexityai/space-ci-mirror:versitygw-v1.8.0
+ghcr.io/versity/versitygw:v1.9.0 sha256:57b45f18ff79cc2fc28aa6eb49920abd96be9786569842b7c5f783cc8ad5a1a4 ghcr.io/perplexityai/space-ci-mirror:versitygw-v1.9.0
 registry.k8s.io/metrics-server/metrics-server:v0.9.0 sha256:25d291fde59974547bac6f07fa9d6cf6f5bedd1f19d60c893311c5e741e0a42f ghcr.io/perplexityai/space-ci-mirror:metrics-server-v0.9.0
 
 # Source image of the Kind OCI template-build smoke (space_smoke/template_build.py),

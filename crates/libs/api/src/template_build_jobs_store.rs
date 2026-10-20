@@ -53,6 +53,8 @@ pub enum TemplateBuildJobsStoreError {
     InvalidDaemonJobId(#[from] BuildRunIdParseError),
     #[error("template build inputs belong to another organization")]
     OwnershipConflict,
+    #[error("tenant publication requires the accepting builder identity")]
+    BuilderIdentityRequired,
 }
 
 impl TemplateBuildJobsStoreError {
@@ -68,7 +70,9 @@ impl TemplateBuildJobsStoreError {
     pub(crate) fn as_sql(&self) -> Option<&sqlx::Error> {
         match self {
             Self::Storage(error) => Some(error),
-            Self::InvalidDaemonJobId(_) | Self::OwnershipConflict => None,
+            Self::InvalidDaemonJobId(_)
+            | Self::OwnershipConflict
+            | Self::BuilderIdentityRequired => None,
         }
     }
 }
@@ -95,6 +99,9 @@ impl TemplateBuildJobsStore {
         builder_node_id: Option<NodeId>,
         grants: BuilderPinnedGrants,
     ) -> Result<(), TemplateBuildJobsStoreError> {
+        if grants.tenant_publication.is_some() && builder_node_id.is_none() {
+            return Err(TemplateBuildJobsStoreError::BuilderIdentityRequired);
+        }
         if !template_build_owner_matches(&self.pool, template_name, org_id).await? {
             return Err(TemplateBuildJobsStoreError::OwnershipConflict);
         }
@@ -226,11 +233,14 @@ impl TemplateBuildJobsStore {
     /// Record, before `StartBuild` is dispatched, that this submission may
     /// publish `template_name` for `org_id`.
     ///
-    /// The grant has to exist before dispatch because the build may publish
-    /// before the API records the response;
+    /// Build-manager's publisher identity can assert any organization, so
+    /// ClusterApi accepts its tenant publication only under such a grant, from
+    /// the builder the grant is bound to, and the release registration
+    /// consumes it. The grant has to exist before dispatch because the build
+    /// may publish before the API records the response;
     /// [`Self::record_accepted_build`] then pins it to the accepting builder.
-    /// Preparation records grants without requiring them at publication.
-    /// Sweep after seven days, since nothing else observes a build's end.
+    /// Rows older than the longest validity ClusterApi honours are swept
+    /// here, since nothing else observes a build's end.
     pub(crate) async fn record_tenant_publication_grant(
         &self,
         org_id: OrgId,

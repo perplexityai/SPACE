@@ -79,7 +79,7 @@ fn public_openapi_value() -> Value {
         "info": {
             "title": "SPACE API",
             "version": env!("CARGO_PKG_VERSION"),
-            "description": "### Errors and retries\n\n- Keep `x-request-id` for troubleshooting. Management errors use `PublicErrorEnvelope`, with a stable `code` and a `retryable` flag; SSE admission errors use the nested `DataPlaneHttpErrorEnvelope`.\n- Follow the returned `retryable` flag, subject to the duplicate-work precautions below. If no valid envelope is available, HTTP 429 and 5xx may be transient, but do not blindly retry mutations with ambiguous outcomes.\n- Wait for `Retry-After` when present (whole seconds). Otherwise, start with a one-second delay and double it with jitter. Stop after five attempts.\n\n### Avoid duplicate work\n\nOnly endpoints declaring a required `Idempotency-Key` deduplicate mutations. Retry those with the same method, path, body, and key. Within 24 hours, this returns the original result. A different body returns `idempotency_conflict`; a new or expired key can start another operation. Process kill and signal do not use this mechanism: inspect ambiguous outcomes before repeating them, because a repeat can apply the action again.\n\n### Error codes\n\n- Management errors that are not retryable: `invalid_request` (400), `unauthorized` (401), `forbidden` (403), `not_found` (404), `conflict` and `idempotency_conflict` (409), `failed_precondition` (412).\n- Usually retryable management errors: `rate_limited` (429), `capacity_unavailable` and `service_unavailable` (503), `internal` (500). Always check the returned `retryable` flag. Data-plane mappings differ; see each response's envelope.\n- Unsupported methods (405), oversized bodies (413), wrong content types (415), and invalid request schemas (422) use `invalid_request` with `retryable: false`. Other unhandled management 5xx errors use `internal`."
+            "description": "### Errors and retries\n\n- Keep `x-request-id` for troubleshooting. Management errors use `PublicErrorEnvelope`, with a stable `code` and a `retryable` flag; SSE admission errors use the nested `DataPlaneHttpErrorEnvelope`.\n- Follow the returned `retryable` flag, subject to the duplicate-work precautions below. If no valid envelope is available, HTTP 429 and 5xx may be transient, but do not blindly retry mutations with ambiguous outcomes.\n- Wait for `Retry-After` when present (whole seconds). Otherwise, start with a one-second delay and double it with jitter. Stop after five attempts.\n\n### Avoid duplicate work\n\nOnly endpoints declaring a required `Idempotency-Key` deduplicate mutations. Retry those with the same method, path, body, and key. Within 24 hours, this returns the original result. A different body returns `idempotency_conflict`; a new or expired key can start another operation. Process kill and signal do not use this mechanism: inspect ambiguous outcomes before repeating them, because a repeat can apply the action again.\n\n### Error codes\n\n- Management errors that are not retryable: `invalid_request` (400), `unauthorized` (401), `forbidden` (403), `not_found` (404), `conflict` and `idempotency_conflict` (409), `failed_precondition` (412).\n- Usually retryable management errors: `rate_limited` (429), `capacity_unavailable` and `service_unavailable` (503), `internal` (500). Always check the returned `retryable` flag. Data-plane mappings differ; see each response's envelope.\n- Unsupported methods (405), oversized bodies (413), wrong content types (415), and invalid request schemas (422) use `invalid_request` with `retryable: false`. Other unhandled management 5xx errors use `internal`.\n- A file route's `not_found` lists `{\"key\": \"resource\", \"value\": \"path\"}` in `details` when the sandbox is yours and the path does not exist. Without that detail, treat it as the sandbox not being found: a missing sandbox and one you cannot access answer alike."
         },
         "servers": [
             { "url": "/v1" },
@@ -121,7 +121,7 @@ fn public_openapi_value() -> Value {
                     "parameters": [idempotency_key_parameter.clone()],
                     "responses": {
                         "202": { "description": "Sandbox operation" },
-                        "400": { "description": "Unsupported update field" },
+                        "400": { "description": "Invalid sandbox id, or unsupported update field" },
                         "404": { "description": "Sandbox not found" },
                         "409": { "description": "Idempotency conflict" }
                     }
@@ -204,7 +204,7 @@ fn public_openapi_value() -> Value {
                             "description": "File byte stream",
                             "content": { "application/octet-stream": {} }
                         },
-                        "400": { "description": "Missing or oversized length" },
+                        "400": { "description": "Invalid sandbox id, or missing or oversized length" },
                         "404": { "description": "Sandbox or file not found" }
                     }
                 }
@@ -583,7 +583,7 @@ fn insert_file_mutation_paths(paths: &mut Map<String, Value>, idempotency_key_pa
                 "parameters": [idempotency_key_parameter.clone()],
                 "responses": {
                     "200": { "description": "Write result" },
-                    "400": { "description": "Invalid file write request" },
+                    "400": { "description": "Invalid sandbox id, or invalid file write request" },
                     "404": { "description": "Sandbox or parent path not found" },
                     "412": { "description": "The sandbox's disk or quota is full; free space before retrying" },
                     "413": { "description": "The request body exceeds the write limit" }
@@ -606,7 +606,7 @@ fn insert_file_mutation_paths(paths: &mut Map<String, Value>, idempotency_key_pa
                 "parameters": [idempotency_key_parameter.clone()],
                 "responses": {
                     "200": { "description": "Batch write result" },
-                    "400": { "description": "Invalid file write batch request, including a batch over its data and path limit" },
+                    "400": { "description": "Invalid sandbox id, or invalid file write batch request, including a batch over its data and path limit" },
                     "404": { "description": "Sandbox or parent path not found" },
                     "413": { "description": "The request body exceeds the batch limit" }
                 }
@@ -621,7 +621,7 @@ fn insert_file_mutation_paths(paths: &mut Map<String, Value>, idempotency_key_pa
                 "parameters": [idempotency_key_parameter.clone()],
                 "responses": {
                     "200": { "description": "Tracking status" },
-                    "400": { "description": "Invalid change-tracking request" },
+                    "400": { "description": "Invalid sandbox id, or invalid change-tracking request" },
                     "404": { "description": "Sandbox not found" }
                 }
             }
@@ -648,7 +648,7 @@ fn insert_file_mutation_paths(paths: &mut Map<String, Value>, idempotency_key_pa
                 "description": "`window_seconds`, `since`, and `cursor` are mutually exclusive filters.",
                 "responses": {
                     "200": { "description": "Modified file list" },
-                    "400": { "description": "Invalid modified-file filter" },
+                    "400": { "description": "Invalid sandbox id, or invalid modified-file filter" },
                     "404": { "description": "Sandbox not found" }
                 }
             }
@@ -662,7 +662,7 @@ fn insert_file_mutation_paths(paths: &mut Map<String, Value>, idempotency_key_pa
                 "parameters": [idempotency_key_parameter.clone()],
                 "responses": {
                     "200": { "description": "Directory created or already present" },
-                    "400": { "description": "Non-idempotent mkdir modes are rejected" },
+                    "400": { "description": "Invalid sandbox id, or a non-idempotent mkdir mode" },
                     "404": { "description": "Sandbox not found" }
                 }
             }
@@ -676,7 +676,7 @@ fn insert_file_mutation_paths(paths: &mut Map<String, Value>, idempotency_key_pa
                 "parameters": [idempotency_key_parameter.clone()],
                 "responses": {
                     "200": { "description": "Path removed or already absent" },
-                    "400": { "description": "Non-idempotent remove modes are rejected" },
+                    "400": { "description": "Invalid sandbox id, or a non-idempotent remove mode" },
                     "404": { "description": "Sandbox not found" }
                 }
             }

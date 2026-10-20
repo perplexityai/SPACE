@@ -168,6 +168,21 @@ impl PublicApiError {
         self
     }
 
+    /// A `not_found` for a path inside a sandbox the caller owns, as opposed
+    /// to a sandbox that does not exist or belongs to someone else.
+    ///
+    /// Only call this after the owner check passed: the detail confirms the
+    /// sandbox exists, so the not-found answers for missing and unowned
+    /// sandboxes must never carry it.
+    pub fn path_not_found(message: impl Into<String>) -> Self {
+        let mut error = Self::not_found(message);
+        error.details.push(PublicErrorDetail {
+            key: pplx_space_public_api::NOT_FOUND_RESOURCE_DETAIL_KEY.to_string(),
+            value: pplx_space_public_api::NOT_FOUND_RESOURCE_PATH.to_string(),
+        });
+        error
+    }
+
     pub fn with_retry_after(mut self, retry_after: Duration) -> Self {
         self.retry_after = Some(retry_after);
         self

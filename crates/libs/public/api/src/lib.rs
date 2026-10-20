@@ -1389,7 +1389,7 @@ pub struct PortExposureResponse {
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SandboxOperationResponse {
     /// Poll this operation and require success before relying on the action's
     /// outcome. An HTTP 202 response only accepts the work.
@@ -1400,6 +1400,18 @@ pub struct SandboxOperationResponse {
         schemars(schema_with = "schema::public_sandbox_id")
     )]
     pub sandbox_id: PublicSandboxId,
+    /// The operation's record, as `GET /v1/operations/{operation_id}` returns
+    /// it, when the server finished the work before answering. Present only
+    /// with a terminal `state`; when absent, poll `operation_id`.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "schema::optional_incubating_operation_record")
+    )]
+    pub operation: Option<PublicOperationRecord>,
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -1985,9 +1997,20 @@ pub struct PublicErrorEnvelope {
     /// and only with the same `Idempotency-Key` for mutations. The HTTP status
     /// decides only when no valid envelope was returned.
     pub retryable: bool,
-    /// Bounded typed details; empty when the error has none.
+    /// Bounded typed details; empty when the error has none. A `not_found`
+    /// from a file route carries `{"key": "resource", "value": "path"}` when
+    /// the sandbox is yours and the path inside it does not exist; any other
+    /// `not_found`, including a missing or unowned sandbox, carries none.
     pub details: Vec<PublicErrorDetail>,
 }
+
+/// [`PublicErrorDetail::key`] naming which resource a `not_found` is about.
+pub const NOT_FOUND_RESOURCE_DETAIL_KEY: &str = "resource";
+
+/// [`NOT_FOUND_RESOURCE_DETAIL_KEY`] value of a `not_found` for a guest path in
+/// a sandbox the caller owns. Never set for the sandbox itself, so a missing
+/// sandbox and another org's sandbox stay indistinguishable.
+pub const NOT_FOUND_RESOURCE_PATH: &str = "path";
 
 open_wire_enum!(DataPlaneHttpErrorCode, "data-plane HTTP error code", {
     InvalidRequest => "invalid_request",
