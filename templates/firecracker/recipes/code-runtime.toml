@@ -37,7 +37,7 @@ name = "Install system packages"
 type = "run"
 command = """
 set -eu
-APT_SNAPSHOT="20261016T000000Z"
+APT_SNAPSHOT="20261020T200000Z"
 PACKAGES="python3 python3-venv python3-pip python-is-python3 python3-dev
   python3-setuptools curl ca-certificates sudo git git-lfs procps jq wget lsof
   sqlite3 iputils-ping libcap2-bin iproute2"
@@ -140,10 +140,10 @@ name = "Install uv package manager"
 type = "run"
 command = """
 set -eu
-UV_VERSION="0.12.18"
+UV_VERSION="0.13.4"
 case "$(uname -m)" in
-  aarch64) UV_ARCH="aarch64"; UV_SHA256="afb6291f3f0a6b4521fc67b947822506c41dde5b60d2189dd8f3695b2ac8c9e7" ;;
-  x86_64) UV_ARCH="x86_64"; UV_SHA256="89eadd7c76fc063887959510d5ba0ab1264dfd5f1143b925ddb73021a40acf16" ;;
+  aarch64) UV_ARCH="aarch64"; UV_SHA256="1ae72b4718729e2ccc4f1ae2c6d1e531ca8467800e0546e9130b3886023a60ab" ;;
+  x86_64) UV_ARCH="x86_64"; UV_SHA256="2b428396f12572d4429cf210ca234dd599a33b3af0958a4d5ed569d63e3f344f" ;;
   *) echo "Unsupported uv architecture" >&2; exit 1 ;;
 esac
 UV_PACKAGE="uv-${UV_ARCH}-unknown-linux-gnu"

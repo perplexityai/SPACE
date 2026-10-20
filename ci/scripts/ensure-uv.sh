@@ -14,23 +14,23 @@ LOCAL_UV_BIN="${LOCAL_BIN_DIR}/uv"
 # together. Each checksum below is the asset's `digest` in GitHub's release
 # API (gh api repos/astral-sh/uv/releases/tags/<version>) and matches the
 # archive both hosts serve.
-UV_VERSION="${SPACE_UV_VERSION:-0.12.18}"
+UV_VERSION="${SPACE_UV_VERSION:-0.13.4}"
 case "$(uname -s)-$(uname -m)" in
     Linux-x86_64)
         uv_target=x86_64-unknown-linux-gnu
-        uv_sha256=89eadd7c76fc063887959510d5ba0ab1264dfd5f1143b925ddb73021a40acf16
+        uv_sha256=2b428396f12572d4429cf210ca234dd599a33b3af0958a4d5ed569d63e3f344f
         ;;
     Linux-aarch64 | Linux-arm64)
         uv_target=aarch64-unknown-linux-gnu
-        uv_sha256=afb6291f3f0a6b4521fc67b947822506c41dde5b60d2189dd8f3695b2ac8c9e7
+        uv_sha256=1ae72b4718729e2ccc4f1ae2c6d1e531ca8467800e0546e9130b3886023a60ab
         ;;
     Darwin-arm64)
         uv_target=aarch64-apple-darwin
-        uv_sha256=cf40e0c6a202190ccd9e0406dcfdd5b2d6668a9a5c779b17948963df32aafe5b
+        uv_sha256=e0b1d4743ce64c55d9f0f4a444afa6b81125680070ee04e853fcd0f6c1ebf8f1
         ;;
     Darwin-x86_64)
         uv_target=x86_64-apple-darwin
-        uv_sha256=2e4108f5395397c8bc5d43bf83d3bdbb2d0e92b90d0efa607756be704905fa33
+        uv_sha256=7be2dcd316122f4b3e5a0a7889f6248266c14425374e105ff7dc9779184603a6
         ;;
     *)
         uv_target=""

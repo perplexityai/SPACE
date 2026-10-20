@@ -204,14 +204,14 @@ extraction. A missing checksum, invalid signature, or mismatched download stops
 the build. Checksum metadata must remain reachable even when the image is cached.
 
 The maintained code-runtime recipe pins Node.js 20.20.2, GitHub CLI 2.101.0,
-and uv 0.12.18 (also used by the CI image), with SHA-256 values for both
+and uv 0.13.4 (also used by the CI image), with SHA-256 values for both
 architectures checked before extraction. uv is installed from its release
 archive without executing a remote installer. `scripts/build-code-runtime.py`
 reads these installation commands from the recipe. The digest sources are:
 
 - [Node.js release checksums](https://nodejs.org/dist/v20.20.2/SHASUMS256.txt)
 - [GitHub CLI release checksums](https://github.com/cli/cli/releases/download/v2.101.0/gh_2.101.0_checksums.txt)
-- uv [aarch64 checksum](https://github.com/astral-sh/uv/releases/download/0.12.18/uv-aarch64-unknown-linux-gnu.tar.gz.sha256) and [x86_64 checksum](https://github.com/astral-sh/uv/releases/download/0.12.18/uv-x86_64-unknown-linux-gnu.tar.gz.sha256)
+- uv [aarch64 checksum](https://github.com/astral-sh/uv/releases/download/0.13.4/uv-aarch64-unknown-linux-gnu.tar.gz.sha256) and [x86_64 checksum](https://github.com/astral-sh/uv/releases/download/0.13.4/uv-x86_64-unknown-linux-gnu.tar.gz.sha256)
 
 The recipe's Python packages are listed in `recipes/code-runtime/pyproject.toml`
 and pinned, with every transitive dependency, to wheel hashes in
