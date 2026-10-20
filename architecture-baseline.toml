@@ -99,7 +99,7 @@
 "crates/libs/sbx/mgr/store/src/db/auto_lifecycle_delete_receipts.rs" = 1147
 "crates/libs/sbx/mgr/store/src/db/cleanup_episodes.rs" = 1815
 "crates/libs/sbx/mgr/store/src/db/quarantine_recovery.rs" = 1042
-"crates/libs/sbx/mgr/store/src/db/sandboxes.rs" = 1523
+"crates/libs/sbx/mgr/store/src/db/sandboxes.rs" = 1516
 "crates/libs/spaced/host/client/src/lib.rs" = 1040
 "crates/libs/spaced/host/server/src/bridge.rs" = 1249
 "crates/libs/template/mgr/src/db.rs" = 1276

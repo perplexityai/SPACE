@@ -248,44 +248,37 @@ fn legacy_iso_deadlines_remain_claimable_and_raw_lease_evidence_is_cas_fenced() 
 
 #[test]
 fn malformed_expiry_cannot_clear_ownership_when_quarantine_is_reclassified() {
-    for state in ["quarantined", "restoring"] {
-        let conn = db::test_conn();
-        let (sandbox_id, candidate) = db::tests::setup_quarantine_recovery_candidate(&conn);
-        let claimed = db::claim_quarantine_recovery_candidate(
-            &conn,
-            &candidate,
-            crate::db::PlanRejectionRunEffect::Leaves,
-        )
-        .unwrap()
-        .unwrap();
-        conn.execute(
-            "UPDATE sandboxes SET state = ?1 WHERE id = ?2",
-            params![state, sandbox_id.to_string()],
-        )
-        .unwrap();
-        conn.execute(
-            "UPDATE sandbox_quarantine_state SET claim_expires_at = 'invalid-expiry' WHERE sandbox_id = ?1",
-            [sandbox_id.to_string()],
-        ).unwrap();
-        db::mark_quarantined(
-            &conn,
-            &sandbox_id.to_string(),
-            db::SandboxQuarantineSource::SbxManager,
-            db::SandboxQuarantineReasonCode::RestorePrepareFailed,
-            "reclassified",
-            db::SandboxQuarantineNextAction::RequiresOperatorAttention,
-        )
-        .unwrap();
-        let (_, attempts, _, token, expiry) = db::tests::quarantine_claim_state(&conn, sandbox_id);
-        // New episodes reset pacing while retaining the previous writer's
-        // exclusion; same-episode reconfirmation inherits both.
-        let expected_attempts = if state == "restoring" {
-            0
-        } else {
-            i64::from(claimed.candidate.attempt_count)
-        };
-        assert_eq!(attempts, expected_attempts, "{state}");
-        assert_eq!(token, Some(claimed.claim_token.to_string()), "{state}");
-        assert_eq!(expiry.as_deref(), Some("invalid-expiry"), "{state}");
-    }
+    let conn = db::test_conn();
+    let (sandbox_id, candidate) = db::tests::setup_quarantine_recovery_candidate(&conn);
+    let claimed = db::claim_quarantine_recovery_candidate(
+        &conn,
+        &candidate,
+        crate::db::PlanRejectionRunEffect::Leaves,
+    )
+    .unwrap()
+    .unwrap();
+    conn.execute(
+        "UPDATE sandboxes SET state = 'restoring' WHERE id = ?1",
+        params![sandbox_id.to_string()],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE sandbox_quarantine_state SET claim_expires_at = 'invalid-expiry' WHERE sandbox_id = ?1",
+        [sandbox_id.to_string()],
+    ).unwrap();
+    db::mark_quarantined(
+        &conn,
+        &sandbox_id.to_string(),
+        db::SandboxQuarantineSource::SbxManager,
+        db::SandboxQuarantineReasonCode::RestorePrepareFailed,
+        "reclassified",
+        db::SandboxQuarantineNextAction::RequiresOperatorAttention,
+    )
+    .unwrap();
+    let (_, attempts, _, token, expiry) = db::tests::quarantine_claim_state(&conn, sandbox_id);
+    // The new episode resets pacing while retaining the previous writer's
+    // exclusion.
+    assert_eq!(attempts, 0);
+    assert_eq!(token, Some(claimed.claim_token.to_string()));
+    assert_eq!(expiry.as_deref(), Some("invalid-expiry"));
 }

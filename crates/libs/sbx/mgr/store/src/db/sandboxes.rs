@@ -714,7 +714,7 @@ pub fn update_uuid8(conn: &Connection, id: &str, uuid8: &SandboxRuntimeLabel) ->
 
 /// Publish route identity and invalidate evidence bound to a replaced execution.
 ///
-/// Unlike [`update_runtime_fields`] this touches no runtime process state and
+/// Unlike [`update_runtime_fields_for_activation`] this touches no runtime process state and
 /// does not advance the teardown suspend lease: it exists for activations that
 /// republish the route identity of an already-running VM, where the runtime
 /// fields and the execution generation are unchanged.
@@ -821,14 +821,6 @@ pub fn update_space_api_route_identity_in_transaction(
     Ok(receipt_supersession)
 }
 
-pub fn update_runtime_fields(
-    conn: &Connection,
-    sandbox_id: SandboxId,
-    fields: RuntimeFields<'_>,
-) -> Result<SupersededTeardownGeneration> {
-    update_runtime_fields_with_activation_owner(conn, sandbox_id, None, fields)
-}
-
 pub fn update_runtime_fields_for_activation(
     conn: &Connection,
     sandbox_id: SandboxId,
@@ -838,7 +830,7 @@ pub fn update_runtime_fields_for_activation(
     update_runtime_fields_with_activation_owner(conn, sandbox_id, Some(cleanup_id), fields)
 }
 
-fn update_runtime_fields_with_activation_owner(
+pub(super) fn update_runtime_fields_with_activation_owner(
     conn: &Connection,
     sandbox_id: SandboxId,
     cleanup_id: Option<SandboxCleanupEpisodeId>,

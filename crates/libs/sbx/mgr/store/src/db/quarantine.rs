@@ -341,8 +341,7 @@ pub(super) fn insert_new_quarantine_episode(
     // Clearing a live lease would make the episode look due and unclaimed while
     // its operation is still running, so the next tick would start a second one.
     // Clearing a foreign owner's state would reach into a newer release's
-    // bookkeeping, which this release cannot reason about — the reconfirmation
-    // path refuses that too.
+    // bookkeeping, which this release cannot reason about.
     //
     // Every arm is NULL-guarded on purpose. `owner = ?3` against a NULL owner
     // yields SQL NULL rather than false, which propagates through AND, fails
@@ -393,8 +392,7 @@ pub(super) fn insert_new_quarantine_episode(
     // The pacing — attempt count, retry time, last error — is reset whenever the
     // row is ours, because a new `quarantine_id` means the sandbox left quarantine
     // and came back. A genuinely new episode should not wait out the previous
-    // episode's backoff or report its error. That differs from a reconfirmation of
-    // the same episode, where the pacing is inherited on purpose.
+    // episode's backoff or report its error.
     let retry_state_reset = match (legacy_owned, claim_dead) {
         (false, _) => {
             "next_action_after = next_action_after,
@@ -810,6 +808,12 @@ fn mark_quarantined_inner(
     }) {
         return Ok(false);
     }
+    // A quarantined row keeps its episode. No production caller passes
+    // `quarantined` as the expected state, so the check above already refuses
+    // one there; only the test-only `mark_quarantined` reaches this.
+    if previous_state.as_deref() == Some(SandboxState::Quarantined.as_str()) {
+        return Ok(false);
+    }
     if let Some(previous_state_label) = previous_state.as_deref() {
         let previous_state_value = previous_state_label.parse::<SandboxState>().map_err(|_| {
             MarkQuarantinedError::UnknownCurrentState {
@@ -818,7 +822,6 @@ fn mark_quarantined_inner(
         })?;
         previous_state_value.transition(SandboxState::Quarantined)?;
     }
-    let starts_new_episode = previous_state.as_deref() != Some(SandboxState::Quarantined.as_str());
     let ts = now()?;
 
     let tx = Transaction::deferred(conn)?;
@@ -861,153 +864,11 @@ fn mark_quarantined_inner(
             next_action,
             timestamp: &ts,
         };
-        if starts_new_episode {
-            insert_new_quarantine_episode(&tx, &episode)?;
-        } else {
-            // A reconfirmation that changes source or reason invalidates the
-            // retry state legacy recovery accumulated for the old reason — but
-            // only once nothing is acting on it. Clearing a live lease would
-            // make the episode look due and unclaimed while its claimed
-            // operation is still running, so the next tick would start a second
-            // one. A newer release's owner keeps its retry and lease columns, which
-            // is the whole of its claim. This branch still rewrites `source`,
-            // `reason_code`, `reason_message` and `evidence_json` on a
-            // foreign-owned row — identity columns a future owner's own fence
-            // would pin — because the new classification has to be recorded and
-            // this row is where it lives.
-            //
-            // Nor does a later tick finish the job: `legacy_owned` is `owner IS
-            // NULL OR owner = 'legacy_recovery'`, and a foreign owner string does
-            // not become NULL when its lease lapses. The retry state stays until
-            // that owner clears it — by design, not by deferral.
-            // Three facts, not one: whether the classification actually changed,
-            // whether legacy recovery still owns the row, and whether a lease is
-            // live. The lease decides only whether the *lease* fields may be
-            // cleared; the retry bookkeeping is invalidated by the change itself.
-            let current_epoch = now_epoch_i64()?;
-            let (classification_changed, legacy_owned, claim_live): (bool, bool, bool) = tx
-                .query_row(
-                    "SELECT (source != ?2 OR reason_code != ?3),
-                        (next_action_owner IS NULL OR next_action_owner = ?4),
-                        claim_expires_at
-                   FROM sandbox_quarantine_state
-                  WHERE sandbox_id = ?1",
-                    params![
-                        id,
-                        source.as_str(),
-                        reason_code.as_str(),
-                        QuarantineRecoveryOwner::LegacyRecovery.as_str(),
-                    ],
-                    |row| {
-                        let expiry: rusqlite::types::Value = row.get(2)?;
-                        // Unknown expiry is not evidence that a previous writer
-                        // stopped. Keep its lease until explicitly repaired.
-                        let claim_live = !matches!(expiry, rusqlite::types::Value::Null)
-                            && timestamps::EpochSeconds::decode(&expiry)
-                                .map_or(true, |value| value.get() > current_epoch);
-                        Ok((row.get(0)?, row.get(1)?, claim_live))
-                    },
-                )?;
-            let reset_legacy_recovery_state = classification_changed && legacy_owned && !claim_live;
-            // Under a live lease the lease itself is kept and the attempt count with
-            // it, but the retry *time* is cleared. Three separate reasons, because
-            // an earlier revision got each of them wrong in turn:
-            //
-            // The lease stays because clearing it would make the episode look due
-            // and unclaimed while its operation is still doing physical work, so
-            // the next tick would start a second one on the same sandbox.
-            //
-            // The attempt count stays because a sandbox whose classification keeps
-            // changing would otherwise reset its curve on every reconfirmation and
-            // land attempts one tick apart indefinitely — the cadence this exists
-            // to bound. It is not kept because `ExactClaimFence` pins it: this
-            // statement rewrites `source` and `reason_code`, which the fence pins
-            // too, so the running operation's writes already miss regardless.
-            // `quarantine_recovery_reason_change_preserves_a_live_claim` asserts
-            // exactly that.
-            //
-            // The retry time is cleared because it was computed as claim expiry
-            // plus a backoff, for a classification that no longer applies. Left in
-            // place it strands the episode for the lease *and* that backoff — up to
-            // half an hour — when the operation holding the lease can no longer
-            // commit anything. Clearing it bounds the wait by the lease alone, and
-            // the next attempt then recomputes the backoff from the preserved count.
-            if reset_legacy_recovery_state {
-                tx.execute(
-                    "UPDATE sandbox_quarantine_state
-                     SET updated_at = ?2,
-                         next_action_after = NULL,
-                         next_action_owner = NULL,
-                         attempt_count = 0,
-                         claim_token = NULL,
-                         claim_expires_at = NULL,
-                         last_error = NULL,
-                         source = ?3,
-                         reason_code = ?4,
-                         reason_message = ?5,
-                         evidence_json = '{}'
-                     WHERE sandbox_id = ?1",
-                    params![
-                        id,
-                        ts,
-                        source.as_str(),
-                        reason_code.as_str(),
-                        reason_message
-                    ],
-                )?;
-            } else if classification_changed && legacy_owned {
-                tx.execute(
-                    "UPDATE sandbox_quarantine_state
-                     SET updated_at = ?2,
-                         next_action_after = NULL,
-                         last_error = NULL,
-                         source = ?3,
-                         reason_code = ?4,
-                         reason_message = ?5,
-                         evidence_json = '{}'
-                     WHERE sandbox_id = ?1",
-                    params![
-                        id,
-                        ts,
-                        source.as_str(),
-                        reason_code.as_str(),
-                        reason_message
-                    ],
-                )?;
-            } else {
-                tx.execute(
-                    "UPDATE sandbox_quarantine_state
-                     SET updated_at = ?2,
-                         source = ?3,
-                         reason_code = ?4,
-                         reason_message = ?5,
-                         evidence_json = '{}'
-                     WHERE sandbox_id = ?1",
-                    params![
-                        id,
-                        ts,
-                        source.as_str(),
-                        reason_code.as_str(),
-                        reason_message
-                    ],
-                )?;
-            }
-            let current_quarantine_id: String = tx.query_row(
-                "SELECT quarantine_id FROM sandbox_quarantine_state WHERE sandbox_id = ?1",
-                params![id],
-                |row| row.get(0),
-            )?;
-            insert_quarantine_history(
-                &tx,
-                &episode,
-                &current_quarantine_id,
-                SandboxQuarantineHistoryAction::ReconfirmedQuarantine,
-            )?;
-        }
+        insert_new_quarantine_episode(&tx, &episode)?;
     }
     tx.commit()?;
 
-    if changed != 0 && previous_state.as_deref() != Some(SandboxState::Quarantined.as_str()) {
+    if changed != 0 {
         emit_sandbox_quarantined_event(
             id,
             previous_state.as_deref(),

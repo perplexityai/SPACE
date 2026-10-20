@@ -1827,10 +1827,9 @@ async fn a_validated_artifact_is_adopted_into_durable_cleanup() {
 // Between the claim and the commit there is no seam a test controls, and adding
 // one would be production surface existing only for a test. The class is instead
 // covered by tests that construct the mid-operation state directly and assert the
-// fence holds: `quarantine_recovery_new_episode_preserves_a_live_claim`,
-// `..._preserves_a_foreign_owners_live_claim`, and
-// `quarantine_recovery_reason_change_preserves_a_live_claim` in `db/tests.rs`.
-// Each of those was red before its fix, which a race test never managed to be.
+// fence holds: `quarantine_recovery_new_episode_preserves_a_live_claim` and
+// `..._preserves_a_foreign_owners_live_claim` in `db/tests.rs`. Each of those
+// was red before its fix, which a race test never managed to be.
 
 /// A deferred orphan restore must not put a storage URI in the log stream.
 ///

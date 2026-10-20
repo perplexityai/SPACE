@@ -1,4 +1,4 @@
-//! Network-policy columns, the reconcile queue, and the node dirty-ref outbox.
+//! Network-policy columns, the live-gateway check, and the node dirty-ref outbox.
 
 use super::*;
 
@@ -152,7 +152,7 @@ pub fn update_network_policy_override(
                 ],
             )?;
             if enqueue_live_gateway {
-                queued_live_gateway = enqueue_network_policy_reconcile_if_live_tx(&tx, id)?;
+                queued_live_gateway = has_live_network_policy_gateway(&tx, id)?;
             }
             if mark_dirty {
                 queued_dirty_ref = enqueue_node_dirty_network_policy_sandbox_tx(&tx, id)?;
@@ -161,7 +161,7 @@ pub fn update_network_policy_override(
         }
         NetworkPolicyOverrideUpdatePlan::RepairIfLiveGateway => {
             if enqueue_live_gateway {
-                queued_live_gateway = enqueue_network_policy_reconcile_if_live_tx(&tx, id)?;
+                queued_live_gateway = has_live_network_policy_gateway(&tx, id)?;
             }
             if queued_live_gateway {
                 NetworkPolicyOverrideUpdate::Repair
@@ -196,7 +196,7 @@ pub fn clear_local_network_policy(
     let mut queued_dirty_ref = false;
     let decision = if existing_authority == PolicyAuthority::Cluster {
         if enqueue_live_gateway {
-            queued_live_gateway = enqueue_network_policy_reconcile_if_live_tx(&tx, id)?;
+            queued_live_gateway = has_live_network_policy_gateway(&tx, id)?;
         }
         if queued_live_gateway {
             NetworkPolicyOverrideUpdate::Repair
@@ -214,7 +214,7 @@ pub fn clear_local_network_policy(
             params![PolicyAuthority::Cluster.as_str(), now()?, id],
         )?;
         if enqueue_live_gateway {
-            queued_live_gateway = enqueue_network_policy_reconcile_if_live_tx(&tx, id)?;
+            queued_live_gateway = has_live_network_policy_gateway(&tx, id)?;
         }
         if mark_dirty {
             queued_dirty_ref = enqueue_node_dirty_network_policy_sandbox_tx(&tx, id)?;
@@ -240,6 +240,8 @@ pub enum NetworkPolicyOverrideUpdate {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct NetworkPolicyOverrideUpdateOutcome {
     pub decision: NetworkPolicyOverrideUpdate,
+    /// The caller was asked to reach a live gateway and the sandbox has one,
+    /// so the caller queues its reconcile.
     pub queued_live_gateway: bool,
     pub queued_dirty_ref: bool,
 }
@@ -306,36 +308,19 @@ pub(super) fn decide_network_policy_override_update(
     }
 }
 
-pub fn enqueue_network_policy_reconcile_if_live(
-    conn: &Connection,
-    sandbox_id: &str,
-) -> Result<bool> {
-    let tx = immediate_transaction(conn)?;
-    let queued = enqueue_network_policy_reconcile_if_live_tx(&tx, sandbox_id)?;
-    tx.commit()?;
-    Ok(queued)
-}
-
-fn enqueue_network_policy_reconcile_if_live_tx(
-    tx: &Transaction<'_>,
-    sandbox_id: &str,
-) -> Result<bool> {
-    let ts = now()?;
-    let changed = tx.execute(
-        "INSERT INTO network_policy_reconcile_queue (sandbox_id, requested_at, updated_at)
-         SELECT ?1, ?2, ?2
-         WHERE EXISTS (
+/// Whether `sandbox_id` is a non-pool sandbox with a registered network
+/// gateway, so a policy change has a live gateway to reconcile.
+pub fn has_live_network_policy_gateway(conn: &Connection, sandbox_id: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS (
              SELECT 1 FROM sandboxes
              WHERE id = ?1
                AND netgtw_pid IS NOT NULL
                AND pool_template IS NULL
-         )
-         ON CONFLICT(sandbox_id) DO UPDATE SET
-             requested_at = excluded.requested_at,
-             updated_at = excluded.updated_at",
-        params![sandbox_id, ts],
-    )?;
-    Ok(changed != 0)
+         )",
+        params![sandbox_id],
+        |row| row.get(0),
+    )
 }
 
 fn enqueue_node_dirty_network_policy_sandbox_tx(
@@ -430,23 +415,6 @@ pub fn delete_node_dirty_refs(conn: &Connection, refs: &[NodeDirtyRefRow]) -> Re
                 reference.element_value,
                 reference.revision
             ],
-        )?;
-    }
-    tx.commit()?;
-    Ok(deleted)
-}
-
-pub fn delete_network_policy_reconcile_rows<I>(conn: &Connection, sandbox_ids: I) -> Result<usize>
-where
-    I: IntoIterator,
-    I::Item: AsRef<str>,
-{
-    let tx = immediate_transaction(conn)?;
-    let mut deleted = 0;
-    for sandbox_id in sandbox_ids {
-        deleted += tx.execute(
-            "DELETE FROM network_policy_reconcile_queue WHERE sandbox_id = ?1",
-            params![sandbox_id.as_ref()],
         )?;
     }
     tx.commit()?;

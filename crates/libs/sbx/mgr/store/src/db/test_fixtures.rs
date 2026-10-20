@@ -23,6 +23,15 @@ pub fn quarantine_cleanup_episode(
     quarantine_cleanup_episode_for_job(conn, sandbox_id, cleanup_id, unsafe_evidence, None)
 }
 
+/// [`update_runtime_fields_for_activation`] with no activation owner.
+pub fn update_runtime_fields(
+    conn: &Connection,
+    sandbox_id: SandboxId,
+    fields: RuntimeFields<'_>,
+) -> Result<SupersededTeardownGeneration> {
+    sandboxes::update_runtime_fields_with_activation_owner(conn, sandbox_id, None, fields)
+}
+
 /// [`begin_activation_with_route_evidence`] with no route evidence.
 pub fn begin_activation(
     conn: &Connection,

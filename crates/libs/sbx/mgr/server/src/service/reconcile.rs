@@ -927,11 +927,6 @@ impl SandboxManagerService {
         };
         if let Err(error) = &result {
             tracing::warn!(sandbox_id, %error, "network policy reconcile failed");
-        } else {
-            let db = self.db_conn()?;
-            if let Err(error) = crate::db::delete_network_policy_reconcile_rows(&db, [sandbox_id]) {
-                tracing::warn!(sandbox_id, %error, "failed to delete completed network policy reconcile row");
-            }
         }
 
         let outcome = if result.is_ok() { "ok" } else { "error" };

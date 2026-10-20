@@ -422,7 +422,9 @@ pub fn emit_auto_lifecycle_delete_receipt_superseded_if_present(
 /// Delete every `sandbox_id`-scoped child row of a sandbox inside the
 /// caller's open transaction. The `foreign_keys` pragma is disabled, so this
 /// manual cascade is the single source of truth for sandbox child tables:
-/// add new child tables here, not at the individual delete call sites.
+/// add new child tables here, not at the individual delete call sites. It
+/// deliberately skips `network_policy_reconcile_queue`, which nothing writes or
+/// reads any more and a later release drops.
 fn delete_sandbox_child_rows(tx: &Connection, id: &str) -> Result<()> {
     teardown_jobs::fail_active(tx, id, TeardownSuspendFailure::Deleted)?;
     crate::db::route_activation_claims::close_claim(tx, id)?;
@@ -432,10 +434,6 @@ fn delete_sandbox_child_rows(tx: &Connection, id: &str) -> Result<()> {
     )?;
     tx.execute(
         "DELETE FROM local_artifacts WHERE sandbox_id = ?1",
-        params![id],
-    )?;
-    tx.execute(
-        "DELETE FROM network_policy_reconcile_queue WHERE sandbox_id = ?1",
         params![id],
     )?;
     tx.execute(
@@ -703,7 +701,9 @@ pub mod fixture {
 )]
 pub mod test_fixtures;
 #[cfg(any(test, feature = "test-support"))]
-pub use test_fixtures::{begin_activation, complete_cleanup_episode, quarantine_cleanup_episode};
+pub use test_fixtures::{
+    begin_activation, complete_cleanup_episode, quarantine_cleanup_episode, update_runtime_fields,
+};
 
 #[cfg(test)]
 pub(crate) mod tests;

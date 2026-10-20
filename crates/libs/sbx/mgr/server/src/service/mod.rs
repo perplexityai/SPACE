@@ -1490,7 +1490,11 @@ impl SandboxManagerService {
             Some(cleanup_id) => {
                 crate::db::update_runtime_fields_for_activation(&db, sandbox_id, cleanup_id, fields)
             }
+            // Only the test-only `update_runtime_fields` wrapper passes no owner.
+            #[cfg(test)]
             None => crate::db::update_runtime_fields(&db, sandbox_id, fields),
+            #[cfg(not(test))]
+            None => return Err(Status::internal("runtime fields update has no owner")),
         }
         .map_err(map_runtime_fields_update_error)?;
         if let Some(route_identity) = route_identity {

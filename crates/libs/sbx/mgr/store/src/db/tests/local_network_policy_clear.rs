@@ -118,14 +118,6 @@ fn clearing_a_local_network_policy_hands_authority_back_to_the_cluster() {
             );
             assert_eq!(row.network_policy_generation, 5, "{name}");
         }
-        let queued: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM network_policy_reconcile_queue WHERE sandbox_id = 'sandbox'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(queued == 1, case.expected.queued_live_gateway, "{name}");
         let dirty = list_node_dirty_refs(&conn, 16)
             .unwrap()
             .into_iter()

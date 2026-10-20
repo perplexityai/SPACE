@@ -73,7 +73,7 @@ impl fmt::Display for QuarantineRecoveryOutcome {
 /// that quarantined it, the event's own `operation` (`mark_quarantined`,
 /// `insert_quarantined_sandbox`, `startup_resident_recovery`,
 /// `complete_cleanup_episode`, `complete_row_intent_cleanup`,
-/// `quarantine_cleanup_episode`). A re-confirmed quarantine is not an entry.
+/// `quarantine_cleanup_episode`).
 pub fn quarantine_entered(reason: SandboxQuarantineReasonCode, operation: &'static str) {
     counter(
         "sandbox.worker.quarantine.entered",

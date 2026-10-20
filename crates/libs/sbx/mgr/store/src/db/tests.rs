@@ -2942,32 +2942,6 @@ fn delete_sandbox_removes_local_artifacts() {
 }
 
 #[test]
-fn delete_sandbox_removes_network_policy_reconcile_rows() {
-    let conn = test_conn();
-    insert_test_sandbox(
-        &conn,
-        TestSandboxInsert::new("sandbox-1", "sandbox1", SandboxState::Stopped),
-    );
-    conn.execute(
-        "INSERT INTO network_policy_reconcile_queue (sandbox_id, requested_at, updated_at)
-         VALUES (?1, ?2, ?2)",
-        params!["sandbox-1", now().unwrap()],
-    )
-    .unwrap();
-
-    delete_sandbox(&conn, "sandbox-1").unwrap();
-
-    let queue_count: u32 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM network_policy_reconcile_queue WHERE sandbox_id = ?1",
-            params!["sandbox-1"],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(queue_count, 0);
-}
-
-#[test]
 fn delete_sandbox_removes_local_artifact_orphans() {
     let conn = test_conn();
     insert_local_artifact(
@@ -3974,109 +3948,39 @@ fn mark_quarantined_persists_current_state_and_history() {
         history.4,
         SandboxQuarantineNextAction::RequiresOperatorAttention.as_str()
     );
+}
 
-    conn.execute(
-        "UPDATE sandbox_quarantine_state
-         SET claim_token = 'claim-1',
-             claim_expires_at = '2099-01-01T00:00:00Z',
-             next_action_owner = 'healer',
-             next_action_after = '2099-01-01T00:00:00Z',
-             last_error = 'still investigating'
-         WHERE sandbox_id = ?1",
-        params!["sandbox-1"],
-    )
-    .unwrap();
-
-    mark_quarantined(
+#[test]
+fn quarantining_from_an_expected_state_leaves_an_already_quarantined_sandbox_alone() {
+    let conn = test_conn();
+    insert_test_sandbox(
         &conn,
-        "sandbox-1",
-        SandboxQuarantineSource::NodeStatePublish,
-        SandboxQuarantineReasonCode::NodePublishedQuarantined,
-        "different reason",
-        SandboxQuarantineNextAction::SweeperCleanup,
-    )
-    .unwrap();
-
-    type QuarantineStateTuple = (
-        String,
-        String,
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
+        TestSandboxInsert::new("sandbox-1", "sandbox1", SandboxState::Pausing),
     );
-    let reentry: QuarantineStateTuple = conn
-        .query_row(
-            "SELECT quarantine_id, entered_from_state, source, reason_code,
-                    reason_message, next_action, claim_token, claim_expires_at,
-                    next_action_owner, last_error
-             FROM sandbox_quarantine_state
-             WHERE sandbox_id = ?1",
-            params!["sandbox-1"],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                    row.get(8)?,
-                    row.get(9)?,
-                ))
-            },
+    let quarantine_from_pausing = |reason_code, reason| {
+        mark_quarantined_from_state(
+            &conn,
+            "sandbox-1",
+            SandboxState::Pausing,
+            SandboxQuarantineSource::SbxManager,
+            reason_code,
+            reason,
+            SandboxQuarantineNextAction::RequiresOperatorAttention,
         )
-        .unwrap();
-    assert_eq!(reentry.0, current.0);
-    assert_eq!(reentry.1, "starting");
-    assert_eq!(
-        reentry.2,
-        SandboxQuarantineSource::NodeStatePublish.as_str()
-    );
-    assert_eq!(
-        reentry.3,
-        SandboxQuarantineReasonCode::NodePublishedQuarantined.as_str()
-    );
-    assert_eq!(reentry.4, "different reason");
-    assert_eq!(
-        reentry.5.as_deref(),
-        Some(SandboxQuarantineNextAction::RequiresOperatorAttention.as_str())
-    );
-    assert_eq!(reentry.6.as_deref(), Some("claim-1"));
-    assert_eq!(reentry.7.as_deref(), Some("2099-01-01T00:00:00Z"));
-    assert_eq!(reentry.8.as_deref(), Some("healer"));
-    assert_eq!(reentry.9.as_deref(), Some("still investigating"));
-
-    let row = get_sandbox(&conn, "sandbox-1").unwrap().unwrap();
-    assert_eq!(row.failure_reason.as_deref(), Some("different reason"));
-
-    let history_actions = {
-        let mut stmt = conn
-            .prepare(
-                "SELECT action
-                 FROM sandbox_quarantine_history
-                 WHERE sandbox_id = ?1
-                 ORDER BY occurred_at, id",
-            )
-            .unwrap();
-        stmt.query_map(params!["sandbox-1"], |row| row.get::<_, String>(0))
-            .unwrap()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .unwrap()
+        .unwrap()
     };
-    assert_eq!(
-        history_actions,
-        vec![
-            SandboxQuarantineHistoryAction::EnteredQuarantine.as_str(),
-            SandboxQuarantineHistoryAction::ReconfirmedQuarantine.as_str()
-        ]
-    );
+    assert!(quarantine_from_pausing(
+        SandboxQuarantineReasonCode::PauseFailed,
+        "pause outcome unknown",
+    ));
+    let before = database_rows(&conn);
+
+    // A second failure on the same path, after the first one won.
+    assert!(!quarantine_from_pausing(
+        SandboxQuarantineReasonCode::RuntimeProbeInconsistent,
+        "runtime probe inconsistent",
+    ));
+    assert_eq!(database_rows(&conn), before);
 }
 
 #[test]
@@ -5555,270 +5459,11 @@ fn cleanup_contention_releases_the_claim_and_backs_off() {
 }
 
 #[test]
-fn quarantine_recovery_reason_change_resets_episode_retry_state() {
-    let conn = crate::db::test_conn();
-    let (sandbox_id, candidate) = setup_quarantine_recovery_candidate(&conn);
-    let claimed =
-        claim_quarantine_recovery_candidate(&conn, &candidate, PlanRejectionRunEffect::Leaves)
-            .unwrap()
-            .expect("due episode should be claimable");
-    record_quarantine_recovery_no_progress(
-        &conn,
-        &claimed,
-        QuarantineRecoveryNoProgressReason::PlanIneligible,
-    )
-    .unwrap();
-    conn.execute(
-        "UPDATE sandbox_quarantine_state
-            SET next_action_after = NULL
-          WHERE sandbox_id = ?1",
-        params![sandbox_id.to_string()],
-    )
-    .unwrap();
-    let [candidate] = scan_quarantine_recovery_candidates(&conn)
-        .unwrap()
-        .candidates
-        .try_into()
-        .unwrap();
-    assert!(
-        claim_quarantine_recovery_candidate(&conn, &candidate, PlanRejectionRunEffect::Leaves)
-            .unwrap()
-            .is_some(),
-        "test requires a legacy claim before reconfirmation"
-    );
-    // Expire the lease: the reset only fires once nothing is acting on the
-    // episode. A live claim is covered by
-    // `quarantine_recovery_reason_change_preserves_a_live_claim`.
-    conn.execute(
-        "UPDATE sandbox_quarantine_state
-            SET claim_expires_at = '1'
-          WHERE sandbox_id = ?1",
-        params![sandbox_id.to_string()],
-    )
-    .unwrap();
-
-    mark_quarantined(
-        &conn,
-        &sandbox_id.to_string(),
-        SandboxQuarantineSource::SbxManager,
-        SandboxQuarantineReasonCode::RestoreSpacedHostLaunchFailed,
-        "reconfirmed with new recovery policy evidence",
-        SandboxQuarantineNextAction::RequiresOperatorAttention,
-    )
-    .unwrap();
-
-    let retry_state = conn
-        .query_row(
-            "SELECT next_action_owner, attempt_count, next_action_after,
-                    claim_token, claim_expires_at, last_error
-               FROM sandbox_quarantine_state
-              WHERE sandbox_id = ?1",
-            params![sandbox_id.to_string()],
-            |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                ))
-            },
-        )
-        .unwrap();
-    assert_eq!(retry_state, (None, 0, None, None, None, None));
-    let candidates = scan_quarantine_recovery_candidates(&conn)
-        .unwrap()
-        .candidates;
-    assert_eq!(candidates.len(), 1);
-    assert_eq!(
-        candidates[0].reason_code,
-        SandboxQuarantineReasonCode::RestoreSpacedHostLaunchFailed
-    );
-
-    conn.execute(
-        "UPDATE sandbox_quarantine_state
-            SET next_action_owner = 'future_owner',
-                attempt_count = 7,
-                next_action_after = '1234',
-                last_error = 'future hold'
-          WHERE sandbox_id = ?1",
-        params![sandbox_id.to_string()],
-    )
-    .unwrap();
-    mark_quarantined(
-        &conn,
-        &sandbox_id.to_string(),
-        SandboxQuarantineSource::SbxManager,
-        SandboxQuarantineReasonCode::RestorePrepareFailed,
-        "reconfirmed while a newer owner is active",
-        SandboxQuarantineNextAction::RequiresOperatorAttention,
-    )
-    .unwrap();
-    conn.execute(
-        "UPDATE sandbox_quarantine_state
-            SET reason_code = 'future_reason'
-          WHERE sandbox_id = ?1",
-        params![sandbox_id.to_string()],
-    )
-    .unwrap();
-    assert_eq!(
-        conn.query_row(
-            "SELECT next_action_owner, attempt_count, next_action_after, last_error
-               FROM sandbox_quarantine_state
-              WHERE sandbox_id = ?1",
-            params![sandbox_id.to_string()],
-            |row| Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?
-            )),
-        )
-        .unwrap(),
-        (
-            "future_owner".to_string(),
-            7,
-            "1234".to_string(),
-            "future hold".to_string(),
-        )
-    );
-    let scan = scan_quarantine_recovery_candidates(&conn).unwrap();
-    assert!(scan.candidates.is_empty());
-    assert_eq!(
-        (
-            scan.pending_count,
-            scan.pending_oldest_age.as_secs(),
-            scan.malformed_count
-        ),
-        (0, 0, 0),
-        "an owner introduced by a newer release is not legacy-owned or corrupt"
-    );
-}
-
-#[test]
-fn quarantine_recovery_source_change_resets_episode_retry_state() {
-    let conn = crate::db::test_conn();
-    let (sandbox_id, candidate) = setup_quarantine_recovery_candidate(&conn);
-    let claimed =
-        claim_quarantine_recovery_candidate(&conn, &candidate, PlanRejectionRunEffect::Leaves)
-            .unwrap()
-            .expect("due episode should be claimable");
-    record_quarantine_recovery_no_progress(
-        &conn,
-        &claimed,
-        QuarantineRecoveryNoProgressReason::PlanIneligible,
-    )
-    .unwrap();
-    let (_, attempt_count, next_action_after, _, _) = quarantine_claim_state(&conn, sandbox_id);
-    assert_eq!(attempt_count, 1);
-    assert!(next_action_after.is_some());
-
-    // A different authority reconfirming the same reason is still a new
-    // classification, so the retry state accumulated under the old source does
-    // not carry over. The reason code deliberately does not change here: the
-    // source alone has to be enough to reset.
-    mark_quarantined(
-        &conn,
-        &sandbox_id.to_string(),
-        SandboxQuarantineSource::NodeStatePublish,
-        candidate.reason_code,
-        "reconfirmed by a different source with the same reason",
-        SandboxQuarantineNextAction::RequiresOperatorAttention,
-    )
-    .unwrap();
-
-    assert_eq!(
-        quarantine_claim_state(&conn, sandbox_id),
-        (None, 0, None, None, None),
-        "a source change must reset the retry state it did not produce"
-    );
-    let stored_source: String = conn
-        .query_row(
-            "SELECT source FROM sandbox_quarantine_state WHERE sandbox_id = ?1",
-            params![sandbox_id.to_string()],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        stored_source,
-        SandboxQuarantineSource::NodeStatePublish.as_str()
-    );
-}
-
-#[test]
-fn quarantine_recovery_reason_change_preserves_a_live_claim() {
-    let conn = crate::db::test_conn();
-    let (sandbox_id, candidate) = setup_quarantine_recovery_candidate(&conn);
-    let claimed =
-        claim_quarantine_recovery_candidate(&conn, &candidate, PlanRejectionRunEffect::Leaves)
-            .unwrap()
-            .expect("due episode should be claimable");
-    let claim_state_before = quarantine_claim_state(&conn, sandbox_id);
-
-    // A concurrent failure re-marks the sandbox while the claimed operation is
-    // still running. Clearing the lease here would make the episode look due
-    // and unclaimed, so the next tick starts a second recovery operation
-    // alongside the one still holding the claim.
-    mark_quarantined(
-        &conn,
-        &sandbox_id.to_string(),
-        SandboxQuarantineSource::SbxManager,
-        SandboxQuarantineReasonCode::RestoreSpacedHostLaunchFailed,
-        "reconfirmed while the legacy recovery claim is still live",
-        SandboxQuarantineNextAction::RequiresOperatorAttention,
-    )
-    .unwrap();
-
-    let (owner_after, attempts_after, retry_after, token_after, expiry_after) =
-        quarantine_claim_state(&conn, sandbox_id);
-    assert_eq!(
-        (owner_after, token_after, expiry_after),
-        (
-            claim_state_before.0.clone(),
-            claim_state_before.3.clone(),
-            claim_state_before.4.clone()
-        ),
-        "the lease is kept: clearing it would make the episode look due and \
-         unclaimed while its operation is still doing physical work, so the next \
-         tick would start a second one on the same sandbox"
-    );
-    assert_eq!(
-        attempts_after, claim_state_before.1,
-        "the attempt count is kept too, so a sandbox whose classification keeps \
-         changing cannot reset its curve every reconfirmation and land attempts \
-         one tick apart"
-    );
-    assert!(
-        retry_after.is_none(),
-        "but the retry time goes: it was claim-expiry-plus-backoff for a \
-         classification that no longer applies, and leaving it strands the \
-         episode for the lease plus that backoff when the operation holding the \
-         lease can no longer commit anything"
-    );
-    assert!(
-        scan_quarantine_recovery_candidates(&conn)
-            .unwrap()
-            .candidates
-            .is_empty(),
-        "the still-claimed episode must not be offered to a second operation"
-    );
-    // The claim is now stale against the new reason code — the fence pins both
-    // `source` and `reason_code`, which this statement just rewrote — so the
-    // in-flight operation cannot commit anything. That is also why the retry time
-    // is cleared above rather than left for "a later tick": by a later tick the
-    // row already carries the new reason and the change is undetectable.
-    assert!(!quarantine_recovery_claim_is_current(&conn, &claimed).unwrap());
-}
-
-#[test]
 fn quarantine_recovery_new_episode_preserves_a_live_claim() {
     let conn = crate::db::test_conn();
     // The orphan restore runs with the sandbox in `restoring`, so a failure that
-    // re-quarantines it takes the new-episode path rather than the
-    // reconfirmation path. That path's upsert is the one that has to respect a
-    // live lease; the reconfirmation branch is covered separately by
-    // `quarantine_recovery_reason_change_preserves_a_live_claim`.
+    // re-quarantines it replaces the episode. That upsert is the one that has to
+    // respect a live lease.
     let sandbox_id = setup_quarantine_recovery_episode(
         &conn,
         SandboxQuarantineReasonCode::OrphanedSandboxRowMissing,
@@ -8599,8 +8244,8 @@ fn quarantine_recovery_new_episode_survives_a_lease_without_an_owner() {
         ],
     )
     .unwrap();
-    // Leaving the sandbox in `quarantined` would take the reconfirmation branch
-    // and never reach the new-episode probe this test is about.
+    // A sandbox left in `quarantined` keeps its episode and never reaches the
+    // new-episode probe this test is about.
     conn.execute(
         "UPDATE sandboxes SET state = 'restoring' WHERE id = ?1",
         params![sandbox_id.to_string()],
@@ -8632,7 +8277,7 @@ fn quarantine_recovery_new_episode_survives_a_lease_without_an_owner() {
 enum AcquirePrecondition {
     EpisodeReplaced,
     // `source` has now been the uncovered conjunct three separate times across
-    // this work — absent from one fence, unpinned in the reconfirmation guard,
+    // this work — absent from one fence, unpinned in a since-removed guard,
     // and missing from this matrix. It is the conjunct most easily forgotten
     // because every episode this loop sees already has the same value.
     SourceChanged,
@@ -9079,18 +8724,6 @@ fn every_recovery_table_writer_is_fenced_or_explicitly_exempt() {
              acquiring_a_claim_refuses_every_changed_precondition",
         ),
         (
-            "mark_quarantined_inner",
-            "reconfirms an episode rather than acting under a claim; preserves the \
-             retry and lease columns of a live lease or a foreign owner. Note for \
-             whoever adds the \
-             next writer: all three of its branches rewrite `source` and \
-             `reason_code`, which the fence pins, so a classification change \
-             deliberately invalidates any in-flight claim and the running \
-             operation aborts on its next heartbeat. That is intended and \
-             asserted, but it means this function mutates fence identity \
-             columns — do not read the exemption as `does not touch the fence`",
-        ),
-        (
             "retire_quarantine_recovery",
             "runs after the cleanup episode carrying the recovery fence was \
              validated; fails typed on a row-count mismatch",
@@ -9186,8 +8819,8 @@ fn every_recovery_table_writer_is_fenced_or_explicitly_exempt() {
 
     assert_eq!(
         writers.len(),
-        12,
-        "the scan found {} writers of sandbox_quarantine_state, not 12. A floor \
+        11,
+        "the scan found {} writers of sandbox_quarantine_state, not 11. A floor \
          rather than an equality let a detection regression on up to three \
          writers pass green — a writer rewritten into a shape the predicate \
          misses simply leaves the list, and the stale-exemption check below only \
@@ -10328,6 +9961,7 @@ mod accepted_shapes_quarantine;
 mod accepted_shapes_single_statement;
 mod cleanup_quarantine_refusal;
 mod local_network_policy_clear;
+mod network_policy_live_gateway;
 mod pinned_artifact_capture;
 mod state_write_table;
 mod stopped_artifact_pin;

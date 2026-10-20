@@ -191,17 +191,10 @@ impl SandboxManagerService {
                         effective_policy.inherited,
                         effective_policy.generation,
                     )?;
-                    // The durable outbox row written by the DB update (when
-                    // queued_live_gateway) is left for the in-memory reconciler to
-                    // drain rather than deleted here. Deleting it inline can't be
-                    // done race-free: the row is keyed only by sandbox_id (second-
-                    // resolution timestamps give no unique token), so a concurrent
-                    // SetNetworkPolicy that re-enqueues between our read and delete
-                    // would be clobbered. Handing it to the reconciler is safe: the
-                    // reconciler reads the *latest* desired policy at drain time
-                    // (correctly applying any concurrent newer update), finds the
-                    // gateway already matches ours (idempotent), and deletes the row
-                    // via its normal post-drain cleanup.
+                    // Still hand the sandbox to the in-memory reconciler: it reads
+                    // the *latest* desired policy at drain time, so a concurrent
+                    // newer update is applied, and an unchanged one finds the
+                    // gateway already matching ours (idempotent).
                     if outcome.queued_live_gateway {
                         self.enqueue_network_policy_reconcile(sandbox.id.clone());
                     }
@@ -332,13 +325,12 @@ impl SandboxManagerService {
             if !Self::sandbox_has_live_net_gateway(sandbox) {
                 continue;
             }
-            let queued = {
+            let live = {
                 let db = self.db_conn()?;
-                crate::db::enqueue_network_policy_reconcile_if_live(&db, &sandbox.id).map_err(
-                    |e| Status::internal(format!("db enqueue network_policy failed: {e}")),
-                )?
+                crate::db::has_live_network_policy_gateway(&db, &sandbox.id)
+                    .map_err(|e| Status::internal(format!("db live-gateway check failed: {e}")))?
             };
-            if queued {
+            if live {
                 self.enqueue_network_policy_reconcile(sandbox.id.clone());
                 queued_gateways += 1;
                 if sandbox.applied_network_policy_source
