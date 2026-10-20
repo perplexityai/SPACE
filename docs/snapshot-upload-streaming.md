@@ -63,6 +63,11 @@ pull-only: an S3 copy already accepted by the server cannot be recalled, so
 copies cannot promise its writer barrier. Disconnecting does not delete a
 possibly completed destination out from under its owner.
 
+Permanent credential-manager rejections fail the copy job immediately instead
+of spending its retry budget. Transient credential-service and transport
+failures retain normal retries. A caller can select a compatible transfer
+only after observing a terminal failure; credentials are never broadened.
+
 Deploy the credential authority and forwarding agents before copy consumers,
 and volume-manager before sandbox-manager begins submitting copies. Roll back
 consumers first. Existing transfers do not submit copy jobs.

@@ -184,3 +184,74 @@ async fn cancellation_and_invalid_recovered_payloads_cannot_start_a_copy() {
     assert_eq!(store.copies.load(Ordering::SeqCst), 0);
     assert!(store.destination.lock().unwrap().is_none());
 }
+
+#[test]
+fn copy_credential_rejections_are_terminal_but_transient_failures_retry() {
+    let directory = tempfile::tempdir().unwrap();
+    let endpoint = format!(
+        "unix://{}/credential-manager.sock",
+        directory.path().display()
+    );
+    if !pplx_space_test_env::enter_test_process(&[(
+        "SPACE_CREDMGR_ENDPOINT",
+        Some(std::ffi::OsStr::new(&endpoint)),
+    )]) {
+        return;
+    }
+    let endpoint = std::env::var("SPACE_CREDMGR_ENDPOINT").unwrap();
+    let socket = endpoint.strip_prefix("unix://").unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        let reply = Arc::new(std::sync::atomic::AtomicI32::new(0));
+        let response_code = Arc::clone(&reply);
+        let router = axum::Router::new().fallback(move || {
+            let code = tonic::Code::from_i32(response_code.load(Ordering::SeqCst));
+            async move {
+                tonic::Status::new(code, "synthetic credential exchange failure")
+                    .into_http::<axum::body::Body>()
+            }
+        });
+        let shutdown = CancellationToken::new();
+        let stopped = shutdown.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(stopped.cancelled_owned())
+                .await
+                .unwrap();
+        });
+        for (code, permanent) in [
+            (tonic::Code::InvalidArgument, true),
+            (tonic::Code::NotFound, true),
+            (tonic::Code::PermissionDenied, true),
+            (tonic::Code::Unauthenticated, true),
+            (tonic::Code::FailedPrecondition, true),
+            (tonic::Code::Unimplemented, true),
+            (tonic::Code::Unavailable, false),
+            (tonic::Code::DeadlineExceeded, false),
+            (tonic::Code::ResourceExhausted, false),
+            (tonic::Code::Aborted, false),
+            (tonic::Code::Internal, false),
+        ] {
+            reply.store(code as i32, Ordering::SeqCst);
+            let (store, mut executor, job) = fixture(Some(vec![1, 2, 3]), false);
+            executor.config.static_credentials = None;
+            let error = executor
+                .execute(&job, CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                matches!(
+                    error,
+                    JobError::Permanent(_) | JobError::PermanentWithReason { .. }
+                ),
+                permanent,
+                "{code:?}: permanent credential rejections must allow prompt copy fallback; {error}"
+            );
+            assert_eq!(store.copies.load(Ordering::SeqCst), 0);
+            assert!(store.destination.lock().unwrap().is_none());
+        }
+        shutdown.cancel();
+        server.await.unwrap();
+    });
+}

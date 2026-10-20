@@ -48,6 +48,18 @@ impl StorageAccess {
     }
 }
 
+/// Retains authority rejection codes so copy jobs can distinguish permanent
+/// policy failures from transient credential-service failures.
+#[derive(Debug, thiserror::Error)]
+pub enum StorageCredentialError {
+    #[error("credmgr connect failed: {0}")]
+    Connect(#[source] Box<pplx_space_credmgr_client::ConnectError>),
+    #[error("credmgr exchange_token failed: {0}")]
+    Exchange(#[source] Box<Status>),
+    #[error("credmgr returned unexpected payload type; expected AwsCredentials")]
+    UnexpectedPayload,
+}
+
 /// Exchange a SPACE subject for short-lived AWS credentials scoped to one
 /// exact object or canonical object prefix.
 pub async fn exchange_credentials(
@@ -62,14 +74,16 @@ pub async fn exchange_credentials(
     } else {
         format!("arn:aws:s3:::{bucket}/{key}")
     };
-    request_credentials(storage_request(resource, subject, access)).await
+    request_credentials(storage_request(resource, subject, access))
+        .await
+        .map_err(|error| Status::internal(error.to_string()))
 }
 
 pub async fn exchange_copy_credentials(
     source: &StorageUri,
     destination: &StorageUri,
     subject: &SubjectId,
-) -> Result<ObjectCredentials, Status> {
+) -> Result<ObjectCredentials, StorageCredentialError> {
     let mut request = storage_request(
         format!(
             "arn:aws:s3:::{}/{}",
@@ -105,14 +119,16 @@ fn storage_request(
     }
 }
 
-async fn request_credentials(request: ExchangeTokenRequest) -> Result<ObjectCredentials, Status> {
+async fn request_credentials(
+    request: ExchangeTokenRequest,
+) -> Result<ObjectCredentials, StorageCredentialError> {
     let mut client = pplx_space_credmgr_client::connect_from_env()
         .await
-        .map_err(|e| Status::internal(format!("credmgr connect failed: {e}")))?;
+        .map_err(|error| StorageCredentialError::Connect(Box::new(error)))?;
     let mut resp = client
         .exchange_token(request)
         .await
-        .map_err(|e| Status::internal(format!("credmgr exchange_token failed: {e}")))?
+        .map_err(|error| StorageCredentialError::Exchange(Box::new(error)))?
         .into_inner();
     match resp.payload.as_mut() {
         Some(exchange_token_response::Payload::AwsCredentials(c)) => Ok(ObjectCredentials {
@@ -120,9 +136,7 @@ async fn request_credentials(request: ExchangeTokenRequest) -> Result<ObjectCred
             secret_access_key: std::mem::take(&mut c.secret_access_key),
             session_token: std::mem::take(&mut c.session_token),
         }),
-        _ => Err(Status::internal(
-            "credmgr returned unexpected payload type; expected AwsCredentials",
-        )),
+        _ => Err(StorageCredentialError::UnexpectedPayload),
     }
 }
 

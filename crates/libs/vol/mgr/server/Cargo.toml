@@ -56,6 +56,7 @@ insta = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
+pplx-space-test-env = { workspace = true }
 tonic-health = { workspace = true }
 tracing-subscriber = { workspace = true }
 # `test-util` enables `#[tokio::test(start_paused = true)]` so the codec

@@ -7352,6 +7352,7 @@ dependencies = [
  "pplx-space-node-mgr-client",
  "pplx-space-object-store",
  "pplx-space-sqlite",
+ "pplx-space-test-env",
  "pplx-space-volmgr-client",
  "rusqlite",
  "serde",

@@ -115,9 +115,7 @@ impl TransferExecutor {
             None => {
                 crate::credentials::exchange_copy_credentials(source, destination, &payload.subject)
                     .await
-                    .map_err(|error| {
-                        JobError::retriable(format!("copy credential exchange: {error}"))
-                    })?
+                    .map_err(classify_copy_credentials)?
             }
         };
         let source_target = target(source);
@@ -150,6 +148,29 @@ impl TransferExecutor {
             )));
         }
         bytes_len_to_job_i64(source_meta.size, "copied object size")
+    }
+}
+
+fn classify_copy_credentials(error: crate::credentials::StorageCredentialError) -> JobError {
+    use crate::credentials::StorageCredentialError;
+
+    let reason = match &error {
+        StorageCredentialError::Exchange(status) => match status.code() {
+            tonic::Code::InvalidArgument
+            | tonic::Code::FailedPrecondition
+            | tonic::Code::Unimplemented => Some(JobFailureReason::InvalidInput),
+            tonic::Code::NotFound => Some(JobFailureReason::NotFound),
+            tonic::Code::PermissionDenied | tonic::Code::Unauthenticated => {
+                Some(JobFailureReason::PermissionDenied)
+            }
+            _ => None,
+        },
+        StorageCredentialError::Connect(_) | StorageCredentialError::UnexpectedPayload => None,
+    };
+    let message = format!("copy credential exchange: {error}");
+    match reason {
+        Some(reason) => JobError::permanent_with_reason(reason, message),
+        None => JobError::retriable(message),
     }
 }
 
