@@ -56,6 +56,7 @@ pplx-space-spaced-common = { workspace = true }
 pplx-space-template-mgr-client = { workspace = true }
 
 [dev-dependencies]
+libc = { workspace = true }
 pplx-space-execution-common = { workspace = true, features = ["serde"] }
 tokio = { workspace = true, features = ["test-util"] }
 pplx-space-common-svc = { workspace = true, features = ["test-support"] }
