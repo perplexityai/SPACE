@@ -258,14 +258,15 @@ fn local_file_verify_honors_nonstandard_bootable_artifact_filename() {
 
 #[tokio::test]
 async fn bootable_artifact_hash_matches_dir_name_when_bytes_agree() {
-    let fixture = write_digest_fixture(b"rootfs-bytes", b"zst-bytes");
-    verify_bootable_artifact_hash(
-        fixture.dir.path(),
-        TEMPLATE_ROOTFS_FILE,
-        &fixture.rootfs_hash,
-    )
-    .await
-    .unwrap();
+    let fixture = write_digest_fixture(b"abc", b"zst-bytes");
+    for hash in [
+        fixture.rootfs_hash.as_str(),
+        "blake3:6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85",
+    ] {
+        verify_bootable_artifact_hash(fixture.dir.path(), TEMPLATE_ROOTFS_FILE, hash)
+            .await
+            .unwrap();
+    }
 }
 
 #[tokio::test]
@@ -387,4 +388,32 @@ async fn prune_restores_deleting_row_when_artifacts_intact() {
         state, "ready",
         "stuck 'deleting' row with intact artifacts must be restored to 'ready'"
     );
+}
+
+#[tokio::test]
+async fn recovery_adopts_blake3_bytes_and_rejects_corruption_without_a_catalog_row() {
+    let fixture = write_digest_fixture(b"abc", b"zst-bytes");
+    let hash = "blake3:6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85";
+    let mut manifest = canonical_manifest(&fixture);
+    manifest.content_hash = hash.to_string();
+    manifest.files.get_mut(TEMPLATE_ROOTFS_FILE).unwrap().digest = hash.to_string();
+    write_manifest_json(fixture.dir.path(), &manifest);
+    let service =
+        TemplateManagerService::new_with_template_root(crate::db::test_conn(), fixture.dir.path())
+            .unwrap();
+    reconcile_digest_dir_against_db(&service, "seed", hash, fixture.dir.path()).await;
+    assert!(
+        crate::db::get_build(&service.db.lock().unwrap(), "seed", hash)
+            .unwrap()
+            .is_some()
+    );
+    crate::db::delete_build(&service.db.lock().unwrap(), "seed", hash).unwrap();
+    std::fs::write(fixture.dir.path().join(TEMPLATE_ROOTFS_FILE), b"bad").unwrap();
+    reconcile_digest_dir_against_db(&service, "seed", hash, fixture.dir.path()).await;
+    assert!(
+        crate::db::get_build(&service.db.lock().unwrap(), "seed", hash)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!fixture.dir.path().exists());
 }
