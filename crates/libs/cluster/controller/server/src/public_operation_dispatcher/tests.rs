@@ -104,6 +104,28 @@ fn execution_concurrency_parses_and_clamps_from_the_environment() {
 }
 
 #[test]
+fn create_concurrency_is_independent_and_bounded() {
+    const CREATE: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_CREATE_EXECUTION_CONCURRENCY";
+    let mut env = pplx_space_test_env::TestEnv::default();
+    env.set(
+        "SPACE_PUBLIC_OPERATION_DISPATCHER_EXECUTION_CONCURRENCY",
+        "3",
+    );
+    for (value, expected) in [
+        ("7", 7),
+        ("500", MAX_EXECUTION_CONCURRENCY),
+        ("99999999999999999999", MAX_EXECUTION_CONCURRENCY),
+        ("0", DEFAULT_CREATE_EXECUTION_CONCURRENCY),
+        ("invalid", DEFAULT_CREATE_EXECUTION_CONCURRENCY),
+    ] {
+        env.set(CREATE, value);
+        let config = ReconcilerConfig::from_environment(&env);
+        assert_eq!(config.create_execution_concurrency, expected);
+        assert_eq!(config.execution_concurrency, 3);
+    }
+}
+
+#[test]
 fn tick_report_merge_sums_outcomes_without_claim_double_counting() {
     let mut report = TickReport {
         claimed: 3,
@@ -449,6 +471,80 @@ async fn run_never_claims_beyond_execution_concurrency() -> TestResult {
     wait_for_state(&db.pool, waiting, OperationState::Succeeded).await?;
     shutdown.cancel();
     tokio::time::timeout(Duration::from_secs(5), dispatcher).await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn run_lane_backlog_cannot_occupy_other_lanes_slots() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    // Exercise both directions: a delete flood cannot starve creates, and
+    // a create flood cannot take the general lane's reserved capacity.
+    for (blocked_kind, independent_kind) in [
+        (OperationKind::DeleteSandbox, OperationKind::CreateSandbox),
+        (OperationKind::CreateSandbox, OperationKind::DeleteSandbox),
+    ] {
+        let slow = create_queued_operation(
+            &store,
+            org_id,
+            ApiProduct::Native,
+            blocked_kind,
+            TargetBlockingExecutor::BLOCKED_TARGET,
+        )
+        .await?;
+        let mut backlog = Vec::new();
+        for _ in 0..20 {
+            backlog.push(
+                create_queued_operation(
+                    &store,
+                    org_id,
+                    ApiProduct::Native,
+                    blocked_kind,
+                    "sbx_waiting",
+                )
+                .await?,
+            );
+        }
+        let independent = create_queued_operation(
+            &store,
+            org_id,
+            ApiProduct::Native,
+            independent_kind,
+            "sbx_independent",
+        )
+        .await?;
+        let executor = TargetBlockingExecutor::default();
+        let shutdown = CancellationToken::new();
+        let dispatcher = tokio::spawn(run(
+            ReconcilerConfig {
+                create_execution_concurrency: 1,
+                ..fast_loop_config(1)
+            },
+            store.clone(),
+            executor.clone(),
+            shutdown.clone(),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), executor.started.notified()).await?;
+        wait_for_state(&db.pool, independent, OperationState::Succeeded).await?;
+        for waiting in &backlog {
+            let operation = store.fetch_operation_admin(*waiting).await?.unwrap();
+            assert_eq!(operation.state, OperationState::Queued);
+            assert_eq!(operation.attempts, 0);
+        }
+        assert_eq!(
+            operation_state(&db.pool, slow).await?,
+            OperationState::Running.as_str()
+        );
+        executor.release.notify_one();
+        for waiting in backlog {
+            wait_for_state(&db.pool, waiting, OperationState::Succeeded).await?;
+        }
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), dispatcher).await??;
+    }
     Ok(())
 }
 
@@ -1158,7 +1254,7 @@ impl TargetBlockingExecutor {
 #[async_trait::async_trait]
 impl PublicOperationExecutor for TargetBlockingExecutor {
     fn supported_kinds(&self) -> &'static [OperationKind] {
-        &[OperationKind::DeleteSandbox]
+        &[OperationKind::CreateSandbox, OperationKind::DeleteSandbox]
     }
 
     async fn execute(

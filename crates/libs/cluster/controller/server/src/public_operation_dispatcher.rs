@@ -42,6 +42,7 @@ const DEFAULT_TICK: Duration = Duration::from_millis(25);
 const CLAIM_FAILURE_WARN_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_CLAIM_LIMIT: u32 = 64;
 const DEFAULT_EXECUTION_CONCURRENCY: usize = 16;
+const DEFAULT_CREATE_EXECUTION_CONCURRENCY: usize = 16;
 const MAX_EXECUTION_CONCURRENCY: usize = 128;
 const M1_MAX_AGE_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_M1_MAX_AGE_SECS";
 
@@ -51,6 +52,7 @@ pub struct ReconcilerConfig {
     pub tick: Duration,
     pub claim_limit: u32,
     pub execution_concurrency: usize,
+    pub create_execution_concurrency: usize,
     pub claim_stale_after: Duration,
     pub retry_after: Duration,
     pub max_retry_attempts: i32,
@@ -64,6 +66,7 @@ impl Default for ReconcilerConfig {
             tick: DEFAULT_TICK,
             claim_limit: DEFAULT_CLAIM_LIMIT,
             execution_concurrency: DEFAULT_EXECUTION_CONCURRENCY,
+            create_execution_concurrency: DEFAULT_CREATE_EXECUTION_CONCURRENCY,
             claim_stale_after: DEFAULT_CLAIM_STALE_AFTER,
             retry_after: DEFAULT_RETRY_AFTER,
             max_retry_attempts: DEFAULT_MAX_RETRY_ATTEMPTS,
@@ -99,6 +102,11 @@ impl ReconcilerConfig {
             execution_concurrency: config.bounded_usize(
                 "SPACE_PUBLIC_OPERATION_DISPATCHER_EXECUTION_CONCURRENCY",
                 DEFAULT_EXECUTION_CONCURRENCY,
+                MAX_EXECUTION_CONCURRENCY,
+            ),
+            create_execution_concurrency: config.bounded_usize(
+                "SPACE_PUBLIC_OPERATION_DISPATCHER_CREATE_EXECUTION_CONCURRENCY",
+                DEFAULT_CREATE_EXECUTION_CONCURRENCY,
                 MAX_EXECUTION_CONCURRENCY,
             ),
             claim_stale_after: config.test_duration_secs(
@@ -315,11 +323,62 @@ pub async fn run<E>(
         tracing::info!(
             "public-operation-dispatcher is enabled but has no supported operation kinds"
         );
+        shutdown_token.cancelled().await;
+        return;
     }
+    // Separate claim loops and execution budgets prevent either lane's queue
+    // or slow claims from occupying the other's execution slots.
+    let (create_kinds, general_kinds): (Vec<_>, Vec<_>) = executor
+        .supported_kinds()
+        .iter()
+        .copied()
+        .partition(|kind| *kind == OperationKind::CreateSandbox);
+    tokio::join!(
+        run_lane(
+            &config,
+            &store,
+            &executor,
+            &shutdown_token,
+            &create_kinds,
+            config.create_execution_concurrency,
+        )
+        .instrument(tracing::info_span!(
+            "public_operation_lane",
+            lane = "create"
+        )),
+        run_lane(
+            &config,
+            &store,
+            &executor,
+            &shutdown_token,
+            &general_kinds,
+            config.execution_concurrency,
+        )
+        .instrument(tracing::info_span!(
+            "public_operation_lane",
+            lane = "general"
+        )),
+    );
+}
+
+async fn run_lane<E>(
+    config: &ReconcilerConfig,
+    store: &PublicOperationStore,
+    executor: &E,
+    shutdown_token: &CancellationToken,
+    claimable_kinds: &[OperationKind],
+    concurrency: usize,
+) where
+    E: PublicOperationExecutor + Clone,
+{
+    if claimable_kinds.is_empty() {
+        return;
+    }
+    let concurrency = concurrency.max(1);
     // The effective width, after the ceiling clamp. Nothing else exposes it,
     // so without this line an over-ceiling setting looks like it took effect.
     tracing::info!(
-        execution_concurrency = config.execution_concurrency,
+        execution_concurrency = concurrency,
         "starting public-operation-dispatcher"
     );
 
@@ -330,8 +389,7 @@ pub async fn run<E>(
     // Executions run independently of the claim loop: a slow operation holds
     // one of `execution_concurrency` slots but does not delay pickup of newly
     // queued operations into the remaining slots.
-    let concurrency = config.execution_concurrency.max(1);
-    let execution_config = execution_config(&config);
+    let execution_config = execution_config(config);
     let mut in_flight = JoinSet::new();
     let mut last_claim_failure_warn: Option<Instant> = None;
     let mut suppressed_claim_failures: u64 = 0;
@@ -344,7 +402,7 @@ pub async fn run<E>(
                     continue;
                 }
                 let started = Instant::now();
-                match claim_up_to(&config, &store, &executor, free).await {
+                match claim_up_to(config, store, claimable_kinds, free).await {
                     Ok(claim) => {
                         let claimed = claim.operations.len();
                         for operation in claim.operations {
@@ -426,15 +484,12 @@ fn log_execution_outcome(
     }
 }
 
-async fn claim_up_to<E>(
+async fn claim_up_to(
     config: &ReconcilerConfig,
     store: &PublicOperationStore,
-    executor: &E,
+    claimable_kinds: &[OperationKind],
     free_slots: usize,
-) -> Result<PublicOperationClaim, pplx_space_api::public_operations::PublicOperationStoreError>
-where
-    E: PublicOperationExecutor,
-{
+) -> Result<PublicOperationClaim, pplx_space_api::public_operations::PublicOperationStoreError> {
     let limit = u32::try_from(free_slots)
         .unwrap_or(u32::MAX)
         .min(config.claim_limit);
@@ -442,7 +497,7 @@ where
         .claim_operations(ClaimPublicOperations {
             limit,
             claim_stale_after: config.claim_stale_after,
-            claimable_kinds: executor.supported_kinds(),
+            claimable_kinds,
         })
         .await
 }

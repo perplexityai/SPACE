@@ -666,6 +666,50 @@ async fn claim_operations_filters_kind_and_marks_running() -> TestResult {
 }
 
 #[tokio::test]
+async fn create_claim_skips_older_delete_backlog() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let mut deletes = Vec::new();
+    for _ in 0..20 {
+        deletes.push(
+            create_test_operation(&store, org_id, OperationKind::DeleteSandbox)
+                .await?
+                .expect_created(),
+        );
+    }
+    let create = create_test_operation(&store, org_id, OperationKind::CreateSandbox)
+        .await?
+        .expect_created();
+    let claim = store
+        .claim_operations(ClaimPublicOperations {
+            limit: 1,
+            claim_stale_after: Duration::from_secs(60),
+            claimable_kinds: &[OperationKind::CreateSandbox],
+        })
+        .await?;
+    assert_eq!(claim.operations.len(), 1);
+    assert_eq!(claim.operations[0].id, create);
+    for delete in &deletes {
+        let operation = store.fetch_operation_admin(*delete).await?.unwrap();
+        assert_eq!(operation.state, OperationState::Queued);
+        assert_eq!(operation.attempts, 0);
+    }
+    let claim = store
+        .claim_operations(ClaimPublicOperations {
+            limit: 1,
+            claim_stale_after: Duration::from_secs(60),
+            claimable_kinds: &[OperationKind::DeleteSandbox],
+        })
+        .await?;
+    assert_eq!(claim.operations.len(), 1);
+    assert_eq!(claim.operations[0].id, deletes[0]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn claimed_payload_updates_require_the_active_claim_generation() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
