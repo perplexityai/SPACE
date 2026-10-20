@@ -33,7 +33,7 @@ while IFS= read -r line || [[ -n "${line}" ]]; do
     line="${line%%#*}"
     line="${line#"${line%%[![:space:]]*}"}"
     line="${line%"${line##*[![:space:]]}"}"
-    [[ -n "${line}" ]] && pathspecs+=(":(glob)${line}")
+    [[ -n "${line}" ]] && pathspecs+=(":(top,glob)${line}")
 done <"${PATHS_FILE}"
 if [[ "${#pathspecs[@]}" -eq 0 ]]; then
     echo "${PATHS_FILE} lists no paths." >&2

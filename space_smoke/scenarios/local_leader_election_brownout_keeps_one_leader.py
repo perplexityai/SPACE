@@ -4,9 +4,9 @@ import space_smoke as smoke
 
 
 # Runs in the implicit inventory, so Kind CI exercises it on every push to
-# main and on every PR that Kind pull CI's path filter selects. It waits out the
-# controller's liveness budget twice, once with a refused contender and once
-# with the control-plane apiserver deliberately down. Both faults are captured
+# main and on every PR whose paths select the Kind smoke in Pull CI. It waits
+# out the controller's liveness budget twice, once with a refused contender and
+# once with the control-plane apiserver deliberately down. Both faults are captured
 # and undone by this run; the Kind mutation Lease keeps cooperating smokes off
 # the cluster meanwhile. See space_smoke/leader_election.py for what is read
 # where.
