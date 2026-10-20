@@ -290,7 +290,7 @@ fn receive_bounds_memory_of_appended_stream() {
     {
         let mut rootfs = File::create(fixture.join("source/rootfs.ext4")).unwrap();
         let chunk = vec![0x5a_u8; 8 << 20];
-        for _ in 0..(1800 / 8) {
+        for _ in 0..(1700 / 8) {
             rootfs.write_all(&chunk).unwrap();
         }
         rootfs.sync_all().unwrap();
@@ -298,21 +298,24 @@ fn receive_bounds_memory_of_appended_stream() {
     let source = directory(&parent, "source".as_ref()).unwrap();
     btrfs::snapshot(&source, &parent, "sent".as_ref(), true).unwrap();
     let sent = directory(&parent, "sent".as_ref()).unwrap();
-    let stream = File::create(fixture.join("stream")).unwrap();
-    btrfs::send(&template, &sent, &stream).unwrap();
-    drop(stream);
-    // The interrupted send got as far as its 17-byte stream header; the
-    // restarted send then appended a whole new stream.
+    // The interrupted send got as far as its 17-byte protocol-v1 stream
+    // header; the restarted send then appended a whole new stream. Append
+    // the real stream after that header (O_APPEND) to keep the fixture to
+    // one copy of the payload on disk.
     {
-        let mut whole = File::open(fixture.join("stream")).unwrap();
-        let mut header = [0_u8; 17];
-        std::io::Read::read_exact(&mut whole, &mut header).unwrap();
-        assert_eq!(&header[..13], b"btrfs-stream\0");
-        let mut corrupt = File::create(fixture.join("corrupt")).unwrap();
-        corrupt.write_all(&header).unwrap();
-        let mut whole = File::open(fixture.join("stream")).unwrap();
-        std::io::copy(&mut whole, &mut corrupt).unwrap();
+        let mut corrupt = std::fs::OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .open(fixture.join("corrupt"))
+            .unwrap();
+        corrupt.write_all(b"btrfs-stream\0").unwrap();
+        corrupt.write_all(&1_u32.to_le_bytes()).unwrap();
+        btrfs::send(&template, &sent, &corrupt).unwrap();
         corrupt.sync_all().unwrap();
+        let mut head = [0_u8; 30];
+        std::io::Read::read_exact(&mut File::open(fixture.join("corrupt")).unwrap(), &mut head)
+            .unwrap();
+        assert_eq!(&head[17..30], b"btrfs-stream\0", "second stream must follow the header");
     }
     let destination = fixture.join("destination");
     std::fs::create_dir(&destination).unwrap();
