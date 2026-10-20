@@ -10,7 +10,7 @@ This section covers the [Kind installation](installation.md). Use the explicit `
 
 | Symptom | Check and action |
 |---|---|
-| `required tool not on PATH: kind` or `command not found: tilt` | Complete [Install and verify tools](installation.md#install-and-verify-tools), including the Bash startup configuration and fresh-login check. Bootstrap does not install tools. |
+| `required tool not on PATH: kind` or `command not found: tilt` | Complete [Install and verify tools](installation.md#install-and-verify-tools), including the Bash startup configuration and fresh-login check. The bring-up does not install tools. |
 | Tools work in one terminal but not a new one | Confirm that `$HOME/.local/bin` is on PATH in the new Bash shell. Repeat the startup configuration and fresh-login check in [Install and verify tools](installation.md#install-and-verify-tools); another inline export alone will not fix future logins. |
 | SSH disconnects during a build | Reconnect to the same host and run `tmux attach-session -t space-setup`. Inspect the running command before starting anything else; if you did not use tmux, check whether the original build is still running before retrying. |
 | Running setup from a Mac | Use a Linux x86_64 host with KVM and run the setup there over SSH. Installing the command-line tools on macOS does not satisfy the host requirements. |
@@ -18,9 +18,9 @@ This section covers the [Kind installation](installation.md). Use the explicit `
 | Package installation fails | Install the packages named in the error, or provide root/non-interactive sudo access. Rerun the failed step rather than skipping it. |
 | Pods remain pending or restart | Run the commands below and inspect the first failing pod's events and container logs. Confirm the host supports the required privileged containers and storage operations. |
 | `seed:latest` cannot be resolved | Check `space-seed-publish` logs and completion. The seed must be built and published before sandbox creation. |
-| Login rejects `root@local` | Use the password selected during bootstrap (`password` by default). Confirm bootstrap completed or Tilt's `provision-local-console` resource succeeded; rerunning does not reset an existing password. |
-| API or data plane refuses connections | Check service readiness: `kubectl --context kind-space-local -n space get pods,endpoints,svc` should show ready pods behind `space-api-entry` and `space-data-plane-entry`. localhost reaches them through the cluster's port mappings (`docker port space-local-worker3`); a cluster created before those mappings is refused by bootstrap with the command to recreate it. API reachability does not prove data-plane reachability. |
-| `curl: (52) Empty reply from server` | A replica may have been replaced mid-request, or, for the UI and object storage, a port forward may be reconnecting after its target pod was replaced, including after a smoke test starts Tilt. Check the forwarding logs before changing credentials. |
+| Login rejects `root@local` | Use the password selected before the bring-up (`password` by default). Confirm the bring-up completed and Tilt's `provision-local-console` resource succeeded; rerunning does not reset an existing password. |
+| API or data plane refuses connections | Check service readiness: `kubectl --context kind-space-local -n space get pods,endpoints,svc` should show ready pods behind `space-api-entry` and `space-data-plane-entry`. localhost reaches them through the cluster's port mappings (`docker port space-local-worker3`); a cluster created before those mappings is refused by the bring-up with the command to recreate it. API reachability does not prove data-plane reachability. |
+| `curl: (52) Empty reply from server` | A replica may have been replaced mid-request, or, for the UI and object storage, Tilt's port forward may be reconnecting after Tilt replaced its target pod. Check the forwarding logs before changing credentials. |
 
 ```bash
 kubectl --context kind-space-local -n space get pods
@@ -36,13 +36,12 @@ For an individual pod, use `kubectl --context kind-space-local -n space describe
 
 Sandbox pods (`space-sbx-…`) run in their own namespace, `sandboxes`, not in `space`: list them and their events with `kubectl --context kind-space-local -n sandboxes get pods,events`. NetworkPolicies there admit only the API and cluster-controller on port 9800; `kubectl --context kind-space-local -n sandboxes get networkpolicies` shows them.
 
-For an empty reply, inspect `/tmp/space-local-pf-<service>.log` for `lost connection to pod`, then wait for a new `Forwarding from 127.0.0.1:<port>` message before retrying:
+For an empty reply, inspect the Tilt resource that holds the forward (`space-ui` for port 3000, `space-object-store` for port 8333) for port-forward errors, and wait for its pod to be ready again before retrying:
 
 ```bash
-for log in /tmp/space-local-pf-*.log; do
-  [[ -f "$log" ]] || continue
-  printf '\n== %s ==\n' "$log"
-  tail -n 60 "$log"
+for resource in space-ui space-object-store; do
+  printf '\n== %s ==\n' "$resource"
+  tilt logs "$resource" 2>&1 | grep -i 'port.forward' | tail -n 20
 done
 ```
 

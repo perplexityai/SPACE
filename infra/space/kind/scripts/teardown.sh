@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# teardown.sh — tear down the local kind SPACE stack brought up by bootstrap.sh.
+# teardown.sh — tear down the local kind SPACE stack brought up by up.sh.
 #
 # Steps (best-effort, idempotent, in safe order):
-#   1. Stop the host-side Tilt watcher and scripted port-forwards.
-#   2. Delete the kubernetes resources bootstrap.sh applied (it uses
-#      `helm template | kubectl apply`, so there are no helm releases to
-#      uninstall — the namespace deletes remove everything: the sandbox
-#      namespace first, while the node services its pods' teardown needs
-#      still run, then the control plane's).
-#   3. `kind delete cluster` for the cluster bootstrap.sh created.
+#   1. Stop the host-side Tilt watcher, and any port-forward supervisors the
+#      retired scripted bring-up recorded in its pidfile.
+#   2. Delete the kubernetes resources Tilt applied (it renders each chart
+#      with `helm template`, so there are no helm releases to uninstall — the
+#      namespace deletes remove everything: the sandbox namespace first, while
+#      the node services its pods' teardown needs still run, then the control
+#      plane's).
+#   3. `kind delete cluster` for the cluster the bring-up created.
 #
 # Each step continues on failure so a partially-torn-down stack can always
 # be brought to a clean state. Re-running the script when there's nothing to
@@ -73,7 +74,7 @@ if [[ -s "$PF_PIDFILE" ]]; then
   log "killing port-forwards listed in $PF_PIDFILE"
   while read -r pid; do
     [[ -z "$pid" ]] && continue
-    # Group kill: bootstrap.sh starts each supervisor under `setsid`, so the
+    # Group kill: the scripted bring-up started each supervisor under `setsid`, so the
     # recorded pid leads a group containing the loop and its kubectl child. A
     # plain `kill` takes the loop and leaves the child holding its port, with
     # nothing left tracking it.
@@ -105,8 +106,8 @@ if command -v tilt >/dev/null 2>&1 && command -v curl >/dev/null 2>&1 \
 fi
 
 # ── 2. Workloads (only needed with --keep-cluster) ───────────────────────────
-# bootstrap.sh applies rendered manifests with kubectl (no helm release
-# bookkeeping), so removing the namespace removes every SPACE workload.
+# Tilt applies rendered manifests (no helm release bookkeeping), so removing
+# the namespace removes every SPACE workload.
 # When the cluster is being deleted anyway, skip this — `kind delete
 # cluster` is faster than waiting for a graceful namespace drain.
 if (( KEEP_CLUSTER )) && kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER"; then

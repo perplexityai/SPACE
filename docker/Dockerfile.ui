@@ -26,7 +26,7 @@ ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
 
 # Same build-time bake for the data-plane rewrite (process stream events
 # + session attach/proxy URLs). Default preserves the historical localhost
-# behavior; the kind build-images.sh passes `http://space-data-plane:8090`
+# behavior; the kind Tiltfile passes `http://space-data-plane:8090`
 # so the in-cluster UI pod's rewrite resolves via Service DNS without the
 # browser ever crossing origins.
 ARG NEXT_PUBLIC_DATA_PLANE_URL=http://localhost:8090

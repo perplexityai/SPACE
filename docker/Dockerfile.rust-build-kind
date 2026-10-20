@@ -14,7 +14,7 @@
 # `chef-base` stage (built by the caller as SPACE_RUST_CHEF_IMAGE), the bin and
 # feature lists below are the union of the production sets' lists, and the
 # planner/build-context COPY sets match the production stages. Only LTO is off,
-# as build-images.sh and the Tiltfile already chose for local images, and
+# as the Tiltfile already chose for local images, and
 # every crate's `test-hooks` feature is on so the test-only environment
 # overrides the Kind charts set take effect (production images never enable it). Keep the
 # lists in step with Dockerfile.rust-build-common when a set changes.

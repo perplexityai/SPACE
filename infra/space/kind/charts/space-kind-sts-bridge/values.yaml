@@ -45,7 +45,7 @@ audience: kind-sts-bridge
 upstream: https://object-store-iam:7070/
 upstreamCaSecretName: space-internal-rpc-ca
 
-# Set by every bring-up path to the checksum sts-bridge-secret.sh prints, so a
+# Set by the Tiltfile to the checksum sts-bridge-secret.sh prints, so a
 # reissued Secret rolls the bridge.
 storageExchange:
   secretChecksum: ""

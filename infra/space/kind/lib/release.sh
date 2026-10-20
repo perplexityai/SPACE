@@ -52,8 +52,8 @@ release_init() {
   # The space-kind-telemetry OTLP endpoints resolve these namespaces by name;
   # they move in the same commit as this.
   owner=$name
-  # bootstrap.sh and the Tiltfile both support a non-default bench through
-  # SPACE_KIND_CLUSTER, and they now invoke these helpers automatically. The
+  # The bring-up supports a non-default bench through SPACE_KIND_CLUSTER, and
+  # the Tiltfile invokes these helpers automatically. The
   # identity checks follow that selection instead of assuming space-local.
   cluster=${SPACE_KIND_CLUSTER:-space-local}
   control_plane=$cluster-control-plane

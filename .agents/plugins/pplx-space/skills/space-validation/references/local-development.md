@@ -1,8 +1,9 @@
 
 # Develop SPACE locally
 
-Keep `infra/space/kind/scripts/bootstrap.sh` and the installation guide aligned
-whenever a service is added, removed, or the local architecture changes materially.
+Keep the `Tiltfile` (the Kind bring-up, which `infra/space/kind/scripts/up.sh`
+starts) and the installation guide aligned whenever a service is added,
+removed, or the local architecture changes materially.
 
 Follow `CONTRIBUTING.md` for the development entry points and
 `docs/installation.md` for the Linux/KVM runtime prerequisites. See
@@ -27,8 +28,8 @@ Follow `CONTRIBUTING.md` for the development entry points and
 
 ## Local runtime
 
-Follow `docs/installation.md` to install prerequisites, bootstrap the Kind
-cluster, and start Tilt. Use `infra/space/kind/README.md` for the ongoing
+Follow `docs/installation.md` to install prerequisites and bring the Kind stack
+up with `infra/space/kind/scripts/up.sh`, which starts Tilt. Use `infra/space/kind/README.md` for the ongoing
 development loop and `docs/troubleshooting.md` for inspection and recovery.
 Direct-node deployments require operator-supplied provisioning and service
 management; this repository does not provide a direct-deployment command.

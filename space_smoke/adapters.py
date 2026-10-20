@@ -629,7 +629,7 @@ TEMPLATE_CACHE_OWNER = "space-tmplmgr"
 TEMPLATE_CACHE_GROUP = "space-cache-rw"
 KIND_SANDBOX_NODE_SELECTOR = "space.pplx.net/node-pool=sandbox"
 # The query API of each local observability backend, on the localhost port
-# both bring-up paths forward to it in `otel` mode.
+# the Tiltfile forwards to it in `otel` mode.
 KIND_TELEMETRY_BACKENDS = {
     "prometheus": "http://127.0.0.1:19090",
     "tempo": "http://127.0.0.1:13200",

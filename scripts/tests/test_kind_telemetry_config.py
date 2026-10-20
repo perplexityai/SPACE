@@ -443,7 +443,7 @@ def test_invalid_configuration_rejected_before_bootstrap_mutates(key, value, tmp
         key: value,
     }
     result = subprocess.run(
-        ["bash", str(KIND_DIR / "scripts/bootstrap.sh"), "--skip-images"],
+        ["bash", str(KIND_DIR / "scripts/up.sh")],
         env=env,
         capture_output=True,
         text=True,

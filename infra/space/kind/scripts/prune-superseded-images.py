@@ -14,7 +14,8 @@ An image is removed only when all of these hold:
 
 * it belongs to one of those repositories: every tag and digest it carries
   names one, or, untagged, its `org.opencontainers.image.title` label does;
-* no current reference names it: the `<name>:local` refs build-images.sh loads,
+* no current reference names it: the `<name>:local` refs (the retired scripted
+  bring-up loaded its builds under them),
   every image a workload in the cluster references (pods, their controllers,
   Jobs and CronJobs, the rendered charts as applied), and every image the Tilt
   serving this cluster last built;
@@ -37,7 +38,7 @@ stopping the pass as soon as Tilt has begun one. The sizes it logs are what
 content; the unpacked layers free more, and layers a kept build shares stay.
 
 Usage:
-  prune-superseded-images.py                  # one pass (bootstrap.sh)
+  prune-superseded-images.py                  # one pass
   prune-superseded-images.py --dry-run        # report only
   prune-superseded-images.py --watch 30 \\
       --tilt-resource prune-superseded-images  # the Tiltfile's resource

@@ -232,7 +232,7 @@ def test_superseded_selection():
 @pytest.mark.parametrize(
     "kept, why",
     [
-        (1, "the :local tag build-images.sh loads"),
+        (1, "a :local tag"),
         (3, "the tag a DaemonSet deploys"),
         (6, "untagged, but a container uses it"),
         (7, "the seed publisher no container runs right now"),
@@ -470,7 +470,7 @@ def test_opt_out(monkeypatch, capsys):
     assert f"{prune.OPT_OUT}=0" in capsys.readouterr().out
 
 
-# ── The image list matches what both bring-up paths build ───────────────────
+# ── The image list matches what the Tiltfile builds ─────────────────────────
 
 
 def test_tiltfile_builds_exactly_the_listed_images():
@@ -482,9 +482,9 @@ def test_tiltfile_builds_exactly_the_listed_images():
 
 def test_each_listed_image_carries_its_title_label():
     # The only way an untagged build is recognized as one of these images.
-    build_images = (KIND_DIR / "scripts/build-images.sh").read_text()
+    tiltfile = (ROOT / "Tiltfile").read_text()
     titles = set()
-    for dockerfile in set(re.findall(r"docker/Dockerfile\.[a-z0-9-]+", build_images)):
+    for dockerfile in set(re.findall(r"docker/Dockerfile\.[a-z0-9-]+", tiltfile)):
         titles |= set(
             re.findall(
                 r'LABEL org\.opencontainers\.image\.title="([^"]+)"',
@@ -688,8 +688,8 @@ def test_host_kept(kept, why):
 
 
 def test_host_without_tilt_keeps_the_newest_build_as_the_previous_one():
-    # bootstrap.sh's pass: `:local` is current, so the last Tilt build of
-    # each image is the previous one.
+    # A pass no Tilt answers for: `:local` is current, so the last Tilt build
+    # of each image is the previous one.
     removed = host_selected()
     assert image_id(1) not in removed
     assert image_id(2) in removed

@@ -73,7 +73,7 @@ grep -q '30080/tcp 127.0.0.1 8080' "$work/output" \
 STUB_PUBLISHED="$api_port" check 1 "no entry mappings"
 grep -q '30090/tcp 127.0.0.1 8090' "$work/output" \
     || fail "the refusal names every missing mapping" "$(cat "$work/output")"
-grep -q 'bash infra/space/kind/scripts/bootstrap.sh' "$work/output" \
+grep -q 'bash infra/space/kind/scripts/up.sh' "$work/output" \
     || fail "the port refusal prints the recreate commands" "$(cat "$work/output")"
 
 # Case 4.

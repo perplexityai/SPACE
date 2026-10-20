@@ -10,7 +10,7 @@
 # own DaemonSet. Applying the new charts beside the old pod would run two
 # node-managers, sandbox-managers and supervisors over the same /space/run and
 # /space/cache, and the old pod's VMs cannot move to the node's supervisor, so
-# every bring-up path stops here instead and the operator recreates the
+# the bring-up stops here instead and the operator recreates the
 # cluster once. See "Upgrading from the node-stack layout" in
 # infra/space/kind/README.md.
 #
@@ -51,9 +51,9 @@ env_prefix=""
 
 recreate_remedy() {
   printf '         %sbash infra/space/kind/scripts/teardown.sh\n' "$env_prefix"
-  printf '         %sbash infra/space/kind/scripts/bootstrap.sh\n' "$env_prefix"
-  printf '       (or re-run the smoke suite, which creates the cluster itself; Tilt\n'
-  printf '       users then run "tilt up"). Nothing was changed.'
+  printf '         %sbash infra/space/kind/scripts/up.sh\n' "$env_prefix"
+  printf '       (or re-run the smoke suite, which creates the cluster itself).\n'
+  printf '       Nothing was changed.'
 }
 
 if [[ -n "$legacy" ]]; then

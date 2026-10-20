@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Reconcile the selected Kind profile without deleting backend data.
 #
-# Both supported bring-up paths call this before producer changes: bootstrap.sh
-# and Tiltfile evaluation. The local node-side endpoints use fixed ClusterIPs,
+# Tiltfile evaluation calls this before producer changes. The local node-side
+# endpoints use fixed ClusterIPs,
 # so already-running exporters reconnect if a backend is later reinstalled.
 #
 # Each helper is idempotent and refuses any cluster but the selected bench.

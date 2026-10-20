@@ -14,7 +14,7 @@ spec:
       annotations:
         # The one input from outside this template: the bridge Secret, whose
         # issuer CA thumbprint the provider pins. A reissue makes a new Job
-        # spec, which both bring-up paths rerun, as a changed provider, role
+        # spec, which Tilt reruns, as a changed provider, role
         # or policy setting below does.
         checksum/sts-bridge-secret: {{ .Values.storageExchange.secretChecksum | quote }}
       labels:

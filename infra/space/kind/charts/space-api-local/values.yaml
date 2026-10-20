@@ -307,8 +307,8 @@ byokVolumeEncryption: "1"
 # either way — so what the bench buys is the query executing. The discount
 # itself is `node_drain/store/residency_tests.rs`, against real Postgres.
 #
-# On this bench api and cluster-controller are separate chart renders — via
-# `bootstrap.sh`'s `helm template | kubectl apply` or via Tilt — so one cannot
+# On this bench api and cluster-controller are separate chart renders (Tilt's
+# `helm template` of each), so one cannot
 # read the other's values the way the EKS chart has both containers render
 # from the controller's own key. Nothing in Helm can stop these two from drifting;
 # `scripts/tests/test_node_drain_activation_parity.py` is what holds them

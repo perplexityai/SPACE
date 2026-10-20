@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 #
-# Shared idempotent bootstrap for the local KinD + Tilt SPACE stack.
-# Sourced by `smoke-kind-e2e.sh`, and by the harness tests
-# `test-kind-port-forward-parity.sh`, `test-kind-stale-tilt-recovery.sh`, and
-# `test-kind-tombstone-sweep.sh`.
+# Shared idempotent bootstrap for the local KinD + Tilt SPACE stack, the only
+# Kind bring-up. Sourced by `infra/space/kind/scripts/up.sh` (the documented
+# command), `infra/space/kind/scripts/prepare-cluster.sh`, `smoke-kind-e2e.sh`,
+# and by the harness tests `test-kind-localhost-ports.sh`,
+# `test-kind-stale-tilt-recovery.sh`, and `test-kind-tombstone-sweep.sh`.
 #
 # Contract: after `bootstrap_kind_stack` returns successfully, the kind
 # cluster `$KIND_CLUSTER` exists, and — when docker is on PATH and the host
@@ -23,8 +24,8 @@
 # checked too, unless Tilt still has an update pending), (when DATA_PLANE_URL is
 # supplied) the public data plane is reachable, and no node carries a
 # tombstone contradicted by kube. A Tilt build that fails ends the bring-up
-# with that resource's log instead of consuming the timeout; a Tilt bound to a
-# deleted cluster is restarted.
+# with that resource's log instead of consuming the timeout, as does a failed
+# space-db-migrate Job; a Tilt bound to a deleted cluster is restarted.
 #
 # Public entry points: `bootstrap_kind_stack`, `kind_stack_prepare_cluster`,
 # `kind_stack_recheck_for_scenario` for each scenario of a suite whose runner
@@ -541,6 +542,21 @@ bootstrap_kind_stack__check_live_provenance() {
     bootstrap_kind_stack__check_provenance
 }
 
+# The space-db-migrate Job makes one attempt (backoffLimit 0) and gates the
+# api-server, so once it has failed nothing the API wait waits for can arrive.
+bootstrap_kind_stack__die_on_failed_migration() {
+    local conditions
+    conditions="$(kubectl --context "kind-${KIND_CLUSTER}" -n space get job space-db-migrate \
+        -o jsonpath='{range .status.conditions[?(@.status=="True")]}{.type}{" "}{end}' 2>/dev/null)" \
+        || return 0
+    [[ " $conditions " == *" Failed "* ]] || return 0
+    echo "ERROR: the space-db-migrate Job failed, so the api-server cannot start. Its logs:" >&2
+    kubectl --context "kind-${KIND_CLUSTER}" -n space logs job/space-db-migrate \
+        --all-containers --prefix --tail=50 >&2 || true
+    echo "       Fix the cause, then 'tilt trigger space-db-migrate' to run it again." >&2
+    exit 1
+}
+
 bootstrap_kind_stack__wait_for_api() {
     local deadline=$(( $(date +%s) + BOOTSTRAP_TIMEOUT ))
     local last_log_at=0
@@ -549,6 +565,7 @@ bootstrap_kind_stack__wait_for_api() {
             return 0
         fi
         bootstrap_kind_stack__die_on_failed_builds
+        bootstrap_kind_stack__die_on_failed_migration
         local now
         now=$(date +%s)
         if (( now - last_log_at >= 15 )); then
@@ -691,8 +708,9 @@ bootstrap_kind_stack__kill_stale_tilt() {
 
 # Stop stale `kubectl port-forward` supervisors (and their kubectl children)
 # that a previous bring-up of THIS kind context left behind and no pidfile
-# names. bootstrap.sh starts each supervisor as
-# `setsid bash port-forward.sh <ctx> <ns> <target> <mapping> space-kind-pf:<ctx>`
+# names. Each supervisor (the Tiltfile's observability forwards, and those
+# the retired scripted bring-up left under `setsid`) runs as
+# `bash port-forward.sh <ctx> <ns> <target> <mapping> space-kind-pf:<ctx>`
 # — the label is deliberately its LAST argument — and the loop's kubectl child
 # carries `--context <ctx> … port-forward`. Both are matched on the process's
 # own command line, anchored: the label at the end, `kubectl` as the command.
@@ -871,8 +889,8 @@ kind_stack_assert_cluster_mounts() {
     # nothing to compare and no honest verdict to give. Skip loudly rather
     # than fail: before this check existed, SKIP_BOOTSTRAP=1 read $HOME
     # nowhere, and turning an unevaluable comparison into a hard error would
-    # break every kind suite on a box that never needed one.
-    # `bootstrap.sh`, which actually creates clusters, still requires them.
+    # break every kind suite on a box that never needed one. Creating a
+    # cluster, below, still requires them.
     if [[ -z "${SPACE_VENDOR_ROOT:-}" || -z "${SPACE_KIND_DATA_ROOT:-}" ]]; then
         echo "[bootstrap] host roots not derivable (no HOME and no explicit" \
             "SPACE_VENDOR_ROOT/SPACE_KIND_DATA_ROOT); skipping the live-cluster" \
@@ -1013,14 +1031,12 @@ kind_stack_prepare_cluster() {
 
 bootstrap_kind_stack__prepare_cluster() {
     # `kind create` reads static YAML, so the host paths it bind-mounts are
-    # resolved and stamped in here the same way
-    # `infra/space/kind/scripts/bootstrap.sh` does it — including staging the
-    # vendor tree, because `kind_prepare_host_mounts` refuses a missing one and
-    # this suite is documented as self-bootstrapping.
+    # resolved and stamped in here — including staging the vendor tree, because
+    # `kind_prepare_host_mounts` refuses a missing one and this bring-up is
+    # documented as self-bootstrapping.
     # shellcheck source=../../../infra/space/kind/scripts/lib/kind-host-paths.sh
     source "$REPO_ROOT/infra/space/kind/scripts/lib/kind-host-paths.sh"
-    # Process-private, not the shared $SPACE_KIND_CONFIG, and for the same
-    # reason `bootstrap.sh` renders to `$SPACE_KIND_CONFIG.$$`: the vendor
+    # Process-private, not the shared $SPACE_KIND_CONFIG: the vendor
     # staging below can take a minute, and `kind create` reads this file
     # afterwards. Rendering into the shared per-user path leaves a window in
     # which another bring-up on the same box replaces it, and this cluster is
@@ -1028,10 +1044,9 @@ bootstrap_kind_stack__prepare_cluster() {
     # every mount it declares exists. Two bootstraps racing on one devbox is
     # the normal contended case, not a hypothetical.
     #
-    # Nothing publishes from here: `bootstrap.sh` and
-    # `infra/space/kind/scripts/render-cluster-config.sh` own the documented
-    # path, and a test library adding itself as a second writer to it is what
-    # created the window in the first place.
+    # Nothing publishes from here: `infra/space/kind/scripts/render-cluster-config.sh`
+    # owns the documented path, for the manual render-and-create flow, and a
+    # second writer to it is what created the window in the first place.
     # In $TMPDIR and reaped explicitly below, not by an EXIT trap: the smoke
     # scripts that source this library each install their own `trap cleanup
     # EXIT`, which deletes sandboxes and clusters, and a trap set here would
@@ -1044,8 +1059,8 @@ bootstrap_kind_stack__prepare_cluster() {
     kind_stack_config="$(mktemp "${TMPDIR:-/tmp}/kind-cluster-bringup.XXXXXX")"
     kind_render_cluster_config \
         "$REPO_ROOT/infra/space/kind/kind-cluster.yaml.tmpl" "$kind_stack_config"
-    # Staged unless the tree lacks this Firecracker release or the pinned
-    # guest kernel, as bootstrap.sh decides.
+    # Staged unless the tree already holds this Firecracker release and the
+    # pinned guest kernel.
     if ! SPACE_VENDOR_ROOT="$SPACE_VENDOR_ROOT" \
         bash "$REPO_ROOT/infra/space/kind/scripts/install-fc-vendor.sh" --check; then
         echo "[bootstrap] staging Firecracker vendor tree → $SPACE_VENDOR_ROOT"

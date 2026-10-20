@@ -41,7 +41,7 @@ or the builder node-api's service name and build-manager endpoint.
 
 The `space-db-migrate` Job is not part of either release.
 `install.sh` renders it from `space-api-local` and runs it to completion before
-the releases, as `bootstrap.sh` does. A Job's pod template is immutable, so
+the releases, as the Kind harness does. A Job's pod template is immutable, so
 each run replaces the previous Job.
 
 Not installed: the Kind key broker, Postgres, the object store, Redis, the UI,

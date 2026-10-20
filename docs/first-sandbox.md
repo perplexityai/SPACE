@@ -8,7 +8,7 @@ Create a sandbox, run a command, collect its output, and delete it through the S
 
 ## Prepare your environment
 
-Complete [Install and configure locally](installation.md), including authentication. Run the example from the repository root on the same Linux host, with Python 3.8 or newer. It uses the guide's Kind deployment, API and data-plane port forwards, and published `seed:latest` template.
+Complete [Install and configure locally](installation.md), including authentication. Run the example from the repository root on the same Linux host, with Python 3.8 or newer. It uses the guide's Kind deployment, its API and data-plane ports (8080 and 8090, which the cluster maps to loopback), and the published `seed:latest` template.
 
 The installation exports `SPACE_API_URL`, `SPACE_DATA_PLANE_URL`, and `SPACE_API_TOKEN`. Python inherits them from the shell; if you opened a new terminal, repeat the configuration and authentication steps first. `SPACE_TEMPLATE` defaults to `seed:latest`.
 

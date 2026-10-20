@@ -28,7 +28,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 KIND_DIR = REPO_ROOT / "infra/space/kind"
 TEMPLATE = KIND_DIR / "kind-cluster.yaml.tmpl"
 LIB = KIND_DIR / "scripts/lib/kind-host-paths.sh"
-BOOTSTRAP = KIND_DIR / "scripts/bootstrap.sh"
 INSTALL_FC_VENDOR = KIND_DIR / "scripts/install-fc-vendor.sh"
 SMOKE_BOOTSTRAP = REPO_ROOT / "scripts/tests/lib/bootstrap-kind-stack.sh"
 
@@ -766,8 +765,8 @@ class LiveClusterMountTests(unittest.TestCase):
         """A reused cluster with no extraMounts at all must not be accepted.
 
         The source comparison can only disagree with a mount that exists, so
-        this cluster passed it untouched and `bootstrap.sh` skipped creation —
-        failing two minutes later in `apply_node_labels`, blaming labels for a
+        this cluster passed it untouched and the bring-up skipped creation —
+        failing minutes later, blaming whatever first needed a mount, for a
         cluster that simply was not built from this config.
         """
         result = run_bash(
@@ -786,7 +785,7 @@ class LiveClusterMountTests(unittest.TestCase):
 
     def test_no_docker_on_path_is_not_a_failure(self) -> None:
         # A box without docker must not fail here: the check has nothing to
-        # inspect, and `bootstrap.sh` already refuses an unreachable daemon
+        # inspect, and the bring-up already fails on an unreachable daemon
         # with a message about that. PATH carries bash alone, since with
         # docker absent the function runs only shell builtins.
         bash = shutil.which("bash")
@@ -1268,7 +1267,7 @@ class InstallerAgreementTests(unittest.TestCase):
     """The writer and the mount have to resolve to one directory.
 
     This is the acceptance criterion the issue names, checked without a
-    cluster: stage the vendor tree the way `bootstrap.sh` does under a
+    cluster: stage the vendor tree the way the bring-up does under a
     non-`dev` home, then read the rendered config and confirm the tree landed
     at the path the workers will mount.
     """
@@ -1330,7 +1329,7 @@ class InstallerAgreementTests(unittest.TestCase):
         self.assertEqual(len(vendor_mounts), 1, "one vendor root drives every node")
         mounted = Path(vendor_mounts.pop())
 
-        # The exact predicate bootstrap.sh gates staging on, applied to the
+        # The exact predicate the bring-up gates staging on, applied to the
         # path the workers read. Before the fix it was false here and true
         # nowhere, so the installer re-ran on every invocation and the workers
         # mounted an empty directory.
@@ -2038,7 +2037,7 @@ class RenderWrapperTests(unittest.TestCase):
         tree and reuses the path from their scrollback would otherwise build
         from the render that preceded the fix. And nothing already there may be
         removed: deleting it on failure, which is what the earlier EXIT trap
-        did, could take out the config a `bootstrap.sh` in a sibling worktree
+        did, could take out the config a bring-up in a sibling worktree
         had just rendered and not yet handed to `kind create`.
         """
         tmp = Path(os.environ.get("TMPDIR", "/tmp"), f"kind-wrapper-{os.getpid()}")
@@ -2264,9 +2263,7 @@ class BringUpConfigPrivacyTests(unittest.TestCase):
 
         `$SPACE_KIND_CONFIG` is per-user, not per-run, so a sibling bring-up
         rendering its roots into it between this run's render and its create
-        is the whole failure. `bootstrap.sh` renders to
-        `$SPACE_KIND_CONFIG.$$` for the same reason, and this path is the one
-        the smoke suites take.
+        is the whole failure. This path is the one every bring-up takes.
 
         Non-vacuous by construction: `drive_bring_up` fails the test if no
         rendered config was named at all, so "not the shared path" cannot pass

@@ -129,7 +129,7 @@ storageExchange:
   roleName: kind-storage-vend
   maxSessionDuration: 3600
   bridgeSecretName: space-kind-sts-bridge
-  # Set by every bring-up path to the checksum sts-bridge-secret.sh prints,
+  # Set by the Tiltfile to the checksum sts-bridge-secret.sh prints,
   # so a reissued issuer CA reruns the bucket-init Job (and only it).
   secretChecksum: ""
 

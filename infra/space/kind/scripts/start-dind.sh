@@ -19,7 +19,7 @@
 # Then in your shell (and in any script that needs to talk to this daemon):
 #   export DOCKER_HOST=unix:///run/docker-kind.sock
 #
-# bootstrap.sh inherits DOCKER_HOST from the calling env. kind / docker / docker
+# up.sh, and the Tilt it starts, inherit DOCKER_HOST from the calling env. kind / docker / docker
 # buildx CLIs all honor DOCKER_HOST.
 set -euo pipefail
 

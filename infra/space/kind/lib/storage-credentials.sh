@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # storage-credentials.sh — how the Kind harness's node services get
 # object-store credentials, selected by SPACE_KIND_STORAGE_CREDENTIALS for
-# every bring-up path (the Tiltfile, bootstrap.sh and the smoke bring-up):
+# the Tiltfile and the bring-up that starts it:
 #
 #   exchange  (default) as deployed: volume-manager on sandbox workers and
 #             builders, and the builders' build-manager, hold no object-store

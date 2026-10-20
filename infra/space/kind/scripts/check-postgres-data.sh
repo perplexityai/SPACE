@@ -10,7 +10,7 @@
 # keeps running without TLS, so the harness's sslmode=require psql fails. The
 # role setup the pod's init script provides (templates/configmap.yaml) runs
 # only when the image initializes an empty data directory, so the database is
-# reset rather than upgraded in place. Every bring-up path stops here instead.
+# reset rather than upgraded in place. The bring-up stops here instead.
 # See "Recovering from an unbundled migration version" in
 # infra/space/kind/README.md.
 #
@@ -86,10 +86,10 @@ env_prefix=""
   printf '         %s delete pvc %s\n' "$kctl" "$PVC"
   printf '         %s delete job space-db-migrate space-seed-publish --ignore-not-found\n' "$kctl"
   printf '       then bring the stack up from this checkout again:\n'
-  printf '         %sbash infra/space/kind/scripts/bootstrap.sh\n' "$env_prefix"
-  printf '       (or re-run the smoke suite without SKIP_BOOTSTRAP, or "tilt up"; a Tilt\n'
-  printf '       that is already running reloads with: tilt trigger "(Tiltfile)").\n'
-  printf '       Recreating the cluster (teardown.sh, then bootstrap.sh) also works.\n'
+  printf '         %sbash infra/space/kind/scripts/up.sh\n' "$env_prefix"
+  printf '       (or re-run the smoke suite without SKIP_BOOTSTRAP; a Tilt that is\n'
+  printf '       already running reloads with: tilt trigger "(Tiltfile)").\n'
+  printf '       Recreating the cluster (teardown.sh, then up.sh) also works.\n'
   printf '       Nothing was changed. See "Recovering from an unbundled migration\n'
   printf '       version" in infra/space/kind/README.md.\n'
 } >&2

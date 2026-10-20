@@ -2187,7 +2187,7 @@ class TelemetryBackendControl(Protocol):
 
     Prometheus (`space-metrics`), Tempo (`space-traces`) and Loki
     (`space-logs`) are read through their own HTTP query APIs, on the localhost
-    ports both bring-up paths forward to them.
+    ports the Tiltfile forwards to them.
     """
 
     def telemetry_query(self, backend: str, path: str, params: Mapping[str, str]) -> Any:

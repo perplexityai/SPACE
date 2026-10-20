@@ -1,9 +1,9 @@
 # Template for the `space-local` kind cluster config. Not consumable by
 # `kind create` as it stands: the `${...}` host paths are substituted by
 # `infra/space/kind/scripts/lib/kind-host-paths.sh`, which writes the result to
-# $SPACE_KIND_CONFIG (default ~/.space-devbox/kind/kind-cluster.yaml) and is
-# what both bring-up paths — `scripts/bootstrap.sh` and the smoke suites'
-# `scripts/tests/lib/bootstrap-kind-stack.sh` — pass to `kind create`.
+# $SPACE_KIND_CONFIG (default ~/.space-devbox/kind/kind-cluster.yaml), or to
+# the bring-up's private copy that `scripts/tests/lib/bootstrap-kind-stack.sh`
+# (behind `scripts/up.sh` and the smoke suites) passes to `kind create`.
 #
 # The host paths are rendered rather than written here because `kind create`
 # expands nothing, so a literal path would name one machine's layout: these

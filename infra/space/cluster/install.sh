@@ -195,7 +195,7 @@ if [[ $obs_available == true ]]; then
   helm upgrade --install "${obs_args[@]}" --kube-context "$context" --wait --timeout "$timeout"
 fi
 
-# Migrations, as bootstrap.sh runs them: once, before any API replica. A Job's
+# Migrations, as the Kind harness runs them: once, before any API replica. A Job's
 # pod template is immutable, so the previous run's Job is replaced.
 log "running space-db-migrate"
 k -n "$namespace" delete job space-db-migrate --ignore-not-found >/dev/null
