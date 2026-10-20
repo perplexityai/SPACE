@@ -34,7 +34,10 @@ execution metadata.
 - Execution and daemon constructors now return typed errors. Missing worker
   configuration fails construction; incompatible worker protocols fail startup
   without dispatching filesystem operations. IdentityWorkers on non-Linux returns
-  an error; Direct remains the non-Linux default.
+  an error; Direct remains the non-Linux default. The daemon validates its
+  executable during construction: an unreadable or invalid `/proc/self/exe`
+  intentionally fails startup before readiness, rather than deferring that
+  failure to the first filesystem request.
 - Linux identity workers require the daemon's privilege to install the requested
   OS account's groups and IDs; an unprivileged worker host is unsupported. Direct mode
   runs filesystem syscalls with the daemon's credentials; its `user` selects path

@@ -320,6 +320,14 @@ impl SpacedGuestService {
         Self::with_config(shutdown, SpacedGuestServiceConfig::default())
     }
 
+    /// Construct the daemon and select its worker artifact before serving requests.
+    ///
+    /// # Errors
+    ///
+    /// Linux identity mode returns an error if `/proc/self/exe` cannot be opened
+    /// or validated. This intentionally fails daemon startup before readiness,
+    /// rather than accepting a guest whose first filesystem request cannot launch
+    /// a worker. Unsupported execution configurations also return an error.
     pub fn with_config(
         shutdown: CancellationToken,
         config: SpacedGuestServiceConfig,
