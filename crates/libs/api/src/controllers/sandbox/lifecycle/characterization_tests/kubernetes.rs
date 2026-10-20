@@ -254,29 +254,38 @@ async fn wake_refuses_teardown_and_terminal_lifecycles_before_admission() -> Tes
     let pool = &db.pool;
     let controller = kubernetes_controller_with_empty_cluster_admission(pool);
 
-    let variants = SandboxLifecycle::all().iter().map(|lifecycle| {
-        let refusal = match lifecycle {
-            SandboxLifecycle::Stopping
-            | SandboxLifecycle::Stopped
-            | SandboxLifecycle::Deleting
-            | SandboxLifecycle::Quarantined
-            | SandboxLifecycle::Failed => WakeRefusal::EntryGuard,
-            SandboxLifecycle::Created
-            | SandboxLifecycle::Restoring
-            | SandboxLifecycle::Suspended => WakeRefusal::Admission,
-            SandboxLifecycle::Suspending => WakeRefusal::SuspendInFlight,
-            SandboxLifecycle::Creating
-            | SandboxLifecycle::Starting
-            | SandboxLifecycle::Started
-            | SandboxLifecycle::Pausing
-            | SandboxLifecycle::Paused
-            | SandboxLifecycle::Resuming
-            | SandboxLifecycle::Checkpointing => WakeRefusal::PodCreate,
+    let stored = StoredSandboxLifecycle::all().iter().map(|stored| {
+        let refusal = match stored {
+            StoredSandboxLifecycle::Live(
+                SandboxLifecycle::Stopping
+                | SandboxLifecycle::Stopped
+                | SandboxLifecycle::Deleting
+                | SandboxLifecycle::Quarantined
+                | SandboxLifecycle::Failed,
+            )
+            | StoredSandboxLifecycle::Deleted
+            | StoredSandboxLifecycle::CleanupRequired => WakeRefusal::EntryGuard,
+            StoredSandboxLifecycle::Live(
+                SandboxLifecycle::Created
+                | SandboxLifecycle::Restoring
+                | SandboxLifecycle::Suspended,
+            ) => WakeRefusal::Admission,
+            StoredSandboxLifecycle::Live(SandboxLifecycle::Suspending) => {
+                WakeRefusal::SuspendInFlight
+            }
+            StoredSandboxLifecycle::Live(
+                SandboxLifecycle::Creating
+                | SandboxLifecycle::Starting
+                | SandboxLifecycle::Started
+                | SandboxLifecycle::Pausing
+                | SandboxLifecycle::Paused
+                | SandboxLifecycle::Resuming
+                | SandboxLifecycle::Checkpointing,
+            ) => WakeRefusal::PodCreate,
         };
-        (lifecycle.as_str(), refusal)
+        (stored.as_str(), refusal)
     });
-    let non_variants = NON_VARIANT_LIFECYCLES.map(|lifecycle| (lifecycle, WakeRefusal::EntryGuard));
-    for (lifecycle, refusal) in variants.chain(non_variants) {
+    for (lifecycle, refusal) in stored {
         for action in [
             SandboxAction::Wake,
             SandboxAction::ImplicitWake(ExecutionActivityKind::Access),
@@ -709,7 +718,7 @@ async fn completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight() ->
         // guard families treat as terminal.
         let terminal = ["failed", "quarantined"]
             .into_iter()
-            .chain(NON_VARIANT_LIFECYCLES)
+            .chain(StoredSandboxLifecycle::tombstones_as_str())
             .map(Some);
         for landed in [None].into_iter().chain(terminal) {
             let case = format!("{action:?} with {landed:?} landed {landing:?}");
@@ -1487,11 +1496,7 @@ async fn redrive_completes_only_a_restoring_row() -> TestResult {
     let db = pg_test_db_with_max_connections(2).await?;
     let pool = &db.pool;
 
-    let lifecycles = SandboxLifecycle::all()
-        .iter()
-        .map(|lifecycle| lifecycle.as_str())
-        .chain(NON_VARIANT_LIFECYCLES);
-    for lifecycle in lifecycles {
+    for lifecycle in StoredSandboxLifecycle::all_as_str() {
         for routable in [true, false] {
             let sandbox_id = SandboxId::new();
             insert_sandbox(pool, sandbox_id, lifecycle, "k8s").await?;

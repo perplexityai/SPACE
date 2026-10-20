@@ -10,10 +10,12 @@ use super::*;
 
 use pplx_space_test_env::TestResult;
 
+mod cleanup_recovery_lifecycle_matrix_tests;
 mod lifecycle_writer_tests;
 mod stopped_evacuation_claim_tests;
 mod stopped_restore_selector_tests;
 mod substrate_scope_tests;
+mod suspend_lifecycle_matrix_tests;
 use stopped_evacuation_claim_tests::{
     a_fresh_stopped_claim_is_not_rolled_back_on_a_clean_failure,
     evacuation_claim_takes_only_a_released_stopped_evacuation,

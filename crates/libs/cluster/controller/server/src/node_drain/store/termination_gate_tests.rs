@@ -18,6 +18,7 @@
 use pplx_space_common_core::types::{NodeId, SandboxId};
 
 use pplx_space_common_svc::sql::sandbox_residency::CENSUS_PLACEMENT_SETTLE;
+use pplx_space_placement::StoredSandboxLifecycle;
 
 use crate::drained_node_terminator::store::mark_terminating_query;
 
@@ -64,9 +65,9 @@ fn counted_by(lifecycle: SandboxLifecycle) -> CountedBy {
     }
 }
 
-/// Lifecycle strings `sandboxes.lifecycle` can hold that the
-/// `SandboxLifecycle` enum does not model, so `SandboxLifecycle::all()` cannot
-/// reach them:
+/// The stored values the `SandboxLifecycle` enum does not model, which
+/// `StoredSandboxLifecycle::all` sweeps after its variants. Wildcard-free over
+/// the stored vocabulary, so a new tombstone fails to compile here too.
 ///
 /// * `deleted` — a real tombstone value, written by raw SQL in the internal
 ///   API's status handler and pruned later by `tombstone_retention`. It has to
@@ -75,14 +76,20 @@ fn counted_by(lifecycle: SandboxLifecycle) -> CountedBy {
 /// * `cleanup_required` — a node-local sandbox-manager state. Nothing writes it
 ///   to this column, but the terminator's guard excludes it, so the exclusion
 ///   is exercised rather than argued.
-/// * `cleanup_failed` — stands in for *any* value neither list knows. An
-///   exclusion list is fail-closed for those: it counts them, so an unmodelled
-///   lifecycle holds the node instead of silently releasing it.
-const UNMODELLED_LIFECYCLES: &[(&str, CountedBy)] = &[
-    ("deleted", CountedBy::NeitherGate),
-    ("cleanup_required", CountedBy::NeitherGate),
-    ("cleanup_failed", CountedBy::TerminatorOnly),
-];
+fn stored_counted_by(stored: StoredSandboxLifecycle) -> CountedBy {
+    match stored {
+        StoredSandboxLifecycle::Live(lifecycle) => counted_by(lifecycle),
+        StoredSandboxLifecycle::Deleted | StoredSandboxLifecycle::CleanupRequired => {
+            CountedBy::NeitherGate
+        }
+    }
+}
+
+/// `cleanup_failed` stands in for *any* value neither list knows. An
+/// exclusion list is fail-closed for those: it counts them, so an unmodelled
+/// lifecycle holds the node instead of silently releasing it.
+const UNMODELLED_LIFECYCLES: &[(&str, CountedBy)] =
+    &[("cleanup_failed", CountedBy::TerminatorOnly)];
 
 /// A node in `draining`. `heartbeat` decides whether the control plane can see
 /// it, which is what decides whether the census discount is even available —
@@ -310,9 +317,9 @@ async fn the_two_gates_agree_across_every_lifecycle() -> TestResult {
     };
     let sink = sink(db.pool.clone(), ResidencyEvidence::LifecycleOnly);
 
-    let matrix = SandboxLifecycle::all()
+    let matrix = StoredSandboxLifecycle::all()
         .iter()
-        .map(|lifecycle| (lifecycle.as_str(), counted_by(*lifecycle)))
+        .map(|stored| (stored.as_str(), stored_counted_by(*stored)))
         .chain(UNMODELLED_LIFECYCLES.iter().copied());
 
     for (lifecycle, expected) in matrix {

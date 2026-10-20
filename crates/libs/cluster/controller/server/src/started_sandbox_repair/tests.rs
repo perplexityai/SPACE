@@ -351,11 +351,13 @@ async fn t6_apply_error_counted() {
 mod postgres_backed {
 
     use super::*;
+    use crate::lifecycle_writer_test_support::relabel_keeping_lifecycle_age;
     use crate::started_sandbox_repair::store::RepairDbStore;
     use pplx_space_common_core::types::{LocalArtifactId, NodeId, SandboxId};
     use pplx_space_db_test_fixtures::{
-        SEED_ORG_ID, SEED_USER_ID, try_pg_test_db, try_pg_test_db_with_max_connections,
+        SEED_ORG_ID, SEED_USER_ID, pg_test_db, try_pg_test_db, try_pg_test_db_with_max_connections,
     };
+    use pplx_space_placement::test_support::stored_lifecycle_matrix;
     use sqlx::PgPool;
 
     use pplx_space_test_env::TestResult;
@@ -1195,6 +1197,71 @@ mod postgres_backed {
                 .await?,
             ApplyOutcome::RevertedToSuspended
         );
+        Ok(())
+    }
+
+    /// The revert moves a row to `suspended` only while it is still
+    /// `started`: a candidate listed while `started` whose row now stores any
+    /// other lifecycle, with every other guard and its age unchanged, is
+    /// refused and keeps that lifecycle. `A`: reverted; `.`: refused.
+    #[tokio::test(flavor = "current_thread")]
+    async fn r14_repair_reverts_only_a_row_still_started() -> TestResult {
+        const EXPECTED: &[&str] = &[
+            "created           .",
+            "creating          .",
+            "starting          .",
+            "started           A",
+            "restoring         .",
+            "pausing           .",
+            "paused            .",
+            "resuming          .",
+            "suspending        .",
+            "suspended         .",
+            "stopping          .",
+            "stopped           .",
+            "deleting          .",
+            "checkpointing     .",
+            "quarantined       .",
+            "failed            .",
+            "deleted           .",
+            "cleanup_required  .",
+            "bogus             .",
+            "_Suspended_       .",
+        ];
+        let db = pg_test_db().await?;
+        let store = RepairDbStore::new(db.pool.clone());
+
+        let mut mismatches = Vec::new();
+        for (stored, [(_, reverts)]) in stored_lifecycle_matrix(["revert"], EXPECTED) {
+            let reverts = reverts.applies();
+            let spec = StartedSandboxSpec::repairable(SandboxId::new());
+            insert_started_sandbox(&db.pool, &spec).await?;
+            let candidate = list_all(&store)
+                .await?
+                .into_iter()
+                .find(|candidate| candidate.sandbox_id == spec.sandbox_id)
+                .expect("the repairable row is listed");
+            relabel_keeping_lifecycle_age(&db.pool, spec.sandbox_id, stored).await?;
+
+            let outcome = store
+                .revert_started_to_suspended(&candidate, default_min_age())
+                .await?;
+
+            let lifecycle: String =
+                sqlx::query_scalar("SELECT lifecycle FROM sandboxes WHERE id = $1")
+                    .bind(spec.sandbox_id)
+                    .fetch_one(&db.pool)
+                    .await?;
+            let (expected_outcome, expected_lifecycle) = if reverts {
+                (ApplyOutcome::RevertedToSuspended, "suspended")
+            } else {
+                (ApplyOutcome::SkippedRaced, stored)
+            };
+            if outcome != expected_outcome || lifecycle != expected_lifecycle {
+                mismatches.push(format!("from {stored}: {outcome:?}, row now {lifecycle}"));
+            }
+        }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
         Ok(())
     }
 }

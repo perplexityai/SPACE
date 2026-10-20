@@ -9,10 +9,9 @@
 //! row to each stored lifecycle with a plain update, as a concurrent writer
 //! would, and then completes it.
 
-use pplx_space_common_core::types::SandboxLifecycle;
+use pplx_space_placement::StoredSandboxLifecycle;
 
 use super::*;
-use crate::controllers::sandbox::lifecycle::characterization_tests::NON_VARIANT_LIFECYCLES;
 
 /// The Postgres `sandboxes` columns the completion writes, and the lease
 /// columns the triggers move with its lifecycle.
@@ -49,19 +48,15 @@ async fn set_lifecycle(pool: &PgPool, sandbox_id: SandboxId, lifecycle: &str) ->
 /// A claimed restore completes to `started` / `on_node`, releasing its lease,
 /// only while the row is still `restoring`: a move to any other stored
 /// lifecycle cleared the token, so the completion is refused as a lost
-/// restore and the row keeps what that move wrote.
+/// restore and the row keeps what that move wrote. Only the completion
+/// returns `Ok`, and every refusal is `RestoreInFlight`.
 #[tokio::test(flavor = "current_thread")]
 async fn completion_applies_only_while_the_claimed_row_is_still_restoring() -> TestResult {
     let Some(fixture) = postgres_fixture().await? else {
         return Ok(());
     };
-    let stored = SandboxLifecycle::all()
-        .iter()
-        .map(|lifecycle| lifecycle.as_str())
-        .chain(NON_VARIANT_LIFECYCLES);
-
     let mut mismatches = Vec::new();
-    for lifecycle in stored {
+    for lifecycle in StoredSandboxLifecycle::all_as_str() {
         let sandbox_id = SandboxId::new();
         insert_sandbox(&fixture.pool, sandbox_id, None).await?;
         let lease = fixture
@@ -90,7 +85,7 @@ async fn completion_applies_only_while_the_claimed_row_is_still_restoring() -> T
         };
         let refused = matches!(result, Err(SubstrateError::RestoreInFlight { .. }));
         let actual = row(&fixture.pool, sandbox_id).await?;
-        if refused == completes || actual != expected {
+        if result.is_ok() != completes || refused == completes || actual != expected {
             mismatches.push(format!("{lifecycle}: {result:?}, row {actual:?}"));
         }
     }

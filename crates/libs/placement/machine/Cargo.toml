@@ -10,6 +10,14 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+# Exposes `test_support` to other crates' test suites as a dev-dependency
+# feature: `StoredSandboxLifecycle::all`, every value Postgres
+# `sandboxes.lifecycle` can hold, and the reader for writer × stored-lifecycle
+# expectation tables. This crate's unit tests get it under `cfg(test)`.
+test-support = []
+
 [dependencies]
 jiff = { workspace = true }
 sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "tls-rustls-aws-lc-rs", "uuid"] }

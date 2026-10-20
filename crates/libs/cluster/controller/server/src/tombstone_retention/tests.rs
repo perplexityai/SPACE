@@ -3,8 +3,10 @@ use pplx_space_common_core::types::{NodeId, SandboxId};
 use std::sync::{Arc, Mutex};
 
 use pplx_space_db_test_fixtures::{
-    SEED_ORG_ID, SEED_USER_ID, insert_pool_slot_receipt, pool_slot_receipt_state, try_pg_test_db,
+    SEED_ORG_ID, SEED_USER_ID, insert_pool_slot_receipt, pg_test_db, pool_slot_receipt_state,
+    try_pg_test_db,
 };
+use pplx_space_placement::test_support::stored_lifecycle_matrix;
 use uuid::Uuid;
 
 use super::*;
@@ -218,6 +220,81 @@ async fn store_prunes_expired_deleted_sandbox_and_its_warm_pool_receipt() -> Tes
         pool_slot_receipt_state(&db.pool, recent_sandbox).await?,
         Some("bound".to_string())
     );
+    Ok(())
+}
+
+/// The sandbox prune deletes only `deleted` tombstones: a row past retention
+/// in any other stored lifecycle survives. `A`: pruned; `.`: kept.
+#[tokio::test(flavor = "current_thread")]
+async fn store_prunes_only_expired_deleted_sandboxes_of_every_stored_lifecycle() -> TestResult {
+    const EXPECTED: &[&str] = &[
+        "created           .",
+        "creating          .",
+        "starting          .",
+        "started           .",
+        "restoring         .",
+        "pausing           .",
+        "paused            .",
+        "resuming          .",
+        "suspending        .",
+        "suspended         .",
+        "stopping          .",
+        "stopped           .",
+        "deleting          .",
+        "checkpointing     .",
+        "quarantined       .",
+        "failed            .",
+        "deleted           A",
+        "cleanup_required  .",
+        "bogus             .",
+        "_Suspended_       .",
+    ];
+    let db = pg_test_db().await?;
+    let matrix = stored_lifecycle_matrix(["prune"], EXPECTED);
+    let mut rows = Vec::new();
+    for &(stored, [(_, pruned)]) in &matrix {
+        let pruned = pruned.applies();
+        let sandbox_id = SandboxId::new();
+        sqlx::query(sql!(
+            "INSERT INTO sandboxes (
+                 id, user_id, org_id, managed_by, lifecycle, placement,
+                 network_policy_generation, created_at, updated_at
+             )
+             VALUES (
+                 $1, $2, $3, 'k8s', $4, 'unplaced', 1,
+                 NOW() - INTERVAL '8 days', NOW() - INTERVAL '8 days'
+             )"
+        ))
+        .bind(sandbox_id)
+        .bind(SEED_USER_ID)
+        .bind(SEED_ORG_ID)
+        .bind(stored)
+        .execute(&db.pool)
+        .await?;
+        rows.push((stored, sandbox_id, pruned));
+    }
+
+    let report = TombstoneRetentionStore::new(db.pool.clone())
+        .prune_tombstones(Duration::from_secs(7 * 24 * 60 * 60), 100)
+        .await?;
+
+    let mut mismatches = Vec::new();
+    for (stored, sandbox_id, pruned) in rows {
+        let exists: bool =
+            sqlx::query_scalar(sql!("SELECT EXISTS(SELECT 1 FROM sandboxes WHERE id = $1)"))
+                .bind(sandbox_id)
+                .fetch_one(&db.pool)
+                .await?;
+        if exists == pruned {
+            mismatches.push(format!("{stored}: row exists {exists}"));
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
+    let expected_pruned = matrix
+        .iter()
+        .filter(|(_, [(_, pruned)])| pruned.applies())
+        .count();
+    assert_eq!(report.deleted_sandboxes_deleted, expected_pruned as u64);
     Ok(())
 }
 

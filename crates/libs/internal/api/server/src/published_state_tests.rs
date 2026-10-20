@@ -4,6 +4,7 @@ use crate::proto::cluster_api_server::ClusterApi;
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{LocalArtifactId, NodeId, SandboxId};
 use pplx_space_db_test_fixtures::{insert_ready_worker_node, pg_test_db, try_pg_test_db};
+use pplx_space_placement::StoredSandboxLifecycle;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 
@@ -573,7 +574,8 @@ async fn registered_inventory_does_not_require_cluster_singleton() -> TestResult
 /// activation receipt) promotes only `restoring`, so it never moves a
 /// `stopped` row. A control-plane write of `started` over a sandbox that is
 /// in fact stopped is therefore corrected by the next publication, while a
-/// `stopped` row whose sandbox runs is not. `space` rows have no Kubernetes
+/// `stopped` row whose sandbox runs is not. Both compare the lifecycle
+/// trimmed and lower-cased. `space` rows have no Kubernetes
 /// execution to route; `k8s` rows carry a routable one, so routability does
 /// not mask the lifecycle filter for either.
 #[tokio::test(flavor = "current_thread")]
@@ -602,19 +604,30 @@ async fn node_publication_converges_only_from_its_source_lifecycles() -> TestRes
     let db = pg_test_db().await?;
     let node_id = NodeId::new();
     insert_ready_worker_node(&db.pool, node_id).await?;
-    let cases = L::all()
+    let cases = StoredSandboxLifecycle::all()
         .iter()
-        .map(|&stored| {
-            let (after_started, after_stopped) = after_reports(stored);
-            (
-                stored.as_str(),
-                after_started.as_str(),
-                after_stopped.as_str(),
-            )
+        .map(|&stored| match stored {
+            StoredSandboxLifecycle::Live(lifecycle) => {
+                let (after_started, after_stopped) = after_reports(lifecycle);
+                (
+                    stored.as_str(),
+                    after_started.as_str(),
+                    after_stopped.as_str(),
+                )
+            }
+            // The stored tombstones; no report moves them.
+            StoredSandboxLifecycle::Deleted | StoredSandboxLifecycle::CleanupRequired => {
+                (stored.as_str(), stored.as_str(), stored.as_str())
+            }
         })
-        // Stored values that are not `SandboxLifecycle` variants; no report
-        // moves them.
-        .chain(["deleted", "cleanup_required"].map(|stored| (stored, stored, stored)));
+        // Values outside the vocabulary. Both convergences compare
+        // `LOWER(TRIM(lifecycle))`, so a padded member of their source sets
+        // converges like the canonical one; an unknown value is in neither.
+        .chain([
+            (" Restoring ", "started", "stopped"),
+            (" Suspended ", " Suspended ", "stopped"),
+            ("bogus", "bogus", "bogus"),
+        ]);
     let cases = ["space", "k8s"]
         .into_iter()
         .flat_map(|managed_by| cases.clone().map(move |case| (managed_by, case)));

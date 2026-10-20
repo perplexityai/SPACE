@@ -4991,6 +4991,7 @@ dependencies = [
  "pplx-space-node-api-sim",
  "pplx-space-node-mgr-client",
  "pplx-space-observability",
+ "pplx-space-placement",
  "pplx-space-public-api",
  "pplx-space-sandbox-portability",
  "pplx-space-sandbox-store",
@@ -5249,6 +5250,7 @@ dependencies = [
  "pplx-space-node-api-client",
  "pplx-space-node-api-sim",
  "pplx-space-observability",
+ "pplx-space-placement",
  "pplx-space-public-api",
  "pplx-space-sandbox-portability",
  "pplx-space-sandbox-store",
@@ -6668,6 +6670,7 @@ version = "0.8.0"
 dependencies = [
  "pplx-space-common-core",
  "pplx-space-db-test-fixtures",
+ "pplx-space-placement",
  "pplx-space-sandbox-portability",
  "pplx-space-test-env",
  "serde",

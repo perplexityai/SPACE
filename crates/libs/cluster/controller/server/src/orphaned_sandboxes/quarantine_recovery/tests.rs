@@ -4,8 +4,11 @@ use pplx_space_common_core::{
     types::{LocalArtifactId, NodeId, SnapshotId},
 };
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, SEED_USER_ID, pg_test_db_with_max_connections};
+use pplx_space_placement::test_support::stored_lifecycle_matrix;
 use pplx_space_test_env::TestResult;
 use uuid::Uuid;
+
+use crate::lifecycle_writer_test_support::relabel_keeping_lifecycle_age;
 
 async fn fixture(pool: &PgPool) -> TestResult<store::Candidate> {
     let id = SandboxId::new();
@@ -169,6 +172,60 @@ async fn publication_quarantine_repair_rechecks_evidence_after_probes() -> TestR
         .await?;
         assert!(present, "{label}: retain the quarantine");
     }
+    Ok(())
+}
+
+/// The recovery moves a row to `suspended` only while it is still
+/// `quarantined`: a candidate listed while `quarantined` whose row now stores
+/// any other lifecycle, with every other piece of evidence and its age
+/// unchanged, is refused and keeps that lifecycle. `A`: recovered; `.`:
+/// refused.
+#[tokio::test]
+async fn publication_quarantine_repair_recovers_only_a_row_still_quarantined() -> TestResult {
+    const EXPECTED: &[&str] = &[
+        "created           .",
+        "creating          .",
+        "starting          .",
+        "started           .",
+        "restoring         .",
+        "pausing           .",
+        "paused            .",
+        "resuming          .",
+        "suspending        .",
+        "suspended         .",
+        "stopping          .",
+        "stopped           .",
+        "deleting          .",
+        "checkpointing     .",
+        "quarantined       A",
+        "failed            .",
+        "deleted           .",
+        "cleanup_required  .",
+        "bogus             .",
+        "_Suspended_       .",
+    ];
+    let db = pg_test_db_with_max_connections(3).await?;
+    let mut mismatches = Vec::new();
+    for (stored, [(_, recovers)]) in stored_lifecycle_matrix(["recover"], EXPECTED) {
+        let recovers = recovers.applies();
+        let c = fixture(&db.pool).await?;
+        relabel_keeping_lifecycle_age(&db.pool, c.sandbox_id, stored).await?;
+
+        let recovered = store::recover(&db.pool, &c).await?;
+
+        let lifecycle: String =
+            sqlx::query_scalar(sql!("SELECT lifecycle FROM sandboxes WHERE id=$1"))
+                .bind(c.sandbox_id)
+                .fetch_one(&db.pool)
+                .await?;
+        let expected_lifecycle = if recovers { "suspended" } else { stored };
+        if recovered != recovers || lifecycle != expected_lifecycle {
+            mismatches.push(format!(
+                "from {stored}: recovered {recovered}, row now {lifecycle}"
+            ));
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
     Ok(())
 }
 

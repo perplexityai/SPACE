@@ -10,13 +10,14 @@
 
 use pplx_space_common_core::types::{NodeId, SandboxId};
 use pplx_space_db_test_fixtures::pg_test_db;
+use pplx_space_placement::StoredSandboxLifecycle;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 
 use super::*;
 use crate::lifecycle_writer_test_support::{
     ExecutionSeed, SandboxSeed, insert_execution, insert_node, insert_sandbox, insert_snapshot,
-    pod_name, pod_uid, stored_lifecycles,
+    pod_name, pod_uid,
 };
 
 /// The Postgres rows a classification moves for one sandbox. The execution
@@ -149,7 +150,7 @@ async fn classification_moves_only_the_lifecycles_its_guard_owns() -> TestResult
 
     let mut mismatches = Vec::new();
     for guard in [Guard::PodName, Guard::Forgotten, Guard::LegacyDeleting] {
-        for stored in stored_lifecycles() {
+        for stored in StoredSandboxLifecycle::all_as_str() {
             for recoverable in [false, true] {
                 let sandbox_id = SandboxId::new();
                 insert_orphan(pool, sandbox_id, node_id, stored, guard).await?;

@@ -567,26 +567,19 @@ async fn claims_outside_the_restore_window_are_blocked() -> TestResult {
     // evacuation claim: `stopped` is inside that claim's window, so the miss
     // reports the missing marker instead (see
     // `evacuation_claim_takes_only_a_released_stopped_evacuation`).
-    const OUTSIDE_WINDOW: [StoredSandboxLifecycle; 16] = [
-        StoredSandboxLifecycle::Live(SandboxLifecycle::Created),
-        StoredSandboxLifecycle::Live(SandboxLifecycle::Creating),
-        StoredSandboxLifecycle::Live(SandboxLifecycle::Starting),
-        StoredSandboxLifecycle::Live(SandboxLifecycle::Started),
-        StoredSandboxLifecycle::Live(SandboxLifecycle::Pausing),
-        StoredSandboxLifecycle::Live(SandboxLifecycle::Paused),
-        StoredSandboxLifecycle::Live(SandboxLifecycle::Resuming),
-        StoredSandboxLifecycle::Live(SandboxLifecycle::Suspending),
-        StoredSandboxLifecycle::Live(SandboxLifecycle::Stopping),
-        StoredSandboxLifecycle::Live(SandboxLifecycle::Stopped),
-        StoredSandboxLifecycle::Live(SandboxLifecycle::Deleting),
-        StoredSandboxLifecycle::Live(SandboxLifecycle::Checkpointing),
-        StoredSandboxLifecycle::Live(SandboxLifecycle::Failed),
-        StoredSandboxLifecycle::Live(SandboxLifecycle::Quarantined),
-        StoredSandboxLifecycle::Deleted,
-        StoredSandboxLifecycle::CleanupRequired,
-    ];
+    let outside_window = StoredSandboxLifecycle::all()
+        .iter()
+        .copied()
+        .filter(|lifecycle| {
+            !matches!(
+                lifecycle,
+                StoredSandboxLifecycle::Live(
+                    SandboxLifecycle::Suspended | SandboxLifecycle::Restoring
+                )
+            )
+        });
 
-    for lifecycle in OUTSIDE_WINDOW {
+    for lifecycle in outside_window {
         let sandbox = insert_sandbox(pool, lifecycle.as_str()).await?;
         for kind in [ClaimKind::UserRestore, ClaimKind::EvacuationRestore] {
             let outcome = store.claim_placement(sandbox, kind).await?;

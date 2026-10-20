@@ -262,7 +262,10 @@ async fn restore_finalize_moves_only_a_row_still_restoring() -> TestResult {
     let timeout = PositiveDuration::new(Duration::from_secs(10)).expect("non-zero");
 
     let mut mismatches = Vec::new();
-    for concurrent_lifecycle in [None].into_iter().chain(stored_lifecycles().map(Some)) {
+    for concurrent_lifecycle in [None]
+        .into_iter()
+        .chain(StoredSandboxLifecycle::all_as_str().map(Some))
+    {
         let pod_ip = private_loopback();
         sqlx::query(sql!(
             "INSERT INTO nodes (id, address, role, managed_by, state)

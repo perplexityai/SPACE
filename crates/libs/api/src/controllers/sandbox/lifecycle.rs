@@ -2406,7 +2406,7 @@ mod drain_guard_postgres_tests;
 mod wake_completion_postgres_tests;
 
 #[cfg(test)]
-pub(in crate::controllers) mod characterization_tests;
+mod characterization_tests;
 
 // Coverage-gap acknowledgment: `SandboxController::control_runtime_client`'s
 // ordering invariant (drain check must run before any substrate call that can

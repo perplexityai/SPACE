@@ -4,8 +4,11 @@ use super::*;
 use pplx_space_common_core::types::{
     ArtifactKind, Email, LocalArtifactId, NodeManagedBy, NodePoolName, OrgId, TemplateName, UserId,
 };
-use pplx_space_db_test_fixtures::{TestDb, try_pg_test_db_with_max_connections};
+use pplx_space_db_test_fixtures::{
+    TestDb, pg_test_db_with_max_connections, try_pg_test_db_with_max_connections,
+};
 use pplx_space_node_api_sim::{SandboxRecord, SimState, SimWorkerHarness};
+use pplx_space_placement::test_support::stored_lifecycle_matrix;
 use sqlx::PgPool;
 
 mod restore_lease_completion;
@@ -724,6 +727,149 @@ async fn non_restore_lifecycle_without_a_lease_reports_conflict() -> TestResult 
         .expect_err("a started sandbox cannot claim the Direct restore lease");
 
     assert!(matches!(error, SubstrateError::Conflict { .. }));
+    Ok(())
+}
+
+/// The Direct restore lease moves a row into and out of `restoring` only from
+/// the lifecycles its restore owns.
+///
+/// - `claim`: an unleased row goes to `restoring` only out of `suspended` or
+///   a lapsed `restoring` retry. The guard compares `LOWER(TRIM(lifecycle))`,
+///   so a padded `suspended` is claimed too.
+/// - `release`: a fresh claim returns to `suspended` only while the row is
+///   still exactly `restoring`. The arrange step stores each lifecycle with
+///   the lease trigger bypassed and checks the token survived, so a refusal
+///   is the lifecycle guard's alone.
+/// - `release_after_write`: the same release after a concurrent write stored
+///   the lifecycle through the trigger, which drops the token outside
+///   `restoring`: the ownership the token carries refuses it too.
+///
+/// `A`: the writer moves the row; `.`: it refuses and leaves the lifecycle.
+#[tokio::test(flavor = "current_thread")]
+async fn restore_lease_claim_and_release_move_only_restore_lifecycles() -> TestResult {
+    const EXPECTED: &[&str] = &[
+        //              claim  release  release_after_write
+        "created          .      .          .",
+        "creating         .      .          .",
+        "starting         .      .          .",
+        "started          .      .          .",
+        "restoring        A      A          A",
+        "pausing          .      .          .",
+        "paused           .      .          .",
+        "resuming         .      .          .",
+        "suspending       .      .          .",
+        "suspended        A      .          .",
+        "stopping         .      .          .",
+        "stopped          .      .          .",
+        "deleting         .      .          .",
+        "checkpointing    .      .          .",
+        "quarantined      .      .          .",
+        "failed           .      .          .",
+        "deleted          .      .          .",
+        "cleanup_required .      .          .",
+        "bogus            .      .          .",
+        "_Suspended_      A      .          .",
+    ];
+    let db = pg_test_db_with_max_connections(4).await?;
+    let pool = &db.pool;
+    let substrate = DirectSubstrate::new(pool.clone());
+
+    async fn lifecycle_and_token(
+        pool: &PgPool,
+        sandbox_id: SandboxId,
+    ) -> TestResult<(String, Option<Uuid>)> {
+        Ok(sqlx::query_as(sql!(
+            "SELECT lifecycle, restore_lease_token FROM sandboxes WHERE id = $1"
+        ))
+        .bind(sandbox_id.as_uuid())
+        .fetch_one(pool)
+        .await?)
+    }
+
+    /// Store `lifecycle` with `sandboxes_clear_restore_lease` disabled for
+    /// the one statement, so the row keeps the lease it holds.
+    async fn set_lifecycle_keeping_lease(
+        pool: &PgPool,
+        sandbox_id: SandboxId,
+        lifecycle: &str,
+    ) -> TestResult {
+        let mut tx = pool.begin().await?;
+        sqlx::query(sql!(
+            "ALTER TABLE sandboxes DISABLE TRIGGER sandboxes_clear_restore_lease"
+        ))
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(sql!("UPDATE sandboxes SET lifecycle = $2 WHERE id = $1"))
+            .bind(sandbox_id.as_uuid())
+            .bind(lifecycle)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(sql!(
+            "ALTER TABLE sandboxes ENABLE TRIGGER sandboxes_clear_restore_lease"
+        ))
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Writer {
+        Claim,
+        Release,
+        ReleaseAfterWrite,
+    }
+
+    let mut mismatches = Vec::new();
+    let writers = [Writer::Claim, Writer::Release, Writer::ReleaseAfterWrite];
+    for (stored, cells) in stored_lifecycle_matrix(writers, EXPECTED) {
+        for (writer, expect) in cells {
+            let applies = expect.applies();
+            let sandbox_id = SandboxId::new();
+            insert_sandbox(pool, sandbox_id, None).await?;
+            let set_lifecycle =
+                sqlx::query(sql!("UPDATE sandboxes SET lifecycle = $2 WHERE id = $1"))
+                    .bind(sandbox_id.as_uuid())
+                    .bind(stored);
+            let (applied, moved_to) = match writer {
+                Writer::Claim => {
+                    set_lifecycle.execute(pool).await?;
+                    let claimed = substrate.claim_direct_restore_lease(sandbox_id).await;
+                    (claimed.is_ok(), "restoring")
+                }
+                Writer::Release => {
+                    let lease = substrate.claim_direct_restore_lease(sandbox_id).await?;
+                    set_lifecycle_keeping_lease(pool, sandbox_id, stored).await?;
+                    let (_, token) = lifecycle_and_token(pool, sandbox_id).await?;
+                    assert_eq!(
+                        token,
+                        Some(lease.token),
+                        "arrange must keep the token for {stored:?}"
+                    );
+                    let released = substrate
+                        .release_direct_restore_lease(sandbox_id, lease)
+                        .await;
+                    (released.is_ok(), "suspended")
+                }
+                Writer::ReleaseAfterWrite => {
+                    let lease = substrate.claim_direct_restore_lease(sandbox_id).await?;
+                    set_lifecycle.execute(pool).await?;
+                    let released = substrate
+                        .release_direct_restore_lease(sandbox_id, lease)
+                        .await;
+                    (released.is_ok(), "suspended")
+                }
+            };
+            let (lifecycle, _) = lifecycle_and_token(pool, sandbox_id).await?;
+            let expected = if applies { moved_to } else { stored };
+            if applied != applies || lifecycle != expected {
+                mismatches.push(format!(
+                    "{writer:?} from {stored:?}: applied {applied}, row now {lifecycle:?}"
+                ));
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
     Ok(())
 }
 

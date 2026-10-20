@@ -1979,6 +1979,8 @@ impl<'de> Deserialize<'de> for SandboxMetadata {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum SandboxLifecycle {
+    // Adding a variant: list it in `SandboxLifecycle::all` too. Nothing makes
+    // that list complete on its own; see its doc for what catches a miss.
     Created,
     Creating,
     Starting,
@@ -2022,7 +2024,12 @@ impl SandboxLifecycle {
     /// Not every value `sandboxes.lifecycle` can hold: `deleted` is a tombstone
     /// written by raw SQL and `cleanup_required` is a node-local
     /// sandbox-manager state, neither of which is a variant here. A test that
-    /// needs those has to name them itself.
+    /// sweeps the column uses `StoredSandboxLifecycle::all` from
+    /// `pplx-space-placement`'s `test-support`, which lists this one and then
+    /// those two. That crate's tests catch an entry dropped from this list, a
+    /// list out of declaration order and a variant declared between two
+    /// listed ones (it renumbers the later variants); a variant appended after
+    /// `Failed` still has to be added here by hand.
     pub const fn all() -> &'static [Self] {
         &[
             Self::Created,

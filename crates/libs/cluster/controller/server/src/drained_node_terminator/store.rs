@@ -775,3 +775,7 @@ mod resident_census_gate_tests;
 /// every terminator statement.
 #[cfg(test)]
 mod substrate_scope_tests;
+
+/// Postgres-backed stored-lifecycle matrix for the mark-lost give-up.
+#[cfg(test)]
+mod stored_lifecycle_matrix_tests;

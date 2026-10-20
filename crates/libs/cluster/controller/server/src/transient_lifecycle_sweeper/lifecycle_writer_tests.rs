@@ -35,6 +35,8 @@ use pplx_space_api::controllers::substrate::direct::DirectSubstrate;
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{NodeId, PositiveDuration, SandboxId, SandboxLifecycle};
 use pplx_space_db_test_fixtures::{pg_test_db, pg_test_db_with_max_connections};
+use pplx_space_placement::StoredSandboxLifecycle;
+use pplx_space_placement::test_support::stored_lifecycle_matrix;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 
@@ -42,7 +44,7 @@ use super::{SWEEPABLE_LIFECYCLES, SubstrateSweepSink, SweepSink};
 use crate::lifecycle_writer_test_support::{
     ExecutionSeed, SandboxSeed, bounded, enter_kubernetes_process, insert_execution,
     insert_sandbox, insert_snapshot, kubernetes_substrate, pin_local_artifact, single_backend_pool,
-    stored_lifecycles, wait_until_blocked,
+    wait_until_blocked,
 };
 
 fn age() -> PositiveDuration {
@@ -223,7 +225,7 @@ async fn fail_cas_claims_only_the_lifecycle_it_was_listed_under() -> TestResult 
     let sink = direct_sink(pool);
 
     let mut mismatches = Vec::new();
-    for stored in stored_lifecycles() {
+    for stored in StoredSandboxLifecycle::all_as_str() {
         for listed in SWEEPABLE_LIFECYCLES.iter().copied() {
             let sandbox_id = SandboxId::new();
             insert_row(pool, sandbox_id, &Row::bare(stored)).await?;
@@ -320,7 +322,7 @@ async fn fail_undo_reverts_only_its_own_failed_write() -> TestResult {
     let sink = direct_sink(pool);
 
     let mut mismatches = Vec::new();
-    for stored in stored_lifecycles() {
+    for stored in StoredSandboxLifecycle::all_as_str() {
         let sandbox_id = SandboxId::new();
         insert_row(pool, sandbox_id, &Row::bare("pausing")).await?;
         let token = sink
@@ -449,7 +451,7 @@ async fn converge_cas_moves_only_restoring_rows() -> TestResult {
     let sink = direct_sink(pool);
 
     let mut mismatches = Vec::new();
-    for stored in stored_lifecycles() {
+    for stored in StoredSandboxLifecycle::all_as_str() {
         for target in [SandboxLifecycle::Started, SandboxLifecycle::Paused] {
             let sandbox_id = SandboxId::new();
             let before = if stored == "restoring" {
@@ -509,7 +511,7 @@ async fn revert_cas_moves_only_restoring_rows() -> TestResult {
     let sink = direct_sink(pool);
 
     let mut mismatches = Vec::new();
-    let markers = stored_lifecycles().map(|stored| (stored, None));
+    let markers = StoredSandboxLifecycle::all_as_str().map(|stored| (stored, None));
     for (stored, marker) in markers.chain([("restoring", Some("started"))]) {
         let sandbox_id = SandboxId::new();
         let mut before = if stored == "restoring" {
@@ -587,7 +589,7 @@ async fn revert_undo_reverts_only_its_own_suspended_write() -> TestResult {
     let sink = direct_sink(pool);
 
     let mut mismatches = Vec::new();
-    for stored in stored_lifecycles() {
+    for stored in StoredSandboxLifecycle::all_as_str() {
         let sandbox_id = SandboxId::new();
         insert_row(
             pool,
@@ -633,7 +635,7 @@ async fn unrestorable_fail_cas_moves_only_unplaced_restoring_rows_of_its_substra
     let sink = direct_sink(pool);
 
     let mut mismatches = Vec::new();
-    for stored in stored_lifecycles() {
+    for stored in StoredSandboxLifecycle::all_as_str() {
         let sandbox_id = SandboxId::new();
         // Unplaced, no execution, no snapshot, no marker, placed long ago:
         // the shape the planner provably cannot restore.
@@ -693,7 +695,7 @@ async fn reap_moves_only_marked_started_rows_and_heal_never_moves_a_lifecycle() 
     let sink = direct_sink(pool);
 
     let mut mismatches = Vec::new();
-    for stored in stored_lifecycles() {
+    for stored in StoredSandboxLifecycle::all_as_str() {
         let reaped = SandboxId::new();
         insert_row(pool, reaped, &Row::bare(stored).pending()).await?;
         let claimed = sink.reap_command_ready_pending(reaped).await?.is_some();
@@ -752,7 +754,7 @@ async fn reap_undo_reverts_only_its_own_failed_write() -> TestResult {
     let sink = direct_sink(pool);
 
     let mut mismatches = Vec::new();
-    for stored in stored_lifecycles() {
+    for stored in StoredSandboxLifecycle::all_as_str() {
         let sandbox_id = SandboxId::new();
         insert_row(pool, sandbox_id, &Row::bare("started").pending()).await?;
         let token = sink
@@ -802,10 +804,33 @@ async fn reap_undo_reverts_only_its_own_failed_write() -> TestResult {
 // ---------------------------------------------------------------------------
 
 /// The failed-active repair moves a placed Kubernetes row with an active
-/// execution back to `started` only out of `failed`, from every stored
-/// lifecycle.
+/// execution back to `started` only out of `failed`: an on-node `k8s` row
+/// with an active execution in any other stored lifecycle is left alone.
+/// `A`: repaired; `.`: refused.
 #[tokio::test(flavor = "current_thread")]
 async fn failed_active_repair_moves_only_failed_rows() -> TestResult {
+    const EXPECTED: &[&str] = &[
+        "created           .",
+        "creating          .",
+        "starting          .",
+        "started           .",
+        "restoring         .",
+        "pausing           .",
+        "paused            .",
+        "resuming          .",
+        "suspending        .",
+        "suspended         .",
+        "stopping          .",
+        "stopped           .",
+        "deleting          .",
+        "checkpointing     .",
+        "quarantined       .",
+        "failed            A",
+        "deleted           .",
+        "cleanup_required  .",
+        "bogus             .",
+        "_Suspended_       .",
+    ];
     if !enter_kubernetes_process()? {
         return Ok(());
     }
@@ -818,7 +843,7 @@ async fn failed_active_repair_moves_only_failed_rows() -> TestResult {
     );
 
     let mut mismatches = Vec::new();
-    for stored in stored_lifecycles() {
+    for (stored, [(_, repairs)]) in stored_lifecycle_matrix(["repair"], EXPECTED) {
         let sandbox_id = SandboxId::new();
         let seed = SandboxSeed::new(stored, "k8s").on_node(NodeId::new());
         insert_sandbox(pool, sandbox_id, &seed).await?;
@@ -826,7 +851,7 @@ async fn failed_active_repair_moves_only_failed_rows() -> TestResult {
 
         let repaired = sink.repair_failed_active_execution(sandbox_id).await?;
 
-        let accepts = stored == "failed";
+        let accepts = repairs.applies();
         let expected = Row::bare(if accepts { "started" } else { stored });
         let actual = row(pool, sandbox_id).await?;
         if repaired != accepts || actual != expected {

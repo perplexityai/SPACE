@@ -8,17 +8,9 @@
 //! revert's execution-proof and snapshot guards are pinned by the
 //! `failed_started_recovery_*` behaviours in the parent module.
 
-use pplx_space_common_core::types::SandboxLifecycle;
+use pplx_space_placement::StoredSandboxLifecycle;
 
 use super::*;
-use crate::controllers::sandbox::lifecycle::characterization_tests::NON_VARIANT_LIFECYCLES;
-
-fn stored_lifecycles() -> impl Iterator<Item = &'static str> {
-    SandboxLifecycle::all()
-        .iter()
-        .map(|lifecycle| lifecycle.as_str())
-        .chain(NON_VARIANT_LIFECYCLES)
-}
 
 /// The Postgres `sandboxes` columns both writes move, and the state of the
 /// execution they retire.
@@ -73,7 +65,7 @@ async fn failed_recovery_reverts_only_a_started_row() -> TestResult {
     let pool = &fixture.pool;
 
     let mut mismatches = Vec::new();
-    for lifecycle in stored_lifecycles() {
+    for lifecycle in StoredSandboxLifecycle::all_as_str() {
         let sandbox_id = SandboxId::new();
         insert_sandbox(pool, sandbox_id, "started").await?;
         sqlx::query(sql!(
@@ -485,7 +477,7 @@ async fn missing_suspend_pod_finalizes_only_a_suspending_row() -> TestResult {
     let pool = &fixture.pool;
 
     let mut mismatches = Vec::new();
-    for lifecycle in stored_lifecycles() {
+    for lifecycle in StoredSandboxLifecycle::all_as_str() {
         let sandbox_id = insert_missing_suspend_pod(pool, lifecycle, Variation::Control).await?;
         let before = row(pool, sandbox_id, 1).await?;
 

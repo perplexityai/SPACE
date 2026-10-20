@@ -2,6 +2,7 @@ use pplx_space_common_core::types::SandboxId;
 
 use super::*;
 use pplx_space_db_test_fixtures::pg_test_db;
+use pplx_space_placement::StoredSandboxLifecycle;
 
 use pplx_space_test_env::TestResult;
 
@@ -87,30 +88,33 @@ async fn wake_completion_cas_outcome_for_every_prior_lifecycle() -> TestResult {
     ];
     for (substrate, capabilities, suspended_outcome) in substrates {
         let fence = PublishedSuspendFence::for_capabilities(capabilities);
-        for lifecycle in SandboxLifecycle::all() {
-            let expected = match lifecycle {
-                SandboxLifecycle::Created
-                | SandboxLifecycle::Creating
-                | SandboxLifecycle::Starting
-                | SandboxLifecycle::Started
-                | SandboxLifecycle::Restoring
-                | SandboxLifecycle::Pausing
-                | SandboxLifecycle::Paused
-                | SandboxLifecycle::Resuming
-                | SandboxLifecycle::Checkpointing => Completed,
-                SandboxLifecycle::Suspending => SupersededBySuspend,
-                SandboxLifecycle::Suspended => suspended_outcome,
-                SandboxLifecycle::Stopping
-                | SandboxLifecycle::Stopped
-                | SandboxLifecycle::Deleting
-                | SandboxLifecycle::Quarantined
-                | SandboxLifecycle::Failed => Lost,
+        for stored in StoredSandboxLifecycle::all() {
+            let expected = match stored {
+                StoredSandboxLifecycle::Live(
+                    SandboxLifecycle::Created
+                    | SandboxLifecycle::Creating
+                    | SandboxLifecycle::Starting
+                    | SandboxLifecycle::Started
+                    | SandboxLifecycle::Restoring
+                    | SandboxLifecycle::Pausing
+                    | SandboxLifecycle::Paused
+                    | SandboxLifecycle::Resuming
+                    | SandboxLifecycle::Checkpointing,
+                ) => Completed,
+                StoredSandboxLifecycle::Live(SandboxLifecycle::Suspending) => SupersededBySuspend,
+                StoredSandboxLifecycle::Live(SandboxLifecycle::Suspended) => suspended_outcome,
+                StoredSandboxLifecycle::Live(
+                    SandboxLifecycle::Stopping
+                    | SandboxLifecycle::Stopped
+                    | SandboxLifecycle::Deleting
+                    | SandboxLifecycle::Quarantined
+                    | SandboxLifecycle::Failed,
+                )
+                // The stored values that are not `SandboxLifecycle` variants.
+                | StoredSandboxLifecycle::Deleted
+                | StoredSandboxLifecycle::CleanupRequired => Lost,
             };
-            cases.push((lifecycle.as_str().to_owned(), substrate, fence, expected));
-        }
-        // Stored values that are not `SandboxLifecycle` variants.
-        for lifecycle in ["deleted", "cleanup_required"] {
-            cases.push((lifecycle.to_owned(), substrate, fence, Lost));
+            cases.push((stored.as_str().to_owned(), substrate, fence, expected));
         }
         // The guard compares a trimmed, lower-cased lifecycle.
         cases.push((" Failed ".to_owned(), substrate, fence, Lost));

@@ -3,9 +3,10 @@ use pplx_space_common_core::types::{
     ArtifactKind, ArtifactOrigin, NodeId, SandboxId, SandboxLifecycle, SnapshotState, SubstrateKind,
 };
 use pplx_space_db_test_fixtures::{
-    SEED_ORG_ID, SEED_USER_ID, insert_ready_worker_node, pg_test_db_with_max_connections,
-    try_pg_test_db,
+    SEED_ORG_ID, SEED_USER_ID, insert_ready_worker_node, pg_test_db,
+    pg_test_db_with_max_connections, try_pg_test_db,
 };
+use pplx_space_placement::test_support::stored_lifecycle_matrix;
 
 use pplx_space_test_env::TestResult;
 
@@ -469,6 +470,81 @@ async fn complete_inventory_marks_missing_space_sandbox_deleted() -> TestResult 
         pruned_sandbox_row(&db.pool, k8s_sandbox_id).await?,
         PrunedSandboxRow::placed("started", node_id)
     );
+    Ok(())
+}
+
+/// The census tombstones a Direct row its node stopped reporting out of every
+/// stored lifecycle but `deleting` and `deleted`, including values outside
+/// the vocabulary, since its guard is an exact exclusion list; those two keep
+/// their lifecycle and placement. Every row is active on the node with no durable artifact,
+/// so the lifecycle is the only variable. `A`: tombstoned; `.`: left placed.
+#[tokio::test(flavor = "current_thread")]
+async fn complete_inventory_tombstones_every_stored_lifecycle_but_the_delete_states() -> TestResult
+{
+    const EXPECTED: &[&str] = &[
+        "created           A",
+        "creating          A",
+        "starting          A",
+        "started           A",
+        "restoring         A",
+        "pausing           A",
+        "paused            A",
+        "resuming          A",
+        "suspending        A",
+        "suspended         A",
+        "stopping          A",
+        "stopped           A",
+        "deleting          .",
+        "checkpointing     A",
+        "quarantined       A",
+        "failed            A",
+        "deleted           .",
+        "cleanup_required  A",
+        "bogus             A",
+        "_Suspended_       A",
+    ];
+    let db = pg_test_db().await?;
+    let node_id = NodeId::new();
+    insert_ready_worker_node(&db.pool, node_id).await?;
+    let mut rows = Vec::new();
+    for (stored, [(_, tombstoned)]) in stored_lifecycle_matrix(["census"], EXPECTED) {
+        let tombstoned = tombstoned.applies();
+        let sandbox_id = SandboxId::new();
+        sqlx::query(
+            "INSERT INTO sandboxes (
+                 id, user_id, org_id, lifecycle, placement, active_node_id,
+                 target_node_id, managed_by, network_policy_generation
+             )
+             VALUES ($1, $2, $3, $4, 'on_node', $5, $5, $6, 1)",
+        )
+        .bind(sandbox_id)
+        .bind(SEED_USER_ID)
+        .bind(SEED_ORG_ID)
+        .bind(stored)
+        .bind(node_id)
+        .bind(SubstrateKind::Space)
+        .execute(&db.pool)
+        .await?;
+        rows.push((stored, sandbox_id, tombstoned));
+    }
+
+    let mut conn = db.pool.acquire().await?;
+    prune_absent_node_sandboxes(&mut conn, node_id, &[]).await?;
+    drop(conn);
+
+    let mut mismatches = Vec::new();
+    for (stored, sandbox_id, tombstoned) in rows {
+        let expected = if tombstoned {
+            PrunedSandboxRow::tombstoned()
+        } else {
+            PrunedSandboxRow::placed(stored, node_id)
+        };
+        let actual = pruned_sandbox_row(&db.pool, sandbox_id).await?;
+        if actual != expected {
+            mismatches.push(format!("{stored}: {actual:?}"));
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
     Ok(())
 }
 

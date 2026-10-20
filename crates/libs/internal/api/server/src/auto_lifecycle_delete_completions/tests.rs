@@ -7,7 +7,8 @@ use pplx_space_common_core::{
     },
 };
 use pplx_space_common_svc::types::AutoLifecyclePolicyFingerprint;
-use pplx_space_db_test_fixtures::{insert_ready_worker_node, try_pg_test_db};
+use pplx_space_db_test_fixtures::{insert_ready_worker_node, pg_test_db, try_pg_test_db};
+use pplx_space_placement::test_support::stored_lifecycle_matrix;
 
 use super::*;
 
@@ -1132,12 +1133,101 @@ async fn quarantine_from_other_source_is_acknowledged_without_deleting() -> Test
     Ok(())
 }
 
+/// A matching delete completion deletes the row only out of a settled
+/// lifecycle its publisher owns: with the row active on the publishing node,
+/// out of `created`, `started`, `paused`, `suspended`, `stopped` and `failed`;
+/// with no active node, only out of the dormant `stopped` and `suspended`.
+/// Every other stored lifecycle keeps the row and its lifecycle. The read
+/// parses the column through `StoredSandboxLifecycle`, which normalizes case
+/// and padding, so a padded `suspended` is deleted like a canonical one and an
+/// unknown value is acknowledged without a delete. Columns are the row's
+/// placement; `A`: deleted; `.`: kept.
+#[tokio::test(flavor = "current_thread")]
+async fn delete_completion_applies_only_from_settled_owned_lifecycles() -> TestResult {
+    const EXPECTED: &[&str] = &[
+        //              on_node  unplaced
+        "created            A        .",
+        "creating           .        .",
+        "starting           .        .",
+        "started            A        .",
+        "restoring          .        .",
+        "pausing            .        .",
+        "paused             A        .",
+        "resuming           .        .",
+        "suspending         .        .",
+        "suspended          A        A",
+        "stopping           .        .",
+        "stopped            A        A",
+        "deleting           .        .",
+        "checkpointing      .        .",
+        "quarantined        .        .",
+        "failed             A        .",
+        "deleted            .        .",
+        "cleanup_required   .        .",
+        "bogus              .        .",
+        "_Suspended_        A        A",
+    ];
+    let db = pg_test_db().await?;
+
+    let mut mismatches = Vec::new();
+    for (stored, cells) in stored_lifecycle_matrix(["on_node", "unplaced"], EXPECTED) {
+        for (placement, deletes) in cells {
+            let deletes = deletes.applies();
+            let sandbox_id = SandboxId::new();
+            let node_id = NodeId::new();
+            let route_activation_id = seed_active_sandbox(&db.pool, sandbox_id, node_id, 7).await?;
+            sqlx::query(sql!("UPDATE sandboxes SET lifecycle = $2 WHERE id = $1"))
+                .bind(sandbox_id)
+                .bind(stored)
+                .execute(&db.pool)
+                .await?;
+            if placement == "unplaced" {
+                sqlx::query(sql!(
+                    "UPDATE sandboxes
+                        SET active_node_id = NULL, target_node_id = NULL, placement = 'unplaced'
+                      WHERE id = $1"
+                ))
+                .bind(sandbox_id)
+                .execute(&db.pool)
+                .await?;
+            }
+
+            let mut tx = db.pool.begin().await?;
+            consume_auto_lifecycle_delete_completions(
+                &mut tx,
+                node_id,
+                &[completion(
+                    AutoLifecycleDeleteReceiptId::generate(),
+                    sandbox_id,
+                    7,
+                    route_activation_id,
+                    matching_policy_fingerprint(),
+                )],
+            )
+            .await?;
+            tx.commit().await?;
+
+            let lifecycle: Option<String> =
+                sqlx::query_scalar(sql!("SELECT lifecycle FROM sandboxes WHERE id = $1"))
+                    .bind(sandbox_id)
+                    .fetch_optional(&db.pool)
+                    .await?;
+            let expected = (!deletes).then(|| stored.to_owned());
+            if lifecycle != expected {
+                mismatches.push(format!("{placement} {stored}: row now {lifecycle:?}"));
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn stored_tombstones_are_acknowledged_without_poisoning_publication() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
-    for lifecycle in ["deleted", "cleanup_required"] {
+    for lifecycle in StoredSandboxLifecycle::tombstones_as_str() {
         let sandbox_id = SandboxId::new();
         let node_id = NodeId::new();
         let receipt_id = AutoLifecycleDeleteReceiptId::generate();

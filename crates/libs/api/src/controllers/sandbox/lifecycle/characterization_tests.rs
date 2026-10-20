@@ -17,6 +17,8 @@ use pplx_space_common_core::types::{NodeId, NodeManagedBy, SandboxId};
 use pplx_space_db_test_fixtures::pg_test_db_with_max_connections;
 use pplx_space_metrics::sandbox::api::{SandboxApiMetricIdentity, WakeCompletionAction};
 use pplx_space_node_api_sim::{SandboxRecord, SimState, SimWorkerHarness};
+use pplx_space_placement::StoredSandboxLifecycle;
+use pplx_space_placement::test_support::{known_defects, stored_lifecycle_matrix};
 use pplx_space_test_env::TestResult;
 
 use super::*;
@@ -25,11 +27,6 @@ use crate::test_support::direct_substrate;
 
 #[cfg(feature = "kubernetes")]
 mod kubernetes;
-
-/// Values `sandboxes.lifecycle` can hold that are not `SandboxLifecycle`
-/// variants (see `SandboxLifecycle::all`).
-pub(in crate::controllers) const NON_VARIANT_LIFECYCLES: [&str; 2] =
-    ["deleted", "cleanup_required"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Row {
@@ -246,29 +243,34 @@ async fn wake_refuses_teardown_and_terminal_lifecycles_before_admission() -> Tes
     let pool = &db.pool;
     let controller = controller_with_empty_cluster_admission(pool);
 
-    let variants = SandboxLifecycle::all().iter().map(|lifecycle| {
-        let refused = match lifecycle {
-            SandboxLifecycle::Stopping
-            | SandboxLifecycle::Stopped
-            | SandboxLifecycle::Deleting
-            | SandboxLifecycle::Quarantined
-            | SandboxLifecycle::Failed => true,
-            SandboxLifecycle::Created
-            | SandboxLifecycle::Creating
-            | SandboxLifecycle::Starting
-            | SandboxLifecycle::Started
-            | SandboxLifecycle::Restoring
-            | SandboxLifecycle::Pausing
-            | SandboxLifecycle::Paused
-            | SandboxLifecycle::Resuming
-            | SandboxLifecycle::Checkpointing
-            | SandboxLifecycle::Suspending
-            | SandboxLifecycle::Suspended => false,
+    let stored = StoredSandboxLifecycle::all().iter().map(|stored| {
+        let refused = match stored {
+            StoredSandboxLifecycle::Live(
+                SandboxLifecycle::Stopping
+                | SandboxLifecycle::Stopped
+                | SandboxLifecycle::Deleting
+                | SandboxLifecycle::Quarantined
+                | SandboxLifecycle::Failed,
+            )
+            | StoredSandboxLifecycle::Deleted
+            | StoredSandboxLifecycle::CleanupRequired => true,
+            StoredSandboxLifecycle::Live(
+                SandboxLifecycle::Created
+                | SandboxLifecycle::Creating
+                | SandboxLifecycle::Starting
+                | SandboxLifecycle::Started
+                | SandboxLifecycle::Restoring
+                | SandboxLifecycle::Pausing
+                | SandboxLifecycle::Paused
+                | SandboxLifecycle::Resuming
+                | SandboxLifecycle::Checkpointing
+                | SandboxLifecycle::Suspending
+                | SandboxLifecycle::Suspended,
+            ) => false,
         };
-        (lifecycle.as_str(), refused)
+        (stored.as_str(), refused)
     });
-    let non_variants = NON_VARIANT_LIFECYCLES.map(|lifecycle| (lifecycle, true));
-    for (lifecycle, refused) in variants.chain(non_variants) {
+    for (lifecycle, refused) in stored {
         for action in [
             SandboxAction::Wake,
             SandboxAction::ImplicitWake(ExecutionActivityKind::Access),
@@ -600,7 +602,7 @@ async fn completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight() ->
         // an open bug and is not encoded here.
         let terminal = ["failed", "quarantined"]
             .into_iter()
-            .chain(NON_VARIANT_LIFECYCLES)
+            .chain(StoredSandboxLifecycle::tombstones_as_str())
             .map(Some);
         for landed in [None].into_iter().chain(terminal) {
             let sandbox_id = SandboxId::new();
@@ -635,6 +637,115 @@ async fn completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight() ->
             );
         }
     }
+    Ok(())
+}
+
+/// The two post-action stamps and the pooled post-wake update share one
+/// guard: they write unless the row is `failed`, `quarantined` or a
+/// tombstone. Swept here over every stored value with today's outcome, so a
+/// change to that guard fails this table. Columns: `stamp` is
+/// `maybe_update_sandbox_lifecycle` with the pause stamp `paused`;
+/// `state_stamp` is `maybe_update_sandbox_state` with start's
+/// `started`/`on_node`; `post_wake` is `update_and_fetch_post_wake_sandbox`.
+///
+/// `!` marks the known defect `completed_actions_keep_a_terminal_lifecycle_that_landed_mid_flight`
+/// leaves unencoded: a write that lands after a cross-intent transition
+/// (`deleting`, `stopping`, `suspending`, `suspended`, however spelled)
+/// replaces it with the action's own lifecycle. Fixing it means turning
+/// those marks into `.` and lowering `KNOWN_DEFECTS`. Whether a row is
+/// written is read from `xmin`, so a stamp that rewrites the value the row
+/// already holds still counts as applied.
+#[tokio::test(flavor = "current_thread")]
+async fn post_action_stamps_write_every_stored_lifecycle_but_the_terminal_ones() -> TestResult {
+    const EXPECTED: &[&str] = &[
+        //              stamp  state_stamp  post_wake
+        "created           A        A           A",
+        "creating          A        A           A",
+        "starting          A        A           A",
+        "started           A        A           A",
+        "restoring         A        A           A",
+        "pausing           A        A           A",
+        "paused            A        A           A",
+        "resuming          A        A           A",
+        "suspending        !        !           !",
+        "suspended         !        !           !",
+        "stopping          !        !           !",
+        "stopped           A        A           A",
+        "deleting          !        !           !",
+        "checkpointing     A        A           A",
+        "quarantined       .        .           .",
+        "failed            .        .           .",
+        "deleted           .        .           .",
+        "cleanup_required  .        .           .",
+        "bogus             A        A           A",
+        "_Suspended_       !        !           !",
+    ];
+    /// Five cross-intent rows in each of three columns.
+    const KNOWN_DEFECTS: usize = 15;
+
+    async fn written_row(pool: &PgPool, sandbox_id: SandboxId) -> TestResult<(String, Row)> {
+        let (xmin, lifecycle, placement): (String, String, String) = sqlx::query_as(sql!(
+            "SELECT xmin::text, lifecycle, placement FROM sandboxes WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(pool)
+        .await?;
+        Ok((xmin, Row::new(&lifecycle, &placement)))
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Writer {
+        Stamp,
+        StateStamp,
+        PostWake,
+    }
+
+    let db = pg_test_db_with_max_connections(2).await?;
+    let pool = &db.pool;
+    let writers = [Writer::Stamp, Writer::StateStamp, Writer::PostWake];
+    let matrix = stored_lifecycle_matrix(writers, EXPECTED);
+    assert_eq!(known_defects(&matrix), KNOWN_DEFECTS);
+
+    let mut mismatches = Vec::new();
+    for (stored, cells) in matrix {
+        for (writer, expect) in cells {
+            let sandbox_id = SandboxId::new();
+            insert_sandbox(pool, sandbox_id, stored, "space").await?;
+            let (xmin_before, before) = written_row(pool, sandbox_id).await?;
+
+            // The stamps are best-effort and report nothing; the post-wake
+            // update reports a refusal as an error.
+            let (moved_to, reported) = match writer {
+                Writer::Stamp => {
+                    maybe_update_sandbox_lifecycle(pool, sandbox_id, "paused").await;
+                    (Row::new("paused", "unplaced"), None)
+                }
+                Writer::StateStamp => {
+                    maybe_update_sandbox_state(pool, sandbox_id, "started", "on_node").await;
+                    (Row::new("started", "on_node"), None)
+                }
+                Writer::PostWake => {
+                    let updated =
+                        update_and_fetch_post_wake_sandbox(pool, sandbox_id, Some(NodeId::new()))
+                            .await;
+                    (Row::new("started", "on_node"), Some(updated.is_ok()))
+                }
+            };
+
+            let (xmin_after, after) = written_row(pool, sandbox_id).await?;
+            let written = xmin_after != xmin_before;
+            let expected = if expect.applies() { moved_to } else { before };
+            if written != expect.applies()
+                || reported.is_some_and(|updated| updated != expect.applies())
+                || after != expected
+            {
+                mismatches.push(format!(
+                    "{writer:?} from {stored:?} ({expect:?}): written {written}, row now {after:?}"
+                ));
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
     Ok(())
 }
 
@@ -1162,11 +1273,7 @@ async fn redrive_completes_only_a_restoring_row() -> TestResult {
     let db = pg_test_db_with_max_connections(2).await?;
     let pool = &db.pool;
 
-    let lifecycles = SandboxLifecycle::all()
-        .iter()
-        .map(|lifecycle| lifecycle.as_str())
-        .chain(NON_VARIANT_LIFECYCLES);
-    for lifecycle in lifecycles {
+    for lifecycle in StoredSandboxLifecycle::all_as_str() {
         let sandbox_id = SandboxId::new();
         insert_sandbox(pool, sandbox_id, lifecycle, "space").await?;
 
@@ -1183,23 +1290,57 @@ async fn redrive_completes_only_a_restoring_row() -> TestResult {
 }
 
 // ---------------------------------------------------------------------------
-// Delete-intent compensation.
+// Delete-intent compensations.
 // ---------------------------------------------------------------------------
 
-/// Restoring the pre-delete lifecycle is a CAS on `deleting`: if anything
-/// moved the row meanwhile it refuses with a 500 and leaves the row alone.
-/// The success arm is pinned by `deferred_delete_restores_the_previous_lifecycle`.
+/// Persisting the delete intent and the two compensations that undo it.
+///
+/// The intent write moves every live row to `deleting` and refuses a
+/// tombstone, or any value that is not exactly a live one, with a 500: its
+/// lifecycle read cannot parse them. Restoring the
+/// pre-delete lifecycle, after a failed delete or a failed finalize, is a CAS
+/// on `deleting`: if anything moved the row meanwhile it refuses with a 500
+/// and leaves the row alone. Columns are the intent write and the
+/// failed-delete and failed-finalize compensations; `A`: the writer moves the
+/// row; `.`: it refuses. The finalize compensation's missing-row success is
+/// pinned by `finalize_failure_accepts_an_already_deleted_row`.
 #[tokio::test(flavor = "current_thread")]
-async fn failed_delete_compensation_refuses_a_row_that_left_deleting() -> TestResult {
+async fn delete_intent_and_its_compensations_over_every_stored_lifecycle() -> TestResult {
+    const EXPECTED: &[&str] = &[
+        //              intent  delete  finalize
+        "created           A       .       .",
+        "creating          A       .       .",
+        "starting          A       .       .",
+        "started           A       .       .",
+        "restoring         A       .       .",
+        "pausing           A       .       .",
+        "paused            A       .       .",
+        "resuming          A       .       .",
+        "suspending        A       .       .",
+        "suspended         A       .       .",
+        "stopping          A       .       .",
+        "stopped           A       .       .",
+        "deleting          A       A       A",
+        "checkpointing     A       .       .",
+        "quarantined       A       .       .",
+        "failed            A       .       .",
+        "deleted           .       .       .",
+        "cleanup_required  .       .       .",
+        "bogus             .       .       .",
+        "_Suspended_       .       .       .",
+    ];
     let db = pg_test_db_with_max_connections(2).await?;
     let pool = &db.pool;
 
-    let moved_to = SandboxLifecycle::all()
-        .iter()
-        .filter(|lifecycle| **lifecycle != SandboxLifecycle::Deleting)
-        .map(|lifecycle| lifecycle.as_str())
-        .chain(NON_VARIANT_LIFECYCLES);
-    for current in moved_to {
+    #[derive(Debug, Clone, Copy)]
+    enum Writer {
+        Intent,
+        FailedDelete,
+        FailedFinalize,
+    }
+
+    let writers = [Writer::Intent, Writer::FailedDelete, Writer::FailedFinalize];
+    for (current, cells) in stored_lifecycle_matrix(writers, EXPECTED) {
         // A restoration target that differs from the current lifecycle, so a
         // write that slipped past the CAS would be visible.
         let target = if current == SandboxLifecycle::Paused.as_str() {
@@ -1207,23 +1348,49 @@ async fn failed_delete_compensation_refuses_a_row_that_left_deleting() -> TestRe
         } else {
             SandboxLifecycle::Paused
         };
-        let sandbox_id = SandboxId::new();
-        insert_sandbox(pool, sandbox_id, current, "space").await?;
+        for (writer, applies) in cells {
+            let applies = applies.applies();
+            let sandbox_id = SandboxId::new();
+            insert_sandbox(pool, sandbox_id, current, "space").await?;
 
-        let error = restore_lifecycle_after_failed_delete(pool, sandbox_id, target)
-            .await
-            .expect_err("the row left `deleting`");
+            let (result, moved_to) = match writer {
+                Writer::Intent => (
+                    begin_delete_against_active_fork(pool, sandbox_id)
+                        .await
+                        .map(|_| ()),
+                    SandboxLifecycle::Deleting,
+                ),
+                Writer::FailedDelete => (
+                    restore_lifecycle_after_failed_delete(pool, sandbox_id, target).await,
+                    target,
+                ),
+                Writer::FailedFinalize => (
+                    restore_lifecycle_after_failed_finalize_delete(pool, sandbox_id, Some(target))
+                        .await,
+                    target,
+                ),
+            };
 
-        assert_eq!(
-            error.status(),
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "{current}"
-        );
-        assert_eq!(
-            row(pool, sandbox_id).await?,
-            Some(Row::new(current, "unplaced")),
-            "{current}"
-        );
+            let case = format!("{writer:?} from {current:?}");
+            if applies {
+                assert!(result.is_ok(), "{case}: {result:?}");
+                assert_eq!(
+                    row(pool, sandbox_id).await?,
+                    Some(Row::new(moved_to.as_str(), "unplaced")),
+                    "{case}"
+                );
+            } else {
+                let Err(error) = result else {
+                    panic!("{case}: moved the row, expected a refusal");
+                };
+                assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR, "{case}");
+                assert_eq!(
+                    row(pool, sandbox_id).await?,
+                    Some(Row::new(current, "unplaced")),
+                    "{case}"
+                );
+            }
+        }
     }
     Ok(())
 }

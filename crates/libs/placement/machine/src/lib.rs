@@ -27,6 +27,8 @@ mod outcome;
 mod postgres;
 mod request;
 mod store;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
 pub use lifecycle::StoredSandboxLifecycle;
 pub use model::{

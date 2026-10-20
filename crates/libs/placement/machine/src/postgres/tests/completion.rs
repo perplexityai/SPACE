@@ -250,6 +250,80 @@ async fn complete_placement_refuses_a_fence_whose_execution_is_not_routable() ->
     Ok(())
 }
 
+/// The fenced completion over every stored lifecycle a row can hold when it
+/// lands: it completes out of `restoring` and every other lifecycle outside
+/// the blocking and superseding sets, and refuses the rest without moving the
+/// row. The lease trigger is bypassed in the arrange step so each refusal is
+/// attributable to the lifecycle guard alone. The guard compares
+/// `LOWER(TRIM(lifecycle))`, so a padded `suspended` is superseded like a
+/// canonical one, while an unknown value is in neither set and completes.
+/// `A`: completed; `.`: refused (the two tests below pin which refusals are
+/// supersessions).
+#[tokio::test(flavor = "current_thread")]
+async fn fenced_completion_completes_out_of_every_unblocked_stored_lifecycle() -> TestResult {
+    const EXPECTED: &[&str] = &[
+        "created           A",
+        "creating          A",
+        "starting          A",
+        "started           A",
+        "restoring         A",
+        "pausing           A",
+        "paused            A",
+        "resuming          A",
+        "suspending        .",
+        "suspended         .",
+        "stopping          .",
+        "stopped           .",
+        "deleting          .",
+        "checkpointing     A",
+        "quarantined       .",
+        "failed            .",
+        "deleted           .",
+        "cleanup_required  .",
+        "bogus             A",
+        "_Suspended_       .",
+    ];
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let store = store_for(&db);
+
+    let mut mismatches = Vec::new();
+    for (stored, [(_, completes)]) in
+        crate::test_support::stored_lifecycle_matrix(["fenced_completion"], EXPECTED)
+    {
+        let completes = completes.applies();
+        let sandbox = insert_sandbox(pool, "suspended").await?;
+        let attempt = expect_claimed(
+            store
+                .claim_placement(sandbox, ClaimKind::UserRestore)
+                .await?,
+        );
+        mark_execution_routable(pool, sandbox).await?;
+        set_lifecycle_bypassing_lease_trigger(pool, sandbox, stored).await?;
+
+        let outcome = store
+            .complete_placement(PlacementProof::Fence(&attempt.fence))
+            .await?;
+
+        let (lifecycle, placement) = lifecycle_and_placement(pool, sandbox).await?;
+        let completed = outcome == PlacementOutcome::Completed;
+        let row_matches = if completes {
+            (lifecycle.as_str(), placement.as_str()) == ("started", "on_node")
+        } else {
+            lifecycle == stored && placement != "on_node"
+        };
+        if completed != completes || !row_matches {
+            mismatches.push(format!(
+                "from {stored}: {outcome:?}, row now {lifecycle}/{placement}"
+            ));
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
+    Ok(())
+}
+
 /// The single blocking set: a teardown or terminal lifecycle that landed
 /// while substrate work was in flight must win against the completion — the
 /// row is not resurrected. The lease trigger is bypassed in the arrange step

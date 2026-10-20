@@ -29,6 +29,8 @@ use std::sync::{Arc, Mutex};
 
 use pplx_space_common_core::types::{LocalArtifactId, NodeId, SandboxId, SandboxLifecycle};
 use pplx_space_db_test_fixtures::{pg_test_db, pg_test_db_with_max_connections};
+use pplx_space_placement::StoredSandboxLifecycle;
+use pplx_space_placement::test_support::stored_lifecycle_matrix;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 
@@ -36,7 +38,7 @@ use super::*;
 use crate::lifecycle_writer_test_support::{
     ExecutionSeed, SandboxSeed, bounded, enter_kubernetes_process, insert_execution, insert_node,
     insert_sandbox, insert_snapshot, keeps_marker, kubernetes_substrate, pin_local_artifact,
-    single_backend_pool, stored_lifecycles, wait_until_blocked,
+    single_backend_pool, wait_until_blocked,
 };
 
 mod restore_finalize;
@@ -267,7 +269,7 @@ async fn evacuation_claims_only_the_listed_lifecycle_or_its_own_marked_suspend()
     let node_id = insert_forced_draining_node(pool).await?;
 
     let mut mismatches = Vec::new();
-    for stored in stored_lifecycles() {
+    for stored in StoredSandboxLifecycle::all_as_str() {
         for listed in LISTED {
             for marker in [None, Some("started"), Some("paused")] {
                 let sandbox_id = insert_resident(pool, node_id, stored, marker).await?;
@@ -390,7 +392,7 @@ async fn evacuation_revert_moves_only_a_claim_still_suspending_and_uncommitted()
     let node_id = insert_forced_draining_node(pool).await?;
 
     let mut mismatches = Vec::new();
-    let landed = stored_lifecycles().map(|lifecycle| (Some(lifecycle), false));
+    let landed = StoredSandboxLifecycle::all_as_str().map(|lifecycle| (Some(lifecycle), false));
     for (concurrent_lifecycle, commits_execution) in landed.chain([(None, true)]) {
         let sandbox_id = insert_resident(pool, node_id, "paused", None).await?;
         let suspend = Suspend::Fails {
@@ -439,7 +441,7 @@ async fn evacuation_after_the_suspend_handoff_leaves_the_handed_off_row() -> Tes
     let pool = &db.pool;
 
     let mut mismatches = Vec::new();
-    let landed = stored_lifecycles().map(Some).chain([None]);
+    let landed = StoredSandboxLifecycle::all_as_str().map(Some).chain([None]);
     for concurrent_lifecycle in landed {
         let node_id = insert_forced_draining_node(pool).await?;
         let sandbox_id = insert_resident(pool, node_id, "started", None).await?;
@@ -571,7 +573,7 @@ async fn redrive_moves_only_marked_suspending_rows() -> TestResult {
     let pool = &db.pool;
 
     let mut ids = Vec::new();
-    for stored in stored_lifecycles() {
+    for stored in StoredSandboxLifecycle::all_as_str() {
         let sandbox_id = SandboxId::new();
         insert_sandbox(
             pool,
@@ -695,7 +697,7 @@ async fn mark_lost_fails_only_suspended_rows_without_a_durable_copy() -> TestRes
     let sink = sink_without_suspend(pool);
 
     let mut mismatches = Vec::new();
-    for stored in stored_lifecycles() {
+    for stored in StoredSandboxLifecycle::all_as_str() {
         let sandbox_id = SandboxId::new();
         insert_sandbox(pool, sandbox_id, &SandboxSeed::new(stored, "k8s")).await?;
         set_target_node(pool, sandbox_id, node_id).await?;
@@ -779,7 +781,7 @@ async fn gone_node_give_up_fails_only_resident_rows_of_the_node() -> TestResult 
     .await?;
 
     let mut cases: Vec<(SandboxId, Row, bool)> = Vec::new();
-    for stored in stored_lifecycles() {
+    for stored in StoredSandboxLifecycle::all_as_str() {
         let sandbox_id = insert_resident(pool, node_id, stored, None).await?;
         cases.push((sandbox_id, row(pool, sandbox_id).await?, resident(stored)));
     }
@@ -811,9 +813,32 @@ async fn gone_node_give_up_fails_only_resident_rows_of_the_node() -> TestResult 
 
 /// The gone-node mark-lost fails a row targeted at the node only out of
 /// `suspended`, from every stored lifecycle; the trigger clears the marker
-/// with it.
+/// with it. `A`: failed; `.`: refused. The lifecycle is compared exactly, so
+/// neither non-canonical value is failed.
 #[tokio::test(flavor = "current_thread")]
 async fn gone_node_mark_lost_fails_only_suspended_rows() -> TestResult {
+    const EXPECTED: &[&str] = &[
+        "created           .",
+        "creating          .",
+        "starting          .",
+        "started           .",
+        "restoring         .",
+        "pausing           .",
+        "paused            .",
+        "resuming          .",
+        "suspending        .",
+        "suspended         A",
+        "stopping          .",
+        "stopped           .",
+        "deleting          .",
+        "checkpointing     .",
+        "quarantined       .",
+        "failed            .",
+        "deleted           .",
+        "cleanup_required  .",
+        "bogus             .",
+        "_Suspended_       .",
+    ];
     let db = pg_test_db().await?;
     let pool = &db.pool;
     let sink = sink_without_suspend(pool);
@@ -827,7 +852,7 @@ async fn gone_node_mark_lost_fails_only_suspended_rows() -> TestResult {
     .await?;
 
     let mut mismatches = Vec::new();
-    for stored in stored_lifecycles() {
+    for (stored, [(_, fails)]) in stored_lifecycle_matrix(["mark_lost"], EXPECTED) {
         let sandbox_id = SandboxId::new();
         let seed = SandboxSeed::new(stored, "k8s").marked("started");
         insert_sandbox(pool, sandbox_id, &seed).await?;
@@ -837,7 +862,7 @@ async fn gone_node_mark_lost_fails_only_suspended_rows() -> TestResult {
             .mark_sandbox_lost_on_gone_node(sandbox_id, node_id, Some("uid-observed"))
             .await?;
 
-        let accepts = stored == "suspended";
+        let accepts = fails.applies();
         let expected = if accepts {
             Row::new("failed", None, None)
         } else {
@@ -892,9 +917,35 @@ fn given_up() -> Row {
 
 /// The failed-on-node give-up claims a row resident on the node only out of
 /// `started` or `paused`, marked or not, from every stored lifecycle, and
-/// tears down only what it claimed.
+/// tears down only what it claimed. One column per marker: unmarked, then
+/// marked `started`. `A`: claimed and torn down; `.`: refused, the row as it
+/// was. The lifecycle is compared exactly, so neither non-canonical value is
+/// claimed.
 #[tokio::test(flavor = "current_thread")]
 async fn failed_on_node_give_up_claims_only_started_or_paused_residents() -> TestResult {
+    const EXPECTED: &[&str] = &[
+        //                 unmarked  marked
+        "created              .        .",
+        "creating             .        .",
+        "starting             .        .",
+        "started              A        A",
+        "restoring            .        .",
+        "pausing              .        .",
+        "paused               A        A",
+        "resuming             .        .",
+        "suspending           .        .",
+        "suspended            .        .",
+        "stopping             .        .",
+        "stopped              .        .",
+        "deleting             .        .",
+        "checkpointing        .        .",
+        "quarantined          .        .",
+        "failed               .        .",
+        "deleted              .        .",
+        "cleanup_required     .        .",
+        "bogus                .        .",
+        "_Suspended_          .        .",
+    ];
     if !enter_kubernetes_process()? {
         return Ok(());
     }
@@ -904,15 +955,15 @@ async fn failed_on_node_give_up_claims_only_started_or_paused_residents() -> Tes
     let node_id = insert_forced_draining_node(pool).await?;
 
     let mut mismatches = Vec::new();
-    for stored in stored_lifecycles() {
-        for marker in [None, Some("started")] {
+    for (stored, cells) in stored_lifecycle_matrix([None, Some("started")], EXPECTED) {
+        for (marker, claims) in cells {
             let sandbox_id =
                 insert_resident_without_execution(pool, node_id, stored, marker).await?;
             let before = row(pool, sandbox_id).await?;
 
             let flipped = Box::pin(sink.mark_sandbox_failed_on_node(sandbox_id, node_id)).await?;
 
-            let accepts = matches!(stored, "started" | "paused");
+            let accepts = claims.applies();
             let expected = if accepts { given_up() } else { before };
             let actual = row(pool, sandbox_id).await?;
             if flipped != u64::from(accepts) || actual != expected {
@@ -930,23 +981,35 @@ async fn failed_on_node_give_up_claims_only_started_or_paused_residents() -> Tes
 /// node that is in a non-evacuable transient lifecycle, unmarked or a marked
 /// `suspending` with nothing to redrive, and nothing else: no other stored
 /// lifecycle, no marked row in any other lifecycle, no row resident
-/// elsewhere.
+/// elsewhere. A row only active or only targeted there counts as resident.
+/// One column per marker: unmarked, then marked `started`. `A`:
+/// claimed and torn down; `.`: refused, the row as it was. The lifecycle is
+/// compared exactly, so neither non-canonical value is claimed.
 #[tokio::test(flavor = "current_thread")]
 async fn abandon_stale_claims_only_aged_unmarked_transients_of_the_node() -> TestResult {
-    fn transient(lifecycle: &str) -> bool {
-        matches!(
-            lifecycle,
-            "creating"
-                | "starting"
-                | "pausing"
-                | "resuming"
-                | "stopping"
-                | "suspending"
-                | "restoring"
-                | "checkpointing"
-        )
-    }
-
+    const EXPECTED: &[&str] = &[
+        //                 unmarked  marked
+        "created              .        .",
+        "creating             A        .",
+        "starting             A        .",
+        "started              .        .",
+        "restoring            A        .",
+        "pausing              A        .",
+        "paused               .        .",
+        "resuming             A        .",
+        "suspending           A        A",
+        "suspended            .        .",
+        "stopping             A        .",
+        "stopped              .        .",
+        "deleting             .        .",
+        "checkpointing        A        .",
+        "quarantined          .        .",
+        "failed               .        .",
+        "deleted              .        .",
+        "cleanup_required     .        .",
+        "bogus                .        .",
+        "_Suspended_          .        .",
+    ];
     if !enter_kubernetes_process()? {
         return Ok(());
     }
@@ -957,17 +1020,36 @@ async fn abandon_stale_claims_only_aged_unmarked_transients_of_the_node() -> Tes
     let age = PositiveDuration::new(Duration::from_secs(60)).expect("non-zero");
 
     let mut cases: Vec<(SandboxId, Row, bool)> = Vec::new();
-    for stored in stored_lifecycles() {
-        for marker in [None, Some("started")] {
+    for (stored, cells) in stored_lifecycle_matrix([None, Some("started")], EXPECTED) {
+        for (marker, claims) in cells {
             let sandbox_id =
                 insert_resident_without_execution(pool, node_id, stored, marker).await?;
-            let abandons = transient(stored) && (marker.is_none() || stored == "suspending");
+            let abandons = claims.applies();
             cases.push((sandbox_id, row(pool, sandbox_id).await?, abandons));
         }
     }
     let elsewhere =
         insert_resident_without_execution(pool, NodeId::new(), "starting", None).await?;
     cases.push((elsewhere, row(pool, elsewhere).await?, false));
+    // The node predicate matches either column, so each of these is claimed:
+    // a row targeted at the node with no active node, one targeted at the node
+    // but still active on another node (its teardown clears that active node
+    // too), and one active on the node but targeted at another.
+    let elsewhere_node_id = NodeId::new();
+    for (active_node_id, target_node_id) in [
+        (None, node_id),
+        (Some(elsewhere_node_id), node_id),
+        (Some(node_id), elsewhere_node_id),
+    ] {
+        let sandbox_id = SandboxId::new();
+        let mut seed = SandboxSeed::new("starting", "k8s");
+        if let Some(active_node_id) = active_node_id {
+            seed = seed.on_node(active_node_id);
+        }
+        insert_sandbox(pool, sandbox_id, &seed).await?;
+        set_target_node(pool, sandbox_id, target_node_id).await?;
+        cases.push((sandbox_id, row(pool, sandbox_id).await?, true));
+    }
 
     let flipped = Box::pin(sink.abandon_stale_resident_sandboxes(node_id, age)).await?;
 

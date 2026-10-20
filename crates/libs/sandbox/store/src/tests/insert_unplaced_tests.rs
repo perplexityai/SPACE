@@ -9,8 +9,8 @@ use std::collections::BTreeMap;
 
 use pplx_space_common_core::types::{
     AutoLifecyclePolicy, AutoLifecycleWakePolicy, AutoLifecycleWakeSource, DiskIoLimits,
-    SandboxLifecycle,
 };
+use pplx_space_placement::StoredSandboxLifecycle;
 use sqlx::types::JsonValue;
 
 use super::*;
@@ -269,14 +269,7 @@ async fn insert_unplaced_refuses_an_existing_id_in_every_lifecycle() -> TestResu
     };
     let inputs = Inputs::new(0)?;
     let egress_profiles = inputs.egress_profiles();
-    // Every value Postgres `sandboxes.lifecycle` holds: the variants and the
-    // two stored non-variants.
-    let stored = SandboxLifecycle::all()
-        .iter()
-        .map(|lifecycle| lifecycle.as_str())
-        .chain(["deleted", "cleanup_required"]);
-
-    for lifecycle in stored {
+    for lifecycle in StoredSandboxLifecycle::all_as_str() {
         let id = SandboxId::from_uuid(insert_sandbox(&db.pool, None, lifecycle).await?);
         let before = row(&db.pool, id).await?;
 

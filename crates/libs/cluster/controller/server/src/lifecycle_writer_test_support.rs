@@ -2,7 +2,8 @@
 //! the cluster-controller's writes to Postgres `sandboxes.lifecycle` against
 //! the real Postgres fixture. Everything here writes Postgres control-plane
 //! tables only, apart from [`kubernetes_substrate`], which also stands in for
-//! the Kubernetes apiserver.
+//! the Kubernetes apiserver. The stored values a sweep seeds come from
+//! `StoredSandboxLifecycle::all_as_str`.
 
 use std::ffi::OsStr;
 use std::future::{Future, IntoFuture};
@@ -14,7 +15,7 @@ use std::time::Duration;
 use axum::response::IntoResponse;
 use pplx_space_api::controllers::substrate::kubernetes::KubernetesSubstrate;
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{NodeId, SandboxId, SandboxLifecycle};
+use pplx_space_common_core::types::{NodeId, SandboxId};
 use pplx_space_common_svc::bearer_token::{
     SPACE_INTERNAL_CONTROL_TOKEN_ENV, SPACE_INTERNAL_TOKEN_ENV,
     SPACE_NODE_API_INTERNAL_TOKEN_PATH_ENV, SPACE_NODE_API_TOKEN_PATH_ENV,
@@ -26,18 +27,6 @@ use sqlx::postgres::PgPoolOptions;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use uuid::Uuid;
-
-/// Values Postgres `sandboxes.lifecycle` can hold that are not
-/// [`SandboxLifecycle`] variants (see `SandboxLifecycle::all`).
-pub(crate) const NON_VARIANT_LIFECYCLES: [&str; 2] = ["deleted", "cleanup_required"];
-
-/// Every value a sweep stores in Postgres `sandboxes.lifecycle`.
-pub(crate) fn stored_lifecycles() -> impl Iterator<Item = &'static str> {
-    SandboxLifecycle::all()
-        .iter()
-        .map(|lifecycle| lifecycle.as_str())
-        .chain(NON_VARIANT_LIFECYCLES)
-}
 
 /// Lifecycles the `BEFORE UPDATE` trigger lets an evacuation marker survive a
 /// lifecycle change into.
@@ -237,6 +226,38 @@ pub(crate) async fn pin_local_artifact(pool: &PgPool, sandbox_id: SandboxId) -> 
     .bind(Uuid::now_v7())
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// Store `lifecycle` on a row and put `lifecycle_changed_at` back, so a writer
+/// whose other guards age the row sees the stored lifecycle as the only
+/// change. The trigger stamps the column only when the lifecycle moves, so
+/// the second write sticks.
+pub(crate) async fn relabel_keeping_lifecycle_age(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+    lifecycle: &str,
+) -> TestResult {
+    let mut tx = pool.begin().await?;
+    let changed_at: String = sqlx::query_scalar(sql!(
+        "SELECT lifecycle_changed_at::text FROM sandboxes WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query(sql!("UPDATE sandboxes SET lifecycle = $2 WHERE id = $1"))
+        .bind(sandbox_id)
+        .bind(lifecycle)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET lifecycle_changed_at = $2::timestamptz WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(changed_at)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
     Ok(())
 }
 

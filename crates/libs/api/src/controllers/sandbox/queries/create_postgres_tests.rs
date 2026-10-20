@@ -45,7 +45,10 @@ type InsertedFederatedPooledSandboxRow = (
 use crate::models::{SandboxMetadata, SandboxMetadataValue};
 use pplx_space_common_core::types::{UpstreamIssuer, UpstreamOrgId, UpstreamSubjectId};
 use pplx_space_common_svc::types::ReconcileFacet;
-use pplx_space_db_test_fixtures::{insert_ready_worker_node, pg_test_db};
+use pplx_space_db_test_fixtures::{
+    SEED_ORG_ID, SEED_USER_ID, insert_ready_worker_node, pg_test_db,
+};
+use pplx_space_placement::test_support::stored_lifecycle_matrix;
 use sqlx::{PgPool, Postgres, Transaction};
 use std::{
     collections::VecDeque,
@@ -85,6 +88,97 @@ async fn insert_actor(pool: &PgPool) -> TestResult<User> {
 
 async fn insert_node(pool: &PgPool, node_id: NodeId) -> TestResult {
     insert_ready_worker_node(pool, node_id).await
+}
+
+/// Create finalization moves a row to `started` on its node only out of the
+/// lifecycle its create owns: a plain create out of `creating`, whether the
+/// row is still unplaced or a receipt already placed it there, and also out
+/// of a `started` row a receipt already converged onto the same node; a
+/// leased restore-shaped create only out of the `restoring` row its lease
+/// token names. Every other stored lifecycle is refused and left as found.
+/// `A`: finalized; `.`: refused.
+#[tokio::test(flavor = "current_thread")]
+async fn create_finalization_finalizes_only_the_lifecycle_its_create_owns() -> TestResult {
+    const EXPECTED: &[&str] = &[
+        //              unplaced  on_node  leased
+        "created            .        .        .",
+        "creating           A        A        .",
+        "starting           .        .        .",
+        "started            .        A        .",
+        "restoring          .        .        A",
+        "pausing            .        .        .",
+        "paused             .        .        .",
+        "resuming           .        .        .",
+        "suspending         .        .        .",
+        "suspended          .        .        .",
+        "stopping           .        .        .",
+        "stopped            .        .        .",
+        "deleting           .        .        .",
+        "checkpointing      .        .        .",
+        "quarantined        .        .        .",
+        "failed             .        .        .",
+        "deleted            .        .        .",
+        "cleanup_required   .        .        .",
+        "bogus              .        .        .",
+        "_Suspended_        .        .        .",
+    ];
+    let db = pg_test_db().await?;
+    let node_id = NodeId::new();
+    insert_node(&db.pool, node_id).await?;
+
+    let mut mismatches = Vec::new();
+    for (stored, cells) in stored_lifecycle_matrix(["unplaced", "on_node", "leased"], EXPECTED) {
+        for (shape, finalizes) in cells {
+            let finalizes = finalizes.applies();
+            let sandbox_id = SandboxId::new();
+            let restore_lease_token = (shape == "leased").then(OperationId::new);
+            let placed_on = (shape == "on_node").then_some(node_id);
+            sqlx::query(sql!(
+                "INSERT INTO sandboxes (
+                     id, user_id, org_id, managed_by, lifecycle, placement, active_node_id,
+                     network_policy_generation, restore_lease_token, restore_lease_expires_at
+                 )
+                 VALUES (
+                     $1, $2, $3, 'k8s', $4,
+                     CASE WHEN $5::uuid IS NULL THEN 'unplaced' ELSE 'on_node' END, $5, 1,
+                     $6, CASE WHEN $6::uuid IS NULL THEN NULL ELSE NOW() + INTERVAL '5 minutes' END
+                 )"
+            ))
+            .bind(sandbox_id)
+            .bind(SEED_USER_ID)
+            .bind(SEED_ORG_ID)
+            .bind(stored)
+            .bind(placed_on)
+            .bind(restore_lease_token.map(|token| token.as_uuid()))
+            .execute(&db.pool)
+            .await?;
+
+            let finalized = finalize_created_sandbox(
+                &db.pool,
+                sandbox_id,
+                "started",
+                "on_node",
+                Some(node_id),
+                false,
+                restore_lease_token,
+            )
+            .await?;
+
+            let lifecycle: String =
+                sqlx::query_scalar(sql!("SELECT lifecycle FROM sandboxes WHERE id = $1"))
+                    .bind(sandbox_id)
+                    .fetch_one(&db.pool)
+                    .await?;
+            let expected_lifecycle = if finalizes { "started" } else { stored };
+            if finalized != finalizes || lifecycle != expected_lifecycle {
+                mismatches.push(format!(
+                    "{shape} from {stored}: finalized {finalized}, row now {lifecycle}"
+                ));
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
+    Ok(())
 }
 
 #[tokio::test(flavor = "current_thread")]

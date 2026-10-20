@@ -202,7 +202,7 @@ fn wake_entry_accepts_recoverable_states_and_rejects_teardown_states() {
         );
     }
 
-    for lifecycle in ["deleted", "cleanup_required"] {
+    for lifecycle in pplx_space_placement::StoredSandboxLifecycle::tombstones_as_str() {
         assert!(
             !wake_lifecycle_allows_started_update(lifecycle),
             "{lifecycle} should reject wake before substrate work"
