@@ -250,7 +250,15 @@ fn with_mounted_ext4<T>(
 
 fn format_ext4(image: &Path) -> Result<(), RootfsAssemblyError> {
     let mut command = command_as_root("mkfs.ext4");
-    command.args(["-F", "-O", "dir_nlink,large_dir", "-J", "size=4", "-m", "1"]);
+    command.args([
+        "-F",
+        "-O",
+        "dir_nlink,large_dir,inline_data",
+        "-J",
+        "size=4",
+        "-m",
+        "1",
+    ]);
     command.arg(image);
     run_status(RootfsAssemblyOperation::FormatRootfs, &mut command, &[])
 }
