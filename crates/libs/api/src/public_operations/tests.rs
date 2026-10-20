@@ -1,6 +1,6 @@
 use pplx_space_common_core::types::{OrgId, SandboxId, UserId};
 
-use pplx_space_db_test_fixtures::try_pg_test_db;
+use pplx_space_db_test_fixtures::{try_pg_test_db, try_pg_test_db_with_max_connections};
 use pplx_space_public_api::{
     PublicSandboxId, PublicSandboxOperationResult, SandboxLifecycleAction, SandboxLifecycleState,
 };
@@ -1739,4 +1739,93 @@ async fn seed_user(pool: &PgPool, org_id: OrgId) -> Result<Uuid, sqlx::Error> {
     .execute(pool)
     .await?;
     Ok(id)
+}
+
+/// Adding or dropping a `public_operations` column must not break the
+/// operation reads on a connection that already ran them. A `SELECT *` would:
+/// the column change alters its result type, and Postgres then refuses the
+/// connection's cached statement with `0A000` ("cached plan must not change
+/// result type") until the pool recycles the connection. One connection runs
+/// every read, the table gains and then loses a column, and the same
+/// connection runs every read again and gets the same records back.
+#[tokio::test]
+async fn operation_reads_survive_a_column_change_on_the_same_connection() -> TestResult {
+    let Some(db) = try_pg_test_db_with_max_connections(1).await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let actor_id = UserId::from_uuid(seed_user(&db.pool, org_id).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let created = store
+        .create_operation(CreatePublicOperation {
+            org_id,
+            actor_user_id: Some(actor_id),
+            api_product: ApiProduct::Native,
+            kind: OperationKind::ForkSandbox,
+            target_type: Some(OperationTargetType::Sandbox),
+            target_id: Some("column-change-probe"),
+            payload_json: serde_json::json!({}),
+            idempotency: None,
+            traceparent: None,
+        })
+        .await?;
+    let CreatePublicOperationResult::Created(operation_id) = created else {
+        return Err(format!("operation was not created: {created:?}").into());
+    };
+    let backend = || async {
+        sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
+            .fetch_one(&db.pool)
+            .await
+    };
+    let read_all = || async {
+        let public = store.fetch_operation(org_id, operation_id).await?;
+        let admin = store.fetch_operation_admin(operation_id).await?;
+        let listed = store
+            .list_operations_admin(ListAdminPublicOperations {
+                limit: 10,
+                org_id: Some(org_id),
+                state: None,
+                kind: None,
+                target_type: None,
+                target_id: Some("column-change-probe".to_string()),
+            })
+            .await?;
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
+            public,
+            serde_json::to_value(admin)?,
+            serde_json::to_value(listed)?,
+        ))
+    };
+    let connection = backend().await?;
+    let before = read_all().await?;
+    assert_eq!(
+        before.0.as_ref().map(|record| record.id),
+        Some(operation_id)
+    );
+    assert_eq!(
+        before.1["id"],
+        serde_json::to_value(operation_id)?,
+        "the admin read finds the operation"
+    );
+    assert_eq!(
+        before.2.as_array().map(Vec::len),
+        Some(1),
+        "the list finds the operation"
+    );
+
+    sqlx::query("ALTER TABLE public_operations ADD COLUMN column_change_probe INTEGER")
+        .execute(&db.pool)
+        .await?;
+    assert_eq!(read_all().await?, before, "after a column is added");
+
+    sqlx::query("ALTER TABLE public_operations DROP COLUMN column_change_probe")
+        .execute(&db.pool)
+        .await?;
+    assert_eq!(read_all().await?, before, "after a column is dropped");
+    assert_eq!(
+        backend().await?,
+        connection,
+        "every read ran on the one connection, so it reused its cached statements"
+    );
+    Ok(())
 }

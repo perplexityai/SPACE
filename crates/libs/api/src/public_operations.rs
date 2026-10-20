@@ -2,6 +2,7 @@ use pplx_space_common_core::types::{OrgId, UserId};
 
 use pplx_space_common_core::sql;
 use std::str::FromStr;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use pplx_space_common_core::types::{IdempotencyKey, SandboxId, SandboxLifecycle};
@@ -21,6 +22,43 @@ use crate::public_store::{InvalidStoredEnum, parse_stored_enum};
 use pplx_space_sandbox_store::fork_source_lifecycle::lock_fork_source_lifecycle;
 
 const DEFAULT_OPERATION_GC_DAYS: i64 = 7;
+
+/// The columns every whole-operation read selects, in [`PublicOperationRow`]'s
+/// shape. Named rather than `*`: adding or dropping a `public_operations`
+/// column changes what `SELECT *` returns, and every pooled connection that
+/// already ran one then fails it with `0A000` ("cached plan must not change
+/// result type") until the pool recycles that connection. A new column a read
+/// needs is selected here and decoded in [`PublicOperationRow`], once for all
+/// three reads; a record that exposes it also needs the field and its line in
+/// that record's `TryFrom<PublicOperationRow>`.
+const PUBLIC_OPERATION_COLUMNS: &str = "operation_id,
+       org_id,
+       actor_user_id,
+       api_product,
+       kind,
+       target_type,
+       target_id,
+       state,
+       progress_message,
+       terminal_error_code,
+       terminal_error_json,
+       result_json,
+       attempts,
+       requested_at,
+       next_attempt_at,
+       created_at,
+       started_at,
+       completed_at,
+       updated_at";
+
+/// `sql` with `{public_operation_columns}` replaced by
+/// [`PUBLIC_OPERATION_COLUMNS`], the one fragment these statements take (the
+/// data-store skill's exception for one row type's column list). Each
+/// statement is otherwise complete, built once at its query site, and binds
+/// every value.
+fn public_operation_query(sql: &str) -> String {
+    sql.replace("{public_operation_columns}", PUBLIC_OPERATION_COLUMNS)
+}
 
 fn update_claimed_payload_sql() -> &'static str {
     sql!(
@@ -182,10 +220,15 @@ impl PublicOperationStore {
         org_id: OrgId,
         operation_id: OperationId,
     ) -> Result<Option<PublicOperationRecord>, PublicOperationStoreError> {
-        let row = sqlx::query_as::<_, PublicOperationRow>(sql!(
-            "SELECT *
-             FROM public_operations
-             WHERE org_id = $1 AND operation_id = $2"
+        static FETCH_OPERATION_SQL: LazyLock<String> = LazyLock::new(|| {
+            sql!(public_operation_query(
+                "SELECT {public_operation_columns}
+                 FROM public_operations
+                 WHERE org_id = $1 AND operation_id = $2"
+            ))
+        });
+        let row = sqlx::query_as::<_, PublicOperationRow>(sqlx::AssertSqlSafe(
+            FETCH_OPERATION_SQL.as_str(),
         ))
         .bind(org_id)
         .bind(operation_id.as_uuid())
@@ -357,10 +400,15 @@ impl PublicOperationStore {
         &self,
         operation_id: OperationId,
     ) -> Result<Option<AdminPublicOperationRecord>, PublicOperationStoreError> {
-        let row = sqlx::query_as::<_, AdminPublicOperationRow>(sql!(
-            "SELECT *
-             FROM public_operations
-             WHERE operation_id = $1"
+        static FETCH_OPERATION_ADMIN_SQL: LazyLock<String> = LazyLock::new(|| {
+            sql!(public_operation_query(
+                "SELECT {public_operation_columns}
+                 FROM public_operations
+                 WHERE operation_id = $1"
+            ))
+        });
+        let row = sqlx::query_as::<_, PublicOperationRow>(sqlx::AssertSqlSafe(
+            FETCH_OPERATION_ADMIN_SQL.as_str(),
         ))
         .bind(operation_id.as_uuid())
         .fetch_optional(&self.pool)
@@ -376,16 +424,21 @@ impl PublicOperationStore {
         let state = input.state.as_ref().map(OperationState::as_str);
         let kind = input.kind.map(OperationKind::as_str);
         let target_type = input.target_type.as_ref().map(OperationTargetType::as_str);
-        let rows = sqlx::query_as::<_, AdminPublicOperationRow>(sql!(
-            "SELECT *
-             FROM public_operations
-             WHERE ($1::UUID IS NULL OR org_id = $1)
-               AND ($2::TEXT IS NULL OR state = $2)
-               AND ($3::TEXT IS NULL OR kind = $3)
-               AND ($4::TEXT IS NULL OR target_type = $4)
-               AND ($5::TEXT IS NULL OR target_id = $5)
-             ORDER BY created_at DESC, operation_id DESC
-             LIMIT $6"
+        static LIST_OPERATIONS_ADMIN_SQL: LazyLock<String> = LazyLock::new(|| {
+            sql!(public_operation_query(
+                "SELECT {public_operation_columns}
+                 FROM public_operations
+                 WHERE ($1::UUID IS NULL OR org_id = $1)
+                   AND ($2::TEXT IS NULL OR state = $2)
+                   AND ($3::TEXT IS NULL OR kind = $3)
+                   AND ($4::TEXT IS NULL OR target_type = $4)
+                   AND ($5::TEXT IS NULL OR target_id = $5)
+                 ORDER BY created_at DESC, operation_id DESC
+                 LIMIT $6"
+            ))
+        });
+        let rows = sqlx::query_as::<_, PublicOperationRow>(sqlx::AssertSqlSafe(
+            LIST_OPERATIONS_ADMIN_SQL.as_str(),
         ))
         .bind(input.org_id)
         .bind(state)
@@ -1930,25 +1983,10 @@ struct DispatcherClaimRow {
     reclaimed: bool,
 }
 
+/// One whole operation, as [`PUBLIC_OPERATION_COLUMNS`] selects it. Both the
+/// public and the admin record are built from it.
 #[derive(Debug, FromRow)]
 struct PublicOperationRow {
-    operation_id: Uuid,
-    kind: String,
-    target_type: Option<String>,
-    target_id: Option<String>,
-    state: String,
-    progress_message: String,
-    terminal_error_code: Option<String>,
-    terminal_error_json: Option<Json<serde_json::Value>>,
-    result_json: Option<Json<serde_json::Value>>,
-    created_at: OffsetDateTime,
-    started_at: Option<OffsetDateTime>,
-    completed_at: Option<OffsetDateTime>,
-    updated_at: OffsetDateTime,
-}
-
-#[derive(Debug, FromRow)]
-struct AdminPublicOperationRow {
     operation_id: Uuid,
     org_id: OrgId,
     actor_user_id: Option<UserId>,
@@ -2019,10 +2057,10 @@ impl TryFrom<PublicOperationRow> for PublicOperationRecord {
     }
 }
 
-impl TryFrom<AdminPublicOperationRow> for AdminPublicOperationRecord {
+impl TryFrom<PublicOperationRow> for AdminPublicOperationRecord {
     type Error = PublicOperationStoreError;
 
-    fn try_from(row: AdminPublicOperationRow) -> Result<Self, Self::Error> {
+    fn try_from(row: PublicOperationRow) -> Result<Self, Self::Error> {
         Ok(Self {
             id: OperationId::from_uuid(row.operation_id),
             org_id: row.org_id,

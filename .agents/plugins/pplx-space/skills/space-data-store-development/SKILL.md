@@ -40,12 +40,22 @@ Exemplar: `crates/libs/sandbox/store` (`pplx-space-sandbox-store`, the
   and result-processing code. Use a typed query builder only when the query
   shape is genuinely open-ended; keep identifiers and operators allowlisted
   and values bound as parameters.
-- The one exception is a whole boolean predicate from
+- One exception is a whole boolean predicate from
   `pplx_space_sandbox_portability`, the single definition of whether a
   sandbox's bytes are recoverable elsewhere. Interpolate it rather than
   re-spelling it: a second copy of that rule is how deletion paths and drain
   gates drift apart. Build the statement once (a `LazyLock<String>`), bind every
   value, and keep the rest of the statement whole at its query site.
+- The other is the column list of one row type read from one table: a shared
+  constant of that table's bare column names, with no expressions, aliases, or
+  joined columns, matching one `FromRow` struct field for field. Interpolate it
+  only as the entire `SELECT` list of a statement whose only `FROM` item is that
+  table and which decodes that struct, each statement built once (a
+  `LazyLock<String>`) at its query site with every value bound. It keeps a new
+  column to one SQL edit, and no read falls back to `SELECT *`, whose cached
+  statements fail with `0A000` once the table gains or loses a column. Nothing
+  else is exempt: predicates, joins, `FROM` clauses, assignments, ordering, and
+  any other column list stay whole at their query sites.
 - A migration that changes a predicate's shape (`SELECT EXISTS(..)` to
   `get(..).is_some_and(..)`, a hand-rolled probe onto a shared fragment) pins
   the equivalence with a Postgres-backed test before it merges.
