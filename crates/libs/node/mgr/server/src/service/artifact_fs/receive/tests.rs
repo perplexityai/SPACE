@@ -262,3 +262,80 @@ fn receiver_namespace_follows_host_unmounts_and_stays_contained() {
     assert!(child.wait().unwrap().success());
     drop(mounts);
 }
+
+/// prod-1 2026-10-20: a stored stream held a partial send followed by a full
+/// restarted send. `btrfs receive` read the second `btrfs-stream` magic as a
+/// command header, took `btrf` as a 1,718,776,930-byte length, and allocated
+/// it before the CRC check. The child runs in node-manager's container, so
+/// one corrupt stream OOMKilled the whole node-manager. The receiver must fail
+/// that stream with bounded memory instead.
+#[test]
+#[ignore = "requires root and an explicitly supplied disposable btrfs fixture directory"]
+fn receive_bounds_memory_of_appended_stream() {
+    let Some(fixture) = std::env::var_os("SPACE_NODEMGR_TEST_BTRFS_DIR") else {
+        eprintln!("not opted in: set SPACE_NODEMGR_TEST_BTRFS_DIR to a disposable btrfs directory");
+        return;
+    };
+    assert!(nix::unistd::geteuid().is_root());
+    let temp = tempfile::tempdir_in(fixture).unwrap();
+    let fixture = temp.path().canonicalize().unwrap();
+    let parent = trusted_paths::open_directory(&fixture).unwrap();
+    btrfs::create(&parent, "template".as_ref()).unwrap();
+    let template = directory(&parent, "template".as_ref()).unwrap();
+    std::fs::write(fixture.join("template/rootfs.ext4"), b"template").unwrap();
+    btrfs::set_readonly(&template, true).unwrap();
+    btrfs::snapshot(&template, &parent, "source".as_ref(), false).unwrap();
+    // Enough payload after the bogus header that the 1.6 GiB buffer is
+    // actually filled, as in the prod-1 streams.
+    {
+        let mut rootfs = File::create(fixture.join("source/rootfs.ext4")).unwrap();
+        let chunk = vec![0x5a_u8; 8 << 20];
+        for _ in 0..(1800 / 8) {
+            rootfs.write_all(&chunk).unwrap();
+        }
+        rootfs.sync_all().unwrap();
+    }
+    let source = directory(&parent, "source".as_ref()).unwrap();
+    btrfs::snapshot(&source, &parent, "sent".as_ref(), true).unwrap();
+    let sent = directory(&parent, "sent".as_ref()).unwrap();
+    let stream = File::create(fixture.join("stream")).unwrap();
+    btrfs::send(&template, &sent, &stream).unwrap();
+    drop(stream);
+    // The interrupted send got as far as its 17-byte stream header; the
+    // restarted send then appended a whole new stream.
+    {
+        let mut whole = File::open(fixture.join("stream")).unwrap();
+        let mut header = [0_u8; 17];
+        std::io::Read::read_exact(&mut whole, &mut header).unwrap();
+        assert_eq!(&header[..13], b"btrfs-stream\0");
+        let mut corrupt = File::create(fixture.join("corrupt")).unwrap();
+        corrupt.write_all(&header).unwrap();
+        let mut whole = File::open(fixture.join("stream")).unwrap();
+        std::io::copy(&mut whole, &mut corrupt).unwrap();
+        corrupt.sync_all().unwrap();
+    }
+    let destination = fixture.join("destination");
+    std::fs::create_dir(&destination).unwrap();
+    let receive = ReceiveRoot::open(&destination).unwrap();
+    let started = std::time::Instant::now();
+    let result = receive.receive(File::open(fixture.join("corrupt")).unwrap(), None);
+    let elapsed = started.elapsed();
+    let peak_kib = nix::sys::resource::getrusage(nix::sys::resource::UsageWho::RUSAGE_CHILDREN)
+        .unwrap()
+        .max_rss();
+    eprintln!(
+        "appended-stream receive: elapsed={elapsed:?} child_peak_rss={} MiB result={result:?}",
+        peak_kib / 1024
+    );
+    let error = result.unwrap_err();
+    assert!(!destination.join("instance").exists());
+    assert!(
+        peak_kib < 512 * 1024,
+        "btrfs receive child peaked at {} MiB on a corrupt stream; it must stay bounded",
+        peak_kib / 1024
+    );
+    assert!(
+        error.message().contains("memory"),
+        "a bounded failure should say it hit the memory cap: {error:?}"
+    );
+}
