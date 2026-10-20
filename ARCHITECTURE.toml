@@ -181,6 +181,87 @@ mode = "required"
 [rules.pattern_ratchet.substrate_literals.stale_entries]     # entries with fewer matches, none, or gone
 mode = "required"
 
+# Writes of the control-plane Postgres `public.sandboxes` row move into its
+# store, `pplx-space-sandbox-store`; this ratchet only shrinks. It counts each
+# production line that opens a statement writing the row (`UPDATE`,
+# `INSERT INTO`, `DELETE FROM`, `MERGE INTO` or `TRUNCATE` naming `sandboxes`,
+# in any case, schema-qualified or quoted, before any alias, including right
+# after a `\n`, `\r` or `\t` escape in a one-line string), and each call to
+# the sandbox-portability renderers that compose part of its SET list
+# (`sandbox_assignments()`, as a method or a path call, and the
+# `*_current_local_artifact_marker_assignments` functions, after punctuation,
+# a line start or `return`, `match`, `if`, `in`, `else` or `while`), so a file
+# with a composed `UPDATE sandboxes s SET {...}` counts the head and each
+# renderer call.
+# Not caught: a statement head split across lines (`UPDATE` and `sandboxes` on
+# different lines) or built at run time (`format!("UPDATE {table} ...")`); a
+# `COPY sandboxes FROM ...`; a statement in a non-`.rs` file, such as the
+# placement state machine's `include_str!` claim statements under
+# `postgres/sql/`; a head right after an escape other than `\n`, `\r` or
+# `\t` (`\0`, `\x0a`); a renderer called through an alias or a `use ... as`
+# rename, passed as a function value
+# (`.map(SuspendedK8sFinalizationSql::sandbox_assignments)`), or called
+# right after `break` or `yield`; database triggers; scripts and smoke
+# harnesses outside workspace members' `src/`.
+# False positives: the same text in a trailing `//` or `/* */` comment, in
+# `#[doc = "..."]`, in a SQL `--` comment or in an ordinary string such as an
+# error message ("failed to update sandboxes"); a statement on another
+# database's table of the same name.
+# sbx-mgr's node-local SQLite database also has a `sandboxes` table, a
+# different database on a different machine with its own store and fences
+# (`sbxmgr_sqlite` and `dependency_fence.sbxmgr_*` below), so its crates are
+# allowed whole: those rules guard `crates/libs/sbx/mgr/**` and
+# `crates/apps/sbx/**`, which today are all of `crates/libs/sbx` and
+# `crates/apps/sbx`, and a narrower glob would make this required rule fire
+# on moves within sbx-mgr. Test files are
+# filename-based, so `allow` adds the `#[cfg(test)]` support modules and
+# fixtures, which write rows to set up their cases; `#[cfg(test)]` code inline
+# in a production file counts, so test-only writes go in a `*_tests` file.
+# Exception paths, each a reviewed baseline edit: a new writer outside the
+# store is a new entry (`no_new_entries`); another write in a listed file is a
+# raised cap (`no_raised_caps`); splitting a listed file into modules needs
+# entries for the new files and a lower cap on the old one, since `--renames`
+# pairs only whole-file renames. Portability calls its private
+# `sandbox_assignments` helper bare; a path-qualified call to it there
+# (`Self::...`, `super::...`) matches and needs a reviewed entry.
+[rules.pattern_ratchet.sandbox_writes]
+patterns = [
+  # A statement head on the row's table
+  '''(?i)(?:\\[nrt]|\b)(?:UPDATE|DELETE\s+FROM|INSERT\s+INTO|MERGE\s+INTO|TRUNCATE(?:\s+TABLE)?)\s+(?:ONLY\s+)?(?:\\?"?public\\?"?\s*\.\s*)?\\?"?sandboxes\b''',
+  # Calls to the portability renderers of the row's assignments
+  '''(?:\.|::)\s*sandbox_assignments\s*\(''',
+  '''(?:^|[^\w\s]|\b(?:return|match|if|in|else|while)\s)\s*(?:\w+\s*::\s*)*(?:clear|write|publish_clear_or_preserve)_current_local_artifact_marker_assignments\s*\(''',
+]
+allow = [
+  "crates/libs/sandbox/store/**",
+  # node-local sbx-mgr SQLite `sandboxes`: a different database
+  "crates/libs/sbx/**",
+  "crates/apps/sbx/**",
+  "**/*_tests/**",
+  "**/test_support.rs",
+  "**/test_support/**",
+  "**/*_test_support.rs",
+  "**/test_fixtures.rs",
+  "**/*_test_fixture.rs",
+  "**/scripted_test_doubles.rs",
+  "crates/libs/db-test-fixtures/**",
+]
+
+[rules.pattern_ratchet.sandbox_writes.no_crossing]       # only allowed and listed files may match
+mode = "required"
+
+[rules.pattern_ratchet.sandbox_writes.no_new_entries]    # a pull request may not add entries to the baseline
+mode = "advisory"
+
+[rules.pattern_ratchet.sandbox_writes.no_raised_caps]    # a pull request may not raise a cap in the baseline
+mode = "advisory"
+
+[rules.pattern_ratchet.sandbox_writes.listed_no_growth]  # listed files may not gain matching lines
+mode = "required"
+
+[rules.pattern_ratchet.sandbox_writes.stale_entries]     # entries with fewer matches, none, or gone
+mode = "required"
+
 # Rootfs copies must preserve NoCoW and sparse extents through common-io's
 # reflink helper. A line matcher cannot infer a path variable's contents, so
 # conservatively fence all new plain filesystem copies and cp launches.
