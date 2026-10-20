@@ -1331,11 +1331,21 @@ pub(super) async fn fetch_network_policy(sandbox_id: &str) -> Result<FetchedNetw
     })
 }
 
+/// A local override created without a generation starts its lineage at 1. A
+/// cluster override keeps the caller's generation, including 0: a cluster
+/// create may seed an inherited sandbox with its template's effective policy
+/// at 0, below the sandbox's own lineage, and the first reconcile, at the
+/// sandbox's generation (never below 1), must replace that seed with
+/// inheritance rather than conflict with it.
 pub(super) fn create_network_policy_generation(
     network_policy_override: Option<&NetworkPolicy>,
     requested_generation: u64,
+    authority: crate::db::PolicyAuthority,
 ) -> u64 {
-    if network_policy_override.is_some() && requested_generation == 0 {
+    if network_policy_override.is_some()
+        && requested_generation == 0
+        && authority == crate::db::PolicyAuthority::Local
+    {
         1
     } else {
         requested_generation

@@ -972,6 +972,39 @@ fn sandbox_policy_apply_filter_skips_matching_policies() {
     );
 }
 
+/// An inherited policy's local generations are the template's counter, not
+/// the sandbox generation node-ctl reconciles with, so they never match it
+/// once the template has changed. A matching inherited policy is skipped
+/// rather than re-applied, and a gateway refresh queued, on every pass.
+#[test]
+fn sandbox_policy_apply_filter_matches_inherited_policy_by_content() {
+    let policy = test_network_policy(EgressDefaultAction::Allow);
+    let desired = desired_sandbox_policy(NetworkPolicySource::Template, policy.clone(), 1);
+    let local = local_sandbox_policy(NetworkPolicySource::Template, true, policy, 2);
+    assert!(!sandbox_policy_needs_apply(&desired, Some(&local)));
+
+    let stale_template = local_sandbox_policy(
+        NetworkPolicySource::Template,
+        true,
+        test_network_policy(EgressDefaultAction::Deny),
+        2,
+    );
+    assert!(sandbox_policy_needs_apply(&desired, Some(&stale_template)));
+
+    // The gateway has not applied the template generation the sandbox now
+    // inherits, so the policy is applied again to refresh it.
+    let gateway_behind = NetworkPolicyDetail {
+        applied_generation: 1,
+        ..local_sandbox_policy(
+            NetworkPolicySource::Template,
+            true,
+            test_network_policy(EgressDefaultAction::Allow),
+            2,
+        )
+    };
+    assert!(sandbox_policy_needs_apply(&desired, Some(&gateway_behind)));
+}
+
 #[test]
 fn sandbox_policy_apply_filter_applies_on_missing_or_effective_drift() {
     let desired = desired_sandbox_policy(

@@ -292,15 +292,16 @@ impl SandboxManagerService {
                 validate_v1_policy(&policy).map_err(Status::invalid_argument)?;
                 let mut runtime_state = AutoLifecycleRuntimeState::default();
                 recompute_runtime_state(&mut runtime_state, &policy);
-                let network_policy_generation = create_network_policy_generation(
-                    network_policy_override.as_ref(),
-                    req.network_policy_generation,
-                );
                 let network_policy_authority = create_network_policy_authority(
                     network_policy_override.as_ref(),
                     req.network_policy_authority,
                     sandbox.network_policy_authority,
                 )?;
+                let network_policy_generation = create_network_policy_generation(
+                    network_policy_override.as_ref(),
+                    req.network_policy_generation,
+                    network_policy_authority,
+                );
                 let route_identity_changed = sandbox.space_api_route_identity != route_identity;
                 self.apply_route_identity_mutation(sandbox_id, "pool_adoption", || {
                     let db = self.db_conn()?;

@@ -294,11 +294,21 @@ pub(super) fn sandbox_policy_needs_apply(
         NetworkPolicySource::Override
     };
 
+    // The desired generation is the sandbox's own, but sandbox-manager reports
+    // an inherited policy's generations from the template's counter. Comparing
+    // the two would re-apply, and refresh the gateway, on every pass whenever
+    // the counters differ, so an inherited policy is matched by content and by
+    // the gateway having applied the template generation it inherits.
+    let generation_drifted = if inherit_template {
+        local.applied_generation != local.effective_generation
+    } else {
+        local.effective_generation != desired.generation
+            || local.applied_generation != desired.generation
+    };
     local.authority != PolicyAuthority::Cluster.as_proto_i32()
         || local.inherited != inherit_template
-        || local.effective_generation != desired.generation
+        || generation_drifted
         || desired.policy != local.effective_policy
-        || local.applied_generation != desired.generation
         || local.applied_source != expected_applied_source as i32
 }
 

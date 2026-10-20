@@ -342,15 +342,16 @@ impl SandboxManagerService {
             })
             .flatten();
         let network_policy_override = Self::resolve_create_network_policy_override(req)?;
-        let network_policy_generation = create_network_policy_generation(
-            network_policy_override.as_ref(),
-            req.network_policy_generation,
-        );
         let network_policy_authority = create_network_policy_authority(
             network_policy_override.as_ref(),
             req.network_policy_authority,
             default_network_policy_authority,
         )?;
+        let network_policy_generation = create_network_policy_generation(
+            network_policy_override.as_ref(),
+            req.network_policy_generation,
+            network_policy_authority,
+        );
         let auto_lifecycle_authority = if req.auto_lifecycle.is_some() {
             crate::db::PolicyAuthority::try_from(req.auto_lifecycle_authority)
                 .map_err(|error| Status::invalid_argument(error.to_string()))?

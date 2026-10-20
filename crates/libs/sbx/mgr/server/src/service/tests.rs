@@ -4248,16 +4248,70 @@ pub(crate) mod service_tests {
     }
 
     #[test]
-    fn create_network_policy_generation_bumps_explicit_zero_to_one() {
+    fn create_network_policy_generation_bumps_only_a_local_explicit_zero() {
+        use crate::db::PolicyAuthority::{Cluster, Local};
+        let policy = NetworkPolicyV1::deny_all();
+        assert_eq!(create_network_policy_generation(Some(&policy), 0, Local), 1);
         assert_eq!(
-            create_network_policy_generation(Some(&NetworkPolicyV1::deny_all()), 0),
-            1
+            create_network_policy_generation(Some(&policy), 0, Cluster),
+            0
         );
         assert_eq!(
-            create_network_policy_generation(Some(&NetworkPolicyV1::deny_all()), 7),
+            create_network_policy_generation(Some(&policy), 7, Cluster),
             7
         );
-        assert_eq!(create_network_policy_generation(None, 0), 0);
+        assert_eq!(create_network_policy_generation(None, 0, Cluster), 0);
+    }
+
+    /// A cluster create may seed an inherited sandbox with its template's
+    /// effective policy at generation 0. node-ctl then reconciles inheritance
+    /// at the sandbox's own generation, which starts at 1. That reconcile must
+    /// replace the seed, and a later user override must apply. A seed bumped to
+    /// generation 1 made both conflict, and the policy state never converged.
+    #[test]
+    fn cluster_reconcile_replaces_a_cold_create_seed() {
+        use crate::db::{NetworkPolicyOverrideUpdate, PolicyAuthority};
+
+        let conn = crate::db::test_conn();
+        let sandbox_id = SandboxId::new().to_string();
+        insert_test_sandbox(&conn, &sandbox_id, SandboxState::Started);
+        let template_policy = NetworkPolicyV1::allow_all();
+        let seed_generation =
+            create_network_policy_generation(Some(&template_policy), 0, PolicyAuthority::Cluster);
+        crate::db::set_network_policy_fields(
+            &conn,
+            &sandbox_id,
+            Some(&template_policy),
+            seed_generation,
+            PolicyAuthority::Cluster,
+        )
+        .unwrap();
+        let reconcile = |policy: Option<&NetworkPolicyV1>, generation: u64| {
+            crate::db::update_network_policy_override(
+                &conn,
+                &sandbox_id,
+                policy,
+                generation,
+                PolicyAuthority::Cluster,
+                false,
+                false,
+            )
+            .unwrap()
+            .decision
+        };
+
+        assert_eq!(reconcile(None, 1), NetworkPolicyOverrideUpdate::Apply);
+        let row = crate::db::get_sandbox(&conn, &sandbox_id).unwrap().unwrap();
+        assert_eq!(row.network_policy_override, None);
+        assert_eq!(row.network_policy_generation, 1);
+
+        let user_policy = NetworkPolicyV1::deny_all();
+        assert_eq!(
+            reconcile(Some(&user_policy), 2),
+            NetworkPolicyOverrideUpdate::Apply
+        );
+        let row = crate::db::get_sandbox(&conn, &sandbox_id).unwrap().unwrap();
+        assert_eq!(row.network_policy_override, Some(user_policy));
     }
 
     #[test]
