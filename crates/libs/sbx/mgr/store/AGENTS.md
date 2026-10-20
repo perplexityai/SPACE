@@ -22,8 +22,8 @@ that nothing else in the server's production graph brings them in.
   `ALLOWLIST` in `src/db/tests/state_write_table.rs`. Nothing checks the table
   against the writers; the `&'static Edge` argument does that at call sites. A
   refused write must leave every row unchanged.
-- Foreign keys are off: register a new sandbox child table in
-  `delete_sandbox_child_rows` (`src/db.rs`).
+- Only some child tables declare `ON DELETE CASCADE`: register a new sandbox
+  child table in `delete_sandbox_child_rows` (`src/db.rs`).
 - Fixtures that sbx-mgr's other test suites share live in `db::fixture` and
   `db::test_fixtures`, behind `test-support`; fixtures only this crate's tests
   use stay in the test modules.

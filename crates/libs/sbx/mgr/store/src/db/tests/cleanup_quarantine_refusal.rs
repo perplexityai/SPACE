@@ -623,8 +623,9 @@ fn quarantine_cleanup_refuses_without_a_current_requested_episode() {
             );
             episode.id
         }),
-        // The service opens SQLite without foreign-key enforcement, so an
-        // episode can outlive its sandbox row.
+        // The bundled SQLite enforces foreign keys, which would cascade the
+        // episode away; turn enforcement off to model an episode that
+        // outlived its sandbox row anyway.
         ("sandbox row gone", |conn, id| {
             let episode = requested_start(conn, id, "gone0003");
             let foreign_keys: bool = conn
