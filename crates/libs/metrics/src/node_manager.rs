@@ -235,3 +235,36 @@ pub fn balloon_snapshot_statistics(
 pub fn legacy_execution_source_launch() {
     counter("node_mgr.execution.legacy_source_launch", 1, &[]);
 }
+
+metric_vocabulary!(
+    /// The framing check that refused a btrfs send stream before node-manager
+    /// relayed it to volume-manager.
+    BtrfsSendStreamRejection {
+        /// The stream does not start with the btrfs-stream header.
+        BadMagic => "bad_magic",
+        /// The stream header names a version node-manager does not read.
+        Version => "version",
+        /// A command declares more payload than a send command can carry.
+        CommandTooLarge => "command_too_large",
+        /// A command's CRC does not match: the kernel restarted the send
+        /// mid-pipe and appended a fresh stream to the partial one.
+        Crc => "crc",
+        /// Bytes follow the stream's END command.
+        DataAfterEnd => "data_after_end",
+        /// The stream ended inside an item, before its END command.
+        Truncated => "truncated",
+    }
+);
+
+/// `node_mgr.btrfs_send.stream_rejected`: node-manager refused a btrfs send
+/// stream at its framing check, failing that upload attempt (`Aborted`, which
+/// volume-manager retries with a fresh send) instead of forwarding a stream
+/// `btrfs receive` would reject. Tagged with the check that failed; no lease
+/// or sandbox tag.
+pub fn btrfs_send_stream_rejected(reason: BtrfsSendStreamRejection) {
+    counter(
+        "node_mgr.btrfs_send.stream_rejected",
+        1,
+        &[tag("reason", reason)],
+    );
+}

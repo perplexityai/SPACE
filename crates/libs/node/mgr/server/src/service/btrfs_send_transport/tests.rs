@@ -178,3 +178,28 @@ async fn durable_lease_survives_producer_removal_and_cancelled_grpc_reader() {
     shutdown.cancel();
     task.await.unwrap();
 }
+
+/// A send the kernel restarted mid-pipe: the partial first stream, then the
+/// restart's complete one. The relay refuses it with the status volume-manager
+/// retries, and counts the refusal by the check that failed.
+#[test]
+fn a_restarted_send_is_refused_as_retriable_and_counted() {
+    const STREAM: &[u8] = include_bytes!("../../fixtures/btrfs_send_v1.stream");
+    let restarted = [&STREAM[..STREAM.len() / 2], STREAM].concat();
+    let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+    let mut framing = framing::SendStreamFraming::new();
+    let status = framing
+        .feed(&restarted)
+        .and_then(|()| framing.finish())
+        .map_err(framing_status)
+        .expect_err("a restarted send must not frame as one stream");
+    assert_eq!(status.code(), tonic::Code::Aborted);
+    assert!(status.message().starts_with("btrfs send stream rejected: "));
+    let rejected: Vec<_> = capture
+        .finish()
+        .into_iter()
+        .filter(|counter| counter.name == "node_mgr.btrfs_send.stream_rejected")
+        .map(|counter| (counter.value, counter.tags))
+        .collect();
+    assert_eq!(rejected, vec![(1, vec!["reason:crc".to_string()])]);
+}
