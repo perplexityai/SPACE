@@ -103,7 +103,7 @@ impl K8sCaches {
     /// Assemble caches from pre-populated stores, with explicit node readiness.
     /// The `nodes_ready` field is private, so sibling test modules build caches
     /// through this constructor instead of a struct literal.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(super) fn for_test(
         node_api_pods: Store<Pod>,
         nodes: Store<Node>,

@@ -36,9 +36,9 @@ use sqlx::PgPool;
 
 use super::*;
 use crate::lifecycle_writer_test_support::{
-    ExecutionSeed, SandboxSeed, bounded, enter_kubernetes_process, insert_execution, insert_node,
-    insert_sandbox, insert_snapshot, keeps_marker, kubernetes_substrate, pin_local_artifact,
-    single_backend_pool, wait_until_blocked,
+    ExecutionSeed, SandboxSeed, bounded, insert_execution, insert_node, insert_sandbox,
+    insert_snapshot, keeps_marker, kubernetes_substrate, pin_local_artifact, single_backend_pool,
+    wait_until_blocked,
 };
 
 mod restore_finalize;
@@ -883,8 +883,8 @@ async fn gone_node_mark_lost_fails_only_suspended_rows() -> TestResult {
 // Give-up writes that tear down through Kubernetes.
 // ---------------------------------------------------------------------------
 
-async fn kubernetes_sink(pool: &PgPool) -> TestResult<SubstrateSink> {
-    let substrate = kubernetes_substrate(pool).await?;
+fn kubernetes_sink(pool: &PgPool) -> TestResult<SubstrateSink> {
+    let substrate = kubernetes_substrate(pool)?;
     Ok(SubstrateSink::new(
         pool.clone(),
         Arc::new(substrate),
@@ -946,12 +946,9 @@ async fn failed_on_node_give_up_claims_only_started_or_paused_residents() -> Tes
         "bogus                .        .",
         "_Suspended_          .        .",
     ];
-    if !enter_kubernetes_process()? {
-        return Ok(());
-    }
     let db = pg_test_db().await?;
     let pool = &db.pool;
-    let sink = Box::pin(kubernetes_sink(pool)).await?;
+    let sink = kubernetes_sink(pool)?;
     let node_id = insert_forced_draining_node(pool).await?;
 
     let mut mismatches = Vec::new();
@@ -1010,12 +1007,9 @@ async fn abandon_stale_claims_only_aged_unmarked_transients_of_the_node() -> Tes
         "bogus                .        .",
         "_Suspended_          .        .",
     ];
-    if !enter_kubernetes_process()? {
-        return Ok(());
-    }
     let db = pg_test_db().await?;
     let pool = &db.pool;
-    let sink = Box::pin(kubernetes_sink(pool)).await?;
+    let sink = kubernetes_sink(pool)?;
     let node_id = insert_forced_draining_node(pool).await?;
     let age = PositiveDuration::new(Duration::from_secs(60)).expect("non-zero");
 
@@ -1099,12 +1093,9 @@ async fn give_up_claims_skip_a_locked_row() -> TestResult {
         })
     }
 
-    if !enter_kubernetes_process()? {
-        return Ok(());
-    }
     let db = pg_test_db_with_max_connections(3).await?;
     let pool = &db.pool;
-    let sink = Box::pin(kubernetes_sink(pool)).await?;
+    let sink = kubernetes_sink(pool)?;
 
     for give_up in [GiveUp::FailedOnNode, GiveUp::AbandonStale] {
         let node_id = insert_forced_draining_node(pool).await?;

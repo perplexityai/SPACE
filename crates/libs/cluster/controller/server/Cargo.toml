@@ -81,6 +81,7 @@ pplx-space-sandbox-portability = { workspace = true }
 pplx-space-sbx-mgr-client = { workspace = true }
 
 [dev-dependencies]
+pplx-space-api = { workspace = true, features = ["test-hooks"] }
 pplx-space-common-core = { workspace = true, features = ["sqlx", "test-hooks"] }
 pplx-space-common-svc = { workspace = true, features = ["test-support"] }
 pplx-space-metrics = { workspace = true, features = ["test-capture"] }

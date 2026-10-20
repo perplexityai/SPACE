@@ -125,7 +125,7 @@ impl PodEvents {
         (Self { tx: tx.clone() }, tx)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(super) fn for_test() -> Self {
         Self::new().0
     }

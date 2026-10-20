@@ -42,9 +42,8 @@ use sqlx::PgPool;
 
 use super::{SWEEPABLE_LIFECYCLES, SubstrateSweepSink, SweepSink};
 use crate::lifecycle_writer_test_support::{
-    ExecutionSeed, SandboxSeed, bounded, enter_kubernetes_process, insert_execution,
-    insert_sandbox, insert_snapshot, kubernetes_substrate, pin_local_artifact, single_backend_pool,
-    wait_until_blocked,
+    ExecutionSeed, SandboxSeed, bounded, insert_execution, insert_sandbox, insert_snapshot,
+    kubernetes_substrate, pin_local_artifact, single_backend_pool, wait_until_blocked,
 };
 
 fn age() -> PositiveDuration {
@@ -831,12 +830,9 @@ async fn failed_active_repair_moves_only_failed_rows() -> TestResult {
         "bogus             .",
         "_Suspended_       .",
     ];
-    if !enter_kubernetes_process()? {
-        return Ok(());
-    }
     let db = pg_test_db().await?;
     let pool = &db.pool;
-    let substrate = Box::pin(kubernetes_substrate(pool)).await?;
+    let substrate = kubernetes_substrate(pool)?;
     let sink = SubstrateSweepSink::new(
         pool.clone(),
         Arc::new(Substrate::from_kubernetes(substrate)),
