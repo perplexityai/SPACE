@@ -26,9 +26,10 @@ Its normal native selection now includes these checks; no extra package or
 separate hardening workflow is needed. Existing duration-balanced sharding
 also includes them.
 
-Kind CI runs this inventory on main and on the existing path-selected Kind PR
-workflow. This does not introduce Kind execution on every PR. Private
-compositions invoke platform commands through their platform-command wrapper.
+Kind CI runs this inventory on main and on pull requests whose paths select
+the Kind smoke in Pull CI. This does not introduce Kind execution on every PR.
+Private compositions invoke platform commands through their platform-command
+wrapper.
 
 For HTTP-only access to an already deployed test environment:
 
