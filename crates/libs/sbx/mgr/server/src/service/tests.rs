@@ -11557,10 +11557,8 @@ pub(crate) mod service_tests {
         }
     }
 
-    /// Builds a suspended sandbox whose original suspend artifact is the
-    /// restore source, then rolls back a restore activation for `generation`
-    /// before the activation attached a runtime.
-    fn job_snapshot(conn: &rusqlite::Connection) -> Vec<(i64, String, String)> {
+    /// Every job row in insertion order, to show a step queued no job.
+    fn job_snapshot(conn: &crate::db::Connection) -> Vec<(i64, String, String)> {
         conn.prepare("SELECT rowid, kind, status FROM jobs ORDER BY rowid")
             .unwrap()
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
@@ -11569,15 +11567,36 @@ pub(crate) mod service_tests {
             .collect()
     }
 
+    /// The route identity of the execution that ran before the suspend: what
+    /// a paused sandbox that actually ran carries. The suspend and the
+    /// rollback both retain it (`apply_cleanup_state`).
+    const PRIOR_ROUTE_POD_UID: &str = "pod-gen-1";
+
+    /// Builds a suspended sandbox whose original suspend artifact is the
+    /// restore source, then rolls back a restore activation for `generation`
+    /// before the activation attached a runtime. With `prior_route`, the
+    /// sandbox first ran as generation 1 with [`PRIOR_ROUTE_POD_UID`], the
+    /// production shape; without it, it has no route identity at all.
     fn suspended_sandbox_after_restore_rollback(
-        conn: &rusqlite::Connection,
+        conn: &crate::db::Connection,
         id: &str,
         original_artifact: LocalArtifactId,
         original_backed: bool,
         generation: ExecutionGeneration,
         attempt: SandboxActivationAttemptId,
+        prior_route: bool,
     ) {
         insert_test_sandbox(conn, id, SandboxState::Paused);
+        if prior_route {
+            conn.execute(
+                "UPDATE sandboxes
+                    SET space_api_route_execution_generation = ?2,
+                        space_api_route_pod_uid = ?3
+                  WHERE id = ?1",
+                crate::db::fixture::params![id, teardown_generation().get(), PRIOR_ROUTE_POD_UID],
+            )
+            .unwrap();
+        }
         let suspended_generation = teardown_generation();
         crate::db::begin_teardown_suspend(conn, id, suspended_generation).unwrap();
         crate::db::stage_teardown_suspend_artifact(
@@ -11633,18 +11652,43 @@ pub(crate) mod service_tests {
         let row = crate::db::get_sandbox(conn, id).unwrap().unwrap();
         assert_eq!(row.state, SandboxState::Suspended);
         assert_eq!(row.current_local_artifact_id, Some(original_artifact));
+        let retained: (Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT space_api_route_execution_generation, space_api_route_pod_uid
+                   FROM sandboxes WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let expected = if prior_route {
+            (
+                Some(teardown_generation().get()),
+                Some(PRIOR_ROUTE_POD_UID.to_owned()),
+            )
+        } else {
+            (None, None)
+        };
+        assert_eq!(
+            retained, expected,
+            "the rollback keeps the prior route identity"
+        );
     }
 
     #[tokio::test]
     async fn teardown_after_late_activation_of_rolled_back_attempt_reuses_original_artifact() {
         // A confirmed rollback retires its exact generation/activation attempt.
-        // A late activation for that same attempt, followed by the retired
-        // execution's teardown before any successor exists, must neither take
+        // A late activation for that same attempt is refused, and the retired
+        // execution's teardown before any successor exists must neither take
         // a new snapshot nor queue a backup: the original artifact stays the
-        // restore source for the retry.
+        // restore source for the retry. `prior_route` covers a sandbox that
+        // ran before the suspend, whose rollback keeps that route identity.
         for original_backed in [true, false] {
-            for late_activation in [true, false] {
-                let case = format!("backed={original_backed}/late_activation={late_activation}");
+            for (late_activation, prior_route) in
+                [(true, true), (true, false), (false, true), (false, false)]
+            {
+                let case = format!(
+                    "backed={original_backed}/late_activation={late_activation}/prior_route={prior_route}"
+                );
                 let directory = tempfile::tempdir().unwrap();
                 let db_path = directory.path().join("manager.sqlite");
                 let sandbox_id = SandboxId::new();
@@ -11656,11 +11700,10 @@ pub(crate) mod service_tests {
                     .activation_attempt_id
                     .unwrap();
                 let original_artifact = LocalArtifactId::new();
-                let mut late_admitted = None;
                 let jobs_after_rollback;
                 {
                     crate::db::create_test_schema_on_disk(&db_path);
-                    let conn = rusqlite::Connection::open(&db_path).unwrap();
+                    let conn = crate::db::Connection::open_at(&db_path).unwrap();
                     suspended_sandbox_after_restore_rollback(
                         &conn,
                         &id,
@@ -11668,6 +11711,7 @@ pub(crate) mod service_tests {
                         original_backed,
                         generation,
                         attempt,
+                        prior_route,
                     );
                     jobs_after_rollback = job_snapshot(&conn);
                     if late_activation {
@@ -11679,7 +11723,6 @@ pub(crate) mod service_tests {
                             Some(generation),
                             Some(attempt),
                         );
-                        late_admitted = Some(matches!(late, Ok(Some(_))));
                         assert!(
                             matches!(
                                 late,
@@ -11691,27 +11734,11 @@ pub(crate) mod service_tests {
                             ),
                             "{case}: {late:?}"
                         );
-                        if let Ok(Some(episode)) = late {
-                            // Pre-fix behavior: the abandoned attempt completes.
-                            crate::db::update_runtime_fields_for_activation(
-                                &conn, sandbox_id, episode.id, fields,
-                            )
-                            .unwrap();
-                            assert!(
-                                crate::db::mark_restore_succeeded(
-                                    &conn,
-                                    &id,
-                                    SandboxState::Started,
-                                    Some(episode.id),
-                                )
-                                .unwrap()
-                            );
-                        }
                     }
                 }
 
                 let service =
-                    service_for_teardown_test(rusqlite::Connection::open(&db_path).unwrap());
+                    service_for_teardown_test(crate::db::Connection::open_at(&db_path).unwrap());
                 let response = service
                     .prepare_teardown_suspend(internal_request(prepare_teardown_suspend_request(
                         id.clone(),
@@ -11752,12 +11779,6 @@ pub(crate) mod service_tests {
                     )
                     .unwrap();
                 assert_eq!(artifacts, 1, "{case}: no new snapshot artifact");
-                if let Some(admitted) = late_admitted {
-                    assert!(
-                        !admitted,
-                        "{case}: the rolled-back attempt must not reactivate"
-                    );
-                }
                 // The retry is a new activation attempt from the original artifact.
                 let successor = runtime_fields(ExecutionGeneration::new(3).unwrap(), 3);
                 assert!(
@@ -11794,6 +11815,7 @@ pub(crate) mod service_tests {
             true,
             generation,
             rolled_back_attempt,
+            true,
         );
 
         let new_attempt = SandboxActivationAttemptId::new();
@@ -11809,6 +11831,136 @@ pub(crate) mod service_tests {
         let row = crate::db::get_sandbox(&conn, &id).unwrap().unwrap();
         assert_eq!(row.state, SandboxState::Restoring);
         assert_eq!(row.current_local_artifact_id, Some(original_artifact));
+    }
+
+    #[test]
+    fn a_rollback_receipt_refuses_only_activations_from_its_own_state() {
+        // The receipt describes the row as the rollback left it. A caller
+        // that expects another state is not refused on its authority.
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        let generation = ExecutionGeneration::new(2).unwrap();
+        let attempt = SandboxActivationAttemptId::new();
+        suspended_sandbox_after_restore_rollback(
+            &conn,
+            &id,
+            LocalArtifactId::new(),
+            true,
+            generation,
+            attempt,
+            true,
+        );
+        let check = |expected_state| {
+            crate::db::retired_activation(
+                &conn,
+                &id,
+                expected_state,
+                Some(generation),
+                Some(attempt),
+                None,
+            )
+            .unwrap()
+        };
+        assert!(
+            matches!(
+                check(SandboxState::Suspended),
+                Some(crate::db::BeginActivationError::RolledBackAttempt { .. })
+            ),
+            "the rollback's own state is refused"
+        );
+        assert!(
+            check(SandboxState::Stopped).is_none(),
+            "another expected state is not refused on this receipt"
+        );
+    }
+
+    #[test]
+    fn a_malformed_rollback_receipt_carries_no_authority_anywhere() {
+        // All three readers of the rollback receipt share one rule: a receipt
+        // that does not decode is ignored. Admission must not refuse on it,
+        // and the delete fence must not widen to its generation.
+        let generation = ExecutionGeneration::new(2).unwrap();
+        let malformed = |conn: &crate::db::Connection, id: &str| {
+            suspended_sandbox_after_restore_rollback(
+                conn,
+                id,
+                LocalArtifactId::new(),
+                true,
+                generation,
+                SandboxActivationAttemptId::new(),
+                true,
+            );
+            // A blank receipt id fails decoding; the kind still names a rollback.
+            conn.execute(
+                "UPDATE sandboxes SET transition_receipt_id = ' ' WHERE id = ?1",
+                [id],
+            )
+            .unwrap();
+        };
+
+        // The delete fence covers only the row's own route generation.
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        malformed(&conn, &id);
+        let artifact = crate::db::get_sandbox(&conn, &id)
+            .unwrap()
+            .unwrap()
+            .current_local_artifact_id
+            .unwrap();
+        assert!(
+            crate::db::claim_suspended_sandbox_for_eviction(
+                &conn,
+                &id,
+                Some(&artifact.to_string()),
+                None,
+            )
+            .unwrap()
+        );
+        crate::db::set_cleanup_intent(&conn, &id, false, crate::db::CleanupCompletion::DeleteRow)
+            .unwrap();
+        crate::db::complete_row_intent_cleanup(
+            &conn,
+            &id,
+            crate::db::CleanupCompletion::DeleteRow,
+            None,
+        )
+        .unwrap();
+        assert!(crate::db::get_sandbox(&conn, &id).unwrap().is_none());
+        assert!(
+            crate::db::execution_delete_receipt_covers(&conn, &id, teardown_generation()).unwrap()
+        );
+        assert!(
+            !crate::db::execution_delete_receipt_covers(&conn, &id, generation).unwrap(),
+            "a malformed receipt must not widen the delete fence"
+        );
+
+        // Admission ignores it: the same attempt is admitted.
+        let conn = crate::db::test_conn();
+        let id = SandboxId::new().to_string();
+        let attempt = SandboxActivationAttemptId::new();
+        suspended_sandbox_after_restore_rollback(
+            &conn,
+            &id,
+            LocalArtifactId::new(),
+            true,
+            generation,
+            attempt,
+            true,
+        );
+        conn.execute(
+            "UPDATE sandboxes SET transition_receipt_id = ' ' WHERE id = ?1",
+            [&id],
+        )
+        .unwrap();
+        let late = crate::db::begin_activation(
+            &conn,
+            &id,
+            SandboxState::Suspended,
+            crate::db::ActivationKind::Restore,
+            Some(generation),
+            Some(attempt),
+        );
+        assert!(matches!(late, Ok(Some(_))), "{late:?}");
     }
 
     #[test]
@@ -11828,6 +11980,7 @@ pub(crate) mod service_tests {
             true,
             generation,
             attempt,
+            true,
         );
 
         assert!(
@@ -11893,7 +12046,7 @@ pub(crate) mod service_tests {
     /// The fields a refused activation must leave untouched: lifecycle state,
     /// rollback receipt, artifact pin, retained route evidence and the row's
     /// write stamp.
-    fn rollback_row_witness(conn: &rusqlite::Connection, id: &str) -> Vec<Option<String>> {
+    fn rollback_row_witness(conn: &crate::db::Connection, id: &str) -> Vec<Option<String>> {
         conn.query_row(
             "SELECT state, current_local_artifact_id, transition_receipt_id,
                     transition_receipt_kind, CAST(transition_receipt_execution_generation AS TEXT),
@@ -11907,7 +12060,7 @@ pub(crate) mod service_tests {
         .unwrap()
     }
 
-    fn local_artifact_count(conn: &rusqlite::Connection, id: &str) -> i64 {
+    fn local_artifact_count(conn: &crate::db::Connection, id: &str) -> i64 {
         conn.query_row(
             "SELECT COUNT(*) FROM local_artifacts WHERE sandbox_id = ?1",
             [id],
@@ -11943,7 +12096,7 @@ pub(crate) mod service_tests {
             let original_artifact = LocalArtifactId::new();
             crate::db::create_test_schema_on_disk(&db_path);
             {
-                let conn = rusqlite::Connection::open(&db_path).unwrap();
+                let conn = crate::db::Connection::open_at(&db_path).unwrap();
                 suspended_sandbox_after_restore_rollback(
                     &conn,
                     &id,
@@ -11951,9 +12104,11 @@ pub(crate) mod service_tests {
                     original_backed,
                     generation,
                     attempt,
+                    true,
                 );
             }
-            let service = service_for_teardown_test(rusqlite::Connection::open(&db_path).unwrap());
+            let service =
+                service_for_teardown_test(crate::db::Connection::open_at(&db_path).unwrap());
             let (witness, jobs) = {
                 let db = service.db.lock().unwrap();
                 (rollback_row_witness(&db, &id), job_snapshot(&db))
@@ -12036,6 +12191,7 @@ pub(crate) mod service_tests {
             true,
             generation,
             attempt,
+            true,
         );
         assert!(
             crate::db::claim_suspended_sandbox_for_eviction(
@@ -12153,6 +12309,7 @@ pub(crate) mod service_tests {
             true,
             generation,
             attempt,
+            true,
         );
         let observed = crate::db::get_sandbox(&conn, &id).unwrap().unwrap();
         assert!(matches!(

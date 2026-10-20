@@ -396,7 +396,7 @@ pub fn begin_activation_with_route_evidence(
 /// `begin_activation_with_route_evidence` runs this inside its transaction;
 /// start paths also call it before any staging work so a refused retry does
 /// no restore work at all.
-pub(crate) fn retired_activation(
+pub fn retired_activation(
     conn: &Connection,
     id: &str,
     expected_state: SandboxState,
@@ -446,45 +446,26 @@ fn rolled_back_activation_attempt(
     if activation_attempt_id.is_none() && operation_activation_attempt_id.is_none() {
         return Ok(None);
     }
-    let row = tx
-        .query_row(
-            "SELECT transition_receipt_id, transition_receipt_kind,
-                    transition_receipt_target_state, transition_receipt_execution_generation,
-                    transition_receipt_reason_code, transition_receipt_activation_attempt_id,
-                    last_observed_execution_generation, last_observed_route_activation_id
-               FROM sandboxes
-              WHERE id = ?1 AND state = ?2 AND transition_receipt_id IS NOT NULL",
-            params![id, expected_state.as_str()],
-            |row| {
-                Ok((
-                    RawSandboxStatePublicationMetadata {
-                        quarantine_reason_code: None,
-                        transition_receipt_id: row.get(0)?,
-                        transition_receipt_kind: row.get(1)?,
-                        transition_receipt_target_state: row.get(2)?,
-                        transition_receipt_execution_generation: row.get(3)?,
-                        transition_receipt_reason_code: row.get(4)?,
-                        transition_receipt_activation_attempt_id: row.get(5)?,
-                    },
-                    row.get::<_, Option<i64>>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                ))
-            },
-        )
-        .optional()?;
-    let Some((receipt, observed_generation, observed_route_attempt)) = row else {
+    let Some(rollback) = activation_rollback_receipt(tx, id)? else {
         return Ok(None);
     };
-    // A malformed receipt carries no rollback authority; admission proceeds
-    // exactly as it did before this guard existed.
-    let Ok(SandboxStatePublicationMetadata::TransitionReceipt(receipt)) =
-        receipt.decode(expected_state)
-    else {
+    if !rollback.is_current_for(expected_state) {
         return Ok(None);
-    };
-    if receipt.kind() != SandboxTransitionReceiptKind::ActivationRollback
-        || receipt.execution_generation() != execution_generation
-    {
+    }
+    let receipt = rollback.receipt;
+    let (observed_generation, observed_route_attempt) = tx.query_row(
+        "SELECT last_observed_execution_generation, last_observed_route_activation_id
+           FROM sandboxes
+          WHERE id = ?1",
+        [id],
+        |row| {
+            Ok((
+                row.get::<_, Option<i64>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        },
+    )?;
+    if receipt.execution_generation() != execution_generation {
         return Ok(None);
     }
     let receipt_attempt = receipt.activation_attempt_id();
@@ -508,6 +489,86 @@ fn rolled_back_activation_attempt(
             activation_attempt_id,
         },
     ))
+}
+
+/// A well-formed activation-rollback receipt and the row state it was read from.
+pub(crate) struct ActivationRollbackReceipt {
+    /// The row's state when the receipt was read.
+    pub(crate) row_state: SandboxState,
+    /// The state the rollback left the row in.
+    pub(crate) target_state: SandboxState,
+    pub(crate) receipt: SandboxTransitionReceipt<PublishedQuarantineReasonCode>,
+}
+
+impl ActivationRollbackReceipt {
+    /// The receipt still describes the row as it is: the row is in the state
+    /// the rollback left it in, and that state is `state`.
+    pub(crate) fn is_current_for(&self, state: SandboxState) -> bool {
+        self.row_state == state && self.target_state == state
+    }
+}
+
+/// The row's activation-rollback receipt, if it is well formed.
+///
+/// Every reader of that receipt (activation admission, the execution delete
+/// fence and the teardown release arm) goes through here, so they agree on
+/// one rule: the receipt is decoded against the state it names, and a
+/// missing, malformed or other-kind receipt carries no rollback authority.
+/// Admission and teardown also require the receipt to be current for the
+/// row's state ([`ActivationRollbackReceipt::is_current_for`]). The delete
+/// fence does not: eviction moves the row to `deleting` before the delete,
+/// and the fence must still cover the generation the rollback retired.
+/// Each reader then applies its own generation rule.
+pub(crate) fn activation_rollback_receipt(
+    conn: &Connection,
+    id: &str,
+) -> Result<Option<ActivationRollbackReceipt>> {
+    let row = conn
+        .query_row(
+            "SELECT state, transition_receipt_id, transition_receipt_kind,
+                    transition_receipt_target_state, transition_receipt_execution_generation,
+                    transition_receipt_reason_code, transition_receipt_activation_attempt_id
+               FROM sandboxes
+              WHERE id = ?1 AND transition_receipt_id IS NOT NULL",
+            [id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(3)?,
+                    RawSandboxStatePublicationMetadata {
+                        quarantine_reason_code: None,
+                        transition_receipt_id: row.get(1)?,
+                        transition_receipt_kind: row.get(2)?,
+                        transition_receipt_target_state: row.get(3)?,
+                        transition_receipt_execution_generation: row.get(4)?,
+                        transition_receipt_reason_code: row.get(5)?,
+                        transition_receipt_activation_attempt_id: row.get(6)?,
+                    },
+                ))
+            },
+        )
+        .optional()?;
+    let Some((row_state, target_state, receipt)) = row else {
+        return Ok(None);
+    };
+    let (Ok(row_state), Some(Ok(target_state))) = (
+        row_state.parse::<SandboxState>(),
+        target_state.map(|state| state.parse::<SandboxState>()),
+    ) else {
+        return Ok(None);
+    };
+    Ok(match receipt.decode(target_state) {
+        Ok(SandboxStatePublicationMetadata::TransitionReceipt(receipt))
+            if receipt.kind() == SandboxTransitionReceiptKind::ActivationRollback =>
+        {
+            Some(ActivationRollbackReceipt {
+                row_state,
+                target_state,
+                receipt,
+            })
+        }
+        _ => None,
+    })
 }
 
 /// Stamp the terminal-teardown-suspend marker on a `suspending` row whose

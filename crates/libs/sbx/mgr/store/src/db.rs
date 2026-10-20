@@ -433,20 +433,10 @@ fn record_execution_delete_receipt(
     // row's route identity may name. Fence that generation too, so a late
     // retry of the rolled-back attempt cannot revive it after the row (and
     // its rollback receipt) is gone, for example after local eviction.
-    let rolled_back_generation = conn
-        .query_row(
-            "SELECT transition_receipt_execution_generation
-               FROM sandboxes
-              WHERE id = ?1 AND transition_receipt_kind = ?2",
-            params![
-                sandbox_id,
-                SandboxTransitionReceiptKind::ActivationRollback.as_str()
-            ],
-            |row| row.get::<_, Option<i64>>(0),
-        )
-        .optional()?
-        .flatten()
-        .and_then(|generation| ExecutionGeneration::new(generation).ok());
+    // Deliberately not `is_current_for`: an evicted row is already
+    // `deleting` here, and its retired generation must stay fenced.
+    let rolled_back_generation = activation_rollback_receipt(conn, sandbox_id)?
+        .map(|rollback| rollback.receipt.execution_generation());
     let Some(execution_generation) = execution_generation.max(rolled_back_generation) else {
         return Ok(());
     };

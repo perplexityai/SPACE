@@ -444,7 +444,8 @@ pub fn teardown_release_evidence(
             )?
         }
         // A rollback back to `suspended` keeps the predecessor's artifact pin
-        // and may retain the predecessor's generation as its release witness.
+        // and may retain the predecessor's generation and pod UID as its
+        // release witness.
         // Only the exact rolled-back generation is retired here; an older
         // generation keeps its durable answer for the retained artifact.
         Some(status)
@@ -479,17 +480,20 @@ fn completed_activation_rollback_covers(
     state: SandboxState,
     execution_generation: ExecutionGeneration,
 ) -> Result<bool> {
-    let receipt = conn.query_row(
-        sql!("SELECT transition_receipt_id, transition_receipt_kind,
-                     transition_receipt_target_state, transition_receipt_execution_generation,
-                     transition_receipt_reason_code, transition_receipt_activation_attempt_id
+    // A `suspended` row may keep an older route generation together with its
+    // pod UID: `apply_cleanup_state` retains the predecessor's pair. Rows with
+    // no route generation must have no pod UID either.
+    let shape_allows_release = conn.query_row(
+        sql!("SELECT 1
                 FROM sandboxes s
                WHERE s.id = ?1
                  AND (
                      (s.state IN ('created', 'stopped')
-                      AND s.space_api_route_execution_generation IS NULL)
+                      AND s.space_api_route_execution_generation IS NULL
+                      AND s.space_api_route_pod_uid IS NULL)
                      OR (s.state = 'suspended'
-                         AND (s.space_api_route_execution_generation IS NULL
+                         AND ((s.space_api_route_execution_generation IS NULL
+                               AND s.space_api_route_pod_uid IS NULL)
                               OR s.space_api_route_execution_generation < ?2))
                  )
                  AND s.uid IS NULL AND s.slot IS NULL AND s.guest_cid IS NULL
@@ -497,36 +501,31 @@ fn completed_activation_rollback_covers(
                  AND s.vsock_uds_path IS NULL AND s.api_socket_path IS NULL
                  AND s.space_api_route_generation IS NULL
                  AND s.space_api_route_node_id IS NULL
-                 AND s.space_api_route_pod_uid IS NULL
                  AND s.space_api_route_substrate_kind IS NULL
                  AND s.space_api_route_activation_attempt_id IS NULL
                  AND s.cleanup_completion IS NULL AND s.cleanup_keep_filesystem IS NULL
                  AND NOT EXISTS (SELECT 1 FROM sandbox_cleanup_episodes e WHERE e.sandbox_id = s.id)"),
         params![sandbox_id, execution_generation.get()],
-        |row| Ok(RawSandboxStatePublicationMetadata {
-            quarantine_reason_code: None,
-            transition_receipt_id: row.get(0)?,
-            transition_receipt_kind: row.get(1)?,
-            transition_receipt_target_state: row.get(2)?,
-            transition_receipt_execution_generation: row.get(3)?,
-            transition_receipt_reason_code: row.get(4)?,
-            transition_receipt_activation_attempt_id: row.get(5)?,
-        }),
+        |_| Ok(()),
     ).optional()?;
+    if shape_allows_release.is_none() {
+        return Ok(false);
+    }
     // Missing or malformed receipts supply no release authority. In particular,
     // absence of a runtime generation is also normal after a failed suspend.
-    Ok(receipt.is_some_and(|receipt| {
-        matches!(
-            receipt.decode(state),
-            Ok(SandboxStatePublicationMetadata::TransitionReceipt(receipt))
-                if receipt.kind() == SandboxTransitionReceiptKind::ActivationRollback
-                    && if state == SandboxState::Suspended {
-                        receipt.execution_generation() == execution_generation
-                    } else {
-                        receipt.execution_generation() >= execution_generation
-                    }
-        )
-    }))
+    Ok(
+        activation_rollback_receipt(conn, sandbox_id)?.is_some_and(|rollback| {
+            let rolled_back = rollback.receipt.execution_generation();
+            rollback.is_current_for(state)
+                && if state == SandboxState::Suspended {
+                    // The row may keep an older generation's route identity, so
+                    // only the exact rolled-back generation is retired.
+                    rolled_back == execution_generation
+                } else {
+                    rolled_back >= execution_generation
+                }
+        }),
+    )
 }
 
 pub fn teardown_suspend_status(
