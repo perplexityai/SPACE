@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -18,6 +19,9 @@ use tonic::{Status, transport::Channel};
 use crate::identity::GuestAccount;
 
 use super::super::{FilesystemWorkerService, WORKER_PROTOCOL_VERSION};
+
+// Fit Linux's 15-byte comm limit so task name and argv[0] agree.
+const WORKER_PROCESS_NAME: &std::ffi::CStr = c"spaced-fsworker";
 
 const WORKER_MODE_ENV: &str = "SPACE_SPACED_FILESYSTEM_WORKER";
 const WORKER_USER_ENV: &str = "SPACE_SPACED_FILESYSTEM_WORKER_USER";
@@ -760,7 +764,9 @@ fn worker_command_from_environment(
     env: &dyn pplx_space_common_core::env::Environment,
 ) -> ChildCommand {
     let mut command = ChildCommand::new(executable);
+    // Executing /proc/self/fd/N otherwise exposes the descriptor as argv[0].
     command
+        .arg0(std::ffi::OsStr::from_bytes(WORKER_PROCESS_NAME.to_bytes()))
         .env_clear()
         .env(WORKER_MODE_ENV, "1")
         .env(WORKER_USER_ENV, user.as_str())
@@ -846,6 +852,8 @@ fn supervise_worker(
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum FilesystemWorkerError {
+    #[error("failed to set filesystem worker process name: {0}")]
+    SetProcessName(#[source] nix::errno::Errno),
     #[error("filesystem worker user is missing: {0}")]
     MissingUser(#[source] std::env::VarError),
     #[error("filesystem worker user is invalid: {0}")]
@@ -875,6 +883,10 @@ pub(crate) fn run_from_environment() -> Result<bool, FilesystemWorkerError> {
     if std::env::var_os(WORKER_MODE_ENV).is_none() {
         return Ok(false);
     }
+    // exec resets comm to the executable path's basename, even with arg0 set.
+    // Name the main thread before the runtime and telemetry create more threads.
+    nix::sys::prctl::set_name(WORKER_PROCESS_NAME)
+        .map_err(FilesystemWorkerError::SetProcessName)?;
     let user = std::env::var(WORKER_USER_ENV).map_err(FilesystemWorkerError::MissingUser)?;
     let user = GuestUserName::parse(user).map_err(FilesystemWorkerError::InvalidUser)?;
     let raw_fd = std::env::var(WORKER_FD_ENV)

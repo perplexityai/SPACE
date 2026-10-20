@@ -144,6 +144,19 @@ pub(super) async fn run() {
     assert_eq!(children().len(), 2, "separate worker per identity");
     // The executable pin is CLOEXEC; only the worker channel is deliberately inherited.
     for pid in children() {
+        assert_eq!(
+            std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                .expect("worker name")
+                .trim(),
+            "spaced-fsworker",
+            "worker name must remain recognizable when executing a pinned descriptor",
+        );
+        let command_line =
+            std::fs::read(format!("/proc/{pid}/cmdline")).expect("worker command line");
+        assert_eq!(
+            command_line.split(|byte| *byte == 0).next(),
+            Some(b"spaced-fsworker".as_slice())
+        );
         for entry in std::fs::read_dir(format!("/proc/{pid}/fd")).expect("worker descriptors") {
             let target =
                 std::fs::read_link(entry.expect("descriptor").path()).expect("descriptor target");
