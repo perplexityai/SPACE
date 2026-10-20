@@ -165,7 +165,7 @@ pub(crate) fn ecw_resolved_route(
         cache_epoch: route_generation,
         origin: test_ecw_route_origin(sandbox_id),
         sandbox_id,
-        org_id: None,
+        org_id: Some(OrgId::new()),
         template_id: Some("seed".to_string()),
         route_generation,
         current_node_id: NodeId::new(),

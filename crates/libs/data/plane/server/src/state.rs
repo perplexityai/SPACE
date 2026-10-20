@@ -785,8 +785,9 @@ pub(super) struct EcwResolvedRoute {
     pub(super) cache_epoch: u64,
     pub(super) origin: EcwRouteOrigin,
     pub(super) sandbox_id: SandboxId,
-    /// Owning org, for upload attribution. `None` when the resolve response
-    /// carries no parseable org; nothing routes or authorizes on it.
+    /// Owning org: upload admission, transfer rates and upload attribution
+    /// key on it. `None` when the resolve response carries no parseable org;
+    /// nothing routes or authorizes on it.
     pub(super) org_id: Option<OrgId>,
     pub(super) template_id: Option<String>,
     pub(super) route_generation: u64,
@@ -1581,6 +1582,38 @@ impl EcwProxyError {
             ResponseKind::Admission,
         )
         .with_retry_after(retry_after)
+    }
+
+    /// A file transfer refused while its org owes its byte-rate bucket.
+    pub(super) fn org_transfer_rate_exceeded(retry_after: Duration) -> Self {
+        Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Org file transfer rate exceeded; retry later",
+            ResponseOrigin::DataPlane,
+            ResponseKind::Admission,
+        )
+        .with_retry_after(retry_after)
+    }
+
+    /// An admitted upload whose body arrived below the minimum body rate. 408,
+    /// since the client, not the pod, ran out of time.
+    pub(super) fn upload_body_stalled() -> Self {
+        Self::new(
+            StatusCode::REQUEST_TIMEOUT,
+            "Upload body arrived too slowly",
+            ResponseOrigin::DataPlane,
+            ResponseKind::Timeout,
+        )
+    }
+
+    /// An admitted HTTP/2 upload that hadn't finished within its time limit.
+    pub(super) fn upload_body_timed_out() -> Self {
+        Self::new(
+            StatusCode::REQUEST_TIMEOUT,
+            "Upload didn't finish within its time limit",
+            ResponseOrigin::DataPlane,
+            ResponseKind::Timeout,
+        )
     }
 
     /// A new stream refused because this replica is draining. A 503 rather

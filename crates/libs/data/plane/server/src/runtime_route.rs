@@ -145,12 +145,19 @@ pub(super) async fn resolve_ecw_route_uncached(
         .sandbox_id
         .parse::<SandboxId>()
         .map_err(|_| EcwProxyError::internal("Invalid sandbox route"))?;
+    // Only upload admission, the transfer rate and upload attribution need the
+    // org, so a route whose org doesn't parse still serves everything else.
+    let org_id = route.org_id.parse::<OrgId>().ok();
+    // Only worth a warning when admission, which needs the org, is on.
+    if org_id.is_none() && state.uploads.is_some() {
+        tracing::warn!(%sandbox_id, "ECW sandbox route has no valid org id");
+    }
 
     let resolved = EcwResolvedRoute {
         cache_epoch: state.route_cache.next_cache_epoch(),
         origin: origin.clone(),
         sandbox_id,
-        org_id: route.org_id.parse().ok(),
+        org_id,
         template_id: route.template_id,
         route_generation: route.route_generation,
         current_node_id: route

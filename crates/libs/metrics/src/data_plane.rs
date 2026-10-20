@@ -1,8 +1,15 @@
 //! Ingress preparation emits outcome/count and duration before forwarding; waiter
 //! rejection and completion inactivity timeouts have separate counters. Established
 //! stream lifetime is excluded from preparation latency. No sandbox ID labels.
-//! `data_plane.upload.rejected{reason}` counts `POST /files` requests the
-//! per-pod upload admission limiter answered with 429.
+//! `data_plane.upload.rejected{scope,reason}` counts `POST /files` requests the
+//! upload admission limiter answered with 429, by the budget that ran out.
+//! `data_plane.upload.stalled` counts admitted uploads ended for arriving below
+//! the minimum body rate, and `data_plane.upload.timed_out` HTTP/2 uploads
+//! ended for running past their time limit, and `data_plane.upload.over_rate`
+//! admitted uploads ended for meeting more debt than the longest throttle
+//! sleep. `data_plane.upload.throttled_ms`
+//! sums the time
+//! HTTP/1.x upload bodies spent waiting on their org's byte-rate bucket.
 //!
 //! HTTP traffic: `data_plane.http.bytes{direction,route_class}` counts request
 //! body bytes read and response body bytes sent; bytes sent to a client that
@@ -20,7 +27,7 @@
 //! `data_plane.upload.in_flight` and `data_plane.upload.in_flight_bytes` are
 //! per-pod gauges of ECW `POST /files` uploads that resolved their route,
 //! passed request validation, and passed upload admission when it's on, with
-//! the budget bytes admission holds for them (or their declared length or
+//! the pod budget bytes admission holds for them (or their declared length or
 //! body limit, when admission is off). An upload without a `Content-Length` reserves the full
 //! body limit, so chunked uploads inflate `in_flight_bytes`. Org attribution
 //! is a per-upload log event, not a tag: org IDs are an unbounded set.
@@ -293,20 +300,57 @@ impl fmt::Display for SpaceApiRouteTokenDropReason {
 }
 
 metric_vocabulary!(
-    /// Which per-pod upload admission budget a rejected upload waited on.
+    /// Which share of the upload admission budget a rejected upload waited on.
+    UploadAdmissionScope {
+        /// The replica's whole budget.
+        Pod => "pod",
+        /// The upload's org's share of the replica's budget.
+        Org => "org",
+        /// The upload's sandbox's share of the replica's budget.
+        Sandbox => "sandbox",
+    }
+);
+
+metric_vocabulary!(
+    /// Which part of an upload admission budget a rejected upload waited on.
     UploadRejectReason {
         /// No concurrent-upload slot freed within the admission wait.
         Concurrency => "concurrency",
         /// The in-flight byte budget couldn't cover the reservation in time.
         Bytes => "bytes",
+        /// The org owed its transfer-rate bucket more than the upload could
+        /// sleep off within the admission wait: any debt, for an HTTP/2
+        /// upload, which doesn't wait.
+        TransferRate => "transfer_rate",
     }
 );
 
-pub fn upload_rejected(reason: UploadRejectReason) {
+pub fn upload_rejected(scope: UploadAdmissionScope, reason: UploadRejectReason) {
     counter(
         "data_plane.upload.rejected",
         1,
-        &[tag("reason", reason.as_str())],
+        &[tag("scope", scope.as_str()), tag("reason", reason.as_str())],
+    );
+}
+
+pub fn upload_body_stalled() {
+    counter("data_plane.upload.stalled", 1, &[]);
+}
+
+pub fn upload_body_timed_out() {
+    counter("data_plane.upload.timed_out", 1, &[]);
+}
+
+pub fn upload_body_over_rate() {
+    counter("data_plane.upload.over_rate", 1, &[]);
+}
+
+pub fn upload_throttled(delay: std::time::Duration) {
+    counter(
+        "data_plane.upload.throttled_ms",
+        // Rounded rather than truncated, so many short sleeps aren't all lost.
+        u64::try_from(delay.as_micros().saturating_add(500) / 1000).unwrap_or(u64::MAX),
+        &[],
     );
 }
 
@@ -765,11 +809,30 @@ metric_vocabulary! {
         /// The sandbox refused before starting anything because it's at
         /// capacity.
         SandboxAtCapacity => "sandbox_at_capacity",
-        /// No concurrent-upload slot freed within the upload admission wait.
+        /// No slot in the pod's upload budget freed within the upload admission
+        /// wait.
         UploadConcurrency => "upload_concurrency",
-        /// The upload in-flight byte budget couldn't cover the reservation in
-        /// time.
+        /// The pod's upload in-flight byte budget couldn't cover the
+        /// reservation in time.
         UploadBytes => "upload_bytes",
+        /// No slot in the upload's org's share freed within the admission wait.
+        UploadConcurrencyPerOrg => "upload_concurrency_per_org",
+        /// The upload's org's share of the byte budget couldn't cover the
+        /// reservation in time.
+        UploadBytesPerOrg => "upload_bytes_per_org",
+        /// No slot in the upload's sandbox's share freed within the admission
+        /// wait.
+        UploadConcurrencyPerSandbox => "upload_concurrency_per_sandbox",
+        /// The upload's sandbox's share of the byte budget couldn't cover the
+        /// reservation in time.
+        UploadBytesPerSandbox => "upload_bytes_per_sandbox",
+        /// An upload arrived while its org owed its transfer-rate bucket more
+        /// than it could sleep off within the admission wait, or an admitted
+        /// one met more debt mid-body than the longest throttle sleep.
+        UploadTransferRatePerOrg => "upload_transfer_rate_per_org",
+        /// A `GET /files` download arrived while its org owed its
+        /// transfer-rate bucket.
+        DownloadTransferRatePerOrg => "download_transfer_rate_per_org",
         /// A backend returned `RESOURCE_EXHAUSTED` with no more specific shape.
         BackendResourceExhausted => "backend_resource_exhausted",
         /// Not a data-plane limit: a relay marker on responses from the

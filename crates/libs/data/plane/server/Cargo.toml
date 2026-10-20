@@ -22,6 +22,7 @@ kubernetes = ["pplx-space-node-api-client/kubernetes"]
 axum = { workspace = true, features = ["ws"] }
 base64 = { workspace = true }
 bytes = { workspace = true }
+clap = { workspace = true, features = ["derive", "env"] }
 dashmap = { workspace = true }
 form_urlencoded = { workspace = true }
 futures-util = { workspace = true }
@@ -65,3 +66,4 @@ pplx-space-test-env = { workspace = true }
 aws-lc-rs = { workspace = true }
 insta = { workspace = true }
 tower = { workspace = true, features = ["util"] }
+hyper = { workspace = true, features = ["client", "http1", "http2"] }
