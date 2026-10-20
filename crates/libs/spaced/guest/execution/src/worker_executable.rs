@@ -15,6 +15,8 @@ use std::{fs::File, sync::Arc};
 pub struct WorkerExecutable {
     #[cfg(target_os = "linux")]
     file: Arc<File>,
+    #[cfg(not(target_os = "linux"))]
+    _private: (),
 }
 
 #[derive(Debug, thiserror::Error)]
