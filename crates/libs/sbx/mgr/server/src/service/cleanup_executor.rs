@@ -266,8 +266,9 @@ impl SandboxManagerService {
         {
             return Ok(None);
         }
-        let generation =
-            crate::db::runtime_execution_generation(&tx, &id).map_err(storage_status)?;
+        let generation = crate::db::read::sandbox_view(&tx, &id)
+            .runtime_execution_generation()
+            .map_err(storage_status)?;
         if expected_generation.is_some_and(|expected| expected != generation) {
             return Ok(None);
         }
@@ -341,9 +342,9 @@ impl SandboxManagerService {
                 let _admission = admission;
                 let _fence = fence;
                 let tx = crate::db::Transaction::deferred(db).map_err(storage_status)?;
-                let generation =
-                    crate::db::runtime_execution_generation(&tx, &sandbox_id.to_string())
-                        .map_err(storage_status)?;
+                let generation = crate::db::read::sandbox_view(&tx, &sandbox_id.to_string())
+                    .runtime_execution_generation()
+                    .map_err(storage_status)?;
                 if expected.is_some_and(|expected| expected != generation) {
                     return Err(Status::aborted("cleanup execution superseded"));
                 }
@@ -425,7 +426,7 @@ impl SandboxManagerService {
         }
         let capacity = DEFAULT_CLEANUP_CONCURRENCY_CAP;
         let mut foreground_first = true;
-        let mut recovery_cursor = None;
+        let mut recovery_cursor = crate::db::scan::CleanupObligationScan::default();
         let mut tasks = tokio::task::JoinSet::new();
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -442,15 +443,18 @@ impl SandboxManagerService {
             if self.is_draining_for_restart() {
                 continue;
             }
-            let after = recovery_cursor;
+            // A failed read keeps the cursor where it was: only the copy advances.
+            let mut cursor = recovery_cursor;
             match self
                 .storage(move |db| {
-                    crate::db::cleanup_recovery_page(db, after, 128).map_err(storage_status)
+                    let page =
+                        crate::db::scan::sandbox_pages(db, &mut cursor).map_err(storage_status)?;
+                    Ok((cursor, page))
                 })
                 .await
             {
-                Ok(page) => {
-                    recovery_cursor = page.next_cursor;
+                Ok((cursor, page)) => {
+                    recovery_cursor = cursor;
                     let ids = page.ids;
                     if !ids.is_empty() {
                         let permit = Arc::clone(&self.cleanup_io).acquire_owned().await;
@@ -509,7 +513,7 @@ impl SandboxManagerService {
                         .map_err(storage_status)?
                         {
                             let Some(job) =
-                                cleanup_jobs::get_job(&tx, &id).map_err(storage_status)?
+                                crate::db::read::cleanup_job(&tx, &id).map_err(storage_status)?
                             else {
                                 continue;
                             };
@@ -618,7 +622,7 @@ impl SandboxManagerService {
         let job_id = id.to_owned();
         let selected = self
             .storage(move |db| {
-                let job = cleanup_jobs::get_job(db, &job_id)
+                let job = crate::db::read::cleanup_job(db, &job_id)
                     .map_err(storage_status)?
                     .ok_or_else(|| Status::internal("cleanup job disappeared"))?;
                 if job.status != JobStatus::Running.as_str() {
@@ -634,11 +638,9 @@ impl SandboxManagerService {
                     tx.commit().map_err(storage_status)?;
                     return Ok(None);
                 }
-                let receipt =
-                    crate::db::auto_lifecycle_delete_receipts::pending_receipt_for_sandbox(
-                        db,
-                        work.sandbox_id,
-                    )
+                let receipt = crate::db::read::typed_sandbox_view(db, work.sandbox_id)
+                    .delete_receipts()
+                    .pending()
                     .map_err(storage_status)?;
                 Ok(Some((work, receipt)))
             })
@@ -710,7 +712,7 @@ impl SandboxManagerService {
                         cleanup_jobs::finish(&tx, &id, outcome).map_err(storage_status)?;
                         tx.commit().map_err(storage_status)?;
                     } else {
-                        let stored = cleanup_jobs::get_job(db, &id)
+                        let stored = crate::db::read::cleanup_job(db, &id)
                             .map_err(storage_status)?
                             .ok_or_else(|| Status::internal("cleanup job disappeared"))?;
                         if stored.status != outcome.job_status().as_str() {
@@ -721,7 +723,7 @@ impl SandboxManagerService {
                     }
                 }
                 Err(error) => {
-                    let attempts = cleanup_jobs::get_job(db, &id)
+                    let attempts = crate::db::read::cleanup_job(db, &id)
                         .map_err(storage_status)?
                         .map_or(1, |job| job.attempts);
                     let delay = CLEANUP_RETRY_INITIAL_DELAY_SECS
@@ -805,7 +807,9 @@ impl SandboxManagerService {
         loop {
             let read_id = id;
             let stored = self
-                .storage(move |db| cleanup_jobs::get_job(db, &read_id).map_err(storage_status))
+                .storage(move |db| {
+                    crate::db::read::cleanup_job(db, &read_id).map_err(storage_status)
+                })
                 .await?
                 .ok_or_else(|| Status::internal("cleanup job disappeared"))?;
             #[cfg(test)]

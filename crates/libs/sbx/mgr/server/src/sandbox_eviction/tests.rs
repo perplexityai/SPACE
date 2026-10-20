@@ -1,3 +1,4 @@
+use crate::db::eviction_scan::{count_malformed_suspended_updated_at, count_resident_rows};
 use crate::db::fixture::params;
 use pplx_space_common_core::types::{LocalArtifactId, SnapshotId};
 

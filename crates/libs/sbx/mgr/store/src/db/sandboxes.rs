@@ -10,18 +10,20 @@ pub struct RawSandboxLifecycle {
     pub state_changed_at: String,
 }
 
-pub fn raw_sandbox_lifecycle(conn: &Connection, id: &str) -> Result<Option<RawSandboxLifecycle>> {
-    conn.query_row(
-        "SELECT state, state_changed_at FROM sandboxes WHERE id = ?1",
-        [id],
-        |row| {
-            Ok(RawSandboxLifecycle {
-                state: row.get(0)?,
-                state_changed_at: timestamps::diagnostic_column(row, 1)?,
-            })
-        },
-    )
-    .optional()
+db_private_outside_tests! {
+    fn raw_sandbox_lifecycle(conn: &Connection, id: &str) -> Result<Option<RawSandboxLifecycle>> {
+        conn.query_row(
+            "SELECT state, state_changed_at FROM sandboxes WHERE id = ?1",
+            [id],
+            |row| {
+                Ok(RawSandboxLifecycle {
+                    state: row.get(0)?,
+                    state_changed_at: timestamps::diagnostic_column(row, 1)?,
+                })
+            },
+        )
+        .optional()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -85,38 +87,42 @@ pub enum InsertRecoveredSuspendedSandboxError {
     ArtifactPinInvariant { changed: usize },
 }
 
-/// Count every durable sandbox-manager row by its bounded lifecycle. This stays
-/// in SQL so the sampler's memory use is independent of the number of sandboxes
-/// on the node.
-pub fn sandbox_lifecycle_counts(conn: &Connection) -> Result<Vec<SandboxLifecycleCount>> {
-    let mut statement = conn.prepare(
-        "SELECT state, COUNT(*)
+db_private_outside_tests! {
+    /// Count every durable sandbox-manager row by its bounded lifecycle. This stays
+    /// in SQL so the sampler's memory use is independent of the number of sandboxes
+    /// on the node.
+    fn sandbox_lifecycle_counts(conn: &Connection) -> Result<Vec<SandboxLifecycleCount>> {
+        let mut statement = conn.prepare(
+            "SELECT state, COUNT(*)
            FROM sandboxes
        GROUP BY state
        ORDER BY state",
-    )?;
-    let rows = statement.query_map([], |row| {
-        let state_label: String = row.get(0)?;
-        let state = state_label.parse::<SandboxState>().map_err(|_| {
-            rusqlite::Error::FromSqlConversionFailure(
-                0,
-                Type::Text,
-                format!("unknown sandbox state '{state_label}'").into(),
-            )
+        )?;
+        let rows = statement.query_map([], |row| {
+            let state_label: String = row.get(0)?;
+            let state = state_label.parse::<SandboxState>().map_err(|_| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    Type::Text,
+                    format!("unknown sandbox state '{state_label}'").into(),
+                )
+            })?;
+            let count = row.get::<_, SqliteU64>(1)?.0;
+            Ok(SandboxLifecycleCount { state, count })
         })?;
-        let count = row.get::<_, SqliteU64>(1)?.0;
-        Ok(SandboxLifecycleCount { state, count })
-    })?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
 }
 
-pub fn current_state_label(conn: &Connection, id: &str) -> Result<Option<String>> {
-    conn.query_row(
-        "SELECT state FROM sandboxes WHERE id = ?1",
-        params![id],
-        |row| row.get(0),
-    )
-    .optional()
+db_private_outside_tests! {
+    fn current_state_label(conn: &Connection, id: &str) -> Result<Option<String>> {
+        conn.query_row(
+            "SELECT state FROM sandboxes WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()
+    }
 }
 
 pub fn record_remote_restore_artifact_staging(conn: &Connection, sandbox_id: &str) -> Result<bool> {
@@ -247,46 +253,50 @@ pub fn insert_sandbox(conn: &Connection, params: InsertSandboxParams<'_>) -> Res
     Ok(())
 }
 
-pub fn node_execution_fence(
-    conn: &Connection,
-    sandbox_id: &str,
-) -> Result<Option<pplx_space_node_mgr_client::execution_fence::ExecutionFence>> {
-    use pplx_space_node_mgr_client::execution_fence::ExecutionFence;
-    let (current, previous): (Option<String>, Option<String>) = conn.query_row(
-        "SELECT node_execution_id, previous_node_execution_id FROM sandboxes WHERE id = ?1",
-        params![sandbox_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    let parse = |raw: String| {
-        raw.parse::<SandboxActivationAttemptId>().map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(
-                0,
-                rusqlite::types::Type::Text,
-                Box::new(error),
-            )
-        })
-    };
-    match current {
-        Some(current) => Ok(Some(ExecutionFence::new(
-            parse(current)?,
-            previous.map(parse).transpose()?,
-        ))),
-        None if previous.is_none() => Ok(None),
-        None => Err(Error::invalid_query()),
+db_private_outside_tests! {
+    fn node_execution_fence(
+        conn: &Connection,
+        sandbox_id: &str,
+    ) -> Result<Option<pplx_space_node_mgr_client::execution_fence::ExecutionFence>> {
+        use pplx_space_node_mgr_client::execution_fence::ExecutionFence;
+        let (current, previous): (Option<String>, Option<String>) = conn.query_row(
+            "SELECT node_execution_id, previous_node_execution_id FROM sandboxes WHERE id = ?1",
+            params![sandbox_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let parse = |raw: String| {
+            raw.parse::<SandboxActivationAttemptId>().map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+        };
+        match current {
+            Some(current) => Ok(Some(ExecutionFence::new(
+                parse(current)?,
+                previous.map(parse).transpose()?,
+            ))),
+            None if previous.is_none() => Ok(None),
+            None => Err(Error::invalid_query()),
+        }
     }
 }
 
-/// Bounded startup preflight; legacy NULL rows require the adoption baseline.
-pub fn unbound_node_executions(conn: &Connection) -> Result<Vec<String>> {
-    let mut statement = conn
-        .prepare("SELECT id FROM sandboxes WHERE node_execution_id IS NULL ORDER BY id LIMIT ?1")?;
-    statement
-        .query_map(
-            [pplx_space_node_mgr_client::execution_fence::EXECUTION_PREFLIGHT_LIMIT as i64],
-            |row| row.get(0),
-        )?
-        .collect::<rusqlite::Result<_>>()
-        .map_err(Error::from)
+db_private_outside_tests! {
+    /// Bounded startup preflight; legacy NULL rows require the adoption baseline.
+    fn unbound_node_executions(conn: &Connection) -> Result<Vec<String>> {
+        let mut statement = conn
+            .prepare("SELECT id FROM sandboxes WHERE node_execution_id IS NULL ORDER BY id LIMIT ?1")?;
+        statement
+            .query_map(
+                [pplx_space_node_mgr_client::execution_fence::EXECUTION_PREFLIGHT_LIMIT as i64],
+                |row| row.get(0),
+            )?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(Error::from)
+    }
 }
 
 /// Import receiver authority only while inserting a previously absent orphan
@@ -643,65 +653,71 @@ pub fn startup_resident_witness_current(conn: &Connection, observed: &SandboxRow
         )?)
 }
 
-pub fn sandbox_is_retryable_interrupted_restore(row: &SandboxRow) -> bool {
-    row.state == SandboxState::Restoring
-        && row
-            .restore_operation
-            .as_ref()
-            .is_some_and(|operation| operation.origin() == RestoreOrigin::Remote)
-        && !sandbox_has_runtime_fields(row)
-        && row.current_local_artifact_id.is_none()
-        && row.cleanup_completion.is_none()
-        && row.cleanup_keep_filesystem.is_none()
+db_private_outside_tests! {
+    fn sandbox_is_retryable_interrupted_restore(row: &SandboxRow) -> bool {
+        row.state == SandboxState::Restoring
+            && row
+                .restore_operation
+                .as_ref()
+                .is_some_and(|operation| operation.origin() == RestoreOrigin::Remote)
+            && !sandbox_has_runtime_fields(row)
+            && row.current_local_artifact_id.is_none()
+            && row.cleanup_completion.is_none()
+            && row.cleanup_keep_filesystem.is_none()
+    }
 }
 
-pub fn sandbox_state_changed_at(
-    conn: &Connection,
-    sandbox_ids: &[String],
-) -> Result<HashMap<String, String>> {
-    if sandbox_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let placeholders = std::iter::repeat_n("?", sandbox_ids.len())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let query = format!(
-        "SELECT id, state_changed_at
+db_private_outside_tests! {
+    fn sandbox_state_changed_at(
+        conn: &Connection,
+        sandbox_ids: &[String],
+    ) -> Result<HashMap<String, String>> {
+        if sandbox_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = std::iter::repeat_n("?", sandbox_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "SELECT id, state_changed_at
          FROM sandboxes
          WHERE id IN ({placeholders})"
-    );
-    let mut statement = conn.prepare(&query)?;
-    let rows = statement.query_map(rusqlite::params_from_iter(sandbox_ids), |row| {
-        Ok((row.get(0)?, timestamps::diagnostic_column(row, 1)?))
-    })?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+        );
+        let mut statement = conn.prepare(&query)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(sandbox_ids), |row| {
+            Ok((row.get(0)?, timestamps::diagnostic_column(row, 1)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
 }
 
-/// Read one row's `state_changed_at` exactly as stored.
-///
-/// Raw, unlike [`sandbox_state_changed_at`]'s diagnostic rendering, and for
-/// the same reason [`SandboxRow::updated_at`] is raw: the value doubles as a
-/// CAS witness, so it has to compare byte-for-byte against the column it came
-/// from. Time-based decisions decode it strictly through
-/// [`timestamps::EpochSeconds::parse`] instead of trusting the text.
-///
-/// `None` means no such row. A non-text value is returned rendered rather
-/// than rejected, so a corrupt timestamp reaches the caller's explicit
-/// refusal path instead of looking like a missing sandbox.
-pub fn sandbox_state_changed_at_witness(conn: &Connection, id: &str) -> Result<Option<String>> {
-    conn.query_row(
-        "SELECT state_changed_at FROM sandboxes WHERE id = ?1",
-        params![id],
-        |row| {
-            Ok(match row.get::<_, rusqlite::types::Value>(0)? {
-                rusqlite::types::Value::Text(raw) => raw,
-                rusqlite::types::Value::Integer(raw) => raw.to_string(),
-                rusqlite::types::Value::Real(raw) => raw.to_string(),
-                rusqlite::types::Value::Null | rusqlite::types::Value::Blob(_) => String::new(),
-            })
-        },
-    )
-    .optional()
+db_private_outside_tests! {
+    /// Read one row's `state_changed_at` exactly as stored.
+    ///
+    /// Raw, unlike [`sandbox_state_changed_at`]'s diagnostic rendering, and for
+    /// the same reason [`SandboxRow::updated_at`] is raw: the value doubles as a
+    /// CAS witness, so it has to compare byte-for-byte against the column it came
+    /// from. Time-based decisions decode it strictly through
+    /// [`timestamps::EpochSeconds::parse`] instead of trusting the text.
+    ///
+    /// `None` means no such row. A non-text value is returned rendered rather
+    /// than rejected, so a corrupt timestamp reaches the caller's explicit
+    /// refusal path instead of looking like a missing sandbox.
+    fn sandbox_state_changed_at_witness(conn: &Connection, id: &str) -> Result<Option<String>> {
+        conn.query_row(
+            "SELECT state_changed_at FROM sandboxes WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok(match row.get::<_, rusqlite::types::Value>(0)? {
+                    rusqlite::types::Value::Text(raw) => raw,
+                    rusqlite::types::Value::Integer(raw) => raw.to_string(),
+                    rusqlite::types::Value::Real(raw) => raw.to_string(),
+                    rusqlite::types::Value::Null | rusqlite::types::Value::Blob(_) => String::new(),
+                })
+            },
+        )
+        .optional()
+    }
 }
 
 pub fn update_uuid8(conn: &Connection, id: &str, uuid8: &SandboxRuntimeLabel) -> Result<()> {
@@ -991,24 +1007,26 @@ fn reset_access_floor_for_execution_change(
     Ok(())
 }
 
-pub fn runtime_execution_generation(
-    conn: &Connection,
-    sandbox_id: &str,
-) -> Result<Option<ExecutionGeneration>> {
-    let generation = conn
-        .query_row(
-            "SELECT space_api_route_execution_generation
+db_private_outside_tests! {
+    fn runtime_execution_generation(
+        conn: &Connection,
+        sandbox_id: &str,
+    ) -> Result<Option<ExecutionGeneration>> {
+        let generation = conn
+            .query_row(
+                "SELECT space_api_route_execution_generation
          FROM sandboxes
          WHERE id = ?1",
-            params![sandbox_id],
-            |row| row.get::<_, Option<i64>>(0),
-        )
-        .optional()?
-        .flatten();
-    generation
-        .map(ExecutionGeneration::new)
-        .transpose()
-        .map_err(|error| Error::decode(0, Type::Integer, error))
+                params![sandbox_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten();
+        generation
+            .map(ExecutionGeneration::new)
+            .transpose()
+            .map_err(|error| Error::decode(0, Type::Integer, error))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1081,12 +1099,13 @@ fn activation_route_provenance_from_row(
     })
 }
 
-pub fn activation_route_provenance(
-    conn: &Connection,
-    sandbox_id: &str,
-) -> Result<ActivationRouteProvenance> {
-    let values = conn.query_row(
-        "SELECT space_api_route_generation,
+db_private_outside_tests! {
+    fn activation_route_provenance(
+        conn: &Connection,
+        sandbox_id: &str,
+    ) -> Result<ActivationRouteProvenance> {
+        let values = conn.query_row(
+            "SELECT space_api_route_generation,
                 space_api_route_execution_generation,
                 space_api_route_substrate_kind,
                 last_observed_route_generation,
@@ -1095,24 +1114,26 @@ pub fn activation_route_provenance(
                 last_observed_route_substrate_kind
            FROM sandboxes
           WHERE id = ?1",
-        params![sandbox_id],
-        |row| activation_route_provenance_from_row(row, 0),
-    )?;
-    Ok(values)
+            params![sandbox_id],
+            |row| activation_route_provenance_from_row(row, 0),
+        )?;
+        Ok(values)
+    }
 }
 
-pub fn activation_route_provenance_for_sandboxes(
-    conn: &Connection,
-    sandbox_ids: &[String],
-) -> Result<HashMap<String, Result<ActivationRouteProvenance>>> {
-    if sandbox_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let placeholders = std::iter::repeat_n("?", sandbox_ids.len())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let query = format!(
-        "SELECT id,
+db_private_outside_tests! {
+    fn activation_route_provenance_for_sandboxes(
+        conn: &Connection,
+        sandbox_ids: &[String],
+    ) -> Result<HashMap<String, Result<ActivationRouteProvenance>>> {
+        if sandbox_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = std::iter::repeat_n("?", sandbox_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "SELECT id,
                 space_api_route_generation,
                 space_api_route_execution_generation,
                 space_api_route_substrate_kind,
@@ -1122,15 +1143,16 @@ pub fn activation_route_provenance_for_sandboxes(
                 last_observed_route_substrate_kind
            FROM sandboxes
           WHERE id IN ({placeholders})"
-    );
-    let mut statement = conn.prepare(&query)?;
-    let rows = statement.query_map(rusqlite::params_from_iter(sandbox_ids), |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            activation_route_provenance_from_row(row, 1).map_err(Error::from),
-        ))
-    })?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+        );
+        let mut statement = conn.prepare(&query)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(sandbox_ids), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                activation_route_provenance_from_row(row, 1).map_err(Error::from),
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
 }
 
 pub fn clear_runtime_fields(conn: &Connection, id: &str) -> Result<()> {
@@ -1148,12 +1170,14 @@ pub fn clear_runtime_fields(conn: &Connection, id: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn sandbox_exists(conn: &Connection, id: &str) -> Result<bool> {
-    conn.query_row(
-        sql!("SELECT EXISTS(SELECT 1 FROM sandboxes WHERE id = ?1)"),
-        [id],
-        |row| row.get(0),
-    )
+db_private_outside_tests! {
+    fn sandbox_exists(conn: &Connection, id: &str) -> Result<bool> {
+        conn.query_row(
+            sql!("SELECT EXISTS(SELECT 1 FROM sandboxes WHERE id = ?1)"),
+            [id],
+            |row| row.get(0),
+        )
+    }
 }
 
 pub(super) const GET_SANDBOX_SQL: &str =
@@ -1161,31 +1185,35 @@ pub(super) const GET_SANDBOX_SQL: &str =
          spaced_host_pid, netgtw_pid, vsock_uds_path, api_socket_path, created_at, updated_at, snapshots_enabled, rootfs_size_mb, pool_template, guest_uptime_secs, process_env_json, auto_lifecycle_json, auto_lifecycle_state_json, next_auto_event_at, failure_reason, cleanup_completion, cleanup_keep_filesystem, network_policy_override_json, network_tx_bytes, network_rx_bytes, network_policy_generation, applied_network_policy_generation, applied_network_policy_source, network_policy_authority, auto_lifecycle_authority, current_local_artifact_id, current_local_artifact_kind, current_local_artifact_origin, execution_metadata_json, volume_encryption, space_api_route_generation, space_api_route_node_id, space_api_route_execution_generation, space_api_route_pod_uid, restore_origin, restore_phase, restore_storage_uri, space_api_route_substrate_kind, space_api_route_activation_attempt_id, spaced_endpoint_proof_json, disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec, node_execution_id
          FROM sandboxes WHERE id = ?1";
 
-pub fn get_sandbox(conn: &Connection, id: &str) -> Result<Option<SandboxRow>> {
-    // Every guest file operation and process start looks its sandbox up
-    // several times under the one database connection; parsing this wide
-    // SELECT each time dominated that work.
-    let mut stmt = conn.prepare_cached(GET_SANDBOX_SQL)?;
-    let mut rows = stmt.query_map(params![id], row_to_sandbox)?;
-    rows.next().transpose().map_err(Error::from)
+db_private_outside_tests! {
+    fn get_sandbox(conn: &Connection, id: &str) -> Result<Option<SandboxRow>> {
+        // Every guest file operation and process start looks its sandbox up
+        // several times under the one database connection; parsing this wide
+        // SELECT each time dominated that work.
+        let mut stmt = conn.prepare_cached(GET_SANDBOX_SQL)?;
+        let mut rows = stmt.query_map(params![id], row_to_sandbox)?;
+        rows.next().transpose().map_err(Error::from)
+    }
 }
 
-/// Select at most two identities: two matches prove ambiguity without decoding
-/// unrelated or ambiguous sandbox metadata. Callers decode only a unique match.
-pub fn find_by_prefix(conn: &Connection, prefix: &str) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare("SELECT id FROM sandboxes ORDER BY id")?;
-    let mut rows = stmt.query([])?;
-    let mut matches = Vec::new();
-    while let Some(row) = rows.next()? {
-        let id = row.get::<_, String>(0)?;
-        if pplx_space_common_core::ids::sandbox_id_matches(&id, prefix) {
-            matches.push(id);
-            if matches.len() == 2 {
-                break;
+db_private_outside_tests! {
+    /// Select at most two identities: two matches prove ambiguity without decoding
+    /// unrelated or ambiguous sandbox metadata. Callers decode only a unique match.
+    fn find_by_prefix(conn: &Connection, prefix: &str) -> Result<Vec<String>> {
+        let mut stmt = conn.prepare("SELECT id FROM sandboxes ORDER BY id")?;
+        let mut rows = stmt.query([])?;
+        let mut matches = Vec::new();
+        while let Some(row) = rows.next()? {
+            let id = row.get::<_, String>(0)?;
+            if pplx_space_common_core::ids::sandbox_id_matches(&id, prefix) {
+                matches.push(id);
+                if matches.len() == 2 {
+                    break;
+                }
             }
         }
+        Ok(matches)
     }
-    Ok(matches)
 }
 
 const LIST_SANDBOXES_SQL: &str =
@@ -1193,28 +1221,32 @@ const LIST_SANDBOXES_SQL: &str =
          spaced_host_pid, netgtw_pid, vsock_uds_path, api_socket_path, created_at, updated_at, snapshots_enabled, rootfs_size_mb, pool_template, guest_uptime_secs, process_env_json, auto_lifecycle_json, auto_lifecycle_state_json, next_auto_event_at, failure_reason, cleanup_completion, cleanup_keep_filesystem, network_policy_override_json, network_tx_bytes, network_rx_bytes, network_policy_generation, applied_network_policy_generation, applied_network_policy_source, network_policy_authority, auto_lifecycle_authority, current_local_artifact_id, current_local_artifact_kind, current_local_artifact_origin, execution_metadata_json, volume_encryption, space_api_route_generation, space_api_route_node_id, space_api_route_execution_generation, space_api_route_pod_uid, restore_origin, restore_phase, restore_storage_uri, space_api_route_substrate_kind, space_api_route_activation_attempt_id, spaced_endpoint_proof_json, disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec, node_execution_id
          FROM sandboxes ORDER BY created_at";
 
-pub fn list_sandboxes(conn: &Connection) -> Result<Vec<SandboxRow>> {
-    let mut stmt = conn.prepare(LIST_SANDBOXES_SQL)?;
-    let rows = stmt.query_map([], row_to_sandbox)?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+db_private_outside_tests! {
+    fn list_sandboxes(conn: &Connection) -> Result<Vec<SandboxRow>> {
+        let mut stmt = conn.prepare(LIST_SANDBOXES_SQL)?;
+        let rows = stmt.query_map([], row_to_sandbox)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
 }
 
-pub fn list_sandboxes_for_recovery(conn: &Connection) -> Result<Vec<SandboxRow>> {
-    let mut stmt = conn.prepare(LIST_SANDBOXES_SQL)?;
-    let mut rows = stmt.query([])?;
-    let mut valid = Vec::new();
-    while let Some(row) = rows.next()? {
-        match row_to_sandbox(row) {
-            Ok(row) => valid.push(row),
-            Err(error) if is_row_decode_error(&error) => tracing::warn!(
-                sandbox_id = ?row.get_ref(0)?,
-                error = %describe_raw_error(&error),
-                "skipping undecodable sandbox row during local recovery"
-            ),
-            Err(error) => return Err(Error::from(error)),
+db_private_outside_tests! {
+    fn list_sandboxes_for_recovery(conn: &Connection) -> Result<Vec<SandboxRow>> {
+        let mut stmt = conn.prepare(LIST_SANDBOXES_SQL)?;
+        let mut rows = stmt.query([])?;
+        let mut valid = Vec::new();
+        while let Some(row) = rows.next()? {
+            match row_to_sandbox(row) {
+                Ok(row) => valid.push(row),
+                Err(error) if is_row_decode_error(&error) => tracing::warn!(
+                    sandbox_id = ?row.get_ref(0)?,
+                    error = %describe_raw_error(&error),
+                    "skipping undecodable sandbox row during local recovery"
+                ),
+                Err(error) => return Err(Error::from(error)),
+            }
         }
+        Ok(valid)
     }
-    Ok(valid)
 }
 
 /// A finite sweep: concurrent inserts are visited on the next sweep instead of
@@ -1236,130 +1268,136 @@ impl Default for PeriodicLifecycleRecoveryScan {
     }
 }
 
-/// Bounded discovery, not a complete inventory or authority to mutate a row.
-/// Examine at most 128 raw rowids and return at most eight successfully decoded
-/// candidates per tick. Failed decodes do not fill candidate slots, so eligible
-/// malformed rows can cause up to 128 individual full-row decode attempts.
-/// Advance past malformed/ineligible rows as well as candidates, so a retained
-/// or busy first page cannot starve the rest. Rowid is only a scan position;
-/// each consumer must revalidate the execution witness under its own fences.
-pub fn periodic_lifecycle_recovery_batch(
-    conn: &Connection,
-    scan: &mut PeriodicLifecycleRecoveryScan,
-) -> Result<Vec<SandboxRow>> {
-    if scan.through.is_none() {
-        scan.through = conn.query_row(sql!("SELECT MAX(rowid) FROM sandboxes"), [], |row| {
-            row.get(0)
-        })?;
-    }
-    let Some(through) = scan.through else {
-        return Ok(Vec::new());
-    };
-    let mut statement = conn.prepare(sql!(
-        "SELECT rowid, id, state, current_local_artifact_id FROM sandboxes
-         WHERE rowid >= ?1 AND rowid <= ?2 ORDER BY rowid LIMIT 128"
-    ))?;
-    let mut rows = statement.query([scan.next, through])?;
-    let mut candidates = Vec::new();
-    for _ in 0..128 {
-        let Some(row) = rows.next()? else {
-            *scan = PeriodicLifecycleRecoveryScan::default();
-            break;
-        };
-        let rowid: i64 = row.get(0)?;
-        if rowid == through {
-            *scan = PeriodicLifecycleRecoveryScan::default();
-        } else {
-            // The upper witness is greater, so this cannot overflow.
-            scan.next = rowid + 1;
+db_private_outside_tests! {
+    /// Bounded discovery, not a complete inventory or authority to mutate a row.
+    /// Examine at most 128 raw rowids and return at most eight successfully decoded
+    /// candidates per tick. Failed decodes do not fill candidate slots, so eligible
+    /// malformed rows can cause up to 128 individual full-row decode attempts.
+    /// Advance past malformed/ineligible rows as well as candidates, so a retained
+    /// or busy first page cannot starve the rest. Rowid is only a scan position;
+    /// each consumer must revalidate the execution witness under its own fences.
+    fn periodic_lifecycle_recovery_batch(
+        conn: &Connection,
+        scan: &mut PeriodicLifecycleRecoveryScan,
+    ) -> Result<Vec<SandboxRow>> {
+        if scan.through.is_none() {
+            scan.through = conn.query_row(sql!("SELECT MAX(rowid) FROM sandboxes"), [], |row| {
+                row.get(0)
+            })?;
         }
-        let (id, state) = match (row.get::<_, String>(1), row.get::<_, String>(2)) {
-            (Ok(id), Ok(state)) => (id, state),
-            (Err(error), _) | (_, Err(error)) => {
-                tracing::warn!(
-                    rowid,
-                    error = %describe_raw_error(&error),
-                    "skipping undecodable sandbox key/state during periodic recovery"
-                );
+        let Some(through) = scan.through else {
+            return Ok(Vec::new());
+        };
+        let mut statement = conn.prepare(sql!(
+            "SELECT rowid, id, state, current_local_artifact_id FROM sandboxes
+         WHERE rowid >= ?1 AND rowid <= ?2 ORDER BY rowid LIMIT 128"
+        ))?;
+        let mut rows = statement.query([scan.next, through])?;
+        let mut candidates = Vec::new();
+        for _ in 0..128 {
+            let Some(row) = rows.next()? else {
+                *scan = PeriodicLifecycleRecoveryScan::default();
+                break;
+            };
+            let rowid: i64 = row.get(0)?;
+            if rowid == through {
+                *scan = PeriodicLifecycleRecoveryScan::default();
+            } else {
+                // The upper witness is greater, so this cannot overflow.
+                scan.next = rowid + 1;
+            }
+            let (id, state) = match (row.get::<_, String>(1), row.get::<_, String>(2)) {
+                (Ok(id), Ok(state)) => (id, state),
+                (Err(error), _) | (_, Err(error)) => {
+                    tracing::warn!(
+                        rowid,
+                        error = %describe_raw_error(&error),
+                        "skipping undecodable sandbox key/state during periodic recovery"
+                    );
+                    continue;
+                }
+            };
+            let eligible = match state.parse::<SandboxState>() {
+                Ok(SandboxState::Paused | SandboxState::Resuming | SandboxState::Checkpointing) => true,
+                Ok(SandboxState::Suspending) => {
+                    matches!(row.get_ref(3)?, rusqlite::types::ValueRef::Null)
+                }
+                _ => false,
+            };
+            if !eligible {
                 continue;
             }
-        };
-        let eligible = match state.parse::<SandboxState>() {
-            Ok(SandboxState::Paused | SandboxState::Resuming | SandboxState::Checkpointing) => true,
-            Ok(SandboxState::Suspending) => {
-                matches!(row.get_ref(3)?, rusqlite::types::ValueRef::Null)
+            match get_sandbox(conn, &id) {
+                Ok(Some(row)) => candidates.push(row),
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    sandbox_id = %id,
+                    error = %describe_error(&error),
+                    "skipping undecodable sandbox row during periodic recovery"
+                ),
             }
-            _ => false,
-        };
-        if !eligible {
-            continue;
+            if candidates.len() == 8 {
+                break;
+            }
         }
-        match get_sandbox(conn, &id) {
-            Ok(Some(row)) => candidates.push(row),
-            Ok(None) => {}
-            Err(error) => tracing::warn!(
-                sandbox_id = %id,
-                error = %describe_error(&error),
-                "skipping undecodable sandbox row during periodic recovery"
-            ),
-        }
-        if candidates.len() == 8 {
-            break;
-        }
+        Ok(candidates)
     }
-    Ok(candidates)
 }
 
-/// Host-control net-gateway auth lookup: rows whose registered
-/// `(netgtw_pid, uid)` matches the caller's peer credentials.
-///
-/// Restricted to states where a live gateway can legitimately exist
-/// (`SandboxState::can_authorize_net_gateway`): launch-failure and other
-/// terminal rows retain the `(uid, netgtw_pid)` of dead processes, and since
-/// uids are slot-derived and pids recycle, an unfiltered match would let a
-/// stale row shadow — or be served in place of — a later sandbox's gateway.
-/// The state list below must stay in sync with that predicate; the
-/// per-state lookup test cross-checks them.
-pub fn list_by_netgtw_pid_uid(
-    conn: &Connection,
-    netgtw_pid: u32,
-    uid: u32,
-) -> Result<Vec<SandboxRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, uuid8, state, template, template_hash, user, runtime, uid, slot, guest_cid, pid,
+db_private_outside_tests! {
+    /// Host-control net-gateway auth lookup: rows whose registered
+    /// `(netgtw_pid, uid)` matches the caller's peer credentials.
+    ///
+    /// Restricted to states where a live gateway can legitimately exist
+    /// (`SandboxState::can_authorize_net_gateway`): launch-failure and other
+    /// terminal rows retain the `(uid, netgtw_pid)` of dead processes, and since
+    /// uids are slot-derived and pids recycle, an unfiltered match would let a
+    /// stale row shadow — or be served in place of — a later sandbox's gateway.
+    /// The state list below must stay in sync with that predicate; the
+    /// per-state lookup test cross-checks them.
+    fn list_by_netgtw_pid_uid(
+        conn: &Connection,
+        netgtw_pid: u32,
+        uid: u32,
+    ) -> Result<Vec<SandboxRow>> {
+        let mut stmt = conn.prepare(
+            "SELECT id, uuid8, state, template, template_hash, user, runtime, uid, slot, guest_cid, pid,
          spaced_host_pid, netgtw_pid, vsock_uds_path, api_socket_path, created_at, updated_at, snapshots_enabled, rootfs_size_mb, pool_template, guest_uptime_secs, process_env_json, auto_lifecycle_json, auto_lifecycle_state_json, next_auto_event_at, failure_reason, cleanup_completion, cleanup_keep_filesystem, network_policy_override_json, network_tx_bytes, network_rx_bytes, network_policy_generation, applied_network_policy_generation, applied_network_policy_source, network_policy_authority, auto_lifecycle_authority, current_local_artifact_id, current_local_artifact_kind, current_local_artifact_origin, execution_metadata_json, volume_encryption, space_api_route_generation, space_api_route_node_id, space_api_route_execution_generation, space_api_route_pod_uid, restore_origin, restore_phase, restore_storage_uri, space_api_route_substrate_kind, space_api_route_activation_attempt_id, spaced_endpoint_proof_json, disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec, node_execution_id
          FROM sandboxes
          WHERE netgtw_pid = ?1 AND uid = ?2
            AND state IN ('starting', 'started', 'stopping', 'pausing', 'paused',
                          'resuming', 'checkpointing', 'suspending', 'restoring')
          LIMIT 2",
-    )?;
-    let rows = stmt.query_map(params![netgtw_pid, uid], row_to_sandbox)?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+        )?;
+        let rows = stmt.query_map(params![netgtw_pid, uid], row_to_sandbox)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
 }
 
-/// Host-control spaced-host auth lookup: rows whose registered
-/// `(spaced_host_pid, uid)` matches the caller's peer credentials.
-pub fn list_by_spaced_host_pid_uid(
-    conn: &Connection,
-    spaced_host_pid: u32,
-    uid: u32,
-) -> Result<Vec<SandboxRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT id
+db_private_outside_tests! {
+    /// Host-control spaced-host auth lookup: rows whose registered
+    /// `(spaced_host_pid, uid)` matches the caller's peer credentials.
+    fn list_by_spaced_host_pid_uid(
+        conn: &Connection,
+        spaced_host_pid: u32,
+        uid: u32,
+    ) -> Result<Vec<SandboxRow>> {
+        let mut stmt = conn.prepare(
+            "SELECT id
          FROM sandboxes
          WHERE spaced_host_pid = ?1 AND uid = ?2
          LIMIT 2",
-    )?;
-    let sandbox_ids = stmt
-        .query_map(params![spaced_host_pid, uid], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    drop(stmt);
+        )?;
+        let sandbox_ids = stmt
+            .query_map(params![spaced_host_pid, uid], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
 
-    sandbox_ids
-        .into_iter()
-        .map(|sandbox_id| get_sandbox(conn, &sandbox_id)?.ok_or(Error::no_rows()))
-        .collect()
+        sandbox_ids
+            .into_iter()
+            .map(|sandbox_id| get_sandbox(conn, &sandbox_id)?.ok_or(Error::no_rows()))
+            .collect()
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1474,15 +1512,17 @@ pub fn delete_sandbox_if_inventory_witness_matches(
     Ok(InventoryStaleRowMutation::Removed)
 }
 
-pub fn sandbox_has_runtime_fields(row: &SandboxRow) -> bool {
-    row.uid.is_some()
-        || row.slot.is_some()
-        || row.guest_cid.is_some()
-        || row.pid.is_some()
-        || row.spaced_host_pid.is_some()
-        || row.netgtw_pid.is_some()
-        || row.vsock_uds_path.is_some()
-        || row.api_socket_path.is_some()
+db_private_outside_tests! {
+    fn sandbox_has_runtime_fields(row: &SandboxRow) -> bool {
+        row.uid.is_some()
+            || row.slot.is_some()
+            || row.guest_cid.is_some()
+            || row.pid.is_some()
+            || row.spaced_host_pid.is_some()
+            || row.netgtw_pid.is_some()
+            || row.vsock_uds_path.is_some()
+            || row.api_socket_path.is_some()
+    }
 }
 
 pub(super) fn sandbox_has_full_suspend_artifact_pin(row: &SandboxRow) -> bool {

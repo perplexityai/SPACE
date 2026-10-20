@@ -1,6 +1,7 @@
 //! Suspended-sandbox reads behind `crate::sandbox_eviction`'s candidate
 //! scans and local eviction evidence.
 
+use crate::db::db_private_outside_tests;
 use crate::db::{Connection, OptionalExtension, Result};
 use pplx_space_sqlite::SqliteU64;
 use rusqlite::params;
@@ -60,18 +61,19 @@ const IDLE_WITNESS_SQL: &str = "COALESCE(
              CAST(s.updated_at AS INTEGER)
            )";
 
-/// `(sandbox_id, idle witness)` of cold suspended sandboxes after the
-/// `(cursor_witness, cursor_sandbox_id)` keyset position, in witness then id
-/// order.
-pub fn idle_suspended_candidates(
-    conn: &Connection,
-    cutoff: i64,
-    cursor_witness: Option<i64>,
-    cursor_sandbox_id: Option<&str>,
-    limit: usize,
-) -> Result<Vec<(String, u64)>> {
-    let sql = format!(
-        "SELECT s.id, {IDLE_WITNESS_SQL} FROM sandboxes s
+db_private_outside_tests! {
+    /// `(sandbox_id, idle witness)` of cold suspended sandboxes after the
+    /// `(cursor_witness, cursor_sandbox_id)` keyset position, in witness then id
+    /// order.
+    fn idle_suspended_candidates(
+        conn: &Connection,
+        cutoff: i64,
+        cursor_witness: Option<i64>,
+        cursor_sandbox_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, u64)>> {
+        let sql = format!(
+            "SELECT s.id, {IDLE_WITNESS_SQL} FROM sandboxes s
          WHERE s.state = 'suspended'
            AND {VALID_SUSPENDED_UPDATED_AT_SQL}
            AND {IDLE_WITNESS_SQL} <= ?1
@@ -97,30 +99,32 @@ pub fn idle_suspended_candidates(
            )
          ORDER BY {IDLE_WITNESS_SQL} ASC, s.id ASC
          LIMIT ?4"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt
-        .query_map(
-            params![cutoff, cursor_witness, cursor_sandbox_id, limit as i64],
-            |row| {
-                let sandbox_id: String = row.get(0)?;
-                let idle_witness_secs = row.get::<_, SqliteU64>(1)?.0;
-                Ok((sandbox_id, idle_witness_secs))
-            },
-        )?
-        .collect::<rusqlite::Result<_>>()?;
-    Ok(rows)
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(
+                params![cutoff, cursor_witness, cursor_sandbox_id, limit as i64],
+                |row| {
+                    let sandbox_id: String = row.get(0)?;
+                    let idle_witness_secs = row.get::<_, SqliteU64>(1)?.0;
+                    Ok((sandbox_id, idle_witness_secs))
+                },
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
 }
 
-/// Ids of cold suspended sandboxes with neither a pinned artifact nor an
-/// upload job carrying a snapshot id, oldest witness first.
-pub fn legacy_reupload_candidates(
-    conn: &Connection,
-    idle_cutoff_epoch_secs: u64,
-    limit: usize,
-) -> Result<Vec<String>> {
-    let sql = format!(
-        "SELECT s.id FROM sandboxes s
+db_private_outside_tests! {
+    /// Ids of cold suspended sandboxes with neither a pinned artifact nor an
+    /// upload job carrying a snapshot id, oldest witness first.
+    fn legacy_reupload_candidates(
+        conn: &Connection,
+        idle_cutoff_epoch_secs: u64,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let sql = format!(
+            "SELECT s.id FROM sandboxes s
          WHERE s.state = 'suspended'
            AND {VALID_SUSPENDED_UPDATED_AT_SQL}
            AND {IDLE_WITNESS_SQL} <= ?1
@@ -139,81 +143,92 @@ pub fn legacy_reupload_candidates(
            )
          ORDER BY {IDLE_WITNESS_SQL} ASC
          LIMIT ?2"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt
-        .query_map(
-            params![SqliteU64(idle_cutoff_epoch_secs), limit as i64],
-            |r| r.get(0),
-        )?
-        .collect::<rusqlite::Result<_>>()?;
-    Ok(rows)
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(
+                params![SqliteU64(idle_cutoff_epoch_secs), limit as i64],
+                |r| r.get(0),
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
 }
 
-pub fn count_malformed_suspended_updated_at(conn: &Connection) -> Result<usize> {
-    let sql = format!(
-        "SELECT COUNT(*) FROM sandboxes s
+db_private_outside_tests! {
+    fn count_malformed_suspended_updated_at(conn: &Connection) -> Result<usize> {
+        let sql = format!(
+            "SELECT COUNT(*) FROM sandboxes s
          WHERE s.state = 'suspended'
            AND NOT ({VALID_SUSPENDED_UPDATED_AT_SQL})"
-    );
-    conn.query_row(&sql, [], |row| {
-        let count: i64 = row.get(0)?;
-        Ok(usize::try_from(count).unwrap_or_default())
-    })
+        );
+        conn.query_row(&sql, [], |row| {
+            let count: i64 = row.get(0)?;
+            Ok(usize::try_from(count).unwrap_or_default())
+        })
+    }
 }
 
-/// Every local `sandboxes` row, whatever its state. node-ctl's full census
-/// publishes one entry per row, so this is the count that sizes it.
-pub fn count_resident_rows(conn: &Connection) -> Result<usize> {
-    conn.query_row("SELECT COUNT(*) FROM sandboxes", [], |row| {
-        let count: i64 = row.get(0)?;
-        usize::try_from(count).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, count))
-    })
+db_private_outside_tests! {
+    /// Every local `sandboxes` row, whatever its state. node-ctl's full census
+    /// publishes one entry per row, so this is the count that sizes it.
+    fn count_resident_rows(conn: &Connection) -> Result<usize> {
+        conn.query_row("SELECT COUNT(*) FROM sandboxes", [], |row| {
+            let count: i64 = row.get(0)?;
+            usize::try_from(count).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, count))
+        })
+    }
 }
 
-/// The sandbox's pinned artifact id and `updated_at`, `None` without a row.
-pub fn artifact_pin_and_updated_at(
-    conn: &Connection,
-    sandbox_id: &str,
-) -> Result<Option<(Option<String>, EpochSeconds)>> {
-    conn.query_row(
-        "SELECT current_local_artifact_id, updated_at FROM sandboxes WHERE id = ?1",
-        params![sandbox_id],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )
-    .optional()
+db_private_outside_tests! {
+    /// The sandbox's pinned artifact id and `updated_at`, `None` without a row.
+    fn artifact_pin_and_updated_at(
+        conn: &Connection,
+        sandbox_id: &str,
+    ) -> Result<Option<(Option<String>, EpochSeconds)>> {
+        conn.query_row(
+            "SELECT current_local_artifact_id, updated_at FROM sandboxes WHERE id = ?1",
+            params![sandbox_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+    }
 }
 
-/// `(artifact_kind, local_artifact_id, backed up)` of the artifact `pin`
-/// names, only if `sandbox_id` owns it.
-pub fn owned_artifact_evidence(
-    conn: &Connection,
-    pin: &str,
-    sandbox_id: &str,
-) -> Result<Option<(String, String, bool)>> {
-    conn.query_row(
-        "SELECT artifact_kind, local_artifact_id, backup_completed_at IS NOT NULL
+db_private_outside_tests! {
+    /// `(artifact_kind, local_artifact_id, backed up)` of the artifact `pin`
+    /// names, only if `sandbox_id` owns it.
+    fn owned_artifact_evidence(
+        conn: &Connection,
+        pin: &str,
+        sandbox_id: &str,
+    ) -> Result<Option<(String, String, bool)>> {
+        conn.query_row(
+            "SELECT artifact_kind, local_artifact_id, backup_completed_at IS NOT NULL
          FROM local_artifacts
         WHERE local_artifact_id = ?1 AND sandbox_id = ?2",
-        params![pin, sandbox_id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-    )
-    .optional()
+            params![pin, sandbox_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+    }
 }
 
-/// The payload `snapshot_id` and `created_at` of the sandbox's newest
-/// snapshot-upload job, whatever its status.
-pub fn latest_upload_job(
-    conn: &Connection,
-    sandbox_id: &str,
-) -> Result<Option<(Option<String>, String)>> {
-    conn.query_row(
-        "SELECT json_extract(j.payload, '$.snapshot_id'), j.created_at FROM jobs j
+db_private_outside_tests! {
+    /// The payload `snapshot_id` and `created_at` of the sandbox's newest
+    /// snapshot-upload job, whatever its status.
+    fn latest_upload_job(
+        conn: &Connection,
+        sandbox_id: &str,
+    ) -> Result<Option<(Option<String>, String)>> {
+        conn.query_row(
+            "SELECT json_extract(j.payload, '$.snapshot_id'), j.created_at FROM jobs j
          WHERE j.kind = 'snapshot_upload' AND j.subject_id = ?1
          ORDER BY j.created_at DESC, j.job_id DESC
          LIMIT 1",
-        params![sandbox_id],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )
-    .optional()
+            params![sandbox_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+    }
 }

@@ -93,7 +93,7 @@ impl SandboxManagerService {
             };
             let eligible = if guards.is_some() {
                 self.startup_recovery_db().and_then(|db| {
-                    crate::db::get_sandbox(&db, &id).map_err(StartupRecoveryError::from)
+                    crate::db::read::sandbox(&db, &id).map_err(StartupRecoveryError::from)
                 })
             } else {
                 Ok(None)
@@ -289,11 +289,8 @@ impl SandboxManagerService {
         artifact: LocalArtifactId,
     ) -> Result<bool, StartupRecoveryError> {
         let db = self.startup_recovery_db()?;
-        Ok(crate::db::sandbox_suspended_with_pinned_artifact(
-            &db,
-            sandbox_id,
-            &artifact.to_string(),
-        )?)
+        Ok(crate::db::read::sandbox_view(&db, sandbox_id)
+            .suspended_with_pinned_artifact(&artifact.to_string())?)
     }
 }
 

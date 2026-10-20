@@ -591,9 +591,12 @@ impl SandboxManagerService {
         let id = sandbox_id.to_owned();
         let scope = self
             .storage(move |db| {
-                crate::db::restore_transfer_scope(db, &id).map_err(|error| {
-                    Status::internal(format!("read restore transfer scope: {error}"))
-                })
+                crate::db::read::sandbox_view(db, &id)
+                    .restore_scope()
+                    .scope()
+                    .map_err(|error| {
+                        Status::internal(format!("read restore transfer scope: {error}"))
+                    })
             })
             .await?;
         let Some(scope) = scope else {
@@ -610,10 +613,12 @@ impl SandboxManagerService {
     ) -> Result<bool, Status> {
         let still_rowless = {
             let db = self.db_conn()?;
-            crate::db::get_sandbox(&db, sandbox_id)
+            crate::db::read::sandbox(&db, sandbox_id)
                 .map_err(|error| Status::internal(format!("read sandbox row: {error}")))?
                 .is_none()
-                && crate::db::restore_transfer_scope(&db, sandbox_id)
+                && crate::db::read::sandbox_view(&db, sandbox_id)
+                    .restore_scope()
+                    .scope()
                     .map_err(|error| {
                         Status::internal(format!("read restore transfer scope: {error}"))
                     })?
@@ -683,7 +688,10 @@ impl SandboxManagerService {
             let Ok(db) = self.db_conn() else {
                 return;
             };
-            match crate::db::rowless_restore_transfer_scopes(&db) {
+            match crate::db::scan::rowless_restore_scopes(
+                &db,
+                crate::db::scan::RowlessRestoreScopes::All,
+            ) {
                 Ok(scopes) => scopes,
                 Err(error) => {
                     tracing::warn!(%error, "failed to list rowless restore transfer scopes");
@@ -716,7 +724,11 @@ impl SandboxManagerService {
         let mut cursor = std::mem::take(scan);
         let batch = self
             .storage(move |db| {
-                let batch = cursor.next_batch(db).map_err(|error| {
+                let batch = crate::db::scan::rowless_restore_scopes(
+                    db,
+                    crate::db::scan::RowlessRestoreScopes::Cursor(&mut cursor),
+                )
+                .map_err(|error| {
                     Status::internal(format!("discover orphan transfer scopes: {error}"))
                 })?;
                 Ok((cursor, batch))
@@ -835,7 +847,8 @@ impl SandboxManagerService {
         expected_template: Option<&str>,
         require_template_owner: bool,
     ) -> Result<(), Status> {
-        let target = crate::db::cleanup_target(db, sandbox_id)
+        let target = crate::db::read::sandbox_view(db, sandbox_id)
+            .cleanup_target()
             .map_err(|error| Status::unavailable(format!("inspect cleanup template: {error}")))?;
         if require_template_owner
             && target
@@ -987,9 +1000,12 @@ impl SandboxManagerService {
         // An unfamiliar durable intent is not a persistence failure that can
         // authorize best-effort pathname cleanup. Check before any admission
         // branch can return Unpersisted, including transaction-begin failure.
-        crate::db::cleanup_episode(&db, &sandbox_id_string).map_err(|_| {
-            Status::unavailable("cleanup ownership cannot be decoded; retain resources")
-        })?;
+        crate::db::read::sandbox_view(&db, &sandbox_id_string)
+            .cleanup_episode()
+            .strict()
+            .map_err(|_| {
+                Status::unavailable("cleanup ownership cannot be decoded; retain resources")
+            })?;
         let transaction = match if mode.requires_immediate_transaction() || require_selection_check
         {
             crate::db::Transaction::immediate(&db)
@@ -1022,7 +1038,9 @@ impl SandboxManagerService {
             )?;
         }
 
-        if crate::db::cleanup_episode(&transaction, &sandbox_id_string)
+        if crate::db::read::sandbox_view(&transaction, &sandbox_id_string)
+            .cleanup_episode()
+            .strict()
             .map_err(|e| Status::internal(format!("read cleanup ownership: {e}")))?
             .is_some_and(|episode| episode.completion == CleanupCompletion::DeletePoolClone)
         {
@@ -1031,7 +1049,7 @@ impl SandboxManagerService {
             );
         }
         if let Some(observed_state) = mode.observed_state() {
-            let current_state = crate::db::get_sandbox(&transaction, &sandbox_id_string)
+            let current_state = crate::db::read::sandbox(&transaction, &sandbox_id_string)
                 .map_err(|error| {
                     Status::internal(format!(
                         "inspect lifecycle state during cleanup admission failed: {error}"
@@ -1046,22 +1064,13 @@ impl SandboxManagerService {
             }
         }
         if target_state == SandboxState::Deleting && completion.deletes_row() {
-            let erase_safety = crate::db::get_sandbox(&transaction, &sandbox_id_string)
+            let erase_safety = crate::db::read::sandbox(&transaction, &sandbox_id_string)
                 .map_err(|error| {
                     Status::internal(format!(
                         "inspect suspend publication during delete admission failed: {error}"
                     ))
                 })?
-                .map(|row| {
-                    (
-                        row.state,
-                        crate::db::sandbox_erase_safety(
-                            row.state,
-                            row.cleanup_completion,
-                            row.failure_reason.as_deref(),
-                        ),
-                    )
-                });
+                .map(|row| (row.state, row.erase_safety()));
             match erase_safety {
                 Some((state, crate::db::SandboxEraseSafety::SuspendPublicationPending)) => {
                     tracing::info!(
@@ -1085,7 +1094,9 @@ impl SandboxManagerService {
             }
         }
         let current_execution_generation =
-            match crate::db::runtime_execution_generation(&transaction, &sandbox_id_string) {
+            match crate::db::read::sandbox_view(&transaction, &sandbox_id_string)
+                .runtime_execution_generation()
+            {
                 Ok(generation) => generation,
                 Err(error) if require_generation_inspection => {
                     return Err(Status::unavailable(format!(
@@ -1114,16 +1125,15 @@ impl SandboxManagerService {
         }
         if completion.deletes_row()
             && mode.auto_lifecycle_delete_expectation().is_none()
-            && crate::db::auto_lifecycle_delete_receipts::pending_receipt_for_sandbox(
-                &transaction,
-                sandbox_id,
-            )
-            .map_err(|error| {
-                Status::unavailable(format!(
-                    "inspect pending auto-lifecycle delete receipt: {error}"
-                ))
-            })?
-            .is_some()
+            && crate::db::read::typed_sandbox_view(&transaction, sandbox_id)
+                .delete_receipts()
+                .pending()
+                .map_err(|error| {
+                    Status::unavailable(format!(
+                        "inspect pending auto-lifecycle delete receipt: {error}"
+                    ))
+                })?
+                .is_some()
         {
             return Err(Status::unavailable(
                 "pending auto-lifecycle delete receipt owns sandbox deletion",
@@ -1224,7 +1234,8 @@ impl SandboxManagerService {
             None
         };
         let guest_flush = guest_flush.for_superseded_state(
-            crate::db::current_state_label(&transaction, &sandbox_id_string)
+            crate::db::read::sandbox_view(&transaction, &sandbox_id_string)
+                .current_state_label()
                 .ok()
                 .flatten()
                 .and_then(|state| state.parse().ok()),
@@ -1276,7 +1287,9 @@ impl SandboxManagerService {
             }
         }
         if mode.auto_lifecycle_delete_expectation().is_some()
-            && crate::db::cleanup_episode(&transaction, &sandbox_id_string)
+            && crate::db::read::sandbox_view(&transaction, &sandbox_id_string)
+                .cleanup_episode()
+                .strict()
                 .map_err(|error| {
                     Status::unavailable(format!(
                         "inspect cleanup episode after auto-lifecycle delete claim: {error}"
@@ -1388,7 +1401,8 @@ impl SandboxManagerService {
                 }
                 None => (None, None),
             };
-        if let Some(uuid8) = crate::db::cleanup_runtime_label(&transaction, &sandbox_id_string)
+        if let Some(uuid8) = crate::db::read::sandbox_view(&transaction, &sandbox_id_string)
+            .cleanup_runtime_label()
             .map_err(|error| {
                 Status::unavailable(format!("inspect cleanup scheduling identity: {error}"))
             })?
@@ -1468,9 +1482,11 @@ impl SandboxManagerService {
             let db = db
                 .lock()
                 .map_err(|_| Status::internal("database mutex poisoned"))?;
-            crate::db::runtime_execution_generation(&db, sandbox_id).map_err(|error| {
-                Status::internal(format!("inspect runtime generation failed: {error}"))
-            })?
+            crate::db::read::sandbox_view(&db, sandbox_id)
+                .runtime_execution_generation()
+                .map_err(|error| {
+                    Status::internal(format!("inspect runtime generation failed: {error}"))
+                })?
         };
         if current_execution_generation != expected_execution_generation {
             return Ok(CleanupDispatchDisposition::Superseded);
@@ -1697,16 +1713,16 @@ impl SandboxManagerService {
             let sandbox_id = sandbox_id
                 .parse::<SandboxId>()
                 .map_err(|error| error.to_string())?;
-            if !crate::db::auto_lifecycle_delete_receipts::pending_receipt_matches_observed_execution(
-                &db,
-                sandbox_id,
-            )
-            .map_err(|error| error.to_string())?
+            if !crate::db::read::typed_sandbox_view(&db, sandbox_id)
+                .delete_receipts()
+                .pending_matches_observed_execution()
+                .map_err(|error| error.to_string())?
             {
                 return Ok(false);
             }
         }
-        crate::db::cleanup_intent_current(&db, sandbox_id, completion)
+        crate::db::read::sandbox_view(&db, sandbox_id)
+            .cleanup_intent_current(completion)
             .map_err(|error| error.to_string())
     }
 
@@ -1721,7 +1737,9 @@ impl SandboxManagerService {
                 .lock()
                 .map_err(|error| format!("database mutex poisoned: {error}"))?;
 
-            return crate::db::cleanup_episode_current(&db, sandbox_id, cleanup_id)
+            return crate::db::read::sandbox_view(&db, sandbox_id)
+                .cleanup_episode()
+                .current(cleanup_id)
                 .map_err(|error| error.to_string());
         }
         Self::cleanup_attempt_still_current(db, sandbox_id, completion)
@@ -1737,7 +1755,9 @@ impl SandboxManagerService {
             let db = db
                 .lock()
                 .map_err(|_| QuarantineRecoveryArtifactError::DatabaseMutexPoisoned)?;
-            let episode = crate::db::cleanup_episode(&db, sandbox_id)?;
+            let episode = crate::db::read::sandbox_view(&db, sandbox_id)
+                .cleanup_episode()
+                .strict()?;
             let Some(episode) = episode.filter(|episode| episode.id == cleanup_id) else {
                 return Ok(());
             };
@@ -1955,7 +1975,7 @@ impl SandboxManagerService {
             published_artifact,
             job_id,
         } = request;
-        if crate::db::runtime_execution_generation(conn, sandbox_id)?
+        if crate::db::read::sandbox_view(conn, sandbox_id).runtime_execution_generation()?
             != expected_execution_generation
         {
             return Ok(CleanupCompletionDisposition::Superseded);
@@ -1999,7 +2019,7 @@ impl SandboxManagerService {
                 );
                 return;
             };
-            let row = match crate::db::get_sandbox(&db, sandbox_id) {
+            let row = match crate::db::read::sandbox(&db, sandbox_id) {
                 Ok(row) => row,
                 Err(error) => {
                     tracing::warn!(
@@ -2295,9 +2315,11 @@ impl SandboxManagerService {
             Some(admission) => admission.expected_execution_generation(parsed_sandbox_id)?,
             None => {
                 let db = self.db_conn()?;
-                crate::db::runtime_execution_generation(&db, sandbox_id).map_err(|error| {
-                    Status::internal(format!("inspect runtime generation failed: {error}"))
-                })?
+                crate::db::read::sandbox_view(&db, sandbox_id)
+                    .runtime_execution_generation()
+                    .map_err(|error| {
+                        Status::internal(format!("inspect runtime generation failed: {error}"))
+                    })?
             }
         };
         let auto_lifecycle_delete_receipt = match admission.as_ref() {
@@ -2576,11 +2598,15 @@ impl SandboxManagerService {
                 .lock()
                 .map_err(|_| Status::unavailable("cleanup ownership is unavailable"))?;
 
-            crate::db::cleanup_episode(&db, sandbox_id).map_err(|_| {
-                Status::unavailable("cleanup ownership cannot be decoded; retain resources")
-            })?;
+            crate::db::read::sandbox_view(&db, sandbox_id)
+                .cleanup_episode()
+                .strict()
+                .map_err(|_| {
+                    Status::unavailable("cleanup ownership cannot be decoded; retain resources")
+                })?;
             request.completion == CleanupCompletion::DeleteRow
-                && crate::db::current_state_label(&db, sandbox_id)
+                && crate::db::read::sandbox_view(&db, sandbox_id)
+                    .current_state_label()
                     .map_err(|error| {
                         Status::unavailable(format!(
                             "inspect sandbox after unpersisted delete: {error}"
@@ -2805,7 +2831,8 @@ impl SandboxManagerService {
             BeforeStopFlush::ResumeThenFlush => {
                 let execution_fence = {
                     let db = self.db_conn().map_err(StopFlushError::Database)?;
-                    crate::db::node_execution_fence(&db, sandbox_id)
+                    crate::db::read::sandbox_view(&db, sandbox_id)
+                        .node_execution_fence()
                         .map_err(StopFlushError::Fence)?
                         .map(Into::into)
                 };

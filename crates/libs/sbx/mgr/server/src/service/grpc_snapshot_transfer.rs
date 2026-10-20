@@ -329,7 +329,7 @@ impl SandboxManagerService {
         let lookup_id = sandbox_id.clone();
         let sandbox = self
             .storage(move |db| {
-                crate::db::get_sandbox(db, &lookup_id)
+                crate::db::read::sandbox(db, &lookup_id)
                     .map_err(|error| Status::internal(format!("inspect snapshot target: {error}")))
             })
             .await?

@@ -62,9 +62,7 @@ impl PeriodicInventoryScan {
         paths: SandboxInventoryPaths<'_>,
         shutdown: &CancellationToken,
     ) -> Result<InventoryDiscovery, Status> {
-        let rows = self
-            .database
-            .next_batch(&*service.db_conn()?)
+        let rows = crate::db::scan::sandbox_pages(&*service.db_conn()?, &mut self.database)
             .map_err(|error| Status::internal(format!("inventory discovery: {error}")))?;
         let mut ids = BTreeSet::new();
         for (scan, path, is_cache) in [
@@ -197,7 +195,11 @@ impl SandboxManagerService {
                 .map(ToString::to_string)
                 .filter(|id| !listed.contains(id.as_str()))
                 // An unreadable row counts: reconciliation rechecks it.
-                .filter(|id| !crate::db::sandbox_exists(&db, id).unwrap_or(false))
+                .filter(|id| {
+                    !crate::db::read::sandbox_view(&db, id)
+                        .exists()
+                        .unwrap_or(false)
+                })
                 .map(|id| paths.cache_dir.join(id))
                 .collect()
         };

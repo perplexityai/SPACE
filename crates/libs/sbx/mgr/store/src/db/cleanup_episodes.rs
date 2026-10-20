@@ -246,19 +246,22 @@ pub fn bind_prepared_clone_root(
     )? == 1)
 }
 
-/// Presence is authoritative even when a newer binary wrote an intent this
-/// reader cannot decode. Startup must not promote or recreate its resources.
-pub fn has_cleanup_episode(conn: &Connection, id: &str) -> Result<bool> {
-    conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sandbox_cleanup_episodes WHERE sandbox_id = ?1)",
-        [id],
-        |row| row.get(0),
-    )
+db_private_outside_tests! {
+    /// Presence is authoritative even when a newer binary wrote an intent this
+    /// reader cannot decode. Startup must not promote or recreate its resources.
+    fn has_cleanup_episode(conn: &Connection, id: &str) -> Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sandbox_cleanup_episodes WHERE sandbox_id = ?1)",
+            [id],
+            |row| row.get(0),
+        )
+    }
 }
 
-pub fn cleanup_episode(conn: &Connection, id: &str) -> Result<Option<CleanupEpisode>> {
-    conn.query_row(
-        "SELECT cleanup_id, completion, keep_filesystem, entered_from_state,
+db_private_outside_tests! {
+    fn cleanup_episode(conn: &Connection, id: &str) -> Result<Option<CleanupEpisode>> {
+        conn.query_row(
+            "SELECT cleanup_id, completion, keep_filesystem, entered_from_state,
                 activation_state, requested_at, quarantine_reason_code,
                 failure_message, last_cleanup_error, attempt_count,
                 recovery_local_artifact_id, recovery_execution_generation,
@@ -266,139 +269,140 @@ pub fn cleanup_episode(conn: &Connection, id: &str) -> Result<Option<CleanupEpis
                 operation_activation_attempt_id
            FROM sandbox_cleanup_episodes
           WHERE sandbox_id = ?1",
-        params![id],
-        |row| {
-            let cleanup_id = row.get::<_, String>(0)?.parse().map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error))
-            })?;
-            let completion = row.get::<_, String>(1)?.parse().map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(1, Type::Text, Box::new(error))
-            })?;
-            let entered_from_state = row
-                .get::<_, Option<String>>(3)?
-                .map(|state| {
-                    state.parse::<SandboxState>().map_err(|_| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            3,
-                            Type::Text,
-                            Box::new(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                format!("unknown cleanup entered-from state '{state}'"),
-                            )),
-                        )
-                    })
-                })
-                .transpose()?;
-            let activation_state_raw = row.get::<_, String>(4)?;
-            let activation_state = activation_state_raw.parse::<SandboxState>().map_err(|_| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    4,
-                    Type::Text,
-                    Box::new(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("unknown cleanup activation state '{activation_state_raw}'"),
-                    )),
-                )
-            })?;
-            let quarantine_reason_code = row
-                .get::<_, Option<String>>(6)?
-                .map(|reason| {
-                    reason.parse().map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(6, Type::Text, Box::new(error))
-                    })
-                })
-                .transpose()?;
-            let attempt_count = row.get::<_, i64>(9)?;
-            let quarantine_recovery = match (
-                row.get::<_, Option<String>>(10)?,
-                row.get::<_, Option<i64>>(11)?,
-            ) {
-                (None, None) => None,
-                (Some(local_artifact_id), Some(execution_generation)) => {
-                    Some(QuarantineRecoveryFence {
-                        local_artifact_id: local_artifact_id.parse().map_err(|error| {
+            params![id],
+            |row| {
+                let cleanup_id = row.get::<_, String>(0)?.parse().map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error))
+                })?;
+                let completion = row.get::<_, String>(1)?.parse().map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(1, Type::Text, Box::new(error))
+                })?;
+                let entered_from_state = row
+                    .get::<_, Option<String>>(3)?
+                    .map(|state| {
+                        state.parse::<SandboxState>().map_err(|_| {
                             rusqlite::Error::FromSqlConversionFailure(
-                                10,
+                                3,
                                 Type::Text,
-                                Box::new(error),
-                            )
-                        })?,
-                        execution_generation: ExecutionGeneration::new(execution_generation)
-                            .map_err(|error| {
-                                rusqlite::Error::FromSqlConversionFailure(
-                                    11,
-                                    Type::Integer,
-                                    Box::new(error),
-                                )
-                            })?,
-                    })
-                }
-                _ => {
-                    return Err(rusqlite::Error::FromSqlConversionFailure(
-                        10,
-                        Type::Null,
-                        Box::new(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "quarantine recovery fence is incomplete",
-                        )),
-                    ));
-                }
-            };
-            Ok(CleanupEpisode {
-                operation_activation_attempt_id: row
-                    .get::<_, Option<String>>(15)?
-                    .map(|value| value.parse())
-                    .transpose()
-                    .map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(15, Type::Text, Box::new(error))
-                    })?,
-                prepared_clone_root: row
-                    .get::<_, Option<String>>(14)?
-                    .map(|json| {
-                        serde_json::from_str(&json).map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                14,
-                                Type::Text,
-                                Box::new(error),
+                                Box::new(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!("unknown cleanup entered-from state '{state}'"),
+                                )),
                             )
                         })
                     })
-                    .transpose()?,
-                id: cleanup_id,
-                completion,
-                keep_filesystem: row.get(2)?,
-                entered_from_state,
-                activation_state,
-                requested_at: row
-                    .get::<_, Option<i64>>(5)?
-                    .and_then(|value| u64::try_from(value).ok()),
-                quarantine_reason_code,
-                failure_message: row.get(7)?,
-                last_cleanup_error: row.get(8)?,
-                execution_generation: row
-                    .get::<_, Option<i64>>(12)?
-                    .map(ExecutionGeneration::new)
-                    .transpose()
-                    .map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            12,
-                            Type::Integer,
-                            Box::new(error),
-                        )
-                    })?,
-                activation_attempt_id: row
-                    .get::<_, Option<String>>(13)?
-                    .map(|value| value.parse())
-                    .transpose()
-                    .map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(13, Type::Text, Box::new(error))
-                    })?,
-                attempt_count: u32::try_from(attempt_count).unwrap_or(u32::MAX),
-                quarantine_recovery,
-            })
-        },
-    )
-    .optional()
+                    .transpose()?;
+                let activation_state_raw = row.get::<_, String>(4)?;
+                let activation_state = activation_state_raw.parse::<SandboxState>().map_err(|_| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        Type::Text,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("unknown cleanup activation state '{activation_state_raw}'"),
+                        )),
+                    )
+                })?;
+                let quarantine_reason_code = row
+                    .get::<_, Option<String>>(6)?
+                    .map(|reason| {
+                        reason.parse().map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(6, Type::Text, Box::new(error))
+                        })
+                    })
+                    .transpose()?;
+                let attempt_count = row.get::<_, i64>(9)?;
+                let quarantine_recovery = match (
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<i64>>(11)?,
+                ) {
+                    (None, None) => None,
+                    (Some(local_artifact_id), Some(execution_generation)) => {
+                        Some(QuarantineRecoveryFence {
+                            local_artifact_id: local_artifact_id.parse().map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    10,
+                                    Type::Text,
+                                    Box::new(error),
+                                )
+                            })?,
+                            execution_generation: ExecutionGeneration::new(execution_generation)
+                                .map_err(|error| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        11,
+                                        Type::Integer,
+                                        Box::new(error),
+                                    )
+                                })?,
+                        })
+                    }
+                    _ => {
+                        return Err(rusqlite::Error::FromSqlConversionFailure(
+                            10,
+                            Type::Null,
+                            Box::new(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "quarantine recovery fence is incomplete",
+                            )),
+                        ));
+                    }
+                };
+                Ok(CleanupEpisode {
+                    operation_activation_attempt_id: row
+                        .get::<_, Option<String>>(15)?
+                        .map(|value| value.parse())
+                        .transpose()
+                        .map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(15, Type::Text, Box::new(error))
+                        })?,
+                    prepared_clone_root: row
+                        .get::<_, Option<String>>(14)?
+                        .map(|json| {
+                            serde_json::from_str(&json).map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    14,
+                                    Type::Text,
+                                    Box::new(error),
+                                )
+                            })
+                        })
+                        .transpose()?,
+                    id: cleanup_id,
+                    completion,
+                    keep_filesystem: row.get(2)?,
+                    entered_from_state,
+                    activation_state,
+                    requested_at: row
+                        .get::<_, Option<i64>>(5)?
+                        .and_then(|value| u64::try_from(value).ok()),
+                    quarantine_reason_code,
+                    failure_message: row.get(7)?,
+                    last_cleanup_error: row.get(8)?,
+                    execution_generation: row
+                        .get::<_, Option<i64>>(12)?
+                        .map(ExecutionGeneration::new)
+                        .transpose()
+                        .map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                12,
+                                Type::Integer,
+                                Box::new(error),
+                            )
+                        })?,
+                    activation_attempt_id: row
+                        .get::<_, Option<String>>(13)?
+                        .map(|value| value.parse())
+                        .transpose()
+                        .map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(13, Type::Text, Box::new(error))
+                        })?,
+                    attempt_count: u32::try_from(attempt_count).unwrap_or(u32::MAX),
+                    quarantine_recovery,
+                })
+            },
+        )
+        .optional()
+    }
 }
 
 /// Retire an armed episode only after another state writer has conclusively
@@ -594,13 +598,14 @@ pub fn record_cleanup_episode_failure(
     Ok(changed == 1)
 }
 
-pub fn cleanup_episode_current(
-    conn: &Connection,
-    sandbox_id: &str,
-    cleanup_id: SandboxCleanupEpisodeId,
-) -> Result<bool> {
-    conn.query_row(
-        "SELECT EXISTS(
+db_private_outside_tests! {
+    fn cleanup_episode_current(
+        conn: &Connection,
+        sandbox_id: &str,
+        cleanup_id: SandboxCleanupEpisodeId,
+    ) -> Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS(
              SELECT 1
                FROM sandbox_cleanup_episodes episode
                JOIN sandboxes sandbox ON sandbox.id = episode.sandbox_id
@@ -611,9 +616,10 @@ pub fn cleanup_episode_current(
                 AND sandbox.cleanup_completion = episode.completion
                 AND sandbox.cleanup_keep_filesystem = episode.keep_filesystem
          )",
-        params![sandbox_id, cleanup_id.to_string()],
-        |row| row.get(0),
-    )
+            params![sandbox_id, cleanup_id.to_string()],
+            |row| row.get(0),
+        )
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1082,30 +1088,32 @@ pub enum SandboxEraseSafety {
     RetainedFilesystemOnlyCopy,
 }
 
-/// Classify whether erasing this record would drop unpublished suspend state.
-///
-/// The live and retry-owned states still have a suspend completion that can
-/// publish. A terminal missing-artifact failure cannot publish, but its
-/// retained rootfs may be the only copy of the sandbox's latest work. The
-/// failure reason is the durable witness for that distinct safety condition.
-pub fn sandbox_erase_safety(
-    state: SandboxState,
-    cleanup_completion: Option<CleanupCompletion>,
-    failure_reason: Option<&str>,
-) -> SandboxEraseSafety {
-    if state == SandboxState::Suspending
-        || (matches!(
-            state,
-            SandboxState::CleanupRequired | SandboxState::CleanupFailed
-        ) && cleanup_completion == Some(CleanupCompletion::MarkSuspended))
-    {
-        SandboxEraseSafety::SuspendPublicationPending
-    } else if matches!(state, SandboxState::Failed | SandboxState::Quarantined)
-        && failure_reason == Some(SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE)
-    {
-        SandboxEraseSafety::RetainedFilesystemOnlyCopy
-    } else {
-        SandboxEraseSafety::Safe
+db_private_outside_tests! {
+    /// Classify whether erasing this record would drop unpublished suspend state.
+    ///
+    /// The live and retry-owned states still have a suspend completion that can
+    /// publish. A terminal missing-artifact failure cannot publish, but its
+    /// retained rootfs may be the only copy of the sandbox's latest work. The
+    /// failure reason is the durable witness for that distinct safety condition.
+    fn sandbox_erase_safety(
+        state: SandboxState,
+        cleanup_completion: Option<CleanupCompletion>,
+        failure_reason: Option<&str>,
+    ) -> SandboxEraseSafety {
+        if state == SandboxState::Suspending
+            || (matches!(
+                state,
+                SandboxState::CleanupRequired | SandboxState::CleanupFailed
+            ) && cleanup_completion == Some(CleanupCompletion::MarkSuspended))
+        {
+            SandboxEraseSafety::SuspendPublicationPending
+        } else if matches!(state, SandboxState::Failed | SandboxState::Quarantined)
+            && failure_reason == Some(SUSPEND_PUBLISH_FAILED_NO_ARTIFACT_RUNTIME_GONE)
+        {
+            SandboxEraseSafety::RetainedFilesystemOnlyCopy
+        } else {
+            SandboxEraseSafety::Safe
+        }
     }
 }
 
@@ -1751,64 +1759,70 @@ pub struct CleanupTarget {
     pub user: SandboxOwner,
 }
 
-pub fn cleanup_target(conn: &Connection, id: &str) -> Result<Option<CleanupTarget>> {
-    conn.query_row(
-        sql!("SELECT uuid8, template, user FROM sandboxes WHERE id = ?1"),
-        [id],
-        |row| {
-            Ok(CleanupTarget {
-                uuid8: SandboxRuntimeLabel::parse(row.get::<_, String>(0)?).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error))
-                })?,
-                template: row.get(1)?,
-                user: SandboxOwner::parse(row.get::<_, String>(2)?).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(2, Type::Text, Box::new(error))
-                })?,
-            })
-        },
-    )
-    .optional()
-}
-
-pub fn cleanup_runtime_label(conn: &Connection, id: &str) -> Result<Option<SandboxRuntimeLabel>> {
-    conn.query_row(
-        sql!("SELECT uuid8 FROM sandboxes WHERE id = ?1"),
-        [id],
-        |row| {
-            SandboxRuntimeLabel::parse(row.get::<_, String>(0)?).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error))
-            })
-        },
-    )
-    .optional()
-}
-
-pub fn cleanup_intent_current(
-    conn: &Connection,
-    id: &str,
-    completion: CleanupCompletion,
-) -> Result<bool> {
-    let intent = conn
-        .query_row(
-            sql!("SELECT state, cleanup_completion FROM sandboxes WHERE id = ?1"),
+db_private_outside_tests! {
+    fn cleanup_target(conn: &Connection, id: &str) -> Result<Option<CleanupTarget>> {
+        conn.query_row(
+            sql!("SELECT uuid8, template, user FROM sandboxes WHERE id = ?1"),
             [id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            |row| {
+                Ok(CleanupTarget {
+                    uuid8: SandboxRuntimeLabel::parse(row.get::<_, String>(0)?).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error))
+                    })?,
+                    template: row.get(1)?,
+                    user: SandboxOwner::parse(row.get::<_, String>(2)?).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(2, Type::Text, Box::new(error))
+                    })?,
+                })
+            },
         )
-        .optional()?;
-    let Some((state, intent)) = intent else {
-        return Ok(false);
-    };
-    let Ok(state) = state.parse::<SandboxState>() else {
-        return Ok(false);
-    };
-    let intent = intent
-        .map(|value| {
-            value.parse::<CleanupCompletion>().map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(1, Type::Text, Box::new(error))
+        .optional()
+    }
+}
+
+db_private_outside_tests! {
+    fn cleanup_runtime_label(conn: &Connection, id: &str) -> Result<Option<SandboxRuntimeLabel>> {
+        conn.query_row(
+            sql!("SELECT uuid8 FROM sandboxes WHERE id = ?1"),
+            [id],
+            |row| {
+                SandboxRuntimeLabel::parse(row.get::<_, String>(0)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error))
+                })
+            },
+        )
+        .optional()
+    }
+}
+
+db_private_outside_tests! {
+    fn cleanup_intent_current(
+        conn: &Connection,
+        id: &str,
+        completion: CleanupCompletion,
+    ) -> Result<bool> {
+        let intent = conn
+            .query_row(
+                sql!("SELECT state, cleanup_completion FROM sandboxes WHERE id = ?1"),
+                [id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        let Some((state, intent)) = intent else {
+            return Ok(false);
+        };
+        let Ok(state) = state.parse::<SandboxState>() else {
+            return Ok(false);
+        };
+        let intent = intent
+            .map(|value| {
+                value.parse::<CleanupCompletion>().map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(1, Type::Text, Box::new(error))
+                })
             })
-        })
-        .transpose()?;
-    Ok(completion.owns_intent(state, intent))
+            .transpose()?;
+        Ok(completion.owns_intent(state, intent))
+    }
 }
 
 /// Sandboxes with durable cleanup evidence that a live reconciliation pass may
@@ -1876,35 +1890,36 @@ pub struct CleanupRecoveryPage {
     pub next_cursor: Option<i64>,
 }
 
-pub fn cleanup_recovery_page(
-    conn: &Connection,
-    after: Option<i64>,
-    limit: usize,
-) -> Result<CleanupRecoveryPage> {
-    let sql_limit = i64::try_from(limit)
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-    // The rowid is a scan position, never lifecycle authority.
-    let Some(first) = after.map_or(Some(i64::MIN), |rowid| rowid.checked_add(1)) else {
-        return Ok(CleanupRecoveryPage {
-            ids: Vec::new(),
-            next_cursor: None,
-        });
-    };
-    let tx = Transaction::deferred(conn)?;
-    let mut inventory = tx.prepare(sql!(
-        "SELECT rowid FROM sandboxes WHERE rowid >= ?1 ORDER BY rowid LIMIT ?2"
-    ))?;
-    let range: Vec<i64> = inventory
-        .query_map(params![first, sql_limit], |row| row.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    let Some(&last) = range.last() else {
-        return Ok(CleanupRecoveryPage {
-            ids: Vec::new(),
-            next_cursor: None,
-        });
-    };
-    let mut statement = tx.prepare(
-        sql!("SELECT sandbox.id
+db_private_outside_tests! {
+    fn cleanup_recovery_page(
+        conn: &Connection,
+        after: Option<i64>,
+        limit: usize,
+    ) -> Result<CleanupRecoveryPage> {
+        let sql_limit = i64::try_from(limit)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        // The rowid is a scan position, never lifecycle authority.
+        let Some(first) = after.map_or(Some(i64::MIN), |rowid| rowid.checked_add(1)) else {
+            return Ok(CleanupRecoveryPage {
+                ids: Vec::new(),
+                next_cursor: None,
+            });
+        };
+        let tx = Transaction::deferred(conn)?;
+        let mut inventory = tx.prepare(sql!(
+            "SELECT rowid FROM sandboxes WHERE rowid >= ?1 ORDER BY rowid LIMIT ?2"
+        ))?;
+        let range: Vec<i64> = inventory
+            .query_map(params![first, sql_limit], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let Some(&last) = range.last() else {
+            return Ok(CleanupRecoveryPage {
+                ids: Vec::new(),
+                next_cursor: None,
+            });
+        };
+        let mut statement = tx.prepare(
+            sql!("SELECT sandbox.id
            FROM sandboxes sandbox
            LEFT JOIN sandbox_cleanup_episodes episode
              ON episode.sandbox_id = sandbox.id
@@ -1939,13 +1954,14 @@ pub fn cleanup_recovery_page(
                   )
              )
           ) ORDER BY sandbox.rowid"),
-    )?;
-    let ids = statement
-        .query_map(params![first, last], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    let next_cursor = (range.len() == limit).then_some(last);
-    drop(statement);
-    drop(inventory);
-    tx.commit()?;
-    Ok(CleanupRecoveryPage { ids, next_cursor })
+        )?;
+        let ids = statement
+            .query_map(params![first, last], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let next_cursor = (range.len() == limit).then_some(last);
+        drop(statement);
+        drop(inventory);
+        tx.commit()?;
+        Ok(CleanupRecoveryPage { ids, next_cursor })
+    }
 }

@@ -296,7 +296,7 @@ impl SandboxManagerService {
             let Ok(db) = self.db_conn() else {
                 return SuspendSnapshotStagingDisposition::Preserve;
             };
-            match crate::db::get_sandbox(&db, sandbox_id) {
+            match crate::db::read::sandbox(&db, sandbox_id) {
                 Ok(Some(row)) if row.state == SandboxState::Suspending => row,
                 Ok(Some(row)) => {
                     tracing::warn!(
@@ -386,7 +386,10 @@ impl SandboxManagerService {
                     let Ok(db) = self.db_conn() else {
                         return SuspendSnapshotStagingDisposition::Preserve;
                     };
-                    match crate::db::teardown_suspend_status(&db, sandbox_id) {
+                    match crate::db::read::sandbox_view(&db, sandbox_id)
+                        .teardown()
+                        .status()
+                    {
                         Ok(Some(status)) => status
                             .operation
                             .filter(|operation| operation.status.is_active())

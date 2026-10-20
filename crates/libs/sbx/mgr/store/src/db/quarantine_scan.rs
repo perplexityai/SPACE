@@ -1,5 +1,6 @@
 //! Finite quarantine discovery; page counts are not node-wide backlog samples.
 
+use crate::db::db_private_outside_tests;
 use std::time::{Duration, Instant};
 
 use crate::db::{Connection, Result};
@@ -60,13 +61,15 @@ impl PeriodicQuarantineRecoveryScan {
         })
     }
 
-    pub fn next_batch(&mut self, conn: &Connection) -> Result<QuarantineRecoveryBatch> {
-        let batch = self.read_batch(conn);
-        if batch.is_err() {
-            // Never complete a backlog sample after an unread section of a sweep.
-            *self = Self::default();
+    db_private_outside_tests! {
+        fn next_batch(&mut self, conn: &Connection) -> Result<QuarantineRecoveryBatch> {
+            let batch = self.read_batch(conn);
+            if batch.is_err() {
+                // Never complete a backlog sample after an unread section of a sweep.
+                *self = Self::default();
+            }
+            batch
         }
-        batch
     }
 
     fn read_batch(&mut self, conn: &Connection) -> Result<QuarantineRecoveryBatch> {

@@ -2,6 +2,7 @@
 //! restore and delete leases. Each runs on the connection or transaction its
 //! caller holds, so a checkout's reads and its CAS share one transaction.
 
+use crate::db::db_private_outside_tests;
 use crate::db::{Connection, Error, OptionalExtension, Result};
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{ArtifactKind, LocalArtifactId, SnapshotName};
@@ -88,12 +89,13 @@ pub struct NamedArtifactPublication {
     pub state: ArtifactState,
 }
 
-/// Every sandbox whose pinned artifact has no backup-completed stamp, or
-/// whose pin names no row it owns. The caller,
-/// `LocalArtifacts::list_pending_backups`, documents the contract.
-pub fn list_pending_backups(conn: &Connection) -> Result<Vec<PendingBackup>> {
-    conn.prepare(
-        "SELECT s.id, s.current_local_artifact_id, s.current_local_artifact_kind
+db_private_outside_tests! {
+    /// Every sandbox whose pinned artifact has no backup-completed stamp, or
+    /// whose pin names no row it owns. The caller,
+    /// `LocalArtifacts::list_pending_backups`, documents the contract.
+    fn list_pending_backups(conn: &Connection) -> Result<Vec<PendingBackup>> {
+        conn.prepare(
+            "SELECT s.id, s.current_local_artifact_id, s.current_local_artifact_kind
            FROM sandboxes AS s
            LEFT JOIN local_artifacts AS a
              ON a.local_artifact_id = s.current_local_artifact_id
@@ -101,72 +103,75 @@ pub fn list_pending_backups(conn: &Connection) -> Result<Vec<PendingBackup>> {
           WHERE s.current_local_artifact_id IS NOT NULL
             AND (a.local_artifact_id IS NULL OR a.backup_completed_at IS NULL)
           ORDER BY s.id",
-    )?
-    .query_map([], |row| {
-        Ok(PendingBackup {
-            sandbox_id: row.get(0)?,
-            local_artifact_id: row.get::<_, String>(1)?.parse().map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    1,
-                    rusqlite::types::Type::Text,
-                    Box::new(error),
-                )
-            })?,
-            artifact_kind: row.get::<_, String>(2)?.parse().map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    2,
-                    rusqlite::types::Type::Text,
-                    Box::new(error),
-                )
-            })?,
-        })
-    })?
-    .collect::<rusqlite::Result<_>>()
-    .map_err(crate::db::Error::from)
+        )?
+        .query_map([], |row| {
+            Ok(PendingBackup {
+                sandbox_id: row.get(0)?,
+                local_artifact_id: row.get::<_, String>(1)?.parse().map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                artifact_kind: row.get::<_, String>(2)?.parse().map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(crate::db::Error::from)
+    }
 }
 
-/// A sandbox's named-snapshot artifacts, within the inventory read budget.
-pub fn list_named_publications(
-    conn: &Connection,
-    sandbox_id: &str,
-) -> std::result::Result<Vec<NamedArtifactPublication>, crate::db::inventory_read::InventoryReadError>
-{
-    use pplx_space_common_core::inventory::{InventoryBudget, MAX_ITEMS, MAX_RAW_BYTES};
-    let mut statement = conn.prepare(sql!(
-        "SELECT snapshot_name, local_path, artifact_kind, state
+db_private_outside_tests! {
+    /// A sandbox's named-snapshot artifacts, within the inventory read budget.
+    fn list_named_publications(
+        conn: &Connection,
+        sandbox_id: &str,
+    ) -> std::result::Result<Vec<NamedArtifactPublication>, crate::db::inventory_read::InventoryReadError>
+    {
+        use pplx_space_common_core::inventory::{InventoryBudget, MAX_ITEMS, MAX_RAW_BYTES};
+        let mut statement = conn.prepare(sql!(
+            "SELECT snapshot_name, local_path, artifact_kind, state
          FROM local_artifacts WHERE sandbox_id = ?1 AND artifact_origin = 'snapshot'"
-    ))?;
-    let mut rows = statement.query([sandbox_id])?;
-    let mut budget = InventoryBudget::new(MAX_ITEMS, MAX_RAW_BYTES);
-    let mut publications = Vec::new();
-    while let Some(row) = rows.next()? {
-        crate::db::inventory_read::check_row(row, &mut budget)?;
-        publications.push(NamedArtifactPublication {
-            snapshot_name: row.get::<_, String>(0)?.parse().map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    rusqlite::types::Type::Text,
-                    Box::new(error),
-                )
-            })?,
-            local_path: row.get(1)?,
-            artifact_kind: row.get::<_, String>(2)?.parse().map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    2,
-                    rusqlite::types::Type::Text,
-                    Box::new(error),
-                )
-            })?,
-            state: row.get::<_, String>(3)?.parse().map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    3,
-                    rusqlite::types::Type::Text,
-                    Box::new(error),
-                )
-            })?,
-        });
+        ))?;
+        let mut rows = statement.query([sandbox_id])?;
+        let mut budget = InventoryBudget::new(MAX_ITEMS, MAX_RAW_BYTES);
+        let mut publications = Vec::new();
+        while let Some(row) = rows.next()? {
+            crate::db::inventory_read::check_row(row, &mut budget)?;
+            publications.push(NamedArtifactPublication {
+                snapshot_name: row.get::<_, String>(0)?.parse().map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                local_path: row.get(1)?,
+                artifact_kind: row.get::<_, String>(2)?.parse().map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                state: row.get::<_, String>(3)?.parse().map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+            });
+        }
+        Ok(publications)
     }
-    Ok(publications)
 }
 
 /// `(local_path, state)` of an artifact row, as stored.
@@ -311,17 +316,19 @@ pub fn release_restoring_artifact(conn: &Connection, local_artifact_id: &str) ->
     )
 }
 
-/// Whether neither an artifact row nor a sandbox pin names the id.
-pub fn gc_staging_is_unowned(conn: &Connection, local_artifact_id: &str) -> Result<bool> {
-    conn.query_row(
-        sql!(
-            "SELECT NOT EXISTS(SELECT 1 FROM local_artifacts WHERE local_artifact_id = ?1)
+db_private_outside_tests! {
+    /// Whether neither an artifact row nor a sandbox pin names the id.
+    fn gc_staging_is_unowned(conn: &Connection, local_artifact_id: &str) -> Result<bool> {
+        conn.query_row(
+            sql!(
+                "SELECT NOT EXISTS(SELECT 1 FROM local_artifacts WHERE local_artifact_id = ?1)
               AND NOT EXISTS(SELECT 1 FROM sandboxes
                WHERE current_local_artifact_id = ?1 OR suspend_predecessor_artifact_id = ?1)"
-        ),
-        [local_artifact_id],
-        |row| row.get(0),
-    )
+            ),
+            [local_artifact_id],
+            |row| row.get(0),
+        )
+    }
 }
 
 /// The highest artifact rowid, `None` for an empty table.

@@ -170,7 +170,7 @@ impl SandboxManagerService {
                         let db = self
                             .db_conn()
                             .inspect_err(record_endpoint_attestation_error)?;
-                        let winning_proof = crate::db::get_sandbox(&db, &sandbox.id)
+                        let winning_proof = crate::db::read::sandbox(&db, &sandbox.id)
                             .map_err(|error| {
                                 Status::internal(format!("reload spaced endpoint proof: {error}"))
                             })

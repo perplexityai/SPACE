@@ -518,32 +518,34 @@ pub fn mark_local_artifact_backup_completed(
     Ok(())
 }
 
-/// True when the sandbox row is parked `suspended` with
-/// `current_local_artifact_id` equal to `local_artifact_id`.
-///
-/// This is the safety gate for reclaiming per-artifact files under the
-/// published snapshot directory after a backup finalizes ready. Every
-/// suspend stages into a sibling directory and flips the row to
-/// `suspended` with the freshly minted artifact pinned in one
-/// transaction, so while this predicate holds — checked under the same
-/// connection mutex every state transition serializes on — the files at
-/// the published snapshot path are exactly the pinned artifact's bytes,
-/// never a newer suspend's output mid-encode or mid-publish.
-pub fn sandbox_suspended_with_pinned_artifact(
-    conn: &Connection,
-    sandbox_id: &str,
-    local_artifact_id: &str,
-) -> Result<bool> {
-    conn.query_row(
-        "SELECT EXISTS(
+db_private_outside_tests! {
+    /// True when the sandbox row is parked `suspended` with
+    /// `current_local_artifact_id` equal to `local_artifact_id`.
+    ///
+    /// This is the safety gate for reclaiming per-artifact files under the
+    /// published snapshot directory after a backup finalizes ready. Every
+    /// suspend stages into a sibling directory and flips the row to
+    /// `suspended` with the freshly minted artifact pinned in one
+    /// transaction, so while this predicate holds — checked under the same
+    /// connection mutex every state transition serializes on — the files at
+    /// the published snapshot path are exactly the pinned artifact's bytes,
+    /// never a newer suspend's output mid-encode or mid-publish.
+    fn sandbox_suspended_with_pinned_artifact(
+        conn: &Connection,
+        sandbox_id: &str,
+        local_artifact_id: &str,
+    ) -> Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS(
              SELECT 1 FROM sandboxes
              WHERE id = ?1
                AND state = 'suspended'
                AND current_local_artifact_id = ?2
          )",
-        params![sandbox_id, local_artifact_id],
-        |r| r.get(0),
-    )
+            params![sandbox_id, local_artifact_id],
+            |r| r.get(0),
+        )
+    }
 }
 
 pub fn publish_named_local_artifact(
@@ -764,34 +766,38 @@ pub fn pinned_local_artifact_created_at(
     Ok(created_at)
 }
 
-pub fn get_local_artifact(
-    conn: &Connection,
-    local_artifact_id: LocalArtifactId,
-) -> Result<Option<LocalArtifactRow>> {
-    conn.query_row(
-        "SELECT local_artifact_id, sandbox_id, artifact_kind, artifact_origin,
+db_private_outside_tests! {
+    fn get_local_artifact(
+        conn: &Connection,
+        local_artifact_id: LocalArtifactId,
+    ) -> Result<Option<LocalArtifactRow>> {
+        conn.query_row(
+            "SELECT local_artifact_id, sandbox_id, artifact_kind, artifact_origin,
                 snapshot_name, local_path
          FROM local_artifacts WHERE local_artifact_id = ?1",
-        params![local_artifact_id.to_string()],
-        row_to_local_artifact,
-    )
-    .optional()
+            params![local_artifact_id.to_string()],
+            row_to_local_artifact,
+        )
+        .optional()
+    }
 }
 
-pub fn get_named_local_artifact(
-    conn: &Connection,
-    sandbox_id: &str,
-    snapshot_name: &SnapshotName,
-) -> Result<Option<LocalArtifactRow>> {
-    conn.query_row(
-        "SELECT local_artifact_id, sandbox_id, artifact_kind, artifact_origin,
+db_private_outside_tests! {
+    fn get_named_local_artifact(
+        conn: &Connection,
+        sandbox_id: &str,
+        snapshot_name: &SnapshotName,
+    ) -> Result<Option<LocalArtifactRow>> {
+        conn.query_row(
+            "SELECT local_artifact_id, sandbox_id, artifact_kind, artifact_origin,
                 snapshot_name, local_path
          FROM local_artifacts
          WHERE sandbox_id = ?1 AND artifact_origin = 'snapshot' AND snapshot_name = ?2",
-        params![sandbox_id, snapshot_name.as_str()],
-        row_to_local_artifact,
-    )
-    .optional()
+            params![sandbox_id, snapshot_name.as_str()],
+            row_to_local_artifact,
+        )
+        .optional()
+    }
 }
 
 pub(super) fn row_to_local_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocalArtifactRow> {

@@ -2,6 +2,7 @@
 //! Unpaged ListBuildReferencingSandboxes is the exception: it reports overruns
 //! instead.
 
+use crate::db::db_private_outside_tests;
 use crate::db::{Connection, Error};
 use pplx_space_common_core::inventory::{
     InventoryBudget, InventoryLimitExceeded, MAX_ITEMS, MAX_RAW_BYTES,
@@ -96,22 +97,24 @@ impl UnaryListUsage {
 const LIST_COLUMNS: &str =
     "id, state, template, template_hash, user, runtime, created_at, pool_template";
 
-pub fn list(
-    conn: &Connection,
-    rpc: &'static str,
-) -> Result<Vec<super::SandboxListRow>, InventoryReadError> {
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {LIST_COLUMNS} FROM sandboxes ORDER BY created_at"
-    ))?;
-    let mut rows = stmt.query([])?;
-    let mut usage = UnaryListUsage::default();
-    let mut result = Vec::new();
-    while let Some(row) = rows.next()? {
-        usage.observe(row)?;
-        result.push(super::row_to_list_sandbox(row)?);
+db_private_outside_tests! {
+    fn list(
+        conn: &Connection,
+        rpc: &'static str,
+    ) -> Result<Vec<super::SandboxListRow>, InventoryReadError> {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {LIST_COLUMNS} FROM sandboxes ORDER BY created_at"
+        ))?;
+        let mut rows = stmt.query([])?;
+        let mut usage = UnaryListUsage::default();
+        let mut result = Vec::new();
+        while let Some(row) = rows.next()? {
+            usage.observe(row)?;
+            result.push(super::row_to_list_sandbox(row)?);
+        }
+        usage.report(rpc);
+        Ok(result)
     }
-    usage.report(rpc);
-    Ok(result)
 }
 
 /// One scanned List row. An undecodable row keeps its identity so the caller
@@ -140,105 +143,112 @@ pub struct ListPage {
     pub more: bool,
 }
 
-/// Scan up to `limit` rows with IDs after `after`, in ID order. The page ends
-/// early rather than exceed the raw budget; only a single row over the budget
-/// is an error. Keying on the immutable primary key keeps every row present for
-/// the whole scan on exactly one page.
-pub fn list_page(
-    conn: &Connection,
-    after: &str,
-    limit: usize,
-) -> Result<ListPage, InventoryReadError> {
-    let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {LIST_COLUMNS} FROM sandboxes WHERE id > ?1 ORDER BY id LIMIT ?2"
-    ))?;
-    let fetch = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
-    let mut rows = stmt.query(rusqlite::params![after, fetch])?;
-    let mut budget = InventoryBudget::new(limit, MAX_RAW_BYTES);
-    let mut page = Vec::new();
-    while let Some(row) = rows.next()? {
-        match check_row(row, &mut budget) {
-            Ok(()) => {}
-            Err(InventoryReadError::Limit(_)) if !page.is_empty() => {
-                return Ok(ListPage {
-                    rows: page,
-                    more: true,
-                });
+db_private_outside_tests! {
+    /// Scan up to `limit` rows with IDs after `after`, in ID order. The page ends
+    /// early rather than exceed the raw budget; only a single row over the budget
+    /// is an error. Keying on the immutable primary key keeps every row present for
+    /// the whole scan on exactly one page.
+    fn list_page(
+        conn: &Connection,
+        after: &str,
+        limit: usize,
+    ) -> Result<ListPage, InventoryReadError> {
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {LIST_COLUMNS} FROM sandboxes WHERE id > ?1 ORDER BY id LIMIT ?2"
+        ))?;
+        let fetch = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+        let mut rows = stmt.query(rusqlite::params![after, fetch])?;
+        let mut budget = InventoryBudget::new(limit, MAX_RAW_BYTES);
+        let mut page = Vec::new();
+        while let Some(row) = rows.next()? {
+            match check_row(row, &mut budget) {
+                Ok(()) => {}
+                Err(InventoryReadError::Limit(_)) if !page.is_empty() => {
+                    return Ok(ListPage {
+                        rows: page,
+                        more: true,
+                    });
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
+            page.push(match super::row_to_list_sandbox(row) {
+                Ok(row) => ListPageRow::Decoded(row),
+                Err(error) => ListPageRow::Undecodable {
+                    id: row.get("id")?,
+                    state: row.get::<_, String>("state").ok(),
+                    error: error.into(),
+                },
+            });
         }
-        page.push(match super::row_to_list_sandbox(row) {
-            Ok(row) => ListPageRow::Decoded(row),
-            Err(error) => ListPageRow::Undecodable {
-                id: row.get("id")?,
-                state: row.get::<_, String>("state").ok(),
-                error: error.into(),
-            },
-        });
-    }
-    Ok(ListPage {
-        rows: page,
-        more: false,
-    })
-}
-
-pub fn get(
-    conn: &Connection,
-    id: &str,
-    budget: &mut InventoryBudget,
-) -> Result<Option<super::SandboxRow>, InventoryReadError> {
-    let mut stmt = conn.prepare_cached(super::GET_SANDBOX_SQL)?;
-    let mut rows = stmt.query([id])?;
-    rows.next()?
-        .map(|row| {
-            check_row(row, budget)?;
-            Ok(super::row_to_sandbox(row)?)
+        Ok(ListPage {
+            rows: page,
+            more: false,
         })
-        .transpose()
+    }
 }
 
-pub fn lookup(
-    conn: &Connection,
-    selector: &str,
-) -> Result<Option<super::SandboxRow>, InventoryReadError> {
-    let mut budget = InventoryBudget::new(MAX_ITEMS, MAX_RAW_BYTES);
-    if let Some(row) = get(conn, selector, &mut budget)? {
-        return Ok(Some(row));
+db_private_outside_tests! {
+    fn get(
+        conn: &Connection,
+        id: &str,
+        budget: &mut InventoryBudget,
+    ) -> Result<Option<super::SandboxRow>, InventoryReadError> {
+        let mut stmt = conn.prepare_cached(super::GET_SANDBOX_SQL)?;
+        let mut rows = stmt.query([id])?;
+        rows.next()?
+            .map(|row| {
+                check_row(row, budget)?;
+                Ok(super::row_to_sandbox(row)?)
+            })
+            .transpose()
     }
-    let mut stmt = conn.prepare("SELECT id FROM sandboxes ORDER BY id")?;
-    let mut rows = stmt.query([])?;
-    let mut matched = None;
-    while let Some(row) = rows.next()? {
-        check_row(row, &mut budget)?;
-        let id: String = row.get(0)?;
-        if pplx_space_common_core::ids::sandbox_id_matches(&id, selector) {
-            if matched.is_some() {
-                return Err(InventoryReadError::Ambiguous);
+}
+
+db_private_outside_tests! {
+    fn lookup(
+        conn: &Connection,
+        selector: &str,
+    ) -> Result<Option<super::SandboxRow>, InventoryReadError> {
+        let mut budget = InventoryBudget::new(MAX_ITEMS, MAX_RAW_BYTES);
+        if let Some(row) = get(conn, selector, &mut budget)? {
+            return Ok(Some(row));
+        }
+        let mut stmt = conn.prepare("SELECT id FROM sandboxes ORDER BY id")?;
+        let mut rows = stmt.query([])?;
+        let mut matched = None;
+        while let Some(row) = rows.next()? {
+            check_row(row, &mut budget)?;
+            let id: String = row.get(0)?;
+            if pplx_space_common_core::ids::sandbox_id_matches(&id, selector) {
+                if matched.is_some() {
+                    return Err(InventoryReadError::Ambiguous);
+                }
+                matched = Some(id);
             }
-            matched = Some(id);
         }
+        matched
+            .map(|id| {
+                get(
+                    conn,
+                    &id,
+                    &mut InventoryBudget::new(MAX_ITEMS, MAX_RAW_BYTES),
+                )
+            })
+            .transpose()
+            .map(Option::flatten)
     }
-    matched
-        .map(|id| {
-            get(
-                conn,
-                &id,
-                &mut InventoryBudget::new(MAX_ITEMS, MAX_RAW_BYTES),
-            )
-        })
-        .transpose()
-        .map(Option::flatten)
 }
 
-/// Check auxiliary State fields before the existing typed readers allocate them.
-/// The caller retains the same SQLite mutex across preflight and those reads.
-pub fn check_state_metadata(
-    conn: &Connection,
-    ids: &[String],
-    budget: &mut InventoryBudget,
-) -> Result<(), InventoryReadError> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT s.id, s.state, s.state_changed_at, s.transition_receipt_id,
+db_private_outside_tests! {
+    /// Check auxiliary State fields before the existing typed readers allocate them.
+    /// The caller retains the same SQLite mutex across preflight and those reads.
+    fn check_state_metadata(
+        conn: &Connection,
+        ids: &[String],
+        budget: &mut InventoryBudget,
+    ) -> Result<(), InventoryReadError> {
+        let mut stmt = conn.prepare_cached(
+            "SELECT s.id, s.state, s.state_changed_at, s.transition_receipt_id,
                 s.transition_receipt_kind, s.transition_receipt_target_state,
                 s.transition_receipt_execution_generation, s.transition_receipt_reason_code,
                 s.transition_receipt_activation_attempt_id, s.space_api_route_generation,
@@ -248,14 +258,15 @@ pub fn check_state_metadata(
                 q.reason_code, q.quarantine_id, q.next_action_owner, q.attempt_count, q.next_action_after
            FROM sandboxes s LEFT JOIN sandbox_quarantine_state q ON q.sandbox_id = s.id
           WHERE s.id = ?1"
-    )?;
-    for id in ids {
-        let mut rows = stmt.query([id])?;
-        if let Some(row) = rows.next()? {
-            check_row(row, budget)?;
+        )?;
+        for id in ids {
+            let mut rows = stmt.query([id])?;
+            if let Some(row) = rows.next()? {
+                check_row(row, budget)?;
+            }
         }
+        Ok(())
     }
-    Ok(())
 }
 
 #[cfg(test)]

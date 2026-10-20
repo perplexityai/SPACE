@@ -428,7 +428,7 @@ impl SandboxManagerService {
                         let _guard = wake_lock.lock().await;
                         {
                             let db = self.db_conn()?;
-                            existing = crate::db::get_sandbox(&db, &sandbox_id)
+                            existing = crate::db::read::sandbox(&db, &sandbox_id)
                                 .map_err(|e| Status::internal(format!("db lookup failed: {e}")))?
                                 .ok_or_else(|| {
                                     Status::not_found(format!(
@@ -466,7 +466,7 @@ impl SandboxManagerService {
                                     existing.state,
                                     &auto_lifecycle,
                                 )?;
-                                existing = crate::db::get_sandbox(&db, &sandbox_id)
+                                existing = crate::db::read::sandbox(&db, &sandbox_id)
                                     .map_err(|e| {
                                         Status::internal(format!("db lookup failed: {e}"))
                                     })?
@@ -829,11 +829,14 @@ impl SandboxManagerService {
                     .db
                     .lock()
                     .map_err(|_| Status::internal("sandbox database mutex poisoned"))?;
-                let episode = crate::db::cleanup_episode(&db, id)
+                let episode = crate::db::read::sandbox_view(&db, id)
+                    .cleanup_episode()
+                    .strict()
                     .map_err(|e| Status::internal(format!("read clone disposal: {e}")))?
                     .filter(|episode| episode.completion == CleanupCompletion::DeletePoolClone);
                 let quarantined = episode.is_some()
-                    && crate::db::current_state_label(&db, id)
+                    && crate::db::read::sandbox_view(&db, id)
+                        .current_state_label()
                         .map_err(|e| Status::internal(format!("read clone disposal state: {e}")))?
                         .as_deref()
                         == Some(SandboxState::Quarantined.as_str());
@@ -1005,7 +1008,7 @@ impl SandboxManagerService {
         };
         let page = self
             .storage(move |db| {
-                crate::db::inventory_read::list_page(db, &page_token, limit)
+                crate::db::scan::list_page(db, &page_token, limit)
                     .map_err(|error| error.into_status())
             })
             .await?;
@@ -1023,8 +1026,13 @@ impl SandboxManagerService {
         )?;
         let db_rows = self
             .storage(|db| {
-                crate::db::inventory_read::list(db, "ListBuildReferencingSandboxes")
-                    .map_err(|error| error.into_status())
+                crate::db::scan::all_sandboxes(
+                    db,
+                    crate::db::scan::RpcListRows {
+                        rpc: "ListBuildReferencingSandboxes",
+                    },
+                )
+                .map_err(|error| error.into_status())
             })
             .await?;
 
@@ -1072,9 +1080,12 @@ impl SandboxManagerService {
                 let mut resolved_ids = Vec::with_capacity(sandbox_ids.len());
                 let mut missing_ids = Vec::new();
                 for id in sandbox_ids {
-                    if crate::db::sandbox_exists(db, &id).map_err(|error| {
-                        Status::internal(format!("read sandbox identity: {error}"))
-                    })? {
+                    if crate::db::read::sandbox_view(db, &id)
+                        .exists()
+                        .map_err(|error| {
+                            Status::internal(format!("read sandbox identity: {error}"))
+                        })?
+                    {
                         resolved_ids.push(id);
                     } else {
                         missing_ids.push(SbxMissingDiskUsageId {

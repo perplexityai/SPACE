@@ -885,7 +885,7 @@ impl SandboxManagerService {
         selector: String,
     ) -> Result<crate::db::SandboxRow, Status> {
         self.storage(move |db| {
-            crate::db::inventory_read::lookup(db, &selector)
+            crate::db::scan::resolve_selector(db, crate::db::scan::InventorySelector, &selector)
                 .map_err(|error| error.into_status())?
                 .ok_or_else(|| Status::not_found(format!("sandbox not found: {selector}")))
         })
@@ -1236,7 +1236,9 @@ impl SandboxManagerService {
             .db
             .lock()
             .map_err(|_| Status::unavailable("snapshot ownership is unavailable"))?;
-        if crate::db::has_cleanup_episode(&db, sandbox_id)
+        if crate::db::read::sandbox_view(&db, sandbox_id)
+            .cleanup_episode()
+            .present()
             .map_err(|_| Status::unavailable("snapshot cleanup ownership cannot be read"))?
         {
             return Err(Status::failed_precondition(

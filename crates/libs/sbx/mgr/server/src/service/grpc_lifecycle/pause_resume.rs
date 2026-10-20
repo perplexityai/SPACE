@@ -212,7 +212,7 @@ pub(super) async fn pause_with_reconciliation(
         let found = crate::node_state_sync::connection_or_signal_failure(db)
             .ok()
             .and_then(|db| {
-                crate::db::get_sandbox(&db, &sandbox_id_string)
+                crate::db::read::sandbox(&db, &sandbox_id_string)
                     .ok()
                     .flatten()
             })

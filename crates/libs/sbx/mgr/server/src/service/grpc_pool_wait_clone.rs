@@ -217,7 +217,7 @@ impl SandboxManagerService {
         };
         let candidate = {
             let db = self.db_conn()?;
-            crate::db::find_pool_sandbox(&db, template, req.content_hash.as_deref(), required_user)
+            crate::db::scan::pool_donor(&db, template, req.content_hash.as_deref(), required_user)
                 .map_err(|e| Status::internal(format!("db error: {e}")))?
         };
 
@@ -606,7 +606,7 @@ impl SandboxManagerService {
             // Check current state from DB
             let state = {
                 let db = self.db_conn()?;
-                crate::db::get_sandbox(&db, &id)
+                crate::db::read::sandbox(&db, &id)
                     .map_err(|e| Status::internal(format!("db error: {e}")))?
                     .map(|row| row.state)
             };
@@ -839,11 +839,14 @@ impl SandboxManagerService {
         };
         let current = {
             let db = self.db_conn()?;
-            crate::db::cleanup_episode(&db, sandbox_id).map_err(|error| {
-                cleanup.failure(Status::internal(format!(
-                    "read pool clone episode: {error}"
-                )))
-            })?
+            crate::db::read::sandbox_view(&db, sandbox_id)
+                .cleanup_episode()
+                .strict()
+                .map_err(|error| {
+                    cleanup.failure(Status::internal(format!(
+                        "read pool clone episode: {error}"
+                    )))
+                })?
         };
         if !current
             .is_some_and(|episode| episode.id == cleanup_id && episode.requested_at.is_none())

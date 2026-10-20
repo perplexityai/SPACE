@@ -581,9 +581,12 @@ async fn prepare_suspend_restore_dir(
                 "sandbox database mutex poisoned".to_string(),
             )
         })?;
-        crate::db::restore_transfer_scope(&db, &sandbox_id).map_err(|source| {
-            crate::snapshot_restore::RestoreError::AdvanceRestorePhase { source }
-        })?
+        crate::db::read::sandbox_view(&db, &sandbox_id)
+            .restore_scope()
+            .scope()
+            .map_err(
+                |source| crate::snapshot_restore::RestoreError::AdvanceRestorePhase { source },
+            )?
     };
     if let Some(existing_scope) = existing_scope {
         service
@@ -954,7 +957,9 @@ impl SandboxManagerService {
             .db
             .lock()
             .map_err(|_| Status::internal("database mutex poisoned"))?;
-        let episode = crate::db::cleanup_episode(&db, &sandbox.id)
+        let episode = crate::db::read::sandbox_view(&db, &sandbox.id)
+            .cleanup_episode()
+            .strict()
             .map_err(|error| Status::internal(format!("load restore cleanup: {error}")))?;
         Ok(episode
             .filter(|episode| {

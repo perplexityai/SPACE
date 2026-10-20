@@ -548,16 +548,17 @@ impl SandboxManagerService {
     /// Returns error if not found or ambiguous.
     pub(super) fn lookup_sandbox(&self, sandbox_id: &str) -> Result<crate::db::SandboxRow, Status> {
         let db = self.db_conn()?;
-        if let Some(sandbox) = crate::db::get_sandbox(&db, sandbox_id)
+        if let Some(sandbox) = crate::db::read::sandbox(&db, sandbox_id)
             .map_err(|e| Status::internal(format!("db error: {e}")))?
         {
             return Ok(sandbox);
         }
 
-        let matches = crate::db::find_by_prefix(&db, sandbox_id)
-            .map_err(|e| Status::internal(format!("db error: {e}")))?;
+        let matches =
+            crate::db::scan::resolve_selector(&db, crate::db::scan::RpcSelector, sandbox_id)
+                .map_err(|e| Status::internal(format!("db error: {e}")))?;
         match matches.as_slice() {
-            [id] => crate::db::get_sandbox(&db, id)
+            [id] => crate::db::read::sandbox(&db, id)
                 .map_err(|error| Status::internal(format!("db error: {error}")))?
                 .ok_or_else(|| Status::not_found(format!("sandbox not found: {id}"))),
             [] => Err(Status::not_found(format!(
@@ -764,7 +765,7 @@ impl SandboxManagerService {
         // transition is deferred until after the gate succeeds.
         let sandbox = {
             let db = self.db_conn()?;
-            let sandbox = crate::db::get_sandbox(&db, sandbox_id)
+            let sandbox = crate::db::read::sandbox(&db, sandbox_id)
                 .map_err(|e| Status::internal(format!("db error: {e}")))?
                 .ok_or_else(|| Status::not_found(format!("sandbox not found: {sandbox_id}")))?;
             sandbox
@@ -1031,9 +1032,15 @@ impl SandboxManagerService {
         uid: u32,
     ) -> Result<crate::db::SandboxRow, Status> {
         let db = self.db_conn()?;
-        let mut matches = crate::db::list_by_spaced_host_pid_uid(&db, pid, uid)
-            .map_err(|e| Status::internal(format!("db error: {e}")))?
-            .into_iter();
+        let mut matches = crate::db::scan::by_peer(
+            &db,
+            crate::db::scan::Peer::SpacedHost {
+                spaced_host_pid: pid,
+                uid,
+            },
+        )
+        .map_err(|e| Status::internal(format!("db error: {e}")))?
+        .into_iter();
 
         match (matches.next(), matches.next()) {
             (Some(sandbox), None) => Ok(sandbox),
@@ -1059,9 +1066,15 @@ impl SandboxManagerService {
         // The exact PID/owner lookup below remains mandatory in either case.
         .unwrap_or(uid);
         let db = self.db_conn()?;
-        let mut matches = crate::db::list_by_netgtw_pid_uid(&db, pid, uid)
-            .map_err(|e| Status::internal(format!("db error: {e}")))?
-            .into_iter();
+        let mut matches = crate::db::scan::by_peer(
+            &db,
+            crate::db::scan::Peer::NetGateway {
+                netgtw_pid: pid,
+                uid,
+            },
+        )
+        .map_err(|e| Status::internal(format!("db error: {e}")))?
+        .into_iter();
 
         match (matches.next(), matches.next()) {
             (Some(sandbox), None) => Ok(sandbox),

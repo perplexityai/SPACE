@@ -15,6 +15,10 @@ that nothing else in the server's production graph brings them in.
   by design. A method that hands one out is declared through
   `db_private_outside_tests!` (`src/db/handle.rs`), which makes it public only
   with `test-support`.
+- Code outside the store reads through `db::read` (one record or a narrow
+  view of it) and `db::scan` (named many-row scans). Extend those before
+  adding a public reader; the readers they consolidate are declared through
+  `db_private_outside_tests!`, so only tests outside the store still call them.
 - Write `sandboxes.state` only through `update_state_from` with an explicit
   edge, or through a named specialized writer. A new edge in
   `src/db/state_write.rs` needs a kind and a doc comment naming its writer;

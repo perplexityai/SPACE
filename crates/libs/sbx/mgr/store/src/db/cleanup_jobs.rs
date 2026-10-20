@@ -306,8 +306,10 @@ pub fn reset_inactive_running(conn: &Connection, active_subjects: &[String]) -> 
     )?)
 }
 
-pub fn get_job(conn: &Connection, job_id: &JobId) -> Result<Option<pplx_space_common_jobs::Job>> {
-    Ok(jobs::get_job(conn.raw(), job_id)?)
+db_private_outside_tests! {
+    fn get_job(conn: &Connection, job_id: &JobId) -> Result<Option<pplx_space_common_jobs::Job>> {
+        Ok(jobs::get_job(conn.raw(), job_id)?)
+    }
 }
 
 /// Claim a due job; `false` if another claimant won it.

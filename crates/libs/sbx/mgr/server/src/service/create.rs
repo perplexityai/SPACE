@@ -279,7 +279,7 @@ impl SandboxManagerService {
     ) -> Result<Option<crate::db::SandboxRow>, Status> {
         let requested_id_str = requested_id.to_string();
         let db = self.db_conn()?;
-        crate::db::get_sandbox(&db, &requested_id_str)
+        crate::db::read::sandbox(&db, &requested_id_str)
             .map_err(|e| Status::internal(format!("db lookup failed: {e}")))
     }
 

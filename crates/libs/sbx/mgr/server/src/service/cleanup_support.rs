@@ -98,7 +98,8 @@ pub(super) fn read_node_execution_fence(
     let db = db
         .lock()
         .map_err(|_| Status::unavailable("sandbox database mutex poisoned"))?;
-    crate::db::node_execution_fence(&db, sandbox_id)
+    crate::db::read::sandbox_view(&db, sandbox_id)
+        .node_execution_fence()
         .map_err(|error| Status::unavailable(format!("read node execution authority: {error}")))
 }
 
@@ -111,7 +112,9 @@ pub(super) fn admit_prepared_clone_disposal_attempt(
         let db = db
             .lock()
             .map_err(|_| Status::internal("sandbox database mutex poisoned"))?;
-        let episode = crate::db::cleanup_episode(&db, id)
+        let episode = crate::db::read::sandbox_view(&db, id)
+            .cleanup_episode()
+            .strict()
             .map_err(|e| Status::internal(format!("read clone disposal: {e}")))?
             .filter(|e| e.completion == CleanupCompletion::DeletePoolClone)
             .ok_or_else(|| Status::aborted("clone disposal ownership changed"))?;
@@ -160,7 +163,9 @@ pub(super) async fn service_cleanup_via_node_with_options(
         let db = db
             .lock()
             .map_err(|_| Status::internal("sandbox database mutex poisoned"))?;
-        crate::db::cleanup_episode(&db, sandbox_id)
+        crate::db::read::sandbox_view(&db, sandbox_id)
+            .cleanup_episode()
+            .strict()
             .map_err(|e| Status::internal(format!("read disposal authority: {e}")))?
     };
     if let Some(episode) = episode.filter(|e| e.completion == CleanupCompletion::DeletePoolClone) {

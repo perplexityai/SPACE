@@ -66,7 +66,7 @@ pub(crate) async fn run(db: crate::db::SharedConnection, shutdown_token: Cancell
                     continue;
                 }
             };
-            crate::db::sandbox_lifecycle_counts(&db)
+            crate::db::read::counts(&db, crate::db::read::ByLifecycle)
         };
         let counts = match counts {
             Ok(counts) => counts,

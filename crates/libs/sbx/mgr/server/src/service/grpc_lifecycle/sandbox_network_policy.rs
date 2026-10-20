@@ -303,7 +303,7 @@ impl SandboxManagerService {
 
         let sandboxes = {
             let db = self.db_conn()?;
-            crate::db::list_sandboxes(&db)
+            crate::db::scan::all_sandboxes(&db, crate::db::scan::StrictRows)
                 .map_err(|error| {
                     Status::internal(format!(
                         "db list failed: {}",
