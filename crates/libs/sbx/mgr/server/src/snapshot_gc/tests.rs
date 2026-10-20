@@ -745,3 +745,81 @@ async fn gc_defers_to_publication_staging_drain_and_shutdown_ownership() {
     assert_eq!(report.deleted, 1);
     assert!(!Path::new(&path).exists());
 }
+
+/// Once the rename has moved the bytes out of `local_path`, a failed row
+/// commit must leave the row `deleting`, never `ready`: a ready row would
+/// advertise a missing path while its row keeps the orphan sweep off the
+/// staging directory. Startup recovery then finishes the delete. A failure
+/// before the rename leaves the bytes in place and must roll back to `ready`.
+#[test]
+fn row_commit_failure_after_the_rename_is_finished_by_startup_recovery() {
+    // (case, bytes at local_path, staging already occupied, bytes still at
+    // local_path afterwards, state after the failed attempt, rows startup
+    // recovery finishes)
+    for (case, present, staging_occupied, kept, expected_state, finished) in [
+        ("rename refused", true, true, true, "ready", 0),
+        ("renamed, commit failed", true, false, false, "deleting", 1),
+        (
+            "already gone, commit failed",
+            false,
+            false,
+            false,
+            "deleting",
+            1,
+        ),
+    ] {
+        let conn = open_test_db();
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("art1").to_string_lossy().into_owned();
+        if present {
+            make_artifact_dir(&tmp, "art1", 4096);
+        }
+        let staging = format!("{path}.gc-pending-{TEST_ART_ID}");
+        if staging_occupied {
+            fs::create_dir_all(&staging).unwrap();
+            fs::write(Path::new(&staging).join("occupant"), b"x").unwrap();
+        }
+        insert_artifact_row(&conn, TEST_ART_ID, "sbx1", &path, 0, 0, Some(0));
+        insert_sandbox_row(&conn, "sbx1", None);
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER refuse_artifact_delete BEFORE DELETE ON local_artifacts
+             BEGIN SELECT RAISE(ABORT, 'injected row commit failure'); END;",
+        )
+        .unwrap();
+        let db = crate::db::SharedConnection::new(conn);
+        let artifacts = LocalArtifacts::new(db.clone());
+
+        execute_one(
+            &artifacts,
+            TEST_ART_ID,
+            "sbx1",
+            GcEligibility {
+                now_secs: now_secs(),
+                idle_secs: 0,
+                grace_secs: 0,
+            },
+        )
+        .unwrap_err();
+        let state: String = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM local_artifacts WHERE local_artifact_id = ?1",
+                [TEST_ART_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, expected_state, "{case}");
+        assert_eq!(Path::new(&path).exists(), kept, "{case}");
+
+        db.lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER refuse_artifact_delete")
+            .unwrap();
+        let recovery = artifacts.recover_stuck_states().unwrap();
+        assert_eq!(recovery.deleting_finished, finished, "{case}");
+        assert_eq!(recovery.total(), finished, "{case}");
+        let row = artifacts.get(TEST_ART_ID.parse().unwrap()).unwrap();
+        assert_eq!(row.is_none(), finished == 1, "{case}");
+    }
+}

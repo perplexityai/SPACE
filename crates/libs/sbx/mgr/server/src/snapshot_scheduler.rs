@@ -210,18 +210,6 @@ fn write_snapshot_execution_sidecar(snapshot_dir: &str, sandbox_id: &str, snapsh
     }
 }
 
-/// Snapshot retention per tier. Each tier's count covers the gap to the next tier.
-/// d-1m:  keep 5  → covers minutes 1-5 (until d-5m takes over)
-/// d-5m:  keep 1  → covers minutes 5-10 (until f-10m takes over)
-/// f-10m: keep 6  → covers 10min-1h (until f-1h takes over)
-/// f-1h:  keep 6  → covers 1h-6h (until f-6h takes over)
-/// f-6h:  keep 4  → covers 6h-24h
-const KEEP_D_1M: usize = 5;
-const KEEP_D_5M: usize = 1;
-const KEEP_F_10M: usize = 6;
-const KEEP_F_1H: usize = 6;
-const KEEP_F_6H: usize = 4;
-
 const CACHE_DIR: &str = pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR;
 
 struct SandboxSnapshotState {
@@ -515,10 +503,13 @@ async fn process_tick(
             .auto_lifecycle
             .artifact_publication_locks(sandbox_id, ArtifactKind::Disk)
             .await;
-        // Prune once before creation so failed retention blocks further growth.
-        // This tick may add one snapshot per due tier above its retention count;
-        // the next successful prune removes that surplus before creating more.
-        // Deletions from completed pages remain useful progress on a retry.
+        // Prune once before creation so a failed byte delete blocks further
+        // growth. Retention keeps a pinned, leased or unreadable snapshot and
+        // capture goes on, so such snapshots can hold a tier above its `KEEP_*`
+        // count. This tick may also add one snapshot per due tier above its
+        // retention count; the next successful prune removes that surplus
+        // before creating more. Deletions from completed pages remain useful
+        // progress on a retry.
         prune_scheduled_snapshots(&mut node_client, ctx, sandbox_id).await?;
         // Always create a 1m disk snapshot.
         let disk_1m_name = format!("d-1m-{ts}");
@@ -1071,76 +1062,13 @@ pub async fn do_checkpoint(
     })
 }
 
-/// Keep only the newest entries seen for each scheduled tier. A partial walk
-/// may delete an entry only after seeing enough newer entries to retain.
-fn retention_candidate(
-    retained: &mut [std::collections::BTreeSet<(String, String)>; 5],
-    name: String,
-) -> Option<String> {
-    let (index, keep, timestamp) = [
-        ("d-1m-", 0, KEEP_D_1M),
-        ("1m-", 0, KEEP_D_1M),
-        ("d-5m-", 1, KEEP_D_5M),
-        ("5m-", 1, KEEP_D_5M),
-        ("f-10m-", 2, KEEP_F_10M),
-        ("f-1h-", 3, KEEP_F_1H),
-        ("f-6h-", 4, KEEP_F_6H),
-    ]
-    .iter()
-    .find_map(|(prefix, index, keep)| {
-        name.strip_prefix(prefix)
-            .map(|timestamp| (*index, *keep, timestamp.to_owned()))
-    })?;
-    let entries = retained.get_mut(index)?;
-    entries.insert((timestamp, name));
-    (entries.len() > keep)
-        .then(|| entries.pop_first())
-        .flatten()
-        .map(|(_, name)| name)
-}
-
-async fn prune_scheduled_snapshots(
-    node_client: &mut pplx_space_node_mgr_client::NodeManagerGrpcClient,
-    ctx: &CheckpointContext,
-    sandbox_id: &str,
-) -> Result<(), String> {
-    let sandbox = sandbox_id
-        .parse::<SandboxId>()
-        .map_err(|error| error.to_string())?;
-    let mut pages = pplx_space_node_mgr_client::SnapshotPages::new(sandbox, false);
-    let mut retained = std::array::from_fn(|_| std::collections::BTreeSet::new());
-    while let Some(snapshots) = pages
-        .next(node_client)
-        .await
-        .map_err(|e| format!("list snapshots: {e}"))?
-    {
-        for snapshot in snapshots {
-            let Some(name) = retention_candidate(&mut retained, snapshot.name) else {
-                continue;
-            };
-            node_client
-                .delete_btrfs_snapshot(
-                    pplx_space_node_mgr_client::proto::DeleteBtrfsSnapshotRequest {
-                        sandbox_id: sandbox_id.to_string(),
-                        snapshot_name: name.clone(),
-                    },
-                )
-                .await
-                .map_err(|error| format!("prune {name}: {error}"))?;
-            let db = lock_db(ctx)?;
-            if let Err(error) = crate::db::delete_named_local_artifact(&db, sandbox_id, &name) {
-                tracing::warn!(sandbox_id, snapshot_name = %name, %error,
-                    "pruned snapshot but failed to remove local artifact registry entry");
-            }
-        }
-    }
-    Ok(())
-}
-
 pub(crate) fn snapshot_timestamp(now: jiff::Timestamp) -> String {
     // Snapshot names carry a UTC suffix regardless of the host's local zone.
     now.strftime("%Y%m%dT%H%M%SZ").to_string()
 }
+
+mod retention;
+use retention::prune_scheduled_snapshots;
 
 #[cfg(test)]
 mod tests;

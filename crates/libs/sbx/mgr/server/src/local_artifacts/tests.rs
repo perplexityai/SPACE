@@ -1093,3 +1093,339 @@ fn list_pending_backups_fails_rather_than_dropping_an_undecodable_row() {
         "expected a decode failure, got {error:?}"
     );
 }
+
+/// `delete_named_snapshot` orders checkout, byte delete and row delete, and
+/// judges a failed byte delete from the disk: only a missing path commits. The
+/// snapshot's bytes are a real tempdir, so whether they survive is observed
+/// rather than inferred from which RPC ran.
+#[tokio::test]
+async fn named_delete_keeps_the_row_and_the_bytes_together() {
+    use crate::db::OptionalExtension as _;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Setup {
+        Deletable,
+        Uncatalogued,
+        Pinned,
+        Restoring,
+        AlreadyDeleting,
+        SharedPath,
+        UnreadableRow,
+        PathDiffers,
+        RowCommitFails,
+        FailsAfterRemoving,
+        FailsLeavingBytes,
+        RollBackFailsOnce,
+        FailsOnUnreadablePath,
+        NotFoundAfterRemoving,
+        NotFoundLeavingBytes,
+        UncataloguedNotFound,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Outcome {
+        Deleted,
+        InUse,
+        Unreadable,
+        PathDiffers,
+        BytesNotDeleted,
+    }
+    use tonic::Code;
+    // (setup, the byte delete removes the bytes, its result, whether it runs,
+    // the outcome, whether the bytes remain, and the row state afterwards)
+    let cases = [
+        (
+            Setup::Deletable,
+            true,
+            Code::Ok,
+            true,
+            Outcome::Deleted,
+            false,
+            None,
+        ),
+        (
+            Setup::Uncatalogued,
+            true,
+            Code::Ok,
+            true,
+            Outcome::Deleted,
+            false,
+            None,
+        ),
+        (
+            Setup::Pinned,
+            true,
+            Code::Ok,
+            false,
+            Outcome::InUse,
+            true,
+            Some("ready"),
+        ),
+        (
+            Setup::Restoring,
+            true,
+            Code::Ok,
+            false,
+            Outcome::InUse,
+            true,
+            Some("restoring"),
+        ),
+        (
+            Setup::AlreadyDeleting,
+            true,
+            Code::Ok,
+            false,
+            Outcome::InUse,
+            true,
+            Some("deleting"),
+        ),
+        (
+            Setup::SharedPath,
+            true,
+            Code::Ok,
+            false,
+            Outcome::InUse,
+            true,
+            Some("ready"),
+        ),
+        (
+            Setup::UnreadableRow,
+            true,
+            Code::Ok,
+            false,
+            Outcome::Unreadable,
+            true,
+            Some("ready"),
+        ),
+        // The row names a path other than the one the caller deletes.
+        (
+            Setup::PathDiffers,
+            true,
+            Code::Ok,
+            false,
+            Outcome::PathDiffers,
+            true,
+            Some("ready"),
+        ),
+        (
+            Setup::RowCommitFails,
+            true,
+            Code::Ok,
+            true,
+            Outcome::Deleted,
+            false,
+            Some("deleting"),
+        ),
+        (
+            Setup::FailsAfterRemoving,
+            true,
+            Code::Unavailable,
+            true,
+            Outcome::Deleted,
+            false,
+            None,
+        ),
+        (
+            Setup::FailsLeavingBytes,
+            false,
+            Code::Unavailable,
+            true,
+            Outcome::BytesNotDeleted,
+            true,
+            Some("ready"),
+        ),
+        // The first rollback fails, and dropping the lease retries it.
+        (
+            Setup::RollBackFailsOnce,
+            false,
+            Code::Unavailable,
+            true,
+            Outcome::BytesNotDeleted,
+            true,
+            Some("ready"),
+        ),
+        // An unreadable path rolls back too, so the delete stays retryable.
+        (
+            Setup::FailsOnUnreadablePath,
+            false,
+            Code::Unavailable,
+            true,
+            Outcome::BytesNotDeleted,
+            false,
+            Some("ready"),
+        ),
+        (
+            Setup::NotFoundAfterRemoving,
+            true,
+            Code::NotFound,
+            true,
+            Outcome::Deleted,
+            false,
+            None,
+        ),
+        // Node-manager can answer NotFound for a path it failed to stat.
+        (
+            Setup::NotFoundLeavingBytes,
+            false,
+            Code::NotFound,
+            true,
+            Outcome::BytesNotDeleted,
+            true,
+            Some("ready"),
+        ),
+        (
+            Setup::UncataloguedNotFound,
+            true,
+            Code::NotFound,
+            true,
+            Outcome::Deleted,
+            false,
+            None,
+        ),
+    ];
+    const NAME: &str = "d-named-delete";
+    for (setup, removes, code, runs, outcome, kept, state) in cases {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut local_path = tmp.path().join(NAME);
+        if setup == Setup::FailsOnUnreadablePath {
+            // A path under a regular file cannot be probed (ENOTDIR).
+            std::fs::write(tmp.path().join("file"), b"x").unwrap();
+            local_path = tmp.path().join("file").join(NAME);
+        } else {
+            std::fs::create_dir(&local_path).unwrap();
+        }
+        let local_path = local_path.to_str().unwrap().to_owned();
+        let sandbox = SandboxId::new().to_string();
+        let conn = open_test_db();
+        crate::db::fixture::insert_test_sandbox(
+            &conn,
+            &sandbox,
+            crate::state::SandboxState::Stopped,
+        );
+        let id = LocalArtifactId::new();
+        let catalogued = !matches!(
+            setup,
+            Setup::Uncatalogued | Setup::UncataloguedNotFound | Setup::UnreadableRow
+        );
+        let db = crate::db::SharedConnection::new(conn);
+        let store = LocalArtifacts::new(db.clone());
+        if catalogued {
+            store
+                .publish_named_snapshot(
+                    &sandbox,
+                    id,
+                    ArtifactKind::Disk,
+                    &SnapshotName::parse(NAME).unwrap(),
+                    &local_path,
+                )
+                .unwrap();
+        }
+        let conn = db.lock().unwrap();
+        match setup {
+            Setup::Pinned => {
+                conn.execute(
+                    "UPDATE sandboxes SET suspend_predecessor_artifact_id = ?1",
+                    [id.to_string()],
+                )
+                .unwrap();
+            }
+            Setup::AlreadyDeleting => {
+                conn.execute("UPDATE local_artifacts SET state = 'deleting'", [])
+                    .unwrap();
+            }
+            Setup::SharedPath => insert_row(
+                &conn,
+                &LocalArtifactId::new().to_string(),
+                "sibling",
+                &local_path,
+            ),
+            // An id that is not a UUID does not decode.
+            Setup::UnreadableRow => {
+                conn.execute(
+                    "INSERT INTO local_artifacts (local_artifact_id, sandbox_id, artifact_kind,
+                         artifact_origin, snapshot_name, local_path, created_at)
+                     VALUES ('not-a-uuid', ?1, 'disk', 'snapshot', ?2, ?3, '0')",
+                    params![sandbox, NAME, local_path],
+                )
+                .unwrap();
+            }
+            Setup::RowCommitFails => {
+                conn.execute_batch(
+                    "CREATE TEMP TRIGGER refuse_artifact_delete BEFORE DELETE ON local_artifacts
+                     BEGIN SELECT RAISE(ABORT, 'injected row commit failure'); END;",
+                )
+                .unwrap();
+            }
+            // FAIL keeps the trigger's own delete, so only the first UPDATE fails.
+            Setup::RollBackFailsOnce => {
+                conn.execute_batch(
+                    "CREATE TEMP TABLE fail_rollback (once);
+                     INSERT INTO fail_rollback VALUES (1);
+                     CREATE TEMP TRIGGER refuse_artifact_rollback BEFORE UPDATE ON local_artifacts
+                     WHEN NEW.state = 'ready' AND EXISTS (SELECT 1 FROM fail_rollback)
+                     BEGIN DELETE FROM fail_rollback;
+                           SELECT RAISE(FAIL, 'injected rollback failure'); END;",
+                )
+                .unwrap();
+            }
+            Setup::Deletable
+            | Setup::Uncatalogued
+            | Setup::Restoring
+            | Setup::FailsAfterRemoving
+            | Setup::PathDiffers
+            | Setup::FailsLeavingBytes
+            | Setup::FailsOnUnreadablePath
+            | Setup::NotFoundAfterRemoving
+            | Setup::NotFoundLeavingBytes
+            | Setup::UncataloguedNotFound => {}
+        }
+        drop(conn);
+        let reader = (setup == Setup::Restoring).then(|| store.check_out_for_restore(id).unwrap());
+        let ran = Arc::new(AtomicBool::new(false));
+        let delete_bytes = {
+            let (ran, local_path) = (Arc::clone(&ran), local_path.clone());
+            async move {
+                ran.store(true, Ordering::SeqCst);
+                if removes {
+                    std::fs::remove_dir(&local_path).unwrap();
+                }
+                match code {
+                    Code::Ok => Ok(()),
+                    code => Err(tonic::Status::new(code, "injected byte delete result")),
+                }
+            }
+        };
+        let delete_path = if setup == Setup::PathDiffers {
+            format!("{local_path}-elsewhere")
+        } else {
+            local_path.clone()
+        };
+
+        let result = store
+            .delete_named_snapshot(&sandbox, NAME, &delete_path, delete_bytes)
+            .await;
+
+        let observed = match result {
+            NamedSnapshotDelete::Deleted => Outcome::Deleted,
+            NamedSnapshotDelete::Refused(error) if error.is_in_use() => Outcome::InUse,
+            NamedSnapshotDelete::Refused(_) => Outcome::Unreadable,
+            NamedSnapshotDelete::PathDiffers { .. } => Outcome::PathDiffers,
+            NamedSnapshotDelete::BytesNotDeleted(_) => Outcome::BytesNotDeleted,
+        };
+        assert_eq!(observed, outcome, "{setup:?}");
+        assert_eq!(ran.load(Ordering::SeqCst), runs, "{setup:?}");
+        assert_eq!(Path::new(&local_path).exists(), kept, "{setup:?}");
+        let row: Option<String> = db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM local_artifacts WHERE sandbox_id = ?1 AND snapshot_name = ?2",
+                params![sandbox, NAME],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(row.as_deref(), state, "{setup:?}");
+        drop(reader);
+    }
+}

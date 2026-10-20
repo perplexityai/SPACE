@@ -30,7 +30,7 @@
 //!                            │
 //!                       Drop │ (no commit)
 //!                            ▼
-//!                          ready
+//!          ready, or deleting once the bytes left local_path
 //! ```
 //!
 //! `Restoring → Deleting` and `Deleting → Restoring` are never legal;
@@ -47,7 +47,9 @@
 //! caller's work happens with the lease held; an explicit
 //! [`RestoreLease::release`] / [`DeleteLease::commit`] resolves the
 //! transition; `Drop` rolls back best-effort if neither was called
-//! (e.g. on a panic or early `?` return). Process death (SIGKILL,
+//! (e.g. on a panic or early `?` return), except that a delete whose bytes
+//! have already left `local_path` stays `deleting` for startup recovery to
+//! finish ([`DeleteLease::mark_path_vacated`]). Process death (SIGKILL,
 //! OOM, reboot) skips `Drop` entirely —
 //! [`LocalArtifacts::recover_stuck_states`] runs at startup to
 //! resolve rows stranded in a non-`Ready` state.
@@ -111,6 +113,41 @@ pub enum CheckoutError {
     },
     #[error("database error: {0}")]
     Db(#[from] crate::db::Error),
+}
+
+impl CheckoutError {
+    /// The artifact is held, so deleting its bytes would take them from under
+    /// another owner: a pin or a checkout, which a later retry can outlast, or
+    /// a second row at the same path, a catalog conflict that retrying does not
+    /// clear.
+    pub(crate) fn is_in_use(&self) -> bool {
+        match self {
+            Self::Pinned(_) | Self::NotReady { .. } | Self::SharedLocalPath { .. } => true,
+            Self::NotFound(_)
+            | Self::NamedNotFound { .. }
+            | Self::CorruptState { .. }
+            | Self::Db(_) => false,
+        }
+    }
+}
+
+/// How [`LocalArtifacts::delete_named_snapshot`] ended.
+#[derive(Debug)]
+pub(crate) enum NamedSnapshotDelete {
+    /// `local_path` is gone. Its row, if one was published, is deleted, or
+    /// stays `deleting` for startup recovery when that commit failed.
+    Deleted,
+    /// The row refused deletion, so the bytes were left alone.
+    Refused(CheckoutError),
+    /// The row's `local_path` is not the path the caller deletes, so the
+    /// bytes were left alone and the row is `ready` again.
+    PathDiffers { local_path: String },
+    /// The byte delete failed and `local_path` still exists, or could not be
+    /// read. The row, if any, is `ready` again. A partly deleted tree still
+    /// exists, so it is not detected and comes back `ready`. A delete that
+    /// panics returns no outcome: its row stays `deleting` for startup
+    /// recovery.
+    BytesNotDeleted(tonic::Status),
 }
 
 #[derive(Clone, Copy)]
@@ -465,7 +502,7 @@ impl LocalArtifacts {
             id: local_artifact_id,
             local_path,
             db: self.db.clone(),
-            committed: false,
+            on_drop: DeleteDrop::RollBack,
         })
     }
 
@@ -506,7 +543,7 @@ impl LocalArtifacts {
             id: local_artifact_id,
             local_path,
             db: self.db.clone(),
-            committed: false,
+            on_drop: DeleteDrop::RollBack,
         }))
     }
 
@@ -578,6 +615,84 @@ impl LocalArtifacts {
             }
         };
         self.check_out_for_delete(id)
+    }
+
+    /// Delete a named snapshot's bytes at `delete_path` with `delete_bytes`
+    /// under a delete lease on its row: checkout, then the bytes, then the row.
+    /// A row that refuses checkout, or whose `local_path` is not `delete_path`,
+    /// keeps its bytes. A byte delete that fails is judged from the disk: a
+    /// missing `local_path` commits the row delete, and a present or
+    /// unreadable one rolls the row back to `ready` so the delete can be
+    /// retried; `NotFound` is judged the same way. A snapshot without a row
+    /// (older snapshots predate the catalog) has only its bytes deleted, and
+    /// for it `NotFound` counts as deleted.
+    ///
+    /// Callers run this to completion. DeleteSnapshots is a state-writer RPC,
+    /// and restart admission runs its handler on a tracked task that a client
+    /// deadline or disconnect does not cancel (`service::restart_admission`);
+    /// a retention tick is not dropped mid-delete. Only a panic or a runtime
+    /// shutdown mid-delete drops the lease after the byte delete began, and
+    /// then the row stays `deleting` for startup recovery.
+    pub(crate) async fn delete_named_snapshot(
+        &self,
+        sandbox_id: &str,
+        snapshot_name: &str,
+        delete_path: &str,
+        delete_bytes: impl Future<Output = Result<(), tonic::Status>>,
+    ) -> NamedSnapshotDelete {
+        // A name that does not parse can have no row.
+        let mut lease = match SnapshotName::parse(snapshot_name.to_string()) {
+            Ok(name) => match self.check_out_named_for_delete(sandbox_id, &name) {
+                Ok(lease) if lease.local_path() != delete_path => {
+                    let local_path = lease.local_path().to_owned();
+                    if let Err(error) = lease.roll_back() {
+                        tracing::warn!(sandbox_id, snapshot_name, %error,
+                            "snapshot publication path differs; failed to roll back local artifact row");
+                    }
+                    return NamedSnapshotDelete::PathDiffers { local_path };
+                }
+                Ok(lease) => Some(lease),
+                Err(CheckoutError::NotFound(_) | CheckoutError::NamedNotFound { .. }) => None,
+                Err(error) => return NamedSnapshotDelete::Refused(error),
+            },
+            Err(_) => None,
+        };
+        if let Some(lease) = lease.as_mut() {
+            lease.mark_path_vacated();
+        }
+        let result = delete_bytes.await;
+        let Some(lease) = lease else {
+            return match result {
+                Ok(()) => NamedSnapshotDelete::Deleted,
+                Err(status) if status.code() == tonic::Code::NotFound => {
+                    NamedSnapshotDelete::Deleted
+                }
+                Err(status) => NamedSnapshotDelete::BytesNotDeleted(status),
+            };
+        };
+        // Node-manager can answer NotFound when it fails to stat a path that
+        // still exists, so with a row NotFound is judged from the disk too.
+        if let Err(error) = result {
+            match tokio::fs::try_exists(lease.local_path()).await {
+                Ok(false) => {}
+                present => {
+                    if let Err(probe) = present {
+                        tracing::warn!(sandbox_id, snapshot_name, error = %probe,
+                            "snapshot byte delete failed and its path is unreadable; returning local artifact row to 'ready'");
+                    }
+                    if let Err(rollback) = lease.roll_back() {
+                        tracing::warn!(sandbox_id, snapshot_name, error = %rollback,
+                            "snapshot bytes were not deleted; failed to roll back local artifact row");
+                    }
+                    return NamedSnapshotDelete::BytesNotDeleted(error);
+                }
+            }
+        }
+        if let Err(error) = lease.commit() {
+            tracing::warn!(sandbox_id, snapshot_name, %error,
+                "deleted snapshot but failed to remove local artifact row; startup recovery finishes it");
+        }
+        NamedSnapshotDelete::Deleted
     }
 
     /// Crash recovery for rows stranded in a non-`Ready` state.
@@ -829,14 +944,29 @@ impl Drop for RestoreLease {
 }
 
 /// Active checkout of an artifact in `Deleting` state. The caller is
-/// expected to perform any on-disk cleanup (rename, rmdir) and then
-/// call [`Self::commit`] to remove the row. Dropping the lease
-/// without commit best-effort rolls back the state to `Ready`.
+/// expected to perform any on-disk cleanup (rename, rmdir), record it with
+/// [`Self::mark_path_vacated`], and then call [`Self::commit`] to remove the
+/// row. Dropping the lease without commit best-effort rolls back the state to
+/// `Ready` while the bytes are still at `local_path`, and otherwise leaves the
+/// row `Deleting` for [`LocalArtifacts::recover_stuck_states`].
 pub struct DeleteLease {
     id: LocalArtifactId,
     local_path: String,
     db: crate::db::SharedConnection,
-    committed: bool,
+    on_drop: DeleteDrop,
+}
+
+/// What dropping a [`DeleteLease`] does to its row.
+#[derive(Clone, Copy)]
+enum DeleteDrop {
+    /// The bytes are still at `local_path`: roll back to `ready`.
+    RollBack,
+    /// The bytes may have left `local_path`, so a `ready` row could advertise
+    /// a missing path: stay `deleting` until startup recovery decides from the
+    /// disk.
+    KeepDeleting,
+    /// Committed or rolled back explicitly.
+    Resolved,
 }
 
 impl DeleteLease {
@@ -848,11 +978,40 @@ impl DeleteLease {
         &self.local_path
     }
 
+    /// Record that the bytes may no longer be at `local_path`: renamed
+    /// away, deleted, or a delete is in flight. From here a dropped lease no
+    /// longer rolls the row back to `ready`.
+    pub fn mark_path_vacated(&mut self) {
+        self.on_drop = DeleteDrop::KeepDeleting;
+    }
+
+    /// Return the row to `ready` because `local_path` still exists, surfacing
+    /// a failure that `Drop` could only log; on failure `Drop` retries the
+    /// rollback. Existence is all the caller checked: a partly deleted tree is
+    /// not detected and comes back `ready`.
+    pub fn roll_back(mut self) -> crate::db::Result<()> {
+        self.on_drop = DeleteDrop::RollBack;
+        let conn = lock_db(&self.db)?;
+        leases::roll_back_deleting_artifact(&conn, &self.id.to_string())?;
+        drop(conn);
+        self.on_drop = DeleteDrop::Resolved;
+        Ok(())
+    }
+
     /// Finalize the delete by removing the row. The CAS condition
     /// `AND state = 'deleting'` makes this idempotent: a second
     /// commit (e.g. after rollback already ran) is a no-op rather
-    /// than a foot-gun.
+    /// than a foot-gun. A failure after [`Self::mark_path_vacated`]
+    /// leaves the row `deleting` and is the caller's to report.
     pub fn commit(mut self) -> crate::db::Result<()> {
+        let result = self.delete_row();
+        if result.is_ok() || matches!(self.on_drop, DeleteDrop::KeepDeleting) {
+            self.on_drop = DeleteDrop::Resolved;
+        }
+        result
+    }
+
+    fn delete_row(&self) -> crate::db::Result<()> {
         let conn = lock_db(&self.db)?;
         let deleted = leases::delete_deleting_artifact(&conn, &self.id.to_string())?;
         drop(conn);
@@ -862,15 +1021,22 @@ impl DeleteLease {
                 "DeleteLease commit: row was not in 'deleting' state (concurrent rollback?); no row removed",
             );
         }
-        self.committed = true;
         Ok(())
     }
 }
 
 impl Drop for DeleteLease {
     fn drop(&mut self) {
-        if self.committed {
-            return;
+        match self.on_drop {
+            DeleteDrop::RollBack => {}
+            DeleteDrop::KeepDeleting => {
+                tracing::warn!(
+                    local_artifact_id = %self.id,
+                    "DeleteLease drop: bytes may have left local_path; row stays 'deleting' until startup recovery",
+                );
+                return;
+            }
+            DeleteDrop::Resolved => return,
         }
         let conn = match lock_db(&self.db) {
             Ok(conn) => conn,
@@ -878,7 +1044,7 @@ impl Drop for DeleteLease {
                 tracing::warn!(
                     local_artifact_id = %self.id,
                     %error,
-                    "DeleteLease drop: failed to lock database for rollback; row may be stuck in 'deleting' until manual intervention",
+                    "DeleteLease drop: failed to lock database for rollback; row stays 'deleting' until startup recovery",
                 );
                 return;
             }
@@ -887,7 +1053,7 @@ impl Drop for DeleteLease {
             tracing::warn!(
                 local_artifact_id = %self.id,
                 %error,
-                "DeleteLease drop: failed to roll back state to 'ready'; row may be stuck in 'deleting' until manual intervention",
+                "DeleteLease drop: failed to roll back state to 'ready'; row stays 'deleting' until startup recovery",
             );
         }
     }

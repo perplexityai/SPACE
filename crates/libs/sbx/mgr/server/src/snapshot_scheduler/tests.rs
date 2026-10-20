@@ -1,3 +1,6 @@
+use super::retention::{
+    KEEP_D_1M, KEEP_D_5M, KEEP_F_1H, KEEP_F_6H, KEEP_F_10M, retention_candidate,
+};
 use pplx_space_common_core::types::SandboxId;
 
 use super::*;
@@ -506,4 +509,138 @@ fn checkpoint_sidecar_execution_metadata_records_the_capturing_host_cpu() {
     let execution = checkpoint_sidecar_execution_metadata(metadata).unwrap();
 
     assert_eq!(execution.host_cpu(), HostCpu::current());
+}
+
+/// Retention maps each `delete_named_snapshot` outcome to its own policy;
+/// that helper's tests own the row and byte ordering. A pinned or leased
+/// snapshot is kept, and so is one whose row cannot be read or names another
+/// path, without stopping the rest of the prune: it runs before every
+/// scheduled capture. A failed
+/// byte delete stops the prune at that snapshot.
+#[tokio::test]
+async fn retention_prune_skips_pinned_and_leased_snapshot_artifacts() {
+    use crate::local_artifacts::LocalArtifacts;
+    use pplx_space_node_mgr_client::proto::{
+        BtrfsSnapshotInfo, DeleteBtrfsSnapshotRequest, DeleteBtrfsSnapshotResponse,
+        ListBtrfsSnapshotsRequest, ListBtrfsSnapshotsResponse,
+    };
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Setup {
+        Pinned,
+        Restoring,
+        UnreadableRow,
+        PathDiffers,
+        Uncatalogued,
+        Deletable,
+    }
+    // The six oldest of eleven 1m snapshots fall outside retention and are
+    // considered oldest first. The snapshot without a row precedes the
+    // deletable one, so a failing delete stops before any row is checked out.
+    let candidates = [
+        Setup::Pinned,
+        Setup::Restoring,
+        Setup::UnreadableRow,
+        Setup::PathDiffers,
+        Setup::Uncatalogued,
+        Setup::Deletable,
+    ];
+    let names: Vec<String> = (0..11)
+        .map(|minute| format!("d-1m-20260101T00{minute:02}00Z"))
+        .collect();
+    // (byte deletes fail, prune fails, snapshots whose deletion is requested)
+    for (delete_fails, fails, requested) in [
+        (false, false, vec![names[4].clone(), names[5].clone()]),
+        (true, true, vec![names[4].clone()]),
+    ] {
+        let (ctx, sandbox_id) = checkpoint_context(SandboxState::Started);
+        let artifacts = LocalArtifacts::new(ctx.db.clone());
+        let mut ids = Vec::new();
+        for (name, setup) in names.iter().zip(candidates) {
+            let id = LocalArtifactId::new();
+            ids.push(id);
+            let local_path =
+                pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(&sandbox_id, name);
+            if matches!(
+                setup,
+                Setup::Pinned | Setup::Restoring | Setup::PathDiffers | Setup::Deletable
+            ) {
+                let published = if setup == Setup::PathDiffers {
+                    format!("{local_path}-elsewhere")
+                } else {
+                    local_path.clone()
+                };
+                artifacts
+                    .publish_named_snapshot(
+                        &sandbox_id,
+                        id,
+                        ArtifactKind::Disk,
+                        &SnapshotName::parse(name.clone()).unwrap(),
+                        &published,
+                    )
+                    .unwrap();
+            }
+            let db = ctx.db.lock().unwrap();
+            match setup {
+                Setup::Pinned => {
+                    db.execute(
+                        "UPDATE sandboxes SET suspend_predecessor_artifact_id = ?1",
+                        [id.to_string()],
+                    )
+                    .unwrap();
+                }
+                // An id that is not a UUID does not decode.
+                Setup::UnreadableRow => {
+                    db.execute(
+                        "INSERT INTO local_artifacts (local_artifact_id, sandbox_id,
+                             artifact_kind, artifact_origin, snapshot_name, local_path,
+                             created_at)
+                         VALUES ('not-a-uuid', ?1, 'disk', 'snapshot', ?2, ?3, '0')",
+                        [sandbox_id.clone(), name.clone(), local_path],
+                    )
+                    .unwrap();
+                }
+                Setup::Restoring | Setup::PathDiffers | Setup::Uncatalogued | Setup::Deletable => {}
+            }
+        }
+        let reader = artifacts.check_out_for_restore(ids[1]).unwrap();
+        let deletions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listed = names.clone();
+        let node_manager = crate::node_manager_transport::fake::FakeNodeManager::default()
+            .unary("ListBtrfsSnapshots", move |_: ListBtrfsSnapshotsRequest| {
+                Ok(ListBtrfsSnapshotsResponse {
+                    snapshots: listed
+                        .iter()
+                        .map(|name| BtrfsSnapshotInfo {
+                            name: name.clone(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    next_page_token: String::new(),
+                })
+            })
+            .unary("DeleteBtrfsSnapshot", {
+                let deletions = Arc::clone(&deletions);
+                move |request: DeleteBtrfsSnapshotRequest| {
+                    deletions.lock().unwrap().push(request.snapshot_name);
+                    if delete_fails {
+                        return Err(tonic::Status::unavailable("injected byte delete failure"));
+                    }
+                    Ok(DeleteBtrfsSnapshotResponse {})
+                }
+            })
+            .serve();
+
+        let result =
+            prune_scheduled_snapshots(&mut node_manager.connector().lazy(), &ctx, &sandbox_id)
+                .await;
+
+        assert_eq!(result.is_err(), fails, "delete_fails={delete_fails}");
+        assert_eq!(
+            *deletions.lock().unwrap(),
+            requested,
+            "delete_fails={delete_fails}"
+        );
+        drop(reader);
+    }
 }

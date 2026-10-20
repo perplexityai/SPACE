@@ -84,7 +84,7 @@
 "crates/libs/sbx/mgr/server/src/service/create.rs" = 1195
 "crates/libs/sbx/mgr/server/src/service/grpc_core.rs" = 1087
 "crates/libs/sbx/mgr/server/src/service/grpc_lifecycle/suspend_snapshot.rs" = 1016
-"crates/libs/sbx/mgr/server/src/service/grpc_spaced_process_snapshots.rs" = 1636
+"crates/libs/sbx/mgr/server/src/service/grpc_spaced_process_snapshots.rs" = 1620
 "crates/libs/sbx/mgr/server/src/service/grpc_state_snapshot.rs" = 1831
 "crates/libs/sbx/mgr/server/src/service/mod.rs" = 1757
 "crates/libs/sbx/mgr/server/src/service/network_runtime.rs" = 1112

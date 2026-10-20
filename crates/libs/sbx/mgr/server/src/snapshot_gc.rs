@@ -271,7 +271,9 @@ pub(crate) fn dir_size_bytes(path: &Path) -> u64 {
 ///   2. atomic `rename(local_path → .gc-pending-<id>)` outside the
 ///      lock. If it fails for a non-ENOENT reason the lease drops
 ///      and the row rolls back to Ready.
-///   3. `lease.commit()` — DELETEs the row under the lock again.
+///   3. `lease.commit()` — DELETEs the row under the lock again. If
+///      it fails the row stays Deleting, and startup recovery
+///      finishes the delete.
 ///      The on-disk cleanup of the staging dir runs **after** this
 ///      function returns, via node-mgr's `DeleteCacheArtifact` RPC
 ///      (which can `btrfs subvolume delete` a subvolume root that
@@ -290,7 +292,7 @@ fn execute_one(
     let candidate_id: LocalArtifactId = candidate_id_str
         .parse()
         .map_err(|e| format!("invalid local_artifact_id: {e}"))?;
-    let lease = match artifacts.check_out_for_gc(candidate_id, sandbox_id, eligibility) {
+    let mut lease = match artifacts.check_out_for_gc(candidate_id, sandbox_id, eligibility) {
         Ok(GcDeleteCheckout::Leased(lease)) => lease,
         Ok(GcDeleteCheckout::Pinned) | Err(CheckoutError::Pinned(_)) => {
             return Ok((EvictionOutcome::SkippedPinnedCurrentAtExecute, None));
@@ -348,6 +350,10 @@ fn execute_one(
             return Err(format!("rename failed: {err}"));
         }
     };
+    // The bytes are no longer at local_path: if the commit below fails, the
+    // row must stay 'deleting' for startup recovery rather than return to
+    // 'ready' advertising a missing path.
+    lease.mark_path_vacated();
 
     // Finalize: DELETE the row. The DELETE is gated by `state =
     // 'deleting'` so a concurrent rollback (impossible while we

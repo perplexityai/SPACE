@@ -2861,43 +2861,6 @@ fn stopped_publication_commits_disk_identity_with_terminal_state() {
 }
 
 #[test]
-fn deleting_named_snapshot_identity_does_not_delete_current_instance_artifact() {
-    let conn = test_conn();
-    insert_test_sandbox(
-        &conn,
-        TestSandboxInsert::new("sandbox-1", "sandbox1", SandboxState::Stopped),
-    );
-    let current_id = LocalArtifactId::new();
-    publish_stopped_artifact(
-        &conn,
-        "sandbox-1",
-        get_sandbox(&conn, "sandbox-1")
-            .unwrap()
-            .unwrap()
-            .node_execution_id,
-        current_id,
-        "/cache/sandbox-1/snapshots/d-stop-id",
-    )
-    .unwrap();
-    let named_id = LocalArtifactId::new();
-    let snapshot_name = SnapshotName::parse("d-manual-20260605T000000Z").unwrap();
-    publish_named_local_artifact(
-        &conn,
-        "sandbox-1",
-        named_id,
-        ArtifactKind::Disk,
-        &snapshot_name,
-        "/cache/sandbox-1/snapshots/d-manual-20260605T000000Z",
-    )
-    .unwrap();
-
-    delete_named_local_artifact(&conn, "sandbox-1", snapshot_name.as_str()).unwrap();
-
-    assert!(get_local_artifact(&conn, named_id).unwrap().is_none());
-    assert!(get_local_artifact(&conn, current_id).unwrap().is_some());
-}
-
-#[test]
 fn delete_sandbox_removes_local_artifacts() {
     let conn = test_conn();
     insert_test_sandbox(

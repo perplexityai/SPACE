@@ -463,3 +463,194 @@ fn full_rollback_restage_writes_only_over_a_stopped_row() {
         }
     }
 }
+
+/// DeleteSnapshots maps each `delete_named_snapshot` outcome to its answer,
+/// by name and for `all=true`; that helper's tests own the row and byte
+/// ordering. An in-use row, including one a failed row commit left `deleting`,
+/// refuses the name. An unreadable row answers `Internal`, and a row naming
+/// another path `FailedPrecondition`. Delete-all omits each of them from
+/// `deleted` and goes on. None reaches node-manager. A failed byte delete
+/// answers `Internal` by name and passes node-manager's status through for all.
+#[tokio::test]
+async fn delete_snapshots_answers_each_named_delete_outcome() {
+    use pplx_space_common_core::types::{ArtifactKind, LocalArtifactId, SnapshotName};
+    use pplx_space_node_mgr_client::proto::{
+        BtrfsSnapshotInfo, DeleteCacheArtifactRequest, DeleteCacheArtifactResponse,
+        ListBtrfsSnapshotsRequest, ListBtrfsSnapshotsResponse,
+    };
+    use tonic::Code;
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Setup {
+        Deletable,
+        Pinned,
+        AlreadyDeleting,
+        UnreadableRow,
+        PathDiffers,
+        UncataloguedDeleteFails,
+    }
+    const NAME: &str = "d-user-keep";
+    // (setup, byte delete requested, single-name answer, delete-all answer:
+    // whether the snapshot is listed as deleted; an error is its code and the
+    // start of its message)
+    type Answer<T> = Result<T, (Code, &'static str)>;
+    let cases: [(Setup, bool, Answer<()>, Answer<bool>); 6] = [
+        (Setup::Deletable, true, Ok(()), Ok(true)),
+        (
+            Setup::Pinned,
+            false,
+            Err((Code::FailedPrecondition, "snapshot is in use")),
+            Ok(false),
+        ),
+        (
+            Setup::AlreadyDeleting,
+            false,
+            Err((Code::FailedPrecondition, "snapshot is in use")),
+            Ok(false),
+        ),
+        (
+            Setup::UnreadableRow,
+            false,
+            Err((Code::Internal, "inspect snapshot publication")),
+            Ok(false),
+        ),
+        (
+            Setup::PathDiffers,
+            false,
+            Err((
+                Code::FailedPrecondition,
+                "delete snapshot publication path differs",
+            )),
+            Ok(false),
+        ),
+        (
+            Setup::UncataloguedDeleteFails,
+            true,
+            Err((Code::Internal, "delete snapshot failed")),
+            Err((Code::Unavailable, "injected byte delete failure")),
+        ),
+    ];
+    for all in [false, true] {
+        for (setup, byte_delete, single, delete_all) in cases {
+            let case = format!("{setup:?}, all={all}");
+            let deletions = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let node_manager = crate::node_manager_transport::fake::FakeNodeManager::default()
+                .unary("ListBtrfsSnapshots", |_: ListBtrfsSnapshotsRequest| {
+                    Ok(ListBtrfsSnapshotsResponse {
+                        snapshots: vec![BtrfsSnapshotInfo {
+                            name: NAME.into(),
+                            ..Default::default()
+                        }],
+                        next_page_token: String::new(),
+                    })
+                })
+                .unary("DeleteCacheArtifact", {
+                    let deletions = Arc::clone(&deletions);
+                    move |request: DeleteCacheArtifactRequest| {
+                        deletions.lock().unwrap().push(request.local_path);
+                        if setup == Setup::UncataloguedDeleteFails {
+                            return Err(Status::unavailable("injected byte delete failure"));
+                        }
+                        Ok(DeleteCacheArtifactResponse { was_present: true })
+                    }
+                })
+                .serve();
+            let scratch = tempfile::tempdir().unwrap();
+            let conn = crate::db::test_conn();
+            let sandbox = SandboxId::new().to_string();
+            crate::db::fixture::insert_test_sandbox(&conn, &sandbox, SandboxState::Stopped);
+            let service = SandboxManagerService::new_with_options(
+                conn,
+                SandboxManagerServiceOptions {
+                    node_manager: node_manager.connector(),
+                    ..SandboxManagerServiceOptions::for_test_in(scratch.path())
+                },
+            );
+            let local_path =
+                pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(&sandbox, NAME);
+            let artifact = LocalArtifactId::new();
+            if matches!(
+                setup,
+                Setup::Deletable | Setup::Pinned | Setup::AlreadyDeleting | Setup::PathDiffers
+            ) {
+                let published = if setup == Setup::PathDiffers {
+                    format!("{local_path}-elsewhere")
+                } else {
+                    local_path.clone()
+                };
+                service
+                    .local_artifacts
+                    .publish_named_snapshot(
+                        &sandbox,
+                        artifact,
+                        ArtifactKind::Disk,
+                        &SnapshotName::parse(NAME).unwrap(),
+                        &published,
+                    )
+                    .unwrap();
+            }
+            let db = service.db.lock().unwrap();
+            match setup {
+                Setup::Pinned => {
+                    db.execute(
+                        "UPDATE sandboxes SET suspend_predecessor_artifact_id = ?1",
+                        [artifact.to_string()],
+                    )
+                    .unwrap();
+                }
+                // As a failed row commit leaves it.
+                Setup::AlreadyDeleting => {
+                    db.execute("UPDATE local_artifacts SET state = 'deleting'", [])
+                        .unwrap();
+                }
+                // An id that is not a UUID does not decode.
+                Setup::UnreadableRow => {
+                    db.execute(
+                        "INSERT INTO local_artifacts (local_artifact_id, sandbox_id,
+                             artifact_kind, artifact_origin, snapshot_name, local_path,
+                             created_at)
+                         VALUES ('not-a-uuid', ?1, 'disk', 'snapshot', ?2, ?3, '0')",
+                        [sandbox.clone(), NAME.to_string(), local_path.clone()],
+                    )
+                    .unwrap();
+                }
+                Setup::Deletable | Setup::PathDiffers | Setup::UncataloguedDeleteFails => {}
+            }
+            drop(db);
+
+            let result = service
+                .delete_snapshots(crate::service::activation_support::internal_request(
+                    DeleteSnapshotsRequest {
+                        sandbox_id: sandbox.clone(),
+                        all,
+                        snapshot_name: (!all).then(|| NAME.to_string()),
+                    },
+                ))
+                .await
+                .map(|response| response.into_inner().deleted == [NAME]);
+            let expected = if all {
+                delete_all
+            } else {
+                single.map(|()| true)
+            };
+            match (result, expected) {
+                (Ok(listed), Ok(expected)) => assert_eq!(listed, expected, "{case}"),
+                (Err(status), Err((code, message))) => {
+                    assert_eq!(status.code(), code, "{case}");
+                    assert!(
+                        status.message().starts_with(message),
+                        "{case}: {}",
+                        status.message()
+                    );
+                }
+                (result, expected) => panic!("{case}: {result:?}, expected {expected:?}"),
+            }
+            let requested = if byte_delete {
+                vec![local_path]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(*deletions.lock().unwrap(), requested, "{case}");
+        }
+    }
+}

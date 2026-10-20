@@ -794,19 +794,6 @@ pub fn get_named_local_artifact(
     .optional()
 }
 
-pub fn delete_named_local_artifact(
-    conn: &Connection,
-    sandbox_id: &str,
-    snapshot_name: &str,
-) -> Result<()> {
-    conn.execute(
-        "DELETE FROM local_artifacts
-         WHERE sandbox_id = ?1 AND artifact_origin = 'snapshot' AND snapshot_name = ?2",
-        params![sandbox_id, snapshot_name],
-    )?;
-    Ok(())
-}
-
 pub(super) fn row_to_local_artifact(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocalArtifactRow> {
     Ok(LocalArtifactRow {
         local_artifact_id: row.get::<_, String>(0)?.parse().map_err(|error| {

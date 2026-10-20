@@ -13,6 +13,7 @@ use super::create_support::*;
 use super::spaced_bridge::*;
 use super::tail_support::*;
 use super::*;
+use crate::local_artifacts::{CheckoutError, NamedSnapshotDelete};
 use futures_util::StreamExt;
 use pplx_space_common_core::types::{GuestPort, SandboxId};
 use pplx_space_events::{
@@ -1170,6 +1171,32 @@ fn project_snapshot_inventory(
     Ok(snapshots.into_values().collect())
 }
 
+/// [`crate::local_artifacts::LocalArtifacts::delete_named_snapshot`] with
+/// node-manager's DeleteCacheArtifact of `local_path` as the byte delete.
+async fn delete_cached_snapshot(
+    service: &SandboxManagerService,
+    (sandbox_id, snapshot_name): (&str, &str),
+    local_path: String,
+    node_client: &mut pplx_space_node_mgr_client::NodeManagerGrpcClient,
+) -> NamedSnapshotDelete {
+    let request = pplx_space_node_mgr_client::proto::DeleteCacheArtifactRequest {
+        local_path: local_path.clone(),
+    };
+    let delete_bytes = async { node_client.delete_cache_artifact(request).await.map(drop) };
+    service
+        .local_artifacts
+        .delete_named_snapshot(sandbox_id, snapshot_name, &local_path, delete_bytes)
+        .await
+}
+
+fn snapshot_delete_refusal(error: CheckoutError) -> Status {
+    if error.is_in_use() {
+        Status::failed_precondition(format!("snapshot is in use: {error}"))
+    } else {
+        Status::internal(format!("inspect snapshot publication: {error}"))
+    }
+}
+
 impl SandboxManagerService {
     fn checkout_rollback_snapshot(
         &self,
@@ -1273,47 +1300,19 @@ impl SandboxManagerService {
                             "deleted 4096 snapshots; retry delete-all to continue",
                         ));
                     }
-                    node_client
-                        .delete_cache_artifact(
-                            pplx_space_node_mgr_client::proto::DeleteCacheArtifactRequest {
-                                local_path: local_path.clone(),
-                            },
-                        )
-                        .await?;
-                    if let Ok(snap_name) =
-                        pplx_space_common_core::types::SnapshotName::parse(snap.name.clone())
-                    {
-                        match self
-                            .local_artifacts
-                            .check_out_named_for_delete(&sandbox.id, &snap_name)
-                        {
-                            Ok(lease) => {
-                                if let Err(error) = lease.commit() {
-                                    tracing::warn!(
-                                        sandbox_id = %sandbox.id,
-                                        snapshot_name = %snap.name,
-                                        %error,
-                                        "deleted snapshot via node-mgr but failed to remove local_artifact row",
-                                    );
-                                }
-                            }
-                            Err(
-                                crate::local_artifacts::CheckoutError::NotFound(_)
-                                | crate::local_artifacts::CheckoutError::NamedNotFound { .. },
-                            ) => {
-                                // Already gone; nothing to clean up.
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    sandbox_id = %sandbox.id,
-                                    snapshot_name = %snap.name,
-                                    %error,
-                                    "deleted snapshot via node-mgr but local_artifact row remained",
-                                );
-                            }
-                        }
+                    let names = (sandbox.id.as_str(), snap.name.as_str());
+                    match delete_cached_snapshot(self, names, local_path, &mut node_client).await {
+                        NamedSnapshotDelete::Deleted => deleted.push(snap.name),
+                        NamedSnapshotDelete::BytesNotDeleted(status) => return Err(status),
+                        // A refused row or a differing path: kept and left out of
+                        // `deleted`, as delete-all did before rows were checked out.
+                        kept => tracing::warn!(
+                            sandbox_id = %sandbox.id,
+                            snapshot_name = %snap.name,
+                            outcome = ?kept,
+                            "delete-all retains a snapshot it cannot delete",
+                        ),
                     }
-                    deleted.push(snap.name);
                 }
             }
             // Note: list_btrfs_snapshots returns both d-* and f-* entries, so the loop
@@ -1342,47 +1341,17 @@ impl SandboxManagerService {
             // handles both the subvolume case (privileged
             // `btrfs subvolume delete`) and the plain-directory case
             // (`remove_dir_all`), and is idempotent on a missing path.
-            {
-                node_client
-                    .delete_cache_artifact(
-                        pplx_space_node_mgr_client::proto::DeleteCacheArtifactRequest {
-                            local_path: local_path.clone(),
-                        },
-                    )
-                    .await
-                    .map_err(|e| Status::internal(format!("delete snapshot failed: {e}")))?;
-            }
-            if let Ok(snap_name_typed) =
-                pplx_space_common_core::types::SnapshotName::parse(snapshot_name.to_string())
-            {
-                match self
-                    .local_artifacts
-                    .check_out_named_for_delete(&sandbox.id, &snap_name_typed)
-                {
-                    Ok(lease) => {
-                        if let Err(error) = lease.commit() {
-                            tracing::warn!(
-                                sandbox_id = %sandbox.id,
-                                snapshot_name,
-                                %error,
-                                "deleted snapshot but failed to remove local artifact registry entry"
-                            );
-                        }
-                    }
-                    Err(
-                        crate::local_artifacts::CheckoutError::NotFound(_)
-                        | crate::local_artifacts::CheckoutError::NamedNotFound { .. },
-                    ) => {
-                        // Row already gone (e.g. reaper raced us); fine.
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            sandbox_id = %sandbox.id,
-                            snapshot_name,
-                            %error,
-                            "deleted snapshot but local_artifact row could not be removed"
-                        );
-                    }
+            let names = (sandbox.id.as_str(), snapshot_name);
+            match delete_cached_snapshot(self, names, local_path, &mut node_client).await {
+                NamedSnapshotDelete::Deleted => {}
+                NamedSnapshotDelete::Refused(error) => return Err(snapshot_delete_refusal(error)),
+                NamedSnapshotDelete::PathDiffers { .. } => {
+                    return Err(Status::failed_precondition(
+                        "delete snapshot publication path differs",
+                    ));
+                }
+                NamedSnapshotDelete::BytesNotDeleted(e) => {
+                    return Err(Status::internal(format!("delete snapshot failed: {e}")));
                 }
             }
 
