@@ -10,7 +10,7 @@ This guide covers the Kubernetes-based local setup, not a Kubernetes-free deploy
 
 ## Prepare your environment
 
-Use an apt-based **Linux x86_64 host with KVM**. The host needs `/dev/kvm`, `/dev/net/tun`, loop devices, btrfs support, and a local Docker daemon that permits privileged containers. A VM must expose the required devices and support nested virtualization; these instructions do not run directly on macOS.
+Use an apt-based **Linux x86_64 host with KVM**. The host needs `/dev/kvm`, `/dev/net/tun`, loop devices, btrfs support, and a local Docker daemon that permits privileged containers. A VM must expose the required devices and support nested virtualization; these instructions do not run directly on macOS. Keep at least 30 GiB free on the filesystem holding Docker's data root and on the one holding your home directory, where each Kind node keeps its images under `~/.kind-data`; the bring-up warns below that, and image builds can fail part-way.
 
 Start with Bash, Git, curl, tar, OpenSSL, Python 3.8 or newer, and `ssh-keygen`. The prerequisite installer needs root or non-interactive sudo to install system packages.
 
