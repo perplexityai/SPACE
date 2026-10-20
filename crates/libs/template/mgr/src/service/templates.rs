@@ -534,12 +534,7 @@ impl TemplateManagerService {
         let arch = template_arch(&metadata, &empty_manifest);
 
         expand_template_rootfs(template_id, "pending", &staging_dir, "register").await?;
-        let content_hash = compute_template_file_hash(
-            rootfs_path.clone(),
-            HashAlg::Sha256,
-            "hash expanded rootfs",
-        )
-        .await?;
+        let content_hash = self.hash_new_rootfs(rootfs_path.clone()).await?;
         let expanded_size = std::fs::metadata(&rootfs_path)
             .map(|m| m.len())
             .map_err(|e| Status::internal(format!("stat rootfs {}: {e}", rootfs_path.display())))?;
