@@ -12,6 +12,8 @@ use super::{
     update_desired_state,
 };
 
+mod insert_unplaced_tests;
+
 /// The three desired-state columns, read back raw.
 async fn read_desired_state(
     pool: &PgPool,

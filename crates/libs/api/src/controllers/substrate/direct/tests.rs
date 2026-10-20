@@ -8,6 +8,7 @@ use pplx_space_db_test_fixtures::{TestDb, try_pg_test_db_with_max_connections};
 use pplx_space_node_api_sim::{SandboxRecord, SimState, SimWorkerHarness};
 use sqlx::PgPool;
 
+mod restore_lease_completion;
 mod substrate_scope;
 
 #[test]

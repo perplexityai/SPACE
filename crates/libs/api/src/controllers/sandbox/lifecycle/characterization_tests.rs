@@ -28,7 +28,8 @@ mod kubernetes;
 
 /// Values `sandboxes.lifecycle` can hold that are not `SandboxLifecycle`
 /// variants (see `SandboxLifecycle::all`).
-const NON_VARIANT_LIFECYCLES: [&str; 2] = ["deleted", "cleanup_required"];
+pub(in crate::controllers) const NON_VARIANT_LIFECYCLES: [&str; 2] =
+    ["deleted", "cleanup_required"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Row {

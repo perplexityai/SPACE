@@ -10,6 +10,7 @@ use super::*;
 
 use pplx_space_test_env::TestResult;
 
+mod lifecycle_writer_tests;
 mod stopped_evacuation_claim_tests;
 mod stopped_restore_selector_tests;
 mod substrate_scope_tests;

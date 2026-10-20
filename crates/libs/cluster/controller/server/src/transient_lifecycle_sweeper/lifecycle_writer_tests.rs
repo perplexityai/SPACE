@@ -16,10 +16,12 @@
 //!
 //! The sink runs over the direct substrate, which labels its rows
 //! `managed_by = 'space'` and needs no node or Kubernetes API for these
-//! writes. Two guards are therefore out of reach here and stay covered at the
-//! query level in `tests.rs`: the converge CAS's routability predicate (a
-//! non-Kubernetes row is always routable) and the failed-active repair CAS,
-//! which only ever matches `managed_by = 'k8s'` rows.
+//! writes. The converge CAS's routability predicate is therefore out of reach
+//! here and stays covered at the query level in `tests.rs` (a non-Kubernetes
+//! row is always routable). The failed-active repair CAS only ever matches
+//! `managed_by = 'k8s'` rows, so its sweep runs on a sink over the production
+//! Kubernetes substrate ([`kubernetes_substrate`]); its other guards are
+//! pinned at the query level in `tests.rs`.
 //!
 //! Which writer runs is the reconciler's decision, pinned with a fake sink in
 //! `tests.rs`; in particular it never undoes the lossy age-out of a
@@ -38,8 +40,9 @@ use sqlx::PgPool;
 
 use super::{SWEEPABLE_LIFECYCLES, SubstrateSweepSink, SweepSink};
 use crate::lifecycle_writer_test_support::{
-    ExecutionSeed, SandboxSeed, bounded, insert_execution, insert_sandbox, insert_snapshot,
-    pin_local_artifact, single_backend_pool, stored_lifecycles, wait_until_blocked,
+    ExecutionSeed, SandboxSeed, bounded, enter_kubernetes_process, insert_execution,
+    insert_sandbox, insert_snapshot, kubernetes_substrate, pin_local_artifact, single_backend_pool,
+    stored_lifecycles, wait_until_blocked,
 };
 
 fn age() -> PositiveDuration {
@@ -791,5 +794,47 @@ async fn reap_undo_reverts_only_its_own_failed_write() -> TestResult {
             .await?
     );
     assert_eq!(row(pool, sandbox_id).await?, Row::bare("failed"));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Failed-active repair, on the Kubernetes substrate.
+// ---------------------------------------------------------------------------
+
+/// The failed-active repair moves a placed Kubernetes row with an active
+/// execution back to `started` only out of `failed`, from every stored
+/// lifecycle.
+#[tokio::test(flavor = "current_thread")]
+async fn failed_active_repair_moves_only_failed_rows() -> TestResult {
+    if !enter_kubernetes_process()? {
+        return Ok(());
+    }
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+    let substrate = Box::pin(kubernetes_substrate(pool)).await?;
+    let sink = SubstrateSweepSink::new(
+        pool.clone(),
+        Arc::new(Substrate::from_kubernetes(substrate)),
+    );
+
+    let mut mismatches = Vec::new();
+    for stored in stored_lifecycles() {
+        let sandbox_id = SandboxId::new();
+        let seed = SandboxSeed::new(stored, "k8s").on_node(NodeId::new());
+        insert_sandbox(pool, sandbox_id, &seed).await?;
+        insert_execution(pool, sandbox_id, ExecutionSeed::RUNNING).await?;
+
+        let repaired = sink.repair_failed_active_execution(sandbox_id).await?;
+
+        let accepts = stored == "failed";
+        let expected = Row::bare(if accepts { "started" } else { stored });
+        let actual = row(pool, sandbox_id).await?;
+        if repaired != accepts || actual != expected {
+            mismatches.push(format!(
+                "stored {stored}: repaired {repaired}, row {actual:?}"
+            ));
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
     Ok(())
 }
