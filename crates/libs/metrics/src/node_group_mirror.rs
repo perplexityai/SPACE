@@ -5,9 +5,11 @@
 //! silence*. Once the column has converged it changes nothing, and before any
 //! label exists in the cluster it changes nothing either — so without a series
 //! that ticks on a no-op there is no difference between a healthy mirror and
-//! one wedged in its kube LIST or its SQL. [`tick_completed`] is that series,
-//! and it is the reason this module exists; everything else here is context
-//! for reading it.
+//! one that has stopped ticking. [`tick_completed`] is that series, and it is
+//! the reason this module exists; everything else here is context for reading
+//! it. (A LIST or statement that hangs books [`tick_error`] once the
+//! reconciler's bound on it elapses; a loop that isn't running books nothing,
+//! which is why absence is the signal.)
 
 use crate::emit::{counter, gauge, tag};
 
@@ -123,8 +125,8 @@ pub fn rows_updated(count: u64) {
 ///
 /// Singular, unlike the labeler's `tick_errors(kind, count)`: that reconciler
 /// accumulates independently-failing sub-phases within one tick, while this
-/// one is two fallible steps behind a single `Result`, so a tick fails once or
-/// not at all.
+/// one runs its steps in sequence behind a single `Result`, stopping at the
+/// first failure, so a tick fails once or not at all.
 pub fn tick_error(kind: TickErrorKind) {
     counter(
         "node_group_mirror.tick_error",
@@ -151,16 +153,21 @@ pub fn tick_error(kind: TickErrorKind) {
 /// [`Query`]: Self::Query
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TickErrorKind {
-    /// The kube LIST of selector-matching Nodes failed: apiserver
-    /// unavailability, a throttled client, an expired or under-scoped service
-    /// account token.
+    /// The kube LIST of selector-matching Nodes failed or outran the
+    /// reconciler's client-side bound: apiserver unavailability, a throttled
+    /// client, an expired or under-scoped service account token.
     List,
-    /// Postgres rejected or could not serve one of the tick's two statements —
-    /// the `node_groups` read or the bulk UPDATE. Not split further because the
-    /// first move is the same for both: go look at the database. Note the
-    /// asymmetry the split would not capture either — a failed `node_groups`
-    /// read wrote nothing, while a failed UPDATE is merely *unconfirmed*, per
-    /// the note above.
+    /// Postgres rejected or could not serve the tick's `node_groups` read or its
+    /// write — the write's setup (pool acquire included), the bulk UPDATE, or its
+    /// COMMIT — including a step that outran one of the reconciler's bounds. A
+    /// burst during pool exhaustion may involve no slow statement at all. Not
+    /// split further because the first move is the same for each: go look at
+    /// the database. What the split would not capture either: a failed read or
+    /// setup wrote nothing, and a failed UPDATE is rolled back with its
+    /// transaction, so only a failed COMMIT, or a write the reconciler stopped
+    /// waiting for during its COMMIT, is merely *unconfirmed*, per the note
+    /// above. The reconciler can't tell which part of a write it stopped
+    /// waiting on, so a timed-out write reports as unconfirmed either way.
     Query,
 }
 

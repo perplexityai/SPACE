@@ -94,7 +94,7 @@ pplx-space-test-env = { workspace = true }
 serde = { workspace = true }
 sqlx = { workspace = true, features = ["migrate", "postgres", "runtime-tokio", "tls-rustls-aws-lc-rs"] }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "test-util"] }
 tokio-stream = { workspace = true, features = ["net"] }
 tonic-health = { workspace = true }
 tower = { workspace = true, features = ["util"] }

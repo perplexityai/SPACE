@@ -154,7 +154,10 @@
 //! leader election: the holder voluntarily stops acting before the lease
 //! expires, using a renew deadline (`lease_ttl - RENEW_DEADLINE_MARGIN`) whose
 //! margin exceeds the reconciler drain window, so its ticks finish before any
-//! standby can acquire. It does **not** hard-fence: if a holder's process is
+//! standby can acquire. One documented exception, accepted because the write
+//! is idempotent: `node_group_mirror`'s bulk UPDATE can still commit after the
+//! lease changes hands on a slow connection (see its `WRITE_BACKSTOP`). It
+//! does **not** hard-fence: if a holder's process is
 //! frozen past the TTL (e.g. `SIGSTOP`, VM suspension, total runtime
 //! starvation) a standby will acquire and, when the frozen process resumes, an
 //! already-in-flight reconciler tick could run once more before the renewal
@@ -366,8 +369,9 @@ const RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 /// exceed the reconciler drain window
 /// ([`crate::reconcilers::SHUTDOWN_DRAIN_TIMEOUT`]) so the old leader's
 /// in-flight reconciler ticks finish before any standby starts its own — the
-/// no-two-concurrent-runners guarantee. The extra buffer covers scheduling and
-/// clock skew. `renew_deadline = lease_ttl - RENEW_DEADLINE_MARGIN`.
+/// no-two-concurrent-runners guarantee, with the one documented exception
+/// the module doc names. The extra buffer covers scheduling and clock skew.
+/// `renew_deadline = lease_ttl - RENEW_DEADLINE_MARGIN`.
 const RENEW_DEADLINE_MARGIN: Duration =
     Duration::from_secs(crate::reconcilers::SHUTDOWN_DRAIN_TIMEOUT.as_secs() + 2);
 

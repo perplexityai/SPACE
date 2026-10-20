@@ -176,12 +176,11 @@ pub(crate) fn clamp_write_concurrency(value: usize) -> usize {
 /// network call would let a write overshoot the deadline by whatever the call
 /// cost; that method's docs carry the reasoning.
 ///
-/// Without a bound the only ceiling is the kube client's own read deadline —
-/// `kube_client::Config`'s `DEFAULT_READ_TIMEOUT`, 295 s, set by every `Config`
-/// constructor including the `Config::infer` that `common-svc`'s
-/// `traced_kube_client_from_env` builds this process's client from, and applied
-/// by `ClientBuilder`. Nothing in SPACE
-/// overrides it, so one wedged patch would stall the rollout for that long.
+/// Without a bound there is no ceiling: `kube_client::Config` leaves
+/// `read_timeout` unset in every constructor, including the `Config::infer`
+/// that `common-svc`'s `traced_kube_client_from_env` builds this process's
+/// client from, and nothing in SPACE sets one, so one wedged patch would stall
+/// the rollout indefinitely.
 ///
 /// This bounds the *phase*, not the tick: the budget is anchored when the phase
 /// starts (after the seed, the store scan and the census) and the Postgres calls
