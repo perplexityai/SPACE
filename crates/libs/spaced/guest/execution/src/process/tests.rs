@@ -229,16 +229,20 @@ async fn process_payload_admission_rejects_before_decode_and_releases_at_headers
     };
     let held = stdin.lock().await;
     let mut writes = Vec::new();
-    for _ in 0..process_limits::PAYLOAD_SLOTS {
+    for index in 0..process_limits::PAYLOAD_SLOTS {
         let mut client = client.clone();
+        let native = service.clone();
         let process_id = started.process_id.clone();
         writes.push(tokio::spawn(async move {
-            client
-                .send_input(SendInputRequest {
-                    process_id,
-                    data: b"a".to_vec(),
-                })
-                .await
+            let request = SendInputRequest {
+                process_id,
+                data: b"a".to_vec(),
+            };
+            if index % 2 == 0 {
+                Process::send_input(&native, Request::new(request)).await
+            } else {
+                client.send_input(request).await
+            }
         }));
     }
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -1468,4 +1472,36 @@ fn output_budget_scales_with_guest_memory() {
         ProcessOutputBudget::for_guest_memory(None).shared,
         PROCESS_OUTPUT_SHARED_BYTES
     );
+}
+
+#[tokio::test]
+async fn native_process_payloads_obey_message_limits_before_lookup_or_spawn() {
+    let service = cancellation_service();
+    let oversized = vec![b'x'; pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES];
+    let start = Process::start(
+        &service,
+        Request::new(StartRequest {
+            command: vec![
+                "/bin/true".into(),
+                String::from_utf8(oversized.clone()).unwrap(),
+            ],
+            ..Default::default()
+        }),
+    )
+    .await
+    .err()
+    .expect("oversized start");
+    let input = Process::send_input(
+        &service,
+        Request::new(SendInputRequest {
+            process_id: "sbxps_2f1c9a4e-0000-7000-8000-000000000002".into(),
+            data: oversized,
+        }),
+    )
+    .await
+    .unwrap_err();
+    for error in [start, input] {
+        assert_eq!(error.code(), tonic::Code::OutOfRange);
+    }
+    assert!(service.inner.processes.records.is_empty());
 }

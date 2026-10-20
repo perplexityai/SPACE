@@ -8,8 +8,8 @@ use pplx_space_spaced_guest_execution::{
 };
 use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
     StartRequest, StatRequest, WriteBatchEntry, WriteBatchRequest,
-    filesystem_client::FilesystemClient, process_event::Event, process_exit::Outcome,
-    process_server::Process,
+    filesystem_client::FilesystemClient, filesystem_server::Filesystem, process_event::Event,
+    process_exit::Outcome, process_server::Process,
 };
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Channel, Server};
@@ -129,12 +129,12 @@ pub(super) async fn run() {
         idempotency_key: Some("embedding-write".into()),
         user: None,
     };
-    for _ in 0..2 {
-        client
-            .write_batch(write.clone())
-            .await
-            .expect("write and replay");
-    }
+    let native = service.filesystem_service();
+    native
+        .write_batch(tonic::Request::new(write.clone()))
+        .await
+        .expect("native write");
+    client.write_batch(write).await.expect("transport replay");
     assert_eq!(std::fs::read(&path).expect("file"), b"once");
     let metadata = std::fs::metadata(&path).expect("metadata");
     assert_eq!(metadata.uid(), account.uid.as_raw());

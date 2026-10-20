@@ -7171,6 +7171,7 @@ dependencies = [
  "pplx-space-metrics",
  "pplx-space-spaced-guest-protocol",
  "pplx-space-test-env",
+ "prost",
  "prost-types",
  "rustix",
  "tempfile",
