@@ -17,3 +17,7 @@ infra/space/packer/aws/output-*
 **/*.raw
 **/efivars.fd
 **/.DS_Store
+# Git ignores these, so the image-provenance snapshot never sees them; keep
+# them out of the build context too, or a local test run changes an image
+# that still certifies as a clean commit.
+**/__pycache__

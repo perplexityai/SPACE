@@ -115,8 +115,10 @@ def checkout_commit():
     """The checkout's commit, Kind's one version source, or "" outside Git.
 
     Workloads report it as service.version unless an experiment names its own
-    version, and every image built for the bench records it as its build SHA,
-    which host sidecars such as net-gateway inherit from the worker image.
+    version. Every image built for the bench records a build SHA derived from
+    it when the image is built (image-provenance.py): the commit itself, or
+    `<commit>-dirty-<content>` for an image the worktree's changes reach. Host
+    sidecars such as net-gateway inherit the worker image's.
     """
     try:
         result = subprocess.run(

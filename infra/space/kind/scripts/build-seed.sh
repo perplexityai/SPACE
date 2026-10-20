@@ -69,6 +69,8 @@ command -v python3 >/dev/null 2>&1 || die "python3 not on PATH (needed to author
 
 # shellcheck source=../lib/build-cache.sh
 source "$REPO_ROOT/infra/space/kind/lib/build-cache.sh"
+# shellcheck source=../lib/shared-build-inputs.sh
+source "$REPO_ROOT/infra/space/kind/lib/shared-build-inputs.sh"
 # shellcheck source=../../../../templates/firecracker/seed/rootfs-builder.sh
 source "$SEED_DIR/rootfs-builder.sh"
 
@@ -127,6 +129,10 @@ if [[ "${1:-}" == "--cache-only" ]]; then
   exit 0
 fi
 (( $# == 0 )) || die "usage: $0 [--cache-only]"
+
+# $OUT_DIR is shared by every checkout on the host; see the library for who
+# reads this mark.
+space_kind_mark_shared_input_writer "$REPO_ROOT"
 
 # Record the bytes staged for the Kind workers, not a guessed kernel release.
 # shellcheck source=lib/kind-host-paths.sh

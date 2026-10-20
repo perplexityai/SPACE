@@ -98,6 +98,8 @@ RUNTIME_LIBC_IMAGE="${SPACE_KIND_RUNTIME_LIBC_IMAGE:-public.ecr.aws/docker/libra
 
 # shellcheck source=../lib/build-cache.sh
 source "$REPO_ROOT/infra/space/kind/lib/build-cache.sh"
+# shellcheck source=../lib/shared-build-inputs.sh
+source "$REPO_ROOT/infra/space/kind/lib/shared-build-inputs.sh"
 
 log() { printf '[rust-artifacts] %s\n' "$*"; }
 die() { printf '[rust-artifacts] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -444,6 +446,9 @@ fi
 (( $# == 0 )) || die "usage: $0 [--mode]"
 
 mkdir -p "$STATE_DIR"
+# The artifact image's tag is shared by every checkout on the host; see the
+# library for who reads this mark.
+space_kind_mark_shared_input_writer "$REPO_ROOT"
 # One build at a time, in either mode; concurrent callers wait, then find the
 # build up to date. Tilt starts several at once: the rust-artifacts resource and
 # every runtime image's custom_build. The incremental build needs this for its

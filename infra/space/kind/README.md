@@ -82,6 +82,86 @@ once Tilt has nothing pending and every workload in the namespace has finished
 rolling. `teardown.sh` also stops a watcher serving this context that its
 pidfile does not name, so a `kind-down` cannot leave the stale watcher behind.
 
+### Build identity and provenance
+
+Every image Tilt or `build-images.sh` builds goes through
+`scripts/image-provenance.py`, which gives it a build identity when it is
+built, not when Tilt starts: the checkout's commit (`git rev-parse --short=12
+HEAD`) when the image is what that commit builds, and
+`<commit>-dirty-<content>` when the worktree's changes reach it, where
+`<content>` is the first 12 hex digits of the image's config digest as built
+with the plain commit. An image is what the commit builds when its build's
+inputs were the commit's for the whole build, or when its content equals that
+of such a build at the same commit, which every one records under
+`~/.space-devbox/kind/provenance/clean/`. So after an edit to one service only
+the images that edit changes report `-dirty-`, and editing it back returns them
+to the commit once the rebuilt image matches the clean one again. That holds
+while BuildKit's cache still has the clean build's layers: the config digest
+also holds each layer's creation time, so once the cache has dropped them
+(Tilt's pruner removes cache unused for six hours; see
+[Diagnosing iteration disk pressure](#diagnosing-iteration-disk-pressure)), a
+rebuilt image, edited or not, reports `-dirty-` until a clean build records
+its content again. That errs towards `-dirty-`, never the other way. A clean
+build runs its command once, with the commit, as
+before, so CI's clean checkouts build what they did; a dirty build whose
+content differs runs a second time with its dirty identity, which rebuilds only
+the layers from the identity on in the image's final stage (0.8-1.4 s for
+data-plane and worker on a warm cache, 2026-10-20 bench), never a compile or a
+package install.
+
+"The commit's for the whole build" is judged from two snapshots of the
+build's inputs (`image-provenance.py snapshot`): one taken before the build's
+first step (each Tilt build chain's, and `build-images.sh`'s own start), since
+the chain compiles Rust and assembles the seed before the image's
+`docker build`, and one after that `docker build`. Each snapshot holds HEAD,
+`git status` and the stat data of every tracked and untracked file, so an edit
+made and reverted during the build still counts. The Rust artifact image
+(`space-rust-build-kind:local`) and the seed directory are shared by every
+checkout on the host; `build-rust-artifacts.sh` and `build-seed.sh` mark each
+run (`lib/shared-build-inputs.sh`), and a build during which another
+checkout's run was in progress or started is not certified clean either.
+
+The identity reaches the image as the `SPACE_GIT_SHA` build argument, which
+each Dockerfile's final stage writes to `/etc/space/build-git-sha` and the
+`org.opencontainers.image.revision` label. The script sets that label itself
+only on the UI and seed-publish images, whose Dockerfiles take no argument, so
+on every other image the label shows that the argument reached the build.
+`pplx_space_observability::git_sha` reads that file, so the identity is what
+the startup banner's `git_sha`, the `git_sha` metric tags and the
+net-gateway's reported build carry, and what sandbox-manager compares to mark
+a net-gateway stale. `service.version` (`SPACE_VERSION`, `DD_VERSION`,
+`OTEL_RESOURCE_ATTRIBUTES`) is still the commit read when Tilt or bootstrap
+starts, or the experiment's `SPACE_KIND_VERSION` (see
+[Shared experiment identity](#shared-experiment-identity)): the charts set
+it, and Tilt renders them once per Tiltfile evaluation, not per build. Every
+image is built with `--provenance=false`: BuildKit's default attestation
+records the build time, so the image ID would change on every build and its
+workloads would roll whether or not anything in them changed.
+
+Each build records the image's ID, config digest and identity in
+`~/.space-devbox/kind/provenance/<cluster>/<image>.json`. Once Tilt has
+settled, the smoke bring-up runs `image-provenance.py check`: for every
+container in the `space` namespace that runs a SPACE image it records the image
+ID the kubelet reports (the config digest) and that image's revision label in
+its node's containerd store, compares them with the last build of the image,
+and writes the result to `$SPACE_KIND_RUN_DIR/provenance.json` (by default a
+new directory under `~/.space-devbox/kind/runs/`), which a report can cite.
+Pods being deleted and Failed pods (evicted or rejected, which no rollout
+removes) run nothing and are listed rather than compared. A container on any
+other build, such as one left by a Tilt stopped before it rolled a build or one
+pinned to an earlier image, fails the bring-up, naming its workload and the
+remedy. With `SKIP_BOOTSTRAP=1` the bring-up does not wait for Tilt; it runs
+the same check when Tilt has nothing pending or in progress, and skips it with
+a warning when Tilt is still updating. To run it by hand:
+
+```bash
+python3 infra/space/kind/scripts/image-provenance.py check \
+  --cluster space-local --output /tmp/provenance.json
+```
+
+Nothing prunes `provenance/` or `runs/`; their files are a few kilobytes each
+and can be deleted at any time.
+
 ## Template publication authentication
 
 ClusterApi validates projected ServiceAccount tokens with the `space-cluster-api`
@@ -815,8 +895,9 @@ so even native trace/log clients can distinguish phases. Agent-side tags alone
 do not override an application's explicit environment/version. Without
 `SPACE_KIND_VERSION`, every Rust service and the shim report the checkout's
 commit (`git rev-parse --short=12 HEAD`) as their version, read when Tilt or
-bootstrap starts, and every image records that commit as its build SHA, which
-the startup banner's `git_sha` and the node's host sidecars report.
+bootstrap starts. The build SHA each image records, which the startup banner's
+`git_sha` and the node's host sidecars report, is computed when the image is
+built instead ([Build identity and provenance](#build-identity-and-provenance)).
 
 These values align `DD_ENV`/`DD_VERSION`, neutral log identity, and OTel resource
 identity without changing service names. `SPACE_KIND_CLUSTER` names the Kind
@@ -1685,6 +1766,7 @@ asks of the hosting deployment.
 | Reconcile-queue GC (`SPACE_RECONCILE_QUEUE_GC_*`) prunes dead letters and asks EC2 whether a non-ready node's instance is gone | off, because a Kind bench must not call AWS: for a candidate it would sign `DescribeInstances` to the public EC2 API with the object store's keys. A reply with no live instance reads as gone; Kind's refs would be kept only because that call fails. No switch disables the EC2 detector alone, its EC2 client takes only the global `AWS_ENDPOINT_URL` (which would also redirect the controller's S3 clients), and its Postgres-only dead-letter pass runs in the same instance, so both stay off. The gone-node queue GC runs, dry-run |
 | The runtime manager installs releases and kernels, which node-manager publishes into the root-owned store `/space/vendor/artifacts` | `/space/vendor` is a read-only host bind, so the runtime manager runs `--list-only`: listing and cache checks work, installs are off |
 | Operators run node-local CLIs from the node host's shell   | the same CLIs run in the Kind-only `space-node-debug` root shell DaemonSet     |
+| Release images record the CI commit as their build SHA (`ci/scripts/run-space-bundle-builds.py`) | the same from a clean worktree, as its 12-digit short form; an image the worktree's changes reach records `<commit>-dirty-<content>` instead, computed when it is built. `service.version` stays the commit read when Tilt or bootstrap started. The smoke bring-up refuses a SPACE container that does not run the latest build of its image; under `SKIP_BOOTSTRAP=1` only once Tilt has nothing pending, and it warns instead while Tilt is updating ([Build identity and provenance](#build-identity-and-provenance)) |
 | Release binaries, built without `test-hooks`              | binaries built with `test-hooks` (`docker/Dockerfile.rust-build-kind`), so smokes can shrink timers and flip scenario switches; no chart sets a hook for authentication, and the TokenReview listeners read their namespace from the ServiceAccount mount as release binaries do |
 | Build sizing, concurrency, and multipart sizes are configurable | 20 GiB default build disk, one concurrent build, and smaller multipart parts fit the 40 GiB local btrfs cache |
 
