@@ -183,6 +183,9 @@ impl S3ObjectStore {
                     dest.key,
                     &err,
                 );
+                if let Some(error) = classify_terminal_s3_error(&err, dest.key) {
+                    return error;
+                }
                 ObjectStoreError::Multipart(DisplayErrorContext(&err).to_string())
             })?;
         let upload_id = create
@@ -198,6 +201,7 @@ impl S3ObjectStore {
             let key = dest.key.to_string();
             let upload_id = upload_id.clone();
             let copy_source = copy_source.to_string();
+            let source_label = format!("{}/{}", source.bucket, source.key);
             let range_header = byte_range_header(range);
             let cfg = self.op_config(creds, &dest, S3Operation::UploadPartCopy);
 
@@ -225,6 +229,9 @@ impl S3ObjectStore {
                             error,
                             "multipart copy part failed"
                         );
+                        if let Some(error) = classify_terminal_s3_error(&err, &source_label) {
+                            return error;
+                        }
                         ObjectStoreError::Multipart(error)
                     })?;
 
@@ -257,6 +264,9 @@ impl S3ObjectStore {
                     dest.key,
                     &err,
                 );
+                if let Some(error) = classify_terminal_s3_error(&err, dest.key) {
+                    return error;
+                }
                 ObjectStoreError::Multipart(DisplayErrorContext(&err).to_string())
             })?;
         abort.disarm();

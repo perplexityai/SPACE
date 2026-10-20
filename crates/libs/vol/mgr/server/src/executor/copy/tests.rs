@@ -172,7 +172,10 @@ async fn cancellation_and_invalid_recovered_payloads_cannot_start_a_copy() {
     let (store, executor, mut job) = fixture(Some(vec![1, 2, 3]), false);
     let cancellation = CancellationToken::new();
     cancellation.cancel();
-    assert!(executor.execute(&job, cancellation).await.is_err());
+    assert!(matches!(
+        executor.execute(&job, cancellation).await.unwrap_err(),
+        JobError::Retriable(_)
+    ));
     let mut wire: serde_json::Value = serde_json::from_str(&job.payload).unwrap();
     wire["source_s3_uri"] = "s3://example-artifacts/source?region=us-west-2".into();
     job.payload = serde_json::to_string(&wire).unwrap();
