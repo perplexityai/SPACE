@@ -1041,6 +1041,47 @@ async fn create_queued_operation(
     }
 }
 
+#[tokio::test]
+async fn claim_records_how_long_the_operation_waited_in_the_queue() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = seed_org(&db.pool).await?;
+    let store = PublicOperationStore::new(db.pool.clone());
+    let operation_id = create_queued_operation(
+        &store,
+        OrgId::from_uuid(org_id),
+        ApiProduct::Native,
+        OperationKind::WakeSandbox,
+        "sbx_queue_wait",
+    )
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE public_operations
+         SET requested_at = NOW() - INTERVAL '30 seconds',
+             next_attempt_at = NOW() - INTERVAL '30 seconds'
+         WHERE operation_id = $1"
+    ))
+    .bind(operation_id.as_uuid())
+    .execute(&db.pool)
+    .await?;
+
+    let values = pplx_space_metrics::test_capture::capture_values_guard();
+    tick(&single_claim_config(), &store, &AlwaysSuccessExecutor).await?;
+    let queue_wait = values
+        .finish()
+        .into_iter()
+        .find(|metric| metric.name == "operations.queue_wait_ms")
+        .expect("queue wait is recorded");
+
+    assert_eq!(
+        queue_wait.tags,
+        ["api_product:native", "kind:wake_sandbox", "attempt:first"]
+    );
+    assert!(queue_wait.value >= 30_000.0, "{}", queue_wait.value);
+    Ok(())
+}
+
 async fn backdate_operations(pool: &PgPool, operation_ids: &[OperationId]) -> TestResult {
     let operation_ids = operation_ids
         .iter()

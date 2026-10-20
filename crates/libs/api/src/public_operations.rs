@@ -5,6 +5,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use pplx_space_common_core::types::{IdempotencyKey, SandboxId, SandboxLifecycle};
+use pplx_space_metrics::operations::ClaimAttempt;
 use pplx_space_public_api::{
     OperationId, OperationKind, OperationState, OperationTargetType, PublicErrorCode,
     PublicOperationEvent, PublicOperationEventType, PublicOperationRecord, PublicOperationResult,
@@ -1379,9 +1380,11 @@ async fn claim_operations(
         .collect::<Vec<_>>();
 
     let mut tx = pool.begin().await?;
-    let rows = sqlx::query_as::<_, ClaimedPublicOperationRow>(sql!(
+    let rows = sqlx::query_as::<_, DispatcherClaimRow>(sql!(
         "WITH picked AS (
-             SELECT operation_id
+             SELECT operation_id,
+                    GREATEST(requested_at, next_attempt_at) AS claimable_at,
+                    claim_token <> '' AS reclaimed
              FROM public_operations
              WHERE state IN ($4, $5)
                AND kind = ANY($6)
@@ -1418,7 +1421,10 @@ async fn claim_operations(
                    o.payload_json,
                    o.attempts,
                    o.claim_generation,
-                   o.traceparent"
+                   o.traceparent,
+                   (EXTRACT(EPOCH FROM NOW() - picked.claimable_at) * 1000)::DOUBLE PRECISION
+                       AS queue_wait_ms,
+                   picked.reclaimed"
     ))
     .bind(i64::from(input.limit))
     .bind(duration_secs_i64(input.claim_stale_after))
@@ -1430,8 +1436,11 @@ async fn claim_operations(
     .await?;
 
     let mut operations = Vec::with_capacity(rows.len());
+    let mut queue_waits = Vec::with_capacity(rows.len());
     for row in rows {
-        let operation = ClaimedPublicOperation::try_from(row)?;
+        let operation = ClaimedPublicOperation::try_from(row.operation)?;
+        // A stale reclaim was already running, so its wait is not queue time.
+        queue_waits.push((!row.reclaimed).then_some(row.queue_wait_ms));
         append_operation_event_tx(
             &mut tx,
             operation.id,
@@ -1445,6 +1454,21 @@ async fn claim_operations(
         operations.push(operation);
     }
     tx.commit().await?;
+
+    for (operation, wait_ms) in operations.iter().zip(queue_waits) {
+        let Some(wait_ms) = wait_ms else { continue };
+        let attempt = if operation.attempts > 1 {
+            ClaimAttempt::Retry
+        } else {
+            ClaimAttempt::First
+        };
+        pplx_space_metrics::operations::queue_wait(
+            operation.api_product.as_str(),
+            operation.kind.as_str(),
+            attempt,
+            wait_ms.max(0.0),
+        );
+    }
 
     Ok(PublicOperationClaim {
         claim_token,
@@ -1894,6 +1918,14 @@ struct ClaimedPublicOperationRow {
     attempts: i32,
     claim_generation: i64,
     traceparent: Option<String>,
+}
+
+#[derive(Debug, FromRow)]
+struct DispatcherClaimRow {
+    #[sqlx(flatten)]
+    operation: ClaimedPublicOperationRow,
+    queue_wait_ms: f64,
+    reclaimed: bool,
 }
 
 #[derive(Debug, FromRow)]

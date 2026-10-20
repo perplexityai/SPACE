@@ -1,4 +1,4 @@
-use crate::emit::{counter, tag};
+use crate::emit::{counter, distribution, gauge, tag};
 
 pub fn created(api_product: &str, kind: &str, target_type: &str) {
     counter(
@@ -119,4 +119,42 @@ pub fn stale_claim(api_product: &str, kind: &str) {
         1,
         &[tag("api_product", api_product), tag("kind", kind)],
     );
+}
+
+/// Whether a dispatcher claim is an operation's first attempt or a retry after
+/// a requeue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimAttempt {
+    First,
+    Retry,
+}
+
+impl ClaimAttempt {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::First => "first",
+            Self::Retry => "retry",
+        }
+    }
+}
+
+/// How long a queued operation waited between becoming claimable and being
+/// claimed by the cluster-controller dispatcher.
+pub fn queue_wait(api_product: &str, kind: &str, attempt: ClaimAttempt, wait_ms: f64) {
+    distribution(
+        "operations.queue_wait_ms",
+        wait_ms,
+        &[
+            tag("api_product", api_product),
+            tag("kind", kind),
+            tag("attempt", attempt.as_str()),
+        ],
+    );
+}
+
+/// Executions the cluster-controller dispatcher is running, against its
+/// `execution_concurrency` slot limit.
+pub fn dispatcher_slots(in_flight: usize, capacity: usize) {
+    gauge("operations.dispatcher.in_flight", in_flight as f64, &[]);
+    gauge("operations.dispatcher.capacity", capacity as f64, &[]);
 }

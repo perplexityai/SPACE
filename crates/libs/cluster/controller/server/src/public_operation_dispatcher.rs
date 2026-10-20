@@ -339,6 +339,7 @@ pub async fn run<E>(
     loop {
         tokio::select! {
             _ = interval.tick() => {
+                pplx_space_metrics::operations::dispatcher_slots(in_flight.len(), concurrency);
                 let free = concurrency.saturating_sub(in_flight.len());
                 if free == 0 {
                     continue;
