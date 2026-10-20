@@ -26,5 +26,6 @@ tracing = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 
 [dev-dependencies]
+pplx-space-metrics = { workspace = true, features = ["test-capture"] }
 sqlx = { workspace = true, features = ["macros", "migrate"] }
 tokio = { workspace = true, features = ["test-util"] }

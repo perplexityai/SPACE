@@ -2019,4 +2019,7 @@ mod submit_and_wait_tests;
 mod wait_for_job_tests;
 
 #[cfg(test)]
+mod queue_metrics_tests;
+
+#[cfg(test)]
 mod tests;
