@@ -64,6 +64,9 @@ space-node-api-local:
       - space-api
       - space-node-api
       - space-builder-node-api
+    SPACE_NODE_API_AUTH_PEER_NODE_SERVICE_ACCOUNTS:
+      - space-node-api
+      - space-builder-node-api
     SPACE_NODE_API_AUTH_TEMPLATE_BUILD_SERVICE_ACCOUNTS:
       - space-api
     SPACE_BUILD_AUTH_SYSTEM_SERVICE_ACCOUNTS:

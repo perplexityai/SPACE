@@ -19,6 +19,7 @@ fn test_k8s_config() -> K8sTokenAuthConfig {
         node_api_guest_bridge_usernames: BTreeSet::from([
             "system:serviceaccount:space:space-data-plane".to_string(),
         ]),
+        node_api_peer_node_usernames: BTreeSet::new(),
         node_api_trusted_wait_ready_usernames: BTreeSet::from([
             "system:serviceaccount:space:space-api".to_string(),
         ]),
@@ -282,6 +283,103 @@ fn projected_token() -> String {
         .as_secs()
         + 600;
     jwt_with_exp(exp)
+}
+
+#[tokio::test]
+async fn peer_node_identity_is_confined_to_template_export() {
+    let username = "system:serviceaccount:space:space-node-api";
+    let mut config = test_k8s_config();
+    config
+        .node_api_allowed_usernames
+        .insert(username.to_owned());
+    config
+        .node_api_peer_node_usernames
+        .insert(username.to_owned());
+    config
+        .template_transfer_usernames
+        .insert(username.to_owned());
+    // Listing the account for policy trust or on the internal surface must
+    // not widen what a peer node may call.
+    config
+        .node_api_trusted_policy_usernames
+        .insert(username.to_owned());
+    config
+        .node_api_internal_allowed_usernames
+        .insert(username.to_owned());
+    let (reviewer, calls) =
+        reviewer_returning_status(config, token_review_status("space-node-api", username));
+    let token = projected_token();
+    for (method, allowed) in [
+        ("/space.node.api.v1.WorkerApi/ListSandboxes", false),
+        ("/space.node.api.v1.WorkerApi/NodeExportTemplate", true),
+        ("/space.node.api.v1.WorkerApi/SandboxState", false),
+        ("/space.node.api.v1.WorkerApi/SandboxStats", false),
+        ("/space.node.api.v1.WorkerApi/StopSandbox", false),
+        ("/space.node.api.v1.WorkerApi/DeleteSandbox", false),
+        ("/space.node.api.v1.WorkerApi/PullTemplate", false),
+        ("/space.node.api.v1.WorkerApi/ListNodeTemplates", false),
+        (
+            "/space.node.api.v1.WorkerApi/SetSandboxNetworkPolicy",
+            false,
+        ),
+        ("/space.node.api.v1.NodeInfo/GetNodeInfo", true),
+    ] {
+        let result = reviewer
+            .authenticate(NodeRole::Worker, AuthSurface::Normal, method, &token)
+            .await;
+        if allowed {
+            assert_eq!(
+                result.unwrap().template_transfer_authority(),
+                crate::auth::template_transfer::TemplateTransferAuthority::Granted,
+                "{method}"
+            );
+        } else {
+            assert_eq!(
+                result.unwrap_err().code(),
+                tonic::Code::PermissionDenied,
+                "{method}"
+            );
+        }
+    }
+    // One cached identity; the method decision is made on every call.
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let builder_policy = reviewer
+        .config
+        .policy(NodeRole::Builder, AuthSurface::Normal)
+        .unwrap();
+    for (method, allowed) in [
+        ("/space.node.api.v1.BuilderApi/NodeExportTemplate", true),
+        ("/space.node.api.v1.BuilderApi/SandboxState", false),
+        ("/space.node.api.v1.BuilderApi/BuildTemplate", false),
+        ("/space.node.api.v1.WorkerApi/NodeExportTemplate", false),
+    ] {
+        let result = reviewer.authorize_username(
+            &builder_policy,
+            AuthSurface::Normal,
+            method,
+            username,
+            false,
+        );
+        assert_eq!(result.is_ok(), allowed, "{method}");
+    }
+    let internal_policy = reviewer
+        .config
+        .policy(NodeRole::Worker, AuthSurface::WorkerInternal)
+        .unwrap();
+    assert_eq!(
+        reviewer
+            .authorize_username(
+                &internal_policy,
+                AuthSurface::WorkerInternal,
+                "/space.node.api.v1.WorkerApiInternal/WakeSandbox",
+                username,
+                false,
+            )
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
 }
 
 #[test]

@@ -86,6 +86,12 @@ auth:
     - space-api
     - space-node-api
     - space-builder-node-api
+  # What a peer node-api may call here: NodeExportTemplate for the transfer
+  # above and GetNodeInfo (peer_node_method, auth/k8s.rs). Admission and the
+  # transfer grant still apply.
+  SPACE_NODE_API_AUTH_PEER_NODE_SERVICE_ACCOUNTS:
+    - space-node-api
+    - space-builder-node-api
 
 # Lifetimes of the projected tokens node-api presents, as deployed: its
 # NodeApi token, and on builders its build-manager token, which outlasts a
