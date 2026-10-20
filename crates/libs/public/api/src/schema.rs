@@ -100,7 +100,7 @@ pub(crate) fn page_cursor(generator: &mut SchemaGenerator) -> Schema {
 /// `name`, `name:tag`, or `name@sha256:<hex>`, matching `TemplateReference`.
 ///
 /// The digest bounds come from the parser's own constants rather than literals:
-/// `sha256` is the only algorithm `HashAlg::parse` accepts, and a digest is
+/// A digest names a supported algorithm and is
 /// either a full `digest_hex_len()` hex string or a prefix of at least
 /// `MIN_DIGEST_PREFIX_HEX_LEN`. Hex is lowercase only; the parser rejects
 /// uppercase.
@@ -117,12 +117,14 @@ pub(crate) fn template_reference(generator: &mut SchemaGenerator) -> Schema {
     const MAX_TEMPLATE_REFERENCE_BYTES: usize = 255 + 1 + 128;
     const NAME: &str = "[A-Za-z0-9._-]{1,255}";
     const TAG: &str = "[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}";
-    let algorithm = HashAlg::Sha256;
-    let digest = format!(
-        "{algorithm}:[0-9a-f]{{{min},{max}}}",
-        min = MIN_DIGEST_PREFIX_HEX_LEN,
-        max = algorithm.digest_hex_len(),
-    );
+    let digests = [HashAlg::Sha256, HashAlg::Blake3].map(|algorithm| {
+        format!(
+            "{algorithm}:[0-9a-f]{{{min},{max}}}",
+            min = MIN_DIGEST_PREFIX_HEX_LEN,
+            max = algorithm.digest_hex_len(),
+        )
+    });
+    let digest = format!("({})", digests.join("|"));
     let _ = generator;
     schemars::json_schema!({
         "type": "string",
@@ -136,7 +138,7 @@ pub(crate) fn template_reference(generator: &mut SchemaGenerator) -> Schema {
             "seed:latest",
             "seed@sha256:0000000000000000000000000000000000000000000000000000000000000000"
         ],
-        "description": "Template reference as `name`, `name:tag`, or `name@sha256:<hex>`. A bare name resolves to `:latest`. A digest may be truncated to a unique prefix."
+        "description": "Template reference as `name`, `name:tag`, or `name@<algorithm>:<hex>` (sha256 or blake3). A bare name resolves to `:latest`. A digest may be truncated to a unique prefix."
     })
 }
 
