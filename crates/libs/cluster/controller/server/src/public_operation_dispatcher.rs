@@ -10,7 +10,7 @@ use pplx_space_api::fork_operation_executor::ForkSandboxOperationExecutor;
 use pplx_space_api::public_operation_driver::{
     DEFAULT_CLAIM_STALE_AFTER, DEFAULT_M1_MAX_AGE, DEFAULT_MAX_RETRY_ATTEMPTS, DEFAULT_RETRY_AFTER,
     DEFAULT_RETRY_BACKOFF_BASE, DEFAULT_RETRY_BACKOFF_MAX, OperationExecutionConfig,
-    OperationExecutor, drive_claimed_operation, execution_span,
+    OperationExecutor, claim_renewal_interval, drive_claimed_operation, execution_span,
 };
 pub use pplx_space_api::public_operation_driver::{OperationExecutionResult, TickReport};
 use pplx_space_api::public_operations::{
@@ -120,10 +120,7 @@ impl ReconcilerConfig {
                 1024,
             ),
             // A deployment setting, unlike the test hooks around it: it caps
-            // operations executing at once. An execution that would wait
-            // before retrying hands its slot back instead (see
-            // `pplx_space_api::retry_deferral`), so the cap counts active
-            // work, not waiting.
+            // operations executing at once (see `retry_deferral` for waits).
             execution_concurrency: config.bounded_usize(
                 "SPACE_PUBLIC_OPERATION_DISPATCHER_EXECUTION_CONCURRENCY",
                 DEFAULT_EXECUTION_CONCURRENCY,
@@ -387,34 +384,28 @@ pub async fn run<E>(
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     interval.tick().await;
 
-    // A keyed work queue. Executions run independently of the claim loop:
-    // a slow operation holds one of `execution_concurrency` slots but does
-    // not delay pickup into the remaining slots. The claim query keeps one
-    // operation per sandbox key executing across every replica; `busy_keys`
-    // is this process's view of the same rule, so a claim that would
-    // overlap a still-running local execution of its key (one whose claim
-    // went stale under it) is handed straight back instead of running twice.
+    // Executions run independently of the claim loop: a slow operation holds
+    // one of `execution_concurrency` slots but does not delay pickup into the
+    // others. `busy_keys` is this process's view of the claim's one-per-
+    // sandbox rule: a claim that would overlap a local execution of its key
+    // is handed back, beside the loop, instead of running twice.
     let concurrency = config.execution_concurrency.max(1);
     let execution_config = execution_config(&config);
     let mut in_flight = JoinSet::new();
     let mut busy_keys: HashMap<String, OperationId> = HashMap::new();
     let mut task_keys: HashMap<tokio::task::Id, String> = HashMap::new();
-    // Busy-key hand-backs write to the store, so they run beside the claim
-    // loop rather than inside it.
     let mut hand_backs = JoinSet::new();
-    // Reclaiming an operation that is still executing here means its local
-    // execution lost the claim; it notices at its next renewal, so retrying
-    // sooner than that only churns the claim. Any other collision is an
-    // execution that already finished in the store and is not yet reaped.
-    let stale_reclaim_retry_after = execution_config.claim_stale_after / 3;
+    // Reclaiming an operation still executing here means its execution lost
+    // the claim and notices only at its next renewal; any other collision is
+    // an execution already finished in the store but not yet reaped.
+    let stale_reclaim_retry_after = claim_renewal_interval(execution_config.claim_stale_after);
     let mut last_claim_failure_warn: Option<Instant> = None;
     let mut suppressed_claim_failures: u64 = 0;
 
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                // Reap executions that already finished so their slots and
-                // keys are free before this claim.
+                // Free finished executions' slots and keys before claiming.
                 while let Some(joined) = in_flight.try_join_next_with_id() {
                     finish_execution(joined, &mut busy_keys, &mut task_keys);
                 }
@@ -684,9 +675,8 @@ where
         OperationExecutor::Dispatcher,
         async move {
             let mut result = execution.await;
-            // A requeue after a step handed its wait back is the deferral,
-            // not a fresh failure: it spends no attempt and is bounded by
-            // the operation's age.
+            // A requeue after a step handed its wait back spends no attempt
+            // and is bounded by the operation's age instead.
             if result.state == OperationState::Queued
                 && recorded.as_ref().is_some_and(RetryDeferral::deferred)
             {

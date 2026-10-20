@@ -1342,11 +1342,16 @@ impl KubernetesSubstrate {
                     // `Conflict`, not `RestoreInFlight`, so this lap has no
                     // other sleep or deadline check — pace it inside the
                     // readiness budget and stop when the budget elapses.
-                    // A deferring caller keeps the fast first retries, since
-                    // a fence often clears within moments, then hands the
-                    // longer wait back instead of holding its slot.
-                    let conflicted_since = *conflict_started.get_or_insert_with(Instant::now);
-                    if conflicted_since.elapsed() >= RETRY_DEFERRAL_GRACE
+                    // Under the dispatcher's `crate::retry_deferral` scope
+                    // (never set by HTTP callers), this is the one step that
+                    // changes: it keeps the fast first retries for
+                    // `RETRY_DEFERRAL_GRACE`, then returns `RestoreInFlight`
+                    // and records the deferral instead of holding its slot.
+                    let conflicted_for =
+                        conflict_started.get_or_insert_with(Instant::now).elapsed();
+                    let deferring = crate::retry_deferral::current().is_some();
+                    if deferring
+                        && conflicted_for >= RETRY_DEFERRAL_GRACE
                         && crate::retry_deferral::defer_retry_wait("restore_claim_conflict")
                     {
                         return Err(SubstrateError::restore_in_flight(format!(
@@ -1354,12 +1359,13 @@ impl KubernetesSubstrate {
                              the retry to the caller"
                         )));
                     }
-                    if tokio::time::timeout_at(
-                        join_deadline,
-                        tokio::time::sleep(join_backoff.next_delay()),
-                    )
-                    .await
-                    .is_err()
+                    let mut delay = join_backoff.next_delay();
+                    if deferring {
+                        delay = delay.min(RETRY_DEFERRAL_GRACE.saturating_sub(conflicted_for));
+                    }
+                    if tokio::time::timeout_at(join_deadline, tokio::time::sleep(delay))
+                        .await
+                        .is_err()
                     {
                         return Err(SubstrateError::restore_in_flight(format!(
                             "sandbox {sandbox_id} readiness budget elapsed while its restore \

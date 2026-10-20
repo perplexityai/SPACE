@@ -2,7 +2,6 @@
 //! no attempt, is bounded by the operation's age, and has its own switch.
 
 use super::*;
-use pplx_space_api::public_operation_driver::deferred_retry_backoff;
 use pplx_space_api::retry_deferral::defer_retry_wait;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -124,15 +123,10 @@ async fn a_restore_fenced_for_over_ten_minutes_still_converges() -> TestResult {
         let (state, attempts, delay_secs, _) = operation_row(&db.pool, operation_id).await?;
         assert_eq!(state, "queued");
         assert_eq!(attempts, 0, "a deferred requeue spends no attempt");
-        // Spacing grows with age, from the executor's hint up to the max.
-        let expected_max = (age_secs as f64 / 8.0).clamp(5.0, 60.0);
+        // Paced at the executor's hint, not the counted backoff.
         assert!(
-            delay_secs <= expected_max + 1.0,
-            "age {age_secs}s: delay {delay_secs}s above {expected_max}s"
-        );
-        assert!(
-            delay_secs >= 4.0,
-            "age {age_secs}s: delay {delay_secs}s below the hint"
+            (4.0..=5.5).contains(&delay_secs),
+            "age {age_secs}s: delay {delay_secs}s is not the 5 s hint"
         );
     }
     assert_eq!(executor.deferred_attempts.load(Ordering::SeqCst), 25);
@@ -254,20 +248,53 @@ async fn each_switch_turns_off_only_its_own_mechanism() -> TestResult {
     Ok(())
 }
 
-#[test]
-fn deferred_retry_backoff_grows_with_age_between_the_hint_and_the_max() {
-    let operation_id = OperationId::new();
-    let hint = Duration::from_secs(5);
-    let max = Duration::from_secs(60);
-    assert_eq!(
-        deferred_retry_backoff(operation_id, Duration::ZERO, hint, max),
-        hint
-    );
-    let at_four_minutes = deferred_retry_backoff(operation_id, Duration::from_secs(240), hint, max);
-    assert!((Duration::from_secs(15)..=Duration::from_secs(30)).contains(&at_four_minutes));
-    let at_twenty_minutes =
-        deferred_retry_backoff(operation_id, Duration::from_secs(1200), hint, max);
-    assert!((Duration::from_secs(30)..=max).contains(&at_twenty_minutes));
+#[tokio::test]
+async fn the_run_loop_reads_the_deferral_switch() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    for retry_deferral_enabled in [true, false] {
+        create_queued_operation(
+            &store,
+            org_id,
+            ApiProduct::Native,
+            OperationKind::WakeSandbox,
+            &format!("sbx_run_loop_{retry_deferral_enabled}"),
+        )
+        .await?;
+        let executor = FencedRestoreExecutor::default();
+        let shutdown = CancellationToken::new();
+        let dispatcher = tokio::spawn(run(
+            ReconcilerConfig {
+                retry_deferral_enabled,
+                ..fast_loop_config(1)
+            },
+            store.clone(),
+            executor.clone(),
+            shutdown.clone(),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while executor.deferred_attempts.load(Ordering::SeqCst)
+                + executor.in_slot_attempts.load(Ordering::SeqCst)
+                == 0
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await?;
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), dispatcher).await??;
+        let deferred = executor.deferred_attempts.load(Ordering::SeqCst) > 0;
+        let in_slot = executor.in_slot_attempts.load(Ordering::SeqCst) > 0;
+        assert_eq!(
+            (deferred, in_slot),
+            (retry_deferral_enabled, !retry_deferral_enabled),
+            "deferral={retry_deferral_enabled}"
+        );
+    }
+    Ok(())
 }
 
 #[test]

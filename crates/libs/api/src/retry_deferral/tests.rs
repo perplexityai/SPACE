@@ -2,11 +2,11 @@ use super::*;
 
 #[tokio::test]
 async fn deferral_is_scoped_to_the_wrapped_future() {
-    assert!(!retry_waits_deferred());
+    assert!(current().is_none());
     let deferral = RetryDeferral::new();
-    assert!(scope(Some(deferral.clone()), async { retry_waits_deferred() }).await);
-    assert!(!retry_waits_deferred());
-    assert!(!scope(None, async { retry_waits_deferred() }).await);
+    assert!(scope(Some(deferral.clone()), async { current().is_some() }).await);
+    assert!(current().is_none());
+    assert!(!scope(None, async { current().is_some() }).await);
     assert!(!deferral.deferred());
 }
 

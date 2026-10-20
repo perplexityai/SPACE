@@ -178,7 +178,7 @@ where
     let attempts = operation.attempts;
     let executor_label = executor.as_str();
     pplx_space_metrics::operations::claimed_by(api_product_label, kind.as_str(), executor_label);
-    let renew_every = (config.claim_stale_after / 3).max(Duration::from_millis(10));
+    let renew_every = claim_renewal_interval(config.claim_stale_after);
     let mut renewal = tokio::time::interval(renew_every);
     renewal.set_missed_tick_behavior(MissedTickBehavior::Delay);
     renewal.tick().await;
@@ -307,12 +307,14 @@ where
             } else {
                 None
             };
-            let remaining = if let Some(deadline) = deadline {
-                store.remaining_deadline(operation_id, deadline).await?
+            let deadline_exceeded = if let Some(deadline) = deadline {
+                store
+                    .remaining_deadline(operation_id, deadline)
+                    .await?
+                    .is_some_and(|remaining| remaining.is_zero())
             } else {
-                None
+                false
             };
-            let deadline_exceeded = remaining.is_some_and(|remaining| remaining.is_zero());
             if deadline_exceeded {
                 let max_age_seconds = deadline
                     .expect("deadline is configured when it is exceeded")
@@ -428,26 +430,9 @@ where
                 // A transient failure backs off per operation, so one
                 // repeatedly failing sandbox is retried ever more rarely
                 // instead of at its executor's fixed hint; budget-preserving
-                // requeues keep the executor's pacing.
-                let retry_after = if retry_deferred {
-                    let age = deadline
-                        .zip(remaining)
-                        .map_or(Duration::ZERO, |(deadline, remaining)| {
-                            deadline.saturating_sub(remaining)
-                        });
-                    let backoff = deferred_retry_backoff(
-                        operation_id,
-                        age,
-                        retry_hint,
-                        config.retry_backoff_max,
-                    );
-                    pplx_space_metrics::operations::retry_backoff(
-                        api_product_label,
-                        kind.as_str(),
-                        backoff.as_secs_f64(),
-                    );
-                    backoff
-                } else if preserve_retry_budget {
+                // requeues, deferred retries included, keep the executor's
+                // pacing.
+                let retry_after = if preserve_retry_budget {
                     retry_hint
                 } else {
                     let backoff = counted_retry_backoff(
@@ -504,6 +489,12 @@ where
     Ok(report)
 }
 
+/// How often a running execution renews its claim: a third of
+/// `claim_stale_after`, so two renewals can be lost before it goes stale.
+pub fn claim_renewal_interval(claim_stale_after: Duration) -> Duration {
+    (claim_stale_after / 3).max(Duration::from_millis(10))
+}
+
 /// The delay before the next attempt after counted attempt `attempts`
 /// failed: an equal-jitter exponential backoff whose ceiling starts at
 /// `base` and doubles to `max`, floored at the executor's `hint`. The jitter
@@ -526,31 +517,12 @@ pub fn counted_retry_backoff(
     jittered.max(hint)
 }
 
-/// The delay before re-driving an operation whose execution deferred its
-/// retry wait. Deferred retries spend no attempts, so the spacing grows with
-/// the operation's age instead: an eighth of the time it has waited, capped
-/// at `max` and equal-jittered, and never sooner than the executor's `hint`.
-/// A fence that clears quickly is retried within seconds; one that lasts many
-/// minutes is retried about once per `max`.
-pub fn deferred_retry_backoff(
-    operation_id: OperationId,
-    age: Duration,
-    hint: Duration,
-    max: Duration,
-) -> Duration {
-    let ceiling = (age / 8).min(max.max(hint));
-    let half = ceiling / 2;
-    let seed = i64::try_from(age.as_secs()).unwrap_or(i64::MAX);
-    let jittered = half + half.mul_f64(retry_jitter_fraction(operation_id, seed));
-    jittered.max(hint)
-}
-
-fn retry_jitter_fraction(operation_id: OperationId, seed: impl std::hash::Hash) -> f64 {
+fn retry_jitter_fraction(operation_id: OperationId, attempts: i32) -> f64 {
     use std::hash::{DefaultHasher, Hash, Hasher};
 
     let mut hasher = DefaultHasher::new();
     operation_id.to_string().hash(&mut hasher);
-    seed.hash(&mut hasher);
+    attempts.hash(&mut hasher);
     // The top 53 bits fill an f64 mantissa exactly: a fraction in [0, 1).
     (hasher.finish() >> 11) as f64 / (1_u64 << 53) as f64
 }

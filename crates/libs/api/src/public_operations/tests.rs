@@ -806,11 +806,21 @@ async fn release_claimed_operation_requeues_with_backoff() -> TestResult {
                 claim_token: claim.claim_token,
                 operation_id,
                 progress_message: "retry later".to_string(),
-                retry_after: Duration::from_secs(300),
+                // Sub-second precision is kept, so jitter is not rounded off.
+                retry_after: Duration::from_millis(300_500),
                 count_attempt: true,
             })
             .await?
     );
+    let delay_secs: f64 = sqlx::query_scalar(sql!(
+        "SELECT EXTRACT(EPOCH FROM next_attempt_at - updated_at)::DOUBLE PRECISION
+         FROM public_operations
+         WHERE operation_id = $1"
+    ))
+    .bind(operation_id.as_uuid())
+    .fetch_one(&db.pool)
+    .await?;
+    assert!((delay_secs - 300.5).abs() < 0.001, "{delay_secs}");
 
     let operation = store
         .fetch_operation(OrgId::from_uuid(org_id), operation_id)

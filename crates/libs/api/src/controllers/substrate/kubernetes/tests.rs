@@ -5326,11 +5326,14 @@ mod kubernetes_tests {
 
         // Assert: the caller kept retrying in place through the grace, then
         // handed the wait back and recorded that it did.
+        let grace = crate::controllers::substrate::kubernetes::execution::RETRY_DEFERRAL_GRACE;
         assert!(
-            elapsed >= crate::controllers::substrate::kubernetes::execution::RETRY_DEFERRAL_GRACE,
+            elapsed >= grace,
             "the grace keeps fast retries in place: {elapsed:?}"
         );
-        assert!(elapsed < Duration::from_secs(6), "{elapsed:?}");
+        // The last in-place sleep is cut to the grace instead of doubling
+        // past it (it would otherwise leave at ~3.1 s).
+        assert!(elapsed < grace + Duration::from_secs(1), "{elapsed:?}");
         assert!(deferral.deferred());
         let redrives: u64 = counters
             .iter()

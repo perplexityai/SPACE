@@ -1,28 +1,21 @@
-//! Lets a queued-work caller take back the waits a failing step would
-//! otherwise sleep through.
+//! Lets the public-operation dispatcher take back retry waits that would
+//! otherwise hold one of its shared execution slots.
 //!
-//! A wake whose restore claim stays fenced by a stale owner paces its own
-//! retries inside the caller's readiness budget. For an HTTP caller that
-//! wait is the request. For the public-operation dispatcher it holds one of
-//! a few shared execution slots while doing nothing, so the dispatcher runs
-//! executions inside [`scope`] with a [`RetryDeferral`]: after a short grace,
-//! a step that would keep sleeping before retrying instead returns its
-//! retryable error, records the deferral, and the dispatcher hands the slot
-//! back and requeues the operation. Waits on work another caller is actively
-//! doing (joining a live restore lease or a running coalesced wake) are not
-//! retries and are unchanged.
-//!
-//! The deferral is carried in a task-local, like [`crate::wake_trace`], so
-//! the HTTP paths that share the substrate code take no extra argument.
-//! Work handed to a detached task re-enters it with [`current`] and
-//! [`scope`].
+//! Dispatcher executions run inside [`scope`] with a [`RetryDeferral`]. A
+//! step that would keep sleeping before retrying (today only the fenced
+//! restore-claim lap in the Kubernetes wake path) calls [`defer_retry_wait`]
+//! instead, returns its retryable error, and the dispatcher requeues the
+//! operation without spending an attempt. HTTP callers never set a scope and
+//! keep their in-budget waits. It is a task-local, like
+//! [`crate::wake_trace`], because the decision is made above the `Substrate`
+//! trait that every HTTP path shares; detached work re-enters it with
+//! [`current`] and [`scope`].
 
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// One execution's request to take back retry waits, and whether any step
-/// did.
+/// One execution's request to take back retry waits, and whether a step did.
 #[derive(Clone, Debug, Default)]
 pub struct RetryDeferral {
     deferred: Arc<AtomicBool>,
@@ -54,11 +47,6 @@ pub fn scope<T>(
     future: impl Future<Output = T>,
 ) -> impl Future<Output = T> {
     CURRENT.scope(deferral, future)
-}
-
-/// Whether the current task's caller asked to take retry waits back.
-pub fn retry_waits_deferred() -> bool {
-    current().is_some()
 }
 
 /// Called by a step that returns instead of waiting: records the deferral

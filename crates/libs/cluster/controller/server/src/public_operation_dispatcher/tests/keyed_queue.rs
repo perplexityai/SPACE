@@ -709,3 +709,69 @@ async fn a_delete_requested_after_a_create_never_runs_first() -> TestResult {
     assert_eq!(order, vec![create, delete]);
     Ok(())
 }
+
+#[tokio::test]
+async fn a_reclaim_of_a_locally_running_operation_waits_for_its_next_renewal() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db_with_max_connections(8).await?
+    else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let operation_id = create_op(
+        &store,
+        org_id,
+        OperationKind::DeleteSandbox,
+        "sbx_reclaimed",
+    )
+    .await?;
+    let executor = BlockingExecutor::default();
+    let config = fast_loop_config(2);
+    let shutdown = CancellationToken::new();
+    let dispatcher = tokio::spawn(run(
+        config.clone(),
+        store.clone(),
+        executor.clone(),
+        shutdown.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), executor.started.notified()).await?;
+
+    // The claim goes stale under the still-running execution, so the next
+    // tick reclaims it and finds its key busy here.
+    sqlx::query(sql!(
+        "UPDATE public_operations SET claimed_at = NOW() - INTERVAL '1 hour'
+         WHERE operation_id = $1"
+    ))
+    .bind(operation_id.as_uuid())
+    .execute(&db.pool)
+    .await?;
+    let delay_secs: f64 = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let delay: Option<f64> = sqlx::query_scalar(sql!(
+                "SELECT EXTRACT(EPOCH FROM next_attempt_at - updated_at)::DOUBLE PRECISION
+                 FROM public_operations
+                 WHERE operation_id = $1 AND state = 'queued' AND claim_token = ''"
+            ))
+            .bind(operation_id.as_uuid())
+            .fetch_optional(&db.pool)
+            .await?;
+            if let Some(delay) = delay {
+                return Ok::<f64, sqlx::Error>(delay);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    executor.release.notify_one();
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), dispatcher).await??;
+
+    // Handed back until the running execution's next renewal notices it
+    // lost the claim, not re-claimed every second until then.
+    let renewal = config.claim_stale_after / 3;
+    assert!(
+        (delay_secs - renewal.as_secs_f64()).abs() < 0.5,
+        "handed back for {delay_secs}s, renewal is {renewal:?}"
+    );
+    Ok(())
+}

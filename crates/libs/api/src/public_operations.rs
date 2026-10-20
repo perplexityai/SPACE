@@ -1474,18 +1474,14 @@ async fn claim_operations(
     let mut tx = pool.begin().await?;
     let keyed = mode == ClaimMode::Keyed;
     if keyed {
-        // The key rule reads other rows' claim state as of this statement's
-        // snapshot. Two overlapping claimers could each see the other's
-        // pick as still queued: for example, one takes a sandbox's delete
-        // past a wake in backoff while the other, on an older snapshot, takes
-        // that wake as it comes due, and both run at once. The dispatcher
-        // runs behind leader election, so this only matters around a leader
-        // handover, but one claimer at a time makes every claim see the
-        // previous claim's commit. A busy lock means another replica is
-        // mid-claim, so this tick claims nothing rather than waiting. The
-        // same round trip turns off JIT for the claim: the planner's estimate
-        // for the key probe overshoots enough to trigger JIT compilation,
-        // which costs more than the query itself.
+        // The key rule reads other rows' claim state from this statement's
+        // snapshot, so overlapping claimers could both run one sandbox: one
+        // takes a delete past a wake in backoff while the other, on an older
+        // snapshot, takes that wake as it comes due. The dispatcher runs
+        // behind leader election, so this only matters around a handover; a
+        // busy lock makes this tick claim nothing rather than wait. The same
+        // round trip turns off JIT, which the key probe's cost estimate would
+        // trigger and which costs more than the query.
         let (claim_lock_held, _jit) = sqlx::query_as::<_, (bool, String)>(sql!(
             "SELECT pg_try_advisory_xact_lock($1), set_config('jit', 'off', true)"
         ))
@@ -1501,22 +1497,16 @@ async fn claim_operations(
         }
     }
     // Across keys, claim in order of when each operation became claimable,
-    // so a requeued retry waits behind work that was queued before its
-    // backoff expired.
-    //
-    // With `$11` (keyed) set, operations on one sandbox run one at a time in
-    // request order, and operations on different sandboxes never wait on
-    // each other. A candidate is held back while another claimable
-    // operation on its key is running under a live claim, or was requested
-    // earlier and is still queued or stale. A delete is held back only by an
-    // earlier create or by an earlier operation due now, so a delete is not
-    // stuck behind a wake that is waiting out its retry backoff. Forks name
-    // their source by a different id form and keep their own source
-    // lifecycle lock, so they stay outside the key. The key probe costs an
-    // index lookup, so `contended` first finds the few keys with more than
-    // one active operation; a candidate alone on its key cannot be held
-    // back and skips the probe. With `$11` unset this is the unkeyed claim
-    // the kill switch restores, and `contended` is never read.
+    // so a requeued retry waits behind work queued before its backoff
+    // expired. With `$11` (keyed) set, a candidate is held back while another
+    // claimable operation on its sandbox runs under a live claim, or was
+    // requested earlier and is still queued or stale. A delete is held back
+    // only by those that are live, an earlier create, or due now, so it is
+    // not stuck behind a wake in retry backoff. Forks name their source by a
+    // different id form and keep their own lifecycle lock, so they stay
+    // outside the key. `contended` limits the key probe to sandboxes with
+    // more than one active operation. With `$11` unset (the kill switch) the
+    // key rule and `contended` are skipped.
     let rows = sqlx::query_as::<_, DispatcherClaimRow>(sql!(
         "WITH contended AS MATERIALIZED (
              SELECT org_id, target_id
