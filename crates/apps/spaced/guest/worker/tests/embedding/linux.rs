@@ -1,12 +1,15 @@
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use pplx_space_common_core::types::GuestUserName;
 use pplx_space_spaced_guest_execution::{
     ExecutionService, ExecutionServiceConfig, WorkerExecutable,
 };
 use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
-    StatRequest, WriteBatchEntry, WriteBatchRequest, filesystem_client::FilesystemClient,
+    StartRequest, StatRequest, WriteBatchEntry, WriteBatchRequest,
+    filesystem_client::FilesystemClient, process_event::Event, process_exit::Outcome,
+    process_server::Process,
 };
 use tokio_util::sync::CancellationToken;
 use tonic::transport::{Channel, Server};
@@ -142,7 +145,6 @@ pub(super) async fn run() {
         .await
         .expect("second identity");
     assert_eq!(children().len(), 2, "separate worker per identity");
-    // The executable pin is CLOEXEC; only the worker channel is deliberately inherited.
     for pid in children() {
         assert_eq!(
             std::fs::read_to_string(format!("/proc/{pid}/comm"))
@@ -157,6 +159,7 @@ pub(super) async fn run() {
             command_line.split(|byte| *byte == 0).next(),
             Some(b"spaced-fsworker".as_slice())
         );
+        // The executable pin is CLOEXEC; only the worker channel is deliberately inherited.
         for entry in std::fs::read_dir(format!("/proc/{pid}/fd")).expect("worker descriptors") {
             let target =
                 std::fs::read_link(entry.expect("descriptor").path()).expect("descriptor target");
@@ -167,10 +170,6 @@ pub(super) async fn run() {
         }
     }
     // Native process calls and filesystem workers share the selected account.
-    use futures_util::StreamExt;
-    use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
-        StartRequest, process_event::Event, process_exit::Outcome, process_server::Process,
-    };
     let mut events = Process::start(
         &service,
         tonic::Request::new(StartRequest {
@@ -209,13 +208,14 @@ pub(super) async fn run() {
     // Valid executable shape, wrong worker protocol: fail startup and reap.
     let (service, mut client, shutdown, server) =
         host(WorkerExecutable::open("/bin/true").expect("wrong artifact")).await;
-    client
+    let error = client
         .stat_info(StatRequest {
             path: "/".into(),
             user: None,
         })
         .await
         .expect_err("non-worker must fail startup");
+    assert_eq!(error.code(), tonic::Code::Unavailable);
     drop(client);
     stop(service, shutdown, server).await;
 
@@ -247,7 +247,8 @@ pub(super) async fn run() {
     });
     tokio::time::timeout(Duration::from_secs(3), async {
         while children().is_empty() {
-            tokio::task::yield_now().await;
+            // Poll an external process event without busy-reading procfs.
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
