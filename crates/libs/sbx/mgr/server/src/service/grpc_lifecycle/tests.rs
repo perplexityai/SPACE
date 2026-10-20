@@ -1259,7 +1259,7 @@ async fn permanently_refused_teardown_backup_marks_the_suspending_row_terminal()
         if let pplx_space_common_jobs::JobFailure::Permanent { reason } = failure {
             let earlier = JobId::new();
             pplx_space_common_jobs::db::insert_job(
-                &conn,
+                conn.raw(),
                 pplx_space_common_jobs::db::InsertJob {
                     job_id: &earlier,
                     kind: crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
@@ -1273,7 +1273,7 @@ async fn permanently_refused_teardown_backup_marks_the_suspending_row_terminal()
             )
             .unwrap();
             pplx_space_common_jobs::db::fail_job_permanent(
-                &conn,
+                conn.raw(),
                 &earlier,
                 "cluster-api rejected BeginArtifactBackup (NotFound): sandbox not found",
                 reason,

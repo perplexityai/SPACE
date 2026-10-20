@@ -671,7 +671,7 @@ async fn suspended_after_node_local_upload(
 
 fn uploads(service: &SandboxManagerService, sandbox_id: &str) -> Vec<pplx_space_common_jobs::Job> {
     let db = service.db.lock().unwrap();
-    pplx_space_common_jobs::db::list_jobs(&db, Some(sandbox_id), None, 0)
+    pplx_space_common_jobs::db::list_jobs(db.raw(), Some(sandbox_id), None, 0)
         .unwrap()
         .into_iter()
         .filter(|job| job.kind == crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND)

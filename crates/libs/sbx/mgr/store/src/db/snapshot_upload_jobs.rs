@@ -42,6 +42,17 @@ pub fn replace_active_job_payload(
     )
 }
 
+/// Set a pending or running snapshot-upload job's recorded failure scope,
+/// and only that field of its payload: a handoff can persist transfer IDs
+/// into the same payload while the attempt runs. The number of rows changed.
+pub fn set_upload_failure_scope(conn: &Connection, job_id: &JobId, scope: &str) -> Result<usize> {
+    conn.execute(
+        "UPDATE jobs SET payload = json_set(payload, '$.failure_scope', ?1)
+         WHERE job_id = ?2 AND kind = ?3 AND status IN ('pending', 'running')",
+        params![scope, job_id, SNAPSHOT_UPLOAD_JOB_KIND],
+    )
+}
+
 /// The highest job rowid, `None` for an empty table.
 pub fn max_job_rowid(conn: &Connection) -> Result<Option<i64>> {
     conn.query_row("SELECT MAX(rowid) FROM jobs", [], |r| r.get(0))

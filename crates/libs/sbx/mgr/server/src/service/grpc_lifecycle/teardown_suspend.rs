@@ -1376,18 +1376,13 @@ impl SandboxManagerService {
         let scope = job
             .payload_as::<RecordedScope>()
             .map_or_else(|_| Default::default(), |recorded| recorded.failure_scope);
-        let permanently_failed = {
-            let db = self.db_conn()?;
-            pplx_space_common_jobs::db::count_failed_jobs_by_dedup_key(
-                &db,
-                crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
-                &crate::snapshot_upload_jobs::artifact_backup_dedup_key(
-                    backup.artifact.local_artifact_id,
-                ),
-                pplx_space_common_jobs::JobFailureKind::Permanent,
-            )
-            .map_err(|error| Status::internal(format!("failed upload count: {error}")))?
-        };
+        let permanently_failed = self.snapshot_upload_worker.count_failed_jobs_by_dedup_key(
+            crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
+            &crate::snapshot_upload_jobs::artifact_backup_dedup_key(
+                backup.artifact.local_artifact_id,
+            ),
+            pplx_space_common_jobs::JobFailureKind::Permanent,
+        )?;
         Ok(teardown_keyed_upload_use(
             status,
             job.failure,

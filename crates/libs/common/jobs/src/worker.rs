@@ -1114,6 +1114,19 @@ impl<E: JobExecutor> BackgroundWorker<E> {
             .map_err(|e| Status::internal(format!("db error: {e}")))
     }
 
+    /// How many jobs with `kind` and `dedup_key` have failed with
+    /// `failure_kind`; see [`db::count_failed_jobs_by_dedup_key`].
+    pub fn count_failed_jobs_by_dedup_key(
+        &self,
+        kind: &str,
+        dedup_key: &str,
+        failure_kind: crate::JobFailureKind,
+    ) -> Result<u64, Status> {
+        let conn = self.lock_db_for_status()?;
+        db::count_failed_jobs_by_dedup_key(&conn, kind, dedup_key, failure_kind)
+            .map_err(|e| Status::internal(format!("db error: {e}")))
+    }
+
     /// List jobs, optionally filtered by subject and/or status.
     pub fn list_jobs(
         &self,

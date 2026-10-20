@@ -642,19 +642,13 @@ fn registration_refusal_is_final(
 }
 
 /// Record on a failing upload's payload what its failure failed, for a later
-/// caller that has to decide whether a new attempt can succeed. Sets only the
-/// field: a handoff can persist transfer IDs into the same payload while the
-/// attempt runs.
+/// caller that has to decide whether a new attempt can succeed.
 pub(crate) fn record_failure_scope(
-    conn: &rusqlite::Connection,
+    conn: &crate::db::Connection,
     job_id: &JobId,
     scope: crate::snapshot_upload::UploadFailureScope,
-) -> rusqlite::Result<usize> {
-    conn.execute(
-        "UPDATE jobs SET payload = json_set(payload, '$.failure_scope', ?1)
-         WHERE job_id = ?2 AND kind = ?3 AND status IN ('pending', 'running')",
-        rusqlite::params![scope.as_str(), job_id, SNAPSHOT_UPLOAD_JOB_KIND],
-    )
+) -> crate::db::Result<usize> {
+    crate::db::snapshot_upload_jobs::set_upload_failure_scope(conn, job_id, scope.as_str())
 }
 
 /// What the re-sent registration says about the upload's execution.
