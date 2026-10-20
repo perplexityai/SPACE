@@ -1,6 +1,14 @@
 //! Process and filesystem state shared by the guest daemon adapters.
 use super::*;
 
+/// Configuration for process execution and the filesystem backend.
+///
+/// # Defaults
+///
+/// Linux defaults to identity workers without selecting an executable. Callers
+/// must set [`Self::worker_executable`] before constructing the service; the
+/// default alone returns [`CreateExecutionServiceError::MissingWorkerExecutable`].
+/// Other platforms default to Direct filesystem execution.
 #[derive(Clone, Debug)]
 pub struct ExecutionServiceConfig {
     pub default_operation_user: GuestUserName,
@@ -58,6 +66,13 @@ pub(super) struct ExecutionServiceInner {
 }
 
 impl ExecutionService {
+    /// Construct a service with the caller's filesystem execution configuration.
+    ///
+    /// # Errors
+    ///
+    /// Identity workers require an explicit executable on Linux. Selecting them
+    /// on another platform returns an unsupported-mode error. No worker is
+    /// launched during construction; protocol and account checks occur at worker startup.
     pub fn with_config(
         shutdown: CancellationToken,
         config: ExecutionServiceConfig,
@@ -65,6 +80,11 @@ impl ExecutionService {
         Self::with_cgroups(shutdown, config, None)
     }
 
+    /// Construct a service with optional caller-provided workload placement.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same configuration errors as [`Self::with_config`].
     pub fn with_cgroups(
         shutdown: CancellationToken,
         config: ExecutionServiceConfig,
