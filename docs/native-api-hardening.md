@@ -27,7 +27,7 @@ separate hardening workflow is needed. Existing duration-balanced sharding
 also includes them.
 
 Kind CI runs this inventory on main and on pull requests whose paths select
-the Kind smoke in Pull CI. This does not introduce Kind execution on every PR.
+the Kind smoke in Pull CI. This does not run Kind on every PR.
 Private compositions invoke platform commands through their platform-command
 wrapper.
 
