@@ -4,8 +4,9 @@ use super::*;
 use pplx_space_common_core::host::linux::paths;
 use pplx_space_common_core::host::linux::paths::{FIRECRACKER_LOG_FILE, FIRECRACKER_METRICS_FIFO};
 use pplx_space_common_core::sandbox_storage::{validate_rootfs_bytes, validate_rootfs_mib};
+use pplx_space_node_runtime_core::proto::{ArtifactIntegrityRequirement, VerifiedRuntimeLaunch};
 use pplx_space_node_runtime_core::runtime_inventory::{
-    ExecutionSelectionMode, RuntimeFileRole, boot_component_role,
+    ExecutionSelectionMode, ExecutionSourceIntegrity, RuntimeFileRole, boot_component_role,
 };
 
 struct PreparationOwnership {
@@ -15,6 +16,32 @@ struct PreparationOwnership {
 }
 
 impl NodeManagerService {
+    async fn launch_admitted_runtime(
+        &self,
+        sandbox_id: &str,
+        request: pplx_space_node_runtime_core::proto::LaunchFirecrackerRequest,
+    ) -> Result<pplx_space_node_runtime_core::proto::LaunchFirecrackerResponse, Status> {
+        let expected_environment = request
+            .verified_runtime
+            .as_ref()
+            .map(|verified| verified.environment_reference.clone());
+        let launched = self
+            .runtime_supervisor
+            .launch_firecracker(request)
+            .await
+            .map_err(pplx_space_node_runtime_core::launch_admission::supervisor_launch_status)?
+            .into_inner();
+        if expected_environment
+            .is_some_and(|reference| launched.accepted_environment_reference != reference)
+        {
+            kill_launched_process_after_pid_persist_failure(self, sandbox_id, launched.pid).await;
+            return Err(Status::failed_precondition(
+                "supervisor did not acknowledge the verified execution environment",
+            ));
+        }
+        Ok(launched)
+    }
+
     async fn acquire_preparation_ownership(
         &self,
         sandbox_id: &str,
@@ -307,12 +334,12 @@ impl NodeManagerService {
         let sandbox_uid =
             validate_sandbox_uid_gid(sandbox_id, req.uid, req.gid, lease.sandbox_uid)?;
         let ns_path = lease.ns_path();
-        let kernel_src = if req.snapshot_restore {
+        let boot_kernel = if req.snapshot_restore {
             None
         } else {
             Some(
                 resolved_execution
-                    .component_path(
+                    .component(
                         pplx_space_common_core::types::ArtifactComponentKind::Kernel,
                         Some(&boot_component_role()),
                     )
@@ -320,9 +347,7 @@ impl NodeManagerService {
                         Status::failed_precondition(
                             "resolved Firecracker runtime is missing boot kernel",
                         )
-                    })?
-                    .display()
-                    .to_string(),
+                    })?,
             )
         };
 
@@ -360,44 +385,30 @@ impl NodeManagerService {
                 resolved_execution: Some((&resolved_execution.execution).into()),
             }));
         }
-        // Unmount any stale bind mounts (rootfs + memory) before removing.
-        // Use the umount2(MNT_DETACH) helper instead of shelling out — it
-        // silently returns Ok(false) when the path is missing or not a
-        // mount point (the common case on a fresh launch), avoiding the
-        // noisy `umount: ... no mount point specified` log lines that
-        // umount(8) writes to stderr.
-        let stale_rootfs = format!("{jail_root}/rootfs.ext4");
-        let stale_memory = format!("{jail_root}/memory");
-        let stale_mounts = vec![stale_rootfs, stale_memory];
-        let stale_unmount_sandbox_id = sandbox_id.to_string();
+        let verified_environment = protected_launch_environment(
+            resolved_execution.runtime_files.integrity(),
+            resolved_execution.environment,
+            requested_runtime
+                .as_ref()
+                .and_then(|execution| execution.environment()),
+            req.snapshot_restore,
+            resolved_execution
+                .components
+                .iter()
+                .map(|component| component.integrity),
+        )?;
         self.adopt_validated_lease(sandbox_id, &lease)?;
-        if let Err(error) = spawn_lifecycle_blocking(&_lifecycle_permit, move || {
-            for path in &stale_mounts {
-                match unmount_if_present(path) {
-                    Ok(_) => {}
-                    Err(error) => {
-                        tracing::warn!(
-                            sandbox_id = %stale_unmount_sandbox_id,
-                            path,
-                            %error,
-                            "stale bind mount unmount failed"
-                        );
-                    }
-                }
-            }
+        let stale_root = jail_root.clone();
+        spawn_lifecycle_blocking(&_lifecycle_permit, move || {
+            cleanup_jail_root(
+                &stale_root,
+                |path| unmount_if_present(path),
+                || Ok(Vec::new()),
+            )
         })
         .await
-        {
-            tracing::warn!(sandbox_id, %error, "stale bind mount cleanup task failed");
-        }
-        let jail_root_for_remove = jail_root.clone();
-        if let Err(error) = spawn_lifecycle_blocking(&_lifecycle_permit, move || {
-            std::fs::remove_dir_all(&jail_root_for_remove)
-        })
-        .await
-        {
-            tracing::warn!(sandbox_id, %error, "stale jail root cleanup task failed");
-        }
+        .map_err(|error| Status::internal(format!("stale jail cleanup task failed: {error}")))?
+        .map_err(Status::from)?;
         let jail_root_for_create = jail_root.clone();
         spawn_lifecycle_blocking(&_lifecycle_permit, move || {
             std::fs::create_dir_all(&jail_root_for_create)
@@ -456,21 +467,7 @@ impl NodeManagerService {
             .map_err(|e| Status::internal(format!("cannot copy config into jail: {e}")))?;
         }
 
-        // A kernel link left by an earlier launch must not survive into the
-        // chown below, which would hand the shared cache inode to this sandbox.
-        // The stale-root removal above only warns when it fails, so drop the
-        // link explicitly and refuse the launch if that fails too.
         let kernel_dst = format!("{jail_root}/vmlinux.bin");
-        let stale_kernel = kernel_dst.clone();
-        spawn_lifecycle_blocking(&_lifecycle_permit, move || {
-            match std::fs::remove_file(&stale_kernel) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                result => result,
-            }
-        })
-        .await
-        .map_err(|e| Status::internal(format!("remove stale jail kernel task failed: {e}")))?
-        .map_err(|e| Status::internal(format!("cannot remove stale jail kernel: {e}")))?;
 
         // Chown jail root to sandbox UID (--no-dereference to avoid symlink
         // attacks). A partial chown leaves root-owned files in the jail, so
@@ -491,9 +488,37 @@ impl NodeManagerService {
         // shares the cache kernel's inode with every other jail, so chowning
         // it would let this sandbox's Firecracker rewrite the kernel later
         // cold boots load. The root-owned 0644 image is readable as it is.
-        if let Some(kernel_src) = kernel_src {
+        if let Some(kernel) = boot_kernel {
+            let kernel_src = kernel.path.clone();
+            let sealed_kernel = if kernel.integrity == ExecutionSourceIntegrity::FsVerity {
+                Some(
+                    kernel
+                        .metadata
+                        .digest
+                        .map(pplx_space_node_runtime_core::catalog::compiled_verity_digest)
+                        .transpose()
+                        .map_err(|error| Status::failed_precondition(error.to_string()))?
+                        .flatten()
+                        .ok_or_else(|| {
+                            Status::failed_precondition(
+                                "sealed boot kernel has no trusted measurement",
+                            )
+                        })?,
+                )
+            } else {
+                None
+            };
             spawn_lifecycle_blocking(&_lifecycle_permit, move || {
-                std::fs::hard_link(&kernel_src, &kernel_dst)
+                if let Some(expected) = sealed_kernel {
+                    let file = pplx_space_node_runtime_core::verity::SealedFile::open(
+                        &kernel_src,
+                        expected,
+                    )
+                    .map_err(std::io::Error::other)?;
+                    file.link_to(std::path::Path::new(&kernel_dst))
+                } else {
+                    std::fs::hard_link(&kernel_src, &kernel_dst)
+                }
             })
             .await
             .map_err(|e| Status::internal(format!("link kernel task failed: {e}")))?
@@ -533,17 +558,29 @@ impl NodeManagerService {
         } else {
             String::new()
         };
-        let fc_pid = self
-            .runtime_supervisor
-            .launch_firecracker(
+        let verified_runtime = verified_environment.map(|reference| VerifiedRuntimeLaunch {
+            sandbox_id: sandbox_id.to_string(),
+            environment_reference: reference.to_string(),
+            integrity_requirement: ArtifactIntegrityRequirement::AuthenticatedImmutableSources
+                .into(),
+        });
+        let protected_launch = verified_runtime.is_some();
+        let launched = self
+            .launch_admitted_runtime(
+                sandbox_id,
                 pplx_space_node_runtime_core::proto::LaunchFirecrackerRequest {
                     execution_id: req
                         .execution_fence
                         .as_ref()
                         .map_or_else(String::new, |fence| fence.execution_id.clone()),
-                    sandbox_id: sandbox_id.to_string(),
+                    sandbox_id: if protected_launch {
+                        String::new()
+                    } else {
+                        sandbox_id.to_string()
+                    },
                     jailer_bin,
                     firecracker_bin,
+                    verified_runtime,
                     chroot_base_dir: chroot_base.clone(),
                     ns_path: ns_path.clone(),
                     uid: sandbox_uid,
@@ -555,12 +592,8 @@ impl NodeManagerService {
                     cgroup_limits: Some(self.launch_cgroup_limits(req)),
                 },
             )
-            .await
-            .map_err(|error| {
-                Status::internal(format!("runtime-supervisor launch failed: {error}"))
-            })?
-            .into_inner()
-            .pid;
+            .await?;
+        let fc_pid = launched.pid;
         if let Err(error) = self.pool.set_pid(sandbox_id, fc_pid) {
             tracing::error!(
                 sandbox_id,
@@ -651,6 +684,13 @@ impl NodeManagerService {
                 }
                 tokio::time::sleep(FIRECRACKER_VSOCK_POLL).await;
             }
+        }
+
+        if verified_environment.is_none()
+            && resolved_execution.runtime_files.integrity() == ExecutionSourceIntegrity::FsVerity
+        {
+            warn_legacy_execution(sandbox_id);
+            pplx_space_metrics::node_manager::legacy_execution_source_launch();
         }
 
         Ok(Response::new(LaunchSandboxResponse {
@@ -932,6 +972,36 @@ impl NodeManagerService {
     }
 }
 
+fn protected_launch_environment(
+    runtime: ExecutionSourceIntegrity,
+    environment: Option<pplx_space_common_core::types::EnvironmentReference>,
+    requested: Option<pplx_space_common_core::types::EnvironmentReference>,
+    snapshot_restore: bool,
+    components: impl IntoIterator<Item = ExecutionSourceIntegrity>,
+) -> Result<Option<pplx_space_common_core::types::EnvironmentReference>, Status> {
+    if runtime != ExecutionSourceIntegrity::FsVerity {
+        return Ok(None);
+    }
+    match environment {
+        Some(reference) => {
+            if !snapshot_restore
+                && components
+                    .into_iter()
+                    .any(|integrity| integrity != ExecutionSourceIntegrity::FsVerity)
+            {
+                return Err(Status::failed_precondition(
+                    "protected boot requires sealed boot components",
+                ));
+            }
+            Ok(Some(reference))
+        }
+        None if requested.is_some() => Err(Status::failed_precondition(
+            "compiled execution lost its environment binding",
+        )),
+        None => Ok(None),
+    }
+}
+
 fn resize_ext4_rootfs(rootfs_path: &str, rootfs_size_mb: u32) -> Result<(), Status> {
     let target_bytes = validate_rootfs_mib(rootfs_size_mb)
         .map_err(|error| Status::invalid_argument(error.to_string()))?
@@ -1009,6 +1079,28 @@ fn run_rootfs_resize_command(
     Err(Status::internal(format!(
         "{operation} failed with status {status}"
     )))
+}
+
+// Keep a per-process warning sample while counting every legacy launch.
+fn warn_legacy_execution(sandbox_id: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static NEXT_WARNING: AtomicU64 = AtomicU64::new(0);
+    let elapsed = START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs();
+    if NEXT_WARNING
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            (elapsed >= next).then_some(elapsed.saturating_add(60))
+        })
+        .is_ok()
+    {
+        tracing::warn!(
+            sandbox_id,
+            "unbound historical execution uses legacy runtime source admission (warning sampled once per minute)"
+        );
+    }
 }
 
 #[cfg(test)]

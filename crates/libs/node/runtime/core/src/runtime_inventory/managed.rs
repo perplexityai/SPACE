@@ -1,6 +1,6 @@
 use super::*;
 use crate::artifact_store::{
-    ArtifactStore, KERNEL_IMAGE, managed_kernel_directory, managed_release_directory,
+    ArtifactStore, KERNEL_IMAGE, KernelSource, managed_kernel_directory, managed_release_directory,
     release_directory,
 };
 use crate::catalog::InitialEnvironment;
@@ -23,6 +23,11 @@ impl RuntimeInventory {
             assets,
             kernels,
         )?;
+        inventory.initial_environment = if initial.release().architecture == Arch::X86_64 {
+            Some(initial.definition()?)
+        } else {
+            None
+        };
         let stock_legacy = inventory.stock_legacy_binding(initial, assets, kernels);
         for default in inventory
             .defaults
@@ -79,6 +84,7 @@ impl RuntimeInventory {
             .parent()
             .ok_or_else(|| RuntimeInventoryError::ParentlessKernelRoot(kernels.to_path_buf()))?;
         let cached_kernel = ArtifactStore::execution_kernel_path(cache_parent, initial.kernel());
+        let cached_release = ArtifactStore::execution_release_path(cache_parent, initial.release());
         let mut watched = vec![
             store.releases_root().to_path_buf(),
             store.kernels_root().to_path_buf(),
@@ -87,8 +93,10 @@ impl RuntimeInventory {
             managed_release.join("bin/jailer"),
             baked_release.join("bin/firecracker"),
             baked_release.join("bin/jailer"),
+            cached_release.join("bin/firecracker"),
+            cached_release.join("bin/jailer"),
             managed_kernel.join(KERNEL_IMAGE),
-            cached_kernel,
+            cached_kernel.clone(),
             kernels
                 .join(initial.kernel().version.as_str())
                 .join(KERNEL_IMAGE),
@@ -97,18 +105,30 @@ impl RuntimeInventory {
             assets.join("default/kernel/vmlinux.bin"),
             vendor.join("default"),
         ];
+        // Protected consumers check the full ancestry; repairing any rejected
+        // ancestor must invalidate the cached observation too.
+        watched.extend(cache_parent.ancestors().map(Path::to_path_buf));
         watched.extend(inventory.components.iter().map(|entry| entry.path.clone()));
         // A broken preferred copy never silently selects a fallback copy.
         inventory
             .runtimes
             .retain(|entry| entry.runtime != initial.release().release);
         let release = (|| {
-            if probe_inventory_path(&managed_release)?.is_some() {
-                store.verify_release(initial.release())?;
-                inventory.add_initial_release(initial, &managed_release)?;
-            } else if probe_inventory_path(&baked_release)?.is_some() {
-                store.verify_release_at(initial.release(), &baked_release)?;
-                inventory.add_initial_release(initial, &baked_release)?;
+            let source = if probe_inventory_path(&managed_release)?.is_some() {
+                RuntimeSource::Store(&managed_release)
+            } else {
+                RuntimeSource::Baked(&baked_release)
+            };
+            if probe_inventory_path(source.path())?.is_some()
+                || probe_inventory_path(&cached_release.join("bin/firecracker"))?.is_some()
+                || probe_inventory_path(&cached_release.join("bin/jailer"))?.is_some()
+            {
+                inventory.runtimes.push(runtime_from_source(
+                    store,
+                    initial.release(),
+                    source,
+                    cache_parent,
+                )?);
             }
             Ok::<_, RuntimeInventoryError>(())
         })();
@@ -130,15 +150,23 @@ impl RuntimeInventory {
             .components
             .retain(|entry| entry.metadata.digest != Some(initial.kernel().sha256));
         let kernel = (|| {
-            if probe_inventory_path(&managed_kernel)?.is_some() {
-                let cache = store.prepare_execution_cache(cache_parent)?;
-                let staged = store.stage_kernel(initial.kernel(), &cache)?;
-                inventory.add_initial_kernel(initial, staged.path.join(KERNEL_IMAGE))?;
+            let managed_present = probe_inventory_path(&managed_kernel)?.is_some();
+            if managed_present
+                || (initial_kernels.is_empty() && probe_inventory_path(&cached_kernel)?.is_some())
+            {
+                let image = managed_kernel.join(KERNEL_IMAGE);
+                // A present managed source remains authoritative. When only a
+                // cache copy survives, verify that copy without opening a missing store.
+                let source = if managed_present {
+                    KernelSource::Store(&image)
+                } else {
+                    KernelSource::ExecutionCache(&cached_kernel)
+                };
+                let staged = kernel_from_source(store, initial.kernel(), source, cache_parent)?;
+                inventory.add_initial_kernel(initial, staged)?;
             } else {
-                for mut component in initial_kernels {
-                    // Legacy assets may be reached through a supported alias.
-                    // Verify and retain its real target, while the watch list
-                    // above still observes alias replacement and retargeting.
+                let mut failure = None;
+                for component in initial_kernels {
                     let verified = (|| {
                         let target = std::fs::canonicalize(&component.path).map_err(|source| {
                             RuntimeInventoryError::ProbeInventoryPath {
@@ -146,24 +174,33 @@ impl RuntimeInventory {
                                 source,
                             }
                         })?;
-                        store.verify_kernel_at(initial.kernel(), &target)?;
-                        Ok::<_, RuntimeInventoryError>(target)
+                        kernel_from_source(
+                            store,
+                            initial.kernel(),
+                            KernelSource::ExecutionCache(&target),
+                            cache_parent,
+                        )
                     })();
                     match verified {
                         Ok(target) => {
-                            component.path = target;
-                            inventory.components.push(component);
+                            // Several external labels may identify the same pinned
+                            // bytes. Publish one canonical component for this identity.
+                            inventory.add_initial_kernel(initial, target)?;
+                            return Ok(());
                         }
                         Err(error) => {
                             tracing::warn!(%error, "baked E0 kernel copy unavailable");
-                            let error = inventory.binding_error(error);
-                            inventory.unavailable.push(UnavailableArtifact::Kernel {
-                                digest: initial.kernel().sha256,
-                                legacy: stock_legacy,
-                                error,
-                            });
+                            // Only exhaustion withdraws the identity. Keep a
+                            // transient failure if any alternative may recover
+                            // without an operator changing its files.
+                            if failure.is_none() || error.is_transient() {
+                                failure = Some(error);
+                            }
                         }
                     }
+                }
+                if let Some(error) = failure {
+                    return Err(error);
                 }
             }
             Ok::<_, RuntimeInventoryError>(())
@@ -202,6 +239,10 @@ impl RuntimeInventory {
             &release.release,
             release.digest(),
         ));
+        let cache_parent = kernels
+            .parent()
+            .ok_or_else(|| RuntimeInventoryError::ParentlessKernelRoot(kernels.to_path_buf()))?;
+        let sealed_release_root = ArtifactStore::execution_release_path(cache_parent, release);
         let shared_runtime = self
             .runtimes
             .iter()
@@ -217,10 +258,10 @@ impl RuntimeInventory {
                     .map(|entry| &entry.runtime)
                     .find(|entry| {
                         entry.runtime == release.release
-                            && entry
-                                .files
-                                .paths()
-                                .all(|path| path.starts_with(&release_root))
+                            && entry.files.paths().all(|path| {
+                                path.starts_with(&release_root)
+                                    || path.starts_with(&sealed_release_root)
+                            })
                     })
             })
             .cloned();
@@ -232,23 +273,23 @@ impl RuntimeInventory {
         let kernel_root = store
             .kernels_root()
             .join(managed_kernel_directory(&kernel.version, kernel.sha256));
-        let cache_parent = kernels
-            .parent()
-            .ok_or_else(|| RuntimeInventoryError::ParentlessKernelRoot(kernels.to_path_buf()))?;
         let mut watched = vec![
             release_root.join("bin/firecracker"),
             release_root.join("bin/jailer"),
+            sealed_release_root.join("bin/firecracker"),
+            sealed_release_root.join("bin/jailer"),
             kernel_root.join(KERNEL_IMAGE),
             ArtifactStore::execution_kernel_path(cache_parent, kernel),
         ];
         let runtime = match shared_runtime {
             Some(runtime) => Ok(runtime),
             None => {
-                let runtime = (|| {
-                    store.verify_release(release)?;
-                    FirecrackerDriver
-                        .inspect_installation(release_root, release.release.version.clone())
-                })();
+                let runtime = runtime_from_source(
+                    store,
+                    release,
+                    RuntimeSource::Store(&release_root),
+                    cache_parent,
+                );
                 runtime.map_err(|error| {
                     tracing::warn!(%error, "environment runtime unavailable");
                     let error = self.binding_error(error);
@@ -264,16 +305,22 @@ impl RuntimeInventory {
             Some(kernel) => Ok(kernel),
             None => {
                 let component = (|| {
-                    let cache = store.prepare_execution_cache(cache_parent)?;
-                    let staged = store.stage_kernel(kernel, &cache)?;
-                    let image = staged.path.join(KERNEL_IMAGE);
-                    watched.push(image.clone());
-                    Ok::<_, RuntimeInventoryError>(kernel_installation(
+                    let source = kernel_root.join(KERNEL_IMAGE);
+                    let image = kernel_from_source(
+                        store,
+                        kernel,
+                        KernelSource::Store(&source),
+                        cache_parent,
+                    )?;
+                    watched.push(image.path.clone());
+                    let mut installation = kernel_installation(
                         kernel_metadata(kernel.version.clone(), kernel.sha256)?,
-                        image,
+                        image.path,
                         false,
                         false,
-                    ))
+                    );
+                    installation.integrity = image.integrity;
+                    Ok::<_, RuntimeInventoryError>(installation)
                 })();
                 component.map_err(|error| {
                     tracing::warn!(%error, "environment kernel unavailable");
@@ -350,32 +397,113 @@ impl RuntimeInventory {
         stock
     }
 
-    fn add_initial_release(
-        &mut self,
-        initial: &InitialEnvironment,
-        root: &Path,
-    ) -> Result<(), RuntimeInventoryError> {
-        let installation = FirecrackerDriver.inspect_installation(
-            root.to_path_buf(),
-            initial.release().release.version.clone(),
-        )?;
-        self.runtimes.push(installation);
-        Ok(())
-    }
-
     fn add_initial_kernel(
         &mut self,
         initial: &InitialEnvironment,
-        path: PathBuf,
+        staged: StagedKernel,
     ) -> Result<(), RuntimeInventoryError> {
-        self.components.push(kernel_installation(
+        let mut installation = kernel_installation(
             kernel_metadata(initial.kernel().version.clone(), initial.kernel().sha256)?,
-            path,
+            staged.path,
             true,
             true,
-        ));
+        );
+        installation.integrity = staged.integrity;
+        self.components.push(installation);
         Ok(())
     }
+}
+
+#[derive(Clone, Copy)]
+enum RuntimeSource<'a> {
+    Store(&'a Path),
+    Baked(&'a Path),
+}
+
+impl<'a> RuntimeSource<'a> {
+    fn path(self) -> &'a Path {
+        match self {
+            Self::Store(path) | Self::Baked(path) => path,
+        }
+    }
+}
+
+fn runtime_from_source(
+    store: &ArtifactStore,
+    pin: &crate::catalog::PinnedRelease,
+    source: RuntimeSource<'_>,
+    cache_parent: &Path,
+) -> Result<RuntimeInstallation, RuntimeInventoryError> {
+    if pin
+        .binaries
+        .iter()
+        .try_fold(true, |present, file| {
+            crate::catalog::compiled_verity_digest(file.sha256).map(|pin| present && pin.is_some())
+        })
+        .map_err(crate::artifact_store::StageExecutionError::Catalog)?
+    {
+        match store.stage_release_at(pin, source.path(), cache_parent) {
+            Ok(root) => {
+                let mut runtime =
+                    FirecrackerDriver.inspect_installation(root, pin.release.version.clone())?;
+                runtime.files.integrity = ExecutionSourceIntegrity::FsVerity;
+                return Ok(runtime);
+            }
+            Err(error) if error.is_unsupported() => {
+                tracing::warn!(integrity = "publication-sha256", %error, "fs-verity unavailable; retaining verified legacy execution protection");
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    match source {
+        RuntimeSource::Store(_) => store.verify_release(pin)?,
+        RuntimeSource::Baked(path) => store.verify_release_at(pin, path)?,
+    };
+    FirecrackerDriver.inspect_installation(source.path().to_owned(), pin.release.version.clone())
+}
+
+struct StagedKernel {
+    path: PathBuf,
+    integrity: ExecutionSourceIntegrity,
+}
+
+fn kernel_from_source(
+    store: &ArtifactStore,
+    pin: &crate::catalog::PinnedKernel,
+    source: KernelSource<'_>,
+    cache_parent: &Path,
+) -> Result<StagedKernel, RuntimeInventoryError> {
+    if crate::catalog::compiled_verity_digest(pin.sha256)
+        .map_err(crate::artifact_store::StageExecutionError::Catalog)?
+        .is_some()
+    {
+        match store.stage_sealed_kernel_at(pin, source, cache_parent) {
+            Ok(path) => {
+                return Ok(StagedKernel {
+                    path,
+                    integrity: ExecutionSourceIntegrity::FsVerity,
+                });
+            }
+            Err(error) if error.is_unsupported() => {
+                tracing::warn!(integrity = "publication-sha256", %error, "kernel fs-verity unavailable; retaining verified legacy execution protection");
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let path = match source {
+        KernelSource::Store(_) => {
+            let cache = store.prepare_execution_cache(cache_parent)?;
+            store.stage_kernel(pin, &cache)?.path.join(KERNEL_IMAGE)
+        }
+        KernelSource::ExecutionCache(image) => {
+            store.verify_kernel_at(pin, image)?;
+            image.to_owned()
+        }
+    };
+    Ok(StagedKernel {
+        path,
+        integrity: ExecutionSourceIntegrity::Legacy,
+    })
 }
 
 #[cfg(test)]

@@ -562,3 +562,30 @@ fn source_walk_refuses_parent_components() {
         );
     }
 }
+
+#[test]
+fn artifact_io_retries_require_a_recoverable_path_error() {
+    for (errno, transient) in [
+        (libc::ENOENT, false),
+        (libc::EACCES, false),
+        (libc::ENOTDIR, false),
+        (libc::EIO, true),
+        (libc::EMFILE, true),
+        (libc::EINTR, true),
+        (libc::ENOSPC, true),
+        (libc::EBUSY, true),
+        (libc::ETXTBSY, true),
+    ] {
+        let error = || super::protection::DirectoryProtectionError::Io {
+            path: "/synthetic/artifacts".into(),
+            source: std::io::Error::from_raw_os_error(errno),
+        };
+        let verify = VerifyError::from(error());
+        let publish = PublishError::from(error());
+        let remove = RemoveError::from(error());
+        assert_eq!(verify.is_transient(), transient, "verify errno {errno}");
+        assert_eq!(publish.is_transient(), transient, "publish errno {errno}");
+        assert_eq!(remove.is_transient(), transient, "remove errno {errno}");
+        assert_eq!(StageExecutionError::from(verify).is_transient(), transient);
+    }
+}

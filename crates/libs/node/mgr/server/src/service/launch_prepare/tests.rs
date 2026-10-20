@@ -829,3 +829,160 @@ fn retained_instance_repair_grants_traversal_without_write_and_preserves_files()
     std::os::unix::fs::symlink(&instance, &alias).unwrap();
     super::super::ensure_sandbox_instance_traversal(alias).unwrap_err();
 }
+
+#[test]
+fn protected_launch_admission_preserves_binding_and_restore_rules() {
+    use super::ExecutionSourceIntegrity::{FsVerity, Legacy};
+    let reference =
+        pplx_space_node_runtime_core::catalog::InitialEnvironment::for_architecture(Arch::X86_64)
+            .unwrap()
+            .definition()
+            .unwrap()
+            .reference();
+    // Outcome: None is deliberate legacy admission; Some is a protected request.
+    for (runtime, environment, requested, restore, components, expected) in [
+        (
+            FsVerity,
+            Some(reference),
+            Some(reference),
+            false,
+            vec![FsVerity],
+            Ok(Some(reference)),
+        ),
+        (
+            FsVerity,
+            Some(reference),
+            None,
+            false,
+            vec![FsVerity],
+            Ok(Some(reference)),
+        ),
+        (
+            FsVerity,
+            Some(reference),
+            Some(reference),
+            false,
+            vec![FsVerity, Legacy],
+            Err(tonic::Code::FailedPrecondition),
+        ),
+        (
+            FsVerity,
+            Some(reference),
+            Some(reference),
+            true,
+            vec![Legacy],
+            Ok(Some(reference)),
+        ),
+        (
+            FsVerity,
+            None,
+            Some(reference),
+            false,
+            vec![FsVerity],
+            Err(tonic::Code::FailedPrecondition),
+        ),
+        (FsVerity, None, None, false, vec![Legacy], Ok(None)),
+        (
+            Legacy,
+            Some(reference),
+            Some(reference),
+            false,
+            vec![Legacy],
+            Ok(None),
+        ),
+    ] {
+        assert_eq!(
+            super::protected_launch_environment(
+                runtime,
+                environment,
+                requested,
+                restore,
+                components
+            )
+            .map_err(|error| error.code()),
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn wrong_launch_acknowledgement_refuses_and_stops_the_execution() {
+    use crate::runtime_supervisor_client::tests::{SupervisorScript, scripted_in_process_client};
+    use pplx_space_node_runtime_core::proto;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let reference =
+        pplx_space_node_runtime_core::catalog::InitialEnvironment::for_architecture(Arch::X86_64)
+            .unwrap()
+            .definition()
+            .unwrap()
+            .reference();
+    for accepted in [
+        reference.to_string(),
+        String::new(),
+        format!("sha256:{}", "ff".repeat(32)),
+    ] {
+        let (mut service, lease) = allocated_service().await;
+        let fence =
+            super::super::tests::service_tests::bind_test_execution(&service, &lease.sandbox_id);
+        let stops = Arc::new(AtomicUsize::new(0));
+        let stop_calls = stops.clone();
+        let sandbox_id = lease.sandbox_id.clone();
+        let expected_execution = fence.execution_id.clone();
+        let matches = accepted == reference.to_string();
+        service.runtime_supervisor = scripted_in_process_client(SupervisorScript {
+            launch: Some(Arc::new(move |request| {
+                assert!(request.sandbox_id.is_empty());
+                assert_eq!(
+                    request.verified_runtime.unwrap().environment_reference,
+                    reference.to_string()
+                );
+                Ok(proto::LaunchFirecrackerResponse {
+                    pid: 0,
+                    accepted_environment_reference: accepted.clone(),
+                })
+            })),
+            stop_runtime: Some(Arc::new(move |request| {
+                assert_eq!(request.sandbox_id, sandbox_id);
+                assert_eq!(request.execution_id, expected_execution);
+                assert!(request.immediate_kill);
+                stop_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(proto::StopSandboxRuntimeResponse::default())
+            })),
+            ..Default::default()
+        });
+        let result = service
+            .launch_admitted_runtime(
+                &lease.sandbox_id,
+                proto::LaunchFirecrackerRequest {
+                    execution_id: fence.execution_id,
+                    verified_runtime: Some(proto::VerifiedRuntimeLaunch {
+                        sandbox_id: lease.sandbox_id.clone(),
+                        environment_reference: reference.to_string(),
+                        integrity_requirement:
+                            proto::ArtifactIntegrityRequirement::AuthenticatedImmutableSources
+                                .into(),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await;
+        if matches {
+            result.unwrap();
+        } else {
+            assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
+        }
+        assert_eq!(stops.load(Ordering::SeqCst), usize::from(!matches));
+        assert!(
+            service
+                .pool
+                .get(&lease.sandbox_id)
+                .unwrap()
+                .unwrap()
+                .pid
+                .is_none()
+        );
+    }
+}

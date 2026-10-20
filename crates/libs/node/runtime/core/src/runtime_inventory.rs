@@ -85,17 +85,29 @@ impl std::fmt::Display for RuntimeFileRole {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeInstallationFiles {
     files: BTreeMap<RuntimeFileRole, PathBuf>,
+    integrity: ExecutionSourceIntegrity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutionSourceIntegrity {
+    Legacy,
+    FsVerity,
 }
 
 impl RuntimeInstallationFiles {
     fn new(files: impl IntoIterator<Item = (RuntimeFileRole, PathBuf)>) -> Self {
         Self {
             files: files.into_iter().collect(),
+            integrity: ExecutionSourceIntegrity::Legacy,
         }
     }
 
     pub fn paths(&self) -> impl Iterator<Item = &Path> {
         self.files.values().map(PathBuf::as_path)
+    }
+
+    pub fn integrity(&self) -> ExecutionSourceIntegrity {
+        self.integrity
     }
 
     pub fn path(&self, role: RuntimeFileRole) -> Option<&Path> {
@@ -109,10 +121,13 @@ struct ArtifactComponentInstallation {
     path: PathBuf,
     default_for_new: bool,
     legacy_default: bool,
+    integrity: ExecutionSourceIntegrity,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedExecutionEnvironment {
+    /// Inventory-owned binding selected with these runtime files and components.
+    pub environment: Option<EnvironmentReference>,
     pub execution: ExecutionMetadata,
     pub runtime_files: RuntimeInstallationFiles,
     pub components: Vec<ResolvedArtifactComponent>,
@@ -122,18 +137,18 @@ pub struct ResolvedExecutionEnvironment {
 pub struct ResolvedArtifactComponent {
     pub metadata: ArtifactComponentMetadata,
     pub path: PathBuf,
+    pub integrity: ExecutionSourceIntegrity,
 }
 
 impl ResolvedExecutionEnvironment {
-    pub fn component_path(
+    pub fn component(
         &self,
         kind: ArtifactComponentKind,
         role: Option<&ArtifactComponentRole>,
-    ) -> Option<&Path> {
+    ) -> Option<&ResolvedArtifactComponent> {
         self.components
             .iter()
             .find(|component| component_metadata_identity(&component.metadata) == (kind, role))
-            .map(|component| component.path.as_path())
     }
 }
 
@@ -159,6 +174,7 @@ pub struct RuntimeInventory {
     #[cfg(feature = "artifact-store")]
     unavailable: Vec<UnavailableArtifact>,
     retry_after: Option<tokio::time::Instant>,
+    initial_environment: Option<pplx_space_execution_common::environment::EnvironmentDefinition>,
 }
 
 #[cfg(feature = "artifact-store")]
@@ -281,6 +297,9 @@ pub trait ExecutionResolver {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeInventoryError {
+    #[cfg(feature = "artifact-store")]
+    #[error(transparent)]
+    StageExecution(#[from] crate::artifact_store::StageExecutionError),
     #[error("execution binding unavailable: {0}")]
     UnavailableBinding(#[source] std::sync::Arc<RuntimeInventoryError>),
     #[cfg(feature = "artifact-store")]
@@ -310,6 +329,8 @@ pub enum RuntimeInventoryError {
         value: String,
         reason: String,
     },
+    #[error("compiled execution environment is invalid: {0}")]
+    EnvironmentDefinition(#[from] crate::catalog::CompiledEnvironmentDefinitionError),
     #[error("resolved execution metadata is invalid: {0}")]
     InvalidExecutionMetadata(#[from] ExecutionMetadataError),
     #[error("Firecracker runtime version {0} has no known snapshot format mapping")]
@@ -377,6 +398,8 @@ impl RuntimeInventoryError {
     /// fails an activation that a second attempt would have satisfied.
     pub fn is_transient(&self) -> bool {
         match self {
+            #[cfg(feature = "artifact-store")]
+            Self::StageExecution(error) => error.is_transient(),
             Self::UnavailableBinding(error) => error.is_transient(),
             #[cfg(feature = "artifact-store")]
             Self::ManagedArtifact(error) => error.is_transient(),
@@ -398,6 +421,7 @@ impl RuntimeInventoryError {
             | Self::NoInstalledRuntime(_)
             | Self::InvalidVersionOutput { .. }
             | Self::InvalidStaticIdentifier { .. }
+            | Self::EnvironmentDefinition(_)
             | Self::InvalidExecutionMetadata(_)
             | Self::UnknownFirecrackerSnapshotFormat(_)
             | Self::IncompleteInstallation { .. }
@@ -975,6 +999,7 @@ impl RuntimeInventory {
             #[cfg(feature = "artifact-store")]
             unavailable: Vec::new(),
             retry_after: None,
+            initial_environment: None,
         };
         inventory.remember_paths(watched);
         // External discovery must notice new installations even when the
@@ -1223,6 +1248,7 @@ impl RuntimeInventory {
         selected_components.push(ResolvedArtifactComponent {
             metadata: kernel.metadata.clone(),
             path: kernel.path.clone(),
+            integrity: kernel.integrity,
         });
         let execution = ExecutionMetadata::new(
             selected_runtime.runtime.clone(),
@@ -1230,7 +1256,16 @@ impl RuntimeInventory {
             Some(selected_runtime.state_format.clone()),
             resolved_components,
         )?;
+        let environment = if binding.is_some() {
+            requested.and_then(ExecutionMetadata::environment)
+        } else {
+            self.initial_environment
+                .as_ref()
+                .filter(|definition| definition.check_execution(&execution).is_ok())
+                .map(|definition| definition.reference())
+        };
         Ok(ResolvedExecutionEnvironment {
+            environment,
             execution,
             runtime_files: selected_runtime.files.clone(),
             components: selected_components,
@@ -1315,7 +1350,8 @@ fn version_from_dir(path: &Path) -> Option<RuntimeVersion> {
         .and_then(|value| RuntimeVersion::parse(value.strip_prefix('v').unwrap_or(value)).ok())
 }
 
-fn host_arch() -> Result<Arch, RuntimeInventoryError> {
+/// Architecture of the host running execution inventory and launch admission.
+pub fn host_arch() -> Result<Arch, RuntimeInventoryError> {
     match std::env::consts::ARCH {
         "x86_64" => Ok(Arch::X86_64),
         "aarch64" => Ok(Arch::Aarch64),
@@ -1338,6 +1374,7 @@ fn kernel_installation(
         path,
         default_for_new,
         legacy_default,
+        integrity: ExecutionSourceIntegrity::Legacy,
     }
 }
 

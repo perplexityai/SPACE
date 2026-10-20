@@ -12,7 +12,10 @@ pub(crate) struct Fixture {
 
 impl Fixture {
     pub(crate) fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        Self::in_directory(tempfile::tempdir().unwrap())
+    }
+
+    pub(crate) fn in_directory(dir: tempfile::TempDir) -> Self {
         // Keep checked ancestors inside the fixture even when the system
         // temporary directory belongs to a different account.
         let root = dir.path().join("space");

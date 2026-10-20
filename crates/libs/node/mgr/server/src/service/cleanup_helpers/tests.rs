@@ -282,10 +282,17 @@ fn failed_device_teardown_preserves_artifacts_for_retry() {
                 run.to_str().unwrap(),
                 jail.to_str().unwrap(),
                 &instance,
+                |_| Ok(false),
                 || super::teardown_encrypted_volumes_with(sandbox_id, &mut output, &mut mounts),
             )
             .unwrap_err();
             assert!(error.to_string().contains(failed_command));
+            let super::JailCleanupError::DeviceTeardown(super::RuntimeArtifactCleanupError(errors)) =
+                &error
+            else {
+                panic!("device teardown failures must retain their error list: {error:?}");
+            };
+            assert!(!errors.is_empty());
             assert!(run.join("fc.pid").exists());
             assert!(gateway.exists());
             assert!(jail.exists());
@@ -298,6 +305,7 @@ fn failed_device_teardown_preserves_artifacts_for_retry() {
             run.to_str().unwrap(),
             jail.to_str().unwrap(),
             &instance,
+            |_| Ok(false),
             || super::teardown_encrypted_volumes_with(sandbox_id, &mut output, &mut mounts),
         )
         .unwrap();
@@ -306,5 +314,272 @@ fn failed_device_teardown_preserves_artifacts_for_retry() {
         assert!(!run.exists());
         assert!(!gateway.exists());
         assert!(!jail.exists());
+    }
+}
+
+#[test]
+fn teardown_drains_snapshot_binds_before_device_release_or_recursive_removal() {
+    for fail_at in [Some(2), None] {
+        let directory = tempfile::tempdir().unwrap();
+        let jail = directory.path().join("jail");
+        let snapshot = jail.join("root/encsnap/memory");
+        let instance = directory.path().join("instance");
+        let run = directory.path().join("run");
+        let gateway = directory.path().join("gateway");
+        for path in [snapshot.parent().unwrap(), &instance, &run, &gateway] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(&snapshot, b"retained snapshot").unwrap();
+        std::fs::write(instance.join("snapshot.luks"), b"backing").unwrap();
+        let layers = Cell::new(2_usize);
+        let mut calls = 0;
+        let released = Cell::new(false);
+        let result = super::cleanup_runtime_artifacts_at(
+            gateway.to_str().unwrap(),
+            run.to_str().unwrap(),
+            jail.to_str().unwrap(),
+            &instance,
+            |path| {
+                if !path.ends_with("encsnap") {
+                    return Ok(false);
+                }
+                calls += 1;
+                if fail_at == Some(calls) {
+                    return Err("injected lower-layer unmount failure".into());
+                }
+                let remaining = layers.get();
+                layers.set(remaining.saturating_sub(1));
+                Ok(remaining != 0)
+            },
+            || {
+                assert_eq!(
+                    layers.get(),
+                    0,
+                    "device release requires every bind drained"
+                );
+                assert_eq!(std::fs::read(&snapshot).unwrap(), b"retained snapshot");
+                released.set(true);
+                (Vec::new(), Vec::new())
+            },
+        );
+        if fail_at.is_some() {
+            assert!(result.is_err());
+            assert!(!released.get());
+            assert_eq!(std::fs::read(&snapshot).unwrap(), b"retained snapshot");
+            assert!(instance.join("snapshot.luks").exists());
+            assert!(run.exists());
+            assert!(gateway.exists());
+        } else {
+            result.unwrap();
+            assert!(released.get());
+            assert_eq!(layers.get(), 0);
+            assert!(!jail.exists());
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn teardown_preserves_backing_files_below_stacked_directory_binds() {
+    if !pplx_space_test_env::root_or_skip("test jail cleanup in a private mount namespace") {
+        return;
+    }
+    std::thread::spawn(|| {
+        use nix::mount::{MsFlags, mount};
+        nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS).unwrap();
+        mount(
+            None::<&str>,
+            "/",
+            None::<&str>,
+            MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+            None::<&str>,
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let jail = directory.path().join("jail");
+        let target = jail.join("root/encsnap");
+        let instance = directory.path().join("instance");
+        let run = directory.path().join("run");
+        let gateway = directory.path().join("gateway");
+        let lower = directory.path().join("lower-volume");
+        let upper = directory.path().join("upper-volume");
+        for path in [&target, &instance, &run, &gateway, &lower, &upper] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        for volume in [&lower, &upper] {
+            std::fs::write(volume.join("memory"), b"snapshot backing data").unwrap();
+            mount(
+                Some(volume.as_path()),
+                &target,
+                None::<&str>,
+                MsFlags::MS_BIND,
+                None::<&str>,
+            )
+            .unwrap();
+        }
+        super::cleanup_runtime_artifacts_at(
+            gateway.to_str().unwrap(),
+            run.to_str().unwrap(),
+            jail.to_str().unwrap(),
+            &instance,
+            |path| super::unmount_if_present(path),
+            || (Vec::new(), Vec::new()),
+        )
+        .unwrap();
+        for volume in [&lower, &upper] {
+            assert_eq!(
+                std::fs::read(volume.join("memory")).unwrap(),
+                b"snapshot backing data"
+            );
+        }
+        assert!(!jail.exists());
+    })
+    .join()
+    .unwrap();
+}
+
+#[test]
+fn stale_jail_removal_failure_refuses_reuse() {
+    let root = tempfile::tempdir().unwrap();
+    let stale = root.path().join("jail-root");
+    std::fs::write(&stale, b"must not be reused").unwrap();
+    let error = super::cleanup_jail_root(stale.to_str().unwrap(), |_| Ok(false), || Ok(Vec::new()))
+        .unwrap_err();
+    assert!(matches!(error, super::JailCleanupError::Remove(_)));
+    assert_eq!(std::fs::read(&stale).unwrap(), b"must not be reused");
+    std::fs::remove_file(&stale).unwrap();
+    std::fs::create_dir(&stale).unwrap();
+    std::fs::write(stale.join("firecracker"), b"stale executable").unwrap();
+    for _ in 0..2 {
+        super::cleanup_jail_root(stale.to_str().unwrap(), |_| Ok(false), || Ok(Vec::new()))
+            .unwrap();
+        assert!(!stale.try_exists().unwrap());
+    }
+}
+
+#[test]
+fn stale_mount_cleanup_drains_stacks_and_bounds_failures() {
+    for (layers, fail_at, expected_calls, succeeds) in [
+        (0, None, 1, true),
+        (1, None, 2, true),
+        (3, None, 4, true),
+        (31, None, 32, true),
+        (32, None, 32, false),
+        (33, None, 32, false),
+        (usize::MAX, None, 32, false),
+        (3, Some(2), 2, false),
+    ] {
+        let mut calls = 0;
+        let mut remaining = layers;
+        let result =
+            super::drain_stale_mounts(std::path::Path::new("/synthetic/jail/rootfs"), |_| {
+                calls += 1;
+                if fail_at == Some(calls) {
+                    return Err("injected unmount failure".into());
+                }
+                let mounted = remaining != 0;
+                remaining = remaining.saturating_sub(1);
+                Ok(mounted)
+            });
+        assert_eq!(result.is_ok(), succeeds);
+        assert_eq!(calls, expected_calls);
+        if let Err(error) = result {
+            assert_eq!(tonic::Status::from(error).code(), tonic::Code::Internal);
+        }
+        if fail_at.is_none() && layers != usize::MAX {
+            let retry =
+                super::drain_stale_mounts(std::path::Path::new("/synthetic/jail/rootfs"), |_| {
+                    let mounted = remaining != 0;
+                    remaining = remaining.saturating_sub(1);
+                    Ok(mounted)
+                });
+            retry.expect("retry must finish draining a finite mount stack");
+            assert_eq!(remaining, 0);
+        }
+    }
+}
+
+#[test]
+fn encrypted_bind_failure_preserves_stale_jail_contents() {
+    let root = tempfile::tempdir().unwrap();
+    let jail = root.path().join("jail");
+    std::fs::create_dir_all(jail.join("encsnap")).unwrap();
+    let snapshot = jail.join("encsnap/memory");
+    std::fs::write(&snapshot, b"snapshot retained").unwrap();
+    let mut visited = Vec::new();
+    let error = super::cleanup_jail_root(
+        jail.to_str().unwrap(),
+        |path| {
+            let name = path.file_name().unwrap().to_str().unwrap().to_owned();
+            visited.push(name.clone());
+            if name == "encsnap" {
+                Err("injected unmount failure".into())
+            } else {
+                Ok(false)
+            }
+        },
+        || Ok(Vec::new()),
+    )
+    .unwrap_err();
+    assert!(matches!(error, super::JailCleanupError::Unmount { .. }));
+    assert_eq!(visited, ["rootfs.ext4", "memory", "encsnap"]);
+    assert_eq!(std::fs::read(snapshot).unwrap(), b"snapshot retained");
+    let mut encrypted_layers = 2;
+    super::cleanup_jail_root(
+        jail.to_str().unwrap(),
+        |path| {
+            if path.ends_with("encsnap") && encrypted_layers > 0 {
+                encrypted_layers -= 1;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        },
+        || Ok(Vec::new()),
+    )
+    .unwrap();
+    assert_eq!(encrypted_layers, 0);
+    assert!(!jail.exists());
+}
+
+#[test]
+fn jail_cleanup_removes_planted_symlinks_without_following_them() {
+    enum Target {
+        Loop,
+        Missing,
+        Outside,
+    }
+    for target in [Target::Loop, Target::Missing, Target::Outside] {
+        let temp = tempfile::tempdir().unwrap();
+        let jail = temp.path().join("jail");
+        let instance = temp.path().join("instance");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(jail.join("root")).unwrap();
+        std::fs::create_dir_all(&instance).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("memory"), b"retained backing data").unwrap();
+        for name in super::JAIL_BIND_NAMES {
+            let link = jail.join("root").join(name);
+            let destination = match target {
+                Target::Loop => std::path::PathBuf::from(name),
+                Target::Missing => temp.path().join("absent"),
+                Target::Outside => outside.clone(),
+            };
+            std::os::unix::fs::symlink(destination, &link).unwrap();
+        }
+        super::cleanup_runtime_artifacts_at(
+            temp.path().join("gateway").to_str().unwrap(),
+            temp.path().join("run").to_str().unwrap(),
+            jail.to_str().unwrap(),
+            &instance,
+            |path| super::unmount_if_present(path),
+            || panic!("no encrypted device exists in this fixture"),
+        )
+        .unwrap();
+        assert!(!jail.exists());
+        assert_eq!(
+            std::fs::read(outside.join("memory")).unwrap(),
+            b"retained backing data"
+        );
     }
 }

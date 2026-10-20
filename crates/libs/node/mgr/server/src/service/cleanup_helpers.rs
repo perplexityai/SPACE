@@ -677,11 +677,13 @@ pub(super) fn set_btrfs_snapshot_read_only(
 
 pub(super) fn unmount_if_present(path: impl AsRef<Path>) -> Result<bool, String> {
     let path: &Path = path.as_ref();
-    if !path
-        .try_exists()
-        .map_err(|error| format!("inspect mount {}: {error}", path.display()))?
-    {
-        return Ok(false);
+    // The final jail entry is sandbox-writable. A link (including a loop)
+    // has no bind to detach and can be safely unlinked by recursive removal.
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => return Ok(false),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("inspect mount {}: {error}", path.display())),
     }
     unmount_existing_path(path)
 }
@@ -1104,21 +1106,88 @@ pub(super) async fn cleanup_runtime_artifacts_blocking(
         .map_err(|error| {
             Status::internal(format!("runtime artifact cleanup task failed: {error}"))
         })?
-        .map_err(|error| Status::internal(error.to_string()))
+        .map_err(Status::from)
 }
 
 #[derive(Debug, thiserror::Error)]
 #[error("runtime artifacts retained for cleanup retry: {}", .0.join("; "))]
-struct RuntimeArtifactCleanupError(Vec<String>);
+pub(super) struct RuntimeArtifactCleanupError(Vec<String>);
 
-fn cleanup_runtime_artifacts(sandbox_id: &str) -> Result<Vec<String>, RuntimeArtifactCleanupError> {
+fn cleanup_runtime_artifacts(sandbox_id: &str) -> Result<Vec<String>, JailCleanupError> {
     cleanup_runtime_artifacts_at(
         &paths::isolated_net_gateway_run_dir(sandbox_id),
         &format!("{RUN_DIR}/{sandbox_id}"),
         &format!("{JAIL_DIR}/firecracker/{sandbox_id}"),
         &PathBuf::from(format!("{CACHE_DIR}/{sandbox_id}/instance")),
+        |path| unmount_if_present(path),
         || teardown_encrypted_volumes_blocking(sandbox_id),
     )
+}
+
+pub(super) const JAIL_BIND_NAMES: [&str; 3] = [
+    "rootfs.ext4",
+    "memory",
+    super::snapshots::ENC_SNAPSHOT_JAIL_SUBDIR,
+];
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum JailCleanupError {
+    #[error("cannot unmount jail input {}: {problem}", path.display())]
+    Unmount { path: PathBuf, problem: String },
+    #[error("jail mount cleanup budget exhausted at {}; retry cleanup to continue draining mounts", .0.display())]
+    MountLimit(PathBuf),
+    #[error(transparent)]
+    DeviceTeardown(#[from] RuntimeArtifactCleanupError),
+    #[error("{0}")]
+    Remove(String),
+}
+
+impl From<JailCleanupError> for Status {
+    fn from(error: JailCleanupError) -> Self {
+        // A budget-limited attempt can already have removed mounts. Preserve
+        // cleanup retry semantics for both teardown and launch recovery.
+        Self::internal(error.to_string())
+    }
+}
+
+pub(super) fn drain_stale_mounts(
+    path: &Path,
+    mut unmount: impl FnMut(&Path) -> Result<bool, String>,
+) -> Result<usize, JailCleanupError> {
+    // Crash recovery may encounter stacked binds. Bound privileged work even
+    // if another mount owner keeps adding layers; a later cleanup can retry.
+    // Each call may detach a mount, including a final confirmation call. If all
+    // 32 calls detach one, a retry must confirm the path is clear before removal.
+    for removed in 0..32 {
+        if !unmount(path).map_err(|problem| JailCleanupError::Unmount {
+            path: path.to_owned(),
+            problem,
+        })? {
+            return Ok(removed);
+        }
+    }
+    Err(JailCleanupError::MountLimit(path.to_owned()))
+}
+
+/// Drain every known bind before device teardown or recursive removal. Both
+/// launch recovery and final teardown must retain the tree on any failed phase.
+pub(super) fn cleanup_jail_root(
+    root: &str,
+    mut unmount: impl FnMut(&Path) -> Result<bool, String>,
+    before_remove: impl FnOnce() -> Result<Vec<String>, RuntimeArtifactCleanupError>,
+) -> Result<Vec<String>, JailCleanupError> {
+    let mut actions = Vec::new();
+    for name in JAIL_BIND_NAMES {
+        let bind = Path::new(root).join(name);
+        if drain_stale_mounts(&bind, &mut unmount)? != 0 {
+            actions.push(format!("Unmounted {}", bind.display()));
+        }
+    }
+    actions.extend(before_remove()?);
+    if remove_dir_all_if_exists(root).map_err(JailCleanupError::Remove)? {
+        actions.push(format!("Removed {root}"));
+    }
+    Ok(actions)
 }
 
 fn cleanup_runtime_artifacts_at(
@@ -1126,28 +1195,14 @@ fn cleanup_runtime_artifacts_at(
     run_dir: &str,
     jail_dir: &str,
     instance: &Path,
+    mut unmount: impl FnMut(&Path) -> Result<bool, String>,
     teardown: impl FnOnce() -> (Vec<String>, Vec<String>),
-) -> Result<Vec<String>, RuntimeArtifactCleanupError> {
-    let mut actions = Vec::new();
-    // Each phase is a prerequisite for the next. In particular, never unlink
-    // device backing files (or the evidence that selects device teardown) after
-    // unknown/failed teardown, and never remove a tree containing a live bind.
-    for name in [
-        "rootfs.ext4",
-        "memory",
-        super::snapshots::ENC_SNAPSHOT_JAIL_SUBDIR,
-    ] {
-        let bind = format!("{jail_dir}/root/{name}");
-        if unmount_if_present(&bind).map_err(|error| RuntimeArtifactCleanupError(vec![error]))? {
-            actions.push(format!("Unmounted {bind}"));
-        }
-    }
-    cleanup_device_backings_with(instance, teardown)
-        .map(|device_actions| actions.extend(device_actions))?;
+) -> Result<Vec<String>, JailCleanupError> {
+    let mut actions = cleanup_jail_root(&format!("{jail_dir}/root"), &mut unmount, || {
+        cleanup_device_backings_with(instance, teardown)
+    })?;
     for path in [gateway_dir, run_dir, jail_dir] {
-        if remove_dir_all_if_exists(path)
-            .map_err(|error| RuntimeArtifactCleanupError(vec![error]))?
-        {
+        if remove_dir_all_if_exists(path).map_err(JailCleanupError::Remove)? {
             actions.push(format!("Removed {path}"));
         }
     }

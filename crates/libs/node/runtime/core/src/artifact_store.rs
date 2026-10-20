@@ -41,6 +41,12 @@ use sha2::{Digest as _, Sha256};
 
 use crate::catalog::{ManagedDirectoryName, PinnedKernel, PinnedRelease};
 
+mod protection;
+pub use protection::verify_execution_directory;
+use protection::{RootProtection, check_root};
+mod execution_cache;
+pub use execution_cache::{KernelSource, StageExecutionError};
+
 /// A kernel's image within its directory.
 pub const KERNEL_IMAGE: &str = "vmlinux.bin";
 
@@ -74,6 +80,22 @@ fn unique_suffix() -> String {
 /// another node-manager process, as during a handoff. Blocking.
 fn lock_root(root: &Path) -> Result<OwnedFd, std::io::Error> {
     lock_root_with(root, rustix::fs::FlockOperation::LockExclusive)
+}
+
+// The caller owns the root lock and has checked directory protection.
+fn clear_root_leftovers(root: &Path) -> std::io::Result<usize> {
+    let mut removed = 0;
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let leftover = entry.file_name().to_str().is_some_and(|name| {
+            name.starts_with(INCOMING_PREFIX) || name.starts_with(REMOVING_PREFIX)
+        });
+        if leftover && entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(entry.path())?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 fn lock_root_with(
@@ -168,6 +190,8 @@ pub struct VerifiedArtifact {
 pub enum VerifyError {
     #[error("cannot verify image {} without a parent directory", path.display())]
     InvalidImagePath { path: PathBuf },
+    #[error("kernel image {} must be named {}", path.display(), KERNEL_IMAGE)]
+    KernelImageName { path: PathBuf },
     #[error("cannot verify artifact: {} is {problem}", path.display())]
     UnsafeRoot {
         path: PathBuf,
@@ -195,7 +219,7 @@ pub enum VerifyError {
 
 impl VerifyError {
     pub fn is_transient(&self) -> bool {
-        matches!(self, Self::Io { .. })
+        matches!(self, Self::Io { source, .. } if pplx_space_common_core::host::path_errors::host_path_io_error_is_transient(source))
     }
 }
 
@@ -273,7 +297,10 @@ impl PublishError {
     pub fn is_transient(&self) -> bool {
         match self {
             Self::ExistingArtifact(error) => error.is_transient(),
-            _ => matches!(self, Self::Io { .. } | Self::Source { .. }),
+            Self::Io { source, .. } | Self::Source { source, .. } => {
+                pplx_space_common_core::host::path_errors::host_path_io_error_is_transient(source)
+            }
+            _ => false,
         }
     }
 }
@@ -303,7 +330,7 @@ impl RemoveError {
     /// Whether the same request can succeed later without anyone changing
     /// the store: only an I/O failure can.
     pub fn is_transient(&self) -> bool {
-        matches!(self, Self::Io { .. })
+        matches!(self, Self::Io { source, .. } if pplx_space_common_core::host::path_errors::host_path_io_error_is_transient(source))
     }
 }
 
@@ -317,6 +344,7 @@ pub struct ArtifactStore {
     owner: u32,
     /// The largest staged file a publication copies.
     max_file_bytes: u64,
+    verity_support: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<u64, bool>>>,
 }
 
 impl ArtifactStore {
@@ -333,6 +361,7 @@ impl ArtifactStore {
             staging_root: staging_root.into(),
             owner: 0,
             max_file_bytes,
+            verity_support: Default::default(),
         }
     }
 
@@ -388,11 +417,7 @@ impl ArtifactStore {
         pin: &PinnedKernel,
         image: &Path,
     ) -> Result<VerifiedArtifact, VerifyError> {
-        let directory = image
-            .parent()
-            .ok_or_else(|| VerifyError::InvalidImagePath {
-                path: image.to_path_buf(),
-            })?;
+        let directory = kernel_image_directory(image)?;
         self.verify_files(
             directory,
             &[PlannedFile {
@@ -421,18 +446,7 @@ impl ArtifactStore {
     /// Create an isolated execution-cache namespace below a protected or
     /// sticky root-owned parent. Never repair ownership of existing paths.
     pub fn prepare_execution_cache(&self, parent: &Path) -> Result<PathBuf, PublishError> {
-        RootProtection::ExecutionCacheParent.check(parent, self.owner)?;
-        let managed = parent.join("managed");
-        let kernels = Self::execution_cache_root(parent);
-        for directory in [&managed, &kernels] {
-            match std::fs::DirBuilder::new().mode(0o755).create(directory) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(source) => return Err(io_publish("create execution cache", directory, source)),
-            }
-            RootProtection::ExecutionCache.check(directory, self.owner)?;
-        }
-        Ok(kernels)
+        self.prepare_execution_namespace(parent, "kernels")
     }
 
     /// Publish a verified, independent kernel inode onto the execution cache
@@ -599,8 +613,7 @@ impl ArtifactStore {
         digest: Digest,
     ) -> Result<RemoveOutcome, RemoveError> {
         let root = &self.releases_root;
-        check_root(root, self.owner)
-            .map_err(|(path, problem)| RemoveError::UnsafeRoot { path, problem })?;
+        check_root(root, self.owner).map_err(RemoveError::from)?;
         let _locked = lock_root(root).map_err(|source| io("lock", root, source))?;
         let target = root.join(managed_release_directory(release, digest));
         if !exists(&target).map_err(|source| io("inspect", &target, source))? {
@@ -643,8 +656,7 @@ impl ArtifactStore {
             });
         }
         let root = &self.kernels_root;
-        check_root(root, self.owner)
-            .map_err(|(path, problem)| RemoveError::UnsafeRoot { path, problem })?;
+        check_root(root, self.owner).map_err(RemoveError::from)?;
         let _locked = lock_root(root).map_err(|source| io("lock", root, source))?;
         let target = root.join(managed_kernel_directory(version, digest));
         if !exists(&target).map_err(|source| io("inspect", &target, source))? {
@@ -719,8 +731,8 @@ impl ArtifactStore {
                 Err(error) => return Err(error),
                 Ok(_) => {}
             }
-            if let Err((path, problem)) = check_root(root, self.owner) {
-                tracing::warn!(path = %path.display(), problem, "skipping artifact cleanup in an unsafe or absent root");
+            if let Err(error) = check_root(root, self.owner) {
+                tracing::warn!(%error, "skipping artifact cleanup in an unsafe or absent root");
                 continue;
             }
             let _locked =
@@ -736,16 +748,7 @@ impl ArtifactStore {
                     }
                     Err(error) => return Err(error),
                 };
-            for entry in std::fs::read_dir(root)? {
-                let entry = entry?;
-                let leftover = entry.file_name().to_str().is_some_and(|name| {
-                    name.starts_with(INCOMING_PREFIX) || name.starts_with(REMOVING_PREFIX)
-                });
-                if leftover && entry.file_type()?.is_dir() {
-                    std::fs::remove_dir_all(entry.path())?;
-                    removed += 1;
-                }
-            }
+            removed += clear_root_leftovers(root)?;
         }
         Ok(removed)
     }
@@ -1068,76 +1071,12 @@ impl<'a> PublishSource<'a> {
 }
 
 /// One file a publication copies, and what it must be.
+#[derive(Clone)]
 struct PlannedFile {
     path: &'static str,
     sha256: Digest,
     size: Option<u64>,
     mode: u32,
-}
-
-/// Only execution-cache namespaces may live below shared sticky parents.
-/// Durable publication and removal keep the stricter store-root contract.
-#[derive(Clone, Copy)]
-enum RootProtection {
-    Store,
-    ExecutionCache,
-    ExecutionCacheParent,
-}
-
-impl RootProtection {
-    fn check(self, root: &Path, owner: u32) -> Result<(), PublishError> {
-        check_directories(root, owner, self)
-            .map_err(|(path, problem)| PublishError::UnsafeRoot { path, problem })
-    }
-
-    fn verify(self, root: &Path, owner: u32) -> Result<(), VerifyError> {
-        check_directories(root, owner, self)
-            .map_err(|(path, problem)| VerifyError::UnsafeRoot { path, problem })
-    }
-}
-
-/// Refuse a store root that another account could write or swap. Returns
-/// the offending path and the problem.
-fn check_root(root: &Path, owner: u32) -> Result<(), (PathBuf, &'static str)> {
-    check_directories(root, owner, RootProtection::Store)
-}
-
-fn check_directories(
-    root: &Path,
-    owner: u32,
-    protection: RootProtection,
-) -> Result<(), (PathBuf, &'static str)> {
-    for path in [
-        Some(root),
-        root.parent(),
-        root.parent().and_then(Path::parent),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        let metadata = std::fs::symlink_metadata(path)
-            .map_err(|_| (path.to_path_buf(), "missing or unreadable"))?;
-        if metadata.file_type().is_symlink() {
-            return Err((path.to_path_buf(), "a symlink"));
-        }
-        if !metadata.is_dir() {
-            return Err((path.to_path_buf(), "not a directory"));
-        }
-        if metadata.uid() != owner {
-            return Err((path.to_path_buf(), "owned by another account"));
-        }
-        let permits_sticky = match protection {
-            RootProtection::Store => false,
-            RootProtection::ExecutionCache => path != root,
-            RootProtection::ExecutionCacheParent => true,
-        };
-        if metadata.permissions().mode() & 0o022 != 0
-            && !(permits_sticky && metadata.permissions().mode() & 0o1000 != 0)
-        {
-            return Err((path.to_path_buf(), "writable by its group or others"));
-        }
-    }
-    Ok(())
 }
 
 /// Rename `target` out of `root`, so it is gone at once, then delete it.
@@ -1165,11 +1104,28 @@ fn exists(path: &Path) -> Result<bool, std::io::Error> {
     }
 }
 
+// Both legacy verification and sealed staging consume this exact layout.
+// Never authenticate a sibling vmlinux.bin while returning another input path.
+fn kernel_image_directory(image: &Path) -> Result<&Path, VerifyError> {
+    if image.file_name() != Some(std::ffi::OsStr::new(KERNEL_IMAGE)) {
+        return Err(VerifyError::KernelImageName {
+            path: image.to_path_buf(),
+        });
+    }
+    image.parent().ok_or_else(|| VerifyError::InvalidImagePath {
+        path: image.to_path_buf(),
+    })
+}
+
 fn sha256_file(path: &Path) -> Result<Digest, std::io::Error> {
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
+    sha256_reader(file)
+}
+
+fn sha256_reader(mut file: impl std::io::Read) -> Result<Digest, std::io::Error> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0; COPY_BUFFER_BYTES];
     loop {

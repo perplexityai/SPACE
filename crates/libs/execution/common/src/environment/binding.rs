@@ -60,6 +60,15 @@ impl EnvironmentDefinition {
         &self,
         execution: ExecutionMetadata,
     ) -> Result<ExecutionMetadata, EnvironmentBindingError> {
+        self.check_execution(&execution)?;
+        Ok(execution.with_environment(self.reference()))
+    }
+
+    /// Check observations without cloning or changing their binding.
+    pub fn check_execution(
+        &self,
+        execution: &ExecutionMetadata,
+    ) -> Result<(), EnvironmentBindingError> {
         if let Some(actual) = execution.environment()
             && actual != self.reference()
         {
@@ -91,7 +100,7 @@ impl EnvironmentDefinition {
         {
             return Err(EnvironmentBindingError::BootComponents);
         }
-        Ok(execution.with_environment(self.reference()))
+        Ok(())
     }
 }
 

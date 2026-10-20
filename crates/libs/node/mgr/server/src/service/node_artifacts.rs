@@ -27,7 +27,8 @@ use crate::proto::{
 use super::NodeManagerService;
 
 use pplx_space_node_runtime_core::runtime_inventory::{
-    ExecutionSelectionMode, ResolvedExecutionEnvironment, RuntimeInstallationFiles,
+    ExecutionSelectionMode, ExecutionSourceIntegrity, ResolvedExecutionEnvironment,
+    RuntimeInstallationFiles,
 };
 
 impl NodeManagerService {
@@ -111,7 +112,7 @@ impl NodeManagerService {
                 let definition = self.allowed_definition(Some(reference), mode)?;
                 if let Some(requested) = requested {
                     definition
-                        .bind_execution(requested.clone())
+                        .check_execution(requested)
                         .map_err(|error| Status::failed_precondition(describe(&error)))?;
                 }
                 Some(definition)
@@ -127,10 +128,11 @@ impl NodeManagerService {
             let requires_binding =
                 |identity: &RuntimeIdentity, files: &RuntimeInstallationFiles| {
                     identity != &initial.release().release
-                        && files.paths().any(|path| {
-                            path.starts_with(&self.runtime_paths.store.releases)
-                                && !path.starts_with(&self.runtime_paths.vendor)
-                        })
+                        && (files.integrity() == ExecutionSourceIntegrity::FsVerity
+                            || files.paths().any(|path| {
+                                path.starts_with(&self.runtime_paths.store.releases)
+                                    && !path.starts_with(&self.runtime_paths.vendor)
+                            }))
                 };
             // Moving verified legacy runtime bytes into the store does not bind
             // historical custom kernels to E0. Check the requested installation
@@ -361,19 +363,8 @@ pub(super) fn non_default_environments()
 
 pub(super) fn compiled_environments()
 -> Result<&'static [pplx_space_node_runtime_core::catalog::CompiledEnvironment], Status> {
-    static ENVIRONMENTS: std::sync::OnceLock<
-        Result<Vec<pplx_space_node_runtime_core::catalog::CompiledEnvironment>, Status>,
-    > = std::sync::OnceLock::new();
-    ENVIRONMENTS
-        .get_or_init(|| {
-            pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
-                host_arch()?
-            )
-            .map_err(|error| Status::failed_precondition(describe(&error)))
-        })
-        .as_ref()
-        .map(Vec::as_slice)
-        .map_err(Clone::clone)
+    pplx_space_node_runtime_core::catalog::CompiledEnvironment::cached_for_architecture(host_arch()?)
+        .map_err(|error| Status::failed_precondition(describe(error)))
 }
 
 pub(super) fn initial_environment() -> Result<&'static InitialEnvironment, Status> {
@@ -423,7 +414,12 @@ fn publish_status(error: PublishError) -> Status {
         PublishError::UnsafeRoot { .. } | PublishError::ExistingArtifact(_) => {
             Status::failed_precondition(describe(&error))
         }
-        PublishError::Source { .. } | PublishError::Io { .. } => Status::internal(describe(&error)),
+        PublishError::Source { .. } | PublishError::Io { .. } if error.is_transient() => {
+            Status::internal(describe(&error))
+        }
+        PublishError::Source { .. } | PublishError::Io { .. } => {
+            Status::failed_precondition(describe(&error))
+        }
     }
 }
 
@@ -433,7 +429,8 @@ fn remove_status(error: RemoveError) -> Status {
         RemoveError::IdentityChanged { .. } | RemoveError::UnsafeRoot { .. } => {
             Status::failed_precondition(describe(&error))
         }
-        RemoveError::Io { .. } => Status::internal(describe(&error)),
+        RemoveError::Io { .. } if error.is_transient() => Status::internal(describe(&error)),
+        RemoveError::Io { .. } => Status::failed_precondition(describe(&error)),
     }
 }
 
@@ -532,6 +529,14 @@ impl NodeManagerService {
                 tracing::warn!(%error, "artifact store preparation failed; execution roots unchanged")
             }
         }
+        // Warm in the tracked background lane. Inventory consumers still await
+        // the same serialized discovery; unrelated lifecycle RPCs can serve.
+        let service = self.clone();
+        self.device_op_tasks.spawn(async move {
+            if let Err(error) = service.runtime_inventory().await {
+                tracing::warn!(%error, "execution cache preparation incomplete; inventory requests retry binding discovery");
+            }
+        });
         // Reclaim independently of staging/account provisioning, and never hold
         // node readiness behind recursive deletion. Tracked for shutdown.
         let store = self.artifact_store();
