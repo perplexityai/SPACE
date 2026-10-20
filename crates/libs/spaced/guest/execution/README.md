@@ -31,7 +31,7 @@ execution metadata.
   (or `--features datadog`) when building the worker to enable its exporters.
   Host features and forwarded environment variables cannot enable exporters in
   a separately built worker that lacks them.
-- Execution and daemon constructors now return typed errors. Missing worker
+- Execution and daemon constructors return typed errors. Missing worker
   configuration fails construction; incompatible worker protocols fail startup
   without dispatching filesystem operations. IdentityWorkers on non-Linux returns
   an error; Direct remains the non-Linux default. The daemon validates its
