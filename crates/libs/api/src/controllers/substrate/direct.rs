@@ -3001,7 +3001,6 @@ impl DirectSubstrate {
                     );
 
                     let boot_mode = direct_create_boot_mode(request.template_ref.boot_mode)?;
-                    self.claim_create_target(sandbox_id, node.id).await?;
                     let create_response = client
                         .create_sandbox(pplx_space_sbx_mgr_client::proto::CreateRequest {
                             environment: None,
@@ -3045,7 +3044,6 @@ impl DirectSubstrate {
                             return Ok(Some((node, endpoint, client, response.into_inner())));
                         }
                         Err(status) => {
-                            self.release_create_target(sandbox_id, node.id).await?;
                             if pplx_space_sbx_mgr_client::is_template_policy_dependency(&status)
                                 && should_try_next_worker_candidate(&status)
                             {
@@ -3105,51 +3103,6 @@ impl DirectSubstrate {
         }
 
         Ok(None)
-    }
-
-    // Direct placement is recorded before dispatch so the worker can authorize
-    // its template read without requiring the API pod to be a sandbox host.
-    async fn claim_create_target(
-        &self,
-        sandbox_id: SandboxId,
-        node_id: NodeId,
-    ) -> Result<(), SubstrateError> {
-        let claimed = sqlx::query(sql!(
-            "UPDATE sandboxes SET target_node_id = $2
-             WHERE id = $1 AND managed_by = $3 AND lifecycle = 'creating'
-               AND active_node_id IS NULL AND target_node_id IS NULL"
-        ))
-        .bind(sandbox_id)
-        .bind(node_id)
-        .bind(SubstrateKind::Space)
-        .execute(&self.pool)
-        .await
-        .db_context("claim direct create target")?;
-        if claimed.rows_affected() == 0 {
-            return Err(SubstrateError::Conflict {
-                message: "sandbox is no longer awaiting direct creation".into(),
-            });
-        }
-        Ok(())
-    }
-
-    async fn release_create_target(
-        &self,
-        sandbox_id: SandboxId,
-        node_id: NodeId,
-    ) -> Result<(), SubstrateError> {
-        sqlx::query(sql!(
-            "UPDATE sandboxes SET target_node_id = NULL
-             WHERE id = $1 AND managed_by = $3 AND lifecycle = 'creating'
-               AND active_node_id IS NULL AND target_node_id = $2"
-        ))
-        .bind(sandbox_id)
-        .bind(node_id)
-        .bind(SubstrateKind::Space)
-        .execute(&self.pool)
-        .await
-        .db_context("release direct create target")?;
-        Ok(())
     }
 
     async fn worker_client_for_sandbox(

@@ -9,7 +9,6 @@ use super::validation::{
 };
 use super::*;
 use pplx_space_common_core::types::{EnvMap, EnvSanitizationIssue};
-use pplx_space_common_svc::template_lookup::TemplateLookupScope;
 use pplx_space_events::{
     SandboxEventDetails, SandboxEventSource, SandboxEventType, SandboxRestoreProvenance,
     emit_sandbox_event,
@@ -655,42 +654,20 @@ pub(super) fn checkpoint_start_response_for_existing_started_sandbox(
     }
 }
 
-pub(crate) fn template_lookup_scope(
-    owner: &SandboxOwner,
-    sandbox_id: Option<&str>,
-) -> Result<TemplateLookupScope, Status> {
-    if matches!(owner.kind(), SandboxOwnerKind::PlatformUser(_)) {
-        let id = sandbox_id
-            .ok_or_else(|| {
-                Status::failed_precondition("tenant template lookup requires sandbox identity")
-            })?
-            .parse()
-            .map_err(|_| Status::invalid_argument("invalid template sandbox identity"))?;
-        Ok(TemplateLookupScope::Sandbox {
-            id,
-            caller_node: None,
-        })
-    } else {
-        Ok(TemplateLookupScope::LocalExecution)
-    }
-}
-
 pub(super) async fn resolve_template_paths(
     templates: &dyn crate::template_resolver::TemplateResolver,
     template_ref: pplx_space_template_mgr_client::proto::TemplateRef,
-    scope: TemplateLookupScope,
 ) -> Result<ResolvedTemplatePaths, tonic::Status> {
     use crate::template_resolver::TemplateLookupError;
-    let mut request =
-        tonic::Request::new(pplx_space_template_mgr_client::proto::GetTemplateRequest {
-            caller_org_id: None,
-            template: Some(template_ref),
-            vcpu: None,
-            memory_mib: None,
-        });
-    scope.attach(&mut request);
-    let response = templates
-        .get_template(request)
+    let inner = templates
+        .get_template(tonic::Request::new(
+            pplx_space_template_mgr_client::proto::GetTemplateRequest {
+                caller_org_id: None,
+                template: Some(template_ref),
+                vcpu: None,
+                memory_mib: None,
+            },
+        ))
         .await
         .map_err(|error| match error {
             TemplateLookupError::Connect(e) => {
@@ -699,9 +676,8 @@ pub(super) async fn resolve_template_paths(
             TemplateLookupError::Rpc(e) => {
                 tonic::Status::new(e.code(), format!("GetTemplate failed: {e}"))
             }
-        })?;
-    scope.require_acknowledgement(&response)?;
-    let inner = response.into_inner();
+        })?
+        .into_inner();
     let tmpl = inner.template.unwrap_or_default();
     let arch = template_metadata_arch(&inner.template_dir).unwrap_or(inner.arch);
     let spaced_compatibility = template_metadata_spaced_compatibility(&inner.template_dir);
@@ -795,7 +771,6 @@ pub(super) fn stage_base_snapshot_runtime_metadata(
 pub(super) async fn resolve_template_paths_for_start(
     templates: &dyn crate::template_resolver::TemplateResolver,
     template_ref: pplx_space_template_mgr_client::proto::TemplateRef,
-    sandbox: &crate::db::SandboxRow,
 ) -> Result<ResolvedTemplatePaths, Status> {
     // Start restores an existing sandbox's identity. A name-only lookup could
     // silently pick a new image after an alias moves; only create may do that.
@@ -808,13 +783,9 @@ pub(super) async fn resolve_template_paths_for_start(
             "cannot recover sandbox artifact without its saved template hash",
         ));
     }
-    resolve_template_paths(
-        templates,
-        template_ref,
-        template_lookup_scope(&sandbox.user, Some(&sandbox.id))?,
-    )
-    .await
-    .map_err(start_template_resolution_failed_status)
+    resolve_template_paths(templates, template_ref)
+        .await
+        .map_err(start_template_resolution_failed_status)
 }
 
 fn start_template_resolution_failed_status(error: Status) -> Status {
@@ -844,13 +815,6 @@ pub(super) async fn template_runtime_defaults_for_sandbox_start(
             name: sandbox.template.clone(),
             content_hash: sandbox.template_hash.clone(),
             tag: None,
-        },
-        match template_lookup_scope(&sandbox.user, Some(&sandbox.id)) {
-            Ok(scope) => scope,
-            Err(error) => {
-                tracing::warn!(%error, "invalid sandbox template scope");
-                return TemplateRuntimeDefaults::default();
-            }
         },
     )
     .await
@@ -947,7 +911,6 @@ pub(super) async fn template_source_for_sandbox_prepare_in(
             content_hash: sandbox.template_hash.clone(),
             tag: None,
         },
-        sandbox,
     )
     .await?;
     reject_incompatible_template_arch(

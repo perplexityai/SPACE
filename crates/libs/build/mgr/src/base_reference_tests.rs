@@ -102,33 +102,3 @@ fn oci_build_summary_does_not_include_the_caller_reference() {
 
     assert_eq!(message, "  Source: OCI image");
 }
-
-#[rstest]
-#[case::local(false)]
-#[case::tenant(true)]
-fn base_lookup_preserves_local_execution_and_tenant_catalog_authority(#[case] tenant: bool) {
-    use pplx_space_common_svc::template_lookup::TemplateLookupScope;
-    let org = tenant.then(pplx_space_common_core::types::OrgId::new);
-    let builder = super::TemplateBuilder::new().with_caller_org(org);
-    let (_, request) =
-        builder.base_lookup_request(pplx_space_template_mgr_client::proto::TemplateRef {
-            name: "seed".into(),
-            content_hash: Some(HASH.into()),
-            tag: None,
-        });
-
-    let scope = TemplateLookupScope::from_request(&request).unwrap();
-
-    assert_eq!(
-        scope,
-        Some(if tenant {
-            TemplateLookupScope::Cluster
-        } else {
-            TemplateLookupScope::LocalExecution
-        })
-    );
-    assert_eq!(
-        request.get_ref().caller_org_id,
-        org.map(|org| org.to_string())
-    );
-}

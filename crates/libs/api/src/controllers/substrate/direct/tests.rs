@@ -2599,12 +2599,6 @@ async fn direct_create_receipt_failure_deletes_node_local_sandbox() -> TestResul
     let registered_node_id = NodeId::new();
     let (server, state) = start_sim_worker(registered_node_id).await?;
     insert_sandbox(&fixture.pool, sandbox_id, Some(registered_node_id)).await?;
-    sqlx::query(sql!(
-        "UPDATE sandboxes SET lifecycle = 'creating', target_node_id = NULL WHERE id = $1"
-    ))
-    .bind(sandbox_id)
-    .execute(&fixture.pool)
-    .await?;
     insert_ready_worker(
         &fixture.pool,
         registered_node_id,
@@ -2695,12 +2689,6 @@ async fn direct_create_identity_preparation_failure_deletes_node_local_sandbox()
     let node_id = NodeId::new();
     let (server, state) = start_sim_worker(node_id).await?;
     insert_sandbox(&fixture.pool, sandbox_id, Some(node_id)).await?;
-    sqlx::query(sql!(
-        "UPDATE sandboxes SET lifecycle = 'creating', target_node_id = NULL WHERE id = $1"
-    ))
-    .bind(sandbox_id)
-    .execute(&fixture.pool)
-    .await?;
     insert_ready_worker(&fixture.pool, node_id, server.endpoint(), "9.0.0").await?;
     insert_template_inventory(&fixture.pool, node_id, "seed", "hash-seed", "9.0.0").await?;
     sqlx::query("DROP TABLE sandbox_direct_route_provenance")
@@ -2777,12 +2765,6 @@ async fn two_step_direct_create_initializes_identity_for_initial_start() -> Test
     let node_id = NodeId::new();
     let (server, _state) = start_sim_worker(node_id).await?;
     insert_sandbox(&fixture.pool, sandbox_id, Some(node_id)).await?;
-    sqlx::query(sql!(
-        "UPDATE sandboxes SET lifecycle = 'creating', target_node_id = NULL WHERE id = $1"
-    ))
-    .bind(sandbox_id)
-    .execute(&fixture.pool)
-    .await?;
     insert_ready_worker(&fixture.pool, node_id, server.endpoint(), "9.0.0").await?;
     insert_template_inventory(&fixture.pool, node_id, "seed", "hash-seed", "9.0.0").await?;
 
@@ -2831,16 +2813,6 @@ async fn two_step_direct_create_initializes_identity_for_initial_start() -> Test
         })
         .await?;
 
-    let target: Option<NodeId> =
-        sqlx::query_scalar(sql!("SELECT target_node_id FROM sandboxes WHERE id = $1"))
-            .bind(sandbox_id)
-            .fetch_one(&fixture.pool)
-            .await?;
-    assert_eq!(
-        target,
-        Some(node_id),
-        "creation retains the authorized worker placement"
-    );
     assert_eq!(outcome.binding.unwrap().execution_generation, 2);
     let persisted_generation = sqlx::query_scalar::<_, i64>(
         "SELECT execution_generation

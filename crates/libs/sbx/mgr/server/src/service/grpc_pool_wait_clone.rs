@@ -264,7 +264,6 @@ impl SandboxManagerService {
                                 content_hash: sandbox.template_hash.clone(),
                                 tag: None,
                             },
-                            template_lookup_scope(&sandbox.user, Some(&sandbox.id))?,
                         )
                         .await?,
                     )
@@ -695,12 +694,8 @@ impl SandboxManagerService {
         let uuid8 = SandboxRuntimeLabel::from_sandbox_id(new_sandbox_id);
 
         // Resolve template and compute hash
-        let resolved_template = resolve_template_paths(
-            self.template_resolver.as_ref(),
-            template_ref,
-            template_lookup_scope(&donor.user, Some(&donor.id))?,
-        )
-        .await?;
+        let resolved_template =
+            resolve_template_paths(self.template_resolver.as_ref(), template_ref).await?;
         reject_incompatible_template_arch(
             template,
             resolved_template

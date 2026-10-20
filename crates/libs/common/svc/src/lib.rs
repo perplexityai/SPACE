@@ -37,7 +37,6 @@ pub mod space_api_route_capability;
 pub mod space_api_route_ed25519;
 pub mod sql;
 pub mod systemd;
-pub mod template_lookup;
 pub mod tokio_runtime;
 pub mod types;
 

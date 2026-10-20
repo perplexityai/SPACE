@@ -991,7 +991,6 @@ impl SandboxManagerService {
                     content_hash: sandbox.template_hash.clone(),
                     tag: None,
                 },
-                template_lookup_scope(&sandbox.user, Some(&sandbox.id))?,
             )
             .await?;
             policy = resolved_template.default_auto_lifecycle;

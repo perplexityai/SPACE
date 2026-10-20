@@ -3591,11 +3591,8 @@ async fn node_scoped_lookups_hide_unplaced_private_releases() -> TestResult {
 
 /// A sandbox of the template placed on a node, by active or target
 /// placement, lets that node and only that node resolve the release.
-#[rstest::rstest]
 #[tokio::test(flavor = "current_thread")]
-async fn placed_sandbox_unlocks_private_release_for_its_node_only(
-    #[values("present", "deleting")] desired_state: &str,
-) -> TestResult {
+async fn placed_sandbox_unlocks_private_release_for_its_node_only() -> TestResult {
     let Some(fixture) = cluster_fixture().await? else {
         return Ok(());
     };
@@ -3644,104 +3641,6 @@ async fn placed_sandbox_unlocks_private_release_for_its_node_only(
     );
     assert_eq!(found.authorized_org_id, None);
 
-    sqlx::query(sql!(
-        "UPDATE templates SET desired_state = $1 WHERE name = 'private-base'"
-    ))
-    .bind(desired_state)
-    .execute(pool)
-    .await?;
-
-    // Forwarding must intersect scopes; naming a different node cannot borrow
-    // the receiving node's placement, and a sandbox delegates its stored org.
-    use pplx_space_common_svc::template_lookup::TemplateLookupScope;
-    for (delegation, asserted_org, expected) in [
-        (TemplateLookupScope::Node(worker_a_ip.into()), None, None),
-        (
-            TemplateLookupScope::Node(worker_b_ip.into()),
-            None,
-            Some(tonic::Code::NotFound),
-        ),
-        (
-            TemplateLookupScope::Sandbox {
-                id: SandboxId::from_uuid(sandbox_id),
-                caller_node: Some(worker_a_ip.into()),
-            },
-            None,
-            None,
-        ),
-        (
-            TemplateLookupScope::Sandbox {
-                id: SandboxId::from_uuid(sandbox_id),
-                caller_node: Some(worker_b_ip.into()),
-            },
-            None,
-            Some(tonic::Code::PermissionDenied),
-        ),
-        (
-            TemplateLookupScope::Sandbox {
-                id: SandboxId::from_uuid(sandbox_id),
-                caller_node: None,
-            },
-            None,
-            None,
-        ),
-        (
-            TemplateLookupScope::Sandbox {
-                id: SandboxId::from_uuid(sandbox_id),
-                caller_node: None,
-            },
-            Some(Uuid::nil()),
-            Some(tonic::Code::PermissionDenied),
-        ),
-    ] {
-        let mut request = node_scoped_request(
-            FindTemplateReleaseByHashRequest {
-                generic_only: false,
-                template_name: "private-base".into(),
-                hash: hash.clone(),
-                caller_org_id: asserted_org.map(|org| org.to_string()),
-            },
-            worker_a_ip,
-        );
-        delegation.attach(&mut request);
-
-        let response = fixture.service.find_template_release_by_hash(request).await;
-
-        if let Some(code) = expected {
-            assert_eq!(response.unwrap_err().code(), code);
-        } else {
-            let response = response?;
-            delegation.require_acknowledgement(&response)?;
-            if matches!(delegation, TemplateLookupScope::Sandbox { .. }) {
-                assert_eq!(
-                    response.get_ref().authorized_org_id,
-                    Some(owner.to_string())
-                );
-            }
-        }
-    }
-
-    // Static-only installations retain their operator trust boundary.
-    let mut request = Request::new(FindTemplateReleaseByHashRequest {
-        generic_only: false,
-        template_name: "private-base".into(),
-        hash: hash.clone(),
-        caller_org_id: None,
-    });
-    TemplateLookupScope::Sandbox {
-        id: SandboxId::from_uuid(sandbox_id),
-        caller_node: None,
-    }
-    .attach(&mut request);
-    let response = fixture
-        .service
-        .find_template_release_by_hash(request)
-        .await?;
-    assert_eq!(
-        response.get_ref().authorized_org_id,
-        Some(owner.to_string())
-    );
-
     // A pending migration is a target placement; the destination may pull
     // before it becomes active, and the source keeps access while it still
     // hosts the sandbox.
@@ -3754,35 +3653,6 @@ async fn placed_sandbox_unlocks_private_release_for_its_node_only(
     .await?;
     assert!(release_visible_from(&fixture, "private-base", &hash, worker_a_ip, None).await?);
     assert!(release_visible_from(&fixture, "private-base", &hash, worker_b_ip, None).await?);
-    for delegation in [
-        TemplateLookupScope::Node(worker_b_ip.into()),
-        TemplateLookupScope::Sandbox {
-            id: SandboxId::from_uuid(sandbox_id),
-            caller_node: Some(worker_b_ip.into()),
-        },
-    ] {
-        let mut request = node_scoped_request(
-            FindTemplateReleaseByHashRequest {
-                generic_only: false,
-                template_name: "private-base".into(),
-                hash: hash.clone(),
-                caller_org_id: None,
-            },
-            worker_a_ip,
-        );
-        delegation.attach(&mut request);
-
-        let response = fixture
-            .service
-            .find_template_release_by_hash(request)
-            .await?;
-
-        delegation.require_acknowledgement(&response)?;
-        assert_eq!(
-            response.get_ref().release.as_ref().unwrap().id,
-            release_id.to_string()
-        );
-    }
     sqlx::query(sql!(
         "UPDATE sandboxes SET active_node_id = $2 WHERE id = $1"
     ))

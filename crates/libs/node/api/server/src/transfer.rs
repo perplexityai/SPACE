@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use pplx_space_common_svc::bootstrap::wrap_grpc_client_channel;
-use pplx_space_common_svc::template_lookup::TemplateLookupScope;
 use tokio_stream::StreamExt;
 use tonic::Status;
 use tonic::codegen::InterceptedService;
@@ -155,36 +154,6 @@ fn optional_snapshot_dimensions(
     }
 }
 
-async fn probe_cached_template(
-    client: &mut pplx_space_template_mgr_client::TemplateManagerGrpcClient,
-    pull: &PullTemplateRequest,
-    hash: &str,
-    scope: TemplateLookupScope,
-) -> Result<Option<pplx_space_template_mgr_client::proto::GetTemplateResponse>, Status> {
-    let mut request =
-        tonic::Request::new(pplx_space_template_mgr_client::proto::GetTemplateRequest {
-            caller_org_id: None,
-            template: Some(pplx_space_template_mgr_client::proto::TemplateRef {
-                name: pull.template_id.clone(),
-                content_hash: Some(hash.to_owned()),
-                tag: None,
-            }),
-            vcpu: pull.snapshot_vcpu,
-            memory_mib: pull.snapshot_memory_mib,
-        });
-    scope.attach(&mut request);
-    let Ok(response) = pplx_space_common_grpc::fwd_retry!(
-        "template-manager",
-        client.clone(),
-        get_template,
-        request
-    ) else {
-        return Ok(None);
-    };
-    scope.require_acknowledgement(&response)?;
-    Ok(Some(response.into_inner()))
-}
-
 /// Shared PullTemplate orchestration logic used by both WorkerApi and BuilderApi.
 ///
 /// 1. Checks if the template already exists locally (`skip_if_exists`).
@@ -205,7 +174,6 @@ async fn probe_cached_template(
 pub async fn pull_template(
     tmpl_client: &mut pplx_space_template_mgr_client::TemplateManagerGrpcClient,
     req: &PullTemplateRequest,
-    scope: TemplateLookupScope,
 ) -> Result<PullTemplateResponse, Status> {
     let template_id = &req.template_id;
 
@@ -223,9 +191,23 @@ pub async fn pull_template(
     // the remote's tag may point to a different build than the local one.
     if req.skip_if_exists
         && !req_content_hash.is_empty()
-        && let Some(local) =
-            probe_cached_template(tmpl_client, req, req_content_hash, scope).await?
+        && let Ok(resp) = pplx_space_common_grpc::fwd_retry!(
+            "template-manager",
+            tmpl_client.clone(),
+            get_template,
+            tonic::Request::new(pplx_space_template_mgr_client::proto::GetTemplateRequest {
+                caller_org_id: None,
+                template: Some(pplx_space_template_mgr_client::proto::TemplateRef {
+                    name: template_id.clone(),
+                    content_hash: req.content_hash.clone(),
+                    tag: None,
+                }),
+                vcpu: req.snapshot_vcpu,
+                memory_mib: req.snapshot_memory_mib,
+            })
+        )
     {
+        let local = resp.into_inner();
         let local_hash = local
             .template
             .as_ref()
@@ -344,9 +326,23 @@ pub async fn pull_template(
     // For tag-based pulls: now that we know the resolved hash from the source,
     // check if this exact build (+ snapshot if requested) already exists locally.
     if req.skip_if_exists
-        && let Some(local) =
-            probe_cached_template(tmpl_client, req, export_content_hash, scope).await?
+        && let Ok(resp) = pplx_space_common_grpc::fwd_retry!(
+            "template-manager",
+            tmpl_client.clone(),
+            get_template,
+            tonic::Request::new(pplx_space_template_mgr_client::proto::GetTemplateRequest {
+                caller_org_id: None,
+                template: Some(pplx_space_template_mgr_client::proto::TemplateRef {
+                    name: template_id.clone(),
+                    content_hash: Some(export_content_hash.to_string()),
+                    tag: None,
+                }),
+                vcpu: req.snapshot_vcpu,
+                memory_mib: req.snapshot_memory_mib,
+            })
+        )
     {
+        let local = resp.into_inner();
         let local_hash = local
             .template
             .as_ref()

@@ -98,13 +98,6 @@ async fn template_transfer_authority_survives_the_wire(
                 template_id: "example-template".into(),
                 content_hash: Some(format!("sha256:{}", "a".repeat(64))),
                 skip_if_exists: true,
-                sources: vec![crate::proto::TransferSource {
-                    source: Some(crate::proto::transfer_source::Source::Node(
-                        crate::proto::NodeSource {
-                            address: "http://127.0.0.1:1".into(),
-                        }
-                    )),
-                }],
                 ..Default::default()
             }
         ),

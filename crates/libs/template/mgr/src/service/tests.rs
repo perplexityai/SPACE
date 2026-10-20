@@ -1,5 +1,3 @@
-mod lookup_rpc;
-
 use pplx_space_common_core::types::OrgId;
 
 use super::*;
@@ -1164,7 +1162,7 @@ async fn get_template_authorizes_and_resolves_before_using_cached_builds(
     #[values(false, true)] scoped: bool,
     #[values(false, true)] cold: bool,
 ) {
-    use crate::volume::{PullOutcome, ResolvedRelease};
+    use crate::volume::{FindReleaseError, PullOutcome, ResolvedRelease};
     let CachedBaseFixture {
         root,
         service,
@@ -1206,7 +1204,6 @@ async fn get_template_authorizes_and_resolves_before_using_cached_builds(
                     assert_eq!(resolved_tag, tag.unwrap_or_default());
                     assert_eq!(caller, scoped.then_some(org));
                     Ok(ResolvedRelease {
-                        authorized_org: caller,
                         hash: selected.clone(),
                         storage_uris: vec![],
                         visibility:
@@ -1236,34 +1233,7 @@ async fn get_template_authorizes_and_resolves_before_using_cached_builds(
         );
     }
     assert_eq!(materialized.get(), cold);
-}
 
-fn cached_lookup_request(
-    hash: Option<String>,
-    tag: Option<&str>,
-    org: OrgId,
-) -> Request<crate::proto::GetTemplateRequest> {
-    internal_request(crate::proto::GetTemplateRequest {
-        template: Some(crate::proto::TemplateRef {
-            name: "base".into(),
-            content_hash: hash,
-            tag: tag.map(str::to_owned),
-        }),
-        caller_org_id: Some(org.to_string()),
-        vcpu: Some(1),
-        memory_mib: Some(512),
-    })
-}
-
-#[tokio::test]
-async fn local_cached_lookup_stays_available_without_catalog() {
-    let CachedBaseFixture {
-        root: _root,
-        service,
-        org,
-        hash_a,
-        hash_b,
-    } = cached_base_fixture();
     // Sandbox Start reads template policy without a digest, tag, or dimensions.
     // That trusted lookup must work for locally registered, unpublished templates.
     for (hash, tag, selected) in [
@@ -1271,7 +1241,7 @@ async fn local_cached_lookup_stays_available_without_catalog() {
         (Some(hash_a.clone()), Some("stable"), &hash_a),
         (None, None, &hash_b),
     ] {
-        let mut legacy_request = cached_lookup_request(hash, tag, org);
+        let mut legacy_request = request(hash, tag);
         legacy_request.get_mut().caller_org_id = None;
         legacy_request.get_mut().vcpu = None;
         legacy_request.get_mut().memory_mib = None;
@@ -1300,33 +1270,19 @@ async fn local_cached_lookup_stays_available_without_catalog() {
             crate::db::PolicyAuthority::Local.as_proto_i32()
         );
     }
-}
 
-#[tokio::test]
-async fn rejected_catalog_lookup_never_falls_back_to_cache() {
-    let CachedBaseFixture {
-        service,
-        org,
-        hash_a,
-        ..
-    } = cached_base_fixture();
     // Revoked access and a missing tag must not fall back to either cached build.
     for (hash, tag, caller_org) in [
-        (Some(hash_a.clone()), None, Some(org)),
-        (Some(hash_a), None, None),
+        (Some(hash_a), None, Some(org)),
         (None, Some("missing"), Some(org)),
         (None, Some("missing"), None),
     ] {
-        let mut lookup = cached_lookup_request(hash, tag, org);
+        let mut lookup = request(hash, tag);
         lookup.get_mut().caller_org_id = caller_org.map(|org| org.to_string());
-        pplx_space_common_svc::template_lookup::TemplateLookupScope::Node(
-            "127.0.0.2".parse().unwrap(),
-        )
-        .attach(&mut lookup);
         let error = service
             .get_template_resolving(
                 lookup,
-                async |_, _, _, _| Err(crate::volume::FindReleaseError::NotFound),
+                async |_, _, _, _| Err(FindReleaseError::NotFound),
                 async |_, _, _| panic!("unresolved release must not be pulled"),
             )
             .await

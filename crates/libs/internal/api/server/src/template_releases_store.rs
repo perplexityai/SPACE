@@ -237,13 +237,7 @@ impl TemplateReleasesStore {
                AND r.type = $3
                AND (NOT $6 OR tpl.visibility = 'generic')
                AND ($4::UUID IS NULL OR (
-                       (tpl.desired_state = 'present' OR EXISTS (
-                           SELECT 1 FROM sandboxes placed
-                           WHERE placed.template_id = tpl.name
-                             AND placed.org_id = $4
-                             AND ($5::UUID[] IS NULL
-                                  OR placed.active_node_id = ANY($5)
-                                  OR placed.target_node_id = ANY($5))))
+                       tpl.desired_state = 'present'
                        AND (tpl.visibility = 'generic'
                             OR (tpl.visibility = 'org_specific' AND tpl.org_id = $4))))
                AND ($5::UUID[] IS NULL
@@ -337,13 +331,7 @@ impl TemplateReleasesStore {
                AND r.hash IN ($2, $3)
                AND (NOT $6 OR tpl.visibility = 'generic')
                AND ($4::UUID IS NULL OR (
-                       (tpl.desired_state = 'present' OR EXISTS (
-                           SELECT 1 FROM sandboxes placed
-                           WHERE placed.template_id = tpl.name
-                             AND placed.org_id = $4
-                             AND ($5::UUID[] IS NULL
-                                  OR placed.active_node_id = ANY($5)
-                                  OR placed.target_node_id = ANY($5))))
+                       tpl.desired_state = 'present'
                        AND (tpl.visibility = 'generic'
                             OR (tpl.visibility = 'org_specific' AND tpl.org_id = $4))))
                AND ($5::UUID[] IS NULL

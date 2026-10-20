@@ -15,7 +15,6 @@ pub mod node_ctl;
 pub mod node_info;
 mod restart_handoff;
 mod run;
-mod template_lookup;
 pub mod transfer;
 pub mod uds_per_sandbox_limiter;
 pub mod worker;

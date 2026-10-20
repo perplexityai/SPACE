@@ -152,12 +152,9 @@ impl BuilderApi for BuilderApiService {
 
     async fn get_template(
         &self,
-        mut r: Request<pplx_space_template_mgr_client::proto::GetTemplateRequest>,
+        r: Request<pplx_space_template_mgr_client::proto::GetTemplateRequest>,
     ) -> Result<Response<pplx_space_template_mgr_client::proto::GetTemplateResponse>, Status> {
-        let scope = crate::template_lookup::bind_caller_scope(&mut r)?;
-        let response = fwd_retry!("template-manager", self.clients.tmpl(), get_template, r)?;
-        scope.require_acknowledgement(&response)?;
-        Ok(response)
+        fwd_retry!("template-manager", self.clients.tmpl(), get_template, r)
     }
 
     async fn update_template_settings(
@@ -247,12 +244,11 @@ impl BuilderApi for BuilderApiService {
 
     async fn pull_template(
         &self,
-        mut r: Request<crate::proto::PullTemplateRequest>,
+        r: Request<crate::proto::PullTemplateRequest>,
     ) -> Result<Response<crate::proto::PullTemplateResponse>, Status> {
         pplx_space_common_svc::auth::template_transfer::require_template_transfer_authority(&r)?;
-        let scope = crate::template_lookup::bind_caller_scope(&mut r)?;
         let req = r.into_inner();
-        let resp = crate::transfer::pull_template(&mut self.clients.tmpl(), &req, scope).await?;
+        let resp = crate::transfer::pull_template(&mut self.clients.tmpl(), &req).await?;
         Ok(Response::new(resp))
     }
 
