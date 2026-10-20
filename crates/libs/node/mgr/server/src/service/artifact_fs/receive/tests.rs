@@ -317,6 +317,7 @@ fn receive_bounds_memory_of_appended_stream() {
     let destination = fixture.join("destination");
     std::fs::create_dir(&destination).unwrap();
     let receive = ReceiveRoot::open(&destination).unwrap();
+    eprintln!("appended-stream fixture ready; starting real btrfs receive");
     let started = std::time::Instant::now();
     let result = receive.receive(File::open(fixture.join("corrupt")).unwrap(), None);
     let elapsed = started.elapsed();
