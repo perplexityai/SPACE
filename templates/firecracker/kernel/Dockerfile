@@ -1,13 +1,13 @@
 # The linux/amd64 image, not the multi-platform index: BuildKit keys its cache
 # by the manifest it resolves, and the image mirror (ci/mirrored-images.txt)
 # serves this manifest, so the source and the mirror share cached layers.
-FROM ubuntu:24.04@sha256:496754492fb28b4d3049432f2ca787449331e23fb14f0dd3fffea86bf5a93eb4 AS base
+FROM ubuntu:24.04@sha256:a2d43bffc46670d7108bb3c0468c67c5557c4c92e83e1e34cbff1322ad1b94dc AS base
 
-ARG UBUNTU_SNAPSHOT=20260923T000000Z
+ARG UBUNTU_SNAPSHOT=20261020T200000Z
 
 # Ubuntu's minimal image needs a CA bundle before APT can use snapshot HTTPS.
-ADD --checksum=sha256:f66dff1bdf8f96060b8177976f8b7d9254bc89bc4db933d769f7384d28480bc9 \
-    https://curl.se/ca/cacert-2026-08-13.pem /etc/ssl/certs/ca-certificates.crt
+ADD --checksum=sha256:796f1389bfea13c0ed78f663b765baaff54a508e5483786bd6ece73c5e3e3cbe \
+    https://curl.se/ca/cacert-2026-10-20.pem /etc/ssl/certs/ca-certificates.crt
 RUN chmod 0644 /etc/ssl/certs/ca-certificates.crt \
     && sed -i "s|^URIs:.*|URIs: https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/|" \
         /etc/apt/sources.list.d/ubuntu.sources
