@@ -500,17 +500,19 @@ fn sandbox_disk_mib_option(sandbox: &Sandbox) -> Option<u32> {
     sandbox.disk_mib.and_then(|value| u32::try_from(value).ok())
 }
 
-fn sandbox_effective_network_policy_generation(sandbox: &Sandbox) -> u64 {
-    let generation = if sandbox.network_policy.is_some() {
-        Some(sandbox.network_policy_generation)
-    } else {
-        sandbox
-            .template_network_policy_generation
-            .or(Some(sandbox.network_policy_generation))
-    };
-    generation
-        .and_then(|value| u64::try_from(value).ok())
-        .unwrap_or(0)
+/// The generation a cold pod seeds sandbox-manager's network policy with.
+///
+/// The pod annotation always carries the effective policy, so the sandbox
+/// enforces it from its first boot. An override is seeded at the sandbox's own
+/// generation, the lineage node-ctl reconciles it on. An inherited policy is
+/// seeded at 0, which sandbox-manager keeps as a cluster placeholder: the first
+/// reconcile carries the sandbox's generation, never below 1, and replaces it
+/// with template inheritance. Seeding the template's generation, an unrelated
+/// counter, made that reconcile collide with the placeholder at the same
+/// generation, or be skipped below it, so the sandbox followed neither its
+/// template nor a later override.
+fn cold_pod_network_policy_generation(has_override: bool, sandbox_generation: u64) -> u64 {
+    if has_override { sandbox_generation } else { 0 }
 }
 
 fn execution_generation_to_u64(generation: i64) -> Result<u64, SubstrateError> {

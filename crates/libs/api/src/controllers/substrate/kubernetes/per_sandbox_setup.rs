@@ -49,9 +49,9 @@ const SETUP_POLICY_AUTHORITY: PolicyAuthority = PolicyAuthority::Cluster;
 
 /// Resolved network-policy setup intent. The effective policy is the value the
 /// sandbox must enforce and is identical across cold and adoption; the `override`
-/// records whether the user supplied an explicit policy (the wire *generation* is
-/// derived per-path and is intentionally not stored here — see the module-level
-/// note on cold vs. adoption generation handling).
+/// records whether the user supplied an explicit policy (the wire *generation*
+/// comes from the request each path carries and is intentionally not stored
+/// here).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct NetworkPolicySetup {
     /// Explicit per-sandbox override, if the request carried one.
@@ -164,8 +164,8 @@ impl PerSandboxSetup {
     /// metadata block borrows. Exhaustively destructures `self`, so a new setup
     /// field fails to compile here until handled.
     ///
-    /// `network_policy_generation` is supplied by the caller because the cold and
-    /// adoption paths derive it differently (see the module-level note); the
+    /// `network_policy_generation` is supplied by the caller, which derives it
+    /// from its request (see `cold_pod_network_policy_generation`); the
     /// effective policy and owner are shared.
     pub(super) fn into_cold_pod_metadata(
         self,
@@ -185,9 +185,9 @@ impl PerSandboxSetup {
         // Cold create passes process env through the pod/shim create path, not
         // through pod runtime metadata.
         let NetworkPolicySetup {
-            // Cold encodes only the effective policy into the pod annotation; the
-            // override-vs-inherit distinction is carried by the generation the
-            // caller computed.
+            // Cold encodes only the effective policy into the pod annotation, so
+            // the sandbox enforces it from boot; an inherited policy is seeded at
+            // generation 0, which the first reconcile replaces.
             override_policy: _,
             effective_policy,
             authority,

@@ -240,15 +240,13 @@ impl SubstrateAdapter for KubernetesSubstrate {
         // `per_sandbox_setup` for the compile-time guarantee that both paths
         // stay in sync.
         //
-        // Cold derives the network-policy annotation generation from the
-        // template counter on inherit; adoption deliberately uses 0 instead (it
-        // adopts an already-booted pod whose generation counter is independent),
-        // so the wire generation is computed per-path rather than shared.
-        let cold_network_policy_generation = if request.network_policy_override.is_some() {
-            request.network_policy_generation
-        } else {
-            request.template_network_policy_generation
-        };
+        // An inherited policy is seeded at 0, as adoption also sends it, so the
+        // first reconcile at the sandbox's generation replaces the seed; see
+        // `cold_pod_network_policy_generation`.
+        let cold_network_policy_generation = cold_pod_network_policy_generation(
+            request.network_policy_override.is_some(),
+            request.network_policy_generation,
+        );
         // Every fallible step between the claim and the pod create, so a
         // failure gives the claim back before the error is returned.
         let prepared = async {
@@ -2691,12 +2689,10 @@ impl SubstrateAdapter for KubernetesSubstrate {
         // Pool ownership precedes this policy capture; the create request may
         // still contain the policy from before the claim.
         setup.auto_lifecycle = policy.clone();
-        // Cold bakes the inherit-template network-policy generation from the
-        // template counter into the pod annotation; adoption deliberately uses 0
-        // so the adopted pod keeps its own independent generation counter (a later
-        // user override carries the API's Postgres generation and must not be
-        // skipped if the template counter happened to be higher). The override
-        // case uses the request generation in both paths.
+        // Inheritance is sent at 0 and an override at the request generation,
+        // as the cold pod seeds it: a later reconcile or user override carries
+        // the API's Postgres generation and must not be skipped or collide
+        // with a template counter.
         let network_policy_generation = if request.network_policy_override.is_some() {
             request.network_policy_generation
         } else {

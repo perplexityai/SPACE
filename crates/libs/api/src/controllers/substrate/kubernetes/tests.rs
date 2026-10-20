@@ -7088,6 +7088,67 @@ mod kubernetes_tests {
         }
     }
 
+    /// node-ctl reconciles a sandbox's network policy at the sandbox's own
+    /// generation, which starts at 1. A pod rendered for an inherited sandbox
+    /// seeds the policy at generation 0, below that lineage, so the first
+    /// reconcile replaces the seed rather than colliding with it at the
+    /// template's counter. An override is seeded at the sandbox's generation.
+    // A Tokio context: building the substrate constructs a `PgPool`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sandbox_pod_seeds_an_inherited_network_policy_below_the_sandbox_lineage() {
+        let substrate = substrate_with_inventory_caches(Vec::new(), Vec::new());
+        let execution = SandboxExecutionRow {
+            generation: 1,
+            pod_name: "space-sbx-test-g1".to_string(),
+            pod_materialized: false,
+            state: ActiveExecutionState::Creating,
+            create_age_expired: false,
+            activation_attempt_id: None,
+            route_activation_id: None,
+        };
+        let override_sandbox = Sandbox {
+            network_policy_generation: 2,
+            ..test_sandbox_with_lifecycle("started")
+        };
+        let inherited_sandbox = Sandbox {
+            network_policy: None,
+            template_network_policy: Some(sqlx::types::Json(
+                pplx_space_net_common::NetworkPolicyV1::allow_all(),
+            )),
+            template_network_policy_generation: Some(3),
+            ..override_sandbox.clone()
+        };
+        let owner = SandboxOwner::platform_user(override_sandbox.user_id);
+
+        for (label, sandbox, seeded_generation) in [
+            ("inherited", &inherited_sandbox, "0"),
+            ("override", &override_sandbox, "2"),
+        ] {
+            let request = substrate.sandbox_pod_request(
+                sandbox,
+                &execution,
+                crate::controllers::substrate::kubernetes::pod_ops::SandboxPodRequestInputs {
+                    sandbox_owner: &owner,
+                    auto_lifecycle_json: "{}",
+                    network_policy_json: "{}",
+                    node_group_placement: None,
+                },
+                PodCreateContext::OnDemand,
+            );
+            let pod = build_sandbox_pod(&sandbox_pod_config(&substrate.k8s), request);
+            assert_eq!(
+                pod.metadata
+                    .annotations
+                    .as_ref()
+                    .unwrap()
+                    .get(pplx_space_common_core::kubernetes::SANDBOX_NETWORK_POLICY_GENERATION_ANNOTATION)
+                    .map(String::as_str),
+                Some(seeded_generation),
+                "{label}"
+            );
+        }
+    }
+
     /// The boundary has to reach the *PodSpec* on every context
     /// `sandbox_pod_request` renders. Each arm is a one-expression
     /// pass-through, so a single dropped `node_group_placement` would render a

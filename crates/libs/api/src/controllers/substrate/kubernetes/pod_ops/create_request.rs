@@ -155,7 +155,10 @@ impl KubernetesSubstrate {
             auto_lifecycle_json,
             auto_lifecycle_authority: PolicyAuthority::Cluster,
             network_policy_json,
-            network_policy_generation: sandbox_effective_network_policy_generation(sandbox),
+            network_policy_generation: cold_pod_network_policy_generation(
+                sandbox.network_policy.is_some(),
+                u64::try_from(sandbox.network_policy_generation).unwrap_or(0),
+            ),
             network_policy_authority: PolicyAuthority::Cluster,
             vcpu: sandbox_vcpu_option(sandbox),
             memory_mib: sandbox_memory_mib_option(sandbox),

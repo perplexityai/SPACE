@@ -132,6 +132,57 @@ async fn create_execution_releases_tracking_when_the_pod_create_is_rejected() ->
     Ok(())
 }
 
+/// A cold create seeds the pod's network policy on the generation lineage
+/// node-ctl reconciles the sandbox with: an inherited policy at 0, below the
+/// sandbox's generation, and an override at the sandbox's own generation,
+/// never at the template's counter.
+#[rstest::rstest]
+#[case::inherited(false, "0")]
+#[case::override_policy(true, "2")]
+#[tokio::test(flavor = "current_thread")]
+async fn cold_create_seeds_the_network_policy_generation_on_the_sandbox_lineage(
+    #[case] has_override: bool,
+    #[case] seeded_generation: &str,
+) -> TestResult {
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let sandbox_id = SandboxId::new();
+    insert_test_sandbox_row(&db.pool, sandbox_id, "creating").await?;
+    // The pod is recorded, then refused, so the create stops at the POST.
+    let (client, log) = scripted_kube_client(|request| match request.method {
+        Method::POST => kube_status(StatusCode::FORBIDDEN, "Forbidden"),
+        _ => kube_status(StatusCode::BAD_REQUEST, "BadRequest"),
+    });
+    let substrate = substrate_with_store_and_client(db.pool.clone(), client);
+    let inputs = CreateInputs::new();
+    let template_ref = inputs.template_ref();
+    let override_policy = NetworkPolicyV1::allow_all();
+    let request = CreateExecutionRequest {
+        network_policy_override: has_override.then_some(&override_policy),
+        network_policy_generation: 2,
+        template_network_policy_generation: 3,
+        ..inputs.create_request(sandbox_id, &template_ref)
+    };
+
+    let _ = substrate.create_execution(request).await;
+
+    let posts = requests_matching(&log, &Method::POST);
+    let [pod_create] = posts.as_slice() else {
+        panic!("expected one pod create, got {posts:?}");
+    };
+    let annotation = pod_create
+        .body
+        .as_ref()
+        .and_then(|pod| pod.pointer("/metadata/annotations"))
+        .and_then(|annotations| {
+            annotations.get(
+                pplx_space_common_core::kubernetes::SANDBOX_NETWORK_POLICY_GENERATION_ANNOTATION,
+            )
+        })
+        .and_then(serde_json::Value::as_str);
+    assert_eq!(annotation, Some(seeded_generation));
+    Ok(())
+}
+
 // ── teardown_execution ──────────────────────────────────────────────────────
 
 /// Apiserver for teardown: the pod is live in the reflector, DELETEs succeed.
