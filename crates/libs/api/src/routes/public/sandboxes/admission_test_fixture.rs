@@ -210,6 +210,23 @@ impl AdmissionPoolFixture {
         idempotency_key: &str,
         request: CreateSandboxRequest,
     ) -> Result<SandboxOperationResponse, PublicApiError> {
+        self.create_with_execution(
+            super::NativeCreateExecution {
+                pool_claims,
+                cold_inline: None,
+            },
+            idempotency_key,
+            request,
+        )
+        .await
+    }
+
+    pub(crate) async fn create_with_execution(
+        &self,
+        execution: super::NativeCreateExecution<'_>,
+        idempotency_key: &str,
+        request: CreateSandboxRequest,
+    ) -> Result<SandboxOperationResponse, PublicApiError> {
         super::create_native_sandbox_operation(
             &self.db.pool,
             self.org_id,
@@ -217,7 +234,7 @@ impl AdmissionPoolFixture {
             &IdempotencyKey::parse(idempotency_key).expect("fixture idempotency key parses"),
             request,
             None,
-            pool_claims,
+            execution,
         )
         .await
     }

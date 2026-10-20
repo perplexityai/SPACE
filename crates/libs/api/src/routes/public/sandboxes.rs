@@ -45,9 +45,9 @@ use crate::{
     middleware::auth::{AuthFederatedOwner, AuthOrg, AuthUser},
     models::{Sandbox, SandboxMetadata as ControllerSandboxMetadata, SandboxMetadataValue},
     public_operations::{
-        ApiProduct, CreateClaimedPublicOperationResult, CreatePublicOperation,
-        CreatePublicOperationIdempotency, CreatePublicOperationResult, HttpOperationMethod,
-        ObservePublicOperationIdempotency, OperationPathTemplate, PublicOperationStore,
+        ApiProduct, CreatePublicOperation, CreatePublicOperationIdempotency,
+        CreatePublicOperationResult, HttpOperationMethod, ObservePublicOperationIdempotency,
+        OperationPathTemplate, PublicOperationStore,
     },
     public_sandbox_operations::{
         CreateSandboxOperationPayload, SandboxLifecycleOperationPayload,
@@ -111,7 +111,13 @@ pub async fn create_sandbox(
         &idempotency_key,
         request,
         federated_create,
-        pool_claims,
+        NativeCreateExecution {
+            pool_claims,
+            cold_inline: inline_create::InlineColdCreate::from_env(
+                &state.pool,
+                &state.sandbox_controller,
+            ),
+        },
     )
     .await?;
 
@@ -158,6 +164,12 @@ pub(crate) struct NativeCreatePoolClaims<'a> {
     pub(crate) inline: Option<inline_create::InlineCreate>,
 }
 
+#[derive(Default)]
+pub(crate) struct NativeCreateExecution<'a> {
+    pub(crate) pool_claims: Option<NativeCreatePoolClaims<'a>>,
+    pub(crate) cold_inline: Option<inline_create::InlineColdCreate>,
+}
+
 /// Record a native create.
 ///
 /// `pool_claims` is `None` when admission-time pool claiming is off, which
@@ -169,10 +181,10 @@ pub(crate) struct NativeCreatePoolClaims<'a> {
 /// error) records the create with a fresh ID and no claim, as the disabled
 /// path does.
 ///
-/// With inline execution on, a create that won a claim is also claimed for
-/// execution in that transaction, and runs here (see [`inline_create`])
-/// before the response, up to a short deadline. Every other create is
-/// recorded queued for the dispatcher, as before.
+/// Inline execution claims the operation in the admission transaction and
+/// runs it here (see [`inline_create`]) up to a short response deadline.
+/// Cold inline execution is independent of pool claiming and requires an
+/// available process-local permit. Disabled or saturated creates stay queued.
 pub(crate) async fn create_native_sandbox_operation(
     pool: &PgPool,
     org_id: OrgId,
@@ -180,8 +192,12 @@ pub(crate) async fn create_native_sandbox_operation(
     idempotency_key: &IdempotencyKey,
     request: CreateSandboxRequest,
     federated_create: Option<crate::fork_operations::ForkFederatedCreateContext>,
-    pool_claims: Option<NativeCreatePoolClaims<'_>>,
+    execution: NativeCreateExecution<'_>,
 ) -> Result<SandboxOperationResponse, PublicApiError> {
+    let NativeCreateExecution {
+        pool_claims,
+        cold_inline,
+    } = execution;
     let (request, mut fingerprint) = prepare_native_create_request(request)?;
     if let Some(profiles) = federated_create
         .as_ref()
@@ -193,9 +209,16 @@ pub(crate) async fn create_native_sandbox_operation(
             "request": fingerprint, "egress_profiles": profiles,
         }))?;
     }
-    let inline = pool_claims
+    let mut inline = pool_claims
         .as_ref()
         .and_then(|claims| claims.inline.clone());
+    let reserve_cold = || {
+        cold_inline
+            .as_ref()
+            .and_then(|cold| cold.try_reserve())
+            .unzip()
+    };
+    let mut permit = None;
     let plan = match pool_claims.as_ref().map(|claims| claims.controller) {
         None => NativeCreatePoolPlan::Unclaimed(AdmissionClaimOutcome::Disabled),
         Some(controller) => {
@@ -255,10 +278,18 @@ pub(crate) async fn create_native_sandbox_operation(
     let mut inline_claim = None;
     let (sandbox_id, outcome, result) = match plan {
         NativeCreatePoolPlan::Unclaimed(outcome) => {
+            (inline, permit) = reserve_cold();
             let sandbox_id_string = fresh_sandbox_id.to_string();
-            let result = store
-                .create_operation(create(fresh_sandbox_id, &sandbox_id_string, None))
+            let admission = store
+                .begin_operation_admission(org_id, ApiProduct::Native, &idempotency)
                 .await?;
+            let (result, claim) = inline_create::record(
+                admission,
+                create(fresh_sandbox_id, &sandbox_id_string, None),
+                inline.is_some(),
+            )
+            .await?;
+            inline_claim = claim;
             (fresh_sandbox_id, outcome, result)
         }
         NativeCreatePoolPlan::Claim {
@@ -309,44 +340,21 @@ pub(crate) async fn create_native_sandbox_operation(
                             let sandbox_id = PublicSandboxId::from(claim.sandbox_id);
                             let sandbox_id_string = sandbox_id.to_string();
                             let input = create(sandbox_id, &sandbox_id_string, Some(claim));
-                            let result = if inline.is_some() {
-                                match admission.create_claimed_or_roll_back(input).await? {
-                                    CreateClaimedPublicOperationResult::Claimed {
-                                        claim_token,
-                                        operation,
-                                    } => {
-                                        let operation_id = operation.id;
-                                        inline_claim = Some((claim_token, operation));
-                                        CreatePublicOperationResult::Created(operation_id)
-                                    }
-                                    CreateClaimedPublicOperationResult::Existing(operation_id) => {
-                                        CreatePublicOperationResult::Existing(operation_id)
-                                    }
-                                    CreateClaimedPublicOperationResult::IdempotencyConflict {
-                                        operation_id,
-                                        expected_fingerprint,
-                                    } => CreatePublicOperationResult::IdempotencyConflict {
-                                        operation_id,
-                                        expected_fingerprint,
-                                    },
-                                    CreateClaimedPublicOperationResult::AdmissionDenied => {
-                                        CreatePublicOperationResult::AdmissionDenied
-                                    }
-                                }
-                            } else {
-                                admission.create_or_roll_back(input).await?
-                            };
+                            let (result, claim) =
+                                inline_create::record(admission, input, inline.is_some()).await?;
+                            inline_claim = claim;
                             (sandbox_id, AdmissionClaimOutcome::Hit, result)
                         }
                         Ok(None) => {
+                            (inline, permit) = reserve_cold();
                             let sandbox_id_string = fresh_sandbox_id.to_string();
-                            let result = admission
-                                .create_or_roll_back(create(
-                                    fresh_sandbox_id,
-                                    &sandbox_id_string,
-                                    None,
-                                ))
-                                .await?;
+                            let (result, claim) = inline_create::record(
+                                admission,
+                                create(fresh_sandbox_id, &sandbox_id_string, None),
+                                inline.is_some(),
+                            )
+                            .await?;
+                            inline_claim = claim;
                             (fresh_sandbox_id, AdmissionClaimOutcome::Miss, result)
                         }
                         Err(error) => {
@@ -357,14 +365,18 @@ pub(crate) async fn create_native_sandbox_operation(
                                 "warm-pool claim at admission failed; admitting the create cold"
                             );
                             drop(admission);
+                            (inline, permit) = reserve_cold();
                             let sandbox_id_string = fresh_sandbox_id.to_string();
-                            let result = store
-                                .create_operation(create(
-                                    fresh_sandbox_id,
-                                    &sandbox_id_string,
-                                    None,
-                                ))
+                            let admission = store
+                                .begin_operation_admission(org_id, ApiProduct::Native, &idempotency)
                                 .await?;
+                            let (result, claim) = inline_create::record(
+                                admission,
+                                create(fresh_sandbox_id, &sandbox_id_string, None),
+                                inline.is_some(),
+                            )
+                            .await?;
+                            inline_claim = claim;
                             (fresh_sandbox_id, AdmissionClaimOutcome::Miss, result)
                         }
                     }
@@ -404,7 +416,9 @@ pub(crate) async fn create_native_sandbox_operation(
     };
 
     if let Some((inline, (claim_token, operation))) = inline.zip(inline_claim)
-        && inline.run(store.clone(), claim_token, operation).await
+        && inline
+            .run(store.clone(), claim_token, operation, permit)
+            .await
     {
         response.operation = finished_operation(&store, org_id, response.operation_id).await?;
     }

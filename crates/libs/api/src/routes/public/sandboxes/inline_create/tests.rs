@@ -12,6 +12,31 @@ fn the_inline_wait_defaults_and_is_capped() {
     );
 }
 
+#[test]
+fn cold_configuration_bounds_the_wait_and_accepts_zero_capacity() {
+    for (raw, expected) in [
+        (None, 4),
+        (Some("invalid"), 4),
+        (Some("0"), 0),
+        (Some("8"), 8),
+    ] {
+        assert_eq!(cold_concurrency(raw), expected);
+    }
+    assert_eq!(cold_concurrency(Some(&usize::MAX.to_string())), 4);
+    for (raw, expected) in [
+        (None, Duration::from_secs(10)),
+        (Some("invalid"), Duration::from_secs(10)),
+        (Some("0"), Duration::ZERO),
+        (Some("25000"), Duration::from_secs(25)),
+        (Some("999999"), Duration::from_secs(30)),
+    ] {
+        assert_eq!(
+            configured_wait(raw, DEFAULT_NATIVE_CREATE_INLINE_COLD_WAIT),
+            expected
+        );
+    }
+}
+
 #[cfg(feature = "kubernetes")]
 mod postgres {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -24,8 +49,8 @@ mod postgres {
     use super::*;
     use crate::public_operation_driver::OperationExecutionResult;
     use crate::public_operations::{ClaimPublicOperations, PublicOperationRequeueReason};
-    use crate::routes::public::sandboxes::NativeCreatePoolClaims;
     use crate::routes::public::sandboxes::admission_test_fixture::AdmissionPoolFixture;
+    use crate::routes::public::sandboxes::{NativeCreateExecution, NativeCreatePoolClaims};
 
     /// What a scripted inline execution does once it starts.
     #[derive(Clone, Copy)]
@@ -79,6 +104,13 @@ mod postgres {
             InlineCreate {
                 wait,
                 executor: Arc::new(self.clone()),
+            }
+        }
+
+        fn cold(&self, wait: Duration) -> InlineColdCreate {
+            InlineColdCreate {
+                inline: self.inline(wait),
+                permits: Arc::new(Semaphore::new(1)),
             }
         }
     }
@@ -230,6 +262,162 @@ mod postgres {
             .filter(|tag| tag.starts_with("executor:"))
             .cloned()
             .collect()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cold_admission_is_terminal_on_first_read_and_replays_do_not_execute()
+    -> TestDbResult<()> {
+        // Pool miss, pool-ineligible encryption, and pool claiming disabled.
+        for (pool_enabled, encrypted) in [(true, false), (true, true), (false, false)] {
+            let fixture = AdmissionPoolFixture::new(0).await?;
+            if encrypted {
+                fixture.enable_org_encryption().await?;
+            }
+            let controller = fixture.controller();
+            let script = ScriptedCreate::new(Script::Succeed);
+            let cold = script.cold(Duration::from_secs(5));
+            let execution = || NativeCreateExecution {
+                pool_claims: pool_enabled.then_some(NativeCreatePoolClaims {
+                    controller: &controller,
+                    // Cold inline is independent of the warm inline switch.
+                    inline: None,
+                }),
+                cold_inline: Some(cold.clone()),
+            };
+            let first = fixture
+                .create_with_execution(execution(), "cold-replay", fixture.request())
+                .await
+                .expect("cold create is admitted");
+            assert_eq!(
+                first.operation.as_ref().expect("terminal response").state,
+                OperationState::Succeeded
+            );
+            assert_eq!(
+                operation_row(&fixture, first.operation_id).await?.state,
+                "succeeded"
+            );
+            assert!(
+                fixture
+                    .payload(first.operation_id)
+                    .await?
+                    .pool_claim
+                    .is_none()
+            );
+            let replay = fixture
+                .create_with_execution(execution(), "cold-replay", fixture.request())
+                .await
+                .expect("same-key replay");
+            assert_eq!(replay.operation_id, first.operation_id);
+            assert_eq!(replay.sandbox_id, first.sandbox_id);
+            assert_eq!(replay.operation, None);
+            let mut conflicting = fixture.request();
+            conflicting.name = Some("different".parse().expect("valid name"));
+            fixture
+                .create_with_execution(execution(), "cold-replay", conflicting)
+                .await
+                .expect_err("different body still conflicts");
+            assert_eq!(script.calls(), 1);
+            assert_eq!(fixture.create_operations().await?, 1);
+            assert_eq!(cold.permits.available_permits(), 1);
+            assert!(dispatcher_claim(&fixture).await?.operations.is_empty());
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cold_saturation_queues_without_releasing_a_background_tasks_permit() -> TestDbResult<()>
+    {
+        let fixture = AdmissionPoolFixture::new(0).await?;
+        let script = ScriptedCreate::gated(Script::Succeed);
+        let cold = script.cold(Duration::ZERO);
+        let execution = || NativeCreateExecution {
+            pool_claims: None,
+            cold_inline: Some(cold.clone()),
+        };
+        let first = fixture
+            .create_with_execution(execution(), "cold-running", fixture.request())
+            .await
+            .expect("answers while still running");
+        script.0.started.notified().await;
+        assert_eq!(first.operation, None);
+        assert_eq!(cold.permits.available_permits(), 0);
+        let second = fixture
+            .create_with_execution(execution(), "cold-saturated", fixture.request())
+            .await
+            .expect("saturation accepts rather than rejects");
+        assert_eq!(second.operation, None);
+        let row = operation_row(&fixture, second.operation_id).await?;
+        assert_eq!((row.state.as_str(), row.attempts), ("queued", 0));
+        let queued = dispatcher_claim(&fixture).await?;
+        assert_eq!(queued.operations.len(), 1);
+        assert_eq!(queued.operations[0].id, second.operation_id);
+        script.open_gate();
+        wait_for_state(&fixture, first.operation_id, "succeeded").await?;
+        let _released = tokio::time::timeout(
+            Duration::from_secs(5),
+            Arc::clone(&cold.permits).acquire_owned(),
+        )
+        .await
+        .expect("task releases capacity")
+        .expect("open semaphore");
+        assert_eq!(script.calls(), 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cold_task_death_and_retry_return_the_operation_to_the_dispatcher() -> TestDbResult<()>
+    {
+        for script_kind in [Script::Panic, Script::Retry] {
+            let fixture = AdmissionPoolFixture::new(0).await?;
+            let script = ScriptedCreate::new(script_kind);
+            let cold = script.cold(Duration::from_secs(5));
+            let response = fixture
+                .create_with_execution(
+                    NativeCreateExecution {
+                        pool_claims: None,
+                        cold_inline: Some(cold.clone()),
+                    },
+                    "cold-recovery",
+                    fixture.request(),
+                )
+                .await
+                .expect("death or retry does not reject admission");
+            assert_eq!(
+                response.operation, None,
+                "nonterminal results stay out of the response"
+            );
+            assert_eq!(cold.permits.available_permits(), 1);
+            assert!(dispatcher_claim(&fixture).await?.operations.is_empty());
+            age_claim(&fixture, response.operation_id).await?;
+            sqlx::query(sql!(
+                "UPDATE public_operations SET next_attempt_at = NOW() WHERE operation_id = $1"
+            ))
+            .bind(response.operation_id.as_uuid())
+            .execute(&fixture.db.pool)
+            .await?;
+            let mut claim = dispatcher_claim(&fixture).await?;
+            assert_eq!(claim.operations.len(), 1);
+            let operation = claim.operations.remove(0);
+            assert_eq!(operation.id, response.operation_id);
+            assert_eq!(operation.claim_generation, 2);
+            assert!(fixture.payload(operation.id).await?.pool_claim.is_none());
+            // The dispatcher uses the same driver and durable identity.
+            let execution = ScriptedCreate::new(Script::Succeed).execute(operation.clone());
+            drive_claimed_operation(
+                PublicOperationStore::new(fixture.db.pool.clone()),
+                claim.claim_token,
+                OperationExecutionConfig::default(),
+                operation,
+                OperationExecutor::Dispatcher,
+                execution,
+            )
+            .await?;
+            assert_eq!(
+                operation_row(&fixture, response.operation_id).await?.state,
+                "succeeded"
+            );
+        }
+        Ok(())
     }
 
     #[tokio::test(flavor = "current_thread")]

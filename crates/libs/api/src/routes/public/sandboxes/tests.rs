@@ -239,7 +239,7 @@ async fn native_create_persists_default_policy_in_operation_payload() -> TestDbR
             &idempotency_key,
             create_request_with_auto_lifecycle(None),
             Some(admitted),
-            None,
+            NativeCreateExecution::default(),
         )
         .await
         .expect("native create should persist an operation");
@@ -253,7 +253,7 @@ async fn native_create_persists_default_policy_in_operation_payload() -> TestDbR
                 &idempotency_key,
                 create_request_with_auto_lifecycle(None),
                 Some(retried),
-                None,
+                NativeCreateExecution::default(),
             )
             .await;
             if initial == retry || (initial < 2 && retry < 2) {
