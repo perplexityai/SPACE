@@ -86,7 +86,7 @@ class PrivateTemplateBuildAssertions:
         self.context.verify(len(matches) == 1, "private base release is ambiguous")
         self.digest = matches[0]["content_hash"]
         self.context.verify(
-            re.fullmatch(r"sha256:[0-9a-f]{64}", self.digest) is not None,
+            re.fullmatch(r"(?:sha256|blake3):[0-9a-f]{64}", self.digest) is not None,
             "private base publication has no full immutable digest",
         )
         self.context.record("private_base", self.base)

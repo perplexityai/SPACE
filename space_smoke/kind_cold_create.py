@@ -74,7 +74,7 @@ class KindColdCreateSetup:
             )
         release = matches[0]
         name, digest = release["template_name"], release["content_hash"]
-        if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        if not re.fullmatch(r"(?:sha256|blake3):[0-9a-f]{64}", digest):
             raise SmokeConfigurationError(
                 "cold setup requires a full immutable content digest"
             )

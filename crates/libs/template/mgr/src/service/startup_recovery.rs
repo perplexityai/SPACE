@@ -8,7 +8,7 @@
 //!   files the manifest declares are on disk at their recorded sizes —
 //!   no hashing.
 //! - When a digest dir has no DB row, recovery has no prior validity
-//!   signal. It computes the SHA-256 of the bootable artifact and
+//!   signal. It computes the declared digest of the bootable artifact and
 //!   confirms it matches the dir name. On match the build row is
 //!   inserted; on mismatch the digest dir is removed and no row is
 //!   written. The manifest provides the file list and recorded sizes.
@@ -179,7 +179,7 @@ fn verify_local_files_against_manifest(
     Ok(())
 }
 
-/// SHA-256 the bootable artifact and confirm it matches `expected_hash`.
+/// Hash the bootable artifact and confirm it matches `expected_hash`.
 /// Used only when the DB has no prior validity signal for this digest
 /// dir; the multi-GiB read is wrapped in `spawn_blocking`.
 async fn verify_bootable_artifact_hash(
@@ -189,13 +189,14 @@ async fn verify_bootable_artifact_hash(
 ) -> Result<(), DigestDirRejection> {
     let path = digest_dir.join(bootable_filename);
     let path_str = path.display().to_string();
-    let computed_hex = tokio::task::spawn_blocking(move || compute_content_hash(&path_str))
+    let algorithm = content_hash_algorithm(expected_hash)
+        .map_err(|error| DigestDirRejection::BootableArtifactUnreadable(error.to_string()))?;
+    let computed = tokio::task::spawn_blocking(move || compute_content_hash(&path_str, algorithm))
         .await
         .map_err(|error| {
             DigestDirRejection::BootableArtifactUnreadable(format!("hash task failed: {error}"))
         })?
         .map_err(|error| DigestDirRejection::BootableArtifactUnreadable(error.to_string()))?;
-    let computed = format!("sha256:{computed_hex}");
     if computed != expected_hash {
         return Err(DigestDirRejection::BootableArtifactHashMismatch {
             computed,
@@ -817,7 +818,7 @@ impl TemplateManagerService {
                         if is_import_staging_dir(&hash_name)
                             || is_republish_staging_dir(&hash_name)
                             || replaced_digest_base(&hash_name).is_some()
-                            || !hash_name.starts_with("sha256:")
+                            || hash_name.parse::<Digest>().is_err()
                             || !digest_entry.path().is_dir()
                         {
                             continue;
