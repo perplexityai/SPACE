@@ -38,6 +38,48 @@ jobs:
     with:
       base_sha: ${{ github.event.pull_request.base.sha }}
 
+  # The Kind smoke runs only when the PR changes a path it exercises
+  # (ci/kind-pull-paths.txt). Selecting it here rather than with a workflow
+  # `paths:` filter lets the required space-pull-ci check depend on it: a
+  # filtered-out workflow reports nothing, which a required check cannot use.
+  kind_paths:
+    if: github.repository == 'perplexityai/SPACE'
+    name: Select Kind smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      needed: ${{ steps.select.outputs.needed }}
+    steps:
+      - name: Check out SPACE
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The synthetic merge and both of its parents.
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Decide whether this PR needs the Kind smoke
+        id: select
+        env:
+          PULL_REQUEST_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          needed="$(bash ci/scripts/kind-pull-needed.sh "${PULL_REQUEST_HEAD}")"
+          printf 'needed=%s\n' "${needed}" >>"${GITHUB_OUTPUT}"
+
+  # Includes same-repository PRs: no package write token. The read token
+  # reaches the third-party image mirror and the main-produced layer cache;
+  # once both are public, forks read them anonymously. A missing or
+  # inaccessible cache can use the existing read-only Actions cache bridge; if
+  # both miss, build cold. Neither case permits publication from PRs.
+  kind_smoke:
+    needs: kind_paths
+    if: github.repository == 'perplexityai/SPACE' && needs.kind_paths.outputs.needed == 'true'
+    uses: ./.github/workflows/kind-ci.yml
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+
   space-pull-ci:
     if: always() && github.repository == 'perplexityai/SPACE'
     name: space-pull-ci
@@ -45,11 +87,24 @@ jobs:
     needs:
       - rust_static
       - common
+      - kind_paths
+      - kind_smoke
     steps:
       - name: Require every pull-request check
         env:
           RUST_STATIC_RESULT: ${{ needs.rust_static.result }}
           COMMON_RESULT: ${{ needs.common.result }}
+          KIND_PATHS_RESULT: ${{ needs.kind_paths.result }}
+          KIND_NEEDED: ${{ needs.kind_paths.outputs.needed }}
+          KIND_SMOKE_RESULT: ${{ needs.kind_smoke.result }}
         run: |
+          set -euo pipefail
           test "${RUST_STATIC_RESULT}" = success
           test "${COMMON_RESULT}" = success
+          # An unknown selection fails rather than skipping Kind.
+          test "${KIND_PATHS_RESULT}" = success
+          case "${KIND_NEEDED}" in
+            true) test "${KIND_SMOKE_RESULT}" = success ;;
+            false) test "${KIND_SMOKE_RESULT}" = skipped ;;
+            *) echo "Kind smoke selection returned '${KIND_NEEDED}'" >&2; exit 1 ;;
+          esac

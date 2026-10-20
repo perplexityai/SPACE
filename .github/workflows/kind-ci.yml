@@ -3,7 +3,7 @@ name: Kind CI
 on:
   workflow_call:
 
-# The caller owns permissions: kind-pull-ci.yml grants contents:read and
+# The caller owns permissions: pull-ci.yml grants contents:read and
 # packages:read and actions:read; main-ci.yml grants packages:write to this call.
 # Actions reads only inspect a producer in this run; never elevate a PR writer.
 

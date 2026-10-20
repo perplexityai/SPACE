@@ -79,7 +79,7 @@ and lifecycle contention.
 
 The **Quarantined smoke backlog (non-blocking)** job inventories all declared
 quarantines on every PR and applicable manual CI entry point. Pull CI owns the
-single PR check; Kind Pull CI does not repeat it, and main pushes and
+single PR check; the Kind smoke it calls does not repeat it, and main pushes and
 merge-group runs do not run it. It displays counts, reasons, and source links
 in the job summary and warning annotations. The check fails when any scenarios
 remain quarantined, and passes when the backlog is empty. It executes no
