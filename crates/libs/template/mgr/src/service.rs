@@ -345,6 +345,7 @@ const ALLOW_TEMPLATE_SNAPSHOT_POLICY_OPERATOR: &[UdsPeerPrincipal] = &[
 pub struct TemplateManagerService {
     db: Arc<Mutex<rusqlite::Connection>>,
     artifact_store: TemplateArtifactStore,
+    production_hash_algorithm: HashAlg,
     pool_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     snapshot_reconcile_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     snapshot_retry_backoff: Arc<Mutex<snapshots::RetryBackoff>>,
@@ -1458,6 +1459,7 @@ impl TemplateManagerService {
         Ok(Self {
             db,
             artifact_store: TemplateArtifactStore::default(),
+            production_hash_algorithm: crate::content_hash::DEFAULT_PRODUCTION_ALGORITHM,
             pool_handle: Arc::new(Mutex::new(None)),
             snapshot_reconcile_locks: Arc::new(Mutex::new(HashMap::new())),
             snapshot_retry_backoff: Arc::new(Mutex::new(snapshots::RetryBackoff::default())),
@@ -1470,6 +1472,16 @@ impl TemplateManagerService {
             background_worker,
             sbx_connect_retry_policy: pplx_space_sbx_mgr_client::DEFAULT_CONNECT_RETRY_POLICY,
         })
+    }
+
+    pub(crate) fn with_production_hash_algorithm(mut self, algorithm: HashAlg) -> Self {
+        self.production_hash_algorithm = algorithm;
+        self
+    }
+
+    async fn hash_new_rootfs(&self, path: PathBuf) -> Result<String, Status> {
+        compute_template_file_hash(path, self.production_hash_algorithm, "hash expanded rootfs")
+            .await
     }
 
     pub(crate) fn with_rootfs_backing_policy(

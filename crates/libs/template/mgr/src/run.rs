@@ -55,6 +55,8 @@ pub struct TemplateMgrRunConfig {
 /// there is no type-erased I/O variant here.
 #[derive(Debug, thiserror::Error)]
 pub enum RunTemplateMgrError {
+    #[error("invalid template hash configuration: {0}")]
+    TemplateHash(#[source] crate::TemplateHashConfigError),
     #[error("invalid template rootfs backing policy: {0}")]
     RootfsBacking(#[source] crate::RootfsBackingConfigError),
     #[error("template cache cannot honor the rootfs backing policy: {0}")]
@@ -147,6 +149,10 @@ async fn run_service(
     );
     health_server.mark_starting();
 
+    let production_hash_algorithm = crate::content_hash::production_algorithm_from_environment(
+        &pplx_space_common_core::env::ProcessEnvironment,
+    )
+    .map_err(RunTemplateMgrError::TemplateHash)?;
     let backing_policy = crate::rootfs_backing::RootfsBackingPolicy::from_env()
         .map_err(RunTemplateMgrError::RootfsBacking)?;
     if backing_policy == crate::rootfs_backing::RootfsBackingPolicy::NoCow {
@@ -174,9 +180,11 @@ async fn run_service(
 
     tracing::info!(%backing_policy,
         "template rootfs backing policy applies to new materializations only; existing cache entries remain unchanged");
+    tracing::info!(%production_hash_algorithm, "template rootfs algorithm for new registrations");
     let service = TemplateManagerService::new(conn)
         .map_err(RunTemplateMgrError::InitializeService)?
-        .with_rootfs_backing_policy(backing_policy);
+        .with_rootfs_backing_policy(backing_policy)
+        .with_production_hash_algorithm(production_hash_algorithm);
 
     // Re-arm any durable background jobs that were in flight (i.e.
     // `status='running'`) when the previous tmplmgr exited. Without

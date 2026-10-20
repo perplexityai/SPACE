@@ -2194,3 +2194,72 @@ fn template_refresh_preserves_nocow_and_timestamps() {
     file.write_all_at(b"changed", 0).unwrap();
     assert_eq!(std::fs::read(&dst).unwrap(), vec![7; 8192]);
 }
+
+#[tokio::test]
+async fn producer_override_preserves_verification_of_existing_releases() {
+    let (fixture, sha256, bytes) = expanded_test_rootfs_setup();
+    let blake3 = format!("blake3:{}", blake3::hash(&bytes));
+    let compressed = crate::rootfs_zstd::compress_rootfs(
+        &fixture.path().join(TEMPLATE_ROOTFS_FILE),
+        &fixture.path().join(TEMPLATE_ROOTFS_ZSTD_FILE),
+    )
+    .unwrap();
+    for (override_value, expected) in [(None, &blake3), (Some("sha256"), &sha256)] {
+        let mut environment = pplx_space_test_env::TestEnv::default();
+        if let Some(value) = override_value {
+            environment.set("SPACE_TEMPLATE_HASH_ALGORITHM", value);
+        }
+        let algorithm =
+            crate::content_hash::production_algorithm_from_environment(&environment).unwrap();
+        let service = TemplateManagerService::new(crate::db::test_conn())
+            .unwrap()
+            .with_production_hash_algorithm(algorithm)
+            .without_sbx_connect_retries();
+        assert_eq!(
+            &service
+                .hash_new_rootfs(fixture.path().join(TEMPLATE_ROOTFS_FILE))
+                .await
+                .unwrap(),
+            expected
+        );
+        for existing in [&sha256, &blake3] {
+            let manifest = normalize_template_manifest(
+                Default::default(),
+                "register-refresh-test",
+                existing,
+                &Default::default(),
+                bytes.len() as u64,
+                Some((&compressed.compressed_hash, compressed.compressed_size)),
+            )
+            .unwrap();
+            let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+            std::fs::write(fixture.path().join("manifest.json"), &manifest_bytes).unwrap();
+            service
+                .refresh_register_existing_expanded_build(
+                    "register-refresh-test",
+                    existing,
+                    fixture.path().to_str().unwrap(),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(
+                crate::db::get_build(
+                    &service.db.lock().unwrap(),
+                    "register-refresh-test",
+                    existing
+                )
+                .unwrap()
+                .is_some()
+            );
+            assert_eq!(
+                std::fs::read(fixture.path().join("manifest.json")).unwrap(),
+                manifest_bytes
+            );
+        }
+        assert_eq!(
+            std::fs::read(fixture.path().join(TEMPLATE_ROOTFS_FILE)).unwrap(),
+            bytes
+        );
+    }
+}

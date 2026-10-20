@@ -32,3 +32,24 @@ impl ContentHasher {
         }
     }
 }
+
+/// Default for new rootfs registrations, independent of verification algorithms.
+pub(crate) const DEFAULT_PRODUCTION_ALGORITHM: HashAlg = HashAlg::Blake3;
+const PRODUCTION_ALGORITHM_ENV: &str = "SPACE_TEMPLATE_HASH_ALGORITHM";
+
+#[derive(Debug, thiserror::Error)]
+#[error("SPACE_TEMPLATE_HASH_ALGORITHM must be sha256 or blake3")]
+pub struct TemplateHashConfigError;
+
+pub(crate) fn production_algorithm_from_environment(
+    environment: &dyn pplx_space_common_core::env::Environment,
+) -> Result<HashAlg, TemplateHashConfigError> {
+    match environment.var(PRODUCTION_ALGORITHM_ENV) {
+        Ok(value) => value.parse().map_err(|_| TemplateHashConfigError),
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_PRODUCTION_ALGORITHM),
+        Err(std::env::VarError::NotUnicode(_)) => Err(TemplateHashConfigError),
+    }
+}
+
+#[cfg(test)]
+mod tests;
