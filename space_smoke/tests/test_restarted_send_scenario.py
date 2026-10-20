@@ -1,35 +1,43 @@
 """Contracts behind the restarted-send scenario the bench cannot exercise.
 
 The live run proves a restarted kernel send is refused and retried. These pin
-the failed-attempt reader (matched by message and sandbox path), the
-rejection assertion failing closed on a missing or permanent failure, the
-interrupter's lifecycle (always ended, a pulse required), and the on-node
-scripts rendering to valid shell.
+the transfer-job read (attempts and the last error); the rejection verdict
+requiring both a rise in node-manager's rejected-stream counter over the
+interrupt and the sandbox's own send job completing after a retry, and
+ignoring jobs of another kind or path; a bench without Prometheus being
+inconclusive; the interrupter's lifecycle (always ended, a pulse required);
+and the on-node scripts rendering to valid shell.
 """
 
 from __future__ import annotations
 
-import json
 import shutil
 import subprocess
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest import mock
 
 from space_smoke.adapters import (
     BTRFS_SEND_STAGING_ROOT,
-    TRANSFER_JOB_FAILED_MESSAGE,
+    KindConfig,
+    KindHarness,
     _BTRFS_SEND_INTERRUPT_END,
     _BTRFS_SEND_INTERRUPTER,
     _btrfs_send_interrupt_stop_file,
-    _failed_transfers_from_logs,
 )
-from space_smoke.capabilities import FailedTransfer
+from space_smoke.capabilities import TransferJobView
 from space_smoke.fixtures import SuspendCodecAssertions
-from space_smoke.runtime import InvariantViolation, ResourceScope
+from space_smoke.runtime import (
+    CommandResult,
+    InconclusiveSmoke,
+    InvariantViolation,
+    ResourceScope,
+)
 
 SANDBOX_ID = "01a0ac88-c99e-735a-b8fa-f13c948332fa"
+JOB_ID = "01a0ac88-d000-7000-8000-000000000001"
 SEND_PATH = f"/space/cache/firecracker/sandboxes/{SANDBOX_ID}/snapshot/rootfs.btrfs-send"
 REJECTED = (
     "stream snapshot upload: btrfs send source failed: status: Aborted, message: "
@@ -37,18 +45,15 @@ REJECTED = (
 )
 
 
-def _failed_line(local_path: str, *, error_kind: str = "retriable", error: str = REJECTED) -> str:
-    return json.dumps(
-        {
-            "fields": {
-                "message": TRANSFER_JOB_FAILED_MESSAGE,
-                "kind": "push_btrfs_send",
-                "local_path": local_path,
-                "error_kind": error_kind,
-                "error": error,
-            },
-        }
-    )
+def _job(
+    status: str,
+    attempts: int,
+    *,
+    kind: str = "push_btrfs_send",
+    local_path: str = SEND_PATH,
+    job_id: str = JOB_ID,
+) -> TransferJobView:
+    return TransferJobView(job_id, kind, status, local_path, "", attempts)
 
 
 class _Fixture:
@@ -63,18 +68,48 @@ class _Fixture:
     def record(self, key: str, value: object) -> None:
         self.records[key] = value
 
+    def wait(self, _seconds: float) -> None:
+        pass
+
     def phase(self, _name: str):
         return nullcontext()
 
 
 class _Control:
-    def __init__(self) -> None:
-        self.failures: list[FailedTransfer] = []
+    """A worker whose rejected-stream counter reads `rejections`, one value per read."""
+
+    def __init__(
+        self,
+        *,
+        rejections: list[dict[str, float]] | None = None,
+        jobs: list[TransferJobView] | None = None,
+        mode: str = "otel",
+    ) -> None:
+        self.rejections = list(rejections or [{}])
+        self.jobs = list(jobs or [])
+        self.mode = mode
         self.interrupter_output = ["pulse 1", "pulses 1"]
         self.calls: list[str] = []
 
-    def failed_transfers(self, sandbox_id: str, node_name: str, *, since_time: str):
-        return list(self.failures)
+    def telemetry_mode(self) -> str:
+        return self.mode
+
+    def telemetry_query(self, backend: str, path: str, params) -> Any:
+        counts = self.rejections.pop(0) if len(self.rejections) > 1 else self.rejections[0]
+        return {
+            "data": {
+                "result": [
+                    {"metric": {"reason": reason}, "value": [0, str(value)]}
+                    for reason, value in counts.items()
+                ]
+            }
+        }
+
+    def transfer_jobs(self, node_name: str, sandbox_id: str) -> list[TransferJobView]:
+        return list(self.jobs)
+
+    def transfer_job_log(self, node_name: str, *, since_time: str) -> list[str]:
+        return []
 
     def interrupt_btrfs_send(
         self, node_name: str, *, token: str, pulses: int, window_seconds: int
@@ -92,47 +127,106 @@ def _assertions(control: _Control) -> tuple[_Fixture, SuspendCodecAssertions, Re
     return fixture, SuspendCodecAssertions(cast(Any, fixture), cast(Any, control), scope), scope
 
 
-class FailedTransferReader(unittest.TestCase):
-    def test_matches_message_and_sandbox_path(self) -> None:
-        other = SEND_PATH.replace(SANDBOX_ID, "01a0ac88-0000-7000-8000-000000000000")
-        logs = "\n".join(
+def _interrupted(control: _Control) -> tuple[_Fixture, SuspendCodecAssertions]:
+    fixture, assertions, _ = _assertions(control)
+    with assertions.interrupting_btrfs_send("worker-a"):
+        pass
+    return fixture, assertions
+
+
+def setUpModule() -> None:
+    # The baseline is the first read: no export lag to wait out here.
+    patch = mock.patch("space_smoke.fixtures.STREAM_REJECTIONS_SETTLE_SECONDS", 0)
+    patch.start()
+    unittest.addModuleCleanup(patch.stop)
+
+
+class _ShowJobKubectl:
+    def __init__(self, shown: str) -> None:
+        self.shown = shown
+
+    def run(self, command, **_options) -> CommandResult:
+        argv = tuple(command)
+        if "exec" not in argv:
+            # The node-shell pod lookup.
+            return CommandResult(argv, 0, "space-pod-x", "")
+        if argv[-1].startswith("space-volmgr jobs "):
+            return CommandResult(argv, 0, f"│ {JOB_ID} ┆ pending ┆ push_btrfs_send ┆\n", "")
+        return CommandResult(argv, 0, self.shown, "")
+
+
+class TransferJobRead(unittest.TestCase):
+    def test_reads_attempts_and_the_whole_error_line(self) -> None:
+        shown = "\n".join(
             [
-                _failed_line(SEND_PATH),
-                _failed_line(other),
-                json.dumps({"fields": {"message": "transfer job completed", "local_path": SEND_PATH}}),
-                "not json",
+                f"id: {JOB_ID}",
+                "status: pending",
+                "kind: push_btrfs_send",
+                f"local_path: {SEND_PATH}",
+                "attempts: 1",
+                f"error: {REJECTED}",
             ]
         )
-        prefix = f"/space/cache/firecracker/sandboxes/{SANDBOX_ID}/"
+        harness = KindHarness(_ShowJobKubectl(shown), KindConfig())
         self.assertEqual(
-            _failed_transfers_from_logs(logs, prefix, "worker-a"),
-            [FailedTransfer("worker-a", "push_btrfs_send", SEND_PATH, "retriable", REJECTED)],
+            harness.transfer_jobs("worker-a", SANDBOX_ID),
+            [TransferJobView(JOB_ID, "push_btrfs_send", "pending", SEND_PATH, REJECTED, 1)],
         )
 
 
-class RejectedSendAssertion(unittest.TestCase):
-    def test_no_rejection_fails_closed(self) -> None:
-        control = _Control()
-        control.failures = [
-            FailedTransfer("worker-a", "push_btrfs_send", SEND_PATH, "retriable", "credential exchange failed")
-        ]
-        _, assertions, _ = _assertions(control)
-        with self.assertRaises(InvariantViolation):
-            assertions.expect_rejected_send_stream("worker-a", since_time="t")
+class RejectedSendVerdict(unittest.TestCase):
+    def _verdict(self, *, rejections_after: dict[str, float], jobs: list[TransferJobView]):
+        control = _Control(rejections=[{"crc": 2.0}, rejections_after], jobs=jobs)
+        fixture, assertions = _interrupted(control)
+        return fixture, lambda: assertions.expect_rejected_send_stream(
+            "worker-a", since_time="t", timeout=0
+        )
 
-    def test_a_permanent_rejection_fails_closed(self) -> None:
-        control = _Control()
-        control.failures = [FailedTransfer("worker-a", "push_btrfs_send", SEND_PATH, "permanent", REJECTED)]
-        _, assertions, _ = _assertions(control)
-        with self.assertRaises(InvariantViolation):
-            assertions.expect_rejected_send_stream("worker-a", since_time="t")
+    def test_a_counted_rejection_and_a_retried_job_pass(self) -> None:
+        fixture, verdict = self._verdict(
+            rejections_after={"crc": 3.0}, jobs=[_job("completed", 2)]
+        )
+        self.assertEqual(verdict().job_id, JOB_ID)
+        self.assertEqual(
+            fixture.records["rejected_send"],
+            {"job_id": JOB_ID, "attempts": 2, "stream_rejections": {"crc": 1.0}},
+        )
 
-    def test_a_retriable_rejection_is_recorded(self) -> None:
-        control = _Control()
-        control.failures = [FailedTransfer("worker-a", "push_btrfs_send", SEND_PATH, "retriable", REJECTED)]
-        fixture, assertions, _ = _assertions(control)
-        assertions.expect_rejected_send_stream("worker-a", since_time="t")
-        self.assertEqual(json.loads(json.dumps(fixture.records["rejected_send"]))["error_kind"], "retriable")
+    def test_no_counted_rejection_fails_closed(self) -> None:
+        _, verdict = self._verdict(rejections_after={"crc": 2.0}, jobs=[_job("completed", 2)])
+        with self.assertRaises(InvariantViolation):
+            verdict()
+
+    def test_a_job_that_never_retried_fails_closed(self) -> None:
+        _, verdict = self._verdict(rejections_after={"crc": 3.0}, jobs=[_job("completed", 1)])
+        with self.assertRaises(InvariantViolation):
+            verdict()
+
+    def test_a_permanently_failed_job_fails_closed(self) -> None:
+        _, verdict = self._verdict(rejections_after={"crc": 3.0}, jobs=[_job("failed", 1)])
+        with self.assertRaises(InvariantViolation):
+            verdict()
+
+    def test_a_retry_on_another_kind_or_path_is_ignored(self) -> None:
+        other_path = SEND_PATH.replace("rootfs.btrfs-send", "memfile")
+        _, verdict = self._verdict(
+            rejections_after={"crc": 3.0},
+            jobs=[
+                _job("completed", 1),
+                _job("completed", 3, kind="push", job_id="01a0ac88-d000-7000-8000-000000000002"),
+                _job("completed", 3, local_path=other_path, job_id="01a0ac88-d000-7000-8000-000000000003"),
+            ],
+        )
+        with self.assertRaises(InvariantViolation):
+            verdict()
+
+    def test_a_bench_without_prometheus_is_inconclusive(self) -> None:
+        control = _Control(mode="datadog")
+        _, assertions, _ = _assertions(control)
+        with self.assertRaises(InconclusiveSmoke):
+            with assertions.interrupting_btrfs_send("worker-a"):
+                pass
+        self.assertEqual(control.calls, [])
 
 
 class Interrupter(unittest.TestCase):

@@ -40,7 +40,6 @@ from space_smoke.capabilities import (
     EcwForkResult,
     SnapshotReaperConfig,
     SnapshotReaperControl,
-    FailedTransfer,
     ReleaseStorageRow,
     SnapshotRowFacts,
     StartupRecoveryControl,
@@ -112,6 +111,7 @@ from space_smoke.invariants.lifecycle import prove_idle_deadline_reset
 from space_smoke.network_policy import NetworkPolicyAssertions
 from space_smoke.runtime import (
     Compensation,
+    InconclusiveSmoke,
     InvariantViolation,
     ResourceScope,
     ScenarioContext,
@@ -3323,6 +3323,12 @@ TEMPLATE_EVICTION_SETTLE_SECONDS = 30.0
 TEMPLATE_EVICTION_RETRY_SECONDS = 3.0
 
 
+# node-manager's `node_mgr.btrfs_send.stream_rejected` counter, as Prometheus names it.
+BTRFS_SEND_STREAM_REJECTED_METRIC = "space_node_mgr_btrfs_send_stream_rejected_total"
+# Export flushes plus scrape lag, as for the on-demand pull counts.
+STREAM_REJECTIONS_SETTLE_SECONDS = ON_DEMAND_PULL_SETTLE_SECONDS
+
+
 class SuspendCodecAssertions:
     """Prove the production suspend codec's failure matrix on a real bench.
 
@@ -3352,6 +3358,8 @@ class SuspendCodecAssertions:
         self._restore_rows: Compensation | None = None
         self._retire_attempted = False
         self._accepted_snapshots: set[str] = set()
+        # node-manager's rejected-stream counts when the send interrupt began.
+        self._rejections_before: dict[str, float] | None = None
 
     @staticmethod
     def mark_since() -> str:
@@ -3416,11 +3424,25 @@ class SuspendCodecAssertions:
         and runs eagerly when the body exits. A body that completes requires
         at least one pulse: without one, nothing was interrupted.
 
+        Before it starts, node-manager's rejected-stream count on the worker
+        is read once it has stopped moving: the baseline
+        `expect_rejected_send_stream` measures the rejection against. That
+        count is read from the bench's Prometheus, which only the `otel`
+        telemetry mode installs; on any other bench the scenario cannot prove
+        the rejection's cause and is inconclusive.
+
         Scenarios on one bench run in turn, so the send in flight is this
         sandbox's. A concurrent smoke's send that took the pulse instead can
         only fail this scenario's rejection check, never pass it.
         """
 
+        mode = self._control.telemetry_mode()
+        if mode != "otel":
+            raise InconclusiveSmoke(
+                f"the bench runs telemetry mode {mode!r}; proving that node-manager "
+                "rejected the restarted send needs its counter from the otel mode's Prometheus"
+            )
+        self._rejections_before = self._settled_stream_rejections(node_name)
         token = secrets.token_hex(8)
         lines: list[str] = []
         end = self._scope.defer(
@@ -3450,45 +3472,131 @@ class SuspendCodecAssertions:
             interrupter_output=lines,
         )
 
-    def expect_rejected_send_stream(self, node_name: str, *, since_time: str) -> FailedTransfer:
-        """node-manager refused the restarted stream and volume-manager retried.
+    def stream_rejections(self, node_name: str) -> dict[str, float]:
+        """node-manager's cumulative rejected send streams on `node_name`, by reason.
 
-        The record is volume-manager's failed `push_btrfs_send` attempt for
-        the sandbox's send stream, failed as retriable with node-manager's
-        rejection. Unlike sbx-manager's bounded restore error kinds, a
-        transfer's retry class does not name the cause, so the message is
-        matched.
+        `node_mgr.btrfs_send.stream_rejected` (`crates/libs/metrics/src/
+        node_manager.rs`), read from the bench's Prometheus. A series appears
+        with its first rejection, so a reason absent here has counted none.
         """
 
-        from space_smoke.adapters import BTRFS_SEND_REJECTED_ERROR, ROOTFS_SEND_FILE
-
-        failures = self._control.failed_transfers(
-            self._fixture.sandbox.sandbox_id, node_name, since_time=since_time
+        query = (
+            f"sum by (reason) ({BTRFS_SEND_STREAM_REJECTED_METRIC}"
+            f"{{k8s_node_name={_promql_string(node_name)}}})"
         )
-        rejected = [
-            failure
-            for failure in failures
-            if failure.kind == "push_btrfs_send"
-            and PurePosixPath(failure.local_path).name == ROOTFS_SEND_FILE
-            and BTRFS_SEND_REJECTED_ERROR in failure.error
-        ]
+        body = self._control.telemetry_query(
+            "prometheus", "/api/v1/query", {"query": query, "time": str(time.time())}
+        )
+        return {
+            str(sample["metric"].get("reason", "")): float(sample["value"][1])
+            for sample in body["data"]["result"]
+        }
+
+    def _settled_stream_rejections(self, node_name: str) -> dict[str, float]:
+        """The rejection counts once unchanged for `STREAM_REJECTIONS_SETTLE_SECONDS`.
+
+        An earlier scenario's rejection on this worker can land after a single
+        read and would then count as this send's.
+        """
+
+        settle_seconds = STREAM_REJECTIONS_SETTLE_SECONDS
+        counts = self.stream_rejections(node_name)
+        unchanged_since = time.monotonic()
+        deadline = unchanged_since + 180
+        while time.monotonic() - unchanged_since < settle_seconds:
+            self._fixture.verify(
+                time.monotonic() <= deadline,
+                "node-manager's rejected-stream count did not settle before the suspend",
+                worker_node=node_name,
+                stream_rejections=counts,
+            )
+            self._fixture.wait(5)
+            now = self.stream_rejections(node_name)
+            if now != counts:
+                counts, unchanged_since = now, time.monotonic()
+        self._fixture.record("stream_rejections_baseline", counts)
+        return counts
+
+    def expect_rejected_send_stream(
+        self, node_name: str, *, since_time: str, timeout: float = 120
+    ) -> TransferJobView:
+        """node-manager refused the restarted stream and volume-manager retried.
+
+        Two durable records. The retry: the sandbox's `push_btrfs_send` job for
+        its send stream ended `completed` after at least two attempts, so one
+        attempt failed and the same job ran again (the job store never resets
+        `attempts`; a permanent failure would have ended it `failed`). The
+        cause: node-manager's rejected-stream counter rose on the worker over
+        the interrupted upload, against the baseline `interrupting_btrfs_send`
+        read. The counter does not name the sandbox; scenarios on one bench run
+        in turn, and the attempt count ties the failure to this sandbox's job.
+        `since_time` bounds the volume-manager log attached when a check fails.
+        """
+
+        from space_smoke.adapters import ROOTFS_SEND_FILE
+
+        sandbox_id = self._fixture.sandbox.sandbox_id
+        before = self._rejections_before
+        if before is None:
+            raise SmokeConfigurationError(
+                "expect_rejected_send_stream reads the baseline interrupting_btrfs_send takes"
+            )
+        deadline = time.monotonic() + timeout
+        while True:
+            after = self.stream_rejections(node_name)
+            delta = {
+                reason: after[reason] - before.get(reason, 0.0)
+                for reason in after
+                if after[reason] > before.get(reason, 0.0)
+            }
+            if delta or time.monotonic() > deadline:
+                break
+            self._fixture.wait(5)
         self._fixture.verify(
-            len(rejected) >= 1,
+            bool(delta),
             "no streamed upload attempt failed on node-manager's rejection of a "
             "restarted send; the interrupted stream was forwarded",
-            sandbox_id=self._fixture.sandbox.sandbox_id,
+            sandbox_id=sandbox_id,
             worker_node=node_name,
-            failed_attempts=[asdict(failure) for failure in failures],
+            stream_rejections_before=before,
+            stream_rejections_after=after,
+            failure_evidence=lambda: {
+                "volume_manager_log": self._control.transfer_job_log(
+                    node_name, since_time=since_time
+                )
+            },
         )
-        failure = rejected[0]
+        jobs = [
+            job
+            for job in self._control.transfer_jobs(node_name, sandbox_id)
+            if job.kind == "push_btrfs_send"
+            and PurePosixPath(job.local_path).name == ROOTFS_SEND_FILE
+        ]
+        completed = [job for job in jobs if job.status == "completed"]
         self._fixture.verify(
-            failure.error_kind == "retriable",
+            bool(completed),
             "the rejected send failed its upload permanently instead of retrying",
-            sandbox_id=self._fixture.sandbox.sandbox_id,
-            failed_attempt=asdict(failure),
+            sandbox_id=sandbox_id,
+            send_jobs=[asdict(job) for job in jobs],
         )
-        self._fixture.record("rejected_send", asdict(failure))
-        return failure
+        retried = max(completed, key=lambda job: job.attempts)
+        self._fixture.verify(
+            retried.attempts >= 2,
+            "no streamed upload attempt failed on node-manager's rejection of a "
+            "restarted send; the interrupted stream was forwarded",
+            sandbox_id=sandbox_id,
+            send_jobs=[asdict(job) for job in jobs],
+            failure_evidence=lambda: {
+                "volume_manager_log": self._control.transfer_job_log(
+                    node_name, since_time=since_time
+                )
+            },
+        )
+        self._fixture.record(
+            "rejected_send",
+            {"job_id": retried.job_id, "attempts": retried.attempts, "stream_rejections": delta},
+        )
+        return retried
 
     def expect_retained_source_without_send_file(self, node_name: str) -> tuple[str, ...]:
         """The canonical snapshot holds the retained bundle and no send file."""

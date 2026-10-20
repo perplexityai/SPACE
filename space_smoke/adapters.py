@@ -86,7 +86,6 @@ from space_smoke.capabilities import (
     SnapshotReaperConfig,
     SandboxPodPlacement,
     SnapshotRecord,
-    FailedTransfer,
     StorageExchangeOutcome,
     StorageObject,
     StorageRequestResult,
@@ -547,9 +546,6 @@ _TEMPLATE_IN_USE_MARKER = "sandbox(es) were created from"
 BTRFS_SEND_V1 = "btrfs-send-v1"
 RETAINED_SOURCE_BUNDLE = "rootfs.btrfs-source"
 ROOTFS_SEND_FILE = "rootfs.btrfs-send"
-# volume-manager's line for every failed single-file transfer attempt, the
-# streamed `push_btrfs_send` included (crates/libs/vol/mgr/server/src/executor.rs).
-TRANSFER_JOB_FAILED_MESSAGE = "transfer job failed"
 # node-manager's relay refuses a send stream whose framing breaks, as a kernel
 # send restarted mid-pipe does, before forwarding it; volume-manager's failed
 # attempt carries the status message
@@ -2130,17 +2126,17 @@ ON CONFLICT (key_hash) DO NOTHING;
                     kind=fields.get("kind", ""),
                     status=fields.get("status", ""),
                     local_path=fields.get("local_path", ""),
+                    error=fields.get("error", ""),
+                    attempts=int(fields.get("attempts") or 0),
                 )
             )
         return jobs
 
-    def failed_transfers(
-        self, sandbox_id: str, node_name: str, *, since_time: str
-    ) -> list[FailedTransfer]:
+    def transfer_job_log(self, node_name: str, *, since_time: str) -> list[str]:
         logs = self._node_service_logs(node_name, NODE_VOLUME_MANAGER, since_time=since_time)
-        return _failed_transfers_from_logs(
-            logs, f"{SANDBOX_CACHE_ROOT}/{_sql_uuid(sandbox_id)}/", node_name
-        )
+        return [
+            _redact_storage_uris(line)[:600] for line in logs.splitlines() if "transfer job" in line
+        ][-40:]
 
     def interrupt_btrfs_send(
         self, node_name: str, *, token: str, pulses: int, window_seconds: int
@@ -5503,33 +5499,6 @@ def _redact_storage_uris(text: str) -> str:
     """`text` with every storage URI replaced by its scheme, for attached evidence."""
 
     return _STORAGE_URI.sub("s3://<redacted>", text)
-
-
-def _failed_transfers_from_logs(
-    logs: str, path_prefix: str, node_name: str
-) -> list[FailedTransfer]:
-    """Failed transfer attempts in `logs` whose local path is under `path_prefix`."""
-
-    failures: list[FailedTransfer] = []
-    for line in logs.splitlines():
-        if TRANSFER_JOB_FAILED_MESSAGE not in line:
-            continue
-        fields = _tracing_fields(line)
-        if fields is None or fields.get("message") != TRANSFER_JOB_FAILED_MESSAGE:
-            continue
-        local_path = str(fields.get("local_path", ""))
-        if not local_path.startswith(path_prefix):
-            continue
-        failures.append(
-            FailedTransfer(
-                node_name=node_name,
-                kind=str(fields.get("kind", "")),
-                local_path=local_path,
-                error_kind=str(fields.get("error_kind", "")),
-                error=str(fields.get("error", "")),
-            )
-        )
-    return failures
 
 
 def _btrfs_send_interrupt_stop_file(token: str) -> str:

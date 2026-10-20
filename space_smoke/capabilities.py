@@ -1748,13 +1748,17 @@ class TransferJobView:
 
     `kind` is the job kind: `push_btrfs_send` streams a rootfs from a retained
     btrfs source, while a materialized send file uploads under another kind
-    with the same `local_path`.
+    with the same `local_path`. `error` is the persisted message of the last
+    failed attempt, cleared when the job completes; `attempts` counts the
+    executions the job started, retries included, and is never reset.
     """
 
     job_id: str
     kind: str
     status: str
     local_path: str
+    error: str = ""
+    attempts: int = 0
 
 
 @dataclass(frozen=True)
@@ -1776,21 +1780,6 @@ class RestoreFailure:
     error_kind: str
     error: str
     restore_codec: str
-
-
-@dataclass(frozen=True)
-class FailedTransfer:
-    """One volume-manager transfer attempt that failed, from its log line.
-
-    `error_kind` is volume-manager's retry class (`retriable` or `permanent`);
-    `error` is the message that failed the attempt.
-    """
-
-    node_name: str
-    kind: str
-    local_path: str
-    error_kind: str
-    error: str
 
 
 @dataclass(frozen=True)
@@ -1852,10 +1841,11 @@ class SuspendCodecControl(CrossNodeRestoreControl, Protocol):
         """
         ...
 
-    def failed_transfers(
-        self, sandbox_id: str, node_name: str, *, since_time: str
-    ) -> list[FailedTransfer]:
-        """volume-manager's failed transfer attempts under the sandbox's cache directory on `node_name` since `since_time`."""
+    def transfer_job_log(self, node_name: str, *, since_time: str) -> list[str]:
+        """volume-manager's transfer-job lines on `node_name` since `since_time`.
+
+        Failure evidence only: no assertion reads it. Storage URIs are redacted.
+        """
         ...
 
     def interrupt_btrfs_send(
