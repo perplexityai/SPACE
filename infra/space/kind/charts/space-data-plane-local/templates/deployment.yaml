@@ -108,6 +108,8 @@ spec:
               value: {{ .Values.ecwHosts | quote }}
             - name: SPACE_DATA_PLANE_API_INTERNAL_URL
               value: {{ .Values.apiInternalUrl | quote }}
+            - name: SPACE_DATA_PLANE_API_INTERNAL_PLAINTEXT
+              value: {{ .Values.apiInternalPlaintext | quote }}
           ports:
             - name: http
               containerPort: {{ .Values.service.port }}

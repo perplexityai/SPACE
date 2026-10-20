@@ -31,8 +31,19 @@ const FORWARDED_HEADERS: [&str; 4] = ["authorization", "x-request-id", "tracepar
 const FORWARDED_HEADER_PREFIX: &str = "x-space-federated-";
 
 #[derive(Debug, thiserror::Error)]
-#[error("invalid API internal URL {0:?}: expected an http:// origin")]
-pub struct ApiInternalUrlError(String);
+pub enum ApiInternalUrlError {
+    #[error("invalid API internal URL {0:?}: expected an http:// origin")]
+    Invalid(String),
+    /// The create carries the caller's API key, which, unlike the session
+    /// tokens other in-cluster hops carry, is good for any sandbox the key
+    /// can reach. Sending it unencrypted is a deployment's explicit choice.
+    #[error(
+        "the API internal URL forwards callers' API keys unencrypted; set \
+         SPACE_DATA_PLANE_API_INTERNAL_PLAINTEXT=true only where the cluster \
+         network is trusted to carry them"
+    )]
+    Plaintext,
+}
 
 /// Sends `createProcessSession` to the API over the cluster network.
 #[derive(Clone)]
@@ -42,8 +53,8 @@ pub(crate) struct ProcessSessionCreator {
 }
 
 impl ProcessSessionCreator {
-    pub(crate) fn new(origin: &str) -> Result<Self, ApiInternalUrlError> {
-        let invalid = || ApiInternalUrlError(origin.to_string());
+    pub(crate) fn new(origin: &str, allow_plaintext: bool) -> Result<Self, ApiInternalUrlError> {
+        let invalid = || ApiInternalUrlError::Invalid(origin.to_string());
         let uri: Uri = origin.parse().map_err(|_| invalid())?;
         let authority = uri.authority().ok_or_else(invalid)?;
         // A path or query would be silently dropped below, and https would
@@ -53,6 +64,9 @@ impl ProcessSessionCreator {
             || uri.query().is_some()
         {
             return Err(invalid());
+        }
+        if !allow_plaintext {
+            return Err(ApiInternalUrlError::Plaintext);
         }
         let mut connector = HttpConnector::new();
         connector.set_connect_timeout(Some(CONNECT_TIMEOUT));
