@@ -19,6 +19,10 @@ jobs:
     runs-on: ubuntu-24.04-16core
     timeout-minutes: 60
     steps:
+      # Validation only: fail at once so Pull CI sees a red Kind smoke.
+      - name: Fail on purpose to validate the Kind merge gate
+        run: exit 1
+
       - name: Check out SPACE
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -131,6 +135,10 @@ jobs:
     runs-on: ubuntu-24.04-16core
     timeout-minutes: 180
     steps:
+      # Validation only: fail at once so Pull CI sees a red Kind smoke.
+      - name: Fail on purpose to validate the Kind merge gate
+        run: exit 1
+
       - name: Check out SPACE
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
