@@ -253,3 +253,162 @@ mod http_failure {
         assert_eq!(http_reason(&error), "parse");
     }
 }
+
+mod peer_alert {
+    use std::io;
+    use std::sync::Arc;
+
+    use rustls::AlertDescription;
+    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+    use tokio::io::{AsyncWriteExt, DuplexStream};
+    use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+    use super::super::{HandshakeAttempt, TlsFailure, TlsTransportError, alert_name};
+    use crate::tls_interception::TlsHandshakeLeg;
+
+    const HOST: &str = "origin.example";
+
+    fn provider() -> Arc<rustls::crypto::CryptoProvider> {
+        Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+    }
+
+    fn acceptor() -> TlsAcceptor {
+        let certified = rcgen::generate_simple_self_signed(vec![HOST.to_owned()]).unwrap();
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            certified.signing_key.serialize_der(),
+        ));
+        let config = rustls::ServerConfig::builder_with_provider(provider())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![certified.cert.der().clone()], key)
+            .unwrap();
+        TlsAcceptor::from(Arc::new(config))
+    }
+
+    /// A client whose trust store does not contain the server's issuer, as a
+    /// guest runtime with its own CA bundle sees the interception chain.
+    fn untrusting_connector() -> TlsConnector {
+        let config = rustls::ClientConfig::builder_with_provider(provider())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        TlsConnector::from(Arc::new(config))
+    }
+
+    async fn accept_error(client: impl AsyncFnOnce(DuplexStream)) -> io::Error {
+        let (server, client_stream) = tokio::io::duplex(64 * 1024);
+        let (accepted, ()) = tokio::join!(acceptor().accept(server), client(client_stream));
+        let Err(error) = accepted else {
+            panic!("handshake must fail");
+        };
+        error
+    }
+
+    fn handshake_tags(error: &TlsTransportError) -> Vec<String> {
+        let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+        HandshakeAttempt::record_failure(TlsHandshakeLeg::ClientToNetgw, error);
+        let metrics = capture.finish();
+        let handshake = metrics
+            .iter()
+            .find(|metric| metric.name == "gateway.tls.handshake")
+            .expect("handshake counter");
+        handshake.tags.clone()
+    }
+
+    /// The case interception rollout must see: the guest refuses the chain and
+    /// says why. The gateway records the guest's alert under its registry name.
+    #[tokio::test]
+    async fn guest_rejecting_the_chain_is_tagged_with_its_alert() {
+        let error = accept_error(async |stream| {
+            let name = ServerName::try_from(HOST).unwrap();
+            let Err(_) = untrusting_connector().connect(name, stream).await else {
+                panic!("guest must refuse the chain");
+            };
+        })
+        .await;
+        let error = TlsTransportError::Downstream(error);
+
+        assert_eq!(error.failure().alert, Some(AlertDescription::UnknownCA));
+        let tags = handshake_tags(&error);
+        assert!(tags.contains(&"alert:unknown_ca".to_owned()), "{tags:?}");
+        assert!(tags.contains(&"reason:io".to_owned()), "{tags:?}");
+    }
+
+    /// A guest that goes away mid-handshake sent no alert, and must not be
+    /// counted as rejecting the chain.
+    #[tokio::test]
+    async fn guest_disconnecting_is_tagged_without_an_alert() {
+        let error = accept_error(async |mut stream| {
+            stream.shutdown().await.unwrap();
+        })
+        .await;
+        let error = TlsTransportError::Downstream(error);
+
+        assert_eq!(error.failure().alert, None);
+        assert!(handshake_tags(&error).contains(&"alert:none".to_owned()));
+    }
+
+    #[test]
+    fn alert_names_follow_the_iana_registry() {
+        for (alert, name) in [
+            (AlertDescription::CloseNotify, "close_notify"),
+            (AlertDescription::HandshakeFailure, "handshake_failure"),
+            (AlertDescription::BadCertificate, "bad_certificate"),
+            (
+                AlertDescription::UnsupportedCertificate,
+                "unsupported_certificate",
+            ),
+            (AlertDescription::CertificateExpired, "certificate_expired"),
+            (AlertDescription::CertificateUnknown, "certificate_unknown"),
+            (AlertDescription::UnknownCA, "unknown_ca"),
+            (AlertDescription::DecryptError, "decrypt_error"),
+            (AlertDescription::ProtocolVersion, "protocol_version"),
+            (AlertDescription::UnrecognisedName, "unrecognized_name"),
+            (
+                AlertDescription::NoApplicationProtocol,
+                "no_application_protocol",
+            ),
+            (
+                AlertDescription::EncryptedClientHelloRequired,
+                "ech_required",
+            ),
+            (AlertDescription::Unknown(255), "255"),
+        ] {
+            assert_eq!(alert_name(alert), name, "{alert:?}");
+        }
+    }
+
+    /// Every alert rustls can decode has a registry name, so a numeric tag
+    /// only ever means a codepoint the registry does not assign.
+    #[test]
+    fn every_alert_rustls_decodes_has_a_registry_name() {
+        for code in 0..=u8::MAX {
+            let alert = AlertDescription::from(code);
+            if alert.as_str().is_some() {
+                assert!(
+                    alert_name(alert).parse::<u8>().is_err(),
+                    "{alert:?} ({code}) has no registry name"
+                );
+            }
+        }
+    }
+
+    /// Errors that are not a received alert keep the tag at `none`.
+    #[test]
+    fn non_alert_errors_carry_no_alert() {
+        for error in [
+            io::Error::other("reset"),
+            io::Error::new(io::ErrorKind::UnexpectedEof, "eof"),
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer),
+            ),
+        ] {
+            let failure = TlsFailure::io(&error);
+            assert_eq!(failure.alert, None);
+            assert_eq!(failure.alert_tag(), "none");
+        }
+    }
+}

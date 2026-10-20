@@ -1,5 +1,6 @@
 //! Verified TLS transport and ALPN. Callers authorize before establishing the origin.
 
+use std::borrow::Cow;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -63,7 +64,7 @@ impl TlsTransportError {
             outcome = self.as_str(),
             reason = failure.reason,
             io_kind = ?io_kind,
-            tls_alert = failure.alert,
+            tls_alert = failure.alert_field().as_deref(),
             certificate_validation_reason = failure.certificate,
             "inspected connection failed"
         );
@@ -103,7 +104,7 @@ impl TlsTransportError {
             Self::Protocol => TlsFailure::new("alpn_mismatch"),
             Self::Certificate(_) => TlsFailure::new("certificate_material"),
             Self::Configuration(_) => TlsFailure::new("configuration"),
-            Self::Downstream(_) | Self::Upstream(_) => TlsFailure::new("io"),
+            Self::Downstream(error) | Self::Upstream(error) => TlsFailure::io(error),
             Self::Connect(transport::Error::Timeout) => TlsFailure::new("timeout"),
             Self::Connect(transport::Error::Io(_)) => TlsFailure::new("io"),
         }
@@ -113,9 +114,10 @@ impl TlsTransportError {
 #[derive(Clone, Copy)]
 struct TlsFailure {
     reason: &'static str,
-    alert: Option<&'static str>,
-    /// Bounded alert class for metrics. The full `alert` name stays in logs.
-    alert_class: &'static str,
+    /// The fatal alert the peer on this leg sent before the failure, if any.
+    /// A guest that rejects the interception chain sends one (`unknown_ca`,
+    /// `bad_certificate`, ...); a guest that disconnects or resets does not.
+    alert: Option<rustls::AlertDescription>,
     certificate: Option<&'static str>,
 }
 
@@ -124,10 +126,84 @@ impl TlsFailure {
         Self {
             reason,
             alert: None,
-            alert_class: "none",
             certificate: None,
         }
     }
+
+    fn io(error: &io::Error) -> Self {
+        Self {
+            alert: received_alert(error),
+            ..Self::new("io")
+        }
+    }
+
+    /// The `alert` metric tag and log field value. `none` when the peer sent
+    /// no alert.
+    fn alert_tag(&self) -> Cow<'static, str> {
+        self.alert.map_or(Cow::Borrowed("none"), alert_name)
+    }
+
+    fn alert_field(&self) -> Option<Cow<'static, str>> {
+        self.alert.map(alert_name)
+    }
+}
+
+/// The fatal alert the peer sent, if this I/O error carries one. tokio-rustls
+/// reports a TLS failure as an `io::Error` wrapping the `rustls::Error`, and
+/// rustls reports a received fatal alert as `Error::AlertReceived`.
+fn received_alert(error: &io::Error) -> Option<rustls::AlertDescription> {
+    match error.get_ref()?.downcast_ref::<rustls::Error>()? {
+        rustls::Error::AlertReceived(alert) => Some(*alert),
+        _ => None,
+    }
+}
+
+/// The alert's description as named in the IANA TLS Alerts registry
+/// (RFC 8446 section 6 and its updates), keyed by the wire value so the name
+/// does not depend on how rustls spells its variants. A value the registry
+/// does not assign is reported as its decimal wire value; the tag stays
+/// bounded by the one-byte field.
+fn alert_name(alert: rustls::AlertDescription) -> Cow<'static, str> {
+    let name = match u8::from(alert) {
+        0 => "close_notify",
+        10 => "unexpected_message",
+        20 => "bad_record_mac",
+        21 => "decryption_failed_RESERVED",
+        22 => "record_overflow",
+        30 => "decompression_failure_RESERVED",
+        40 => "handshake_failure",
+        41 => "no_certificate_RESERVED",
+        42 => "bad_certificate",
+        43 => "unsupported_certificate",
+        44 => "certificate_revoked",
+        45 => "certificate_expired",
+        46 => "certificate_unknown",
+        47 => "illegal_parameter",
+        48 => "unknown_ca",
+        49 => "access_denied",
+        50 => "decode_error",
+        51 => "decrypt_error",
+        52 => "too_many_cids_requested",
+        60 => "export_restriction_RESERVED",
+        70 => "protocol_version",
+        71 => "insufficient_security",
+        80 => "internal_error",
+        86 => "inappropriate_fallback",
+        90 => "user_canceled",
+        100 => "no_renegotiation_RESERVED",
+        109 => "missing_extension",
+        110 => "unsupported_extension",
+        111 => "certificate_unobtainable_RESERVED",
+        112 => "unrecognized_name",
+        113 => "bad_certificate_status_response",
+        114 => "bad_certificate_hash_value_RESERVED",
+        115 => "unknown_psk_identity",
+        116 => "certificate_required",
+        120 => "no_application_protocol",
+        121 => "ech_required",
+        unassigned => return Cow::Owned(unassigned.to_string()),
+    };
+    Cow::Borrowed(name)
 }
 
 fn negotiated(alpn: Option<&[u8]>) -> Result<HttpAlpn, TlsTransportError> {
@@ -435,7 +511,7 @@ impl HandshakeAttempt {
             leg.as_str(),
             outcome,
             failure.reason,
-            failure.alert_class,
+            &failure.alert_tag(),
         );
         tracing::warn!(
             telemetry_type = "tls_handshake_error",
@@ -444,7 +520,7 @@ impl HandshakeAttempt {
             outcome,
             reason = failure.reason,
             io_kind = ?error.io_error().map(io::Error::kind),
-            tls_alert = failure.alert,
+            tls_alert = failure.alert_field().as_deref(),
             certificate_validation_reason = failure.certificate,
             "TLS handshake failed"
         );
@@ -488,7 +564,7 @@ impl<T> TlsIo<T> {
         if self.error_reported {
             return;
         }
-        let failure = TlsFailure::new("io");
+        let failure = TlsFailure::io(error);
         self.error_reported = true;
         pplx_space_metrics::gateway::tls_connection_error(self.leg.as_str(), failure.reason);
         tracing::warn!(
@@ -498,7 +574,7 @@ impl<T> TlsIo<T> {
             operation,
             reason = failure.reason,
             io_kind = ?error.kind(),
-            tls_alert = failure.alert,
+            tls_alert = failure.alert_field().as_deref(),
             certificate_validation_reason = failure.certificate,
             "established TLS connection failed"
         );
