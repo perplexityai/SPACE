@@ -400,11 +400,12 @@ template-pull route, which only the direct substrate serves, or an operator
 calling node-api directly. The target's node-api then calls
 `NodeExportTemplate` on the source node with its own `SPACE_NODE_API_TOKEN_PATH`
 token. List the account that starts pulls and the node-api account of every
-role that can be a target. Also list each node-api account in
-`SPACE_NODE_API_AUTH_PEER_NODE_SERVICE_ACCOUNTS`, which limits it to the export
-call and `GetNodeInfo`. An empty list disables peer
+role that can be a target. An empty
+`SPACE_NODE_API_AUTH_TEMPLATE_TRANSFER_SERVICE_ACCOUNTS` disables peer
 transfers and node-api logs a startup warning. A deployment without peer
-transfers may leave it empty.
+transfers may leave it empty. Also list each node-api account in
+`SPACE_NODE_API_AUTH_PEER_NODE_SERVICE_ACCOUNTS`, which limits that account to
+the export call and `GetNodeInfo`.
 
 Exact-digest export can use the local cache offline. An omitted digest resolves
 the requested catalog tag (default `latest`) and exports only that digest; a
