@@ -712,21 +712,107 @@ async fn teardown_after_node_local_suspend_shares_its_upload_or_settles_its_fail
     use super::retired_teardown_tests::with_cluster_api;
 
     with_cluster_api(BackupControlPlane::default(), async || {
+        type Case = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+        let cases = [
+            NodeLocalUpload::Running,
+            NodeLocalUpload::TransferFailed,
+            NodeLocalUpload::TransferFailedTwice,
+            NodeLocalUpload::TwoFailedAttempts,
+            NodeLocalUpload::RegistrationRecovers,
+            NodeLocalUpload::RegistrationRefused,
+        ]
+        // Each case's future is large; keep them off the test's stack.
+        .map(|upload| Box::pin(teardown_after_node_local_upload(upload)) as Case);
         futures_util::future::join_all(
-            [
-                NodeLocalUpload::Running,
-                NodeLocalUpload::TransferFailed,
-                NodeLocalUpload::TransferFailedTwice,
-                NodeLocalUpload::TwoFailedAttempts,
-                NodeLocalUpload::RegistrationRecovers,
-                NodeLocalUpload::RegistrationRefused,
-            ]
-            // Each case's future is large; keep them off the test's stack.
-            .map(|upload| Box::pin(teardown_after_node_local_upload(upload))),
+            cases
+                .into_iter()
+                .chain([Box::pin(captured_upload_failing_twice()) as Case]),
         )
         .await;
     })
     .await;
+}
+
+/// A teardown that captured its own artifact, whose upload vol-mgr gives up
+/// on twice. The first failure gets a recovery attempt, so the `suspending`
+/// row isn't marked as finished failing until that attempt fails too.
+async fn captured_upload_failing_twice() {
+    use crate::service::tests::service_tests::insert_stranded_teardown_suspend_sandbox;
+    use pplx_space_common_core::types::ExecutionGeneration;
+    use pplx_space_common_jobs::JobStatus;
+
+    let generation = ExecutionGeneration::new(GENERATION).unwrap();
+    let volume_manager = FakeVolumeManager::serve(Transfers::Failed);
+    let scratch = tempfile::tempdir().unwrap();
+    let conn = crate::db::test_conn();
+    let sandbox_id = SandboxId::new();
+    let id = sandbox_id.to_string();
+    let staged = insert_stranded_teardown_suspend_sandbox(&conn, sandbox_id, generation);
+    let snapshot_dir = scratch.path().join("suspend");
+    crate::service::suspend_snapshot_publication::write_full_suspend_artifact(
+        &snapshot_dir,
+        &id,
+        staged,
+        b"teardown-capture",
+    );
+    conn.execute(
+        "UPDATE local_artifacts SET local_path = ?1 WHERE local_artifact_id = ?2",
+        crate::db::fixture::params![snapshot_dir.to_str().unwrap(), staged.to_string()],
+    )
+    .unwrap();
+    let service = SandboxManagerService::new_with_options(
+        conn,
+        SandboxManagerServiceOptions {
+            volume_manager_socket_path: volume_manager.socket.clone(),
+            ..SandboxManagerServiceOptions::for_test_in(scratch.path())
+        },
+    );
+    let cache = tempfile::tempdir().unwrap();
+    let drive = || {
+        service.drive_teardown_suspend_in(
+            sandbox_id,
+            generation,
+            SandboxEventTrigger::System,
+            cache.path(),
+        )
+    };
+    let ends = std::time::Duration::from_secs(10);
+    let marker = || {
+        let db = service.db.lock().unwrap();
+        crate::db::get_sandbox(&db, &id)
+            .unwrap()
+            .unwrap()
+            .failure_reason
+    };
+
+    tokio::time::timeout(ends, drive())
+        .await
+        .unwrap()
+        .expect_err("vol-mgr gives up on the transfer");
+    let first = only_upload(&service, &id);
+    assert_eq!(first.status, JobStatus::Failed.as_str());
+    assert_eq!(marker(), None, "the recovery attempt is still to come");
+
+    tokio::time::timeout(ends, drive())
+        .await
+        .unwrap()
+        .expect_err("vol-mgr gives up on the recovery attempt too");
+    let attempts = uploads(&service, &id);
+    assert_eq!(attempts.len(), 2, "one recovery attempt");
+    assert!(
+        attempts
+            .iter()
+            .all(|job| job.status == JobStatus::Failed.as_str())
+    );
+    assert_eq!(
+        marker().as_deref(),
+        Some(pplx_space_sbx_mgr_client::TEARDOWN_SUSPEND_BACKUP_PERMANENTLY_FAILED_REASON)
+    );
+    assert_eq!(
+        service.lookup_sandbox(&id).unwrap().state,
+        SandboxState::Suspending
+    );
+    super::retired_teardown_tests::drain(&service).await;
 }
 
 async fn teardown_after_node_local_upload(upload: NodeLocalUpload) {

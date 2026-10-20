@@ -1211,7 +1211,8 @@ impl SandboxManagerService {
     ///
     /// A permanent job failure the teardown can't retry ends the artifact's
     /// upload for good: [`teardown_keyed_upload_use`] refuses a fresh
-    /// attempt for it, so every later poll rejoins the same terminal job.
+    /// attempt for it, so every later poll rejoins the same terminal job. A
+    /// permanent failure that still gets a new attempt is not marked.
     /// The suspend therefore can never publish, the row can never leave
     /// `suspending`, and nothing on this node distinguishes it from a suspend
     /// still uploading — a distinction the cluster-deleted eviction needs
@@ -1317,10 +1318,16 @@ impl SandboxManagerService {
             .submit_and_wait(submission, self.snapshot_upload_worker.worst_case_runtime())
             .await?;
         if !job.is_terminal() || job.failure.is_some() {
+            // Only a failure the next drive would rejoin is final. One that
+            // gets a new attempt leaves the row unmarked, and so does a failed
+            // lookup of that rule: the next drive rejoins and marks it then.
             if matches!(
                 job.failure,
                 Some(pplx_space_common_jobs::JobFailure::Permanent { .. })
-            ) {
+            ) && self
+                .teardown_use_of_upload(&backup, &job)
+                .is_ok_and(|then| then == KeyedUploadUse::Join)
+            {
                 self.record_teardown_suspend_backup_permanent_failure(
                     &sandbox.id,
                     backup.artifact.local_artifact_id,
