@@ -2,6 +2,15 @@ pub mod activation;
 pub mod cluster;
 
 pub mod proto {
+    // Re-export every type from pplx-space-node-api-types so callers of
+    // pplx_space_node_api_client::proto::NodeRole / FacetRef / NodeCtlStatus /
+    // etc. receive the canonical type from pplx-space-node-api-types,
+    // identical to what pplx-space-cluster-api-client uses.  This eliminates
+    // the dual-type problem for the shared vocabulary while leaving the
+    // worker/builder/cluster code generated locally; the locally generated
+    // items, including the NodeInfo/NodeCtl service modules, shadow the glob.
+    pub use pplx_space_node_api_types::proto::*;
+
     tonic::include_proto!("space.node.api.v1");
 
     pub const WORKER_FILE_DESCRIPTOR_SET: &[u8] =

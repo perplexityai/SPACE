@@ -1680,6 +1680,7 @@ fn normalize_ip(value: IpAddr) -> IpAddr {
 mod adapter;
 mod auto_lifecycle_delete_completions;
 mod backup_generation_fence;
+mod compat;
 mod metadata;
 mod node_local_backup_pending;
 mod publish;

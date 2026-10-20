@@ -51,6 +51,7 @@
         "crates/libs/net/common",
         "crates/libs/net/gateway/client",
         "crates/libs/node/api/client",
+        "crates/libs/node/api/types",
         "crates/libs/node/mgr/client",
         "crates/libs/object-store",
         "crates/libs/observability",
@@ -63,6 +64,7 @@
         "crates/libs/sbx/mgr/store",
         "crates/libs/spaced/build",
         "crates/libs/spaced/common",
+        "crates/libs/spaced/guest/protocol",
         "crates/libs/sqlite",
         "crates/libs/template/mgr-client",
         "crates/libs/template/publish"
@@ -96,6 +98,7 @@
         "crates/libs/net/common",
         "crates/libs/net/gateway/client",
         "crates/libs/node/api/client",
+        "crates/libs/node/api/types",
         "crates/libs/node/mgr/client",
         "crates/libs/object-store",
         "crates/libs/observability",
@@ -104,6 +107,7 @@
         "crates/libs/sbx/mgr/store",
         "crates/libs/spaced/build",
         "crates/libs/spaced/common",
+        "crates/libs/spaced/guest/protocol",
         "crates/libs/sqlite",
         "crates/libs/template/mgr-client"
       ]
@@ -142,6 +146,7 @@
         "crates/libs/net/common",
         "crates/libs/net/gateway/client",
         "crates/libs/node/api/client",
+        "crates/libs/node/api/types",
         "crates/libs/node/mgr/client",
         "crates/libs/object-store",
         "crates/libs/observability",
@@ -155,6 +160,7 @@
         "crates/libs/snapshot/store",
         "crates/libs/spaced/build",
         "crates/libs/spaced/common",
+        "crates/libs/spaced/guest/protocol",
         "crates/libs/template/mgr-client"
       ]
     },
@@ -176,12 +182,14 @@
         "crates/libs/net/common",
         "crates/libs/net/gateway/client",
         "crates/libs/node/api/client",
+        "crates/libs/node/api/types",
         "crates/libs/node/mgr/client",
         "crates/libs/observability",
         "crates/libs/public/api",
         "crates/libs/sbx/mgr/client",
         "crates/libs/spaced/build",
         "crates/libs/spaced/common",
+        "crates/libs/spaced/guest/protocol",
         "crates/libs/template/mgr-client"
       ]
     },
@@ -218,6 +226,7 @@
         "crates/libs/build/mgr",
         "crates/libs/build/mgr/client",
         "crates/libs/build/mgr/server",
+        "crates/libs/cluster/api/client",
         "crates/libs/cluster/pool",
         "crates/libs/cluster/trigger-queue",
         "crates/libs/common/cli",
@@ -247,6 +256,7 @@
         "crates/libs/net/gateway/server",
         "crates/libs/node/api/client",
         "crates/libs/node/api/server",
+        "crates/libs/node/api/types",
         "crates/libs/node/ctl/client",
         "crates/libs/node/ctl/server",
         "crates/libs/node/mgr/client",
@@ -270,6 +280,8 @@
         "crates/libs/spaced/build",
         "crates/libs/spaced/common",
         "crates/libs/spaced/guest/client",
+        "crates/libs/spaced/guest/execution",
+        "crates/libs/spaced/guest/protocol",
         "crates/libs/spaced/guest/server",
         "crates/libs/spaced/host/client",
         "crates/libs/spaced/host/server",

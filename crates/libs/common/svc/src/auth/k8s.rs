@@ -17,7 +17,7 @@ use tonic::Status;
 use super::{
     AuthConfigError, AuthSurface, DataPlaneSessionRefreshAuthority, NetworkPolicyMutationAuthority,
     NodeApiAuthenticatedCaller, NodeRole, SPACE_K8S_TOKEN_AUTH_ENABLED_ENV,
-    WaitReadyLifecycleAuthority,
+    WaitReadyLifecycleAuthority, cluster_api_method,
 };
 
 // The namespace is read from the pod's service account mount. The override is a
@@ -704,7 +704,7 @@ fn guest_bridge_method(role: NodeRole, path: &str) -> bool {
         return true;
     }
     if role == NodeRole::Cluster {
-        let Some(method) = path.strip_prefix("/space.node.api.v1.ClusterApi/") else {
+        let Some(method) = cluster_api_method(path) else {
             return false;
         };
         // These are the edge's existing session and runtime-routing calls,
