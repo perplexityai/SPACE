@@ -1,7 +1,7 @@
 ---
 source: crates/libs/sbx/mgr/server/src/snapshot_upload/tests.rs
 assertion_line: 410
-expression: "serde_json::to_string_pretty(&wire).unwrap()"
+expression: "serde_json::to_string_pretty(&parsed).unwrap()"
 ---
 {
   "version": 1,

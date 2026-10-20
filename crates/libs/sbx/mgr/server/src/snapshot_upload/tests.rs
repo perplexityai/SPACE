@@ -402,16 +402,16 @@ fn write_snapshot_metadata_sizes_from_local_artifacts_at_submit_time() {
     assert_eq!(out.size_bytes, 60, "size is the sum of local VM artifacts");
 
     let written = std::fs::read_to_string(dir.join(SNAPSHOT_METADATA_FILENAME)).unwrap();
-    let wire: serde_json::Value = serde_json::from_str(&written).unwrap();
+    let parsed: SnapshotMeta = serde_json::from_str(&written).unwrap();
     assert_eq!(
-        wire["rootfs_size_bytes"], 30,
+        parsed.rootfs_size_bytes,
+        Some(30),
         "disk size excludes memory and VM state"
     );
     insta::assert_snapshot!(
         "snapshot_metadata_with_disk_size",
-        serde_json::to_string_pretty(&wire).unwrap()
+        serde_json::to_string_pretty(&parsed).unwrap()
     );
-    let parsed: SnapshotMeta = serde_json::from_str(&written).unwrap();
     assert_eq!(parsed.size_bytes, 60);
     assert_eq!(parsed.sandbox_id, meta.sandbox_id);
 }
