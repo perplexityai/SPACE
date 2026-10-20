@@ -84,6 +84,30 @@ feature on the crate itself.
   migration with the Squawk transaction override.
 - Do not add partial indexes in either up or down migrations. Use a non-partial
   index or redesign the access path.
+- Enforce value sets that grow with the code in the application, not in
+  `CHECK` constraints. A `CHECK` that lists an enum's wire values duplicates the
+  Rust type, and every new variant then needs its own migration that has to
+  deploy before the code that writes it. When a change would widen such a
+  `CHECK`, drop it instead, but only when all of these hold:
+  - Every production write path binds the column through one closed enum
+    (`wire_enum!` or `wire_enum_open_schema!`; `open_wire_enum!` types carry an
+    `Other(String)` and don't qualify) whose values, apart from the ones this
+    change adds, are exactly the set the `CHECK` admits. A wider enum that a
+    caller filters doesn't qualify; the `CHECK` is what narrows it.
+  - Nothing in production writes a non-NULL value around that enum: no SQL
+    literal, `CASE` result, column default, or trigger.
+  - The `CHECK` reads only that column. One that relates several columns of a
+    row stays: concurrent updates that each change one column can combine into
+    a row no single update validated.
+  - If the `CHECK` also enforces a rule that doesn't grow, such as
+    `cardinality(col) > 0`, keep that part as its own `CHECK`.
+
+  The drop's down migration must refuse while rows hold values outside the
+  restored list, because a `NOT VALID` `CHECK` still evaluates every later
+  update to them, including `ON DELETE SET NULL` cascades. Follow
+  `db/postgres/20261016013700_drop_public_operations_kind_check.down.sql`.
+  Keep `CHECK`s for ranges, formats, and other rules that don't grow, along
+  with primary keys, `UNIQUE`, foreign keys, and `NOT NULL`.
 - Prefer explicit statements and Rust-managed transactions over dense CTE
   chains. Generate application-owned identifiers and labels in application code.
 - Use `space_uuid_v7()` for database-owned UUIDs. A UUIDv4 exception requires
