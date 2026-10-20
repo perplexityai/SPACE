@@ -92,6 +92,7 @@ from space_smoke.capabilities import (
     StorageObject,
     StorageRequestResult,
     StorageSession,
+    ReconcileQueueRef,
     ReleaseStorageRow,
     RestoreActivation,
     RestoreFailure,
@@ -102,6 +103,11 @@ from space_smoke.capabilities import (
     WarmPoolSelection,
 )
 from space_smoke.credmgr_socket import exchange_token, relay_argv
+from space_smoke.reconcile_queue_gc import (
+    GC_ENV_KEYS as RECONCILE_QUEUE_GC_ENV_KEYS,
+    validate_marker,
+    validate_node_name,
+)
 from space_smoke.orphaned_restore_pod_gc import (
     GC_ENV_KEYS,
     GC_LOG_NEEDLE,
@@ -375,6 +381,33 @@ def _sql_identifier_ish(value: str) -> str:
     return value
 
 
+def _sql_uuid_list(values: Sequence[str]) -> str:
+    if not values:
+        raise ValueError("refusing an empty id list")
+    return ", ".join(f"'{_sql_uuid(value)}'" for value in values)
+
+
+# Two non-ready k8s nodes, each with a 25 h-old live ref; the live one also
+# holds a 25 h-old dead letter and a 1 h-old one (`space_smoke.reconcile_queue_gc`).
+RECONCILE_QUEUE_GC_SEED_SQL = """\
+BEGIN;
+INSERT INTO nodes (id, role, managed_by, state)
+VALUES ('{live_id}', 'worker', 'k8s', 'registered'),
+       ('{gone_id}', 'worker', 'k8s', 'registered');
+INSERT INTO node_k8s (node_id, k8s_node_name, k8s_node_uid)
+VALUES ('{live_id}', '{live_name}', '{marker}'),
+       ('{gone_id}', '{gone_name}', '{marker}');
+INSERT INTO node_reconcile_queue (node_id, facet, element, requested_at, updated_at, dead_at, dead_reason)
+VALUES ('{live_id}', 'node-status', '', NOW() - INTERVAL '25 hours', NOW() - INTERVAL '25 hours', NULL, ''),
+       ('{gone_id}', 'node-status', '', NOW() - INTERVAL '25 hours', NOW() - INTERVAL '25 hours', NULL, ''),
+       ('{live_id}', 'sandbox-inventory', '', NOW() - INTERVAL '25 hours', NOW() - INTERVAL '25 hours',
+        NOW() - INTERVAL '25 hours', '{marker}'),
+       ('{live_id}', 'template-inventory', '', NOW() - INTERVAL '1 hour', NOW() - INTERVAL '1 hour',
+        NOW() - INTERVAL '1 hour', '{marker}');
+COMMIT;
+"""
+
+
 # Oldest-first so [0] is the pin target the retention scenario manufactures.
 READY_FULL_SNAPSHOTS_SQL = """\
 SELECT s.id,
@@ -535,7 +568,8 @@ SELECTOR_LABELS_ENV = "SPACE_SANDBOX_NODE_SELECTOR_LABELS"
 ADMISSION_ENABLED_ENV = "SPACE_CLUSTER_ACTIVATION_ADMISSION_ENABLED"
 # Non-pool sandbox pods: `build_pool_pod` stamps `pool-role`, a user create does not.
 KIND_SANDBOX_POD_SELECTOR = "app.kubernetes.io/name=space-sandbox,!space.pplx.net/pool-role"
-KIND_WORKER_NODE_SELECTOR = "!node-role.kubernetes.io/control-plane"
+CONTROL_PLANE_LABEL = "node-role.kubernetes.io/control-plane"
+KIND_WORKER_NODE_SELECTOR = f"!{CONTROL_PLANE_LABEL}"
 SANDBOX_RESIDENCY_SQL = """\
 SELECT lifecycle, coalesce(active_node_id::text, '') FROM sandboxes WHERE id = '{sandbox_id}'::uuid;
 """
@@ -4838,6 +4872,86 @@ ON CONFLICT (key_hash) DO NOTHING;
             ),
             f"delete sandbox pod {pod}",
         )
+
+    # --- reconcile-queue GC -------------------------------------------------
+    #
+    # Named reads and the one seed; the rows' shape and the verdicts live in
+    # `space_smoke.reconcile_queue_gc`.
+
+    def reconcile_queue_gc_env(self) -> dict[str, str | None]:
+        return self._deployment_env_literals(self._controller_deployment(), RECONCILE_QUEUE_GC_ENV_KEYS)
+
+    def unregistered_ready_node(self) -> str:
+        registered = set(
+            self._psql(
+                "SELECT DISTINCT k8s_node_name FROM node_k8s;\n",
+                action="list the node names SPACE rows carry",
+            ).split()
+        )
+        candidates = sorted(
+            (CONTROL_PLANE_LABEL not in node.labels, node.name)
+            for node in self.nodes_snapshot()
+            if node.ready and node.name not in registered
+        )
+        if not candidates:
+            raise SmokeConfigurationError("no Ready Kubernetes Node is free of SPACE node rows")
+        return validate_node_name(candidates[0][1])
+
+    def node_exists(self, name: str) -> bool:
+        result = self.kubectl(
+            "get", "node", validate_node_name(name), "--ignore-not-found", "-o", "name", timeout=15
+        )
+        _require_ok(result, f"look up node {name}")
+        return bool(result.stdout.strip())
+
+    def seed_reconcile_queue_gc_nodes(
+        self,
+        *,
+        live: tuple[str, str],
+        gone: tuple[str, str],
+        marker: str,
+    ) -> None:
+        self._require_isolated_kind("reconcile-queue GC seeding")
+        self._psql(
+            RECONCILE_QUEUE_GC_SEED_SQL.format(
+                live_id=_sql_uuid(live[0]),
+                live_name=validate_node_name(live[1]),
+                gone_id=_sql_uuid(gone[0]),
+                gone_name=validate_node_name(gone[1]),
+                marker=validate_marker(marker),
+            ),
+            action="seed the reconcile-queue GC's synthetic nodes",
+        )
+
+    def reconcile_queue_refs(self, node_ids: Sequence[str]) -> list[ReconcileQueueRef]:
+        out = self._psql(
+            "SELECT node_id, facet, dead_at IS NOT NULL FROM node_reconcile_queue "
+            f"WHERE node_id IN ({_sql_uuid_list(node_ids)}) ORDER BY 1, 2;\n",
+            action="read the seeded nodes' reconcile queue",
+        )
+        refs = []
+        for line in out.splitlines():
+            node_id, _, rest = line.strip().partition("|")
+            facet, _, dead = rest.partition("|")
+            if node_id:
+                refs.append(ReconcileQueueRef(node_id=node_id, facet=facet, dead=dead == "t"))
+        return refs
+
+    def delete_seeded_reconcile_queue_nodes(self, node_ids: Sequence[str], *, marker: str) -> int:
+        ids = _sql_uuid_list(node_ids)
+        out = self._psql(
+            "DELETE FROM nodes n USING node_k8s k WHERE k.node_id = n.id "
+            f"AND n.id IN ({ids}) AND k.k8s_node_uid = '{validate_marker(marker)}';\n"
+            f"SELECT COUNT(*) FROM nodes WHERE id IN ({ids});\n",
+            action="delete the reconcile-queue GC's synthetic nodes",
+        )
+        return int(out.splitlines()[-1])
+
+    def fake_ec2_log_tail(self) -> str:
+        result = self.kubectl(
+            "logs", "deployment/space-kind-fake-ec2", "--tail=40", "--timestamps", timeout=30
+        )
+        return result.stdout if result.returncode == 0 else result.stderr
 
     # --- orphaned-restore-pod GC ---------------------------------------------
     #

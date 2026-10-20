@@ -19,6 +19,10 @@
 #   space-kind-sts-bridge-tls    tls.crt/tls.key  the Kind-only STS bridge's
 #                                                 STS listener: sts-bridge, the
 #                                                 Service the authority dials
+#   space-kind-fake-ec2-tls      tls.crt/tls.key  the Kind-only fake EC2
+#                                                 endpoint: fake-ec2, the
+#                                                 Service the cluster-controller
+#                                                 dials
 #   space-object-store-iam-tls   tls.crt/tls.key  the Kind object store's IAM
 #                                                 service, both listeners:
 #                                                 object-store-iam, the Service
@@ -74,6 +78,7 @@ LEAVES=(
   "space-build-manager-tls|space-build-manager|space-builder-build-manager|daemonset/space-builder-build-manager"
   "space-ingress-activation-tls|space-ingress-activation|space-api|deployment/space-api"
   "space-kind-sts-bridge-tls|sts-bridge|sts-bridge|deployment/space-kind-sts-bridge"
+  "space-kind-fake-ec2-tls|fake-ec2|fake-ec2|deployment/space-kind-fake-ec2"
   "space-object-store-iam-tls|object-store-iam|object-store-iam|deployment/space-object-store-iam"
   "space-object-store-iam-client-tls|space-object-store||deployment/space-object-store|clientAuth"
 )

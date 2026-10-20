@@ -40,6 +40,18 @@ space-cluster-controller-local:
   # Shares the API's cluster-activation bucket, so it names the same store.
   redis:
     url: ""
+  # The Kind fake EC2 endpoint is not installed here, so neither its
+  # AWS_ENDPOINT_URL_EC2, its CA trust nor the pod's loopback alias for the
+  # public EC2 name is rendered, and the reconcile-queue GC that Kind runs
+  # against it stays off, as it ships. templates/validate.yaml refuses the
+  # fake endpoint.
+  ec2:
+    fakeEndpoint:
+      enabled: false
+  reconcilers:
+    reconcileQueueGc:
+      env:
+        SPACE_RECONCILE_QUEUE_GC_ENABLED: "false"
 
 space-data-plane-local:
   entry:

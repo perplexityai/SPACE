@@ -368,6 +368,19 @@ custom_build(
     skips_local_docker = False,
 )
 
+# Kind-only: the fake EC2 endpoint the cluster-controller's reconcile-queue GC
+# calls in place of EC2. Go, standard library only.
+custom_build(
+    ref = "space-kind-fake-ec2:local",
+    command = " && ".join([
+        BUILD_INPUTS_SNAPSHOT,
+        pull_base_images("docker/Dockerfile.kind-fake-ec2"),
+        image_build("space-kind-fake-ec2") + " -t $EXPECTED_REF --build-arg SPACE_GIT_SHA .",
+    ]),
+    deps = ["docker/Dockerfile.kind-fake-ec2", "infra/space/kind/fake-ec2"],
+    skips_local_docker = False,
+)
+
 # UI: no rust, single Dockerfile. NEXT_PUBLIC_API_URL must be passed at
 # BUILD time — Next.js evaluates rewrites in next.config.js once at build
 # and freezes the result in .next/required-server-files.json. Runtime env
@@ -668,6 +681,15 @@ k8s_resource(
     "space-cluster-controller",
     labels = ["control-plane"],
     resource_deps = ["space-api", "label-kind-infra"],
+)
+# Kind-only fake EC2 endpoint: the cluster-controller reconcile-queue GC's
+# DescribeInstances, answered from the cluster's Nodes. Its leaf comes from
+# internal-rpc-tls.
+k8s_yaml(helm_release("space", "infra/space/kind/charts/space-kind-fake-ec2"))
+k8s_resource(
+    "space-kind-fake-ec2",
+    labels = ["control-plane"],
+    resource_deps = ["label-kind-infra", "internal-rpc-tls"],
 )
 
 k8s_yaml(helm_release("space", "infra/space/kind/charts/space-ui-local"))

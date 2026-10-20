@@ -33,8 +33,9 @@ node-ctl publishing.
 
 Direct state manipulation is limited to faults or state with no public setup
 path: the run-scoped ECW API key, stale node tombstones contradicted by
-Kubernetes, stranded lifecycle rows created by the sweeper smoke, and
-Kubernetes Node patches exercised by the node-ctl admission smoke. Keep these exceptions inside their existing helpers
+Kubernetes, stranded lifecycle rows created by the sweeper smoke, the
+backdated reconcile-queue rows of the reconcile-queue GC smoke's synthetic
+nodes, and Kubernetes Node patches exercised by the node-ctl admission smoke. Keep these exceptions inside their existing helpers
 or suites.
 
 ## Harness invariants
@@ -57,7 +58,8 @@ or suites.
   the authority's call to the Kind-only `space-kind-key-broker` fixture, which
   has no TLS listener. The authority reaches the Kind-only STS bridge
   (`space-kind-sts-bridge`), and the bridge the object store's IAM service,
-  over TLS from that CA. Never ship either fixture outside Kind.
+  over TLS from that CA, as the cluster-controller reaches the Kind-only fake
+  EC2 endpoint (`space-kind-fake-ec2`). Never ship these fixtures outside Kind.
 - Node services run one DaemonSet per service and role from
   `charts/space-<service>-local` on the `space-node-service` library, listed in
   `lib/node-services.sh` for every bring-up path. Each pod runs the unmodified

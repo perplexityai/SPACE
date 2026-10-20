@@ -107,6 +107,12 @@ The render fails, listing every gap, unless the file supplies:
   filesystem, set both to `true` together; `templates/validate.yaml` refuses
   a file that sets only one. With them on, runtime-manager exits at startup
   until node-manager has prepared the store and its staging directory.
+- `space-cluster-controller-local.ec2.fakeEndpoint.enabled: false`, so the
+  controller gets no `AWS_ENDPOINT_URL_EC2` for the Kind fake EC2 endpoint,
+  no trust in the internal RPC CA for it, and no loopback alias for the
+  public EC2 name. `templates/validate.yaml` refuses it on. The
+  reconcile-queue GC (`SPACE_RECONCILE_QUEUE_GC_ENABLED`), which Kind runs
+  against that fake, stays off as it ships.
 
 Telemetry follows `global.observability` through the space-kind-telemetry
 helper. A chart's `telemetry.traceExporter: "off"` still vetoes its traces,

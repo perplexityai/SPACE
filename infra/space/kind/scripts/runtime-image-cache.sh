@@ -45,8 +45,8 @@ warn() {
 }
 
 # <image> <dockerfile> <stage>...: the stages each image's build imports and
-# main exports, in build order. The key broker and the STS bridge install
-# nothing.
+# main exports, in build order. The key broker, the STS bridge and the fake
+# EC2 endpoint install nothing.
 IMAGES="
 space-api docker/Dockerfile.api smoke-build runtime-deps
 space-data-plane docker/Dockerfile.data-plane runtime-deps
@@ -56,6 +56,7 @@ space-seed-publish docker/Dockerfile.seed-publish runtime-deps
 space-ui docker/Dockerfile.ui deps
 space-kind-key-broker docker/Dockerfile.kind-key-broker
 space-kind-sts-bridge docker/Dockerfile.kind-sts-bridge
+space-kind-fake-ec2 docker/Dockerfile.kind-fake-ec2
 "
 
 image_entry() {

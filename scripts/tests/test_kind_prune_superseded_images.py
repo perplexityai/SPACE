@@ -484,7 +484,7 @@ def test_each_listed_image_carries_its_title_label():
     # The only way an untagged build is recognized as one of these images.
     build_images = (KIND_DIR / "scripts/build-images.sh").read_text()
     titles = set()
-    for dockerfile in set(re.findall(r"docker/Dockerfile\.[a-z-]+", build_images)):
+    for dockerfile in set(re.findall(r"docker/Dockerfile\.[a-z0-9-]+", build_images)):
         titles |= set(
             re.findall(
                 r'LABEL org\.opencontainers\.image\.title="([^"]+)"',

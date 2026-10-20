@@ -26,6 +26,7 @@ from space_smoke.capabilities import (
     NodeSelectorExtrasControl,
     PendingBackupControl,
     OrphanedRestorePodGcControl,
+    ReconcileQueueGcControl,
     TemplateBuildControl,
     TemplateBuilder,
     RateLimiterControl,
@@ -99,6 +100,7 @@ from space_smoke.node_fence import NodeFenceAssertions
 from space_smoke.node_selector_extras import NodeSelectorExtrasAssertions
 from space_smoke.orphaned_restore_pod_gc import OrphanedRestorePodGcAssertions
 from space_smoke.pending_backup import PendingBackupAssertions
+from space_smoke.reconcile_queue_gc import ReconcileQueueGcAssertions
 from space_smoke.template_build import TemplateBuildAssertions
 from space_smoke.rate_limiters import RateLimiterAssertions
 from space_smoke.sandbox_network_isolation import SandboxNetworkIsolationAssertions
@@ -2786,6 +2788,23 @@ class KindEcw(Ecw):
                 self, self._orphaned_restore_pod_gc_control, self._context.scope
             )
         return self._orphaned_restore_pod_gc_assertions
+
+    _reconcile_queue_gc_control: ReconcileQueueGcControl | None = None
+    _reconcile_queue_gc_assertions: ReconcileQueueGcAssertions | None = None
+
+    @property
+    def reconcile_queue_gc(self) -> ReconcileQueueGcAssertions:
+        """Privileged assertions for the cluster-controller's reconcile-queue GC."""
+
+        if self._reconcile_queue_gc_control is None:
+            raise SmokeConfigurationError(
+                "reconcile-queue GC control is only available on the kind backend"
+            )
+        if self._reconcile_queue_gc_assertions is None:
+            self._reconcile_queue_gc_assertions = ReconcileQueueGcAssertions(
+                self, self._reconcile_queue_gc_control, self._context.scope
+            )
+        return self._reconcile_queue_gc_assertions
 
     _rate_limiter_control: RateLimiterControl | None = None
     _rate_limit_probe: RateLimitProbe | None = None

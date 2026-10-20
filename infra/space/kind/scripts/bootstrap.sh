@@ -471,6 +471,9 @@ helm_apply space "$KIND_DIR/charts/space-kind-key-broker"
 helm_apply space "$KIND_DIR/charts/space-credmgr-authority-local"
 helm_apply space "$KIND_DIR/charts/space-data-plane-local"
 helm_apply space "$KIND_DIR/charts/space-cluster-controller-local"
+# Kind-only fake EC2 endpoint: the cluster-controller reconcile-queue GC's
+# DescribeInstances, answered from the cluster's Nodes.
+helm_apply space "$KIND_DIR/charts/space-kind-fake-ec2"
 helm_apply space "$KIND_DIR/charts/space-ui-local"
 # Node services: one release of each per role (lib/node-services.sh) —
 # `space` on the sandbox workers, `space-builder` with node.role=builder and
@@ -528,6 +531,9 @@ kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-data-plane
 
 log "waiting for space-cluster-controller Deployment"
 kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-cluster-controller --timeout="${TIMEOUT}s"
+
+log "waiting for space-kind-fake-ec2 Deployment"
+kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-kind-fake-ec2 --timeout="${TIMEOUT}s"
 
 log "waiting for space-ui Deployment"
 kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-ui --timeout="${TIMEOUT}s"

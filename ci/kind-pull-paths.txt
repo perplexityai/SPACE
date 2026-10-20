@@ -24,6 +24,7 @@ docker/Dockerfile.seed-publish
 docker/Dockerfile.ui
 docker/Dockerfile.kind-key-broker
 docker/Dockerfile.kind-sts-bridge
+docker/Dockerfile.kind-fake-ec2
 templates/firecracker/seed/**
 templates/firecracker/recipes/seed.toml
 # The cluster-controller's binary, and its library after crates/libs/build:

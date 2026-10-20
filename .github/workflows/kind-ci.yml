@@ -471,6 +471,10 @@ jobs:
             >"${dir}/space-kind-sts-bridge.log" 2>&1 || true
           k 45s -n space logs deployment/space-object-store-iam --timestamps \
             >"${dir}/space-object-store-iam.log" 2>&1 || true
+          # The cluster-controller's Kind fixture: the fake EC2 endpoint, whose
+          # log records every call the reconcile-queue GC made.
+          k 45s -n space logs deployment/space-kind-fake-ec2 --all-containers=true --timestamps \
+            >"${dir}/space-kind-fake-ec2.log" 2>&1 || true
           for node in $(timeout 30s kind get nodes --name space-local 2>/dev/null); do
             timeout 45s docker exec "${node}" journalctl -u kubelet -u containerd --no-pager -o short-iso \
               >"${dir}/${node}.journal.log" 2>&1 || true

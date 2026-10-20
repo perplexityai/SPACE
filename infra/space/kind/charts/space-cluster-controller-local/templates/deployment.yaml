@@ -41,6 +41,17 @@ spec:
       {{- end }}
       priorityClassName: {{ .Values.priorityClassName }}
       serviceAccountName: {{ .Values.serviceAccount.name }}
+      {{- if .Values.ec2.fakeEndpoint.enabled }}
+      # Without AWS_ENDPOINT_URL_EC2, the EC2 client signs to
+      # https://ec2.<AWS_REGION>.amazonaws.com/, the one public endpoint it
+      # can build (AwsQueryClient::endpoint). Pinning that name to loopback
+      # here makes a lost override fail to connect, which the GC reads as an
+      # unknown answer and keeps the refs, instead of reaching AWS.
+      hostAliases:
+        - ip: 127.0.0.1
+          hostnames:
+            - ec2.{{ .Values.snapshotRegion }}.amazonaws.com
+      {{- end }}
       terminationGracePeriodSeconds: 30
       containers:
         - name: cluster-controller
@@ -135,6 +146,17 @@ spec:
               value: {{ .Values.snapshotRegion | quote }}
             - name: SPACE_SNAPSHOT_ENDPOINT
               value: {{ .Values.snapshotEndpoint | quote }}
+            {{- if .Values.ec2.fakeEndpoint.enabled }}
+            # The fake EC2 endpoint; see `ec2` in values.yaml.
+            - name: AWS_ENDPOINT_URL_EC2
+              value: {{ required "ec2.fakeEndpoint.url must name the Kind fake EC2 endpoint" .Values.ec2.fakeEndpoint.url | quote }}
+            # The EC2 client's HTTPS trusts the platform roots
+            # (rustls-platform-verifier, through rustls-native-certs), which
+            # read SSL_CERT_DIR: the image's bundle plus the internal RPC CA
+            # that issued the fake's leaf.
+            - name: SSL_CERT_DIR
+              value: /etc/ssl/certs:/etc/space-rpc-ca
+            {{- end }}
             - name: AWS_ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:

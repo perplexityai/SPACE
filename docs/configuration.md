@@ -62,7 +62,7 @@ because disabling it by mistake would leave every create queued forever.
 | `SPACE_ORPHANED_RESTORE_POD_GC_MAX_DELETES_PER_MINUTE` | 60 | Orphans acted on per rolling minute. A larger value clamps to 600; `0` or a non-number keeps the default. To stop deletions, use `DRY_RUN` or `ENABLED`. |
 | `SPACE_ORPHANED_RESTORE_POD_GC_BATCH_SIZE` | 500 | Sandbox rows looked up per query. A larger value clamps to 5000; `0` or a non-number keeps the default. |
 | `SPACE_ORPHANED_RESTORE_POD_GC_TEARDOWN_STUCK_AFTER_SECS` | 300 | How long a pod may stay terminating before it's reported as a stuck teardown. Seconds; a value above one day clamps to it, and `0` or a non-number keeps the default. |
-| `SPACE_RECONCILE_QUEUE_GC_ENABLED` | off | Needs AWS. |
+| `SPACE_RECONCILE_QUEUE_GC_ENABLED` | off | Needs AWS: it calls EC2 `DescribeInstances`, at `AWS_ENDPOINT_URL_EC2` when that is set. |
 | `SPACE_ORPHANED_NODES_ENABLED` | off | Needs AWS. |
 | `SPACE_NODE_DRAIN_ENABLED` | off | |
 | `SPACE_NODE_DRAIN_NODE_CENSUS_RESIDENCY` | off | |

@@ -154,6 +154,7 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "local.pending_backup_census_reports_blocked_upload",
                 "local.private_template_build_isolation",
                 "local.rate_limiters_enforce_and_fail_open",
+                "local.reconcile_queue_gc_prunes_only_gone_nodes",
                 "local.restarted_btrfs_send_is_rejected_and_retried",
                 "local.retention_claim_finish_forward",
                 "local.retention_restore_source_guard",

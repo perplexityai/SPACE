@@ -19,6 +19,7 @@ SPACE_KIND_LOCAL_IMAGES=(
   space-ui
   space-kind-key-broker
   space-kind-sts-bridge
+  space-kind-fake-ec2
 )
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

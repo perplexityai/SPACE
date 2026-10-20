@@ -40,7 +40,10 @@
 #                       cluster's storage credentials mode is still compared
 #                       with SPACE_KIND_STORAGE_CREDENTIALS, and a mismatch
 #                       refused (`__storage_mode_mismatch`,
-#                       `__node_storage_keys_mismatch`)
+#                       `__node_storage_keys_mismatch`), and so is a
+#                       cluster-controller whose reconcile-queue GC wiring
+#                       differs from this checkout's chart
+#                       (`__reconcile_queue_gc_mismatch`)
 #   SPACE_KIND_STORAGE_CREDENTIALS — exchange (default) or static
 #                       (infra/space/kind/lib/storage-credentials.sh); a live
 #                       Tilt running the other mode is restarted in this one
@@ -1270,6 +1273,65 @@ bootstrap_kind_stack__refuse_storage_mode_mismatch() {
     fi
 }
 
+# Prints each part of the reconcile-queue GC's Kind wiring that the applied
+# cluster-controller Deployment lacks against this checkout's render of its
+# chart: the GC switch, AWS_ENDPOINT_URL_EC2 and the pod's loopback alias for
+# the public EC2 name (`reconcilers.reconcileQueueGc` and `ec2.fakeEndpoint`
+# in charts/space-cluster-controller-local), plus an available
+# space-kind-fake-ec2 when the render names it. Nothing when they agree or
+# there is no Deployment yet. A bench brought up before the fake existed runs
+# the GC off with nothing to answer it, and no suite would notice. Fails on
+# an unreadable cluster or render.
+bootstrap_kind_stack__reconcile_queue_gc_mismatch() {
+    kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER" || return 0
+    local ctx="kind-${KIND_CLUSTER}" applied rendered manifest available errors
+    if ! applied="$(kubectl --context "$ctx" -n space get deployment space-cluster-controller \
+            --ignore-not-found -o json 2>&1)"; then
+        echo "ERROR: cannot read the cluster-controller of kind cluster $KIND_CLUSTER: $applied" >&2
+        return 1
+    fi
+    [[ -n "$applied" ]] || return 0
+    # helm warns about the charts' symlinked libraries on stderr, so only
+    # stdout is the manifest.
+    errors="$(mktemp)"
+    if ! manifest="$(helm template space "$REPO_ROOT/infra/space/kind/charts/space-cluster-controller-local" \
+            --namespace space --show-only templates/deployment.yaml 2>"$errors")" \
+        || ! rendered="$(kubectl --context "$ctx" create --dry-run=client -o json -f - \
+            <<<"$manifest" 2>"$errors")"; then
+        echo "ERROR: cannot render this checkout's cluster-controller chart: $(<"$errors")" >&2
+        rm -f "$errors"
+        return 1
+    fi
+    rm -f "$errors"
+    local diff endpoint
+    if ! diff="$(jq -nr --argjson want "$rendered" --argjson have "$applied" '
+            def env($name): [.spec.template.spec.containers[]
+                | select(.name == "cluster-controller") | .env[]?
+                | select(.name == $name) | .value] | first // "";
+            def wiring: {
+                SPACE_RECONCILE_QUEUE_GC_ENABLED: env("SPACE_RECONCILE_QUEUE_GC_ENABLED"),
+                AWS_ENDPOINT_URL_EC2: env("AWS_ENDPOINT_URL_EC2"),
+                hostAliases: ([.spec.template.spec.hostAliases[]? | .ip as $ip
+                    | .hostnames[] | "\(.)->\($ip)"] | sort | join(","))
+            };
+            ($want | wiring) as $w | ($have | wiring) as $h
+            | $w | keys_unsorted[] | select($w[.] != $h[.])
+            | "\(.): applied \($h[.] | @json), this checkout renders \($w[.] | @json)"' 2>&1)" \
+        || ! endpoint="$(jq -r '[.spec.template.spec.containers[].env[]?
+            | select(.name == "AWS_ENDPOINT_URL_EC2") | .value] | first // ""' <<<"$rendered" 2>&1)"; then
+        echo "ERROR: cannot compare the cluster-controller's reconcile-queue GC wiring: ${endpoint:-$diff}" >&2
+        return 1
+    fi
+    [[ -z "$diff" ]] || printf '%s\n' "$diff"
+    [[ -n "$endpoint" ]] || return 0
+    if ! available="$(kubectl --context "$ctx" -n space get deployment space-kind-fake-ec2 \
+            --ignore-not-found -o jsonpath='{.status.availableReplicas}' 2>&1)"; then
+        echo "ERROR: cannot read the fake EC2 endpoint of kind cluster $KIND_CLUSTER: $available" >&2
+        return 1
+    fi
+    [[ "${available:-0}" -ge 1 ]] || echo "space-kind-fake-ec2: no available replica"
+}
+
 bootstrap_kind_stack__bring_up() {
     # Always run the port-owner guard, even under SKIP_BOOTSTRAP — the
     # whole point is that the smoke test is destructive against
@@ -1279,9 +1341,18 @@ bootstrap_kind_stack__bring_up() {
     # Before the SKIP_BOOTSTRAP return: suites pick scenarios and expectations
     # by the requested mode, so running them against a cluster in the other
     # one would test what was not asked for.
-    local deployed_mode
+    local deployed_mode gc_wiring
     if [[ "${SKIP_BOOTSTRAP:-0}" == "1" ]]; then
         bootstrap_kind_stack__refuse_storage_mode_mismatch
+        gc_wiring="$(bootstrap_kind_stack__reconcile_queue_gc_mismatch)" || exit 1
+        if [[ -n "$gc_wiring" ]]; then
+            echo "ERROR: kind cluster $KIND_CLUSTER does not run this checkout's reconcile-queue GC wiring:" >&2
+            sed 's/^/       /' <<<"$gc_wiring" >&2
+            echo "       Bring it up from this checkout by running once without SKIP_BOOTSTRAP=1," >&2
+            echo "       which starts Tilt here (or restarts one watching another checkout) to apply" >&2
+            echo "       the cluster-controller chart and deploy space-kind-fake-ec2." >&2
+            exit 1
+        fi
         echo "[bootstrap] SKIP_BOOTSTRAP=1; assuming kind+tilt are already running"
         bootstrap_kind_stack__check_live_provenance
         return

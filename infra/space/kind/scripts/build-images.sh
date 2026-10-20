@@ -120,6 +120,17 @@ build_space_kind_sts_bridge() {
   kind_load space-kind-sts-bridge:local
 }
 
+# Kind-only: the fake EC2 endpoint the cluster-controller's reconcile-queue GC
+# calls in place of EC2 (charts/space-kind-fake-ec2). Go, so it needs no Rust
+# artifact.
+build_space_kind_fake_ec2() {
+  log "building runtime image: space-kind-fake-ec2:local (docker/Dockerfile.kind-fake-ec2)"
+  image_build space-kind-fake-ec2 --provenance=false --sbom=false -t space-kind-fake-ec2:local \
+    --build-arg SPACE_GIT_SHA \
+    .
+  kind_load space-kind-fake-ec2:local
+}
+
 build_space_cluster_controller() {
   build_rust_runtime space-cluster-controller docker/Dockerfile.cluster-controller
 }
@@ -178,6 +189,7 @@ dispatch() {
     space-seed-publish)           build_space_seed_publish ;;
     space-kind-key-broker)        build_space_kind_key_broker ;;
     space-kind-sts-bridge)        build_space_kind_sts_bridge ;;
+    space-kind-fake-ec2)          build_space_kind_fake_ec2 ;;
     space-ui)                     build_space_ui ;;
     *)
       printf 'unknown image: %s\nknown: %s\n' "$1" "${ALL_IMAGES[*]}" >&2

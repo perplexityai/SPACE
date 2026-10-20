@@ -76,6 +76,9 @@ _DURATION_SECONDS = {
         # Two Kind runs with fast-pace env rollouts: 61 and 57 s. Kind bench
         # runs (otel) before them, no Redis settle: 98-103 s against 106 s.
         "local.rate_limiters_enforce_and_fail_open": 58,
+        # Estimate until a CI run refreshes it: sandbox setup, then up to one
+        # 300 s GC tick.
+        "local.reconcile_queue_gc_prunes_only_gone_nodes": 330,
         # One Kind run: 16 s of phases (8.5 s suspend with the retried upload)
         # plus sandbox cleanup.
         "local.restarted_btrfs_send_is_rejected_and_retried": 30,

@@ -239,26 +239,40 @@ reconcilers:
       SPACE_ORPHANED_RESTORE_POD_GC_DRY_RUN: "true"
   # Reconcile-queue GC, one reconciler with two detector instances
   # (reconcilers.rs, reconcile_queue_gc/mod.rs).
-  # - `SPACE_RECONCILE_QUEUE_GC_*`, the EC2 instance, ships off. Deployments
-  #   run it; Kind keeps it off because a Kind bench must not call AWS. For
-  #   a non-ready node whose live refs are 24 h old, Ec2Detector signs a
-  #   DescribeInstances call with the controller's AWS_REGION and the object
-  #   store's keys, to the public EC2 API. A reply with no live instance
-  #   would read as gone (Ec2InstanceLookup); only the call's own failure,
-  #   read as unknown, would keep the refs. There is no switch for the
-  #   detector alone, and its EC2 client (pplx_space_aws_client::ec2) takes
-  #   only the global AWS_ENDPOINT_URL, which would also redirect the
-  #   controller's S3 clients. The same instance runs the Postgres-only
-  #   dead-letter pass (run_dead_prune), so that stays off too.
+  # - `SPACE_RECONCILE_QUEUE_GC_*`, the EC2 instance, ships off; deployments
+  #   run it, and so does Kind, at the binary's fixed timers: a 300 s tick
+  #   (DEFAULT_TICK), and 24 h before a dead letter, or a live ref of a
+  #   non-ready node, is old enough to prune. Each tick runs the dead-letter
+  #   pass (run_dead_prune), then asks EC2 about every non-ready node with a
+  #   ref that old (Ec2Detector): DescribeInstances by the node's Kubernetes
+  #   name, which on EKS is the instance's private DNS name. On Kind that
+  #   call goes to the fake EC2 endpoint in `ec2` below, which answers from
+  #   the cluster's Nodes. A cluster younger than 24 h holds no ref that
+  #   old, so there the GC finds no candidate and calls no endpoint.
   # - `SPACE_GONE_NODE_QUEUE_GC_*`, the gone-node queue GC, ships on and
   #   dry-run: it reports the live refs of nodes absent from Kubernetes
   #   without deleting them, from Postgres and Kubernetes reads only.
   #   Rendered explicitly at those defaults.
   reconcileQueueGc:
     env:
-      SPACE_RECONCILE_QUEUE_GC_ENABLED: "false"
+      SPACE_RECONCILE_QUEUE_GC_ENABLED: "true"
       SPACE_GONE_NODE_QUEUE_GC_ENABLED: "true"
       SPACE_GONE_NODE_QUEUE_GC_DRY_RUN: "true"
+
+# EC2 for the reconcile-queue GC's Ec2Detector, and for every other EC2 client
+# in this process (all off on Kind): the Kind-only fake EC2 endpoint
+# (charts/space-kind-fake-ec2), reached through the SDK's service endpoint
+# setting AWS_ENDPOINT_URL_EC2 (configured_endpoint_url,
+# crates/libs/aws/client/src/query.rs), which no S3 client reads, unlike the
+# global AWS_ENDPOINT_URL. `fakeEndpoint.enabled` renders that setting, the
+# internal RPC CA trust (SSL_CERT_DIR) and the pod's loopback alias for the
+# public EC2 name together: on for Kind, where a bench must not call AWS; the
+# space-cluster umbrella, which installs no fake, turns it off
+# (infra/space/cluster/chart/values.yaml).
+ec2:
+  fakeEndpoint:
+    enabled: true
+    url: https://fake-ec2:8443
 
 resources:
   requests:
