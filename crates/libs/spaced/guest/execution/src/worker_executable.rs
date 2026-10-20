@@ -31,6 +31,10 @@ pub enum OpenWorkerExecutableError {
 
 impl WorkerExecutable {
     /// Open a caller-selected artifact. This does not launch it or authenticate it.
+    ///
+    /// The caller needs read access to inspect the ELF header, in addition to the
+    /// execute permission needed at launch. An execute-only artifact is insufficient
+    /// when the caller cannot bypass its read permissions.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, OpenWorkerExecutableError> {
         let path = path.as_ref();
         if !path.is_absolute() {

@@ -19,7 +19,9 @@ execution metadata.
   the service never infers the hosting application's executable. The opened inode
   stays pinned across path replacement. The caller must protect its contents,
   loader and libraries; file validation and the protocol handshake do not establish
-  trust. Scripts are unsupported. Linux `/proc` must be mounted.
+  trust. The caller needs read access for ELF inspection as well as execute
+  permission at launch; execute-only files are insufficient without a read-access
+  override. Scripts are unsupported. Linux `/proc` must be mounted.
 - The daemon explicitly selects its running executable and dispatches worker mode
   before application initialization. Other hosts can build the dedicated worker
   with `cargo build -p pplx-space-spaced-guest-worker` and select the resulting
