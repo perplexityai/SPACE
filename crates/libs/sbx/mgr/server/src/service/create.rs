@@ -641,6 +641,16 @@ impl SandboxManagerService {
             open_activation_claim_eligible,
             restored_snapshot,
         } = launch;
+        // A stopped target is a data placement that must end before
+        // Firecracker. The `Start` boundaries answer it before reaching here;
+        // refusing it at the launch itself means a path that misses them fails
+        // instead of booting a sandbox that is supposed to stay inert.
+        if target_state == SandboxState::Stopped {
+            return Err(Status::failed_precondition(format!(
+                "sandbox {} has a stopped target; a checkpoint launch never runs for it",
+                sandbox.id
+            )));
+        }
         self.ensure_snapshot_restore_supported("start_from_checkpoint")?;
 
         let id = &sandbox.id;

@@ -34,15 +34,21 @@ pub(super) struct WakeStartConfig {
     /// lifecycle-preserving drain evacuation path sets `Paused`: the
     /// restore path skips the post-load resume so the VM stays in the
     /// firecracker-paused state, preserving the user-visible lifecycle.
+    /// The same drain sets `Stopped` for a `stopped` resident: the restore
+    /// path materializes its disk artifact and stops there, never reaching
+    /// Firecracker.
     ///
-    /// Only `Started` or `Paused` are valid here. Other variants of
-    /// `SandboxState` are programmer errors; the proto-to-`SandboxState`
+    /// Only `Started`, `Paused`, or `Stopped` are valid here. Other variants
+    /// of `SandboxState` are programmer errors; the proto-to-`SandboxState`
     /// helper [`wake_target_state_from_proto`] enforces this at the wire
-    /// boundary, and downstream code in `start_from_checkpoint` falls
-    /// through to the Started behavior for anything unexpected.
+    /// boundary. `start_from_checkpoint` refuses `Stopped` and treats any other
+    /// unexpected value as `Started`.
     pub(super) target_state: SandboxState,
     pub(super) suspend_restore_storage_uri: Option<String>,
     pub(super) suspend_restore_source_node: Option<String>,
+    /// Which artifact `suspend_restore_storage_uri` resolves to, forwarded to
+    /// the delegated `Start` so a stopped target can be checked locally.
+    pub(super) expected_local_artifact_id: Option<String>,
     /// Route identity exactly as received by Wake, before runtime normalization.
     /// Internal Start must forward this representation so normalization cannot
     /// turn an incomplete producer identity into control-plane fence evidence.
@@ -66,6 +72,7 @@ impl Default for WakeStartConfig {
             target_state: SandboxState::Started,
             suspend_restore_storage_uri: None,
             suspend_restore_source_node: None,
+            expected_local_artifact_id: None,
             requested_space_api_route_identity: None,
             space_api_route_identity: SpaceApiRouteIdentity::default(),
             route_identity_provenance:
@@ -687,10 +694,11 @@ impl WakeNetworkContext {
 /// `SandboxState` variant the wake/restore path should converge on.
 /// `UNSPECIFIED` and `STARTED` both resolve to `SandboxState::Started`
 /// (back-compat with the historical wake-to-started contract); `PAUSED`
-/// resolves to `SandboxState::Paused`. Unknown values are rejected before
-/// a mutation can run. This is the single boundary where the
-/// proto i32 leaves typed code; downstream Rust passes
-/// `SandboxState` around without conversions.
+/// resolves to `SandboxState::Paused`; `STOPPED` resolves to
+/// `SandboxState::Stopped`, the evacuated-stopped disk materialization.
+/// Unknown values are rejected before a mutation can run. This is the
+/// single boundary where the proto i32 leaves typed code; downstream Rust
+/// passes `SandboxState` around without conversions.
 pub(super) fn wake_target_state_from_proto(value: i32) -> Result<SandboxState, Status> {
     use pplx_space_sbx_mgr_client::proto::WakeTargetState;
     let target = WakeTargetState::try_from(value)
@@ -698,19 +706,21 @@ pub(super) fn wake_target_state_from_proto(value: i32) -> Result<SandboxState, S
     Ok(match target {
         WakeTargetState::Unspecified | WakeTargetState::Started => SandboxState::Started,
         WakeTargetState::Paused => SandboxState::Paused,
+        WakeTargetState::Stopped => SandboxState::Stopped,
     })
 }
 
 /// Inverse of [`wake_target_state_from_proto`]: encode a `SandboxState`
 /// value back to the proto `WakeTargetState` i32 for `StartRequest`
 /// re-emission inside sbx-mgr (the wake handler re-issues
-/// `start_sandbox` with the same target). Only `Started` and `Paused`
-/// are meaningful here; any other `SandboxState` is a programmer error
-/// and falls through to `STARTED`.
+/// `start_sandbox` with the same target). Only `Started`, `Paused`, and
+/// `Stopped` are meaningful here; any other `SandboxState` is a
+/// programmer error and falls through to `STARTED`.
 pub(super) fn wake_target_state_to_proto(state: SandboxState) -> i32 {
     use pplx_space_sbx_mgr_client::proto::WakeTargetState;
     match state {
         SandboxState::Paused => WakeTargetState::Paused as i32,
+        SandboxState::Stopped => WakeTargetState::Stopped as i32,
         // SandboxState::Started is the canonical "wake to started"; all
         // other variants are unreachable on the wake-target path but
         // resolve to Started defensively.

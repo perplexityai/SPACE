@@ -1799,3 +1799,46 @@ async fn restore_template_lookup_uses_validated_owner(#[case] owner: &str, #[cas
         Some(expected)
     );
 }
+
+// A stopped materialization refused because the staged artifact isn't the
+// evacuated disk the caller named is evidence disagreeing with itself, the
+// same class as the other identity mismatches, not a filesystem or database
+// failure.
+#[test]
+fn a_refused_stopped_materialization_is_a_source_mismatch_stage_failure() {
+    let unsuitable = RestoreError::StoppedMaterializationArtifactUnsuitable {
+        kind: Some(ArtifactKind::Full),
+        origin: Some(ArtifactOrigin::Suspend),
+        local_artifact_id: Some(LocalArtifactId::new()),
+    };
+    let mismatch = RestoreError::StoppedMaterializationArtifactMismatch {
+        expected: LocalArtifactId::new(),
+        staged: LocalArtifactId::new(),
+    };
+    for error in [unsuitable, mismatch] {
+        assert_eq!(
+            error.stage_error_kind().as_str(),
+            pplx_space_metrics::snapshot::RestoreStageErrorKind::SourceMismatch.as_str(),
+            "{error}"
+        );
+    }
+}
+
+// The two stopped-materialization refusals are the only stage-in failures a
+// retry can't help, so they're the only ones the `Start` paths report as
+// `FailedPrecondition`. A sibling source-mismatch variant stays retryable.
+#[test]
+fn only_the_stopped_refusals_are_classified_as_permanent() {
+    let unsuitable = RestoreError::StoppedMaterializationArtifactUnsuitable {
+        kind: None,
+        origin: None,
+        local_artifact_id: None,
+    };
+    let mismatch = RestoreError::StoppedMaterializationArtifactMismatch {
+        expected: LocalArtifactId::new(),
+        staged: LocalArtifactId::new(),
+    };
+    assert!(unsuitable.is_stopped_materialization_refusal());
+    assert!(mismatch.is_stopped_materialization_refusal());
+    assert!(!RestoreError::MissingSandboxOwnershipMetadata.is_stopped_materialization_refusal());
+}

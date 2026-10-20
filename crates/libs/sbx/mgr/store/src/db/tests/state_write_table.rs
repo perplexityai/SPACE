@@ -95,7 +95,7 @@ const ALLOWLIST: &[(SandboxState, SandboxState, Disagreement, &str)] = &[
     (Suspended,       Quarantined,     AllowedUnwritten,    NO_QUARANTINE_WRITER),
     (Restoring,       Started,         AllowedNotRequested, COMPLETION_ONLY),
     (Restoring,       Stopping,        RequestForbidden,    STOP_LIVE_RUNTIME),
-    (Restoring,       Stopped,         WriteForbidden,      "restore-as-new publishes a stopped disk"),
+    (Restoring,       Stopped,         WriteForbidden,      "restore-as-new and stopped materialization publish a stopped disk"),
     (Restoring,       Paused,          AllowedNotRequested, COMPLETION_ONLY),
     (Restoring,       Suspended,       WriteForbidden,      "restore rollback, cross-node publication, restore recovery"),
     (Restoring,       CleanupRequired, WriteForbidden,      "an interrupted or ambiguous restore is handed to cleanup"),

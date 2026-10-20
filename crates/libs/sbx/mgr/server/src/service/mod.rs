@@ -209,6 +209,10 @@ fn request_sandbox_ids(sandbox_ids: &[String]) -> Vec<String> {
 
 const RUN_DIR: &str = pplx_space_common_core::host::linux::paths::SANDBOX_RUN_DIR;
 const CACHE_DIR: &str = pplx_space_common_core::host::linux::paths::SANDBOX_CACHE_DIR;
+
+/// Answers whether a sandbox's rootfs is on this node's disk; an error means
+/// presence couldn't be verified.
+pub type RootfsPresenceProbe = Arc<dyn Fn(&str) -> std::io::Result<bool> + Send + Sync>;
 const JAIL_DIR: &str = pplx_space_common_core::host::linux::paths::FIRECRACKER_JAIL_DIR;
 const TEMPLATE_DIR: &str = pplx_space_common_core::host::linux::paths::TEMPLATE_DIR;
 const NET_GATEWAY_SIDECAR_PID_NAME: &str = "space-netgtw-svc";
@@ -429,6 +433,13 @@ pub struct SandboxManagerService {
     /// reattach path without a real `fc.pid` symlink on disk. Production uses
     /// [`is_sandbox_running`].
     sandbox_runtime_live: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    /// Probe for "is this sandbox's rootfs on this node's disk". The stopped
+    /// materialization boundary checks it before vouching for a row, so a row
+    /// whose bytes are gone is refused rather than reported as placed; an
+    /// error means presence couldn't be verified. Injected so tests can answer
+    /// it without `/space/cache`. Production uses
+    /// [`create_support::sandbox_rootfs_exists_in`] over `CACHE_DIR`.
+    sandbox_rootfs_present: RootfsPresenceProbe,
     /// Node-manager's answers about retained btrfs send sources. Injected so
     /// tests can drive recovery without a btrfs node-manager.
     retained_source_inspector: Arc<dyn crate::retained_source::RetainedSourceInspector>,
@@ -1003,6 +1014,7 @@ pub struct SandboxManagerServiceOptions {
     pub host_control_socket_path: PathBuf,
     pub credential_manager_socket_path: PathBuf,
     pub sandbox_runtime_live: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    pub sandbox_rootfs_present: RootfsPresenceProbe,
     pub shutdown_token: CancellationToken,
     pub task_tracker: TaskTracker,
     /// Stable identity of this node. Tests can inject availability explicitly;
@@ -1037,6 +1049,9 @@ impl Default for SandboxManagerServiceOptions {
                 pplx_space_credmgr_client::CREDMGR_SOCKET,
             ),
             sandbox_runtime_live: Arc::new(is_sandbox_running),
+            sandbox_rootfs_present: Arc::new(|id: &str| {
+                create_support::sandbox_rootfs_exists_in(std::path::Path::new(CACHE_DIR), id)
+            }),
             shutdown_token: CancellationToken::new(),
             task_tracker: TaskTracker::new(),
             local_node_id: local_space_node_id(),
@@ -1796,6 +1811,7 @@ impl SandboxManagerService {
             },
             snapshot_upload_worker,
             sandbox_runtime_live: options.sandbox_runtime_live,
+            sandbox_rootfs_present: options.sandbox_rootfs_present,
             retained_source_inspector: Arc::new(
                 crate::retained_source::NodeManagerSourceInspector(options.node_manager.clone()),
             ),
