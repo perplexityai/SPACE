@@ -44,7 +44,6 @@ from space_smoke.capabilities import (
     ReleaseStorageRow,
     SnapshotRowFacts,
     StartupRecoveryControl,
-    StartupRecoveryReport,
     SuspendCodecControl,
     SandboxNetworkIsolationControl,
     StorageExchangeControl,
@@ -896,7 +895,13 @@ class CommandSandboxFixture:
         **evidence: object,
     ) -> None:
         if not condition and failure_evidence is not None:
-            evidence.update(failure_evidence())
+            # Evidence must never replace the verdict it explains.
+            try:
+                evidence.update(failure_evidence())
+            except ScenarioTimedOut:
+                raise
+            except Exception as error:  # noqa: BLE001 - attached, the violation still raises
+                evidence["failure_evidence_error"] = f"{type(error).__name__}: {error}"[:500]
         self._context.verify(condition, message, **evidence)
 
     def warn(self, message: str, **evidence: object) -> None:
@@ -3993,6 +3998,46 @@ class PlantedBuild:
     digest: str
 
 
+@dataclass(frozen=True)
+class RecoveredBuild:
+    """A plant as startup recovery left it: its digest directories and the daemon's answer."""
+
+    digest_dirs: tuple[str, ...]
+    build_state: str | None
+
+
+# The decision-table branch a plant took, keyed on what it held when the daemon
+# restarted and what it holds after recovery, each as (catalog row, digest
+# directory). With the precondition fixed, every branch ends in its own state.
+_RECOVERY_OUTCOMES = {
+    ((True, True), (True, True)): "confirmed",
+    ((False, True), (True, True)): "registered",
+    ((True, True), (False, False)): "rejected",
+    ((False, True), (False, False)): "rejected",
+    ((True, False), (False, False)): "pruned",
+}
+
+
+def recovery_outcome(held: tuple[bool, bool], digest: str, after: RecoveredBuild) -> str:
+    """The branch a plant holding `held` at restart took, from its state after recovery.
+
+    A row counts when `space-tmplmgr get` answers for it at all; a row beside
+    its directory must be `ready`. `untouched` is a plant other than a
+    row-backed one that recovery left as it was; `inconsistent` is a state no
+    branch leaves.
+    """
+
+    if after.digest_dirs not in ((), (digest,)):
+        return "inconsistent"
+    now = (after.build_state is not None, bool(after.digest_dirs))
+    if now == (True, True) and after.build_state != "ready":
+        return "inconsistent"
+    outcome = _RECOVERY_OUTCOMES.get((held, now))
+    if outcome is not None:
+        return outcome
+    return "untouched" if now == held else "inconsistent"
+
+
 RECOVERY_PLANT_BYTES = 4 * 1024**2
 
 
@@ -4002,11 +4047,19 @@ class StartupRecoveryAssertions:
     Recovery runs once, at daemon start, over every template name directory on
     the node. So the scenario plants one throwaway build per branch of the
     table on the sandbox-pool worker that is *not* running its sandbox, puts
-    each into the on-disk/catalog state that branch handles, restarts that
-    worker's template-manager once, and reads the five verdicts from the new
-    pod's log — then checks each verdict against disk (`sha256:*` directories) and
-    the daemon (`space-tmplmgr get`, safe here because the plants have no
-    cluster release and so a miss cannot re-pull).
+    each into the on-disk/catalog state that branch handles, and restarts that
+    worker's template-manager once. Each plant's outcome follows from what it
+    held at the restart and what it holds after recovery: its `sha256:*`
+    directories on disk and the daemon's `space-tmplmgr get` answer (safe here
+    because the plants have no cluster release, so a miss cannot re-pull).
+
+    Recovery is over once the stale plant's row is gone: rows whose bytes are
+    missing are pruned in one pass after every digest directory has been
+    reconciled (`run_startup_recovery`). The eviction loop, which starts beside
+    recovery, can also drop a row, so the stale plant is read `ready`
+    immediately before the restart: that proves no eviction removed it
+    earlier, and the successful read restarts the build's eviction grace
+    (`SPACE_TEMPLATE_GC_GRACE_SECS`), which outlasts a restart.
 
     No SQLite anywhere: "no row" states are made by stashing the digest
     directory aside, running the daemon's own `delete-template`, and putting
@@ -4026,6 +4079,10 @@ class StartupRecoveryAssertions:
         self._scope = scope
         self._node: str | None = None
         self._pod: str | None = None
+        self._plants: dict[str, PlantedBuild] = {}
+        # What each plant holds when the daemon restarts: (catalog row, digest directory).
+        self._held: dict[str, tuple[bool, bool]] = {}
+        self._recovered: dict[str, RecoveredBuild] = {}
 
     def spare_worker(self) -> str:
         """A sandbox-pool node not running the fixture sandbox."""
@@ -4099,6 +4156,8 @@ class StartupRecoveryAssertions:
             build_state=state,
         )
         planted = PlantedBuild(case, name, digests[0])
+        self._plants[name] = planted
+        self._held[name] = (True, True)
         self._fixture.record(f"plant_{case}", f"{name}/{planted.digest}")
         return planted
 
@@ -4107,11 +4166,16 @@ class StartupRecoveryAssertions:
 
         node = self._current_node()
         self._control.remove_template_digest_dir(node, planted.name, planted.digest)
+        digests = self._control.template_digest_dirs(node, planted.name)
+        state = self._control.template_build_state(node, planted.name, planted.digest)
         self._fixture.verify(
-            self._control.template_digest_dirs(node, planted.name) == (),
-            "the digest directory is still on disk after removal",
+            digests == () and state == "ready",
+            "the stale build should keep its row with its digest directory removed",
             template=planted.name,
+            digest_dirs=list(digests),
+            build_state=state,
         )
+        self._held[planted.name] = (True, False)
 
     def orphan(self, planted: PlantedBuild) -> None:
         """Bytes kept, row gone — the state a crash between rename and DB commit leaves."""
@@ -4123,6 +4187,7 @@ class StartupRecoveryAssertions:
             "the digest directory did not survive being orphaned",
             template=planted.name,
         )
+        self._held[planted.name] = (False, True)
 
     def tamper(self, planted: PlantedBuild) -> None:
         """No row, and the bootable artifact's bytes changed under an unchanged size."""
@@ -4139,10 +4204,28 @@ class StartupRecoveryAssertions:
 
     def restart_and_wait_for_recovery(
         self, *, restart_timeout: float = 600, recovery_timeout: float = 300
-    ) -> StartupRecoveryReport:
-        """Replace the spare worker's template-manager pod and wait for recovery to finish."""
+    ) -> None:
+        """Replace the spare worker's template-manager pod and wait for recovery to finish.
+
+        Finished means every stale plant's row is gone (see the class
+        docstring); each plant's state is then read once for the expectations.
+        """
 
         node = self._current_node()
+        stale = [self._plants[name] for name, held in self._held.items() if held == (True, False)]
+        if not stale:
+            raise SmokeConfigurationError(
+                "plant a stale row before restarting: its prune marks the end of recovery"
+            )
+        before = {
+            planted.name: self._control.template_build_state(node, planted.name, planted.digest)
+            for planted in stale
+        }
+        self._fixture.verify(
+            all(state == "ready" for state in before.values()),
+            "the stale row was gone before the restart; its prune cannot mark the end of recovery",
+            stale_build_states=before,
+        )
         started = time.monotonic()
         self._pod = self._control.restart_node_service(
             node, "template-manager", timeout=restart_timeout
@@ -4153,106 +4236,103 @@ class StartupRecoveryAssertions:
         )
         deadline = time.monotonic() + recovery_timeout
         while True:
-            report = self._control.startup_recovery_report(node)
-            if report.finished:
+            states: dict[str, str | None] = {}
+            last_error: str | None = None
+            for planted in stale:
+                try:
+                    states[planted.name] = self._control.template_build_state(
+                        node, planted.name, planted.digest
+                    )
+                except RuntimeError as error:
+                    # The replacement can be Ready before its socket answers.
+                    states[planted.name], last_error = "<unreadable>", str(error)
+            if all(state is None for state in states.values()):
                 break
             self._fixture.verify(
                 time.monotonic() <= deadline,
-                "template-manager did not log the end of startup recovery in time",
+                "template-manager's startup recovery did not prune the stale row in time",
                 pod=self._pod,
                 recovery_timeout_seconds=recovery_timeout,
-                verdicts_so_far=len(report.verdicts),
+                stale_build_states=states,
+                last_read_error=last_error,
+                failure_evidence=lambda: {
+                    "startup_recovery_log": self._control.startup_recovery_log(node)
+                },
             )
             self._fixture.wait(3)
         self._fixture.record(
-            "recovery_verdicts",
-            [
-                {"template": v.template, "outcome": v.outcome, "reason": v.reason}
-                for v in report.verdicts
-                if v.template.startswith("smoke-rec-")
-            ],
+            "recovery_seconds", round(time.monotonic() - started, 1)
         )
-        return report
+        outcomes = []
+        for name, planted in self._plants.items():
+            recovered = RecoveredBuild(
+                self._control.template_digest_dirs(node, name),
+                self._control.template_build_state(node, name, planted.digest),
+            )
+            self._recovered[name] = recovered
+            outcomes.append(
+                {
+                    "template": name,
+                    "held_row_and_dir": list(self._held[name]),
+                    "digest_dirs": list(recovered.digest_dirs),
+                    "build_state": recovered.build_state,
+                    "outcome": recovery_outcome(self._held[name], planted.digest, recovered),
+                }
+            )
+        self._fixture.record("recovery_outcomes", outcomes)
 
-    def _outcomes(self, report: StartupRecoveryReport, planted: PlantedBuild) -> list[str]:
-        return [v.outcome for v in report.for_build(planted.name, planted.digest)]
-
-    def _expect_state(self, planted: PlantedBuild, *, present: bool) -> None:
-        # `space-tmplmgr get` is safe as a negative probe here only because the
-        # plants have no cluster release: a local miss asks the cluster for a
-        # release to pull, gets NotFound, and cannot re-materialize the build
-        # (nor adopt an orphaned directory: the pull asks the cluster for the
-        # release before it touches the disk).
+    def _expect_outcome(self, planted: PlantedBuild, expected: str, message: str) -> None:
+        recovered = self._recovered.get(planted.name)
+        if recovered is None:
+            raise SmokeConfigurationError("restart_and_wait_for_recovery must run first")
         node = self._current_node()
-        digests = self._control.template_digest_dirs(node, planted.name)
-        state = self._control.template_build_state(node, planted.name, planted.digest)
-        if present:
-            ok = digests == (planted.digest,) and state == "ready"
-            message = "the build should have survived recovery with its bytes and a ready row"
-        else:
-            ok = digests == () and state is None
-            message = "the build should have been removed by recovery, bytes and row"
+        outcome = recovery_outcome(self._held[planted.name], planted.digest, recovered)
         self._fixture.verify(
-            ok,
+            outcome == expected,
             message,
             template=planted.name,
-            digest_dirs=list(digests),
-            build_state=state,
+            held_row_and_dir=list(self._held[planted.name]),
+            digest_dirs=list(recovered.digest_dirs),
+            build_state=recovered.build_state,
+            outcome=outcome,
+            failure_evidence=lambda: {
+                "startup_recovery_log": self._control.startup_recovery_log(node)
+            },
         )
 
-    def expect_confirmed(self, report: StartupRecoveryReport, planted: PlantedBuild) -> None:
-        """Row plus intact declared files: confirmed by stat alone, never hashed."""
+    def expect_confirmed(self, planted: PlantedBuild) -> None:
+        """Row plus intact declared files: kept with its bytes and a ready row."""
 
-        outcomes = self._outcomes(report, planted)
-        self._fixture.verify(
-            outcomes == ["confirmed"],
-            "a build with a row and intact bytes was not confirmed exactly once",
-            template=planted.name,
-            outcomes=outcomes,
+        self._expect_outcome(
+            planted, "confirmed", "a build with a row and intact bytes did not survive recovery"
         )
-        self._expect_state(planted, present=True)
 
-    def expect_pruned(self, report: StartupRecoveryReport, planted: PlantedBuild) -> None:
-        """A row whose bytes are gone is pruned; nothing is hashed or registered."""
+    def expect_pruned(self, planted: PlantedBuild) -> None:
+        """A row whose bytes are gone is pruned."""
 
-        outcomes = self._outcomes(report, planted)
-        self._fixture.verify(
-            outcomes == ["pruned"],
-            "a row without bytes was not pruned (or something else happened to it)",
-            template=planted.name,
-            outcomes=outcomes,
+        self._expect_outcome(
+            planted, "pruned", "a row without bytes was not pruned (or something else happened to it)"
         )
-        self._expect_state(planted, present=False)
 
-    def expect_registered(self, report: StartupRecoveryReport, planted: PlantedBuild) -> None:
-        """Bytes without a row are adopted only through a matching hash."""
+    def expect_registered(self, planted: PlantedBuild) -> None:
+        """Bytes without a row are adopted with a ready row."""
 
-        outcomes = self._outcomes(report, planted)
-        self._fixture.verify(
-            outcomes == ["registered"],
-            "an orphaned valid build was not registered exactly once",
-            template=planted.name,
-            outcomes=outcomes,
+        self._expect_outcome(
+            planted, "registered", "an orphaned valid build was not registered"
         )
-        self._expect_state(planted, present=True)
 
-    def expect_rejected(
-        self, report: StartupRecoveryReport, planted: PlantedBuild, *, reason_contains: str
-    ) -> None:
-        """The directory is removed for the stated reason and never adopted."""
+    def expect_rejected(self, planted: PlantedBuild) -> None:
+        """The directory is removed with any row, and never adopted.
 
-        verdicts = report.for_build(planted.name, planted.digest)
-        outcomes = [v.outcome for v in verdicts]
-        reasons = [v.reason for v in verdicts if v.outcome == "rejected"]
-        self._fixture.verify(
-            outcomes == ["rejected"] and any(reason_contains in r for r in reasons),
-            "an invalid digest directory was not rejected for the expected reason",
-            template=planted.name,
-            outcomes=outcomes,
-            reasons=reasons,
-            expected_reason_fragment=reason_contains,
+        Which check rejected it is the daemon's free-text reason, not part of
+        the outcome: each rejected plant is built like a control the scenario
+        expects to be kept (tamper like orphan, drift like happy) and differs
+        from it only in its bootable artifact's bytes or size.
+        """
+
+        self._expect_outcome(
+            planted, "rejected", "an invalid digest directory was not removed with its row"
         )
-        self._expect_state(planted, present=False)
 
 
 # The two healthy outcomes of a remote pull. `remote_local_mismatch` and

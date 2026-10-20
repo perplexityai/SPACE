@@ -427,20 +427,32 @@ class EcwAdditionalScenarioTests(unittest.TestCase):
             "EcwSandboxUnavailable",
         )
 
-    def test_network_snapshot_does_not_swallow_framework_control_flow(self) -> None:
-        for error in (
-            ScenarioTimedOut("scenario execution timed out"),
-            SmokeConfigurationError("unsafe diagnostic configuration"),
-        ):
-            with self.subTest(error_type=type(error).__name__):
-                sandbox = _Sandbox()
-                sandbox.curl_result = EcwCommandResult(7, "000", "connection failed")
-                sandbox.network_snapshot_error = error
+    def test_network_snapshot_does_not_swallow_a_scenario_timeout(self) -> None:
+        sandbox = _Sandbox()
+        sandbox.curl_result = EcwCommandResult(7, "000", "connection failed")
+        sandbox.network_snapshot_error = ScenarioTimedOut("scenario execution timed out")
 
-                with self.assertRaises(type(error)):
-                    immediate_egress.verify(_fixture(sandbox))
+        with self.assertRaises(ScenarioTimedOut):
+            immediate_egress.verify(_fixture(sandbox))
 
-                self.assertEqual(len(sandbox.trace), 2)
+        self.assertEqual(len(sandbox.trace), 2)
+
+    def test_unreadable_network_snapshot_keeps_the_egress_failure(self) -> None:
+        sandbox = _Sandbox()
+        sandbox.curl_result = EcwCommandResult(7, "000", "connection failed")
+        sandbox.network_snapshot_error = SmokeConfigurationError(
+            "unsafe diagnostic configuration"
+        )
+        fixture = _fixture(sandbox)
+
+        with self.assertRaises(InvariantViolation):
+            immediate_egress.verify(fixture)
+
+        self.assertEqual(
+            fixture._context.evidence["failure_evidence_error"],
+            "SmokeConfigurationError: unsafe diagnostic configuration",
+        )
+        self.assertEqual(len(sandbox.trace), 2)
 
     def test_binary_file_round_trip_preserves_every_byte(self) -> None:
         sandbox = _Sandbox()

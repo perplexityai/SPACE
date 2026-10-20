@@ -1,67 +1,200 @@
 """Contracts of the startup-recovery scenario the bench cannot exercise.
 
 The live run proves the decision table. These pin what a passing run would not
-catch: the verdict scan joining each line to exactly one `(template, digest)`
-across the two tracing layouts; the shell-word guards on the names and digests
-that reach an on-node `bash -c`; and a bench with a single sandbox worker being
-a configuration error rather than a restart of the worker running the fixture
-sandbox.
+catch: each branch, and every state no branch leaves, mapping to its own
+outcome from what a plant held at restart; outcomes read only once the stale
+row is pruned, and never when that row was gone before the restart; the
+shell-word guards on the names and digests that reach an on-node `bash -c`;
+and a bench with a single sandbox worker being a configuration error rather
+than a restart of the worker running the fixture sandbox.
 """
 
 from __future__ import annotations
 
 import json
 import unittest
+from types import SimpleNamespace
+from typing import Any, cast
 
 from space_smoke.adapters import (
-    TEMPLATE_RECOVERY_CONFIRMED_MESSAGE,
-    TEMPLATE_RECOVERY_FINISHED_MESSAGE,
-    TEMPLATE_RECOVERY_PRUNED_MESSAGE,
-    TEMPLATE_RECOVERY_REGISTERED_MESSAGE,
-    TEMPLATE_RECOVERY_REJECTED_MESSAGE,
     KindConfig,
     KindHarness,
-    _parse_startup_recovery,
     _ready_pod_names,
     _smoke_template_name,
     _template_digest,
 )
-from space_smoke.runtime import CommandResult, SmokeConfigurationError
+from space_smoke.fixtures import (
+    RecoveredBuild,
+    StartupRecoveryAssertions,
+    recovery_outcome,
+)
+from space_smoke.runtime import (
+    CommandResult,
+    InvariantViolation,
+    ResourceScope,
+    SmokeConfigurationError,
+)
 
 H1 = "sha256:" + "1" * 64
 H2 = "sha256:" + "2" * 64
 
+ROW_AND_DIR = (True, True)
+DIR_ONLY = (False, True)
+ROW_ONLY = (True, False)
 
-class RecoveryVerdictScan(unittest.TestCase):
-    def test_joins_each_line_to_one_build_across_layouts(self) -> None:
-        log = "\n".join(
-            [
-                json.dumps({"message": "template-manager startup recovery started"}),
-                json.dumps({"message": TEMPLATE_RECOVERY_CONFIRMED_MESSAGE, "template": "smoke-rec-abcdef01-happy", "content_hash": H1}),
-                # Nested tracing layout.
-                json.dumps({"fields": {"message": TEMPLATE_RECOVERY_REGISTERED_MESSAGE, "template": "smoke-rec-abcdef01-orphan", "content_hash": H2}}),
-                json.dumps({"message": TEMPLATE_RECOVERY_REJECTED_MESSAGE, "template": "smoke-rec-abcdef01-tamper", "content_hash": H1, "reason": 'bootable artifact sha256 "sha256:ff" does not match digest dir name "' + H1 + '"'}),
-                json.dumps({"level": "WARN", "fields": {"message": TEMPLATE_RECOVERY_PRUNED_MESSAGE, "template": "smoke-rec-abcdef01-stale", "content_hash": H2}}),
-                # Same message for another template must not attach to ours.
-                json.dumps({"message": TEMPLATE_RECOVERY_CONFIRMED_MESSAGE, "template": "seed", "content_hash": H1}),
-                "not json startup recovery noise",
-                json.dumps({"message": TEMPLATE_RECOVERY_FINISHED_MESSAGE}),
-            ]
-        )
-        report = _parse_startup_recovery("worker-2", "pod-x", log)
-        self.assertTrue(report.finished)
-        self.assertEqual(
-            [(v.template.rsplit("-", 1)[-1], v.outcome) for v in report.verdicts if v.template.startswith("smoke-")],
-            [("happy", "confirmed"), ("orphan", "registered"), ("tamper", "rejected"), ("stale", "pruned")],
-        )
-        (tamper,) = report.for_build("smoke-rec-abcdef01-tamper", H1)
-        self.assertIn("does not match digest dir name", tamper.reason)
-        self.assertEqual(report.for_build("smoke-rec-abcdef01-happy", H2), ())
 
-    def test_unfinished_log_reports_not_finished(self) -> None:
-        report = _parse_startup_recovery("n", "p", json.dumps({"message": "template-manager startup recovery started"}))
-        self.assertFalse(report.finished)
-        self.assertEqual(report.verdicts, ())
+class RecoveryOutcomeFromState(unittest.TestCase):
+    def test_each_branch_and_each_impossible_state_has_its_own_outcome(self) -> None:
+        cases = [
+            (ROW_AND_DIR, (H1,), "ready", "confirmed"),
+            (ROW_AND_DIR, (), None, "rejected"),
+            (ROW_AND_DIR, (H1,), "deleting", "inconsistent"),
+            (ROW_AND_DIR, (), "ready", "inconsistent"),
+            (ROW_AND_DIR, (H1,), None, "inconsistent"),
+            (DIR_ONLY, (H1,), "ready", "registered"),
+            (DIR_ONLY, (), None, "rejected"),
+            (DIR_ONLY, (H1,), None, "untouched"),
+            (ROW_ONLY, (), None, "pruned"),
+            (ROW_ONLY, (), "ready", "untouched"),
+            (ROW_ONLY, (H1,), "ready", "inconsistent"),
+            # A directory under any other digest is never this plant's outcome.
+            (DIR_ONLY, (H2,), "ready", "inconsistent"),
+            (ROW_AND_DIR, (H1, H2), "ready", "inconsistent"),
+        ]
+        for held, dirs, state, expected in cases:
+            with self.subTest(held=held, dirs=dirs, state=state):
+                self.assertEqual(recovery_outcome(held, H1, RecoveredBuild(dirs, state)), expected)
+
+
+class _Fixture:
+    def __init__(self) -> None:
+        self.sandbox = SimpleNamespace(sandbox_id="01a0ac88-c99e-735a-b8fa-f13c948332fa")
+        self.records: dict[str, object] = {}
+
+    def verify(self, condition: bool, message: str, **_evidence: object) -> None:
+        if not condition:
+            raise InvariantViolation(message)
+
+    def record(self, key: str, value: object) -> None:
+        self.records[key] = value
+
+    def wait(self, _seconds: float) -> None:
+        pass
+
+
+class _Worker:
+    """One worker's plants on disk and in the catalog, and a recovery sweep.
+
+    The restarted daemon's sweep lands its whole verdict at once, after
+    `sweep_after_reads` reads following the restart: before that every plant
+    still holds what it held at the restart.
+    """
+
+    def __init__(self, *, sweep_after_reads: int) -> None:
+        self.dirs: dict[str, tuple[str, ...]] = {}
+        self.rows: dict[str, str] = {}
+        self.stale: set[str] = set()
+        self.tampered: set[str] = set()
+        self.restarted = False
+        self.swept = False
+        self.sweep_after_reads = sweep_after_reads
+        self.reads_after_restart = 0
+
+    def sandbox_pod_placement(self, _sandbox_id: str):
+        return SimpleNamespace(node_name="worker-a")
+
+    def other_sandbox_worker_node(self, _excluding: str) -> str:
+        return "worker-b"
+
+    def register_unpinned_template(self, _node: str, name: str, _size: int) -> None:
+        self.dirs[name] = (H1,)
+        self.rows[name] = "ready"
+
+    def template_digest_dirs(self, _node: str, name: str) -> tuple[str, ...]:
+        return self.dirs.get(name, ())
+
+    def template_build_state(self, _node: str, name: str, _digest: str) -> str | None:
+        if self.restarted and not self.swept:
+            self.reads_after_restart += 1
+            if self.reads_after_restart > self.sweep_after_reads:
+                self._sweep()
+        return self.rows.get(name)
+
+    def _sweep(self) -> None:
+        self.swept = True
+        for name in self.tampered:
+            self.dirs[name] = ()
+            self.rows.pop(name, None)
+        for name in self.stale:
+            self.rows.pop(name, None)
+
+    def remove_template_digest_dir(self, _node: str, name: str, _digest: str) -> None:
+        self.dirs[name] = ()
+        self.stale.add(name)
+
+    def orphan_template_digest_dir(self, _node: str, name: str, _digest: str) -> None:
+        self.rows.pop(name, None)
+
+    def corrupt_template_rootfs(self, _node: str, name: str, _digest: str) -> None:
+        self.tampered.add(name)
+
+    def restart_node_service(self, _node: str, _component: str, *, timeout: float) -> str:
+        self.restarted = True
+        return "template-manager-new"
+
+    def startup_recovery_log(self, _node: str) -> list[str]:
+        return []
+
+
+def _recovery(worker: _Worker) -> StartupRecoveryAssertions:
+    assertions = StartupRecoveryAssertions(cast(Any, _Fixture()), cast(Any, worker), ResourceScope())
+    assertions.spare_worker()
+    return assertions
+
+
+class RecoveryWait(unittest.TestCase):
+    def test_outcomes_reflect_the_finished_sweep(self) -> None:
+        # The sweep lands only after a few polls; a plant read before it would
+        # still look untouched, so the tamper plant would not read as rejected.
+        worker = _Worker(sweep_after_reads=3)
+        recovery = _recovery(worker)
+        happy = recovery.plant("happy")
+        stale = recovery.plant("stale")
+        recovery.make_row_stale(stale)
+        tamper = recovery.plant("tamper")
+        recovery.tamper(tamper)
+        recovery.restart_and_wait_for_recovery()
+        recovery.expect_confirmed(happy)
+        recovery.expect_pruned(stale)
+        recovery.expect_rejected(tamper)
+        with self.assertRaises(InvariantViolation):
+            recovery.expect_rejected(happy)
+
+    def test_a_row_never_pruned_fails_closed(self) -> None:
+        worker = _Worker(sweep_after_reads=10**6)
+        recovery = _recovery(worker)
+        recovery.make_row_stale(recovery.plant("stale"))
+        with self.assertRaises(InvariantViolation):
+            recovery.restart_and_wait_for_recovery(recovery_timeout=0)
+
+    def test_a_stale_row_gone_before_the_restart_fails_closed(self) -> None:
+        # An eviction that dropped the row first would otherwise read as the prune.
+        worker = _Worker(sweep_after_reads=0)
+        recovery = _recovery(worker)
+        stale = recovery.plant("stale")
+        recovery.make_row_stale(stale)
+        worker.rows.pop(stale.name)
+        with self.assertRaises(InvariantViolation):
+            recovery.restart_and_wait_for_recovery()
+        self.assertFalse(worker.restarted)
+
+    def test_restarting_without_a_stale_plant_is_a_configuration_error(self) -> None:
+        worker = _Worker(sweep_after_reads=0)
+        recovery = _recovery(worker)
+        recovery.plant("happy")
+        with self.assertRaises(SmokeConfigurationError):
+            recovery.restart_and_wait_for_recovery()
+        self.assertFalse(worker.restarted)
 
 
 class ShellWordGuards(unittest.TestCase):

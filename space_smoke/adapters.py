@@ -96,9 +96,7 @@ from space_smoke.capabilities import (
     RestoreFailure,
     TransferJobView,
     SnapshotRowFacts,
-    StartupRecoveryReport,
     TemplateCacheGcConfig,
-    TemplateRecoveryVerdict,
     WarmPoolCandidate,
     WarmPoolSelection,
 )
@@ -493,19 +491,6 @@ EXECUTION_GENERATION_ANNOTATION = "space.pplx.net/execution-generation"
 TEMPLATE_CACHE_ROOT = "/space/cache/firecracker/templates"
 TEMPLATE_CACHE_OWNER = "space-tmplmgr"
 TEMPLATE_CACHE_GROUP = "space-cache-rw"
-# template-manager's startup recovery pass (`service/startup_recovery.rs`).
-# Every verdict is a tracing event. Older images reported the prune as a raw
-# `[template-mgr] pruning stale build: ` stderr line, which is still accepted.
-TEMPLATE_RECOVERY_FINISHED_MESSAGE = "template-manager startup recovery finished"
-TEMPLATE_RECOVERY_CONFIRMED_MESSAGE = (
-    "digest dir confirmed against existing catalog row during startup recovery"
-)
-TEMPLATE_RECOVERY_REGISTERED_MESSAGE = (
-    "digest dir validated via hashing and inserted into catalog during startup recovery"
-)
-TEMPLATE_RECOVERY_REJECTED_MESSAGE = "dropping invalid digest dir during startup recovery"
-TEMPLATE_RECOVERY_PRUNED_MESSAGE = "pruning catalog build row whose artifacts are missing on disk"
-TEMPLATE_RECOVERY_LEGACY_PRUNED_PREFIX = "[template-mgr] pruning stale build: "
 KIND_SANDBOX_NODE_SELECTOR = "space.pplx.net/node-pool=sandbox"
 # The query API of each local observability backend, on the localhost port
 # both bring-up paths forward to it in `otel` mode.
@@ -4740,12 +4725,10 @@ ON CONFLICT (key_hash) DO NOTHING;
                 )
             time.sleep(5)
 
-    def startup_recovery_report(self, node_name: str) -> StartupRecoveryReport:
+    def startup_recovery_log(self, node_name: str) -> list[str]:
         pod = self._node_service_pod(node_name, NODE_TEMPLATE_MANAGER)
-        # The pod's whole log, oldest attempt first: a failed startup restarts
-        # the container, and its first recovery pass is then only in the
-        # previous attempt's log. A new pod cannot inherit an old pod's
-        # recovery verdicts.
+        # Oldest attempt first: a failed startup restarts the container, and
+        # its interrupted pass is then only in the previous attempt's log.
         previous = self.kubectl(
             "logs", pod, "-c", NODE_TEMPLATE_MANAGER, "--previous", timeout=60
         )
@@ -4753,7 +4736,11 @@ ON CONFLICT (key_hash) DO NOTHING;
         log = _require_ok(current, f"read template-manager log on {node_name}")
         if previous.returncode == 0:
             log = previous.stdout + log
-        return _parse_startup_recovery(node_name, pod, log)
+        return [
+            _redact_storage_uris(line)[:400]
+            for line in log.splitlines()
+            if "startup recovery" in line or "smoke-rec-" in line
+        ][-80:]
 
     def telemetry_query(self, backend: str, path: str, params: Mapping[str, str]) -> Any:
         base = KIND_TELEMETRY_BACKENDS[backend]
@@ -5402,75 +5389,6 @@ def _race_request(
 
 def _template_stash_dir(name: str) -> str:
     return f"{TEMPLATE_CACHE_ROOT}/.smoke-stash-{name}"
-
-
-def _parse_startup_recovery(node: str, pod: str, log: str) -> StartupRecoveryReport:
-    """Read the first recovery pass from one template-manager pod's log.
-
-    Verdicts are tracing events keyed on `template` and `content_hash`. An
-    older image's prune is a raw stderr line, matched as text with the same
-    `name/hash` join.
-
-    The container runtime captures stdout and stderr separately, so that raw
-    line can land after "finished" even though the prune ran before it.
-    Prunes are therefore still read after "finished", up to the next
-    "started"; every other verdict ends at "finished".
-
-    A container retry can run recovery again before the pod becomes Ready.
-    That second pass only sees survivors; do not replace the original verdicts
-    with confirmations, combine passes, or hide an interrupted first pass.
-    """
-
-    outcomes = {
-        TEMPLATE_RECOVERY_CONFIRMED_MESSAGE: "confirmed",
-        TEMPLATE_RECOVERY_REGISTERED_MESSAGE: "registered",
-        TEMPLATE_RECOVERY_REJECTED_MESSAGE: "rejected",
-        TEMPLATE_RECOVERY_PRUNED_MESSAGE: "pruned",
-    }
-    finished = False
-    started = False
-    verdicts: list[TemplateRecoveryVerdict] = []
-    for line in log.splitlines():
-        if TEMPLATE_RECOVERY_LEGACY_PRUNED_PREFIX in line:
-            _, _, tail = line.partition(TEMPLATE_RECOVERY_LEGACY_PRUNED_PREFIX)
-            name, sep, digest = tail.strip().partition("/")
-            if sep and digest.startswith("sha256:"):
-                verdicts.append(TemplateRecoveryVerdict(name, digest.split()[0], "pruned"))
-            continue
-        if "startup recovery" not in line and TEMPLATE_RECOVERY_PRUNED_MESSAGE not in line:
-            continue
-        fields = _tracing_fields(line)
-        if fields is None:
-            continue
-        message = fields.get("message")
-        if message == "template-manager startup recovery started":
-            if finished:
-                break
-            if started:
-                raise RuntimeError(
-                    f"template-manager restarted before its first startup recovery "
-                    f"finished on {node or pod}; inspect the retained service logs"
-                )
-            started = True
-            continue
-        if message == TEMPLATE_RECOVERY_FINISHED_MESSAGE:
-            finished = True
-            continue
-        outcome = outcomes.get(str(message))
-        if finished and outcome != "pruned":
-            continue
-        if outcome is None:
-            continue
-        template = str(fields.get("template", ""))
-        content_hash = str(fields.get("content_hash", ""))
-        if not template or not content_hash.startswith("sha256:"):
-            continue
-        verdicts.append(
-            TemplateRecoveryVerdict(
-                template, content_hash, outcome, str(fields.get("reason", "") or "")
-            )
-        )
-    return StartupRecoveryReport(node, pod, finished, tuple(verdicts))
 
 
 def _template_cache_gc_config_from_env(
