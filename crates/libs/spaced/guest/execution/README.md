@@ -27,6 +27,10 @@ execution metadata.
   with `cargo build -p pplx-space-spaced-guest-worker` and select the resulting
   `spaced-filesystem-worker` binary. It runs worker mode only and requires an
   execution service's inherited channel and identity configuration.
+  The standalone build has telemetry disabled by default. Add `--features otel`
+  (or `--features datadog`) when building the worker to enable its exporters.
+  Host features and forwarded environment variables cannot enable exporters in
+  a separately built worker that lacks them.
 - Execution and daemon constructors now return typed errors. Missing worker
   configuration fails construction; incompatible worker protocols fail startup
   without dispatching filesystem operations. IdentityWorkers on non-Linux returns
