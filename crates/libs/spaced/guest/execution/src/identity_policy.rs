@@ -5,14 +5,14 @@
 pub enum IdentityPolicy {
     /// Preserve the guest daemon's account-switching and executable privilege semantics.
     Guest,
-    /// Linux embedding: install account IDs/groups, clear active capability sets,
-    /// and prevent privilege gain across exec. Requires a privileged launcher and
-    /// identity workers; Direct filesystem execution cannot enforce this policy.
+    /// Linux embedding: install a non-root account's IDs/groups, clear active
+    /// capability sets, and prevent privilege gain across exec. Requires a
+    /// privileged launcher and identity workers; Direct cannot enforce this policy.
     Restricted,
 }
 
 impl IdentityPolicy {
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Guest => "guest",
             Self::Restricted => "restricted",
@@ -55,14 +55,14 @@ impl std::fmt::Display for IdentityPolicy {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Debug, thiserror::Error)]
 #[error("identity policy must be guest or restricted")]
-pub struct ParseIdentityPolicyError;
+pub(crate) struct ParseIdentityPolicyError;
 
-impl std::str::FromStr for IdentityPolicy {
-    type Err = ParseIdentityPolicyError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
+#[cfg(target_os = "linux")]
+impl IdentityPolicy {
+    pub(crate) fn parse(value: &str) -> Result<Self, ParseIdentityPolicyError> {
         match value {
             "guest" => Ok(Self::Guest),
             "restricted" => Ok(Self::Restricted),

@@ -90,6 +90,7 @@ fn children() -> Vec<u32> {
 
 pub(super) async fn run() {
     let host_identity = super::identity::current_status();
+    assert!(host_identity.len() > 1, "exercise a multithreaded host");
     let standalone = std::process::Command::new(env!("CARGO_BIN_EXE_spaced-filesystem-worker"))
         .env_clear()
         .output()
@@ -118,6 +119,7 @@ pub(super) async fn run() {
     std::fs::copy("/bin/true", &replacement).expect("replacement artifact");
     std::fs::rename(&replacement, &artifact).expect("atomic replacement");
     let (service, mut client, shutdown, server) = host(executable).await;
+    super::identity::check_cwd(&service, &account).await;
     let write = WriteBatchRequest {
         entries: vec![WriteBatchEntry {
             path: path.display().to_string(),
@@ -138,14 +140,19 @@ pub(super) async fn run() {
     assert_eq!(metadata.uid(), account.uid.as_raw());
     assert_eq!(metadata.gid(), account.gid.as_raw());
     assert_eq!(children().len(), 1, "one resident worker");
-    client
+    let error = client
         .stat_info(StatRequest {
             path: "/".into(),
             user: Some("root".into()),
         })
         .await
-        .expect("second identity");
-    assert_eq!(children().len(), 2, "separate worker per identity");
+        .expect_err("restricted root worker must be rejected");
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        children().len(),
+        1,
+        "rejected identity must not spawn a worker"
+    );
     for pid in children() {
         let status =
             std::fs::read_to_string(format!("/proc/{pid}/status")).expect("worker credentials");
@@ -159,7 +166,7 @@ pub(super) async fn run() {
         let selected = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
             .expect("worker account")
             .expect("installed account");
-        assert!(selected.uid == account.uid || selected.uid.is_root());
+        assert_eq!(selected.uid, account.uid);
         super::identity::assert_restricted(&status, &selected);
         assert_eq!(
             std::fs::read_to_string(format!("/proc/{pid}/comm"))
@@ -217,15 +224,6 @@ pub(super) async fn run() {
     }
     assert!(exited);
     assert_eq!(output, format!("{}\nonce", account.uid).as_bytes());
-    // Even root has no DAC override in restricted mode.
-    let error = client
-        .stat_info(StatRequest {
-            path: path.display().to_string(),
-            user: Some("root".into()),
-        })
-        .await
-        .expect_err("root worker must respect another account's directory permissions");
-    assert_eq!(error.code(), tonic::Code::PermissionDenied);
     super::identity::check_processes(&service, &account).await;
     drop(client);
     stop(service, shutdown, server).await;
@@ -244,12 +242,18 @@ pub(super) async fn run() {
     drop(client);
     stop(service, shutdown, server).await;
 
+    let incompatible = artifacts.path().join("incompatible-worker");
+    std::fs::copy(
+        std::env::current_exe().expect("test executable"),
+        &incompatible,
+    )
+    .expect("incompatible artifact");
     let (service, mut client, shutdown, server) =
-        host(WorkerExecutable::open("/proc/self/exe").expect("incompatible artifact")).await;
+        host(WorkerExecutable::open(&incompatible).expect("incompatible artifact")).await;
     let error = client
         .stat_info(StatRequest {
             path: "/".into(),
-            user: Some("root".into()),
+            user: None,
         })
         .await
         .expect_err("mismatched protocol must fail before dispatch");
@@ -281,9 +285,5 @@ pub(super) async fn run() {
     request.abort();
     assert!(request.await.expect_err("caller cancelled").is_cancelled());
     stop(service, shutdown, server).await;
-    assert_eq!(
-        super::identity::current_status(),
-        host_identity,
-        "host authority must remain unchanged"
-    );
+    super::identity::assert_host_unchanged(&host_identity);
 }

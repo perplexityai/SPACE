@@ -619,8 +619,11 @@ impl WorkerPool {
                 ))
             })?;
         let lookup_user = user.clone();
+        let policy = self.identity_policy;
         let process_slot = tokio::task::spawn_blocking(move || {
-            GuestAccount::resolve(lookup_user).map_err(|error| error.into_status())?;
+            GuestAccount::resolve(lookup_user)
+                .map_err(|error| error.into_status())?
+                .validate_policy(policy)?;
             Ok::<_, Status>(process_slot)
         })
         .await
@@ -880,7 +883,11 @@ pub(crate) enum FilesystemWorkerError {
     #[error("filesystem worker identity policy is missing: {0}")]
     MissingIdentityPolicy(#[source] std::env::VarError),
     #[error("invalid filesystem worker identity policy: {0}")]
-    InvalidIdentityPolicy(#[source] crate::ParseIdentityPolicyError),
+    InvalidIdentityPolicy(#[source] crate::identity_policy::ParseIdentityPolicyError),
+    #[error("cannot inspect filesystem worker threads: {0}")]
+    InspectThreads(#[source] std::io::Error),
+    #[error("restricted filesystem worker must start single-threaded")]
+    MultipleThreads,
     #[error("failed to set filesystem worker process name: {0}")]
     SetProcessName(#[source] nix::errno::Errno),
     #[error("filesystem worker user is missing: {0}")]
@@ -923,8 +930,8 @@ pub(crate) fn run_from_environment() -> Result<bool, FilesystemWorkerError> {
         .parse::<RawFd>()
         .map_err(FilesystemWorkerError::InvalidFd)?;
     let policy = std::env::var(WORKER_IDENTITY_POLICY_ENV)
-        .map_err(FilesystemWorkerError::MissingIdentityPolicy)?
-        .parse()
+        .map_err(FilesystemWorkerError::MissingIdentityPolicy)?;
+    let policy = crate::IdentityPolicy::parse(&policy)
         .map_err(FilesystemWorkerError::InvalidIdentityPolicy)?;
     run_worker(user, raw_fd, policy)?;
     Ok(true)
@@ -935,6 +942,23 @@ fn run_worker(
     raw_fd: RawFd,
     policy: crate::IdentityPolicy,
 ) -> Result<(), FilesystemWorkerError> {
+    if policy == crate::IdentityPolicy::Restricted {
+        // capset and no_new_privs affect only the calling thread. Dispatch must
+        // precede application initialization; reject an already threaded host.
+        let tasks =
+            std::fs::read_dir("/proc/self/task").map_err(FilesystemWorkerError::InspectThreads)?;
+        let mut count = 0;
+        for task in tasks {
+            task.map_err(FilesystemWorkerError::InspectThreads)?;
+            count += 1;
+            if count > 1 {
+                return Err(FilesystemWorkerError::MultipleThreads);
+            }
+        }
+        if count != 1 {
+            return Err(FilesystemWorkerError::MultipleThreads);
+        }
+    }
     // SAFETY: `raw_fd` is inherited exclusively from the root router's
     // socketpair and ownership is transferred into this UnixStream exactly
     // once at worker startup.

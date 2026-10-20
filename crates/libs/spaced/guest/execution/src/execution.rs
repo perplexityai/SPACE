@@ -5,11 +5,12 @@ use super::*;
 ///
 /// # Defaults
 ///
-/// Linux defaults to identity workers without selecting an executable. Callers
-/// must set [`Self::worker_executable`] before constructing the service; the
-/// default alone returns [`CreateExecutionServiceError::MissingWorkerExecutable`].
-/// Linux defaults to restricted child identities. Other platforms default to
-/// Direct filesystem execution with the guest identity policy.
+/// Linux defaults to restricted identity workers. Callers must supply
+/// [`Self::worker_executable`] and a root launcher with effective CAP_SETUID and
+/// CAP_SETGID; otherwise construction returns
+/// [`CreateExecutionServiceError::MissingWorkerExecutable`] or
+/// [`CreateExecutionServiceError::RestrictedRequiresPrivilege`], respectively.
+/// Other platforms default to Direct filesystem execution with the guest policy.
 #[derive(Clone, Debug)]
 pub struct ExecutionServiceConfig {
     pub default_operation_user: GuestUserName,
@@ -88,7 +89,10 @@ impl ExecutionService {
     /// on another platform returns an unsupported-mode error. No worker is
     /// launched during construction; protocol and account checks occur at worker startup.
     /// Restricted identities require identity workers and a root launcher with
-    /// effective CAP_SETUID and CAP_SETGID.
+    /// effective CAP_SETUID and CAP_SETGID. This checks the calling thread's
+    /// current authority, not what the worker retains across exec: securebits,
+    /// capability bounding sets and executable attributes can still cause worker
+    /// startup to fail closed. Restricted requests must resolve to a nonzero UID.
     pub fn with_config(
         shutdown: CancellationToken,
         config: ExecutionServiceConfig,

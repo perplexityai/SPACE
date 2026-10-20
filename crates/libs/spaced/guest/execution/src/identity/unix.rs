@@ -69,9 +69,11 @@ impl GuestAccount {
 
     pub(crate) fn configure_child_credentials(
         &self,
-        _command: &mut Command,
+        command: &mut Command,
         _policy: crate::IdentityPolicy,
+        cwd: &Path,
     ) -> Result<(), Status> {
+        command.current_dir(cwd);
         use nix::unistd::{Gid, Uid};
 
         if Uid::effective().as_raw() == self.uid && Gid::effective().as_raw() == self.gid {

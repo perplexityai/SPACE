@@ -7,7 +7,7 @@ use pplx_space_spaced_guest_execution::{
     CreateExecutionServiceError, ExecutionService, ExecutionServiceConfig, WorkerExecutable,
 };
 use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
-    StartRequest, process_event::Event, process_exit::Outcome, process_server::Process,
+    PtyConfig, StartRequest, process_event::Event, process_exit::Outcome, process_server::Process,
 };
 use rustix::thread::{CapabilitySet, CapabilitySets};
 use tokio_util::sync::CancellationToken;
@@ -27,8 +27,34 @@ pub(super) fn status(text: &str) -> Status {
         .collect()
 }
 
-pub(super) fn current_status() -> Status {
-    status(&std::fs::read_to_string("/proc/self/status").expect("host status"))
+pub(super) fn current_status() -> BTreeMap<u32, Status> {
+    std::fs::read_dir("/proc/self/task")
+        .expect("host threads")
+        .filter_map(|entry| {
+            let entry = entry.expect("thread");
+            let tid = entry
+                .file_name()
+                .to_string_lossy()
+                .parse()
+                .expect("thread id");
+            match std::fs::read_to_string(entry.path().join("status")) {
+                Ok(text) => Some((tid, status(&text))),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!("thread status: {error}"),
+            }
+        })
+        .collect()
+}
+
+pub(super) fn assert_host_unchanged(before: &BTreeMap<u32, Status>) {
+    let inherited = &before[&std::process::id()];
+    for (tid, after) in current_status() {
+        assert_eq!(
+            &after,
+            before.get(&tid).unwrap_or(inherited),
+            "host thread {tid} authority must remain unchanged",
+        );
+    }
 }
 
 // Called before the runtime exists. Seed real inheritable and ambient authority
@@ -49,6 +75,37 @@ pub(super) fn probe() -> bool {
                 "{}",
                 std::fs::read_to_string("/proc/self/status").expect("child status")
             );
+            true
+        }
+        Some("--threaded-worker-probe") => {
+            use std::os::fd::IntoRawFd;
+            let (_parent, child) = std::os::unix::net::UnixStream::pair().expect("worker socket");
+            let fd = child.into_raw_fd();
+            // SAFETY: this probe dispatches before creating any threads.
+            unsafe {
+                std::env::set_var("SPACE_SPACED_FILESYSTEM_WORKER_FD", fd.to_string());
+            }
+            let (stop, wait) = std::sync::mpsc::channel::<()>();
+            let thread = std::thread::spawn(move || {
+                if wait
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .is_err()
+                {
+                    std::process::exit(90);
+                }
+            });
+            let before = current_status();
+            let error = pplx_space_spaced_guest_execution::run_filesystem_worker_from_environment()
+                .expect_err("threaded worker must fail before changing credentials");
+            assert!(
+                error.to_string().contains("must start single-threaded"),
+                "{error}"
+            );
+            assert_host_unchanged(&before);
+            stop.send(()).expect("stop companion thread");
+            thread.join().expect("companion thread");
+            // The rejected entrypoint has not taken ownership of the channel.
+            nix::unistd::close(fd).expect("close worker channel");
             true
         }
         Some("--construction-probe") => {
@@ -120,15 +177,21 @@ pub(super) fn assert_restricted(status: &Status, account: &nix::unistd::User) {
     );
 }
 
-async fn run_probe(service: &ExecutionService, executable: &std::path::Path, user: &str) -> Status {
+async fn run_probe(
+    service: &ExecutionService,
+    executable: &std::path::Path,
+    user: &str,
+    pty: bool,
+) -> Status {
     let mut events = Process::start(
         service,
         tonic::Request::new(StartRequest {
             command: vec![executable.display().to_string(), "--identity-probe".into()],
             cwd: Some("/".into()),
+            pty: pty.then_some(PtyConfig { size: None }),
             user: Some(user.into()),
             idempotency_key: Some(format!(
-                "identity-{}-{user}",
+                "identity-{}-{user}-{pty}",
                 executable.file_name().expect("name").to_string_lossy()
             )),
             ..Default::default()
@@ -202,9 +265,26 @@ pub(super) async fn check_processes(service: &ExecutionService, account: &nix::u
                 );
             }
         }
-        for user in [account, &root] {
-            assert_restricted(&run_probe(service, &path, &user.name).await, user);
+        for pty in [false, true] {
+            assert_restricted(
+                &run_probe(service, &path, &account.name, pty).await,
+                account,
+            );
         }
+        let error = Process::start(
+            service,
+            tonic::Request::new(StartRequest {
+                command: vec![path.display().to_string(), "--identity-probe".into()],
+                user: Some(root.name.clone()),
+                cwd: Some("/".into()),
+                idempotency_key: Some(format!("reject-root-{name}")),
+                ..Default::default()
+            }),
+        )
+        .await
+        .err()
+        .expect("restricted root process must be rejected");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
         if name == "plain" {
             for user in [account, &root] {
                 let result = std::process::Command::new(&path)
@@ -220,4 +300,28 @@ pub(super) async fn check_processes(service: &ExecutionService, account: &nix::u
             }
         }
     }
+}
+
+// Entering a searchable leaf must not bypass its private ancestor.
+pub(super) async fn check_cwd(service: &ExecutionService, account: &nix::unistd::User) {
+    let private = tempfile::tempdir().expect("private ancestor");
+    std::fs::set_permissions(private.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("private ancestor mode");
+    let leaf = private.path().join("public");
+    std::fs::create_dir(&leaf).expect("public leaf");
+    std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o755)).expect("leaf mode");
+    let error = Process::start(
+        service,
+        tonic::Request::new(StartRequest {
+            command: vec!["/bin/pwd".into()],
+            cwd: Some(leaf.display().to_string()),
+            user: Some(account.name.clone()),
+            idempotency_key: Some("private-ancestor".into()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .err()
+    .expect("restricted cwd must respect ancestor permissions");
+    assert_eq!(error.code(), tonic::Code::PermissionDenied);
 }

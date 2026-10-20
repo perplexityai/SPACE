@@ -44,9 +44,11 @@ impl GuestAccount {
 
     pub(crate) fn configure_child_credentials(
         &self,
-        _command: &mut Command,
+        command: &mut Command,
         _policy: crate::IdentityPolicy,
+        cwd: &Path,
     ) -> Result<(), Status> {
+        command.current_dir(cwd);
         Err(Status::failed_precondition(format!(
             "user switching is not supported on this platform: {}",
             self.name

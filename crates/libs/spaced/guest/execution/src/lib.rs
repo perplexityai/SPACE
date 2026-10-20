@@ -43,7 +43,7 @@ mod process;
 mod worker_executable;
 pub use execution::{CreateExecutionServiceError, ExecutionService, ExecutionServiceConfig};
 use idempotency::IdempotencyStore;
-pub use identity_policy::{IdentityPolicy, ParseIdentityPolicyError};
+pub use identity_policy::IdentityPolicy;
 pub use placement::ExecutionCgroups;
 use process::ProcessRegistry;
 pub use worker_executable::{OpenWorkerExecutableError, WorkerExecutable};
