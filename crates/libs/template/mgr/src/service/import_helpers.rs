@@ -276,17 +276,14 @@ async fn materialize_uncompressed_imported_rootfs(
             .map_err(|error| Status::internal(format!("prepare rootfs task: {error}")))?
             .map_err(|error| Status::internal(format!("prepare rootfs backing: {error}")))?;
     }
+    let actual_rootfs_hash =
+        compute_template_file_hash(rootfs_path.to_path_buf(), "compute streamed rootfs hash")
+            .await?;
     let expected_rootfs_hash = header
         .rootfs_hash
         .as_deref()
         .filter(|hash| !hash.is_empty())
         .unwrap_or(content_hash);
-    let actual_rootfs_hash = compute_template_file_hash(
-        rootfs_path.to_path_buf(),
-        content_hash_algorithm(expected_rootfs_hash)?,
-        "compute streamed rootfs hash",
-    )
-    .await?;
     if actual_rootfs_hash != expected_rootfs_hash {
         return Err(Status::data_loss(format!(
             "rootfs hash mismatch: expected {expected_rootfs_hash}, got {actual_rootfs_hash}"
@@ -294,12 +291,9 @@ async fn materialize_uncompressed_imported_rootfs(
     }
 
     expand_template_rootfs(template_id, content_hash, staging_dir, "local_import").await?;
-    let expanded_hash = compute_template_file_hash(
-        rootfs_path.to_path_buf(),
-        content_hash_algorithm(content_hash)?,
-        "compute expanded rootfs hash",
-    )
-    .await?;
+    let expanded_hash =
+        compute_template_file_hash(rootfs_path.to_path_buf(), "compute expanded rootfs hash")
+            .await?;
     if expanded_hash != content_hash {
         return Err(Status::data_loss(format!(
             "expanded rootfs hash mismatch: expected {content_hash}, got {expanded_hash}"
@@ -313,7 +307,6 @@ async fn materialize_uncompressed_imported_rootfs(
         .map_err(|e| Status::internal(format!("stat rootfs {}: {e}", rootfs_path.display())))?;
     let compressed_hash = compute_template_file_hash(
         compressed_rootfs_path.to_path_buf(),
-        HashAlg::Sha256,
         "hash compressed rootfs",
     )
     .await?;
@@ -816,13 +809,13 @@ pub(super) fn validate_template_name(name: &str) -> Result<(), tonic::Status> {
         .map_err(|err| tonic::Status::invalid_argument(format!("invalid template name: {err}")))
 }
 
-/// Validate an algorithm-prefixed content hash.
+/// Validate a content hash format (must start with "sha256:").
 pub(super) fn validate_content_hash(hash: &str) -> Result<(), tonic::Status> {
     hash.parse::<pplx_space_common_core::types::ContentHash>()
         .map(|_| ())
         .map_err(|_| {
             tonic::Status::invalid_argument(format!(
-                "invalid content hash (expected sha256:<hex> or blake3:<hex>): {hash}"
+                "invalid content hash (expected sha256: ...): {hash}"
             ))
         })
 }

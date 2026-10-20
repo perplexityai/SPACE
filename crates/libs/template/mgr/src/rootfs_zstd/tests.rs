@@ -51,17 +51,14 @@ fn read_decoded_rootfs_chunk_coalesces_short_reads() {
     assert!(eof.is_none());
 }
 
-#[rstest::rstest]
-#[case::default(None)]
-#[case::sha256(Some(HashAlg::Sha256))]
-#[case::blake3(Some(HashAlg::Blake3))]
-fn rootfs_zstd_round_trips_sparse_file(#[case] algorithm: Option<HashAlg>) {
+#[test]
+fn rootfs_zstd_round_trips_sparse_file() {
     let temp = tempfile::tempdir().unwrap();
     let rootfs = temp.path().join(TEMPLATE_ROOTFS_FILE);
     let compressed = temp.path().join(TEMPLATE_ROOTFS_ZSTD_FILE);
     std::fs::File::create(&rootfs)
         .unwrap()
-        .set_len((2 * DECODE_BUFFER_SIZE + 123) as u64)
+        .set_len(16 * 1024 * 1024)
         .unwrap();
     let data = b"space rootfs zstd round trip";
     std::fs::OpenOptions::new()
@@ -72,38 +69,30 @@ fn rootfs_zstd_round_trips_sparse_file(#[case] algorithm: Option<HashAlg>) {
         .unwrap();
 
     let compress_stats = compress_rootfs(&rootfs, &compressed).unwrap();
-    assert_eq!(
-        compress_stats.rootfs_size,
-        (2 * DECODE_BUFFER_SIZE + 123) as u64
-    );
+    assert_eq!(compress_stats.rootfs_size, 16 * 1024 * 1024);
     assert!(compress_stats.compressed_size < compress_stats.rootfs_size);
     assert_eq!(
         compress_stats.compressed_hash,
         sha256_bytes(&std::fs::read(&compressed).unwrap())
     );
 
-    let bytes = std::fs::read(&rootfs).unwrap();
-    let expected = match algorithm.unwrap_or(HashAlg::Sha256) {
-        HashAlg::Sha256 => sha256_bytes(&bytes),
-        HashAlg::Blake3 => format!("blake3:{}", blake3::hash(&bytes)),
-    };
     std::fs::remove_file(&rootfs).unwrap();
     let decompress_stats = decompress_rootfs(
         &compressed,
         &rootfs,
-        algorithm.map(|_| expected.as_str()),
+        None,
         crate::rootfs_backing::RootfsBackingPolicy::Inherit,
     )
     .unwrap();
-    assert_eq!(
-        decompress_stats.rootfs_size,
-        (2 * DECODE_BUFFER_SIZE + 123) as u64
-    );
+    assert_eq!(decompress_stats.rootfs_size, 16 * 1024 * 1024);
     assert_eq!(
         decompress_stats.compressed_size,
         compress_stats.compressed_size
     );
-    assert_eq!(decompress_stats.rootfs_hash, expected);
+    assert_eq!(
+        decompress_stats.rootfs_hash,
+        sha256_bytes(&std::fs::read(&rootfs).unwrap())
+    );
     assert_eq!(
         decompress_stats.compressed_hash,
         sha256_bytes(&std::fs::read(&compressed).unwrap())
@@ -122,53 +111,47 @@ fn rootfs_zstd_round_trips_sparse_file(#[case] algorithm: Option<HashAlg>) {
 /// it, so bytes that fail verification must never be renamed into place.
 #[test]
 fn decompress_rootfs_refuses_to_publish_a_digest_mismatch() {
-    for algorithm in [HashAlg::Sha256, HashAlg::Blake3] {
-        let temp = tempfile::tempdir().unwrap();
-        let rootfs = temp.path().join(TEMPLATE_ROOTFS_FILE);
-        let compressed = temp.path().join(TEMPLATE_ROOTFS_ZSTD_FILE);
-        std::fs::write(&rootfs, b"bytes the release never hashed").unwrap();
-        compress_rootfs(&rootfs, &compressed).unwrap();
-        let bytes = std::fs::read(&rootfs).unwrap();
-        let actual_rootfs_hash = match algorithm {
-            HashAlg::Sha256 => sha256_bytes(&bytes),
-            HashAlg::Blake3 => format!("blake3:{}", blake3::hash(&bytes)),
-        };
-        std::fs::remove_file(&rootfs).unwrap();
-        let expected = format!("{algorithm}:{}", "1".repeat(64));
+    let temp = tempfile::tempdir().unwrap();
+    let rootfs = temp.path().join(TEMPLATE_ROOTFS_FILE);
+    let compressed = temp.path().join(TEMPLATE_ROOTFS_ZSTD_FILE);
+    std::fs::write(&rootfs, b"bytes the release never hashed").unwrap();
+    compress_rootfs(&rootfs, &compressed).unwrap();
+    let actual_rootfs_hash = sha256_bytes(&std::fs::read(&rootfs).unwrap());
+    std::fs::remove_file(&rootfs).unwrap();
+    let expected = format!("sha256:{}", "1".repeat(64));
 
-        let err = decompress_rootfs(
-            &compressed,
-            &rootfs,
-            Some(&expected),
-            crate::rootfs_backing::RootfsBackingPolicy::Inherit,
-        )
-        .unwrap_err();
+    let err = decompress_rootfs(
+        &compressed,
+        &rootfs,
+        Some(&expected),
+        crate::rootfs_backing::RootfsBackingPolicy::Inherit,
+    )
+    .unwrap_err();
 
-        assert!(
-            matches!(
-                &err,
-                RootfsZstdError::ExpandedDigestMismatch { expected: e, actual }
-                    if *e == expected && *actual == actual_rootfs_hash
-            ),
-            "{err}"
-        );
-        assert!(!rootfs.exists(), "mismatching bytes must not be published");
-        assert_eq!(
-            std::fs::read_dir(temp.path()).unwrap().count(),
-            1,
-            "only the compressed input may remain; no temp output left behind"
-        );
+    assert!(
+        matches!(
+            &err,
+            RootfsZstdError::ExpandedDigestMismatch { expected: e, actual }
+                if *e == expected && *actual == actual_rootfs_hash
+        ),
+        "{err}"
+    );
+    assert!(!rootfs.exists(), "mismatching bytes must not be published");
+    assert_eq!(
+        std::fs::read_dir(temp.path()).unwrap().count(),
+        1,
+        "only the compressed input may remain; no temp output left behind"
+    );
 
-        let stats = decompress_rootfs(
-            &compressed,
-            &rootfs,
-            Some(&actual_rootfs_hash),
-            crate::rootfs_backing::RootfsBackingPolicy::Inherit,
-        )
-        .unwrap();
-        assert_eq!(stats.rootfs_hash, actual_rootfs_hash);
-        assert!(rootfs.exists());
-    }
+    let stats = decompress_rootfs(
+        &compressed,
+        &rootfs,
+        Some(&actual_rootfs_hash),
+        crate::rootfs_backing::RootfsBackingPolicy::Inherit,
+    )
+    .unwrap();
+    assert_eq!(stats.rootfs_hash, actual_rootfs_hash);
+    assert!(rootfs.exists());
 }
 
 #[test]
@@ -189,8 +172,7 @@ fn hash_rootfs_file_matches_decompressed_hash() {
         .unwrap();
 
     compress_rootfs(&rootfs, &compressed).unwrap();
-    let (legacy_hash, legacy_size) =
-        hash_rootfs_file(&rootfs, pplx_space_common_core::types::HashAlg::Sha256).unwrap();
+    let (legacy_hash, legacy_size) = hash_rootfs_file(&rootfs).unwrap();
     assert_eq!(legacy_size, 4 * 1024 * 1024);
     assert_eq!(legacy_hash, sha256_bytes(&std::fs::read(&rootfs).unwrap()));
 
@@ -271,45 +253,4 @@ fn encoder_workers_cap_host_parallelism() {
     assert_eq!(encoder_workers(128), MAX_ENCODER_WORKERS);
     // Zero can only come from a failed parallelism probe; stay single-threaded.
     assert_eq!(encoder_workers(0), 1);
-}
-
-// Public SHA-256 and BLAKE3 test vectors for "abc" also check that raw-file
-// verification and the streaming decoder implement the same digest contract.
-#[test]
-fn verifies_both_algorithms_and_rejects_unknown_before_creating_output() {
-    let temp = tempfile::tempdir().unwrap();
-    let compressed = temp.path().join(TEMPLATE_ROOTFS_ZSTD_FILE);
-    std::fs::write(&compressed, zstd::encode_all(&b"abc"[..], 1).unwrap()).unwrap();
-    let rootfs = temp.path().join(TEMPLATE_ROOTFS_FILE);
-    for expected in [
-        "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
-        "blake3:6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85",
-    ] {
-        let stats = decompress_rootfs(
-            &compressed,
-            &rootfs,
-            Some(expected),
-            crate::rootfs_backing::RootfsBackingPolicy::Inherit,
-        )
-        .unwrap();
-        assert_eq!(stats.rootfs_hash, expected);
-        assert_eq!(std::fs::read(&rootfs).unwrap(), b"abc");
-        assert_eq!(
-            hash_rootfs_file(&rootfs, expected.parse::<Digest>().unwrap().algorithm()).unwrap(),
-            (expected.to_string(), 3)
-        );
-        std::fs::remove_file(&rootfs).unwrap();
-    }
-    for expected in ["md5:abc", "blake3:abc"] {
-        assert!(matches!(
-            decompress_rootfs(
-                &compressed,
-                &rootfs,
-                Some(expected),
-                crate::rootfs_backing::RootfsBackingPolicy::Inherit
-            ),
-            Err(RootfsZstdError::InvalidDigest(_))
-        ));
-        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
-    }
 }

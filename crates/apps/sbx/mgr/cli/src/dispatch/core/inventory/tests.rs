@@ -2,29 +2,27 @@ use super::*;
 
 #[test]
 fn template_hash_display_marks_stale_template_hashes() {
-    for algorithm in ["sha256", "blake3"] {
-        let mut template_hashes = HashMap::new();
-        template_hashes.insert("seed".to_string(), format!("{algorithm}:abcdef0123459999"));
-        let sandbox = SandboxInfo {
-            template: Some("seed".to_string()),
-            image_hash: Some(format!("{algorithm}:abcdef0123459999")),
-            ..Default::default()
-        };
-        assert_eq!(
-            template_hash_display(&sandbox, &template_hashes),
-            "abcdef012345"
-        );
+    let mut template_hashes = HashMap::new();
+    template_hashes.insert("seed".to_string(), "sha256:abcdef0123459999".to_string());
+    let sandbox = SandboxInfo {
+        template: Some("seed".to_string()),
+        image_hash: Some("sha256:abcdef0123459999".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(
+        template_hash_display(&sandbox, &template_hashes),
+        "abcdef012345"
+    );
 
-        let sandbox = SandboxInfo {
-            template: Some("seed".to_string()),
-            image_hash: Some(format!("{algorithm}:abcdef0123450000")),
-            ..Default::default()
-        };
-        assert_eq!(
-            template_hash_display(&sandbox, &template_hashes),
-            "abcdef012345*"
-        );
-    }
+    let sandbox = SandboxInfo {
+        template: Some("seed".to_string()),
+        image_hash: Some("sha256:abcdef0123450000".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(
+        template_hash_display(&sandbox, &template_hashes),
+        "abcdef012345*"
+    );
 }
 
 #[test]

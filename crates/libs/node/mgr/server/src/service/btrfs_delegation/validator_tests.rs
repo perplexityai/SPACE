@@ -94,9 +94,8 @@ fn template_name_rejects_path_traversal() {
 }
 
 #[test]
-fn content_hash_accepts_canonical_digests() {
+fn content_hash_accepts_canonical_sha256() {
     for ok in &[
-        "blake3:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         "sha256:6dfaca783bd73dbb42fe5833b46e575a7c9555e56801e79cda7f01f573f2ebb1",
     ] {

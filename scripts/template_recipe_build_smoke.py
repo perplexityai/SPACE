@@ -26,7 +26,7 @@ JsonValue: TypeAlias = (
 MIB = 1024 * 1024
 TERMINAL_BUILD_STATES = {"succeeded", "failed", "publish_failed"}
 TERMINAL_OPERATION_STATES = {"succeeded", "failed", "canceled", "expired"}
-FULL_DIGEST = re.compile(r"(?:sha256|blake3):[0-9a-f]{64}\Z")
+FULL_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 TEMPLATE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,62}\Z")
 PACKAGE_MANAGERS = {
     "apt-install": "apt",

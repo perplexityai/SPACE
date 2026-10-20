@@ -237,7 +237,7 @@ message ExportTemplateHeader {
   optional uint32 snapshot_vcpu = 4;
   optional uint32 snapshot_memory_mib = 5;
   bytes manifest_json = 6;
-  optional string rootfs_hash = 7;       // algorithm-prefixed digest of streamed rootfs.ext4 bytes, or expanded rootfs digest for transfer-pack streams
+  optional string rootfs_hash = 7;       // sha256 of streamed rootfs.ext4 bytes, or expanded rootfs digest for transfer-pack streams
 }
 
 message ImportTemplateRequest {
@@ -256,7 +256,7 @@ message ImportTemplateHeader {
   bytes manifest_json = 6;
   // When true, import waits for base-snapshot policy reconciliation.
   optional bool block_on_snapshot_policy_achieved = 7;
-  optional string rootfs_hash = 8;       // algorithm-prefixed digest of streamed rootfs.ext4 bytes, or expanded rootfs digest for transfer-pack streams
+  optional string rootfs_hash = 8;       // sha256 of streamed rootfs.ext4 bytes, or expanded rootfs digest for transfer-pack streams
 }
 
 message ImportTemplateResponse {

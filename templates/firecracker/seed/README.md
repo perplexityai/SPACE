@@ -87,24 +87,6 @@ target deployment, including kernel availability and SSH trust, before relying
 on a new lineage. Keep the previous digest for rollback through the existing
 admin release-tag API.
 
-## Template digest compatibility
-
-Template rootfs identities use `sha256:<64 lowercase hex>` or
-`blake3:<64 lowercase hex>`. Both cover the complete expanded rootfs, including
-zero-filled regions. Consumers select the verifier from the release identity and
-check decoded bytes before publishing the rootfs into the cache. Compressed-file
-checksums, base-snapshot identities and runtime binary checksums remain SHA-256.
-
-Deploy dual-algorithm readers across the API, workers, builders and operator
-clients before enabling BLAKE3 production. The reader release still registers new
-rootfs images with SHA-256. It needs no PostgreSQL or SQLite migration, and uses
-the existing algorithm-prefixed protobuf string fields.
-
-Existing SHA-256 releases keep their identities. A BLAKE3 digest for the same
-bytes is a distinct release and cache entry. Once BLAKE3 releases are published,
-keep dual-algorithm readers deployed: an older SHA-only binary cannot consume
-those releases or safely reconcile their cache directories.
-
 ## Build environment exports
 
 An `env_refs = ["PACKAGE_TOKEN"]` step requests the guest variable
@@ -360,7 +342,7 @@ On the node after deploy:
 
 ```
 /space/cache/firecracker/templates/{id}/
-  {algorithm}:{content-hash}/
+  sha256:{content-hash}/
     rootfs.ext4
     metadata.json   build provenance and runtime compatibility identity
     manifest.json   content manifest with mirrored runtime identity

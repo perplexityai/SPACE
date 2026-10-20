@@ -454,12 +454,12 @@ impl TemplateManagerService {
                 // Legacy flat layout (builder CLI, seed bootstrap scripts).
                 let flat_rootfs = format!("{name_dir}/rootfs.ext4");
                 if !std::path::Path::new(&flat_rootfs).exists() {
-                    // Maybe already organized — check for any digest directory with rootfs
+                    // Maybe already organized — check for any sha256:* dir with rootfs
                     let has_build = std::fs::read_dir(&name_dir)
                         .ok()
                         .map(|entries| {
                             entries.flatten().any(|e| {
-                                e.file_name().to_string_lossy().parse::<Digest>().is_ok()
+                                e.file_name().to_string_lossy().starts_with("sha256:")
                                     && e.path().join("rootfs.ext4").exists()
                             })
                         })
@@ -534,12 +534,8 @@ impl TemplateManagerService {
         let arch = template_arch(&metadata, &empty_manifest);
 
         expand_template_rootfs(template_id, "pending", &staging_dir, "register").await?;
-        let content_hash = compute_template_file_hash(
-            rootfs_path.clone(),
-            HashAlg::Sha256,
-            "hash expanded rootfs",
-        )
-        .await?;
+        let content_hash =
+            compute_template_file_hash(rootfs_path.clone(), "hash expanded rootfs").await?;
         let expanded_size = std::fs::metadata(&rootfs_path)
             .map(|m| m.len())
             .map_err(|e| Status::internal(format!("stat rootfs {}: {e}", rootfs_path.display())))?;

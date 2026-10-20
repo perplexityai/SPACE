@@ -4,14 +4,11 @@ use std::sync::mpsc::{Receiver, SyncSender};
 use std::thread;
 
 use pplx_space_common_core::types::{
-    Digest, DigestParseError, HashAlg, TEMPLATE_ROOTFS_FILE, TEMPLATE_ROOTFS_ZSTD_FILE,
-    TEMPLATE_ROOTFS_ZSTD_LEVEL,
+    TEMPLATE_ROOTFS_FILE, TEMPLATE_ROOTFS_ZSTD_FILE, TEMPLATE_ROOTFS_ZSTD_LEVEL,
 };
 use pplx_space_common_io::sparse::SparseFileWriter;
 use pplx_space_common_svc::page_cache;
 use sha2::{Digest as _, Sha256};
-
-use crate::content_hash::ContentHasher;
 
 type Sha256Context = Sha256;
 
@@ -26,8 +23,6 @@ const MAX_ENCODER_WORKERS: u32 = 16;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RootfsZstdError {
-    #[error("invalid expected rootfs digest: {0}")]
-    InvalidDigest(#[from] DigestParseError),
     #[error("{operation} {path}: {source}")]
     Io {
         operation: &'static str,
@@ -54,7 +49,6 @@ pub(crate) enum RootfsZstdError {
 impl RootfsZstdError {
     pub(crate) fn reason(&self) -> &'static str {
         match self {
-            Self::InvalidDigest(_) => "invalid_digest",
             Self::Io { .. } => "io",
             Self::Zstd { .. } => "zstd",
             Self::Pipeline { .. } => "pipeline",
@@ -184,10 +178,6 @@ pub(crate) fn decompress_rootfs(
     expected_rootfs_hash: Option<&str>,
     backing_policy: crate::rootfs_backing::RootfsBackingPolicy,
 ) -> Result<RootfsZstdDecompressStats, RootfsZstdError> {
-    let algorithm = expected_rootfs_hash
-        .map(str::parse::<Digest>)
-        .transpose()?
-        .map_or(HashAlg::Sha256, Digest::algorithm);
     let compressed_size = std::fs::metadata(compressed_path)
         .map_err(|source| RootfsZstdError::Io {
             operation: "stat compressed rootfs",
@@ -249,7 +239,7 @@ pub(crate) fn decompress_rootfs(
     let (hash_tx, hash_rx) = std::sync::mpsc::sync_channel(DECODE_PIPELINE_DEPTH);
     let hash_handle = thread::Builder::new()
         .name("rootfs-zstd-hash".to_string())
-        .spawn(move || hash_decoded_rootfs_chunks(hash_rx, writer_tx, algorithm))
+        .spawn(move || hash_decoded_rootfs_chunks(hash_rx, writer_tx))
         .map_err(|source| RootfsZstdError::Io {
             operation: "spawn rootfs hash thread",
             path: tmp.display().to_string(),
@@ -329,7 +319,7 @@ pub(crate) fn decompress_rootfs(
     })
 }
 
-/// Stream an uncompressed rootfs on disk to produce `(<algorithm>:<hex>, size)`.
+/// Stream an uncompressed rootfs on disk to produce `(sha256:<hex>, size)`.
 ///
 /// Used by `volume::do_pull` when the build's `manifest.json` declares
 /// the bootable rootfs without a `.zst` sibling — a first-class
@@ -344,10 +334,7 @@ pub(crate) fn decompress_rootfs(
 /// [`decompress_rootfs`] computes both hashes as a side effect of
 /// streaming through the decoder; here we read the file directly
 /// because there's no decompression step.
-pub(crate) fn hash_rootfs_file(
-    rootfs_path: &Path,
-    algorithm: HashAlg,
-) -> Result<(String, u64), RootfsZstdError> {
+pub(crate) fn hash_rootfs_file(rootfs_path: &Path) -> Result<(String, u64), RootfsZstdError> {
     let input = std::fs::File::open(rootfs_path).map_err(|source| RootfsZstdError::Io {
         operation: "open rootfs",
         path: rootfs_path.display().to_string(),
@@ -355,7 +342,7 @@ pub(crate) fn hash_rootfs_file(
     })?;
     let mut reader = BufReader::new(input);
     let mut rootfs_size = 0u64;
-    let mut rootfs_hasher = ContentHasher::new(algorithm);
+    let mut rootfs_hasher = sha256_hasher();
     let mut buffer = vec![0u8; 1024 * 1024];
     loop {
         let read = reader
@@ -377,7 +364,7 @@ pub(crate) fn hash_rootfs_file(
         rootfs_size = rootfs_size.saturating_add(usize_to_u64_saturating(read));
     }
     page_cache::advise_dontneed(reader.get_ref(), rootfs_path, "hash rootfs input");
-    Ok((rootfs_hasher.finish().to_string(), rootfs_size))
+    Ok((sha256_digest(rootfs_hasher), rootfs_size))
 }
 
 #[derive(Debug)]
@@ -543,9 +530,8 @@ fn write_decoded_rootfs_chunks(
 fn hash_decoded_rootfs_chunks(
     chunk_rx: Receiver<DecodedRootfsChunk>,
     writer_tx: SyncSender<DecodedRootfsChunk>,
-    algorithm: HashAlg,
 ) -> Result<RootfsHashOutput, RootfsZstdError> {
-    let mut hasher = ContentHasher::new(algorithm);
+    let mut hasher = sha256_hasher();
     let mut decoded_size = 0u64;
     for chunk in chunk_rx {
         decoded_size = decoded_size.saturating_add(usize_to_u64_saturating(chunk.len));
@@ -556,7 +542,7 @@ fn hash_decoded_rootfs_chunks(
                 operation: "send hashed rootfs chunk to sparse writer",
             })?;
     }
-    let rootfs_hash = hasher.finish().to_string();
+    let rootfs_hash = sha256_digest(hasher);
     Ok(RootfsHashOutput {
         decoded_size,
         rootfs_hash,

@@ -2,7 +2,6 @@
 
 pub mod background_jobs;
 pub mod btrfs_via_nodemgr;
-mod content_hash;
 pub mod db;
 pub(crate) mod eviction;
 mod node_state_sync;

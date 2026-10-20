@@ -1349,8 +1349,8 @@ pub(super) fn unsupported_template_runtime(value: &str) -> Status {
 
 /// Parses `hash` into a canonical
 /// [`pplx_space_common_core::types::ContentHash`]
-/// (`<algorithm>:<64 lowercase hex>`), tolerating a bare 64-hex digest by
-/// assuming SHA-256, and returns the canonical algorithm-prefixed string.
+/// (`sha256:<64 lowercase hex>`), tolerating a bare 64-hex digest by
+/// assuming sha256, and returns the canonical `sha256:`-prefixed string.
 /// Validating at insertion time means every consumer downstream —
 /// template-manager, builders, snapshot reconcilers — can trust the
 /// column's shape without re-checking; accepting a bare hash on the read
@@ -1359,10 +1359,10 @@ pub(super) fn validated_release_hash(value: &str) -> Result<String, Status> {
     let trimmed = trimmed_required(value, "hash")?;
     let Ok(content_hash) = trimmed.parse::<pplx_space_common_core::types::ContentHash>() else {
         return Err(Status::invalid_argument(format!(
-            "hash '{trimmed}' must be formatted as 'sha256:<64 lowercase hex chars>' or 'blake3:<64 lowercase hex chars>'"
+            "hash '{trimmed}' must be formatted as 'sha256:<64 lowercase hex chars>'"
         )));
     };
-    // Canonicalize the algorithm prefix so writes store one shape
+    // Canonicalize to `sha256:`-prefixed form so writes store one shape
     // and the by-hash lookup tolerates a bare hash that round-trips back
     // through prefetch from the `template_releases.hash` column.
     Ok(content_hash.to_string())

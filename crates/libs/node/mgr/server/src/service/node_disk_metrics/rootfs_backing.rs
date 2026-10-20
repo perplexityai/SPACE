@@ -134,8 +134,7 @@ fn collect(sandboxes: &Path, templates: &Path) -> io::Result<Inventory> {
                 let name = name.to_string_lossy();
                 // Import, republish and replaced-generation siblings append
                 // dot-separated markers; they are not canonical cache entries.
-                name.parse::<pplx_space_common_core::types::Digest>()
-                    .is_ok()
+                name.starts_with("sha256:") && !name.contains('.')
             }) {
                 inventory.record(Kind::Template, &digest)?;
             }

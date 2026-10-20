@@ -9,9 +9,7 @@ fn reference() -> ManifestReference {
         .split_whitespace()
         .next()
         .expect("fixture checksum");
-    let Digest::Sha256(bytes) = format!("sha256:{sum}").parse().expect("SHA-256 fixture") else {
-        panic!("expected SHA-256 fixture");
-    };
+    let Digest::Sha256(bytes) = format!("sha256:{sum}").parse().expect("SHA-256 fixture");
     ManifestReference::new(
         SandboxId::from_uuid(Uuid::from_u128(0x019ee004_1111_7000_8000_000000000001)),
         ManifestId::from_uuid(Uuid::from_u128(0x019ee004_2222_7000_8000_000000000002)),

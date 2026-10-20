@@ -32,17 +32,9 @@ fn content_hash_from_str_rejects_malformed() {
 
 #[test]
 fn digest_round_trips_canonical_encoding() {
-    for digest in [Digest::sha256([0xab; 32]), Digest::blake3([0xab; 32])] {
-        let encoded = digest.to_string();
-        assert_eq!(Digest::from_str(&encoded).unwrap(), digest);
-        assert_eq!(encoded.parse::<ContentHash>().unwrap().digest(), digest);
-        assert!(digest.short_prefix().matches(digest));
-    }
-    assert!(
-        !Digest::sha256([0xab; 32])
-            .short_prefix()
-            .matches(Digest::blake3([0xab; 32]))
-    );
+    let digest = Digest::sha256([0xab; 32]);
+    let encoded = digest.to_string();
+    assert_eq!(Digest::from_str(&encoded).unwrap(), digest);
     assert!(matches!(
         Digest::from_str("ab"),
         Err(DigestParseError::MissingAlgorithmSeparator)

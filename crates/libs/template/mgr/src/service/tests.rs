@@ -1552,51 +1552,31 @@ fn expanded_test_rootfs_setup() -> (tempfile::TempDir, String, Vec<u8>) {
     (temp, content_hash, rootfs_bytes)
 }
 
-#[rstest::rstest]
-#[case::sha256(HashAlg::Sha256)]
-#[case::blake3(HashAlg::Blake3)]
-#[tokio::test]
-async fn refresh_register_existing_expanded_build_preserves_rootfs_bytes(
-    #[case] algorithm: HashAlg,
-) {
-    let (temp, sha256, original_bytes) = expanded_test_rootfs_setup();
-    let content_hash = match algorithm {
-        HashAlg::Sha256 => sha256,
-        HashAlg::Blake3 => format!("blake3:{}", blake3::hash(&original_bytes)),
-    };
-    let compressed = crate::rootfs_zstd::compress_rootfs(
-        &temp.path().join(TEMPLATE_ROOTFS_FILE),
-        &temp.path().join(TEMPLATE_ROOTFS_ZSTD_FILE),
-    )
-    .unwrap();
-    let manifest = normalize_template_manifest(
-        Default::default(),
-        "register-refresh-test",
-        &content_hash,
-        &Default::default(),
-        original_bytes.len() as u64,
-        Some((&compressed.compressed_hash, compressed.compressed_size)),
-    )
-    .unwrap();
-    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-    std::fs::write(temp.path().join("manifest.json"), &manifest_bytes).unwrap();
-    let service = TemplateManagerService::new(crate::db::test_conn()).unwrap();
-    service
-        .refresh_register_existing_expanded_build(
+#[test]
+fn refresh_register_existing_expanded_build_preserves_rootfs_bytes() {
+    let (temp, content_hash, original_bytes) = expanded_test_rootfs_setup();
+    let digest_dir = temp.path().to_str().unwrap().to_string();
+
+    let conn = crate::db::test_conn();
+    let service = TemplateManagerService::new(conn).unwrap();
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime
+        .block_on(service.refresh_register_existing_expanded_build(
             "register-refresh-test",
             &content_hash,
-            temp.path().to_str().unwrap(),
+            &digest_dir,
             Some(br#"{"disk_size_mb":4}"#),
-        )
-        .await
+        ))
         .unwrap();
+
+    let after_bytes = std::fs::read(temp.path().join("rootfs.ext4")).unwrap();
     assert_eq!(
-        std::fs::read(temp.path().join("rootfs.ext4")).unwrap(),
-        original_bytes
-    );
-    assert_eq!(
-        std::fs::read(temp.path().join("manifest.json")).unwrap(),
-        manifest_bytes
+        after_bytes, original_bytes,
+        "digest_dir/rootfs.ext4 must not be mutated by register refresh"
     );
     let conn = service.db.lock().unwrap();
     let build = crate::db::get_build(&conn, "register-refresh-test", &content_hash)

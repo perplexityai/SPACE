@@ -27,7 +27,7 @@
 //!    [`crate::rootfs_zstd::decompress_rootfs`] (process-unique tmp
 //!    filename + atomic rename, so two overlapping decompresses from a
 //!    cancellation race can't corrupt each other) and verifying its
-//!    digest against the resolved release `hash`. Mismatch is the only
+//!    SHA-256 against the resolved release `hash`. Mismatch is the only
 //!    hard failure on this path.
 //! 5. Atomically rewriting `manifest.json` with normalized fields (via
 //!    [`write_file_atomic`]) and inserting a `ready` build row in
@@ -1667,7 +1667,7 @@ async fn try_pull_from(
     )
     .await?;
 
-    // 6. Verify the digest against the resolved release hash.
+    // 6. Verify SHA-256 against the resolved release hash.
     if rootfs_outcome.rootfs_hash != content_hash {
         warn!(
             template = name,
@@ -1925,7 +1925,7 @@ async fn try_pull_from(
 ///
 /// 1. **Verify-before-rename in [`crate::rootfs_zstd::decompress_rootfs`].**
 ///    The decompressor streams into a sibling tmp file and only renames
-///    onto `rootfs.ext4` once it has verified the full digest over the
+///    onto `rootfs.ext4` once it has accumulated the full SHA-256 over the
 ///    decoded bytes; the caller (`try_pull_from`) compares that hash against
 ///    the resolved release hash and rejects on mismatch. A file at
 ///    `rootfs.ext4` therefore reflects bytes that passed verification.
@@ -1937,7 +1937,7 @@ async fn try_pull_from(
 /// **If either invariant is ever broken** (e.g. someone removes the verify
 /// step in `decompress_rootfs`, or an operator manually drops a file into a
 /// digest dir), recovery will silently re-register the wrong bytes. The
-/// defense-in-depth fix would be a digest check of `rootfs.ext4` on every
+/// defense-in-depth fix would be a SHA-256 of `rootfs.ext4` on every
 /// recovery, but that's a multi-second cost on a 1 GB rootfs for a cold
 /// path. We accept the trust on the basis that the invariants are local to
 /// this crate.
@@ -2671,7 +2671,7 @@ struct DecompressTarget {
     uncompressed_name: String,
     compressed_path: String,
     uncompressed_path: String,
-    /// Expected algorithm-prefixed digest of the decompressed bytes per the manifest's
+    /// Expected SHA-256 of the decompressed bytes per the manifest's
     /// `files[uncompressed_name].digest`. Compressed-pair
     /// materialization requires this digest and compares the rehashed
     /// expanded bytes against it.
@@ -2925,11 +2925,7 @@ async fn materialize_rootfs(
 
     // Uncompressed-only manifest: `files` declared no `.zst` sibling
     // for the bootable rootfs, so the pull plan downloaded the rootfs
-    // directly. Stream-hash it using the release identity.
-    let algorithm = content_hash
-        .parse::<pplx_space_common_core::types::Digest>()
-        .map_err(|error| PullError::Failed(tonic::Status::invalid_argument(error.to_string())))?
-        .algorithm();
+    // directly. Stream-hash it for SHA verification.
     let hash_source = rootfs_path.to_string();
     let phase_started = Instant::now();
     let (rootfs_hash, rootfs_size) = match tokio::task::spawn_blocking(move || {
@@ -2940,7 +2936,7 @@ async fn materialize_rootfs(
                 path: hash_source.clone(),
                 source,
             })?;
-        crate::rootfs_zstd::hash_rootfs_file(Path::new(&hash_source), algorithm)
+        crate::rootfs_zstd::hash_rootfs_file(Path::new(&hash_source))
     })
     .await
     {

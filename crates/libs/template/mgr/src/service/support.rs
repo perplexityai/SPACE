@@ -16,33 +16,14 @@ impl Drop for ImportGuard {
     }
 }
 
-pub(super) fn content_hash_algorithm(hash: &str) -> Result<HashAlg, Status> {
-    hash.parse::<Digest>()
-        .map(Digest::algorithm)
-        .map_err(|error| Status::invalid_argument(format!("invalid content hash: {error}")))
-}
-
-pub(super) async fn compute_template_file_hash(
-    path: PathBuf,
-    algorithm: HashAlg,
-    context: &'static str,
-) -> Result<String, Status> {
-    let display_path = path.display().to_string();
-    tokio::task::spawn_blocking(move || compute_content_hash(&display_path, algorithm))
-        .await
-        .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))?
-        .map_err(|e| Status::internal(format!("{context} {}: {e}", path.display())))
-}
-
-/// Hash a file using the requested algorithm, including its canonical prefix.
-pub(super) fn compute_content_hash(
-    rootfs_path: &str,
-    algorithm: HashAlg,
-) -> std::io::Result<String> {
+/// Compute SHA256 of the bootable artifact (rootfs.ext4).
+/// Returns the hex string (without "sha256:" prefix).
+pub(super) fn compute_content_hash(rootfs_path: &str) -> std::io::Result<String> {
+    use sha2::Digest;
     use std::io::Read;
 
     let mut file = std::fs::File::open(rootfs_path)?;
-    let mut hasher = crate::content_hash::ContentHasher::new(algorithm);
+    let mut hasher = sha2::Sha256::new();
     let mut buf = vec![0u8; 512 * 1024]; // 512KB read buffer
     loop {
         let n = file.read(&mut buf)?;
@@ -59,7 +40,8 @@ pub(super) fn compute_content_hash(
     }
 
     page_cache::advise_dontneed(&file, Path::new(rootfs_path), "hash template file input");
-    Ok(hasher.finish().to_string())
+    let result = hasher.finalize();
+    Ok(result.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Compute a hash of snapshot.base + vmstate.base in a snapshot dir.

@@ -2456,7 +2456,7 @@ ON CONFLICT (key_hash) DO NOTHING;
                 # truncate the rootfs — would be undone by it. The manifest
                 # listing the compressed sibling is the last file write; the
                 # row upsert follows within the same task, so give it a beat.
-                f"d=$(ls -d {shlex.quote(directory)}/*:* | head -n1)",
+                f"d=$(ls -d {shlex.quote(directory)}/sha256:* | head -n1)",
                 "for _ in $(seq 1 360); do "
                 'if grep -q rootfs.ext4.zst "$d/manifest.json" 2>/dev/null; then sleep 2; exit 0; fi; '
                 "sleep 0.5; done",
@@ -2522,7 +2522,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             node_name, f"space-tmplmgr get --template {name} {selector_arg}", timeout=60
         )
         output = _require_ok(resolved, "resolve the selected protected template before planting")
-        hashes = re.findall(r"^content_hash:\s*((?:sha256|blake3):[0-9a-f]{64})\s*$", output, re.MULTILINE)
+        hashes = re.findall(r"^content_hash:\s*(sha256:[0-9a-f]{64})\s*$", output, re.MULTILINE)
         if len(hashes) != 1:
             raise RuntimeError("template resolve did not return one full content hash")
         return tuple(sorted({active, hashes[0]}))
@@ -2561,7 +2561,7 @@ ON CONFLICT (key_hash) DO NOTHING;
         # else (no shell, pod gone, exec refused) must not read as "gone".
         result = self._node_shell_exec(
             node_name,
-            f"out=$(ls -d {TEMPLATE_CACHE_ROOT}/{name}/*:* 2>/dev/null); "
+            f"out=$(ls -d {TEMPLATE_CACHE_ROOT}/{name}/sha256:* 2>/dev/null); "
             'rc=$?; if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then exit "$rc"; fi; '
             'printf "%s\n" "$out"',
             timeout=30,
@@ -5434,7 +5434,7 @@ def _parse_startup_recovery(node: str, pod: str, log: str) -> StartupRecoveryRep
         if TEMPLATE_RECOVERY_LEGACY_PRUNED_PREFIX in line:
             _, _, tail = line.partition(TEMPLATE_RECOVERY_LEGACY_PRUNED_PREFIX)
             name, sep, digest = tail.strip().partition("/")
-            if sep and digest.startswith(("sha256:", "blake3:")):
+            if sep and digest.startswith("sha256:"):
                 verdicts.append(TemplateRecoveryVerdict(name, digest.split()[0], "pruned"))
             continue
         if "startup recovery" not in line and TEMPLATE_RECOVERY_PRUNED_MESSAGE not in line:
@@ -5463,7 +5463,7 @@ def _parse_startup_recovery(node: str, pod: str, log: str) -> StartupRecoveryRep
             continue
         template = str(fields.get("template", ""))
         content_hash = str(fields.get("content_hash", ""))
-        if not template or not content_hash.startswith(("sha256:", "blake3:")):
+        if not template or not content_hash.startswith("sha256:"):
             continue
         verdicts.append(
             TemplateRecoveryVerdict(
@@ -5853,7 +5853,7 @@ def _smoke_template_name(value: str) -> str:
 def _template_digest(value: str) -> str:
     """A digest directory name as a single safe shell word."""
 
-    if not re.fullmatch(r"(?:sha256|blake3):[0-9a-f]{64}", value):
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
         raise ValueError(f"refusing template digest {value!r}")
     return value
 
