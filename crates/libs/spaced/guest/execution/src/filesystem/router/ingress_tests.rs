@@ -459,7 +459,7 @@ async fn native_mutations_share_the_transport_payload_budget() {
 }
 
 #[tokio::test]
-async fn native_filesystem_messages_match_the_transport_size_boundary() {
+async fn native_messages_allow_exactly_the_size_limit() {
     use prost::Message;
     let router = router();
     let directory = tempfile::tempdir().unwrap();
@@ -479,6 +479,7 @@ async fn native_filesystem_messages_match_the_transport_size_boundary() {
         .await
         .unwrap_err();
     assert_eq!(error.code(), tonic::Code::OutOfRange);
+    assert!(!pplx_space_common_grpc::is_refused_before_start(&error));
     assert_eq!(tokio::fs::read(&path).await.unwrap(), b"before");
     request.entries[0]
         .data
@@ -496,5 +497,6 @@ async fn native_filesystem_messages_match_the_transport_size_boundary() {
         .await
         .unwrap_err();
     assert_eq!(error.code(), tonic::Code::OutOfRange);
+    assert!(!pplx_space_common_grpc::is_refused_before_start(&error));
     router.drain().await;
 }

@@ -90,11 +90,11 @@ execution metadata.
   or redirect inherited output can outlive a completed leader; draining this
   service does not establish that every descendant has exited.
 
-This crate retains the daemon contract. Native upload input, bounded process-
-environment configuration, consistent shutdown semantics and complete operation
-acceptance remain follow-up work. General application embedding also requires
-stronger descendant ownership. Explicit launching alone does not establish those
-guarantees or advertise general embedding support.
+This crate retains the daemon contract. Native upload input, bounded
+process-environment configuration, consistent shutdown semantics and complete
+operation acceptance remain follow-up work. General application embedding also
+requires stronger descendant ownership. Explicit launching alone does not
+establish those guarantees or advertise general embedding support.
 
 The Linux `embedding` integration in the worker app uses the execution crate
 without the guest server. It covers a separate worker artifact, atomic path

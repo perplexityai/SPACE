@@ -486,6 +486,10 @@ impl ProcessLaunch {
 }
 
 impl ExecutionService {
+    /// Wraps a process adapter with predecode payload admission.
+    ///
+    /// The adapter must preserve request extensions when forwarding to this
+    /// service so handlers can reuse admission instead of charging twice.
     pub fn process_grpc_service<S: Process>(
         &self,
         adapter: S,

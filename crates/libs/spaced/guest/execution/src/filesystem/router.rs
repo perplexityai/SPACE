@@ -317,11 +317,10 @@ impl FilesystemRouter {
         &self,
         first: WriteRequest,
         mut incoming: Pin<Box<dyn Stream<Item = Result<WriteRequest, Status>> + Send>>,
-        admission: Option<RequestPermit>,
+        admission: RequestPermit,
     ) -> Result<Response<WriteResponse>, Status> {
         use pplx_space_spaced_guest_protocol::proto::operations::write_request::Message;
         crate::payload::check_message(&first, filesystem_limits::MAX_MESSAGE_BYTES)?;
-        let admission = crate::payload::acquire(&self.payload_slots, 1, admission)?;
         let Some(Message::Open(open)) = first.message else {
             return Err(Status::invalid_argument("first write message must be open"));
         };
@@ -1076,7 +1075,7 @@ impl Filesystem for FilesystemRouter {
             .message()
             .await?
             .ok_or_else(|| Status::invalid_argument("write requires open"))?;
-        self.write_stream(first, Box::pin(incoming), Some(admission))
+        self.write_stream(first, Box::pin(incoming), admission)
             .await
     }
 

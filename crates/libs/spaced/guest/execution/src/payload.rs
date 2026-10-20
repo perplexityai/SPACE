@@ -7,9 +7,9 @@ use tonic::{Request, Status};
 
 pub(crate) fn check_message(message: &impl prost::Message, limit: usize) -> Result<(), Status> {
     if message.encoded_len() > limit {
-        return Err(crate::refused(Status::out_of_range(
+        return Err(Status::out_of_range(
             "request exceeds the message size limit",
-        )));
+        ));
     }
     Ok(())
 }
