@@ -95,7 +95,13 @@ impl GuestAccount {
         &self.shell
     }
 
-    pub(crate) fn assume_process_credentials(&self) -> std::io::Result<()> {
+    pub(crate) fn assume_process_credentials(
+        &self,
+        policy: crate::IdentityPolicy,
+    ) -> std::io::Result<()> {
+        if policy == crate::IdentityPolicy::Restricted {
+            return assume_restricted_credentials(self.uid, self.gid, &self.supplementary_groups);
+        }
         nix::unistd::setgroups(&self.supplementary_groups)
             .map_err(|error| std::io::Error::from_raw_os_error(error as i32))?;
         // SAFETY: this runs in the worker subprocess before constructing its
@@ -105,8 +111,24 @@ impl GuestAccount {
         Ok(())
     }
 
-    pub(crate) fn configure_child_credentials(&self, command: &mut Command) -> Result<(), Status> {
+    pub(crate) fn configure_child_credentials(
+        &self,
+        command: &mut Command,
+        policy: crate::IdentityPolicy,
+    ) -> Result<(), Status> {
         use nix::unistd::{Gid, Uid};
+
+        if policy == crate::IdentityPolicy::Restricted {
+            let uid = self.uid;
+            let gid = self.gid;
+            let groups = self.supplementary_groups.clone();
+            // SAFETY: only credential/capability syscalls run after fork; all
+            // storage is prepared here, and no host thread's authority changes.
+            unsafe {
+                command.pre_exec(move || assume_restricted_credentials(uid, gid, &groups));
+            }
+            return Ok(());
+        }
 
         // An unprivileged test harness can already run as the requested
         // identity, but cannot call setgroups. Reusing it is safe only if its
@@ -147,4 +169,41 @@ impl GuestAccount {
         }
         Ok(())
     }
+}
+
+// Called only in a forked child or the single-threaded worker entrypoint.
+// no_new_privs persists across exec, including a root account's later execs.
+// Bounding capabilities are a ceiling, not granted authority: clearing all
+// active sets and forbidding exec gains leaves no capabilities to recover.
+fn assume_restricted_credentials(
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    groups: &[nix::unistd::Gid],
+) -> std::io::Result<()> {
+    use nix::unistd::{Gid, Uid};
+    use rustix::thread::{CapabilitySet, CapabilitySets};
+
+    rustix::thread::set_no_new_privs(true)?;
+    nix::unistd::setgroups(groups)?;
+    let uid = Uid::from_raw(uid);
+    let gid = Gid::from_raw(gid);
+    nix::unistd::setresgid(gid, gid, gid)?;
+    nix::unistd::setresuid(uid, uid, uid)?;
+    rustix::thread::clear_ambient_capability_set()?;
+    let empty = CapabilitySets {
+        effective: CapabilitySet::empty(),
+        permitted: CapabilitySet::empty(),
+        inheritable: CapabilitySet::empty(),
+    };
+    rustix::thread::set_capabilities(None, empty)?;
+    let uids = nix::unistd::getresuid()?;
+    let gids = nix::unistd::getresgid()?;
+    if [uids.real, uids.effective, uids.saved] != [uid; 3]
+        || [gids.real, gids.effective, gids.saved] != [gid; 3]
+        || rustix::thread::capabilities(None)? != empty
+        || !rustix::thread::no_new_privs()?
+    {
+        return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+    }
+    Ok(())
 }

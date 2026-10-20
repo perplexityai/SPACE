@@ -61,7 +61,7 @@ pub(super) struct FilesystemWorkerService {
 }
 
 const MAX_CONCURRENT_FILE_OPERATIONS: usize = 8;
-pub(super) const WORKER_PROTOCOL_VERSION: u32 = 3;
+pub(super) const WORKER_PROTOCOL_VERSION: u32 = 4;
 
 impl FilesystemWorkerService {
     pub(super) fn new(default_user: GuestUserName, shutdown: CancellationToken) -> Self {

@@ -150,6 +150,7 @@ fn cancellation_service() -> ExecutionService {
         ExecutionServiceConfig {
             default_operation_user: GuestUserName::parse(user.name).expect("valid current user"),
             filesystem_execution: FilesystemExecutionMode::Direct,
+            identity_policy: IdentityPolicy::Guest,
             ..ExecutionServiceConfig::default()
         },
     )

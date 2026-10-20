@@ -14,6 +14,7 @@ fn router() -> FilesystemRouter {
     FilesystemRouter::new(
         FilesystemExecutionMode::Direct,
         None,
+        crate::IdentityPolicy::Guest,
         GuestUserName::parse(user.name).expect("username"),
         CancellationToken::new(),
         super::DEFAULT_CANCELLATION_GRACE,

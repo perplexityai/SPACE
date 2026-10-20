@@ -6,6 +6,7 @@ async fn concurrent_invalidation_waits_for_reaping_after_first_caller_cancels() 
         CancellationToken::new(),
         None,
         crate::WorkerExecutable::open("/proc/self/exe").expect("test executable"),
+        crate::IdentityPolicy::Guest,
     );
     let user = GuestUserName::parse("root").expect("user");
     let channel = tonic::transport::Endpoint::from_static("http://[::]:50051").connect_lazy();
@@ -46,6 +47,7 @@ async fn active_client_lease_prevents_idle_worker_eviction() {
         CancellationToken::new(),
         None,
         crate::WorkerExecutable::open("/proc/self/exe").expect("test executable"),
+        crate::IdentityPolicy::Guest,
     );
     let root = GuestUserName::parse("root").expect("root");
     let user = GuestUserName::parse("user").expect("user");
@@ -88,10 +90,15 @@ async fn identity_worker_command_does_not_inherit_parent_environment() {
     }
 
     let user = GuestUserName::parse("user").expect("valid user");
-    let output = super::worker_command(Path::new("/usr/bin/env"), &user, 17)
-        .output()
-        .await
-        .expect("production worker command executes");
+    let output = super::worker_command(
+        Path::new("/usr/bin/env"),
+        &user,
+        17,
+        crate::IdentityPolicy::Guest,
+    )
+    .output()
+    .await
+    .expect("production worker command executes");
     assert!(output.status.success());
     assert!(!String::from_utf8_lossy(&output.stdout).contains(PARENT_ONLY_ENV));
     let configuration = [
@@ -134,7 +141,13 @@ async fn identity_worker_command_does_not_inherit_parent_environment() {
             if let Some(exporter) = exporter {
                 env.set("SPACE_TRACE_EXPORTER", exporter);
             }
-            super::worker_command_from_environment(Path::new("/usr/bin/env"), &user, 17, &env)
+            super::worker_command_from_environment(
+                Path::new("/usr/bin/env"),
+                &user,
+                17,
+                crate::IdentityPolicy::Guest,
+                &env,
+            )
         };
         let output = command
             .output()
@@ -154,6 +167,7 @@ async fn identity_worker_command_does_not_inherit_parent_environment() {
                 super::WORKER_MODE_ENV,
                 super::WORKER_USER_ENV,
                 super::WORKER_FD_ENV,
+                super::WORKER_IDENTITY_POLICY_ENV,
             ])
             // The configuration below forwards an OTel service name, so the
             // worker's own name is pinned to outrank it.
@@ -181,6 +195,10 @@ async fn identity_worker_command_does_not_inherit_parent_environment() {
             Some(&"17")
         );
         assert_eq!(environment.get("SPACE_TRACE_EXPORTER").copied(), exporter);
+        assert_eq!(
+            environment.get(super::WORKER_IDENTITY_POLICY_ENV),
+            Some(&"guest")
+        );
         for (name, value) in configuration {
             assert_eq!(environment.get(name), Some(&value), "worker lost {name}");
         }
@@ -190,7 +208,13 @@ async fn identity_worker_command_does_not_inherit_parent_environment() {
         let mut command = {
             let mut env = pplx_space_test_env::TestEnv::default();
             env.set("SPACE_METRICS_SINK", metrics_sink);
-            super::worker_command_from_environment(Path::new("/usr/bin/env"), &user, 17, &env)
+            super::worker_command_from_environment(
+                Path::new("/usr/bin/env"),
+                &user,
+                17,
+                crate::IdentityPolicy::Guest,
+                &env,
+            )
         };
         let output = command
             .output()
@@ -241,8 +265,13 @@ async fn worker_names_itself_only_when_it_would_inherit_its_launcher() {
         for (key, value) in settings {
             env.set(key, value);
         }
-        let mut command =
-            super::worker_command_from_environment(Path::new("/usr/bin/env"), &user, 17, &env);
+        let mut command = super::worker_command_from_environment(
+            Path::new("/usr/bin/env"),
+            &user,
+            17,
+            crate::IdentityPolicy::Guest,
+            &env,
+        );
         let output = command
             .output()
             .await
@@ -281,6 +310,7 @@ async fn expired_worker_shutdown_does_not_block_another_resident() {
         CancellationToken::new(),
         None,
         crate::WorkerExecutable::open("/proc/self/exe").expect("test executable"),
+        crate::IdentityPolicy::Guest,
     );
     let expired_user = GuestUserName::parse("root").expect("valid user");
     let resident_user = GuestUserName::parse("user").expect("valid user");
@@ -349,6 +379,7 @@ async fn same_identity_waiters_share_an_in_progress_start() {
         CancellationToken::new(),
         None,
         crate::WorkerExecutable::open("/proc/self/exe").expect("test executable"),
+        crate::IdentityPolicy::Guest,
     );
     let user = GuestUserName::parse("user").expect("valid user");
     let startup_id = uuid::Uuid::now_v7();
@@ -417,6 +448,7 @@ async fn failed_start_removes_its_capacity_reservation() {
         CancellationToken::new(),
         None,
         crate::WorkerExecutable::open("/proc/self/exe").expect("test executable"),
+        crate::IdentityPolicy::Guest,
     );
     let user = GuestUserName::parse("user").expect("valid user");
     let startup_id = uuid::Uuid::now_v7();
@@ -451,6 +483,7 @@ async fn invalidating_a_worker_cancels_its_supervisor() {
         CancellationToken::new(),
         None,
         crate::WorkerExecutable::open("/proc/self/exe").expect("test executable"),
+        crate::IdentityPolicy::Guest,
     );
     let stop_token = CancellationToken::new();
     let worker = WorkerClient {
@@ -510,6 +543,7 @@ async fn reaper_stops_an_expired_idle_worker_without_another_acquisition() {
         CancellationToken::new(),
         None,
         crate::WorkerExecutable::open("/proc/self/exe").expect("test executable"),
+        crate::IdentityPolicy::Guest,
     );
     let idle = GuestUserName::parse("root").expect("root");
     let ledger = GuestUserName::parse("user").expect("user");

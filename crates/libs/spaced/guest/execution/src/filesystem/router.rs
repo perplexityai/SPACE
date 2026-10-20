@@ -449,6 +449,11 @@ impl FilesystemRouter {
             expect(unused_variables, reason = "Linux-only workers")
         )]
         worker_executable: Option<crate::WorkerExecutable>,
+        #[cfg_attr(
+            not(target_os = "linux"),
+            expect(unused_variables, reason = "Linux-only workers")
+        )]
+        identity_policy: crate::IdentityPolicy,
         default_user: GuestUserName,
         shutdown: tokio_util::sync::CancellationToken,
         cancellation_grace: std::time::Duration,
@@ -470,6 +475,7 @@ impl FilesystemRouter {
                     guest_cgroups,
                     worker_executable
                         .ok_or(crate::CreateExecutionServiceError::MissingWorkerExecutable)?,
+                    identity_policy,
                 ))
             }
             #[cfg(not(target_os = "linux"))]

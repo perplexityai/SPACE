@@ -23,6 +23,7 @@ fn identity_router() -> FilesystemRouter {
     FilesystemRouter::new(
         FilesystemExecutionMode::IdentityWorkers,
         Some(crate::WorkerExecutable::open("/proc/self/exe").expect("test executable")),
+        crate::IdentityPolicy::Guest,
         current_user(),
         CancellationToken::new(),
         super::DEFAULT_CANCELLATION_GRACE,

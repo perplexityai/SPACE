@@ -32,6 +32,7 @@ pplx-space-spaced-guest-protocol = { workspace = true }
 pplx-space-test-env = { workspace = true }
 futures-util = "0.3"
 nix = { workspace = true, features = ["user", "fs"] }
+rustix = { workspace = true, features = ["fs", "thread"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time"] }
 tokio-stream = { workspace = true, features = ["net"] }

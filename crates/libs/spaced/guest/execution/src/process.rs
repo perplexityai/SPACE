@@ -2042,7 +2042,7 @@ impl Process for ExecutionService {
         if !uses_pty {
             command.process_group(0);
         }
-        account.configure_child_credentials(&mut command)?;
+        account.configure_child_credentials(&mut command, self.inner.identity_policy)?;
         let mut prepared_pty = pty_config
             .map(|pty_config| prepare_pty(pty_config.size))
             .transpose()?;

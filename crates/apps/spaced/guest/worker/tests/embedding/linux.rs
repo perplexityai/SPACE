@@ -89,6 +89,7 @@ fn children() -> Vec<u32> {
 }
 
 pub(super) async fn run() {
+    let host_identity = super::identity::current_status();
     let standalone = std::process::Command::new(env!("CARGO_BIN_EXE_spaced-filesystem-worker"))
         .env_clear()
         .output()
@@ -139,13 +140,27 @@ pub(super) async fn run() {
     assert_eq!(children().len(), 1, "one resident worker");
     client
         .stat_info(StatRequest {
-            path: path.display().to_string(),
+            path: "/".into(),
             user: Some("root".into()),
         })
         .await
         .expect("second identity");
     assert_eq!(children().len(), 2, "separate worker per identity");
     for pid in children() {
+        let status =
+            std::fs::read_to_string(format!("/proc/{pid}/status")).expect("worker credentials");
+        let status = super::identity::status(&status);
+        let uid = status["Uid"]
+            .split_whitespace()
+            .next()
+            .expect("uid")
+            .parse()
+            .expect("numeric uid");
+        let selected = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+            .expect("worker account")
+            .expect("installed account");
+        assert!(selected.uid == account.uid || selected.uid.is_root());
+        super::identity::assert_restricted(&status, &selected);
         assert_eq!(
             std::fs::read_to_string(format!("/proc/{pid}/comm"))
                 .expect("worker name")
@@ -202,6 +217,16 @@ pub(super) async fn run() {
     }
     assert!(exited);
     assert_eq!(output, format!("{}\nonce", account.uid).as_bytes());
+    // Even root has no DAC override in restricted mode.
+    let error = client
+        .stat_info(StatRequest {
+            path: path.display().to_string(),
+            user: Some("root".into()),
+        })
+        .await
+        .expect_err("root worker must respect another account's directory permissions");
+    assert_eq!(error.code(), tonic::Code::PermissionDenied);
+    super::identity::check_processes(&service, &account).await;
     drop(client);
     stop(service, shutdown, server).await;
 
@@ -256,4 +281,9 @@ pub(super) async fn run() {
     request.abort();
     assert!(request.await.expect_err("caller cancelled").is_cancelled());
     stop(service, shutdown, server).await;
+    assert_eq!(
+        super::identity::current_status(),
+        host_identity,
+        "host authority must remain unchanged"
+    );
 }

@@ -2,6 +2,9 @@
 #![cfg(test)]
 
 #[cfg(target_os = "linux")]
+#[path = "embedding/identity.rs"]
+mod identity;
+#[cfg(target_os = "linux")]
 #[path = "embedding/incompatible.rs"]
 mod incompatible;
 #[cfg(target_os = "linux")]
@@ -10,6 +13,9 @@ mod linux;
 
 #[cfg(target_os = "linux")]
 fn main() {
+    if identity::probe() {
+        return;
+    }
     // An intentionally wrong artifact used to test cancellation during startup.
     // The successful path must execute the dedicated binary, never this branch.
     if pplx_space_spaced_guest_execution::filesystem_worker_requested() {
@@ -30,6 +36,7 @@ fn main() {
     if !pplx_space_test_env::root_or_skip("identity-worker embedding") {
         return;
     }
+    identity::prepare_host();
     tokio::runtime::Runtime::new()
         .expect("runtime")
         .block_on(async {
