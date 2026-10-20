@@ -16,6 +16,11 @@ Callers can add their own package without modifying this inventory by setting
 `SPACE_SMOKE_SCENARIO_PACKAGES` to a comma-separated list of scenario packages.
 Each module in an extension package follows the same one-scenario contract.
 
+New smoke tests against a SPACE deployment belong here or in an extension
+package, not in untyped scripts or inline CI commands. The `space-validation`
+skill's smoke-testing reference owns the authoring rules and the migration
+contract for existing untyped smoke tests.
+
 Scenario-owned sandboxes default to pause-on-timeout with auto-resume disabled.
 This is the smoke framework's default, not the ECW API's omitted-field default.
 It preserves state for explicit reconnect and cleanup.

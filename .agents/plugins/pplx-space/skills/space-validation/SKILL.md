@@ -9,6 +9,11 @@ Choose the narrowest environment and suite that proves the affected behavior.
 Do not claim Firecracker, jailer, cgroup, namespace, btrfs, shim, or Kubernetes
 substrate proof from a macOS-only run.
 
+New smoke tests against a SPACE deployment (Kind or deployed) must be typed
+Python `space_smoke` scenarios; existing untyped smoke tests may be maintained in
+place. [Smoke testing](references/smoke-testing.md#authoring-smoke-coverage)
+owns the authoring and migration rules.
+
 ## Select conditional guidance
 
 Read only the references that match the task:

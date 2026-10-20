@@ -88,6 +88,28 @@ owning layer. If the only failure is "the configured value or file layout
 changed", reject the test; renaming it or wrapping it in a renderer does not fix
 the gap.
 
+## Smoke tests: reviewer stop rule
+
+Reject new smoke tests against a SPACE deployment (Kind or deployed) outside the
+typed `space_smoke` framework, in any language. Component and substrate smokes
+that run without a deployment are out of scope. Inspect new and existing
+scripts, inline CI/configuration commands, and embedded shell snippets: a new
+test belongs in the typed framework even when added to an existing file.
+
+Existing untyped smoke tests may be updated. A change adds a new test when it
+asserts a contract the existing suite didn't already cover. Changes that keep an
+existing check working, or strengthen a contract it already asserts, are
+maintenance, so new lines, actions, polling, or assertions alone aren't
+violations. Don't require piecemeal splitting or immediate migration as a
+condition of maintenance.
+
+Allow thin shell wrappers that bootstrap the environment or launch the typed
+runner and propagate its exit status. A rejection should identify the new untyped
+test and request its typed scenario or framework implementation. The
+[smoke guidance](../../space-validation/references/smoke-testing.md#authoring-smoke-coverage)
+owns where scenarios live, which boundary rules framework extensions follow, and
+the migration contract.
+
 ## One contract clause, one test
 
 Test the *contract* — the promise callers rely on — not the implementation's
@@ -142,7 +164,7 @@ about *ownership of claims*, not file locations.
 | **Unit** (sibling `tests.rs`) | private invariants, parsing, state machines, pure logic; milliseconds, no containers | reach for Postgres/Redis when the logic is testable without them |
 | **DB-backed unit** (`pg_test_db()` / `raw_pg_test_db()`) | SQL semantics *as the contract*: row lifecycles, constraints, query correctness | re-test Rust logic a plain unit test covers; the container is for the SQL |
 | **Integration** (`crates/<crate>/tests/`, reserved per space-conventions) | public-API-only guards, binary spawns, multi-file harnesses | become a default home for unit tests; each file is a separately-linked binary |
-| **Smoke** (`space_smoke`, kind, live suites) | cross-service outcomes on a real substrate: does the *platform* do it | re-assert translation/validation logic the unit layers pin; smokes are for substrate truth |
+| **Smoke** (`space_smoke` scenarios and legacy suites on Kind or a live deployment) | cross-service outcomes on a real substrate: does the *platform* do it | re-assert translation/validation logic the unit layers pin; smokes are for substrate truth |
 
 Where a lower layer owns a shape (the golden pod-spec snapshots in
 `crates/libs/common/core/src/fixtures/`), higher-layer tests assert only

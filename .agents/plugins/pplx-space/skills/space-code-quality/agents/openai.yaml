@@ -1,3 +1,3 @@
 interface:
   display_name: "SPACE Code Quality"
-  short_description: "Tests, snapshots, comments, and review fixes"
+  short_description: "Write and review tests, smoke coverage, and code quality"

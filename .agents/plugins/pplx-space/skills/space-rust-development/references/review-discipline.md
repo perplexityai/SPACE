@@ -9,6 +9,10 @@ no N/A explanations in the PR.
 
 ## Conditional review
 
+### Tests and smoke coverage
+
+- [ ] Test or CI changes follow the [smoke reviewer stop rule](../../space-code-quality/references/test-economy.md#smoke-tests-reviewer-stop-rule): no new deployment smoke tests outside the typed `space_smoke` framework; maintenance of existing untyped ones is allowed.
+
 ### Boundaries and types
 
 - [ ] No new `match action { "foo" => ..., _ => bad_request }` over a closed set of strings. Use an enum with `impl FromStr` + `Display` + instance-method predicates (e.g. `fn affects_lifecycle(self) -> bool`). See §1 in the SPACE lessons.

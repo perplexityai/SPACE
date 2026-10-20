@@ -78,6 +78,11 @@ further progress requires permission or an external change.
 
 ## Validation
 
+New smoke tests against a SPACE deployment (Kind or deployed) are always typed
+Python `space_smoke` scenarios; existing untyped smoke tests may be maintained in
+place. The `space-validation` smoke-testing reference owns the authoring rules,
+and the `space-code-quality` test-economy reference owns the reviewer stop rule.
+
 Choose checks that prove the affected behavior. Documentation-only changes do
 not require workspace code checks. Dependency skips are not final evidence when
 the required services can be started. Use `space-validation` when the correct

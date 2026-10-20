@@ -1,6 +1,6 @@
 ---
 name: space-code-quality
-description: "Apply SPACE test, snapshot, regression-fix, and durable-comment conventions, including test selection for configuration-only changes."
+description: "Write or review SPACE tests, smoke coverage, snapshots, regression fixes, and durable comments, including test selection for configuration-only changes."
 ---
 
 # Maintain SPACE code quality
@@ -18,6 +18,9 @@ evidence instead of adding a surrogate test.
 
 ## Tests
 
+- Reject new deployment smoke tests (Kind or deployed) outside the typed
+  `space_smoke` framework; allow maintenance of existing untyped ones. Apply the
+  [smoke reviewer stop rule](references/test-economy.md#smoke-tests-reviewer-stop-rule).
 - Avoid long wall-clock sleeps and artificial per-item latency in routine
   tests. Prefer virtual or injected time for timer behavior, and explicit
   synchronization or bounded condition waits for asynchronous readiness.
