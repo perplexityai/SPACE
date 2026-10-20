@@ -1489,3 +1489,5 @@ fn test_route_ed25519_authority() -> Arc<SpaceApiRouteEd25519Authority> {
         Arc::new(SpaceApiRouteEd25519Authority::load_required_from_environment(&env).unwrap())
     }
 }
+
+mod keyed_queue;

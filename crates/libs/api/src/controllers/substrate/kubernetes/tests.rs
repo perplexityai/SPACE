@@ -5278,6 +5278,58 @@ mod kubernetes_tests {
         Ok(())
     }
 
+    /// Under the dispatcher's retry deferral the same fence-blocked re-drive
+    /// returns its retryable error at once instead of pacing laps through a
+    /// long readiness budget, so the caller can hand back its slot.
+    #[tokio::test(flavor = "current_thread")]
+    async fn deferred_conflict_redrive_returns_without_waiting_out_the_budget()
+    -> Result<(), BoxError> {
+        // Arrange.
+        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+        let pool = db.pool.clone();
+        let sandbox_id = SandboxId::new();
+        insert_test_sandbox_row(&pool, sandbox_id, "suspended").await?;
+        sqlx::query(
+            "INSERT INTO sandbox_k8s_executions
+                 (sandbox_id, generation, pod_name, pod_namespace, pod_ip, state, active)
+             VALUES ($1, 1, 'space-sbx-ghost-g1', 'space', '127.0.0.1', 'creating', TRUE)",
+        )
+        .bind(sandbox_id)
+        .execute(&pool)
+        .await?;
+        let sandbox = fetch_sandbox(&pool, sandbox_id)
+            .await?
+            .expect("inserted sandbox must be visible");
+        let (substrate, request_count) = substrate_with_failed_pod_creates(pool);
+
+        // Act.
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::retry_deferral::defer_retry_waits(
+                substrate.wake_execution_with_metric_identity(
+                    &sandbox,
+                    Duration::from_secs(60),
+                    SandboxApiMetricIdentity::ecw("connect"),
+                    crate::controllers::substrate::RecoveryCharge::Exempt,
+                ),
+            ),
+        )
+        .await
+        .expect("a deferred re-drive must not wait out its 60s readiness budget");
+
+        // Assert.
+        let error = match result {
+            Ok(_) => panic!("a fence-blocked wake cannot win the claim"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, SubstrateError::RestoreInFlight { .. }),
+            "expected a retryable error, got {error:?}"
+        );
+        assert_eq!(request_count.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn follower_losing_expiry_reclaim_keeps_original_budget_and_new_lease_hint()
     -> Result<(), BoxError> {

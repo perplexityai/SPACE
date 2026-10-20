@@ -10,7 +10,7 @@ use std::future::Future;
 use std::time::{Duration, Instant};
 
 use pplx_space_common_core::types::time::format_simple_duration;
-use pplx_space_public_api::{OperationKind, OperationState, PublicErrorCode};
+use pplx_space_public_api::{OperationId, OperationKind, OperationState, PublicErrorCode};
 use tokio::time::MissedTickBehavior;
 
 use crate::public_operations::{
@@ -27,6 +27,10 @@ pub const DEFAULT_CLAIM_STALE_AFTER: Duration = Duration::from_secs(60);
 pub const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(5);
 pub const DEFAULT_MAX_RETRY_ATTEMPTS: i32 = 16;
 pub const DEFAULT_M1_MAX_AGE: Duration = Duration::from_secs(1_800);
+/// First counted-retry backoff ceiling; each later counted retry doubles it.
+pub const DEFAULT_RETRY_BACKOFF_BASE: Duration = Duration::from_secs(2);
+/// Largest counted-retry backoff ceiling.
+pub const DEFAULT_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
 fn m1_deadline_message(max_age_seconds: u64) -> String {
     let max_age = format_simple_duration(Duration::from_secs(max_age_seconds));
@@ -72,6 +76,7 @@ pub fn execution_span(operation: &ClaimedPublicOperation) -> tracing::Span {
         origin_sampled = tracing::field::Empty,
         otel.status_code = tracing::field::Empty,
         otel.status_description = tracing::field::Empty,
+        retry_backoff_ms = tracing::field::Empty,
     );
     if let Some(traceparent) = operation.traceparent.as_deref() {
         pplx_space_observability::trace_propagation::link_root_to_origins(&span, [traceparent]);
@@ -85,6 +90,10 @@ pub struct OperationExecutionConfig {
     pub retry_after: Duration,
     pub max_retry_attempts: i32,
     pub m1_max_age: Option<Duration>,
+    /// Counted retries back off exponentially from this ceiling, with
+    /// jitter, but never sooner than the executor's own retry hint.
+    pub retry_backoff_base: Duration,
+    pub retry_backoff_max: Duration,
 }
 
 impl Default for OperationExecutionConfig {
@@ -94,6 +103,8 @@ impl Default for OperationExecutionConfig {
             retry_after: DEFAULT_RETRY_AFTER,
             max_retry_attempts: DEFAULT_MAX_RETRY_ATTEMPTS,
             m1_max_age: Some(DEFAULT_M1_MAX_AGE),
+            retry_backoff_base: DEFAULT_RETRY_BACKOFF_BASE,
+            retry_backoff_max: DEFAULT_RETRY_BACKOFF_MAX,
         }
     }
 }
@@ -390,18 +401,57 @@ where
                         OperationState::Failed.as_str(),
                         executor_label,
                     );
+                    pplx_space_metrics::operations::retry_exhausted(
+                        api_product_label,
+                        kind.as_str(),
+                    );
+                    tracing::warn!(
+                        operation_id = %operation_id,
+                        api_product = api_product_label,
+                        kind = kind.as_str(),
+                        retry_reason,
+                        attempts,
+                        max_retry_attempts = config.max_retry_attempts.max(1),
+                        "public operation failed after exhausting its retry attempts"
+                    );
                 }
                 updated
             } else {
+                let retry_hint = result
+                    .retry_after
+                    .filter(|retry_after| !retry_after.is_zero())
+                    .unwrap_or(config.retry_after);
+                // A transient failure backs off per operation, so one
+                // repeatedly failing sandbox is retried ever more rarely
+                // instead of at its executor's fixed hint; budget-preserving
+                // requeues keep the executor's pacing.
+                let retry_after = if preserve_retry_budget {
+                    retry_hint
+                } else {
+                    let backoff = counted_retry_backoff(
+                        operation_id,
+                        attempts,
+                        retry_hint,
+                        config.retry_backoff_base,
+                        config.retry_backoff_max,
+                    );
+                    pplx_space_metrics::operations::retry_backoff(
+                        api_product_label,
+                        kind.as_str(),
+                        backoff.as_secs_f64(),
+                    );
+                    backoff
+                };
+                tracing::Span::current().record(
+                    "retry_backoff_ms",
+                    u64::try_from(retry_after.as_millis()).unwrap_or(u64::MAX),
+                );
                 let updated = store
                     .release_claimed_operation(ReleaseClaimedPublicOperation {
                         claim_token,
                         operation_id,
                         progress_message,
-                        retry_after: result
-                            .retry_after
-                            .filter(|retry_after| !retry_after.is_zero())
-                            .unwrap_or(config.retry_after),
+                        retry_after,
                         // Expected workflow progress and activation admission
                         // waits do not consume the transient-failure budget.
                         count_attempt: !preserve_retry_budget,
@@ -430,6 +480,38 @@ where
     }
 
     Ok(report)
+}
+
+/// The delay before the next attempt after counted attempt `attempts`
+/// failed: an equal-jitter exponential backoff whose ceiling starts at
+/// `base` and doubles to `max`, floored at the executor's `hint`. The jitter
+/// is derived from the operation and attempt, so operations that failed
+/// together spread apart while one operation's schedule stays reproducible.
+pub fn counted_retry_backoff(
+    operation_id: OperationId,
+    attempts: i32,
+    hint: Duration,
+    base: Duration,
+    max: Duration,
+) -> Duration {
+    if base.is_zero() {
+        return hint;
+    }
+    let doublings = u32::try_from(attempts.saturating_sub(1).clamp(0, 20)).unwrap_or(0);
+    let ceiling = base.saturating_mul(1_u32 << doublings).min(max.max(base));
+    let half = ceiling / 2;
+    let jittered = half + half.mul_f64(retry_jitter_fraction(operation_id, attempts));
+    jittered.max(hint)
+}
+
+fn retry_jitter_fraction(operation_id: OperationId, attempts: i32) -> f64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    operation_id.to_string().hash(&mut hasher);
+    attempts.hash(&mut hasher);
+    // The top 53 bits fill an f64 mantissa exactly: a fraction in [0, 1).
+    (hasher.finish() >> 11) as f64 / (1_u64 << 53) as f64
 }
 
 fn retry_budget_exhausted(attempts: i32, max_retry_attempts: i32) -> bool {

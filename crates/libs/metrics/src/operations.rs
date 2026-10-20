@@ -158,3 +158,27 @@ pub fn dispatcher_slots(in_flight: usize, capacity: usize) {
     gauge("operations.dispatcher.in_flight", in_flight as f64, &[]);
     gauge("operations.dispatcher.capacity", capacity as f64, &[]);
 }
+
+/// Backoff chosen when a counted retry hands its slot back.
+pub fn retry_backoff(api_product: &str, kind: &str, seconds: f64) {
+    distribution(
+        "operations.retry_backoff_seconds",
+        seconds,
+        &[tag("api_product", api_product), tag("kind", kind)],
+    );
+}
+
+/// An operation terminally failed because it used its retry budget.
+pub fn retry_exhausted(api_product: &str, kind: &str) {
+    counter(
+        "operations.retry_exhausted",
+        1,
+        &[tag("api_product", api_product), tag("kind", kind)],
+    );
+}
+
+/// A step that would have slept before retrying returned to the
+/// dispatcher instead, freeing its execution slot. `site` names the step.
+pub fn retry_wait_deferred(site: &str) {
+    counter("operations.retry_wait_deferred", 1, &[tag("site", site)]);
+}

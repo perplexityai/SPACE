@@ -1127,18 +1127,22 @@ impl KubernetesSubstrate {
                     let run_sandbox = wake_sandbox.clone();
                     let handling = restore_claim_handling.clone();
                     let wake_trace = crate::wake_trace::current();
-                    crate::wake_trace::scope(wake_trace, async move {
-                        substrate
-                            .wake_execution_uncoalesced(
-                                &run_sandbox,
-                                timeout,
-                                metric_identity,
-                                None,
-                                target,
-                                handling,
-                            )
-                            .await
-                    })
+                    let retry_waits_deferred = crate::retry_deferral::retry_waits_deferred();
+                    crate::wake_trace::scope(
+                        wake_trace,
+                        crate::retry_deferral::scope(retry_waits_deferred, async move {
+                            substrate
+                                .wake_execution_uncoalesced(
+                                    &run_sandbox,
+                                    timeout,
+                                    metric_identity,
+                                    None,
+                                    target,
+                                    handling,
+                                )
+                                .await
+                        }),
+                    )
                 })
                 .await;
             // The owner already recorded its plan in the detached run. Only
@@ -1196,6 +1200,15 @@ impl KubernetesSubstrate {
                         metric_identity,
                         outcome,
                     );
+                    if crate::retry_deferral::retry_waits_deferred() {
+                        pplx_space_metrics::operations::retry_wait_deferred(
+                            "coalesced_wake_rerace",
+                        );
+                        return Err(SubstrateError::restore_in_flight(format!(
+                            "sandbox {sandbox_id} coalesced wake run failed; deferring \
+                             the retry to the caller"
+                        )));
+                    }
                     if tokio::time::timeout_at(
                         join_deadline,
                         tokio::time::sleep(rerace_backoff.next_delay()),
@@ -1332,6 +1345,15 @@ impl KubernetesSubstrate {
                     // `Conflict`, not `RestoreInFlight`, so this lap has no
                     // other sleep or deadline check — pace it inside the
                     // readiness budget and stop when the budget elapses.
+                    if crate::retry_deferral::retry_waits_deferred() {
+                        pplx_space_metrics::operations::retry_wait_deferred(
+                            "restore_claim_conflict",
+                        );
+                        return Err(SubstrateError::restore_in_flight(format!(
+                            "sandbox {sandbox_id} restore claim is unavailable; deferring \
+                             the retry to the caller"
+                        )));
+                    }
                     if tokio::time::timeout_at(
                         join_deadline,
                         tokio::time::sleep(join_backoff.next_delay()),

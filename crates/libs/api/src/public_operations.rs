@@ -71,6 +71,9 @@ fn update_claimed_payload_sql() -> &'static str {
     )
 }
 const DEFAULT_IDEMPOTENCY_TTL_HOURS: i64 = 24;
+/// Advisory transaction lock that serializes dispatcher claims across
+/// controller replicas so the keyed-claim rule sees every committed claim.
+pub const PUBLIC_OPERATION_CLAIM_LOCK_KEY: i64 = 0x7370_6163_655f_6f70;
 
 mod responses;
 pub(crate) use responses::ResponseAdmissionError;
@@ -1187,6 +1190,18 @@ impl ClaimedPublicOperation {
         };
         Some(sandbox_id.to_string())
     }
+
+    /// The work-queue key the dispatcher serializes on: the `sbx_<uuid>`
+    /// target of a sandbox operation. A fork, and any operation that names
+    /// no sandbox, has no key and never waits on another operation.
+    pub fn work_key(&self) -> Option<&str> {
+        if self.target_type != Some(OperationTargetType::Sandbox)
+            || self.kind == OperationKind::ForkSandbox
+        {
+            return None;
+        }
+        self.target_id.as_deref()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1433,24 +1448,80 @@ async fn claim_operations(
         .collect::<Vec<_>>();
 
     let mut tx = pool.begin().await?;
-    // Claim in order of when each operation became claimable, so a requeued
-    // retry waits behind work that was queued before its backoff expired.
+    // The key rule below reads other rows' claim state, which a concurrent
+    // claim may be changing. One claimer at a time makes every claim see
+    // the previous claim's commit; a busy lock means another replica is
+    // mid-claim, so this tick claims nothing rather than waiting.
+    let claim_lock_held =
+        sqlx::query_scalar::<_, bool>(sql!("SELECT pg_try_advisory_xact_lock($1)"))
+            .bind(PUBLIC_OPERATION_CLAIM_LOCK_KEY)
+            .fetch_one(&mut *tx)
+            .await?;
+    if !claim_lock_held {
+        tx.rollback().await?;
+        return Ok(PublicOperationClaim {
+            claim_token,
+            operations: Vec::new(),
+        });
+    }
+    // Keyed claim: operations on one sandbox run one at a time in request
+    // order, and operations on different sandboxes never wait on each other.
+    // A candidate is held back while another operation on its key is
+    // running under a live claim, or was requested earlier and is still
+    // queued or stale. A delete is held back only by an earlier create or
+    // by an earlier operation due now, so a delete is not stuck behind a
+    // wake that is waiting out its retry backoff. Forks name their source
+    // by a different id form and keep their own source lifecycle lock, so
+    // they stay outside the key. Across keys, claim in order of when each
+    // operation became claimable, so a requeued retry waits behind work
+    // that was queued before its backoff expired.
     let rows = sqlx::query_as::<_, DispatcherClaimRow>(sql!(
         "WITH picked AS (
-             SELECT operation_id,
-                    GREATEST(requested_at, next_attempt_at) AS claimable_at,
-                    claim_token <> '' AS reclaimed
-             FROM public_operations
-             WHERE state IN ($4, $5)
-               AND kind = ANY($6)
-               AND next_attempt_at <= NOW()
+             SELECT candidate.operation_id,
+                    GREATEST(candidate.requested_at, candidate.next_attempt_at) AS claimable_at,
+                    candidate.claim_token <> '' AS reclaimed
+             FROM public_operations candidate
+             WHERE candidate.state IN ($4, $5)
+               AND candidate.kind = ANY($6)
+               AND candidate.next_attempt_at <= NOW()
                AND (
-                   claim_token = ''
-                   OR claimed_at <= NOW() - make_interval(secs => $2::BIGINT)
+                   candidate.claim_token = ''
+                   OR candidate.claimed_at <= NOW() - make_interval(secs => $2::BIGINT)
                )
-             ORDER BY next_attempt_at ASC, requested_at ASC, operation_id ASC
+               AND NOT (
+                   candidate.target_type = $7
+                   AND candidate.target_id IS NOT NULL
+                   AND candidate.kind <> $8
+                   AND EXISTS (
+                       SELECT 1
+                       FROM public_operations other
+                       WHERE other.org_id = candidate.org_id
+                         AND other.target_type = candidate.target_type
+                         AND other.target_id = candidate.target_id
+                         AND other.operation_id <> candidate.operation_id
+                         AND other.state IN ($4, $5)
+                         AND other.kind <> $8
+                         AND (
+                             (
+                                 other.state = $5
+                                 AND other.claim_token <> ''
+                                 AND other.claimed_at > NOW() - make_interval(secs => $2::BIGINT)
+                             )
+                             OR (
+                                 (other.requested_at, other.operation_id)
+                                     < (candidate.requested_at, candidate.operation_id)
+                                 AND (
+                                     candidate.kind <> $9
+                                     OR other.kind = $10
+                                     OR other.next_attempt_at <= NOW()
+                                 )
+                             )
+                         )
+                   )
+               )
+             ORDER BY candidate.next_attempt_at ASC, candidate.requested_at ASC, candidate.operation_id ASC
              LIMIT $1
-             FOR UPDATE SKIP LOCKED
+             FOR UPDATE OF candidate SKIP LOCKED
          )
          UPDATE public_operations o
          SET state = $5,
@@ -1487,6 +1558,10 @@ async fn claim_operations(
     .bind(OperationState::Queued.as_str())
     .bind(OperationState::Running.as_str())
     .bind(&kind_labels)
+    .bind(OperationTargetType::Sandbox.as_str())
+    .bind(OperationKind::ForkSandbox.as_str())
+    .bind(OperationKind::DeleteSandbox.as_str())
+    .bind(OperationKind::CreateSandbox.as_str())
     .fetch_all(&mut *tx)
     .await?;
 
