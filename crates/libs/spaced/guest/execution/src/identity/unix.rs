@@ -73,8 +73,9 @@ impl GuestAccount {
         _policy: crate::IdentityPolicy,
         cwd: &Path,
     ) -> Result<(), Status> {
-        command.current_dir(cwd);
         use nix::unistd::{Gid, Uid};
+
+        command.current_dir(cwd);
 
         if Uid::effective().as_raw() == self.uid && Gid::effective().as_raw() == self.gid {
             Ok(())

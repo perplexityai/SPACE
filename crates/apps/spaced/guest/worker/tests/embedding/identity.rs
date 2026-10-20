@@ -4,7 +4,8 @@ use std::os::unix::process::CommandExt;
 
 use futures_util::StreamExt;
 use pplx_space_spaced_guest_execution::{
-    CreateExecutionServiceError, ExecutionService, ExecutionServiceConfig, WorkerExecutable,
+    CreateExecutionServiceError, ExecutionService, ExecutionServiceConfig,
+    RunFilesystemWorkerError, WorkerExecutable,
 };
 use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
     PtyConfig, StartRequest, process_event::Event, process_exit::Outcome, process_server::Process,
@@ -98,7 +99,10 @@ pub(super) fn probe() -> bool {
             let error = pplx_space_spaced_guest_execution::run_filesystem_worker_from_environment()
                 .expect_err("threaded worker must fail before changing credentials");
             assert!(
-                error.to_string().contains("must start single-threaded"),
+                matches!(
+                    error,
+                    RunFilesystemWorkerError::RequiresSingleThreadedStartup
+                ),
                 "{error}"
             );
             assert_host_unchanged(&before);

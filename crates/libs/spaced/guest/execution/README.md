@@ -55,8 +55,10 @@ execution metadata.
   set-ID and file-capability executables from granting additional authority.
   Accounts resolving to UID 0 are rejected with `FailedPrecondition` for both
   process and filesystem calls: root retains ownership and signal authority even
-  without capabilities. Process children enter their working directory only after
-  the drop, enforcing the account's access to every ancestor. The capability
+  without capabilities. Primary and supplementary groups, including GID 0, are
+  preserved: callers must provision accounts whose group-based access is appropriate
+  for the workload. Process children enter their working directory only after the
+  drop, enforcing the account's access to every ancestor. The capability
   bounding set is retained as a ceiling; it grants no active capabilities.
   Only child credentials change, before worker threads or command exec. Custom
   entrypoints must dispatch worker mode before starting threads; restricted
@@ -94,7 +96,8 @@ sets with and without a PTY, set-ID/file-capability privilege suppression,
 root-account and launcher rejection, working-directory traversal, late worker
 entrypoint rejection, and unchanged authority on every surviving host thread.
 Run it as root in a disposable environment with a provisioned `nobody` account,
-`CAP_NET_RAW` and `CAP_SETFCAP`, and a writable filesystem that supports executable set-ID and file capabilities (not `nosuid`), using
+`CAP_NET_RAW` and `CAP_SETFCAP`, and a writable filesystem that supports executable
+set-ID and file capabilities (not `nosuid`), using
 `cargo test -p pplx-space-spaced-guest-worker --test embedding`.
 CI assigns it to the privileged test group. Broader embedding acceptance remains
 tracked by the RFC.

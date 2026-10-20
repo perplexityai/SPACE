@@ -56,17 +56,27 @@ pub enum FilesystemExecutionMode {
 
 /// Failure while starting the optional filesystem worker subprocess mode.
 #[derive(Debug, thiserror::Error)]
-#[error("filesystem worker startup failed: {source}")]
-pub struct RunFilesystemWorkerError {
-    #[source]
-    source: Box<dyn std::error::Error + Send + Sync + 'static>,
+pub enum RunFilesystemWorkerError {
+    /// Dispatch restricted worker mode before starting application threads.
+    #[error("restricted filesystem worker must start single-threaded")]
+    RequiresSingleThreadedStartup,
+    #[error("filesystem worker startup failed: {source}")]
+    Startup {
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
 }
 
 impl RunFilesystemWorkerError {
     #[cfg(target_os = "linux")]
     fn new(source: filesystem::FilesystemWorkerError) -> Self {
-        Self {
-            source: Box::new(source),
+        match source {
+            filesystem::FilesystemWorkerError::MultipleThreads => {
+                Self::RequiresSingleThreadedStartup
+            }
+            source => Self::Startup {
+                source: Box::new(source),
+            },
         }
     }
 }
