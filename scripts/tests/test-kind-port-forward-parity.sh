@@ -164,7 +164,7 @@ TILT
     API_URL=http://localhost:8080
     KIND_STACK_DETACH=1
     SKIP_BOOTSTRAP=0
-    unset SPACE_KIND_STORAGE_CREDENTIALS
+    unset SPACE_KIND_STORAGE_CREDENTIALS SPACE_KIND_RUST_BUILD
     source "$repo_root/scripts/tests/lib/bootstrap-kind-stack.sh"
 
     pgrep() { return 0; }
@@ -174,9 +174,16 @@ TILT
         [[ "$*" == 'get clusters' ]] || return 1
         printf '%s\n' "$KIND_CLUSTER"
     }
-    # The cluster runs the requested storage credentials mode: the authority's
-    # label and the worker volume-manager's env agree with the default. Every
-    # other cluster read fails.
+    # The cluster runs the requested storage credentials mode and Rust build:
+    # the authority's label, the worker volume-manager's env and the build
+    # deployed-rust-build.py reads agree with the defaults. Every other cluster
+    # read fails.
+    python3() {
+        case "$*" in
+            *deployed-rust-build.py*) echo test-hooks ;;
+            *) command python3 "$@" ;;
+        esac
+    }
     kubectl() {
         case "$*" in
             *" get deployments -l app.kubernetes.io/name=space-credmgr-authority "*) printf 'exchange|' ;;

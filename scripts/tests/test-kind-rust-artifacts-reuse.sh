@@ -27,13 +27,14 @@ fail() {
     status=1
 }
 
-# The fake checkout: the real script, its libraries and sync helper, and a build stage whose
+# The fake checkout: the real script, its cache, shared-input and Rust build libraries and sync helper, and a build stage whose
 # COPY list ends with an input the cases can take away.
 repo="$work/repo"
 mkdir -p "$repo/infra/space/kind/scripts" "$repo/infra/space/kind/lib" "$repo/docker" "$repo/crates/a/src"
 cp "$script_src" "$repo/infra/space/kind/scripts/"
 cp "$repo_root/infra/space/kind/lib/build-cache.sh" "$repo_root/infra/space/kind/lib/shared-build-inputs.sh" \
     "$repo/infra/space/kind/lib/"
+cp "$repo_root/infra/space/kind/lib/rust-build.sh" "$repo/infra/space/kind/lib/"
 cp "$repo_root/infra/space/kind/scripts/sync-rust-sources.py" "$repo/infra/space/kind/scripts/"
 cat >"$repo/docker/Dockerfile.rust-build-kind" <<'EOF'
 FROM chef AS cook
@@ -88,6 +89,7 @@ inputs=(Cargo.toml crates late-input)
 # The record a completed assembly of this checkout would have written, computed
 # by the script's own variable block and key function.
 key="$(cd "$repo" && bash -c '
+    RUST_BUILD=test-hooks
     eval "$(sed -n "/^ARTIFACT_IMAGE=/,/^RUNTIME_LIBC_IMAGE=/p" "$1")"
     eval "$(sed -n "/^assembly_key()/,/^}/p" "$1")"
     assembly_key' _ infra/space/kind/scripts/build-rust-artifacts.sh)"

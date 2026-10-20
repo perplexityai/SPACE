@@ -50,6 +50,11 @@ rootfsBackingPolicy: ""
 #
 # A change here rolls template-manager only; the sandboxes on the node keep
 # running.
+#
+# The GC interval and grace and the prefetch latest-N are test hooks
+# (`GcConfig::from_env` in eviction.rs, `LATEST_N_TEST_HOOK` in prefetch.rs);
+# the release lane (`rustBuild: release`) renders only the budget, which
+# release binaries read.
 templateCache:
   budgetBytes: "1610612736"
   gcIntervalSecs: "15"

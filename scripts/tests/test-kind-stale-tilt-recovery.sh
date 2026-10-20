@@ -123,15 +123,22 @@ TILT
         # Its own knob rather than SPACE_TILT_PIDFILE, so a value inherited
         # from the box running this test can never name a real pidfile.
         SPACE_TILT_PIDFILE="${TEST_TILT_PIDFILE:-$work/no-such-pidfile}"
-        unset SPACE_KIND_STORAGE_CREDENTIALS
+        unset SPACE_KIND_STORAGE_CREDENTIALS SPACE_KIND_RUST_BUILD
         source "$repo_root/scripts/tests/lib/bootstrap-kind-stack.sh"
 
         pgrep() { return 0; }
         curl() { return 0; }
         lsof() { return 0; }
-        # The cluster runs the requested storage credentials mode: the
-        # authority's label and the worker volume-manager's env agree with the
-        # default. Every other cluster read fails.
+        # The cluster runs the requested storage credentials mode and Rust
+        # build: the authority's label, the worker volume-manager's env and the
+        # build deployed-rust-build.py reads agree with the defaults. Every
+        # other cluster read fails.
+        python3() {
+            case "$*" in
+                *deployed-rust-build.py*) echo test-hooks ;;
+                *) command python3 "$@" ;;
+            esac
+        }
         kubectl() {
             case "$*" in
                 *" get deployments -l app.kubernetes.io/name=space-credmgr-authority "*) printf 'exchange|' ;;

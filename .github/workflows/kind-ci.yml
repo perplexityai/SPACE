@@ -2,6 +2,14 @@ name: Kind CI
 
 on:
   workflow_call:
+    inputs:
+      # test-hooks, every caller's default, or release: kind-release-ci.yml's
+      # on-demand lane of binaries built without test hooks
+      # (infra/space/kind/lib/rust-build.sh). Only the release lane sets
+      # SPACE_KIND_RUST_BUILD, so the default lane runs as it always has.
+      rust_build:
+        type: string
+        default: test-hooks
 
 # The caller owns permissions: pull-ci.yml grants contents:read and
 # packages:read and actions:read; main-ci.yml grants packages:write to this call.
@@ -76,7 +84,7 @@ jobs:
       # repository variable SPACE_KIND_RUST_REUSE to `off` stops PR reuse.
       - name: Reuse main's Rust artifact image for identical inputs
         id: reuse
-        if: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main') && vars.SPACE_KIND_RUST_REUSE != 'off' }}
+        if: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main') && vars.SPACE_KIND_RUST_REUSE != 'off' && inputs.rust_build != 'release' }}
         continue-on-error: true
         run: python3 infra/space/kind/scripts/rust-artifact-handoff.py reuse ghcr.io/perplexityai/space-kind-rust-artifacts
 
@@ -85,6 +93,7 @@ jobs:
         env:
           SPACE_CI_IMAGE_MIRROR: ghcr
           SPACE_KIND_RUST_ARTIFACTS: docker
+          SPACE_KIND_RUST_BUILD: ${{ inputs.rust_build == 'release' && 'release' || '' }}
           SPACE_KIND_BUILD_CACHE_REPOSITORY: ghcr.io/perplexityai/space-kind-build-cache
           SPACE_KIND_BUILD_CACHE_WRITE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && '1' || '0' }}
         run: bash infra/space/kind/scripts/build-rust-artifacts.sh
@@ -201,6 +210,9 @@ jobs:
       # images come from the GHCR mirror; see ci/mirrored-images.txt.
       SPACE_CI_IMAGE_MIRROR: ghcr
       SPACE_KIND_RUST_ARTIFACTS: prebuilt
+      # The release lane's build, which the handoff checks on the loaded image
+      # and the bring-up and the typed smoke check on the bench.
+      SPACE_KIND_RUST_BUILD: ${{ inputs.rust_build == 'release' && 'release' || '' }}
       # The runtime images and the seed import their dependency layers from
       # the cache main writes; a miss builds them cold. Never written here.
       SPACE_KIND_BUILD_CACHE_REPOSITORY: ghcr.io/perplexityai/space-kind-build-cache

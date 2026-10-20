@@ -36,6 +36,12 @@ spec:
         app.kubernetes.io/name: {{ $name }}
         app.kubernetes.io/instance: {{ .Release.Name }}
         team: {{ .Values.datadogTeam | quote }}
+        {{- /* The Rust build this pod is rendered for (infra/space/kind/lib/rust-build.sh),
+        so a change of build rolls it; scripts/deployed-rust-build.py checks it
+        against the image the pod runs. */}}
+        {{- with .Values.rustBuild }}
+        space.pplx.net/kind-rust-build: {{ . | quote }}
+        {{- end }}
     spec:
       {{- with .Values.nodeSelector }}
       nodeSelector:

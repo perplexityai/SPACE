@@ -127,6 +127,7 @@ spec:
               value: "1"
             - name: SPACE_SBX_GC_ENGAGE_FRACTION
               value: {{ .engageFraction | quote }}
+            {{- if eq (include "space-node-service.rustBuild" $) "test-hooks" }}
             - name: SPACE_SBX_GC_TARGET_FRACTION
               value: {{ .targetFraction | quote }}
             - name: SPACE_SBX_GC_INTERVAL_SECS
@@ -135,6 +136,7 @@ spec:
               value: {{ .graceSecs | quote }}
             - name: SPACE_SBX_GC_IDLE_SECS
               value: {{ .idleSecs | quote }}
+            {{- end }}
             {{- end }}
             {{- end }}
             {{- if .Values.eppo.secretName }}

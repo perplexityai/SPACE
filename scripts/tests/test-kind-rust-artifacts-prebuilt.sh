@@ -19,6 +19,8 @@ cat >"$work/bin/docker" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 case "$*" in
+  'image inspect -f {{index .Config.Labels "space.pplx.net/kind-rust-build"}} space-rust-build-kind:local')
+    echo test-hooks ;;
   "image inspect -f {{.Id}} space-rust-build-kind:local")
     [[ -n "$STUB_IMAGE_ID" ]] || exit 1
     echo "$STUB_IMAGE_ID" ;;

@@ -101,6 +101,8 @@ or suites.
   `scripts/tests/lib/ecw-ops.sh`.
 - Object-store data remains on its node-local hostPath. Preserve that
   persistence, 40 GiB sparse worker cache, and Kind-specific disk-admission values.
+  The release-build lane (`SPACE_KIND_RUST_BUILD=release`) renders no test hook,
+  the reservation hook included; mark a scenario that needs one `test_hooks=`.
 
 ## Operational boundary
 

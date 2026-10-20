@@ -16,6 +16,19 @@ template-manager).
 {{- $role -}}
 {{- end -}}
 
+{{/*
+The Rust build the bring-up deploys (`rustBuild`, infra/space/kind/lib/rust-build.sh):
+`test-hooks`, the default, or `release`, whose binaries read no test hook
+(`pplx_space_common_core::env::test_hook`), so no chart renders one for it.
+*/}}
+{{- define "space-node-service.rustBuild" -}}
+{{- $build := .Values.rustBuild | default "test-hooks" -}}
+{{- if not (has $build (list "test-hooks" "release")) -}}
+{{- fail (printf "rustBuild must be test-hooks or release, got %q" $build) -}}
+{{- end -}}
+{{- $build -}}
+{{- end -}}
+
 {{/* DaemonSet and ServiceAccount name: space-node-manager, space-builder-node-manager, ... */}}
 {{- define "space-node-service.name" -}}
 {{- printf "%s-%s" .ctx.Release.Name .component -}}
@@ -34,11 +47,17 @@ node role but watches only `app.kubernetes.io/component=node-api`
 (crates/libs/api/src/controllers/substrate/kubernetes/caches.rs), so only the
 node-api pods become node endpoints. `space.pplx.net/node-service` lets the
 harness and diagnostics select every node-service pod at once.
+`space.pplx.net/kind-rust-build`, set when a Kind bring-up names `rustBuild`,
+records the build the pod was rendered for, so a change of build rolls it;
+infra/space/kind/scripts/deployed-rust-build.py checks it against the image.
 */}}
 {{- define "space-node-service.labels" -}}
 {{ include "space-node-service.selectorLabels" . }}
 app.kubernetes.io/part-of: space-node
 space.pplx.net/node-service: {{ .component }}
+{{- if .ctx.Values.rustBuild }}
+space.pplx.net/kind-rust-build: {{ include "space-node-service.rustBuild" .ctx }}
+{{- end }}
 team: {{ .ctx.Values.node.datadogTeam | quote }}
 {{- end -}}
 
@@ -168,8 +187,10 @@ service by TokenReview. Pair with the credmgr-token volume below.
 {{- define "space-node-service.env.diskAdmission" -}}
 - name: SPACE_NODE_DISK_ADMISSION_MIN_AVAILABLE_BYTES
   value: {{ .Values.node.diskAdmission.minAvailableBytes | quote }}
+{{- if eq (include "space-node-service.rustBuild" .) "test-hooks" }}
 - name: SPACE_NODE_DISK_ADMISSION_ALLOCATION_RESERVATION_BYTES
   value: {{ .Values.node.diskAdmission.allocationReservationBytes | quote }}
+{{- end }}
 {{- end -}}
 
 {{- define "space-node-service.env.objectStoreCredentials" -}}

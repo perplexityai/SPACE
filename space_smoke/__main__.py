@@ -41,6 +41,7 @@ def _describe(scenario_id: str) -> int:
         "ignored": scenario.ignored,
         "telemetry_mode": scenario.telemetry_mode,
         "storage_credentials": scenario.storage_credentials,
+        "test_hooks": scenario.test_hooks,
         "selected_api_surface": os.environ.get("SPACE_SMOKE_API_SURFACE", "ecw"),
         "sandbox": {
             "count": scenario.sandbox_count,
@@ -373,6 +374,10 @@ def _run_all(
     telemetry_error = telemetry_error or storage_error
     if not scenarios:
         return _mode_emptied(selection, "storage credentials mode", shard, telemetry_error)
+    scenarios, rust_build_error = _apply_rust_build(scenarios, services)
+    telemetry_error = telemetry_error or rust_build_error
+    if not scenarios:
+        return _mode_emptied(selection, "Rust build", shard, telemetry_error)
 
     environment = dict(os.environ)
     if environment.get("SPACE_SMOKE_BACKEND", "kind") == "kind":
@@ -527,6 +532,50 @@ def _apply_storage_credentials(
                 f"the bench runs {bench_mode}"
             )
     return runnable, None
+
+
+def _apply_rust_build(
+    scenarios: tuple[Scenario, ...], services: SmokeServices
+) -> tuple[tuple[Scenario, ...], str | None]:
+    """Skip the scenarios that need test hooks on a bench of release binaries.
+
+    As for the other modes, the bench's build is read from the cluster. A
+    runner that names a build (SPACE_KIND_RUST_BUILD) fails the suite when the
+    bench runs the other one, or when its build cannot be read: the release
+    lane's result means nothing on test-hook binaries.
+    """
+
+    declared = tuple(scenario for scenario in scenarios if scenario.test_hooks is not None)
+    requested = os.environ.get("SPACE_KIND_RUST_BUILD") or None
+    if not declared and requested is None:
+        return scenarios, None
+    try:
+        bench_build = services.rust_build()
+    except Exception as error:  # noqa: BLE001 - the scenarios report their own reads
+        if requested is not None:
+            return scenarios, (
+                f"SPACE_KIND_RUST_BUILD={requested}, but the bench's Rust build could not be read: "
+                f"{type(error).__name__}: {error}"
+            )
+        names = ", ".join(scenario.id for scenario in declared)
+        print(
+            f"WARN: could not read the bench's Rust build, so {names} will run: "
+            f"{type(error).__name__}: {error}",
+            file=sys.stderr,
+        )
+        return scenarios, None
+    if requested is not None and requested != bench_build:
+        return scenarios, (
+            f"SPACE_KIND_RUST_BUILD={requested}, but the bench runs the {bench_build} Rust build"
+        )
+    if bench_build != "release":
+        return scenarios, None
+    for skipped in declared:
+        print(
+            f"SKIPPED {skipped.id}: needs test hooks ({skipped.test_hooks}); "
+            "the bench runs release binaries"
+        )
+    return tuple(scenario for scenario in scenarios if scenario.test_hooks is None), None
 
 
 def _parse_shard(value: str) -> tuple[int, int]:

@@ -25,7 +25,10 @@
 #       options that import its stages (never an export), then the given
 #       arguments, which are relative to the repository root. A build that
 #       fails reading the cache or a mirrored base is built again without
-#       either, from the Dockerfile's own FROM sources.
+#       either, from the Dockerfile's own FROM sources. An image built from a
+#       Rust artifact image (--build-arg SPACE_RUST_BUILD_IMAGE=...) is
+#       labelled with that image's space.pplx.net/kind-rust-build
+#       (infra/space/kind/lib/rust-build.sh).
 #   bash infra/space/kind/scripts/runtime-image-cache.sh publish
 #       Main CI (SPACE_KIND_BUILD_CACHE_WRITE=1): build every cached stage,
 #       and the seed builder's, and export them; a failed export fails. With
@@ -36,6 +39,8 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 cd "$REPO_ROOT"
 # shellcheck source=../lib/build-cache.sh
 source "$REPO_ROOT/infra/space/kind/lib/build-cache.sh"
+# shellcheck source=../lib/rust-build.sh
+source "$REPO_ROOT/infra/space/kind/lib/rust-build.sh"
 
 log() { printf '[runtime-image-cache] %s\n' "$*" >&2; }
 die() { printf '[runtime-image-cache] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -74,10 +79,27 @@ mirror_flags() {
   space_kind_mirror_contexts "$1"
 }
 
+# The --label option that records the Rust build of the artifact image a
+# runtime build copies its binaries from (its SPACE_RUST_BUILD_IMAGE build
+# argument), so the deployed image names the binaries it carries; none for an
+# image without Rust artifacts.
+rust_build_label() {
+  local arg artifact_image="" build
+  RUST_BUILD_LABEL=()
+  for arg in "$@"; do
+    [[ "$arg" == SPACE_RUST_BUILD_IMAGE=* ]] && artifact_image="${arg#SPACE_RUST_BUILD_IMAGE=}"
+  done
+  [[ -n "$artifact_image" ]] || return 0
+  build="$(space_kind_image_rust_build "$artifact_image")" \
+    || die "cannot read the Rust build of $artifact_image"
+  RUST_BUILD_LABEL=(--label "space.pplx.net/kind-rust-build=$build")
+}
+
 build() {
   local image=$1 entry stage
   local -a fields imports=()
   shift
+  rust_build_label "$@"
   entry="$(image_entry "$image")" || die "no cached stages are declared for $image"
   read -r -a fields <<<"$entry"
   for stage in "${fields[@]:2}"; do
@@ -87,7 +109,8 @@ build() {
   done
   mirror_flags "${fields[1]}"
   space_kind_build_reading_cache $(( ${#imports[@]} + ${#MIRROR_FLAGS[@]} )) \
-    "${imports[@]}" "${MIRROR_FLAGS[@]}" -f "${fields[1]}" "$@"
+    "${imports[@]}" "${MIRROR_FLAGS[@]}" -f "${fields[1]}" \
+    ${RUST_BUILD_LABEL[@]+"${RUST_BUILD_LABEL[@]}"} "$@"
 }
 
 # Build each stage on its own, with no output but the cache. A failure leaves

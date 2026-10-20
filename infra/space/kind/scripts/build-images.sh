@@ -138,7 +138,8 @@ build_space_cluster_controller() {
 # The production worker image (docker/Dockerfile.worker — the binaries, cargo
 # features, identities, init scripts and nftables policies of the production
 # node DaemonSets), which every node-service chart, the operator shell and
-# space-internal-api run unchanged. LTO stays off locally.
+# space-internal-api run unchanged. LTO stays off locally, except in the
+# release lane (infra/space/kind/lib/rust-build.sh).
 build_space_worker() {
   build_rust_runtime space-worker docker/Dockerfile.worker
 }

@@ -66,6 +66,7 @@ spec:
             - name: SPACE_TEMPLATE_CACHE_BUDGET_BYTES
               value: {{ . | quote }}
             {{- end }}
+            {{- if eq (include "space-node-service.rustBuild" $) "test-hooks" }}
             {{- with .gcIntervalSecs }}
             - name: SPACE_TEMPLATE_GC_INTERVAL_SECS
               value: {{ . | quote }}
@@ -79,6 +80,7 @@ spec:
             # pinned bytes count toward the budget and are never reclaimed.
             - name: SPACE_TEMPLATE_PREFETCH_LATEST_N
               value: {{ . | quote }}
+            {{- end }}
             {{- end }}
             {{- end }}
           {{- include "space-node-service.probes" $ctx | nindent 10 }}

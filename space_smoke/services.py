@@ -139,6 +139,15 @@ class SmokeServices:
             )
         return self.kind.storage_credentials_mode()
 
+    def rust_build(self) -> str:
+        """The Rust build (`test-hooks` or `release`) the Kind bench runs."""
+
+        if self.kind is None:
+            raise SmokeConfigurationError(
+                "the Rust build is only readable on the kind backend"
+            )
+        return self.kind.rust_build()
+
     def fixture(
         self,
         fixture_type: type[Fixture],

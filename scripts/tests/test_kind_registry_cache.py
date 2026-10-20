@@ -102,6 +102,11 @@ class RegistryCacheTests(unittest.TestCase):
                     command = ["build", "-t", image, "-f", dockerfile]
                     if target:
                         command += ["--target", target]
+                    if scope == "kind-rust-build":
+                        command += [
+                            "--build-arg", "SPACE_KIND_RUST_BUILD=test-hooks",
+                            "--build-arg", "SPACE_CARGO_RELEASE_LTO=false",
+                        ]
                     if mode != "local":
                         command += [
                             "--cache-from",

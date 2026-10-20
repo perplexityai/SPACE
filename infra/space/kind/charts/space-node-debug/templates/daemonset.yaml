@@ -20,6 +20,12 @@ spec:
       labels:
         app.kubernetes.io/name: space-node-debug
         app.kubernetes.io/instance: {{ .Release.Name }}
+        {{- /* The Rust build this pod is rendered for (infra/space/kind/lib/rust-build.sh),
+        so a change of build rolls it; scripts/deployed-rust-build.py checks it
+        against the image the pod runs. */}}
+        {{- with .Values.rustBuild }}
+        space.pplx.net/kind-rust-build: {{ . | quote }}
+        {{- end }}
     spec:
       affinity:
         nodeAffinity:

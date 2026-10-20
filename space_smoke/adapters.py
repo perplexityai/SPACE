@@ -13,6 +13,7 @@ import re
 import secrets
 import shlex
 import subprocess
+import sys
 import tempfile
 import threading
 import socket
@@ -5353,6 +5354,19 @@ ON CONFLICT (key_hash) DO NOTHING;
                 f"SPACE_TRACE_EXPORTER={traces or 'unset'}"
             )
         return mode
+
+    def rust_build(self) -> str:
+        # Read from the images every running SPACE Rust container runs, checked
+        # against the build each pod was rendered for; the bring-up uses the
+        # same reader.
+        result = self.executor.run(
+            [sys.executable, str(REPO_ROOT / "infra/space/kind/scripts/deployed-rust-build.py"),
+             "--cluster", self.config.cluster],
+            timeout=180,
+        )
+        if result.returncode != 0:
+            raise SmokeConfigurationError(f"the bench runs no single Rust build: {result.detail()}")
+        return result.stdout.strip()
 
     # --- cluster-controller leader election ------------------------------------
     #

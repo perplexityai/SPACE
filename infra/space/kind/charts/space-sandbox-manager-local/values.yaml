@@ -144,6 +144,9 @@ sandboxEviction:
 # when it publishes) — i.e. only cold named snapshots that already have a
 # durable copy. With target 0 the loop also logs "disk still over target
 # after tick" every tick; that is the always-on gate talking, not a fault.
+# Target, interval, grace and idle are test hooks (`GcConfig::from_env` in
+# snapshot_gc.rs): the release lane (`rustBuild: release`) renders only the
+# switch and the engage gate, and its binaries reap at the release timers.
 # Builder: null.
 snapshotReaper:
   enabled: true

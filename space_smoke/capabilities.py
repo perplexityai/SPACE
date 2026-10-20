@@ -1209,6 +1209,8 @@ class KindEnvironment(Protocol):
 
     def telemetry_mode(self) -> str: ...
 
+    def rust_build(self) -> str: ...
+
     def admin_request(
         self, method: str, resource: str, body: dict[str, object] | None = None,
         *, expected: tuple[int, ...] = (200, 201, 202, 204),

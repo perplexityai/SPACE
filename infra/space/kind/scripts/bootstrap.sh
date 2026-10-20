@@ -43,6 +43,9 @@
 #   SPACE_TILT_PRUNE_HOST_IMAGES=0 keep superseded builds in the host's Docker store
 #                            (default: all but the current and previous build
 #                            of each removed, here and under Tilt)
+#   SPACE_KIND_RUST_BUILD    test-hooks (default) or release: the release lane
+#                            builds without the test-hooks feature and renders
+#                            no test hook (lib/rust-build.sh)
 #   SPACE_KIND_MIN_FREE_GIB  warn before bring-up when the Docker data root or
 #                            SPACE_KIND_DATA_ROOT has less free (default: 30)
 #
@@ -105,6 +108,12 @@ done <<<"$telemetry_values"
 # shellcheck source=../lib/storage-credentials.sh
 . "$KIND_DIR/lib/storage-credentials.sh"
 STORAGE_CREDENTIALS="$(space_kind_storage_credentials)" || die "invalid SPACE_KIND_STORAGE_CREDENTIALS"
+# Which Rust binaries build-images.sh builds (lib/rust-build.sh), read there
+# from the same variable; helm_apply renders every chart for it, and the images
+# and the running pods are checked against it (Steps 5 and 8).
+# shellcheck source=../lib/rust-build.sh
+. "$KIND_DIR/lib/rust-build.sh"
+RUST_BUILD="$(space_kind_rust_build)" || die "invalid SPACE_KIND_RUST_BUILD"
 
 # ── Step 0: prereqs ──────────────────────────────────────────────────────────
 require_bin() {
@@ -318,6 +327,19 @@ else
     bash "$KIND_DIR/scripts/build-images.sh"
 fi
 
+# Before any chart is rendered for RUST_BUILD: the artifact image and the Rust
+# runtime images build-images.sh built from it (build_rust_runtime) must carry
+# that build, or the charts would drop the test hooks of binaries that read
+# them (or set them for binaries that do not). --skip-images reuses whatever
+# was built last.
+for image in space-rust-build-kind space-api space-data-plane space-cluster-controller \
+    space-worker space-kind-key-broker; do
+  image_build="$(space_kind_image_rust_build "$image:local")" \
+    || die "$image:local is missing; run without --skip-images"
+  [[ "$image_build" == "$RUST_BUILD" ]] \
+    || die "$image:local is the $image_build Rust build, and SPACE_KIND_RUST_BUILD asks for $RUST_BUILD; run without --skip-images to rebuild it"
+done
+
 # Re-assert node labels: the shim install and image side-loading above can
 # churn nodes enough to drop admin-applied labels (pool labels from
 # the cluster config survive because the kubelet owns them).
@@ -345,6 +367,7 @@ helm_apply() {
     ${TELEMETRY_HELM_ARGS[@]+"${TELEMETRY_HELM_ARGS[@]}"} \
     --set-string "storageCredentials=$STORAGE_CREDENTIALS" \
     --set-string "storageExchange.secretChecksum=$STS_BRIDGE_SECRET_CHECKSUM" \
+    --set-string "rustBuild=$RUST_BUILD" \
     "$@" \
     | kubectl --context "$KCTX" apply --validate=false -f -
 }
@@ -555,6 +578,17 @@ while read -r daemonset; do
     "ds/$daemonset" --timeout="${TIMEOUT}s" >/dev/null
 done < <(space_kind_node_daemonsets)
 
+# What the Rust pods run, read from each running container's image once every
+# Rust Deployment and DaemonSet has rolled out: a change of build rolls them all
+# (their pods record the build they were rendered for).
+log "checking every SPACE Rust container runs the $RUST_BUILD build"
+deployed_build="$(python3 "$KIND_DIR/scripts/deployed-rust-build.py" --cluster "$KIND_CLUSTER" \
+  --wait "$TIMEOUT")" || deployed_build=""
+if [[ "$deployed_build" != "$RUST_BUILD" ]]; then
+  python3 "$KIND_DIR/scripts/deployed-rust-build.py" --cluster "$KIND_CLUSTER" --pods >/dev/null || true
+  die "the SPACE Rust containers do not all run the $RUST_BUILD build (per pod above)"
+fi
+
 # Ready pods are not a registered node: wait until each node's node-ctl has
 # published it through ClusterApi and the API reports it schedulable.
 log "waiting for every SPACE node to be published and ready"
@@ -687,6 +721,7 @@ cat <<MSG
   UI:         http://localhost:3000
   Datadog:    $DATADOG_MODE
   Telemetry:  $TELEMETRY_MODE
+  Rust build: $RUST_BUILD
   Login:      root@local
 
   Smoke:      bash scripts/tests/smoke-kind-e2e.sh

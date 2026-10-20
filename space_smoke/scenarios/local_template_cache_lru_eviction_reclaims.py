@@ -35,7 +35,8 @@ import space_smoke as smoke
     # Write and hash the rendered cache budget, then wait out the rendered
     # grace and a few ticks; the sandbox itself is idle throughout.
     sandbox=smoke.SandboxConfig(timeout=900),
-
+    test_hooks="the chart's SPACE_TEMPLATE_GC_INTERVAL_SECS, SPACE_TEMPLATE_GC_GRACE_SECS "
+    "and SPACE_TEMPLATE_PREFETCH_LATEST_N; release waits a 1800 s grace",
 )
 def template_cache_lru_eviction_reclaims(test: smoke.KindEcw) -> None:
     """template-manager's LRU eviction loop, running with the production knobs
