@@ -1130,18 +1130,24 @@ impl KubernetesSubstrate {
                     let retry_waits_deferred = crate::retry_deferral::retry_waits_deferred();
                     crate::wake_trace::scope(
                         wake_trace,
-                        crate::retry_deferral::scope(retry_waits_deferred, async move {
-                            substrate
-                                .wake_execution_uncoalesced(
-                                    &run_sandbox,
-                                    timeout,
-                                    metric_identity,
-                                    None,
-                                    target,
-                                    handling,
-                                )
-                                .await
-                        }),
+                        // Boxed so the scope wrappers hold a pointer rather
+                        // than another copy of the large wake future on the
+                        // stack while the run is built.
+                        crate::retry_deferral::scope(
+                            retry_waits_deferred,
+                            Box::pin(async move {
+                                substrate
+                                    .wake_execution_uncoalesced(
+                                        &run_sandbox,
+                                        timeout,
+                                        metric_identity,
+                                        None,
+                                        target,
+                                        handling,
+                                    )
+                                    .await
+                            }),
+                        ),
                     )
                 })
                 .await;

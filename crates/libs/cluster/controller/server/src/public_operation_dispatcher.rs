@@ -638,11 +638,16 @@ where
         config,
         operation,
         OperationExecutor::Dispatcher,
-        pplx_space_api::retry_deferral::scope(defer_retry_waits, async move {
-            executor
-                .execute(&execution_claim_token, execution_operation)
-                .await
-        }),
+        // Boxed so the deferral wrapper does not hold a second copy of the
+        // executor's future on the stack.
+        pplx_space_api::retry_deferral::scope(
+            defer_retry_waits,
+            Box::pin(async move {
+                executor
+                    .execute(&execution_claim_token, execution_operation)
+                    .await
+            }),
+        ),
     )
     .await
 }
