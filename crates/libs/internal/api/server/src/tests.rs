@@ -3712,6 +3712,26 @@ async fn placed_sandbox_unlocks_private_release_for_its_node_only(
         } else {
             let response = response?;
             delegation.require_acknowledgement(&response)?;
+
+            // The split package forwards to the same handler and has to carry
+            // the acknowledgement back with the result.
+            let mut request = node_scoped_request(
+                pplx_space_cluster_api_client::proto::FindTemplateReleaseByHashRequest {
+                    generic_only: false,
+                    template_name: "private-base".into(),
+                    hash: hash.clone(),
+                    caller_org_id: asserted_org.map(|org| org.to_string()),
+                },
+                worker_a_ip,
+            );
+            delegation.attach(&mut request);
+            let forwarded = pplx_space_cluster_api_client::proto::cluster_api_server::ClusterApi::find_template_release_by_hash(
+                &fixture.service,
+                request,
+            )
+            .await?;
+            delegation.require_acknowledgement(&forwarded)?;
+
             if matches!(delegation, TemplateLookupScope::Sandbox { .. }) {
                 assert_eq!(
                     response.get_ref().authorized_org_id,

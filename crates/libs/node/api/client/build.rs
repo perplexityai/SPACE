@@ -1,3 +1,44 @@
+/// Every message and enum defined in `node/api/v1/common.proto`.
+const COMMON_PROTO_TYPES: &[&str] = &[
+    "NodeRole",
+    "NodeSchedulingStatus",
+    "CacheDiskAdmissionState",
+    "GetReconciliationStatusRequest",
+    "GetReconciliationStatusResponse",
+    "ReconciliationStatus",
+    "FacetDirection",
+    "ReconcileFacet",
+    "NetworkPolicyTargetRef",
+    "FacetRef",
+    "RefreshFacetStateRequest",
+    "RefreshFacetStateResponse",
+    "StateReconciliationReason",
+    "TriggerStateReconciliationRequest",
+    "TriggerStateReconciliationResponse",
+    "MarkFacetDirtyRequest",
+    "MarkFacetDirtyResponse",
+    "SetFacetSyncDisabledRequest",
+    "SetFacetSyncDisabledResponse",
+    "FacetSyncOverride",
+    "GetControllerStateRequest",
+    "GetControllerStateResponse",
+    "FacetControllerState",
+    "FacetQueueItem",
+    "GetNodeInfoRequest",
+    "CacheDiskStatus",
+    "NodeResourceStatus",
+    "GetNodeInfoResponse",
+    "NodeCtlStatus",
+    "TransferSource",
+    "NodeSource",
+    "SnapshotInfo",
+    "PullTemplateRequest",
+    "PullTemplateResponse",
+    "ListNodeTemplatesRequest",
+    "ListNodeTemplatesResponse",
+    "NodeTemplateBuild",
+];
+
 fn main() -> anyhow::Result<()> {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")?;
     let proto_root = std::path::Path::new(&manifest_dir).join("../../../../../proto");
@@ -11,7 +52,18 @@ fn main() -> anyhow::Result<()> {
 
     let raw_descriptor_path = out_dir.join("node_api_descriptor_raw.bin");
 
-    let builder = tonic_prost_build::configure()
+    // Per-type extern_path for every message/enum defined in common.proto so
+    // node-api-client and cluster-api-client share identical Rust types for the
+    // space.node.api.v1 vocabulary.  Worker/builder/cluster types are generated
+    // fresh in this crate; only the common-proto vocabulary is remapped.
+    let mut builder = tonic_prost_build::configure();
+    for name in COMMON_PROTO_TYPES {
+        builder = builder.extern_path(
+            format!(".space.node.api.v1.{name}"),
+            format!("::pplx_space_node_api_types::proto::{name}"),
+        );
+    }
+    let builder = builder
         .extern_path(
             ".space.sandbox.manager.v1",
             "::pplx_space_sbx_mgr_client::proto",

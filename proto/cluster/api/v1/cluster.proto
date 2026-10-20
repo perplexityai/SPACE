@@ -1,0 +1,1223 @@
+syntax = "proto3";
+package space.cluster.api.v1;
+
+import "execution/v1/execution.proto";
+import "google/protobuf/timestamp.proto";
+
+import "node/api/v1/common.proto";
+import "net/policy/v1/policy.proto";
+import "sandbox/manager/v1/manager.proto";
+import "template/manager/v1/manager.proto";
+
+// ClusterApi is served by cluster-role node-api processes. It exposes manual
+// self-managed cluster inventory and template metadata from the Postgres
+// control plane.
+service ClusterApi {
+  rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
+
+  // Delegate one system publication to a build. Only a system-only publisher
+  // may issue these grants; a dual-authority build-manager cannot authorize itself.
+  rpc CreateSystemTemplatePublicationGrant(CreateSystemTemplatePublicationGrantRequest) returns (CreateSystemTemplatePublicationGrantResponse);
+
+  // Register a template. Fails with ALREADY_EXISTS if `name` is already taken.
+  rpc RegisterTemplate(RegisterTemplateRequest) returns (RegisterTemplateResponse);
+
+  // Register or reuse an immutable release for a template, keyed by
+  // `(template_name, hash)`, plus its tags and storage locations. Performed in
+  // a single transaction. Fails with NOT_FOUND if the template does not
+  // exist; ALREADY_EXISTS only for incompatible existing release identity such
+  // as a runtime mismatch on the same `(template_name, hash)`; INVALID_ARGUMENT
+  // for unsupported runtimes.
+  rpc RegisterTemplateRelease(RegisterTemplateReleaseRequest) returns (RegisterTemplateReleaseResponse);
+
+  // Resolve a (template_name, runtime, tag) tuple to its release and the
+  // storage locations holding it. Fails with NOT_FOUND if no release matches.
+  rpc FindTemplateRelease(FindTemplateReleaseRequest) returns (FindTemplateReleaseResponse);
+
+  // Resolve a (template_name, hash) pair to its release and the
+  // storage locations holding it. Queries `template_releases.hash`
+  // directly rather than going through `template_release_tags`, so
+  // it works regardless of whether the digest happens to be
+  // registered as a tag. Runtime is intentionally not part of the
+  // key — artifact digests are runtime-scoped by construction, so
+  // `(template_name, hash)` uniquely identifies a release across
+  // every supported runtime. Fails with NOT_FOUND if no release
+  // matches.
+  rpc FindTemplateReleaseByHash(FindTemplateReleaseByHashRequest) returns (FindTemplateReleaseResponse);
+
+  // Return the latest `limit` releases for `(template_name, runtime)`
+  // ordered by `template_releases.created_at` DESC, along with the
+  // storage locations holding each. Used by the node-side prefetcher
+  // to warm the latest N artifacts per template without going through
+  // the tag indirection. An empty `runtime` is rejected; `limit` must
+  // be in `[1, 50]`. Returns an empty `releases` list (NOT NOT_FOUND)
+  // when the template exists but has no releases yet.
+  rpc ListLatestTemplateReleases(ListLatestTemplateReleasesRequest) returns (ListLatestTemplateReleasesResponse);
+
+  // Return every `(template_name, hash)` release that warm pools
+  // currently target: each `kubernetes_pool_configs` release plus the
+  // retained-N release window of every enabled `warm_pool_policies`
+  // row. The node-side template GC unions this set into its protected
+  // set so a warm-pool selected release that is outside the local
+  // prefetch pins (and has no live warm slot on the node at tick time)
+  // is never evicted — eviction would otherwise turn the next pool
+  // refill into a full re-pull under disk pressure. Callers treat any
+  // error as "do not evict this tick" (fail closed).
+  rpc ListWarmPoolTemplateReleases(ListWarmPoolTemplateReleasesRequest) returns (ListWarmPoolTemplateReleasesResponse);
+
+  // Return the control-plane desired network policy state for the node-local
+  // templates and sandboxes reported by a worker/builder node.
+  rpc GetNodeNetworkPolicyState(GetNodeNetworkPolicyStateRequest) returns (GetNodeNetworkPolicyStateResponse);
+
+  // Return the control-plane desired base-snapshot policy for node-local
+  // templates reported by a worker/builder node. This is a cluster -> node
+  // facet; node-local edits are not published back through node-ctl.
+  rpc GetNodeTemplateBaseSnapshotPolicyState(GetNodeTemplateBaseSnapshotPolicyStateRequest) returns (GetNodeTemplateBaseSnapshotPolicyStateResponse);
+
+  // Return the control-plane desired template settings for node-local
+  // templates. This carries template-scoped state whose source of truth is
+  // Postgres but whose local side effects are owned by template-manager.
+  rpc GetNodeTemplateDesiredState(GetNodeTemplateDesiredStateRequest) returns (GetNodeTemplateDesiredStateResponse);
+
+  // Return the control-plane desired sandbox state for node-local sandboxes.
+  // This is a cluster -> node facet; observed node-local state is published
+  // back through PublishNodeState.
+  rpc GetNodeSandboxDesiredState(GetNodeSandboxDesiredStateRequest) returns (GetNodeSandboxDesiredStateResponse);
+
+  // Resolve the bounded, non-secret data-plane route metadata for a protocol
+  // session. The response carries only routing identity and backend endpoint
+  // coordinates; credentials and bearer material stay outside this API.
+  rpc ResolveDataPlaneSessionRoute(ResolveDataPlaneSessionRouteRequest) returns (ResolveDataPlaneSessionRouteResponse);
+
+  // Atomically bind a process-backed data-plane session to the backend
+  // process created for its first attach. Replays with the same process_id are
+  // idempotent; attempts to bind a different process_id fail with
+  // ALREADY_EXISTS so data-plane replicas do not create competing terminal or
+  // process backends for the same public session.
+  rpc BindDataPlaneSessionProcess(BindDataPlaneSessionProcessRequest) returns (BindDataPlaneSessionProcessResponse);
+
+  // Record an observed backend reconnect attempt for a data-plane session.
+  // This is a diagnostic/state update only; route resolution remains the
+  // source of truth for the current backend endpoint.
+  rpc RecordDataPlaneSessionReconnect(RecordDataPlaneSessionReconnectRequest) returns (RecordDataPlaneSessionReconnectResponse);
+
+  // Read the current revocation epoch/status for a protocol session without
+  // returning route backend or credential material.
+  rpc GetDataPlaneSessionRevocationState(GetDataPlaneSessionRevocationStateRequest) returns (GetDataPlaneSessionRevocationStateResponse);
+
+  // Read the org-level revocation epoch used by data-plane replicas to avoid
+  // per-session polling when no session in the org has been revoked.
+  rpc GetDataPlaneOrgRevocationEpoch(GetDataPlaneOrgRevocationEpochRequest) returns (GetDataPlaneOrgRevocationEpochResponse);
+
+  // Legacy ECW compatibility helper for direct sandbox_id + port service
+  // routing. First-class native SPACE sessions use ResolveDataPlaneSessionRoute
+  // and carry their own route/session state; this worse point-read exists only
+  // because the E2B-compatible API addresses ports by sandbox_id and port
+  // without a native session. Data-plane uses it after an ECW route/proxy
+  // failure to avoid regressing the old API's retry behavior. Delete this RPC
+  // with the ECW compatibility shim.
+  rpc GetSandboxRuntimeAccess(GetSandboxRuntimeAccessRequest) returns (GetSandboxRuntimeAccessResponse);
+
+  // Legacy ECW compatibility resolver for direct sandbox_id + port service
+  // routing.
+  //
+  // This is intentionally not a public SPACE API contract. Direct edge routing
+  // by sandbox_id + port is a bad native SPACE design; this exists only as a
+  // temporary compatibility escape hatch for E2B-style APIs. Native SPACE
+  // callers should use first-class data-plane sessions and session route
+  // resolution instead. Delete this RPC with the ECW compatibility shim. The
+  // request carries token digests only; credentials and raw bearer material
+  // stay outside this API.
+  rpc UnstableResolveSandboxServiceRoute(UnstableResolveSandboxServiceRouteRequest) returns (UnstableResolveSandboxServiceRouteResponse);
+
+  // Legacy ECW compatibility repair command for direct sandbox_id + port
+  // service routing. Reset a previously resolved sandbox service route after
+  // the caller observes that it is no longer usable. Cluster API invalidates
+  // the matching applied route state only when `route_generation` still
+  // matches the active sandbox execution, then asks node-ctl to reconcile the
+  // desired state.
+  //
+  // The route key is an internal data-plane contract. Its sandbox_id+port shape
+  // currently exists for E2B-compatible edge routing; native SPACE callers
+  // should use first-class data-plane sessions instead. Delete this RPC with
+  // the ECW compatibility shim.
+  rpc UnstableResetSandboxServiceRoute(UnstableResetSandboxServiceRouteRequest) returns (UnstableResetSandboxServiceRouteResponse);
+
+  // Claim control-plane queued reconciliation refs for this node. Node-ctl
+  // polls this and runs the returned refs locally, keeping HTTP/API handlers
+  // out of the node fanout path.
+  rpc ClaimNodeReconcileRefs(ClaimNodeReconcileRefsRequest) returns (ClaimNodeReconcileRefsResponse);
+
+  // Complete a previously claimed reconciliation lease.
+  rpc CompleteNodeReconcileRefs(CompleteNodeReconcileRefsRequest) returns (CompleteNodeReconcileRefsResponse);
+
+  // Publish the result of applying sandbox port-exposure desired-state items.
+  rpc PublishSandboxPortExposureStates(PublishSandboxPortExposureStatesRequest) returns (PublishSandboxPortExposureStatesResponse);
+
+  // Publish latest node-local observed state. Node-ctl sends coalesced state
+  // snapshots built by reading the local managers at sync time.
+  rpc PublishNodeState(PublishNodeStateRequest) returns (PublishNodeStateResponse);
+
+  // Register, finish, heartbeat, or resolve an enqueue-only backup attempt for
+  // an exact immutable local artifact. A ready backup is the cross-node
+  // restoration and source-node release barrier.
+  rpc BeginArtifactBackup(BeginArtifactBackupRequest) returns (BeginArtifactBackupResponse);
+  rpc FinalizeArtifactBackup(FinalizeArtifactBackupRequest) returns (FinalizeArtifactBackupResponse);
+  rpc TouchArtifactBackup(TouchArtifactBackupRequest) returns (TouchArtifactBackupResponse);
+  // Two request shapes. A location request reads where a ready backup lives,
+  // only for a node the sandbox is placed on. A readiness query lets any
+  // registered node, including a former host after relocation, ask whether
+  // an identity it already holds is backed up; the reply is only `ready`.
+  rpc GetArtifactBackupLocation(GetArtifactBackupLocationRequest) returns (GetArtifactBackupLocationResponse);
+
+  // Return a read-only, generation-fenced plan for automatic recovery of the
+  // caller's currently assigned quarantine episode. The plan identity is the
+  // central quarantine episode id; the node echoes it in its transition
+  // receipt, and publication revalidates every field before convergence.
+  rpc GetQuarantineRecoveryPlan(GetQuarantineRecoveryPlanRequest) returns (GetQuarantineRecoveryPlanResponse);
+
+  // Return the org-level S3 override that applies to a sandbox (the
+  // `organizations.snapshot_base_object_storage_uri` of the sandbox's
+  // owning org). An absent `storage_uri` in the response means the org
+  // has no override set; callers should fall back to their default
+  // (e.g. an env-derived bucket). The URI is returned unparsed.
+  rpc GetSandboxSnapshotStorageUri(GetSandboxSnapshotStorageUriRequest) returns (GetSandboxSnapshotStorageUriResponse);
+
+  // Look up the most recent ready suspend-snapshot storage location for a
+  // sandbox. Returns the `s3://…` connection string of the latest row with
+  // `state='ready'` (selected via
+  // `ORDER BY timestamp DESC LIMIT 1`), so partial uploads and failed
+  // attempts are invisible. Used by on-node sbx-mgr to restore a sandbox
+  // whose local snapshot files are absent (e.g. cross-node restore or
+  // restore after a node-local cache wipe). Returns `NOT_FOUND` if no
+  // ready suspend snapshot exists for the sandbox.
+  // TODO: [legacy] Remove once all restore callers look up exact artifact
+  // backups with `GetArtifactBackupLocation`.
+  rpc GetSuspendSnapshotLocation(GetSuspendSnapshotLocationRequest) returns (GetSuspendSnapshotLocationResponse);
+
+  // BYOK volume encryption (per-sandbox DEK gate, KEK resolution, and wrap
+  // storage) is owned end to end by the credential manager
+  // (credmgr GetOrIssueSandboxVolumeDek), so
+  // cluster-api carries no encryption RPCs.
+}
+
+message ListNodesRequest {
+  optional space.node.api.v1.NodeRole role = 1;
+  bool include_deleted = 2;
+}
+
+message NodeRecord {
+  string id = 1;
+  optional string name = 2;
+  optional string address = 3;
+  string node_api_endpoint = 4;
+  space.node.api.v1.NodeRole role = 5;
+  string managed_by = 6;
+  optional string state = 7;
+  optional string last_heartbeat = 8;
+  string created_at = 9;
+  string updated_at = 10;
+  optional string deleted_at = 11;
+  string metadata_json = 12;
+}
+
+message ListNodesResponse {
+  repeated NodeRecord nodes = 1;
+}
+
+// ── Template metadata ─────────────────────────────────────────────────────
+
+message Template {
+  string name = 1;
+  optional string description = 2;
+  string created_at = 3; // RFC3339
+  space.net.policy.v1.NetworkPolicyV1 network_policy = 4;
+  uint64 network_policy_generation = 5;
+}
+
+message TemplateRelease {
+  string id = 1;            // UUID
+  string template_name = 2;
+  string runtime = 3;       // 'fc' (extends as DB CHECK relaxes)
+  string hash = 4;
+  string created_at = 5;    // RFC3339
+}
+
+// Who may launch a template (mirrors `templates.visibility`). Carried on the
+// release-resolution responses so node-side consumers — the template-manager
+// prefetch loop in particular — can decline to warm a template that is not
+// generic.
+//
+// Note the deliberate limit of this signal: it says *whether* a template is
+// org-scoped, not *which* org owns it. The owning `templates.org_id` is not on
+// the wire, so the only policy a consumer can implement from these responses
+// is "do not prefetch org-specific templates at all" — not "prefetch only onto
+// nodes of the owning org". Per-org placement would need the owner id added
+// here first.
+//
+// UNSPECIFIED means the cluster could not determine visibility (e.g. the
+// control-plane schema predates the `templates.visibility` column, or the
+// lookup failed or timed out); consumers enforcing isolation must treat it as
+// "not known to be generic" and fail closed.
+//
+// The converse does NOT hold: a GENERIC or ORG_SPECIFIC answer does not mean the
+// row was read on this request. Where the control plane's visibility cache is
+// enabled — it is off by default, and per-cluster — successful reads are reused
+// both while fresh and while a later read is failing, so a concrete value can be
+// up to the cache's staleness bound old. Stated as always-possible on purpose: a
+// consumer that assumes staleness is correct in either configuration, whereas one
+// that assumes freshness breaks when a cluster turns the cache on. Every field
+// carrying this enum inherits that, and none of them distinguishes a cached
+// answer from a fresh one — deliberately, since a consumer cannot act on the
+// difference. Treat a concrete value as "this is what the row said recently".
+enum TemplateVisibility {
+  TEMPLATE_VISIBILITY_UNSPECIFIED = 0;
+  TEMPLATE_VISIBILITY_GENERIC = 1;
+  TEMPLATE_VISIBILITY_ORG_SPECIFIC = 2;
+}
+
+message TemplateReleaseTag {
+  string id = 1;            // UUID
+  string tag = 2;
+  string created_at = 3;    // RFC3339
+}
+
+message TemplateReleaseStorageLocation {
+  string id = 1;            // UUID
+  string connection_string = 2;
+  string created_at = 3;    // RFC3339
+}
+
+message CreateSystemTemplatePublicationGrantRequest {
+  string template_name = 1;
+}
+
+message CreateSystemTemplatePublicationGrantResponse {
+  string grant_id = 1;
+}
+
+message RegisterTemplateRequest {
+  string name = 1;
+  optional string description = 2;
+  optional string org_id = 4;
+  // One build submission's system publication authorization.
+  optional string system_publication_grant_id = 5;
+  // One build submission's tenant publication authorization, for `org_id`.
+  optional string tenant_publication_grant_id = 6;
+}
+
+message RegisterTemplateResponse {
+  Template template = 1;
+}
+
+message RegisterTemplateReleaseRequest {
+  string template_name = 1;
+  string runtime = 2;
+  string hash = 3;
+  // Tags to attach to the release. Tags are unique per template
+  // (UNIQUE(template_name, tag)); if a tag already exists for the template it
+  // is reassigned to this release and its `modified_at` is bumped. Repeating
+  // the same `(template_name, hash)` registration remains idempotent because
+  // the release row itself is keyed by hash.
+  repeated string tags = 4;
+  // Storage URIs (e.g. "s3://bucket/key", "https://...") where this release
+  // can be fetched from. Duplicates within the request are deduplicated;
+  // duplicates already attached to this same release are treated as success.
+  repeated string storage_connection_strings = 5;
+  optional string org_id = 7;
+  // Execution environment captured at build time. Releases are immutable per
+  // `(template_name, hash)`, so the first registration that carries this wins;
+  // later registrations never overwrite stored execution metadata.
+  optional space.execution.v1.ExecutionMetadata execution = 8;
+  // Consumed atomically with the release; never substitutes another build's grant.
+  optional string system_publication_grant_id = 9;
+  // Tenant counterpart of `system_publication_grant_id`, for `org_id`.
+  optional string tenant_publication_grant_id = 10;
+}
+
+message RegisterTemplateReleaseResponse {
+  TemplateRelease release = 1;
+  repeated TemplateReleaseTag tags = 2;
+  repeated TemplateReleaseStorageLocation storage_locations = 3;
+}
+
+message FindTemplateReleaseRequest {
+  string template_name = 1;
+  string runtime = 2;
+  string tag = 3;
+  // Tenant authorization is checked atomically with release resolution.
+  optional string caller_org_id = 4;
+  // Restrict release and storage resolution to generic templates in one SQL snapshot.
+  bool generic_only = 5;
+}
+
+message FindTemplateReleaseResponse {
+  TemplateRelease release = 1;
+  repeated TemplateReleaseStorageLocation storage_locations = 2;
+  // Visibility of the template this release belongs to. Best-effort:
+  // UNSPECIFIED when the control plane cannot resolve it, and a concrete value
+  // may be a cached read rather than a fresh one (see the enum docs).
+  TemplateVisibility template_visibility = 3;
+  // Scoped callers must reject responses without this acknowledgement.
+  optional string authorized_org_id = 4;
+  // True only when generic-only resolution succeeded. Prefetch must require this
+  // acknowledgement so older servers cannot silently ignore the restriction.
+  bool generic_authorized = 5;
+}
+
+message FindTemplateReleaseByHashRequest {
+  string template_name = 1;
+  // The full digest including algorithm prefix, e.g.
+  // "sha256:7f2c852039ccdd...". Matched against
+  // `template_releases.hash` exactly. Runtime is not needed —
+  // artifact digests are already runtime-scoped, so
+  // `(template_name, hash)` uniquely identifies a release.
+  string hash = 2;
+  optional string caller_org_id = 3;
+  bool generic_only = 4;
+}
+
+message ListLatestTemplateReleasesRequest {
+  string template_name = 1;
+  string runtime = 2;
+  // Maximum number of releases to return. Must be in `[1, 50]`.
+  uint32 limit = 3;
+}
+
+// A single `(release, storage_locations)` entry. Mirrors the shape of
+// FindTemplateReleaseResponse so callers that already know how to
+// handle one resolved release can iterate `entries` uniformly.
+message ListLatestTemplateReleasesEntry {
+  TemplateRelease release = 1;
+  repeated TemplateReleaseStorageLocation storage_locations = 2;
+  // Visibility of the template these releases belong to. Identical across
+  // every entry of one response (visibility is a template-level attribute);
+  // carried per entry so the entry mirrors FindTemplateReleaseResponse. Same
+  // best-effort and possibly-cached caveats as the enum docs.
+  TemplateVisibility template_visibility = 3;
+}
+
+message ListLatestTemplateReleasesResponse {
+  // Ordered most-recent-first by `template_releases.created_at`.
+  repeated ListLatestTemplateReleasesEntry entries = 1;
+  // Visibility of the requested template. Response-level so the signal
+  // survives an empty `entries` list: a template row with zero registered
+  // releases still has a visibility, which lets a prefetch consumer drop
+  // stale pins for an org-specific template that no longer resolves to
+  // anything. Note the bound on that — once the last release is gone the
+  // `templates` row itself can be deleted, and after that this reports
+  // UNSPECIFIED rather than ORG_SPECIFIC, so the signal covers
+  // "template exists, no releases" and not "template deleted".
+  //
+  // That last transition is eventually consistent, not immediate, wherever the
+  // control plane's visibility cache is enabled (it is off by default). A
+  // successful read is reusable for a short TTL, and if the read that would
+  // observe the deletion instead *fails* transiently, the last successful read
+  // stays serveable out to a longer staleness ceiling. So the bound is the
+  // larger of the two windows, not the TTL. A consumer acting on the deleted
+  // case should read it as "gone within a tick", not "gone the instant the row
+  // is".
+  // Best-effort like the per-entry field: UNSPECIFIED when the control
+  // plane cannot resolve it.
+  TemplateVisibility template_visibility = 2;
+}
+
+message ListWarmPoolTemplateReleasesRequest {}
+
+// One release a warm pool targets. Only the GC protected-set key is
+// carried — callers needing storage locations or timestamps should use
+// the FindTemplateRelease* RPCs.
+message WarmPoolTemplateRelease {
+  string template_name = 1;
+  string hash = 2;
+}
+
+message ListWarmPoolTemplateReleasesResponse {
+  repeated WarmPoolTemplateRelease releases = 1;
+}
+
+message GetNodeNetworkPolicyStateRequest {
+  string node_id = 1;
+  repeated string templates = 2;
+  repeated string sandbox_ids = 3;
+  optional space.node.api.v1.NodeRole role = 4;
+}
+
+message TemplateNetworkPolicyState {
+  string template = 1;
+  space.net.policy.v1.NetworkPolicyV1 policy = 2;
+  uint64 generation = 3;
+}
+
+message SandboxNetworkPolicyState {
+  string sandbox_id = 1;
+  space.net.policy.v1.NetworkPolicySource source = 2;
+  space.net.policy.v1.NetworkPolicyV1 policy = 3;
+  uint64 generation = 4;
+  string template = 5;
+}
+
+message GetNodeNetworkPolicyStateResponse {
+  repeated TemplateNetworkPolicyState templates = 1;
+  repeated SandboxNetworkPolicyState sandboxes = 2;
+}
+
+message GetNodeTemplateBaseSnapshotPolicyStateRequest {
+  string node_id = 1;
+  repeated string templates = 2;
+  optional space.node.api.v1.NodeRole role = 3;
+}
+
+message TemplateBaseSnapshotPolicyState {
+  string template = 1;
+  bool ensure_base_snapshot = 2;
+  uint32 snapshot_vcpu = 3;
+  uint32 snapshot_memory_mib = 4;
+}
+
+message GetNodeTemplateBaseSnapshotPolicyStateResponse {
+  repeated TemplateBaseSnapshotPolicyState templates = 1;
+}
+
+message GetNodeTemplateDesiredStateRequest {
+  string node_id = 1;
+  repeated string templates = 2;
+  optional space.node.api.v1.NodeRole role = 3;
+}
+
+message TemplatePoolPolicyState {
+  uint32 target_count = 1;
+  string boot_mode = 2;
+  optional uint32 vcpu = 3;
+  optional uint32 memory_mib = 4;
+}
+
+message TemplateDesiredState {
+  string template = 1;
+  optional space.sandbox.manager.v1.AutoLifecyclePolicy default_auto_lifecycle = 2;
+  optional TemplatePoolPolicyState pool = 3;
+  optional bool present = 4;
+}
+
+message GetNodeTemplateDesiredStateResponse {
+  repeated TemplateDesiredState templates = 1;
+}
+
+message GetNodeSandboxDesiredStateRequest {
+  string node_id = 1;
+  repeated string sandbox_ids = 2;
+  optional space.node.api.v1.NodeRole role = 3;
+}
+
+message SandboxDesiredState {
+  string sandbox_id = 1;
+  bool snapshots_enabled_desired = 2;
+  repeated SandboxPortExposureDesiredState port_exposures = 3;
+  optional space.sandbox.manager.v1.AutoLifecyclePolicy auto_lifecycle = 4;
+}
+
+enum SandboxPortProtocol {
+  SANDBOX_PORT_PROTOCOL_UNSPECIFIED = 0;
+  SANDBOX_PORT_PROTOCOL_TCP = 1;
+}
+
+enum SandboxPortDesiredStateKind {
+  SANDBOX_PORT_DESIRED_STATE_UNSPECIFIED = 0;
+  SANDBOX_PORT_DESIRED_STATE_OPEN = 1;
+  SANDBOX_PORT_DESIRED_STATE_CLOSED = 2;
+}
+
+enum SandboxPortApplyStateKind {
+  SANDBOX_PORT_APPLY_STATE_UNSPECIFIED = 0;
+  SANDBOX_PORT_APPLY_STATE_APPLIED = 1;
+  SANDBOX_PORT_APPLY_STATE_FAILED = 2;
+}
+
+message SandboxPortExposureDesiredState {
+  SandboxPortProtocol protocol = 1;
+  uint32 guest_port = 2;
+  SandboxPortDesiredStateKind desired_state = 3;
+}
+
+message GetNodeSandboxDesiredStateResponse {
+  repeated SandboxDesiredState sandboxes = 1;
+  // Requested sandbox ids for which the cluster has no `sandboxes` row at
+  // all — the sandbox was deleted (rows are hard-deleted on delete). Ids
+  // that exist but are assigned to another node appear in neither list.
+  // Consumers may reclaim local state (wake-cache snapshots, local DB
+  // rows) for these ids: with the cluster row gone the sandbox can never
+  // be restored, so retaining its bytes is pure leak. Absence from this
+  // list is not a liveness signal, so consumers must only act on explicit
+  // membership.
+  repeated string deleted_sandbox_ids = 2;
+}
+
+// ── Data-plane session routes ──────────────────────────────────────────────
+
+enum DataPlaneRevocationStatus {
+  DATA_PLANE_REVOCATION_STATUS_UNSPECIFIED = 0;
+  DATA_PLANE_REVOCATION_STATUS_ACTIVE = 1;
+  DATA_PLANE_REVOCATION_STATUS_REVOKING = 2;
+  DATA_PLANE_REVOCATION_STATUS_REVOKED = 3;
+}
+
+message DataPlaneBackendEndpoint {
+  // Node currently responsible for the backend hop.
+  string node_id = 1;
+  // Plain host:port or URI-style endpoint coordinate. This is routing
+  // metadata only; do not put credentials in this field.
+  string endpoint = 2;
+  // Optional endpoint transport label, for example "tcp" or "grpc".
+  optional string transport = 3;
+}
+
+message DataPlaneRevocationState {
+  uint64 epoch = 1;
+  DataPlaneRevocationStatus status = 2;
+  optional google.protobuf.Timestamp updated_at = 3;
+  optional string reason = 4;
+  uint64 org_epoch = 5;
+}
+
+message SpaceApiRouteToken {
+  // Ed25519 capability over the complete sandbox route identity.
+  string token = 2;
+}
+
+message ResolveDataPlaneSessionRouteRequest {
+  string session_id = 1;
+  optional string protocol_session_id = 2;
+  // SHA-256 hex digest of the raw data-plane attach token. The data-plane
+  // service sends the digest so the cluster API can validate the session
+  // without data-plane replicas owning database connections. Only the
+  // data-plane edge identity may omit it together with `required_scope`,
+  // which refreshes the route of a session it already attached; every other
+  // caller is refused without the token.
+  optional string token_sha256 = 4;
+  // Exact scope required for the attach attempt, e.g. "terminal:connect".
+  optional string required_scope = 5;
+  // Requested transport. Port and protocol sessions require SERVICE_PORT_INGRESS;
+  // when absent they default to that transport. Other session kinds default to
+  // DIRECT.
+  optional SandboxServiceRouteTransport requested_transport = 6;
+}
+
+message ResolveDataPlaneSessionRouteResponse {
+  string session_id = 1;
+  optional string protocol_session_id = 2;
+  uint64 route_generation = 3;
+  string current_node_id = 4;
+  DataPlaneBackendEndpoint backend = 5;
+  DataPlaneRevocationState revocation = 6;
+  string sandbox_id = 7;
+  string kind = 8;
+  optional uint32 target_port = 9;
+  optional string target_protocol = 10;
+  optional string target_path = 11;
+  string adapter_state_json = 12;
+  optional string backend_process_id = 14;
+  string org_id = 15;
+  optional SpaceApiRouteToken space_api_route_token = 16;
+}
+
+message BindDataPlaneSessionProcessRequest {
+  string session_id = 1;
+  optional string protocol_session_id = 2;
+  string process_id = 3;
+}
+
+message BindDataPlaneSessionProcessResponse {
+  string session_id = 1;
+  optional string protocol_session_id = 2;
+  string process_id = 3;
+  bool newly_bound = 4;
+}
+
+enum DataPlaneReconnectReason {
+  DATA_PLANE_RECONNECT_REASON_UNSPECIFIED = 0;
+  DATA_PLANE_RECONNECT_REASON_BACKEND_RESTART = 1;
+  DATA_PLANE_RECONNECT_REASON_SANDBOX_MIGRATION = 2;
+  DATA_PLANE_RECONNECT_REASON_ROUTE_GENERATION_CHANGED = 3;
+  DATA_PLANE_RECONNECT_REASON_WORKER_UNAVAILABLE = 4;
+  DATA_PLANE_RECONNECT_REASON_DATA_PLANE_RESTART = 5;
+}
+
+message RecordDataPlaneSessionReconnectRequest {
+  string session_id = 1;
+  optional string protocol_session_id = 2;
+  DataPlaneReconnectReason reason = 3;
+  uint64 observed_route_generation = 4;
+}
+
+message RecordDataPlaneSessionReconnectResponse {
+  string session_id = 1;
+  optional string protocol_session_id = 2;
+  uint64 reconnect_count = 3;
+  DataPlaneReconnectReason last_reconnect_reason = 4;
+}
+
+message GetDataPlaneSessionRevocationStateRequest {
+  string session_id = 1;
+  optional string protocol_session_id = 2;
+}
+
+message GetDataPlaneSessionRevocationStateResponse {
+  string session_id = 1;
+  optional string protocol_session_id = 2;
+  DataPlaneRevocationState revocation = 3;
+  string org_id = 4;
+}
+
+message GetDataPlaneOrgRevocationEpochRequest {
+  string org_id = 1;
+}
+
+message GetDataPlaneOrgRevocationEpochResponse {
+  string org_id = 1;
+  uint64 epoch = 2;
+  optional google.protobuf.Timestamp updated_at = 3;
+}
+
+enum SandboxRuntimeAccessDecision {
+  SANDBOX_RUNTIME_ACCESS_DECISION_UNSPECIFIED = 0;
+  // No runtime-access blocker is known from control-plane state. The caller may
+  // proceed with its normal route/proxy behavior.
+  SANDBOX_RUNTIME_ACCESS_DECISION_READY = 1;
+  // The sandbox is in, or just finished, a runtime convergence path. Callers
+  // should return a retryable shape instead of a terminal unavailable error.
+  SANDBOX_RUNTIME_ACCESS_DECISION_RETRYABLE_CONVERGING = 2;
+  // The sandbox runtime is gone for good; retrying the same data-plane access
+  // cannot succeed.
+  SANDBOX_RUNTIME_ACCESS_DECISION_TERMINAL_UNAVAILABLE = 3;
+  // Control-plane state exists but cannot be classified safely. Callers should
+  // preserve the original route/proxy failure.
+  SANDBOX_RUNTIME_ACCESS_DECISION_UNKNOWN = 4;
+}
+
+message SandboxRuntimeAccess {
+  SandboxRuntimeAccessDecision decision = 1;
+  uint64 retry_after_ms = 2;
+}
+
+message GetSandboxRuntimeAccessRequest {
+  string sandbox_id = 1;
+}
+
+message GetSandboxRuntimeAccessResponse {
+  SandboxRuntimeAccess access = 1;
+}
+
+enum SandboxServiceRouteKind {
+  SANDBOX_SERVICE_ROUTE_KIND_UNSPECIFIED = 0;
+  SANDBOX_SERVICE_ROUTE_KIND_AGENT = 1;
+  SANDBOX_SERVICE_ROUTE_KIND_SERVICE_PORT = 2;
+}
+
+enum SandboxServiceRouteCredentialKind {
+  SANDBOX_SERVICE_ROUTE_CREDENTIAL_KIND_UNSPECIFIED = 0;
+  SANDBOX_SERVICE_ROUTE_CREDENTIAL_KIND_SANDBOX_AGENT_TOKEN = 1;
+  SANDBOX_SERVICE_ROUTE_CREDENTIAL_KIND_SANDBOX_TRAFFIC_TOKEN = 2;
+  SANDBOX_SERVICE_ROUTE_CREDENTIAL_KIND_ORG_API_KEY = 3;
+}
+
+enum SandboxServiceRouteTransport {
+  SANDBOX_SERVICE_ROUTE_TRANSPORT_UNSPECIFIED = 0;
+  SANDBOX_SERVICE_ROUTE_TRANSPORT_DIRECT = 1;
+  SANDBOX_SERVICE_ROUTE_TRANSPORT_SERVICE_PORT_INGRESS = 2;
+}
+
+message SandboxServiceRouteCredentialProof {
+  SandboxServiceRouteCredentialKind kind = 1;
+  string sha256 = 2;
+}
+
+message UnstableResolveSandboxServiceRouteRequest {
+  string sandbox_id = 1;
+  uint32 port = 2;
+  SandboxServiceRouteKind route_kind = 3;
+  repeated SandboxServiceRouteCredentialProof credential_proofs = 4;
+  SandboxServiceRouteTransport transport = 5;
+}
+
+message UnstableResolveSandboxServiceRouteResponse {
+  string sandbox_id = 1;
+  string org_id = 2;
+  uint32 port = 3;
+  string lifecycle = 4;
+  uint64 route_generation = 5;
+  string current_node_id = 6;
+  DataPlaneBackendEndpoint backend = 7;
+  optional string template_id = 9;
+  optional SpaceApiRouteToken space_api_route_token = 10;
+  optional SpaceApiRouteToken service_port_ingress_token = 11;
+}
+
+message SandboxServiceRouteKey {
+  string sandbox_id = 1;
+  uint32 port = 2;
+  SandboxServiceRouteKind kind = 3;
+}
+
+enum UnstableResetSandboxServiceRouteResult {
+  UNSTABLE_RESET_SANDBOX_SERVICE_ROUTE_RESULT_UNSPECIFIED = 0;
+  UNSTABLE_RESET_SANDBOX_SERVICE_ROUTE_RESULT_NOOP = 1;
+  UNSTABLE_RESET_SANDBOX_SERVICE_ROUTE_RESULT_RESET = 2;
+}
+
+message UnstableResetSandboxServiceRouteRequest {
+  SandboxServiceRouteKey route = 1;
+  uint64 route_generation = 2;
+  optional string diagnostic_message = 3;
+}
+
+message UnstableResetSandboxServiceRouteResponse {
+  UnstableResetSandboxServiceRouteResult result = 1;
+  bool reconcile_enqueued = 2;
+}
+
+message ClaimNodeReconcileRefsRequest {
+  string node_id = 1;
+  uint32 limit = 2;
+  optional space.node.api.v1.NodeRole role = 3;
+}
+
+message ClaimNodeReconcileRefsResponse {
+  repeated space.node.api.v1.FacetRef refs = 1;
+  string claim_token = 2;
+  // The distinct W3C traceparents saved with the claimed refs: the trace
+  // context of the writers that queued them, in the order the claim picked the
+  // refs (longest queued first, then facet, then element). The pass that
+  // applies the refs links to at most eight, sampled ones first, then in this
+  // order. Refs queued without trace context add none.
+  repeated string origin_traceparents = 3;
+}
+
+message FailedNodeReconcileRef {
+  space.node.api.v1.FacetRef ref = 1;
+  string error = 2;
+}
+
+message CompleteNodeReconcileRefsRequest {
+  string node_id = 1;
+  string claim_token = 2;
+  repeated space.node.api.v1.FacetRef succeeded = 3;
+  repeated FailedNodeReconcileRef failed = 4;
+  optional space.node.api.v1.NodeRole role = 5;
+}
+
+message CompleteNodeReconcileRefsResponse {
+  uint64 succeeded = 1;
+  uint64 failed = 2;
+}
+
+message SandboxPortExposureApplyState {
+  string sandbox_id = 1;
+  SandboxPortProtocol protocol = 2;
+  uint32 guest_port = 3;
+  SandboxPortApplyStateKind apply_state = 4;
+  optional string error = 5;
+  // Last observed status of the in-VM loopback bridge installation, mirroring
+  // `space.sandbox.manager.v1.SpacedLoopbackBridgeStatus`. Persisted alongside
+  // the apply_state so a future UI can render port reachability without a live
+  // node probe, and so the reconciler can skip rows that are observed
+  // healthy in steady state.
+  optional SandboxPortBridgeStatus bridge_status = 6;
+  // Last observed `service_generation` from `spaced-guest-svc`. A change
+  // between successive observations means the guest agent restarted (and lost
+  // its in-memory authorized port set), which forces re-application even for
+  // rows whose `apply_state` says `applied`.
+  optional string service_generation = 7;
+}
+
+// Mirrors `space.sandbox.manager.v1.SpacedLoopbackBridgeStatus` numerically;
+// kept as a separate enum here because cluster.proto has no dependency on the
+// sandbox-manager proto.
+enum SandboxPortBridgeStatus {
+  SANDBOX_PORT_BRIDGE_STATUS_UNSPECIFIED = 0;
+  SANDBOX_PORT_BRIDGE_STATUS_DIRECT = 1;
+  SANDBOX_PORT_BRIDGE_STATUS_LOOPBACK_FORWARDED = 2;
+  SANDBOX_PORT_BRIDGE_STATUS_WAITING_FOR_LISTENER = 3;
+  SANDBOX_PORT_BRIDGE_STATUS_BIND_CONFLICT = 4;
+  SANDBOX_PORT_BRIDGE_STATUS_FAILED = 5;
+}
+
+message SandboxPortExposureApplyStateError {
+  string sandbox_id = 1;
+  SandboxPortProtocol protocol = 2;
+  uint32 guest_port = 3;
+  string error = 4;
+}
+
+message PublishSandboxPortExposureStatesRequest {
+  string node_id = 1;
+  repeated SandboxPortExposureApplyState states = 2;
+  optional space.node.api.v1.NodeRole role = 3;
+}
+
+message PublishSandboxPortExposureStatesResponse {
+  uint64 accepted = 1;
+  repeated SandboxPortExposureApplyStateError errors = 2;
+}
+
+message PublishedSandboxState {
+  string sandbox_id = 1;
+  bool present = 2;
+  optional string template = 3;
+  optional string status = 4;
+  optional string content_hash = 5;
+  optional string runtime = 6;
+  optional string created_at = 7;
+  optional string owner = 8;
+  optional space.net.policy.v1.NetworkPolicyV1 observed_network_policy = 9;
+  uint64 observed_network_policy_generation = 10;
+  space.net.policy.v1.NetworkPolicySource observed_network_policy_source = 11;
+  optional uint64 network_tx_bytes = 12;
+  optional uint64 network_rx_bytes = 13;
+  bool snapshots_enabled = 14;
+  optional uint64 disk_usage_bytes = 15;
+  optional string pool_template = 16;
+  optional string failure_reason = 17;
+  repeated space.sandbox.manager.v1.SnapshotDetail snapshots = 18;
+  optional uint32 pid = 19;
+  optional string namespace = 20;
+  optional string uptime = 21;
+  space.net.policy.v1.PolicyAuthority observed_network_policy_authority = 22;
+  space.net.policy.v1.PolicyAuthority auto_lifecycle_authority = 23;
+  optional space.execution.v1.ExecutionMetadata execution = 24;
+  // Most recent node-local sandbox activity timestamp that advanced
+  // auto-lifecycle keepalive state; max(last_access_at, last_command_at).
+  optional google.protobuf.Timestamp last_used_at = 25;
+  // Most recent non-command guest activity: file access, terminal/session
+  // attach, port/protocol sessions, or compatibility data-plane access.
+  optional google.protobuf.Timestamp last_access_at = 26;
+  // Most recent guest command/process execution.
+  optional google.protobuf.Timestamp last_command_at = 27;
+  optional string spaced_version = 28;
+  // Bounded quarantine classification authored by sbx-manager. The cluster
+  // projection validates and preserves it instead of replacing it with a
+  // generic publication reason.
+  optional string quarantine_reason_code = 29;
+  // Generation-fenced proof of a node-local transition.
+  optional space.sandbox.manager.v1.TransitionReceipt transition_receipt = 30;
+  // The node confirms presence and status, but optional inventory fields are
+  // incomplete. The control plane must not replace richer observations with
+  // defaults from this publication.
+  bool state_degraded = 31;
+  // Current immutable artifact identity. These fields are published together
+  // so transition receipts can bind convergence to the exact node evidence.
+  optional string current_local_artifact_id = 32;
+  optional space.sandbox.manager.v1.ArtifactKind current_local_artifact_kind = 33;
+  optional space.sandbox.manager.v1.ArtifactOrigin current_local_artifact_origin = 34;
+  // Exact Kubernetes execution identity observed for this sandbox. The API
+  // uses it with the published suspend artifact to fence finalization to the
+  // execution that produced those bytes.
+  optional int64 execution_generation = 37;
+  optional string pod_uid = 38;
+  // Time the node-local state last changed. This timestamp describes `status`,
+  // not the last update to any other sandbox field.
+  optional google.protobuf.Timestamp state_changed_at = 39;
+  // Node-local quarantine recovery scheduling facts. The cluster stores this
+  // as observation and does not treat it as recovery authority.
+  optional space.sandbox.manager.v1.QuarantineRecoveryObservation quarantine_recovery = 40;
+  // Exact activation attempt observed with this state. Generations may be
+  // reused by placement retries, so attempt-scoped evidence must carry both.
+  optional string activation_attempt_id = 41;
+}
+
+message PublishedTemplateState {
+  string template = 1;
+  bool present = 2;
+  optional string content_hash = 3;
+  optional string runtime = 4;
+  optional string arch = 5;
+  bool has_base_snapshot = 6;
+  optional space.net.policy.v1.NetworkPolicyV1 network_policy = 7;
+  optional bool ensure_base_snapshot = 8;
+  optional uint32 snapshot_vcpu = 9;
+  optional uint32 snapshot_memory_mib = 10;
+  optional string built_at = 11;
+  // Logical expanded rootfs artifact size from build metadata or object transfer.
+  optional uint64 artifact_size_bytes = 12;
+  optional uint64 base_snapshot_size_bytes = 13;
+  optional uint32 pool_target = 14;
+  uint32 pool_current = 15;
+  uint32 pool_pending = 16;
+  repeated string pool_sandbox_ids = 17;
+  repeated space.template.manager.v1.SnapshotInfo snapshots = 18;
+  optional space.sandbox.manager.v1.AutoLifecyclePolicy default_auto_lifecycle = 19;
+  uint64 network_policy_generation = 20;
+  optional uint32 vcpu = 21;
+  optional uint32 memory_mib = 22;
+  optional uint32 disk_size_mb = 23;
+  // Node-local allocated bytes for the materialized template rootfs cache.
+  optional uint64 cache_size_bytes = 24;
+  space.net.policy.v1.PolicyAuthority network_policy_authority = 25;
+  space.net.policy.v1.PolicyAuthority auto_lifecycle_authority = 26;
+  optional space.execution.v1.ExecutionMetadata execution = 27;
+}
+
+message PublishNodeStateRequest {
+  string node_id = 1;
+  bool sandbox_inventory_complete = 2;
+  repeated PublishedSandboxState sandboxes = 3;
+  bool template_inventory_complete = 4;
+  repeated PublishedTemplateState templates = 5;
+  optional space.node.api.v1.NodeRole role = 6;
+  optional PublishedNodeStatus node_status = 7;
+  optional space.execution.v1.NodeExecutionInventory execution_inventory = 8;
+  repeated AutoLifecycleDeleteCompletion auto_lifecycle_delete_completions = 9;
+  // This node's local artifacts with no finalized remote backup.
+  //
+  // Present exactly when the node answered for its whole set. Absent on
+  // every delta publish and on any tick where sandbox-manager could not
+  // answer — both are "the node did not report", and neither means
+  // "nothing is pending". Presence carries that distinction instead of a
+  // sibling flag so a reader cannot reach the list without deciding what to
+  // do when there is no report: an empty list treated as a complete one
+  // releases a node over artifacts nobody enumerated.
+  optional PendingLocalBackupReport pending_local_backups = 10;
+}
+
+// A node's whole answer to "which artifacts on this disk have no durable
+// copy yet". An empty `pending` here does mean nothing is pending; it is
+// the absence of this message that means the node did not answer.
+message PendingLocalBackupReport {
+  repeated space.sandbox.manager.v1.PendingLocalBackup pending = 1;
+}
+
+message PublishNodeStateResponse {
+  uint64 sandboxes_accepted = 1;
+  uint64 templates_accepted = 2;
+  repeated string acknowledged_auto_lifecycle_delete_receipt_ids = 3;
+}
+
+// Durable proof that a node finished a cluster-owned automatic sandbox
+// deletion for one Kubernetes execution generation. Locally authoritative
+// deployments do not emit receipts. The node retries this receipt until the
+// cluster acknowledges its receipt_id.
+message AutoLifecycleDeleteCompletion {
+  string receipt_id = 1;
+  string sandbox_id = 2;
+  int64 execution_generation = 3;
+  // Identifies the exact route activation within the execution generation.
+  string route_activation_id = 4;
+  // SHA-256 identity of the normalized policy that authorized this delete.
+  string auto_lifecycle_policy_fingerprint = 5;
+}
+
+message PublishedNodeStatus {
+  space.node.api.v1.NodeSchedulingStatus scheduling_status = 1;
+  string scheduling_reason = 2;
+  uint32 network_slots_ready = 3;
+  uint32 network_pool_min_ready = 4;
+  uint32 network_slots_degraded = 5;
+  uint32 network_slots_quarantined = 6;
+  uint32 network_slots_total = 7;
+  uint32 network_slots_leased = 8;
+  uint32 network_pool_max_slots = 9;
+  optional space.node.api.v1.NodeCtlStatus node_ctl = 10;
+}
+
+// Terminal lifecycle state a backup attempt can be transitioned into by
+// `FinalizeArtifactBackup`. `creating` is the implicit starting state set by
+// `BeginArtifactBackup` and is not selectable here.
+enum SuspendSnapshotTerminalState {
+  SUSPEND_SNAPSHOT_TERMINAL_STATE_UNSPECIFIED = 0;
+  // Upload completed; row becomes visible to restore-side readers.
+  SUSPEND_SNAPSHOT_TERMINAL_STATE_READY = 1;
+  // Upload pipeline gave up permanently; row stays invisible to restore.
+  SUSPEND_SNAPSHOT_TERMINAL_STATE_FAILED = 2;
+}
+
+message BeginArtifactBackupRequest {
+  // Identity of immutable locally published bytes to back up.
+  string sandbox_id = 1;
+  string local_artifact_id = 2;
+  space.sandbox.manager.v1.ArtifactKind artifact_kind = 3;
+  // UUIDv7 identity of this independently retryable backup attempt.
+  string backup_attempt_id = 4;
+  string storage_uri = 5;
+  space.sandbox.manager.v1.ArtifactOrigin artifact_origin = 6;
+  optional string snapshot_name = 7;
+  // Exact source environment encoded in the artifact metadata sidecar.
+  // Required: the server rejects a request without it as INVALID_ARGUMENT.
+  space.execution.v1.ExecutionMetadata execution = 8;
+  // CPU identity of the host that captured the artifact's VM state, as a
+  // Kubernetes label value. Absent when unknown. The cluster API records it
+  // in the snapshot's execution metadata as restore-placement evidence.
+  optional string capture_host_cpu = 9;
+  // Kubernetes execution generation whose runtime captured the artifact: a
+  // teardown suspend's own capture (the API's generation-bound suspend
+  // included), a node-local suspend, or a backup requested again by local
+  // artifact id, which carries the generation of that artifact's earlier
+  // upload. When set, the server refuses the first registration of a local
+  // artifact whose generation was superseded: a newer execution is active or
+  // has materialized a pod, or this generation's execution was retired as
+  // replaced. So a runtime no restore can adopt (e.g. a reaped orphaned
+  // restore pod's VM) can't register a snapshot. The fence covers
+  // registration only: an admitted attempt can still finalize, a replay of an
+  // already-registered attempt isn't re-fenced, and a fresh attempt for bytes
+  // an earlier attempt registered is a retry and isn't fenced either. Unset
+  // for backups that aren't bound to one execution.
+  optional int64 execution_generation = 10;
+  // Answer as this registration would, the generation fence and the source
+  // node check included, but persist nothing: no snapshot row is created or
+  // changed. A node sets it to recover the fence's verdict for an upload that
+  // already failed, so asking leaves no row that could outrank a ready
+  // snapshot. A server that predates the field registers the attempt and
+  // leaves `fence_verdict_only` unset in its response.
+  bool fence_verdict_only = 11;
+}
+
+message BeginArtifactBackupResponse {
+  string local_artifact_id = 1;
+  string backup_attempt_id = 2;
+  // Echoes the request's `fence_verdict_only`: set when the server persisted
+  // nothing. Unset in a reply to a verdict-only request means the server
+  // predates the field and registered the attempt, which the caller then
+  // closes.
+  bool fence_verdict_only = 3;
+}
+
+message FinalizeArtifactBackupRequest {
+  string backup_attempt_id = 1;
+  SuspendSnapshotTerminalState target_state = 2;
+  int64 bytes_uploaded = 3;
+  optional string failure_reason = 4;
+  // Digests of the artifacts this attempt uploaded. Recorded only for READY
+  // and write-once: a replay must repeat the same digests.
+  repeated SnapshotArtifactDigest artifact_digests = 5;
+}
+
+// Content digest of one artifact file in a backup attempt, reported by the
+// uploading node and handed back to restore so the bytes it pulls are
+// verified against the catalog rather than trusted from the object store.
+message SnapshotArtifactDigest {
+  // Canonical file name under the attempt prefix: `memfile`, `binfile`,
+  // `rootfs`, `rootfs.btrfs-send`, `snapshot.luks`, `cow.luks`, or
+  // `metadata.json`.
+  string artifact = 1;
+  // `sha256:<64 lowercase hex>` over the artifact bytes as they exist on the
+  // node, before any transfer compression or encryption.
+  string digest = 2;
+  // Size in bytes of the same bytes the digest covers.
+  uint64 size_bytes = 3;
+}
+
+message FinalizeArtifactBackupResponse {}
+
+message TouchArtifactBackupRequest {
+  string backup_attempt_id = 1;
+}
+
+message TouchArtifactBackupResponse {}
+
+message GetArtifactBackupLocationRequest {
+  // Select a ready remote copy only for this exact immutable local artifact.
+  string sandbox_id = 1;
+  string local_artifact_id = 2;
+  space.sandbox.manager.v1.ArtifactKind artifact_kind = 3;
+  // Set for a readiness query, which leaves `local_artifact_id` empty and
+  // `artifact_kind` unspecified. A server without readiness support ignores
+  // this field and rejects the empty artifact id instead of returning a
+  // location.
+  BackupReadinessQuery readiness = 4;
+}
+
+message BackupReadinessQuery {
+  oneof artifact {
+    // Ready when these exact immutable bytes have a ready, non-orphaned
+    // backup.
+    LocalArtifactBackupIdentity local_artifact = 1;
+    // An unpinned cache's suspend attempt. Ready only while it is still the
+    // latest ready full suspend, not merely an older attempt with a backup.
+    string latest_ready_suspend_snapshot_id = 2;
+    // Ready when the sandbox is durably restorable from a ready snapshot the
+    // restore would select: a restoring one needs a source in its retry
+    // window, any other one marked to a local artifact that artifact's ready
+    // backup, and an unmarked one a ready newest full snapshot (fresher than
+    // its last placement change unless it is marked for evacuation). Unlike the
+    // other two, it names no identity the caller holds, so any registered node
+    // learns whether a sandbox it names is restorable. Must be true.
+    bool durably_restorable = 3;
+  }
+}
+
+message LocalArtifactBackupIdentity {
+  string local_artifact_id = 1;
+  space.sandbox.manager.v1.ArtifactKind artifact_kind = 2;
+}
+
+message GetArtifactBackupLocationResponse {
+  string local_artifact_id = 1;
+  space.sandbox.manager.v1.ArtifactKind artifact_kind = 2;
+  string backup_attempt_id = 3;
+  string storage_uri = 4;
+  int64 bytes_uploaded = 5;
+  // Empty for attempts finalized before digests were recorded.
+  repeated SnapshotArtifactDigest artifact_digests = 6;
+  // Set only in reply to a readiness query; every other field is then empty.
+  optional bool ready = 7;
+}
+
+message GetQuarantineRecoveryPlanRequest {
+  // Authenticated node requesting recovery. The server verifies that the
+  // sandbox's active execution is still assigned to this node.
+  string node_id = 1;
+  string sandbox_id = 2;
+  optional space.node.api.v1.NodeRole role = 3;
+}
+
+enum QuarantineRecoveryTargetState {
+  QUARANTINE_RECOVERY_TARGET_STATE_UNSPECIFIED = 0;
+  QUARANTINE_RECOVERY_TARGET_STATE_SUSPENDED = 1;
+}
+
+message QuarantineRecoverySuspendSnapshot {
+  string snapshot_id = 1;
+  // Immutable artifact identity for modern snapshots. Empty only for legacy
+  // snapshots created before artifact identity was recorded.
+  string local_artifact_id = 2;
+  string storage_uri = 3;
+  int64 bytes_uploaded = 4;
+}
+
+message GetQuarantineRecoveryPlanResponse {
+  // The central quarantine episode id. This is also the node cleanup episode
+  // and transition receipt id, making retries idempotent across restarts.
+  string recovery_id = 1;
+  int64 execution_generation = 2;
+  string reason_code = 3;
+  QuarantineRecoveryTargetState target_state = 4;
+  QuarantineRecoverySuspendSnapshot suspend_snapshot = 5;
+}
+
+message GetSandboxSnapshotStorageUriRequest {
+  // Sandbox whose org-level override should be resolved.
+  string sandbox_id = 1;
+}
+
+message GetSandboxSnapshotStorageUriResponse {
+  // The org's `snapshot_base_object_storage_uri`, when set. Absent means
+  // "no override; caller should use its own default". Returned verbatim;
+  // the cluster API does not parse or validate it (parsing is done by the
+  // node-side `SnapshotUploadConfig::from_uri`).
+  optional string storage_uri = 1;
+}
+
+message GetSuspendSnapshotLocationRequest {
+  // Sandbox whose latest suspend snapshot location should be returned.
+  string sandbox_id = 1;
+}
+
+message GetSuspendSnapshotLocationResponse {
+  // ID of the `snapshots` row backing this location.
+  string snapshot_id = 1;
+  // `s3://bucket/<prefix>/suspend_snapshots/<sandbox_id>?region=…` connection
+  // string identifying where the artifacts live.
+  string storage_uri = 2;
+  // Total compressed bytes of all VM artifacts that were uploaded.
+  int64 bytes_uploaded = 3;
+  // Empty for snapshots finalized before digests were recorded.
+  repeated SnapshotArtifactDigest artifact_digests = 4;
+}

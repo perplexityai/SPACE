@@ -307,7 +307,14 @@ async fn publication_authority_is_method_scoped_and_comes_from_token_review() {
             (false, false),
         ),
     ] {
-        for method in ["RegisterTemplate", "RegisterTemplateRelease"] {
+        for (service, method) in [
+            "space.node.api.v1.ClusterApi",
+            "space.cluster.api.v1.ClusterApi",
+        ]
+        .into_iter()
+        .flat_map(|service| {
+            ["RegisterTemplate", "RegisterTemplateRelease"].map(|method| (service, method))
+        }) {
             let (mut reviewer, calls) = reviewer(
                 bound_publisher_status(
                     "space-cluster-api",
@@ -328,7 +335,7 @@ async fn publication_authority_is_method_scoped_and_comes_from_token_review() {
             auth.surface = BuildSurface::Publication;
             let result = auth
                 .authenticate(
-                    &format!("/space.node.api.v1.ClusterApi/{method}"),
+                    &format!("/{service}/{method}"),
                     Some(&format!("Bearer {TOKEN}")),
                 )
                 .await
@@ -344,7 +351,7 @@ async fn publication_authority_is_method_scoped_and_comes_from_token_review() {
             assert_eq!(
                 result.as_ref().err().map(tonic::Status::code),
                 expected,
-                "{account}: {method}"
+                "{account}: {service}/{method}"
             );
             assert_eq!(
                 result.unwrap_or((false, false)),

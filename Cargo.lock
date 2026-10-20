@@ -5183,6 +5183,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-cluster-api-client"
+version = "0.8.0"
+dependencies = [
+ "anyhow",
+ "insta",
+ "pplx-space-common-core",
+ "pplx-space-common-grpc",
+ "pplx-space-common-grpc-lb",
+ "pplx-space-common-proto-build",
+ "pplx-space-common-svc",
+ "pplx-space-execution-common",
+ "pplx-space-net-common",
+ "pplx-space-node-api-types",
+ "pplx-space-sbx-mgr-client",
+ "pplx-space-template-mgr-client",
+ "prost",
+ "prost-types",
+ "thiserror 2.0.20",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tracing",
+]
+
+[[package]]
 name = "pplx-space-cluster-controller"
 version = "0.8.0"
 dependencies = [
@@ -5816,6 +5841,7 @@ dependencies = [
  "insta",
  "k8s-openapi",
  "kube",
+ "pplx-space-cluster-api-client",
  "pplx-space-cluster-pool",
  "pplx-space-cluster-trigger-queue",
  "pplx-space-common-core",
@@ -6067,6 +6093,7 @@ dependencies = [
  "pplx-space-execution-common",
  "pplx-space-net-common",
  "pplx-space-net-gateway-client",
+ "pplx-space-node-api-types",
  "pplx-space-node-mgr-client",
  "pplx-space-sbx-mgr-client",
  "pplx-space-template-mgr-client",
@@ -6167,6 +6194,18 @@ dependencies = [
  "clap",
  "pplx-space-common-svc",
  "pplx-space-node-api-server",
+]
+
+[[package]]
+name = "pplx-space-node-api-types"
+version = "0.8.0"
+dependencies = [
+ "anyhow",
+ "pplx-space-common-proto-build",
+ "prost",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
 ]
 
 [[package]]
