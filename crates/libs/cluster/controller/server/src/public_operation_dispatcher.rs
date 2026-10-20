@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -22,9 +22,10 @@ use pplx_space_api::public_sandbox_operations::{
     UpdateSandboxOperationExecutor,
 };
 use pplx_space_api::public_template_operations::DeleteTemplateOperationExecutor;
+use pplx_space_api::retry_deferral::RetryDeferral;
 use pplx_space_api::tls_interception_exemptions::TlsInterceptionExemptions;
 use pplx_space_feature_flags::FeatureFlagClient;
-use pplx_space_public_api::{OperationKind, OperationState, PublicErrorCode};
+use pplx_space_public_api::{OperationId, OperationKind, OperationState, PublicErrorCode};
 use sqlx::PgPool;
 use std::sync::Arc;
 use tokio::task::JoinSet;
@@ -54,8 +55,9 @@ const RETRY_BACKOFF_MAX_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_RETRY_BAC
 const RETRY_BACKOFF_MAX_CEILING: Duration = Duration::from_secs(900);
 /// How soon an operation handed back because its key is already executing
 /// in this process becomes claimable again.
-const KEY_BUSY_RETRY_AFTER: Duration = Duration::from_secs(1);
+const BUSY_KEY_RETRY_AFTER: Duration = Duration::from_secs(1);
 const KEYED_CLAIM_ENABLED_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_KEYED_CLAIM_ENABLED";
+const RETRY_DEFERRAL_ENABLED_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_RETRY_DEFERRAL_ENABLED";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconcilerConfig {
@@ -69,10 +71,12 @@ pub struct ReconcilerConfig {
     pub m1_max_age: Option<Duration>,
     pub retry_backoff_base: Duration,
     pub retry_backoff_max: Duration,
-    /// Kill switch for the keyed work queue: off restores the unkeyed
-    /// request-order claim, in-slot retry waits, and the executor's fixed
-    /// retry pacing.
+    /// Kill switch for the keyed work queue: off restores the unkeyed claim
+    /// and the executor's fixed pacing for counted retries.
     pub keyed_claim_enabled: bool,
+    /// Kill switch for retry deferral, independent of the keyed claim: off
+    /// keeps every retry wait inside the execution's slot, as before.
+    pub retry_deferral_enabled: bool,
 }
 
 impl Default for ReconcilerConfig {
@@ -89,6 +93,7 @@ impl Default for ReconcilerConfig {
             retry_backoff_base: DEFAULT_RETRY_BACKOFF_BASE,
             retry_backoff_max: DEFAULT_RETRY_BACKOFF_MAX,
             keyed_claim_enabled: true,
+            retry_deferral_enabled: true,
         }
     }
 }
@@ -147,6 +152,8 @@ impl ReconcilerConfig {
             ),
             keyed_claim_enabled: config
                 .truthy_default(KEYED_CLAIM_ENABLED_ENV, default.keyed_claim_enabled),
+            retry_deferral_enabled: config
+                .truthy_default(RETRY_DEFERRAL_ENABLED_ENV, default.retry_deferral_enabled),
             m1_max_age: config
                 .test_optional_positive_duration_secs(
                     M1_MAX_AGE_ENV,
@@ -372,6 +379,7 @@ pub async fn run<E>(
         retry_backoff_base_secs = config.retry_backoff_base.as_secs(),
         retry_backoff_max_secs = config.retry_backoff_max.as_secs(),
         keyed_claim_enabled = config.keyed_claim_enabled,
+        retry_deferral_enabled = config.retry_deferral_enabled,
         "starting public-operation-dispatcher"
     );
 
@@ -389,14 +397,27 @@ pub async fn run<E>(
     let concurrency = config.execution_concurrency.max(1);
     let execution_config = execution_config(&config);
     let mut in_flight = JoinSet::new();
-    let mut busy_keys: HashSet<String> = HashSet::new();
+    let mut busy_keys: HashMap<String, OperationId> = HashMap::new();
     let mut task_keys: HashMap<tokio::task::Id, String> = HashMap::new();
+    // Busy-key hand-backs write to the store, so they run beside the claim
+    // loop rather than inside it.
+    let mut hand_backs = JoinSet::new();
+    // Reclaiming an operation that is still executing here means its local
+    // execution lost the claim; it notices at its next renewal, so retrying
+    // sooner than that only churns the claim. Any other collision is an
+    // execution that already finished in the store and is not yet reaped.
+    let stale_reclaim_retry_after = execution_config.claim_stale_after / 3;
     let mut last_claim_failure_warn: Option<Instant> = None;
     let mut suppressed_claim_failures: u64 = 0;
 
     loop {
         tokio::select! {
             _ = interval.tick() => {
+                // Reap executions that already finished so their slots and
+                // keys are free before this claim.
+                while let Some(joined) = in_flight.try_join_next_with_id() {
+                    finish_execution(joined, &mut busy_keys, &mut task_keys);
+                }
                 pplx_space_metrics::operations::dispatcher_slots(in_flight.len(), concurrency);
                 let free = concurrency.saturating_sub(in_flight.len());
                 if free == 0 {
@@ -412,10 +433,23 @@ pub async fn run<E>(
                                 .then(|| operation.work_key().map(str::to_owned))
                                 .flatten();
                             if let Some(key) = &key
-                                && !busy_keys.insert(key.clone())
+                                && let Some(&running) = busy_keys.get(key)
                             {
-                                hand_back_busy_key(&store, &claim.claim_token, &operation).await;
+                                let retry_after = if running == operation.id {
+                                    stale_reclaim_retry_after
+                                } else {
+                                    BUSY_KEY_RETRY_AFTER
+                                };
+                                hand_backs.spawn(hand_back_busy_key(
+                                    store.clone(),
+                                    claim.claim_token.clone(),
+                                    operation,
+                                    retry_after,
+                                ));
                                 continue;
+                            }
+                            if let Some(key) = &key {
+                                busy_keys.insert(key.clone(), operation.id);
                             }
                             let span = execution_span(&operation);
                             let execution = execute_claimed_operation(
@@ -423,7 +457,7 @@ pub async fn run<E>(
                                 executor.clone(),
                                 claim.claim_token.clone(),
                                 execution_config,
-                                config.keyed_claim_enabled,
+                                config.retry_deferral_enabled,
                                 operation,
                             )
                             .instrument(span);
@@ -461,6 +495,7 @@ pub async fn run<E>(
             Some(joined) = in_flight.join_next_with_id(), if !in_flight.is_empty() => {
                 finish_execution(joined, &mut busy_keys, &mut task_keys);
             }
+            Some(_) = hand_backs.join_next(), if !hand_backs.is_empty() => {}
             _ = shutdown_token.cancelled() => break,
         }
     }
@@ -471,6 +506,7 @@ pub async fn run<E>(
     while let Some(joined) = in_flight.join_next_with_id().await {
         finish_execution(joined, &mut busy_keys, &mut task_keys);
     }
+    while hand_backs.join_next().await.is_some() {}
 }
 
 type ExecutionOutcome =
@@ -481,7 +517,7 @@ type ExecutionOutcome =
 /// so the claim query recovers the operation in its key's order.
 fn finish_execution(
     joined: Result<(tokio::task::Id, ExecutionOutcome), tokio::task::JoinError>,
-    busy_keys: &mut HashSet<String>,
+    busy_keys: &mut HashMap<String, OperationId>,
     task_keys: &mut HashMap<tokio::task::Id, String>,
 ) {
     let task_id = match &joined {
@@ -497,9 +533,10 @@ fn finish_execution(
 /// Requeue an operation this process cannot start because another of its
 /// key's operations is still executing here, without charging an attempt.
 async fn hand_back_busy_key(
-    store: &PublicOperationStore,
-    claim_token: &str,
-    operation: &ClaimedPublicOperation,
+    store: PublicOperationStore,
+    claim_token: String,
+    operation: ClaimedPublicOperation,
+    retry_after: Duration,
 ) {
     tracing::warn!(
         operation_id = %operation.id,
@@ -510,10 +547,10 @@ async fn hand_back_busy_key(
     );
     if let Err(error) = store
         .release_claimed_operation(ReleaseClaimedPublicOperation {
-            claim_token: claim_token.to_owned(),
+            claim_token,
             operation_id: operation.id,
             progress_message: "waiting for an earlier operation on the same sandbox".to_owned(),
-            retry_after: KEY_BUSY_RETRY_AFTER,
+            retry_after,
             count_attempt: false,
         })
         .await
@@ -605,7 +642,7 @@ where
             executor.clone(),
             claim.claim_token.clone(),
             execution_config,
-            config.keyed_claim_enabled,
+            config.retry_deferral_enabled,
             operation,
         )
         .instrument(span)
@@ -632,22 +669,31 @@ where
 {
     let execution_claim_token = claim_token.clone();
     let execution_operation = operation.clone();
+    let deferral = defer_retry_waits.then(RetryDeferral::new);
+    let recorded = deferral.clone();
+    let execution = pplx_space_api::retry_deferral::scope(deferral, async move {
+        executor
+            .execute(&execution_claim_token, execution_operation)
+            .await
+    });
     drive_claimed_operation(
         store,
         claim_token,
         config,
         operation,
         OperationExecutor::Dispatcher,
-        // Boxed so the deferral wrapper does not hold a second copy of the
-        // executor's future on the stack.
-        pplx_space_api::retry_deferral::scope(
-            defer_retry_waits,
-            Box::pin(async move {
-                executor
-                    .execute(&execution_claim_token, execution_operation)
-                    .await
-            }),
-        ),
+        async move {
+            let mut result = execution.await;
+            // A requeue after a step handed its wait back is the deferral,
+            // not a fresh failure: it spends no attempt and is bounded by
+            // the operation's age.
+            if result.state == OperationState::Queued
+                && recorded.as_ref().is_some_and(RetryDeferral::deferred)
+            {
+                result.requeue_reason = PublicOperationRequeueReason::RetryDeferred;
+            }
+            result
+        },
     )
     .await
 }

@@ -1490,4 +1490,5 @@ fn test_route_ed25519_authority() -> Arc<SpaceApiRouteEd25519Authority> {
     }
 }
 
+mod deferral;
 mod keyed_queue;

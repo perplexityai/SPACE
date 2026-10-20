@@ -5302,22 +5302,45 @@ mod kubernetes_tests {
             .expect("inserted sandbox must be visible");
         let (substrate, request_count) = substrate_with_failed_pod_creates(pool);
 
+        let deferral = crate::retry_deferral::RetryDeferral::new();
+
         // Act.
+        let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+        let started = tokio::time::Instant::now();
         let result = tokio::time::timeout(
-            Duration::from_secs(5),
-            crate::retry_deferral::defer_retry_waits(
+            Duration::from_secs(10),
+            crate::retry_deferral::scope(
+                Some(deferral.clone()),
                 substrate.wake_execution_with_metric_identity(
                     &sandbox,
                     Duration::from_secs(60),
-                    SandboxApiMetricIdentity::ecw("connect"),
+                    SandboxApiMetricIdentity::native("wake"),
                     crate::controllers::substrate::RecoveryCharge::Exempt,
                 ),
             ),
         )
         .await
         .expect("a deferred re-drive must not wait out its 60s readiness budget");
+        let elapsed = started.elapsed();
+        let counters = capture.finish();
 
-        // Assert.
+        // Assert: the caller kept retrying in place through the grace, then
+        // handed the wait back and recorded that it did.
+        assert!(
+            elapsed >= crate::controllers::substrate::kubernetes::execution::RETRY_DEFERRAL_GRACE,
+            "the grace keeps fast retries in place: {elapsed:?}"
+        );
+        assert!(elapsed < Duration::from_secs(6), "{elapsed:?}");
+        assert!(deferral.deferred());
+        let redrives: u64 = counters
+            .iter()
+            .filter(|counter| counter.tags.iter().any(|tag| tag == "lap:conflict_redrive"))
+            .map(|counter| counter.value)
+            .sum();
+        assert!(
+            redrives >= 2,
+            "expected in-place retries during the grace: {counters:?}"
+        );
         let error = match result {
             Ok(_) => panic!("a fence-blocked wake cannot win the claim"),
             Err(error) => error,
@@ -5354,7 +5377,7 @@ mod kubernetes_tests {
             .await?
             .expect("inserted sandbox must be visible");
         let (substrate, request_count) = substrate_with_failed_pod_creates(pool);
-        let http_budget = Duration::from_millis(1_500);
+        let http_budget = Duration::from_secs(5);
 
         // Act: the dispatcher caller is polled first, so it owns the run the
         // HTTP caller joins.
@@ -5362,7 +5385,8 @@ mod kubernetes_tests {
         let started = tokio::time::Instant::now();
         let (dispatcher, http) = tokio::join!(
             async {
-                let result = crate::retry_deferral::defer_retry_waits(
+                let result = crate::retry_deferral::scope(
+                    Some(crate::retry_deferral::RetryDeferral::new()),
                     substrate.wake_execution_with_metric_identity(
                         &sandbox,
                         Duration::from_secs(60),
@@ -5410,7 +5434,10 @@ mod kubernetes_tests {
             dispatcher_error.to_string().contains("deferring"),
             "{dispatcher_error}"
         );
-        assert!(dispatcher_elapsed < Duration::from_secs(1));
+        assert!(
+            dispatcher_elapsed < http_budget - Duration::from_secs(1),
+            "{dispatcher_elapsed:?}"
+        );
 
         let (http_result, http_elapsed) = http;
         let http_error = match http_result {

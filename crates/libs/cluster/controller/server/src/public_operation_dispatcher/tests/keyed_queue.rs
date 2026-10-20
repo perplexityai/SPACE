@@ -5,7 +5,6 @@
 use super::*;
 use pplx_space_api::public_operation_driver::counted_retry_backoff;
 use pplx_space_api::public_operations::PUBLIC_OPERATION_CLAIM_LOCK_KEY;
-use pplx_space_api::retry_deferral::retry_waits_deferred;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -54,7 +53,7 @@ impl PublicOperationExecutor for KeyedRecordingExecutor {
             let now = self.stuck_running.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_stuck_running.fetch_max(now, Ordering::SeqCst);
             self.stuck_attempts.fetch_add(1, Ordering::SeqCst);
-            if !retry_waits_deferred() {
+            if !pplx_space_api::retry_deferral::defer_retry_wait("test") {
                 self.undeferred_stuck_attempts
                     .fetch_add(1, Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_secs(30)).await;
@@ -660,4 +659,53 @@ fn keyed_claim_kill_switch_reads_from_env() {
     assert!(!ReconcilerConfig::from_environment(&env).keyed_claim_enabled);
     env.set(KEYED_CLAIM_ENABLED_ENV, "true");
     assert!(ReconcilerConfig::from_environment(&env).keyed_claim_enabled);
+}
+
+/// Regression: before the keyed claim, a delete requested after a create
+/// could run first and hard-delete the row, and the create would then
+/// rebuild the sandbox under the same id. The delete now waits for the
+/// create, even while the create sits in retry backoff.
+#[tokio::test]
+async fn a_delete_requested_after_a_create_never_runs_first() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let create = create_op(
+        &store,
+        org_id,
+        OperationKind::CreateSandbox,
+        "sbx_resurrect",
+    )
+    .await?;
+    let delete = create_op(
+        &store,
+        org_id,
+        OperationKind::DeleteSandbox,
+        "sbx_resurrect",
+    )
+    .await?;
+    // The create failed once and is waiting out its backoff.
+    defer_until(&db.pool, create, 300).await?;
+    let executor = KeyedRecordingExecutor::default();
+    let config = ReconcilerConfig {
+        claim_limit: 8,
+        execution_concurrency: 8,
+        ..single_claim_config()
+    };
+
+    let report = tick(&config, &store, &executor).await?;
+    assert_eq!(
+        report.claimed, 0,
+        "the delete must wait for the pending create"
+    );
+
+    defer_until(&db.pool, create, 0).await?;
+    while tick(&config, &store, &executor).await?.claimed > 0 {}
+
+    let completed = executor.completed.lock().expect("lock").clone();
+    let order: Vec<_> = completed.into_iter().map(|(_, id)| id).collect();
+    assert_eq!(order, vec![create, delete]);
+    Ok(())
 }

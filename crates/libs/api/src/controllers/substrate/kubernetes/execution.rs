@@ -34,6 +34,9 @@ const RECOVERY_JOIN_MAX_DELAY: Duration = Duration::from_secs(5);
 /// budget-elapsed error. The grace only covers publish/scheduling latency —
 /// the run itself never runs longer because of it.
 const COALESCED_RUN_PUBLISH_GRACE: Duration = Duration::from_millis(500);
+/// How long a deferring caller keeps retrying a fenced restore claim inside
+/// its slot before handing the wait back.
+pub(crate) const RETRY_DEFERRAL_GRACE: Duration = Duration::from_secs(2);
 
 /// The follower-join backoff's two bounds, carried on the substrate so a
 /// test can shorten a join's re-check without touching the wake path it is
@@ -1127,27 +1130,23 @@ impl KubernetesSubstrate {
                     let run_sandbox = wake_sandbox.clone();
                     let handling = restore_claim_handling.clone();
                     let wake_trace = crate::wake_trace::current();
-                    let retry_waits_deferred = crate::retry_deferral::retry_waits_deferred();
+                    // The run is detached, so it re-enters the owner's retry
+                    // deferral explicitly, as it does the wake trace.
+                    let retry_deferral = crate::retry_deferral::current();
                     crate::wake_trace::scope(
                         wake_trace,
-                        // Boxed so the scope wrappers hold a pointer rather
-                        // than another copy of the large wake future on the
-                        // stack while the run is built.
-                        crate::retry_deferral::scope(
-                            retry_waits_deferred,
-                            Box::pin(async move {
-                                substrate
-                                    .wake_execution_uncoalesced(
-                                        &run_sandbox,
-                                        timeout,
-                                        metric_identity,
-                                        None,
-                                        target,
-                                        handling,
-                                    )
-                                    .await
-                            }),
-                        ),
+                        crate::retry_deferral::scope(retry_deferral, async move {
+                            substrate
+                                .wake_execution_uncoalesced(
+                                    &run_sandbox,
+                                    timeout,
+                                    metric_identity,
+                                    None,
+                                    target,
+                                    handling,
+                                )
+                                .await
+                        }),
                     )
                 })
                 .await;
@@ -1206,15 +1205,6 @@ impl KubernetesSubstrate {
                         metric_identity,
                         outcome,
                     );
-                    if crate::retry_deferral::retry_waits_deferred() {
-                        pplx_space_metrics::operations::retry_wait_deferred(
-                            "coalesced_wake_rerace",
-                        );
-                        return Err(SubstrateError::restore_in_flight(format!(
-                            "sandbox {sandbox_id} coalesced wake run failed; deferring \
-                             the retry to the caller"
-                        )));
-                    }
                     if tokio::time::timeout_at(
                         join_deadline,
                         tokio::time::sleep(rerace_backoff.next_delay()),
@@ -1288,6 +1278,7 @@ impl KubernetesSubstrate {
         let (_, join_deadline) = ready_wait_bounds(timeout);
         let mut join_backoff = RecoveryJoinBackoff::new(self.recovery_join_backoff);
         let mut refreshed_sandbox = None;
+        let mut conflict_started = None;
         let prepared = loop {
             let current_sandbox = refreshed_sandbox.as_ref().unwrap_or(sandbox);
             let lap = match self
@@ -1351,10 +1342,13 @@ impl KubernetesSubstrate {
                     // `Conflict`, not `RestoreInFlight`, so this lap has no
                     // other sleep or deadline check — pace it inside the
                     // readiness budget and stop when the budget elapses.
-                    if crate::retry_deferral::retry_waits_deferred() {
-                        pplx_space_metrics::operations::retry_wait_deferred(
-                            "restore_claim_conflict",
-                        );
+                    // A deferring caller keeps the fast first retries, since
+                    // a fence often clears within moments, then hands the
+                    // longer wait back instead of holding its slot.
+                    let conflicted_since = *conflict_started.get_or_insert_with(Instant::now);
+                    if conflicted_since.elapsed() >= RETRY_DEFERRAL_GRACE
+                        && crate::retry_deferral::defer_retry_wait("restore_claim_conflict")
+                    {
                         return Err(SubstrateError::restore_in_flight(format!(
                             "sandbox {sandbox_id} restore claim is unavailable; deferring \
                              the retry to the caller"

@@ -114,7 +114,8 @@ fn classify_fork_attempt(
 ) {
     let retry_kind = if result.state == OperationState::Queued {
         Some(match result.requeue_reason {
-            PublicOperationRequeueReason::TransientFailure => {
+            PublicOperationRequeueReason::TransientFailure
+            | PublicOperationRequeueReason::RetryDeferred => {
                 pplx_space_metrics::sandbox_fork::ForkRetryKind::TransientFailure
             }
             PublicOperationRequeueReason::WorkflowProgress => {
@@ -136,7 +137,8 @@ fn classify_fork_attempt(
         | OperationState::Expired
         | OperationState::Other(_) => pplx_space_metrics::sandbox_fork::ForkAttemptOutcome::Failed,
         OperationState::Queued | OperationState::Running => match result.requeue_reason {
-            PublicOperationRequeueReason::TransientFailure => {
+            PublicOperationRequeueReason::TransientFailure
+            | PublicOperationRequeueReason::RetryDeferred => {
                 pplx_space_metrics::sandbox_fork::ForkAttemptOutcome::TransientRetry
             }
             PublicOperationRequeueReason::WorkflowProgress

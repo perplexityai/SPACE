@@ -52,3 +52,11 @@ shim/tracing*.go
 ci/mirrored-images.txt
 # Generates the SDK native.m1_generated_sdk_conformance drives.
 scripts/check-m1-sdk-generation.sh
+# The public-operation claim, driver and dispatcher decide the order and
+# concurrency of every lifecycle operation the Kind scenarios drive.
+crates/libs/api/src/public_operations.rs
+crates/libs/api/src/public_operation_driver.rs
+crates/libs/api/src/retry_deferral.rs
+crates/libs/api/src/retry_deferral/**
+crates/libs/cluster/controller/server/src/public_operation_dispatcher.rs
+crates/libs/cluster/controller/server/src/public_operation_dispatcher/**

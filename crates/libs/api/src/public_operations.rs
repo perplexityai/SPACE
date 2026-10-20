@@ -1226,6 +1226,10 @@ pub enum PublicOperationRequeueReason {
     TransientFailure,
     WorkflowProgress,
     ActivationBackpressure,
+    /// The execution handed a retry wait back to the dispatcher instead of
+    /// sleeping in its slot. Not a failure of its own: it spends no attempt
+    /// and is bounded by the operation's age instead.
+    RetryDeferred,
 }
 
 impl PublicOperationRequeueReason {
@@ -1234,11 +1238,15 @@ impl PublicOperationRequeueReason {
             Self::TransientFailure => "transient_failure",
             Self::WorkflowProgress => "workflow_progress",
             Self::ActivationBackpressure => "activation_backpressure",
+            Self::RetryDeferred => "retry_deferred",
         }
     }
 
     pub const fn preserves_retry_budget(self) -> bool {
-        matches!(self, Self::WorkflowProgress | Self::ActivationBackpressure)
+        matches!(
+            self,
+            Self::WorkflowProgress | Self::ActivationBackpressure | Self::RetryDeferred
+        )
     }
 }
 
@@ -1464,73 +1472,26 @@ async fn claim_operations(
         .collect::<Vec<_>>();
 
     let mut tx = pool.begin().await?;
-    // Claim in order of when each operation became claimable, so a requeued
-    // retry waits behind work that was queued before its backoff expired.
-    let rows = if mode == ClaimMode::Unkeyed {
-        sqlx::query_as::<_, DispatcherClaimRow>(sql!(
-            "WITH picked AS (
-                 SELECT operation_id,
-                        GREATEST(requested_at, next_attempt_at) AS claimable_at,
-                        claim_token <> '' AS reclaimed
-                 FROM public_operations
-                 WHERE state IN ($4, $5)
-                   AND kind = ANY($6)
-                   AND next_attempt_at <= NOW()
-                   AND (
-                       claim_token = ''
-                       OR claimed_at <= NOW() - make_interval(secs => $2::BIGINT)
-                   )
-                 ORDER BY next_attempt_at ASC, requested_at ASC, operation_id ASC
-                 LIMIT $1
-                 FOR UPDATE SKIP LOCKED
-             )
-             UPDATE public_operations o
-             SET state = $5,
-                 attempts = o.attempts + 1,
-                 claim_token = $3,
-                 claim_generation = o.claim_generation + 1,
-                 claimed_at = NOW(),
-                 started_at = COALESCE(o.started_at, NOW()),
-                 progress_message = CASE
-                     WHEN o.progress_message = '' THEN 'operation claimed'
-                     ELSE o.progress_message
-                 END,
-                 updated_at = NOW()
-             FROM picked
-             WHERE o.operation_id = picked.operation_id
-             RETURNING o.operation_id,
-                       o.org_id,
-                       o.actor_user_id,
-                       o.api_product,
-                       o.kind,
-                       o.target_type,
-                       o.target_id,
-                       o.payload_json,
-                       o.attempts,
-                       o.claim_generation,
-                       o.traceparent,
-                       (EXTRACT(EPOCH FROM NOW() - picked.claimable_at) * 1000)::DOUBLE PRECISION
-                           AS queue_wait_ms,
-                       picked.reclaimed"
+    let keyed = mode == ClaimMode::Keyed;
+    if keyed {
+        // The key rule reads other rows' claim state as of this statement's
+        // snapshot. Two overlapping claimers could each see the other's
+        // pick as still queued: for example, one takes a sandbox's delete
+        // past a wake in backoff while the other, on an older snapshot, takes
+        // that wake as it comes due, and both run at once. The dispatcher
+        // runs behind leader election, so this only matters around a leader
+        // handover, but one claimer at a time makes every claim see the
+        // previous claim's commit. A busy lock means another replica is
+        // mid-claim, so this tick claims nothing rather than waiting. The
+        // same round trip turns off JIT for the claim: the planner's estimate
+        // for the key probe overshoots enough to trigger JIT compilation,
+        // which costs more than the query itself.
+        let (claim_lock_held, _jit) = sqlx::query_as::<_, (bool, String)>(sql!(
+            "SELECT pg_try_advisory_xact_lock($1), set_config('jit', 'off', true)"
         ))
-        .bind(i64::from(input.limit))
-        .bind(duration_secs_i64(input.claim_stale_after))
-        .bind(&claim_token)
-        .bind(OperationState::Queued.as_str())
-        .bind(OperationState::Running.as_str())
-        .bind(&kind_labels)
-        .fetch_all(&mut *tx)
-        .await?
-    } else {
-        // The key rule below reads other rows' claim state, which a concurrent
-        // claim may be changing. One claimer at a time makes every claim see
-        // the previous claim's commit; a busy lock means another replica is
-        // mid-claim, so this tick claims nothing rather than waiting.
-        let claim_lock_held =
-            sqlx::query_scalar::<_, bool>(sql!("SELECT pg_try_advisory_xact_lock($1)"))
-                .bind(PUBLIC_OPERATION_CLAIM_LOCK_KEY)
-                .fetch_one(&mut *tx)
-                .await?;
+        .bind(PUBLIC_OPERATION_CLAIM_LOCK_KEY)
+        .fetch_one(&mut *tx)
+        .await?;
         if !claim_lock_held {
             tx.rollback().await?;
             return Ok(PublicOperationClaim {
@@ -1538,128 +1499,130 @@ async fn claim_operations(
                 operations: Vec::new(),
             });
         }
-        // Keyed claim: operations on one sandbox run one at a time in request
-        // order, and operations on different sandboxes never wait on each other.
-        // A candidate is held back while another operation on its key is
-        // running under a live claim, or was requested earlier and is still
-        // queued or stale. A delete is held back only by an earlier create or
-        // by an earlier operation due now, so a delete is not stuck behind a
-        // wake that is waiting out its retry backoff. Forks name their source
-        // by a different id form and keep their own source lifecycle lock, so
-        // they stay outside the key.
-        // The per-candidate key check costs an index probe, so `contended`
-        // first finds the few keys with more than one active operation; a
-        // candidate alone on its key cannot be held back and skips the probe.
-        // Planner estimates for the probe overshoot enough to trigger JIT
-        // compilation, which costs more than the query itself.
-        sqlx::query(sql!("SET LOCAL jit = off"))
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query_as::<_, DispatcherClaimRow>(sql!(
-            "WITH contended AS MATERIALIZED (
-                 SELECT org_id, target_id
-                 FROM public_operations
-                 WHERE state IN ($4, $5)
-                   AND target_type = $7
-                   AND target_id IS NOT NULL
-                   AND kind = ANY($6)
-                   AND kind <> $8
-                 GROUP BY org_id, target_id
-                 HAVING COUNT(*) > 1
-             ),
-             picked AS (
-                 SELECT candidate.operation_id,
-                        GREATEST(candidate.requested_at, candidate.next_attempt_at) AS claimable_at,
-                        candidate.claim_token <> '' AS reclaimed
-                 FROM public_operations candidate
-                 WHERE candidate.state IN ($4, $5)
-                   AND candidate.kind = ANY($6)
-                   AND candidate.next_attempt_at <= NOW()
-                   AND (
-                       candidate.claim_token = ''
-                       OR candidate.claimed_at <= NOW() - make_interval(secs => $2::BIGINT)
+    }
+    // Across keys, claim in order of when each operation became claimable,
+    // so a requeued retry waits behind work that was queued before its
+    // backoff expired.
+    //
+    // With `$11` (keyed) set, operations on one sandbox run one at a time in
+    // request order, and operations on different sandboxes never wait on
+    // each other. A candidate is held back while another claimable
+    // operation on its key is running under a live claim, or was requested
+    // earlier and is still queued or stale. A delete is held back only by an
+    // earlier create or by an earlier operation due now, so a delete is not
+    // stuck behind a wake that is waiting out its retry backoff. Forks name
+    // their source by a different id form and keep their own source
+    // lifecycle lock, so they stay outside the key. The key probe costs an
+    // index lookup, so `contended` first finds the few keys with more than
+    // one active operation; a candidate alone on its key cannot be held
+    // back and skips the probe. With `$11` unset this is the unkeyed claim
+    // the kill switch restores, and `contended` is never read.
+    let rows = sqlx::query_as::<_, DispatcherClaimRow>(sql!(
+        "WITH contended AS MATERIALIZED (
+             SELECT org_id, target_id
+             FROM public_operations
+             WHERE state IN ($4, $5)
+               AND target_type = $7
+               AND target_id IS NOT NULL
+               AND kind = ANY($6)
+               AND kind <> $8
+             GROUP BY org_id, target_id
+             HAVING COUNT(*) > 1
+         ),
+         picked AS (
+             SELECT candidate.operation_id,
+                    GREATEST(candidate.requested_at, candidate.next_attempt_at) AS claimable_at,
+                    candidate.claim_token <> '' AS reclaimed
+             FROM public_operations candidate
+             WHERE candidate.state IN ($4, $5)
+               AND candidate.kind = ANY($6)
+               AND candidate.next_attempt_at <= NOW()
+               AND (
+                   candidate.claim_token = ''
+                   OR candidate.claimed_at <= NOW() - make_interval(secs => $2::BIGINT)
+               )
+               AND NOT (
+                   $11::BOOLEAN
+                   AND candidate.target_type = $7
+                   AND candidate.target_id IS NOT NULL
+                   AND candidate.kind <> $8
+                   AND (candidate.org_id, candidate.target_id) IN (
+                       SELECT org_id, target_id FROM contended
                    )
-                   AND NOT (
-                       candidate.target_type = $7
-                       AND candidate.target_id IS NOT NULL
-                       AND candidate.kind <> $8
-                       AND (candidate.org_id, candidate.target_id) IN (
-                           SELECT org_id, target_id FROM contended
-                       )
-                       AND EXISTS (
-                           SELECT 1
-                           FROM public_operations other
-                           WHERE other.org_id = candidate.org_id
-                             AND other.target_type = candidate.target_type
-                             AND other.target_id = candidate.target_id
-                             AND other.operation_id <> candidate.operation_id
-                             AND other.state IN ($4, $5)
-                             AND other.kind = ANY($6)
-                             AND other.kind <> $8
-                             AND (
-                                 (
-                                     other.state = $5
-                                     AND other.claim_token <> ''
-                                     AND other.claimed_at > NOW() - make_interval(secs => $2::BIGINT)
-                                 )
-                                 OR (
-                                     (other.requested_at, other.operation_id)
-                                         < (candidate.requested_at, candidate.operation_id)
-                                     AND (
-                                         candidate.kind <> $9
-                                         OR other.kind = $10
-                                         OR other.next_attempt_at <= NOW()
-                                     )
+                   AND EXISTS (
+                       SELECT 1
+                       FROM public_operations other
+                       WHERE other.org_id = candidate.org_id
+                         AND other.target_type = candidate.target_type
+                         AND other.target_id = candidate.target_id
+                         AND other.operation_id <> candidate.operation_id
+                         AND other.state IN ($4, $5)
+                         AND other.kind = ANY($6)
+                         AND other.kind <> $8
+                         AND (
+                             (
+                                 other.state = $5
+                                 AND other.claim_token <> ''
+                                 AND other.claimed_at > NOW() - make_interval(secs => $2::BIGINT)
+                             )
+                             OR (
+                                 (other.requested_at, other.operation_id)
+                                     < (candidate.requested_at, candidate.operation_id)
+                                 AND (
+                                     candidate.kind <> $9
+                                     OR other.kind = $10
+                                     OR other.next_attempt_at <= NOW()
                                  )
                              )
-                       )
+                         )
                    )
-                 ORDER BY candidate.next_attempt_at ASC, candidate.requested_at ASC, candidate.operation_id ASC
-                 LIMIT $1
-                 FOR UPDATE OF candidate SKIP LOCKED
-             )
-             UPDATE public_operations o
-             SET state = $5,
-                 attempts = o.attempts + 1,
-                 claim_token = $3,
-                 claim_generation = o.claim_generation + 1,
-                 claimed_at = NOW(),
-                 started_at = COALESCE(o.started_at, NOW()),
-                 progress_message = CASE
-                     WHEN o.progress_message = '' THEN 'operation claimed'
-                     ELSE o.progress_message
-                 END,
-                 updated_at = NOW()
-             FROM picked
-             WHERE o.operation_id = picked.operation_id
-             RETURNING o.operation_id,
-                       o.org_id,
-                       o.actor_user_id,
-                       o.api_product,
-                       o.kind,
-                       o.target_type,
-                       o.target_id,
-                       o.payload_json,
-                       o.attempts,
-                       o.claim_generation,
-                       o.traceparent,
-                       (EXTRACT(EPOCH FROM NOW() - picked.claimable_at) * 1000)::DOUBLE PRECISION
-                           AS queue_wait_ms,
-                       picked.reclaimed"
-        ))
-        .bind(i64::from(input.limit))
-        .bind(duration_secs_i64(input.claim_stale_after))
-        .bind(&claim_token)
-        .bind(OperationState::Queued.as_str())
-        .bind(OperationState::Running.as_str())
-        .bind(&kind_labels)
-        .bind(OperationTargetType::Sandbox.as_str())
-        .bind(OperationKind::ForkSandbox.as_str())
-        .bind(OperationKind::DeleteSandbox.as_str())
-        .bind(OperationKind::CreateSandbox.as_str())
-        .fetch_all(&mut *tx)
-        .await?
-    };
+               )
+             ORDER BY candidate.next_attempt_at ASC, candidate.requested_at ASC, candidate.operation_id ASC
+             LIMIT $1
+             FOR UPDATE OF candidate SKIP LOCKED
+         )
+         UPDATE public_operations o
+         SET state = $5,
+             attempts = o.attempts + 1,
+             claim_token = $3,
+             claim_generation = o.claim_generation + 1,
+             claimed_at = NOW(),
+             started_at = COALESCE(o.started_at, NOW()),
+             progress_message = CASE
+                 WHEN o.progress_message = '' THEN 'operation claimed'
+                 ELSE o.progress_message
+             END,
+             updated_at = NOW()
+         FROM picked
+         WHERE o.operation_id = picked.operation_id
+         RETURNING o.operation_id,
+                   o.org_id,
+                   o.actor_user_id,
+                   o.api_product,
+                   o.kind,
+                   o.target_type,
+                   o.target_id,
+                   o.payload_json,
+                   o.attempts,
+                   o.claim_generation,
+                   o.traceparent,
+                   (EXTRACT(EPOCH FROM NOW() - picked.claimable_at) * 1000)::DOUBLE PRECISION
+                       AS queue_wait_ms,
+                   picked.reclaimed"
+    ))
+    .bind(i64::from(input.limit))
+    .bind(duration_secs_i64(input.claim_stale_after))
+    .bind(&claim_token)
+    .bind(OperationState::Queued.as_str())
+    .bind(OperationState::Running.as_str())
+    .bind(&kind_labels)
+    .bind(OperationTargetType::Sandbox.as_str())
+    .bind(OperationKind::ForkSandbox.as_str())
+    .bind(OperationKind::DeleteSandbox.as_str())
+    .bind(OperationKind::CreateSandbox.as_str())
+    .bind(keyed)
+    .fetch_all(&mut *tx)
+    .await?;
 
     let mut operations = Vec::with_capacity(rows.len());
     let mut queue_waits = Vec::with_capacity(rows.len());
@@ -1807,7 +1770,7 @@ async fn release_claimed_operation(
          SET state = $3,
              claim_token = '',
              progress_message = $4,
-             next_attempt_at = NOW() + make_interval(secs => $5::BIGINT),
+             next_attempt_at = NOW() + make_interval(secs => $5::DOUBLE PRECISION),
              attempts = GREATEST(attempts - CASE WHEN $7 THEN 0 ELSE 1 END, 0),
              updated_at = NOW()
          WHERE operation_id = $1
@@ -1819,7 +1782,7 @@ async fn release_claimed_operation(
     .bind(&input.claim_token)
     .bind(OperationState::Queued.as_str())
     .bind(&input.progress_message)
-    .bind(duration_secs_i64(input.retry_after))
+    .bind(input.retry_after.as_secs_f64())
     .bind(OperationState::Running.as_str())
     .bind(input.count_attempt)
     .fetch_optional(&mut *tx)

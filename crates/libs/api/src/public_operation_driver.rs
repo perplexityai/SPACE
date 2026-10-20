@@ -296,19 +296,23 @@ where
             } else {
                 "unsupported_executor_state"
             };
-            let deadline = if is_native_m1_terminalized_kind(api_product, kind) {
+            let retry_deferred =
+                supported_requeue && requeue_reason == PublicOperationRequeueReason::RetryDeferred;
+            // Deferred retries spend no attempts, so the operation's age is
+            // what bounds them, whatever its kind or product.
+            let deadline = if retry_deferred {
+                Some(config.m1_max_age.unwrap_or(DEFAULT_M1_MAX_AGE))
+            } else if is_native_m1_terminalized_kind(api_product, kind) {
                 config.m1_max_age
             } else {
                 None
             };
-            let deadline_exceeded = if let Some(deadline) = deadline {
-                store
-                    .remaining_deadline(operation_id, deadline)
-                    .await?
-                    .is_some_and(|remaining| remaining.is_zero())
+            let remaining = if let Some(deadline) = deadline {
+                store.remaining_deadline(operation_id, deadline).await?
             } else {
-                false
+                None
             };
+            let deadline_exceeded = remaining.is_some_and(|remaining| remaining.is_zero());
             if deadline_exceeded {
                 let max_age_seconds = deadline
                     .expect("deadline is configured when it is exceeded")
@@ -425,7 +429,25 @@ where
                 // repeatedly failing sandbox is retried ever more rarely
                 // instead of at its executor's fixed hint; budget-preserving
                 // requeues keep the executor's pacing.
-                let retry_after = if preserve_retry_budget {
+                let retry_after = if retry_deferred {
+                    let age = deadline
+                        .zip(remaining)
+                        .map_or(Duration::ZERO, |(deadline, remaining)| {
+                            deadline.saturating_sub(remaining)
+                        });
+                    let backoff = deferred_retry_backoff(
+                        operation_id,
+                        age,
+                        retry_hint,
+                        config.retry_backoff_max,
+                    );
+                    pplx_space_metrics::operations::retry_backoff(
+                        api_product_label,
+                        kind.as_str(),
+                        backoff.as_secs_f64(),
+                    );
+                    backoff
+                } else if preserve_retry_budget {
                     retry_hint
                 } else {
                     let backoff = counted_retry_backoff(
@@ -504,12 +526,31 @@ pub fn counted_retry_backoff(
     jittered.max(hint)
 }
 
-fn retry_jitter_fraction(operation_id: OperationId, attempts: i32) -> f64 {
+/// The delay before re-driving an operation whose execution deferred its
+/// retry wait. Deferred retries spend no attempts, so the spacing grows with
+/// the operation's age instead: an eighth of the time it has waited, capped
+/// at `max` and equal-jittered, and never sooner than the executor's `hint`.
+/// A fence that clears quickly is retried within seconds; one that lasts many
+/// minutes is retried about once per `max`.
+pub fn deferred_retry_backoff(
+    operation_id: OperationId,
+    age: Duration,
+    hint: Duration,
+    max: Duration,
+) -> Duration {
+    let ceiling = (age / 8).min(max.max(hint));
+    let half = ceiling / 2;
+    let seed = i64::try_from(age.as_secs()).unwrap_or(i64::MAX);
+    let jittered = half + half.mul_f64(retry_jitter_fraction(operation_id, seed));
+    jittered.max(hint)
+}
+
+fn retry_jitter_fraction(operation_id: OperationId, seed: impl std::hash::Hash) -> f64 {
     use std::hash::{DefaultHasher, Hash, Hasher};
 
     let mut hasher = DefaultHasher::new();
     operation_id.to_string().hash(&mut hasher);
-    attempts.hash(&mut hasher);
+    seed.hash(&mut hasher);
     // The top 53 bits fill an f64 mantissa exactly: a fraction in [0, 1).
     (hasher.finish() >> 11) as f64 / (1_u64 << 53) as f64
 }

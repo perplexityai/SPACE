@@ -207,21 +207,6 @@ async fn deleted_sandbox_replay_is_authorized_by_its_retained_operation() -> Tes
         .await?;
         assert_eq!(status, StatusCode::ACCEPTED, "{created}");
         let sandbox_id = seed_target(&fixture, &created).await?;
-        // The seeded row stands in for a finished create; finish its
-        // operation too, since a sandbox's delete runs after its create.
-        sqlx::query(sql!(
-            "UPDATE public_operations SET state = 'succeeded', completed_at = NOW()
-             WHERE operation_id = $1"
-        ))
-        .bind(
-            created["operation_id"]
-                .as_str()
-                .unwrap()
-                .parse::<OperationId>()?
-                .as_uuid(),
-        )
-        .execute(&fixture.db.pool)
-        .await?;
         let path = format!("/v1/sandboxes/{sandbox_id}");
         let (status, deleted) = send(
             &fixture.app,
