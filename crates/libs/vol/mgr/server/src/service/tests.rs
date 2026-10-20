@@ -840,6 +840,16 @@ fn sample_artifact() -> ArtifactPayload {
 }
 
 #[test]
+fn a_completed_retry_keeps_its_attempt_count_after_the_error_is_cleared() {
+    let mut job = persisted_job("completed", &sample_artifact());
+    job.attempts = 2;
+    let reported = job_to_proto(job).unwrap();
+    assert_eq!(reported.status, TransferJobStatus::Completed as i32);
+    assert_eq!(reported.error, None);
+    assert_eq!(reported.attempts, 2);
+}
+
+#[test]
 fn pull_job_failure_status_preserves_typed_reason_and_retry_semantics() {
     let mut job = persisted_job("failed", &sample_artifact());
     job.error = Some("object not found".to_string());

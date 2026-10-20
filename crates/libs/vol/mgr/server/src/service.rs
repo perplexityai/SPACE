@@ -649,6 +649,7 @@ fn job_to_proto(job: pplx_space_common_jobs::Job) -> Result<TransferJob, Status>
         started_at: job.started_at,
         completed_at: job.completed_at,
         transfer_scope_id,
+        attempts: u32::try_from(job.attempts).unwrap_or_default(),
     })
 }
 

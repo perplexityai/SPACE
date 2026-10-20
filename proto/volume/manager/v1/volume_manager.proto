@@ -425,6 +425,10 @@ message TransferJob {
     optional string   started_at        = 10;
     optional string   completed_at      = 11;
     optional string   transfer_scope_id = 12;
+    // Executions this job has started, retries included. A completed job
+    // with more than one had a failed attempt; `error` is cleared on
+    // completion, `attempts` never is.
+    uint32            attempts          = 13;
 }
 
 message GetTransferJobRequest {

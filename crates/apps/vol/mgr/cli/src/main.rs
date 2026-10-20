@@ -506,6 +506,7 @@ fn print_job(job: &TransferJob) {
     println!("local_path: {}", job.local_path);
     println!("s3_uri: {}", job.s3_uri);
     println!("bytes_transferred: {}", job.bytes_transferred);
+    println!("attempts: {}", job.attempts);
     println!("created_at: {}", job.created_at);
     if let Some(started_at) = &job.started_at {
         println!("started_at: {started_at}");
