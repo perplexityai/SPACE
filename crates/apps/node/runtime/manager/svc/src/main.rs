@@ -77,7 +77,7 @@ struct Cli {
     list_admission_timeout_secs: u64,
 
     /// Only list and report: refuse every install and uninstall. For hosts
-    /// whose node store has no node-manager to publish into it, such as Kind.
+    /// whose node store has no node-manager to publish into it.
     #[arg(long)]
     list_only: bool,
 

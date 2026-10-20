@@ -149,12 +149,13 @@ log "rendering kind cluster config → $kind_config_published"
 kind_render_cluster_config "$KIND_DIR/kind-cluster.yaml.tmpl"
 
 # ── Step 0b: stage the Firecracker vendor tree ───────────────────────────────
-# The sandbox and builder kind nodes bind-mount $SPACE_VENDOR_ROOT at
-# /space/vendor, where the host runtime-supervisor and the node services read
-# it. Reuse an already staged vendor tree, which `install-fc-vendor.sh
-# --check` confirms holds this Firecracker release and the pinned guest kernel,
-# or run the artifact installer here. The root is
-# named at the call site even though sourcing the library already exported it:
+# The sandbox and builder kind nodes bind-mount $SPACE_VENDOR_ROOT read-only at
+# /opt/space-kind/host-vendor, and each copies it into its own /space/vendor on
+# its first boot, where the host runtime-supervisor and the node services read
+# it (stage_vendor in node/space-kind-node.sh). Reuse an already staged vendor
+# tree, which `install-fc-vendor.sh --check` confirms holds this Firecracker
+# release and the pinned guest kernel, or run the artifact installer here. The
+# root is named at the call site even though sourcing the library already exported it:
 # one resolved value reaching both the mount and the writer is the whole point
 # of the fix, so the call that stages the tree says which value it is rather
 # than leaving it to an inherited environment.
@@ -201,6 +202,10 @@ if kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER"; then
   # created from, so a cluster from before the SPACE Kind node image, or from
   # an older build of it, has to be recreated rather than patched.
   bash "$KIND_DIR/scripts/check-kind-node-image.sh" "$KIND_CLUSTER"
+  # Each of those nodes copied the host vendor tree on its first boot and
+  # keeps that copy, so a host tree changed since (step 0b replaces a kernel
+  # whose pin changed) would never reach it.
+  bash "$KIND_DIR/scripts/check-node-vendor.sh" "$KIND_CLUSTER"
   # A cluster from before the per-service node DaemonSets runs every node
   # service, and its sandboxes, in one pod per node; stop rather than run both
   # layouts on a node.

@@ -58,10 +58,13 @@ nodes:
   # extraMounts on sandbox workers:
   #   - SPACE_VENDOR_ROOT : where install-fc-vendor.sh stages
   #     Firecracker v1.15.1 (binary, jailer,
-  #     vmlinux). The host runtime-supervisor and the node services read
-  #     /space/vendor from the node, matching production where
-  #     /space/vendor is populated by Packer on the AMI. Without this the
-  #     worker image would have to bake the FC tree itself.
+  #     vmlinux), mounted read-only away from /space. On its first boot the
+  #     node layer copies it into the node's own root-owned /space/vendor
+  #     (stage_vendor in node/space-kind-node.sh), which the host
+  #     runtime-supervisor and the node services read and node-manager
+  #     publishes installed releases and kernels into, as on a production
+  #     node whose /space/vendor Packer bakes into the AMI. The host tree is
+  #     shared by every node and never written.
   #   - /dev/kvm : Firecracker needs the host KVM character device. kind
   #     nodes run as privileged docker containers; bind-mounting the device
   #     file lets the container's /dev/kvm work.
@@ -73,7 +76,7 @@ nodes:
       - hostPath: ${SPACE_KIND_DATA_ROOT}/worker1/containerd
         containerPath: /var/lib/containerd
       - hostPath: ${SPACE_VENDOR_ROOT}
-        containerPath: /space/vendor
+        containerPath: /opt/space-kind/host-vendor
         readOnly: true
       - hostPath: /dev/kvm
         containerPath: /dev/kvm
@@ -85,7 +88,7 @@ nodes:
       - hostPath: ${SPACE_KIND_DATA_ROOT}/worker2/containerd
         containerPath: /var/lib/containerd
       - hostPath: ${SPACE_VENDOR_ROOT}
-        containerPath: /space/vendor
+        containerPath: /opt/space-kind/host-vendor
         readOnly: true
       - hostPath: /dev/kvm
         containerPath: /dev/kvm
@@ -128,7 +131,7 @@ nodes:
       - hostPath: ${SPACE_KIND_DATA_ROOT}/builder/containerd
         containerPath: /var/lib/containerd
       - hostPath: ${SPACE_VENDOR_ROOT}
-        containerPath: /space/vendor
+        containerPath: /opt/space-kind/host-vendor
         readOnly: true
       - hostPath: /dev/kvm
         containerPath: /dev/kvm
@@ -140,7 +143,7 @@ nodes:
       - hostPath: ${SPACE_KIND_DATA_ROOT}/builder2/containerd
         containerPath: /var/lib/containerd
       - hostPath: ${SPACE_VENDOR_ROOT}
-        containerPath: /space/vendor
+        containerPath: /opt/space-kind/host-vendor
         readOnly: true
       - hostPath: /dev/kvm
         containerPath: /dev/kvm

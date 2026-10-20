@@ -1,5 +1,7 @@
 # runtime-manager on every SPACE Kind node: lists the node's Firecracker
-# releases and guest kernels (`space-rtmgr list`). Nothing depends on it yet.
+# releases and guest kernels (`space-rtmgr list`) and installs the catalog's
+# (`space-rtmgr runtimes|kernels install`), which node-manager publishes into
+# the node's /space/vendor/artifacts. Nothing depends on it for execution.
 # One release per role: `space` and `space-builder` (`--set node.role=builder`).
 
 image:
@@ -17,6 +19,13 @@ node: {}
 # (crates/libs/node/runtime/manager/server/src/run.rs). The shared lifecycle
 # default grace (crates/libs/common/svc/src/lifecycle.rs).
 terminationGracePeriodSeconds: 60
+
+# Installs (no --list-only, /space/cache writable for its staging). Set with
+# space-node-manager-local's artifactInstalls.enabled, which lets node-manager
+# create and publish into the store; off, the service only lists.
+# infra/space/cluster turns it off.
+artifactInstalls:
+  enabled: true
 
 # Kind sizing: requests only (see space-node-manager-local/values.yaml).
 resources:

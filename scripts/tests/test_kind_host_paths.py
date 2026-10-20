@@ -587,7 +587,7 @@ class LiveClusterMountTests(unittest.TestCase):
         """PATH-shadow `docker` with a stub standing in for a real cluster.
 
         The rendered config declares six `/var/lib/containerd` mounts, four
-        `/space/vendor` and four `/dev/kvm`, and the check counts every
+        `/opt/space-kind/host-vendor` and four `/dev/kvm`, and the check counts every
         destination the config names, so the stub reports that shape rather
         than a single node. `mountless=True` reports the six node containers
         with no mounts at all — a cluster created without this config.
@@ -613,7 +613,7 @@ class LiveClusterMountTests(unittest.TestCase):
                     f"            printf '/var/lib/containerd {data_source_root}/n{index}/containerd\\n'"
                 ]
                 if has_vendor:
-                    lines.append(f"            printf '/space/vendor {vendor_source}\\n'")
+                    lines.append(f"            printf '/opt/space-kind/host-vendor {vendor_source}\\n'")
                     if kvm:
                         lines.append(
                             f"            printf '/dev/kvm {kvm_source}\\n'"
@@ -722,12 +722,15 @@ class LiveClusterMountTests(unittest.TestCase):
             check=False,
         )
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("/space/vendor <- /home/dev/.space-devbox/space/vendor", result.stderr)
+        self.assertIn(
+            "/opt/space-kind/host-vendor <- /home/dev/.space-devbox/space/vendor",
+            result.stderr,
+        )
         self.assertIn("renders /home/test-user/.space-devbox/space/vendor", result.stderr)
         self.assertIn("kind delete cluster --name space-local", result.stderr)
         # Four nodes declare it, and each is named so the operator can see the
         # scope rather than inferring it.
-        self.assertEqual(result.stderr.count("/space/vendor <-"), 4)
+        self.assertEqual(result.stderr.count("/opt/space-kind/host-vendor <-"), 4)
 
     def test_a_cluster_on_a_stale_data_root_is_refused(self) -> None:
         # The vendor root agrees, so a vendor-only check reports success while
@@ -748,7 +751,7 @@ class LiveClusterMountTests(unittest.TestCase):
         self.assertIn("renders under /home/test-user/.kind-data", result.stderr)
         self.assertIn("kind delete cluster --name space-local", result.stderr)
         # The vendor root agrees, so it must not be reported as drifted.
-        self.assertNotIn("/space/vendor <-", result.stderr)
+        self.assertNotIn("/opt/space-kind/host-vendor <-", result.stderr)
 
     def test_a_cluster_mounting_the_rendered_root_passes(self) -> None:
         # Non-vacuity for the test above: the same stub with the agreeing
@@ -776,7 +779,9 @@ class LiveClusterMountTests(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("0 of 6 expected /var/lib/containerd mounts", result.stderr)
-        self.assertIn("0 of 4 expected /space/vendor mounts", result.stderr)
+        self.assertIn(
+            "0 of 4 expected /opt/space-kind/host-vendor mounts", result.stderr
+        )
         self.assertIn("kind delete cluster --name space-local", result.stderr)
 
     def test_no_docker_on_path_is_not_a_failure(self) -> None:
@@ -1061,7 +1066,7 @@ class PrepareHostMountsTests(unittest.TestCase):
         """Refuse, do not create — read as a pair with the empty-dir test.
 
         This pins "refuse, and do not create the source", which is what its
-        name claims: with the `/space/vendor` arm deleted the path falls
+        name claims: with the vendor-mount arm deleted the path falls
         through to the generic existence check, which still refuses and still
         creates nothing. `test_an_empty_vendor_directory_is_refused` is what
         pins the arm itself.
@@ -1320,7 +1325,7 @@ class InstallerAgreementTests(unittest.TestCase):
             mount["hostPath"]
             for node in config["nodes"]
             for mount in node.get("extraMounts", [])
-            if mount["containerPath"] == "/space/vendor"
+            if mount["containerPath"] == "/opt/space-kind/host-vendor"
         }
         self.assertEqual(len(vendor_mounts), 1, "one vendor root drives every node")
         mounted = Path(vendor_mounts.pop())

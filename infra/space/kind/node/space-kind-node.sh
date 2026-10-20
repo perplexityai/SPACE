@@ -12,8 +12,9 @@
 #   space-loop-nodes.service       loop-device node headroom in the node's /dev
 #   space-kind-devices.service     Kind-only /dev/kvm and vhost permission widening
 #   space-cgroup.service           /sys/fs/cgroup/space   (packer 07-sysctl.sh)
-#   space-layout.service           SPACE accounts, /space skeleton, Firecracker
-#                                  copies/links, sandbox.toml    (packer 04-firecracker.sh,
+#   space-layout.service           SPACE accounts, /space skeleton, the node's
+#                                  /space/vendor, Firecracker copies/links,
+#                                  sandbox.toml    (packer 04-firecracker.sh,
 #                                                          07-sysctl.sh)
 #   space-cache.service            btrfs /space/cache     (packer 01-partitions.sh,
 #                                                          11-nvme-cache.sh)
@@ -53,6 +54,10 @@ CACHE_IMAGE=/var/lib/space-cache.img
 CACHE_STATE_DIR=/run/space-kind-node
 CACHE_BOOT_MARKER="$CACHE_STATE_DIR/cache.done"
 CACHE_SIZE_MB="${SPACE_CACHE_SIZE_MB:-40960}"
+# The developer's vendor tree (SPACE_VENDOR_ROOT), bind-mounted read-only by
+# kind-cluster.yaml.tmpl, and the node's own copy of it (see stage_vendor).
+HOST_VENDOR_DIR=/opt/space-kind/host-vendor
+VENDOR_DIR=/space/vendor
 
 log() { printf '%s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -118,14 +123,68 @@ ensure_identities() {
   done <<<"$SPACE_USER_SPECS"
 }
 
+# ── /space/vendor ────────────────────────────────────────────────────────────
+# A deployed node's image bakes /space/vendor/{firecracker,kernels} root-owned
+# and closed to other accounts (packer 04-firecracker.sh), and node-manager
+# creates the managed store /space/vendor/artifacts beneath it, the store only
+# it writes. Both services check that ownership: node-manager's
+# ArtifactStore::prepare_roots refuses a /space/vendor that is not root-owned
+# or is group- or other-writable, and the runtime manager disables installs
+# when an execution root it reads is not root-owned throughout
+# (protection::audit). The host tree is the developer's, owned by them and
+# shared by every node, so each node gets its own copy instead: on the node's
+# first boot the host tree is copied into a fresh directory, made root-owned,
+# stripped of set-id bits and closed to group and other writes, and renamed
+# into place. The host tree is only read. A host `artifacts/` is not copied:
+# the store starts empty and node-manager creates it. Later boots keep the
+# node's copy, with whatever node-manager has published into it, as a deployed
+# node keeps its root volume; a changed host tree reaches a node only when the
+# node is recreated, and the bring-up refuses a reused cluster whose copies
+# differ from the host tree (scripts/check-node-vendor.sh).
+stage_vendor() (
+  local staged=""
+  if findmnt -n --mountpoint "$VENDOR_DIR" >/dev/null 2>&1; then
+    die "$VENDOR_DIR is a mount ($(findmnt -n -o SOURCE --mountpoint "$VENDOR_DIR")), the layout of a cluster created before each node had its own vendor store; recreate the cluster"
+  fi
+  rm -rf -- /space/.vendor.incoming.*
+  if [[ -e $VENDOR_DIR || -L $VENDOR_DIR ]]; then
+    [[ -d $VENDOR_DIR && ! -L $VENDOR_DIR && $(stat -c %u "$VENDOR_DIR") == 0 ]] ||
+      die "$VENDOR_DIR is not a root-owned directory; recreate the Kind node"
+    (( (8#$(stat -c %a "$VENDOR_DIR") & 0022) == 0 )) ||
+      die "$VENDOR_DIR is writable by another account; recreate the Kind node"
+    log "keeping this node's $VENDOR_DIR"
+    return 0
+  fi
+  [[ -d $HOST_VENDOR_DIR && ! -L $HOST_VENDOR_DIR ]] ||
+    die "the host vendor tree is not mounted at $HOST_VENDOR_DIR"
+  staged="$(mktemp -d /space/.vendor.incoming.XXXXXXXX)"
+  trap '[[ -z $staged ]] || rm -rf -- "$staged"' EXIT
+  cp -a -- "$HOST_VENDOR_DIR/." "$staged/"
+  if [[ -e $staged/artifacts || -L $staged/artifacts ]]; then
+    rm -rf -- "$staged/artifacts"
+    log "not seeding the host tree's artifacts/: node-manager creates the managed store"
+  fi
+  chown -R -h 0:0 "$staged"
+  # As the image bakes them: no set-id bits, nothing writable but by root.
+  # chmod -R leaves the links it meets alone.
+  chmod -R ug-s,go-w "$staged"
+  chmod 0755 "$staged"
+  sync -f "$staged"
+  mv -T -- "$staged" "$VENDOR_DIR"
+  sync -f /space
+  staged=""
+  log "seeded this node's root-owned $VENDOR_DIR from the host vendor tree"
+)
+
 # ── /space skeleton ──────────────────────────────────────────────────────────
-# The developer's read-only vendor mount is a download cache, not executable
-# root-owned state. Copy the bootstrap E0 runtime to the node's /space/bin
-# hostPath; node-manager verifies its compiled pins before admitting execution.
-# Never rewrite an installed runtime: a live supervisor may still be using it.
+# Copy the bootstrap E0 runtime from the node's vendor tree to the node's
+# /space/bin hostPath, which node-manager executes from
+# (SPACE_FIRECRACKER_VENDOR_DIR in its chart); node-manager verifies its
+# compiled pins before admitting execution. Never rewrite an installed
+# runtime: a live supervisor may still be using it.
 stage_runtime() (
   local version=v1.15.1 root=/space/bin/runtime/firecracker
-  local source="/space/vendor/firecracker/$version" path binary staged=""
+  local source="$VENDOR_DIR/firecracker/$version" path binary staged=""
   for path in /space/bin/runtime "$root"; do
     if [[ ! -e $path && ! -L $path ]]; then
       mkdir -m 0755 "$path"
@@ -155,7 +214,7 @@ stage_runtime() (
     for binary in firecracker jailer; do
       if [[ ! -f $root/$version/bin/$binary || ! -x $root/$version/bin/$binary ]] ||
           ! cmp -s "$source/bin/$binary" "$root/$version/bin/$binary"; then
-        die "installed $version differs from the download cache; recreate the Kind node"
+        die "installed $version differs from the node's vendor tree; recreate the Kind node"
       fi
     done
   else
@@ -211,6 +270,7 @@ layout() {
   install -d -m 0755 -o "$SPACE_SBXMGR_UID" -g "$SPACE_SBXMGR_GID" /space/run/sandbox-host-control
   install -d -m 0750 -o "$SPACE_TMPLMGR_UID" -g "$(space_expected_gid_for_group space-tmplclients)" \
     /space/run/template-manager
+  stage_vendor
   stage_runtime
   # The host supervisor and node-manager see the same protected runtime path.
   # The production init container stages SPACE's service binaries beside it.

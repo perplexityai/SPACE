@@ -24,7 +24,9 @@
 # and with explicit path overrides.
 #
 # Env knobs:
-#   SPACE_VENDOR_ROOT     Firecracker vendor tree, mounted at /space/vendor
+#   SPACE_VENDOR_ROOT     Firecracker vendor tree, mounted read-only at
+#                         $KIND_HOST_PATHS_VENDOR_MOUNT, which each node copies
+#                         into its own /space/vendor
 #                         (default: $HOME/.space-devbox/space/vendor)
 #   SPACE_KIND_DATA_ROOT  per-node containerd storage backing
 #                         (default: $HOME/.kind-data)
@@ -34,6 +36,11 @@
 #                         node images the config names (default: what
 #                         ../kind-node-image.sh prints for `ref` /
 #                         `cluster-base`)
+
+# Where the cluster config mounts SPACE_VENDOR_ROOT on sandbox workers and
+# builders: read-only, outside /space. The node layer seeds the node's own
+# /space/vendor from it (stage_vendor in node/space-kind-node.sh).
+KIND_HOST_PATHS_VENDOR_MOUNT=/opt/space-kind/host-vendor
 
 # The binary a sandbox worker executes through /space/vendor; the mount
 # preflight refuses a vendor root without it. Whether a tree is fully
@@ -422,10 +429,10 @@ kind_assert_live_cluster_mounts() {
       printf '%s\n' "$declared_dests" | grep -qFx "$dest" || continue
       live_dests+="$dest"$'\n'
       case "$dest" in
-        /space/vendor)
+        "$KIND_HOST_PATHS_VENDOR_MOUNT")
           # RENDERED space: $src is what Docker was given and reports back.
           [[ "$src" == "$SPACE_VENDOR_ROOT" ]] \
-            || drifted+=("$node: /space/vendor <- $src (renders $SPACE_VENDOR_ROOT)")
+            || drifted+=("$node: $dest <- $src (renders $SPACE_VENDOR_ROOT)")
           ;;
         /var/lib/containerd)
           # Per-node subdirectory, so the root is a prefix rather than equal.
@@ -523,7 +530,7 @@ kind_prepare_host_mounts() {
           not_a_device+=("$host")
         fi
         ;;
-      /space/vendor)
+      "$KIND_HOST_PATHS_VENDOR_MOUNT")
         # Existence is not the property that matters. The message below names
         # the path, and the obvious response to "does not exist" is `mkdir -p`
         # — which an existence test would then accept, putting an empty
