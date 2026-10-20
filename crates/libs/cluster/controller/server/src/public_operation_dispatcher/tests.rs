@@ -318,6 +318,66 @@ async fn delete_execution_renews_claim_while_a_phase_is_blocked() -> TestResult 
     Ok(())
 }
 
+#[tokio::test]
+async fn requeued_operation_waits_behind_work_queued_before_its_retry() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let retry = create_queued_operation(
+        &store,
+        org_id,
+        ApiProduct::Native,
+        OperationKind::WakeSandbox,
+        "sbx_retrying_wake",
+    )
+    .await?;
+    let fresh = create_queued_operation(
+        &store,
+        org_id,
+        ApiProduct::Native,
+        OperationKind::DeleteSandbox,
+        "sbx_fresh_delete",
+    )
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE public_operations
+         SET requested_at = NOW() - INTERVAL '60 seconds',
+             next_attempt_at = NOW() - INTERVAL '1 second',
+             attempts = 3
+         WHERE operation_id = $1"
+    ))
+    .bind(retry.as_uuid())
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE public_operations
+         SET requested_at = NOW() - INTERVAL '30 seconds',
+             next_attempt_at = NOW() - INTERVAL '30 seconds'
+         WHERE operation_id = $1"
+    ))
+    .bind(fresh.as_uuid())
+    .execute(&db.pool)
+    .await?;
+
+    let claim = store
+        .claim_operations(ClaimPublicOperations {
+            limit: 1,
+            claim_stale_after: Duration::from_secs(60),
+            claimable_kinds: &[OperationKind::WakeSandbox, OperationKind::DeleteSandbox],
+        })
+        .await?;
+
+    let claimed = claim
+        .operations
+        .iter()
+        .map(|operation| operation.id)
+        .collect::<Vec<_>>();
+    assert_eq!(claimed, [fresh]);
+    Ok(())
+}
+
 fn fast_loop_config(execution_concurrency: usize) -> ReconcilerConfig {
     ReconcilerConfig {
         enabled: true,

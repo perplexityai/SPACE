@@ -1380,6 +1380,8 @@ async fn claim_operations(
         .collect::<Vec<_>>();
 
     let mut tx = pool.begin().await?;
+    // Claim in order of when each operation became claimable, so a requeued
+    // retry waits behind work that was queued before its backoff expired.
     let rows = sqlx::query_as::<_, DispatcherClaimRow>(sql!(
         "WITH picked AS (
              SELECT operation_id,
@@ -1393,7 +1395,7 @@ async fn claim_operations(
                    claim_token = ''
                    OR claimed_at <= NOW() - make_interval(secs => $2::BIGINT)
                )
-             ORDER BY requested_at ASC, operation_id ASC
+             ORDER BY next_attempt_at ASC, requested_at ASC, operation_id ASC
              LIMIT $1
              FOR UPDATE SKIP LOCKED
          )
