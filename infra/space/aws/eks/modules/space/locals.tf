@@ -8,6 +8,11 @@ locals {
   cluster_id = coalesce(var.cluster_id, var.environment)
   name       = "${var.name_prefix}-${local.cluster_id}"
 
+  # An ASG's IAM resource ARN is this prefix plus its name. The `*` stands in
+  # for the per-ASG UUID, which AWS assigns at creation time and isn't part of
+  # the human-readable name.
+  autoscaling_group_arn_prefix = "arn:${data.aws_partition.current.partition}:autoscaling:${var.aws_region}:${data.aws_caller_identity.current.account_id}:autoScalingGroup:*:autoScalingGroupName/"
+
   azs = var.availability_zones
 
 
@@ -311,6 +316,8 @@ locals {
       # An ownership-tag policy can require Team on EBS root volumes; common_tags
       # already supplies the calling root's other ownership tags.
       volume_tags = { Team = "team-space" }
+      # general-2 runs on a retired general's launch template and node role.
+      launch_template_and_role_only = name == "general" && var.general_node_group_retired
     }
   }
 

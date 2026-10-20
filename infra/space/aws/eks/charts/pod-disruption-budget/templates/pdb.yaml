@@ -1,0 +1,33 @@
+{{- /* An empty selector matches every pod in the namespace, so refuse it. */ -}}
+{{- if empty .Values.matchLabels }}
+{{- fail "matchLabels must name at least one label" }}
+{{- end -}}
+{{- /*
+Only a positive whole number, or a percentage up to 100, with no leading zero.
+Zero refuses every eviction and pins the node, and the value renders unquoted,
+so "+0" would reach the API as 0 and "010" as octal 8.
+*/ -}}
+{{- $maxUnavailable := trim (toString (required "maxUnavailable is required" .Values.maxUnavailable)) }}
+{{- if not (regexMatch "^([1-9][0-9]*|[1-9][0-9]?%|100%)$" $maxUnavailable) }}
+{{- fail "maxUnavailable must be a positive whole number or a percentage from 1% to 100%" }}
+{{- end -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ required "name is required" .Values.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
+spec:
+  maxUnavailable: {{ $maxUnavailable }}
+  {{- /*
+  A pod that isn't Ready isn't serving, so evicting it costs nothing. Without
+  this, a crashlooping singleton refuses every eviction and blocks any drain of
+  its node.
+  */}}
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      {{- toYaml .Values.matchLabels | nindent 6 }}

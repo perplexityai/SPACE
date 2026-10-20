@@ -280,8 +280,10 @@ resource "aws_eks_node_group" "general_blue_green" {
   }
 
   # After creation, operators scale this pool between zero and its active
-  # target through EKS. Unrelated Terraform applies must not wake a dormant
-  # pool or scale down one that is carrying the active general workload.
+  # target through EKS, and while it serves, cluster-autoscaler moves its
+  # desired size inside those bounds. Unrelated Terraform applies must not
+  # wake a dormant pool or scale down one that is carrying the active general
+  # workload.
   lifecycle {
     ignore_changes = [
       scaling_config[0].min_size,
@@ -289,6 +291,63 @@ resource "aws_eks_node_group" "general_blue_green" {
       scaling_config[0].max_size,
     ]
   }
+}
+
+# general_node_group_retired deletes the general MNG together with any node it
+# still runs, so the general_serving_node_group output refuses the plan until
+# general is parked: its ASG wants no instances and none are left. Each lookup
+# below runs only if the one before it found its target, and lists rather than
+# reads, so none fails on a missing cluster or node group. Once retirement has
+# landed, general isn't among the cluster's node groups and the check passes.
+# The cluster name is read from local.name rather than module.eks so that the
+# lookups run at plan time even when the cluster itself has pending changes.
+#
+# Retirement also needs a cluster that exists. A new cluster comes up with
+# general: its deployment-backed addons wait only on node groups inside
+# module.eks, while general-2 waits only on the pre-node addons (vpc-cni,
+# kube-proxy), so a cluster created retired would install its other addons
+# with no node group they wait for.
+data "aws_eks_clusters" "retiring_general" {
+  count = var.general_node_group_retired ? 1 : 0
+}
+
+data "aws_eks_node_groups" "retiring_general" {
+  count = length([for clusters in data.aws_eks_clusters.retiring_general : true if contains(clusters.names, local.name)])
+
+  cluster_name = local.name
+}
+
+data "aws_eks_node_group" "retiring_general" {
+  count = length([for groups in data.aws_eks_node_groups.retiring_general : true if contains(groups.names, "general")])
+
+  cluster_name    = local.name
+  node_group_name = "general"
+}
+
+locals {
+  retiring_general_asg_names = toset(flatten([
+    for group in data.aws_eks_node_group.retiring_general : [
+      for r in group.resources : [for asg in r.autoscaling_groups : asg.name]
+    ]
+  ]))
+}
+
+data "aws_autoscaling_group" "retiring_general" {
+  for_each = local.retiring_general_asg_names
+
+  name = each.value
+}
+
+# A desired capacity of zero only says the ASG has stopped asking for nodes;
+# the ones it's removing can still be draining. Every instance still alive in
+# the ASG counts until it's gone.
+data "aws_instances" "retiring_general" {
+  for_each = local.retiring_general_asg_names
+
+  instance_tags = {
+    "aws:autoscaling:groupName" = each.value
+  }
+  instance_state_names = ["pending", "running", "shutting-down", "stopping", "stopped"]
 }
 
 data "aws_iam_policy_document" "irsa_assume_role" {

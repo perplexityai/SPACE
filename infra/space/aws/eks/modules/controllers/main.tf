@@ -1,6 +1,19 @@
 terraform {
   # Variable validations reference other variables (1.9+).
   required_version = ">= 1.9.0"
+
+  required_providers {
+    # Lower bounds, as in the space module that calls this one. Exact
+    # selection belongs to the calling root and its lock file.
+    aws = {
+      source  = "hashicorp/aws"
+      version = ">= 6.40.0"
+    }
+    helm = {
+      source  = "hashicorp/helm"
+      version = ">= 2.17.0"
+    }
+  }
 }
 
 # The zone's domain is read from the zone itself rather than taken as a second
@@ -119,9 +132,36 @@ resource "helm_release" "external_secrets_operator" {
   namespace  = "kube-system"
   version    = "0.16.1"
 
+  # Each component's nodeSelector is its own key; the top-level one places only
+  # the controller.
+  #
+  # The chart renders only the webhook's budget; the controller and
+  # cert-controller get theirs from disruption_budgets.tf, because the 0.16.1
+  # chart can't render `unhealthyPodEvictionPolicy`. The controller and
+  # cert-controller stay single replicas: evicting one only pauses secret sync
+  # or certificate rotation until the replacement starts. The webhook gets a
+  # second replica because its validating webhooks fail closed: the
+  # ExternalSecret one sets `failurePolicy: Fail` and the SecretStore ones take
+  # the API default, which is also Fail. While no replica serves, the API server
+  # rejects every create, update and delete of those resources, so an apply that
+  # creates or updates one in a chart that carries them (space-secrets-bootstrap,
+  # or one the calling root adds) fails.
   values = [yamlencode({
     nodeSelector = {
       "space.pplx.net/node-pool" = "general"
+    }
+    webhook = {
+      replicaCount = 2
+      nodeSelector = {
+        "space.pplx.net/node-pool" = "general"
+      }
+      podDisruptionBudget = local.external_secrets_webhook_disruption_budget
+      affinity            = local.external_secrets_webhook_affinity
+    }
+    certController = {
+      nodeSelector = {
+        "space.pplx.net/node-pool" = "general"
+      }
     }
   })]
   # Every controller pins its pods to the general node pool; waiting on it
@@ -149,6 +189,18 @@ resource "helm_release" "aws_load_balancer_controller" {
       vpcId       = var.vpc_id
       nodeSelector = {
         "space.pplx.net/node-pool" = "general"
+      }
+      # The chart's two replicas keep one serving its webhooks through an
+      # eviction; all six (the pod, Service and TargetGroupBinding mutators and
+      # the Ingress, IngressClassParams and TargetGroupBinding validators) are
+      # `failurePolicy: Fail`. The chart's default anti-affinity only
+      # prefers separate nodes. When both replicas share one, cluster-autoscaler
+      # still removes it, evicting them one at a time. The chart renders the
+      # budget map as given, so it can carry `AlwaysAllow`: with both replicas
+      # unready, none is serving and a drain shouldn't wait for one.
+      podDisruptionBudget = {
+        maxUnavailable             = 1
+        unhealthyPodEvictionPolicy = "AlwaysAllow"
       }
       serviceAccount = {
         create = true

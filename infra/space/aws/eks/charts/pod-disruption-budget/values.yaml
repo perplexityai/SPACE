@@ -1,0 +1,13 @@
+# Set by the owning Terraform module to the chart's content hash, so a template
+# edit changes the release's values and plans. Nothing renders it.
+chart:
+  checksum: ""
+
+# Name of the PodDisruptionBudget.
+name: ""
+
+# Labels of the pods the budget covers. Use the workload's own selector labels
+# so the budget never matches pods from another release.
+matchLabels: {}
+
+maxUnavailable: 1

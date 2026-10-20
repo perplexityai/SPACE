@@ -76,7 +76,7 @@ resource "aws_launch_template" "node_group" {
 resource "aws_eks_node_group" "custom" {
   for_each = {
     for key, value in var.node_pools : key => value
-    if value.ami_id != null
+    if value.ami_id != null && !value.launch_template_and_role_only
   }
 
   cluster_name    = aws_eks_cluster.this.name
@@ -135,7 +135,7 @@ resource "aws_eks_node_group" "custom" {
 resource "aws_eks_node_group" "managed" {
   for_each = {
     for key, value in var.node_pools : key => value
-    if value.ami_id == null
+    if value.ami_id == null && !value.launch_template_and_role_only
   }
 
   cluster_name    = aws_eks_cluster.this.name
@@ -194,11 +194,13 @@ resource "aws_eks_node_group" "managed" {
     update = var.node_group_update_timeout
   }
 
-  # These groups have no autoscaler, so their size moves only when an operator
-  # resizes them through the EKS API. Without this, the next apply for any
-  # unrelated change would reset each group to its creation-time sizing and
-  # scale it down under whatever is running on it. The sizes in node_pools
-  # still decide what a new cluster comes up with.
+  # These groups' size moves only outside Terraform: an operator resizing them
+  # through the EKS API, or a cluster-autoscaler the caller runs on one of them,
+  # which sets the ASG's desired capacity between the min and max it reads live
+  # from that ASG. Without this, the next apply for any unrelated change would
+  # reset each group to its creation-time sizing and scale it down under
+  # whatever is running on it. The sizes in node_pools still decide what a new
+  # cluster comes up with.
   lifecycle {
     ignore_changes = [
       scaling_config[0].min_size,

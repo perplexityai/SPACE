@@ -136,11 +136,19 @@ variable "node_pools" {
     `node_pool_user_data` must carry the pool's bootstrap script. `additional_policy_arns` keys must be known at plan time; their
     values may not be. For a pool with no `ami_id`, `min_size`,
     `desired_size`, and `max_size` apply at creation only: afterwards the
-    group is resized through the EKS API and Terraform ignores all three. A
-    custom-AMI pool keeps its size under Terraform. `update_strategy` is the
-    group's rolling-update strategy: null leaves EKS's default, which launches
+    group is resized through the EKS API (or its ASG's desired capacity by a
+    cluster-autoscaler the caller runs on it) and Terraform ignores all three. A custom-AMI pool
+    keeps its size under Terraform. `update_strategy` is the group's
+    rolling-update strategy: null leaves EKS's default, which launches
     replacements before draining; `MINIMAL` drains first, so a roll never runs
     more nodes than the group's size.
+
+    `launch_template_and_role_only` true keeps only the pool's launch template,
+    node IAM role, and the role's policy attachments, and creates no node
+    group, so a node group declared outside this module can run on them (the
+    `launch_templates` and `node_role_arns` outputs). The pool's node-group
+    fields (sizes, instance and capacity types, labels, taints, subnets,
+    `update_strategy`) are then unused.
   EOT
   type = map(object({
     instance_types                          = list(string)
@@ -160,6 +168,7 @@ variable "node_pools" {
     additional_policy_arns                  = optional(map(string), {})
     volume_tags                             = optional(map(string), {})
     update_strategy                         = optional(string)
+    launch_template_and_role_only           = optional(bool, false)
   }))
   default = {}
 
@@ -175,9 +184,18 @@ variable "node_pools" {
   validation {
     condition = alltrue([
       for name in keys(var.cluster_addons) : contains(["vpc-cni", "kube-proxy"], name)
-    ]) || anytrue([for pool in values(var.node_pools) : pool.desired_size > 0])
-    error_message = "Addons other than vpc-cni and kube-proxy need a node pool in this module with desired_size above zero to schedule on."
+      ]) || var.external_node_group_hosts_addons || anytrue([
+      for pool in values(var.node_pools) : !pool.launch_template_and_role_only && pool.desired_size > 0
+    ])
+    error_message = "Addons other than vpc-cni and kube-proxy need a node pool with a node group and desired_size above zero to schedule on: one in this module, or one declared outside it with external_node_group_hosts_addons set."
   }
+}
+
+variable "external_node_group_hosts_addons" {
+  description = "Whether a node group the caller declares outside this module, on a pool's launch template and role, has nodes the deployment-backed addons (coredns, metrics-server, ...) can schedule on. Set it when that group is the only such capacity, so the addon check in node_pools counts it. This module can't wait for that group: the group takes its cluster name from this module's outputs, so the addons only become healthy once it has nodes."
+  type        = bool
+  default     = false
+  nullable    = false
 }
 
 variable "node_group_update_timeout" {

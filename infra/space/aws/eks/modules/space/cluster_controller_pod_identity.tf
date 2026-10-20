@@ -45,11 +45,11 @@ locals {
     aws_eks_node_group.rollout_managed,
   )
 
-  # Names of every ASG backing a SPACE worker node group. A single EKS
-  # node group can publish multiple ASGs when the instance-type list is
-  # heterogeneous (one ASG per AZ in some cases), so flatten across both
-  # `resources[*].autoscaling_groups[*]` AND across pools. `flatten` is
-  # recursive, so the triple nesting collapses to a flat list.
+  # Names of every ASG backing a SPACE worker node group. EKS backs each
+  # managed node group with one ASG spanning all its subnets, but the provider
+  # exposes it as a list under `resources[*].autoscaling_groups[*]`, so flatten
+  # across that nesting AND across pools. `flatten` is recursive, so the triple
+  # nesting collapses to a flat list.
   #
   # Three sources, concatenated then flattened:
   #
@@ -88,12 +88,10 @@ locals {
     var.additional_worker_asg_names,
   ))
 
-  # IAM resource ARNs for those ASGs. The middle `*` stands in for the
-  # per-ASG UUID, which AWS assigns at creation time and is not part of the
-  # human-readable name.
+  # IAM resource ARNs for those ASGs.
   worker_capacity_asg_arns = [
     for name in values(local.worker_capacity_asg_names) :
-    "arn:${data.aws_partition.current.partition}:autoscaling:${var.aws_region}:${data.aws_caller_identity.current.account_id}:autoScalingGroup:*:autoScalingGroupName/${name}"
+    "${local.autoscaling_group_arn_prefix}${name}"
   ]
 
   worker_capacity_nodegroup_arns = [
@@ -103,13 +101,13 @@ locals {
   cluster_controller_worker_asg_arns = concat(
     [
       for name in local.cluster_controller_worker_asg_names :
-      "arn:${data.aws_partition.current.partition}:autoscaling:${var.aws_region}:${data.aws_caller_identity.current.account_id}:autoScalingGroup:*:autoScalingGroupName/${name}"
+      "${local.autoscaling_group_arn_prefix}${name}"
     ],
     # Root-declared worker ASGs whose names are unknown until apply: fine here
     # because this is an IAM policy `resources` value, not a for_each key.
     [
       for name in var.additional_worker_asg_names_policy_only :
-      "arn:${data.aws_partition.current.partition}:autoscaling:${var.aws_region}:${data.aws_caller_identity.current.account_id}:autoScalingGroup:*:autoScalingGroupName/${name}"
+      "${local.autoscaling_group_arn_prefix}${name}"
     ],
     local.worker_capacity_asg_arns,
   )

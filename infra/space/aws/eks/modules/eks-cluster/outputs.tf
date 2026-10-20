@@ -91,6 +91,17 @@ output "vpc_cni_role_arn" {
   value       = aws_iam_role.vpc_cni.arn
 }
 
+output "managed_node_groups" {
+  description = "EKS-managed-AMI node groups by pool: arn, the backing ASG names, and scaling_config. It depends only on those groups, so a consumer doesn't wait on custom-AMI pools."
+  value = {
+    for name, group in aws_eks_node_group.managed : name => {
+      arn            = group.arn
+      asg_names      = flatten([for r in group.resources : [for asg in r.autoscaling_groups : asg.name]])
+      scaling_config = group.scaling_config
+    }
+  }
+}
+
 output "managed_node_group_arns" {
   description = "ARNs of the EKS-managed-AMI node groups by pool. Depends only on those groups, so a readiness edge through it doesn't wait on custom-AMI pools."
   value       = { for name, group in aws_eks_node_group.managed : name => group.arn }

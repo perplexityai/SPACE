@@ -101,24 +101,34 @@ output "general_serving_node_group" {
 
   precondition {
     # Existing single-pool environments retain their positive-capacity gate.
-    # Blue/green configurations additionally enforce the operator-recorded floor.
-    condition = var.general_blue_green_node_group == null ? (
-      module.eks.node_groups["general"].scaling_config[0].min_size > 0
-      ) : var.general_serving_node_group == "general" ? (
-      module.eks.node_groups["general"].scaling_config[0].min_size >= var.general_min_size
-      ) : (
-      aws_eks_node_group.general_blue_green[0].scaling_config[0].min_size >= var.general_blue_green_node_group.recorded_active_size
+    # Blue/green configurations additionally enforce the operator-recorded
+    # floor on the serving pool. The sizes are the live ones: Terraform
+    # ignores them after creation, so the plan carries what EKS reports.
+    condition = local.serving_general_node_group.scaling_config[0].min_size >= (
+      var.general_blue_green_node_group == null ? 1 :
+      var.general_serving_node_group == "general" ? var.general_min_size :
+      var.general_blue_green_node_group.recorded_active_size
     )
     error_message = "The recorded general_serving_node_group must be live and, for blue/green configurations, meet its recorded capacity floor."
+  }
+
+  precondition {
+    condition = alltrue([
+      for name, asg in data.aws_autoscaling_group.retiring_general :
+      asg.desired_capacity == 0 && length(data.aws_instances.retiring_general[name].ids) == 0
+    ])
+    error_message = "general_node_group_retired deletes the general node group, which still wants or runs instances. Cut over to general-2 in one apply, then scale general to zero through EKS and wait for its nodes to leave, then retire it."
+  }
+
+  precondition {
+    condition     = alltrue([for clusters in data.aws_eks_clusters.retiring_general : contains(clusters.names, local.name)])
+    error_message = "general_node_group_retired retires a general that exists, and cluster ${local.name} doesn't exist yet. Create it with general, cut over to general-2, park general at zero, then retire it."
   }
 }
 
 output "general_serving_min_size" {
-  description = "Larger configured floor of the two permanent general pools. Either may carry the active workload, so a root-owned DaemonSet that must roll on the general pool gates on this while the inactive pool stays at zero; referencing it also orders the consumer after a floor update."
-  value = max(
-    module.eks.node_groups["general"].scaling_config[0].min_size,
-    try(aws_eks_node_group.general_blue_green[0].scaling_config[0].min_size, 0),
-  )
+  description = "Larger live floor of the declared general pools. Either may carry the active workload, so a root-owned DaemonSet that must roll on the general pool gates on this while the inactive pool stays at zero; referencing it also orders the consumer after a floor update."
+  value       = max([for group in values(local.general_node_groups) : group.scaling_config[0].min_size]...)
 }
 
 output "vpc_cni_service_account_role_arn" {

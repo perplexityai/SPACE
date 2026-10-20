@@ -284,6 +284,43 @@ variable "external_dns_records_enabled" {
   }
 }
 
+variable "cluster_autoscaler_enabled" {
+  description = "Whether to run cluster-autoscaler on the serving general node group (general_serving_node_group), bounded by that group's own min and max size as EKS reports them, so resizing the group through the EKS API moves the bounds. The serving pool's recorded floor (general_min_size, or general_blue_green_node_group.recorded_active_size) still has to hold for that min, so lower the record before lowering the min. It never touches any other pool."
+  type        = bool
+  default     = false
+  nullable    = false
+}
+
+variable "cluster_autoscaler_memory_mib" {
+  description = "cluster-autoscaler's memory request and limit, in MiB. Read only when cluster_autoscaler_enabled, which requires it."
+  type        = number
+  default     = null
+
+  validation {
+    condition     = !var.cluster_autoscaler_enabled || try(floor(var.cluster_autoscaler_memory_mib) == var.cluster_autoscaler_memory_mib && var.cluster_autoscaler_memory_mib >= 256, false)
+    error_message = "cluster_autoscaler_memory_mib must be set when cluster_autoscaler_enabled, to a whole number of MiB, at least 256."
+  }
+}
+
+variable "cluster_autoscaler_scale_down_enabled" {
+  description = "Whether cluster-autoscaler may remove serving general nodes it finds unneeded. Off, it still adds nodes for Pending pods and still removes instances that never registered or failed to create. Read only when cluster_autoscaler_enabled."
+  type        = bool
+  default     = false
+  nullable    = false
+}
+
+variable "cluster_autoscaler_max_graceful_termination_sec" {
+  description = "The longest grace period, in seconds, cluster-autoscaler gives a pod it evicts to scale down a serving general node. A pod with a shorter terminationGracePeriodSeconds keeps its own. Null leaves the upstream default, 600. Read only when cluster_autoscaler_enabled."
+  type        = number
+  default     = null
+}
+
+variable "cluster_autoscaler_new_pod_scale_up_delay" {
+  description = "How old a Pending pod must be before cluster-autoscaler adds a node for it, as a duration such as \"90s\". Null leaves the upstream default, 0s. Read only when cluster_autoscaler_enabled."
+  type        = string
+  default     = null
+}
+
 variable "cluster_service_cidr" {
   description = "Kubernetes service CIDR used when bootstrapping custom AMIs"
   type        = string
@@ -782,7 +819,7 @@ variable "general_taints" {
 }
 
 variable "general_blue_green_node_group" {
-  description = "Optional permanent general-2 MNG used for additive blue/green swaps. recorded_active_size creates the pool initially and records its operator-managed active target for capacity checks."
+  description = "Optional permanent general-2 MNG used for additive blue/green swaps. recorded_active_size creates the pool initially and records its operator-managed active target for capacity checks. After creation the pool is sized only through the EKS API, by operators or, while it serves, cluster-autoscaler."
   type = object({
     instance_types       = list(string)
     recorded_active_size = number
@@ -803,7 +840,7 @@ variable "general_blue_green_node_group" {
 }
 
 variable "general_serving_node_group" {
-  description = "General MNG that is currently intended to serve SPACE workloads. Keep this aligned with the operator-managed blue/green cutover so capacity checks use the live node shape."
+  description = "General MNG that is currently intended to serve SPACE workloads. Keep this aligned with the blue/green cutover so capacity checks use the live node shape. cluster-autoscaler, where enabled, scales this group and only this group, so changing it retargets the autoscaler in the same apply."
   type        = string
   default     = "general"
 
@@ -813,6 +850,18 @@ variable "general_serving_node_group" {
       var.general_blue_green_node_group != null
     )
     error_message = "general_serving_node_group must be general, or general-2 when general_blue_green_node_group is declared."
+  }
+}
+
+variable "general_node_group_retired" {
+  description = "Whether the original `general` MNG has been removed, leaving general-2 as the only general pool. Its launch template, node IAM role, and service-account role stay, because general-2 runs on the first two. Set `true` only once general-2 serves and general is drained and parked at zero nodes. The plan fails while general's ASG still wants or runs any instance, and on a cluster that doesn't exist yet: a new cluster comes up with general, because the cluster's addons wait only on node groups inside module.eks. Those checks read AWS at plan time, so while retiring, don't put this module behind a module-level depends_on, which defers the reads and fails the plan."
+  type        = bool
+  default     = false
+  nullable    = false
+
+  validation {
+    condition     = !var.general_node_group_retired || var.general_serving_node_group == "general-2"
+    error_message = "general_node_group_retired needs general_serving_node_group = \"general-2\"."
   }
 }
 
