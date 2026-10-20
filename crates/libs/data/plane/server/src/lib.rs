@@ -118,10 +118,11 @@ use native::{
     stream_bridge_error_label, strip_data_plane_auth_headers, token_from_headers,
 };
 use native::{
-    RouteResolutionError, attach_session, data_plane_http_error, is_upgrade_request,
-    node_api_request_with_route_token_state, node_api_request_with_timeout_and_route_token_state,
-    observe_data_plane_http_error, proxy_session, proxy_upgraded_connection,
-    revocation_state_is_active, session_events, token_sha256,
+    ProcessSessionCreator, RouteResolutionError, attach_session, create_and_attach_process_session,
+    data_plane_http_error, is_upgrade_request, node_api_request_with_route_token_state,
+    node_api_request_with_timeout_and_route_token_state, observe_data_plane_http_error,
+    proxy_session, proxy_upgraded_connection, revocation_state_is_active, session_events,
+    token_sha256,
 };
 use runtime_route::{
     EcwRouteTransport, acquire_ecw_stream_permit, ecw_backend_channel,
@@ -212,6 +213,14 @@ pub struct DataPlaneConfig {
     /// outlives the drain. `None` sets no deadline: streams run until they end
     /// or the pod's termination grace period kills the process.
     pub shutdown_grace: Option<Duration>,
+    /// The API's in-cluster `http://` origin, which serves
+    /// `createAndAttachProcessSession`'s creates. `None` leaves that endpoint
+    /// answering 404, so clients use the two-step create and attach.
+    pub api_internal_url: Option<String>,
+    /// Whether `api_internal_url` may carry callers' API keys unencrypted.
+    /// It is the only transport that hop has, so without this a configured
+    /// URL fails startup rather than sending the keys in the clear.
+    pub api_internal_plaintext: bool,
 }
 
 impl Default for DataPlaneConfig {
@@ -228,6 +237,8 @@ impl Default for DataPlaneConfig {
             route_cache_ttl: Duration::from_millis(DEFAULT_ROUTE_CACHE_TTL_MS),
             upload_admission: None,
             shutdown_grace: None,
+            api_internal_url: None,
+            api_internal_plaintext: false,
         }
     }
 }
@@ -246,6 +257,7 @@ struct DataPlaneState {
     ecw_route_repairs: Arc<DashMap<String, tokio::time::Instant>>,
     ecw_process_input_locks: Arc<EcwProcessInputLocks>,
     ecw_hosts: EcwHostConfig,
+    session_create: Option<ProcessSessionCreator>,
     revocation_check_interval: Duration,
     route_cache_ttl: Duration,
     /// Cancelled on SIGTERM: a child of the caller's shutdown token. New
@@ -368,6 +380,8 @@ pub enum RunDataPlaneError {
     },
     #[error("data-plane HTTP server failed: {0}")]
     Serve(#[source] std::io::Error),
+    #[error(transparent)]
+    ApiInternalUrl(#[from] native::ApiInternalUrlError),
 }
 
 /// Serve until `stop.shutdown` is cancelled, then drain. `stop.forced`, a
@@ -385,6 +399,13 @@ pub async fn run(
     let drain_started = shutdown_token.child_token();
     let stream_shutdown_token = CancellationToken::new();
 
+    let session_create = config
+        .api_internal_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(|url| ProcessSessionCreator::new(url, config.api_internal_plaintext))
+        .transpose()?;
     let cluster_api = connect_cluster_api_clients_for_startup(&shutdown_token)
         .await
         .map_err(RunDataPlaneError::ConnectClusterApi)?;
@@ -411,6 +432,7 @@ pub async fn run(
         ecw_route_repairs: Arc::new(DashMap::new()),
         ecw_process_input_locks: Arc::new(EcwProcessInputLocks::default()),
         ecw_hosts: EcwHostConfig::from_env(),
+        session_create,
         revocation_check_interval: config
             .revocation_check_interval
             .max(Duration::from_millis(1)),
@@ -546,6 +568,13 @@ fn router(state: DataPlaneState) -> Router {
             on(
                 native_method_filter(native_routes::ATTACH_SESSION.method()),
                 attach_session,
+            ),
+        )
+        .route(
+            native_routes::CREATE_AND_ATTACH_PROCESS_SESSION.runtime_path(),
+            on(
+                native_method_filter(native_routes::CREATE_AND_ATTACH_PROCESS_SESSION.method()),
+                create_and_attach_process_session,
             ),
         )
         .route(

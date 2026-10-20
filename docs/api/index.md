@@ -28,6 +28,7 @@ Ready to run code? Follow [Your first sandbox](../first-sandbox.md) for a comple
 - **Attach to start execution.** Creating a command alone does not run it. Process endpoints show running processes, not command history.
 - **Use the session token**, not your management API token. Check the returned URL against your configured stream origin and session path; never follow redirects with credentials.
 - **Create and attach in one request** by sending `Accept: text/event-stream` with the create. The response is the event stream, preceded by a `command` frame whose `command` field is the handle. If the server answers with the JSON handle instead, attach as usual.
+- **Create and attach an interactive process on one socket** with `GET /v1/sandboxes/{sandbox_id}/process-sessions:attach` on the stream origin, authenticated with your API key. Send the `createProcessSession` body and its idempotency key as the first `create` frame; the first server frame is the `session` handle, or the create's error. Reattach later through the handle's `attach.url`. A 404 on the upgrade means the deployment does not offer it: create and attach in two steps.
 - **Save output as it arrives.** Streams are live, with no replay. Check `process_exited`; a closed connection alone is not success. See [command output](../first-sandbox.md#read-command-output).
 
 ## Retry safely
