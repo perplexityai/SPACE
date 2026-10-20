@@ -52,6 +52,13 @@ spec:
             - --health-socket={{ include "space-node-service.healthSocket" $ctx }}
           {{- include "space-node-service.restrictedContainer" . | nindent 10 }}
           env:
+            {{- with .Values.hashAlgorithm }}
+            {{- if not (has . (list "sha256" "blake3")) }}
+            {{- fail "hashAlgorithm must be sha256 or blake3" }}
+            {{- end }}
+            - name: SPACE_TEMPLATE_HASH_ALGORITHM
+              value: {{ . | quote }}
+            {{- end }}
             {{- with .Values.rootfsBackingPolicy }}
             {{- if not (has . (list "inherit" "nocow")) }}
             {{- fail "rootfsBackingPolicy must be inherit, nocow, or empty" }}

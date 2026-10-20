@@ -345,6 +345,7 @@ const ALLOW_TEMPLATE_SNAPSHOT_POLICY_OPERATOR: &[UdsPeerPrincipal] = &[
 pub struct TemplateManagerService {
     db: Arc<Mutex<rusqlite::Connection>>,
     artifact_store: TemplateArtifactStore,
+    production_hash_algorithm: HashAlg,
     pool_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     snapshot_reconcile_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     snapshot_retry_backoff: Arc<Mutex<snapshots::RetryBackoff>>,
@@ -375,11 +376,6 @@ pub struct TemplateManagerService {
 }
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
-
-/// Path to the template name directory: `{TEMPLATE_DIR}/{name}`
-fn template_name_dir(name: &str) -> String {
-    format!("{TEMPLATE_DIR}/{name}")
-}
 
 /// Path to a build's digest directory: `{TEMPLATE_DIR}/{name}/{content_hash}/`
 fn build_dir(name: &str, content_hash: &str) -> String {
@@ -1458,6 +1454,7 @@ impl TemplateManagerService {
         Ok(Self {
             db,
             artifact_store: TemplateArtifactStore::default(),
+            production_hash_algorithm: crate::content_hash::DEFAULT_PRODUCTION_ALGORITHM,
             pool_handle: Arc::new(Mutex::new(None)),
             snapshot_reconcile_locks: Arc::new(Mutex::new(HashMap::new())),
             snapshot_retry_backoff: Arc::new(Mutex::new(snapshots::RetryBackoff::default())),
@@ -1470,6 +1467,11 @@ impl TemplateManagerService {
             background_worker,
             sbx_connect_retry_policy: pplx_space_sbx_mgr_client::DEFAULT_CONNECT_RETRY_POLICY,
         })
+    }
+
+    pub(crate) fn with_production_hash_algorithm(mut self, algorithm: HashAlg) -> Self {
+        self.production_hash_algorithm = algorithm;
+        self
     }
 
     pub(crate) fn with_rootfs_backing_policy(

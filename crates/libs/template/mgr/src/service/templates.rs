@@ -436,7 +436,12 @@ impl TemplateManagerService {
             .map(proto_network_policy_to_common)
             .transpose()?;
 
-        let name_dir = template_name_dir(template_id);
+        let name_dir = self
+            .artifact_store
+            .root
+            .join(template_id)
+            .display()
+            .to_string();
         let register_source = match req.staging_dir.as_deref() {
             Some(staging_dir_name) => {
                 // Build-scoped source: a single validated path component under
@@ -536,7 +541,7 @@ impl TemplateManagerService {
         expand_template_rootfs(template_id, "pending", &staging_dir, "register").await?;
         let content_hash = compute_template_file_hash(
             rootfs_path.clone(),
-            HashAlg::Sha256,
+            self.production_hash_algorithm,
             "hash expanded rootfs",
         )
         .await?;
@@ -544,7 +549,9 @@ impl TemplateManagerService {
             .map(|m| m.len())
             .map_err(|e| Status::internal(format!("stat rootfs {}: {e}", rootfs_path.display())))?;
 
-        let digest_dir = build_dir(template_id, &content_hash);
+        let digest_dir = build_artifacts_dir(&self.artifact_store.root, template_id, &content_hash)
+            .display()
+            .to_string();
 
         // If a build with this same expanded hash already exists,
         // drop the staging copy and short-circuit to a metadata refresh.
