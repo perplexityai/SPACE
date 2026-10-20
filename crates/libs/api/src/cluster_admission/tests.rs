@@ -53,7 +53,7 @@ fn admission_with_flags(
 /// Prefers `SPACE_TEST_REDIS_URL` (e.g. a locally running `redis-server`) so
 /// the token-bucket Lua can be exercised without Docker; otherwise starts a
 /// throwaway Redis container. Returns `None` (skips the test) only when neither
-/// is available.
+/// is available and the run opted out of required test dependencies.
 async fn try_redis_url() -> TestResult<Option<(Option<ContainerAsync<Redis>>, String)>> {
     if let Ok(url) = std::env::var("SPACE_TEST_REDIS_URL")
         && !url.trim().is_empty()
@@ -72,12 +72,7 @@ async fn try_redis_url() -> TestResult<Option<(Option<ContainerAsync<Redis>>, St
     {
         Ok(node) => node,
         Err(error) => {
-            if pplx_space_db_test_fixtures::require_test_deps() {
-                return Err(error.into());
-            }
-            pplx_space_db_test_fixtures::report_dependency_skip(&format!(
-                "redis unavailable: {error}"
-            ))?;
+            pplx_space_db_test_fixtures::report_unavailable_dependency("redis", &error)?;
             return Ok(None);
         }
     };
@@ -410,9 +405,9 @@ fn a_rate_limited_hint_is_paced_by_the_configured_refill_rate() {
     // Docker-free coverage of the *function* the rate-limit call site calls —
     // not of the call site itself, which only
     // `exhausted_bucket_rate_limits_activation` reaches and which
-    // dependency-skips without Postgres and Redis. So a refactor of
-    // `admit_activation` that stopped passing `config.refill_rps` would still
-    // be caught only there (and in CI, where the fixtures are required). This
+    // needs Postgres and Redis. So a refactor of `admit_activation` that
+    // stopped passing `config.refill_rps` would still be caught only there,
+    // and only by a run with those dependencies up. This
     // covers the arithmetic: a sub-one-token-per-second rate must be honoured
     // rather than collapsed onto the header floor.
     // Non-constancy lives here rather than in the Redis-backed test: this calls

@@ -420,6 +420,23 @@ needs an attribute to say what `mod tests;` says for free, and it puts test
 files in the same directory listing as production ones. Don't propagate it; new
 test modules use the plain `#[cfg(test)] mod <name>;` + `<host>/<name>.rs` form.
 
+## Service-dependency tests
+
+Tests reach Postgres and Redis through `pplx-space-db-test-fixtures`
+(`pg_test_db`, `try_pg_test_db` and their raw variants). A test that starts its
+own container, as the api Redis and migrator bootstrap-role tests do, passes a
+start failure to `report_unavailable_dependency` and returns only when that
+returns `Ok`. An unavailable dependency then fails the test by default, with a
+message naming the dependency and how to provide it. Only a run that sets
+`SPACE_TEST_DEPS_OPTIONAL` to anything but empty or `0` skips instead, and
+every such skip prints a `SPACE-TEST-DEP-SKIP:` marker that CI counts
+(`SPACE_TEST_DEP_SKIP_LOG`). `SPACE_CI_REQUIRE_TEST_DEPS` predates the default:
+set to anything but empty or `0` it requires the dependencies even under the
+opt-out. Set to empty or `0` it is still read as optional, a legacy reading
+rather than an opt-out to use: the NoCoW host-fixture tests treat any value of
+it as CI. Don't print the marker for a skip that is not a missing service, such
+as a main-CI-only test.
+
 ## Privileged tests and the CI host
 
 The GitHub Rust test job runs the whole workspace, ignored tests included

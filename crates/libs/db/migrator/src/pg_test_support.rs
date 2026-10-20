@@ -1,9 +1,9 @@
 //! Shared Postgres testcontainer fixture for migrator tests.
 //!
-//! Starts a throwaway Postgres via Docker and skips gracefully (`Ok(None)`)
-//! when no container runtime is reachable, matching the repo-wide
-//! testcontainers convention: a run without Docker skips these tests instead
-//! of failing.
+//! Starts a throwaway Postgres via Docker. When no container runtime is
+//! reachable it fails the test, or returns `Ok(None)` for the test to skip
+//! when the run opted out, by the same rule as the shared fixtures
+//! (`pplx_space_db_test_fixtures::report_unavailable_dependency`).
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Connection as _, PgConnection, PgPool};
@@ -48,12 +48,7 @@ pub(crate) async fn postgres_fixture() -> TestResult<Option<PostgresFixture>> {
     {
         Ok(container) => container,
         Err(error) => {
-            if pplx_space_db_test_fixtures::require_test_deps() {
-                return Err(error.into());
-            }
-            pplx_space_db_test_fixtures::report_dependency_skip(&format!(
-                "postgres unavailable: {error}"
-            ))?;
+            pplx_space_db_test_fixtures::report_unavailable_dependency("postgres", &error)?;
             return Ok(None);
         }
     };

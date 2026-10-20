@@ -1,7 +1,8 @@
+use pplx_space_common_core::env::{Environment, ProcessEnvironment, test_hook};
 use pplx_space_common_core::types::{LocalArtifactId, NodeId, SandboxId, SnapshotId};
 
 use std::error::Error;
-use std::ffi::OsStr;
+use std::fmt::Display;
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::{Arc, Weak};
@@ -324,15 +325,18 @@ pub async fn pg_test_db_with_max_connections(max_connections: u32) -> TestDbResu
 
 /// Return a migrated Postgres database cloned from the shared template.
 ///
-/// This is the graceful API for suites that historically no-op when Docker is
-/// unavailable. Only container startup failures map to `Ok(None)`; migration
-/// and cloning failures still fail the test because they indicate broken setup.
+/// This is the graceful API for suites that return early when Docker is
+/// unavailable. A container startup failure fails the test like
+/// [`pg_test_db`] unless the run opted out with `SPACE_TEST_DEPS_OPTIONAL`
+/// (see [`report_unavailable_dependency`]); only then does it map to
+/// `Ok(None)`. Migration and cloning failures always fail the test because
+/// they indicate broken setup.
 pub async fn try_pg_test_db() -> TestDbResult<Option<TestDb>> {
     try_pg_test_db_with_max_connections(2).await
 }
 
 /// Return a migrated Postgres database cloned from the process-local template,
-/// preserving graceful container-unavailable semantics and using the requested
+/// with the same container-unavailable semantics and using the requested
 /// pool size for the per-test database connection pool.
 pub async fn try_pg_test_db_with_max_connections(
     max_connections: u32,
@@ -371,9 +375,11 @@ pub async fn raw_pg_test_db_with_max_connections(max_connections: u32) -> TestDb
 
 /// Return a raw, unmigrated database on the shared run-scoped Postgres.
 ///
-/// This is the graceful API for suites that historically no-op when Docker is
-/// unavailable. Only container startup failures map to `Ok(None)`; database
-/// creation failures still fail the test because they indicate broken setup.
+/// This is the graceful API for suites that return early when Docker is
+/// unavailable. A container startup failure maps to `Ok(None)` only when the
+/// run opted out with `SPACE_TEST_DEPS_OPTIONAL` (see
+/// [`report_unavailable_dependency`]); database creation failures always fail
+/// the test because they indicate broken setup.
 pub async fn try_raw_pg_test_db() -> TestDbResult<Option<TestDb>> {
     try_raw_pg_test_db_with_max_connections(2).await
 }
@@ -390,22 +396,138 @@ pub async fn try_raw_pg_test_db_with_max_connections(
     shared.cloned_raw_database(max_connections).await.map(Some)
 }
 
-/// True when the suite must hard-fail instead of skipping when a test
-/// dependency (Postgres/Redis testcontainer) is unavailable.
+/// Opts a run out of [`require_test_deps`]: present, non-empty and not `0`
+/// turns an unavailable service dependency into a counted skip.
+const TEST_DEPS_OPTIONAL_ENV: &str = "SPACE_TEST_DEPS_OPTIONAL";
+/// The variable CI set before dependencies were required by default. Set to
+/// anything but empty or `0` it still requires them, whatever
+/// [`TEST_DEPS_OPTIONAL_ENV`] says; set to empty or `0` it keeps its older
+/// meaning, optional.
+const REQUIRE_TEST_DEPS_ENV: &str = "SPACE_CI_REQUIRE_TEST_DEPS";
+
+/// What a test does when a service dependency it needs (Postgres, Redis, or
+/// the container runtime that starts them) is unavailable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TestDepsPolicy {
+    /// Fail the test. The default, when `required_by` is `None`; otherwise it
+    /// names the setting that requires dependencies whatever the opt-out says,
+    /// so the failure does not offer an opt-out that cannot work.
+    Required { required_by: Option<&'static str> },
+    /// Skip the test with a `SPACE-TEST-DEP-SKIP:` marker. Carries which
+    /// setting opted out, so every marker says why the run allowed it.
+    Optional { opted_out_by: &'static str },
+}
+
+impl TestDepsPolicy {
+    fn from_env(env: &dyn Environment) -> Self {
+        Self::from_values(
+            test_hook(env, REQUIRE_TEST_DEPS_ENV).as_deref(),
+            test_hook(env, TEST_DEPS_OPTIONAL_ENV).as_deref(),
+        )
+    }
+
+    fn from_values(require: Option<&str>, optional: Option<&str>) -> Self {
+        let on = |value: Option<&str>| value.is_some_and(|value| !value.is_empty() && value != "0");
+        if on(require) {
+            Self::Required {
+                required_by: Some("SPACE_CI_REQUIRE_TEST_DEPS is set"),
+            }
+        } else if on(optional) {
+            Self::Optional {
+                opted_out_by: "SPACE_TEST_DEPS_OPTIONAL is set",
+            }
+        } else if require.is_some() {
+            Self::Optional {
+                opted_out_by: "SPACE_CI_REQUIRE_TEST_DEPS is empty or 0",
+            }
+        } else {
+            Self::Required { required_by: None }
+        }
+    }
+}
+
+/// True unless the run opted out of failing on an unavailable test
+/// dependency (Postgres/Redis testcontainer) with `SPACE_TEST_DEPS_OPTIONAL`.
 ///
-/// Runtime environment check rather than a compile-time cfg so CI can flip
-/// strictness per pipeline step without changing compile flags (which would
-/// invalidate every sccache key) and can roll back by unsetting one variable.
+/// Runtime environment check rather than a compile-time cfg so a run can opt
+/// out without changing compile flags (which would invalidate every sccache
+/// key). Callers that start their own container should prefer
+/// [`report_unavailable_dependency`], which also says how to fix the failure.
 pub fn require_test_deps() -> bool {
-    require_test_deps_value(
-        pplx_space_common_core::env::test_hook_var("SPACE_CI_REQUIRE_TEST_DEPS")
-            .as_deref()
-            .map(OsStr::new),
+    matches!(
+        TestDepsPolicy::from_env(&ProcessEnvironment),
+        TestDepsPolicy::Required { .. }
     )
 }
 
-fn require_test_deps_value(value: Option<&OsStr>) -> bool {
-    value.is_some_and(|value| !value.is_empty() && value != "0")
+/// Decide what a test does about a service `dependency` it could not start or
+/// reach, with `detail` saying why.
+///
+/// Returns the error the test should fail with unless the run opted out with
+/// `SPACE_TEST_DEPS_OPTIONAL`. Under the opt-out it records the skip with
+/// [`report_dependency_skip`] and returns `Ok(())`, and the caller returns
+/// early without testing anything.
+pub fn report_unavailable_dependency(dependency: &str, detail: &dyn Display) -> TestDbResult<()> {
+    let log = pplx_space_common_core::env::test_hook_var("SPACE_TEST_DEP_SKIP_LOG");
+    unavailable_dependency_outcome(
+        TestDepsPolicy::from_env(&ProcessEnvironment),
+        dependency,
+        detail,
+        log.as_deref().map(Path::new),
+    )
+}
+
+fn unavailable_dependency_outcome(
+    policy: TestDepsPolicy,
+    dependency: &str,
+    detail: &dyn Display,
+    log: Option<&Path>,
+) -> TestDbResult<()> {
+    match policy {
+        TestDepsPolicy::Required { required_by: None } => Err(unavailable_dependency_error(
+            dependency,
+            detail,
+            &format!(
+                "Test dependencies are required by default. To skip tests that need it \
+                 instead, set {TEST_DEPS_OPTIONAL_ENV}=1; each skip prints a \
+                 SPACE-TEST-DEP-SKIP: marker."
+            ),
+        )),
+        TestDepsPolicy::Required {
+            required_by: Some(setting),
+        } => Err(unavailable_dependency_error(
+            dependency,
+            detail,
+            &format!(
+                "Test dependencies are required because {setting}, which overrides \
+                 {TEST_DEPS_OPTIONAL_ENV}."
+            ),
+        )),
+        TestDepsPolicy::Optional { opted_out_by } => {
+            report_dependency_skip_to(
+                &format!("{dependency} unavailable ({opted_out_by}): {detail}"),
+                log,
+            )?;
+            Ok(())
+        }
+    }
+}
+
+/// `requirement` says why the test may not skip, and whether the run can opt
+/// out. One line, so a test that returns the error prints it readably through
+/// the derived `Debug`.
+fn unavailable_dependency_error(
+    dependency: &str,
+    detail: &dyn Display,
+    requirement: &str,
+) -> Box<dyn Error + Send + Sync> {
+    FixtureError::boxed(format!(
+        "test dependency {dependency} is unavailable: {detail}. Make a Docker daemon \
+         reachable: the fixtures start {dependency} in it, and `cargo nextest run` \
+         starts the shared Postgres and Redis through its setup scripts \
+         (ci/scripts/setup-nextest-postgres.sh, ci/scripts/setup-nextest-redis.sh). \
+         {requirement} See CONTRIBUTING.md#run-the-tests."
+    ))
 }
 
 /// Record that a test skipped because a dependency was unavailable.
@@ -460,7 +582,6 @@ fn append_skip_record(path: &Path, record: &[u8]) -> io::Result<()> {
 }
 
 async fn shared_postgres(graceful: bool) -> TestDbResult<Option<Arc<SharedPostgres>>> {
-    let graceful = graceful && !require_test_deps();
     let shared_cell = SHARED_POSTGRES
         .get_or_init(|| async { Mutex::new(Weak::new()) })
         .await;
@@ -477,12 +598,14 @@ async fn shared_postgres(graceful: bool) -> TestDbResult<Option<Arc<SharedPostgr
             Ok(Some(shared))
         }
         Err(InitError::Unavailable(message)) if graceful => {
-            report_dependency_skip(&format!("postgres unavailable: {message}"))?;
+            report_unavailable_dependency("postgres", &message)?;
             Ok(None)
         }
-        Err(InitError::Unavailable(message)) => Err(FixtureError::boxed(format!(
-            "postgres testcontainer is unavailable: {message}"
-        ))),
+        Err(InitError::Unavailable(message)) => Err(unavailable_dependency_error(
+            "postgres",
+            &message,
+            &format!("This fixture never skips, whatever {TEST_DEPS_OPTIONAL_ENV} says."),
+        )),
         Err(InitError::Failed(message)) => Err(FixtureError::boxed(message)),
     }
 }

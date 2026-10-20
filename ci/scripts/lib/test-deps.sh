@@ -1,11 +1,36 @@
 #!/usr/bin/env bash
 
-# Match pplx_space_db_test_fixtures::require_test_deps(): unset, empty, and
-# literal 0 are off; every other non-empty value is on.
+# Match pplx_space_db_test_fixtures::require_test_deps(): test dependencies
+# are required unless SPACE_TEST_DEPS_OPTIONAL is non-empty and not 0.
+# SPACE_CI_REQUIRE_TEST_DEPS keeps the meaning it had before that default:
+# non-empty and not 0 requires them regardless, and set to empty or 0 makes
+# them optional.
 space_test_deps_required() {
-    case "${SPACE_CI_REQUIRE_TEST_DEPS:-}" in
-        "" | 0) return 1 ;;
+    case "${SPACE_CI_REQUIRE_TEST_DEPS:-0}" in
+        0) ;;
         *) return 0 ;;
+    esac
+    case "${SPACE_TEST_DEPS_OPTIONAL:-0}" in
+        0) ;;
+        *) return 1 ;;
+    esac
+    [ -z "${SPACE_CI_REQUIRE_TEST_DEPS+set}" ]
+}
+
+# The setting that let space_test_deps_required say no, for a skip marker.
+space_test_deps_opted_out_by() {
+    case "${SPACE_TEST_DEPS_OPTIONAL:-0}" in
+        0) echo "SPACE_CI_REQUIRE_TEST_DEPS is empty or 0" ;;
+        *) echo "SPACE_TEST_DEPS_OPTIONAL is set" ;;
+    esac
+}
+
+# The end of a failure message when space_test_deps_required said yes: the
+# opt-out, unless SPACE_CI_REQUIRE_TEST_DEPS overrides it.
+space_test_deps_opt_out_hint() {
+    case "${SPACE_CI_REQUIRE_TEST_DEPS:-0}" in
+        0) echo ", or set SPACE_TEST_DEPS_OPTIONAL=1 to skip the tests that need it" ;;
+        *) echo " (SPACE_CI_REQUIRE_TEST_DEPS is set, which overrides SPACE_TEST_DEPS_OPTIONAL)" ;;
     esac
 }
 

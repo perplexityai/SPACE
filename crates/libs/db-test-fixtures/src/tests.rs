@@ -1,22 +1,120 @@
-use std::ffi::OsStr;
 use std::sync::{Arc, Barrier};
 
-use super::{append_skip_record, report_dependency_skip_to, require_test_deps_value};
+use pplx_space_test_env::TestEnv;
+
+use super::{
+    TestDepsPolicy, append_skip_record, report_dependency_skip_to, unavailable_dependency_outcome,
+};
 
 #[test]
-fn require_test_deps_is_off_when_unset() {
-    assert!(!require_test_deps_value(None));
+fn test_deps_are_required_unless_the_run_opts_out() {
+    const OPTED_OUT: TestDepsPolicy = TestDepsPolicy::Optional {
+        opted_out_by: "SPACE_TEST_DEPS_OPTIONAL is set",
+    };
+    const LEGACY_OPT_OUT: TestDepsPolicy = TestDepsPolicy::Optional {
+        opted_out_by: "SPACE_CI_REQUIRE_TEST_DEPS is empty or 0",
+    };
+    const BY_DEFAULT: TestDepsPolicy = TestDepsPolicy::Required { required_by: None };
+    const BY_CI: TestDepsPolicy = TestDepsPolicy::Required {
+        required_by: Some("SPACE_CI_REQUIRE_TEST_DEPS is set"),
+    };
+    // (SPACE_CI_REQUIRE_TEST_DEPS, SPACE_TEST_DEPS_OPTIONAL, policy)
+    for (require, optional, expected) in [
+        (None, None, BY_DEFAULT),
+        (None, Some("1"), OPTED_OUT),
+        (None, Some("true"), OPTED_OUT),
+        (None, Some("0"), BY_DEFAULT),
+        (None, Some(""), BY_DEFAULT),
+        // Every value CI may already set keeps its meaning: a requirement
+        // outranks an opt-out inherited from the surrounding shell, and empty
+        // or 0 stays optional, now saying so in each skip marker.
+        (Some("1"), None, BY_CI),
+        (Some("true"), None, BY_CI),
+        (Some("1"), Some("1"), BY_CI),
+        (Some("0"), None, LEGACY_OPT_OUT),
+        (Some(""), None, LEGACY_OPT_OUT),
+        (Some("0"), Some("1"), OPTED_OUT),
+        (Some("0"), Some("0"), LEGACY_OPT_OUT),
+    ] {
+        assert_eq!(
+            TestDepsPolicy::from_values(require, optional),
+            expected,
+            "SPACE_CI_REQUIRE_TEST_DEPS={require:?} SPACE_TEST_DEPS_OPTIONAL={optional:?}"
+        );
+    }
 }
 
 #[test]
-fn require_test_deps_is_on_for_one_and_off_for_zero_or_empty() {
-    for (value, expected) in [("1", true), ("true", true), ("0", false), ("", false)] {
-        assert_eq!(
-            require_test_deps_value(Some(OsStr::new(value))),
-            expected,
-            "value {value:?}"
-        );
-    }
+fn the_policy_reads_each_variable_by_its_own_name() {
+    let mut env = TestEnv::default();
+    env.set("SPACE_CI_REQUIRE_TEST_DEPS", "1");
+    assert_eq!(
+        TestDepsPolicy::from_env(&env),
+        TestDepsPolicy::Required {
+            required_by: Some("SPACE_CI_REQUIRE_TEST_DEPS is set"),
+        }
+    );
+
+    let mut env = TestEnv::default();
+    env.set("SPACE_TEST_DEPS_OPTIONAL", "1");
+    assert_eq!(
+        TestDepsPolicy::from_env(&env),
+        TestDepsPolicy::Optional {
+            opted_out_by: "SPACE_TEST_DEPS_OPTIONAL is set",
+        }
+    );
+}
+
+#[test]
+fn an_unavailable_dependency_fails_unless_opted_out_and_then_counts_a_skip() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("skips.log");
+
+    let error = unavailable_dependency_outcome(
+        TestDepsPolicy::Required { required_by: None },
+        "redis",
+        &"connection refused",
+        Some(&log),
+    )
+    .unwrap_err()
+    .to_string();
+    // The failure has to tell whoever reads it what is missing and how to opt out.
+    assert!(
+        error.contains("redis") && error.contains("SPACE_TEST_DEPS_OPTIONAL=1"),
+        "{error}"
+    );
+    // Required by the CI variable, the opt-out cannot help, so it is not offered.
+    let error = unavailable_dependency_outcome(
+        TestDepsPolicy::Required {
+            required_by: Some("SPACE_CI_REQUIRE_TEST_DEPS is set"),
+        },
+        "redis",
+        &"connection refused",
+        Some(&log),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("SPACE_CI_REQUIRE_TEST_DEPS is set")
+            && !error.contains("SPACE_TEST_DEPS_OPTIONAL=1"),
+        "{error}"
+    );
+    assert!(!log.exists(), "a required dependency must not count a skip");
+
+    unavailable_dependency_outcome(
+        TestDepsPolicy::Optional {
+            opted_out_by: "SPACE_TEST_DEPS_OPTIONAL is set",
+        },
+        "redis",
+        &"connection refused",
+        Some(&log),
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        "SPACE-TEST-DEP-SKIP: redis unavailable (SPACE_TEST_DEPS_OPTIONAL is set): \
+         connection refused\n"
+    );
 }
 
 #[test]

@@ -47,6 +47,17 @@ if [ -n "${SPACE_NEXTEST_POSTGRES_ADDRESS:-}" ]; then
     exit 0
 fi
 
+# A run that opted out of test dependencies (space_test_deps_required) and has
+# no Docker daemon gets no shared server: the fixtures then try their own
+# container, and the tests that may skip do, each with its own marker, while
+# the pg_test_db fixtures, which never skip, fail. A run that requires them
+# still fails here.
+if ! space_test_deps_required && ! docker info >/dev/null 2>&1; then
+    echo "SPACE-TEST-DEP-SKIP: postgres unavailable ($(space_test_deps_opted_out_by)):" \
+        "Docker is not reachable, so this nextest run starts no shared Postgres." >&2
+    exit 0
+fi
+
 nextest_pid="${PPID}"
 container_id=""
 
