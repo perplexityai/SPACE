@@ -402,6 +402,19 @@ NODE_TEMPLATE_MANAGER = "template-manager"
 NODE_VOLUME_MANAGER = "volume-manager"
 NODE_CTL = "node-ctl"
 NODE_API = "node-api"
+# The node services that read the object store, by DaemonSet and the
+# container that does: each holds the store's static keys in
+# `SPACE_KIND_STORAGE_CREDENTIALS=static` only, and exchanges its credentials
+# through credential-manager otherwise.
+STORAGE_CREDENTIAL_DAEMONSETS = (
+    ("space-volume-manager", NODE_VOLUME_MANAGER, "worker volume-manager"),
+    ("space-builder-volume-manager", NODE_VOLUME_MANAGER, "builder volume-manager"),
+    ("space-builder-build-manager", "build-manager", "build-manager"),
+)
+OBJECT_STORE_STATIC_KEYS = (
+    "SPACE_OBJECT_STORE_STATIC_ACCESS_KEY_ID",
+    "SPACE_OBJECT_STORE_STATIC_SECRET_ACCESS_KEY",
+)
 # The Kind-only operator shell on every sandbox worker and builder
 # (infra/space/kind/charts/space-node-debug): the stand-in for the node host's
 # root shell, where the on-node CLIs, btrfs, dmsetup, cryptsetup and ctr run
@@ -4995,22 +5008,86 @@ ON CONFLICT (key_hash) DO NOTHING;
         mode = modes.pop() if len(modes) == 1 else "static" if not modes else ""
         if mode not in ("exchange", "static"):
             raise SmokeConfigurationError(f"the authority runs no known storage credentials mode: {sorted(modes)}")
-        # The label records how the authority's chart was rendered. The worker
-        # volume-manager must agree, holding the store's static keys in
-        # `static` only: a failed apply or a stale Tilt resource can leave the
-        # workers on the other side of it.
-        result = self.kubectl(
-            "get", "daemonset", "space-volume-manager",
-            "-o", "jsonpath={.spec.template.spec.containers[*].env[*].name}", timeout=15,
-        )
-        names = _require_ok(result, "read the worker volume-manager env").split()
-        worker_keys = sorted(name for name in names if name.startswith("SPACE_OBJECT_STORE_STATIC_"))
-        if bool(worker_keys) != (mode == "static"):
-            raise SmokeConfigurationError(
-                f"the authority runs storage credentials mode {mode}, but the worker volume-manager "
-                + (f"holds static keys ({', '.join(worker_keys)})" if worker_keys else "holds no static keys")
-            )
+        # The label records how the authority's chart was rendered. Every node
+        # service that transfers objects must agree, in its DaemonSet's pod
+        # template and in every pod it runs: a failed apply, a stale Tilt
+        # resource or a rollout still under way can leave either on the other
+        # side of it.
+        pods = json.loads(_require_ok(self.kubectl("get", "pods", "-o", "json", timeout=30), "list pods") or "{}")
+        for daemonset, container, service in STORAGE_CREDENTIAL_DAEMONSETS:
+            result = self.kubectl("get", "daemonset", daemonset, "-o", "json", timeout=15)
+            template = json.loads(_require_ok(result, f"read the {service} DaemonSet") or "{}")
+            specs = [("its pod template", template.get("spec", {}).get("template", {}).get("spec", {}))] + [
+                (f"pod {item['metadata']['name']}", item.get("spec", {}))
+                for item in pods.get("items", [])
+                if any(
+                    owner.get("kind") == "DaemonSet" and owner.get("name") == daemonset
+                    for owner in item.get("metadata", {}).get("ownerReferences", [])
+                )
+            ]
+            for where, spec in specs:
+                problem = self._storage_keys_disagreement(mode, spec, container)
+                if problem:
+                    raise SmokeConfigurationError(
+                        f"the authority runs storage credentials mode {mode}, but the {service} "
+                        f"({daemonset}, {where}) {problem}"
+                    )
         return mode
+
+    def _storage_keys_disagreement(self, mode: str, spec: dict[str, Any], container: str) -> str:
+        """How one pod spec contradicts `mode`, or "" when it agrees.
+
+        In `exchange`, no container, init and ephemeral ones included, may
+        hold a static key name, by `env` or through an `envFrom` Secret or
+        ConfigMap, which is resolved to its keys; one that cannot be read is
+        refused. In `static`, the consuming container must hold both keys.
+        """
+
+        sources: dict[str, set[str] | None] = {}
+
+        def static_keys(item: dict[str, Any]) -> tuple[set[str], list[str]]:
+            """The static key names a container gets, and its envFrom sources that cannot be read."""
+            found = {str(entry.get("name", "")) for entry in item.get("env") or []}
+            unreadable: list[str] = []
+            for source in item.get("envFrom") or []:
+                if source.get("secretRef"):
+                    ref = f"secret/{source['secretRef'].get('name', '')}"
+                elif source.get("configMapRef"):
+                    ref = f"configmap/{source['configMapRef'].get('name', '')}"
+                else:
+                    continue
+                if ref not in sources:
+                    result = self.kubectl("get", ref, "--ignore-not-found", "-o", "json", timeout=15)
+                    document = json.loads(_require_ok(result, f"read {ref}") or "null")
+                    sources[ref] = (
+                        None if document is None
+                        else set(document.get("data") or {}) | set(document.get("binaryData") or {})
+                    )
+                keys = sources[ref]
+                if keys is None:
+                    unreadable.append(ref)
+                else:
+                    found |= {str(source.get("prefix") or "") + key for key in keys}
+            return {name for name in found if name.startswith("SPACE_OBJECT_STORE_STATIC_")}, unreadable
+
+        containers = [
+            item
+            for field in ("initContainers", "containers", "ephemeralContainers")
+            for item in spec.get(field) or []
+        ]
+        if mode == "exchange":
+            for item in containers:
+                keys, unreadable = static_keys(item)
+                if keys:
+                    return f"has container {item.get('name')} holding static keys ({', '.join(sorted(keys))})"
+                if unreadable:
+                    return f"has container {item.get('name')} taking env from {unreadable[0]}, which cannot be read"
+            return ""
+        consumer = next((item for item in containers if item.get("name") == container), None)
+        if consumer is None:
+            return f"has no {container} container"
+        missing = sorted(set(OBJECT_STORE_STATIC_KEYS) - static_keys(consumer)[0])
+        return f"has container {container} lacking static keys ({', '.join(missing)})" if missing else ""
 
     def sandbox_worker_nodes(self) -> list[str]:
         result = self.kubectl(

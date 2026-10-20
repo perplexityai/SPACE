@@ -5,9 +5,9 @@ exactly when that service's chart renders it. These checks render every node
 service, per role, and the control-plane credential-manager authority, and
 assert that the credential database, its password, the AWS credentials and the
 Secrets Manager reader role reach only the authority, and the static
-object-store credentials only the builders' volume-manager and build-manager
-(the services that transfer objects with them; worker volume-manager
-exchanges its credentials by default). Volume-manager's streaming upload budget is
+object-store credentials no node service (volume-manager and build-manager,
+the services that transfer objects, exchange their credentials by default).
+Volume-manager's streaming upload budget is
 unset by default, so the service default applies, and renders exactly as set.
 """
 
@@ -42,7 +42,6 @@ OBJECT_STORE_STATIC = {
     "SPACE_OBJECT_STORE_STATIC_ACCESS_KEY_ID",
     "SPACE_OBJECT_STORE_STATIC_SECRET_ACCESS_KEY",
 }
-OBJECT_STORE_CONSUMERS = {("builder", "volume-manager"), ("builder", "build-manager")}
 STREAM_BUDGET = "SPACE_VOLUME_STREAM_PUSH_BUFFER_BUDGET_BYTES"
 VOLUME_MANAGER_CHART = KIND_DIR / "charts/space-volume-manager-local"
 
@@ -71,12 +70,9 @@ def test_node_services_receive_no_credential_authority_settings(release, role, s
 
 
 @pytest.mark.parametrize(("release", "role", "service"), NODE_RELEASES)
-def test_static_object_store_credentials_reach_only_their_consumers(release, role, service):
+def test_no_node_service_receives_static_object_store_credentials_by_default(release, role, service):
     present = _node_service_env(release, role, service) & OBJECT_STORE_STATIC
-    if (role, service) in OBJECT_STORE_CONSUMERS:
-        assert present == OBJECT_STORE_STATIC, f"{release} {service} renders {sorted(present)}"
-    else:
-        assert not present, f"{release} {service} renders {sorted(present)}"
+    assert not present, f"{release} {service} renders {sorted(present)}"
 
 
 @pytest.mark.parametrize(("release", "role", "service"), NODE_RELEASES)

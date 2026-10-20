@@ -2363,10 +2363,10 @@ class StorageRequestResult:
 class StorageExchangeControl(Protocol):
     """Kind-only access to credential-manager's storage exchange and the store.
 
-    The exchange goes through a sandbox worker's credential-manager agent, on
-    the volume socket and as the volume-manager account, exactly as
-    volume-manager asks for a transfer's credentials; the agent forwards it to
-    the authority, which vends a session through STS. S3 requests then use
+    The exchange goes through a sandbox worker's or builder's
+    credential-manager agent, on the volume socket and as the volume-manager
+    account, exactly as volume-manager asks for a transfer's credentials; the
+    agent forwards it to the authority, which vends a session through STS. S3 requests then use
     that session against the object store.
     """
 
@@ -2378,14 +2378,18 @@ class StorageExchangeControl(Protocol):
         """Nodes running the worker volume-manager DaemonSet, sorted."""
         ...
 
+    def builder_nodes(self) -> list[str]:
+        """Builder nodes with a Ready node-api, sorted."""
+        ...
+
     def ready_full_snapshots(self, sandbox_id: str) -> list[SnapshotRecord]: ...
 
     def snapshot_objects(self, record: SnapshotRecord) -> list[StorageObject]:
         """The objects under a snapshot's storage prefix, read with root keys."""
         ...
 
-    def bucket_objects(self, bucket: str, *, limit: int) -> list[StorageObject]:
-        """Up to `limit` objects of a bucket, read with root keys."""
+    def bucket_objects(self, bucket: str, *, limit: int, prefix: str = "") -> list[StorageObject]:
+        """Up to `limit` objects of a bucket under `prefix`, read with root keys."""
         ...
 
     def head_object(self, bucket: str, key: str) -> StorageObject | None:

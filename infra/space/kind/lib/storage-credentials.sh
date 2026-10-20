@@ -3,18 +3,20 @@
 # object-store credentials, selected by SPACE_KIND_STORAGE_CREDENTIALS for
 # every bring-up path (the Tiltfile, bootstrap.sh and the smoke bring-up):
 #
-#   exchange  (default) as deployed: volume-manager on the sandbox workers
-#             holds no object-store keys. The credential-manager authority
-#             vends each transfer a session scoped to its one object through
-#             STS AssumeRole, which the Kind-only STS bridge answers from the
+#   exchange  (default) as deployed: volume-manager on sandbox workers and
+#             builders, and the builders' build-manager, hold no object-store
+#             keys. The credential-manager authority vends each transfer a
+#             session scoped to its one object or release prefix through STS
+#             AssumeRole, which the Kind-only STS bridge answers from the
 #             object store's IAM service. See "Object-store credentials" in
 #             infra/space/kind/README.md.
-#   static    the opt-out: worker volume-manager reads the store's static keys
-#             and the authority's storage exchange is off.
+#   static    the opt-out: those services read the store's static keys and
+#             the authority's storage exchange is off.
 #
 # Both modes run the same object store, IAM service and bridge over the same
-# data, so an existing cluster switches on its next bring-up. Builders,
-# build-manager and cluster-controller read the static keys in both.
+# data, so an existing cluster switches on its next bring-up.
+# cluster-controller and the bucket-init and seed-publish Jobs read the static
+# keys in both.
 #
 # Source it for the function, or run it to print the mode.
 

@@ -20,7 +20,14 @@ def storage_exchange_scoping(test: smoke.KindEcw) -> None:
     bucket, and for a small write to its own object, which stays unchanged;
     and the authority refuses to vend that sandbox's subject for the other
     sandbox's object at all. Afterwards the session, and a fresh one, still
-    read the object, so no refusal was a session that stopped working."""
+    read the object, so no refusal was a session that stopped working. A
+    builder's agent likewise vends a read session for one published file of
+    the sandboxes' template, as the builder volume-manager asks for a template
+    pull; it reads that file, and the store refuses it another file of the
+    same release, the sandbox's snapshot object and, when another template is
+    published, that template's file; the authority refuses to vend the
+    template's subject for another template's file at all. The same closing
+    controls follow."""
 
     exchange = test.storage_exchange
 
@@ -50,3 +57,18 @@ def storage_exchange_scoping(test: smoke.KindEcw) -> None:
 
     with test.phase("control: the session and a fresh exchange still read the object"):
         exchange.expect_controls_hold_after_refusals()
+
+    with test.phase("exchange a template read session through a builder's agent"):
+        exchange.exchange_builder_template_session()
+
+    with test.phase("the builder's session reads its template file"):
+        exchange.expect_builder_session_reads_its_file()
+
+    with test.phase("the store refuses it its release's other file, a snapshot and another template's file"):
+        exchange.expect_builder_session_refused_beyond_its_file()
+
+    with test.phase("the authority refuses to vend the template's subject for another template's file"):
+        exchange.expect_authority_refuses_another_templates_file()
+
+    with test.phase("control: the builder's session and a fresh builder exchange still read its file"):
+        exchange.expect_builder_controls_hold_after_refusals()

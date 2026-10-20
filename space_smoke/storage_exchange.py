@@ -8,6 +8,17 @@ keeps a session to that object is the store, which evaluates the policy on
 every request. These checks ask for such a session the same way, for one
 sandbox's suspend snapshot under read scope, then take it to the store.
 
+A builder's agent is asked the same way, as the builder volume-manager asks
+for a template pull: for one published file of the sandboxes' template under
+read scope. The authority vends it only to a builder whose Kubernetes node it
+has recorded, with the same exact-object session policy, so the store refuses
+that session another file of the same release (which every broader prefix,
+from the release to the whole bucket, would cover) and a sandbox's snapshot,
+and, when another template is published, that template's file. The authority
+itself refuses to vend the template's subject for another template's file at
+all; it decides by the key's template name, so that needs no such object.
+Its controls are taken the same way.
+
 Each refusal is judged against controls taken the same way: the session
 reads its own object before the refusals and again after them, and a fresh
 exchange for that object succeeds at the end, so its keys, token and
@@ -37,6 +48,19 @@ if TYPE_CHECKING:
 
 READ_SCOPE = "space.storage.read"
 TEMPLATE_BUCKET = "templates"
+# The scenario's sandboxes run the default template (SandboxConfig).
+SANDBOX_TEMPLATE = "seed"
+# Published template files small enough to read whole, which the authority
+# vends a template subject (validate_template_resource,
+# crates/libs/credential/mgr/server/src/storage_exchange.rs).
+TEMPLATE_PROBE_FILES = ("metadata.json", "manifest.json")
+# The template name in the authority refusal's key when no other template is
+# published. The authority refuses by the key's template name before any
+# lookup (validate_template_resource), so the object need not exist.
+ABSENT_TEMPLATE = "storage-exchange-scoping-absent"
+# A refused target larger than this is only HEAD-probed: a policy broader than
+# it should be would otherwise download it whole (a release's rootfs).
+REFUSED_GET_MAX_BYTES = 1 << 20
 # At most 64 KiB, so a refusal returns its status (see the module docstring).
 REFUSED_WRITE_BODY = b"storage exchange scoping smoke: must not be written\n" * 64
 SESSION_LIFETIME_SECONDS = 3600
@@ -46,6 +70,15 @@ SESSION_LIFETIME_SECONDS = 3600
 RESOURCE_DENIED_STATUS = "PERMISSION_DENIED"
 RESOURCE_DENIED_DETAIL = "requested storage resource is not authorized for the subject"
 SNAPSHOT_READY_TIMEOUT_SECONDS = 300
+
+
+def _file_name(item: StorageObject) -> str:
+    return item.key.rsplit("/", 1)[1]
+
+
+def _release(item: StorageObject) -> str:
+    """A published template file's release prefix, `templates/<name>/<hash>/`."""
+    return item.key.rsplit("/", 1)[0] + "/"
 
 
 def _evidence(result: StorageRequestResult) -> dict[str, object]:
@@ -70,6 +103,11 @@ class StorageExchangeScopingAssertions:
         self._other: StorageObject | None = None
         self._template: StorageObject | None = None
         self._session: StorageSession | None = None
+        self._builder: str | None = None
+        self._builder_session: StorageSession | None = None
+        self._builder_template: StorageObject | None = None
+        self._builder_sibling: StorageObject | None = None
+        self._other_template: StorageObject | None = None
 
     def require_exchange_mode(self) -> None:
         mode = self._control.storage_credentials_mode()
@@ -82,6 +120,10 @@ class StorageExchangeScopingAssertions:
         self._fixture.verify(bool(nodes), "no sandbox worker runs volume-manager")
         self._node = nodes[0]
         self._fixture.record("exchange_node", self._node)
+        builders = self._control.builder_nodes()
+        self._fixture.verify(bool(builders), "no builder has a Ready node-api")
+        self._builder = builders[0]
+        self._fixture.record("builder_exchange_node", self._builder)
 
     def suspend_both(self) -> None:
         """Suspend both sandboxes so each has a snapshot in the store."""
@@ -207,6 +249,135 @@ class StorageExchangeScopingAssertions:
             status=outcome.status,
             detail=outcome.detail,
         )
+
+    def exchange_builder_template_session(self) -> None:
+        """ExchangeToken on a builder's agent volume socket, as its volume-manager pulls a template.
+
+        The session is for the smallest probe file of one release of the
+        sandboxes' template; the refusals use another file of that release
+        and, when there is one, the smallest probe file of another published
+        template.
+        """
+
+        published: dict[str, list[StorageObject]] = {}
+        for item in self._control.bucket_objects(TEMPLATE_BUCKET, limit=1000, prefix="templates/"):
+            parts = item.key.split("/")
+            if len(parts) == 4:
+                published.setdefault(parts[1], []).append(item)
+        own = [item for item in published.get(SANDBOX_TEMPLATE, []) if _file_name(item) in TEMPLATE_PROBE_FILES]
+        self._fixture.verify(bool(own), "the template has no published file to probe", template=SANDBOX_TEMPLATE)
+        self._builder_template = min(own, key=lambda item: item.size)
+        release = _release(self._builder_template)
+        siblings = [
+            item
+            for item in published[SANDBOX_TEMPLATE]
+            if _release(item) == release and item.key != self._builder_template.key
+        ]
+        self._fixture.verify(bool(siblings), "the template's release has no other file", release=release)
+        # Another probe file if there is one, so the refusal is also read whole.
+        self._builder_sibling = min(siblings, key=lambda item: (_file_name(item) not in TEMPLATE_PROBE_FILES, item.size))
+        others = [
+            item
+            for name, items in published.items()
+            if name != SANDBOX_TEMPLATE
+            for item in items
+            if _file_name(item) in TEMPLATE_PROBE_FILES
+        ]
+        self._other_template = min(others, key=lambda item: item.size) if others else None
+        self._fixture.record("published_templates", sorted(published))
+        for name, item in (
+            ("builder_template", self._builder_template),
+            ("builder_sibling", self._builder_sibling),
+            ("other_template", self._other_template),
+        ):
+            self._fixture.record(
+                f"{name}_object", None if item is None else {"arn": item.arn, "etag": item.etag, "size": item.size}
+            )
+        self._builder_session = self._exchange_builder_session()
+
+    def _exchange_builder_session(self) -> StorageSession:
+        assert self._builder is not None and self._builder_template is not None
+        outcome = self._control.exchange_storage_credentials(
+            self._builder,
+            subject=f"template:{SANDBOX_TEMPLATE}",
+            resource=self._builder_template.arn,
+            scope=READ_SCOPE,
+        )
+        self._fixture.verify(
+            outcome.session is not None and bool(outcome.session.session_token),
+            "the authority did not vend a builder's template pull",
+            builder=self._builder,
+            status=outcome.status,
+            detail=outcome.detail,
+        )
+        assert outcome.session is not None
+        return outcome.session
+
+    def expect_builder_session_reads_its_file(self) -> None:
+        assert self._builder_session is not None
+        self._expect_builder_readable(self._builder_session)
+
+    def _expect_builder_readable(self, session: StorageSession) -> None:
+        assert self._builder_template is not None
+        for operation in ("head", "get"):
+            result = self._control.storage_request(
+                session, operation, self._builder_template.bucket, self._builder_template.key
+            )
+            self._fixture.verify(
+                result.succeeded, "the builder's session could not read its template file", **_evidence(result)
+            )
+
+    def expect_builder_session_refused_beyond_its_file(self) -> None:
+        """The store refuses the builder's session its release's other file, a snapshot and another template's file."""
+
+        assert self._builder_session is not None and self._own is not None
+        assert self._builder_sibling is not None
+        targets = [
+            ("sibling", self._builder_sibling, "the builder's session read another file of its template's release"),
+            ("snapshot", self._own, "the builder's template session read a sandbox's snapshot"),
+        ]
+        if self._other_template is not None:
+            targets.append(
+                ("other_template", self._other_template, "the builder's session read another template's file")
+            )
+        for name, item, summary in targets:
+            operations = ("head", "get") if item.size <= REFUSED_GET_MAX_BYTES else ("head",)
+            for operation in operations:
+                result = self._control.storage_request(self._builder_session, operation, item.bucket, item.key)
+                self._fixture.verify(result.refused, summary, **_evidence(result))
+                self._fixture.record(f"builder_refused_{operation}_{name}", result.detail)
+
+    def expect_authority_refuses_another_templates_file(self) -> None:
+        """The authority vends a template's subject only for that template's files."""
+
+        assert self._builder is not None and self._builder_template is not None
+        if self._other_template is not None:
+            resource = self._other_template.arn
+        else:
+            _, _, digest, file = self._builder_template.key.split("/")
+            resource = f"arn:aws:s3:::{self._builder_template.bucket}/templates/{ABSENT_TEMPLATE}/{digest}/{file}"
+        outcome = self._control.exchange_storage_credentials(
+            self._builder, subject=f"template:{SANDBOX_TEMPLATE}", resource=resource, scope=READ_SCOPE
+        )
+        self._fixture.record(
+            "cross_template_exchange", {"resource": resource, "status": outcome.status, "detail": outcome.detail}
+        )
+        self._fixture.verify(
+            outcome.session is None, "the authority vended one template's subject for another template's file"
+        )
+        self._fixture.verify(
+            outcome.status == RESOURCE_DENIED_STATUS and RESOURCE_DENIED_DETAIL in outcome.detail,
+            "the cross-template exchange failed, but not as the authority's resource denial",
+            status=outcome.status,
+            detail=outcome.detail,
+        )
+
+    def expect_builder_controls_hold_after_refusals(self) -> None:
+        """The builder's session still reads its file, and a fresh builder exchange does too."""
+
+        assert self._builder_session is not None
+        self._expect_builder_readable(self._builder_session)
+        self._expect_builder_readable(self._exchange_builder_session())
 
     def expect_controls_hold_after_refusals(self) -> None:
         """The session still reads its object, and a fresh exchange does too."""

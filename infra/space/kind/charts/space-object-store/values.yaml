@@ -55,8 +55,8 @@ region: us-east-1
 # so sigv4 is actually validated. Handed as static creds
 # (SPACE_OBJECT_STORE_STATIC_*) to whatever does not exchange
 # (README, "Object-store credentials"): the bucket-init and seed-publish
-# Jobs, builders, build-manager and cluster-controller, and worker
-# volume-manager in static mode. Do NOT put the
+# Jobs and cluster-controller, and in static mode volume-manager on sandbox
+# workers and builders and the builders' build-manager. Do NOT put the
 # substring "space" (or "minio") anywhere in these values: Tilt redacts secret
 # VALUES from command lines (including docker build-args), so a "space"
 # substring would poison every `docker build … space-rust-build-… …`
