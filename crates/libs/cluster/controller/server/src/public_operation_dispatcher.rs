@@ -55,6 +55,7 @@ const RETRY_BACKOFF_MAX_CEILING: Duration = Duration::from_secs(900);
 /// How soon an operation handed back because its key is already executing
 /// in this process becomes claimable again.
 const KEY_BUSY_RETRY_AFTER: Duration = Duration::from_secs(1);
+const KEYED_CLAIM_ENABLED_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_KEYED_CLAIM_ENABLED";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconcilerConfig {
@@ -68,6 +69,10 @@ pub struct ReconcilerConfig {
     pub m1_max_age: Option<Duration>,
     pub retry_backoff_base: Duration,
     pub retry_backoff_max: Duration,
+    /// Kill switch for the keyed work queue: off restores the unkeyed
+    /// request-order claim, in-slot retry waits, and the executor's fixed
+    /// retry pacing.
+    pub keyed_claim_enabled: bool,
 }
 
 impl Default for ReconcilerConfig {
@@ -83,6 +88,7 @@ impl Default for ReconcilerConfig {
             m1_max_age: Some(DEFAULT_M1_MAX_AGE),
             retry_backoff_base: DEFAULT_RETRY_BACKOFF_BASE,
             retry_backoff_max: DEFAULT_RETRY_BACKOFF_MAX,
+            keyed_claim_enabled: true,
         }
     }
 }
@@ -139,6 +145,8 @@ impl ReconcilerConfig {
                 default.retry_backoff_max,
                 RETRY_BACKOFF_MAX_CEILING,
             ),
+            keyed_claim_enabled: config
+                .truthy_default(KEYED_CLAIM_ENABLED_ENV, default.keyed_claim_enabled),
             m1_max_age: config
                 .test_optional_positive_duration_secs(
                     M1_MAX_AGE_ENV,
@@ -157,7 +165,13 @@ fn execution_config(config: &ReconcilerConfig) -> OperationExecutionConfig {
         retry_after: config.retry_after,
         max_retry_attempts: config.max_retry_attempts,
         m1_max_age: config.m1_max_age,
-        retry_backoff_base: config.retry_backoff_base,
+        // A zero base makes a counted retry wait exactly the executor's hint,
+        // the pacing before backoff existed.
+        retry_backoff_base: if config.keyed_claim_enabled {
+            config.retry_backoff_base
+        } else {
+            Duration::ZERO
+        },
         retry_backoff_max: config.retry_backoff_max.max(config.retry_backoff_base),
     }
 }
@@ -357,6 +371,7 @@ pub async fn run<E>(
         max_retry_attempts = config.max_retry_attempts,
         retry_backoff_base_secs = config.retry_backoff_base.as_secs(),
         retry_backoff_max_secs = config.retry_backoff_max.as_secs(),
+        keyed_claim_enabled = config.keyed_claim_enabled,
         "starting public-operation-dispatcher"
     );
 
@@ -392,7 +407,10 @@ pub async fn run<E>(
                     Ok(claim) => {
                         let claimed = claim.operations.len();
                         for operation in claim.operations {
-                            let key = operation.work_key().map(str::to_owned);
+                            let key = config
+                                .keyed_claim_enabled
+                                .then(|| operation.work_key().map(str::to_owned))
+                                .flatten();
                             if let Some(key) = &key
                                 && !busy_keys.insert(key.clone())
                             {
@@ -405,6 +423,7 @@ pub async fn run<E>(
                                 executor.clone(),
                                 claim.claim_token.clone(),
                                 execution_config,
+                                config.keyed_claim_enabled,
                                 operation,
                             )
                             .instrument(span);
@@ -545,13 +564,16 @@ where
     let limit = u32::try_from(free_slots)
         .unwrap_or(u32::MAX)
         .min(config.claim_limit);
-    store
-        .claim_operations(ClaimPublicOperations {
-            limit,
-            claim_stale_after: config.claim_stale_after,
-            claimable_kinds: executor.supported_kinds(),
-        })
-        .await
+    let input = ClaimPublicOperations {
+        limit,
+        claim_stale_after: config.claim_stale_after,
+        claimable_kinds: executor.supported_kinds(),
+    };
+    if config.keyed_claim_enabled {
+        store.claim_operations(input).await
+    } else {
+        store.claim_operations_unkeyed(input).await
+    }
 }
 
 /// Claim one batch and run it to completion. [`run`] does not use this: it
@@ -568,13 +590,7 @@ where
 {
     use futures_util::{StreamExt, stream};
 
-    let claim = store
-        .claim_operations(ClaimPublicOperations {
-            limit: config.claim_limit,
-            claim_stale_after: config.claim_stale_after,
-            claimable_kinds: executor.supported_kinds(),
-        })
-        .await?;
+    let claim = claim_up_to(config, store, executor, usize::MAX).await?;
 
     let mut report = TickReport {
         claimed: claim.operations.len(),
@@ -589,6 +605,7 @@ where
             executor.clone(),
             claim.claim_token.clone(),
             execution_config,
+            config.keyed_claim_enabled,
             operation,
         )
         .instrument(span)
@@ -607,6 +624,7 @@ async fn execute_claimed_operation<E>(
     executor: E,
     claim_token: String,
     config: OperationExecutionConfig,
+    defer_retry_waits: bool,
     operation: ClaimedPublicOperation,
 ) -> Result<TickReport, pplx_space_api::public_operations::PublicOperationStoreError>
 where
@@ -620,7 +638,7 @@ where
         config,
         operation,
         OperationExecutor::Dispatcher,
-        pplx_space_api::retry_deferral::defer_retry_waits(async move {
+        pplx_space_api::retry_deferral::scope(defer_retry_waits, async move {
             executor
                 .execute(&execution_claim_token, execution_operation)
                 .await

@@ -593,3 +593,71 @@ fn retry_cap_and_backoff_read_bounded_env_values() {
         );
     }
 }
+
+#[tokio::test]
+async fn an_unclaimable_kind_never_holds_back_its_sandbox() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    // Only some other claimer could run this stop; it must not strand the
+    // wake requested after it.
+    let _foreign = create_op(&store, org_id, OperationKind::StopSandbox, "sbx_foreign").await?;
+    let wake = create_op(&store, org_id, OperationKind::WakeSandbox, "sbx_foreign").await?;
+
+    let claim = store
+        .claim_operations(ClaimPublicOperations {
+            limit: 8,
+            claim_stale_after: Duration::from_secs(60),
+            claimable_kinds: &[OperationKind::WakeSandbox],
+        })
+        .await?;
+    assert_eq!(claimed_ids(&claim), vec![wake]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn kill_switch_restores_the_unkeyed_claim_and_fixed_retry_pacing() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let first = create_op(&store, org_id, OperationKind::WakeSandbox, "sbx_unkeyed").await?;
+    let second = create_op(&store, org_id, OperationKind::WakeSandbox, "sbx_unkeyed").await?;
+    let config = ReconcilerConfig {
+        keyed_claim_enabled: false,
+        retry_backoff_base: Duration::from_secs(30),
+        claim_limit: 8,
+        max_retry_attempts: 4,
+        ..single_claim_config()
+    };
+
+    let report = tick(&config, &store, &AlwaysRetryExecutor).await?;
+    // Both wakes on the sandbox ran in the same pass, as before keying.
+    assert_eq!(report.claimed, 2);
+    assert_eq!(report.retried, 2);
+    for operation_id in [first, second] {
+        let delay_secs: f64 = sqlx::query_scalar(sql!(
+            "SELECT EXTRACT(EPOCH FROM next_attempt_at - NOW())::DOUBLE PRECISION
+             FROM public_operations WHERE operation_id = $1"
+        ))
+        .bind(operation_id.as_uuid())
+        .fetch_one(&db.pool)
+        .await?;
+        // The executor's 1s hint, not the 30s backoff base.
+        assert!(delay_secs <= 1.5, "{delay_secs}");
+    }
+    Ok(())
+}
+
+#[test]
+fn keyed_claim_kill_switch_reads_from_env() {
+    let mut env = pplx_space_test_env::TestEnv::default();
+    assert!(ReconcilerConfig::from_environment(&env).keyed_claim_enabled);
+    env.set(KEYED_CLAIM_ENABLED_ENV, "false");
+    assert!(!ReconcilerConfig::from_environment(&env).keyed_claim_enabled);
+    env.set(KEYED_CLAIM_ENABLED_ENV, "true");
+    assert!(ReconcilerConfig::from_environment(&env).keyed_claim_enabled);
+}
