@@ -33,28 +33,37 @@ impl Transfers {
             .unwrap()
             .to_str()
             .unwrap();
-        self.calls.lock().unwrap().push(format!("pull:{artifact}"));
+        self.calls
+            .lock()
+            .map_err(|error| Status::internal(error.to_string()))?
+            .push(format!("pull:{artifact}"));
         let bytes = if artifact == SnapshotArtifact::Metadata.file_name() {
-            serde_json::to_vec(&self.metadata).unwrap()
+            serde_json::to_vec(&self.metadata)
+                .map_err(|error| Status::internal(error.to_string()))?
         } else {
             b"disk".to_vec()
         };
-        std::fs::write(request.local_path, &bytes).unwrap();
+        std::fs::write(request.local_path, &bytes)
+            .map_err(|error| Status::internal(error.to_string()))?;
         Ok(PullFileResponse {
             bytes_downloaded: bytes.len() as u64,
         })
     }
 
     fn copy(&self, request: CopyObjectRequest) -> Result<SubmitTransferResponse, Status> {
-        self.calls.lock().unwrap().push("copy".into());
+        self.calls
+            .lock()
+            .map_err(|error| Status::internal(error.to_string()))?
+            .push("copy".into());
         assert_eq!(
             request.subject_id,
             format!("sandbox:{}", self.metadata.sandbox_id)
         );
-        let source =
-            pplx_space_common_core::types::StorageUri::parse(&request.source_s3_uri).unwrap();
+        let source = pplx_space_common_core::types::StorageUri::parse(&request.source_s3_uri)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let destination =
-            pplx_space_common_core::types::StorageUri::parse(&request.destination_s3_uri).unwrap();
+            pplx_space_common_core::types::StorageUri::parse(&request.destination_s3_uri)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
         assert_eq!(source.key_prefix, "snapshot/rootfs.btrfs-send");
         assert_eq!(
             destination.key_prefix,
@@ -69,7 +78,10 @@ impl Transfers {
     }
 
     fn wait(&self, request: GetTransferJobRequest) -> Result<GetTransferJobResponse, Status> {
-        self.calls.lock().unwrap().push("wait".into());
+        self.calls
+            .lock()
+            .map_err(|error| Status::internal(error.to_string()))?
+            .push("wait".into());
         assert_eq!(request.job_id, self.job_id);
         if matches!(self.reply, CopyReply::Interrupted) {
             return Err(Status::unavailable(
@@ -106,14 +118,24 @@ impl Transfers {
             .unwrap()
             .to_str()
             .unwrap();
-        self.calls.lock().unwrap().push(format!("push:{artifact}"));
-        let bytes = std::fs::read(&request.local_path).unwrap();
+        self.calls
+            .lock()
+            .map_err(|error| Status::internal(error.to_string()))?
+            .push(format!("push:{artifact}"));
+        let bytes = std::fs::read(&request.local_path)
+            .map_err(|error| Status::internal(error.to_string()))?;
         if artifact == SnapshotArtifact::Metadata.file_name() {
             assert!(
                 self.disk_ready.load(Ordering::SeqCst),
                 "metadata published before disk durability"
             );
-            *self.published.lock().unwrap() = Some(serde_json::from_slice(&bytes).unwrap());
+            *self
+                .published
+                .lock()
+                .map_err(|error| Status::internal(error.to_string()))? = Some(
+                serde_json::from_slice(&bytes)
+                    .map_err(|error| Status::internal(error.to_string()))?,
+            );
         } else {
             assert_eq!(bytes, b"disk");
             self.disk_ready.store(true, Ordering::SeqCst);
@@ -349,18 +371,24 @@ async fn invalid_sources_and_interrupted_copy_waits_cannot_publish_metadata() {
         );
         assert!(peer.transfers.published.lock().unwrap().is_none());
     }
-    for reply in [
-        CopyReply::Interrupted,
-        CopyReply::Cancelled,
-        CopyReply::Nonterminal,
-        CopyReply::WrongJob,
+    for (reply, expected_code) in [
+        (CopyReply::Interrupted, tonic::Code::Unavailable),
+        (CopyReply::Cancelled, tonic::Code::Cancelled),
+        (CopyReply::Nonterminal, tonic::Code::Unavailable),
+        (CopyReply::WrongJob, tonic::Code::Internal),
     ] {
         let mut metadata = suspended_metadata(source);
         metadata.rootfs_size_bytes = Some(4);
         metadata.rootfs_diff_format =
             Some(crate::snapshot_upload::ROOTFS_DIFF_FORMAT_BTRFS_SEND_V1.into());
         let mut peer = peer(metadata, reply).await;
-        assert!(run(&mut peer, source, SandboxId::new()).await.is_err());
+        assert_eq!(
+            run(&mut peer, source, SandboxId::new())
+                .await
+                .unwrap_err()
+                .code(),
+            expected_code
+        );
         let calls = peer.transfers.calls.lock().unwrap();
         assert_eq!(*calls, ["pull:metadata.json", "copy", "wait"]);
         assert!(peer.transfers.published.lock().unwrap().is_none());
