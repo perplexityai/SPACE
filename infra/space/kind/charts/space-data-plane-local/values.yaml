@@ -89,6 +89,10 @@ grpcClient:
 # sends `process-sessions:attach` creates to. Empty answers that endpoint
 # with 404, and clients create and attach in two steps.
 apiInternalUrl: http://space-api:8080
+# SPACE_DATA_PLANE_API_INTERNAL_PLAINTEXT — that origin is plain HTTP, so the
+# callers' API keys it forwards cross the cluster network unencrypted. Kind's
+# network is local to the machine running it.
+apiInternalPlaintext: true
 
 # JSON array of {apiHost, host} pairs (SPACE_ECW_HOSTS).
 ecwHosts: '[{"apiHost":"api.local.e2b.test","host":"local.e2b.test"}]'

@@ -172,7 +172,7 @@ async fn serve_data_plane(api: Option<&str>, backend: &str) -> SocketAddr {
             .unwrap(),
     );
     state.revocation_check_interval = Duration::from_secs(3600);
-    state.session_create = api.map(|origin| ProcessSessionCreator::new(origin).unwrap());
+    state.session_create = api.map(|origin| ProcessSessionCreator::new(origin, true).unwrap());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -525,7 +525,7 @@ async fn without_an_api_url_the_endpoint_is_not_found() {
 #[test]
 fn api_internal_url_must_be_a_plain_http_origin() {
     for origin in ["http://api:8080", "http://api:8080/", "http://10.0.0.1"] {
-        assert!(ProcessSessionCreator::new(origin).is_ok(), "{origin}");
+        assert!(ProcessSessionCreator::new(origin, true).is_ok(), "{origin}");
     }
     for origin in [
         "https://api:8080",
@@ -534,8 +534,22 @@ fn api_internal_url_must_be_a_plain_http_origin() {
         "api:8080",
         "",
     ] {
-        assert!(ProcessSessionCreator::new(origin).is_err(), "{origin}");
+        assert!(
+            matches!(
+                ProcessSessionCreator::new(origin, true),
+                Err(ApiInternalUrlError::Invalid(_))
+            ),
+            "{origin}"
+        );
     }
+}
+
+#[test]
+fn api_keys_cross_the_cluster_unencrypted_only_by_explicit_choice() {
+    assert!(matches!(
+        ProcessSessionCreator::new("http://api:8080", false),
+        Err(ApiInternalUrlError::Plaintext)
+    ));
 }
 
 #[test]

@@ -217,6 +217,10 @@ pub struct DataPlaneConfig {
     /// `createAndAttachProcessSession`'s creates. `None` leaves that endpoint
     /// answering 404, so clients use the two-step create and attach.
     pub api_internal_url: Option<String>,
+    /// Whether `api_internal_url` may carry callers' API keys unencrypted.
+    /// It is the only transport that hop has, so without this a configured
+    /// URL fails startup rather than sending the keys in the clear.
+    pub api_internal_plaintext: bool,
 }
 
 impl Default for DataPlaneConfig {
@@ -234,6 +238,7 @@ impl Default for DataPlaneConfig {
             upload_admission: None,
             shutdown_grace: None,
             api_internal_url: None,
+            api_internal_plaintext: false,
         }
     }
 }
@@ -399,7 +404,7 @@ pub async fn run(
         .as_deref()
         .map(str::trim)
         .filter(|url| !url.is_empty())
-        .map(ProcessSessionCreator::new)
+        .map(|url| ProcessSessionCreator::new(url, config.api_internal_plaintext))
         .transpose()?;
     let cluster_api = connect_cluster_api_clients_for_startup(&shutdown_token)
         .await

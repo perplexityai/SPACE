@@ -143,6 +143,20 @@ struct Cli {
     /// Unset, that endpoint answers 404.
     #[arg(long, env = "SPACE_DATA_PLANE_API_INTERNAL_URL")]
     api_internal_url: Option<String>,
+    /// Accept that `--api-internal-url` carries callers' API keys
+    /// unencrypted. Startup fails without it while that URL is set, since
+    /// an API key, unlike the session tokens other in-cluster hops carry,
+    /// reaches every sandbox its owner can.
+    #[arg(
+        long,
+        env = "SPACE_DATA_PLANE_API_INTERNAL_PLAINTEXT",
+        action = clap::ArgAction::Set,
+        value_parser = clap::builder::BoolishValueParser::new(),
+        num_args = 0..=1,
+        default_value_t = false,
+        default_missing_value = "true"
+    )]
+    api_internal_plaintext: bool,
 }
 
 impl From<Cli> for DataPlaneConfig {
@@ -166,6 +180,7 @@ impl From<Cli> for DataPlaneConfig {
             }),
             shutdown_grace: cli.shutdown_grace_secs.map(Duration::from_secs),
             api_internal_url: cli.api_internal_url,
+            api_internal_plaintext: cli.api_internal_plaintext,
         }
     }
 }
