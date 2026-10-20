@@ -320,6 +320,9 @@ fn sandbox_create_schema_tracks_public_wire_parsing() {
         (json!({ "template": "seed:v1.2.3" }), true),
         (json!({ "template": "seed_1.2-3" }), true),
         (json!({ "template": format!("seed@sha256:{digest}") }), true),
+        (json!({ "template": format!("seed@blake3:{digest}") }), true),
+        (json!({ "template": "seed@blake3:0123456789ab" }), true),
+        (json!({ "template": "seed@blake3:0123456789" }), false),
         (
             json!({ "template": format!("seed@sha256:{}", "0".repeat(12)) }),
             true,
@@ -328,7 +331,7 @@ fn sandbox_create_schema_tracks_public_wire_parsing() {
             json!({ "template": format!("seed@sha256:{}", "0".repeat(63)) }),
             true,
         ),
-        // Digest hex is lowercase only, sha256 only, and 12..=64 long.
+        // Digest hex is lowercase only and 12..=64 long.
         (
             json!({ "template": format!("seed@sha256:{}", "A".repeat(64)) }),
             false,
