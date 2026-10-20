@@ -60,4 +60,5 @@ SandboxInfo {
     lifecycle: Some(
         Suspended,
     ),
+    current_local_artifact_created_at: None,
 }

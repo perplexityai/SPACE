@@ -578,6 +578,7 @@ impl SandboxManagerService {
             mut sandboxes,
             route_identity_provenance,
             mut state_changed_at,
+            mut pinned_artifact_created_at,
             raw_budget,
             metadata_budget,
         ) = self.storage(move |db| {
@@ -657,6 +658,8 @@ impl SandboxManagerService {
                     })?;
                 let state_changed_at = crate::db::sandbox_state_changed_at(db, &row_ids)
                     .map_err(|error| Status::internal(format!("load state change times: {error}")))?;
+                let pinned_artifact_created_at = crate::db::pinned_local_artifact_created_at(db, &row_ids)
+                    .map_err(|error| Status::internal(format!("load pinned artifact capture times: {error}")))?;
                 let recovery_observations = crate::db::quarantine_recovery_observations(db, &row_ids)
                     .map_err(|error| {
                         tracing::warn!(%error, "failed to load quarantine recovery observations");
@@ -670,6 +673,7 @@ impl SandboxManagerService {
                     state_only,
                     route_identity_provenance,
                     state_changed_at,
+                    pinned_artifact_created_at,
                     raw_budget,
                     metadata_budget,
                 ))
@@ -681,6 +685,7 @@ impl SandboxManagerService {
             let status = sandbox.state.to_string();
             let metadata = publication_metadata.remove(&sandbox.id);
             let state_changed_at = state_changed_at.remove(&sandbox.id);
+            let pinned_artifact_created_at = pinned_artifact_created_at.remove(&sandbox.id);
             let recovery_observation = recovery_observations.remove(&sandbox.id);
             let (route_identity_provenance, route_provenance_degraded) =
                 match route_identity_provenance.remove(&sandbox.id) {
@@ -701,6 +706,7 @@ impl SandboxManagerService {
                 sandbox,
                 metadata,
                 state_changed_at,
+                pinned_artifact_created_at,
                 recovery_observation,
                 route_identity_provenance,
                 route_provenance_degraded,
@@ -713,6 +719,7 @@ impl SandboxManagerService {
                 sandbox,
                 metadata,
                 state_changed_at,
+                pinned_artifact_created_at,
                 recovery_observation,
                 route_identity_provenance,
                 route_provenance_degraded,
@@ -726,6 +733,7 @@ impl SandboxManagerService {
                         sandbox,
                         metadata,
                         state_changed_at,
+                        pinned_artifact_created_at,
                         recovery_observation,
                     )
                     .await,
@@ -813,6 +821,7 @@ impl SandboxManagerService {
         sandbox: crate::db::SandboxRow,
         raw_publication_metadata: Option<crate::db::RawSandboxStatePublicationMetadataRead>,
         state_changed_at: Option<String>,
+        pinned_artifact_created_at: Option<crate::db::timestamps::EpochSeconds>,
         raw_recovery_observation: Option<crate::db::RawQuarantineRecoveryObservationRead>,
     ) -> Result<SandboxInfo, Status> {
         let id = &sandbox.id;
@@ -1034,6 +1043,15 @@ impl SandboxManagerService {
             network_policy_authority: sandbox.network_policy_authority.as_proto_i32(),
             auto_lifecycle_authority: sandbox.auto_lifecycle_authority.as_proto_i32(),
             current_local_artifact_id: sandbox.current_local_artifact_id.map(|id| id.to_string()),
+            // Joined on the row's own pin, under the same connection lock as
+            // the row read, so this is the time of the artifact
+            // `current_local_artifact_id` names.
+            current_local_artifact_created_at: pinned_artifact_created_at.map(|seconds| {
+                prost_types::Timestamp {
+                    seconds: seconds.get(),
+                    nanos: 0,
+                }
+            }),
             current_local_artifact_kind: sandbox.current_local_artifact_kind.map(
                 |kind| match kind {
                     pplx_space_common_core::types::ArtifactKind::Disk => {

@@ -814,6 +814,163 @@ fn a_reported_pin_is_pinless_only_when_genuinely_absent() {
     );
 }
 
+/// The node's capture time travels with its pin and never without one: a
+/// readable pin carries it, while a time beside no pin or beside an unreadable
+/// one is dropped, so a time can't be attributed to an artifact nobody can name.
+/// The row's stopped-since time comes through unchanged in every case.
+#[test]
+fn the_capture_time_is_carried_only_beside_a_readable_pin() {
+    use pplx_space_sbx_mgr_client::proto::{SandboxInfo, SandboxLifecycleState};
+    let sandbox_id = SandboxId::from_uuid(Uuid::now_v7());
+    let pin = Uuid::now_v7();
+    let at = |seconds| prost_types::Timestamp { seconds, nanos: 0 };
+    let reported = |current_local_artifact_id: Option<String>| {
+        node_reported_artifact_from_info(
+            SandboxInfo {
+                sandbox_id: sandbox_id.to_string(),
+                lifecycle: Some(SandboxLifecycleState::Stopped as i32),
+                current_local_artifact_id,
+                current_local_artifact_created_at: Some(at(200)),
+                state_changed_at: Some(at(100)),
+                ..SandboxInfo::default()
+            },
+            sandbox_id,
+        )
+    };
+
+    let readable = reported(Some(pin.to_string()));
+    assert_eq!(
+        readable.pinned_artifact,
+        Some(LocalArtifactId::from_uuid(pin))
+    );
+    assert_eq!(readable.pin_captured_at, Some(at(200)));
+    assert_eq!(readable.stopped_since, Some(at(100)));
+
+    for (shape, raw) in [
+        ("no pin", None),
+        ("an unreadable pin", Some("nope".to_owned())),
+    ] {
+        let answer = reported(raw);
+        assert_eq!(answer.pinned_artifact, None, "{shape}");
+        assert_eq!(
+            answer.pin_captured_at, None,
+            "{shape}: the time names no artifact"
+        );
+        assert_eq!(answer.stopped_since, Some(at(100)), "{shape}");
+    }
+}
+
+/// **A pin is never shown current on an invalid time.** A stop time before the
+/// epoch would read as older than every capture, so a corrupt one could make
+/// any pin look current; an invalid capture time could do the same in the
+/// other direction. Either makes the order unknown, so the pin is refused like
+/// one the node reports with no time. The same pin with valid times is current.
+#[test]
+fn a_pin_with_an_invalid_capture_or_stop_time_is_never_current() {
+    let at = |seconds, nanos| Some(prost_types::Timestamp { seconds, nanos });
+    let node = |pin_captured_at, stopped_since| NodeReportedArtifact {
+        pinned_artifact: Some(LocalArtifactId::from_uuid(Uuid::now_v7())),
+        pin_captured_at,
+        stopped_since,
+        ..NodeReportedArtifact::default()
+    };
+
+    let valid = node(at(1_700_000_100, 0), at(1_700_000_000, 0));
+    assert_eq!(valid.pin_capture_order(), Some(std::cmp::Ordering::Greater));
+    assert!(valid.pin_shown_current());
+
+    for (shape, captured, stopped) in [
+        ("negative stop time", at(1_700_000_100, 0), at(-1, 0)),
+        ("negative capture time", at(-1, 0), at(-5, 0)),
+        (
+            "stop time nanos out of range",
+            at(1_700_000_100, 0),
+            at(1_700_000_000, -1),
+        ),
+        (
+            "capture time nanos out of range",
+            at(1_700_000_100, 1_000_000_000),
+            at(1_700_000_000, 0),
+        ),
+    ] {
+        let invalid = node(captured, stopped);
+        assert_eq!(invalid.pin_capture_order(), None, "{shape}");
+        assert!(!invalid.pin_shown_current(), "{shape}");
+    }
+}
+
+/// A pin the node reports without a capture time, which is how it reports an
+/// artifact an older binary recorded, isn't shown current however recent its
+/// row's stop. The same pin reported with a capture time no earlier than the
+/// stop is.
+#[test]
+fn a_pin_reported_without_a_capture_time_is_never_current() {
+    use pplx_space_sbx_mgr_client::proto::{SandboxInfo, SandboxLifecycleState};
+    let sandbox_id = SandboxId::from_uuid(Uuid::now_v7());
+    let at = |seconds| prost_types::Timestamp { seconds, nanos: 0 };
+    let reported = |current_local_artifact_created_at| {
+        node_reported_artifact_from_info(
+            SandboxInfo {
+                sandbox_id: sandbox_id.to_string(),
+                lifecycle: Some(SandboxLifecycleState::Stopped as i32),
+                current_local_artifact_id: Some(Uuid::now_v7().to_string()),
+                current_local_artifact_created_at,
+                state_changed_at: Some(at(100)),
+                ..SandboxInfo::default()
+            },
+            sandbox_id,
+        )
+    };
+    let older = reported(None);
+    assert!(older.pinned_artifact.is_some());
+    assert!(!older.pin_shown_current());
+    assert!(reported(Some(at(100))).pin_shown_current());
+    assert!(reported(Some(at(160))).pin_shown_current());
+}
+
+/// The order is a fact about the node's two times, compared exactly, and it's
+/// unknown whenever either is missing: an older node that reports no capture
+/// time, or a row whose stopped-since time didn't parse, has no order rather
+/// than a default one.
+#[test]
+fn the_capture_order_is_known_only_when_the_node_reports_both_times() {
+    let at = |seconds| Some(prost_types::Timestamp { seconds, nanos: 0 });
+    let order = |pin_captured_at, stopped_since| {
+        NodeReportedArtifact {
+            pin_captured_at,
+            stopped_since,
+            ..NodeReportedArtifact::default()
+        }
+        .pin_capture_order()
+    };
+    assert_eq!(order(at(101), at(100)), Some(std::cmp::Ordering::Greater));
+    assert_eq!(order(at(100), at(100)), Some(std::cmp::Ordering::Equal));
+    assert_eq!(order(at(99), at(100)), Some(std::cmp::Ordering::Less));
+    assert_eq!(order(None, at(100)), None);
+    assert_eq!(order(at(101), None), None);
+}
+
+/// A capture in the stop's own second or later shows the pin current; an
+/// earlier capture or an unknown order doesn't.
+#[test]
+fn a_pin_is_current_from_the_stops_own_second() {
+    let at = |seconds| Some(prost_types::Timestamp { seconds, nanos: 0 });
+    for (shape, captured, stopped, current) in [
+        ("later", at(101), at(100), true),
+        ("same second", at(100), at(100), true),
+        ("earlier", at(99), at(100), false),
+        ("no capture time", None, at(100), false),
+        ("no stop time", at(101), None, false),
+    ] {
+        let node = NodeReportedArtifact {
+            pin_captured_at: captured,
+            stopped_since: stopped,
+            ..NodeReportedArtifact::default()
+        };
+        assert_eq!(node.pin_shown_current(), current, "{shape}");
+    }
+}
+
 /// The property: the node's answer never reads as "stopped, pinless, no live
 /// VM" unless the node actually said all three. A process the node's live probe
 /// sees running marks the VM alive whatever the watchdog's cached flag says,

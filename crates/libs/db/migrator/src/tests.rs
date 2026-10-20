@@ -23,6 +23,21 @@ async fn sandbox_baseline_refuses_down_without_changing_shared_jobs_or_history()
     let path = directory.path().join("sandbox.sqlite");
     let database = SqliteDatabase::from(pplx_space_sbx_mgr_store::db::migration::target());
     migrate_sqlite_up(database, &path).await.unwrap();
+    // Step back to the baseline first: the property is about the baseline's
+    // own down migration, not whichever migration happens to be newest.
+    let after_baseline = pplx_space_sbx_mgr_store::db::migration::target()
+        .service
+        .iter()
+        .filter(|migration| {
+            migration.migration_type.is_up_migration()
+                && migration.version > pplx_space_sqlite::baselines::PUBLIC_SQLITE_BASELINE
+        })
+        .count();
+    for _ in 0..after_baseline {
+        rollback_last_sqlite_database(database, &path, &COMMON_SCHEMA_MIGRATOR)
+            .await
+            .unwrap();
+    }
     let conn = Connection::open(&path).unwrap();
     conn.execute(
         "INSERT INTO jobs (job_id, kind, status) VALUES ('cancelled-witness', 'test', 'cancelled')",
@@ -51,6 +66,87 @@ async fn sandbox_baseline_refuses_down_without_changing_shared_jobs_or_history()
         )
         .unwrap(),
         "cancelled"
+    );
+}
+
+/// Rolling a node back past the capture-time marker keeps its artifact rows,
+/// and upgrading again brings every one of them back as not comparable. A pin
+/// recorded before a downgrade can't then report a capture time the
+/// downgraded binary never guaranteed.
+#[tokio::test]
+async fn capture_time_marker_round_trips_and_reupgrades_as_not_comparable() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sandbox.sqlite");
+    let database = SqliteDatabase::from(pplx_space_sbx_mgr_store::db::migration::target());
+    let marker_columns = |conn: &Connection| -> Vec<String> {
+        let mut statement = conn
+            .prepare("SELECT name FROM pragma_table_info('local_artifacts') WHERE name = 'capture_time_comparable'")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    let marker = |conn: &Connection| -> i64 {
+        conn.query_row(
+            "SELECT capture_time_comparable FROM local_artifacts WHERE local_artifact_id = 'a'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+
+    migrate_sqlite_up(database, &path).await.unwrap();
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO local_artifacts (
+                 local_artifact_id, sandbox_id, artifact_kind, artifact_origin,
+                 local_path, created_at, capture_time_comparable
+             ) VALUES ('a', 's', 'disk', 'stop', '/cache/a', '1', 1)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(marker(&conn), 1);
+    }
+
+    // Roll back until the marker's own migration has been undone, however many
+    // newer migrations sit above it.
+    for _ in 0..pplx_space_sbx_mgr_store::db::migration::target()
+        .service
+        .iter()
+        .count()
+    {
+        if marker_columns(&Connection::open(&path).unwrap()).is_empty() {
+            break;
+        }
+        rollback_last_sqlite_database(database, &path, &COMMON_SCHEMA_MIGRATOR)
+            .await
+            .unwrap();
+    }
+    {
+        let conn = Connection::open(&path).unwrap();
+        assert!(
+            marker_columns(&conn).is_empty(),
+            "the down migration drops the marker"
+        );
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_artifacts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "and keeps the artifact row");
+    }
+
+    migrate_sqlite_up(database, &path).await.unwrap();
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(
+        marker_columns(&conn),
+        vec!["capture_time_comparable".to_owned()]
+    );
+    assert_eq!(
+        marker(&conn),
+        0,
+        "a row from before the downgrade isn't comparable"
     );
 }
 

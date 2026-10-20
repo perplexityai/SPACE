@@ -10328,6 +10328,7 @@ mod accepted_shapes_quarantine;
 mod accepted_shapes_single_statement;
 mod cleanup_quarantine_refusal;
 mod local_network_policy_clear;
+mod pinned_artifact_capture;
 mod state_write_table;
 mod stopped_artifact_pin;
 mod thin_writer_coverage;

@@ -2186,17 +2186,91 @@ pub struct NodeReportedArtifact {
     /// move a row into `stopped` stamp it only on a state change, and
     /// `transfer.rs` reaches `stopped` only from `creating`, so for a row one
     /// of them stopped it is the current stopped episode's start rather than a
-    /// last-touch. Not every writer of the column is guarded that way: startup
-    /// recovery restamps it without a state change.
+    /// last-touch. Startup recovery restamps without a state change, but never
+    /// a `stopped` row.
     ///
-    /// For a stopped sandbox this is the instant its rootfs froze, which makes
-    /// it half of the only sound test for whether a pinned artifact describes
-    /// the current bytes: an artifact captured at or after it does. The other
-    /// half — the artifact's own capture time — is write-once on the node and
-    /// not exposed yet. Carried now because the response already contains it
-    /// and a caller that has to refuse can at least say when the sandbox
-    /// stopped.
+    /// For a stopped sandbox this is the instant its rootfs froze: a start
+    /// that boots the guest and fails moves the row out of `stopped` and back,
+    /// restamping it. That makes it half of [`Self::pin_capture_order`];
+    /// [`Self::pin_captured_at`] is the other.
     pub stopped_since: Option<prost_types::Timestamp>,
+    /// When the node recorded [`Self::pinned_artifact`], from the node's
+    /// `local_artifacts.created_at`: stamped when the catalog row is inserted
+    /// and never rewritten. Same clock as [`Self::stopped_since`]. A `stopped`
+    /// sandbox's pin is recorded just after its snapshot is taken, either as
+    /// the row enters `stopped` or later on the already-stopped row (the
+    /// ordinary stop-time mint), or, for a disk a stopped evacuation restored
+    /// onto this node, as the rootfs is materialized from it, so the rootfs is
+    /// that artifact. Compare it only
+    /// when [`Self::reports_stopped`]; other recordings (a suspend artifact
+    /// adopted at backup time, a restored suspend checkpoint) can lag the
+    /// capture.
+    ///
+    /// `None` whenever there's no readable pin, and also when the node doesn't
+    /// report it: older nodes don't, and a node omits it for a pin whose
+    /// catalog row is missing, unreadable, or recorded by an older node. Read
+    /// `None` as unknown, never as old or new.
+    pub pin_captured_at: Option<prost_types::Timestamp>,
+}
+
+impl NodeReportedArtifact {
+    /// How the pinned artifact's capture time compares with the instant the
+    /// row entered its current state, or `None` when either is unknown.
+    ///
+    /// Both are the node's own clock, which is what makes the comparison
+    /// meaningful at all; a cluster timestamp against either would let clock
+    /// skew accept a stale artifact. They're whole epoch seconds, and the
+    /// clock is the wall clock rather than a monotonic one, so the orderings
+    /// mean:
+    ///
+    /// * `Greater`: captured in a later second than the row stopped, so the
+    ///   artifact describes the rootfs as it stands.
+    /// * `Equal`: same second, which is the ordinary case: the execution
+    ///   retire stops the sandbox and enqueues its disk backup straight after,
+    ///   so the stop-time mint usually lands in the stop's own second. On its
+    ///   own the second can't separate that from a mint followed by a start
+    ///   that boots, writes and fails within it. The node closes that case
+    ///   instead: it drops a `stopped` row's pin when a start that launched
+    ///   fails and before a process-snapshot rollback rewrites the disk, and
+    ///   it refuses to pin a disk backup whose row has started since the
+    ///   backup took its snapshot, so a pin that survives on a `stopped` row
+    ///   was taken after the last write. A node reports a capture time only for
+    ///   an artifact it recorded under all three, which shipped before the
+    ///   capture time did; an artifact recorded by an older node has none.
+    /// * `Less`: captured before the row's current stopped episode began, so
+    ///   the rootfs may have changed since. Reusing it is the data-loss case.
+    ///   Not every `Less` pin is stale: a start refused before it launched
+    ///   rolls the row back to `stopped`, restamping it, and keeps the pin of
+    ///   a rootfs nothing touched. Such a sandbox isn't evacuated, which fails
+    ///   closed.
+    ///
+    /// A backward step of the node's clock between a mint and a later restamp
+    /// can make a stale artifact read as current. That residual isn't
+    /// closable from a wall-clock second, and is accepted.
+    ///
+    /// A time before the Unix epoch, or with nanos outside `0..1_000_000_000`,
+    /// is unknown too. The node never writes one, so it can only come from a
+    /// corrupt row, and read literally a negative stop time is older than every
+    /// capture, which would make any pin look current.
+    pub fn pin_capture_order(&self) -> Option<std::cmp::Ordering> {
+        let valid = |time: &prost_types::Timestamp| {
+            time.seconds >= 0 && (0..1_000_000_000).contains(&time.nanos)
+        };
+        let captured = self.pin_captured_at.as_ref().filter(|time| valid(time))?;
+        let stopped = self.stopped_since.as_ref().filter(|time| valid(time))?;
+        Some((captured.seconds, captured.nanos).cmp(&(stopped.seconds, stopped.nanos)))
+    }
+
+    /// The node shows its pin was captured during the current stopped
+    /// episode: `Greater` or `Equal` (see [`Self::pin_capture_order`]). The
+    /// only orders on which a fresh stopped evacuation may reuse a pin. An
+    /// unknown order proves nothing, so it's refused.
+    pub fn pin_shown_current(&self) -> bool {
+        matches!(
+            self.pin_capture_order(),
+            Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+        )
+    }
 }
 
 /// Which of three things the node's `current_local_artifact_id` says, given that
@@ -2285,6 +2359,11 @@ fn node_reported_artifact_from_info(
 ) -> NodeReportedArtifact {
     let (pinned_artifact, pin_unreadable) =
         parse_reported_pin(info.current_local_artifact_id.as_deref(), sandbox_id);
+    // Only beside a readable pin: a time with no artifact to attach it to is
+    // evidence about nothing.
+    let pin_captured_at = info
+        .current_local_artifact_created_at
+        .filter(|_| pinned_artifact.is_some());
     NodeReportedArtifact {
         present: true,
         pinned_artifact,
@@ -2301,6 +2380,7 @@ fn node_reported_artifact_from_info(
         vm_alive: info.firecracker_alive || info.namespace.is_some(),
         state_degraded: info.state_degraded,
         stopped_since: info.state_changed_at,
+        pin_captured_at,
     }
 }
 

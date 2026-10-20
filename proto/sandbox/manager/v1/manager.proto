@@ -665,6 +665,20 @@ message SandboxInfo {
   // Always set by the sandbox manager; readers reject its absence. Present
   // UNSPECIFIED or an unknown value means undecodable state.
   optional SandboxLifecycleState lifecycle = 57;
+  // When the node recorded the artifact named by current_local_artifact_id in
+  // its catalog, from the node's clock, never rewritten. Set only together
+  // with current_local_artifact_id, and only when the node's catalog holds
+  // that artifact with a readable time and recorded it under rules that keep
+  // the comparison sound: an artifact an older node recorded has no time
+  // here. Meaningful only for a STOPPED sandbox, where the pin is recorded
+  // just after its snapshot is taken (as the row enters STOPPED or later,
+  // while it stays STOPPED) or as a restored disk is materialized from it:
+  // compare it there against state_changed_at, which comes from the same
+  // clock. For other states the
+  // recording can lag the capture, so the time says nothing about whether the
+  // artifact matches the disk. A time from any other machine isn't
+  // comparable. Absent means unknown, not old: older nodes never set it.
+  optional google.protobuf.Timestamp current_local_artifact_created_at = 58;
 }
 
 enum SandboxHealthStatus {

@@ -14,7 +14,7 @@
 
 use super::*;
 
-type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+pub(super) type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// A worker node in some drain state. Tests vary the two columns the claim
 /// guards on and nothing else.
@@ -37,13 +37,13 @@ async fn insert_node(
     Ok(node_id)
 }
 
-async fn forced_draining_node(pool: &PgPool) -> TestResult<NodeId> {
+pub(super) async fn forced_draining_node(pool: &PgPool) -> TestResult<NodeId> {
     insert_node(pool, Some(PHASE_DRAINING), "forced").await
 }
 
 /// A resident sandbox in `lifecycle`, placed long enough ago that the census
 /// settle window is never what a case is measuring.
-async fn insert_sandbox(
+pub(super) async fn insert_sandbox(
     pool: &PgPool,
     node_id: Option<NodeId>,
     lifecycle: &str,
@@ -93,7 +93,7 @@ async fn set_current_artifact(
 /// One catalog row for a backup attempt. `orphaned` models a storage location
 /// whose bytes have been reclaimed — a `ready` snapshot with nothing left to
 /// restore from.
-async fn insert_backup(
+pub(super) async fn insert_backup(
     pool: &PgPool,
     sandbox_id: SandboxId,
     artifact_id: LocalArtifactId,
@@ -138,7 +138,7 @@ async fn lifecycle_of(pool: &PgPool, sandbox_id: SandboxId) -> TestResult<String
     )
 }
 
-async fn marker_of(pool: &PgPool, sandbox_id: SandboxId) -> TestResult<Option<String>> {
+pub(super) async fn marker_of(pool: &PgPool, sandbox_id: SandboxId) -> TestResult<Option<String>> {
     Ok(sqlx::query_scalar::<_, Option<String>>(sql!(
         "SELECT evacuation_restore_target FROM sandboxes WHERE id = $1"
     ))
@@ -1263,7 +1263,7 @@ async fn a_pin_committed_while_the_claim_waits_still_refuses_it() -> TestResult 
 }
 
 /// The artifact the faked node hands back from a publish.
-fn enqueued(pin: LocalArtifactId) -> EnqueuedArtifactBackup {
+pub(super) fn enqueued(pin: LocalArtifactId) -> EnqueuedArtifactBackup {
     EnqueuedArtifactBackup {
         artifact: PublishedLocalArtifact {
             id: pin,

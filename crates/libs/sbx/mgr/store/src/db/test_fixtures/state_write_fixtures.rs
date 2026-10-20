@@ -627,6 +627,7 @@ pub fn local_artifact_inserted(
         ("last_touched_at", Cell::NowText),
         ("backup_completed_at", NULL),
         ("state", text("ready")),
+        ("capture_time_comparable", int(1)),
     ]
 }
 

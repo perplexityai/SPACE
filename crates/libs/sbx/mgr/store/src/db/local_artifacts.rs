@@ -331,7 +331,8 @@ fn publish_restored_artifact_impl(
             params![id, local_path, local_artifact_id.to_string()],
         )?,
     };
-    insert_local_artifact(
+    let ts = now()?;
+    insert_local_artifact_at(
         &tx,
         id,
         local_artifact_id,
@@ -339,6 +340,7 @@ fn publish_restored_artifact_impl(
         publication.origin,
         None,
         local_path,
+        &ts,
     )?;
     let changed = tx.execute(
         "UPDATE sandboxes
@@ -360,7 +362,7 @@ fn publish_restored_artifact_impl(
             local_artifact_id.to_string(),
             publication.kind.as_str(),
             publication.origin.as_str(),
-            now()?,
+            ts,
             id,
             publication.clear_failure_reason
         ],
@@ -429,6 +431,21 @@ pub fn publish_restored_disk_as_new(conn: &Connection, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Record a freshly minted artifact.
+///
+/// `created_at` is write-once: nothing may rewrite it, here or in a later
+/// `UPDATE`. The node publishes it for the pinned artifact as
+/// `SandboxInfo.current_local_artifact_created_at`, and the cluster's
+/// stopped-resident evacuation reuses a pin only when it was captured since the
+/// row entered `stopped`. A later `created_at` would make a stale pin read as
+/// current.
+///
+/// `capture_time_comparable` is set because this binary drops a `stopped`
+/// row's pin on every path that can leave it stale, so for an artifact it
+/// records that comparison means what the cluster takes it to mean. Rows an
+/// older binary wrote keep the column's default, 0, and are published with no
+/// capture time: such a binary may have kept a pin across a rollback of its
+/// rootfs.
 pub(super) fn insert_local_artifact(
     conn: &Connection,
     sandbox_id: &str,
@@ -438,12 +455,39 @@ pub(super) fn insert_local_artifact(
     snapshot_name: Option<&SnapshotName>,
     local_path: &str,
 ) -> Result<()> {
-    let ts = now()?;
+    insert_local_artifact_at(
+        conn,
+        sandbox_id,
+        local_artifact_id,
+        artifact_kind,
+        artifact_origin,
+        snapshot_name,
+        local_path,
+        &now()?,
+    )
+}
+
+/// [`insert_local_artifact`] stamped with `ts`, for a writer that pins the
+/// artifact and moves the row into `stopped` in one transaction. Both stamps
+/// have to come from the same clock read: two reads can straddle a second, and
+/// then a pin minted with its stop reads as captured before it and is refused.
+#[allow(clippy::too_many_arguments)]
+fn insert_local_artifact_at(
+    conn: &Connection,
+    sandbox_id: &str,
+    local_artifact_id: LocalArtifactId,
+    artifact_kind: ArtifactKind,
+    artifact_origin: ArtifactOrigin,
+    snapshot_name: Option<&SnapshotName>,
+    local_path: &str,
+    ts: &str,
+) -> Result<()> {
     conn.execute(
         "INSERT INTO local_artifacts (
              local_artifact_id, sandbox_id, artifact_kind, artifact_origin,
-             snapshot_name, local_path, created_at, last_touched_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+             snapshot_name, local_path, created_at, last_touched_at,
+             capture_time_comparable
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, 1)",
         params![
             local_artifact_id.to_string(),
             sandbox_id,
@@ -536,7 +580,8 @@ pub fn publish_stopped_artifact(
     local_path: &str,
 ) -> Result<()> {
     let tx = immediate_transaction(conn)?;
-    insert_local_artifact(
+    let ts = now()?;
+    insert_local_artifact_at(
         &tx,
         sandbox_id,
         local_artifact_id,
@@ -544,6 +589,7 @@ pub fn publish_stopped_artifact(
         ArtifactOrigin::Stop,
         None,
         local_path,
+        &ts,
     )?;
     let changed = tx.execute(
         "UPDATE sandboxes
@@ -590,7 +636,7 @@ pub fn publish_stopped_artifact(
             local_artifact_id.to_string(),
             ArtifactKind::Disk.as_str(),
             ArtifactOrigin::Stop.as_str(),
-            now()?,
+            ts,
             sandbox_id,
             expected_execution.map(|id| id.to_string()),
         ],
@@ -666,6 +712,56 @@ pub fn drop_stopped_artifact_pin(conn: &Connection, id: &str) -> Result<bool> {
         params![now()?, id],
     )?;
     Ok(changed == 1)
+}
+
+/// Capture times of the artifacts the given sandboxes pin, keyed by sandbox id.
+///
+/// One join on the pin, so a time is the pinned artifact's by construction. A
+/// sandbox has no entry when it pins nothing, when its pin names no catalog row
+/// of its own, when that row isn't `capture_time_comparable` (see
+/// [`insert_local_artifact`]), or when the stored time can't be decoded: an
+/// unknown capture time is reported as absent, never guessed. Read under the
+/// same lock of sbx-mgr's single connection as the sandbox row, so no writer
+/// moves the pin in between.
+pub fn pinned_local_artifact_created_at(
+    conn: &Connection,
+    sandbox_ids: &[String],
+) -> Result<HashMap<String, timestamps::EpochSeconds>> {
+    if sandbox_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let placeholders = std::iter::repeat_n("?", sandbox_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "SELECT s.id, la.created_at
+         FROM sandboxes s
+         JOIN local_artifacts la
+           ON la.local_artifact_id = s.current_local_artifact_id
+          AND la.sandbox_id = s.id
+          AND la.capture_time_comparable = 1
+         WHERE s.id IN ({placeholders})"
+    );
+    let mut statement = conn.prepare(&query)?;
+    let rows = statement.query_map(rusqlite::params_from_iter(sandbox_ids), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, rusqlite::types::Value>(1)?,
+        ))
+    })?;
+    let mut created_at = HashMap::new();
+    for row in rows {
+        let (sandbox_id, value) = row?;
+        match timestamps::EpochSeconds::decode(&value) {
+            Ok(seconds) => {
+                created_at.insert(sandbox_id, seconds);
+            }
+            Err(error) => {
+                tracing::warn!(%sandbox_id, %error, "omitting malformed pinned artifact capture time");
+            }
+        }
+    }
+    Ok(created_at)
 }
 
 pub fn get_local_artifact(

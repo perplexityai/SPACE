@@ -290,24 +290,34 @@ pub fn sandbox_failed_on_node(node_id: &str, pre_lifecycle: &str) {
 ///   execution appeared before the teardown. Nothing was destroyed, though a
 ///   backup may already have been enqueued.
 /// - `"unattributable_artifact"` — the sandbox carries an artifact pin this
-///   drain did not mint, so the next publish would reuse those bytes rather
-///   than capture the rootfs as it stands, and the evacuation refused to start.
-///   Almost always read from sbx-mgr over the same connection the publish
-///   uses, because that is the row the mint decision is made against; the
-///   cluster's column of the same name is checked first, but it is NULL for
-///   almost every stopped sandbox. **The one outcome that never
-///   self-resolves**, and today it is the **expected** outcome rather than an
-///   exception. The execution retire enqueues a disk backup on every ordinary
-///   stop and a pinless row mints, so nearly every stopped resident's node row
-///   carries a pin; the pin is usually current, but a start that fails after
-///   the guest ran keeps an older one, and the guard cannot tell the two
-///   apart. So until the node side changes, every ordinarily-stopped resident
-///   reports this and parks its node.
+///   drain did not mint, and its node can't show the pin was captured since
+///   the sandbox last stopped, so the next publish would reuse bytes that
+///   may predate the rootfs as it stands, and the evacuation refused to start.
+///   Read from sbx-mgr over the same connection the publish uses, because
+///   that is the row the mint decision is made against; the cluster's column
+///   of the same name is checked first, but it is NULL for almost every
+///   stopped sandbox. **The one outcome that never self-resolves.**
 ///
-///   **Do not alert on its rate at enablement.** It will fire immediately, on
-///   correct fail-closed behaviour. What is worth alerting on is this outcome
-///   persisting *after* the node-side change lands, which is when it goes back
-///   to meaning "a sandbox nobody can evacuate". **This counter is the whole
+///   Nearly every stopped resident's node row carries a pin, because the
+///   execution retire enqueues a disk backup on every ordinary stop. The node
+///   reports when that pin was captured and when its row entered `stopped`,
+///   and a pin captured no earlier than the stop is evacuated on instead of
+///   refused. What lands here: a pin captured before the sandbox's current
+///   stop; a pin the node reports with no capture time, because its catalog
+///   row is missing, its time is unreadable, or an older node recorded it; a
+///   stop time the node can't report; and every pin on a node too old to
+///   report a capture time, so a fleet that hasn't rolled the node side
+///   reports this for nearly every stopped resident.
+///
+///   **Don't alert on its rate before the node side reports capture times.**
+///   Until then it fires on correct fail-closed behaviour for nearly every
+///   stopped resident. Even after, it keeps firing for every sandbox that was
+///   already stopped when its node upgraded: that pin was recorded before
+///   the node marked its artifacts comparable, and a stopped sandbox keeps its
+///   pin until it's next started, so it stays refused, and holds a forced drain
+///   of its node, until then. Persisting for a sandbox stopped since its node
+///   upgraded is what's worth alerting on: that means "a sandbox nobody can
+///   evacuate". **This counter is the whole
 ///   signal for it** — `node_drain.stopped_evacuation_stall_secs` selects on the
 ///   evacuation marker, and this refusal returns before the claim writes one, so
 ///   it does not appear there at all. The per-sandbox log line is at `debug`

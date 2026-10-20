@@ -279,9 +279,47 @@ pub(crate) fn immediate_transaction(conn: &Connection) -> Result<Transaction<'_>
 }
 
 pub(crate) fn now() -> Result<String> {
+    #[cfg(test)]
+    if let Some(seconds) = test_clock::tick() {
+        return Ok(seconds.to_string());
+    }
     // Preserve whole epoch-second storage without fabricating persisted evidence
     // when the host clock is invalid.
     now_epoch_i64().map(|seconds| seconds.to_string())
+}
+
+/// A clock for tests that need two reads of [`now`] to land in different
+/// seconds, which the wall clock only does by chance.
+#[cfg(test)]
+pub(crate) mod test_clock {
+    use std::cell::Cell;
+
+    thread_local! {
+        static NEXT: Cell<Option<i64>> = const { Cell::new(None) };
+    }
+
+    /// Until the guard drops, every [`super::now`] on this thread returns
+    /// `start`, then `start + 1`, and so on.
+    pub(crate) fn ticking_from(start: i64) -> Guard {
+        NEXT.with(|next| next.set(Some(start)));
+        Guard
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            NEXT.with(|next| next.set(None));
+        }
+    }
+
+    pub(super) fn tick() -> Option<i64> {
+        NEXT.with(|next| {
+            let seconds = next.get()?;
+            next.set(Some(seconds + 1));
+            Some(seconds)
+        })
+    }
 }
 
 pub fn now_epoch_i64() -> Result<i64> {

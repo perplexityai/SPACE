@@ -200,14 +200,15 @@ async fn claim_evacuation_suspend(
 /// existing pin (`(_, Some(id)) => id`) and short-circuits entirely when its
 /// backup is already `ready`, so no new catalog row appears.
 ///
-/// A successful start clears the node's pin (`mark_start_succeeded`), so the
-/// pin normally describes the rootfs as of the latest stop. Other paths into
-/// `stopped` need not: a start that boots the guest and then fails is rolled
-/// back through `apply_cleanup_state`, which keeps the existing pin
-/// (`COALESCE(?11, current_local_artifact_id)`) while the guest may have
-/// written to the rootfs in between. Such a row carries a pin older than its
-/// bytes, and its `snapshots.timestamp` — *registration* time — still looks
-/// recent.
+/// A successful start clears the node's pin (`mark_start_succeeded`), and a
+/// start that boots the guest and then fails is cleaned up back to `stopped`
+/// through `apply_cleanup_state`, which drops it too, so a node's pin
+/// describes the rootfs as of the latest stop. That's node behaviour the
+/// cluster can't observe: a node too old to drop the pin on that path keeps
+/// one older than its bytes, while the pin's `snapshots.timestamp` —
+/// *registration* time — still looks recent. Nothing cluster-side can tell
+/// the two apart, which is why the node's own capture time is what decides
+/// (below).
 ///
 /// Freshness cannot be recovered from a cluster timestamp either. The
 /// sandbox's `lifecycle_changed_at` does not move for a pin minted after the
@@ -218,8 +219,11 @@ async fn claim_evacuation_suspend(
 /// → escalate` yields a pin that passes that anchor and predates the writes.
 ///
 /// What *is* checkable is provenance: an evacuation may only give up a copy
-/// whose mint it caused. A pinless row mints, so the artifact is of the rootfs
-/// as it stands; a pinned row reuses, so nothing published can be attributed.
+/// whose mint it caused, or one the node shows was captured since the sandbox
+/// last stopped. A pinless row mints, so the artifact is of the rootfs as it
+/// stands. A pinned row reuses, so what's published is the pin's bytes, and
+/// those are the rootfs's only if the pin was captured during the current
+/// stopped episode — which only the node's own clocks can say (below).
 ///
 /// **But "pinned" has to mean pinned on the node.** For a `stopped` sandbox this
 /// column is NULL almost always, whatever sbx-mgr holds: the projection that
@@ -236,36 +240,36 @@ async fn claim_evacuation_suspend(
 /// on a marker this refusal returns before writing — rather than destroying a
 /// user's disk on evidence about different bytes.
 ///
-/// **Which today means: almost always.** Every ordinarily stopped resident
-/// carries a pin: the execution retire issues
-/// `EnqueueArtifactBackup(CurrentInstance, Disk)` on every stop, and on a
-/// pinless row that mints and pins. That pin is usually current, but this guard
-/// cannot tell it from one a failed start left behind, so a fresh evacuation
-/// refuses nearly every stopped resident and the feature is safe-but-inert
-/// until the node side changes. That is the right trade for a default-disabled
-/// path whose failure mode is silent data loss, but it is a trade, not a corner
-/// case.
+/// **Every ordinarily stopped resident carries a pin**: the execution retire
+/// issues `EnqueueArtifactBackup(CurrentInstance, Disk)` on every stop, and on
+/// a pinless row that mints and pins. Refusing on presence alone would refuse
+/// nearly every stopped resident, so the node's answer is made precise
+/// instead: it reports the pinned artifact's capture time, its
+/// `local_artifacts.created_at`, beside the instant its row entered
+/// `stopped`. A stopped rootfs can't change, so an artifact captured since
+/// the row entered `stopped` describes the current bytes, and the refusal
+/// fires only for a pin that the node can't show is that recent. Both clocks
+/// are the node's — one machine, one `now()` — which is what separates this
+/// from the timestamp arguments above: those compared *cluster registration*
+/// time against a cluster clock, and a cross-machine version would accept a
+/// stale artifact under clock skew in one direction.
+/// [`NodeReportedArtifact::pin_capture_order`] spells out the comparison,
+/// including why a pin captured in the stop's own second is accepted.
 ///
-/// **Two routes out, and they cost very different things.**
+/// That relies on node-side facts. `created_at` is write-once (see
+/// `insert_local_artifact` in sbx-mgr). The node drops a `stopped` row's pin
+/// wherever its rootfs changes without a stamp that's sure to be later: a
+/// start that launched and failed, whose restamp can land in the capture's
+/// own second, and a process-snapshot rollback, which rewrites the disk
+/// without a state change at all. And it refuses to pin a disk backup
+/// whose row started since the backup took its snapshot; `created_at` is the
+/// catalog insert, just after the snapshot, so without that a start that
+/// boots, writes and fails in between would leave old bytes reading as
+/// current. A node reports a capture time only for an artifact it recorded
+/// under all three; see [`NodeReportedArtifact::pin_capture_order`].
 ///
-/// One is to have the node drop any pin that could be stale on every path into
-/// `stopped`, so a stopped row's pin is always one minted from its current
-/// rootfs. It is still *present*, though, so this refusal still fires, and
-/// relaxing it becomes a co-requisite: the two would land together or not at
-/// all.
-///
-/// The other is to make the refusal *precise* instead of relaxing it, by
-/// comparing the pinned artifact's capture time against the node's own
-/// stopped-since time. A stopped rootfs cannot change, so an artifact captured
-/// at or after the row entered `stopped` describes the current bytes. Both
-/// clocks are node-local — one machine, one `now()` — which is what separates
-/// this from the timestamp arguments above: those compared *cluster
-/// registration* time against a cluster clock, and a cross-machine version
-/// would accept a stale artifact under clock skew in one direction. The node
-/// already reports `state_changed_at` and this path already receives it; the
-/// artifact's `created_at` is write-once on the node and not yet exposed. That
-/// route is read-only, purely additive, needs no change to the stop path, and
-/// leaves this guard sound whether or not the pin is ever cleared.
+/// A node too old to report the capture time leaves it `None`, which the
+/// refusal treats exactly as before: any pin refuses.
 ///
 /// A **resumed** claim is not re-checked against the node on every tick, and
 /// what keeps that sound is the **conjunction** every read of this claim
@@ -280,10 +284,10 @@ async fn claim_evacuation_suspend(
 /// `stopped` sandbox boots its pod while the row still reads `stopped`, so one
 /// that boots, lets the guest write and then fails leaves the row exactly as
 /// the claim last saw it. The teardown re-asks the node before releasing
-/// anything (`tear_down_stopped_local_copy`), but that only catches the case
-/// once the node drops the pin on such a rollback; until then the pin it keeps
-/// still matches. The window is widest for a marker an abandoned evacuation
-/// left behind, which a later forced drain resumes.
+/// anything (`tear_down_stopped_local_copy`), which catches the case on a
+/// node that drops the pin on such a rollback; against one that doesn't, the
+/// kept pin still matches. The window is widest for a marker an abandoned
+/// evacuation left behind, which a later forced drain resumes.
 ///
 /// **`allow_new_claims` gates opening an evacuation, never finishing one.**
 /// This is where the feature flag lands, and the asymmetry is the point: a row
@@ -2535,12 +2539,7 @@ impl SubstrateSink {
             substrate: SubstrateSinkBackend::StoppedPath(Arc::new(TestStoppedPath {
                 publish: Box::new(move |_| Ok(artifact)),
                 publish_calls: std::sync::Mutex::new(0),
-                node_artifact: NodeReportedArtifact {
-                    present: true,
-                    pinned_artifact: None,
-                    reports_stopped: true,
-                    ..NodeReportedArtifact::default()
-                },
+                node_artifact: Self::stopped_pinless_node(),
                 teardown_node_artifact: None,
                 teardowns: std::sync::Mutex::new(Vec::new()),
             })),
@@ -2560,15 +2559,7 @@ impl SubstrateSink {
         artifact: EnqueuedArtifactBackup,
         node_artifact: NodeReportedArtifact,
     ) -> Self {
-        let mut sink = Self::with_stopped_path(pool, artifact);
-        sink.substrate = SubstrateSinkBackend::StoppedPath(Arc::new(TestStoppedPath {
-            publish: Box::new(move |_| Ok(artifact)),
-            publish_calls: std::sync::Mutex::new(0),
-            node_artifact,
-            teardown_node_artifact: None,
-            teardowns: std::sync::Mutex::new(Vec::new()),
-        }));
-        sink
+        Self::with_stopped_path_node_states(pool, artifact, node_artifact, None)
     }
 
     /// Same as [`Self::with_stopped_path`], but with the node reporting
@@ -2579,20 +2570,44 @@ impl SubstrateSink {
         artifact: EnqueuedArtifactBackup,
         teardown_node_artifact: NodeReportedArtifact,
     ) -> Self {
+        Self::with_stopped_path_node_states(
+            pool,
+            artifact,
+            Self::stopped_pinless_node(),
+            Some(teardown_node_artifact),
+        )
+    }
+
+    /// The faked node reporting `node_artifact` when an evacuation would open
+    /// and `teardown_node_artifact`, if any, on the tick that would tear down;
+    /// without one, the teardown read reports the cluster row's pin.
+    #[cfg(test)]
+    fn with_stopped_path_node_states(
+        pool: PgPool,
+        artifact: EnqueuedArtifactBackup,
+        node_artifact: NodeReportedArtifact,
+        teardown_node_artifact: Option<NodeReportedArtifact>,
+    ) -> Self {
         let mut sink = Self::with_stopped_path(pool, artifact);
         sink.substrate = SubstrateSinkBackend::StoppedPath(Arc::new(TestStoppedPath {
             publish: Box::new(move |_| Ok(artifact)),
             publish_calls: std::sync::Mutex::new(0),
-            node_artifact: NodeReportedArtifact {
-                present: true,
-                pinned_artifact: None,
-                reports_stopped: true,
-                ..NodeReportedArtifact::default()
-            },
-            teardown_node_artifact: Some(teardown_node_artifact),
+            node_artifact,
+            teardown_node_artifact,
             teardowns: std::sync::Mutex::new(Vec::new()),
         }));
         sink
+    }
+
+    /// A node that reports the sandbox present, stopped and pinless.
+    #[cfg(test)]
+    fn stopped_pinless_node() -> NodeReportedArtifact {
+        NodeReportedArtifact {
+            present: true,
+            pinned_artifact: None,
+            reports_stopped: true,
+            ..NodeReportedArtifact::default()
+        }
     }
 
     /// How many times the faked publish was called. The observable that separates
@@ -2780,21 +2795,15 @@ impl SubstrateSink {
     /// row it was written to refuse. Reading the node's own answer over the same
     /// connection the publish uses is what makes the guard mean what it says.
     ///
-    /// **The consequence is that it currently refuses nearly everything.** The
-    /// execution retire enqueues a disk backup on every ordinary stop and a
-    /// pinless row mints, so a stopped sandbox's node row is almost always
+    /// The execution retire enqueues a disk backup on every ordinary stop and
+    /// a pinless row mints, so a stopped sandbox's node row is almost always
     /// pinned by the time a drain asks. That pin is usually current — a
     /// successful start clears it — but a start that fails after the guest ran
-    /// keeps the older one. So this reports `unattributable_artifact` for the
-    /// ordinary case and the exceptional one alike, and cannot distinguish
-    /// them, because the difference is *when the pin was minted* and no
-    /// cluster-visible clock carries that (see [`claim_stopped_evacuation`]).
-    ///
-    /// The fix that does *not* couple to this check is to expose the pinned
-    /// artifact's capture time, so the refusal becomes "the pin predates the
-    /// current stop" rather than "there is a pin". See
-    /// [`claim_stopped_evacuation`] for why both clocks have to be the node's,
-    /// and for the alternative that does couple.
+    /// can keep an older one. The difference is *when the pin was captured*,
+    /// and no cluster-visible clock carries that, so the node reports its own:
+    /// [`NodeReportedArtifact::pin_captured_at`] against
+    /// [`NodeReportedArtifact::stopped_since`]. See
+    /// [`claim_stopped_evacuation`] for why both clocks have to be the node's.
     ///
     /// One RPC per tick that tries to *open* an evacuation, and one more on
     /// the tick that would release the node; a resumed claim in between needs
@@ -2803,10 +2812,14 @@ impl SubstrateSink {
     /// writes nothing, so it is listed and asked again on every tick until the
     /// refusal clears: the price of keeping the refusal stateless.
     ///
-    /// The window between this read and the publish is benign, which is not
-    /// obvious: anything that pins the node's row in it must itself have minted
-    /// from a pinless row, so whatever it pinned describes the rootfs as it
-    /// stands.
+    /// The window between this read and the publish is benign for a pinless
+    /// row, which is not obvious: anything that pins the node's row in it must
+    /// itself have minted from a pinless row, so whatever it pinned describes
+    /// the rootfs as it stands. For a row accepted on a current pin, a start
+    /// that boots, writes and fails in between drops that pin on a node that
+    /// reports capture times, so the publish mints a fresh one from the
+    /// rootfs as it then stands, and that's the artifact the teardown checks
+    /// against (`tear_down_stopped_local_copy`).
     async fn node_reported_artifact(
         &self,
         sandbox_id: SandboxId,
@@ -2864,8 +2877,9 @@ impl SubstrateSink {
     ///
     /// What it does **not** re-establish is that the artifact describes the
     /// rootfs about to be given up. That is provenance, not state, and it is
-    /// settled once at the claim — see [`claim_stopped_evacuation`]. No query
-    /// here could recover it: registration time is not capture time.
+    /// settled at the claim — see [`claim_stopped_evacuation`] — and checked
+    /// again against the node by `tear_down_stopped_local_copy`. No query here
+    /// could recover it: registration time is not capture time.
     ///
     /// Reading them together rather than in sequence is what makes the
     /// authorization a single point in time. It does not close the window
@@ -3022,9 +3036,17 @@ impl SubstrateSink {
     /// placement and all. So this asks the node, over the connection the
     /// publish used, and proceeds only if it reports the sandbox present,
     /// stopped, with no live VM, and pinned to exactly this artifact. A node
-    /// that drops the pin on such a rollback is then refused here; until the
-    /// node does, the pin it keeps still matches, and only a capture-time
-    /// comparison could tell the bytes apart.
+    /// that drops the pin on such a rollback is then refused here, and every
+    /// node that reports capture times does (see
+    /// [`NodeReportedArtifact::pin_capture_order`]). Against an older node the
+    /// pin it keeps still matches.
+    ///
+    /// The capture order isn't consulted here. On a node that reports it,
+    /// every restamp that can change the rootfs also drops the pin, which the
+    /// identity terms already refuse; the only restamps that keep one are a
+    /// start refused before it launched and startup recovery of a start that
+    /// never launched, and nothing touched the rootfs in either.
+    /// Refusing on the order would hold that claim, and its node, forever.
     async fn tear_down_stopped_local_copy(
         &self,
         sandbox_id: SandboxId,
@@ -3051,6 +3073,8 @@ impl SubstrateSink {
                 node_vm_alive = node.vm_alive,
                 node_state_degraded = node.state_degraded,
                 node_pin = ?node.pinned_artifact,
+                node_stopped_since = ?node.stopped_since,
+                node_pin_captured_at = ?node.pin_captured_at,
                 cluster_pin = ?pinned_artifact,
                 "node_drain: not releasing a stopped resident whose node no longer reports \
                  the copy the durable artifact describes"
@@ -3151,9 +3175,12 @@ impl SubstrateSink {
         // `lifecycle_changed_at` nor the node's `drain_started_at` can serve as
         // one, because `snapshots.timestamp` is registration time and a reused
         // pin decouples it from when the snapshot was taken. The property is
-        // established upstream instead, by `claim_stopped_evacuation` refusing
-        // to open an evacuation on a row that already carries a pin: everything
-        // this query can see was minted by the evacuation asking about it.
+        // established upstream instead: `claim_stopped_evacuation` refuses to
+        // open an evacuation on a cluster row that already carries a pin, and
+        // step 0c accepts a node pin only when the node shows it was captured
+        // no earlier than the sandbox stopped. So everything this query can see was
+        // minted by the evacuation asking about it, or is of the rootfs as it
+        // stood when that evacuation opened.
         //
         // Re-adding one here would not add safety and would subtract some. A
         // `drain_started_at` comparison, for instance, is satisfied by
@@ -4734,28 +4761,6 @@ impl NodeDrainSink for SubstrateSink {
                     local_artifact_id: None,
                 });
             }
-            if let Some(pinned) = node.pinned_artifact {
-                // `debug`: this refusal is today the expected outcome for
-                // nearly every stopped resident, and it repeats every tick for
-                // as long as the sandbox sits there, so an `info` line would be
-                // a line per sandbox per five seconds. The counter is the
-                // signal. `stopped_since` is the node's own entry time into
-                // `stopped`; the artifact's capture time is the value that
-                // would make this refusal precise instead of universal, and the
-                // node does not expose it yet.
-                tracing::debug!(
-                    sandbox_id = %sandbox_id,
-                    node_id = %node_label,
-                    local_artifact_id = %pinned.as_uuid(),
-                    node_stopped_since = ?node.stopped_since,
-                    "node_drain: refusing to open a stopped evacuation on an artifact this \
-                     drain did not mint; the node would reuse it rather than capture the \
-                     rootfs as it stands"
-                );
-                return Ok(StoppedEvacuationOutcome::UnattributableArtifact {
-                    local_artifact_id: Some(pinned),
-                });
-            }
             if !node.present || !node.reports_stopped || node.vm_alive {
                 // Not a provenance problem and not permanent, so none of these
                 // may be reported as unattributable. Three shapes:
@@ -4780,6 +4785,33 @@ impl NodeDrainSink for SubstrateSink {
                          an evacuation for it yet",
                         node.present, node.reports_stopped, node.vm_alive
                     ),
+                });
+            }
+            // A pin the node would reuse is acceptable only if the node shows
+            // it was captured during the current stopped episode: a stopped
+            // rootfs can't change, so such an artifact is of the bytes about to
+            // be given up. See [`NodeReportedArtifact::pin_shown_current`].
+            // After the drift checks above, so the capture order is only ever
+            // read for a node that reports the sandbox stopped, the one state
+            // it means anything for; drift defers whatever the times say.
+            if let Some(pinned) = node.pinned_artifact
+                && !node.pin_shown_current()
+            {
+                // `debug`: this refusal repeats every tick for as long as the
+                // sandbox sits there, so an `info` line would be a line per
+                // sandbox per five seconds. The counter is the signal.
+                tracing::debug!(
+                    sandbox_id = %sandbox_id,
+                    node_id = %node_label,
+                    local_artifact_id = %pinned.as_uuid(),
+                    node_stopped_since = ?node.stopped_since,
+                    node_pin_captured_at = ?node.pin_captured_at,
+                    "node_drain: refusing to open a stopped evacuation on an artifact the \
+                     node can't show was captured since the sandbox stopped; the node would \
+                     reuse it rather than capture the rootfs as it stands"
+                );
+                return Ok(StoppedEvacuationOutcome::UnattributableArtifact {
+                    local_artifact_id: Some(pinned),
                 });
             }
         }
@@ -5606,3 +5638,8 @@ mod termination_gate_tests;
 /// destroying the user's rootfs, and the re-placement sweep's second arm.
 #[cfg(test)]
 mod stopped_evacuation_tests;
+
+/// Coverage for the node's capture-order evidence: which node pins a fresh
+/// stopped evacuation may open on, and which the teardown still refuses.
+#[cfg(test)]
+mod stopped_evacuation_capture_order_tests;

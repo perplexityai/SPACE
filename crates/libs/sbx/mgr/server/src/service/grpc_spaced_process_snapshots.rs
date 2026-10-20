@@ -1419,6 +1419,39 @@ impl SandboxManagerService {
         let artifact_guard = artifact_lock.lock().await;
         let sandbox = self.lookup_sandbox(&sandbox.id)?;
         self.require_snapshot_mutation_ownership(&sandbox.id)?;
+        // A suspended sandbox's restore source is its pinned suspend artifact,
+        // whose memory image was captured against the current rootfs. Below,
+        // the rollback rewrites that rootfs, and for an `f-*` restart it also
+        // overwrites the suspend directory the pin names, while nothing here
+        // touches the pin. A later resume would then pair the old memory with
+        // the rolled-back disk. Refuse before any of it: restoring first stops
+        // the sandbox on the ordinary path, which rollback already handles.
+        // Read under the artifact lock, which the suspend publish also takes.
+        //
+        // Two more shapes are the same case, and neither has a cleanup episode
+        // for the ownership check above to stop: a row startup suspend
+        // recovery parked in `cleanup_required`, whose pending cleanup
+        // completes to `suspended`, and a row quarantined by a failed restore,
+        // which keeps the suspend pin that automatic recovery restores from.
+        // So a suspend pin refuses in every state except the ones below that
+        // don't restore from it: a running sandbox is stopped first, and a
+        // stopped row's pin is dropped before the disk is rewritten.
+        let pins_suspend_artifact = sandbox.current_local_artifact_origin
+            == Some(pplx_space_common_core::types::ArtifactOrigin::Suspend);
+        if sandbox.state == SandboxState::Suspended
+            || sandbox.cleanup_completion == Some(CleanupCompletion::MarkSuspended)
+            || (pins_suspend_artifact
+                && !matches!(
+                    sandbox.state,
+                    SandboxState::Started | SandboxState::Paused | SandboxState::Stopped
+                ))
+        {
+            return Err(Status::failed_precondition(
+                "cannot roll back a sandbox whose restore source is its suspend snapshot: \
+                 that snapshot describes the current disk; roll back once the sandbox has \
+                 been restored",
+            ));
+        }
         let transferred_path = pplx_space_common_core::host::linux::paths::sandbox_snapshot_dir(
             &sandbox.id,
             snapshot_name,

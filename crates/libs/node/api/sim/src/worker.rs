@@ -305,6 +305,7 @@ fn sandbox_info_from_record(rec: &crate::state::SandboxRecord) -> sbx::SandboxIn
         current_local_artifact_id: None,
         current_local_artifact_kind: None,
         current_local_artifact_origin: None,
+        current_local_artifact_created_at: None,
         state_changed_at: None,
         execution_generation: rec.execution_generation,
         pod_uid: None,

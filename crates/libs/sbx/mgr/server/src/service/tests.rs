@@ -1695,6 +1695,328 @@ pub(crate) mod service_tests {
         }
     }
 
+    /// A suspended sandbox can't be rolled back, and neither can one that
+    /// startup suspend recovery parked on its way to `suspended` or one a
+    /// failed restore quarantined with its suspend pin: the refusal
+    /// comes before anything is rewritten, and the sandbox keeps its suspend
+    /// snapshot as its restore source. The same row in `stopped` gets past this
+    /// check and fails later, on the fixture's missing snapshot files, which
+    /// shows the refusal is the state check and not one of the input checks.
+    #[tokio::test]
+    async fn rollback_refuses_a_suspended_sandbox_before_rewriting_its_disk() {
+        // `pinned: false` cases isolate the state and pending-completion terms:
+        // with no suspend pin, the pin term can't refuse them.
+        for (shape, pinned, refused) in [
+            ("suspended", true, true),
+            ("suspended, unpinned", false, true),
+            ("recovering to suspended", true, true),
+            ("recovering to suspended, unpinned", false, true),
+            ("quarantined by a failed restore", true, true),
+            // Isolates the pin term: the same quarantined row without a
+            // suspend pin isn't restored from one, so it gets past the check.
+            ("quarantined, unpinned", false, false),
+            ("stopped", true, false),
+        ] {
+            let conn = crate::db::test_conn();
+            let sandbox_id = SandboxId::new().to_string();
+            let pin = LocalArtifactId::new();
+            match shape {
+                "suspended" | "suspended, unpinned" => {
+                    insert_platform_owned_sandbox(
+                        &conn,
+                        &sandbox_id,
+                        SandboxState::Suspended,
+                        None,
+                    );
+                }
+                "recovering to suspended" | "recovering to suspended, unpinned" => {
+                    insert_platform_owned_sandbox(
+                        &conn,
+                        &sandbox_id,
+                        SandboxState::Suspending,
+                        None,
+                    );
+                    crate::db::pin_suspended_artifact_for_cleanup(
+                        &conn,
+                        &sandbox_id,
+                        pin,
+                        "/cache/recovered-suspend",
+                    )
+                    .unwrap();
+                }
+                "quarantined by a failed restore" | "quarantined, unpinned" => {
+                    insert_platform_owned_sandbox(
+                        &conn,
+                        &sandbox_id,
+                        SandboxState::Quarantined,
+                        None,
+                    );
+                }
+                _ => {
+                    insert_platform_owned_sandbox(&conn, &sandbox_id, SandboxState::Stopped, None);
+                }
+            }
+            if pinned {
+                conn.execute(
+                    "UPDATE sandboxes
+                        SET current_local_artifact_id = ?1,
+                            current_local_artifact_kind = 'full',
+                            current_local_artifact_origin = 'suspend'
+                      WHERE id = ?2",
+                    crate::db::fixture::params![pin.to_string(), sandbox_id],
+                )
+                .unwrap();
+            } else {
+                conn.execute(
+                    "UPDATE sandboxes
+                        SET current_local_artifact_id = NULL,
+                            current_local_artifact_kind = NULL,
+                            current_local_artifact_origin = NULL
+                      WHERE id = ?1",
+                    crate::db::fixture::params![sandbox_id],
+                )
+                .unwrap();
+            }
+            let service = service_for_teardown_test(conn);
+            let before = service.lookup_sandbox(&sandbox_id).unwrap();
+
+            let error = service
+                .rollback(internal_request(RollbackRequest {
+                    sandbox_id: sandbox_id.clone(),
+                    snapshot_name: "f-before-suspend".into(),
+                    auto_restart: false,
+                    netns_path: None,
+                    route_identity: None,
+                }))
+                .await
+                .unwrap_err();
+
+            assert_eq!(
+                error.code(),
+                tonic::Code::FailedPrecondition,
+                "{shape}: {error}"
+            );
+            assert_eq!(
+                error
+                    .message()
+                    .contains("whose restore source is its suspend snapshot"),
+                refused,
+                "{shape}: {error}"
+            );
+            assert_eq!(
+                error.message().contains("rootfs.ext4"),
+                !refused,
+                "{shape}: {error}"
+            );
+            let row = service.lookup_sandbox(&sandbox_id).unwrap();
+            assert_eq!(row.state, before.state, "{shape}");
+            assert_eq!(row.cleanup_completion, before.cleanup_completion, "{shape}");
+            assert_eq!(
+                row.current_local_artifact_id, before.current_local_artifact_id,
+                "{shape}"
+            );
+            assert_eq!(
+                row.current_local_artifact_origin, before.current_local_artifact_origin,
+                "{shape}"
+            );
+            if pinned {
+                assert_eq!(row.current_local_artifact_id, Some(pin), "{shape}");
+                assert_eq!(
+                    row.current_local_artifact_origin,
+                    Some(ArtifactOrigin::Suspend),
+                    "{shape}"
+                );
+            }
+        }
+    }
+
+    /// **A pin recorded without the comparable marker reports no capture time,
+    /// even when its times would read as current.** That's how an older
+    /// binary left a pin it kept across a rollback of a stopped sandbox, seeded
+    /// here as the rollback left the row. That binary didn't drop a stopped pin
+    /// before rewriting the disk, and the rewrite changed no state, so the
+    /// pin still names the pre-rollback bytes while its `created_at` is at or
+    /// after `state_changed_at`. Reported, that time would read as current and
+    /// let the drain give up the rolled-back disk. The same row recorded by
+    /// this binary, with the comparable marker set and the same times, does
+    /// report its time.
+    #[tokio::test]
+    async fn an_unmarked_pin_reports_no_capture_time_even_when_its_times_read_current() {
+        let conn = crate::db::test_conn();
+        let older = SandboxId::new().to_string();
+        let current = SandboxId::new().to_string();
+        let mut pin_of = std::collections::HashMap::new();
+        for (id, comparable) in [(&older, 0), (&current, 1)] {
+            insert_test_sandbox(&conn, id, SandboxState::Stopped);
+            set_test_state_changed_at(&conn, id, "1700000050");
+            let pin = LocalArtifactId::new();
+            conn.execute(
+                "INSERT INTO local_artifacts (
+                     local_artifact_id, sandbox_id, artifact_kind, artifact_origin,
+                     local_path, created_at, capture_time_comparable
+                 ) VALUES (?1, ?2, 'disk', 'stop', '/cache/pre-rollback', '1700000060', ?3)",
+                crate::db::fixture::params![pin.to_string(), id, comparable],
+            )
+            .unwrap();
+            // The rollback rewrote the rootfs and wrote nothing to the row: the
+            // pin stays, and so does the stamp of the row's entry into `stopped`.
+            conn.execute(
+                "UPDATE sandboxes
+                    SET current_local_artifact_id = ?1,
+                        current_local_artifact_kind = 'disk',
+                        current_local_artifact_origin = 'stop'
+                  WHERE id = ?2",
+                crate::db::fixture::params![pin.to_string(), id],
+            )
+            .unwrap();
+            pin_of.insert(id.clone(), pin);
+        }
+        let service = service_for_teardown_test(conn);
+
+        let response = service
+            .state(internal_request(StateRequest {
+                sandbox_ids: vec![older.clone(), current.clone()],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let info = |id: &str| {
+            response
+                .sandboxes
+                .iter()
+                .find(|info| info.sandbox_id == id)
+                .unwrap_or_else(|| panic!("{id} missing from {response:?}"))
+        };
+        let seconds = |seconds| Some(prost_types::Timestamp { seconds, nanos: 0 });
+        let older_info = info(&older);
+        assert_eq!(
+            older_info.current_local_artifact_id,
+            Some(pin_of[&older].to_string()),
+            "the pin is still reported, so the drain refuses rather than minting"
+        );
+        assert_eq!(older_info.state_changed_at, seconds(1_700_000_050));
+        assert_eq!(older_info.current_local_artifact_created_at, None);
+        let current_info = info(&current);
+        assert_eq!(
+            current_info.current_local_artifact_created_at,
+            seconds(1_700_000_060)
+        );
+        service.shutdown_token.cancel();
+        service.task_tracker.close();
+        service.task_tracker.wait().await;
+    }
+
+    /// The node publishes when its pinned artifact was captured, beside the
+    /// time the row entered its state, both in the node's own epoch seconds,
+    /// including a capture in the stop's own second. A pin whose catalog row is
+    /// missing is still reported as a pin, with no capture time, and so is one
+    /// whose stored time can't be read and one an older node recorded, which
+    /// isn't marked comparable; an unpinned sandbox reports neither, even when
+    /// it owns an artifact.
+    #[tokio::test]
+    async fn sandbox_state_publishes_the_pinned_artifact_capture_time() {
+        let conn = crate::db::test_conn();
+        let captured = SandboxId::new().to_string();
+        let tied = SandboxId::new().to_string();
+        let dangling = SandboxId::new().to_string();
+        let unreadable = SandboxId::new().to_string();
+        let legacy = SandboxId::new().to_string();
+        let unpinned = SandboxId::new().to_string();
+        for id in [&captured, &tied, &dangling, &unreadable, &legacy, &unpinned] {
+            insert_test_sandbox(&conn, id, SandboxState::Stopped);
+            set_test_state_changed_at(&conn, id, "1700000050");
+        }
+        let mut artifact_for = std::collections::HashMap::new();
+        for (id, created_at, comparable) in [
+            (&captured, "1700000100", 1),
+            (&tied, "1700000050", 1),
+            (&unreadable, "soon", 1),
+            (&legacy, "1700000100", 0),
+            (&unpinned, "1700000200", 1),
+        ] {
+            let artifact = LocalArtifactId::new();
+            conn.execute(
+                "INSERT INTO local_artifacts (
+                     local_artifact_id, sandbox_id, artifact_kind, artifact_origin,
+                     local_path, created_at, capture_time_comparable
+                 ) VALUES (?1, ?2, 'disk', 'stop', '/cache/artifact', ?3, ?4)",
+                crate::db::fixture::params![artifact.to_string(), id, created_at, comparable],
+            )
+            .unwrap();
+            artifact_for.insert(id.clone(), artifact);
+        }
+        let dangling_pin = LocalArtifactId::new();
+        artifact_for.insert(dangling.clone(), dangling_pin);
+        for id in [&captured, &tied, &dangling, &unreadable, &legacy] {
+            conn.execute(
+                "UPDATE sandboxes
+                    SET current_local_artifact_id = ?1,
+                        current_local_artifact_kind = 'disk',
+                        current_local_artifact_origin = 'stop'
+                  WHERE id = ?2",
+                crate::db::fixture::params![artifact_for[id].to_string(), id],
+            )
+            .unwrap();
+        }
+        let service = service_for_teardown_test(conn);
+
+        let response = service
+            .state(internal_request(StateRequest {
+                sandbox_ids: vec![
+                    captured.clone(),
+                    tied.clone(),
+                    dangling.clone(),
+                    unreadable.clone(),
+                    legacy.clone(),
+                    unpinned.clone(),
+                ],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let info = |id: &str| {
+            response
+                .sandboxes
+                .iter()
+                .find(|info| info.sandbox_id == id)
+                .unwrap_or_else(|| panic!("{id} missing from {response:?}"))
+        };
+        let seconds = |seconds| Some(prost_types::Timestamp { seconds, nanos: 0 });
+        let captured_info = info(&captured);
+        assert_eq!(
+            captured_info.current_local_artifact_id,
+            Some(artifact_for[&captured].to_string())
+        );
+        assert_eq!(
+            captured_info.current_local_artifact_created_at,
+            seconds(1_700_000_100)
+        );
+        assert_eq!(captured_info.state_changed_at, seconds(1_700_000_050));
+        let tied_info = info(&tied);
+        assert_eq!(
+            tied_info.current_local_artifact_created_at,
+            seconds(1_700_000_050)
+        );
+        assert_eq!(tied_info.state_changed_at, seconds(1_700_000_050));
+        for id in [&dangling, &unreadable, &legacy] {
+            let info = info(id);
+            assert_eq!(
+                info.current_local_artifact_id,
+                Some(artifact_for[id].to_string())
+            );
+            assert_eq!(info.current_local_artifact_created_at, None, "{id}");
+            assert!(!info.state_degraded, "{id}");
+        }
+        let unpinned_info = info(&unpinned);
+        assert_eq!(unpinned_info.current_local_artifact_id, None);
+        assert_eq!(unpinned_info.current_local_artifact_created_at, None);
+        service.shutdown_token.cancel();
+        service.task_tracker.close();
+        service.task_tracker.wait().await;
+    }
+
     #[tokio::test]
     async fn template_manager_start_is_an_explicit_local_producer() {
         let conn = crate::db::test_conn();
@@ -15393,6 +15715,7 @@ pub(crate) mod service_tests {
                 })),
                 Some("123".to_string()),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -15429,6 +15752,7 @@ pub(crate) mod service_tests {
         let info = service
             .build_sandbox_info(
                 sandbox,
+                None,
                 None,
                 None,
                 Some(Ok(crate::db::RawQuarantineRecoveryObservation {
@@ -15473,6 +15797,7 @@ pub(crate) mod service_tests {
                 sandbox,
                 None,
                 None,
+                None,
                 Some(Ok(crate::db::RawQuarantineRecoveryObservation {
                     local_quarantine_id: "not-a-uuid".to_string(),
                     owner: Some(
@@ -15503,6 +15828,7 @@ pub(crate) mod service_tests {
         let info = service
             .build_sandbox_info(
                 sandbox,
+                None,
                 None,
                 None,
                 Some(Ok(crate::db::RawQuarantineRecoveryObservation {
