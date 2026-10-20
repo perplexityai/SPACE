@@ -68,19 +68,14 @@ table:
 ```toml
 [rules.pattern_ratchet.<instance>]
 patterns = ['\bsome_name\b']     # regexes, matched against each code line
-include = ["crates/x/src/**"]    # optional; omitted means all production files
+include = ["crates/x/src/**"]    # optional: the files checked; all when absent
 allow = ["crates/x/src/owner.rs", "crates/x/src/owner/**"]
-paths = ["crates/x/**"]          # optional: the files checked; all when absent
 
 [rules.pattern_ratchet.<instance>.no_crossing]
 mode = "advisory"
 # ...and no_new_entries, no_raised_caps, listed_no_growth and stale_entries,
 # as for file_size
 ```
-
-Only production files matching `include` are measured when it is present; an
-empty list measures none. `allow` exempts files within that scope. Existing
-instances without `include` retain their repository-wide scope.
 
 It counts mentions, not uses. A code line matches if any pattern matches
 anywhere in it, so a string literal, an error message, a log line or a
@@ -98,12 +93,12 @@ name so that longer identifiers containing it do not match. Patterns are
 case-sensitive unless they use an inline `(?i)` flag. `allow` globs match
 repository-relative paths: `*` and `?` stay within one path component and
 `**` spans any number. Files they match are never counted.
-`paths`, when given, takes globs of the same form and limits the instance to
+`include`, when given, takes globs of the same form and limits the instance to
 the production files they match, for a name that other crates use for their
 own purposes; files outside them are never counted, and an entry for one is
-stale. An empty `paths` would check nothing and exits 2; omit it to check
-every production file. An empty `allow` is fine. An instance may give both
-`include` and `paths`; it then checks only the files that match both.
+stale. `allow` still exempts files inside that scope. An empty `include` would
+check nothing and exits 2; omit it to check every production file. An empty
+`allow` is fine.
 
 - `no_crossing`: a file outside the allowed paths and the instance's baseline
   table has a matching line;
@@ -298,7 +293,7 @@ into the server's production graph.
 Each behaviour has a `mode`: `advisory` findings are reported, `required` ones
 also fail the check, so behaviours can graduate one at a time. Unknown keys,
 sections or modes, a missing file, bad TOML, an invalid regex, glob or instance
-name, an empty `patterns`, `paths`, `packages` or `members` list, a baseline
+name, an empty `patterns`, `include`, `packages` or `members` list, a baseline
 table for an instance that is not configured, and a failing `cargo metadata`
 exit 2. So does a `--base-baseline`, `--renames` or `--base-architecture` that
 can't be read, or one combined with `--write-baseline`, and `--renames` input

@@ -4,7 +4,7 @@
 //! any of its `patterns` to the files its `allow` globs match: a file outside
 //! them with a matching line violates it, and the instance's own
 //! `[pattern_ratchet.<instance>]` baseline table caps each listed file's
-//! matching lines; [`super::ratchet`] has the behaviours. An optional `paths`
+//! matching lines; [`super::ratchet`] has the behaviours. An optional `include`
 //! list limits the instance to the files its globs match; it checks every
 //! production file without one. Instances are independent: each reads only
 //! its own configuration and tables.
@@ -43,9 +43,9 @@ impl Instance<'_> {
     /// Whether `file` is among the paths the instance checks.
     fn checks(&self, file: &ProductionFile) -> bool {
         self.config
-            .paths
+            .include
             .as_ref()
-            .is_none_or(|paths| paths.is_match(&file.path))
+            .is_none_or(|include| include.is_match(&file.path))
     }
 
     /// The instance's baseline table and where it is.
@@ -74,14 +74,7 @@ impl CountRatchet for Instance<'_> {
     /// outside the checked paths, allowed, or none do. Findings about them
     /// are shown on the first.
     fn measure(&self, file: &ProductionFile) -> Option<Count> {
-        if self
-            .config
-            .include
-            .as_ref()
-            .is_some_and(|scope| !scope.is_match(&file.path))
-            || !self.checks(file)
-            || self.config.allow.is_match(&file.path)
-        {
+        if !self.checks(file) || self.config.allow.is_match(&file.path) {
             return None;
         }
         let mut lines = code_lines(&file.text)
@@ -126,7 +119,7 @@ impl CountRatchet for Instance<'_> {
                 " has no code lines left matching the {instance} patterns outside its allowed paths"
             )
         } else {
-            format!(" is outside the paths [rules.{RULE}.{instance}] in ARCHITECTURE.toml checks")
+            format!(" is outside the paths [rules.{RULE}.{instance}] in ARCHITECTURE.toml includes")
         }
     }
 

@@ -86,7 +86,7 @@ fn node_manager_commands_reject_direct_spawns_without_restricting_other_services
 }
 
 /// Repository-relative path of the one crate the `sbxmgr_sqlite` workspace
-/// below has: inside the instance's `paths`, outside its `allow`.
+/// below has: inside the instance's `include`, outside its `allow`.
 const SBXMGR_SRC: &str = "crates/libs/sbx/mgr/server/src";
 
 /// The database migrator's sources, outside `sbxmgr_sqlite_schema`'s `allow`.

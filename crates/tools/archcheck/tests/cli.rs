@@ -1904,10 +1904,45 @@ fn crate_names_rdjson_and_exit_codes() {
     assert_eq!(document["diagnostics"][0]["severity"], "WARNING");
 }
 
-/// `paths` limits an instance to the files it matches: others are neither
-/// counted nor kept in its table, and `allow` still applies inside them.
+/// `include` limits an instance to the files it matches, and an instance
+/// without it checks every production file: others are neither counted nor
+/// kept in its table, and `allow` still applies inside the scope. An empty
+/// `include` would check nothing, so it is rejected.
 #[test]
-fn pattern_ratchet_paths() {
+fn pattern_ratchet_include_scopes_measurement_without_changing_default() {
+    for (include, expected) in [
+        (None, vec!["crates/a/src/lib.rs", "crates/b/src/lib.rs"]),
+        (Some("['crates/a/src/**']"), vec!["crates/a/src/lib.rs"]),
+    ] {
+        let mut rule = ratchet(
+            "scoped",
+            &[r"\bold_table\b"],
+            &["crates/a/src/owner.rs"],
+            REQUIRED,
+        );
+        if let Some(include) = include {
+            rule = rule.replace("patterns =", &format!("include = {include}\npatterns ="));
+        }
+        let ws = workspace(&[
+            ("ARCHITECTURE.toml", format!("{}{rule}", config(ADVISORY))),
+            (
+                "architecture-baseline.toml",
+                ratchet_baseline(&[("scoped", &[])]),
+            ),
+            ("crates/a/src/lib.rs", "old_table\n".to_owned()),
+            ("crates/a/src/owner.rs", "old_table\n".to_owned()),
+            ("crates/a/src/tests.rs", "old_table\n".to_owned()),
+            ("crates/b/src/lib.rs", "old_table\n".to_owned()),
+        ]);
+        let ctx = Context::load(ws.path()).unwrap();
+        let paths: Vec<_> = check(&ctx)
+            .into_iter()
+            .filter(|finding| finding.code() == "pattern_ratchet.scoped.no_crossing")
+            .map(|finding| finding.path)
+            .collect();
+        assert_eq!(paths, expected, "include={include:?}");
+    }
+
     let config = format!(
         "{}{}",
         config(ADVISORY),
@@ -1920,7 +1955,7 @@ fn pattern_ratchet_paths() {
     )
     .replace(
         "allow = ['crates/a/src/allowed.rs']\n",
-        "allow = ['crates/a/src/allowed.rs']\npaths = ['crates/a/**']\n",
+        "allow = ['crates/a/src/allowed.rs']\ninclude = ['crates/a/**']\n",
     );
     type Case<'a> = (
         &'a str,
@@ -1930,31 +1965,31 @@ fn pattern_ratchet_paths() {
     );
     let cases: &[Case] = &[
         (
-            "a file inside the paths is checked",
+            "a file inside the include is checked",
             &[],
             &[("crates/a/src/x.rs", "old_table\n")],
             &[("no_crossing", "crates/a/src/x.rs: 1 code line matches")],
         ),
         (
-            "a file outside the paths is not",
+            "a file outside the include is not",
             &[],
             &[("crates/b/src/x.rs", "old_table\n")],
             &[],
         ),
         (
-            "allowed paths inside the paths may match",
+            "allowed paths inside the include may match",
             &[],
             &[("crates/a/src/allowed.rs", "old_table\n")],
             &[],
         ),
         (
-            "an entry for a file outside the paths is stale",
+            "an entry for a file outside the include is stale",
             &[("crates/b/src/x.rs", 1)],
             &[("crates/b/src/x.rs", "old_table\n")],
             &[(
                 "stale_entries",
                 "crates/b/src/x.rs is outside the paths [rules.pattern_ratchet.old] in \
-                 ARCHITECTURE.toml checks. Remove it from [pattern_ratchet.old] in \
+                 ARCHITECTURE.toml includes. Remove it from [pattern_ratchet.old] in \
                  architecture-baseline.toml.",
             )],
         ),
@@ -1984,7 +2019,7 @@ fn pattern_ratchet_paths() {
         }
     }
 
-    // An empty `paths` would check nothing, so it is rejected; an empty
+    // An empty `include` would check nothing, so it is rejected; an empty
     // `allow` is still legal.
     let no_allow = config.replace("allow = ['crates/a/src/allowed.rs']", "allow = []");
     let baseline = ratchet_baseline(&[("old", &[])]);
@@ -1996,15 +2031,15 @@ fn pattern_ratchet_paths() {
     let ws = workspace(&[
         (
             "ARCHITECTURE.toml",
-            no_allow.replace("paths = ['crates/a/**']", "paths = []"),
+            no_allow.replace("include = ['crates/a/**']", "include = []"),
         ),
         ("architecture-baseline.toml", baseline),
     ]);
-    let error = Context::load(ws.path()).expect_err("an empty paths list is rejected");
+    let error = Context::load(ws.path()).expect_err("an empty include list is rejected");
     assert!(
-        error
-            .to_string()
-            .contains("paths must list at least one glob; omit it to check every production file"),
+        error.to_string().contains(
+            "include must list at least one glob; omit it to check every production file"
+        ),
         "{error}"
     );
 }
@@ -4874,42 +4909,5 @@ fn pattern_ratchet_errors_point_at_the_line() {
             "{key}: {error}"
         );
         assert!(error.contains(problem), "{key}: {error}");
-    }
-}
-
-#[test]
-fn pattern_ratchet_include_scopes_measurement_without_changing_default() {
-    for (include, expected) in [
-        (None, vec!["crates/a/src/lib.rs", "crates/b/src/lib.rs"]),
-        (Some("['crates/a/src/**']"), vec!["crates/a/src/lib.rs"]),
-        (Some("[]"), vec![]),
-    ] {
-        let mut rule = ratchet(
-            "scoped",
-            &[r"\bold_table\b"],
-            &["crates/a/src/owner.rs"],
-            REQUIRED,
-        );
-        if let Some(include) = include {
-            rule = rule.replace("patterns =", &format!("include = {include}\npatterns ="));
-        }
-        let ws = workspace(&[
-            ("ARCHITECTURE.toml", format!("{}{rule}", config(ADVISORY))),
-            (
-                "architecture-baseline.toml",
-                ratchet_baseline(&[("scoped", &[])]),
-            ),
-            ("crates/a/src/lib.rs", "old_table\n".to_owned()),
-            ("crates/a/src/owner.rs", "old_table\n".to_owned()),
-            ("crates/a/src/tests.rs", "old_table\n".to_owned()),
-            ("crates/b/src/lib.rs", "old_table\n".to_owned()),
-        ]);
-        let ctx = Context::load(ws.path()).unwrap();
-        let paths: Vec<_> = check(&ctx)
-            .into_iter()
-            .filter(|finding| finding.code() == "pattern_ratchet.scoped.no_crossing")
-            .map(|finding| finding.path)
-            .collect();
-        assert_eq!(paths, expected, "include={include:?}");
     }
 }

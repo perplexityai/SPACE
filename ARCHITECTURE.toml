@@ -264,8 +264,9 @@ mode = "required"
 # earlier escape it. Its `sql::sqlite` pattern predates the shared helpers'
 # move into `pplx-space-sqlite` and matches nothing now; the fence and the
 # graph assertion cover them. Other services' crates use rusqlite for their own databases, so
-# `paths` limits the rule to sbx-mgr's.
+# `include` limits the rule to sbx-mgr's.
 [rules.pattern_ratchet.sbxmgr_sqlite]
+include = ["crates/libs/sbx/mgr/**", "crates/apps/sbx/**"]
 patterns = [
   '\brusqlite\s*::',
   '\buse\s+(?:::\s*)?rusqlite\b',
@@ -280,7 +281,6 @@ patterns = [
   '"\s*(?:SELECT\b|INSERT\s+(?:OR\s+[A-Z]+\s+)?INTO\b|REPLACE\s+INTO\b|UPDATE\s+(?:OR\s+[A-Z]+\s+)?\w+(?:\s+SET\b|\s*$)|DELETE\s+FROM\b|(?:CREATE|DROP|ALTER)\s+(?:TEMP\s+|TEMPORARY\s+|UNIQUE\s+)?(?:TABLE|INDEX|TRIGGER|VIEW)\b|PRAGMA\s+\w|WITH\s+(?:RECURSIVE\s+)?\w+\s+AS\b|(?:BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE|VACUUM)\b[\w\s]*;?\s*")',
   '^\s*(?:SELECT\s|INSERT\s+(?:OR\s+[A-Z]+\s+)?INTO\s|UPDATE\s+(?:OR\s+[A-Z]+\s+)?\w+(?:\s+SET\s|\s*$)|DELETE\s+FROM\s|WITH\s+(?:RECURSIVE\s+)?\w+\s+AS\b)',
 ]
-paths = ["crates/libs/sbx/mgr/**", "crates/apps/sbx/**"]
 allow = ["crates/libs/sbx/mgr/store/src/**"]
 
 [rules.pattern_ratchet.sbxmgr_sqlite.no_crossing]

@@ -60,15 +60,12 @@ pub struct FileSizeConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PatternRatchetConfig {
-    /// Optional repository-relative scope; absent means all production files.
-    #[serde(default)]
-    pub include: Option<PathGlobs>,
-    /// A code line matching any of these regexes is restricted.
-    pub patterns: Patterns,
     /// Repository-relative path globs of the files the instance checks;
     /// every production file when absent.
     #[serde(default)]
-    pub paths: Option<CheckedPaths>,
+    pub include: Option<IncludeGlobs>,
+    /// A code line matching any of these regexes is restricted.
+    pub patterns: Patterns,
     /// Repository-relative path globs whose files may match freely.
     pub allow: PathGlobs,
     pub no_crossing: BehaviourConfig,
@@ -292,32 +289,32 @@ impl TryFrom<Vec<String>> for PathGlobs {
     }
 }
 
-/// An instance's `paths`: [`PathGlobs`] with at least one glob, since an
+/// An instance's `include`: [`PathGlobs`] with at least one glob, since an
 /// empty list would check nothing.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(try_from = "Vec<String>")]
-pub struct CheckedPaths(PathGlobs);
+pub struct IncludeGlobs(PathGlobs);
 
 #[derive(Debug, Error)]
-pub enum CheckedPathsError {
-    #[error("paths must list at least one glob; omit it to check every production file")]
+pub enum IncludeGlobsError {
+    #[error("include must list at least one glob; omit it to check every production file")]
     Empty,
     #[error(transparent)]
     Glob(#[from] globset::Error),
 }
 
-impl CheckedPaths {
+impl IncludeGlobs {
     pub fn is_match(&self, path: &str) -> bool {
         self.0.is_match(path)
     }
 }
 
-impl TryFrom<Vec<String>> for CheckedPaths {
-    type Error = CheckedPathsError;
+impl TryFrom<Vec<String>> for IncludeGlobs {
+    type Error = IncludeGlobsError;
 
     fn try_from(globs: Vec<String>) -> Result<Self, Self::Error> {
         if globs.is_empty() {
-            return Err(CheckedPathsError::Empty);
+            return Err(IncludeGlobsError::Empty);
         }
         Ok(Self(PathGlobs::try_from(globs)?))
     }
