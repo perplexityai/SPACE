@@ -777,15 +777,18 @@ async fn readiness_transport_failures_recover_within_the_original_deadline() {
                 if cached {
                     client.wait_ready(Duration::from_secs(1)).await.unwrap();
                 }
-                // Persistent failures outlast the 100ms readiness budget at the
-                // coordinator's existing retry cadence.
+                // Persistent failures outlast the readiness budget: the
+                // coordinator sleeps at least 5ms between attempts, so 1000
+                // errors take over 5s to drain. The budget leaves room for
+                // several reconnecting probes on a loaded runner; the retry
+                // assertion below must not depend on runner speed.
                 errors
                     .lock()
                     .unwrap()
-                    .extend(std::iter::repeat_n(code, if recovers { 1 } else { 100 }));
+                    .extend(std::iter::repeat_n(code, if recovers { 1 } else { 1000 }));
                 let result = tokio::time::timeout(
                     Duration::from_secs(2),
-                    client.wait_ready(Duration::from_millis(100)),
+                    client.wait_ready(Duration::from_millis(500)),
                 )
                 .await
                 .expect("readiness exceeded its bounded wait");
@@ -797,7 +800,11 @@ async fn readiness_transport_failures_recover_within_the_original_deadline() {
                 } else {
                     assert_eq!(result.unwrap_err().code(), tonic::Code::DeadlineExceeded);
                 }
-                assert!(calls.load(Ordering::SeqCst) >= 2);
+                let calls = calls.load(Ordering::SeqCst);
+                assert!(
+                    calls >= 2,
+                    "cached={cached}, code={code:?}, recovers={recovers}: {calls} guest probes"
+                );
             }
         }
     }
