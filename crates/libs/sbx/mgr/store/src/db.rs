@@ -160,7 +160,7 @@ pub enum CleanupCompletion {
 }
 
 impl CleanupCompletion {
-    pub fn as_str(self) -> &'static str {
+    fn as_str(self) -> &'static str {
         match self {
             Self::MarkCreated => "mark_created",
             Self::MarkStopped => "mark_stopped",
@@ -176,7 +176,7 @@ impl CleanupCompletion {
         matches!(self, Self::DeleteRow | Self::DeletePoolClone)
     }
 
-    pub const fn target_state(self) -> Option<SandboxState> {
+    const fn target_state(self) -> Option<SandboxState> {
         match self {
             Self::MarkCreated => Some(SandboxState::Created),
             Self::MarkStopped => Some(SandboxState::Stopped),
@@ -186,7 +186,7 @@ impl CleanupCompletion {
         }
     }
 
-    pub const fn transition_target(self) -> Option<SandboxTransitionTargetState> {
+    const fn transition_target(self) -> Option<SandboxTransitionTargetState> {
         match self {
             Self::MarkCreated => Some(SandboxTransitionTargetState::Created),
             Self::MarkStopped => Some(SandboxTransitionTargetState::Stopped),
@@ -664,6 +664,8 @@ pub mod fixture {
     clippy::panic
 )]
 pub mod test_fixtures;
+#[cfg(any(test, feature = "test-support"))]
+pub use test_fixtures::{begin_activation, complete_cleanup_episode, quarantine_cleanup_episode};
 
 #[cfg(test)]
 pub(crate) mod tests;

@@ -57,7 +57,7 @@ pub enum SandboxStatePublicationMetadataField {
 }
 
 impl SandboxStatePublicationMetadataField {
-    pub const fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::QuarantineReasonCode => "quarantine_reason_code",
             Self::TransitionReceiptId => "transition_receipt_id",
@@ -531,6 +531,7 @@ pub fn mark_quarantined(
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub fn current_quarantine_reason_wire_value(conn: &Connection, id: &str) -> Result<Option<String>> {
     let raw = conn
         .query_row(

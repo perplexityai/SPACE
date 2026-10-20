@@ -4,6 +4,45 @@ use super::*;
 
 pub mod state_write_fixtures;
 
+/// [`complete_cleanup_episode_for_job`] outside a cleanup job.
+pub fn complete_cleanup_episode(
+    conn: &Connection,
+    sandbox_id: &str,
+    cleanup_id: SandboxCleanupEpisodeId,
+) -> std::result::Result<Option<()>, CompleteCleanupEpisodeError> {
+    complete_cleanup_episode_for_job(conn, sandbox_id, cleanup_id, None)
+}
+
+/// [`quarantine_cleanup_episode_for_job`] outside a cleanup job.
+pub fn quarantine_cleanup_episode(
+    conn: &Connection,
+    sandbox_id: &str,
+    cleanup_id: SandboxCleanupEpisodeId,
+    unsafe_evidence: &str,
+) -> std::result::Result<bool, MarkQuarantinedError> {
+    quarantine_cleanup_episode_for_job(conn, sandbox_id, cleanup_id, unsafe_evidence, None)
+}
+
+/// [`begin_activation_with_route_evidence`] with no route evidence.
+pub fn begin_activation(
+    conn: &Connection,
+    id: &str,
+    expected_state: SandboxState,
+    kind: ActivationKind,
+    execution_generation: Option<ExecutionGeneration>,
+    activation_attempt_id: Option<SandboxActivationAttemptId>,
+) -> std::result::Result<Option<CleanupEpisode>, BeginActivationError> {
+    begin_activation_with_route_evidence(
+        conn,
+        id,
+        expected_state,
+        kind,
+        execution_generation,
+        activation_attempt_id,
+        ActivationRouteAdmission::default(),
+    )
+}
+
 /// Build a quarantine-recovery episode for the loop's mechanics to act on.
 ///
 /// For any reason other than `orphaned_sandbox_row_missing` this both names a

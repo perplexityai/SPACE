@@ -48,7 +48,7 @@ impl Default for ArtifactScan {
     }
 }
 
-pub const PAGE_SQL: &str = sql!(
+const PAGE_SQL: &str = sql!(
     "SELECT a.rowid, a.local_artifact_id, a.sandbox_id,
             a.artifact_origin, a.artifact_kind, a.local_path,
             a.created_at, COALESCE(a.last_touched_at, a.created_at),

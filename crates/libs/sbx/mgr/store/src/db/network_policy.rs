@@ -15,7 +15,7 @@ pub enum NetworkPolicyAppliedSource {
 }
 
 impl NetworkPolicyAppliedSource {
-    pub fn as_str(self) -> &'static str {
+    fn as_str(self) -> &'static str {
         match self {
             Self::Unknown => "",
             Self::Template => "template",
@@ -23,7 +23,7 @@ impl NetworkPolicyAppliedSource {
         }
     }
 
-    pub fn parse(value: &str) -> Self {
+    pub(super) fn parse(value: &str) -> Self {
         value.parse().unwrap_or(Self::Unknown)
     }
 

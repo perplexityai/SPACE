@@ -97,7 +97,7 @@ pub enum CleanupEpisodeRequestOutcome {
 }
 
 impl CleanupEpisodeRequestOutcome {
-    pub const fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::Requested => "requested",
             Self::AlreadyRequested => "already_requested",
@@ -986,14 +986,6 @@ fn retire_quarantine_recovery(
 /// Runtime cleanup happens before this call. The episode id prevents an old
 /// worker from completing a newer activation, while the transaction prevents
 /// a crash from leaving a healthy row blocked by a requested episode.
-pub fn complete_cleanup_episode(
-    conn: &Connection,
-    sandbox_id: &str,
-    cleanup_id: SandboxCleanupEpisodeId,
-) -> std::result::Result<Option<()>, CompleteCleanupEpisodeError> {
-    complete_cleanup_episode_for_job(conn, sandbox_id, cleanup_id, None)
-}
-
 pub fn complete_cleanup_episode_for_job(
     conn: &Connection,
     sandbox_id: &str,
@@ -1119,7 +1111,8 @@ pub fn sandbox_erase_safety(
 
 /// Complete cleanup owned by lifecycle intent stored directly on the sandbox
 /// row. Routine stop, delete, kill, suspend, and startup recovery use this
-/// path; activation compensation uses [`complete_cleanup_episode`] instead.
+/// path; activation compensation uses [`complete_cleanup_episode_for_job`]
+/// instead.
 #[derive(Debug, thiserror::Error)]
 pub enum CompleteRowIntentCleanupError {
     #[error("row-deleting cleanup cannot complete as a resident state")]
@@ -1426,15 +1419,6 @@ pub fn complete_row_intent_cleanup_for_job(
     } else {
         CompleteRowIntentCleanupDisposition::Applied
     })
-}
-
-pub fn quarantine_cleanup_episode(
-    conn: &Connection,
-    sandbox_id: &str,
-    cleanup_id: SandboxCleanupEpisodeId,
-    unsafe_evidence: &str,
-) -> std::result::Result<bool, MarkQuarantinedError> {
-    quarantine_cleanup_episode_for_job(conn, sandbox_id, cleanup_id, unsafe_evidence, None)
 }
 
 pub fn quarantine_cleanup_episode_for_job(

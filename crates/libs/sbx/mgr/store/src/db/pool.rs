@@ -104,21 +104,6 @@ pub fn claim_pool_sandbox(
     Ok(Some(donor))
 }
 
-/// Count pool sandboxes: (available=Paused, pending=Creating|Starting|Pausing).
-pub fn count_pool_sandboxes(conn: &Connection, template: &str) -> Result<(u32, u32)> {
-    let available: u32 = conn.query_row(
-        "SELECT COUNT(*) FROM sandboxes WHERE pool_template = ?1 AND state = 'paused'",
-        params![template],
-        |row| row.get(0),
-    )?;
-    let pending: u32 = conn.query_row(
-        "SELECT COUNT(*) FROM sandboxes WHERE pool_template = ?1 AND state IN ('creating', 'created', 'starting', 'pausing')",
-        params![template],
-        |row| row.get(0),
-    )?;
-    Ok((available, pending))
-}
-
 /// Set or clear the pool_template field on a sandbox.
 pub fn set_pool_template(conn: &Connection, id: &str, pool_template: Option<&str>) -> Result<()> {
     conn.execute(

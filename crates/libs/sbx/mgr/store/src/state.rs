@@ -36,7 +36,7 @@ impl SandboxState {
         )
     }
 
-    pub fn can_transition_to(&self, target: SandboxState) -> bool {
+    pub(crate) fn can_transition_to(&self, target: SandboxState) -> bool {
         if target == SandboxState::Quarantined {
             return *self != SandboxState::Failed;
         }
@@ -217,7 +217,7 @@ impl SandboxState {
         }
     }
 
-    /// A not-yet-[`guest_bridge_reachable`] state that still precedes the
+    /// A not-yet-[`Self::guest_bridge_reachable`] state that still precedes the
     /// sandbox's first running state, so it progresses toward reachability
     /// (`Started`) through its own create/start lifecycle — no separate,
     /// cluster-driven wake is required. Only the pre-run states qualify:

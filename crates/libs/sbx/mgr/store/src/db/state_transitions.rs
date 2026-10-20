@@ -9,7 +9,7 @@ pub enum ActivationKind {
 }
 
 impl ActivationKind {
-    pub const fn activation_state(self) -> SandboxState {
+    pub(super) const fn activation_state(self) -> SandboxState {
         match self {
             Self::ColdStart => SandboxState::Starting,
             Self::Restore => SandboxState::Restoring,
@@ -201,29 +201,6 @@ pub fn mark_deleting_superseding_activation(
     update_state_superseding_activation(conn, id, SandboxState::Deleting)
 }
 
-/// Claim the caller-observed sandbox state for activation.
-///
-/// A false result means the row was removed or another state transition won;
-/// the caller must not allocate or launch runtime resources.
-pub fn begin_activation(
-    conn: &Connection,
-    id: &str,
-    expected_state: SandboxState,
-    kind: ActivationKind,
-    execution_generation: Option<ExecutionGeneration>,
-    activation_attempt_id: Option<SandboxActivationAttemptId>,
-) -> std::result::Result<Option<CleanupEpisode>, BeginActivationError> {
-    begin_activation_with_route_evidence(
-        conn,
-        id,
-        expected_state,
-        kind,
-        execution_generation,
-        activation_attempt_id,
-        ActivationRouteAdmission::default(),
-    )
-}
-
 #[derive(Default)]
 pub struct ActivationRouteAdmission<'a> {
     pub auto_lifecycle: Option<&'a AutoLifecyclePolicy>,
@@ -232,6 +209,10 @@ pub struct ActivationRouteAdmission<'a> {
     pub open_claim: Option<&'a route_activation_claims::OpenRouteActivationClaim>,
 }
 
+/// Claim the caller-observed sandbox state for activation.
+///
+/// A false result means the row was removed or another state transition won;
+/// the caller must not allocate or launch runtime resources.
 pub fn begin_activation_with_route_evidence(
     conn: &Connection,
     id: &str,

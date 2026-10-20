@@ -34,7 +34,7 @@ pub enum TeardownSuspendOperationStatus {
 }
 
 impl TeardownSuspendOperationStatus {
-    pub const fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
             Self::Running => "running",
@@ -85,7 +85,7 @@ pub struct TeardownSuspendStatus {
 }
 
 impl TeardownSuspendStatus {
-    pub fn is_ready(&self) -> bool {
+    fn is_ready(&self) -> bool {
         self.state == SandboxState::Suspended && self.artifact.is_some() && self.backup_completed
     }
 
@@ -226,6 +226,7 @@ pub(super) fn emit_teardown_suspend_lease_claim(
     );
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub fn claim_teardown_suspend_operation(
     conn: &Connection,
     id: &str,

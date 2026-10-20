@@ -12,9 +12,10 @@ workspace = true
 
 [features]
 default = []
-# Exposes the raw connection and the SQL fixtures (test connections, schema
-# images, `db::fixture`) to sbx-mgr's test suites, which enable it as a
-# dev-dependency. Unit tests in this crate get them under `cfg(test)`.
+# Exposes the raw connection, the SQL fixtures (test connections, schema
+# images, `db::fixture`) and the store functions only tests call to sbx-mgr's
+# test suites, which enable it as a dev-dependency. Unit tests in this crate
+# get them under `cfg(test)`.
 # `serialize` provides `sqlite3_serialize`, which the test-schema helpers use
 # to migrate once per test process and stamp the resulting image into each
 # fixture database instead of replaying every migration per connection.

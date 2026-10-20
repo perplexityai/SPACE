@@ -3,7 +3,7 @@
 //! compares against the caller's expected states. Every other writer of the
 //! column is a named specialized writer in `src/db`.
 //!
-//! `SandboxState::can_transition_to` is the RPC-admission machine. [`EDGES`]
+//! `SandboxState::can_transition_to` is the RPC-admission machine. `EDGES`
 //! is a separate inventory of the transitions the database writers implement:
 //! one entry per writer purpose, naming the writer functions and their
 //! callers. Constructors are private, and `update_state_from` takes a
@@ -28,8 +28,8 @@ use super::*;
 pub struct StateSet(u32);
 
 impl StateSet {
-    pub const EMPTY: Self = Self(0);
-    pub const ALL: Self = Self((1 << 18) - 1);
+    pub(super) const EMPTY: Self = Self(0);
+    pub(super) const ALL: Self = Self((1 << 18) - 1);
 
     pub const fn of(states: &[SandboxState]) -> Self {
         let mut set = Self::EMPTY;
@@ -41,11 +41,11 @@ impl StateSet {
         set
     }
 
-    pub const fn with(self, state: SandboxState) -> Self {
+    const fn with(self, state: SandboxState) -> Self {
         Self(self.0 | bit(state))
     }
 
-    pub const fn without(self, state: SandboxState) -> Self {
+    pub(super) const fn without(self, state: SandboxState) -> Self {
         Self(self.0 & !bit(state))
     }
 
@@ -53,12 +53,12 @@ impl StateSet {
         self.0 & bit(state) != 0
     }
 
-    pub const fn is_empty(self) -> bool {
+    pub(super) const fn is_empty(self) -> bool {
         self.0 == 0
     }
 
     /// The members in `SandboxState::all()` order.
-    pub fn iter(self) -> impl Iterator<Item = SandboxState> {
+    fn iter(self) -> impl Iterator<Item = SandboxState> {
         SandboxState::all()
             .into_iter()
             .filter(move |state| self.contains(*state))
@@ -122,7 +122,7 @@ pub struct Edge {
 }
 
 impl Edge {
-    pub const fn name(&self) -> &'static str {
+    pub(super) const fn name(&self) -> &'static str {
         self.name
     }
 
@@ -164,6 +164,7 @@ macro_rules! edge_table {
             )+
 
             /// Every persisted edge, in declaration order.
+            #[cfg(test)]
             pub const EDGES: &[Edge] = &[$($name),+];
         }
     };
@@ -430,6 +431,7 @@ edge_table! {
     ORPHAN_RESTORE_INSERT: Recovery, INSERT => Restoring;
 }
 
+#[cfg(test)]
 pub use edges::EDGES;
 
 /// A generic guard that refused a write.

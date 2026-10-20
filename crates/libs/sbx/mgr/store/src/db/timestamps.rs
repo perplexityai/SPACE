@@ -36,7 +36,7 @@ impl EpochSeconds {
         Self::column_result(ValueRef::from(value))
     }
 
-    pub fn get(self) -> i64 {
+    pub(super) fn get(self) -> i64 {
         self.0
     }
 

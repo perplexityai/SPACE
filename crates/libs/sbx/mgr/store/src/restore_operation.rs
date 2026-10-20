@@ -16,7 +16,7 @@ pub enum RestoreOrigin {
 }
 
 impl RestoreOrigin {
-    pub const fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::Local => "local",
             Self::Remote => "remote",
@@ -54,7 +54,7 @@ pub enum RestorePhase {
 }
 
 impl RestorePhase {
-    pub const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::MetadataStaging => "metadata_staging",
             Self::ArtifactStaging => "artifact_staging",
@@ -62,7 +62,7 @@ impl RestorePhase {
         }
     }
 
-    pub const fn is_remote_staging(self) -> bool {
+    const fn is_remote_staging(self) -> bool {
         matches!(self, Self::MetadataStaging | Self::ArtifactStaging)
     }
 }
@@ -115,11 +115,11 @@ impl RemoteRestoreOperation {
         }
     }
 
-    pub const fn phase(&self) -> RestorePhase {
+    pub(crate) const fn phase(&self) -> RestorePhase {
         self.phase
     }
 
-    pub const fn source(&self) -> &ExactStorageUri {
+    pub(crate) const fn source(&self) -> &ExactStorageUri {
         &self.source
     }
 }
@@ -128,7 +128,7 @@ impl RemoteRestoreOperation {
 #[error(
     "restore origin {origin:?}, phase {phase:?}, and storage source presence {has_source} form an invalid operation"
 )]
-pub struct RestoreOperationShapeError {
+pub(crate) struct RestoreOperationShapeError {
     origin: Option<RestoreOrigin>,
     phase: Option<RestorePhase>,
     has_source: bool,
@@ -170,7 +170,8 @@ impl RestoreOperation {
         }
     }
 
-    pub const fn local_activation() -> Self {
+    #[cfg(test)]
+    pub(crate) const fn local_activation() -> Self {
         Self::LocalActivation
     }
 
@@ -181,6 +182,7 @@ impl RestoreOperation {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn phase(&self) -> RestorePhase {
         match self {
             Self::LocalActivation => RestorePhase::Activation,

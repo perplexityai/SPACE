@@ -422,12 +422,12 @@ pub fn insert_recovered_suspended_sandbox_in_transaction(
     Ok(())
 }
 
-/// Adopts or inserts a restore's sandbox row in a transaction of its own.
-///
-/// Callers already inside a transaction — the quarantine-recovery paths, which
-/// have to commit the row and its claim together — use
-/// `restore_adopt_orphan_or_insert_sandbox_in_transaction` directly.
-pub fn restore_adopt_orphan_or_insert_sandbox(
+/// The store tests' convenience for
+/// `restore_adopt_orphan_or_insert_sandbox_in_transaction`: it opens and
+/// commits a transaction of its own. Both production callers already hold a
+/// transaction and call the `_in_transaction` form directly.
+#[cfg(test)]
+pub(super) fn restore_adopt_orphan_or_insert_sandbox(
     conn: &Connection,
     params: InsertSandboxParams<'_>,
     restore_operation: &RemoteRestoreOperation,
@@ -1318,12 +1318,6 @@ pub fn periodic_lifecycle_recovery_batch(
     Ok(candidates)
 }
 
-pub fn list_sandbox_id_states(conn: &Connection) -> Result<Vec<(String, String)>> {
-    let mut statement = conn.prepare("SELECT id, state FROM sandboxes ORDER BY created_at")?;
-    let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
-}
-
 /// Host-control net-gateway auth lookup: rows whose registered
 /// `(netgtw_pid, uid)` matches the caller's peer credentials.
 ///
@@ -1376,16 +1370,7 @@ pub fn list_by_spaced_host_pid_uid(
         .collect()
 }
 
-pub fn list_by_state(conn: &Connection, state: SandboxState) -> Result<Vec<SandboxRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, uuid8, state, template, template_hash, user, runtime, uid, slot, guest_cid, pid,
-         spaced_host_pid, netgtw_pid, vsock_uds_path, api_socket_path, created_at, updated_at, snapshots_enabled, rootfs_size_mb, pool_template, guest_uptime_secs, process_env_json, auto_lifecycle_json, auto_lifecycle_state_json, next_auto_event_at, failure_reason, cleanup_completion, cleanup_keep_filesystem, network_policy_override_json, network_tx_bytes, network_rx_bytes, network_policy_generation, applied_network_policy_generation, applied_network_policy_source, network_policy_authority, auto_lifecycle_authority, current_local_artifact_id, current_local_artifact_kind, current_local_artifact_origin, execution_metadata_json, volume_encryption, space_api_route_generation, space_api_route_node_id, space_api_route_execution_generation, space_api_route_pod_uid, restore_origin, restore_phase, restore_storage_uri, space_api_route_substrate_kind, space_api_route_activation_attempt_id, spaced_endpoint_proof_json, disk_io_max_operations_per_sec, disk_io_max_bandwidth_mib_per_sec, node_execution_id
-         FROM sandboxes WHERE state = ?1",
-    )?;
-    let rows = stmt.query_map(params![state.as_str()], row_to_sandbox)?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
-}
-
+#[cfg(any(test, feature = "test-support"))]
 pub fn delete_sandbox(conn: &Connection, id: &str) -> Result<()> {
     let tx = immediate_transaction(conn)?;
     delete_sandbox_child_rows(&tx, id)?;
@@ -1508,13 +1493,13 @@ pub fn sandbox_has_runtime_fields(row: &SandboxRow) -> bool {
         || row.api_socket_path.is_some()
 }
 
-pub fn sandbox_has_full_suspend_artifact_pin(row: &SandboxRow) -> bool {
+pub(super) fn sandbox_has_full_suspend_artifact_pin(row: &SandboxRow) -> bool {
     row.current_local_artifact_id.is_some()
         && row.current_local_artifact_kind == Some(ArtifactKind::Full)
         && row.current_local_artifact_origin == Some(ArtifactOrigin::Suspend)
 }
 
-pub fn sandbox_has_registered_full_suspend_artifact(
+pub(super) fn sandbox_has_registered_full_suspend_artifact(
     conn: &Connection,
     row: &SandboxRow,
 ) -> Result<bool> {

@@ -8,10 +8,11 @@ use std::sync::{Arc, LockResult, Mutex, MutexGuard, PoisonError};
 
 use ref_cast::{RefCastCustom, ref_cast_custom};
 
-/// A method that returns or takes rusqlite values: public with the
-/// `test-support` feature, for sbx-mgr's fixtures and tripwires outside the
-/// store, and private to `db` otherwise, so production code outside the
-/// store cannot reach a raw connection, statement or error.
+/// A method that returns or takes rusqlite values, or that only `db` calls in
+/// production: public with the `test-support` feature, for sbx-mgr's fixtures
+/// and tripwires outside the store, and private to `db` otherwise, so
+/// production code outside the store cannot reach a raw connection, statement
+/// or error, or a method only tests need.
 macro_rules! db_private_outside_tests {
     ($(#[$attr:meta])* fn $name:ident $($rest:tt)*) => {
         $(#[$attr])*
@@ -52,9 +53,11 @@ impl Error {
         ))
     }
 
-    /// The statement matched no row.
-    pub fn no_rows() -> Self {
-        Self(rusqlite::Error::QueryReturnedNoRows)
+    db_private_outside_tests! {
+        /// The statement matched no row.
+        fn no_rows() -> Self {
+            Self(rusqlite::Error::QueryReturnedNoRows)
+        }
     }
 
     /// A lock protecting store state was poisoned; `message` says which.
@@ -223,8 +226,10 @@ impl Connection {
         }
     }
 
-    pub fn is_autocommit(&self) -> bool {
-        self.0.is_autocommit()
+    db_private_outside_tests! {
+        fn is_autocommit(&self) -> bool {
+            self.0.is_autocommit()
+        }
     }
 }
 
@@ -250,7 +255,7 @@ impl<'c> Transaction<'c> {
         Ok(self.0.commit()?)
     }
 
-    pub fn rollback(self) -> Result<()> {
+    pub(super) fn rollback(self) -> Result<()> {
         Ok(self.0.rollback()?)
     }
 }

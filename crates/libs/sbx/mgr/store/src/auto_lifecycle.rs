@@ -13,11 +13,11 @@ use tonic::Status;
 
 use pplx_space_sbx_mgr_client::proto;
 
-pub const ACCESS_IDLE_CONDITION_SET: AutoLifecycleConditionSetId =
+const ACCESS_IDLE_CONDITION_SET: AutoLifecycleConditionSetId =
     AutoLifecycleConditionSetId::AccessIdle;
-pub const COMMAND_IDLE_CONDITION_SET: AutoLifecycleConditionSetId =
+const COMMAND_IDLE_CONDITION_SET: AutoLifecycleConditionSetId =
     AutoLifecycleConditionSetId::CommandIdle;
-pub const GUEST_ACTIVITY_CONDITION_SET: AutoLifecycleConditionSetId =
+const GUEST_ACTIVITY_CONDITION_SET: AutoLifecycleConditionSetId =
     AutoLifecycleConditionSetId::GuestActivity;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -310,7 +310,9 @@ pub fn initial_runtime_state(policy: &AutoLifecyclePolicy, now: u64) -> AutoLife
 }
 
 /// Build policy state before the sandbox can accept access or commands.
-pub fn initial_disarmed_runtime_state(policy: &AutoLifecyclePolicy) -> AutoLifecycleRuntimeState {
+pub(crate) fn initial_disarmed_runtime_state(
+    policy: &AutoLifecyclePolicy,
+) -> AutoLifecycleRuntimeState {
     let mut state = AutoLifecycleRuntimeState::default();
     for (name, condition_set) in &policy.condition_sets {
         if !is_v1_runtime_condition(name, condition_set)
@@ -339,7 +341,7 @@ pub fn initial_disarmed_runtime_state(policy: &AutoLifecyclePolicy) -> AutoLifec
 }
 
 /// Arm clocks exactly once when a sandbox first becomes activity-capable.
-pub fn arm_inactivity_conditions(
+pub(crate) fn arm_inactivity_conditions(
     state: &mut AutoLifecycleRuntimeState,
     policy: &AutoLifecyclePolicy,
     now: u64,
@@ -494,14 +496,6 @@ pub fn apply_observed_access_touch(
         observed_at,
         &[AutoLifecycleActivitySource::Access],
     )
-}
-
-pub fn touch_command(
-    state: &mut AutoLifecycleRuntimeState,
-    policy: &AutoLifecyclePolicy,
-    now: u64,
-) {
-    touch_sources(state, policy, now, &[AutoLifecycleActivitySource::Command]);
 }
 
 /// Apply an externally observed command touch without moving an existing epoch backward.
@@ -663,7 +657,7 @@ pub fn mark_error(
 /// the sandbox self-heals when the cause clears (e.g. a completed
 /// node-manager rollout) without needing tenant activity, while the fast
 /// loop stays dead.
-pub const MAX_AUTO_SUSPEND_ERROR_STREAK: u32 = 10;
+const MAX_AUTO_SUSPEND_ERROR_STREAK: u32 = 10;
 const AUTO_SUSPEND_RETRY_BASE_SECS: u64 = 10;
 const AUTO_SUSPEND_RETRY_CAP_SECS: u64 = 600;
 const AUTO_SUSPEND_STREAK_STALE_SECS: u64 = 6 * 3600;
@@ -848,7 +842,7 @@ pub fn due_stage(
         .map(|(condition_set, (index, due_at, action))| (index, condition_set, action, due_at))
 }
 
-pub fn compute_next_auto_event(
+fn compute_next_auto_event(
     policy: &AutoLifecyclePolicy,
     state: &AutoLifecycleRuntimeState,
 ) -> Option<u64> {
