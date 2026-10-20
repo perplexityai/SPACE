@@ -162,8 +162,8 @@ def main() -> None:
     if args.iterations < 1 or min(args.vcpu, args.memory_mib) < 1:
         parser.error("iterations and resource limits must be positive")
     for value in (args.baseline_hash, args.candidate_hash):
-        if not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
-            parser.error("each template hash must be a canonical SHA-256 digest")
+        if not re.fullmatch(r"(?:sha256|blake3):[0-9a-f]{64}", value):
+            parser.error("each template hash must be a canonical SHA-256 or BLAKE3 digest")
     if args.baseline_template == args.candidate_template:
         parser.error(
             "use distinct template names to keep artifact and pool namespaces separate"

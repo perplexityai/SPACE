@@ -420,7 +420,10 @@ async fn main() -> anyhow::Result<()> {
             ]);
             for t in templates {
                 let content_hash = t.content_hash.as_deref().unwrap_or("");
-                let hash_display = content_hash.strip_prefix("sha256:").unwrap_or(content_hash);
+                let hash_display = content_hash
+                    .strip_prefix("sha256:")
+                    .or_else(|| content_hash.strip_prefix("blake3:"))
+                    .unwrap_or(content_hash);
                 let hash_short = hash_display.chars().take(12).collect::<String>();
                 let base_snapshot_col = format_base_snapshot(&t);
                 table.add_row(vec![

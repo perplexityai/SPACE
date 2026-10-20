@@ -12,8 +12,8 @@ use pplx_space_common_core::host::linux::paths::{
     set_template_cache_permissions as set_template_cache_permissions_io,
 };
 use pplx_space_common_core::types::{
-    AutoLifecyclePolicy, DEFAULT_BASE_SNAPSHOT_MEMORY_MIB, DEFAULT_BASE_SNAPSHOT_VCPU,
-    MIN_BASE_SNAPSHOT_MEMORY_MIB, MIN_BASE_SNAPSHOT_VCPU, RUNTIME_FIRECRACKER_ALIAS,
+    AutoLifecyclePolicy, DEFAULT_BASE_SNAPSHOT_MEMORY_MIB, DEFAULT_BASE_SNAPSHOT_VCPU, Digest,
+    HashAlg, MIN_BASE_SNAPSHOT_MEMORY_MIB, MIN_BASE_SNAPSHOT_VCPU, RUNTIME_FIRECRACKER_ALIAS,
     TEMPLATE_ROOTFS_FILE, TEMPLATE_ROOTFS_ZSTD_CODEC, TEMPLATE_ROOTFS_ZSTD_FILE,
     TEMPLATE_ROOTFS_ZSTD_LEVEL,
 };
@@ -202,7 +202,9 @@ fn lock_status<'a, T>(mutex: &'a Mutex<T>, context: &str) -> Result<MutexGuard<'
 }
 
 fn is_import_staging_dir(name: &str) -> bool {
-    name.starts_with("sha256:") && name.contains(IMPORTING_MARKER)
+    name.split_once(':')
+        .is_some_and(|(algorithm, _)| algorithm.parse::<HashAlg>().is_ok())
+        && name.contains(IMPORTING_MARKER)
 }
 
 fn is_build_staging_dir(name: &str) -> bool {
@@ -219,10 +221,8 @@ fn replaced_digest_base(name: &str) -> Option<&str> {
 }
 
 fn transient_digest_base<'a>(name: &'a str, marker: &str) -> Option<&'a str> {
-    if !name.starts_with("sha256:") {
-        return None;
-    }
     let (base, suffix) = name.split_once(marker)?;
+    base.parse::<Digest>().ok()?;
     if base.is_empty() || suffix.is_empty() {
         return None;
     }
@@ -842,18 +842,6 @@ impl Drop for RootfsZstdGenerationInflightGuard {
     }
 }
 
-async fn compute_template_file_hash(
-    path: PathBuf,
-    context: &'static str,
-) -> Result<String, Status> {
-    let display_path = path.display().to_string();
-    tokio::task::spawn_blocking(move || compute_content_hash(&display_path))
-        .await
-        .map_err(|e| Status::internal(format!("spawn_blocking: {e}")))?
-        .map(|hex| format!("sha256:{hex}"))
-        .map_err(|e| Status::internal(format!("{context} {}: {e}", path.display())))
-}
-
 async fn generate_template_compressed_rootfs(
     template_id: &str,
     content_hash: &str,
@@ -882,7 +870,8 @@ async fn generate_template_compressed_rootfs(
                 ))
             })?;
         let compressed_hash =
-            compute_template_file_hash(compressed_path, "hash compressed rootfs").await?;
+            compute_template_file_hash(compressed_path, HashAlg::Sha256, "hash compressed rootfs")
+                .await?;
         return Ok(crate::rootfs_zstd::RootfsZstdStats {
             rootfs_size,
             compressed_size,
@@ -1969,6 +1958,7 @@ impl TemplateManagerService {
         } else {
             let hash = compute_template_file_hash(
                 compressed_rootfs_path.clone(),
+                HashAlg::Sha256,
                 "hash compressed rootfs",
             )
             .await?;
@@ -2051,8 +2041,12 @@ impl TemplateManagerService {
             ))
         })?;
         if rootfs_hash_verification == RootfsHashVerification::Verify {
-            let observed_hash =
-                compute_template_file_hash(rootfs_path.clone(), "hash digest rootfs").await?;
+            let observed_hash = compute_template_file_hash(
+                rootfs_path.clone(),
+                content_hash_algorithm(content_hash)?,
+                "hash digest rootfs",
+            )
+            .await?;
             if observed_hash != content_hash {
                 return Err(Status::failed_precondition(format!(
                     "rootfs at {} has hash {observed_hash} but expected {content_hash}",
@@ -2150,6 +2144,7 @@ impl TemplateManagerService {
         })?;
         let observed_hash = compute_template_file_hash(
             prepared_path.join(TEMPLATE_ROOTFS_FILE),
+            content_hash_algorithm(content_hash)?,
             "hash existing rootfs",
         )
         .await?;
@@ -2301,8 +2296,12 @@ impl TemplateManagerService {
             )));
         }
 
-        let observed_hash =
-            compute_template_file_hash(rootfs_path.clone(), "hash digest rootfs").await?;
+        let observed_hash = compute_template_file_hash(
+            rootfs_path.clone(),
+            content_hash_algorithm(content_hash)?,
+            "hash digest rootfs",
+        )
+        .await?;
         if observed_hash != content_hash {
             return Err(Status::failed_precondition(format!(
                 "rootfs at {} has hash {observed_hash} but expected {content_hash}",

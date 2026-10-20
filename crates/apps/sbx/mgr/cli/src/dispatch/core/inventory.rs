@@ -214,7 +214,10 @@ fn template_hash_display(
     let Some(image_hash) = sandbox.image_hash.as_ref() else {
         return "-".into();
     };
-    let hash_display = image_hash.strip_prefix("sha256:").unwrap_or(image_hash);
+    let hash_display = image_hash
+        .strip_prefix("sha256:")
+        .or_else(|| image_hash.strip_prefix("blake3:"))
+        .unwrap_or(image_hash);
     let short = hash_display.chars().take(12).collect::<String>();
     let matches_current = template_hashes
         .get(sandbox.template.as_deref().unwrap_or(""))

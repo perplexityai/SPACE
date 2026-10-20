@@ -79,18 +79,26 @@ fn classify_disk_metric_targets_uses_disk_layout() {
             .join("snapshots")
             .join("d-1m-20260615T010203Z"),
     );
-    mkdir(&templates.join("code-runtime").join("sha256:abc"));
+    mkdir(
+        &templates
+            .join("code-runtime")
+            .join(format!("blake3:{}", "a".repeat(64))),
+    );
     write(
         &templates
             .join("code-runtime")
-            .join("sha256:abc")
+            .join(format!("blake3:{}", "a".repeat(64)))
             .join("rootfs.ext4"),
     );
-    mkdir(&templates.join(".hidden").join("sha256:def"));
+    mkdir(
+        &templates
+            .join(".hidden")
+            .join(format!("sha256:{}", "b".repeat(64))),
+    );
     write(
         &templates
             .join(".hidden")
-            .join("sha256:def")
+            .join(format!("sha256:{}", "b".repeat(64)))
             .join("rootfs.ext4"),
     );
 
@@ -152,11 +160,15 @@ fn classify_disk_metric_targets_enumerates_nodes_past_4096_targets() {
     let tmp = tempfile::tempdir().unwrap();
     let sandbox_cache = tmp.path().join("sandboxes");
     let templates = tmp.path().join("templates");
-    mkdir(&templates.join("code-runtime").join("sha256:abc"));
+    mkdir(
+        &templates
+            .join("code-runtime")
+            .join(format!("sha256:{}", "a".repeat(64))),
+    );
     write(
         &templates
             .join("code-runtime")
-            .join("sha256:abc")
+            .join(format!("sha256:{}", "a".repeat(64)))
             .join("rootfs.ext4"),
     );
     let suspended = 2_100;

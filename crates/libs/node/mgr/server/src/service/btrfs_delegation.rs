@@ -106,22 +106,11 @@ fn validate_template_name(name: &str) -> Result<(), Status> {
 }
 
 fn validate_content_hash(hash: &str) -> Result<(), Status> {
-    let Some(rest) = hash.strip_prefix("sha256:") else {
-        return Err(Status::invalid_argument(format!(
-            "content_hash must start with 'sha256:': got '{hash}'"
-        )));
-    };
-    if rest.len() != 64 || !rest.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(Status::invalid_argument(format!(
-            "content_hash must be 'sha256:' followed by 64 lowercase hex digits: got '{hash}'"
-        )));
-    }
-    if rest.bytes().any(|b| b.is_ascii_uppercase()) {
-        return Err(Status::invalid_argument(format!(
-            "content_hash hex must be lowercase: got '{hash}'"
-        )));
-    }
-    Ok(())
+    hash.parse::<pplx_space_common_core::types::Digest>()
+        .map(|_| ())
+        .map_err(|error| {
+            Status::invalid_argument(format!("invalid content_hash '{hash}': {error}"))
+        })
 }
 
 fn template_digest_dir(name: &str, content_hash: &str) -> PathBuf {

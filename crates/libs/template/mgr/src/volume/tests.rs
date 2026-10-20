@@ -1281,8 +1281,13 @@ async fn hash_mismatch_cleanup_removes_digest_dir_so_recovery_declines() {
 /// release hash. The bytes that would boot must be rehashed and refused, and
 /// they must never reach the rootfs path: disk recovery adopts whatever sits
 /// there, so a refusal that published first would still be recoverable.
+#[rstest::rstest]
+#[case(pplx_space_common_core::types::HashAlg::Sha256)]
+#[case(pplx_space_common_core::types::HashAlg::Blake3)]
 #[tokio::test(start_paused = true)]
-async fn materialize_rootfs_rejects_decoded_bytes_that_disagree_with_the_release_hash() {
+async fn materialize_rootfs_rejects_decoded_bytes_that_disagree_with_the_release_hash(
+    #[case] algorithm: pplx_space_common_core::types::HashAlg,
+) {
     use pplx_space_common_core::types::{
         TemplateManifest, TemplateManifestCompression, TemplateManifestFile,
     };
@@ -1295,11 +1300,11 @@ async fn materialize_rootfs_rejects_decoded_bytes_that_disagree_with_the_release
     let compressed_path = digest_dir.join(&compressed_name);
     let replaced_bytes = b"rootfs bytes the release never hashed";
     std::fs::write(&rootfs_path, replaced_bytes).unwrap();
-    let (replaced_hash, _) = crate::rootfs_zstd::hash_rootfs_file(&rootfs_path).unwrap();
+    let (replaced_hash, _) = crate::rootfs_zstd::hash_rootfs_file(&rootfs_path, algorithm).unwrap();
     let compress_stats =
         crate::rootfs_zstd::compress_rootfs(&rootfs_path, &compressed_path).unwrap();
     std::fs::remove_file(&rootfs_path).unwrap();
-    let release_hash = format!("sha256:{}", "a".repeat(64));
+    let release_hash = format!("{algorithm}:{}", "a".repeat(64));
     assert_ne!(replaced_hash, release_hash);
 
     let mut manifest = TemplateManifest {
@@ -1351,5 +1356,58 @@ async fn materialize_rootfs_rejects_decoded_bytes_that_disagree_with_the_release
     assert!(
         !rootfs_path.exists(),
         "replaced bytes must not be published at the rootfs path, or recovery could adopt them"
+    );
+}
+
+#[rstest::rstest]
+#[case::raw(false)]
+#[case::compressed(true)]
+#[tokio::test]
+async fn materialize_blake3_release(#[case] compressed: bool) {
+    use pplx_space_common_core::types::{TemplateManifest, TemplateManifestFile, TemplateMetadata};
+    let directory = tempfile::tempdir().unwrap();
+    let rootfs = directory.path().join(TEMPLATE_ROOTFS_FILE);
+    std::fs::write(&rootfs, b"abc").unwrap();
+    let hash = "blake3:6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85";
+    let stats = compressed.then(|| {
+        let stats = crate::rootfs_zstd::compress_rootfs(
+            &rootfs,
+            &directory.path().join(TEMPLATE_ROOTFS_ZSTD_FILE),
+        )
+        .unwrap();
+        std::fs::remove_file(&rootfs).unwrap();
+        stats
+    });
+    let manifest = crate::service::normalize_template_manifest(
+        TemplateManifest::default(),
+        "seed",
+        hash,
+        &TemplateMetadata::default(),
+        3,
+        stats
+            .as_ref()
+            .map(|stats| (stats.compressed_hash.as_str(), stats.compressed_size)),
+    )
+    .unwrap();
+    let outcome = materialize_rootfs(
+        &manifest,
+        directory.path().to_str().unwrap(),
+        TEMPLATE_ROOTFS_FILE,
+        &[],
+        "seed",
+        hash,
+        RootfsBackingPolicy::Inherit,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.rootfs_hash, hash);
+    assert_eq!(std::fs::read(&rootfs).unwrap(), b"abc");
+    assert_eq!(
+        manifest.files[TEMPLATE_ROOTFS_FILE],
+        TemplateManifestFile {
+            digest: hash.to_string(),
+            size: Some(3),
+            compression: None,
+        }
     );
 }
