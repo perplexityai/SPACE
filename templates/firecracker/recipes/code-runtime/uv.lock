@@ -13,8 +13,8 @@ exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for 
 exclude-newer-span = "P7D"
 
 [options.exclude-newer-package]
-certifi = "2026-10-21T00:00:00Z"
-pip = "2026-10-21T00:00:00Z"
+certifi = { timestamp = "0001-01-01T00:00:00Z", span = "PT0S" }
+pip = { timestamp = "0001-01-01T00:00:00Z", span = "PT0S" }
 
 [[package]]
 name = "annotated-doc"
@@ -334,7 +334,7 @@ requires-dist = [
     { name = "numpy" },
     { name = "pandas" },
     { name = "pillow" },
-    { name = "pip", specifier = "==26.2.2" },
+    { name = "pip" },
     { name = "pygments" },
     { name = "scipy" },
     { name = "send2trash" },
