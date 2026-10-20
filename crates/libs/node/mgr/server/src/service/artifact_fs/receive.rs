@@ -43,10 +43,18 @@ impl ReceiveRoot {
         )
         .map_err(|error| Status::unavailable(format!("btrfs receive failed: {error}")))?;
         if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if hit_memory_cap(&stderr) {
+                // Healthy commands stay far below the cap, so this stream is
+                // corrupt (e.g. an appended second stream); retrying cannot help.
+                return Err(Status::failed_precondition(format!(
+                    "btrfs receive hit its {} MiB memory cap; the send stream is likely corrupt: {stderr}",
+                    RECEIVE_DATA_LIMIT_BYTES >> 20,
+                )));
+            }
             return Err(Status::internal(format!(
-                "btrfs receive exited with {}: {}",
+                "btrfs receive exited with {}: {stderr}",
                 output.status,
-                String::from_utf8_lossy(&output.stderr),
             )));
         }
         if cancel.is_some_and(CancellationToken::is_cancelled) {
@@ -79,7 +87,47 @@ fn configure_receiver(
     directory: &File,
 ) -> std::io::Result<()> {
     command.args(["receive", "--chroot", "-m", "/space/cache", "--", "/tmp"]);
-    attach_destination_at_tmp(command, directory)
+    attach_destination_at_tmp(command, directory)?;
+    limit_receiver_memory(command);
+    Ok(())
+}
+
+/// Heap/anonymous-mapping cap for one `btrfs receive` child.
+///
+/// btrfs-progs `read_cmd()` allocates each command's declared length before
+/// checking its CRC. A corrupt stream (prod-1, 2026-10-20: an appended second
+/// stream whose `btrf` magic decoded as a 1.6 GiB length) therefore makes the
+/// child allocate and fill ~1.6 GiB inside node-manager's container, and the
+/// container OOM kill takes node-manager with it. Healthy commands are at most
+/// 64 KiB (protocol v1) or a few hundred KiB (v2), and healthy receives add
+/// tens of MiB, so 256 MiB leaves ample headroom while failing a corrupt
+/// stream with ENOMEM. RLIMIT_DATA does not count page cache, so large
+/// healthy restores are not throttled the way a memory cgroup would be.
+const RECEIVE_DATA_LIMIT_BYTES: u64 = 256 << 20;
+
+#[cfg(target_os = "linux")]
+fn limit_receiver_memory(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+
+    use nix::sys::resource::{Resource, setrlimit};
+
+    // SAFETY: setrlimit is async-signal-safe and touches only this child.
+    unsafe {
+        command.pre_exec(|| {
+            setrlimit(
+                Resource::RLIMIT_DATA,
+                RECEIVE_DATA_LIMIT_BYTES,
+                RECEIVE_DATA_LIMIT_BYTES,
+            )?;
+            Ok(())
+        });
+    }
+}
+
+/// btrfs-progs reports a failed command-buffer allocation as
+/// "not enough memory"; other allocation sites use strerror(ENOMEM).
+fn hit_memory_cap(stderr: &str) -> bool {
+    stderr.contains("not enough memory") || stderr.contains("Cannot allocate memory")
 }
 
 /// Run `command` in its own mount namespace with `directory` bound at `/tmp`.

@@ -343,3 +343,27 @@ fn receive_bounds_memory_of_appended_stream() {
         "a bounded failure should say it hit the memory cap: {error:?}"
     );
 }
+
+#[test]
+fn memory_cap_failures_are_recognised() {
+    assert!(hit_memory_cap(
+        "ERROR: not enough memory: read buffer for command\n"
+    ));
+    assert!(hit_memory_cap("ERROR: failed: Cannot allocate memory\n"));
+    assert!(!hit_memory_cap("ERROR: crc32 mismatch in command\n"));
+}
+
+#[test]
+fn receiver_memory_cap_applies_to_the_child_only() {
+    let mut command = std::process::Command::new("sh");
+    command.args(["-c", "ulimit -d"]);
+    limit_receiver_memory(&mut command);
+    let output = command.output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        (RECEIVE_DATA_LIMIT_BYTES / 1024).to_string(),
+    );
+    let (soft, _) = nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_DATA).unwrap();
+    assert_ne!(soft, RECEIVE_DATA_LIMIT_BYTES, "the cap must not leak into node-manager");
+}
