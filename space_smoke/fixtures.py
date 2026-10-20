@@ -3987,6 +3987,13 @@ class SuspendCodecAssertions:
         """A confirmed corrupt backup is withdrawn and another restore cannot re-pull it."""
 
         sandbox_id = self._fixture.sandbox.sandbox_id
+        residency = self._control.sandbox_residency(sandbox_id)
+        self._fixture.record("corrupt_restore_lifecycle", residency.lifecycle)
+        self._fixture.verify(
+            residency.lifecycle == "quarantined",
+            "the corrupt restore did not quarantine the sandbox",
+            lifecycle=residency.lifecycle,
+        )
         facts = self._control.snapshot_row_facts(sandbox_id)
         matching = [row for row in facts if row.snapshot_id == snapshot.snapshot_id]
         jobs = self._control.transfer_jobs(node_name, sandbox_id)

@@ -648,6 +648,8 @@ message SandboxInfo {
   // Always set by the sandbox manager; readers reject its absence. Present
   // UNSPECIFIED or an unknown value means undecodable state.
   optional SandboxLifecycleState lifecycle = 57;
+  // Exact backup rejected by restore integrity validation while quarantined.
+  optional string corrupt_restore_storage_uri = 58;
 }
 
 enum SandboxHealthStatus {

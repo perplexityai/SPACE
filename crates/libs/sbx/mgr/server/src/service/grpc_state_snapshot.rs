@@ -1001,7 +1001,16 @@ impl SandboxManagerService {
                 }
             }
         };
+        let corrupt_restore_storage_uri = if sandbox.state == SandboxState::Quarantined {
+            let db = self.db_conn()?;
+            crate::db::quarantined_corrupt_restore_source(&db, id).map_err(|error| {
+                Status::internal(format!("read corrupt restore evidence: {error}"))
+            })?
+        } else {
+            None
+        };
         Ok(SandboxInfo {
+            corrupt_restore_storage_uri,
             sandbox_id: sandbox.id.clone(),
             template: Some(sandbox.template.clone()),
             lifecycle: Some(crate::proto::SandboxLifecycleState::from(observed_state) as i32),

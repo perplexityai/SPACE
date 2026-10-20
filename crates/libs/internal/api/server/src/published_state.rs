@@ -369,6 +369,7 @@ pub(crate) struct ArtifactComponentProjection {
 #[derive(Clone, Debug)]
 struct QuarantineProjectionInput {
     sandbox_id: SandboxId,
+    corrupt_restore_source: Option<pplx_space_common_core::types::ExactStorageUri>,
     failure_reason: Option<String>,
     source: SandboxQuarantineSource,
     reason_code: SandboxQuarantineReasonCode,
@@ -1941,8 +1942,22 @@ pub async fn publish_sandbox_states(
                         SandboxQuarantineReasonCode::NodePublishedQuarantined,
                     ),
                 };
+                let corrupt_restore_source =
+                    if reason_code == SandboxQuarantineReasonCode::RestoreArtifactCorrupt {
+                        state
+                            .corrupt_restore_storage_uri
+                            .as_deref()
+                            .map(str::parse::<pplx_space_common_core::types::ExactStorageUri>)
+                            .transpose()
+                            .map_err(|_| {
+                                Status::invalid_argument("invalid corrupt restore storage URI")
+                            })?
+                    } else {
+                        None
+                    };
                 quarantine_inputs.push(QuarantineProjectionInput {
                     sandbox_id,
+                    corrupt_restore_source,
                     failure_reason: optional_trimmed(state.failure_reason.as_deref()),
                     source,
                     reason_code,
@@ -3060,6 +3075,23 @@ pub async fn publish_sandbox_states(
 
     let mut quarantined_sandboxes = Vec::new();
     if !quarantine_inputs.is_empty() {
+        // The evidence remains in the node's quarantine episode until it is
+        // resolved. Repeat withdrawal even when lifecycle is already quarantined;
+        // a failed publication rolls this back with the rest of node state.
+        for input in &quarantine_inputs {
+            if let Some(source) = &input.corrupt_restore_source {
+                pplx_space_snapshot_store::mark_restore_source_corrupt(
+                    &mut *conn,
+                    input.sandbox_id,
+                    source,
+                    &[node_id],
+                )
+                .await
+                .map_err(|error| {
+                    Status::internal(format!("withdraw corrupt restore source: {error}"))
+                })?;
+            }
+        }
         let quarantine_sql_inputs = quarantine_inputs
             .iter()
             .map(QuarantineProjectionInput::sql_input)

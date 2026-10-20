@@ -1971,6 +1971,7 @@ fn _all_reasons_listed(reason: pplx_space_common_core::types::SandboxQuarantineR
         | Reason::ColdActivationFirecrackerLaunchFailed
         | Reason::ColdActivationSidecarLaunchFailed
         | Reason::RestorePrepareFailed
+        | Reason::RestoreArtifactCorrupt
         | Reason::RestoreMetadataFailed
         | Reason::RestoreEncryptedDevicesPrepareFailed
         | Reason::RestoreFirecrackerLaunchFailed
@@ -2014,6 +2015,7 @@ async fn orphan_restore_declines_a_plan_for_a_different_quarantine_reason() {
         Reason::ColdActivationFirecrackerLaunchFailed,
         Reason::ColdActivationSidecarLaunchFailed,
         Reason::RestorePrepareFailed,
+        Reason::RestoreArtifactCorrupt,
         Reason::RestoreMetadataFailed,
         Reason::RestoreEncryptedDevicesPrepareFailed,
         Reason::RestoreFirecrackerLaunchFailed,

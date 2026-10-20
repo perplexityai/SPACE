@@ -129,12 +129,10 @@ pub enum RecoveredSandboxRowFieldsError {
 /// Errors returned from [`prepare_restore_dir`].
 #[derive(Debug, thiserror::Error)]
 pub enum RestoreError {
-    #[error("snapshot artifact is corrupt")]
-    CorruptArtifact,
-    #[error("access corrupt restore source state: {source}")]
-    CorruptionState {
+    #[error("quarantine corrupt restore artifact: {source}")]
+    QuarantineCorruptArtifact {
         #[source]
-        source: rusqlite::Error,
+        source: crate::db::MarkQuarantinedError,
     },
     /// Cluster API is not configured on this node — restore-from-S3 can't
     /// run. Falls through to normal `NotFound` handling for the caller.
@@ -289,8 +287,7 @@ pub enum RestoreError {
 
 impl RestoreError {
     pub(crate) fn is_corrupt_artifact(&self) -> bool {
-        matches!(self, Self::CorruptArtifact)
-            || matches!(self, Self::BtrfsReceive {
+        matches!(self, Self::BtrfsReceive {
                 source: crate::btrfs_via_nodemgr::BtrfsViaNodemgrError::Rpc { status, .. },
             } if status.code() == tonic::Code::DataLoss)
     }
@@ -313,7 +310,7 @@ impl RestoreError {
             | Self::RemoveFile { .. }
             | Self::RemoveDirectory { .. }
             | Self::RenamePath { .. } => Kind::Filesystem,
-            Self::CorruptionState { .. }
+            Self::QuarantineCorruptArtifact { .. }
             | Self::ReadSandboxRow { .. }
             | Self::PersistRestoringRow { .. }
             | Self::InvalidRecoveredSandboxRow { .. }
@@ -328,7 +325,7 @@ impl RestoreError {
             | Self::QuarantineRecoveryAbandonedAtShutdown { .. } => Kind::QuarantineRecovery,
             Self::QuarantineRecoveryTimedOut { .. } => Kind::QuarantineRecoveryTimeout,
             Self::ParentTemplateLookup { .. } => Kind::ParentTemplate,
-            Self::BtrfsReceive { .. } | Self::CorruptArtifact => Kind::BtrfsReceive,
+            Self::BtrfsReceive { .. } => Kind::BtrfsReceive,
             Self::ClusterApiUnconfigured(_)
             | Self::SnapshotNotRegistered(_)
             | Self::AdmissionRejected(_)
@@ -414,8 +411,7 @@ impl RestoreError {
             // timeouts, paths it constructed, and wrapped rusqlite/io sources.
             // Nothing here holds a string supplied by a caller, a peer, or
             // downloaded metadata.
-            Self::CorruptArtifact
-            | Self::CorruptionState { .. }
+            Self::QuarantineCorruptArtifact { .. }
             | Self::SnapshotNotRegistered(..)
             | Self::RootfsPolicy(..)
             | Self::RestoreOperationBusy { .. }
@@ -449,8 +445,7 @@ impl RestoreError {
     /// compiles.
     pub fn kind_label(&self) -> &'static str {
         match self {
-            Self::CorruptArtifact => "corrupt_artifact",
-            Self::CorruptionState { .. } => "corruption_state",
+            Self::QuarantineCorruptArtifact { .. } => "quarantine_corrupt_artifact",
             Self::ClusterApiUnconfigured(..) => "cluster_api_unconfigured",
             Self::SnapshotNotRegistered(..) => "snapshot_not_registered",
             Self::AdmissionRejected(..) => "admission_rejected",

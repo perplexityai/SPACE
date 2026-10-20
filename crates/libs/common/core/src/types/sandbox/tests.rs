@@ -36,6 +36,7 @@ fn quarantine_reason_codes_round_trip_through_the_wire_vocabulary() {
         SandboxQuarantineReasonCode::ColdActivationFirecrackerLaunchFailed,
         SandboxQuarantineReasonCode::ColdActivationSidecarLaunchFailed,
         SandboxQuarantineReasonCode::RestorePrepareFailed,
+        SandboxQuarantineReasonCode::RestoreArtifactCorrupt,
         SandboxQuarantineReasonCode::RestoreMetadataFailed,
         SandboxQuarantineReasonCode::RestoreEncryptedDevicesPrepareFailed,
         SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,
@@ -58,6 +59,7 @@ fn quarantine_reason_codes_round_trip_through_the_wire_vocabulary() {
 #[test]
 fn direct_failure_quarantine_reasons_have_no_automatic_recovery() {
     for reason in [
+        SandboxQuarantineReasonCode::RestoreArtifactCorrupt,
         SandboxQuarantineReasonCode::PauseFailed,
         SandboxQuarantineReasonCode::CheckpointResumeFailed,
         SandboxQuarantineReasonCode::ResidentResumeFailed,

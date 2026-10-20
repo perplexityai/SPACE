@@ -406,6 +406,7 @@ pub(super) fn published_sandbox_state(
         pool_template: sandbox.pool_template.clone(),
         failure_reason: sandbox.failure_reason.clone(),
         quarantine_reason_code: sandbox.quarantine_reason_code.clone(),
+        corrupt_restore_storage_uri: sandbox.corrupt_restore_storage_uri.clone(),
         transition_receipt: sandbox.transition_receipt.clone(),
         state_degraded: sandbox.state_degraded || lifecycle.is_err(),
         current_local_artifact_id: sandbox.current_local_artifact_id.clone(),

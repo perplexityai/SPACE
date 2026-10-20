@@ -289,6 +289,7 @@ fn sandbox_info_from_record(rec: &crate::state::SandboxRecord) -> sbx::SandboxIn
         auto_lifecycle_status: None,
         failure_reason: None,
         quarantine_reason_code: None,
+        corrupt_restore_storage_uri: None,
         transition_receipt: None,
         state_degraded: false,
         firecracker_alive: rec.status == status::RUNNING,

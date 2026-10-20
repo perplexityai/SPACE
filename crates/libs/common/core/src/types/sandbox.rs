@@ -2402,6 +2402,7 @@ pub enum SandboxQuarantineReasonCode {
     ColdActivationFirecrackerLaunchFailed,
     ColdActivationSidecarLaunchFailed,
     RestorePrepareFailed,
+    RestoreArtifactCorrupt,
     RestoreMetadataFailed,
     RestoreEncryptedDevicesPrepareFailed,
     RestoreFirecrackerLaunchFailed,
@@ -2495,6 +2496,7 @@ impl SandboxQuarantineReasonCode {
             }
             Self::ColdActivationSidecarLaunchFailed => "cold_activation_sidecar_launch_failed",
             Self::RestorePrepareFailed => "restore_prepare_failed",
+            Self::RestoreArtifactCorrupt => "restore_artifact_corrupt",
             Self::RestoreMetadataFailed => "restore_metadata_failed",
             Self::RestoreEncryptedDevicesPrepareFailed => {
                 "restore_encrypted_devices_prepare_failed"
@@ -2540,6 +2542,7 @@ impl SandboxQuarantineReasonCode {
             | Self::ColdActivationEncryptedRootfsPrepareFailed
             | Self::ColdActivationFirecrackerLaunchFailed
             | Self::ColdActivationSidecarLaunchFailed
+            | Self::RestoreArtifactCorrupt
             | Self::RestoreMetadataFailed
             | Self::RestoreEncryptedDevicesPrepareFailed
             | Self::RestoreNetGatewayLaunchFailed
@@ -2584,6 +2587,7 @@ impl FromStr for SandboxQuarantineReasonCode {
             }
             "cold_activation_sidecar_launch_failed" => Ok(Self::ColdActivationSidecarLaunchFailed),
             "restore_prepare_failed" => Ok(Self::RestorePrepareFailed),
+            "restore_artifact_corrupt" => Ok(Self::RestoreArtifactCorrupt),
             "restore_metadata_failed" => Ok(Self::RestoreMetadataFailed),
             "restore_encrypted_devices_prepare_failed" => {
                 Ok(Self::RestoreEncryptedDevicesPrepareFailed)

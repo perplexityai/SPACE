@@ -1345,10 +1345,6 @@ impl SandboxManagerService {
 
         let expected_restore_source =
             select_interrupted_restore_source(storage_uri, interrupted_restore_source.clone())?;
-        if let Some(source) = expected_restore_source.as_ref() {
-            self.reject_corrupt_restore_source(&canonical_id, source)
-                .await?;
-        }
         if retrying_interrupted_restore
             && let (Some(persisted_source), Some(selected_source)) = (
                 interrupted_restore_source.as_ref(),
@@ -1681,8 +1677,6 @@ impl SandboxManagerService {
                 uri: staged.storage_uri.clone(),
                 source,
             })?;
-        self.reject_corrupt_restore_source(&canonical_id, &restore_source)
-            .await?;
         emit_sandbox_event(
             &canonical_id,
             SandboxEventType::SnapshotRestoreStarted,
@@ -1785,8 +1779,6 @@ impl SandboxManagerService {
         .instrument(phase2_span)
         .await;
         if let Err(ref e) = phase2_result {
-            self.record_restore_corruption(&canonical_id, &restore_source, e)
-                .await?;
             emit_sandbox_event(
                 &canonical_id,
                 SandboxEventType::SnapshotRestoreFailed,
@@ -1799,6 +1791,26 @@ impl SandboxManagerService {
                         .error(e.to_string()),
                 ),
             );
+            if e.is_corrupt_artifact() {
+                let scope = crate::db::RestoreTransferScopeRow {
+                    transfer_scope_id,
+                    execution_generation,
+                    activation_attempt_id,
+                    staging_dir: crate::snapshot_restore::remote_restore_metadata_staging_dir(
+                        &canonical_id,
+                        transfer_scope_id,
+                    )
+                    .to_string_lossy()
+                    .into_owned(),
+                };
+                self.quarantine_corrupt_restore(
+                    &canonical_id,
+                    &restore_source,
+                    &scope,
+                    recovery.map(|context| context.claim),
+                )?;
+                return phase2_result.map(|_| None);
+            }
             let failure_reason = format!("cross-node restore artifact staging failed: {e}");
             // The claim was current before the pull, but the pull is a transfer and
             // can outlive it. Under a recovery claim the write is fenced on that

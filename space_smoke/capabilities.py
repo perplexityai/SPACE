@@ -1861,6 +1861,8 @@ class SuspendCodecControl(CrossNodeRestoreControl, Protocol):
     operation with its compensation owned by the fixture.
     """
 
+    def sandbox_residency(self, sandbox_id: str) -> SandboxResidency: ...
+
     def other_sandbox_worker_node(self, excluding_node: str) -> str:
         """A sandbox-pool kube node other than `excluding_node`, or a configuration error."""
         ...

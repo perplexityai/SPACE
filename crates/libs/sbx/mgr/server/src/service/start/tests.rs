@@ -303,7 +303,6 @@ async fn restore_stage_preserves_permanent_and_retryable_failures() {
             ),
             tonic::Code::FailedPrecondition,
         ),
-        (RestoreError::CorruptArtifact, tonic::Code::DataLoss),
         (
             RestoreError::BtrfsReceive {
                 source: crate::btrfs_via_nodemgr::BtrfsViaNodemgrError::Rpc {

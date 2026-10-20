@@ -797,16 +797,48 @@ fn mark_quarantined_inner(
     reason_message: &str,
     next_action: SandboxQuarantineNextAction,
 ) -> std::result::Result<bool, MarkQuarantinedError> {
+    let tx = immediate_transaction(conn)?;
+    let (changed, previous_state) = mark_quarantined_in_transaction(
+        &tx,
+        id,
+        expected_state,
+        source,
+        reason_code,
+        reason_message,
+        next_action,
+    )?;
+    tx.commit()?;
+    if changed && previous_state.as_deref() != Some(SandboxState::Quarantined.as_str()) {
+        emit_sandbox_quarantined_event(
+            id,
+            previous_state.as_deref(),
+            reason_code,
+            "mark_quarantined",
+            None,
+        );
+    }
+    Ok(changed)
+}
+
+fn mark_quarantined_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
+    expected_state: Option<SandboxState>,
+    source: SandboxQuarantineSource,
+    reason_code: SandboxQuarantineReasonCode,
+    reason_message: &str,
+    next_action: SandboxQuarantineNextAction,
+) -> std::result::Result<(bool, Option<String>), MarkQuarantinedError> {
     let reason_message = reason_message.trim();
     let reason_message = (!reason_message.is_empty()).then_some(reason_message);
-    let previous_state = current_state_label(conn, id)?;
+    let previous_state = current_state_label(tx, id)?;
     if expected_state.is_some_and(|expected| {
         previous_state
             .as_deref()
             .and_then(|state| state.parse::<SandboxState>().ok())
             != Some(expected)
     }) {
-        return Ok(false);
+        return Ok((false, previous_state));
     }
     if let Some(previous_state_label) = previous_state.as_deref() {
         let previous_state_value = previous_state_label.parse::<SandboxState>().map_err(|_| {
@@ -819,7 +851,6 @@ fn mark_quarantined_inner(
     let starts_new_episode = previous_state.as_deref() != Some(SandboxState::Quarantined.as_str());
     let ts = now()?;
 
-    let tx = conn.unchecked_transaction()?;
     let changed = tx.execute(
         "UPDATE sandboxes
          SET state = 'quarantined',
@@ -849,7 +880,7 @@ fn mark_quarantined_inner(
         );
     }
     if changed != 0 {
-        crate::route_activation_claims::close_claim(&tx, id)?;
+        crate::route_activation_claims::close_claim(tx, id)?;
         let episode = QuarantineEpisode {
             sandbox_id: id,
             entered_from_state: previous_state.as_deref(),
@@ -860,7 +891,7 @@ fn mark_quarantined_inner(
             timestamp: &ts,
         };
         if starts_new_episode {
-            insert_new_quarantine_episode(&tx, &episode)?;
+            insert_new_quarantine_episode(tx, &episode)?;
         } else {
             // A reconfirmation that changes source or reason invalidates the
             // retry state legacy recovery accumulated for the old reason — but
@@ -996,23 +1027,95 @@ fn mark_quarantined_inner(
                 |row| row.get(0),
             )?;
             insert_quarantine_history(
-                &tx,
+                tx,
                 &episode,
                 &current_quarantine_id,
                 SandboxQuarantineHistoryAction::ReconfirmedQuarantine,
             )?;
         }
     }
-    tx.commit()?;
+    Ok((changed != 0, previous_state))
+}
 
-    if changed != 0 && previous_state.as_deref() != Some(SandboxState::Quarantined.as_str()) {
-        emit_sandbox_quarantined_event(
-            id,
-            previous_state.as_deref(),
-            reason_code,
-            "mark_quarantined",
-            None,
-        );
+/// Quarantine only the transfer attempt that observed corrupt bytes. The source
+/// survives clearing restore intent so normal node publication can withdraw the
+/// exact backup, including after a process restart or control-plane outage.
+pub(crate) fn quarantine_corrupt_restore(
+    conn: &Connection,
+    id: &str,
+    source: &pplx_space_common_core::types::ExactStorageUri,
+    scope: &RestoreTransferScopeRow,
+    recovery_claim: Option<&ClaimedQuarantineRecoveryCandidate>,
+) -> std::result::Result<bool, MarkQuarantinedError> {
+    let tx = immediate_transaction(conn)?;
+    let Some(row) = get_sandbox(&tx, id)? else {
+        return Ok(false);
+    };
+    if !edges::CORRUPT_RESTORE_QUARANTINE.from().contains(row.state)
+        || restore_transfer_scope(&tx, id)?.as_ref() != Some(scope)
+        || row
+            .restore_operation
+            .as_ref()
+            .and_then(|op| op.remote_source())
+            .is_some_and(|current| current != source)
+    {
+        return Ok(false);
     }
-    Ok(changed != 0)
+    if let Some(claim) = recovery_claim
+        && !quarantine_recovery_claim_is_current(&tx, claim)?
+    {
+        return Ok(false);
+    }
+    let reason = SandboxQuarantineReasonCode::RestoreArtifactCorrupt;
+    let (changed, previous_state) = mark_quarantined_in_transaction(
+        &tx,
+        id,
+        Some(row.state),
+        SandboxQuarantineSource::SbxManager,
+        reason,
+        "snapshot artifact is corrupt",
+        SandboxQuarantineNextAction::RequiresOperatorAttention,
+    )?;
+    if !changed {
+        return Ok(false);
+    }
+    let evidence = serde_json::json!({"corrupt_restore_storage_uri": source.as_wire()}).to_string();
+    tx.execute(
+        "UPDATE sandbox_quarantine_state SET evidence_json = ?2 WHERE sandbox_id = ?1",
+        params![id, evidence],
+    )?;
+    tx.execute(
+        "UPDATE sandbox_quarantine_history SET evidence_json = ?2
+         WHERE sandbox_id = ?1 AND quarantine_id = (
+             SELECT quarantine_id FROM sandbox_quarantine_state WHERE sandbox_id = ?1
+         ) AND reason_code = ?3",
+        params![id, evidence, reason.as_str()],
+    )?;
+    tx.commit()?;
+    emit_sandbox_quarantined_event(
+        id,
+        previous_state.as_deref(),
+        reason,
+        "quarantine_corrupt_restore",
+        None,
+    );
+    Ok(true)
+}
+
+pub(crate) fn quarantined_corrupt_restore_source(
+    conn: &Connection,
+    id: &str,
+) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT json_extract(q.evidence_json, '$.corrupt_restore_storage_uri')
+         FROM sandbox_quarantine_state q JOIN sandboxes s ON s.id = q.sandbox_id
+         WHERE s.id = ?1 AND s.state = 'quarantined' AND q.reason_code = ?2",
+        params![
+            id,
+            SandboxQuarantineReasonCode::RestoreArtifactCorrupt.as_str()
+        ],
+        |row| row.get(0),
+    )
+    .optional()
+    .map(Option::flatten)
 }

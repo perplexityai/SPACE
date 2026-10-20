@@ -362,6 +362,10 @@ edge_table! {
 
     // Quarantine entry and exit.
 
+    /// `quarantine_corrupt_restore`: validated corrupt bytes from the current
+    /// restore transfer put the sandbox on hold for operator attention.
+    CORRUPT_RESTORE_QUARANTINE: Recovery, of(&[Suspended, Restoring]) => Quarantined;
+
     /// `mark_quarantined_best_effort` and `mark_quarantined_from_state`: an
     /// unconfirmed pause (`pause_with_reconciliation`, startup pause
     /// recovery), a failed checkpoint, a failed process-snapshot stop, and a

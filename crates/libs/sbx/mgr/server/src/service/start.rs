@@ -449,9 +449,6 @@ async fn prepare_suspend_restore_dir(
             source,
         }
     })?;
-    service
-        .reject_corrupt_restore_source(&sandbox_id, &restore_source)
-        .await?;
     let retire_scope = |
         transfer_scope_id: pplx_space_common_core::types::TransferScopeId,
     | -> Result<(), crate::snapshot_restore::RestoreError> {
@@ -536,9 +533,9 @@ async fn prepare_suspend_restore_dir(
     let prepared = match prepared {
         Ok(prepared) => prepared,
         Err(stage_error) => {
-            service
-                .record_restore_corruption(&sandbox_id, &restore_source, &stage_error)
-                .await?;
+            if stage_error.is_corrupt_artifact() {
+                service.quarantine_corrupt_restore(&sandbox_id, &restore_source, &scope, None)?;
+            }
             service
                 .cancel_restore_transfer_scope_and_remove_staging(&sandbox_id, &scope)
                 .await

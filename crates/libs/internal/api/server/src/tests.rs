@@ -4814,7 +4814,9 @@ async fn get_location(
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn corruption_report_withdraws_only_the_exact_backup_on_the_callers_node() -> TestResult {
+async fn corrupt_restore_publication_quarantines_and_withdraws_only_the_exact_backup() -> TestResult
+{
+    use pplx_space_common_core::types::SandboxQuarantineReasonCode;
     let Some(fixture) = cluster_fixture().await? else {
         return Ok(());
     };
@@ -4831,22 +4833,32 @@ async fn corruption_report_withdraws_only_the_exact_backup_on_the_callers_node()
         )
         .await?;
     }
-    let request = crate::proto::ReportCorruptSnapshotRequest {
-        sandbox_id: sandbox_id.to_string(),
-        storage_uri: test_storage_uri(sandbox_id, corrupt),
+    let node_id: NodeId =
+        sqlx::query_scalar(sql!("SELECT active_node_id FROM sandboxes WHERE id = $1"))
+            .bind(sandbox_id)
+            .fetch_one(&fixture.service.pool)
+            .await?;
+    let mut state = published_sandbox_state(sandbox_id, "quarantined");
+    state.quarantine_reason_code =
+        Some(SandboxQuarantineReasonCode::RestoreArtifactCorrupt.to_string());
+    state.corrupt_restore_storage_uri = Some(test_storage_uri(sandbox_id, corrupt));
+    let request = crate::proto::PublishNodeStateRequest {
+        node_id: node_id.to_string(),
+        sandboxes: vec![state],
+        ..Default::default()
     };
     let denied = fixture
         .service
-        .report_corrupt_snapshot(Request::new(request.clone()))
+        .publish_node_state(Request::new(request.clone()))
         .await
         .unwrap_err();
     assert_eq!(denied.code(), Code::PermissionDenied);
     let denied = fixture
         .service
-        .report_corrupt_snapshot(request_from_node(request.clone(), "192.0.2.99".parse()?))
+        .publish_node_state(request_from_node(request.clone(), "192.0.2.99".parse()?))
         .await
         .unwrap_err();
-    assert_eq!(denied.code(), Code::FailedPrecondition);
+    assert_eq!(denied.code(), Code::PermissionDenied);
     assert_eq!(
         snapshot_store::get(&fixture.service.pool, corrupt)
             .await?
@@ -4858,9 +4870,21 @@ async fn corruption_report_withdraws_only_the_exact_backup_on_the_callers_node()
     for _ in 0..2 {
         fixture
             .service
-            .report_corrupt_snapshot(request_from_node(request.clone(), TEST_WORKER_IP))
+            .publish_node_state(request_from_node(request.clone(), TEST_WORKER_IP))
             .await?;
     }
+    let (lifecycle, reason): (String, String) = sqlx::query_as(sql!(
+        "SELECT s.lifecycle, q.reason_code FROM sandboxes s
+         JOIN sandbox_quarantine_state q ON q.sandbox_id = s.id WHERE s.id = $1"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(&fixture.service.pool)
+    .await?;
+    assert_eq!(lifecycle, "quarantined");
+    assert_eq!(
+        reason,
+        SandboxQuarantineReasonCode::RestoreArtifactCorrupt.as_str()
+    );
     assert_eq!(
         snapshot_store::get(&fixture.service.pool, corrupt)
             .await?

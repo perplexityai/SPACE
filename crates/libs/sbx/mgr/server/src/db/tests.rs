@@ -1,3 +1,4 @@
+mod corrupt_restore;
 mod state_writer_refusal;
 
 use super::*;
@@ -676,6 +677,7 @@ fn quarantine_recovery_candidates_follow_the_complete_reason_policy() {
         SandboxQuarantineReasonCode::ColdActivationFirecrackerLaunchFailed,
         SandboxQuarantineReasonCode::ColdActivationSidecarLaunchFailed,
         SandboxQuarantineReasonCode::RestorePrepareFailed,
+        SandboxQuarantineReasonCode::RestoreArtifactCorrupt,
         SandboxQuarantineReasonCode::RestoreMetadataFailed,
         SandboxQuarantineReasonCode::RestoreEncryptedDevicesPrepareFailed,
         SandboxQuarantineReasonCode::RestoreFirecrackerLaunchFailed,

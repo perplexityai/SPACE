@@ -69,5 +69,5 @@ def btrfs_send_restore_rejects_corrupted_stream(test: smoke.KindEcw) -> None:
         with test.phase("no instance and no partial receive remain on the target"):
             codec.expect_no_instance(target_node)
 
-        with test.phase("corruption permanently fails the stored snapshot without downloading it again"):
+        with test.phase("corruption quarantines the sandbox and withdraws the snapshot without another download"):
             codec.expect_corrupt_snapshot_terminal(corrupted, target_node)

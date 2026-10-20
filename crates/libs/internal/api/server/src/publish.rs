@@ -62,6 +62,17 @@ impl ClusterApiService {
                 "auto-lifecycle delete completions require a node registration that predates this publication",
             ));
         }
+        if request
+            .get_ref()
+            .sandboxes
+            .iter()
+            .any(|sandbox| sandbox.corrupt_restore_storage_uri.is_some())
+            && (origin.bootstrapped || origin.role != SpaceNodeRole::Worker)
+        {
+            return Err(Status::permission_denied(
+                "corrupt restore evidence requires a pre-existing worker registration",
+            ));
+        }
         let request = request.into_inner();
         let node_status = request
             .node_status

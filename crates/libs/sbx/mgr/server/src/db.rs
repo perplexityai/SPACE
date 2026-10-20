@@ -65,7 +65,6 @@ use sandbox_row::{row_to_list_sandbox, row_to_sandbox};
 
 mod auto_lifecycle;
 mod cleanup_episodes;
-mod corrupt_restore_sources;
 mod eviction;
 mod local_artifacts;
 mod network_policy;
@@ -80,7 +79,6 @@ mod state_write;
 mod teardown_suspend;
 pub use auto_lifecycle::*;
 pub use cleanup_episodes::*;
-pub(crate) use corrupt_restore_sources::*;
 pub use eviction::*;
 pub use local_artifacts::*;
 pub use network_policy::*;
@@ -346,10 +344,6 @@ pub(crate) fn emit_auto_lifecycle_delete_receipt_superseded_if_present(
 /// manual cascade is the single source of truth for sandbox child tables:
 /// add new child tables here, not at the individual delete call sites.
 fn delete_sandbox_child_rows(tx: &Connection, id: &str) -> Result<()> {
-    tx.execute(
-        "DELETE FROM corrupt_restore_sources WHERE sandbox_id = ?1",
-        params![id],
-    )?;
     teardown_jobs::fail_active(tx, id, TeardownSuspendFailure::Deleted)?;
     crate::route_activation_claims::close_claim(tx, id)?;
     tx.execute(
