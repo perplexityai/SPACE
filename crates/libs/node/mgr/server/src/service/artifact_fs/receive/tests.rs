@@ -315,7 +315,11 @@ fn receive_bounds_memory_of_appended_stream() {
         let mut head = [0_u8; 30];
         std::io::Read::read_exact(&mut File::open(fixture.join("corrupt")).unwrap(), &mut head)
             .unwrap();
-        assert_eq!(&head[17..30], b"btrfs-stream\0", "second stream must follow the header");
+        assert_eq!(
+            &head[17..30],
+            b"btrfs-stream\0",
+            "second stream must follow the header"
+        );
     }
     let destination = fixture.join("destination");
     std::fs::create_dir(&destination).unwrap();
@@ -364,6 +368,10 @@ fn receiver_memory_cap_applies_to_the_child_only() {
         String::from_utf8_lossy(&output.stdout).trim(),
         (RECEIVE_DATA_LIMIT_BYTES / 1024).to_string(),
     );
-    let (soft, _) = nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_DATA).unwrap();
-    assert_ne!(soft, RECEIVE_DATA_LIMIT_BYTES, "the cap must not leak into node-manager");
+    let (soft, _) =
+        nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_DATA).unwrap();
+    assert_ne!(
+        soft, RECEIVE_DATA_LIMIT_BYTES,
+        "the cap must not leak into node-manager"
+    );
 }
