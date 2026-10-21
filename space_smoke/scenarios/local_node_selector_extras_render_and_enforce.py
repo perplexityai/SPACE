@@ -6,10 +6,10 @@ from space_smoke.node_selector_extras import ABSENT_EXTRA, SATISFIED_EXTRAS
 
 # Exclusive bench: with the unsatisfiable extras on both renderers, every create
 # on the cluster is refused for the length of the negative phase (pool fills
-# included). Two env rewrites and a restore, each a concurrent rollout of the
-# api and the cluster controller plus the API readiness wait (~15–17 s), two
-# real sandbox boots (~4 s each) and one refused create: ~60 s on the kind
-# bench (2026-09-24: 65 s and 60 s wall).
+# included). Two env rewrites and a restore, each a concurrent fast-pace
+# rollout of every renderer plus the API readiness wait (~15 s; ~40 s at the
+# charts' pace), two real sandbox boots (~5 s each) and one refused create:
+# ~65 s on the kind bench.
 @smoke.scenario(
     "local.node_selector_extras_render_and_enforce",
     sandbox=smoke.SandboxConfig(timeout=900),

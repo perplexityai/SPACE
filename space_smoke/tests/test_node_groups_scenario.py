@@ -237,7 +237,10 @@ class _ScriptedKubectl:
             return CommandResult(argv, 0, "space-cluster-controller" if "controller" in selector else "space-api", "")
         if "get" in argv and "deploy" in argv and argv[-1] == "json":
             # The post-rollout drain: one desired pod, one present.
-            deployment = {"spec": {"replicas": 1, "selector": {"matchLabels": {"app": "x"}}}}
+            deployment = {
+                "metadata": {"uid": "u", "resourceVersion": "1"},
+                "spec": {"replicas": 1, "selector": {"matchLabels": {"app": "x"}}},
+            }
             return CommandResult(argv, 0, json.dumps(deployment), "")
         if "get" in argv and "pods" in argv:
             return CommandResult(argv, 0, json.dumps({"items": [{"metadata": {"name": "p"}}]}), "")

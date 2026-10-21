@@ -217,22 +217,31 @@ class EnvOverride(unittest.TestCase):
         self.assertEqual(cast(_ScriptedKubectl, harness.executor).calls, [])
 
     def test_sets_env_on_the_controller_container_then_awaits_the_rollout(self) -> None:
+        deployment = {
+            "metadata": {"uid": "u", "resourceVersion": "1"},
+            "spec": {"replicas": 1, "selector": {"matchLabels": {"app": "x"}}},
+        }
         kubectl = _ScriptedKubectl(
             [
                 _ok(_lease_json()),
                 _ok("space-cluster-controller"),
+                # The fast-rollout pace: read, then patch.
+                _ok(json.dumps(deployment)),
+                _ok(),
                 _ok("cluster-controller"),
                 _ok(),
                 _ok(),
                 # The post-rollout drain: the Deployment, then its one pod.
-                _ok(json.dumps({"spec": {"replicas": 1, "selector": {"matchLabels": {"app": "x"}}}})),
+                _ok(json.dumps(deployment)),
                 _ok(json.dumps({"items": [{"metadata": {"name": "p"}}]})),
+                # The pace restore reads a Deployment with no record left to restore.
+                _ok(json.dumps(deployment)),
             ]
         )
         harness = KindHarness(kubectl, KindConfig())
         _live_lease(harness)
         harness.restore_orphaned_restore_pod_gc_env({GC_ENABLED_ENV: "false", GC_THRESHOLD_ENV: None})
-        set_env = kubectl.calls[3]
+        set_env = kubectl.calls[5]
         self.assertIn("set", set_env)
         self.assertEqual(
             set_env[set_env.index("env"):],
@@ -245,8 +254,8 @@ class EnvOverride(unittest.TestCase):
                 f"{GC_THRESHOLD_ENV}-",
             ),
         )
-        self.assertIn("rollout", kubectl.calls[4])
-        self.assertIn("deploy/space-cluster-controller", kubectl.calls[4])
+        self.assertIn("rollout", kubectl.calls[6])
+        self.assertIn("deploy/space-cluster-controller", kubectl.calls[6])
 
 
 class PlantedOrphanShape(unittest.TestCase):

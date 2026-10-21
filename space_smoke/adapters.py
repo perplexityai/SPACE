@@ -19,7 +19,7 @@ import socket
 import time
 import uuid
 from collections import deque
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from http.client import HTTPException
@@ -282,6 +282,45 @@ def _json_pointer_token(key: str) -> str:
     return key.replace("~", "~0").replace("/", "~1")
 
 
+def _json_pointer_get(document: Mapping[str, Any], pointer: str) -> object | None:
+    """The value at a JSON pointer of plain keys, None if any step is absent."""
+
+    value: object = document
+    for token in pointer.split("/")[1:]:
+        if not isinstance(value, dict) or token not in value:
+            return None
+        value = value[token]
+    return value
+
+
+@dataclass(frozen=True)
+class _RolloutPace:
+    """A Deployment's identity and the pace fields it stood at before a fast rollout (None: unset)."""
+
+    uid: str
+    standing: Mapping[str, object | None]
+
+
+_FAST_ROLLOUT_FIELDS = frozenset({"/spec/minReadySeconds", "/spec/strategy/rollingUpdate/maxSurge"})
+
+
+def _fast_rollout_record(text: str, owner: str) -> dict[str, object | None]:
+    try:
+        record = json.loads(text)
+    except json.JSONDecodeError:
+        record = None
+    if not isinstance(record, dict) or not set(record) <= _FAST_ROLLOUT_FIELDS or not all(
+        value is None
+        or (isinstance(value, int) and not isinstance(value, bool) and value >= 0)
+        or (isinstance(value, str) and re.fullmatch(r"\d+%?", value))
+        for value in record.values()
+    ):
+        raise SmokeConfigurationError(
+            f"{owner} carries an unreadable {FAST_ROLLOUT_STANDING_ANNOTATION} record: {text!r}"
+        )
+    return record
+
+
 def _lease_parts(
     document: Mapping[str, object],
 ) -> tuple[dict[str, object], dict[str, object]]:
@@ -428,6 +467,14 @@ CORDONED_NODE_ANNOTATION = "space.pplx.net/smoke-cordoned-node"
 # without the limiters' store.
 LIMITER_ENV_ANNOTATION = "space.pplx.net/smoke-limiter-env"
 REDIS_REPLICAS_ANNOTATION = "space.pplx.net/smoke-redis-replicas"
+# A rollout a scenario starts only to apply or restore its env
+# (`KindHarness._fast_rollout`) runs with every replacement surged at once and
+# no `minReadySeconds`, and the Deployment carries the `minReadySeconds` and
+# `maxSurge` it stood at (JSON, null for unset) until they are back. A run
+# killed in between leaves the record, and the next fast rollout of that
+# Deployment restores the recorded values rather than its own fast ones.
+FAST_ROLLOUT_STANDING_ANNOTATION = "space.pplx.net/smoke-fast-rollout-standing"
+FAST_ROLLOUT_MAX_SURGE = "100%"
 DRAIN_KEEP_ANNOTATION = "space.pplx.net/drain-keep"
 NODE_GROUP_BOUNDARY_LABEL = "node-restriction.kubernetes.io/space-node-group"
 NODE_GROUP_GATE_ENV = "SPACE_SANDBOX_NODE_GROUP_PLACEMENT"
@@ -1511,6 +1558,11 @@ class KindHarness:
             return
         self._assert_retention_lease_owned()
         deployment = self._controller_deployment()
+        # At the charts' pace, not `_fast_rollout`'s: the sweeper runs on the
+        # Lease holder, and surging every replica retires the old holder only
+        # as the rollout ends, so the new knobs took hold later (on the kind
+        # bench the Lease reached a new pod ~9 s after the write, against
+        # ~6.5 s) even though this wait, which does not drain, returned sooner.
         _require_ok(
             self.kubectl("set", "env", f"deploy/{deployment}", *assignments),
             "set retention sweeper env",
@@ -3115,8 +3167,13 @@ ON CONFLICT (key_hash) DO NOTHING;
         )
 
     def _set_deployment_env(self, name: str, values: Mapping[str, str | None], *, timeout: float) -> None:
-        if self._set_deployment_env_only(name, values):
-            self._await_deployment_rollout(name, timeout=timeout)
+        """Write env literals and await the rollout, at the fast pace: callers set up or restore with it."""
+
+        if not values:
+            return
+        with self._fast_rollout(name):
+            if self._set_deployment_env_only(name, values):
+                self._await_deployment_rollout(name, timeout=timeout)
 
     def _set_deployment_env_only(self, name: str, values: Mapping[str, str | None]) -> bool:
         """`kubectl set env` without waiting; True when anything was set."""
@@ -3137,6 +3194,121 @@ ON CONFLICT (key_hash) DO NOTHING;
             f"await rollout of {name}",
         )
         self._wait_deployment_pods_drained(name, timeout=timeout)
+
+    @contextlib.contextmanager
+    def _fast_rollout(self, name: str) -> Iterator[None]:
+        """Roll `name` fast while the body runs, then put its standing pace back, even if the body fails.
+
+        Only for a rollout that is a scenario's setup or restore, never its
+        subject: a scenario about rollouts, drains, restarts or disruption
+        keeps the chart's pace. Every replacement surges at once and counts as
+        available once Ready, so a two-replica Deployment rolls in one wave
+        without `minReadySeconds`, not in two waves with it. `maxUnavailable`
+        is untouched, so no old replica stops before its replacement is Ready.
+        Neither field is in the pod template, so neither patch rolls a pod.
+        Callers write the env and await the rollout inside the body. A
+        leader-elected Deployment hands its Lease over only once every old
+        replica has gone, after the rollout rather than during it, so a caller
+        waiting on the new leader gains little.
+        """
+
+        pace = self._speed_up_rollout(name)
+        try:
+            yield
+        finally:
+            self._restore_rollout_pace(name, pace)
+
+    def _speed_up_rollout(self, name: str) -> _RolloutPace:
+        pace: _RolloutPace | None = None
+
+        def fast_patch(deployment: Mapping[str, Any]) -> list[dict[str, object]]:
+            nonlocal pace
+            metadata, spec = deployment["metadata"], deployment["spec"]
+            fast: dict[str, object] = {"/spec/minReadySeconds": 0}
+            if (spec.get("strategy") or {}).get("type") == "RollingUpdate":
+                fast["/spec/strategy/rollingUpdate/maxSurge"] = FAST_ROLLOUT_MAX_SURGE
+            annotations = metadata.get("annotations") or {}
+            recorded = annotations.get(FAST_ROLLOUT_STANDING_ANNOTATION)
+            # An earlier run that died mid-rollout left its fast values live;
+            # what it recorded is what the Deployment stood at.
+            previous = _fast_rollout_record(recorded, name) if recorded is not None else {}
+            standing = {
+                pointer: previous[pointer] if pointer in previous else _json_pointer_get(deployment, pointer)
+                for pointer in fast
+            }
+            pace = _RolloutPace(uid=str(metadata["uid"]), standing=standing)
+            patch: list[dict[str, object]] = []
+            if not metadata.get("annotations"):
+                patch.append({"op": "add", "path": "/metadata/annotations", "value": {}})
+            patch.append({
+                "op": "add",
+                "path": f"/metadata/annotations/{_json_pointer_token(FAST_ROLLOUT_STANDING_ANNOTATION)}",
+                "value": json.dumps(standing, sort_keys=True),
+            })
+            patch.extend({"op": "add", "path": pointer, "value": value} for pointer, value in fast.items())
+            return patch
+
+        self._patch_deployment_guarded(name, fast_patch, f"speed up the rollout of {name}")
+        assert pace is not None
+        return pace
+
+    def _restore_rollout_pace(self, name: str, pace: _RolloutPace) -> None:
+        def restore_patch(deployment: Mapping[str, Any]) -> list[dict[str, object]]:
+            metadata = deployment["metadata"]
+            if metadata["uid"] != pace.uid:
+                raise SmokeConfigurationError(f"refusing to restore the rollout pace of a replaced {name}")
+            if FAST_ROLLOUT_STANDING_ANNOTATION not in (metadata.get("annotations") or {}):
+                # A cooperating run's restore already put the record back.
+                return []
+            patch: list[dict[str, object]] = []
+            for pointer, value in pace.standing.items():
+                if value is not None:
+                    patch.append({"op": "add", "path": pointer, "value": value})
+                elif _json_pointer_get(deployment, pointer) is not None:
+                    patch.append({"op": "remove", "path": pointer})
+            patch.append({
+                "op": "remove",
+                "path": f"/metadata/annotations/{_json_pointer_token(FAST_ROLLOUT_STANDING_ANNOTATION)}",
+            })
+            return patch
+
+        self._patch_deployment_guarded(name, restore_patch, f"restore the rollout pace of {name}")
+
+    def _patch_deployment_guarded(
+        self,
+        name: str,
+        build: Callable[[Mapping[str, Any]], list[dict[str, object]]],
+        action: str,
+    ) -> None:
+        """JSON-patch the Deployment as last read; re-read and retry when a concurrent write lands first.
+
+        The Deployment controller writes status throughout a rollout, so a
+        patch guarded by the resourceVersion it read can lose that race.
+        """
+
+        detail = ""
+        for _ in range(5):
+            deployment = json.loads(
+                _require_ok(self.kubectl("get", "deploy", name, "-o", "json", timeout=15), f"read {name}")
+            )
+            patch = build(deployment)
+            if not patch:
+                return
+            metadata = deployment["metadata"]
+            result = self.kubectl(
+                "patch", "deploy", name, "--type=json", "--patch",
+                json.dumps([
+                    {"op": "test", "path": "/metadata/uid", "value": metadata["uid"]},
+                    {"op": "test", "path": "/metadata/resourceVersion", "value": metadata["resourceVersion"]},
+                    *patch,
+                ]),
+                timeout=15,
+            )
+            if result.returncode == 0:
+                return
+            detail = result.detail()
+            time.sleep(0.5)
+        raise SmokeConfigurationError(f"could not {action}: {detail or '<no output>'}")
 
     def node_group_env(self) -> dict[str, str | None]:
         """`api:<key>` / `controller:<key>` literals for the gate and the labeler."""
@@ -3183,10 +3355,11 @@ ON CONFLICT (key_hash) DO NOTHING;
         # group and labelling workers while the API rolls with the gate on.
         # Restore: API first, so the gate is off before the labeler stops and
         # a stray group cannot affect a create in between. The *writes* keep
-        # that order; the two rollouts are then awaited together, since each is
-        # ~11 s on kind and neither depends on the other having finished (the
-        # scenario's create waits for the default group and the labels anyway).
-        # Bench 2026-09-23: 22 s per phase sequential; ~11 s concurrent.
+        # that order; the rollouts are then awaited together, since neither
+        # depends on the other having finished (the scenario's create waits for
+        # the default group and the labels anyway). Each runs at the fast pace
+        # and ends once the replaced pods are gone; the slowest, the API's,
+        # is about 15 s on kind, against about 38 s at the chart's pace.
         order = [("controller", controller), ("api", api)] if controller_first else [("api", api), ("controller", controller)]
         order.append(("internal-api", {k.split(":", 1)[1]: v for k, v in values.items() if k.startswith("internal-api:")}))
         deployments = {
@@ -3195,18 +3368,20 @@ ON CONFLICT (key_hash) DO NOTHING;
             "internal-api": self._internal_api_deployment,
         }
         rolling: list[str] = []
-        for target, assignments in order:
-            if not assignments:
-                continue
-            name = deployments[target]()
-            if self._set_deployment_env_only(name, assignments):
-                rolling.append(name)
-        waits = [
-            background(f"rollout of {name}", lambda name=name: self._await_deployment_rollout(name, timeout=300))
-            for name in rolling
-        ]
-        for wait in waits:
-            wait.join(timeout=330)
+        with contextlib.ExitStack() as paces:
+            for target, assignments in order:
+                if not assignments:
+                    continue
+                name = deployments[target]()
+                paces.enter_context(self._fast_rollout(name))
+                if self._set_deployment_env_only(name, assignments):
+                    rolling.append(name)
+            waits = [
+                background(f"rollout of {name}", lambda name=name: self._await_deployment_rollout(name, timeout=300))
+                for name in rolling
+            ]
+            for wait in waits:
+                wait.join(timeout=330)
 
     def set_node_group_env(self, *, gate: bool, labeler: bool) -> None:
         self._apply_node_group_env(
@@ -4096,11 +4271,12 @@ ON CONFLICT (key_hash) DO NOTHING;
             return
         name = self._public_api_deployment()
         container = self._public_api_container(name)
-        _require_ok(
-            self.kubectl("set", "env", f"deploy/{name}", "-c", container, *assignments, timeout=30),
-            action,
-        )
-        self.wait_public_api_rollout(timeout=240)
+        with self._fast_rollout(name):
+            _require_ok(
+                self.kubectl("set", "env", f"deploy/{name}", "-c", container, *assignments, timeout=30),
+                action,
+            )
+            self.wait_public_api_rollout(timeout=240)
 
     def set_public_api_env(self, overrides: Mapping[str, str]) -> None:
         from space_smoke.rate_limiters import LIMITER_ENV_KEYS

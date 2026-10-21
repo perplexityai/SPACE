@@ -62,11 +62,13 @@ _DURATION_SECONDS = {
         # two liveness-budget windows, one of them with the apiserver down.
         "local.leader_election_brownout_keeps_one_leader": 1680,
         "local.node_ctl_fence_refuses_and_reconciles": 18,
-        "local.node_group_boundary_schedules": 42,
+        # The next three: two Kind runs each, with fast-pace env rollouts.
+        # 38 and 38 s.
+        "local.node_group_boundary_schedules": 40,
+        # 63 and 63 s.
         "local.node_selector_extras_render_and_enforce": 65,
-        # Estimate until a bench run refreshes it: two controller rollouts, three
-        # suspend/restore cycles, three threshold-bound reaps, one survival window.
-        "local.orphaned_restore_pod_gc_reaps_only_superseded": 300,
+        # 128 and 129 s.
+        "local.orphaned_restore_pod_gc_reaps_only_superseded": 130,
         "local.pending_backup_census_reports_blocked_upload": 216,
         "local.private_template_build_isolation": 87,
         # Two episodes share passes: measured 255 s including initial
