@@ -346,10 +346,9 @@ impl ProcessSseState {
         pplx_space_metrics::data_plane::stream_closed(self.session_id.kind().as_str(), result);
         tracing::warn!(%error, "data-plane process event stream failed");
         self.finished = true;
-        // The error's detail can name internal endpoints; it stays in the log.
         self.push_frame(DataPlaneServerFrame::Error {
             code: DataPlaneErrorCode::BackendStreamError,
-            message: "process event stream failed".to_string(),
+            message: PROCESS_STREAM_FAILED.to_string(),
             retryable: true,
         });
     }
@@ -657,10 +656,9 @@ impl FileWatchSseState {
         pplx_space_metrics::data_plane::stream_closed(self.session_id.kind().as_str(), result);
         tracing::warn!(%error, "data-plane file watch event stream failed");
         self.finished = true;
-        // The error's detail can name internal endpoints; it stays in the log.
         self.push_frame(DataPlaneServerFrame::Error {
             code: DataPlaneErrorCode::BackendStreamError,
-            message: "file watch event stream failed".to_string(),
+            message: FILE_WATCH_STREAM_FAILED.to_string(),
             retryable: true,
         });
     }

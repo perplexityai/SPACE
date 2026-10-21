@@ -107,7 +107,7 @@ async fn process_start_http_errors_preserve_permanent_guest_failures() {
             actual_websocket_retryable, websocket_retryable,
             "WebSocket opening errors retain the established stream retry contract"
         );
-        assert_eq!(message, "event stream could not be opened", "{code:?}");
+        assert_eq!(message, STREAM_OPEN_FAILED, "{code:?}");
     }
 }
 
@@ -380,10 +380,14 @@ async fn refusals_before_start_are_retryable_with_retry_after() {
         assert_eq!(body["error"]["code"], expected_code, "{body}");
         assert_eq!(body["error"]["retryable"], true, "{body}");
         assert!(!body.to_string().contains("synthetic guest wording"));
-        let DataPlaneServerFrame::Error { retryable, .. } = stream_start_error_frame(&error) else {
+        let DataPlaneServerFrame::Error {
+            message, retryable, ..
+        } = stream_start_error_frame(&error)
+        else {
             panic!("expected error frame")
         };
         assert!(retryable, "WebSocket agrees with SSE for {code:?}");
+        assert_eq!(message, STREAM_OPEN_REFUSED, "{code:?}");
     }
 }
 
@@ -1008,4 +1012,234 @@ async fn revoked_session_ends_its_stream_at_once() {
     })
     .await
     .expect("the stream ends after the revocation");
+}
+
+/// How the fake backend fails a native WebSocket session.
+#[derive(Clone, Copy)]
+enum BackendFailure {
+    /// The backend stream errors after its first event.
+    MidStream,
+    /// The stream stays open, and a terminal resize is refused.
+    ResizeRefused,
+}
+
+/// Backend status text naming an internal endpoint, which must stay out of
+/// public frames.
+const BACKEND_FAILURE_DETAIL: &str = "dial 192.0.2.10:9443: connection refused";
+
+/// A fake cluster API and worker for one native session that fail it as
+/// `failure` says. Returns its endpoint.
+async fn spawn_backend_failure_fake(
+    session_id: DataPlaneSessionId,
+    failure: BackendFailure,
+) -> String {
+    use prost::Message as _;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let mut route = crate::tests::route_response_with_token(session_id, None);
+    route.backend.as_mut().unwrap().endpoint = endpoint.clone();
+    route.adapter_state_json = match session_id.kind() {
+        SessionKind::FileWatch => r#"{"path":"/tmp"}"#,
+        _ => r#"{"command":["sleep","600"]}"#,
+    }
+    .to_string();
+    let route = route.encode_to_vec();
+    let process_id = pplx_space_public_api::process_id_for_session(session_id).to_string();
+    let service = axum::Router::new().fallback(move |request: Request<Body>| {
+        let route = route.clone();
+        let process_id = process_id.clone();
+        async move {
+            let path = request.uri().path().to_string();
+            if path.ends_with("/Check") {
+                return crate::tests::grpc_test_response(vec![8, 1]);
+            }
+            if path.ends_with("/ResolveDataPlaneSessionRoute") {
+                return crate::tests::grpc_test_response(route);
+            }
+            if path.ends_with("/BindDataPlaneSessionProcess") {
+                return crate::tests::grpc_test_response(Vec::new());
+            }
+            if path.ends_with("/SpacedResizePty") {
+                return tonic::Status::failed_precondition(BACKEND_FAILURE_DETAIL)
+                    .into_http::<Body>();
+            }
+            let first = if path.ends_with("/SpacedWatch") {
+                grpc_message(&FileEvent {
+                    path: "/tmp/changed".to_string(),
+                    kind: SpacedFileEventKind::Modified as i32,
+                    ..Default::default()
+                })
+            } else {
+                assert!(
+                    path.ends_with("/SpacedStartProcess"),
+                    "unexpected call {path}"
+                );
+                grpc_message(&ProcessEvent {
+                    process_id,
+                    pid: Some(42),
+                    event: Some(spaced_process_event::Event::Started(
+                        pplx_space_sbx_mgr_client::operations::ProcessStarted { start_time: None },
+                    )),
+                })
+            };
+            let mut trailers = HeaderMap::new();
+            trailers.insert("grpc-status", HeaderValue::from_static("13"));
+            trailers.insert(
+                "grpc-message",
+                HeaderValue::from_static(BACKEND_FAILURE_DETAIL),
+            );
+            let end = match failure {
+                BackendFailure::MidStream => Some(hyper::body::Frame::trailers(trailers)),
+                BackendFailure::ResizeRefused => None,
+            };
+            let frames = futures_util::stream::iter(
+                [Some(hyper::body::Frame::data(first)), end]
+                    .into_iter()
+                    .flatten()
+                    .map(Ok::<_, Infallible>),
+            )
+            .chain(futures_util::stream::pending());
+            Response::builder()
+                .header("content-type", "application/grpc")
+                .body(Body::new(http_body_util::StreamBody::new(frames)))
+                .unwrap()
+        }
+    });
+    tokio::spawn(async move {
+        axum::serve(listener, service).await.unwrap();
+    });
+    endpoint
+}
+
+/// Serves the data plane against the fake at `endpoint` and attaches a native
+/// WebSocket to the session, returning the upgraded connection.
+async fn attach_native_websocket(
+    endpoint: &str,
+    session_id: DataPlaneSessionId,
+) -> tokio::net::TcpStream {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut state = crate::tests::test_data_plane_state().await;
+    state.cluster_api = ClusterApiClients::service_only(
+        pplx_space_node_api_client::cluster::connect(endpoint.to_string(), "test")
+            .await
+            .unwrap(),
+    );
+    state.revocation_check_interval = Duration::from_secs(3600);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router(state).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    tcp.write_all(
+        format!(
+            "GET /v1/sessions/{session_id}/attach HTTP/1.1\r\n\
+             Host: data-plane.test\r\n\
+             Authorization: Bearer {DATA_PLANE_TOKEN_PREFIX}{}\r\n\
+             Connection: Upgrade\r\n\
+             Upgrade: websocket\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: {}\r\n\r\n",
+            "c".repeat(64),
+            BASE64_STANDARD.encode(b"native-test-nonc"),
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut response = Vec::new();
+    while !response.ends_with(b"\r\n\r\n") {
+        let mut byte = [0_u8; 1];
+        tcp.read_exact(&mut byte).await.expect("upgrade response");
+        response.push(byte[0]);
+    }
+    assert!(response.starts_with(b"HTTP/1.1 101"));
+    tcp
+}
+
+/// Reads server text frames into `seen` until one contains `marker`.
+async fn read_websocket_until(tcp: &mut tokio::net::TcpStream, seen: &mut String, marker: &str) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !seen.contains(marker) {
+            let (opcode, payload) = crate::tests::read_server_frame(tcp).await;
+            assert_eq!(opcode, 0x1, "text frames until {marker}; saw {seen}");
+            seen.push_str(&String::from_utf8_lossy(&payload));
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{marker} within 5s; saw {seen}"));
+}
+
+/// Sends one short client text frame. Client frames must be masked; an
+/// all-zero key leaves the payload as written.
+async fn send_websocket_text(tcp: &mut tokio::net::TcpStream, text: &str) {
+    use tokio::io::AsyncWriteExt;
+    let len = u8::try_from(text.len())
+        .ok()
+        .filter(|len| *len < 126)
+        .unwrap();
+    let mut frame = vec![0x81, 0x80 | len, 0, 0, 0, 0];
+    frame.extend_from_slice(text.as_bytes());
+    tcp.write_all(&frame).await.unwrap();
+}
+
+#[tokio::test]
+async fn websocket_backend_stream_errors_carry_a_fixed_message() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    for (kind, live, message) in [
+        (
+            SessionKind::Process,
+            "process_started",
+            PROCESS_STREAM_FAILED,
+        ),
+        (
+            SessionKind::FileWatch,
+            "file_event",
+            FILE_WATCH_STREAM_FAILED,
+        ),
+    ] {
+        let session_id = DataPlaneSessionId::new_for_kind(kind);
+        let endpoint = spawn_backend_failure_fake(session_id, BackendFailure::MidStream).await;
+        let mut tcp = attach_native_websocket(&endpoint, session_id).await;
+        let mut seen = String::new();
+        read_websocket_until(&mut tcp, &mut seen, live).await;
+        read_websocket_until(&mut tcp, &mut seen, "backend_stream_error").await;
+        assert!(
+            seen.contains(&format!(r#""message":"{message}""#)),
+            "{kind:?}: {seen}"
+        );
+        assert!(
+            !seen.contains("192.0.2.10"),
+            "{kind:?}: internal detail leaked: {seen}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn websocket_resize_refusal_carries_a_fixed_message() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let endpoint = spawn_backend_failure_fake(session_id, BackendFailure::ResizeRefused).await;
+    let mut tcp = attach_native_websocket(&endpoint, session_id).await;
+    let mut seen = String::new();
+    read_websocket_until(&mut tcp, &mut seen, "process_started").await;
+    send_websocket_text(&mut tcp, r#"{"type":"resize","cols":80,"rows":24}"#).await;
+    read_websocket_until(&mut tcp, &mut seen, "resize_not_supported").await;
+    assert!(
+        seen.contains(r#""message":"terminal resize is not supported by this process""#),
+        "{seen}"
+    );
+    assert!(
+        !seen.contains("192.0.2.10"),
+        "internal detail leaked: {seen}"
+    );
 }

@@ -4021,6 +4021,28 @@ async fn legacy_ingress_eof_delivers_buffered_body_without_completion_frames() {
     );
 }
 
+/// Read one server WebSocket frame header from `tcp` and return its opcode and
+/// payload. Server frames are never masked, so the header is two bytes plus an
+/// optional extended length.
+pub(crate) async fn read_server_frame(tcp: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
+    let mut header = [0_u8; 2];
+    tcp.read_exact(&mut header).await.expect("frame header");
+    let opcode = header[0] & 0x0f;
+    let len = match header[1] & 0x7f {
+        126 => {
+            let mut extended = [0_u8; 2];
+            tcp.read_exact(&mut extended)
+                .await
+                .expect("extended length");
+            usize::from(u16::from_be_bytes(extended))
+        }
+        len => usize::from(len),
+    };
+    let mut payload = vec![0_u8; len];
+    tcp.read_exact(&mut payload).await.expect("frame payload");
+    (opcode, payload)
+}
+
 pub(crate) fn grpc_test_response(bytes: Vec<u8>) -> Response {
     let mut message = vec![0];
     message.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
