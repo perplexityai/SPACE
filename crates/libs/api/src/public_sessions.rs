@@ -26,6 +26,10 @@ const SESSION_OPERATION_PROGRESS: &str = "session created";
 const DEFAULT_ATTACH_TOKEN_TTL: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_ATTACH_DEADLINE: Duration = Duration::from_secs(60);
 const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Live attach tokens one session keeps. Each replay of the create mints
+/// another; past this many, the replay evicts the live tokens that expire
+/// first. This bounds a session's rows however often its key is replayed.
+const MAX_LIVE_ATTACH_TOKENS: i64 = 16;
 const DATA_PLANE_TOKEN_PREFIX: &str = "dpt_";
 const DEFAULT_DATA_PLANE_BASE_URL: &str = "";
 const DATA_PLANE_BASE_URL_ENV: &str = "SPACE_DATA_PLANE_PUBLIC_URL";
@@ -57,6 +61,8 @@ pub enum PublicSessionStoreError {
     MissingIdempotencyOperation,
     #[error("session idempotency operation has no target session")]
     MissingIdempotencyTarget,
+    #[error("session was revoked or closed")]
+    SessionRevoked,
     #[error("database error: {0}")]
     Sql(#[from] sqlx::Error),
 }
@@ -108,10 +114,29 @@ impl PublicSessionStore {
             let session_id = fetch_operation_target_session(&mut tx, operation_id)
                 .await?
                 .ok_or(PublicSessionStoreError::MissingIdempotencyTarget)?;
-            let token = refresh_attach_token_tx(&mut tx, session_id).await?;
-            let row = fetch_session_tx(&mut tx, input.org_id, input.sandbox_id, session_id)
-                .await?
-                .ok_or(PublicSessionStoreError::MissingIdempotencyTarget)?;
+            let token = DataPlaneToken::new();
+            let Some(row) = refresh_attach_token_tx(
+                &mut tx,
+                input.org_id,
+                input.sandbox_id,
+                session_id,
+                &token,
+            )
+            .await?
+            else {
+                // The refresh skips a session that has ended. One that still
+                // exists ended by revocation or close; a replay must not hand
+                // out a token for it.
+                return Err(
+                    match fetch_session_tx(&mut tx, input.org_id, input.sandbox_id, session_id)
+                        .await?
+                    {
+                        Some(_) => PublicSessionStoreError::SessionRevoked,
+                        None => PublicSessionStoreError::MissingIdempotencyTarget,
+                    },
+                );
+            };
+            evict_attach_tokens_tx(&mut tx, session_id, &token).await?;
             tx.commit().await?;
             return PublicSessionRow::try_into_public(
                 row,
@@ -129,8 +154,11 @@ impl PublicSessionStore {
         let attach_deadline_at = now + DEFAULT_ATTACH_DEADLINE;
         let expires_at = now + DEFAULT_SESSION_TTL;
 
+        // The token row's foreign key is checked at the end of the statement,
+        // after the session row.
         let row = sqlx::query_as::<_, PublicSessionRow>(sql!(
-            "INSERT INTO data_plane_sessions (
+            "WITH session AS (
+             INSERT INTO data_plane_sessions (
                  session_id,
                  org_id,
                  actor_user_id,
@@ -163,7 +191,27 @@ impl PublicSessionStore {
                        target_path,
                        created_at,
                        updated_at,
-                       expires_at"
+                       expires_at
+             ),
+             token AS (
+             INSERT INTO data_plane_session_tokens (token_hash, session_id, expires_at)
+             SELECT $8, session_id, $9
+             FROM session
+             )
+             SELECT session_id,
+                    sandbox_id,
+                    kind,
+                    state,
+                    reconnect_count,
+                    last_reconnect_reason,
+                    scopes,
+                    target_port,
+                    target_protocol,
+                    target_path,
+                    created_at,
+                    updated_at,
+                    expires_at
+             FROM session"
         ))
         .bind(&session_id_string)
         .bind(input.org_id)
@@ -348,6 +396,14 @@ impl PublicSessionStore {
         .bind(input.reason)
         .bind(transitioned)
         .fetch_one(&mut *tx)
+        .await?;
+
+        sqlx::query(sql!(
+            "DELETE FROM data_plane_session_tokens
+             WHERE session_id = $1"
+        ))
+        .bind(input.session_id.to_string())
+        .execute(&mut *tx)
         .await?;
 
         if transitioned {
@@ -580,28 +636,108 @@ async fn fetch_operation_target_session(
         .transpose()
 }
 
+/// Mint `token` for a replayed session, or `None` when the session has expired
+/// or ended. The session row keeps naming the latest token for validators that
+/// predate `data_plane_session_tokens`; the token row is what keeps earlier
+/// tokens valid. The row lock this takes orders the replay against a
+/// concurrent revoke, whose deletion of the session's tokens then includes
+/// this one.
 async fn refresh_attach_token_tx(
     tx: &mut Transaction<'_, Postgres>,
+    org_id: OrgId,
+    sandbox_id: PublicSandboxId,
     session_id: DataPlaneSessionId,
-) -> Result<DataPlaneToken, sqlx::Error> {
-    let token = DataPlaneToken::new();
+    token: &DataPlaneToken,
+) -> Result<Option<PublicSessionRow>, sqlx::Error> {
     let now = OffsetDateTime::now_utc();
-    let session_id_string = session_id.to_string();
-    sqlx::query(sql!(
-        "UPDATE data_plane_sessions
-         SET token_hash = $2,
-             token_expires_at = $3,
-             attach_deadline_at = $4,
+    sqlx::query_as::<_, PublicSessionRow>(sql!(
+        "WITH session AS (
+         UPDATE data_plane_sessions
+         SET token_hash = $4,
+             token_expires_at = $5,
+             attach_deadline_at = $6,
              updated_at = NOW()
-         WHERE session_id = $1"
+         WHERE org_id = $1
+           AND sandbox_id = $2
+           AND session_id = $3
+           AND (expires_at IS NULL OR expires_at > NOW())
+           AND revocation_status = 'active'
+           AND state NOT IN ('closed', 'revoked', 'failed')
+         RETURNING session_id,
+                   sandbox_id,
+                   kind,
+                   state,
+                   reconnect_count,
+                   last_reconnect_reason,
+                   scopes,
+                   target_port,
+                   target_protocol,
+                   target_path,
+                   created_at,
+                   updated_at,
+                   expires_at
+         ),
+         token AS (
+         INSERT INTO data_plane_session_tokens (token_hash, session_id, expires_at)
+         SELECT $4, session_id, $5
+         FROM session
+         )
+         SELECT session_id,
+                sandbox_id,
+                kind,
+                state,
+                reconnect_count,
+                last_reconnect_reason,
+                scopes,
+                target_port,
+                target_protocol,
+                target_path,
+                created_at,
+                updated_at,
+                expires_at
+         FROM session"
     ))
-    .bind(&session_id_string)
+    .bind(org_id)
+    .bind(sandbox_id.as_uuid())
+    .bind(session_id.to_string())
     .bind(token.hash.as_str())
     .bind(now + DEFAULT_ATTACH_TOKEN_TTL)
     .bind(now + DEFAULT_ATTACH_DEADLINE)
+    .fetch_optional(&mut **tx)
+    .await
+}
+
+/// Delete the session's expired tokens, and its live ones beyond
+/// [`MAX_LIVE_ATTACH_TOKENS`] counting `keep`, earliest expiry first. `keep` is
+/// the token this replay returns and is never evicted.
+async fn evict_attach_tokens_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    session_id: DataPlaneSessionId,
+    keep: &DataPlaneToken,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(sql!(
+        "DELETE FROM data_plane_session_tokens
+         WHERE session_id = $1
+           AND token_hash <> $2
+           AND (
+               expires_at <= NOW()
+               OR token_hash IN (
+                   SELECT token_hash
+                   FROM data_plane_session_tokens
+                   WHERE session_id = $1
+                     AND token_hash <> $2
+                     AND expires_at > NOW()
+                   ORDER BY expires_at DESC, token_hash DESC
+                   OFFSET $3
+               )
+           )"
+    ))
+    .bind(session_id.to_string())
+    .bind(keep.hash.as_str())
+    .bind(MAX_LIVE_ATTACH_TOKENS - 1)
     .execute(&mut **tx)
     .await?;
-    Ok(token)
+    Ok(())
 }
 
 async fn fetch_session_tx(

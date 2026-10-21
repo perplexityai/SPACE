@@ -30,6 +30,14 @@ Ready to run code? Follow [Your first sandbox](../first-sandbox.md) for a comple
 - **Create and attach in one request** by sending `Accept: text/event-stream` with the create. The response is the event stream, preceded by a `command` frame whose `command` field is the handle. If the server answers with the JSON handle instead, attach as usual.
 - **Save output as it arrives.** Streams are live, with no replay. Check `process_exited`; a closed connection alone is not success. See [command output](../first-sandbox.md#read-command-output).
 
+## Renew session tokens
+
+A command's session token, and the token of any other data-plane session, is valid for 5 minutes, until its `attach.expires_at`.
+
+- **Replay the create to get another token.** Sending the same method, path, body, and `Idempotency-Key` again returns the same session with an additional 5-minute token. Earlier tokens stay valid until their own `expires_at`, so a renewal or a concurrent retry does not invalidate a token still in use. A session keeps at most 16 unexpired tokens; past that, a replay revokes the ones that expire first.
+- **An attached stream outlives its token.** It is not closed when the token expires. Reconnecting needs an unexpired token, and so does every request through a port or protocol session.
+- **Renewal ends with the session**, 24 hours after it was created. Revoking a session ends all of its tokens. Replaying the create of a revoked or closed session returns `409` `conflict` with the detail `{"key": "reason", "value": "session_revoked"}` and no token; create a new session with a new key instead.
+
 ## Retry safely
 
 Error samples are illustrative, not exhaustive. Messages can change, and the same HTTP status can have different codes or retryability. Follow the returned `retryable` flag and `Retry-After`, not the sample.

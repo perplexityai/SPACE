@@ -26,6 +26,11 @@ pub(super) struct SessionRouteRow {
     pub(super) scopes: Vec<String>,
     pub(super) token_hash: Option<String>,
     pub(super) token_expires_at: Option<OffsetDateTime>,
+    /// Expiry of the presented attach token's `data_plane_session_tokens` row,
+    /// `None` when it has none. Only [`fetch_route_row`] reads it; authorization
+    /// runs on that row, before any route update.
+    #[sqlx(default)]
+    pub(super) presented_token_expires_at: Option<OffsetDateTime>,
     pub(super) sandbox_active_node_id: Option<NodeId>,
     pub(super) sandbox_lifecycle: SandboxLifecycle,
     pub(super) node_address: Option<String>,
@@ -53,8 +58,14 @@ pub(crate) async fn resolve_session_route(
     let deadline = tokio::time::Instant::now() + budget;
     let mut activated = false;
     loop {
-        let mut row = fetch_route_row(pool, &session_id, protocol_session_id.as_deref()).await?;
-        validate_attach_authorization(
+        let mut row = fetch_route_row(
+            pool,
+            &session_id,
+            protocol_session_id.as_deref(),
+            token_sha256.as_deref(),
+        )
+        .await?;
+        let token_expires_at = validate_attach_authorization(
             &row,
             refresh_authority,
             token_sha256.as_deref(),
@@ -64,7 +75,7 @@ pub(crate) async fn resolve_session_route(
             row.kind.parse::<SessionKind>(),
             Ok(SessionKind::Port | SessionKind::Protocol)
         ) {
-            validate_ingress_session(&row)?;
+            validate_ingress_session(&row, token_expires_at)?;
             Some(
                 pplx_space_common_svc::ingress_admission::IngressPreparationPermit::acquire(Some(
                     row.sandbox_id,
@@ -308,10 +319,13 @@ pub(super) fn data_plane_session_transport(
     }
 }
 
-pub(super) fn validate_ingress_session(row: &SessionRouteRow) -> Result<(), Status> {
+pub(super) fn validate_ingress_session(
+    row: &SessionRouteRow,
+    token_expires_at: Option<OffsetDateTime>,
+) -> Result<(), Status> {
     validate_ingress_session_access(
         &row.revocation_status,
-        row.token_expires_at,
+        token_expires_at,
         OffsetDateTime::now_utc(),
     )
 }
@@ -330,19 +344,21 @@ pub(super) fn validate_ingress_session_access(
     Ok(())
 }
 
+/// Authorize an attach, returning the expiry that bounds it: the presented
+/// token's, or for a tokenless edge refresh the session's latest token's.
 pub(super) fn validate_attach_authorization(
     row: &SessionRouteRow,
     refresh_authority: Option<DataPlaneSessionRefreshAuthority>,
     token_sha256: Option<&str>,
     required_scope: Option<&str>,
-) -> Result<(), Status> {
+) -> Result<Option<OffsetDateTime>, Status> {
     if token_sha256.is_none() && required_scope.is_none() {
         // The data-plane edge refreshes the route of a session it already
         // attached without re-sending the attach secret. Any other caller
         // holding only a session ID must prove the attach, or the ID alone
         // would mint a route token for another tenant's session.
         return match refresh_authority {
-            Some(DataPlaneSessionRefreshAuthority::Granted) => Ok(()),
+            Some(DataPlaneSessionRefreshAuthority::Granted) => Ok(row.token_expires_at),
             _ => Err(Status::unauthenticated(
                 "data-plane attach token is required",
             )),
@@ -353,22 +369,31 @@ pub(super) fn validate_attach_authorization(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| Status::unauthenticated("data-plane attach token is required"))?;
-    let stored_hash = row
-        .token_hash
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| Status::unauthenticated("data-plane session has no attach token"))?;
-    if stored_hash
-        .as_bytes()
-        .ct_eq(token_sha256.as_bytes())
-        .unwrap_u8()
-        != 1
-    {
-        return Err(Status::unauthenticated("invalid data-plane attach token"));
-    }
+    // A token with a row in `data_plane_session_tokens` carries its own expiry.
+    // Any other token must be the one the session row names: the latest, and
+    // the only one a server that predates the table minted.
+    let token_expires_at = match row.presented_token_expires_at {
+        Some(expires_at) => Some(expires_at),
+        None => {
+            let stored_hash = row
+                .token_hash
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| Status::unauthenticated("data-plane session has no attach token"))?;
+            if stored_hash
+                .as_bytes()
+                .ct_eq(token_sha256.as_bytes())
+                .unwrap_u8()
+                != 1
+            {
+                return Err(Status::unauthenticated("invalid data-plane attach token"));
+            }
+            row.token_expires_at
+        }
+    };
 
-    match row.token_expires_at {
+    match token_expires_at {
         Some(expires_at) if expires_at > OffsetDateTime::now_utc() => {}
         Some(_) => return Err(Status::unauthenticated("data-plane attach token expired")),
         None => {
@@ -386,5 +411,5 @@ pub(super) fn validate_attach_authorization(
         ));
     }
 
-    Ok(())
+    Ok(token_expires_at)
 }

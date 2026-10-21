@@ -1105,3 +1105,232 @@ async fn seed_sandbox(pool: &PgPool, org_id: OrgId, user_id: UserId) -> Result<U
     .await?;
     Ok(id)
 }
+
+/// One terminal session create, replayable with the same key and body.
+struct ReplayableCreate {
+    store: PublicSessionStore,
+    org_id: OrgId,
+    actor_id: UserId,
+    sandbox_id: PublicSandboxId,
+    request: serde_json::Value,
+    fingerprint: serde_json::Value,
+    key: IdempotencyKey,
+}
+
+impl ReplayableCreate {
+    async fn seed(pool: &PgPool, key: &str) -> TestResult<Self> {
+        let org_id = OrgId::from_uuid(seed_org(pool).await?);
+        let actor_id = UserId::from_uuid(seed_user(pool, org_id).await?);
+        let sandbox_id = PublicSandboxId::from_uuid(seed_sandbox(pool, org_id, actor_id).await?);
+        let request = serde_json::json!({"command": [], "env": {}});
+        let fingerprint = session_fingerprint_payload(
+            sandbox_id,
+            SessionKind::Terminal,
+            None,
+            None,
+            None,
+            &request,
+        );
+        Ok(Self {
+            store: PublicSessionStore::with_data_plane_base_url(pool.clone(), ""),
+            org_id,
+            actor_id,
+            sandbox_id,
+            request,
+            fingerprint,
+            key: IdempotencyKey::parse(key)?,
+        })
+    }
+
+    async fn create(&self) -> Result<PublicSession, PublicSessionStoreError> {
+        self.store
+            .create_session(CreatePublicSession {
+                org_id: self.org_id,
+                actor_user_id: Some(self.actor_id),
+                sandbox_id: self.sandbox_id,
+                kind: SessionKind::Terminal,
+                target_port: None,
+                target_protocol: None,
+                target_path: None,
+                adapter_state: self.request.clone(),
+                fingerprint_payload: &self.fingerprint,
+                idempotency: CreatePublicSessionIdempotency {
+                    method: HttpOperationMethod::Post,
+                    path_template: OperationPathTemplate::new(
+                        "/v1/sandboxes/{sandbox_id}/terminal-sessions",
+                    ),
+                    key: &self.key,
+                },
+            })
+            .await
+    }
+
+    async fn revoke(&self, session_id: DataPlaneSessionId) -> TestResult {
+        self.store
+            .revoke_session(RevokePublicSession {
+                org_id: self.org_id,
+                sandbox_id: self.sandbox_id,
+                session_id,
+                reason: "user_requested",
+            })
+            .await?
+            .expect("session should be revoked");
+        Ok(())
+    }
+}
+
+fn attach_token_hash(session: &PublicSession) -> String {
+    hash_token(&session.attach.as_ref().expect("attach token").token)
+}
+
+/// The session's token rows that have not expired, by hash.
+async fn live_token_hashes(
+    pool: &PgPool,
+    session_id: DataPlaneSessionId,
+) -> Result<std::collections::BTreeSet<String>, sqlx::Error> {
+    let hashes = sqlx::query_scalar::<_, String>(sql!(
+        "SELECT token_hash
+         FROM data_plane_session_tokens
+         WHERE session_id = $1 AND expires_at > NOW()"
+    ))
+    .bind(session_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    Ok(hashes.into_iter().collect())
+}
+
+async fn token_row_count(
+    pool: &PgPool,
+    session_id: DataPlaneSessionId,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(sql!(
+        "SELECT COUNT(*) FROM data_plane_session_tokens WHERE session_id = $1"
+    ))
+    .bind(session_id.to_string())
+    .fetch_one(pool)
+    .await
+}
+
+#[tokio::test]
+async fn concurrent_replays_each_add_a_token_and_keep_earlier_ones() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let create = ReplayableCreate::seed(&db.pool, "concurrent-token-replays").await?;
+    let first = create.create().await?;
+    let first_hash = attach_token_hash(&first);
+    assert_eq!(
+        live_token_hashes(&db.pool, first.id).await?,
+        [first_hash.clone()].into()
+    );
+
+    let replays = futures_util::future::join_all((0..10).map(|_| create.create())).await;
+    let mut hashes = std::collections::BTreeSet::from([first_hash.clone()]);
+    for replay in replays {
+        let replay = replay?;
+        assert_eq!(replay.id, first.id);
+        hashes.insert(attach_token_hash(&replay));
+    }
+    assert_eq!(hashes.len(), 11, "every replay mints a distinct token");
+    assert_eq!(live_token_hashes(&db.pool, first.id).await?, hashes);
+
+    // The session row still names one of them for validators that predate
+    // the token table.
+    let latest = sqlx::query_scalar::<_, Option<String>>(sql!(
+        "SELECT token_hash FROM data_plane_sessions WHERE session_id = $1"
+    ))
+    .bind(first.id.to_string())
+    .fetch_one(&db.pool)
+    .await?
+    .expect("session row names the latest token");
+    assert!(hashes.contains(&latest));
+    Ok(())
+}
+
+#[tokio::test]
+async fn replay_prunes_expired_tokens_and_caps_live_ones() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let create = ReplayableCreate::seed(&db.pool, "capped-token-replays").await?;
+    let first = create.create().await?;
+    sqlx::query(sql!(
+        "INSERT INTO data_plane_session_tokens (token_hash, session_id, expires_at)
+         VALUES ('expired-token-hash', $1, NOW() - INTERVAL '1 second')"
+    ))
+    .bind(first.id.to_string())
+    .execute(&db.pool)
+    .await?;
+
+    let mut minted = vec![attach_token_hash(&first)];
+    for _ in 0..20 {
+        minted.push(attach_token_hash(&create.create().await?));
+    }
+
+    // 21 minted: the five that expire first are evicted, and the expired row
+    // is gone.
+    let live = live_token_hashes(&db.pool, first.id).await?;
+    let newest: std::collections::BTreeSet<String> = minted[5..].iter().cloned().collect();
+    assert_eq!(live.len(), 16);
+    assert_eq!(live, newest);
+    assert_eq!(token_row_count(&db.pool, first.id).await?, 16);
+    Ok(())
+}
+
+#[tokio::test]
+async fn revoke_deletes_every_token_and_replay_is_refused() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let create = ReplayableCreate::seed(&db.pool, "revoked-token-replay").await?;
+    let first = create.create().await?;
+    create.create().await?;
+    assert_eq!(token_row_count(&db.pool, first.id).await?, 2);
+
+    create.revoke(first.id).await?;
+    assert_eq!(token_row_count(&db.pool, first.id).await?, 0);
+
+    let replay = create
+        .create()
+        .await
+        .expect_err("a revoked session's replay must not mint a token");
+    assert!(
+        matches!(replay, PublicSessionStoreError::SessionRevoked),
+        "{replay:?}"
+    );
+    assert_eq!(token_row_count(&db.pool, first.id).await?, 0);
+    let column = sqlx::query_scalar::<_, Option<String>>(sql!(
+        "SELECT token_hash FROM data_plane_sessions WHERE session_id = $1"
+    ))
+    .bind(first.id.to_string())
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(column, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn replay_of_an_ended_session_is_refused() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    for state in ["closed", "revoked", "failed"] {
+        let create = ReplayableCreate::seed(&db.pool, &format!("{state}-token-replay")).await?;
+        let first = create.create().await?;
+        sqlx::query(sql!(
+            "UPDATE data_plane_sessions SET state = $2 WHERE session_id = $1"
+        ))
+        .bind(first.id.to_string())
+        .bind(state)
+        .execute(&db.pool)
+        .await?;
+
+        let replay = create.create().await.expect_err(state);
+        assert!(
+            matches!(replay, PublicSessionStoreError::SessionRevoked),
+            "{state}: {replay:?}"
+        );
+        assert_eq!(token_row_count(&db.pool, first.id).await?, 1, "{state}");
+    }
+    Ok(())
+}

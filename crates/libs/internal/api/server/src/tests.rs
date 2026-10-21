@@ -2591,6 +2591,98 @@ async fn data_plane_route_resolve_validates_token_and_scope() -> TestResult {
     Ok(())
 }
 
+/// Every live token a session's create or replays minted attaches, each until
+/// its own expiry; a token with no row still attaches when the session row
+/// names it, as one minted by a server that predates the token table does.
+#[tokio::test(flavor = "current_thread")]
+async fn data_plane_route_resolve_accepts_each_live_session_token() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    let sandbox_id = SandboxId::new();
+    let session_id = format!("term_{}", Uuid::now_v7());
+    let other_session_id = format!("term_{}", Uuid::now_v7());
+
+    insert_data_plane_worker_node(&fixture.service.pool, node_id, "10.0.0.32").await?;
+    insert_data_plane_active_sandbox(&fixture.service.pool, sandbox_id, node_id).await?;
+    insert_active_execution(&fixture.service.pool, sandbox_id, "10.80.0.32", 32).await?;
+    insert_data_plane_session(&fixture.service.pool, &session_id, sandbox_id).await?;
+    insert_data_plane_session(&fixture.service.pool, &other_session_id, sandbox_id).await?;
+    sqlx::query(
+        "UPDATE data_plane_sessions
+             SET token_hash = 'latest-token',
+                 token_expires_at = NOW() + ('5 minutes')::INTERVAL,
+                 scopes = ARRAY['terminal:connect']",
+    )
+    .execute(&fixture.service.pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO data_plane_session_tokens (token_hash, session_id, expires_at)
+             VALUES ('latest-token', $1, NOW() + ('5 minutes')::INTERVAL),
+                    ('earlier-token', $1, NOW() + ('2 minutes')::INTERVAL),
+                    ('expired-token', $1, NOW() - ('1 second')::INTERVAL),
+                    ('other-session-token', $2, NOW() + ('5 minutes')::INTERVAL)",
+    )
+    .bind(&session_id)
+    .bind(&other_session_id)
+    .execute(&fixture.service.pool)
+    .await?;
+
+    let resolve = |session_id: &str, token: &str| {
+        fixture
+            .service
+            .resolve_data_plane_session_route(data_plane_request(
+                ResolveDataPlaneSessionRouteRequest {
+                    session_id: session_id.to_string(),
+                    protocol_session_id: None,
+                    token_sha256: Some(token.to_string()),
+                    required_scope: Some("terminal:connect".to_string()),
+                    requested_transport: None,
+                },
+            ))
+    };
+
+    resolve(&session_id, "latest-token").await?;
+    resolve(&session_id, "earlier-token").await?;
+    for token in ["expired-token", "other-session-token", "unknown-token"] {
+        let error = resolve(&session_id, token)
+            .await
+            .expect_err("token must not attach");
+        assert_eq!(error.code(), Code::Unauthenticated, "{token}");
+    }
+
+    // The session row's token attaches without a row of its own.
+    sqlx::query(
+        "UPDATE data_plane_sessions
+             SET token_hash = 'column-only-token'
+             WHERE session_id = $1",
+    )
+    .bind(&session_id)
+    .execute(&fixture.service.pool)
+    .await?;
+    resolve(&session_id, "column-only-token").await?;
+    resolve(&session_id, "earlier-token").await?;
+
+    // A revoke by a server that predates the token table clears only the
+    // session row's token; that alone must end every token.
+    sqlx::query(
+        "UPDATE data_plane_sessions
+             SET token_hash = NULL, token_expires_at = NOW()
+             WHERE session_id = $1",
+    )
+    .bind(&session_id)
+    .execute(&fixture.service.pool)
+    .await?;
+    for token in ["latest-token", "earlier-token", "column-only-token"] {
+        let error = resolve(&session_id, token)
+            .await
+            .expect_err("revoked session token must not attach");
+        assert_eq!(error.code(), Code::Unauthenticated, "{token}");
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn ecw_route_resolve_allows_envd_with_api_key() -> TestResult {
     if !pplx_space_test_env::enter_test_process(&[
