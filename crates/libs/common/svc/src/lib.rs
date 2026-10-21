@@ -122,12 +122,7 @@ pub fn init_service_subprocess_with_log_context(
     pplx_space_observability::init_with_log_context(service_name, log_context)
 }
 
-pub fn install_default_rustls_crypto_provider() {
-    match rustls::crypto::aws_lc_rs::default_provider().install_default() {
-        Ok(()) => {}
-        Err(_already_installed) => {}
-    }
-}
+pub use pplx_space_rustls_provider::install_default_rustls_crypto_provider;
 
 pub use bootstrap::{
     CLIENT_SERVICE_METADATA_KEY, GRPC_HTTP2_KEEPALIVE_INTERVAL, GRPC_HTTP2_KEEPALIVE_TIMEOUT,

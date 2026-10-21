@@ -55,6 +55,7 @@ members = [
     "crates/libs/sbx/mgr/migrations",
     "crates/libs/sbx/mgr/server",
     "crates/libs/sbx/mgr/store",
+    "crates/libs/rustls-provider",
     "crates/libs/sqlite",
     "crates/libs/unix-socket-path",
     "crates/libs/node/api/client",
@@ -360,6 +361,7 @@ pplx-space-sbxmgr-migrations = { path = "crates/libs/sbx/mgr/migrations" }
 pplx-space-sbx-mgr = { path = "crates/libs/sbx/mgr/server" }
 pplx-space-sbx-mgr-client = { path = "crates/libs/sbx/mgr/client" }
 pplx-space-sbx-mgr-store = { path = "crates/libs/sbx/mgr/store" }
+pplx-space-rustls-provider = { path = "crates/libs/rustls-provider" }
 pplx-space-sqlite = { path = "crates/libs/sqlite" }
 pplx-space-spaced-build = { path = "crates/libs/spaced/build" }
 pplx-space-spaced-guest-protocol = { path = "crates/libs/spaced/guest/protocol" }

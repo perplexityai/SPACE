@@ -5510,11 +5510,11 @@ dependencies = [
  "pplx-space-dependency-drain",
  "pplx-space-metrics",
  "pplx-space-observability",
+ "pplx-space-rustls-provider",
  "pplx-space-test-env",
  "pplx-space-unix-socket-path",
  "rand 0.10.2",
  "redis",
- "rustls",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -5680,8 +5680,8 @@ dependencies = [
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-common-proto-build",
- "pplx-space-common-svc",
  "pplx-space-credential-injection-core",
+ "pplx-space-rustls-provider",
  "pplx-space-test-env",
  "prost",
  "rustls",
@@ -6679,6 +6679,13 @@ dependencies = [
  "clap",
  "pplx-space-common-core",
  "pplx-space-node-runtime-supervisor",
+]
+
+[[package]]
+name = "pplx-space-rustls-provider"
+version = "0.8.0"
+dependencies = [
+ "rustls",
 ]
 
 [[package]]

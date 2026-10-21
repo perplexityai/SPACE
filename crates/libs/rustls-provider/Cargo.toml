@@ -1,0 +1,18 @@
+[package]
+name = "pplx-space-rustls-provider"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The features common-svc enabled for this call. `aws_lc_rs` provides the
+# provider and `tls12` keeps TLS 1.2 in its default cipher suites. Other
+# features that shape the provider, such as `prefer-post-quantum` and `fips`,
+# come from the rest of the build.
+rustls = { workspace = true, default-features = false, features = ["aws_lc_rs", "std", "tls12"] }

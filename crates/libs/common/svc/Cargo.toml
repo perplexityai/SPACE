@@ -45,7 +45,6 @@ nix = { workspace = true, features = ["fs", "user"] }
 pin-project-lite = { workspace = true }
 redis = { workspace = true }
 rand = { workspace = true }
-rustls = { workspace = true, default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -71,6 +70,7 @@ pplx-space-common-grpc = { workspace = true }
 pplx-space-dependency-drain = { workspace = true }
 pplx-space-metrics = { workspace = true }
 pplx-space-observability = { workspace = true }
+pplx-space-rustls-provider = { workspace = true }
 pplx-space-unix-socket-path = { workspace = true }
 
 [dev-dependencies]

@@ -215,7 +215,7 @@ impl CredmgrEndpoint {
 /// Ensure the repository-standard AWS-LC `CryptoProvider` is installed before
 /// tonic materializes a rustls `ClientConfig`.
 fn ensure_crypto_provider() {
-    pplx_space_common_svc::install_default_rustls_crypto_provider();
+    pplx_space_rustls_provider::install_default_rustls_crypto_provider();
 }
 
 /// Build the rustls client config, re-reading the CA PEM so renewed server
