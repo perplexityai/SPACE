@@ -13,8 +13,12 @@ use pplx_space_sbx_mgr_client::proto::access_idle_update::Operation as AccessIdl
 /// `FieldPatch::Clear` becomes reachable when the request type grows an
 /// `InheritTemplateDefault` arm for resources, as the network-policy and
 /// auto-lifecycle patches already have.
-fn to_field_patch(value: Option<u32>) -> FieldPatch<i32> {
-    value.map_or(FieldPatch::Unchanged, |value| FieldPatch::Set(value as i32))
+fn to_field_patch(
+    value: Option<u32>,
+    field: &'static str,
+) -> Result<FieldPatch<i32>, ControllerError> {
+    Ok(super::queries::stored_resource(value, field)?
+        .map_or(FieldPatch::Unchanged, FieldPatch::Set))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,6 +258,7 @@ impl SandboxController {
         }
 
         if req.vcpu.is_some() || req.memory_mib.is_some() || req.pids_max.is_some() {
+            let memory_mib = to_field_patch(req.memory_mib, "memory_mib")?;
             let mut client = self
                 .control_runtime_client(pool, sandbox, super::lifecycle::SandboxAction::Update)
                 .await?;
@@ -278,7 +283,7 @@ impl SandboxController {
                     pool,
                     id,
                     sandbox_store::SandboxDesiredStatePatch {
-                        memory_mib: to_field_patch(req.memory_mib),
+                        memory_mib,
                         ..Default::default()
                     },
                 )

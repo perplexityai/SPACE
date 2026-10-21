@@ -40,7 +40,7 @@ use crate::{
 use super::{
     error::{PublicApiError, with_retry_after_hint},
     owner_scope::{AuthorizedSandbox, authorized_sandbox},
-    sandboxes::parse_public_sandbox_id,
+    sandboxes::{idempotency_key, parse_public_sandbox_id},
 };
 
 const MAX_FILE_LIST_ENTRIES: usize = 10_000;
@@ -90,7 +90,6 @@ pub(crate) const WRITE_FILE_BATCH_BODY_LIMIT_BYTES: usize = MAX_FILE_WRITE_BATCH
     + MAX_WRITE_BATCH_ENTRIES * FILE_WRITE_BATCH_ENTRY_JSON_OVERHEAD_BYTES
     + 64 * 1024;
 const DEFAULT_FILE_LIST_DEPTH: u32 = 1;
-const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 
 pub async fn stat_file(
     State(state): State<AppState>,
@@ -617,19 +616,6 @@ fn parse_guest_user(user: Option<String>) -> Result<Option<GuestUserName>, Publi
     user.map(GuestUserName::parse)
         .transpose()
         .map_err(|error| PublicApiError::bad_request(error.to_string()))
-}
-
-fn idempotency_key(headers: &HeaderMap) -> Result<IdempotencyKey, PublicApiError> {
-    let Some(value) = headers
-        .get(IDEMPOTENCY_KEY_HEADER)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return Err(PublicApiError::bad_request(
-            "Idempotency-Key header is required",
-        ));
-    };
-    IdempotencyKey::parse(value)
-        .map_err(|error| PublicApiError::bad_request(format!("invalid Idempotency-Key: {error}")))
 }
 
 fn decode_write_payload(data_base64: &str) -> Result<Vec<u8>, PublicApiError> {

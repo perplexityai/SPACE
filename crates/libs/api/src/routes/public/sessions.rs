@@ -43,7 +43,8 @@ use super::{
     sandboxes::parse_public_sandbox_id,
 };
 
-const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
+pub(crate) use super::sandboxes::idempotency_key;
+
 const TERMINAL_SESSION_PATH_TEMPLATE: &str = native_routes::CREATE_TERMINAL_SESSION.path();
 const PROCESS_SESSION_PATH_TEMPLATE: &str = native_routes::CREATE_PROCESS_SESSION.path();
 const COMMAND_PATH_TEMPLATE: &str = native_routes::CREATE_COMMAND.path();
@@ -705,19 +706,6 @@ async fn ensure_sandbox_owner(
     sandbox_id: PublicSandboxId,
 ) -> Result<Sandbox, PublicApiError> {
     authorized_sandbox(authorized, pool, org_id, sandbox_id).await
-}
-
-pub(crate) fn idempotency_key(headers: &HeaderMap) -> Result<IdempotencyKey, PublicApiError> {
-    let Some(value) = headers
-        .get(IDEMPOTENCY_KEY_HEADER)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return Err(PublicApiError::bad_request(
-            "Idempotency-Key header is required",
-        ));
-    };
-    IdempotencyKey::parse(value)
-        .map_err(|error| PublicApiError::bad_request(format!("invalid Idempotency-Key: {error}")))
 }
 
 fn validate_terminal_size(size: Option<&TerminalSize>) -> Result<(), PublicApiError> {

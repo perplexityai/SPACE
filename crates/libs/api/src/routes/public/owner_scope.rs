@@ -10,7 +10,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use pplx_space_common_core::types::{IdempotencyKey, SandboxOwnerSource};
+use pplx_space_common_core::types::SandboxOwnerSource;
 use pplx_space_public_api::PublicSandboxId;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -259,14 +259,13 @@ fn namespace_idempotency_key(
     headers: &mut HeaderMap,
     subject_id: UserId,
 ) -> Result<(), PublicApiError> {
-    let Some(key) = headers.get("idempotency-key") else {
+    if !headers.contains_key("idempotency-key") {
         return Ok(());
-    };
-    let key = key
-        .to_str()
-        .map_err(|_| PublicApiError::bad_request("invalid Idempotency-Key"))?;
-    IdempotencyKey::parse(key)
-        .map_err(|_| PublicApiError::bad_request("invalid Idempotency-Key"))?;
+    }
+    // Check the caller's key before it is replaced by its hash, so a
+    // federated caller meets the same header limits as every other caller.
+    let key = super::sandboxes::idempotency_key(headers)?;
+    let key = key.as_str();
     // The existing store namespace is org + route + key. Add the durable
     // materialized subject without a schema change; never hash mutable flags.
     let mut hash = Sha256::new();

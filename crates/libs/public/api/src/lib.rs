@@ -21,6 +21,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 #[cfg(any(feature = "schema", feature = "serde"))]
 mod command;
+pub mod limits;
 pub mod routes;
 mod sandbox;
 #[cfg(feature = "schema")]
@@ -1201,16 +1202,31 @@ pub struct CreateSandboxRequest {
     )]
     pub runtime: Option<RuntimeKind>,
     #[cfg_attr(feature = "serde", serde(default))]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "schema::optional_sandbox_name")
+    )]
     pub name: Option<String>,
-    /// Guest environment for the sandbox.
-    ///
-    /// Accepts string keys and values without the command endpoint's
-    /// environment-name and size limits.
+    // Guest environment, bounded by the command endpoint's entry and size
+    // limits but not its key-name grammar. A doc comment here would replace
+    // the schema's description, which states the limits.
     #[cfg_attr(feature = "serde", serde(default))]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "schema::sandbox_environment_map")
+    )]
     pub env: BTreeMap<String, String>,
     #[cfg_attr(feature = "serde", serde(default))]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "schema::sandbox_metadata_input")
+    )]
     pub metadata: PublicSandboxMetadata,
     #[cfg_attr(feature = "serde", serde(default))]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "schema::optional_sandbox_resources_input")
+    )]
     pub resources: Option<SandboxResources>,
     #[cfg_attr(feature = "serde", serde(default))]
     #[cfg_attr(
@@ -2082,7 +2098,10 @@ pub struct PublicErrorEnvelope {
     /// (`sandbox_not_running`), `state` (the sandbox's lifecycle state) and,
     /// unless the sandbox is deleting or failed, `wake` (the request that
     /// returns it to running). An `invalid_request` for a command streamed
-    /// with a `pty` carries `{"key": "field", "value": "pty"}`.
+    /// with a `pty` carries `{"key": "field", "value": "pty"}`. An
+    /// `invalid_request` for a sandbox create or update field outside its limit
+    /// carries `{"key": "field", "value": "<field>"}`, such as `metadata` or
+    /// `resources.vcpu`.
     pub details: Vec<PublicErrorDetail>,
 }
 

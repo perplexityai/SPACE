@@ -271,6 +271,20 @@ fn claim_duration_ms(accumulated_nanos: &AtomicU64) -> f64 {
     accumulated_nanos.load(Ordering::Relaxed) as f64 / 1_000_000.0
 }
 
+/// A resource request as the `integer` column stores it. A value past
+/// `i32::MAX` is rejected rather than wrapped to a negative.
+pub(super) fn stored_resource(
+    value: Option<u32>,
+    field: &'static str,
+) -> Result<Option<i32>, ControllerError> {
+    value
+        .map(|value| {
+            i32::try_from(value)
+                .map_err(|_| ControllerError::bad_request(format!("{field} is out of range")))
+        })
+        .transpose()
+}
+
 impl PoolCreateResult {
     fn warm(
         response: SandboxResponse,
@@ -1393,9 +1407,9 @@ impl SandboxController {
             managed_by: self.substrate.managed_by(),
             template,
             content_hash: &resolved_content_hash,
-            vcpu: resources.vcpu.map(|value| value as i32),
-            memory_mib: resources.memory_mib.map(|value| value as i32),
-            disk_mib: resources.disk_mib.map(|value| value as i32),
+            vcpu: stored_resource(resources.vcpu, "vcpu")?,
+            memory_mib: stored_resource(resources.memory_mib, "memory_mib")?,
+            disk_mib: stored_resource(resources.disk_mib, "disk_mib")?,
             disk_io_limits,
             env: &env,
             metadata: &req.metadata,

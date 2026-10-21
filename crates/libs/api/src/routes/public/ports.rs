@@ -36,10 +36,9 @@ use crate::{
 use super::{
     error::{PublicApiError, with_retry_after_hint},
     owner_scope::{AuthorizedSandbox, authorized_sandbox},
-    sandboxes::parse_public_sandbox_id,
+    sandboxes::{idempotency_key, parse_public_sandbox_id},
 };
 
-const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 const OPEN_PORT_PATH_TEMPLATE: &str = pplx_space_public_api::routes::OPEN_PORT.path();
 const CLOSE_PORT_PATH_TEMPLATE: &str = pplx_space_public_api::routes::CLOSE_PORT.path();
 
@@ -222,19 +221,6 @@ fn validate_port(port: u16) -> Result<(), PublicApiError> {
         ));
     }
     Ok(())
-}
-
-fn idempotency_key(headers: &HeaderMap) -> Result<IdempotencyKey, PublicApiError> {
-    let Some(value) = headers
-        .get(IDEMPOTENCY_KEY_HEADER)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return Err(PublicApiError::bad_request(
-            "Idempotency-Key header is required",
-        ));
-    };
-    IdempotencyKey::parse(value)
-        .map_err(|error| PublicApiError::bad_request(format!("invalid Idempotency-Key: {error}")))
 }
 
 fn controller_port_protocol(value: PortExposureProtocol) -> ControllerPortProtocol {

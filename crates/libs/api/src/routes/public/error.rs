@@ -220,6 +220,17 @@ impl PublicApiError {
         error
     }
 
+    /// An `invalid_request` for a create or update field outside its limit,
+    /// naming the field in `details`.
+    pub fn request_limit(error: pplx_space_public_api::limits::RequestLimitError) -> Self {
+        let mut rejected = Self::bad_request(error.to_string());
+        rejected.details.push(PublicErrorDetail {
+            key: pplx_space_public_api::INVALID_REQUEST_FIELD_DETAIL_KEY.to_string(),
+            value: error.field().as_str().to_string(),
+        });
+        rejected
+    }
+
     pub fn with_retry_after(mut self, retry_after: Duration) -> Self {
         self.retry_after = Some(retry_after);
         self
