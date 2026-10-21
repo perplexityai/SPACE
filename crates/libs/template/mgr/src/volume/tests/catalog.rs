@@ -1,6 +1,7 @@
 use crate::volume::{PullFailure, PullOutcome, PullTrigger, VolumePuller};
 use pplx_space_common_core::types::OrgId;
 use pplx_space_common_svc::auth::{NodeApiAuthConfig, NodeApiAuthLayer, NodeRole};
+use pplx_space_common_svc::template_lookup::TemplateLookupScope;
 use pplx_space_internal_api_server::ClusterApiService;
 use pplx_space_node_api_client::proto::{
     RegisterTemplateReleaseRequest, RegisterTemplateRequest, TemplateVisibility,
@@ -18,6 +19,7 @@ const CHILD_ENDPOINT: &str = "SPACE_TEST_PREFETCH_CATALOG_ENDPOINT";
 pub(crate) struct Catalog {
     pub(crate) endpoint: String,
     pub(crate) token_file: tempfile::NamedTempFile,
+    pub(crate) lookup_scopes: Arc<Mutex<Vec<Option<TemplateLookupScope>>>>,
     server: tokio::task::JoinHandle<()>,
     _database: pplx_space_db_test_fixtures::TestDb,
 }
@@ -77,10 +79,21 @@ impl Catalog {
             None,
         )?;
         let auth = NodeApiAuthLayer::from_config(config).await?;
+        let lookup_scopes = Arc::new(Mutex::new(Vec::new()));
+        let observed_scopes = Arc::clone(&lookup_scopes);
         let server = tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .layer(auth)
-                .add_service(ClusterApiServer::new(service))
+                .add_service(ClusterApiServer::with_interceptor(
+                    service,
+                    move |request: tonic::Request<()>| {
+                        observed_scopes
+                            .lock()
+                            .unwrap()
+                            .push(TemplateLookupScope::from_request(&request)?);
+                        Ok(request)
+                    },
+                ))
                 .serve_with_incoming(TcpListenerStream::new(listener))
                 .await
                 .unwrap();
@@ -88,6 +101,7 @@ impl Catalog {
         Ok(Self {
             endpoint,
             token_file,
+            lookup_scopes,
             server,
             _database: database,
         })
@@ -138,6 +152,10 @@ async fn final_catalog_resolution_controls_prefetch(
             retired_setting.map(OsStr::new)
         ),
     ]));
+    assert_eq!(
+        *catalog.lookup_scopes.lock().unwrap(),
+        vec![Some(TemplateLookupScope::Cluster); 2]
+    );
     Ok(())
 }
 

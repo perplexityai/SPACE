@@ -407,6 +407,25 @@ impl VolumePuller {
     /// This keeps caller cancellation from multiplying rootfs
     /// decompressions while preserving the recover-from-disk behavior for
     /// process death.
+    pub async fn pull(
+        &self,
+        db: Arc<std::sync::Mutex<rusqlite::Connection>>,
+        name: &str,
+        req_hash: &str,
+        req_tag: &str,
+        trigger: PullTrigger,
+    ) -> PullOutcome {
+        self.pull_in_scope(
+            db,
+            name,
+            req_hash,
+            req_tag,
+            trigger,
+            Some(TemplateLookupScope::Cluster),
+        )
+        .await
+    }
+
     #[tracing::instrument(
         skip_all,
         fields(
@@ -417,13 +436,14 @@ impl VolumePuller {
             content_hash = tracing::field::Empty,
         )
     )]
-    pub async fn pull(
+    pub(crate) async fn pull_in_scope(
         &self,
         db: Arc<std::sync::Mutex<rusqlite::Connection>>,
         name: &str,
         req_hash: &str,
         req_tag: &str,
         trigger: PullTrigger,
+        scope: Option<TemplateLookupScope>,
     ) -> PullOutcome {
         let started = Instant::now();
         let base_tags = pull_metric_tags(name, req_hash, req_tag, trigger);
@@ -435,7 +455,7 @@ impl VolumePuller {
             req_tag,
             trigger,
         };
-        let outcome = pull_inner(self, db, spec, &base_tags, &mut path_taken).await;
+        let outcome = pull_inner(self, db, spec, &base_tags, &mut path_taken, scope).await;
 
         pplx_space_metrics::template::pull_duration(
             &base_tags,
@@ -775,28 +795,28 @@ async fn pull_inner(
     spec: PullSpec<'_>,
     base_tags: &[String],
     path_taken: &mut PullPath,
+    scope: Option<TemplateLookupScope>,
 ) -> PullOutcome {
     let name = spec.name;
     // 1. Resolve (release.hash, storage_uris) via ClusterApi.
-    let release =
-        match find_release(name, spec.req_hash, spec.req_tag, base_tags, spec.trigger).await {
-            Ok(found) => found,
-            Err(FindReleaseError::NotFound) => {
-                return PullOutcome::ClassifiedFailure(PullFailure::ClusterMetadataMissing);
-            }
-            Err(FindReleaseError::Unavailable) => {
-                return PullOutcome::ClassifiedFailure(PullFailure::ClusterMetadataUnavailable);
-            }
-            Err(FindReleaseError::InvalidResponse) => {
-                return PullOutcome::ClassifiedFailure(PullFailure::ClusterMetadataInvalid);
-            }
-            Err(FindReleaseError::Status(status)) => {
-                return PullOutcome::DownstreamFailure {
-                    failure: PullFailure::ClusterMetadataUnavailable,
-                    status,
-                };
-            }
-        };
+    let release = match find_release(spec, base_tags, scope).await {
+        Ok(found) => found,
+        Err(FindReleaseError::NotFound) => {
+            return PullOutcome::ClassifiedFailure(PullFailure::ClusterMetadataMissing);
+        }
+        Err(FindReleaseError::Unavailable) => {
+            return PullOutcome::ClassifiedFailure(PullFailure::ClusterMetadataUnavailable);
+        }
+        Err(FindReleaseError::InvalidResponse) => {
+            return PullOutcome::ClassifiedFailure(PullFailure::ClusterMetadataInvalid);
+        }
+        Err(FindReleaseError::Status(status)) => {
+            return PullOutcome::DownstreamFailure {
+                failure: PullFailure::ClusterMetadataUnavailable,
+                status,
+            };
+        }
+    };
 
     // The catalog has enforced generic-only selection in the same SQL snapshot
     // as the release and locations. Cached visibility is only an additional
@@ -944,23 +964,20 @@ async fn pull_resolved_owner(
 /// Connects to the cluster-role node-api and asks
 /// `FindTemplateRelease(name, runtime, tag)`.
 async fn find_release(
-    name: &str,
-    req_hash: &str,
-    req_tag: &str,
+    spec: PullSpec<'_>,
     base_tags: &[String],
-    trigger: PullTrigger,
+    scope: Option<TemplateLookupScope>,
 ) -> Result<ResolvedRelease, FindReleaseError> {
     let started = Instant::now();
-    let generic_only = trigger.is_prefetch();
-    let result = find_release_with_requirement(
+    let PullSpec {
         name,
         req_hash,
         req_tag,
-        None,
-        generic_only,
-        Some(TemplateLookupScope::Cluster),
-    )
-    .await;
+        trigger,
+    } = spec;
+    let generic_only = trigger.is_prefetch();
+    let result =
+        find_release_with_requirement(name, req_hash, req_tag, None, generic_only, scope).await;
     let result_label = match &result {
         Ok(_) => "ok",
         Err(FindReleaseError::NotFound) => "not_found",

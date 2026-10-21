@@ -60,6 +60,7 @@ impl TemplateManagerService {
         ) -> crate::volume::PullOutcome,
     ) -> Result<Response<crate::proto::GetTemplateResponse>, Status> {
         self.authorize_peer(&request, "GetTemplate", ALLOW_TEMPLATE_OBSERVER)?;
+        let scope = TemplateLookupScope::from_request(&request)?;
         let req = request.get_ref();
         let tmpl_ref = req
             .template
@@ -235,12 +236,13 @@ impl TemplateManagerService {
             }
             None => {
                 self.volume_puller
-                    .pull(
+                    .pull_in_scope(
                         Arc::clone(&self.db),
                         template_id,
                         &req_hash,
                         &req_tag,
                         crate::volume::PullTrigger::OnDemand,
+                        scope,
                     )
                     .await
             }
