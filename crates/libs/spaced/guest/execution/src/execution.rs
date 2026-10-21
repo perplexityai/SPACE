@@ -97,6 +97,9 @@ pub(super) struct ExecutionServiceInner {
 impl ExecutionService {
     /// Construct a service with the caller's filesystem execution configuration.
     ///
+    /// Caller cancellation closes the service. Closing or draining the service
+    /// does not cancel the caller's token.
+    ///
     /// # Errors
     ///
     /// Identity workers require an explicit executable on Linux. Selecting them
@@ -116,6 +119,8 @@ impl ExecutionService {
 
     /// Construct a service with optional caller-provided workload placement.
     ///
+    /// Cancellation has the same scope as [`Self::with_config`].
+    ///
     /// # Errors
     ///
     /// Returns the same configuration errors as [`Self::with_config`].
@@ -124,6 +129,7 @@ impl ExecutionService {
         config: ExecutionServiceConfig,
         guest_cgroups: Option<Arc<ExecutionCgroups>>,
     ) -> Result<Self, CreateExecutionServiceError> {
+        let shutdown = shutdown.child_token();
         let filesystem = filesystem::FilesystemHandle::new(
             config.filesystem_execution,
             config.worker_executable,
@@ -170,7 +176,8 @@ impl ExecutionService {
     ///
     /// Calls through every service clone and previously obtained filesystem handle
     /// are refused once admission is closed. Repeated calls are harmless. Work
-    /// admitted earlier may still finish; this does not wait for cleanup.
+    /// admitted earlier may still finish; this does not wait for cleanup or cancel
+    /// the caller's token.
     pub fn close(&self) {
         let _start_gate = self
             .inner

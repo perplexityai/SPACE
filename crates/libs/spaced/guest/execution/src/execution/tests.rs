@@ -80,6 +80,12 @@ async fn closed_services_refuse_every_operation_through_existing_handles() {
             Close::CallerCancellation => shutdown.cancel(),
             Close::Drain => service.drain().await,
         }
+        let caller_cancelled = matches!(close, Close::CallerCancellation);
+        assert_eq!(
+            shutdown.is_cancelled(),
+            caller_cancelled,
+            "service closure must not cancel the caller's token"
+        );
         macro_rules! refused {
             ($($call:expr),+ $(,)?) => {$(
                 let error = $call.await.err().expect(concat!(stringify!($call), " must refuse"));
@@ -129,5 +135,10 @@ async fn closed_services_refuse_every_operation_through_existing_handles() {
         assert_eq!(*service.inner.process_env.read().await, environment);
         assert_eq!(tokio::fs::read(&path).await.unwrap(), b"original");
         service.drain().await;
+        assert_eq!(
+            shutdown.is_cancelled(),
+            caller_cancelled,
+            "draining a closed service must not cancel the caller's token"
+        );
     }
 }

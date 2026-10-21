@@ -128,8 +128,11 @@ and error evolution, requires a separate crate-level policy before stabilization
   clones and filesystem handles. Execution entrypoints refuse new process,
   filesystem and environment-update calls with `Unavailable`; transport admission
   retains its earlier rejections. Uploads waiting for their first message wake
-  on cancellation. Cancelling the supplied token also closes admission.
-  Work admitted before closure may still finish; closure does not wait for it.
+  on cancellation. The service owns a child of the supplied token: caller
+  cancellation closes admission, but `close()` and `drain()` do not cancel the
+  caller's token. Work admitted before closure may still finish; closure does
+  not wait for it. Already-admitted same-key retries can still wait for the owner
+  or the retry retention deadline; closure does not directly wake them.
 - The daemon coordinates listener shutdown with `drain()`, which first closes
   admission and then joins its tracked work. The filesystem drain still logs an
   internal timeout rather than reporting incomplete cleanup, and some detached
