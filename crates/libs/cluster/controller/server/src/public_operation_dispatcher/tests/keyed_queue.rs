@@ -719,3 +719,69 @@ async fn a_claim_onto_a_key_busy_with_another_operation_retries_after_a_second()
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn an_execution_finishing_during_a_claim_frees_its_sandbox_for_that_claim() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db_with_max_connections(8).await?
+    else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    create_op(&store, org_id, OperationKind::DeleteSandbox, "sbx_reap").await?;
+    let executor = BlockingExecutor::default();
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook: super::BeforeClaimHook = {
+        let armed = armed.clone();
+        let executor = executor.clone();
+        Arc::new(move || {
+            let armed = armed.clone();
+            let executor = executor.clone();
+            Box::pin(async move {
+                if !armed.swap(false, Ordering::SeqCst) {
+                    return;
+                }
+                // The first delete finishes after this tick's reap and before
+                // its claim. Its task drops its executor clone as it
+                // completes; on this current-thread runtime that means it has
+                // finished and waits unreaped.
+                let alive = Arc::strong_count(&executor.started);
+                executor.release.notify_one();
+                while Arc::strong_count(&executor.started) >= alive {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+        })
+    };
+    let shutdown = CancellationToken::new();
+    let dispatcher = tokio::spawn(super::BEFORE_CLAIM.scope(
+        hook,
+        run(
+            fast_loop_config(2),
+            store.clone(),
+            executor.clone(),
+            shutdown.clone(),
+        ),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), executor.started.notified()).await?;
+    let second = create_op(&store, org_id, OperationKind::DeleteSandbox, "sbx_reap").await?;
+    armed.store(true, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(5), executor.started.notified()).await?;
+    executor.release.notify_one();
+    super::wait_for_state(&db.pool, second, OperationState::Succeeded).await?;
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), dispatcher).await??;
+
+    // Claimed once and run, not handed back as if the finished delete were
+    // still running here.
+    let claims: i64 = sqlx::query_scalar(sql!(
+        "SELECT COUNT(*) FROM public_operation_events
+         WHERE operation_id = $1 AND event_type = $2"
+    ))
+    .bind(second.as_uuid())
+    .bind(PublicOperationEventType::Claimed.as_str())
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(claims, 1);
+    Ok(())
+}

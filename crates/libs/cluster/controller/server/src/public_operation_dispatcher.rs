@@ -377,6 +377,8 @@ pub async fn run<E>(
                 if free == 0 {
                     continue;
                 }
+                #[cfg(test)]
+                tests::before_claim().await;
                 let started = Instant::now();
                 match claim_up_to(&config, &store, &executor, free).await {
                     Ok(claim) => {

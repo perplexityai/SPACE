@@ -1522,34 +1522,15 @@ async fn claim_operations(
     // sandbox can start beside its old execution; otherwise the
     // earliest-requested one if it is due; otherwise the earliest due delete
     // with no create requested before it, so a delete is not stuck behind
-    // work in retry backoff but never overtakes a create. Forks name
+    // work in retry backoff but never overtakes a create. Only sandboxes with
+    // more than one active operation can hold anything back, so the window
+    // pass reads just those, in one sort. Forks name
     // their source by a different id form and keep their own lifecycle lock,
     // so they stay outside the key. With `$11` unset (the kill switch)
     // `blocked` is empty.
     let rows = sqlx::query_as::<_, DispatcherClaimRow>(sql!(
-        "WITH keyed AS MATERIALIZED (
-             SELECT operation_id,
-                    org_id,
-                    target_id,
-                    requested_at,
-                    kind = $9
-                        AND next_attempt_at <= NOW()
-                        AND NOT COALESCE(
-                            BOOL_OR(kind = $10) OVER (
-                                queue ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
-                            ),
-                            FALSE
-                        ) AS free_delete,
-                    ROW_NUMBER() OVER queue AS position,
-                    FIRST_VALUE(next_attempt_at <= NOW()) OVER queue AS head_due,
-                    state = $5 AND claim_token <> ''
-                        AND claimed_at <= NOW() - make_interval(secs => $2::BIGINT) AS stale,
-                    BOOL_OR(
-                        state = $5
-                        AND claim_token <> ''
-                        AND claimed_at > NOW() - make_interval(secs => $2::BIGINT)
-                    ) OVER sandbox AS sandbox_live,
-                    COUNT(*) OVER sandbox AS active_on_sandbox
+        "WITH shared AS (
+             SELECT org_id, target_id
              FROM public_operations
              WHERE $11::BOOLEAN
                AND state IN ($4, $5)
@@ -1557,39 +1538,55 @@ async fn claim_operations(
                AND target_id IS NOT NULL
                AND kind = ANY($6)
                AND kind <> $8
-             WINDOW sandbox AS (PARTITION BY org_id, target_id),
-                    queue AS (
+             GROUP BY org_id, target_id
+             HAVING COUNT(*) > 1
+         ),
+         active AS (
+             SELECT operation_id,
+                    op.org_id,
+                    op.target_id,
+                    requested_at,
+                    kind,
+                    next_attempt_at <= NOW() AS due,
+                    state = $5 AND claim_token <> ''
+                        AND claimed_at > NOW() - make_interval(secs => $2::BIGINT) AS live,
+                    state = $5 AND claim_token <> ''
+                        AND claimed_at <= NOW() - make_interval(secs => $2::BIGINT) AS stale
+             FROM shared
+             JOIN public_operations op
+               ON op.org_id = shared.org_id
+              AND op.target_type = $7
+              AND op.target_id = shared.target_id
+             WHERE op.state IN ($4, $5)
+               AND op.kind = ANY($6)
+               AND op.kind <> $8
+         ),
+         ranked AS (
+             SELECT operation_id,
+                    ROW_NUMBER() OVER queue AS position,
+                    FIRST_VALUE(due) OVER queue AS head_due,
+                    BOOL_OR(live) OVER whole AS sandbox_live,
+                    BOOL_OR(stale) OVER whole AS sandbox_stale,
+                    stale AND NOT COALESCE(BOOL_OR(stale) OVER earlier, FALSE) AS first_stale,
+                    kind = $9
+                        AND due
+                        AND NOT COALESCE(BOOL_OR(kind = $10) OVER earlier, FALSE)
+                        AND NOT COALESCE(BOOL_OR(kind = $9 AND due) OVER earlier, FALSE)
+                        AS first_free_delete
+             FROM active
+             WINDOW queue AS (
                         PARTITION BY org_id, target_id ORDER BY requested_at, operation_id
-                    )
+                    ),
+                    whole AS (queue ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING),
+                    earlier AS (queue ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
          ),
          blocked AS (
              SELECT operation_id
-             FROM (
-                 SELECT operation_id,
-                        position,
-                        head_due,
-                        sandbox_live,
-                        active_on_sandbox,
-                        BOOL_OR(stale) OVER (PARTITION BY org_id, target_id) AS sandbox_stale,
-                        stale
-                            AND ROW_NUMBER() OVER (
-                                PARTITION BY org_id, target_id, stale
-                                ORDER BY requested_at, operation_id
-                            ) = 1 AS first_stale,
-                        free_delete
-                            AND ROW_NUMBER() OVER (
-                                PARTITION BY org_id, target_id, free_delete
-                                ORDER BY requested_at, operation_id
-                            ) = 1 AS first_free_delete
-                 FROM keyed
-             ) ranked
-             WHERE active_on_sandbox > 1
-               AND (
-                   sandbox_live
-                   OR (sandbox_stale AND NOT first_stale)
-                   OR (NOT sandbox_stale AND head_due AND position > 1)
-                   OR (NOT sandbox_stale AND NOT head_due AND NOT first_free_delete)
-               )
+             FROM ranked
+             WHERE sandbox_live
+                OR (sandbox_stale AND NOT first_stale)
+                OR (NOT sandbox_stale AND head_due AND position > 1)
+                OR (NOT sandbox_stale AND NOT head_due AND NOT first_free_delete)
          ),
          picked AS (
              SELECT candidate.operation_id,
