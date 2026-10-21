@@ -5301,6 +5301,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-cluster-id"
+version = "0.8.0"
+dependencies = [
+ "pplx-space-env-vars",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
 name = "pplx-space-cluster-pool"
 version = "0.8.0"
 dependencies = [
@@ -5383,6 +5394,7 @@ dependencies = [
  "libc",
  "nix 0.31.3",
  "pplx-space-byte-size",
+ "pplx-space-cluster-id",
  "pplx-space-content-digest",
  "pplx-space-cpu-arch",
  "pplx-space-durations",

@@ -17,6 +17,7 @@ k8s-openapi = { workspace = true, features = ["v1_32"], optional = true }
 libc = { workspace = true }
 nix = { workspace = true, features = ["fs", "ioctl"] }
 pplx-space-byte-size = { workspace = true }
+pplx-space-cluster-id = { workspace = true }
 pplx-space-content-digest = { workspace = true }
 pplx-space-cpu-arch = { workspace = true }
 pplx-space-durations = { workspace = true }
@@ -55,6 +56,7 @@ serde = [
     "pplx-space-semver/serde",
     "pplx-space-cpu-arch/serde",
     "pplx-space-k8s-ids/serde",
+    "pplx-space-cluster-id/serde",
 ]
 sqlx = ["dep:sqlx", "pplx-space-semver/sqlx", "pplx-space-k8s-ids/sqlx"]
 rusqlite = ["dep:rusqlite"]
