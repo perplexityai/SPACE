@@ -169,9 +169,10 @@ TILT
         curl() { return 0; }
         lsof() { return 0; }
         # The cluster runs the requested storage credentials mode and Rust
-        # build: the authority's label, the worker volume-manager's env and the
-        # build deployed-rust-build.py reads agree with the defaults. Every
-        # other cluster read fails.
+        # build: the authority's label and the node services' env agree with
+        # the default, each storage DaemonSet's template holding no static key
+        # and running no pod, and the build deployed-rust-build.py reads is the
+        # default. Every other cluster read fails.
         python3() {
             case "$*" in
                 *deployed-rust-build.py*) echo test-hooks ;;
@@ -181,7 +182,9 @@ TILT
         kubectl() {
             case "$*" in
                 *" get deployments -l app.kubernetes.io/name=space-credmgr-authority "*) printf 'exchange|' ;;
-                *" get daemonset space-volume-manager "*) printf 'space-volume-manager|' ;;
+                *" get pods -o json") printf '{"items": []}' ;;
+                *" get daemonset "*" --ignore-not-found -o json")
+                    printf '{"spec": {"template": {"spec": {"containers": [{"name": "service", "env": [{"name": "SPACE_OBJECT_STORE_BUCKET"}]}]}}}}' ;;
                 *" get job space-db-migrate "*)
                     [[ -n "${TEST_MIGRATE_JOB:-}" ]] || return 1
                     printf '%s' "$TEST_MIGRATE_JOB" ;;
