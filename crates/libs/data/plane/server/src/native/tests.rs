@@ -728,7 +728,17 @@ enum FakeRevocation {
     Active,
     /// The cluster API is unreachable; its status names an internal address.
     Down,
+    /// The cluster API takes the check and never answers.
+    Hung,
+    /// The org epoch moved on, and the session check then never answers.
+    HungAfterOrgEpochChange,
     Revoked,
+    /// The org epoch moved on, and the session answer carries no state.
+    MissingState,
+    /// The org epoch moved on, and the session answer names no valid org.
+    InvalidOrgId,
+    /// The cluster API refuses the check.
+    Rejected,
 }
 
 /// A fake cluster API and worker for one running process. The test sets how
@@ -737,6 +747,8 @@ enum FakeRevocation {
 struct RevocationFake {
     endpoint: String,
     revocation: Arc<std::sync::Mutex<FakeRevocation>>,
+    /// Revocation checks answered with an error or an unusable answer.
+    failed_answers: Arc<std::sync::atomic::AtomicUsize>,
     stdout: tokio::sync::mpsc::UnboundedSender<&'static str>,
 }
 
@@ -747,6 +759,10 @@ impl RevocationFake {
 
     fn print(&self, data: &'static str) {
         self.stdout.send(data).unwrap();
+    }
+
+    fn failed_answers(&self) -> usize {
+        self.failed_answers.load(Ordering::SeqCst)
     }
 }
 
@@ -774,11 +790,13 @@ async fn spawn_revocation_fake(session_id: DataPlaneSessionId) -> RevocationFake
     let route = route.encode_to_vec();
     let process_id = pplx_space_public_api::process_id_for_session(session_id).to_string();
     let revocation = Arc::new(std::sync::Mutex::new(FakeRevocation::Active));
+    let failed_answers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (stdout, stdout_rx) = tokio::sync::mpsc::unbounded_channel();
     let stdout_rx = Arc::new(std::sync::Mutex::new(Some(stdout_rx)));
     let fake = RevocationFake {
         endpoint,
         revocation: Arc::clone(&revocation),
+        failed_answers: Arc::clone(&failed_answers),
         stdout,
     };
     let service = axum::Router::new().fallback(move |request: Request<Body>| {
@@ -786,6 +804,7 @@ async fn spawn_revocation_fake(session_id: DataPlaneSessionId) -> RevocationFake
         let org_id = org_id.clone();
         let process_id = process_id.clone();
         let answer = *revocation.lock().unwrap();
+        let failed_answers = Arc::clone(&failed_answers);
         let stdout_rx = Arc::clone(&stdout_rx);
         async move {
             let path = request.uri().path().to_string();
@@ -798,39 +817,65 @@ async fn spawn_revocation_fake(session_id: DataPlaneSessionId) -> RevocationFake
             if path.ends_with("/BindDataPlaneSessionProcess") {
                 return crate::tests::grpc_test_response(Vec::new());
             }
-            let epoch = match answer {
-                FakeRevocation::Active => 1,
-                FakeRevocation::Revoked => 2,
-                FakeRevocation::Down => {
-                    return tonic::Status::unavailable(FAKE_CLUSTER_API_OUTAGE).into_http::<Body>();
-                }
-            };
-            if path.ends_with("/GetDataPlaneOrgRevocationEpoch") {
-                return crate::tests::grpc_test_response(
-                    GetDataPlaneOrgRevocationEpochResponse {
-                        org_id,
-                        epoch,
-                        updated_at: None,
+            let org_epoch_request = path.ends_with("/GetDataPlaneOrgRevocationEpoch");
+            if org_epoch_request || path.ends_with("/GetDataPlaneSessionRevocationState") {
+                let failed = || failed_answers.fetch_add(1, Ordering::SeqCst);
+                let (epoch, status) = match answer {
+                    FakeRevocation::Active => (1, DataPlaneRevocationStatus::Active),
+                    FakeRevocation::Down => {
+                        failed();
+                        return tonic::Status::unavailable(FAKE_CLUSTER_API_OUTAGE)
+                            .into_http::<Body>();
                     }
-                    .encode_to_vec(),
+                    FakeRevocation::Rejected => {
+                        failed();
+                        return tonic::Status::permission_denied(FAKE_CLUSTER_API_OUTAGE)
+                            .into_http::<Body>();
+                    }
+                    FakeRevocation::Hung => std::future::pending().await,
+                    FakeRevocation::HungAfterOrgEpochChange if !org_epoch_request => {
+                        std::future::pending().await
+                    }
+                    FakeRevocation::Revoked => (2, DataPlaneRevocationStatus::Revoked),
+                    FakeRevocation::HungAfterOrgEpochChange
+                    | FakeRevocation::MissingState
+                    | FakeRevocation::InvalidOrgId => (2, DataPlaneRevocationStatus::Active),
+                };
+                if org_epoch_request {
+                    return crate::tests::grpc_test_response(
+                        GetDataPlaneOrgRevocationEpochResponse {
+                            org_id,
+                            epoch,
+                            updated_at: None,
+                        }
+                        .encode_to_vec(),
+                    );
+                }
+                let unusable = matches!(
+                    answer,
+                    FakeRevocation::MissingState | FakeRevocation::InvalidOrgId
                 );
-            }
-            if path.ends_with("/GetDataPlaneSessionRevocationState") {
-                let status = match answer {
-                    FakeRevocation::Revoked => DataPlaneRevocationStatus::Revoked,
-                    _ => DataPlaneRevocationStatus::Active,
+                if unusable {
+                    failed();
+                }
+                let revocation = (!matches!(answer, FakeRevocation::MissingState)).then_some(
+                    DataPlaneRevocationState {
+                        epoch,
+                        status: status as i32,
+                        updated_at: None,
+                        reason: None,
+                        org_epoch: epoch,
+                    },
+                );
+                let org_id = match answer {
+                    FakeRevocation::InvalidOrgId => "not-an-org-id".to_string(),
+                    _ => org_id,
                 };
                 return crate::tests::grpc_test_response(
                     GetDataPlaneSessionRevocationStateResponse {
                         session_id: session_id.to_string(),
                         protocol_session_id: None,
-                        revocation: Some(DataPlaneRevocationState {
-                            epoch,
-                            status: status as i32,
-                            updated_at: None,
-                            reason: None,
-                            org_epoch: epoch,
-                        }),
+                        revocation,
                         org_id,
                     }
                     .encode_to_vec(),
@@ -877,14 +922,31 @@ async fn spawn_revocation_fake(session_id: DataPlaneSessionId) -> RevocationFake
     fake
 }
 
-/// Opens a process session's event stream against the fake, checking
-/// revocation every 20ms and keeping a verdict for `max_staleness` while
-/// checks fail.
+/// Revocation timings for the stream tests below. Checks run every 20ms. The
+/// staleness bound and check timeout are production's unless a test shortens
+/// them; their assertions count checks or wait on outcomes rather than
+/// measure time.
+struct RevocationTimings {
+    max_staleness: Duration,
+    check_timeout: Duration,
+}
+
+impl Default for RevocationTimings {
+    fn default() -> Self {
+        Self {
+            max_staleness: REVOCATION_MAX_STALENESS,
+            check_timeout: REVOCATION_CHECK_TIMEOUT,
+        }
+    }
+}
+
+/// Opens a process session's event stream against the fake and reads it until
+/// the process has started.
 async fn open_revocation_checked_events(
     fake: &RevocationFake,
     session_id: DataPlaneSessionId,
-    max_staleness: Duration,
-) -> tokio::sync::mpsc::UnboundedReceiver<String> {
+    timings: RevocationTimings,
+) -> (tokio::sync::mpsc::UnboundedReceiver<String>, String) {
     let mut state = crate::tests::test_data_plane_state().await;
     state.cluster_api = ClusterApiClients::service_only(
         pplx_space_node_api_client::cluster::connect(fake.endpoint.clone(), "test")
@@ -892,7 +954,8 @@ async fn open_revocation_checked_events(
             .unwrap(),
     );
     state.revocation_check_interval = Duration::from_millis(20);
-    state.revocation_max_staleness = max_staleness;
+    state.revocation_max_staleness = timings.max_staleness;
+    state.revocation_check_timeout = timings.check_timeout;
     let token = format!("{DATA_PLANE_TOKEN_PREFIX}{}", "c".repeat(64));
     let response = tower::ServiceExt::oneshot(
         router(state),
@@ -905,7 +968,7 @@ async fn open_revocation_checked_events(
     .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let mut body = response.into_body();
-    let (chunk_tx, chunks) = tokio::sync::mpsc::unbounded_channel();
+    let (chunk_tx, mut chunks) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
         while let Some(Ok(frame)) = body.frame().await {
             if let Ok(data) = frame.into_data()
@@ -917,7 +980,17 @@ async fn open_revocation_checked_events(
             }
         }
     });
-    chunks
+    let mut seen = String::new();
+    read_until(&mut chunks, &mut seen, "process_started").await;
+    (chunks, seen)
+}
+
+async fn assert_stream_ends(chunks: &mut tokio::sync::mpsc::UnboundedReceiver<String>) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while chunks.recv().await.is_some() {}
+    })
+    .await
+    .expect("the stream ends");
 }
 
 fn stdout_marker(data: &str) -> String {
@@ -931,14 +1004,18 @@ async fn process_stream_survives_a_revocation_outage_within_the_staleness_bound(
     }
     let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
     let fake = spawn_revocation_fake(session_id).await;
-    let mut chunks =
-        open_revocation_checked_events(&fake, session_id, Duration::from_secs(60)).await;
-    let mut seen = String::new();
-    read_until(&mut chunks, &mut seen, "process_started").await;
+    let (mut chunks, mut seen) =
+        open_revocation_checked_events(&fake, session_id, RevocationTimings::default()).await;
 
-    // Many failed checks, all well inside the bound: output keeps flowing.
+    // Failed checks well inside the bound: output keeps flowing.
     fake.answer(FakeRevocation::Down);
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while fake.failed_answers() < 5 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("checks failed");
     fake.print("during the outage");
     read_until(&mut chunks, &mut seen, &stdout_marker("during the outage")).await;
 
@@ -953,25 +1030,76 @@ async fn process_stream_survives_a_revocation_outage_within_the_staleness_bound(
 }
 
 #[tokio::test]
+async fn process_stream_keeps_delivering_while_revocation_checks_hang() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_revocation_fake(session_id).await;
+    let timings = RevocationTimings {
+        check_timeout: Duration::from_millis(100),
+        ..RevocationTimings::default()
+    };
+    let (mut chunks, mut seen) = open_revocation_checked_events(&fake, session_id, timings).await;
+
+    // Output sent while checks hang arrives as each one times out, long
+    // before the cluster API client's own 30-second deadline.
+    fake.answer(FakeRevocation::Hung);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    fake.print("during the hang");
+    read_until(&mut chunks, &mut seen, &stdout_marker("during the hang")).await;
+
+    fake.answer(FakeRevocation::Active);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    fake.print("after the hang");
+    read_until(&mut chunks, &mut seen, &stdout_marker("after the hang")).await;
+    assert!(
+        !seen.contains("backend_stream_error") && !seen.contains("closed"),
+        "{seen}"
+    );
+}
+
+#[tokio::test]
+async fn hung_check_after_an_org_revocation_fails_closed_once_it_times_out() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_revocation_fake(session_id).await;
+    let timings = RevocationTimings {
+        check_timeout: Duration::from_millis(100),
+        ..RevocationTimings::default()
+    };
+    let (mut chunks, mut seen) = open_revocation_checked_events(&fake, session_id, timings).await;
+
+    // The org's epoch moved on, so the cached verdict no longer counts, and
+    // the session check that would settle it never answers.
+    fake.answer(FakeRevocation::HungAfterOrgEpochChange);
+    read_until(&mut chunks, &mut seen, "backend_stream_error").await;
+    assert_stream_ends(&mut chunks).await;
+}
+
+#[tokio::test]
 async fn process_stream_fails_closed_once_its_verdict_is_older_than_the_bound() {
     if !binding_fake_test_process() {
         return;
     }
     let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
     let fake = spawn_revocation_fake(session_id).await;
-    let max_staleness = Duration::from_millis(400);
-    let mut chunks = open_revocation_checked_events(&fake, session_id, max_staleness).await;
-    let mut seen = String::new();
-    read_until(&mut chunks, &mut seen, "process_started").await;
+    let timings = RevocationTimings {
+        max_staleness: Duration::from_millis(500),
+        check_timeout: Duration::from_millis(50),
+    };
+    let (mut chunks, mut seen) = open_revocation_checked_events(&fake, session_id, timings).await;
 
     fake.answer(FakeRevocation::Down);
-    let outage = tokio::time::Instant::now();
     read_until(&mut chunks, &mut seen, "backend_stream_error").await;
-    // The last confirmed verdict predates the outage by at most one check.
+    // About 20 checks fit in the 430ms the verdict is kept; well over a few
+    // of them were ridden out before the stream failed closed.
     assert!(
-        outage.elapsed() >= max_staleness - Duration::from_millis(100),
-        "failed closed after {:?}, inside the bound",
-        outage.elapsed()
+        fake.failed_answers() >= 5,
+        "failed closed after {} failed checks",
+        fake.failed_answers()
     );
     assert!(seen.contains(r#""retryable":true"#), "{seen}");
     assert!(
@@ -982,11 +1110,31 @@ async fn process_stream_fails_closed_once_its_verdict_is_older_than_the_bound() 
         !seen.contains("192.0.2.10"),
         "internal detail leaked: {seen}"
     );
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while chunks.recv().await.is_some() {}
-    })
-    .await
-    .expect("the stream ends after failing closed");
+    assert_stream_ends(&mut chunks).await;
+}
+
+#[tokio::test]
+async fn unusable_revocation_answers_fail_closed_at_once() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    for answer in [
+        FakeRevocation::MissingState,
+        FakeRevocation::InvalidOrgId,
+        FakeRevocation::Rejected,
+    ] {
+        let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+        let fake = spawn_revocation_fake(session_id).await;
+        let (mut chunks, mut seen) =
+            open_revocation_checked_events(&fake, session_id, RevocationTimings::default()).await;
+
+        // The verdict is fresh, but an answer the data plane cannot use is
+        // not an outage to ride out: the first one ends the stream.
+        fake.answer(answer);
+        read_until(&mut chunks, &mut seen, "backend_stream_error").await;
+        assert_eq!(fake.failed_answers(), 1, "{seen}");
+        assert_stream_ends(&mut chunks).await;
+    }
 }
 
 #[tokio::test]
@@ -996,22 +1144,132 @@ async fn revoked_session_ends_its_stream_at_once() {
     }
     let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
     let fake = spawn_revocation_fake(session_id).await;
-    let mut chunks =
-        open_revocation_checked_events(&fake, session_id, Duration::from_secs(60)).await;
-    let mut seen = String::new();
-    read_until(&mut chunks, &mut seen, "process_started").await;
+    let (mut chunks, mut seen) =
+        open_revocation_checked_events(&fake, session_id, RevocationTimings::default()).await;
 
     // Even mid-outage, a revocation the next check confirms ends the stream
-    // without waiting out the staleness bound.
+    // without waiting out the minute-long staleness bound.
     fake.answer(FakeRevocation::Down);
     tokio::time::sleep(Duration::from_millis(100)).await;
     fake.answer(FakeRevocation::Revoked);
     read_until(&mut chunks, &mut seen, r#""reason":"revoked""#).await;
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while chunks.recv().await.is_some() {}
-    })
-    .await
-    .expect("the stream ends after the revocation");
+    assert_stream_ends(&mut chunks).await;
+}
+
+/// At production timings and on a paused clock, for every phase of the stream's
+/// checks against its last confirmed one: failed checks keep the verdict
+/// while the stream can still end within the bound, and no longer.
+#[tokio::test]
+async fn failed_checks_keep_a_verdict_only_while_the_stream_ends_within_the_bound() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let mut state = crate::tests::test_data_plane_state().await;
+    // Nothing below reaches the network, so the clock moves only as told.
+    tokio::time::pause();
+    state.revocation_check_interval =
+        Duration::from_millis(crate::DEFAULT_REVOCATION_CHECK_INTERVAL_MS);
+    let interval = state.revocation_check_interval;
+    let unavailable =
+        StreamBridgeError::RevocationStatus(tonic::Status::unavailable("synthetic outage"));
+    let step = Duration::from_millis(250);
+    let phases = (interval.as_millis() / step.as_millis()) as u32;
+    for phase in (0..phases).map(|n| step * n) {
+        let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+        state
+            .revocation_cache
+            .remember_active(session_id, 1, OrgId::new(), 1, interval);
+        let confirmed = tokio::time::Instant::now();
+        // The first check `phase` after the confirmation, then one per
+        // interval, each decided as soon as it starts. The one that fails
+        // closed may take the whole check timeout to do so.
+        tokio::time::advance(phase).await;
+        let ended = loop {
+            if !keeps_last_verdict(&state, session_id, &unavailable) {
+                break confirmed.elapsed() + REVOCATION_CHECK_TIMEOUT;
+            }
+            tokio::time::advance(interval).await;
+        };
+        assert!(
+            ended <= REVOCATION_MAX_STALENESS,
+            "phase {phase:?}: ended {ended:?} after the last confirmed check"
+        );
+        assert!(
+            ended > REVOCATION_MAX_STALENESS - interval - REVOCATION_CHECK_TIMEOUT,
+            "phase {phase:?}: ended {ended:?} after the last confirmed check, \
+             well inside the bound"
+        );
+        // An answer the data plane cannot use never keeps the verdict.
+        state
+            .revocation_cache
+            .remember_active(session_id, 2, OrgId::new(), 1, interval);
+        assert!(!keeps_last_verdict(
+            &state,
+            session_id,
+            &StreamBridgeError::MissingRevocationState
+        ));
+    }
+}
+
+#[tokio::test]
+async fn route_cache_hit_does_not_confirm_the_revocation_verdict() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_revocation_fake(session_id).await;
+    let mut state = crate::tests::test_data_plane_state().await;
+    state.cluster_api = ClusterApiClients::service_only(
+        pplx_space_node_api_client::cluster::connect(fake.endpoint.clone(), "test")
+            .await
+            .unwrap(),
+    );
+    let interval = Duration::from_millis(crate::DEFAULT_REVOCATION_CHECK_INTERVAL_MS);
+    state.revocation_check_interval = interval;
+    state.route_cache_ttl = 10 * REVOCATION_MAX_STALENESS;
+    let token = format!("{DATA_PLANE_TOKEN_PREFIX}{}", "c".repeat(64));
+    resolve_session_route(&state, session_id, &token)
+        .await
+        .unwrap();
+    let tolerance = Duration::from_secs(1);
+    assert!(
+        state
+            .revocation_cache
+            .confirmed_active(session_id, tolerance)
+    );
+
+    // Past the tolerance, an attach answered from the route cache asked the
+    // cluster API nothing, so the verdict is as old as it was. Nothing below
+    // reaches the network, so the paused clock moves only as told.
+    tokio::time::pause();
+    tokio::time::advance(2 * tolerance).await;
+    state.revocation_cache.forget(session_id);
+    resolve_session_route(&state, session_id, &token)
+        .await
+        .unwrap();
+    assert!(
+        !state
+            .revocation_cache
+            .confirmed_active(session_id, tolerance)
+    );
+    assert!(matches!(
+        state
+            .revocation_cache
+            .probe(session_id, REVOCATION_MAX_STALENESS),
+        RevocationProbe::Fresh(true)
+    ));
+    // The resolve set the next refresh one interval after it; the cache hit
+    // must not have moved it later.
+    tokio::time::advance(interval - tolerance).await;
+    assert!(
+        matches!(
+            state
+                .revocation_cache
+                .probe(session_id, REVOCATION_MAX_STALENESS),
+            RevocationProbe::RefreshOrg(_)
+        ),
+        "the cache hit pushed the org's next refresh out"
+    );
 }
 
 /// How the fake backend fails a native WebSocket session.

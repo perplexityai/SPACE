@@ -923,6 +923,7 @@ pub(crate) async fn test_data_plane_state() -> DataPlaneState {
         ecw_hosts: Arc::default(),
         revocation_check_interval: Duration::from_secs(1),
         revocation_max_staleness: REVOCATION_MAX_STALENESS,
+        revocation_check_timeout: REVOCATION_CHECK_TIMEOUT,
         route_cache_ttl: Duration::from_secs(60),
         drain_started: CancellationToken::new(),
         stream_shutdown_token: CancellationToken::new(),

@@ -47,12 +47,11 @@ async fn resolve_session_route_with_cache(
         && use_cache
         && !space_api_route_token_needs_refresh(&attached.space_api_route_token)
     {
-        state.revocation_cache.remember_active(
+        state.revocation_cache.remember_cached_active(
             session_id,
             attached.revocation_epoch,
             attached.org_id,
             attached.org_revocation_epoch,
-            state.revocation_check_interval,
         );
         return Ok(attached);
     }
@@ -785,26 +784,64 @@ pub(super) fn revocation_check_interval(state: &DataPlaneState) -> tokio::time::
 /// Whether an attached stream's session has been revoked, checked on each
 /// revocation tick.
 ///
-/// A check that fails keeps the session's last confirmed verdict while that
-/// verdict is younger than the staleness bound, so a brief cluster API or
-/// database outage does not end every attached stream. Past the bound the
-/// error is returned and the stream fails closed. A confirmed revocation is
-/// reported at once.
+/// A check the cluster API could not answer keeps the session's last
+/// confirmed verdict while that verdict is young enough, so a brief cluster
+/// API or database outage does not end every attached stream. Once it is not,
+/// the error is returned and the stream fails closed, at most the staleness
+/// bound ([`REVOCATION_MAX_STALENESS`]) after its last confirmed check. Any
+/// other failure, such as a malformed answer, fails closed at once, and so
+/// does a confirmed revocation.
 pub(super) async fn session_is_revoked(
     state: &DataPlaneState,
     session_id: DataPlaneSessionId,
 ) -> Result<bool, StreamBridgeError> {
     match check_session_revocation(state, session_id).await {
-        Err(error)
-            if state
-                .revocation_cache
-                .confirmed_active(session_id, state.revocation_max_staleness) =>
-        {
+        Err(error) if keeps_last_verdict(state, session_id, &error) => {
             tracing::warn!(%error, "revocation check failed; keeping the last confirmed verdict");
             Ok(false)
         }
         result => result,
     }
+}
+
+/// Whether a failed check leaves the stream on the session's last confirmed
+/// verdict rather than failing it closed.
+fn keeps_last_verdict(
+    state: &DataPlaneState,
+    session_id: DataPlaneSessionId,
+    error: &StreamBridgeError,
+) -> bool {
+    revocation_check_unavailable(error)
+        && state
+            .revocation_cache
+            .confirmed_active(session_id, revocation_tolerance(state))
+}
+
+/// How old a confirmed verdict may be and still stand in for a failed check.
+/// The check that finds it too old can start up to one interval later and
+/// take up to one check timeout, so both come off the staleness bound and the
+/// stream ends within it of its last confirmed check.
+fn revocation_tolerance(state: &DataPlaneState) -> Duration {
+    state
+        .revocation_max_staleness
+        .saturating_sub(state.revocation_check_interval)
+        .saturating_sub(state.revocation_check_timeout)
+}
+
+/// Whether a revocation check failed because the cluster API could not
+/// answer, rather than because it answered something unusable.
+fn revocation_check_unavailable(error: &StreamBridgeError) -> bool {
+    matches!(
+        error,
+        StreamBridgeError::RevocationStatus(status)
+            if matches!(
+                status.code(),
+                tonic::Code::Unavailable
+                    | tonic::Code::DeadlineExceeded
+                    | tonic::Code::Internal
+                    | tonic::Code::Unknown
+            )
+    )
 }
 
 async fn check_session_revocation(
@@ -814,7 +851,7 @@ async fn check_session_revocation(
     let kind = session_id.kind().as_str();
     match state
         .revocation_cache
-        .probe(session_id, state.revocation_max_staleness)
+        .probe(session_id, revocation_tolerance(state))
     {
         RevocationProbe::Fresh(active) => {
             pplx_space_metrics::data_plane::revocation_cache_probe(kind, "fresh");
@@ -902,12 +939,15 @@ pub(super) async fn fetch_session_revocation_state(
     session_id: DataPlaneSessionId,
 ) -> Result<Option<(OrgId, DataPlaneRevocationState)>, StreamBridgeError> {
     let mut client = state.cluster_api.for_session(&session_id);
-    let response = match client
-        .get_data_plane_session_revocation_state(GetDataPlaneSessionRevocationStateRequest {
+    let response = match tokio::time::timeout(
+        state.revocation_check_timeout,
+        client.get_data_plane_session_revocation_state(GetDataPlaneSessionRevocationStateRequest {
             session_id: session_id.to_string(),
             protocol_session_id: protocol_session_id(session_id),
-        })
-        .await
+        }),
+    )
+    .await
+    .unwrap_or_else(|_| Err(revocation_check_timed_out()))
     {
         Ok(response) => response.into_inner(),
         Err(status) if status.code() == tonic::Code::NotFound => return Ok(None),
@@ -928,14 +968,23 @@ pub(super) async fn fetch_org_revocation_epoch(
     org_id: OrgId,
 ) -> Result<u64, StreamBridgeError> {
     let mut client = state.cluster_api.for_org(&org_id);
-    let response = client
-        .get_data_plane_org_revocation_epoch(GetDataPlaneOrgRevocationEpochRequest {
+    let response = tokio::time::timeout(
+        state.revocation_check_timeout,
+        client.get_data_plane_org_revocation_epoch(GetDataPlaneOrgRevocationEpochRequest {
             org_id: org_id.to_string(),
-        })
-        .await
-        .map_err(StreamBridgeError::RevocationStatus)?
-        .into_inner();
+        }),
+    )
+    .await
+    .unwrap_or_else(|_| Err(revocation_check_timed_out()))
+    .map_err(StreamBridgeError::RevocationStatus)?
+    .into_inner();
     Ok(response.epoch)
+}
+
+/// A revocation check that outlived its timeout, reported as the deadline
+/// status the cluster API would have returned.
+fn revocation_check_timed_out() -> tonic::Status {
+    tonic::Status::deadline_exceeded("revocation check timed out")
 }
 
 pub(super) fn revocation_check_error_label(error: &StreamBridgeError) -> &'static str {

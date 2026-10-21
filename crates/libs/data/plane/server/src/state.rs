@@ -528,11 +528,39 @@ impl RevocationCache {
         org_epoch: u64,
         refresh_after: Duration,
     ) {
+        if self.remember_session(session_id, epoch, active, org_id, org_epoch) {
+            self.remember_org_epoch(org_id, org_epoch, refresh_after);
+        }
+    }
+
+    /// Record an active session from a route this replica resolved earlier
+    /// and still caches. The cluster API was not asked, so the org's last
+    /// confirmation and next refresh stay as the resolve left them.
+    pub(super) fn remember_cached_active(
+        &self,
+        session_id: DataPlaneSessionId,
+        epoch: u64,
+        org_id: OrgId,
+        org_epoch: u64,
+    ) {
+        self.remember_session(session_id, epoch, true, org_id, org_epoch);
+    }
+
+    /// Record the session's verdict unless a newer epoch is already cached;
+    /// returns whether it was recorded.
+    fn remember_session(
+        &self,
+        session_id: DataPlaneSessionId,
+        epoch: u64,
+        active: bool,
+        org_id: OrgId,
+        org_epoch: u64,
+    ) -> bool {
         let key = session_id.to_string();
         if let Some(existing) = self.entries.get(&key)
             && epoch < existing.epoch
         {
-            return;
+            return false;
         }
         self.entries.insert(
             key,
@@ -543,7 +571,7 @@ impl RevocationCache {
                 org_epoch,
             },
         );
-        self.remember_org_epoch(org_id, org_epoch, refresh_after);
+        true
     }
 
     pub(super) fn remember_org_epoch(&self, org_id: OrgId, epoch: u64, refresh_after: Duration) {
@@ -566,11 +594,11 @@ impl RevocationCache {
 
     /// Probe the session's cached verdict. A refresh another stream has in
     /// flight answers from the cache only while that verdict is younger than
-    /// `max_staleness`; past it, this session is re-read instead.
+    /// `tolerance`; past it, this session is re-read instead.
     pub(super) fn probe(
         self: &Arc<Self>,
         session_id: DataPlaneSessionId,
-        max_staleness: Duration,
+        tolerance: Duration,
     ) -> RevocationProbe {
         let key = session_id.to_string();
         let Some(entry) = self.entries.get(&key) else {
@@ -598,7 +626,7 @@ impl RevocationCache {
             return RevocationProbe::Fresh(active);
         }
         let cached_org_epoch = org.epoch.max(session_org_epoch);
-        let confirmed_recently = org.confirmed_at.elapsed() < max_staleness;
+        let confirmed_recently = org.confirmed_at.elapsed() < tolerance;
         let refreshing = Arc::clone(&org.refreshing);
         drop(org);
         if refreshing
@@ -621,13 +649,12 @@ impl RevocationCache {
     }
 
     /// Whether the session's last confirmed verdict is active and younger
-    /// than `max_staleness`. A newer org epoch than the session was read
-    /// under means a revocation in its org since, so the verdict no longer
-    /// counts.
+    /// than `tolerance`. A newer org epoch than the session was read under
+    /// means a revocation in its org since, so the verdict no longer counts.
     pub(super) fn confirmed_active(
         &self,
         session_id: DataPlaneSessionId,
-        max_staleness: Duration,
+        tolerance: Duration,
     ) -> bool {
         let Some(entry) = self.entries.get(&session_id.to_string()) else {
             return false;
@@ -635,7 +662,7 @@ impl RevocationCache {
         let Some(org) = self.orgs.get(&entry.org_id) else {
             return false;
         };
-        entry.active && entry.org_epoch >= org.epoch && org.confirmed_at.elapsed() < max_staleness
+        entry.active && entry.org_epoch >= org.epoch && org.confirmed_at.elapsed() < tolerance
     }
 
     pub(super) fn forget(&self, session_id: DataPlaneSessionId) {

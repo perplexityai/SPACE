@@ -143,9 +143,12 @@ pub const DEFAULT_MAX_ATTACHED_STREAMS_PER_SANDBOX: usize = 512;
 pub const DEFAULT_BACKEND_CHANNEL_POOL_SIZE: usize = 4;
 pub const DEFAULT_REVOCATION_CHECK_INTERVAL_MS: u64 = 10_000;
 pub const DEFAULT_ROUTE_CACHE_TTL_MS: u64 = 1_000;
-/// How long an attached stream keeps its last confirmed revocation verdict
-/// while revocation checks fail, before it fails closed.
+/// How long after its last confirmed revocation check an attached stream may
+/// keep running while later checks fail, before it fails closed.
 const REVOCATION_MAX_STALENESS: Duration = Duration::from_secs(60);
+/// How long one revocation check may wait on the cluster API. A check that
+/// takes longer counts as unavailable.
+const REVOCATION_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 /// The shortest drain deadline the service accepts: the 8-second stream-open
 /// budget, so a `Process.Start` already opening when SIGTERM arrives finishes
 /// opening, and can report whether the command started, before the deadline.
@@ -256,6 +259,7 @@ struct DataPlaneState {
     ecw_hosts: Arc<EcwHostConfig>,
     revocation_check_interval: Duration,
     revocation_max_staleness: Duration,
+    revocation_check_timeout: Duration,
     route_cache_ttl: Duration,
     /// Cancelled on SIGTERM: a child of the caller's shutdown token. New
     /// streams are refused once it is cancelled, and sockets still
@@ -425,6 +429,7 @@ pub async fn run(
             .revocation_check_interval
             .max(Duration::from_millis(1)),
         revocation_max_staleness: REVOCATION_MAX_STALENESS,
+        revocation_check_timeout: REVOCATION_CHECK_TIMEOUT,
         route_cache_ttl: config.route_cache_ttl.max(Duration::from_millis(1)),
         drain_started,
         stream_shutdown_token: stream_shutdown_token.clone(),
