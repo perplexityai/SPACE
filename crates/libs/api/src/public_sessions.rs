@@ -57,6 +57,8 @@ pub enum PublicSessionStoreError {
     MissingIdempotencyOperation,
     #[error("session idempotency operation has no target session")]
     MissingIdempotencyTarget,
+    #[error("session was revoked or ended")]
+    SessionRevoked,
     #[error("database error: {0}")]
     Sql(#[from] sqlx::Error),
 }
@@ -112,6 +114,11 @@ impl PublicSessionStore {
             let row = fetch_session_tx(&mut tx, input.org_id, input.sandbox_id, session_id)
                 .await?
                 .ok_or(PublicSessionStoreError::MissingIdempotencyTarget)?;
+            // The refresh skips a session that has ended, which still exists
+            // after a revoke or close; a replay must not hand out a token for it.
+            let Some(token) = token else {
+                return Err(PublicSessionStoreError::SessionRevoked);
+            };
             tx.commit().await?;
             return PublicSessionRow::try_into_public(
                 row,
@@ -580,20 +587,25 @@ async fn fetch_operation_target_session(
         .transpose()
 }
 
+/// Mint a token for a replayed session, or `None` when the session was revoked
+/// or has ended. The row lock this takes orders the replay against a concurrent
+/// revoke.
 async fn refresh_attach_token_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: DataPlaneSessionId,
-) -> Result<DataPlaneToken, sqlx::Error> {
+) -> Result<Option<DataPlaneToken>, sqlx::Error> {
     let token = DataPlaneToken::new();
     let now = OffsetDateTime::now_utc();
     let session_id_string = session_id.to_string();
-    sqlx::query(sql!(
+    let refreshed = sqlx::query(sql!(
         "UPDATE data_plane_sessions
          SET token_hash = $2,
              token_expires_at = $3,
              attach_deadline_at = $4,
              updated_at = NOW()
-         WHERE session_id = $1"
+         WHERE session_id = $1
+           AND revocation_status = 'active'
+           AND state NOT IN ('closed', 'revoked', 'failed')"
     ))
     .bind(&session_id_string)
     .bind(token.hash.as_str())
@@ -601,7 +613,7 @@ async fn refresh_attach_token_tx(
     .bind(now + DEFAULT_ATTACH_DEADLINE)
     .execute(&mut **tx)
     .await?;
-    Ok(token)
+    Ok((refreshed.rows_affected() > 0).then_some(token))
 }
 
 async fn fetch_session_tx(

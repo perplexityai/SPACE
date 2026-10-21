@@ -1105,3 +1105,136 @@ async fn seed_sandbox(pool: &PgPool, org_id: OrgId, user_id: UserId) -> Result<U
     .await?;
     Ok(id)
 }
+
+/// One terminal session create, replayable with the same key and body.
+struct ReplayableCreate {
+    store: PublicSessionStore,
+    org_id: OrgId,
+    actor_id: UserId,
+    sandbox_id: PublicSandboxId,
+    request: serde_json::Value,
+    fingerprint: serde_json::Value,
+    key: IdempotencyKey,
+}
+
+impl ReplayableCreate {
+    async fn seed(pool: &PgPool, key: &str) -> TestResult<Self> {
+        let org_id = OrgId::from_uuid(seed_org(pool).await?);
+        let actor_id = UserId::from_uuid(seed_user(pool, org_id).await?);
+        let sandbox_id = PublicSandboxId::from_uuid(seed_sandbox(pool, org_id, actor_id).await?);
+        let request = serde_json::json!({"command": [], "env": {}});
+        let fingerprint = session_fingerprint_payload(
+            sandbox_id,
+            SessionKind::Terminal,
+            None,
+            None,
+            None,
+            &request,
+        );
+        Ok(Self {
+            store: PublicSessionStore::with_data_plane_base_url(pool.clone(), ""),
+            org_id,
+            actor_id,
+            sandbox_id,
+            request,
+            fingerprint,
+            key: IdempotencyKey::parse(key)?,
+        })
+    }
+
+    async fn create(&self) -> Result<PublicSession, PublicSessionStoreError> {
+        self.store
+            .create_session(CreatePublicSession {
+                org_id: self.org_id,
+                actor_user_id: Some(self.actor_id),
+                sandbox_id: self.sandbox_id,
+                kind: SessionKind::Terminal,
+                target_port: None,
+                target_protocol: None,
+                target_path: None,
+                adapter_state: self.request.clone(),
+                fingerprint_payload: &self.fingerprint,
+                idempotency: CreatePublicSessionIdempotency {
+                    method: HttpOperationMethod::Post,
+                    path_template: OperationPathTemplate::new(
+                        "/v1/sandboxes/{sandbox_id}/terminal-sessions",
+                    ),
+                    key: &self.key,
+                },
+            })
+            .await
+    }
+}
+
+async fn stored_token_hash(
+    pool: &PgPool,
+    session_id: DataPlaneSessionId,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar::<_, Option<String>>(sql!(
+        "SELECT token_hash FROM data_plane_sessions WHERE session_id = $1"
+    ))
+    .bind(session_id.to_string())
+    .fetch_one(pool)
+    .await
+}
+
+#[tokio::test]
+async fn replay_of_a_revoked_session_is_refused_without_a_token() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let create = ReplayableCreate::seed(&db.pool, "revoked-session-replay").await?;
+    let first = create.create().await?;
+    create
+        .store
+        .revoke_session(RevokePublicSession {
+            org_id: create.org_id,
+            sandbox_id: create.sandbox_id,
+            session_id: first.id,
+            reason: "user_requested",
+        })
+        .await?
+        .expect("session should be revoked");
+
+    let replay = create
+        .create()
+        .await
+        .expect_err("a revoked session's replay must not mint a token");
+    assert!(
+        matches!(replay, PublicSessionStoreError::SessionRevoked),
+        "{replay:?}"
+    );
+    assert_eq!(stored_token_hash(&db.pool, first.id).await?, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn replay_of_an_ended_session_is_refused() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    for state in ["closed", "revoked", "failed"] {
+        let create = ReplayableCreate::seed(&db.pool, &format!("{state}-session-replay")).await?;
+        let first = create.create().await?;
+        let first_hash = hash_token(&first.attach.as_ref().expect("attach token").token);
+        sqlx::query(sql!(
+            "UPDATE data_plane_sessions SET state = $2 WHERE session_id = $1"
+        ))
+        .bind(first.id.to_string())
+        .bind(state)
+        .execute(&db.pool)
+        .await?;
+
+        let replay = create.create().await.expect_err(state);
+        assert!(
+            matches!(replay, PublicSessionStoreError::SessionRevoked),
+            "{state}: {replay:?}"
+        );
+        assert_eq!(
+            stored_token_hash(&db.pool, first.id).await?,
+            Some(first_hash),
+            "{state}"
+        );
+    }
+    Ok(())
+}

@@ -373,6 +373,16 @@ impl From<crate::public_sessions::PublicSessionStoreError> for PublicApiError {
                     "idempotency key was already used with a different request",
                 )
             }
+            crate::public_sessions::PublicSessionStoreError::SessionRevoked => {
+                let mut error = Self::conflict(
+                    "session was revoked or ended; create a new session with a new idempotency key",
+                );
+                error.details.push(PublicErrorDetail {
+                    key: pplx_space_public_api::CONFLICT_REASON_DETAIL_KEY.to_string(),
+                    value: pplx_space_public_api::CONFLICT_REASON_SESSION_REVOKED.to_string(),
+                });
+                error
+            }
             crate::public_sessions::PublicSessionStoreError::Sql(error) => Self::from(error),
             other => {
                 tracing::error!(error = %other, "public session store error");
