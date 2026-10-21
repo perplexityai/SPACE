@@ -374,31 +374,32 @@ where
                 let terminal_error_code = result
                     .terminal_error_code
                     .unwrap_or(PublicErrorCode::Internal);
-                let terminal_error_json = result.terminal_error_json.unwrap_or_else(|| {
-                    let mut error = serde_json::json!({
+                let mut terminal_error_json = result.terminal_error_json.unwrap_or_else(|| {
+                    serde_json::json!({
                         "operation_id": operation_id.to_string(),
                         "kind": kind.as_str(),
                         "reason": "retry_attempts_exhausted",
                         "retry_reason": retry_reason,
                         "attempts": attempts,
                         "max_retry_attempts": config.max_retry_attempts.max(1),
-                    });
-                    // Deferred retries give their attempts back, so the
-                    // window, not the attempt count, is what ran out.
-                    if let (Some(elapsed), Some(fields)) =
-                        (deferral_exhausted_after, error.as_object_mut())
-                    {
-                        fields.insert(
-                            "deferred_retry_window_ms".to_owned(),
-                            serde_json::json!(DEFERRED_RETRY_WINDOW.as_millis()),
-                        );
-                        fields.insert(
-                            "elapsed_since_first_claim_ms".to_owned(),
-                            serde_json::json!(elapsed.as_millis()),
-                        );
-                    }
-                    error
+                    })
                 });
+                // Deferred retries give their attempts back, so the window,
+                // not the attempt count, is what ran out, whichever error
+                // the operation fails with.
+                if let (Some(elapsed), Some(fields)) = (
+                    deferral_exhausted_after,
+                    terminal_error_json.as_object_mut(),
+                ) {
+                    fields.insert(
+                        "deferred_retry_window_ms".to_owned(),
+                        serde_json::json!(DEFERRED_RETRY_WINDOW.as_millis()),
+                    );
+                    fields.insert(
+                        "elapsed_since_first_claim_ms".to_owned(),
+                        serde_json::json!(elapsed.as_millis()),
+                    );
+                }
                 let progress_message = match deferral_exhausted_after {
                     Some(elapsed) => format!(
                         "retry deferral window of {} exhausted {} after the first claim: \
