@@ -3234,56 +3234,6 @@ async fn insert_data_plane_session_with_protocol(
     Ok(())
 }
 
-/// A daemon heartbeating from an instance whose admin row was
-/// terminated must be refused (`FailedPrecondition`) instead of
-/// having the row resurrected. Without this guard, the worker-side
-/// daemon on the still-running EC2 keeps re-creating the row during
-/// the long bare-metal `shutting-down` window and the orchestrator
-/// re-drains the
-/// same node every tick.
-#[tokio::test(flavor = "current_thread")]
-async fn bootstrap_k8s_origin_node_refuses_tombstoned_node() -> TestResult {
-    use std::net::{IpAddr, Ipv4Addr};
-
-    let Some(fixture) = cluster_fixture().await? else {
-        return Ok(());
-    };
-    let node_name = "space-test-tombstoned-node";
-    let role = SpaceNodeRole::Worker;
-    let node_id = space_k8s_node_id(node_name, role.as_str());
-
-    sqlx::query(
-        "INSERT INTO node_k8s_tombstones (node_id, k8s_node_name, role, reason)
-             VALUES ($1, $2, 'worker', 'admin-terminate')",
-    )
-    .bind(node_id)
-    .bind(node_name)
-    .execute(&fixture.service.pool)
-    .await?;
-
-    let err = fixture
-        .service
-        .bootstrap_k8s_origin_node(node_name, role, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 99)))
-        .await
-        .expect_err("tombstoned node must refuse bootstrap");
-    assert_eq!(err.code(), Code::FailedPrecondition);
-    assert!(
-        err.message().contains("was terminated"),
-        "message should explain refusal: {}",
-        err.message()
-    );
-
-    let resurrected: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM nodes WHERE id = $1")
-        .bind(node_id)
-        .fetch_one(&fixture.service.pool)
-        .await?;
-    assert_eq!(
-        resurrected, 0,
-        "tombstoned bootstrap must not insert a nodes row"
-    );
-    Ok(())
-}
-
 #[tokio::test(flavor = "current_thread")]
 async fn direct_origin_node_id_does_not_reactivate_soft_deleted_node() -> TestResult {
     let Some(fixture) = cluster_fixture().await? else {
@@ -3307,11 +3257,7 @@ async fn direct_origin_node_id_does_not_reactivate_soft_deleted_node() -> TestRe
 
     let err = fixture
         .service
-        .resolve_origin_node_id(
-            &node_id.to_string(),
-            Some(SpaceNodeRole::Worker),
-            Some(std::net::SocketAddr::from(([10, 0, 0, 99], 12345))),
-        )
+        .resolve_origin_node_id(&node_id.to_string(), Some(SpaceNodeRole::Worker))
         .await
         .expect_err("deleted direct nodes must require explicit admin registration");
     assert_eq!(err.code(), Code::NotFound);

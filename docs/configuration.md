@@ -246,9 +246,9 @@ Build-manager forwards the grant to template and release registration.
 ClusterApi accepts a tenant-list account's publication only with a grant that
 names the requested template and organization and that covers the builder node
 identified by freshly reviewed pod-bound node name and UID, matched against
-live Kubernetes builder inventory. A bootstrapped node with no inventory UID
-cannot publish yet; build-manager retries until inventory synchronization
-completes, within its bounded registration backoff. Updated build-managers also
+live Kubernetes builder inventory. A builder whose registration has no
+inventory UID yet cannot publish; build-manager retries until inventory
+synchronization completes, within its bounded registration backoff. Updated build-managers also
 retry publication failures explicitly marked as uncommitted database
 contention; transport failures with an unknown commit outcome remain terminal.
 Both build-manager and ClusterApi must be upgraded for these retries.

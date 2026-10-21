@@ -138,7 +138,8 @@ impl TemplateReleasesStore {
         Ok(TemplateReadScope::NodeScoped { node_ids })
     }
 
-    /// A bootstrap name is not authority: wait for inventory to supply its UID.
+    /// A registration without an inventory UID is not authority: wait for
+    /// node sync to supply it.
     pub(super) async fn publisher_node_for_identity(
         &self,
         node: &pplx_space_common_svc::auth::build::AuthenticatedBuildNode,

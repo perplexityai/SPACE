@@ -3812,15 +3812,14 @@ async fn node_publish_rejects_delete_completions_from_a_builder_node() -> TestRe
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn node_publish_rejects_delete_completions_from_a_freshly_bootstrapped_node() -> TestResult {
+async fn node_publish_refuses_a_name_registered_under_another_role() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
     // A Kubernetes node name resolves against (k8s_node_name, role). Declaring
-    // a role the name is not registered under bootstraps a *new* worker row —
-    // with that role, that address, and a node_k8s row for the same node name,
-    // which is exactly what the receipt path's execution-ownership check reads.
-    // The worker-role gate alone would pass on an identity minted by this call.
+    // a role the name is not registered under is a miss: registration belongs
+    // to the controller's node sync, so the publication is NotFound and leaves
+    // no second row carrying the asserted role and the caller's address.
     let builder_node_id = NodeId::new();
     let k8s_node_name = format!("node-{builder_node_id}");
     sqlx::query(sql!(
@@ -3865,13 +3864,20 @@ async fn node_publish_rejects_delete_completions_from_a_freshly_bootstrapped_nod
     let status = ClusterApiService::new(db.pool.clone())
         .publish_node_state(request)
         .await
-        .expect_err("receipts from a just-minted registration must be rejected");
+        .expect_err("a name registered under another role must not resolve");
 
-    assert_eq!(status.code(), tonic::Code::PermissionDenied);
-    assert!(
-        status.message().contains("predates this publication"),
-        "unexpected message: {}",
-        status.message()
+    assert_eq!(status.code(), tonic::Code::NotFound);
+    let rows_for_name: i64 = sqlx::query_scalar(sql!(
+        "SELECT COUNT(*) FROM nodes n
+         JOIN node_k8s nk ON nk.node_id = n.id
+         WHERE nk.k8s_node_name = $1"
+    ))
+    .bind(&k8s_node_name)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        rows_for_name, 1,
+        "the publication must not register a second row for the name"
     );
     Ok(())
 }
