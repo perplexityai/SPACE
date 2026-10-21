@@ -15,8 +15,13 @@
 #      forms outside the check's grammar: a heredoc, exec form, `cargo` inside
 #      a command string, substitution or after `;`, `cargo install --path=`,
 #      an expansion in a dropped option's value, cargo in another
-#      instruction, and an escape directive. A blank line inside a continued
-#      RUN is dropped as Docker drops it, not taken as its end.
+#      instruction, a SHELL instruction, and an escape directive. A blank line
+#      inside a continued RUN is dropped as Docker drops it, not taken as its
+#      end, and a word split across a continuation is read whole.
+#   7. A `cargo install` of local code fails however its `--path` is written,
+#      and so does one with an expansion other than a quoted `--version`
+#      variable. An expansion that may run cargo, such as `${CARGO:-cargo}`,
+#      fails. A stage before the first named one is checked.
 #   6. A failure to process the graph fails the check rather than reading as
 #      clean: a leaking selection still fails with an unwritable TMPDIR, and
 #      with a `sort` that fails.
@@ -95,7 +100,7 @@ expect() {
 
 clean='FROM rust AS base
 RUN rustup toolchain install && cargo --version
-RUN cargo install --locked --version 0.1.78 cargo-chef
+RUN cargo install --locked --version "${CARGO_CHEF_VERSION}" cargo-chef
 
 FROM base AS build-app
 # A comment inside a continued RUN, as Docker allows.
@@ -181,12 +186,34 @@ expect fail separator-without-space-fails "$(hidden "RUN true;${leak}")" "${unre
 expect fail command-substitution-fails "$(hidden "RUN echo \$(${leak})")" "${unread}"
 expect fail backticks-fail "$(hidden "RUN echo \`${leak}\`")" "${unread}"
 expect fail install-path-equals-fails "$(hidden 'RUN cargo install --locked --path=app')" \
-    'cannot read cargo install --path=app'
+    'cargo install --path=app builds local code'
 expect fail expansion-in-a-dropped-value-fails \
     "$(hidden 'RUN cargo build --locked --release -p app --bin ${BIN_FLAGS}')" \
     'cannot read --bin ${BIN_FLAGS}'
 expect fail cargo-in-another-instruction-fails "$(hidden "ONBUILD RUN ${leak}")" \
     'cannot read cargo in a ONBUILD instruction'
+expect fail shell-instruction-fails "$(hidden 'SHELL ["/bin/bash", "-c"]')" \
+    'cannot read RUN instructions under a SHELL instruction'
+expect fail install-path-before-a-separator-fails \
+    "$(hidden 'RUN cargo install --locked --features test-hooks --path=app; true')" \
+    'cargo install --path=app builds local code'
+expect fail install-double-quoted-path-fails "$(hidden 'RUN cargo install --locked "--path=app"')" \
+    'cargo install --path=app builds local code'
+expect fail install-single-quoted-path-fails "$(hidden "RUN cargo install --locked '--path' app")" \
+    'cargo install --path builds local code'
+expect fail install-expansion-fails "$(hidden 'RUN cargo install --locked ${INSTALL_ARGS}')" \
+    'cannot read cargo install argument ${INSTALL_ARGS}'
+expect fail install-unquoted-version-expansion-fails \
+    "$(hidden 'RUN cargo install --locked --version ${V} cargo-chef')" \
+    'cannot read cargo install argument ${V}'
+expect fail cargo-in-an-expansion-fails "$(hidden "RUN \${CARGO:-cargo} ${leak#cargo }")" \
+    'which may run cargo'
+expect fail word-split-across-a-continuation-is-read "$(hidden "RUN car\\
+go ${leak#cargo }")" 'app feature "test-hooks"'
+expect fail unnamed-first-stage-is-checked "FROM rust
+RUN cargo build --locked --release --bin app
+
+${clean}" '(no stage) cargo build enables' 'base feature "test-hooks"'
 expect fail escape-directive-fails "# escape=\`
 ${clean}" 'cannot read a file with an escape parser directive'
 

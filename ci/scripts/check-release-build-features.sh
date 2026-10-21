@@ -27,23 +27,34 @@
 # `--target`, the graph is resolved for every target, a superset of the host
 # the image builds on.
 #
-# The file is read through a small grammar, and anything outside it fails
-# rather than being skipped:
-#   - Instructions are joined across backslash continuations. Comment lines and
-#     blank lines inside one are dropped, as Docker drops them. A parser
-#     directive that changes the escape character, and a SHELL instruction,
-#     fail.
+# It checks the `cargo` invocations written in the Dockerfile itself, read
+# through the small grammar below; anything in the file outside the grammar
+# fails rather than being skipped. A build inside a script that a RUN runs is
+# out of its scope: the runtime-supervisor stage's script is checked only
+# through the cargo command the Dockerfile passes it.
+#   - Instructions are joined across backslash continuations the way Docker
+#     joins them, with nothing inserted, so a word split across a continuation
+#     is read whole. Comment lines and blank lines inside one are dropped, as
+#     Docker drops them. A parser directive that changes the escape
+#     character, and a SHELL instruction, fail.
 #   - A RUN is in shell form without a heredoc. A RUN in exec form, or with
 #     `<<` anywhere in it, fails, and so does `cargo` in any other instruction.
 #   - In a RUN, `cargo` is a word of its own. `cargo build` and
 #     `cargo chef cook` are checked. `cargo chef prepare`, `cargo --version`
-#     and `cargo install` without `--path` build nothing from the workspace and
-#     pass. Any other subcommand fails. So does any `cargo` the word scan did
-#     not reach: one inside `$(...)`, backticks or an `sh -c` string, or after
-#     a separator with no space, such as `true;cargo`.
+#     and a `cargo install` of a registry crate build nothing from the
+#     workspace and pass. Any other subcommand fails. So does any `cargo` the
+#     word scan did not reach: one inside `$(...)`, backticks or an `sh -c`
+#     string, or after a separator with no space, such as `true;cargo`. So
+#     does any word that needs the shell to expand it and contains `cargo` in
+#     any case, such as `${CARGO:-cargo}`.
 #   - Every argument of a checked invocation, including the values of options
 #     it drops such as `--bin`, is a literal word: a quoted literal is read as
 #     its contents, and an expansion, glob or redirection fails.
+#   - A `cargo install` argument is a literal word too, read the same way, and
+#     `--path` in any form fails, since it builds local code. The one
+#     expansion allowed is a double-quoted variable as the value of
+#     `--version`, such as `--version "${CARGO_CHEF_VERSION}"`, which stays
+#     one word.
 #
 # Usage: check-release-build-features.sh [DOCKERFILE [WORKSPACE_DIR]]
 set -euo pipefail
@@ -64,7 +75,8 @@ shown="${dockerfile#"${REPO_ROOT}/"}"
 LITERAL='^[A-Za-z0-9_./,:=+@-]+$'
 
 # One line per instruction, as "<first line number><TAB><stage><TAB><text>",
-# with backslash continuations joined.
+# with backslash continuations joined. The stage is `-` before the first named
+# one: an empty field would collapse into the next under `read`.
 instructions() {
     awk '
         /^[[:space:]]*#/ { next }
@@ -72,17 +84,17 @@ instructions() {
         {
             line = $0
             if (!start) start = NR
-            if (sub(/\\[[:space:]]*$/, "", line)) { text = text line " "; continued = 1; next }
+            if (sub(/\\[[:space:]]*$/, "", line)) { text = text line; continued = 1; next }
             text = text line
             continued = 0
             if (toupper(text) ~ /^[[:space:]]*FROM[[:space:]]/) {
                 n = split(text, words, /[[:space:]]+/)
                 for (i = 1; i < n; i++) if (toupper(words[i]) == "AS") stage = words[i + 1]
             }
-            if (text ~ /[^[:space:]]/) print start "\t" stage "\t" text
+            if (text ~ /[^[:space:]]/) print start "\t" (stage == "" ? "-" : stage) "\t" text
             text = ""; start = 0
         }
-        END { if (text ~ /[^[:space:]]/) print start "\t" stage "\t" text }
+        END { if (text ~ /[^[:space:]]/) print start "\t" (stage == "" ? "-" : stage) "\t" text }
     ' "${dockerfile}"
 }
 
@@ -215,19 +227,53 @@ check_invocation() {
     check_selection "${where}" "${selection[@]}"
 }
 
+# Read the arguments of a `cargo install` at words[index] in the caller's
+# scope, up to the end of its command, and fail one that builds local code or
+# cannot be read. Marks the one expansion it allows in `allowed`.
+check_install() {
+    local arg value end=false
+    while [ "${index}" -lt "${#words[@]}" ] && [ "${end}" = false ]; do
+        arg="${words[index]}"
+        case "${arg}" in
+            '&&' | '||' | ';;' | ';' | '|' | ')') break ;;
+            *';')
+                arg="${arg%;}"
+                end=true
+                ;;
+        esac
+        index=$((index + 1))
+        if [[ "${arg}" == --version || "${arg}" == --vers ]] && [ "${end}" = false ] \
+            && [[ "${words[index]:-}" =~ ^\"\$(\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)\"\;?$ ]]; then
+            allowed[index]=1
+            [[ "${words[index]}" != *';' ]] || end=true
+            index=$((index + 1))
+            continue
+        fi
+        if ! value="$(literal "${arg}")"; then
+            fail "${where}: cannot read cargo install argument ${arg}"
+            return
+        fi
+        case "${value}" in
+            --path | --path=*)
+                fail "${where}: cargo install ${value} builds local code, which this check does not read"
+                return
+                ;;
+        esac
+    done
+}
+
 # Check one RUN instruction's shell-form body.
 check_run() {
     local at="$1" body="$2"
     local words word index=0 handled=0 expected branch="" where subcommand kind
-    local args=()
+    local args=() allowed=()
     expected="$(count_cargo "${body}")"
-    [ "${expected}" -gt 0 ] || return 0
     # Word splitting without globbing: the words are only compared below.
     set -f
     # shellcheck disable=SC2206
     words=(${body})
     set +f
-    while [ "${index}" -lt "${#words[@]}" ]; do
+    while [ "${expected}" -gt 0 ] && [ "${index}" -lt "${#words[@]}" ]; do
         word="${words[index]}"
         index=$((index + 1))
         # The `case` branch an invocation sits in, such as the cook's `worker)`.
@@ -262,16 +308,8 @@ check_run() {
                 ;;
             # Installs a tool from its registry, outside the workspace graph.
             install)
-                while [ "${index}" -lt "${#words[@]}" ]; do
-                    case "${words[index]}" in
-                        '&&' | '||' | ';;' | ';' | '|' | ')' | *';') break ;;
-                        --path | --path=*)
-                            fail "${where}: cannot read cargo install ${words[index]}"
-                            break
-                            ;;
-                    esac
-                    index=$((index + 1))
-                done
+                index=$((index + 1))
+                check_install
                 continue
                 ;;
             --version | -V) continue ;;
@@ -296,6 +334,15 @@ check_run() {
         builds=$((builds + 1))
         check_invocation "${where} ${kind}" ${args[@]+"${args[@]}"}
     done
+    # A word the shell expands that mentions cargo may run it, as in
+    # `${CARGO:-cargo} build`, whatever the scan above made of it.
+    for index in "${!words[@]}"; do
+        word="${words[index]}"
+        if [[ "${word,,}" == *cargo* ]] && [ -z "${allowed[index]:-}" ] \
+            && ! literal "${word}" >/dev/null; then
+            fail "${at}): cannot read ${word}, which may run cargo"
+        fi
+    done
     if [ "${handled}" -ne "${expected}" ]; then
         fail "${at}): cargo appears where this check cannot read it, such as inside" \
             "\$(...), backticks, a quoted command or after a separator with no space"
@@ -311,7 +358,8 @@ parsed="$(instructions)"
 builds=0
 while IFS=$'\t' read -r line_number stage text; do
     [ -n "${line_number}" ] || continue
-    at="${shown}:${line_number} (${stage:-no stage}"
+    [ "${stage}" != - ] || stage="no stage"
+    at="${shown}:${line_number} (${stage}"
     # Leading whitespace, then the instruction keyword.
     text="${text#"${text%%[![:space:]]*}"}"
     keyword="${text%%[[:space:]]*}"
