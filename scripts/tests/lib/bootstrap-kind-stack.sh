@@ -26,9 +26,11 @@
 # with that resource's log instead of consuming the timeout; a Tilt bound to a
 # deleted cluster is restarted.
 #
-# Public entry points: `bootstrap_kind_stack`, `kind_stack_prepare_cluster`, plus
-# `kind_stack_sweep_stale_node_tombstones` and `kind_stack_psql` for suites that
-# have to repeat a bring-up step in their own setup or cleanup.
+# Public entry points: `bootstrap_kind_stack`, `kind_stack_prepare_cluster`,
+# `kind_stack_recheck_for_scenario` for each scenario of a suite whose runner
+# already bootstrapped, plus `kind_stack_sweep_stale_node_tombstones` and
+# `kind_stack_psql` for suites that have to repeat a bring-up step in their own
+# setup or cleanup.
 #
 # Inputs (env vars, all optional with defaults set by the caller):
 #   API_URL           — health-check URL (e.g. http://localhost:8080)
@@ -49,6 +51,9 @@
 #                       directory under ~/.space-devbox/kind/runs, named by the
 #                       time and cluster, which the bring-up sets this to so
 #                       the sourcing script can cite the record)
+#   KIND_STACK_PROVENANCE_PASSED_FILE — created once the image provenance
+#                       check has passed, so a caller that relies on it
+#                       (the typed suite runner) learns it was not skipped
 #   SPACE_TILT_DETACH_TIMEOUT — registration wait for a detached start (default
 #                       60 seconds, at most 240). A timeout leaves the detached
 #                       watcher running; inspect its log and retry once ready.
@@ -502,6 +507,9 @@ bootstrap_kind_stack__check_provenance() {
             --cluster "$KIND_CLUSTER" --output "$SPACE_KIND_RUN_DIR/provenance.json"; then
         exit 1
     fi
+    if [[ -n "${KIND_STACK_PROVENANCE_PASSED_FILE:-}" ]]; then
+        : >"$KIND_STACK_PROVENANCE_PASSED_FILE"
+    fi
 }
 
 # Under SKIP_BOOTSTRAP=1, the mode a live stack is used in and so where a
@@ -912,6 +920,24 @@ kind_stack_start_detached() {
     KIND_STACK_DETACH=1 bootstrap_kind_stack__bring_up
 }
 
+# For each scenario the typed suite runner (`python -m space_smoke run --all`)
+# launches after its own `bootstrap_kind_stack` passed against the same live
+# stack. It repeats what can change between two scenarios: another cluster
+# taking the API port, another bring-up switching the storage credentials
+# mode, and node tombstones a scenario left. It leaves out the prerequisite,
+# mount, node vendor copy and Postgres data checks, which only provisioning
+# the box or creating the cluster changes, and the image provenance check,
+# which only a Tilt build changes; scenarios restart and reconfigure workloads
+# but build no image. The runner uses this only when its own bootstrap's
+# provenance check passed (KIND_STACK_PROVENANCE_PASSED_FILE), not when a busy
+# Tilt skipped it.
+# Each check added to `bootstrap_kind_stack` belongs here or in that list.
+kind_stack_recheck_for_scenario() {
+    bootstrap_kind_stack__assert_port_owner
+    bootstrap_kind_stack__refuse_storage_mode_mismatch
+    kind_stack_sweep_stale_node_tombstones
+}
+
 bootstrap_kind_stack() {
     kind_stack_assert_smoke_prereqs
     kind_stack_assert_cluster_mounts
@@ -1221,6 +1247,29 @@ bootstrap_kind_stack__node_reapply_hint() {
     done < <(awk '{ print $1 }' <<<"$mismatches" | sort -u)
 }
 
+# Without a bring-up nothing restarts Tilt in the requested mode, so a cluster
+# running the other one is refused.
+bootstrap_kind_stack__refuse_storage_mode_mismatch() {
+    local deployed_mode node_keys
+    deployed_mode="$(bootstrap_kind_stack__storage_mode_mismatch)" || exit 1
+    if [[ -n "$deployed_mode" ]]; then
+        echo "ERROR: kind cluster $KIND_CLUSTER runs SPACE_KIND_STORAGE_CREDENTIALS=$deployed_mode," >&2
+        echo "       and this run asks for ${SPACE_KIND_STORAGE_CREDENTIALS:-exchange} (the default is exchange)." >&2
+        echo "       Set SPACE_KIND_STORAGE_CREDENTIALS=$deployed_mode, or switch the cluster by" >&2
+        echo "       running once without SKIP_BOOTSTRAP=1, which restarts Tilt in the requested" >&2
+        echo "       mode; both modes share one object store, so nothing is recreated." >&2
+        exit 1
+    fi
+    node_keys="$(bootstrap_kind_stack__node_storage_keys_mismatch)" || exit 1
+    if [[ -n "$node_keys" ]]; then
+        echo "ERROR: kind cluster $KIND_CLUSTER runs SPACE_KIND_STORAGE_CREDENTIALS=${SPACE_KIND_STORAGE_CREDENTIALS:-exchange}," >&2
+        echo "       but in its node services:" >&2
+        sed 's/^/         /' <<<"$node_keys" >&2
+        bootstrap_kind_stack__node_reapply_hint "$node_keys" 1
+        exit 1
+    fi
+}
+
 bootstrap_kind_stack__bring_up() {
     # Always run the port-owner guard, even under SKIP_BOOTSTRAP — the
     # whole point is that the smoke test is destructive against
@@ -1230,29 +1279,14 @@ bootstrap_kind_stack__bring_up() {
     # Before the SKIP_BOOTSTRAP return: suites pick scenarios and expectations
     # by the requested mode, so running them against a cluster in the other
     # one would test what was not asked for.
-    local deployed_mode node_keys
-    deployed_mode="$(bootstrap_kind_stack__storage_mode_mismatch)" || exit 1
+    local deployed_mode
     if [[ "${SKIP_BOOTSTRAP:-0}" == "1" ]]; then
-        if [[ -n "$deployed_mode" ]]; then
-            echo "ERROR: kind cluster $KIND_CLUSTER runs SPACE_KIND_STORAGE_CREDENTIALS=$deployed_mode," >&2
-            echo "       and this run asks for ${SPACE_KIND_STORAGE_CREDENTIALS:-exchange} (the default is exchange)." >&2
-            echo "       Set SPACE_KIND_STORAGE_CREDENTIALS=$deployed_mode, or switch the cluster by" >&2
-            echo "       running once without SKIP_BOOTSTRAP=1, which restarts Tilt in the requested" >&2
-            echo "       mode; both modes share one object store, so nothing is recreated." >&2
-            exit 1
-        fi
-        node_keys="$(bootstrap_kind_stack__node_storage_keys_mismatch)" || exit 1
-        if [[ -n "$node_keys" ]]; then
-            echo "ERROR: kind cluster $KIND_CLUSTER runs SPACE_KIND_STORAGE_CREDENTIALS=${SPACE_KIND_STORAGE_CREDENTIALS:-exchange}," >&2
-            echo "       but in its node services:" >&2
-            sed 's/^/         /' <<<"$node_keys" >&2
-            bootstrap_kind_stack__node_reapply_hint "$node_keys" 1
-            exit 1
-        fi
+        bootstrap_kind_stack__refuse_storage_mode_mismatch
         echo "[bootstrap] SKIP_BOOTSTRAP=1; assuming kind+tilt are already running"
         bootstrap_kind_stack__check_live_provenance
         return
     fi
+    deployed_mode="$(bootstrap_kind_stack__storage_mode_mismatch)" || exit 1
 
     # curl is listed because this lib polls `/healthz` itself, not only because
     # the bring-up commands need it.

@@ -23,6 +23,7 @@ from collections import deque
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from http.client import HTTPException
 from pathlib import Path
 from typing import Any, BinaryIO, NoReturn
@@ -115,6 +116,7 @@ from space_smoke.runtime import (
     CommandResult,
     REPO_ROOT,
     SmokeConfigurationError,
+    run_concurrently,
 )
 
 KIND_NAMESPACE = "space"
@@ -614,6 +616,9 @@ LIMIT 1;
 # deletes. Both fit the 120 s cleanup window a 30-minute scenario gets.
 LOCAL_SANDBOX_RECLAIM_WAIT_SECONDS = 60
 LOCAL_SANDBOX_RECLAIM_DELETE_SECONDS = 45
+# Each poll is itself a kubectl round trip; the sleeps only space them out.
+LOCAL_SANDBOX_RECLAIM_POLL_SECONDS = 0.25
+LOCAL_SANDBOX_RECLAIM_POD_POLL_SECONDS = 0.5
 # Three delete refusals get their own handling. Two settle on their own and are
 # retried within the delete budget: sbx-manager's quarantine recovery
 # completing (`CleanupAdmissionError` in
@@ -890,6 +895,8 @@ class KindConfig:
     data_plane_url: str = "http://127.0.0.1:8090"
     skip_bootstrap: bool = False
     bootstrap_timeout: int = 1800
+    # Set in the scenarios the suite runner launches after its own bootstrap.
+    suite_bootstrapped: bool = False
 
     @property
     def context(self) -> str:
@@ -1160,7 +1167,13 @@ class KindHarness:
     def warm_pool_claim_pod(self, sandbox_id: str) -> WarmPoolCandidate:
         return self._warm_pool_pod("sandbox-id", sandbox_id)
 
-    def bootstrap(self) -> None:
+    def bootstrap(self) -> bool:
+        """Bootstrap the stack; whether its image provenance check ran and passed.
+
+        A `SKIP_BOOTSTRAP=1` bootstrap skips that check while Tilt is still
+        updating, and the per-scenario recheck never runs it.
+        """
+
         script = REPO_ROOT / "scripts/tests/lib/bootstrap-kind-stack.sh"
         environment = dict(self.environment)
         environment.update(
@@ -1173,16 +1186,24 @@ class KindHarness:
                 "BOOTSTRAP_TIMEOUT": str(self.config.bootstrap_timeout),
             }
         )
-        result = self.executor.run(
-            ["bash", "-c", f"source {shlex.quote(str(script))}; bootstrap_kind_stack"],
-            env=environment,
-            # The shell helper has bounded waits after its configurable API
-            # deadline. Keep an outer subprocess deadline around all of them.
-            timeout=(
-                self.config.bootstrap_timeout + KIND_BOOTSTRAP_POST_API_TIMEOUT_SECONDS
-            ),
-        )
-        _require_ok(result, "kind stack bootstrap")
+        entry = "bootstrap_kind_stack"
+        if self.config.skip_bootstrap and self.config.suite_bootstrapped:
+            # The library's own split of what can change between scenarios.
+            entry = "kind_stack_recheck_for_scenario"
+        with tempfile.TemporaryDirectory(prefix="space-smoke-bootstrap-") as scratch:
+            passed = Path(scratch) / "provenance-passed"
+            environment["KIND_STACK_PROVENANCE_PASSED_FILE"] = str(passed)
+            result = self.executor.run(
+                ["bash", "-c", f"source {shlex.quote(str(script))}; {entry}"],
+                env=environment,
+                # The shell helper has bounded waits after its configurable API
+                # deadline. Keep an outer subprocess deadline around all of them.
+                timeout=(
+                    self.config.bootstrap_timeout + KIND_BOOTSTRAP_POST_API_TIMEOUT_SECONDS
+                ),
+            )
+            _require_ok(result, "kind stack bootstrap")
+            return passed.exists()
 
     @staticmethod
     def api_key_hash(api_key: str) -> str:
@@ -2738,7 +2759,7 @@ ON CONFLICT (key_hash) DO NOTHING;
                     f"sandbox {canonical} still exists on the cluster {wait_timeout:g}s after "
                     "its delete; its local rows are live state, not residue"
                 )
-            time.sleep(1)
+            time.sleep(LOCAL_SANDBOX_RECLAIM_POLL_SECONDS)
         # While a pod of the sandbox has not finished, the kubelet keeps
         # retrying its sandbox creation, and each retry of a restore pod
         # re-materializes a local row from the pod's own annotations. Rows are
@@ -2755,15 +2776,24 @@ ON CONFLICT (key_hash) DO NOTHING;
                     "its delete: "
                     + ", ".join(f"{p.pod_name} ({p.phase}, node {p.node_name})" for p in pods)
                 )
-            time.sleep(2)
-        # Every worker is attempted before anything is raised: one worker's
-        # refusal must not leave another worker's rows behind for the next
-        # scenario.
+            time.sleep(LOCAL_SANDBOX_RECLAIM_POD_POLL_SECONDS)
+        # Every worker is attempted, all at once, before anything is raised:
+        # one worker's refusal must not leave another worker's rows behind for
+        # the next scenario.
         deadline = time.monotonic() + delete_timeout
+        nodes = self.sandbox_pool_nodes()
+        outcomes = run_concurrently(
+            [
+                partial(self._reclaim_local_sandbox_on, node, canonical, deadline)
+                for node in nodes
+            ]
+        )
         failures = [
-            failure
-            for node in self.sandbox_pool_nodes()
-            if (failure := self._reclaim_local_sandbox_on(node, canonical, deadline))
+            f"on {node}: {type(outcome).__name__}: {outcome}"
+            if isinstance(outcome, BaseException)
+            else outcome
+            for node, outcome in zip(nodes, outcomes)
+            if outcome
         ]
         if failures:
             raise RuntimeError(f"reclaim local sandbox {canonical}: " + "; ".join(failures))
@@ -4515,12 +4545,27 @@ ON CONFLICT (key_hash) DO NOTHING;
         )
 
     def wait_redis_unreachable(self, *, timeout: float) -> None:
-        """Pod gone, endpoints empty, then a settle so the API's pooled connection dies."""
+        """No Redis pod object left, then endpoints empty.
 
-        self.kubectl(
-            "wait", "--for=delete", "pod", "-l", KIND_REDIS_POD_SELECTOR,
-            f"--timeout={int(timeout)}s", timeout=timeout + 15,
-        )
+        The API removes a deleted pod's object only once the kubelet reports
+        its containers stopped: as soon as Redis exits on SIGTERM, at the
+        latest when the grace period ends. Endpoints empty as soon as it is
+        NotReady, while it may still serve. With the object gone no
+        Redis process is left to answer, so a pooled connection can only error
+        or hit the limiters' 500 ms store timeout, and both fail open.
+        """
+
+        deadline = time.monotonic() + timeout
+        while True:
+            pods = _require_ok(
+                self.kubectl("get", "pods", "-l", KIND_REDIS_POD_SELECTOR, "-o", "name", timeout=15),
+                "list Redis pods",
+            ).split()
+            if not pods:
+                break
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"Redis pods {pods} still exist {timeout:g}s after the scale to zero")
+            time.sleep(0.5)
         deadline = time.monotonic() + 30
         while True:
             result = self.kubectl(
@@ -4532,7 +4577,6 @@ ON CONFLICT (key_hash) DO NOTHING;
             if time.monotonic() > deadline:
                 raise RuntimeError("Redis endpoints did not drain after the pod left")
             time.sleep(1)
-        time.sleep(5)
 
     def wait_redis_rollout(self, *, timeout: float) -> None:
         _require_ok(
@@ -6326,7 +6370,9 @@ def _tcp_probe_script(targets: Sequence[TcpTarget], *, timeout: float, pod_ip: s
 
     With `pod_ip`, the connects run in the network namespace whose interface
     carries that address, found among the node's netns handles; without it,
-    in the shell's own.
+    in the shell's own. The connects run concurrently, each under its own
+    timeout, so a refusal costs one timeout however many targets there are.
+    Each result is one short line, written whole.
     """
 
     if not targets:
@@ -6357,13 +6403,16 @@ def _tcp_probe_script(targets: Sequence[TcpTarget], *, timeout: float, pod_ip: s
             raise ValueError(f"refusing probe target {target!r}")
         host = str(ipaddress.IPv4Address(target.host))
         lines += [
+            "(",
             f"if $enter timeout {seconds} bash -c 'exec 3<>\"/dev/tcp/$0/$1\"' {host} {target.port} 2>/dev/null; then",
             f"  echo 'PROBE {target.name} connected'",
             "else",
             "  rc=$?",
             f"  if [ \"$rc\" = 124 ]; then echo 'PROBE {target.name} timed-out'; else echo \"PROBE {target.name} refused rc=$rc\"; fi",
             "fi",
+            ") &",
         ]
+    lines.append("wait")
     return "\n".join(lines) + "\n"
 
 

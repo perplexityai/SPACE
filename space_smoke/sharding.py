@@ -71,14 +71,18 @@ _DURATION_SECONDS = {
         # suspend/restore cycles, three threshold-bound reaps, one survival window.
         "local.orphaned_restore_pod_gc_reaps_only_superseded": 300,
         "local.pending_backup_census_reports_blocked_upload": 216,
-        "local.private_template_build_isolation": 87,
-        # Two Kind runs with fast-pace env rollouts: 61 and 57 s.
-        "local.rate_limiters_enforce_and_fail_open": 60,
+        # Kind bench runs (otel), template deletes concurrent: 60-64 s.
+        "local.private_template_build_isolation": 63,
+        # Two Kind runs with fast-pace env rollouts: 61 and 57 s. Kind bench
+        # runs (otel) before them, no Redis settle: 98-103 s against 106 s.
+        "local.rate_limiters_enforce_and_fail_open": 58,
         # One Kind run: 16 s of phases (8.5 s suspend with the retried upload)
         # plus sandbox cleanup.
         "local.restarted_btrfs_send_is_rejected_and_retried": 30,
         "local.retention_claim_finish_forward": 80,
         "local.retention_restore_source_guard": 107,
+        # Kind bench runs (otel), probes concurrent: 21-23 s.
+        "local.sandbox_network_isolation_holds": 21,
         "local.snapshot_reaper_reclaims_backed_fork_snapshot": 147,
         "local.storage_exchange_scoping": 30,
         "local.suspend_restore_cross_node_from_object_storage": 14,
@@ -97,12 +101,14 @@ _DURATION_SECONDS = {
         "network_policy.v1_fastly_shared_edge_bypass": 4,
         "network_policy.v1_platform_guardrail_precedes_allow": 27,
         "network_policy.v1_rules_survive_restore": 33,
-        "network_policy.v1_tcp_dns_transport_respects_ip_allow": 10,
-        "network_policy.v1_udp_deny_precedes_allow": 18,
-        "network_policy.v1_udp_respects_cidr_allow": 19,
-        "network_policy.v1_udp_respects_cidr_deny": 18,
-        "network_policy.v1_udp_respects_ip_allow": 19,
-        "network_policy.v1_udp_respects_ip_deny": 18,
+        # The DNS transport hints: Kind bench runs (otel) without the settle
+        # an accepted reply makes redundant.
+        "network_policy.v1_tcp_dns_transport_respects_ip_allow": 5,
+        "network_policy.v1_udp_deny_precedes_allow": 14,
+        "network_policy.v1_udp_respects_cidr_allow": 13,
+        "network_policy.v1_udp_respects_cidr_deny": 14,
+        "network_policy.v1_udp_respects_ip_allow": 14,
+        "network_policy.v1_udp_respects_ip_deny": 13,
         "network_policy.v1_wildcard_domain_allow": 19,
     },
     "native": {

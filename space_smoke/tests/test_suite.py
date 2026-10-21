@@ -92,11 +92,16 @@ class SmokeSuiteTests(unittest.TestCase):
         )
         self.assertIn("aws", required_tools)
         from_environment.assert_called_once_with(
-            next(iter(REGISTRY.select())), required_tools=required_tools
+            next(iter(REGISTRY.select())),
+            {"SPACE_SMOKE_BACKEND": "kind", "SPACE_SMOKE_API_SURFACE": "ecw"},
+            required_tools=required_tools,
         )
         services.bootstrap.assert_called_once_with()
         self.assertEqual(run.call_args.args[0], selected)
         self.assertEqual(run.call_args.kwargs["environment"]["SKIP_BOOTSTRAP"], "1")
+        self.assertEqual(
+            run.call_args.kwargs["environment"]["SPACE_SMOKE_SUITE_BOOTSTRAPPED"], "1"
+        )
 
     def test_all_command_names_each_quarantined_scenario_and_skips_it(self) -> None:
         # Quarantine a copy of a real scenario rather than reading the live

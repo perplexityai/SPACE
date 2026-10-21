@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import signal
 import subprocess
 import sys
@@ -13,7 +14,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
-from typing import Protocol
+from typing import Protocol, TypeVar
 
 from space_smoke.model import ScenarioResult, Verdict
 
@@ -87,17 +88,27 @@ class SubprocessExecutor:
                     command_env.pop(name, None)
                 else:
                     command_env[name] = value
+        children = _CHILD_PROCESSES.get()
         try:
-            completed = subprocess.run(
-                list(command),
-                cwd=self.cwd,
-                env=command_env if command_env or env is not None else None,
-                input=input_text,
-                text=True,
-                capture_output=True,
-                timeout=timeout,
-                check=False,
-            )
+            if children is None:
+                completed = subprocess.run(
+                    list(command),
+                    cwd=self.cwd,
+                    env=command_env if command_env or env is not None else None,
+                    input=input_text,
+                    text=True,
+                    capture_output=True,
+                    timeout=timeout,
+                    check=False,
+                )
+            else:
+                completed = children.run(
+                    list(command),
+                    cwd=self.cwd,
+                    env=command_env if command_env or env is not None else None,
+                    input_text=input_text,
+                    timeout=timeout,
+                )
             return CommandResult(
                 tuple(command),
                 completed.returncode,
@@ -199,6 +210,114 @@ def background(name: str, target: Callable[[], None]) -> BackgroundWork:
     """Start `target` on a named thread whose `join` is a verdict (see [`BackgroundWork`])."""
 
     return BackgroundWork(name, target).start()
+
+
+T = TypeVar("T")
+
+
+class _ChildProcesses:
+    """The subprocesses one `run_concurrently` call's workers start.
+
+    `subprocess.run` enforces its timeout from the thread that called it; a
+    daemon worker left running when the process exits takes that enforcement
+    with it, and its child outlives the deadline. `end` kills and reaps every
+    child still running, and refuses new ones.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._running: set[subprocess.Popen[str]] = set()
+        self._ended = False
+
+    def run(
+        self,
+        command: list[str],
+        *,
+        cwd: Path,
+        env: Mapping[str, str] | None,
+        input_text: str | None,
+        timeout: float | None,
+    ) -> subprocess.CompletedProcess[str]:
+        """`subprocess.run(..., text=True, capture_output=True)`, owned by this group."""
+
+        with self._lock:
+            if self._ended:
+                raise RuntimeError(f"not started after the concurrent calls ended: {command[0]}")
+            process = subprocess.Popen(
+                command,
+                cwd=cwd,
+                env=env,
+                text=True,
+                stdin=subprocess.PIPE if input_text is not None else None,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self._running.add(process)
+        # As subprocess.run does: on a timeout the exception already holds the
+        # output so far, so kill and wait rather than read on, which a
+        # grandchild still holding the pipes would hold past the timeout.
+        try:
+            with process:
+                try:
+                    stdout, stderr = process.communicate(input_text, timeout=timeout)
+                except BaseException:
+                    process.kill()
+                    raise
+        finally:
+            with self._lock:
+                self._running.discard(process)
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+    def end(self) -> None:
+        with self._lock:
+            self._ended = True
+            running = list(self._running)
+        for process in running:
+            process.kill()
+        for process in running:
+            process.wait()
+
+
+_CHILD_PROCESSES: contextvars.ContextVar[_ChildProcesses | None] = contextvars.ContextVar(
+    "space_smoke_child_processes", default=None
+)
+
+
+def run_concurrently(calls: Sequence[Callable[[], T]]) -> list[T | BaseException]:
+    """Run each call on its own thread; each one's result, or what it raised, in order.
+
+    For independent waits that would otherwise run one after another. An
+    exception that interrupts the wait, such as a scenario or cleanup deadline,
+    is raised at once, after every subprocess the calls started through
+    `SubprocessExecutor` is killed and reaped; the daemon threads themselves
+    start no more.
+    """
+
+    children = _ChildProcesses()
+    outcomes: list[T | BaseException] = [
+        RuntimeError("the call did not finish") for _ in calls
+    ]
+
+    def run(index: int, call: Callable[[], T]) -> None:
+        _CHILD_PROCESSES.set(children)
+        try:
+            outcomes[index] = call()
+        except BaseException as error:  # noqa: BLE001 - returned to the caller in order
+            outcomes[index] = error
+
+    threads = [
+        threading.Thread(target=run, args=(index, call), daemon=True)
+        for index, call in enumerate(calls)
+    ]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    except BaseException:
+        children.end()
+        raise
+    return outcomes
 
 
 class ResourceScope:
