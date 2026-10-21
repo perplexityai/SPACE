@@ -17,6 +17,7 @@ bytesize = { workspace = true }
 k8s-openapi = { workspace = true, features = ["v1_32"], optional = true }
 libc = { workspace = true }
 nix = { workspace = true, features = ["fs", "ioctl"] }
+pplx-space-env-vars = { workspace = true }
 pplx-space-net-common = { workspace = true }
 rusqlite = { workspace = true, optional = true }
 semver = { workspace = true }

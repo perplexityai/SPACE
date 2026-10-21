@@ -26,7 +26,7 @@ openfeature = [
     "dep:open-feature",
     "dep:tokio",
     "dep:thiserror",
-    "dep:pplx-space-common-core",
+    "dep:pplx-space-env-vars",
 ]
 flagd = ["openfeature", "dep:open-feature-flagd"]
 
@@ -43,9 +43,10 @@ thiserror = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["rt", "sync", "time"] }
 
 # internal
-# `common-core` only for its shared env-flag vocabulary; it arrives with
-# `pplx-space-metrics` either way, so this adds no crate to the graph.
-pplx-space-common-core = { workspace = true, optional = true }
+# `env-vars` for the shared env-flag vocabulary the flagd switch is read
+# with; it arrives with `pplx-space-metrics` either way, so this adds no crate
+# to the graph.
+pplx-space-env-vars = { workspace = true, optional = true }
 
 pplx-space-metrics = { workspace = true }
 

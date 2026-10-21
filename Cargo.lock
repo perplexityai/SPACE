@@ -5374,6 +5374,7 @@ dependencies = [
  "k8s-openapi",
  "libc",
  "nix 0.31.3",
+ "pplx-space-env-vars",
  "pplx-space-net-common",
  "rusqlite",
  "semver",
@@ -5828,6 +5829,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-env-vars"
+version = "0.8.0"
+
+[[package]]
 name = "pplx-space-events"
 version = "0.8.0"
 dependencies = [
@@ -5860,7 +5865,7 @@ dependencies = [
  "eppo",
  "open-feature",
  "open-feature-flagd",
- "pplx-space-common-core",
+ "pplx-space-env-vars",
  "pplx-space-metrics",
  "pplx-space-test-env",
  "serde",
