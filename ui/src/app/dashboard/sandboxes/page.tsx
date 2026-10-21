@@ -18,6 +18,11 @@ import {
   waitForPublicOperation,
 } from '@/lib/public-api';
 import { adminApi } from '@/lib/api';
+import {
+  ROLLBACK_NOT_ENABLED,
+  SNAPSHOTS_NOT_ENABLED,
+  isHiddenOperationError,
+} from '@/lib/hidden-operations';
 import { useAuth } from '@/lib/auth';
 import {
   AutoLifecyclePolicy,
@@ -457,11 +462,19 @@ function SnapshotsPanel({ sandboxId }: { sandboxId: string }) {
   const { message } = App.useApp();
   const [snapshots, setSnapshots] = useState<SnapshotInfo[]>([]);
   const [loading, setLoading] = useState(true);
+  const [snapshotsOff, setSnapshotsOff] = useState(false);
+  const [rollbackOff, setRollbackOff] = useState(false);
 
   useEffect(() => {
     getPublicPage<PublicSnapshot>(`/sandboxes/${sandboxId}/snapshots`)
       .then((items) => setSnapshots(items.map(publicSnapshotToConsoleSnapshot)))
-      .catch((err: any) => message.error(err.message || 'failed to load snapshots'))
+      .catch((err: any) => {
+        if (isHiddenOperationError(err)) {
+          setSnapshotsOff(true);
+          return;
+        }
+        message.error(err.message || 'failed to load snapshots');
+      })
       .finally(() => setLoading(false));
   }, [sandboxId]);
 
@@ -473,6 +486,11 @@ function SnapshotsPanel({ sandboxId }: { sandboxId: string }) {
       });
       message.success('Snapshot rollback queued');
     } catch (err: any) {
+      if (isHiddenOperationError(err)) {
+        setRollbackOff(true);
+        message.info(ROLLBACK_NOT_ENABLED);
+        return;
+      }
       message.error(err.message || 'failed to queue rollback');
     }
   };
@@ -512,6 +530,8 @@ function SnapshotsPanel({ sandboxId }: { sandboxId: string }) {
       },
     },
     { title: 'Size', dataIndex: 'size_bytes', width: 100, render: (v: number) => v ? formatSnapshotBytes(v) : '0' },
+  ];
+  const rollbackColumns: ColumnsType<SnapshotInfo> = rollbackOff ? [] : [
     {
       title: 'Action', width: 120,
       render: (_, record) => (
@@ -527,11 +547,22 @@ function SnapshotsPanel({ sandboxId }: { sandboxId: string }) {
     },
   ];
 
+  if (snapshotsOff) {
+    return (
+      <div style={{ padding: '8px 0' }}>
+        <Text strong><CameraOutlined /> Snapshots</Text>
+        <div style={{ marginTop: 8 }}>
+          <Text type="secondary">{SNAPSHOTS_NOT_ENABLED}</Text>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div style={{ padding: '8px 0' }}>
       <Text strong><CameraOutlined /> Snapshots</Text>
       <Table
-        columns={snapshotColumns}
+        columns={[...snapshotColumns, ...rollbackColumns]}
         dataSource={snapshots}
         rowKey="id"
         loading={loading}
@@ -738,13 +769,26 @@ function SandboxesPage() {
       const sandbox = targetOrgId
         ? await createConsoleSandboxForOrg(targetOrgId, payload)
         : await postPublicOperation('/sandboxes', payload);
+      // The sandbox exists from here on: a failed snapshot enable is a
+      // partial success, reported as such, so a retry does not create a
+      // second sandbox.
+      let snapshotsNotice: string | null = null;
       if (values.snapshots) {
         if (targetOrgId) {
           await waitForAdminOperation(sandbox.operation_id);
-          await forceConsoleSandboxAction(sandbox.sandbox_id, 'enable_snapshots');
         } else {
           await waitForPublicOperation(sandbox.operation_id);
-          await postPublicOperation(`/sandboxes/${sandbox.sandbox_id}:enable_snapshots`);
+        }
+        try {
+          if (targetOrgId) {
+            await forceConsoleSandboxAction(sandbox.sandbox_id, 'enable_snapshots');
+          } else {
+            await postPublicOperation(`/sandboxes/${sandbox.sandbox_id}:enable_snapshots`);
+          }
+        } catch (err: any) {
+          snapshotsNotice = isHiddenOperationError(err)
+            ? 'snapshots are not enabled for your organization'
+            : `enabling snapshots failed: ${err.message || 'request failed'}`;
         }
       }
       form.resetFields();
@@ -761,10 +805,11 @@ function SandboxesPage() {
           void navigator.clipboard.writeText(sandboxId);
         }
       };
-      message.success({
+      message.open({
+        type: snapshotsNotice ? 'warning' : 'success',
         content: (
           <Space size={6}>
-            <span>Sandbox created</span>
+            <span>{snapshotsNotice ? `Sandbox created; ${snapshotsNotice}` : 'Sandbox created'}</span>
             <Link href={`/dashboard/sandboxes/${sandboxId}`}>
               <code>{sandboxLabelOrId(sandboxId)}</code>
             </Link>
