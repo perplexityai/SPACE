@@ -6,11 +6,20 @@ import space_smoke as smoke
 
 PATH = "/tmp/space-smoke-orphaned-restore-pod-gc.txt"
 MARKER = "space-smoke-orphaned-restore-pod-gc-ok"
+# The threshold is how long a pod must classify as superseded on every tick
+# before it is reaped, and so also the margin for the reaper's pod cache and
+# its Postgres read disagreeing. A live restore pod does not classify as
+# superseded at all: its execution claim is committed at the pod's generation
+# before the pod is created, and the reaper re-reads the pod before deleting.
+# Ten seconds is five ticks; the reap budget and the survival window are
+# derived from it.
+THRESHOLD_SECONDS = 10
+INTERVAL_SECONDS = 2
 
 
 # The reaper ships default-off and dry-run and reads its config at startup,
-# so the body runs inside a scoped live config (20 s threshold, 2 s ticks)
-# whose standing env is put back as the body unwinds. The orphans are
+# so the body runs inside a scoped live config (short threshold, 2 s ticks)
+# whose standing env is put back in the body's last phase. The orphans are
 # unschedulable clones of this sandbox's own restore pod at retired
 # generations (see `space_smoke.orphaned_restore_pod_gc`): Pending, never a
 # VM, exactly what a stranded pre-bind restore pod looks like to the reaper.
@@ -43,8 +52,10 @@ def orphaned_restore_pod_gc_reaps_only_superseded(test: smoke.KindEcw) -> None:
 
     with gc.scoped_live_gc():
         # 2 s ticks keep the reaps and the survival window short.
-        with test.phase("run the GC live with a 20 s threshold and 2 s ticks"):
-            gc.go_live(threshold_seconds=20, interval_seconds=2)
+        with test.phase(
+            f"run the GC live with a {THRESHOLD_SECONDS} s threshold and {INTERVAL_SECONDS} s ticks"
+        ):
+            gc.go_live(threshold_seconds=THRESHOLD_SECONDS, interval_seconds=INTERVAL_SECONDS)
 
         with test.phase("superseded: an older generation on the started row and a row-less pod are reaped"):
             superseded = gc.plant(sandbox_id=test.sandbox.sandbox_id, generation=restored.generation - 1)
@@ -85,3 +96,8 @@ def orphaned_restore_pod_gc_reaps_only_superseded(test: smoke.KindEcw) -> None:
             test.reconnect_by_id()
             test.expect_command(test.run_command_when_ready(f"cat {shlex.quote(PATH)}"), stdout=marker)
             gc.expect_one_live_execution(above=retired)
+
+        # A failed body still restores as it unwinds; this phase accounts for
+        # the controller rollout on the passing path.
+        with test.phase("restore the standing GC config"):
+            gc.restore_standing()

@@ -85,8 +85,11 @@ OCI_USER_MARKER_PATH = "/home/user/ecw-oci-user-marker.txt"
 OCI_DOCKERFILE_ENV_NAME = "ECW_OCI_DOCKERFILE_ENV"
 OCI_DOCKERFILE_ENV_VALUE = "from-dockerfile"
 # Widens the window between acceptance and completion so the Service can be
-# moved to the peer while the build is still running (the shell suite's 15 s).
-BUILD_DELAY_SECONDS = 15
+# moved to the peer while the build is still running. The reroute follows the
+# prepared-rootfs commit, ahead of the Dockerfile's RUN steps, so most of the
+# window is the build's own work; `build_through_sdk` fails a build that had
+# already finished when the Service moved.
+BUILD_DELAY_SECONDS = 5
 # The scope's cleanup budget is min(120 s, 10 % of the scenario timeout); every
 # compensation here must fit inside it together: settle ≤ 30 s, template delete
 # ≤ 60 s, route clear and sandbox kill a few seconds each.
@@ -178,7 +181,7 @@ def delete_template_and_wait(
             raise RuntimeError(
                 f"template delete operation {operation_id} for {alias} ended {state or 'pending'}"
             )
-        time.sleep(3)
+        time.sleep(0.5)
 
 
 def build_dedicated_template(
@@ -445,13 +448,28 @@ class TemplateBuildAssertions:
             detail=handoff_error,
         )
         self._control.route_builder_service("poll-peer", other)
+        rerouted_at = time.monotonic()
         self._fixture.record("service_routed_to", other)
+        # A build that had already finished leaves no poll for the Service to
+        # misroute, and would pass vacuously. The API asks the accepting
+        # builder on every status read, so `building` here means the build
+        # still had work left once the Service pointed away.
+        status = self._builder.build_status(self.alias, job.build_id)
+        self._fixture.record("build_status_after_reroute", status)
+        self._fixture.verify(
+            status in ("waiting", "building"),
+            "the build was no longer running when the Service moved off the accepting builder",
+            build_status=status,
+            build_id=job.build_id,
+            build_delay_seconds=BUILD_DELAY_SECONDS,
+        )
         try:
             work.join(timeout=build_timeout)
         finally:
             if self._route_clear is not None:
                 clear, self._route_clear = self._route_clear, None
                 clear.release()
+        self._fixture.record("build_seconds_after_reroute", round(time.monotonic() - rerouted_at, 1))
         if self._settle_build is not None:
             self._settle_build.disarm()
             self._settle_build = None

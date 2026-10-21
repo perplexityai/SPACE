@@ -1,14 +1,17 @@
 """Retention must never destroy the snapshot restore would load."""
 
 import space_smoke as smoke
+from space_smoke.fixtures import SMOKE_SWEEPER_KEEP_N
+
+TIMEOUT_MINUTES = 30
 
 
 @smoke.scenario(
     "local.retention_restore_source_guard",
-    # Generous deadline: the scenario spends most of its budget waiting out
-    # the sweeper grace; the default pause-on-timeout keeps even a stalled
+    timeout_minutes=TIMEOUT_MINUTES,
+    # Generous deadline: the default pause-on-timeout keeps even a stalled
     # run recoverable, but must never fire mid-cycle.
-    sandbox=smoke.SandboxConfig(timeout=1800),
+    sandbox=smoke.SandboxConfig(timeout=TIMEOUT_MINUTES * 60),
 )
 def restore_source_guard(test: smoke.KindEcw) -> None:
     """The live retention sweeper prunes unpinned history past keep-N while
@@ -17,16 +20,19 @@ def restore_source_guard(test: smoke.KindEcw) -> None:
 
     with test.retention.scoped_sweeper_mutation():
         # A slow KVM bench can take longer than the smoke grace to build this
-        # history. Keep the loop disabled until the pin and its negative control
+        # history. Hold the loop off until the pin and its negative control
         # exist; otherwise the behavior under test can legitimately prune the
-        # oldest row while the fixture is still constructing it.
-        with test.phase("disable the sweeper while constructing snapshot history"):
-            config = test.retention.stage_smoke_sweeper(enabled=False, dry_run=True)
+        # oldest row while the fixture is still constructing it. A standing
+        # sweeper whose grace outlasts the whole scenario already holds off,
+        # with no rollout.
+        with test.phase("hold the sweeper off while constructing snapshot history"):
+            if not test.retention.standing_sweeper_is_inert(for_seconds=TIMEOUT_MINUTES * 60):
+                test.retention.stage_smoke_sweeper(enabled=False, dry_run=True)
 
         # keep_n + 2 ready fulls: the oldest becomes the manufactured stale pin,
         # the second-oldest stays unpinned past keep-N — the negative control
         # proving the sweep ran live rather than idling.
-        cycles = config.keep_n + 2
+        cycles = SMOKE_SWEEPER_KEEP_N + 2
         with test.phase(f"commit {cycles} ready full snapshots"):
             for cycle in range(1, cycles + 1):
                 test.pause()
@@ -57,6 +63,11 @@ def restore_source_guard(test: smoke.KindEcw) -> None:
                 summary="the pinned snapshot was pruned after the control sweep "
                 "— the restore-source guard did not hold",
             )
+
+        # A failed body still restores as it unwinds; this phase accounts for
+        # the controller rollout on the passing path.
+        with test.phase("restore the standing sweeper"):
+            test.retention.restore_standing_sweeper()
 
     with test.phase("resume and execute after the sweep"):
         test.reconnect_by_id()

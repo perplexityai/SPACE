@@ -129,6 +129,12 @@ if TYPE_CHECKING:
 # the run-scoped sandbox, the kill-by-metadata backstop, and fork children.
 SANDBOX_CLEANUP_ATTEMPTS = 10
 SANDBOX_CLEANUP_RETRY_SECONDS = 1.0
+# The stopped-delete check waits out sandbox-manager's cluster-deleted
+# eviction window before deleting. Kind's is 10 s (the worker default is
+# 600 s), and the margin covers the whole seconds sandbox-manager measures the
+# row's idle time in.
+LOCAL_CLEANUP_MAX_QUIESCENCE_SECONDS = 60
+LOCAL_CLEANUP_QUIESCENCE_MARGIN_SECONDS = 2
 
 
 def retry_sandbox_delete(delete: Callable[[], None]) -> int:
@@ -1216,6 +1222,20 @@ class CommandSandboxFixture:
             self.record("local_cleanup_observer", "unavailable outside Kind")
             return
         sandbox_id = self.sandbox.sandbox_id.removeprefix("sbx_")
+        # The caller saw the stop land, so the node row last moved before now.
+        # node-ctl evicts a cluster-deleted sandbox on its periodic sync; one
+        # that lands inside sandbox-manager's quiescence window is refused and
+        # deferred past the following poll. Deleting once the window has passed
+        # lets the first sync after the delete reclaim the rootfs.
+        quiescence = control.cluster_deleted_quiescence_seconds(worker)
+        self.verify(
+            quiescence <= LOCAL_CLEANUP_MAX_QUIESCENCE_SECONDS,
+            "the worker's cluster-deleted eviction window is longer than this "
+            "check waits; it needs the Kind chart's short window",
+            worker=worker,
+            quiescence_seconds=quiescence,
+        )
+        quiescent_at = time.monotonic() + quiescence + LOCAL_CLEANUP_QUIESCENCE_MARGIN_SECONDS
         deadline = time.monotonic() + 90
         while True:
             pods = control.sandbox_pods(sandbox_id)
@@ -1231,15 +1251,17 @@ class CommandSandboxFixture:
             control.sandbox_cache_dir_present(worker, sandbox_id),
             "STOP lost the retained rootfs before DELETE",
         )
+        if (remaining := quiescent_at - time.monotonic()) > 0:
+            self._context.wait(remaining)
         since_time = _log_since_time()
         self.delete_sandbox()
         self.wait_until_deleted()
-        # Kind configures a 10-second quiescence window; allow normal node
-        # reconciliation, its 60-second retry slack and another poll to complete.
-        # The retained rootfs leaving the worker is the outcome, whichever
-        # reclaim path removed it: the eviction itself, or the durable cleanup
-        # that retries an eviction refused while node-manager reset the
-        # network slot the stop released.
+        # Allow a node-ctl poll and, should the row have moved after the stop
+        # after all, the refused eviction's retry a poll later. The retained
+        # rootfs leaving the worker is the outcome, whichever reclaim path
+        # removed it: the eviction itself, or the durable cleanup that retries
+        # an eviction refused while node-manager reset the network slot the
+        # stop released.
         deadline = time.monotonic() + 180
         while control.sandbox_cache_dir_present(worker, sandbox_id):
             self.verify(
@@ -1253,7 +1275,7 @@ class CommandSandboxFixture:
                     )
                 },
             )
-            self._context.wait(10)
+            self._context.wait(2)
         self.record("stopped_delete_local_cleanup", "retained rootfs removed")
 
     def start_background_process(
@@ -2190,16 +2212,21 @@ class Ecw(CommandSandboxFixture):
             self.wait(self.lifecycle_poll_interval)
 
 
-# The scenario-scoped sweeper knobs: live, fast ticks, and a grace long
-# enough to outlast setup but short enough for a smoke budget. Applied by
-# `ensure_live_sweeper` and reverted while the scenario body unwinds — never
-# baked into the kind chart, whose standing grace must outlast the API's fork
-# restore-activation lease.
+# The scenario-scoped sweeper knobs: live, 1 s ticks, keep one, and a short
+# grace. Applied by `stage_smoke_sweeper` and reverted while the scenario body
+# unwinds — never baked into the kind chart, whose standing grace must outlast
+# the API's fork restore-activation lease. Keeping one lets a scenario build
+# its keep-N-plus-two history in three suspends. The grace does not protect
+# that history while it is built: the scenarios hold the sweeper off by other
+# means (disabled, or a standing grace that outlasts the scenario). It stays
+# nonzero, since zero disables the age filter a real prune passes through.
+SMOKE_SWEEPER_KEEP_N = 1
 SMOKE_SWEEPER_ENV: dict[str, str | None] = {
     "SPACE_SNAPSHOT_RETENTION_SWEEPER_ENABLED": "true",
     "SPACE_SNAPSHOT_RETENTION_SWEEPER_DRY_RUN": "false",
-    "SPACE_SNAPSHOT_RETENTION_SWEEPER_TICK_SECS": "5",
-    "SPACE_SNAPSHOT_RETENTION_SWEEPER_MIN_AGE_SECS": "60",
+    "SPACE_SNAPSHOT_RETENTION_SWEEPER_TICK_SECS": "1",
+    "SPACE_SNAPSHOT_RETENTION_SWEEPER_MIN_AGE_SECS": "10",
+    "SPACE_SNAPSHOT_RETENTION_SWEEPER_KEEP_N": str(SMOKE_SWEEPER_KEEP_N),
 }
 MIN_OBJECT_STORE_PROBE_TIMEOUT_SECONDS = 1.0
 
@@ -2242,7 +2269,7 @@ class RetentionAssertions:
         self,
         *,
         max_tick_seconds: int = 30,
-        min_grace_seconds: int = 30,
+        min_grace_seconds: int = 1,
         max_grace_seconds: int = 300,
     ) -> RetentionSweeperConfig:
         """Scope a live smoke-sized sweeper to this scenario.
@@ -2272,7 +2299,7 @@ class RetentionAssertions:
         enabled: bool = True,
         dry_run: bool,
         max_tick_seconds: int = 30,
-        min_grace_seconds: int = 30,
+        min_grace_seconds: int = 1,
         max_grace_seconds: int = 300,
     ) -> RetentionSweeperConfig:
         """Apply smoke-sized sweeper knobs in the requested mode.
@@ -2288,17 +2315,12 @@ class RetentionAssertions:
             return (
                 config.enabled == enabled
                 and config.dry_run == dry_run
+                and config.keep_n == SMOKE_SWEEPER_KEEP_N
                 and config.tick_seconds <= max_tick_seconds
                 and min_grace_seconds <= config.min_age_seconds <= max_grace_seconds
             )
 
-        if self._mutation_lock is None:
-            release = self._control.acquire_retention_sweeper_mutation()
-            self._mutation_lock = self._scope.defer(
-                "release exclusive retention controller mutation",
-                release,
-                critical=True,
-            )
+        self._hold_mutation_lock()
         config = self._control.retention_sweeper_config()
         if in_bounds(config):
             return config
@@ -2323,9 +2345,44 @@ class RetentionAssertions:
                 f"knobs after the scoped override: enabled={config.enabled} "
                 f"(wanted {enabled}) "
                 f"dry_run={config.dry_run} (wanted {dry_run}) "
+                f"keep_n={config.keep_n} (wanted {SMOKE_SWEEPER_KEEP_N}) "
                 f"tick={config.tick_seconds}s grace={config.min_age_seconds}s"
             )
         return config
+
+    def standing_sweeper_is_inert(self, *, for_seconds: float) -> bool:
+        """Whether the running sweeper can prune none of this scenario's snapshots.
+
+        Takes the mutation Lease first, so the configuration read here stays
+        the running one until the scenario stages its own. A disabled or
+        dry-run sweeper creates no claims; a live one claims only rows older
+        than its grace, and every snapshot a scenario creates is younger than
+        the scenario's own budget, `for_seconds`. A zero grace disables the
+        age filter and is never inert.
+        """
+
+        self._hold_mutation_lock()
+        config = self._control.retention_sweeper_config()
+        inert = not config.enabled or config.dry_run or config.min_age_seconds > for_seconds
+        self._fixture.record(
+            "standing_sweeper",
+            {
+                "enabled": config.enabled,
+                "dry_run": config.dry_run,
+                "min_age_seconds": config.min_age_seconds,
+                "inert_for_seconds": for_seconds if inert else None,
+            },
+        )
+        return inert
+
+    def _hold_mutation_lock(self) -> None:
+        if self._mutation_lock is None:
+            release = self._control.acquire_retention_sweeper_mutation()
+            self._mutation_lock = self._scope.defer(
+                "release exclusive retention controller mutation",
+                release,
+                critical=True,
+            )
 
     def restore_standing_sweeper(self) -> None:
         """Eagerly restore the standing sweeper env inside the scenario body.
@@ -2417,7 +2474,7 @@ class RetentionAssertions:
                 "sweeper did not run live within the scenario budget",
                 snapshot_id=record.snapshot_id,
             )
-            self._fixture.wait(5)
+            self._fixture.wait(1)
 
     def expect_backing_objects_reaped(
         self, record: SnapshotRecord, *, timeout: float
@@ -2492,10 +2549,20 @@ class RetentionAssertions:
         )
 
     def expect_present(self, record: SnapshotRecord, *, summary: str) -> None:
+        """The row is still a `ready` full snapshot.
+
+        A prune claim moves it to `deleting` before any byte goes, and never
+        back, so a claim fails this at once however long its reap then takes.
+        """
+
+        ready = {snapshot.snapshot_id for snapshot in self.ready_full_snapshots()}
         self._fixture.verify(
-            self._control.snapshot_exists(record.snapshot_id),
+            record.snapshot_id in ready,
             summary,
             snapshot_id=record.snapshot_id,
+            failure_evidence=lambda: {
+                "snapshot_row_exists": self._control.snapshot_exists(record.snapshot_id)
+            },
         )
 
 

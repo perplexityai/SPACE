@@ -43,6 +43,8 @@ from space_smoke.runtime import (
     SmokeConfigurationError,
 )
 from space_smoke.scenarios.local_orphaned_restore_pod_gc_reaps_only_superseded import (
+    INTERVAL_SECONDS,
+    THRESHOLD_SECONDS,
     orphaned_restore_pod_gc_reaps_only_superseded as scenario,
 )
 
@@ -159,7 +161,9 @@ class Choreography(unittest.TestCase):
         live = names.index("orphaned_restore_pod_gc.go_live")
         self.assertEqual(
             calls[live],
-            mock.call.orphaned_restore_pod_gc.go_live(threshold_seconds=20, interval_seconds=2),
+            mock.call.orphaned_restore_pod_gc.go_live(
+                threshold_seconds=THRESHOLD_SECONDS, interval_seconds=INTERVAL_SECONDS
+            ),
         )
         self.assertLess(names.index("orphaned_restore_pod_gc.capture_restore_pod"), live)
         plants = [i for i, n in enumerate(names) if n == "orphaned_restore_pod_gc.plant"]
@@ -193,6 +197,10 @@ class Choreography(unittest.TestCase):
         self.assertLess(plants[1], reaps[0])
         self.assertLess(plants[2], reaps[1])
         self.assertLess(reaps[1], reconnects[-1])
+        # The standing config comes back in the body's last phase, after the
+        # final restore was checked, not only as the scope unwinds.
+        restored = names.index("orphaned_restore_pod_gc.restore_standing")
+        self.assertLess(lives[-1], restored)
         gc.scoped_live_gc.assert_called_once_with()
 
 

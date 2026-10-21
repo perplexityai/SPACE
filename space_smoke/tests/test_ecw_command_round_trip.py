@@ -7,10 +7,12 @@ import io
 import json
 import socket
 import sys
+import time
 import types
 import unittest
 from collections.abc import Mapping
 from contextlib import nullcontext
+from datetime import UTC, datetime
 from email.message import Message
 from typing import BinaryIO, cast
 from unittest import mock
@@ -74,6 +76,7 @@ from space_smoke.scenarios.ecw_timeout_update import (
     EXTENDED_TIMEOUT_SECONDS,
     INITIAL_TIMEOUT_SECONDS,
     MARKER as TIMEOUT_MARKER,
+    PRE_SUSPEND_TIMEOUT_SECONDS,
     SUSPENDED_TIMEOUT_SECONDS,
     timeout_update,
 )
@@ -145,6 +148,8 @@ class _Sandbox:
         self.deleted = False
         self.state = EcwSandboxState.RUNNING
         self._files = _Filesystem()
+        self._timeout = 0
+        self._end_at = time.time()
 
     @property
     def files(self) -> EcwFilesystem:
@@ -173,6 +178,7 @@ class _Sandbox:
             self.sandbox_id,
             "seed",
             self.state,
+            end_at=datetime.fromtimestamp(self._end_at, UTC),
         )
 
     def try_get_info(self) -> EcwSandboxInfo | None:
@@ -180,6 +186,9 @@ class _Sandbox:
 
     def set_timeout(self, timeout: int) -> None:
         self.trace.append(f"sandbox.set-timeout:{timeout}")
+        self._timeout = timeout
+        if self.state is EcwSandboxState.RUNNING:
+            self._end_at = time.time() + timeout
 
     def refresh(self) -> None:
         self.trace.append("sandbox.refresh")
@@ -188,8 +197,8 @@ class _Sandbox:
         self.state = EcwSandboxState.PAUSED
 
     def connect(self, *, timeout: int = 300) -> _Sandbox:
-        del timeout
         self.state = EcwSandboxState.RUNNING
+        self._end_at = time.time() + max(timeout, self._timeout)
         return self
 
 
@@ -415,6 +424,7 @@ class EcwCommandRoundTripTests(unittest.TestCase):
                 "ecw.lifecycle:pause:False",
                 f"sandbox.set-timeout:{EXTENDED_TIMEOUT_SECONDS}",
                 f"sandbox.run:printf %s {TIMEOUT_MARKER}:60",
+                f"sandbox.set-timeout:{PRE_SUSPEND_TIMEOUT_SECONDS}",
                 f"sandbox.set-timeout:{SUSPENDED_TIMEOUT_SECONDS}",
                 f"sandbox.run:printf %s {TIMEOUT_MARKER}:60",
                 "sandbox.kill",

@@ -56,6 +56,11 @@ def claim_finish_forward(test: smoke.KindEcw) -> None:
                 keep_n=config.keep_n,
             )
 
+        # A failed body still restores as it unwinds; this phase accounts for
+        # the controller rollout on the passing path.
+        with test.phase("restore the standing sweeper"):
+            test.retention.restore_standing_sweeper()
+
     with test.phase("resume and execute after the recovery sweep"):
         test.reconnect_by_id()
         result = test.run_command(

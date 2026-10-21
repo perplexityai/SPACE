@@ -593,7 +593,7 @@ SELECT artifact_id::text, artifact_kind FROM node_local_backup_pending
 # once a builder has accepted it (`record_accepted_build`).
 TEMPLATE_BUILD_JOB_SQL = """\
 SELECT coalesce(j.daemon_job_id, ''), coalesce(j.builder_node_id::text, ''),
-       coalesce(nk.k8s_node_name, '')
+       coalesce(nk.k8s_node_name, ''), j.build_id
   FROM template_build_jobs j LEFT JOIN node_k8s nk ON nk.node_id = j.builder_node_id
  WHERE j.template_id = '{template_id}' AND j.daemon_job_id IS NOT NULL
  ORDER BY j.created_at DESC LIMIT 1;
@@ -882,9 +882,6 @@ RETENTION_SWEEPER_ENV_KEYS: tuple[str, ...] = (
     "SPACE_SNAPSHOT_RETENTION_SWEEPER_DRY_RUN",
     "SPACE_SNAPSHOT_RETENTION_SWEEPER_TICK_SECS",
     "SPACE_SNAPSHOT_RETENTION_SWEEPER_MIN_AGE_SECS",
-)
-_RETENTION_SWEEPER_CONFIG_ENV_KEYS = (
-    *RETENTION_SWEEPER_ENV_KEYS,
     "SPACE_SNAPSHOT_RETENTION_SWEEPER_KEEP_N",
 )
 _RETENTION_BOOLEAN_ENV_KEYS = {
@@ -1288,7 +1285,7 @@ class KindHarness:
                 continue
             name = entry["name"]
             value = entry.get("value")
-            if name in _RETENTION_SWEEPER_CONFIG_ENV_KEYS and (
+            if name in RETENTION_SWEEPER_ENV_KEYS and (
                 "valueFrom" in entry or not isinstance(value, str) or not value
             ):
                 raise SmokeConfigurationError(
@@ -1330,8 +1327,9 @@ class KindHarness:
             enabled=_truthy_default(
                 env.get("SPACE_SNAPSHOT_RETENTION_SWEEPER_ENABLED"), False
             ),
+            # `ReconcilerConfig::from_environment` defaults an unset dry-run to live.
             dry_run=_truthy_default(
-                env.get("SPACE_SNAPSHOT_RETENTION_SWEEPER_DRY_RUN"), True
+                env.get("SPACE_SNAPSHOT_RETENTION_SWEEPER_DRY_RUN"), False
             ),
             keep_n=_unsigned_default(
                 env.get("SPACE_SNAPSHOT_RETENTION_SWEEPER_KEEP_N"),
@@ -2227,6 +2225,17 @@ ON CONFLICT (key_hash) DO NOTHING;
         return _cold_eviction_config_from_env(
             self._node_service_env(node_name, NODE_SANDBOX_MANAGER)
         )
+
+    def cluster_deleted_quiescence_seconds(self, node_name: str) -> int:
+        # `cluster_deleted_eviction_quiescence`: an unset, unparsable or zero
+        # value keeps the 600 s default.
+        raw = str(
+            self._node_service_env(node_name, NODE_SANDBOX_MANAGER).get(
+                "SPACE_SBX_CLUSTER_DELETED_QUIESCENCE_SECS"
+            )
+            or ""
+        )
+        return int(raw) if raw.isdigit() and int(raw) > 0 else 600
 
     def sandbox_cache_dir_present(self, node_name: str, sandbox_id: str) -> bool:
         path = f"{SANDBOX_CACHE_ROOT}/{_sql_uuid(sandbox_id)}"
@@ -4224,11 +4233,12 @@ ON CONFLICT (key_hash) DO NOTHING;
         )
         if not row:
             return None
-        job_id, node_id, node = (row.split("|") + ["", ""])[:3]
+        job_id, node_id, node, build_id = (row.split("|") + ["", "", ""])[:4]
         return TemplateBuildJob(
             daemon_job_id=job_id.strip(),
             builder_node_id=node_id.strip() or None,
             builder_node=node.strip() or None,
+            build_id=build_id.strip(),
         )
 
     def prepared_rootfs_handoff(self, node_name: str, *, window_seconds: int = 60) -> str | None:
@@ -7588,6 +7598,21 @@ class EcwSdk:
             log_tail=tuple(tail),
         )
 
+    def build_status(self, template_id: str, build_id: str) -> str:
+        info = _ecw_control_plane_json(
+            self.config,
+            "GET",
+            f"/templates/{quote(template_id, safe='')}/builds/{quote(build_id, safe='')}/status",
+            body=None,
+            idempotency_key=None,
+            expected_status=200,
+            timeout=30,
+        )
+        status = info.get("status") if isinstance(info, dict) else None
+        if not isinstance(status, str):
+            raise RuntimeError(f"the build status response carried no status: {info!r}")
+        return status
+
     def _build_sdk_options(self) -> dict[str, Any]:
         """SDK options for `Template.build`: the Host header is the API URL's own authority.
 
@@ -7870,10 +7895,12 @@ def _sdk_sandbox_info(info: Any) -> EcwSandboxInfo:
     raw_state = getattr(info, "state", None)
     state = EcwSandboxState(str(raw_state)) if raw_state is not None else None
     template_id = getattr(info, "template_id", None)
+    end_at = getattr(info, "end_at", None)
     return EcwSandboxInfo(
         sandbox_id=str(info.sandbox_id),
         template_id=str(template_id) if template_id is not None else None,
         state=state,
+        end_at=end_at if isinstance(end_at, datetime) else None,
     )
 
 

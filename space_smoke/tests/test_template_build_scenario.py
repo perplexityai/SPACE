@@ -112,6 +112,7 @@ class _Builder:
         self.fail = fail
         self.failing_check = failing_check
         self.built_with: dict[str, object] = {}
+        self.status_after_reroute = "building"
 
     def build_template(self, recipe, *, alias, cpu_count, memory_mb, tags):
         self.calls.append("build")
@@ -119,6 +120,9 @@ class _Builder:
             raise self.fail
         self.built_with = {"alias": alias, "tags": tuple(tags), "cpu": cpu_count, "mem": memory_mb}
         return TemplateBuildResult("tpl-1", "bld-1", alias, 12.5, ("log a", "log b"))
+
+    def build_status(self, template_id, build_id):
+        return self.status_after_reroute
 
     def create(self, *, template, timeout, metadata):
         self.calls.append(f"create:{template}")

@@ -45,14 +45,15 @@ _DURATION_SECONDS = {
         "ecw.sandbox_info": 4,
         "ecw.sandbox_list_pagination": 10,
         "ecw.timeout_rearm": 41,
-        "ecw.timeout_update": 50,
+        "ecw.timeout_update": 40,
         "ecw.warm_pool_environment": 13,
         "ecw.watcher_identity": 5,
         "local.btrfs_send_restore_fails_closed_without_parent_source": 135,
         "local.btrfs_send_restore_pulls_parent_template": 20,
         "local.btrfs_send_restore_rejects_corrupted_stream": 133,
         "local.cold_sandbox_eviction_wake_round_trip": 137,
-        "local.concurrent_restore_converges_to_one_execution": 87,
+        "local.concurrent_restore_converges_to_one_execution": 60,
+        "local.ecw_template_build_from_oci_boots": 40,
         "local.encrypted_resuspend_preserves_cow": 60,
         # Local seed run including durable suspend, cross-node fork, restore
         # and cleanup: 23.5 s.
@@ -67,9 +68,9 @@ _DURATION_SECONDS = {
         "local.node_group_boundary_schedules": 40,
         # Two Kind runs with fast-pace env rollouts: 63 and 63 s.
         "local.node_selector_extras_render_and_enforce": 65,
-        # Estimate until a bench run refreshes it: two controller rollouts, three
+        # Three Kind runs measured 92-101 s: two controller rollouts, three
         # suspend/restore cycles, three threshold-bound reaps, one survival window.
-        "local.orphaned_restore_pod_gc_reaps_only_superseded": 300,
+        "local.orphaned_restore_pod_gc_reaps_only_superseded": 95,
         "local.pending_backup_census_reports_blocked_upload": 216,
         # Kind bench runs (otel), template deletes concurrent: 60-64 s.
         "local.private_template_build_isolation": 63,
@@ -82,8 +83,8 @@ _DURATION_SECONDS = {
         # One Kind run: 16 s of phases (8.5 s suspend with the retried upload)
         # plus sandbox cleanup.
         "local.restarted_btrfs_send_is_rejected_and_retried": 30,
-        "local.retention_claim_finish_forward": 80,
-        "local.retention_restore_source_guard": 107,
+        "local.retention_claim_finish_forward": 50,
+        "local.retention_restore_source_guard": 45,
         # Kind bench runs (otel), probes concurrent: 21-23 s.
         "local.sandbox_network_isolation_holds": 21,
         "local.snapshot_reaper_reclaims_backed_fork_snapshot": 147,
@@ -128,6 +129,9 @@ _DURATION_SECONDS = {
         # Docker Hub: 15-18 s, of which SDK generation is 2-5 s.
         "native.m1_generated_sdk_conformance": 20,
         "native.resident_pause": 5,
+        # Three Kind runs measured 39-84 s: the deleted rootfs is reclaimed at
+        # node-ctl's next periodic sync.
+        "native.stopped_restart_preserves_rootfs": 60,
         "native_contract.command_validation": 6,
         "native_contract.idempotency_conflict": 5,
         "native_contract.tenant_isolation": 5,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import StrEnum
 from typing import Any, BinaryIO, Generic, Protocol, TypeVar
 
@@ -258,6 +259,9 @@ class CommandSandboxFactory(Protocol):
 class EcwSandboxInfo(SandboxInfo):
     template_id: str | None
     state: EcwSandboxState | None = None
+    end_at: datetime | None = None
+    """The public `end_at`: the persisted timeout policy as an expiry from the
+    sandbox's start. It is not the node's live deadline."""
 
 
 class EcwSandboxPages(SandboxPages[EcwSandboxInfo]):
@@ -789,6 +793,10 @@ class TemplateBuilder(Protocol):
         """`Template.build` (blocking; the SDK polls build status) with the run's credentials."""
         ...
 
+    def build_status(self, template_id: str, build_id: str) -> str:
+        """The public build status the SDK polls: `waiting`, `building`, `ready` or `error`."""
+        ...
+
     def create(
         self,
         *,
@@ -806,6 +814,8 @@ class TemplateBuildJob:
     builder_node_id: str | None
     builder_node: str | None
     """The accepting builder's Kubernetes node, through `node_k8s`; `None` when unpinned."""
+    build_id: str = ""
+    """The public build id the SDK polls the status of."""
 
 
 @dataclass(frozen=True)
@@ -2064,6 +2074,11 @@ class ColdEvictionControl(RestoreStateRead, RestorePodRead, Protocol):
 
     def cold_eviction_config(self, node_name: str) -> ColdEvictionConfig:
         """The eviction knobs of the sandbox-manager pod on the sandbox's worker."""
+        ...
+
+    def cluster_deleted_quiescence_seconds(self, node_name: str) -> int:
+        """How long that worker's sandbox-manager refuses to evict a cluster-deleted
+        row after the row last moved (`SPACE_SBX_CLUSTER_DELETED_QUIESCENCE_SECS`)."""
         ...
 
     def sandbox_cache_dir_present(self, node_name: str, sandbox_id: str) -> bool:

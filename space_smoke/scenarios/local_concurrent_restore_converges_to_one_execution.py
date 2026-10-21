@@ -65,6 +65,9 @@ def concurrent_restore_converges_to_one_execution(test: smoke.KindEcw) -> None:
         before = len(race.executions())
         outcomes = race.race_connects(CALLERS)
         race.expect_converged(outcomes, executions_total=before + 1, label="happy")
+        # Every caller landed, so the slowest waited out the whole restore:
+        # the claim, the pod POST, the pod reaching Running and the VM serving.
+        restore_seconds = max(o.elapsed_seconds for o in outcomes)
         test.reconnect_by_id()
         observed = test.run_command_when_ready(f"cat {shlex.quote(PATH)}")
         test.expect_command(observed, stdout=marker)
@@ -159,7 +162,14 @@ def concurrent_restore_converges_to_one_execution(test: smoke.KindEcw) -> None:
         # The join is the no-hang contract: it fails if a caller is still
         # running at the deadline and re-raises if the callers died.
         firing.join(timeout=200)
-        running_after_lift = pod_watch.stop_after(seconds=30)
+        # Nothing re-drives a refused pod POST once its caller is gone (the
+        # restore abandons the claim), so a pod that could still run was
+        # admitted before the callers drained. It is Running within one
+        # restore as measured on this runner above, and the watch sees it at
+        # its next poll.
+        window = round(restore_seconds + 2 * pod_watch.interval_seconds, 1)
+        test.record("teardown_no_running_window_seconds", window)
+        running_after_lift = pod_watch.stop_after(seconds=window)
         race.expect_torn_down(
             outcomes,
             label="teardown",
