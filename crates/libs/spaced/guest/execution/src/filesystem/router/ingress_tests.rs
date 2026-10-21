@@ -450,7 +450,32 @@ async fn native_mutations_share_the_transport_payload_budget() {
         .expect_err("native batch requires payload capacity");
     assert_eq!(error.code(), tonic::Code::ResourceExhausted);
     assert!(pplx_space_common_grpc::is_refused_before_start(&error));
+    let mut polled = false;
+    let input = futures_util::stream::poll_fn(|_| {
+        polled = true;
+        std::task::Poll::Ready(None)
+    });
+    let error = router
+        .write_from_stream(Request::new(input))
+        .await
+        .expect_err("native upload requires payload capacity");
+    assert!(!polled, "an upload without capacity must not poll input");
+    assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    assert!(pplx_space_common_grpc::is_refused_before_start(&error));
     drop(occupied);
+    let mut upload =
+        Box::pin(router.write_from_stream(Request::new(futures_util::stream::pending())));
+    assert!(futures_util::poll!(&mut upload).is_pending());
+    assert_eq!(
+        router.payload_slots.available_permits(),
+        filesystem_limits::PAYLOAD_SLOTS - 1,
+        "waiting for Open retains capacity"
+    );
+    drop(upload);
+    assert_eq!(
+        router.payload_slots.available_permits(),
+        filesystem_limits::PAYLOAD_SLOTS
+    );
     router
         .write_batch(Request::new(WriteBatchRequest::default()))
         .await
@@ -460,6 +485,9 @@ async fn native_mutations_share_the_transport_payload_budget() {
 
 #[tokio::test]
 async fn native_messages_allow_exactly_the_size_limit() {
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
+        WriteOpen, write_request::Message as WriteMessage,
+    };
     use prost::Message;
     let router = router();
     let directory = tempfile::tempdir().unwrap();
@@ -498,5 +526,59 @@ async fn native_messages_allow_exactly_the_size_limit() {
         .unwrap_err();
     assert_eq!(error.code(), tonic::Code::OutOfRange);
     assert!(!pplx_space_common_grpc::is_refused_before_start(&error));
+    let oversized_open = WriteRequest {
+        message: Some(WriteMessage::Open(WriteOpen {
+            path: "x".repeat(filesystem_limits::MAX_MESSAGE_BYTES),
+            ..Default::default()
+        })),
+    };
+    let error = router
+        .write_from_stream(Request::new(futures_util::stream::iter([Ok(
+            oversized_open,
+        )])))
+        .await
+        .expect_err("oversized Open");
+    assert_eq!(error.code(), tonic::Code::OutOfRange);
+    for excess in [0, 1] {
+        let open = WriteRequest {
+            message: Some(WriteMessage::Open(WriteOpen {
+                path: path.display().to_string(),
+                ..Default::default()
+            })),
+        };
+        let mut data = WriteRequest {
+            message: Some(WriteMessage::Data(vec![
+                42;
+                filesystem_limits::MAX_MESSAGE_BYTES
+            ])),
+        };
+        let overhead = data.encoded_len() - filesystem_limits::MAX_MESSAGE_BYTES;
+        let Some(WriteMessage::Data(bytes)) = &mut data.message else {
+            unreachable!()
+        };
+        bytes.truncate(filesystem_limits::MAX_MESSAGE_BYTES - overhead + excess);
+        let expected_bytes = bytes.len();
+        assert_eq!(
+            data.encoded_len(),
+            filesystem_limits::MAX_MESSAGE_BYTES + excess
+        );
+        let result = router
+            .write_from_stream(Request::new(futures_util::stream::iter([
+                Ok(open),
+                Ok(data),
+            ])))
+            .await;
+        if excess == 0 {
+            result.expect("exact upload message limit is allowed");
+            assert_eq!(
+                tokio::fs::read(&path).await.unwrap(),
+                vec![42; expected_bytes]
+            );
+        } else {
+            let error = result.expect_err("oversized Data");
+            assert_eq!(error.code(), tonic::Code::OutOfRange);
+            assert!(!pplx_space_common_grpc::is_refused_before_start(&error));
+        }
+    }
     router.drain().await;
 }

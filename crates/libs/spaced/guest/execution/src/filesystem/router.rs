@@ -313,13 +313,26 @@ impl FilesystemRouter {
         .map_err(|_| operations::unknown_outcome())?
     }
 
-    async fn write_stream(
+    pub(crate) async fn write_from_stream<S>(
         &self,
-        first: WriteRequest,
-        mut incoming: Pin<Box<dyn Stream<Item = Result<WriteRequest, Status>> + Send>>,
-        admission: RequestPermit,
-    ) -> Result<Response<WriteResponse>, Status> {
+        mut request: Request<S>,
+    ) -> Result<Response<WriteResponse>, Status>
+    where
+        S: Stream<Item = Result<WriteRequest, Status>> + Send,
+    {
         use pplx_space_spaced_guest_protocol::proto::operations::write_request::Message;
+        let admission = crate::payload::acquire(
+            &self.payload_slots,
+            1,
+            request.extensions_mut().remove::<RequestPermit>(),
+        )?;
+        let incoming = request.into_inner();
+        tokio::pin!(incoming);
+        let first = incoming
+            .next()
+            .await
+            .transpose()?
+            .ok_or_else(|| Status::invalid_argument("write requires open"))?;
         crate::payload::check_message(&first, filesystem_limits::MAX_MESSAGE_BYTES)?;
         let Some(Message::Open(open)) = first.message else {
             return Err(Status::invalid_argument("first write message must be open"));
@@ -1063,20 +1076,9 @@ impl Filesystem for FilesystemRouter {
 
     async fn write(
         &self,
-        mut request: Request<tonic::Streaming<WriteRequest>>,
+        request: Request<tonic::Streaming<WriteRequest>>,
     ) -> Result<Response<WriteResponse>, Status> {
-        let admission = crate::payload::acquire(
-            &self.payload_slots,
-            1,
-            request.extensions_mut().remove::<RequestPermit>(),
-        )?;
-        let mut incoming = request.into_inner();
-        let first = incoming
-            .message()
-            .await?
-            .ok_or_else(|| Status::invalid_argument("write requires open"))?;
-        self.write_stream(first, Box::pin(incoming), admission)
-            .await
+        self.write_from_stream(request).await
     }
 
     async fn write_batch(

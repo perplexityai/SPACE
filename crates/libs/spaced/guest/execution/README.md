@@ -82,7 +82,18 @@ execution metadata.
 - The daemon registers `filesystem_grpc_service()` and `process_grpc_service()`
   to retain predecode protection. Handlers reuse that admission without charging
   twice. Native calls cannot install predecode protection retroactively.
-  Uploads retain the generated trait's Tonic input-stream type and bounded relay.
+- Native uploads use `write_file(Request<Stream<Item = Result<WriteRequest, Status>>>)`.
+  The stream starts with `Open`, then yields `Data` messages using the existing
+  protobuf types. It shares gRPC's upload path, admission, per-message size checks
+  and bounded relay. Admission precedes the first poll; EOF completes the write.
+  Input errors and dropped callers use the same cancellation and partial-write
+  semantics as gRPC. Borrowed streams and streams without `Unpin` are supported.
+- `configure_process_env(EnvMap)` replaces defaults for future process starts;
+  request entries override them and `clean_env` skips them. Running processes
+  retain their environment. `EnvMap` already enforces the shared key/value,
+  entry-count and total-byte [limits](../../../common/core/src/types/env/contract.rs).
+  Native callers can use `EnvMap::try_from` to reject invalid maps. The daemon
+  retains its wire adapter's sanitization of invalid entries before configuration.
 - The daemon cancels the shared token and coordinates listener shutdown with draining work.
   `drain()` joins tracked work; it is not a reusable shutdown-and-reject contract
   for subsequent direct calls. Direct filesystem calls can still have effects.
@@ -106,8 +117,7 @@ execution metadata.
   when it returns. A caller-assigned process id stays in use for the whole
   window. Records live in daemon memory and do not survive a daemon restart.
 
-This crate retains the daemon contract. Native upload input, bounded
-process-environment configuration, consistent shutdown semantics and complete
+This crate retains the daemon contract. Consistent shutdown semantics and complete
 operation acceptance remain follow-up work. General application embedding also
 requires stronger descendant ownership. Explicit launching alone does not
 establish those guarantees or advertise general embedding support.

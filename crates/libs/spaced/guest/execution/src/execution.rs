@@ -1,5 +1,6 @@
 //! Process and filesystem state shared by the guest daemon adapters.
 use super::*;
+use pplx_space_spaced_guest_protocol::proto::bridge_guest::{WriteRequest, WriteResponse};
 
 /// Configuration for process execution and the filesystem backend.
 ///
@@ -174,18 +175,42 @@ impl ExecutionService {
         );
     }
 
+    /// Replace the environment defaults used by future process starts.
+    ///
+    /// [`EnvMap`] enforces the shared entry-count, key, value and aggregate byte
+    /// limits at construction. Request environment entries override these defaults;
+    /// `clean_env` skips them. Already-started processes keep their environment.
     pub async fn configure_process_env(&self, env: EnvMap) {
         *self.inner.process_env.write().await = env;
     }
 
     /// Native calls use the same filesystem operations and payload budgets as gRPC.
-    /// Streaming uploads retain the generated trait's Tonic input-stream type.
+    /// Use [`Self::write_file`] for uploads from a native stream.
     pub fn filesystem_service(
         &self,
     ) -> impl pplx_space_spaced_guest_protocol::proto::bridge_guest::filesystem_server::Filesystem
     + Clone
     + use<> {
         self.inner.filesystem.clone()
+    }
+
+    /// Upload a file using the same messages and execution path as `Filesystem.Write`.
+    ///
+    /// The stream starts with `Open`, followed by `Data` messages. Payload capacity
+    /// is acquired before polling input, each message has the filesystem size limit,
+    /// and the relay applies backpressure. EOF completes the write; an input error or
+    /// dropped future cancels it with the same partial-write and retry semantics as
+    /// gRPC. Admission remains held until owned execution and cleanup settle.
+    /// Caller-owned buffers and allocations before yielding input are not bounded
+    /// by the service. The stream may borrow from the caller and need not be `Unpin`.
+    pub async fn write_file<S>(
+        &self,
+        request: Request<S>,
+    ) -> Result<Response<WriteResponse>, Status>
+    where
+        S: futures_util::Stream<Item = Result<WriteRequest, Status>> + Send,
+    {
+        self.inner.filesystem.write_from_stream(request).await
     }
 
     pub fn filesystem_grpc_service(
