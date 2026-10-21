@@ -40,8 +40,9 @@ modes, the prune and parallel-update switches, `SPACE_LOOP_DEVICE_TARGET`,
 `SPACE_SEED_OUTPUT_DIR` and the Rust build mode), each compared with its
 default, plus the optional AWS credentials when storage credentials are
 `static`. Nothing else restarts it, so a refreshed AWS session token in the
-default mode keeps the running Tilt, and a setting the bring-up would refuse
-fails before Tilt is stopped. Tilt's log
+default mode keeps the running Tilt. Before stopping it, `up.sh` checks its own
+refusals (the timeout, storage mode and parallelism, and the cluster's mounts,
+layout and Postgres data); a refusal at Tiltfile load is not pre-checked. Tilt's log
 is `~/.space-devbox/kind/tilt-space-local.log`, its pid is in
 `~/.space-devbox/kind/tilt-space-local.pid`, and `teardown.sh` stops it.
 

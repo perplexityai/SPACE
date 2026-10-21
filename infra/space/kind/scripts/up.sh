@@ -14,10 +14,12 @@
 # stack has settled, or fails with the log of any resource whose update failed.
 # Tilt is restarted only when it serves a deleted cluster or another checkout,
 # or was started with other values of the settings listed in TILT_SETTINGS
-# below, since Tilt reads those once, at start; every refusal this run would
-# make is checked before a running Tilt is stopped. Tilt keeps running
-# afterwards and redeploys whatever changes in the checkout; teardown.sh
-# stops it.
+# below, since Tilt reads those once, at start. Before a running Tilt is
+# stopped, this run's own refusals are checked: the timeout, storage mode and
+# parallelism, and the cluster's mounts, layout and data (assert_restartable);
+# the Tiltfile's load-time refusals are not, and would leave no watcher. Tilt
+# keeps running afterwards and redeploys whatever changes in the checkout;
+# teardown.sh stops it.
 #
 # Usage:
 #   bash infra/space/kind/scripts/up.sh
@@ -27,8 +29,8 @@
 #   SPACE_CONSOLE_PASSWORD   initial root@local password (default: password;
 #                            only applied while the account is locked)
 #   SPACE_BOOTSTRAP_TIMEOUT  seconds each wait may take: Tilt's start, the
-#                            API, the seed Job, each rollout and node
-#                            publication (default: 1800)
+#                            API, each Job, each rollout (the Datadog Agent's
+#                            included) and node publication (default: 1800)
 #   SPACE_KIND_DATADOG_MODE, SPACE_KIND_TELEMETRY_MODE, SPACE_KIND_OBSERVABILITY,
 #   SPACE_KIND_OBSERVABILITY_CONFIG, SPACE_KIND_STORAGE_CREDENTIALS,
 #   SPACE_LOOP_DEVICE_TARGET, SPACE_KIND_PRUNE_SUPERSEDED_IMAGES,
@@ -70,9 +72,12 @@ BOOTSTRAP_TIMEOUT="${SPACE_BOOTSTRAP_TIMEOUT:-1800}"
 log() { printf '[up] %s\n' "$*"; }
 die() { printf '[up] ERROR: %s\n' "$*" >&2; exit 1; }
 
-# Validate before creating or changing any cluster resources. The Tiltfile
-# repeats both checks, but only after the cluster exists and, for the password,
-# after the full build.
+# Validate before creating or changing any cluster resources, or stopping a
+# running Tilt. The Tiltfile repeats the telemetry and password checks, but
+# only after the cluster exists and, for the password, after the full build;
+# the library refuses a bad timeout only once it is starting Tilt.
+[[ "$BOOTSTRAP_TIMEOUT" =~ ^[1-9][0-9]*$ ]] \
+  || die "SPACE_BOOTSTRAP_TIMEOUT must be a positive integer number of seconds, not '$BOOTSTRAP_TIMEOUT'"
 TELEMETRY_JSON="$(python3 "$KIND_DIR/scripts/datadog_backend.py" preflight --for-deployment)"
 DATADOG_MODE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["backend"])' <<<"$TELEMETRY_JSON")"
 TELEMETRY_MODE="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["mode"])' <<<"$TELEMETRY_JSON")"
@@ -195,7 +200,7 @@ bootstrap_kind_stack
 
 if [[ "$DATADOG_MODE" != off ]]; then
   log "verifying the Datadog Agent ($DATADOG_MODE)"
-  python3 "$KIND_DIR/scripts/datadog_backend.py" verify >/dev/null
+  python3 "$KIND_DIR/scripts/datadog_backend.py" verify --timeout "$BOOTSTRAP_TIMEOUT" >/dev/null
 fi
 
 tilt_log="${SPACE_TILT_LOG:-${SPACE_TILT_STATE_DIR:-$HOME/.space-devbox/kind}/tilt-${KIND_CLUSTER}.log}"

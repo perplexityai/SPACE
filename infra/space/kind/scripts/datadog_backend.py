@@ -119,12 +119,12 @@ def plan(env):
 
 
 def kube(config, *args, namespace="kube-system", **kwargs):
+    kwargs.setdefault("timeout", 360)
     return subprocess.run(
         ["kubectl", "--context", config["context"], "-n", namespace, *args],
         check=True,
         text=True,
         capture_output=True,
-        timeout=360,
         **kwargs,
     ).stdout
 
@@ -275,7 +275,8 @@ def render(config):
     ).stdout
 
 
-def verify(config):
+def verify(config, timeout=300):
+    """Wait up to `timeout` seconds for each Agent rollout, then check its pods."""
     if config["backend"] == "off":
         raise ValueError(
             "off does not uninstall/stop an existing Agent; use stop to reconcile Fake Intake"
@@ -286,13 +287,14 @@ def verify(config):
             "rollout",
             "status",
             "deployment/datadog-fakeintake",
-            "--timeout=300s",
+            f"--timeout={timeout}s",
+            timeout=timeout + 60,
         )
     for resource in (
         "daemonset/datadog-agent",
         "deployment/datadog-agent-cluster-agent",
     ):
-        kube(config, "rollout", "status", resource, "--timeout=300s")
+        kube(config, "rollout", "status", resource, f"--timeout={timeout}s", timeout=timeout + 60)
     pods = json.loads(
         kube(
             config,
@@ -517,6 +519,12 @@ def main():
         action="store_true",
         help="require explicit acknowledgement of untimed SaaS deployment",
     )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=300,
+        help="seconds `verify` waits for each Agent rollout (default: 300)",
+    )
     args = parser.parse_args()
     try:
         env = options()
@@ -542,7 +550,7 @@ def main():
                 json.dumps(
                     {
                         "apply": lambda: apply(config),
-                        "verify": lambda: verify(config),
+                        "verify": lambda: verify(config, args.timeout),
                         "stop": lambda: stop(env),
                     }[args.command]()
                 )

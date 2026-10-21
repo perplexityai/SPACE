@@ -9,8 +9,9 @@
 #      storage credentials (nothing reads it then), not a knob only up.sh reads
 #      (SPACE_KIND_MIN_FREE_GIB), and not a setting set explicitly to its
 #      default. With static storage credentials the AWS variables count.
-#   3. A run whose settings the bring-up would refuse leaves the running Tilt
-#      running: the refusal comes before the stop, not after it.
+#   3. A run whose settings up.sh or the bring-up would refuse (an invalid
+#      storage mode, parallelism or timeout) leaves the running Tilt running:
+#      the refusal comes before the stop, not after it.
 #
 # External commands are PATH stubs. The running Tilt is a real process renamed
 # `tilt up`, so up.sh reads its environment from /proc as it would a real
@@ -143,6 +144,7 @@ up_case static-session-token restart \
 # 3: a refusal comes before the stop.
 up_case invalid-storage-mode refuse "" "SPACE_KIND_STORAGE_CREDENTIALS=bogus"
 up_case invalid-parallelism refuse "" "SPACE_TILT_MAX_PARALLEL_UPDATES=many"
+up_case invalid-timeout refuse "" "SPACE_BOOTSTRAP_TIMEOUT=30m SPACE_KIND_TELEMETRY_MODE=otel"
 
 if [ "$status" -eq 0 ]; then
     echo "ok: up.sh restarts Tilt only for a changed setting Tilt reads, and refuses invalid settings before stopping it"

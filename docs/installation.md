@@ -190,7 +190,7 @@ The bring-up creates the Kind cluster, then starts [Tilt](https://tilt.dev/) in 
 
 Continue in the same shell, checkout, and Docker environment.
 
-Do not configure cloud credentials for this setup. Clear any inherited AWS credentials below: the bring-up otherwise copies them from the shell into a cluster Secret, for optional integrations this guide does not use.
+Do not configure cloud credentials for this setup. Clear any inherited AWS credentials below: with `SPACE_KIND_STORAGE_CREDENTIALS=static` the bring-up copies them from the shell into a cluster Secret, for optional integrations this guide does not use. The default mode does not copy them.
 
 A fresh setup has three users in the Local organization: `root@local` and `deploy@local` have the `organization_admin` role, and `dev@local` has the `member` role. `root@local` can sign in to both the API and Admin Console. `deploy@local` and `dev@local` cannot sign in by default; an admin must [set their passwords](#activate-the-other-local-users-optional) to enable login.
 
@@ -248,7 +248,7 @@ Keep installation settings consistent across steps. The guide explicitly sets th
 | `SPACE_KIND_CLUSTER` | Explicitly set to `space-local` | Kind cluster name; context is `kind-space-local`. |
 | `SPACE_CONSOLE_PASSWORD` | Defaults to `password` when unset | Initial `root@local` login password for a locked account. |
 | `SPACE_KIND_DATA_ROOT` | Defaults to `$HOME/.kind-data` when not already set | Host-side backing storage for node containerd data. This guide does not override it. |
-| `SPACE_BOOTSTRAP_TIMEOUT` | Defaults to `1800` seconds when not already set | The longest each wait of the bring-up may take: Tilt's start, the first build and the API, the seed Job, each rollout, and node publication. Not a sandbox or command timeout. |
+| `SPACE_BOOTSTRAP_TIMEOUT` | Defaults to `1800` seconds when not already set | The longest each wait of the bring-up may take: Tilt's start, the first build and the API, each Job, each rollout (the Datadog Agent's included), and node publication. A positive number of seconds. Not a sandbox or command timeout. |
 
 The examples use the following client settings. Changing a client URL does not change the server listener or the port that reaches it.
 
