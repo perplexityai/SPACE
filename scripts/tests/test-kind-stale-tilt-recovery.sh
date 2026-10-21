@@ -85,6 +85,22 @@ fail() {
     status=1
 }
 
+# Write `$1/lsof` that reports the pid given (if any) as the :10350 listener
+# and nothing else, appending each call to `$1/lsof.calls`. Every fixture that
+# runs teardown or the library's real-process paths puts it first on PATH: the
+# real lsof would find a developer's live Tilt on :10350, which passes the
+# `tilt up` check and would be signalled.
+write_lsof_stub() {
+    local dir="$1" listener="${2:-}"
+    printf '#!/usr/bin/env bash
+printf "%%s\\n" "$*" >>"%s/lsof.calls"
+case "$*" in *:10350*) [ -z "%s" ] || echo %s ;; esac
+exit 0
+' \
+        "$dir" "$listener" "$listener" >"$dir/lsof"
+    chmod +x "$dir/lsof"
+}
+
 # Write `$1/pgrep` that prints only the pids given after it, whatever the
 # pattern. The library and teardown filter these through `ps -o command=`, which
 # stays real, so the anchored matching under test is still exercised — only the
@@ -227,6 +243,10 @@ TILT
         fi
         bootstrap_kind_stack__start_tilt() { touch "$work/started"; }
         bootstrap_kind_stack__kill_stale_tilt() { touch "$work/killed"; }
+        # Which build each pod runs is image-provenance.py's to check, with
+        # its own tests; here it would ask the stubbed cluster and write a run
+        # record under the real $HOME.
+        bootstrap_kind_stack__check_provenance() { touch "$work/provenance-checked"; }
         "${TEST_ENTRY:-bootstrap_kind_stack__bring_up}"
     ) >"$work/result" 2>&1
 }
@@ -593,6 +613,8 @@ run_bring_up "$work" TEST_REPO_ROOT="$shadow_root" TEST_TILT_EPOCH=3000 TEST_CLU
         TEST_API_REACHABLE=0 SEED_PUBLISH_COMPLETE_TIMEOUT=4 \
         TEST_SEED_JOBS='uid-old Complete |uid-new Complete ' TEST_UIRESOURCES='space-seed-publish ok\n' \
     || fail "a settled stack with its current Jobs complete must be up" "$(cat "$work/result")"
+[[ -e "$work/provenance-checked" ]] \
+    || fail "the bring-up must still check which build each pod runs" "$(cat "$work/result")"
 rm -rf "$work"
 
 # Case 14b: the seed Job is pending and the migration fails meanwhile. The
@@ -749,9 +771,9 @@ teardown_case() {
     # Another project's watcher on another port: never teardown's to stop.
     bash -c 'exec -a "tilt up --port 10351" sleep 300' >/dev/null 2>&1 &
     local other_pid=$!
-    # lsof reports the first fake as the :10350 listener.
-    printf '#!/usr/bin/env bash\ncase "$*" in *:10350*) echo %s ;; esac\nexit 0\n' "$fake_pid" >"$work/bin/lsof"
     chmod +x "$work/bin/"*
+    # lsof reports the first fake as the :10350 listener.
+    write_lsof_stub "$work/bin" "$fake_pid"
     sleep 0.2
     if ! ps -p "$fake_pid" -o command= | grep -q '^tilt up'; then
         echo "skip: this platform does not let exec -a rename the fake tilt; case 5 not exercised" >&2
@@ -821,6 +843,10 @@ bystander_case() {
         return 0
     fi
     write_pgrep_stub "$work/bin" "$bystander"
+    # No :10350 listener this fixture owns, so none at all.
+    write_lsof_stub "$work/bin"
+    [[ "$(PATH="$work/bin:$PATH" command -v lsof)" == "$work/bin/lsof" ]] \
+        || fail "the bystander case must shadow the real lsof"
     # The library's stale-watcher kill, with no Tilt on the box at all: the
     # bystander is the only `pgrep -f "tilt up"` match and must be left alone.
     (
@@ -845,6 +871,9 @@ bystander_case() {
     sleep 0.3
     kill -0 "$bystander" 2>/dev/null \
         || fail "teardown signaled a process that merely mentions 'tilt up'" "$(cat "$work/result")"
+    # Teardown did look for the :10350 listener, and asked the stub.
+    grep -q ':10350' "$work/bin/lsof.calls" 2>/dev/null \
+        || fail "teardown's listener lookup must reach the stub lsof, not the real one" "$(cat "$work/result")"
     kill "$bystander" 2>/dev/null || true
     wait "$bystander" 2>/dev/null || true
     rm -rf "$work"
@@ -875,6 +904,10 @@ SUP
     PF_CHILD_FILE="$work/child.pid" bash "$work/port-forward.sh" kind-space-local space svc/space-ui 3000:3000 \
         space-kind-pf:kind-space-local >/dev/null 2>&1 &
     local supervisor=$!
+    # Another cluster's supervisor, listed in the same shared pidfile.
+    PF_CHILD_FILE="$work/other-child.pid" bash "$work/port-forward.sh" kind-other-bench space svc/space-ui 3001:3000 \
+        space-kind-pf:kind-other-bench >/dev/null 2>&1 &
+    local other_supervisor=$!
     cat >"$work/tilt-parent.sh" <<'TILTP'
 PF_CHILD_FILE="$1/tilt-child.pid" bash "$1/port-forward.sh" kind-space-local space-logs svc/loki 13101:3100 \
     space-kind-pf:kind-space-local &
@@ -900,7 +933,10 @@ TILTP
     child="$(cat "$work/child.pid" 2>/dev/null || true)"
     tilt_supervisor="$(cat "$work/tilt-supervisor.pid" 2>/dev/null || true)"
     tilt_child="$(cat "$work/tilt-child.pid" 2>/dev/null || true)"
-    local all=("$supervisor" "$tilt_parent" "$unowned" "$bystander" "$foreign" "$search" $child $tilt_supervisor $tilt_child)
+    local other_child
+    other_child="$(cat "$work/other-child.pid" 2>/dev/null || true)"
+    local all=("$supervisor" "$other_supervisor" "$tilt_parent" "$unowned" "$bystander" "$foreign" "$search" \
+        $child $other_child $tilt_supervisor $tilt_child)
     if [[ -z "$child" || -z "$tilt_child" ]] || ! ps -p "$child" -o command= | grep -q '^kubectl' \
             || ! ps -p "$tilt_parent" -o command= | grep -q '^tilt up'; then
         echo "skip: this platform does not let exec -a rename the fakes; case 7 not exercised" >&2
@@ -910,6 +946,7 @@ TILTP
     fi
     mkdir -p "$work/bin"
     write_pgrep_stub "$work/bin" "${all[@]}"
+    write_lsof_stub "$work/bin"
     # The scripted bring-up's pidfile, listing the orphaned supervisor.
     printf '%s\n' "$supervisor" >"$work/pf.pids"
     (
@@ -937,12 +974,26 @@ TILTP
         || fail "the reap signaled a command whose last argument is merely the label" "$(cat "$work/result")"
     [[ ! -e "$work/pf.pids" ]] \
         || fail "the reap must remove the scripted bring-up's pidfile once its supervisors are gone" "$(cat "$work/result")"
+    kill -0 "$other_supervisor" 2>/dev/null \
+        || fail "the reap signaled another cluster's supervisor" "$(cat "$work/result")"
+    # The shared pidfile stays while it lists another cluster's live supervisor.
+    printf '%s\n' "$other_supervisor" >"$work/pf.pids"
+    (
+        export PATH="$work/bin:$PATH"
+        REPO_ROOT="$repo_root"
+        KIND_CLUSTER=space-local
+        SPACE_PORT_FORWARD_PIDFILE="$work/pf.pids"
+        source "$repo_root/scripts/tests/lib/bootstrap-kind-stack.sh"
+        kind_stack_reap_stale_port_forwards
+    ) >"$work/result" 2>&1 || fail "the port-forward reap must not fail" "$(cat "$work/result")"
+    [[ -s "$work/pf.pids" ]] \
+        || fail "the reap removed a shared pidfile that still lists another cluster's supervisor" "$(cat "$work/result")"
     local p
     for p in "${all[@]}"; do
         pkill -P "$p" 2>/dev/null || true
         kill "$p" 2>/dev/null || true
     done
-    wait "$supervisor" "$tilt_parent" "$unowned" "$bystander" "$foreign" "$search" 2>/dev/null || true
+    wait "$supervisor" "$other_supervisor" "$tilt_parent" "$unowned" "$bystander" "$foreign" "$search" 2>/dev/null || true
     rm -rf "$work"
 }
 port_forward_reap_case
@@ -960,6 +1011,7 @@ teardown_pidfile_case() {
     printf '#!/usr/bin/env bash\nexit 1\n' >"$work/bin/curl"   # no Tilt on :10350
     chmod +x "$work/bin/"*
     write_pgrep_stub "$work/bin"
+    write_lsof_stub "$work/bin"
     cat >"$work/port-forward.sh" <<'SUP'
 (exec -a kubectl bash -c "sleep 60; true" _ --context "$1" -n "$2" port-forward "$3" "$4") &
 printf '%s\n' "$!" >"$PF_CHILD_FILE"
@@ -1025,6 +1077,7 @@ stale_kill_case() {
         return 0
     fi
     write_pgrep_stub "$work/bin" "$other" "$other_context" "$here" "$named"
+    write_lsof_stub "$work/bin"
     (
         export PATH="$work/bin:$PATH"
         REPO_ROOT="$repo_root"

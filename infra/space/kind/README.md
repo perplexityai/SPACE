@@ -116,7 +116,7 @@ pidfile does not name, so a `kind-down` cannot leave the stale watcher behind.
 
 ### Build identity and provenance
 
-Every image Tilt or `build-images.sh` builds goes through
+Every image Tilt builds goes through
 `scripts/image-provenance.py`, which gives it a build identity when it is
 built, not when Tilt starts: the checkout's commit (`git rev-parse --short=12
 HEAD`) when the image is what that commit builds, and
@@ -143,7 +143,7 @@ package install.
 
 "The commit's for the whole build" is judged from two snapshots of the
 build's inputs (`image-provenance.py snapshot`): one taken before the build's
-first step (each Tilt build chain's, and `build-images.sh`'s own start), since
+first step (the start of each Tilt build chain), since
 the chain compiles Rust and assembles the seed before the image's
 `docker build`, and one after that `docker build`. Each snapshot holds HEAD,
 `git status` and the stat data of every tracked and untracked file, so an edit

@@ -204,9 +204,10 @@ if [[ "$DATADOG_MODE" != off ]]; then
 fi
 
 tilt_log="${SPACE_TILT_LOG:-${SPACE_TILT_STATE_DIR:-$HOME/.space-devbox/kind}/tilt-${KIND_CLUSTER}.log}"
+served_pid="$(bootstrap_kind_stack__served_tilt_pid)"
 cat <<MSG
 
-[up] kind cluster '$KIND_CLUSTER' is up; Tilt (pid $(bootstrap_kind_stack__tilt_pid)) keeps it in sync with this checkout.
+[up] kind cluster '$KIND_CLUSTER' is up; Tilt${served_pid:+ (pid $served_pid)} keeps it in sync with this checkout.
 
   API:        $API_URL
   Data-plane: $DATA_PLANE_URL

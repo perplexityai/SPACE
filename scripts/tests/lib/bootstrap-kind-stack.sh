@@ -879,9 +879,10 @@ bootstrap_kind_stack__kill_stale_tilt() {
 # SIGTERMed by the bring-up it had just started — and the label alone still
 # matches a search whose last argument it is. A forward nobody's supervisor
 # owns, or one to another context, is never touched (the suites' port-owner
-# guard exists for that footgun). The scripted bring-up's pidfile is removed
-# once nothing it lists is a live supervisor, so teardown never meets a pid
-# that has since been reused.
+# guard exists for that footgun). The scripted bring-up's pidfile, shared by
+# every cluster on the host, is removed once nothing it lists is a live
+# supervisor of any context, so teardown never meets a pid that has since been
+# reused.
 kind_stack_reap_stale_port_forwards() {
     local kctx="kind-${KIND_CLUSTER}" pid parent pidfile live="" reaped=() attempt
     for pid in $(pgrep -f "space-kind-pf:${kctx}" 2>/dev/null || true); do
@@ -900,7 +901,7 @@ kind_stack_reap_stale_port_forwards() {
     pidfile="$(space_kind_pf_pidfile)"
     [[ -s "$pidfile" ]] || return 0
     while IFS= read -r pid; do
-        space_kind_pf_is_supervisor "$pid" "$kctx" && live=1
+        space_kind_pf_is_supervisor "$pid" && live=1
     done <"$pidfile"
     [[ -n "$live" ]] || rm -f "$pidfile"
 }

@@ -18,12 +18,15 @@ space_kind_pf_pidfile() {
   printf '%s\n' "${SPACE_PORT_FORWARD_PIDFILE:-/tmp/space-local-pf.pids}"
 }
 
-# Whether pid $1 is a supervisor for context $2.
+# Whether pid $1 is a supervisor for context $2, or for any context when $2 is
+# empty.
 space_kind_pf_is_supervisor() {
-  local pid="$1" ctx="$2" command
+  local pid="$1" ctx="${2:-}" command
   [[ "$pid" =~ ^[0-9]+$ ]] || return 1
   command="$(ps -o command= -p "$pid" 2>/dev/null)" || return 1
-  [[ "$command" =~ ^[[:space:]]*([^[:space:]]*/)?bash[[:space:]]+([^[:space:]]*/)?port-forward\.sh[[:space:]]+${ctx}([[:space:]]+[^[:space:]]+){3}[[:space:]]+space-kind-pf:${ctx}[[:space:]]*$ ]]
+  [[ "$command" =~ ^[[:space:]]*([^[:space:]]*/)?bash[[:space:]]+([^[:space:]]*/)?port-forward\.sh[[:space:]]+([^[:space:]]+)([[:space:]]+[^[:space:]]+){3}[[:space:]]+space-kind-pf:([^[:space:]]+)[[:space:]]*$ ]] \
+    || return 1
+  [[ "${BASH_REMATCH[3]}" == "${BASH_REMATCH[5]}" && ( -z "$ctx" || "${BASH_REMATCH[3]}" == "$ctx" ) ]]
 }
 
 # Stop supervisor $1 of context $2 (verified by the caller), then those of its
