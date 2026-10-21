@@ -29,7 +29,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use pplx_space_common_core::types::OrgId;
+use pplx_space_common_core::{env::env_flag, types::OrgId};
 use pplx_space_feature_flags::{
     Attributes, FeatureFlagClient, SPACE_NATIVE_HIDDEN_OPERATIONS_FLAG,
 };
@@ -81,7 +81,9 @@ pub enum HiddenOperationsConfigError {
     InvalidOrg(String),
     #[error("{HIDDEN_OPERATIONS_ORGS_ENV}: `*` must stand alone, not in a list of org ids")]
     WildcardInList,
-    #[error("{HIDDEN_OPERATIONS_FLAG_ENV} must be empty, `true`/`1` or `false`/`0`; {0:?} is not")]
+    #[error(
+        "{HIDDEN_OPERATIONS_FLAG_ENV} must be empty or an on/off value (such as `off`, `false` or `0`); {0:?} is not"
+    )]
     InvalidFlagMaster(String),
 }
 
@@ -163,12 +165,18 @@ fn parse_orgs(raw: &str) -> Result<EnabledOrgs, HiddenOperationsConfigError> {
         .map(EnabledOrgs::Listed)
 }
 
-/// Unset or empty keeps the master on. Any other value must say on or off:
-/// this is a kill switch, so a typo fails startup rather than leaving it on.
+/// Unset or empty keeps the master on. Otherwise the value must be in the
+/// shared on/off vocabulary of [`env_flag`] (`off`, `false`, `0`, `no`,
+/// `disabled` and their opposites): this is a kill switch, so a typo fails
+/// startup rather than leaving it on.
 fn parse_flag_master(raw: &str) -> Result<bool, HiddenOperationsConfigError> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "" | "true" | "1" => Ok(true),
-        "false" | "0" => Ok(false),
+    if raw.trim().is_empty() {
+        return Ok(true);
+    }
+    // `env_flag` answers its default for a value outside its vocabulary, so a
+    // value is in it exactly when the default does not change the answer.
+    match (env_flag(Some(raw), true), env_flag(Some(raw), false)) {
+        (on, off) if on == off => Ok(on),
         _ => Err(HiddenOperationsConfigError::InvalidFlagMaster(
             raw.to_owned(),
         )),

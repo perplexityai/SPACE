@@ -78,8 +78,14 @@ fn the_flag_master_is_on_unless_set_off_and_refuses_anything_else() {
         (Some(""), Some(true)),
         (Some("true"), Some(true)),
         (Some("1"), Some(true)),
+        (Some("on"), Some(true)),
+        (Some("enabled"), Some(true)),
         (Some("FALSE"), Some(false)),
         (Some(" 0 "), Some(false)),
+        (Some("off"), Some(false)),
+        (Some("Off"), Some(false)),
+        (Some("no"), Some(false)),
+        (Some("disabled"), Some(false)),
         (Some("off-ish"), None),
     ] {
         let master = raw.map_or(Err(VarError::NotPresent), |raw| Ok(raw.to_owned()));
