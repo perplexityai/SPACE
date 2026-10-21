@@ -189,7 +189,7 @@ async fn an_exclusive_create_waits_for_a_racing_create_and_counts_it() -> TestRe
         let mut racing = db.pool.begin().await?;
         lock_tx(&mut racing, lock_id, seed, LockMode::Exclusive).await?;
         let racing_target = PublicSandboxId::new().to_string();
-        create_operation_tx(
+        let (_created, _superseded) = create_operation_tx(
             &mut racing,
             native_create(org_id, actor_id, &racing_target, None),
         )
