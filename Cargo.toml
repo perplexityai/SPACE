@@ -92,6 +92,7 @@ members = [
     "crates/libs/data/plane/server",
     "crates/libs/db-test-fixtures",
     "crates/libs/db/migrator",
+    "crates/libs/dependency-drain",
     "crates/libs/aws/client",
     "crates/libs/aws/s3-http-client",
     "crates/libs/feature-flags",
@@ -307,6 +308,7 @@ pplx-space-common-work-coalescer = { path = "crates/libs/common/work-coalescer" 
 pplx-space-data-plane-server = { path = "crates/libs/data/plane/server" }
 pplx-space-db-migrate = { path = "crates/libs/db/migrator" }
 pplx-space-db-test-fixtures = { path = "crates/libs/db-test-fixtures" }
+pplx-space-dependency-drain = { path = "crates/libs/dependency-drain" }
 pplx-space-execution-common = { path = "crates/libs/execution/common" }
 pplx-space-feature-flags = { path = "crates/libs/feature-flags" }
 pplx-space-events = { path = "crates/libs/events" }

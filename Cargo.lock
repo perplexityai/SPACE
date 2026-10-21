@@ -5494,6 +5494,7 @@ dependencies = [
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-db-test-fixtures",
+ "pplx-space-dependency-drain",
  "pplx-space-metrics",
  "pplx-space-observability",
  "pplx-space-test-env",
@@ -5798,6 +5799,16 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "pplx-space-dependency-drain"
+version = "0.8.0"
+dependencies = [
+ "libc",
+ "nix 0.31.3",
+ "tempfile",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
