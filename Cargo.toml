@@ -82,6 +82,7 @@ members = [
     "crates/libs/build/mgr/client",
     "crates/libs/build/mgr/server",
     "crates/libs/object-store",
+    "crates/libs/page-cache",
     "crates/libs/placement/executor",
     "crates/libs/placement/machine",
     "crates/libs/public/api",
@@ -354,6 +355,7 @@ pplx-space-node-runtime-manager-client = { path = "crates/libs/node/runtime/mana
 pplx-space-node-runtime-supervisor = { path = "crates/libs/node/runtime/supervisor" }
 pplx-space-net-common = { path = "crates/libs/net/common" }
 pplx-space-object-store = { path = "crates/libs/object-store" }
+pplx-space-page-cache = { path = "crates/libs/page-cache" }
 pplx-space-public-api = { path = "crates/libs/public/api" }
 pplx-space-metrics = { path = "crates/libs/metrics" }
 pplx-space-observability = { path = "crates/libs/observability", default-features = false }

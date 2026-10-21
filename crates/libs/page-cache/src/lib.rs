@@ -1,3 +1,10 @@
+//! Page-cache advice and range writeback (start and wait) for files streamed
+//! through a service: `posix_fadvise` and `sync_file_range` wrappers that are
+//! no-ops off Linux.
+//!
+//! It is its own crate so file-copying code can use it without the rest of the
+//! service host.
+
 use std::path::Path;
 
 /// Ask Linux to reclaim clean page-cache entries for a file we just streamed.

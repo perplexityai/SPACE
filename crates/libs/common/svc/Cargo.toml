@@ -70,6 +70,7 @@ pplx-space-dependency-drain = { workspace = true }
 pplx-space-metrics = { workspace = true }
 pplx-space-migration-checksums = { workspace = true, optional = true }
 pplx-space-observability = { workspace = true }
+pplx-space-page-cache = { workspace = true }
 pplx-space-rustls-provider = { workspace = true }
 pplx-space-service-mutex = { workspace = true }
 pplx-space-systemd-watchdog = { workspace = true }

@@ -5515,6 +5515,7 @@ dependencies = [
  "pplx-space-metrics",
  "pplx-space-migration-checksums",
  "pplx-space-observability",
+ "pplx-space-page-cache",
  "pplx-space-rustls-provider",
  "pplx-space-service-mutex",
  "pplx-space-systemd-watchdog",
@@ -6642,6 +6643,16 @@ dependencies = [
  "tracing-log",
  "tracing-opentelemetry",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "pplx-space-page-cache"
+version = "0.8.0"
+dependencies = [
+ "libc",
+ "nix 0.31.3",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]

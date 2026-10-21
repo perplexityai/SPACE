@@ -26,7 +26,7 @@ pub mod http_listener;
 pub mod kube_client;
 pub mod lifecycle;
 pub mod local_health;
-pub mod page_cache;
+pub use pplx_space_page_cache as page_cache;
 pub mod peer_auth;
 pub mod rate_limiter;
 pub mod redis;
