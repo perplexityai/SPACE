@@ -345,6 +345,19 @@ pub struct AdminNodeStatusSnapshot {
     pub node_id_reported: Option<String>,
     pub scheduling: Option<AdminNodeSchedulingStatus>,
     pub health: Option<AdminNodeHealthStatus>,
+    /// Independent collection evidence, not a readiness or upgrade verdict.
+    /// Missing on older API servers and nodes that have not reported inventory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_inventory: Option<AdminExecutionInventoryObservation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminExecutionInventoryObservation {
+    /// Diagnostic label: complete, unavailable, or legacy. Preserve future
+    /// labels for display during mixed-version rollout; never infer eligibility.
+    pub status: String,
+    /// Control-plane receipt time, independent of the node heartbeat.
+    pub received_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

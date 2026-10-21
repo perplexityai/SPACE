@@ -8,10 +8,10 @@ use axum::{
     response::IntoResponse,
 };
 use pplx_space_common_core::types::admin::{
-    AdminNodeDrainability, AdminNodeHealthStatus, AdminNodeNetworkSlots, AdminNodeResponse,
-    AdminNodeSchedulingStatus, AdminNodeSort, AdminNodeStatusSnapshot, DrainRequest,
-    ForceUploadFailure, ForceUploadLocalSnapshotsResponse, GetAdminNodeFilters,
-    ListAdminNodesFilters,
+    AdminExecutionInventoryObservation, AdminNodeDrainability, AdminNodeHealthStatus,
+    AdminNodeNetworkSlots, AdminNodeResponse, AdminNodeSchedulingStatus, AdminNodeSort,
+    AdminNodeStatusSnapshot, DrainRequest, ForceUploadFailure, ForceUploadLocalSnapshotsResponse,
+    GetAdminNodeFilters, ListAdminNodesFilters,
 };
 use pplx_space_common_core::types::{
     NodeDrainMode, NodeDrainPhase, NodeDrainState, NodeManagedBy, SandboxId,
@@ -424,6 +424,14 @@ fn admin_node_status(row: &AdminNodeRow) -> Option<AdminNodeStatusSnapshot> {
         });
 
     Some(AdminNodeStatusSnapshot {
+        execution_inventory: row
+            .execution_inventory_status
+            .as_ref()
+            .zip(row.execution_inventory_received_at)
+            .map(|(status, received_at)| AdminExecutionInventoryObservation {
+                status: status.clone(),
+                received_at: format_time(received_at),
+            }),
         observed_at: format_time(observed_at),
         stale_after: format_time(stale_after),
         stale: stale_after <= OffsetDateTime::now_utc(),

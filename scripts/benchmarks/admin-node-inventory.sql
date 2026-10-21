@@ -16,7 +16,9 @@ SELECT n.id, nd.name, host(n.address) AS address,
        nss.network_slots_total, nss.network_slots_leased, nss.network_pool_max_slots,
        n.drain_phase, n.drain_mode, n.drain_started_at,
        n.drain_last_error, n.terminate_decrement_capacity, nd.metadata,
-       n.last_heartbeat, nss.observed_at AS status_observed_at, nss.health_healthy AS status_health_healthy,
+       n.last_heartbeat, nss.observed_at AS status_observed_at,
+       nss.execution_inventory_status, nss.execution_inventory_received_at,
+       nss.health_healthy AS status_health_healthy,
        nss.services AS status_services, nss.node_ctl AS status_node_ctl, n.created_at,
        nd.updated_at, nd.deleted_at, nk.k8s_node_name AS substrate_node_id
 FROM nodes n

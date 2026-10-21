@@ -190,6 +190,40 @@ space-admin-cli warm-pool get my-template
 space-admin-cli warm-pool get my-template@sha256:a710c90b3897
 ```
 
+### Execution inventory collection
+
+`space-admin-cli get-node <node>` displays **Execution Collection** and
+**Execution Receipt** when the node has a status row. The same evidence is
+available as `status.execution_inventory` in `get-node --json` and the admin
+node list/get API responses.
+
+- `complete`: collection succeeded, possibly with an empty inventory.
+- `unavailable`: collection failed; the last artifact inventory is retained.
+- `legacy`: inventory arrived without the collection-outcome protocol.
+- `not reported`: no receipt is available, including from older API servers.
+
+The receipt timestamp is independent of the node heartbeat. A recent heartbeat
+does not refresh execution evidence, and `complete` does not certify a required
+runtime, environment readiness, or completion of an upgrade. This readout does
+not change placement or provision artifacts.
+
+Use the readout to choose the next diagnostic step:
+
+| Evidence | Operator action |
+| --- | --- |
+| No receipt | Check API/node-ctl versions and whether the node has published execution inventory. Cluster-role nodes do not collect it. |
+| Receipt stops advancing across expected collection ticks | Inspect node-ctl reconciliation/publication errors and connectivity to the cluster API. A recent heartbeat alone does not clear this condition. |
+| Recent `unavailable` | Inspect node-manager discovery/staging and node-ctl collection errors. First-boot staging can temporarily exceed the five-second collection budget. |
+| `legacy` | Check the node-ctl version; inventory exists without the collection-outcome protocol. |
+| Recent `complete` | Collection succeeded. Inspect the actual inventory before diagnosing a missing runtime; completion can describe an empty inventory. |
+
+Judge receipt age against the configured collection period (60 seconds by
+default) and reconciliation delays, not the node heartbeat's stale flag. This
+diagnostic has no automatic stale/ready threshold. During mixed cluster-reader
+rollouts, older readers can update artifact rows without updating receipts;
+finish the reader rollout before relying on receipt advancement, and never
+interpret it as certification that an upgrade is applied.
+
 ### Safety
 
 Treat shared clusters as production-sensitive. `list-nodes` and
