@@ -125,13 +125,19 @@ async fn closed_services_refuse_every_operation_through_existing_handles() {
                 .disable_file_changes(Request::new(protocol::DisableFileChangesRequest::default())),
             files.get_modified_files(Request::new(protocol::GetModifiedFilesRequest::default())),
         );
-        let mut polled = false;
-        let input = futures_util::stream::poll_fn(|_| {
-            polled = true;
-            std::task::Poll::Ready(None)
-        });
-        refused!(existing.write_file(Request::new(input)));
-        assert!(!polled, "closed uploads must not consume caller input");
+        for through_handle in [false, true] {
+            let mut polled = false;
+            let input = futures_util::stream::poll_fn(|_| {
+                polled = true;
+                std::task::Poll::Ready(None)
+            });
+            if through_handle {
+                refused!(files.write_file(Request::new(input)));
+            } else {
+                refused!(existing.write_file(Request::new(input)));
+            }
+            assert!(!polled, "closed uploads must not consume caller input");
+        }
         assert_eq!(*service.inner.process_env.read().await, environment);
         assert_eq!(tokio::fs::read(&path).await.unwrap(), b"original");
         service.drain().await;

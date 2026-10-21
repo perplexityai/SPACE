@@ -130,15 +130,20 @@ and error evolution, requires a separate crate-level policy before stabilization
   retains its earlier rejections. Uploads waiting for their first message wake
   on cancellation. The service owns a child of the supplied token: caller
   cancellation closes admission, but `close()` and `drain()` do not cancel the
-  caller's token. Work admitted before closure may still finish; closure does
-  not wait for it. Already-admitted same-key retries can still wait for the owner
-  or the retry retention deadline; closure does not directly wake them.
+  caller's token. Closure signals cancellation of admitted work immediately;
+  supervised filesystem mutations can finish during `cancellation_grace`, then
+  identity workers are terminated and the outcome may be unknown. Direct execution
+  still waits for outstanding I/O. This is abortive shutdown, not graceful
+  admission-only closure; it neither waits nor rolls back effects. Already-admitted
+  same-key retries can still wait for the owner or the retry retention deadline;
+  closure does not directly wake them.
 - The daemon coordinates listener shutdown with `drain()`, which first closes
   admission and then joins its tracked work. The filesystem drain still logs an
   internal timeout rather than reporting incomplete cleanup, and some detached
   or blocking work is not covered by its trackers. A complete embedding drain
-  contract remains follow-up work; returning from `drain()` is not yet proof that
-  every previously admitted effect has settled.
+  contract, including graceful admission-only closure and explicit deadline-driven
+  cancellation, remains follow-up work. Returning from `drain()` is not yet proof
+  that every previously admitted effect has settled.
 - Linux PTY descriptors are created with close-on-exec atomically. Other Unix
   targets serialize PTY allocation and workload spawning through a private lock;
   unrelated spawners do not participate in that coordination.

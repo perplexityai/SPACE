@@ -213,10 +213,7 @@ impl FilesystemHandle {
     }
 
     fn require_running(&self) -> Result<(), Status> {
-        if self.shutdown.is_cancelled() {
-            return Err(crate::refused(Status::unavailable("guest shutting down")));
-        }
-        Ok(())
+        crate::execution::require_running(&self.shutdown)
     }
 
     pub(crate) fn grpc_service(

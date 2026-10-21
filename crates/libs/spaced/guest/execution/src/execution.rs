@@ -4,6 +4,14 @@ use pplx_space_spaced_guest_protocol::proto::bridge_guest::{WriteRequest, WriteR
 
 pub(crate) const DEFAULT_NATIVE_UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Shared admission check for process, filesystem and environment operations.
+pub(crate) fn require_running(shutdown: &CancellationToken) -> Result<(), Status> {
+    if shutdown.is_cancelled() {
+        return Err(crate::refused(Status::unavailable("guest shutting down")));
+    }
+    Ok(())
+}
+
 /// Configuration for process execution and the filesystem backend.
 ///
 /// # Defaults
@@ -166,18 +174,19 @@ impl ExecutionService {
     }
 
     pub(super) fn require_running(&self) -> Result<(), Status> {
-        if self.inner.shutdown.is_cancelled() {
-            return Err(crate::refused(Status::unavailable("guest shutting down")));
-        }
-        Ok(())
+        require_running(&self.inner.shutdown)
     }
 
     /// Close operation admission and signal cancellation of owned work.
     ///
     /// Calls through every service clone and previously obtained filesystem handle
     /// are refused once admission is closed. Repeated calls are harmless. Work
-    /// admitted earlier may still finish; this does not wait for cleanup or cancel
-    /// the caller's token.
+    /// admitted earlier is signalled to cancel immediately. Supervised filesystem
+    /// mutations can finish during [`ExecutionServiceConfig::cancellation_grace`];
+    /// after that grace, identity workers are terminated and the outcome may be
+    /// unknown. Direct execution still waits for its outstanding I/O. This is
+    /// abortive shutdown, not graceful admission-only closure. It neither waits
+    /// for cleanup nor cancels the caller's token, and cannot roll back effects.
     pub fn close(&self) {
         let _start_gate = self
             .inner
@@ -204,6 +213,9 @@ impl ExecutionService {
     /// limits at construction. Request environment entries override these defaults;
     /// `clean_env` skips them. Already-started processes keep their environment.
     /// Returns a refused `Unavailable` status when operation admission is closed.
+    /// Uses `Status` deliberately to share the generated operation methods' error
+    /// codes and `is_refused_before_start` classification, including in the daemon
+    /// adapter; callers do not need a second shutdown-error representation.
     pub async fn configure_process_env(&self, env: EnvMap) -> Result<(), Status> {
         self.require_running()?;
         *self.inner.process_env.write().await = env;
