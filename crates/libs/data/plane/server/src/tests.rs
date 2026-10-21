@@ -1,6 +1,9 @@
 use super::*;
 use crate::{
-    native::{ProcessReplayState, first_frame_attach_token_from_recv},
+    native::{
+        PROCESS_EVENT_ID_STRIDE, ProcessReplayState, first_frame_attach_token_from_recv,
+        next_process_event_id, process_event_output_position,
+    },
     runtime_route::sweep_expired_ecw_routes,
 };
 use aws_lc_rs::rand::SystemRandom;
@@ -3701,24 +3704,72 @@ async fn first_frame_attach_token_times_out_at_deadline() {
     assert_eq!(result, Err(DataPlaneErrorCode::AttachDeadlineExceeded));
 }
 
+/// A fresh attach replays the guest journal from its start, and a resume
+/// continues from the output position its id carries. Only an id without a
+/// position, as earlier data planes issued, still resumes the live tail
+/// behind `resync_required`.
 #[test]
-fn process_sse_resume_emits_resync_at_next_event_id() {
+fn process_sse_resume_starts_at_the_journal_position_its_id_carries() {
     let session_id = DataPlaneSessionId::Process(Default::default());
-    let replay = ProcessReplayState::load(session_id, Some(41));
-
-    assert_eq!(replay.event_seq, 42);
-    assert_eq!(replay.backend_output_cursor, None);
-    assert_eq!(replay.pending.len(), 1);
 
     let fresh = ProcessReplayState::load(session_id, None);
     assert_eq!(fresh.event_seq, 0);
+    assert_eq!(fresh.backend_output_cursor, Some(0));
     assert!(fresh.pending.is_empty());
+
+    let resumed = ProcessReplayState::load(session_id, Some(4 * PROCESS_EVENT_ID_STRIDE + 2));
+    assert_eq!(resumed.event_seq, 4 * PROCESS_EVENT_ID_STRIDE + 2);
+    assert_eq!(resumed.backend_output_cursor, Some(3));
+    assert!(resumed.pending.is_empty());
+
+    let legacy = ProcessReplayState::load(session_id, Some(41));
+    assert_eq!(legacy.event_seq, 42);
+    assert_eq!(legacy.backend_output_cursor, None);
+    assert_eq!(legacy.pending.len(), 1);
 }
 
-/// The public reconnection contract, shared by process and file-watch
-/// sessions: `Last-Event-ID` resumes the live stream at `last + 1` behind a
-/// `resync_required(cursor_replay_unavailable)` frame; no cursor, no frame.
-/// Missed output is never replayed, so the backend cursor stays unset.
+/// Process SSE ids increase, and each decodes to the output position a
+/// resume from it continues at. While the position is unknown the ids stay
+/// with the last position known, never moving onto output the client lacks.
+#[test]
+fn process_event_ids_carry_the_output_position() {
+    let mut previous = 0;
+    let mut last_known = None;
+    for position in [
+        Some(0),
+        Some(0),
+        Some(1),
+        Some(2),
+        Some(2),
+        None,
+        None,
+        Some(5),
+    ] {
+        let id = next_process_event_id(previous, position);
+        assert!(id > previous, "{id} after {previous}");
+        last_known = position.or(last_known);
+        assert_eq!(process_event_output_position(id), last_known, "{id}");
+        previous = id;
+    }
+
+    // Ids without a position stay without one.
+    assert_eq!(
+        process_event_output_position(next_process_event_id(42, None)),
+        None
+    );
+    // Frame counts saturate inside their position rather than spill into the next.
+    let last = 2 * PROCESS_EVENT_ID_STRIDE - 1;
+    assert_eq!(next_process_event_id(last, Some(0)), last);
+    assert_eq!(next_process_event_id(last, None), last);
+    // Every id stays a valid `Last-Event-ID`.
+    assert!(next_process_event_id(0, Some(u64::MAX)) <= MAX_LAST_EVENT_ID);
+    assert!(next_process_event_id(MAX_LAST_EVENT_ID, Some(u64::MAX)) <= MAX_LAST_EVENT_ID);
+}
+
+/// The file-watch reconnection contract, which a process session keeps for an
+/// id without an output position: `Last-Event-ID` resumes the live stream at
+/// `last + 1` behind a `resync_required(cursor_replay_unavailable)` frame; no
+/// cursor, no frame.
 #[test]
 fn last_event_id_resume_is_a_cursor_replay_unavailable_resync() {
     for kind in ["process", "file_watch"] {

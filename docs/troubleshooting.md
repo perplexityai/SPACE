@@ -78,7 +78,7 @@ This prints sandbox listings and the saved creation/deletion operations, sandbox
 | Stream authentication fails | Use `attach.token`, not `SPACE_API_TOKEN`, and the correct session URL. Check expiry and attach promptly after creating the command. |
 | Example rejects an endpoint, events URL, or redirect | Use HTTPS except for loopback HTTP. Check the data-plane origin and session ID; correct the configuration rather than removing destination or redirect checks. |
 | HTTP stream succeeds but output is incomplete | Check for `process_exited`, its exit result, and any `error` or `resync_required` frame. A closed connection is not proof of successful execution. |
-| Reconnect reports `resync_required` | Missed output is not replayed. Inspect the saved event transcript and query the process only if it is still running. Rerun only if repeating the command's effects is safe. |
+| Reconnect reports `resync_required` | Output from before the reconnect is no longer retained, so some of it was missed. Inspect the saved event transcript and query the process only if it is still running. Rerun only if repeating the command's effects is safe. |
 | Command exits nonzero | Read stderr and the exit result from the saved event transcript. Check that the executable and working directory exist inside the sandbox, not just on the host. |
 | Single-process GET returns `not_found` | This endpoint inspects a running process, not historical command results. It returns `not_found` before attachment and after exit. |
 

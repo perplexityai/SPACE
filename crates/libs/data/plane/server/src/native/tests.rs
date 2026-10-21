@@ -539,29 +539,30 @@ fn binding_fake_test_process() -> bool {
     ])
 }
 
-/// Opens the session's event stream and forwards its body text, chunk by
-/// chunk, until the body ends.
+/// Opens the session's event stream, through the fake cluster API at
+/// `endpoint`, and forwards its body text, chunk by chunk, until the body ends.
 async fn open_process_events(
-    fake: &BindingFake,
+    endpoint: &str,
     session_id: DataPlaneSessionId,
+    last_event_id: Option<u64>,
 ) -> (DataPlaneState, tokio::sync::mpsc::UnboundedReceiver<String>) {
     let mut state = crate::tests::test_data_plane_state().await;
     state.cluster_api = ClusterApiClients::service_only(
-        pplx_space_node_api_client::cluster::connect(fake.endpoint.clone(), "test")
+        pplx_space_node_api_client::cluster::connect(endpoint.to_string(), "test")
             .await
             .unwrap(),
     );
     state.revocation_check_interval = Duration::from_secs(3600);
     let token = format!("{DATA_PLANE_TOKEN_PREFIX}{}", "c".repeat(64));
-    let response = tower::ServiceExt::oneshot(
-        router(state.clone()),
-        Request::get(format!("/v1/sessions/{session_id}/events"))
-            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await
-    .unwrap();
+    let mut request = Request::get(format!("/v1/sessions/{session_id}/events"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"));
+    if let Some(last_event_id) = last_event_id {
+        request = request.header("last-event-id", last_event_id.to_string());
+    }
+    let response =
+        tower::ServiceExt::oneshot(router(state.clone()), request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let mut body = response.into_body();
     let (chunk_tx, chunks) = tokio::sync::mpsc::unbounded_channel();
@@ -607,7 +608,7 @@ async fn process_start_reaches_the_client_before_its_binding_commits() {
     }
     let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
     let fake = spawn_binding_fake(session_id, false, FakeBind::Succeeds).await;
-    let (state, mut chunks) = open_process_events(&fake, session_id).await;
+    let (state, mut chunks) = open_process_events(&fake.endpoint, session_id, None).await;
     let mut seen = String::new();
 
     // The bind is still held open, yet the start already reached the client.
@@ -642,7 +643,7 @@ async fn process_exit_is_reported_only_after_its_binding_commits() {
     }
     let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
     let fake = spawn_binding_fake(session_id, true, FakeBind::Succeeds).await;
-    let (_state, mut chunks) = open_process_events(&fake, session_id).await;
+    let (_state, mut chunks) = open_process_events(&fake.endpoint, session_id, None).await;
     let mut seen = String::new();
 
     read_until(&mut chunks, &mut seen, "process_started").await;
@@ -674,7 +675,7 @@ async fn failed_binding_ends_the_process_stream_with_a_retryable_error() {
     }
     let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
     let fake = spawn_binding_fake(session_id, false, FakeBind::NotFound).await;
-    let (state, mut chunks) = open_process_events(&fake, session_id).await;
+    let (state, mut chunks) = open_process_events(&fake.endpoint, session_id, None).await;
     let mut seen = String::new();
 
     read_until(&mut chunks, &mut seen, "process_started").await;
@@ -696,7 +697,7 @@ async fn binding_survives_a_client_that_disconnects_mid_bind() {
     }
     let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
     let fake = spawn_binding_fake(session_id, false, FakeBind::Succeeds).await;
-    let (state, mut chunks) = open_process_events(&fake, session_id).await;
+    let (state, mut chunks) = open_process_events(&fake.endpoint, session_id, None).await;
     let mut seen = String::new();
 
     read_until(&mut chunks, &mut seen, "process_started").await;
@@ -1707,5 +1708,360 @@ async fn websocket_resize_refusal_carries_a_fixed_message() {
     assert!(
         !seen.contains("192.0.2.10"),
         "internal detail leaked: {seen}"
+    );
+}
+
+/// One reply of a fake guest process stream.
+enum FakeReply {
+    Event(spaced_process_event::Event),
+    /// Ends the stream with this status.
+    Status(tonic::Code),
+}
+
+fn connected() -> FakeReply {
+    FakeReply::Event(spaced_process_event::Event::Connected(
+        pplx_space_sbx_mgr_client::operations::ProcessConnected {},
+    ))
+}
+
+fn stdout(line: &str) -> FakeReply {
+    FakeReply::Event(spaced_process_event::Event::Stdout(
+        pplx_space_sbx_mgr_client::operations::ProcessOutput {
+            data: line.as_bytes().to_vec(),
+        },
+    ))
+}
+
+fn exited() -> FakeReply {
+    FakeReply::Event(spaced_process_event::Event::Exit(
+        pplx_space_sbx_mgr_client::proto::SpacedProcessExit {
+            outcome: Some(
+                pplx_space_sbx_mgr_client::proto::spaced_process_exit::Outcome::Exited(
+                    pplx_space_sbx_mgr_client::proto::SpacedProcessExited { exit_code: 0 },
+                ),
+            ),
+        },
+    ))
+}
+
+/// What the guest replays for `output_cursor` from a process that wrote
+/// `lines` and exited: the output from that position on, or, without a
+/// cursor, only the start and the exit.
+fn journal_replay(lines: &[&str], output_cursor: Option<u64>) -> Vec<FakeReply> {
+    let Some(cursor) = output_cursor else {
+        return vec![connected(), exited()];
+    };
+    let mut replies = vec![connected()];
+    replies.extend(lines.iter().skip(cursor as usize).map(|line| stdout(line)));
+    replies.push(exited());
+    replies
+}
+
+type FakeReplies = Arc<dyn Fn(usize, Option<u64>) -> Vec<FakeReply> + Send + Sync>;
+
+/// A fake cluster API and worker for a native process session whose process
+/// is already bound. Each `SpacedConnectProcess` is answered by `replies`,
+/// given how many connects came before it and its `output_cursor`; a stream
+/// without a closing status stays open.
+struct JournalFake {
+    endpoint: String,
+    output_cursors: Arc<std::sync::Mutex<Vec<Option<u64>>>>,
+}
+
+async fn spawn_journal_fake(session_id: DataPlaneSessionId, replies: FakeReplies) -> JournalFake {
+    use prost::Message as _;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let process_id = pplx_space_public_api::process_id_for_session(session_id).to_string();
+    let mut route = crate::tests::route_response_with_token(session_id, None);
+    route.backend.as_mut().unwrap().endpoint = endpoint.clone();
+    route.adapter_state_json = r#"{"command":["true"]}"#.to_string();
+    route.backend_process_id = Some(process_id.clone());
+    let route = route.encode_to_vec();
+    let output_cursors = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let fake = JournalFake {
+        endpoint,
+        output_cursors: Arc::clone(&output_cursors),
+    };
+    let service = axum::Router::new().fallback(move |request: Request<Body>| {
+        let route = route.clone();
+        let process_id = process_id.clone();
+        let replies = Arc::clone(&replies);
+        let output_cursors = Arc::clone(&output_cursors);
+        async move {
+            let path = request.uri().path().to_string();
+            if path.ends_with("/Check") {
+                return crate::tests::grpc_test_response(vec![8, 1]);
+            }
+            if path.ends_with("/ResolveDataPlaneSessionRoute") {
+                return crate::tests::grpc_test_response(route);
+            }
+            if path.ends_with("/RecordDataPlaneSessionReconnect") {
+                return crate::tests::grpc_test_response(Vec::new());
+            }
+            assert!(
+                path.ends_with("/SpacedConnectProcess"),
+                "unexpected call {path}"
+            );
+            let body = request.into_body().collect().await.unwrap().to_bytes();
+            let output_cursor = SpacedConnectProcessRequest::decode(&body[5..])
+                .unwrap()
+                .operation
+                .unwrap()
+                .output_cursor;
+            let connects = {
+                let mut output_cursors = output_cursors.lock().unwrap();
+                output_cursors.push(output_cursor);
+                output_cursors.len() - 1
+            };
+            let mut frames = Vec::new();
+            let mut status = None;
+            for reply in replies(connects, output_cursor) {
+                match reply {
+                    FakeReply::Event(event) => {
+                        let encoded = ProcessEvent {
+                            process_id: process_id.clone(),
+                            pid: Some(42),
+                            event: Some(event),
+                        }
+                        .encode_to_vec();
+                        let mut framed = vec![0];
+                        framed.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+                        framed.extend(encoded);
+                        frames.push(hyper::body::Frame::data(bytes::Bytes::from(framed)));
+                    }
+                    FakeReply::Status(code) => status = Some(code),
+                }
+            }
+            let ending = match status {
+                Some(code) => {
+                    let mut trailers = HeaderMap::new();
+                    trailers.insert("grpc-status", HeaderValue::from(code as i32));
+                    futures_util::stream::once(
+                        async move { hyper::body::Frame::trailers(trailers) },
+                    )
+                    .boxed()
+                }
+                None => futures_util::stream::pending().boxed(),
+            };
+            let frames = futures_util::stream::iter(frames)
+                .chain(ending)
+                .map(Ok::<_, Infallible>);
+            Response::builder()
+                .header("content-type", "application/grpc")
+                .body(Body::new(http_body_util::StreamBody::new(frames)))
+                .unwrap()
+        }
+    });
+    tokio::spawn(async move {
+        axum::serve(listener, service).await.unwrap();
+    });
+    fake
+}
+
+/// The complete SSE events in `body`, as each one's id and JSON frame.
+fn sse_frames(body: &str) -> Vec<(Option<u64>, serde_json::Value)> {
+    let mut events: Vec<&str> = body.split("\n\n").collect();
+    events.pop();
+    events
+        .into_iter()
+        .filter_map(|event| {
+            let mut id = None;
+            let mut data = None;
+            for line in event.lines() {
+                if let Some(value) = line.strip_prefix("id:") {
+                    id = Some(value.trim().parse().unwrap());
+                } else if let Some(value) = line.strip_prefix("data:") {
+                    data = Some(serde_json::from_str(value.trim()).unwrap());
+                }
+            }
+            Some((id, data?))
+        })
+        .collect()
+}
+
+fn frames_of_type<'a>(
+    frames: &'a [(Option<u64>, serde_json::Value)],
+    frame_type: &'a str,
+) -> impl Iterator<Item = &'a (Option<u64>, serde_json::Value)> {
+    frames
+        .iter()
+        .filter(move |(_, frame)| frame["type"] == frame_type)
+}
+
+fn stdout_text(frames: &[(Option<u64>, serde_json::Value)]) -> String {
+    frames_of_type(frames, "stdout")
+        .map(|(_, frame)| {
+            let data = BASE64_STANDARD
+                .decode(frame["data_base64"].as_str().unwrap())
+                .unwrap();
+            String::from_utf8(data).unwrap()
+        })
+        .collect()
+}
+
+fn resync_reasons(frames: &[(Option<u64>, serde_json::Value)]) -> Vec<String> {
+    frames_of_type(frames, "resync_required")
+        .map(|(_, frame)| frame["reason"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Reads one process event stream to its end.
+async fn process_events_to_close(
+    endpoint: &str,
+    session_id: DataPlaneSessionId,
+    last_event_id: Option<u64>,
+) -> Vec<(Option<u64>, serde_json::Value)> {
+    let (_state, mut chunks) = open_process_events(endpoint, session_id, last_event_id).await;
+    let mut seen = String::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(chunk) = chunks.recv().await {
+            seen.push_str(&chunk);
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("stream ends within 5s; saw {seen}"));
+    let frames = sse_frames(&seen);
+    assert_eq!(frames.last().unwrap().1["type"], "closed", "{seen}");
+    let ids: Vec<u64> = frames.iter().filter_map(|(id, _)| *id).collect();
+    assert!(ids.is_sorted_by(|a, b| a < b), "ids increase: {ids:?}");
+    frames
+}
+
+const JOURNAL: [&str; 4] = ["one\n", "two\n", "three\n", "four\n"];
+
+/// A client that drops its first stream, and so never sends `Last-Event-ID`,
+/// still gets the process's whole retained output when it attaches again.
+#[tokio::test]
+async fn process_reattach_replays_retained_output_from_the_start() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_journal_fake(
+        session_id,
+        Arc::new(|_, output_cursor| journal_replay(&JOURNAL, output_cursor)),
+    )
+    .await;
+
+    let frames = process_events_to_close(&fake.endpoint, session_id, None).await;
+
+    assert_eq!(stdout_text(&frames), JOURNAL.concat());
+    assert_eq!(resync_reasons(&frames), Vec::<String>::new());
+    assert_eq!(*fake.output_cursors.lock().unwrap(), [Some(0)]);
+}
+
+/// `Last-Event-ID` resumes at the output after the last frame received: the
+/// two streams together carry the output once, without a gap or a resync.
+#[tokio::test]
+async fn process_resume_continues_after_the_last_event_id() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_journal_fake(
+        session_id,
+        Arc::new(|_, output_cursor| journal_replay(&JOURNAL, output_cursor)),
+    )
+    .await;
+    let first = process_events_to_close(&fake.endpoint, session_id, None).await;
+    let received: Vec<_> = first
+        .iter()
+        .take_while(|(_, frame)| frame["seq"] != 3)
+        .cloned()
+        .collect();
+    let last_event_id = received.last().unwrap().0.unwrap();
+
+    let resumed = process_events_to_close(&fake.endpoint, session_id, Some(last_event_id)).await;
+
+    assert_eq!(stdout_text(&received), "one\ntwo\n");
+    assert_eq!(stdout_text(&resumed), "three\nfour\n");
+    assert_eq!(resync_reasons(&resumed), Vec::<String>::new());
+    assert!(
+        resumed
+            .iter()
+            .filter_map(|(id, _)| *id)
+            .all(|id| id > last_event_id)
+    );
+    assert_eq!(*fake.output_cursors.lock().unwrap(), [Some(0), Some(2)]);
+}
+
+/// Output the guest evicted before the client asked for it is a real gap:
+/// the stream reports it, follows the live tail, and a resume from what it
+/// sent next reports the gap again rather than replaying output.
+#[tokio::test]
+async fn evicted_process_output_is_reported_before_the_live_tail() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_journal_fake(
+        session_id,
+        Arc::new(|_, output_cursor| match output_cursor {
+            Some(cursor) if cursor < 2 => vec![
+                connected(),
+                FakeReply::Status(tonic::Code::ResourceExhausted),
+            ],
+            Some(cursor) => journal_replay(&JOURNAL, Some(cursor)),
+            None => vec![connected(), stdout("live\n"), exited()],
+        }),
+    )
+    .await;
+
+    let frames = process_events_to_close(&fake.endpoint, session_id, None).await;
+    assert_eq!(resync_reasons(&frames), ["cursor_out_of_window"]);
+    assert_eq!(stdout_text(&frames), "live\n");
+    assert!(
+        frames_of_type(&frames, "error").next().is_none(),
+        "{frames:?}"
+    );
+
+    let last_event_id = frames.last().unwrap().0.unwrap();
+    let resumed = process_events_to_close(&fake.endpoint, session_id, Some(last_event_id)).await;
+    assert_eq!(resync_reasons(&resumed), ["cursor_out_of_window"]);
+    assert_eq!(
+        *fake.output_cursors.lock().unwrap(),
+        [Some(0), None, Some(0), None]
+    );
+}
+
+/// A backend reconnect after a resume reopens the guest stream at the output
+/// position the client has reached; that replay is lossless, so the client is
+/// not told to resync.
+#[tokio::test]
+async fn backend_reconnect_after_a_resume_continues_without_a_resync() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_journal_fake(
+        session_id,
+        Arc::new(|connects, output_cursor| match (connects, output_cursor) {
+            // The resume's stream drops after one line.
+            (1, Some(cursor)) => vec![
+                connected(),
+                stdout(JOURNAL[cursor as usize]),
+                FakeReply::Status(tonic::Code::Unavailable),
+            ],
+            (_, output_cursor) => journal_replay(&JOURNAL, output_cursor),
+        }),
+    )
+    .await;
+    let first = process_events_to_close(&fake.endpoint, session_id, None).await;
+    let after_one = first
+        .iter()
+        .find(|(_, frame)| frame["seq"] == 1)
+        .unwrap()
+        .0
+        .unwrap();
+
+    let resumed = process_events_to_close(&fake.endpoint, session_id, Some(after_one)).await;
+
+    assert_eq!(stdout_text(&resumed), "two\nthree\nfour\n");
+    assert_eq!(frames_of_type(&resumed, "backend_reconnected").count(), 1);
+    assert_eq!(resync_reasons(&resumed), Vec::<String>::new());
+    assert_eq!(
+        *fake.output_cursors.lock().unwrap(),
+        [Some(0), Some(1), Some(2)]
     );
 }
