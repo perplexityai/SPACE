@@ -2491,9 +2491,13 @@ func (s *ociSpec) sandboxPolicyAuthority(annotation string, defaultToCluster boo
 	}
 }
 
+// The manager stores the converted policy at the annotation's generation, so
+// reject fields the shim cannot represent instead of dropping them.
 func parseNetworkPolicyJSON(raw string) (*netpb.NetworkPolicyV1, error) {
 	var decoded networkPolicyJSON
-	if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decoded); err != nil {
 		return nil, fmt.Errorf("invalid JSON: %w", err)
 	}
 	version := "v1"

@@ -1275,6 +1275,21 @@ func TestSandboxNetworkPolicyRejectsInvalidAnnotations(t *testing.T) {
 			wantMessage: "unsupported network policy egress default_action",
 		},
 		{
+			name:        "unknown top-level field",
+			policy:      `{"version":"v1","egress":{"default_action":"deny"},"future_field":[{"domain":"example.test"}]}`,
+			wantMessage: `unknown field "future_field"`,
+		},
+		{
+			name:        "unknown egress field",
+			policy:      `{"version":"v1","egress":{"default_action":"allow","future_field":[]}}`,
+			wantMessage: `unknown field "future_field"`,
+		},
+		{
+			name:        "unknown destination field",
+			policy:      `{"version":"v1","egress":{"default_action":"deny","allow":[{"domain":"example.test","future_field":443}]}}`,
+			wantMessage: `unknown field "future_field"`,
+		},
+		{
 			name:        "bad authority",
 			policy:      `{"version":"v1","egress":{"default_action":"allow"}}`,
 			authority:   "global",
