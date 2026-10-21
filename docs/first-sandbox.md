@@ -85,7 +85,7 @@ Read `/openapi-m1.json` for exact request constraints and supported fields. This
 
 The example displays decoded stdout and stderr and saves the raw event stream in its run directory. Handle binary output separately rather than displaying it in a terminal.
 
-Command output is a live stream, not durable log storage. The sandbox retains a bounded amount of each process's recent output: reconnecting with `Last-Event-ID` resumes with the output after that event while it is retained, and otherwise produces `resync_required` before live output. Keep the transcript when a stream fails; repeat a command only if repeating its effects is safe.
+Command output is a live stream, not durable log storage. The sandbox retains a bounded amount of each process's recent output: reconnecting with `Last-Event-ID`, set to the last event's `id` exactly as received, resumes with the output after that event while it is retained, and otherwise produces `resync_required` first. Keep the transcript when a stream fails; repeat a command only if repeating its effects is safe.
 
 ## Inspect and manage the sandbox
 

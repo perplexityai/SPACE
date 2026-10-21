@@ -612,7 +612,8 @@ function parseEvents(buffer) {
       else if (name === 'id') id = value;
       else if (name === 'data') data.push(value);
     }
-    if (data.length) events.push({ event, id: id === null ? null : Number(id), data: JSON.parse(data.join('\n')) });
+    // Ids are opaque and exceed what a JavaScript number holds exactly.
+    if (data.length) events.push({ event, id, data: JSON.parse(data.join('\n')) });
   }
   return { events, rest };
 }
@@ -621,7 +622,7 @@ function parseEvents(buffer) {
 // Every identified frame must carry a greater id than the one before.
 async function readStream(resumeFrom, onEvent) {
   const headers = { Accept: 'text/event-stream', Authorization: `Bearer ${command.attach.token}` };
-  if (resumeFrom !== null) headers['Last-Event-ID'] = String(resumeFrom);
+  if (resumeFrom !== null) headers['Last-Event-ID'] = resumeFrom;
   const response = await fetch(eventsUrl(command), { headers });
   if (!response.ok || !response.body) {
     throw new Error(`command event stream returned HTTP ${response.status}`);
@@ -637,7 +638,7 @@ async function readStream(resumeFrom, onEvent) {
     buffer = rest;
     for (const event of events) {
       if (event.id !== null) {
-        if (lastEventId !== null && event.id <= lastEventId) eventIdsMonotonic = false;
+        if (lastEventId !== null && BigInt(event.id) <= BigInt(lastEventId)) eventIdsMonotonic = false;
         lastEventId = event.id;
       }
       if (event.event !== null && event.event !== event.data.type) eventIdsMonotonic = false;
@@ -686,13 +687,13 @@ async function readStream(resumeFrom, onEvent) {
   // replaying output already received or asking to resync, and the exited
   // process still reports its exit.
   const resumeFrom = lastEventId;
-  const resume = { attached_first: null, first_id: null, resync: null, stdout: '', exit_code: null };
+  const resume = { attached_first: null, ids_continue: null, resync: null, stdout: '', exit_code: null };
   let seen = 0;
   await readStream(resumeFrom, (event) => {
     const frame = event.data;
     seen += 1;
     if (seen === 1) resume.attached_first = frame.type === 'attached' && event.id === null;
-    if (event.id !== null && resume.first_id === null) resume.first_id = event.id;
+    if (event.id !== null && resume.ids_continue === null) resume.ids_continue = BigInt(event.id) > BigInt(resumeFrom);
     if (frame.type === 'resync_required' && resume.resync === null) resume.resync = frame.reason;
     if (frame.type === 'stdout') resume.stdout += Buffer.from(frame.data_base64, 'base64').toString('utf8');
     if (frame.type === 'process_exited') {
@@ -843,7 +844,7 @@ assert_eq "$(jq -r '.event_ids_monotonic' <<<"$command_result")" "true" "command
 assert_eq "$(jq -r '.resume.attached_first' <<<"$command_result")" "true" "resumed stream starts with attached"
 assert_eq "$(jq -r '.resume.resync' <<<"$command_result")" "null" "lossless resume does not resync"
 assert_eq "$(jq -r '.resume.stdout' <<<"$command_result")" "" "resume does not replay received output"
-assert_eq "$(jq -r '.resume.first_id > .resume_from' <<<"$command_result")" "true" "resumed ids continue after Last-Event-ID"
+assert_eq "$(jq -r '.resume.ids_continue' <<<"$command_result")" "true" "resumed ids continue after Last-Event-ID"
 assert_eq "$(jq -r '.resume.exit_code' <<<"$command_result")" "6" "resumed stream reports the process exit"
 log "one-shot command event stream ok (Last-Event-ID resume verified)"
 

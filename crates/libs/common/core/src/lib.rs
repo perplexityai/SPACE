@@ -158,6 +158,11 @@ pub mod spaced {
     /// as opposed to the sandbox or its runtime being unknown to a hop.
     pub const GUEST_PATH_NOT_FOUND: &str = "guest-path-not-found";
 
+    /// [`ERROR_REASON_METADATA_KEY`] value of an OUT_OF_RANGE that ends a
+    /// process output stream whose cursor is past the output the process has
+    /// written, as opposed to a message too large for a hop to decode.
+    pub const PROCESS_OUTPUT_CURSOR_AHEAD: &str = "process-output-cursor-ahead";
+
     /// [`ERROR_REASON_METADATA_KEY`] value of a request refused before any of
     /// its work started: an admission limit, or a guest or registry shutting
     /// down. This request did nothing, so the caller may retry it, after the

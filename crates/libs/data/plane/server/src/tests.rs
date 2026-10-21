@@ -1,8 +1,8 @@
 use super::*;
 use crate::{
     native::{
-        PROCESS_EVENT_ID_STRIDE, ProcessReplayState, first_frame_attach_token_from_recv,
-        next_process_event_id, process_event_output_position,
+        PROCESS_EVENT_ID_GUARD_BITS, PROCESS_EVENT_ID_MAX_FRAME, PROCESS_EVENT_ID_MAX_POSITION,
+        ProcessEventId, ProcessReplayState, first_frame_attach_token_from_recv,
     },
     runtime_route::sweep_expired_ecw_routes,
 };
@@ -3705,71 +3705,130 @@ async fn first_frame_attach_token_times_out_at_deadline() {
 }
 
 /// A fresh attach replays the guest journal from its start, and a resume
-/// continues from the output position its id carries. Only an id without a
-/// position, as earlier data planes issued, still resumes the live tail
-/// behind `resync_required`.
+/// continues from the output position its id carries. An id without one,
+/// including every id an earlier data plane issued, also replays from the
+/// start, behind `resync_required`.
 #[test]
 fn process_sse_resume_starts_at_the_journal_position_its_id_carries() {
     let session_id = DataPlaneSessionId::Process(Default::default());
 
     let fresh = ProcessReplayState::load(session_id, None);
-    assert_eq!(fresh.event_seq, 0);
-    assert_eq!(fresh.backend_output_cursor, Some(0));
+    assert_eq!(fresh.backend_output_cursor, 0);
     assert!(fresh.pending.is_empty());
 
-    let resumed = ProcessReplayState::load(session_id, Some(4 * PROCESS_EVENT_ID_STRIDE + 2));
-    assert_eq!(resumed.event_seq, 4 * PROCESS_EVENT_ID_STRIDE + 2);
-    assert_eq!(resumed.backend_output_cursor, Some(3));
+    let carried = ProcessEventId::Position {
+        position: 3,
+        frame: 2,
+    };
+    let resumed = ProcessReplayState::load(session_id, Some(carried.encode()));
+    assert_eq!(resumed.event_id, carried);
+    assert_eq!(resumed.backend_output_cursor, 3);
     assert!(resumed.pending.is_empty());
 
-    let legacy = ProcessReplayState::load(session_id, Some(41));
-    assert_eq!(legacy.event_seq, 42);
-    assert_eq!(legacy.backend_output_cursor, None);
-    assert_eq!(legacy.pending.len(), 1);
+    let unknown = ProcessEventId::Unknown { block: 4, frame: 1 }.encode();
+    // Earlier data planes count frames from 1, so their ids sit on either side
+    // of any decimal boundary; one counted on from a tagged id fails its guard.
+    for last_event_id in [
+        0,
+        41,
+        999_999,
+        1_000_000,
+        1_500_000,
+        unknown,
+        carried.encode() + 1,
+    ] {
+        let replay = ProcessReplayState::load(session_id, Some(last_event_id));
+        assert_eq!(replay.backend_output_cursor, 0, "{last_event_id}");
+        assert_eq!(replay.pending.len(), 1, "{last_event_id}");
+    }
 }
 
-/// Process SSE ids increase, and each decodes to the output position a
-/// resume from it continues at. While the position is unknown the ids stay
-/// with the last position known, never moving onto output the client lacks.
+/// Process SSE ids increase on every frame, each decodes to the position the
+/// client has received output up to, and once a stream loses that position no
+/// later id of it carries one, however many frames follow.
 #[test]
-fn process_event_ids_carry_the_output_position() {
-    let mut previous = 0;
-    let mut last_known = None;
-    for position in [
-        Some(0),
-        Some(0),
-        Some(1),
-        Some(2),
-        Some(2),
-        None,
-        None,
-        Some(5),
-    ] {
-        let id = next_process_event_id(previous, position);
-        assert!(id > previous, "{id} after {previous}");
-        last_known = position.or(last_known);
-        assert_eq!(process_event_output_position(id), last_known, "{id}");
+fn process_event_ids_increase_and_carry_the_output_position() {
+    let mut previous = ProcessEventId::START;
+    let mut lost = false;
+    let positions = [Some(0), Some(0), Some(1), Some(2)]
+        .into_iter()
+        .chain(std::iter::repeat_n(
+            Some(2),
+            PROCESS_EVENT_ID_MAX_FRAME as usize + 1,
+        ))
+        .chain([Some(3), None, Some(4)])
+        .chain(std::iter::repeat_n(
+            None,
+            PROCESS_EVENT_ID_MAX_FRAME as usize + 1,
+        ));
+    for position in positions {
+        let id = previous.next(position);
+        assert!(id.encode() > previous.encode(), "{id:?} after {previous:?}");
+        assert!(id.encode() <= MAX_LAST_EVENT_ID);
+        assert_eq!(ProcessEventId::decode(id.encode()), Some(id));
+        lost |= !matches!(id, ProcessEventId::Position { .. });
+        match id {
+            ProcessEventId::Position {
+                position: carried, ..
+            } => {
+                assert!(!lost, "{id:?} after the position was lost");
+                assert_eq!(Some(carried), position);
+            }
+            ProcessEventId::Unknown { .. } => assert!(lost),
+        }
         previous = id;
     }
+    assert!(lost, "running out of frames at one position loses it");
 
-    // Ids without a position stay without one.
-    assert_eq!(
-        process_event_output_position(next_process_event_id(42, None)),
-        None
-    );
-    // Frame counts saturate inside their position rather than spill into the next.
-    let last = 2 * PROCESS_EVENT_ID_STRIDE - 1;
-    assert_eq!(next_process_event_id(last, Some(0)), last);
-    assert_eq!(next_process_event_id(last, None), last);
-    // Every id stays a valid `Last-Event-ID`.
-    assert!(next_process_event_id(0, Some(u64::MAX)) <= MAX_LAST_EVENT_ID);
-    assert!(next_process_event_id(MAX_LAST_EVENT_ID, Some(u64::MAX)) <= MAX_LAST_EVENT_ID);
+    for (from, position) in [
+        // A position the field cannot hold, and one behind the last.
+        (
+            ProcessEventId::START,
+            Some(PROCESS_EVENT_ID_MAX_POSITION + 1),
+        ),
+        (
+            ProcessEventId::Position {
+                position: 5,
+                frame: 0,
+            },
+            Some(4),
+        ),
+    ] {
+        let id = from.next(position);
+        assert!(matches!(id, ProcessEventId::Unknown { .. }), "{id:?}");
+        assert!(id.encode() > from.encode());
+    }
+
+    let highest = ProcessEventId::Unknown {
+        block: PROCESS_EVENT_ID_MAX_POSITION,
+        frame: PROCESS_EVENT_ID_MAX_FRAME,
+    };
+    assert!(highest.encode() <= MAX_LAST_EVENT_ID);
+
+    // An id off by less than the guard, as `+1` counting or rounding through
+    // a double leaves it, carries no position.
+    let id = ProcessEventId::Position {
+        position: 7,
+        frame: 3,
+    }
+    .encode();
+    for mangled in [
+        id + 1,
+        id - 1,
+        id + 96,
+        id - 512,
+        id + (1 << PROCESS_EVENT_ID_GUARD_BITS) - 1,
+    ] {
+        assert_eq!(ProcessEventId::decode(mangled), None, "{mangled}");
+    }
+    // Unrounded, a double holds the id exactly.
+    let double: f64 = id.to_string().parse().unwrap();
+    assert_eq!(format!("{double:.0}"), id.to_string());
 }
 
-/// The file-watch reconnection contract, which a process session keeps for an
-/// id without an output position: `Last-Event-ID` resumes the live stream at
-/// `last + 1` behind a `resync_required(cursor_replay_unavailable)` frame; no
-/// cursor, no frame.
+/// The file-watch reconnection contract: `Last-Event-ID` resumes the live
+/// stream at `last + 1` behind a `resync_required(cursor_replay_unavailable)`
+/// frame; no cursor, no frame.
 #[test]
 fn last_event_id_resume_is_a_cursor_replay_unavailable_resync() {
     for kind in ["process", "file_watch"] {

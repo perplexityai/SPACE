@@ -81,6 +81,8 @@ const PROCESS_OUTPUT_SHARED_BYTES: usize =
 const PROCESS_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const PROCESS_OUTPUT_LAGGED_MESSAGE: &str =
     "process output stream fell behind retained output buffer";
+const PROCESS_OUTPUT_CURSOR_AHEAD_MESSAGE: &str =
+    "process output cursor is past the output the process has written";
 const PROCESS_CAPACITY_MESSAGE: &str = "too many retained processes";
 // A start phase slower than this is logged with every phase's duration once
 // the spawn returns, so a slow start names its cause. The account lookup
@@ -1211,6 +1213,12 @@ impl ProcessEventJournal {
         if cursor < state.first_sequence {
             return ProcessJournalRead::Lagged;
         }
+        // A cursor only ever advances over output it has read, so one past the
+        // end came from a caller, not from this journal: waiting for output to
+        // reach it would skip everything written before it.
+        if cursor > state.next_sequence {
+            return ProcessJournalRead::Ahead;
+        }
         if cursor < state.next_sequence {
             let offset = (cursor - state.first_sequence) as usize;
             return ProcessJournalRead::Event(
@@ -1281,6 +1289,7 @@ enum ProcessJournalRead {
     Exit(ProcessEvent),
     Pending,
     Lagged,
+    Ahead,
 }
 
 #[derive(Clone, Copy)]
@@ -1543,6 +1552,7 @@ fn process_event_stream_with_prefix(
                     ProcessJournalRead::Lagged => {
                         break Err(Status::resource_exhausted(PROCESS_OUTPUT_LAGGED_MESSAGE));
                     }
+                    ProcessJournalRead::Ahead => break Err(process_output_cursor_ahead_status()),
                     ProcessJournalRead::Pending => {
                         if current.changed.changed().await.is_err() {
                             break evicted_process_journal_result(current);
@@ -1553,6 +1563,17 @@ fn process_event_stream_with_prefix(
             Some((result, (prefix, None)))
         },
     ))
+}
+
+fn process_output_cursor_ahead_status() -> Status {
+    let mut status = Status::out_of_range(PROCESS_OUTPUT_CURSOR_AHEAD_MESSAGE);
+    status.metadata_mut().insert(
+        pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+        tonic::metadata::MetadataValue::from_static(
+            pplx_space_common_core::spaced::PROCESS_OUTPUT_CURSOR_AHEAD,
+        ),
+    );
+    status
 }
 
 fn evicted_process_journal_result(cursor: &ProcessJournalCursor) -> Result<ProcessEvent, Status> {

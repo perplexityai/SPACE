@@ -210,7 +210,7 @@ pub(crate) struct ProcessSseState {
     attached: AttachedSession,
     client: WorkerApiClient<GrpcClientTrace<Channel>>,
     stream: tonic::Streaming<ProcessEvent>,
-    event_seq: u64,
+    event_id: ProcessEventId,
     /// The guest output journal position the client has received output up
     /// to, or `None` once the stream follows the live tail from an unknown one.
     backend_output_cursor: Option<u64>,
@@ -219,6 +219,9 @@ pub(crate) struct ProcessSseState {
     process_id: Option<ProcessId>,
     process_bound: bool,
     binding: Option<PendingProcessBinding>,
+    /// The stream was reopened after an output gap, so the start it reports
+    /// next repeats one the client already has.
+    reopened_after_gap: bool,
     revocation_tick: tokio::time::Interval,
     pending: VecDeque<Event>,
     finished: bool,
@@ -228,8 +231,8 @@ pub(crate) struct ProcessSseState {
 }
 
 pub(crate) struct ProcessReplayState {
-    pub(crate) event_seq: u64,
-    pub(crate) backend_output_cursor: Option<u64>,
+    pub(crate) event_id: ProcessEventId,
+    pub(crate) backend_output_cursor: u64,
     pub(crate) pending: VecDeque<Event>,
 }
 
@@ -237,12 +240,10 @@ pub(crate) struct ProcessReplayState {
 /// id and the `resync_required(cursor_replay_unavailable)` frame that carries
 /// it. `None` when the client did not send a cursor.
 ///
-/// This is the reconnection contract for file-watch sessions, and for a
-/// process session resumed from an id that carries no output position (see
-/// [`PROCESS_EVENT_ID_STRIDE`]): the data plane resumes the *live* stream at
-/// `last + 1` and does not replay what was missed. Keep this the single place
-/// that decides so the docs, the conformance smoke, and both session kinds
-/// cannot drift.
+/// This is the reconnection contract for file-watch sessions: the data plane
+/// resumes the *live* stream at `last + 1` and does not replay what was
+/// missed. Keep this the single place that decides so the docs and the
+/// conformance smoke cannot drift.
 ///
 /// `last + 1` cannot overflow: the request boundary rejects cursors above
 /// [`auth::MAX_LAST_EVENT_ID`] (`i64::MAX`) with a 400, so a resumed stream
@@ -259,65 +260,142 @@ pub(crate) fn resume_resync_frame(
     ))
 }
 
-/// How far apart the SSE ids of successive guest output positions are.
+/// A process stream's SSE id, which a resume decodes to recover the guest
+/// output position to continue from, so any replica can serve it.
 ///
-/// A process stream's id is `(position + 1) * PROCESS_EVENT_ID_STRIDE + n`:
-/// `position` is the guest output journal position the client has received
-/// output up to, and `n` counts the frames since output last advanced it. A
-/// resume recovers the position from the id alone, so any replica can serve
-/// it. Ids below the stride carry no position: they are the plain frame
-/// counters earlier data planes issued, and a resume from one still follows
-/// the live tail behind [`resume_resync_frame`].
-pub(crate) const PROCESS_EVENT_ID_STRIDE: u64 = 1_000_000;
-
-/// The guest output position a process stream's SSE id resumes from, or
-/// `None` for an id that carries none.
-pub(crate) fn process_event_output_position(event_id: u64) -> Option<u64> {
-    (event_id / PROCESS_EVENT_ID_STRIDE).checked_sub(1)
+/// On the wire, bit 62 tags the id: no frame counter an earlier data plane
+/// issued reaches it. The low [`PROCESS_EVENT_ID_GUARD_BITS`] bits are zero,
+/// so an id that a data plane without this encoding counted on from by `+1`,
+/// or that a client rounded through a floating-point number, fails to decode
+/// rather than decoding to the wrong position. Above them come a frame counter
+/// and a position field, whose top bit marks a block of ids without a position.
+/// Those blocks sort above every position, so a stream that loses its
+/// position keeps its ids increasing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProcessEventId {
+    /// The client has received the guest's output up to `position`.
+    Position { position: u64, frame: u64 },
+    /// The id carries no position; a resume from it cannot be exact.
+    Unknown { block: u64, frame: u64 },
 }
 
-/// The SSE id of a process stream's frame after `previous`, once the client
-/// has received output up to `output_position`.
-///
-/// While the position is unknown, ids stay among those of the last position
-/// the stream knew. The guest has evicted that position, or the stream never
-/// had one, so a resume from such an id reports the gap again instead of
-/// replaying output the client already has.
-pub(crate) fn next_process_event_id(previous: u64, output_position: Option<u64>) -> u64 {
-    let first = output_position
-        .and_then(|position| {
-            position
-                .checked_add(1)?
-                .checked_mul(PROCESS_EVENT_ID_STRIDE)
+const PROCESS_EVENT_ID_TAG: u64 = 1 << 62;
+pub(crate) const PROCESS_EVENT_ID_GUARD_BITS: u32 = 16;
+const PROCESS_EVENT_ID_FRAME_BITS: u32 = 12;
+const PROCESS_EVENT_ID_FIELD_BITS: u32 = 34;
+const PROCESS_EVENT_ID_FIELD_SHIFT: u32 = PROCESS_EVENT_ID_GUARD_BITS + PROCESS_EVENT_ID_FRAME_BITS;
+pub(crate) const PROCESS_EVENT_ID_MAX_FRAME: u64 = (1 << PROCESS_EVENT_ID_FRAME_BITS) - 1;
+const PROCESS_EVENT_ID_UNKNOWN: u64 = 1 << (PROCESS_EVENT_ID_FIELD_BITS - 1);
+pub(crate) const PROCESS_EVENT_ID_MAX_POSITION: u64 = PROCESS_EVENT_ID_UNKNOWN - 1;
+
+impl ProcessEventId {
+    /// Precedes the first frame of a stream that starts at the beginning of
+    /// the guest's output. Never sent.
+    pub(crate) const START: Self = Self::Position {
+        position: 0,
+        frame: 0,
+    };
+
+    pub(crate) fn encode(self) -> u64 {
+        let (field, frame) = match self {
+            Self::Position { position, frame } => (position, frame),
+            Self::Unknown { block, frame } => (PROCESS_EVENT_ID_UNKNOWN | block, frame),
+        };
+        PROCESS_EVENT_ID_TAG
+            | field << PROCESS_EVENT_ID_FIELD_SHIFT
+            | frame << PROCESS_EVENT_ID_GUARD_BITS
+    }
+
+    /// `None` for an id this encoding did not produce.
+    pub(crate) fn decode(id: u64) -> Option<Self> {
+        if id >> 62 != 1 || id & ((1 << PROCESS_EVENT_ID_GUARD_BITS) - 1) != 0 {
+            return None;
+        }
+        let frame = (id >> PROCESS_EVENT_ID_GUARD_BITS) & PROCESS_EVENT_ID_MAX_FRAME;
+        let field = (id >> PROCESS_EVENT_ID_FIELD_SHIFT) & ((1 << PROCESS_EVENT_ID_FIELD_BITS) - 1);
+        Some(if field & PROCESS_EVENT_ID_UNKNOWN == 0 {
+            Self::Position {
+                position: field,
+                frame,
+            }
+        } else {
+            Self::Unknown {
+                block: field & !PROCESS_EVENT_ID_UNKNOWN,
+                frame,
+            }
         })
-        .filter(|first| *first <= auth::MAX_LAST_EVENT_ID)
-        .unwrap_or(previous - previous % PROCESS_EVENT_ID_STRIDE);
-    let last = first
-        .saturating_add(PROCESS_EVENT_ID_STRIDE - 1)
-        .min(auth::MAX_LAST_EVENT_ID);
-    previous.saturating_add(1).clamp(first, last)
+    }
+
+    /// The id of the next frame, once the client has received output up to
+    /// `position`. Always greater than this one.
+    pub(crate) fn next(self, position: Option<u64>) -> Self {
+        match self {
+            Self::Position {
+                position: last,
+                frame,
+            } => match position {
+                Some(position) if position == last && frame < PROCESS_EVENT_ID_MAX_FRAME => {
+                    Self::Position {
+                        position,
+                        frame: frame + 1,
+                    }
+                }
+                Some(position) if position > last && position <= PROCESS_EVENT_ID_MAX_POSITION => {
+                    Self::Position { position, frame: 0 }
+                }
+                // The position is unknown, beyond the field, behind this one,
+                // or out of frames: no later id of this stream carries one, and
+                // a resume from them replays behind `resync_required`.
+                _ => Self::Unknown { block: 0, frame: 0 },
+            },
+            Self::Unknown { block, frame } if frame < PROCESS_EVENT_ID_MAX_FRAME => Self::Unknown {
+                block,
+                frame: frame + 1,
+            },
+            // A stream would need 2^45 frames to exhaust the blocks.
+            Self::Unknown { block, .. } => Self::Unknown {
+                block: block + 1,
+                frame: 0,
+            },
+        }
+    }
 }
 
 impl ProcessReplayState {
     /// Where a process stream starts in the guest's output journal: a fresh
     /// attach replays the retained output from the start, and a resume
-    /// continues from the position its `Last-Event-ID` carries.
+    /// continues from the position its `Last-Event-ID` carries. A resume from
+    /// an id without one also replays from the start, behind
+    /// `resync_required(cursor_replay_unavailable)`, as output the client
+    /// already has may repeat.
     pub(crate) fn load(session_id: DataPlaneSessionId, last_event_id: Option<u64>) -> Self {
-        let mut replay = Self {
-            event_seq: last_event_id.unwrap_or_default(),
-            backend_output_cursor: last_event_id.map_or(Some(0), process_event_output_position),
-            pending: VecDeque::new(),
-        };
-        if replay.backend_output_cursor.is_none()
-            && let Some((event_seq, frame)) =
-                resume_resync_frame(session_id.kind().as_str(), last_event_id)
-        {
-            replay.event_seq = event_seq;
-            replay
-                .pending
-                .push_back(sse_event_from_frame(&frame, Some(event_seq)));
+        match last_event_id.map(ProcessEventId::decode) {
+            None => Self {
+                event_id: ProcessEventId::START,
+                backend_output_cursor: 0,
+                pending: VecDeque::new(),
+            },
+            Some(Some(event_id @ ProcessEventId::Position { position, .. })) => Self {
+                event_id,
+                backend_output_cursor: position,
+                pending: VecDeque::new(),
+            },
+            Some(_) => {
+                let event_id = ProcessEventId::START.next(Some(0));
+                let frame = resync_required_frame(
+                    session_id.kind().as_str(),
+                    DataPlaneResyncReason::CursorReplayUnavailable,
+                );
+                Self {
+                    event_id,
+                    backend_output_cursor: 0,
+                    pending: VecDeque::from([sse_event_from_frame(
+                        &frame,
+                        Some(event_id.encode()),
+                    )]),
+                }
+            }
         }
-        replay
     }
 }
 
@@ -331,12 +409,13 @@ impl ProcessSseState {
         start_permit: Option<NativeSessionAttachPermit>,
     ) -> Result<Self, StreamBridgeError> {
         let replay = ProcessReplayState::load(session_id, last_event_id);
-        let backend_output_cursor = replay
-            .backend_output_cursor
-            .or_else(|| attached.backend_process_id.is_none().then_some(0));
-        let (client, stream) =
-            open_native_process_stream(&state, session_id, &mut attached, backend_output_cursor)
-                .await?;
+        let (client, stream) = open_native_process_stream(
+            &state,
+            session_id,
+            &mut attached,
+            Some(replay.backend_output_cursor),
+        )
+        .await?;
         let mut pending = VecDeque::new();
         pending.push_back(sse_event_from_frame(&attached_frame(&attached), None));
         pending.extend(replay.pending);
@@ -351,12 +430,13 @@ impl ProcessSseState {
             attached,
             client,
             stream,
-            event_seq: replay.event_seq,
-            backend_output_cursor,
-            output_seq: backend_output_cursor.unwrap_or_default(),
+            event_id: replay.event_id,
+            backend_output_cursor: Some(replay.backend_output_cursor),
+            output_seq: replay.backend_output_cursor,
             process_id,
             process_bound,
             binding: None,
+            reopened_after_gap: false,
             revocation_tick,
             pending,
             finished: false,
@@ -367,9 +447,9 @@ impl ProcessSseState {
     }
 
     fn push_frame(&mut self, frame: DataPlaneServerFrame) {
-        self.event_seq = next_process_event_id(self.event_seq, self.backend_output_cursor);
+        self.event_id = self.event_id.next(self.backend_output_cursor);
         self.pending
-            .push_back(sse_event_from_frame(&frame, Some(self.event_seq)));
+            .push_back(sse_event_from_frame(&frame, Some(self.event_id.encode())));
     }
 
     fn finish(&mut self, result: &'static str) {
@@ -474,11 +554,13 @@ async fn next_process_sse_frame(state: &mut ProcessSseState) -> Option<Event> {
                 };
                 match event {
                     Ok(event) => {
+                        let mut repeated_start = false;
                         if matches!(
                             event.event,
                             Some(spaced_process_event::Event::Started(_))
                                 | Some(spaced_process_event::Event::Connected(_))
                         ) {
+                            repeated_start = std::mem::take(&mut state.reopened_after_gap);
                             let event_process_id: ProcessId = match event.process_id.parse() {
                                 Ok(process_id) => process_id,
                                 Err(_) => {
@@ -490,6 +572,22 @@ async fn next_process_sse_frame(state: &mut ProcessSseState) -> Option<Event> {
                             };
                             state.process_id = Some(event_process_id.clone());
                             if !state.process_bound {
+                                if matches!(
+                                    event.event,
+                                    Some(spaced_process_event::Event::Started(_))
+                                ) && state.backend_output_cursor != Some(0)
+                                {
+                                    // This attach started the process, so its
+                                    // output begins here: the position the
+                                    // client resumed from was another's.
+                                    state.backend_output_cursor = Some(0);
+                                    state.output_seq = 0;
+                                    state.event_id = ProcessEventId::START;
+                                    state.push_frame(resync_required_frame(
+                                        state.session_id.kind().as_str(),
+                                        DataPlaneResyncReason::CursorOutOfWindow,
+                                    ));
+                                }
                                 state.process_bound = true;
                                 state.binding = Some(PendingProcessBinding::spawn(
                                     &state.state,
@@ -500,7 +598,12 @@ async fn next_process_sse_frame(state: &mut ProcessSseState) -> Option<Event> {
                             }
                         }
                         let mut output_seq = state.output_seq;
-                        let batch = process_event_frames(event, &mut output_seq);
+                        let mut batch = process_event_frames(event, &mut output_seq);
+                        if repeated_start {
+                            batch.frames.retain(|frame| {
+                                !matches!(frame, DataPlaneServerFrame::ProcessStarted { .. })
+                            });
+                        }
                         if batch
                             .frames
                             .iter()
@@ -532,14 +635,20 @@ async fn next_process_sse_frame(state: &mut ProcessSseState) -> Option<Event> {
                             return Some(event);
                         }
                     }
-                    Err(status) if is_output_journal_gap(&status) => {
-                        // The guest no longer retains the output this stream
-                        // asked for. Report the gap, then follow the live tail.
+                    Err(status) if is_output_window_miss(&status) => {
+                        // The guest does not hold the output this stream asked
+                        // for. Report the gap, then reopen: from the start of
+                        // the output when the cursor was past its end, else at
+                        // the live tail, as what was evicted is gone.
                         let Some(process_id) = state.process_id.clone() else {
                             state.finish_with_error(StreamBridgeError::BackendStatus(status));
                             return state.pending.pop_front();
                         };
-                        state.backend_output_cursor = None;
+                        let reopen_at = (is_output_cursor_ahead(&status)
+                            && state.backend_output_cursor != Some(0))
+                        .then_some(0);
+                        state.backend_output_cursor = reopen_at;
+                        state.output_seq = reopen_at.unwrap_or(state.output_seq);
                         state.push_frame(resync_required_frame(
                             state.session_id.kind().as_str(),
                             DataPlaneResyncReason::CursorOutOfWindow,
@@ -548,12 +657,15 @@ async fn next_process_sse_frame(state: &mut ProcessSseState) -> Option<Event> {
                             &mut state.client,
                             &state.attached.sandbox_id,
                             &process_id,
-                            None,
+                            reopen_at,
                             state.attached.space_api_route_token.as_ref(),
                         )
                         .await
                         {
-                            Ok(stream) => state.stream = stream,
+                            Ok(stream) => {
+                                state.stream = stream;
+                                state.reopened_after_gap = true;
+                            }
                             Err(error) => state.finish_with_error(error),
                         }
                         return state.pending.pop_front();
@@ -652,12 +764,24 @@ async fn next_process_sse_frame(state: &mut ProcessSseState) -> Option<Event> {
     }
 }
 
-/// The guest ends a process stream with `resource_exhausted` once the output
-/// its cursor reaches has been evicted. The node's per-sandbox limiter uses the
-/// same code, but it refuses a call before any stream exists.
-fn is_output_journal_gap(status: &tonic::Status) -> bool {
-    status.code() == tonic::Code::ResourceExhausted
-        && pplx_space_common_grpc::UdsPerSandboxLimitExceeded::from_status(status).is_none()
+/// Whether the guest ended a process stream because its cursor is outside the
+/// retained output: `resource_exhausted` once that output has been evicted (the
+/// node's per-sandbox limiter uses the same code, but it refuses a call before
+/// any stream exists), or a cursor past the end of the output.
+fn is_output_window_miss(status: &tonic::Status) -> bool {
+    is_output_cursor_ahead(status)
+        || (status.code() == tonic::Code::ResourceExhausted
+            && pplx_space_common_grpc::UdsPerSandboxLimitExceeded::from_status(status).is_none())
+}
+
+/// A guest older than this check waits for output to reach such a cursor.
+fn is_output_cursor_ahead(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::OutOfRange
+        && status
+            .metadata()
+            .get(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY)
+            .and_then(|value| value.to_str().ok())
+            == Some(pplx_space_common_core::spaced::PROCESS_OUTPUT_CURSOR_AHEAD)
 }
 
 pub(crate) struct FileWatchSseState {

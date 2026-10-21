@@ -904,6 +904,55 @@ async fn evicted_cursor_reports_lag_before_terminal_event() {
     );
 }
 
+/// A cursor past the written output fails at once, whether the process is
+/// still running or has exited, rather than waiting for output to reach it and
+/// skipping everything written before. The end of the output stays valid.
+#[tokio::test]
+async fn cursor_past_the_output_fails_instead_of_waiting() {
+    for completed in [false, true] {
+        let journal = Arc::new(ProcessEventJournal::new(output_slots()));
+        let process_id = ProcessId::new();
+        journal.append_output(process_stdout_event(
+            &process_id,
+            Some(1),
+            b"written".to_vec(),
+        ));
+        let exit = process_stdout_event(&process_id, Some(1), b"terminal".to_vec());
+        if completed {
+            journal.complete(exit.clone());
+        }
+
+        let mut ahead = process_event_stream_with_prefix(Vec::new(), Some(journal.cursor(Some(5))));
+        let error = tokio::time::timeout(Duration::from_secs(1), ahead.next())
+            .await
+            .expect("a cursor past the output must not wait")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            error.code(),
+            tonic::Code::OutOfRange,
+            "completed: {completed}"
+        );
+        assert_eq!(
+            error
+                .metadata()
+                .get(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY)
+                .and_then(|value| value.to_str().ok()),
+            Some(pplx_space_common_core::spaced::PROCESS_OUTPUT_CURSOR_AHEAD)
+        );
+        assert!(ahead.next().await.is_none());
+
+        let mut at_end =
+            process_event_stream_with_prefix(Vec::new(), Some(journal.cursor(Some(1))));
+        let next = tokio::time::timeout(Duration::from_millis(100), at_end.next()).await;
+        if completed {
+            assert_eq!(next.unwrap().unwrap().unwrap(), exit);
+        } else {
+            assert!(next.is_err(), "the end of a running process's output waits");
+        }
+    }
+}
+
 #[tokio::test]
 async fn login_tty_pty_supports_output_input_and_resize() {
     let prepared = prepare_pty(Some(PtySize { rows: 24, cols: 80 })).expect("open test pty");
