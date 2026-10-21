@@ -4615,8 +4615,7 @@ pub(crate) mod service_tests {
                 policy,
                 generation,
                 PolicyAuthority::Cluster,
-                false,
-                false,
+                Default::default(),
             )
             .unwrap()
             .decision

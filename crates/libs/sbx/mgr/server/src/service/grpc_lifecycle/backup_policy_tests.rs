@@ -700,6 +700,106 @@ fn set_policy_request(
     })
 }
 
+#[test]
+fn seed_divergence_repair_requires_node_ctl_and_an_explicit_generation() {
+    use pplx_space_common_core::host::linux::identities::user_names;
+    use pplx_space_common_svc::{LocalRole, UdsPeerPrincipal};
+    for (principal, eligible) in [
+        (UdsPeerPrincipal::Service(user_names::SPACE_NODECTL), true),
+        (UdsPeerPrincipal::Service(user_names::SPACE_NODEAPI), false),
+        (UdsPeerPrincipal::Service(user_names::SPACE_TMPLMGR), false),
+        (UdsPeerPrincipal::Root, false),
+        (UdsPeerPrincipal::Role(LocalRole::Operator), false),
+        (UdsPeerPrincipal::Role(LocalRole::Admin), false),
+        (UdsPeerPrincipal::Role(LocalRole::Observer), false),
+        (UdsPeerPrincipal::Other, false),
+    ] {
+        for generation in [0, 7] {
+            assert_eq!(
+                super::sandbox_network_policy::allows_seed_divergence_repair(principal, generation),
+                eligible && generation != 0,
+                "{principal:?}, generation={generation}"
+            );
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn set_network_policy_repairs_cluster_seed_only_for_node_ctl() {
+    use pplx_space_common_core::host::linux::identities::users;
+    use pplx_space_common_svc::PeerIdentity;
+    use pplx_space_net_common::proto::NetworkPolicyApplyDecision::{Apply, Skip};
+
+    let conn = crate::db::test_conn();
+    let id = SandboxId::new().to_string();
+    insert_test_sandbox(&conn, &id, SandboxState::Stopped);
+    crate::db::set_network_policy_fields(
+        &conn,
+        &id,
+        Some(&NetworkPolicyV1::allow_all()),
+        7,
+        PolicyAuthority::Cluster,
+    )
+    .unwrap();
+    let service = service_with_template_policy(conn, Egress::Deny, 3).await;
+    for (identity, expected) in [
+        (PeerIdentity::new(0, 0, None), None),
+        (
+            PeerIdentity::new(
+                users::SPACE_NODEAPI.uid,
+                users::SPACE_NODEAPI.primary_group.gid,
+                None,
+            ),
+            None,
+        ),
+        (
+            PeerIdentity::new(
+                users::SPACE_NODECTL.uid,
+                users::SPACE_NODECTL.primary_group.gid,
+                None,
+            ),
+            Some(Apply),
+        ),
+        (
+            PeerIdentity::new(
+                users::SPACE_NODECTL.uid,
+                users::SPACE_NODECTL.primary_group.gid,
+                None,
+            ),
+            Some(Skip),
+        ),
+    ] {
+        let mut request = set_policy_request(
+            &id,
+            Some(Egress::Deny),
+            false,
+            7,
+            wire_authority(PolicyAuthority::Cluster),
+        );
+        request.extensions_mut().insert(identity);
+        let response = service.set_network_policy(request).await;
+        if let Some(expected) = expected {
+            let response = response.unwrap().into_inner();
+            assert_eq!(response.apply_decision, expected as i32);
+            assert_eq!(response.effective_policy, Some(wire_policy(Egress::Deny)));
+            assert_eq!(response.effective_generation, 7);
+        } else {
+            assert_eq!(
+                response.unwrap_err().code(),
+                tonic::Code::FailedPrecondition
+            );
+            let db = service.db_conn().unwrap();
+            let row = crate::db::get_sandbox(&db, &id).unwrap().unwrap();
+            assert_eq!(
+                row.network_policy_override,
+                Some(NetworkPolicyV1::allow_all())
+            );
+            assert_eq!(row.network_policy_generation, 7);
+        }
+    }
+    drain_service_tasks(&service).await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn set_network_policy_reports_the_committed_decision_and_effective_policy() {
     use pplx_space_net_common::proto::NetworkPolicyApplyDecision::{Apply, Skip};

@@ -3,6 +3,13 @@
 
 use super::*;
 
+pub(super) fn allows_seed_divergence_repair(
+    principal: UdsPeerPrincipal,
+    requested_generation: u64,
+) -> bool {
+    principal == UdsPeerPrincipal::Service(user_names::SPACE_NODECTL) && requested_generation != 0
+}
+
 impl SandboxManagerService {
     pub(in crate::service) async fn get_network_policy(
         &self,
@@ -124,8 +131,14 @@ impl SandboxManagerService {
                     policy_override.as_ref(),
                     desired_generation,
                     requested_authority,
-                    Self::sandbox_has_live_net_gateway(&sandbox),
-                    publish_node_state,
+                    crate::db::NetworkPolicyOverrideUpdateOptions {
+                        enqueue_live_gateway: Self::sandbox_has_live_net_gateway(&sandbox),
+                        mark_dirty: publish_node_state,
+                        allow_seed_divergence_repair: allows_seed_divergence_repair(
+                            peer.principal(),
+                            req.policy_generation,
+                        ),
+                    },
                 )
             }
             .map_err(|e| Status::internal(format!("db network_policy update failed: {e}")))?
@@ -147,6 +160,17 @@ impl SandboxManagerService {
         match outcome.decision {
             crate::db::NetworkPolicyOverrideUpdate::Apply => {
                 pplx_space_metrics::reconcile::apply_applied(FACET_NETWORK_POLICY, "apply");
+            }
+            crate::db::NetworkPolicyOverrideUpdate::RepairDivergence => {
+                pplx_space_metrics::reconcile::apply_applied(
+                    FACET_NETWORK_POLICY,
+                    "network_policy_seed_divergence",
+                );
+                tracing::warn!(
+                    sandbox_id = %sandbox.id,
+                    generation = desired_generation,
+                    "network_policy_seed_divergence"
+                );
             }
             crate::db::NetworkPolicyOverrideUpdate::Repair => {
                 pplx_space_metrics::reconcile::apply_applied(FACET_NETWORK_POLICY, "repair");
@@ -229,6 +253,9 @@ impl SandboxManagerService {
         let decision = match outcome.decision {
             crate::db::NetworkPolicyOverrideUpdate::Apply => "apply",
             crate::db::NetworkPolicyOverrideUpdate::Repair => "repair",
+            crate::db::NetworkPolicyOverrideUpdate::RepairDivergence => {
+                "network_policy_seed_divergence"
+            }
             crate::db::NetworkPolicyOverrideUpdate::Skip => "skip",
             crate::db::NetworkPolicyOverrideUpdate::Conflict => "conflict",
         };
@@ -268,7 +295,10 @@ impl SandboxManagerService {
             applied_generation: response_sandbox.applied_network_policy_generation,
             applied_source: response_sandbox.applied_network_policy_source.as_proto(),
             apply_decision: apply_decision_to_proto(match outcome.decision {
-                crate::db::NetworkPolicyOverrideUpdate::Apply => ApplyDecisionKind::Apply,
+                crate::db::NetworkPolicyOverrideUpdate::Apply
+                | crate::db::NetworkPolicyOverrideUpdate::RepairDivergence => {
+                    ApplyDecisionKind::Apply
+                }
                 crate::db::NetworkPolicyOverrideUpdate::Repair => ApplyDecisionKind::Repair,
                 crate::db::NetworkPolicyOverrideUpdate::Skip => ApplyDecisionKind::Skip,
                 crate::db::NetworkPolicyOverrideUpdate::Conflict => ApplyDecisionKind::Conflict,

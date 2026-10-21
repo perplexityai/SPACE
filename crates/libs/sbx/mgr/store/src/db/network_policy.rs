@@ -88,14 +88,22 @@ pub fn set_network_policy_fields(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NetworkPolicyOverrideUpdateOptions {
+    pub enqueue_live_gateway: bool,
+    pub mark_dirty: bool,
+    /// Only an authenticated node-ctl push with an explicit generation may
+    /// replace a divergent seed in the cluster-owned generation lineage.
+    pub allow_seed_divergence_repair: bool,
+}
+
 pub fn update_network_policy_override(
     conn: &Connection,
     id: &str,
     network_policy_override: Option<&NetworkPolicy>,
     network_policy_generation: u64,
     authority: PolicyAuthority,
-    enqueue_live_gateway: bool,
-    mark_dirty: bool,
+    options: NetworkPolicyOverrideUpdateOptions,
 ) -> Result<NetworkPolicyOverrideUpdateOutcome> {
     let network_policy_override_json = network_policy_override
         .map(serde_json::to_string)
@@ -130,11 +138,13 @@ pub fn update_network_policy_override(
             generation,
             authority,
         },
+        options.allow_seed_divergence_repair,
     );
     let decision = match plan {
         NetworkPolicyOverrideUpdatePlan::Apply {
             generation,
             authority,
+            repair_divergence,
         } => {
             tx.execute(
                 "UPDATE sandboxes
@@ -151,16 +161,20 @@ pub fn update_network_policy_override(
                     id
                 ],
             )?;
-            if enqueue_live_gateway {
+            if options.enqueue_live_gateway {
                 queued_live_gateway = has_live_network_policy_gateway(&tx, id)?;
             }
-            if mark_dirty {
+            if options.mark_dirty {
                 queued_dirty_ref = enqueue_node_dirty_network_policy_sandbox_tx(&tx, id)?;
             }
-            NetworkPolicyOverrideUpdate::Apply
+            if repair_divergence {
+                NetworkPolicyOverrideUpdate::RepairDivergence
+            } else {
+                NetworkPolicyOverrideUpdate::Apply
+            }
         }
         NetworkPolicyOverrideUpdatePlan::RepairIfLiveGateway => {
-            if enqueue_live_gateway {
+            if options.enqueue_live_gateway {
                 queued_live_gateway = has_live_network_policy_gateway(&tx, id)?;
             }
             if queued_live_gateway {
@@ -234,6 +248,7 @@ pub enum NetworkPolicyOverrideUpdate {
     Skip,
     Apply,
     Repair,
+    RepairDivergence,
     Conflict,
 }
 
@@ -268,12 +283,14 @@ pub(super) enum NetworkPolicyOverrideUpdatePlan {
     Apply {
         generation: i64,
         authority: PolicyAuthority,
+        repair_divergence: bool,
     },
 }
 
 pub(super) fn decide_network_policy_override_update(
     existing: NetworkPolicyOverrideExisting<'_>,
     requested: NetworkPolicyOverrideRequested<'_>,
+    _allow_seed_divergence_repair: bool,
 ) -> NetworkPolicyOverrideUpdatePlan {
     if requested.authority == PolicyAuthority::Cluster
         && existing.authority == PolicyAuthority::Local
@@ -288,6 +305,7 @@ pub(super) fn decide_network_policy_override_update(
         return NetworkPolicyOverrideUpdatePlan::Apply {
             generation: 0,
             authority: PolicyAuthority::Local,
+            repair_divergence: false,
         };
     }
 
@@ -304,6 +322,7 @@ pub(super) fn decide_network_policy_override_update(
         NetworkPolicyOverrideUpdatePlan::Apply {
             generation: requested.generation,
             authority: requested.authority,
+            repair_divergence: false,
         }
     }
 }

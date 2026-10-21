@@ -2956,8 +2956,7 @@ fn network_policy_override_round_trips_and_can_clear() {
         None,
         2,
         PolicyAuthority::Cluster,
-        false,
-        false,
+        Default::default(),
     )
     .unwrap();
     assert_eq!(outcome.decision, NetworkPolicyOverrideUpdate::Apply);
@@ -2985,8 +2984,7 @@ fn network_policy_generations_are_monotonic_and_applied_is_separate() {
         None,
         1,
         PolicyAuthority::Cluster,
-        false,
-        false,
+        Default::default(),
     )
     .unwrap();
     assert_eq!(outcome.decision, NetworkPolicyOverrideUpdate::Conflict);
@@ -3003,8 +3001,7 @@ fn network_policy_generations_are_monotonic_and_applied_is_separate() {
         None,
         2,
         PolicyAuthority::Cluster,
-        false,
-        false,
+        Default::default(),
     )
     .unwrap();
     assert_eq!(outcome.decision, NetworkPolicyOverrideUpdate::Apply);
@@ -3018,8 +3015,7 @@ fn network_policy_generations_are_monotonic_and_applied_is_separate() {
         Some(&NetworkPolicyV1::allow_all()),
         2,
         PolicyAuthority::Cluster,
-        false,
-        false,
+        Default::default(),
     )
     .unwrap();
     assert_eq!(outcome.decision, NetworkPolicyOverrideUpdate::Conflict);
@@ -3033,8 +3029,7 @@ fn network_policy_generations_are_monotonic_and_applied_is_separate() {
         Some(&NetworkPolicyV1::allow_all()),
         3,
         PolicyAuthority::Cluster,
-        false,
-        false,
+        Default::default(),
     )
     .unwrap();
     assert_eq!(outcome.decision, NetworkPolicyOverrideUpdate::Apply);
@@ -3051,8 +3046,7 @@ fn network_policy_generations_are_monotonic_and_applied_is_separate() {
         Some(&NetworkPolicyV1::deny_all()),
         3,
         PolicyAuthority::Cluster,
-        false,
-        false,
+        Default::default(),
     )
     .unwrap();
     assert_eq!(outcome.decision, NetworkPolicyOverrideUpdate::Conflict);
@@ -3063,8 +3057,7 @@ fn network_policy_generations_are_monotonic_and_applied_is_separate() {
         None,
         4,
         PolicyAuthority::Cluster,
-        false,
-        false,
+        Default::default(),
     )
     .unwrap();
     assert_eq!(outcome.decision, NetworkPolicyOverrideUpdate::Apply);
@@ -3110,8 +3103,7 @@ fn network_policy_source_changes_cannot_roll_back_generation() {
         None,
         4,
         PolicyAuthority::Cluster,
-        false,
-        false,
+        Default::default(),
     )
     .unwrap();
     assert_eq!(outcome.decision, NetworkPolicyOverrideUpdate::Skip);
@@ -3128,8 +3120,7 @@ fn network_policy_source_changes_cannot_roll_back_generation() {
         None,
         5,
         PolicyAuthority::Cluster,
-        false,
-        false,
+        Default::default(),
     )
     .unwrap();
     assert_eq!(outcome.decision, NetworkPolicyOverrideUpdate::Conflict);
@@ -3146,8 +3137,7 @@ fn network_policy_source_changes_cannot_roll_back_generation() {
         None,
         6,
         PolicyAuthority::Cluster,
-        false,
-        false,
+        Default::default(),
     )
     .unwrap();
     assert_eq!(outcome.decision, NetworkPolicyOverrideUpdate::Apply);
@@ -3161,8 +3151,7 @@ fn network_policy_source_changes_cannot_roll_back_generation() {
         Some(&NetworkPolicyV1::deny_all()),
         5,
         PolicyAuthority::Cluster,
-        false,
-        false,
+        Default::default(),
     )
     .unwrap();
     assert_eq!(outcome.decision, NetworkPolicyOverrideUpdate::Skip);
@@ -3176,8 +3165,7 @@ fn network_policy_source_changes_cannot_roll_back_generation() {
         Some(&NetworkPolicyV1::deny_all()),
         6,
         PolicyAuthority::Cluster,
-        false,
-        false,
+        Default::default(),
     )
     .unwrap();
     assert_eq!(outcome.decision, NetworkPolicyOverrideUpdate::Conflict);
@@ -3191,8 +3179,7 @@ fn network_policy_source_changes_cannot_roll_back_generation() {
         Some(&NetworkPolicyV1::deny_all()),
         7,
         PolicyAuthority::Cluster,
-        false,
-        false,
+        Default::default(),
     )
     .unwrap();
 
@@ -3228,6 +3215,7 @@ fn network_policy_override_update_decision_covers_authority_generation_and_body(
                 generation: 5,
                 authority: PolicyAuthority::Cluster,
             },
+            false,
         ),
         Skip,
         "cluster updates must not overwrite a local policy"
@@ -3240,6 +3228,7 @@ fn network_policy_override_update_decision_covers_authority_generation_and_body(
                 generation: 0,
                 authority: PolicyAuthority::Local,
             },
+            false,
         ),
         RepairIfLiveGateway,
         "idempotent local updates only repair live gateway state"
@@ -3252,10 +3241,12 @@ fn network_policy_override_update_decision_covers_authority_generation_and_body(
                 generation: 0,
                 authority: PolicyAuthority::Local,
             },
+            false,
         ),
         Apply {
             generation: 0,
             authority: PolicyAuthority::Local,
+            repair_divergence: false,
         },
         "local updates intentionally replace cluster state without a cluster generation"
     );
@@ -3267,6 +3258,7 @@ fn network_policy_override_update_decision_covers_authority_generation_and_body(
                 generation: 3,
                 authority: PolicyAuthority::Cluster,
             },
+            false,
         ),
         Skip,
         "stale cluster generations are ignored"
@@ -3279,6 +3271,7 @@ fn network_policy_override_update_decision_covers_authority_generation_and_body(
                 generation: 4,
                 authority: PolicyAuthority::Cluster,
             },
+            false,
         ),
         Conflict,
         "same-generation cluster writes with different content conflict"
@@ -3291,6 +3284,7 @@ fn network_policy_override_update_decision_covers_authority_generation_and_body(
                 generation: 4,
                 authority: PolicyAuthority::Cluster,
             },
+            false,
         ),
         RepairIfLiveGateway,
         "same-generation cluster writes with identical content are idempotent"
@@ -3303,10 +3297,12 @@ fn network_policy_override_update_decision_covers_authority_generation_and_body(
                 generation: 5,
                 authority: PolicyAuthority::Cluster,
             },
+            false,
         ),
         Apply {
             generation: 5,
             authority: PolicyAuthority::Cluster,
+            repair_divergence: false,
         },
         "newer cluster generations apply"
     );
@@ -3666,8 +3662,7 @@ fn broken_network_policy_override_can_be_healed_by_bumping_generation() {
         Some(&NetworkPolicyV1::deny_all()),
         row.network_policy_generation.saturating_add(1).max(1),
         PolicyAuthority::Cluster,
-        false,
-        false,
+        Default::default(),
     )
     .unwrap();
     assert_eq!(outcome.decision, NetworkPolicyOverrideUpdate::Apply);
