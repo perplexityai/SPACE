@@ -856,6 +856,11 @@ class TemplateBuildControl(Protocol):
         `window_seconds` without one, the failure text."""
         ...
 
+    def build_sandbox_started(self, node_name: str) -> bool:
+        """Whether the builder still runs the build's own sandbox: the `builder@local`
+        sandbox holding the committed prepared rootfs, listed `starting` or `started`."""
+        ...
+
     def published_guest_metadata(self, node_name: str, alias: str) -> GuestMetadata: ...
 
     def containerd_residue(self, node_name: str, image: str) -> list[str]:
@@ -1233,6 +1238,10 @@ class ClusterRetentionControl(Protocol):
     """
 
     def retention_sweeper_config(self) -> RetentionSweeperConfig: ...
+
+    def running_retention_sweeper_config(self) -> RetentionSweeperConfig | None:
+        """The knobs the running controller pods started with; `None` unless they all agree."""
+        ...
 
     def acquire_retention_sweeper_mutation(self) -> Callable[[], None]:
         """Acquire exclusive ownership of shared controller sweeper settings.

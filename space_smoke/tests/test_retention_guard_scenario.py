@@ -727,6 +727,8 @@ class _StubControl:
         self.standing_reads = 0
         self.lock_acquisitions = 0
         self.lock_releases = 0
+        self.failing_restores = 0
+        self.events: list[str] = []
 
     def retention_sweeper_config(self) -> RetentionSweeperConfig:
         return self._configs.pop(0)
@@ -736,6 +738,7 @@ class _StubControl:
 
         def release() -> None:
             self.lock_releases += 1
+            self.events.append("unlock")
 
         return release
 
@@ -747,6 +750,11 @@ class _StubControl:
         self.applied.append(dict(overrides))
 
     def restore_retention_sweeper_env(self, standing: Any) -> None:
+        if self.failing_restores:
+            self.failing_restores -= 1
+            self.events.append("restore failed")
+            raise RuntimeError("rollout did not finish")
+        self.events.append("restore")
         self.applied.append(dict(standing))
 
 
@@ -876,6 +884,25 @@ class EnsureLiveSweeper(unittest.TestCase):
         retention.restore_standing_sweeper()
         self.assertEqual(scope.close(), ())
         self.assertEqual(control.applied, [])
+
+    def test_a_failed_restore_keeps_the_lease_until_a_retry_lands(self) -> None:
+        control = _StubControl(
+            configs=[_config(dry_run=True, tick_seconds=300, min_age_seconds=3600), _config()],
+            standing=dict(self.STANDING),
+        )
+        control.failing_restores = 2
+        retention, scope = self._retention(control)
+
+        with self.assertRaisesRegex(RuntimeError, "rollout"), retention.scoped_sweeper_mutation():
+            retention.ensure_live_sweeper()
+            retention.restore_standing_sweeper()
+
+        # The body's restore and the unwind's retry both failed; neither let go
+        # of the Lease, so the scope's retry still runs under it.
+        self.assertEqual(control.events, ["restore failed", "restore failed"])
+        self.assertEqual(scope.close(), ())
+        self.assertEqual(control.events, ["restore failed", "restore failed", "restore", "unlock"])
+        self.assertEqual(control.applied[-1], self.STANDING)
 
     def test_still_restores_when_the_override_does_not_take(self) -> None:
         control = _StubControl(

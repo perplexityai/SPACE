@@ -7,10 +7,9 @@ from space_smoke.capabilities import EcwSandboxInfo, EcwSandboxState
 
 MARKER = "space-smoke-timeout-update-ok"
 INITIAL_TIMEOUT_SECONDS = 10
-EXTENDED_TIMEOUT_SECONDS = 30
-# Set just before the suspend: a restore that kept it instead of the update
-# made while suspended would act on it one short window after the restore.
-PRE_SUSPEND_TIMEOUT_SECONDS = 5
+# The shortest extension that outlasts the first behaviour check: the original
+# deadline waited out by a tick and the margin, with headroom for the check.
+EXTENDED_TIMEOUT_SECONDS = 20
 SUSPENDED_TIMEOUT_SECONDS = 60
 # Connect's extension must be shorter than both policies: otherwise it could
 # conceal failure to persist the suspended timeout update.
@@ -73,7 +72,6 @@ def timeout_update(test: smoke.Ecw) -> None:
         )
 
     with test.phase("update timeout while durably suspended"):
-        test.sandbox.set_timeout(PRE_SUSPEND_TIMEOUT_SECONDS)
         pre_suspend_end_at = _end_at(test, "before suspending")
         test.suspend_durably()
         test.wait_until_paused()
@@ -91,17 +89,19 @@ def timeout_update(test: smoke.Ecw) -> None:
         _expect_end_at_moved(
             test,
             since=pre_suspend_end_at,
-            by=SUSPENDED_TIMEOUT_SECONDS - PRE_SUSPEND_TIMEOUT_SECONDS,
+            by=SUSPENDED_TIMEOUT_SECONDS - EXTENDED_TIMEOUT_SECONDS,
             when="after restoring",
         )
-        # Both the policy before the suspend and connect's own extension end
-        # inside this wait; only the update made while suspended outlasts it.
-        waited = _wait_out(test, restored, PRE_SUSPEND_TIMEOUT_SECONDS)
+        # Every earlier timeout in this scenario, re-armed at the restore, and
+        # connect's own extension end inside this wait; only the update made
+        # while suspended outlasts it.
+        earlier = max(INITIAL_TIMEOUT_SECONDS, EXTENDED_TIMEOUT_SECONDS, RECONNECT_TIMEOUT_SECONDS)
+        waited = _wait_out(test, restored, earlier)
         observed = test.sandbox.try_get_info()
         test.verify(
             observed is not None and observed.state is EcwSandboxState.RUNNING,
             "restored sandbox did not retain its suspended timeout update",
-            previous_timeout_seconds=PRE_SUSPEND_TIMEOUT_SECONDS,
+            previous_timeout_seconds=EXTENDED_TIMEOUT_SECONDS,
             requested_timeout_seconds=SUSPENDED_TIMEOUT_SECONDS,
             waited_seconds=waited,
         )

@@ -162,14 +162,20 @@ def concurrent_restore_converges_to_one_execution(test: smoke.KindEcw) -> None:
         # The join is the no-hang contract: it fails if a caller is still
         # running at the deadline and re-raises if the callers died.
         firing.join(timeout=200)
+        joined = time.monotonic()
         # Nothing re-drives a refused pod POST once its caller is gone (the
         # restore abandons the claim), so a pod that could still run was
-        # admitted before the callers drained. It is Running within one
-        # restore as measured on this runner above, and the watch sees it at
-        # its next poll.
-        window = round(restore_seconds + 2 * pod_watch.interval_seconds, 1)
-        test.record("teardown_no_running_window_seconds", window)
-        running_after_lift = pod_watch.stop_after(seconds=window)
+        # admitted before the callers drained and is listed by now. Keep
+        # watching until every such pod is gone, however long one sat Pending
+        # first, and for at least one restore as measured on this runner above
+        # plus the watch's polls. The verdict below fails on a pod still left.
+        race.wait_for_pods_gone()
+        window = restore_seconds + 2 * pod_watch.interval_seconds
+        watched = round(max(window, time.monotonic() - joined + pod_watch.interval_seconds), 1)
+        test.record("teardown_no_running_window_seconds", watched)
+        running_after_lift = pod_watch.stop_after(
+            seconds=max(pod_watch.interval_seconds, joined + window - time.monotonic())
+        )
         race.expect_torn_down(
             outcomes,
             label="teardown",

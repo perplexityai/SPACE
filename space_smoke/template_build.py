@@ -451,15 +451,19 @@ class TemplateBuildAssertions:
         rerouted_at = time.monotonic()
         self._fixture.record("service_routed_to", other)
         # A build that had already finished leaves no poll for the Service to
-        # misroute, and would pass vacuously. The API asks the accepting
-        # builder on every status read, so `building` here means the build
-        # still had work left once the Service pointed away.
+        # misroute, and would pass vacuously. The public status alone cannot
+        # show it is still running: the API answers `building` when its poll
+        # of the builder fails transiently. The build's own sandbox, still
+        # started on the accepting builder, can.
         status = self._builder.build_status(self.alias, job.build_id)
+        still_running = self._control.build_sandbox_started(accepted)
         self._fixture.record("build_status_after_reroute", status)
+        self._fixture.record("build_sandbox_started_after_reroute", still_running)
         self._fixture.verify(
-            status in ("waiting", "building"),
+            status in ("waiting", "building") and still_running,
             "the build was no longer running when the Service moved off the accepting builder",
             build_status=status,
+            build_sandbox_started=still_running,
             build_id=job.build_id,
             build_delay_seconds=BUILD_DELAY_SECONDS,
         )

@@ -157,6 +157,9 @@ class _Control:
     def prepared_rootfs_handoff(self, node_name, *, window_seconds=60):
         return self.handoff
 
+    def build_sandbox_started(self, node_name):
+        return True
+
     def published_guest_metadata(self, node_name, alias):
         return self.metadata
 

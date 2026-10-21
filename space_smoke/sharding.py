@@ -45,7 +45,7 @@ _DURATION_SECONDS = {
         "ecw.sandbox_info": 4,
         "ecw.sandbox_list_pagination": 10,
         "ecw.timeout_rearm": 41,
-        "ecw.timeout_update": 40,
+        "ecw.timeout_update": 55,
         "ecw.warm_pool_environment": 13,
         "ecw.watcher_identity": 5,
         "local.btrfs_send_restore_fails_closed_without_parent_source": 135,
@@ -83,8 +83,8 @@ _DURATION_SECONDS = {
         # One Kind run: 16 s of phases (8.5 s suspend with the retried upload)
         # plus sandbox cleanup.
         "local.restarted_btrfs_send_is_rejected_and_retried": 30,
-        "local.retention_claim_finish_forward": 50,
-        "local.retention_restore_source_guard": 45,
+        "local.retention_claim_finish_forward": 65,
+        "local.retention_restore_source_guard": 50,
         # Kind bench runs (otel), probes concurrent: 21-23 s.
         "local.sandbox_network_isolation_holds": 21,
         "local.snapshot_reaper_reclaims_backed_fork_snapshot": 147,

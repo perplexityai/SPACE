@@ -76,7 +76,6 @@ from space_smoke.scenarios.ecw_timeout_update import (
     EXTENDED_TIMEOUT_SECONDS,
     INITIAL_TIMEOUT_SECONDS,
     MARKER as TIMEOUT_MARKER,
-    PRE_SUSPEND_TIMEOUT_SECONDS,
     SUSPENDED_TIMEOUT_SECONDS,
     timeout_update,
 )
@@ -424,7 +423,6 @@ class EcwCommandRoundTripTests(unittest.TestCase):
                 "ecw.lifecycle:pause:False",
                 f"sandbox.set-timeout:{EXTENDED_TIMEOUT_SECONDS}",
                 f"sandbox.run:printf %s {TIMEOUT_MARKER}:60",
-                f"sandbox.set-timeout:{PRE_SUSPEND_TIMEOUT_SECONDS}",
                 f"sandbox.set-timeout:{SUSPENDED_TIMEOUT_SECONDS}",
                 f"sandbox.run:printf %s {TIMEOUT_MARKER}:60",
                 "sandbox.kill",

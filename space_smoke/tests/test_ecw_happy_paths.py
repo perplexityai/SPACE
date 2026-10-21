@@ -52,7 +52,6 @@ from space_smoke.scenarios.ecw_timeout_update import (
     EXTENDED_TIMEOUT_SECONDS,
     INITIAL_TIMEOUT_SECONDS,
     MARKER as TIMEOUT_MARKER,
-    PRE_SUSPEND_TIMEOUT_SECONDS,
     RECONNECT_TIMEOUT_SECONDS,
     SCHEDULER_TICK_SECONDS,
     SUSPENDED_TIMEOUT_SECONDS,
@@ -188,12 +187,12 @@ class EcwHappyPathScenarioTests(unittest.TestCase):
 
         self.assertEqual(timeout_update.sandbox.timeout, INITIAL_TIMEOUT_SECONDS)
         # Each wait runs out a deadline plus one scheduler tick and the margin:
-        # the original deadline, then the policy set before the suspend.
+        # the original deadline, then the longest earlier timeout after restore.
         settle = SCHEDULER_TICK_SECONDS + DEADLINE_MARGIN_SECONDS
         waits = [call.args[0] for call in sleep.call_args_list]
         self.assertEqual(len(waits), 2)
         self.assertAlmostEqual(waits[0], INITIAL_TIMEOUT_SECONDS + settle, delta=1)
-        self.assertAlmostEqual(waits[1], PRE_SUSPEND_TIMEOUT_SECONDS + settle, delta=1)
+        self.assertAlmostEqual(waits[1], EXTENDED_TIMEOUT_SECONDS + settle, delta=1)
         self.assertEqual(
             sandbox.trace,
             [
@@ -202,7 +201,6 @@ class EcwHappyPathScenarioTests(unittest.TestCase):
                 "get_info",
                 "get_info",
                 f"run:printf %s {TIMEOUT_MARKER}:60",
-                f"set_timeout:{PRE_SUSPEND_TIMEOUT_SECONDS}",
                 "get_info",
                 "pause",
                 "try_get_info",

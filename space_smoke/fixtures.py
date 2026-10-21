@@ -1222,11 +1222,6 @@ class CommandSandboxFixture:
             self.record("local_cleanup_observer", "unavailable outside Kind")
             return
         sandbox_id = self.sandbox.sandbox_id.removeprefix("sbx_")
-        # The caller saw the stop land, so the node row last moved before now.
-        # node-ctl evicts a cluster-deleted sandbox on its periodic sync; one
-        # that lands inside sandbox-manager's quiescence window is refused and
-        # deferred past the following poll. Deleting once the window has passed
-        # lets the first sync after the delete reclaim the rootfs.
         quiescence = control.cluster_deleted_quiescence_seconds(worker)
         self.verify(
             quiescence <= LOCAL_CLEANUP_MAX_QUIESCENCE_SECONDS,
@@ -1235,7 +1230,6 @@ class CommandSandboxFixture:
             worker=worker,
             quiescence_seconds=quiescence,
         )
-        quiescent_at = time.monotonic() + quiescence + LOCAL_CLEANUP_QUIESCENCE_MARGIN_SECONDS
         deadline = time.monotonic() + 90
         while True:
             pods = control.sandbox_pods(sandbox_id)
@@ -1251,8 +1245,13 @@ class CommandSandboxFixture:
             control.sandbox_cache_dir_present(worker, sandbox_id),
             "STOP lost the retained rootfs before DELETE",
         )
-        if (remaining := quiescent_at - time.monotonic()) > 0:
-            self._context.wait(remaining)
+        # The stop and its task's release have landed, so the node row last
+        # moved before now. node-ctl evicts a cluster-deleted sandbox on its
+        # periodic sync; one that lands inside sandbox-manager's quiescence
+        # window is refused and deferred past the following poll. Deleting once
+        # the window has passed lets the first sync after the delete reclaim
+        # the rootfs.
+        self._context.wait(quiescence + LOCAL_CLEANUP_QUIESCENCE_MARGIN_SECONDS)
         since_time = _log_since_time()
         self.delete_sandbox()
         self.wait_until_deleted()
@@ -2216,7 +2215,9 @@ class Ecw(CommandSandboxFixture):
 # grace. Applied by `stage_smoke_sweeper` and reverted while the scenario body
 # unwinds — never baked into the kind chart, whose standing grace must outlast
 # the API's fork restore-activation lease. Keeping one lets a scenario build
-# its keep-N-plus-two history in three suspends. The grace does not protect
+# its keep-N-plus-two history in three suspends; a scenario that asserts the
+# keep-N floor itself stages a larger one, since with one the only survivor is
+# the restore source, which its own guard protects. The grace does not protect
 # that history while it is built: the scenarios hold the sweeper off by other
 # means (disabled, or a standing grace that outlasts the scenario). It stays
 # nonzero, since zero disables the age filter a real prune passes through.
@@ -2298,6 +2299,7 @@ class RetentionAssertions:
         *,
         enabled: bool = True,
         dry_run: bool,
+        keep_n: int = SMOKE_SWEEPER_KEEP_N,
         max_tick_seconds: int = 30,
         min_grace_seconds: int = 1,
         max_grace_seconds: int = 300,
@@ -2315,7 +2317,7 @@ class RetentionAssertions:
             return (
                 config.enabled == enabled
                 and config.dry_run == dry_run
-                and config.keep_n == SMOKE_SWEEPER_KEEP_N
+                and config.keep_n == keep_n
                 and config.tick_seconds <= max_tick_seconds
                 and min_grace_seconds <= config.min_age_seconds <= max_grace_seconds
             )
@@ -2337,6 +2339,7 @@ class RetentionAssertions:
         overrides["SPACE_SNAPSHOT_RETENTION_SWEEPER_DRY_RUN"] = (
             "true" if dry_run else "false"
         )
+        overrides["SPACE_SNAPSHOT_RETENTION_SWEEPER_KEEP_N"] = str(keep_n)
         self._control.set_retention_sweeper_env(overrides)
         config = self._control.retention_sweeper_config()
         if not in_bounds(config):
@@ -2345,7 +2348,7 @@ class RetentionAssertions:
                 f"knobs after the scoped override: enabled={config.enabled} "
                 f"(wanted {enabled}) "
                 f"dry_run={config.dry_run} (wanted {dry_run}) "
-                f"keep_n={config.keep_n} (wanted {SMOKE_SWEEPER_KEEP_N}) "
+                f"keep_n={config.keep_n} (wanted {keep_n}) "
                 f"tick={config.tick_seconds}s grace={config.min_age_seconds}s"
             )
         return config
@@ -2354,19 +2357,24 @@ class RetentionAssertions:
         """Whether the running sweeper can prune none of this scenario's snapshots.
 
         Takes the mutation Lease first, so the configuration read here stays
-        the running one until the scenario stages its own. A disabled or
-        dry-run sweeper creates no claims; a live one claims only rows older
-        than its grace, and every snapshot a scenario creates is younger than
-        the scenario's own budget, `for_seconds`. A zero grace disables the
-        age filter and is never inert.
+        the running one until the scenario stages its own. It is what the
+        running controller pods started with, and is unknown, so not inert,
+        while they disagree. A disabled or dry-run sweeper creates no claims;
+        a live one claims only rows older than its grace, and every snapshot a
+        scenario creates is younger than the scenario's own budget,
+        `for_seconds`. A zero grace disables the age filter and is never inert.
         """
 
         self._hold_mutation_lock()
-        config = self._control.retention_sweeper_config()
-        inert = not config.enabled or config.dry_run or config.min_age_seconds > for_seconds
+        config = self._control.running_retention_sweeper_config()
+        inert = config is not None and (
+            not config.enabled or config.dry_run or config.min_age_seconds > for_seconds
+        )
         self._fixture.record(
             "standing_sweeper",
-            {
+            None
+            if config is None
+            else {
                 "enabled": config.enabled,
                 "dry_run": config.dry_run,
                 "min_age_seconds": config.min_age_seconds,
@@ -2393,10 +2401,11 @@ class RetentionAssertions:
         sweeper already smoke-sized and overrode nothing.
         """
 
+        # The handle is dropped only once the restore took: a failed restore
+        # stays armed for the next attempt, and the Lease stays held for it.
         if self._restore is not None:
-            restore = self._restore
+            self._restore.release()
             self._restore = None
-            restore.release()
         if self._mutation_lock is not None:
             mutation_lock = self._mutation_lock
             self._mutation_lock = None

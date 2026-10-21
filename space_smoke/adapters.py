@@ -904,6 +904,65 @@ _LIMITER_ENV_VALUE = re.compile(r"[A-Za-z0-9._:/@-]{1,64}")
 _UNSIGNED_INTEGER = re.compile(r"\+?[0-9]+")
 
 
+def _env_flag_default(value: str | None, default: bool) -> bool:
+    """Match `env_flag`, the wider boolean vocabulary some controller knobs use."""
+
+    normalized = (value or "").strip().lower()
+    if value is not None and normalized in {"1", "true", "yes", "on", "enabled"}:
+        return True
+    if value is not None and normalized in {"0", "false", "no", "off", "disabled"}:
+        return False
+    return default
+
+
+def _literal_retention_env(entries: list[Any], source: str) -> dict[str, str]:
+    env: dict[str, str] = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
+            continue
+        name = entry["name"]
+        value = entry.get("value")
+        if name in RETENTION_SWEEPER_ENV_KEYS and (
+            "valueFrom" in entry or not isinstance(value, str) or not value
+        ):
+            raise SmokeConfigurationError(
+                f"cannot safely read nonliteral or empty {source} env {name}"
+            )
+        if isinstance(value, str):
+            env[name] = value
+    return env
+
+
+def _retention_sweeper_config(env: Mapping[str, str]) -> RetentionSweeperConfig:
+    """Parse as `ReconcilerConfig::from_environment` does, knob by knob."""
+
+    min_age = env.get("SPACE_SNAPSHOT_RETENTION_SWEEPER_MIN_AGE_SECS")
+    return RetentionSweeperConfig(
+        enabled=_truthy_default(env.get("SPACE_SNAPSHOT_RETENTION_SWEEPER_ENABLED"), False),
+        # A test hook read through `env_flag`; unset is live.
+        dry_run=_env_flag_default(env.get("SPACE_SNAPSHOT_RETENTION_SWEEPER_DRY_RUN"), False),
+        keep_n=_unsigned_default(
+            env.get("SPACE_SNAPSHOT_RETENTION_SWEEPER_KEEP_N"),
+            3,
+            maximum=(1 << 32) - 1,
+            allow_zero=False,
+        ),
+        tick_seconds=_unsigned_default(
+            env.get("SPACE_SNAPSHOT_RETENTION_SWEEPER_TICK_SECS"),
+            300,
+            maximum=(1 << 64) - 1,
+            allow_zero=False,
+        ),
+        # `snapshot_sweeper_grace_seconds` trims; zero disables the grace.
+        min_age_seconds=_unsigned_default(
+            min_age.strip() if min_age is not None else None,
+            3600,
+            maximum=(1 << 64) - 1,
+            allow_zero=True,
+        ),
+    )
+
+
 def _unsigned_default(
     raw: str | None,
     default: int,
@@ -1278,22 +1337,25 @@ class KindHarness:
             "jsonpath={.items[0].spec.template.spec.containers[0].env}",
         )
         _require_ok(result, "read cluster-controller deployment env")
-        entries = json.loads(result.stdout or "[]")
-        env: dict[str, str] = {}
-        for entry in entries:
-            if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
-                continue
-            name = entry["name"]
-            value = entry.get("value")
-            if name in RETENTION_SWEEPER_ENV_KEYS and (
-                "valueFrom" in entry or not isinstance(value, str) or not value
+        return _literal_retention_env(json.loads(result.stdout or "[]"), "deployment")
+
+    def _running_controller_envs(self) -> list[dict[str, str]]:
+        """The literal env of every running, not-terminating controller pod."""
+
+        result = self.kubectl(
+            "get", "pods", "-l", KIND_CONTROLLER_SELECTOR, "-o", "json", timeout=15
+        )
+        _require_ok(result, "read cluster-controller pods")
+        envs = []
+        for pod in json.loads(result.stdout or "{}").get("items", []):
+            metadata = pod.get("metadata") or {}
+            if (pod.get("status") or {}).get("phase") != "Running" or metadata.get(
+                "deletionTimestamp"
             ):
-                raise SmokeConfigurationError(
-                    f"cannot safely read nonliteral or empty deployment env {name}"
-                )
-            if isinstance(value, str):
-                env[name] = value
-        return env
+                continue
+            containers = (pod.get("spec") or {}).get("containers") or [{}]
+            envs.append(_literal_retention_env(containers[0].get("env") or [], "pod"))
+        return envs
 
     def _controller_deployment(self) -> str:
         result = self.kubectl(
@@ -1322,34 +1384,11 @@ class KindHarness:
         return name
 
     def retention_sweeper_config(self) -> RetentionSweeperConfig:
-        env = self._controller_env()
-        return RetentionSweeperConfig(
-            enabled=_truthy_default(
-                env.get("SPACE_SNAPSHOT_RETENTION_SWEEPER_ENABLED"), False
-            ),
-            # `ReconcilerConfig::from_environment` defaults an unset dry-run to live.
-            dry_run=_truthy_default(
-                env.get("SPACE_SNAPSHOT_RETENTION_SWEEPER_DRY_RUN"), False
-            ),
-            keep_n=_unsigned_default(
-                env.get("SPACE_SNAPSHOT_RETENTION_SWEEPER_KEEP_N"),
-                3,
-                maximum=(1 << 32) - 1,
-                allow_zero=False,
-            ),
-            tick_seconds=_unsigned_default(
-                env.get("SPACE_SNAPSHOT_RETENTION_SWEEPER_TICK_SECS"),
-                300,
-                maximum=(1 << 64) - 1,
-                allow_zero=False,
-            ),
-            min_age_seconds=_unsigned_default(
-                env.get("SPACE_SNAPSHOT_RETENTION_SWEEPER_MIN_AGE_SECS"),
-                3600,
-                maximum=(1 << 64) - 1,
-                allow_zero=True,
-            ),
-        )
+        return _retention_sweeper_config(self._controller_env())
+
+    def running_retention_sweeper_config(self) -> RetentionSweeperConfig | None:
+        configs = {_retention_sweeper_config(env) for env in self._running_controller_envs()}
+        return configs.pop() if len(configs) == 1 else None
 
     # ----- Cluster-visible mutation Leases --------------------------------------
     #
@@ -4248,6 +4287,15 @@ ON CONFLICT (key_hash) DO NOTHING;
         result = self._node_shell_exec(node_name, script, timeout=window_seconds + 60)
         return None if result.returncode == 0 else (result.detail() or f"exit {result.returncode}")
 
+    def build_sandbox_started(self, node_name: str) -> bool:
+        result = self._node_shell_exec(node_name, _BUILD_SANDBOX_STARTED_SCRIPT, timeout=60)
+        if result.returncode not in (0, 1):
+            raise RuntimeError(
+                f"could not list the build sandbox on {node_name} ({result.returncode}): "
+                f"{result.detail() or '<no output>'}"
+            )
+        return result.returncode == 0
+
     def published_guest_metadata(self, node_name: str, alias: str) -> GuestMetadata:
         template_dir = shlex.quote(f"{TEMPLATE_CACHE_ROOT}/{_template_alias(alias)}")
         result = self._node_shell_exec(
@@ -6274,6 +6322,23 @@ while [ "$(date +%s)" -le "$deadline" ]; do
   sleep 0.2
 done
 echo "committed prepared rootfs was not observed on the accepting builder" >&2
+exit 1
+"""
+
+# Exits 0 while the builder@local sandbox holding a committed prepared rootfs is
+# listed `starting` or `started` (the build's RUN steps run in it), 1 when
+# there is none. The list's cells are separated by `┆`.
+_BUILD_SANDBOX_STARTED_SCRIPT = r"""set -eu
+sandboxes="$(/space/bin/space-sbxmgr list)"
+for marker in /space/cache/firecracker/sandboxes/*/instance/.space-prepared-rootfs-ready; do
+  [ -f "$marker" ] || continue
+  sandbox_dir="${marker%/instance/.space-prepared-rootfs-ready}"
+  short_id="$(printf '%s' "${sandbox_dir##*/}" | cut -c 29-36)"
+  if printf '%s\n' "$sandboxes" | grep -F "$short_id" | grep -F 'builder@local' \
+      | grep -Eq '┆ *(starting|started) *┆'; then
+    exit 0
+  fi
+done
 exit 1
 """
 
