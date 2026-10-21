@@ -7,3 +7,8 @@ output "ready" {
   # avoids making them depend on every unrelated controller in this module.
   depends_on = [helm_release.external_secrets_operator]
 }
+
+output "cluster_autoscaler_discovery_tag_key" {
+  description = "The ASG tag key cluster-autoscaler discovers its node groups by. An ASG that carries it is one cluster-autoscaler may still scale."
+  value       = local.cluster_autoscaler_discovery_tag_key
+}

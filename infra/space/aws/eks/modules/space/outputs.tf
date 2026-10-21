@@ -101,15 +101,15 @@ output "general_serving_node_group" {
 
   precondition {
     # Existing single-pool environments retain their positive-capacity gate.
-    # Blue/green configurations additionally enforce the operator-recorded
-    # floor on the serving pool. The sizes are the live ones: Terraform
-    # ignores them after creation, so the plan carries what EKS reports.
-    condition = local.serving_general_node_group.scaling_config[0].min_size >= (
-      var.general_blue_green_node_group == null ? 1 :
-      var.general_serving_node_group == "general" ? var.general_min_size :
-      var.general_blue_green_node_group.recorded_active_size
-    )
-    error_message = "The recorded general_serving_node_group must be live and, for blue/green configurations, meet its recorded capacity floor."
+    # Blue/green and per-AZ configurations additionally enforce the
+    # operator-recorded floor on every serving group. The sizes are the live
+    # ones: Terraform ignores them after creation, so the plan carries what EKS
+    # reports.
+    condition = alltrue([
+      for name, group in local.serving_general_node_groups :
+      group.scaling_config[0].min_size >= local.serving_general_node_group_floors[name]
+    ])
+    error_message = "The recorded general_serving_node_group must be live and, for blue/green and per-AZ configurations, meet its recorded capacity floor."
   }
 
   precondition {
@@ -117,17 +117,43 @@ output "general_serving_node_group" {
       for name, asg in data.aws_autoscaling_group.retiring_general :
       asg.desired_capacity == 0 && length(data.aws_instances.retiring_general[name].ids) == 0
     ])
-    error_message = "general_node_group_retired deletes the general node group, which still wants or runs instances. Cut over to general-2 in one apply, then scale general to zero through EKS and wait for its nodes to leave, then retire it."
+    error_message = "Removing a general node group (general_node_group_retired, dropping general_blue_green_node_group, or dropping a zone from general_per_az_node_groups) deletes it, and it still wants or runs instances. Drain its nodes, scale it to zero through EKS and wait for its nodes to leave, then remove it."
+  }
+
+  # A group whose ASG still carries the discovery tag is one cluster-autoscaler
+  # may scale until the apply that removes it, and balancing scales the
+  # smallest group up first, so a group parked at plan time can have nodes
+  # again by the apply. The tag is read live, so a plan that moves serving off
+  # the group in the same apply doesn't pass.
+  precondition {
+    condition = alltrue([
+      for asg in data.aws_autoscaling_group.retiring_general :
+      !anytrue([for tag in asg.tag : tag.key == module.controllers.cluster_autoscaler_discovery_tag_key])
+    ])
+    error_message = "Removing a general node group that cluster-autoscaler still discovers (${join(", ", [for name, group in data.aws_eks_node_group.retiring_general : name])} among those being removed) lets it scale the group up again before the apply deletes it. Move general_serving_node_group off the group in an earlier apply, then park it and remove it."
   }
 
   precondition {
-    condition     = alltrue([for clusters in data.aws_eks_clusters.retiring_general : contains(clusters.names, local.name)])
-    error_message = "general_node_group_retired retires a general that exists, and cluster ${local.name} doesn't exist yet. Create it with general, cut over to general-2, park general at zero, then retire it."
+    condition = length(local.general_per_az_replacing) == 0 || (
+      var.general_serving_node_group != "general-per-az" &&
+      alltrue([for group in values(local.general_per_az_replacing) : group.scaling_config[0].desired_size == 0]) &&
+      alltrue([for instances in data.aws_instances.general_per_az_replacing : length(instances.ids) == 0]) &&
+      alltrue([
+        for asg in data.aws_autoscaling_group.general_per_az_replacing :
+        !anytrue([for tag in asg.tag : tag.key == module.controllers.cluster_autoscaler_discovery_tag_key])
+      ])
+    )
+    error_message = "Changing the instance type, capacity type, AMI type or subnet of ${join(", ", keys(local.general_per_az_replacing))} replaces it, and EKS deletes the old group with its nodes before the new one exists. For instance_types, serve from general or general-2 in an earlier apply, so cluster-autoscaler no longer discovers these groups, then drain them and scale them to zero through EKS, then change it. general_capacity_type also sets general's and general-2's capacity type and replaces them too, so it has no safe path while any general group serves."
+  }
+
+  precondition {
+    condition     = !var.general_node_group_retired || alltrue([for clusters in data.aws_eks_clusters.retiring_general : contains(clusters.names, local.name)])
+    error_message = "general_node_group_retired retires a general that exists, and cluster ${local.name} doesn't exist yet. Create it with general, cut over to general-2 or the per-AZ groups, park general at zero, then retire it."
   }
 }
 
 output "general_serving_min_size" {
-  description = "Larger live floor of the declared general pools. Either may carry the active workload, so a root-owned DaemonSet that must roll on the general pool gates on this while the inactive pool stays at zero; referencing it also orders the consumer after a floor update."
+  description = "Largest live floor of the declared general groups. Any of them may carry the active workload, so a root-owned DaemonSet that must roll on the general pool gates on this while the inactive pools stay at zero; referencing it also orders the consumer after a floor update."
   value       = max([for group in values(local.general_node_groups) : group.scaling_config[0].min_size]...)
 }
 

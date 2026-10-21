@@ -316,7 +316,8 @@ locals {
       # An ownership-tag policy can require Team on EBS root volumes; common_tags
       # already supplies the calling root's other ownership tags.
       volume_tags = { Team = "team-space" }
-      # general-2 runs on a retired general's launch template and node role.
+      # general-2 and the per-AZ groups run on a retired general's launch
+      # template and node role.
       launch_template_and_role_only = name == "general" && var.general_node_group_retired
     }
   }

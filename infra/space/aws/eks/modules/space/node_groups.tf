@@ -293,22 +293,146 @@ resource "aws_eks_node_group" "general_blue_green" {
   }
 }
 
-# general_node_group_retired deletes the general MNG together with any node it
-# still runs, so the general_serving_node_group output refuses the plan until
-# general is parked: its ASG wants no instances and none are left. Each lookup
-# below runs only if the one before it found its target, and lists rather than
-# reads, so none fails on a missing cluster or node group. Once retirement has
-# landed, general isn't among the cluster's node groups and the check passes.
-# The cluster name is read from local.name rather than module.eks so that the
+# One general pool per availability zone, each in that zone's private subnet
+# only. A multi-AZ ASG rebalances once a scale-down leaves its zones uneven:
+# AZRebalance launches in the short zone and terminates elsewhere, and EKS
+# drains that termination without honoring PodDisruptionBudgets and kills the
+# node after 15 minutes. A single-zone ASG has nothing to rebalance. Like
+# general-2, each group runs on general's launch template, role, labels and
+# taints, so cluster-autoscaler sees the groups as similar and can balance
+# scale-ups across them, and general workloads move without a Helm change.
+#
+# Moving a cluster onto them takes three applies, each with nothing else in it:
+# 1. Declare general_per_az_node_groups. The groups come up at their floors
+#    beside the serving group, which keeps serving. A serving general's live
+#    min_size now has to hold general_min_size, as it does beside general-2.
+# 2. Set general_serving_node_group = "general-per-az". The discovery tags move,
+#    so cluster-autoscaler stops scaling the old group and balances the new
+#    ones. Then cordon the old group's nodes and drain them through the
+#    eviction API, which honors PodDisruptionBudgets and each pod's grace
+#    period; the evicted pods land on the per-AZ groups, which
+#    cluster-autoscaler grows as they go Pending (without it, grow them through
+#    EKS first). Only then scale the old group
+#    to zero through EKS. A smaller desired size doesn't honor the budgets, and
+#    EKS terminates a node 15 minutes into its drain, so it must find the nodes
+#    empty.
+# 3. Once the old group runs no nodes, remove it: general_node_group_retired
+#    for general, or drop general_blue_green_node_group for general-2. The plan
+#    refuses either while the group still wants or runs an instance. Removing
+#    the ASG also removes any process suspended on it, AZRebalance included; an
+#    old group that's kept instead needs its suspended processes resumed.
+#
+# The plan refuses removing any group cluster-autoscaler still discovers, a
+# zone dropped while the per-AZ groups serve among them: it keeps scaling that
+# group, smallest first, until the apply that removes it. Serve from another
+# group in an earlier apply first.
+locals {
+  # Keyed by node group name, with each group's zone and sizes.
+  general_per_az_node_groups = var.general_per_az_node_groups == null ? {} : {
+    for zone, sizes in var.general_per_az_node_groups.zones : "general-${zone}" => merge(sizes, { zone = zone })
+  }
+  general_per_az_floors = { for name, group in local.general_per_az_node_groups : name => group.min_size }
+}
+
+resource "aws_eks_node_group" "general_per_az" {
+  for_each = local.general_per_az_node_groups
+
+  cluster_name    = module.eks.node_group_cluster_name
+  node_group_name = each.key
+  node_role_arn   = module.eks.node_role_arns["general"]
+  subnet_ids      = [data.aws_subnet.private[each.value.zone].id]
+
+  ami_type       = "AL2023_x86_64_STANDARD"
+  capacity_type  = local.node_pools.general.capacity_type
+  instance_types = var.general_per_az_node_groups.instance_types
+
+  launch_template {
+    id      = module.eks.launch_templates["general"].id
+    version = module.eks.launch_templates["general"].latest_version
+  }
+
+  labels = local.node_pools.general.labels
+
+  scaling_config {
+    desired_size = each.value.min_size
+    max_size     = each.value.max_size
+    min_size     = each.value.min_size
+  }
+
+  update_config {
+    max_unavailable = 1
+  }
+
+  dynamic "taint" {
+    for_each = local.node_pools.general.taints
+
+    content {
+      effect = taint.value.effect
+      key    = taint.value.key
+      value  = taint.value.value
+    }
+  }
+
+  tags = merge(var.common_tags, {
+    Name = "${local.name}-${each.key}"
+  })
+
+  timeouts {
+    create = "2h"
+    update = "5h"
+    delete = "2h"
+  }
+
+  # The same contract as general-2: after creation each group is sized through
+  # EKS, and while the groups serve, cluster-autoscaler moves their desired
+  # sizes, so no apply sends a stale size back.
+  lifecycle {
+    ignore_changes = [
+      scaling_config[0].min_size,
+      scaling_config[0].desired_size,
+      scaling_config[0].max_size,
+    ]
+  }
+}
+
+# Removing a general MNG deletes it together with any node it still runs, so
+# the general_serving_node_group output refuses the plan until the group is
+# parked: its ASG wants no instances and none are left. A group is being
+# removed when EKS still reports it and this configuration no longer declares
+# it: general once general_node_group_retired, general-2 once
+# general_blue_green_node_group is dropped, and general-<zone> once its zone
+# leaves general_per_az_node_groups. The lookups run only while general is
+# retired or the per-AZ groups are declared. Running them everywhere would add
+# AWS reads to every cluster's plan, and fail it under a module-level
+# depends_on. So, unless general is retired, two removals aren't checked and
+# need parking by hand first: dropping general-2 from a cluster with no per-AZ
+# groups, and setting general_per_az_node_groups back to null. Each lookup below runs
+# only if the one before it found its target, and lists rather than reads, so
+# none fails on a missing cluster or node group. Once the removal has landed,
+# the group isn't among the cluster's node groups and the check passes. The
+# cluster name is read from local.name rather than module.eks so that the
 # lookups run at plan time even when the cluster itself has pending changes.
 #
-# Retirement also needs a cluster that exists. A new cluster comes up with
-# general: its deployment-backed addons wait only on node groups inside
-# module.eks, while general-2 waits only on the pre-node addons (vpc-cni,
-# kube-proxy), so a cluster created retired would install its other addons
-# with no node group they wait for.
+# Retiring general also needs a cluster that exists. A new cluster comes up
+# with general: its deployment-backed addons wait only on node groups inside
+# module.eks, while general-2 and the per-AZ groups wait only on the pre-node
+# addons (vpc-cni, kube-proxy), so a cluster created retired would install its
+# other addons with no node group they wait for.
+locals {
+  retiring_general_checked = var.general_node_group_retired || var.general_per_az_node_groups != null
+  # Matched against what EKS reports rather than built from the zones still
+  # configured, so a zone dropped from availability_zones in the same apply is
+  # still checked.
+  general_node_group_name_pattern = "^general(-2|-[a-z]{2}(-[a-z]+)+-[0-9]+([a-z]|-[a-z]+-[0-9]+[a-z]))?$"
+  declared_general_node_group_names = concat(
+    var.general_node_group_retired ? [] : ["general"],
+    var.general_blue_green_node_group == null ? [] : ["general-2"],
+    keys(local.general_per_az_node_groups),
+  )
+}
+
 data "aws_eks_clusters" "retiring_general" {
-  count = var.general_node_group_retired ? 1 : 0
+  count = local.retiring_general_checked ? 1 : 0
 }
 
 data "aws_eks_node_groups" "retiring_general" {
@@ -318,15 +442,21 @@ data "aws_eks_node_groups" "retiring_general" {
 }
 
 data "aws_eks_node_group" "retiring_general" {
-  count = length([for groups in data.aws_eks_node_groups.retiring_general : true if contains(groups.names, "general")])
+  for_each = toset(flatten([
+    for groups in data.aws_eks_node_groups.retiring_general :
+    [
+      for name in groups.names : name
+      if can(regex(local.general_node_group_name_pattern, name)) && !contains(local.declared_general_node_group_names, name)
+    ]
+  ]))
 
   cluster_name    = local.name
-  node_group_name = "general"
+  node_group_name = each.value
 }
 
 locals {
   retiring_general_asg_names = toset(flatten([
-    for group in data.aws_eks_node_group.retiring_general : [
+    for group in values(data.aws_eks_node_group.retiring_general) : [
       for r in group.resources : [for asg in r.autoscaling_groups : asg.name]
     ]
   ]))
@@ -343,6 +473,58 @@ data "aws_autoscaling_group" "retiring_general" {
 # the ASG counts until it's gone.
 data "aws_instances" "retiring_general" {
   for_each = local.retiring_general_asg_names
+
+  instance_tags = {
+    "aws:autoscaling:groupName" = each.value
+  }
+  instance_state_names = ["pending", "running", "shutting-down", "stopping", "stopped"]
+}
+
+# A per-AZ group's instance type, capacity type, AMI type and subnet force its
+# replacement (so does its node role, which isn't compared: it can be unknown
+# until apply, and the comparison has to be known at plan time), and
+# its fixed name means EKS deletes the old group, nodes and all, before the new
+# one exists. So the general_serving_node_group output refuses a change to any
+# of the four while the per-AZ groups serve, or while a changing group still
+# wants or runs a node. Each declared group that EKS reports is read live; the
+# reads ride on the same cluster listing as the removal check.
+data "aws_eks_node_group" "general_per_az_live" {
+  for_each = toset(flatten([
+    for groups in data.aws_eks_node_groups.retiring_general :
+    [for name in keys(local.general_per_az_node_groups) : name if contains(groups.names, name)]
+  ]))
+
+  cluster_name    = local.name
+  node_group_name = each.value
+}
+
+locals {
+  general_per_az_replacing = {
+    for name, group in data.aws_eks_node_group.general_per_az_live : name => group
+    if(
+      tolist(group.instance_types) != tolist(var.general_per_az_node_groups == null ? [] : var.general_per_az_node_groups.instance_types) ||
+      group.capacity_type != local.node_pools.general.capacity_type ||
+      group.ami_type != "AL2023_x86_64_STANDARD" ||
+      toset(group.subnet_ids) != toset([data.aws_subnet.private[local.general_per_az_node_groups[name].zone].id])
+    )
+  }
+  general_per_az_replacing_asg_names = toset(flatten([
+    for group in values(local.general_per_az_replacing) : [
+      for r in group.resources : [for asg in r.autoscaling_groups : asg.name]
+    ]
+  ]))
+}
+
+# cluster-autoscaler can scale a replacing group up again until its discovery
+# tag is gone, so the tag is read live, as for a removal.
+data "aws_autoscaling_group" "general_per_az_replacing" {
+  for_each = local.general_per_az_replacing_asg_names
+
+  name = each.value
+}
+
+data "aws_instances" "general_per_az_replacing" {
+  for_each = local.general_per_az_replacing_asg_names
 
   instance_tags = {
     "aws:autoscaling:groupName" = each.value

@@ -285,7 +285,7 @@ variable "external_dns_records_enabled" {
 }
 
 variable "cluster_autoscaler_enabled" {
-  description = "Whether to run cluster-autoscaler on the serving general node group (general_serving_node_group), bounded by that group's own min and max size as EKS reports them, so resizing the group through the EKS API moves the bounds. The serving pool's recorded floor (general_min_size, or general_blue_green_node_group.recorded_active_size) still has to hold for that min, so lower the record before lowering the min. It never touches any other pool."
+  description = "Whether to run cluster-autoscaler on the serving general node group (general_serving_node_group), bounded by each group's own min and max size as EKS reports them, so resizing a group through the EKS API moves its bounds. When the per-AZ groups serve, it scales all of them with --balance-similar-node-groups, so a scale-up goes to the zones with the fewest nodes. A scale-down picks nodes by utilization and can leave the zones uneven until the next scale-up. The serving pool's recorded floor (general_min_size, general_blue_green_node_group.recorded_active_size, or each zone's min_size) still has to hold for that min, so lower the record before lowering the min. It never touches any other pool."
   type        = bool
   default     = false
   nullable    = false
@@ -839,29 +839,69 @@ variable "general_blue_green_node_group" {
   }
 }
 
+variable "general_per_az_node_groups" {
+  description = "Optional general MNGs, one per availability zone and each in that zone's private subnet only, named general-<zone>. They run on general's launch template and node role, with its labels and taints, so general workloads move onto them without a Helm change. A single-zone group has no other zone to rebalance into, so EC2 Auto Scaling's AZRebalance never terminates one of its nodes. zones maps each zone to its group's min_size, which creates the group at that size and records its floor for capacity checks, and its max_size. Size each zone explicitly. Over three zones, a min_size of ceil(min/3) each keeps at least a pool-wide floor; a max_size of floor(max/3) each stays within a pool-wide ceiling, and ceil(max/3) can exceed it by up to two nodes. After creation the groups are sized only through the EKS API, by operators or, while they serve, cluster-autoscaler. Changing instance_types destroys every group and its nodes before recreating it, since the fixed names rule out creating the new group first. The plan refuses it until, in earlier applies, general or general-2 serves (declared again if need be) and each per-AZ group is drained and scaled to zero through EKS. general_capacity_type replaces these groups the same way, and general and general-2 with them, so it has no safe path while any general group serves. Declaring this makes every plan read the cluster's node groups from AWS, to refuse removing a general group that still runs nodes or that cluster-autoscaler still discovers. Setting it back to null turns those reads off, so that removal isn't checked unless general is retired: park the groups by hand first. Don't put this module behind a module-level depends_on, which defers the reads and fails the plan."
+  type = object({
+    instance_types = list(string)
+    zones = map(object({
+      min_size = number
+      max_size = number
+    }))
+  })
+  default = null
+
+  validation {
+    condition = var.general_per_az_node_groups == null ? true : (
+      length(var.general_per_az_node_groups.instance_types) == 1 &&
+      trimspace(var.general_per_az_node_groups.instance_types[0]) != ""
+    )
+    error_message = "general_per_az_node_groups must select exactly one instance type, shared by every zone, so cluster-autoscaler can balance across the groups."
+  }
+
+  validation {
+    condition = var.general_per_az_node_groups == null ? true : (
+      length(var.general_per_az_node_groups.zones) >= 2 &&
+      alltrue([for zone in keys(var.general_per_az_node_groups.zones) : contains(var.availability_zones, zone)])
+    )
+    error_message = "general_per_az_node_groups.zones must name at least two zones, each one of availability_zones."
+  }
+
+  validation {
+    condition = var.general_per_az_node_groups == null ? true : alltrue([
+      for zone in values(var.general_per_az_node_groups.zones) :
+      floor(zone.min_size) == zone.min_size && floor(zone.max_size) == zone.max_size &&
+      zone.min_size >= 1 && zone.min_size <= zone.max_size && zone.max_size <= 20
+    ])
+    error_message = "Each zone in general_per_az_node_groups must use whole numbers with 1 <= min_size <= max_size <= 20."
+  }
+}
+
 variable "general_serving_node_group" {
-  description = "General MNG that is currently intended to serve SPACE workloads. Keep this aligned with the blue/green cutover so capacity checks use the live node shape. cluster-autoscaler, where enabled, scales this group and only this group, so changing it retargets the autoscaler in the same apply."
+  description = "General MNG that is currently intended to serve SPACE workloads: general, general-2, or general-per-az for the whole general_per_az_node_groups set. Keep this aligned with the cutover so capacity checks use the live node shape. cluster-autoscaler, where enabled, scales these groups and only these, so changing it retargets the autoscaler in the same apply."
   type        = string
   default     = "general"
 
   validation {
-    condition = contains(["general", "general-2"], var.general_serving_node_group) && (
+    condition = contains(["general", "general-2", "general-per-az"], var.general_serving_node_group) && (
       var.general_serving_node_group != "general-2" ||
       var.general_blue_green_node_group != null
+      ) && (
+      var.general_serving_node_group != "general-per-az" ||
+      var.general_per_az_node_groups != null
     )
-    error_message = "general_serving_node_group must be general, or general-2 when general_blue_green_node_group is declared."
+    error_message = "general_serving_node_group must be general, general-2 when general_blue_green_node_group is declared, or general-per-az when general_per_az_node_groups is declared."
   }
 }
 
 variable "general_node_group_retired" {
-  description = "Whether the original `general` MNG has been removed, leaving general-2 as the only general pool. Its launch template, node IAM role, and service-account role stay, because general-2 runs on the first two. Set `true` only once general-2 serves and general is drained and parked at zero nodes. The plan fails while general's ASG still wants or runs any instance, and on a cluster that doesn't exist yet: a new cluster comes up with general, because the cluster's addons wait only on node groups inside module.eks. Those checks read AWS at plan time, so while retiring, don't put this module behind a module-level depends_on, which defers the reads and fails the plan."
+  description = "Whether the original `general` MNG has been removed, leaving general-2 or the per-AZ groups as the general pool. Its launch template, node IAM role, and service-account role stay, because the other general groups run on the first two. Set `true` only once another general group serves and general is drained and parked at zero nodes. The plan fails while general's ASG still wants or runs any instance, and on a cluster that doesn't exist yet: a new cluster comes up with general, because the cluster's addons wait only on node groups inside module.eks. Those checks read AWS at plan time, so while retiring, don't put this module behind a module-level depends_on, which defers the reads and fails the plan."
   type        = bool
   default     = false
   nullable    = false
 
   validation {
-    condition     = !var.general_node_group_retired || var.general_serving_node_group == "general-2"
-    error_message = "general_node_group_retired needs general_serving_node_group = \"general-2\"."
+    condition     = !var.general_node_group_retired || var.general_serving_node_group != "general"
+    error_message = "general_node_group_retired needs general_serving_node_group = \"general-2\" or \"general-per-az\"."
   }
 }
 

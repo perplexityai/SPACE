@@ -82,13 +82,17 @@ variable "aws_load_balancer_controller_resources" {
 }
 
 variable "cluster_autoscaler" {
-  description = "cluster-autoscaler for the one serving general node group, or null to install none of it. It scales between that group's own min and max, read live from its ASG, so a resize through the EKS API moves its bounds too."
+  description = "cluster-autoscaler for the serving general node groups, or null to install none of it. It scales each between that group's own min and max, read live from its ASG, so a resize through the EKS API moves its bounds too. With more than one group it balances scale-ups across them, so give it only groups that differ by zone alone: the same instance type, launch template, labels and taints."
   type = object({
-    role_name              = string
-    kubernetes_version     = string
-    autoscaling_group_arn  = string
-    autoscaling_group_name = string
-    node_group_arn         = string
+    role_name          = string
+    kubernetes_version = string
+    # One entry per serving managed node group, each backed by one ASG.
+    node_groups = list(object({
+      name                   = string
+      autoscaling_group_arn  = string
+      autoscaling_group_name = string
+      node_group_arn         = string
+    }))
     # optional so a null takes false: the chart renders a null value as a bare
     # `--scale-down-enabled`, which the flag parser reads as true.
     scale_down_enabled = optional(bool, false)
@@ -98,6 +102,11 @@ variable "cluster_autoscaler" {
     new_pod_scale_up_delay       = optional(string)
   })
   default = null
+
+  validation {
+    condition     = try(length(var.cluster_autoscaler.node_groups) >= 1 && length(distinct(var.cluster_autoscaler.node_groups[*].name)) == length(var.cluster_autoscaler.node_groups), var.cluster_autoscaler == null)
+    error_message = "cluster_autoscaler.node_groups must name at least one node group, each once."
+  }
 
   validation {
     condition     = try(floor(var.cluster_autoscaler.memory_mib) == var.cluster_autoscaler.memory_mib && var.cluster_autoscaler.memory_mib >= 256, var.cluster_autoscaler == null)

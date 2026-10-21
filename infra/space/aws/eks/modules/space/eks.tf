@@ -26,9 +26,9 @@ module "eks" {
   node_pools          = local.core_node_pools
   node_pool_user_data = local.core_node_pool_user_data
 
-  # Once general-2 serves, it's general capacity the addons can run on, even
-  # with general retired.
-  external_node_group_hosts_addons = var.general_serving_node_group == "general-2"
+  # Once general-2 or the per-AZ groups serve, they're general capacity the
+  # addons can run on, even with general retired.
+  external_node_group_hosts_addons = var.general_serving_node_group != "general"
 }
 
 # Joins the general and cred-authority pools' launch templates through

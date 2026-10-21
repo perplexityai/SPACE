@@ -1,15 +1,15 @@
 locals {
   # Every general MNG this cluster declares, keyed by name: general unless it's
-  # retired, and general-2 when it's declared. general comes from the
-  # managed-group output rather than node_groups, which merges every pool and
-  # would hold its consumers behind a custom-AMI pool update. Consumers still
-  # wait on both general pools whichever one serves: Terraform orders by
-  # reference, not by the branch a value takes, and they must be able to follow
-  # general-2 once general is retired.
+  # retired, general-2 when it's declared, and general-<zone> for each per-AZ
+  # group. general comes from the managed-group output rather than
+  # node_groups, which merges every pool and would hold its consumers behind a
+  # custom-AMI pool update. Consumers still wait on every general pool whichever
+  # one serves: Terraform orders by reference, not by the branch a value takes,
+  # and they must be able to follow another group once general is retired.
   general_node_groups = merge(
     { for name, group in module.eks.managed_node_groups : name => group if name == "general" },
     {
-      for group in aws_eks_node_group.general_blue_green : "general-2" => {
+      for group in concat(aws_eks_node_group.general_blue_green, values(aws_eks_node_group.general_per_az)) : group.node_group_name => {
         arn            = group.arn
         asg_names      = flatten([for r in group.resources : [for asg in r.autoscaling_groups : asg.name]])
         scaling_config = group.scaling_config
@@ -17,10 +17,21 @@ locals {
     },
   )
 
-  # The one general_serving_node_group names. Its validations guarantee the
-  # key exists: general can only be retired while general-2 serves, and
-  # general-2 can only serve once it's declared.
-  serving_general_node_group = local.general_node_groups[var.general_serving_node_group]
+  # The groups general_serving_node_group names, each with the recorded floor
+  # its live min has to meet: one group, or every per-AZ group for
+  # general-per-az. Its validations guarantee the names exist in
+  # general_node_groups: general can only be retired while another group
+  # serves, and general-2 or the per-AZ groups can only serve once they're
+  # declared.
+  serving_general_node_group_floors = var.general_serving_node_group == "general-per-az" ? local.general_per_az_floors : {
+    (var.general_serving_node_group) = (
+      var.general_serving_node_group == "general-2" ? var.general_blue_green_node_group.recorded_active_size :
+      var.general_blue_green_node_group == null && var.general_per_az_node_groups == null ? 1 : var.general_min_size
+    )
+  }
+  serving_general_node_groups = {
+    for name in keys(local.serving_general_node_group_floors) : name => local.general_node_groups[name]
+  }
 }
 
 module "controllers" {
@@ -39,23 +50,28 @@ module "controllers" {
   disruption_budget_chart_path           = "${var.charts_dir}/pod-disruption-budget"
   resource_tags                          = var.common_tags
   aws_load_balancer_controller_resources = var.aws_load_balancer_controller_resources
-  # The serving general group carries the general pool's labels, so it's the
-  # one the releases schedule onto, and once general is retired it's the only
-  # one.
-  nodes_ready = local.serving_general_node_group.arn != ""
+  # The serving general groups carry the general pool's labels, so they're the
+  # ones the releases schedule onto, and once general is retired they're the
+  # only ones.
+  nodes_ready = alltrue([for group in values(local.serving_general_node_groups) : group.arn != ""])
 
   # A managed node group is backed by one ASG. one() fails the plan if it
   # reports several, and gives null if it reports none, which the controllers
   # module's precondition on the discovery tag turns into a named error. The
   # ARN is "" then, so it doesn't fail first on interpolating the null.
   cluster_autoscaler = var.cluster_autoscaler_enabled ? {
-    role_name              = "${local.name}-cluster-autoscaler"
-    kubernetes_version     = var.kubernetes_version
-    autoscaling_group_arn  = one(local.serving_general_node_group.asg_names) == null ? "" : "${local.autoscaling_group_arn_prefix}${one(local.serving_general_node_group.asg_names)}"
-    autoscaling_group_name = one(local.serving_general_node_group.asg_names)
-    node_group_arn         = local.serving_general_node_group.arn
-    scale_down_enabled     = var.cluster_autoscaler_scale_down_enabled
-    memory_mib             = var.cluster_autoscaler_memory_mib
+    role_name          = "${local.name}-cluster-autoscaler"
+    kubernetes_version = var.kubernetes_version
+    node_groups = [
+      for name, group in local.serving_general_node_groups : {
+        name                   = name
+        autoscaling_group_arn  = one(group.asg_names) == null ? "" : "${local.autoscaling_group_arn_prefix}${one(group.asg_names)}"
+        autoscaling_group_name = one(group.asg_names)
+        node_group_arn         = group.arn
+      }
+    ]
+    scale_down_enabled = var.cluster_autoscaler_scale_down_enabled
+    memory_mib         = var.cluster_autoscaler_memory_mib
 
     max_graceful_termination_sec = var.cluster_autoscaler_max_graceful_termination_sec
     new_pod_scale_up_delay       = var.cluster_autoscaler_new_pod_scale_up_delay

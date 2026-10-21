@@ -1,19 +1,26 @@
-# cluster-autoscaler for the serving general node group, and nothing else.
+# cluster-autoscaler for the serving general node groups, and nothing else.
 #
-# It discovers that group by a SPACE-specific tag this module puts on its one
-# ASG, not by the stock `k8s.io/cluster-autoscaler/enabled` +
+# It discovers those groups by a SPACE-specific tag this module puts on each
+# one's ASG, not by the stock `k8s.io/cluster-autoscaler/enabled` +
 # `k8s.io/cluster-autoscaler/<cluster>` pair, because EKS stamps that pair on
 # every managed node group's ASG: workers, builders and cred-authority as well
 # as general. Worker nodes carry Firecracker sandboxes whose drain path
 # cluster-autoscaler knows nothing about, so the stock pair would let it scale
 # those pools down under live sandboxes. The IAM write actions are scoped to
-# the same one ASG ARN for the same reason.
+# the same ASG ARNs for the same reason.
 #
 # Discovery rather than `--nodes=<min>:<max>:<asg>` because a discovered group's
 # bounds are the ASG's own min and max, read live. Terraform leaves the node
 # group's sizes alone after creation, so an operator resizes the pool through
 # the EKS API and cluster-autoscaler follows, and no apply ever sends a stale
 # desired size back to the group.
+#
+# Several groups are the general pool split one per zone. A single-zone ASG
+# never runs AZRebalance, which EKS drains without honoring PodDisruptionBudgets
+# and cuts off after 15 minutes. --balance-similar-node-groups then spreads each
+# scale-up over the groups, adding to the smallest first. Scale-down doesn't
+# balance: it removes the nodes it finds unneeded wherever they are, and the
+# next scale-up evens the zones out again.
 
 locals {
   # Pinned to the control plane's minor, as upstream recommends. Add the next
@@ -39,19 +46,53 @@ locals {
   # The discovery tag, unique per cluster so a tagged ASG can't be picked up by
   # another cluster's autoscaler in the same account.
   cluster_autoscaler_discovery_tag_key = "space.pplx.net/cluster-autoscaler/${var.cluster_name}"
+
+  cluster_autoscaler_node_groups = var.cluster_autoscaler == null ? [] : var.cluster_autoscaler.node_groups
+  cluster_autoscaler_balanced    = length(local.cluster_autoscaler_node_groups) >= 2
 }
 
-# Moving general_serving_node_group retargets this tag, so the old group drops
-# out of discovery and the new one joins it in the same apply.
+# Moving general_serving_node_group retargets these tags, so the old groups
+# drop out of discovery and the new ones join it in the same apply. A single
+# group keeps the indexed address it had before there could be several. Several
+# are keyed by group name, so adding or removing one leaves the others' tags
+# alone: replacing an indexed tag whose ASG shifted could delete a tag another
+# index had just created on that ASG, since both name the same key. A list that
+# goes from one group to several shouldn't keep its first group: that group's
+# indexed tag and its keyed tag would be the same tag, raced the same way. The
+# space module never does this; a single group and a per-AZ set never share a
+# group.
 resource "aws_autoscaling_group_tag" "cluster_autoscaler" {
-  count = var.cluster_autoscaler == null ? 0 : 1
+  count = length(local.cluster_autoscaler_node_groups) == 1 ? 1 : 0
 
-  autoscaling_group_name = var.cluster_autoscaler.autoscaling_group_name
+  autoscaling_group_name = local.cluster_autoscaler_node_groups[0].autoscaling_group_name
 
   lifecycle {
     precondition {
-      condition     = var.cluster_autoscaler.autoscaling_group_name != null
-      error_message = "cluster-autoscaler needs the serving node group's ASG name, and the group reports none; check the node group's health in EKS."
+      condition     = local.cluster_autoscaler_node_groups[0].autoscaling_group_name != null
+      error_message = "cluster-autoscaler needs node group ${local.cluster_autoscaler_node_groups[0].name}'s ASG name, and the group reports none; check the node group's health in EKS."
+    }
+    precondition {
+      condition     = length(local.cluster_autoscaler_discovery_tag_key) <= 128
+      error_message = "The discovery tag key ${local.cluster_autoscaler_discovery_tag_key} is longer than the 128 characters AWS allows; the cluster name is too long for it."
+    }
+  }
+
+  tag {
+    key                 = local.cluster_autoscaler_discovery_tag_key
+    value               = "owned"
+    propagate_at_launch = false
+  }
+}
+
+resource "aws_autoscaling_group_tag" "cluster_autoscaler_balanced" {
+  for_each = local.cluster_autoscaler_balanced ? { for group in local.cluster_autoscaler_node_groups : group.name => group } : {}
+
+  autoscaling_group_name = each.value.autoscaling_group_name
+
+  lifecycle {
+    precondition {
+      condition     = each.value.autoscaling_group_name != null
+      error_message = "cluster-autoscaler needs node group ${each.key}'s ASG name, and the group reports none; check the node group's health in EKS."
     }
     precondition {
       condition     = length(local.cluster_autoscaler_discovery_tag_key) <= 128
@@ -119,7 +160,7 @@ data "aws_iam_policy_document" "cluster_autoscaler" {
 
   statement {
     actions   = ["eks:DescribeNodegroup"]
-    resources = [var.cluster_autoscaler.node_group_arn]
+    resources = local.cluster_autoscaler_node_groups[*].node_group_arn
   }
 
   statement {
@@ -127,7 +168,7 @@ data "aws_iam_policy_document" "cluster_autoscaler" {
       "autoscaling:SetDesiredCapacity",
       "autoscaling:TerminateInstanceInAutoScalingGroup",
     ]
-    resources = [var.cluster_autoscaler.autoscaling_group_arn]
+    resources = local.cluster_autoscaler_node_groups[*].autoscaling_group_arn
   }
 }
 
@@ -206,6 +247,22 @@ resource "helm_release" "cluster_autoscaler" {
       var.cluster_autoscaler.new_pod_scale_up_delay == null ? {} : {
         "new-pod-scale-up-delay" = var.cluster_autoscaler.new_pod_scale_up_delay
       },
+      # Only with several groups, so a single-group cluster's values don't
+      # change. Similar groups need identical labels apart from an ignore list
+      # (zone, hostname and eks.amazonaws.com/nodegroup among them). The groups
+      # share a launch template, but each one rolls to a new AMI or template
+      # version on its own, and during that roll its nodes carry a different
+      # nodegroup-image or sourceLaunchTemplateVersion than the other groups'.
+      # The chart drops everything from the first `_` in a key, which is how
+      # one flag is passed twice. Two maps, so the flag keeps its bool rather
+      # than being unified with the labels into strings.
+      !local.cluster_autoscaler_balanced ? {} : {
+        "balance-similar-node-groups" = true
+      },
+      !local.cluster_autoscaler_balanced ? {} : {
+        "balancing-ignore-label_image"  = "eks.amazonaws.com/nodegroup-image"
+        "balancing-ignore-label_launch" = "eks.amazonaws.com/sourceLaunchTemplateVersion"
+      },
     )
     priorityClassName = "system-cluster-critical"
     # One replica, and a budget that lets it go: the pod lives on the pool it
@@ -264,6 +321,7 @@ resource "helm_release" "cluster_autoscaler" {
 
   depends_on = [
     aws_autoscaling_group_tag.cluster_autoscaler,
+    aws_autoscaling_group_tag.cluster_autoscaler_balanced,
     aws_iam_role_policy.cluster_autoscaler,
   ]
 }
