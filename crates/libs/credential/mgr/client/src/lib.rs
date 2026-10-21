@@ -40,7 +40,9 @@ mod token;
 pub const INTERMEDIATE_CSR_COMMON_NAME: &str = "space-node-intermediate-ca";
 pub const MAX_INTERMEDIATE_CSR_BYTES: usize = 4096;
 
-use pplx_space_common_svc::bootstrap::{GrpcClientTrace, wrap_grpc_client_channel};
+use pplx_space_common_grpc::{
+    GrpcClientTrace, trace_grpc_client_transport as wrap_grpc_client_channel,
+};
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 

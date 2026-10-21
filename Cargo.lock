@@ -6477,6 +6477,7 @@ dependencies = [
  "anyhow",
  "hyper-util",
  "pplx-space-common-core",
+ "pplx-space-common-grpc",
  "pplx-space-common-proto-build",
  "pplx-space-common-svc",
  "pplx-space-execution-common",

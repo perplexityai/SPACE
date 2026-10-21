@@ -1,6 +1,8 @@
 //! Client for the node-local runtime manager, `space-rtmgr-svc`.
 
-use pplx_space_common_svc::bootstrap::{GrpcClientTrace, wrap_grpc_client_channel};
+use pplx_space_common_grpc::{
+    GrpcClientTrace, trace_grpc_client_transport as wrap_grpc_client_channel,
+};
 use tonic::transport::{Channel, Endpoint};
 
 pub mod labels;

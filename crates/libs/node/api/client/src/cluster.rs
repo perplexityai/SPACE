@@ -4,8 +4,10 @@ use std::time::Duration;
 
 use pplx_space_common_core::types::ExecutionGeneration;
 use pplx_space_common_grpc::RotatingChannel;
+use pplx_space_common_grpc::{
+    GrpcClientTrace, trace_grpc_client_transport as wrap_grpc_client_channel,
+};
 use pplx_space_common_svc::bearer_token::BearerTokenError;
-use pplx_space_common_svc::bootstrap::{GrpcClientTrace, wrap_grpc_client_channel};
 use tonic::metadata::{Ascii, MetadataValue};
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Endpoint, Uri};
