@@ -1104,12 +1104,12 @@ where
                 Err(StreamBridgeError::BackendStatus(status))
                     if status.code() == tonic::Code::FailedPrecondition =>
                 {
-                    tracing::info!(grpc_message = %status.message(), "terminal resize was refused");
+                    tracing::debug!(grpc_message = %status.message(), "terminal resize was refused");
                     send_server_frame(
                         sink,
                         &DataPlaneServerFrame::Error {
                             code: DataPlaneErrorCode::ResizeNotSupported,
-                            message: "terminal resize is not supported by this process".to_string(),
+                            message: RESIZE_REFUSED.to_string(),
                             retryable: false,
                         },
                     )
