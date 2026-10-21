@@ -86,6 +86,7 @@ members = [
     "crates/libs/api",
     "crates/libs/common/core",
     "crates/libs/semver",
+    "crates/libs/durations",
     "crates/libs/common/cli",
     "crates/libs/common/connection/admission",
     "crates/libs/common/grpc",
@@ -305,6 +306,7 @@ pplx-space-build-mgr = { path = "crates/libs/build/mgr" }
 pplx-space-build-mgr-client = { path = "crates/libs/build/mgr/client" }
 pplx-space-build-mgr-server = { path = "crates/libs/build/mgr/server" }
 pplx-space-common-core = { path = "crates/libs/common/core" }
+pplx-space-durations = { path = "crates/libs/durations" }
 pplx-space-common-cli = { path = "crates/libs/common/cli" }
 pplx-space-common-connection-admission = { path = "crates/libs/common/connection/admission" }
 pplx-space-common-grpc = { path = "crates/libs/common/grpc" }

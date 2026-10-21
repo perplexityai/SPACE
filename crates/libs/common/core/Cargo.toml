@@ -18,6 +18,7 @@ k8s-openapi = { workspace = true, features = ["v1_32"], optional = true }
 libc = { workspace = true }
 nix = { workspace = true, features = ["fs", "ioctl"] }
 pplx-space-content-digest = { workspace = true }
+pplx-space-durations = { workspace = true }
 pplx-space-env-vars = { workspace = true }
 pplx-space-net-common = { workspace = true }
 pplx-space-semver = { workspace = true }
@@ -46,6 +47,7 @@ serde = [
     "dep:serde_json",
     "bytesize/serde",
     "pplx-space-content-digest/serde",
+    "pplx-space-durations/serde",
     "uuid/serde",
     "pplx-space-semver/serde",
 ]

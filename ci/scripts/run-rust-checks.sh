@@ -471,6 +471,25 @@ run_clippy_checks() {
         -- \
         -D warnings
 
+    # Built alone with no features and with all of them, so a dependency
+    # feature the duration types need but only get through unification with
+    # common-core or the rest of the workspace fails here.
+    echo "--- :rust: Running isolated durations clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-durations \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-durations \
+        --all-features \
+        --all-targets \
+        -- \
+        -D warnings
+
     run_sbxmgr_production_checks "${target_dir}"
 
     # feature-flags must lint clean with no vendor SDK compiled in; the matching

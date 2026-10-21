@@ -1,14 +1,26 @@
-//! Generic positive and compact human duration value types.
+//! Generic duration value types and parsers.
+//!
+//! [`PositiveDuration`] is a `Duration` known to be greater than zero, and
+//! [`SimpleDuration`] is a positive duration read from and written as the
+//! compact `s/m/h/d` syntax (`30s`, `1.5m`, `0.5d`). The crate also holds
+//! that syntax's parse and format functions and the parser for gRPC's
+//! `grpc-timeout` metadata value.
+//!
+//! None of it depends on the SPACE domain model, so it is its own crate rather
+//! than part of `pplx-space-common-core`: a crate that needs only these values
+//! can depend on it alone. common-core re-exports every item at its original
+//! paths.
 
-use super::*;
+use std::{fmt, str::FromStr, time::Duration};
 
 /// Error returned when a duration role wrapper is built from zero.
 ///
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::*;
-/// assert!(ReadyTimeout::from_secs(0).is_err());
+/// # use std::time::Duration;
+/// # use pplx_space_durations::*;
+/// assert!(SimpleDuration::new(Duration::ZERO).is_err());
 /// ```
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[error("duration must be greater than zero")]
@@ -67,7 +79,7 @@ pub fn format_simple_duration(value: Duration) -> String {
 ///
 /// ```rust
 /// # use std::time::Duration;
-/// # use pplx_space_common_core::types::parse_simple_duration;
+/// # use pplx_space_durations::parse_simple_duration;
 /// assert_eq!(parse_simple_duration("1.5m")?, Duration::from_secs(90));
 /// assert_eq!(parse_simple_duration("2h")?, Duration::from_secs(7_200));
 /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -159,7 +171,7 @@ pub fn parse_simple_duration(value: &str) -> Result<Duration, SimpleDurationPars
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::parse_simple_duration_secs;
+/// # use pplx_space_durations::parse_simple_duration_secs;
 /// assert_eq!(parse_simple_duration_secs("1.5m")?, 90);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
@@ -202,7 +214,7 @@ pub fn parse_grpc_timeout(value: &str) -> Option<Duration> {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(try_from = "String", into = "String"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct SimpleDuration(pub(super) PositiveDuration);
+pub struct SimpleDuration(PositiveDuration);
 
 impl SimpleDuration {
     pub fn new(value: Duration) -> Result<Self, DurationParseError> {
@@ -284,13 +296,13 @@ impl From<SimpleDuration> for Duration {
 ///
 /// ```rust
 /// # use std::time::Duration;
-/// # use pplx_space_common_core::types::PositiveDuration;
+/// # use pplx_space_durations::PositiveDuration;
 /// assert!(PositiveDuration::new(Duration::ZERO).is_none());
 /// let p = PositiveDuration::new(Duration::from_secs(30)).unwrap();
 /// assert_eq!(p.get(), Duration::from_secs(30));
 /// ```
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct PositiveDuration(pub(super) Duration);
+pub struct PositiveDuration(Duration);
 
 impl PositiveDuration {
     /// Constructs a `PositiveDuration` from a `Duration`, returning
@@ -321,3 +333,6 @@ impl From<PositiveDuration> for Duration {
         value.0
     }
 }
+
+#[cfg(test)]
+mod tests;

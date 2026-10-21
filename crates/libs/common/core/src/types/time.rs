@@ -17,7 +17,12 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-use std::{fmt, str::FromStr, time::Duration};
+use std::time::Duration;
+
+pub use pplx_space_durations::{
+    DurationParseError, PositiveDuration, SimpleDuration, SimpleDurationParseError,
+    format_simple_duration, parse_grpc_timeout, parse_simple_duration, parse_simple_duration_secs,
+};
 
 macro_rules! duration_type {
     (
@@ -116,10 +121,6 @@ macro_rules! duration_type {
     };
 }
 
-mod durations;
-
-pub use durations::*;
-
 duration_type!(
     /// Maximum time to wait for a sandbox to report readiness.
     ///
@@ -188,6 +189,3 @@ duration_type!(
     60,
     "a snapshot interval"
 );
-
-#[cfg(test)]
-mod tests;

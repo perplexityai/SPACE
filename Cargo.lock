@@ -5375,6 +5375,7 @@ dependencies = [
  "libc",
  "nix 0.31.3",
  "pplx-space-content-digest",
+ "pplx-space-durations",
  "pplx-space-env-vars",
  "pplx-space-net-common",
  "pplx-space-semver",
@@ -5834,6 +5835,14 @@ dependencies = [
  "libc",
  "nix 0.31.3",
  "tempfile",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "pplx-space-durations"
+version = "0.8.0"
+dependencies = [
+ "serde",
  "thiserror 2.0.20",
 ]
 
