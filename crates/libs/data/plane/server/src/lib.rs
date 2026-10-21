@@ -146,9 +146,17 @@ pub const DEFAULT_ROUTE_CACHE_TTL_MS: u64 = 1_000;
 /// How long after its last confirmed revocation check an attached stream may
 /// keep running while later checks fail, before it fails closed.
 const REVOCATION_MAX_STALENESS: Duration = Duration::from_secs(60);
-/// How long one revocation check may wait on the cluster API. A check that
-/// takes longer counts as unavailable.
+/// How long one revocation check may wait on the cluster API, across all of
+/// its reads. A check that takes longer counts as unavailable.
 const REVOCATION_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+/// The longest revocation check interval the service accepts: a third of the
+/// staleness bound less one check timeout. A failed check keeps a verdict
+/// until it is that bound less one interval and one timeout old, so at this
+/// interval or below that is at least two intervals: a stream rides out at
+/// least the first failed check after a confirmed one, and a refresh another
+/// stream has in flight can still answer for it.
+pub const MAX_REVOCATION_CHECK_INTERVAL_MS: u64 =
+    ((REVOCATION_MAX_STALENESS.as_millis() - REVOCATION_CHECK_TIMEOUT.as_millis()) / 3) as u64;
 /// The shortest drain deadline the service accepts: the 8-second stream-open
 /// budget, so a `Process.Start` already opening when SIGTERM arrives finishes
 /// opening, and can report whether the command started, before the deadline.
@@ -436,6 +444,12 @@ pub async fn run(
         upgrade_tasks: upgrade_tasks.clone(),
     };
 
+    tracing::info!(
+        revocation_check_interval_ms = state.revocation_check_interval.as_millis(),
+        revocation_tolerance_ms = native::revocation_tolerance(&state).as_millis(),
+        "attached streams keep a confirmed revocation verdict through failed checks \
+         for up to the revocation tolerance"
+    );
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await

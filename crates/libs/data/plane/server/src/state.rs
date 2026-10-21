@@ -497,9 +497,9 @@ impl RevocationCache {
         epoch: u64,
         org_id: OrgId,
         org_epoch: u64,
-        refresh_after: Duration,
+        read: RevocationRead,
     ) {
-        self.remember_state(session_id, epoch, true, org_id, org_epoch, refresh_after);
+        self.remember_state(session_id, epoch, true, org_id, org_epoch, read);
     }
 
     pub(super) fn remember(
@@ -507,7 +507,7 @@ impl RevocationCache {
         session_id: DataPlaneSessionId,
         org_id: OrgId,
         revocation: &DataPlaneRevocationState,
-        refresh_after: Duration,
+        read: RevocationRead,
     ) {
         self.remember_state(
             session_id,
@@ -515,7 +515,7 @@ impl RevocationCache {
             revocation_state_is_active(revocation),
             org_id,
             revocation.org_epoch,
-            refresh_after,
+            read,
         );
     }
 
@@ -526,10 +526,10 @@ impl RevocationCache {
         active: bool,
         org_id: OrgId,
         org_epoch: u64,
-        refresh_after: Duration,
+        read: RevocationRead,
     ) {
         if self.remember_session(session_id, epoch, active, org_id, org_epoch) {
-            self.remember_org_epoch(org_id, org_epoch, refresh_after);
+            self.remember_org_epoch(org_id, org_epoch, read);
         }
     }
 
@@ -574,22 +574,32 @@ impl RevocationCache {
         true
     }
 
-    pub(super) fn remember_org_epoch(&self, org_id: OrgId, epoch: u64, refresh_after: Duration) {
-        if let Some(existing) = self.orgs.get(&org_id)
-            && epoch < existing.epoch
-        {
-            return;
+    /// Record the org epoch `read` returned. An older epoch than the cached
+    /// one is ignored, and the same epoch only moves its confirmation and next
+    /// refresh later, so an answer that arrives late cannot undo a newer one.
+    pub(super) fn remember_org_epoch(&self, org_id: OrgId, epoch: u64, read: RevocationRead) {
+        let refresh_after = read.started_at + read.fresh_for;
+        match self.orgs.entry(org_id) {
+            dashmap::mapref::entry::Entry::Occupied(mut current) => {
+                let current = current.get_mut();
+                if epoch < current.epoch
+                    || (epoch == current.epoch && read.started_at < current.confirmed_at)
+                {
+                    return;
+                }
+                current.epoch = epoch;
+                current.confirmed_at = read.started_at;
+                current.refresh_after = refresh_after;
+            }
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                slot.insert(OrgRevocationCacheEntry {
+                    epoch,
+                    confirmed_at: read.started_at,
+                    refresh_after,
+                    refreshing: Arc::new(AtomicBool::new(false)),
+                });
+            }
         }
-        let now = tokio::time::Instant::now();
-        self.orgs.insert(
-            org_id,
-            OrgRevocationCacheEntry {
-                epoch,
-                confirmed_at: now,
-                refresh_after: now + refresh_after,
-                refreshing: Arc::new(AtomicBool::new(false)),
-            },
-        );
     }
 
     /// Probe the session's cached verdict. A refresh another stream has in
@@ -649,8 +659,11 @@ impl RevocationCache {
     }
 
     /// Whether the session's last confirmed verdict is active and younger
-    /// than `tolerance`. A newer org epoch than the session was read under
-    /// means a revocation in its org since, so the verdict no longer counts.
+    /// than `tolerance`. The verdict's age is its org entry's: every
+    /// revocation advances the org epoch, so a check that confirms the org's
+    /// epoch unchanged also confirms each session read under that epoch. A
+    /// newer org epoch than the session was read under means a revocation in
+    /// its org since, so the verdict no longer counts.
     pub(super) fn confirmed_active(
         &self,
         session_id: DataPlaneSessionId,
@@ -690,10 +703,29 @@ pub(super) struct RevocationCacheEntry {
     pub(super) org_epoch: u64,
 }
 
+/// When a revocation read began, and how long its answer stays fresh. The
+/// cluster API may have read its rows at any point before it answered, so an
+/// answer is dated from when the read began, not from when it arrived.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RevocationRead {
+    pub(super) started_at: tokio::time::Instant,
+    pub(super) fresh_for: Duration,
+}
+
+impl RevocationRead {
+    /// A read beginning now.
+    pub(super) fn start(fresh_for: Duration) -> Self {
+        Self {
+            started_at: tokio::time::Instant::now(),
+            fresh_for,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct OrgRevocationCacheEntry {
     pub(super) epoch: u64,
-    /// When a check last confirmed this epoch.
+    /// When the latest read that confirmed this epoch began.
     pub(super) confirmed_at: tokio::time::Instant,
     pub(super) refresh_after: tokio::time::Instant,
     pub(super) refreshing: Arc<AtomicBool>,

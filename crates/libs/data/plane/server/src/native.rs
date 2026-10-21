@@ -57,6 +57,7 @@ async fn resolve_session_route_with_cache(
     }
 
     let mut client = state.cluster_api.for_session(&session_id);
+    let read = start_revocation_read(state);
     let response = client
         .resolve_data_plane_session_route(ResolveDataPlaneSessionRouteRequest {
             session_id: session_id.to_string(),
@@ -86,7 +87,7 @@ async fn resolve_session_route_with_cache(
         attached.revocation_epoch,
         attached.org_id,
         attached.org_revocation_epoch,
-        state.revocation_check_interval,
+        read,
     );
     attached.cache_key = Some(cache_key.clone());
     state
@@ -366,6 +367,7 @@ pub(super) async fn resolve_session_route_internal(
     session_id: DataPlaneSessionId,
 ) -> Result<AttachedSession, StreamBridgeError> {
     let mut client = state.cluster_api.for_session(&session_id);
+    let read = start_revocation_read(state);
     let response = client
         .resolve_data_plane_session_route(ResolveDataPlaneSessionRouteRequest {
             session_id: session_id.to_string(),
@@ -388,7 +390,7 @@ pub(super) async fn resolve_session_route_internal(
         attached.revocation_epoch,
         attached.org_id,
         attached.org_revocation_epoch,
-        state.revocation_check_interval,
+        read,
     );
     Ok(attached)
 }
@@ -782,21 +784,38 @@ pub(super) fn revocation_check_interval(state: &DataPlaneState) -> tokio::time::
 }
 
 /// Whether an attached stream's session has been revoked, checked on each
-/// revocation tick.
+/// revocation tick. The whole check, which can take an org read and then a
+/// session read, gets one [`REVOCATION_CHECK_TIMEOUT`]; a check that outlives
+/// it counts as one the cluster API could not answer.
 ///
 /// A check the cluster API could not answer keeps the session's last
 /// confirmed verdict while that verdict is young enough, so a brief cluster
 /// API or database outage does not end every attached stream. Once it is not,
-/// the error is returned and the stream fails closed, at most the staleness
-/// bound ([`REVOCATION_MAX_STALENESS`]) after its last confirmed check. Any
-/// other failure, such as a malformed answer, fails closed at once, and so
-/// does a confirmed revocation.
+/// the error is returned and the stream fails closed: the first check that
+/// starts once the verdict is older than [`revocation_tolerance`] ends it, at
+/// most the staleness bound ([`REVOCATION_MAX_STALENESS`]) after the read that
+/// confirmed it. The verdict's age is its org entry's; see
+/// [`RevocationCache::confirmed_active`]. Any other failure, such as a
+/// malformed answer, fails closed at once, and so does a confirmed revocation.
 pub(super) async fn session_is_revoked(
     state: &DataPlaneState,
     session_id: DataPlaneSessionId,
 ) -> Result<bool, StreamBridgeError> {
-    match check_session_revocation(state, session_id).await {
+    let kind = session_id.kind().as_str();
+    let checked = tokio::time::timeout(
+        state.revocation_check_timeout,
+        check_session_revocation(state, session_id),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        pplx_space_metrics::data_plane::revocation_check(kind, "timeout");
+        Err(StreamBridgeError::RevocationStatus(
+            revocation_check_timed_out(),
+        ))
+    });
+    match checked {
         Err(error) if keeps_last_verdict(state, session_id, &error) => {
+            pplx_space_metrics::data_plane::revocation_check(kind, "kept_last_verdict");
             tracing::warn!(%error, "revocation check failed; keeping the last confirmed verdict");
             Ok(false)
         }
@@ -818,18 +837,42 @@ fn keeps_last_verdict(
 }
 
 /// How old a confirmed verdict may be and still stand in for a failed check.
-/// The check that finds it too old can start up to one interval later and
-/// take up to one check timeout, so both come off the staleness bound and the
-/// stream ends within it of its last confirmed check.
-fn revocation_tolerance(state: &DataPlaneState) -> Duration {
-    state
-        .revocation_max_staleness
-        .saturating_sub(state.revocation_check_interval)
-        .saturating_sub(state.revocation_check_timeout)
+pub(super) fn revocation_tolerance(state: &DataPlaneState) -> Duration {
+    revocation_tolerance_within(
+        state.revocation_max_staleness,
+        state.revocation_check_interval,
+        state.revocation_check_timeout,
+    )
 }
 
-/// Whether a revocation check failed because the cluster API could not
-/// answer, rather than because it answered something unusable.
+/// The check that finds a verdict too old can start up to one interval after
+/// the verdict became too old and take up to one check timeout, so both come
+/// off the staleness bound and the stream ends within it.
+pub(super) fn revocation_tolerance_within(
+    max_staleness: Duration,
+    check_interval: Duration,
+    check_timeout: Duration,
+) -> Duration {
+    max_staleness
+        .saturating_sub(check_interval)
+        .saturating_sub(check_timeout)
+}
+
+/// A revocation read beginning now, whose answer stays fresh for just under
+/// one check interval. A stream's checks are an interval apart, but each
+/// starts a little late by a varying amount; with a full interval, a stream
+/// alone in its org could start a check just before the refresh its own last
+/// check set, and re-read the org only on every other check.
+fn start_revocation_read(state: &DataPlaneState) -> RevocationRead {
+    let interval = state.revocation_check_interval;
+    RevocationRead::start(interval - interval / 10)
+}
+
+/// Whether a revocation check failed for want of a usable answer from the
+/// cluster API: it was unreachable, overloaded or timed out, the call was
+/// cancelled, or it failed in a way tonic reports as `Internal` or `Unknown`,
+/// which includes an answer that could not be decoded at all. A refusal, or
+/// an answer that decoded but could not be used, is not one.
 fn revocation_check_unavailable(error: &StreamBridgeError) -> bool {
     matches!(
         error,
@@ -838,6 +881,8 @@ fn revocation_check_unavailable(error: &StreamBridgeError) -> bool {
                 status.code(),
                 tonic::Code::Unavailable
                     | tonic::Code::DeadlineExceeded
+                    | tonic::Code::Cancelled
+                    | tonic::Code::ResourceExhausted
                     | tonic::Code::Internal
                     | tonic::Code::Unknown
             )
@@ -863,6 +908,7 @@ async fn check_session_revocation(
         }
         RevocationProbe::RefreshSession => {
             pplx_space_metrics::data_plane::revocation_cache_probe(kind, "refresh");
+            let read = start_revocation_read(state);
             let Some((org_id, revocation)) = fetch_session_revocation_state(state, session_id)
                 .await
                 .inspect_err(|error| {
@@ -878,16 +924,14 @@ async fn check_session_revocation(
             let active = revocation_state_is_active(&revocation);
             let result = if active { "active" } else { "revoked" };
             pplx_space_metrics::data_plane::revocation_check(kind, result);
-            state.revocation_cache.remember(
-                session_id,
-                org_id,
-                &revocation,
-                state.revocation_check_interval,
-            );
+            state
+                .revocation_cache
+                .remember(session_id, org_id, &revocation, read);
             Ok(!active)
         }
         RevocationProbe::RefreshOrg(refresh) => {
             pplx_space_metrics::data_plane::revocation_cache_probe(kind, "refresh");
+            let read = start_revocation_read(state);
             let org_epoch = fetch_org_revocation_epoch(state, refresh.org_id)
                 .await
                 .inspect_err(|error| {
@@ -896,11 +940,9 @@ async fn check_session_revocation(
                         revocation_check_error_label(error),
                     );
                 })?;
-            state.revocation_cache.remember_org_epoch(
-                refresh.org_id,
-                org_epoch,
-                state.revocation_check_interval,
-            );
+            state
+                .revocation_cache
+                .remember_org_epoch(refresh.org_id, org_epoch, read);
             if org_epoch <= refresh.cached_org_epoch {
                 pplx_space_metrics::data_plane::revocation_check(kind, "org_epoch_unchanged");
                 drop(refresh.guard);
@@ -908,6 +950,7 @@ async fn check_session_revocation(
             }
             pplx_space_metrics::data_plane::revocation_check(kind, "org_epoch_changed");
             drop(refresh.guard);
+            let read = start_revocation_read(state);
             let Some((org_id, revocation)) = fetch_session_revocation_state(state, session_id)
                 .await
                 .inspect_err(|error| {
@@ -923,12 +966,9 @@ async fn check_session_revocation(
             let active = revocation_state_is_active(&revocation);
             let result = if active { "active" } else { "revoked" };
             pplx_space_metrics::data_plane::revocation_check(kind, result);
-            state.revocation_cache.remember(
-                session_id,
-                org_id,
-                &revocation,
-                state.revocation_check_interval,
-            );
+            state
+                .revocation_cache
+                .remember(session_id, org_id, &revocation, read);
             Ok(!active)
         }
     }
@@ -939,15 +979,12 @@ pub(super) async fn fetch_session_revocation_state(
     session_id: DataPlaneSessionId,
 ) -> Result<Option<(OrgId, DataPlaneRevocationState)>, StreamBridgeError> {
     let mut client = state.cluster_api.for_session(&session_id);
-    let response = match tokio::time::timeout(
-        state.revocation_check_timeout,
-        client.get_data_plane_session_revocation_state(GetDataPlaneSessionRevocationStateRequest {
+    let response = match client
+        .get_data_plane_session_revocation_state(GetDataPlaneSessionRevocationStateRequest {
             session_id: session_id.to_string(),
             protocol_session_id: protocol_session_id(session_id),
-        }),
-    )
-    .await
-    .unwrap_or_else(|_| Err(revocation_check_timed_out()))
+        })
+        .await
     {
         Ok(response) => response.into_inner(),
         Err(status) if status.code() == tonic::Code::NotFound => return Ok(None),
@@ -968,16 +1005,13 @@ pub(super) async fn fetch_org_revocation_epoch(
     org_id: OrgId,
 ) -> Result<u64, StreamBridgeError> {
     let mut client = state.cluster_api.for_org(&org_id);
-    let response = tokio::time::timeout(
-        state.revocation_check_timeout,
-        client.get_data_plane_org_revocation_epoch(GetDataPlaneOrgRevocationEpochRequest {
+    let response = client
+        .get_data_plane_org_revocation_epoch(GetDataPlaneOrgRevocationEpochRequest {
             org_id: org_id.to_string(),
-        }),
-    )
-    .await
-    .unwrap_or_else(|_| Err(revocation_check_timed_out()))
-    .map_err(StreamBridgeError::RevocationStatus)?
-    .into_inner();
+        })
+        .await
+        .map_err(StreamBridgeError::RevocationStatus)?
+        .into_inner();
     Ok(response.epoch)
 }
 

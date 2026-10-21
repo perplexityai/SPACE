@@ -53,3 +53,21 @@ fn shutdown_grace_below_the_stream_open_budget_is_rejected() {
         Some(MIN_SHUTDOWN_GRACE)
     );
 }
+
+#[test]
+fn revocation_check_interval_above_the_maximum_is_rejected() {
+    let maximum = MAX_REVOCATION_CHECK_INTERVAL_MS.to_string();
+    assert_eq!(
+        config(&["--revocation-check-interval-ms", &maximum]).revocation_check_interval,
+        Duration::from_millis(MAX_REVOCATION_CHECK_INTERVAL_MS)
+    );
+    let above = (MAX_REVOCATION_CHECK_INTERVAL_MS + 1).to_string();
+    assert!(
+        Cli::try_parse_from([
+            "space-data-plane-svc",
+            "--revocation-check-interval-ms",
+            &above
+        ])
+        .is_err()
+    );
+}

@@ -732,14 +732,23 @@ enum FakeRevocation {
     Hung,
     /// The org epoch moved on, and the session check then never answers.
     HungAfterOrgEpochChange,
+    /// The org read takes most of a check timeout and finds the epoch moved
+    /// on, and the session read then never answers.
+    SlowOrgThenHungSession,
+    /// Every call, route resolves included, answers as `Active` does after
+    /// [`FAKE_SLOW_ANSWER`].
+    Slow,
     Revoked,
-    /// The org epoch moved on, and the session answer carries no state.
-    MissingState,
-    /// The org epoch moved on, and the session answer names no valid org.
-    InvalidOrgId,
     /// The cluster API refuses the check.
     Rejected,
 }
+
+/// How long [`FakeRevocation::Slow`] takes to answer.
+const FAKE_SLOW_ANSWER: Duration = Duration::from_millis(300);
+/// The check timeout for [`FakeRevocation::SlowOrgThenHungSession`], and how
+/// long its org read takes.
+const SPLIT_CHECK_TIMEOUT: Duration = Duration::from_millis(1_000);
+const SPLIT_CHECK_ORG_READ: Duration = Duration::from_millis(800);
 
 /// A fake cluster API and worker for one running process. The test sets how
 /// revocation checks are answered and sends stdout chunks down the open
@@ -747,7 +756,7 @@ enum FakeRevocation {
 struct RevocationFake {
     endpoint: String,
     revocation: Arc<std::sync::Mutex<FakeRevocation>>,
-    /// Revocation checks answered with an error or an unusable answer.
+    /// Revocation checks answered with an error.
     failed_answers: Arc<std::sync::atomic::AtomicUsize>,
     stdout: tokio::sync::mpsc::UnboundedSender<&'static str>,
 }
@@ -811,6 +820,9 @@ async fn spawn_revocation_fake(session_id: DataPlaneSessionId) -> RevocationFake
             if path.ends_with("/Check") {
                 return crate::tests::grpc_test_response(vec![8, 1]);
             }
+            if matches!(answer, FakeRevocation::Slow) {
+                tokio::time::sleep(FAKE_SLOW_ANSWER).await;
+            }
             if path.ends_with("/ResolveDataPlaneSessionRoute") {
                 return crate::tests::grpc_test_response(route);
             }
@@ -821,7 +833,9 @@ async fn spawn_revocation_fake(session_id: DataPlaneSessionId) -> RevocationFake
             if org_epoch_request || path.ends_with("/GetDataPlaneSessionRevocationState") {
                 let failed = || failed_answers.fetch_add(1, Ordering::SeqCst);
                 let (epoch, status) = match answer {
-                    FakeRevocation::Active => (1, DataPlaneRevocationStatus::Active),
+                    FakeRevocation::Active | FakeRevocation::Slow => {
+                        (1, DataPlaneRevocationStatus::Active)
+                    }
                     FakeRevocation::Down => {
                         failed();
                         return tonic::Status::unavailable(FAKE_CLUSTER_API_OUTAGE)
@@ -833,13 +847,20 @@ async fn spawn_revocation_fake(session_id: DataPlaneSessionId) -> RevocationFake
                             .into_http::<Body>();
                     }
                     FakeRevocation::Hung => std::future::pending().await,
-                    FakeRevocation::HungAfterOrgEpochChange if !org_epoch_request => {
+                    FakeRevocation::HungAfterOrgEpochChange
+                    | FakeRevocation::SlowOrgThenHungSession
+                        if !org_epoch_request =>
+                    {
                         std::future::pending().await
                     }
+                    FakeRevocation::SlowOrgThenHungSession => {
+                        tokio::time::sleep(SPLIT_CHECK_ORG_READ).await;
+                        (2, DataPlaneRevocationStatus::Active)
+                    }
                     FakeRevocation::Revoked => (2, DataPlaneRevocationStatus::Revoked),
-                    FakeRevocation::HungAfterOrgEpochChange
-                    | FakeRevocation::MissingState
-                    | FakeRevocation::InvalidOrgId => (2, DataPlaneRevocationStatus::Active),
+                    FakeRevocation::HungAfterOrgEpochChange => {
+                        (2, DataPlaneRevocationStatus::Active)
+                    }
                 };
                 if org_epoch_request {
                     return crate::tests::grpc_test_response(
@@ -851,31 +872,17 @@ async fn spawn_revocation_fake(session_id: DataPlaneSessionId) -> RevocationFake
                         .encode_to_vec(),
                     );
                 }
-                let unusable = matches!(
-                    answer,
-                    FakeRevocation::MissingState | FakeRevocation::InvalidOrgId
-                );
-                if unusable {
-                    failed();
-                }
-                let revocation = (!matches!(answer, FakeRevocation::MissingState)).then_some(
-                    DataPlaneRevocationState {
-                        epoch,
-                        status: status as i32,
-                        updated_at: None,
-                        reason: None,
-                        org_epoch: epoch,
-                    },
-                );
-                let org_id = match answer {
-                    FakeRevocation::InvalidOrgId => "not-an-org-id".to_string(),
-                    _ => org_id,
-                };
                 return crate::tests::grpc_test_response(
                     GetDataPlaneSessionRevocationStateResponse {
                         session_id: session_id.to_string(),
                         protocol_session_id: None,
-                        revocation,
+                        revocation: Some(DataPlaneRevocationState {
+                            epoch,
+                            status: status as i32,
+                            updated_at: None,
+                            reason: None,
+                            org_epoch: epoch,
+                        }),
                         org_id,
                     }
                     .encode_to_vec(),
@@ -1114,26 +1121,72 @@ async fn process_stream_fails_closed_once_its_verdict_is_older_than_the_bound() 
 }
 
 #[tokio::test]
-async fn unusable_revocation_answers_fail_closed_at_once() {
+async fn refused_revocation_check_fails_closed_at_once() {
     if !binding_fake_test_process() {
         return;
     }
-    for answer in [
-        FakeRevocation::MissingState,
-        FakeRevocation::InvalidOrgId,
-        FakeRevocation::Rejected,
-    ] {
-        let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
-        let fake = spawn_revocation_fake(session_id).await;
-        let (mut chunks, mut seen) =
-            open_revocation_checked_events(&fake, session_id, RevocationTimings::default()).await;
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_revocation_fake(session_id).await;
+    let (mut chunks, mut seen) =
+        open_revocation_checked_events(&fake, session_id, RevocationTimings::default()).await;
 
-        // The verdict is fresh, but an answer the data plane cannot use is
-        // not an outage to ride out: the first one ends the stream.
-        fake.answer(answer);
-        read_until(&mut chunks, &mut seen, "backend_stream_error").await;
-        assert_eq!(fake.failed_answers(), 1, "{seen}");
-        assert_stream_ends(&mut chunks).await;
+    // The verdict is fresh, but a refusal is not an outage to ride out: the
+    // first one ends the stream.
+    fake.answer(FakeRevocation::Rejected);
+    read_until(&mut chunks, &mut seen, "backend_stream_error").await;
+    assert_eq!(fake.failed_answers(), 1, "{seen}");
+    assert_stream_ends(&mut chunks).await;
+}
+
+/// Which failed checks keep a fresh verdict: every status the cluster API
+/// could not answer with, and nothing else.
+#[tokio::test]
+async fn only_unanswered_revocation_checks_keep_the_last_verdict() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let state = crate::tests::test_data_plane_state().await;
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    state.revocation_cache.remember_active(
+        session_id,
+        1,
+        OrgId::new(),
+        1,
+        start_revocation_read(&state),
+    );
+    for code in (0..=16).map(tonic::Code::from) {
+        let keeps = match code {
+            tonic::Code::Unavailable
+            | tonic::Code::DeadlineExceeded
+            | tonic::Code::Cancelled
+            | tonic::Code::ResourceExhausted
+            | tonic::Code::Internal
+            | tonic::Code::Unknown => true,
+            tonic::Code::Ok
+            | tonic::Code::InvalidArgument
+            | tonic::Code::NotFound
+            | tonic::Code::AlreadyExists
+            | tonic::Code::PermissionDenied
+            | tonic::Code::FailedPrecondition
+            | tonic::Code::Aborted
+            | tonic::Code::OutOfRange
+            | tonic::Code::Unimplemented
+            | tonic::Code::DataLoss
+            | tonic::Code::Unauthenticated => false,
+        };
+        let error = StreamBridgeError::RevocationStatus(tonic::Status::new(code, "synthetic"));
+        assert_eq!(
+            keeps_last_verdict(&state, session_id, &error),
+            keeps,
+            "{code:?}"
+        );
+    }
+    // Answers that decoded but could not be used.
+    for error in [
+        StreamBridgeError::MissingRevocationState,
+        StreamBridgeError::RouteState("invalid_org_id"),
+    ] {
+        assert!(!keeps_last_verdict(&state, session_id, &error), "{error}");
     }
 }
 
@@ -1157,7 +1210,7 @@ async fn revoked_session_ends_its_stream_at_once() {
 }
 
 /// At production timings and on a paused clock, for every phase of the stream's
-/// checks against its last confirmed one: failed checks keep the verdict
+/// checks against its last confirmed read: failed checks keep the verdict
 /// while the stream can still end within the bound, and no longer.
 #[tokio::test]
 async fn failed_checks_keep_a_verdict_only_while_the_stream_ends_within_the_bound() {
@@ -1170,45 +1223,224 @@ async fn failed_checks_keep_a_verdict_only_while_the_stream_ends_within_the_boun
     state.revocation_check_interval =
         Duration::from_millis(crate::DEFAULT_REVOCATION_CHECK_INTERVAL_MS);
     let interval = state.revocation_check_interval;
+    // The check that fails closed may take the whole check timeout, so it
+    // must start no later than this after the read that confirmed the
+    // verdict; and since checks are an interval apart, no earlier than one
+    // interval before it.
+    let latest_start = REVOCATION_MAX_STALENESS - REVOCATION_CHECK_TIMEOUT;
     let unavailable =
         StreamBridgeError::RevocationStatus(tonic::Status::unavailable("synthetic outage"));
     let step = Duration::from_millis(250);
     let phases = (interval.as_millis() / step.as_millis()) as u32;
     for phase in (0..phases).map(|n| step * n) {
         let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
-        state
-            .revocation_cache
-            .remember_active(session_id, 1, OrgId::new(), 1, interval);
+        state.revocation_cache.remember_active(
+            session_id,
+            1,
+            OrgId::new(),
+            1,
+            start_revocation_read(&state),
+        );
         let confirmed = tokio::time::Instant::now();
         // The first check `phase` after the confirmation, then one per
-        // interval, each decided as soon as it starts. The one that fails
-        // closed may take the whole check timeout to do so.
+        // interval, each decided as soon as it starts.
         tokio::time::advance(phase).await;
-        let ended = loop {
+        let failing_check_started = loop {
             if !keeps_last_verdict(&state, session_id, &unavailable) {
-                break confirmed.elapsed() + REVOCATION_CHECK_TIMEOUT;
+                break confirmed.elapsed();
             }
             tokio::time::advance(interval).await;
         };
         assert!(
-            ended <= REVOCATION_MAX_STALENESS,
-            "phase {phase:?}: ended {ended:?} after the last confirmed check"
+            failing_check_started <= latest_start,
+            "phase {phase:?}: the failing check started {failing_check_started:?} after \
+             the confirmed read"
         );
         assert!(
-            ended > REVOCATION_MAX_STALENESS - interval - REVOCATION_CHECK_TIMEOUT,
-            "phase {phase:?}: ended {ended:?} after the last confirmed check, \
-             well inside the bound"
+            failing_check_started >= latest_start - interval,
+            "phase {phase:?}: the failing check started {failing_check_started:?} after \
+             the confirmed read, a whole interval early"
         );
-        // An answer the data plane cannot use never keeps the verdict.
+    }
+}
+
+/// A stream alone in its org re-reads the org on each of its checks, even
+/// when a check starts a little sooner than one interval after the previous
+/// read began.
+#[tokio::test]
+async fn lone_stream_rereads_its_org_on_every_check() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let mut state = crate::tests::test_data_plane_state().await;
+    tokio::time::pause();
+    state.revocation_check_interval =
+        Duration::from_millis(crate::DEFAULT_REVOCATION_CHECK_INTERVAL_MS);
+    let interval = state.revocation_check_interval;
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let org_id = OrgId::new();
+    state
+        .revocation_cache
+        .remember_active(session_id, 1, org_id, 1, start_revocation_read(&state));
+    for early in [0, 1, 50, 500].map(Duration::from_millis) {
+        tokio::time::advance(interval - early).await;
+        let RevocationProbe::RefreshOrg(refresh) = state
+            .revocation_cache
+            .probe(session_id, revocation_tolerance(&state))
+        else {
+            panic!("a check {early:?} early answered from the cache");
+        };
         state
             .revocation_cache
-            .remember_active(session_id, 2, OrgId::new(), 1, interval);
-        assert!(!keeps_last_verdict(
-            &state,
-            session_id,
-            &StreamBridgeError::MissingRevocationState
-        ));
+            .remember_org_epoch(org_id, 1, start_revocation_read(&state));
+        drop(refresh.guard);
     }
+}
+
+/// The org's confirmation is dated from when each read that confirmed it
+/// began, whether a route resolve or a revocation check, not from when its
+/// slow answer arrived.
+#[tokio::test]
+async fn revocation_verdicts_are_dated_from_when_their_read_began() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_revocation_fake(session_id).await;
+    let mut state = crate::tests::test_data_plane_state().await;
+    state.cluster_api = ClusterApiClients::service_only(
+        pplx_space_node_api_client::cluster::connect(fake.endpoint.clone(), "test")
+            .await
+            .unwrap(),
+    );
+    // Every answer is due for a refresh by the time the next read starts.
+    state.revocation_check_interval = Duration::from_millis(1);
+    fake.answer(FakeRevocation::Slow);
+    let assert_dated_from = |read: &str, began: tokio::time::Instant, state: &DataPlaneState| {
+        let org_id = state
+            .revocation_cache
+            .entries
+            .get(&session_id.to_string())
+            .unwrap()
+            .org_id;
+        let confirmed_at = state
+            .revocation_cache
+            .orgs
+            .get(&org_id)
+            .unwrap()
+            .confirmed_at;
+        assert!(
+            confirmed_at >= began && confirmed_at < began + FAKE_SLOW_ANSWER,
+            "{read}: confirmed {:?} after the read began",
+            confirmed_at - began
+        );
+    };
+
+    let token = format!("{DATA_PLANE_TOKEN_PREFIX}{}", "c".repeat(64));
+    let began = tokio::time::Instant::now();
+    resolve_session_route(&state, session_id, &token)
+        .await
+        .unwrap();
+    assert_dated_from("route resolve", began, &state);
+
+    let began = tokio::time::Instant::now();
+    resolve_session_route_internal(&state, session_id)
+        .await
+        .unwrap();
+    assert_dated_from("internal route resolve", began, &state);
+
+    let began = tokio::time::Instant::now();
+    assert!(!session_is_revoked(&state, session_id).await.unwrap());
+    assert_dated_from("org check", began, &state);
+
+    state.revocation_cache.forget(session_id);
+    let began = tokio::time::Instant::now();
+    assert!(!session_is_revoked(&state, session_id).await.unwrap());
+    assert_dated_from("session check", began, &state);
+}
+
+/// A check that reads the org and then the session gets one timeout for
+/// both reads, not one each.
+#[tokio::test]
+async fn revocation_check_has_one_timeout_across_its_reads() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_revocation_fake(session_id).await;
+    let mut state = crate::tests::test_data_plane_state().await;
+    state.cluster_api = ClusterApiClients::service_only(
+        pplx_space_node_api_client::cluster::connect(fake.endpoint.clone(), "test")
+            .await
+            .unwrap(),
+    );
+    state.revocation_check_interval = Duration::from_millis(1);
+    state.revocation_check_timeout = SPLIT_CHECK_TIMEOUT;
+    let token = format!("{DATA_PLANE_TOKEN_PREFIX}{}", "c".repeat(64));
+    resolve_session_route(&state, session_id, &token)
+        .await
+        .unwrap();
+
+    fake.answer(FakeRevocation::SlowOrgThenHungSession);
+    let started = tokio::time::Instant::now();
+    let error = session_is_revoked(&state, session_id)
+        .await
+        .expect_err("the org moved on, so the hung session read fails closed");
+    let took = started.elapsed();
+    assert!(
+        matches!(&error, StreamBridgeError::RevocationStatus(status)
+            if status.code() == tonic::Code::DeadlineExceeded),
+        "{error}"
+    );
+    // Halfway between one timeout and the org read plus a second timeout.
+    assert!(
+        took < SPLIT_CHECK_TIMEOUT + SPLIT_CHECK_ORG_READ / 2,
+        "the check took {took:?}"
+    );
+}
+
+/// Failed checks are counted apart from the ones that kept the last verdict,
+/// and a check that timed out locally is counted as a timeout.
+#[tokio::test]
+async fn revocation_check_metrics_count_kept_verdicts_and_timeouts() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_revocation_fake(session_id).await;
+    let mut state = crate::tests::test_data_plane_state().await;
+    state.cluster_api = ClusterApiClients::service_only(
+        pplx_space_node_api_client::cluster::connect(fake.endpoint.clone(), "test")
+            .await
+            .unwrap(),
+    );
+    state.revocation_check_interval = Duration::from_millis(1);
+    state.revocation_check_timeout = Duration::from_millis(100);
+    let token = format!("{DATA_PLANE_TOKEN_PREFIX}{}", "c".repeat(64));
+    resolve_session_route(&state, session_id, &token)
+        .await
+        .unwrap();
+    let results = |counters: Vec<pplx_space_metrics::test_capture::CapturedCounter>| {
+        counters
+            .into_iter()
+            .filter(|counter| counter.name == "data_plane.revocation.check")
+            .flat_map(|counter| counter.tags)
+            .filter_map(|tag| tag.strip_prefix("result:").map(str::to_string))
+            .collect::<Vec<_>>()
+    };
+
+    fake.answer(FakeRevocation::Down);
+    let counters = pplx_space_metrics::test_capture::capture_counters_guard();
+    assert!(!session_is_revoked(&state, session_id).await.unwrap());
+    assert_eq!(
+        results(counters.finish()),
+        ["status_error", "kept_last_verdict"]
+    );
+
+    fake.answer(FakeRevocation::Hung);
+    let counters = pplx_space_metrics::test_capture::capture_counters_guard();
+    assert!(!session_is_revoked(&state, session_id).await.unwrap());
+    assert_eq!(results(counters.finish()), ["timeout", "kept_last_verdict"]);
 }
 
 #[tokio::test]
@@ -1255,17 +1487,17 @@ async fn route_cache_hit_does_not_confirm_the_revocation_verdict() {
     assert!(matches!(
         state
             .revocation_cache
-            .probe(session_id, REVOCATION_MAX_STALENESS),
+            .probe(session_id, revocation_tolerance(&state)),
         RevocationProbe::Fresh(true)
     ));
-    // The resolve set the next refresh one interval after it; the cache hit
-    // must not have moved it later.
+    // The resolve set the next refresh just under one interval after it
+    // began; the cache hit must not have moved it later.
     tokio::time::advance(interval - tolerance).await;
     assert!(
         matches!(
             state
                 .revocation_cache
-                .probe(session_id, REVOCATION_MAX_STALENESS),
+                .probe(session_id, revocation_tolerance(&state)),
             RevocationProbe::RefreshOrg(_)
         ),
         "the cache hit pushed the org's next refresh out"
