@@ -127,6 +127,34 @@ async fn claim_all(
         .await
 }
 
+/// Claims `create`, the only due operation, lets a delete of its sandbox be
+/// requested while it holds the claim, so the delete cannot cancel it, then
+/// requeues it straight into a five-minute backoff through the store, as no
+/// dispatcher execution would. Returns the delete.
+async fn delete_behind_a_create_in_backoff(
+    store: &PublicOperationStore,
+    org_id: OrgId,
+    create: OperationId,
+    target_id: &str,
+) -> Result<OperationId, Box<dyn std::error::Error + Send + Sync>> {
+    let claim = claim_all(store).await?;
+    assert_eq!(claimed_ids(&claim), vec![create]);
+    let delete = create_op(store, org_id, OperationKind::DeleteSandbox, target_id).await?;
+    assert!(
+        store
+            .release_claimed_operation(ReleaseClaimedPublicOperation {
+                claim_token: claim.claim_token.clone(),
+                operation_id: create,
+                progress_message: "sandbox pod is not ready".to_string(),
+                retry_after: Duration::from_secs(300),
+                count_attempt: true,
+                undo_first_start: false,
+            })
+            .await?
+    );
+    Ok(delete)
+}
+
 fn claimed_ids(claim: &PublicOperationClaim) -> Vec<OperationId> {
     claim
         .operations
@@ -346,6 +374,19 @@ async fn delete_supersedes_backed_off_work_but_not_a_pending_create() -> TestRes
     let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
     let store = PublicOperationStore::new(db.pool.clone());
 
+    // A create in backoff that the delete could not cancel still owns the
+    // sandbox's future: a delete that ran first would let the create
+    // resurrect it afterwards.
+    let create = create_op(
+        &store,
+        org_id,
+        OperationKind::CreateSandbox,
+        "sbx_create_delete",
+    )
+    .await?;
+    let delete_after_create =
+        delete_behind_a_create_in_backoff(&store, org_id, create, "sbx_create_delete").await?;
+
     // A wake due now is about to run: the delete waits for it. A second
     // wake, a client retry, queues behind the first.
     let wake = create_op(
@@ -369,23 +410,6 @@ async fn delete_supersedes_backed_off_work_but_not_a_pending_create() -> TestRes
         "sbx_wake_delete",
     )
     .await?;
-    // A create in backoff still owns the sandbox's future: a delete that
-    // ran first would let the create resurrect it afterwards.
-    let create = create_op(
-        &store,
-        org_id,
-        OperationKind::CreateSandbox,
-        "sbx_create_delete",
-    )
-    .await?;
-    let delete_after_create = create_op(
-        &store,
-        org_id,
-        OperationKind::DeleteSandbox,
-        "sbx_create_delete",
-    )
-    .await?;
-    defer_until(&db.pool, create, 300).await?;
     // Another create stays schedulable even while this sandbox waits.
     let unrelated = create_op(
         &store,
@@ -583,8 +607,9 @@ fn keyed_claim_kill_switch_reads_from_env() {
 
 /// Regression: a delete requested after a create must not run first and
 /// hard-delete the row, or the create would rebuild the sandbox under the
-/// same id. The delete waits for the create, even while the create sits in
-/// retry backoff.
+/// same id. A delete cancels a create that is only queued; one it could
+/// not cancel, because the create held a claim when the delete arrived, the
+/// delete waits for, even while the create sits in retry backoff.
 #[tokio::test]
 async fn a_delete_requested_after_a_create_never_runs_first() -> TestResult {
     let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
@@ -599,15 +624,7 @@ async fn a_delete_requested_after_a_create_never_runs_first() -> TestResult {
         "sbx_resurrect",
     )
     .await?;
-    let delete = create_op(
-        &store,
-        org_id,
-        OperationKind::DeleteSandbox,
-        "sbx_resurrect",
-    )
-    .await?;
-    // The create failed once and is waiting out its backoff.
-    defer_until(&db.pool, create, 300).await?;
+    let delete = delete_behind_a_create_in_backoff(&store, org_id, create, "sbx_resurrect").await?;
     let executor = KeyedRecordingExecutor::default();
     let config = ReconcilerConfig {
         claim_limit: 8,
@@ -799,5 +816,194 @@ async fn an_execution_finishing_during_a_claim_frees_its_sandbox_for_that_claim(
     .fetch_one(&db.pool)
     .await?;
     assert_eq!(claims, 1);
+    Ok(())
+}
+
+async fn assert_superseded(
+    store: &PublicOperationStore,
+    org_id: OrgId,
+    create: OperationId,
+    delete: OperationId,
+) -> TestResult {
+    let operation = store
+        .fetch_operation(org_id, create)
+        .await?
+        .expect("the create remains visible");
+    assert_eq!(operation.state, OperationState::Canceled, "{create}");
+    assert_eq!(
+        operation.terminal_error_code,
+        Some(PublicErrorCode::OperationFailed)
+    );
+    assert!(operation.completed_at.is_some());
+    let error = operation
+        .terminal_error
+        .expect("a canceled create carries its error envelope");
+    assert_eq!(error["reason"], "superseded_by_delete");
+    assert_eq!(error["delete_operation_id"], delete.to_string());
+    let events = store
+        .fetch_operation_events(org_id, create, None, 20)
+        .await?
+        .expect("the create's events remain visible");
+    let event = events.last().expect("the cancel is recorded");
+    assert_eq!(event.event_type, PublicOperationEventType::Canceled);
+    assert_eq!(event.event["error"], error);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_delete_cancels_its_sandboxs_queued_create_which_then_never_runs() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let other_org = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    // One create is waiting out a retry backoff, one has never been claimed.
+    let backed_off =
+        create_op(&store, org_id, OperationKind::CreateSandbox, "sbx_cancel_1").await?;
+    defer_until(&db.pool, backed_off, 300).await?;
+    let fresh = create_op(&store, org_id, OperationKind::CreateSandbox, "sbx_cancel_2").await?;
+    // Neither another sandbox's create nor another organization's create of
+    // the same id is the delete's to cancel.
+    let unrelated = create_op(&store, org_id, OperationKind::CreateSandbox, "sbx_cancel_3").await?;
+    let foreign = create_op(
+        &store,
+        other_org,
+        OperationKind::CreateSandbox,
+        "sbx_cancel_1",
+    )
+    .await?;
+    let delete_1 = create_op(&store, org_id, OperationKind::DeleteSandbox, "sbx_cancel_1").await?;
+    let delete_2 = create_op(&store, org_id, OperationKind::DeleteSandbox, "sbx_cancel_2").await?;
+    assert_superseded(&store, org_id, backed_off, delete_1).await?;
+    assert_superseded(&store, org_id, fresh, delete_2).await?;
+
+    let executor = KeyedRecordingExecutor::default();
+    let config = ReconcilerConfig {
+        claim_limit: 8,
+        execution_concurrency: 8,
+        ..single_claim_config()
+    };
+    defer_until(&db.pool, backed_off, 0).await?;
+    while tick(&config, &store, &executor).await?.claimed > 0 {}
+
+    let mut ran = executor
+        .completed
+        .lock()
+        .expect("lock")
+        .iter()
+        .map(|(_, id)| *id)
+        .collect::<Vec<_>>();
+    ran.sort();
+    let mut expected = vec![unrelated, foreign, delete_1, delete_2];
+    expected.sort();
+    assert_eq!(ran, expected);
+    assert_superseded(&store, org_id, backed_off, delete_1).await?;
+    Ok(())
+}
+
+/// A create whose attempt is running when a delete of its sandbox is
+/// requested: the delete arrives from inside the attempt, which then fails
+/// retryably.
+#[derive(Clone)]
+struct DeleteDuringCreate {
+    store: PublicOperationStore,
+    org_id: OrgId,
+    delete: Arc<Mutex<Option<OperationId>>>,
+    ran: Arc<Mutex<Vec<OperationId>>>,
+}
+
+#[async_trait::async_trait]
+impl PublicOperationExecutor for DeleteDuringCreate {
+    fn supported_kinds(&self) -> &'static [OperationKind] {
+        &[OperationKind::CreateSandbox, OperationKind::DeleteSandbox]
+    }
+
+    async fn execute(
+        &self,
+        _claim_token: &str,
+        operation: ClaimedPublicOperation,
+    ) -> OperationExecutionResult {
+        self.ran.lock().expect("lock").push(operation.id);
+        if operation.kind == OperationKind::CreateSandbox {
+            let delete = create_op(
+                &self.store,
+                self.org_id,
+                OperationKind::DeleteSandbox,
+                operation
+                    .target_id
+                    .as_deref()
+                    .expect("a create names its sandbox"),
+            )
+            .await
+            .expect("the delete is requested");
+            *self.delete.lock().expect("lock") = Some(delete);
+            return OperationExecutionResult {
+                state: OperationState::Queued,
+                progress_message: "timed out waiting for sandbox pod to become ready".to_string(),
+                result_json: None,
+                terminal_error_code: None,
+                terminal_error_json: None,
+                retry_after: Some(Duration::from_secs(1)),
+                requeue_reason: PublicOperationRequeueReason::TransientFailure,
+            };
+        }
+        OperationExecutionResult {
+            state: OperationState::Succeeded,
+            progress_message: "completed".to_string(),
+            result_json: Some(serde_json::json!({})),
+            terminal_error_code: None,
+            terminal_error_json: None,
+            retry_after: None,
+            requeue_reason: PublicOperationRequeueReason::TransientFailure,
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_create_mid_attempt_when_a_delete_arrives_ends_canceled_instead_of_retrying() -> TestResult
+{
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let create = create_op(
+        &store,
+        org_id,
+        OperationKind::CreateSandbox,
+        "sbx_mid_attempt",
+    )
+    .await?;
+    let executor = DeleteDuringCreate {
+        store: store.clone(),
+        org_id,
+        delete: Arc::default(),
+        ran: Arc::default(),
+    };
+    let config = ReconcilerConfig {
+        claim_limit: 8,
+        execution_concurrency: 8,
+        max_retry_attempts: 10,
+        ..single_claim_config()
+    };
+
+    // The delete waits for the running attempt; the attempt then ends the
+    // create instead of requeueing it.
+    let report = tick(&config, &store, &executor).await?;
+    assert_eq!((report.canceled, report.retried), (1, 0), "{report:?}");
+    let delete = executor
+        .delete
+        .lock()
+        .expect("lock")
+        .expect("the delete was requested");
+    assert_superseded(&store, org_id, create, delete).await?;
+
+    while tick(&config, &store, &executor).await?.claimed > 0 {}
+    assert_eq!(*executor.ran.lock().expect("lock"), vec![create, delete]);
+    assert_eq!(
+        operation_state(&db.pool, delete).await?,
+        OperationState::Succeeded.as_str()
+    );
     Ok(())
 }

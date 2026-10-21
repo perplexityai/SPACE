@@ -150,6 +150,7 @@ fn tick_report_merge_sums_outcomes_without_claim_double_counting() {
         retried: 3,
         stale_claims: 4,
         expired: 5,
+        canceled: 6,
     });
 
     assert_eq!(
@@ -161,6 +162,7 @@ fn tick_report_merge_sums_outcomes_without_claim_double_counting() {
             retried: 3,
             stale_claims: 4,
             expired: 5,
+            canceled: 6,
         }
     );
 }
