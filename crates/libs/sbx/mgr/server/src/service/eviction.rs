@@ -271,17 +271,24 @@ impl SandboxManagerService {
                 .err()
                 .unwrap_or(crate::sandbox_eviction::SkipReason::LocalArtifactAwaitingBackup);
             pplx_space_metrics::sandbox_eviction::skipped(reason.as_str());
+            let held_because =
+                if reason == crate::sandbox_eviction::SkipReason::LocalArtifactStampFailed {
+                    "the cluster proved another local artifact of the sandbox backed, but its \
+                 backup stamp couldn't be written, and the release requires it"
+                } else {
+                    "the cluster can't show another local artifact of the sandbox is backed up, \
+                 and releasing would delete it"
+                };
             tracing::warn!(
                 sandbox_id,
                 %execution_generation,
                 %staged_artifact,
                 reason = reason.as_str(),
-                "retired execution's runtime stays resident: the cluster can't show another \
-                 local artifact of the sandbox is backed up, and releasing would delete it",
+                "retired execution's runtime stays resident: {held_because}",
             );
-            return Err(Status::failed_precondition(
-                "another local artifact of the sandbox awaits its backup",
-            ));
+            return Err(Status::failed_precondition(format!(
+                "retired execution's release is held: {held_because}"
+            )));
         }
         // The release discards the refused capture unpublished. Unless the
         // cluster shows the sandbox is durably restorable without it, that

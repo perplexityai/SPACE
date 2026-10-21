@@ -84,7 +84,7 @@
 //! `deleting` row as a current cleanup — a crash mid-eviction therefore
 //! converges through the existing cleanup recovery paths.
 
-use pplx_space_common_core::types::{LocalArtifactId, SnapshotId};
+use pplx_space_common_core::types::{ArtifactKind, LocalArtifactId, SnapshotId};
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -288,6 +288,11 @@ pub(crate) enum SkipReason {
     /// delete those bytes too. Counted by the teardown driver, not this loop.
     LocalArtifactAwaitingBackup,
     /// A retired execution's teardown release is held because the cluster
+    /// proved another local artifact of the sandbox backed, but its
+    /// `backup_completed_at` stamp couldn't be written, and the release's
+    /// claim requires it. Counted by the teardown driver, not this loop.
+    LocalArtifactStampFailed,
+    /// A retired execution's teardown release is held because the cluster
     /// can't show the sandbox is durably restorable: the refused capture may
     /// be its only copy. Counted by the teardown driver,
     /// not this loop.
@@ -308,6 +313,7 @@ impl SkipReason {
             SkipReason::RpcError => "rpc_error",
             SkipReason::RpcTransportError => "rpc_transport_error",
             SkipReason::LocalArtifactAwaitingBackup => "local_artifact_awaiting_backup",
+            SkipReason::LocalArtifactStampFailed => "local_artifact_stamp_failed",
             SkipReason::NoBackedCopy => "no_backed_copy",
         }
     }
@@ -875,6 +881,20 @@ pub(crate) fn report_eviction_outcome(
     }
 }
 
+/// The exact-artifact readiness query for one local artifact.
+fn local_artifact_readiness(
+    artifact_id: LocalArtifactId,
+    artifact_kind: ArtifactKind,
+) -> pplx_space_node_api_client::proto::backup_readiness_query::Artifact {
+    use pplx_space_node_api_client::proto::{
+        LocalArtifactBackupIdentity, backup_readiness_query::Artifact,
+    };
+    Artifact::LocalArtifact(LocalArtifactBackupIdentity {
+        local_artifact_id: artifact_id.to_string(),
+        artifact_kind: pplx_space_sbx_mgr_client::proto::ArtifactKind::from(artifact_kind) as i32,
+    })
+}
+
 /// Check the cluster for a ready backup of **exactly** the pinned
 /// artifact id without reading its storage location. On success the
 /// local `backup_completed_at` marker is stamped best-effort so the
@@ -888,45 +908,44 @@ async fn prove_pinned_artifact(
     sandbox_id: &str,
     pinned: &PinnedArtifact,
 ) -> Result<bool, SkipReason> {
-    use pplx_space_node_api_client::proto::{
-        LocalArtifactBackupIdentity, backup_readiness_query::Artifact,
-    };
-    let artifact = Artifact::LocalArtifact(LocalArtifactBackupIdentity {
-        local_artifact_id: pinned.artifact_id.to_string(),
-        artifact_kind: match pinned.artifact_kind {
-            pplx_space_common_core::types::ArtifactKind::Disk => {
-                pplx_space_sbx_mgr_client::proto::ArtifactKind::Disk as i32
-            }
-            pplx_space_common_core::types::ArtifactKind::Full => {
-                pplx_space_sbx_mgr_client::proto::ArtifactKind::Full as i32
-            }
-        },
-    });
+    let artifact = local_artifact_readiness(pinned.artifact_id, pinned.artifact_kind);
     if !backup_ready(cluster, sandbox_id, artifact).await? {
         return Ok(false);
     }
+    stamp_backup_marker(service, sandbox_id, pinned.artifact_id).await;
+    Ok(true)
+}
+
+/// Stamp `artifact_id`'s `backup_completed_at` marker after the cluster proved
+/// its backup ready. Returns whether the stamp was written; a failure is
+/// logged. Eviction needs only the proof and re-proves next tick; the
+/// retired-teardown release needs the stamp.
+async fn stamp_backup_marker(
+    service: &SandboxManagerService,
+    sandbox_id: &str,
+    artifact_id: LocalArtifactId,
+) -> bool {
     let service = service.clone();
-    let artifact_id = pinned.artifact_id;
     let stamp = tokio::task::spawn_blocking(move || {
+        // The service's connection, not `LocalArtifacts`', so a poisoned
+        // database mutex still escalates to the supervisor.
         let conn = service.db_conn().map_err(|error| error.to_string())?;
         crate::db::mark_local_artifact_backup_completed(&conn, &artifact_id.to_string())
             .map_err(|error| error.to_string())
     })
     .await;
     let stamp_error = match stamp {
-        Ok(Ok(())) => None,
-        Ok(Err(error)) => Some(error.to_string()),
-        Err(join_error) => Some(join_error.to_string()),
+        Ok(Ok(())) => return true,
+        Ok(Err(error)) => error,
+        Err(join_error) => join_error.to_string(),
     };
-    if let Some(error) = stamp_error {
-        warn!(
-            sandbox_id,
-            local_artifact_id = %pinned.artifact_id,
-            error,
-            "sandbox eviction: failed to stamp backup marker after exact-artifact proof; next tick re-proves via RPC",
-        );
-    }
-    Ok(true)
+    warn!(
+        sandbox_id,
+        local_artifact_id = %artifact_id,
+        error = stamp_error,
+        "failed to stamp a local artifact's backup marker after the cluster proved its backup ready",
+    );
+    false
 }
 
 /// The newest local upload generation of an unpinned cache, when the cluster
@@ -953,7 +972,9 @@ async fn ready_unpinned_suspend_generation(
 /// eviction makes for a pinned artifact ([`prove_pinned_artifact`]), stamping
 /// each proven one's `backup_completed_at` marker. `Ok(false)` at the first
 /// one the cluster has no ready backup of; a failure to get an answer is its
-/// classified reason. An artifact restored from another node's backup carries
+/// classified reason, and a proven artifact whose stamp couldn't be written is
+/// [`SkipReason::LocalArtifactStampFailed`], since the release's claim
+/// requires the stamp. An artifact restored from another node's backup carries
 /// no stamp and no upload job that could repair it, so this is how it stops
 /// holding a release.
 pub(crate) async fn prove_local_artifact_backups(
@@ -971,13 +992,17 @@ pub(crate) async fn prove_local_artifact_backups(
             SkipReason::RpcTransportError
         })?;
     for artifact in artifacts {
-        let pinned = PinnedArtifact {
-            artifact_id: artifact.local_artifact_id,
-            artifact_kind: artifact.artifact_kind,
-            backup_marker: false,
-        };
-        if !prove_pinned_artifact(&mut cluster, service, sandbox_id, &pinned).await? {
+        if !backup_ready(
+            &mut cluster,
+            sandbox_id,
+            local_artifact_readiness(artifact.local_artifact_id, artifact.artifact_kind),
+        )
+        .await?
+        {
             return Ok(false);
+        }
+        if !stamp_backup_marker(service, sandbox_id, artifact.local_artifact_id).await {
+            return Err(SkipReason::LocalArtifactStampFailed);
         }
     }
     Ok(true)

@@ -515,7 +515,10 @@ async fn retired_execution_without_a_successor_still_registers() -> TestResult {
 
 /// A newer claim abandoned before it materialized a pod never ran, so it
 /// doesn't supersede the execution below it. One that materialized does, even
-/// after it retired.
+/// after it retired: by its `pod_uid` alone while the materialization record
+/// is unset (a row from before the record, until the backfill stamps it), and
+/// by the record once its `pod_uid` is cleared, as pod re-materialization and
+/// failed-recovery pod absence clear it after the pod may have run.
 #[tokio::test(flavor = "current_thread")]
 async fn only_a_newer_execution_that_ran_supersedes() -> TestResult {
     let Some(fixture) = cluster_fixture().await? else {
@@ -530,19 +533,83 @@ async fn only_a_newer_execution_that_ran_supersedes() -> TestResult {
     begin_teardown_backup(&fixture.service, source_ip, sandbox_id, admitted, 5).await?;
     assert_eq!(snapshot_state(pool, admitted).await?, "creating");
 
+    for (case, update) in [
+        (
+            "a recorded pod UID with no materialization record",
+            sql!(
+                "UPDATE sandbox_k8s_executions SET pod_uid = 'pod-uid-6'
+                  WHERE sandbox_id = $1 AND generation = 6"
+            ),
+        ),
+        (
+            "a materialization record whose pod UID was cleared",
+            sql!(
+                "UPDATE sandbox_k8s_executions
+                    SET pod_uid = NULL, pod_materialized_at = NOW()
+                  WHERE sandbox_id = $1 AND generation = 6"
+            ),
+        ),
+    ] {
+        sqlx::query(update).bind(sandbox_id).execute(pool).await?;
+        let refused = SnapshotId::new();
+        let error = begin_teardown_backup(&fixture.service, source_ip, sandbox_id, refused, 5)
+            .await
+            .expect_err(case);
+        assert_superseded_refusal(&error, 5);
+        assert_eq!(snapshot_row_count(pool, refused).await?, 0, "{case}");
+    }
+    Ok(())
+}
+
+/// The last execution of a sandbox, retired as `forgotten` with nothing
+/// newer, left the row `suspended` on no node. Its capture can't register,
+/// but it isn't superseded either: it may hold writes newer than the ready
+/// snapshot the sandbox is durably restorable from. So it gets the plain
+/// source-node refusal, which keeps it on the node, and not the verdict that
+/// would have the node discard it.
+#[tokio::test(flavor = "current_thread")]
+async fn last_execution_on_no_node_keeps_its_capture() -> TestResult {
+    let Some(fixture) = cluster_fixture().await? else {
+        return Ok(());
+    };
+    let pool = &fixture.service.pool;
+    let (sandbox_id, source_ip, _) = seed_sandbox_on_source_node(pool).await?;
+    insert_execution(pool, sandbox_id, 1, "running", true).await?;
+    let earlier = SnapshotId::new();
+    begin_teardown_backup(&fixture.service, source_ip, sandbox_id, earlier, 1).await?;
+    finalize_artifact_backup_from_node(&fixture.service, source_ip, earlier).await?;
     sqlx::query(sql!(
-        "UPDATE sandbox_k8s_executions SET pod_uid = 'pod-uid-6'
-          WHERE sandbox_id = $1 AND generation = 6"
+        "UPDATE sandbox_k8s_executions SET active = FALSE, state = 'forgotten'
+          WHERE sandbox_id = $1 AND generation = 1"
     ))
     .bind(sandbox_id)
     .execute(pool)
     .await?;
-    let refused = SnapshotId::new();
-    let error = begin_teardown_backup(&fixture.service, source_ip, sandbox_id, refused, 5)
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET lifecycle = 'suspended', placement = 'unplaced',
+                active_node_id = NULL, target_node_id = NULL, placement_changed_at = NULL
+          WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(pool)
+    .await?;
+    assert!(
+        pplx_space_sandbox_store::durably_restorable(pool, sandbox_id).await?,
+        "the earlier snapshot makes the sandbox restorable without the capture"
+    );
+
+    let later = SnapshotId::new();
+    let error = begin_teardown_backup(&fixture.service, source_ip, sandbox_id, later, 1)
         .await
-        .expect_err("a newer execution that materialized a pod supersedes this one");
-    assert_superseded_refusal(&error, 5);
-    assert_eq!(snapshot_row_count(pool, refused).await?, 0);
+        .expect_err("a capture with no source node can't register");
+    assert_eq!(error.code(), Code::FailedPrecondition, "{error}");
+    assert_eq!(
+        backup_execution_superseded_generation(&error),
+        None,
+        "the last execution's capture isn't declared superseded: {error:?}"
+    );
+    assert_eq!(snapshot_row_count(pool, later).await?, 0);
     Ok(())
 }
 

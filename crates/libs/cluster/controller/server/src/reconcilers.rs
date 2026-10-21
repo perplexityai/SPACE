@@ -25,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 use crate::admin_audit_retention;
 use crate::data_plane_session_retention;
 use crate::drained_node_terminator;
+use crate::execution_materialization_backfill;
 use crate::failed_restorable_repair;
 use crate::kube_node_sync;
 use crate::node_drain;
@@ -395,6 +396,14 @@ pub async fn run_reconcilers(
             tracing::info!("skipping Kubernetes-only reconcilers on direct substrate");
         }
         Some(kube) => {
+            // Kubernetes executions are the only rows that record a pod.
+            handles.push(tokio::spawn(
+                execution_materialization_backfill::run_with_pool(
+                    execution_materialization_backfill::ReconcilerConfig::default(),
+                    pool.clone(),
+                    shutdown_token.child_token(),
+                ),
+            ));
             let kube = Arc::new(kube.clone());
             let warm_pool_token = shutdown_token.child_token();
             let warm_pool_store = WarmPoolStore::new(pool.clone());

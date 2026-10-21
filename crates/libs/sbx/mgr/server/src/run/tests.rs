@@ -1373,6 +1373,75 @@ async fn daemon_migrations_converge_jobs_from_each_supported_schema() {
     }
 }
 
+/// Recording a teardown capture's execution generation writes nothing a
+/// sandbox-manager migration owns: the record is a file in the capture's
+/// directory, and this change adds no migration. A database this release
+/// wrote, holding a staged capture with its record, its pending teardown and
+/// a pending upload, goes through the startup migration step again with that
+/// state intact. A manager rolled back to the previous release runs the same
+/// step with the same catalog, which is what refused the database when the
+/// record was a migration's column.
+#[tokio::test]
+async fn a_database_holding_a_recorded_capture_reopens_at_startup() {
+    use pplx_space_common_jobs::{JobPriority, db as jobs};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sandbox-manager.db");
+    crate::db::migrate_at(&path).await.unwrap();
+    let conn = crate::db::Connection::open_at(&path).unwrap();
+    let sandbox_id = pplx_space_common_core::types::SandboxId::new();
+    let generation = pplx_space_common_core::types::ExecutionGeneration::new(7).unwrap();
+    let staged = crate::service::tests::service_tests::insert_stranded_teardown_suspend_sandbox(
+        &conn, sandbox_id, generation,
+    );
+    let artifact_dir = dir.path().join("suspend");
+    std::fs::create_dir_all(&artifact_dir).unwrap();
+    crate::capture_record::write(&artifact_dir, staged, generation).unwrap();
+    conn.execute(
+        "UPDATE local_artifacts SET local_path = ?1 WHERE local_artifact_id = ?2",
+        crate::db::fixture::params![artifact_dir.to_str().unwrap(), staged.to_string()],
+    )
+    .unwrap();
+    let upload: pplx_space_common_core::types::JobId =
+        "019d84bd-280d-7331-99c6-000000000003".parse().unwrap();
+    jobs::insert_job(
+        conn.raw(),
+        jobs::InsertJob {
+            job_id: &upload,
+            kind: crate::snapshot_upload_jobs::SNAPSHOT_UPLOAD_JOB_KIND,
+            payload: "{}",
+            subject_id: Some(&sandbox_id.to_string()),
+            dedup_key: Some(&staged.to_string()),
+            max_attempts: 3,
+            traceparent: None,
+            priority: JobPriority::default(),
+        },
+    )
+    .unwrap();
+    drop(conn);
+
+    crate::db::migrate_at(&path)
+        .await
+        .expect("a manager with the same catalog opens the database");
+    let conn = crate::db::Connection::open_at(&path).unwrap();
+    let row = crate::db::get_sandbox(&conn, &sandbox_id.to_string())
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, crate::state::SandboxState::Suspending);
+    assert_eq!(row.current_local_artifact_id, Some(staged));
+    assert_eq!(
+        crate::db::latest_teardown_suspend_operation(&conn, &sandbox_id.to_string())
+            .unwrap()
+            .map(|operation| operation.execution_generation),
+        Some(generation),
+        "the pending teardown survives the reopen"
+    );
+    assert!(jobs::get_job(conn.raw(), &upload).unwrap().is_some());
+    assert_eq!(
+        crate::capture_record::read(&artifact_dir, staged).unwrap(),
+        Some(generation)
+    );
+}
+
 #[tokio::test]
 async fn daemon_migration_failure_preserves_durable_jobs() {
     use pplx_space_common_jobs::{JobPriority, db as jobs};

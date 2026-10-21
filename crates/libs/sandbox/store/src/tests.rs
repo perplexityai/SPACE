@@ -696,13 +696,14 @@ async fn insert_full_snapshot(
     Ok(())
 }
 
-/// A sandbox marked to a local artifact is durably restorable only through
-/// that artifact's ready backup with a live location: a stale ready snapshot
-/// of another artifact doesn't count, since the restore wouldn't select it. An
+/// A sandbox marked to a local artifact is durably restorable through a ready
+/// backup of that artifact with a live location: a stale ready snapshot of
+/// another artifact doesn't count, since the restore wouldn't select it. An
 /// unmarked sandbox needs a ready full snapshot at least as fresh as its last
-/// placement change, with no newer full row in any state; an evacuation-marked
-/// one only a ready newest full snapshot. A restoring row needs a source taken
-/// before the restore started. A missing sandbox isn't restorable.
+/// placement change, with no newer full row (a failed one, say); an
+/// evacuation-marked one a ready newest full snapshot, however old. A
+/// restoring row needs a source taken before the restore started. A missing
+/// sandbox isn't restorable.
 #[tokio::test(flavor = "current_thread")]
 async fn durably_restorable_follows_the_marker_and_placement() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
@@ -833,6 +834,19 @@ async fn durably_restorable_follows_the_marker_and_placement() -> TestResult {
     assert!(
         durably_restorable(pool, SandboxId::from_uuid(evacuating)).await?,
         "an evacuation's newest ready snapshot"
+    );
+    insert_full_snapshot(
+        pool,
+        evacuating,
+        Uuid::now_v7(),
+        "creating",
+        "2026-04-02T00:00:00Z",
+        false,
+    )
+    .await?;
+    assert!(
+        !durably_restorable(pool, SandboxId::from_uuid(evacuating)).await?,
+        "a newer unfinished full row is the evacuation's newest"
     );
 
     // A restoring row needs a source in its retry window: a snapshot taken

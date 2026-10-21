@@ -15602,44 +15602,61 @@ pub(crate) mod service_tests {
         assert_eq!(row.current_local_artifact_id, Some(local_artifact_id));
     }
 
+    /// Recovery adopts a teardown capture it finds staged or already
+    /// published, pins it for backup without cleaning up, and records its
+    /// execution generation in the published capture.
     #[tokio::test]
     async fn startup_recovery_adopts_but_does_not_cleanup_an_unbacked_teardown_artifact() {
-        let conn = crate::db::test_conn();
-        let sandbox_id = SandboxId::new().to_string();
-        insert_test_sandbox(&conn, &sandbox_id, SandboxState::Paused);
-        crate::db::begin_teardown_suspend(&conn, &sandbox_id, teardown_generation()).unwrap();
+        for staged in [true, false] {
+            let conn = crate::db::test_conn();
+            let sandbox_id = SandboxId::new().to_string();
+            insert_test_sandbox(&conn, &sandbox_id, SandboxState::Paused);
+            crate::db::begin_teardown_suspend(&conn, &sandbox_id, teardown_generation()).unwrap();
 
-        let cache_dir = tempfile::tempdir().unwrap();
-        let local_artifact_id = LocalArtifactId::new();
-        let snapshot_dir = canonical_suspend_snapshot_dir(&cache_dir.path().join(&sandbox_id));
-        write_full_suspend_artifact(
-            &snapshot_dir,
-            &sandbox_id,
-            local_artifact_id,
-            b"published-before-db-pin",
-        );
+            let cache_dir = tempfile::tempdir().unwrap();
+            let local_artifact_id = LocalArtifactId::new();
+            let sandbox_dir = cache_dir.path().join(&sandbox_id);
+            let snapshot_dir = canonical_suspend_snapshot_dir(&sandbox_dir);
+            let written_dir = if staged {
+                suspend_snapshot_staging_dir(&sandbox_dir, local_artifact_id)
+            } else {
+                snapshot_dir.clone()
+            };
+            write_full_suspend_artifact(
+                &written_dir,
+                &sandbox_id,
+                local_artifact_id,
+                b"published-before-db-pin",
+            );
 
-        let service = service_with_runtime_probe(conn, false);
-        let records = service
-            .recover_prelaunch_startup_states_in(cache_dir.path(), &Default::default())
-            .unwrap();
+            let service = service_with_runtime_probe(conn, false);
+            let records = service
+                .recover_prelaunch_startup_states_in(cache_dir.path(), &Default::default())
+                .unwrap();
 
-        assert_eq!(records.len(), 1);
-        assert_eq!(
-            records[0].outcome,
-            crate::db::StartupRecoveryOutcome::Deferred,
-            "planned teardown must wait for remote durability before runtime cleanup",
-        );
-        let db = service.db.lock().expect("mutex poisoned");
-        let row = crate::db::get_sandbox(&db, &sandbox_id).unwrap().unwrap();
-        assert_eq!(row.state, SandboxState::Suspending);
-        assert_eq!(row.current_local_artifact_id, Some(local_artifact_id));
-        assert!(
-            crate::db::get_local_artifact(&db, local_artifact_id)
-                .unwrap()
-                .is_some(),
-            "recovery must pin the complete artifact so backup can resume",
-        );
+            assert_eq!(records.len(), 1, "staged: {staged}");
+            assert_eq!(
+                records[0].outcome,
+                crate::db::StartupRecoveryOutcome::Deferred,
+                "planned teardown must wait for remote durability before runtime cleanup \
+                 (staged: {staged})",
+            );
+            let db = service.db.lock().expect("mutex poisoned");
+            let row = crate::db::get_sandbox(&db, &sandbox_id).unwrap().unwrap();
+            assert_eq!(row.state, SandboxState::Suspending, "staged: {staged}");
+            assert_eq!(row.current_local_artifact_id, Some(local_artifact_id));
+            assert!(
+                crate::db::get_local_artifact(&db, local_artifact_id)
+                    .unwrap()
+                    .is_some(),
+                "recovery must pin the complete artifact so backup can resume (staged: {staged})",
+            );
+            assert_eq!(
+                crate::capture_record::read(&snapshot_dir, local_artifact_id).unwrap(),
+                Some(teardown_generation()),
+                "staged: {staged}"
+            );
+        }
     }
 
     #[tokio::test]

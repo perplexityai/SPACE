@@ -115,6 +115,10 @@ pub fn malformed_updated_at(rows: u64) {
 ///   release is held because another local artifact of the sandbox still
 ///   awaits its backup; the pod keeps terminating until it completes.
 ///   Emitted by the teardown driver once per drive.
+/// - `local_artifact_stamp_failed` — a retired execution's teardown release
+///   is held because the cluster proved another local artifact of the sandbox
+///   backed, but its node-local backup stamp couldn't be written, and the
+///   release requires it. Emitted by the teardown driver once per drive.
 /// - `no_backed_copy` — a retired execution's teardown release is held
 ///   because the cluster can't show the sandbox is durably restorable, so the
 ///   refused capture may be its only copy; the runtime stays resident.

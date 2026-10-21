@@ -126,6 +126,13 @@ impl K8sStore {
     /// row. Callers must have taken the row lock first
     /// (`lock_active_execution_state_in`) — the guarded UPDATE alone cannot
     /// distinguish "row already current" from "row retired underneath".
+    ///
+    /// Stamps `pod_materialized_at` when the row records a pod UID, or held
+    /// one before this write replaces or clears it, and never clears a stamp:
+    /// the record that a pod ran must outlive the UID. An otherwise unchanged
+    /// row is still written when it carries a UID and no stamp, so a row from
+    /// before the record gains one; that write leaves `state` and
+    /// `updated_at` as they were.
     pub(super) async fn update_active_execution_pod_metadata(
         &self,
         conn: &mut PgConnection,
@@ -138,13 +145,46 @@ impl K8sStore {
             "UPDATE sandbox_k8s_executions
              SET pod_uid = $1::TEXT,
                  pod_ip = $2::INET,
+                 pod_materialized_at = COALESCE(
+                     pod_materialized_at,
+                     CASE
+                         WHEN NULLIF(BTRIM(pod_uid), '') IS NOT NULL
+                           OR NULLIF(BTRIM($1::TEXT), '') IS NOT NULL
+                         THEN NOW()
+                     END
+                 ),
                  state = CASE
                      WHEN state = 'recovering' THEN state
+                     WHEN NOT (
+                         pod_uid IS DISTINCT FROM $1::TEXT
+                         OR pod_ip IS DISTINCT FROM $2::INET
+                         OR (
+                             state NOT IN ('running', 'recovering')
+                             AND (
+                                 $2::TEXT IS NOT NULL
+                                 OR ($1::TEXT IS NOT NULL AND state <> 'created')
+                             )
+                         )
+                     ) THEN state
                      WHEN $2::TEXT IS NOT NULL THEN 'running'
                      WHEN $1::TEXT IS NOT NULL THEN 'created'
                      ELSE state
                  END,
-                 updated_at = CASE WHEN state = 'recovering' THEN updated_at ELSE NOW() END
+                 updated_at = CASE
+                     WHEN state = 'recovering' THEN updated_at
+                     WHEN NOT (
+                         pod_uid IS DISTINCT FROM $1::TEXT
+                         OR pod_ip IS DISTINCT FROM $2::INET
+                         OR (
+                             state NOT IN ('running', 'recovering')
+                             AND (
+                                 $2::TEXT IS NOT NULL
+                                 OR ($1::TEXT IS NOT NULL AND state <> 'created')
+                             )
+                         )
+                     ) THEN updated_at
+                     ELSE NOW()
+                 END
              WHERE sandbox_id = $3 AND generation = $4 AND active
                AND (
                  pod_uid IS DISTINCT FROM $1::TEXT
@@ -154,6 +194,13 @@ impl K8sStore {
                      AND (
                          $2::TEXT IS NOT NULL
                          OR ($1::TEXT IS NOT NULL AND state <> 'created')
+                     )
+                 )
+                 OR (
+                     pod_materialized_at IS NULL
+                     AND (
+                         NULLIF(BTRIM(pod_uid), '') IS NOT NULL
+                         OR NULLIF(BTRIM($1::TEXT), '') IS NOT NULL
                      )
                  )
                )"
@@ -1027,10 +1074,16 @@ impl K8sStore {
                 .db_context("failed to commit create claim reset transaction")?;
             return Ok(false);
         }
+        // Clearing the pod UID stamps `pod_materialized_at` first if the row
+        // held one, so the record that a pod ran outlives the UID.
         let reset = sqlx::query(sql!(
             "UPDATE sandbox_k8s_executions
              SET pod_uid = NULL,
                  pod_ip = NULL,
+                 pod_materialized_at = COALESCE(
+                     pod_materialized_at,
+                     CASE WHEN NULLIF(BTRIM(pod_uid), '') IS NOT NULL THEN NOW() END
+                 ),
                  state = 'creating',
                  updated_at = NOW()
              WHERE sandbox_id = $1

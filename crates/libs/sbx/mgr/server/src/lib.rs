@@ -5,6 +5,7 @@
 
 pub(crate) mod btrfs_via_nodemgr;
 pub(crate) mod byok;
+pub(crate) mod capture_record;
 pub mod config;
 pub mod disk_usage;
 mod firecracker_via_nodemgr;

@@ -17,6 +17,7 @@ mod admin_audit_retention;
 mod data_plane_session_retention;
 mod drained_node_terminator;
 mod env_config;
+mod execution_materialization_backfill;
 mod failed_restorable_repair;
 mod kube_node_sync;
 mod leader_election;

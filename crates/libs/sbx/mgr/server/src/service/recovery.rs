@@ -950,6 +950,23 @@ impl SandboxManagerService {
         match decision {
             SuspendSnapshotPublicationDecision::CanonicalReady(artifact) => {
                 if let Some(execution_generation) = teardown_generation {
+                    // A capture published before its record was written gets
+                    // one now. Best effort: the capture is already published,
+                    // and without the record a re-request falls back to the
+                    // upload job's and the running teardown's generation.
+                    if let Err(error) = crate::capture_record::write(
+                        &artifact.path,
+                        artifact.local_artifact_id,
+                        execution_generation,
+                    ) {
+                        tracing::warn!(
+                            sandbox_id = %row.id,
+                            local_artifact_id = %artifact.local_artifact_id,
+                            %execution_generation,
+                            %error,
+                            "could not record a recovered capture's execution generation",
+                        );
+                    }
                     return self.stage_recovered_teardown_artifact(
                         row,
                         execution_generation,
@@ -967,12 +984,18 @@ impl SandboxManagerService {
             }
             SuspendSnapshotPublicationDecision::StagedComplete(staged) => {
                 let snapshot_dir = canonical_suspend_snapshot_dir(&sandbox_dir);
-                let published = suspend_snapshot_publication::publish_suspend_snapshot_dir(
-                    &staged.staging_dir,
-                    &snapshot_dir,
-                    staged.local_artifact_id,
-                    verdicts,
-                );
+                // A teardown capture is recorded before it's published, as the
+                // live path does; a record that can't be written defers the
+                // publication like a failed publish.
+                let published =
+                    suspend_snapshot_publication::publish_recorded_suspend_snapshot_dir(
+                        &staged.staging_dir,
+                        &snapshot_dir,
+                        staged.local_artifact_id,
+                        teardown_generation,
+                        verdicts,
+                    )
+                    .map_err(|error| error.to_string());
                 let error = match published {
                     Ok(garbage) => {
                         for path in garbage {

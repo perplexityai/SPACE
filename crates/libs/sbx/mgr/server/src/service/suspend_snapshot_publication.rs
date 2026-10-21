@@ -1,8 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use pplx_space_common_core::types::{
-    ArtifactKind, ArtifactOrigin, ContentHash, DEFAULT_GUEST_USER, ExecutionMetadata,
-    LocalArtifactId, RuntimeKind, SandboxId, SandboxOwner, SandboxRuntimeLabel, TemplateName,
+    ArtifactKind, ArtifactOrigin, ContentHash, DEFAULT_GUEST_USER, ExecutionGeneration,
+    ExecutionMetadata, LocalArtifactId, RuntimeKind, SandboxId, SandboxOwner, SandboxRuntimeLabel,
+    TemplateName,
 };
 
 use crate::retained_source::{
@@ -929,6 +930,40 @@ pub(super) fn release_retired_suspend_snapshot(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+/// Why a staged capture wasn't published by
+/// [`publish_recorded_suspend_snapshot_dir`].
+#[derive(Debug, thiserror::Error)]
+pub(super) enum RecordedPublicationError {
+    #[error("recording the capture's execution failed: {0}")]
+    Record(#[source] std::io::Error),
+    #[error(transparent)]
+    Publish(#[from] SuspendSnapshotPublicationError),
+}
+
+/// Publish a staged capture as [`publish_suspend_snapshot_dir`] does. A
+/// teardown suspend's capture, the one with an `execution_generation`, first
+/// records the execution that took it ([`crate::capture_record`]) in its
+/// staging directory, so the record is published with the bytes and lasts as
+/// long as they do. A capture whose record can't be written isn't published.
+pub(super) fn publish_recorded_suspend_snapshot_dir(
+    staging_dir: &Path,
+    snapshot_dir: &Path,
+    local_artifact_id: LocalArtifactId,
+    execution_generation: Option<ExecutionGeneration>,
+    verdicts: &RetainedSourceVerdicts,
+) -> Result<Vec<PathBuf>, RecordedPublicationError> {
+    if let Some(execution_generation) = execution_generation {
+        crate::capture_record::write(staging_dir, local_artifact_id, execution_generation)
+            .map_err(RecordedPublicationError::Record)?;
+    }
+    Ok(publish_suspend_snapshot_dir(
+        staging_dir,
+        snapshot_dir,
+        local_artifact_id,
+        verdicts,
+    )?)
 }
 
 /// Publish `staging_dir` as the canonical snapshot. Returns the lane entries

@@ -15,11 +15,12 @@ use super::create_support::SUSPEND_CHECKPOINT;
 use super::network_runtime::*;
 use super::recovery::SuspendSnapshotPublicationRecoveryOrigin;
 use super::suspend_snapshot_publication::{
-    SuspendSnapshotPublicationDecision, canonical_suspend_snapshot_dir,
+    RecordedPublicationError, SuspendSnapshotPublicationDecision, canonical_suspend_snapshot_dir,
     classify_suspend_snapshot_publication, commit_encrypted_capture_record,
-    prepare_encrypted_capture_record, publish_suspend_snapshot_dir, read_encrypted_capture_record,
-    recorded_encrypted_capture_to_seal, remove_encrypted_capture_record,
-    suspend_snapshot_staging_dir, suspend_snapshot_staging_parent_dir,
+    prepare_encrypted_capture_record, publish_recorded_suspend_snapshot_dir,
+    read_encrypted_capture_record, recorded_encrypted_capture_to_seal,
+    remove_encrypted_capture_record, suspend_snapshot_staging_dir,
+    suspend_snapshot_staging_parent_dir,
 };
 use super::tail_support::*;
 use super::validation::optional_positive_or_default;

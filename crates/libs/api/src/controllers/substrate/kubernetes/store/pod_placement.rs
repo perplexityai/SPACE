@@ -109,11 +109,17 @@ impl K8sStore {
         Self::lock_sandbox_for_execution_lifecycle_in(&mut tx, sandbox_id, expected_lifecycle)
             .await?;
 
+        // Clearing the pod UID stamps `pod_materialized_at` first if the row
+        // held one, so the record that a pod ran outlives the UID.
         let claimed = sqlx::query(sql!(
             "UPDATE sandbox_k8s_executions
              SET state = CASE WHEN state = 'recovering' THEN state ELSE 'creating' END,
                  pod_uid = NULL,
                  pod_ip = NULL,
+                 pod_materialized_at = COALESCE(
+                     pod_materialized_at,
+                     CASE WHEN NULLIF(BTRIM(pod_uid), '') IS NOT NULL THEN NOW() END
+                 ),
                  updated_at = NOW()
              WHERE sandbox_id = $1 AND generation = $2 AND active
              RETURNING 1"

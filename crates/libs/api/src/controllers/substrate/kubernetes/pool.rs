@@ -542,9 +542,12 @@ pub(super) async fn persist_pooled_execution_claim(
     sqlx::query(sql!(
         "INSERT INTO sandbox_k8s_executions (
              sandbox_id, generation, pod_name, pod_namespace, pod_uid, pod_ip,
-             k8s_node_name, state, active, route_activation_id
+             k8s_node_name, state, active, route_activation_id, pod_materialized_at
          )
-         VALUES ($1, 1, $2, $3, $4, $5::inet, $6, 'running', TRUE, $7)"
+         VALUES (
+             $1, 1, $2, $3, $4, $5::inet, $6, 'running', TRUE, $7,
+             CASE WHEN NULLIF(BTRIM($4::TEXT), '') IS NOT NULL THEN NOW() END
+         )"
     ))
     .bind(claim.sandbox_id)
     .bind(&source.pod_name)

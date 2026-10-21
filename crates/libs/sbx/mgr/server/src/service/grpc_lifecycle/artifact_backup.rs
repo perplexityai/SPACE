@@ -952,53 +952,8 @@ impl SandboxManagerService {
                 self.snapshot_upload_config.is_some(),
             )?,
         };
-        // A fresh attempt registers under the execution generation the
-        // artifact's earlier attempt carried, so a teardown capture the
-        // control plane refused stays refused when the backup is requested
-        // again by artifact id. The control plane fences only an artifact's
-        // first registration, so a capture it admitted once registers again.
-        // Every attempt carries the generation forward, so the chain lasts
-        // until the jobs are pruned.
-        // An earlier upload that can't be decoded can't vouch for its
-        // generation, so the re-request is refused rather than sent unfenced.
-        let execution_generation = previous_job
-            .as_ref()
-            .map(|job| job.payload_as::<crate::snapshot_upload::SnapshotUploadJobs>())
-            .transpose()
-            .map_err(|error| {
-                Status::failed_precondition(format!(
-                    "earlier artifact backup payload is invalid for {}, so its execution \
-                     generation is unknown: {error}",
-                    artifact.local_artifact_id
-                ))
-            })?
-            .and_then(|payload| payload.execution_generation);
-        // A teardown capture requested before its own upload job exists has no
-        // earlier attempt to carry the generation, so take it from the running
-        // teardown that staged it: the row still pins the capture, in any state
-        // the teardown drive treats as its own (a restart mid-teardown leaves it
-        // in cleanup). A suspended row's artifact belongs to an earlier
-        // node-local suspend: its upload is the earlier attempt above, and
-        // without one (no destination when it suspended) it stays unfenced.
-        let execution_generation = match execution_generation {
-            Some(generation) => Some(generation),
-            None if matches!(
-                sandbox.state,
-                SandboxState::Suspending
-                    | SandboxState::CleanupRequired
-                    | SandboxState::CleanupFailed
-            ) && sandbox.current_local_artifact_id == Some(artifact.local_artifact_id) =>
-            {
-                let db = self.db_conn()?;
-                crate::db::latest_teardown_suspend_operation(&db, &sandbox.id)
-                    .map_err(|error| Status::internal(format!("teardown job lookup: {error}")))?
-                    .filter(|operation| {
-                        operation.status == crate::db::TeardownSuspendOperationStatus::Running
-                    })
-                    .map(|operation| operation.execution_generation)
-            }
-            None => None,
-        };
+        let execution_generation =
+            self.capture_execution_generation(&sandbox, &artifact, previous_job.as_ref())?;
         let backup_attempt_id = pplx_space_common_core::types::BackupAttemptId::new();
         let backup_attempt_id = match self
             .submit_artifact_backup(
@@ -1247,6 +1202,91 @@ impl SandboxManagerService {
         };
         Ok(job_id)
     }
+}
+
+impl SandboxManagerService {
+    /// The execution generation a fresh backup attempt of `artifact`
+    /// registers under: the one whose teardown suspend captured it, so a
+    /// capture the control plane refused as superseded stays refused when the
+    /// backup is requested again by artifact id. The control plane fences only
+    /// an artifact's first registration, so a capture it admitted once
+    /// registers again.
+    ///
+    /// The capture records the generation in its capture record
+    /// ([`crate::capture_record`]), which lasts as long as the bytes do. A
+    /// capture written before that record existed falls back to the
+    /// generation its earlier upload carried, until
+    /// the job store prunes that job, and then to the running teardown that
+    /// staged it while the row still pins the capture in a state the teardown
+    /// drive treats as its own (a restart mid-teardown leaves it in cleanup).
+    /// A recorded capture registers under its generation whatever its row's
+    /// state, a suspended one included: the bytes are that execution's. A
+    /// suspended row's unrecorded artifact belongs to an earlier node-local
+    /// suspend: its upload is the earlier attempt, and without one (no
+    /// destination when it suspended) it stays unfenced.
+    fn capture_execution_generation(
+        &self,
+        sandbox: &crate::db::SandboxRow,
+        artifact: &crate::db::LocalArtifactRow,
+        previous_job: Option<&pplx_space_common_jobs::Job>,
+    ) -> Result<Option<pplx_space_common_core::types::ExecutionGeneration>, Status> {
+        if let Some(generation) = capture_generation_from_record(artifact)? {
+            return Ok(Some(generation));
+        }
+        // An earlier upload that can't be decoded can't vouch for its
+        // generation, so the re-request is refused rather than sent unfenced.
+        if let Some(job) = previous_job {
+            let payload = job
+                .payload_as::<crate::snapshot_upload::SnapshotUploadJobs>()
+                .map_err(|error| {
+                    Status::failed_precondition(format!(
+                        "earlier artifact backup payload is invalid for {}, so its execution \
+                         generation is unknown: {error}",
+                        artifact.local_artifact_id
+                    ))
+                })?;
+            if let Some(generation) = payload.execution_generation {
+                return Ok(Some(generation));
+            }
+        }
+        let pinned_by_teardown = matches!(
+            sandbox.state,
+            SandboxState::Suspending | SandboxState::CleanupRequired | SandboxState::CleanupFailed
+        ) && sandbox.current_local_artifact_id
+            == Some(artifact.local_artifact_id);
+        if !pinned_by_teardown {
+            return Ok(None);
+        }
+        let db = self.db_conn()?;
+        Ok(
+            crate::db::latest_teardown_suspend_operation(&db, &sandbox.id)
+                .map_err(|error| Status::internal(format!("teardown job lookup: {error}")))?
+                .filter(|operation| {
+                    operation.status == crate::db::TeardownSuspendOperationStatus::Running
+                })
+                .map(|operation| operation.execution_generation),
+        )
+    }
+}
+
+/// The execution generation the capture's record holds for the teardown
+/// suspend that captured `artifact`, if the record in its directory names it.
+/// A record that can't
+/// be read or parsed can't vouch for the generation, so the re-request fails
+/// rather than registering unfenced.
+fn capture_generation_from_record(
+    artifact: &crate::db::LocalArtifactRow,
+) -> Result<Option<pplx_space_common_core::types::ExecutionGeneration>, Status> {
+    let artifact_dir = &artifact.local_path;
+    crate::capture_record::read(
+        std::path::Path::new(artifact_dir),
+        artifact.local_artifact_id,
+    )
+    .map_err(|error| {
+        Status::internal(format!(
+            "read the capture record in {artifact_dir}: {error}"
+        ))
+    })
 }
 
 /// The status an `EnqueueArtifactBackup` submission failure answers with. A

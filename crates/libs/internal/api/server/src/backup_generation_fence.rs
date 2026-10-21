@@ -22,9 +22,12 @@ use tonic::Status;
 /// Any other state is admitted, including an execution retired for another
 /// reason (a suspend the transient-lifecycle sweeper aged out, a pod found
 /// missing) with nothing newer: its capture may be the sandbox's latest state,
-/// so it registers as it did before this fence. The predicate is the
-/// generation, which retirement works in; it doesn't tell apart two attempts
-/// of the same still-active generation.
+/// so it registers as it did before this fence. That holds on a row left on
+/// no node too, where the source-node check then refuses the capture without
+/// a verdict and the node keeps it resident: a ready earlier snapshot isn't
+/// proof that the last execution's later writes are disposable. The predicate
+/// is the generation, which retirement works in; it doesn't tell apart two
+/// attempts of the same still-active generation.
 ///
 /// The caller applies it to an artifact's first registration only. A capture
 /// the control plane admitted once was taken while its execution was current
@@ -43,7 +46,8 @@ pub(crate) async fn refuse_superseded_backup_execution(
     generation: ExecutionGeneration,
 ) -> Result<(), Status> {
     let executions: Vec<(i64, bool, String, bool)> = sqlx::query_as(sql!(
-        "SELECT generation, active, state, NULLIF(BTRIM(pod_uid), '') IS NOT NULL
+        "SELECT generation, active, state,
+                pod_materialized_at IS NOT NULL OR NULLIF(BTRIM(pod_uid), '') IS NOT NULL
            FROM sandbox_k8s_executions
           WHERE sandbox_id = $1
             AND generation >= $2
@@ -55,33 +59,27 @@ pub(crate) async fn refuse_superseded_backup_execution(
     .await
     .map_err(|e| Status::internal(format!("backup execution lookup: {e}")))?;
     // A newer execution supersedes this one once it's active or has
-    // materialized a pod. A newer claim abandoned before that never ran, so it
-    // takes nothing from this execution.
+    // materialized a pod. A newer claim abandoned before it created one never
+    // ran, so it takes nothing from this execution. `pod_materialized_at` is
+    // the set-once record that the execution created a pod, which the
+    // substrate's execution store writes in the same statements that record
+    // or clear a `pod_uid`; `pod_uid` alone is current state, which
+    // re-materialization, failed-recovery pod absence and a cross-node
+    // re-drive's reset clear after the pod may have run. The record is NULL on
+    // rows that predate it until the backfill stamps them, so a non-blank
+    // `pod_uid` counts too, and a row whose `pod_uid` was cleared before it
+    // was stamped reads as never having run, as it did before the record
+    // existed.
     //
-    // Residual window: `pod_uid` is current state, not a record that a pod
-    // ran, so a newer execution can stop counting after it ran. The capture
-    // of generation N registers when both hold:
-    // - N was retired as something other than `replaced`, so the own-row
-    //   branch below doesn't refuse it.
-    // - A newer execution is inactive and its `pod_uid` was cleared after it
-    //   ran. Two writers clear it on an active row whose pod may have run:
-    //   pod re-materialization (`claim_active_execution_pod_materialization`
-    //   in the API substrate's `store/pod_placement.rs`) and failed-recovery
-    //   pod absence (`converge_failed_recovery_after_pod_absence_if_generation`
-    //   in `store/pod_tracking.rs`). A third, the cross-node re-drive's reset
-    //   (`reset_active_execution_to_creating_if_generation` in
-    //   `store/execution_rows.rs`), clears it for a deleted pod whose row has
-    //   no IP; that includes a pod that ran only if the pod was later
-    //   observed without an IP, which `update_active_execution_pod_metadata`
-    //   assigns from the observed pod. The newer-row branch reads only `active` and `pod_uid`, so
-    //   the row's retirement state doesn't matter: the
-    //   `finish_active_execution*` and `finish_fenced_execution_in` writers in
-    //   `store/execution_rows.rs` retire it under any state, and
-    //   re-materialization leaves it in the podless `creating` shape
-    //   `abandon_unmaterialized_create_claim_by_generation` retires as
-    //   `replaced`.
-    // Closing it needs a set-once materialization marker on the execution
-    // row.
+    // The store records a pod's UID when it creates the pod, before the
+    // scheduler places it, so a created pod counts even if it never started:
+    // a source-pinned restore pod ruled Unschedulable leaves its execution
+    // stamped after the cross-node re-drive deletes it and resets the row.
+    // That's deliberate. Counting only pods with a recorded IP or state would
+    // miss a pod that ran before either was recorded, and admitting a capture
+    // over a pod that ran registers stale bytes as the latest snapshot. A
+    // capture refused this way stays on its node unless a backed copy of the
+    // sandbox releases it.
     let superseded =
         executions
             .iter()

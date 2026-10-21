@@ -132,7 +132,12 @@ impl K8sStore {
             Self::identity_binds(identity);
         let filled = sqlx::query(sql!(
             "UPDATE sandbox_k8s_executions
-                SET pod_uid = $4, updated_at = NOW()
+                SET pod_uid = $4,
+                    pod_materialized_at = COALESCE(
+                        pod_materialized_at,
+                        CASE WHEN NULLIF(BTRIM($4::TEXT), '') IS NOT NULL THEN NOW() END
+                    ),
+                    updated_at = NOW()
               WHERE sandbox_id = $1
                 AND generation IS NOT DISTINCT FROM $2
                 AND active
@@ -221,11 +226,17 @@ impl K8sStore {
             return Ok(FailedRecoveryPodAbsenceOutcome::NotMatched);
         }
 
+        // Clearing the pod UID stamps `pod_materialized_at` first if the row
+        // held one, so the record that a pod ran outlives the UID.
         let cleared = sqlx::query(sql!(
             "UPDATE sandbox_k8s_executions
              SET pod_uid = NULL,
                  pod_ip = NULL,
                  k8s_node_name = NULL,
+                 pod_materialized_at = COALESCE(
+                     pod_materialized_at,
+                     CASE WHEN NULLIF(BTRIM(pod_uid), '') IS NOT NULL THEN NOW() END
+                 ),
                  updated_at = NOW()
              WHERE sandbox_id = $1
                AND generation = $2

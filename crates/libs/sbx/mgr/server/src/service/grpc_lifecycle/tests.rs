@@ -10,12 +10,13 @@ use super::{
     ArtifactBackupSubmissionError, OrgSnapshotConfigResolution, SuspendRequestContext,
     artifact_backup_format, artifact_backup_lookup_error, current_instance_backup_precondition,
     encrypted_snapshot_prepare_error_status, ensure_completed_suspend_retry_format,
-    pause_reconciliation_outcome, publish_suspend_snapshot_dir, require_artifact_backup_files,
-    reupload_format_from_sidecar, teardown_artifact_backup_status,
+    pause_reconciliation_outcome, require_artifact_backup_files, reupload_format_from_sidecar,
+    teardown_artifact_backup_status,
 };
 use crate::auto_lifecycle::AutoLifecycleCoordinator;
 use crate::guest_filesystem_flush::GuestSnapshotPreparationBudget;
 use crate::service::SandboxManagerService;
+use crate::service::suspend_snapshot_publication::publish_suspend_snapshot_dir;
 use crate::service::suspend_snapshot_publication::write_full_suspend_artifact;
 use crate::state::SandboxState;
 use pplx_space_common_core::types::{

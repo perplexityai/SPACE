@@ -205,13 +205,18 @@ async fn caller_classified_cancelled_respects_deadline() {
     let status = retry_grpc_status_with_context_if(
         "test",
         "Process.Start",
+        // The retry delay fits the policy's elapsed budget but not the
+        // deadline, so the first refusal ends with `DeadlineExceeded` without
+        // sleeping. The deadline leaves the first attempt ample time to start:
+        // a deadline already past at that point would be refused before any
+        // attempt.
         GrpcRetryPolicy {
-            initial_delay: Duration::from_millis(50),
-            max_delay: Duration::from_millis(50),
+            initial_delay: Duration::from_millis(500),
+            max_delay: Duration::from_millis(500),
             jitter_factor: 0.0,
             ..test_policy()
         },
-        GrpcRetryContext::with_timeout(Duration::from_millis(1)),
+        GrpcRetryContext::with_timeout(Duration::from_millis(200)),
         |status| status.code() == Code::Cancelled,
         move || {
             let attempts = Arc::clone(&attempts_for_call);

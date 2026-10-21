@@ -12,6 +12,7 @@ use pplx_space_test_env::TestResult;
 
 mod cleanup_recovery_lifecycle_matrix_tests;
 mod lifecycle_writer_tests;
+mod materialization_record_tests;
 mod stopped_evacuation_claim_tests;
 mod stopped_restore_selector_tests;
 mod substrate_scope_tests;

@@ -435,6 +435,16 @@ async fn postgres_claim_and_bind_pool_slot() -> TestResult {
     assert!(active);
     assert_eq!(route_activation_id, Some(expected_slot_id));
     assert_ne!(route_activation_id, Some(claim.claim_id));
+    let materialized: bool = sqlx::query_scalar(sql!(
+        "SELECT pod_materialized_at IS NOT NULL FROM sandbox_k8s_executions WHERE sandbox_id = $1"
+    ))
+    .bind(slot.sandbox_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(
+        materialized,
+        "an execution born with its slot's pod records that it materialized one"
+    );
 
     Ok(())
 }

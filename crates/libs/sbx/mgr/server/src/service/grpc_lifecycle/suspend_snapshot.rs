@@ -995,10 +995,17 @@ impl SandboxManagerService {
                     return Err(Status::internal(reason));
                 }
             }
-            let published = publish_suspend_snapshot_dir(
+            // A teardown suspend's capture records the execution that took it,
+            // so a backup requested again by artifact id stays fenced however
+            // long the capture outlives its upload job and its teardown. A
+            // capture that can't be recorded isn't published, as one whose
+            // metadata can't be written isn't, and the failure keeps the staged
+            // capture as a publication failure after staging does.
+            let published = publish_recorded_suspend_snapshot_dir(
                 &staging_dir,
                 &snapshot_dir,
                 local_artifact_id,
+                durability.execution_generation(),
                 &verdicts,
             );
             let publish_error = match published {
@@ -1015,7 +1022,13 @@ impl SandboxManagerService {
                 Err(error) => Some(error),
             };
             if let Some(error) = publish_error {
-                let reason = format!("local artifact publication failed: {error}");
+                let (reason, failure) = match &error {
+                    RecordedPublicationError::Record(_) => (error.to_string(), "metadata_failed"),
+                    RecordedPublicationError::Publish(_) => (
+                        format!("local artifact publication failed: {error}"),
+                        "rename_failed",
+                    ),
+                };
                 // A live rollback here leaves `monitoring_guard` to re-arm the
                 // watchdog on return.
                 if self.record_suspend_snapshot_publication_failure_after_staging(
@@ -1033,14 +1046,14 @@ impl SandboxManagerService {
                     create_codec,
                     sandbox.volume_encryption,
                     "publish",
-                    "rename_failed",
+                    failure,
                     create_started_at,
                 );
                 emit_suspend_failed_event(
                     &sandbox.id,
                     &suspend_event_details,
                     "publish",
-                    "rename_failed",
+                    failure,
                     reason.clone(),
                 );
                 return Err(Status::internal(reason));

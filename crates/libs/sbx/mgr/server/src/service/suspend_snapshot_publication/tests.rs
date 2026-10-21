@@ -622,3 +622,63 @@ fn a_retained_artifact_stays_complete_across_stream_reclaim() {
         validate_complete_suspend_snapshot_dir(&snapshot_dir, &Default::default()).unwrap_err();
     assert!(error.is_pending());
 }
+
+/// A teardown capture's execution record is published with its bytes, where a
+/// backup requested again by artifact id reads it; a capture with no execution
+/// publishes without one. A record that can't be written publishes nothing and
+/// leaves the staged capture for the failure handling to keep.
+#[test]
+fn a_teardown_capture_publishes_only_with_its_execution_record() {
+    let generation = ExecutionGeneration::new(7).unwrap();
+    for (case, execution_generation, record_blocked) in [
+        ("a teardown capture", Some(generation), false),
+        ("a capture with no execution", None, false),
+        ("a record that can't be written", Some(generation), true),
+    ] {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let sandbox_dir = tmp.path();
+        let snapshot_dir = canonical_suspend_snapshot_dir(sandbox_dir);
+        let local_artifact_id = LocalArtifactId::new();
+        let staging_dir = suspend_snapshot_staging_dir(sandbox_dir, local_artifact_id);
+        write_full_suspend_artifact(&staging_dir, TEST_SANDBOX_ID, local_artifact_id, b"capture");
+        if record_blocked {
+            // A directory where the record goes: the write's final rename
+            // fails, as a full or read-only filesystem would fail it.
+            std::fs::create_dir(staging_dir.join(crate::capture_record::CAPTURE_RECORD_FILENAME))
+                .unwrap();
+        }
+
+        let published = publish_recorded_suspend_snapshot_dir(
+            &staging_dir,
+            &snapshot_dir,
+            local_artifact_id,
+            execution_generation,
+            &Default::default(),
+        );
+
+        if record_blocked {
+            assert!(
+                matches!(published, Err(RecordedPublicationError::Record(_))),
+                "{case}: {published:?}"
+            );
+            assert!(!snapshot_dir.exists(), "{case}: nothing is published");
+            assert_eq!(
+                std::fs::read(staging_dir.join("vmstate")).unwrap(),
+                b"capture",
+                "{case}: the staged capture stays"
+            );
+        } else {
+            published.unwrap();
+            assert_eq!(
+                std::fs::read(snapshot_dir.join("vmstate")).unwrap(),
+                b"capture",
+                "{case}"
+            );
+            assert_eq!(
+                crate::capture_record::read(&snapshot_dir, local_artifact_id).unwrap(),
+                execution_generation,
+                "{case}"
+            );
+        }
+    }
+}
