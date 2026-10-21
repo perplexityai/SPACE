@@ -612,7 +612,7 @@ function parseEvents(buffer) {
       else if (name === 'id') id = value;
       else if (name === 'data') data.push(value);
     }
-    // Ids are opaque and exceed what a JavaScript number holds exactly.
+    // Ids are opaque: keep them as received, to echo them exactly.
     if (data.length) events.push({ event, id, data: JSON.parse(data.join('\n')) });
   }
   return { events, rest };

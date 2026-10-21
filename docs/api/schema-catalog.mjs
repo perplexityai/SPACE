@@ -50,7 +50,7 @@ export const modelGroups = [
   },
   {
     name: 'Stream event models',
-    description: 'SSE events carry these frames. Streams are live, not replayable history; related WebSocket and file-watch types do not add supported creation endpoints.',
+    description: 'SSE events carry these frames. Streams are not durable history: a reconnect resumes only output the sandbox still retains; related WebSocket and file-watch types do not add supported creation endpoints.',
     models: [
       ['DataPlaneServerFrame', 'Stream event', 'The tagged event payload carried by the stream, including output, resynchronization, errors and process exit.'],
       ['DataPlaneProcessExitStatus', 'Process exit status', 'How a streamed process ended; also inspect its exit code and any output loss or error.'],
