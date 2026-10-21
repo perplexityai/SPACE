@@ -7,6 +7,9 @@
 //! work gate exclusively to wait for admitted work before replacing the
 //! dependency. It keeps both gates closed until the replacement is healthy.
 //! Kernel lock release makes both sides fail safe across process death.
+//!
+//! It is its own crate because the mechanism needs only `flock` and the
+//! filesystem, so a service can use it without the rest of common-svc.
 
 use std::fs::OpenOptions;
 use std::os::unix::fs::OpenOptionsExt as _;

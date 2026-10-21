@@ -354,6 +354,68 @@ async fn write_imported_sandbox_metadata(
     Ok(sandbox_metadata)
 }
 
+async fn export_file_inventory(
+    connector: &crate::node_manager_transport::NodeManagerConnector,
+    sandbox_id: String,
+    include_snapshot: bool,
+) -> Result<Vec<pplx_space_node_mgr_client::proto::SandboxExportFile>, Status> {
+    let mut node = connector.connect().await.map_err(|error| {
+        Status::unavailable(format!("connect node-manager for export: {error}"))
+    })?;
+    let mut request = Request::new(
+        pplx_space_node_mgr_client::proto::ListSandboxExportFilesRequest {
+            sandbox_id,
+            include_snapshot,
+        },
+    );
+    request.set_timeout(std::time::Duration::from_secs(5));
+    Ok(node
+        .list_sandbox_export_files(request)
+        .await?
+        .into_inner()
+        .files)
+}
+
+fn relay_export_file(
+    node: &mut pplx_space_node_mgr_client::NodeManagerGrpcClient,
+    sandbox_id: &str,
+    name: &str,
+    send: impl FnMut(u64, Vec<u8>, bool) -> Result<(), Status>,
+) -> Result<(), Status> {
+    let runtime = tokio::runtime::Handle::current();
+    let stream = runtime
+        .block_on(node.read_sandbox_export_file(
+            pplx_space_node_mgr_client::proto::ReadSandboxExportFileRequest {
+                sandbox_id: sandbox_id.to_owned(),
+                name: name.to_owned(),
+            },
+        ))?
+        .into_inner();
+    relay_export_chunks(stream, send)
+}
+
+fn relay_export_chunks(
+    mut stream: impl tokio_stream::Stream<
+        Item = Result<pplx_space_node_mgr_client::proto::SandboxExportFileChunk, Status>,
+    > + Unpin,
+    mut send: impl FnMut(u64, Vec<u8>, bool) -> Result<(), Status>,
+) -> Result<(), Status> {
+    use tokio_stream::StreamExt;
+    let runtime = tokio::runtime::Handle::current();
+    let mut eof = false;
+    while let Some(chunk) = runtime.block_on(stream.next()).transpose()? {
+        if eof {
+            return Err(Status::data_loss("export file continued after EOF"));
+        }
+        eof = chunk.eof;
+        send(chunk.offset, chunk.data, eof)?;
+    }
+    if !eof {
+        return Err(Status::data_loss("export file missing EOF"));
+    }
+    Ok(())
+}
+
 impl SandboxManagerService {
     pub(super) async fn export_sandbox(
         &self,
@@ -436,8 +498,22 @@ impl SandboxManagerService {
         let errors = tx.clone();
         self.task_tracker
             .spawn(super::drain::with_state_writer(writer, async move {
+                // Resolve the manifest before publishing the export header.
+                let manifest = match export_file_inventory(
+                    &service.node_manager,
+                    sandbox_id.clone(),
+                    include_snapshot,
+                )
+                .await
+                {
+                    Ok(manifest) => manifest,
+                    Err(error) => {
+                        errors.finish(Err(error));
+                        return;
+                    }
+                };
                 let result = service
-                    .blocking_export_io(move |_| {
+                    .blocking_export_io(move |service| {
                         let _ownership = (wake, artifact, fence, lease);
                         (|| {
                             // Check if we can compute a delta against the template rootfs
@@ -512,6 +588,7 @@ impl SandboxManagerService {
                                 include_snapshot
                                     .then(|| std::path::Path::new(&snapshot_working_dir)),
                                 diff_path.as_deref().map(std::path::Path::new),
+                                manifest,
                             ) {
                                 Ok(manifest) => manifest,
                                 Err(error) => {
@@ -563,29 +640,34 @@ impl SandboxManagerService {
                                 return;
                             }
 
+                            let mut reader = service.node_manager.lazy();
                             for (file_name, path) in files {
-                                if let Err(error) = receive::stream_sparse_file(
-                                    &path,
-                                    true,
-                                    || tx.is_closed(),
-                                    |offset, data, eof| {
-                                        tx.blocking_send(Ok(ExportSandboxChunk {
-                                            payload: Some(
-                                                crate::proto::export_sandbox_chunk::Payload::Chunk(
-                                                    crate::proto::ExportSandboxFileChunk {
-                                                        file_name: file_name.clone(),
-                                                        offset,
-                                                        data,
-                                                        eof,
-                                                    },
-                                                ),
+                                let send = |offset, data, eof| {
+                                    tx.blocking_send(Ok(ExportSandboxChunk {
+                                        payload: Some(
+                                            crate::proto::export_sandbox_chunk::Payload::Chunk(
+                                                crate::proto::ExportSandboxFileChunk {
+                                                    file_name: file_name.clone(),
+                                                    offset,
+                                                    data,
+                                                    eof,
+                                                },
                                             ),
-                                        }))
-                                        .map_err(|_| {
-                                            Status::cancelled("export consumer disconnected")
-                                        })
-                                    },
-                                ) {
+                                        ),
+                                    }))
+                                    .map_err(|_| Status::cancelled("export consumer disconnected"))
+                                };
+                                let result = if is_delta && file_name == "rootfs.ext4.diff" {
+                                    receive::stream_sparse_file(
+                                        &path,
+                                        true,
+                                        || tx.is_closed(),
+                                        send,
+                                    )
+                                } else {
+                                    relay_export_file(&mut reader, &sandbox_id, &file_name, send)
+                                };
+                                if let Err(error) = result {
                                     let _ = tx.blocking_send(Err(error));
                                     return;
                                 }

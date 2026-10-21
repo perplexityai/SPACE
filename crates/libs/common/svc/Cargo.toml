@@ -67,6 +67,7 @@ uuid = { workspace = true, features = ["v5", "v7"] }
 # internal
 pplx-space-common-core = { workspace = true, features = ["serde", "sqlx"] }
 pplx-space-common-grpc = { workspace = true }
+pplx-space-dependency-drain = { workspace = true }
 pplx-space-metrics = { workspace = true }
 pplx-space-observability = { workspace = true }
 

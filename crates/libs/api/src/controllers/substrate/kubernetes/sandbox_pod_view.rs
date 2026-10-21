@@ -580,7 +580,7 @@ pub(super) fn sandbox_pod_cache() -> (
 /// A sandbox-pod store and slot index seeded with `pods` through one complete
 /// initial list (`Init`, `InitApply` per pod, `InitDone`), so the store reads
 /// as ready. The writer stays usable for later events.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 pub(super) fn seeded_sandbox_pod_cache(
     pods: impl IntoIterator<Item = Pod>,
 ) -> (

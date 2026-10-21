@@ -183,7 +183,30 @@ async fn sparse_transfer_preserves_holes_and_delta_export_keeps_other_files() {
     std::fs::write(instance.join("runtime.json"), b"runtime identity").unwrap();
     let delta = temp.path().join("rootfs.diff");
     std::fs::write(&delta, b"delta bytes").unwrap();
-    let (files, _) = receive::sandbox_export_files(&instance, None, Some(&delta)).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    // Node-manager supplies names; sandbox-manager can traverse a retained
+    // instance directory but cannot enumerate it through its cache group.
+    let manifest = vec![
+        pplx_space_node_mgr_client::proto::SandboxExportFile {
+            name: "rootfs.ext4".into(),
+            size_bytes: 1024 * 1024,
+        },
+        pplx_space_node_mgr_client::proto::SandboxExportFile {
+            name: "runtime.json".into(),
+            size_bytes: 16,
+        },
+    ];
+    std::fs::set_permissions(&instance, std::fs::Permissions::from_mode(0o111)).unwrap();
+    if !nix::unistd::geteuid().is_root() {
+        assert_eq!(
+            std::fs::read_dir(&instance).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+    let result = receive::sandbox_export_files(&instance, None, Some(&delta), manifest);
+    std::fs::set_permissions(&instance, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (files, size) = result.unwrap();
+    assert_eq!(size, b"delta bytes".len() as u64 + 16);
     assert_eq!(
         files
             .iter()
@@ -482,5 +505,95 @@ async fn import_identity_normalization_and_existing_owner_detection_agree() {
             ..Default::default()
         };
         assert!(validate_import_sandbox_header(&header).is_err());
+    }
+}
+
+#[tokio::test]
+async fn export_inventory_uses_the_privileged_owner_and_preserves_failures() {
+    use crate::node_manager_transport::fake::FakeNodeManager;
+    use pplx_space_node_mgr_client::proto::{
+        ListSandboxExportFilesRequest, ListSandboxExportFilesResponse, SandboxExportFile,
+    };
+
+    for (include_snapshot, failure) in [
+        (false, None),
+        (true, None),
+        (false, Some(tonic::Code::Unimplemented)),
+        (true, Some(tonic::Code::Unavailable)),
+    ] {
+        let id = SandboxId::new().to_string();
+        let expected_id = id.clone();
+        let node = FakeNodeManager::default()
+            .unary(
+                "ListSandboxExportFiles",
+                move |request: ListSandboxExportFilesRequest| {
+                    assert_eq!(request.sandbox_id, expected_id);
+                    assert_eq!(request.include_snapshot, include_snapshot);
+                    if let Some(code) = failure {
+                        return Err(Status::new(code, "inventory unavailable"));
+                    }
+                    Ok(ListSandboxExportFilesResponse {
+                        files: vec![SandboxExportFile {
+                            name: "rootfs.ext4".into(),
+                            size_bytes: 123,
+                        }],
+                    })
+                },
+            )
+            .serve();
+        let result = export_file_inventory(&node.connector(), id, include_snapshot).await;
+        if let Some(code) = failure {
+            assert_eq!(result.unwrap_err().code(), code);
+        } else {
+            let files = result.unwrap();
+            assert_eq!(
+                (files[0].name.as_str(), files[0].size_bytes),
+                ("rootfs.ext4", 123)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn export_relay_requires_complete_eof_and_preserves_terminal_failures() {
+    use pplx_space_node_mgr_client::proto::SandboxExportFileChunk;
+    let eof = SandboxExportFileChunk {
+        offset: 9,
+        data: Vec::new(),
+        eof: true,
+    };
+    let data = SandboxExportFileChunk {
+        offset: 3,
+        data: vec![42],
+        eof: false,
+    };
+    for (chunks, expected_error) in [
+        (vec![Ok(data.clone()), Ok(eof.clone())], None),
+        (vec![Ok(data.clone())], Some(tonic::Code::DataLoss)),
+        (vec![Ok(eof.clone()), Ok(data)], Some(tonic::Code::DataLoss)),
+        (
+            vec![Ok(eof), Err(Status::internal("producer failed"))],
+            Some(tonic::Code::Internal),
+        ),
+        (
+            vec![Err(Status::unavailable("reader failed"))],
+            Some(tonic::Code::Unavailable),
+        ),
+    ] {
+        tokio::task::spawn_blocking(move || {
+            let mut sent = Vec::new();
+            let result = relay_export_chunks(tokio_stream::iter(chunks), |offset, data, eof| {
+                sent.push((offset, data, eof));
+                Ok(())
+            });
+            if let Some(code) = expected_error {
+                assert_eq!(result.unwrap_err().code(), code);
+            } else {
+                result.unwrap();
+                assert_eq!(sent, [(3, vec![42], false), (9, Vec::new(), true)]);
+            }
+        })
+        .await
+        .unwrap();
     }
 }

@@ -11,20 +11,13 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-prost = { workspace = true }
 thiserror = { workspace = true }
 tonic = { workspace = true }
-tonic-prost = { workspace = true }
 
 # internal
 pplx-space-common-core = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
-pplx-space-execution-common = { workspace = true }
-
-[build-dependencies]
-anyhow = { workspace = true }
-pplx-space-common-proto-build = { workspace = true }
-tonic-prost-build = { workspace = true }
+pplx-space-node-mgr-protocol = { workspace = true }
 
 [dev-dependencies]
 pplx-space-common-svc = { workspace = true }

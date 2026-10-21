@@ -40,6 +40,9 @@ Follow "Privileged tests and the CI host" in `docs/rust/space-conventions.md`.
   against `pplx_space_db_test_fixtures`.
 - Parse config through `from_environment(&dyn Environment)` with a `TestEnv`.
   Add that seam to a loop that only has `from_env()`.
+- Build a `KubernetesSubstrate` through
+  `lifecycle_writer_test_support::kubernetes_substrate`, not `try_from_env`,
+  which reads the process environment.
 
 Module moves change log targets and `sql!` locators: see "Log targets" in
 `docs/rust/space-conventions.md`.

@@ -16,10 +16,11 @@ import subprocess
 import tempfile
 import threading
 import socket
+import sys
 import time
 import uuid
 from collections import deque
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from http.client import HTTPException
@@ -282,6 +283,62 @@ def _json_pointer_token(key: str) -> str:
     return key.replace("~", "~0").replace("/", "~1")
 
 
+def _json_pointer_get(document: Mapping[str, Any], pointer: str) -> object | None:
+    """The value at a JSON pointer of plain keys, None if any step is absent."""
+
+    value: object = document
+    for token in pointer.split("/")[1:]:
+        if not isinstance(value, dict) or token not in value:
+            return None
+        value = value[token]
+    return value
+
+
+@dataclass(frozen=True)
+class _RolloutPace:
+    """A Deployment's identity and the pace fields it stood at before a fast rollout (None: unset)."""
+
+    uid: str
+    standing: Mapping[str, object | None]
+
+
+_FAST_ROLLOUT_FIELDS = frozenset({"/spec/minReadySeconds", "/spec/strategy/rollingUpdate/maxSurge"})
+
+
+def _fast_pace(deployment: Mapping[str, Any]) -> dict[str, object]:
+    """The pace fields a fast rollout writes on this Deployment, and their values."""
+
+    fast: dict[str, object] = {"/spec/minReadySeconds": 0}
+    if (deployment["spec"].get("strategy") or {}).get("type") == "RollingUpdate":
+        fast["/spec/strategy/rollingUpdate/maxSurge"] = FAST_ROLLOUT_MAX_SURGE
+    return fast
+
+
+def _holds_fast_value(deployment: Mapping[str, Any], pointer: str, fast: Mapping[str, object]) -> bool:
+    if pointer not in fast:
+        return False
+    live = _json_pointer_get(deployment, pointer)
+    # The apiserver omits a zero `minReadySeconds`.
+    return live == fast[pointer] or (live is None and fast[pointer] == 0)
+
+
+def _fast_rollout_record(text: str, owner: str) -> dict[str, object | None]:
+    try:
+        record = json.loads(text)
+    except json.JSONDecodeError:
+        record = None
+    if not isinstance(record, dict) or not set(record) <= _FAST_ROLLOUT_FIELDS or not all(
+        value is None
+        or (isinstance(value, int) and not isinstance(value, bool) and value >= 0)
+        or (isinstance(value, str) and re.fullmatch(r"\d+%?", value))
+        for value in record.values()
+    ):
+        raise SmokeConfigurationError(
+            f"{owner} carries an unreadable {FAST_ROLLOUT_STANDING_ANNOTATION} record: {text!r}"
+        )
+    return record
+
+
 def _lease_parts(
     document: Mapping[str, object],
 ) -> tuple[dict[str, object], dict[str, object]]:
@@ -402,6 +459,19 @@ NODE_TEMPLATE_MANAGER = "template-manager"
 NODE_VOLUME_MANAGER = "volume-manager"
 NODE_CTL = "node-ctl"
 NODE_API = "node-api"
+# The node services that read the object store, by DaemonSet and the
+# container that does: each holds the store's static keys in
+# `SPACE_KIND_STORAGE_CREDENTIALS=static` only, and exchanges its credentials
+# through credential-manager otherwise.
+STORAGE_CREDENTIAL_DAEMONSETS = (
+    ("space-volume-manager", NODE_VOLUME_MANAGER, "worker volume-manager"),
+    ("space-builder-volume-manager", NODE_VOLUME_MANAGER, "builder volume-manager"),
+    ("space-builder-build-manager", "build-manager", "build-manager"),
+)
+OBJECT_STORE_STATIC_KEYS = (
+    "SPACE_OBJECT_STORE_STATIC_ACCESS_KEY_ID",
+    "SPACE_OBJECT_STORE_STATIC_SECRET_ACCESS_KEY",
+)
 # The Kind-only operator shell on every sandbox worker and builder
 # (infra/space/kind/charts/space-node-debug): the stand-in for the node host's
 # root shell, where the on-node CLIs, btrfs, dmsetup, cryptsetup and ctr run
@@ -428,6 +498,14 @@ CORDONED_NODE_ANNOTATION = "space.pplx.net/smoke-cordoned-node"
 # without the limiters' store.
 LIMITER_ENV_ANNOTATION = "space.pplx.net/smoke-limiter-env"
 REDIS_REPLICAS_ANNOTATION = "space.pplx.net/smoke-redis-replicas"
+# A rollout a scenario starts only to apply or restore its env
+# (`KindHarness._fast_rollout`) runs with every replacement surged at once and
+# no `minReadySeconds`, and the Deployment carries the `minReadySeconds` and
+# `maxSurge` it stood at (JSON, null for unset) until they are back. A run
+# killed in between leaves the record, and every Kind scenario run first puts
+# the recorded values back (`repair_orphaned_rollout_pace`).
+FAST_ROLLOUT_STANDING_ANNOTATION = "space.pplx.net/smoke-fast-rollout-standing"
+FAST_ROLLOUT_MAX_SURGE = "100%"
 DRAIN_KEEP_ANNOTATION = "space.pplx.net/drain-keep"
 NODE_GROUP_BOUNDARY_LABEL = "node-restriction.kubernetes.io/space-node-group"
 NODE_GROUP_GATE_ENV = "SPACE_SANDBOX_NODE_GROUP_PLACEMENT"
@@ -1511,6 +1589,11 @@ class KindHarness:
             return
         self._assert_retention_lease_owned()
         deployment = self._controller_deployment()
+        # At the charts' pace, not `_fast_rollout`'s: the sweeper runs on the
+        # Lease holder, and surging every replica retires the old holder only
+        # as the rollout ends, so the new knobs took hold later (on the kind
+        # bench the Lease reached a new pod ~9 s after the write, against
+        # ~6.5 s) even though this wait, which does not drain, returned sooner.
         _require_ok(
             self.kubectl("set", "env", f"deploy/{deployment}", *assignments),
             "set retention sweeper env",
@@ -3138,6 +3221,152 @@ ON CONFLICT (key_hash) DO NOTHING;
         )
         self._wait_deployment_pods_drained(name, timeout=timeout)
 
+    @contextlib.contextmanager
+    def _fast_rollout(self, name: str, ownership: _LeaseOwnership | None = None) -> Iterator[None]:
+        """Roll `name` fast while the body runs, then put its standing pace back, even if the body fails.
+
+        Only for a rollout that is a scenario's setup or restore, never its
+        subject: a scenario about rollouts, drains, restarts or disruption
+        keeps the chart's pace. Every replacement surges at once and counts as
+        available once Ready, so a two-replica Deployment rolls in one wave
+        without `minReadySeconds`, not in two waves with it. `maxUnavailable`
+        is untouched, so no old replica stops before its replacement is Ready.
+        Neither field is in the pod template, so neither patch rolls a pod.
+        Callers write the env and await the rollout inside the body. A
+        leader-elected Deployment hands its Lease over only once every old
+        replica has gone, after the rollout rather than during it, so a caller
+        waiting on the new leader gains little.
+
+        Only under the public-API mutation Lease, the caller's or `ownership`
+        (a repair running inside the acquisition), which is the guard
+        `repair_orphaned_rollout_pace` takes before it restores a pace a run
+        left behind.
+        """
+
+        ownership = ownership or self._held_public_api_lease(f"a fast rollout of {name}")
+        self._assert_lease_owned(ownership, f"a fast rollout of {name}")
+
+        # Armed before the first patch is sent: a patch whose reply is lost,
+        # or that a deadline interrupts, may still have committed, and the
+        # restore is a no-op on a Deployment that carries no record.
+        armed: list[_RolloutPace] = []
+        try:
+            self._speed_up_rollout(name, armed.append)
+            yield
+        except BaseException as error:
+            if armed:
+                try:
+                    self._restore_rollout_pace(name, armed[-1])
+                except Exception as restore_error:  # noqa: BLE001 - attached to the body's error below
+                    note = (
+                        f"restoring the rollout pace of {name} also failed: {restore_error!r}; "
+                        "the next scenario's preflight repair restores it from the Deployment's record"
+                    )
+                    error.add_note(note)
+                    # A verdict reports only the body's error, not its notes.
+                    print(f"PACE RESTORE FAILED: {note}", file=sys.stderr, flush=True)
+            raise
+        if armed:
+            self._restore_rollout_pace(name, armed[-1])
+
+    def _speed_up_rollout(self, name: str, arm: Callable[[_RolloutPace], None]) -> None:
+        def fast_patch(deployment: Mapping[str, Any]) -> list[dict[str, object]]:
+            metadata = deployment["metadata"]
+            fast = _fast_pace(deployment)
+            recorded = (metadata.get("annotations") or {}).get(FAST_ROLLOUT_STANDING_ANNOTATION)
+            # An earlier run that died mid-rollout left its fast values live,
+            # and what it recorded is what the Deployment stood at. A record
+            # beside values something else has since written is stale.
+            previous = _fast_rollout_record(recorded, name) if recorded is not None else {}
+            if not all(_holds_fast_value(deployment, pointer, fast) for pointer in previous):
+                previous = {}
+            standing = {
+                pointer: previous[pointer] if pointer in previous else _json_pointer_get(deployment, pointer)
+                for pointer in fast
+            }
+            arm(_RolloutPace(uid=str(metadata["uid"]), standing=standing))
+            patch: list[dict[str, object]] = []
+            if not metadata.get("annotations"):
+                patch.append({"op": "add", "path": "/metadata/annotations", "value": {}})
+            patch.append({
+                "op": "add",
+                "path": f"/metadata/annotations/{_json_pointer_token(FAST_ROLLOUT_STANDING_ANNOTATION)}",
+                "value": json.dumps(standing, sort_keys=True),
+            })
+            patch.extend({"op": "add", "path": pointer, "value": value} for pointer, value in fast.items())
+            return patch
+
+        self._patch_deployment_guarded(name, fast_patch, f"speed up the rollout of {name}")
+
+    def _restore_rollout_pace(self, name: str, pace: _RolloutPace | None) -> None:
+        """Put back the pace `pace` recorded, or with None the one the Deployment's record names.
+
+        Only while every recorded field still holds its fast value, the rule
+        `_speed_up_rollout` trusts a record by: otherwise something else (a
+        chart re-apply) has written the pace since, and only the record goes.
+        """
+
+        def restore_patch(deployment: Mapping[str, Any]) -> list[dict[str, object]]:
+            metadata = deployment["metadata"]
+            if pace is not None and metadata["uid"] != pace.uid:
+                raise SmokeConfigurationError(f"refusing to restore the rollout pace of a replaced {name}")
+            recorded = (metadata.get("annotations") or {}).get(FAST_ROLLOUT_STANDING_ANNOTATION)
+            if recorded is None:
+                # Never sped up, or a cooperating run's restore already ran.
+                return []
+            standing = pace.standing if pace is not None else _fast_rollout_record(recorded, name)
+            fast = _fast_pace(deployment)
+            patch: list[dict[str, object]] = []
+            still_fast = all(_holds_fast_value(deployment, pointer, fast) for pointer in standing)
+            for pointer, value in standing.items() if still_fast else ():
+                if value is not None:
+                    patch.append({"op": "add", "path": pointer, "value": value})
+                elif _json_pointer_get(deployment, pointer) is not None:
+                    patch.append({"op": "remove", "path": pointer})
+            patch.append({
+                "op": "remove",
+                "path": f"/metadata/annotations/{_json_pointer_token(FAST_ROLLOUT_STANDING_ANNOTATION)}",
+            })
+            return patch
+
+        self._patch_deployment_guarded(name, restore_patch, f"restore the rollout pace of {name}")
+
+    def _patch_deployment_guarded(
+        self,
+        name: str,
+        build: Callable[[Mapping[str, Any]], list[dict[str, object]]],
+        action: str,
+    ) -> None:
+        """JSON-patch the Deployment as last read; re-read and retry when a concurrent write lands first.
+
+        The Deployment controller writes status throughout a rollout, so a
+        patch guarded by the resourceVersion it read can lose that race.
+        """
+
+        detail = ""
+        for _ in range(5):
+            deployment = json.loads(
+                _require_ok(self.kubectl("get", "deploy", name, "-o", "json", timeout=15), f"read {name}")
+            )
+            patch = build(deployment)
+            if not patch:
+                return
+            metadata = deployment["metadata"]
+            result = self.kubectl(
+                "patch", "deploy", name, "--type=json", "--patch",
+                json.dumps([
+                    {"op": "test", "path": "/metadata/uid", "value": metadata["uid"]},
+                    {"op": "test", "path": "/metadata/resourceVersion", "value": metadata["resourceVersion"]},
+                    *patch,
+                ]),
+                timeout=15,
+            )
+            if result.returncode == 0:
+                return
+            detail = result.detail()
+            time.sleep(0.5)
+        raise SmokeConfigurationError(f"could not {action}: {detail or '<no output>'}")
+
     def node_group_env(self) -> dict[str, str | None]:
         """`api:<key>` / `controller:<key>` literals for the gate and the labeler."""
 
@@ -3183,10 +3412,11 @@ ON CONFLICT (key_hash) DO NOTHING;
         # group and labelling workers while the API rolls with the gate on.
         # Restore: API first, so the gate is off before the labeler stops and
         # a stray group cannot affect a create in between. The *writes* keep
-        # that order; the two rollouts are then awaited together, since each is
-        # ~11 s on kind and neither depends on the other having finished (the
-        # scenario's create waits for the default group and the labels anyway).
-        # Bench 2026-09-23: 22 s per phase sequential; ~11 s concurrent.
+        # that order; the rollouts are then awaited together, since neither
+        # depends on the other having finished (the scenario's create waits for
+        # the default group and the labels anyway). Each runs at the fast pace
+        # and ends once the replaced pods are gone; the slowest, the API's,
+        # is about 15 s on kind, against about 38 s at the chart's pace.
         order = [("controller", controller), ("api", api)] if controller_first else [("api", api), ("controller", controller)]
         order.append(("internal-api", {k.split(":", 1)[1]: v for k, v in values.items() if k.startswith("internal-api:")}))
         deployments = {
@@ -3195,18 +3425,20 @@ ON CONFLICT (key_hash) DO NOTHING;
             "internal-api": self._internal_api_deployment,
         }
         rolling: list[str] = []
-        for target, assignments in order:
-            if not assignments:
-                continue
-            name = deployments[target]()
-            if self._set_deployment_env_only(name, assignments):
-                rolling.append(name)
-        waits = [
-            background(f"rollout of {name}", lambda name=name: self._await_deployment_rollout(name, timeout=300))
-            for name in rolling
-        ]
-        for wait in waits:
-            wait.join(timeout=330)
+        with contextlib.ExitStack() as paces:
+            for target, assignments in order:
+                if not assignments:
+                    continue
+                name = deployments[target]()
+                paces.enter_context(self._fast_rollout(name))
+                if self._set_deployment_env_only(name, assignments):
+                    rolling.append(name)
+            waits = [
+                background(f"rollout of {name}", lambda name=name: self._await_deployment_rollout(name, timeout=300))
+                for name in rolling
+            ]
+            for wait in waits:
+                wait.join(timeout=330)
 
     def set_node_group_env(self, *, gate: bool, labeler: bool) -> None:
         self._apply_node_group_env(
@@ -4006,7 +4238,7 @@ ON CONFLICT (key_hash) DO NOTHING;
             standing = _recorded_limiter_env(recorded_env)
             self._renew_lease(ownership, "an orphaned limiter env repair")
             self._apply_public_api_env(
-                standing, "restore the limiter env a previous smoke Lease holder left"
+                standing, "restore the limiter env a previous smoke Lease holder left", ownership
             )
             self._renew_lease(
                 ownership, "clearing the limiter env record", {LIMITER_ENV_ANNOTATION: None}
@@ -4024,9 +4256,7 @@ ON CONFLICT (key_hash) DO NOTHING;
         mid-fault, and the caller must not run against it. True if a repair ran.
         """
 
-        contexts = self.executor.run(["kubectl", "config", "get-contexts", "-o", "name"], timeout=15)
-        if contexts.returncode == 0 and self.config.context not in contexts.stdout.split():
-            # No cluster yet: the run bootstraps a fresh one, which has no faults.
+        if self._kind_context_missing():
             return False
         observed = self.kubectl("get", "lease", self._public_api_lease_name(), "-o", "json", timeout=15)
         if observed.returncode != 0:
@@ -4050,6 +4280,59 @@ ON CONFLICT (key_hash) DO NOTHING;
             ) from error
         release()
         return True
+
+    def repair_orphaned_rollout_pace(self) -> bool:
+        """Put back a rollout pace an earlier run left recorded on a Deployment, or refuse to proceed.
+
+        Every Kind scenario runs this first, beside the limiter repair: a run
+        killed, or out of cleanup time, between `_fast_rollout`'s speed-up and
+        its restore leaves a Deployment surging every replica without
+        `minReadySeconds`, and a later scenario whose subject is that pace
+        (an API restart, the leader-election brownout) would run without it.
+        One Deployment listing when nothing is recorded. Fast rollouts run
+        only under the public-API mutation Lease, so the repair acquires it:
+        a live holder may be mid-rollout, and the caller must not run against
+        it. True if a repair ran.
+        """
+
+        if self._kind_context_missing():
+            return False
+        listing = json.loads(
+            _require_ok(
+                self.kubectl("get", "deploy", "-o", "json", timeout=15),
+                "list Deployments for a fast-rollout pace an earlier run left",
+            )
+            or "{}"
+        )
+        recorded = sorted(
+            item["metadata"]["name"]
+            for item in listing.get("items", [])
+            if FAST_ROLLOUT_STANDING_ANNOTATION in (item["metadata"].get("annotations") or {})
+        )
+        if not recorded:
+            return False
+        self._require_isolated_kind("orphaned rollout-pace repair")
+        try:
+            release = self.acquire_public_api_mutation()
+        except SmokeConfigurationError as error:
+            raise SmokeConfigurationError(
+                f"refusing to run while another smoke may still own the fast-rollout pace "
+                f"recorded on {', '.join(recorded)}: {error}"
+            ) from error
+        try:
+            ownership = self._held_public_api_lease("an orphaned rollout-pace repair")
+            for name in recorded:
+                self._assert_lease_owned(ownership, f"restoring the rollout pace of {name}")
+                self._restore_rollout_pace(name, None)
+        finally:
+            release()
+        return True
+
+    def _kind_context_missing(self) -> bool:
+        """No such kubectl context yet: the run bootstraps a fresh cluster, which has no faults."""
+
+        contexts = self.executor.run(["kubectl", "config", "get-contexts", "-o", "name"], timeout=15)
+        return contexts.returncode == 0 and self.config.context not in contexts.stdout.split()
 
     def _held_public_api_lease(self, action: str) -> _LeaseOwnership:
         ownership = self._public_api_lease_ownership
@@ -4086,7 +4369,9 @@ ON CONFLICT (key_hash) DO NOTHING;
 
         return self._deployment_env_literals(self._public_api_deployment(), keys)
 
-    def _apply_public_api_env(self, values: Mapping[str, str | None], action: str) -> None:
+    def _apply_public_api_env(
+        self, values: Mapping[str, str | None], action: str, ownership: _LeaseOwnership | None = None
+    ) -> None:
         _require_limiter_env_keys(values)
         self._require_isolated_kind("public API env override")
         assignments = [
@@ -4096,11 +4381,12 @@ ON CONFLICT (key_hash) DO NOTHING;
             return
         name = self._public_api_deployment()
         container = self._public_api_container(name)
-        _require_ok(
-            self.kubectl("set", "env", f"deploy/{name}", "-c", container, *assignments, timeout=30),
-            action,
-        )
-        self.wait_public_api_rollout(timeout=240)
+        with self._fast_rollout(name, ownership):
+            _require_ok(
+                self.kubectl("set", "env", f"deploy/{name}", "-c", container, *assignments, timeout=30),
+                action,
+            )
+            self.wait_public_api_rollout(timeout=240)
 
     def set_public_api_env(self, overrides: Mapping[str, str]) -> None:
         from space_smoke.rate_limiters import LIMITER_ENV_KEYS
@@ -4514,6 +4800,10 @@ ON CONFLICT (key_hash) DO NOTHING;
                 "caller's live mutation Lease"
             )
         self._assert_lease_owned(ownership, "an orphaned-restore-pod GC controller deployment write")
+        # At the charts' pace, not `_fast_rollout`'s, as for the retention
+        # sweeper: the GC runs on the Lease holder, and the fast rollout's
+        # earlier return was spent waiting for the new holder's first reaps
+        # (bench: 125-127 s at this pace, 123-126 s at the fast one).
         self._set_deployment_env(self._controller_deployment(), values, timeout=180)
 
     def controller_log_records(self, *, since_time: str) -> list[dict[str, Any]]:
@@ -4995,22 +5285,86 @@ ON CONFLICT (key_hash) DO NOTHING;
         mode = modes.pop() if len(modes) == 1 else "static" if not modes else ""
         if mode not in ("exchange", "static"):
             raise SmokeConfigurationError(f"the authority runs no known storage credentials mode: {sorted(modes)}")
-        # The label records how the authority's chart was rendered. The worker
-        # volume-manager must agree, holding the store's static keys in
-        # `static` only: a failed apply or a stale Tilt resource can leave the
-        # workers on the other side of it.
-        result = self.kubectl(
-            "get", "daemonset", "space-volume-manager",
-            "-o", "jsonpath={.spec.template.spec.containers[*].env[*].name}", timeout=15,
-        )
-        names = _require_ok(result, "read the worker volume-manager env").split()
-        worker_keys = sorted(name for name in names if name.startswith("SPACE_OBJECT_STORE_STATIC_"))
-        if bool(worker_keys) != (mode == "static"):
-            raise SmokeConfigurationError(
-                f"the authority runs storage credentials mode {mode}, but the worker volume-manager "
-                + (f"holds static keys ({', '.join(worker_keys)})" if worker_keys else "holds no static keys")
-            )
+        # The label records how the authority's chart was rendered. Every node
+        # service that transfers objects must agree, in its DaemonSet's pod
+        # template and in every pod it runs: a failed apply, a stale Tilt
+        # resource or a rollout still under way can leave either on the other
+        # side of it.
+        pods = json.loads(_require_ok(self.kubectl("get", "pods", "-o", "json", timeout=30), "list pods") or "{}")
+        for daemonset, container, service in STORAGE_CREDENTIAL_DAEMONSETS:
+            result = self.kubectl("get", "daemonset", daemonset, "-o", "json", timeout=15)
+            template = json.loads(_require_ok(result, f"read the {service} DaemonSet") or "{}")
+            specs = [("its pod template", template.get("spec", {}).get("template", {}).get("spec", {}))] + [
+                (f"pod {item['metadata']['name']}", item.get("spec", {}))
+                for item in pods.get("items", [])
+                if any(
+                    owner.get("kind") == "DaemonSet" and owner.get("name") == daemonset
+                    for owner in item.get("metadata", {}).get("ownerReferences", [])
+                )
+            ]
+            for where, spec in specs:
+                problem = self._storage_keys_disagreement(mode, spec, container)
+                if problem:
+                    raise SmokeConfigurationError(
+                        f"the authority runs storage credentials mode {mode}, but the {service} "
+                        f"({daemonset}, {where}) {problem}"
+                    )
         return mode
+
+    def _storage_keys_disagreement(self, mode: str, spec: dict[str, Any], container: str) -> str:
+        """How one pod spec contradicts `mode`, or "" when it agrees.
+
+        In `exchange`, no container, init and ephemeral ones included, may
+        hold a static key name, by `env` or through an `envFrom` Secret or
+        ConfigMap, which is resolved to its keys; one that cannot be read is
+        refused. In `static`, the consuming container must hold both keys.
+        """
+
+        sources: dict[str, set[str] | None] = {}
+
+        def static_keys(item: dict[str, Any]) -> tuple[set[str], list[str]]:
+            """The static key names a container gets, and its envFrom sources that cannot be read."""
+            found = {str(entry.get("name", "")) for entry in item.get("env") or []}
+            unreadable: list[str] = []
+            for source in item.get("envFrom") or []:
+                if source.get("secretRef"):
+                    ref = f"secret/{source['secretRef'].get('name', '')}"
+                elif source.get("configMapRef"):
+                    ref = f"configmap/{source['configMapRef'].get('name', '')}"
+                else:
+                    continue
+                if ref not in sources:
+                    result = self.kubectl("get", ref, "--ignore-not-found", "-o", "json", timeout=15)
+                    document = json.loads(_require_ok(result, f"read {ref}") or "null")
+                    sources[ref] = (
+                        None if document is None
+                        else set(document.get("data") or {}) | set(document.get("binaryData") or {})
+                    )
+                keys = sources[ref]
+                if keys is None:
+                    unreadable.append(ref)
+                else:
+                    found |= {str(source.get("prefix") or "") + key for key in keys}
+            return {name for name in found if name.startswith("SPACE_OBJECT_STORE_STATIC_")}, unreadable
+
+        containers = [
+            item
+            for field in ("initContainers", "containers", "ephemeralContainers")
+            for item in spec.get(field) or []
+        ]
+        if mode == "exchange":
+            for item in containers:
+                keys, unreadable = static_keys(item)
+                if keys:
+                    return f"has container {item.get('name')} holding static keys ({', '.join(sorted(keys))})"
+                if unreadable:
+                    return f"has container {item.get('name')} taking env from {unreadable[0]}, which cannot be read"
+            return ""
+        consumer = next((item for item in containers if item.get("name") == container), None)
+        if consumer is None:
+            return f"has no {container} container"
+        missing = sorted(set(OBJECT_STORE_STATIC_KEYS) - static_keys(consumer)[0])
+        return f"has container {container} lacking static keys ({', '.join(missing)})" if missing else ""
 
     def sandbox_worker_nodes(self) -> list[str]:
         result = self.kubectl(

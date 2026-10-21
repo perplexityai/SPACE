@@ -241,6 +241,27 @@ impl NodeManager for NodeManagerService {
         NodeManagerService::inspect_sandbox(self, request).await
     }
 
+    async fn list_sandbox_export_files(
+        &self,
+        request: Request<crate::proto::ListSandboxExportFilesRequest>,
+    ) -> Result<Response<crate::proto::ListSandboxExportFilesResponse>, Status> {
+        NodeManagerService::list_sandbox_export_files(self, request).await
+    }
+
+    type ReadSandboxExportFileStream = std::pin::Pin<
+        Box<
+            dyn tokio_stream::Stream<Item = Result<crate::proto::SandboxExportFileChunk, Status>>
+                + Send,
+        >,
+    >;
+
+    async fn read_sandbox_export_file(
+        &self,
+        request: Request<crate::proto::ReadSandboxExportFileRequest>,
+    ) -> Result<Response<Self::ReadSandboxExportFileStream>, Status> {
+        NodeManagerService::read_sandbox_export_file(self, request).await
+    }
+
     async fn capture_sandbox_endpoint_proof(
         &self,
         request: Request<CaptureSandboxEndpointProofRequest>,

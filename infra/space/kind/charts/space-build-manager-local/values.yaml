@@ -57,6 +57,11 @@ traceExporter: "off"
 blob:
   minAvailableBytes: "1073741824"
 
+# How build-manager gets object-store credentials, set by every bring-up path
+# from SPACE_KIND_STORAGE_CREDENTIALS (infra/space/kind/lib/storage-credentials.sh):
+# `exchange` from the credential-manager authority, or `static` keys.
+storageCredentials: exchange
+
 # Publication target: the Kind object store's templates bucket, with smaller
 # multipart parts for the local store.
 objectStore:

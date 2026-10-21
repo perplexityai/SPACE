@@ -38,7 +38,7 @@
 #                       cluster's storage credentials mode is still compared
 #                       with SPACE_KIND_STORAGE_CREDENTIALS, and a mismatch
 #                       refused (`__storage_mode_mismatch`,
-#                       `__worker_storage_keys_mismatch`)
+#                       `__node_storage_keys_mismatch`)
 #   SPACE_KIND_STORAGE_CREDENTIALS — exchange (default) or static
 #                       (infra/space/kind/lib/storage-credentials.sh); a live
 #                       Tilt running the other mode is restarted in this one
@@ -1087,35 +1087,134 @@ bootstrap_kind_stack__storage_mode_mismatch() {
     [[ "$deployed" == "$requested" ]] || printf '%s\n' "$deployed"
 }
 
-# Prints what the worker volume-manager holds when it contradicts the
-# requested mode: "static keys" in exchange mode, "no static keys" in static
-# mode; nothing when it agrees or there is no DaemonSet yet. The label above
-# records how the authority's chart was rendered; a failed apply or a stale
-# Tilt resource can leave the workers on the other side of it. Fails on an
-# invalid request or an unreadable cluster.
-bootstrap_kind_stack__worker_storage_keys_mismatch() {
-    local requested found
+# The node-service DaemonSets that read the object store, each with the
+# container that does: the sandbox workers' and builders' volume-manager and
+# the builders' build-manager. Each holds the store's static keys in static
+# mode only.
+BOOTSTRAP_KIND_STACK__STORAGE_DAEMONSETS=(
+    space-volume-manager/volume-manager
+    space-builder-volume-manager/volume-manager
+    space-builder-build-manager/build-manager
+)
+
+# jq definitions over a DaemonSet (the input), the namespace's pods and the
+# envFrom sources read so far, for the function below. `pod_specs` are the
+# DaemonSet's template's and its pods'; `names` are a container's env names,
+# each envFrom source resolved to its keys (null when it cannot be read).
+BOOTSTRAP_KIND_STACK__STORAGE_KEYS_JQ='
+    def pod_specs:
+        {where: "template", spec: .spec.template.spec},
+        ($pods[0].items[]
+            | select(any(.metadata.ownerReferences[]?; .kind == "DaemonSet" and .name == $name))
+            | {where: "pod \(.metadata.name)", spec: .spec});
+    def containers: (.spec.initContainers // [])[], (.spec.containers // [])[], (.spec.ephemeralContainers // [])[];
+    def source_ref:
+        if .secretRef then "secret/\(.secretRef.name)"
+        elif .configMapRef then "configmap/\(.configMapRef.name)"
+        else empty end;
+    def names: [.env[]?.name] + [.envFrom[]? | (.prefix // "") as $prefix | source_ref as $ref
+        | ($sources[0][$ref] // [])[] | $prefix + .];
+    def static_keys: [names[] | select(startswith("SPACE_OBJECT_STORE_STATIC_"))] | unique;
+    def disagreements:
+        pod_specs | .where as $where
+        | if $requested == "exchange" then
+            containers | .name as $cname
+            | (static_keys | select(length > 0)
+                | "\($name) \($where), container \($cname) holds static keys (\(join(", ")))"),
+              (.envFrom[]? | source_ref | select($sources[0][.] == null)
+                | "\($name) \($where), container \($cname) takes env from \(.), which cannot be read")
+          else
+            [containers | select(.name == $container)][0] as $c
+            | if $c == null then "\($name) \($where) has no \($container) container"
+              else (["SPACE_OBJECT_STORE_STATIC_ACCESS_KEY_ID", "SPACE_OBJECT_STORE_STATIC_SECRET_ACCESS_KEY"]
+                  - ($c | static_keys)) | select(length > 0)
+                | "\($name) \($where), container \($container) lacks static keys (\(join(", ")))"
+              end
+          end;
+'
+
+# Prints one "<daemonset> <where> ..." line for each disagreement with the
+# requested mode, for the DaemonSet's pod template and for every pod it owns:
+# in exchange mode, any container (init and ephemeral ones included) holding
+# a SPACE_OBJECT_STORE_STATIC_* name, by `env` or through an `envFrom` Secret
+# or ConfigMap (resolved to its keys; one that cannot be read is refused); in
+# static mode, the consuming container lacking either key. Nothing when they
+# agree or a DaemonSet does not exist yet. The label above records how the
+# authority's chart was rendered; a failed apply, a stale Tilt resource or a
+# rollout still under way can leave a template or a pod on the other side of
+# it. Fails on an invalid request or an unreadable cluster.
+bootstrap_kind_stack__node_storage_keys_mismatch() {
+    local requested work
     requested="$(space_kind_storage_credentials)" || return 1
     kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER" || return 0
-    if ! found="$(kubectl --context "kind-${KIND_CLUSTER}" -n space get daemonset space-volume-manager \
-            --ignore-not-found -o jsonpath='{.metadata.name}|{.spec.template.spec.containers[*].env[*].name}' 2>&1)"; then
-        echo "ERROR: cannot read the worker volume-manager of kind cluster $KIND_CLUSTER: $found" >&2
-        return 1
-    fi
-    [[ -n "$found" ]] || return 0
-    if [[ " ${found#*|} " == *" SPACE_OBJECT_STORE_STATIC_"* ]]; then
-        [[ "$requested" == static ]] || echo "static keys"
-    else
-        [[ "$requested" == exchange ]] || echo "no static keys"
-    fi
+    # Files, not arguments: a namespace's pod list outgrows one argument.
+    work="$(mktemp -d "${TMPDIR:-/tmp}/kind-storage-keys.XXXXXX")" || return 1
+    bootstrap_kind_stack__node_storage_keys_in "$requested" "$work"
+    local status=$?
+    rm -rf "$work"
+    return "$status"
 }
 
-# Neither a running nor a restarted Tilt removes a field added to the
-# DaemonSet out of band (apply keeps fields it never owned), so the remedy
-# recreates it from its render.
-bootstrap_kind_stack__worker_reapply_hint() {
-    echo "       Recreate it from its render: kubectl --context kind-${KIND_CLUSTER} -n space delete" >&2
-    echo "       daemonset space-volume-manager, then tilt trigger space-volume-manager." >&2
+bootstrap_kind_stack__node_storage_keys_in() {
+    local requested=$1 work=$2 entry daemonset container ref found
+    local kube=(kubectl --context "kind-${KIND_CLUSTER}" -n space)
+    if ! "${kube[@]}" get pods -o json >"$work/pods.json" 2>"$work/err"; then
+        echo "ERROR: cannot list the pods of kind cluster $KIND_CLUSTER: $(cat "$work/err")" >&2
+        return 1
+    fi
+    for entry in "${BOOTSTRAP_KIND_STACK__STORAGE_DAEMONSETS[@]}"; do
+        daemonset="${entry%/*}" container="${entry#*/}"
+        if ! "${kube[@]}" get daemonset "$daemonset" --ignore-not-found -o json >"$work/ds.json" 2>"$work/err"; then
+            echo "ERROR: cannot read DaemonSet $daemonset of kind cluster $KIND_CLUSTER: $(cat "$work/err")" >&2
+            return 1
+        fi
+        [[ -s "$work/ds.json" ]] || continue
+        echo '{}' >"$work/sources.json"
+        if ! found="$(bootstrap_kind_stack__storage_keys_jq "$work" "$daemonset" "$container" "$requested" \
+                'pod_specs | containers | .envFrom[]? | source_ref')"; then
+            return 1
+        fi
+        while read -r ref; do
+            [[ -n "$ref" ]] || continue
+            if ! "${kube[@]}" get "$ref" --ignore-not-found -o json >"$work/source.json" 2>"$work/err"; then
+                echo "ERROR: cannot read $ref of kind cluster $KIND_CLUSTER: $(cat "$work/err")" >&2
+                return 1
+            fi
+            jq -c --arg ref "$ref" --slurpfile doc "$work/source.json" \
+                '.[$ref] = ($doc[0] // null | if . == null then null else (.data // {}) + (.binaryData // {}) | keys end)' \
+                "$work/sources.json" >"$work/sources.next" && mv "$work/sources.next" "$work/sources.json" || return 1
+        done < <(sort -u <<<"$found")
+        bootstrap_kind_stack__storage_keys_jq "$work" "$daemonset" "$container" "$requested" disagreements || return 1
+    done
+}
+
+# Runs `expression` after the definitions above, over the DaemonSet, pods and
+# envFrom sources read into `work`.
+bootstrap_kind_stack__storage_keys_jq() {
+    local work=$1 daemonset=$2 container=$3 requested=$4 expression=$5
+    jq -r --arg name "$daemonset" --arg container "$container" --arg requested "$requested" \
+        --slurpfile pods "$work/pods.json" --slurpfile sources "$work/sources.json" \
+        "$BOOTSTRAP_KIND_STACK__STORAGE_KEYS_JQ $expression" "$work/ds.json"
+}
+
+# A bring-up without SKIP_BOOTSTRAP=1 runs Tilt from this checkout, which
+# re-applies each chart and waits for its rollout: the remedy for a chart
+# rendered from another checkout or an older commit, and for a rollout still
+# under way, so it is offered first where it has not just run. Neither a
+# running nor a restarted Tilt removes a field added to a DaemonSet out of band
+# (apply keeps fields it never owned), so for that the remedy recreates each
+# one named from its render.
+bootstrap_kind_stack__node_reapply_hint() {
+    local mismatches=$1 offer_bring_up=$2 daemonset
+    if [[ "$offer_bring_up" == 1 ]]; then
+        echo "       Run one bring-up without SKIP_BOOTSTRAP=1: it runs Tilt from this checkout," >&2
+        echo "       which re-applies these charts and waits for their rollouts. If one still" >&2
+        echo "       disagrees afterwards, a field was added to it out of band:" >&2
+    fi
+    while read -r daemonset; do
+        echo "       Recreate $daemonset from its render: kubectl --context kind-${KIND_CLUSTER} -n space" >&2
+        echo "       delete daemonset $daemonset, then tilt trigger $daemonset." >&2
+    done < <(awk '{ print $1 }' <<<"$mismatches" | sort -u)
 }
 
 bootstrap_kind_stack__bring_up() {
@@ -1127,7 +1226,7 @@ bootstrap_kind_stack__bring_up() {
     # Before the SKIP_BOOTSTRAP return: suites pick scenarios and expectations
     # by the requested mode, so running them against a cluster in the other
     # one would test what was not asked for.
-    local deployed_mode worker_keys
+    local deployed_mode node_keys
     deployed_mode="$(bootstrap_kind_stack__storage_mode_mismatch)" || exit 1
     if [[ "${SKIP_BOOTSTRAP:-0}" == "1" ]]; then
         if [[ -n "$deployed_mode" ]]; then
@@ -1138,11 +1237,12 @@ bootstrap_kind_stack__bring_up() {
             echo "       mode; both modes share one object store, so nothing is recreated." >&2
             exit 1
         fi
-        worker_keys="$(bootstrap_kind_stack__worker_storage_keys_mismatch)" || exit 1
-        if [[ -n "$worker_keys" ]]; then
+        node_keys="$(bootstrap_kind_stack__node_storage_keys_mismatch)" || exit 1
+        if [[ -n "$node_keys" ]]; then
             echo "ERROR: kind cluster $KIND_CLUSTER runs SPACE_KIND_STORAGE_CREDENTIALS=${SPACE_KIND_STORAGE_CREDENTIALS:-exchange}," >&2
-            echo "       but its worker volume-manager DaemonSet holds $worker_keys." >&2
-            bootstrap_kind_stack__worker_reapply_hint
+            echo "       but in its node services:" >&2
+            sed 's/^/         /' <<<"$node_keys" >&2
+            bootstrap_kind_stack__node_reapply_hint "$node_keys" 1
             exit 1
         fi
         echo "[bootstrap] SKIP_BOOTSTRAP=1; assuming kind+tilt are already running"
@@ -1331,11 +1431,12 @@ bootstrap_kind_stack__bring_up() {
         echo "ERROR: the bring-up finished with the cluster still in storage credentials mode $deployed_mode" >&2
         exit 1
     fi
-    worker_keys="$(bootstrap_kind_stack__worker_storage_keys_mismatch)" || exit 1
-    if [[ -n "$worker_keys" ]]; then
+    node_keys="$(bootstrap_kind_stack__node_storage_keys_mismatch)" || exit 1
+    if [[ -n "$node_keys" ]]; then
         echo "ERROR: the bring-up finished in storage credentials mode ${SPACE_KIND_STORAGE_CREDENTIALS:-exchange}" >&2
-        echo "       with the worker volume-manager DaemonSet holding $worker_keys" >&2
-        bootstrap_kind_stack__worker_reapply_hint
+        echo "       with node services that disagree:" >&2
+        sed 's/^/         /' <<<"$node_keys" >&2
+        bootstrap_kind_stack__node_reapply_hint "$node_keys" 0
         exit 1
     fi
 

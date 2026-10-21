@@ -703,6 +703,7 @@ pub(crate) mod disk_io_ceiling;
 mod encrypted_volumes;
 mod endpoint_attestation;
 mod execution_fence;
+mod export_files;
 mod gateway_isolation;
 mod launch_prepare;
 mod network_helpers;

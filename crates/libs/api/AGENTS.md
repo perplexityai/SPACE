@@ -30,6 +30,10 @@ Follow "Privileged tests and the CI host" in `docs/rust/space-conventions.md`.
   `enter_test_process` only for tests that need the process-env constructors.
 - Point clients a test must not use at a closed port with a short acquire
   timeout, not a default port the host may serve.
+- Another crate's tests build a `KubernetesSubstrate` in process with
+  `KubernetesSubstrate::with_seeded_caches`
+  (`src/controllers/substrate/kubernetes/test_substrate.rs`), behind
+  `test-hooks`. Enable that feature only from `[dev-dependencies]`.
 
 Module moves change log targets and `sql!` locators: see "Log targets" in
 `docs/rust/space-conventions.md`.

@@ -95,7 +95,7 @@ def _run(scenario_id: str) -> int:
     # Outside the scenario's budget: the repair may wait out two rollouts.
     try:
         if repair_orphaned_kind_faults(os.environ):
-            print("REPAIRED: a limiter fault an earlier run left recorded", flush=True)
+            print("REPAIRED: a limiter fault or rollout pace an earlier run left recorded", flush=True)
     except Exception as error:  # noqa: BLE001 - a fault left up makes any verdict untrustworthy
         print(f"ERROR: {type(error).__name__}: {error}", file=sys.stderr)
         return 2

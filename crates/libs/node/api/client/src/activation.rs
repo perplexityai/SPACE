@@ -4,10 +4,10 @@ use crate::proto::{
 };
 use pplx_space_common_core::types::SandboxId;
 use pplx_space_common_grpc::internal_transport::{ClientTransport, Service};
-use pplx_space_common_svc::{
-    bearer_token::{SpaceBearerToken, insert_space_bearer_token},
-    bootstrap::{GrpcClientTrace, wrap_grpc_client_channel},
+use pplx_space_common_grpc::{
+    GrpcClientTrace, trace_grpc_client_transport as wrap_grpc_client_channel,
 };
+use pplx_space_common_svc::bearer_token::{SpaceBearerToken, insert_space_bearer_token};
 use std::time::Duration;
 use tonic::{
     Request, Status,

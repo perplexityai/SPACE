@@ -14,12 +14,13 @@ import unittest
 import time
 import json
 import threading
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, cast
 
 from space_smoke.capabilities import AdminNodeGroupView, LimiterProbeOutcome
 from space_smoke.node_groups import NodeGroupAssertions
-from space_smoke.adapters import KindConfig, KindHarness
+from space_smoke.adapters import KindConfig, KindHarness, _LeaseOwnership
 from space_smoke.runtime import CommandResult, InvariantViolation, ResourceScope
 
 SID = "01a0b0c9-b8a3-7473-9c12-3821a701bc28"
@@ -232,12 +233,23 @@ class _ScriptedKubectl:
         with self._lock:
             self.calls.append(tuple(command))
         argv = tuple(command)
+        if "get" in argv and "lease" in argv:
+            # The caller's live public-API mutation Lease, which a fast rollout requires.
+            renewed = datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+            lease = {
+                "metadata": {"uid": "lease-uid", "resourceVersion": "7"},
+                "spec": {"holderIdentity": "me", "leaseDurationSeconds": 3600, "renewTime": renewed},
+            }
+            return CommandResult(argv, 0, json.dumps(lease), "")
         if "get" in argv and "deploy" in argv and "-l" in argv:
             selector = argv[argv.index("-l") + 1]
             return CommandResult(argv, 0, "space-cluster-controller" if "controller" in selector else "space-api", "")
         if "get" in argv and "deploy" in argv and argv[-1] == "json":
             # The post-rollout drain: one desired pod, one present.
-            deployment = {"spec": {"replicas": 1, "selector": {"matchLabels": {"app": "x"}}}}
+            deployment = {
+                "metadata": {"uid": "u", "resourceVersion": "1"},
+                "spec": {"replicas": 1, "selector": {"matchLabels": {"app": "x"}}},
+            }
             return CommandResult(argv, 0, json.dumps(deployment), "")
         if "get" in argv and "pods" in argv:
             return CommandResult(argv, 0, json.dumps({"items": [{"metadata": {"name": "p"}}]}), "")
@@ -248,10 +260,17 @@ class _ScriptedKubectl:
         return CommandResult(argv, 0, "", "")
 
 
+def _leased(harness: KindHarness) -> KindHarness:
+    harness._public_api_lease_ownership = _LeaseOwnership(
+        name="space-smoke-public-api-x", uid="lease-uid", holder="me", subject="public API deployment mutation"
+    )
+    return harness
+
+
 class ConcurrentRollouts(unittest.TestCase):
     def test_both_env_writes_land_in_order_before_either_rollout_and_both_are_awaited(self) -> None:
         kubectl = _ScriptedKubectl()
-        harness = KindHarness(kubectl, KindConfig())
+        harness = _leased(KindHarness(kubectl, KindConfig()))
         started = time.monotonic()
         harness.set_node_group_env(gate=True, labeler=True)
         elapsed = time.monotonic() - started
@@ -265,7 +284,7 @@ class ConcurrentRollouts(unittest.TestCase):
 
     def test_restore_writes_the_api_first(self) -> None:
         kubectl = _ScriptedKubectl()
-        harness = KindHarness(kubectl, KindConfig())
+        harness = _leased(KindHarness(kubectl, KindConfig()))
         harness.restore_node_group_env({
             "api:SPACE_SANDBOX_NODE_GROUP_PLACEMENT": None,
             "controller:SPACE_SANDBOX_NODE_GROUP_PLACEMENT": None,

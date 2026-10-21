@@ -13,6 +13,10 @@ workspace = true
 [features]
 default = []
 federated-identity = []
+# Test-only surfaces, for other crates' tests through a dev-dependency: the
+# environment overrides of `pplx_space_common_core::env::test_hook`, and, with
+# `kubernetes`, `KubernetesSubstrate::with_seeded_caches`. Enabled from a normal
+# dependency, a workspace-wide release build would ship them.
 test-hooks = ["pplx-space-common-core/test-hooks"]
 kubernetes = [
     "dep:kube",

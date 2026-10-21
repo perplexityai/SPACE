@@ -1230,6 +1230,8 @@ mod pool;
 #[cfg(test)]
 pub(crate) mod scripted_test_doubles;
 mod support;
+#[cfg(any(test, feature = "test-hooks"))]
+mod test_substrate;
 #[cfg(test)]
 pub(crate) mod tests;
 mod wait_ready;
@@ -1237,3 +1239,5 @@ mod wait_ready;
 pub use node_sync::SyncNodeInventoryError;
 use pod_ops::ExecutionHydrationOutcome;
 use pod_ops::{ActivationAttemptAssignment, PodMaterializationOwnership, StartedRecoveryOwnership};
+#[cfg(any(test, feature = "test-hooks"))]
+pub use test_substrate::TEST_SANDBOX_NAMESPACE;

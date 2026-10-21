@@ -140,7 +140,23 @@ spec:
             {{- end }}
             {{- end }}
             {{- include "space-node-service.env.diskAdmission" . | nindent 12 }}
+            {{- if eq .Values.storageCredentials "exchange" }}
+            # No object-store keys: template publication and build-input
+            # transfers exchange a session scoped to their release prefix or
+            # input object (object_store_credentials,
+            # crates/libs/build/mgr/src/object_store.rs) with the authority
+            # itself, as deployed. Not through the node agent: its sockets
+            # admit only volume-manager and template-manager to ExchangeToken
+            # (effective_actor, crates/libs/credential/mgr/server/src/storage_exchange.rs),
+            # and the authority admits build-manager directly
+            # (ALLOW_EXCHANGE_TOKEN_SERVICES, service.rs) under the
+            # ServiceAccount its chart maps (space-credmgr-authority-local).
+            {{- include "space-node-service.env.credmgrAuthority" . | nindent 12 }}
+            {{- else }}
+            # Static object-store credentials instead of credential-manager's
+            # token exchange (object_store_credentials reads them first).
             {{- include "space-node-service.env.objectStoreCredentials" . | nindent 12 }}
+            {{- end }}
             - name: SPACE_OBJECT_STORE_BUCKET
               value: {{ .Values.objectStore.bucket | quote }}
             - name: SPACE_OBJECT_STORE_REGION
@@ -180,6 +196,9 @@ spec:
             {{- include "space-node-service.mount.clusterApiToken" . | nindent 12 }}
             {{- include "space-node-service.mount.rpcCa" . | nindent 12 }}
             {{- include "space-node-service.mount.rpcIdentity" . | nindent 12 }}
+            {{- if eq .Values.storageCredentials "exchange" }}
+            {{- include "space-node-service.mount.credmgrToken" . | nindent 12 }}
+            {{- end }}
             # HostToContainer: build-manager's OCI-rootfs, assembly and
             # snapshot-view mounts under /space/cache/firecracker/builds must
             # stay in this pod's mount namespace, never in the node's mount
@@ -217,6 +236,9 @@ spec:
         {{- include "space-node-service.volume.clusterApiToken" . | nindent 8 }}
         {{- include "space-node-service.volume.rpcCa" . | nindent 8 }}
         {{- include "space-node-service.volume.rpcIdentity" (dict "secret" "space-build-manager-tls") | nindent 8 }}
+        {{- if eq .Values.storageCredentials "exchange" }}
+        {{- include "space-node-service.volume.credmgrToken" . | nindent 8 }}
+        {{- end }}
         - name: netns
           hostPath:
             path: /var/run/netns

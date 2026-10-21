@@ -43,12 +43,15 @@ postgres:
 # one is (`account=service`, crates/libs/credential/mgr/server/src/k8s_identity.rs).
 # Each node's credential-manager agent forwards its node services' calls;
 # node-manager fetches sandbox volume DEKs directly (GetOrIssueSandboxVolumeDek
-# admits only node-manager, crates/libs/credential/mgr/server/src/service.rs).
+# admits only node-manager, crates/libs/credential/mgr/server/src/service.rs),
+# and the builders' build-manager exchanges its storage credentials directly
+# (ALLOW_EXCHANGE_TOKEN_SERVICES, service.rs; space-build-manager-local).
 allowedServiceAccounts:
   - space-credential-manager
   - space-builder-credential-manager=space-credential-manager
   - space-node-manager
   - space-builder-node-manager=space-node-manager
+  - space-builder-build-manager=space-build-manager
 
 # Credentials for the authority's own AWS integrations (AWS Secrets Manager
 # network-credential references, resolved only where the database pool lives,

@@ -11,15 +11,17 @@
 //! shows, and optionally lands another writer's lifecycle on it, which is the
 //! window the finalize's guard closes.
 //!
-//! The substrate dials a pod's node-api on its fixed proxy port, so each
-//! double listens on that port at its own `127.x.y.z` address. Only Linux
-//! routes that whole block to loopback, and a host process listening on that
-//! port on every address makes the bind fail; either way the test reports a
-//! skip, or fails when test dependencies are required.
+//! Each case's double listens on a port of its own on `127.0.0.1`, and its
+//! substrate dials the pod's sandbox proxy on that port, where the double
+//! serves the worker APIs.
 
+use std::ffi::OsStr;
 use std::net::Ipv4Addr;
 
-use pplx_space_common_core::kubernetes::DEFAULT_SANDBOX_PROXY_PORT;
+use pplx_space_common_grpc::internal_transport::INSECURE_DEV_ENV;
+use pplx_space_common_svc::bearer_token::{
+    SPACE_NODE_API_INTERNAL_TOKEN_PATH_ENV, SPACE_NODE_API_TOKEN_PATH_ENV,
+};
 use pplx_space_node_api_client::proto::worker_api_internal_server::{
     WorkerApiInternal, WorkerApiInternalServer,
 };
@@ -92,6 +94,7 @@ impl WorkerApiInternal for SucceedingWake {
 
 /// The node-api double, stopped on drop.
 struct NodeApi {
+    port: u16,
     shutdown: CancellationToken,
     _state_dir: tempfile::TempDir,
 }
@@ -102,8 +105,9 @@ impl Drop for NodeApi {
     }
 }
 
-async fn start_node_api(address: Ipv4Addr, wake: SucceedingWake) -> TestResult<NodeApi> {
-    let listener = tokio::net::TcpListener::bind((address, DEFAULT_SANDBOX_PROXY_PORT)).await?;
+async fn start_node_api(wake: SucceedingWake) -> TestResult<NodeApi> {
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let port = listener.local_addr()?.port();
     let state_dir = tempfile::tempdir()?;
     let state = SimState::new(
         state_dir.path().join("snapshots"),
@@ -136,31 +140,36 @@ async fn start_node_api(address: Ipv4Addr, wake: SucceedingWake) -> TestResult<N
         }
     });
     Ok(NodeApi {
+        port,
         shutdown,
         _state_dir: state_dir,
     })
 }
 
-/// A loopback address of this test's own, so no other test's double holds
-/// the fixed port on it.
-///
-/// Returns `None` when the host cannot bind the fixed port there: any host
-/// but Linux, or a process already listening on it on every address.
-fn bindable_private_loopback() -> std::io::Result<Option<Ipv4Addr>> {
-    if !cfg!(target_os = "linux") {
-        return Ok(None);
-    }
-    let address = private_loopback();
-    match std::net::TcpListener::bind((address, DEFAULT_SANDBOX_PROXY_PORT)) {
-        Ok(_) => Ok(Some(address)),
-        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
-fn private_loopback() -> Ipv4Addr {
-    let [.., a, b, c] = Uuid::now_v7().into_bytes();
-    Ipv4Addr::new(127, a, b, c.max(2))
+/// Re-run the calling test in a child process whose environment lets the
+/// substrate's node-api client reach the double: plaintext internal RPC, and
+/// node-api token paths naming files this parent writes and keeps until the
+/// child exits, so the token reader never falls back to the host's token
+/// files. That client reads both from the process environment, as in
+/// production. Call it first, and return when it returns `false`: the child
+/// has then run the test.
+fn enter_node_api_client_process() -> TestResult<bool> {
+    let tokens = tempfile::tempdir()?;
+    let node_api_token = tokens.path().join("node-api.token");
+    let node_api_internal_token = tokens.path().join("node-api-internal.token");
+    std::fs::write(&node_api_token, "synthetic-internal-token")?;
+    std::fs::write(&node_api_internal_token, "synthetic-internal-control-token")?;
+    Ok(pplx_space_test_env::enter_test_process(&[
+        (INSECURE_DEV_ENV, Some(OsStr::new("true"))),
+        (
+            SPACE_NODE_API_TOKEN_PATH_ENV,
+            Some(node_api_token.as_os_str()),
+        ),
+        (
+            SPACE_NODE_API_INTERNAL_TOKEN_PATH_ENV,
+            Some(node_api_internal_token.as_os_str()),
+        ),
+    ]))
 }
 
 /// A marked `suspended` row resident on the worker node at `pod_ip`, with a
@@ -241,19 +250,7 @@ async fn insert_resident_suspended(
 /// the Wake left it, and the restore reports the lost finalize CAS.
 #[tokio::test(flavor = "current_thread")]
 async fn restore_finalize_moves_only_a_row_still_restoring() -> TestResult {
-    if bindable_private_loopback()?.is_none() {
-        let reason = format!(
-            "restore_finalize: cannot bind the node-api proxy port \
-             {DEFAULT_SANDBOX_PROXY_PORT} on a private loopback address (Linux only, \
-             and nothing may hold it on every address)"
-        );
-        if pplx_space_db_test_fixtures::require_test_deps() {
-            return Err(reason.into());
-        }
-        pplx_space_db_test_fixtures::report_dependency_skip(&reason)?;
-        return Ok(());
-    }
-    if !enter_kubernetes_process()? {
+    if !enter_node_api_client_process()? {
         return Ok(());
     }
     let db = pg_test_db().await?;
@@ -266,7 +263,7 @@ async fn restore_finalize_moves_only_a_row_still_restoring() -> TestResult {
         .into_iter()
         .chain(StoredSandboxLifecycle::all_as_str().map(Some))
     {
-        let pod_ip = private_loopback();
+        let pod_ip = Ipv4Addr::LOCALHOST;
         sqlx::query(sql!(
             "INSERT INTO nodes (id, address, role, managed_by, state)
              VALUES ($1, $2::INET, 'worker', 'k8s', 'ready')
@@ -278,16 +275,13 @@ async fn restore_finalize_moves_only_a_row_still_restoring() -> TestResult {
         .await?;
         let sandbox_id = SandboxId::new();
         let pod = insert_resident_suspended(pool, sandbox_id, node_id, pod_ip).await?;
-        let _node_api = start_node_api(
-            pod_ip,
-            SucceedingWake {
-                pool: pool.clone(),
-                node_id,
-                concurrent_lifecycle,
-            },
-        )
+        let node_api = start_node_api(SucceedingWake {
+            pool: pool.clone(),
+            node_id,
+            concurrent_lifecycle,
+        })
         .await?;
-        let substrate = Box::pin(kubernetes_substrate_with_pods(pool, vec![pod])).await?;
+        let substrate = kubernetes_substrate_with_pods(pool, vec![pod], node_api.port)?;
         let sink = SubstrateSink::new(
             pool.clone(),
             Arc::new(substrate),

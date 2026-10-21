@@ -1,8 +1,6 @@
 use pplx_space_common_core::types::{NodeGroupId, SnapshotId};
 
-use super::execution::{
-    RecoveryJoinBackoffPolicy, ensure_wake_recovery_lifecycle, should_join_started_recovery,
-};
+use super::execution::{ensure_wake_recovery_lifecycle, should_join_started_recovery};
 use super::pod_ops::{
     ActivationWakeFailure, PodCreateContext, RestoreContext, WakeDispatchStatus,
     parse_pod_create_context,
@@ -38,6 +36,9 @@ mod kubernetes_tests {
     use crate::controllers::sandbox::{SandboxController, fetch_sandbox};
     use crate::controllers::substrate::kubernetes::store::{
         ActivationFenceOwnership, ActivationRoutePublication, classify_activation_route_publication,
+    };
+    use crate::controllers::substrate::kubernetes::test_substrate::{
+        assemble_substrate, seeded_substrate,
     };
     use crate::controllers::substrate::{
         NodeApiTarget, PooledExecutionClaim, PublishedLocalArtifact, RecordedExecution, Substrate,
@@ -197,63 +198,13 @@ mod kubernetes_tests {
         nodes: Vec<Node>,
         pool: PgPool,
     ) -> KubernetesSubstrate {
-        let shutdown_token = CancellationToken::new();
-        let task_tracker = tokio_util::task::TaskTracker::new();
-        // Fixtures mix node-api and sandbox pods; each cache gets the full
-        // list, as each production reflector would see its own label subset.
-        let (node_api_pod_store, mut node_api_pod_writer) = reflector::store::<Pod>();
-        node_api_pod_writer.apply_watcher_event(&Event::Init);
-        for pod in &pods {
-            node_api_pod_writer.apply_watcher_event(&Event::InitApply(pod.clone()));
-        }
-        node_api_pod_writer.apply_watcher_event(&Event::InitDone);
-        let (pod_store, pod_network_slots, _) = sandbox_pod_view::seeded_sandbox_pod_cache(pods);
-
-        let (node_store, mut node_writer) = reflector::store::<Node>();
-        node_writer.apply_watcher_event(&Event::Init);
-        for node in nodes {
-            node_writer.apply_watcher_event(&Event::InitApply(node));
-        }
-        node_writer.apply_watcher_event(&Event::InitDone);
-
-        let caches = Arc::new(K8sCaches::for_test(node_api_pod_store, node_store, true));
-        KubernetesSubstrate {
-            k8s: KubernetesState {
-                client: inert_kubernetes_client(),
-                sandbox_namespace: "space".to_string(),
-                sandbox_proxy_port: DEFAULT_SANDBOX_PROXY_PORT,
-                node_api_port: DEFAULT_SANDBOX_PROXY_PORT,
-                sandbox_pod_config: SandboxPodConfigValues::default(),
-                create_command_ready_timeout: Duration::from_secs(1),
-                create_data_plane_ready_timeout: Duration::from_secs(1),
-                k8s_blocking_delete_timeout: Duration::from_secs(1),
-                caches,
-            },
-            restore_waiters: RestoreWaiters::new(
-                K8sStore::new(pool.clone(), "space".to_string()),
-                shutdown_token.clone(),
-                task_tracker.clone(),
-            ),
-            pod_worker_channels: Arc::default(),
-            wake_coalescer: Arc::new(
-                pplx_space_common_work_coalescer::WorkCoalescer::with_tracker(task_tracker.clone()),
-            ),
-            store: K8sStore::new(pool.clone(), "space".to_string()),
-            pod_store,
-            pod_network_slots,
-            pod_events: pod_reflector::PodEvents::for_test(),
-            pod_reflector_ready: ReflectorReady::always_ready(),
-            cancel_tracker: Arc::new(CancelRateTracker::with_budget(64)),
-            // Gate closed: these tests exercise pod lifecycle, not placement,
-            // and a closed gate issues no query — so the lazily-connected pool
-            // stays undialed. Placement rendering is covered by the pod-builder
-            // snapshots; resolution by `node_group_placement`'s own tests.
-            node_group_placement: NodeGroupPlacementResolver::new(pool, false),
-            recovery_join_backoff: RecoveryJoinBackoffPolicy::default(),
-            budgets: SubstrateBudgets::default(),
-            shutdown_token,
-            task_tracker,
-        }
+        seeded_substrate(
+            pool,
+            inert_kubernetes_client(),
+            DEFAULT_SANDBOX_PROXY_PORT,
+            pods,
+            nodes,
+        )
     }
 
     #[test]
@@ -1929,8 +1880,6 @@ mod kubernetes_tests {
         pods: Vec<Pod>,
         nodes: Vec<Node>,
     ) -> KubernetesSubstrate {
-        let shutdown_token = CancellationToken::new();
-        let task_tracker = tokio_util::task::TaskTracker::new();
         let (node_api_pod_store, mut node_api_pod_writer) = reflector::store::<Pod>();
         let (pod_store, pod_network_slots, mut pod_writer) = sandbox_pod_view::sandbox_pod_cache();
         if !pods.is_empty() {
@@ -1952,43 +1901,14 @@ mod kubernetes_tests {
         node_writer.apply_watcher_event(&Event::InitDone);
         let caches = Arc::new(K8sCaches::for_test(node_api_pod_store, node_store, true));
 
-        KubernetesSubstrate {
-            k8s: KubernetesState {
-                client,
-                sandbox_namespace: "space".to_string(),
-                sandbox_proxy_port,
-                node_api_port: sandbox_proxy_port,
-                sandbox_pod_config: SandboxPodConfigValues::default(),
-                create_command_ready_timeout: Duration::from_secs(1),
-                create_data_plane_ready_timeout: Duration::from_secs(1),
-                k8s_blocking_delete_timeout: Duration::from_secs(1),
-                caches,
-            },
-            restore_waiters: RestoreWaiters::new(
-                K8sStore::new(pool.clone(), "space".to_string()),
-                shutdown_token.clone(),
-                task_tracker.clone(),
-            ),
-            pod_worker_channels: Arc::default(),
-            wake_coalescer: Arc::new(
-                pplx_space_common_work_coalescer::WorkCoalescer::with_tracker(task_tracker.clone()),
-            ),
-            store: K8sStore::new(pool.clone(), "space".to_string()),
-            pod_store,
-            pod_network_slots,
-            pod_events: pod_reflector::PodEvents::for_test(),
-            pod_reflector_ready: ReflectorReady::always_ready(),
-            cancel_tracker: Arc::new(CancelRateTracker::with_budget(64)),
-            // Gate closed: these tests exercise pod lifecycle, not placement,
-            // and a closed gate issues no query — so the lazily-connected pool
-            // stays undialed. Placement rendering is covered by the pod-builder
-            // snapshots; resolution by `node_group_placement`'s own tests.
-            node_group_placement: NodeGroupPlacementResolver::new(pool, false),
-            recovery_join_backoff: RecoveryJoinBackoffPolicy::default(),
-            budgets: SubstrateBudgets::default(),
-            shutdown_token,
-            task_tracker,
-        }
+        assemble_substrate(
+            pool,
+            client,
+            sandbox_proxy_port,
+            SandboxPodConfigValues::default(),
+            caches,
+            (pod_store, pod_network_slots),
+        )
     }
 
     fn test_worker_node_id() -> NodeId {
@@ -9037,8 +8957,6 @@ mod kubernetes_tests {
         nodes_ready: bool,
         sandbox_pod_config: SandboxPodConfigValues,
     ) -> KubernetesSubstrate {
-        let shutdown_token = CancellationToken::new();
-        let task_tracker = tokio_util::task::TaskTracker::new();
         use kube::runtime::watcher::Event;
         let (node_store, mut node_writer) = reflector::store::<Node>();
         node_writer.apply_watcher_event(&Event::Init);
@@ -9059,43 +8977,14 @@ mod kubernetes_tests {
         let pool = PgPoolOptions::new()
             .connect_lazy("postgres://unused@localhost/unused")
             .expect("lazy pool builds without connecting");
-        KubernetesSubstrate {
-            k8s: KubernetesState {
-                client: inert_kubernetes_client(),
-                sandbox_namespace: "space".to_string(),
-                sandbox_proxy_port: DEFAULT_SANDBOX_PROXY_PORT,
-                node_api_port: DEFAULT_SANDBOX_PROXY_PORT,
-                sandbox_pod_config,
-                create_command_ready_timeout: Duration::from_secs(1),
-                create_data_plane_ready_timeout: Duration::from_secs(1),
-                k8s_blocking_delete_timeout: Duration::from_secs(1),
-                caches,
-            },
-            restore_waiters: RestoreWaiters::new(
-                K8sStore::new(pool.clone(), "space".to_string()),
-                shutdown_token.clone(),
-                task_tracker.clone(),
-            ),
-            pod_worker_channels: Arc::default(),
-            wake_coalescer: Arc::new(
-                pplx_space_common_work_coalescer::WorkCoalescer::with_tracker(task_tracker.clone()),
-            ),
-            store: K8sStore::new(pool.clone(), "space".to_string()),
-            pod_store,
-            pod_network_slots,
-            pod_events: pod_reflector::PodEvents::for_test(),
-            pod_reflector_ready: ReflectorReady::always_ready(),
-            cancel_tracker: Arc::new(CancelRateTracker::with_budget(64)),
-            // Gate closed: these tests exercise pod lifecycle, not placement,
-            // and a closed gate issues no query — so the lazily-connected pool
-            // stays undialed. Placement rendering is covered by the pod-builder
-            // snapshots; resolution by `node_group_placement`'s own tests.
-            node_group_placement: NodeGroupPlacementResolver::new(pool, false),
-            recovery_join_backoff: RecoveryJoinBackoffPolicy::default(),
-            budgets: SubstrateBudgets::default(),
-            shutdown_token,
-            task_tracker,
-        }
+        assemble_substrate(
+            pool,
+            inert_kubernetes_client(),
+            DEFAULT_SANDBOX_PROXY_PORT,
+            sandbox_pod_config,
+            caches,
+            (pod_store, pod_network_slots),
+        )
     }
 
     /// A Ready, schedulable, selector-matching worker whose node-local service

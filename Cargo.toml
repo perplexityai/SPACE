@@ -61,6 +61,7 @@ members = [
     "crates/libs/node/ctl/client",
     "crates/libs/node/api/sim",
     "crates/libs/node/mgr/client",
+    "crates/libs/node/mgr/protocol",
     "crates/libs/node/mgr/server",
     "crates/libs/node/runtime/core",
     "crates/libs/node/runtime/manager/client",
@@ -92,6 +93,7 @@ members = [
     "crates/libs/data/plane/server",
     "crates/libs/db-test-fixtures",
     "crates/libs/db/migrator",
+    "crates/libs/dependency-drain",
     "crates/libs/aws/client",
     "crates/libs/aws/s3-http-client",
     "crates/libs/feature-flags",
@@ -307,6 +309,7 @@ pplx-space-common-work-coalescer = { path = "crates/libs/common/work-coalescer" 
 pplx-space-data-plane-server = { path = "crates/libs/data/plane/server" }
 pplx-space-db-migrate = { path = "crates/libs/db/migrator" }
 pplx-space-db-test-fixtures = { path = "crates/libs/db-test-fixtures" }
+pplx-space-dependency-drain = { path = "crates/libs/dependency-drain" }
 pplx-space-execution-common = { path = "crates/libs/execution/common" }
 pplx-space-feature-flags = { path = "crates/libs/feature-flags" }
 pplx-space-events = { path = "crates/libs/events" }
@@ -327,6 +330,7 @@ pplx-space-node-ctl-server = { path = "crates/libs/node/ctl/server" }
 pplx-space-node-api-sim = { path = "crates/libs/node/api/sim" }
 pplx-space-node-mgr = { path = "crates/libs/node/mgr/server" }
 pplx-space-node-mgr-client = { path = "crates/libs/node/mgr/client" }
+pplx-space-node-mgr-protocol = { path = "crates/libs/node/mgr/protocol" }
 pplx-space-node-runtime-core = { path = "crates/libs/node/runtime/core" }
 pplx-space-node-runtime-manager = { path = "crates/libs/node/runtime/manager/server" }
 pplx-space-node-runtime-manager-client = { path = "crates/libs/node/runtime/manager/client" }

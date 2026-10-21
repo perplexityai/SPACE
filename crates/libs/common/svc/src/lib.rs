@@ -17,7 +17,7 @@ pub use pplx_space_observability::{self as observability, LogContext, Observabil
 pub mod auth;
 pub mod bearer_token;
 pub mod bootstrap;
-pub mod dependency_drain;
+pub use pplx_space_dependency_drain as dependency_drain;
 pub mod disk_admission;
 pub mod ecw_credential;
 pub mod federated_identity;

@@ -112,6 +112,64 @@ pub use teardown_suspend::*;
 // `crate::db::QuarantineRecoveryNoProgressReason` stays the name callers use.
 pub use pplx_space_common_core::types::QuarantineRecoveryNoProgressReason;
 
+/// Typed reads: one sandbox's whole row, the narrow views that keep working
+/// without one, a State RPC batch, one local artifact, one cleanup job and
+/// the node-wide counts. Each keeps the decoder, missing-row rule and
+/// tolerance of the reader it consolidates.
+pub mod read {
+    mod cleanup_job;
+    mod counts;
+    mod local_artifact;
+    mod sandbox;
+    mod sandbox_view;
+    mod state_page;
+    pub use cleanup_job::*;
+    pub use counts::*;
+    pub use local_artifact::*;
+    pub use sandbox::*;
+    pub use sandbox_view::*;
+    pub use state_page::*;
+
+    #[cfg(test)]
+    mod tests;
+}
+
+/// Named scans over many rows. Each keeps its own pinning, filter, cap,
+/// budget and policy for rows that do not decode.
+pub mod scan {
+    mod all_sandboxes;
+    mod by_peer;
+    mod due_auto_lifecycle;
+    mod eviction_candidates;
+    mod list_page;
+    mod local_artifacts;
+    mod node_dirty_batch;
+    mod pending_backups;
+    mod pool_donor;
+    mod quarantine_recovery;
+    mod resolve_selector;
+    mod rowless_restore_scopes;
+    mod sandbox_pages;
+    mod unbound_executions;
+    pub use all_sandboxes::*;
+    pub use by_peer::*;
+    pub use due_auto_lifecycle::*;
+    pub use eviction_candidates::*;
+    pub use list_page::*;
+    pub use local_artifacts::*;
+    pub use node_dirty_batch::*;
+    pub use pending_backups::*;
+    pub use pool_donor::*;
+    pub use quarantine_recovery::*;
+    pub use resolve_selector::*;
+    pub use rowless_restore_scopes::*;
+    pub use sandbox_pages::*;
+    pub use unbound_executions::*;
+
+    #[cfg(test)]
+    mod tests;
+}
+
 const EXECUTION_DELETE_RECEIPT_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 
 fn parse_policy_authority(value: &str, column: usize) -> rusqlite::Result<PolicyAuthority> {
@@ -420,11 +478,13 @@ pub fn emit_auto_lifecycle_delete_receipt_superseded_if_present(
 }
 
 /// Delete every `sandbox_id`-scoped child row of a sandbox inside the
-/// caller's open transaction. The `foreign_keys` pragma is disabled, so this
-/// manual cascade is the single source of truth for sandbox child tables:
-/// add new child tables here, not at the individual delete call sites. It
-/// deliberately skips `network_policy_reconcile_queue`, which nothing writes or
-/// reads any more and a later release drops.
+/// caller's open transaction. This manual cascade is the single source of
+/// truth for sandbox child tables: add new child tables here, not at the
+/// individual delete call sites. Foreign keys are enforced (the bundled SQLite
+/// build defaults `foreign_keys` on and the store never turns it off), but only
+/// some child tables declare `ON DELETE CASCADE`, so the cascade alone is not
+/// the cleanup. It deliberately skips `network_policy_reconcile_queue`, which
+/// nothing writes or reads any more and a later release drops.
 fn delete_sandbox_child_rows(tx: &Connection, id: &str) -> Result<()> {
     teardown_jobs::fail_active(tx, id, TeardownSuspendFailure::Deleted)?;
     crate::db::route_activation_claims::close_claim(tx, id)?;
@@ -490,18 +550,10 @@ pub fn execution_delete_receipt_covers(
     sandbox_id: &str,
     execution_generation: ExecutionGeneration,
 ) -> Result<bool> {
-    let minimum_deleted_at =
-        now_epoch_i64()?.saturating_sub(EXECUTION_DELETE_RECEIPT_RETENTION_SECS);
-    conn.query_row(
-        "SELECT execution_generation >= ?1
-         FROM sandbox_execution_delete_receipts
-         WHERE sandbox_id = ?2
-           AND deleted_at >= ?3",
-        params![execution_generation.get(), sandbox_id, minimum_deleted_at],
-        |row| row.get(0),
-    )
-    .optional()
-    .map(|covers| covers.unwrap_or(false))
+    let now = now_epoch_i64()?;
+    read::sandbox_view(conn, sandbox_id)
+        .delete_receipts()
+        .execution_covers(execution_generation, now)
 }
 
 /// Only use at read/decode boundaries. Statement, schema and write failures

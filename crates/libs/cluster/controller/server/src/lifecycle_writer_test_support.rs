@@ -2,30 +2,24 @@
 //! the cluster-controller's writes to Postgres `sandboxes.lifecycle` against
 //! the real Postgres fixture. Everything here writes Postgres control-plane
 //! tables only, apart from [`kubernetes_substrate`], which also stands in for
-//! the Kubernetes apiserver. The stored values a sweep seeds come from
-//! `StoredSandboxLifecycle::all_as_str`.
+//! the Kubernetes apiserver, in process. The stored values a sweep seeds come
+//! from `StoredSandboxLifecycle::all_as_str`.
 
-use std::ffi::OsStr;
-use std::future::{Future, IntoFuture};
-use std::io::Write;
-use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::response::IntoResponse;
-use pplx_space_api::controllers::substrate::kubernetes::KubernetesSubstrate;
+use k8s_openapi::api::core::v1::Pod;
+use pplx_space_api::controllers::substrate::kubernetes::{
+    KubernetesSubstrate, TEST_SANDBOX_NAMESPACE,
+};
 use pplx_space_common_core::sql;
 use pplx_space_common_core::types::{NodeId, SandboxId};
-use pplx_space_common_svc::bearer_token::{
-    SPACE_INTERNAL_CONTROL_TOKEN_ENV, SPACE_INTERNAL_TOKEN_ENV,
-    SPACE_NODE_API_INTERNAL_TOKEN_PATH_ENV, SPACE_NODE_API_TOKEN_PATH_ENV,
-};
 use pplx_space_db_test_fixtures::TestDb;
 use pplx_space_test_env::TestResult;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
-use tokio_util::sync::CancellationToken;
-use tokio_util::task::TaskTracker;
 use uuid::Uuid;
 
 /// Lifecycles the `BEFORE UPDATE` trigger lets an evacuation marker survive a
@@ -312,231 +306,69 @@ pub(crate) async fn wait_until_blocked(
 // A Kubernetes substrate, for the writers that call one.
 // ---------------------------------------------------------------------------
 
-/// Re-run the calling test in a child process whose environment lets
-/// [`kubernetes_substrate`] build a substrate. Call it first, before any
-/// fixture, and return when it returns `false`: the child has then run the
-/// test.
+/// The namespace the substrate's sandbox pods and their executions live in.
+pub(crate) const KUBERNETES_NAMESPACE: &str = TEST_SANDBOX_NAMESPACE;
+
+/// A port no host service listens on, for a substrate that must not dial.
+const CLOSED_PORT: u16 = 1;
+
+/// A `KubernetesSubstrate` over `pool` whose apiserver is an in-process
+/// double holding no pods and no nodes; see [`kubernetes_substrate_with_pods`].
 ///
-/// `pplx-space-api` builds its Kubernetes test substrates in `#[cfg(test)]`
-/// code this crate cannot reach, and the substrate's only public constructor
-/// is the production one, `KubernetesSubstrate::try_from_env`, which reads the
-/// process environment. So the child gets the variables it reads. This parent
-/// keeps a directory until the child exits: [`KUBECONFIG_DOUBLE_ENV`] names
-/// it, `KUBECONFIG` names a file in it that does not exist yet, and the
-/// node-api token paths name files in it holding the internal tokens, so the
-/// token reader never falls back to the host's token files. The child's own
-/// copy of the directory is unused. The
-/// proxy variables kube reads are removed so the client dials the loopback
-/// apiserver directly, and the internal-RPC variables let the substrate dial a
-/// node-api double in plaintext.
-pub(crate) fn enter_kubernetes_process() -> TestResult<bool> {
-    let owned = tempfile::tempdir()?;
-    let kubeconfig = owned.path().join("kubeconfig");
-    let node_api_token = owned.path().join("node-api.token");
-    let node_api_internal_token = owned.path().join("node-api-internal.token");
-    std::fs::write(&node_api_token, INTERNAL_TOKEN)?;
-    std::fs::write(&node_api_internal_token, INTERNAL_CONTROL_TOKEN)?;
-    Ok(pplx_space_test_env::enter_test_process(&[
-        ("SPACE_K8S_CONTROL_PLANE", Some(OsStr::new("true"))),
-        ("KUBECONFIG", Some(kubeconfig.as_os_str())),
-        (KUBECONFIG_DOUBLE_ENV, Some(owned.path().as_os_str())),
-        (
-            "SPACE_SANDBOX_NAMESPACE",
-            Some(OsStr::new(KUBERNETES_NAMESPACE)),
-        ),
-        (
-            "SPACE_NODE_API_NAMESPACE",
-            Some(OsStr::new(KUBERNETES_NAMESPACE)),
-        ),
-        ("HTTPS_PROXY", None),
-        ("https_proxy", None),
-        ("KUBE_RS_DEBUG_OVERRIDE_URL", None),
-        ("SPACE_INTERNAL_RPC_INSECURE_DEV", Some(OsStr::new("true"))),
-        (SPACE_INTERNAL_TOKEN_ENV, Some(OsStr::new(INTERNAL_TOKEN))),
-        (
-            SPACE_INTERNAL_CONTROL_TOKEN_ENV,
-            Some(OsStr::new(INTERNAL_CONTROL_TOKEN)),
-        ),
-        (
-            SPACE_NODE_API_TOKEN_PATH_ENV,
-            Some(node_api_token.as_os_str()),
-        ),
-        (
-            SPACE_NODE_API_INTERNAL_TOKEN_PATH_ENV,
-            Some(node_api_internal_token.as_os_str()),
-        ),
-    ]))
+/// Its callers seed no pod and no execution with a `pod_ip`, so the substrate
+/// resolves no address to dial. Should one resolve, [`CLOSED_PORT`] keeps the
+/// dial off any host service: it fails rather than sending an RPC, so no
+/// bearer token is read.
+pub(crate) fn kubernetes_substrate(pool: &PgPool) -> TestResult<KubernetesSubstrate> {
+    kubernetes_substrate_with_pods(pool, Vec::new(), CLOSED_PORT)
 }
 
-const INTERNAL_TOKEN: &str = "synthetic-internal-token";
-const INTERNAL_CONTROL_TOKEN: &str = "synthetic-internal-control-token";
-
-/// Names the directory [`enter_kubernetes_process`] created for its child.
-/// The fixture writes a kubeconfig only as a new file in that directory (see
-/// [`write_owned_kubeconfig`]), so a test that skips the child process cannot
-/// overwrite a developer's kubeconfig.
-const KUBECONFIG_DOUBLE_ENV: &str = "SPACE_TEST_KUBECONFIG_DOUBLE";
-
-/// Create `kubeconfig` holding `contents`, only when its directory, with
-/// symlinks and `..` resolved, is the directory `owned_dir` names, and only
-/// as a new file: an existing file, or a symlink in its place, is refused
-/// rather than written through.
-fn write_owned_kubeconfig(
-    kubeconfig: Option<&OsStr>,
-    owned_dir: Option<&OsStr>,
-    contents: &str,
-) -> TestResult {
-    let refuse = |why: &str| -> TestResult {
-        Err(format!(
-            "refusing to write a kubeconfig: {why}; call enter_kubernetes_process first \
-             and run inside its child"
-        )
-        .into())
-    };
-    let (Some(kubeconfig), Some(owned_dir)) = (kubeconfig, owned_dir) else {
-        return refuse(&format!(
-            "KUBECONFIG and {KUBECONFIG_DOUBLE_ENV} must both be set"
-        ));
-    };
-    let kubeconfig = Path::new(kubeconfig);
-    let Some(directory) = kubeconfig.parent() else {
-        return refuse("KUBECONFIG names no directory");
-    };
-    if directory.canonicalize()? != Path::new(owned_dir).canonicalize()? {
-        return refuse(&format!(
-            "KUBECONFIG is not in the directory {KUBECONFIG_DOUBLE_ENV} names"
-        ));
-    }
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(kubeconfig)?
-        .write_all(contents.as_bytes())?;
-    Ok(())
-}
-
-/// The namespace the substrate's sandbox pods and node-api pods live in.
-pub(crate) const KUBERNETES_NAMESPACE: &str = "space";
-
-/// A `KubernetesSubstrate` built by `try_from_env` over `pool`, its
-/// apiserver an in-process double holding no pods and no nodes. Only inside
-/// [`enter_kubernetes_process`]'s child.
-pub(crate) async fn kubernetes_substrate(pool: &PgPool) -> TestResult<KubernetesSubstrate> {
-    kubernetes_substrate_with_pods(pool, Vec::new()).await
-}
-
-/// [`kubernetes_substrate`] whose apiserver double holds `pods` (Pod objects
-/// in the [`KUBERNETES_NAMESPACE`]) and no nodes.
+/// A `KubernetesSubstrate` over `pool` whose caches start warm holding `pods`
+/// (Pod objects in the [`KUBERNETES_NAMESPACE`]) and no nodes, and which
+/// dials a pod's sandbox proxy on `sandbox_proxy_port`; a node's node-api is
+/// dialed there too only when its node-api pod advertises no port. Its
+/// budgets are the production defaults.
 ///
-/// The double answers every pod or node collection read with what it holds,
-/// whatever the selector, and a read of a held pod by name with that pod. It
-/// holds every watch open without an event, so the substrate's caches sync at
-/// once with exactly those pods. Anything else, including any write, is a
-/// 404.
-///
-/// The kubeconfig naming the double can only be created once, so the double
-/// is one per process: the first call starts it, and every call replaces the
-/// pods it holds. A substrate built earlier keeps the pods its caches synced
-/// with, since no watch event arrives; only its direct API reads see the new
-/// ones.
-pub(crate) async fn kubernetes_substrate_with_pods(
+/// Its apiserver is a double of its own, answering a read of a held pod by
+/// name with that pod. Anything else, including any write, is a 404.
+pub(crate) fn kubernetes_substrate_with_pods(
     pool: &PgPool,
     pods: Vec<serde_json::Value>,
+    sandbox_proxy_port: u16,
 ) -> TestResult<KubernetesSubstrate> {
-    let held = APISERVER_DOUBLE_PODS
-        .get_or_try_init(start_apiserver_double)
-        .await?;
-    *held.lock().map_err(|_| "apiserver double pods poisoned")? = pods;
-    KubernetesSubstrate::try_from_env(pool, CancellationToken::new(), TaskTracker::new())
-        .await?
-        .ok_or_else(|| "enter_kubernetes_process sets SPACE_K8S_CONTROL_PLANE".into())
-}
-
-type HeldPods = Arc<Mutex<Vec<serde_json::Value>>>;
-
-/// The pods this process's apiserver double holds, once it is started.
-static APISERVER_DOUBLE_PODS: tokio::sync::OnceCell<HeldPods> = tokio::sync::OnceCell::const_new();
-
-/// Start the apiserver double and create the kubeconfig that names it.
-async fn start_apiserver_double() -> TestResult<HeldPods> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let server = format!("http://{}", listener.local_addr()?);
-    write_owned_kubeconfig(
-        std::env::var_os("KUBECONFIG").as_deref(),
-        std::env::var_os(KUBECONFIG_DOUBLE_ENV).as_deref(),
-        &format!(
-            "apiVersion: v1
-kind: Config
-clusters:
-- name: double
-  cluster:
-    server: {server}
-users:
-- name: double
-  user: {{}}
-contexts:
-- name: double
-  context:
-    cluster: double
-    user: double
-    namespace: {KUBERNETES_NAMESPACE}
-current-context: double
-"
-        ),
-    )?;
-    let pods = HeldPods::default();
-    let held = Arc::clone(&pods);
+    let seeded = pods
+        .iter()
+        .map(|pod| serde_json::from_value::<Pod>(pod.clone()))
+        .collect::<Result<_, _>>()?;
+    let held = Arc::new(pods);
     let apiserver = axum::Router::new().fallback(move |request: axum::extract::Request| {
         let held = Arc::clone(&held);
-        async move {
-            match held.lock() {
-                Ok(pods) => apiserver_double(&pods, &request),
-                Err(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-            }
-        }
+        async move { apiserver_double(&held, &request) }
     });
-    tokio::spawn(axum::serve(listener, apiserver).into_future());
-    Ok(pods)
+    Ok(KubernetesSubstrate::with_seeded_caches(
+        pool.clone(),
+        kube::Client::new(apiserver, KUBERNETES_NAMESPACE),
+        sandbox_proxy_port,
+        seeded,
+    ))
 }
 
 fn apiserver_double(
     pods: &[serde_json::Value],
     request: &axum::extract::Request,
 ) -> axum::response::Response {
-    use axum::http::{Method, StatusCode, header};
+    use axum::http::{Method, StatusCode};
 
-    let path = request.uri().path();
-    let watch = request
+    let held = request
         .uri()
-        .query()
-        .is_some_and(|query| query.split('&').any(|pair| pair == "watch=true"));
-    let list = |kind: &str, items: &[serde_json::Value]| {
-        axum::Json(serde_json::json!({
-            "kind": kind,
-            "apiVersion": "v1",
-            "metadata": { "resourceVersion": "1" },
-            "items": items,
-        }))
-        .into_response()
-    };
-    let pod_name = path
+        .path()
         .strip_prefix(&format!("/api/v1/namespaces/{KUBERNETES_NAMESPACE}/pods/"))
-        .filter(|name| !name.contains('/'));
-    let held = pod_name.and_then(|name| {
-        pods.iter()
-            .find(|pod| pod["metadata"]["name"].as_str() == Some(name))
-    });
-    let collection = path.ends_with("/pods") || path.ends_with("/nodes");
+        .filter(|name| !name.contains('/'))
+        .and_then(|name| {
+            pods.iter()
+                .find(|pod| pod["metadata"]["name"].as_str() == Some(name))
+        });
     match (request.method(), held) {
-        (&Method::GET, _) if collection && watch => (
-            [(header::CONTENT_TYPE, "application/json")],
-            axum::body::Body::from_stream(futures_util::stream::pending::<
-                Result<bytes::Bytes, std::convert::Infallible>,
-            >()),
-        )
-            .into_response(),
-        (&Method::GET, _) if path.ends_with("/pods") => list("PodList", pods),
-        (&Method::GET, _) if path.ends_with("/nodes") => list("NodeList", &[]),
         (&Method::GET, Some(pod)) => axum::Json(pod.clone()).into_response(),
         _ => (
             StatusCode::NOT_FOUND,
@@ -551,6 +383,3 @@ fn apiserver_double(
             .into_response(),
     }
 }
-
-#[cfg(test)]
-mod tests;

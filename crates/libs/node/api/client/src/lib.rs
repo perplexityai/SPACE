@@ -21,10 +21,10 @@ use pplx_space_common_grpc::{
     DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY, GrpcClient, GrpcRetryContext, GrpcRetryPolicy,
     should_reconnect_status,
 };
-use pplx_space_common_svc::{
-    bearer_token::{SpaceBearerToken, insert_space_bearer_token},
-    bootstrap::{GrpcClientTrace, wrap_grpc_client_channel},
+use pplx_space_common_grpc::{
+    GrpcClientTrace, trace_grpc_client_transport as wrap_grpc_client_channel,
 };
+use pplx_space_common_svc::bearer_token::{SpaceBearerToken, insert_space_bearer_token};
 use tonic::transport::{Channel, Endpoint};
 
 pub use pplx_space_common_core::operation_budget::RuntimeOperationBudget as NodeApiOperationBudget;
