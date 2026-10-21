@@ -117,7 +117,7 @@ pub(super) fn insert_command_event_stream_schema(spec: &mut Value) {
             "name": "Last-Event-ID",
             "in": "header",
             "required": false,
-            "description": "SSE `id` of the last frame received.\n\n- Echo the `id` exactly; do not parse it into a floating-point number.\n- A process stream resumes with the output after that frame while it is retained; otherwise `resync_required` precedes the output it continues with: `cursor_out_of_window` when the output is evicted or the `id` is past it, `cursor_replay_unavailable` when the `id` does not resume exactly.\n- A file-watch stream resumes live; its first identified frame is `resync_required` (`cursor_replay_unavailable`), with id `Last-Event-ID + 1`.\n- Values above the `int64` maximum return 400.",
+            "description": "SSE `id` of the last frame received.\n\n- Echo the `id` exactly; do not parse it into a floating-point number.\n- A process stream resumes with the output after that frame while it is retained; otherwise `resync_required` precedes the output it continues with: `cursor_out_of_window` when the output is evicted or the `id` is past it, `cursor_replay_unavailable` when the `id` does not resume exactly.\n- A file-watch stream resumes live; its first identified frame is `resync_required` (`cursor_replay_unavailable`), with id `Last-Event-ID + 1`.\n- Values above the `int64` maximum, and process stream values too high to number a later frame above, return 400.",
             "schema": {
                 "type": "integer",
                 "format": "int64",

@@ -2,7 +2,8 @@ use super::*;
 use crate::{
     native::{
         PROCESS_EVENT_ID_GUARD_BITS, PROCESS_EVENT_ID_MAX_FRAME, PROCESS_EVENT_ID_MAX_POSITION,
-        ProcessEventId, ProcessReplayState, first_frame_attach_token_from_recv,
+        PROCESS_EVENT_ID_MAX_RESUME_BLOCK, ProcessEventId, ProcessReplayState,
+        first_frame_attach_token_from_recv,
     },
     runtime_route::sweep_expired_ecw_routes,
 };
@@ -3712,7 +3713,7 @@ async fn first_frame_attach_token_times_out_at_deadline() {
 fn process_sse_resume_starts_at_the_journal_position_its_id_carries() {
     let session_id = DataPlaneSessionId::Process(Default::default());
 
-    let fresh = ProcessReplayState::load(session_id, None);
+    let fresh = ProcessReplayState::load(session_id, None).unwrap();
     assert_eq!(fresh.backend_output_cursor, 0);
     assert!(fresh.pending.is_empty());
 
@@ -3720,26 +3721,50 @@ fn process_sse_resume_starts_at_the_journal_position_its_id_carries() {
         position: 3,
         frame: 2,
     };
-    let resumed = ProcessReplayState::load(session_id, Some(carried.encode()));
+    let resumed = ProcessReplayState::load(session_id, Some(carried.encode())).unwrap();
     assert_eq!(resumed.event_id, carried);
     assert_eq!(resumed.backend_output_cursor, 3);
     assert!(resumed.pending.is_empty());
 
-    let unknown = ProcessEventId::Unknown { block: 4, frame: 1 }.encode();
     // Earlier data planes count frames from 1, so their ids sit on either side
     // of any decimal boundary; one counted on from a tagged id fails its guard.
+    // Whatever the id, every id the replay sends is above it.
     for last_event_id in [
         0,
         41,
         999_999,
         1_000_000,
         1_500_000,
-        unknown,
         carried.encode() + 1,
+        ProcessEventId::Unknown { block: 4, frame: 1 }.encode(),
+        ProcessEventId::Unknown { block: 4, frame: 1 }.encode() + 1,
+        ProcessEventId::Unknown {
+            block: PROCESS_EVENT_ID_MAX_RESUME_BLOCK - 1,
+            frame: PROCESS_EVENT_ID_MAX_FRAME,
+        }
+        .encode(),
     ] {
-        let replay = ProcessReplayState::load(session_id, Some(last_event_id));
+        let replay = ProcessReplayState::load(session_id, Some(last_event_id)).unwrap();
         assert_eq!(replay.backend_output_cursor, 0, "{last_event_id}");
         assert_eq!(replay.pending.len(), 1, "{last_event_id}");
+        assert!(replay.event_id.encode() > last_event_id, "{last_event_id}");
+        let mut id = replay.event_id;
+        for position in [Some(0), Some(1), None, Some(2)] {
+            id = id.next(position);
+            assert!(id.encode() > last_event_id, "{last_event_id}");
+        }
+    }
+
+    // An id this close to the end leaves a stream too few ids to send.
+    for forged in [
+        ProcessEventId::Unknown {
+            block: PROCESS_EVENT_ID_MAX_RESUME_BLOCK,
+            frame: 0,
+        }
+        .encode(),
+        MAX_LAST_EVENT_ID,
+    ] {
+        assert!(ProcessReplayState::load(session_id, Some(forged)).is_none());
     }
 }
 

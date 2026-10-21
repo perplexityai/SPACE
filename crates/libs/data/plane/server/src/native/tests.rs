@@ -1718,6 +1718,8 @@ enum FakeReply {
     Status(tonic::Code),
     /// Ends the stream as the guest does for a cursor past the output.
     CursorAhead,
+    /// Refuses the call outright, before any stream.
+    Refuse(tonic::Code),
 }
 
 /// How the data plane opened a fake guest process stream.
@@ -1856,6 +1858,13 @@ async fn spawn_journal_fake(
             let mut trailers = None;
             for reply in replies(opened, open) {
                 let (code, reason) = match reply {
+                    FakeReply::Refuse(code) => {
+                        return Response::builder()
+                            .header("content-type", "application/grpc")
+                            .header("grpc-status", code as i32)
+                            .body(Body::empty())
+                            .unwrap();
+                    }
                     FakeReply::Event(event) => {
                         let encoded = ProcessEvent {
                             process_id: process_id.clone(),
@@ -1980,6 +1989,14 @@ async fn process_events_to_close(
 
 const JOURNAL: [&str; 4] = ["one\n", "two\n", "three\n", "four\n"];
 
+fn assert_ids_above(frames: &[(Option<u64>, serde_json::Value)], last_event_id: u64) {
+    let ids: Vec<u64> = frames.iter().filter_map(|(id, _)| *id).collect();
+    assert!(
+        ids.iter().all(|id| *id > last_event_id),
+        "ids {ids:?} after Last-Event-ID {last_event_id}"
+    );
+}
+
 fn connects(cursors: &[Option<u64>]) -> Vec<FakeOpen> {
     cursors.iter().copied().map(FakeOpen::Connect).collect()
 }
@@ -2081,6 +2098,7 @@ async fn evicted_process_output_is_reported_before_the_live_tail() {
         resync_reasons(&resumed),
         ["cursor_replay_unavailable", "cursor_out_of_window"]
     );
+    assert_ids_above(&resumed, last_event_id);
     assert_eq!(
         *fake.opens.lock().unwrap(),
         connects(&[Some(0), None, Some(0), None])
@@ -2122,6 +2140,7 @@ async fn backend_reconnect_after_a_resume_continues_without_a_resync() {
 
     assert_eq!(stdout_text(&resumed), "two\nthree\nfour\n");
     assert_eq!(frames_of_type(&resumed, "backend_reconnected").count(), 1);
+    assert_eq!(frames_of_type(&resumed, "process_started").count(), 1);
     assert_eq!(resync_reasons(&resumed), Vec::<String>::new());
     assert_eq!(
         *fake.opens.lock().unwrap(),
@@ -2153,6 +2172,7 @@ async fn resume_past_the_output_replays_it_behind_a_resync() {
 
     let frames = process_events_to_close(&fake.endpoint, session_id, Some(ahead)).await;
 
+    assert_ids_above(&frames, ahead);
     assert_eq!(resync_reasons(&frames), ["cursor_out_of_window"]);
     assert_eq!(stdout_text(&frames), JOURNAL.concat());
     assert_eq!(frames_of_type(&frames, "process_started").count(), 1);
@@ -2179,18 +2199,14 @@ async fn resume_from_an_untagged_id_replays_behind_a_resync() {
 
     assert_eq!(resync_reasons(&frames), ["cursor_replay_unavailable"]);
     assert_eq!(stdout_text(&frames), JOURNAL.concat());
-    assert!(
-        frames
-            .iter()
-            .filter_map(|(id, _)| *id)
-            .all(|id| id > 1_500_000)
-    );
+    assert_ids_above(&frames, 1_500_000);
     assert_eq!(*fake.opens.lock().unwrap(), connects(&[Some(0)]));
 }
 
 /// The attach that starts a process counts its output from the start, even
 /// when the client sent another stream's `Last-Event-ID`: the stream says the
-/// id did not apply, and a later resume continues exactly.
+/// id did not apply, numbers its frames above it, and a later resume replays
+/// behind `resync_required` rather than at a wrong position.
 #[tokio::test]
 async fn starting_attach_ignores_a_foreign_last_event_id() {
     if !binding_fake_test_process() {
@@ -2225,16 +2241,89 @@ async fn starting_attach_ignores_a_foreign_last_event_id() {
     .await
     .expect("the starting attach binds the process");
     let first = sse_frames(&seen);
+    assert_ids_above(&first, foreign);
     assert_eq!(resync_reasons(&first), ["cursor_out_of_window"]);
     assert_eq!(stdout_text(&first), "one\ntwo\n");
 
     let last_event_id = first.last().unwrap().0.unwrap();
     let resumed = process_events_to_close(&fake.endpoint, session_id, Some(last_event_id)).await;
 
-    assert_eq!(stdout_text(&resumed), "three\nfour\n");
-    assert_eq!(resync_reasons(&resumed), Vec::<String>::new());
+    assert_ids_above(&resumed, last_event_id);
+    assert_eq!(resync_reasons(&resumed), ["cursor_replay_unavailable"]);
+    assert_eq!(stdout_text(&resumed), JOURNAL.concat());
+    assert_eq!(
+        *fake.opens.lock().unwrap(),
+        [FakeOpen::Start, FakeOpen::Connect(Some(0))]
+    );
+}
+
+/// An attach that finds the process already started, its binding never
+/// persisted, connects at the client's position: a completed process replays
+/// exactly what the client lacks, with no resync.
+#[tokio::test]
+async fn already_started_process_is_resumed_exactly() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_journal_fake(
+        session_id,
+        false,
+        Arc::new(|_, open| match open {
+            FakeOpen::Start => vec![FakeReply::Refuse(tonic::Code::AlreadyExists)],
+            open => journal_replay(&JOURNAL, open),
+        }),
+    )
+    .await;
+    let after_two = ProcessEventId::Position {
+        position: 2,
+        frame: 0,
+    }
+    .encode();
+
+    let frames = process_events_to_close(&fake.endpoint, session_id, Some(after_two)).await;
+
+    assert_eq!(stdout_text(&frames), "three\nfour\n");
+    assert_eq!(resync_reasons(&frames), Vec::<String>::new());
+    assert_ids_above(&frames, after_two);
     assert_eq!(
         *fake.opens.lock().unwrap(),
         [FakeOpen::Start, FakeOpen::Connect(Some(2))]
     );
+}
+
+/// A `Last-Event-ID` too close to the end of the id space to number a later
+/// frame above is refused before anything is opened.
+#[tokio::test]
+async fn last_event_id_without_room_after_it_is_rejected() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_journal_fake(
+        session_id,
+        true,
+        Arc::new(|_, open| journal_replay(&JOURNAL, open)),
+    )
+    .await;
+    let mut state = crate::tests::test_data_plane_state().await;
+    state.cluster_api = ClusterApiClients::service_only(
+        pplx_space_node_api_client::cluster::connect(fake.endpoint.clone(), "test")
+            .await
+            .unwrap(),
+    );
+    let token = format!("{DATA_PLANE_TOKEN_PREFIX}{}", "c".repeat(64));
+    let response = tower::ServiceExt::oneshot(
+        router(state),
+        Request::get(format!("/v1/sessions/{session_id}/events"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header("last-event-id", MAX_LAST_EVENT_ID.to_string())
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(fake.opens.lock().unwrap().is_empty());
 }

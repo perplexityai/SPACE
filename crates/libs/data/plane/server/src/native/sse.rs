@@ -94,6 +94,17 @@ pub(crate) async fn session_events(
     };
     let stream_state = match attached.kind {
         SessionKind::Process => {
+            // Only a forged id leaves no later id to number the stream with.
+            let Some(replay) = ProcessReplayState::load(session_id, last_event_id) else {
+                return data_plane_http_error(
+                    StatusCode::BAD_REQUEST,
+                    DataPlaneHttpErrorCode::InvalidRequest,
+                    "last-event-id is past every event id this stream can send",
+                    false,
+                    ResponseOrigin::Client,
+                    ResponseKind::Validation,
+                );
+            };
             let start_permit = match state.native_sessions.try_acquire(session_id, attached.kind) {
                 Ok(permit) => permit,
                 Err(()) => {
@@ -118,7 +129,7 @@ pub(crate) async fn session_events(
                     state,
                     session_id,
                     attached,
-                    last_event_id,
+                    replay,
                     stream_permit,
                     start_permit,
                 ),
@@ -219,9 +230,9 @@ pub(crate) struct ProcessSseState {
     process_id: Option<ProcessId>,
     process_bound: bool,
     binding: Option<PendingProcessBinding>,
-    /// The stream was reopened after an output gap, so the start it reports
-    /// next repeats one the client already has.
-    reopened_after_gap: bool,
+    /// The backend stream was reopened, so the start it reports next repeats
+    /// one the client already has.
+    reopened: bool,
     revocation_tick: tokio::time::Interval,
     pending: VecDeque<Event>,
     finished: bool,
@@ -287,6 +298,7 @@ const PROCESS_EVENT_ID_FIELD_SHIFT: u32 = PROCESS_EVENT_ID_GUARD_BITS + PROCESS_
 pub(crate) const PROCESS_EVENT_ID_MAX_FRAME: u64 = (1 << PROCESS_EVENT_ID_FRAME_BITS) - 1;
 const PROCESS_EVENT_ID_UNKNOWN: u64 = 1 << (PROCESS_EVENT_ID_FIELD_BITS - 1);
 pub(crate) const PROCESS_EVENT_ID_MAX_POSITION: u64 = PROCESS_EVENT_ID_UNKNOWN - 1;
+pub(crate) const PROCESS_EVENT_ID_MAX_RESUME_BLOCK: u64 = 1 << 32;
 
 impl ProcessEventId {
     /// Precedes the first frame of a stream that starts at the beginning of
@@ -295,6 +307,27 @@ impl ProcessEventId {
         position: 0,
         frame: 0,
     };
+
+    /// Precedes the first frame of a stream that replays the output from its
+    /// start for a client whose `Last-Event-ID` carries no position, so that
+    /// every id it sends is above that one. Never sent. A tagged id gets a
+    /// fresh block without a position: positions from the start would sort
+    /// below it. `None` for an id fewer than 2^32 blocks from the end, which
+    /// only a forged one is, so a stream never runs out of blocks.
+    pub(crate) fn first_after(last_event_id: u64) -> Option<Self> {
+        if last_event_id < PROCESS_EVENT_ID_TAG {
+            return Some(Self::START);
+        }
+        let first_unknown = Self::Unknown { block: 0, frame: 0 }.encode();
+        let block = if last_event_id < first_unknown {
+            0
+        } else {
+            let field = (last_event_id >> PROCESS_EVENT_ID_FIELD_SHIFT)
+                & ((1 << PROCESS_EVENT_ID_FIELD_BITS) - 1);
+            (field & !PROCESS_EVENT_ID_UNKNOWN) + 1
+        };
+        (block <= PROCESS_EVENT_ID_MAX_RESUME_BLOCK).then_some(Self::Unknown { block, frame: 0 })
+    }
 
     pub(crate) fn encode(self) -> u64 {
         let (field, frame) = match self {
@@ -352,7 +385,8 @@ impl ProcessEventId {
                 block,
                 frame: frame + 1,
             },
-            // A stream would need 2^45 frames to exhaust the blocks.
+            // A resumed stream starts at most at block 2^32
+            // (`first_after`), and would need 2^44 frames to exhaust the rest.
             Self::Unknown { block, .. } => Self::Unknown {
                 block: block + 1,
                 frame: 0,
@@ -367,35 +401,36 @@ impl ProcessReplayState {
     /// continues from the position its `Last-Event-ID` carries. A resume from
     /// an id without one also replays from the start, behind
     /// `resync_required(cursor_replay_unavailable)`, as output the client
-    /// already has may repeat.
-    pub(crate) fn load(session_id: DataPlaneSessionId, last_event_id: Option<u64>) -> Self {
-        match last_event_id.map(ProcessEventId::decode) {
-            None => Self {
+    /// already has may repeat. Every id the stream sends is above
+    /// `Last-Event-ID`; `None` when no id can be (see
+    /// [`ProcessEventId::first_after`]).
+    pub(crate) fn load(session_id: DataPlaneSessionId, last_event_id: Option<u64>) -> Option<Self> {
+        let Some(last_event_id) = last_event_id else {
+            return Some(Self {
                 event_id: ProcessEventId::START,
                 backend_output_cursor: 0,
                 pending: VecDeque::new(),
-            },
-            Some(Some(event_id @ ProcessEventId::Position { position, .. })) => Self {
+            });
+        };
+        if let Some(event_id @ ProcessEventId::Position { position, .. }) =
+            ProcessEventId::decode(last_event_id)
+        {
+            return Some(Self {
                 event_id,
                 backend_output_cursor: position,
                 pending: VecDeque::new(),
-            },
-            Some(_) => {
-                let event_id = ProcessEventId::START.next(Some(0));
-                let frame = resync_required_frame(
-                    session_id.kind().as_str(),
-                    DataPlaneResyncReason::CursorReplayUnavailable,
-                );
-                Self {
-                    event_id,
-                    backend_output_cursor: 0,
-                    pending: VecDeque::from([sse_event_from_frame(
-                        &frame,
-                        Some(event_id.encode()),
-                    )]),
-                }
-            }
+            });
         }
+        let event_id = ProcessEventId::first_after(last_event_id)?.next(Some(0));
+        let frame = resync_required_frame(
+            session_id.kind().as_str(),
+            DataPlaneResyncReason::CursorReplayUnavailable,
+        );
+        Some(Self {
+            event_id,
+            backend_output_cursor: 0,
+            pending: VecDeque::from([sse_event_from_frame(&frame, Some(event_id.encode()))]),
+        })
     }
 }
 
@@ -404,11 +439,10 @@ impl ProcessSseState {
         state: DataPlaneState,
         session_id: DataPlaneSessionId,
         mut attached: AttachedSession,
-        last_event_id: Option<u64>,
+        replay: ProcessReplayState,
         stream_permit: AttachedStreamPermit,
         start_permit: Option<NativeSessionAttachPermit>,
     ) -> Result<Self, StreamBridgeError> {
-        let replay = ProcessReplayState::load(session_id, last_event_id);
         let (client, stream) = open_native_process_stream(
             &state,
             session_id,
@@ -436,7 +470,7 @@ impl ProcessSseState {
             process_id,
             process_bound,
             binding: None,
-            reopened_after_gap: false,
+            reopened: false,
             revocation_tick,
             pending,
             finished: false,
@@ -444,6 +478,19 @@ impl ProcessSseState {
             start_permit,
             _stream_permit: stream_permit,
         })
+    }
+
+    /// Counts the client's output from the start of the guest's again, after
+    /// the position it resumed from turned out not to be in it. The ids sent
+    /// after this carry no position: they must stay above the ones already
+    /// sent, which positions from the start would sort below.
+    fn restart_from_output_start(&mut self) {
+        self.backend_output_cursor = Some(0);
+        self.output_seq = 0;
+        self.push_frame(resync_required_frame(
+            self.session_id.kind().as_str(),
+            DataPlaneResyncReason::CursorOutOfWindow,
+        ));
     }
 
     fn push_frame(&mut self, frame: DataPlaneServerFrame) {
@@ -560,7 +607,7 @@ async fn next_process_sse_frame(state: &mut ProcessSseState) -> Option<Event> {
                             Some(spaced_process_event::Event::Started(_))
                                 | Some(spaced_process_event::Event::Connected(_))
                         ) {
-                            repeated_start = std::mem::take(&mut state.reopened_after_gap);
+                            repeated_start = std::mem::take(&mut state.reopened);
                             let event_process_id: ProcessId = match event.process_id.parse() {
                                 Ok(process_id) => process_id,
                                 Err(_) => {
@@ -580,13 +627,7 @@ async fn next_process_sse_frame(state: &mut ProcessSseState) -> Option<Event> {
                                     // This attach started the process, so its
                                     // output begins here: the position the
                                     // client resumed from was another's.
-                                    state.backend_output_cursor = Some(0);
-                                    state.output_seq = 0;
-                                    state.event_id = ProcessEventId::START;
-                                    state.push_frame(resync_required_frame(
-                                        state.session_id.kind().as_str(),
-                                        DataPlaneResyncReason::CursorOutOfWindow,
-                                    ));
+                                    state.restart_from_output_start();
                                 }
                                 state.process_bound = true;
                                 state.binding = Some(PendingProcessBinding::spawn(
@@ -647,12 +688,15 @@ async fn next_process_sse_frame(state: &mut ProcessSseState) -> Option<Event> {
                         let reopen_at = (is_output_cursor_ahead(&status)
                             && state.backend_output_cursor != Some(0))
                         .then_some(0);
-                        state.backend_output_cursor = reopen_at;
-                        state.output_seq = reopen_at.unwrap_or(state.output_seq);
-                        state.push_frame(resync_required_frame(
-                            state.session_id.kind().as_str(),
-                            DataPlaneResyncReason::CursorOutOfWindow,
-                        ));
+                        if reopen_at.is_some() {
+                            state.restart_from_output_start();
+                        } else {
+                            state.backend_output_cursor = None;
+                            state.push_frame(resync_required_frame(
+                                state.session_id.kind().as_str(),
+                                DataPlaneResyncReason::CursorOutOfWindow,
+                            ));
+                        }
                         match connect_process_stream(
                             &mut state.client,
                             &state.attached.sandbox_id,
@@ -664,7 +708,7 @@ async fn next_process_sse_frame(state: &mut ProcessSseState) -> Option<Event> {
                         {
                             Ok(stream) => {
                                 state.stream = stream;
-                                state.reopened_after_gap = true;
+                                state.reopened = true;
                             }
                             Err(error) => state.finish_with_error(error),
                         }
@@ -735,6 +779,7 @@ async fn next_process_sse_frame(state: &mut ProcessSseState) -> Option<Event> {
                             Ok((client, stream)) => {
                                 state.client = client;
                                 state.stream = stream;
+                                state.reopened = true;
                                 state.push_frame(DataPlaneServerFrame::BackendReconnected {
                                     route_generation: refreshed.route_generation,
                                     current_node_id: refreshed.current_node_id.to_string(),
