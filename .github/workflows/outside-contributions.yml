@@ -19,9 +19,12 @@ on:
 
 permissions: {}
 
+# One run at a time per item, in order. queue: max keeps every waiting event;
+# the default would replace a waiting run and lose its reply.
 concurrency:
   group: outside-contributions-${{ github.event.pull_request.number || github.event.issue.number }}
   cancel-in-progress: false
+  queue: max
 
 env:
   GH_REPO: ${{ github.repository }}
@@ -49,12 +52,24 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh api --method POST "repos/${GH_REPO}/issues/${NUMBER}/labels" \
-            -f 'labels[]=triage:pending' >/dev/null
+          # Read state first; a failed read stops the job (set -e) rather
+          # than looking like "no label" or "no comment yet".
+          labels="$(gh api --paginate "repos/${GH_REPO}/issues/${NUMBER}/labels" \
+            --jq '.[].name')"
+          comments="$(gh api --paginate "repos/${GH_REPO}/issues/${NUMBER}/comments" \
+            --jq '.[].body')"
+
+          # A rerun after a maintainer already decided must not reopen triage.
+          if grep -qxE 'triage:(needs-issue|investigating|reviewing|declined)' \
+            <<<"${labels}"; then
+            echo "Already triaged; leaving labels as they are."
+          else
+            gh api --method POST "repos/${GH_REPO}/issues/${NUMBER}/labels" \
+              -f 'labels[]=triage:pending' >/dev/null
+          fi
 
           marker='<!-- space-outside-contributions:thanks -->'
-          if gh api --paginate "repos/${GH_REPO}/issues/${NUMBER}/comments" \
-            --jq '.[].body' | grep -qF "${marker}"; then
+          if grep -qF "${marker}" <<<"${comments}"; then
             echo "Thank-you already posted."
             exit 0
           fi
@@ -119,8 +134,10 @@ jobs:
           esac
 
           marker="<!-- space-outside-contributions:${LABEL} -->"
-          if gh api --paginate "repos/${GH_REPO}/issues/${NUMBER}/comments" \
-            --jq '.[].body' | grep -qF "${marker}"; then
+          # A failed read stops the job (set -e) instead of authorizing a post.
+          comments="$(gh api --paginate "repos/${GH_REPO}/issues/${NUMBER}/comments" \
+            --jq '.[].body')"
+          if grep -qF "${marker}" <<<"${comments}"; then
             echo "Reply for ${LABEL} already posted."
           else
             gh api --method POST "repos/${GH_REPO}/issues/${NUMBER}/comments" \
