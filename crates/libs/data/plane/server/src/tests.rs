@@ -1857,6 +1857,32 @@ fn production_revocation_tolerance() -> Duration {
     )
 }
 
+#[tokio::test]
+async fn run_refuses_a_revocation_check_interval_above_the_maximum() {
+    let maximum = Duration::from_millis(MAX_REVOCATION_CHECK_INTERVAL_MS);
+    let config = |revocation_check_interval| DataPlaneConfig {
+        revocation_check_interval,
+        ..DataPlaneConfig::default()
+    };
+    config(maximum).validate().unwrap();
+    let above = config(maximum + Duration::from_millis(1));
+    assert!(matches!(
+        above.validate(),
+        Err(RunDataPlaneError::RevocationCheckIntervalTooLong { .. })
+    ));
+    // Refused before it connects to anything.
+    let stop = pplx_space_common_svc::StopTokens {
+        shutdown: CancellationToken::new(),
+        forced: CancellationToken::new(),
+    };
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), run(above, stop)).await,
+        Ok(Err(
+            RunDataPlaneError::RevocationCheckIntervalTooLong { .. }
+        ))
+    ));
+}
+
 #[test]
 fn revocation_cache_uses_epoch_and_coalesces_refresh() {
     let cache = Arc::new(RevocationCache::default());

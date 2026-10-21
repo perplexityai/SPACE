@@ -219,6 +219,8 @@ pub struct DataPlaneConfig {
     pub max_attached_streams_per_org: usize,
     pub max_attached_streams_per_sandbox: usize,
     pub backend_channel_pool_size: usize,
+    /// At most [`MAX_REVOCATION_CHECK_INTERVAL_MS`]; [`run`] refuses a longer
+    /// one.
     pub revocation_check_interval: Duration,
     pub route_cache_ttl: Duration,
     /// `None` leaves `POST /files` unbounded.
@@ -377,8 +379,26 @@ fn cluster_api_flag_attributes() -> Attributes {
     attributes
 }
 
+impl DataPlaneConfig {
+    /// Check the settings [`run`] cannot serve with.
+    pub fn validate(&self) -> Result<(), RunDataPlaneError> {
+        if self.revocation_check_interval > Duration::from_millis(MAX_REVOCATION_CHECK_INTERVAL_MS)
+        {
+            return Err(RunDataPlaneError::RevocationCheckIntervalTooLong {
+                interval_ms: self.revocation_check_interval.as_millis(),
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RunDataPlaneError {
+    #[error(
+        "revocation check interval of {interval_ms} ms is above the maximum of {} ms",
+        MAX_REVOCATION_CHECK_INTERVAL_MS
+    )]
+    RevocationCheckIntervalTooLong { interval_ms: u128 },
     #[error("failed to connect to SPACE internal ClusterApi: {0}")]
     ConnectClusterApi(#[source] ConnectClusterApiError),
     #[error("failed to bind data-plane listener at {listen}: {source}")]
@@ -398,6 +418,7 @@ pub async fn run(
     config: DataPlaneConfig,
     stop: pplx_space_common_svc::StopTokens,
 ) -> Result<(), RunDataPlaneError> {
+    config.validate()?;
     let pplx_space_common_svc::StopTokens {
         shutdown: shutdown_token,
         forced: force_token,
