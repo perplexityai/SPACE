@@ -102,14 +102,22 @@ output "general_serving_node_group" {
   precondition {
     # Existing single-pool environments retain their positive-capacity gate.
     # Blue/green and per-AZ configurations additionally enforce the
-    # operator-recorded floor on every serving group. The sizes are the live
-    # ones: Terraform ignores them after creation, so the plan carries what EKS
-    # reports.
+    # operator-recorded floor on every serving group. Terraform sets a serving
+    # group's minimum to that floor, so those hold by construction; the
+    # single-pool gate still refuses a general_min_size of zero.
     condition = alltrue([
       for name, group in local.serving_general_node_groups :
       group.scaling_config[0].min_size >= local.serving_general_node_group_floors[name]
     ])
     error_message = "The recorded general_serving_node_group must be live and, for blue/green and per-AZ configurations, meet its recorded capacity floor."
+  }
+
+  # As module.eks checks for its managed groups: a serving switch raises the
+  # incoming group's minimum to its floor, and EKS refuses one above the live
+  # desired size partway through the apply, so this refuses the plan instead.
+  precondition {
+    condition     = length(local.general_node_groups_outside_bounds) == 0
+    error_message = "The live desired size of ${join(", ", local.general_node_groups_outside_bounds)} is outside the min_size and max_size this plan sets, and EKS refuses those bounds. Move the live group to the new bounds through the EKS API, in the order the comment on aws_eks_node_group.managed in the eks-cluster module gives, and re-plan; or change the configured sizes, which for a group being created or replaced are its creation sizes."
   }
 
   precondition {
@@ -153,7 +161,7 @@ output "general_serving_node_group" {
 }
 
 output "general_serving_min_size" {
-  description = "Largest live floor of the declared general groups. Any of them may carry the active workload, so a root-owned DaemonSet that must roll on the general pool gates on this while the inactive pools stay at zero; referencing it also orders the consumer after a floor update."
+  description = "Largest configured minimum among the declared general groups: the serving group's floor, or the largest zone floor while the per-AZ groups serve, since the parked groups' minimums are zero. A root-owned DaemonSet that must roll on the general pool gates on this; referencing it also orders the consumer after a floor update."
   value       = max([for group in values(local.general_node_groups) : group.scaling_config[0].min_size]...)
 }
 

@@ -19,7 +19,7 @@ output "cluster_name" {
 }
 
 output "node_pool_sizes" {
-  description = "Nodes each pool was sized for at the last apply, keyed by the `space.pplx.net/node-pool` label value. The scheduled job takes the pool names from here and each pool's current size from EKS, since `general` can be resized through the EKS API without a Terraform change."
+  description = "Nodes each pool was sized for at the last apply, keyed by the `space.pplx.net/node-pool` label value. The scheduled job takes the pool names from here and each pool's current size from EKS, since `general`'s desired size can move through the EKS API, within its configured bounds, without a Terraform change."
   value = {
     for pool, group in module.eks.node_groups : pool => group.scaling_config[0].desired_size
   }

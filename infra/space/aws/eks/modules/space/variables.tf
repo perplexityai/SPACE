@@ -285,7 +285,7 @@ variable "external_dns_records_enabled" {
 }
 
 variable "cluster_autoscaler_enabled" {
-  description = "Whether to run cluster-autoscaler on the serving general node group (general_serving_node_group), bounded by each group's own min and max size as EKS reports them, so resizing a group through the EKS API moves its bounds. When the per-AZ groups serve, it scales all of them with --balance-similar-node-groups, so a scale-up goes to the zones with the fewest nodes. A scale-down picks nodes by utilization and can leave the zones uneven until the next scale-up. The serving pool's recorded floor (general_min_size, general_blue_green_node_group.recorded_active_size, or each zone's min_size) still has to hold for that min, so lower the record before lowering the min. It never touches any other pool."
+  description = "Whether to run cluster-autoscaler on the serving general node group (general_serving_node_group), bounded by each group's own min and max size as Terraform applies them. When the per-AZ groups serve, it scales all of them with --balance-similar-node-groups, so a scale-up goes to the zones with the fewest nodes. A scale-down picks nodes by utilization and can leave the zones uneven until the next scale-up. The serving pool's min is its recorded floor (general_min_size, general_blue_green_node_group.recorded_active_size, or each zone's min_size), and the parked pools' is zero. It never touches any other pool."
   type        = bool
   default     = false
   nullable    = false
@@ -773,7 +773,7 @@ variable "general_instance_types" {
 }
 
 variable "general_min_size" {
-  description = "Minimum size of the general node group"
+  description = "Minimum size of the general node group while general_serving_node_group names it, and, beside general-2 or the per-AZ groups, its recorded floor; zero while another group serves."
   type        = number
   default     = 1
 }
@@ -785,7 +785,7 @@ variable "general_max_size" {
 }
 
 variable "general_desired_size" {
-  description = "Desired size of the general node group"
+  description = "Desired size of the general node group at creation; afterwards it moves through the EKS API or cluster-autoscaler, and Terraform ignores it."
   type        = number
   default     = 2
 }
@@ -819,7 +819,7 @@ variable "general_taints" {
 }
 
 variable "general_blue_green_node_group" {
-  description = "Optional permanent general-2 MNG used for additive blue/green swaps. recorded_active_size creates the pool initially and records its operator-managed active target for capacity checks. After creation the pool is sized only through the EKS API, by operators or, while it serves, cluster-autoscaler."
+  description = "Optional permanent general-2 MNG used for additive blue/green swaps. recorded_active_size is the pool's size at creation, its min_size while general_serving_node_group names it (zero otherwise), and the floor capacity checks use. min_size and max_size are applied by Terraform; desired_size is left to operators or, while the pool serves, cluster-autoscaler."
   type = object({
     instance_types       = list(string)
     recorded_active_size = number
@@ -840,7 +840,7 @@ variable "general_blue_green_node_group" {
 }
 
 variable "general_per_az_node_groups" {
-  description = "Optional general MNGs, one per availability zone and each in that zone's private subnet only, named general-<zone>. They run on general's launch template and node role, with its labels and taints, so general workloads move onto them without a Helm change. A single-zone group has no other zone to rebalance into, so EC2 Auto Scaling's AZRebalance never terminates one of its nodes. zones maps each zone to its group's min_size, which creates the group at that size and records its floor for capacity checks, and its max_size. Size each zone explicitly. Over three zones, a min_size of ceil(min/3) each keeps at least a pool-wide floor; a max_size of floor(max/3) each stays within a pool-wide ceiling, and ceil(max/3) can exceed it by up to two nodes. After creation the groups are sized only through the EKS API, by operators or, while they serve, cluster-autoscaler. Changing instance_types destroys every group and its nodes before recreating it, since the fixed names rule out creating the new group first. The plan refuses it until, in earlier applies, general or general-2 serves (declared again if need be) and each per-AZ group is drained and scaled to zero through EKS. general_capacity_type replaces these groups the same way, and general and general-2 with them, so it has no safe path while any general group serves. Declaring this makes every plan read the cluster's node groups from AWS, to refuse removing a general group that still runs nodes or that cluster-autoscaler still discovers. Setting it back to null turns those reads off, so that removal isn't checked unless general is retired: park the groups by hand first. Don't put this module behind a module-level depends_on, which defers the reads and fails the plan."
+  description = "Optional general MNGs, one per availability zone and each in that zone's private subnet only, named general-<zone>. They run on general's launch template and node role, with its labels and taints, so general workloads move onto them without a Helm change. A single-zone group has no other zone to rebalance into, so EC2 Auto Scaling's AZRebalance never terminates one of its nodes. zones maps each zone to its group's min_size and max_size. min_size is the group's size at creation, its minimum while general_serving_node_group is general-per-az (zero otherwise), and the floor capacity checks use. Size each zone explicitly. Over three zones, a min_size of ceil(min/3) each keeps at least a pool-wide floor; a max_size of floor(max/3) each stays within a pool-wide ceiling, and ceil(max/3) can exceed it by up to two nodes. Terraform applies each group's minimum and max_size; its desired size is left to operators or, while the groups serve, cluster-autoscaler. Changing instance_types destroys every group and its nodes before recreating it, since the fixed names rule out creating the new group first. The plan refuses it until, in earlier applies, general or general-2 serves (declared again if need be) and each per-AZ group is drained and scaled to zero through EKS. general_capacity_type replaces these groups the same way, and general and general-2 with them, so it has no safe path while any general group serves. Declaring this makes every plan read the cluster's node groups from AWS, to refuse removing a general group that still runs nodes or that cluster-autoscaler still discovers. Setting it back to null turns those reads off, so that removal isn't checked unless general is retired: park the groups by hand first. Don't put this module behind a module-level depends_on, which defers the reads and fails the plan."
   type = object({
     instance_types = list(string)
     zones = map(object({
@@ -1019,7 +1019,7 @@ variable "ci_helm_deploy_external_id" {
 }
 
 variable "cred_authority_node_count" {
-  description = "Node count (min = desired) for the dedicated cred-authority pool that hosts credmgr-authority. Defaults to 1 for clusters without live authority traffic; set 2 on clusters with live authority traffic so the two authority replicas spread across nodes."
+  description = "Node count (min = desired, max one more) for the dedicated cred-authority pool that hosts credmgr-authority. Terraform applies min and max whenever they change but desired only at creation, and the plan refuses bounds that don't contain the live desired size. So on an existing pool, change it one step at a time. To grow, raise the pool's desired size by one through the EKS API, then raise this. To shrink, lower this by one, then drain one of the pool's nodes and terminate it with `aws autoscaling terminate-instance-in-auto-scaling-group --should-decrement-desired-capacity`. Defaults to 1 for clusters without live authority traffic; set 2 on clusters with live authority traffic so the two authority replicas spread across nodes."
   type        = number
   default     = 1
 

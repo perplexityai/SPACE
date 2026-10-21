@@ -194,18 +194,55 @@ resource "aws_eks_node_group" "managed" {
     update = var.node_group_update_timeout
   }
 
-  # These groups' size moves only outside Terraform: an operator resizing them
-  # through the EKS API, or a cluster-autoscaler the caller runs on one of them,
-  # which sets the ASG's desired capacity between the min and max it reads live
-  # from that ASG. Without this, the next apply for any unrelated change would
-  # reset each group to its creation-time sizing and scale it down under
-  # whatever is running on it. The sizes in node_pools still decide what a new
-  # cluster comes up with.
+  # min_size and max_size are code-owned: node_pools decides them, and a change
+  # lands through an apply. desired_size isn't. Something else moves it: an
+  # operator through the EKS API, or a cluster-autoscaler the caller runs on
+  # one of these groups. Without this, every unrelated apply would reset each
+  # group to its configured desired size and could scale it down under
+  # whatever is running on it. node_pools' desired_size still decides what a
+  # new group comes up with.
+  #
+  # The provider sends all three fields in one UpdateNodegroupConfig call,
+  # desired_size as it stood in state when the plan was made, and EKS requires
+  # min_size <= desired_size <= max_size. So raising min_size above a group's
+  # live desired size, or lowering max_size below it (say after
+  # cluster-autoscaler has grown the pool), can't apply: the managed_node_groups
+  # output refuses the plan. And an apply of a saved plan, on a pool
+  # cluster-autoscaler has resized since the plan, sends the old desired size
+  # back and resizes the pool to it. Both go away if the live group already
+  # has the new bounds when the plan is made: it then has no bound change and
+  # sends no size. Make that EKS change immediately before planning the
+  # matching code change, since any other apply in between reverts it (see
+  # below). To raise bounds, raise max, then desired if it's below the new
+  # min, then min. To lower them, lower min, then shrink the pool to the new
+  # max, then lower max. Shrink by draining a chosen node and terminating it
+  # with `aws autoscaling terminate-instance-in-auto-scaling-group
+  # --should-decrement-desired-capacity`, one at a time, each from the zone
+  # with the most nodes: a smaller desired size lets the ASG pick which
+  # instances go, and a multi-zone ASG left uneven runs AZRebalance, neither
+  # of which honors PodDisruptionBudgets.
+  #
+  # Otherwise, on a cluster running the autoscaler, plan immediately before
+  # applying a min/max change, check the plan's desired_size against the live
+  # group, and keep the change out of an apply that also rolls the group: the
+  # provider rolls first, which can take hours, and only then sends the
+  # desired size it planned.
+  #
+  # An out-of-band min/max change through the EKS API is drift: every later
+  # apply on the cluster, whatever it's for, plans to revert it, and the plan
+  # fails while the live desired size sits outside the configured bounds.
+  # Record an emergency resize in node_pools rather than leaving it live-only.
   lifecycle {
     ignore_changes = [
-      scaling_config[0].min_size,
       scaling_config[0].desired_size,
-      scaling_config[0].max_size,
     ]
   }
+}
+
+locals {
+  managed_node_groups_outside_bounds = [
+    for name, group in aws_eks_node_group.managed : name
+    if group.scaling_config[0].desired_size < group.scaling_config[0].min_size ||
+    group.scaling_config[0].desired_size > group.scaling_config[0].max_size
+  ]
 }

@@ -227,7 +227,12 @@ locals {
           var.general_labels,
         )
         max_size = var.general_max_size
-        min_size = var.general_min_size
+        # The recorded floor applies only while general serves. Parked, its
+        # minimum is zero, so an operator can scale it to zero through EKS
+        # without the next apply raising it again. desired_size is ignored, but
+        # the apply that drops the minimum sends the desired size the plan read,
+        # so plan it immediately before applying while the pool serves.
+        min_size = var.general_serving_node_group == "general" ? var.general_min_size : 0
         ami_id   = null
         service_account = {
           name      = var.general_service_account_name

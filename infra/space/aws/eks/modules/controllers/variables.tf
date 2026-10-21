@@ -82,7 +82,7 @@ variable "aws_load_balancer_controller_resources" {
 }
 
 variable "cluster_autoscaler" {
-  description = "cluster-autoscaler for the serving general node groups, or null to install none of it. It scales each between that group's own min and max, read live from its ASG, so a resize through the EKS API moves its bounds too. With more than one group it balances scale-ups across them, so give it only groups that differ by zone alone: the same instance type, launch template, labels and taints."
+  description = "cluster-autoscaler for the serving general node groups, or null to install none of it. It scales each between that group's own min and max, read live from its ASG, so it follows the bounds an apply sets without a restart. With more than one group it balances scale-ups across them, so give it only groups that differ by zone alone: the same instance type, launch template, labels and taints."
   type = object({
     role_name          = string
     kubernetes_version = string

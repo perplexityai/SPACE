@@ -134,11 +134,11 @@ variable "node_pools" {
     by default; `AL2023_ARM_64_STANDARD` for Graviton instance types); set, the
     group runs that AMI as `CUSTOM`, `ami_type` is ignored, and
     `node_pool_user_data` must carry the pool's bootstrap script. `additional_policy_arns` keys must be known at plan time; their
-    values may not be. For a pool with no `ami_id`, `min_size`,
-    `desired_size`, and `max_size` apply at creation only: afterwards the
-    group is resized through the EKS API (or its ASG's desired capacity by a
-    cluster-autoscaler the caller runs on it) and Terraform ignores all three. A custom-AMI pool
-    keeps its size under Terraform. `update_strategy` is the group's
+    values may not be. For a pool with no `ami_id`, `min_size` and
+    `max_size` are applied whenever they change, and `desired_size` at creation
+    only: afterwards it moves through the EKS API or a cluster-autoscaler the
+    caller runs on the group, and Terraform ignores it. A custom-AMI pool
+    keeps all three under Terraform. `update_strategy` is the group's
     rolling-update strategy: null leaves EKS's default, which launches
     replacements before draining; `MINIMAL` drains first, so a roll never runs
     more nodes than the group's size.
