@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -14,8 +14,9 @@ use pplx_space_api::public_operation_driver::{
 };
 pub use pplx_space_api::public_operation_driver::{OperationExecutionResult, TickReport};
 use pplx_space_api::public_operations::{
-    ClaimPublicOperations, ClaimedPublicOperation, PublicOperationClaim,
+    ClaimLimits, ClaimPublicOperations, ClaimedPublicOperation, PublicOperationClaim,
     PublicOperationRequeueReason, PublicOperationStore, ReleaseClaimedPublicOperation,
+    TEARDOWN_KINDS,
 };
 use pplx_space_api::public_sandbox_operations::{
     CreateSandboxOperationExecutor, SandboxLifecycleOperationExecutor,
@@ -51,6 +52,15 @@ const EXPIRY_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_CLAIM_LIMIT: u32 = 64;
 const DEFAULT_EXECUTION_CONCURRENCY: usize = 16;
 const MAX_EXECUTION_CONCURRENCY: usize = 128;
+/// Execution slots only teardowns (sandbox deletes and kills) may use, so a
+/// teardown can start while every other slot is held.
+const DEFAULT_DELETE_RESERVED_SLOTS: u32 = 2;
+const DELETE_RESERVED_SLOTS_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_DELETE_RESERVED_SLOTS";
+/// Execution slots teardowns may not take while other work is due, so other
+/// work can start while teardowns hold every other slot.
+const DEFAULT_NON_DELETE_RESERVED_SLOTS: u32 = 2;
+const NON_DELETE_RESERVED_SLOTS_ENV: &str =
+    "SPACE_PUBLIC_OPERATION_DISPATCHER_NON_DELETE_RESERVED_SLOTS";
 const M1_MAX_AGE_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_M1_MAX_AGE_SECS";
 /// How soon an operation handed back because its key is already executing
 /// in this process becomes claimable again.
@@ -64,6 +74,12 @@ pub struct ReconcilerConfig {
     pub tick: Duration,
     pub claim_limit: u32,
     pub execution_concurrency: usize,
+    /// Of `execution_concurrency`, the slots kept for teardowns (sandbox
+    /// deletes and kills); at least one slot is always left for other work.
+    pub delete_reserved_slots: usize,
+    /// Of `execution_concurrency`, the slots teardowns may not take while
+    /// other work is due; with none due, teardowns may use them.
+    pub non_delete_reserved_slots: usize,
     pub claim_stale_after: Duration,
     pub retry_after: Duration,
     pub max_retry_attempts: i32,
@@ -82,6 +98,8 @@ impl Default for ReconcilerConfig {
             tick: DEFAULT_TICK,
             claim_limit: DEFAULT_CLAIM_LIMIT,
             execution_concurrency: DEFAULT_EXECUTION_CONCURRENCY,
+            delete_reserved_slots: DEFAULT_DELETE_RESERVED_SLOTS as usize,
+            non_delete_reserved_slots: DEFAULT_NON_DELETE_RESERVED_SLOTS as usize,
             claim_stale_after: DEFAULT_CLAIM_STALE_AFTER,
             retry_after: DEFAULT_RETRY_AFTER,
             max_retry_attempts: DEFAULT_MAX_RETRY_ATTEMPTS,
@@ -120,6 +138,16 @@ impl ReconcilerConfig {
                 DEFAULT_EXECUTION_CONCURRENCY,
                 MAX_EXECUTION_CONCURRENCY,
             ),
+            delete_reserved_slots: config.bounded_u32_allow_zero(
+                DELETE_RESERVED_SLOTS_ENV,
+                DEFAULT_DELETE_RESERVED_SLOTS,
+                MAX_EXECUTION_CONCURRENCY as u32 - 1,
+            ) as usize,
+            non_delete_reserved_slots: config.bounded_u32_allow_zero(
+                NON_DELETE_RESERVED_SLOTS_ENV,
+                DEFAULT_NON_DELETE_RESERVED_SLOTS,
+                MAX_EXECUTION_CONCURRENCY as u32,
+            ) as usize,
             claim_stale_after: config.test_duration_secs(
                 "SPACE_PUBLIC_OPERATION_DISPATCHER_CLAIM_STALE_SECS",
                 DEFAULT_CLAIM_STALE_AFTER,
@@ -341,8 +369,15 @@ pub async fn run<E>(
     }
     // The effective width, after the ceiling clamp. Nothing else exposes it,
     // so without this line an over-ceiling setting looks like it took effect.
+    let concurrency = config.execution_concurrency.max(1);
+    let delete_reserved_slots = config.delete_reserved_slots.min(concurrency - 1);
+    let non_delete_reserved_slots = config
+        .non_delete_reserved_slots
+        .min(concurrency - delete_reserved_slots);
     tracing::info!(
         execution_concurrency = config.execution_concurrency,
+        delete_reserved_slots,
+        non_delete_reserved_slots,
         keyed_claim_enabled = config.keyed_claim_enabled,
         retry_deferral_enabled = config.retry_deferral_enabled,
         "starting public-operation-dispatcher"
@@ -356,12 +391,16 @@ pub async fn run<E>(
     // one of `execution_concurrency` slots but does not delay pickup into the
     // others. `busy_keys` is this process's view of the claim's one-per-
     // sandbox rule: a claim that would overlap a local execution of its key
-    // is handed back, beside the loop, instead of running twice.
-    let concurrency = config.execution_concurrency.max(1);
+    // is handed back, beside the loop, instead of running twice. Executions
+    // other than teardowns may hold all but the slots reserved for teardowns;
+    // teardowns may hold all but the slots reserved for other work while
+    // other work is due.
+    let other_concurrency = concurrency - delete_reserved_slots;
     let execution_config = execution_config(&config);
     let mut in_flight = JoinSet::new();
     let mut busy_keys: HashMap<String, OperationId> = HashMap::new();
     let mut task_keys: HashMap<tokio::task::Id, String> = HashMap::new();
+    let mut other_tasks: HashSet<tokio::task::Id> = HashSet::new();
     let mut hand_backs = JoinSet::new();
     // Reclaiming an operation still executing here means its execution lost
     // the claim and notices only at its next renewal. Any other collision is
@@ -376,7 +415,7 @@ pub async fn run<E>(
             _ = interval.tick() => {
                 // Free finished executions' slots and keys before claiming.
                 while let Some(joined) = in_flight.try_join_next_with_id() {
-                    finish_execution(joined, &mut busy_keys, &mut task_keys);
+                    finish_execution(joined, &mut busy_keys, &mut task_keys, &mut other_tasks);
                 }
                 pplx_space_metrics::operations::dispatcher_slots(in_flight.len(), concurrency);
                 if last_expiry_sweep.is_none_or(|at| at.elapsed() >= EXPIRY_SWEEP_INTERVAL) {
@@ -398,15 +437,27 @@ pub async fn run<E>(
                 if free == 0 {
                     continue;
                 }
+                let free_other = other_concurrency.saturating_sub(other_tasks.len());
+                let free_teardown_while_other_due = free
+                    .saturating_sub(non_delete_reserved_slots.saturating_sub(other_tasks.len()));
                 #[cfg(test)]
                 tests::before_claim().await;
                 let started = Instant::now();
-                match claim_up_to(&config, &store, &executor, free).await {
+                match claim_up_to(
+                    &config,
+                    &store,
+                    &executor,
+                    ClaimSlots {
+                        free,
+                        free_other,
+                        free_teardown_while_other_due,
+                    },
+                ).await {
                     Ok(claim) => {
                         // An execution that committed while the claim ran
                         // must not make its successor look busy.
                         while let Some(joined) = in_flight.try_join_next_with_id() {
-                            finish_execution(joined, &mut busy_keys, &mut task_keys);
+                            finish_execution(joined, &mut busy_keys, &mut task_keys, &mut other_tasks);
                         }
                         let claimed = claim.operations.len();
                         for operation in claim.operations {
@@ -433,6 +484,7 @@ pub async fn run<E>(
                             if let Some(key) = &key {
                                 busy_keys.insert(key.clone(), operation.id);
                             }
+                            let is_teardown = TEARDOWN_KINDS.contains(&operation.kind);
                             let span = execution_span(&operation);
                             let execution = execute_claimed_operation(
                                 store.clone(),
@@ -444,6 +496,9 @@ pub async fn run<E>(
                             )
                             .instrument(span);
                             let task = in_flight.spawn(execution);
+                            if !is_teardown {
+                                other_tasks.insert(task.id());
+                            }
                             if let Some(key) = key {
                                 task_keys.insert(task.id(), key);
                             }
@@ -475,7 +530,7 @@ pub async fn run<E>(
                 }
             }
             Some(joined) = in_flight.join_next_with_id(), if !in_flight.is_empty() => {
-                finish_execution(joined, &mut busy_keys, &mut task_keys);
+                finish_execution(joined, &mut busy_keys, &mut task_keys, &mut other_tasks);
             }
             Some(_) = hand_backs.join_next(), if !hand_backs.is_empty() => {}
             _ = shutdown_token.cancelled() => break,
@@ -486,7 +541,7 @@ pub async fn run<E>(
     // outcome, matching the previous behavior of completing the in-progress
     // batch before exiting.
     while let Some(joined) = in_flight.join_next_with_id().await {
-        finish_execution(joined, &mut busy_keys, &mut task_keys);
+        finish_execution(joined, &mut busy_keys, &mut task_keys, &mut other_tasks);
     }
     while hand_backs.join_next().await.is_some() {}
 }
@@ -494,18 +549,20 @@ pub async fn run<E>(
 type ExecutionOutcome =
     Result<TickReport, pplx_space_api::public_operations::PublicOperationStoreError>;
 
-/// Frees the finished execution's key, whether it returned or panicked: a
+/// Frees the finished execution's slot and key, whether it returned or panicked: a
 /// panicked execution is gone, and the claim it stopped renewing goes stale
 /// so the claim query recovers the operation in its key's order.
 fn finish_execution(
     joined: Result<(tokio::task::Id, ExecutionOutcome), tokio::task::JoinError>,
     busy_keys: &mut HashMap<String, OperationId>,
     task_keys: &mut HashMap<tokio::task::Id, String>,
+    other_tasks: &mut HashSet<tokio::task::Id>,
 ) {
     let task_id = match &joined {
         Ok((task_id, _)) => *task_id,
         Err(error) => error.id(),
     };
+    other_tasks.remove(&task_id);
     if let Some(key) = task_keys.remove(&task_id) {
         busy_keys.remove(&key);
     }
@@ -571,20 +628,43 @@ fn log_execution_outcome(
     }
 }
 
+/// Free execution slots, by what may use them.
+#[derive(Debug, Clone, Copy)]
+struct ClaimSlots {
+    free: usize,
+    /// Free slots other work may use.
+    free_other: usize,
+    /// Free slots teardowns may use while other work is due.
+    free_teardown_while_other_due: usize,
+}
+
+impl ClaimSlots {
+    /// No slot-class limits, for a pass that claims a whole batch.
+    #[cfg(test)]
+    const UNLIMITED: Self = Self {
+        free: usize::MAX,
+        free_other: usize::MAX,
+        free_teardown_while_other_due: usize::MAX,
+    };
+}
+
 async fn claim_up_to<E>(
     config: &ReconcilerConfig,
     store: &PublicOperationStore,
     executor: &E,
-    free_slots: usize,
+    slots: ClaimSlots,
 ) -> Result<PublicOperationClaim, pplx_space_api::public_operations::PublicOperationStoreError>
 where
     E: PublicOperationExecutor,
 {
-    let limit = u32::try_from(free_slots)
-        .unwrap_or(u32::MAX)
-        .min(config.claim_limit);
+    let limit = |slots: usize, ceiling: u32| u32::try_from(slots).unwrap_or(u32::MAX).min(ceiling);
+    let total = limit(slots.free, config.claim_limit);
     let input = ClaimPublicOperations {
-        limit,
+        limits: ClaimLimits {
+            total,
+            non_teardown: limit(slots.free_other, total),
+            teardown_while_other_due: limit(slots.free_teardown_while_other_due, total),
+        },
         claim_stale_after: config.claim_stale_after,
         claimable_kinds: executor.supported_kinds(),
     };
@@ -609,7 +689,7 @@ where
 {
     use futures_util::{StreamExt, stream};
 
-    let claim = claim_up_to(config, store, executor, usize::MAX).await?;
+    let claim = claim_up_to(config, store, executor, ClaimSlots::UNLIMITED).await?;
 
     let mut report = TickReport {
         claimed: claim.operations.len(),

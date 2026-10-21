@@ -23,7 +23,9 @@ mod postgres {
 
     use super::*;
     use crate::public_operation_driver::OperationExecutionResult;
-    use crate::public_operations::{ClaimPublicOperations, PublicOperationRequeueReason};
+    use crate::public_operations::{
+        ClaimLimits, ClaimPublicOperations, PublicOperationRequeueReason,
+    };
     use crate::routes::public::sandboxes::NativeCreatePoolClaims;
     use crate::routes::public::sandboxes::admission_test_fixture::AdmissionPoolFixture;
 
@@ -173,7 +175,7 @@ mod postgres {
     ) -> TestDbResult<crate::public_operations::PublicOperationClaim> {
         Ok(PublicOperationStore::new(fixture.db.pool.clone())
             .claim_operations(ClaimPublicOperations {
-                limit: 16,
+                limits: ClaimLimits::any(16),
                 claim_stale_after: OperationExecutionConfig::default().claim_stale_after,
                 claimable_kinds: &[OperationKind::CreateSandbox],
             })

@@ -301,7 +301,7 @@ async fn delete_execution_renews_claim_while_a_phase_is_blocked() -> TestResult 
 
     let competing = store
         .claim_operations(ClaimPublicOperations {
-            limit: 1,
+            limits: ClaimLimits::any(1),
             claim_stale_after: Duration::from_secs(1),
             claimable_kinds: &[OperationKind::DeleteSandbox],
         })
@@ -365,7 +365,7 @@ async fn requeued_operation_waits_behind_work_queued_before_its_retry() -> TestR
 
     let claim = store
         .claim_operations(ClaimPublicOperations {
-            limit: 1,
+            limits: ClaimLimits::any(1),
             claim_stale_after: Duration::from_secs(60),
             claimable_kinds: &[OperationKind::WakeSandbox, OperationKind::DeleteSandbox],
         })
@@ -1531,6 +1531,7 @@ fn test_route_ed25519_authority() -> Arc<SpaceApiRouteEd25519Authority> {
     }
 }
 
+mod capacity;
 mod deadline;
 mod deferral;
 mod keyed_queue;
