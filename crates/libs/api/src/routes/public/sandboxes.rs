@@ -915,7 +915,7 @@ async fn enqueue_lifecycle_operation(
 }
 
 /// `visible` decides whether the caller may use an action's operation; a
-/// hidden one answers as an unmounted route would.
+/// hidden one answers exactly as an unknown action does.
 fn parse_action_segment(
     value: &str,
     visible: impl FnOnce(native_routes::NativeOperation) -> bool,
@@ -938,7 +938,7 @@ fn parse_action_segment(
         ));
     }
     if !visible(lifecycle_operation(action)) {
-        return Err(super::hidden_operations::not_found());
+        return Err(PublicApiError::bad_request("invalid sandbox action"));
     }
     Ok((sandbox_id, action))
 }

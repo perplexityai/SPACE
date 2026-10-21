@@ -6,7 +6,6 @@ use axum::{
     routing::{MethodFilter, MethodRouter, on},
 };
 use pplx_space_public_api::routes::{self as native, NativeHttpMethod, NativeOperation};
-use std::collections::BTreeSet;
 
 use super::AppState;
 use crate::middleware::auth::require_native_auth;
@@ -262,29 +261,61 @@ async fn native_data_plane(
 }
 
 pub fn v1_router(state: AppState) -> Router<AppState> {
-    let mut mounted = BTreeSet::new();
-    let mut router = Router::new();
+    // Each `(path, method)` mount: the operation whose entry installed the
+    // handler, the handler, and every operation the mount serves, which
+    // includes that one and its `:action` siblings.
+    let mut mounts: Vec<(
+        NativeOperation,
+        MethodRouter<AppState>,
+        Vec<NativeOperation>,
+    )> = Vec::new();
     for (operation, method_router) in mounted_operations() {
-        let path = operation.relative_runtime_path();
-        if mounted.insert((path, operation.method())) {
-            let method_router = if fails_over_from_silent_pods(operation) {
-                method_router.layer(middleware::from_fn(native_data_plane))
-            } else {
-                method_router
-            };
-            router = router.route(path, method_router);
+        let mount = (operation.relative_runtime_path(), operation.method());
+        match mounts
+            .iter_mut()
+            .find(|(first, _, _)| (first.relative_runtime_path(), first.method()) == mount)
+        {
+            Some((_, _, operations)) => operations.push(operation),
+            None => mounts.push((operation, method_router, vec![operation])),
         }
+    }
+    let mut router = Router::new();
+    for (operation, method_router, operations) in mounts {
+        let method_router = if fails_over_from_silent_pods(operation) {
+            method_router.layer(middleware::from_fn(native_data_plane))
+        } else {
+            method_router
+        };
+        // Owner scoping runs per mount rather than router-wide so that the
+        // hidden-operation gate can be layered outside it, on the mount it
+        // guards: a hidden route answers as an unmounted one, whatever
+        // sandbox it names.
+        let mut method_router = method_router.layer(middleware::from_fn_with_state(
+            state.clone(),
+            owner_scope::authorize,
+        ));
+        if let Some(hidden) = hidden_operations::route_gate(&operations) {
+            method_router = method_router.layer(middleware::from_fn_with_state(
+                (state.clone(), hidden),
+                hidden_operations::hide_unless_enabled,
+            ));
+        }
+        router = router.route(operation.relative_runtime_path(), method_router);
     }
     router
         .fallback(error::public_route_not_found)
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            owner_scope::authorize,
-        ))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            hidden_operations::hide_unless_enabled,
-        ))
+        .layer(middleware::from_fn_with_state(state, require_native_auth))
+        .layer(middleware::from_fn(error::normalize_public_error_response))
+        .layer(middleware::from_fn(request_context::with_public_request_id))
+}
+
+/// `method_router` behind the same authentication and error envelope as
+/// [`v1_router`], for a document that is not itself a `/v1` operation.
+pub(crate) fn with_native_auth(
+    state: AppState,
+    method_router: MethodRouter<AppState>,
+) -> MethodRouter<AppState> {
+    method_router
         .layer(middleware::from_fn_with_state(state, require_native_auth))
         .layer(middleware::from_fn(error::normalize_public_error_response))
         .layer(middleware::from_fn(request_context::with_public_request_id))

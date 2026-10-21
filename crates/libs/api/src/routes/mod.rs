@@ -252,7 +252,10 @@ fn public_api_router(state: AppState) -> Router<AppState> {
         )
         .route(
             "/openapi-full.json",
-            axum::routing::get(public_docs::full_openapi_json),
+            public::with_native_auth(
+                state.clone(),
+                axum::routing::get(public_docs::full_openapi_json),
+            ),
         )
         .route("/llms.txt", axum::routing::get(public_docs::llms_txt))
         .route(
@@ -265,7 +268,10 @@ fn public_api_router(state: AppState) -> Router<AppState> {
         )
         .route(
             "/api/openapi-full.json",
-            axum::routing::get(public_docs::full_openapi_json),
+            public::with_native_auth(
+                state.clone(),
+                axum::routing::get(public_docs::full_openapi_json),
+            ),
         )
         .route("/api/llms.txt", axum::routing::get(public_docs::llms_txt))
         .nest("/v1", public_v1_router(state.clone()))
