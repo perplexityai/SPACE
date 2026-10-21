@@ -976,6 +976,93 @@ fn sandbox_policy_apply_filter_skips_matching_policies() {
     );
 }
 
+#[tokio::test]
+async fn sandbox_network_policy_apply_isolates_generation_conflicts() {
+    let failed_id: SandboxId = "00000000-0000-0000-0000-000000000001".parse().unwrap();
+    let healthy_id: SandboxId = "00000000-0000-0000-0000-000000000002".parse().unwrap();
+    let desired_policy = test_network_policy(EgressDefaultAction::Deny);
+    let sandboxes = [failed_id, healthy_id]
+        .into_iter()
+        .map(|id| SandboxNetworkPolicyState {
+            sandbox_id: id.to_string(),
+            ..desired_sandbox_policy(NetworkPolicySource::Override, desired_policy.clone(), 7)
+        })
+        .collect();
+    let local = LocalSandboxNetworkPolicies::from_policies(
+        [failed_id, healthy_id]
+            .into_iter()
+            .map(|id| {
+                let mut policy = local_sandbox_policy(
+                    NetworkPolicySource::Override,
+                    false,
+                    test_network_policy(EgressDefaultAction::Allow),
+                    7,
+                );
+                policy.sandbox_id = id.to_string();
+                (id, policy)
+            })
+            .collect(),
+    );
+    let conflict = tonic::Status::failed_precondition("network policy generation conflict");
+    let mut calls = Vec::new();
+    let mut result = InboundFacetResult::default();
+
+    let outcome = apply_sandbox_network_policy_state(
+        sandboxes,
+        &local,
+        &mut result,
+        |id, policy, inherit_template, generation| {
+            calls.push(id.clone());
+            assert_eq!(policy, Some(desired_policy.clone()));
+            assert!(!inherit_template);
+            assert_eq!(generation, 7);
+            std::future::ready(if id == failed_id.to_string() {
+                Err(conflict.to_string())
+            } else {
+                Ok(NetworkPolicyApplyDecision::Apply)
+            })
+        },
+    )
+    .await;
+
+    assert_eq!(calls, vec![failed_id.to_string(), healthy_id.to_string()]);
+    assert_eq!(outcome, Ok(()));
+    assert_eq!(result.stats.sandboxes_applied, 1);
+    let failed_element = NetworkPolicyTarget::sandbox(failed_id).to_string();
+    let healthy_element = NetworkPolicyTarget::sandbox(healthy_id).to_string();
+    let expected_error = format!("failed to apply sandbox network policy {failed_id}: {conflict}");
+    assert_eq!(
+        result.element_errors,
+        BTreeMap::from([(failed_element.clone(), expected_error.clone())])
+    );
+
+    // Completion must use the prefixed ref, not the bare sandbox id, so only
+    // the failed item remains retryable and full-scope failures stay visible.
+    let failed_ref = FacetRef::new(FACET_NETWORK_POLICY, Some(failed_element));
+    let healthy_ref = FacetRef::new(FACET_NETWORK_POLICY, Some(healthy_element));
+    let full_ref = FacetRef::new(FACET_NETWORK_POLICY, None::<String>);
+    let report = BTreeMap::from([(FacetKind::NetworkPolicy, Ok(result))]);
+    let (succeeded, failed) = crate::partition_completed_refs(
+        vec![failed_ref.clone(), healthy_ref.clone(), full_ref.clone()],
+        &report,
+    );
+    assert_eq!(
+        succeeded,
+        vec![crate::proto_facet_ref(&healthy_ref).unwrap()]
+    );
+    assert_eq!(failed.len(), 2);
+    assert_eq!(
+        failed[0].r#ref,
+        Some(crate::proto_facet_ref(&failed_ref).unwrap())
+    );
+    assert_eq!(failed[0].error, expected_error);
+    assert_eq!(
+        failed[1].r#ref,
+        Some(crate::proto_facet_ref(&full_ref).unwrap())
+    );
+    assert!(failed[1].error.contains("1 network-policy item(s)"));
+}
+
 /// An inherited policy's local generations are the template's counter, not
 /// the sandbox generation node-ctl reconciles with, so they never match it
 /// once the template has changed. A matching inherited policy is skipped

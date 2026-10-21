@@ -309,9 +309,9 @@ impl FacetKind {
         progress: crate::FacetProgress,
     ) -> Result<InboundFacetResult, String> {
         match self {
-            Self::NetworkPolicy => refresh_network_policy(node_id, node_role, scope, progress)
-                .await
-                .map(InboundFacetResult::from_stats),
+            Self::NetworkPolicy => {
+                refresh_network_policy(node_id, node_role, scope, progress).await
+            }
             Self::SandboxDesiredState => {
                 refresh_sandbox_desired_state(node_id, node_role, scope).await
             }
