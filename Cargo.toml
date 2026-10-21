@@ -59,6 +59,7 @@ members = [
     "crates/libs/rustls-provider",
     "crates/libs/sqlite",
     "crates/libs/unix-socket-path",
+    "crates/libs/systemd-watchdog",
     "crates/libs/node/api/client",
     "crates/libs/node/api/server",
     "crates/libs/node/ctl/server",
@@ -364,6 +365,7 @@ pplx-space-sbx-mgr-client = { path = "crates/libs/sbx/mgr/client" }
 pplx-space-sbx-mgr-store = { path = "crates/libs/sbx/mgr/store" }
 pplx-space-rustls-provider = { path = "crates/libs/rustls-provider" }
 pplx-space-sqlite = { path = "crates/libs/sqlite" }
+pplx-space-systemd-watchdog = { path = "crates/libs/systemd-watchdog" }
 pplx-space-spaced-build = { path = "crates/libs/spaced/build" }
 pplx-space-spaced-guest-protocol = { path = "crates/libs/spaced/guest/protocol" }
 pplx-space-spaced-guest-execution = { path = "crates/libs/spaced/guest/execution" }

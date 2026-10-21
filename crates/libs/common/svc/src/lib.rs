@@ -36,7 +36,7 @@ pub mod space_api_route;
 pub mod space_api_route_capability;
 pub mod space_api_route_ed25519;
 pub mod sql;
-pub mod systemd;
+pub use pplx_space_systemd_watchdog as systemd;
 pub use pplx_space_tokio_runtime as tokio_runtime;
 pub mod types;
 

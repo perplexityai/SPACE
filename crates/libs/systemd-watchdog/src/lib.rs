@@ -1,3 +1,11 @@
+//! systemd watchdog notifier for SPACE services.
+//!
+//! When systemd sets `WATCHDOG_USEC` and `NOTIFY_SOCKET` for this process,
+//! `install_watchdog` spawns a task on the current tokio runtime that sends
+//! `WATCHDOG=1` to the notify socket at half the watchdog interval. It is its
+//! own crate so a service can arm the watchdog without the rest of
+//! `pplx-space-common-svc`.
+
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::time::Duration;

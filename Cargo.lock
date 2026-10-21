@@ -5511,6 +5511,7 @@ dependencies = [
  "pplx-space-metrics",
  "pplx-space-observability",
  "pplx-space-rustls-provider",
+ "pplx-space-systemd-watchdog",
  "pplx-space-test-env",
  "pplx-space-tokio-runtime",
  "pplx-space-unix-socket-path",
@@ -7246,6 +7247,14 @@ dependencies = [
  "pplx-space-common-core",
  "pplx-space-sbx-mgr-client",
  "tokio",
+]
+
+[[package]]
+name = "pplx-space-systemd-watchdog"
+version = "0.8.0"
+dependencies = [
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

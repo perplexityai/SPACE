@@ -68,6 +68,7 @@
         "crates/libs/spaced/build",
         "crates/libs/spaced/common",
         "crates/libs/sqlite",
+        "crates/libs/systemd-watchdog",
         "crates/libs/template/mgr-client",
         "crates/libs/template/publish",
         "crates/libs/tokio-runtime",
@@ -115,6 +116,7 @@
         "crates/libs/spaced/build",
         "crates/libs/spaced/common",
         "crates/libs/sqlite",
+        "crates/libs/systemd-watchdog",
         "crates/libs/template/mgr-client",
         "crates/libs/tokio-runtime",
         "crates/libs/unix-socket-path"
@@ -171,6 +173,7 @@
         "crates/libs/snapshot/store",
         "crates/libs/spaced/build",
         "crates/libs/spaced/common",
+        "crates/libs/systemd-watchdog",
         "crates/libs/template/mgr-client",
         "crates/libs/tokio-runtime",
         "crates/libs/unix-socket-path"
@@ -204,6 +207,7 @@
         "crates/libs/sbx/mgr/client",
         "crates/libs/spaced/build",
         "crates/libs/spaced/common",
+        "crates/libs/systemd-watchdog",
         "crates/libs/template/mgr-client",
         "crates/libs/tokio-runtime",
         "crates/libs/unix-socket-path"
@@ -302,6 +306,7 @@
         "crates/libs/spaced/host/client",
         "crates/libs/spaced/host/server",
         "crates/libs/sqlite",
+        "crates/libs/systemd-watchdog",
         "crates/libs/template/mgr",
         "crates/libs/template/mgr-client",
         "crates/libs/tokio-runtime",

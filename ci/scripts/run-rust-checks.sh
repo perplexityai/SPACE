@@ -423,6 +423,17 @@ run_clippy_checks() {
         -- \
         -D warnings
 
+    # Built alone, so a tokio feature the watchdog needs but only gets
+    # through unification fails here; its notify path is Linux-specific.
+    echo "--- :rust: Running isolated systemd watchdog clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-systemd-watchdog \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
+
     run_sbxmgr_production_checks "${target_dir}"
 
     # feature-flags must lint clean with no vendor SDK compiled in; the matching
