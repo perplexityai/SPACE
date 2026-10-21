@@ -31,11 +31,12 @@
 #      old `pkill -f "tilt up"` killed the automation driving a bring-up on
 #      2026-09-22, and the bring-up then ran on with nobody watching.
 #   7. The stale port-forward reap stops a supervisor carrying the
-#      `space-kind-pf:<ctx>` label as its last argument and a `kubectl …
-#      --context <ctx> … port-forward` child, and nothing else — not a process
-#      whose arguments mention the context and "port-forward" in passing (the
-#      second way the same automation was killed that day), and not a forward
-#      to another context.
+#      `space-kind-pf:<ctx>` label as its last argument and its own `kubectl …
+#      --context <ctx> … port-forward` child, and nothing else — not a live
+#      Tilt's own supervisor, not a forward nobody's supervisor owns, not a
+#      process whose arguments mention the context and "port-forward" in
+#      passing (the second way the same automation was killed that day), and
+#      not a forward to another context.
 #   8. A live Tilt watching another checkout — or a checkout deleted since it
 #      started — is restarted from this one; one whose directory cannot be read
 #      is reused. Reusing the former made `kind` from a fresh worktree pass in
@@ -43,7 +44,18 @@
 #   9. Initial Tiltfile evaluation may install observability receivers before
 #      registering the cluster. It gets the bounded bootstrap budget, while a
 #      dead process or failed evaluation stops early and a wrong context never
-#      satisfies readiness.
+#      satisfies readiness. Tilt is started with `--context kind-<cluster>`:
+#      allow_k8s_contexts only permits a context, so a plain `tilt up` applied
+#      the stack to whatever context the kubeconfig named.
+#  10. With :10350 silent, the stale-watcher kill stops only a `tilt up` the
+#      pidfile names or one started from this checkout; another checkout's
+#      watcher, or one naming another context, keeps running.
+#  11. A warm bring-up whose Tilt has settled with a resource in error fails
+#      with that resource's log: the old pods still pass every rollout, and
+#      the quiet wait used to return 0 over them.
+#  12. A Failed space-db-migrate Job is final only once Tilt's space-db-migrate
+#      resource is idle: while Tilt is still replacing it, the old Job's
+#      failure is not this run's verdict.
 #
 # Hermetic by construction: every case that reaches a real `kill` runs with a
 # `pgrep` that reports ONLY the fake processes the case started. The first
@@ -143,6 +155,11 @@ TILT
             case "$*" in
                 *" get deployments -l app.kubernetes.io/name=space-credmgr-authority "*) printf 'exchange|' ;;
                 *" get daemonset space-volume-manager "*) printf 'space-volume-manager|' ;;
+                *" get job space-db-migrate "*)
+                    [[ -n "${TEST_MIGRATE_JOB:-}" ]] || return 1
+                    printf '%s' "$TEST_MIGRATE_JOB" ;;
+                *" logs job/space-db-migrate "*) echo "fake migration log" ;;
+                *" get deploy,statefulset,daemonset "*) ;;
                 *) return 1 ;;
             esac
         }
@@ -172,7 +189,7 @@ TILT
         bootstrap_kind_stack__stop_stale_tilt() { printf '%s\n' "${1-}" >"$work/stopped"; }
         bootstrap_kind_stack__start_tilt() { touch "$work/started"; }
         bootstrap_kind_stack__kill_stale_tilt() { touch "$work/killed"; }
-        bootstrap_kind_stack__bring_up
+        "${TEST_ENTRY:-bootstrap_kind_stack__bring_up}"
     ) >"$work/result" 2>&1
 }
 
@@ -282,7 +299,7 @@ rm -rf "$work"
 # Case 2f: empty context but NO error — a watcher still initializing, or one
 # whose error the stub cannot answer — is not an orphan, pidfile or not. The
 # first cut of the orphan check accepted the empty context alone and, run
-# from test-kind-port-forward-parity.sh on a devbox with a live stack, walked
+# from a port-forward harness test on a devbox with a live stack, walked
 # the real pidfile into `__stop_stale_tilt`, which deleted it (bench
 # 2026-09-23). Nothing is stopped and the refusal path is kept.
 work="$(mktemp -d)"
@@ -423,6 +440,53 @@ else
 fi
 rm -rf "$work"
 
+# Case 11: Tilt has nothing pending or in progress, but a resource's last
+# update failed. On a warm stack the old pods keep every rollout green, so the
+# quiet wait must fail on the error itself, with the resource's log.
+work="$(mktemp -d)"
+started_at=$SECONDS
+if run_bring_up "$work" TEST_ENTRY=bootstrap_kind_stack__wait_for_tilt_quiet TEST_BOOTSTRAP_TIMEOUT=60 \
+        TEST_UIRESOURCES='(Tiltfile) ok\nspace-ui error\nspace-api ok\n'; then
+    fail "a settled Tilt with a failed resource must fail the bring-up" "$(cat "$work/result")"
+else
+    (( SECONDS - started_at < 30 )) \
+        || fail "the settled failure must end the wait well before BOOTSTRAP_TIMEOUT" "$(cat "$work/result")"
+    grep -q "fake build log for space-ui" "$work/result" \
+        || fail "the settled failure must print the failed resource's log tail" "$(cat "$work/result")"
+fi
+rm -rf "$work"
+
+# Case 11b: settled with nothing in error → the quiet wait returns.
+work="$(mktemp -d)"
+run_bring_up "$work" TEST_ENTRY=bootstrap_kind_stack__wait_for_tilt_quiet TEST_BOOTSTRAP_TIMEOUT=60 \
+        TEST_UIRESOURCES='(Tiltfile) ok\nspace-ui ok\n' \
+    || fail "a settled Tilt with every resource ok must pass the quiet wait" "$(cat "$work/result")"
+rm -rf "$work"
+
+# Case 12: the space-db-migrate Job in the cluster is Failed, but Tilt is
+# still updating space-db-migrate (a rerun after fixing db/). The API wait must
+# not end on that old Job; with a 3 s budget it times out on the api-server.
+work="$(mktemp -d)"
+if run_bring_up "$work" TEST_ENTRY=bootstrap_kind_stack__wait_for_api TEST_BOOTSTRAP_TIMEOUT=3 \
+        TEST_MIGRATE_JOB='uid-old Failed ' TEST_UIRESOURCES='space-db-migrate in_progress\nspace-api pending\n'; then
+    fail "an unreachable api-server must still time out" "$(cat "$work/result")"
+fi
+grep -q "space-db-migrate Job failed" "$work/result" \
+    && fail "a Failed Job Tilt is still replacing must not end the bring-up" "$(cat "$work/result")"
+rm -rf "$work"
+
+# Case 12b: the same Failed Job with space-db-migrate idle is the current one:
+# the wait ends on it, with its logs, long before the budget.
+work="$(mktemp -d)"
+started_at=$SECONDS
+run_bring_up "$work" TEST_ENTRY=bootstrap_kind_stack__wait_for_api TEST_BOOTSTRAP_TIMEOUT=600 \
+        TEST_MIGRATE_JOB='uid-new Failed ' TEST_UIRESOURCES='space-db-migrate ok\nspace-api pending\n' || true
+grep -q "space-db-migrate Job failed" "$work/result" && grep -q "fake migration log" "$work/result" \
+    || fail "a Failed Job Tilt has finished applying must end the bring-up with its logs" "$(cat "$work/result")"
+(( SECONDS - started_at < 60 )) \
+    || fail "the current Job's failure must end the wait well before BOOTSTRAP_TIMEOUT" "$(cat "$work/result")"
+rm -rf "$work"
+
 # Initial startup, against the real start/liveness helpers. Only the process,
 # clock and CLI boundaries are stubbed: no real Tilt, cluster or signal.
 run_startup() {
@@ -439,7 +503,7 @@ run_startup() {
         source "$repo_root/scripts/tests/lib/bootstrap-kind-stack.sh"
         clock=0
         # The detached command produces only this fixture's log/marker.
-        setsid() { echo "synthetic startup log"; touch "$work/spawned"; }
+        setsid() { printf '%s\n' "$*" >"$work/argv"; echo "synthetic startup log"; touch "$work/spawned"; }
         pgrep() { return 0; }
         curl() { return 0; }
         timeout() { shift; "$@"; }
@@ -489,6 +553,8 @@ for detached in 0 1; do
             || fail "timeout must explain that the watcher is still running" "$(cat "$work/result")"
     fi
     [[ ! -e "$work/unexpected-signal" ]] || fail "startup must not signal a process"
+    [[ "$(cat "$work/argv")" == "nohup tilt up --context kind-space-local" ]] \
+        || fail "Tilt must be started pinned to kind-space-local, not the kubeconfig's context" "$(cat "$work/argv")"
     rm -rf "$work"
 done
 
@@ -654,38 +720,60 @@ bystander_case() {
 }
 bystander_case
 
-# Case 7: the port-forward reap. Real processes: a labelled supervisor (label
-# last), a fake kubectl child (argv-0 renamed to kubectl), a bystander whose
-# arguments mention the context and the word in passing, and a forward to
-# another context. Only the first two may die.
+# Case 7: the port-forward reap. Real processes: an orphaned labelled
+# supervisor (label last) with its own fake kubectl child (argv-0 renamed to
+# kubectl); the same pair under a fake `tilt up` parent, as a live Tilt's
+# serve_cmd runs; a kubectl forward to this context that no supervisor owns; a
+# bystander whose arguments mention the context and the word in passing; and a
+# forward to another context. Only the orphaned pair may die.
 port_forward_reap_case() {
     local work
     work="$(mktemp -d)"
-    # Every fake detaches from this script's stdout/stderr: a `sleep` child
-    # that inherits the pipe would keep the test runner's reader open after the
+    # A supervisor that starts one kubectl-named child and waits on it. Every
+    # fake detaches from this script's stdout/stderr: a `sleep` child that
+    # inherits the pipe would keep the test runner's reader open after the
     # script exits. `; true` stops bash from exec'ing its single command, which
     # would lose the renamed argv[0] the reap's anchored match looks for.
-    bash -c 'sleep 60; true' _ svc/space-api 8080:8080 api space kind-space-local space-kind-pf:kind-space-local \
-        >/dev/null 2>&1 &
+    cat >"$work/supervisor.sh" <<'SUP'
+(exec -a kubectl bash -c "sleep 60; true" _ --context kind-space-local -n space port-forward svc/space-ui 3000:3000) &
+printf '%s\n' "$!" >"$1"
+wait
+SUP
+    bash "$work/supervisor.sh" "$work/child.pid" kind-space-local space svc/space-ui 3000:3000 \
+        space-kind-pf:kind-space-local >/dev/null 2>&1 &
     local supervisor=$!
-    bash -c 'exec -a kubectl bash -c "sleep 60; true" _ --context kind-space-local -n space port-forward svc/space-api 8080:8080' \
+    cat >"$work/tilt-parent.sh" <<'TILTP'
+bash "$1/supervisor.sh" "$1/tilt-child.pid" kind-space-local space-logs svc/loki 13101:3100 \
+    space-kind-pf:kind-space-local &
+printf '%s\n' "$!" >"$1/tilt-supervisor.pid"
+wait
+TILTP
+    bash -c 'exec -a "tilt up" bash "$1/tilt-parent.sh" "$1"' _ "$work" >/dev/null 2>&1 &
+    local tilt_parent=$!
+    bash -c 'exec -a kubectl bash -c "sleep 60; true" _ --context kind-space-local -n space port-forward svc/space-api 8081:8080' \
         >/dev/null 2>&1 &
-    local child=$!
-    bash -c 'sleep 60; true' _ "note: kubectl --context kind-space-local get rs; later run test-kind-port-forward-parity.sh" \
+    local unowned=$!
+    bash -c 'sleep 60; true' _ "note: kubectl --context kind-space-local get rs; later run the port-forward reap" \
         >/dev/null 2>&1 &
     local bystander=$!
     bash -c 'exec -a kubectl bash -c "sleep 60; true" _ --context kind-production -n space port-forward svc/space-api 8080:8080' \
         >/dev/null 2>&1 &
     local foreign=$!
-    sleep 0.3
-    if ! ps -p "$child" -o command= | grep -q '^kubectl'; then
-        echo "skip: this platform does not let exec -a rename the fake kubectl; case 7 not exercised" >&2
-        kill "$supervisor" "$child" "$bystander" "$foreign" 2>/dev/null || true
+    sleep 0.5
+    local child tilt_supervisor tilt_child
+    child="$(cat "$work/child.pid" 2>/dev/null || true)"
+    tilt_supervisor="$(cat "$work/tilt-supervisor.pid" 2>/dev/null || true)"
+    tilt_child="$(cat "$work/tilt-child.pid" 2>/dev/null || true)"
+    local all=("$supervisor" "$tilt_parent" "$unowned" "$bystander" "$foreign" $child $tilt_supervisor $tilt_child)
+    if [[ -z "$child" || -z "$tilt_child" ]] || ! ps -p "$child" -o command= | grep -q '^kubectl' \
+            || ! ps -p "$tilt_parent" -o command= | grep -q '^tilt up'; then
+        echo "skip: this platform does not let exec -a rename the fakes; case 7 not exercised" >&2
+        kill "${all[@]}" 2>/dev/null || true
         rm -rf "$work"
         return 0
     fi
     mkdir -p "$work/bin"
-    write_pgrep_stub "$work/bin" "$supervisor" "$child" "$bystander" "$foreign"
+    write_pgrep_stub "$work/bin" "${all[@]}"
     (
         export PATH="$work/bin:$PATH"
         REPO_ROOT="$repo_root"
@@ -694,32 +782,86 @@ port_forward_reap_case() {
         kind_stack_reap_stale_port_forwards
     ) >"$work/result" 2>&1 || fail "the port-forward reap must not fail" "$(cat "$work/result")"
     sleep 0.5
-    # The reap signals the wrapper shells; their sleep children are reaped here
-    # so nothing outlives the case.
-    pkill -P "$supervisor" 2>/dev/null || true
-    pkill -P "$child" 2>/dev/null || true
     kill -0 "$supervisor" 2>/dev/null \
-        && fail "the reap must stop the labelled supervisor" "$(cat "$work/result")"
+        && fail "the reap must stop the orphaned labelled supervisor" "$(cat "$work/result")"
     kill -0 "$child" 2>/dev/null \
-        && fail "the reap must stop the kubectl port-forward child for this context" "$(cat "$work/result")"
+        && fail "the reap must stop the orphaned supervisor's kubectl child" "$(cat "$work/result")"
+    kill -0 "$tilt_supervisor" 2>/dev/null && kill -0 "$tilt_child" 2>/dev/null \
+        || fail "the reap signaled a supervisor a live Tilt runs" "$(cat "$work/result")"
+    kill -0 "$unowned" 2>/dev/null \
+        || fail "the reap signaled a kubectl forward no supervisor owns" "$(cat "$work/result")"
     kill -0 "$bystander" 2>/dev/null \
         || fail "the reap signaled a process that merely mentions the context and port-forward" "$(cat "$work/result")"
     kill -0 "$foreign" 2>/dev/null \
         || fail "the reap signaled a port-forward to another context" "$(cat "$work/result")"
     local p
-    for p in "$supervisor" "$child" "$bystander" "$foreign"; do
+    for p in "${all[@]}"; do
         pkill -P "$p" 2>/dev/null || true
         kill "$p" 2>/dev/null || true
     done
-    wait "$supervisor" "$child" "$bystander" "$foreign" 2>/dev/null || true
+    wait "$supervisor" "$tilt_parent" "$unowned" "$bystander" "$foreign" 2>/dev/null || true
     rm -rf "$work"
 }
 port_forward_reap_case
+
+# Case 10: :10350 does not answer, so the bring-up clears stale watchers before
+# starting its own. Real processes again: a `tilt up` started from another
+# checkout, one from this checkout naming another context, one from this
+# checkout, and one the pidfile names (started elsewhere). Only the last two
+# may be signalled.
+stale_kill_case() {
+    local work
+    work="$(mktemp -d)"
+    mkdir -p "$work/bin" "$work/other-checkout"
+    printf '#!/usr/bin/env bash\nexit 1\n' >"$work/bin/curl"   # :10350 does not answer
+    chmod +x "$work/bin/curl"
+    (cd "$work/other-checkout" && exec -a "tilt up" sleep 300) >/dev/null 2>&1 &
+    local other=$!
+    (cd "$repo_root" && exec -a "tilt up --context kind-other-bench --port 10351" sleep 300) >/dev/null 2>&1 &
+    local other_context=$!
+    (cd "$repo_root" && exec -a "tilt up" sleep 300) >/dev/null 2>&1 &
+    local here=$!
+    (cd "$work/other-checkout" && exec -a "tilt up" sleep 300) >/dev/null 2>&1 &
+    local named=$!
+    printf '%s\n' "$named" >"$work/tilt.pid"
+    sleep 0.2
+    if ! ps -p "$here" -o command= | grep -q '^tilt up'; then
+        echo "skip: this platform does not let exec -a rename the fake tilt; case 10 not exercised" >&2
+        kill "$other" "$other_context" "$here" "$named" 2>/dev/null || true
+        rm -rf "$work"
+        return 0
+    fi
+    write_pgrep_stub "$work/bin" "$other" "$other_context" "$here" "$named"
+    (
+        export PATH="$work/bin:$PATH"
+        REPO_ROOT="$repo_root"
+        KIND_CLUSTER=space-local
+        SPACE_TILT_PIDFILE="$work/tilt.pid"
+        source "$repo_root/scripts/tests/lib/bootstrap-kind-stack.sh"
+        bootstrap_kind_stack__kill_stale_tilt
+    ) >"$work/result" 2>&1 || fail "the stale-watcher kill must succeed" "$(cat "$work/result")"
+    sleep 0.3
+    kill -0 "$other" 2>/dev/null \
+        || fail "the stale-watcher kill stopped another checkout's tilt up" "$(cat "$work/result")"
+    kill -0 "$other_context" 2>/dev/null \
+        || fail "the stale-watcher kill stopped a tilt up serving another context" "$(cat "$work/result")"
+    kill -0 "$here" 2>/dev/null \
+        && fail "the stale-watcher kill must stop a tilt up started from this checkout" "$(cat "$work/result")"
+    kill -0 "$named" 2>/dev/null \
+        && fail "the stale-watcher kill must stop the tilt up the pidfile names" "$(cat "$work/result")"
+    grep -q "leaving 'tilt up' (pid $other) running" "$work/result" \
+        || fail "the stale-watcher kill must say which watchers it left running" "$(cat "$work/result")"
+    kill "$other" "$other_context" "$here" "$named" 2>/dev/null || true
+    wait "$other" "$other_context" "$here" "$named" 2>/dev/null || true
+    rm -rf "$work"
+}
+stale_kill_case
 fi
 
 if [ "$status" -eq 0 ]; then
-    echo "ok: a Tilt bound to a deleted cluster or another checkout is restarted, a live one is reused, a failed build" \
-        "fails the bring-up fast, teardown stops the watcher it would otherwise orphan, and neither" \
-        "the Tilt nor the port-forward reap signals a process that merely mentions its pattern"
+    echo "ok: a Tilt bound to a deleted cluster or another checkout is restarted, a live one is reused, Tilt is" \
+        "pinned to the kind context, a failed build or a settled error fails the bring-up fast, only the current" \
+        "migration Job's failure is final, teardown stops the watcher it would otherwise orphan, and neither" \
+        "the Tilt nor the port-forward reap signals a process that is not this bring-up's"
 fi
 exit "$status"

@@ -11,9 +11,11 @@
 # scripts/tests/lib/bootstrap-kind-stack.sh, the one the smoke suites use.
 #
 # Idempotent: on a live stack it reuses the running Tilt and returns once the
-# stack has settled. Tilt is restarted only when it serves a deleted cluster or
-# another checkout, or was started with other settings than this run's (the
-# knobs below), since Tilt reads those once, at start. Tilt keeps running
+# stack has settled, or fails with the log of any resource whose update failed.
+# Tilt is restarted only when it serves a deleted cluster or another checkout,
+# or was started with other values of the settings listed in TILT_SETTINGS
+# below, since Tilt reads those once, at start; every refusal this run would
+# make is checked before a running Tilt is stopped. Tilt keeps running
 # afterwards and redeploys whatever changes in the checkout; teardown.sh
 # stops it.
 #
@@ -24,17 +26,20 @@
 #   SPACE_KIND_CLUSTER       kind cluster name (default: space-local)
 #   SPACE_CONSOLE_PASSWORD   initial root@local password (default: password;
 #                            only applied while the account is locked)
-#   SPACE_BOOTSTRAP_TIMEOUT  seconds each bring-up stage may take (default: 1800)
+#   SPACE_BOOTSTRAP_TIMEOUT  seconds each wait may take: Tilt's start, the
+#                            API, the seed Job, each rollout and node
+#                            publication (default: 1800)
 #   SPACE_KIND_DATADOG_MODE, SPACE_KIND_TELEMETRY_MODE, SPACE_KIND_OBSERVABILITY,
 #   SPACE_KIND_OBSERVABILITY_CONFIG, SPACE_KIND_STORAGE_CREDENTIALS,
 #   SPACE_LOOP_DEVICE_TARGET, SPACE_KIND_PRUNE_SUPERSEDED_IMAGES,
-#   SPACE_TILT_PRUNE_HOST_IMAGES, SPACE_TILT_MAX_PARALLEL_UPDATES
-#                            see infra/space/kind/README.md
+#   SPACE_TILT_PRUNE_HOST_IMAGES, SPACE_TILT_MAX_PARALLEL_UPDATES,
+#   SPACE_SEED_OUTPUT_DIR    see infra/space/kind/README.md
 #   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN,
 #   SPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN
-#                            optional; copied into the `space-aws-creds` Secret
-#                            for the credential-manager authority's AWS
-#                            integrations (sandbox account only)
+#                            optional, with SPACE_KIND_STORAGE_CREDENTIALS=static
+#                            only; copied into the `space-aws-creds` Secret for
+#                            the credential-manager authority's AWS integrations
+#                            (sandbox account only)
 #   SPACE_KIND_MIN_FREE_GIB  warn before bring-up when the Docker data root or
 #                            SPACE_KIND_DATA_ROOT has less free (default: 30)
 #   SPACE_VENDOR_ROOT, SPACE_KIND_DATA_ROOT
@@ -95,40 +100,97 @@ source "$REPO_ROOT/scripts/tests/lib/bootstrap-kind-stack.sh"
 SKIP_BOOTSTRAP=0
 KIND_STACK_DETACH=0
 
-# The settings the Tiltfile and its helpers read from the environment. The
+# The settings Tilt reads from its environment once, at start — in the
+# Tiltfile, telemetry_config.py and the build scripts it runs — each with the
+# default its reader applies, so unset, empty and an explicit default compare
+# equal. Anything else (a refreshed token, a knob only this script reads) never
+# restarts Tilt, which would interrupt whatever else is using the stack. The
 # cluster name and host roots are left out: the bring-up checks those against
-# the cluster itself, and sets them in Tilt's environment when unset here.
-tilt_setting() {
-  [[ "$1" =~ ^(SPACE_KIND_|SPACE_TILT_(MAX_PARALLEL_UPDATES|PRUNE_HOST_IMAGES)$|SPACE_LOOP_DEVICE_TARGET$|AWS_(ACCESS_KEY_ID|SECRET_ACCESS_KEY|SESSION_TOKEN)$|SPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN$) ]] \
-    && [[ ! "$1" =~ ^SPACE_KIND_(CLUSTER|DATA_ROOT|CONFIG)$ ]]
-}
+# the cluster itself.
+TILT_SETTINGS=(
+  SPACE_KIND_STORAGE_CREDENTIALS=exchange
+  SPACE_KIND_OBSERVABILITY_CONFIG=
+  SPACE_TILT_MAX_PARALLEL_UPDATES=8
+  SPACE_LOOP_DEVICE_TARGET=
+  SPACE_KIND_PRUNE_SUPERSEDED_IMAGES=1
+  SPACE_TILT_PRUNE_HOST_IMAGES=1
+  SPACE_SEED_OUTPUT_DIR="$HOME/.space-devbox/kind/seed/build"
+  SPACE_KIND_RUST_ARTIFACTS=auto
+  SPACE_KIND_RUST_PROFILE=release
+  SPACE_KIND_BUILD_CACHE_REPOSITORY=
+  # telemetry_config.py OPTIONS
+  SPACE_KIND_DATADOG_MODE=off
+  SPACE_KIND_DATADOG_UNBOUNDED=
+  SPACE_KIND_DATADOG_SITE=
+  SPACE_KIND_DATADOG_API_KEY_SECRET=
+  SPACE_KIND_DATADOG_DURATION_MINUTES=0
+  SPACE_KIND_DATADOG_ACKNOWLEDGE_SHARED_BACKEND=
+  SPACE_KIND_TELEMETRY_MODE=datadog
+  SPACE_KIND_CLUSTER_ID=kind-local
+  SPACE_KIND_ENV=
+  SPACE_KIND_VERSION=
+  SPACE_KIND_PHASE=
+  SPACE_KIND_OWNER=
+  SPACE_KIND_SHIM_ENV=
+  SPACE_KIND_SHIM_OTLP_ENDPOINT=
+  SPACE_KIND_OTLP_METRICS_ENDPOINT=
+  SPACE_KIND_OTLP_TRACES_ENDPOINT=
+  SPACE_KIND_OBSERVABILITY=auto
+)
+# Read by the Tiltfile's space-aws-creds resource, which exists with static
+# storage credentials only.
+STATIC_TILT_SETTINGS=(
+  AWS_ACCESS_KEY_ID=
+  AWS_SECRET_ACCESS_KEY=
+  AWS_SESSION_TOKEN=
+  SPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN=
+)
 
 # Prints the first setting whose value differs between this environment and
 # the one Tilt $1 started with; fails when they agree or Tilt's is unreadable.
 tilt_settings_differ() {
-  local entry name
+  local entry name default now was settings=("${TILT_SETTINGS[@]}")
   local -A started=()
   [[ -r "/proc/$1/environ" ]] || return 1
   while IFS= read -r -d '' entry; do
-    name="${entry%%=*}"
-    tilt_setting "$name" && started[$name]="${entry#*=}"
+    started[${entry%%=*}]="${entry#*=}"
   done <"/proc/$1/environ"
-  for name in "${!started[@]}"; do
-    [[ -v "$name" && "${!name}" == "${started[$name]}" ]] || { printf '%s\n' "$name"; return 0; }
+  if [[ "$(space_kind_storage_credentials 2>/dev/null)" == static ]]; then
+    settings+=("${STATIC_TILT_SETTINGS[@]}")
+  fi
+  for entry in "${settings[@]}"; do
+    name="${entry%%=*}"
+    default="${entry#*=}"
+    now="${!name:-$default}"
+    was="${started[$name]:-$default}"
+    [[ "$now" == "$was" ]] || { printf '%s\n' "$name"; return 0; }
   done
-  while IFS= read -r name; do
-    tilt_setting "$name" && [[ ! -v "started[$name]" ]] && { printf '%s\n' "$name"; return 0; }
-  done < <(compgen -e)
   return 1
+}
+
+# Everything the bring-up would refuse about this run's settings or the
+# existing cluster, so a refusal leaves a running Tilt running rather than
+# stopping it first.
+assert_restartable() {
+  space_kind_storage_credentials >/dev/null || exit 1
+  [[ "${SPACE_TILT_MAX_PARALLEL_UPDATES:-8}" =~ ^[1-9][0-9]*$ ]] \
+    || die "SPACE_TILT_MAX_PARALLEL_UPDATES must be a positive integer"
+  kind_stack_assert_cluster_mounts
+  kind_stack_assert_postgres_data
+  kind_stack_assert_existing_cluster
 }
 
 kind_stack_assert_smoke_prereqs
 if bootstrap_kind_stack__tilt_running \
     && tilt_pid="$(bootstrap_kind_stack__tilt_listener_pid)" \
     && changed="$(tilt_settings_differ "$tilt_pid")"; then
+  assert_restartable
   log "tilt (pid $tilt_pid) started with another $changed; restarting it with this run's settings"
   bootstrap_kind_stack__stop_stale_tilt "$tilt_pid" || exit 1
 fi
+# A fresh Tilt starts after the bring-up reaps the port-forward supervisors a
+# scripted bring-up left behind (kind_stack_reap_stale_port_forwards), so its
+# own forwards can bind.
 bootstrap_kind_stack
 
 if [[ "$DATADOG_MODE" != off ]]; then

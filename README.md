@@ -73,7 +73,7 @@ SPACE is implemented in Rust, but applications interact with it over HTTP and se
 
 See [DEPENDENCIES.md](DEPENDENCIES.md) when adding or updating third-party code.
 
-After [local installation](docs/installation.md), run `tilt up` from the repository root to rebuild affected images and roll their workloads as files change. The [Kind runbook](infra/space/kind/README.md) covers this development loop, local topology, and template builds.
+After [local installation](docs/installation.md), the Tilt watcher that `up.sh` started keeps running: it rebuilds affected images and rolls their workloads as files change. Rerun `up.sh` to wait for the stack to settle again; do not start a second `tilt up`. The [Kind runbook](infra/space/kind/README.md) covers this development loop, local topology, and template builds.
 
 Use focused unit tests for component logic and the [Kind smoke suites](infra/space/kind/README.md#smoke-test) for runtime behavior. For setup-specific diagnostics, see [host-path troubleshooting](infra/space/kind/README.md#host-paths-and-running-as-a-user-other-than-dev) and [template-build debugging](infra/space/kind/README.md#debugging-a-template-build).
 

@@ -36,6 +36,12 @@
 KIND_CLUSTER = os.getenv("SPACE_KIND_CLUSTER", "space-local")
 NAMESPACE = "space"
 allow_k8s_contexts("kind-" + KIND_CLUSTER)
+# allow_k8s_contexts only permits a context; Tilt applies to whichever one the
+# kubeconfig currently names. The bring-up passes `--context`, and anything
+# else is refused before a single command runs against it.
+if k8s_context() != "kind-" + KIND_CLUSTER:
+    fail("Tilt is pointed at context '{}', not kind-{}; start it with `tilt up --context kind-{}` (up.sh does)".format(
+        k8s_context(), KIND_CLUSTER, KIND_CLUSTER))
 
 # A cluster from before the versitygw object store keeps its objects in
 # SeaweedFS; refuse it rather than apply the new charts over it. See "Object
@@ -337,16 +343,21 @@ custom_build(
 # publisher that uploads it to the object store and registers the release through
 # the real ClusterApi RPCs. build-seed.sh skips the privileged rootfs build
 # when its inputs (guest binaries, builder script, recipe, pubkey) are
-# unchanged, so watch-mode rebuilds are cheap unless spaced changed.
+# unchanged, so watch-mode rebuilds are cheap unless spaced changed. One
+# directory for both steps, resolved once: build-seed.sh writes
+# SPACE_SEED_OUTPUT_DIR (default below), and the image is built from what it
+# wrote.
 custom_build(
     ref = "space-seed-publish:local",
     command = " && ".join([
         BUILD_INPUTS_SNAPSHOT,
         pull_base_images("docker/Dockerfile.seed-publish"),
         RUST_ARTIFACT_BUILD,
-        "SPACE_RUST_BUILD_IMAGE={} bash infra/space/kind/scripts/build-seed.sh".format(RUST_ARTIFACT_IMAGE),
+        'seed_dir="${SPACE_SEED_OUTPUT_DIR:-$HOME/.space-devbox/kind/seed/build}"',
+        'SPACE_SEED_OUTPUT_DIR="$seed_dir" SPACE_RUST_BUILD_IMAGE={} bash infra/space/kind/scripts/build-seed.sh'.format(
+            RUST_ARTIFACT_IMAGE),
         (image_build("space-seed-publish", revision_label = True) + " -t $EXPECTED_REF " +
-         "--build-context seed=$HOME/.space-devbox/kind/seed/build ."),
+         '--build-context seed="$seed_dir" .'),
     ]),
     deps = RUST_ARTIFACT_DEPS + [
             "templates/firecracker/seed",
@@ -564,9 +575,8 @@ def helm_release(name, chart, values = []):
 # an existing Secret only.
 if DATADOG_MODE != "off":
     DATADOG_CHART = "infra/space/kind/charts/datadog-agent-local"
-    # Never replace an Agent this harness did not deploy.
-    if config.tilt_subcommand != "down":
-        local(["python3", DATADOG_SCRIPT, "guard-owner"], quiet = True)
+    # install-observability.sh, above, has already refused an Agent this
+    # harness did not deploy (its guard-owner step runs in every profile).
     local("helm repo add datadog https://helm.datadoghq.com --force-update", quiet = True)
     local("helm dependency build {}".format(DATADOG_CHART), quiet = True)
     # Helm rewrites charts/ and tmpcharts-* during dependency builds. Watching
@@ -665,21 +675,23 @@ k8s_yaml(helm_release("space", "infra/space/kind/charts/space-credmgr-authority-
 k8s_resource(
     "space-credmgr-authority",
     labels = ["control-plane"],
-    resource_deps = ["space-api", "label-kind-infra", "space-aws-creds"],
+    resource_deps = ["space-api", "label-kind-infra"] + (["space-aws-creds"] if STORAGE_CREDENTIALS == "static" else []),
 )
 # Optional credentials for the authority's own AWS integrations, such as AWS
-# Secrets Manager network-credential references (static storage credentials
-# only; see "Object-store credentials" in infra/space/kind/README.md): the
-# `space-aws-creds` Secret, from the AWS_* variables and
-# SPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN in Tilt's environment, when
-# AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are set. Sandbox-account,
+# Secrets Manager network-credential references: the `space-aws-creds` Secret,
+# from the AWS_* variables and SPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN in Tilt's
+# environment, when AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are set. Only
+# with static storage credentials: the chart reads the Secret in that mode
+# alone (see "Object-store credentials" in infra/space/kind/README.md), so in
+# exchange mode nothing is copied into the cluster. Sandbox-account,
 # short-lived credentials only. The chart reads it at pod start, and Tilt reads
 # its environment once, so rotating them means restarting Tilt (up.sh does when
 # they changed) and then the authority. Fed to kubectl on stdin so the values
 # stay off every command line.
-local_resource(
-    "space-aws-creds",
-    cmd = """
+if STORAGE_CREDENTIALS == "static":
+    local_resource(
+        "space-aws-creds",
+        cmd = """
 set -eu
 if [ -z "${{AWS_ACCESS_KEY_ID:-}}" ] || [ -z "${{AWS_SECRET_ACCESS_KEY:-}}" ]; then
   echo "AWS credentials unset; the authority's optional AWS integrations stay disabled"
@@ -692,9 +704,9 @@ printf 'AWS_ACCESS_KEY_ID=%s\\nAWS_SECRET_ACCESS_KEY=%s\\nAWS_SESSION_TOKEN=%s\\
       --dry-run=client -o yaml \\
   | kubectl --context kind-{cluster} apply -f -
 """.format(cluster = KIND_CLUSTER, ns = NAMESPACE),
-    allow_parallel = True,
-    labels = ["bootstrap"],
-)
+        allow_parallel = True,
+        labels = ["bootstrap"],
+    )
 # The authority's external key provider: the Kind-only intermediate-key broker
 # fixture, whose derived keys survive restarts of either side.
 k8s_yaml(helm("infra/space/kind/charts/space-kind-key-broker", name = "space", namespace = NAMESPACE,

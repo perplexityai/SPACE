@@ -32,18 +32,22 @@ bash infra/space/kind/scripts/up.sh                 # creates space-local, start
 workload in the namespace has rolled, `space-seed-publish` has completed, every
 node is published and schedulable, and the API and data plane answer on
 `localhost:8080` and `:8090`. Rerun on a live stack, `up.sh` reuses the running
-Tilt and returns once it has settled. It restarts Tilt when Tilt was started
-with other values of the settings the `Tiltfile` reads from its environment
-(the `SPACE_KIND_*` settings such as the telemetry, Datadog and storage
-credentials modes, the prune and parallel-update switches,
-`SPACE_LOOP_DEVICE_TARGET`, and the optional AWS credentials), since Tilt reads
-them once, at start. Tilt's log
+Tilt and returns once it has settled, or fails with the log of any resource
+whose update failed. It restarts Tilt when Tilt was started with other values of
+the settings Tilt reads from its environment once, at start: the list is
+`TILT_SETTINGS` in `up.sh` (the telemetry, Datadog and storage credentials
+modes, the prune and parallel-update switches, `SPACE_LOOP_DEVICE_TARGET`,
+`SPACE_SEED_OUTPUT_DIR` and the Rust build mode), each compared with its
+default, plus the optional AWS credentials when storage credentials are
+`static`. Nothing else restarts it, so a refreshed AWS session token in the
+default mode keeps the running Tilt, and a setting the bring-up would refuse
+fails before Tilt is stopped. Tilt's log
 is `~/.space-devbox/kind/tilt-space-local.log`, its pid is in
 `~/.space-devbox/kind/tilt-space-local.pid`, and `teardown.sh` stops it.
 
-Tilt does not create the cluster itself. The `Tiltfile` attaches to the
-existing `kind-space-local` context (`allow_k8s_contexts`) and refuses any
-other. Do not create the cluster by hand: `kind-cluster.yaml` bind-mounts
+Tilt does not create the cluster itself. `up.sh` starts it with
+`--context kind-space-local`, and the `Tiltfile` refuses any other context
+before it runs a command. Do not create the cluster by hand: `kind-cluster.yaml` bind-mounts
 per-node containerd host directories and the staged vendor tree, which must
 exist before `kind create`, and Tilt's bootstrap resources run only after the
 cluster is up. `up.sh` performs that preparation first.
@@ -51,7 +55,9 @@ cluster is up. `up.sh` performs that preparation first.
 Once the cluster is up, Tilt is the everyday loop: it builds any image
 that is missing, then watches the tree, rebuilding affected images and rolling
 the corresponding workloads without recreating the cluster or its persistent
-data. Every Rust binary comes from one artifact image,
+data. Tilt orders resources only on their first build: on a later update an
+API image can roll before that revision's `space-db-migrate` Job has finished,
+which a fresh bring-up never does. Every Rust binary comes from one artifact image,
 `space-rust-build-kind:local` (the union of the production artifact sets),
 owned by `scripts/build-rust-artifacts.sh`: on Linux/x86_64 it runs **one
 incremental cargo build inside the production `chef-base` builder image** —
@@ -93,12 +99,18 @@ when its process predates the current `space-local-control-plane` container.
 It likewise restarts a watcher that serves this cluster from a different
 checkout, or from one deleted since it started, so the code built and deployed
 is always the checkout the bring-up ran from; the cluster and its pods stay up.
-The same bring-up ends with a Tilt build error, printing that resource's log,
-or with a failed `space-db-migrate` Job, printing its log, rather than
-consuming its timeout — Tilt does not retry a failed build until a
+The same bring-up ends with a Tilt build error, printing that resource's log
+(including an error Tilt has settled with on a warm stack, whose old pods still
+pass every rollout), or with a failed `space-db-migrate` Job once Tilt has
+finished replacing it, printing its log, rather than consuming its timeout — Tilt does not retry a failed build until a
 watched file changes or you run `tilt trigger <resource>` — and it returns only
 once Tilt has nothing pending and every workload in the namespace has finished
-rolling. `teardown.sh` also stops a watcher serving this context that its
+rolling. When `:10350` does not answer, it stops only a `tilt up` its pidfile
+names or one started from this checkout, and leaves any other watcher on the
+host running. Before it starts Tilt it also stops the self-restarting
+`port-forward.sh` supervisors the retired scripted bring-up left on `:3000`,
+`:8333` and the telemetry ports, so Tilt's own forwards can bind. `teardown.sh`
+also stops a watcher serving this context that its
 pidfile does not name, so a `kind-down` cannot leave the stale watcher behind.
 
 ### Build identity and provenance
@@ -2175,8 +2187,8 @@ SPACE_SMOKE_BACKEND=kind SPACE_SMOKE_API_SURFACE=ecw \
 #    up.sh, export short-lived sandbox-account AWS_ACCESS_KEY_ID,
 #    AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, and
 #    SPACE_CREDMGR_SECRETS_MANAGER_ROLE_ARN (for example from the gitignored
-#    infra/space/kind/private.env); Tilt's space-aws-creds resource copies
-#    them into the authority's space-aws-creds Secret. The selected
+#    infra/space/kind/private.env); with static storage credentials, Tilt's
+#    space-aws-creds resource copies them into the authority's Secret. The selected
 #    identity must be able to sts:AssumeRole and sts:TagSession on that role;
 #    the role reads the task-owned ARN only when the secret's space-org-id tag
 #    equals the smoke organization's ID (docs/configuration.md).
@@ -2426,9 +2438,9 @@ bash scripts/tests/smoke-kind-e2e.sh                                         # b
 ```
 
 A switch re-renders the authority and the volume-manager and build-manager
-DaemonSets, which roll; a running Tilt reads the mode once, so the smoke
-bring-up restarts a Tilt that runs the other one, and `tilt up` users restart it
-themselves. The authority's Deployment records the mode in its
+DaemonSets, which roll; a running Tilt reads the mode once, so the bring-up
+(`up.sh` or a smoke run) restarts a Tilt that runs the other one. The
+authority's Deployment records the mode in its
 `space.pplx.net/kind-storage-credentials` label, and the worker and builder
 volume-manager and build-manager DaemonSets must agree, in their pod templates
 and in every pod they run: in `exchange` no container, init containers
@@ -2438,9 +2450,10 @@ with `SKIP_BOOTSTRAP=1` refuses a cluster in the other mode or with a
 disagreeing node service, the bring-up checks both after Tilt settles, and
 `local.storage_exchange_scoping` fails on a cluster where they disagree. The
 refusal names each disagreeing DaemonSet and pod, and its remedy is one
-bring-up without `SKIP_BOOTSTRAP=1`, which runs Tilt from this checkout,
-re-applies the charts and waits for their rollouts. A cluster brought up
-before the builders exchanged their credentials needs exactly that once.
+bring-up (`up.sh`, or a smoke run without `SKIP_BOOTSTRAP=1`), which runs Tilt
+from this checkout, re-applies the charts and waits for their rollouts. A
+cluster brought up before the builders exchanged their credentials needs
+exactly that once.
 `local.storage_exchange_scoping` exchanges through a worker's agent socket as
 volume-manager does, then shows the store refusing the session for another
 sandbox's snapshot, the templates bucket and a write under read scope, and

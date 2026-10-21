@@ -248,7 +248,7 @@ Keep installation settings consistent across steps. The guide explicitly sets th
 | `SPACE_KIND_CLUSTER` | Explicitly set to `space-local` | Kind cluster name; context is `kind-space-local`. |
 | `SPACE_CONSOLE_PASSWORD` | Defaults to `password` when unset | Initial `root@local` login password for a locked account. |
 | `SPACE_KIND_DATA_ROOT` | Defaults to `$HOME/.kind-data` when not already set | Host-side backing storage for node containerd data. This guide does not override it. |
-| `SPACE_BOOTSTRAP_TIMEOUT` | Defaults to `1800` seconds when not already set | The longest each bring-up stage may take, such as the first build, not a sandbox or command timeout. |
+| `SPACE_BOOTSTRAP_TIMEOUT` | Defaults to `1800` seconds when not already set | The longest each wait of the bring-up may take: Tilt's start, the first build and the API, the seed Job, each rollout, and node publication. Not a sandbox or command timeout. |
 
 The examples use the following client settings. Changing a client URL does not change the server listener or the port that reaches it.
 
