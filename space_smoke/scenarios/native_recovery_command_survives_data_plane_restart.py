@@ -36,8 +36,9 @@ def command_survives_data_plane_restart(fixture: KindNativeHardeningFixture) -> 
             fixture, fixture.command(sandbox_id, ["sh", "-c", script], timeout_seconds=180), 201
         )
         with fixture.context.phase("start command and replace data-plane pods"):
-            # The SSE contract starts with attached, then process_started.
-            initial = attach_after_recovery(fixture, command, max_events=2)
+            # The SSE contract starts with attached, then process_started; the
+            # first output ("begun") is the first frame with an id.
+            initial = attach_after_recovery(fixture, command, max_events=3)
             fixture.context.verify(
                 any(event.data.get("type") == "process_started" for event in initial.events),
                 "fault requires an observed running guest process",
