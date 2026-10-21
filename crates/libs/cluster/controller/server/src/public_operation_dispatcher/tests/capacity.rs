@@ -1,7 +1,8 @@
 //! How the dispatcher shares its execution slots: some are kept for
 //! teardowns (sandbox deletes and kills), so a teardown starts while other
 //! work holds every other slot, and some for other work, so it starts while
-//! teardowns hold every other slot.
+//! teardowns hold every other slot; and no organization's other work holds
+//! more than its limit while another organization's work waits.
 
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -538,6 +539,230 @@ async fn a_teardown_still_starts_with_no_reservation_and_a_floor_at_every_slot()
     for operation in operations {
         wait_for_state(&db.pool, operation, OperationState::Succeeded).await?;
     }
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), dispatcher).await??;
+    Ok(())
+}
+
+#[test]
+fn org_slot_settings_parse_from_the_environment() {
+    let settings = |env: &pplx_space_test_env::TestEnv| {
+        let config = ReconcilerConfig::from_environment(env);
+        (
+            config.org_slot_limit.map(NonZeroU32::get),
+            config.org_slot_headroom,
+        )
+    };
+    let mut env = pplx_space_test_env::TestEnv::default();
+    assert_eq!(settings(&env), (Some(8), 2));
+    for (raw, limit, headroom) in [
+        ("0", None, 0),
+        ("3", Some(3), 3),
+        ("500", Some(128), 128),
+        ("eight", Some(8), 2),
+        ("", Some(8), 2),
+    ] {
+        env.set(ORG_SLOT_LIMIT_ENV, raw);
+        env.set(ORG_SLOT_HEADROOM_ENV, raw);
+        assert_eq!(settings(&env), (limit, headroom), "{raw:?}");
+    }
+}
+
+fn org_limit(contended: u32, uncontended: u32) -> OrgSlotLimit {
+    OrgSlotLimit {
+        contended: NonZeroU32::new(contended).expect("a positive limit"),
+        uncontended: NonZeroU32::new(uncontended).expect("a positive limit"),
+    }
+}
+
+#[tokio::test]
+async fn an_organizations_limit_holds_only_while_another_organization_waits() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let busy_org = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let other_org = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    // The busy organization already has one operation running.
+    queue_all(
+        &store,
+        busy_org,
+        &[(OperationKind::CreateSandbox, "sbx_busy_running")],
+    )
+    .await?;
+    claim_with(&store, ClaimLimits::any(1)).await?;
+    let busy = queue_all(
+        &store,
+        busy_org,
+        &[
+            (OperationKind::CreateSandbox, "sbx_busy_create_0"),
+            (OperationKind::CreateSandbox, "sbx_busy_create_1"),
+            (OperationKind::CreateSandbox, "sbx_busy_create_2"),
+            (OperationKind::DeleteSandbox, "sbx_busy_delete"),
+            (OperationKind::KillSandbox, "sbx_busy_kill"),
+        ],
+    )
+    .await?;
+    let other = queue_all(
+        &store,
+        other_org,
+        &[
+            (OperationKind::CreateSandbox, "sbx_other_create_0"),
+            (OperationKind::CreateSandbox, "sbx_other_create_1"),
+        ],
+    )
+    .await?;
+    let limits = ClaimLimits {
+        per_org_non_teardown: Some(org_limit(2, 64)),
+        ..ClaimLimits::any(64)
+    };
+
+    // While the other organization waits, one more for the busy one, as it
+    // already runs one. Teardowns are outside the limit.
+    let mut expected = vec![busy[0], busy[3], busy[4], other[0], other[1]];
+    expected.sort();
+    assert_eq!(claim_with(&store, limits).await?, expected);
+    // Nothing else waits now, so the busy organization may go past it.
+    assert_eq!(claim_with(&store, limits).await?, [busy[1], busy[2]]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn one_organizations_held_work_leaves_slots_for_another() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let busy_org = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let other_org = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let targets = (0..4)
+        .map(|index| format!("sbx_busy_held_{index}"))
+        .collect::<Vec<_>>();
+    let mut creates = queue_all(
+        &store,
+        busy_org,
+        &targets
+            .iter()
+            .map(|target_id| (OperationKind::CreateSandbox, target_id.as_str()))
+            .collect::<Vec<_>>(),
+    )
+    .await?;
+    let executor = HeldWork::default();
+    let shutdown = CancellationToken::new();
+    let dispatcher = tokio::spawn(run(
+        ReconcilerConfig {
+            delete_reserved_slots: 0,
+            non_delete_reserved_slots: 0,
+            org_slot_limit: NonZeroU32::new(2),
+            org_slot_headroom: 1,
+            ..fast_loop_config(4)
+        },
+        store.clone(),
+        executor.clone(),
+        shutdown.clone(),
+    ));
+    // Alone, the busy organization goes past its limit but leaves one slot.
+    wait_for_running(&executor, 3).await?;
+
+    let other_create = queue_all(
+        &store,
+        other_org,
+        &[(OperationKind::CreateSandbox, "sbx_other_meanwhile")],
+    )
+    .await?[0];
+    wait_for_running(&executor, 4).await?;
+    assert_eq!(
+        operation_state(&db.pool, other_create).await?,
+        OperationState::Running.as_str()
+    );
+
+    executor.release.cancel();
+    creates.push(other_create);
+    for create in creates {
+        wait_for_state(&db.pool, create, OperationState::Succeeded).await?;
+    }
+    assert_eq!(executor.max_running.load(Ordering::SeqCst), 4);
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), dispatcher).await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_claim_that_finds_its_work_held_back_waits_before_the_next() -> TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let targets = (0..3)
+        .map(|index| format!("sbx_capped_{index}"))
+        .collect::<Vec<_>>();
+    let creates = queue_all(
+        &store,
+        org_id,
+        &targets
+            .iter()
+            .map(|target_id| (OperationKind::CreateSandbox, target_id.as_str()))
+            .collect::<Vec<_>>(),
+    )
+    .await?;
+    let executor = HeldWork::default();
+    let claims = Arc::new(AtomicUsize::new(0));
+    let hook: BeforeClaimHook = {
+        let claims = claims.clone();
+        Arc::new(move || {
+            claims.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        })
+    };
+    let shutdown = CancellationToken::new();
+    // One slot for the organization, the others free but closed to it.
+    let dispatcher = tokio::spawn(super::BEFORE_CLAIM.scope(
+        hook,
+        run(
+            ReconcilerConfig {
+                delete_reserved_slots: 0,
+                non_delete_reserved_slots: 0,
+                org_slot_limit: NonZeroU32::new(1),
+                org_slot_headroom: 3,
+                ..fast_loop_config(4)
+            },
+            store.clone(),
+            executor.clone(),
+            shutdown.clone(),
+        ),
+    ));
+    wait_for_running(&executor, 1).await?;
+    let before = claims.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    // About four claims a second, not one every 20 ms tick.
+    let during = claims.load(Ordering::SeqCst) - before;
+    assert!((1..=8).contains(&during), "{during} claims in a second");
+
+    // A finished execution frees a slot, and the next claim follows at once.
+    executor.release.cancel();
+    for create in creates {
+        wait_for_state(&db.pool, create, OperationState::Succeeded).await?;
+    }
+    // Work waiting out a backoff is not held back: claims keep every tick.
+    let later = queue_all(
+        &store,
+        org_id,
+        &[(OperationKind::CreateSandbox, "sbx_capped_later")],
+    )
+    .await?[0];
+    sqlx::query(sql!(
+        "UPDATE public_operations
+         SET next_attempt_at = NOW() + INTERVAL '1 hour'
+         WHERE operation_id = $1"
+    ))
+    .bind(later.as_uuid())
+    .execute(&db.pool)
+    .await?;
+    let before = claims.load(Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let idle = claims.load(Ordering::SeqCst) - before;
+    assert!(idle >= 10, "{idle} claims in half a second");
     shutdown.cancel();
     tokio::time::timeout(Duration::from_secs(5), dispatcher).await??;
     Ok(())
