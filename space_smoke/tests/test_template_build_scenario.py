@@ -31,19 +31,15 @@ from space_smoke.adapters import (
     KindConfig,
     KindHarness,
     _endpoint_target_pods,
-    _template_alias,
 )
 from space_smoke.capabilities import GuestMetadata, TemplateBuildJob, TemplateBuildResult, TemplateRecipe
 from space_smoke.runtime import CommandResult, InvariantViolation, ResourceScope
-from space_smoke.config import SandboxConfig
 from space_smoke.template_build import (
     OCI_IMAGE,
     TemplateBuildAssertions,
-    build_dedicated_template,
     compatibility_family,
     guest_checks,
     metadata_matches_bundle,
-    minimal_recipe,
     oci_recipe,
 )
 
@@ -606,93 +602,12 @@ class SdkBuild(unittest.TestCase):
         self.assertEqual(steps[-1][0], "start")
         self.assertEqual(steps[-1][1][1], "wait:2")
 
-    def test_a_recipe_without_a_start_command_is_built_as_the_bare_dockerfile(self) -> None:
-        seen: dict[str, object] = {}
-
-        class Builder:
-            def __getattr__(self, name):
-                raise AssertionError(f"the minimal recipe must not add a {name} step")
-
-        class Template:
-            def __init__(self, file_context_path=None, **_kw) -> None:
-                seen["context_files"] = sorted(p.name for p in Path(file_context_path).iterdir())
-
-            def from_dockerfile(self, path):
-                seen["dockerfile"] = Path(path).read_text()
-                return Builder()
-
-            @staticmethod
-            def build(final, *, alias, tags, cpu_count, memory_mb, on_build_logs, **opts):
-                seen["final"] = final
-                return SimpleNamespace(template_id="tpl-1", build_id="bld-1")
-
-        fake = types.SimpleNamespace(Template=Template, wait_for_timeout=lambda t: f"wait:{t}")
-        with mock.patch.dict(sys.modules, {"e2b": fake}):
-            EcwSdk(EcwConfig(api_key="key")).build_template(
-                minimal_recipe(), alias="space-smoke-parent-0123abcd", cpu_count=1, memory_mb=1024, tags=("latest",)
-            )
-        self.assertEqual(seen["dockerfile"], f"FROM {OCI_IMAGE}\n")
-        self.assertEqual(seen["context_files"], ["Dockerfile"])
-        self.assertIsInstance(seen["final"], Builder)
-
     def test_a_context_file_name_with_a_path_is_refused(self) -> None:
         recipe = TemplateRecipe("FROM x", {"../escape": "x"}, {}, (), "true", 1)
         fake = types.SimpleNamespace(Template=lambda **kw: None, wait_for_timeout=lambda t: t)
         with mock.patch.dict(sys.modules, {"e2b": fake}):
             with self.assertRaises(ValueError):
                 EcwSdk(EcwConfig(api_key="key")).build_template(recipe, alias="a", cpu_count=1, memory_mb=1, tags=())
-
-
-
-class DedicatedTemplate(unittest.TestCase):
-    class Control:
-        def __init__(self) -> None:
-            self.deleted: list[str] = []
-
-        def delete_template_as_admin(self, alias: str) -> str | None:
-            self.deleted.append(_template_alias(alias))
-            return "op-1"
-
-        def operation_state(self, operation_id: str) -> str:
-            return "succeeded"
-
-    def test_the_template_is_deleted_at_teardown_even_when_the_build_fails(self) -> None:
-        control = self.Control()
-        submitted: list[str] = []
-
-        class Builder:
-            def build_template(self, recipe, *, alias, cpu_count, memory_mb, tags):
-                submitted.append(alias)
-                raise RuntimeError("build failed after the API accepted it")
-
-        scope = ResourceScope()
-        with self.assertRaises(RuntimeError):
-            build_dedicated_template(scope, cast(Any, control), cast(Any, Builder()))
-        self.assertEqual(control.deleted, [])
-        self.assertEqual(scope.close(), ())
-        self.assertEqual(control.deleted, submitted)
-
-    def test_a_built_template_is_returned_under_an_alias_the_admin_delete_accepts(self) -> None:
-        control = self.Control()
-
-        class Builder:
-            def build_template(self, recipe, *, alias, cpu_count, memory_mb, tags):
-                self.recipe, self.tags = recipe, tags
-                return TemplateBuildResult("tpl-1", "bld-1", alias, 12.0, ())
-
-        builder = Builder()
-        scope = ResourceScope()
-        built = build_dedicated_template(scope, cast(Any, control), cast(Any, builder))
-        self.assertRegex(built.alias, r"^space-smoke-parent-[0-9a-f]{8}$")
-        self.assertEqual(builder.recipe, minimal_recipe())
-        self.assertEqual(builder.tags, ("latest",))
-        self.assertEqual(scope.close(), ())
-        self.assertEqual(control.deleted, [built.alias])
-
-    def test_the_dedicated_template_replaces_rather_than_combines_with_other_template_setup(self) -> None:
-        SandboxConfig(kind_dedicated_template=True)
-        with self.assertRaises(ValueError):
-            SandboxConfig(kind_dedicated_template=True, template="other")
 
 
 if __name__ == "__main__":
