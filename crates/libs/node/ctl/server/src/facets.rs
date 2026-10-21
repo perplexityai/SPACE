@@ -21,8 +21,8 @@ use pplx_space_node_api_client::proto::{
     SandboxPortExposureDesiredState, SandboxPortProtocol,
 };
 use pplx_space_node_mgr_client::proto::{
-    AllowPortRequest, DenyPortRequest, ExposePortRequest, GetExecutionInventoryRequest,
-    ListNetworkLeasesRequest, NetworkProtocol, NetworkSlotState, UnexposePortRequest,
+    AllowPortRequest, DenyPortRequest, ExposePortRequest, ListNetworkLeasesRequest,
+    NetworkProtocol, NetworkSlotState, UnexposePortRequest,
 };
 use pplx_space_sbx_mgr_client::proto::{
     AcknowledgeAutoLifecycleDeleteReceiptsRequest, DisableSnapshotsRequest, EnableSnapshotsRequest,
@@ -46,6 +46,7 @@ use crate::dirty_state::{
 use crate::{InboundFacetResult, ReconcileStats, connect_cluster_api, local_manager_request, util};
 
 mod cluster_deleted_eviction;
+mod execution_inventory;
 mod inventory_publish;
 mod local_state;
 mod network_policy;
@@ -119,7 +120,7 @@ struct NodeStatePublish {
     sandboxes_seen: u64,
     templates_seen: u64,
     node_status: Option<PublishedNodeStatus>,
-    execution_inventory: Option<pplx_space_execution_common::proto::NodeExecutionInventory>,
+    execution_observation: Option<execution_inventory::CollectedExecutionInventory>,
     auto_lifecycle_delete_completions: Vec<AutoLifecycleDeleteCompletion>,
     /// `None` is "this publish carries no report", which is what a delta
     /// publish and a failed enumeration both produce. It is not "nothing is
@@ -199,7 +200,7 @@ pub const FACET_PLUGINS: &[FacetPlugin] = &[
     FacetPlugin {
         kind: FacetKind::NodeStatus,
         inbound_tick: FacetTickMode::Disabled,
-        outbound_tick: FacetTickMode::DirtyOnly,
+        outbound_tick: FacetTickMode::EveryTickFull,
     },
 ];
 
@@ -410,7 +411,7 @@ async fn publish_node_state(
         && !state.sandbox_inventory_complete
         && !state.template_inventory_complete
         && state.node_status.is_none()
-        && state.execution_inventory.is_none()
+        && state.execution_observation.is_none()
         && state.auto_lifecycle_delete_completions.is_empty()
     {
         return Ok(ReconcileStats {
@@ -422,6 +423,13 @@ async fn publish_node_state(
 
     let templates_seen = state.templates_seen;
     let sandboxes_seen = state.sandboxes_seen;
+    let (execution_inventory, execution_observation) = match state.execution_observation {
+        Some(observation) => {
+            let (legacy, report) = observation.into_publication();
+            (legacy, Some(report))
+        }
+        None => (None, None),
+    };
     let mut client = connect_cluster_api()
         .await
         .map_err(|error| error.to_string())?;
@@ -434,8 +442,8 @@ async fn publish_node_state(
             templates: state.templates,
             role: proto_node_role(node_role),
             node_status: state.node_status,
-            execution_inventory: state.execution_inventory,
-            execution_observation: None,
+            execution_inventory,
+            execution_observation,
             auto_lifecycle_delete_completions: state.auto_lifecycle_delete_completions,
             pending_local_backups: state.pending_local_backups,
         })

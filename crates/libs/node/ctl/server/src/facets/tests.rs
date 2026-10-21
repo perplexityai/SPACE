@@ -427,7 +427,11 @@ fn ref_names(refs: Vec<FacetRef>) -> Vec<String> {
 fn inventory_facets_publish_full_snapshots_on_every_tick() {
     assert_eq!(
         ref_names(periodic_outbound_refs()),
-        vec![FACET_SANDBOX_INVENTORY, FACET_TEMPLATE_INVENTORY]
+        vec![
+            FACET_SANDBOX_INVENTORY,
+            FACET_TEMPLATE_INVENTORY,
+            FACET_NODE_STATUS
+        ]
     );
 }
 

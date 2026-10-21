@@ -194,6 +194,39 @@ During a mixed cluster-reader rollout, old readers can update artifact rows
 without updating observation receipts. Neither strict rejection nor an
 unavailable observation is a placement quarantine.
 
+Node-ctl samples on the node-status facet's periodic reconciliation.
+Cluster-role nodes omit the sample. The shared node-manager channel is reused;
+connection readiness plus inventory RPC share a five-second budget.
+Failure, an unsupported RPC, or timeout publishes an
+unavailable observation; it does not abort publication of the remaining node
+status. The next periodic tick samples again rather than replaying a cached
+inventory. Other facets omit the observation, leaving its receipt unchanged.
+A successful collection populates both the report and the identical legacy
+inventory so old cluster readers retain their existing behavior.
+
+Execution collection accompanies only the node-status facet. Sandbox and
+template censuses run as separate outbound publications and can also refresh
+node status; an execution protocol error does not reject those separate
+requests. Failed publications remain reconciliation errors and the next
+periodic tick retries with a new sample. A persistent protocol defect needs a
+publisher fix, not a successful acknowledgement of the rejected report.
+
+The inventory polling period (60 seconds by default) is not a heartbeat
+freshness guarantee. It must not be used to justify the separate 30-second
+node-status freshness window. First-boot artifact staging may exceed the
+five-second collection budget and legitimately report unavailable until a
+later sample succeeds; the previous artifact rows remain in place.
+
+Repeated complete samples advance the collection receipt without replacing
+unchanged runtime, guest, state-format or component rows. Reconciliation deletes
+missing entries, inserts new ones and updates changed flags; a capability can
+also be revoked on a retained runtime. Duplicate entries are combined within
+the current sample, never with flags from an older sample. Unchanged artifact
+row timestamps stay unchanged, so use the receipt to diagnose collection age.
+This still issues one separate status publication per tick and performs scoped
+database reconciliation; it avoids full inventory rewrites, not all database
+work. Keeping this publication separate isolates protocol errors from censuses.
+
 ## Canonical identity and stored representation
 
 The schema-1 canonical encoding is defined by

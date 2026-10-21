@@ -65,7 +65,7 @@ pub(super) async fn publish_sandbox_inventory(
             sandboxes_seen,
             templates_seen: 0,
             node_status,
-            execution_inventory: None,
+            execution_observation: None,
             auto_lifecycle_delete_completions,
             pending_local_backups,
         },
@@ -92,7 +92,7 @@ pub(super) async fn publish_template_inventory(
             sandboxes_seen: 0,
             templates_seen,
             node_status,
-            execution_inventory: None,
+            execution_observation: None,
             auto_lifecycle_delete_completions: Vec::new(),
             pending_local_backups: None,
         },
@@ -105,31 +105,7 @@ pub(super) async fn publish_node_status(
     node_role: Option<NodeRole>,
     node_status: Option<PublishedNodeStatus>,
 ) -> Result<ReconcileStats, String> {
-    let execution_inventory = match pplx_space_node_mgr_client::connect().await {
-        Ok(mut node_manager) => match node_manager
-            .get_execution_inventory(local_manager_request(
-                GetExecutionInventoryRequest {},
-                false,
-            ))
-            .await
-        {
-            Ok(response) => Some(response.into_inner()),
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "skipping execution inventory publish because node-manager inventory is unavailable"
-                );
-                None
-            }
-        },
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                "skipping execution inventory publish because node-manager is unavailable"
-            );
-            None
-        }
-    };
+    let execution_observation = execution_inventory::collect(node_role).await;
     publish_node_state(
         node_id,
         node_role,
@@ -141,7 +117,7 @@ pub(super) async fn publish_node_status(
             sandboxes_seen: 0,
             templates_seen: 0,
             node_status,
-            execution_inventory,
+            execution_observation,
             auto_lifecycle_delete_completions: Vec::new(),
             pending_local_backups: None,
         },
