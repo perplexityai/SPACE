@@ -632,8 +632,12 @@ class PendingBackupControl(Protocol):
 
     def sandbox_pod_placement(self, sandbox_id: str) -> SandboxPodPlacement | None: ...
 
-    def publish_node_ctl_facet(self, node_name: str, facet: str) -> None:
-        """Have that node's node-ctl publish `facet` now instead of on its next poll."""
+    def publish_node_ctl_facet(self, node_name: str, facet: str) -> str | None:
+        """Have that node's node-ctl publish `facet` now instead of on its next poll.
+
+        None once node-ctl has the request; otherwise why a transient failure
+        kept it from node-ctl, for the caller to record and retry.
+        """
         ...
 
 
@@ -1020,8 +1024,12 @@ class NodeFenceControl(Protocol):
         """`status.capacity[resource]`, None when absent or unreadable."""
         ...
 
-    def publish_node_ctl_facet(self, node_name: str, facet: str) -> None:
-        """Have that node's node-ctl publish `facet` now instead of on its next poll."""
+    def publish_node_ctl_facet(self, node_name: str, facet: str) -> str | None:
+        """Have that node's node-ctl publish `facet` now instead of on its next poll.
+
+        None once node-ctl has the request; otherwise why a transient failure
+        kept it from node-ctl, for the caller to record and retry.
+        """
         ...
 
     def patch_node_as(

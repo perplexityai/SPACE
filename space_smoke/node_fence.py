@@ -31,8 +31,12 @@ Two halves, and the second is the one that would fail silently:
    and the *running binary* has to write both back through its own credential.
    The two canaries run concurrently, and node-ctl is asked to run the
    reconciles that write them (`space-nodectl facet publish
-   template-inventory`) instead of the run waiting out its 60 s poll; the
-   poll still repairs them if the request is lost.
+   template-inventory`) instead of the run waiting out its 60 s poll. That
+   proves the reconcile path and the fence, not that node-ctl's timer drives
+   it: the node-ctl crate's
+   `a_timer_tick_publishes_the_periodic_outbound_facets_and_reconciles_node_objects`
+   proves that. A failed request is recorded and retried, and the timer still
+   repairs both canaries within the budget.
 
 Residue: every field a probe can touch is snapshotted before the probes and
 reverted on every exit path, keyed on markers the run plants (a forged
@@ -539,7 +543,8 @@ class NodeFenceAssertions:
         Concurrent, not serial, and requested: node-ctl's Node reconciles ride
         its template-inventory publication, which the run asks for after the
         strip and again every `RECONCILE_REQUEST_SECONDS` until both are back,
-        rather than waiting out the 60 s poll that would also run them.
+        rather than waiting out the 60 s poll that would also run them. A
+        failed request is recorded, not fatal.
         """
 
         own = self._require_identity().node_name
@@ -552,10 +557,14 @@ class NodeFenceAssertions:
         deadline = started + budget
         seen: dict[str, float] = {}
         requested_at: float | None = None
+        request_failures: list[str] = []
         while len(seen) < 2:
             if requested_at is None or time.monotonic() - requested_at >= RECONCILE_REQUEST_SECONDS:
-                self._control.publish_node_ctl_facet(own, NODE_RECONCILE_FACET)
+                failure = self._control.publish_node_ctl_facet(own, NODE_RECONCILE_FACET)
                 requested_at = time.monotonic()
+                if failure is not None:
+                    request_failures.append(failure)
+                    self._fixture.record("reconcile_request_failures", request_failures[-6:])
             self._fixture.wait(RECONCILE_POLL_SECONDS)
             if "label" not in seen and self._control.node_label(own, OWNED_LABEL):
                 seen["label"] = round(time.monotonic() - started, 1)

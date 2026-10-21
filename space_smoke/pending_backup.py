@@ -23,9 +23,14 @@ ladder (5, 30, 120, 300 s) and can wait out a full 300 s before it uploads, so
 the drain budget is 600 s and the downtime is kept short so the fifth attempt
 never runs with the store still down. The census is asked for, not waited
 for: once the snapshot is in flight the sandbox's node-ctl publishes its
-sandbox inventory on demand (`space-nodectl facet publish`), the same Full
-census its 60 s poll would send, so the store is back within the transfer's
-first retries rather than after a minute of them. Scaling the object store to
+sandbox inventory on demand (`space-nodectl facet publish`), through the same
+outbound sync and Full census its 60 s poll runs, so the store is back within
+the transfer's first retries rather than after a minute of them. This proves
+the census and its queue mirror, not that node-ctl's timer sends it: the
+node-ctl crate's
+`a_timer_tick_publishes_the_periodic_outbound_facets_and_reconciles_node_objects`
+proves that. A failed request is recorded and retried, and the timer still
+covers it within the budget. Scaling the object store to
 zero stops every suspend upload on the stack, so this must not run concurrently
 with another suspend-bearing smoke.
 """
@@ -119,8 +124,9 @@ class PendingBackupAssertions:
 
         The queue is the census's only writer, so its row is the outcome. The
         census is requested from the sandbox's node-ctl, again every
-        `republish_seconds` while the row is missing; its own poll still sends
-        one as well.
+        `republish_seconds` while the row is missing. A request that fails is
+        recorded, not fatal: node-ctl's poll still sends the census inside the
+        budget.
         """
 
         node_name = self._node_name
@@ -129,10 +135,14 @@ class PendingBackupAssertions:
         sandbox_id = self._fixture.sandbox.sandbox_id
         deadline = time.monotonic() + timeout
         published_at = None
+        request_failures: list[str] = []
         while True:
             if published_at is None or time.monotonic() - published_at >= republish_seconds:
-                self._control.publish_node_ctl_facet(node_name, "sandbox-inventory")
+                failure = self._control.publish_node_ctl_facet(node_name, "sandbox-inventory")
                 published_at = time.monotonic()
+                if failure is not None:
+                    request_failures.append(failure)
+                    self._fixture.record("census_request_failures", request_failures[-6:])
             rows = self._control.pending_backup_queue(sandbox_id)
             if rows:
                 self._fixture.verify(

@@ -2645,19 +2645,35 @@ ON CONFLICT (key_hash) DO NOTHING;
             timeout=timeout,
         )
 
-    def publish_node_ctl_facet(self, node_name: str, facet: str) -> None:
+    def publish_node_ctl_facet(self, node_name: str, facet: str) -> str | None:
         """Have node-ctl on `node_name` publish an outbound facet now (`space-nodectl facet publish`).
 
         Marks the whole facet dirty through node-ctl's own `MarkFacetDirty`, so
         its next outbound sync is the same publication its poll would make:
         `sandbox-inventory` a Full census, `template-inventory` with the node's
         Kubernetes object reconciles.
+
+        Returns None once node-ctl has the request, or why it does not: a
+        failed exec or RPC (node-ctl restarting, a kubectl blip) is the
+        caller's to record and retry, since node-ctl's poll still publishes the
+        facet. A bench that is not an isolated Kind stack, or a node without
+        exactly one operator shell, still raises `SmokeConfigurationError`.
         """
 
-        result = self._node_shell_exec(
-            node_name, f"space-nodectl facet publish {shlex.quote(facet)}", timeout=30
-        )
-        _require_ok(result, f"publish node-ctl facet {facet} on {node_name}")
+        try:
+            result = self._node_shell_exec(
+                node_name, f"space-nodectl facet publish {shlex.quote(facet)}", timeout=30
+            )
+        except SmokeConfigurationError:
+            raise
+        except RuntimeError as error:
+            return f"publish node-ctl facet {facet} on {node_name}: {error}"
+        if result.returncode != 0:
+            return (
+                f"publish node-ctl facet {facet} on {node_name} failed "
+                f"({result.returncode}): {result.detail() or '<no output>'}"
+            )
+        return None
 
     def register_unpinned_template(
         self, node_name: str, template: str, size_bytes: int

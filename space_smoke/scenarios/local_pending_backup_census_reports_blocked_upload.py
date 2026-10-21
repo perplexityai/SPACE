@@ -7,8 +7,9 @@ import space_smoke as smoke
 # broken: a natural suspend is unbacked for seconds while the census fires
 # once a minute. The object store is scaled to zero for the suspend with its
 # scale-back armed first, the census is then requested from the sandbox's
-# node-ctl rather than waited for, and the store is restored the moment the
-# queue row is seen, so
+# node-ctl rather than waited for (this proves the census and its mirror; the
+# node-ctl crate's TimerTick test proves the poll sends it), and the store is
+# restored the moment the queue row is seen, so
 # the downtime stays inside the API's 300 s durable-suspend budget and the
 # transfer's fifth retry never runs against a dead store; the drain budget
 # covers a transfer that waited out the whole 455 s ladder. Do not run
