@@ -1246,7 +1246,8 @@ pub enum PublicOperationRequeueReason {
     ActivationBackpressure,
     /// The execution handed a retry wait back to the dispatcher instead of
     /// sleeping in its slot. Not a failure of its own: it spends no attempt
-    /// and is bounded by the operation's age instead.
+    /// and is bounded instead by the deferral window, wall-clock time from
+    /// the operation's first claim.
     RetryDeferred,
 }
 
@@ -1498,7 +1499,7 @@ async fn claim_operations(
         // snapshot, takes that wake as it comes due. The dispatcher runs
         // behind leader election, so this only matters around a handover; a
         // busy lock makes this tick claim nothing rather than wait. The same
-        // round trip turns off JIT, which the key probe's cost estimate would
+        // round trip turns off JIT, which the keyed claim's cost estimate can
         // trigger and which costs more than the query.
         let (claim_lock_held, _jit) = sqlx::query_as::<_, (bool, String)>(sql!(
             "SELECT pg_try_advisory_xact_lock($1), set_config('jit', 'off', true)"

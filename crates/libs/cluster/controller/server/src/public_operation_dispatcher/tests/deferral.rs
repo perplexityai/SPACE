@@ -131,8 +131,8 @@ async fn a_restore_fenced_for_over_ten_minutes_still_converges() -> TestResult {
         let (state, attempts, delay_secs, _) = operation_row(&db.pool, operation_id).await?;
         assert_eq!(state, "queued");
         assert_eq!(attempts, 0, "a deferred requeue spends no attempt");
-        // The 5 s hint plus an equal-jittered eighth of the time deferring,
-        // capped at a minute.
+        // The 5 s hint plus an equal-jittered eighth of the time since the
+        // first claim, that term capped at a minute.
         let ceiling = (age_secs as f64 / 8.0).min(60.0);
         assert!(
             (5.0 + ceiling / 2.0 - 0.5..=5.0 + ceiling + 0.5).contains(&delay_secs),
@@ -178,6 +178,15 @@ async fn a_deferred_operation_past_its_window_fails_with_its_existing_error() ->
     .await?;
     age_and_make_due(&db.pool, start, max_age.as_secs() as i64 + 1).await?;
     assert_eq!(tick(&config, &store, &executor).await?.retried, 1);
+    // The window runs from the first claim, not from creation.
+    age_and_make_due(&db.pool, start, window.as_secs() as i64 + 1).await?;
+    sqlx::query(sql!(
+        "UPDATE public_operations SET started_at = NOW() WHERE operation_id = $1"
+    ))
+    .bind(start.as_uuid())
+    .execute(&db.pool)
+    .await?;
+    assert_eq!(tick(&config, &store, &executor).await?.retried, 1);
     age_and_make_due(&db.pool, start, window.as_secs() as i64 + 1).await?;
     assert_eq!(tick(&config, &store, &executor).await?.failed, 1);
     let (state, _, _, error) = operation_row(&db.pool, start).await?;
@@ -185,6 +194,15 @@ async fn a_deferred_operation_past_its_window_fails_with_its_existing_error() ->
     let error = error.expect("a failed operation carries its error envelope");
     assert_eq!(error["reason"], "retry_attempts_exhausted");
     assert_eq!(error["retry_reason"], "retry_deferred");
+    // Its attempts were given back, so the envelope names the window.
+    assert_eq!(error["deferred_retry_window_ms"], window.as_secs() * 1000);
+    let elapsed_ms = error["elapsed_since_first_claim_ms"]
+        .as_u64()
+        .expect("the envelope carries the elapsed time");
+    assert!(
+        (window.as_secs() * 1000..(window.as_secs() + 60) * 1000).contains(&elapsed_ms),
+        "{elapsed_ms}"
+    );
 
     // A wake keeps its age deadline.
     let wake = create_queued_operation(

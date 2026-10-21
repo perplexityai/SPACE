@@ -5199,8 +5199,9 @@ mod kubernetes_tests {
     }
 
     /// Under the dispatcher's retry deferral the same fence-blocked re-drive
-    /// returns its retryable error at once instead of pacing laps through a
-    /// long readiness budget, so the caller can hand back its slot.
+    /// retries in place for the 2 s grace, then returns its retryable error
+    /// instead of pacing laps through a long readiness budget, so the caller
+    /// can hand back its slot.
     #[tokio::test(flavor = "current_thread")]
     async fn deferred_conflict_redrive_returns_without_waiting_out_the_budget()
     -> Result<(), BoxError> {
