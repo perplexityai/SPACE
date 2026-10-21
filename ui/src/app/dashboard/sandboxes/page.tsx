@@ -18,6 +18,7 @@ import {
   waitForPublicOperation,
 } from '@/lib/public-api';
 import { adminApi } from '@/lib/api';
+import { settleAcceptedCreate } from '@/lib/accepted-create';
 import {
   ROLLBACK_NOT_ENABLED,
   SNAPSHOTS_NOT_ENABLED,
@@ -769,28 +770,22 @@ function SandboxesPage() {
       const sandbox = targetOrgId
         ? await createConsoleSandboxForOrg(targetOrgId, payload)
         : await postPublicOperation('/sandboxes', payload);
-      // The sandbox exists from here on: a failed snapshot enable is a
-      // partial success, reported as such, so a retry does not create a
-      // second sandbox.
-      let snapshotsNotice: string | null = null;
-      if (values.snapshots) {
-        if (targetOrgId) {
-          await waitForAdminOperation(sandbox.operation_id);
-        } else {
-          await waitForPublicOperation(sandbox.operation_id);
-        }
-        try {
-          if (targetOrgId) {
-            await forceConsoleSandboxAction(sandbox.sandbox_id, 'enable_snapshots');
-          } else {
-            await postPublicOperation(`/sandboxes/${sandbox.sandbox_id}:enable_snapshots`);
-          }
-        } catch (err: any) {
-          snapshotsNotice = isHiddenOperationError(err)
-            ? 'snapshots are not enabled for your organization'
-            : `enabling snapshots failed: ${err.message || 'request failed'}`;
-        }
-      }
+      // Accepted: the sandbox exists from here on, so whatever happens next
+      // is reported against it rather than through the error path below,
+      // where resubmitting the form would create a second sandbox.
+      const outcome = await settleAcceptedCreate({
+        waitForCreate: values.snapshots
+          ? () => targetOrgId
+            ? waitForAdminOperation(sandbox.operation_id)
+            : waitForPublicOperation(sandbox.operation_id)
+          : undefined,
+        enableSnapshots: values.snapshots
+          ? () => targetOrgId
+            ? forceConsoleSandboxAction(sandbox.sandbox_id, 'enable_snapshots')
+            : postPublicOperation(`/sandboxes/${sandbox.sandbox_id}:enable_snapshots`)
+          : undefined,
+        snapshotsOff: isHiddenOperationError,
+      });
       form.resetFields();
       form.setFieldsValue({
         runtime: 'fc',
@@ -806,10 +801,10 @@ function SandboxesPage() {
         }
       };
       message.open({
-        type: snapshotsNotice ? 'warning' : 'success',
+        type: outcome.type,
         content: (
           <Space size={6}>
-            <span>{snapshotsNotice ? `Sandbox created; ${snapshotsNotice}` : 'Sandbox created'}</span>
+            <span>{outcome.text}</span>
             <Link href={`/dashboard/sandboxes/${sandboxId}`}>
               <code>{sandboxLabelOrId(sandboxId)}</code>
             </Link>
