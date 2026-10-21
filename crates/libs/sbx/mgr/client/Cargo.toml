@@ -21,23 +21,10 @@ test-support = []
 
 [dependencies]
 tokio = { workspace = true, features = ["time"] }
-prost = { workspace = true }
-prost-types = { workspace = true }
 thiserror = { workspace = true }
 tonic = { workspace = true }
-tonic-prost = { workspace = true }
-uuid = { workspace = true }
 
 # internal
 pplx-space-common-core = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
-pplx-space-execution-common = { workspace = true }
-pplx-space-net-common = { workspace = true }
-pplx-space-net-gateway-client = { workspace = true }
-pplx-space-spaced-common = { workspace = true }
-
-[build-dependencies]
-anyhow = { workspace = true }
-pplx-space-spaced-build = { workspace = true }
-pplx-space-common-proto-build = { workspace = true }
-tonic-prost-build = { workspace = true }
+pplx-space-sbx-mgr-protocol = { workspace = true }

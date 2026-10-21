@@ -6832,9 +6832,20 @@ dependencies = [
 name = "pplx-space-sbx-mgr-client"
 version = "0.8.0"
 dependencies = [
- "anyhow",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
+ "pplx-space-sbx-mgr-protocol",
+ "thiserror 2.0.20",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
+name = "pplx-space-sbx-mgr-protocol"
+version = "0.8.0"
+dependencies = [
+ "anyhow",
+ "pplx-space-common-core",
  "pplx-space-common-proto-build",
  "pplx-space-execution-common",
  "pplx-space-net-common",
@@ -6844,7 +6855,6 @@ dependencies = [
  "prost",
  "prost-types",
  "thiserror 2.0.20",
- "tokio",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",

@@ -54,6 +54,7 @@ members = [
     "crates/libs/snapshot/retention",
     "crates/libs/sbx/mgr/client",
     "crates/libs/sbx/mgr/migrations",
+    "crates/libs/sbx/mgr/protocol",
     "crates/libs/sbx/mgr/server",
     "crates/libs/sbx/mgr/store",
     "crates/libs/rustls-provider",
@@ -362,6 +363,7 @@ pplx-space-snapshot-store = { path = "crates/libs/snapshot/store" }
 pplx-space-sbxmgr-migrations = { path = "crates/libs/sbx/mgr/migrations" }
 pplx-space-sbx-mgr = { path = "crates/libs/sbx/mgr/server" }
 pplx-space-sbx-mgr-client = { path = "crates/libs/sbx/mgr/client" }
+pplx-space-sbx-mgr-protocol = { path = "crates/libs/sbx/mgr/protocol" }
 pplx-space-sbx-mgr-store = { path = "crates/libs/sbx/mgr/store" }
 pplx-space-rustls-provider = { path = "crates/libs/rustls-provider" }
 pplx-space-sqlite = { path = "crates/libs/sqlite" }
