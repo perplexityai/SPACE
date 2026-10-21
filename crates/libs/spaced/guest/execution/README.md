@@ -94,6 +94,9 @@ execution metadata.
   retain payload capacity and, after dispatch, execution capacity. Bound uploads
   in the caller, for example with `tokio::time::timeout`; cancellation can retain
   capacity until cleanup settles.
+  After an upload reserves its idempotency key, a stalled upload also blocks
+  retries for the same user and key. Each admitted retry holds its own payload
+  slot while waiting, for up to the retention window.
 - `configure_process_env(EnvMap)` replaces defaults for future process starts;
   request entries override them and `clean_env` skips them. Running processes
   retain their environment. `EnvMap` already enforces the shared key/value,

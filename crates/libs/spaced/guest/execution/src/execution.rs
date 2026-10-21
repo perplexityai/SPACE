@@ -207,6 +207,9 @@ impl ExecutionService {
     /// stream retains payload capacity and, after dispatch, execution capacity.
     /// Callers should bound the upload, for example with `tokio::time::timeout`;
     /// dropping its future cancels the upload but cleanup can retain capacity.
+    /// After an upload reserves its idempotency key, a stalled upload also blocks
+    /// retries for the same user and key. Each admitted retry holds its own payload
+    /// slot while waiting, for up to the retention window.
     pub async fn write_file<S>(
         &self,
         request: Request<S>,
