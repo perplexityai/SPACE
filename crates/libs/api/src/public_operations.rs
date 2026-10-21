@@ -1,6 +1,7 @@
 use pplx_space_common_core::types::{OrgId, UserId};
 
 use pplx_space_common_core::sql;
+use std::num::NonZeroU32;
 use std::str::FromStr;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -1214,6 +1215,20 @@ pub struct ClaimLimits {
     /// kept for other work are not taken by teardowns. With no other work
     /// due, teardowns may take all `total`.
     pub teardown_while_other_due: u32,
+    /// The most operations other than teardowns that one organization may
+    /// have running under a live claim, counting those it already has,
+    /// across every claimer. `None` sets no such limit.
+    pub per_org_non_teardown: Option<OrgSlotLimit>,
+}
+
+/// How many operations other than teardowns one organization may have
+/// running at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrgSlotLimit {
+    /// While another organization also has such work due.
+    pub contended: NonZeroU32,
+    /// While no other organization does; at least `contended`.
+    pub uncontended: NonZeroU32,
 }
 
 impl ClaimLimits {
@@ -1223,6 +1238,7 @@ impl ClaimLimits {
             total,
             non_teardown: total,
             teardown_while_other_due: total,
+            per_org_non_teardown: None,
         }
     }
 }
@@ -1241,6 +1257,10 @@ pub struct ListAdminPublicOperations {
 pub struct PublicOperationClaim {
     pub claim_token: String,
     pub operations: Vec<ClaimedPublicOperation>,
+    /// The claim took nothing although operations were due: each was held
+    /// back by earlier work on its sandbox, its organization's limit, or a
+    /// lack of slots of its class.
+    pub held_back: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1568,6 +1588,7 @@ async fn claim_operations(
         return Ok(PublicOperationClaim {
             claim_token: new_claim_token(),
             operations: Vec::new(),
+            held_back: false,
         });
     }
 
@@ -1604,6 +1625,7 @@ async fn claim_operations(
             return Ok(PublicOperationClaim {
                 claim_token,
                 operations: Vec::new(),
+                held_back: false,
             });
         }
     }
@@ -1625,7 +1647,14 @@ async fn claim_operations(
     // the slots reserved for teardowns free of it. While other work is due, at
     // most `$13` are teardowns, which keeps the slots reserved for other work
     // free of them; with none due, teardowns may take any free slot. The claim
-    // then takes the first `$1` of both, in the same order.
+    // then takes the first `$1` of both, in the same order. With `$15` above
+    // zero, no organization gets more than `$15` operations other than
+    // teardowns running under a live claim while another organization has
+    // such work due, or more than `$16` while none has: `org_slots` counts
+    // the ones it holds and, in claim order, the ones this claim would add.
+    // That rank needs a window, which cannot share a level with `FOR
+    // UPDATE`, so `picked_other` locks the chosen rows by key and re-checks
+    // that each is still claimable.
     let rows = sqlx::query_as::<_, DispatcherClaimRow>(sql!(
         "WITH shared AS (
              SELECT org_id, target_id
@@ -1686,14 +1715,31 @@ async fn claim_operations(
                 OR (NOT sandbox_stale AND head_due AND position > 1)
                 OR (NOT sandbox_stale AND NOT head_due AND NOT first_free_delete)
          ),
-         picked_other AS (
+         org_live AS (
+             SELECT org_id, COUNT(*) AS live
+             FROM public_operations
+             WHERE $15::BIGINT > 0
+               AND state = $5
+               AND claim_token <> ''
+               AND claimed_at > NOW() - make_interval(secs => $2::BIGINT)
+               AND kind = ANY($6)
+               AND kind <> ALL($14)
+             GROUP BY org_id
+         ),
+         other_candidates AS (
              SELECT candidate.operation_id,
+                    candidate.org_id,
                     candidate.next_attempt_at,
                     candidate.requested_at,
                     GREATEST(candidate.requested_at, candidate.next_attempt_at) AS claimable_at,
                     candidate.claim_token <> '' AS reclaimed,
-                    candidate.started_at IS NULL AS first_start
+                    candidate.started_at IS NULL AS first_start,
+                    COALESCE(org_live.live, 0) + ROW_NUMBER() OVER (
+                        PARTITION BY candidate.org_id
+                        ORDER BY candidate.next_attempt_at, candidate.requested_at, candidate.operation_id
+                    ) AS org_slots
              FROM public_operations candidate
+             LEFT JOIN org_live ON org_live.org_id = candidate.org_id
              WHERE candidate.state IN ($4, $5)
                AND candidate.kind = ANY($6)
                AND candidate.kind <> ALL($14)
@@ -1703,8 +1749,41 @@ async fn claim_operations(
                    OR candidate.claimed_at <= NOW() - make_interval(secs => $2::BIGINT)
                )
                AND candidate.operation_id NOT IN (SELECT operation_id FROM blocked)
-             ORDER BY candidate.next_attempt_at ASC, candidate.requested_at ASC, candidate.operation_id ASC
+         ),
+         first_other AS (
+             SELECT operation_id, next_attempt_at, requested_at, claimable_at, reclaimed, first_start
+             FROM other_candidates other
+             WHERE $15::BIGINT = 0
+                OR other.org_slots <= CASE
+                    -- Every candidate's organization is among them, so
+                    -- another organization waits exactly when two do.
+                    WHEN EXISTS (
+                        SELECT 1
+                        FROM other_candidates any_other
+                        WHERE any_other.org_id <> (SELECT org_id FROM other_candidates LIMIT 1)
+                    )
+                    THEN $15
+                    ELSE $16
+                END
+             ORDER BY next_attempt_at ASC, requested_at ASC, operation_id ASC
              LIMIT $12
+         ),
+         picked_other AS (
+             SELECT candidate.operation_id,
+                    first_other.next_attempt_at,
+                    first_other.requested_at,
+                    first_other.claimable_at,
+                    first_other.reclaimed,
+                    first_other.first_start
+             FROM first_other
+             JOIN public_operations candidate
+               ON candidate.operation_id = first_other.operation_id
+             WHERE candidate.state IN ($4, $5)
+               AND candidate.next_attempt_at <= NOW()
+               AND (
+                   candidate.claim_token = ''
+                   OR candidate.claimed_at <= NOW() - make_interval(secs => $2::BIGINT)
+               )
              FOR UPDATE OF candidate SKIP LOCKED
          ),
          picked_teardown AS (
@@ -1789,6 +1868,18 @@ async fn claim_operations(
             .min(input.limits.total),
     ))
     .bind(&teardown_labels)
+    .bind(
+        input
+            .limits
+            .per_org_non_teardown
+            .map_or(0, |limit| i64::from(limit.contended.get())),
+    )
+    .bind(
+        input
+            .limits
+            .per_org_non_teardown
+            .map_or(0, |limit| i64::from(limit.uncontended.get())),
+    )
     .fetch_all(&mut *tx)
     .await?;
 
@@ -1810,6 +1901,27 @@ async fn claim_operations(
         .await?;
         operations.push(operation);
     }
+    // A count, not `EXISTS`: the planner reads `EXISTS` as wanting one early
+    // row and picks a sequential scan, which with many active rows costs more
+    // than the claim; a count reads only the due range of the state index.
+    let held_back = operations.is_empty()
+        && sqlx::query_scalar::<_, bool>(sql!(
+            "SELECT COUNT(*) > 0
+             FROM public_operations
+             WHERE state IN ($1, $2)
+               AND kind = ANY($3)
+               AND next_attempt_at <= NOW()
+               AND (
+                   claim_token = ''
+                   OR claimed_at <= NOW() - make_interval(secs => $4::BIGINT)
+               )"
+        ))
+        .bind(OperationState::Queued.as_str())
+        .bind(OperationState::Running.as_str())
+        .bind(&kind_labels)
+        .bind(duration_secs_i64(input.claim_stale_after))
+        .fetch_one(&mut *tx)
+        .await?;
     tx.commit().await?;
 
     for (operation, wait_ms) in operations.iter().zip(queue_waits) {
@@ -1830,6 +1942,7 @@ async fn claim_operations(
     Ok(PublicOperationClaim {
         claim_token,
         operations,
+        held_back,
     })
 }
 
