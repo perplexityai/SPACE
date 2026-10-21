@@ -1,5 +1,5 @@
 use super::*;
-use pplx_space_common_core::env::Environment;
+use pplx_space_env_vars::Environment;
 
 #[test]
 fn configuration_values_are_owned_and_preserve_non_unicode() {

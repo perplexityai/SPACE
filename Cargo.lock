@@ -7364,7 +7364,7 @@ name = "pplx-space-test-env"
 version = "0.8.0"
 dependencies = [
  "nix 0.31.3",
- "pplx-space-common-core",
+ "pplx-space-env-vars",
  "tempfile",
 ]
 

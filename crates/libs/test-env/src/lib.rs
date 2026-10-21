@@ -230,7 +230,7 @@ impl TestEnv {
     }
 }
 
-impl pplx_space_common_core::env::Environment for TestEnv {
+impl pplx_space_env_vars::Environment for TestEnv {
     fn var_os(&self, name: &str) -> Option<OsString> {
         self.0.get(name).cloned()
     }
