@@ -170,9 +170,15 @@ RUST_DEPENDENCY_INPUTS = (
 RUST_ARTIFACT_COMMON_INPUTS = (
     Path("ci/scripts/run-space-bundle-builds.py"),
     Path("ci/runtime-capabilities.json"),
+    Path(".cargo/config.toml"),
     Path(".dockerignore"),
+    Path("Cargo.toml"),
+    Path("Cargo.lock"),
+    Path("rust-toolchain.toml"),
     Path("proto"),
-    *RUST_DEPENDENCY_INPUTS,
+    Path("docker/Dockerfile.rust-build-common"),
+    Path("docker/run-cargo-with-sccache.sh"),
+    Path("infra/space/identity/node-identities.sh"),
 )
 RUST_ARTIFACT_TEMPLATE_RECIPES = (
     Path("templates/firecracker/recipes/seed.toml"),
@@ -562,10 +568,14 @@ def repository_inputs_digest(
 class RustPackage:
     # The names `cargo metadata` gives the package's binary targets.
     binaries: frozenset[str]
-    # The packages it names by path as normal or build dependencies, on any
+    # The workspace packages it names as normal or build dependencies, on any
     # target platform, optional ones included: the edges a release build of
     # its binaries can follow.
     dependencies: frozenset[Path]
+
+
+RUST_DEPENDENCY_TABLES = ("dependencies", "build-dependencies", "build_dependencies")
+RUST_DEV_DEPENDENCY_TABLES = ("dev-dependencies", "dev_dependencies")
 
 
 def read_cargo_manifest(path: Path) -> dict[str, Any]:
@@ -608,49 +618,88 @@ def rust_binaries(package_root: Path, manifest: dict[str, Any]) -> frozenset[str
     )
 
 
+def rust_local_overrides(source_root: Path, root_manifest: dict[str, Any]) -> list[str]:
+    """The local crates that `[patch]`, `[replace]` or `paths` build in place
+    of the crates they name, from the root manifest and `.cargo/config.toml`."""
+    config_path = source_root / ".cargo/config.toml"
+    config = read_cargo_manifest(config_path) if config_path.exists() else {}
+    paths = list(config.get("paths", []))
+    for source in (root_manifest, config):
+        for table in (*source.get("patch", {}).values(), source.get("replace", {})):
+            paths.extend(
+                spec["path"]
+                for spec in table.values()
+                if isinstance(spec, dict) and "path" in spec
+            )
+    return paths
+
+
 def rust_workspace_packages(source_root: Path) -> dict[Path, RustPackage]:
     """Read each workspace package from its manifest. As in Cargo, a path
-    dependency is a member whether or not `members` lists it."""
-    workspace = read_cargo_manifest(source_root / "Cargo.toml")["workspace"]
-    if "exclude" in workspace or any(
-        set(member) & set("*?[") for member in workspace["members"]
+    dependency is a member whether or not `members` lists it, and as in
+    `cargo metadata`, a dependency reaches the member with its package name
+    from any source, so a member that a `[patch]` substitutes is covered."""
+    root_manifest = read_cargo_manifest(source_root / "Cargo.toml")
+    workspace = root_manifest.get("workspace", {})
+    if (
+        "package" in root_manifest
+        or "exclude" in workspace
+        or any(set(member) & set("*?[") for member in workspace.get("members", []))
     ):
-        raise SystemExit("Rust artifact inputs support no workspace globs or excludes")
-    workspace_paths = {
-        name: repository_relative(Path(spec["path"]))
-        for name, spec in workspace.get("dependencies", {}).items()
-        if isinstance(spec, dict) and "path" in spec
-    }
+        raise SystemExit(
+            "Rust artifact inputs need a virtual workspace root with literal members"
+        )
+    workspace_dependencies = workspace.get("dependencies", {})
 
-    packages: dict[Path, RustPackage] = {}
-    pending = [repository_relative(Path(member)) for member in workspace["members"]]
+    manifests: dict[Path, dict[str, Any]] = {}
+    dependency_names: dict[Path, set[str]] = {}
+    pending = [Path(member) for member in workspace.get("members", [])]
     while pending:
-        directory = pending.pop()
-        if directory in packages:
+        directory = repository_relative(pending.pop())
+        if directory in manifests:
             continue
         manifest = read_cargo_manifest(source_root / directory / "Cargo.toml")
-        dependencies: set[Path] = set()
+        manifests[directory] = manifest
+        names = dependency_names[directory] = set()
         for table in (manifest, *manifest.get("target", {}).values()):
-            for kind in ("dependencies", "build-dependencies", "dev-dependencies"):
-                for name, spec in table.get(kind, {}).items():
-                    if not isinstance(spec, dict):
-                        continue
-                    if spec.get("workspace"):
-                        path = workspace_paths.get(name)
-                    elif "path" in spec:
-                        path = repository_relative(directory / spec["path"])
-                    else:
-                        path = None
-                    if path is None:
-                        continue
-                    pending.append(path)
-                    if kind != "dev-dependencies":
-                        dependencies.add(path)
-        packages[directory] = RustPackage(
-            binaries=rust_binaries(source_root / directory, manifest),
-            dependencies=frozenset(dependencies),
+            for kind in (*RUST_DEPENDENCY_TABLES, *RUST_DEV_DEPENDENCY_TABLES):
+                for key, spec in table.get(kind, {}).items():
+                    base, package = directory, key
+                    if isinstance(spec, dict) and spec.get("workspace"):
+                        spec, base = workspace_dependencies.get(key, key), Path()
+                    if isinstance(spec, dict):
+                        if "path" in spec:
+                            pending.append(base / spec["path"])
+                        package = spec.get("package", key)
+                    if kind in RUST_DEPENDENCY_TABLES:
+                        names.add(package)
+
+    # No lane would hash the sources of a substitute outside the workspace.
+    outside = [
+        path
+        for path in rust_local_overrides(source_root, root_manifest)
+        if repository_relative(Path(path)) not in manifests
+    ]
+    if outside:
+        raise SystemExit(
+            "Rust artifact inputs cover no local override outside the workspace "
+            f"members: {', '.join(outside)}"
         )
-    return packages
+    directory_by_name = {
+        manifest["package"]["name"]: directory
+        for directory, manifest in manifests.items()
+    }
+    return {
+        directory: RustPackage(
+            binaries=rust_binaries(source_root / directory, manifest),
+            dependencies=frozenset(
+                directory_by_name[name]
+                for name in dependency_names[directory]
+                if name in directory_by_name
+            ),
+        )
+        for directory, manifest in manifests.items()
+    }
 
 
 def rust_artifact_packages(feature: str, source_root: Path = REPO_ROOT) -> tuple[Path, ...]:

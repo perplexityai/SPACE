@@ -80,10 +80,13 @@ def fixture_workspace(root: Path) -> None:
     write(
         root,
         "Cargo.toml",
-        '[workspace]\nresolver = "2"\nmembers = ["apps/svc", "apps/other"]\n'
+        '[workspace]\nresolver = "2"\n'
+        'members = ["apps/svc", "apps/other", "apps/manual", "libs/patched"]\n'
         "[workspace.dependencies]\n"
         'fixture-core = { path = "libs/core" }\n'
-        'shared = { path = "libs/shared-impl", package = "fixture-shared-impl" }\n',
+        'shared = { path = "libs/shared-impl", package = "fixture-shared-impl" }\n'
+        "[patch.crates-io]\n"
+        'fixture-patched = { path = "libs/patched" }\n',
     )
     write(
         root,
@@ -95,6 +98,7 @@ def fixture_workspace(root: Path) -> None:
         "shared = { workspace = true }\n"
         'alias = { path = "../../libs/aliased", package = "fixture-aliased" }\n'
         'optional = { path = "../../libs/optional", optional = true, package = "fixture-optional" }\n'
+        'fixture-patched = "0.1"\n'
         'anyhow = "1"\n'
         "[build-dependencies]\n"
         'build-helper = { path = "../../libs/build-helper", package = "fixture-build-helper" }\n'
@@ -112,17 +116,27 @@ def fixture_workspace(root: Path) -> None:
         '[[bin]]\nname = "other-main"\npath = "src/main.rs"\n'
         '[dependencies]\nunrelated = { path = "../../libs/unrelated", package = "fixture-unrelated" }\n',
     )
-    write(root, "apps/other/src/main.rs", "fn main() {}\n")
-    write(root, "apps/other/src/bin/other-tool.rs", "fn main() {}\n")
+    for path in ("src/main.rs", "src/bin/other-tool.rs", "src/bin/sub/main.rs"):
+        write(root, f"apps/other/{path}", "fn main() {}\n")
+    write(
+        root,
+        "apps/manual/Cargo.toml",
+        '[package]\nname = "fixture-manual"\nversion = "0.1.0"\nedition = "2021"\n'
+        'autobins = false\n[[bin]]\nname = "manual-tool"\npath = "src/tool.rs"\n',
+    )
+    for path in ("src/main.rs", "src/tool.rs", "src/bin/skipped.rs"):
+        write(root, f"apps/manual/{path}", "fn main() {}\n")
     write(
         root,
         "libs/core/Cargo.toml",
         '[package]\nname = "fixture-core"\nversion = "0.1.0"\nedition = "2021"\n'
-        '[dependencies]\ndeep = { path = "../deep", package = "fixture-deep" }\n',
+        '[dependencies]\ndeep = { path = "../deep", package = "fixture-deep" }\n'
+        # The spelling editions before 2024 still accept.
+        '[build_dependencies]\nlegacy = { path = "../legacy-build", package = "fixture-legacy-build" }\n',
     )
     for directory in (
         "shared-impl", "aliased", "optional", "build-helper", "windows-only",
-        "test-only", "unrelated", "deep",
+        "test-only", "unrelated", "deep", "legacy-build", "patched",
     ):
         write(
             root,
@@ -140,8 +154,13 @@ def test_a_lane_covers_what_its_binaries_reach_without_dev_dependencies(tmp_path
         "RUST_ARTIFACT_BINARIES",
         {
             "tool": ("fixture-tool",),
-            "other": ("other-tool", "other-main"),
-            "missing": ("fixture-svc", "fixture-other", "gone"),
+            "other": ("other-tool", "other-main", "sub"),
+            # The first three exist. An explicit target at src/main.rs replaces
+            # the one named after the package, and autobins = false infers none.
+            "missing": (
+                "fixture-svc", "manual-tool", "sub",
+                "fixture-other", "fixture-manual", "skipped", "gone",
+            ),
         },
     )
 
@@ -153,7 +172,9 @@ def test_a_lane_covers_what_its_binaries_reach_without_dev_dependencies(tmp_path
             "libs/build-helper",
             "libs/core",
             "libs/deep",
+            "libs/legacy-build",
             "libs/optional",
+            "libs/patched",
             "libs/shared-impl",
             "libs/windows-only",
         )
@@ -162,11 +183,61 @@ def test_a_lane_covers_what_its_binaries_reach_without_dev_dependencies(tmp_path
         Path("apps/other"),
         Path("libs/unrelated"),
     )
-    # An explicit target at src/main.rs replaces the one named after the package.
-    with pytest.raises(SystemExit, match="Rust binaries: fixture-other, gone$"):
+    with pytest.raises(
+        SystemExit, match="Rust binaries: fixture-manual, fixture-other, gone, skipped$"
+    ):
         bundle_builds.rust_artifact_packages("missing", tmp_path)
     if cargo() is not None:
         assert bundle_builds.rust_workspace_packages(tmp_path) == cargo_packages(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("path", "old", "new", "error"),
+    [
+        ("Cargo.toml", "members = [", 'members = ["vendor/*", ', "literal members"),
+        ("Cargo.toml", "[workspace]\n", '[workspace]\nexclude = ["vendor"]\n', "literal members"),
+        (
+            "Cargo.toml",
+            "[workspace]\n",
+            '[package]\nname = "fixture-root"\nversion = "0.1.0"\n[workspace]\n',
+            "virtual workspace root",
+        ),
+        (
+            "apps/svc/Cargo.toml",
+            "[dependencies]\n",
+            '[dependencies]\noutside = { path = "../../../outside" }\n',
+            "leaves the repository",
+        ),
+        (
+            "Cargo.toml",
+            "[patch.crates-io]\n",
+            '[patch.crates-io]\nfixture-vendored = { path = "vendor/fixture-vendored" }\n',
+            "outside the workspace members: vendor/fixture-vendored$",
+        ),
+        (
+            ".cargo/config.toml",
+            "",
+            'paths = ["vendor/fixture-vendored"]\n',
+            "outside the workspace members: vendor/fixture-vendored$",
+        ),
+    ],
+)
+def test_a_workspace_the_reader_cannot_cover_fails_loudly(tmp_path, path, old, new, error):
+    fixture_workspace(tmp_path)
+    existing = (tmp_path / path).read_text() if (tmp_path / path).exists() else ""
+    assert old in existing
+    write(tmp_path, path, existing.replace(old, new, 1))
+    with pytest.raises(SystemExit, match=error):
+        bundle_builds.rust_workspace_packages(tmp_path)
+
+
+def test_every_lane_resolves_and_hashes_on_this_workspace():
+    # What a registry-pushing build does before it reuses an artifact: a
+    # renamed binary or a moved input fails here rather than there.
+    for lane in bundle_builds.RUST_ARTIFACT_BINARIES:
+        bundle_builds.repository_inputs_digest(
+            REPO_ROOT, bundle_builds.rust_artifact_inputs(lane), namespace=lane
+        )
 
 
 @pytest.mark.skipif(cargo() is None, reason="cargo not installed")
