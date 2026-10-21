@@ -306,9 +306,10 @@ pub(crate) enum ProcessEventId {
 const PROCESS_EVENT_ID_TAG_BIT: u32 = 52;
 const PROCESS_EVENT_ID_TAG: u64 = 1 << PROCESS_EVENT_ID_TAG_BIT;
 const PROCESS_EVENT_ID_GUARD_BITS: u32 = 16;
-/// Frames at one position: those sent between two outputs, such as a
-/// resume's `process_started` or a backend reconnect's two frames. The rest
-/// of the 36 bits below the tag go to positions, up to 2^27 - 1 outputs.
+/// Identified frames at one position: output moves it, so only
+/// `resync_required` frames share one (see [`process_frame_has_event_id`]).
+/// The rest of the 36 bits below the tag go to positions: ids carry one for a
+/// process's first 2^27 - 1 outputs.
 const PROCESS_EVENT_ID_FRAME_BITS: u32 = 8;
 const PROCESS_EVENT_ID_FIELD_SHIFT: u32 = PROCESS_EVENT_ID_GUARD_BITS + PROCESS_EVENT_ID_FRAME_BITS;
 const PROCESS_EVENT_ID_FIELD_BITS: u32 = PROCESS_EVENT_ID_TAG_BIT - PROCESS_EVENT_ID_FIELD_SHIFT;
@@ -561,9 +562,11 @@ impl ProcessSseState {
             DataPlaneServerFrame::ProcessStarted { .. } => self.started_sent = true,
             _ => {}
         }
-        self.event_id = self.event_id.next(self.backend_output_cursor);
-        self.pending
-            .push_back(sse_event_from_frame(&frame, Some(self.event_id.encode())));
+        let id = process_frame_has_event_id(&frame).then(|| {
+            self.event_id = self.event_id.next(self.backend_output_cursor);
+            self.event_id.encode()
+        });
+        self.pending.push_back(sse_event_from_frame(&frame, id));
     }
 
     fn finish(&mut self, result: &'static str) {
@@ -882,6 +885,19 @@ async fn next_process_sse_frame(state: &mut ProcessSseState) -> Option<Event> {
             }
         }
     }
+}
+
+/// Whether a process stream frame carries an SSE id: only one that moves the
+/// client's position does. That is output, and `resync_required`, which
+/// acknowledges a gap, so a resume from it continues past the gap without
+/// reporting it again; a gap moves the position, so it never repeats at one.
+/// Every other frame (`process_started`, `process_exited`, a backend
+/// reconnect's, `error`, `closed`) leaves the client's last id unchanged, so
+/// resumes and reconnects against an idle process spend no frames of the
+/// [`ProcessEventId`] at its position.
+fn process_frame_has_event_id(frame: &DataPlaneServerFrame) -> bool {
+    process_frame_advances_backend_cursor(frame)
+        || matches!(frame, DataPlaneServerFrame::ResyncRequired { .. })
 }
 
 /// Backend reopens after an output window miss, without output or an exit

@@ -687,13 +687,14 @@ async function readStream(resumeFrom, onEvent) {
   // replaying output already received or asking to resync, and the exited
   // process still reports its exit.
   const resumeFrom = lastEventId;
-  const resume = { attached_first: null, ids_continue: null, resync: null, stdout: '', exit_code: null };
+  const resume = { attached_first: null, ids_continue: true, resync: null, stdout: '', exit_code: null };
   let seen = 0;
   await readStream(resumeFrom, (event) => {
     const frame = event.data;
     seen += 1;
     if (seen === 1) resume.attached_first = frame.type === 'attached' && event.id === null;
-    if (event.id !== null && resume.ids_continue === null) resume.ids_continue = BigInt(event.id) > BigInt(resumeFrom);
+    // Only output and resync_required carry ids; any sent follow Last-Event-ID.
+    if (event.id !== null && BigInt(event.id) <= BigInt(resumeFrom)) resume.ids_continue = false;
     if (frame.type === 'resync_required' && resume.resync === null) resume.resync = frame.reason;
     if (frame.type === 'stdout') resume.stdout += Buffer.from(frame.data_base64, 'base64').toString('utf8');
     if (frame.type === 'process_exited') {

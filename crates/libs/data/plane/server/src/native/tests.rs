@@ -1967,17 +1967,18 @@ async fn process_events_to_close(
 ) -> Vec<(Option<u64>, serde_json::Value)> {
     let (_state, mut chunks) = open_process_events(endpoint, session_id, last_event_id).await;
     let mut seen = String::new();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         while let Some(chunk) = chunks.recv().await {
             seen.push_str(&chunk);
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("stream ends within 5s; saw {seen}"));
+    .unwrap_or_else(|_| panic!("stream ends within 30s; saw {seen}"));
     let frames = sse_frames(&seen);
     assert_eq!(frames.last().unwrap().1["type"], "closed", "{seen}");
     let ids: Vec<u64> = frames.iter().filter_map(|(id, _)| *id).collect();
     assert!(ids.is_sorted_by(|a, b| a < b), "ids increase: {ids:?}");
+    assert_identified_frames(&frames);
     frames
 }
 
@@ -1989,6 +1990,22 @@ fn assert_ids_above(frames: &[(Option<u64>, serde_json::Value)], last_event_id: 
         ids.iter().all(|id| *id > last_event_id),
         "ids {ids:?} after Last-Event-ID {last_event_id}"
     );
+}
+
+/// The id a client resumes from: the last one it received.
+fn last_id(frames: &[(Option<u64>, serde_json::Value)]) -> u64 {
+    frames.iter().rev().find_map(|(id, _)| *id).unwrap()
+}
+
+/// Only output and `resync_required` carry an id.
+fn assert_identified_frames(frames: &[(Option<u64>, serde_json::Value)]) {
+    for (id, frame) in frames {
+        let identified = matches!(
+            frame["type"].as_str(),
+            Some("stdout" | "stderr" | "resync_required")
+        );
+        assert_eq!(id.is_some(), identified, "{frame}");
+    }
 }
 
 fn connects(cursors: &[Option<u64>]) -> Vec<FakeOpen> {
@@ -2037,7 +2054,7 @@ async fn process_resume_continues_after_the_last_event_id() {
         .take_while(|(_, frame)| frame["seq"] != 3)
         .cloned()
         .collect();
-    let last_event_id = received.last().unwrap().0.unwrap();
+    let last_event_id = last_id(&received);
 
     let resumed = process_events_to_close(&fake.endpoint, session_id, Some(last_event_id)).await;
 
@@ -2128,7 +2145,7 @@ async fn evicted_output_on_an_older_guest_is_reported_before_the_live_tail() {
         "{frames:?}"
     );
 
-    let last_event_id = frames.last().unwrap().0.unwrap();
+    let last_event_id = last_id(&frames);
     let resumed = process_events_to_close(&fake.endpoint, session_id, Some(last_event_id)).await;
     assert_eq!(
         resync_reasons(&resumed),
@@ -2308,6 +2325,113 @@ async fn window_miss_reopen_refreshes_a_refused_route() {
     );
 }
 
+/// Backend reconnects and client resumes before a process's next output.
+const IDLE_ROUNDS: usize = 300;
+
+/// The id of the output after the two lines the idle fakes start with.
+fn third_line_id() -> u64 {
+    ProcessEventId::Position {
+        position: 3,
+        frame: 0,
+    }
+    .encode()
+}
+
+/// How an idle fake answers `open`, the `opened`th: the lines from its cursor,
+/// then, once `rounds` opens have gone by, a third line and the exit.
+/// `fails` ends each earlier stream as an unavailable backend.
+fn idle_replies(rounds: usize, fails: bool, opened: usize, open: FakeOpen) -> Vec<FakeReply> {
+    let FakeOpen::Connect(Some(cursor)) = open else {
+        panic!("unexpected open {open:?}");
+    };
+    let lines = ["one\n", "two\n", "three\n"];
+    let written = if opened > rounds { 3 } else { 2 };
+    let mut replies = vec![connected()];
+    replies.extend(
+        lines[..written]
+            .iter()
+            .skip(cursor as usize)
+            .map(|line| stdout(line)),
+    );
+    if opened > rounds {
+        replies.push(exited());
+    } else if fails {
+        replies.push(end(tonic::Code::Unavailable));
+    }
+    replies
+}
+
+/// The id of the frame that carries the third line.
+fn third_line_frame_id(frames: &[(Option<u64>, serde_json::Value)]) -> Option<u64> {
+    frames_of_type(frames, "stdout")
+        .find(|(_, frame)| frame["seq"] == 3)
+        .and_then(|(id, _)| *id)
+}
+
+/// Frames that carry no output carry no id either, so resumes against an
+/// idle process, however many, spend none of the ids at its position: the
+/// next output still carries it.
+#[tokio::test]
+async fn idle_resumes_keep_positional_ids() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_journal_fake(
+        session_id,
+        true,
+        Arc::new(|opened, open| idle_replies(IDLE_ROUNDS, false, opened, open)),
+    )
+    .await;
+    let (_state, mut chunks) = open_process_events(&fake.endpoint, session_id, None).await;
+    let mut seen = String::new();
+    read_until(&mut chunks, &mut seen, &BASE64_STANDARD.encode("two\n")).await;
+    read_until(&mut chunks, &mut seen, "\n\n").await;
+    drop(chunks);
+    // Each resume reports the process and is dropped; like an EventSource,
+    // the client resumes from the last id it has received.
+    let mut last_event_id = last_id(&sse_frames(&seen));
+    for _ in 0..IDLE_ROUNDS {
+        let (_state, mut chunks) =
+            open_process_events(&fake.endpoint, session_id, Some(last_event_id)).await;
+        let mut seen = String::new();
+        read_until(&mut chunks, &mut seen, "process_started").await;
+        read_until(&mut chunks, &mut seen, "\n\n").await;
+        if let Some(id) = sse_frames(&seen).iter().rev().find_map(|(id, _)| *id) {
+            last_event_id = id;
+        }
+    }
+    let resumed = process_events_to_close(&fake.endpoint, session_id, Some(last_event_id)).await;
+    assert_eq!(stdout_text(&resumed), "three\n");
+    assert_eq!(third_line_frame_id(&resumed), Some(third_line_id()));
+}
+
+/// Likewise, backend reconnects before the next output spend no ids at the
+/// position, however many there are.
+#[tokio::test]
+async fn idle_backend_reconnects_keep_positional_ids() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_journal_fake(
+        session_id,
+        true,
+        Arc::new(|opened, open| idle_replies(IDLE_ROUNDS, true, opened, open)),
+    )
+    .await;
+
+    let frames = process_events_to_close(&fake.endpoint, session_id, None).await;
+
+    assert_eq!(
+        frames_of_type(&frames, "backend_reconnected").count(),
+        IDLE_ROUNDS + 1
+    );
+    assert_eq!(resync_reasons(&frames), Vec::<String>::new());
+    assert_eq!(stdout_text(&frames), "one\ntwo\nthree\n");
+    assert_eq!(third_line_frame_id(&frames), Some(third_line_id()));
+}
+
 /// A bound attach whose first backend stream fails before it reports the
 /// process still sends `process_started` once, from the reopened stream.
 #[tokio::test]
@@ -2475,7 +2599,7 @@ async fn starting_attach_ignores_a_foreign_last_event_id() {
     assert_eq!(resync_reasons(&first), ["cursor_out_of_window"]);
     assert_eq!(stdout_text(&first), "one\ntwo\n");
 
-    let last_event_id = first.last().unwrap().0.unwrap();
+    let last_event_id = last_id(&first);
     let resumed = process_events_to_close(&fake.endpoint, session_id, Some(last_event_id)).await;
 
     assert_ids_above(&resumed, last_event_id);

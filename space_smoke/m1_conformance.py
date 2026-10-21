@@ -634,12 +634,12 @@ class M1Conformance:
             )
             if not second.attached_first:
                 raise InvariantViolation("reconnected stream did not start with an attached frame")
-            if not second.identified:
-                raise InvariantViolation("reconnected stream delivered no identified events")
-            first_id, _ = second.identified[0]
-            if first_id <= first.last_id:
+            # Only output and resync_required carry ids, so a resume that sends
+            # neither has none; any it does send must follow Last-Event-ID.
+            if second.identified and second.identified[0][0] <= first.last_id:
                 raise InvariantViolation(
-                    f"resumed stream restarted ids at {first_id}, after {first.last_id}"
+                    f"resumed stream restarted ids at {second.identified[0][0]}, "
+                    f"after {first.last_id}"
                 )
             resyncs = [frame for frame in resumed if frame.get("type") == "resync_required"]
             if resyncs:
@@ -668,7 +668,8 @@ class M1Conformance:
     ) -> SessionRead:
         """Read one SSE connection until `stop()` holds, asserting id monotonicity.
 
-        Every identified frame must carry a greater id than the one before;
+        Every identified frame must carry a greater id than the one before, and
+        on a process stream only output and resync_required frames carry one;
         `on_connected` runs once the stream reports the process (started or
         reconnected), so process control can be exercised while attached.
         """
@@ -685,6 +686,10 @@ class M1Conformance:
                 if first:
                     result.attached_first = frame.get("type") == "attached" and frame_id is None
                     first = False
+                if (frame_id is not None) != (
+                    frame.get("type") in {"stdout", "stderr", "resync_required"}
+                ):
+                    raise InvariantViolation(f"unexpected SSE id {frame_id} on {frame}")
                 if frame_id is not None:
                     if result.last_id is not None and frame_id <= result.last_id:
                         raise InvariantViolation(
