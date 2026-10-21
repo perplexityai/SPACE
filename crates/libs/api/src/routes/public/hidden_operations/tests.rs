@@ -131,16 +131,16 @@ fn the_flag_master_closes_every_org_the_flag_opened_and_none_the_list_did() {
         orgs: EnabledOrgs::Listed(BTreeSet::from([listed])),
         flag_enabled,
     };
-    for (flag_enabled, org, expected) in [
-        (true, flagged, true),
-        (false, flagged, false),
-        (true, listed, true),
-        (false, listed, true),
+    for (flag_enabled, case, org, expected) in [
+        (true, "flagged org", flagged, true),
+        (false, "flagged org", flagged, false),
+        (true, "listed org", listed, true),
+        (false, "listed org", listed, true),
     ] {
         assert_eq!(
             gate(flag_enabled).allows(&flags, org, native::LIST_SNAPSHOTS),
             expected,
-            "master {flag_enabled}, org {org}"
+            "master {flag_enabled}, {case}"
         );
         assert!(gate(flag_enabled).allows(&flags, org, native::LIST_PROCESSES));
     }
