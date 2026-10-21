@@ -320,22 +320,36 @@ where
                 let max_age_seconds = deadline
                     .expect("deadline is configured when it is exceeded")
                     .as_secs();
-                let terminal_error_code = PublicErrorCode::OperationFailed;
+                // A requeue that carries the error it stands for (as an
+                // exhausted retry budget records it) names the cause: its
+                // code, and its fields beside the deadline's evidence.
+                let terminal_error_code = result
+                    .terminal_error_code
+                    .unwrap_or(PublicErrorCode::OperationFailed);
+                let mut terminal_error_json = serde_json::json!({
+                    "operation_id": operation_id.to_string(),
+                    "kind": kind.as_str(),
+                    "reason": "operation_deadline_exceeded",
+                    "max_age_seconds": max_age_seconds,
+                    "last_requeue_reason": last_requeue_reason,
+                    "last_progress_message": last_progress_message,
+                    "attempts": attempts,
+                });
+                if let (Some(evidence), Some(serde_json::Value::Object(cause))) = (
+                    terminal_error_json.as_object_mut(),
+                    result.terminal_error_json,
+                ) {
+                    for (field, value) in cause {
+                        evidence.entry(field).or_insert(value);
+                    }
+                }
                 let updated = store
                     .fail_claimed_operation(FailClaimedPublicOperation {
                         claim_token,
                         operation_id,
                         progress_message: m1_deadline_message(max_age_seconds),
                         terminal_error_code: terminal_error_code.clone(),
-                        terminal_error_json: serde_json::json!({
-                            "operation_id": operation_id.to_string(),
-                            "kind": kind.as_str(),
-                            "reason": "operation_deadline_exceeded",
-                            "max_age_seconds": max_age_seconds,
-                            "last_requeue_reason": last_requeue_reason,
-                            "last_progress_message": last_progress_message,
-                            "attempts": attempts,
-                        }),
+                        terminal_error_json,
                     })
                     .await?;
                 if updated {

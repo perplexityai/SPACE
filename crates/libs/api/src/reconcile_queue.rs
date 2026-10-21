@@ -92,6 +92,26 @@ pub async fn any_creating_snapshot_for_sandbox(
     Ok(row.is_some())
 }
 
+/// How long the oldest snapshot holding off a user DELETE — the rows
+/// [`any_creating_snapshot_for_sandbox`] matches — has been `creating`, or
+/// `None` when no such row remains.
+pub async fn oldest_creating_snapshot_age(
+    pool: &PgPool,
+    sandbox_id: SandboxId,
+) -> Result<Option<std::time::Duration>, sqlx::Error> {
+    let age_secs: Option<f64> = sqlx::query_scalar(sql!(
+        "SELECT EXTRACT(EPOCH FROM NOW() - MIN(\"timestamp\"))::DOUBLE PRECISION
+         FROM snapshots
+         WHERE sandbox_id = $1
+           AND state = 'creating'
+           AND artifact_origin IS DISTINCT FROM 'fork'"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(age_secs.map(|secs| std::time::Duration::from_secs_f64(secs.max(0.0))))
+}
+
 /// Variant of [`finalize_sandbox_db_delete`] safe for user-facing
 /// DELETEs: refuses to orphan storage-location rows while any
 /// `snapshots` row for the sandbox is in `state='creating'`. See

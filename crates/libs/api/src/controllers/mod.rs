@@ -59,7 +59,16 @@ enum ControllerErrorKind {
     /// A DELETE refused because a suspend's snapshot upload is still in
     /// flight. Carried so the native delete executor can wait for the upload
     /// to finalize instead of failing the operation.
-    SuspendUploadInFlight,
+    SuspendUploadInFlight(SuspendUploadCheck),
+}
+
+/// Which delete check found a suspend-snapshot upload in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SuspendUploadCheck {
+    /// The pre-flight check, before any runtime teardown.
+    Preflight,
+    /// The locked check at finalize, after the runtime was torn down.
+    Locked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -297,14 +306,22 @@ impl ControllerError {
         matches!(self.kind, ControllerErrorKind::SandboxAlreadyExists)
     }
 
-    pub(crate) fn suspend_upload_in_flight(message: impl Into<String>) -> Self {
+    pub(crate) fn suspend_upload_in_flight(
+        check: SuspendUploadCheck,
+        message: impl Into<String>,
+    ) -> Self {
         let mut error = Self::conflict(message);
-        error.kind = ControllerErrorKind::SuspendUploadInFlight;
+        error.kind = ControllerErrorKind::SuspendUploadInFlight(check);
         error
     }
 
-    pub(crate) const fn is_suspend_upload_in_flight(&self) -> bool {
-        matches!(self.kind, ControllerErrorKind::SuspendUploadInFlight)
+    /// The check that refused this DELETE for an in-flight suspend-snapshot
+    /// upload, if that is what it is.
+    pub(crate) const fn suspend_upload_in_flight_check(&self) -> Option<SuspendUploadCheck> {
+        match self.kind {
+            ControllerErrorKind::SuspendUploadInFlight(check) => Some(check),
+            _ => None,
+        }
     }
 
     pub fn precondition_failed(message: impl Into<String>) -> Self {

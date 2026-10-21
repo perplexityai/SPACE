@@ -119,8 +119,14 @@ fn is_retryable_finalize_sandbox_db_delete_error(err: &sqlx::Error) -> bool {
 /// in-flight-suspend gate refuses a DELETE. Used both at the
 /// pre-flight check (before runtime teardown) and at the locked
 /// check inside the finalize transaction.
-fn in_flight_suspend_upload_conflict() -> ControllerError {
+///
+/// Neither check emits `DeleteFailed`: the native delete executor may wait
+/// for the upload and retry, so the caller that settles the outcome emits it.
+fn in_flight_suspend_upload_conflict(
+    check: crate::controllers::SuspendUploadCheck,
+) -> ControllerError {
     ControllerError::suspend_upload_in_flight(
+        check,
         "sandbox has a suspend-snapshot upload in flight; \
          retry the DELETE after the snapshot finalizes",
     )
@@ -1372,24 +1378,14 @@ impl SandboxController {
             }
             mapped
         })? {
-            SandboxEvent::new(
-                event_sandbox_id,
-                SandboxEventType::DeleteFailed,
-                SandboxEventSource::Api,
-            )
-            .emit_with(
-                SandboxEventDetails::default()
-                    .action("delete")
-                    .reason("in_flight_suspend_upload")
-                    .routine()
-                    .trigger(SandboxEventTrigger::User),
-            );
             tracing::info!(
                 sandbox_id = %id,
                 "rejecting sandbox DELETE pre-flight: \
                  suspend-snapshot upload in flight"
             );
-            return Err(in_flight_suspend_upload_conflict());
+            return Err(in_flight_suspend_upload_conflict(
+                crate::controllers::SuspendUploadCheck::Preflight,
+            ));
         }
         // Publish delete intent while holding the same lifecycle lock as fork
         // admission. New forks are denied from this commit through runtime
@@ -1434,24 +1430,14 @@ impl SandboxController {
                 // but the prior lifecycle is restored so the user can
                 // retry DELETE after the upload finalizes.
                 FinalizeSandboxDbDeleteError::InFlightSuspendUpload => {
-                    SandboxEvent::new(
-                        event_sandbox_id,
-                        SandboxEventType::DeleteFailed,
-                        SandboxEventSource::Api,
-                    )
-                    .emit_with(
-                        SandboxEventDetails::default()
-                            .action("delete")
-                            .reason("in_flight_suspend_upload_locked")
-                            .routine()
-                            .trigger(SandboxEventTrigger::User),
-                    );
                     tracing::info!(
                         sandbox_id = %id,
                         "rejecting sandbox DELETE at locked check: \
                          suspend-snapshot upload landed mid-delete"
                     );
-                    in_flight_suspend_upload_conflict()
+                    in_flight_suspend_upload_conflict(
+                        crate::controllers::SuspendUploadCheck::Locked,
+                    )
                 }
                 FinalizeSandboxDbDeleteError::ForkInProgress => fork_in_progress_conflict(),
                 FinalizeSandboxDbDeleteError::Db(err) => {
