@@ -675,7 +675,11 @@ impl PublicOperationStore {
             find_idempotency_record(&mut tx, org_id, api_product, idempotency).await?,
             idempotency,
         );
-        Ok(PublicOperationAdmission { tx, observation })
+        Ok(PublicOperationAdmission {
+            tx,
+            observation,
+            sandbox_quota: None,
+        })
     }
 
     pub async fn observe_operation_idempotency(
@@ -1001,9 +1005,86 @@ async fn claim_created_operation_tx(
     Ok((claim_token, operation))
 }
 
+/// The sandboxes a native caller holds against its quota, after taking the
+/// per-org quota lock (see [`PublicOperationAdmission::create_within_quota_tx`]).
+///
+/// It counts what the caller can see and delete through the native API: the
+/// org's sandboxes that are not terminal (`failed`, `quarantined`, `deleted`,
+/// `cleanup_required`, the set the lifecycle guards treat as final) and
+/// whose owner the native list shows the caller, a local user for a local
+/// caller and the caller itself for a federated one. To those it adds the
+/// caller's queued or running native creates that have no row yet; a create
+/// targets its public sandbox id, the row's id with the public prefix, so
+/// one past its row insert is counted once.
+///
+/// The in-flight count filters on `state` first, so the planner can take
+/// `idx_public_operations_state_next_attempt` over the cluster's active
+/// operations instead of the org's whole operation history.
+async fn sandboxes_held_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    org_id: OrgId,
+    federated_subject: Option<UserId>,
+) -> Result<i64, PublicOperationStoreError> {
+    sqlx::query(sql!(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1::text, $2))"
+    ))
+    .bind(org_id)
+    .bind(ORG_SANDBOX_QUOTA_LOCK_SEED)
+    .execute(&mut **tx)
+    .await?;
+    Ok(sqlx::query_scalar::<_, i64>(sql!(
+        "SELECT (SELECT COUNT(*)
+                   FROM sandboxes s
+                  WHERE s.org_id = $1
+                    AND s.lifecycle NOT IN ('failed', 'quarantined', 'deleted', 'cleanup_required')
+                    AND (($2::UUID IS NOT NULL AND s.user_id = $2)
+                      OR ($2::UUID IS NULL AND EXISTS (
+                          SELECT 1 FROM users owner
+                           WHERE owner.id = s.user_id
+                             AND owner.owner_source = 'local'
+                      ))))
+              + (SELECT COUNT(*)
+                   FROM public_operations op
+                  WHERE op.state IN ('queued', 'running')
+                    AND op.org_id = $1
+                    AND op.api_product = $3
+                    AND op.kind = $4
+                    AND (($2::UUID IS NOT NULL AND op.actor_user_id = $2)
+                      OR ($2::UUID IS NULL AND EXISTS (
+                          SELECT 1 FROM users actor
+                           WHERE actor.id = op.actor_user_id
+                             AND actor.owner_source = 'local'
+                      )))
+                    AND NOT EXISTS (
+                        SELECT 1
+                          FROM sandboxes s
+                         WHERE s.org_id = $1
+                           AND $5 || s.id::text = op.target_id
+                    ))"
+    ))
+    .bind(org_id)
+    .bind(federated_subject)
+    .bind(ApiProduct::Native.as_str())
+    .bind(OperationKind::CreateSandbox.as_str())
+    .bind(pplx_space_public_api::PUBLIC_SANDBOX_ID_PREFIX)
+    .fetch_one(&mut **tx)
+    .await?)
+}
+
 pub struct PublicOperationAdmission {
     tx: Transaction<'static, Postgres>,
     observation: ObservePublicOperationIdempotency,
+    sandbox_quota: Option<SandboxQuota>,
+}
+
+/// A cap on the sandboxes a native create may bring its caller to, counted
+/// over what that caller can see and delete through the native API.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SandboxQuota {
+    pub limit: u32,
+    /// `None` for an org's local callers, who see every sandbox a local
+    /// user owns; a federated caller's own user, who sees only its own.
+    pub federated_subject: Option<UserId>,
 }
 
 impl PublicOperationAdmission {
@@ -1034,55 +1115,38 @@ impl PublicOperationAdmission {
         Ok(exists)
     }
 
-    /// Whether `org_id` holds fewer than `limit` sandboxes, counting its
-    /// sandbox rows plus its queued or running native creates that have no
-    /// row yet. Call only for a genuinely new create, then record it through
-    /// this admission so the count and the insert commit together.
+    /// Hold the create recorded through this admission to `quota`: a
+    /// genuinely new create that would exceed it records nothing and returns
+    /// [`CreatePublicOperationResult::AdmissionDenied`]. A replay or a key
+    /// conflict is not counted and answers as it would without one.
+    pub(crate) fn hold_to_sandbox_quota(&mut self, quota: SandboxQuota) {
+        self.sandbox_quota = Some(quota);
+    }
+
+    /// [`create_operation_tx`], refused first if it would exceed the quota.
     ///
-    /// Two creates for the same org must not both see `limit - 1`. A
-    /// per-org advisory transaction lock serializes them: a second create
-    /// waits here until the first commits or rolls back, and the count runs
-    /// as its own statement after the lock is granted, so under READ
-    /// COMMITTED its snapshot includes the first create's operation row.
-    /// Deletes do not take the lock; one landing concurrently only lowers
-    /// the count. Take it after the idempotency-key lock, as every native
-    /// create does, so the two cannot deadlock.
-    pub(crate) async fn org_sandbox_quota_allows_create(
+    /// Two creates must not both see `limit - 1`. A per-org advisory
+    /// transaction lock serializes the count and the insert: a second create
+    /// waits here until the first commits or rolls back, and the count runs as
+    /// its own statement after the lock is granted, so under READ COMMITTED
+    /// its snapshot includes the first create's operation row. The lock is
+    /// taken here, after any other work the admission's transaction does (an
+    /// admission-time warm-pool claim), so it is held only for the count, the
+    /// insert, and the commit. Deletes do not take it; one landing
+    /// concurrently only lowers the count. It comes after the idempotency-key
+    /// lock, as on every native create, so the two cannot deadlock.
+    async fn create_within_quota_tx(
         &mut self,
-        org_id: OrgId,
-        limit: u32,
-    ) -> Result<bool, PublicOperationStoreError> {
-        sqlx::query(sql!(
-            "SELECT pg_advisory_xact_lock(hashtextextended($1::text, $2))"
-        ))
-        .bind(org_id)
-        .bind(ORG_SANDBOX_QUOTA_LOCK_SEED)
-        .execute(&mut *self.tx)
-        .await?;
-        // A create's target is the public sandbox id, its row's id with the
-        // public prefix, so one already past its row insert counts once.
-        let held = sqlx::query_scalar::<_, i64>(sql!(
-            "SELECT (SELECT COUNT(*) FROM sandboxes WHERE org_id = $1)
-                  + (SELECT COUNT(*)
-                       FROM public_operations op
-                      WHERE op.org_id = $1
-                        AND op.api_product = $2
-                        AND op.kind = $3
-                        AND op.state IN ('queued', 'running')
-                        AND NOT EXISTS (
-                            SELECT 1
-                              FROM sandboxes s
-                             WHERE s.org_id = $1
-                               AND $4 || s.id::text = op.target_id
-                        ))"
-        ))
-        .bind(org_id)
-        .bind(ApiProduct::Native.as_str())
-        .bind(OperationKind::CreateSandbox.as_str())
-        .bind(pplx_space_public_api::PUBLIC_SANDBOX_ID_PREFIX)
-        .fetch_one(&mut *self.tx)
-        .await?;
-        Ok(held < i64::from(limit))
+        input: CreatePublicOperation<'_>,
+    ) -> Result<CreatePublicOperationResult, PublicOperationStoreError> {
+        if let Some(quota) = self.sandbox_quota
+            && matches!(self.observation, ObservePublicOperationIdempotency::Missing)
+            && sandboxes_held_tx(&mut self.tx, input.org_id, quota.federated_subject).await?
+                >= i64::from(quota.limit)
+        {
+            return Ok(CreatePublicOperationResult::AdmissionDenied);
+        }
+        create_operation_tx(&mut self.tx, input).await
     }
 
     pub async fn create(
@@ -1092,7 +1156,7 @@ impl PublicOperationAdmission {
         let api_product = input.api_product;
         let kind = input.kind;
         let target_type = input.target_type.clone();
-        let result = create_operation_tx(&mut self.tx, input).await?;
+        let result = self.create_within_quota_tx(input).await?;
         self.tx.commit().await?;
         if matches!(result, CreatePublicOperationResult::Created(_)) {
             pplx_space_metrics::operations::created(
@@ -1129,7 +1193,7 @@ impl PublicOperationAdmission {
         let api_product = input.api_product;
         let kind = input.kind;
         let target_type = input.target_type.clone();
-        let result = create_operation_tx(&mut self.tx, input).await?;
+        let result = self.create_within_quota_tx(input).await?;
         if !matches!(result, CreatePublicOperationResult::Created(_)) {
             self.tx.rollback().await?;
             return Ok(result);
@@ -1157,7 +1221,7 @@ impl PublicOperationAdmission {
         let api_product = input.api_product;
         let kind = input.kind;
         let target_type = input.target_type.clone();
-        let operation_id = match create_operation_tx(&mut self.tx, input).await? {
+        let operation_id = match self.create_within_quota_tx(input).await? {
             CreatePublicOperationResult::Created(operation_id) => operation_id,
             CreatePublicOperationResult::Existing(operation_id) => {
                 self.tx.rollback().await?;

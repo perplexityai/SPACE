@@ -335,7 +335,7 @@ async fn native_create_refuses_a_new_create_at_the_org_quota() -> TestDbResult<(
     .bind(org_id)
     .execute(&db.pool)
     .await?;
-    let create = |key: &'static str, quota_limit: Option<u32>| {
+    let create = |key: &'static str, limit: Option<u32>| {
         let pool = db.pool.clone();
         async move {
             create_native_sandbox_operation(
@@ -346,7 +346,10 @@ async fn native_create_refuses_a_new_create_at_the_org_quota() -> TestDbResult<(
                 create_request_with_auto_lifecycle(None),
                 None,
                 None,
-                quota_limit,
+                limit.map(|limit| SandboxQuota {
+                    limit,
+                    federated_subject: None,
+                }),
             )
             .await
         }
@@ -1434,8 +1437,8 @@ mod admission_pool_claim {
         Ok(())
     }
 
-    /// The quota is checked before the slot claim, so a refused create
-    /// leaves the slot ready for the next admitted one.
+    /// A create refused by the quota after claiming a slot rolls the claim
+    /// back, leaving the slot ready for the next admitted one.
     #[tokio::test(flavor = "current_thread")]
     async fn a_create_refused_by_the_org_quota_claims_no_slot() -> TestDbResult<()> {
         let fixture = AdmissionPoolFixture::new(2).await?;
@@ -1452,7 +1455,10 @@ mod admission_pool_claim {
                     controller: &controller,
                     inline: None,
                 }),
-                Some(1),
+                Some(SandboxQuota {
+                    limit: 1,
+                    federated_subject: None,
+                }),
             )
             .await
         };
