@@ -52,11 +52,19 @@ space-cluster-controller-local:
     reconcileQueueGc:
       env:
         SPACE_RECONCILE_QUEUE_GC_ENABLED: "false"
+    # Kind turns the deletion-cost reconciler on to exercise it; here it stays
+    # opt-in, and so does its pod `patch` grant.
+    dataPlaneDeletionCost:
+      env:
+        SPACE_DATA_PLANE_DELETION_COST_ENABLED: "false"
 
 space-data-plane-local:
   entry:
     type: ClusterIP
   ecwHosts: ""
+  # The internal stream-load listener only serves that reconciler; opt in
+  # with it.
+  internalPort: ""
 
 # Kind gives every node its own root-owned /space/vendor (stage_vendor in
 # kind/node/space-kind-node.sh); a caller's node brings its own, which may be

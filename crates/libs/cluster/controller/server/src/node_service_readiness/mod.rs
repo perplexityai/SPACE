@@ -419,7 +419,8 @@ pub async fn run(
         return;
     }
 
-    let backend = KubernetesReadinessBackend::spawn(substrate, &config);
+    let backend =
+        KubernetesReadinessBackend::spawn(substrate, &config, shutdown_token.child_token());
     run_with_backend(backend, config, shutdown_token).await
 }
 

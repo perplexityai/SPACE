@@ -55,6 +55,9 @@ _DURATION_SECONDS = {
         "local.btrfs_send_restore_rejects_corrupted_stream": 61,
         "local.cold_sandbox_eviction_wake_round_trip": 148,
         "local.concurrent_restore_converges_to_one_execution": 60,
+        # Estimate until a bench run refreshes it: setup plus a 90 s held stream
+        # and a settle of about 10 s on each side (210 s if both settles time out).
+        "local.data_plane_deletion_cost_tracks_live_streams": 120,
         "local.ecw_template_build_from_oci_boots": 40,
         "local.encrypted_resuspend_preserves_cow": 60,
         # Local seed run including durable suspend, cross-node fork, restore

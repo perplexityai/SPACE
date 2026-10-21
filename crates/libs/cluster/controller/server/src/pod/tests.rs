@@ -4,6 +4,7 @@ use uuid::Uuid;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
+use std::time::Duration;
 
 use k8s_openapi::api::core::v1::{NodeSelectorRequirement, PodCondition, PodSpec, PodStatus};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -578,4 +579,83 @@ fn node_group_labeler_selector_matches_the_rendered_pod_node_selector() {
         "the node-group labeler's worker selector has drifted from the sandbox pod's \
          rendered nodeSelector"
     );
+}
+
+/// A response body for the fake apiserver below: `data`, then, when `open`
+/// holds a guard, no further frame and no end, like a watch with no events.
+/// Dropping the body drops the guard, which is how a test sees the watch end.
+struct FakeApiBody {
+    data: Option<bytes::Bytes>,
+    open: Option<tokio_util::sync::DropGuard>,
+}
+
+impl http_body::Body for FakeApiBody {
+    type Data = bytes::Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        if let Some(data) = self.data.take() {
+            return std::task::Poll::Ready(Some(Ok(http_body::Frame::data(data))));
+        }
+        if self.open.is_some() {
+            std::task::Poll::Pending
+        } else {
+            std::task::Poll::Ready(None)
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_cancelled_labeled_pod_reflector_closes_its_watch() {
+    let watch_closed = tokio_util::sync::CancellationToken::new();
+    let closed = watch_closed.clone();
+    // An apiserver with no pods: a LIST returns an empty page and a WATCH
+    // stays open with no events.
+    let apiserver = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+        let closed = closed.clone();
+        async move {
+            let watch = request
+                .uri()
+                .query()
+                .is_some_and(|query| query.contains("watch=true"));
+            let body = if watch {
+                FakeApiBody {
+                    data: None,
+                    open: Some(closed.drop_guard()),
+                }
+            } else {
+                FakeApiBody {
+                    data: Some(bytes::Bytes::from_static(
+                        br#"{"apiVersion":"v1","kind":"PodList","metadata":{"resourceVersion":"1"},"items":[]}"#,
+                    )),
+                    open: None,
+                }
+            };
+            Ok::<_, std::convert::Infallible>(http::Response::new(body))
+        }
+    });
+    let api: kube::Api<Pod> = kube::Api::namespaced(kube::Client::new(apiserver, "space"), "space");
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let (store, ready) = spawn_labeled_pod_reflector(api, "app=fake", "fake pods", cancel.clone());
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !ready.load(std::sync::atomic::Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the reflector syncs against the fake apiserver");
+    assert_eq!(store.len(), 0);
+    assert!(
+        !watch_closed.is_cancelled(),
+        "the watch is open while the reflector runs"
+    );
+
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(5), watch_closed.cancelled())
+        .await
+        .expect("a cancelled reflector drops its watch instead of outliving its reconciler");
 }
