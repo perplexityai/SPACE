@@ -5387,6 +5387,7 @@ dependencies = [
  "pplx-space-cpu-arch",
  "pplx-space-durations",
  "pplx-space-env-vars",
+ "pplx-space-k8s-ids",
  "pplx-space-net-common",
  "pplx-space-semver",
  "pplx-space-sql-locator",
@@ -5976,6 +5977,15 @@ dependencies = [
  "pplx-space-common-svc",
  "pplx-space-internal-api-server",
  "tikv-jemallocator",
+]
+
+[[package]]
+name = "pplx-space-k8s-ids"
+version = "0.8.0"
+dependencies = [
+ "serde",
+ "sqlx",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

@@ -569,6 +569,24 @@ run_clippy_checks() {
         --all-targets \
         -- \
         -D warnings
+
+    # Built alone, so a serde or sqlx feature the Kubernetes identifier crate
+    # needs but only gets through unification with common-core fails here.
+    echo "--- :rust: Running isolated Kubernetes identifier clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-k8s-ids \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-k8s-ids \
+        --all-features \
+        --all-targets \
+        -- \
+        -D warnings
 }
 
 nextest_test_threads() {

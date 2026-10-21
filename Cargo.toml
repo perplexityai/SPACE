@@ -116,6 +116,7 @@ members = [
     "crates/libs/metrics",
     "crates/libs/observability",
     "crates/libs/internal/api/server",
+    "crates/libs/k8s-ids",
     "crates/libs/cluster/controller/server",
     "crates/libs/cluster/pool",
     "crates/libs/cluster/reconciler",
@@ -366,6 +367,7 @@ pplx-space-observability = { path = "crates/libs/observability", default-feature
 pplx-space-placement = { path = "crates/libs/placement/machine" }
 pplx-space-internal-api-server = { path = "crates/libs/internal/api/server" }
 pplx-space-internal-api-svc = { path = "crates/apps/internal/api/svc" }
+pplx-space-k8s-ids = { path = "crates/libs/k8s-ids" }
 pplx-space-cluster-controller-server = { path = "crates/libs/cluster/controller/server" }
 pplx-space-cluster-pool = { path = "crates/libs/cluster/pool" }
 pplx-space-cluster-reconciler = { path = "crates/libs/cluster/reconciler" }

@@ -1,6 +1,15 @@
-//! Kubernetes pod and node identifier newtypes.
+//! Kubernetes pod and node identifiers: pod UID, name and resource version,
+//! and node name and UID. They encode Kubernetes' own naming rules; no SPACE
+//! node-model types or logic.
+//!
+//! They are their own crate so that code can name them without depending on
+//! `pplx-space-common-core`. `pplx-space-common-core` re-exports them from
+//! `types::node`.
 
-use super::*;
+use std::{fmt, str::FromStr};
+
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 
 /// Kubernetes pod UID.
 ///
@@ -9,7 +18,7 @@ use super::*;
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(try_from = "String", into = "String"))]
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct PodUid(pub(super) String);
+pub struct PodUid(String);
 
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[error("pod uid must not be empty")]
@@ -95,7 +104,7 @@ impl<'r> sqlx::Decode<'r, sqlx::Postgres> for PodUid {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(try_from = "String", into = "String"))]
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct PodName(pub(super) String);
+pub struct PodName(String);
 
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[error("pod name must be a non-empty lowercase DNS subdomain")]
@@ -188,7 +197,7 @@ impl<'r> sqlx::Decode<'r, sqlx::Postgres> for PodName {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(try_from = "String", into = "String"))]
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub struct PodResourceVersion(pub(super) String);
+pub struct PodResourceVersion(String);
 
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[error("pod resource version must not be empty")]
@@ -245,7 +254,7 @@ impl TryFrom<String> for PodResourceVersion {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(try_from = "String", into = "String"))]
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct K8sNodeName(pub(super) String);
+pub struct K8sNodeName(String);
 
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[error("kubernetes node name must be a non-empty lowercase DNS subdomain")]
@@ -331,7 +340,7 @@ impl<'r> sqlx::Decode<'r, sqlx::Postgres> for K8sNodeName {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(try_from = "String", into = "String"))]
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct K8sNodeUid(pub(super) String);
+pub struct K8sNodeUid(String);
 
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[error("kubernetes node uid must not be empty")]
@@ -410,7 +419,7 @@ impl<'r> sqlx::Decode<'r, sqlx::Postgres> for K8sNodeUid {
 
 /// RFC 1123 DNS subdomain shape, the loose common denominator for kube pod
 /// and node names.
-pub(super) fn is_dns_subdomain(value: &str) -> bool {
+fn is_dns_subdomain(value: &str) -> bool {
     let alnum = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
     let bytes = value.as_bytes();
     bytes.len() <= 253
@@ -418,3 +427,6 @@ pub(super) fn is_dns_subdomain(value: &str) -> bool {
         && bytes.first().copied().is_some_and(alnum)
         && bytes.last().copied().is_some_and(alnum)
 }
+
+#[cfg(test)]
+mod tests;

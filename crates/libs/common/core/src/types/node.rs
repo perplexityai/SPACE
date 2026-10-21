@@ -5,9 +5,10 @@ use std::{fmt, net::IpAddr, str::FromStr};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-mod k8s_ids;
-
-pub use k8s_ids::*;
+pub use pplx_space_k8s_ids::{
+    K8sNodeName, K8sNodeNameParseError, K8sNodeUid, K8sNodeUidParseError, PodName,
+    PodNameParseError, PodResourceVersion, PodResourceVersionParseError, PodUid, PodUidParseError,
+};
 
 pub const NODE_ROLE_WORKER: &str = "worker";
 pub const NODE_ROLE_BUILDER: &str = "builder";
