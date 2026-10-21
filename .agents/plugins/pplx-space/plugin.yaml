@@ -1,5 +1,5 @@
 name: pplx-space
-version: '0.2.39'
+version: '0.2.40'
 description: 'SPACE development, validation, infrastructure, and operations workflows.'
 
 components:
