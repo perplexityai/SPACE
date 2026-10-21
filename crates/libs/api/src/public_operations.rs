@@ -1005,8 +1005,57 @@ async fn claim_created_operation_tx(
     Ok((claim_token, operation))
 }
 
-/// The sandboxes a native caller holds against its quota, after taking the
-/// per-org quota lock (see [`PublicOperationAdmission::create_within_quota_tx`]).
+/// What a lock-free count of a caller's sandboxes decides about one more
+/// create under `limit`.
+///
+/// Admitting without the lock trades exactness for not serializing every
+/// create of a busy org: creates that each counted under `limit - headroom`
+/// can commit together. The overshoot is at most the number of the org's
+/// creates admitted concurrently beyond the headroom, and each holds a
+/// pooled database connection while it does, so it is bounded by the API's
+/// total pool size less the headroom. The headroom is a tenth of the limit
+/// and never less than [`SANDBOX_QUOTA_MIN_LOCK_HEADROOM`], so a limit of
+/// that size or less is always checked under the lock and never overshoots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SandboxQuotaCheck {
+    Admit,
+    Refuse,
+    RecountLocked,
+}
+
+/// See [`SandboxQuotaCheck`].
+const SANDBOX_QUOTA_MIN_LOCK_HEADROOM: i64 = 64;
+
+impl SandboxQuotaCheck {
+    fn for_count(held: i64, limit: u32) -> Self {
+        let limit = i64::from(limit);
+        let headroom = (limit / 10).max(SANDBOX_QUOTA_MIN_LOCK_HEADROOM);
+        if held >= limit {
+            Self::Refuse
+        } else if held < limit - headroom {
+            Self::Admit
+        } else {
+            Self::RecountLocked
+        }
+    }
+}
+
+/// Serialize the quota recount and insert of one org's native creates.
+async fn lock_org_sandbox_quota_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    org_id: OrgId,
+) -> Result<(), PublicOperationStoreError> {
+    sqlx::query(sql!(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1::text, $2))"
+    ))
+    .bind(org_id)
+    .bind(ORG_SANDBOX_QUOTA_LOCK_SEED)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// The sandboxes a native caller holds against its quota.
 ///
 /// It counts what the caller can see and delete through the native API: the
 /// org's sandboxes that are not terminal (`failed`, `quarantined`, `deleted`,
@@ -1025,13 +1074,6 @@ async fn sandboxes_held_tx(
     org_id: OrgId,
     federated_subject: Option<UserId>,
 ) -> Result<i64, PublicOperationStoreError> {
-    sqlx::query(sql!(
-        "SELECT pg_advisory_xact_lock(hashtextextended($1::text, $2))"
-    ))
-    .bind(org_id)
-    .bind(ORG_SANDBOX_QUOTA_LOCK_SEED)
-    .execute(&mut **tx)
-    .await?;
     Ok(sqlx::query_scalar::<_, i64>(sql!(
         "SELECT (SELECT COUNT(*)
                    FROM sandboxes s
@@ -1125,26 +1167,41 @@ impl PublicOperationAdmission {
 
     /// [`create_operation_tx`], refused first if it would exceed the quota.
     ///
-    /// Two creates must not both see `limit - 1`. A per-org advisory
-    /// transaction lock serializes the count and the insert: a second create
-    /// waits here until the first commits or rolls back, and the count runs as
-    /// its own statement after the lock is granted, so under READ COMMITTED
-    /// its snapshot includes the first create's operation row. The lock is
-    /// taken here, after any other work the admission's transaction does (an
-    /// admission-time warm-pool claim), so it is held only for the count, the
-    /// insert, and the commit. Deletes do not take it; one landing
-    /// concurrently only lowers the count. It comes after the idempotency-key
-    /// lock, as on every native create, so the two cannot deadlock.
+    /// A first count runs without a lock. At or over the limit the create is
+    /// refused, and well under it ([`SandboxQuotaCheck`]) it is admitted, so
+    /// neither case queues on the per-org lock or holds a pooled connection
+    /// waiting for it. Only a count near the limit takes the lock and counts
+    /// again, and there two creates cannot both see `limit - 1`: a per-org
+    /// advisory transaction lock serializes the recount and the insert, a
+    /// second create waits for the first to commit or roll back, and its
+    /// recount is a new statement, so under READ COMMITTED it sees the first
+    /// create's operation. The lock is taken here, after any other work the
+    /// admission's transaction does (an admission-time warm-pool claim), so
+    /// it is held only for the recount, the insert and the commit. Deletes do
+    /// not take it; one landing concurrently only lowers the count. It comes
+    /// after the idempotency-key lock, as on every native create, so the two
+    /// cannot deadlock.
     async fn create_within_quota_tx(
         &mut self,
         input: CreatePublicOperation<'_>,
     ) -> Result<CreatePublicOperationResult, PublicOperationStoreError> {
         if let Some(quota) = self.sandbox_quota
             && matches!(self.observation, ObservePublicOperationIdempotency::Missing)
-            && sandboxes_held_tx(&mut self.tx, input.org_id, quota.federated_subject).await?
-                >= i64::from(quota.limit)
         {
-            return Ok(CreatePublicOperationResult::AdmissionDenied);
+            let subject = quota.federated_subject;
+            let held = sandboxes_held_tx(&mut self.tx, input.org_id, subject).await?;
+            let admits = match SandboxQuotaCheck::for_count(held, quota.limit) {
+                SandboxQuotaCheck::Admit => true,
+                SandboxQuotaCheck::Refuse => false,
+                SandboxQuotaCheck::RecountLocked => {
+                    lock_org_sandbox_quota_tx(&mut self.tx, input.org_id).await?;
+                    sandboxes_held_tx(&mut self.tx, input.org_id, subject).await?
+                        < i64::from(quota.limit)
+                }
+            };
+            if !admits {
+                return Ok(CreatePublicOperationResult::AdmissionDenied);
+            }
         }
         create_operation_tx(&mut self.tx, input).await
     }

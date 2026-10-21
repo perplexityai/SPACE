@@ -2004,6 +2004,90 @@ async fn sandbox_quota_create_waits_for_a_racing_create_and_counts_it() -> TestR
     Ok(())
 }
 
+#[test]
+fn sandbox_quota_takes_the_lock_only_near_the_limit() {
+    use SandboxQuotaCheck::{Admit, RecountLocked, Refuse};
+    for (held, limit, expected) in [
+        // A limit within the minimum headroom is always checked exactly.
+        (0, 1, RecountLocked),
+        (0, 3, RecountLocked),
+        (2, 3, RecountLocked),
+        (3, 3, Refuse),
+        (4, 3, Refuse),
+        (0, 64, RecountLocked),
+        (0, 65, Admit),
+        (1, 65, RecountLocked),
+        // Larger limits keep a tenth of themselves as headroom.
+        (899, 1000, Admit),
+        (900, 1000, RecountLocked),
+        (999, 1000, RecountLocked),
+        (1000, 1000, Refuse),
+    ] {
+        assert_eq!(
+            SandboxQuotaCheck::for_count(held, limit),
+            expected,
+            "{held} held of {limit}"
+        );
+    }
+}
+
+/// A count well under the limit admits, and one at the limit refuses,
+/// without queueing on the per-org lock a racing create holds.
+#[tokio::test]
+async fn sandbox_quota_far_from_the_limit_does_not_wait_for_the_lock() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let actor_id = UserId::from_uuid(seed_user(&db.pool, org_id).await?);
+    for _ in 0..2 {
+        seed_sandbox(&db.pool, SandboxId::new(), actor_id, org_id, "started").await?;
+    }
+    let store = PublicOperationStore::new(db.pool.clone());
+    let mut racing = db.pool.begin().await?;
+    sqlx::query(sql!(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1::text, $2))"
+    ))
+    .bind(org_id)
+    .bind(ORG_SANDBOX_QUOTA_LOCK_SEED)
+    .execute(&mut *racing)
+    .await?;
+
+    for (limit, expected_created) in [(1000, true), (2, false)] {
+        let key = IdempotencyKey::parse(format!("quota-lock-free-{limit}"))?;
+        let fingerprint = RequestFingerprint::parse("f".repeat(64))?;
+        let idempotency = native_create_idempotency(&key, &fingerprint);
+        let target_id = PublicSandboxId::new().to_string();
+        let create = async {
+            let mut admission = store
+                .begin_operation_admission(org_id, ApiProduct::Native, &idempotency)
+                .await?;
+            admission.hold_to_sandbox_quota(SandboxQuota {
+                limit,
+                federated_subject: None,
+            });
+            admission
+                .create(native_create(
+                    org_id,
+                    actor_id,
+                    &target_id,
+                    Some(idempotency.clone()),
+                ))
+                .await
+        };
+        let result = tokio::time::timeout(Duration::from_secs(2), create)
+            .await
+            .map_err(|_| format!("limit {limit}: the create waited on the quota lock"))??;
+        assert_eq!(
+            matches!(result, CreatePublicOperationResult::Created(_)),
+            expected_created,
+            "limit {limit}: {result:?}"
+        );
+    }
+    racing.rollback().await?;
+    Ok(())
+}
+
 fn native_create<'a>(
     org_id: OrgId,
     actor_id: UserId,
