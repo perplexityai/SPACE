@@ -55,6 +55,22 @@ fn environment_overrides_policy_and_scope() {
 }
 
 #[test]
+fn dry_run_is_read_as_an_operator_setting() {
+    for (value, expected) in [
+        ("true", true),
+        ("1", true),
+        ("false", false),
+        ("bogus", false),
+    ] {
+        let mut env = pplx_space_test_env::TestEnv::default();
+        env.set("SPACE_SNAPSHOT_RETENTION_SWEEPER_DRY_RUN", value);
+        let config = ReconcilerConfig::from_environment(&env);
+        assert_eq!(config.dry_run, expected, "DRY_RUN={value}");
+        assert_eq!(RetentionPolicy::from(config).dry_run, expected);
+    }
+}
+
+#[test]
 fn invalid_and_dangerous_values_fall_back_or_clamp() {
     let mut env = pplx_space_test_env::TestEnv::default();
     env.set("SPACE_SNAPSHOT_RETENTION_SWEEPER_TICK_SECS", "invalid");

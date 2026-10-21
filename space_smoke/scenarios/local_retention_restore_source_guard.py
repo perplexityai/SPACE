@@ -12,8 +12,8 @@ TIMEOUT_MINUTES = 30
     # Generous deadline: the default pause-on-timeout keeps even a stalled
     # run recoverable, but must never fire mid-cycle.
     sandbox=smoke.SandboxConfig(timeout=TIMEOUT_MINUTES * 60),
-    test_hooks="SPACE_SNAPSHOT_RETENTION_SWEEPER_DRY_RUN, SPACE_SNAPSHOT_RETENTION_SWEEPER_TICK_SECS "
-    "and SPACE_SNAPSHOT_RETENTION_SWEEPER_MIN_AGE_SECS, which it stages",
+    test_hooks="SPACE_SNAPSHOT_RETENTION_SWEEPER_TICK_SECS and "
+    "SPACE_SNAPSHOT_RETENTION_SWEEPER_MIN_AGE_SECS, which it stages",
 )
 def restore_source_guard(test: smoke.KindEcw) -> None:
     """The live retention sweeper prunes unpinned history past keep-N while

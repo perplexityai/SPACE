@@ -1,4 +1,4 @@
-use pplx_space_common_core::env::{Environment, ProcessEnvironment, test_hook};
+use pplx_space_common_core::env::{Environment, ProcessEnvironment};
 use pplx_space_common_core::types::{
     LocalArtifactId, NodeId, OrgId, SandboxId, SnapshotId, UserId,
 };
@@ -473,8 +473,8 @@ enum TestDepsPolicy {
 impl TestDepsPolicy {
     fn from_env(env: &dyn Environment) -> Self {
         Self::from_values(
-            test_hook(env, REQUIRE_TEST_DEPS_ENV).as_deref(),
-            test_hook(env, TEST_DEPS_OPTIONAL_ENV).as_deref(),
+            env.var(REQUIRE_TEST_DEPS_ENV).ok().as_deref(),
+            env.var(TEST_DEPS_OPTIONAL_ENV).ok().as_deref(),
         )
     }
 
@@ -520,7 +520,7 @@ pub fn require_test_deps() -> bool {
 /// [`report_dependency_skip`] and returns `Ok(())`, and the caller returns
 /// early without testing anything.
 pub fn report_unavailable_dependency(dependency: &str, detail: &dyn Display) -> TestDbResult<()> {
-    let log = pplx_space_common_core::env::test_hook_var("SPACE_TEST_DEP_SKIP_LOG");
+    let log = std::env::var("SPACE_TEST_DEP_SKIP_LOG").ok();
     unavailable_dependency_outcome(
         TestDepsPolicy::from_env(&ProcessEnvironment),
         dependency,
@@ -591,7 +591,7 @@ fn unavailable_dependency_error(
 /// measurement contract: invalid paths and write failures are returned rather
 /// than silently producing incomplete soak data.
 pub fn report_dependency_skip(message: &str) -> io::Result<()> {
-    let path = pplx_space_common_core::env::test_hook_var("SPACE_TEST_DEP_SKIP_LOG");
+    let path = std::env::var("SPACE_TEST_DEP_SKIP_LOG").ok();
     report_dependency_skip_to(message, path.as_deref().map(Path::new))
 }
 
@@ -670,9 +670,7 @@ struct SharedPostgres {
 
 impl SharedPostgres {
     async fn start() -> Result<Self, InitError> {
-        if let Some(admin_database_url) =
-            pplx_space_common_core::env::test_hook_var(SHARED_POSTGRES_ADMIN_URL_ENV)
-        {
+        if let Ok(admin_database_url) = std::env::var(SHARED_POSTGRES_ADMIN_URL_ENV) {
             database_url_from_admin(&admin_database_url, TEMPLATE_DATABASE)
                 .map_err(|error| InitError::failed(error.to_string()))?;
             return Ok(Self {

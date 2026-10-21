@@ -13,8 +13,8 @@ KEEP_N = 2
 @smoke.scenario(
     "local.retention_claim_finish_forward",
     required_tools=("aws",),
-    test_hooks="SPACE_SNAPSHOT_RETENTION_SWEEPER_DRY_RUN, SPACE_SNAPSHOT_RETENTION_SWEEPER_TICK_SECS "
-    "and SPACE_SNAPSHOT_RETENTION_SWEEPER_MIN_AGE_SECS, which it stages",
+    test_hooks="SPACE_SNAPSHOT_RETENTION_SWEEPER_TICK_SECS and "
+    "SPACE_SNAPSHOT_RETENTION_SWEEPER_MIN_AGE_SECS, which it stages",
 )
 def claim_finish_forward(test: smoke.KindEcw) -> None:
     """A crash-orphaned `deleting` claim finishes forward without violating

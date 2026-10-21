@@ -118,10 +118,10 @@ pub struct RetentionPolicy {
     /// When `true`, the sweep runs its full candidate scan and per-candidate
     /// keep-N safety gate but performs **no** destructive action — it logs
     /// and meters (`would_prune`) what a live run would delete, and touches
-    /// neither S3 nor Postgres. `true` by default so that *enabling* the
-    /// reconciler (`..._ENABLED=true`) in a new environment is observe-only
-    /// until an operator has validated the keep-N filter against real data
-    /// and explicitly flips `SPACE_SNAPSHOT_RETENTION_SWEEPER_DRY_RUN=false`.
+    /// neither S3 nor Postgres. The cluster controller reads it from
+    /// `SPACE_SNAPSHOT_RETENTION_SWEEPER_DRY_RUN` (off by default), so a new
+    /// environment can enable the reconciler observe-only and turn dry run
+    /// off once an operator has validated the keep-N filter against real data.
     pub dry_run: bool,
     /// Number of newest `ready` full snapshots to keep per sandbox.
     /// Hosting applications must validate this as non-zero before

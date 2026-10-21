@@ -381,6 +381,12 @@ run_clippy_checks() {
 
     run_sbxmgr_production_checks "${target_dir}"
 
+    # The check above resolves a `-p` selection. The release images build
+    # from the workspace root without one, so this one reads each release
+    # `cargo build` selection from docker/Dockerfile.rust-build-common.
+    echo "--- :rust: Checking release build selections for test-only features"
+    bash "${SCRIPT_DIR}/check-release-build-features.sh"
+
     # feature-flags must lint clean with no vendor SDK compiled in; the matching
     # dependency-graph assertion lives in run_feature_isolation_checks.
     # `--all-targets` so the SDK-free test targets lint too; run_feature_isolation_checks
