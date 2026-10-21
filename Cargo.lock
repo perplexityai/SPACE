@@ -5072,6 +5072,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-bearer-token"
+version = "0.8.0"
+dependencies = [
+ "pplx-space-common-core",
+ "pplx-space-test-env",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tonic",
+ "uuid",
+]
+
+[[package]]
 name = "pplx-space-build-mgr"
 version = "0.8.0"
 dependencies = [
@@ -5147,10 +5159,10 @@ name = "pplx-space-build-mgr-client"
 version = "0.8.0"
 dependencies = [
  "anyhow",
+ "pplx-space-bearer-token",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-common-proto-build",
- "pplx-space-common-svc",
  "pplx-space-test-env",
  "prost",
  "rcgen",
@@ -5491,6 +5503,7 @@ dependencies = [
  "log",
  "nix 0.31.3",
  "pin-project-lite",
+ "pplx-space-bearer-token",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-db-test-fixtures",
@@ -6107,16 +6120,17 @@ dependencies = [
  "bytes",
  "http-body-util",
  "hyper-util",
+ "pplx-space-bearer-token",
  "pplx-space-build-mgr-client",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-common-grpc-lb",
  "pplx-space-common-proto-build",
- "pplx-space-common-svc",
  "pplx-space-execution-common",
  "pplx-space-net-common",
  "pplx-space-net-gateway-client",
  "pplx-space-node-mgr-client",
+ "pplx-space-observability",
  "pplx-space-sbx-mgr-client",
  "pplx-space-template-mgr-client",
  "pplx-space-test-env",

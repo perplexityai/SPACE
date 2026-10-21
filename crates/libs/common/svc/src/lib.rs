@@ -15,7 +15,7 @@ pub use pplx_space_common_core::sql;
 pub use pplx_space_observability::{self as observability, LogContext, ObservabilityError};
 
 pub mod auth;
-pub mod bearer_token;
+pub use pplx_space_bearer_token as bearer_token;
 pub mod bootstrap;
 pub use pplx_space_dependency_drain as dependency_drain;
 pub mod disk_admission;

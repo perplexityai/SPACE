@@ -1,3 +1,14 @@
+//! SPACE internal bearer tokens: the token kinds, their projected-token paths
+//! and static-token environment variables, and the tonic interceptor and
+//! helpers that attach or resolve them. Outbound clients attach a token with
+//! the interceptor or helpers; services read the environment variable names
+//! when they load or check the static token they accept.
+//!
+//! It is its own crate so client crates can attach these tokens without
+//! depending on `pplx-space-common-svc` and the service host it brings.
+//! `pplx-space-common-svc` re-exports it as `bearer_token` and re-exports the
+//! interceptor and `required_space_bearer_token` from its `auth` module.
+
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -5,6 +16,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use tonic::metadata::{Ascii, MetadataMap, MetadataValue};
+use tonic::{Request, Status};
 
 const SPACE_AUTH_DIR: &str = "/var/run/space-auth";
 // Kubelet rotates projected tokens on disk before expiry. This tiny cache
@@ -246,6 +258,87 @@ fn cache_token_file(path: &Path, modified: SystemTime, checked_at: Instant, toke
             checked_at,
         },
     );
+}
+
+/// Channel interceptor that attaches the SPACE internal bearer token of a
+/// fixed [`SpaceBearerToken`] kind to
+/// every outbound request.
+///
+/// Construct it once at client construction (wrapped in
+/// `tonic::service::interceptor::InterceptedService`) so a local token
+/// read/mount failure fails the call locally instead of being swallowed into a
+/// header-less request that the remote server then misreports as a
+/// `401`/`UNAUTHENTICATED`. The token is re-read on every RPC, so
+/// projected-token rotation is picked up. Mirrors the role-specific
+/// `BearerAuthInterceptor` in the node-api client.
+///
+/// The failure is reported as `UNAVAILABLE`, not `UNAUTHENTICATED` or
+/// `INTERNAL`: a missing/unreadable projected token (e.g. an unmounted volume,
+/// a permissions problem, or a token caught mid-rotation) is a *transient,
+/// local* infrastructure failure, distinct from the remote server actually
+/// rejecting a token. The code matters — callers that classify error codes
+/// (snapshot-upload retry, the command-ready probe / transient-lifecycle
+/// sweeper) treat `UNAVAILABLE` as retryable/unreachable and `INTERNAL` as a
+/// permanent or guest-wedge verdict. Emitting `INTERNAL` here would let a local
+/// credential blip be misread as remote wedge evidence and reap healthy
+/// sandboxes.
+#[derive(Clone)]
+pub struct SpaceBearerInterceptor {
+    kind: crate::SpaceBearerToken,
+}
+
+impl SpaceBearerInterceptor {
+    pub fn new(kind: crate::SpaceBearerToken) -> Self {
+        Self { kind }
+    }
+}
+
+impl tonic::service::Interceptor for SpaceBearerInterceptor {
+    fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
+        self.call_with_environment(request, &pplx_space_common_core::env::ProcessEnvironment)
+    }
+}
+impl SpaceBearerInterceptor {
+    pub(crate) fn call_with_environment(
+        &mut self,
+        mut request: Request<()>,
+        env: &dyn pplx_space_common_core::env::Environment,
+    ) -> Result<Request<()>, Status> {
+        crate::insert_space_bearer_token_from_environment(request.metadata_mut(), self.kind, env)
+            .map_err(|error| {
+            Status::unavailable(format!(
+                "failed to attach {} bearer token: {error}",
+                self.kind.as_str()
+            ))
+        })?;
+        Ok(request)
+    }
+}
+
+/// Resolve the projected (or static-fallback) bearer token for an outbound
+/// client path.
+///
+/// A token-source failure (unmounted/unreadable/mid-rotation projected token,
+/// or no token configured) is a *transient, local* infrastructure failure, so
+/// it surfaces as retryable `UNAVAILABLE` — never `INTERNAL`/`UNAUTHENTICATED`.
+/// This matches `SpaceBearerInterceptor` and the retrying node-api client, so
+/// the shared gRPC retry policy retries it (e.g. a projected token caught
+/// mid-rotation) instead of treating a local credential blip as a permanent
+/// verdict. (`required_bearer_token`, by contrast, loads the static token as a
+/// service *boot* precondition and stays `INTERNAL`.)
+pub fn required_space_bearer_token(kind: crate::SpaceBearerToken) -> Result<String, Status> {
+    required_space_bearer_token_from_environment(
+        kind,
+        &pplx_space_common_core::env::ProcessEnvironment,
+    )
+}
+
+pub(crate) fn required_space_bearer_token_from_environment(
+    kind: crate::SpaceBearerToken,
+    env: &dyn pplx_space_common_core::env::Environment,
+) -> Result<String, Status> {
+    crate::space_bearer_token_from_environment(kind, env)
+        .map_err(|error| Status::unavailable(error.to_string()))
 }
 
 #[cfg(test)]

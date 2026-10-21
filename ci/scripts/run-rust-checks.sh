@@ -390,6 +390,18 @@ run_clippy_checks() {
         -- \
         -D warnings
 
+    # Built alone, so a tonic or common-core feature the bearer-token crate
+    # needs but only gets through unification with the rest of the workspace
+    # fails here. Its tests build alone too, so they are linted with it.
+    echo "--- :rust: Running isolated bearer-token clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-bearer-token \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
+
     run_sbxmgr_production_checks "${target_dir}"
 
     # feature-flags must lint clean with no vendor SDK compiled in; the matching

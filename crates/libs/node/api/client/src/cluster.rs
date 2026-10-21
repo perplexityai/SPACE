@@ -2,12 +2,12 @@ use std::fmt;
 use std::str::FromStr;
 use std::time::Duration;
 
+use pplx_space_bearer_token::BearerTokenError;
 use pplx_space_common_core::types::ExecutionGeneration;
 use pplx_space_common_grpc::RotatingChannel;
 use pplx_space_common_grpc::{
     GrpcClientTrace, trace_grpc_client_transport as wrap_grpc_client_channel,
 };
-use pplx_space_common_svc::bearer_token::BearerTokenError;
 use tonic::metadata::{Ascii, MetadataValue};
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Endpoint, Uri};
@@ -125,8 +125,8 @@ impl tonic::service::Interceptor for BearerAuthInterceptor {
                 // token) is transient and retryable: surface UNAVAILABLE, not
                 // INTERNAL, so a credential blip on this side is never misread as
                 // remote wedge evidence. Mirrors `SpaceBearerInterceptor`.
-                pplx_space_common_svc::bearer_token::space_bearer_metadata(
-                    pplx_space_common_svc::bearer_token::SpaceBearerToken::ClusterApi,
+                pplx_space_bearer_token::space_bearer_metadata(
+                    pplx_space_bearer_token::SpaceBearerToken::ClusterApi,
                 )
                 .map_err(|error| tonic::Status::unavailable(error.to_string()))?
             }
@@ -247,8 +247,8 @@ pub async fn connect_from_env_with_discovery(
     // connect fine and only fail on the first RPC as an opaque `internal`
     // Status. The returned client still uses the token-file interceptor, which
     // re-reads on every RPC so projected-token rotation is picked up.
-    if let Err(error) = pplx_space_common_svc::bearer_token::space_bearer_metadata(
-        pplx_space_common_svc::bearer_token::SpaceBearerToken::ClusterApi,
+    if let Err(error) = pplx_space_bearer_token::space_bearer_metadata(
+        pplx_space_bearer_token::SpaceBearerToken::ClusterApi,
     ) {
         return Err(classify_token_error(error));
     }
@@ -357,7 +357,7 @@ async fn cluster_api_channel(
         // Discovery is an optimization over the Service address. Missing
         // RBAC or an unavailable Kubernetes API must preserve the old path.
         Err(error) => {
-            pplx_space_common_svc::observability::with_peer_service!(tracing::error!(
+            pplx_space_observability::with_peer_service!(tracing::error!(
                 peer.service = CLUSTER_API_SERVICE_NAME,
                 error = %error,
                 "endpoint discovery unavailable; dialing the service address"

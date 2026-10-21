@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn interceptor_reports_token_source_failure_as_unavailable() {
-    use crate::auth::SpaceBearerInterceptor;
+    use crate::SpaceBearerInterceptor;
 
     let mut env = pplx_space_test_env::TestEnv::default();
     let dir = tempfile::tempdir().unwrap();
@@ -21,7 +21,7 @@ fn interceptor_reports_token_source_failure_as_unavailable() {
 
 #[test]
 fn required_space_bearer_token_reports_source_failure_as_unavailable() {
-    use crate::auth::required_space_bearer_token_from_environment;
+    use crate::required_space_bearer_token_from_environment;
 
     let mut env = pplx_space_test_env::TestEnv::default();
     let dir = tempfile::tempdir().unwrap();
