@@ -22,9 +22,9 @@ table (`node_direct`, `sandbox_direct_route_*`), read the
   placement and Direct admin registration; a request naming an unregistered
   node fails with `NotFound`.
 - `PublishNodeState` writes inventory, projections, node status and receipt
-  consumption in one transaction (`src/publish.rs`), after origin
-  registration commits separately. Keep receipts last, so their fencing sees
-  the final evidence.
+  consumption in one transaction (`src/publish.rs`), after resolving the
+  publisher to its existing registration. Keep receipts last, so their fencing
+  sees the final evidence.
 - A new `public.sandboxes` lifecycle write from a node report rechecks, in
   the write or under a `FOR UPDATE` or `FOR NO KEY UPDATE` row lock taken in
   the same transaction, that `active_node_id` is the authenticated publisher
