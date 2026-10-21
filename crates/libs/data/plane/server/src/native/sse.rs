@@ -82,9 +82,15 @@ pub(crate) async fn session_events(
     if state.drain_started.is_cancelled() {
         return native_draining_response(session_id.kind().as_str());
     }
-    // Refused before anything starts: the process would wait on input this
-    // stream cannot deliver and outlive the request.
-    if attached.kind == SessionKind::Process && process_session_needs_input(&attached) {
+    // Refused only when this attach would start the process, which would then
+    // wait on input this stream cannot deliver and outlive the request. A
+    // process already bound to the session (started over WebSocket, or before
+    // this check existed) reconnects as usual: reading its output starts
+    // nothing.
+    if attached.kind == SessionKind::Process
+        && attached.backend_process_id.is_none()
+        && process_session_needs_input(&attached)
+    {
         return data_plane_http_error(
             StatusCode::BAD_REQUEST,
             DataPlaneHttpErrorCode::InvalidRequest,

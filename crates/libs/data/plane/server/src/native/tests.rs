@@ -722,12 +722,121 @@ async fn binding_survives_a_client_that_disconnects_mid_bind() {
     assert_eq!(fake.bound_process_ids.lock().unwrap().len(), 1);
 }
 
-/// Server-sent events carry no input, so a process session that asks for stdin
-/// or a pty is refused before the worker is asked to start it.
-#[tokio::test]
-async fn events_stream_refuses_process_sessions_that_need_input() {
-    use http_body_util::BodyExt;
+/// A fake cluster API and worker for one process session whose adapter state
+/// asks for input. `bound` persists the session's process binding, as a start
+/// over WebSocket does. The worker serves reconnects only, and every call is
+/// recorded.
+struct InputSessionFake {
+    endpoint: String,
+    calls: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+async fn spawn_input_session_fake(
+    session_id: DataPlaneSessionId,
+    adapter_state: &str,
+    bound: bool,
+) -> InputSessionFake {
     use prost::Message as _;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let process_id = pplx_space_public_api::process_id_for_session(session_id).to_string();
+    let mut route = crate::tests::route_response_with_token(session_id, None);
+    route.backend.as_mut().unwrap().endpoint = endpoint.clone();
+    route.adapter_state_json = adapter_state.to_string();
+    route.backend_process_id = bound.then(|| process_id.clone());
+    let route = route.encode_to_vec();
+    let frame = |event| {
+        let encoded = ProcessEvent {
+            process_id: process_id.clone(),
+            pid: Some(42),
+            event: Some(event),
+        }
+        .encode_to_vec();
+        let mut framed = vec![0];
+        framed.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+        framed.extend(encoded);
+        bytes::Bytes::from(framed)
+    };
+    let events = vec![
+        frame(spaced_process_event::Event::Connected(
+            pplx_space_sbx_mgr_client::proto::SpacedProcessConnected {},
+        )),
+        frame(spaced_process_event::Event::Exit(
+            pplx_space_sbx_mgr_client::proto::SpacedProcessExit {
+                outcome: Some(
+                    pplx_space_sbx_mgr_client::proto::spaced_process_exit::Outcome::Exited(
+                        pplx_space_sbx_mgr_client::proto::SpacedProcessExited { exit_code: 0 },
+                    ),
+                ),
+            },
+        )),
+    ];
+    let calls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let recorded = Arc::clone(&calls);
+    let service = axum::Router::new().fallback(move |request: Request<Body>| {
+        let route = route.clone();
+        let events = events.clone();
+        let recorded = Arc::clone(&recorded);
+        async move {
+            let path = request.uri().path().to_string();
+            recorded.lock().unwrap().push(path.clone());
+            if path.ends_with("/Check") {
+                return crate::tests::grpc_test_response(vec![8, 1]);
+            }
+            if path.ends_with("/ResolveDataPlaneSessionRoute") {
+                return crate::tests::grpc_test_response(route);
+            }
+            if path.ends_with("/SpacedConnectProcess") {
+                let frames = futures_util::stream::iter(
+                    events
+                        .into_iter()
+                        .map(|event| Ok::<_, Infallible>(hyper::body::Frame::data(event))),
+                )
+                .chain(futures_util::stream::pending());
+                return Response::builder()
+                    .header("content-type", "application/grpc")
+                    .body(Body::new(http_body_util::StreamBody::new(frames)))
+                    .unwrap();
+            }
+            tonic::Status::unimplemented("not part of this fake").into_http::<Body>()
+        }
+    });
+    tokio::spawn(async move {
+        axum::serve(listener, service).await.unwrap();
+    });
+    InputSessionFake { endpoint, calls }
+}
+
+async fn get_session_events(
+    fake: &InputSessionFake,
+    session_id: DataPlaneSessionId,
+    last_event_id: Option<&str>,
+) -> (DataPlaneState, Response) {
+    let mut state = crate::tests::test_data_plane_state().await;
+    state.cluster_api = ClusterApiClients::service_only(
+        pplx_space_node_api_client::cluster::connect(fake.endpoint.clone(), "test")
+            .await
+            .unwrap(),
+    );
+    state.revocation_check_interval = Duration::from_secs(3600);
+    let token = format!("{DATA_PLANE_TOKEN_PREFIX}{}", "c".repeat(64));
+    let mut request = Request::get(format!("/v1/sessions/{session_id}/events"))
+        .header(header::AUTHORIZATION, format!("Bearer {token}"));
+    if let Some(last_event_id) = last_event_id {
+        request = request.header("last-event-id", last_event_id);
+    }
+    let response =
+        tower::ServiceExt::oneshot(router(state.clone()), request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+    (state, response)
+}
+
+/// Server-sent events carry no input, so an events attach that would start a
+/// process asking for stdin or a pty is refused before the worker is called.
+#[tokio::test]
+async fn events_stream_refuses_to_start_process_sessions_that_need_input() {
+    use http_body_util::BodyExt;
     if !binding_fake_test_process() {
         return;
     }
@@ -736,48 +845,8 @@ async fn events_stream_refuses_process_sessions_that_need_input() {
         r#"{"command":["sh"],"pty":{"rows":24,"cols":80}}"#,
     ] {
         let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let mut route = crate::tests::route_response_with_token(session_id, None);
-        route.backend.as_mut().unwrap().endpoint = endpoint.clone();
-        route.adapter_state_json = adapter_state.to_string();
-        let route = route.encode_to_vec();
-        let calls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-        let recorded = Arc::clone(&calls);
-        let service = axum::Router::new().fallback(move |request: Request<Body>| {
-            let route = route.clone();
-            let recorded = Arc::clone(&recorded);
-            async move {
-                let path = request.uri().path().to_string();
-                recorded.lock().unwrap().push(path.clone());
-                if path.ends_with("/Check") {
-                    return crate::tests::grpc_test_response(vec![8, 1]);
-                }
-                if path.ends_with("/ResolveDataPlaneSessionRoute") {
-                    return crate::tests::grpc_test_response(route);
-                }
-                tonic::Status::unimplemented("not part of this fake").into_http::<Body>()
-            }
-        });
-        tokio::spawn(async move {
-            axum::serve(listener, service).await.unwrap();
-        });
-        let mut state = crate::tests::test_data_plane_state().await;
-        state.cluster_api = ClusterApiClients::service_only(
-            pplx_space_node_api_client::cluster::connect(endpoint, "test")
-                .await
-                .unwrap(),
-        );
-        let token = format!("{DATA_PLANE_TOKEN_PREFIX}{}", "c".repeat(64));
-        let response = tower::ServiceExt::oneshot(
-            router(state.clone()),
-            Request::get(format!("/v1/sessions/{session_id}/events"))
-                .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+        let fake = spawn_input_session_fake(session_id, adapter_state, false).await;
+        let (state, response) = get_session_events(&fake, session_id, None).await;
 
         assert_eq!(
             response.status(),
@@ -788,7 +857,7 @@ async fn events_stream_refuses_process_sessions_that_need_input() {
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"]["code"], "invalid_request", "{body}");
         assert_eq!(body["error"]["retryable"], false, "{body}");
-        let calls = calls.lock().unwrap();
+        let calls = fake.calls.lock().unwrap();
         assert!(
             calls
                 .iter()
@@ -798,11 +867,57 @@ async fn events_stream_refuses_process_sessions_that_need_input() {
         assert!(
             !calls
                 .iter()
-                .any(|path| path.ends_with("/SpacedStartProcess")),
-            "no process was started: {calls:?}"
+                .any(|path| path.ends_with("/SpacedStartProcess")
+                    || path.ends_with("/SpacedConnectProcess")),
+            "the worker was not called: {calls:?}"
         );
         assert!(!state.native_sessions.is_active(session_id));
     }
+}
+
+/// A process the session already started, over WebSocket or before the
+/// refusal existed, is only read from, so an events reconnect still resumes it.
+#[tokio::test]
+async fn events_stream_resumes_started_process_sessions_that_need_input() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake =
+        spawn_input_session_fake(session_id, r#"{"command":["cat"],"stdin":true}"#, true).await;
+    let (_state, response) = get_session_events(&fake, session_id, Some("3")).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    let seen = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut seen = String::new();
+        while !seen.contains("process_exited") {
+            let Some(Ok(frame)) = body.frame().await else {
+                break;
+            };
+            if let Ok(data) = frame.into_data() {
+                seen.push_str(&String::from_utf8_lossy(&data));
+            }
+        }
+        seen
+    })
+    .await
+    .expect("the resumed stream reports the exit within 5s");
+    assert!(seen.contains("resync_required"), "{seen}");
+    assert!(seen.contains("process_exited"), "{seen}");
+    let calls = fake.calls.lock().unwrap();
+    assert!(
+        calls
+            .iter()
+            .any(|path| path.ends_with("/SpacedConnectProcess")),
+        "{calls:?}"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|path| path.ends_with("/SpacedStartProcess")),
+        "nothing was started: {calls:?}"
+    );
 }
 
 /// How a fake cluster API answers revocation checks.

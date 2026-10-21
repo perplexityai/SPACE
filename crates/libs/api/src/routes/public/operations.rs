@@ -190,10 +190,17 @@ pub(super) fn accepts_event_stream(headers: &HeaderMap) -> bool {
         .and_then(|value| value.to_str().ok())
         .is_some_and(|accept| {
             accept.split(',').any(|part| {
-                part.trim()
-                    .split(';')
+                let mut parts = part.trim().split(';');
+                parts
                     .next()
                     .is_some_and(|media_type| media_type.trim() == "text/event-stream")
+                    // `q=0` marks the type as not acceptable (RFC 9110, 12.4.2).
+                    && !parts.any(|parameter| {
+                        parameter.split_once('=').is_some_and(|(name, value)| {
+                            name.trim().eq_ignore_ascii_case("q")
+                                && value.trim().parse::<f32>().is_ok_and(|q| q <= 0.0)
+                        })
+                    })
             })
         })
 }

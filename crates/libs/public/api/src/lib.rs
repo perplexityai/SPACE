@@ -1589,14 +1589,15 @@ pub struct CreateCommandRequest {
     pub env: EnvMap,
     /// Runs the command in a pseudo-terminal of this size. Server-sent events
     /// carry no input, so a command with `pty` is rejected with
-    /// `invalid_request` when created with `Accept: text/event-stream` or
-    /// attached at `/sessions/{session_id}/events`. Only a WebSocket attach
-    /// can drive it.
+    /// `invalid_request` when created with `Accept: text/event-stream`, and
+    /// `/sessions/{session_id}/events` refuses to start it. Only a WebSocket
+    /// attach can drive it; once started, `/events` can read its output.
     pub pty: Option<TerminalSize>,
     /// Keeps standard input open for writing. Server-sent events carry no
     /// input, so `true` is rejected with `invalid_request` when created with
-    /// `Accept: text/event-stream` or attached at
-    /// `/sessions/{session_id}/events`. Only a WebSocket attach can write it.
+    /// `Accept: text/event-stream`, and `/sessions/{session_id}/events`
+    /// refuses to start the command. Only a WebSocket attach can write it;
+    /// once started, `/events` can read its output.
     pub stdin: Option<bool>,
     /// Guest user to run as. Defaults to the sandbox's configured user.
     #[cfg_attr(

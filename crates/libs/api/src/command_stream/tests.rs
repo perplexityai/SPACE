@@ -412,6 +412,18 @@ async fn streamed_commands_that_ask_for_input_are_refused_before_the_create() ->
     }
     assert!(seen.lock().unwrap().is_empty());
 
+    // A zero-weight event stream is a JSON create, which keeps accepting input.
+    let declined = post_command_body(
+        &fixture,
+        Some("declined-stream"),
+        Some("text/event-stream;q=0, application/json"),
+        &json!({"command": ["cat"], "stdin": true}),
+    )
+    .await?;
+    assert_eq!(declined.status, StatusCode::CREATED, "{}", declined.body);
+    assert_eq!(declined.content_type.as_deref(), Some("application/json"));
+    assert!(seen.lock().unwrap().is_empty());
+
     // `stdin: false` asks for no input.
     let closed_stdin = post_command_body(
         &fixture,
