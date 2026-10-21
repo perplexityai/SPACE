@@ -6,15 +6,11 @@ use axum::{
 };
 use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::{SEED_ORG_ID, TestDb, TestDbResult, pg_test_db};
-use pplx_space_feature_flags::{
-    AttributeValue, FeatureFlagClient, FeatureFlagProvider, ProviderState, Unresolved,
-};
-use pplx_space_public_api::{
-    PublicSandboxId,
-    routes::{NATIVE_V1_OPERATIONS, NativeSurface},
-};
+use pplx_space_feature_flags::{AttributeValue, FeatureFlagProvider, ProviderState, Unresolved};
+use pplx_space_public_api::{PublicSandboxId, routes::NATIVE_V1_OPERATIONS};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::env::VarError;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -34,54 +30,151 @@ const ROOTS: [&str; 3] = [
     "/elsewhere/v1",
 ];
 
+fn listing(orgs: EnabledOrgs) -> HiddenOperationsGate {
+    HiddenOperationsGate {
+        orgs,
+        ..HiddenOperationsGate::default()
+    }
+}
+
 #[test]
 fn the_env_override_names_every_org_or_a_list_of_them() {
     let org = OrgId::from_uuid(SEED_ORG_ID);
     let other = OrgId::from_uuid(Uuid::from_u128(2));
     for (raw, expected) in [
-        (None, Some(HiddenOperationsGate::FlagOnly)),
-        (Some(""), Some(HiddenOperationsGate::FlagOnly)),
-        (Some(" "), Some(HiddenOperationsGate::FlagOnly)),
-        (Some("*"), Some(HiddenOperationsGate::AllOrgs)),
+        (None, Ok(EnabledOrgs::None)),
+        (Some(""), Ok(EnabledOrgs::None)),
+        (Some(" "), Ok(EnabledOrgs::None)),
+        (Some("*"), Ok(EnabledOrgs::All)),
         (
             Some(&format!("{org}, {other}")),
-            Some(HiddenOperationsGate::Orgs(BTreeSet::from([org, other]))),
+            Ok(EnabledOrgs::Listed(BTreeSet::from([org, other]))),
         ),
-        (Some(&format!("{org},*")), None),
-        (Some(&format!("{org},")), None),
-        (Some("not-an-org"), None),
+        (
+            Some(&format!("{org},*")),
+            Err("SPACE_NATIVE_HIDDEN_OPERATIONS_ORGS: `*` must stand alone, not in a list of org ids".to_owned()),
+        ),
+        (
+            Some(&format!("{org},")),
+            Err(r#"SPACE_NATIVE_HIDDEN_OPERATIONS_ORGS must be `*` or comma-separated org ids; "" is not an org id"#.to_owned()),
+        ),
+        (
+            Some("not-an-org"),
+            Err(r#"SPACE_NATIVE_HIDDEN_OPERATIONS_ORGS must be `*` or comma-separated org ids; "not-an-org" is not an org id"#.to_owned()),
+        ),
     ] {
-        assert_eq!(HiddenOperationsGate::parse(raw).ok(), expected, "{raw:?}");
+        let orgs = raw.map_or(Err(VarError::NotPresent), |raw| Ok(raw.to_owned()));
+        let parsed = HiddenOperationsGate::from_vars(orgs, Err(VarError::NotPresent))
+            .map(|gate| gate.orgs)
+            .map_err(|error| error.to_string());
+        assert_eq!(parsed, expected, "{raw:?}");
+    }
+}
+
+#[test]
+fn the_flag_master_is_on_unless_set_off_and_refuses_anything_else() {
+    for (raw, expected) in [
+        (None, Some(true)),
+        (Some(""), Some(true)),
+        (Some("true"), Some(true)),
+        (Some("1"), Some(true)),
+        (Some("FALSE"), Some(false)),
+        (Some(" 0 "), Some(false)),
+        (Some("off-ish"), None),
+    ] {
+        let master = raw.map_or(Err(VarError::NotPresent), |raw| Ok(raw.to_owned()));
+        let parsed = HiddenOperationsGate::from_vars(Err(VarError::NotPresent), master)
+            .ok()
+            .map(|gate| gate.flag_enabled);
+        assert_eq!(parsed, expected, "{raw:?}");
+    }
+}
+
+#[test]
+fn a_value_that_is_not_unicode_fails_startup_rather_than_reading_as_unset() {
+    use std::os::unix::ffi::OsStringExt;
+    let not_unicode = || {
+        Err(VarError::NotUnicode(std::ffi::OsString::from_vec(vec![
+            0xff,
+        ])))
+    };
+    for (orgs, master, name) in [
+        (
+            not_unicode(),
+            Err(VarError::NotPresent),
+            HIDDEN_OPERATIONS_ORGS_ENV,
+        ),
+        (
+            Err(VarError::NotPresent),
+            not_unicode(),
+            HIDDEN_OPERATIONS_FLAG_ENV,
+        ),
+    ] {
+        assert!(
+            matches!(
+                HiddenOperationsGate::from_vars(orgs, master),
+                Err(HiddenOperationsConfigError::NotUnicode(failed)) if failed == name
+            ),
+            "{name}"
+        );
+    }
+}
+
+/// With its env master off the flag opens nothing, even for an org it
+/// targets; the env list still opens the orgs it names.
+#[test]
+fn the_flag_master_closes_every_org_the_flag_opened_and_none_the_list_did() {
+    let listed = OrgId::from_uuid(SEED_ORG_ID);
+    let flagged = OrgId::from_uuid(Uuid::from_u128(2));
+    let flags = FeatureFlagClient::fixed_bools([(SPACE_NATIVE_HIDDEN_OPERATIONS_FLAG.key(), true)]);
+    let gate = |flag_enabled| HiddenOperationsGate {
+        orgs: EnabledOrgs::Listed(BTreeSet::from([listed])),
+        flag_enabled,
+    };
+    for (flag_enabled, org, expected) in [
+        (true, flagged, true),
+        (false, flagged, false),
+        (true, listed, true),
+        (false, listed, true),
+    ] {
+        assert_eq!(
+            gate(flag_enabled).allows(&flags, org, native::LIST_SNAPSHOTS),
+            expected,
+            "master {flag_enabled}, org {org}"
+        );
+        assert!(gate(flag_enabled).allows(&flags, org, native::LIST_PROCESSES));
     }
 }
 
 /// Each hidden operation is enforced by exactly one of the two checks: it owns
 /// its mount and gets the route gate, or it is a sandbox action, which
-/// `parse_action_segment` checks. Any other shared mount refuses to build.
+/// `parse_action_segment` checks.
 #[test]
 fn every_hidden_operation_is_enforced_by_its_route_or_its_action() {
     let mut mounts = BTreeMap::<_, Vec<NativeOperation>>::new();
-    for operation in NATIVE_V1_OPERATIONS
-        .iter()
-        .filter(|operation| operation.surface() == NativeSurface::ControlPlane)
-    {
-        mounts
-            .entry((operation.relative_runtime_path(), operation.method()))
-            .or_default()
-            .push(*operation);
+    for operation in NATIVE_V1_OPERATIONS {
+        assert!(
+            operation.surface() == NativeSurface::ControlPlane
+                || !operation.status().is_hidden_by_default(),
+            "{operation:?}"
+        );
+        if operation.surface() == NativeSurface::ControlPlane {
+            mounts
+                .entry((operation.relative_runtime_path(), operation.method()))
+                .or_default()
+                .push(*operation);
+        }
     }
-    for operations in mounts.values() {
-        let gate = route_gate(operations);
-        for operation in operations {
+    let mounts = mounts.values().map(Vec::as_slice).collect::<Vec<_>>();
+    for (operations, gate) in mounts.iter().zip(route_gates(&mounts)) {
+        for operation in *operations {
             if !operation.status().is_hidden_by_default() {
                 assert_ne!(gate, Some(*operation), "{operation:?}");
             } else if gate != Some(*operation) {
                 let action = operation
                     .path()
                     .rsplit_once(':')
-                    .and_then(|(_, action)| {
-                        pplx_space_public_api::SandboxLifecycleAction::parse_known(action).ok()
-                    })
+                    .and_then(|(_, action)| SandboxLifecycleAction::parse_known(action).ok())
                     .unwrap_or_else(|| panic!("{operation:?} is not enforced"));
                 assert_eq!(
                     super::super::sandboxes::lifecycle_operation(action),
@@ -90,9 +183,60 @@ fn every_hidden_operation_is_enforced_by_its_route_or_its_action() {
             }
         }
     }
-    let uncovered =
-        std::panic::catch_unwind(|| route_gate(&[native::LIST_SNAPSHOTS, native::LIST_PROCESSES]));
-    assert!(uncovered.is_err(), "a hidden operation on a shared mount");
+}
+
+/// Building the router refuses a hidden operation that neither check would
+/// cover, rather than serving it to every org.
+#[test]
+fn the_router_refuses_a_hidden_operation_no_check_covers() {
+    let mounts: &[&[NativeOperation]] = &[
+        &[native::LIST_SNAPSHOTS],
+        &[native::GET_SESSION],
+        &[native::REVOKE_SESSION],
+        &[
+            native::START_SANDBOX,
+            native::ROLLBACK_SANDBOX,
+            native::SET_SANDBOX_TIMEOUT,
+        ],
+        &[native::LIST_PROCESSES, native::CREATE_COMMAND],
+    ];
+    let manifest = &[
+        native::LIST_SNAPSHOTS,
+        native::GET_SESSION,
+        native::REVOKE_SESSION,
+        native::START_SANDBOX,
+        native::ROLLBACK_SANDBOX,
+        native::SET_SANDBOX_TIMEOUT,
+        native::LIST_PROCESSES,
+        native::CREATE_COMMAND,
+        native::STREAM_SESSION_EVENTS,
+    ];
+    let gates = |hidden: &'static [NativeOperation]| {
+        std::panic::catch_unwind(|| {
+            route_gates_marking(mounts, manifest, |operation| hidden.contains(&operation))
+        })
+    };
+    assert_eq!(
+        gates(&[native::LIST_SNAPSHOTS, native::ROLLBACK_SANDBOX]).ok(),
+        Some(vec![Some(native::LIST_SNAPSHOTS), None, None, None, None]),
+    );
+    for (hidden, why) in [
+        (
+            &[native::LIST_PROCESSES][..],
+            "a shared mount that is not the action mount",
+        ),
+        (
+            &[native::SET_SANDBOX_TIMEOUT],
+            "an action answered before the action parser",
+        ),
+        (&[native::STREAM_SESSION_EVENTS], "a data-plane operation"),
+        (
+            &[native::GET_SESSION],
+            "a path another method is mounted on",
+        ),
+    ] {
+        assert!(gates(hidden).is_err(), "{why}");
+    }
 }
 
 /// A flag backend that opens hidden operations only for `subject`, and only
@@ -212,7 +356,7 @@ impl Fixture {
     /// Admit a create as `headers` names the caller, and record its sandbox
     /// as started.
     async fn seed(state: &AppState, headers: &HeaderMap) -> TestDbResult<String> {
-        let (status, created) = send(
+        let (status, _, created) = send(
             &app(state.clone()),
             Method::POST,
             "/v1/sandboxes",
@@ -256,7 +400,7 @@ async fn send(
     path: &str,
     headers: &HeaderMap,
     body: Value,
-) -> TestDbResult<(StatusCode, Value)> {
+) -> TestDbResult<(StatusCode, HeaderMap, Value)> {
     let mut request = Request::builder()
         .method(method.clone())
         .uri(path)
@@ -270,13 +414,14 @@ async fn send(
         .oneshot(request.body(Body::from(serde_json::to_vec(&body)?))?)
         .await?;
     let status = response.status();
+    let headers = response.headers().clone();
     let body = axum::body::to_bytes(response.into_body(), 1024 * 1024).await?;
     let body = if body.is_empty() {
         Value::Null
     } else {
         serde_json::from_slice(&body)?
     };
-    Ok((status, body))
+    Ok((status, headers, body))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -297,38 +442,38 @@ async fn hidden_operations_answer_as_nonexistent_unless_the_effective_org_is_ena
     let cases: [(&str, GateFor, FlagsFor, Enabled); 7] = [
         (
             "nothing enabled",
-            Box::new(|_| HiddenOperationsGate::FlagOnly),
+            Box::new(|_| HiddenOperationsGate::default()),
             Box::new(|_| FeatureFlagClient::disabled()),
             |_, _| false,
         ),
         (
             "an unrelated org listed",
-            Box::new(move |_| HiddenOperationsGate::Orgs(BTreeSet::from([unrelated]))),
+            Box::new(move |_| listing(EnabledOrgs::Listed(BTreeSet::from([unrelated])))),
             Box::new(|_| FeatureFlagClient::disabled()),
             |_, _| false,
         ),
         // The key's own org owns only the key's local data, not its end users'.
         (
             "the integration key's org listed",
-            Box::new(move |_| HiddenOperationsGate::Orgs(BTreeSet::from([local_org]))),
+            Box::new(move |_| listing(EnabledOrgs::Listed(BTreeSet::from([local_org])))),
             Box::new(|_| FeatureFlagClient::disabled()),
             |caller, _| caller == Caller::Local,
         ),
         (
             "the federated owner's org listed",
-            Box::new(|federated| HiddenOperationsGate::Orgs(BTreeSet::from([federated]))),
+            Box::new(|federated| listing(EnabledOrgs::Listed(BTreeSet::from([federated])))),
             Box::new(|_| FeatureFlagClient::disabled()),
             |caller, _| caller == Caller::Federated,
         ),
         (
             "every org",
-            Box::new(|_| HiddenOperationsGate::AllOrgs),
+            Box::new(|_| listing(EnabledOrgs::All)),
             Box::new(|_| FeatureFlagClient::disabled()),
             |_, _| true,
         ),
         (
             "the flag on for everyone",
-            Box::new(|_| HiddenOperationsGate::FlagOnly),
+            Box::new(|_| HiddenOperationsGate::default()),
             Box::new(|_| {
                 FeatureFlagClient::fixed_bools([(SPACE_NATIVE_HIDDEN_OPERATIONS_FLAG.key(), true)])
             }),
@@ -336,7 +481,7 @@ async fn hidden_operations_answer_as_nonexistent_unless_the_effective_org_is_ena
         ),
         (
             "the flag targeting the federated org's snapshot list",
-            Box::new(|_| HiddenOperationsGate::FlagOnly),
+            Box::new(|_| HiddenOperationsGate::default()),
             Box::new(|federated| {
                 FeatureFlagClient::from_provider(Targeted {
                     subject: federated.to_string(),
@@ -368,7 +513,8 @@ async fn hidden_operations_answer_as_nonexistent_unless_the_effective_org_is_ena
                 let case = format!("{case}: {caller:?} under {root}");
 
                 // A route only a hidden operation owns answers, for every
-                // method and every id, as a route that does not exist.
+                // method and every id, as a route that does not exist,
+                // headers included: no `Allow` naming the hidden method.
                 let visible = enabled(caller, native::LIST_SNAPSHOTS);
                 for (method, id, visible_status) in [
                     (Method::GET, ids[0], StatusCode::OK),
@@ -376,6 +522,7 @@ async fn hidden_operations_answer_as_nonexistent_unless_the_effective_org_is_ena
                     (Method::GET, ids[2], StatusCode::NOT_FOUND),
                     (Method::HEAD, ids[0], StatusCode::OK),
                     (Method::OPTIONS, ids[0], StatusCode::METHOD_NOT_ALLOWED),
+                    (Method::POST, ids[0], StatusCode::METHOD_NOT_ALLOWED),
                 ] {
                     let path = format!("{root}/sandboxes/{id}/snapshots");
                     let answer = send(app, method.clone(), &path, &headers, Value::Null).await?;
@@ -410,33 +557,43 @@ async fn hidden_operations_answer_as_nonexistent_unless_the_effective_org_is_ena
                 }
             }
 
-            // A visible incubating action on the same mount is served regardless.
-            let path = format!("/v1/sandboxes/{own}:stop");
-            let answer = send(app, Method::POST, &path, &headers, Value::Null).await?;
-            assert_eq!(
-                answer.0,
-                StatusCode::ACCEPTED,
-                "{case}: {caller:?}: {answer:?}"
-            );
+            // Visible incubating actions on the same mount are served
+            // regardless: `:resume` and `:restore` reach transitions `:wake`
+            // already offers, and `:disable_snapshots` is the off switch for
+            // a schedule enabled before the gate.
+            for action in ["stop", "resume", "restore", "disable_snapshots"] {
+                let path = format!("/v1/sandboxes/{own}:{action}");
+                let answer = send(app, Method::POST, &path, &headers, Value::Null).await?;
+                assert_eq!(
+                    answer.0,
+                    StatusCode::ACCEPTED,
+                    "{case}: {caller:?}: {path}: {answer:?}"
+                );
+            }
         }
     }
     Ok(())
 }
 
 /// The full document lists hidden operations, so it needs the same
-/// credentials as `/v1`; the default one stays public.
+/// credentials as `/v1`; the default one stays public. It reads no tenant
+/// data, so a service credential that resolves no actor may fetch it too.
 #[tokio::test]
 async fn only_the_full_contract_requires_authentication() -> TestDbResult<()> {
+    const ACTORLESS_KEY: &str = "hidden-operations-docs-actorless-key";
     let db = pg_test_db().await?;
-    sqlx::query(sql!(
-        "INSERT INTO api_keys (id, org_id, name, key_hash, allowed_surfaces)
-         VALUES ($1, $2, 'hidden-operations-docs-test', $3, ARRAY['native'])"
-    ))
-    .bind(Uuid::now_v7())
-    .bind(SEED_ORG_ID)
-    .bind(crate::auth::hash_token(KEY))
-    .execute(&db.pool)
-    .await?;
+    // The second seeded org has no users, so its key resolves no actor.
+    for (key, org) in [(KEY, SEED_ORG_ID), (ACTORLESS_KEY, Uuid::from_u128(2))] {
+        sqlx::query(sql!(
+            "INSERT INTO api_keys (id, org_id, name, key_hash, allowed_surfaces)
+             VALUES ($1, $2, 'hidden-operations-docs-test', $3, ARRAY['native'])"
+        ))
+        .bind(Uuid::now_v7())
+        .bind(org)
+        .bind(crate::auth::hash_token(key))
+        .execute(&db.pool)
+        .await?;
+    }
     let app = crate::routes::router(AppState::from_pool(db.pool.clone()).await?);
     let operations = |document: &Value| {
         document["paths"]
@@ -463,10 +620,19 @@ async fn only_the_full_contract_requires_authentication() -> TestDbResult<()> {
         let (status, body) = get(format!("{root}/openapi-full.json"), None).await?;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{root}: {body}");
         assert_eq!(body["code"], "unauthorized", "{root}: {body}");
-        let (status, full) = get(format!("{root}/openapi-full.json"), Some(KEY)).await?;
-        assert_eq!(status, StatusCode::OK, "{root}/openapi-full.json: {full}");
-        assert_eq!(operations(&full), NATIVE_V1_OPERATIONS.len(), "{root}");
-        assert!(operations(&default) < operations(&full), "{root}");
+        for key in [KEY, ACTORLESS_KEY] {
+            let (status, full) = get(format!("{root}/openapi-full.json"), Some(key)).await?;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{root}/openapi-full.json: {key}: {full}"
+            );
+            assert_eq!(operations(&full), NATIVE_V1_OPERATIONS.len(), "{root}");
+            assert!(operations(&default) < operations(&full), "{root}");
+        }
+        // The marker the documents set does not leak to `/v1`.
+        let (status, body) = get(format!("{root}/v1/templates"), Some(ACTORLESS_KEY)).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{root}/v1/templates: {body}");
     }
     Ok(())
 }

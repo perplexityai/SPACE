@@ -31,9 +31,11 @@ pub const MAX_AGGREGATE_UTF8_BYTES_EXTENSION: &str = "x-space-max-aggregate-utf8
 pub enum NativeOperationStatus {
     M1Supported,
     Incubating,
-    /// Incubating and not served by default: the API answers it as an
-    /// unmounted route, and the default OpenAPI document omits it, unless the
-    /// caller's org is enabled for hidden operations.
+    /// Incubating and not served by default: unless the caller's org is
+    /// enabled for hidden operations, the API answers a hidden route as an
+    /// unmounted one and a hidden sandbox action as an unknown action.
+    /// `/openapi.json` omits it for every caller; only the authenticated
+    /// `/openapi-full.json` documents it.
     IncubatingHidden,
 }
 
@@ -227,12 +229,12 @@ native_operations! {
     GET_SANDBOX_STATS = NativeOperation::new("/v1/sandboxes/{sandbox_id}/stats", Get, "getSandboxStats", Incubating);
     CREATE_TERMINAL_SESSION = NativeOperation::new("/v1/sandboxes/{sandbox_id}/terminal-sessions", Post, "createTerminalSession", Incubating);
     CHECKPOINT_SANDBOX = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}:checkpoint", SANDBOX_ACTION_RUNTIME_PATH, Post, "checkpointSandbox", IncubatingHidden);
-    DISABLE_SANDBOX_SNAPSHOTS = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}:disable_snapshots", SANDBOX_ACTION_RUNTIME_PATH, Post, "disableSandboxSnapshots", IncubatingHidden);
+    DISABLE_SANDBOX_SNAPSHOTS = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}:disable_snapshots", SANDBOX_ACTION_RUNTIME_PATH, Post, "disableSandboxSnapshots", Incubating);
     ENABLE_SANDBOX_SNAPSHOTS = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}:enable_snapshots", SANDBOX_ACTION_RUNTIME_PATH, Post, "enableSandboxSnapshots", IncubatingHidden);
     KILL_SANDBOX = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}:kill", SANDBOX_ACTION_RUNTIME_PATH, Post, "killSandbox", Incubating);
     PAUSE_SANDBOX = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}:pause", SANDBOX_ACTION_RUNTIME_PATH, Post, "pauseSandbox", M1Supported);
-    RESTORE_SANDBOX = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}:restore", SANDBOX_ACTION_RUNTIME_PATH, Post, "restoreSandbox", IncubatingHidden);
-    RESUME_SANDBOX = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}:resume", SANDBOX_ACTION_RUNTIME_PATH, Post, "resumeSandbox", IncubatingHidden);
+    RESTORE_SANDBOX = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}:restore", SANDBOX_ACTION_RUNTIME_PATH, Post, "restoreSandbox", Incubating);
+    RESUME_SANDBOX = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}:resume", SANDBOX_ACTION_RUNTIME_PATH, Post, "resumeSandbox", Incubating);
     ROLLBACK_SANDBOX = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}:rollback", SANDBOX_ACTION_RUNTIME_PATH, Post, "rollbackSandbox", IncubatingHidden);
     START_SANDBOX = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}:start", SANDBOX_ACTION_RUNTIME_PATH, Post, "startSandbox", Incubating);
     STOP_SANDBOX = NativeOperation::with_runtime_path("/v1/sandboxes/{sandbox_id}:stop", SANDBOX_ACTION_RUNTIME_PATH, Post, "stopSandbox", Incubating);

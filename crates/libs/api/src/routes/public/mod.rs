@@ -3,12 +3,13 @@ use axum::{
     extract::DefaultBodyLimit,
     handler::Handler,
     middleware,
-    routing::{MethodFilter, MethodRouter, on},
+    routing::{MethodFilter, MethodRouter, any_service, on},
 };
 use pplx_space_public_api::routes::{self as native, NativeHttpMethod, NativeOperation};
+use tower::Layer as _;
 
 use super::AppState;
-use crate::middleware::auth::require_native_auth;
+use crate::middleware::auth::{owner_not_required, require_native_auth};
 
 mod credential_references;
 mod cursors;
@@ -279,28 +280,45 @@ pub fn v1_router(state: AppState) -> Router<AppState> {
             None => mounts.push((operation, method_router, vec![operation])),
         }
     }
+    let gates = hidden_operations::route_gates(
+        &mounts
+            .iter()
+            .map(|(_, _, operations)| operations.as_slice())
+            .collect::<Vec<_>>(),
+    );
     let mut router = Router::new();
-    for (operation, method_router, operations) in mounts {
+    for ((operation, method_router, _), gate) in mounts.into_iter().zip(gates) {
         let method_router = if fails_over_from_silent_pods(operation) {
             method_router.layer(middleware::from_fn(native_data_plane))
         } else {
             method_router
         };
         // Owner scoping runs per mount rather than router-wide so that the
-        // hidden-operation gate can be layered outside it, on the mount it
-        // guards: a hidden route answers as an unmounted one, whatever
-        // sandbox it names.
-        let mut method_router = method_router.layer(middleware::from_fn_with_state(
+        // hidden-operation gate can run outside it: a hidden route answers as
+        // an unmounted one, whatever sandbox it names.
+        let method_router = method_router.layer(middleware::from_fn_with_state(
             state.clone(),
             owner_scope::authorize,
         ));
-        if let Some(hidden) = hidden_operations::route_gate(&operations) {
-            method_router = method_router.layer(middleware::from_fn_with_state(
-                (state.clone(), hidden),
-                hidden_operations::hide_unless_enabled,
-            ));
-        }
-        router = router.route(operation.relative_runtime_path(), method_router);
+        let path = operation.relative_runtime_path();
+        router = match gate {
+            // Around the whole method router, not layered into it: axum adds
+            // a method router's `Allow` header to its 405 fallback after any
+            // layer inside it has answered, and an unmounted route has none.
+            // `any_service` sends every method through the gate and adds no
+            // `Allow` of its own.
+            Some(hidden) => router.route(
+                path,
+                any_service(
+                    middleware::from_fn_with_state(
+                        (state.clone(), hidden),
+                        hidden_operations::hide_unless_enabled,
+                    )
+                    .layer(method_router.with_state(state.clone())),
+                ),
+            ),
+            None => router.route(path, method_router),
+        };
     }
     router
         .fallback(error::public_route_not_found)
@@ -309,14 +327,17 @@ pub fn v1_router(state: AppState) -> Router<AppState> {
         .layer(middleware::from_fn(request_context::with_public_request_id))
 }
 
-/// `method_router` behind the same authentication and error envelope as
-/// [`v1_router`], for a document that is not itself a `/v1` operation.
+/// `method_router` behind the same credentials and error envelope as
+/// [`v1_router`], for a document that is not itself a `/v1` operation. It
+/// reads no tenant data, so it needs no effective owner: a service credential
+/// that resolves no actor may fetch it too.
 pub(crate) fn with_native_auth(
     state: AppState,
     method_router: MethodRouter<AppState>,
 ) -> MethodRouter<AppState> {
     method_router
         .layer(middleware::from_fn_with_state(state, require_native_auth))
+        .layer(middleware::from_fn(owner_not_required))
         .layer(middleware::from_fn(error::normalize_public_error_response))
         .layer(middleware::from_fn(request_context::with_public_request_id))
 }

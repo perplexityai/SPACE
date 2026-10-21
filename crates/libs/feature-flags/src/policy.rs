@@ -55,6 +55,13 @@
 //! are the same policy without a client, for a caller that already holds a read
 //! and for tests that want the policy without a backend.
 //!
+//! A gate that a deployment can also open without a provider, as
+//! `space-native-hidden-operations` is opened by an env list of orgs, still
+//! passes its master here and ORs the list outside the gate. The master then
+//! closes everything the flag opened and nothing the list did, so the list is
+//! not an exception to "env off is a kill switch": it is a second, static
+//! answer the master was never asked about.
+//!
 //! A gate answers `bool`, so its two "nothing resolved" reasons collapse into
 //! the flag's declared fallback. An override has no declaration to fall back to
 //! and its value *may itself be* the feature, so [`Override`] keeps "the master

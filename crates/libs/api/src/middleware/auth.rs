@@ -132,6 +132,18 @@ const SERVICE_CREDENTIAL_OPERATIONS: &[NativeOperation] = &[
     routes::READ_FILE,
 ];
 
+/// Set by [`owner_not_required`]; a client cannot set it.
+#[derive(Clone, Copy, Debug)]
+struct OwnerNotRequired;
+
+/// Layered outside [`require_native_auth`] on a route that needs a native
+/// credential but no effective owner, so a service credential with no actor
+/// may call it whatever its path.
+pub(crate) async fn owner_not_required(mut request: Request, next: Next) -> Response {
+    request.extensions_mut().insert(OwnerNotRequired);
+    next.run(request).await
+}
+
 /// Absent or unrecognised routing information denies, so a request this
 /// cannot classify is refused rather than allowed.
 fn service_credential_may_call(request: &Request) -> bool {
@@ -299,7 +311,10 @@ pub async fn require_native_auth(
                 }
             }
             let actor = context.actor.clone();
-            if actor.is_none() && !service_credential_may_call(&request) {
+            if actor.is_none()
+                && request.extensions().get::<OwnerNotRequired>().is_none()
+                && !service_credential_may_call(&request)
+            {
                 return crate::routes::public::error::PublicApiError::forbidden(
                     "this operation requires an effective owner; a service credential cannot call it",
                 )

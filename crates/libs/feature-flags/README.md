@@ -143,7 +143,7 @@ can match on beyond the subject.
 | `space-net-gateway-known-egress-domains` | JSON object | sandbox id | none | the deployment's local list |
 | `space-cluster-api-client-side-balancing` | boolean | `sandbox:`/`session:`/`org:` prefixed id | `cluster_id` | off |
 | `space-native-create-pool-claim` | boolean | constant `space-cluster` | none | off |
-| `space-native-hidden-operations` | boolean | org id | `operation_id` | off |
+| `space-native-hidden-operations` | boolean | SPACE org id | `operation_id` | off |
 | `space-snapshot-retention-config` | JSON object | cluster id | none | env-configured limits |
 
 Each fallback is chosen so that losing the flag backend cannot turn a
@@ -152,6 +152,13 @@ that would enable new behavior fall back **off**. All three JSON keys fall back
 to whatever their deployment configured locally rather than to a value chosen
 here, because an override that resolves nothing should leave local
 configuration standing — see `policy::override_allowed`.
+
+`space-native-hidden-operations` opens hidden native operations to an org, so
+its env master, `SPACE_NATIVE_HIDDEN_OPERATIONS_FLAG_ENABLED` (on by default),
+is how a deployment closes every org the flag opened without touching the flag
+source. Orgs listed in `SPACE_NATIVE_HIDDEN_OPERATIONS_ORGS` stay open either
+way. Its subject is SPACE's own org id: for a federated owner, the org SPACE
+materialized for it, not the upstream org id the integrator sends.
 
 Sandbox-fork admission is controlled solely by `SPACE_SANDBOX_FORK_ENABLED`,
 which defaults to `true`. Set it to `false` on the API service and redeploy to

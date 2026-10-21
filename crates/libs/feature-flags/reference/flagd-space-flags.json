@@ -65,7 +65,7 @@
         "on": true,
         "off": false
       },
-      "_comment": "The subject is the org id and `operation_id` is supplied as an attribute, so a rule can open every hidden operation for one org, or only some of them.",
+      "_comment": "The subject is SPACE's org id (for a federated owner, the org SPACE materialized, not the upstream org id) and `operation_id` is supplied as an attribute, so a rule can open every hidden operation for one org, or only some of them. SPACE_NATIVE_HIDDEN_OPERATIONS_FLAG_ENABLED=false closes every org this flag opens.",
       "targeting": {
         "if": [
           {

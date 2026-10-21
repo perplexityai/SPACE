@@ -278,11 +278,14 @@ pub const SPACE_NATIVE_CREATE_POOL_CLAIM_FLAG: BoolFlag =
     BoolFlag::new("space-native-create-pool-claim", false);
 
 /// Boolean gate opening native operations the manifest marks
-/// `IncubatingHidden` to one org. Evaluated by space-api with the org id as the
-/// subject and the operation id as the `operation_id` attribute, so targeting
-/// can open one operation without the rest. It only ever opens: an org is also
-/// enabled when listed in `SPACE_NATIVE_HIDDEN_OPERATIONS_ORGS`, the
-/// provider-free override, and there is no env master that can close an org
-/// the flag opens. Falls back off: a provider that cannot answer means hidden.
+/// `IncubatingHidden` to one org. Evaluated by space-api with SPACE's org id
+/// (for a federated owner, the org SPACE materialized, not the upstream id) as
+/// the subject and the operation id as the `operation_id` attribute, so
+/// targeting can open one operation without the rest. Layered under the static
+/// `SPACE_NATIVE_HIDDEN_OPERATIONS_FLAG_ENABLED` env master (on by default) by
+/// [`policy`]: turning the master off closes every org the flag opened. An org
+/// listed in `SPACE_NATIVE_HIDDEN_OPERATIONS_ORGS`, the provider-free override,
+/// is enabled whatever the flag or its master says. Falls back off: a provider
+/// that cannot answer means hidden.
 pub const SPACE_NATIVE_HIDDEN_OPERATIONS_FLAG: BoolFlag =
     BoolFlag::new("space-native-hidden-operations", false);

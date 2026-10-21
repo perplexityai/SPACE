@@ -47,7 +47,7 @@ pub(crate) async fn llms_txt() -> impl IntoResponse {
             header::CONTENT_TYPE,
             HeaderValue::from_static("text/plain; charset=utf-8"),
         )],
-        "SPACE API\n\n- SPACE OpenAPI (M1 SDK operations plus incubating operations): /openapi.json or /api/openapi.json\n- M1 SDK OpenAPI: /openapi-m1.json or /api/openapi-m1.json\n- Admin OpenAPI: /admin/api/openapi.json on shared hosts\n- SPACE API base path: /v1 on api.space hosts, /api/v1 on shared hosts\n- Admin API base path: /admin/api/v1 on shared hosts\n- ECW (E2B-compatible) API base path: / on e2b.api.space hosts, /e2b/api on shared hosts\n",
+        "SPACE API\n\n- SPACE OpenAPI (M1 SDK operations plus the incubating operations that are not hidden): /openapi.json or /api/openapi.json\n- M1 SDK OpenAPI: /openapi-m1.json or /api/openapi-m1.json\n- Full SPACE OpenAPI, hidden operations included (requires API credentials): /openapi-full.json or /api/openapi-full.json\n- Admin OpenAPI: /admin/api/openapi.json on shared hosts\n- SPACE API base path: /v1 on api.space hosts, /api/v1 on shared hosts\n- Admin API base path: /admin/api/v1 on shared hosts\n- ECW (E2B-compatible) API base path: / on e2b.api.space hosts, /e2b/api on shared hosts\n",
     )
 }
 

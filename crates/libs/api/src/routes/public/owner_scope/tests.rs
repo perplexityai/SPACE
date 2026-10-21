@@ -38,7 +38,7 @@ async fn fixture() -> TestDbResult<Fixture> {
     let mut state = AppState::from_pool(db.pool.clone()).await?;
     // The sweeps below cover every mounted operation, hidden ones included.
     state.native_hidden_operations =
-        crate::routes::public::hidden_operations::HiddenOperationsGate::AllOrgs;
+        crate::routes::public::hidden_operations::HiddenOperationsGate::all_orgs();
     state.federated_identity = crate::federated_identity::FederatedIdentityConfig {
         enabled: true,
         policy: crate::federated_identity::FederatedIdentityPolicy::parse(
