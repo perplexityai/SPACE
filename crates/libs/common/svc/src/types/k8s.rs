@@ -1,8 +1,9 @@
 use pplx_space_common_core::types::{K8sNodeName, K8sNodeNameParseError, NodeId, NodeRole};
 use uuid::Uuid;
 
-/// Kubernetes label-value grammar lives in `pplx-space-common-core` so there is
-/// one validator across the workspace; re-exported here for the historical
+/// Kubernetes label-value grammar lives in `pplx-space-k8s-ids` (re-exported
+/// through `pplx-space-common-core`) so there is one validator across the
+/// workspace; re-exported here for the historical
 /// `pplx_space_common_svc::types::k8s::LabelValue` path.
 pub use pplx_space_common_core::types::{LabelValue, LabelValueParseError};
 
