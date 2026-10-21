@@ -257,8 +257,8 @@ db_private_outside_tests! {
     fn node_execution_fence(
         conn: &Connection,
         sandbox_id: &str,
-    ) -> Result<Option<pplx_space_node_mgr_client::execution_fence::ExecutionFence>> {
-        use pplx_space_node_mgr_client::execution_fence::ExecutionFence;
+    ) -> Result<Option<pplx_space_node_mgr_protocol::execution_fence::ExecutionFence>> {
+        use pplx_space_node_mgr_protocol::execution_fence::ExecutionFence;
         let (current, previous): (Option<String>, Option<String>) = conn.query_row(
             "SELECT node_execution_id, previous_node_execution_id FROM sandboxes WHERE id = ?1",
             params![sandbox_id],
@@ -291,7 +291,7 @@ db_private_outside_tests! {
             .prepare("SELECT id FROM sandboxes WHERE node_execution_id IS NULL ORDER BY id LIMIT ?1")?;
         statement
             .query_map(
-                [pplx_space_node_mgr_client::execution_fence::EXECUTION_PREFLIGHT_LIMIT as i64],
+                [pplx_space_node_mgr_protocol::execution_fence::EXECUTION_PREFLIGHT_LIMIT as i64],
                 |row| row.get(0),
             )?
             .collect::<rusqlite::Result<_>>()
@@ -305,7 +305,7 @@ db_private_outside_tests! {
 pub fn inherit_orphan_node_execution(
     tx: &Transaction<'_>,
     sandbox_id: &str,
-    fence: pplx_space_node_mgr_client::execution_fence::ExecutionFence,
+    fence: pplx_space_node_mgr_protocol::execution_fence::ExecutionFence,
 ) -> Result<()> {
     let changed = tx.execute(
         "UPDATE sandboxes SET node_execution_id = ?2, previous_node_execution_id = ?3,
@@ -328,7 +328,7 @@ pub fn inherit_orphan_node_execution(
 pub fn acknowledge_node_cleanup(
     conn: &Connection,
     sandbox_id: &str,
-    expected: pplx_space_node_mgr_client::execution_fence::ExecutionFence,
+    expected: pplx_space_node_mgr_protocol::execution_fence::ExecutionFence,
     retained: Option<SandboxActivationAttemptId>,
 ) -> Result<bool> {
     if retained.is_some_and(|id| !expected.owns(id)) {

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use pplx_space_common_core::types::{
     ExecutionGeneration, LinuxPid, LinuxUid, SandboxActivationAttemptId, SandboxId, VsockCid,
 };
-use pplx_space_node_mgr_client::proto::{
+use pplx_space_node_mgr_protocol::proto::{
     ProcessEndpointIdentity as WireProcessEndpointIdentity,
     SandboxEndpointProof as WireSandboxEndpointProof,
     VsockEndpointIdentity as WireVsockEndpointIdentity,

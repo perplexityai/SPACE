@@ -371,7 +371,7 @@ pub fn mark_teardown_suspend_backup_permanently_failed(
     id: &str,
     staged_artifact: LocalArtifactId,
 ) -> Result<bool> {
-    let reason = pplx_space_sbx_mgr_client::TEARDOWN_SUSPEND_BACKUP_PERMANENTLY_FAILED_REASON;
+    let reason = pplx_space_sbx_mgr_protocol::TEARDOWN_SUSPEND_BACKUP_PERMANENTLY_FAILED_REASON;
     let changed = conn.execute(
         "UPDATE sandboxes
          SET failure_reason = ?1,

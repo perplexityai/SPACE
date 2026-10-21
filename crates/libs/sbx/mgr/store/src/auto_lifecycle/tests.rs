@@ -14,7 +14,7 @@ use super::{
     policy_from_proto, recompute_runtime_state, test_guest_activity_hold_cap, touch_access,
     touch_command_and_access, validate_v1_policy,
 };
-use pplx_space_sbx_mgr_client::proto;
+use pplx_space_sbx_mgr_protocol::proto;
 
 fn sample_policy() -> AutoLifecyclePolicy {
     let mut policy = AutoLifecyclePolicy {

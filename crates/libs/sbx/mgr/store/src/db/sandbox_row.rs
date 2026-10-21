@@ -78,9 +78,9 @@ pub struct SandboxRow {
 impl SandboxRow {
     pub fn node_execution_fence(
         &self,
-    ) -> Option<pplx_space_node_mgr_client::proto::ExecutionFence> {
+    ) -> Option<pplx_space_node_mgr_protocol::proto::ExecutionFence> {
         self.node_execution_id.map(|id| {
-            pplx_space_node_mgr_client::execution_fence::ExecutionFence::new(id, None).into()
+            pplx_space_node_mgr_protocol::execution_fence::ExecutionFence::new(id, None).into()
         })
     }
 }

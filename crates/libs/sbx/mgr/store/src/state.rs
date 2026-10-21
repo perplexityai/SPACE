@@ -386,7 +386,7 @@ impl std::str::FromStr for SandboxState {
     }
 }
 
-impl From<SandboxState> for pplx_space_sbx_mgr_client::proto::SandboxLifecycleState {
+impl From<SandboxState> for pplx_space_sbx_mgr_protocol::proto::SandboxLifecycleState {
     fn from(state: SandboxState) -> Self {
         match state {
             SandboxState::Creating => Self::Creating,

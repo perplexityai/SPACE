@@ -5,7 +5,7 @@ fn main() -> anyhow::Result<()> {
     let builder = tonic_prost_build::configure()
         .extern_path(
             ".space.sandbox.manager.v1",
-            "::pplx_space_sbx_mgr_client::proto",
+            "::pplx_space_sbx_mgr_protocol::proto",
         )
         .extern_path(".space.net.policy.v1", "::pplx_space_net_common::proto")
         .extern_path(
