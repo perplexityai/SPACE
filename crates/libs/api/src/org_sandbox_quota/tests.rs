@@ -1,13 +1,17 @@
-use pplx_space_common_core::types::OrgId;
+use pplx_space_common_core::types::{OrgId, UserId};
 
 use super::OrgSandboxQuota;
+use crate::public_operations::{SandboxQuota, SubjectSandboxQuota};
 
 #[test]
-fn unset_or_empty_configuration_caps_no_org() {
+fn unset_or_empty_configuration_limits_no_caller() {
     let org = OrgId::new();
-    for (default_limit, overrides) in [(None, None), (Some(""), Some("  "))] {
-        let quota = OrgSandboxQuota::parse(default_limit, overrides).unwrap();
-        assert_eq!(quota.limit_for(org), None);
+    for (default_limit, overrides, subject_limit) in
+        [(None, None, None), (Some(""), Some("  "), Some(""))]
+    {
+        let quota = OrgSandboxQuota::parse(default_limit, overrides, subject_limit).unwrap();
+        assert_eq!(quota.for_create(org, None), None);
+        assert_eq!(quota.for_create(org, Some(UserId::new())), None);
     }
 }
 
@@ -17,30 +21,64 @@ fn an_org_override_takes_precedence_over_the_default() {
     let other = OrgId::new();
     let overrides = format!(r#"{{"{capped}": 3}}"#);
 
-    let quota = OrgSandboxQuota::parse(None, Some(&overrides)).unwrap();
+    let quota = OrgSandboxQuota::parse(None, Some(&overrides), None).unwrap();
     assert_eq!(quota.limit_for(capped), Some(3));
     assert_eq!(quota.limit_for(other), None);
 
-    let quota = OrgSandboxQuota::parse(Some("100"), Some(&overrides)).unwrap();
+    let quota = OrgSandboxQuota::parse(Some("100"), Some(&overrides), None).unwrap();
     assert_eq!(quota.limit_for(capped), Some(3));
     assert_eq!(quota.limit_for(other), Some(100));
 }
 
 #[test]
+fn only_a_federated_caller_has_a_subject_limit() {
+    let org = OrgId::new();
+    let subject = UserId::new();
+    let subject_only = OrgSandboxQuota::parse(None, None, Some("5")).unwrap();
+    assert_eq!(subject_only.for_create(org, None), None);
+    assert_eq!(
+        subject_only.for_create(org, Some(subject)),
+        Some(SandboxQuota {
+            org_limit: None,
+            subject: Some(SubjectSandboxQuota {
+                user_id: subject,
+                limit: 5
+            }),
+        })
+    );
+
+    let both = OrgSandboxQuota::parse(Some("100"), None, Some("5")).unwrap();
+    assert_eq!(
+        both.for_create(org, None),
+        Some(SandboxQuota {
+            org_limit: Some(100),
+            subject: None,
+        })
+    );
+    assert_eq!(
+        both.for_create(org, Some(subject))
+            .map(|quota| quota.org_limit),
+        Some(Some(100))
+    );
+}
+
+#[test]
 fn malformed_configuration_is_rejected() {
-    for (default_limit, overrides) in [
-        (Some("-1"), None),
-        (Some("ten"), None),
-        (None, Some(r#"{"not-an-org": 3}"#)),
+    for (default_limit, overrides, subject_limit) in [
+        (Some("-1"), None, None),
+        (Some("ten"), None, None),
+        (None, Some(r#"{"not-an-org": 3}"#), None),
         (
             None,
             Some(r#"{"0190d5a4-2b4e-7c3e-8f00-000000000001": -3}"#),
+            None,
         ),
-        (None, Some("[3]")),
+        (None, Some("[3]"), None),
+        (None, None, Some("five")),
     ] {
         assert!(
-            OrgSandboxQuota::parse(default_limit, overrides).is_err(),
-            "{default_limit:?} {overrides:?}"
+            OrgSandboxQuota::parse(default_limit, overrides, subject_limit).is_err(),
+            "{default_limit:?} {overrides:?} {subject_limit:?}"
         );
     }
 }

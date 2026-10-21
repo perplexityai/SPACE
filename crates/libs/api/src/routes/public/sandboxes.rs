@@ -47,8 +47,8 @@ use crate::{
     public_operations::{
         ApiProduct, CreateClaimedPublicOperationResult, CreatePublicOperation,
         CreatePublicOperationIdempotency, CreatePublicOperationResult, HttpOperationMethod,
-        ObservePublicOperationIdempotency, OperationPathTemplate, PublicOperationStore,
-        PublicOperationStoreError, SandboxQuota,
+        ObservePublicOperationIdempotency, OperationPathTemplate, PublicOperationAdmission,
+        PublicOperationStore, SandboxQuota, SandboxQuotaOutcome, SandboxQuotaRefusal,
     },
     public_sandbox_operations::{
         CreateSandboxOperationPayload, SandboxLifecycleOperationPayload,
@@ -115,11 +115,7 @@ pub async fn create_sandbox(
         pool_claims,
         state
             .org_sandbox_quota
-            .limit_for(org.id)
-            .map(|limit| SandboxQuota {
-                limit,
-                federated_subject: owner.is_some().then_some(actor.id),
-            }),
+            .for_create(org.id, owner.is_some().then_some(actor.id)),
     )
     .await?;
 
@@ -182,10 +178,10 @@ pub(crate) struct NativeCreatePoolClaims<'a> {
 /// before the response, up to a short deadline. Every other create is
 /// recorded queued for the dispatcher, as before.
 ///
-/// `sandbox_quota` is the caller's live-sandbox cap, `None` when its org is
-/// uncapped. A new create that would exceed it is refused with a
-/// non-retryable 429 and records nothing; a replay of an admitted create
-/// still answers with it.
+/// `sandbox_quota` is the caller's live-sandbox limits, `None` when it has
+/// none. A new create that would exceed one is refused with a non-retryable
+/// 429 naming it and records nothing; a replay of an admitted create still
+/// answers with it.
 #[expect(
     clippy::too_many_arguments,
     reason = "the native create's request-scoped inputs; bundling them only moves the list"
@@ -293,11 +289,6 @@ pub(crate) async fn create_native_sandbox_operation(
             let mut admission = store
                 .begin_operation_admission(org_id, ApiProduct::Native, &idempotency)
                 .await?;
-            // The quota is checked as the create is recorded, after the
-            // claim; a refused create rolls the claim back with the rest.
-            if let Some(quota) = sandbox_quota {
-                admission.hold_to_sandbox_quota(quota);
-            }
             // A retry or a conflict records no create, so its outcome is
             // never counted.
             match admission.observation().clone() {
@@ -324,6 +315,11 @@ pub(crate) async fn create_native_sandbox_operation(
                     )
                 }
                 ObservePublicOperationIdempotency::Missing => {
+                    // Before the claim, so a refused create never takes a
+                    // slot and one waiting for its quota lock holds none.
+                    if let Some(quota) = sandbox_quota {
+                        admit_within_sandbox_quota(&mut admission, org_id, quota).await?;
+                    }
                     match controller
                         .claim_admission_pool_slot(admission.transaction(), template_release_id)
                         .await
@@ -427,16 +423,7 @@ pub(crate) async fn create_native_sandbox_operation(
                 "idempotency key was already used with a different request body",
             ));
         }
-        // Only the quota refuses a native create.
-        CreatePublicOperationResult::AdmissionDenied => {
-            return Err(match sandbox_quota {
-                Some(quota) => PublicApiError::sandbox_quota_exceeded(format!(
-                    "sandbox limit of {} reached; delete a sandbox to create another",
-                    quota.limit
-                )),
-                None => PublicApiError::internal(),
-            });
-        }
+        CreatePublicOperationResult::AdmissionDenied => return Err(PublicApiError::internal()),
     };
 
     if let Some((inline, (claim_token, operation))) = inline.zip(inline_claim)
@@ -479,15 +466,50 @@ async fn create_unclaimed_operation(
     idempotency: &CreatePublicOperationIdempotency<'_>,
     sandbox_quota: Option<SandboxQuota>,
     input: CreatePublicOperation<'_>,
-) -> Result<CreatePublicOperationResult, PublicOperationStoreError> {
+) -> Result<CreatePublicOperationResult, PublicApiError> {
     let Some(quota) = sandbox_quota else {
-        return store.create_operation(input).await;
+        return Ok(store.create_operation(input).await?);
     };
     let mut admission = store
         .begin_operation_admission(input.org_id, ApiProduct::Native, idempotency)
         .await?;
-    admission.hold_to_sandbox_quota(quota);
-    admission.create(input).await
+    if matches!(
+        admission.observation(),
+        ObservePublicOperationIdempotency::Missing
+    ) {
+        admit_within_sandbox_quota(&mut admission, input.org_id, quota).await?;
+    }
+    Ok(admission.create(input).await?)
+}
+
+/// Hold a genuinely new create to `quota` in its admission transaction,
+/// which then holds the quota locks until it commits. Record the create
+/// through `admission` next; an error drops it, rolling the transaction back.
+async fn admit_within_sandbox_quota(
+    admission: &mut PublicOperationAdmission,
+    org_id: OrgId,
+    quota: SandboxQuota,
+) -> Result<(), PublicApiError> {
+    let plan = admission
+        .plan_sandbox_quota(org_id, quota)
+        .await?
+        .map_err(sandbox_quota_refused)?;
+    match admission.enforce_sandbox_quota(org_id, plan).await? {
+        SandboxQuotaOutcome::Admit => Ok(()),
+        SandboxQuotaOutcome::Refuse(refusal) => Err(sandbox_quota_refused(refusal)),
+        SandboxQuotaOutcome::Contended => Err(PublicApiError::lock_contention()),
+    }
+}
+
+fn sandbox_quota_refused(refusal: SandboxQuotaRefusal) -> PublicApiError {
+    PublicApiError::sandbox_quota_exceeded(match refusal {
+        SandboxQuotaRefusal::Org { limit } => format!(
+            "organization sandbox limit of {limit} reached; delete a sandbox to create another"
+        ),
+        SandboxQuotaRefusal::Subject { limit } => {
+            format!("sandbox limit of {limit} per user reached; delete a sandbox to create another")
+        }
+    })
 }
 
 /// What admission does about a warm-pool slot for one native create.

@@ -7,6 +7,7 @@ use pplx_space_common_core::types::{OrgId, UserId};
 use uuid::Uuid;
 
 use super::*;
+use crate::public_operations::SubjectSandboxQuota;
 use pplx_space_db_test_fixtures::{
     SEED_ORG_ID, SEED_USER_ID, TestDbResult, insert_ready_worker_node, pg_test_db,
 };
@@ -308,9 +309,9 @@ async fn native_create_persists_default_policy_in_operation_payload() -> TestDbR
     Ok(())
 }
 
-/// A native create past the org's quota is refused with a non-retryable 429
-/// and records nothing; a replay of an admitted create still answers, and an
-/// uncapped org (the default) is never refused.
+/// A native create past a limit is refused with a non-retryable 429 naming
+/// that limit and records nothing; a replay of an admitted create still
+/// answers, and an uncapped caller (the default) is never refused.
 #[tokio::test]
 async fn native_create_refuses_a_new_create_at_the_org_quota() -> TestDbResult<()> {
     use http_body_util::BodyExt;
@@ -335,7 +336,7 @@ async fn native_create_refuses_a_new_create_at_the_org_quota() -> TestDbResult<(
     .bind(org_id)
     .execute(&db.pool)
     .await?;
-    let create = |key: &'static str, limit: Option<u32>| {
+    let create = |key: &'static str, quota: Option<SandboxQuota>| {
         let pool = db.pool.clone();
         async move {
             create_native_sandbox_operation(
@@ -346,13 +347,22 @@ async fn native_create_refuses_a_new_create_at_the_org_quota() -> TestDbResult<(
                 create_request_with_auto_lifecycle(None),
                 None,
                 None,
-                limit.map(|limit| SandboxQuota {
-                    limit,
-                    federated_subject: None,
-                }),
+                quota,
             )
             .await
         }
+    };
+    let org_limit = |limit| {
+        Some(SandboxQuota {
+            org_limit: Some(limit),
+            subject: None,
+        })
+    };
+    let refusal = |result: Result<SandboxOperationResponse, PublicApiError>| async move {
+        let refused = result.expect_err("at the limit").into_response();
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = refused.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice::<PublicErrorEnvelope>(&body).unwrap()
     };
     let create_operations = || async {
         sqlx::query_scalar::<_, i64>(sql!(
@@ -363,33 +373,48 @@ async fn native_create_refuses_a_new_create_at_the_org_quota() -> TestDbResult<(
         .await
     };
 
-    let first = create("quota-first", Some(2))
+    let first = create("quota-first", org_limit(2))
         .await
         .expect("under the limit");
-    create("quota-second", Some(2))
+    create("quota-second", org_limit(2))
         .await
         .expect("reaches the limit");
 
-    let refused = create("quota-third", Some(2))
-        .await
-        .expect_err("at the limit")
-        .into_response();
-    assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
-    let envelope: PublicErrorEnvelope =
-        serde_json::from_slice(&refused.into_body().collect().await.unwrap().to_bytes())?;
+    let envelope = refusal(create("quota-third", org_limit(2)).await).await;
     assert_eq!(envelope.code, PublicErrorCode::RateLimited);
     assert!(!envelope.retryable, "only a delete clears the quota");
+    assert!(
+        envelope
+            .message
+            .starts_with("organization sandbox limit of 2 reached"),
+        "{}",
+        envelope.message
+    );
     assert_eq!(create_operations().await?, 2, "a refusal records nothing");
 
-    let replay = create("quota-first", Some(2))
+    let replay = create("quota-first", org_limit(2))
         .await
         .expect("a replay of an admitted create is not counted again");
     assert_eq!(replay.operation_id, first.operation_id);
 
     create("quota-uncapped", None)
         .await
-        .expect("an uncapped org is never refused");
+        .expect("an uncapped caller is never refused");
     assert_eq!(create_operations().await?, 3);
+
+    let per_user = Some(SandboxQuota {
+        org_limit: None,
+        subject: Some(SubjectSandboxQuota { user_id, limit: 3 }),
+    });
+    let envelope = refusal(create("quota-per-user", per_user).await).await;
+    assert!(!envelope.retryable);
+    assert!(
+        envelope
+            .message
+            .starts_with("sandbox limit of 3 per user reached"),
+        "{}",
+        envelope.message
+    );
     Ok(())
 }
 
@@ -1437,8 +1462,8 @@ mod admission_pool_claim {
         Ok(())
     }
 
-    /// A create refused by the quota after claiming a slot rolls the claim
-    /// back, leaving the slot ready for the next admitted one.
+    /// A create refused by the quota claims no slot, leaving it ready for
+    /// the next admitted one.
     #[tokio::test(flavor = "current_thread")]
     async fn a_create_refused_by_the_org_quota_claims_no_slot() -> TestDbResult<()> {
         let fixture = AdmissionPoolFixture::new(2).await?;
@@ -1456,8 +1481,8 @@ mod admission_pool_claim {
                     inline: None,
                 }),
                 Some(SandboxQuota {
-                    limit: 1,
-                    federated_subject: None,
+                    org_limit: Some(1),
+                    subject: None,
                 }),
             )
             .await
