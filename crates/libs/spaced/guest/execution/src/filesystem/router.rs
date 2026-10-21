@@ -320,7 +320,6 @@ impl FilesystemRouter {
     where
         S: Stream<Item = Result<WriteRequest, Status>> + Send,
     {
-        use pplx_space_spaced_guest_protocol::proto::operations::write_request::Message;
         let admission = crate::payload::acquire(
             &self.payload_slots,
             1,
@@ -328,6 +327,15 @@ impl FilesystemRouter {
         )?;
         let incoming = request.into_inner();
         tokio::pin!(incoming);
+        self.write_stream(incoming.as_mut(), admission).await
+    }
+
+    async fn write_stream(
+        &self,
+        mut incoming: Pin<&mut (dyn Stream<Item = Result<WriteRequest, Status>> + Send)>,
+        admission: RequestPermit,
+    ) -> Result<Response<WriteResponse>, Status> {
+        use pplx_space_spaced_guest_protocol::proto::operations::write_request::Message;
         let first = incoming
             .next()
             .await

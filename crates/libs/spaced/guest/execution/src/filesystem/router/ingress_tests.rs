@@ -539,6 +539,7 @@ async fn native_messages_allow_exactly_the_size_limit() {
         .await
         .expect_err("oversized Open");
     assert_eq!(error.code(), tonic::Code::OutOfRange);
+    let mut committed = Vec::new();
     for excess in [0, 1] {
         let open = WriteRequest {
             message: Some(WriteMessage::Open(WriteOpen {
@@ -562,18 +563,20 @@ async fn native_messages_allow_exactly_the_size_limit() {
             data.encoded_len(),
             filesystem_limits::MAX_MESSAGE_BYTES + excess
         );
+        let mut messages = vec![Ok(open)];
+        if excess != 0 {
+            messages.push(Ok(WriteRequest {
+                message: Some(WriteMessage::Data(b"must not commit".to_vec())),
+            }));
+        }
+        messages.push(Ok(data));
         let result = router
-            .write_from_stream(Request::new(futures_util::stream::iter([
-                Ok(open),
-                Ok(data),
-            ])))
+            .write_from_stream(Request::new(futures_util::stream::iter(messages)))
             .await;
         if excess == 0 {
             result.expect("exact upload message limit is allowed");
-            assert_eq!(
-                tokio::fs::read(&path).await.unwrap(),
-                vec![42; expected_bytes]
-            );
+            committed = vec![42; expected_bytes];
+            assert_eq!(tokio::fs::read(&path).await.unwrap(), committed);
         } else {
             let error = result.expect_err("oversized Data");
             assert_eq!(error.code(), tonic::Code::OutOfRange);
@@ -581,4 +584,9 @@ async fn native_messages_allow_exactly_the_size_limit() {
         }
     }
     router.drain().await;
+    assert_eq!(
+        tokio::fs::read(&path).await.unwrap(),
+        committed,
+        "rejected replacement must preserve the exact-limit upload after cleanup"
+    );
 }

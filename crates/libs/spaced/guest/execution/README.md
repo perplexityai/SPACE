@@ -82,18 +82,26 @@ execution metadata.
 - The daemon registers `filesystem_grpc_service()` and `process_grpc_service()`
   to retain predecode protection. Handlers reuse that admission without charging
   twice. Native calls cannot install predecode protection retroactively.
-- Native uploads use `write_file(Request<Stream<Item = Result<WriteRequest, Status>>>)`.
+- Native uploads use `ExecutionService::write_file` with
+  `Request<impl Stream<Item = Result<WriteRequest, Status>> + Send>`; keep a service
+  clone for uploads when handing out `filesystem_service()` handles.
   The stream starts with `Open`, then yields `Data` messages using the existing
   protobuf types. It shares gRPC's upload path, admission, per-message size checks
   and bounded relay. Admission precedes the first poll; EOF completes the write.
   Input errors and dropped callers use the same cancellation and partial-write
   semantics as gRPC. Borrowed streams and streams without `Unpin` are supported.
+  There is no idle timeout before `Open` or between `Data` messages. Stalled streams
+  retain payload capacity and, after dispatch, execution capacity. Bound uploads
+  in the caller, for example with `tokio::time::timeout`; cancellation can retain
+  capacity until cleanup settles.
 - `configure_process_env(EnvMap)` replaces defaults for future process starts;
   request entries override them and `clean_env` skips them. Running processes
   retain their environment. `EnvMap` already enforces the shared key/value,
   entry-count and total-byte [limits](../../../common/core/src/types/env/contract.rs).
   Native callers can use `EnvMap::try_from` to reject invalid maps. The daemon
   retains its wire adapter's sanitization of invalid entries before configuration.
+  Native `StartRequest.env` still uses `parse_env`: invalid entries are dropped
+  with a warning, rather than rejecting the start.
 - The daemon cancels the shared token and coordinates listener shutdown with draining work.
   `drain()` joins tracked work; it is not a reusable shutdown-and-reject contract
   for subsequent direct calls. Direct filesystem calls can still have effects.

@@ -203,6 +203,10 @@ impl ExecutionService {
     /// gRPC. Admission remains held until owned execution and cleanup settle.
     /// Caller-owned buffers and allocations before yielding input are not bounded
     /// by the service. The stream may borrow from the caller and need not be `Unpin`.
+    /// There is no idle timeout before `Open` or between `Data` messages. A stalled
+    /// stream retains payload capacity and, after dispatch, execution capacity.
+    /// Callers should bound the upload, for example with `tokio::time::timeout`;
+    /// dropping its future cancels the upload but cleanup can retain capacity.
     pub async fn write_file<S>(
         &self,
         request: Request<S>,
