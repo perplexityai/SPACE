@@ -64,7 +64,20 @@ jobs:
             echo "::warning::Could not log in to GHCR; its reads fall back to their sources"
           fi
 
+      # A run whose Rust build inputs equal those of an image main already
+      # published takes that image instead of compiling it again. The key is
+      # content-addressed over everything the build reads
+      # (build-rust-artifacts.sh --input-key), so a PR that changes only
+      # scripts, charts, smoke scenarios or workflows hits; any Rust input
+      # change misses. Every miss or failure, a fork's unreadable package
+      # included, leaves the build below to run with a notice.
+      - name: Reuse main's Rust artifact image for identical inputs
+        id: reuse
+        continue-on-error: true
+        run: python3 infra/space/kind/scripts/rust-artifact-handoff.py reuse ghcr.io/perplexityai/space-kind-rust-artifacts
+
       - name: Build the Rust artifact image once
+        if: steps.reuse.outputs.reused != 'true'
         env:
           SPACE_CI_IMAGE_MIRROR: ghcr
           SPACE_KIND_RUST_ARTIFACTS: docker
@@ -88,6 +101,14 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+      # Only main writes the package, and only an image it built here, after
+      # the shards' upload so they never wait for it. A failed push costs the
+      # next runs with this key a build, never this job.
+      - name: Publish the artifact image under its Rust input key
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.reuse.outputs.reused != 'true'
+        continue-on-error: true
+        run: python3 infra/space/kind/scripts/rust-artifact-handoff.py publish ghcr.io/perplexityai/space-kind-rust-artifacts
+
       # Only this dedicated cache package is pruned, never release images.
       # Fixed tagged heads stay intact; retain ten untagged versions for readers
       # already pulling an older manifest. This never runs on a PR.
@@ -101,6 +122,20 @@ jobs:
           package-type: container
           delete-only-untagged-versions: 'true'
           min-versions-to-keep: 10
+
+      # Only this dedicated artifact package, tags included: each version is
+      # one input key's image, and a run whose key was pruned builds it again.
+      # A PR tests its merge with the main it started from, and a re-run keeps
+      # that merge, so keep twenty recent keys. This never runs on a PR.
+      - name: Retain twenty Rust artifact images
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        continue-on-error: true
+        uses: actions/delete-package-versions@e5bc658cc4c965c472efe991f8beea3981499c55 # v5
+        with:
+          owner: perplexityai
+          package-name: space-kind-rust-artifacts
+          package-type: container
+          min-versions-to-keep: 20
 
   smoke:
     if: github.repository == 'perplexityai/SPACE'

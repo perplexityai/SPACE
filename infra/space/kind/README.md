@@ -1962,6 +1962,21 @@ The CI-only `SPACE_KIND_RUST_ARTIFACTS=prebuilt` mode checks both
 or mismatched artifact fails rather than falling back to compilation. Local
 build defaults are unchanged.
 
+The producer skips the build when main already built an image from the same
+Rust inputs. `build-rust-artifacts.sh --input-key` hashes everything the
+Docker build reads: both Rust Dockerfiles, the blob ID and mode of every path
+they `COPY`, `.dockerignore`, the build script, the architecture and the
+pinned digest of each registry base. Commits and times are not part of it.
+Main labels each image it builds from committed inputs and mirrored bases with
+that key and its commit, then pushes it to
+`ghcr.io/perplexityai/space-kind-rust-artifacts:<key>`, keeping the twenty most
+recent versions. Every run first tries to pull its own key's image. Any miss
+or failure builds as before, with a notice, including a fork that cannot read
+the package. A reused image still goes through the same handoff. Prebuilt
+mode then accepts its other commit only when the image's label, the handoff
+and this checkout's recomputed key all agree. The runtime images Tilt builds
+still record the checkout's commit.
+
 To reproduce a shard, use `scripts/tests/smoke-kind-typed.sh all 1/4` (through
 `4/4`) with the same admin-token setup as a full `all` run, on a bench brought
 up with `SPACE_KIND_TELEMETRY_MODE=otel` and that variable still set, as CI
