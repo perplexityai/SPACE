@@ -57,7 +57,7 @@ the ordinary smoke job logs.
 |---|---|---|
 | Contract | Command validation, changed-request idempotency conflicts, token scope, tenant isolation | Included |
 | Contract | Completed DELETE replay, permanent startup errors | Included |
-| Proposed contract | Overlapping replay credential validity | Ignored; explicit invocation only |
+| Contract | Earlier credentials stay valid after an idempotent replay | Included |
 | Admission | Zero-vCPU rejection before accepting an operation | Included on Kind with bounded cleanup |
 | Concurrency | Same-key create and command fanout, independent commands, pause/wake contention, slow-reader output integrity | Included |
 | Recovery | Queued create across controller outage/API restart; original command session across data-plane restart | Included on Kind only |
@@ -99,29 +99,18 @@ Named development benches require `SPACE_SMOKE_KIND_CLUSTER_UID` to match the
 live `kube-system` namespace UID before privileged fixture operations. The
 standard `kind-space-local` setup retains its existing isolation checks.
 
-## Credential replay contract (deferred)
+## Credential replay contract
 
-The current API rotates attachment credentials on an idempotent replay.
-`native_concurrency.command_idempotency` remains required: same-key requests
-share session and process identity, execute their side effect once, and return
-an attachable fresh credential after concurrent requests finish.
+An idempotent replay of a session create returns the same session with an
+additional attachment credential. Credentials returned earlier stay valid until
+their own expiry; revocation ends all of them. The API reference's
+[session token renewal](api/index.md#renew-session-tokens) section states the
+expiry, issuance bound, and revoked-session behavior.
 
-`native_contract.command_replay_credentials` additionally expects the previous
-credential to remain valid. That stronger guarantee is not agreed. Its reproducer
-is explicitly `ignored`, appears as `IGNORED` in suite logs, and is excluded from
-normal selection and the quarantine defect backlog. It is not fixed or counted
-as a passing scenario. Run its unchanged assertions explicitly with:
-
-```bash
-SPACE_SMOKE_BACKEND=kind SPACE_SMOKE_API_SURFACE=native \
-  uv run --frozen --python 3.11 -m space_smoke run native_contract.command_replay_credentials
-```
-
-The [review decision](https://github.com/perplexityai/SPACE/pull/79#pullrequestreview-5423918313)
-defers overlap. The [separate storage proposal](https://github.com/perplexityai/SPACE/pull/91)
-is not a prerequisite for the smoke repairs. Before adopting an implementation,
-resolve replay versus explicit credential renewal, validity of earlier responses,
-expiry, revocation, issuance bounds, and deployment compatibility together.
+`native_contract.command_replay_credentials` checks that the original
+credential still attaches after a replay. `native_concurrency.command_idempotency`
+checks that same-key requests share session and process identity, execute their
+side effect once, and return an attachable credential.
 
 ## Concurrency and recovery controls
 

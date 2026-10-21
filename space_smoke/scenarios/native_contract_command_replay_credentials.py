@@ -2,14 +2,7 @@
 from space_smoke.registry import scenario
 from space_smoke.native_hardening import NativeHardeningFixture
 
-@scenario(
-    "native_contract.command_replay_credentials",
-    api_surfaces=("native",),
-    ignored=(
-        "Overlapping credential validity is not an agreed API guarantee; "
-        "decision: docs/native-api-hardening.md#credential-replay-contract-deferred"
-    ),
-)
+@scenario("native_contract.command_replay_credentials", api_surfaces=("native",))
 def command_replay_credentials(test: NativeHardeningFixture) -> None:
     """A command retry preserves its session and reports any credential invalidation."""
     sid = test.create_ready()

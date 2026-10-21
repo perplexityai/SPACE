@@ -2020,6 +2020,14 @@ pub const NOT_FOUND_RESOURCE_DETAIL_KEY: &str = "resource";
 /// sandbox and another org's sandbox stay indistinguishable.
 pub const NOT_FOUND_RESOURCE_PATH: &str = "path";
 
+/// [`PublicErrorDetail::key`] naming why a `conflict` was refused.
+pub const CONFLICT_REASON_DETAIL_KEY: &str = "reason";
+
+/// [`CONFLICT_REASON_DETAIL_KEY`] value of a `conflict` for replaying a
+/// session create whose session was revoked or closed. Replaying cannot renew
+/// its token; create a new session with a new idempotency key.
+pub const CONFLICT_REASON_SESSION_REVOKED: &str = "session_revoked";
+
 open_wire_enum!(DataPlaneHttpErrorCode, "data-plane HTTP error code", {
     InvalidRequest => "invalid_request",
     Unauthorized => "unauthorized",

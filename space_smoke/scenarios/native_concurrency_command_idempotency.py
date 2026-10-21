@@ -44,9 +44,9 @@ def command_idempotency(test: NativeHardeningFixture) -> None:
     outcomes = run_fanout(test, settings, "command_replay_fanout", submit)
     identities = {(item.value["session_id"], item.value["process_id"]) for item in outcomes if item.value}
     test.context.verify(len(identities) == 1, "same-key command retries produced multiple sessions or processes")
-    # The current contract rotates the attachment token on replay. Fetch a fresh
-    # credential after concurrent POSTs drain; this case proves execution count,
-    # not validity of credentials returned by overlapping retries.
+    # Fetch a fresh credential after concurrent POSTs drain; this case proves
+    # execution count. native_contract.command_replay_credentials covers the
+    # validity of credentials returned by earlier replays.
     response = test.request("POST", path, body=body, idempotency_key=key)
     test.context.verify(response.status == 201, "final command replay failed")
     test.context.verify((response.body.get("session_id"), response.body.get("process_id")) in identities,

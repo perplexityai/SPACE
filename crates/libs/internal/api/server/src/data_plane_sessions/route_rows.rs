@@ -8,7 +8,10 @@ pub(super) async fn fetch_route_row(
     pool: &sqlx::PgPool,
     session_id: &str,
     protocol_session_id: Option<&str>,
+    token_sha256: Option<&str>,
 ) -> Result<SessionRouteRow, Status> {
+    // A revoke from a server that predates `data_plane_session_tokens` clears
+    // only `d.token_hash`, so a token row counts only while that is set.
     sqlx::query_as::<_, SessionRouteRow>(sql!(
         "SELECT d.session_id,
                 d.protocol_session_id,
@@ -31,6 +34,11 @@ pub(super) async fn fetch_route_row(
                 d.scopes,
                 d.token_hash,
                 d.token_expires_at,
+                (SELECT t.expires_at
+                   FROM data_plane_session_tokens t
+                  WHERE t.token_hash = $3
+                    AND t.session_id = d.session_id
+                    AND d.token_hash IS NOT NULL) AS presented_token_expires_at,
                 s.lifecycle AS sandbox_lifecycle,
                 COALESCE(direct_route.current_node_id, s.active_node_id)
                     AS sandbox_active_node_id,
@@ -61,6 +69,7 @@ pub(super) async fn fetch_route_row(
     ))
     .bind(session_id)
     .bind(protocol_session_id)
+    .bind(token_sha256)
     .fetch_optional(pool)
     .await
     .map_err(|error| Status::internal(format!("resolve data-plane session route: {error}")))?
