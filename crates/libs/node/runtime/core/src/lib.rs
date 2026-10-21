@@ -23,7 +23,9 @@ pub mod proto {
     tonic::include_proto!("space.node.runtime.v1");
 }
 
-use pplx_space_common_svc::bootstrap::{GrpcClientTrace, wrap_grpc_client_channel};
+use pplx_space_common_grpc::{
+    GrpcClientTrace, trace_grpc_client_transport as wrap_grpc_client_channel,
+};
 use tonic::transport::{Channel, Endpoint};
 
 pub const RUNTIME_SUPERVISOR_SOCKET: &str =

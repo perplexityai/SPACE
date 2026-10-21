@@ -23,4 +23,4 @@ pplx-space-node-mgr-protocol = { workspace = true }
 [dev-dependencies]
 prost = { workspace = true }
 pplx-space-execution-common = { workspace = true, features = ["serde"] }
-pplx-space-common-svc = { workspace = true }
+pplx-space-tokio-runtime = { workspace = true }
