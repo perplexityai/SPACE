@@ -22,6 +22,11 @@ checksum-pinned CA bundle bootstraps HTTPS for APT; update its URL and checksum
 when needed. Validate pin updates with a kernel build and `smoke-boot.sh` before
 publishing artifacts.
 
+Both stages install packages with `apt-install.sh`. When package downloads from
+the snapshot fail, it fetches the missing files from archive.ubuntu.com at the
+same pool paths. Each file must match the SHA-256 in the snapshot's signed
+index. The index itself still has to come from the snapshot.
+
 ## Optional BPF/module-signing profile
 
 Place a configuration fragment in this directory and pass its filename explicitly:

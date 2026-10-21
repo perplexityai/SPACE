@@ -16,8 +16,10 @@ RUN chmod 0644 /etc/ssl/certs/ca-certificates.crt \
 # kernel compile (ci.sh).
 FROM base AS toolchain
 
-RUN apt-get -o Acquire::Retries=5 update --error-on=any \
-    && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install --yes --no-install-recommends \
+# apt-install.sh falls back to archive.ubuntu.com for package files the
+# snapshot fails to serve, checked against the snapshot's index.
+RUN --mount=type=bind,source=apt-install.sh,target=/usr/local/sbin/apt-install.sh \
+    sh /usr/local/sbin/apt-install.sh \
         bc \
         binutils \
         bison \
@@ -30,8 +32,7 @@ RUN apt-get -o Acquire::Retries=5 update --error-on=any \
         libelf-dev \
         libssl-dev \
         openssl \
-        python3 \
-    && rm -rf /var/lib/apt/lists/*
+        python3
 
 FROM toolchain AS build
 
@@ -84,7 +85,5 @@ COPY --from=build /output/ /
 
 FROM base AS smoke
 
-RUN apt-get -o Acquire::Retries=5 update --error-on=any \
-    && DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install --yes --no-install-recommends \
-        qemu-system-x86 \
-    && rm -rf /var/lib/apt/lists/*
+RUN --mount=type=bind,source=apt-install.sh,target=/usr/local/sbin/apt-install.sh \
+    sh /usr/local/sbin/apt-install.sh qemu-system-x86
