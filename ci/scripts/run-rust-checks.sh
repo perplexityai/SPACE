@@ -518,6 +518,24 @@ run_clippy_checks() {
         -- \
         -D warnings
 
+    # Built alone, so a serde feature the CPU architecture crate needs but only
+    # gets through unification with common-core fails here.
+    echo "--- :rust: Running isolated CPU architecture clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-cpu-arch \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-cpu-arch \
+        --all-features \
+        --all-targets \
+        -- \
+        -D warnings
+
     run_sbxmgr_production_checks "${target_dir}"
 
     # feature-flags must lint clean with no vendor SDK compiled in; the matching
