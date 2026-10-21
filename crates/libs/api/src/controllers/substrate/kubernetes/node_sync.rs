@@ -1,12 +1,11 @@
 //! Proactive kube Node → SPACE DB inventory sync.
 //!
-//! In production, the `space-node-api-svc` DaemonSet registers each
-//! worker with SPACE when it starts (via the gRPC `RegisterNode` call).
-//! Environments that don't run that DaemonSet (kind/Tilt, direct-substrate
-//! tests) never get that registration, so nodes only appear in the SPACE
-//! UI after the first sandbox pod lands on them.
+//! This sync owns Kubernetes node registration. ClusterApi resolves a node
+//! name published by node-ctl only to a row that already exists, so a node's
+//! first publication after boot succeeds once a sync tick (or a sandbox pod
+//! placed on the node) has recorded it.
 //!
-//! `sync_labeled_nodes_to_db` fills that gap: it lists kube Nodes carrying the
+//! `sync_labeled_nodes_to_db` lists kube Nodes carrying the
 //! sandbox selector and joins scheduled node-api pods to the watcher-backed
 //! Node inventory for roles outside that selector. Missing-node reconciliation
 //! compares stale ready rows with the full watcher-backed Node membership.

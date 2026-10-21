@@ -5,6 +5,7 @@ api-server on `KubernetesSubstrate` (each sandbox is its own K8s Pod whose
 pause container is hijacked by `containerd-shim-space-v2` into a real
 Firecracker microVM), the production worker service set on every sandbox
 node, a dedicated builder role that runs actual ECW recipes, node registration
+by the cluster controller's Kubernetes inventory sync with node state published
 through node-ctl → internal-api, templates distributed through the production
 publish/pull path, and real S3 snapshot transit via an in-cluster versitygw object store,
 with sandbox workers' volume-manager holding no object-store keys: like a deployment's, it
@@ -1212,7 +1213,7 @@ kind cluster: space-local (kind-cluster.yaml.tmpl — 6 nodes)
 │   ├── space-redis           (Deployment; the rate limiters' store, which api, admin-api and cluster-controller reach through SPACE_REDIS_URL)
 │   ├── space-api             (Deployment, 2–3 replicas by HPA; SPACE_K8S_CONTROL_PLANE=true)
 │   ├── space-admin-api       (Deployment; the same binary on the dedicated admin surface)
-│   ├── space-internal-api    (Deployment, 2 replicas; ClusterApi — node registration + template releases)
+│   ├── space-internal-api    (Deployment, 2 replicas; ClusterApi — node state + template releases)
 │   ├── space-credmgr-authority (Deployment, 2 replicas; credential-manager authority — credential tables + platform KEK)
 │   ├── space-kind-key-broker (Deployment; Kind-only intermediate-key broker fixture behind the platform KEK)
 │   ├── space-data-plane      (Deployment, 2–3 replicas by HPA)
@@ -1624,9 +1625,10 @@ ServiceAccount to its client service, and never accepts the static internal
 token. On every request it also requires the token's pod to be current and
 Running in its namespace, with the connection's source address among that
 pod's IPs, and the token's node to be registered under that name and UID; its
-Role lists and watches the namespace's pods for this. internal-api registers a
-node without its UID. The node inventory sync records it for the
-sandbox-selector nodes and for every node running a node-api pod, builders
+Role lists and watches the namespace's pods for this. internal-api never
+registers a node; it resolves a published name only to an existing row. The
+node inventory sync records each node, with its UID, for the sandbox-selector
+nodes and for every node running a node-api pod, builders
 included (`crates/libs/api/src/controllers/substrate/kubernetes/node_sync.rs`);
 a sandbox pod placed on a node records it too, and so does an admin node
 listing (node-status refresh, reconcile or template listing), which upserts
