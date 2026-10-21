@@ -165,8 +165,9 @@ RUST_DEPENDENCY_INPUTS = (
 )
 
 # A lane's Rust artifact digest covers these inputs, the lane's extra inputs,
-# and each crate its binaries reach through non-dev dependencies, which
-# rust_artifact_packages reads from the workspace manifests.
+# every crate its binaries reach through non-dev dependencies
+# (rust_artifact_packages), and every workspace member's Cargo.toml, since
+# features unify across all members.
 RUST_ARTIFACT_COMMON_INPUTS = (
     Path("ci/scripts/run-space-bundle-builds.py"),
     Path("ci/runtime-capabilities.json"),
@@ -179,6 +180,9 @@ RUST_ARTIFACT_COMMON_INPUTS = (
     Path("docker/Dockerfile.rust-build-common"),
     Path("docker/run-cargo-with-sccache.sh"),
     Path("infra/space/identity/node-identities.sh"),
+    # Embedded under common-svc's migration-checksums feature, which feature
+    # unification across all members turns on in every lane.
+    Path("db/accepted-checksums.toml"),
 )
 RUST_ARTIFACT_TEMPLATE_RECIPES = (
     Path("templates/firecracker/recipes/seed.toml"),
@@ -751,6 +755,14 @@ def rust_artifact_inputs(
         *RUST_ARTIFACT_COMMON_INPUTS,
         *RUST_ARTIFACT_EXTRA_INPUTS[feature],
         *rust_artifact_packages(feature, source_root),
+        # A lane builds its service binaries with `cargo build --bin` and no
+        # `-p`, which resolves dependency features across every member, so any
+        # member's manifest can change the lane's binaries. Cargo.lock records
+        # no features.
+        *(
+            directory / "Cargo.toml"
+            for directory in rust_workspace_packages(source_root)
+        ),
     )
 
 
