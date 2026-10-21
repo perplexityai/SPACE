@@ -2577,6 +2577,18 @@ type ConnectProcessRequest struct {
 	// follows the live tail. Native public data-plane replay sets this to the
 	// number of stdout/stderr events already durably captured so output emitted
 	// while a client was disconnected is replayed from the guest journal.
+	//
+	// A cursor outside the retained output ends the stream with a status whose
+	// `space-error-reason` metadata names why:
+	//   - past the output the process has written: OUT_OF_RANGE,
+	//     `process-output-cursor-ahead`;
+	//   - before the oldest output the guest still retains: RESOURCE_EXHAUSTED,
+	//     `process-output-lagged`, with `space-process-output-first-sequence`
+	//     metadata giving the cursor of that oldest output, in decimal, while the
+	//     guest still holds the process.
+	//
+	// Older guests end a lagged stream with RESOURCE_EXHAUSTED and no reason,
+	// and wait for output to reach a cursor past it.
 	OutputCursor  *uint64 `protobuf:"varint,3,opt,name=output_cursor,json=outputCursor,proto3,oneof" json:"output_cursor,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

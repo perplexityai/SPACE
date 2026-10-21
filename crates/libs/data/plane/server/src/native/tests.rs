@@ -1,5 +1,8 @@
 use super::*;
 use axum::extract::ws::Message;
+use pplx_space_common_svc::space_api_route::{
+    RouteIdentityRemediation, set_route_identity_rejection_metadata,
+};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -411,119 +414,37 @@ async fn full_guest_storage_is_named_and_not_retryable() {
     assert_eq!(body["error"]["retryable"], false);
 }
 
-/// How a fake cluster API answers `BindDataPlaneSessionProcess`.
+/// How a fake cluster API answers `BindDataPlaneSessionProcess` once the test
+/// adds a `release` permit.
 #[derive(Clone, Copy)]
 enum FakeBind {
     Succeeds,
     NotFound,
 }
 
-/// A fake cluster API and worker for one native process session. Each bind
-/// waits for a `release` permit before answering, so a test can hold the
-/// binding open while it watches what the client receives.
-struct BindingFake {
-    endpoint: String,
-    release: Arc<tokio::sync::Semaphore>,
-    bind_started: Arc<tokio::sync::Notify>,
-    bound_process_ids: Arc<std::sync::Mutex<Vec<String>>>,
-}
-
+/// A process fake whose start reports the process (and its exit, if
+/// `exits`) and stays open, and whose binds wait for a `release` permit, so
+/// a test can hold the binding open while it watches what the client
+/// receives.
 async fn spawn_binding_fake(
     session_id: DataPlaneSessionId,
     exits: bool,
     bind: FakeBind,
-) -> BindingFake {
-    use prost::Message as _;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    let mut route = crate::tests::route_response_with_token(session_id, None);
-    route.backend.as_mut().unwrap().endpoint = endpoint.clone();
-    route.adapter_state_json = r#"{"command":["true"]}"#.to_string();
-    let route = route.encode_to_vec();
-    let process_id = pplx_space_public_api::process_id_for_session(session_id).to_string();
-    let event = |event| {
-        let mut framed = vec![0];
-        let encoded = ProcessEvent {
-            process_id: process_id.clone(),
-            pid: Some(42),
-            event: Some(event),
-        }
-        .encode_to_vec();
-        framed.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
-        framed.extend(encoded);
-        bytes::Bytes::from(framed)
-    };
-    let mut events = vec![event(spaced_process_event::Event::Started(
-        pplx_space_sbx_mgr_client::operations::ProcessStarted { start_time: None },
-    ))];
-    if exits {
-        events.push(event(spaced_process_event::Event::Exit(
-            pplx_space_sbx_mgr_client::proto::SpacedProcessExit {
-                outcome: Some(
-                    pplx_space_sbx_mgr_client::proto::spaced_process_exit::Outcome::Exited(
-                        pplx_space_sbx_mgr_client::proto::SpacedProcessExited { exit_code: 0 },
-                    ),
-                ),
-            },
-        )));
-    }
-    let release = Arc::new(tokio::sync::Semaphore::new(0));
-    let bind_started = Arc::new(tokio::sync::Notify::new());
-    let bound_process_ids = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let fake = BindingFake {
-        endpoint,
-        release: Arc::clone(&release),
-        bind_started: Arc::clone(&bind_started),
-        bound_process_ids: Arc::clone(&bound_process_ids),
-    };
-    let service = axum::Router::new().fallback(move |request: Request<Body>| {
-        let route = route.clone();
-        let events = events.clone();
-        let release = Arc::clone(&release);
-        let bind_started = Arc::clone(&bind_started);
-        let bound_process_ids = Arc::clone(&bound_process_ids);
-        async move {
-            let path = request.uri().path().to_string();
-            if path.ends_with("/Check") {
-                return crate::tests::grpc_test_response(vec![8, 1]);
+) -> ProcessFake {
+    spawn_process_fake(
+        session_id,
+        false,
+        Some(bind),
+        Arc::new(move |_, open| {
+            assert_eq!(open, FakeOpen::Start);
+            let mut replies = vec![started()];
+            if exits {
+                replies.push(exited());
             }
-            if path.ends_with("/ResolveDataPlaneSessionRoute") {
-                return crate::tests::grpc_test_response(route);
-            }
-            if path.ends_with("/BindDataPlaneSessionProcess") {
-                let body = request.into_body().collect().await.unwrap().to_bytes();
-                let bound = BindDataPlaneSessionProcessRequest::decode(&body[5..]).unwrap();
-                bound_process_ids.lock().unwrap().push(bound.process_id);
-                bind_started.notify_one();
-                release.acquire().await.unwrap().forget();
-                return match bind {
-                    FakeBind::Succeeds => crate::tests::grpc_test_response(Vec::new()),
-                    FakeBind::NotFound => {
-                        tonic::Status::not_found("process-backed data-plane session not found")
-                            .into_http::<Body>()
-                    }
-                };
-            }
-            assert!(
-                path.ends_with("/SpacedStartProcess"),
-                "unexpected call {path}"
-            );
-            let frames = futures_util::stream::iter(
-                events
-                    .into_iter()
-                    .map(|event| Ok::<_, Infallible>(hyper::body::Frame::data(event))),
-            )
-            .chain(futures_util::stream::pending());
-            Response::builder()
-                .header("content-type", "application/grpc")
-                .body(Body::new(http_body_util::StreamBody::new(frames)))
-                .unwrap()
-        }
-    });
-    tokio::spawn(async move {
-        axum::serve(listener, service).await.unwrap();
-    });
-    fake
+            replies
+        }),
+    )
+    .await
 }
 
 fn binding_fake_test_process() -> bool {
@@ -1715,11 +1636,66 @@ async fn websocket_resize_refusal_carries_a_fixed_message() {
 enum FakeReply {
     Event(spaced_process_event::Event),
     /// Ends the stream with this status.
-    Status(tonic::Code),
-    /// Ends the stream as the guest does for a cursor past the output.
-    CursorAhead,
+    End(tonic::Status),
     /// Refuses the call outright, before any stream.
-    Refuse(tonic::Code),
+    Refuse(tonic::Status),
+}
+
+fn end(code: tonic::Code) -> FakeReply {
+    FakeReply::End(tonic::Status::new(code, "fake"))
+}
+
+fn with_reason(mut status: tonic::Status, reason: &'static str) -> tonic::Status {
+    status.metadata_mut().insert(
+        pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+        tonic::metadata::MetadataValue::from_static(reason),
+    );
+    status
+}
+
+/// Ends the stream as the guest does for a cursor past the output.
+fn cursor_ahead() -> FakeReply {
+    FakeReply::End(with_reason(
+        tonic::Status::out_of_range("fake"),
+        pplx_space_common_core::spaced::PROCESS_OUTPUT_CURSOR_AHEAD,
+    ))
+}
+
+/// Ends the stream as the guest does for a cursor before the oldest retained
+/// output, `first_retained`, when it still holds the process.
+fn lagged(first_retained: Option<u64>) -> FakeReply {
+    let mut status = with_reason(
+        tonic::Status::resource_exhausted(
+            pplx_space_common_core::spaced::PROCESS_OUTPUT_LAGGED_MESSAGE,
+        ),
+        pplx_space_common_core::spaced::PROCESS_OUTPUT_LAGGED,
+    );
+    if let Some(first_retained) = first_retained {
+        status.metadata_mut().insert(
+            pplx_space_common_core::spaced::PROCESS_OUTPUT_FIRST_SEQUENCE_METADATA_KEY,
+            first_retained.into(),
+        );
+    }
+    FakeReply::End(status)
+}
+
+/// Ends the stream as a guest older than the lag reason does on eviction.
+fn untagged_lagged() -> FakeReply {
+    FakeReply::End(tonic::Status::resource_exhausted(
+        pplx_space_common_core::spaced::PROCESS_OUTPUT_LAGGED_MESSAGE,
+    ))
+}
+
+/// Refuses the call as a node does a route token that a refresh replaces,
+/// such as an expired one.
+fn refreshable_route_rejection() -> FakeReply {
+    let mut status = tonic::Status::permission_denied("route token expired");
+    set_route_identity_rejection_metadata(
+        &mut status,
+        RouteIdentityRemediation::RefreshRoute,
+        None,
+    );
+    FakeReply::Refuse(status)
 }
 
 /// How the data plane opened a fake guest process stream.
@@ -1770,7 +1746,7 @@ fn journal_replay(lines: &[&str], open: FakeOpen) -> Vec<FakeReply> {
         FakeOpen::Start => (vec![started()], 0),
         FakeOpen::Connect(None) => return vec![started(), exited()],
         FakeOpen::Connect(Some(cursor)) if cursor as usize > lines.len() => {
-            return vec![connected(), FakeReply::CursorAhead];
+            return vec![connected(), cursor_ahead()];
         }
         FakeOpen::Connect(Some(cursor)) => (vec![connected()], cursor),
     };
@@ -1784,18 +1760,31 @@ type FakeReplies = Arc<dyn Fn(usize, FakeOpen) -> Vec<FakeReply> + Send + Sync>;
 /// A fake cluster API and worker for one native process session, bound to its
 /// process unless `bound` is false. Each process stream the data plane opens
 /// is answered by `replies`, given how many opens came before it; a stream
-/// without a closing status stays open.
-struct JournalFake {
+/// without a closing status stays open. A bind succeeds at once, or with
+/// `gated_bind`, answers as that says once the test adds a `release` permit.
+struct ProcessFake {
     endpoint: String,
     bound: Arc<AtomicBool>,
     opens: Arc<std::sync::Mutex<Vec<FakeOpen>>>,
+    release: Arc<tokio::sync::Semaphore>,
+    bind_started: Arc<tokio::sync::Notify>,
+    bound_process_ids: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 async fn spawn_journal_fake(
     session_id: DataPlaneSessionId,
     bound: bool,
     replies: FakeReplies,
-) -> JournalFake {
+) -> ProcessFake {
+    spawn_process_fake(session_id, bound, None, replies).await
+}
+
+async fn spawn_process_fake(
+    session_id: DataPlaneSessionId,
+    bound: bool,
+    gated_bind: Option<FakeBind>,
+    replies: FakeReplies,
+) -> ProcessFake {
     use prost::Message as _;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -1803,19 +1792,28 @@ async fn spawn_journal_fake(
     let mut route = crate::tests::route_response_with_token(session_id, None);
     route.backend.as_mut().unwrap().endpoint = endpoint.clone();
     route.adapter_state_json = r#"{"command":["true"]}"#.to_string();
-    let bound = Arc::new(AtomicBool::new(bound));
-    let opens = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let fake = JournalFake {
+    let fake = ProcessFake {
         endpoint,
-        bound: Arc::clone(&bound),
-        opens: Arc::clone(&opens),
+        bound: Arc::new(AtomicBool::new(bound)),
+        opens: Arc::new(std::sync::Mutex::new(Vec::new())),
+        release: Arc::new(tokio::sync::Semaphore::new(0)),
+        bind_started: Arc::new(tokio::sync::Notify::new()),
+        bound_process_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
     };
+    let bound = Arc::clone(&fake.bound);
+    let opens = Arc::clone(&fake.opens);
+    let release = Arc::clone(&fake.release);
+    let bind_started = Arc::clone(&fake.bind_started);
+    let bound_process_ids = Arc::clone(&fake.bound_process_ids);
     let service = axum::Router::new().fallback(move |request: Request<Body>| {
         let mut route = route.clone();
         let process_id = process_id.clone();
         let replies = Arc::clone(&replies);
         let opens = Arc::clone(&opens);
         let bound = Arc::clone(&bound);
+        let release = Arc::clone(&release);
+        let bind_started = Arc::clone(&bind_started);
+        let bound_process_ids = Arc::clone(&bound_process_ids);
         async move {
             let path = request.uri().path().to_string();
             if path.ends_with("/Check") {
@@ -1826,11 +1824,23 @@ async fn spawn_journal_fake(
                 return crate::tests::grpc_test_response(route.encode_to_vec());
             }
             if path.ends_with("/BindDataPlaneSessionProcess") {
+                let body = request.into_body().collect().await.unwrap().to_bytes();
+                let request = BindDataPlaneSessionProcessRequest::decode(&body[5..]).unwrap();
+                bound_process_ids.lock().unwrap().push(request.process_id);
+                if let Some(bind) = gated_bind {
+                    bind_started.notify_one();
+                    release.acquire().await.unwrap().forget();
+                    if let FakeBind::NotFound = bind {
+                        return tonic::Status::not_found(
+                            "process-backed data-plane session not found",
+                        )
+                        .into_http::<Body>();
+                    }
+                }
                 bound.store(true, Ordering::SeqCst);
+                return crate::tests::grpc_test_response(Vec::new());
             }
-            if path.ends_with("/RecordDataPlaneSessionReconnect")
-                || path.ends_with("/BindDataPlaneSessionProcess")
-            {
+            if path.ends_with("/RecordDataPlaneSessionReconnect") {
                 return crate::tests::grpc_test_response(Vec::new());
             }
             let open = if path.ends_with("/SpacedStartProcess") {
@@ -1857,14 +1867,8 @@ async fn spawn_journal_fake(
             let mut frames = Vec::new();
             let mut trailers = None;
             for reply in replies(opened, open) {
-                let (code, reason) = match reply {
-                    FakeReply::Refuse(code) => {
-                        return Response::builder()
-                            .header("content-type", "application/grpc")
-                            .header("grpc-status", code as i32)
-                            .body(Body::empty())
-                            .unwrap();
-                    }
+                match reply {
+                    FakeReply::Refuse(status) => return status.into_http::<Body>(),
                     FakeReply::Event(event) => {
                         let encoded = ProcessEvent {
                             process_id: process_id.clone(),
@@ -1876,23 +1880,13 @@ async fn spawn_journal_fake(
                         framed.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
                         framed.extend(encoded);
                         frames.push(hyper::body::Frame::data(bytes::Bytes::from(framed)));
-                        continue;
                     }
-                    FakeReply::Status(code) => (code, None),
-                    FakeReply::CursorAhead => (
-                        tonic::Code::OutOfRange,
-                        Some(pplx_space_common_core::spaced::PROCESS_OUTPUT_CURSOR_AHEAD),
-                    ),
-                };
-                let mut status = HeaderMap::new();
-                status.insert("grpc-status", HeaderValue::from(code as i32));
-                if let Some(reason) = reason {
-                    status.insert(
-                        pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
-                        HeaderValue::from_static(reason),
-                    );
+                    FakeReply::End(status) => {
+                        let mut headers = status.into_http::<Body>().into_parts().0.headers;
+                        headers.remove(header::CONTENT_TYPE);
+                        trailers = Some(headers);
+                    }
                 }
-                trailers = Some(status);
             }
             let ending = match trailers {
                 Some(trailers) => {
@@ -2060,11 +2054,11 @@ async fn process_resume_continues_after_the_last_event_id() {
 }
 
 /// Output the guest evicted before the client asked for it is a real gap:
-/// the stream reports it once, follows the live tail without reporting the
-/// process start again, and a resume from what it sent next carries no
-/// position, so it replays behind `resync_required` rather than silently.
+/// the stream reports it once and continues from the oldest output the guest
+/// still retains, without reporting the process start again. Its ids keep
+/// carrying positions, so a resume from the gap's id is exact.
 #[tokio::test]
-async fn evicted_process_output_is_reported_before_the_live_tail() {
+async fn evicted_process_output_continues_from_the_oldest_retained_output() {
     if !binding_fake_test_process() {
         return;
     }
@@ -2073,10 +2067,52 @@ async fn evicted_process_output_is_reported_before_the_live_tail() {
         session_id,
         true,
         Arc::new(|_, open| match open {
-            FakeOpen::Connect(Some(cursor)) if cursor < 2 => vec![
-                connected(),
-                FakeReply::Status(tonic::Code::ResourceExhausted),
-            ],
+            FakeOpen::Connect(Some(cursor)) if cursor < 2 => vec![connected(), lagged(Some(2))],
+            open => journal_replay(&JOURNAL, open),
+        }),
+    )
+    .await;
+
+    let frames = process_events_to_close(&fake.endpoint, session_id, None).await;
+    assert_eq!(resync_reasons(&frames), ["cursor_out_of_window"]);
+    assert_eq!(stdout_text(&frames), "three\nfour\n");
+    assert_eq!(frames_of_type(&frames, "process_started").count(), 1);
+    assert!(
+        frames_of_type(&frames, "error").next().is_none(),
+        "{frames:?}"
+    );
+
+    let gap = frames_of_type(&frames, "resync_required")
+        .next()
+        .unwrap()
+        .0
+        .unwrap();
+    let resumed = process_events_to_close(&fake.endpoint, session_id, Some(gap)).await;
+    assert_eq!(resync_reasons(&resumed), Vec::<String>::new());
+    assert_eq!(stdout_text(&resumed), "three\nfour\n");
+    assert_ids_above(&resumed, gap);
+    assert_eq!(
+        *fake.opens.lock().unwrap(),
+        connects(&[Some(0), Some(2), Some(2)])
+    );
+}
+
+/// A guest older than the lag reason does not say where its retained output
+/// starts: the stream reports the gap once, follows the live tail without
+/// reporting the process start again, and a resume from what it sent next
+/// carries no position, so it replays behind `resync_required` rather than
+/// silently.
+#[tokio::test]
+async fn evicted_output_on_an_older_guest_is_reported_before_the_live_tail() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_journal_fake(
+        session_id,
+        true,
+        Arc::new(|_, open| match open {
+            FakeOpen::Connect(Some(cursor)) if cursor < 2 => vec![connected(), untagged_lagged()],
             FakeOpen::Connect(None) => vec![connected(), stdout("live\n"), exited()],
             open => journal_replay(&JOURNAL, open),
         }),
@@ -2105,6 +2141,200 @@ async fn evicted_process_output_is_reported_before_the_live_tail() {
     );
 }
 
+/// A RESOURCE_EXHAUSTED the guest did not tag as a lag, such as a hop's
+/// refusal of an oversized chunk, is not reported as evicted output: the
+/// stream ends with a retryable error instead of skipping to the live tail.
+#[tokio::test]
+async fn untagged_resource_exhausted_is_not_an_output_gap() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_journal_fake(
+        session_id,
+        true,
+        Arc::new(|_, _| {
+            vec![
+                connected(),
+                stdout(JOURNAL[0]),
+                FakeReply::End(tonic::Status::resource_exhausted(
+                    "guest process output chunk is too large",
+                )),
+            ]
+        }),
+    )
+    .await;
+
+    let (_state, mut chunks) = open_process_events(&fake.endpoint, session_id, None).await;
+    let mut seen = String::new();
+    read_until(&mut chunks, &mut seen, "backend_stream_error").await;
+    let frames = sse_frames(&seen);
+    assert_eq!(resync_reasons(&frames), Vec::<String>::new());
+    assert_eq!(*fake.opens.lock().unwrap(), connects(&[Some(0)]));
+}
+
+/// A cursor past the output restarts at the start; when the start has been
+/// evicted too, that is the same gap, reported once.
+#[tokio::test]
+async fn cursor_ahead_then_evicted_start_reports_one_gap() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_journal_fake(
+        session_id,
+        true,
+        Arc::new(|_, open| match open {
+            FakeOpen::Connect(Some(cursor)) if cursor < 2 => vec![connected(), lagged(Some(2))],
+            open => journal_replay(&JOURNAL, open),
+        }),
+    )
+    .await;
+    let ahead = ProcessEventId::Position {
+        position: 10,
+        frame: 0,
+    }
+    .encode();
+
+    let frames = process_events_to_close(&fake.endpoint, session_id, Some(ahead)).await;
+
+    assert_eq!(resync_reasons(&frames), ["cursor_out_of_window"]);
+    assert_eq!(stdout_text(&frames), "three\nfour\n");
+    assert_ids_above(&frames, ahead);
+    assert_eq!(
+        *fake.opens.lock().unwrap(),
+        connects(&[Some(10), Some(0), Some(2)])
+    );
+}
+
+/// A guest that keeps refusing the cursor without ever sending output does
+/// not keep the stream reopening: after a few reopens it ends with an error.
+#[tokio::test]
+async fn window_miss_reopens_without_progress_are_capped() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_journal_fake(
+        session_id,
+        true,
+        Arc::new(|_, open| {
+            let FakeOpen::Connect(Some(cursor)) = open else {
+                panic!("unexpected open {open:?}");
+            };
+            vec![connected(), lagged(Some(cursor + 1))]
+        }),
+    )
+    .await;
+
+    let (_state, mut chunks) = open_process_events(&fake.endpoint, session_id, None).await;
+    let mut seen = String::new();
+    read_until(&mut chunks, &mut seen, "backend_stream_error").await;
+    let frames = sse_frames(&seen);
+
+    assert_eq!(resync_reasons(&frames), ["cursor_out_of_window"]);
+    assert_eq!(
+        *fake.opens.lock().unwrap(),
+        connects(&[Some(0), Some(1), Some(2), Some(3)])
+    );
+}
+
+/// Output between window misses is progress: a stream that keeps falling
+/// behind but keeps receiving output is not ended by the reopen cap.
+#[tokio::test]
+async fn window_misses_with_output_between_are_not_capped() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_journal_fake(
+        session_id,
+        true,
+        Arc::new(|_, open| {
+            let FakeOpen::Connect(Some(cursor)) = open else {
+                panic!("unexpected open {open:?}");
+            };
+            // Each reopen gets one line, then falls behind by one more.
+            if cursor >= 12 {
+                return vec![connected(), exited()];
+            }
+            vec![connected(), stdout("line\n"), lagged(Some(cursor + 2))]
+        }),
+    )
+    .await;
+
+    let frames = process_events_to_close(&fake.endpoint, session_id, None).await;
+
+    assert!(
+        frames_of_type(&frames, "error").next().is_none(),
+        "{frames:?}"
+    );
+    assert_eq!(stdout_text(&frames), "line\n".repeat(6));
+    assert_eq!(fake.opens.lock().unwrap().len(), 7);
+}
+
+/// The reopen after a window miss uses the stream's route token; when the
+/// node refuses it as one a refresh replaces, such as an expired token, the
+/// stream refreshes its route and continues instead of failing.
+#[tokio::test]
+async fn window_miss_reopen_refreshes_a_refused_route() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_journal_fake(
+        session_id,
+        true,
+        Arc::new(|opened, open| match (opened, open) {
+            (0, _) => vec![connected(), lagged(Some(2))],
+            (1, _) => vec![refreshable_route_rejection()],
+            (_, open) => journal_replay(&JOURNAL, open),
+        }),
+    )
+    .await;
+
+    let frames = process_events_to_close(&fake.endpoint, session_id, None).await;
+
+    assert!(
+        frames_of_type(&frames, "error").next().is_none(),
+        "{frames:?}"
+    );
+    assert_eq!(frames_of_type(&frames, "backend_reconnected").count(), 1);
+    assert_eq!(resync_reasons(&frames), ["cursor_out_of_window"]);
+    assert_eq!(stdout_text(&frames), "three\nfour\n");
+    assert_eq!(
+        *fake.opens.lock().unwrap(),
+        connects(&[Some(0), Some(2), Some(2)])
+    );
+}
+
+/// A bound attach whose first backend stream fails before it reports the
+/// process still sends `process_started` once, from the reopened stream.
+#[tokio::test]
+async fn backend_failure_before_the_start_still_reports_it_once() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_journal_fake(
+        session_id,
+        true,
+        Arc::new(|opened, open| match opened {
+            0 => vec![end(tonic::Code::Unavailable)],
+            _ => journal_replay(&JOURNAL, open),
+        }),
+    )
+    .await;
+
+    let frames = process_events_to_close(&fake.endpoint, session_id, None).await;
+
+    assert_eq!(frames_of_type(&frames, "backend_reconnected").count(), 1);
+    assert_eq!(frames_of_type(&frames, "process_started").count(), 1);
+    assert_eq!(stdout_text(&frames), JOURNAL.concat());
+    assert_eq!(resync_reasons(&frames), Vec::<String>::new());
+    assert_eq!(*fake.opens.lock().unwrap(), connects(&[Some(0), Some(0)]));
+}
+
 /// A backend reconnect after a resume reopens the guest stream at the output
 /// position the client has reached; that replay is lossless, so the client is
 /// not told to resync.
@@ -2122,7 +2352,7 @@ async fn backend_reconnect_after_a_resume_continues_without_a_resync() {
             (1, FakeOpen::Connect(Some(cursor))) => vec![
                 connected(),
                 stdout(JOURNAL[cursor as usize]),
-                FakeReply::Status(tonic::Code::Unavailable),
+                end(tonic::Code::Unavailable),
             ],
             (_, open) => journal_replay(&JOURNAL, open),
         }),
@@ -2270,7 +2500,7 @@ async fn already_started_process_is_resumed_exactly() {
         session_id,
         false,
         Arc::new(|_, open| match open {
-            FakeOpen::Start => vec![FakeReply::Refuse(tonic::Code::AlreadyExists)],
+            FakeOpen::Start => vec![FakeReply::Refuse(tonic::Status::already_exists("fake"))],
             open => journal_replay(&JOURNAL, open),
         }),
     )
@@ -2313,6 +2543,7 @@ async fn last_event_id_without_room_after_it_is_rejected() {
             .unwrap(),
     );
     let token = format!("{DATA_PLANE_TOKEN_PREFIX}{}", "c".repeat(64));
+    let capture = pplx_space_metrics::test_capture::capture_counters_guard();
     let response = tower::ServiceExt::oneshot(
         router(state),
         Request::get(format!("/v1/sessions/{session_id}/events"))
@@ -2326,4 +2557,62 @@ async fn last_event_id_without_room_after_it_is_rejected() {
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(fake.opens.lock().unwrap().is_empty());
+    assert!(
+        capture
+            .finish()
+            .iter()
+            .any(|counter| counter.name == "data_plane.attach"
+                && counter
+                    .tags
+                    .contains(&"result:invalid_last_event_id".to_string())),
+        "the refused attach is counted"
+    );
+}
+
+/// An attach refused because the session is already attached sends nothing,
+/// so it counts no `resync_required` either.
+#[tokio::test]
+async fn refused_attach_counts_no_replay_miss() {
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let fake = spawn_journal_fake(
+        session_id,
+        true,
+        Arc::new(|_, open| journal_replay(&JOURNAL, open)),
+    )
+    .await;
+    let mut state = crate::tests::test_data_plane_state().await;
+    state.cluster_api = ClusterApiClients::service_only(
+        pplx_space_node_api_client::cluster::connect(fake.endpoint.clone(), "test")
+            .await
+            .unwrap(),
+    );
+    let _attached = state
+        .native_sessions
+        .try_acquire(session_id, SessionKind::Process)
+        .unwrap();
+    let token = format!("{DATA_PLANE_TOKEN_PREFIX}{}", "c".repeat(64));
+    let capture = pplx_space_metrics::test_capture::capture_counters_guard();
+    let response = tower::ServiceExt::oneshot(
+        router(state),
+        Request::get(format!("/v1/sessions/{session_id}/events"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            // Untagged, so a stream would open behind `resync_required`.
+            .header("last-event-id", "41")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let counters = capture.finish();
+    assert!(
+        !counters
+            .iter()
+            .any(|counter| counter.name == "data_plane.replay.miss"),
+        "{counters:?}"
+    );
 }

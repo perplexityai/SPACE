@@ -79,8 +79,6 @@ const PROCESS_OUTPUT_GUARANTEED_BYTES: usize =
 const PROCESS_OUTPUT_SHARED_BYTES: usize =
     PROCESS_OUTPUT_RETENTION_MAX_BYTES - PROCESS_RECORD_LIMIT * PROCESS_OUTPUT_GUARANTEED_BYTES;
 const PROCESS_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
-const PROCESS_OUTPUT_LAGGED_MESSAGE: &str =
-    "process output stream fell behind retained output buffer";
 const PROCESS_OUTPUT_CURSOR_AHEAD_MESSAGE: &str =
     "process output cursor is past the output the process has written";
 const PROCESS_CAPACITY_MESSAGE: &str = "too many retained processes";
@@ -1211,7 +1209,9 @@ impl ProcessEventJournal {
             .lock()
             .expect("process output journal lock poisoned");
         if cursor < state.first_sequence {
-            return ProcessJournalRead::Lagged;
+            return ProcessJournalRead::Lagged {
+                first_sequence: state.first_sequence,
+            };
         }
         // A cursor only ever advances over output it has read, so one past the
         // end came from a caller, not from this journal: waiting for output to
@@ -1288,7 +1288,7 @@ enum ProcessJournalRead {
     Event(ProcessEvent),
     Exit(ProcessEvent),
     Pending,
-    Lagged,
+    Lagged { first_sequence: u64 },
     Ahead,
 }
 
@@ -1549,8 +1549,8 @@ fn process_event_stream_with_prefix(
                         return Some((Ok(event), (prefix, cursor)));
                     }
                     ProcessJournalRead::Exit(exit) => break Ok(exit),
-                    ProcessJournalRead::Lagged => {
-                        break Err(Status::resource_exhausted(PROCESS_OUTPUT_LAGGED_MESSAGE));
+                    ProcessJournalRead::Lagged { first_sequence } => {
+                        break Err(process_output_lagged_status(Some(first_sequence)));
                     }
                     ProcessJournalRead::Ahead => break Err(process_output_cursor_ahead_status()),
                     ProcessJournalRead::Pending => {
@@ -1576,15 +1576,35 @@ fn process_output_cursor_ahead_status() -> Status {
     status
 }
 
+/// The status that ends a stream whose cursor is before the oldest retained
+/// output, naming where that output starts, `first_sequence`, so the caller
+/// can continue from there. `None` once the journal itself is gone.
+fn process_output_lagged_status(first_sequence: Option<u64>) -> Status {
+    let mut status =
+        Status::resource_exhausted(pplx_space_common_core::spaced::PROCESS_OUTPUT_LAGGED_MESSAGE);
+    let metadata = status.metadata_mut();
+    metadata.insert(
+        pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY,
+        tonic::metadata::MetadataValue::from_static(
+            pplx_space_common_core::spaced::PROCESS_OUTPUT_LAGGED,
+        ),
+    );
+    if let Some(first_sequence) = first_sequence {
+        metadata.insert(
+            pplx_space_common_core::spaced::PROCESS_OUTPUT_FIRST_SEQUENCE_METADATA_KEY,
+            tonic::metadata::MetadataValue::from(first_sequence),
+        );
+    }
+    status
+}
+
 fn evicted_process_journal_result(cursor: &ProcessJournalCursor) -> Result<ProcessEvent, Status> {
     match cursor.changed.borrow().clone() {
         ProcessJournalChange::Exit {
             event,
             next_sequence,
         } if cursor.next_sequence >= next_sequence => Ok(event),
-        ProcessJournalChange::Exit { .. } => {
-            Err(Status::resource_exhausted(PROCESS_OUTPUT_LAGGED_MESSAGE))
-        }
+        ProcessJournalChange::Exit { .. } => Err(process_output_lagged_status(None)),
         ProcessJournalChange::OutputChanged => Err(Status::resource_exhausted(
             "process replay state was evicted",
         )),

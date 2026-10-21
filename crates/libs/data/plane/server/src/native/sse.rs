@@ -95,7 +95,11 @@ pub(crate) async fn session_events(
     let stream_state = match attached.kind {
         SessionKind::Process => {
             // Only a forged id leaves no later id to number the stream with.
-            let Some(replay) = ProcessReplayState::load(session_id, last_event_id) else {
+            let Some(replay) = ProcessReplayState::load(last_event_id) else {
+                pplx_space_metrics::data_plane::attach(
+                    session_id.kind().as_str(),
+                    "invalid_last_event_id",
+                );
                 return data_plane_http_error(
                     StatusCode::BAD_REQUEST,
                     DataPlaneHttpErrorCode::InvalidRequest,
@@ -230,9 +234,15 @@ pub(crate) struct ProcessSseState {
     process_id: Option<ProcessId>,
     process_bound: bool,
     binding: Option<PendingProcessBinding>,
-    /// The backend stream was reopened, so the start it reports next repeats
-    /// one the client already has.
-    reopened: bool,
+    /// This response has sent `process_started`; a reopened backend stream
+    /// reports the start again, and the client already has it.
+    started_sent: bool,
+    /// `resync_required(cursor_out_of_window)` was sent and no output has
+    /// followed it, so another gap before any output is the same one.
+    gap_reported: bool,
+    /// Backend reopens after an output window miss since the last output or
+    /// exit, capped at [`PROCESS_OUTPUT_WINDOW_REOPENS_WITHOUT_PROGRESS`].
+    window_reopens_without_progress: u32,
     revocation_tick: tokio::time::Interval,
     pending: VecDeque<Event>,
     finished: bool,
@@ -241,10 +251,12 @@ pub(crate) struct ProcessSseState {
     _stream_permit: AttachedStreamPermit,
 }
 
-pub(crate) struct ProcessReplayState {
-    pub(crate) event_id: ProcessEventId,
-    pub(crate) backend_output_cursor: u64,
-    pub(crate) pending: VecDeque<Event>,
+struct ProcessReplayState {
+    event_id: ProcessEventId,
+    backend_output_cursor: u64,
+    /// Sent with `event_id` before any live event. Counted only once the
+    /// stream opens, so a refused attach does not count a frame never sent.
+    resync: Option<DataPlaneResyncReason>,
 }
 
 /// What a `Last-Event-ID` resume produces before any live event: the next SSE
@@ -274,14 +286,15 @@ pub(crate) fn resume_resync_frame(
 /// A process stream's SSE id, which a resume decodes to recover the guest
 /// output position to continue from, so any replica can serve it.
 ///
-/// On the wire, bit 62 tags the id: no frame counter an earlier data plane
-/// issued reaches it. The low [`PROCESS_EVENT_ID_GUARD_BITS`] bits are zero,
-/// so an id that a data plane without this encoding counted on from by `+1`,
-/// or that a client rounded through a floating-point number, fails to decode
-/// rather than decoding to the wrong position. Above them come a frame counter
-/// and a position field, whose top bit marks a block of ids without a position.
-/// Those blocks sort above every position, so a stream that loses its
-/// position keeps its ids increasing.
+/// On the wire, bit 52 tags the id: no frame counter an earlier data plane
+/// issued reaches it, and every id stays below 2^53, so a client that parses
+/// it into a double still holds it exactly. The low
+/// [`PROCESS_EVENT_ID_GUARD_BITS`] bits are zero, so an id that a data plane
+/// without this encoding counted on from by `+1` fails to decode rather than
+/// decoding to the wrong position, unless it counted a multiple of 2^16
+/// frames. Above them come a frame counter and a position field, whose top
+/// bit marks a block of ids without a position. Those blocks sort above every
+/// position, so a stream that loses its position keeps its ids increasing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProcessEventId {
     /// The client has received the guest's output up to `position`.
@@ -290,15 +303,31 @@ pub(crate) enum ProcessEventId {
     Unknown { block: u64, frame: u64 },
 }
 
-const PROCESS_EVENT_ID_TAG: u64 = 1 << 62;
-pub(crate) const PROCESS_EVENT_ID_GUARD_BITS: u32 = 16;
-const PROCESS_EVENT_ID_FRAME_BITS: u32 = 12;
-const PROCESS_EVENT_ID_FIELD_BITS: u32 = 34;
+const PROCESS_EVENT_ID_TAG_BIT: u32 = 52;
+const PROCESS_EVENT_ID_TAG: u64 = 1 << PROCESS_EVENT_ID_TAG_BIT;
+const PROCESS_EVENT_ID_GUARD_BITS: u32 = 16;
+/// Frames at one position: those sent between two outputs, such as a
+/// resume's `process_started` or a backend reconnect's two frames. The rest
+/// of the 36 bits below the tag go to positions, up to 2^27 - 1 outputs.
+const PROCESS_EVENT_ID_FRAME_BITS: u32 = 8;
 const PROCESS_EVENT_ID_FIELD_SHIFT: u32 = PROCESS_EVENT_ID_GUARD_BITS + PROCESS_EVENT_ID_FRAME_BITS;
-pub(crate) const PROCESS_EVENT_ID_MAX_FRAME: u64 = (1 << PROCESS_EVENT_ID_FRAME_BITS) - 1;
+const PROCESS_EVENT_ID_FIELD_BITS: u32 = PROCESS_EVENT_ID_TAG_BIT - PROCESS_EVENT_ID_FIELD_SHIFT;
+const PROCESS_EVENT_ID_FIELD_MASK: u64 = (1 << PROCESS_EVENT_ID_FIELD_BITS) - 1;
+const PROCESS_EVENT_ID_MAX_FRAME: u64 = (1 << PROCESS_EVENT_ID_FRAME_BITS) - 1;
 const PROCESS_EVENT_ID_UNKNOWN: u64 = 1 << (PROCESS_EVENT_ID_FIELD_BITS - 1);
-pub(crate) const PROCESS_EVENT_ID_MAX_POSITION: u64 = PROCESS_EVENT_ID_UNKNOWN - 1;
-pub(crate) const PROCESS_EVENT_ID_MAX_RESUME_BLOCK: u64 = 1 << 32;
+const PROCESS_EVENT_ID_MAX_POSITION: u64 = PROCESS_EVENT_ID_UNKNOWN - 1;
+/// The highest block a resumed stream starts in: half the blocks, so every
+/// stream has at least 2^(field + frame - 2) ids left to send.
+const PROCESS_EVENT_ID_MAX_RESUME_BLOCK: u64 = 1 << (PROCESS_EVENT_ID_FIELD_BITS - 2);
+
+const _: () = {
+    // The field holds the no-position marker and at least two resume blocks,
+    // and an id, whose bits all lie at or below the tag, is below 2^53.
+    assert!(PROCESS_EVENT_ID_FIELD_BITS > 2);
+    assert!(PROCESS_EVENT_ID_TAG_BIT < 53);
+    // A stream that starts in the highest resume block cannot run out.
+    assert!(PROCESS_EVENT_ID_MAX_RESUME_BLOCK < PROCESS_EVENT_ID_MAX_POSITION);
+};
 
 impl ProcessEventId {
     /// Precedes the first frame of a stream that starts at the beginning of
@@ -312,18 +341,22 @@ impl ProcessEventId {
     /// start for a client whose `Last-Event-ID` carries no position, so that
     /// every id it sends is above that one. Never sent. A tagged id gets a
     /// fresh block without a position: positions from the start would sort
-    /// below it. `None` for an id fewer than 2^32 blocks from the end, which
-    /// only a forged one is, so a stream never runs out of blocks.
-    pub(crate) fn first_after(last_event_id: u64) -> Option<Self> {
+    /// below it. `None` for an id at or above 2^53, or in a block from
+    /// [`PROCESS_EVENT_ID_MAX_RESUME_BLOCK`] on, which only a forged one is, so
+    /// a stream never runs out of blocks.
+    fn first_after(last_event_id: u64) -> Option<Self> {
         if last_event_id < PROCESS_EVENT_ID_TAG {
             return Some(Self::START);
+        }
+        if last_event_id >> PROCESS_EVENT_ID_TAG_BIT != 1 {
+            return None;
         }
         let first_unknown = Self::Unknown { block: 0, frame: 0 }.encode();
         let block = if last_event_id < first_unknown {
             0
         } else {
-            let field = (last_event_id >> PROCESS_EVENT_ID_FIELD_SHIFT)
-                & ((1 << PROCESS_EVENT_ID_FIELD_BITS) - 1);
+            let field =
+                (last_event_id >> PROCESS_EVENT_ID_FIELD_SHIFT) & PROCESS_EVENT_ID_FIELD_MASK;
             (field & !PROCESS_EVENT_ID_UNKNOWN) + 1
         };
         (block <= PROCESS_EVENT_ID_MAX_RESUME_BLOCK).then_some(Self::Unknown { block, frame: 0 })
@@ -331,21 +364,29 @@ impl ProcessEventId {
 
     pub(crate) fn encode(self) -> u64 {
         let (field, frame) = match self {
-            Self::Position { position, frame } => (position, frame),
-            Self::Unknown { block, frame } => (PROCESS_EVENT_ID_UNKNOWN | block, frame),
+            Self::Position { position, frame } => {
+                debug_assert!(position <= PROCESS_EVENT_ID_MAX_POSITION, "{self:?}");
+                (position, frame)
+            }
+            Self::Unknown { block, frame } => {
+                debug_assert!(block <= PROCESS_EVENT_ID_MAX_POSITION, "{self:?}");
+                (PROCESS_EVENT_ID_UNKNOWN | block, frame)
+            }
         };
+        debug_assert!(frame <= PROCESS_EVENT_ID_MAX_FRAME, "{self:?}");
         PROCESS_EVENT_ID_TAG
             | field << PROCESS_EVENT_ID_FIELD_SHIFT
             | frame << PROCESS_EVENT_ID_GUARD_BITS
     }
 
     /// `None` for an id this encoding did not produce.
-    pub(crate) fn decode(id: u64) -> Option<Self> {
-        if id >> 62 != 1 || id & ((1 << PROCESS_EVENT_ID_GUARD_BITS) - 1) != 0 {
+    fn decode(id: u64) -> Option<Self> {
+        if id >> PROCESS_EVENT_ID_TAG_BIT != 1 || id & ((1 << PROCESS_EVENT_ID_GUARD_BITS) - 1) != 0
+        {
             return None;
         }
         let frame = (id >> PROCESS_EVENT_ID_GUARD_BITS) & PROCESS_EVENT_ID_MAX_FRAME;
-        let field = (id >> PROCESS_EVENT_ID_FIELD_SHIFT) & ((1 << PROCESS_EVENT_ID_FIELD_BITS) - 1);
+        let field = (id >> PROCESS_EVENT_ID_FIELD_SHIFT) & PROCESS_EVENT_ID_FIELD_MASK;
         Some(if field & PROCESS_EVENT_ID_UNKNOWN == 0 {
             Self::Position {
                 position: field,
@@ -361,7 +402,7 @@ impl ProcessEventId {
 
     /// The id of the next frame, once the client has received output up to
     /// `position`. Always greater than this one.
-    pub(crate) fn next(self, position: Option<u64>) -> Self {
+    fn next(self, position: Option<u64>) -> Self {
         match self {
             Self::Position {
                 position: last,
@@ -385,8 +426,9 @@ impl ProcessEventId {
                 block,
                 frame: frame + 1,
             },
-            // A resumed stream starts at most at block 2^32
-            // (`first_after`), and would need 2^44 frames to exhaust the rest.
+            // A resumed stream starts at most at block
+            // `PROCESS_EVENT_ID_MAX_RESUME_BLOCK` (`first_after`), and would
+            // need 2^34 frames to exhaust the rest.
             Self::Unknown { block, .. } => Self::Unknown {
                 block: block + 1,
                 frame: 0,
@@ -404,12 +446,12 @@ impl ProcessReplayState {
     /// already has may repeat. Every id the stream sends is above
     /// `Last-Event-ID`; `None` when no id can be (see
     /// [`ProcessEventId::first_after`]).
-    pub(crate) fn load(session_id: DataPlaneSessionId, last_event_id: Option<u64>) -> Option<Self> {
+    fn load(last_event_id: Option<u64>) -> Option<Self> {
         let Some(last_event_id) = last_event_id else {
             return Some(Self {
                 event_id: ProcessEventId::START,
                 backend_output_cursor: 0,
-                pending: VecDeque::new(),
+                resync: None,
             });
         };
         if let Some(event_id @ ProcessEventId::Position { position, .. }) =
@@ -418,18 +460,13 @@ impl ProcessReplayState {
             return Some(Self {
                 event_id,
                 backend_output_cursor: position,
-                pending: VecDeque::new(),
+                resync: None,
             });
         }
-        let event_id = ProcessEventId::first_after(last_event_id)?.next(Some(0));
-        let frame = resync_required_frame(
-            session_id.kind().as_str(),
-            DataPlaneResyncReason::CursorReplayUnavailable,
-        );
         Some(Self {
-            event_id,
+            event_id: ProcessEventId::first_after(last_event_id)?.next(Some(0)),
             backend_output_cursor: 0,
-            pending: VecDeque::from([sse_event_from_frame(&frame, Some(event_id.encode()))]),
+            resync: Some(DataPlaneResyncReason::CursorReplayUnavailable),
         })
     }
 }
@@ -452,7 +489,12 @@ impl ProcessSseState {
         .await?;
         let mut pending = VecDeque::new();
         pending.push_back(sse_event_from_frame(&attached_frame(&attached), None));
-        pending.extend(replay.pending);
+        if let Some(reason) = replay.resync {
+            pending.push_back(sse_event_from_frame(
+                &resync_required_frame(session_id.kind().as_str(), reason),
+                Some(replay.event_id.encode()),
+            ));
+        }
         let process_id = attached.backend_process_id.clone();
         let process_bound = process_id.is_some();
         let revocation_tick = revocation_check_interval(&state);
@@ -470,7 +512,9 @@ impl ProcessSseState {
             process_id,
             process_bound,
             binding: None,
-            reopened: false,
+            started_sent: false,
+            gap_reported: false,
+            window_reopens_without_progress: 0,
             revocation_tick,
             pending,
             finished: false,
@@ -484,16 +528,39 @@ impl ProcessSseState {
     /// the position it resumed from turned out not to be in it. The ids sent
     /// after this carry no position: they must stay above the ones already
     /// sent, which positions from the start would sort below.
-    fn restart_from_output_start(&mut self) {
-        self.backend_output_cursor = Some(0);
-        self.output_seq = 0;
-        self.push_frame(resync_required_frame(
-            self.session_id.kind().as_str(),
-            DataPlaneResyncReason::CursorOutOfWindow,
-        ));
+    fn restart_from_output_start(&mut self, cause: &'static str) {
+        self.continue_after_gap(Some(0), cause);
+    }
+
+    /// Continues the client's output at `position` of the guest's, or at the
+    /// live tail when `None`, behind `resync_required(cursor_out_of_window)`:
+    /// the output between what the client has and `position` is not sent.
+    fn continue_after_gap(&mut self, position: Option<u64>, cause: &'static str) {
+        tracing::info!(
+            cause,
+            from = ?self.backend_output_cursor,
+            to = ?position,
+            "process event stream continues after an output gap"
+        );
+        self.backend_output_cursor = position;
+        if let Some(position) = position {
+            self.output_seq = position;
+        }
+        if !self.gap_reported {
+            self.gap_reported = true;
+            self.push_frame(resync_required_frame(
+                self.session_id.kind().as_str(),
+                DataPlaneResyncReason::CursorOutOfWindow,
+            ));
+        }
     }
 
     fn push_frame(&mut self, frame: DataPlaneServerFrame) {
+        match frame {
+            DataPlaneServerFrame::ProcessStarted { .. } if self.started_sent => return,
+            DataPlaneServerFrame::ProcessStarted { .. } => self.started_sent = true,
+            _ => {}
+        }
         self.event_id = self.event_id.next(self.backend_output_cursor);
         self.pending
             .push_back(sse_event_from_frame(&frame, Some(self.event_id.encode())));
@@ -519,6 +586,128 @@ impl ProcessSseState {
             message: PROCESS_STREAM_FAILED.to_string(),
             retryable: true,
         });
+    }
+
+    /// Reopens the backend stream after the guest refused its cursor as
+    /// outside the retained output, behind one
+    /// `resync_required(cursor_out_of_window)` for the gap: from the start of
+    /// the output when the cursor was past its end, from the oldest output the
+    /// guest still retains when it reports it, else at the live tail.
+    async fn reopen_after_window_miss(&mut self, status: tonic::Status, miss: OutputWindowMiss) {
+        let Some(process_id) = self.process_id.clone() else {
+            self.finish_with_error(StreamBridgeError::BackendStatus(status));
+            return;
+        };
+        if self.window_reopens_without_progress >= PROCESS_OUTPUT_WINDOW_REOPENS_WITHOUT_PROGRESS {
+            self.finish_with_error(StreamBridgeError::BackendStatus(status));
+            return;
+        }
+        match (miss, self.backend_output_cursor) {
+            // Only a position the client resumed from can be past the output.
+            (OutputWindowMiss::CursorAhead, Some(cursor)) if cursor > 0 => {
+                self.restart_from_output_start("cursor_ahead");
+            }
+            (OutputWindowMiss::CursorAhead, _) => {
+                self.finish_with_error(StreamBridgeError::BackendStatus(status));
+                return;
+            }
+            (
+                OutputWindowMiss::Evicted {
+                    first_retained: Some(first),
+                },
+                Some(cursor),
+            ) if first > cursor => self.continue_after_gap(Some(first), "output_evicted"),
+            (OutputWindowMiss::Evicted { .. }, _) => {
+                self.continue_after_gap(None, "output_evicted");
+            }
+        }
+        self.window_reopens_without_progress += 1;
+        match connect_process_stream(
+            &mut self.client,
+            &self.attached.sandbox_id,
+            &process_id,
+            self.backend_output_cursor,
+            self.attached.space_api_route_token.as_ref(),
+        )
+        .await
+        {
+            Ok(stream) => self.stream = stream,
+            // The route token may have expired since the stream opened.
+            Err(StreamBridgeError::BackendStatus(status)) if is_backend_reconnectable(&status) => {
+                self.reconnect_backend(status).await;
+            }
+            Err(error) => self.finish_with_error(error),
+        }
+    }
+
+    /// Re-resolves the route after the backend stream failed with `status`
+    /// and reopens it at the output position the client has reached.
+    async fn reconnect_backend(&mut self, status: tonic::Status) {
+        let Some(current_process_id) = self.process_id.clone() else {
+            self.finish_with_error(StreamBridgeError::BackendStatus(status));
+            return;
+        };
+        let current_generation = self.attached.route_generation;
+        let (refreshed, refresh_dimension) =
+            match refresh_native_stream_route(&self.state, &self.attached, &status).await {
+                Ok(refreshed) => refreshed,
+                Err(error) => {
+                    self.finish_with_error(error);
+                    return;
+                }
+            };
+        let reason =
+            reconnect_reason_for_route_change(current_generation, refreshed.route_generation);
+        record_backend_channel_reset(self.session_id.kind().as_str(), &reason);
+        self.push_frame(DataPlaneServerFrame::BackendReconnecting {
+            reason: reason.clone(),
+            route_generation: current_generation,
+        });
+        if let Err(error) =
+            record_session_reconnect(&self.state, self.session_id, reason, current_generation).await
+        {
+            self.finish_with_error(error);
+            return;
+        }
+        let reopened = async {
+            let channel = self
+                .state
+                .backend_channels
+                .channel(&refreshed.backend_endpoint, self.session_id)
+                .await?;
+            let mut client = WorkerApiClient::new(wrap_grpc_client_channel(channel));
+            let stream = connect_process_stream(
+                &mut client,
+                &refreshed.sandbox_id,
+                &current_process_id,
+                self.backend_output_cursor,
+                refreshed.space_api_route_token.as_ref(),
+            )
+            .await?;
+            Ok((client, stream))
+        }
+        .await;
+        match finish_native_stream_refresh(refresh_dimension, reopened) {
+            Ok((client, stream)) => {
+                self.client = client;
+                self.stream = stream;
+                self.push_frame(DataPlaneServerFrame::BackendReconnected {
+                    route_generation: refreshed.route_generation,
+                    current_node_id: refreshed.current_node_id.to_string(),
+                });
+                // From a known position the reopened stream continues where
+                // this one stopped; only one that follows the live tail can
+                // skip output.
+                if self.backend_output_cursor.is_none() {
+                    self.push_frame(resync_required_frame(
+                        self.session_id.kind().as_str(),
+                        DataPlaneResyncReason::ProcessStreamReconnected,
+                    ));
+                }
+                self.attached = refreshed;
+            }
+            Err(error) => self.finish_with_error(error),
+        }
     }
 }
 
@@ -601,13 +790,11 @@ async fn next_process_sse_frame(state: &mut ProcessSseState) -> Option<Event> {
                 };
                 match event {
                     Ok(event) => {
-                        let mut repeated_start = false;
                         if matches!(
                             event.event,
                             Some(spaced_process_event::Event::Started(_))
                                 | Some(spaced_process_event::Event::Connected(_))
                         ) {
-                            repeated_start = std::mem::take(&mut state.reopened);
                             let event_process_id: ProcessId = match event.process_id.parse() {
                                 Ok(process_id) => process_id,
                                 Err(_) => {
@@ -627,7 +814,7 @@ async fn next_process_sse_frame(state: &mut ProcessSseState) -> Option<Event> {
                                     // This attach started the process, so its
                                     // output begins here: the position the
                                     // client resumed from was another's.
-                                    state.restart_from_output_start();
+                                    state.restart_from_output_start("foreign_last_event_id");
                                 }
                                 state.process_bound = true;
                                 state.binding = Some(PendingProcessBinding::spawn(
@@ -639,12 +826,7 @@ async fn next_process_sse_frame(state: &mut ProcessSseState) -> Option<Event> {
                             }
                         }
                         let mut output_seq = state.output_seq;
-                        let mut batch = process_event_frames(event, &mut output_seq);
-                        if repeated_start {
-                            batch.frames.retain(|frame| {
-                                !matches!(frame, DataPlaneServerFrame::ProcessStarted { .. })
-                            });
-                        }
+                        let batch = process_event_frames(event, &mut output_seq);
                         if batch
                             .frames
                             .iter()
@@ -664,6 +846,10 @@ async fn next_process_sse_frame(state: &mut ProcessSseState) -> Option<Event> {
                                     *cursor = output_seq;
                                 }
                             }
+                            if process_frame_advances_backend_cursor(&frame) || exited {
+                                state.gap_reported = false;
+                                state.window_reopens_without_progress = 0;
+                            }
                             state.push_frame(frame);
                             if exited {
                                 state.push_frame(DataPlaneServerFrame::Closed {
@@ -676,132 +862,21 @@ async fn next_process_sse_frame(state: &mut ProcessSseState) -> Option<Event> {
                             return Some(event);
                         }
                     }
-                    Err(status) if is_output_window_miss(&status) => {
-                        // The guest does not hold the output this stream asked
-                        // for. Report the gap, then reopen: from the start of
-                        // the output when the cursor was past its end, else at
-                        // the live tail, as what was evicted is gone.
-                        let Some(process_id) = state.process_id.clone() else {
-                            state.finish_with_error(StreamBridgeError::BackendStatus(status));
-                            return state.pending.pop_front();
-                        };
-                        let reopen_at = (is_output_cursor_ahead(&status)
-                            && state.backend_output_cursor != Some(0))
-                        .then_some(0);
-                        if reopen_at.is_some() {
-                            state.restart_from_output_start();
-                        } else {
-                            state.backend_output_cursor = None;
-                            state.push_frame(resync_required_frame(
-                                state.session_id.kind().as_str(),
-                                DataPlaneResyncReason::CursorOutOfWindow,
-                            ));
-                        }
-                        match connect_process_stream(
-                            &mut state.client,
-                            &state.attached.sandbox_id,
-                            &process_id,
-                            reopen_at,
-                            state.attached.space_api_route_token.as_ref(),
-                        )
-                        .await
-                        {
-                            Ok(stream) => {
-                                state.stream = stream;
-                                state.reopened = true;
-                            }
-                            Err(error) => state.finish_with_error(error),
-                        }
-                        return state.pending.pop_front();
-                    }
-                    Err(status)
-                        if status.code() == tonic::Code::Unavailable
-                            || is_refreshable_route_identity_rejection(&status) =>
-                    {
-                        let Some(current_process_id) = state.process_id.clone() else {
-                            state.finish_with_error(StreamBridgeError::BackendStatus(status));
-                            return state.pending.pop_front();
-                        };
-                        let current_generation = state.attached.route_generation;
-                        let (refreshed, refresh_dimension) =
-                            match refresh_native_stream_route(
-                                &state.state,
-                                &state.attached,
-                                &status,
-                            )
-                            .await
-                            {
-                            Ok(refreshed) => refreshed,
-                            Err(error) => {
-                                state.finish_with_error(error);
-                                return state.pending.pop_front();
-                            }
-                        };
-                        let reason = reconnect_reason_for_route_change(
-                            current_generation,
-                            refreshed.route_generation,
-                        );
-                        record_backend_channel_reset(state.session_id.kind().as_str(), &reason);
-                        state.push_frame(DataPlaneServerFrame::BackendReconnecting {
-                            reason: reason.clone(),
-                            route_generation: current_generation,
-                        });
-                        if let Err(error) = record_session_reconnect(
-                            &state.state,
-                            state.session_id,
-                            reason,
-                            current_generation,
-                        )
-                        .await
-                        {
-                            state.finish_with_error(error);
-                            return state.pending.pop_front();
-                        }
-                        let reopened = async {
-                            let channel = state
-                                .state
-                                .backend_channels
-                                .channel(&refreshed.backend_endpoint, state.session_id).await?;
-                            let mut client =
-                                WorkerApiClient::new(wrap_grpc_client_channel(channel));
-                            let stream = connect_process_stream(
-                                &mut client,
-                                &refreshed.sandbox_id,
-                                &current_process_id,
-                                state.backend_output_cursor,
-                                refreshed.space_api_route_token.as_ref(),
-                            )
-                            .await?;
-                            Ok((client, stream))
-                        }
-                        .await;
-                        match finish_native_stream_refresh(refresh_dimension, reopened) {
-                            Ok((client, stream)) => {
-                                state.client = client;
-                                state.stream = stream;
-                                state.reopened = true;
-                                state.push_frame(DataPlaneServerFrame::BackendReconnected {
-                                    route_generation: refreshed.route_generation,
-                                    current_node_id: refreshed.current_node_id.to_string(),
-                                });
-                                // From a known position the reopened stream
-                                // continues where this one stopped; only one
-                                // that follows the live tail can skip output.
-                                if state.backend_output_cursor.is_none() {
-                                    state.push_frame(resync_required_frame(
-                                        state.session_id.kind().as_str(),
-                                        DataPlaneResyncReason::ProcessStreamReconnected,
-                                    ));
-                                }
-                                state.attached = refreshed;
-                            }
-                            Err(error) => state.finish_with_error(error),
-                        }
-                        return state.pending.pop_front();
-                    }
                     Err(status) => {
-                        state.finish_with_error(StreamBridgeError::BackendStatus(status));
-                        return state.pending.pop_front();
+                        if let Some(miss) = output_window_miss(&status) {
+                            state.reopen_after_window_miss(status, miss).await;
+                        } else if is_backend_reconnectable(&status) {
+                            state.reconnect_backend(status).await;
+                        } else {
+                            state.finish_with_error(StreamBridgeError::BackendStatus(status));
+                        }
+                        // A reopen after a gap already reported sends nothing.
+                        if let Some(event) = state.pending.pop_front() {
+                            return Some(event);
+                        }
+                        if state.finished {
+                            return None;
+                        }
                     }
                 }
             }
@@ -809,24 +884,62 @@ async fn next_process_sse_frame(state: &mut ProcessSseState) -> Option<Event> {
     }
 }
 
-/// Whether the guest ended a process stream because its cursor is outside the
-/// retained output: `resource_exhausted` once that output has been evicted (the
-/// node's per-sandbox limiter uses the same code, but it refuses a call before
-/// any stream exists), or a cursor past the end of the output.
-fn is_output_window_miss(status: &tonic::Status) -> bool {
-    is_output_cursor_ahead(status)
-        || (status.code() == tonic::Code::ResourceExhausted
-            && pplx_space_common_grpc::UdsPerSandboxLimitExceeded::from_status(status).is_none())
+/// Backend reopens after an output window miss, without output or an exit
+/// in between, before the stream ends with an error. A cursor past the output
+/// restarts at the start, which the guest may in turn report as evicted, so
+/// two in a row are expected.
+const PROCESS_OUTPUT_WINDOW_REOPENS_WITHOUT_PROGRESS: u32 = 3;
+
+/// Why the guest ended a process stream because its cursor is outside the
+/// output it retains.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutputWindowMiss {
+    /// The cursor is past the output the process has written.
+    CursorAhead,
+    /// The output at the cursor was evicted. `first_retained` is the cursor
+    /// of the oldest output the guest still retains, when it reports one.
+    Evicted { first_retained: Option<u64> },
 }
 
-/// A guest older than this check waits for output to reach such a cursor.
-fn is_output_cursor_ahead(status: &tonic::Status) -> bool {
-    status.code() == tonic::Code::OutOfRange
-        && status
-            .metadata()
-            .get(pplx_space_common_core::spaced::ERROR_REASON_METADATA_KEY)
-            .and_then(|value| value.to_str().ok())
-            == Some(pplx_space_common_core::spaced::PROCESS_OUTPUT_CURSOR_AHEAD)
+/// The window miss a backend stream status reports: an OUT_OF_RANGE or a
+/// RESOURCE_EXHAUSTED the guest tagged as one, or, from a guest older than
+/// those tags, a RESOURCE_EXHAUSTED with its lag message. Other statuses with
+/// these codes (a hop's refusal of an oversized chunk, an HTTP/2 reset) are
+/// not misses.
+fn output_window_miss(status: &tonic::Status) -> Option<OutputWindowMiss> {
+    use pplx_space_common_core::spaced;
+    let metadata = status.metadata();
+    let reason = metadata
+        .get(spaced::ERROR_REASON_METADATA_KEY)
+        .and_then(|value| value.to_str().ok());
+    match (status.code(), reason) {
+        (tonic::Code::OutOfRange, Some(spaced::PROCESS_OUTPUT_CURSOR_AHEAD)) => {
+            Some(OutputWindowMiss::CursorAhead)
+        }
+        (tonic::Code::ResourceExhausted, Some(spaced::PROCESS_OUTPUT_LAGGED)) => {
+            Some(OutputWindowMiss::Evicted {
+                first_retained: metadata
+                    .get(spaced::PROCESS_OUTPUT_FIRST_SEQUENCE_METADATA_KEY)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse().ok()),
+            })
+        }
+        (tonic::Code::ResourceExhausted, None)
+            if status.message() == spaced::PROCESS_OUTPUT_LAGGED_MESSAGE =>
+        {
+            Some(OutputWindowMiss::Evicted {
+                first_retained: None,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Whether a backend stream that failed with `status` may be reopened after
+/// re-resolving its route: the backend is unavailable, or it rejected the
+/// route's identity as one a refresh replaces.
+fn is_backend_reconnectable(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::Unavailable || is_refreshable_route_identity_rejection(status)
 }
 
 pub(crate) struct FileWatchSseState {
@@ -1084,3 +1197,6 @@ async fn next_file_watch_sse_frame(state: &mut FileWatchSseState) -> Option<Even
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
