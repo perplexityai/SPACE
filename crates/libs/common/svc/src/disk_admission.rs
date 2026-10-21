@@ -3,7 +3,8 @@ use std::time::Duration;
 
 use pplx_space_common_core::host::disk_admission::{
     CacheDiskAdmissionConfig, CacheDiskAdmissionDecision, CacheDiskAdmissionMonitor,
-    CacheDiskAdmissionReason, CacheDiskAdmissionState,
+    CacheDiskAdmissionReason, CacheDiskAdmissionState, CacheDiskMeasurement, CacheDiskProbeError,
+    CacheDiskRefreshFailure, read_cache_disk_measurement,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -37,6 +38,11 @@ impl CacheDiskAdmissionHandle {
 
     pub fn config(&self) -> CacheDiskAdmissionConfig {
         self.config
+    }
+
+    /// See [`CacheDiskAdmissionMonitor::successful_refreshes`].
+    pub fn successful_refreshes(&self) -> u64 {
+        self.monitor.successful_refreshes()
     }
 
     pub fn evaluate(&self, pending_reservation_bytes: u64) -> CacheDiskAdmissionDecision {
@@ -83,12 +89,29 @@ where
     (handle, refresh_task)
 }
 
+/// Periodic refresh: a failed probe keeps the last good measurement until its TTL.
 pub async fn refresh_cache_disk_admission_once(
     handle: &CacheDiskAdmissionHandle,
 ) -> Result<(), String> {
+    refresh_cache_disk_admission_once_with(
+        handle,
+        CacheDiskRefreshFailure::KeepLastGood,
+        read_cache_disk_measurement,
+    )
+    .await
+}
+
+pub async fn refresh_cache_disk_admission_once_with<P>(
+    handle: &CacheDiskAdmissionHandle,
+    on_failure: CacheDiskRefreshFailure,
+    probe: P,
+) -> Result<(), String>
+where
+    P: FnOnce() -> Result<CacheDiskMeasurement, CacheDiskProbeError> + Send + 'static,
+{
     tokio::task::spawn_blocking({
         let monitor = Arc::clone(&handle.monitor);
-        move || monitor.refresh()
+        move || monitor.refresh_with(on_failure, probe)
     })
     .await
     .map_err(|error| format!("disk admission refresh task failed: {error}"))?
