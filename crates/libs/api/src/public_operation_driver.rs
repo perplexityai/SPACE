@@ -178,6 +178,7 @@ pub struct TickReport {
     pub retried: usize,
     pub stale_claims: usize,
     pub expired: usize,
+    pub canceled: usize,
 }
 
 impl TickReport {
@@ -188,6 +189,7 @@ impl TickReport {
         self.retried += other.retried;
         self.stale_claims += other.stale_claims;
         self.expired += other.expired;
+        self.canceled += other.canceled;
     }
 }
 
@@ -346,6 +348,28 @@ where
         | OperationState::Canceled
         | OperationState::Expired
         | OperationState::Other(_) => {
+            // A create a later delete supersedes ends here rather than
+            // retrying, so the delete need not wait out its retries and the
+            // create never runs after it.
+            if kind == OperationKind::CreateSandbox
+                && let Some(delete_id) = store
+                    .cancel_claimed_create_superseded_by_delete(&claim_token, operation_id)
+                    .await?
+            {
+                report.canceled += 1;
+                pplx_space_metrics::operations::completed_by(
+                    api_product_label,
+                    kind.as_str(),
+                    OperationState::Canceled.as_str(),
+                    executor_label,
+                );
+                tracing::info!(
+                    operation_id = %operation_id,
+                    delete_operation_id = %delete_id,
+                    "public create canceled instead of retried: a later delete supersedes it"
+                );
+                return Ok(report);
+            }
             let supported_requeue = result.state == OperationState::Queued;
             let requeue_reason = if supported_requeue {
                 result.requeue_reason

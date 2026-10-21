@@ -127,6 +127,13 @@ async fn a_claim_takes_no_more_than_its_non_teardown_limit_of_other_work() -> Te
     };
     let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
     let store = PublicOperationStore::new(db.pool.clone());
+    queue_all(
+        &store,
+        org_id,
+        &[(OperationKind::CreateSandbox, "sbx_capacity_running")],
+    )
+    .await?;
+    claim_with(&store, ClaimLimits::any(1)).await?;
     let requested = queue_all(
         &store,
         org_id,
@@ -137,8 +144,8 @@ async fn a_claim_takes_no_more_than_its_non_teardown_limit_of_other_work() -> Te
             (OperationKind::KillSandbox, "sbx_capacity_kill_2"),
             (OperationKind::CreateSandbox, "sbx_capacity_create_3"),
             (OperationKind::DeleteSandbox, "sbx_capacity_delete_3"),
-            // Still waits for the create requested before it on its sandbox.
-            (OperationKind::DeleteSandbox, "sbx_capacity_create_1"),
+            // Still waits for the create running on its sandbox.
+            (OperationKind::DeleteSandbox, "sbx_capacity_running"),
         ],
     )
     .await?;
@@ -159,7 +166,7 @@ async fn a_claim_takes_no_more_than_its_non_teardown_limit_of_other_work() -> Te
         [create_1, delete_1, kill_2, delete_3]
     );
     // With no room for other work, only a teardown may start, and none here
-    // can: the one left waits for its sandbox's create.
+    // can: the one left waits for the create running on its sandbox.
     assert!(
         claim_with(
             &store,
