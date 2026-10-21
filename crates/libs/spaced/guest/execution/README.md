@@ -93,6 +93,16 @@ execution metadata.
   process groups while supervision is active. Background descendants that close
   or redirect inherited output can outlive a completed leader; draining this
   service does not establish that every descendant has exited.
+- A completed process stays connectable for 15 minutes after it exits, so a
+  client that reattaches still reads its exit, and the process list includes it
+  with its exit when asked to (`include_exited`); by default it lists running
+  processes only. The window is measured on the guest's monotonic clock, so time
+  the sandbox spends suspended does not count. Starts beyond the 128-record limit
+  evict the oldest completed records first, which can end it early. The record
+  keeps its output only for the start idempotency window (60 seconds), then just
+  its exit, and closes its stdin and terminal descriptors when the process exits.
+  A caller-assigned process id stays in use for the whole window. Records live
+  in daemon memory and do not survive a daemon restart.
 
 This crate retains the daemon contract. Native upload input, bounded
 process-environment configuration, consistent shutdown semantics and complete

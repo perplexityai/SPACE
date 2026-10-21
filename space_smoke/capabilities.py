@@ -223,6 +223,10 @@ class ProcessInfo:
     process_id: str
     pid: int
     command: tuple[str, ...]
+    # The native API can report a recently exited process, with its exit.
+    state: str = "running"
+    exit_status: str | None = None
+    signal: int | None = None
 
 
 class ProcessSandbox(CommandSandbox, Protocol):

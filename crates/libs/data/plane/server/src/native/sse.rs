@@ -348,8 +348,13 @@ impl ProcessSseState {
         self.finished = true;
         self.push_frame(DataPlaneServerFrame::Error {
             code: DataPlaneErrorCode::BackendStreamError,
-            message: PROCESS_STREAM_FAILED.to_string(),
-            retryable: true,
+            message: match error {
+                StreamBridgeError::ProcessNotRetained => PROCESS_NOT_RETAINED_MESSAGE,
+                _ => PROCESS_STREAM_FAILED,
+            }
+            .to_string(),
+            // A reattach cannot bring back a process the guest let go of.
+            retryable: !matches!(error, StreamBridgeError::ProcessNotRetained),
         });
     }
 }
@@ -547,7 +552,8 @@ async fn next_process_sse_frame(state: &mut ProcessSseState) -> Option<Event> {
                                 state.backend_output_cursor,
                                 refreshed.space_api_route_token.as_ref(),
                             )
-                            .await?;
+                            .await
+                            .map_err(process_not_retained)?;
                             Ok((client, stream))
                         }
                         .await;

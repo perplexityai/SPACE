@@ -604,12 +604,15 @@ impl SandboxController {
             })?
     }
 
+    /// Running processes, and with `include_exited` also the exited ones the
+    /// sandbox still retains.
     pub async fn spaced_list_processes(
         &self,
         pool: &PgPool,
         sandbox: &Sandbox,
         metric_identity: SandboxApiMetricIdentity,
         id: SandboxId,
+        include_exited: bool,
     ) -> Result<SpacedListProcessesResponse, ControllerError> {
         let mut client = self
             .spaced_client(
@@ -622,7 +625,7 @@ impl SandboxController {
         client
             .spaced_list_processes(SpacedListProcessesRequest {
                 sandbox_id: id.to_string(),
-                operation: Some(spaced_ops::ListProcessesRequest {}),
+                operation: Some(spaced_ops::ListProcessesRequest { include_exited }),
             })
             .await
     }

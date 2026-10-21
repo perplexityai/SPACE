@@ -32,6 +32,12 @@ const PROCESS_OUTPUT_RETENTION_MIN_BYTES: usize = 16 * 1024 * 1024;
 // cap them as well as the output bytes. Completed records are evicted first
 // under pressure; if every slot belongs to a running process, admission fails.
 const PROCESS_RECORD_LIMIT: usize = 128;
+// How long a completed record, and so its exit, stays connectable: a client
+// that reattaches after the command ends still reads `process_exited`. Its
+// output is released `IDEMPOTENCY_RECORD_TTL` after the exit, when no start
+// retry can replay it any more, so finished processes do not hold the shared
+// output budget. The record limit above still bounds what is retained.
+const COMPLETED_PROCESS_RETENTION: Duration = Duration::from_secs(15 * 60);
 // One process retains at most a quarter of the smallest total.
 const PROCESS_OUTPUT_RETENTION_BYTES: usize = PROCESS_OUTPUT_RETENTION_MIN_BYTES / 4;
 
@@ -183,6 +189,10 @@ impl ProcessSupervision {
             }
         }
         let exit = process_exit_event(&process_id, Some(pid), outcome);
+        // Output tasks have ended, so these are the last input descriptors.
+        // The signal pidfd stays: a signal racing this exit uses it safely, as
+        // a reaped pidfd only reports ESRCH, and the record limit bounds it.
+        record.input.release();
         record.journal.complete(exit);
         // Release supervisor ownership. Eviction can free this record's
         // permit once any in-flight stdin/control handlers also release it.
@@ -196,11 +206,11 @@ impl ProcessSupervision {
         drop(exit_observer);
         #[cfg(not(target_os = "linux"))]
         let () = exit_observer;
-        // The record stays for `IDEMPOTENCY_RECORD_TTL`; the registry's single
-        // reaper removes it. Waiting here instead kept this whole task (its
-        // future, about 2 KiB) alive for the retention of every start, so at
-        // sustained start rates spaced held starts/s x 60 s of them: ~48 MiB
-        // at 450 starts/s, though at most 128 records exist.
+        // The record stays for `COMPLETED_PROCESS_RETENTION`; the registry's
+        // single reaper removes it. Waiting here instead kept this whole task
+        // (its future, about 2 KiB) alive for the retention of every start:
+        // ~48 MiB at 450 starts/s with a 60 s retention, though at most 128
+        // records exist.
         drop(process_id);
         registry.ensure_reaper(shutdown);
     }
@@ -369,8 +379,8 @@ impl ProcessLaunch {
         let (input, pty_reader, stdout, stderr) = if let Some(pty) = prepared_pty.take() {
             (
                 ProcessInput::Pty(PtyInput {
-                    writer: Mutex::new(pty.writer),
-                    resize_fd: pty.resize_fd,
+                    writer: Mutex::new(Some(pty.writer)),
+                    resize_fd: std::sync::Mutex::new(Some(pty.resize_fd)),
                 }),
                 Some(pty.reader),
                 None,
@@ -661,8 +671,8 @@ enum ProcessInput {
 }
 
 struct PtyInput {
-    writer: Mutex<PtyIo>,
-    resize_fd: PtyIo,
+    writer: Mutex<Option<PtyIo>>,
+    resize_fd: std::sync::Mutex<Option<PtyIo>>,
 }
 
 impl ProcessInput {
@@ -681,6 +691,9 @@ impl ProcessInput {
             }
             Self::Pty(pty) => {
                 let mut writer = pty.writer.lock().await;
+                let writer = writer
+                    .as_mut()
+                    .ok_or_else(|| Status::failed_precondition("process input is closed"))?;
                 writer.write_all(data).await.map_err(map_io_error)?;
                 writer.flush().await.map_err(map_io_error)
             }
@@ -704,9 +717,43 @@ impl ProcessInput {
 
     fn resize_pty(&self, size: PtySize) -> Result<(), Status> {
         match self {
-            Self::Pty(pty) => set_pty_size(&pty.resize_fd, size),
+            Self::Pty(pty) => {
+                let resize_fd = pty
+                    .resize_fd
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let resize_fd = resize_fd
+                    .as_ref()
+                    .ok_or_else(|| Status::failed_precondition("process input is closed"))?;
+                set_pty_size(resize_fd, size)
+            }
             Self::Disabled | Self::Pipe(_) => {
                 Err(Status::failed_precondition("process is not pty-backed"))
+            }
+        }
+    }
+
+    /// Closes the input descriptors once the process has exited, so a
+    /// descendant still reading the stdin pipe sees EOF and one still writing
+    /// to the terminal gets EIO, rather than either blocking for the record's
+    /// retention. A write still in flight keeps its descriptor until it
+    /// returns; the record's eviction closes it then.
+    fn release(&self) {
+        match self {
+            Self::Disabled => {}
+            Self::Pipe(stdin) => {
+                if let Ok(mut stdin) = stdin.try_lock() {
+                    stdin.take();
+                }
+            }
+            Self::Pty(pty) => {
+                if let Ok(mut writer) = pty.writer.try_lock() {
+                    writer.take();
+                }
+                pty.resize_fd
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
             }
         }
     }
@@ -1008,7 +1055,56 @@ impl ProcessEventJournal {
             .lock()
             .expect("process output journal lock poisoned")
             .completed_at
-            .is_some_and(|completed_at| completed_at.elapsed() > IDEMPOTENCY_RECORD_TTL)
+            .is_some_and(|completed_at| completed_at.elapsed() > COMPLETED_PROCESS_RETENTION)
+    }
+
+    /// Drops the retained output of a process that completed more than
+    /// `IDEMPOTENCY_RECORD_TTL` ago, keeping its exit. Only a retried start
+    /// replays output, and its key has expired by then; a reconnect without a
+    /// cursor needs just the start and the exit.
+    fn release_output_if_due(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("process output journal lock poisoned");
+        if state.output_released
+            || !state
+                .completed_at
+                .is_some_and(|completed_at| completed_at.elapsed() > IDEMPOTENCY_RECORD_TTL)
+        {
+            return;
+        }
+        state.output.clear();
+        state.retained_bytes = 0;
+        state.guaranteed_bytes = 0;
+        state.first_sequence = state.next_sequence;
+        state.output_released = true;
+    }
+
+    /// When the reaper next has work for this record: releasing its output,
+    /// then ending its retention (just after each, as both are strictly past).
+    fn next_deadline(&self) -> Option<Instant> {
+        let state = self
+            .state
+            .lock()
+            .expect("process output journal lock poisoned");
+        let retained_for = if state.output_released {
+            COMPLETED_PROCESS_RETENTION
+        } else {
+            IDEMPOTENCY_RECORD_TTL
+        };
+        state
+            .completed_at
+            .map(|completed_at| completed_at + retained_for + Duration::from_millis(1))
+    }
+
+    /// The exit and its wall-clock time, once the process has completed.
+    fn ended(&self) -> Option<(ProcessEvent, Option<SystemTime>)> {
+        let state = self
+            .state
+            .lock()
+            .expect("process output journal lock poisoned");
+        state.exit.clone().map(|exit| (exit, state.ended_at))
     }
 
     /// Moves the completion time back, as if `by` had passed since.
@@ -1195,6 +1291,7 @@ impl ProcessEventJournal {
                 .expect("process output journal lock poisoned");
             state.exit = Some(exit.clone());
             state.completed_at = Some(Instant::now());
+            state.ended_at = Some(SystemTime::now());
             state.next_sequence
         };
         self.changed.send_replace(ProcessJournalChange::Exit {
@@ -1240,6 +1337,8 @@ struct ProcessJournalState {
     guaranteed_bytes: usize,
     exit: Option<ProcessEvent>,
     completed_at: Option<Instant>,
+    ended_at: Option<SystemTime>,
+    output_released: bool,
 }
 
 struct SequencedProcessEvent {
@@ -1459,25 +1558,28 @@ impl ProcessRegistry {
 
     fn remove_expired(&self) {
         self.records.retain(|_, entry| {
-            !entry
-                .record()
-                .is_some_and(|record| record.journal.is_expired())
+            let Some(record) = entry.record() else {
+                return true;
+            };
+            record.journal.release_output_if_due();
+            !record.journal.is_expired()
         });
     }
 
-    /// When the earliest retained completed record expires (just after, as
-    /// expiry is strictly past the TTL).
+    /// When the reaper next has work: releasing a completed record's output
+    /// or ending its retention, whichever comes first.
     fn next_expiry(&self) -> Option<Instant> {
         self.records
             .iter()
-            .filter_map(|entry| entry.record()?.journal.completed_at())
+            .filter_map(|entry| entry.record()?.journal.next_deadline())
             .min()
-            .map(|completed_at| completed_at + IDEMPOTENCY_RECORD_TTL + Duration::from_millis(1))
     }
 
-    fn list(&self) -> Vec<ProcessInfo> {
+    /// Running processes, and with `include_exited` also the retained
+    /// completed ones, each with its exit.
+    fn list(&self, include_exited: bool) -> Vec<ProcessInfo> {
         let mut expired = Vec::new();
-        let running = self
+        let listed = self
             .records
             .iter()
             .filter_map(|entry| {
@@ -1486,13 +1588,30 @@ impl ProcessRegistry {
                     expired.push(entry.key().clone());
                     return None;
                 }
-                (!record.journal.is_completed()).then(|| record.info.clone())
+                let Some((exit, ended_at)) = record.journal.ended() else {
+                    return Some(record.info.clone());
+                };
+                let Some(
+                    pplx_space_spaced_guest_protocol::proto::bridge_guest::process_event::Event::Exit(
+                        exit,
+                    ),
+                ) = exit.event
+                else {
+                    return None;
+                };
+                include_exited.then(|| ProcessInfo {
+                    exit: Some(exit),
+                    ended_at: ended_at.and_then(|ended_at| {
+                        pplx_space_spaced_guest_protocol::system_time_to_proto(ended_at).ok()
+                    }),
+                    ..record.info.clone()
+                })
             })
             .collect();
         for process_id in expired {
             self.records.remove(&process_id);
         }
-        running
+        listed
     }
 }
 
@@ -2128,6 +2247,8 @@ impl Process for ExecutionService {
                 user: listed_user,
                 tag: listed_tag,
                 pty: Some(uses_pty),
+                exit: None,
+                ended_at: None,
             },
             timeout,
             process_id: process_id.clone(),
@@ -2225,7 +2346,10 @@ impl Process for ExecutionService {
             request.get_ref(),
             pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
         )?;
-        let processes = self.inner.processes.list();
+        let processes = self
+            .inner
+            .processes
+            .list(request.into_inner().include_exited);
         tracing::debug!(
             command = "bridge_guest_process_list",
             count = processes.len(),

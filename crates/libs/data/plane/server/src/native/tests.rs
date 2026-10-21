@@ -411,6 +411,187 @@ async fn full_guest_storage_is_named_and_not_retryable() {
     assert_eq!(body["error"]["retryable"], false);
 }
 
+// Reattaching to a session whose process the guest no longer retains names
+// that, rather than reporting a command that could not be started. A node's
+// own `NotFound`, not the guest's, keeps its retryable answer.
+#[tokio::test]
+async fn reattach_to_a_process_no_longer_retained_names_it() {
+    use http_body_util::BodyExt;
+    use prost::Message as _;
+    if !binding_fake_test_process() {
+        return;
+    }
+    for (guest, expected_status, expected_message, retryable) in [
+        (
+            true,
+            StatusCode::NOT_FOUND,
+            PROCESS_NOT_RETAINED_MESSAGE,
+            false,
+        ),
+        (
+            false,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "process event stream is not available",
+            true,
+        ),
+    ] {
+        let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let mut route = crate::tests::route_response_with_token(session_id, None);
+        route.backend.as_mut().unwrap().endpoint = endpoint.clone();
+        route.backend_process_id =
+            Some(pplx_space_public_api::process_id_for_session(session_id).to_string());
+        let route = route.encode_to_vec();
+        let service = axum::Router::new().fallback(move |request: Request<Body>| {
+            let route = route.clone();
+            async move {
+                let path = request.uri().path().to_string();
+                if path.ends_with("/Check") {
+                    return crate::tests::grpc_test_response(vec![8, 1]);
+                }
+                if path.ends_with("/ResolveDataPlaneSessionRoute") {
+                    return crate::tests::grpc_test_response(route);
+                }
+                assert!(
+                    path.ends_with("/SpacedConnectProcess"),
+                    "a bound session reconnects rather than starting: {path}"
+                );
+                let mut status = tonic::Status::not_found("process not found");
+                if guest {
+                    status
+                        .metadata_mut()
+                        .insert("space-guest-process-error", "terminal".parse().unwrap());
+                }
+                status.into_http::<Body>()
+            }
+        });
+        tokio::spawn(async move {
+            axum::serve(listener, service).await.unwrap();
+        });
+        let mut state = crate::tests::test_data_plane_state().await;
+        state.cluster_api = ClusterApiClients::service_only(
+            pplx_space_node_api_client::cluster::connect(endpoint, "test")
+                .await
+                .unwrap(),
+        );
+        let token = format!("{DATA_PLANE_TOKEN_PREFIX}{}", "c".repeat(64));
+        let response = tower::ServiceExt::oneshot(
+            router(state),
+            Request::get(format!("/v1/sessions/{session_id}/events"))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), expected_status, "guest={guest}");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["message"], expected_message, "{body}");
+        assert_eq!(body["error"]["retryable"], retryable, "{body}");
+    }
+    let DataPlaneServerFrame::Error {
+        message, retryable, ..
+    } = stream_start_error_frame(&StreamBridgeError::ProcessNotRetained)
+    else {
+        panic!("expected error frame")
+    };
+    assert_eq!(message, PROCESS_NOT_RETAINED_MESSAGE);
+    assert!(!retryable, "WebSocket agrees with SSE");
+}
+
+// A stream that loses its backend and finds the guest no longer retains the
+// process names that, not retryable, rather than inviting another reattach.
+#[tokio::test]
+async fn mid_stream_reconnect_to_a_process_no_longer_retained_names_it() {
+    use prost::Message as _;
+    if !binding_fake_test_process() {
+        return;
+    }
+    let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let process_id = pplx_space_public_api::process_id_for_session(session_id).to_string();
+    let mut route = crate::tests::route_response_with_token(session_id, None);
+    route.backend.as_mut().unwrap().endpoint = endpoint.clone();
+    route.backend_process_id = Some(process_id.clone());
+    let route = route.encode_to_vec();
+    let connected = {
+        let encoded = ProcessEvent {
+            process_id,
+            pid: Some(42),
+            event: Some(spaced_process_event::Event::Connected(
+                pplx_space_sbx_mgr_client::operations::ProcessConnected {},
+            )),
+        }
+        .encode_to_vec();
+        let mut framed = vec![0];
+        framed.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+        framed.extend(encoded);
+        bytes::Bytes::from(framed)
+    };
+    let connects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let service = axum::Router::new().fallback({
+        let connects = Arc::clone(&connects);
+        move |request: Request<Body>| {
+            let route = route.clone();
+            let connected = connected.clone();
+            let connects = Arc::clone(&connects);
+            async move {
+                let path = request.uri().path().to_string();
+                if path.ends_with("/Check") {
+                    return crate::tests::grpc_test_response(vec![8, 1]);
+                }
+                if path.ends_with("/ResolveDataPlaneSessionRoute") {
+                    return crate::tests::grpc_test_response(route);
+                }
+                if path.ends_with("/RecordDataPlaneSessionReconnect") {
+                    return crate::tests::grpc_test_response(Vec::new());
+                }
+                assert!(
+                    path.ends_with("/SpacedConnectProcess"),
+                    "unexpected call {path}"
+                );
+                if connects.fetch_add(1, Ordering::AcqRel) > 0 {
+                    let mut status = tonic::Status::not_found("process not found");
+                    status
+                        .metadata_mut()
+                        .insert("space-guest-process-error", "terminal".parse().unwrap());
+                    return status.into_http::<Body>();
+                }
+                // The first stream connects, then loses its backend.
+                let mut trailers = axum::http::HeaderMap::new();
+                trailers.insert("grpc-status", "14".parse().unwrap());
+                trailers.insert("grpc-message", "backend%20restarted".parse().unwrap());
+                let frames = futures_util::stream::iter([
+                    Ok::<_, Infallible>(hyper::body::Frame::data(connected)),
+                    Ok(hyper::body::Frame::trailers(trailers)),
+                ]);
+                Response::builder()
+                    .header("content-type", "application/grpc")
+                    .body(Body::new(http_body_util::StreamBody::new(frames)))
+                    .unwrap()
+            }
+        }
+    });
+    tokio::spawn(async move {
+        axum::serve(listener, service).await.unwrap();
+    });
+    let fake = BindingFake {
+        endpoint,
+        release: Arc::new(tokio::sync::Semaphore::new(0)),
+        bind_started: Arc::new(tokio::sync::Notify::new()),
+        bound_process_ids: Arc::new(std::sync::Mutex::new(Vec::new())),
+    };
+    let (_state, mut chunks) = open_process_events(&fake, session_id).await;
+    let mut seen = String::new();
+    read_until(&mut chunks, &mut seen, "backend_stream_error").await;
+    assert!(seen.contains(PROCESS_NOT_RETAINED_MESSAGE), "{seen}");
+    assert!(seen.contains(r#""retryable":false"#), "{seen}");
+    assert_eq!(connects.load(Ordering::Acquire), 2, "reconnected once");
+}
+
 /// How a fake cluster API answers `BindDataPlaneSessionProcess`.
 #[derive(Clone, Copy)]
 enum FakeBind {

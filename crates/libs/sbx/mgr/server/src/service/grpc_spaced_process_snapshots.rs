@@ -258,11 +258,12 @@ impl SandboxManagerService {
         let req = request.get_ref();
         let route_auth =
             self.prepare_space_api_bridge(&request, &req.sandbox_id, SpacedRpc::ListProcesses)?;
-        if req.operation.is_none() {
+        let Some(operation) = req.operation.as_ref() else {
             return Err(Status::invalid_argument(
                 "spaced operation payload is required",
             ));
-        }
+        };
+        let include_exited = operation.include_exited;
         let sandbox = self
             .ensure_active_for_read_only_guest_activity(
                 Some(route_auth.clone()),
@@ -276,11 +277,11 @@ impl SandboxManagerService {
         route_auth.authorize_sandbox(&sandbox)?;
         let client = self.connect_spaced_host(&sandbox).await?;
         let processes = client
-            .list_processes()
+            .list_processes(include_exited)
             .await?
             .into_iter()
             .map(process_info_to_spaced)
-            .collect();
+            .collect::<Result<_, _>>()?;
         Ok(Response::new(SpacedListProcessesResponse { processes }))
     }
 

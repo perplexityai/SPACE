@@ -1303,9 +1303,8 @@ class CommandSandboxFixture:
         while True:
             processes = self.list_processes()
             process = self.get_process(process_id)
-            if (
-                not any(item.process_id == process_id for item in processes)
-                and process is None
+            if not any(item.process_id == process_id for item in processes) and (
+                process is None or process.state == "exited"
             ):
                 return processes, process
             remaining = deadline - time.monotonic()

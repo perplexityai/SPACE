@@ -231,7 +231,7 @@ async fn bridge_host_retries_preserve_generation_and_do_not_retry_overload() {
 async fn process_adapter_requires_guest_readiness_and_observes_shutdown() {
     let shutdown = CancellationToken::new();
     let service = SpacedGuestService::new(shutdown.clone()).expect("guest service");
-    let request = || Request::new(ListProcessesRequest {});
+    let request = || Request::new(ListProcessesRequest::default());
     assert_eq!(
         Process::list_processes(&service, request())
             .await

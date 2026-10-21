@@ -773,7 +773,7 @@ async fn kill_reaped_process_releases_stalled_output_and_capacity() {
     )
     .await;
     let completed = tokio::time::timeout(Duration::from_secs(2), async {
-        while !service.inner.processes.list().is_empty() {
+        while !service.inner.processes.list(false).is_empty() {
             tokio::task::yield_now().await;
         }
     })
@@ -1440,11 +1440,270 @@ async fn an_exited_process_task_does_not_wait_out_its_record_retention() {
             .record()
             .expect("published")
             .journal
-            .backdate_completion(IDEMPOTENCY_RECORD_TTL + Duration::from_secs(1));
+            .backdate_completion(COMPLETED_PROCESS_RETENTION + Duration::from_secs(1));
     }
     registry.remove_expired();
     assert_eq!(registry.records.len(), 0);
     assert_eq!(registry.next_expiry(), None);
+}
+
+// A client that reattaches after its command ended still reads the exit, well
+// past the start's idempotency window, until the completed record's retention
+// ends. The process list reports it, with its exit, only when asked.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_completed_process_exit_stays_connectable_until_its_retention_ends() {
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::{
+        process_event::Event, process_exit::Outcome,
+    };
+    let service = cancellation_service();
+    let process_id = "sbxps_2f1c9a4e-0000-7000-8000-000000000003";
+    let response = Process::start(
+        &service,
+        Request::new(StartRequest {
+            command: vec!["/bin/sh".into(), "-c".into(), "exit 7".into()],
+            idempotency_key: Some("exit-retention".into()),
+            process_id: Some(process_id.into()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("process starts");
+    let mut events = response.into_inner();
+    while let Some(event) = events.next().await {
+        event.expect("process stream remains successful");
+    }
+    let connect = || {
+        Process::connect_process(
+            &service,
+            Request::new(ConnectProcessRequest {
+                process_id: process_id.into(),
+                timeout: None,
+                output_cursor: None,
+            }),
+        )
+    };
+    let backdate = |by: Duration| {
+        for entry in service.inner.processes.records.iter() {
+            entry
+                .record()
+                .expect("published")
+                .journal
+                .backdate_completion(by);
+        }
+    };
+
+    backdate(IDEMPOTENCY_RECORD_TTL + Duration::from_secs(1));
+    service.inner.processes.remove_expired();
+    let events = connect()
+        .await
+        .expect("the completed process is still retained")
+        .into_inner()
+        .collect::<Vec<_>>()
+        .await;
+    let exit = events
+        .last()
+        .and_then(|event| event.as_ref().ok())
+        .and_then(|event| event.event.clone());
+    let Some(Event::Exit(exit)) = exit else {
+        panic!("reattach ends with the exit: {events:?}");
+    };
+    assert_eq!(
+        exit.outcome,
+        Some(Outcome::Exited(
+            pplx_space_spaced_guest_protocol::proto::bridge_guest::ProcessExited { exit_code: 7 }
+        ))
+    );
+    assert!(
+        service.inner.processes.list(false).is_empty(),
+        "the default list reports running processes only"
+    );
+    let listed = service.inner.processes.list(true);
+    let [listed] = listed.as_slice() else {
+        panic!("the exited process is listed when asked: {listed:?}");
+    };
+    assert_eq!(listed.process_id, process_id);
+    assert_eq!(
+        listed.exit.as_ref().and_then(|exit| exit.outcome),
+        Some(Outcome::Exited(
+            pplx_space_spaced_guest_protocol::proto::bridge_guest::ProcessExited { exit_code: 7 }
+        ))
+    );
+    assert!(listed.ended_at.is_some(), "{listed:?}");
+
+    backdate(COMPLETED_PROCESS_RETENTION);
+    service.inner.processes.remove_expired();
+    let status = connect()
+        .await
+        .err()
+        .expect("the record is gone once its retention ends");
+    assert_eq!(status.code(), tonic::Code::NotFound, "{status:?}");
+    shut_down(&service).await;
+}
+
+// A finished process keeps its output only for its start's idempotency
+// window; after that the reaper returns the shared output budget to running
+// processes and the record keeps just its exit.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_completed_process_releases_its_output_after_the_idempotency_window() {
+    use pplx_space_spaced_guest_protocol::proto::bridge_guest::process_event::Event;
+    let service = cancellation_service();
+    let registry = &service.inner.processes;
+    let process_id = "sbxps_2f1c9a4e-0000-7000-8000-000000000004";
+    let idle_shared = registry.shared_output_slots.available_permits();
+    let response = Process::start(
+        &service,
+        Request::new(StartRequest {
+            // Past the per-record guaranteed share, so it borrows shared budget.
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "head -c 1048576 /dev/zero".into(),
+            ],
+            idempotency_key: Some("output-release".into()),
+            process_id: Some(process_id.into()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("process starts");
+    let mut events = response.into_inner();
+    while let Some(event) = events.next().await {
+        event.expect("process stream remains successful");
+    }
+    assert!(
+        registry.shared_output_slots.available_permits() < idle_shared,
+        "the finished process still holds its output for a retried start"
+    );
+
+    for entry in registry.records.iter() {
+        entry
+            .record()
+            .expect("published")
+            .journal
+            .backdate_completion(IDEMPOTENCY_RECORD_TTL + Duration::from_secs(1));
+    }
+    registry.remove_expired();
+    assert_eq!(
+        registry.shared_output_slots.available_permits(),
+        idle_shared,
+        "the shared output budget is released"
+    );
+    // The reaper's next work for it is the end of its retention.
+    assert!(
+        registry
+            .next_expiry()
+            .is_some_and(|next| next > Instant::now() + IDEMPOTENCY_RECORD_TTL),
+        "{:?}",
+        registry.next_expiry()
+    );
+    let events = Process::connect_process(
+        &service,
+        Request::new(ConnectProcessRequest {
+            process_id: process_id.into(),
+            timeout: None,
+            output_cursor: None,
+        }),
+    )
+    .await
+    .expect("the exit is still retained")
+    .into_inner()
+    .collect::<Vec<_>>()
+    .await;
+    assert!(
+        matches!(
+            events.as_slice(),
+            [Ok(started), Ok(exit)]
+                if matches!(started.event, Some(Event::Started(_)))
+                    && matches!(exit.event, Some(Event::Exit(_)))
+        ),
+        "a reattach without a cursor gets the start and the exit: {events:?}"
+    );
+    shut_down(&service).await;
+}
+
+// Once the process has exited its input descriptors close: a descendant still
+// reading the stdin pipe sees EOF rather than blocking for the retention.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_exited_process_closes_its_stdin_for_descendants() {
+    let service = cancellation_service();
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("stdin-closed");
+    let response = Process::start(
+        &service,
+        Request::new(StartRequest {
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                // The background reader holds the stdin pipe, not the output.
+                r#"exec 3<&0; (cat <&3 >/dev/null; touch "$1") >/dev/null 2>&1 & exit 0"#.into(),
+                "sh".into(),
+                marker.to_str().unwrap().into(),
+            ],
+            stdin: true,
+            idempotency_key: Some("stdin-release".into()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("process starts");
+    let mut events = response.into_inner();
+    while let Some(event) = events.next().await {
+        event.expect("process stream remains successful");
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !marker.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the descendant reads EOF once the process has exited");
+    shut_down(&service).await;
+}
+
+// The PTY's writer and resize descriptors close with the exit, so the master
+// is gone and a descendant writing to the terminal gets EIO.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_exited_pty_process_closes_its_terminal() {
+    let service = cancellation_service();
+    let response = Process::start(
+        &service,
+        Request::new(StartRequest {
+            command: vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+            pty: Some(
+                pplx_space_spaced_guest_protocol::proto::bridge_guest::PtyConfig { size: None },
+            ),
+            idempotency_key: Some("pty-release".into()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("process starts");
+    let mut events = response.into_inner();
+    while let Some(event) = events.next().await {
+        event.expect("process stream remains successful");
+    }
+    let record = service
+        .inner
+        .processes
+        .records
+        .iter()
+        .next()
+        .and_then(|entry| entry.value().record().cloned())
+        .expect("the exited process is retained");
+    let ProcessInput::Pty(pty) = &record.input else {
+        panic!("a PTY-backed process");
+    };
+    assert!(pty.writer.lock().await.is_none(), "the writer is closed");
+    assert!(
+        pty.resize_fd.lock().unwrap().is_none(),
+        "the resize descriptor is closed"
+    );
+    drop(record);
+    shut_down(&service).await;
 }
 
 // The retained-output budget follows the guest's memory: a 2 GiB guest keeps

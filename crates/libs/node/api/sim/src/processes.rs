@@ -102,6 +102,8 @@ impl SimProcessTable {
                 user: spec.user,
                 tag: spec.tag,
                 pty: Some(spec.pty),
+                exit: None,
+                ended_at: None,
             },
             output,
             exit_tx: Arc::new(exit_tx),

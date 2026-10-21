@@ -25,10 +25,11 @@ Ready to run code? Follow [Your first sandbox](../first-sandbox.md) for a comple
 
 ## Run commands
 
-- **Attach to start execution.** Creating a command alone does not run it. Process endpoints show running processes, not command history.
+- **Attach to start execution.** Creating a command alone does not run it. The process list shows running processes, not command history.
 - **Use the session token**, not your management API token. Check the returned URL against your configured stream origin and session path; never follow redirects with credentials.
 - **Create and attach in one request** by sending `Accept: text/event-stream` with the create. The response is the event stream, preceded by a `command` frame whose `command` field is the handle. If the server answers with the JSON handle instead, attach as usual.
 - **Save output as it arrives.** Streams are live, with no replay. Check `process_exited`; a closed connection alone is not success. See [command output](../first-sandbox.md#read-command-output).
+- **Reattach promptly to read a missed exit.** For 15 minutes after a command exits, reattaching reports its `process_exited`, and getting its process returns `state` `exited` with the same `exit_code` and `exit_status`; a running process omits these fields. The window counts the sandbox's running time, so time it spends suspended does not count. It is shorter once many newer processes finish, and does not survive a restart of the sandbox's agent. After it, both return a non-retryable `404` `not_found`. Output is not replayed. To reattach once the attachment token has expired, resend the command's create request with its original `Idempotency-Key` and body; it returns the same session with a fresh token.
 
 ## Retry safely
 

@@ -676,8 +676,10 @@ pub(super) fn write_batch_entry_to_host(
     }
 }
 
-pub(super) fn process_info_to_spaced(info: host_proto::ProcessInfo) -> SpacedProcessInfo {
-    SpacedProcessInfo {
+pub(super) fn process_info_to_spaced(
+    info: host_proto::ProcessInfo,
+) -> Result<SpacedProcessInfo, Status> {
+    Ok(SpacedProcessInfo {
         process_id: info.process_id,
         pid: info.pid,
         command: info.command,
@@ -686,7 +688,9 @@ pub(super) fn process_info_to_spaced(info: host_proto::ProcessInfo) -> SpacedPro
         user: info.user,
         tag: info.tag,
         pty: info.pty,
-    }
+        exit: info.exit.map(process_exit_to_spaced).transpose()?,
+        ended_at: info.ended_at,
+    })
 }
 
 // Decode boundary: reject structurally missing wire data (unset oneofs) as a
@@ -698,9 +702,7 @@ pub(super) fn process_event_to_spaced(
     event: host_proto::ProcessEvent,
 ) -> Result<SpacedProcessEvent, Status> {
     use crate::proto::spaced_process_event::Event as SpacedEvent;
-    use crate::proto::spaced_process_exit::Outcome as SpacedOutcome;
     use host_proto::process_event::Event as HostEvent;
-    use host_proto::process_exit::Outcome as HostOutcome;
 
     let host_event = event
         .event
@@ -712,34 +714,37 @@ pub(super) fn process_event_to_spaced(
         HostEvent::Connected(_) => SpacedEvent::Connected(SpacedProcessConnected {}),
         HostEvent::Stdout(output) => SpacedEvent::Stdout(SpacedProcessOutput { data: output.data }),
         HostEvent::Stderr(output) => SpacedEvent::Stderr(SpacedProcessOutput { data: output.data }),
-        HostEvent::Exit(exit) => {
-            let host_outcome = exit.outcome.ok_or_else(|| {
-                Status::internal("spaced host returned exit event without outcome")
-            })?;
-            let outcome = match host_outcome {
-                HostOutcome::Exited(exited) => SpacedOutcome::Exited(SpacedProcessExited {
-                    exit_code: exited.exit_code,
-                }),
-                HostOutcome::Signaled(signaled) => SpacedOutcome::Signaled(SpacedProcessSignaled {
-                    signal: signaled.signal,
-                }),
-                HostOutcome::TimedOut(timed_out) => {
-                    SpacedOutcome::TimedOut(SpacedProcessTimedOut {
-                        signal: timed_out.signal,
-                    })
-                }
-                HostOutcome::Unknown(_) => SpacedOutcome::Unknown(SpacedProcessUnknown {}),
-            };
-            SpacedEvent::Exit(SpacedProcessExit {
-                outcome: Some(outcome),
-            })
-        }
+        HostEvent::Exit(exit) => SpacedEvent::Exit(process_exit_to_spaced(exit)?),
     };
 
     Ok(SpacedProcessEvent {
         process_id: event.process_id,
         pid: event.pid,
         event: Some(event_payload),
+    })
+}
+
+fn process_exit_to_spaced(exit: host_proto::ProcessExit) -> Result<SpacedProcessExit, Status> {
+    use crate::proto::spaced_process_exit::Outcome as SpacedOutcome;
+    use host_proto::process_exit::Outcome as HostOutcome;
+
+    let host_outcome = exit
+        .outcome
+        .ok_or_else(|| Status::internal("spaced host returned exit event without outcome"))?;
+    let outcome = match host_outcome {
+        HostOutcome::Exited(exited) => SpacedOutcome::Exited(SpacedProcessExited {
+            exit_code: exited.exit_code,
+        }),
+        HostOutcome::Signaled(signaled) => SpacedOutcome::Signaled(SpacedProcessSignaled {
+            signal: signaled.signal,
+        }),
+        HostOutcome::TimedOut(timed_out) => SpacedOutcome::TimedOut(SpacedProcessTimedOut {
+            signal: timed_out.signal,
+        }),
+        HostOutcome::Unknown(_) => SpacedOutcome::Unknown(SpacedProcessUnknown {}),
+    };
+    Ok(SpacedProcessExit {
+        outcome: Some(outcome),
     })
 }
 

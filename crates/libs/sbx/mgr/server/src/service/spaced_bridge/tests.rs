@@ -251,9 +251,18 @@ fn process_info_to_spaced_preserves_process_config() {
         user: Some("user".to_string()),
         tag: Some("server".to_string()),
         pty: Some(true),
+        exit: Some(host_proto::ProcessExit {
+            outcome: Some(host_proto::process_exit::Outcome::Signaled(
+                host_proto::ProcessSignaled { signal: Some(9) },
+            )),
+        }),
+        ended_at: Some(prost_types::Timestamp {
+            seconds: 1_790_596_800,
+            nanos: 0,
+        }),
     };
 
-    let spaced = process_info_to_spaced(info);
+    let spaced = process_info_to_spaced(info).expect("valid process info");
 
     assert_eq!(spaced.process_id, "proc-1");
     assert_eq!(spaced.pid, 123);
@@ -263,6 +272,16 @@ fn process_info_to_spaced_preserves_process_config() {
     assert_eq!(spaced.user.as_deref(), Some("user"));
     assert_eq!(spaced.tag.as_deref(), Some("server"));
     assert_eq!(spaced.pty, Some(true));
+    assert_eq!(
+        spaced.exit.and_then(|exit| exit.outcome),
+        Some(crate::proto::spaced_process_exit::Outcome::Signaled(
+            crate::proto::SpacedProcessSignaled { signal: Some(9) }
+        ))
+    );
+    assert_eq!(
+        spaced.ended_at.map(|ended_at| ended_at.seconds),
+        Some(1_790_596_800)
+    );
 }
 
 #[tokio::test]

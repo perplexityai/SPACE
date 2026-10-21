@@ -230,7 +230,11 @@ message ConnectProcessRequest {
   // while a client was disconnected is replayed from the guest journal.
   optional uint64 output_cursor = 3;
 }
-message ListProcessesRequest {}
+message ListProcessesRequest {
+  // Also list processes that have exited but are still retained, with their
+  // exit. Older guests ignore it and list running processes only.
+  bool include_exited = 1;
+}
 message ProcessInfo {
   string process_id = 1;
   uint32 pid = 2;
@@ -240,6 +244,9 @@ message ProcessInfo {
   optional string user = 6;
   optional string tag = 7;
   optional bool pty = 8;
+  // Set once the process has exited; only listed with `include_exited`.
+  optional ProcessExit exit = 9;
+  optional google.protobuf.Timestamp ended_at = 10;
 }
 message SendSignalRequest {
   string process_id = 1;

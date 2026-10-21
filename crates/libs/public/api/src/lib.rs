@@ -852,6 +852,11 @@ open_wire_enum!(DataPlaneProcessExitStatus, "data-plane process exit status", {
     Unknown => "unknown",
 });
 
+// Only an exited process reports a state; a running one omits it.
+open_wire_enum!(ProcessState, "process state", {
+    Exited => "exited",
+});
+
 open_wire_enum!(DataPlaneResyncReason, "data-plane resync reason", {
     ProcessStreamReconnected => "process_stream_reconnected",
     FileWatchRestarted => "file_watch_restarted",
@@ -1056,6 +1061,49 @@ pub struct PublicProcess {
     pub cwd: Option<String>,
     pub user: Option<String>,
     pub tag: Option<String>,
+    /// `exited` once the process has ended; absent while it is running, as are
+    /// the other exit fields. A finished process stays visible for a bounded
+    /// time after it exits; then it is `not_found`.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub state: Option<ProcessState>,
+    /// Set when `state` is `exited`: the same value as `process_exited`'s
+    /// `exit_code`.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub exit_code: Option<i32>,
+    /// Set when `state` is `exited`: the same value as `process_exited`'s
+    /// `status`.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub exit_status: Option<DataPlaneProcessExitStatus>,
+    /// The signal that ended the process, when `exit_status` is `signaled` or
+    /// `timed_out` and the sandbox reported it.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub signal: Option<i32>,
+    /// When the process ended, by the sandbox's clock.
+    #[cfg_attr(
+        feature = "serde",
+        serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "time::serde::rfc3339::option"
+        )
+    )]
+    #[cfg_attr(
+        feature = "schema",
+        schemars(schema_with = "schema::optional_date_time")
+    )]
+    pub ended_at: Option<time::OffsetDateTime>,
 }
 
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
