@@ -1,4 +1,9 @@
 use super::command::MAX_COMMAND_TIMEOUT_SOURCE_BYTES;
+use crate::limits::{
+    MAX_METADATA_ENTRIES, MAX_METADATA_KEY_BYTES, MAX_METADATA_TOTAL_BYTES,
+    MAX_METADATA_VALUE_BYTES, MAX_SANDBOX_DISK_MIB, MAX_SANDBOX_MEMORY_MIB, MAX_SANDBOX_NAME_BYTES,
+    MAX_SANDBOX_VCPU, MIN_SANDBOX_DISK_MIB, MIN_SANDBOX_MEMORY_MIB, MIN_SANDBOX_VCPU,
+};
 use crate::routes::{MAX_AGGREGATE_UTF8_BYTES_EXTENSION, MAX_UTF8_BYTES_EXTENSION};
 use pplx_space_common_core::types::{
     HashAlg, MAX_ENV_ENTRIES, MAX_ENV_KEY_BYTES, MAX_ENV_TOTAL_BYTES, MAX_ENV_VALUE_BYTES,
@@ -331,5 +336,80 @@ pub(crate) fn optional_simple_duration(generator: &mut SchemaGenerator) -> Schem
             },
             { "type": "null" }
         ]
+    })
+}
+
+const NO_NUL_PATTERN: &str = "^[^\\u0000]*$";
+
+fn bounded_no_nul_string(max_bytes: usize) -> Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "maxLength": max_bytes,
+        MAX_UTF8_BYTES_EXTENSION: max_bytes,
+        "pattern": NO_NUL_PATTERN
+    })
+}
+
+pub(crate) fn optional_sandbox_name(generator: &mut SchemaGenerator) -> Schema {
+    let _ = generator;
+    schemars::json_schema!({
+        "type": ["string", "null"],
+        "maxLength": MAX_SANDBOX_NAME_BYTES,
+        MAX_UTF8_BYTES_EXTENSION: MAX_SANDBOX_NAME_BYTES,
+        "pattern": NO_NUL_PATTERN,
+        "description": format!("Sandbox name of at most {MAX_SANDBOX_NAME_BYTES} UTF-8 bytes, without NUL.")
+    })
+}
+
+/// Create's environment: the command endpoint's entry and size limits, but
+/// not its key grammar, which create has never enforced.
+pub(crate) fn sandbox_environment_map(generator: &mut SchemaGenerator) -> Schema {
+    let _ = generator;
+    schemars::json_schema!({
+        "type": "object",
+        "maxProperties": MAX_ENV_ENTRIES,
+        MAX_AGGREGATE_UTF8_BYTES_EXTENSION: MAX_ENV_TOTAL_BYTES,
+        "propertyNames": bounded_no_nul_string(MAX_ENV_KEY_BYTES),
+        "additionalProperties": bounded_no_nul_string(MAX_ENV_VALUE_BYTES),
+        "description": format!(
+            "Guest environment for the sandbox: at most {MAX_ENV_ENTRIES} entries, keys of at most {MAX_ENV_KEY_BYTES} and values of at most {MAX_ENV_VALUE_BYTES} UTF-8 bytes, {MAX_ENV_TOTAL_BYTES} bytes in total, without NUL."
+        )
+    })
+}
+
+/// Create's metadata map. The value component is shared with responses,
+/// which can still carry values stored before these limits, so the per-value
+/// bound is stated in the description rather than on that component.
+pub(crate) fn sandbox_metadata_input(generator: &mut SchemaGenerator) -> Schema {
+    let value = generator.subschema_for::<crate::PublicSandboxMetadataValue>();
+    schemars::json_schema!({
+        "type": "object",
+        "maxProperties": MAX_METADATA_ENTRIES,
+        MAX_AGGREGATE_UTF8_BYTES_EXTENSION: MAX_METADATA_TOTAL_BYTES,
+        "propertyNames": bounded_no_nul_string(MAX_METADATA_KEY_BYTES),
+        "additionalProperties": value,
+        "description": format!(
+            "Caller-defined sandbox metadata: at most {MAX_METADATA_ENTRIES} entries, keys of at most {MAX_METADATA_KEY_BYTES} and string values of at most {MAX_METADATA_VALUE_BYTES} UTF-8 bytes, {MAX_METADATA_TOTAL_BYTES} bytes in total across keys and string values, without NUL."
+        )
+    })
+}
+
+pub(crate) fn optional_sandbox_resources_input(generator: &mut SchemaGenerator) -> Schema {
+    let mut bounded = |min: u32, max: u32| {
+        let mut schema = Option::<u32>::json_schema(generator);
+        schema.insert("minimum".into(), min.into());
+        schema.insert("maximum".into(), max.into());
+        schema
+    };
+    let vcpu = bounded(MIN_SANDBOX_VCPU, MAX_SANDBOX_VCPU);
+    let memory_mib = bounded(MIN_SANDBOX_MEMORY_MIB, MAX_SANDBOX_MEMORY_MIB);
+    let disk_mib = bounded(MIN_SANDBOX_DISK_MIB, MAX_SANDBOX_DISK_MIB);
+    schemars::json_schema!({
+        "type": ["object", "null"],
+        "properties": {
+            "vcpu": vcpu,
+            "memory_mib": memory_mib,
+            "disk_mib": disk_mib
+        }
     })
 }

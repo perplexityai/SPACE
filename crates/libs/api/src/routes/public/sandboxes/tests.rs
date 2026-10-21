@@ -1591,3 +1591,172 @@ mod admission_pool_claim {
         Ok(())
     }
 }
+
+async fn error_envelope(
+    error: PublicApiError,
+) -> (
+    axum::http::StatusCode,
+    pplx_space_public_api::PublicErrorEnvelope,
+) {
+    use axum::response::IntoResponse;
+    use http_body_util::BodyExt;
+
+    let response = error.into_response();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+fn field_detail(field: &str) -> Vec<pplx_space_public_api::PublicErrorDetail> {
+    vec![pplx_space_public_api::PublicErrorDetail {
+        key: pplx_space_public_api::limits::INVALID_FIELD_DETAIL_KEY.to_string(),
+        value: field.to_string(),
+    }]
+}
+
+/// Create and update reject out-of-limit fields with a non-retryable
+/// `invalid_request` that names the field, before anything is admitted.
+#[tokio::test]
+async fn create_and_update_name_the_field_outside_its_limit() {
+    use pplx_space_public_api::{PublicErrorCode, PublicSandboxMetadataValue};
+
+    let mut big_metadata = create_request_with_auto_lifecycle(None);
+    big_metadata.metadata = (0..65)
+        .map(|index| (format!("k{index}"), PublicSandboxMetadataValue::Bool(true)))
+        .collect();
+    let mut nul_name = create_request_with_auto_lifecycle(None);
+    nul_name.name = Some("a\0b".into());
+    let mut wrapping_vcpu = create_request_with_auto_lifecycle(None);
+    wrapping_vcpu.resources = Some(SandboxResources {
+        vcpu: Some(3_000_000_000),
+        memory_mib: None,
+        disk_mib: None,
+    });
+    for (request, field) in [
+        (big_metadata, "metadata"),
+        (nul_name, "name"),
+        (wrapping_vcpu, "resources.vcpu"),
+    ] {
+        let (status, envelope) =
+            error_envelope(prepare_native_create_request(request).unwrap_err()).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{field}");
+        assert_eq!(envelope.code, PublicErrorCode::InvalidRequest, "{field}");
+        assert!(!envelope.retryable, "{field}");
+        assert_eq!(envelope.details, field_detail(field));
+    }
+
+    let update = UpdateSandboxRequest {
+        metadata: None,
+        resources: Some(SandboxResources {
+            vcpu: None,
+            memory_mib: Some(16),
+            disk_mib: None,
+        }),
+        network_policy: None,
+        auto_lifecycle: None,
+    };
+    let (status, envelope) = error_envelope(validate_update_request(&update).unwrap_err()).await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(envelope.details, field_detail("resources.memory_mib"));
+}
+
+#[tokio::test]
+async fn idempotency_key_distinguishes_missing_from_invalid() {
+    use axum::http::HeaderValue;
+
+    let with_key = |value: HeaderValue| {
+        let mut headers = HeaderMap::new();
+        headers.insert(IDEMPOTENCY_KEY_HEADER, value);
+        headers
+    };
+    let max = "k".repeat(pplx_space_public_api::limits::MAX_IDEMPOTENCY_KEY_BYTES);
+    assert_eq!(
+        idempotency_key(&with_key(HeaderValue::from_str(&max).unwrap()))
+            .unwrap()
+            .as_str(),
+        max
+    );
+
+    let cases = [
+        (HeaderMap::new(), "Idempotency-Key header is required"),
+        (
+            with_key(HeaderValue::from_str(&format!("{max}k")).unwrap()),
+            "Idempotency-Key exceeds 1024 bytes",
+        ),
+        (
+            with_key(HeaderValue::from_bytes("clé".as_bytes()).unwrap()),
+            "Idempotency-Key must contain only visible ASCII characters",
+        ),
+        (
+            with_key(HeaderValue::from_static("two words")),
+            "Idempotency-Key must contain only visible ASCII characters",
+        ),
+        (
+            with_key(HeaderValue::from_static("")),
+            "Idempotency-Key must not be empty",
+        ),
+    ];
+    for (headers, message) in cases {
+        let (status, envelope) = error_envelope(idempotency_key(&headers).unwrap_err()).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{message}");
+        assert_eq!(envelope.message, message);
+    }
+}
+
+/// A row whose metadata fills its byte limits with control characters, each
+/// of which JSON escapes to six bytes: the largest row capped input allows.
+fn escaped_metadata_row(created_at: OffsetDateTime, id: SandboxId) -> PublicSandboxRow {
+    let metadata = (0..16)
+        .map(|index| {
+            (
+                format!("{index:0>4}"),
+                SandboxMetadataValue::String("\u{1}".repeat(1020)),
+            )
+        })
+        .collect();
+    PublicSandboxRow {
+        name: Some("\u{1}".repeat(pplx_space_public_api::limits::MAX_SANDBOX_NAME_BYTES)),
+        metadata: SqlJson(metadata),
+        ..public_sandbox_row(created_at, id)
+    }
+}
+
+#[test]
+fn sandboxes_page_stops_at_its_byte_budget() {
+    let base = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+    let rows = (0..i64::from(MAX_SANDBOX_LIST_LIMIT) + 1)
+        .map(|index| escaped_metadata_row(base - time::Duration::seconds(index), SandboxId::new()))
+        .collect::<Vec<_>>();
+    let positions = rows
+        .iter()
+        .map(|row| (row.created_at, row.id))
+        .collect::<Vec<_>>();
+
+    let page = sandboxes_page(rows, MAX_SANDBOX_LIST_LIMIT).unwrap();
+
+    let page_bytes = serde_json::to_vec(&page).unwrap().len();
+    assert!(
+        page_bytes <= MAX_SANDBOX_LIST_PAGE_BYTES + 1024,
+        "{page_bytes}"
+    );
+    assert!(page.data.len() < usize::from(MAX_SANDBOX_LIST_LIMIT));
+    assert!(!page.data.is_empty());
+    let cursor = page.next_cursor.expect("a cut page continues");
+    let resumes_after =
+        parse_sandbox_cursor(&decode_cursor(CursorKind::Sandbox, cursor.as_str()).unwrap())
+            .unwrap();
+    assert_eq!(resumes_after, positions[page.data.len() - 1]);
+}
+
+#[test]
+fn sandboxes_page_keeps_one_sandbox_over_the_budget() {
+    let created_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+    let id = SandboxId::new();
+    let mut row = escaped_metadata_row(created_at, id);
+    row.name = Some("\u{1}".repeat(MAX_SANDBOX_LIST_PAGE_BYTES));
+
+    let page = sandboxes_page(vec![row], 1).unwrap();
+
+    assert_eq!(page.data.len(), 1);
+    assert!(page.next_cursor.is_none());
+}

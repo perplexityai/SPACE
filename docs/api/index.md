@@ -30,6 +30,23 @@ Ready to run code? Follow [Your first sandbox](../first-sandbox.md) for a comple
 - **Create and attach in one request** by sending `Accept: text/event-stream` with the create. The response is the event stream, preceded by a `command` frame whose `command` field is the handle. If the server answers with the JSON handle instead, attach as usual.
 - **Save output as it arrives.** Streams are live, with no replay. Check `process_exited`; a closed connection alone is not success. See [command output](../first-sandbox.md#read-command-output).
 
+## Limits
+
+Sandbox create (`POST /v1/sandboxes`) and update (`PATCH /v1/sandboxes/{sandbox_id}`) reject input outside these limits with `invalid_request` (400). The error's `details` names the field, for example `{"key": "field", "value": "metadata"}`. Sizes are UTF-8 bytes, and no string may contain NUL.
+
+| Field | Limit |
+| --- | --- |
+| `name` | 256 bytes |
+| `metadata` | 64 entries; keys up to 128 bytes; string values up to 1024 bytes; 16 KiB across keys and string values |
+| `env` (create only) | 256 entries; keys up to 128 bytes; values up to 8192 bytes; 64 KiB in total |
+| `resources.vcpu` | 1 to 32 |
+| `resources.memory_mib` | 512 to 8192 |
+| `resources.disk_mib` (create only) | 1 to 131072; it must also hold the template's root filesystem |
+
+Every request that requires an `Idempotency-Key` header takes 1 to 1024 visible ASCII characters (`!` through `~`). A missing header and an invalid one return different messages.
+
+A sandbox list page holds at most `limit` sandboxes, and ends early once it reaches 8 MiB of JSON. Follow `next_cursor` until it is null rather than treating a short page as the last one.
+
 ## Retry safely
 
 Error samples are illustrative, not exhaustive. Messages can change, and the same HTTP status can have different codes or retryability. Follow the returned `retryable` flag and `Retry-After`, not the sample.

@@ -67,6 +67,11 @@ const CREATE_SANDBOX_PATH_TEMPLATE: &str = native_routes::CREATE_SANDBOX.path();
 const UPDATE_SANDBOX_PATH_TEMPLATE: &str = native_routes::UPDATE_SANDBOX.path();
 const DEFAULT_SANDBOX_LIST_LIMIT: u16 = 100;
 const MAX_SANDBOX_LIST_LIMIT: u16 = 1000;
+/// Serialized bytes after which a sandbox list page stops. Capped metadata
+/// keeps a typical full row near 18 KB, but JSON escapes a control character
+/// to six bytes, so `MAX_SANDBOX_LIST_LIMIT` rows could still reach about
+/// 100 MB without this.
+const MAX_SANDBOX_LIST_PAGE_BYTES: usize = 8 * 1024 * 1024;
 const SANDBOX_METRICS_STREAM_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_NATIVE_IDLE_TIMEOUT_SECS: u64 = 6 * 60 * 60;
 /// Env master for claiming a warm-pool slot at native-create admission.
@@ -452,22 +457,8 @@ fn prepare_native_create_request(
     let idle_timeout_secs = request
         .idle_timeout_secs()
         .map_err(|error| PublicApiError::bad_request(error.to_string()))?;
-    if let Some(vcpu) = request
-        .resources
-        .as_ref()
-        .and_then(|resources| resources.vcpu)
-    {
-        pplx_space_common_core::types::VcpuCount::try_from_u32(vcpu)
-            .map_err(|error| PublicApiError::bad_request(format!("vcpu: {error}")))?;
-    }
-    if let Some(size_mib) = request
-        .resources
-        .as_ref()
-        .and_then(|resources| resources.disk_mib)
-    {
-        pplx_space_common_core::sandbox_storage::validate_rootfs_mib(size_mib)
-            .map_err(|error| PublicApiError::bad_request(format!("disk_mib: {error}")))?;
-    }
+    pplx_space_public_api::limits::validate_create_request(&request)
+        .map_err(PublicApiError::request_limit)?;
     // Hash the parsed client request before applying server defaults. This keeps
     // idempotent retries stable across rolling deploys where older API replicas
     // still hash the omitted policy as null.
@@ -636,25 +627,44 @@ fn sandbox_metrics_stream(
     )
 }
 
+/// Builds a page of at most `limit` sandboxes whose serialized JSON stays
+/// within [`MAX_SANDBOX_LIST_PAGE_BYTES`], except that a page always holds at
+/// least one sandbox. A page cut short by the budget carries a cursor to the
+/// rest, as one cut short by `limit` does.
 fn sandboxes_page(
     mut rows: Vec<PublicSandboxRow>,
     limit: u16,
 ) -> Result<PublicPage<PublicSandbox>, PublicApiError> {
-    let has_more = rows.len() > usize::from(limit);
+    let mut has_more = rows.len() > usize::from(limit);
     if has_more {
         rows.truncate(usize::from(limit));
     }
+    let mut data = Vec::with_capacity(rows.len());
+    let mut page_bytes = 0_usize;
+    let mut last = None;
+    for row in rows {
+        let position = (row.created_at, row.id);
+        let sandbox = public_sandbox_from_row(row)?;
+        let sandbox_bytes = serde_json::to_vec(&sandbox)
+            .map_err(|error| {
+                tracing::error!(error = %error, "failed to serialize public sandbox");
+                PublicApiError::internal()
+            })?
+            .len();
+        if !data.is_empty() && page_bytes + sandbox_bytes > MAX_SANDBOX_LIST_PAGE_BYTES {
+            has_more = true;
+            break;
+        }
+        page_bytes += sandbox_bytes;
+        data.push(sandbox);
+        last = Some(position);
+    }
     let next_cursor = if has_more {
-        rows.last()
-            .map(|sandbox| sandbox_cursor(sandbox.created_at, sandbox.id))
+        last.map(|(created_at, id)| sandbox_cursor(created_at, id))
             .transpose()?
     } else {
         None
     };
-    let data = rows
-        .into_iter()
-        .map(public_sandbox_from_row)
-        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(PublicPage { data, next_cursor })
 }
@@ -1152,15 +1162,16 @@ async fn sandbox_operation_response(
     })
 }
 
-pub(super) fn idempotency_key(headers: &HeaderMap) -> Result<IdempotencyKey, PublicApiError> {
-    let Some(value) = headers
-        .get(IDEMPOTENCY_KEY_HEADER)
-        .and_then(|value| value.to_str().ok())
-    else {
+/// The native `Idempotency-Key` header, shared by every `/v1` route that
+/// requires one so all of them match the published parameter.
+pub(crate) fn idempotency_key(headers: &HeaderMap) -> Result<IdempotencyKey, PublicApiError> {
+    let Some(value) = headers.get(IDEMPOTENCY_KEY_HEADER) else {
         return Err(PublicApiError::bad_request(
             "Idempotency-Key header is required",
         ));
     };
+    let value = pplx_space_public_api::limits::validate_idempotency_key(value.as_bytes())
+        .map_err(|error| PublicApiError::bad_request(error.to_string()))?;
     IdempotencyKey::parse(value)
         .map_err(|error| PublicApiError::bad_request(format!("invalid Idempotency-Key: {error}")))
 }
@@ -1176,7 +1187,8 @@ fn validate_update_request(request: &UpdateSandboxRequest) -> Result<(), PublicA
             "disk_mib is not mutable in place; recreate or restore the sandbox with the new disk size",
         ));
     }
-    Ok(())
+    pplx_space_public_api::limits::validate_update_request(request)
+        .map_err(PublicApiError::request_limit)
 }
 
 fn request_fingerprint(
