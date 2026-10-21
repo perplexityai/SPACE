@@ -45,6 +45,7 @@ members = [
     "crates/libs/spaced/host/server",
     "crates/libs/test-env",
     "crates/libs/bearer-token",
+    "crates/libs/tokio-runtime",
     "crates/libs/sandbox/store",
     "crates/libs/sandbox/teardown",
     "crates/libs/sandbox/portability",
@@ -376,6 +377,7 @@ pplx-space-template-mgr-client = { path = "crates/libs/template/mgr-client" }
 pplx-space-template-publisher = { path = "crates/libs/template/publish" }
 pplx-space-test-env = { path = "crates/libs/test-env" }
 pplx-space-unix-socket-path = { path = "crates/libs/unix-socket-path" }
+pplx-space-tokio-runtime = { path = "crates/libs/tokio-runtime" }
 [profile.release]
 lto = "thin"
 strip = true

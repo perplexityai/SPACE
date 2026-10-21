@@ -5512,6 +5512,7 @@ dependencies = [
  "pplx-space-observability",
  "pplx-space-rustls-provider",
  "pplx-space-test-env",
+ "pplx-space-tokio-runtime",
  "pplx-space-unix-socket-path",
  "rand 0.10.2",
  "redis",
@@ -7377,6 +7378,16 @@ dependencies = [
  "clap",
  "pplx-space-common-svc",
  "pplx-space-template-mgr",
+]
+
+[[package]]
+name = "pplx-space-tokio-runtime"
+version = "0.8.0"
+dependencies = [
+ "pplx-space-metrics",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

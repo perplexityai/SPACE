@@ -70,6 +70,7 @@
         "crates/libs/sqlite",
         "crates/libs/template/mgr-client",
         "crates/libs/template/publish",
+        "crates/libs/tokio-runtime",
         "crates/libs/unix-socket-path"
       ]
     },
@@ -115,6 +116,7 @@
         "crates/libs/spaced/common",
         "crates/libs/sqlite",
         "crates/libs/template/mgr-client",
+        "crates/libs/tokio-runtime",
         "crates/libs/unix-socket-path"
       ]
     },
@@ -170,6 +172,7 @@
         "crates/libs/spaced/build",
         "crates/libs/spaced/common",
         "crates/libs/template/mgr-client",
+        "crates/libs/tokio-runtime",
         "crates/libs/unix-socket-path"
       ]
     },
@@ -202,6 +205,7 @@
         "crates/libs/spaced/build",
         "crates/libs/spaced/common",
         "crates/libs/template/mgr-client",
+        "crates/libs/tokio-runtime",
         "crates/libs/unix-socket-path"
       ]
     },
@@ -300,6 +304,7 @@
         "crates/libs/sqlite",
         "crates/libs/template/mgr",
         "crates/libs/template/mgr-client",
+        "crates/libs/tokio-runtime",
         "crates/libs/unix-socket-path",
         "crates/libs/vol/mgr/client",
         "crates/libs/vol/mgr/server"
