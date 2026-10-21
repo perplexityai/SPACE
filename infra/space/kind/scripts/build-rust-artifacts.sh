@@ -287,8 +287,8 @@ uncovered_context_reads() {
   for dockerfile in "$KIND_DOCKERFILE" "$COMMON_DOCKERFILE"; do
     grep -qiE '^[[:space:]]*(ADD|ONBUILD)([[:space:]]|$)' "$dockerfile" \
       && echo "$dockerfile uses ADD or ONBUILD"
-    grep -iE '^[[:space:]]*COPY([[:space:]]|$)' "$dockerfile" | grep -qvE '^COPY ' \
-      && echo "$dockerfile has a COPY not written as an unindented uppercase instruction"
+    awk 'toupper($0) ~ /^[[:space:]]*COPY([[:space:]]|$)/ && !/^COPY / { found = 1 } END { exit !found }' \
+      "$dockerfile" && echo "$dockerfile has a COPY not written as an unindented uppercase instruction"
     grep -qE '^COPY .*\\$' "$dockerfile" && echo "$dockerfile continues a COPY onto another line"
     while read -r mount; do
       [[ "$mount" =~ (^|,)type=(secret|tmpfs|ssh)(,|$) ]] && continue
@@ -332,7 +332,8 @@ rust_input_key() {
     done
   done
   mapfile -t optional < <(printf '%s\n' "${optional[@]}" | sort -u)
-  changes="$(git status --porcelain --untracked-files=all -- "${paths[@]}" "${optional[@]}")" \
+  # No index refresh: Tilt's concurrent builds read the same checkout.
+  changes="$(git --no-optional-locks status --porcelain --untracked-files=all -- "${paths[@]}" "${optional[@]}")" \
     || die "could not read the Rust build inputs' git status"
   [[ -z "$changes" ]] || die "the Rust build inputs have uncommitted changes; they have no input key"
   listing="$(git ls-files -s --error-unmatch -- "${paths[@]}")" \

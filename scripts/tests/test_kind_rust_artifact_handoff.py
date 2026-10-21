@@ -111,7 +111,8 @@ def test_reuse_falls_back_to_the_build(run, monkeypatch, environment, input_key)
     monkeypatch.setattr(handoff, "PULL_TIMEOUT_SECONDS", 0.5)
     handoff.reuse(REPOSITORY)
     assert (run / "output").read_text() == ""
-    assert " tag " not in f" {(run / 'docker.log').read_text()}"
+    log = (run / "docker.log").read_text().splitlines()
+    assert not any(line.startswith("tag ") for line in log)
 
 
 def stub_build(run, monkeypatch) -> pathlib.Path:

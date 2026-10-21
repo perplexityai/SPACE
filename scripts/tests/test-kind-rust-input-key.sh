@@ -131,7 +131,7 @@ refused "ADD" 'ADD extra /extra'
 refused "a lowercase add" 'add extra /extra'
 refused "a lowercase copy" 'copy extra /extra'
 refused "an indented COPY" '  COPY extra /extra'
-refused "a continued COPY" "COPY extra \\"
+refused "a continued COPY" "COPY Cargo.toml \\"
 refused "a bind mount" 'RUN --mount=type=bind,source=extra,target=/extra true'
 refused "an untyped mount" 'RUN --mount=source=extra,target=/extra true'
 refused "a cache mount seeded from the context" 'RUN --mount=type=cache,from=.,target=/extra true'
