@@ -68,11 +68,14 @@ const CREATE_SANDBOX_PATH_TEMPLATE: &str = native_routes::CREATE_SANDBOX.path();
 const UPDATE_SANDBOX_PATH_TEMPLATE: &str = native_routes::UPDATE_SANDBOX.path();
 const DEFAULT_SANDBOX_LIST_LIMIT: u16 = 100;
 const MAX_SANDBOX_LIST_LIMIT: u16 = 1000;
-/// Serialized bytes after which a sandbox list page stops. Capped metadata
-/// keeps a typical full row near 18 KB, but JSON escapes a control character
-/// to six bytes, so `MAX_SANDBOX_LIST_LIMIT` rows could still reach about
-/// 100 MB without this.
-const MAX_SANDBOX_LIST_PAGE_BYTES: usize = 8 * 1024 * 1024;
+/// Estimated JSON bytes after which a sandbox list page stops, applied in
+/// the page query. Capped metadata keeps a typical full row near 18 KB, but
+/// JSON escapes a control character to six bytes, and rows stored before the
+/// input limits can hold megabytes of metadata.
+const MAX_SANDBOX_LIST_PAGE_BYTES: i64 = 8 * 1024 * 1024;
+/// A listed sandbox's JSON apart from its name and metadata: about 700 bytes,
+/// up to about 1.1 KB with the longest template reference.
+const SANDBOX_LIST_ROW_OVERHEAD_BYTES: i64 = 2 * 1024;
 const SANDBOX_METRICS_STREAM_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_NATIVE_IDLE_TIMEOUT_SECS: u64 = 6 * 60 * 60;
 /// Env master for claiming a warm-pool slot at native-create admission.
@@ -696,44 +699,26 @@ fn sandbox_metrics_stream(
     )
 }
 
-/// Builds a page of at most `limit` sandboxes whose serialized JSON stays
-/// within [`MAX_SANDBOX_LIST_PAGE_BYTES`], except that a page always holds at
-/// least one sandbox. A page cut short by the budget carries a cursor to the
-/// rest, as one cut short by `limit` does.
+/// Builds a page from the rows `fetch_sandboxes_page` returned: at most
+/// `limit` sandboxes, with a cursor when the limit's lookahead row came back
+/// or the query stopped at its byte budget before the end of the list.
 fn sandboxes_page(
     mut rows: Vec<PublicSandboxRow>,
     limit: u16,
 ) -> Result<PublicPage<PublicSandbox>, PublicApiError> {
-    let mut has_more = rows.len() > usize::from(limit);
-    if has_more {
-        rows.truncate(usize::from(limit));
-    }
-    let mut data = Vec::with_capacity(rows.len());
-    let mut page_bytes = 0_usize;
-    let mut last = None;
-    for row in rows {
-        let position = (row.created_at, row.id);
-        let sandbox = public_sandbox_from_row(row)?;
-        let sandbox_bytes = serde_json::to_vec(&sandbox)
-            .map_err(|error| {
-                tracing::error!(error = %error, "failed to serialize public sandbox");
-                PublicApiError::internal()
-            })?
-            .len();
-        if !data.is_empty() && page_bytes + sandbox_bytes > MAX_SANDBOX_LIST_PAGE_BYTES {
-            has_more = true;
-            break;
-        }
-        page_bytes += sandbox_bytes;
-        data.push(sandbox);
-        last = Some(position);
-    }
+    let has_more = rows.len() > usize::from(limit) || rows.last().is_some_and(|row| row.has_next);
+    rows.truncate(usize::from(limit));
     let next_cursor = if has_more {
-        last.map(|(created_at, id)| sandbox_cursor(created_at, id))
+        rows.last()
+            .map(|sandbox| sandbox_cursor(sandbox.created_at, sandbox.id))
             .transpose()?
     } else {
         None
     };
+    let data = rows
+        .into_iter()
+        .map(public_sandbox_from_row)
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(PublicPage { data, next_cursor })
 }
@@ -1079,6 +1064,9 @@ struct PublicSandboxRow {
     auto_lifecycle: SqlJson<AutoLifecyclePolicy>,
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
+    /// A page row is followed by another sandbox in list order, whether or
+    /// not the page's byte budget let it in.
+    has_next: bool,
 }
 
 const PUBLIC_SANDBOX_SELECT: &str = "SELECT s.id,
@@ -1130,8 +1118,9 @@ const PUBLIC_SANDBOX_SELECT: &str = "SELECT s.id,
             s.next_auto_event_at,
             s.auto_lifecycle_json AS auto_lifecycle,
             s.created_at,
-            s.updated_at
-     FROM sandboxes s
+            s.updated_at";
+
+const PUBLIC_SANDBOX_FROM: &str = "FROM sandboxes s
      LEFT JOIN sandbox_direct_route_identities direct_route
        ON direct_route.sandbox_id = s.id
      LEFT JOIN sandbox_observed_states sos
@@ -1151,27 +1140,63 @@ enum PublicSandboxQuery {
 fn public_sandbox_query(query: PublicSandboxQuery) -> sqlx::AssertSqlSafe<String> {
     // Control-plane retention keeps deleted tombstones, but deleted public
     // resources are NotFound and must not consume a list page's lookahead.
-    let suffix = match query {
-        PublicSandboxQuery::ById => {
-            "WHERE s.id = $8 AND s.org_id = $9 AND s.lifecycle <> 'deleted'"
-        }
-        PublicSandboxQuery::Page => {
-            "WHERE s.org_id = $8
-               AND s.lifecycle <> 'deleted'
-               AND (($12::UUID IS NOT NULL AND s.user_id = $12)
-                 OR ($12::UUID IS NULL AND EXISTS (
-                     SELECT 1 FROM users owner WHERE owner.id = s.user_id
-                       AND owner.owner_source = 'local'
-                 )))
-               AND (
-                   $9::TIMESTAMPTZ IS NULL
-                   OR (s.created_at, s.id) < ($9::TIMESTAMPTZ, $10::UUID)
-               )
-             ORDER BY s.created_at DESC, s.id DESC
-             LIMIT $11"
-        }
+    let sql = match query {
+        PublicSandboxQuery::ById => format!(
+            "{PUBLIC_SANDBOX_SELECT}, FALSE AS has_next
+             {PUBLIC_SANDBOX_FROM}
+             WHERE s.id = $8 AND s.org_id = $9 AND s.lifecycle <> 'deleted'"
+        ),
+        // `page` takes up to $11 rows in list order and keeps them while the
+        // running total of their estimated JSON size stays within $13 bytes,
+        // always keeping the first so the cursor advances. Postgres then
+        // returns only those rows, so rows stored before the input limits
+        // cannot make a page arbitrarily large. The size estimate is the
+        // metadata's and the escaped name's JSON text plus $14 bytes for
+        // everything else; jsonb's text form is never shorter than the
+        // compact JSON the page is served as. `pg_column_size` would be
+        // cheaper, but it is the compressed size, which repetitive metadata
+        // makes many times smaller than the decoded row.
+        PublicSandboxQuery::Page => format!(
+            "{PUBLIC_SANDBOX_SELECT}, page.has_next
+             {PUBLIC_SANDBOX_FROM}
+             JOIN (
+                 SELECT candidate.id, candidate.has_next
+                 FROM (
+                     SELECT s.id,
+                            size.row_bytes,
+                            SUM(size.row_bytes) OVER (
+                                ORDER BY s.created_at DESC, s.id DESC
+                                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                            ) AS through_bytes,
+                            LEAD(s.id) OVER (ORDER BY s.created_at DESC, s.id DESC)
+                                IS NOT NULL AS has_next
+                     FROM sandboxes s
+                     CROSS JOIN LATERAL (
+                         SELECT octet_length(s.metadata::TEXT)
+                                + COALESCE(octet_length(to_jsonb(s.name)::TEXT), 0)
+                                + $14::BIGINT AS row_bytes
+                     ) size
+                     WHERE s.org_id = $8
+                       AND s.lifecycle <> 'deleted'
+                       AND (($12::UUID IS NOT NULL AND s.user_id = $12)
+                         OR ($12::UUID IS NULL AND EXISTS (
+                             SELECT 1 FROM users owner WHERE owner.id = s.user_id
+                               AND owner.owner_source = 'local'
+                         )))
+                       AND (
+                           $9::TIMESTAMPTZ IS NULL
+                           OR (s.created_at, s.id) < ($9::TIMESTAMPTZ, $10::UUID)
+                       )
+                     ORDER BY s.created_at DESC, s.id DESC
+                     LIMIT $11
+                 ) candidate
+                 WHERE candidate.through_bytes <= $13
+                    OR candidate.through_bytes = candidate.row_bytes
+             ) page ON page.id = s.id
+             ORDER BY s.created_at DESC, s.id DESC"
+        ),
     };
-    sqlx::AssertSqlSafe(sql!(format!("{PUBLIC_SANDBOX_SELECT}\n{suffix}")))
+    sqlx::AssertSqlSafe(sql!(sql))
 }
 
 async fn fetch_public_sandbox(
@@ -1216,6 +1241,8 @@ async fn fetch_sandboxes_page(
         .bind(cursor_id)
         .bind(i64::from(limit) + 1)
         .bind(subject_id)
+        .bind(MAX_SANDBOX_LIST_PAGE_BYTES)
+        .bind(SANDBOX_LIST_ROW_OVERHEAD_BYTES)
         .fetch_all(pool)
         .await
 }

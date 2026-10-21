@@ -44,7 +44,7 @@ Sandbox create (`POST /v1/sandboxes`) and update (`PATCH /v1/sandboxes/{sandbox_
 | `resources.memory_mib` | 512 to 8192 |
 | `resources.disk_mib` (create only) | 1 to 131072; it must also hold the template's root filesystem |
 
-Every request that requires an `Idempotency-Key` header takes 1 to 1024 visible ASCII characters (`!` through `~`). A missing header and an invalid one return different messages.
+Every request that requires an `Idempotency-Key` header takes 1 to 1024 printable ASCII characters (space through `~`) or tabs; other control characters and non-ASCII bytes are rejected. A missing header and an invalid one return different messages.
 
 A sandbox list page holds at most `limit` sandboxes, and ends early once it reaches 8 MiB of JSON. Follow `next_cursor` until it is null rather than treating a short page as the last one.
 

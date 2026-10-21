@@ -166,12 +166,13 @@ pub enum IdempotencyKeyError {
     Empty,
     #[error("Idempotency-Key exceeds {MAX_IDEMPOTENCY_KEY_BYTES} bytes")]
     TooLong,
-    #[error("Idempotency-Key must contain only visible ASCII characters")]
+    #[error("Idempotency-Key must contain only printable ASCII characters, spaces and tabs")]
     InvalidEncoding,
 }
 
 /// Checks a native `Idempotency-Key` header value: 1 to
-/// [`MAX_IDEMPOTENCY_KEY_BYTES`] visible ASCII bytes.
+/// [`MAX_IDEMPOTENCY_KEY_BYTES`] bytes of printable ASCII, space or tab: what an
+/// HTTP header value can carry as text, without obs-text.
 pub fn validate_idempotency_key(value: &[u8]) -> Result<&str, IdempotencyKeyError> {
     if value.is_empty() {
         return Err(IdempotencyKeyError::Empty);
@@ -179,7 +180,10 @@ pub fn validate_idempotency_key(value: &[u8]) -> Result<&str, IdempotencyKeyErro
     if value.len() > MAX_IDEMPOTENCY_KEY_BYTES {
         return Err(IdempotencyKeyError::TooLong);
     }
-    if !value.iter().all(u8::is_ascii_graphic) {
+    if !value
+        .iter()
+        .all(|byte| byte.is_ascii_graphic() || matches!(byte, b' ' | b'\t'))
+    {
         return Err(IdempotencyKeyError::InvalidEncoding);
     }
     std::str::from_utf8(value).map_err(|_| IdempotencyKeyError::InvalidEncoding)

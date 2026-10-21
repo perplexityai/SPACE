@@ -63,8 +63,8 @@ fn public_openapi_value() -> Value {
             "minLength": 1,
             "maxLength": MAX_IDEMPOTENCY_KEY_BYTES,
             MAX_UTF8_BYTES_EXTENSION: MAX_IDEMPOTENCY_KEY_BYTES,
-            "pattern": "^[!-~]+$",
-            "description": format!("1 to {MAX_IDEMPOTENCY_KEY_BYTES} visible ASCII characters.")
+            "pattern": "^[\\t -~]+$",
+            "description": format!("1 to {MAX_IDEMPOTENCY_KEY_BYTES} printable ASCII characters, spaces or tabs.")
         }
     });
     let data_plane_events_path =
