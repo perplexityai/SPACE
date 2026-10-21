@@ -64,7 +64,7 @@ pub mod template;
 pub mod template_runtime;
 pub mod time;
 pub mod transport_vsock;
-pub mod version;
+pub use pplx_space_semver as version;
 
 #[cfg(feature = "serde")]
 pub use admin::*;

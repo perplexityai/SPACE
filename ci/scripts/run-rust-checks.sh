@@ -434,6 +434,25 @@ run_clippy_checks() {
         -- \
         -D warnings
 
+    # Built alone with no features and with all of them, so a serde or sqlx
+    # feature the semantic-version crate needs but only gets through
+    # common-core's features fails here.
+    echo "--- :rust: Running isolated semantic-version clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-semver \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-semver \
+        --all-features \
+        --all-targets \
+        -- \
+        -D warnings
+
     run_sbxmgr_production_checks "${target_dir}"
 
     # feature-flags must lint clean with no vendor SDK compiled in; the matching

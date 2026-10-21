@@ -85,6 +85,7 @@ members = [
     "crates/libs/public/api",
     "crates/libs/api",
     "crates/libs/common/core",
+    "crates/libs/semver",
     "crates/libs/common/cli",
     "crates/libs/common/connection/admission",
     "crates/libs/common/grpc",
@@ -364,6 +365,7 @@ pplx-space-sbx-mgr = { path = "crates/libs/sbx/mgr/server" }
 pplx-space-sbx-mgr-client = { path = "crates/libs/sbx/mgr/client" }
 pplx-space-sbx-mgr-store = { path = "crates/libs/sbx/mgr/store" }
 pplx-space-rustls-provider = { path = "crates/libs/rustls-provider" }
+pplx-space-semver = { path = "crates/libs/semver" }
 pplx-space-sqlite = { path = "crates/libs/sqlite" }
 pplx-space-systemd-watchdog = { path = "crates/libs/systemd-watchdog" }
 pplx-space-spaced-build = { path = "crates/libs/spaced/build" }
