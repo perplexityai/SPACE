@@ -290,7 +290,7 @@ pub(super) enum NetworkPolicyOverrideUpdatePlan {
 pub(super) fn decide_network_policy_override_update(
     existing: NetworkPolicyOverrideExisting<'_>,
     requested: NetworkPolicyOverrideRequested<'_>,
-    _allow_seed_divergence_repair: bool,
+    allow_seed_divergence_repair: bool,
 ) -> NetworkPolicyOverrideUpdatePlan {
     if requested.authority == PolicyAuthority::Cluster
         && existing.authority == PolicyAuthority::Local
@@ -315,6 +315,16 @@ pub(super) fn decide_network_policy_override_update(
     if requested.generation == existing.generation {
         if existing.authority == requested.authority && existing.json == requested.json {
             NetworkPolicyOverrideUpdatePlan::RepairIfLiveGateway
+        } else if allow_seed_divergence_repair
+            && requested.generation > 0
+            && existing.authority == PolicyAuthority::Cluster
+            && requested.authority == PolicyAuthority::Cluster
+        {
+            NetworkPolicyOverrideUpdatePlan::Apply {
+                generation: requested.generation,
+                authority: requested.authority,
+                repair_divergence: true,
+            }
         } else {
             NetworkPolicyOverrideUpdatePlan::Conflict
         }
