@@ -879,7 +879,7 @@ echo "=== Creating ext4 image ==="
 # to the configured build disk size before installing packages.
 IMG_SIZE="1024M"
 truncate -s "$IMG_SIZE" "${OUTPUT}/rootfs.ext4"
-mkfs.ext4 -O dir_nlink,large_dir -J size=4 -m 1 -F "${OUTPUT}/rootfs.ext4"
+mkfs.ext4 -O dir_nlink,large_dir,inline_data -J size=4 -m 1 -F "${OUTPUT}/rootfs.ext4"
 populate_ext4 "${OUTPUT}/rootfs.ext4" "${CHROOT}"
 
 # Shrink to minimum + 100 MB headroom (SSH host keys, logs, journal)
