@@ -133,22 +133,24 @@ pub(crate) async fn fetch_template_default_network_policy(
     templates: &dyn crate::template_resolver::TemplateResolver,
     template: &str,
 ) -> Result<EffectiveNetworkPolicy, Status> {
-    let response = match templates
-        .get_template_on_shared_channel(tonic::Request::new(
-            pplx_space_template_mgr_client::proto::GetTemplateRequest {
-                caller_org_id: None,
-                template: Some(pplx_space_template_mgr_client::proto::TemplateRef {
-                    name: template.to_string(),
-                    content_hash: None,
-                    tag: None,
-                }),
-                vcpu: None,
-                memory_mib: None,
-            },
-        ))
-        .await
-    {
-        Ok(response) => response.into_inner(),
+    let mut request =
+        tonic::Request::new(pplx_space_template_mgr_client::proto::GetTemplateRequest {
+            caller_org_id: None,
+            template: Some(pplx_space_template_mgr_client::proto::TemplateRef {
+                name: template.to_string(),
+                content_hash: None,
+                tag: None,
+            }),
+            vcpu: None,
+            memory_mib: None,
+        });
+    let scope = pplx_space_common_svc::template_lookup::TemplateLookupScope::LocalExecution;
+    scope.attach(&mut request);
+    let response = match templates.get_template_on_shared_channel(request).await {
+        Ok(response) => {
+            scope.observe_response(&response)?;
+            response.into_inner()
+        }
         Err(error) => {
             return Err(Status::internal(format!(
                 "template-manager GetTemplate({template}) failed: {error}"

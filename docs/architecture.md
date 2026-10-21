@@ -24,6 +24,26 @@ empty policy preserves local S3-compatible storage. This policy does not audit
 existing releases or replace publisher authorization; provision the allowlist
 before promoting an enforcement image.
 
+## Template lookup rollout
+
+Template lookup clients attach scope metadata and compatible servers return a
+receipt. A missing receipt preserves the existing lookup behavior during a
+rolling upgrade. A mismatched receipt fails the request. Authentication,
+organization checks, and cache decisions continue to use the existing rules.
+
+The `auth.template_lookup.compatibility` counter records `missing_scope`,
+`missing_receipt`, and `received`, under the emitting service's identity. A
+receipt confirms only that one peer received the metadata. It does not certify
+that a downstream peer received it or that the scope was authorized. Check
+all participating services and exercise cache misses as well as hits; an idle
+service or a cached lookup cannot prove the catalog supports the protocol.
+
+Deploy this compatibility phase before introducing stricter lookup rules.
+Strict enforcement requires a separate authorization acknowledgement; it must
+not accept the compatibility receipt as proof. Existing clients that omit scope
+must be migrated before enforcing it. Rollback to the previous version remains
+compatible with these requests and replies.
+
 ## Request and execution flow
 
 The API records desired state in PostgreSQL. Controllers and worker services reconcile the running system with that state, so an accepted request is not a readiness signal.

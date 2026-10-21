@@ -575,12 +575,13 @@ impl WorkerApi for WorkerApiService {
 
     async fn create_sandbox(
         &self,
-        r: Request<pplx_space_sbx_mgr_client::proto::CreateRequest>,
+        mut r: Request<pplx_space_sbx_mgr_client::proto::CreateRequest>,
     ) -> Result<Response<pplx_space_sbx_mgr_client::proto::CreateResponse>, Status> {
         // Before any check, so a refused create names its sandbox too.
         if let Some(sandbox_id) = r.get_ref().sandbox_id.as_deref() {
             record_sandbox_id(&tracing::Span::current(), sandbox_id);
         }
+        crate::template_lookup::bind_create_caller_scope(&mut r)?;
         // Overrides and nonzero generations require policy authority. A generation
         // persists even without an override and can block later sandbox-specific
         // policy corrections. No override and generation zero retain inheritance.
@@ -1216,9 +1217,12 @@ impl WorkerApi for WorkerApiService {
 
     async fn get_template(
         &self,
-        r: Request<pplx_space_template_mgr_client::proto::GetTemplateRequest>,
+        mut r: Request<pplx_space_template_mgr_client::proto::GetTemplateRequest>,
     ) -> Result<Response<pplx_space_template_mgr_client::proto::GetTemplateResponse>, Status> {
-        fwd_retry!("template-manager", self.clients.tmpl(), get_template, r)
+        let scope = crate::template_lookup::bind_caller_scope(&mut r)?;
+        let response = fwd_retry!("template-manager", self.clients.tmpl(), get_template, r)?;
+        scope.observe_response(&response)?;
+        Ok(response)
     }
 
     async fn update_template_settings(
@@ -1328,11 +1332,12 @@ impl WorkerApi for WorkerApiService {
 
     async fn pull_template(
         &self,
-        r: Request<crate::proto::PullTemplateRequest>,
+        mut r: Request<crate::proto::PullTemplateRequest>,
     ) -> Result<Response<crate::proto::PullTemplateResponse>, Status> {
         pplx_space_common_svc::auth::template_transfer::require_template_transfer_authority(&r)?;
+        let scope = crate::template_lookup::bind_caller_scope(&mut r)?;
         let req = r.into_inner();
-        let resp = crate::transfer::pull_template(&mut self.clients.tmpl(), &req).await?;
+        let resp = crate::transfer::pull_template(&mut self.clients.tmpl(), &req, scope).await?;
         Ok(Response::new(resp))
     }
 

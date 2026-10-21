@@ -118,6 +118,12 @@ pub(super) fn auth_layer(
 
 pub(super) fn bearer<T>(body: T, token: &str) -> Request<T> {
     let mut request = Request::new(body);
+    request
+        .extensions_mut()
+        .insert(tonic::transport::server::TcpConnectInfo {
+            local_addr: None,
+            remote_addr: Some(([127, 0, 0, 1], 1234).into()),
+        });
     request.metadata_mut().insert(
         "authorization",
         format!("Bearer {token}")
@@ -139,7 +145,9 @@ enum Rpc {
 
 #[tokio::test]
 async fn policy_rpc_authentication_reaches_handlers() {
-    let (clients, calls, shutdown, mut servers) = backend().await;
+    let forwarded_scope = Arc::new(std::sync::Mutex::new(None));
+    let (clients, calls, shutdown, mut servers) =
+        backend_with_scope(Some(forwarded_scope.clone())).await;
     for (k8s, username, token, trusted) in [
         (true, "space-api", PROJECTED_TOKEN, true),
         (true, "workers", PROJECTED_TOKEN, false),
@@ -261,6 +269,15 @@ async fn policy_rpc_authentication_reaches_handlers() {
                         .await
                         .map(|_| ()),
                 };
+                if matches!(rpc, Rpc::Create) && result.is_ok() {
+                    use pplx_space_common_svc::template_lookup::TemplateLookupScope;
+                    let expected = if trusted {
+                        TemplateLookupScope::Cluster
+                    } else {
+                        TemplateLookupScope::Node("127.0.0.1".parse().unwrap())
+                    };
+                    assert_eq!(*forwarded_scope.lock().unwrap(), Some(expected.to_string()));
+                }
                 let requires_authority = match rpc {
                     Rpc::Network | Rpc::Lifecycle => true,
                     Rpc::Create | Rpc::Adopt => network || lifecycle || generation != 0,
@@ -300,12 +317,24 @@ pub(super) async fn backend() -> (
     tokio_util::sync::CancellationToken,
     tokio::task::JoinSet<()>,
 ) {
+    backend_with_scope(None).await
+}
+
+async fn backend_with_scope(
+    forwarded_scope: Option<Arc<std::sync::Mutex<Option<String>>>>,
+) -> (
+    BackendClients,
+    Arc<AtomicUsize>,
+    tokio_util::sync::CancellationToken,
+    tokio::task::JoinSet<()>,
+) {
     let calls = Arc::new(AtomicUsize::new(0));
     let recorded_calls = calls.clone();
     // Acknowledging backend: success and the count prove a real handler forwarded
     // the request; denial must leave it untouched. No manager/database is needed.
     let backend = Router::new().fallback(any(move |request: http::Request<Body>| {
         let calls = recorded_calls.clone();
+        let scope = forwarded_scope.clone();
         async move {
             if request.uri().path().ends_with("/ExportTemplate") {
                 assert_eq!(
@@ -316,8 +345,22 @@ pub(super) async fn backend() -> (
                     "granted"
                 );
             }
+            if let Some(scope) = scope {
+                *scope.lock().expect("scope recorder lock") = request
+                    .headers()
+                    .get("x-space-template-lookup-scope")
+                    .map(|value| value.to_str().expect("ASCII scope header").to_owned());
+            }
             calls.fetch_add(1, Ordering::SeqCst);
+            let lookup_scope = request
+                .headers()
+                .get("x-space-template-lookup-scope")
+                .cloned();
             let payload = if request.uri().path().ends_with("/GetTemplate") {
+                assert!(
+                    lookup_scope.is_some(),
+                    "cache probes must carry authenticated scope"
+                );
                 use prost::Message;
                 tmpl::GetTemplateResponse {
                     template: Some(tmpl::TemplateRef {
@@ -339,9 +382,13 @@ pub(super) async fn backend() -> (
                     .to_be_bytes(),
             );
             frame.extend(payload);
-            http::Response::builder()
+            let mut response = http::Response::builder()
                 .header("content-type", "application/grpc")
-                .header("grpc-status", "0")
+                .header("grpc-status", "0");
+            if let Some(scope) = lookup_scope {
+                response = response.header("x-space-template-lookup-scope-received", scope);
+            }
+            response
                 .body(Body::from(frame))
                 .expect("valid gRPC acknowledgement")
         }

@@ -1,4 +1,5 @@
 use pplx_space_common_core::types::OrgId;
+use pplx_space_common_svc::template_lookup::TemplateLookupScope;
 
 use super::metadata::*;
 use super::status::*;
@@ -394,6 +395,10 @@ impl ClusterApi for ClusterApiService {
         request: Request<FindTemplateReleaseRequest>,
     ) -> Result<Response<FindTemplateReleaseResponse>, Status> {
         let scope = self.template_read_scope(&request).await?;
+        let delegation = TemplateLookupScope::from_request(&request)?;
+        if delegation.is_none() {
+            pplx_space_metrics::auth::template_lookup_compatibility("missing_scope");
+        }
         let request = request.into_inner();
         let template_name = trimmed_required(&request.template_name, "template_name")?;
         let runtime = validated_template_runtime(&request.runtime)?;
@@ -454,13 +459,17 @@ impl ClusterApi for ClusterApiService {
             &template_name,
         )
         .await;
-        Ok(Response::new(FindTemplateReleaseResponse {
+        let mut response = Response::new(FindTemplateReleaseResponse {
             generic_authorized,
             authorized_org_id: caller_org.map(|org| org.to_string()),
             release: Some(release),
             storage_locations,
             template_visibility: visibility.into(),
-        }))
+        });
+        if let Some(scope) = delegation {
+            scope.receipt(&mut response);
+        }
+        Ok(response)
     }
 
     async fn find_template_release_by_hash(
@@ -468,6 +477,10 @@ impl ClusterApi for ClusterApiService {
         request: Request<FindTemplateReleaseByHashRequest>,
     ) -> Result<Response<FindTemplateReleaseResponse>, Status> {
         let scope = self.template_read_scope(&request).await?;
+        let delegation = TemplateLookupScope::from_request(&request)?;
+        if delegation.is_none() {
+            pplx_space_metrics::auth::template_lookup_compatibility("missing_scope");
+        }
         let request = request.into_inner();
         let template_name = trimmed_required(&request.template_name, "template_name")?;
         // Canonical `sha256:`-prefixed form.
@@ -538,13 +551,17 @@ impl ClusterApi for ClusterApiService {
             &template_name,
         )
         .await;
-        Ok(Response::new(FindTemplateReleaseResponse {
+        let mut response = Response::new(FindTemplateReleaseResponse {
             generic_authorized,
             authorized_org_id: caller_org.map(|org| org.to_string()),
             release: Some(release),
             storage_locations,
             template_visibility: visibility.into(),
-        }))
+        });
+        if let Some(scope) = delegation {
+            scope.receipt(&mut response);
+        }
+        Ok(response)
     }
 
     async fn list_latest_template_releases(

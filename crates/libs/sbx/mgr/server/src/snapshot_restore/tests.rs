@@ -1754,6 +1754,58 @@ fn restored_sidecar_is_replaced_without_writing_the_pulled_file() {
     assert!(!tmp.path().join(".snapshot.json.restore").exists());
 }
 
+#[rstest::rstest]
+#[case::root("root@local", true)]
+#[case::operator("deploy@local", true)]
+#[case::tenant("user:00000000-0000-0000-0000-000000000001", false)]
+#[tokio::test]
+async fn restore_template_lookup_uses_validated_owner(
+    #[case] owner: &str,
+    #[case] local: bool,
+    #[values(false, true)] receipt: bool,
+) {
+    use pplx_space_common_svc::template_lookup::TemplateLookupScope;
+    use pplx_space_template_mgr_client::proto::GetTemplateResponse;
+    let id = pplx_space_common_core::types::SandboxId::new();
+    let expected = if local {
+        TemplateLookupScope::LocalExecution
+    } else {
+        TemplateLookupScope::Sandbox {
+            id,
+            caller_node: None,
+        }
+    };
+    let templates = crate::template_resolver::fake::FakeTemplateResolver::new(move || {
+        let mut response = tonic::Response::new(GetTemplateResponse {
+            template_dir: "/synthetic/cached-base".into(),
+            ..Default::default()
+        });
+        if receipt {
+            expected.receipt(&mut response);
+        }
+        Ok(response)
+    });
+
+    let path = ensure_local_template(
+        &templates,
+        &id.to_string(),
+        &owner.parse().unwrap(),
+        "base",
+        "sha256:cached",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(path, "/synthetic/cached-base");
+    let lookup = templates.lookups().pop().unwrap();
+    let mut request = tonic::Request::new(lookup.request);
+    *request.metadata_mut() = lookup.metadata;
+    assert_eq!(
+        TemplateLookupScope::from_request(&request).unwrap(),
+        Some(expected)
+    );
+}
+
 // A stopped materialization refused because the staged artifact isn't the
 // evacuated disk the caller named is evidence disagreeing with itself, the
 // same class as the other identity mismatches, not a filesystem or database

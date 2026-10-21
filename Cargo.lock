@@ -6890,6 +6890,7 @@ dependencies = [
  "prost",
  "prost-types",
  "rcgen",
+ "rstest",
  "rustix",
  "rustls",
  "serde",

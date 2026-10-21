@@ -100,3 +100,12 @@ pub fn uds_peer_exe_deleted(service: &str, principal: &str) {
         &[tag("service", service), tag("principal", principal)],
     );
 }
+
+/// Per-hop scope protocol support; a receipt does not certify authorization.
+pub fn template_lookup_compatibility(result: &str) {
+    counter(
+        "auth.template_lookup.compatibility",
+        1,
+        &[tag("result", result)],
+    );
+}
