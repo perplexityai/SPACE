@@ -57,7 +57,7 @@ the ordinary smoke job logs.
 |---|---|---|
 | Contract | Command validation, changed-request idempotency conflicts, token scope, tenant isolation | Included |
 | Contract | Completed DELETE replay, permanent startup errors | Included |
-| Contract | Earlier credentials stay valid after an idempotent replay | Included |
+| Proposed contract | Earlier credentials stay valid after an idempotent replay | Included |
 | Admission | Zero-vCPU rejection before accepting an operation | Included on Kind with bounded cleanup |
 | Concurrency | Same-key create and command fanout, independent commands, pause/wake contention, slow-reader output integrity | Included |
 | Recovery | Queued create across controller outage/API restart; original command session across data-plane restart | Included on Kind only |
@@ -99,13 +99,24 @@ Named development benches require `SPACE_SMOKE_KIND_CLUSTER_UID` to match the
 live `kube-system` namespace UID before privileged fixture operations. The
 standard `kind-space-local` setup retains its existing isolation checks.
 
-## Credential replay contract
+## Credential replay contract (proposed)
 
-An idempotent replay of a session create returns the same session with an
-additional attachment credential. Credentials returned earlier stay valid until
-their own expiry; revocation ends all of them. The API reference's
-[session token renewal](api/index.md#renew-session-tokens) section states the
-expiry, issuance bound, and revoked-session behavior.
+Whether an idempotent replay of a command create should also renew its
+attachment credential is not yet agreed. The
+[review of #79](https://github.com/perplexityai/SPACE/pull/79#pullrequestreview-5423918313)
+and the [review of #91](https://github.com/perplexityai/SPACE/pull/91#pullrequestreview-5423917990)
+deferred it: command-create replay is to be defined separately from credential
+renewal, including expiry, revocation, and whether overlapping validity is
+promised, before choosing the smallest implementation.
+
+The behavior described here and in
+[session token renewal](api/index.md#renew-session-tokens) is one proposal
+pending that agreement. A replay returns the same session with an additional
+attachment credential, credentials returned earlier stay valid until their own
+expiry, at most 16 stay valid per session, and revocation ends all of them.
+Alternatives are an explicit credential-renew endpoint that leaves replay
+unchanged, and a single `previous_token_hash` grace column that keeps only the
+credential before the latest one valid.
 
 `native_contract.command_replay_credentials` checks that the original
 credential still attaches after a replay. `native_concurrency.command_idempotency`
