@@ -34,6 +34,12 @@ class SandboxConfig:
     kind_byok: bool = False
     kind_cold_create: KindColdCreateConfig | None = None
     kind_warm_pool: KindWarmPoolConfig | None = None
+    kind_dedicated_template: bool = False
+    """Create the sandbox from a minimal run-owned template no worker prefetches.
+
+    For scenarios that need a worker to stay without the sandbox's template
+    once it is removed there; `template` is then not used.
+    """
 
     def __post_init__(self) -> None:
         if self.timeout <= 0:
@@ -42,6 +48,15 @@ class SandboxConfig:
             raise ValueError("sandbox template must not be empty")
         if self.kind_cold_create is not None and self.kind_warm_pool is not None:
             raise ValueError("cold-create and warm-pool setup are mutually exclusive")
+        if self.kind_dedicated_template and (
+            self.template != "seed"
+            or self.kind_cold_create is not None
+            or self.kind_warm_pool is not None
+        ):
+            raise ValueError(
+                "a dedicated template replaces the configured template and its "
+                "cold-create or warm-pool setup"
+            )
 
 
 def sandbox_with_authenticated_public_ports() -> SandboxConfig:

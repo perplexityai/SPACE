@@ -6058,7 +6058,7 @@ def _routing_value(value: str) -> str:
 def _template_alias(value: str) -> str:
     """Only the scenario's own throwaway aliases reach a shell or a URL."""
 
-    if not re.fullmatch(r"space-smoke-oci-[0-9a-f]{8}", value):
+    if not re.fullmatch(r"space-smoke-(oci|parent)-[0-9a-f]{8}", value):
         raise ValueError(f"refusing template alias {value!r}")
     return value
 
@@ -7400,8 +7400,12 @@ class EcwSdk:
                 template = template.set_envs(dict(recipe.envs))
             for command, user in recipe.run_cmds:
                 template = template.run_cmd(command, user=user)
-            final = template.set_start_cmd(
-                recipe.start_cmd, e2b.wait_for_timeout(recipe.ready_timeout_seconds)
+            final = (
+                template
+                if recipe.start_cmd is None
+                else template.set_start_cmd(
+                    recipe.start_cmd, e2b.wait_for_timeout(recipe.ready_timeout_seconds)
+                )
             )
             started = time.monotonic()
             info = e2b.Template.build(

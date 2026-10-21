@@ -138,6 +138,74 @@ def oci_recipe(image: str = OCI_IMAGE) -> TemplateRecipe:
     )
 
 
+def minimal_recipe(image: str = OCI_IMAGE) -> TemplateRecipe:
+    """The smallest template the builder makes: the base image and nothing else.
+
+    No build steps, files, envs or start command, so the build is the image
+    pull, the guest-bundle assembly and the publish, and the release is little
+    more than the base image. The image is the one `oci_recipe` already pulls on
+    the Kind builders (and ci/mirrored-images.txt mirrors), so it adds no new
+    external dependency.
+    """
+
+    return TemplateRecipe(
+        dockerfile=f"FROM {image}\n",
+        files={},
+        envs={},
+        run_cmds=(),
+        start_cmd=None,
+        ready_timeout_seconds=0,
+    )
+
+
+def delete_template_and_wait(
+    control: TemplateBuildControl,
+    alias: str,
+    *,
+    timeout: float = TEMPLATE_DELETE_BUDGET_SECONDS,
+) -> None:
+    """Delete a run-owned template through the admin API and wait for the operation."""
+
+    operation_id = control.delete_template_as_admin(alias)
+    if operation_id is None:
+        return
+    deadline = time.monotonic() + timeout
+    while True:
+        state = control.operation_state(operation_id)
+        if state == "succeeded":
+            return
+        if state in ("failed", "canceled", "expired") or time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"template delete operation {operation_id} for {alias} ended {state or 'pending'}"
+            )
+        time.sleep(3)
+
+
+def build_dedicated_template(
+    scope: ResourceScope,
+    control: TemplateBuildControl,
+    builder: TemplateBuilder,
+) -> TemplateBuildResult:
+    """Build a run-owned minimal template that only the calling scenario uses.
+
+    Its alias is not in template-manager's `SPACE_TEMPLATE_PREFETCH_TAGS` and
+    the release is org-specific, so no worker prefetches it: a worker it was
+    removed from stays without it until something asks for it. The delete is
+    armed before the build so a failed or ambiguous build cannot leak it, and
+    before the caller creates a sandbox from it so that sandbox unwinds first.
+    """
+
+    alias = f"space-smoke-parent-{secrets.token_hex(4)}"
+    scope.defer(
+        f"delete the scenario-owned template {alias}",
+        lambda: delete_template_and_wait(control, alias),
+        critical=True,
+    )
+    return builder.build_template(
+        minimal_recipe(), alias=alias, cpu_count=1, memory_mb=1024, tags=("latest",)
+    )
+
+
 def guest_checks(image: str = OCI_IMAGE) -> dict[str, str]:
     """Shell checks run inside the booted guest; each must exit 0. Order is the report order."""
 
@@ -521,19 +589,7 @@ class TemplateBuildAssertions:
             )
 
     def _delete_template(self, *, timeout: float = TEMPLATE_DELETE_BUDGET_SECONDS) -> None:
-        operation_id = self._control.delete_template_as_admin(self.alias)
-        if operation_id is None:
-            return
-        deadline = time.monotonic() + timeout
-        while True:
-            state = self._control.operation_state(operation_id)
-            if state == "succeeded":
-                return
-            if state in ("failed", "canceled", "expired") or time.monotonic() >= deadline:
-                raise RuntimeError(
-                    f"template delete operation {operation_id} for {self.alias} ended {state or 'pending'}"
-                )
-            time.sleep(3)
+        delete_template_and_wait(self._control, self.alias, timeout=timeout)
 
     def _require_accepted(self) -> str:
         if self._accepted is None:

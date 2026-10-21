@@ -703,7 +703,8 @@ class TemplateRecipe:
     envs: Mapping[str, str]
     run_cmds: tuple[tuple[str, str], ...]
     """`(command, user)` pairs appended after the Dockerfile."""
-    start_cmd: str
+    start_cmd: str | None
+    """None builds without a start command (and so without a ready wait)."""
     ready_timeout_seconds: int
 
 
