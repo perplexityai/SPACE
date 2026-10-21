@@ -61,7 +61,7 @@ python3 -m http.server 8000 --bind 127.0.0.1 --directory target/docs/site
 
 Open <http://127.0.0.1:8000>. The build also requires Git and Python 3.11+. The standalone commands remain `bash scripts/build-guide-docs.sh` and `bash scripts/build-api-docs.sh`; they also support local uncommitted edits.
 
-The API serves its generated reference at `/openapi-m1.json`, with request fields, response schemas, and errors.
+The API serves its generated reference at `/openapi-m1.json`, with request fields, response schemas, and errors. `/openapi.json` adds the incubating operations. Some incubating operations, including snapshots, checkpoint, and rollback, are hidden: unless the deployment enables them for your organization, they answer `404` and are left out of both documents.
 
 ## SPACE API
 

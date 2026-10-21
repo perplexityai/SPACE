@@ -3,7 +3,9 @@ use axum::{
     http::{HeaderValue, header},
     response::IntoResponse,
 };
-use pplx_space_public_api::routes::{M1_STATUS_EXTENSION, MAX_UTF8_BYTES_EXTENSION};
+use pplx_space_public_api::routes::{
+    M1_STATUS_EXTENSION, MAX_UTF8_BYTES_EXTENSION, NativeOperationStatus,
+};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
 
@@ -28,6 +30,10 @@ mod schema_contract;
 mod success_examples;
 
 pub(crate) async fn openapi_json() -> Json<Value> {
+    Json(default_openapi_value())
+}
+
+pub(crate) async fn full_openapi_json() -> Json<Value> {
     Json(public_openapi_value())
 }
 
@@ -41,7 +47,7 @@ pub(crate) async fn llms_txt() -> impl IntoResponse {
             header::CONTENT_TYPE,
             HeaderValue::from_static("text/plain; charset=utf-8"),
         )],
-        "SPACE API\n\n- SPACE OpenAPI: /openapi.json or /api/openapi.json\n- M1 SDK OpenAPI: /openapi-m1.json or /api/openapi-m1.json\n- Admin OpenAPI: /admin/api/openapi.json on shared hosts\n- SPACE API base path: /v1 on api.space hosts, /api/v1 on shared hosts\n- Admin API base path: /admin/api/v1 on shared hosts\n- ECW (E2B-compatible) API base path: / on e2b.api.space hosts, /e2b/api on shared hosts\n",
+        "SPACE API\n\n- SPACE OpenAPI (M1 SDK operations plus incubating operations): /openapi.json or /api/openapi.json\n- M1 SDK OpenAPI: /openapi-m1.json or /api/openapi-m1.json\n- Admin OpenAPI: /admin/api/openapi.json on shared hosts\n- SPACE API base path: /v1 on api.space hosts, /api/v1 on shared hosts\n- Admin API base path: /admin/api/v1 on shared hosts\n- ECW (E2B-compatible) API base path: / on e2b.api.space hosts, /e2b/api on shared hosts\n",
     )
 }
 
@@ -419,12 +425,23 @@ fn apply_native_operation_manifest(spec: &mut Value) {
 }
 
 pub(crate) fn m1_sdk_openapi_value() -> Value {
+    operations_openapi_value(|status| status.is_m1_supported())
+}
+
+/// The document `/openapi.json` serves: every operation except those hidden
+/// by default, which `/openapi-full.json` still documents.
+pub(crate) fn default_openapi_value() -> Value {
+    operations_openapi_value(|status| !status.is_hidden_by_default())
+}
+
+/// The native contract narrowed to the operations whose status `keep` accepts.
+fn operations_openapi_value(keep: impl Fn(NativeOperationStatus) -> bool) -> Value {
     use pplx_space_public_api::routes::NATIVE_V1_OPERATIONS;
 
     let mut spec = public_openapi_value();
     let supported = NATIVE_V1_OPERATIONS
         .iter()
-        .filter(|operation| operation.status().is_m1_supported())
+        .filter(|operation| keep(operation.status()))
         .map(|operation| (operation.relative_path(), operation.method().openapi_name()))
         .collect::<BTreeSet<_>>();
     spec.get_mut("paths")

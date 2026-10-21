@@ -754,6 +754,47 @@ fn public_openapi_local_references_resolve() {
     assert_local_references_resolve(&spec, &spec);
 }
 
+/// `/openapi.json` documents every operation but the hidden ones, which only
+/// `/openapi-full.json` still lists.
+#[tokio::test]
+async fn default_contract_omits_exactly_the_hidden_operations() {
+    let operations = |spec: &Value| {
+        spec["paths"]
+            .as_object()
+            .expect("paths should be an object")
+            .iter()
+            .flat_map(|(path, item)| {
+                item.as_object()
+                    .expect("path item should be an object")
+                    .keys()
+                    .filter(|method| OPENAPI_HTTP_METHODS.contains(&method.as_str()))
+                    .map(move |method| (path.clone(), method.clone()))
+            })
+            .collect::<BTreeSet<_>>()
+    };
+    let served = super::openapi_json().await.0;
+    let full = super::full_openapi_json().await.0;
+    let hidden = pplx_space_public_api::routes::NATIVE_V1_OPERATIONS
+        .iter()
+        .filter(|operation| operation.status().is_hidden_by_default())
+        .map(|operation| {
+            (
+                operation.relative_path().to_owned(),
+                operation.method().openapi_name().to_owned(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+
+    assert!(!hidden.is_empty());
+    assert!(hidden.is_subset(&operations(&full)));
+    assert_eq!(
+        operations(&served),
+        &operations(&full) - &hidden,
+        "the served contract should drop exactly the hidden operations"
+    );
+    assert_local_references_resolve(&served, &served);
+}
+
 #[test]
 fn rollback_contract_only_advertises_reachable_responses() {
     let spec = public_openapi_value();

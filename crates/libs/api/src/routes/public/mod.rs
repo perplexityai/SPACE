@@ -15,6 +15,7 @@ mod credential_references;
 mod cursors;
 pub(crate) mod error;
 mod files;
+pub(crate) mod hidden_operations;
 pub(crate) use files::{
     MAX_FILE_WRITE_BATCH_BYTES, WRITE_FILE_BATCH_BODY_LIMIT_BYTES, WRITE_FILE_BODY_LIMIT_BYTES,
 };
@@ -279,6 +280,10 @@ pub fn v1_router(state: AppState) -> Router<AppState> {
         .layer(middleware::from_fn_with_state(
             state.clone(),
             owner_scope::authorize,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            hidden_operations::hide_unless_enabled,
         ))
         .layer(middleware::from_fn_with_state(state, require_native_auth))
         .layer(middleware::from_fn(error::normalize_public_error_response))

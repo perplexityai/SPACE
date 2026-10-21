@@ -2,7 +2,7 @@
 
 Use the SPACE API to create sandboxes, run commands, and collect output. Browse the endpoint reference for request fields, responses, and examples. Fields labeled “Experimental” are outside the supported contract.
 
-This reference covers 14 supported HTTP operations: sandbox creation, inspection and lifecycle actions; command creation and process inspection/control; operation polling; and SSE event streams. Generated file-watch and WebSocket-related types do not make their session-creation or interactive APIs part of this supported surface.
+This reference covers 14 supported HTTP operations: sandbox creation, inspection and lifecycle actions; command creation and process inspection/control; operation polling; and SSE event streams. Generated file-watch and WebSocket-related types do not make their session-creation or interactive APIs part of this supported surface. Operations outside this reference are incubating; some, including snapshots, checkpoint, rollback, and file-watch sessions, are hidden and answer `404` unless the deployment enables them for your organization.
 
 Use the management API endpoint and bearer token for sandbox, command, process, and operation requests. Event streams use the separate data-plane endpoint and session-scoped token returned with the command. Response fields with open string values can gain new values; tolerate unknown values rather than treating the examples as a closed enum.
 
