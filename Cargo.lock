@@ -5223,6 +5223,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-byte-size"
+version = "0.8.0"
+dependencies = [
+ "bytesize",
+ "serde",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "pplx-space-cluster-controller"
 version = "0.8.0"
 dependencies = [
@@ -5369,11 +5378,11 @@ version = "0.8.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
- "bytesize",
  "insta",
  "k8s-openapi",
  "libc",
  "nix 0.31.3",
+ "pplx-space-byte-size",
  "pplx-space-content-digest",
  "pplx-space-cpu-arch",
  "pplx-space-durations",

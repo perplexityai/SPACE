@@ -4,10 +4,15 @@
 //! `DiskSize` wrap it so API boundaries cannot accidentally pass disk bytes as
 //! memory bytes or vice versa.
 //!
+//! These are generic validated value types over the `bytesize` crate with
+//! nothing SPACE-specific in them, so they live in their own crate rather than
+//! in the domain model. `pplx-space-common-core` re-exports these types as
+//! `types::size`.
+//!
 //! # Examples
 //!
 //! ```rust
-//! # use pplx_space_common_core::types::*;
+//! # use pplx_space_byte_size::*;
 //! let memory = MemorySize::gib(4)?;
 //! let disk = DiskSize::gib(20)?;
 //!
@@ -27,7 +32,7 @@ use std::str::FromStr;
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::*;
+/// # use pplx_space_byte_size::*;
 /// let raw = ByteSize::mib(512);
 /// assert_eq!(raw.as_u64(), 512 * 1024 * 1024);
 /// ```
@@ -41,7 +46,7 @@ use serde::{Deserialize, Serialize};
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::*;
+/// # use pplx_space_byte_size::*;
 /// assert_eq!(MemorySize::b(0), Err(SizeParseError::Zero));
 /// ```
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
@@ -67,7 +72,7 @@ pub enum SizeParseError {
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::*;
+/// # use pplx_space_byte_size::*;
 /// let memory = MemorySize::gib(4)?;
 /// assert_eq!(memory.as_mib_floor(), 4096);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -83,7 +88,7 @@ impl MemorySize {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_byte_size::*;
     /// let memory = MemorySize::b(1024)?;
     /// assert_eq!(memory.as_bytes(), 1024);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -97,7 +102,7 @@ impl MemorySize {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_byte_size::*;
     /// let memory = MemorySize::kib(2)?;
     /// assert_eq!(memory.as_bytes(), 2 * 1024);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -111,7 +116,7 @@ impl MemorySize {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_byte_size::*;
     /// let memory = MemorySize::mib(512)?;
     /// assert_eq!(memory.as_mib_floor(), 512);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -125,7 +130,7 @@ impl MemorySize {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_byte_size::*;
     /// let memory = MemorySize::gib(4)?;
     /// assert_eq!(memory.as_mib_floor(), 4096);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -139,7 +144,7 @@ impl MemorySize {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_byte_size::*;
     /// let memory = MemorySize::tib(1)?;
     /// assert_eq!(memory.as_mib_floor(), 1024 * 1024);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -153,7 +158,7 @@ impl MemorySize {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_byte_size::*;
     /// let memory = MemorySize::mib(1)?;
     /// assert_eq!(memory.as_bytes(), 1024 * 1024);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -167,7 +172,7 @@ impl MemorySize {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_byte_size::*;
     /// let memory = MemorySize::b(3 * 1024 * 1024 + 1)?;
     /// assert_eq!(memory.as_mib_floor(), 3);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -181,7 +186,7 @@ impl MemorySize {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_byte_size::*;
     /// let memory = MemorySize::b(3 * 1024 * 1024 + 1)?;
     /// assert_eq!(memory.as_mib_ceil(), 4);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -198,7 +203,7 @@ impl MemorySize {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_byte_size::*;
     /// let requested = MemorySize::gib(4)?;
     /// let max = MemorySize::gib(8)?;
     /// assert_eq!(requested.ensure_at_most(max)?, requested);
@@ -253,7 +258,7 @@ impl FromStr for MemorySize {
 /// # Examples
 ///
 /// ```rust
-/// # use pplx_space_common_core::types::*;
+/// # use pplx_space_byte_size::*;
 /// let disk = DiskSize::gib(20)?;
 /// assert_eq!(disk.as_mib_floor(), 20 * 1024);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -269,7 +274,7 @@ impl DiskSize {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_byte_size::*;
     /// let disk = DiskSize::b(4096)?;
     /// assert_eq!(disk.as_bytes(), 4096);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -283,7 +288,7 @@ impl DiskSize {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_byte_size::*;
     /// let disk = DiskSize::kib(4)?;
     /// assert_eq!(disk.as_bytes(), 4 * 1024);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -297,7 +302,7 @@ impl DiskSize {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_byte_size::*;
     /// let disk = DiskSize::mib(512)?;
     /// assert_eq!(disk.as_mib_floor(), 512);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -311,7 +316,7 @@ impl DiskSize {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_byte_size::*;
     /// let disk = DiskSize::gib(20)?;
     /// assert_eq!(disk.as_mib_floor(), 20 * 1024);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -325,7 +330,7 @@ impl DiskSize {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_byte_size::*;
     /// let disk = DiskSize::tib(1)?;
     /// assert_eq!(disk.as_mib_floor(), 1024 * 1024);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -339,7 +344,7 @@ impl DiskSize {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_byte_size::*;
     /// let disk = DiskSize::mib(1)?;
     /// assert_eq!(disk.as_bytes(), 1024 * 1024);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -353,7 +358,7 @@ impl DiskSize {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_byte_size::*;
     /// let disk = DiskSize::b(5 * 1024 * 1024 + 1)?;
     /// assert_eq!(disk.as_mib_floor(), 5);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -367,7 +372,7 @@ impl DiskSize {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_byte_size::*;
     /// let disk = DiskSize::b(5 * 1024 * 1024 + 1)?;
     /// assert_eq!(disk.as_mib_ceil(), 6);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -384,7 +389,7 @@ impl DiskSize {
     /// # Examples
     ///
     /// ```rust
-    /// # use pplx_space_common_core::types::*;
+    /// # use pplx_space_byte_size::*;
     /// let requested = DiskSize::gib(20)?;
     /// let max = DiskSize::gib(100)?;
     /// assert_eq!(requested.ensure_at_most(max)?, requested);

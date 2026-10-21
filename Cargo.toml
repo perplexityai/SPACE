@@ -87,6 +87,7 @@ members = [
     "crates/libs/placement/machine",
     "crates/libs/public/api",
     "crates/libs/api",
+    "crates/libs/byte-size",
     "crates/libs/common/core",
     "crates/libs/semver",
     "crates/libs/durations",
@@ -310,6 +311,7 @@ pplx-space-bearer-token = { path = "crates/libs/bearer-token" }
 pplx-space-build-mgr = { path = "crates/libs/build/mgr" }
 pplx-space-build-mgr-client = { path = "crates/libs/build/mgr/client" }
 pplx-space-build-mgr-server = { path = "crates/libs/build/mgr/server" }
+pplx-space-byte-size = { path = "crates/libs/byte-size" }
 pplx-space-common-core = { path = "crates/libs/common/core" }
 pplx-space-durations = { path = "crates/libs/durations" }
 pplx-space-common-cli = { path = "crates/libs/common/cli" }

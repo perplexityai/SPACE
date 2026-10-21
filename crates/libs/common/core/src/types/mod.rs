@@ -54,7 +54,7 @@ pub mod runtime;
 pub mod sandbox;
 #[cfg(feature = "serde")]
 pub mod sandbox_artifact;
-pub mod size;
+pub use pplx_space_byte_size as size;
 pub mod snapshot;
 #[cfg(feature = "rusqlite")]
 mod sqlite;
