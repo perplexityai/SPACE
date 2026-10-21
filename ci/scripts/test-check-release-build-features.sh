@@ -7,10 +7,19 @@
 #      dependencies fails the check. `-p` on the binary's package passes.
 #   2. `test-support` fails like `test-hooks`, and so does a test-only feature
 #      a selected package turns on itself with `-F`, on itself or forwarded.
+#      Any other `test-*` feature fails on a package built from the checkout.
 #   3. A stage added to a passing file is checked without listing it anywhere.
 #   4. A `cargo chef cook` case branch is checked and named.
 #   5. An invocation the check cannot read, an unknown cargo subcommand, and a
-#      file with no build at all fail instead of passing unchecked.
+#      file with no build at all fail instead of passing unchecked. So do the
+#      forms outside the check's grammar: a heredoc, exec form, `cargo` inside
+#      a command string, substitution or after `;`, `cargo install --path=`,
+#      an expansion in a dropped option's value, cargo in another
+#      instruction, and an escape directive. A blank line inside a continued
+#      RUN is dropped as Docker drops it, not taken as its end.
+#   6. A failure to process the graph fails the check rather than reading as
+#      clean: a leaking selection still fails with an unwritable TMPDIR, and
+#      with a `sort` that fails.
 #
 # The fixture Dockerfiles keep their shell expansions literal.
 # shellcheck disable=SC2016
@@ -29,17 +38,20 @@ add_crate() { # name manifest-tail
     : >"${workspace}/$1/src/lib.rs"
 }
 mkdir -p "${workspace}"
-printf '[workspace]\nresolver = "2"\nmembers = ["base", "fixtures", "support", "app"]\n' \
+printf '[workspace]\nresolver = "2"\nmembers = ["base", "fixtures", "support", "capture", "app"]\n' \
     >"${workspace}/Cargo.toml"
 # The workspace's own toolchain, so rustup resolves the one CI already has.
 cp "${repo_root}/rust-toolchain.toml" "${workspace}/"
 add_crate base '[features]
 test-hooks = []
-test-support = []'
+test-support = []
+test-capture = []'
 add_crate fixtures '[dependencies]
 base = { path = "../base", features = ["test-hooks"] }'
 add_crate support '[dependencies]
 base = { path = "../base", features = ["test-support"] }'
+add_crate capture '[dependencies]
+base = { path = "../base", features = ["test-capture"] }'
 add_crate app '[features]
 extra = []
 test-hooks = []
@@ -142,5 +154,93 @@ RUN cargo rustc --locked --release -p app' 'unrecognized cargo rustc'
 
 expect fail no-build-fails 'FROM rust AS base
 RUN cargo --version' 'found no cargo build or cargo chef cook invocation'
+
+expect fail test-capture-on-a-checkout-package 'FROM rust AS build-capture
+RUN cargo build --locked --release -p capture' 'base feature "test-capture"'
+
+expect fail blank-continuation-lines-are-dropped "FROM rust AS build-app
+RUN cargo build --locked --release -p app \\
+
+   
+      -F app/test-hooks --bin app" 'app feature "test-hooks"'
+
+# Each form below hides the same leaking build; the clean one keeps the file
+# from failing only for having nothing to check.
+hidden() {
+    printf '%s\n' "${clean}" "" "FROM base AS build-hidden" "$1"
+}
+leak='cargo build --locked --release -p app -F app/test-hooks --bin app'
+unread='cargo appears where this check cannot read it'
+expect fail heredoc-fails "$(hidden "RUN <<EOF
+${leak}
+EOF")" 'cannot read a RUN with a heredoc'
+expect fail exec-form-fails "$(hidden 'RUN ["cargo", "build", "-p", "app", "-F", "app/test-hooks"]')" \
+    'cannot read a RUN in exec form'
+expect fail command-string-fails "$(hidden "RUN sh -c \"${leak}\"")" "${unread}"
+expect fail separator-without-space-fails "$(hidden "RUN true;${leak}")" "${unread}"
+expect fail command-substitution-fails "$(hidden "RUN echo \$(${leak})")" "${unread}"
+expect fail backticks-fail "$(hidden "RUN echo \`${leak}\`")" "${unread}"
+expect fail install-path-equals-fails "$(hidden 'RUN cargo install --locked --path=app')" \
+    'cannot read cargo install --path=app'
+expect fail expansion-in-a-dropped-value-fails \
+    "$(hidden 'RUN cargo build --locked --release -p app --bin ${BIN_FLAGS}')" \
+    'cannot read --bin ${BIN_FLAGS}'
+expect fail cargo-in-another-instruction-fails "$(hidden "ONBUILD RUN ${leak}")" \
+    'cannot read cargo in a ONBUILD instruction'
+expect fail escape-directive-fails "# escape=\`
+${clean}" 'cannot read a file with an escape parser directive'
+
+# A graph larger than a pipe buffer, so a here-string of it would need a
+# temporary file: a package with 1200 dependencies of its own.
+wide="${tmp_dir}/wide"
+mkdir -p "${wide}/base/src" "${wide}/wide/src"
+cp "${repo_root}/rust-toolchain.toml" "${wide}/"
+printf '[workspace]\nresolver = "2"\nmembers = ["base", "wide", "leaves/*"]\n' >"${wide}/Cargo.toml"
+cp "${workspace}/base/Cargo.toml" "${wide}/base/"
+: >"${wide}/base/src/lib.rs"
+{
+    printf '[package]\nname = "wide"\nversion = "0.1.0"\nedition = "2021"\n\n'
+    printf '[features]\nforward = ["base/test-hooks"]\n\n[dependencies]\n'
+    printf 'base = { path = "../base" }\n'
+    for leaf in $(seq 1 1200); do
+        mkdir -p "${wide}/leaves/leaf-${leaf}/src"
+        printf '[package]\nname = "leaf-%s"\nversion = "0.1.0"\nedition = "2021"\n' "${leaf}" \
+            >"${wide}/leaves/leaf-${leaf}/Cargo.toml"
+        : >"${wide}/leaves/leaf-${leaf}/src/lib.rs"
+        printf 'leaf-%s = { path = "../leaves/leaf-%s" }\n' "${leaf}" "${leaf}"
+    done
+} >"${wide}/wide/Cargo.toml"
+: >"${wide}/wide/src/lib.rs"
+(cd "${wide}" && CARGO_NET_OFFLINE=true cargo generate-lockfile --quiet)
+read_only="${tmp_dir}/read-only"
+mkdir "${read_only}"
+chmod 0500 "${read_only}"
+printf 'FROM rust AS build-wide\nRUN cargo build --locked --release -p wide -F wide/forward\n' \
+    >"${tmp_dir}/wide.Dockerfile"
+if TMPDIR="${read_only}" bash "${check}" "${tmp_dir}/wide.Dockerfile" "${wide}" \
+    >"${tmp_dir}/wide.log" 2>&1; then
+    fail "unwritable-tmpdir-still-fails: expected the check to fail, it did pass" \
+        "${tmp_dir}/wide.log"
+elif ! grep -qF 'base feature "test-hooks"' "${tmp_dir}/wide.log" \
+    && ! grep -qF 'could not resolve the selection' "${tmp_dir}/wide.log"; then
+    fail "unwritable-tmpdir-still-fails: failed without naming the leak or the error" \
+        "${tmp_dir}/wide.log"
+fi
+chmod 0700 "${read_only}"
+
+# Bash falls back to /tmp when TMPDIR is unwritable, so as a non-root user the
+# case above passes either way. A failing tool in the graph's pipeline does not.
+shims="${tmp_dir}/shims"
+mkdir "${shims}"
+printf '#!/bin/sh\nexit 1\n' >"${shims}/sort"
+chmod +x "${shims}/sort"
+printf 'FROM rust AS build-app\nRUN cargo build --locked --release -p app -F app/forward\n' \
+    >"${tmp_dir}/sort.Dockerfile"
+if PATH="${shims}:${PATH}" bash "${check}" "${tmp_dir}/sort.Dockerfile" "${workspace}" \
+    >"${tmp_dir}/sort.log" 2>&1; then
+    fail "failing-sort-fails: expected the check to fail, it did pass" "${tmp_dir}/sort.log"
+elif ! grep -qF 'could not resolve the selection' "${tmp_dir}/sort.log"; then
+    fail "failing-sort-fails: failed without naming the error" "${tmp_dir}/sort.log"
+fi
 
 exit "${status}"

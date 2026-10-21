@@ -47,6 +47,26 @@ impl EnvConfig<'_> {
         }
     }
 
+    /// A switch whose `true` is the non-destructive mode, such as a dry run.
+    /// Unset keeps `default`; a value in the shared `env_flag` vocabulary
+    /// wins; any other present value, empty included, turns it on with a
+    /// warning. A misspelled dry-run switch must keep the dry run, never start
+    /// deleting.
+    pub(crate) fn safe_mode_flag(&self, var: &str, default: bool) -> bool {
+        let Some(raw) = self.0.var_os(var) else {
+            return default;
+        };
+        let raw = raw.to_string_lossy();
+        pplx_space_common_core::env::parse_env_flag(&raw).unwrap_or_else(|| {
+            tracing::warn!(
+                variable = var,
+                value = %raw,
+                "unrecognized value for a safe-mode switch; keeping it on"
+            );
+            true
+        })
+    }
+
     /// Kill switch for a reconciler that writes or deletes and ships enabled:
     /// unset keeps it on, an explicit truthy value keeps it on, and any other
     /// present value (including `off`, whitespace, or an empty string)
