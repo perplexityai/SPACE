@@ -6370,14 +6370,23 @@ dependencies = [
 name = "pplx-space-node-mgr-client"
 version = "0.8.0"
 dependencies = [
- "anyhow",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
- "pplx-space-common-proto-build",
  "pplx-space-common-svc",
+ "pplx-space-node-mgr-protocol",
+ "thiserror 2.0.20",
+ "tonic",
+]
+
+[[package]]
+name = "pplx-space-node-mgr-protocol"
+version = "0.8.0"
+dependencies = [
+ "anyhow",
+ "pplx-space-common-core",
+ "pplx-space-common-proto-build",
  "pplx-space-execution-common",
  "prost",
- "thiserror 2.0.20",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
