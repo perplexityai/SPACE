@@ -325,8 +325,11 @@ apt-get install -y --no-install-recommends \
   curl \
   e2fsprogs \
   gpgv \
+  mount \
   squashfs-tools \
+  tar \
   ubuntu-keyring \
+  util-linux \
   wget
 source /workspace/inputs/rootfs-builder.env
 mkdir -p /space /space/etc/ssh

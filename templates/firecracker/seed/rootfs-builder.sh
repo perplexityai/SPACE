@@ -148,6 +148,74 @@ extract_verified_squashfs() (
   unsquashfs -d "${build_dir}/squashfs-root" "${image_dir}/image.squashfs"
 )
 
+check_ext4_for_resize() {
+  # A read-only check detects corruption without repairing it, but does not
+  # update lastcheck. Record success so resize2fs accepts a post-mount image.
+  e2fsck -fn "$1" || return
+  tune2fs -T now "$1"
+}
+
+# Populate through the kernel, rather than libext2fs's mke2fs -d path. In
+# particular, long symlinks must remain block-backed when inline_data is used:
+# libext2fs's inline symlinks can break fsck/resize after an xattr is added.
+populate_ext4() (
+  set -euo pipefail
+  local image="$1" source="$2" target mounts mount_path device attempt
+  source="$(realpath -e "$source")"
+  mounts="$(findmnt --raw --noheadings --output TARGET)"
+  while IFS= read -r mount_path; do
+    # findmnt --raw hex-escapes spaces and other unsafe path characters.
+    printf -v mount_path '%b' "$mount_path"
+    if [[ "$mount_path" == "$source" || "$mount_path" == "$source/"* ]]; then
+      echo "ERROR: seed source still contains a mount: ${mount_path}" >&2
+      exit 1
+    fi
+  done <<< "$mounts"
+  target="$(mktemp -d)"
+  # shellcheck disable=SC2329 # Invoked by the EXIT trap in this subshell.
+  cleanup_population() {
+    local status=$?
+    if mountpoint -q "$target" && ! umount "$target"; then
+      echo "ERROR: cannot unmount seed staging filesystem at ${target}" >&2
+      exit 1
+    fi
+    rmdir "$target"
+    exit "$status"
+  }
+  trap cleanup_population EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  # Container /dev is a snapshot of the nodes present at container startup.
+  # The loop driver can return a free index whose node is missing there.
+  # Select an index, create its node if needed, and ask mount to attach that
+  # exact device. Retry boundedly if another build claims it first. mount owns
+  # attachment cleanup on failure and autoclear on the successful unmount.
+  for attempt in {1..10}; do
+    device="$(losetup --find)"
+    # Newer util-linux labels a missing node as "(lost)".
+    device="${device% (lost)}"
+    if [[ ! "$device" =~ ^/dev/loop([0-9]+)$ ]]; then
+      echo "ERROR: unexpected loop device: ${device}" >&2
+      exit 1
+    fi
+    if [[ ! -b "$device" ]]; then
+      mknod -m 0600 "$device" b 7 "${BASH_REMATCH[1]}" || [[ -b "$device" ]]
+    fi
+    if mount -t ext4 -o "loop=$device" "$image" "$target"; then
+      break
+    fi
+  done
+  if ! mountpoint -q "$target"; then
+    echo "ERROR: cannot mount seed image after ${attempt} attempts" >&2
+    exit 1
+  fi
+  tar --create --file=- --numeric-owner --xattrs --xattrs-include='*' \
+    --acls --sparse --one-file-system --directory "$source" . \
+    | tar --extract --file=- --same-owner --preserve-permissions \
+      --numeric-owner --xattrs --xattrs-include='*' --acls --overwrite \
+      --directory "$target"
+)
+
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
   return
 fi
@@ -811,11 +879,13 @@ echo "=== Creating ext4 image ==="
 # to the configured build disk size before installing packages.
 IMG_SIZE="1024M"
 truncate -s "$IMG_SIZE" "${OUTPUT}/rootfs.ext4"
-mkfs.ext4 -O dir_nlink,large_dir -J size=4 -m 1 -d "${CHROOT}" -F "${OUTPUT}/rootfs.ext4"
+mkfs.ext4 -O dir_nlink,large_dir -J size=4 -m 1 -F "${OUTPUT}/rootfs.ext4"
+populate_ext4 "${OUTPUT}/rootfs.ext4" "${CHROOT}"
 
 # Shrink to minimum + 100 MB headroom (SSH host keys, logs, journal)
-e2fsck -fy "${OUTPUT}/rootfs.ext4" 2>/dev/null || true
+check_ext4_for_resize "${OUTPUT}/rootfs.ext4"
 resize2fs -M "${OUTPUT}/rootfs.ext4"
+check_ext4_for_resize "${OUTPUT}/rootfs.ext4"
 # Get actual filesystem size (resize2fs -M shrinks fs but not the file)
 FS_BLOCKS=$(dumpe2fs -h "${OUTPUT}/rootfs.ext4" 2>/dev/null | awk '/Block count:/{print $NF}')
 BLOCK_SIZE=$(dumpe2fs -h "${OUTPUT}/rootfs.ext4" 2>/dev/null | awk '/Block size:/{print $NF}')
@@ -828,6 +898,7 @@ HEADROOM=$(( 100 * 1024 * 1024 ))
 TARGET_SIZE=$(( FS_SIZE + HEADROOM ))
 truncate -s "$TARGET_SIZE" "${OUTPUT}/rootfs.ext4"
 resize2fs "${OUTPUT}/rootfs.ext4"
+e2fsck -fn "${OUTPUT}/rootfs.ext4"
 
 # ── Metadata ──────────────────────────────────────────────────────────────────
 cat > "${OUTPUT}/metadata.json" <<EOF
