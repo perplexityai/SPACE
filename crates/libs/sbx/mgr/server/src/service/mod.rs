@@ -159,6 +159,8 @@ const CLEANUP_RETRY_INITIAL_DELAY_SECS: u64 = 1;
 const CLEANUP_RETRY_MAX_DELAY_SECS: u64 = 30;
 const TEARDOWN_SUSPEND_DRIVER_CONCURRENCY: usize = 4;
 const FORK_COPY_CONCURRENCY: usize = 1;
+const FORK_COPY_MAX_QUEUED: usize = 4;
+const FORK_COPY_MAX_WAIT: Duration = Duration::from_secs(5);
 
 const RESUME_CLOCK_SYNC_TIMEOUT: Duration = Duration::from_secs(5);
 // Foreground Stats should promptly fall back to recorded counters when the
@@ -391,9 +393,9 @@ pub struct SandboxManagerService {
     /// semaphore returns `Pending` to the shim, whose next poll retries
     /// admission without leaving an unbounded queue of tasks on this node.
     teardown_suspend_driver_sem: Arc<tokio::sync::Semaphore>,
-    /// Node-wide admission for durable artifact copies. The default remains
-    /// one copy at a time, while operators can tune the capacity explicitly.
-    fork_copy_sem: Arc<tokio::sync::Semaphore>,
+    /// Copies share one active slot and a bounded, deadline-limited queue.
+    /// Busy callers retry their durable operation before staging any data.
+    fork_copy_slots: pplx_space_common_grpc::QueuedSlots,
     fork_copy_waiting: Arc<AtomicUsize>,
     fork_copy_active: Arc<AtomicUsize>,
     /// In-flight operation staging roots owned by this service instance. The
@@ -1787,7 +1789,10 @@ impl SandboxManagerService {
             teardown_suspend_driver_sem: Arc::new(tokio::sync::Semaphore::new(
                 teardown_suspend_driver_concurrency,
             )),
-            fork_copy_sem: Arc::new(tokio::sync::Semaphore::new(FORK_COPY_CONCURRENCY)),
+            fork_copy_slots: pplx_space_common_grpc::QueuedSlots::new(Arc::new(
+                tokio::sync::Semaphore::new(FORK_COPY_CONCURRENCY),
+            ))
+            .with_queue(FORK_COPY_MAX_QUEUED, FORK_COPY_MAX_WAIT),
             fork_copy_waiting: Arc::new(AtomicUsize::new(0)),
             fork_copy_active: Arc::new(AtomicUsize::new(0)),
             active_fork_copy_operations: Arc::new(

@@ -832,10 +832,14 @@ class EcwSandboxCollection(SandboxCollection):
         *,
         idempotency_key: str | None = None,
         timeout: int | None = None,
+        request_timeout: float | None = None,
     ) -> EcwForkResult:
         """Fork a run-owned source with child cleanup armed before dispatch."""
 
-        return self._sandboxes.fork(source, idempotency_key=idempotency_key, timeout=timeout)
+        return self._sandboxes.fork(
+            source, idempotency_key=idempotency_key, timeout=timeout,
+            request_timeout=request_timeout,
+        )
 
 
 @dataclass(frozen=True)

@@ -751,6 +751,7 @@ class _ScenarioSandboxes:
         *,
         idempotency_key: str | None = None,
         timeout: int | None = None,
+        request_timeout: float | None = None,
     ) -> EcwForkResult:
         """Track a fork before attaching its data plane, including replayed children."""
 
@@ -783,7 +784,9 @@ class _ScenarioSandboxes:
             if not child_ids:
                 # Replay the original operation, never create a replacement.
                 # Child expiry inherits the source's lifecycle and may pause.
-                record_child(forkable.fork_response(timeout=lifetime, idempotency_key=key))
+                record_child(forkable.fork_response(
+                    timeout=lifetime, idempotency_key=key, request_timeout=request_timeout,
+                ))
             for child_id in child_ids:
                 retry_sandbox_delete(lambda: forkable.delete_forked(child_id))
                 if self._after_teardown_delete is not None:
@@ -792,7 +795,9 @@ class _ScenarioSandboxes:
         # A lost response still leaves an operation recoverable by this key.
         # Record its child before SDK construction, which can also fail.
         compensation = self._context.scope.defer("delete fork child", cleanup, critical=True)
-        response = forkable.fork_response(timeout=lifetime, idempotency_key=key)
+        response = forkable.fork_response(
+            timeout=lifetime, idempotency_key=key, request_timeout=request_timeout,
+        )
         record_child(response)
         child = self._ecw.attach_fork(response)
         self._created.append(child)

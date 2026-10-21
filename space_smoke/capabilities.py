@@ -975,7 +975,8 @@ class ForkableSandbox(Protocol):
     """
 
     def fork_response(
-        self, *, timeout: int, idempotency_key: str | None = None
+        self, *, timeout: int, idempotency_key: str | None = None,
+        request_timeout: float | None = None,
     ) -> Mapping[str, Any]:
         """The public fork result, including child data-plane credentials."""
         ...
@@ -1089,6 +1090,7 @@ class EcwScenarioSandboxes(Protocol):
         *,
         idempotency_key: str | None = None,
         timeout: int | None = None,
+        request_timeout: float | None = None,
     ) -> EcwForkResult: ...
 
     def attempt_create(
