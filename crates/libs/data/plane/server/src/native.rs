@@ -508,6 +508,9 @@ pub(super) async fn proxy_session(
     if is_upgrade_request(request.headers()) && state.drain_started.is_cancelled() {
         return Ok(native_draining_response(session_id.kind().as_str()));
     }
+    // Counted from here, through route resolution and the ingress open, until
+    // the response ends: a scale-in cuts a request that is still preparing too.
+    let in_flight = state.ingress_requests.track();
     let mut preparation = pplx_space_metrics::data_plane::IngressPreparationObservation::default();
     let mut waiter =
         pplx_space_common_svc::ingress_admission::IngressPreparationPermit::acquire(None)
@@ -549,6 +552,8 @@ pub(super) async fn proxy_session(
     } else {
         None
     };
+    // An upgrade is counted by its stream permit from here on, not twice.
+    let in_flight = upgrade_stream_permit.is_none().then_some(in_flight);
     let proxied_path = request.uri().path().to_string();
     let downstream_upgrade = if upgrade_stream_permit.is_some() {
         Some(hyper::upgrade::on(&mut request))
@@ -614,6 +619,11 @@ pub(super) async fn proxy_session(
     if upgrade_stream_permit.is_some() {
         ingress_io.track_transport_progress();
     }
+    if let Some(in_flight) = in_flight {
+        // A plain request holds no stream permit; keep it counted for the
+        // stream-load report until its response ends or its client goes away.
+        completion.hold(in_flight);
+    }
     let request = request.map(|body| completion.body(body));
     let (mut sender, connection) =
         http1::handshake(TokioIo::new(ingress_io))
@@ -640,6 +650,11 @@ pub(super) async fn proxy_session(
         } else {
             None
         };
+    if upgrade_stream_permit.is_some() && upstream_upgrade.is_none() {
+        // An upgrade the sandbox declined is answered as a plain response; its
+        // permit goes with this handler, so count the response instead.
+        completion.hold(state.ingress_requests.track());
+    }
 
     if attached.kind == SessionKind::Protocol
         && upstream_upgrade.is_none()

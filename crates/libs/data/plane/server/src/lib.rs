@@ -95,6 +95,7 @@ mod native;
 use ingress_lifetime::{Completion, IngressIo, Progress};
 mod runtime_route;
 mod state;
+mod stream_load;
 mod upload_admission;
 use upload_admission::UploadAdmission;
 pub use upload_admission::{
@@ -214,6 +215,9 @@ fn record_ecw_backend_rpc_latency(
 #[derive(Debug, Clone)]
 pub struct DataPlaneConfig {
     pub listen: String,
+    /// Address of the internal stream-load listener, or `None` to serve none.
+    /// Keep it off the public Service; see [`stream_load`].
+    pub internal_listen: Option<String>,
     pub attach_deadline: Duration,
     pub unauthenticated_upgrade_cap_per_ip: usize,
     pub max_attached_streams: usize,
@@ -239,6 +243,7 @@ impl Default for DataPlaneConfig {
     fn default() -> Self {
         Self {
             listen: DEFAULT_LISTEN.to_string(),
+            internal_listen: None,
             attach_deadline: Duration::from_millis(DEFAULT_ATTACH_DEADLINE_MS),
             unauthenticated_upgrade_cap_per_ip: DEFAULT_UNAUTHENTICATED_UPGRADE_CAP_PER_IP,
             max_attached_streams: DEFAULT_MAX_ATTACHED_STREAMS,
@@ -259,6 +264,8 @@ struct DataPlaneState {
     attach_deadline: Duration,
     unauthenticated: Arc<UnauthenticatedUpgradeLimiter>,
     attached_streams: Arc<AttachedStreamLimiter>,
+    /// Plain service-port HTTP requests in flight, for the stream-load report.
+    ingress_requests: Arc<stream_load::InFlightIngressRequests>,
     uploads: Option<Arc<UploadAdmission>>,
     upload_tracker: Arc<http_traffic::UploadTracker>,
     native_sessions: Arc<NativeSessionAttachLimiter>,
@@ -436,6 +443,7 @@ pub async fn run(
         config.max_attached_streams_per_org,
         config.max_attached_streams_per_sandbox,
     ));
+    let ingress_requests = Arc::new(stream_load::InFlightIngressRequests::default());
     let state = DataPlaneState {
         cluster_api,
         attach_deadline: config.attach_deadline,
@@ -443,6 +451,7 @@ pub async fn run(
             config.unauthenticated_upgrade_cap_per_ip,
         )),
         attached_streams: Arc::clone(&attached_streams),
+        ingress_requests: Arc::clone(&ingress_requests),
         uploads: config
             .upload_admission
             .as_ref()
@@ -472,6 +481,21 @@ pub async fn run(
         "attached streams keep a confirmed revocation verdict through failed checks \
          for up to the revocation tolerance"
     );
+    // Bind before the public listener so a bad internal address fails startup
+    // instead of leaving a replica that serves traffic but never reports load.
+    let internal_listener = match &config.internal_listen {
+        Some(listen) => Some((
+            tokio::net::TcpListener::bind(listen)
+                .await
+                .map_err(|source| RunDataPlaneError::Bind {
+                    listen: listen.clone(),
+                    source,
+                })?,
+            listen,
+        )),
+        None => None,
+    };
+
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
@@ -480,8 +504,25 @@ pub async fn run(
             source,
         })?;
     tracing::info!(listen = %config.listen, "space-data-plane-svc listening");
+    // A dead internal listener is logged, not fatal: the cluster controller then
+    // ranks this replica as busy, which only errs toward removing it last, while
+    // shutting it down would cut every stream it holds. It stops with the
+    // process's stop signal, or once serving ends for any other reason, so the
+    // wait for it below can't hang.
+    let internal_stop = shutdown_token.child_token();
+    let internal_task = internal_listener.map(|(internal_listener, listen)| {
+        tracing::info!(listen = %listen, "space-data-plane-svc internal stream-load listener");
+        stream_load::spawn_internal(
+            internal_listener,
+            stream_load::StreamLoadSources {
+                streams: Arc::clone(&attached_streams),
+                ingress_requests: Arc::clone(&ingress_requests),
+            },
+            internal_stop.clone(),
+        )
+    });
 
-    serve_and_drain(
+    let served = serve_and_drain(
         data_plane_listener(listener),
         app,
         DrainLifecycle {
@@ -494,7 +535,16 @@ pub async fn run(
         },
     )
     .await
-    .map_err(RunDataPlaneError::Serve)
+    .map_err(RunDataPlaneError::Serve);
+
+    internal_stop.cancel();
+    if let Some(task) = internal_task
+        && let Err(error) = task.await
+    {
+        tracing::warn!(%error, "data-plane internal stream-load supervisor task failed");
+    }
+
+    served
 }
 
 /// How long an accepted connection may sit idle before its first keepalive
@@ -861,6 +911,9 @@ async fn ecw_service_proxy(
     if is_upgrade_request(request.headers()) {
         refuse_new_ecw_stream_while_draining(&state, ECW_SERVICE_STREAM_KIND)?;
     }
+    // Counted from here, through route resolution and the ingress open, until
+    // the response ends: a scale-in cuts a request that is still preparing too.
+    let in_flight = state.ingress_requests.track();
 
     pplx_space_metrics::data_plane::service_route_transport(
         ServiceRouteSurface::Ecw,
@@ -936,7 +989,15 @@ async fn ecw_service_proxy(
     let (route, ingress_io) = prepared?;
     preparation.ready();
     drop(preparation);
-    ecw_service_proxy_via_service_port_ingress(state, target, route, request, Ok(ingress_io)).await
+    ecw_service_proxy_via_service_port_ingress(
+        state,
+        target,
+        route,
+        request,
+        Ok(ingress_io),
+        in_flight,
+    )
+    .await
 }
 
 async fn ecw_service_proxy_via_service_port_ingress(
@@ -945,10 +1006,12 @@ async fn ecw_service_proxy_via_service_port_ingress(
     route: EcwResolvedRoute,
     request: Request<Body>,
     ingress_open: Result<IngressIo, ServicePortIngressOpenError>,
+    in_flight: stream_load::InFlightIngressRequest,
 ) -> Result<Response, EcwProxyError> {
     match ingress_open {
         Ok(ingress_io) => {
-            ecw_service_ingress_proxy_with_io(state, target, route, request, ingress_io).await
+            ecw_service_ingress_proxy_with_io(state, target, route, request, ingress_io, in_flight)
+                .await
         }
         Err(ServicePortIngressOpenError {
             error,
@@ -985,6 +1048,7 @@ async fn ecw_service_ingress_proxy_with_io(
     route: EcwResolvedRoute,
     mut request: Request<Body>,
     mut ingress_io: IngressIo,
+    in_flight: stream_load::InFlightIngressRequest,
 ) -> Result<Response, EcwProxyError> {
     rewrite_ecw_service_ingress_request(&mut request)?;
     let upgrade_stream_permit = if is_upgrade_request(request.headers()) {
@@ -992,6 +1056,8 @@ async fn ecw_service_ingress_proxy_with_io(
     } else {
         None
     };
+    // An upgrade is counted by its stream permit from here on, not twice.
+    let in_flight = upgrade_stream_permit.is_none().then_some(in_flight);
     let downstream_upgrade = if upgrade_stream_permit.is_some() {
         Some(hyper::upgrade::on(&mut request))
     } else {
@@ -1000,6 +1066,11 @@ async fn ecw_service_ingress_proxy_with_io(
     let completion = ingress_io.take_completion();
     if upgrade_stream_permit.is_some() {
         ingress_io.track_transport_progress();
+    }
+    if let Some(in_flight) = in_flight {
+        // A plain request holds no stream permit; keep it counted for the
+        // stream-load report until its response ends or its client goes away.
+        completion.hold(in_flight);
     }
     let request = request.map(|body| completion.body(body));
     let (mut sender, connection) =
@@ -1047,6 +1118,11 @@ async fn ecw_service_ingress_proxy_with_io(
         } else {
             None
         };
+    if upgrade_stream_permit.is_some() && upstream_upgrade.is_none() {
+        // An upgrade the sandbox declined is answered as a plain response; its
+        // permit goes with this handler, so count the response instead.
+        completion.hold(state.ingress_requests.track());
+    }
     let response = response.map(|body| completion.body(Body::new(body)));
     if let (Some(downstream_upgrade), Some(upstream_upgrade), Some(stream_permit)) =
         (downstream_upgrade, upstream_upgrade, upgrade_stream_permit)
@@ -1827,5 +1903,7 @@ fn optional_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
         .filter(|value| !value.is_empty())
 }
 
+#[cfg(test)]
+mod ingress_request_count_tests;
 #[cfg(test)]
 mod tests;

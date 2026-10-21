@@ -56,6 +56,7 @@ pub mod byok;
 pub mod cluster_reconciler;
 pub mod credmgr;
 pub mod data_plane;
+pub mod data_plane_deletion_cost;
 pub mod db;
 pub mod feature_flags;
 pub mod gateway;

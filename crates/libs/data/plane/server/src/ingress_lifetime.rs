@@ -53,24 +53,44 @@ impl Progress {
     }
 }
 
-struct CompletionInner(CancellationToken);
+struct CompletionInner {
+    done: CancellationToken,
+    /// Dropped with the last `Completion` clone: when the response body ends,
+    /// errors, or is dropped because the client went away, or when progress
+    /// times out. See [`Completion::hold`].
+    held: Mutex<Option<crate::stream_load::InFlightIngressRequest>>,
+}
 impl Drop for CompletionInner {
     fn drop(&mut self) {
-        self.0.cancel();
+        self.done.cancel();
     }
 }
 
 #[derive(Clone)]
 pub(super) struct Completion {
-    _owner: Arc<CompletionInner>,
+    owner: Arc<CompletionInner>,
     pub progress: Progress,
 }
 impl Completion {
     pub fn new(done: CancellationToken, progress: Progress) -> Self {
         Self {
-            _owner: Arc::new(CompletionInner(done)),
+            owner: Arc::new(CompletionInner {
+                done,
+                held: Mutex::new(None),
+            }),
             progress,
         }
+    }
+    /// Keep `request` counted for as long as this request owns the ingress:
+    /// until the response body finishes, errors, or is dropped (a client
+    /// disconnect), or progress times out. A second call replaces the first,
+    /// so a request is never counted twice.
+    pub fn hold(&self, request: crate::stream_load::InFlightIngressRequest) {
+        *self
+            .owner
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(request);
     }
     pub fn body(&self, body: Body) -> Body {
         Body::new(OwnedBody {

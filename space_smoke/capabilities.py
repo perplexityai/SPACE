@@ -590,6 +590,31 @@ class CensusPublication:
     reported: int
 
 
+class DataPlaneDeletionCostObserver(Protocol):
+    """Kind-only, read-only view of the data plane's scale-in ordering.
+
+    The cluster controller writes `controller.kubernetes.io/pod-deletion-cost`
+    on each Ready data-plane pod from the pod's internal stream-load report;
+    the observable is that annotation as the apiserver holds it.
+    """
+
+    def data_plane_deletion_costs(self) -> dict[str, str | None]:
+        """Ready, non-terminating data-plane pods by name, with the annotation value or None."""
+        ...
+
+    def data_plane_stream_loads(self) -> dict[str, int | None]:
+        """Each Ready data-plane pod's own count of connections a scale-in would
+        cut (attached streams plus in-flight plain requests), from its
+        internal stream-load report read through the apiserver pod proxy; None
+        when unreadable.
+
+        Says which pod really holds the stream the annotation is ranking, and
+        whether a pod that did not settle to cost 0 holds a leftover connection
+        or the writer lagged.
+        """
+        ...
+
+
 class PendingBackupControl(Protocol):
     """Kind-only operations for the pending-backup census scenario.
 

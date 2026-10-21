@@ -113,6 +113,10 @@ The render fails, listing every gap, unless the file supplies:
   public EC2 name. `templates/validate.yaml` refuses it on. The
   reconcile-queue GC (`SPACE_RECONCILE_QUEUE_GC_ENABLED`), which Kind runs
   against that fake, stays off as it ships.
+- The data-plane deletion-cost reconciler, its pod `patch` grant, and the
+  data plane's internal stream-load listener are off. Enable them together:
+  `SPACE_DATA_PLANE_DELETION_COST_ENABLED` on the controller and a data-plane
+  `internalPort`.
 
 The Kind bring-up also passes `space-api-local`'s `values-kind.yaml`, which
 holds bench-only settings that are not test hooks, such as a 45 s

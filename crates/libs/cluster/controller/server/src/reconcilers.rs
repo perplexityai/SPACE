@@ -23,6 +23,7 @@ use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
 use crate::admin_audit_retention;
+use crate::data_plane_deletion_cost;
 use crate::data_plane_session_retention;
 use crate::drained_node_terminator;
 use crate::execution_materialization_backfill;
@@ -502,6 +503,20 @@ pub async fn run_reconcilers(
             handles.push(tokio::spawn(node_service_readiness::run(
                 kube.clone(),
                 node_service_readiness::ReconcilerConfig::from_env(),
+                shutdown_token.child_token(),
+            )));
+
+            // Data-plane deletion cost: annotates each Ready data-plane pod
+            // with `controller.kubernetes.io/pod-deletion-cost` bucketed from
+            // its connections (attached streams plus in-flight service-port
+            // requests), so a scale-in removes the replicas with the fewest
+            // connections first. Reads each pod's internal stream-load
+            // listener; the data plane itself gets no pod write access. Best
+            // effort, and default-disabled via
+            // `SPACE_DATA_PLANE_DELETION_COST_ENABLED`.
+            handles.push(tokio::spawn(data_plane_deletion_cost::run(
+                kube.clone(),
+                data_plane_deletion_cost::ReconcilerConfig::from_env(),
                 shutdown_token.child_token(),
             )));
 

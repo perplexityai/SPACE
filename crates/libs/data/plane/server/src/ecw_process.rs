@@ -554,6 +554,9 @@ pub(super) async fn process_stream_input(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Json<EmptyUnaryConnectResponseE2b>, EcwProxyError> {
+    // Streamed input holds no stream permit, yet stays open as long as its
+    // client keeps sending; it counts while this handler runs.
+    let _in_flight = state.ingress_requests.track();
     let streaming = is_connect_json_stream_request(&headers);
     // A streamed input request stays open as long as its client keeps
     // sending, so the drain treats it as a stream; the unary form is served.

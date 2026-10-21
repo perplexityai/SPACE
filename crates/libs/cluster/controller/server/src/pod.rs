@@ -82,5 +82,77 @@ pub(crate) fn pod_ready(conditions: Option<&[k8s_openapi::api::core::v1::PodCond
         .any(|condition| condition.type_ == "Ready" && condition.status == "True")
 }
 
+/// A label-scoped pod reflector plus a flag that turns true once its initial
+/// `LIST` has populated the store. `Store` has no synchronous readiness check,
+/// and acting on a cold store would read as "no pods", so reconcilers gate each
+/// tick on the flag. `name` labels the reflector's log lines. Both spawned
+/// tasks stop when `cancel` fires, so the watch ends with the reconciler that
+/// owns it.
+pub(crate) fn spawn_labeled_pod_reflector(
+    api: kube::Api<Pod>,
+    selector: &str,
+    name: &'static str,
+    cancel: tokio_util::sync::CancellationToken,
+) -> (
+    kube::runtime::reflector::Store<Pod>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use futures_util::StreamExt;
+    use kube::runtime::{WatchStreamExt, reflector, watcher};
+
+    let (store, writer) = reflector::store::<Pod>();
+    let stream = reflector::reflector(
+        writer,
+        watcher::watcher(api, watcher::Config::default().labels(selector)),
+    )
+    .default_backoff();
+    let watch_cancel = cancel.clone();
+    tokio::spawn(async move {
+        futures_util::pin_mut!(stream);
+        loop {
+            let event = tokio::select! {
+                _ = watch_cancel.cancelled() => {
+                    tracing::info!(reflector = name, "pod reflector stopped");
+                    return;
+                }
+                event = stream.next() => event,
+            };
+            match event {
+                Some(Err(error)) => tracing::warn!(reflector = name, %error, "watcher error"),
+                Some(Ok(_)) => {}
+                None => break,
+            }
+        }
+        tracing::warn!(reflector = name, "watcher stream ended");
+    });
+
+    let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ready_flag = ready.clone();
+    let ready_store = store.clone();
+    tokio::spawn(async move {
+        let synced = tokio::select! {
+            _ = cancel.cancelled() => return,
+            synced = ready_store.wait_until_ready() => synced,
+        };
+        match synced {
+            Ok(()) => {
+                ready_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                tracing::info!(
+                    reflector = name,
+                    pod_count = ready_store.len(),
+                    "pod reflector initial sync complete"
+                );
+            }
+            Err(error) => tracing::warn!(
+                reflector = name,
+                %error,
+                "pod reflector writer dropped before initial sync; readiness stays \
+                 false until the process restarts"
+            ),
+        }
+    });
+    (store, ready)
+}
+
 #[cfg(test)]
 mod tests;
