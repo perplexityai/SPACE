@@ -328,7 +328,7 @@ fn update_checks_vcpu_and_memory() {
 }
 
 #[test]
-fn idempotency_key_is_visible_ascii_within_the_cap() {
+fn idempotency_key_is_header_text_within_the_cap() {
     let at_max = "k".repeat(MAX_IDEMPOTENCY_KEY_BYTES);
     assert_eq!(
         validate_idempotency_key(at_max.as_bytes()),
@@ -343,10 +343,17 @@ fn idempotency_key_is_visible_ascii_within_the_cap() {
         validate_idempotency_key(b""),
         Err(IdempotencyKeyError::Empty)
     );
+    for accepted in ["!~", "two words", "tab\tseparated"] {
+        assert_eq!(
+            validate_idempotency_key(accepted.as_bytes()),
+            Ok(accepted),
+            "{accepted:?}"
+        );
+    }
     for invalid in [
-        &b"a b"[..],
-        b"a\tb",
-        b"a\0b",
+        &b"a\0b"[..],
+        b"a\x01b",
+        b"a\rb",
         b"a\x7fb",
         "ключ".as_bytes(),
         b"\xff",

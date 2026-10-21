@@ -1208,6 +1208,7 @@ fn public_sandbox_row(created_at: OffsetDateTime, id: SandboxId) -> PublicSandbo
         auto_lifecycle: SqlJson(AutoLifecyclePolicy::disabled()),
         created_at,
         updated_at: created_at,
+        has_next: false,
     }
 }
 
@@ -1677,6 +1678,15 @@ async fn idempotency_key_distinguishes_missing_from_invalid() {
         max
     );
 
+    for accepted in ["two words", "tab\tseparated"] {
+        assert_eq!(
+            idempotency_key(&with_key(HeaderValue::from_static(accepted)))
+                .unwrap()
+                .as_str(),
+            accepted
+        );
+    }
+
     let cases = [
         (HeaderMap::new(), "Idempotency-Key header is required"),
         (
@@ -1685,11 +1695,7 @@ async fn idempotency_key_distinguishes_missing_from_invalid() {
         ),
         (
             with_key(HeaderValue::from_bytes("clé".as_bytes()).unwrap()),
-            "Idempotency-Key must contain only visible ASCII characters",
-        ),
-        (
-            with_key(HeaderValue::from_static("two words")),
-            "Idempotency-Key must contain only visible ASCII characters",
+            "Idempotency-Key must contain only printable ASCII characters, spaces and tabs",
         ),
         (
             with_key(HeaderValue::from_static("")),
@@ -1703,60 +1709,114 @@ async fn idempotency_key_distinguishes_missing_from_invalid() {
     }
 }
 
-/// A row whose metadata fills its byte limits with control characters, each
-/// of which JSON escapes to six bytes: the largest row capped input allows.
-fn escaped_metadata_row(created_at: OffsetDateTime, id: SandboxId) -> PublicSandboxRow {
-    let metadata = (0..16)
-        .map(|index| {
-            (
-                format!("{index:0>4}"),
-                SandboxMetadataValue::String("\u{1}".repeat(1020)),
-            )
-        })
-        .collect();
-    PublicSandboxRow {
-        name: Some("\u{1}".repeat(pplx_space_public_api::limits::MAX_SANDBOX_NAME_BYTES)),
-        metadata: SqlJson(metadata),
-        ..public_sandbox_row(created_at, id)
-    }
-}
-
 #[test]
-fn sandboxes_page_stops_at_its_byte_budget() {
-    let base = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
-    let rows = (0..i64::from(MAX_SANDBOX_LIST_LIMIT) + 1)
-        .map(|index| escaped_metadata_row(base - time::Duration::seconds(index), SandboxId::new()))
-        .collect::<Vec<_>>();
-    let positions = rows
-        .iter()
-        .map(|row| (row.created_at, row.id))
-        .collect::<Vec<_>>();
-
-    let page = sandboxes_page(rows, MAX_SANDBOX_LIST_LIMIT).unwrap();
-
-    let page_bytes = serde_json::to_vec(&page).unwrap().len();
-    assert!(
-        page_bytes <= MAX_SANDBOX_LIST_PAGE_BYTES + 1024,
-        "{page_bytes}"
-    );
-    assert!(page.data.len() < usize::from(MAX_SANDBOX_LIST_LIMIT));
-    assert!(!page.data.is_empty());
-    let cursor = page.next_cursor.expect("a cut page continues");
-    let resumes_after =
-        parse_sandbox_cursor(&decode_cursor(CursorKind::Sandbox, cursor.as_str()).unwrap())
-            .unwrap();
-    assert_eq!(resumes_after, positions[page.data.len() - 1]);
-}
-
-#[test]
-fn sandboxes_page_keeps_one_sandbox_over_the_budget() {
+fn sandboxes_page_continues_after_a_budget_cut() {
     let created_at = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+    let last_id = SandboxId::new();
+    let rows = |has_next| {
+        vec![
+            public_sandbox_row(created_at, SandboxId::new()),
+            PublicSandboxRow {
+                has_next,
+                ..public_sandbox_row(created_at - time::Duration::seconds(1), last_id)
+            },
+        ]
+    };
+
+    let cut = sandboxes_page(rows(true), 100).unwrap();
+    assert_eq!(cut.data.len(), 2);
+    let cursor = cut.next_cursor.expect("a cut page continues");
+    assert_eq!(
+        parse_sandbox_cursor(&decode_cursor(CursorKind::Sandbox, cursor.as_str()).unwrap())
+            .unwrap(),
+        (created_at - time::Duration::seconds(1), last_id)
+    );
+    assert!(
+        sandboxes_page(rows(false), 100)
+            .unwrap()
+            .next_cursor
+            .is_none()
+    );
+}
+
+/// Inserts a sandbox directly, as one stored before the input limits could
+/// be, with a single metadata string of `metadata_bytes` bytes.
+async fn insert_legacy_sandbox(
+    pool: &PgPool,
+    created_at: OffsetDateTime,
+    metadata_bytes: usize,
+) -> TestDbResult<SandboxId> {
     let id = SandboxId::new();
-    let mut row = escaped_metadata_row(created_at, id);
-    row.name = Some("\u{1}".repeat(MAX_SANDBOX_LIST_PAGE_BYTES));
+    let metadata = serde_json::json!({ "legacy": "m".repeat(metadata_bytes) });
+    sqlx::query(pplx_space_common_core::sql!(
+        "INSERT INTO sandboxes (
+             id, user_id, org_id, lifecycle, created_at, metadata,
+             network_policy_override_json, network_policy_generation
+         ) VALUES ($1, $2, $3, 'stopped', $4, $5, $6, 1)"
+    ))
+    .bind(id)
+    .bind(SEED_USER_ID)
+    .bind(SEED_ORG_ID)
+    .bind(created_at)
+    .bind(SqlJson(metadata))
+    .bind(SqlJson(&pplx_space_net_common::NetworkPolicyV1::default()))
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
 
-    let page = sandboxes_page(vec![row], 1).unwrap();
+/// Rows stored before the metadata limits still page within the byte
+/// budget: Postgres returns no more than the budget (or one oversized row),
+/// and following the cursor visits every row once.
+#[tokio::test]
+async fn sandbox_list_query_bounds_the_bytes_it_returns() -> TestDbResult<()> {
+    const MIB: usize = 1024 * 1024;
+    let db = pg_test_db().await?;
+    let org_id = OrgId::from_uuid(SEED_ORG_ID);
+    let newest = OffsetDateTime::from_unix_timestamp(1_800_000_000)?;
+    // Newest first: one row over the whole budget, twelve 1 MiB rows, then
+    // three small ones.
+    let sizes = std::iter::once(9 * MIB)
+        .chain(std::iter::repeat_n(MIB, 12))
+        .chain(std::iter::repeat_n(16, 3));
+    let mut expected = Vec::new();
+    for (offset, size) in sizes.enumerate() {
+        let created_at = newest - time::Duration::seconds(offset as i64);
+        expected.push(insert_legacy_sandbox(&db.pool, created_at, size).await?);
+    }
 
-    assert_eq!(page.data.len(), 1);
-    assert!(page.next_cursor.is_none());
+    let mut pages = Vec::new();
+    let mut cursor = None;
+    loop {
+        let rows =
+            fetch_sandboxes_page(&db.pool, org_id, None, cursor, MAX_SANDBOX_LIST_LIMIT).await?;
+        let metadata_bytes = rows
+            .iter()
+            .map(|row| serde_json::to_vec(&row.metadata.0).unwrap().len())
+            .sum::<usize>();
+        if rows.len() > 1 {
+            assert!(
+                metadata_bytes <= MAX_SANDBOX_LIST_PAGE_BYTES as usize,
+                "{metadata_bytes}"
+            );
+        }
+        let ids = rows.iter().map(|row| row.id).collect::<Vec<_>>();
+        let page = sandboxes_page(rows, MAX_SANDBOX_LIST_LIMIT).unwrap();
+        pages.push(ids);
+        let Some(next) = page.next_cursor else {
+            break;
+        };
+        cursor = Some(
+            parse_sandbox_cursor(&decode_cursor(CursorKind::Sandbox, next.as_str()).unwrap())
+                .unwrap(),
+        );
+    }
+
+    // The oversized row comes back alone; 1 MiB rows fit seven to a page.
+    assert_eq!(
+        pages.iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![1, 7, 8]
+    );
+    assert_eq!(pages.concat(), expected);
+    Ok(())
 }
