@@ -580,8 +580,9 @@ impl PublicOperationStore {
         let kind = input.kind;
         let target_type = input.target_type.clone();
         let mut tx = self.pool.begin().await?;
-        let result = create_operation_tx(&mut tx, input).await?;
+        let (result, superseded) = create_operation_tx(&mut tx, input).await?;
         tx.commit().await?;
+        superseded.record();
         if matches!(result, CreatePublicOperationResult::Created(_)) {
             pplx_space_metrics::operations::created(
                 api_product.as_str(),
@@ -635,7 +636,7 @@ impl PublicOperationStore {
                 OperationId::from_uuid(operation_id),
             ));
         }
-        let result = create_operation_tx(
+        let (result, superseded) = create_operation_tx(
             &mut tx,
             CreatePublicOperation {
                 org_id,
@@ -651,6 +652,7 @@ impl PublicOperationStore {
         )
         .await?;
         tx.commit().await?;
+        superseded.record();
         if matches!(result, CreatePublicOperationResult::Created(_)) {
             pplx_space_metrics::operations::created(
                 ApiProduct::Native.as_str(),
@@ -722,7 +724,8 @@ impl PublicOperationStore {
         let target_type = input.target_type.clone();
 
         let mut tx = self.pool.begin().await?;
-        let operation_id = match create_operation_tx(&mut tx, input).await? {
+        let (created, superseded) = create_operation_tx(&mut tx, input).await?;
+        let operation_id = match created {
             CreatePublicOperationResult::Created(operation_id) => operation_id,
             CreatePublicOperationResult::Existing(operation_id) => {
                 tx.commit().await?;
@@ -745,6 +748,7 @@ impl PublicOperationStore {
         };
         let (claim_token, operation) = claim_created_operation_tx(&mut tx, operation_id).await?;
         tx.commit().await?;
+        superseded.record();
 
         pplx_space_metrics::operations::created(
             api_product.as_str(),
@@ -838,6 +842,19 @@ impl PublicOperationStore {
         expiry: impl Fn(&OverdueQueuedPublicOperation) -> ExpirePublicOperation,
     ) -> Result<Vec<OverdueQueuedPublicOperation>, PublicOperationStoreError> {
         expire_overdue_queued_operations(&self.pool, input, expiry).await
+    }
+
+    /// Cancel a claimed create, instead of requeueing it, if a delete of its
+    /// sandbox was requested after it and is still active, so the delete
+    /// need not wait out the create's retries and the create never runs
+    /// after it. Returns the superseding delete; `None` leaves the create
+    /// to be recorded as usual.
+    pub async fn cancel_claimed_create_superseded_by_delete(
+        &self,
+        claim_token: &str,
+        create_id: OperationId,
+    ) -> Result<Option<OperationId>, PublicOperationStoreError> {
+        cancel_claimed_create_superseded_by_delete(&self.pool, claim_token, create_id).await
     }
 
     pub async fn release_claimed_operation(
@@ -1067,8 +1084,9 @@ impl PublicOperationAdmission {
         let api_product = input.api_product;
         let kind = input.kind;
         let target_type = input.target_type.clone();
-        let result = create_operation_tx(&mut self.tx, input).await?;
+        let (result, superseded) = create_operation_tx(&mut self.tx, input).await?;
         self.tx.commit().await?;
+        superseded.record();
         if matches!(result, CreatePublicOperationResult::Created(_)) {
             pplx_space_metrics::operations::created(
                 api_product.as_str(),
@@ -1104,12 +1122,13 @@ impl PublicOperationAdmission {
         let api_product = input.api_product;
         let kind = input.kind;
         let target_type = input.target_type.clone();
-        let result = create_operation_tx(&mut self.tx, input).await?;
+        let (result, superseded) = create_operation_tx(&mut self.tx, input).await?;
         if !matches!(result, CreatePublicOperationResult::Created(_)) {
             self.tx.rollback().await?;
             return Ok(result);
         }
         self.tx.commit().await?;
+        superseded.record();
         pplx_space_metrics::operations::created(
             api_product.as_str(),
             kind.as_str(),
@@ -1132,7 +1151,8 @@ impl PublicOperationAdmission {
         let api_product = input.api_product;
         let kind = input.kind;
         let target_type = input.target_type.clone();
-        let operation_id = match create_operation_tx(&mut self.tx, input).await? {
+        let (created, superseded) = create_operation_tx(&mut self.tx, input).await?;
+        let operation_id = match created {
             CreatePublicOperationResult::Created(operation_id) => operation_id,
             CreatePublicOperationResult::Existing(operation_id) => {
                 self.tx.rollback().await?;
@@ -1156,6 +1176,7 @@ impl PublicOperationAdmission {
         let (claim_token, operation) =
             claim_created_operation_tx(&mut self.tx, operation_id).await?;
         self.tx.commit().await?;
+        superseded.record();
         pplx_space_metrics::operations::created(
             api_product.as_str(),
             kind.as_str(),
@@ -1456,10 +1477,29 @@ impl PublicOperationGcReport {
     }
 }
 
+/// Creates that a delete created in a transaction canceled, to be counted
+/// once that transaction commits.
+#[must_use]
+#[derive(Debug, Default)]
+pub struct SupersededCreates(Vec<ApiProduct>);
+
+impl SupersededCreates {
+    /// Count the canceled creates; call after the transaction commits.
+    pub fn record(self) {
+        for api_product in self.0 {
+            pplx_space_metrics::operations::completed(
+                api_product.as_str(),
+                OperationKind::CreateSandbox.as_str(),
+                OperationState::Canceled.as_str(),
+            );
+        }
+    }
+}
+
 pub async fn create_operation_tx(
     tx: &mut Transaction<'_, Postgres>,
     input: CreatePublicOperation<'_>,
-) -> Result<CreatePublicOperationResult, PublicOperationStoreError> {
+) -> Result<(CreatePublicOperationResult, SupersededCreates), PublicOperationStoreError> {
     if let Some(idempotency) = input.idempotency.as_ref() {
         lock_idempotency_key(tx, input.org_id, input.api_product, idempotency).await?;
         if let Some(existing) =
@@ -1468,12 +1508,18 @@ pub async fn create_operation_tx(
             if existing.request_fingerprint == *idempotency.request_fingerprint
                 && let Some(operation_id) = existing.operation_id
             {
-                return Ok(CreatePublicOperationResult::Existing(operation_id));
+                return Ok((
+                    CreatePublicOperationResult::Existing(operation_id),
+                    SupersededCreates::default(),
+                ));
             }
-            return Ok(CreatePublicOperationResult::IdempotencyConflict {
-                operation_id: existing.operation_id,
-                expected_fingerprint: existing.request_fingerprint,
-            });
+            return Ok((
+                CreatePublicOperationResult::IdempotencyConflict {
+                    operation_id: existing.operation_id,
+                    expected_fingerprint: existing.request_fingerprint,
+                },
+                SupersededCreates::default(),
+            ));
         }
         delete_expired_idempotency_record_tx(
             tx,
@@ -1535,6 +1581,16 @@ pub async fn create_operation_tx(
     )
     .await?;
 
+    let mut superseded = SupersededCreates::default();
+    if input.kind == OperationKind::DeleteSandbox
+        && input.target_type == Some(OperationTargetType::Sandbox)
+        && let Some(target_id) = input.target_id
+    {
+        superseded =
+            cancel_creates_superseded_by_delete_tx(tx, input.org_id, target_id, operation_id)
+                .await?;
+    }
+
     if let Some(idempotency) = input.idempotency.as_ref() {
         sqlx::query(sql!(
             "INSERT INTO public_idempotency_records (
@@ -1566,7 +1622,184 @@ pub async fn create_operation_tx(
         .await?;
     }
 
-    Ok(CreatePublicOperationResult::Created(operation_id))
+    Ok((
+        CreatePublicOperationResult::Created(operation_id),
+        superseded,
+    ))
+}
+
+/// The terminal record of a create canceled because a delete of its sandbox
+/// was requested before it could finish.
+fn superseded_create(
+    create_id: OperationId,
+    delete_id: OperationId,
+) -> (String, PublicErrorCode, serde_json::Value) {
+    (
+        "Superseded by a delete of the same sandbox requested before the create finished."
+            .to_owned(),
+        PublicErrorCode::OperationFailed,
+        serde_json::json!({
+            "operation_id": create_id.to_string(),
+            "kind": OperationKind::CreateSandbox.as_str(),
+            "reason": "superseded_by_delete",
+            "delete_operation_id": delete_id.to_string(),
+        }),
+    )
+}
+
+/// Cancel the queued, unclaimed creates of `target_id` that `delete_id`, a
+/// delete of the same sandbox just requested in this transaction,
+/// supersedes, so it need not wait for them to run out their retries. A
+/// create under a claim, live or stale, is left alone: its execution may be
+/// building the sandbox, and it is canceled instead of requeued when its
+/// attempt ends.
+async fn cancel_creates_superseded_by_delete_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    org_id: OrgId,
+    target_id: &str,
+    delete_id: OperationId,
+) -> Result<SupersededCreates, PublicOperationStoreError> {
+    let creates = sqlx::query_as::<_, (Uuid, String)>(sql!(
+        "SELECT operation_id, api_product
+         FROM public_operations
+         WHERE org_id = $1
+           AND target_type = $2
+           AND target_id = $3
+           AND kind = $4
+           AND state = $5
+           AND claim_token = ''
+           AND requested_at <= NOW()
+         ORDER BY requested_at, operation_id
+         FOR UPDATE SKIP LOCKED"
+    ))
+    .bind(org_id)
+    .bind(OperationTargetType::Sandbox.as_str())
+    .bind(target_id)
+    .bind(OperationKind::CreateSandbox.as_str())
+    .bind(OperationState::Queued.as_str())
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut superseded = SupersededCreates::default();
+    for (create, api_product) in creates {
+        superseded
+            .0
+            .push(parse_stored_enum("api_product", &api_product)?);
+        let create_id = OperationId::from_uuid(create);
+        let (progress_message, code, error) = superseded_create(create_id, delete_id);
+        sqlx::query(sql!(
+            "UPDATE public_operations
+             SET state = $2,
+                 completed_at = NOW(),
+                 progress_message = $3,
+                 terminal_error_code = $4,
+                 terminal_error_json = $5,
+                 payload_json = payload_json #- '{federated_create,service_grant_base64}'::text[],
+                 updated_at = NOW()
+             WHERE operation_id = $1"
+        ))
+        .bind(create)
+        .bind(OperationState::Canceled.as_str())
+        .bind(&progress_message)
+        .bind(code.as_str())
+        .bind(Json(error.clone()))
+        .execute(&mut **tx)
+        .await?;
+        append_operation_event_tx(
+            tx,
+            create_id,
+            PublicOperationEventType::Canceled,
+            serde_json::json!({
+                "state": OperationState::Canceled.as_str(),
+                "code": code.as_str(),
+                "error": error,
+            }),
+        )
+        .await?;
+    }
+    Ok(superseded)
+}
+
+/// Cancel a claimed create, instead of requeueing it, if a delete of its
+/// sandbox was requested after it and is still active. Returns the delete
+/// that superseded it, or `None` if there is none or the claim was lost.
+async fn cancel_claimed_create_superseded_by_delete(
+    pool: &PgPool,
+    claim_token: &str,
+    create_id: OperationId,
+) -> Result<Option<OperationId>, PublicOperationStoreError> {
+    let mut tx = pool.begin().await?;
+    let delete = sqlx::query_scalar::<_, Uuid>(sql!(
+        "SELECT delete_op.operation_id
+         FROM public_operations create_op
+         JOIN public_operations delete_op
+           ON delete_op.org_id = create_op.org_id
+          AND delete_op.target_type = create_op.target_type
+          AND delete_op.target_id = create_op.target_id
+         WHERE create_op.operation_id = $1
+           AND create_op.kind = $2
+           AND create_op.target_type = $3
+           AND delete_op.kind = $4
+           AND delete_op.state IN ($5, $6)
+           AND (delete_op.requested_at, delete_op.operation_id)
+               > (create_op.requested_at, create_op.operation_id)
+         ORDER BY delete_op.requested_at, delete_op.operation_id
+         LIMIT 1"
+    ))
+    .bind(create_id.as_uuid())
+    .bind(OperationKind::CreateSandbox.as_str())
+    .bind(OperationTargetType::Sandbox.as_str())
+    .bind(OperationKind::DeleteSandbox.as_str())
+    .bind(OperationState::Queued.as_str())
+    .bind(OperationState::Running.as_str())
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(delete) = delete else {
+        tx.rollback().await?;
+        return Ok(None);
+    };
+    let delete_id = OperationId::from_uuid(delete);
+    let (progress_message, code, error) = superseded_create(create_id, delete_id);
+    let canceled = sqlx::query_scalar::<_, Uuid>(sql!(
+        "UPDATE public_operations
+         SET state = $3,
+             claim_token = '',
+             completed_at = NOW(),
+             progress_message = $4,
+             terminal_error_code = $5,
+             terminal_error_json = $6,
+             payload_json = payload_json #- '{federated_create,service_grant_base64}'::text[],
+             updated_at = NOW()
+         WHERE operation_id = $1
+           AND claim_token = $2
+           AND state = $7
+         RETURNING operation_id"
+    ))
+    .bind(create_id.as_uuid())
+    .bind(claim_token)
+    .bind(OperationState::Canceled.as_str())
+    .bind(&progress_message)
+    .bind(code.as_str())
+    .bind(Json(error.clone()))
+    .bind(OperationState::Running.as_str())
+    .fetch_optional(&mut *tx)
+    .await?;
+    if canceled.is_none() {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+    append_operation_event_tx(
+        &mut tx,
+        create_id,
+        PublicOperationEventType::Canceled,
+        serde_json::json!({
+            "state": OperationState::Canceled.as_str(),
+            "code": code.as_str(),
+            "error": error,
+        }),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Some(delete_id))
 }
 
 fn new_claim_token() -> String {
