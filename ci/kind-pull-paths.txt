@@ -65,3 +65,16 @@ crates/libs/api/src/retry_deferral.rs
 crates/libs/api/src/retry_deferral/**
 crates/libs/cluster/controller/server/src/public_operation_dispatcher.rs
 crates/libs/cluster/controller/server/src/public_operation_dispatcher/**
+# The native /v1 surface: its contract crate, route handlers, session and
+# sandbox-operation services, and the data plane. native.m1_generated_sdk_conformance
+# exercises them end to end.
+crates/libs/public/api/**
+crates/libs/api/src/routes/public*
+crates/libs/api/src/routes/public/**
+crates/libs/api/src/routes/public_docs*
+crates/libs/api/src/routes/public_docs/**
+crates/libs/api/src/public_sessions*
+crates/libs/api/src/public_sessions/**
+crates/libs/api/src/public_sandbox_operations*
+crates/libs/api/src/public_sandbox_operations/**
+crates/libs/data/plane/**
