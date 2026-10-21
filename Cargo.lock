@@ -5511,6 +5511,7 @@ dependencies = [
  "pplx-space-metrics",
  "pplx-space-observability",
  "pplx-space-test-env",
+ "pplx-space-unix-socket-path",
  "rand 0.10.2",
  "redis",
  "rustls",
@@ -6513,8 +6514,8 @@ dependencies = [
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-common-proto-build",
- "pplx-space-common-svc",
  "pplx-space-execution-common",
+ "pplx-space-unix-socket-path",
  "prost",
  "serde",
  "serde_json",
@@ -7369,6 +7370,13 @@ dependencies = [
  "clap",
  "pplx-space-common-svc",
  "pplx-space-template-mgr",
+]
+
+[[package]]
+name = "pplx-space-unix-socket-path"
+version = "0.8.0"
+dependencies = [
+ "thiserror 2.0.20",
 ]
 
 [[package]]

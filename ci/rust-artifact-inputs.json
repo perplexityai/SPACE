@@ -68,7 +68,8 @@
         "crates/libs/spaced/common",
         "crates/libs/sqlite",
         "crates/libs/template/mgr-client",
-        "crates/libs/template/publish"
+        "crates/libs/template/publish",
+        "crates/libs/unix-socket-path"
       ]
     },
     "builder": {
@@ -111,7 +112,8 @@
         "crates/libs/spaced/build",
         "crates/libs/spaced/common",
         "crates/libs/sqlite",
-        "crates/libs/template/mgr-client"
+        "crates/libs/template/mgr-client",
+        "crates/libs/unix-socket-path"
       ]
     },
     "cluster-controller": {
@@ -164,7 +166,8 @@
         "crates/libs/snapshot/store",
         "crates/libs/spaced/build",
         "crates/libs/spaced/common",
-        "crates/libs/template/mgr-client"
+        "crates/libs/template/mgr-client",
+        "crates/libs/unix-socket-path"
       ]
     },
     "data-plane": {
@@ -194,7 +197,8 @@
         "crates/libs/sbx/mgr/client",
         "crates/libs/spaced/build",
         "crates/libs/spaced/common",
-        "crates/libs/template/mgr-client"
+        "crates/libs/template/mgr-client",
+        "crates/libs/unix-socket-path"
       ]
     },
     "worker": {
@@ -291,6 +295,7 @@
         "crates/libs/sqlite",
         "crates/libs/template/mgr",
         "crates/libs/template/mgr-client",
+        "crates/libs/unix-socket-path",
         "crates/libs/vol/mgr/client",
         "crates/libs/vol/mgr/server"
       ]

@@ -23,8 +23,8 @@ tower = { workspace = true }
 # internal
 pplx-space-common-core = { workspace = true }
 pplx-space-common-grpc = { workspace = true }
-pplx-space-common-svc = { workspace = true }
 pplx-space-execution-common = { workspace = true }
+pplx-space-unix-socket-path = { workspace = true }
 
 [build-dependencies]
 anyhow = { workspace = true }

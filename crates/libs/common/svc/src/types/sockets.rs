@@ -1,8 +1,6 @@
 use std::fmt;
-use std::path::{Path, PathBuf};
 
-#[cfg(unix)]
-use std::os::unix::net::SocketAddr as UnixSocketAddr;
+pub use pplx_space_unix_socket_path::{UnixSocketPath, UnixSocketPathParseError};
 
 macro_rules! socket_path_type {
     ($(#[$meta:meta])* $name:ident) => {
@@ -52,10 +50,6 @@ macro_rules! socket_path_type {
     };
 }
 
-mod unix_socket_path;
-
-pub use unix_socket_path::*;
-
 socket_path_type!(
     /// Unix socket path used to expose a vsock bridge over UDS.
     ///
@@ -100,6 +94,3 @@ socket_path_type!(
     /// ```
     BridgeControlSocketPath
 );
-
-#[cfg(test)]
-mod tests;

@@ -71,6 +71,7 @@ pplx-space-common-grpc = { workspace = true }
 pplx-space-dependency-drain = { workspace = true }
 pplx-space-metrics = { workspace = true }
 pplx-space-observability = { workspace = true }
+pplx-space-unix-socket-path = { workspace = true }
 
 [dev-dependencies]
 # The accepted-checksums tests migrate in-memory SQLite databases.

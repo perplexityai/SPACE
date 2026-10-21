@@ -56,6 +56,7 @@ members = [
     "crates/libs/sbx/mgr/server",
     "crates/libs/sbx/mgr/store",
     "crates/libs/sqlite",
+    "crates/libs/unix-socket-path",
     "crates/libs/node/api/client",
     "crates/libs/node/api/server",
     "crates/libs/node/ctl/server",
@@ -372,6 +373,7 @@ pplx-space-template-mgr = { path = "crates/libs/template/mgr" }
 pplx-space-template-mgr-client = { path = "crates/libs/template/mgr-client" }
 pplx-space-template-publisher = { path = "crates/libs/template/publish" }
 pplx-space-test-env = { path = "crates/libs/test-env" }
+pplx-space-unix-socket-path = { path = "crates/libs/unix-socket-path" }
 [profile.release]
 lto = "thin"
 strip = true
