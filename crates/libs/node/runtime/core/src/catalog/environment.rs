@@ -12,6 +12,8 @@ pub enum CompiledEnvironmentDefinitionError {
     UnsupportedArchitecture(Arch),
     #[error("invalid compiled environment descriptor: {0}")]
     Descriptor(#[from] EnvironmentDescriptorError),
+    #[error("invalid compiled runtime ordering version: {0}")]
+    RuntimeVersion(#[from] semver::Error),
     #[error("invalid compiled state format: {0}")]
     StateFormat(#[from] StateFormatNameParseError),
     #[error("invalid compiled state format version: {0}")]
@@ -27,6 +29,23 @@ pub enum ResolveEnvironmentError {
 }
 
 impl InitialEnvironment {
+    /// Resolve E0 independently of additional compiled bindings. An invalid
+    /// optional qualification must not withdraw the production default.
+    pub fn compiled_environment(
+        &self,
+    ) -> Result<CompiledEnvironment, CompiledEnvironmentDefinitionError> {
+        let definition = self.definition()?;
+        Ok(CompiledEnvironment {
+            runtime_ordering_key: semver::Version::parse(self.release.release.version.as_str())?,
+            initial_reference: definition.reference(),
+            release: self.release.clone(),
+            kernel: self.kernel.clone(),
+            definition,
+            memory_state: true,
+            name: "e0",
+        })
+    }
+
     /// Production qualification covers Linux/x86_64 E0 only. Existing artifact
     /// pins for other architectures retain their installation meaning.
     pub fn definition(&self) -> Result<EnvironmentDefinition, CompiledEnvironmentDefinitionError> {
@@ -105,6 +124,9 @@ pub struct CompiledEnvironment {
     kernel: PinnedKernel,
     definition: EnvironmentDefinition,
     memory_state: bool,
+    name: &'static str,
+    runtime_ordering_key: semver::Version,
+    initial_reference: EnvironmentReference,
 }
 
 impl CompiledEnvironment {
@@ -117,11 +139,24 @@ impl CompiledEnvironment {
     ) -> Self {
         let definition = definition_from_pins(&release, &kernel, state_version).unwrap();
         Self {
+            runtime_ordering_key: semver::Version::parse(release.release.version.as_str()).unwrap(),
+            initial_reference: InitialEnvironment::for_architecture(release.architecture)
+                .unwrap()
+                .definition()
+                .unwrap()
+                .reference(),
             release,
             kernel,
             definition,
             memory_state,
+            name: "synthetic",
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn named_for_test(mut self, name: &'static str) -> Self {
+        self.name = name;
+        self
     }
 
     /// Shared immutable catalog for execution consumers in this process.
@@ -141,25 +176,44 @@ impl CompiledEnvironment {
             .as_deref()
     }
 
+    /// Build an owned catalog for startup validation and qualification tests.
+    /// Repeated execution lookups use `cached_for_architecture` instead.
     pub fn for_architecture(architecture: Arch) -> Result<Vec<Self>, CatalogError> {
         if architecture != Arch::X86_64 {
             return Ok(Vec::new());
         }
         let catalog = RuntimeCatalog::compiled()?;
+        let initial_reference = InitialEnvironment::for_architecture(architecture)?
+            .definition()
+            .map_err(CatalogError::EnvironmentDefinition)?
+            .reference();
         // Complete bindings are approved independently of downloadable release pins.
         // Memory-state compatibility must be qualified before it is advertised.
         [
             (
+                "e0",
                 "1.15.1",
                 "6.1.155",
                 INITIAL_FIRECRACKER_STATE_FORMAT_VERSION,
                 true,
             ),
-            ("1.17.0", "6.18.44", "12.0.0", true),
-            ("1.17.0", "6.1.155", "12.0.0", true),
+            (
+                "fc-1.17.0-linux-6.18.44",
+                "1.17.0",
+                "6.18.44",
+                "12.0.0",
+                true,
+            ),
+            (
+                "fc-1.17.0-linux-6.1.155",
+                "1.17.0",
+                "6.1.155",
+                "12.0.0",
+                true,
+            ),
         ]
         .into_iter()
-        .map(|(runtime, kernel, state_version, memory_state)| {
+        .map(|(name, runtime, kernel, state_version, memory_state)| {
             let release = catalog
                 .releases(RuntimeKind::Firecracker, architecture)
                 .find(|pin| pin.release.version.as_str() == runtime)
@@ -172,14 +226,32 @@ impl CompiledEnvironment {
                 .ok_or(CatalogError::MissingEnvironmentPins { runtime, kernel })?;
             let definition = definition_from_pins(release, kernel_pin, state_version)
                 .map_err(CatalogError::EnvironmentDefinition)?;
+            let runtime_ordering_key = semver::Version::parse(release.release.version.as_str())
+                .map_err(CompiledEnvironmentDefinitionError::RuntimeVersion)
+                .map_err(CatalogError::EnvironmentDefinition)?;
             Ok(Self {
+                runtime_ordering_key,
+                initial_reference,
                 release: release.clone(),
                 kernel: kernel_pin.clone(),
                 definition,
                 memory_state,
+                name,
             })
         })
         .collect()
+    }
+
+    pub fn is_initial(&self) -> bool {
+        self.definition.reference() == self.initial_reference
+    }
+
+    pub(crate) fn runtime_ordering_key(&self) -> &semver::Version {
+        &self.runtime_ordering_key
+    }
+
+    pub fn name(&self) -> &'static str {
+        self.name
     }
 
     pub fn release(&self) -> &PinnedRelease {

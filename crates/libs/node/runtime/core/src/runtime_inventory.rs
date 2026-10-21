@@ -1061,7 +1061,9 @@ impl RuntimeInventory {
                             RuntimeInventoryError::NoInstalledRuntime(_)
                                 | RuntimeInventoryError::NoCompatibleRuntime { .. }
                         ) && identity.kind == runtime
-                            && (mode == ExecutionSelectionMode::NewColdBoot
+                            && ((mode == ExecutionSelectionMode::NewColdBoot
+                                && requested
+                                    .is_none_or(|metadata| metadata.environment().is_none()))
                                 || requested
                                     .is_some_and(|metadata| metadata.runtime() == identity)) =>
                     {

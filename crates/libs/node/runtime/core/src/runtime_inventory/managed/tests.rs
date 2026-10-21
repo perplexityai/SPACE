@@ -1048,3 +1048,104 @@ fn baked_kernel_aliases_report_one_binding_outcome() {
         }
     }
 }
+
+#[test]
+fn discovered_initial_failure_is_not_replaced_by_an_unrelated_runtime_error() {
+    use crate::{
+        catalog::CompiledEnvironment,
+        selection::{self, CompatibleSelection, ExecutionPolicy, SelectionError},
+    };
+    #[derive(Clone, Copy)]
+    enum Failure {
+        Absent,
+        Corrupt,
+        Transient,
+    }
+    for failure in [Failure::Absent, Failure::Corrupt, Failure::Transient] {
+        let fixture = Fixture::new();
+        let initial = synthetic_initial_environment();
+        let e0 = initial.compiled_environment().unwrap();
+        let source = e0.definition().execution_requirements().unwrap();
+        let candidate = CompiledEnvironment::for_test(
+            pin("1.17.0", 7),
+            initial.kernel().clone(),
+            "12.0.0",
+            true,
+        );
+        fixture.place_release("1.17.0", 7);
+        let kernel = fixture
+            .kernels
+            .join(crate::artifact_store::managed_kernel_directory(
+                &initial.kernel().version,
+                initial.kernel().sha256,
+            ));
+        std::fs::create_dir_all(&kernel).unwrap();
+        std::fs::write(kernel.join(KERNEL_IMAGE), binary(42)).unwrap();
+        let e0_path = fixture.release_path("1.15.1", 1);
+        match failure {
+            Failure::Absent | Failure::Transient => std::fs::remove_dir_all(&e0_path).unwrap(),
+            Failure::Corrupt => {
+                std::fs::write(e0_path.join("bin/firecracker"), binary(99)).unwrap()
+            }
+        }
+        let cache = fixture._dir.path().join("cache/firecracker");
+        std::fs::create_dir_all(&cache).unwrap();
+        let mut inventory = RuntimeInventory::discover_with_store(
+            &fixture.store,
+            &initial,
+            &fixture._dir.path().join("vendor"),
+            &cache.join("assets"),
+            &cache.join("kernels"),
+        )
+        .unwrap();
+        assert!(
+            !inventory
+                .environments
+                .contains_key(&e0.definition().reference())
+        );
+        inventory
+            .include_environment(&fixture.store, &candidate, &cache.join("kernels"))
+            .unwrap();
+        // Synthetic binaries use the test host architecture; the qualification
+        // under test is x86_64, including when these filesystem tests run on ARM.
+        for environment in inventory.environments.values_mut() {
+            if let Ok(runtime) = &mut environment.runtime {
+                runtime.guest = source.guest();
+            }
+        }
+        let io_failure = || {
+            std::sync::Arc::new(RuntimeInventoryError::ReadDir {
+                path: fixture._dir.path().join("injected-read-failure"),
+                source: std::io::Error::from(std::io::ErrorKind::Interrupted),
+            })
+        };
+        // Inject the I/O outcome at the discovery boundary; do not put E0 in
+        // environments, which would bypass production's unavailable remapping.
+        if matches!(failure, Failure::Transient) {
+            inventory.unavailable.push(UnavailableArtifact::Runtime {
+                identity: initial.release().release.clone(),
+                error: io_failure(),
+            });
+        }
+        inventory.unavailable.push(UnavailableArtifact::Runtime {
+            identity: firecracker("1.16.0"),
+            error: io_failure(),
+        });
+        let policy = ExecutionPolicy::parse(Some("e0,synthetic"), None, &[e0, candidate]).unwrap();
+        let selected = selection::select(
+            &inventory,
+            &policy,
+            CompatibleSelection::ColdBoot { source: &source },
+        );
+        if matches!(failure, Failure::Transient) {
+            assert!(
+                matches!(selected, Err(SelectionError::Unavailable(error)) if error.is_transient())
+            );
+        } else {
+            assert_eq!(
+                selected.unwrap().1.execution.runtime().version.as_str(),
+                "1.17.0"
+            );
+        }
+    }
+}

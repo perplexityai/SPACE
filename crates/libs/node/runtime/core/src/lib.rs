@@ -14,6 +14,7 @@ pub mod file_delta;
 
 pub mod launch_admission;
 pub mod runtime_inventory;
+pub mod selection;
 pub mod verity;
 
 pub mod snapshot_files;

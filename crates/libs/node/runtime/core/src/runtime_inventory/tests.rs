@@ -1182,3 +1182,262 @@ fn bound_cold_boot_uses_the_recorded_runtime_and_never_the_node_default() {
         );
     }
 }
+
+#[test]
+fn compatible_selection_preserves_exact_before_fallback() {
+    use crate::catalog::CompiledEnvironment;
+    use crate::selection::{self, CompatibleSelection, ExecutionPolicy};
+    let catalog = CompiledEnvironment::for_architecture(Arch::X86_64).unwrap();
+    let source = catalog[0].definition().execution_requirements().unwrap();
+    let all = "e0,fc-1.17.0-linux-6.1.155,fc-1.17.0-linux-6.18.44";
+    for exact_installed in [true, false] {
+        let mut inventory = inventory(Vec::new());
+        for entry in &catalog {
+            if entry.name() == "e0" && !exact_installed {
+                continue;
+            }
+            let execution = entry.definition().execution_requirements().unwrap();
+            let mut runtime = installation(
+                execution.runtime().version.as_str(),
+                execution.state_format().unwrap().version.as_str(),
+            );
+            runtime.guest = execution.guest();
+            let mut component = kernel(entry.kernel().version.as_str(), 0, false, false);
+            component.metadata = execution.components()[0].clone();
+            inventory.environments.insert(
+                entry.definition().reference(),
+                InstalledEnvironment {
+                    runtime: Ok(runtime),
+                    components: Ok(vec![component]),
+                },
+            );
+        }
+        for (allowed, default, exact_allowed) in [
+            (all, "e0", true),
+            (
+                "fc-1.17.0-linux-6.1.155,fc-1.17.0-linux-6.18.44",
+                "fc-1.17.0-linux-6.18.44",
+                false,
+            ),
+        ] {
+            let policy = ExecutionPolicy::parse(Some(allowed), Some(default), &catalog).unwrap();
+            let (_, cold) = selection::select(
+                &inventory,
+                &policy,
+                CompatibleSelection::ColdBoot { source: &source },
+            )
+            .unwrap();
+            assert_eq!(
+                cold.execution.runtime().version.as_str(),
+                if exact_installed && exact_allowed {
+                    "1.15.1"
+                } else {
+                    "1.17.0"
+                }
+            );
+            assert_eq!(cold.execution.components(), source.components());
+            let restore = selection::select(
+                &inventory,
+                &policy,
+                CompatibleSelection::Restore { source: &source },
+            );
+            if exact_installed && exact_allowed {
+                assert_eq!(
+                    restore.unwrap().1.execution.runtime().version.as_str(),
+                    "1.15.1"
+                );
+            } else {
+                restore.unwrap_err();
+            }
+        }
+    }
+}
+
+#[test]
+fn restore_falls_back_after_revocation_without_boot_files() {
+    use crate::catalog::CompiledEnvironment;
+    use crate::selection::{self, CompatibleSelection, ExecutionPolicy};
+    let mut catalog = CompiledEnvironment::for_architecture(Arch::X86_64).unwrap();
+    let source = catalog[0].definition().execution_requirements().unwrap();
+    // Synthetic qualification proves a patch release is eligible because its
+    // declared profile matches, not because its version happens to be newer.
+    let mut release = catalog[0].release().clone();
+    release.release.version = "1.15.2".parse().unwrap();
+    catalog.push(CompiledEnvironment::for_test(
+        release,
+        catalog[0].kernel().clone(),
+        "9.0.0",
+        true,
+    ));
+    let mut inventory = inventory(Vec::new());
+    inventory.components.clear();
+    for entry in &catalog {
+        let execution = entry.definition().execution_requirements().unwrap();
+        let mut runtime = installation(
+            execution.runtime().version.as_str(),
+            execution.state_format().unwrap().version.as_str(),
+        );
+        runtime.guest = execution.guest();
+        inventory.environments.insert(
+            entry.definition().reference(),
+            InstalledEnvironment {
+                runtime: Ok(runtime),
+                components: Err(std::sync::Arc::new(
+                    RuntimeInventoryError::NoCompatibleComponent(execution.components()[0].clone()),
+                )),
+            },
+        );
+    }
+    for (allowed, expected) in [("e0,synthetic", "1.15.1"), ("synthetic", "1.15.2")] {
+        let policy = ExecutionPolicy::parse(Some(allowed), Some("synthetic"), &catalog).unwrap();
+        let (_, selected) = selection::select(
+            &inventory,
+            &policy,
+            CompatibleSelection::Restore { source: &source },
+        )
+        .unwrap();
+        assert_eq!(selected.execution.runtime().version.as_str(), expected);
+        assert_eq!(selected.execution.state_format(), source.state_format());
+        assert_eq!(selected.execution.components(), source.components());
+        assert!(selected.components.is_empty());
+        assert_eq!(source.runtime().version.as_str(), "1.15.1");
+        selection::select(
+            &inventory,
+            &policy,
+            CompatibleSelection::ColdBoot { source: &source },
+        )
+        .unwrap_err();
+    }
+}
+
+#[test]
+fn transient_exact_source_failure_never_selects_another_consumer() {
+    use crate::catalog::CompiledEnvironment;
+    use crate::selection::{self, CompatibleSelection, ExecutionPolicy, SelectionError};
+    let mut catalog = CompiledEnvironment::for_architecture(Arch::X86_64).unwrap();
+    let source = catalog[0].definition().execution_requirements().unwrap();
+    let mut release = catalog[0].release().clone();
+    release.release.version = "1.15.2".parse().unwrap();
+    catalog.push(CompiledEnvironment::for_test(
+        release,
+        catalog[0].kernel().clone(),
+        "9.0.0",
+        true,
+    ));
+    for reverse in [false, true] {
+        if reverse {
+            catalog.reverse();
+        }
+        for transient in [false, true] {
+            for allowed in ["e0,synthetic", "synthetic"] {
+                let policy =
+                    ExecutionPolicy::parse(Some(allowed), Some("synthetic"), &catalog).unwrap();
+                let mut inventory = inventory(Vec::new());
+                for entry in &catalog {
+                    let execution = entry.definition().execution_requirements().unwrap();
+                    let mut runtime = installation(
+                        execution.runtime().version.as_str(),
+                        execution.state_format().unwrap().version.as_str(),
+                    );
+                    runtime.guest = execution.guest();
+                    let mut component = kernel(entry.kernel().version.as_str(), 0, false, false);
+                    component.metadata = execution.components()[0].clone();
+                    inventory.environments.insert(
+                        entry.definition().reference(),
+                        InstalledEnvironment {
+                            runtime: if entry.name() == "e0" {
+                                Err(std::sync::Arc::new(RuntimeInventoryError::ReadDir {
+                                    path: "/synthetic/runtime".into(),
+                                    source: std::io::Error::from(if transient {
+                                        std::io::ErrorKind::Interrupted
+                                    } else {
+                                        std::io::ErrorKind::NotFound
+                                    }),
+                                }))
+                            } else {
+                                Ok(runtime)
+                            },
+                            components: Ok(vec![component]),
+                        },
+                    );
+                }
+                for intent in [
+                    CompatibleSelection::ColdBoot { source: &source },
+                    CompatibleSelection::Restore { source: &source },
+                ] {
+                    let result = selection::select(&inventory, &policy, intent);
+                    if transient && allowed == "e0,synthetic" {
+                        assert!(
+                            matches!(result, Err(SelectionError::Unavailable(ref error)) if error.is_transient())
+                        );
+                    } else {
+                        assert_eq!(
+                            result.unwrap().1.execution.runtime().version.as_str(),
+                            "1.15.2"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn compatible_fallback_orders_versions_and_refuses_equal_ranked_identities() {
+    use crate::{
+        catalog::CompiledEnvironment,
+        selection::{self, CompatibleSelection, ExecutionPolicy, SelectionError},
+    };
+    let initial = CompiledEnvironment::for_architecture(Arch::X86_64)
+        .unwrap()
+        .remove(0);
+    let source = initial.definition().execution_requirements().unwrap();
+    for ambiguous in [false, true] {
+        let mut catalog = vec![initial.clone()];
+        let mut inventory = inventory(Vec::new());
+        for (name, version, digest) in [
+            ("older", "1.15.2", 21),
+            ("newer", if ambiguous { "1.15.2" } else { "1.15.3" }, 22),
+        ] {
+            let mut release = initial.release().clone();
+            release.release.version = version.parse().unwrap();
+            release.binaries[0].sha256 = Digest::sha256([digest; 32]);
+            let entry =
+                CompiledEnvironment::for_test(release, initial.kernel().clone(), "9.0.0", true)
+                    .named_for_test(name);
+            let mut runtime = installation(version, "9.0.0");
+            runtime.guest = source.guest();
+            let mut component = kernel("6.1.155", 0, false, false);
+            component.metadata = source.components()[0].clone();
+            inventory.environments.insert(
+                entry.definition().reference(),
+                InstalledEnvironment {
+                    runtime: Ok(runtime),
+                    components: Ok(vec![component]),
+                },
+            );
+            catalog.push(entry);
+        }
+        for reverse in [false, true] {
+            if reverse {
+                catalog.reverse();
+            }
+            let policy =
+                ExecutionPolicy::parse(Some("older,newer"), Some("older"), &catalog).unwrap();
+            for intent in [
+                CompatibleSelection::ColdBoot { source: &source },
+                CompatibleSelection::Restore { source: &source },
+            ] {
+                let result = selection::select(&inventory, &policy, intent);
+                if ambiguous {
+                    assert!(matches!(result, Err(SelectionError::Ambiguous)));
+                } else {
+                    assert_eq!(
+                        result.unwrap().1.execution.runtime().version.as_str(),
+                        "1.15.3"
+                    );
+                }
+            }
+        }
+    }
+}
