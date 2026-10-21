@@ -1131,6 +1131,21 @@ const PUBLIC_SANDBOX_FROM: &str = "FROM sandboxes s
       AND failure_observation.facet = $1
       AND failure_observation.element = s.id::TEXT";
 
+/// The rows a sandbox list may show: the org's live sandboxes, owned by
+/// subject $12 or, without one, by a local user.
+const PAGE_FILTER: &str = "s.org_id = $8
+    AND s.lifecycle <> 'deleted'
+    AND (($12::UUID IS NOT NULL AND s.user_id = $12)
+      OR ($12::UUID IS NULL AND EXISTS (
+          SELECT 1 FROM users owner WHERE owner.id = s.user_id
+            AND owner.owner_source = 'local'
+      )))";
+
+/// A listed row's estimated JSON size; see `PublicSandboxQuery::Page`.
+const PAGE_ROW_BYTES: &str = "(octet_length(s.metadata::TEXT)
+    + COALESCE(octet_length(to_jsonb(s.name)::TEXT), 0)
+    + $14::BIGINT)";
+
 #[derive(Clone, Copy)]
 enum PublicSandboxQuery {
     ById,
@@ -1146,53 +1161,52 @@ fn public_sandbox_query(query: PublicSandboxQuery) -> sqlx::AssertSqlSafe<String
              {PUBLIC_SANDBOX_FROM}
              WHERE s.id = $8 AND s.org_id = $9 AND s.lifecycle <> 'deleted'"
         ),
-        // `page` takes up to $11 rows in list order and keeps them while the
-        // running total of their estimated JSON size stays within $13 bytes,
-        // always keeping the first so the cursor advances. Postgres then
-        // returns only those rows, so rows stored before the input limits
-        // cannot make a page arbitrarily large. The size estimate is the
-        // metadata's and the escaped name's JSON text plus $14 bytes for
-        // everything else; jsonb's text form is never shorter than the
-        // compact JSON the page is served as. `pg_column_size` would be
-        // cheaper, but it is the compressed size, which repetitive metadata
+        // `page_walk` follows the list order one row at a time, adding each
+        // row's estimated JSON size to a running total. It stops one row
+        // after the total passes $13 bytes or at $11 rows, so the page keeps
+        // rows within the budget, always the first so the cursor advances,
+        // and the row after the last kept one tells the handler whether the
+        // list continues. It is recursive so that Postgres sizes only those
+        // rows: a running-sum window cannot stop early and would size all $11
+        // candidates, megabytes each for rows stored before the input limits.
+        //
+        // The estimate is the metadata's and the escaped name's JSON text plus
+        // $14 bytes for everything else; jsonb's text form is never shorter
+        // than the compact JSON the page is served as. `pg_column_size` would
+        // be cheaper, but it is the compressed size, which repetitive metadata
         // makes many times smaller than the decoded row.
         PublicSandboxQuery::Page => format!(
-            "{PUBLIC_SANDBOX_SELECT}, page.has_next
+            "WITH RECURSIVE page_walk AS (
+                 (SELECT s.id, s.created_at, {PAGE_ROW_BYTES} AS through_bytes,
+                         1::BIGINT AS position
+                  FROM sandboxes s
+                  WHERE {PAGE_FILTER}
+                    AND (
+                        $9::TIMESTAMPTZ IS NULL
+                        OR (s.created_at, s.id) < ($9::TIMESTAMPTZ, $10::UUID)
+                    )
+                  ORDER BY s.created_at DESC, s.id DESC
+                  LIMIT 1)
+                 UNION ALL
+                 (SELECT next.id, next.created_at, walk.through_bytes + next.row_bytes,
+                         walk.position + 1
+                  FROM page_walk walk
+                  CROSS JOIN LATERAL (
+                      SELECT s.id, s.created_at, {PAGE_ROW_BYTES} AS row_bytes
+                      FROM sandboxes s
+                      WHERE {PAGE_FILTER}
+                        AND (s.created_at, s.id) < (walk.created_at, walk.id)
+                      ORDER BY s.created_at DESC, s.id DESC
+                      LIMIT 1
+                  ) next
+                  WHERE (walk.through_bytes <= $13::BIGINT OR walk.position = 1)
+                    AND walk.position < $11::BIGINT)
+             )
+             {PUBLIC_SANDBOX_SELECT}, walk.position < walk_end.last_position AS has_next
              {PUBLIC_SANDBOX_FROM}
-             JOIN (
-                 SELECT candidate.id, candidate.has_next
-                 FROM (
-                     SELECT s.id,
-                            size.row_bytes,
-                            SUM(size.row_bytes) OVER (
-                                ORDER BY s.created_at DESC, s.id DESC
-                                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-                            ) AS through_bytes,
-                            LEAD(s.id) OVER (ORDER BY s.created_at DESC, s.id DESC)
-                                IS NOT NULL AS has_next
-                     FROM sandboxes s
-                     CROSS JOIN LATERAL (
-                         SELECT octet_length(s.metadata::TEXT)
-                                + COALESCE(octet_length(to_jsonb(s.name)::TEXT), 0)
-                                + $14::BIGINT AS row_bytes
-                     ) size
-                     WHERE s.org_id = $8
-                       AND s.lifecycle <> 'deleted'
-                       AND (($12::UUID IS NOT NULL AND s.user_id = $12)
-                         OR ($12::UUID IS NULL AND EXISTS (
-                             SELECT 1 FROM users owner WHERE owner.id = s.user_id
-                               AND owner.owner_source = 'local'
-                         )))
-                       AND (
-                           $9::TIMESTAMPTZ IS NULL
-                           OR (s.created_at, s.id) < ($9::TIMESTAMPTZ, $10::UUID)
-                       )
-                     ORDER BY s.created_at DESC, s.id DESC
-                     LIMIT $11
-                 ) candidate
-                 WHERE candidate.through_bytes <= $13
-                    OR candidate.through_bytes = candidate.row_bytes
-             ) page ON page.id = s.id
+             JOIN page_walk walk ON walk.id = s.id
+             CROSS JOIN (SELECT max(position) AS last_position FROM page_walk) walk_end
+             WHERE walk.through_bytes <= $13::BIGINT OR walk.position = 1
              ORDER BY s.created_at DESC, s.id DESC"
         ),
     };
