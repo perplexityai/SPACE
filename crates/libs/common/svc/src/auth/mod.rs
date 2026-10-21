@@ -26,6 +26,7 @@ use k8s::{K8sTokenAuthConfig, K8sTokenReviewer};
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 pub use crate::bearer_token::SPACE_INTERNAL_TOKEN_ENV;
+pub use crate::bearer_token::{SpaceBearerInterceptor, required_space_bearer_token};
 
 const SPACE_K8S_TOKEN_AUTH_ENABLED_ENV: &str = "SPACE_K8S_TOKEN_AUTH_ENABLED";
 const SPACE_K8S_TOKEN_AUTH_STATIC_FALLBACK_ENABLED_ENV: &str =
@@ -664,97 +665,10 @@ pub fn bearer_client_interceptor(
     }
 }
 
-/// Channel interceptor that attaches the SPACE internal bearer token of a
-/// fixed [`SpaceBearerToken`](crate::bearer_token::SpaceBearerToken) kind to
-/// every outbound request.
-///
-/// Construct it once at client construction (wrapped in
-/// `tonic::service::interceptor::InterceptedService`) so a local token
-/// read/mount failure fails the call locally instead of being swallowed into a
-/// header-less request that the remote server then misreports as a
-/// `401`/`UNAUTHENTICATED`. The token is re-read on every RPC, so
-/// projected-token rotation is picked up. Mirrors the role-specific
-/// `BearerAuthInterceptor` in the node-api client.
-///
-/// The failure is reported as `UNAVAILABLE`, not `UNAUTHENTICATED` or
-/// `INTERNAL`: a missing/unreadable projected token (e.g. an unmounted volume,
-/// a permissions problem, or a token caught mid-rotation) is a *transient,
-/// local* infrastructure failure, distinct from the remote server actually
-/// rejecting a token. The code matters — callers that classify error codes
-/// (snapshot-upload retry, the command-ready probe / transient-lifecycle
-/// sweeper) treat `UNAVAILABLE` as retryable/unreachable and `INTERNAL` as a
-/// permanent or guest-wedge verdict. Emitting `INTERNAL` here would let a local
-/// credential blip be misread as remote wedge evidence and reap healthy
-/// sandboxes.
-#[derive(Clone)]
-pub struct SpaceBearerInterceptor {
-    kind: crate::bearer_token::SpaceBearerToken,
-}
-
-impl SpaceBearerInterceptor {
-    pub fn new(kind: crate::bearer_token::SpaceBearerToken) -> Self {
-        Self { kind }
-    }
-}
-
-impl tonic::service::Interceptor for SpaceBearerInterceptor {
-    fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
-        self.call_with_environment(request, &pplx_space_common_core::env::ProcessEnvironment)
-    }
-}
-impl SpaceBearerInterceptor {
-    pub(crate) fn call_with_environment(
-        &mut self,
-        mut request: Request<()>,
-        env: &dyn pplx_space_common_core::env::Environment,
-    ) -> Result<Request<()>, Status> {
-        crate::bearer_token::insert_space_bearer_token_from_environment(
-            request.metadata_mut(),
-            self.kind,
-            env,
-        )
-        .map_err(|error| {
-            Status::unavailable(format!(
-                "failed to attach {} bearer token: {error}",
-                self.kind.as_str()
-            ))
-        })?;
-        Ok(request)
-    }
-}
-
 pub fn required_bearer_token(env_var: &str) -> Result<String, Status> {
     std::env::var(env_var)
         .map_err(|_| Status::internal(format!("{env_var} not set")))
         .and_then(|token| validate_required_bearer_token(env_var, token))
-}
-
-/// Resolve the projected (or static-fallback) bearer token for an outbound
-/// client path.
-///
-/// A token-source failure (unmounted/unreadable/mid-rotation projected token,
-/// or no token configured) is a *transient, local* infrastructure failure, so
-/// it surfaces as retryable `UNAVAILABLE` — never `INTERNAL`/`UNAUTHENTICATED`.
-/// This matches `SpaceBearerInterceptor` and the retrying node-api client, so
-/// the shared gRPC retry policy retries it (e.g. a projected token caught
-/// mid-rotation) instead of treating a local credential blip as a permanent
-/// verdict. (`required_bearer_token`, by contrast, loads the static token as a
-/// service *boot* precondition and stays `INTERNAL`.)
-pub fn required_space_bearer_token(
-    kind: crate::bearer_token::SpaceBearerToken,
-) -> Result<String, Status> {
-    required_space_bearer_token_from_environment(
-        kind,
-        &pplx_space_common_core::env::ProcessEnvironment,
-    )
-}
-
-pub(crate) fn required_space_bearer_token_from_environment(
-    kind: crate::bearer_token::SpaceBearerToken,
-    env: &dyn pplx_space_common_core::env::Environment,
-) -> Result<String, Status> {
-    crate::bearer_token::space_bearer_token_from_environment(kind, env)
-        .map_err(|error| Status::unavailable(error.to_string()))
 }
 
 fn validate_required_bearer_token(env_var: &str, token: String) -> Result<String, Status> {

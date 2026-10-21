@@ -17,6 +17,7 @@ type Sha256Context = Sha256;
 
 const ROOTFS_SPARSE_BLOCK_BYTES: usize = 64 * 1024;
 const COMPRESSED_INPUT_BUFFER_SIZE: usize = 8 * 1024 * 1024;
+const COMPRESSED_INPUT_PIPELINE_DEPTH: usize = 3;
 const DECODE_BUFFER_SIZE: usize = 16 * 1024 * 1024;
 const DECODE_PIPELINE_DEPTH: usize = 4;
 // Compression waves must not pin every core of a metal host. The pod runs
@@ -213,8 +214,16 @@ pub(crate) fn decompress_rootfs(
             path: tmp.display().to_string(),
             source,
         })?;
-    let digesting_input = DigestingReader::new(input);
-    let buffered_input = BufReader::with_capacity(COMPRESSED_INPUT_BUFFER_SIZE, digesting_input);
+    let buffered_input = HashedCompressedInput::new(
+        input,
+        COMPRESSED_INPUT_BUFFER_SIZE,
+        COMPRESSED_INPUT_PIPELINE_DEPTH,
+    )
+    .map_err(|source| RootfsZstdError::Io {
+        operation: "start compressed rootfs hash stage",
+        path: compressed_path.display().to_string(),
+        source,
+    })?;
     let mut decoder =
         zstd::stream::read::Decoder::with_buffer(buffered_input).map_err(|source| {
             RootfsZstdError::Zstd {
@@ -288,9 +297,9 @@ pub(crate) fn decompress_rootfs(
     }
     let compressed_hash = decoder
         .finish()
-        .into_inner()
         .finish_hash_and_advise_dontneed(compressed_path, "decompress compressed rootfs input");
     let (hash_output, sparse_output) = pipeline.finish()?;
+    let compressed_hash = compressed_hash?;
     if hash_output.decoded_size != sparse_output.decoded_size {
         return Err(RootfsZstdError::Pipeline {
             operation: "verify hash/write decoded size agreement",
@@ -465,42 +474,200 @@ impl<W: Write> Write for DigestingWriter<W> {
     }
 }
 
-struct DigestingReader<R> {
+struct CompressedInputChunk {
+    buffer: Vec<u8>,
+    len: usize,
+}
+
+impl CompressedInputChunk {
+    fn bytes(&self) -> std::io::Result<&[u8]> {
+        self.buffer
+            .get(..self.len)
+            .ok_or_else(|| invalid_data("compressed chunk length exceeded its buffer"))
+    }
+}
+
+/// Buffered compressed input whose SHA-256 is computed on its own thread.
+///
+/// Hashing inline cost the decoder thread, the pipeline's slowest stage,
+/// about 0.75 CPU-seconds per compressed GB. Each chunk read here is shared
+/// with the hash thread, which hands the buffer back once hashed; the
+/// fixed pool bounds memory and makes reads wait if hashing falls behind.
+///
+/// A buffer the hash thread never receives must not be dropped, or the pool
+/// shrinks until a read waits forever: an empty fill is kept as `spare`, end
+/// of input is remembered, and an error after a partial fill is reported on
+/// the next read so the bytes already read are still delivered and hashed.
+struct HashedCompressedInput<R> {
     inner: R,
-    hasher: Sha256Context,
+    current: Option<std::sync::Arc<CompressedInputChunk>>,
+    spare: Option<std::sync::Arc<CompressedInputChunk>>,
+    position: usize,
+    eof: bool,
+    pending_error: Option<std::io::Error>,
+    hash_tx: Option<SyncSender<std::sync::Arc<CompressedInputChunk>>>,
+    free_rx: Receiver<std::sync::Arc<CompressedInputChunk>>,
+    hash_handle: Option<thread::JoinHandle<Result<String, RootfsZstdError>>>,
 }
 
-impl<R> DigestingReader<R> {
-    fn new(inner: R) -> Self {
-        Self {
+impl<R: Read> HashedCompressedInput<R> {
+    fn new(inner: R, chunk_size: usize, depth: usize) -> std::io::Result<Self> {
+        let (hash_tx, hash_rx) = std::sync::mpsc::sync_channel(depth);
+        let (free_tx, free_rx) = std::sync::mpsc::sync_channel(depth);
+        for _ in 0..depth {
+            free_tx
+                .send(std::sync::Arc::new(CompressedInputChunk {
+                    buffer: vec![0u8; chunk_size],
+                    len: 0,
+                }))
+                .map_err(|_| invalid_data("seed compressed input buffer pool"))?;
+        }
+        let hash_handle = thread::Builder::new()
+            .name("rootfs-zstd-input-hash".to_string())
+            .spawn(move || hash_compressed_rootfs_chunks(hash_rx, free_tx))?;
+        Ok(Self {
             inner,
-            hasher: sha256_hasher(),
-        }
+            current: None,
+            spare: None,
+            position: 0,
+            eof: false,
+            pending_error: None,
+            hash_tx: Some(hash_tx),
+            free_rx,
+            hash_handle: Some(hash_handle),
+        })
     }
 
-    fn finish_hash(self) -> String {
-        sha256_digest(self.hasher)
+    fn finish_hash(&mut self) -> Result<String, RootfsZstdError> {
+        self.hash_tx.take();
+        self.current.take();
+        self.hash_handle
+            .take()
+            .expect("compressed hash thread joined at most once")
+            .join()
+            .map_err(|_| RootfsZstdError::HashThreadPanic)?
+    }
+
+    fn next_chunk(&mut self) -> std::io::Result<()> {
+        if let Some(error) = self.pending_error.take() {
+            return Err(error);
+        }
+        // Release this reader's share first: the pool only hands back
+        // buffers that no stage still reads.
+        self.current.take();
+        self.position = 0;
+        let mut chunk = match self.spare.take() {
+            Some(chunk) => chunk,
+            None => self
+                .free_rx
+                .recv()
+                .map_err(|_| invalid_data("compressed hash stage stopped"))?,
+        };
+        let Some(filled) = std::sync::Arc::get_mut(&mut chunk) else {
+            return Err(invalid_data("compressed input buffer still shared"));
+        };
+        filled.len = 0;
+        while filled.len < filled.buffer.len() {
+            let Some(tail) = filled.buffer.get_mut(filled.len..) else {
+                break;
+            };
+            match self.inner.read(tail) {
+                Ok(0) => {
+                    self.eof = true;
+                    break;
+                }
+                Ok(read) => filled.len = filled.len.saturating_add(read),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    self.pending_error = Some(error);
+                    break;
+                }
+            }
+        }
+        if filled.len == 0 {
+            self.spare = Some(chunk);
+            return self.pending_error.take().map_or(Ok(()), Err);
+        }
+        self.hash_tx
+            .as_ref()
+            .ok_or_else(|| invalid_data("compressed input read after hashing finished"))?
+            .send(std::sync::Arc::clone(&chunk))
+            .map_err(|_| invalid_data("compressed hash stage stopped"))?;
+        self.current = Some(chunk);
+        Ok(())
     }
 }
 
-impl DigestingReader<std::fs::File> {
-    fn finish_hash_and_advise_dontneed(self, path: &Path, operation: &'static str) -> String {
+impl HashedCompressedInput<std::fs::File> {
+    fn finish_hash_and_advise_dontneed(
+        mut self,
+        path: &Path,
+        operation: &'static str,
+    ) -> Result<String, RootfsZstdError> {
+        let hash = self.finish_hash();
         page_cache::advise_dontneed(&self.inner, path, operation);
-        self.finish_hash()
+        hash
     }
 }
 
-impl<R: Read> Read for DigestingReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let read = self.inner.read(buf)?;
-        if read > 0 {
-            let bytes = buf
-                .get(..read)
-                .ok_or_else(|| invalid_data("read byte count exceeded digest buffer"))?;
-            self.hasher.update(bytes);
+impl<R: Read> std::io::BufRead for HashedCompressedInput<R> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        let exhausted = self
+            .current
+            .as_ref()
+            .is_none_or(|chunk| self.position >= chunk.len);
+        if exhausted && (!self.eof || self.pending_error.is_some()) {
+            self.next_chunk()?;
         }
+        match self.current.as_ref() {
+            Some(chunk) => chunk
+                .bytes()?
+                .get(self.position..)
+                .ok_or_else(|| invalid_data("compressed read position exceeded chunk length")),
+            None => Ok(&[]),
+        }
+    }
+
+    fn consume(&mut self, amount: usize) {
+        self.position = self.position.saturating_add(amount);
+    }
+}
+
+impl<R: Read> Read for HashedCompressedInput<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let available = std::io::BufRead::fill_buf(self)?;
+        let read = available.len().min(buf.len());
+        buf.get_mut(..read)
+            .zip(available.get(..read))
+            .ok_or_else(|| invalid_data("compressed read exceeded available bytes"))
+            .map(|(target, source)| target.copy_from_slice(source))?;
+        std::io::BufRead::consume(self, read);
         Ok(read)
     }
+}
+
+impl<R> Drop for HashedCompressedInput<R> {
+    fn drop(&mut self) {
+        self.hash_tx.take();
+        if let Some(handle) = self.hash_handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn hash_compressed_rootfs_chunks(
+    chunk_rx: Receiver<std::sync::Arc<CompressedInputChunk>>,
+    free_tx: SyncSender<std::sync::Arc<CompressedInputChunk>>,
+) -> Result<String, RootfsZstdError> {
+    let mut hasher = sha256_hasher();
+    for chunk in chunk_rx {
+        hasher.update(chunk.bytes().map_err(|_| RootfsZstdError::Pipeline {
+            operation: "read compressed chunk bytes",
+        })?);
+        // The reader may have stopped; a closed pool only ends recycling.
+        let _ = free_tx.send(chunk);
+    }
+    Ok(sha256_digest(hasher))
 }
 
 fn write_decoded_rootfs_chunks(

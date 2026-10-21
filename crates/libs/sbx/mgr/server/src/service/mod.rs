@@ -159,6 +159,8 @@ const CLEANUP_RETRY_INITIAL_DELAY_SECS: u64 = 1;
 const CLEANUP_RETRY_MAX_DELAY_SECS: u64 = 30;
 const TEARDOWN_SUSPEND_DRIVER_CONCURRENCY: usize = 4;
 const FORK_COPY_CONCURRENCY: usize = 1;
+const FORK_COPY_MAX_QUEUED: usize = 4;
+const FORK_COPY_MAX_WAIT: Duration = Duration::from_secs(5);
 
 const RESUME_CLOCK_SYNC_TIMEOUT: Duration = Duration::from_secs(5);
 // Foreground Stats should promptly fall back to recorded counters when the
@@ -391,9 +393,9 @@ pub struct SandboxManagerService {
     /// semaphore returns `Pending` to the shim, whose next poll retries
     /// admission without leaving an unbounded queue of tasks on this node.
     teardown_suspend_driver_sem: Arc<tokio::sync::Semaphore>,
-    /// Node-wide admission for durable artifact copies. The default remains
-    /// one copy at a time, while operators can tune the capacity explicitly.
-    fork_copy_sem: Arc<tokio::sync::Semaphore>,
+    /// Copies share one active slot and a bounded, deadline-limited queue.
+    /// Busy callers retry their durable operation before staging any data.
+    fork_copy_slots: pplx_space_common_grpc::QueuedSlots,
     fork_copy_waiting: Arc<AtomicUsize>,
     fork_copy_active: Arc<AtomicUsize>,
     /// In-flight operation staging roots owned by this service instance. The
@@ -941,12 +943,14 @@ fn persisted_activation_owns_route_identity(
     incoming: &RouteStreamEpochIdentity,
 ) -> Result<bool, Status> {
     let sandbox_id = sandbox_id.to_string();
-    let Some(episode) = crate::db::cleanup_episode(db, &sandbox_id)
+    let Some(episode) = crate::db::read::sandbox_view(db, &sandbox_id)
+        .cleanup_episode()
+        .strict()
         .map_err(|error| Status::internal(format!("db error: {error}")))?
     else {
         return Ok(false);
     };
-    let Some(sandbox) = crate::db::get_sandbox(db, &sandbox_id)
+    let Some(sandbox) = crate::db::read::sandbox(db, &sandbox_id)
         .map_err(|error| Status::internal(format!("db error: {error}")))?
     else {
         return Ok(false);
@@ -1246,7 +1250,7 @@ impl SandboxManagerService {
                     RouteIdentityAdoptionReason::Internal,
                 )
             })?;
-        let Some(sandbox) = crate::db::get_sandbox(&db, &sandbox_id.to_string())
+        let Some(sandbox) = crate::db::read::sandbox(&db, &sandbox_id.to_string())
             .map_err(|error| Status::internal(format!("db error: {error}")))
             .inspect_err(|_| {
                 route_identity_adoption(
@@ -1277,16 +1281,14 @@ impl SandboxManagerService {
             local.current_node_id = local.current_node_id.or(self.local_node_id);
         }
         let merged = merge_authoritative_route_identity(&local, incoming);
-        let metadata = crate::db::auto_lifecycle_delete_receipts::route_identity_adoption_metadata(
-            &db, sandbox_id,
-        )
-        .map_err(|error| Status::internal(format!("inspect route identity metadata: {error}")))
-        .inspect_err(|_| {
-            route_identity_adoption(
-                RouteIdentityAdoptionOutcome::Rejected,
-                RouteIdentityAdoptionReason::Internal,
-            );
-        })?;
+        let metadata = crate::db::read::route_identity_adoption(&db, sandbox_id)
+            .map_err(|error| Status::internal(format!("inspect route identity metadata: {error}")))
+            .inspect_err(|_| {
+                route_identity_adoption(
+                    RouteIdentityAdoptionOutcome::Rejected,
+                    RouteIdentityAdoptionReason::Internal,
+                );
+            })?;
         let candidate_provenance =
             crate::auto_lifecycle_delete_receipts::RouteIdentityProvenance::for_authoritative_adoption(
                 &local,
@@ -1315,10 +1317,9 @@ impl SandboxManagerService {
             // Equality of the route fields does not prove the migration-only
             // provenance and receipt mode are current. Persist an authoritative
             // observation even when it does not advance the stream epoch.
-            let pending_receipt =
-                crate::db::auto_lifecycle_delete_receipts::pending_receipt_for_sandbox(
-                    &db, sandbox_id,
-                )
+            let pending_receipt = crate::db::read::typed_sandbox_view(&db, sandbox_id)
+                .delete_receipts()
+                .pending()
                 .map_err(|error| {
                     route_identity_adoption(
                         RouteIdentityAdoptionOutcome::Rejected,
@@ -1460,7 +1461,7 @@ impl SandboxManagerService {
                 }
                 _ => ActivationRouteReplacementAuthority::Unowned,
             };
-            let persisted = crate::db::get_sandbox(&db, &sandbox_id.to_string())
+            let persisted = crate::db::read::sandbox(&db, &sandbox_id.to_string())
                 .map_err(|error| Status::internal(format!("db error: {error}")))?;
             if let Some(sandbox) = persisted.as_ref() {
                 validate_cold_start_provenance(sandbox, route_identity)?;
@@ -1520,7 +1521,7 @@ impl SandboxManagerService {
             sandbox.space_api_route_identity.clone(),
         )?;
         let db = self.db_conn()?;
-        let current = crate::db::get_sandbox(&db, &sandbox.id)
+        let current = crate::db::read::sandbox(&db, &sandbox.id)
             .map_err(|error| Status::internal(format!("db error: {error}")))?
             .ok_or_else(|| Status::not_found(format!("sandbox not found: {}", sandbox.id)))?;
         let current_identity = RouteStreamEpochIdentity::from_stream_attachment(
@@ -1677,7 +1678,7 @@ impl SandboxManagerService {
             .as_ref()
             .map(|bundle| bundle.generation.get());
         if options.node_role != Some(NodeRole::Worker) {
-            match crate::db::auto_lifecycle_delete_receipts::outbox_stats(&conn) {
+            match crate::db::read::counts(&conn, crate::db::read::DeleteOutbox) {
                 Ok(stats) if stats.pending_count.saturating_add(stats.completed_count) != 0 => {
                     tracing::warn!(
                         node_role = ?options.node_role,
@@ -1787,7 +1788,10 @@ impl SandboxManagerService {
             teardown_suspend_driver_sem: Arc::new(tokio::sync::Semaphore::new(
                 teardown_suspend_driver_concurrency,
             )),
-            fork_copy_sem: Arc::new(tokio::sync::Semaphore::new(FORK_COPY_CONCURRENCY)),
+            fork_copy_slots: pplx_space_common_grpc::QueuedSlots::new(Arc::new(
+                tokio::sync::Semaphore::new(FORK_COPY_CONCURRENCY),
+            ))
+            .with_queue(FORK_COPY_MAX_QUEUED, FORK_COPY_MAX_WAIT),
             fork_copy_waiting: Arc::new(AtomicUsize::new(0)),
             fork_copy_active: Arc::new(AtomicUsize::new(0)),
             active_fork_copy_operations: Arc::new(

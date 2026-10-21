@@ -104,8 +104,7 @@
 //! # What the budget doesn't cover
 //!
 //! * **The holder.** A holder that can't renew is forced out at `renew_deadline`
-//!   — `lease_ttl - 12s`, so 18s at the chart default and 48s at the 60s TTL
-//!   every cluster running election actually sets — by [`renew_loop`],
+//!   — `lease_ttl - 12s`, so 48s at the fixed 60s TTL — by [`renew_loop`],
 //!   independently of this budget. A restarted pod re-enters [`campaign`] as a
 //!   standby and can only reach that path by *acquiring*, which a lease-path
 //!   outage prevents — so during a sustained outage that exit happens at most
@@ -206,6 +205,13 @@ const DEFAULT_RETRY_INTERVAL: Duration = Duration::from_secs(8);
 /// `MissedTickBehavior::Delay` leaves the ticker already due when a timed-out
 /// call returns, so the next attempt starts immediately.
 const DEFAULT_LEASE_FAILURE_GRACE: Duration = Duration::from_secs(600);
+/// Test hook (`pplx_space_common_core::env::test_hook`) for the budget
+/// [`Timings::derive`] is asked for, in whole seconds; it is bounded and
+/// spread like the default. Lets a Kind scenario wait out a budget at its
+/// floor instead of this default. Inert unless the `test-hooks` feature is
+/// compiled in.
+const LEASE_FAILURE_GRACE_TEST_ENV: &str =
+    "SPACE_CLUSTER_CONTROLLER_LEADER_ELECTION_LEASE_FAILURE_GRACE_SECS";
 
 /// Floor for the liveness budget as a multiple of the resolved lease TTL: a
 /// budget near the lease timings would restart the pod on exactly the transients
@@ -225,7 +231,7 @@ const MIN_GRACE_LEASE_TTL_MULTIPLE: u32 = 4;
 /// floor still has to catch. The floor is this multiple of the **resolved** retry
 /// interval: for example, 60s at `2s` and 240s at `8s`. The retry ceiling bounds
 /// the worst it can reach — 300s at a 30s TTL, 900s at a 60s TTL — which keeps a
-/// wide `retryIntervalSecs` from floating the floor out of reach.
+/// wide retry interval from floating the floor out of reach.
 /// Counted in intervals throughout, since the attempt count depends on the
 /// failure shape.
 const MIN_GRACE_RETRY_INTERVALS: u32 = 30;
@@ -378,10 +384,10 @@ const RENEW_DEADLINE_MARGIN: Duration =
 /// Ceiling for the lease TTL. The TTL bounds crash-failover time, so a value
 /// beyond a few minutes is already a misconfiguration — but without a ceiling it
 /// is also the one knob that can defeat the liveness budget from above: at
-/// `leaseTtlSecs: 30000` (a plausible seconds-for-millis slip) the TTL-based
-/// grace floor becomes ~33 hours, so the budget is floored to a value it can
-/// never reach and the exit is silently dead. Clamping here is what makes
-/// [`Timings`]'s "no combination of env values is unsafe" claim actually true.
+/// a 30000s TTL (a plausible seconds-for-millis slip) the TTL-based grace floor
+/// becomes ~33 hours, so the budget is floored to a value it can never reach
+/// and the exit is silently dead. Clamping here keeps [`Timings`]'s bounds
+/// consistent for any TTL it is given.
 const MAX_LEASE_TTL: Duration = Duration::from_secs(300);
 
 /// Floor for the lease TTL: it must leave a renew deadline
@@ -389,11 +395,12 @@ const MAX_LEASE_TTL: Duration = Duration::from_secs(300);
 /// attempts. Requests below this are bumped up with a warning.
 const MIN_LEASE_TTL: Duration = Duration::from_secs(RENEW_DEADLINE_MARGIN.as_secs() + 6);
 
-/// Deploy-time knobs for the election, resolved once from the environment. The
-/// operator-facing knobs are [`Self::lease_ttl`], [`Self::retry_interval`] and
-/// [`Self::lease_failure_grace`]; the renewal cadence and deadline are *derived*
-/// from the TTL, and the other two are bounded against it (see [`Timings`]), so
-/// the safety relationships can't be misconfigured.
+/// The election's settings, resolved once from the environment, which supplies
+/// the kill-switch and the identity (`HOSTNAME`). [`Self::lease_ttl`],
+/// [`Self::retry_interval`] and [`Self::lease_failure_grace`] are this module's
+/// defaults, and the budget alone has a test-hook override. The renewal cadence and deadline are
+/// *derived* from the TTL, and the other two are bounded against it (see
+/// [`Timings`]), so the safety relationships hold whatever is requested.
 #[derive(Debug, Clone)]
 pub struct LeaderElectionConfig {
     /// Stable per-replica identity written into the lease's `holder_id`
@@ -445,16 +452,23 @@ impl LeaderElectionConfig {
     }
 
     pub fn from_env() -> Self {
-        let identity = election_identity();
+        Self::from_environment(&pplx_space_common_core::env::ProcessEnvironment)
+    }
+
+    pub(crate) fn from_environment(env: &dyn pplx_space_common_core::env::Environment) -> Self {
+        let config = crate::env_config::EnvConfig(env);
+        let identity = election_identity(env);
+        let requested_grace =
+            config.test_duration_secs(LEASE_FAILURE_GRACE_TEST_ENV, DEFAULT_LEASE_FAILURE_GRACE);
         let timings = Timings::derive(
             DEFAULT_LEASE_TTL,
             DEFAULT_RETRY_INTERVAL,
-            Some(PositiveDuration::new_panic(DEFAULT_LEASE_FAILURE_GRACE)),
+            Some(PositiveDuration::new_panic(requested_grace)),
             &identity,
         );
         Self {
             identity,
-            enabled: crate::env_config::truthy_default(ENABLED_ENV, true),
+            enabled: config.truthy_default(ENABLED_ENV, true),
             lease_ttl: timings.lease_ttl,
             renew_deadline: timings.renew_deadline,
             renew_interval: timings.renew_interval,
@@ -465,8 +479,8 @@ impl LeaderElectionConfig {
     }
 }
 
-/// The resolved lease timings. Three knobs are operator-facing — the TTL, the
-/// retry interval and the liveness budget — and each is bounded here against the
+/// The resolved lease timings. Three are requested — the TTL, the retry
+/// interval and the liveness budget — and each is bounded here against the
 /// *resolved* values of the ones it interacts with, rather than trusted:
 ///
 /// * `lease_ttl` into `MIN_LEASE_TTL..MAX_LEASE_TTL`;
@@ -515,7 +529,7 @@ impl Timings {
         // The retry interval is capped three ways, because it is doing three jobs.
         //
         // 1. `MAX_RETRY_INTERVAL`, which holds the cadence-based grace floor to
-        //    900s. Bound 3 below already caps a typo'd `retryIntervalSecs` well
+        //    900s. Bound 3 below already caps a typo'd retry interval well
         //    short of absurd, so this is about the plausible-but-too-wide range
         //    it leaves: at a 300s TTL bound 3 alone permits ~190s, a floor over
         //    an hour and a half, which most pods would not live to spend.
@@ -533,9 +547,9 @@ impl Timings {
         //    first renewal tick, releases the lease, exits non-zero, re-acquires
         //    and repeats — a crash-loop with no reconciler running that the
         //    liveness budget never even sees, because every call *succeeded*.
-        //    Reachable at `leaseTtlSecs: 30` with `retryIntervalSecs: 25`, which
-        //    the TTL cap alone accepts. Leaving room for one renewal attempt
-        //    inside the deadline, plus `FIRST_RENEWAL_HEADROOM`, rules it out.
+        //    Reachable at a 30s TTL with a 25s retry interval, which the TTL
+        //    cap alone accepts. Leaving room for one renewal attempt inside the
+        //    deadline, plus `FIRST_RENEWAL_HEADROOM`, rules it out.
         //
         // Floored at 1s as well: `env_config::duration_secs` already rejects 0,
         // but `interval(Duration::ZERO)` panics, so the precondition belongs next
@@ -646,9 +660,9 @@ fn spread_across_replicas(grace: PositiveDuration, identity: &str) -> PositiveDu
 /// `HOSTNAME` (Kubernetes sets it to the pod name), else a random UUID so two
 /// replicas can never accidentally share an identity and both believe they
 /// hold the lease.
-fn election_identity() -> String {
+fn election_identity(env: &dyn pplx_space_common_core::env::Environment) -> String {
     for var in ["HOSTNAME"] {
-        if let Ok(value) = std::env::var(var) {
+        if let Ok(value) = env.var(var) {
             let trimmed = value.trim();
             if !trimmed.is_empty() {
                 return trimmed.to_string();

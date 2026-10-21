@@ -9,6 +9,12 @@ acts on. This module is the typed form of the opt-in shell suite that proved
 them by reading cluster-controller log lines off the nodes; every verdict here
 comes from state instead.
 
+- **A budget sized for one run.** The liveness budget ships at 600 s. This
+  run asks for its floor through the controller's test hook, which every
+  replica and the contender read at startup, records the Deployment's standing
+  value first and puts it back in its last phase. The outage runs first: its
+  budget exit has to land within the requested budget's ceiling, so a binary
+  that ignored the hook fails there, before the refusal is judged against it.
 - **One leader, one runner.** Two healthy replicas, the Lease naming one of
   them with a fresh `renewTime`, and exactly one pod whose
   `space.cluster_reconciler.loop_latency_ms` tick count moves. Every
@@ -20,9 +26,18 @@ comes from state instead.
   acquisition: a holder that restarts keeps its name and can keep its
   `acquireTime`, so an older anchor would credit it with its predecessor's
   ticks. The window stays open for two of the slowest loop's 60 s ticks, so a
-  second runner that starts late is still seen.
+  second runner that starts late is still seen. That is judged once the
+  apiserver is back, with the refused contender already running, and opens at
+  the restore, so the outage's record checks run inside it. Before the outage
+  the window lasts one tick of every loop plus two exports, enough to show the
+  holder ticking and no other process ticking throughout, which the outage's
+  check that the holder's ticks stop relies on.
 - **A refused lease call is not a restart.** A third contender runs the
   controller's own pod template under a ServiceAccount with no `leases` grant.
+  It is placed before the outage, held by a gate container, and released once
+  the apiserver is back, so its controller's first lease call follows the
+  restore. The watch ends a budget ceiling, a retry interval and the time a
+  restart takes to show after its first refused call reaches Prometheus.
   Prometheus shows its `acquire_failed{reason="refused"}`; it stays NotReady
   with `restartCount` 0 for the whole liveness-budget ceiling counted from its
   container's start, and the healthy pair keeps its holder throughout.
@@ -49,7 +64,8 @@ comes from state instead.
 
 The readiness marker is the file the controller's readiness probe tests, read
 through the node's CRI; container exits are read there too during the outage,
-because nothing else answers then. Logs are never read for a verdict: the
+because nothing else answers then, and from the node's containerd events,
+because kubelet can remove an exited container before any read lists it. Logs are never read for a verdict: the
 controller's container logs are attached to a failure as evidence.
 
 Not covered, as in the shell suite: the `overloaded` category (nothing in Kind
@@ -71,26 +87,53 @@ import time
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any, TypeVar
 
-from space_smoke.capabilities import ControllerLease, ControllerPod, LeaderElectionControl, NodeContainer
+from space_smoke.capabilities import (
+    ControllerLease,
+    ControllerPod,
+    LeaderElectionControl,
+    NodeContainer,
+    NodeExitWatch,
+)
 from space_smoke.runtime import Compensation, ResourceScope, SmokeConfigurationError
 
 if TYPE_CHECKING:
     from space_smoke.fixtures import KindEcw
 
-# The timings `LeaderElectionConfig::from_env` resolves, which no Kubernetes
-# object or metric exposes (crates/libs/cluster/controller/server/src/
-# leader_election/mod.rs): a standby retries every 8 s, and the liveness budget
-# is 600 s plus a per-pod spread of up to a quarter of it. The Lease's own
-# `leaseDurationSeconds` is read from the Lease.
+# The timings `LeaderElectionConfig::from_environment` resolves
+# (crates/libs/cluster/controller/server/src/leader_election/mod.rs), which
+# nothing but the Lease's `leaseDurationSeconds` exposes: the lease TTL
+# (DEFAULT_LEASE_TTL, checked against the Lease) and the standby retry
+# interval (DEFAULT_RETRY_INTERVAL). The liveness budget is the requested one
+# raised to at least MIN_GRACE_LEASE_TTL_MULTIPLE TTLs and
+# MIN_GRACE_RETRY_INTERVALS retries, plus a per-pod spread of up to
+# 1/GRACE_SPREAD_DIVISOR of it. The crate pins each of these with a
+# compile-time assert; change them here with it. This run requests the floor,
+# so every wait for a budget is bounded by the floor's ceiling.
+LEASE_TTL_SECONDS = 60
 RETRY_INTERVAL_SECONDS = 8.0
-LIVENESS_BUDGET_CEILING_SECONDS = 600.0 * 1.25
+LIVENESS_BUDGET_SECONDS = max(4 * LEASE_TTL_SECONDS, 30 * int(RETRY_INTERVAL_SECONDS))
+LIVENESS_BUDGET_SPREAD = 1 + 1 / 4
+# Past the first refused call plus the budget's ceiling and one retry interval
+# (the attempt that would cross it), how long until a contender whose
+# refusals spent its budget shows the restart: its exit runs only the metric
+# and trace providers' shutdowns (5 s each, crates/libs/observability); kubelet
+# notices within a PLEG relist (1 s), restarts a first exit at once, and
+# reports the restart count within its status batch (10 s); the watch reads
+# every 5 s. That is 26 s; 30 s leaves room for a loaded node.
+REFUSAL_RESTART_SEEN_SECONDS = 30.0
 # The OTLP metric export interval (crates/libs/observability/src/sink/otlp.rs).
 EXPORT_INTERVAL_SECONDS = 10.0
-# The slowest interval among the loops that record the reconciler tick
-# histogram: 60 s for started_sandbox_repair, failed_restorable_repair,
-# suspended_execution_reaper, transient_lifecycle_sweeper and the two pod GCs;
-# the warm pool's is 5 s.
+# The interval of the loops that record the reconciler tick histogram in Kind:
+# 60 s for started_sandbox_repair, failed_restorable_repair,
+# transient_lifecycle_sweeper and the two pod GCs. The warm pool's 5 s loop
+# records it only with its orphan GC on, which Kind leaves off.
 SLOWEST_TICK_SECONDS = 60.0
+# A process that runs the reconcilers throughout this window records a tick of
+# every loop above in its first 60 s, and exports it with an export interval
+# to spare, even when it started in the same second as the holder and its
+# first tick fell just before the window opened. Before the outage this
+# shows the holder running and no other process running throughout.
+ONE_TICK_WINDOW_SECONDS = SLOWEST_TICK_SECONDS + 2 * EXPORT_INTERVAL_SECONDS
 # How far past the Lease's expiry the holder's process may still exit. It stops
 # acting at its renew deadline, the duration less RENEW_DEADLINE_MARGIN (12 s),
 # after its last confirmed renewal, whose call was issued before the
@@ -116,6 +159,17 @@ LEASE_LOST = "space_cluster_controller_leader_election_lease_lost_total"
 LEASE_UNREACHABLE = "space_cluster_controller_leader_election_lease_unreachable_total"
 
 POLL_SECONDS = 2.0
+# Cleanup's time plan after a failure with the apiserver down. Its budget is
+# shared, min(120 s, 10 % of the scenario timeout), so 120 s at the 30-minute
+# default, and its compensations run in this order. The apiserver's restore:
+# the node exec within APISERVER_RESTORE_SECONDS, then /readyz probes until
+# APISERVER_ANSWER_SECONDS, the last bounded at 10 s, so 40 s at most. The
+# budget's restore: two tries of an ownership read and the env write, 32 s.
+# The contender's deletion, 8 s, and the mutation Lease's release, a read and
+# a patch, 16 s (8 s per request, CLEANUP_REQUEST_SECONDS in adapters.py).
+# That is 96 s, which leaves the fixture's own compensations 24 s.
+APISERVER_RESTORE_SECONDS = 10.0
+APISERVER_ANSWER_SECONDS = 20.0
 LOG_TAIL_LINES = 40
 
 T = TypeVar("T")
@@ -135,11 +189,17 @@ class LeaderElectionAssertions:
         self._contender: ControllerPod | None = None
         self._remove_contender: Compensation | None = None
         self._restore_apiserver: Compensation | None = None
+        self._restore_budget: Compensation | None = None
+        self._standing_budget: str | None = None
+        # The ceiling of the budget this run requested, once it is live.
+        self._budget_ceiling: float | None = None
         self._outage_started = 0.0
         # When the restore was requested: no Lease can be acquired before it.
         self._restore_requested = 0.0
         self._lease_before_outage: ControllerLease | None = None
         self._budget_exit: tuple[str, NodeContainer] | None = None
+        # The initial check's Lease and the instant its runner window may open.
+        self._initial: tuple[ControllerLease, float] | None = None
         # Pod name -> node, for reading container state and logs while the
         # apiserver is down.
         self._nodes: dict[str, str] = {}
@@ -147,6 +207,10 @@ class LeaderElectionAssertions:
         self._markers: list[tuple[str, str]] = []
         # Pod name -> the container ids running when the outage began.
         self._running_before: dict[str, set[str]] = {}
+        # Pod name -> every container id the node's runtime has listed for it.
+        self._listed: dict[str, set[str]] = {}
+        # Node -> its containerd's exit events, recorded through the outage.
+        self._exit_watches: dict[str, NodeExitWatch] = {}
 
     # --- setup ----------------------------------------------------------------
 
@@ -166,37 +230,191 @@ class LeaderElectionAssertions:
             )
         release = self._control.acquire_retention_sweeper_mutation()
         self._scope.defer("release the Kind mutation Lease", release, critical=True)
+        # A contender a killed run left behind, in this shape or an earlier one.
+        self._control.remove_refused_contender()
         self._control_plane = self._control.control_plane_node()
         self._fixture.record("control_plane_node", self._control_plane)
 
-    def start_refused_contender(self) -> None:
-        """Start the contender with no `leases` grant and wait for its container."""
+    def shrink_liveness_budget(self) -> None:
+        """Record the standing budget hook, request the floor and await the rollout."""
 
-        # Armed before dispatch: an apply whose reply is lost may still commit.
+        standing = self._control.controller_liveness_budget_env()
+        self._standing_budget = standing
+        self._fixture.record("liveness_budget_env_before", standing)
+        # Cleanup runs these after the apiserver's restore and before the
+        # mutation Lease's release, in reverse: the budget's write first, then
+        # the contender's deletion. Neither waits, so after a failed outage
+        # both fit the shared cleanup budget and the Lease is still released;
+        # the phases at the end wait for the rollout and the deletion instead.
+        # The contender's is armed here, before its pod exists, because its
+        # deletion is idempotent; the budget's before the write, so a set that
+        # half-applies is still put back.
         self._remove_contender = self._scope.defer(
             "remove the refused leader-election contender",
-            self._control.remove_refused_contender,
+            lambda: self._control.remove_refused_contender(wait=False),
             critical=True,
         )
-        self._control.start_refused_contender()
+        self._restore_budget = self._scope.defer(
+            "restore the standing leader-election liveness budget",
+            lambda: self._control.restore_controller_liveness_budget_env(standing, wait=False),
+            critical=True,
+        )
+        requested = str(LIVENESS_BUDGET_SECONDS)
+        self._control.set_controller_liveness_budget_env(requested)
+        live = self._control.controller_liveness_budget_env()
+        self._fixture.verify(
+            live == requested,
+            "the rolled cluster-controller does not carry this run's liveness budget",
+            requested=requested,
+            live=live,
+        )
+        self._budget_ceiling = LIVENESS_BUDGET_SECONDS * LIVENESS_BUDGET_SPREAD
+        self._fixture.record(
+            "liveness_budget", {"requested": requested, "ceiling_seconds": self._budget_ceiling}
+        )
+
+    def restore_liveness_budget(self) -> None:
+        """Put the standing budget hook back and check it took."""
+
+        if self._restore_budget is None:
+            return
+        standing = self._standing_budget
+        self._control.restore_controller_liveness_budget_env(standing)
+        after = self._control.controller_liveness_budget_env()
+        self._fixture.verify(
+            after == standing,
+            "the controller's liveness-budget env did not come back to its standing value",
+            standing=standing,
+            after=after,
+        )
+        self._fixture.record("liveness_budget_env_after", after)
+        self._restore_budget.disarm()
+        self._restore_budget = None
+
+    def _ceiling(self) -> float:
+        if self._budget_ceiling is None:
+            raise RuntimeError("the liveness budget was not shrunk before a wait was bounded by it")
+        return self._budget_ceiling
+
+    def place_refused_contender(self) -> None:
+        """Place the contender with no `leases` grant, held before its first lease call.
+
+        Its removal is armed by `shrink_liveness_budget`, before this dispatch.
+        """
+
+        self._control.place_refused_contender()
+        # Cloned from the live Deployment, so it carries the same budget the
+        # outage is about to show that image honours.
+        inherited = self._control.controller_liveness_budget_env(refused_contender=True)
+        self._fixture.verify(
+            inherited == str(LIVENESS_BUDGET_SECONDS),
+            "the refused contender does not carry this run's liveness budget, so its watch "
+            "would end before its own budget could",
+            inherited=inherited,
+        )
+
+    def start_refused_contender(self) -> None:
+        """Release the placed contender and wait for its controller container.
+
+        Released only once a healthy replica has renewed the Lease since the
+        restore: the apiserver can answer on its host port a minute or more
+        before pods reach it through the cluster's Service, and the
+        contender's calls in that gap would be unreachable, which charges its
+        budget, rather than refused. A container that started before the
+        restore fails here.
+        """
+
+        before = self._lease_before_outage
+        assert before is not None
+        # Nothing renews the Lease while the apiserver is down, so a renewal
+        # newer than the outage's last one was written after the restore.
+        self._poll(
+            "a healthy replica to renew the Lease through the cluster after the restore",
+            self._control.controller_lease,
+            lambda lease: lease is not None and lease.renew_time > before.renew_time,
+            timeout=300,
+            tolerate_errors=True,
+        )
+        self._control.release_refused_contender()
         pods = self._poll(
             "the refused contender's container to start",
             lambda: self._control.controller_pods(refused_contender=True),
             lambda pods: len(pods) == 1 and pods[0].started_at is not None,
             timeout=180,
+            tolerate_errors=True,
         )
-        self._contender = pods[0]
-        self._nodes[pods[0].name] = pods[0].node
+        contender = pods[0]
+        assert contender.started_at is not None
+        self._fixture.verify(
+            contender.restart_count == 0
+            and contender.started_at + KUBE_TIME_RESOLUTION_SECONDS >= self._restore_requested,
+            "the refused contender's controller started before the apiserver was restored",
+            contender_started_at=contender.started_at,
+            restore_requested_at=self._restore_requested,
+            contender_restarts=contender.restart_count,
+        )
+        self._contender = contender
+        self._nodes[contender.name] = contender.node
         self._fixture.record(
-            "refused_contender", {"pod": pods[0].name, "started_at": pods[0].started_at}
+            "refused_contender", {"pod": contender.name, "started_at": contender.started_at}
         )
 
     # --- one leader, one runner -------------------------------------------------
 
-    def expect_one_leader(self, *, label: str, timeout: float = 180) -> str:
-        """Two Ready replicas, a holder renewing among them, and only it reconciling."""
+    def expect_one_leader(self, *, label: str, since: float | None = None, timeout: float = 180) -> str:
+        """Two Ready replicas, a holder renewing among them, and only it reconciling.
+
+        The window opens no earlier than `since`, the phase start by default.
+        """
+
+        since = time.time() if since is None else since
+        lease = self.expect_a_holder(label=label, since=since, timeout=timeout)
+        self._expect_only_runner(lease, label=label, since=since)
+        return lease.holder
+
+    def expect_initial_holder(self) -> None:
+        """Two Ready replicas and a renewing holder, on the TTL the budget's floor assumes.
+
+        The runner window that `expect_initial_runner` judges may open as
+        early as this check's start.
+        """
 
         since = time.time()
+        lease = self.expect_a_holder(label="initial", since=since)
+        self._fixture.verify(
+            lease.duration_seconds == LEASE_TTL_SECONDS,
+            f"the Lease lasts {lease.duration_seconds}s, but the liveness budget this run requests "
+            f"is the floor of a {LEASE_TTL_SECONDS}s TTL",
+        )
+        self._initial = (lease, since)
+
+    def expect_initial_runner(self) -> None:
+        """Before the outage, only the holder reconciles, for one tick of every loop.
+
+        The outage's later checks that the holder's ticks stop are only as
+        good as this proof that it was ticking.
+        """
+
+        assert self._initial is not None
+        lease, since = self._initial
+        self._expect_only_runner(lease, label="initial", since=since, window=ONE_TICK_WINDOW_SECONDS)
+
+    def expect_recovered_leader(self) -> str:
+        """One fresh holder and one runner, judged from the restore on.
+
+        Nothing could hold the Lease before the restore, so the window may
+        open there, and the outage's record checks that ran since count
+        toward it.
+        """
+
+        return self.expect_one_leader(label="recovered", since=self._restore_requested, timeout=300)
+
+    def expect_a_holder(
+        self, *, label: str, since: float | None = None, timeout: float = 180
+    ) -> ControllerLease:
+        """Two Ready replicas and a holder among them that renewed since `since`."""
+
+        since = time.time() if since is None else since
 
         def settled() -> tuple[list[ControllerPod], ControllerLease | None]:
             return self._live_healthy_pods(), self._control.controller_lease()
@@ -223,18 +441,25 @@ class LeaderElectionAssertions:
             {"holder": lease.holder, "renew_time": lease.renew_time,
              "acquire_time": lease.acquire_time, "transitions": lease.transitions},
         )
-        self._expect_only_runner(lease, label=label, since=since)
-        return lease.holder
+        return lease
 
-    def _expect_only_runner(self, lease: ControllerLease, *, label: str, since: float) -> None:
+    def _expect_only_runner(
+        self,
+        lease: ControllerLease,
+        *,
+        label: str,
+        since: float,
+        window: float = 2 * SLOWEST_TICK_SECONDS,
+    ) -> None:
         """Only the holder's reconciler tick count moves in a window opened now.
 
         The window opens at the latest of `since`, the holder's current
         container start and its acquisition. Each series' count at that
         instant is its baseline, so a series that first appears inside the
         window counts from zero rather than from its first sample. It stays
-        open for two of the slowest loop's ticks and until the holder's count
-        has moved; any other pod's count moving fails at once.
+        open for `window`, by default two of the slowest loop's ticks so a
+        second runner that starts late is still seen, and until the holder's
+        count has moved; any other pod's count moving fails at once.
         """
 
         holder_started = self._healthy[lease.holder].started_at or 0.0
@@ -245,7 +470,7 @@ class LeaderElectionAssertions:
             holder_started + KUBE_TIME_RESOLUTION_SECONDS,
             (lease.acquire_time or 0.0) + KUBE_TIME_RESOLUTION_SECONDS,
         )
-        closes = opened + 2 * SLOWEST_TICK_SECONDS
+        closes = opened + window
         # The candidates: both replicas, and the refused contender if it runs.
         pods = sorted({*self._healthy, *([self._contender.name] if self._contender else [])})
         selector = f'{{k8s_pod_name=~"{"|".join(pods)}"}}'
@@ -302,26 +527,30 @@ class LeaderElectionAssertions:
         contender = self._contender
         assert contender is not None and contender.started_at is not None
 
-        def refused() -> float:
-            return sum(
-                float(sample["value"][1])
-                for sample in self._prometheus(
-                    f'{ACQUIRE_FAILED}{{reason="refused", k8s_pod_name="{contender.name}"}}'
-                )
-            )
-
-        refusals = self._poll(
-            "the contender's refused lease calls to reach Prometheus",
-            refused,
-            lambda count: count > 0,
+        # The contender's name is fixed, so a series an earlier run left can
+        # still answer an instant query; only an increment since this
+        # container started is this contender's.
+        first_refused = self._poll(
+            "the contender's first refused lease call to reach Prometheus",
+            lambda: self._first_increment(
+                f'{ACQUIRE_FAILED}{{reason="refused", k8s_pod_name="{contender.name}"}}',
+                since=contender.started_at - KUBE_TIME_RESOLUTION_SECONDS,
+            ),
+            lambda at: at is not None,
             timeout=120,
+            tolerate_errors=True,
         )
-        self._fixture.record("contender_refused_calls", refusals)
+        assert first_refused is not None
 
-        # A budget that charged refusals would end the process one budget after
-        # its first lease call, which follows the container's start.
-        until = contender.started_at + LIVENESS_BUDGET_CEILING_SECONDS + 2 * RETRY_INTERVAL_SECONDS
-        self._fixture.record("contender_watched_until", until)
+        # A budget that charged refusals would start at the first refused
+        # call, stamped no earlier than the sample that shows it, and end the
+        # process on the attempt that crosses its ceiling.
+        until = first_refused + self._ceiling() + RETRY_INTERVAL_SECONDS + REFUSAL_RESTART_SEEN_SECONDS
+        self._fixture.record(
+            "contender_refusals",
+            {"first_after_start_seconds": round(first_refused - contender.started_at, 1),
+             "watched_until": until},
+        )
         lease = self._control.controller_lease()
         assert lease is not None
         while True:
@@ -379,8 +608,11 @@ class LeaderElectionAssertions:
         self._expect_only_runner(lease, label="refused", since=watch_started)
 
     def remove_refused_contender(self) -> None:
+        """Delete the contender and wait for its pod to be gone."""
+
+        self._control.remove_refused_contender()
         if self._remove_contender is not None:
-            self._remove_contender.release()
+            self._remove_contender.disarm()
         self._contender = None
 
     # --- the apiserver outage ------------------------------------------------------
@@ -407,6 +639,13 @@ class LeaderElectionAssertions:
         }
         self._fixture.record("readiness_markers_before_outage", [pod for pod, _ in markers])
 
+        # Started before the fault, so every controller container's exit
+        # during it is recorded as containerd reports it.
+        for controller_node in sorted({pod.node for pod in self._healthy.values()}):
+            exits = self._control.watch_node_container_exits(controller_node)
+            self._scope.defer(f"stop the container exit watch on {controller_node}", exits.stop)
+            self._exit_watches[controller_node] = exits
+
         node = self._control_plane
         # Started before the fault, so it has delivered every renewal the
         # apiserver committed by the time it stops answering.
@@ -419,8 +658,10 @@ class LeaderElectionAssertions:
         self._fixture.verify(before is not None, "the cluster-controller has no Lease to anchor the outage on")
 
         def restore() -> None:
-            self._control.restore_apiserver(node)
-            deadline = time.monotonic() + 90
+            # It answers within seconds of the restore; bounded by cleanup's
+            # time plan (by APISERVER_RESTORE_SECONDS), so what follows still runs.
+            self._control.restore_apiserver(node, timeout=APISERVER_RESTORE_SECONDS)
+            deadline = time.monotonic() + APISERVER_ANSWER_SECONDS
             while not self._control.apiserver_answers() and time.monotonic() < deadline:
                 time.sleep(POLL_SECONDS)
 
@@ -498,7 +739,7 @@ class LeaderElectionAssertions:
         running = self._running_before[holder]
 
         def ended() -> list[NodeContainer]:
-            return [c for c in self._containers(holder) if c.container_id in running and not c.running]
+            return [container for container in self._exits(holder) if container.container_id in running]
 
         due = expiry + HOLDER_EXIT_AFTER_EXPIRY_SECONDS
         # Read past `due`, so a late exit is measured rather than timed out on.
@@ -533,19 +774,19 @@ class LeaderElectionAssertions:
         assert lease is not None
         # Nothing holds the Lease after it lapses with the apiserver down, so no
         # later exit is a resignation; the holder's own container is left out
-        # in case it ended late, which `expect_outage_recorded` reports.
+        # in case it ended late, which `expect_outage_recorded` reports. A
+        # budget the requested one did not bound, such as the shipped 600 s,
+        # exits after this deadline.
         lapsed = _latest_expiry(lease)
         resigned = self._running_before[lease.holder]
-        until = self._outage_started + LIVENESS_BUDGET_CEILING_SECONDS + 120
+        until = self._outage_started + self._ceiling() + 120
 
         def exited() -> list[tuple[str, NodeContainer]]:
             return [
                 (pod, container)
                 for pod in self._healthy
-                for container in self._containers(pod)
-                if not container.running
-                and (container.finished_at or 0) > lapsed
-                and container.container_id not in resigned
+                for container in self._exits(pod)
+                if (container.finished_at or 0) > lapsed and container.container_id not in resigned
             ]
 
         found = self._poll(
@@ -566,6 +807,8 @@ class LeaderElectionAssertions:
             f"{pod} exited {container.exit_code} after the Lease lapsed; a spent budget exits non-zero",
             failure_evidence=self._log_evidence,
         )
+        for exits in self._exit_watches.values():
+            exits.stop()
 
     def bring_the_apiserver_back(self) -> None:
         self._restore_requested = time.time()
@@ -599,10 +842,12 @@ class LeaderElectionAssertions:
         self._fixture.record(
             "restarts_after_outage", {name: pods[name].restart_count for name in before if name in pods}
         )
-        self._fixture.verify(
-            pods[spender].last_exit_code not in (None, 0),
-            f"{spender}'s last container exited {pods[spender].last_exit_code}",
-            failure_evidence=self._log_evidence,
+        # The spender's non-zero exit is judged from containerd's record in
+        # `expect_budget_exit`. kubelet's last termination is evidence only:
+        # it reports none for a container it removed as it restarted it.
+        self._fixture.record(
+            "spender_last_termination",
+            {"exit_code": pods[spender].last_exit_code, "finished_at": pods[spender].last_finished_at},
         )
 
         lost = self._poll(
@@ -667,7 +912,35 @@ class LeaderElectionAssertions:
         return [pod for pod in self._control.controller_pods() if not pod.deleting]
 
     def _containers(self, pod: str) -> list[NodeContainer]:
-        return self._control.node_controller_containers(self._nodes[pod], pod)
+        containers = self._control.node_controller_containers(self._nodes[pod], pod)
+        self._listed.setdefault(pod, set()).update(container.container_id for container in containers)
+        return containers
+
+    def _exits(self, pod: str) -> list[NodeContainer]:
+        """The pod's ended controller containers.
+
+        Those the node's runtime lists as exited, and those it no longer lists
+        whose exit its containerd reported: kubelet can remove an exited
+        container as soon as it starts the next one, before any listing shows
+        it exited.
+        """
+
+        containers = self._containers(pod)
+        ended = {container.container_id: container for container in containers if not container.running}
+        listed = {container.container_id for container in containers}
+        watch = self._exit_watches.get(self._nodes[pod])
+        for container_id, (exit_code, exited_at) in (watch.exits() if watch else {}).items():
+            if container_id in self._listed.get(pod, set()) and container_id not in listed:
+                ended[container_id] = NodeContainer(
+                    container_id=container_id,
+                    # Gone with the container; only log evidence names attempts.
+                    attempt=-1,
+                    running=False,
+                    started_at=None,
+                    finished_at=exited_at,
+                    exit_code=exit_code,
+                )
+        return list(ended.values())
 
     def _prometheus(self, query: str, at: float | None = None) -> list[dict[str, Any]]:
         body = self._control.telemetry_query(
@@ -726,7 +999,9 @@ class LeaderElectionAssertions:
         return first
 
     def _log_evidence(self) -> Mapping[str, object]:
-        """Each controller container's last log lines, read on its node."""
+        """Each controller container's last log lines, read on its node, and
+        each node's exit watch's state and stderr: a watch that died leaves
+        exits to the runtime's listings alone."""
 
         logs: dict[str, str] = {}
         for pod, node in sorted(self._nodes.items()):
@@ -737,7 +1012,8 @@ class LeaderElectionAssertions:
                     )
             except Exception as error:  # noqa: BLE001 - evidence must not mask the failure
                 logs[pod] = f"could not read logs: {type(error).__name__}: {error}"
-        return {"controller_logs": logs}
+        watches = {node: watch.diagnostics() for node, watch in sorted(self._exit_watches.items())}
+        return {"controller_logs": logs, **({"exit_watches": watches} if watches else {})}
 
     def _poll(
         self,

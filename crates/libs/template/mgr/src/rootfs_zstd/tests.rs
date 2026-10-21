@@ -51,6 +51,90 @@ fn read_decoded_rootfs_chunk_coalesces_short_reads() {
     assert!(eof.is_none());
 }
 
+/// Fails its `n`th read once with each listed error kind, then reads normally.
+struct FaultyReader {
+    inner: ShortReader,
+    calls: usize,
+    faults: Vec<(usize, std::io::ErrorKind)>,
+}
+
+impl std::io::Read for FaultyReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.calls += 1;
+        if let Some(index) = self.faults.iter().position(|(call, _)| *call == self.calls) {
+            let (_, kind) = self.faults.remove(index);
+            return Err(std::io::Error::new(kind, "injected"));
+        }
+        self.inner.read(buf)
+    }
+}
+
+/// The decoder sees every input byte once, in order, and the off-thread
+/// digest covers exactly those bytes, however reads split across pooled
+/// buffers that are recycled many times over. Interrupted reads retry, a
+/// failed read surfaces once without losing bytes already read, and reads
+/// past the end keep returning nothing. A buffer lost on any of those paths
+/// would leave a later read waiting forever, so each case runs under a
+/// timeout.
+#[test]
+fn hashed_compressed_input_matches_a_whole_file_digest() {
+    use std::io::ErrorKind::{Interrupted, Other};
+    let bytes: Vec<u8> = (0..10_000u32).map(|i| (i * 31 % 251) as u8).collect();
+    for (chunk_size, depth, max_read, faults) in [
+        (1, 1, 1, vec![]),
+        (7, 2, 3, vec![]),
+        (64, 3, 64, vec![]),
+        (20_000, 3, 4096, vec![]),
+        (7, 1, 3, vec![(2, Interrupted), (5, Other)]),
+        (64, 1, 64, vec![(1, Other), (40, Other)]),
+    ] {
+        let case = format!("chunk {chunk_size}, depth {depth}, faults {faults:?}");
+        let expected_errors = faults.iter().filter(|(_, kind)| *kind == Other).count();
+        let bytes = bytes.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let reader = FaultyReader {
+                inner: ShortReader {
+                    bytes: bytes.clone(),
+                    pos: 0,
+                    max_read,
+                },
+                calls: 0,
+                faults,
+            };
+            let mut input = HashedCompressedInput::new(reader, chunk_size, depth).unwrap();
+            let (mut seen, mut errors) = (Vec::new(), 0);
+            let mut scratch = [0u8; 5];
+            loop {
+                match input.read(&mut scratch) {
+                    Ok(0) => break,
+                    Ok(read) => seen.extend_from_slice(&scratch[..read]),
+                    Err(_) => errors += 1,
+                }
+            }
+            let past_end = (0..depth + 2)
+                .map(|_| input.read(&mut scratch).unwrap())
+                .sum::<usize>();
+            let digest = input.finish_hash().unwrap();
+            done_tx
+                .send((
+                    seen == bytes,
+                    errors,
+                    past_end,
+                    digest == sha256_bytes(&bytes),
+                ))
+                .unwrap();
+        });
+        let (bytes_match, errors, past_end, digest_matches) = done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap_or_else(|_| panic!("{case}: reader stalled"));
+        assert!(bytes_match, "{case}: delivered bytes");
+        assert_eq!(errors, expected_errors, "{case}: surfaced errors");
+        assert_eq!(past_end, 0, "{case}: reads past the end");
+        assert!(digest_matches, "{case}: digest");
+    }
+}
+
 #[rstest::rstest]
 #[case::default(None)]
 #[case::sha256(Some(HashAlg::Sha256))]

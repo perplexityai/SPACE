@@ -715,16 +715,17 @@ pub fn recover_pause_failed_quarantine(
     Ok(true)
 }
 
-/// Load optional quarantine or transition-receipt metadata for inventory
-/// publication. Wire degradation for malformed rows happens in the State RPC,
-/// so this storage helper exposes the row vocabulary without deciding whether
-/// another sandbox may still be published.
-pub fn sandbox_state_publication_metadata(
-    conn: &Connection,
-    sandbox_ids: &[String],
-) -> Result<BTreeMap<String, RawSandboxStatePublicationMetadataRead>> {
-    let mut statement = conn.prepare_cached(
-        "SELECT s.id, s.state, qs.reason_code,
+db_private_outside_tests! {
+    /// Load optional quarantine or transition-receipt metadata for inventory
+    /// publication. Wire degradation for malformed rows happens in the State RPC,
+    /// so this storage helper exposes the row vocabulary without deciding whether
+    /// another sandbox may still be published.
+    fn sandbox_state_publication_metadata(
+        conn: &Connection,
+        sandbox_ids: &[String],
+    ) -> Result<BTreeMap<String, RawSandboxStatePublicationMetadataRead>> {
+        let mut statement = conn.prepare_cached(
+            "SELECT s.id, s.state, qs.reason_code,
                 s.transition_receipt_id,
                 s.transition_receipt_kind,
                 s.transition_receipt_target_state,
@@ -736,36 +737,37 @@ pub fn sandbox_state_publication_metadata(
           WHERE s.id = ?1
             AND (s.state = 'quarantined'
                  OR s.transition_receipt_id IS NOT NULL)",
-    )?;
-    let mut publications = BTreeMap::new();
-    for sandbox_id in sandbox_ids {
-        let publication = statement
-            .query_row(params![sandbox_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    RawSandboxStatePublicationMetadata {
-                        quarantine_reason_code: row.get(2)?,
-                        transition_receipt_id: row.get(3)?,
-                        transition_receipt_kind: row.get(4)?,
-                        transition_receipt_target_state: row.get(5)?,
-                        transition_receipt_execution_generation: row.get(6)?,
-                        transition_receipt_reason_code: row.get(7)?,
-                        transition_receipt_activation_attempt_id: row.get(8)?,
-                    },
-                ))
-            })
-            .optional();
-        match publication {
-            Ok(Some((id, publication))) => {
-                publications.insert(id, Ok(publication));
-            }
-            Ok(None) => {}
-            Err(error) => {
-                publications.insert(sandbox_id.clone(), Err(error.into()));
+        )?;
+        let mut publications = BTreeMap::new();
+        for sandbox_id in sandbox_ids {
+            let publication = statement
+                .query_row(params![sandbox_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        RawSandboxStatePublicationMetadata {
+                            quarantine_reason_code: row.get(2)?,
+                            transition_receipt_id: row.get(3)?,
+                            transition_receipt_kind: row.get(4)?,
+                            transition_receipt_target_state: row.get(5)?,
+                            transition_receipt_execution_generation: row.get(6)?,
+                            transition_receipt_reason_code: row.get(7)?,
+                            transition_receipt_activation_attempt_id: row.get(8)?,
+                        },
+                    ))
+                })
+                .optional();
+            match publication {
+                Ok(Some((id, publication))) => {
+                    publications.insert(id, Ok(publication));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    publications.insert(sandbox_id.clone(), Err(error.into()));
+                }
             }
         }
+        Ok(publications)
     }
-    Ok(publications)
 }
 
 pub fn mark_quarantined_from_state(

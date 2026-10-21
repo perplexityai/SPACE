@@ -64,7 +64,24 @@ jobs:
             echo "::warning::Could not log in to GHCR; its reads fall back to their sources"
           fi
 
+      # A PR whose Rust build inputs equal those of an image main already
+      # published takes that image instead of compiling it again. The key is
+      # content-addressed over everything the build reads
+      # (build-rust-artifacts.sh --input-key), so a PR that changes only
+      # scripts, charts, smoke scenarios or workflows hits; any Rust input
+      # change misses. Every miss or failure, a fork's unreadable package
+      # included, leaves the build below to run with a notice. Main never
+      # reuses: building every push proves the producer still builds at HEAD
+      # and replaces a bad published image on the next push. Setting the
+      # repository variable SPACE_KIND_RUST_REUSE to `off` stops PR reuse.
+      - name: Reuse main's Rust artifact image for identical inputs
+        id: reuse
+        if: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main') && vars.SPACE_KIND_RUST_REUSE != 'off' }}
+        continue-on-error: true
+        run: python3 infra/space/kind/scripts/rust-artifact-handoff.py reuse ghcr.io/perplexityai/space-kind-rust-artifacts
+
       - name: Build the Rust artifact image once
+        if: steps.reuse.outputs.reused != 'true'
         env:
           SPACE_CI_IMAGE_MIRROR: ghcr
           SPACE_KIND_RUST_ARTIFACTS: docker
@@ -72,7 +89,7 @@ jobs:
           SPACE_KIND_BUILD_CACHE_WRITE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && '1' || '0' }}
         run: bash infra/space/kind/scripts/build-rust-artifacts.sh
 
-      - name: Export the exact-commit artifact image
+      - name: Export this run's artifact image
         run: |
           set -euo pipefail
           install -d "${RUNNER_TEMP}/kind-rust"
@@ -88,11 +105,63 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # Main only: push the image main's producer just built under its Rust input
+  # key, for PRs with the same key to reuse, and prune the producer's two
+  # registry packages. A job of its own because the shards wait for the whole
+  # producer job to complete, so nothing here delays them. It verifies the
+  # handoff as a shard does before pushing. Every step tolerates failure: a
+  # missed push costs later PRs a build, never main's result. No permissions
+  # block: the caller grants them, and a PR caller's read-only grant would
+  # refuse a job that asks for packages:write even though it never runs there.
+  rust_artifacts_publish:
+    if: github.repository == 'perplexityai/SPACE' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    name: Publish shared Kind Rust artifacts
+    needs: rust_artifacts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - name: Check out SPACE
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - *enable-containerd-store
+
+      - *ghcr-login
+
+      - name: Find this attempt's Rust producer
+        id: producer
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 infra/space/kind/scripts/rust-artifact-handoff.py wait --timeout 300
+
+      - name: Download this attempt's Rust artifact image
+        id: download
+        if: steps.producer.outcome == 'success'
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: kind-rust-${{ github.sha }}-${{ env.SPACE_KIND_RUST_PRODUCER_ATTEMPT }}
+          path: ${{ runner.temp }}/kind-rust
+
+      - name: Load and verify the Rust artifact image
+        id: load
+        if: steps.download.outcome == 'success'
+        continue-on-error: true
+        run: python3 infra/space/kind/scripts/rust-artifact-handoff.py load "${RUNNER_TEMP}/kind-rust"
+
+      # Main builds on every push, so this replaces the key's earlier image.
+      - name: Publish the artifact image under its Rust input key
+        if: steps.load.outcome == 'success'
+        continue-on-error: true
+        run: python3 infra/space/kind/scripts/rust-artifact-handoff.py publish ghcr.io/perplexityai/space-kind-rust-artifacts
+
       # Only this dedicated cache package is pruned, never release images.
       # Fixed tagged heads stay intact; retain ten untagged versions for readers
       # already pulling an older manifest. This never runs on a PR.
       - name: Retain ten superseded cache versions
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         continue-on-error: true
         uses: actions/delete-package-versions@e5bc658cc4c965c472efe991f8beea3981499c55 # v5
         with:
@@ -101,6 +170,20 @@ jobs:
           package-type: container
           delete-only-untagged-versions: 'true'
           min-versions-to-keep: 10
+
+      # Only this dedicated artifact package, tags included. Every main push
+      # republishes its key, leaving the previous image untagged, so twenty
+      # versions are about the last twenty main pushes. A PR tests its merge
+      # with the main it started from, and a re-run keeps that merge; a PR
+      # whose key was pruned builds it. This never runs on a PR.
+      - name: Retain twenty Rust artifact images
+        continue-on-error: true
+        uses: actions/delete-package-versions@e5bc658cc4c965c472efe991f8beea3981499c55 # v5
+        with:
+          owner: perplexityai
+          package-name: space-kind-rust-artifacts
+          package-type: container
+          min-versions-to-keep: 20
 
   smoke:
     if: github.repository == 'perplexityai/SPACE'
@@ -138,7 +221,8 @@ jobs:
           persist-credentials: false
 
       # Match the producer before loading the archive: the classic image store
-      # exposes a config digest instead of the producer's OCI image-index ID.
+      # exposes a config digest instead of the producer's image manifest
+      # digest, which is its image ID on the containerd store.
       # Restart Docker before any Kind/Tilt containers exist.
       - *enable-containerd-store
 

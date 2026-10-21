@@ -393,7 +393,7 @@ async fn gc_tick(
     let mut next_scan = *scan;
     let (next_scan, page) = tokio::task::spawn_blocking(move || {
         let conn = crate::node_state_sync::connection_or_signal_failure(&db_for_snap)?;
-        let page = next_scan.next_page(&conn)?;
+        let page = crate::db::scan::local_artifacts(&conn, &mut next_scan)?;
         Ok::<_, GcDatabaseReadError>((next_scan, page))
     })
     .await

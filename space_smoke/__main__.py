@@ -13,7 +13,12 @@ from typing import Any
 from space_smoke.registry import Scenario
 from space_smoke.runtime import SmokeConfigurationError, execute_scenario
 from space_smoke.scenarios import REGISTRY
-from space_smoke.services import MissingToolError, SmokeServices, repair_orphaned_kind_faults
+from space_smoke.services import (
+    SUITE_BOOTSTRAPPED_ENV,
+    MissingToolError,
+    SmokeServices,
+    repair_orphaned_kind_faults,
+)
 from space_smoke.sharding import select_shard
 from space_smoke.suite import (
     RESULT_PREFIX,
@@ -343,10 +348,14 @@ def _run_all(
                 tool for scenario in scenarios for tool in scenario.required_tools
             )
         )
+        # The suite's own bootstrap always runs every check, whatever the
+        # caller's environment says; its scenarios rely on that.
+        suite_environment = dict(os.environ)
+        suite_environment.pop(SUITE_BOOTSTRAPPED_ENV, None)
         services = SmokeServices.from_environment(
-            scenarios[0], required_tools=required_tools
+            scenarios[0], suite_environment, required_tools=required_tools
         )
-        services.bootstrap()
+        provenance_checked = services.bootstrap()
     except MissingToolError as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
@@ -368,6 +377,16 @@ def _run_all(
     environment = dict(os.environ)
     if environment.get("SPACE_SMOKE_BACKEND", "kind") == "kind":
         environment["SKIP_BOOTSTRAP"] = "1"
+        # The scenarios skip the checks this bootstrap ran only if it ran the
+        # provenance check too; a busy Tilt skips it, and each scenario then
+        # repeats it once Tilt is idle.
+        if provenance_checked:
+            environment[SUITE_BOOTSTRAPPED_ENV] = "1"
+        elif services.kind is not None:
+            print(
+                "NOTE: the image provenance check did not run (Tilt was still updating); "
+                "each scenario runs the full bootstrap"
+            )
     label = f" {category}" if category is not None else ""
     print(f"Running {len(scenarios)}{label} smoke scenarios sequentially.")
     results = run_scenarios(

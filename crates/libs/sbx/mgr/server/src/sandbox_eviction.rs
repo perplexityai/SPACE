@@ -96,7 +96,6 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 pub(crate) use crate::auto_lifecycle::now_secs;
-use crate::db::eviction_scan::{count_malformed_suspended_updated_at, count_resident_rows};
 use crate::service::SandboxManagerService;
 
 /// Runtime configuration for the eviction loop. Loaded from env on
@@ -533,12 +532,14 @@ fn query_candidates_after(
         cursor.map(|cursor| i64::try_from(cursor.idle_witness_secs).unwrap_or(i64::MAX));
     let cursor_sandbox_id = cursor.map(|cursor| cursor.sandbox_id.as_str());
     let cutoff = i64::try_from(idle_cutoff_epoch_secs).unwrap_or(i64::MAX);
-    let rows = crate::db::eviction_scan::idle_suspended_candidates(
+    let rows = crate::db::scan::eviction_candidates(
         conn,
-        cutoff,
-        cursor_witness,
-        cursor_sandbox_id,
-        limit,
+        crate::db::scan::Proofable {
+            cutoff,
+            cursor_witness,
+            cursor_sandbox_id,
+            limit,
+        },
     )?;
     Ok(rows
         .into_iter()
@@ -579,7 +580,13 @@ pub(crate) fn list_legacy_reupload_candidates(
     idle_cutoff_epoch_secs: u64,
     limit: usize,
 ) -> crate::db::Result<Vec<String>> {
-    crate::db::eviction_scan::legacy_reupload_candidates(conn, idle_cutoff_epoch_secs, limit)
+    crate::db::scan::eviction_candidates(
+        conn,
+        crate::db::scan::ProoflessLegacy {
+            idle_cutoff_epoch_secs,
+            limit,
+        },
+    )
 }
 
 /// Gather the local half of the eviction evidence plus the sandbox's
@@ -598,14 +605,18 @@ pub(crate) fn gather_local_evidence(
     conn: &Connection,
     sandbox_id: &str,
 ) -> crate::db::Result<Option<(LocalEvidence, u64)>> {
-    let row = crate::db::eviction_scan::artifact_pin_and_updated_at(conn, sandbox_id)?;
+    let row = crate::db::read::sandbox_view(conn, sandbox_id)
+        .pinned_artifact()
+        .pin_and_updated_at()?;
     let Some((pin, updated_at)) = row else {
         return Ok(None);
     };
     let updated_at_secs = updated_at.unsigned();
 
     if let Some(pin) = pin {
-        let artifact = crate::db::eviction_scan::owned_artifact_evidence(conn, &pin, sandbox_id)?;
+        let artifact = crate::db::read::sandbox_view(conn, sandbox_id)
+            .pinned_artifact()
+            .owned_evidence(&pin)?;
         let evidence = match artifact {
             Some((kind, id, backup_marker)) => {
                 match (id.parse(), kind.parse()) {
@@ -627,7 +638,7 @@ pub(crate) fn gather_local_evidence(
     // Unpinned: the newest upload job regardless of status (a failed
     // newest upload must still count — it proves newer-than-backed
     // local state exists).
-    let job = crate::db::eviction_scan::latest_upload_job(conn, sandbox_id)?;
+    let job = crate::db::read::sandbox_view(conn, sandbox_id).latest_upload()?;
     let latest_job = job.and_then(|(snapshot_id, created_at)| {
         let snapshot_id = snapshot_id?.trim().parse::<SnapshotId>().ok()?;
         // Invalid time cannot prove recency, even when the sandbox itself
@@ -1239,10 +1250,11 @@ async fn evict_tick(
         let conn = service_for_counts
             .db_conn()
             .map_err(|error| format!("eviction row counts db_conn: {error}"))?;
-        let malformed = count_malformed_suspended_updated_at(&conn)
-            .map_err(|error| format!("count_malformed_suspended_updated_at: {error}"))?;
-        let resident =
-            count_resident_rows(&conn).map_err(|error| format!("count_resident_rows: {error}"))?;
+        let malformed =
+            crate::db::read::counts(&conn, crate::db::read::MalformedSuspendedUpdatedAt)
+                .map_err(|error| format!("count_malformed_suspended_updated_at: {error}"))?;
+        let resident = crate::db::read::counts(&conn, crate::db::read::Resident)
+            .map_err(|error| format!("count_resident_rows: {error}"))?;
         Ok::<_, String>((malformed, resident))
     })
     .await

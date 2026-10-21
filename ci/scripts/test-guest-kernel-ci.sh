@@ -18,7 +18,7 @@ WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "${WORK_DIR}"' EXIT
 
 REPOSITORY="registry.example/space-guest-kernel-ci"
-BASE="ubuntu:24.04@sha256:496754492fb28b4d3049432f2ca787449331e23fb14f0dd3fffea86bf5a93eb4"
+BASE="ubuntu:24.04@sha256:a2d43bffc46670d7108bb3c0468c67c5557c4c92e83e1e34cbff1322ad1b94dc"
 MIRROR="ghcr.io/example/mirror@sha256:$(printf 'b%.0s' {1..64})"
 BUILDKIT="moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8"
 BUILDKIT_MIRROR="ghcr.io/example/mirror@sha256:$(printf 'e%.0s' {1..64})"

@@ -56,18 +56,24 @@ func (c *activationPolicyClient) State(_ context.Context, r *pb.StateRequest, _ 
 	return &pb.StateResponse{Sandboxes: []*pb.SandboxInfo{{SandboxId: r.SandboxIds[0], Pid: ptr(uint32(123)), Lifecycle: pb.SandboxLifecycleState_SANDBOX_LIFECYCLE_STATE_STARTED.Enum()}}}, nil
 }
 
+const unsupportedNetworkPolicy = `{"version":"v1","egress":{"default_action":"deny"},"future_field":[]}`
+
 func TestActivationConsumesCurrentPolicy(t *testing.T) {
 	for _, tc := range []struct {
 		name, checkpoint  string
 		policy, supported bool
 		wantSeconds       int64
 		wantCode          codes.Code
+		networkPolicy     string
 	}{
-		{"cold", "", true, true, 60, codes.OK},
-		{"suspend", "suspend", true, true, 60, codes.OK},
-		{"checkpoint", "f-example", true, true, 60, codes.OK},
-		{"older_worker", "suspend", true, false, 0, codes.Unavailable},
-		{"omitted_policy", "suspend", false, false, 30, codes.OK},
+		{"cold", "", true, true, 60, codes.OK, ""},
+		{"suspend", "suspend", true, true, 60, codes.OK, ""},
+		{"checkpoint", "f-example", true, true, 60, codes.OK, ""},
+		{"older_worker", "suspend", true, false, 0, codes.Unavailable, ""},
+		{"omitted_policy", "suspend", false, false, 30, codes.OK, ""},
+		// Only a cold create consumes the network-policy annotation.
+		{"cold_unsupported_network_policy", "", true, true, 0, codes.InvalidArgument, unsupportedNetworkPolicy},
+		{"suspend_unsupported_network_policy", "suspend", true, true, 60, codes.OK, unsupportedNetworkPolicy},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			bundle := t.TempDir()
@@ -79,6 +85,10 @@ func TestActivationConsumesCurrentPolicy(t *testing.T) {
 			if tc.policy {
 				annotations[sandboxAutoLifecycleAuthorityAnnotation] = "cluster"
 				annotations[sandboxAutoLifecycleAnnotation] = `{"wake":{"on":["access"]},"condition_sets":{"access_idle":{"kind":"inactivity","activity_source":"access"}},"stages":[{"condition_set":"access_idle","at":"60s","action":"suspend"}]}`
+			}
+			if tc.networkPolicy != "" {
+				annotations[sandboxNetworkPolicyAnnotation] = tc.networkPolicy
+				annotations[sandboxNetworkPolicyGenerationAnnotation] = "1"
 			}
 			raw, err := json.Marshal(map[string]any{"annotations": annotations})
 			if err != nil {

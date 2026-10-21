@@ -94,112 +94,114 @@ pub fn auto_lifecycle_state_is_settled(state: SandboxState) -> bool {
     !state.is_transient()
 }
 
-pub fn due_auto_lifecycle_batch(
-    conn: &Connection,
-    now_secs: u64,
-    active: &[SandboxId],
-    available: usize,
-    cursor: &mut AutoLifecycleScan,
-) -> Result<Vec<DueAutoLifecycleSandbox>> {
-    if available == 0 {
-        return Ok(Vec::new());
-    }
-    let now = now_secs.min(i64::MAX as u64) as i64;
-    let mut selected = Vec::new();
-    let fresh_slots = if available == 1 {
-        usize::from(cursor.fresh_turn)
-    } else {
-        available / 2
-    };
-    let eligible = |row: &rusqlite::Row<'_>,
-                    selected: &[DueAutoLifecycleSandbox]|
-     -> Result<Option<DueAutoLifecycleSandbox>> {
-        let (id, deadline) = match (row.get::<_, String>(1), row.get::<_, Option<i64>>(2)) {
-            (Ok(id), Ok(deadline)) => (id, deadline),
-            (Err(error), _) | (_, Err(error)) if is_row_decode_error(&error) => {
-                tracing::warn!(rowid = row.get::<_, i64>(0)?, error = %describe_raw_error(&error), "skipping malformed auto lifecycle discovery row");
+db_private_outside_tests! {
+    fn due_auto_lifecycle_batch(
+        conn: &Connection,
+        now_secs: u64,
+        active: &[SandboxId],
+        available: usize,
+        cursor: &mut AutoLifecycleScan,
+    ) -> Result<Vec<DueAutoLifecycleSandbox>> {
+        if available == 0 {
+            return Ok(Vec::new());
+        }
+        let now = now_secs.min(i64::MAX as u64) as i64;
+        let mut selected = Vec::new();
+        let fresh_slots = if available == 1 {
+            usize::from(cursor.fresh_turn)
+        } else {
+            available / 2
+        };
+        let eligible = |row: &rusqlite::Row<'_>,
+                        selected: &[DueAutoLifecycleSandbox]|
+         -> Result<Option<DueAutoLifecycleSandbox>> {
+            let (id, deadline) = match (row.get::<_, String>(1), row.get::<_, Option<i64>>(2)) {
+                (Ok(id), Ok(deadline)) => (id, deadline),
+                (Err(error), _) | (_, Err(error)) if is_row_decode_error(&error) => {
+                    tracing::warn!(rowid = row.get::<_, i64>(0)?, error = %describe_raw_error(&error), "skipping malformed auto lifecycle discovery row");
+                    return Ok(None);
+                }
+                (Err(error), _) | (_, Err(error)) => return Err(Error::from(error)),
+            };
+            let Some(deadline) = deadline else {
+                return Ok(None);
+            };
+            let Ok(parsed) = id.parse::<SandboxId>() else {
+                return Ok(None);
+            };
+            // The rowid lane sees every row; a row no action can ever act on is
+            // not due work (see `AUTO_LIFECYCLE_NEVER_ACTIONABLE_STATES_SQL`).
+            // A state that does not decode is skipped like a malformed id above;
+            // a statement-level failure propagates. An unknown-but-decodable
+            // state string is left to the transition's own lookup error.
+            let state = match row.get::<_, String>(3) {
+                Ok(state) => state,
+                Err(error) if is_row_decode_error(&error) => {
+                    tracing::warn!(rowid = row.get::<_, i64>(0)?, error = %describe_raw_error(&error), "skipping malformed auto lifecycle discovery row");
+                    return Ok(None);
+                }
+                Err(error) => return Err(Error::from(error)),
+            };
+            if state.parse::<SandboxState>().ok() == Some(SandboxState::Deleting) {
                 return Ok(None);
             }
-            (Err(error), _) | (_, Err(error)) => return Err(Error::from(error)),
-        };
-        let Some(deadline) = deadline else {
-            return Ok(None);
-        };
-        let Ok(parsed) = id.parse::<SandboxId>() else {
-            return Ok(None);
-        };
-        // The rowid lane sees every row; a row no action can ever act on is
-        // not due work (see `AUTO_LIFECYCLE_NEVER_ACTIONABLE_STATES_SQL`).
-        // A state that does not decode is skipped like a malformed id above;
-        // a statement-level failure propagates. An unknown-but-decodable
-        // state string is left to the transition's own lookup error.
-        let state = match row.get::<_, String>(3) {
-            Ok(state) => state,
-            Err(error) if is_row_decode_error(&error) => {
-                tracing::warn!(rowid = row.get::<_, i64>(0)?, error = %describe_raw_error(&error), "skipping malformed auto lifecycle discovery row");
+            if !(0..=now).contains(&deadline)
+                || active.contains(&parsed)
+                || selected.iter().any(|due| due.sandbox_id == parsed)
+            {
                 return Ok(None);
             }
-            Err(error) => return Err(Error::from(error)),
+            Ok(Some(DueAutoLifecycleSandbox {
+                storage_id: id,
+                sandbox_id: parsed,
+            }))
         };
-        if state.parse::<SandboxState>().ok() == Some(SandboxState::Deleting) {
-            return Ok(None);
-        }
-        if !(0..=now).contains(&deadline)
-            || active.contains(&parsed)
-            || selected.iter().any(|due| due.sandbox_id == parsed)
-        {
-            return Ok(None);
-        }
-        Ok(Some(DueAutoLifecycleSandbox {
-            storage_id: id,
-            sandbox_id: parsed,
-        }))
-    };
-    // LIMIT applies to raw index entries, before identity/metadata eligibility.
-    if fresh_slots > 0 {
-        let mut statement = conn.prepare(&sql!(format!(
-            "SELECT rowid, id, next_auto_event_at, state
+        // LIMIT applies to raw index entries, before identity/metadata eligibility.
+        if fresh_slots > 0 {
+            let mut statement = conn.prepare(&sql!(format!(
+                "SELECT rowid, id, next_auto_event_at, state
              FROM sandboxes INDEXED BY idx_sandboxes_next_auto_event_at
              WHERE next_auto_event_at <= ?1
                AND state NOT IN {AUTO_LIFECYCLE_NEVER_ACTIONABLE_STATES_SQL}
              ORDER BY next_auto_event_at DESC, created_at DESC LIMIT 32"
-        )))?;
-        let mut rows = statement.query([now])?;
-        while let Some(row) = rows.next()? {
+            )))?;
+            let mut rows = statement.query([now])?;
+            while let Some(row) = rows.next()? {
+                if let Some(id) = eligible(row, &selected)? {
+                    selected.push(id);
+                }
+                if selected.len() == fresh_slots {
+                    break;
+                }
+            }
+        }
+        // The rowid lane must still ADVANCE past `deleting` rows (it is a scan
+        // position, not a work list), so they stay in the result set of this
+        // statement and are filtered by `eligible`, not by SQL.
+        let mut statement = conn.prepare(sql!(
+            "SELECT rowid, id, next_auto_event_at, state
+         FROM sandboxes WHERE rowid > ?1 ORDER BY rowid LIMIT 128"
+        ))?;
+        let mut rows = statement.query([cursor.after])?;
+        let mut scanned = 0;
+        while selected.len() < available {
+            let Some(row) = rows.next()? else {
+                if scanned < 128 {
+                    cursor.after = i64::MIN;
+                }
+                break;
+            };
+            scanned += 1;
+            cursor.after = row.get(0)?;
             if let Some(id) = eligible(row, &selected)? {
                 selected.push(id);
             }
-            if selected.len() == fresh_slots {
-                break;
-            }
         }
-    }
-    // The rowid lane must still ADVANCE past `deleting` rows (it is a scan
-    // position, not a work list), so they stay in the result set of this
-    // statement and are filtered by `eligible`, not by SQL.
-    let mut statement = conn.prepare(sql!(
-        "SELECT rowid, id, next_auto_event_at, state
-         FROM sandboxes WHERE rowid > ?1 ORDER BY rowid LIMIT 128"
-    ))?;
-    let mut rows = statement.query([cursor.after])?;
-    let mut scanned = 0;
-    while selected.len() < available {
-        let Some(row) = rows.next()? else {
-            if scanned < 128 {
-                cursor.after = i64::MIN;
-            }
-            break;
-        };
-        scanned += 1;
-        cursor.after = row.get(0)?;
-        if let Some(id) = eligible(row, &selected)? {
-            selected.push(id);
+        if available == 1 {
+            cursor.fresh_turn = !cursor.fresh_turn;
         }
+        Ok(selected)
     }
-    if available == 1 {
-        cursor.fresh_turn = !cursor.fresh_turn;
-    }
-    Ok(selected)
 }
 
 pub fn update_auto_lifecycle(

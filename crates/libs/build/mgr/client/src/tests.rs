@@ -74,7 +74,7 @@ async fn blob_upload_sender_frames_a_committed_stream() {
 
 #[test]
 fn projected_client_auth_rotates_and_fails_closed() {
-    use pplx_space_common_svc::bearer_token::SPACE_BUILD_MANAGER_TOKEN_PATH_ENV;
+    use pplx_space_bearer_token::SPACE_BUILD_MANAGER_TOKEN_PATH_ENV;
     use tonic::service::Interceptor;
 
     let dir = tempfile::tempdir().unwrap();

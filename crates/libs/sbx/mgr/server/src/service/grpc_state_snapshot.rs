@@ -567,8 +567,8 @@ impl SandboxManagerService {
     async fn state_batch(
         &self,
         sandbox_ids: Vec<String>,
-        mut raw_budget: InventoryBudget,
-        mut metadata_budget: InventoryBudget,
+        raw_budget: InventoryBudget,
+        metadata_budget: InventoryBudget,
     ) -> Result<(StateResponse, InventoryBudget, InventoryBudget), Status> {
         let (
             rows,
@@ -582,33 +582,77 @@ impl SandboxManagerService {
             raw_budget,
             metadata_budget,
         ) = self.storage(move |db| {
-                crate::db::inventory_read::check_state_metadata(db, &sandbox_ids, &mut metadata_budget).map_err(|error| error.into_status())?;
-                let mut route_identity_provenance =
-                    crate::db::activation_route_provenance_for_sandboxes(db, &sandbox_ids).map_err(
-                        |error| Status::internal(format!("load route identity provenance: {error}")),
-                    )?;
-                let mut rows = Vec::with_capacity(sandbox_ids.len());
+                use crate::db::read::{StatePageError, StatePageRow};
+                let mut budgets = crate::db::read::StateBudgets {
+                    raw: raw_budget,
+                    metadata: metadata_budget,
+                };
+                let page = crate::db::read::state_page(db, &sandbox_ids, &mut budgets).map_err(
+                    |error| match error {
+                        StatePageError::Metadata(error) | StatePageError::Row(error) => {
+                            error.into_status()
+                        }
+                        StatePageError::RouteProvenance(error) => Status::internal(format!(
+                            "load route identity provenance: {error}"
+                        )),
+                        StatePageError::RawLifecycle { sandbox_id, error } => {
+                            Status::internal(format!(
+                                "read raw sandbox state for {sandbox_id}: {error}"
+                            ))
+                        }
+                        StatePageError::Publication(error) => {
+                            tracing::warn!(%error, "failed to load sandbox publication metadata");
+                            Status::internal(format!("load sandbox publication metadata: {error}"))
+                        }
+                        StatePageError::StateChangedAt(error) => {
+                            Status::internal(format!("load state change times: {error}"))
+                        }
+                        StatePageError::PinnedArtifactCreatedAt(error) => Status::internal(
+                            format!("load pinned artifact capture times: {error}"),
+                        ),
+                        StatePageError::RecoveryObservations(error) => {
+                            tracing::warn!(%error, "failed to load quarantine recovery observations");
+                            Status::internal(format!("load quarantine recovery observations: {error}"))
+                        }
+                    },
+                )?;
+                let mut rows = Vec::with_capacity(page.len());
                 let mut missing_ids = Vec::new();
                 let mut state_only = Vec::new();
-                for sandbox_id in sandbox_ids {
-                    match crate::db::inventory_read::get(db, &sandbox_id, &mut raw_budget) {
-                        Ok(Some(sandbox)) => rows.push(sandbox),
-                        Ok(None) => missing_ids.push(sandbox_id),
-                        Err(error @ crate::db::inventory_read::InventoryReadError::Limit(_)) => return Err(error.into_status()),
-                        Err(error @ crate::db::inventory_read::InventoryReadError::Ambiguous) => return Err(error.into_status()),
-                        Err(crate::db::inventory_read::InventoryReadError::Database(error)) => {
-                            let lifecycle = match crate::db::raw_sandbox_lifecycle(db, &sandbox_id) {
-                                Ok(Some(state)) => state,
-                                Ok(None) => {
-                                    missing_ids.push(sandbox_id);
-                                    continue;
-                                }
-                                Err(state_error) => {
-                                    return Err(Status::internal(format!(
-                                        "read raw sandbox state for {sandbox_id}: {state_error}"
-                                    )));
-                                }
-                            };
+                let mut route_identity_provenance = std::collections::HashMap::new();
+                let mut publications = std::collections::BTreeMap::new();
+                let mut state_changed_at = std::collections::HashMap::new();
+                let mut pinned_artifact_created_at = std::collections::HashMap::new();
+                let mut recovery_observations = std::collections::BTreeMap::new();
+                for entry in page {
+                    match entry {
+                        StatePageRow::Missing(sandbox_id) => missing_ids.push(sandbox_id),
+                        StatePageRow::Decoded(decoded) => {
+                            let decoded = *decoded;
+                            let id = decoded.row.id.clone();
+                            if let Some(provenance) = decoded.route_provenance {
+                                route_identity_provenance.insert(id.clone(), provenance);
+                            }
+                            if let Some(publication) = decoded.publication {
+                                publications.insert(id.clone(), publication);
+                            }
+                            if let Some(changed_at) = decoded.state_changed_at {
+                                state_changed_at.insert(id.clone(), changed_at);
+                            }
+                            if let Some(created_at) = decoded.pinned_artifact_created_at {
+                                pinned_artifact_created_at.insert(id.clone(), created_at);
+                            }
+                            if let Some(observation) = decoded.recovery_observation {
+                                recovery_observations.insert(id, observation);
+                            }
+                            rows.push(decoded.row);
+                        }
+                        StatePageRow::StateOnly(crate::db::read::StateOnlyRow {
+                            sandbox_id,
+                            lifecycle,
+                            error,
+                            route_provenance,
+                        }) => {
                             let disposition = pplx_space_metrics::sandbox::publication::StatePublicationDisposition::StateOnly;
                             pplx_space_metrics::sandbox::publication::degraded(
                                 pplx_space_metrics::sandbox::publication::StatePublicationComponent::Worker,
@@ -621,9 +665,7 @@ impl SandboxManagerService {
                                 %disposition,
                                 "publishing raw lifecycle without malformed sandbox fields"
                             );
-                            let route_identity_provenance = match route_identity_provenance
-                                .remove(&sandbox_id)
-                            {
+                            let route_identity_provenance = match route_provenance {
                                 Some(Ok(provenance)) => provenance,
                                 Some(Err(provenance_error)) => {
                                     tracing::warn!(
@@ -650,21 +692,6 @@ impl SandboxManagerService {
                         }
                     }
                 }
-                let row_ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
-                let publications = crate::db::sandbox_state_publication_metadata(db, &row_ids)
-                    .map_err(|error| {
-                        tracing::warn!(%error, "failed to load sandbox publication metadata");
-                        Status::internal(format!("load sandbox publication metadata: {error}"))
-                    })?;
-                let state_changed_at = crate::db::sandbox_state_changed_at(db, &row_ids)
-                    .map_err(|error| Status::internal(format!("load state change times: {error}")))?;
-                let pinned_artifact_created_at = crate::db::pinned_local_artifact_created_at(db, &row_ids)
-                    .map_err(|error| Status::internal(format!("load pinned artifact capture times: {error}")))?;
-                let recovery_observations = crate::db::quarantine_recovery_observations(db, &row_ids)
-                    .map_err(|error| {
-                        tracing::warn!(%error, "failed to load quarantine recovery observations");
-                        Status::internal(format!("load quarantine recovery observations: {error}"))
-                    })?;
                 Ok((
                     rows,
                     missing_ids,
@@ -674,8 +701,8 @@ impl SandboxManagerService {
                     route_identity_provenance,
                     state_changed_at,
                     pinned_artifact_created_at,
-                    raw_budget,
-                    metadata_budget,
+                    budgets.raw,
+                    budgets.metadata,
                 ))
         })
         .await?;
@@ -1384,8 +1411,14 @@ impl SandboxManagerService {
                 .db
                 .lock()
                 .map_err(|_| Status::internal("sandbox database mutex poisoned"))?;
-            crate::db::get_named_local_artifact(&db, &sandbox_id, &snapshot_name)
-                .map_err(|error| Status::internal(format!("read operation snapshot: {error}")))?
+            crate::db::read::local_artifact(
+                &db,
+                crate::db::read::LocalArtifactKey::Named {
+                    sandbox_id: &sandbox_id,
+                    snapshot_name: &snapshot_name,
+                },
+            )
+            .map_err(|error| Status::internal(format!("read operation snapshot: {error}")))?
         };
         if let Some(artifact) = existing.as_ref()
             && !disk_operation_snapshot_artifact_matches(
@@ -1655,11 +1688,16 @@ impl SandboxManagerService {
                     .db
                     .lock()
                     .map_err(|_| Status::internal("sandbox database mutex poisoned"))?;
-                crate::db::get_named_local_artifact(&db, &sandbox_id, &snapshot_name).map_err(
-                    |error| {
-                        Status::internal(format!("read concurrent operation snapshot: {error}"))
+                crate::db::read::local_artifact(
+                    &db,
+                    crate::db::read::LocalArtifactKey::Named {
+                        sandbox_id: &sandbox_id,
+                        snapshot_name: &snapshot_name,
                     },
-                )?
+                )
+                .map_err(|error| {
+                    Status::internal(format!("read concurrent operation snapshot: {error}"))
+                })?
             };
             let matching_artifact_was_published = existing.as_ref().is_some_and(|artifact| {
                 disk_operation_snapshot_artifact_matches(
@@ -1782,7 +1820,7 @@ impl SandboxManagerService {
 
         let (sandbox, content_hash) = {
             let db = self.db_conn()?;
-            let sandbox = crate::db::get_sandbox(&db, &sandbox_id)
+            let sandbox = crate::db::read::sandbox(&db, &sandbox_id)
                 .map_err(|e| Status::internal(format!("db error: {e}")))?
                 .ok_or_else(|| Status::not_found(format!("sandbox not found: {sandbox_id}")))?;
             if !Self::sandbox_owned_by_template_manager(&sandbox) {

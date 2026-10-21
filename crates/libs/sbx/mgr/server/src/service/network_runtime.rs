@@ -725,7 +725,7 @@ fn refresh_abandon_reason(
     sandbox_id: &str,
 ) -> Result<Option<RefreshAbandonReason>, crate::node_state_sync::DatabaseMutexPoisoned> {
     let db = crate::node_state_sync::connection_or_signal_failure(db)?;
-    Ok(match crate::db::get_sandbox(&db, sandbox_id) {
+    Ok(match crate::db::read::sandbox(&db, sandbox_id) {
         Ok(None) => Some(RefreshAbandonReason::SandboxRowGone),
         Ok(Some(sandbox)) if !sandbox.state.can_authorize_net_gateway() => Some(
             RefreshAbandonReason::StateCannotAuthorizeGateway(sandbox.state),

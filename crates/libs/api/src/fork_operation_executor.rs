@@ -19,7 +19,8 @@ use pplx_space_public_api::{
 use sqlx::PgPool;
 
 use crate::controllers::substrate::{
-    NodeAddressing, OwnedNodeApiTarget, SnapshotRef, Substrate, SubstrateAdapter,
+    DurableSnapshotError, NodeAddressing, OwnedNodeApiTarget, SnapshotRef, Substrate,
+    SubstrateAdapter,
 };
 use crate::controllers::{
     ControllerError,
@@ -856,7 +857,7 @@ impl ForkSandboxOperationExecutor {
             .map_err(|_| {
                 ForkExecutionError::Retry("fork artifact copy reached its deadline".into())
             })??
-            .map_err(ForkExecutionError::retry_error)
+            .map_err(copy_artifact_error)
         }
         .await;
         let published = match copy_result {
@@ -1731,6 +1732,13 @@ fn successful_fork_result_after_retirement(
         );
     }
     successful_fork_result(results)
+}
+
+fn copy_artifact_error(error: DurableSnapshotError) -> ForkExecutionError {
+    match error {
+        DurableSnapshotError::Backpressure => ForkExecutionError::Wait(error.to_string()),
+        error => ForkExecutionError::retry_error(error),
+    }
 }
 
 fn retry(message: impl Into<String>) -> PublicOperationExecutionResult {

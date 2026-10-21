@@ -58,7 +58,7 @@ spec:
               value: "/var/run/space-publication/cluster-api.token"
             # NodeApi credentials for the api substrate the operation
             # dispatcher and warm-pool probe run, and the trigger fan-out
-            # (SpaceBearerToken, crates/libs/common/svc/src/bearer_token.rs):
+            # (SpaceBearerToken, crates/libs/bearer-token/src/lib.rs):
             # one projected token per node-api surface, admitted by TokenReview
             # (space-node-api-local's auth allowlists).
             - name: SPACE_NODE_API_TOKEN_PATH

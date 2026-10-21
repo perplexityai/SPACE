@@ -482,7 +482,7 @@ impl SandboxManagerService {
 
         let sandbox = {
             let db = self.db_conn()?;
-            crate::db::get_sandbox(&db, sandbox_id)
+            crate::db::read::sandbox(&db, sandbox_id)
                 .map_err(|err| Status::internal(format!("db sandbox lookup failed: {err}")))?
                 .ok_or_else(|| Status::not_found(format!("sandbox {sandbox_id} not found")))?
         };
@@ -1258,14 +1258,14 @@ impl SandboxManagerService {
             return Ok(None);
         }
         let db = self.db_conn()?;
-        Ok(
-            crate::db::latest_teardown_suspend_operation(&db, &sandbox.id)
-                .map_err(|error| Status::internal(format!("teardown job lookup: {error}")))?
-                .filter(|operation| {
-                    operation.status == crate::db::TeardownSuspendOperationStatus::Running
-                })
-                .map(|operation| operation.execution_generation),
-        )
+        Ok(crate::db::read::sandbox_view(&db, &sandbox.id)
+            .teardown()
+            .latest()
+            .map_err(|error| Status::internal(format!("teardown job lookup: {error}")))?
+            .filter(|operation| {
+                operation.status == crate::db::TeardownSuspendOperationStatus::Running
+            })
+            .map(|operation| operation.execution_generation))
     }
 }
 

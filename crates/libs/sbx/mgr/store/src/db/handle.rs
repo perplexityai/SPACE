@@ -8,11 +8,14 @@ use std::sync::{Arc, LockResult, Mutex, MutexGuard, PoisonError};
 
 use ref_cast::{RefCastCustom, ref_cast_custom};
 
-/// A method that returns or takes rusqlite values, or that only `db` calls in
-/// production: public with the `test-support` feature, for sbx-mgr's fixtures
-/// and tripwires outside the store, and private to `db` otherwise, so
-/// production code outside the store cannot reach a raw connection, statement
-/// or error, or a method only tests need.
+/// A function or method that returns or takes rusqlite values, or that only
+/// `db` calls in production: public with the `test-support` feature, for
+/// sbx-mgr's fixtures and tripwires outside the store, and private to `db`
+/// otherwise, so production code outside the store cannot reach a raw
+/// connection, statement or error, or a function only tests need. The readers
+/// that `db::read` and `db::scan` consolidate are declared through it: tests
+/// outside the store still compare against them, production reads through
+/// the consolidated API.
 macro_rules! db_private_outside_tests {
     ($(#[$attr:meta])* fn $name:ident $($rest:tt)*) => {
         $(#[$attr])*
@@ -24,6 +27,7 @@ macro_rules! db_private_outside_tests {
         pub(in crate::db) fn $name $($rest)*
     };
 }
+pub(in crate::db) use db_private_outside_tests;
 
 /// A failed SQLite operation. `Display` and `source` are the underlying
 /// rusqlite error's, unchanged.

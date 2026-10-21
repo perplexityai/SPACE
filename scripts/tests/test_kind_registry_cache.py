@@ -127,6 +127,10 @@ class RegistryCacheTests(unittest.TestCase):
                             ])
                         else:
                             command += exports
+                    if scope == "kind-rust-build":
+                        # One manifest, and no input key label: these builds
+                        # take no base from the mirror.
+                        command[5:5] = ["--provenance=false"]
                     expected.append([*command, "."])
                 self.assertEqual(calls, expected)
 

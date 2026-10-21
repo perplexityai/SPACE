@@ -18,7 +18,7 @@ impl SandboxManagerService {
     ) -> Result<Vec<StartupRecoveryRecord>, StartupRecoveryError> {
         let rows = {
             let db = self.startup_recovery_db()?;
-            crate::db::list_sandboxes_for_recovery(&db)?
+            crate::db::scan::all_sandboxes(&db, crate::db::scan::SkipUndecodableRows)?
         };
         let failed = AtomicBool::new(false);
         stream::iter(rows.into_iter().filter(|row| {
@@ -169,7 +169,7 @@ impl SandboxManagerService {
                 detail =
                     "startup recovery found an invalid sandbox ID; operator repair required".into();
             }
-            Ok(id) if crate::db::sandbox_has_runtime_fields(&row) => {
+            Ok(id) if row.has_runtime_fields() => {
                 use crate::runtime_reconciliation::observe_stable_resident_state;
                 use pplx_space_node_runtime_core::fc_api::FirecrackerVmState;
                 match observe_stable_resident_state(id, probe).await {

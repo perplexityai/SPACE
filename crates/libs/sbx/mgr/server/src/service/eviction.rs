@@ -218,20 +218,20 @@ impl SandboxManagerService {
         // row still holds this teardown's capture. The claim re-checks all of
         // it.
         let claimable = self.db_conn().and_then(|db| {
-            let running = crate::db::teardown_suspend_operation_running_for(
-                &db,
-                sandbox_id,
-                execution_generation,
-            )
-            .map_err(|error| Status::internal(format!("teardown job lookup: {error}")))?;
-            let holds_capture = crate::db::get_sandbox(&db, sandbox_id)
+            let running = crate::db::read::sandbox_view(&db, sandbox_id)
+                .teardown()
+                .running_for(execution_generation)
+                .map_err(|error| Status::internal(format!("teardown job lookup: {error}")))?;
+            let holds_capture = crate::db::read::sandbox(&db, sandbox_id)
                 .map_err(|error| Status::internal(format!("sandbox lookup: {error}")))?
                 .is_some_and(|row| {
                     row.state == crate::state::SandboxState::Suspending
                         && row.current_local_artifact_id == Some(staged_artifact)
                 });
             let awaiting_backup = if running && holds_capture {
-                crate::db::other_local_artifacts_awaiting_backup(&db, sandbox_id, staged_artifact)
+                crate::db::read::sandbox_view(&db, sandbox_id)
+                    .artifacts()
+                    .others_awaiting_backup(staged_artifact)
                     .map_err(|error| Status::internal(format!("local artifact lookup: {error}")))?
             } else {
                 Vec::new()
@@ -337,25 +337,21 @@ impl SandboxManagerService {
                 // Only a claim held back by another artifact's backup is that
                 // case; one that lost because the teardown job moved on is not.
                 let awaiting_backup = self.db_conn().ok().and_then(|db| {
-                    let still_driving = crate::db::teardown_suspend_operation_running_for(
-                        &db,
-                        sandbox_id,
-                        execution_generation,
-                    )
-                    .ok()?
-                        && crate::db::get_sandbox(&db, sandbox_id)
+                    let still_driving = crate::db::read::sandbox_view(&db, sandbox_id)
+                        .teardown()
+                        .running_for(execution_generation)
+                        .ok()?
+                        && crate::db::read::sandbox(&db, sandbox_id)
                             .ok()?
                             .is_some_and(|row| {
                                 row.state == crate::state::SandboxState::Suspending
                                     && row.current_local_artifact_id == Some(staged_artifact)
                             });
-                    let pending = !crate::db::other_local_artifacts_awaiting_backup(
-                        &db,
-                        sandbox_id,
-                        staged_artifact,
-                    )
-                    .ok()?
-                    .is_empty();
+                    let pending = !crate::db::read::sandbox_view(&db, sandbox_id)
+                        .artifacts()
+                        .others_awaiting_backup(staged_artifact)
+                        .ok()?
+                        .is_empty();
                     Some(still_driving && pending)
                 });
                 if awaiting_backup == Some(true) {
@@ -407,7 +403,7 @@ impl SandboxManagerService {
         };
         let row = {
             let db = self.db_conn()?;
-            crate::db::get_sandbox(&db, sandbox_id)
+            crate::db::read::sandbox(&db, sandbox_id)
                 .map_err(|e| Status::internal(format!("db sandbox lookup failed: {e}")))?
                 .ok_or_else(|| Status::not_found(format!("sandbox {sandbox_id} not found")))?
         };
@@ -635,10 +631,10 @@ impl SandboxManagerService {
         // between them fails its CAS rather than being acted on.
         let (row, state_changed_at) = {
             let db = self.db_conn()?;
-            let row = crate::db::get_sandbox(&db, &sandbox_id)
+            let row = crate::db::read::sandbox(&db, &sandbox_id)
                 .map_err(|e| Status::internal(format!("db sandbox lookup failed: {e}")))?
                 .ok_or_else(|| Status::not_found(format!("sandbox {sandbox_id} not found")))?;
-            let state_changed_at = crate::db::sandbox_state_changed_at_witness(&db, &sandbox_id)
+            let state_changed_at = crate::db::read::state_changed_at_witness(&db, &sandbox_id)
                 .map_err(|e| Status::internal(format!("db sandbox lookup failed: {e}")))?
                 .ok_or_else(|| Status::not_found(format!("sandbox {sandbox_id} not found")))?;
             (row, state_changed_at)

@@ -55,7 +55,7 @@ public.ecr.aws/docker/library/rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d781
 
 # Base of the guest kernel build, templates/firecracker/kernel/Dockerfile
 # (Main CI's guest_kernel job).
-ubuntu:24.04@sha256:496754492fb28b4d3049432f2ca787449331e23fb14f0dd3fffea86bf5a93eb4 sha256:496754492fb28b4d3049432f2ca787449331e23fb14f0dd3fffea86bf5a93eb4 ghcr.io/perplexityai/space-ci-mirror:ubuntu-24.04-guest-kernel public.ecr.aws/docker/library/ubuntu
+ubuntu:24.04@sha256:a2d43bffc46670d7108bb3c0468c67c5557c4c92e83e1e34cbff1322ad1b94dc sha256:a2d43bffc46670d7108bb3c0468c67c5557c4c92e83e1e34cbff1322ad1b94dc ghcr.io/perplexityai/space-ci-mirror:ubuntu-24.04-guest-kernel public.ecr.aws/docker/library/ubuntu
 
 # Base of the seed builder, templates/firecracker/seed/Dockerfile (Kind).
 ubuntu:26.04@sha256:da6fc2be547864451aa253836dd926da33623312df4a9a243e35dc877c378a78 sha256:61ebaa5cc23ca45450db85eac015435199ec569e28ec222ea13f2aed2110b8a6 ghcr.io/perplexityai/space-ci-mirror:ubuntu-26.04

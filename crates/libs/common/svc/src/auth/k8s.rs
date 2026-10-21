@@ -29,6 +29,8 @@ const SPACE_NODE_API_AUTH_ALLOWED_SERVICE_ACCOUNTS_ENV: &str =
     "SPACE_NODE_API_AUTH_ALLOWED_SERVICE_ACCOUNTS";
 const SPACE_NODE_API_AUTH_GUEST_BRIDGE_SERVICE_ACCOUNTS_ENV: &str =
     "SPACE_NODE_API_AUTH_GUEST_BRIDGE_SERVICE_ACCOUNTS";
+const SPACE_NODE_API_AUTH_PEER_NODE_SERVICE_ACCOUNTS_ENV: &str =
+    "SPACE_NODE_API_AUTH_PEER_NODE_SERVICE_ACCOUNTS";
 const SPACE_NODE_API_AUTH_TRUSTED_WAIT_READY_SERVICE_ACCOUNTS_ENV: &str =
     "SPACE_NODE_API_AUTH_TRUSTED_WAIT_READY_SERVICE_ACCOUNTS";
 const SPACE_NODE_API_AUTH_TRUSTED_POLICY_SERVICE_ACCOUNTS_ENV: &str =
@@ -399,6 +401,12 @@ impl K8sTokenReviewer {
             ));
         }
 
+        if policy.peer_node_usernames.contains(username) && !peer_node_method(policy.role, method) {
+            return Err(Status::permission_denied(
+                "peer node service account is not allowed for this node-api method",
+            ));
+        }
+
         if log_accept {
             tracing::info!(
                 service_account = username,
@@ -501,6 +509,7 @@ pub(super) struct K8sTokenAuthConfig {
     pub(super) cluster_api_audience: String,
     node_api_allowed_usernames: BTreeSet<String>,
     node_api_guest_bridge_usernames: BTreeSet<String>,
+    node_api_peer_node_usernames: BTreeSet<String>,
     node_api_trusted_wait_ready_usernames: BTreeSet<String>,
     node_api_trusted_policy_usernames: BTreeSet<String>,
     template_transfer_usernames: BTreeSet<String>,
@@ -555,6 +564,9 @@ impl K8sTokenAuthConfig {
                 SPACE_NODE_API_AUTH_ALLOWED_SERVICE_ACCOUNTS_ENV,
             ),
             node_api_guest_bridge_usernames: guest_bridge_usernames,
+            node_api_peer_node_usernames: qualified_env_set(
+                SPACE_NODE_API_AUTH_PEER_NODE_SERVICE_ACCOUNTS_ENV,
+            ),
             node_api_trusted_wait_ready_usernames: qualified_env_set(
                 SPACE_NODE_API_AUTH_TRUSTED_WAIT_READY_SERVICE_ACCOUNTS_ENV,
             ),
@@ -658,6 +670,7 @@ impl K8sTokenAuthConfig {
             allowed_usernames,
             trusted_wait_ready_usernames,
             guest_bridge_usernames: &self.node_api_guest_bridge_usernames,
+            peer_node_usernames: &self.node_api_peer_node_usernames,
             trusted_policy_usernames,
             template_transfer_usernames: &self.template_transfer_usernames,
         })
@@ -692,6 +705,7 @@ struct AuthPolicy<'a> {
     allowed_usernames: &'a BTreeSet<String>,
     trusted_wait_ready_usernames: Option<&'a BTreeSet<String>>,
     guest_bridge_usernames: &'a BTreeSet<String>,
+    peer_node_usernames: &'a BTreeSet<String>,
     trusted_policy_usernames: Option<&'a BTreeSet<String>>,
     template_transfer_usernames: &'a BTreeSet<String>,
 }
@@ -760,6 +774,20 @@ fn guest_bridge_method(role: NodeRole, path: &str) -> bool {
             | "SpacedCloseLoopbackBridge"
             | "ServicePortIngress"
     )
+}
+
+/// A peer node's node-api calls this node only to export a template it is
+/// pulling (`connect_remote`, node-api `transfer.rs`). Every other RPC stays
+/// refused for a peer-node account, whatever else lists it.
+fn peer_node_method(role: NodeRole, path: &str) -> bool {
+    if path == "/space.node.api.v1.NodeInfo/GetNodeInfo" {
+        return true;
+    }
+    match role {
+        NodeRole::Worker => path == "/space.node.api.v1.WorkerApi/NodeExportTemplate",
+        NodeRole::Builder => path == "/space.node.api.v1.BuilderApi/NodeExportTemplate",
+        NodeRole::Cluster => false,
+    }
 }
 
 impl AuthPolicy<'_> {

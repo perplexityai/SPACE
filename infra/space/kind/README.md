@@ -182,16 +182,18 @@ either (see [Service identities](#service-identities)).
 
 ## CI smoke partitions
 
-Kind CI builds one exact-commit Rust artifact image and hands it to four
-isolated runners. Each runner boots its own Kind stack, proves the baseline,
+Kind CI produces one Rust artifact image per run and hands it to four isolated
+runners. Main builds it from its commit; a PR reuses main's image when its Rust
+inputs are the same (see [Smoke test](#smoke-test)). Each runner boots its own Kind stack, proves the baseline,
 and runs its assigned typed scenarios serially. Cluster-wide fault injection
 must never run concurrently on a shared stack. Every shard must pass.
 
 The shards prepare their node image, vendor mounts, cluster, and chart-image
-preloads while the Rust producer compiles. Application startup remains behind
+preloads while the Rust producer compiles or pulls the image. Application startup remains behind
 the verified artifact handoff; preparation never starts Tilt or compiles Rust.
 The manifest identifies the repository, source commit, run, producer attempt,
-archive digest, and Docker image ID. Failed-jobs-only reruns may use the nearest
+archive digest, and Docker image ID, plus the commit the image was built from
+and its Rust input key. Failed-jobs-only reruns may use the nearest
 successful producer from the same run, with the same source verification. A
 failed producer, expired artifact, or mismatched identity fails closed instead
 of compiling separately on each shard.
@@ -226,9 +228,11 @@ consume four concurrent runners; queue time remains a separate constraint.
 
 ### CI layer cache
 
-Kind CI builds the Rust artifact image once and transfers that exact image to
-all four smoke shards. This run-local handoff is independent of cross-run caching;
-each shard still verifies its source SHA and image ID before use.
+Kind CI produces the Rust artifact image once per run and transfers that exact
+image to all four smoke shards. The run-local handoff is the same whether the
+producer built the image or reused main's from
+`ghcr.io/perplexityai/space-kind-rust-artifacts` (see [Smoke test](#smoke-test)):
+each shard verifies its run, source and image ID before use.
 
 New cross-run BuildKit layers go to `ghcr.io/perplexityai/space-kind-build-cache`,
 not GitHub Actions' shared cache quota. The three stable tags are
@@ -1304,9 +1308,11 @@ load-balanced entry, scaled on load.
 - **cluster-controller** runs two replicas with leader election on: the Lease
   holder runs every reconciler and the other stands by, Ready, to take over.
   The typed scenario `local.leader_election_brownout_keeps_one_leader`
-  exercises the handoff. It needs `otel` mode. It takes about 30 minutes, so
-  Kind CI's duration-balanced sharding gives it one shard's ECW pass to itself;
-  that shard's native pass runs after it. Run it alone with
+  exercises the handoff. It needs `otel` mode. It lowers the controller's
+  liveness budget to its floor for its own run, through a test hook that is
+  inert unless the `test-hooks` feature is compiled in, as the Kind build
+  does, and puts the standing value back at the end; it takes about 13
+  minutes. Run it alone with
   `uv run --frozen --python 3.11 -m space_smoke run
   local.leader_election_brownout_keeps_one_leader`.
 - **internal-api** (ClusterApi) runs two replicas behind its ClusterIP
@@ -1976,18 +1982,47 @@ published templates.
 
 ## Smoke test
 
-Main CI builds the Kind Rust artifact image once and hands that exact image to
-four isolated runners. Each runner brings up its own Kind/Firecracker stack,
+Kind CI produces the Kind Rust artifact image once per run and hands that exact
+image to four isolated runners. Each runner brings up its own Kind/Firecracker stack,
 runs the baseline smoke, then runs one of four duration-balanced partitions of
 the eligible ECW and native inventories. Scenarios remain serial within each
 shard because some mutate cluster-wide state. Every shard must pass for
 `space-ci` to pass.
 
-The CI-only `SPACE_KIND_RUST_ARTIFACTS=prebuilt` mode checks both
-`SPACE_KIND_PREBUILT_RUST_SHA` against the checkout and
-`SPACE_KIND_PREBUILT_RUST_IMAGE_ID` against the loaded Docker image. A missing
-or mismatched artifact fails rather than falling back to compilation. Local
-build defaults are unchanged.
+The CI-only `SPACE_KIND_RUST_ARTIFACTS=prebuilt` mode checks
+`SPACE_KIND_PREBUILT_RUST_IMAGE_ID` against the loaded Docker image and
+`SPACE_KIND_PREBUILT_RUST_SHA`, the commit the image was built from, against
+the checkout. For an image built from another commit, it instead requires the
+image's input key label, `SPACE_KIND_PREBUILT_RUST_KEY` from the handoff, and
+this checkout's recomputed key to agree. A missing or mismatched artifact fails
+rather than falling back to compilation. Local build defaults are unchanged.
+
+A PR's producer skips the build when main already built an image from the same
+Rust inputs. `build-rust-artifacts.sh --input-key` hashes everything the
+Docker build reads:
+
+- both Rust Dockerfiles, and the git mode and blob ID of every path they `COPY`;
+- the `.dockerignore`, any `<Dockerfile>.dockerignore`, and every
+  `.gitattributes` from the root down to each input;
+- the build script and the architecture;
+- the digest the effective mirrored-image list pins for each registry base.
+
+Commits and times are not part of it. There is no key when an input is
+uncommitted or untracked, or when a Dockerfile reads the context in a way the
+key cannot list, such as `ADD` or a bind mount.
+
+Main builds on every push, which proves the producer still builds at its
+commit. A build from committed inputs, with every base from its mirrored
+digest, labels the image with its key and commit. A separate main-only job then
+pushes it to `ghcr.io/perplexityai/space-kind-rust-artifacts:<key>`, replacing
+the key's earlier image, and keeps the twenty newest versions. The shards
+never wait for that push.
+
+Each PR first tries to pull its key's image. Any miss or failure builds as
+before, with a notice, including a fork, or any PR whose token cannot read the
+package. Setting the repository variable `SPACE_KIND_RUST_REUSE` to `off`
+turns PR reuse off without a code change. A reused image goes through the same
+handoff. The runtime images Tilt builds still record the checkout's commit.
 
 To reproduce a shard, use `scripts/tests/smoke-kind-typed.sh all 1/4` (through
 `4/4`) with the same admin-token setup as a full `all` run, on a bench brought

@@ -1,6 +1,6 @@
 use crate::db::Connection;
 
-use crate::db::route_activation_claims::{OpenRouteActivationClaim, claim_matches};
+use crate::db::route_activation_claims::OpenRouteActivationClaim;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum OpenRouteActivationAdmissionError {
@@ -39,10 +39,14 @@ pub(crate) fn validate_cluster_fenced_activation(
     sandbox_id: &str,
     claim: &OpenRouteActivationClaim,
 ) -> Result<(), OpenRouteActivationAdmissionError> {
-    let provenance = crate::db::activation_route_provenance(conn, sandbox_id)?;
+    let provenance =
+        crate::db::read::sandbox_view(conn, sandbox_id).activation_route_provenance()?;
     let retained = observed_generation_floor(provenance);
     let requested = claim.requested_generation();
-    if claim_matches(conn, sandbox_id, claim)? {
+    if crate::db::read::sandbox_view(conn, sandbox_id)
+        .route_claim()
+        .matches(claim)?
+    {
         return Ok(());
     }
     if let Some(retained) = retained

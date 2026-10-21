@@ -714,10 +714,11 @@ fn adopt_restoring_row_under_recovery_claim(
     // The generation CAS below sees the newly written Restoring state, so it
     // cannot independently prove the prior row was still eligible for recovery.
     if recovery.is_some() {
-        let existing_state =
-            crate::db::current_state_label(&tx, canonical_id).map_err(|source| {
-                crate::snapshot_restore::RestoreError::AdvanceRestorePhase { source }
-            })?;
+        let existing_state = crate::db::read::sandbox_view(&tx, canonical_id)
+            .current_state_label()
+            .map_err(
+                |source| crate::snapshot_restore::RestoreError::AdvanceRestorePhase { source },
+            )?;
         // An absent row is the orphan case this path exists for; the upsert
         // inserts it. Only an existing row in an unexpected state is a refusal.
         //
@@ -1063,14 +1064,14 @@ fn claim_exchanged_restore_cleanup(
     let db = db.lock().map_err(|_| {
         crate::snapshot_restore::RestoreError::Other("sandbox database mutex poisoned".to_string())
     })?;
-    if crate::db::canonical_restore_reclaim_attempt_is_current(
-        &db,
-        sandbox_id,
-        existing.transfer_scope_id,
-        execution_generation,
-        activation_attempt_id,
-    )
-    .map_err(|source| crate::snapshot_restore::RestoreError::AdvanceRestorePhase { source })?
+    if crate::db::read::sandbox_view(&db, sandbox_id)
+        .restore_scope()
+        .reclaim_attempt_is_current(
+            existing.transfer_scope_id,
+            execution_generation,
+            activation_attempt_id,
+        )
+        .map_err(|source| crate::snapshot_restore::RestoreError::AdvanceRestorePhase { source })?
     {
         return Ok(existing.clone());
     }
@@ -1087,7 +1088,7 @@ fn claim_exchanged_restore_cleanup(
             "restore activation attempt is not newer than the durable exchanged-root cleanup owner for {sandbox_id}; retry"
         )));
     }
-    crate::db::restore_transfer_scope(&db, sandbox_id)
+    crate::db::read::sandbox_view(&db, sandbox_id).restore_scope().scope()
         .map_err(|source| crate::snapshot_restore::RestoreError::AdvanceRestorePhase { source })?
         .ok_or_else(|| {
             crate::snapshot_restore::RestoreError::Other(format!(
@@ -1150,9 +1151,13 @@ impl SandboxManagerService {
             .db
             .lock()
             .map_err(|_| crate::snapshot_restore::RestoreError::SandboxDatabaseMutexPoisoned)?;
-        if crate::db::quarantine_recovery_claim_is_current(&db, claimed).map_err(|source| {
-            crate::snapshot_restore::RestoreError::ReadQuarantineRecoveryClaim { source }
-        })? {
+        if crate::db::read::sandbox_view(&db, &claimed.candidate.sandbox_id.to_string())
+            .quarantine()
+            .claim_is_current(claimed)
+            .map_err(|source| {
+                crate::snapshot_restore::RestoreError::ReadQuarantineRecoveryClaim { source }
+            })?
+        {
             return Ok(());
         }
         Err(
@@ -1303,7 +1308,9 @@ impl SandboxManagerService {
             let db = self
                 .db_conn()
                 .map_err(|_| crate::snapshot_restore::RestoreError::SandboxDatabaseMutexPoisoned)?;
-            crate::db::restore_transfer_scope(&db, sandbox_id)
+            crate::db::read::sandbox_view(&db, sandbox_id)
+                .restore_scope()
+                .scope()
                 .map_err(
                     |source| crate::snapshot_restore::RestoreError::AdvanceRestorePhase { source },
                 )?
@@ -1392,7 +1399,7 @@ impl SandboxManagerService {
             let db = self
                 .db_conn()
                 .map_err(|_| crate::snapshot_restore::RestoreError::SandboxDatabaseMutexPoisoned)?;
-            crate::db::get_sandbox(&db, &canonical_id)
+            crate::db::read::sandbox(&db, &canonical_id)
                 .map_err(|source| RestoreError::ReadSandboxRow { source })?
         };
         let mut recovering_orphan_quarantine = false;
@@ -1413,7 +1420,9 @@ impl SandboxManagerService {
                     let db = self.db_conn().map_err(|_| {
                         crate::snapshot_restore::RestoreError::SandboxDatabaseMutexPoisoned
                     })?;
-                    crate::db::is_orphan_quarantine_recovery_state(&db, &canonical_id, row.state)
+                    crate::db::read::sandbox_view(&db, &canonical_id)
+                        .quarantine()
+                        .is_orphan_recovery_state(row.state)
                         .map_err(|source| RestoreError::ReadSandboxRow { source })?
                 };
                 if !eligible {
@@ -1460,7 +1469,7 @@ impl SandboxManagerService {
                             .result("removed"),
                     );
                 }
-            } else if crate::db::sandbox_is_retryable_interrupted_restore(&row) {
+            } else if row.is_retryable_interrupted_restore() {
                 retrying_interrupted_restore = true;
                 interrupted_restore_source = row
                     .restore_operation
@@ -1553,7 +1562,9 @@ impl SandboxManagerService {
                     let db = self.db_conn().map_err(|_| {
                         crate::snapshot_restore::RestoreError::SandboxDatabaseMutexPoisoned
                     })?;
-                    crate::db::restore_transfer_scope(&db, &canonical_id)
+                    crate::db::read::sandbox_view(&db, &canonical_id)
+                        .restore_scope()
+                        .scope()
                         .map_err(|source| RestoreError::AdvanceRestorePhase { source })?
                         .filter(|scope| std::path::Path::new(&scope.staging_dir).exists())
                 };
@@ -1661,7 +1672,9 @@ impl SandboxManagerService {
                 let db = self.db_conn().map_err(|_| {
                     crate::snapshot_restore::RestoreError::SandboxDatabaseMutexPoisoned
                 })?;
-                crate::db::restore_transfer_scope(&db, &canonical_id)
+                crate::db::read::sandbox_view(&db, &canonical_id)
+                    .restore_scope()
+                    .scope()
                     .map_err(|source| RestoreError::AdvanceRestorePhase { source })?
             };
             if let Some(existing) = existing {
@@ -2027,14 +2040,14 @@ impl SandboxManagerService {
                 let db = self.db_conn().map_err(|_| {
                     crate::snapshot_restore::RestoreError::SandboxDatabaseMutexPoisoned
                 })?;
-                crate::db::canonical_restore_reclaim_attempt_is_current(
-                    &db,
-                    &canonical_id,
-                    transfer_scope_id,
-                    execution_generation,
-                    activation_attempt_id,
-                )
-                .map_err(|source| RestoreError::AdvanceRestorePhase { source })?
+                crate::db::read::sandbox_view(&db, &canonical_id)
+                    .restore_scope()
+                    .reclaim_attempt_is_current(
+                        transfer_scope_id,
+                        execution_generation,
+                        activation_attempt_id,
+                    )
+                    .map_err(|source| RestoreError::AdvanceRestorePhase { source })?
             };
             if !attempt_is_current {
                 return Err(RestoreError::Other(format!(
@@ -2074,7 +2087,7 @@ impl SandboxManagerService {
                         let db = self.db_conn().map_err(|_| {
                             crate::snapshot_restore::RestoreError::SandboxDatabaseMutexPoisoned
                         })?;
-                        crate::db::restore_transfer_scope(&db, &canonical_id)
+                        crate::db::read::sandbox_view(&db, &canonical_id).restore_scope().scope()
                             .map_err(|source| RestoreError::AdvanceRestorePhase { source })?
                             .ok_or_else(|| {
                                 RestoreError::Other(format!(

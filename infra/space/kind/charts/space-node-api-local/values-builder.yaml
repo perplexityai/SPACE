@@ -26,6 +26,11 @@ auth:
     - space-api
     - space-node-api
     - space-builder-node-api
+  # Peer node-apis are confined to NodeExportTemplate and GetNodeInfo
+  # (values.yaml).
+  SPACE_NODE_API_AUTH_PEER_NODE_SERVICE_ACCOUNTS:
+    - space-node-api
+    - space-builder-node-api
   # BuilderApi/BuildTemplate also passes the build reviewer
   # (BuildSurface::NodeApi, crates/libs/common/svc/src/auth/build/k8s.rs):
   # these accounts, if also allowed above, may submit builds; tenant builds

@@ -5072,6 +5072,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-bearer-token"
+version = "0.8.0"
+dependencies = [
+ "pplx-space-common-core",
+ "pplx-space-test-env",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tonic",
+ "uuid",
+]
+
+[[package]]
 name = "pplx-space-build-mgr"
 version = "0.8.0"
 dependencies = [
@@ -5147,10 +5159,10 @@ name = "pplx-space-build-mgr-client"
 version = "0.8.0"
 dependencies = [
  "anyhow",
+ "pplx-space-bearer-token",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-common-proto-build",
- "pplx-space-common-svc",
  "pplx-space-test-env",
  "prost",
  "rcgen",
@@ -5491,16 +5503,20 @@ dependencies = [
  "log",
  "nix 0.31.3",
  "pin-project-lite",
+ "pplx-space-bearer-token",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-db-test-fixtures",
  "pplx-space-dependency-drain",
  "pplx-space-metrics",
  "pplx-space-observability",
+ "pplx-space-rustls-provider",
+ "pplx-space-systemd-watchdog",
  "pplx-space-test-env",
+ "pplx-space-tokio-runtime",
+ "pplx-space-unix-socket-path",
  "rand 0.10.2",
  "redis",
- "rustls",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -5666,8 +5682,8 @@ dependencies = [
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-common-proto-build",
- "pplx-space-common-svc",
  "pplx-space-credential-injection-core",
+ "pplx-space-rustls-provider",
  "pplx-space-test-env",
  "prost",
  "rustls",
@@ -6107,16 +6123,17 @@ dependencies = [
  "bytes",
  "http-body-util",
  "hyper-util",
+ "pplx-space-bearer-token",
  "pplx-space-build-mgr-client",
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-common-grpc-lb",
  "pplx-space-common-proto-build",
- "pplx-space-common-svc",
  "pplx-space-execution-common",
  "pplx-space-net-common",
  "pplx-space-net-gateway-client",
  "pplx-space-node-mgr-client",
+ "pplx-space-observability",
  "pplx-space-sbx-mgr-client",
  "pplx-space-template-mgr-client",
  "pplx-space-test-env",
@@ -6499,8 +6516,8 @@ dependencies = [
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-common-proto-build",
- "pplx-space-common-svc",
  "pplx-space-execution-common",
+ "pplx-space-unix-socket-path",
  "prost",
  "serde",
  "serde_json",
@@ -6664,6 +6681,13 @@ dependencies = [
  "clap",
  "pplx-space-common-core",
  "pplx-space-node-runtime-supervisor",
+]
+
+[[package]]
+name = "pplx-space-rustls-provider"
+version = "0.8.0"
+dependencies = [
+ "rustls",
 ]
 
 [[package]]
@@ -7226,6 +7250,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-systemd-watchdog"
+version = "0.8.0"
+dependencies = [
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "pplx-space-template-mgr"
 version = "0.8.0"
 dependencies = [
@@ -7355,6 +7387,23 @@ dependencies = [
  "clap",
  "pplx-space-common-svc",
  "pplx-space-template-mgr",
+]
+
+[[package]]
+name = "pplx-space-tokio-runtime"
+version = "0.8.0"
+dependencies = [
+ "pplx-space-metrics",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "pplx-space-unix-socket-path"
+version = "0.8.0"
+dependencies = [
+ "thiserror 2.0.20",
 ]
 
 [[package]]

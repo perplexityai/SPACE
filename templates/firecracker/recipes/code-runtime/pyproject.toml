@@ -8,6 +8,8 @@ version = "0"
 # different interpreter fails the build until the lock is regenerated.
 requires-python = "==3.14.*"
 dependencies = [
+    # Package management
+    "pip",
     # Jupyter
     "jupyter",
     "ipython",
@@ -40,8 +42,8 @@ no-build = true
 # Lock only releases at least a week old, so new releases settle before a
 # rebuild picks them up.
 exclude-newer = "7 days"
-# Permit the current CA bundle update through the settling window.
-exclude-newer-package = { certifi = "2026-10-21T00:00:00Z" }
+# Package-specific delays stay relative so future upgrades remain eligible.
+exclude-newer-package = { certifi = "0 days", pip = "0 days" }
 # Builders run x86_64 or aarch64 Linux; locking only those keeps uv.lock small.
 environments = [
     "sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",

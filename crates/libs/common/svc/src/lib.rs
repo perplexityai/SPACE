@@ -15,7 +15,7 @@ pub use pplx_space_common_core::sql;
 pub use pplx_space_observability::{self as observability, LogContext, ObservabilityError};
 
 pub mod auth;
-pub mod bearer_token;
+pub use pplx_space_bearer_token as bearer_token;
 pub mod bootstrap;
 pub use pplx_space_dependency_drain as dependency_drain;
 pub mod disk_admission;
@@ -36,8 +36,8 @@ pub mod space_api_route;
 pub mod space_api_route_capability;
 pub mod space_api_route_ed25519;
 pub mod sql;
-pub mod systemd;
-pub mod tokio_runtime;
+pub use pplx_space_systemd_watchdog as systemd;
+pub use pplx_space_tokio_runtime as tokio_runtime;
 pub mod types;
 
 pub use dependency_drain::{
@@ -122,12 +122,7 @@ pub fn init_service_subprocess_with_log_context(
     pplx_space_observability::init_with_log_context(service_name, log_context)
 }
 
-pub fn install_default_rustls_crypto_provider() {
-    match rustls::crypto::aws_lc_rs::default_provider().install_default() {
-        Ok(()) => {}
-        Err(_already_installed) => {}
-    }
-}
+pub use pplx_space_rustls_provider::install_default_rustls_crypto_provider;
 
 pub use bootstrap::{
     CLIENT_SERVICE_METADATA_KEY, GRPC_HTTP2_KEEPALIVE_INTERVAL, GRPC_HTTP2_KEEPALIVE_TIMEOUT,

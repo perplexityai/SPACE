@@ -1,0 +1,107 @@
+{
+  "version": "v1",
+  "egress": {
+    "default_action": "deny",
+    "allow": [
+      {
+        "ip": "192.0.2.10"
+      },
+      {
+        "ip": "2001:db8::10"
+      },
+      {
+        "cidr": "198.51.100.10/32"
+      },
+      {
+        "cidr": "2001:db8:10::/48"
+      },
+      {
+        "domain": "host-10.example.test"
+      },
+      {
+        "wildcard_domain": "*.zone-10.example.test"
+      }
+    ],
+    "deny": [
+      {
+        "ip": "192.0.2.20"
+      },
+      {
+        "ip": "2001:db8::20"
+      },
+      {
+        "cidr": "198.51.100.20/32"
+      },
+      {
+        "cidr": "2001:db8:20::/48"
+      },
+      {
+        "domain": "host-20.example.test"
+      },
+      {
+        "wildcard_domain": "*.zone-20.example.test"
+      }
+    ]
+  },
+  "tls_interception": "on",
+  "network_credential_rules": [
+    {
+      "rule_id": "custom-port",
+      "destination": {
+        "exact_host": "api.example.test",
+        "port": 8443,
+        "path_prefix": "/v1"
+      },
+      "credential_header_bindings": [
+        {
+          "header_name": "authorization",
+          "credential_reference_id": "00000000-0000-4000-8000-000000000001"
+        },
+        {
+          "header_name": "x-api-key",
+          "credential_reference_id": "00000000-0000-4000-8000-000000000002"
+        }
+      ],
+      "supported_http_methods": [
+        "GET",
+        "POST",
+        "HEAD"
+      ]
+    },
+    {
+      "rule_id": "default-port",
+      "destination": {
+        "exact_host": "files.example.test"
+      },
+      "credential_header_bindings": [
+        {
+          "header_name": "authorization",
+          "credential_reference_id": "00000000-0000-4000-8000-000000000003"
+        }
+      ],
+      "supported_http_methods": [
+        "GET"
+      ]
+    }
+  ],
+  "tls_interception_exemptions": [
+    {
+      "ip": "192.0.2.30"
+    },
+    {
+      "ip": "2001:db8::30"
+    },
+    {
+      "cidr": "198.51.100.30/32"
+    },
+    {
+      "cidr": "2001:db8:30::/48"
+    },
+    {
+      "domain": "host-30.example.test"
+    },
+    {
+      "wildcard_domain": "*.zone-30.example.test"
+    }
+  ]
+}

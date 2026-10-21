@@ -122,7 +122,11 @@ def verify_dns_transport(
             failure_evidence=test.collect_guest_network_snapshot,
             dns_transport_checks=evidence,
         )
-    if blocked:
+    # No settle after an accepted probe: the gateway installs the create-time
+    # policy in one atomic swap and forwards nothing before it (it holds
+    # traffic until then), and records DNS answers before replying, so there
+    # is nothing left to settle. Without an accepted probe, the settle stays.
+    if blocked and not accepted:
         test.wait(5, reason="for the network policy to settle")
     for resolver, qname in blocked:
         exits = [probe(resolver, qname, "blocked") for _sample in range(3)]

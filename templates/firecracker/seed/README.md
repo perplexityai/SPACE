@@ -276,8 +276,8 @@ request:
   `constraint-dependencies = ["<name>!=<version>"]` under `[tool.uv]` in
   `pyproject.toml`, then run `uv lock`. uv selects the newest remaining
   eligible release.
-- To take a release less than a week old, allow it for that package only with
-  `exclude-newer-package = { <name> = "<timestamp>" }`.
+- To take a release less than a week old, set its package-specific delay to zero
+  with `exclude-newer-package = { <name> = "0 days" }`.
 
 Confirm the new lock passes without installing anything, using the recipe's uv
 version, then rebuild. Do not bypass the check with `UV_MALWARE_CHECK=0`.

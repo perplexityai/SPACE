@@ -165,38 +165,40 @@ pub fn settle_startup_resident(
     Ok(true)
 }
 
-pub fn cleanup_intent_for_startup_recovery(row: &SandboxRow) -> Option<(bool, CleanupCompletion)> {
-    if let (Some(keep_filesystem), Some(completion)) =
-        (row.cleanup_keep_filesystem, row.cleanup_completion)
-        && completion.owns_row_intent(row)
-    {
-        return Some((keep_filesystem, completion));
-    }
+db_private_outside_tests! {
+    fn cleanup_intent_for_startup_recovery(row: &SandboxRow) -> Option<(bool, CleanupCompletion)> {
+        if let (Some(keep_filesystem), Some(completion)) =
+            (row.cleanup_keep_filesystem, row.cleanup_completion)
+            && completion.owns_row_intent(row)
+        {
+            return Some((keep_filesystem, completion));
+        }
 
-    match row.state {
-        // Transient cleanup states represent an unfinished lifecycle operation.
-        // Finish them even if runtime fields were already cleared when the
-        // target terminal state is self-contained. Suspending is stricter:
-        // recovery may only mark it suspended once a full suspend artifact is
-        // already pinned; otherwise service-level startup recovery must either
-        // finish a complete staged publish or quarantine the row.
-        SandboxState::Stopping => Some((true, CleanupCompletion::MarkStopped)),
-        SandboxState::Suspending if sandbox_has_full_suspend_artifact_pin(row) => {
-            Some((true, CleanupCompletion::MarkSuspended))
+        match row.state {
+            // Transient cleanup states represent an unfinished lifecycle operation.
+            // Finish them even if runtime fields were already cleared when the
+            // target terminal state is self-contained. Suspending is stricter:
+            // recovery may only mark it suspended once a full suspend artifact is
+            // already pinned; otherwise service-level startup recovery must either
+            // finish a complete staged publish or quarantine the row.
+            SandboxState::Stopping => Some((true, CleanupCompletion::MarkStopped)),
+            SandboxState::Suspending if sandbox_has_full_suspend_artifact_pin(row) => {
+                Some((true, CleanupCompletion::MarkSuspended))
+            }
+            SandboxState::Suspending => None,
+            SandboxState::Deleting => Some((false, CleanupCompletion::DeleteRow)),
+            SandboxState::CleanupRequired => Some((true, CleanupCompletion::Quarantine)),
+            SandboxState::Starting if sandbox_has_runtime_fields(row) => {
+                Some((true, CleanupCompletion::MarkStopped))
+            }
+            SandboxState::Restoring if sandbox_has_runtime_fields(row) => {
+                Some((true, CleanupCompletion::MarkSuspended))
+            }
+            SandboxState::CleanupFailed if sandbox_has_runtime_fields(row) => {
+                Some((true, CleanupCompletion::Quarantine))
+            }
+            _ => None,
         }
-        SandboxState::Suspending => None,
-        SandboxState::Deleting => Some((false, CleanupCompletion::DeleteRow)),
-        SandboxState::CleanupRequired => Some((true, CleanupCompletion::Quarantine)),
-        SandboxState::Starting if sandbox_has_runtime_fields(row) => {
-            Some((true, CleanupCompletion::MarkStopped))
-        }
-        SandboxState::Restoring if sandbox_has_runtime_fields(row) => {
-            Some((true, CleanupCompletion::MarkSuspended))
-        }
-        SandboxState::CleanupFailed if sandbox_has_runtime_fields(row) => {
-            Some((true, CleanupCompletion::Quarantine))
-        }
-        _ => None,
     }
 }
 

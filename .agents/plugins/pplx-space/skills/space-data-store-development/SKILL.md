@@ -74,13 +74,11 @@ Not store verbs — leave these where they are:
   freshness checks). Moving the comparison client-side changes clock
   authority.
 
-When a store change adds a workspace crate or dependency edge: regenerate
-`ci/rust-artifact-inputs.json` with
-`ci/scripts/run-space-bundle-builds.py --regenerate-rust-artifact-inputs`
-(a Python test pins the manifest to the workspace graph and fails CI on
-drift), and run a lib-only `cargo check -p <crate>` — `--all-targets` pulls
-dev-dependencies into feature unification and can mask a missing cargo
-feature on the crate itself.
+When a store change adds a workspace crate or dependency edge, run a lib-only
+`cargo check -p <crate>` — `--all-targets` pulls dev-dependencies into feature
+unification and can mask a missing cargo feature on the crate itself. Release
+artifact digests read the crate graph from the workspace manifests, so no
+input list needs updating.
 
 ## PostgreSQL migrations
 

@@ -374,21 +374,23 @@ pub(super) fn active_teardown_suspend_operation(
         .map_err(Error::from)
 }
 
-pub fn latest_teardown_suspend_operation(
-    conn: &Connection,
-    sandbox_id: &str,
-) -> Result<Option<TeardownSuspendOperation>> {
-    conn.query_row(
-        "SELECT job_id, payload, status
+db_private_outside_tests! {
+    fn latest_teardown_suspend_operation(
+        conn: &Connection,
+        sandbox_id: &str,
+    ) -> Result<Option<TeardownSuspendOperation>> {
+        conn.query_row(
+            "SELECT job_id, payload, status
          FROM jobs
          WHERE kind = ?1
            AND subject_id = ?2
          ORDER BY created_at DESC, job_id DESC
          LIMIT 1",
-        params![TEARDOWN_SUSPEND_JOB_KIND, sandbox_id],
-        |row| parse_teardown_suspend_operation(row.get(0)?, row.get(1)?, row.get(2)?),
-    )
-    .optional()
+            params![TEARDOWN_SUSPEND_JOB_KIND, sandbox_id],
+            |row| parse_teardown_suspend_operation(row.get(0)?, row.get(1)?, row.get(2)?),
+        )
+        .optional()
+    }
 }
 
 fn parse_teardown_suspend_operation(
@@ -417,41 +419,43 @@ pub struct TeardownReleaseEvidence {
     pub activation_rolled_back: bool,
 }
 
-/// Release evidence must describe one SQLite snapshot: a historical rollback
-/// cannot be combined with ownership from before a replacement activation.
-pub fn teardown_release_evidence(
-    conn: &Connection,
-    sandbox_id: &str,
-    execution_generation: ExecutionGeneration,
-) -> Result<TeardownReleaseEvidence> {
-    let tx = Transaction::deferred(conn)?;
-    let runtime_generation = runtime_execution_generation(&tx, sandbox_id)?;
-    let suspend = teardown_suspend_status(&tx, sandbox_id)?;
-    let deleted = execution_delete_receipt_covers(&tx, sandbox_id, execution_generation)?;
-    let activation_rolled_back = match &suspend {
-        Some(status)
-            if runtime_generation.is_none()
-                && matches!(status.state, SandboxState::Created | SandboxState::Stopped)
-                && status.operation.as_ref().is_none_or(|operation| {
-                    operation.status == TeardownSuspendOperationStatus::Completed
-                }) =>
-        {
-            completed_activation_rollback_covers(
-                &tx,
-                sandbox_id,
-                status.state,
-                execution_generation,
-            )?
-        }
-        _ => false,
-    };
-    tx.commit()?;
-    Ok(TeardownReleaseEvidence {
-        runtime_generation,
-        suspend,
-        deleted,
-        activation_rolled_back,
-    })
+db_private_outside_tests! {
+    /// Release evidence must describe one SQLite snapshot: a historical rollback
+    /// cannot be combined with ownership from before a replacement activation.
+    fn teardown_release_evidence(
+        conn: &Connection,
+        sandbox_id: &str,
+        execution_generation: ExecutionGeneration,
+    ) -> Result<TeardownReleaseEvidence> {
+        let tx = Transaction::deferred(conn)?;
+        let runtime_generation = runtime_execution_generation(&tx, sandbox_id)?;
+        let suspend = teardown_suspend_status(&tx, sandbox_id)?;
+        let deleted = execution_delete_receipt_covers(&tx, sandbox_id, execution_generation)?;
+        let activation_rolled_back = match &suspend {
+            Some(status)
+                if runtime_generation.is_none()
+                    && matches!(status.state, SandboxState::Created | SandboxState::Stopped)
+                    && status.operation.as_ref().is_none_or(|operation| {
+                        operation.status == TeardownSuspendOperationStatus::Completed
+                    }) =>
+            {
+                completed_activation_rollback_covers(
+                    &tx,
+                    sandbox_id,
+                    status.state,
+                    execution_generation,
+                )?
+            }
+            _ => false,
+        };
+        tx.commit()?;
+        Ok(TeardownReleaseEvidence {
+            runtime_generation,
+            suspend,
+            deleted,
+            activation_rolled_back,
+        })
+    }
 }
 
 fn completed_activation_rollback_covers(
@@ -501,13 +505,14 @@ fn completed_activation_rollback_covers(
     }))
 }
 
-pub fn teardown_suspend_status(
-    conn: &Connection,
-    sandbox_id: &str,
-) -> Result<Option<TeardownSuspendStatus>> {
-    let status = conn
-        .query_row(
-            "SELECT s.state,
+db_private_outside_tests! {
+    fn teardown_suspend_status(
+        conn: &Connection,
+        sandbox_id: &str,
+    ) -> Result<Option<TeardownSuspendStatus>> {
+        let status = conn
+            .query_row(
+                "SELECT s.state,
                 s.current_local_artifact_id,
                 s.current_local_artifact_kind,
                 s.current_local_artifact_origin,
@@ -518,103 +523,104 @@ pub fn teardown_suspend_status(
            ON a.local_artifact_id = s.current_local_artifact_id
           AND a.sandbox_id = s.id
          WHERE s.id = ?1",
-            params![sandbox_id],
-            |row| {
-                let state_text = row.get::<_, String>(0)?;
-                let state = state_text.parse::<SandboxState>().map_err(|_| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        Type::Text,
-                        Box::new(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("unknown sandbox state {state_text:?}"),
-                        )),
-                    )
-                })?;
-                let local_artifact_id = row
-                    .get::<_, Option<String>>(1)?
-                    .map(|value| {
-                        LocalArtifactId::from_str(&value).map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                1,
-                                Type::Text,
-                                Box::new(error),
-                            )
-                        })
-                    })
-                    .transpose()?;
-                let artifact_kind = row
-                    .get::<_, Option<String>>(2)?
-                    .map(|value| {
-                        ArtifactKind::from_str(&value).map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                2,
-                                Type::Text,
-                                Box::new(error),
-                            )
-                        })
-                    })
-                    .transpose()?;
-                let artifact_origin = row
-                    .get::<_, Option<String>>(3)?
-                    .map(|value| {
-                        ArtifactOrigin::from_str(&value).map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                3,
-                                Type::Text,
-                                Box::new(error),
-                            )
-                        })
-                    })
-                    .transpose()?;
-                let artifact_path = row.get::<_, Option<String>>(4)?;
-                let backup_completed = row.get::<_, bool>(5)?;
-
-                let artifact = match (
-                    local_artifact_id,
-                    artifact_kind,
-                    artifact_origin,
-                    artifact_path,
-                ) {
-                    (None, None, None, None) => None,
-                    (
-                        Some(local_artifact_id),
-                        Some(ArtifactKind::Full),
-                        Some(ArtifactOrigin::Suspend),
-                        Some(local_path),
-                    ) => Some(LocalArtifactRow {
-                        local_artifact_id,
-                        sandbox_id: sandbox_id.to_string(),
-                        artifact_kind: ArtifactKind::Full,
-                        artifact_origin: ArtifactOrigin::Suspend,
-                        snapshot_name: None,
-                        local_path,
-                    }),
-                    _ => {
-                        return Err(rusqlite::Error::FromSqlConversionFailure(
-                            1,
+                params![sandbox_id],
+                |row| {
+                    let state_text = row.get::<_, String>(0)?;
+                    let state = state_text.parse::<SandboxState>().map_err(|_| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
                             Type::Text,
                             Box::new(std::io::Error::new(
                                 std::io::ErrorKind::InvalidData,
-                                "sandbox suspend artifact pin is incomplete or invalid",
+                                format!("unknown sandbox state {state_text:?}"),
                             )),
-                        ));
-                    }
-                };
+                        )
+                    })?;
+                    let local_artifact_id = row
+                        .get::<_, Option<String>>(1)?
+                        .map(|value| {
+                            LocalArtifactId::from_str(&value).map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    1,
+                                    Type::Text,
+                                    Box::new(error),
+                                )
+                            })
+                        })
+                        .transpose()?;
+                    let artifact_kind = row
+                        .get::<_, Option<String>>(2)?
+                        .map(|value| {
+                            ArtifactKind::from_str(&value).map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    2,
+                                    Type::Text,
+                                    Box::new(error),
+                                )
+                            })
+                        })
+                        .transpose()?;
+                    let artifact_origin = row
+                        .get::<_, Option<String>>(3)?
+                        .map(|value| {
+                            ArtifactOrigin::from_str(&value).map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    3,
+                                    Type::Text,
+                                    Box::new(error),
+                                )
+                            })
+                        })
+                        .transpose()?;
+                    let artifact_path = row.get::<_, Option<String>>(4)?;
+                    let backup_completed = row.get::<_, bool>(5)?;
 
-                Ok((state, artifact, backup_completed))
-            },
-        )
-        .optional()?;
-    let Some((state, artifact, backup_completed)) = status else {
-        return Ok(None);
-    };
-    Ok(Some(TeardownSuspendStatus {
-        state,
-        operation: latest_teardown_suspend_operation(conn, sandbox_id)?,
-        artifact,
-        backup_completed,
-    }))
+                    let artifact = match (
+                        local_artifact_id,
+                        artifact_kind,
+                        artifact_origin,
+                        artifact_path,
+                    ) {
+                        (None, None, None, None) => None,
+                        (
+                            Some(local_artifact_id),
+                            Some(ArtifactKind::Full),
+                            Some(ArtifactOrigin::Suspend),
+                            Some(local_path),
+                        ) => Some(LocalArtifactRow {
+                            local_artifact_id,
+                            sandbox_id: sandbox_id.to_string(),
+                            artifact_kind: ArtifactKind::Full,
+                            artifact_origin: ArtifactOrigin::Suspend,
+                            snapshot_name: None,
+                            local_path,
+                        }),
+                        _ => {
+                            return Err(rusqlite::Error::FromSqlConversionFailure(
+                                1,
+                                Type::Text,
+                                Box::new(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "sandbox suspend artifact pin is incomplete or invalid",
+                                )),
+                            ));
+                        }
+                    };
+
+                    Ok((state, artifact, backup_completed))
+                },
+            )
+            .optional()?;
+        let Some((state, artifact, backup_completed)) = status else {
+            return Ok(None);
+        };
+        Ok(Some(TeardownSuspendStatus {
+            state,
+            operation: latest_teardown_suspend_operation(conn, sandbox_id)?,
+            artifact,
+            backup_completed,
+        }))
+    }
 }
 
 pub fn complete_teardown_suspend(

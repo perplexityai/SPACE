@@ -1,5 +1,6 @@
 //! Bounded, progressing artifact discovery; deletion authority stays with its lease.
 
+use crate::db::db_private_outside_tests;
 use crate::db::{Connection, Result};
 use pplx_space_common_core::inventory::{InventoryBudget, MAX_RAW_BYTES};
 use pplx_space_common_core::sql;
@@ -61,86 +62,88 @@ const PAGE_SQL: &str = sql!(
 );
 
 impl ArtifactScan {
-    pub fn next_page(
-        &mut self,
-        conn: &Connection,
-    ) -> std::result::Result<ArtifactPage, InventoryReadError> {
-        let through = match self.through {
-            Some(through) => through,
-            None => {
-                let maximum: Option<i64> =
-                    conn.query_row(sql!("SELECT MAX(rowid) FROM local_artifacts"), [], |row| {
-                        row.get(0)
-                    })?;
-                let Some(maximum) = maximum else {
-                    return Ok(ArtifactPage::default());
-                };
-                maximum
-            }
-        };
-        let mut statement = conn.prepare_cached(PAGE_SQL)?;
-        let mut rows = statement.query(params![self.next, through, PAGE_SIZE as i64])?;
-        let mut page = ArtifactPage::default();
-        let mut last = None;
-        let mut budget = InventoryBudget::new(PAGE_SIZE, MAX_RAW_BYTES);
-        let mut page_full = false;
-        while let Some(row) = rows.next()? {
-            let rowid: i64 = row.get(0)?;
-            // Oversize evidence is retained without allocation and does not
-            // prevent later rows progressing. A row that fits alone but not
-            // this page is retried with a fresh budget on the next tick.
-            match check_row(row, &mut InventoryBudget::new(1, MAX_RAW_BYTES)) {
-                Ok(()) => {}
-                Err(InventoryReadError::Limit(_)) => {
-                    page.examined += 1;
-                    last = Some(rowid);
-                    tracing::warn!(
-                        rowid,
-                        "snapshot reaper: retaining oversized artifact observation"
-                    );
-                    continue;
+    db_private_outside_tests! {
+        fn next_page(
+            &mut self,
+            conn: &Connection,
+        ) -> std::result::Result<ArtifactPage, InventoryReadError> {
+            let through = match self.through {
+                Some(through) => through,
+                None => {
+                    let maximum: Option<i64> =
+                        conn.query_row(sql!("SELECT MAX(rowid) FROM local_artifacts"), [], |row| {
+                            row.get(0)
+                        })?;
+                    let Some(maximum) = maximum else {
+                        return Ok(ArtifactPage::default());
+                    };
+                    maximum
                 }
-                Err(error) => return Err(error),
-            }
-            match check_row(row, &mut budget) {
-                Ok(()) => {}
-                Err(InventoryReadError::Limit(_)) => {
-                    page_full = true;
-                    break;
+            };
+            let mut statement = conn.prepare_cached(PAGE_SQL)?;
+            let mut rows = statement.query(params![self.next, through, PAGE_SIZE as i64])?;
+            let mut page = ArtifactPage::default();
+            let mut last = None;
+            let mut budget = InventoryBudget::new(PAGE_SIZE, MAX_RAW_BYTES);
+            let mut page_full = false;
+            while let Some(row) = rows.next()? {
+                let rowid: i64 = row.get(0)?;
+                // Oversize evidence is retained without allocation and does not
+                // prevent later rows progressing. A row that fits alone but not
+                // this page is retried with a fresh budget on the next tick.
+                match check_row(row, &mut InventoryBudget::new(1, MAX_RAW_BYTES)) {
+                    Ok(()) => {}
+                    Err(InventoryReadError::Limit(_)) => {
+                        page.examined += 1;
+                        last = Some(rowid);
+                        tracing::warn!(
+                            rowid,
+                            "snapshot reaper: retaining oversized artifact observation"
+                        );
+                        continue;
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(error) => return Err(error),
-            }
-            page.examined += 1;
-            last = Some(rowid);
-            let observation = (|| -> Result<ArtifactObservation> {
-                Ok(ArtifactObservation {
-                    local_artifact_id: row.get(1)?,
-                    sandbox_id: row.get(2)?,
-                    artifact_origin: row.get(3)?,
-                    artifact_kind: row.get(4)?,
-                    local_path: row.get(5)?,
-                    created_at_secs: row.get::<_, EpochSeconds>(6)?.unsigned(),
-                    last_touched_at_secs: row.get::<_, EpochSeconds>(7)?.unsigned(),
-                    backup_completed: row.get(8)?,
-                    is_ready_state: row.get(9)?,
-                    pinned_current: row.get(10)?,
-                })
-            })();
-            match observation {
-                Ok(observation) => page.artifacts.push(observation),
-                Err(error) => {
-                    tracing::warn!(rowid, %error, "snapshot reaper: retaining malformed artifact observation")
+                match check_row(row, &mut budget) {
+                    Ok(()) => {}
+                    Err(InventoryReadError::Limit(_)) => {
+                        page_full = true;
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                }
+                page.examined += 1;
+                last = Some(rowid);
+                let observation = (|| -> Result<ArtifactObservation> {
+                    Ok(ArtifactObservation {
+                        local_artifact_id: row.get(1)?,
+                        sandbox_id: row.get(2)?,
+                        artifact_origin: row.get(3)?,
+                        artifact_kind: row.get(4)?,
+                        local_path: row.get(5)?,
+                        created_at_secs: row.get::<_, EpochSeconds>(6)?.unsigned(),
+                        last_touched_at_secs: row.get::<_, EpochSeconds>(7)?.unsigned(),
+                        backup_completed: row.get(8)?,
+                        is_ready_state: row.get(9)?,
+                        pinned_current: row.get(10)?,
+                    })
+                })();
+                match observation {
+                    Ok(observation) => page.artifacts.push(observation),
+                    Err(error) => {
+                        tracing::warn!(rowid, %error, "snapshot reaper: retaining malformed artifact observation")
+                    }
                 }
             }
+            *self = match last {
+                Some(last) if (page.examined == PAGE_SIZE || page_full) && last < through => Self {
+                    next: last + 1,
+                    through: Some(through),
+                },
+                _ => Self::default(),
+            };
+            Ok(page)
         }
-        *self = match last {
-            Some(last) if (page.examined == PAGE_SIZE || page_full) && last < through => Self {
-                next: last + 1,
-                through: Some(through),
-            },
-            _ => Self::default(),
-        };
-        Ok(page)
     }
 }
 

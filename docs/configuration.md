@@ -344,6 +344,7 @@ calls.
 | `SPACE_CLUSTER_API_AUTH_ALLOWED_SERVICE_ACCOUNTS`, `SPACE_NODE_API_AUTH_ALLOWED_SERVICE_ACCOUNTS`, `SPACE_NODE_API_INTERNAL_AUTH_ALLOWED_SERVICE_ACCOUNTS` | empty | With Kubernetes auth on, an empty list rejects every call. |
 | `SPACE_NODE_API_AUTH_GUEST_BRIDGE_SERVICE_ACCOUNTS`, `SPACE_NODE_API_AUTH_TEMPLATE_BUILD_SERVICE_ACCOUNTS`, `SPACE_NODE_API_AUTH_TRUSTED_POLICY_SERVICE_ACCOUNTS`, `SPACE_NODE_API_AUTH_TRUSTED_WAIT_READY_SERVICE_ACCOUNTS` | empty | |
 | `SPACE_NODE_API_AUTH_TEMPLATE_TRANSFER_SERVICE_ACCOUNTS` | empty | Explicit artifact-transfer accounts for `NodeExportTemplate` and `PullTemplate`; also require normal surface admission. Guest-bridge accounts are always excluded. |
+| `SPACE_NODE_API_AUTH_PEER_NODE_SERVICE_ACCOUNTS` | empty | Accounts another node's node-api presents. They may call only `NodeExportTemplate` and `GetNodeInfo`, after admission and the transfer grant. |
 | `SPACE_NODE_API_NAMESPACE`, `SPACE_NODE_API_TLS_SERVER_NAME`, `SPACE_CLUSTER_API_TLS_SERVER_NAME` | namespace chain, from endpoint | |
 | `SPACE_API_ROUTE_ED25519_ISSUER`, `SPACE_API_ROUTE_ED25519_SIGNING_KEY_ID`, `SPACE_API_ROUTE_ED25519_SIGNING_KEY_PATH` | unset = no signing | Set all three. |
 | `SPACE_API_ROUTE_ED25519_VERIFICATION_BUNDLE_PATH` | required on sandbox managers | |
@@ -401,9 +402,12 @@ template-pull route, which only the direct substrate serves, or an operator
 calling node-api directly. The target's node-api then calls
 `NodeExportTemplate` on the source node with its own `SPACE_NODE_API_TOKEN_PATH`
 token. List the account that starts pulls and the node-api account of every
-role that can be a target. An empty list disables peer
+role that can be a target. An empty
+`SPACE_NODE_API_AUTH_TEMPLATE_TRANSFER_SERVICE_ACCOUNTS` disables peer
 transfers and node-api logs a startup warning. A deployment without peer
-transfers may leave it empty.
+transfers may leave it empty. Also list each node-api account in
+`SPACE_NODE_API_AUTH_PEER_NODE_SERVICE_ACCOUNTS`, which limits that account to
+the export call and `GetNodeInfo`.
 
 Exact-digest export can use the local cache offline. An omitted digest resolves
 the requested catalog tag (default `latest`) and exports only that digest; a

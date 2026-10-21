@@ -143,6 +143,7 @@ runpy.run_module("space_smoke", run_name="__main__")
                 "local.ecw_template_build_from_oci_boots",
                 "local.encrypted_resuspend_preserves_cow",
                 "local.forced_drain_evacuates_sandbox",
+                "local.fork_saturation_safety",
                 "local.fork_suspended_cross_node",
                 "local.gentle_drain_leaves_sandbox_resident",
                 "local.leader_election_brownout_keeps_one_leader",

@@ -34,6 +34,7 @@ use rusqlite::{OptionalExtension as _, params};
 
 mod handle;
 pub use handle::OptionalExtension;
+use handle::db_private_outside_tests;
 pub use handle::{Connection, ConnectionGuard, Error, Result, SharedConnection, Transaction};
 
 pub mod auto_lifecycle_delete_receipts;
@@ -66,8 +67,11 @@ use auto_lifecycle_delete_receipts::discard_pending_receipt_for_execution_advanc
 pub use teardown_jobs::{
     TeardownSuspendFailure, defer_teardown_suspend_retry, fail_teardown_suspend_backup_operation,
     fail_teardown_suspend_operation, reconcile_terminal_teardown_suspend_jobs,
-    teardown_suspend_retry_admissible, teardown_suspend_retry_due,
 };
+#[cfg(not(any(test, feature = "test-support")))]
+use teardown_jobs::{teardown_suspend_retry_admissible, teardown_suspend_retry_due};
+#[cfg(any(test, feature = "test-support"))]
+pub use teardown_jobs::{teardown_suspend_retry_admissible, teardown_suspend_retry_due};
 #[cfg(any(test, feature = "test-support"))]
 mod test_schema_image_cache;
 pub use quarantine_scan::PeriodicQuarantineRecoveryScan;
@@ -545,15 +549,17 @@ fn record_execution_delete_receipt(
     Ok(())
 }
 
-pub fn execution_delete_receipt_covers(
-    conn: &Connection,
-    sandbox_id: &str,
-    execution_generation: ExecutionGeneration,
-) -> Result<bool> {
-    let now = now_epoch_i64()?;
-    read::sandbox_view(conn, sandbox_id)
-        .delete_receipts()
-        .execution_covers(execution_generation, now)
+db_private_outside_tests! {
+    fn execution_delete_receipt_covers(
+        conn: &Connection,
+        sandbox_id: &str,
+        execution_generation: ExecutionGeneration,
+    ) -> Result<bool> {
+        let now = now_epoch_i64()?;
+        read::sandbox_view(conn, sandbox_id)
+            .delete_receipts()
+            .execution_covers(execution_generation, now)
+    }
 }
 
 /// Only use at read/decode boundaries. Statement, schema and write failures

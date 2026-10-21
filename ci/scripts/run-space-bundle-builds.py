@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # /// script
-# requires-python = ">=3.9"
+# requires-python = ">=3.11"
 # ///
 """Build and publish SPACE bundle images via `uv run --script`.
 
@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -121,7 +122,6 @@ RELEASE_IMAGE_REPOSITORIES: dict[str, str] = json.loads(
     RELEASE_IMAGE_MANIFEST.read_text()
 )
 
-RUST_ARTIFACT_INPUT_MANIFEST = Path("ci/rust-artifact-inputs.json")
 RUST_ARTIFACT_BINARIES = {
     "worker": (
         "spaced",
@@ -163,6 +163,46 @@ RUST_DEPENDENCY_INPUTS = (
     # Copied into the dependency stage before `cargo chef cook`.
     Path("infra/space/identity/node-identities.sh"),
 )
+
+# A lane's Rust artifact digest covers these inputs, the lane's extra inputs,
+# and each crate its binaries reach through non-dev dependencies, which
+# rust_artifact_packages reads from the workspace manifests.
+RUST_ARTIFACT_COMMON_INPUTS = (
+    Path("ci/scripts/run-space-bundle-builds.py"),
+    Path("ci/runtime-capabilities.json"),
+    Path(".cargo/config.toml"),
+    Path(".dockerignore"),
+    Path("Cargo.toml"),
+    Path("Cargo.lock"),
+    Path("rust-toolchain.toml"),
+    Path("proto"),
+    Path("docker/Dockerfile.rust-build-common"),
+    Path("docker/run-cargo-with-sccache.sh"),
+    Path("infra/space/identity/node-identities.sh"),
+)
+RUST_ARTIFACT_TEMPLATE_RECIPES = (
+    Path("templates/firecracker/recipes/seed.toml"),
+    Path("templates/firecracker/recipes/code-runtime.toml"),
+    Path("templates/firecracker/recipes/code-runtime"),
+)
+RUST_ARTIFACT_EXTRA_INPUTS = {
+    "worker": (
+        Path("db"),
+        Path("templates/firecracker/seed/rootfs-builder.sh"),
+        Path("scripts/build-runtime-supervisor.sh"),
+    ),
+    "builder": (Path("db"), Path("templates/firecracker/seed/rootfs-builder.sh")),
+    "api": (
+        Path("db"),
+        Path("templates/firecracker/seed/rootfs-builder.sh"),
+        *RUST_ARTIFACT_TEMPLATE_RECIPES,
+    ),
+    "data-plane": (),
+    "cluster-controller": (
+        Path("templates/firecracker/seed/rootfs-builder.sh"),
+        *RUST_ARTIFACT_TEMPLATE_RECIPES,
+    ),
+}
 
 
 # Asked for explicitly so ECR returns the stored manifest unconverted when a
@@ -524,144 +564,194 @@ def repository_inputs_digest(
     return digest.hexdigest()
 
 
-def rust_artifact_input_manifest(source_root: Path = REPO_ROOT) -> dict[str, Any]:
+@dataclass(frozen=True)
+class RustPackage:
+    # The names `cargo metadata` gives the package's binary targets.
+    binaries: frozenset[str]
+    # The workspace packages it names as normal or build dependencies, on any
+    # target platform, optional ones included: the edges a release build of
+    # its binaries can follow.
+    dependencies: frozenset[Path]
+
+
+RUST_DEPENDENCY_TABLES = ("dependencies", "build-dependencies", "build_dependencies")
+RUST_DEV_DEPENDENCY_TABLES = ("dev-dependencies", "dev_dependencies")
+
+
+def read_cargo_manifest(path: Path) -> dict[str, Any]:
     try:
-        manifest = json.loads(
-            (source_root / RUST_ARTIFACT_INPUT_MANIFEST).read_text()
+        with path.open("rb") as source:
+            return tomllib.load(source)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise SystemExit(f"Could not read Rust manifest {path}: {exc}") from exc
+
+
+def repository_relative(path: Path) -> Path:
+    normalized = Path(os.path.normpath(path))
+    if normalized.is_absolute() or normalized.parts[:1] == ("..",):
+        raise SystemExit(f"Rust package path leaves the repository: {path}")
+    return normalized
+
+
+def rust_binaries(package_root: Path, manifest: dict[str, Any]) -> frozenset[str]:
+    """Explicit `[[bin]]` targets plus those Cargo infers from the layout."""
+    explicit = manifest.get("bin", [])
+    names = {target["name"] for target in explicit}
+    if not manifest["package"].get("autobins", True):
+        return frozenset(names)
+    claimed = {os.path.normpath(target["path"]) for target in explicit if "path" in target}
+    inferred = []
+    if (package_root / "src/main.rs").is_file():
+        inferred.append((manifest["package"]["name"], "src/main.rs"))
+    if (package_root / "src/bin").is_dir():
+        for entry in (package_root / "src/bin").iterdir():
+            if entry.is_file() and entry.suffix == ".rs":
+                inferred.append((entry.stem, f"src/bin/{entry.name}"))
+            elif (entry / "main.rs").is_file():
+                inferred.append((entry.name, f"src/bin/{entry.name}/main.rs"))
+    return frozenset(
+        names.union(
+            name
+            for name, path in inferred
+            if name not in names and path not in claimed
         )
-        if not isinstance(manifest, dict) or set(manifest) != {
-            "version",
-            "common",
-            "lanes",
-        }:
-            raise TypeError("manifest must contain version, common, and lanes")
-        if manifest["version"] != 1:
-            raise ValueError("unsupported manifest version")
-        common = manifest["common"]
-        lanes = manifest["lanes"]
-        if not isinstance(common, list) or not isinstance(lanes, dict):
-            raise TypeError("common must be a list and lanes must be an object")
-        for lane, inputs in lanes.items():
-            if not isinstance(inputs, dict) or set(inputs) != {"extra", "packages"}:
-                raise TypeError(f"{lane} must contain extra and packages lists")
-            for group in ("extra", "packages"):
-                if not isinstance(inputs[group], list):
-                    raise TypeError(f"{lane}.{group} must be a list")
-        declared = [*common]
-        for inputs in lanes.values():
-            declared.extend(inputs["extra"])
-            declared.extend(inputs["packages"])
-        for value in declared:
-            path = Path(value) if isinstance(value, str) else None
-            if (
-                path is None
-                or path.is_absolute()
-                or path == Path(".")
-                or ".." in path.parts
-            ):
-                raise ValueError(f"invalid repository-relative input: {value!r}")
-    except (KeyError, OSError, TypeError, ValueError) as exc:
+    )
+
+
+def rust_local_overrides(source_root: Path) -> list[str]:
+    """The local crates that `[patch]`, `[replace]` or `paths` build in place
+    of the crates they name, from the root manifest and `.cargo/config.toml`.
+    Exits on what it cannot follow: a config `include`, and a source replaced
+    by a local directory, which no lane hashes."""
+    root_manifest = read_cargo_manifest(source_root / "Cargo.toml")
+    config_path = source_root / ".cargo/config.toml"
+    config = read_cargo_manifest(config_path) if config_path.exists() else {}
+    if "include" in config:
+        raise SystemExit("Rust artifact inputs follow no `include` in .cargo/config.toml")
+    vendored = sorted(
+        name
+        for name, source in config.get("source", {}).items()
+        if "directory" in source or "local-registry" in source
+    )
+    if vendored:
         raise SystemExit(
-            f"Could not load Rust artifact input manifest: {exc}"
-        ) from exc
-    return manifest
+            "Rust artifact inputs cover no source replaced by a local directory: "
+            + ", ".join(vendored)
+        )
+    paths = list(config.get("paths", []))
+    for source in (root_manifest, config):
+        for table in (*source.get("patch", {}).values(), source.get("replace", {})):
+            paths.extend(
+                spec["path"]
+                for spec in table.values()
+                if isinstance(spec, dict) and "path" in spec
+            )
+    return paths
+
+
+def rust_workspace_packages(source_root: Path) -> dict[Path, RustPackage]:
+    """Read each workspace package from its manifest. As in Cargo, a path
+    dependency is a member whether or not `members` lists it, and as in
+    `cargo metadata`, a dependency reaches the member with its package name
+    from any source."""
+    root_manifest = read_cargo_manifest(source_root / "Cargo.toml")
+    workspace = root_manifest.get("workspace", {})
+    if (
+        "package" in root_manifest
+        or "exclude" in workspace
+        or any(set(member) & set("*?[") for member in workspace.get("members", []))
+    ):
+        raise SystemExit(
+            "Rust artifact inputs need a virtual workspace root with literal members"
+        )
+    workspace_dependencies = workspace.get("dependencies", {})
+
+    manifests: dict[Path, dict[str, Any]] = {}
+    dependency_names: dict[Path, set[str]] = {}
+    pending = [Path(member) for member in workspace.get("members", [])]
+    while pending:
+        directory = repository_relative(pending.pop())
+        if directory in manifests:
+            continue
+        manifest = read_cargo_manifest(source_root / directory / "Cargo.toml")
+        manifests[directory] = manifest
+        names = dependency_names[directory] = set()
+        for table in (manifest, *manifest.get("target", {}).values()):
+            for kind in (*RUST_DEPENDENCY_TABLES, *RUST_DEV_DEPENDENCY_TABLES):
+                for key, spec in table.get(kind, {}).items():
+                    base, package = directory, key
+                    if isinstance(spec, dict) and spec.get("workspace"):
+                        spec, base = workspace_dependencies.get(key, key), Path()
+                    if isinstance(spec, dict):
+                        if "path" in spec:
+                            pending.append(base / spec["path"])
+                        package = spec.get("package", key)
+                    if kind in RUST_DEPENDENCY_TABLES:
+                        names.add(package)
+
+    # No lane would hash the sources of a substitute outside the workspace.
+    outside = [
+        path
+        for path in rust_local_overrides(source_root)
+        if repository_relative(Path(path)) not in manifests
+    ]
+    if outside:
+        raise SystemExit(
+            "Rust artifact inputs cover no local override outside the workspace "
+            f"members: {', '.join(outside)}"
+        )
+    directory_by_name = {
+        manifest["package"]["name"]: directory
+        for directory, manifest in manifests.items()
+    }
+    return {
+        directory: RustPackage(
+            binaries=rust_binaries(source_root / directory, manifest),
+            dependencies=frozenset(
+                directory_by_name[name]
+                for name in dependency_names[directory]
+                if name in directory_by_name
+            ),
+        )
+        for directory, manifest in manifests.items()
+    }
+
+
+def rust_artifact_packages(feature: str, source_root: Path = REPO_ROOT) -> tuple[Path, ...]:
+    """The workspace packages the lane's binaries reach through non-dev
+    dependencies, read from the manifests at build time so none can drift."""
+    binaries = set(RUST_ARTIFACT_BINARIES[feature])
+    packages = rust_workspace_packages(source_root)
+    missing = binaries.difference(*(package.binaries for package in packages.values()))
+    if missing:
+        raise SystemExit(
+            f"Could not find workspace packages for Rust binaries: {', '.join(sorted(missing))}"
+        )
+    # Cargo also builds a local override wherever the crate it replaces sits
+    # in the graph, under registry crates too, so every lane covers each one.
+    pending = [
+        *(directory for directory, package in packages.items() if package.binaries & binaries),
+        *(repository_relative(Path(path)) for path in rust_local_overrides(source_root)),
+    ]
+    selected: set[Path] = set()
+    while pending:
+        directory = pending.pop()
+        if directory not in selected:
+            selected.add(directory)
+            pending.extend(packages[directory].dependencies)
+    return tuple(sorted(selected))
 
 
 def rust_artifact_inputs(
     feature: str, source_root: Path = REPO_ROOT
 ) -> tuple[Path, ...]:
-    try:
-        manifest = rust_artifact_input_manifest(source_root)
-        lane = manifest["lanes"][feature]
-    except KeyError as exc:
-        raise SystemExit(f"Unknown Rust artifact lane: {feature}") from exc
-    return tuple(
-        Path(path)
-        for path in (*manifest["common"], *lane["extra"], *lane["packages"])
+    if feature not in RUST_ARTIFACT_BINARIES:
+        raise SystemExit(f"Unknown Rust artifact lane: {feature}")
+    return (
+        *RUST_ARTIFACT_COMMON_INPUTS,
+        *RUST_ARTIFACT_EXTRA_INPUTS[feature],
+        *rust_artifact_packages(feature, source_root),
     )
-
-
-def rust_artifact_input_manifest_from_metadata(
-    metadata: dict[str, Any], repo_root: Path
-) -> dict[str, list[str]]:
-    """Select each bundle's non-dev workspace dependency closure."""
-    workspace_members = set(metadata["workspace_members"])
-    packages = {
-        package["id"]: package
-        for package in metadata["packages"]
-        if package["id"] in workspace_members
-    }
-    package_by_name = {
-        package["name"]: package_id for package_id, package in packages.items()
-    }
-    package_by_binary = {
-        target["name"]: package_id
-        for package_id, package in packages.items()
-        for target in package["targets"]
-        if "bin" in target["kind"]
-    }
-
-    manifest: dict[str, list[str]] = {}
-    for feature, binaries in RUST_ARTIFACT_BINARIES.items():
-        try:
-            pending = [package_by_binary[binary] for binary in binaries]
-        except KeyError as exc:
-            raise SystemExit(
-                f"Could not find workspace package for Rust binary {exc.args[0]!r}"
-            ) from exc
-
-        selected: set[str] = set()
-        while pending:
-            package_id = pending.pop()
-            if package_id in selected:
-                continue
-            selected.add(package_id)
-            for dependency in packages[package_id]["dependencies"]:
-                dependency_id = package_by_name.get(dependency["name"])
-                if dependency["kind"] != "dev" and dependency_id is not None:
-                    pending.append(dependency_id)
-
-        manifest[feature] = sorted(
-            str(
-                Path(packages[package_id]["manifest_path"]).parent.relative_to(
-                    repo_root
-                )
-            )
-            for package_id in selected
-        )
-    return manifest
-
-
-def generate_rust_artifact_input_manifest(
-    repo_root: Path = REPO_ROOT,
-) -> dict[str, list[str]]:
-    result = run(
-        ["cargo", "metadata", "--format-version", "1", "--locked", "--no-deps"],
-        capture=True,
-        cwd=repo_root,
-    )
-    return rust_artifact_input_manifest_from_metadata(
-        json.loads(result.stdout), repo_root
-    )
-
-
-def regenerate_rust_artifact_input_manifest(repo_root: Path = REPO_ROOT) -> Path:
-    manifest_path = repo_root / RUST_ARTIFACT_INPUT_MANIFEST
-    manifest = rust_artifact_input_manifest(repo_root)
-    package_inputs = generate_rust_artifact_input_manifest(repo_root)
-    if set(manifest["lanes"]) != set(package_inputs):
-        raise SystemExit("Rust artifact input manifest lanes do not match the build lanes")
-    for feature, inputs in package_inputs.items():
-        manifest["lanes"][feature]["packages"] = inputs
-    manifest_path.write_text(
-        json.dumps(
-            manifest,
-            indent=2,
-            sort_keys=True,
-        )
-        + "\n"
-    )
-    return manifest_path
 
 
 class BundleBuilder:
@@ -1945,11 +2035,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="exact source revision that produced the release artifact",
     )
     parser.add_argument(
-        "--regenerate-rust-artifact-inputs",
-        action="store_true",
-        help="regenerate the committed per-bundle Rust dependency manifest",
-    )
-    parser.add_argument(
         "features",
         nargs="*",
         metavar="FEATURE",
@@ -1967,12 +2052,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     unknown_features = sorted(set(args.features) - supported_features)
     if unknown_features:
         parser.error(f"unknown bundle feature(s): {', '.join(unknown_features)}")
-    if args.regenerate_rust_artifact_inputs:
-        if args.features:
-            parser.error(
-                "--regenerate-rust-artifact-inputs cannot be combined with bundle features"
-            )
-    elif not args.features:
+    if not args.features:
         args.features = [
             "worker",
             "builder",
@@ -1995,11 +2075,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
-    if args.regenerate_rust_artifact_inputs:
-        source_root = args.source_root.resolve()
-        manifest_path = regenerate_rust_artifact_input_manifest(source_root)
-        print(f"Regenerated {manifest_path.relative_to(source_root)}")
-        return 0
     BundleBuilder(
         args.features,
         source_root=args.source_root,

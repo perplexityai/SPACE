@@ -883,11 +883,12 @@ fn stream_reclaim_due(
         return Ok(false);
     }
     let sandbox_id = &payload.meta.sandbox_id;
-    if !crate::db::sandbox_suspended_with_pinned_artifact(
-        conn,
-        sandbox_id,
-        &local_artifact_id.to_string(),
-    )? {
+    // Not a fence here: the connection guard is released before node-manager
+    // is asked, so `reclaim_stream` repeats this check under the hold that
+    // unlinks.
+    if !crate::db::read::sandbox_view(conn, sandbox_id)
+        .suspended_with_pinned_artifact(&local_artifact_id.to_string())?
+    {
         pplx_space_metrics::snapshot::stream_reclaim_skipped("not_pinned_suspended");
         tracing::info!(
             sandbox_id,
@@ -923,11 +924,11 @@ fn reclaim_stream(
         return Ok(());
     }
     let sandbox_id = &payload.meta.sandbox_id;
-    if !crate::db::sandbox_suspended_with_pinned_artifact(
-        conn,
-        sandbox_id,
-        &local_artifact_id.to_string(),
-    )? {
+    // A fence only because `conn` is the connection guard every state
+    // transition serializes on, held here across the unlink below.
+    if !crate::db::read::sandbox_view(conn, sandbox_id)
+        .suspended_with_pinned_artifact(&local_artifact_id.to_string())?
+    {
         pplx_space_metrics::snapshot::stream_reclaim_skipped("not_pinned_suspended");
         tracing::info!(
             sandbox_id,

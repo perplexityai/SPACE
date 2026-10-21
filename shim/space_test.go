@@ -1004,7 +1004,8 @@ func TestSandboxNetworkPolicyFromAnnotations(t *testing.T) {
 						{"cidr": "10.0.0.0/8"}
 					]
 				}
-			}`,
+			}
+			`,
 			sandboxNetworkPolicyGenerationAnnotation: "42",
 		},
 	}
@@ -1189,6 +1190,58 @@ func TestSandboxNetworkPolicyCredentialRules(t *testing.T) {
 	}
 }
 
+// The Rust policy serializer renders this fixture; every field it emits must decode strictly here.
+func TestParseNetworkPolicyJSONDecodesRustFixture(t *testing.T) {
+	raw, err := os.ReadFile("testdata/network-policy-v1.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := parseNetworkPolicyJSON(string(raw))
+	if err != nil {
+		t.Fatalf("parseNetworkPolicyJSON(fixture) error = %v", err)
+	}
+	if policy.GetTlsInterception() != netpb.TlsInterception_TLS_INTERCEPTION_ON {
+		t.Fatalf("tls_interception = %v, want on", policy.GetTlsInterception())
+	}
+	for name, destinations := range map[string][]*netpb.EgressDestinationV1{
+		"allow":                       policy.GetAllow(),
+		"deny":                        policy.GetDeny(),
+		"tls_interception_exemptions": policy.GetTlsInterceptionExemptions(),
+	} {
+		if len(destinations) != 6 {
+			t.Fatalf("%s has %d destinations, want 6", name, len(destinations))
+		}
+		if got := destinations[3].GetCidr(); !strings.HasPrefix(got, "2001:db8:") {
+			t.Fatalf("%s[3].cidr = %q, want an IPv6 CIDR", name, got)
+		}
+		if got := destinations[5].GetWildcardDomain(); !strings.HasPrefix(got, "*.") {
+			t.Fatalf("%s[5].wildcard_domain = %q, want a wildcard", name, got)
+		}
+	}
+	rules := policy.GetNetworkCredentialRules()
+	if len(rules) != 2 {
+		t.Fatalf("network_credential_rules has %d rules, want 2", len(rules))
+	}
+	custom := rules[0]
+	if custom.GetDestination().GetPort() != 8443 || custom.GetDestination().GetPathPrefix() != "/v1" {
+		t.Fatalf("custom destination = %v, want port 8443 and path /v1", custom.GetDestination())
+	}
+	if len(custom.GetCredentialHeaderBindings()) != 2 {
+		t.Fatalf("custom bindings = %v, want 2", custom.GetCredentialHeaderBindings())
+	}
+	wantMethods := []netpb.NetworkCredentialHttpMethodV1{
+		netpb.NetworkCredentialHttpMethodV1_NETWORK_CREDENTIAL_HTTP_METHOD_V1_GET,
+		netpb.NetworkCredentialHttpMethodV1_NETWORK_CREDENTIAL_HTTP_METHOD_V1_POST,
+		netpb.NetworkCredentialHttpMethodV1_NETWORK_CREDENTIAL_HTTP_METHOD_V1_HEAD,
+	}
+	if !reflect.DeepEqual(custom.GetSupportedHttpMethods(), wantMethods) {
+		t.Fatalf("custom methods = %v, want %v", custom.GetSupportedHttpMethods(), wantMethods)
+	}
+	if destination := rules[1].GetDestination(); destination.Port != nil || destination.PathPrefix != nil {
+		t.Fatalf("default destination = %v, want port and path omitted", destination)
+	}
+}
+
 func TestSandboxNetworkPolicyRequiresGeneration(t *testing.T) {
 	spec := &ociSpec{
 		Annotations: map[string]string{
@@ -1273,6 +1326,31 @@ func TestSandboxNetworkPolicyRejectsInvalidAnnotations(t *testing.T) {
 			name:        "bad default action",
 			policy:      `{"version":"v1","egress":{"default_action":"sometimes"}}`,
 			wantMessage: "unsupported network policy egress default_action",
+		},
+		{
+			name:        "unknown top-level field",
+			policy:      `{"version":"v1","egress":{"default_action":"deny"},"future_field":[{"domain":"example.test"}]}`,
+			wantMessage: `unknown field "future_field"`,
+		},
+		{
+			name:        "unknown egress field",
+			policy:      `{"version":"v1","egress":{"default_action":"allow","future_field":[]}}`,
+			wantMessage: `unknown field "future_field"`,
+		},
+		{
+			name:        "unknown destination field",
+			policy:      `{"version":"v1","egress":{"default_action":"deny","allow":[{"domain":"example.test","future_field":443}]}}`,
+			wantMessage: `unknown field "future_field"`,
+		},
+		{
+			name:        "trailing object",
+			policy:      `{"version":"v1","egress":{"default_action":"deny"}}{"version":"v1","egress":{"default_action":"allow"}}`,
+			wantMessage: "trailing content",
+		},
+		{
+			name:        "trailing garbage",
+			policy:      `{"version":"v1","egress":{"default_action":"deny"}}junk`,
+			wantMessage: "trailing content",
 		},
 		{
 			name:        "bad authority",

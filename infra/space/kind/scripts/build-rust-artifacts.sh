@@ -32,7 +32,9 @@
 #           registry layer cache (SPACE_KIND_BUILD_CACHE_REPOSITORY) warms.
 #
 #   prebuilt  CI-only handoff: use the already loaded image, requiring its exact
-#           image ID and checkout SHA. No compilation or automatic fallback.
+#           image ID, and either this checkout's SHA or, for an image built
+#           from another commit, this checkout's Rust input key (--input-key).
+#           No compilation or automatic fallback.
 #
 # Mode: SPACE_KIND_RUST_ARTIFACTS=auto (default) picks incremental on
 # Linux/x86_64 with Docker and says why when it falls back; =incremental
@@ -47,11 +49,14 @@
 # Usage:
 #   bash infra/space/kind/scripts/build-rust-artifacts.sh
 #   bash infra/space/kind/scripts/build-rust-artifacts.sh --mode     # print the mode decision, build nothing
+#   bash infra/space/kind/scripts/build-rust-artifacts.sh --input-key  # print the Docker build's input key, build nothing
 #
 # Env knobs:
 #   SPACE_KIND_RUST_ARTIFACTS       auto | incremental | docker | prebuilt (default: auto)
 #   SPACE_KIND_PREBUILT_RUST_IMAGE_ID  prebuilt mode: verified Docker image ID
 #   SPACE_KIND_PREBUILT_RUST_SHA       prebuilt mode: source commit of that image
+#   SPACE_KIND_PREBUILT_RUST_KEY       prebuilt mode: that image's Rust input key,
+#                                      checked when the commit is not this checkout's
 #   SPACE_KIND_RUST_PROFILE         incremental mode cargo profile: release
 #                                   (default, LTO off — the Docker path's shape)
 #                                   or dev-release (incremental codegen, debug=1)
@@ -83,6 +88,9 @@ HEALTH_PROBE_IMAGE="space-grpc-health-probe:local"
 KIND_DOCKERFILE="docker/Dockerfile.rust-build-kind"
 COMMON_DOCKERFILE="docker/Dockerfile.rust-build-common"
 HOST_DOCKERFILE="docker/Dockerfile.rust-artifacts-host"
+# A Docker-mode image built from pinned bases carries its input key and commit.
+INPUT_KEY_LABEL="space.pplx.net/kind-rust-input-key"
+REVISION_LABEL="org.opencontainers.image.revision"
 STATE_DIR="${SPACE_TILT_STATE_DIR:-$HOME/.space-devbox/kind}"
 STAGE_DIR="${SPACE_KIND_ARTIFACT_STAGE_DIR:-$STATE_DIR/rust-artifacts}"
 TARGET_DIR="${SPACE_KIND_RUST_TARGET_DIR:-$STATE_DIR/rust-target}"
@@ -153,13 +161,19 @@ docker_cache_flags() {
 
 # In GitHub CI (SPACE_CI_IMAGE_MIRROR set), the --build-context options that
 # take the common Dockerfile's registry bases from the repository's GHCR
-# mirror (ci/mirrored-images.txt); elsewhere none.
+# mirror (ci/mirrored-images.txt); elsewhere none. Clears BASES_PINNED when
+# any registry base of the build would come from its source instead, whose tag
+# can move away from the digest the input key records.
+BASES_PINNED=1
 mirror_build_flags() {
   MIRROR_FLAGS=()
-  local flag
+  local flag base
   while IFS= read -r flag; do
     MIRROR_FLAGS+=("$flag")
   done < <(bash "$REPO_ROOT/ci/scripts/mirror-images.sh" build-contexts "$COMMON_DOCKERFILE")
+  while read -r base; do
+    printf '%s\n' "${MIRROR_FLAGS[@]}" | grep -qF -- "--build-context=$base=" || BASES_PINNED=0
+  done < <(registry_bases)
 }
 
 # The production Dockerfile's toolchain stage: bookworm, the rust-toolchain.toml
@@ -194,7 +208,20 @@ build_docker() {
     docker build -f "$KIND_DOCKERFILE" --target cook --output type=cacheonly "${CACHE_FLAGS[@]}" .
   fi
   SPACE_KIND_BUILD_CACHE_WRITE=0 docker_cache_flags kind-rust-build
-  docker build -t "$ARTIFACT_IMAGE" -f "$KIND_DOCKERFILE" "${CACHE_FLAGS[@]}" .
+  # Label the image with what it was built from, so main CI can publish it for
+  # later runs with the same inputs (rust-artifact-handoff.py). Only when the
+  # key is exact: committed inputs and every base at its pinned digest.
+  local key labels=()
+  if (( BASES_PINNED )) && key="$(rust_input_key 2>/dev/null)"; then
+    labels=(--label "$INPUT_KEY_LABEL=$key" --label "$REVISION_LABEL=$(git rev-parse HEAD)")
+    log "Rust input key $key"
+  else
+    log "no Rust input key label: an input is uncommitted or a base is not at its mirrored digest"
+  fi
+  # One manifest, no attestation: the provenance attestation carries the build
+  # time, and an index would split into several registry package versions.
+  docker build -t "$ARTIFACT_IMAGE" -f "$KIND_DOCKERFILE" --provenance=false \
+    ${labels[@]+"${labels[@]}"} "${CACHE_FLAGS[@]}" .
 }
 
 # ── Incremental mode ──────────────────────────────────────────────────────────
@@ -231,10 +258,96 @@ supervisor_features() {
     | grep -oE -- '-F [^ \\]+' | awk '{print $2}'
 }
 
+# The checkout paths the COPY instructions on stdin take from the build context.
+copy_sources() {
+  awk '/^COPY / && !/--from=/ { for (i = 2; i < NF; i++) if ($i !~ /^--/) print $i }'
+}
+
 # The checkout paths the build stage COPYs in: exactly what the production
 # image compiles from, so exactly what the synced copy needs.
 build_inputs() {
-  build_stage | awk '/^COPY / && !/--from=/ { for (i = 2; i < NF; i++) if ($i !~ /^--/) print $i }'
+  build_stage | copy_sources
+}
+
+# The registry images the Docker build's stages start from; the other FROMs
+# name a stage, a build argument (an image built here from these) or scratch.
+registry_bases() {
+  awk '/^FROM / { from[$2] = 1; if (toupper($3) == "AS") stage[$4] = 1 }
+       END { for (f in from) if (!(f in stage) && f !~ /^\$/ && f != "scratch") print f }' \
+    "$KIND_DOCKERFILE" "$COMMON_DOCKERFILE" | sort
+}
+
+# Why the Rust Dockerfiles may read context bytes the input key cannot list,
+# one reason per line; empty when they cannot. Instructions are matched in any
+# case and indentation, as BuildKit reads them. A mount reads the context
+# unless it is a secret, tmpfs, ssh or plain cache mount (an untyped mount is
+# a bind mount).
+uncovered_context_reads() {
+  local dockerfile mount
+  for dockerfile in "$KIND_DOCKERFILE" "$COMMON_DOCKERFILE"; do
+    grep -qiE '^[[:space:]]*(ADD|ONBUILD)([[:space:]]|$)' "$dockerfile" \
+      && echo "$dockerfile uses ADD or ONBUILD"
+    awk 'toupper($0) ~ /^[[:space:]]*COPY([[:space:]]|$)/ && !/^COPY / { found = 1 } END { exit !found }' \
+      "$dockerfile" && echo "$dockerfile has a COPY not written as an unindented uppercase instruction"
+    grep -qE '^COPY .*\\$' "$dockerfile" && echo "$dockerfile continues a COPY onto another line"
+    while read -r mount; do
+      [[ "$mount" =~ (^|,)type=(secret|tmpfs|ssh)(,|$) ]] && continue
+      [[ "$mount" =~ (^|,)type=cache(,|$) && ! "$mount" =~ (^|,)from= ]] && continue
+      echo "$dockerfile mounts --mount=$mount"
+    done < <(grep -oiE -- '--mount=[^[:space:]]+' "$dockerfile" | cut -d= -f2-)
+  done
+}
+
+# The content key of the Docker-mode artifact image: equal keys mean the
+# build reads the same bytes. It covers:
+#   - both Dockerfiles: the stages, their build-argument defaults, and the
+#     feature and bin lists;
+#   - every path they COPY from the context, by mode and blob ID;
+#   - the ignore files that filter those (.dockerignore and each Dockerfile's
+#     own <Dockerfile>.dockerignore, which BuildKit prefers), and every
+#     .gitattributes from the root down to each input, which can change the
+#     checked-out bytes;
+#   - this script, which passes the build no build arguments;
+#   - the digest the effective mirrored-image list (SPACE_MIRRORED_IMAGES, as
+#     ci/scripts/mirror-images.sh reads it) pins for each registry base;
+#   - the architecture.
+# Commits, times and file stat data are not part of it. A key exists only for
+# committed inputs: it fails when any input is modified or untracked, or when
+# a Dockerfile reads the context in a way it cannot list.
+rust_input_key() {
+  local paths=() optional=() path dir base pin changes listing uncovered
+  local pins="${SPACE_MIRRORED_IMAGES:-$REPO_ROOT/ci/mirrored-images.txt}"
+  uncovered="$(uncovered_context_reads)"
+  [[ -z "$uncovered" ]] || die "the Rust Dockerfiles read context files the input key cannot list:"$'\n'"$uncovered"
+  mapfile -t paths < <(cat "$KIND_DOCKERFILE" "$COMMON_DOCKERFILE" | copy_sources | sort -u)
+  (( ${#paths[@]} > 0 )) || die "could not read the COPY sources of the Rust Dockerfiles"
+  paths+=("$KIND_DOCKERFILE" "$COMMON_DOCKERFILE" .dockerignore infra/space/kind/scripts/build-rust-artifacts.sh)
+  # Inputs that change the build only when present; absent, they list nothing.
+  optional=("$KIND_DOCKERFILE.dockerignore" "$COMMON_DOCKERFILE.dockerignore" .gitattributes)
+  for path in "${paths[@]}"; do
+    dir="$(dirname "$path")"
+    while [[ "$dir" != . ]]; do
+      optional+=("$dir/.gitattributes")
+      dir="$(dirname "$dir")"
+    done
+  done
+  mapfile -t optional < <(printf '%s\n' "${optional[@]}" | sort -u)
+  # No index refresh: Tilt's concurrent builds read the same checkout.
+  changes="$(git --no-optional-locks status --porcelain --untracked-files=all -- "${paths[@]}" "${optional[@]}")" \
+    || die "could not read the Rust build inputs' git status"
+  [[ -z "$changes" ]] || die "the Rust build inputs have uncommitted changes; they have no input key"
+  listing="$(git ls-files -s --error-unmatch -- "${paths[@]}")" \
+    || die "a COPY source of the Rust Dockerfiles is not tracked"
+  listing+=$'\n'"$(git ls-files -s -- "${optional[@]}")" \
+    || die "could not list the Rust build's ignore and attribute files"
+  {
+    echo "space-kind-rust-artifacts docker v1 $(uname -m)"
+    while read -r base; do
+      pin="$(awk -v name="$base" '$1 == name { print $2 }' "$pins")"
+      echo "base $base ${pin:-unpinned}"
+    done < <(registry_bases)
+    printf '%s\n' "$listing"
+  } | sha256sum | awk '{ print $1 }'
 }
 
 # "<target-relative-source> <artifact-path>" per line, from the scratch stage.
@@ -438,12 +551,16 @@ assembly_key() {
 
 # ── Entry ─────────────────────────────────────────────────────────────────────
 
+if [[ "${1:-}" == "--input-key" ]]; then
+  rust_input_key
+  exit 0
+fi
 MODE="$(decide_mode)"
 if [[ "${1:-}" == "--mode" ]]; then
   echo "$MODE"
   exit 0
 fi
-(( $# == 0 )) || die "usage: $0 [--mode]"
+(( $# == 0 )) || die "usage: $0 [--mode | --input-key]"
 
 mkdir -p "$STATE_DIR"
 # The artifact image's tag is shared by every checkout on the host; see the
@@ -471,10 +588,19 @@ case "$MODE" in
   prebuilt)
     [[ -n "${SPACE_KIND_PREBUILT_RUST_IMAGE_ID:-}" && -n "${SPACE_KIND_PREBUILT_RUST_SHA:-}" ]] \
       || die "prebuilt mode requires an image ID and source SHA from the CI artifact handoff"
-    [[ "$(git rev-parse HEAD)" == "$SPACE_KIND_PREBUILT_RUST_SHA" ]] \
-      || die "prebuilt Rust source SHA does not match this checkout"
     [[ "$(docker image inspect -f '{{.Id}}' "$ARTIFACT_IMAGE")" == "$SPACE_KIND_PREBUILT_RUST_IMAGE_ID" ]] \
       || die "prebuilt Rust image is missing or does not match the verified image ID"
+    # An image main CI built from another commit is this checkout's build when
+    # the image, the handoff and this checkout all name the same input key.
+    if [[ "$(git rev-parse HEAD)" != "$SPACE_KIND_PREBUILT_RUST_SHA" ]]; then
+      [[ -n "${SPACE_KIND_PREBUILT_RUST_KEY:-}" ]] \
+        || die "prebuilt Rust source SHA does not match this checkout, and the handoff names no input key"
+      [[ "$(docker image inspect -f "{{index .Config.Labels \"$INPUT_KEY_LABEL\"}}" "$ARTIFACT_IMAGE")" == "$SPACE_KIND_PREBUILT_RUST_KEY" ]] \
+        || die "prebuilt Rust image does not carry the input key its handoff names"
+      [[ "$(rust_input_key)" == "$SPACE_KIND_PREBUILT_RUST_KEY" ]] \
+        || die "prebuilt Rust source SHA does not match this checkout, and neither does its input key"
+      log "prebuilt image built from ${SPACE_KIND_PREBUILT_RUST_SHA:0:12}: its Rust input key matches this checkout's"
+    fi
     ;;
   docker) build_docker ;;
   incremental) build_incremental ;;

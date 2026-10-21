@@ -259,41 +259,110 @@ fn source_not_found_is_a_terminal_copy_error() {
     assert_eq!(error.code(), tonic::Code::NotFound);
 }
 
-#[tokio::test]
+fn copy_slots() -> pplx_space_common_grpc::QueuedSlots {
+    pplx_space_common_grpc::QueuedSlots::new(Arc::new(tokio::sync::Semaphore::new(1)))
+        .with_queue(4, Duration::from_secs(5))
+}
+
+#[tokio::test(start_paused = true)]
 async fn copy_admission_allows_only_one_in_flight_copy() {
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let slots = copy_slots();
     let waiting = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let first = acquire_copy_permit(
-        Arc::clone(&semaphore),
-        Arc::clone(&waiting),
-        Arc::clone(&active),
+    let first = acquire_copy_permit(&slots, Arc::clone(&waiting), Arc::clone(&active))
+        .await
+        .unwrap();
+
+    tokio::time::timeout(
+        std::time::Duration::from_millis(10),
+        acquire_copy_permit(&slots, Arc::clone(&waiting), Arc::clone(&active)),
     )
     .await
-    .unwrap();
-
-    assert!(
-        tokio::time::timeout(
-            std::time::Duration::from_millis(10),
-            acquire_copy_permit(
-                Arc::clone(&semaphore),
-                Arc::clone(&waiting),
-                Arc::clone(&active),
-            )
-        )
-        .await
-        .is_err(),
-        "a second copy must wait for the active copy"
-    );
+    .map(|_| ())
+    .expect_err("a second copy must wait for the active copy");
 
     drop(first);
     let _second = tokio::time::timeout(
         std::time::Duration::from_secs(1),
-        acquire_copy_permit(semaphore, waiting, active),
+        acquire_copy_permit(&slots, waiting, active),
     )
     .await
     .expect("the queued copy should proceed after release")
     .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn copy_admission_bounds_its_queue_wait() {
+    let slots = copy_slots();
+    let waiting = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let _held = acquire_copy_permit(&slots, Arc::clone(&waiting), Arc::clone(&active))
+        .await
+        .unwrap();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(6),
+        acquire_copy_permit(&slots, waiting, active),
+    )
+    .await
+    .expect("copy admission must return backpressure before the caller's deadline");
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("a busy worker must not admit a second copy"),
+    };
+    assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    assert!(pplx_space_common_grpc::retry_after(&error).is_some());
+    assert!(pplx_space_common_grpc::is_refused_before_start(&error));
+}
+
+#[tokio::test(start_paused = true)]
+async fn copy_admission_rejects_overflow_and_reuses_cancelled_queue_places() {
+    let slots = copy_slots();
+    let waiting = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let held = acquire_copy_permit(&slots, Arc::clone(&waiting), Arc::clone(&active))
+        .await
+        .unwrap();
+    let mut queued: Vec<_> = (0..4)
+        .map(|_| {
+            Box::pin(acquire_copy_permit(
+                &slots,
+                Arc::clone(&waiting),
+                Arc::clone(&active),
+            ))
+        })
+        .collect();
+    for request in &mut queued {
+        assert!(futures_util::poll!(request.as_mut()).is_pending());
+    }
+    let overflow = tokio::time::timeout(
+        Duration::from_millis(1),
+        acquire_copy_permit(&slots, Arc::clone(&waiting), Arc::clone(&active)),
+    )
+    .await
+    .expect("a full copy queue must reject without waiting");
+    let error = match overflow {
+        Err(error) => error,
+        Ok(_) => panic!("a full copy queue admitted excess work"),
+    };
+    assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    assert!(pplx_space_common_grpc::retry_after(&error).is_some());
+    assert!(pplx_space_common_grpc::is_refused_before_start(&error));
+
+    drop(queued.pop());
+    let mut replacement = Box::pin(acquire_copy_permit(
+        &slots,
+        Arc::clone(&waiting),
+        Arc::clone(&active),
+    ));
+    assert!(futures_util::poll!(replacement.as_mut()).is_pending());
+    drop(queued);
+    drop(held);
+    tokio::time::timeout(Duration::from_millis(1), replacement)
+        .await
+        .expect("a cancelled queue must not strand capacity")
+        .unwrap();
+    acquire_copy_permit(&slots, waiting, active).await.unwrap();
 }
 
 #[test]

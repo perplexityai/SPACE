@@ -209,7 +209,7 @@ pub(super) async fn copy_objects(
 ) -> Result<Response<crate::proto::CreateSnapshotResponse>, Status> {
     let operation_id = request.operation_id;
     let _copy_permit = acquire_copy_permit(
-        Arc::clone(&service.fork_copy_sem),
+        &service.fork_copy_slots,
         Arc::clone(&service.fork_copy_waiting),
         Arc::clone(&service.fork_copy_active),
     )
@@ -476,21 +476,29 @@ async fn copy_remote_disk(
 }
 
 async fn acquire_copy_permit(
-    semaphore: Arc<tokio::sync::Semaphore>,
+    slots: &pplx_space_common_grpc::QueuedSlots,
     waiting_count: Arc<std::sync::atomic::AtomicUsize>,
     active_count: Arc<std::sync::atomic::AtomicUsize>,
 ) -> Result<CopyAdmissionPermit, Status> {
     let started_at = Instant::now();
-    let waiting = waiting_count.fetch_add(1, Ordering::AcqRel) + 1;
-    pplx_space_metrics::snapshot::fork_copy_queue_depth("waiting", waiting);
-    let waiter = CopyAdmissionWaiter {
-        waiting: waiting_count,
+    let busy = || {
+        pplx_space_common_grpc::refused_before_start(
+            Status::resource_exhausted("fork copy admission is busy; retry the same operation"),
+            Duration::from_secs(1),
+        )
     };
-    let permit = semaphore
-        .acquire_owned()
-        .await
-        .map_err(|_| Status::unavailable("fork copy admission is shutting down"))?;
-    drop(waiter);
+    let permit = match slots.request(1) {
+        pplx_space_common_grpc::SlotRequest::Admitted(permit) => permit,
+        pplx_space_common_grpc::SlotRequest::Queued(queued) => {
+            let waiting = waiting_count.fetch_add(1, Ordering::AcqRel) + 1;
+            pplx_space_metrics::snapshot::fork_copy_queue_depth("waiting", waiting);
+            let _waiter = CopyAdmissionWaiter {
+                waiting: waiting_count,
+            };
+            queued.admitted().await.ok_or_else(busy)?
+        }
+        pplx_space_common_grpc::SlotRequest::Rejected => return Err(busy()),
+    };
     pplx_space_metrics::snapshot::fork_copy_queue_wait(started_at);
     let active = active_count.fetch_add(1, Ordering::AcqRel) + 1;
     pplx_space_metrics::snapshot::fork_copy_queue_depth("active", active);

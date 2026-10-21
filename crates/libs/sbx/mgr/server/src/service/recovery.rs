@@ -341,7 +341,7 @@ impl SandboxManagerService {
         // Recover snapshot scheduling for started sandboxes with snapshots_enabled
         let started = {
             let db = self.startup_recovery_db()?;
-            crate::db::list_sandboxes_for_recovery(&db)?
+            crate::db::scan::all_sandboxes(&db, crate::db::scan::SkipUndecodableRows)?
         };
         for row in started
             .into_iter()
@@ -375,7 +375,7 @@ impl SandboxManagerService {
         // and the prelaunch classification that consumes its answers.
         let rows = {
             let db = self.startup_recovery_db()?;
-            crate::db::list_sandboxes_for_recovery(&db)?
+            crate::db::scan::all_sandboxes(&db, crate::db::scan::SkipUndecodableRows)?
         };
         let verdicts = self
             .suspending_retained_source_verdicts(Path::new(CACHE_DIR), &rows)
@@ -408,7 +408,7 @@ impl SandboxManagerService {
     ) -> Result<Vec<crate::db::StartupRecoveryRecord>, StartupRecoveryError> {
         let rows = {
             let db = self.startup_recovery_db()?;
-            crate::db::list_sandboxes_for_recovery(&db)?
+            crate::db::scan::all_sandboxes(&db, crate::db::scan::SkipUndecodableRows)?
         };
         let failed = AtomicBool::new(false);
         stream::iter(
@@ -454,7 +454,7 @@ impl SandboxManagerService {
                 Output = crate::runtime_reconciliation::FirecrackerVmStateObservation,
             >,
     {
-        if !crate::db::sandbox_has_runtime_fields(&row) {
+        if !row.has_runtime_fields() {
             return self
                 .quarantine_interrupted_pause(row, "sandbox row has no retained runtime identity")
                 .await;
@@ -666,7 +666,7 @@ impl SandboxManagerService {
     ) -> Result<Vec<crate::db::StartupRecoveryRecord>, StartupRecoveryError> {
         let rows = {
             let db = self.startup_recovery_db()?;
-            crate::db::list_sandboxes_for_recovery(&db)?
+            crate::db::scan::all_sandboxes(&db, crate::db::scan::SkipUndecodableRows)?
         };
         self.recover_prelaunch_rows(cache_dir, verdicts, rows)
     }
@@ -683,7 +683,7 @@ impl SandboxManagerService {
                 SandboxState::Creating => {
                     records.push(self.recover_interrupted_create(cache_dir, row)?);
                 }
-                SandboxState::Starting if !crate::db::sandbox_has_runtime_fields(&row) => {
+                SandboxState::Starting if !row.has_runtime_fields() => {
                     records.push(self.recover_unlaunched_start(cache_dir, row)?);
                 }
                 SandboxState::Suspending => {
@@ -800,13 +800,15 @@ impl SandboxManagerService {
         };
         let owned = self.startup_recovery_db().and_then(|db| {
             if !crate::db::startup_resident_witness_current(&db, row)?
-                || crate::db::teardown_suspend_status(&db, &row.id)?
+                || crate::db::read::sandbox_view(&db, &row.id)
+                    .teardown()
+                    .status()?
                     .and_then(|status| status.operation)
                     .is_some_and(|operation| operation.status.is_active())
             {
                 return Ok(None);
             }
-            Ok(crate::db::get_sandbox(&db, &row.id)?.filter(unowned_publication))
+            Ok(crate::db::read::sandbox(&db, &row.id)?.filter(unowned_publication))
         });
         let row = match owned {
             Ok(Some(row)) => row,
@@ -868,7 +870,9 @@ impl SandboxManagerService {
                 {
                     let db = self.startup_recovery_db()?;
                     if !crate::db::startup_resident_witness_current(&db, &row)?
-                        || crate::db::teardown_suspend_status(&db, &row.id)?
+                        || crate::db::read::sandbox_view(&db, &row.id)
+                            .teardown()
+                            .status()?
                             .and_then(|status| status.operation)
                             .is_some_and(|operation| operation.status.is_active())
                     {
@@ -899,7 +903,9 @@ impl SandboxManagerService {
     ) -> Result<crate::db::StartupRecoveryRecord, StartupRecoveryError> {
         let teardown_status = {
             let db = self.startup_recovery_db()?;
-            crate::db::teardown_suspend_status(&db, &row.id)?
+            crate::db::read::sandbox_view(&db, &row.id)
+                .teardown()
+                .status()?
         };
         let teardown_generation = teardown_status
             .as_ref()
@@ -1217,7 +1223,10 @@ impl SandboxManagerService {
     ) -> Result<crate::db::StartupRecoveryRecord, StartupRecoveryError> {
         {
             let db = self.startup_recovery_db()?;
-            if crate::db::has_cleanup_episode(&db, &row.id)? {
+            if crate::db::read::sandbox_view(&db, &row.id)
+                .cleanup_episode()
+                .present()?
+            {
                 // Startup cleanup owns interrupted creates, including partial
                 // unpublished clones. Promoting the row would retire its
                 // armed deletion episode before resources are cleaned.
@@ -1259,7 +1268,9 @@ impl SandboxManagerService {
     ) -> Result<crate::db::StartupRecoveryRecord, StartupRecoveryError> {
         let has_episode = {
             let db = self.startup_recovery_db()?;
-            crate::db::has_cleanup_episode(&db, &row.id)?
+            crate::db::read::sandbox_view(&db, &row.id)
+                .cleanup_episode()
+                .present()?
         };
         if has_episode {
             // Even before runtime allocation, the episode owns rollback and
@@ -1451,8 +1462,7 @@ impl SandboxManagerService {
         let mut cursor = std::mem::take(scan_cursor);
         let scan = self
             .storage(move |db| {
-                let batch = cursor
-                    .next_batch(db)
+                let batch = crate::db::scan::quarantine_recovery(db, &mut cursor)
                     .map_err(|error| Status::internal(format!("quarantine discovery: {error}")))?;
                 Ok((cursor, batch))
             })
@@ -2092,7 +2102,7 @@ impl SandboxManagerService {
             let db = db
                 .lock()
                 .map_err(|_| StartupRecoveryError::DatabaseMutexPoisoned)?;
-            crate::db::list_sandboxes_for_recovery(&db)?
+            crate::db::scan::all_sandboxes(&db, crate::db::scan::SkipUndecodableRows)?
         };
 
         Self::recover_required_cleanup_targets_from_rows(db, rows, authority)
@@ -2110,7 +2120,7 @@ impl SandboxManagerService {
                 .into_iter()
                 .filter_map(|sandbox_id| {
                     let sandbox_id = sandbox_id.to_string();
-                    match crate::db::get_sandbox(&db, &sandbox_id) {
+                    match crate::db::read::sandbox(&db, &sandbox_id) {
                         Ok(row) => row,
                         Err(error) => {
                             tracing::warn!(
@@ -2194,7 +2204,10 @@ impl SandboxManagerService {
                 let db = db
                     .lock()
                     .map_err(|_| StartupRecoveryError::DatabaseMutexPoisoned)?;
-                match crate::db::cleanup_episode(&db, &row.id) {
+                match crate::db::read::sandbox_view(&db, &row.id)
+                    .cleanup_episode()
+                    .strict()
+                {
                     Ok(episode) => episode,
                     Err(error) => {
                         tracing::warn!(
@@ -2298,9 +2311,7 @@ impl SandboxManagerService {
                 continue;
             }
             let cleanup_intent = match authority {
-                CleanupRecoveryAuthority::Startup => {
-                    crate::db::cleanup_intent_for_startup_recovery(&row)
-                }
+                CleanupRecoveryAuthority::Startup => row.cleanup_intent_for_startup_recovery(),
                 CleanupRecoveryAuthority::RequestedOnly => {
                     // State alone is authoritative for teardown states entered
                     // under the cleanup fence and the settled legacy cleanup
@@ -2324,7 +2335,7 @@ impl SandboxManagerService {
                         }
                         (None, None)
                             if matches!(row.state, SandboxState::CleanupFailed)
-                                && crate::db::sandbox_has_runtime_fields(&row) =>
+                                && row.has_runtime_fields() =>
                         {
                             Some((true, CleanupCompletion::Quarantine))
                         }
@@ -2451,7 +2462,7 @@ impl SandboxManagerService {
             }
             let mut cursor = std::mem::take(&mut recovery_cursor);
             let candidates = match service.storage(move |db| {
-                let rows = crate::db::periodic_lifecycle_recovery_batch(db, &mut cursor)
+                let rows = crate::db::scan::sandbox_pages(db, &mut cursor)
                     .map_err(|error| Status::internal(format!("lifecycle discovery: {error}")))?;
                 Ok((cursor, rows))
             }).await {

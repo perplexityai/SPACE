@@ -58,6 +58,21 @@ Scenario phase timings report runtime without a flaky latency assertion.
 The fork shard-duration hints use local seed measurements; refresh them from
 successful CI runs. Scheduling estimates are not measured CI runtimes.
 
+## Opt-in fork pressure
+
+`local.fork_saturation_safety` is an explicit, opt-in Kind pressure check. It
+runs fork waves of 1, 2, 4, and 8 against a durable suspended source, deletes
+each wave before continuing, and checks an existing sandbox's commands and
+files throughout. It requires at least one child to share the health sentinel's
+worker, verifies source/sibling disk isolation, and reports phase and probe
+timings. It changes no worker limits, faults, or scheduling configuration.
+Use a dedicated bench with headroom for eight children and the sentinel,
+including control-plane and object-store disk space, not only worker resources.
+This is bounded functional evidence, not proof of maximum capacity or a latency SLO.
+Fork calls retain the normal response wait rather than a short client-side
+timeout: the server owns the operation deadline, and cleanup replays the same
+idempotency key if a response is lost.
+
 ## Temporarily omitted lifecycle cases
 
 Auto-kill (both the omitted/default lifecycle and explicit

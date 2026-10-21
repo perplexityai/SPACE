@@ -332,7 +332,7 @@ impl SandboxManagerService {
             .db
             .lock()
             .map_err(|_| Status::internal("lifecycle database mutex poisoned"))?;
-        crate::db::get_sandbox(&db, id)
+        crate::db::read::sandbox(&db, id)
             .map_err(|error| Status::internal(format!("read auto lifecycle sandbox: {error}")))?
             .ok_or_else(|| {
                 Status::not_found("sandbox disappeared before auto lifecycle transition")
@@ -655,7 +655,7 @@ impl SandboxManagerService {
             let service = self.clone();
             let scan = tokio::task::spawn_blocking(move || {
                 let db = service.db_conn()?;
-                let selected = crate::db::due_auto_lifecycle_batch(
+                let selected = crate::db::scan::due_auto_lifecycle(
                     &db,
                     now_secs(),
                     &active,
@@ -727,8 +727,7 @@ impl SandboxManagerService {
         let mut scan = std::mem::take(cursor);
         let (scan, count) = self
             .blocking_io(move |service| {
-                let rows = scan
-                    .next_batch(&*service.db_conn()?)
+                let rows = crate::db::scan::sandbox_pages(&*service.db_conn()?, &mut scan)
                     .map_err(|error| Status::internal(format!("policy inventory: {error}")))?;
                 let mut count = 0;
                 for sandbox in rows {
@@ -1058,7 +1057,7 @@ impl SandboxManagerService {
         if requested == BootMode::Pool {
             let has_pool = {
                 let db = self.db_conn()?;
-                crate::db::find_pool_sandbox(&db, template, None, None)
+                crate::db::scan::pool_donor(&db, template, None, None)
                     .map_err(|error| Status::internal(format!("resolve pool creation: {error}")))?
                     .is_some()
             };

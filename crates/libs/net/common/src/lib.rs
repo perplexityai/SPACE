@@ -316,9 +316,15 @@ pub enum NetworkPolicyVersion {
     V1,
 }
 
-/// Top-level fields are additive: readers ignore unknown fields, so a new field
-/// must be safe for an older reader to drop. Fields that restrict traffic belong
-/// in a strict nested type such as [`EgressPolicyV1`].
+/// Top-level fields are additive: Rust readers ignore unknown fields, so a new
+/// field must be safe for an older Rust reader to drop. Fields that restrict
+/// traffic belong in a strict nested type such as [`EgressPolicyV1`].
+///
+/// The containerd shim decodes the pod's policy annotation strictly at every
+/// level. A new field, top-level or nested, must be omitted when unused
+/// (`skip_serializing_if`); every node's shim must accept it before any API sets
+/// it; and the shim must keep accepting it while pods annotated with it exist.
+/// `shim/testdata/network-policy-v1.json` pins this serialization for both sides.
 #[cfg_attr(feature = "serde", derive(Serialize))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NetworkPolicyV1 {

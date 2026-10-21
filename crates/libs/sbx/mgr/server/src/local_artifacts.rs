@@ -207,7 +207,10 @@ impl LocalArtifacts {
         local_artifact_id: LocalArtifactId,
     ) -> crate::db::Result<Option<LocalArtifactRow>> {
         let conn = self.db_conn()?;
-        crate::db::get_local_artifact(&conn, local_artifact_id)
+        crate::db::read::local_artifact(
+            &conn,
+            crate::db::read::LocalArtifactKey::Id(local_artifact_id),
+        )
     }
 
     /// Read-only fetch by `(sandbox_id, snapshot_name)` for the
@@ -218,7 +221,13 @@ impl LocalArtifacts {
         snapshot_name: &SnapshotName,
     ) -> crate::db::Result<Option<LocalArtifactRow>> {
         let conn = self.db_conn()?;
-        crate::db::get_named_local_artifact(&conn, sandbox_id, snapshot_name)
+        crate::db::read::local_artifact(
+            &conn,
+            crate::db::read::LocalArtifactKey::Named {
+                sandbox_id,
+                snapshot_name,
+            },
+        )
     }
 
     /// Every sandbox whose **current lifecycle artifact** this node cannot
@@ -330,7 +339,7 @@ impl LocalArtifacts {
     /// with no report, which every consumer already has to handle.
     pub fn list_pending_backups(&self) -> crate::db::Result<Vec<PendingBackup>> {
         let conn = self.db_conn()?;
-        leases::list_pending_backups(&conn)
+        crate::db::scan::pending_backups(&conn)
     }
 
     /// Inventory-only observation. Callers must still acquire a checkout before
@@ -340,7 +349,9 @@ impl LocalArtifacts {
         sandbox_id: &str,
     ) -> Result<Vec<NamedArtifactPublication>, crate::db::inventory_read::InventoryReadError> {
         let conn = self.db_conn()?;
-        leases::list_named_publications(&conn, sandbox_id)
+        crate::db::read::sandbox_view(&conn, sandbox_id)
+            .artifacts()
+            .named()
     }
 
     /// Mark the artifact's remote backup as durably completed. This
@@ -603,7 +614,13 @@ impl LocalArtifacts {
     ) -> Result<DeleteLease, CheckoutError> {
         let id = {
             let conn = self.db_conn()?;
-            let row = crate::db::get_named_local_artifact(&conn, sandbox_id, snapshot_name)?;
+            let row = crate::db::read::local_artifact(
+                &conn,
+                crate::db::read::LocalArtifactKey::Named {
+                    sandbox_id,
+                    snapshot_name,
+                },
+            )?;
             match row {
                 Some(r) => r.local_artifact_id,
                 None => {
@@ -775,7 +792,7 @@ impl LocalArtifacts {
     /// Retain rows in every state, including historical deletion conflicts.
     pub(crate) fn gc_staging_is_unowned(&self, id: LocalArtifactId) -> crate::db::Result<bool> {
         let conn = self.db_conn()?;
-        leases::gc_staging_is_unowned(&conn, &id.to_string())
+        crate::db::read::local_artifact_unowned(&conn, id)
     }
 
     /// Examine at most `max_records` raw rows, advancing past owned, present,

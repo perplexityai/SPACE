@@ -1,3 +1,4 @@
+use crate::db::db_private_outside_tests;
 use std::str::FromStr;
 
 use crate::db::{Connection, Error, OptionalExtension};
@@ -595,53 +596,55 @@ pub fn record_retained_route_evidence(
     Ok(updated)
 }
 
-pub fn route_identity_adoption_metadata(
-    conn: &Connection,
-    sandbox_id: SandboxId,
-) -> crate::db::Result<RouteIdentityAdoptionMetadata> {
-    conn.query_row(
-        "SELECT space_api_route_identity_provenance,
+db_private_outside_tests! {
+    fn route_identity_adoption_metadata(
+        conn: &Connection,
+        sandbox_id: SandboxId,
+    ) -> crate::db::Result<RouteIdentityAdoptionMetadata> {
+        conn.query_row(
+            "SELECT space_api_route_identity_provenance,
                 last_observed_execution_generation,
                 last_observed_route_activation_id,
                 last_observed_route_substrate_kind,
                 last_observed_route_identity_provenance
            FROM sandboxes
           WHERE id = ?1",
-        [sandbox_id.to_string()],
-        |row| {
-            let current_provenance = row
-                .get::<_, Option<String>>(0)?
-                .map(|value| parse_text::<RouteIdentityProvenance>(&value, 0))
-                .transpose()?;
-            let generation = row.get::<_, Option<i64>>(1)?;
-            let attempt = row.get::<_, Option<String>>(2)?;
-            let substrate = row.get::<_, Option<String>>(3)?;
-            let provenance = row.get::<_, Option<String>>(4)?;
-            let retained_evidence = match (generation, attempt, substrate, provenance) {
-                (Some(generation), Some(attempt), Some(substrate), Some(provenance)) => {
-                    Some(RouteEvidence {
-                        execution_generation: ExecutionGeneration::new(generation).map_err(
-                            |error| {
-                                rusqlite::Error::FromSqlConversionFailure(
-                                    1,
-                                    Type::Integer,
-                                    Box::new(error),
-                                )
-                            },
-                        )?,
-                        activation_attempt_id: parse_text(&attempt, 2)?,
-                        substrate: parse_text(&substrate, 3)?,
-                        provenance: parse_text(&provenance, 4)?,
-                    })
-                }
-                _ => None,
-            };
-            Ok(RouteIdentityAdoptionMetadata {
-                current_provenance,
-                retained_evidence,
-            })
-        },
-    )
+            [sandbox_id.to_string()],
+            |row| {
+                let current_provenance = row
+                    .get::<_, Option<String>>(0)?
+                    .map(|value| parse_text::<RouteIdentityProvenance>(&value, 0))
+                    .transpose()?;
+                let generation = row.get::<_, Option<i64>>(1)?;
+                let attempt = row.get::<_, Option<String>>(2)?;
+                let substrate = row.get::<_, Option<String>>(3)?;
+                let provenance = row.get::<_, Option<String>>(4)?;
+                let retained_evidence = match (generation, attempt, substrate, provenance) {
+                    (Some(generation), Some(attempt), Some(substrate), Some(provenance)) => {
+                        Some(RouteEvidence {
+                            execution_generation: ExecutionGeneration::new(generation).map_err(
+                                |error| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        1,
+                                        Type::Integer,
+                                        Box::new(error),
+                                    )
+                                },
+                            )?,
+                            activation_attempt_id: parse_text(&attempt, 2)?,
+                            substrate: parse_text(&substrate, 3)?,
+                            provenance: parse_text(&provenance, 4)?,
+                        })
+                    }
+                    _ => None,
+                };
+                Ok(RouteIdentityAdoptionMetadata {
+                    current_provenance,
+                    retained_evidence,
+                })
+            },
+        )
+    }
 }
 
 fn clear_route_evidence_block(conn: &Connection, sandbox_id: SandboxId) -> crate::db::Result<()> {
@@ -711,19 +714,20 @@ pub(crate) fn discard_pending_receipt_for_execution_advance(
     )
 }
 
-/// Returns whether any pending delete receipt still describes every observed
-/// execution incarnation for this row.
-///
-/// This protects recovery of receipts admitted by an older mixed-version
-/// writer: local cleanup must not dispatch after either the current route or
-/// its retained high-water mark has advanced to a different generation or
-/// same-generation activation attempt.
-pub fn pending_receipt_matches_observed_execution(
-    conn: &Connection,
-    sandbox_id: SandboxId,
-) -> crate::db::Result<bool> {
-    conn.query_row(
-        "SELECT NOT EXISTS (
+db_private_outside_tests! {
+    /// Returns whether any pending delete receipt still describes every observed
+    /// execution incarnation for this row.
+    ///
+    /// This protects recovery of receipts admitted by an older mixed-version
+    /// writer: local cleanup must not dispatch after either the current route or
+    /// its retained high-water mark has advanced to a different generation or
+    /// same-generation activation attempt.
+    fn pending_receipt_matches_observed_execution(
+        conn: &Connection,
+        sandbox_id: SandboxId,
+    ) -> crate::db::Result<bool> {
+        conn.query_row(
+            "SELECT NOT EXISTS (
              SELECT 1
                FROM auto_lifecycle_delete_outbox AS receipt
                JOIN sandboxes AS sandbox ON sandbox.id = receipt.sandbox_id
@@ -756,9 +760,10 @@ pub fn pending_receipt_matches_observed_execution(
                     )
                 )
          )",
-        [sandbox_id.to_string()],
-        |row| row.get(0),
-    )
+            [sandbox_id.to_string()],
+            |row| row.get(0),
+        )
+    }
 }
 
 fn record_block(
@@ -1091,87 +1096,93 @@ pub fn acknowledge_completed_receipts(
     Ok(acknowledged)
 }
 
-pub fn outbox_stats(conn: &Connection) -> crate::db::Result<AutoLifecycleDeleteOutboxStats> {
-    let now = crate::db::now_epoch_i64()?;
-    let (pending, completed, attempts, oldest_pending, oldest_completed) = conn.query_row(
-        "SELECT
+db_private_outside_tests! {
+    fn outbox_stats(conn: &Connection) -> crate::db::Result<AutoLifecycleDeleteOutboxStats> {
+        let now = crate::db::now_epoch_i64()?;
+        let (pending, completed, attempts, oldest_pending, oldest_completed) = conn.query_row(
+            "SELECT
              COALESCE(SUM(state = 'pending'), 0),
              COALESCE(SUM(state = 'completed'), 0),
              COALESCE(MAX(CASE WHEN state = 'completed' THEN attempt_count END), 0),
              MIN(CASE WHEN state = 'pending' THEN CAST(created_at AS INTEGER) END),
              MIN(CASE WHEN state = 'completed' THEN CAST(completed_at AS INTEGER) END)
            FROM auto_lifecycle_delete_outbox",
-        [],
-        |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-                row.get::<_, Option<i64>>(4)?,
-            ))
-        },
-    )?;
-    let value = |value: i64, column| {
-        u64::try_from(value).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(column, Type::Integer, Box::new(error))
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                ))
+            },
+        )?;
+        let value = |value: i64, column| {
+            u64::try_from(value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(column, Type::Integer, Box::new(error))
+            })
+        };
+        let age = |timestamp: Option<i64>, column| {
+            timestamp
+                .map(|timestamp| value(now.saturating_sub(timestamp), column))
+                .transpose()
+                .map(Option::unwrap_or_default)
+        };
+        Ok(AutoLifecycleDeleteOutboxStats {
+            pending_count: value(pending, 0)?,
+            completed_count: value(completed, 1)?,
+            max_attempt_count: value(attempts, 2)?,
+            oldest_pending_age_secs: age(oldest_pending, 3)?,
+            oldest_completed_age_secs: age(oldest_completed, 4)?,
         })
-    };
-    let age = |timestamp: Option<i64>, column| {
-        timestamp
-            .map(|timestamp| value(now.saturating_sub(timestamp), column))
-            .transpose()
-            .map(Option::unwrap_or_default)
-    };
-    Ok(AutoLifecycleDeleteOutboxStats {
-        pending_count: value(pending, 0)?,
-        completed_count: value(completed, 1)?,
-        max_attempt_count: value(attempts, 2)?,
-        oldest_pending_age_secs: age(oldest_pending, 3)?,
-        oldest_completed_age_secs: age(oldest_completed, 4)?,
-    })
+    }
 }
 
-pub fn blocked_stats(conn: &Connection) -> crate::db::Result<Vec<AutoLifecycleDeleteBlockedStats>> {
-    let now = crate::db::now_epoch_i64()?;
-    let mut statement = conn.prepare(
-        "SELECT auto_lifecycle_delete_block_reason,
+db_private_outside_tests! {
+    fn blocked_stats(conn: &Connection) -> crate::db::Result<Vec<AutoLifecycleDeleteBlockedStats>> {
+        let now = crate::db::now_epoch_i64()?;
+        let mut statement = conn.prepare(
+            "SELECT auto_lifecycle_delete_block_reason,
                 COUNT(*),
                 MIN(CAST(auto_lifecycle_delete_blocked_at AS INTEGER))
            FROM sandboxes
           WHERE auto_lifecycle_delete_block_reason IS NOT NULL
           GROUP BY auto_lifecycle_delete_block_reason",
-    )?;
-    statement
-        .query_map([], |row| {
-            let reason =
-                parse_text::<AutoLifecycleDeleteBlockReason>(&row.get::<_, String>(0)?, 0)?;
-            let count = u64::try_from(row.get::<_, i64>(1)?).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(1, Type::Integer, Box::new(error))
-            })?;
-            let oldest = row.get::<_, Option<i64>>(2)?.unwrap_or(now);
-            let oldest_age_secs = u64::try_from(now.saturating_sub(oldest)).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(2, Type::Integer, Box::new(error))
-            })?;
-            Ok(AutoLifecycleDeleteBlockedStats {
-                reason,
-                count,
-                oldest_age_secs,
-            })
-        })?
-        .collect::<rusqlite::Result<_>>()
-        .map_err(crate::db::Error::from)
+        )?;
+        statement
+            .query_map([], |row| {
+                let reason =
+                    parse_text::<AutoLifecycleDeleteBlockReason>(&row.get::<_, String>(0)?, 0)?;
+                let count = u64::try_from(row.get::<_, i64>(1)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(1, Type::Integer, Box::new(error))
+                })?;
+                let oldest = row.get::<_, Option<i64>>(2)?.unwrap_or(now);
+                let oldest_age_secs = u64::try_from(now.saturating_sub(oldest)).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(2, Type::Integer, Box::new(error))
+                })?;
+                Ok(AutoLifecycleDeleteBlockedStats {
+                    reason,
+                    count,
+                    oldest_age_secs,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(crate::db::Error::from)
+    }
 }
 
-pub fn pending_receipt_for_sandbox(
-    conn: &Connection,
-    sandbox_id: SandboxId,
-) -> crate::db::Result<Option<AutoLifecycleDeleteReceipt>> {
-    Ok(
-        receipt_record_for_sandbox(conn, sandbox_id)?.and_then(|(receipt, state)| {
-            (state == AutoLifecycleDeleteOutboxState::Pending).then_some(receipt)
-        }),
-    )
+db_private_outside_tests! {
+    fn pending_receipt_for_sandbox(
+        conn: &Connection,
+        sandbox_id: SandboxId,
+    ) -> crate::db::Result<Option<AutoLifecycleDeleteReceipt>> {
+        Ok(
+            receipt_record_for_sandbox(conn, sandbox_id)?.and_then(|(receipt, state)| {
+                (state == AutoLifecycleDeleteOutboxState::Pending).then_some(receipt)
+            }),
+        )
+    }
 }
 
 fn receipt_record_for_sandbox(

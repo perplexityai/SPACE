@@ -379,22 +379,24 @@ pub struct NodeDirtyRefRow {
     pub revision: i64,
 }
 
-pub fn list_node_dirty_refs(conn: &Connection, limit: usize) -> Result<Vec<NodeDirtyRefRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT facet, element_kind, element_value, revision
+db_private_outside_tests! {
+    fn list_node_dirty_refs(conn: &Connection, limit: usize) -> Result<Vec<NodeDirtyRefRow>> {
+        let mut stmt = conn.prepare(
+            "SELECT facet, element_kind, element_value, revision
          FROM node_dirty_refs
          ORDER BY requested_at ASC
          LIMIT ?1",
-    )?;
-    let rows = stmt.query_map(params![limit.min(i64::MAX as usize) as i64], |row| {
-        Ok(NodeDirtyRefRow {
-            facet: row.get(0)?,
-            element_kind: row.get(1)?,
-            element_value: row.get(2)?,
-            revision: row.get(3)?,
-        })
-    })?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+        )?;
+        let rows = stmt.query_map(params![limit.min(i64::MAX as usize) as i64], |row| {
+            Ok(NodeDirtyRefRow {
+                facet: row.get(0)?,
+                element_kind: row.get(1)?,
+                element_value: row.get(2)?,
+                revision: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
 }
 
 /// Acknowledge only the obligations read before sending. A newer enqueue, even

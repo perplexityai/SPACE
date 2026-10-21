@@ -55,6 +55,8 @@ assert_needed() {
 # `*` also crosses `/`, would answer `true`.
 assert_needed true space_smoke/adapters.py
 assert_needed true crates/libs/build/mgr/src/deep/nested.rs
+assert_needed true crates/apps/cluster/controller/svc/src/main.rs
+assert_needed true crates/libs/cluster/controller/server/src/leader_election/mod.rs
 assert_needed true crates/libs/internal/api/server/src/template_builds.rs
 assert_needed true shim/telemetry_export.go
 assert_needed true docs/unrelated.md crates/libs/template/mgr/src/volume.rs

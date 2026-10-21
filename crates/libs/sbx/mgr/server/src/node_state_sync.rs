@@ -157,7 +157,7 @@ pub(crate) fn start_dirty_outbox_worker(
                 let Ok(db) = connection_or_signal_failure(&db) else {
                     return;
                 };
-                match crate::db::list_node_dirty_refs(&db, batch_limit) {
+                match crate::db::scan::node_dirty_batch(&db, batch_limit) {
                     Ok(rows) => rows,
                     Err(error) => {
                         tracing::warn!(%error, "failed to read node dirty outbox");

@@ -49,46 +49,50 @@ pub(super) fn restore_transfer_scope_from_row(
     })
 }
 
-pub fn restore_transfer_scope(
-    conn: &Connection,
-    sandbox_id: &str,
-) -> Result<Option<RestoreTransferScopeRow>> {
-    conn.query_row(
-        "SELECT transfer_scope_id, execution_generation, activation_attempt_id, staging_dir
+db_private_outside_tests! {
+    fn restore_transfer_scope(
+        conn: &Connection,
+        sandbox_id: &str,
+    ) -> Result<Option<RestoreTransferScopeRow>> {
+        conn.query_row(
+            "SELECT transfer_scope_id, execution_generation, activation_attempt_id, staging_dir
            FROM sandbox_restore_transfer_scopes
           WHERE sandbox_id = ?1",
-        params![sandbox_id],
-        |row| restore_transfer_scope_from_row(row, 0),
-    )
-    .optional()
+            params![sandbox_id],
+            |row| restore_transfer_scope_from_row(row, 0),
+        )
+        .optional()
+    }
 }
 
-pub fn rowless_restore_transfer_scopes(
-    conn: &Connection,
-) -> Result<Vec<(String, RestoreTransferScopeRow)>> {
-    let mut statement = conn.prepare(
-        "SELECT scopes.sandbox_id, scopes.transfer_scope_id,
+db_private_outside_tests! {
+    fn rowless_restore_transfer_scopes(
+        conn: &Connection,
+    ) -> Result<Vec<(String, RestoreTransferScopeRow)>> {
+        let mut statement = conn.prepare(
+            "SELECT scopes.sandbox_id, scopes.transfer_scope_id,
                 scopes.execution_generation, scopes.activation_attempt_id,
                 scopes.staging_dir
            FROM sandbox_restore_transfer_scopes AS scopes
       LEFT JOIN sandboxes ON sandboxes.id = scopes.sandbox_id
           WHERE sandboxes.id IS NULL",
-    )?;
-    let mut rows = statement.query([])?;
-    let mut scopes = Vec::new();
-    while let Some(row) = rows.next()? {
-        let decoded = (|| Ok((row.get(0)?, restore_transfer_scope_from_row(row, 1)?)))();
-        match decoded {
-            Ok(scope) => scopes.push(scope),
-            Err(error) if is_row_decode_error(&error) => tracing::warn!(
-                sandbox_id = ?row.get_ref(0)?,
-                error = %describe_raw_error(&error),
-                "retaining malformed rowless restore scope; operator repair required"
-            ),
-            Err(error) => return Err(error.into()),
+        )?;
+        let mut rows = statement.query([])?;
+        let mut scopes = Vec::new();
+        while let Some(row) = rows.next()? {
+            let decoded = (|| Ok((row.get(0)?, restore_transfer_scope_from_row(row, 1)?)))();
+            match decoded {
+                Ok(scope) => scopes.push(scope),
+                Err(error) if is_row_decode_error(&error) => tracing::warn!(
+                    sandbox_id = ?row.get_ref(0)?,
+                    error = %describe_raw_error(&error),
+                    "retaining malformed rowless restore scope; operator repair required"
+                ),
+                Err(error) => return Err(error.into()),
+            }
         }
+        Ok(scopes)
     }
-    Ok(scopes)
 }
 
 pub fn retire_rowless_restore_transfer_scope(
@@ -308,24 +312,26 @@ pub fn retire_restore_transfer_scope_if_matches(
     Ok(changed == 1)
 }
 
-pub fn canonical_restore_reclaim_attempt_is_current(
-    conn: &Connection,
-    sandbox_id: &str,
-    transfer_scope_id: pplx_space_common_core::types::TransferScopeId,
-    execution_generation: ExecutionGeneration,
-    activation_attempt_id: SandboxActivationAttemptId,
-) -> Result<bool> {
-    let Some(row) = get_sandbox(conn, sandbox_id)? else {
-        return Ok(false);
-    };
-    if !sandbox_is_retryable_interrupted_restore(&row) {
-        return Ok(false);
+db_private_outside_tests! {
+    fn canonical_restore_reclaim_attempt_is_current(
+        conn: &Connection,
+        sandbox_id: &str,
+        transfer_scope_id: pplx_space_common_core::types::TransferScopeId,
+        execution_generation: ExecutionGeneration,
+        activation_attempt_id: SandboxActivationAttemptId,
+    ) -> Result<bool> {
+        let Some(row) = get_sandbox(conn, sandbox_id)? else {
+            return Ok(false);
+        };
+        if !sandbox_is_retryable_interrupted_restore(&row) {
+            return Ok(false);
+        }
+        Ok(
+            restore_transfer_scope(conn, sandbox_id)?.is_some_and(|scope| {
+                scope.transfer_scope_id == transfer_scope_id
+                    && scope.execution_generation == Some(execution_generation)
+                    && scope.activation_attempt_id == Some(activation_attempt_id)
+            }),
+        )
     }
-    Ok(
-        restore_transfer_scope(conn, sandbox_id)?.is_some_and(|scope| {
-            scope.transfer_scope_id == transfer_scope_id
-                && scope.execution_generation == Some(execution_generation)
-                && scope.activation_attempt_id == Some(activation_attempt_id)
-        }),
-    )
 }

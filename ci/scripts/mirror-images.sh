@@ -365,7 +365,12 @@ case "${1:-}" in
         ;;
     verified)
         [ $# -eq 2 ] || { echo "usage: $0 verified <name>" >&2; exit 2; }
-        entry="$(entries | awk -v name="$2" '$1 == name { print; exit }')"
+        # Listed in full before awk stops at the match, as in pull. Piped, an
+        # awk that exits at the match while entries is still writing ends
+        # entries by SIGPIPE, or fails its writes where SIGPIPE is ignored,
+        # and pipefail turns either into a failed verify.
+        listed="$(entries)"
+        entry="$(awk -v name="$2" '$1 == name { print; exit }' <<<"${listed}")"
         [ -n "${entry}" ] || exit 1
         read -r name mirror _ use _ <<<"${entry}"
         registry_login || true

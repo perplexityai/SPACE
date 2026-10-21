@@ -832,7 +832,9 @@ where
     Retirement: Fn(&str) -> Option<RetirementGuard>,
     RetirementGuard: FnOnce(),
 {
-    let rows = db.with_connection(crate::db::list_sandboxes_for_recovery)??;
+    let rows = db.with_connection(|conn| {
+        crate::db::scan::all_sandboxes(conn, crate::db::scan::SkipUndecodableRows)
+    })??;
     reconcile_inventory_batch(
         db,
         paths,
@@ -1123,7 +1125,9 @@ where
         // Periodic DB and directory cursors advance independently: absence from
         // this DB page is not absence from SQLite. Avoid receiver RPCs for rows
         // owned by another page; recheck again in the insertion transaction.
-        if db.with_connection(|conn| crate::db::sandbox_exists(conn, &sandbox_id.to_string()))?? {
+        if db.with_connection(|conn| {
+            crate::db::read::sandbox_view(conn, &sandbox_id.to_string()).exists()
+        })?? {
             continue;
         }
         let observed_presence = SandboxInventoryPresence {
@@ -1231,10 +1235,14 @@ where
                     return Ok(OrphanRowMaterialization::InventoryChanged);
                 }
                 let tx = crate::db::Transaction::immediate(conn)?;
-                if crate::db::get_sandbox(&tx, &sandbox_id_string)?.is_some() {
+                if crate::db::read::sandbox(&tx, &sandbox_id_string)?.is_some() {
                     return Ok(OrphanRowMaterialization::DatabaseRowAppeared);
                 }
-                if crate::db::restore_transfer_scope(&tx, &sandbox_id_string)?.is_some() {
+                if crate::db::read::sandbox_view(&tx, &sandbox_id_string)
+                    .restore_scope()
+                    .scope()?
+                    .is_some()
+                {
                     return Ok(OrphanRowMaterialization::RestoreTransferScope);
                 }
                 let committed = insert_orphaned_sandbox_row_in_transaction(
@@ -1473,7 +1481,7 @@ impl SandboxManagerService {
     ) -> crate::db::Result<()> {
         // The caller keeps SQLite locked through retirement, excluding a
         // same-ID insertion and its new policy obligation.
-        if !crate::db::sandbox_exists(db, sandbox_id)? {
+        if !crate::db::read::sandbox_view(db, sandbox_id).exists()? {
             self.network_policy_reconcile_queue.retire(sandbox_id);
         }
         Ok(())

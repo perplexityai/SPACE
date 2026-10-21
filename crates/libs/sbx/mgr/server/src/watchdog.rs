@@ -28,7 +28,7 @@ use pplx_space_metrics::sandbox::worker::{
 use pplx_space_node_runtime_core::fc_api::FirecrackerVmState;
 
 use crate::auto_lifecycle::AutoLifecycleCoordinator;
-use crate::db::guest_health_scan::{SandboxGuestHealthRow, list_guest_health_rows};
+use crate::db::guest_health_scan::SandboxGuestHealthRow;
 use crate::node_manager_transport::NodeManagerConnector;
 use crate::node_state_sync::mark_sandbox_dirty;
 use crate::service::network_policy::NetworkPolicyReconcileQueue;
@@ -887,7 +887,7 @@ impl SandboxWatchdog {
                     return;
                 }
             };
-            match crate::db::get_sandbox(&conn, sandbox_id) {
+            match crate::db::read::sandbox(&conn, sandbox_id) {
                 Ok(Some(row)) => sidecar_info_from_row(&row),
                 Ok(None) => {
                     tracing::debug!(sandbox_id, "sandbox disappeared before watchdog re-arm");
@@ -1084,7 +1084,7 @@ impl SandboxWatchdog {
                         continue;
                     }
                 };
-                match crate::db::get_sandbox(&conn, &id) {
+                match crate::db::read::sandbox(&conn, &id) {
                     Ok(row) => row,
                     Err(error) => {
                         tracing::warn!(sandbox_id = %id, %error, "failed to load live sandbox during watchdog recovery");
@@ -1557,14 +1557,14 @@ fn emit_auto_lifecycle_delete_gauges(db: &crate::db::SharedConnection) {
                 return;
             }
         };
-        let outbox = match crate::db::auto_lifecycle_delete_receipts::outbox_stats(&db) {
+        let outbox = match crate::db::read::counts(&db, crate::db::read::DeleteOutbox) {
             Ok(stats) => stats,
             Err(error) => {
                 tracing::warn!(%error, "failed to inspect auto-lifecycle delete outbox gauges");
                 return;
             }
         };
-        let blocked = match crate::db::auto_lifecycle_delete_receipts::blocked_stats(&db) {
+        let blocked = match crate::db::read::counts(&db, crate::db::read::DeleteBlocked) {
             Ok(stats) => stats,
             Err(error) => {
                 tracing::warn!(%error, "failed to inspect auto-lifecycle delete block gauges");
@@ -1611,7 +1611,7 @@ fn load_guest_health_rows(db: &crate::db::SharedConnection) -> Option<Vec<Sandbo
             return None;
         }
     };
-    match list_guest_health_rows(&db) {
+    match crate::db::scan::all_sandboxes(&db, crate::db::scan::GuestHealthRows) {
         Ok(rows) => Some(rows),
         Err(error) => {
             tracing::warn!(%error, "failed to list sandboxes for lifecycle gauges");
@@ -1894,7 +1894,7 @@ fn sandbox_states_for_ids(
             return None;
         }
     };
-    let labels = match crate::db::guest_health_scan::state_labels_for_ids(&db, sandbox_ids) {
+    let labels = match crate::db::read::sandbox_views(&db, sandbox_ids).state_labels() {
         Ok(labels) => labels,
         Err(error) => {
             tracing::warn!(%error, "failed to prepare watchdog probe-state lookup");
@@ -3091,7 +3091,7 @@ fn net_gateway_relaunch_args(
     let conn = db
         .lock()
         .map_err(|error| NetGatewayRelaunchArgsError::DatabaseMutexPoisoned(error.to_string()))?;
-    let sandbox = crate::db::get_sandbox(&conn, sandbox_id)
+    let sandbox = crate::db::read::sandbox(&conn, sandbox_id)
         .map_err(|source| NetGatewayRelaunchArgsError::LoadSandbox {
             sandbox_id: sandbox_id.to_string(),
             source,

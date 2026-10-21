@@ -7,13 +7,12 @@ pub mod proto {
 
 use std::path::Path;
 
+use pplx_space_bearer_token::{SPACE_INTERNAL_TOKEN_ENV, SpaceBearerInterceptor, SpaceBearerToken};
 use pplx_space_common_grpc::DEFAULT_TCP_GRPC_CONNECT_RETRY_POLICY;
 use pplx_space_common_grpc::internal_transport::{self, ClientTransport, Service};
 use pplx_space_common_grpc::{
     GrpcClientTrace, trace_grpc_client_transport as wrap_grpc_client_channel,
 };
-use pplx_space_common_svc::auth::{SPACE_INTERNAL_TOKEN_ENV, SpaceBearerInterceptor};
-use pplx_space_common_svc::bearer_token::SpaceBearerToken;
 use tokio::sync::mpsc;
 use tonic::metadata::{Ascii, MetadataValue};
 use tonic::service::interceptor::InterceptedService;

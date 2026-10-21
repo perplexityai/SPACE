@@ -331,7 +331,7 @@ class RateLimiterAssertions:
         Endpoints drain the moment the pod is NotReady, but during its grace
         window the pod still serves and the API's pooled connection keeps
         succeeding, so the limiter would still enforce. The wait covers pod
-        deletion, empty endpoints and a settle for the stale connection.
+        deletion and empty endpoints.
         """
 
         # Read, arm the restoration, then write: a scale that times out after

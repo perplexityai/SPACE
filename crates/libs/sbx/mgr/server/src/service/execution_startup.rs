@@ -9,7 +9,7 @@ impl SandboxManagerService {
             let db = db
                 .lock()
                 .map_err(|_| Status::unavailable("sandbox database mutex poisoned"))?;
-            let unadopted = crate::db::unbound_node_executions(&db).map_err(|error| {
+            let unadopted = crate::db::scan::unbound_executions(&db).map_err(|error| {
                 Status::unavailable(format!("read execution preflight: {error}"))
             })?;
             pplx_space_node_mgr_client::execution_fence::execution_preflight_result(&unadopted)

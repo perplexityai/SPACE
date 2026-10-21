@@ -251,6 +251,33 @@ fn executor_wait_preserves_retry_budget() {
 }
 
 #[test]
+fn copy_admission_refusal_preserves_the_failure_retry_budget() {
+    use crate::controllers::substrate::durable_snapshot_rpc_error;
+    use pplx_space_common_grpc::{rate_limited_status, refused_before_start};
+
+    let hint = Duration::from_secs(1);
+    let busy = refused_before_start(
+        rate_limited_status("copy admission is busy", Some(hint)),
+        hint,
+    );
+    let error = copy_artifact_error(durable_snapshot_rpc_error(busy));
+    assert!(
+        matches!(error, ForkExecutionError::Wait(_)),
+        "admission backpressure must wait without consuming failure retries: {error:?}"
+    );
+
+    for status in [
+        rate_limited_status("storage quota exceeded", Some(hint)),
+        tonic::Status::unavailable("worker unavailable"),
+    ] {
+        assert!(matches!(
+            copy_artifact_error(durable_snapshot_rpc_error(status)),
+            ForkExecutionError::Retry(_)
+        ));
+    }
+}
+
+#[test]
 fn suspended_source_selects_the_durable_artifact_path() {
     assert_eq!(
         "suspended".parse::<ForkSourceLifecycle>().unwrap(),

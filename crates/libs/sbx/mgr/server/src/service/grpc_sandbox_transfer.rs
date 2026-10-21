@@ -613,7 +613,8 @@ impl SandboxManagerService {
             let db = db
                 .lock()
                 .map_err(|_| Status::internal("sandbox db mutex poisoned"))?;
-            if crate::db::sandbox_exists(&db, &sandbox_id.to_string())
+            if crate::db::read::sandbox_view(&db, &sandbox_id.to_string())
+                .exists()
                 .map_err(|error| Status::internal(format!("inspect import identity: {error}")))?
             {
                 return Err(Status::already_exists(
@@ -642,7 +643,8 @@ impl SandboxManagerService {
             .db
             .lock()
             .map_err(|_| Status::internal("sandbox db mutex poisoned"))?;
-        if crate::db::sandbox_exists(&db, sandbox_id)
+        if crate::db::read::sandbox_view(&db, sandbox_id)
+            .exists()
             .map_err(|error| Status::internal(format!("inspect import identity: {error}")))?
         {
             return Err(Status::already_exists(

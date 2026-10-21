@@ -452,7 +452,8 @@ async fn process_tick(
 
     let execution_fence: Option<pplx_space_node_mgr_client::proto::ExecutionFence> = {
         let db = lock_db(ctx)?;
-        crate::db::node_execution_fence(&db, sandbox_id)
+        crate::db::read::sandbox_view(&db, sandbox_id)
+            .node_execution_fence()
             .map_err(|error| error.to_string())?
             .map(Into::into)
     };
@@ -805,7 +806,7 @@ pub async fn do_checkpoint(
     let (previous_state, execution_fence, execution) = {
         let db = lock_db(ctx)?;
         let sandbox =
-            crate::db::get_sandbox(&db, sandbox_id).map_err(|e| format!("db error: {e}"))?;
+            crate::db::read::sandbox(&db, sandbox_id).map_err(|e| format!("db error: {e}"))?;
         let sandbox = match sandbox {
             Some(s) => s,
             None => return Err(format!("sandbox {sandbox_id} not found in DB")),

@@ -65,11 +65,13 @@ Read only the references that match the task:
 - Prefer `DashMap` for independent concurrent map operations. Use an explicit
   lock when an invariant spans multiple operations.
 - Delete dead code instead of adding `#[allow(dead_code)]`.
-- The common service initializer (`crates/libs/common/svc/src/systemd.rs`)
-  arms the systemd watchdog before slow startup work and sends an initial
-  notification immediately. Keep that ordering when refactoring startup code;
-  direct deployments run `WatchdogSec=30s` (also noted in the
-  `$space-validation` local-development reference).
+- The common service initializer (`init_service` in
+  `crates/libs/common/svc/src/lib.rs`, which installs the notifier from
+  `crates/libs/systemd-watchdog`) arms the systemd watchdog before slow
+  startup work and sends an initial notification immediately. Keep that
+  ordering when refactoring startup code; direct deployments run
+  `WatchdogSec=30s` (also noted in the `$space-validation` local-development
+  reference).
 - Protobuf definitions live in `proto/` and generate Rust through `tonic-build`;
   `protoc` is required.
 

@@ -285,7 +285,9 @@ impl SandboxManagerService {
         let sandbox_id_string = sandbox_id.to_string();
         let evidence = {
             let db = self.db_conn()?;
-            crate::db::teardown_release_evidence(&db, &sandbox_id_string, execution_generation)
+            crate::db::read::sandbox_view(&db, &sandbox_id_string)
+                .teardown()
+                .release_evidence(execution_generation)
                 .map_err(|error| Status::internal(format!("db error: {error}")))?
         };
         let Some(mut status) = evidence.suspend else {
@@ -403,7 +405,9 @@ impl SandboxManagerService {
                 }
                 Err(error) => return Err(Status::internal(format!("db error: {error}"))),
             }
-            status = crate::db::teardown_suspend_status(&db, &sandbox_id.to_string())
+            status = crate::db::read::sandbox_view(&db, &sandbox_id.to_string())
+                .teardown()
+                .status()
                 .map_err(|error| Status::internal(format!("db error: {error}")))?
                 .ok_or_else(|| Status::not_found("sandbox record no longer exists"))?;
         }
@@ -438,7 +442,9 @@ impl SandboxManagerService {
                 }
                 Err(error) => return Err(Status::internal(format!("db error: {error}"))),
             }
-            status = crate::db::teardown_suspend_status(&db, &sandbox_id.to_string())
+            status = crate::db::read::sandbox_view(&db, &sandbox_id.to_string())
+                .teardown()
+                .status()
                 .map_err(|error| Status::internal(format!("db error: {error}")))?
                 .ok_or_else(|| Status::not_found("sandbox record no longer exists"))?;
             bound_existing_suspend = true;
@@ -463,7 +469,9 @@ impl SandboxManagerService {
             )?;
             status = {
                 let db = self.db_conn()?;
-                crate::db::teardown_suspend_status(&db, &sandbox_id_string)
+                crate::db::read::sandbox_view(&db, &sandbox_id_string)
+                    .teardown()
+                    .status()
                     .map_err(|error| Status::internal(format!("db error: {error}")))?
                     .ok_or_else(|| Status::not_found("sandbox record no longer exists"))?
             };
@@ -518,10 +526,12 @@ impl SandboxManagerService {
         generation: pplx_space_common_core::types::ExecutionGeneration,
     ) -> Result<TerminalTeardownSuspend, Status> {
         let db = self.db_conn()?;
-        let state = crate::db::get_sandbox(&db, sandbox_id)
+        let state = crate::db::read::sandbox(&db, sandbox_id)
             .map_err(|error| Status::internal(format!("db error: {error}")))?
             .map(|row| row.state);
-        let operation = crate::db::latest_teardown_suspend_operation(&db, sandbox_id)
+        let operation = crate::db::read::sandbox_view(&db, sandbox_id)
+            .teardown()
+            .latest()
             .map_err(|error| Status::internal(format!("db error: {error}")))?;
         // A failed older generation must not block a new execution.
         let exact = operation
@@ -530,7 +540,12 @@ impl SandboxManagerService {
         let reason = match state {
             Some(SandboxState::Quarantined) => Some(crate::db::TeardownSuspendFailure::Quarantined),
             Some(SandboxState::Deleting) => Some(crate::db::TeardownSuspendFailure::Deleting),
-            None if crate::db::execution_delete_receipt_covers(&db, sandbox_id, generation)
+            None if crate::db::now_epoch_i64()
+                .and_then(|now| {
+                    crate::db::read::sandbox_view(&db, sandbox_id)
+                        .delete_receipts()
+                        .execution_covers(generation, now)
+                })
                 .map_err(|error| Status::internal(format!("db error: {error}")))? =>
             {
                 return Ok(TerminalTeardownSuspend::Deleted);
@@ -538,10 +553,10 @@ impl SandboxManagerService {
             None if exact.is_some() => Some(crate::db::TeardownSuspendFailure::Missing),
             _ if exact.is_some_and(|operation| {
                 operation.status == crate::db::TeardownSuspendOperationStatus::Failed
-            }) && !crate::db::teardown_suspend_retry_admissible(
-                &db, sandbox_id, generation,
-            )
-            .map_err(|error| Status::internal(format!("db error: {error}")))? =>
+            }) && !crate::db::read::sandbox_view(&db, sandbox_id)
+                .teardown()
+                .retry_admissible(generation)
+                .map_err(|error| Status::internal(format!("db error: {error}")))? =>
             {
                 Some(crate::db::TeardownSuspendFailure::Failed)
             }
@@ -566,12 +581,10 @@ impl SandboxManagerService {
         event_trigger: SandboxEventTrigger,
     ) -> TeardownSuspendDriverAdmission {
         let due = self.db_conn().and_then(|db| {
-            crate::db::teardown_suspend_retry_due(
-                &db,
-                &sandbox_id.to_string(),
-                execution_generation,
-            )
-            .map_err(|error| Status::internal(format!("read teardown retry deadline: {error}")))
+            crate::db::read::sandbox_view(&db, &sandbox_id.to_string())
+                .teardown()
+                .retry_due(execution_generation)
+                .map_err(|error| Status::internal(format!("read teardown retry deadline: {error}")))
         });
         match due {
             Ok(true) => {}
@@ -881,7 +894,7 @@ impl SandboxManagerService {
         backup_lookup: Option<&OrgSnapshotConfigResolution>,
     ) -> Result<(), Status> {
         let db = self.db_conn()?;
-        let local = crate::db::get_sandbox(&db, &sandbox_id.to_string())
+        let local = crate::db::read::sandbox(&db, &sandbox_id.to_string())
             .map_err(|error| Status::internal(format!("db error: {error}")))?;
         let reason = match local {
             None => Some(crate::db::TeardownSuspendFailure::Missing),
@@ -940,7 +953,9 @@ impl SandboxManagerService {
         let artifact_guard = artifact_lock.lock_owned().await;
         let status = {
             let db = self.db_conn()?;
-            crate::db::teardown_suspend_status(&db, &sandbox_id_string)
+            crate::db::read::sandbox_view(&db, &sandbox_id_string)
+                .teardown()
+                .status()
                 .map_err(|error| Status::internal(format!("db error: {error}")))?
                 .ok_or_else(|| Status::not_found("sandbox record no longer exists"))?
         };
@@ -972,7 +987,9 @@ impl SandboxManagerService {
                     .await?;
                 let status = {
                     let db = self.db_conn()?;
-                    crate::db::teardown_suspend_status(&db, &sandbox_id_string)
+                    crate::db::read::sandbox_view(&db, &sandbox_id_string)
+                        .teardown()
+                        .status()
                         .map_err(|error| Status::internal(format!("db error: {error}")))?
                         .ok_or_else(|| Status::not_found("sandbox record no longer exists"))?
                 };
@@ -1125,7 +1142,9 @@ impl SandboxManagerService {
                 .db
                 .lock()
                 .map_err(|_| Status::internal("database mutex poisoned"))?;
-            crate::db::teardown_suspend_status(&db, sandbox_id)
+            crate::db::read::sandbox_view(&db, sandbox_id)
+                .teardown()
+                .status()
                 .map_err(|error| Status::internal(format!("db error: {error}")))?
         };
         let owns_runtime = status
@@ -1162,7 +1181,9 @@ impl SandboxManagerService {
     ) -> Result<(), Status> {
         let completed = {
             let db = self.db_conn()?;
-            let status = crate::db::teardown_suspend_status(&db, sandbox_id)
+            let status = crate::db::read::sandbox_view(&db, sandbox_id)
+                .teardown()
+                .status()
                 .map_err(|error| Status::internal(format!("db error: {error}")))?
                 .ok_or_else(|| Status::not_found("sandbox record no longer exists"))?;
             let is_ready = status.is_ready_for(execution_generation);
@@ -1405,7 +1426,9 @@ impl SandboxManagerService {
     ) -> Result<(), Status> {
         let still_owned = {
             let db = self.db_conn()?;
-            crate::db::teardown_suspend_status(&db, &sandbox.id)
+            crate::db::read::sandbox_view(&db, &sandbox.id)
+                .teardown()
+                .status()
                 .map_err(|error| Status::internal(format!("db error: {error}")))?
                 .is_some_and(|status| {
                     // Once the artifact is stamped, the next PrepareTeardownSuspend

@@ -21,10 +21,9 @@ impl CleanupInventoryCursor {
     ) -> Result<(Self, CleanupTargetBatch), Status> {
         let mut targets = Vec::new();
         if !self.database.complete() {
-            let observations = self
-                .database
-                .next_batch(&*service.db_conn()?)
-                .map_err(|error| error.into_status())?;
+            let observations =
+                crate::db::scan::sandbox_pages(&*service.db_conn()?, &mut self.database)
+                    .map_err(|error| error.into_status())?;
             targets.extend(observations.into_iter().map(|row| {
                 CleanupTargetObservation {
                     sandbox_id: row.raw_id,
@@ -72,7 +71,8 @@ impl CleanupInventoryCursor {
                 // No filesystem operation runs while SQLite is locked. This
                 // suppresses stable duplicates without retaining all seen IDs;
                 // concurrent deletion can repeat a target, as the wire states.
-                if crate::db::sandbox_exists(&*service.db_conn()?, &name)
+                if crate::db::read::sandbox_view(&*service.db_conn()?, &name)
+                    .exists()
                     .map_err(|error| Status::internal(format!("inspect cleanup target: {error}")))?
                 {
                     continue;
@@ -249,7 +249,8 @@ fn resolve_lifecycle_target_blocking(
         let db = db
             .lock()
             .map_err(|_| Status::internal("cleanup database mutex poisoned"))?;
-        crate::db::cleanup_target(&db, &id)
+        crate::db::read::sandbox_view(&db, &id)
+            .cleanup_target()
             .map_err(|error| Status::internal(format!("read cleanup target: {error}")))?
     };
     if row.is_none() {

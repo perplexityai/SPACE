@@ -173,19 +173,20 @@ pub struct RawQuarantineRecoveryObservation {
 pub type RawQuarantineRecoveryObservationRead =
     std::result::Result<RawQuarantineRecoveryObservation, Error>;
 
-pub fn is_orphan_quarantine_recovery_state(
-    conn: &Connection,
-    sandbox_id: &str,
-    expected_state: SandboxState,
-) -> Result<bool> {
-    if !matches!(
-        expected_state,
-        SandboxState::Quarantined | SandboxState::Restoring
-    ) {
-        return Ok(false);
-    }
-    conn.query_row(
-        "SELECT EXISTS (
+db_private_outside_tests! {
+    fn is_orphan_quarantine_recovery_state(
+        conn: &Connection,
+        sandbox_id: &str,
+        expected_state: SandboxState,
+    ) -> Result<bool> {
+        if !matches!(
+            expected_state,
+            SandboxState::Quarantined | SandboxState::Restoring
+        ) {
+            return Ok(false);
+        }
+        conn.query_row(
+            "SELECT EXISTS (
              SELECT 1
                FROM sandboxes
                JOIN sandbox_quarantine_state qs ON qs.sandbox_id = sandboxes.id
@@ -195,14 +196,15 @@ pub fn is_orphan_quarantine_recovery_state(
                 AND qs.source = ?3
                 AND qs.reason_code = ?4
          )",
-        params![
-            sandbox_id,
-            expected_state.as_str(),
-            SandboxQuarantineSource::SbxManager.as_str(),
-            SandboxQuarantineReasonCode::OrphanedSandboxRowMissing.as_str(),
-        ],
-        |row| row.get(0),
-    )
+            params![
+                sandbox_id,
+                expected_state.as_str(),
+                SandboxQuarantineSource::SbxManager.as_str(),
+                SandboxQuarantineReasonCode::OrphanedSandboxRowMissing.as_str(),
+            ],
+            |row| row.get(0),
+        )
+    }
 }
 
 /// Persists a cross-node staging failure on behalf of a recovery claim.
@@ -252,17 +254,18 @@ pub fn mark_cross_node_restore_staging_failed_under_recovery_claim(
     Ok(changed == 1)
 }
 
-/// Load node-local recovery scheduling facts separately from quarantine
-/// classification metadata. The observation covers the automatic-recovery
-/// reason class, including owners introduced by a newer release; artifact
-/// eligibility is published independently and remains owned by
-/// `quarantine_recovery_branch`.
-pub fn quarantine_recovery_observations(
-    conn: &Connection,
-    sandbox_ids: &[String],
-) -> Result<BTreeMap<String, RawQuarantineRecoveryObservationRead>> {
-    let mut statement = conn.prepare_cached(
-        "SELECT qs.sandbox_id, qs.quarantine_id, qs.next_action_owner,
+db_private_outside_tests! {
+    /// Load node-local recovery scheduling facts separately from quarantine
+    /// classification metadata. The observation covers the automatic-recovery
+    /// reason class, including owners introduced by a newer release; artifact
+    /// eligibility is published independently and remains owned by
+    /// `quarantine_recovery_branch`.
+    fn quarantine_recovery_observations(
+        conn: &Connection,
+        sandbox_ids: &[String],
+    ) -> Result<BTreeMap<String, RawQuarantineRecoveryObservationRead>> {
+        let mut statement = conn.prepare_cached(
+            "SELECT qs.sandbox_id, qs.quarantine_id, qs.next_action_owner,
                 qs.attempt_count, qs.next_action_after, qs.reason_code
            FROM sandbox_quarantine_state qs
            JOIN sandboxes s ON s.id = qs.sandbox_id
@@ -271,59 +274,60 @@ pub fn quarantine_recovery_observations(
             AND qs.source = ?2
             AND s.state IN ('quarantined', 'restoring')
             AND cleanup.sandbox_id IS NULL",
-    )?;
-    let mut observations = BTreeMap::new();
-    for sandbox_id in sandbox_ids {
-        let observation = statement
-            .query_row(
-                params![sandbox_id, SandboxQuarantineSource::SbxManager.as_str()],
-                |row| {
-                    let reason_raw = row.get::<_, String>(5)?;
-                    let reason =
-                        reason_raw
-                            .parse::<SandboxQuarantineReasonCode>()
-                            .map_err(|error| {
-                                rusqlite::Error::FromSqlConversionFailure(
-                                    5,
-                                    Type::Text,
-                                    Box::new(error),
-                                )
-                            })?;
-                    let observation = if reason.automatic_recovery_policy().is_some() {
-                        Some(RawQuarantineRecoveryObservation {
-                            local_quarantine_id: row.get(1)?,
-                            owner: row.get(2)?,
-                            attempt_count: row.get(3)?,
-                            next_attempt_at: {
-                                let value = row.get::<_, rusqlite::types::Value>(4)?;
-                                let stored_type = value.data_type();
-                                nullable_stored_timestamp_text(value).ok_or_else(|| {
-                                    rusqlite::Error::InvalidColumnType(
-                                        4,
-                                        "next_action_after".into(),
-                                        stored_type,
+        )?;
+        let mut observations = BTreeMap::new();
+        for sandbox_id in sandbox_ids {
+            let observation = statement
+                .query_row(
+                    params![sandbox_id, SandboxQuarantineSource::SbxManager.as_str()],
+                    |row| {
+                        let reason_raw = row.get::<_, String>(5)?;
+                        let reason =
+                            reason_raw
+                                .parse::<SandboxQuarantineReasonCode>()
+                                .map_err(|error| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        5,
+                                        Type::Text,
+                                        Box::new(error),
                                     )
-                                })?
-                            },
-                        })
-                    } else {
-                        None
-                    };
-                    Ok((row.get::<_, String>(0)?, observation))
-                },
-            )
-            .optional();
-        match observation {
-            Ok(Some((id, Some(observation)))) => {
-                observations.insert(id, Ok(observation));
-            }
-            Ok(Some((_, None)) | None) => {}
-            Err(error) => {
-                observations.insert(sandbox_id.clone(), Err(error.into()));
+                                })?;
+                        let observation = if reason.automatic_recovery_policy().is_some() {
+                            Some(RawQuarantineRecoveryObservation {
+                                local_quarantine_id: row.get(1)?,
+                                owner: row.get(2)?,
+                                attempt_count: row.get(3)?,
+                                next_attempt_at: {
+                                    let value = row.get::<_, rusqlite::types::Value>(4)?;
+                                    let stored_type = value.data_type();
+                                    nullable_stored_timestamp_text(value).ok_or_else(|| {
+                                        rusqlite::Error::InvalidColumnType(
+                                            4,
+                                            "next_action_after".into(),
+                                            stored_type,
+                                        )
+                                    })?
+                                },
+                            })
+                        } else {
+                            None
+                        };
+                        Ok((row.get::<_, String>(0)?, observation))
+                    },
+                )
+                .optional();
+            match observation {
+                Ok(Some((id, Some(observation)))) => {
+                    observations.insert(id, Ok(observation));
+                }
+                Ok(Some((_, None)) | None) => {}
+                Err(error) => {
+                    observations.insert(sandbox_id.clone(), Err(error.into()));
+                }
             }
         }
+        Ok(observations)
     }
-    Ok(observations)
 }
 
 /// One scanned row of the legacy-recovery quarantine cohort.
@@ -1087,29 +1091,31 @@ pub fn renew_quarantine_recovery_claim(
     Ok(changed == 1)
 }
 
-pub fn quarantine_recovery_claim_is_current(
-    conn: &Connection,
-    claimed: &ClaimedQuarantineRecoveryCandidate,
-) -> Result<bool> {
-    let fence = ExactClaimFence::new(
-        conn,
-        claimed,
-        now_epoch_i64()?,
-        LeaseRequirement::MustBeLive,
-        SandboxStateRequirement::MustBeActivatable,
-        CleanupRequirement::MustBeAbsent,
-    )?;
-    let sql = format!(
-        "SELECT EXISTS (
+db_private_outside_tests! {
+    fn quarantine_recovery_claim_is_current(
+        conn: &Connection,
+        claimed: &ClaimedQuarantineRecoveryCandidate,
+    ) -> Result<bool> {
+        let fence = ExactClaimFence::new(
+            conn,
+            claimed,
+            now_epoch_i64()?,
+            LeaseRequirement::MustBeLive,
+            SandboxStateRequirement::MustBeActivatable,
+            CleanupRequirement::MustBeAbsent,
+        )?;
+        let sql = format!(
+            "SELECT EXISTS (
              SELECT 1
                FROM sandbox_quarantine_state AS qs
               WHERE {}{}
          )",
-        fence.quarantine_row_predicate("qs."),
-        fence.sandbox_guards("qs.sandbox_id"),
-    );
-    let mut statement = conn.prepare_cached(&sql)?;
-    Ok(statement.query_row(&fence.binds()[..], |row| row.get(0))?)
+            fence.quarantine_row_predicate("qs."),
+            fence.sandbox_guards("qs.sandbox_id"),
+        );
+        let mut statement = conn.prepare_cached(&sql)?;
+        Ok(statement.query_row(&fence.binds()[..], |row| row.get(0))?)
+    }
 }
 
 fn quarantine_recovery_backoff(local_quarantine_id: uuid::Uuid, attempt_count: u32) -> Duration {

@@ -26,6 +26,10 @@ docker/Dockerfile.kind-key-broker
 docker/Dockerfile.kind-sts-bridge
 templates/firecracker/seed/**
 templates/firecracker/recipes/seed.toml
+# The cluster-controller's binary, and its library after crates/libs/build:
+# leader election, the retention sweeper, the orphaned-restore-pod GC and
+# node groups each have Kind scenarios.
+crates/apps/cluster/controller/**
 crates/libs/api/src/controllers/template.rs
 crates/libs/api/src/controllers/template/**
 crates/libs/api/src/template_build_jobs_store.rs
@@ -33,6 +37,7 @@ crates/libs/api/src/controllers/substrate/kubernetes/node_sync.rs
 crates/libs/api/src/controllers/substrate/kubernetes/node_sync/**
 crates/libs/api/src/controllers/substrate/kubernetes/store/node_inventory.rs
 crates/libs/build/mgr/**
+crates/libs/cluster/controller/**
 crates/libs/common/svc/src/auth/build.rs
 crates/libs/common/svc/src/auth/build/**
 crates/libs/internal/api/server/src/adapter.rs

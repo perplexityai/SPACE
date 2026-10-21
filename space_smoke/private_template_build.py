@@ -7,6 +7,7 @@ import secrets
 import time
 import uuid
 from dataclasses import replace
+from functools import partial
 
 from space_smoke.adapters import (
     EcwConfig,
@@ -16,7 +17,12 @@ from space_smoke.adapters import (
     _ecw_control_plane_json,
 )
 from space_smoke.fixtures import retry_sandbox_delete
-from space_smoke.runtime import ResourceScope, ScenarioContext, SmokeConfigurationError
+from space_smoke.runtime import (
+    ResourceScope,
+    ScenarioContext,
+    SmokeConfigurationError,
+    run_concurrently,
+)
 
 
 class PrivateTemplateBuildAssertions:
@@ -37,6 +43,7 @@ class PrivateTemplateBuildAssertions:
         self.owner: EcwConfig | None = None
         self.foreign: EcwConfig | None = None
         self.digest = ""
+        self.templates: list[str] = []
 
     def _key(self, org_id: str, user_id: str) -> EcwConfig:
         key = secrets.token_hex(32)
@@ -219,11 +226,31 @@ class PrivateTemplateBuildAssertions:
         cleanup.release()
 
     def _own_template(self, name: str) -> None:
-        self.resources.defer(
-            f"delete run-owned template {name}",
-            lambda: self._delete_template(name),
-            critical=True,
-        )
+        # One compensation, armed with the first template, deletes them all.
+        if not self.templates:
+            self.resources.defer(
+                "delete run-owned templates", self._delete_templates, critical=True
+            )
+        self.templates.append(name)
+
+    def _delete_templates(self) -> None:
+        # Every other template at once, then the private base, which two of
+        # them were built from, last as before.
+        base, *derived = self.templates
+        failures = [
+            f"{name}: {type(outcome).__name__}: {outcome}"
+            for name, outcome in zip(
+                derived,
+                run_concurrently([partial(self._delete_template, name) for name in derived]),
+            )
+            if isinstance(outcome, BaseException)
+        ]
+        try:
+            self._delete_template(base)
+        except Exception as error:  # noqa: BLE001 - reported with the others
+            failures.append(f"{base}: {type(error).__name__}: {error}")
+        if failures:
+            raise RuntimeError("run-owned template cleanup failed: " + "; ".join(failures))
 
     def _delete_template(self, name: str) -> None:
         admin = self.kind.admin_request
@@ -238,7 +265,7 @@ class PrivateTemplateBuildAssertions:
                     status["state"] not in {"failed", "canceled", "expired"},
                     f"template cleanup failed: {name}",
                 )
-                self.context.wait(1)
+                self.context.wait(0.5)
         admin("GET", f"templates/{name}", expected=(404,))
 
     def _cleanup(self) -> None:

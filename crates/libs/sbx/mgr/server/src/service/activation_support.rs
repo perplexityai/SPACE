@@ -364,7 +364,7 @@ impl SandboxManagerService {
             }
             let provenance = {
                 let db = self.db_conn()?;
-                match crate::db::activation_route_provenance(&db, sandbox_id) {
+                match crate::db::read::sandbox_view(&db, sandbox_id).activation_route_provenance() {
                     Ok(provenance) => {
                         if requested_can_open_claim
                             && let Some(claim) = crate::db::route_activation_claims::OpenRouteActivationClaim::for_cluster_fenced_identity(
@@ -454,7 +454,7 @@ impl SandboxManagerService {
         }
         let provenance = {
             let db = self.db_conn()?;
-            match crate::db::activation_route_provenance(&db, sandbox_id) {
+            match crate::db::read::sandbox_view(&db, sandbox_id).activation_route_provenance() {
                 Ok(provenance) => provenance,
                 Err(error) if error.is_no_rows() => {
                     return Err(
@@ -1003,10 +1003,12 @@ pub(super) async fn configure_process_env_for_activation(
     let read = || {
         let conn = crate::node_state_sync::connection_or_signal_failure(db)
             .map_err(|error| Status::internal(error.to_string()))?;
-        let sandbox = crate::db::get_sandbox(&conn, sandbox_id)
+        let sandbox = crate::db::read::sandbox(&conn, sandbox_id)
             .map_err(|error| Status::internal(format!("db error: {error}")))?
             .ok_or_else(|| Status::not_found("activation sandbox disappeared"))?;
-        let episode = crate::db::cleanup_episode(&conn, sandbox_id)
+        let episode = crate::db::read::sandbox_view(&conn, sandbox_id)
+            .cleanup_episode()
+            .strict()
             .map_err(|error| Status::internal(format!("db error: {error}")))?;
         // Start and restore pre-arm rollback before guest setup. Its presence
         // is valid until cleanup is requested or another activation owns it.
@@ -1116,11 +1118,13 @@ fn activation_failure_status_if_current(
         .lock()
         .map_err(|error| Status::internal(format!("database mutex poisoned: {error}")))
         .and_then(|db| {
-            let row = crate::db::get_sandbox(&db, sandbox_id)
+            let row = crate::db::read::sandbox(&db, sandbox_id)
                 .map_err(|error| Status::internal(format!("db error: {error}")))?;
             let episode = cleanup_id
                 .map(|cleanup_id| {
-                    crate::db::cleanup_episode(&db, sandbox_id)
+                    crate::db::read::sandbox_view(&db, sandbox_id)
+                        .cleanup_episode()
+                        .strict()
                         .map(|episode| {
                             episode.is_some_and(|episode| {
                                 episode.id == cleanup_id && episode.requested_at.is_none()
@@ -1295,7 +1299,7 @@ where
                     );
                     return Err(activation_completion_lost_status(SandboxState::Starting));
                 }
-                if let Ok(Some(sandbox)) = crate::db::get_sandbox(&db, sandbox_id) {
+                if let Ok(Some(sandbox)) = crate::db::read::sandbox(&db, sandbox_id) {
                     emit_guest_observed_specs(
                         sandbox_id,
                         &sandbox.template,
@@ -1481,7 +1485,7 @@ async fn mark_restore_after_network_ready(
             let db = db
                 .lock()
                 .map_err(|error| Status::internal(format!("database mutex poisoned: {error}")))?;
-            crate::db::get_sandbox(&db, sandbox_id)
+            crate::db::read::sandbox(&db, sandbox_id)
                 .map_err(|error| Status::internal(format!("read restoring sandbox: {error}")))?
                 .ok_or_else(|| activation_completion_lost_status(SandboxState::Restoring))?
                 .pool_template

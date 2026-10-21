@@ -45,7 +45,6 @@ nix = { workspace = true, features = ["fs", "user"] }
 pin-project-lite = { workspace = true }
 redis = { workspace = true }
 rand = { workspace = true }
-rustls = { workspace = true, default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -53,7 +52,7 @@ sqlx = { workspace = true, features = ["derive", "postgres", "runtime-tokio", "t
 subtle = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
-tokio = { workspace = true, features = ["macros", "net", "rt", "rt-multi-thread", "signal", "time"] }
+tokio = { workspace = true, features = ["macros", "net", "rt", "signal", "time"] }
 tokio-stream = { workspace = true, features = ["net"] }
 tokio-util = { workspace = true }
 toml = { workspace = true, optional = true }
@@ -65,11 +64,16 @@ tracing = { workspace = true }
 uuid = { workspace = true, features = ["v5", "v7"] }
 
 # internal
+pplx-space-bearer-token = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["serde", "sqlx"] }
 pplx-space-common-grpc = { workspace = true }
 pplx-space-dependency-drain = { workspace = true }
 pplx-space-metrics = { workspace = true }
 pplx-space-observability = { workspace = true }
+pplx-space-rustls-provider = { workspace = true }
+pplx-space-systemd-watchdog = { workspace = true }
+pplx-space-tokio-runtime = { workspace = true }
+pplx-space-unix-socket-path = { workspace = true }
 
 [dev-dependencies]
 # The accepted-checksums tests migrate in-memory SQLite databases.

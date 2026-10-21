@@ -5,7 +5,7 @@
 //! proves runtime release. Periodic reconciliation closes at most 128 terminal
 //! active teardown jobs per tick, excluding unrelated and retained job history.
 
-use super::{active_teardown_suspend_operation, immediate_transaction};
+use super::{active_teardown_suspend_operation, db_private_outside_tests, immediate_transaction};
 use crate::db::{Connection, Result};
 use pplx_space_common_core::{
     sql,
@@ -46,16 +46,17 @@ impl std::fmt::Display for TeardownSuspendFailure {
     }
 }
 
-/// A recovered resident may start a fresh attempt; retained artifacts and
-/// in-flight cleanup cannot supply that authority, even for the same generation.
-pub fn teardown_suspend_retry_admissible(
-    conn: &Connection,
-    id: &str,
-    generation: ExecutionGeneration,
-) -> Result<bool> {
-    conn.query_row(
-        sql!(
-            "SELECT EXISTS (
+db_private_outside_tests! {
+    /// A recovered resident may start a fresh attempt; retained artifacts and
+    /// in-flight cleanup cannot supply that authority, even for the same generation.
+    fn teardown_suspend_retry_admissible(
+        conn: &Connection,
+        id: &str,
+        generation: ExecutionGeneration,
+    ) -> Result<bool> {
+        conn.query_row(
+            sql!(
+                "SELECT EXISTS (
                  SELECT 1 FROM sandboxes s
                   WHERE s.id = ?1 AND s.state IN ('started', 'paused')
                     AND s.space_api_route_execution_generation = ?2
@@ -64,10 +65,11 @@ pub fn teardown_suspend_retry_admissible(
                         SELECT 1 FROM sandbox_cleanup_episodes e WHERE e.sandbox_id = s.id
                     )
              )"
-        ),
-        params![id, generation.get()],
-        |row| row.get(0),
-    )
+            ),
+            params![id, generation.get()],
+            |row| row.get(0),
+        )
+    }
 }
 
 pub fn fail_teardown_suspend_operation(
@@ -220,23 +222,25 @@ pub fn defer_teardown_suspend_retry(
     Ok(())
 }
 
-pub fn teardown_suspend_retry_due(
-    conn: &Connection,
-    id: &str,
-    generation: ExecutionGeneration,
-) -> Result<bool> {
-    let Some(operation) = active_teardown_suspend_operation(conn, id)? else {
-        return Ok(true);
-    };
-    if operation.execution_generation != generation {
-        return Ok(true);
-    }
-    conn.query_row(
-        sql!(
-            "SELECT next_attempt_at IS NULL OR next_attempt_at <= datetime('now')
+db_private_outside_tests! {
+    fn teardown_suspend_retry_due(
+        conn: &Connection,
+        id: &str,
+        generation: ExecutionGeneration,
+    ) -> Result<bool> {
+        let Some(operation) = active_teardown_suspend_operation(conn, id)? else {
+            return Ok(true);
+        };
+        if operation.execution_generation != generation {
+            return Ok(true);
+        }
+        conn.query_row(
+            sql!(
+                "SELECT next_attempt_at IS NULL OR next_attempt_at <= datetime('now')
            FROM jobs WHERE job_id = ?1"
-        ),
-        params![operation.job_id],
-        |row| row.get(0),
-    )
+            ),
+            params![operation.job_id],
+            |row| row.get(0),
+        )
+    }
 }

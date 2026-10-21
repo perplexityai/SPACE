@@ -2,6 +2,7 @@
 //! (`sandbox_open_route_activations`).
 
 use crate::db::Connection;
+use crate::db::db_private_outside_tests;
 use pplx_space_common_core::types::{
     ExecutionGeneration, NodeId, NodeManagedBy, PodUid, RouteGeneration,
     SandboxActivationAttemptId, SpaceApiRouteIdentity,
@@ -93,13 +94,14 @@ pub(crate) fn insert_create_claim(
     write_claim(conn, sandbox_id, claim)
 }
 
-pub fn claim_matches(
-    conn: &Connection,
-    sandbox_id: &str,
-    claim: &OpenRouteActivationClaim,
-) -> crate::db::Result<bool> {
-    conn.query_row(
-        "SELECT EXISTS (
+db_private_outside_tests! {
+    fn claim_matches(
+        conn: &Connection,
+        sandbox_id: &str,
+        claim: &OpenRouteActivationClaim,
+    ) -> crate::db::Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS (
              SELECT 1
               FROM sandbox_open_route_activations
               WHERE sandbox_id = ?1
@@ -111,17 +113,18 @@ pub fn claim_matches(
                 AND activation_attempt_id = ?6
                 AND identity_provenance = ?7
          )",
-        params![
-            sandbox_id,
-            SqliteU64(claim.route_generation.get()),
-            claim.node_id.to_string(),
-            claim.execution_generation.get(),
-            claim.pod_uid.as_str(),
-            claim.activation_attempt_id.to_string(),
-            RouteIdentityProvenance::ClusterFenced.as_str(),
-        ],
-        |row| row.get(0),
-    )
+            params![
+                sandbox_id,
+                SqliteU64(claim.route_generation.get()),
+                claim.node_id.to_string(),
+                claim.execution_generation.get(),
+                claim.pod_uid.as_str(),
+                claim.activation_attempt_id.to_string(),
+                RouteIdentityProvenance::ClusterFenced.as_str(),
+            ],
+            |row| row.get(0),
+        )
+    }
 }
 
 pub fn close_claim(conn: &Connection, sandbox_id: &str) -> crate::db::Result<bool> {

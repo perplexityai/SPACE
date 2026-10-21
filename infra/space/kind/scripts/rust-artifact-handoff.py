@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Hand off one verified producer image within a GitHub Actions run."""
+"""Hand off one verified producer image within a GitHub Actions run.
+
+A PR's producer either builds the image or, with `reuse`, takes the one main
+CI published for the same Rust input key (`build-rust-artifacts.sh
+--input-key`) from a registry package that only main writes. Main always
+builds; a job of its own then `publish`es the image, so the shards never wait
+for the push. Either way the shards load and verify the exact image the
+producer recorded.
+"""
 
 from __future__ import annotations
 
@@ -15,6 +23,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 IMAGE = "space-rust-build-kind:local"
 PRODUCER = "Build shared Kind Rust artifacts"
+BUILD = ROOT / "infra/space/kind/scripts/build-rust-artifacts.sh"
+# Set by build-rust-artifacts.sh on a Docker-mode image with an exact input key.
+INPUT_KEY_LABEL = "space.pplx.net/kind-rust-input-key"
+REVISION_LABEL = "org.opencontainers.image.revision"
+# A healthy pull of the image takes well under a minute. One still running
+# after this has stalled, and all of its wait is added to the build that
+# then runs anyway. The log reports each pull's duration to calibrate this.
+PULL_TIMEOUT_SECONDS = 90
 
 
 def context() -> dict:
@@ -47,6 +63,141 @@ def digest(path: Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def labels(reference: str) -> dict:
+    value = json.loads(
+        subprocess.check_output(
+            ["docker", "image", "inspect", "-f", "{{json .Config.Labels}}", reference],
+            text=True,
+            timeout=60,
+        )
+    )
+    return value if isinstance(value, dict) else {}
+
+
+def input_key() -> str:
+    """This checkout's Rust input key; fails when its inputs are uncommitted."""
+
+    key = subprocess.check_output(
+        ["bash", str(BUILD), "--input-key"], cwd=ROOT, text=True, timeout=120
+    ).strip()
+    if not re.fullmatch(r"[a-f0-9]{64}", key):
+        raise ValueError("invalid Rust input key")
+    return key
+
+
+def image_source(identity: dict) -> tuple[str, str]:
+    """(commit the local image was built from, its input key or "").
+
+    An image without a key label was built by this producer. One with a key
+    label may have been built by main from another commit.
+    """
+
+    image_labels = labels(IMAGE)
+    key = image_labels.get(INPUT_KEY_LABEL, "")
+    if not key:
+        return identity["source_sha"], ""
+    built_from = image_labels.get(REVISION_LABEL, "")
+    if not re.fullmatch(r"[a-f0-9]{64}", key) or not re.fullmatch(
+        r"[a-f0-9]{40}", built_from
+    ):
+        raise ValueError("producer image carries an invalid input key or revision")
+    return built_from, key
+
+
+def reuse(repository: str) -> None:
+    """Take main's image for this checkout's Rust input key, if it has one.
+
+    Never fails: any miss leaves the build step to run, as without reuse.
+    """
+
+    try:
+        key = input_key()
+        reference = f"{repository}:{key}"
+        started = time.monotonic()
+        try:
+            # Never echo a remote error body or authentication diagnostics.
+            pulled = subprocess.run(
+                ["docker", "pull", "--quiet", reference],
+                capture_output=True,
+                text=True,
+                timeout=PULL_TIMEOUT_SECONDS,
+                check=False,
+            ).returncode
+        except subprocess.TimeoutExpired:
+            pulled = None
+        elapsed = time.monotonic() - started
+        if pulled != 0:
+            outcome = "timed out" if pulled is None else "failed"
+            print(
+                f"::notice::The pull of the Rust artifact image for input key "
+                f"{key[:12]} {outcome} after {elapsed:.0f} s; building it",
+                flush=True,
+            )
+            return
+        print(f"Pulled {reference} in {elapsed:.0f} s", flush=True)
+        image_labels = labels(reference)
+        built_from = image_labels.get(REVISION_LABEL, "")
+        if image_labels.get(INPUT_KEY_LABEL) != key or not re.fullmatch(
+            r"[a-f0-9]{40}", built_from
+        ):
+            print(
+                "::notice::The published Rust artifact image does not carry its "
+                "input key; building it",
+                flush=True,
+            )
+            return
+        subprocess.run(["docker", "tag", reference, IMAGE], check=True, timeout=60)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        print(
+            f"::notice::Rust artifact reuse stopped ({type(error).__name__}); "
+            "building the image",
+            flush=True,
+        )
+        return
+    with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
+        output.write("reused=true\n")
+    print(
+        f"::notice::Reusing the Rust artifact image main built from {built_from} "
+        f"for input key {key[:12]}; skipping the build",
+        flush=True,
+    )
+
+
+def publish(repository: str) -> None:
+    """Publish the loaded producer image under its input key (main only).
+
+    Main builds on every push, so this replaces the key's earlier image.
+    Never fails: a later PR with the same key then builds it.
+    """
+
+    try:
+        identity = context()
+        built_from, key = image_source(identity)
+        if not key:
+            print(
+                "::notice::The Rust artifact image has no input key; not publishing it",
+                flush=True,
+            )
+            return
+        if built_from != identity["source_sha"] or key != input_key():
+            raise ValueError("artifact image was not built from this checkout")
+        reference = f"{repository}:{key}"
+        subprocess.run(["docker", "tag", IMAGE, reference], check=True, timeout=60)
+        subprocess.run(
+            ["docker", "push", "--quiet", reference],
+            capture_output=True,
+            check=True,
+            timeout=600,
+        )
+    except (KeyError, OSError, ValueError, subprocess.SubprocessError) as error:
+        print(
+            f"::warning::Could not publish the Rust artifact image ({type(error).__name__})",
+            flush=True,
+        )
+        return
+    print(f"Published the Rust artifact image for input key {key}", flush=True)
+
+
 def record(directory: Path) -> None:
     identity = context()
     archive = directory / "kind-rust.tar.gz"
@@ -55,12 +206,15 @@ def record(directory: Path) -> None:
     ).strip()
     if not re.fullmatch(r"sha256:[a-f0-9]{64}", image):
         raise ValueError("producer returned an invalid Docker image identity")
+    built_from, key = image_source(identity)
     (directory / "manifest.json").write_text(
         json.dumps(
             {
                 **identity,
                 "image_id": image,
                 "archive_sha256": digest(archive),
+                "built_from": built_from,
+                "input_key": key,
             },
             indent=2,
         )
@@ -220,6 +374,14 @@ def load(directory: Path) -> None:
         raise ValueError(
             "artifact does not match this run attempt, source, or archive digest"
         )
+    built_from, key = manifest.get("built_from"), manifest.get("input_key")
+    if (
+        not isinstance(built_from, str)
+        or not re.fullmatch(r"[a-f0-9]{40}", built_from)
+        or not isinstance(key, str)
+        or not re.fullmatch(r"(?:[a-f0-9]{64})?", key)
+    ):
+        raise ValueError("artifact manifest names an invalid image source")
     subprocess.run(
         ["docker", "image", "load", "--input", str(archive)],
         check=True,
@@ -236,10 +398,13 @@ def load(directory: Path) -> None:
         **os.environ,
         "SPACE_KIND_RUST_ARTIFACTS": "prebuilt",
         "SPACE_KIND_PREBUILT_RUST_IMAGE_ID": actual,
-        "SPACE_KIND_PREBUILT_RUST_SHA": identity["source_sha"],
+        # The commit the image was built from; when it is not this checkout's,
+        # prebuilt mode requires the input key to match instead.
+        "SPACE_KIND_PREBUILT_RUST_SHA": built_from,
+        "SPACE_KIND_PREBUILT_RUST_KEY": key,
     }
     subprocess.run(
-        ["bash", "infra/space/kind/scripts/build-rust-artifacts.sh"],
+        ["bash", str(BUILD)],
         cwd=ROOT,
         env=environment,
         check=True,
@@ -250,6 +415,7 @@ def load(directory: Path) -> None:
             for key in (
                 "SPACE_KIND_PREBUILT_RUST_IMAGE_ID",
                 "SPACE_KIND_PREBUILT_RUST_SHA",
+                "SPACE_KIND_PREBUILT_RUST_KEY",
             )
         )
 
@@ -259,6 +425,8 @@ def main() -> None:
     commands = parser.add_subparsers(dest="command", required=True)
     for name in ("record", "load"):
         commands.add_parser(name).add_argument("directory", type=Path)
+    for name in ("reuse", "publish"):
+        commands.add_parser(name).add_argument("repository")
     commands.add_parser("wait").add_argument("--timeout", type=int, default=65 * 60)
     args = parser.parse_args()
     if args.command == "wait":
@@ -267,6 +435,10 @@ def main() -> None:
         wait(args.timeout)
     elif args.command == "record":
         record(args.directory)
+    elif args.command == "reuse":
+        reuse(args.repository)
+    elif args.command == "publish":
+        publish(args.repository)
     else:
         load(args.directory)
 

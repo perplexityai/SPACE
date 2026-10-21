@@ -390,6 +390,50 @@ run_clippy_checks() {
         -- \
         -D warnings
 
+    # Built alone, so a tonic or common-core feature the bearer-token crate
+    # needs but only gets through unification with the rest of the workspace
+    # fails here. Its tests build alone too, so they are linted with it.
+    echo "--- :rust: Running isolated bearer-token clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-bearer-token \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
+
+    # Built alone, so a rustls feature the provider install needs but only
+    # gets through unification with the rest of the workspace fails here.
+    echo "--- :rust: Running isolated rustls provider clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-rustls-provider \
+        --no-default-features \
+        -- \
+        -D warnings
+
+    # Built alone, so a tokio feature the runtime builder needs but only gets
+    # through unification with the rest of the workspace fails here.
+    echo "--- :rust: Running isolated Tokio runtime builder clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-tokio-runtime \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
+
+    # Built alone, so a tokio feature the watchdog needs but only gets
+    # through unification fails here; its notify path is Linux-specific.
+    echo "--- :rust: Running isolated systemd watchdog clippy"
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-systemd-watchdog \
+        --no-default-features \
+        --all-targets \
+        -- \
+        -D warnings
+
     run_sbxmgr_production_checks "${target_dir}"
 
     # feature-flags must lint clean with no vendor SDK compiled in; the matching

@@ -325,43 +325,47 @@ fn cancel_live_upload_job(conn: &Connection, artifact: LocalArtifactId) -> Resul
     Ok(())
 }
 
-/// The local artifacts of the sandbox other than `staged_artifact` with no
-/// `backup_completed_at` stamp: the rows that hold
-/// [`claim_retired_teardown_execution_for_release`] back until each is
-/// stamped.
-pub fn other_local_artifacts_awaiting_backup(
-    conn: &Connection,
-    id: &str,
-    staged_artifact: LocalArtifactId,
-) -> Result<Vec<LocalArtifactRow>> {
-    let mut statement = conn.prepare(
-        "SELECT local_artifact_id, sandbox_id, artifact_kind, artifact_origin,
+db_private_outside_tests! {
+    /// The local artifacts of the sandbox other than `staged_artifact` with no
+    /// `backup_completed_at` stamp: the rows that hold
+    /// [`claim_retired_teardown_execution_for_release`] back until each is
+    /// stamped.
+    fn other_local_artifacts_awaiting_backup(
+        conn: &Connection,
+        id: &str,
+        staged_artifact: LocalArtifactId,
+    ) -> Result<Vec<LocalArtifactRow>> {
+        let mut statement = conn.prepare(
+            "SELECT local_artifact_id, sandbox_id, artifact_kind, artifact_origin,
                 snapshot_name, local_path
            FROM local_artifacts
           WHERE sandbox_id = ?1
             AND local_artifact_id <> ?2
             AND backup_completed_at IS NULL
           ORDER BY local_artifact_id",
-    )?;
-    Ok(statement
-        .query_map(
-            params![id, staged_artifact.to_string()],
-            row_to_local_artifact,
-        )?
-        .collect::<rusqlite::Result<_>>()?)
+        )?;
+        Ok(statement
+            .query_map(
+                params![id, staged_artifact.to_string()],
+                row_to_local_artifact,
+            )?
+            .collect::<rusqlite::Result<_>>()?)
+    }
 }
 
-/// Whether this generation's teardown-suspend job is still running: the other
-/// half of what [`claim_retired_teardown_execution_for_release`] requires.
-pub fn teardown_suspend_operation_running_for(
-    conn: &Connection,
-    id: &str,
-    execution_generation: ExecutionGeneration,
-) -> Result<bool> {
-    Ok(
-        active_teardown_suspend_operation(conn, id)?.is_some_and(|operation| {
-            operation.execution_generation == execution_generation
-                && operation.status == TeardownSuspendOperationStatus::Running
-        }),
-    )
+db_private_outside_tests! {
+    /// Whether this generation's teardown-suspend job is still running: the other
+    /// half of what [`claim_retired_teardown_execution_for_release`] requires.
+    fn teardown_suspend_operation_running_for(
+        conn: &Connection,
+        id: &str,
+        execution_generation: ExecutionGeneration,
+    ) -> Result<bool> {
+        Ok(
+            active_teardown_suspend_operation(conn, id)?.is_some_and(|operation| {
+                operation.execution_generation == execution_generation
+                    && operation.status == TeardownSuspendOperationStatus::Running
+            }),
+        )
+    }
 }

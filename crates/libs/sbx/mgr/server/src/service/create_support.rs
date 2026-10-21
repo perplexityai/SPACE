@@ -617,9 +617,7 @@ pub(super) fn checkpoint_restore_retry_action(
         // can safely reattach while no runtime, artifact pin, or cleanup intent
         // was committed. The current request supplies the desired target state
         // after staging returns the row to Suspended.
-        SandboxState::Restoring
-            if !runtime_live && crate::db::sandbox_is_retryable_interrupted_restore(existing) =>
-        {
+        SandboxState::Restoring if !runtime_live && existing.is_retryable_interrupted_restore() => {
             CheckpointRestoreRetryAction::ResumeRestoring
         }
         SandboxState::Restoring => CheckpointRestoreRetryAction::CleanupRestoring,

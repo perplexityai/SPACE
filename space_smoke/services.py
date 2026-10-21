@@ -94,6 +94,9 @@ KIND_BACKEND = "kind"
 DEPLOYED_BACKEND = "deployed"
 ECW_API_SURFACE = "ecw"
 NATIVE_API_SURFACE = "native"
+# Set by the suite runner on the scenarios it launches once its own bootstrap
+# has passed; a scenario run on its own does every bootstrap check itself.
+SUITE_BOOTSTRAPPED_ENV = "SPACE_SMOKE_SUITE_BOOTSTRAPPED"
 
 
 @dataclass(frozen=True)
@@ -108,11 +111,14 @@ class SmokeServices:
     native: CommandSandboxFactory | None = None
     api_surface: str = ECW_API_SURFACE
 
-    def bootstrap(self) -> None:
-        """Prepare the selected environment once before suite dispatch."""
+    def bootstrap(self) -> bool:
+        """Prepare the selected environment once before suite dispatch.
 
-        if self.kind is not None:
-            self.kind.bootstrap()
+        Returns whether the bootstrap checked that every SPACE pod runs the
+        latest build of its image.
+        """
+
+        return self.kind.bootstrap() if self.kind is not None else False
 
     def telemetry_mode(self) -> str:
         """The telemetry mode of the Kind bench, read from the cluster."""
@@ -579,6 +585,7 @@ class SmokeServices:
             data_plane_url=data_plane_url,
             skip_bootstrap=values.get("SKIP_BOOTSTRAP", "0") == "1",
             bootstrap_timeout=int(values.get("BOOTSTRAP_TIMEOUT", "1800")),
+            suite_bootstrapped=values.get(SUITE_BOOTSTRAPPED_ENV) == "1",
         )
         executor = SubprocessExecutor(base_env=values)
         kind = KindHarness(executor, kind_config, environment=values)
