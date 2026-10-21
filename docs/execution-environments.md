@@ -598,14 +598,24 @@ in a versioned job payload. A downgraded worker cannot decode that payload as an
 ordinary build and silently substitute E0; such work must be inspected/resubmitted
 after upgrading, not treated as successful.
 
-An explicit selection must match the template's recorded environment. An unbound
-legacy template may acquire a binding for this creation only after its recorded
-runtime, guest, state format and kernel digest match the node-verified definition;
-its stored template metadata is not rewritten. Create commits the verified execution
-binding with the sandbox and cleanup intent before acknowledging success. First
-Start, service restarts, and later starts preserve it; conflicting or missing
-artifact evidence fails closed. Without a selection, a bound template retains
-that environment, including its exact runtime on new cold boot and stop/start.
+A selected cold-boot consumer must match the template's guest, runtime family
+and kernel digest. Its runtime version may differ from the template producer.
+The template's stored metadata is never relabelled. Create saves the selected
+execution with the sandbox and cleanup intent before acknowledging success.
+First Start, service restarts and later cold starts retain that exact consumer.
+Disk metadata records its producer; it cannot override the saved selection, and
+conflicting guest or kernel inputs fail. Snapshot producer evidence stays in the
+snapshot manifest, independently of the sandbox's current consumer.
+
+Unpinned scratch builds use the configured default, refusing when it is unusable.
+Derived builds and new node-local cold sandboxes prefer the bound source when
+allowed and usable. Only a revoked or unavailable source permits fallback to the
+newest allowed qualified consumer with the same kernel. Adding an allowed binding
+therefore does not upgrade a usable source or contaminate an exact benchmark arm.
+Explicit requests never fall back. Existing sandbox stop/start retains its saved
+consumer. After a failed restore that saved consumer may be the newly selected
+loader; its kernel identity is unchanged and cold admission rechecks policy.
+Cluster-directed work and pools still require their placement-bound identities.
 
 Retained instance directories grant sandbox-manager traversal without group write.
 Normal Start repairs old traversal permissions through node-manager before choosing
@@ -643,15 +653,19 @@ error before restarting. It repairs permissions on a valid directory, not a
 regular-file instance, symlink loop, or storage I/O fault; those conditions need
 filesystem repair without discarding the retained disk or rewriting its binding.
 
-Unbound derived builds keep the legacy request path regardless of runtime version.
-Ordinary builds inheriting the immutable E0 binding also retain that compatible
-path; explicit E0 requests and every inherited non-default binding require exact
-protocol acknowledgement. The distinction uses complete environment identity,
-never the runtime version alone. No kernel-only or runtime-only substitution is
-allowed. Local selected creation is cold-only, without pool adoption, snapshots,
-or cluster-owned identities. This creation restriction also covers explicit E0
-requests; later snapshot and suspend operations independently check memory-state
-qualification. Unqualified memory-state operations are refused.
+Unbound derived builds and custom kernel recipes retain their legacy contracts
+while the default-enabled `legacy` permission remains present.
+Every resolved build, including E0, sends its exact selected environment to Create
+so inventory changes cannot cause reselection. Local selected creation remains
+cold-only, without pool adoption, snapshots or cluster-owned identities; later
+snapshot and suspend operations independently check memory-state qualification.
+
+During mixed versions, an old resolver's missing selection acknowledgement keeps
+the pre-existing exact source contract. Scratch builds use ordinary default
+resolution, including during rollout. Other errors never cause fallback. A new
+non-default binding requires all its readers on the target node to be upgraded;
+older sandbox-managers reject cross-binding Create
+before execution. Roll out node-manager, then sandbox-manager, then builders.
 Managed non-default bindings are omitted from the legacy cluster placement
 projection. Historical external runtime and kernel installations remain available
 to legacy execution and placement. Fleet placement for complete environments,

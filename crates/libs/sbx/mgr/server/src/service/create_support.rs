@@ -932,44 +932,58 @@ pub(super) async fn template_source_for_sandbox_prepare_in(
     Ok(SandboxPrepareSource {
         template: Some(sandbox.template.clone()),
         template_dir: Some(resolved_template.template_dir),
-        execution: bind_saved_execution(sandbox, resolved_template.execution)?,
+        execution: bind_disk_execution(
+            sandbox.execution_metadata.as_ref(),
+            resolved_template.execution,
+        )?,
         existing_artifact: false,
     })
 }
 
-/// Saved selection wins over absent legacy annotations, never over conflicting
-/// artifact evidence. Kernel directory labels do not change byte identity.
+/// The saved sandbox binding owns execution selection. Disk metadata records
+/// the runtime that last prepared the disk; it is not a second selection pin.
+/// Raw disks can cross qualified consumers while their guest and kernel inputs
+/// remain fixed. Snapshot producer evidence is read separately from its manifest.
 fn bind_saved_execution(
     sandbox: &crate::db::SandboxRow,
     observed: pplx_space_common_core::types::ExecutionMetadata,
 ) -> Result<pplx_space_common_core::types::ExecutionMetadata, Status> {
-    let Some((saved, reference)) = sandbox
-        .execution_metadata
-        .as_ref()
-        .and_then(|saved| saved.environment().map(|reference| (saved, reference)))
-    else {
+    bind_disk_execution(sandbox.execution_metadata.as_ref(), observed)
+}
+
+fn bind_disk_execution(
+    saved: Option<&pplx_space_common_core::types::ExecutionMetadata>,
+    observed: pplx_space_common_core::types::ExecutionMetadata,
+) -> Result<pplx_space_common_core::types::ExecutionMetadata, Status> {
+    let Some(saved) = saved.filter(|saved| saved.environment().is_some()) else {
         return Ok(observed);
     };
-    if observed
-        .environment()
-        .is_some_and(|actual| actual != reference)
+    // Only the Firecracker adapter currently declares cross-consumer raw-disk
+    // compatibility. Other adapters must supply their own disk contract.
+    if saved.runtime().kind != pplx_space_common_core::types::RuntimeKind::Firecracker
+        && saved != &observed
     {
         return Err(Status::failed_precondition(
-            "artifact environment differs from the sandbox's saved binding",
+            "runtime adapter requires the exact disk execution contract",
         ));
     }
-    if observed.runtime() != saved.runtime() || observed.guest() != saved.guest() {
+    if saved.runtime().kind != observed.runtime().kind
+        || saved.guest() != observed.guest()
+        || !matching_execution_components(saved, &observed)
+    {
         return Err(Status::failed_precondition(
-            "artifact runtime or guest differs from the sandbox's saved binding",
+            "disk boot inputs differ from the sandbox's saved execution",
         ));
     }
-    if observed.state_format() != saved.state_format() {
-        return Err(Status::failed_precondition(
-            "artifact state format differs from the sandbox's saved binding",
-        ));
-    }
-    if observed.components().len() != saved.components().len()
-        || !saved.components().iter().all(|expected| {
+    Ok(saved.clone())
+}
+
+fn matching_execution_components(
+    saved: &pplx_space_common_core::types::ExecutionMetadata,
+    observed: &pplx_space_common_core::types::ExecutionMetadata,
+) -> bool {
+    observed.components().len() == saved.components().len()
+        && saved.components().iter().all(|expected| {
             observed.components().iter().any(|actual| {
                 expected.kind == actual.kind
                     && expected.role == actual.role
@@ -983,12 +997,6 @@ fn bind_saved_execution(
                     }
             })
         })
-    {
-        return Err(Status::failed_precondition(
-            "artifact components differ from the sandbox's saved binding",
-        ));
-    }
-    Ok(observed.with_environment(reference))
 }
 
 pub(super) fn guest_console_logs_enabled() -> bool {

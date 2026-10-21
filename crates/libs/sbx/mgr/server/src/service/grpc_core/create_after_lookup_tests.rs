@@ -1,11 +1,8 @@
 //! Create's paths after template lookup, against a scripted template resolver
 //! and an in-process node-manager.
 //!
-//! A create that inserts a new sandbox row goes on to create the sandbox's
-//! cache root under the fixed host cache directory. Every service here
-//! refuses new sandbox rows with a SQLite trigger, so a create that reaches
-//! the insert stops there. The refusal carries the row create tried to
-//! write, which is what the cases that reach `create_with_id` assert on.
+//! Most cases fence the sandbox insert and inspect the attempted row. Successful
+//! logical creates instead use a test-owned cache root and assert durable state.
 
 use super::*;
 use crate::node_manager_transport::fake::{FakeNodeManager, ServedNodeManager};
@@ -803,6 +800,12 @@ async fn selected_create_persists_the_binding_used_by_first_start() {
         let execution = definition.execution_requirements().unwrap();
         let mut wire = pplx_space_execution_common::proto::ExecutionMetadata::from(&execution);
         wire.environment = None;
+        // The disk may have been built by an older consumer of the same
+        // kernel. The sandbox must keep the newly selected exact consumer.
+        if environment.kernel().version.as_str() == "6.1.155" {
+            wire.runtime.as_mut().unwrap().version = "1.15.1".into();
+            wire.state_format.as_mut().unwrap().version = "9.0.0".into();
+        }
         let legacy = pplx_space_common_core::types::ExecutionMetadata::try_from(&wire).unwrap();
         let build = TemplateBuild::new();
         let mut metadata: serde_json::Value =
@@ -890,7 +893,8 @@ async fn selected_create_persists_the_binding_used_by_first_start() {
         std::fs::write(build.dir.path().join("metadata.json"), &metadata_bytes).unwrap();
 
         // A retained rootfs and its matching legacy evidence also inherit the
-        // saved binding. No annotation may change runtime or kernel bytes.
+        // saved binding. Disk producer annotations cannot select a different
+        // consumer; conflicting guest or kernel inputs still fail.
         let sandbox_dir = cache.path().join(&created.sandbox_id);
         std::fs::create_dir_all(sandbox_dir.join("instance")).unwrap();
         std::fs::write(sandbox_dir.join("instance/rootfs.ext4"), b"test rootfs").unwrap();
@@ -899,6 +903,7 @@ async fn selected_create_persists_the_binding_used_by_first_start() {
             Matching,
             Alias,
             Runtime,
+            RuntimeKind,
             Kernel,
             Reference,
             Missing,
@@ -907,6 +912,7 @@ async fn selected_create_persists_the_binding_used_by_first_start() {
             Evidence::Matching,
             Evidence::Alias,
             Evidence::Runtime,
+            Evidence::RuntimeKind,
             Evidence::Kernel,
             Evidence::Reference,
             Evidence::Missing,
@@ -916,6 +922,10 @@ async fn selected_create_persists_the_binding_used_by_first_start() {
                 Evidence::Matching => {}
                 Evidence::Alias => wire.components[0].version = Some("legacy-kernel-label".into()),
                 Evidence::Runtime => wire.runtime.as_mut().unwrap().version = "1.16.0".into(),
+                Evidence::RuntimeKind => {
+                    wire.runtime.as_mut().unwrap().kind =
+                        pplx_space_execution_common::proto::RuntimeKind::CloudHypervisor as i32
+                }
                 Evidence::Kernel => {
                     wire.components[0].digest = Some(format!("sha256:{}", "00".repeat(32)))
                 }
@@ -945,7 +955,10 @@ async fn selected_create_persists_the_binding_used_by_first_start() {
                 cache.path(),
             )
             .await;
-            if matches!(evidence, Evidence::Matching | Evidence::Alias) {
+            if matches!(
+                evidence,
+                Evidence::Matching | Evidence::Alias | Evidence::Runtime | Evidence::Reference
+            ) {
                 let source = source.unwrap();
                 assert!(source.existing_artifact);
                 assert_eq!(source.execution.environment(), Some(definition.reference()));
@@ -968,4 +981,102 @@ async fn selected_create_persists_the_binding_used_by_first_start() {
             .await
             .unwrap();
     }
+}
+
+/// A revoked template source must reach compatible selection rather than first
+/// requiring exact permission for the revoked producer.
+#[tokio::test]
+async fn unpinned_create_selects_before_admitting_a_non_default_source() {
+    use pplx_space_common_core::types::{Arch, EnvironmentDescriptor, RuntimeBinding};
+    use pplx_space_execution_common::environment::EnvironmentDefinition;
+    use pplx_space_node_mgr_client::proto::{
+        ExecutionEnvironmentSelection, ResolveExecutionEnvironmentRequest,
+        ResolveExecutionEnvironmentResponse, resolve_execution_environment_request::Compatible,
+    };
+    if !enter_isolated_test_process() {
+        return;
+    }
+    let catalog =
+        pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(Arch::X86_64)
+            .unwrap();
+    let definition = |name| {
+        let mut spec = catalog
+            .iter()
+            .find(|entry| entry.name() == name)
+            .unwrap()
+            .definition()
+            .descriptor()
+            .spec()
+            .clone();
+        let arch = std::env::consts::ARCH.parse().unwrap();
+        spec.host.architecture = arch;
+        spec.guest.architecture = arch;
+        let RuntimeBinding::ManagedRelease(runtime) = &mut spec.runtime;
+        runtime.target.architecture = arch;
+        EnvironmentDefinition::new(EnvironmentDescriptor::try_from(spec).unwrap())
+    };
+    let source = definition("fc-1.17.0-linux-6.1.155")
+        .execution_requirements()
+        .unwrap();
+    let target = definition("e0");
+    let execution = target.execution_requirements().unwrap();
+    let build = TemplateBuild::new();
+    let mut metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(build.dir.path().join("metadata.json")).unwrap())
+            .unwrap();
+    metadata["schema_version"] = 3.into();
+    metadata["execution"] = serde_json::to_value(&source).unwrap();
+    std::fs::write(
+        build.dir.path().join("metadata.json"),
+        serde_json::to_vec(&metadata).unwrap(),
+    )
+    .unwrap();
+    let expected_consumer = execution.clone();
+    let node = FakeNodeManager::default().unary(
+        "ResolveExecutionEnvironment",
+        move |request: ResolveExecutionEnvironmentRequest| {
+            let Some(Compatible::ColdBootSource(observed)) = request.compatible else {
+                return Err(Status::failed_precondition("source environment revoked"));
+            };
+            assert_eq!(
+                pplx_space_common_core::types::ExecutionMetadata::try_from(&observed).unwrap(),
+                source
+            );
+            Ok(ResolveExecutionEnvironmentResponse {
+                accepted_selection: ExecutionEnvironmentSelection::ColdBoot as i32,
+                definition: Some((&target).into()),
+                execution: Some((&execution).into()),
+            })
+        },
+    );
+    let database = tempfile::tempdir().unwrap();
+    let db_path = database.path().join("sandbox.sqlite");
+    crate::db::create_test_schema_on_disk(&db_path);
+    let mut fixture = Fixture::new(
+        crate::db::Connection::open_at(&db_path).unwrap(),
+        build.resolver(BUILD),
+        node,
+    );
+    fixture
+        .service
+        .db_conn()
+        .unwrap()
+        .execute_batch("DROP TRIGGER create_after_lookup_insert_fence")
+        .unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    fixture.service.create_cache_dir = Some(cache.path().to_owned());
+    let mut request = create_request();
+    request.boot_mode = BootMode::Cold as i32;
+    let created = fixture.create(request).await.unwrap();
+    let reopened = crate::db::Connection::open_at(&db_path).unwrap();
+    let row = crate::db::get_sandbox(&reopened, &created.sandbox_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.execution_metadata, Some(expected_consumer));
+    assert_eq!(row.state, SandboxState::Created);
+    fixture.service.shutdown_token.cancel();
+    fixture.service.task_tracker.close();
+    tokio::time::timeout(CREATE_WAIT, fixture.service.task_tracker.wait())
+        .await
+        .unwrap();
 }

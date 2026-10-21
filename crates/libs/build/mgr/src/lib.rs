@@ -806,7 +806,7 @@ impl TemplateBuilder {
                 Some(build_rootfs_size_mib),
                 execution_binding
                     .as_ref()
-                    .and_then(|binding| binding.create_environment(self.environment.is_some())),
+                    .map(BuildExecutionBinding::create_environment),
                 &self.network_policy,
             );
             Ok::<String, BuildError>(

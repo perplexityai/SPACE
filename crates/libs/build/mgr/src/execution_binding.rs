@@ -2,9 +2,7 @@
 //! process environment variables and from downloadable artifact catalog entries.
 use std::path::Path;
 
-use pplx_space_common_core::types::{
-    Digest, EnvironmentReference, ExecutionMetadata, TemplateMetadata,
-};
+use pplx_space_common_core::types::{EnvironmentReference, ExecutionMetadata, TemplateMetadata};
 use pplx_space_execution_common::{
     ExecutionProtoError,
     environment::{EnvironmentBindingError, EnvironmentDecodeError, EnvironmentDefinition},
@@ -12,15 +10,6 @@ use pplx_space_execution_common::{
 use pplx_space_node_mgr_client::proto::{
     ResolveExecutionEnvironmentRequest, ResolveExecutionEnvironmentResponse,
 };
-
-// The legacy Create protocol implies the immutable stock E0 binding. This is
-// compatibility evidence, not an approval or selection of another environment.
-const LEGACY_CREATE_ENVIRONMENT: EnvironmentReference =
-    EnvironmentReference::new(Digest::sha256([
-        0x31, 0x68, 0xc9, 0x6b, 0x57, 0x19, 0xce, 0x62, 0x54, 0x3a, 0xe5, 0x3e, 0x66, 0x41, 0xa4,
-        0xeb, 0x80, 0x41, 0x6a, 0x9f, 0x01, 0xe5, 0x58, 0x5f, 0x6f, 0x76, 0xc3, 0xc7, 0x01, 0x11,
-        0xfa, 0x0b,
-    ]));
 
 #[derive(Debug, thiserror::Error)]
 pub enum BuildExecutionBindingError {
@@ -42,6 +31,14 @@ pub enum BuildExecutionBindingError {
     Binding(#[from] EnvironmentBindingError),
     #[error("environment resolver returned a different requested binding")]
     Reference,
+    #[error("compatible environment resolution: {0}")]
+    Selection(#[from] pplx_space_node_mgr_client::environment_selection::SelectionResponseError),
+    #[error("scratch build requires Firecracker/Linux/{architecture}, got {runtime:?}/{guest:?}")]
+    ScratchRequirements {
+        architecture: pplx_space_common_core::types::Arch,
+        runtime: pplx_space_common_core::types::RuntimeKind,
+        guest: pplx_space_common_core::types::GuestPlatform,
+    },
     #[error("recipe kernel pin differs from the resolved environment")]
     KernelPin,
     #[error("cannot read template metadata {path}: {source}")]
@@ -67,25 +64,27 @@ impl BuildExecutionBinding {
         self.definition.reference()
     }
 
-    /// Ordinary inherited E0 work remains compatible during reader rollout.
-    /// Every explicit request or other complete binding requires acknowledgement.
-    pub(super) fn create_environment(&self, explicit: bool) -> Option<EnvironmentReference> {
-        (explicit || self.reference() != LEGACY_CREATE_ENVIRONMENT).then(|| self.reference())
+    /// Freeze even E0 before Create; inventory changes must not cause a second
+    /// selection between builder resolution and the sandbox's persisted intent.
+    pub(super) fn create_environment(&self) -> EnvironmentReference {
+        self.reference()
     }
 
-    /// Legacy bases keep their execution contract. Requested and inherited
-    /// references use verified node resolution; wire compatibility for implicit
-    /// E0 remains a separate decision.
     pub(super) async fn for_base(
         reference: Option<EnvironmentReference>,
         execution: &ExecutionMetadata,
     ) -> Result<Option<Self>, BuildExecutionBindingError> {
-        // An explicit request takes precedence, but must match the base evidence.
-        let Some(reference) = reference.or(execution.environment()) else {
+        if let Some(reference) = reference {
+            let binding = Self::resolve(Some(reference)).await?;
+            binding.definition.check_cold_boot_source(execution)?;
+            return Ok(Some(binding));
+        }
+        let Some(reference) = execution.environment() else {
             return Ok(None);
         };
-        let binding = Self::resolve(Some(reference)).await?;
-        binding.bind(execution.clone())?;
+        let request = pplx_space_node_mgr_client::proto::resolve_execution_environment_request::Compatible::ColdBootSource(execution.into());
+        let binding = Self::resolve_compatible(request, reference).await?;
+        binding.definition.check_cold_boot_source(execution)?;
         Ok(Some(binding))
     }
 
@@ -101,7 +100,68 @@ impl BuildExecutionBinding {
         {
             return Ok(None);
         }
-        Self::resolve(reference).await.map(Some)
+        let binding = Self::resolve(reference).await?;
+        binding.check_scratch_requirements(architecture)?;
+        Ok(Some(binding))
+    }
+
+    fn check_scratch_requirements(
+        &self,
+        architecture: pplx_space_common_core::types::Arch,
+    ) -> Result<(), BuildExecutionBindingError> {
+        use pplx_space_common_core::types::{GuestOperatingSystem, GuestPlatform, RuntimeKind};
+        let guest = GuestPlatform {
+            os: GuestOperatingSystem::Linux,
+            architecture,
+        };
+        if self.execution.runtime().kind != RuntimeKind::Firecracker
+            || self.execution.guest() != guest
+        {
+            return Err(BuildExecutionBindingError::ScratchRequirements {
+                architecture,
+                runtime: self.execution.runtime().kind,
+                guest: self.execution.guest(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Resolution, including an old-peer exact fallback, shares one deadline.
+    async fn resolve_compatible(
+        request: pplx_space_node_mgr_client::proto::resolve_execution_environment_request::Compatible,
+        fallback_reference: EnvironmentReference,
+    ) -> Result<Self, BuildExecutionBindingError> {
+        use pplx_space_node_mgr_client::environment_selection::{SelectionResponseError, decode};
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let mut node = pplx_space_node_mgr_client::connect().await?;
+            let response = node
+                .resolve_execution_environment(ResolveExecutionEnvironmentRequest {
+                    reference: None,
+                    compatible: Some(request.clone()),
+                })
+                .await?
+                .into_inner();
+            match decode(&request, response) {
+                Ok(selected) => Ok(Self {
+                    definition: selected.definition,
+                    execution: selected.execution,
+                }),
+                Err(SelectionResponseError::Unsupported) => {
+                    // Mixed rollout retains the pre-existing exact source,
+                    // never an unacknowledged upgrade.
+                    let response = node
+                        .resolve_execution_environment(ResolveExecutionEnvironmentRequest {
+                            reference: Some(fallback_reference.to_string()),
+                            compatible: None,
+                        })
+                        .await?
+                        .into_inner();
+                    Self::from_response(Some(fallback_reference), response)
+                }
+                Err(error) => Err(error.into()),
+            }
+        })
+        .await?
     }
 
     /// Resolve within 30 seconds, including connection setup.

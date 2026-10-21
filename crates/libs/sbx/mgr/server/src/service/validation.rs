@@ -309,17 +309,24 @@ pub(super) fn validate_environment_create(
 pub(super) fn validate_environment_create_fields(
     request: &crate::proto::CreateRequest,
 ) -> Result<(), Status> {
-    if request.sandbox_id.is_some()
-        || request.route_identity.is_some()
-        || request.pool_template.is_some()
-        || request.snapshots_enabled
-        || request.boot_mode != crate::proto::BootMode::Cold as i32
-    {
+    if !allows_node_local_environment_selection(request) {
         return Err(Status::failed_precondition(
             "selected environments require node-local cold creation without pools, snapshots, or cluster-owned identity",
         ));
     }
     Ok(())
+}
+
+/// Node-local cold creation can select before its first persisted execution.
+/// Cluster-directed work and pools retain their placement-bound identities.
+pub(super) fn allows_node_local_environment_selection(
+    request: &crate::proto::CreateRequest,
+) -> bool {
+    request.sandbox_id.is_none()
+        && request.route_identity.is_none()
+        && request.pool_template.is_none()
+        && !request.snapshots_enabled
+        && request.boot_mode == crate::proto::BootMode::Cold as i32
 }
 
 /// Decode the additive input before normal admission. Both legacy inputs must

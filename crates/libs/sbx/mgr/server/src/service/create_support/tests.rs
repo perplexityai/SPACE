@@ -742,3 +742,35 @@ async fn retained_instance_permission_recovery_and_repair_preserve_disk() {
         }
     }
 }
+
+#[test]
+fn template_provenance_does_not_overwrite_a_selected_cold_boot_consumer() {
+    use pplx_space_common_core::types::Arch;
+    use pplx_space_node_runtime_core::catalog::CompiledEnvironment;
+    let catalog = CompiledEnvironment::for_architecture(Arch::X86_64).unwrap();
+    let source = catalog[0].definition().execution_requirements().unwrap();
+    let selected = catalog
+        .iter()
+        .find(|entry| {
+            entry.release().release.version.as_str() == "1.17.0"
+                && entry.kernel().version.as_str() == "6.1.155"
+        })
+        .unwrap()
+        .definition()
+        .execution_requirements()
+        .unwrap();
+    assert_ne!(source.runtime(), selected.runtime());
+    assert_eq!(
+        bind_disk_execution(Some(&selected), source.clone()).unwrap(),
+        selected
+    );
+    let other_kernel = catalog
+        .iter()
+        .find(|entry| entry.kernel().version.as_str() == "6.18.44")
+        .unwrap()
+        .definition()
+        .execution_requirements()
+        .unwrap();
+    bind_disk_execution(Some(&selected), other_kernel).unwrap_err();
+    assert_eq!(bind_disk_execution(None, source.clone()).unwrap(), source);
+}
