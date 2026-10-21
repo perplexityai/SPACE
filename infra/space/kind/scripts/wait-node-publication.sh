@@ -9,15 +9,16 @@
 # network pool) is ready. This polls the admin node list
 # (`GET /admin/api/v1/nodes`) as the local root account until every Kubernetes
 # node in the sandbox and builder pools appears there with its role, a
-# reachable status observed within the last five node-ctl poll ticks, and
-# scheduling status `ready`.
+# reachable status observed within the last five minutes, and scheduling
+# status `ready`.
 #
 # The status's `stale` flag is not the test: it flips 30 s after each publish
-# (NODE_STATUS_STALE_AFTER_SECS) while node-ctl publishes on a 60 s tick, so a
-# healthy idle node reads stale about half the time, and four nodes on
-# different phases may never all read fresh at once. Freshness here is the
-# window the API itself trusts a node's census for (CENSUS_INVENTORY_MAX_AGE,
-# five ticks, crates/libs/common/svc/src/sql/sandbox_residency.rs).
+# (NODE_STATUS_STALE_AFTER_SECS) while node-ctl publishes on its poll, 60 s by
+# default and unset by the Kind chart, so a healthy idle node reads stale about
+# half the time, and four nodes on different phases may never all read fresh
+# at once. Freshness here is the window the API itself trusts a node's census
+# for (CENSUS_INVENTORY_MAX_AGE, five minutes, which is five default polls;
+# crates/libs/common/svc/src/sql/sandbox_residency.rs).
 #
 # Usage:
 #   bash infra/space/kind/scripts/wait-node-publication.sh [timeout-seconds]

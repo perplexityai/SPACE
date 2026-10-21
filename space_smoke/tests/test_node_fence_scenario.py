@@ -230,6 +230,9 @@ class _Control:
     def node_ctl_log_tail(self, pod, lines):
         return ["denied"]
 
+    def publish_node_ctl_facet(self, node, facet):
+        self.calls.append(f"publish:{node}:{facet}")
+
     # the fake node-ctl: writes back after N polls of node_label/node_capacity
     def tick(self) -> None:
         self._polls += 1
@@ -469,6 +472,10 @@ class Convergence(unittest.TestCase):
         self.assertEqual(set(seen), {"label", "slots"})
         self.assertIn(f"admin-label:{OWN}:{OWNED_LABEL}=None", control.calls)
         self.assertIn(f"strip:{OWN}:{SLOTS_RESOURCE}", control.calls)
+        # The reconcile is requested from this node's node-ctl, after both strips.
+        request = f"publish:{OWN}:template-inventory"
+        self.assertIn(request, control.calls)
+        self.assertLess(control.calls.index(f"strip:{OWN}:{SLOTS_RESOURCE}"), control.calls.index(request))
 
     def test_a_stalled_node_ctl_fails_with_its_log_tail_and_the_slots_repair_restores(self) -> None:
         control = _Control()

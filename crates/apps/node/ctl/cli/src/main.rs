@@ -7,9 +7,9 @@ use pplx_space_common_core::types::{SimpleDurationParseError, parse_simple_durat
 use pplx_space_node_api_client::proto::node_ctl_client::NodeCtlClient;
 use pplx_space_node_api_client::proto::{
     FacetControllerState, FacetDirection, FacetQueueItem, FacetRef, FacetSyncOverride,
-    GetControllerStateRequest, GetControllerStateResponse, NetworkPolicyTargetRef, ReconcileFacet,
-    ReconciliationStatus, RefreshFacetStateRequest, SetFacetSyncDisabledRequest, facet_ref,
-    network_policy_target_ref,
+    GetControllerStateRequest, GetControllerStateResponse, MarkFacetDirtyRequest,
+    NetworkPolicyTargetRef, ReconcileFacet, ReconciliationStatus, RefreshFacetStateRequest,
+    SetFacetSyncDisabledRequest, facet_ref, network_policy_target_ref,
 };
 use serde::Serialize;
 use tonic::transport::Channel;
@@ -122,6 +122,16 @@ enum FacetCommand {
     /// Reconcile inbound state now.
     Reconcile {
         facet: Option<String>,
+
+        #[arg(long)]
+        element: Vec<String>,
+    },
+    /// Publish outbound state now instead of on the next poll. Without
+    /// --element the whole facet is published: a full sandbox-inventory
+    /// census, or template-inventory with the node's Kubernetes object
+    /// reconciles that ride it.
+    Publish {
+        facet: String,
 
         #[arg(long)]
         element: Vec<String>,
@@ -288,6 +298,10 @@ async fn handle_facet_command(
             reconcile_facet(client, facet, element).await?;
             println!("facet reconciliation enqueued");
         }
+        FacetCommand::Publish { facet, element } => {
+            publish_facet(client, facet, element).await?;
+            println!("facet publication enqueued");
+        }
     }
     Ok(())
 }
@@ -411,6 +425,36 @@ async fn reconcile_facet(
     };
     client
         .refresh_facet_state(RefreshFacetStateRequest { refs })
+        .await?;
+    Ok(())
+}
+
+/// Mark `facet` (or the named elements of it) dirty, so node control's
+/// outbound sync publishes it now. Refused for a facet node control does not
+/// publish: its dirty row would never be claimed.
+async fn publish_facet(
+    client: &mut NodeCtlClient<Channel>,
+    facet: String,
+    elements: Vec<String>,
+) -> Result<()> {
+    let state = get_controller_state(client, Some(facet.clone()), false).await?;
+    if !state
+        .facets
+        .iter()
+        .any(|known| known.facet == facet && known.supports_outbound)
+    {
+        anyhow::bail!("facet {facet:?} has no outbound publication");
+    }
+    let refs = if elements.is_empty() {
+        vec![facet_ref_from_args(&facet, None)?]
+    } else {
+        elements
+            .into_iter()
+            .map(|element| facet_ref_from_args(&facet, Some(element)))
+            .collect::<Result<Vec<_>>>()?
+    };
+    client
+        .mark_facet_dirty(MarkFacetDirtyRequest { refs })
         .await?;
     Ok(())
 }

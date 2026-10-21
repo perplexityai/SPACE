@@ -1,0 +1,17 @@
+# Kind bench values: Tilt and infra/space/kind/scripts/bootstrap.sh pass this
+# file after values.yaml. The caller-provided-cluster chart
+# (infra/space/cluster/chart) does not, so nothing here reaches a real
+# cluster's install. Only values that are not test hooks belong here: a test
+# hook is inert in a release binary, these are not.
+
+k8s:
+  # SPACE_CREATE_DATA_PLANE_READY_TIMEOUT_SECS, 120 s by default. A restore the
+  # node cannot complete fails its pod sandbox with a retryable `Unavailable`
+  # and the kubelet retries it, so the pod reports no terminal state the API
+  # could stop on and the create or wake waits the whole timeout. That is what
+  # local.btrfs_send_restore_rejects_corrupted_stream and
+  # local.btrfs_send_restore_fails_closed_without_parent_source wait for. On
+  # Kind CI the slowest healthy waits are a few seconds: creates finish in
+  # under 3 s and the slowest restore, a cold one that first pulls its parent
+  # template, in about 4 s, so 45 s keeps a margin of ten times that.
+  createDataPlaneReadyTimeoutSecs: "45"

@@ -550,8 +550,8 @@ local_resource(
 
 # ── Helm releases (in dependency order) ───────────────────────────────────
 
-def helm_release(name, chart):
-    return helm(chart, name = name, namespace = NAMESPACE, set = CHART_SET)
+def helm_release(name, chart, values = []):
+    return helm(chart, name = name, namespace = NAMESPACE, values = values, set = CHART_SET)
 
 # Both entry points use a fresh, shared render for backend transitions.
 # Fake mode never consumes SaaS credentials; SaaS uses an existing Secret only.
@@ -589,7 +589,10 @@ SPACE_API_DEPS = ["space-postgres", "label-kind-workers", "label-kind-infra",
 # No port_forward: localhost:8080 is the cluster's host port mapping onto the
 # space-api-entry NodePort (kind-cluster.yaml.tmpl), which spreads connections
 # across the autoscaled replicas as a deployment's load balancer does.
-k8s_yaml(helm_release("space", "infra/space/kind/charts/space-api-local"))
+# values-kind.yaml carries the bench's non-test-hook overrides, which the
+# caller-provided-cluster chart must not inherit; bootstrap.sh passes it too.
+k8s_yaml(helm_release("space", "infra/space/kind/charts/space-api-local",
+                      values = ["infra/space/kind/charts/space-api-local/values-kind.yaml"]))
 k8s_resource(
     "space-api",
     labels = ["control-plane"],

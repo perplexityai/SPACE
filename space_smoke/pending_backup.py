@@ -21,9 +21,13 @@ to zero for the suspend with its scale-back armed first. The restore does not
 finalize the upload at once: the transfer climbs the shared job worker's retry
 ladder (5, 30, 120, 300 s) and can wait out a full 300 s before it uploads, so
 the drain budget is 600 s and the downtime is kept short so the fifth attempt
-never runs with the store still down. Scaling the object store to zero stops every
-suspend upload on the stack, so this must not run concurrently with another
-suspend-bearing smoke.
+never runs with the store still down. The census is asked for, not waited
+for: once the snapshot is in flight the sandbox's node-ctl publishes its
+sandbox inventory on demand (`space-nodectl facet publish`), the same Full
+census its 60 s poll would send, so the store is back within the transfer's
+first retries rather than after a minute of them. Scaling the object store to
+zero stops every suspend upload on the stack, so this must not run concurrently
+with another suspend-bearing smoke.
 """
 
 from __future__ import annotations
@@ -49,6 +53,7 @@ class PendingBackupAssertions:
         self._since: str | None = None
         self._artifact: PendingBackupRow | None = None
         self._operation_id: str | None = None
+        self._node_name: str | None = None
 
     def block_uploads(self, *, timeout: float = 120) -> None:
         """Scale the object store to zero; the scale-back is armed before the write."""
@@ -75,6 +80,17 @@ class PendingBackupAssertions:
         operation is checked at the end, after uploads are restored.
         """
 
+        # The worker whose node-ctl will publish the census; read while the
+        # sandbox still has its running pod.
+        placement = self._control.sandbox_pod_placement(self._fixture.sandbox.sandbox_id)
+        self._fixture.verify(
+            placement is not None,
+            "the sandbox has no bound pod to read its worker from before the suspend",
+            sandbox_id=self._fixture.sandbox.sandbox_id,
+        )
+        assert placement is not None
+        self._node_name = placement.node_name
+        self._fixture.record("census_node", placement.node_name)
         self._operation_id = self._control.suspend_without_waiting(self._fixture.sandbox.sandbox_id)
         self._fixture.record("suspend_operation_id", self._operation_id)
         return self._operation_id
@@ -96,15 +112,27 @@ class PendingBackupAssertions:
             )
             self._fixture.wait(3)
 
-    def expect_queue_names_this_sandbox(self, *, timeout: float = 240) -> PendingBackupRow:
+    def expect_queue_names_this_sandbox(
+        self, *, timeout: float = 240, republish_seconds: float = 10
+    ) -> PendingBackupRow:
         """A Full census carried the pinned artifact and internal-api mirrored it into the queue.
 
-        The queue is the census's only writer, so its row is the outcome.
+        The queue is the census's only writer, so its row is the outcome. The
+        census is requested from the sandbox's node-ctl, again every
+        `republish_seconds` while the row is missing; its own poll still sends
+        one as well.
         """
 
+        node_name = self._node_name
+        if node_name is None:
+            raise RuntimeError("suspend_async() must run first")
         sandbox_id = self._fixture.sandbox.sandbox_id
         deadline = time.monotonic() + timeout
+        published_at = None
         while True:
+            if published_at is None or time.monotonic() - published_at >= republish_seconds:
+                self._control.publish_node_ctl_facet(node_name, "sandbox-inventory")
+                published_at = time.monotonic()
             rows = self._control.pending_backup_queue(sandbox_id)
             if rows:
                 self._fixture.verify(
@@ -125,9 +153,9 @@ class PendingBackupAssertions:
                     ][-6:]
                 },
             )
-            # Short against the census interval: the store comes back only
-            # once the row is seen, and the transfer's next retry, about 35 s
-            # after its first attempt, uploads only if it already has.
+            # The store comes back only once the row is seen, and each of the
+            # transfer's retries (5 s, then 30 s later) uploads only if it
+            # already has.
             self._fixture.wait(2)
         return self._artifact
 

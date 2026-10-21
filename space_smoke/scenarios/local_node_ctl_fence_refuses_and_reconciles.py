@@ -3,12 +3,11 @@
 import space_smoke as smoke
 
 
-# Every phase but one takes under a second: the two convergence canaries ride
-# node-ctl's facet poll (60 s deployed, 20 s in the kind chart) and run
-# concurrently, so that poll is the stated reason for the time; the 180 s
-# budget is a ceiling for a stalled run. Node writes are serialized with the
-# drain scenario through the worker cordon lease; the boundary label is live
-# on the worker for one probe.
+# Every phase but one takes under a second: the two convergence canaries run
+# concurrently, and node-ctl is asked to run the reconciles that write them
+# rather than the run waiting out its 60 s facet poll (budget 180 s = three
+# poll periods). Node writes are serialized with the drain scenario through the
+# worker cordon lease; the boundary label is live on the worker for one probe.
 @smoke.scenario(
     "local.node_ctl_fence_refuses_and_reconciles",
     sandbox=smoke.SandboxConfig(timeout=900),

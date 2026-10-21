@@ -51,10 +51,11 @@ pub(super) enum ClusterDeletedEvictDisposition {
 /// for refusals with no horizon. Everything else is a failure.
 ///
 /// The slack added to a horizon is `sync_interval`, node-ctl's configured
-/// poll, so the retry lands on a sync *after* the horizon passes rather than
-/// racing it, and on the first such sync rather than a fixed minute later: a
-/// node polling every 20 s retries a refused eviction about 20 s after the
-/// window ends, not 60 s.
+/// poll, so the retry waits for the window's end plus one poll: it lands on
+/// the first sync after that, normally the second sync after the window ends,
+/// never on one racing the end itself. Sized to the configured poll rather
+/// than the 60 s default, so a node polling every 20 s retries a refused
+/// eviction 20-40 s after the window ends instead of 60-80 s.
 pub(super) fn cluster_deleted_evict_refusal_disposition(
     status: &tonic::Status,
     sync_interval: std::time::Duration,

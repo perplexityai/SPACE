@@ -630,6 +630,12 @@ class PendingBackupControl(Protocol):
 
     def artifact_backed(self, sandbox_id: str, local_artifact_id: str) -> bool: ...
 
+    def sandbox_pod_placement(self, sandbox_id: str) -> SandboxPodPlacement | None: ...
+
+    def publish_node_ctl_facet(self, node_name: str, facet: str) -> None:
+        """Have that node's node-ctl publish `facet` now instead of on its next poll."""
+        ...
+
 
 @dataclass(frozen=True)
 class ReconcileQueueRef:
@@ -1012,6 +1018,10 @@ class NodeFenceControl(Protocol):
 
     def node_capacity(self, node_name: str, resource: str) -> str | None:
         """`status.capacity[resource]`, None when absent or unreadable."""
+        ...
+
+    def publish_node_ctl_facet(self, node_name: str, facet: str) -> None:
+        """Have that node's node-ctl publish `facet` now instead of on its next poll."""
         ...
 
     def patch_node_as(
@@ -1909,6 +1919,10 @@ class SuspendCodecControl(CrossNodeRestoreControl, Protocol):
 
     def sandbox_canonical_snapshot_entries(self, node_name: str, sandbox_id: str) -> tuple[str, ...]:
         """Entries of the sandbox's canonical suspend snapshot directory on `node_name`."""
+        ...
+
+    def metric_export_interval_seconds(self, node_name: str, component: str) -> float:
+        """The OTLP metric export interval `component`'s pod on `node_name` runs with."""
         ...
 
     def transfer_jobs(self, node_name: str, sandbox_id: str) -> list[TransferJobView]:

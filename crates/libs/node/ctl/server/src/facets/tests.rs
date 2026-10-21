@@ -331,9 +331,9 @@ fn cluster_deleted_evict_quiescence_refusal_defers_to_the_window_end_not_the_fla
 
 #[test]
 fn cluster_deleted_evict_quiescence_slack_is_one_configured_sync() {
-    // A node polling faster than the default retries one of its own syncs
-    // after the window ends, not a default-sized minute later: with a 20 s
-    // poll and a 10 s window, 30 s rather than 70 s.
+    // The deferral is the window's end plus one configured poll, not a
+    // default-sized minute: with a 20 s poll and a 10 s window, 30 s rather
+    // than 70 s.
     let refusal = pplx_space_common_grpc::with_retry_after(
         tonic::Status::failed_precondition("inside the 10s quiescence window"),
         Duration::from_secs(10),

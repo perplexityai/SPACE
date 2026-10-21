@@ -29,8 +29,10 @@ Two halves, and the second is the one that would fail silently:
    patch clearing a `template-write` annotation, the `nodes/status` capacity
    apply — and then a label and the slot capacity node-ctl owns are stripped
    and the *running binary* has to write both back through its own credential.
-   The two canaries run concurrently: node-ctl rides its facet poll, so each
-   is up to a poll plus slack, and serially they were the bulk of the shell run.
+   The two canaries run concurrently, and node-ctl is asked to run the
+   reconciles that write them (`space-nodectl facet publish
+   template-inventory`) instead of the run waiting out its 60 s poll; the
+   poll still repairs them if the request is lost.
 
 Residue: every field a probe can touch is snapshotted before the probes and
 reverted on every exit path, keyed on markers the run plants (a forged
@@ -95,12 +97,16 @@ RULE_CAPACITY = "may only advertise its own extended resource"
 RULE_STATUS_FROZEN = "may not write a Node's status outside its own extended resource"
 RULE_TEMPLATE_WRITE = "may only clear a template-write annotation"
 
-# node-ctl's facet poll is 60 s by default (`DEFAULT_POLL_INTERVAL_SECS`); the
-# kind chart sets 20 s (`pollIntervalSecs`). Three default periods are a
-# ceiling for a stalled run, not an expected duration: convergence takes up to
-# one poll.
+# node-ctl's facet poll is 60 s (`DEFAULT_POLL_INTERVAL_SECS`); the kind chart
+# sets none. Three periods of slack is a ceiling for a stalled run, not an
+# expected duration: requested, convergence takes a few seconds.
 RECONCILE_BUDGET_SECONDS = 180.0
 RECONCILE_POLL_SECONDS = 2.0
+# How often the reconcile is requested again while either canary is missing.
+RECONCILE_REQUEST_SECONDS = 10.0
+# The facet whose publication runs node-ctl's Kubernetes Node reconciles (the
+# SSD placement labels and the network-slot capacity among them).
+NODE_RECONCILE_FACET = "template-inventory"
 
 
 @dataclass(frozen=True)
@@ -530,8 +536,10 @@ class NodeFenceAssertions:
     def expect_node_ctl_reconciles(self, *, budget: float = RECONCILE_BUDGET_SECONDS) -> dict[str, float]:
         """Strip an owned label and the slot capacity; the running node-ctl writes both back through its own credential.
 
-        Concurrent, not serial: both ride node-ctl's facet poll, and waiting
-        them out one after the other was the bulk of the shell run.
+        Concurrent, not serial, and requested: node-ctl's Node reconciles ride
+        its template-inventory publication, which the run asks for after the
+        strip and again every `RECONCILE_REQUEST_SECONDS` until both are back,
+        rather than waiting out the 60 s poll that would also run them.
         """
 
         own = self._require_identity().node_name
@@ -543,7 +551,11 @@ class NodeFenceAssertions:
         started = time.monotonic()
         deadline = started + budget
         seen: dict[str, float] = {}
+        requested_at: float | None = None
         while len(seen) < 2:
+            if requested_at is None or time.monotonic() - requested_at >= RECONCILE_REQUEST_SECONDS:
+                self._control.publish_node_ctl_facet(own, NODE_RECONCILE_FACET)
+                requested_at = time.monotonic()
             self._fixture.wait(RECONCILE_POLL_SECONDS)
             if "label" not in seen and self._control.node_label(own, OWNED_LABEL):
                 seen["label"] = round(time.monotonic() - started, 1)

@@ -37,20 +37,14 @@ rootfsBackingPolicy: ""
 # active-sandbox set and warm-pool releases are never evicted, so the only
 # builds this reclaims on a worker are ones nothing references — e.g. an ECW
 # template build whose last sandbox was deleted more than `gcGraceSecs` ago,
-# which a later create re-pulls through the normal path. Grace is 20 s, below
-# the binary's 60 s safety floor, so the daemon logs its floor warning at
-# startup. The floor exists because grace is the only guard for the
-# create-vs-GC race: a build `GetTemplate` just handed out, or one a pull just
-# landed, must outlive the moment sandbox-manager's row for it becomes visible
-# to `List()`. On a bench that gap is the rest of one create, a few seconds, and
-# the loop only reclaims while the worker is over budget, which on a bench is
-# `local.template_cache_lru_eviction_reclaims`'s own plant; scenarios run
-# serially within a shard, so no other create races it there. A deployment
-# keeps the 1800 s release default (`eviction.rs`).
+# which a later create re-pulls through the normal path. Grace sits exactly at
+# the binary's 60 s safety floor (below it the daemon warns at startup); the
+# floor exists because grace is the only guard for the create-vs-GC race, and
+# 60 s is already wide for a bench.
 #
 # WORKERS ONLY. values-builder.yaml sets this to null: build-manager registers
 # a build and then publishes it by reading the digest dir template-manager
-# just created, and a fresh build is unpinned and unreferenced — a short grace
+# just created, and a fresh build is unpinned and unreferenced — a 60 s grace
 # could delete it under the upload. Builder cleanup needs a grace period long
 # enough for publication, or an explicit prune after publishing.
 #
@@ -59,7 +53,7 @@ rootfsBackingPolicy: ""
 templateCache:
   budgetBytes: "1610612736"
   gcIntervalSecs: "15"
-  gcGraceSecs: "20"
+  gcGraceSecs: "60"
   prefetchLatestN: "1"
 
 # template-manager drains for 25 s, then exits while holding its service mutex

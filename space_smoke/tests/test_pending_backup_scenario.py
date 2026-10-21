@@ -85,6 +85,12 @@ class _Control:
     def operation_state(self, operation_id: str) -> str:
         return self.op_state
 
+    def sandbox_pod_placement(self, sandbox_id: str):
+        return SimpleNamespace(node_name="worker-a")
+
+    def publish_node_ctl_facet(self, node_name: str, facet: str) -> None:
+        self.calls.append(f"publish:{node_name}:{facet}")
+
 
 def _assertions(control: _Control):
     fixture = _Fixture()
@@ -103,6 +109,7 @@ class Verdicts(unittest.TestCase):
     def test_an_empty_queue_with_an_unbacked_artifact_still_fails(self) -> None:
         control = _Control()
         _, census, _ = _assertions(control)
+        census.suspend_async()
         census.expect_queue_names_this_sandbox(timeout=60)
         control.queue = []
         control.backed = False
@@ -125,7 +132,33 @@ class Verdicts(unittest.TestCase):
         control = _Control()
         control.queue = [PendingBackupRow("a", "full"), PendingBackupRow("b", "disk")]
         _, census, _ = _assertions(control)
+        census.suspend_async()
         with self.assertRaisesRegex(InvariantViolation, "more than once"):
+            census.expect_queue_names_this_sandbox(timeout=60)
+
+    def test_the_census_is_requested_from_the_sandboxs_worker_until_the_row_appears(self) -> None:
+        control = _Control()
+        control.queue = []
+        _, census, _ = _assertions(control)
+        census.suspend_async()
+        reads = 0
+
+        def queue(_sandbox_id: str):
+            nonlocal reads
+            reads += 1
+            return [PendingBackupRow("art-1", "full")] if reads >= 3 else []
+
+        control.pending_backup_queue = queue  # type: ignore[method-assign]
+        census.expect_queue_names_this_sandbox(timeout=60, republish_seconds=0)
+        self.assertEqual(
+            [call for call in control.calls if call.startswith("publish:")],
+            ["publish:worker-a:sandbox-inventory"] * 3,
+        )
+        self.assertLess(control.calls.index("suspend"), control.calls.index("publish:worker-a:sandbox-inventory"))
+
+    def test_the_queue_wait_needs_the_suspend_to_have_recorded_the_worker(self) -> None:
+        _, census, _ = _assertions(_Control())
+        with self.assertRaisesRegex(RuntimeError, "suspend_async"):
             census.expect_queue_names_this_sandbox(timeout=60)
 
 

@@ -12,20 +12,6 @@ clusterId: kind-local
 telemetry: {}
 node: {}
 
-# Reconciliation poll (`--poll-interval-secs`). The deployed space-node-ctl
-# chart and the binary default are 60 s (`DEFAULT_POLL_INTERVAL_SECS`,
-# crates/libs/node/ctl/server/src/lib.rs); Kind runs it every 20 s, so the
-# scenarios that wait on a timer-driven census or reconcile wait a third as
-# long. The poll's lower bound is the pending-backup census budget: it must
-# stay a tenth of the interval or less
-# (`the_budget_stays_a_small_share_of_the_census_interval`), and 20 s is that
-# floor. No control-plane threshold assumes the 60 s cadence: a status reads
-# stale 30 s after a publish (`NODE_STATUS_STALE_AFTER_SECS`) and a census is
-# trusted for five minutes (`CENSUS_INVENTORY_MAX_AGE`), so a faster poll only
-# keeps both fresher. A cluster-deleted eviction that sbx-manager refuses
-# inside its quiescence window is retried one poll after the window ends.
-pollIntervalSecs: 20
-
 # node-ctl waits up to 25 s for its worker on SIGTERM, then exits holding its
 # service mutex if it overran (crates/libs/node/ctl/server/src/lib.rs); the
 # shared lifecycle default grace (crates/libs/common/svc/src/lifecycle.rs).

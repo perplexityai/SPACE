@@ -46,7 +46,6 @@ spec:
           command:
             - /opt/space/bin/space-nodectl-svc
             - --health-socket={{ include "space-node-service.healthSocket" $ctx }}
-            - --poll-interval-secs={{ .Values.pollIntervalSecs | int }}
           {{- include "space-node-service.restrictedContainer" . | nindent 10 }}
           env:
             {{- include "space-node-service.env.identity" . | nindent 12 }}

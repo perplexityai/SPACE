@@ -114,6 +114,11 @@ The render fails, listing every gap, unless the file supplies:
   reconcile-queue GC (`SPACE_RECONCILE_QUEUE_GC_ENABLED`), which Kind runs
   against that fake, stays off as it ships.
 
+The Kind bring-up also passes `space-api-local`'s `values-kind.yaml`, which
+holds bench-only settings that are not test hooks, such as a 45 s
+`SPACE_CREATE_DATA_PLANE_READY_TIMEOUT_SECS`. This chart does not read that
+file, so those settings keep their binary defaults here.
+
 Telemetry follows `global.observability` through the space-kind-telemetry
 helper. A chart's `telemetry.traceExporter: "off"` still vetoes its traces,
 which is how build-manager keeps them off. Producers get no identity from the

@@ -438,7 +438,10 @@ done
 # api-server. The main container is gated on /readyz, which only turns 200
 # after the K8s pod reflector's initial LIST completes (empty list is fine at
 # this stage — no node-api pods yet).
-helm_apply space "$KIND_DIR/charts/space-api-local"
+# values-kind.yaml: the bench's non-test-hook overrides, kept out of the chart
+# defaults the caller-provided-cluster chart inherits; the Tiltfile passes it too.
+helm_apply space "$KIND_DIR/charts/space-api-local" \
+  -f "$KIND_DIR/charts/space-api-local/values-kind.yaml"
 log "waiting for space-api Deployment to be ready"
 kubectl --context "$KCTX" -n "$NAMESPACE" rollout status deploy/space-api --timeout="${TIMEOUT}s"
 

@@ -89,6 +89,8 @@ from space_smoke.capabilities import (
 )
 from space_smoke.adapters import (
     BTRFS_SEND_V1,
+    NODE_MANAGER,
+    NODE_TEMPLATE_MANAGER,
     RESTORE_STORAGE_URI_ANNOTATION,
     SUSPEND_ROOTFS_OBJECTS,
     template_received_uuid,
@@ -3400,12 +3402,21 @@ class TemplateCacheAssertions:
 # crates/libs/template/mgr/src/volume.rs).
 TEMPLATE_PULL_DURATION_METRIC = "space_template_pull_duration_milliseconds"
 ON_DEMAND_PULL_RESULTS = "materialized|coalesced|recovered"
-# Several of the Kind exporter's 2 s flushes (`OTEL_METRIC_EXPORT_INTERVAL`,
-# set in otel mode by infra/space/kind/scripts/telemetry_config.py) plus the
-# Collector's 1 s batch; the Collector pushes to Prometheus, so nothing waits
-# on a scrape. Polled at a fraction of the flush.
-ON_DEMAND_PULL_SETTLE_SECONDS = 10.0
+# A count read back from the bench's Prometheus has settled once it holds
+# still for this many of its producer's export periods, plus the Collector's
+# 1 s batch; the Collector pushes to Prometheus, so nothing waits on a scrape.
+# The period is the producer pod's own `OTEL_METRIC_EXPORT_INTERVAL`: 2 s in the
+# Kind otel profile (infra/space/kind/scripts/telemetry_config.py), the SDKs'
+# 10 s on a bench brought up without it.
+METRIC_SETTLE_EXPORT_PERIODS = 5
+METRIC_COLLECTOR_BATCH_SECONDS = 1.0
 METRIC_POLL_SECONDS = 2.0
+
+
+def metric_settle_seconds(export_interval_seconds: float) -> float:
+    """How long a metric must hold still before a baseline read can trust it."""
+
+    return METRIC_SETTLE_EXPORT_PERIODS * export_interval_seconds + METRIC_COLLECTOR_BATCH_SECONDS
 
 
 def _rfc3339(epoch: float) -> str:
@@ -3424,8 +3435,6 @@ TEMPLATE_EVICTION_RETRY_SECONDS = 3.0
 
 # node-manager's `node_mgr.btrfs_send.stream_rejected` counter, as Prometheus names it.
 BTRFS_SEND_STREAM_REJECTED_METRIC = "space_node_mgr_btrfs_send_stream_rejected_total"
-# Export flushes plus the Collector's batch, as for the on-demand pull counts.
-STREAM_REJECTIONS_SETTLE_SECONDS = ON_DEMAND_PULL_SETTLE_SECONDS
 
 
 class SuspendCodecAssertions:
@@ -3592,13 +3601,16 @@ class SuspendCodecAssertions:
         }
 
     def _settled_stream_rejections(self, node_name: str) -> dict[str, float]:
-        """The rejection counts once unchanged for `STREAM_REJECTIONS_SETTLE_SECONDS`.
+        """The rejection counts once unchanged for `metric_settle_seconds` of node-manager's export interval.
 
         An earlier scenario's rejection on this worker can land after a single
         read and would then count as this send's.
         """
 
-        settle_seconds = STREAM_REJECTIONS_SETTLE_SECONDS
+        settle_seconds = metric_settle_seconds(
+            self._control.metric_export_interval_seconds(node_name, NODE_MANAGER)
+        )
+        self._fixture.record("stream_rejections_settle_seconds", settle_seconds)
         counts = self.stream_rejections(node_name)
         unchanged_since = time.monotonic()
         deadline = unchanged_since + 180
@@ -3906,7 +3918,7 @@ class SuspendCodecAssertions:
         node_name: str,
         template: str,
         *,
-        settle_seconds: float = ON_DEMAND_PULL_SETTLE_SECONDS,
+        settle_seconds: float | None = None,
         timeout: float = 180,
     ) -> dict[str, float]:
         """The on-demand pull counts once they have stopped moving: the baseline.
@@ -3914,10 +3926,15 @@ class SuspendCodecAssertions:
         The exporter flushes every few seconds and the Collector batches
         after that, so a single read can miss an earlier pull's increment that
         lands later and would then read as this restore's pull. Polled until
-        unchanged for `settle_seconds`, several export intervals plus the
-        batch; the value at that point is the baseline.
+        unchanged for `settle_seconds`, by default `metric_settle_seconds` of
+        template-manager's export interval on that worker; the value at that
+        point is the baseline.
         """
 
+        if settle_seconds is None:
+            settle_seconds = metric_settle_seconds(
+                self._control.metric_export_interval_seconds(node_name, NODE_TEMPLATE_MANAGER)
+            )
         started = time.time()
         counts = self.on_demand_pull_counts(node_name, template)
         unchanged_since = time.monotonic()
@@ -3941,6 +3958,7 @@ class SuspendCodecAssertions:
                 "counts": counts,
                 "settled_at": _rfc3339(time.time()),
                 "settle_wait_seconds": round(time.time() - started, 1),
+                "settle_seconds": settle_seconds,
             },
         )
         return counts
@@ -4266,9 +4284,7 @@ class StartupRecoveryAssertions:
     recovery, can also drop a row, so the stale plant is read `ready`
     immediately before the restart: that proves no eviction removed it
     earlier, and the successful read restarts the build's eviction grace
-    (`SPACE_TEMPLATE_GC_GRACE_SECS`). The loop reclaims only while the worker
-    is over its cache budget, least recently used first, so the 4 MiB plants
-    it has just read are the last builds it would take.
+    (`SPACE_TEMPLATE_GC_GRACE_SECS`), which outlasts a restart.
 
     No SQLite anywhere: "no row" states are made by stashing the digest
     directory aside, running the daemon's own `delete-template`, and putting
