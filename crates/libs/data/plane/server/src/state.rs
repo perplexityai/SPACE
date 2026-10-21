@@ -552,17 +552,26 @@ impl RevocationCache {
         {
             return;
         }
+        let now = tokio::time::Instant::now();
         self.orgs.insert(
             org_id,
             OrgRevocationCacheEntry {
                 epoch,
-                refresh_after: tokio::time::Instant::now() + refresh_after,
+                confirmed_at: now,
+                refresh_after: now + refresh_after,
                 refreshing: Arc::new(AtomicBool::new(false)),
             },
         );
     }
 
-    pub(super) fn probe(self: &Arc<Self>, session_id: DataPlaneSessionId) -> RevocationProbe {
+    /// Probe the session's cached verdict. A refresh another stream has in
+    /// flight answers from the cache only while that verdict is younger than
+    /// `max_staleness`; past it, this session is re-read instead.
+    pub(super) fn probe(
+        self: &Arc<Self>,
+        session_id: DataPlaneSessionId,
+        max_staleness: Duration,
+    ) -> RevocationProbe {
         let key = session_id.to_string();
         let Some(entry) = self.entries.get(&key) else {
             return RevocationProbe::RefreshSession;
@@ -589,6 +598,7 @@ impl RevocationCache {
             return RevocationProbe::Fresh(active);
         }
         let cached_org_epoch = org.epoch.max(session_org_epoch);
+        let confirmed_recently = org.confirmed_at.elapsed() < max_staleness;
         let refreshing = Arc::clone(&org.refreshing);
         drop(org);
         if refreshing
@@ -603,9 +613,29 @@ impl RevocationCache {
                     refreshing: Some(refreshing),
                 },
             })
-        } else {
+        } else if confirmed_recently {
             RevocationProbe::RefreshInFlight(active)
+        } else {
+            RevocationProbe::RefreshSession
         }
+    }
+
+    /// Whether the session's last confirmed verdict is active and younger
+    /// than `max_staleness`. A newer org epoch than the session was read
+    /// under means a revocation in its org since, so the verdict no longer
+    /// counts.
+    pub(super) fn confirmed_active(
+        &self,
+        session_id: DataPlaneSessionId,
+        max_staleness: Duration,
+    ) -> bool {
+        let Some(entry) = self.entries.get(&session_id.to_string()) else {
+            return false;
+        };
+        let Some(org) = self.orgs.get(&entry.org_id) else {
+            return false;
+        };
+        entry.active && entry.org_epoch >= org.epoch && org.confirmed_at.elapsed() < max_staleness
     }
 
     pub(super) fn forget(&self, session_id: DataPlaneSessionId) {
@@ -636,6 +666,8 @@ pub(super) struct RevocationCacheEntry {
 #[derive(Debug, Clone)]
 pub(super) struct OrgRevocationCacheEntry {
     pub(super) epoch: u64,
+    /// When a check last confirmed this epoch.
+    pub(super) confirmed_at: tokio::time::Instant,
     pub(super) refresh_after: tokio::time::Instant,
     pub(super) refreshing: Arc<AtomicBool>,
 }

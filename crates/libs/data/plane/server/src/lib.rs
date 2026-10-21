@@ -143,6 +143,9 @@ pub const DEFAULT_MAX_ATTACHED_STREAMS_PER_SANDBOX: usize = 512;
 pub const DEFAULT_BACKEND_CHANNEL_POOL_SIZE: usize = 4;
 pub const DEFAULT_REVOCATION_CHECK_INTERVAL_MS: u64 = 10_000;
 pub const DEFAULT_ROUTE_CACHE_TTL_MS: u64 = 1_000;
+/// How long an attached stream keeps its last confirmed revocation verdict
+/// while revocation checks fail, before it fails closed.
+const REVOCATION_MAX_STALENESS: Duration = Duration::from_secs(60);
 /// The shortest drain deadline the service accepts: the 8-second stream-open
 /// budget, so a `Process.Start` already opening when SIGTERM arrives finishes
 /// opening, and can report whether the command started, before the deadline.
@@ -252,6 +255,7 @@ struct DataPlaneState {
     ecw_process_input_locks: Arc<EcwProcessInputLocks>,
     ecw_hosts: Arc<EcwHostConfig>,
     revocation_check_interval: Duration,
+    revocation_max_staleness: Duration,
     route_cache_ttl: Duration,
     /// Cancelled on SIGTERM: a child of the caller's shutdown token. New
     /// streams are refused once it is cancelled, and sockets still
@@ -420,6 +424,7 @@ pub async fn run(
         revocation_check_interval: config
             .revocation_check_interval
             .max(Duration::from_millis(1)),
+        revocation_max_staleness: REVOCATION_MAX_STALENESS,
         route_cache_ttl: config.route_cache_ttl.max(Duration::from_millis(1)),
         drain_started,
         stream_shutdown_token: stream_shutdown_token.clone(),
@@ -436,7 +441,7 @@ pub async fn run(
     tracing::info!(listen = %config.listen, "space-data-plane-svc listening");
 
     serve_and_drain(
-        pplx_space_common_svc::http_listener::nodelay(listener),
+        data_plane_listener(listener),
         app,
         DrainLifecycle {
             shutdown_token,
@@ -449,6 +454,45 @@ pub async fn run(
     )
     .await
     .map_err(RunDataPlaneError::Serve)
+}
+
+/// Accepted data-plane connections probe an idle peer after 30 seconds and
+/// every 10 seconds after, and are dropped after 3 unanswered probes. On Linux,
+/// data left unacknowledged for a minute drops them too. A client whose
+/// connection dies silently then releases its stream, and the node's
+/// per-sandbox permit behind it, in about a minute.
+const DATA_PLANE_TCP_KEEPALIVE_TIME: Duration = Duration::from_secs(30);
+const DATA_PLANE_TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const DATA_PLANE_TCP_KEEPALIVE_RETRIES: u32 = 3;
+#[cfg(target_os = "linux")]
+const DATA_PLANE_TCP_USER_TIMEOUT: Duration = Duration::from_secs(60);
+
+type DataPlaneListener = axum::serve::TapIo<
+    pplx_space_common_svc::http_listener::NodelayListener,
+    fn(&mut tokio::net::TcpStream),
+>;
+
+/// Accept connections with `TCP_NODELAY` and the data plane's dead-peer
+/// detection set.
+fn data_plane_listener(listener: tokio::net::TcpListener) -> DataPlaneListener {
+    fn set_dead_peer_detection(tcp: &mut tokio::net::TcpStream) {
+        let socket = socket2::SockRef::from(&*tcp);
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(DATA_PLANE_TCP_KEEPALIVE_TIME)
+            .with_interval(DATA_PLANE_TCP_KEEPALIVE_INTERVAL)
+            .with_retries(DATA_PLANE_TCP_KEEPALIVE_RETRIES);
+        if let Err(error) = socket.set_tcp_keepalive(&keepalive) {
+            tracing::debug!(%error, "failed to set TCP keepalive on an accepted connection");
+        }
+        #[cfg(target_os = "linux")]
+        if let Err(error) = socket.set_tcp_user_timeout(Some(DATA_PLANE_TCP_USER_TIMEOUT)) {
+            tracing::debug!(%error, "failed to set TCP_USER_TIMEOUT on an accepted connection");
+        }
+    }
+    axum::serve::ListenerExt::tap_io(
+        pplx_space_common_svc::http_listener::nodelay(listener),
+        set_dead_peer_detection as fn(&mut tokio::net::TcpStream),
+    )
 }
 
 async fn connect_cluster_api_clients_for_startup(

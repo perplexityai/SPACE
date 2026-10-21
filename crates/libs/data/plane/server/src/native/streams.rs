@@ -215,9 +215,10 @@ pub(super) fn stream_start_error_frame(error: &StreamBridgeError) -> DataPlaneSe
             if !pplx_space_common_grpc::is_terminal_guest_process_error(status)
                 && backend_stream_status_retryable(status)
     );
+    // The error's detail can name internal endpoints; the bridge logs it.
     DataPlaneServerFrame::Error {
         code: DataPlaneErrorCode::BackendStreamError,
-        message: error.to_string(),
+        message: "event stream could not be opened".to_string(),
         retryable,
     }
 }

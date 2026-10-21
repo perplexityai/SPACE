@@ -52,7 +52,7 @@ enum DrainEnding {
 /// second stop signal cancels `force_token`, which ends the drain the same way
 /// the deadline does.
 pub(super) async fn serve_and_drain(
-    listener: pplx_space_common_svc::http_listener::NodelayListener,
+    listener: DataPlaneListener,
     app: Router,
     lifecycle: DrainLifecycle,
 ) -> std::io::Result<()> {

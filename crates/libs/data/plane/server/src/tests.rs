@@ -870,6 +870,37 @@ async fn spawn_cluster_api_stub() -> std::net::SocketAddr {
     addr
 }
 
+#[tokio::test]
+async fn accepted_connections_detect_dead_peers() {
+    use axum::serve::Listener;
+
+    let mut listener =
+        data_plane_listener(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
+    let address = listener.local_addr().unwrap();
+    let _client = tokio::net::TcpStream::connect(address).await.unwrap();
+    let (accepted, _peer) = listener.accept().await;
+    assert!(accepted.nodelay().unwrap());
+    let socket = socket2::SockRef::from(&accepted);
+    assert!(socket.keepalive().unwrap());
+    assert_eq!(
+        socket.tcp_keepalive_time().unwrap(),
+        DATA_PLANE_TCP_KEEPALIVE_TIME
+    );
+    assert_eq!(
+        socket.tcp_keepalive_interval().unwrap(),
+        DATA_PLANE_TCP_KEEPALIVE_INTERVAL
+    );
+    assert_eq!(
+        socket.tcp_keepalive_retries().unwrap(),
+        DATA_PLANE_TCP_KEEPALIVE_RETRIES
+    );
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        socket.tcp_user_timeout().unwrap(),
+        Some(DATA_PLANE_TCP_USER_TIMEOUT)
+    );
+}
+
 pub(crate) async fn test_data_plane_state() -> DataPlaneState {
     let addr = spawn_cluster_api_stub().await;
     let cluster_api =
@@ -891,6 +922,7 @@ pub(crate) async fn test_data_plane_state() -> DataPlaneState {
         ecw_process_input_locks: Arc::new(EcwProcessInputLocks::default()),
         ecw_hosts: Arc::default(),
         revocation_check_interval: Duration::from_secs(1),
+        revocation_max_staleness: REVOCATION_MAX_STALENESS,
         route_cache_ttl: Duration::from_secs(60),
         drain_started: CancellationToken::new(),
         stream_shutdown_token: CancellationToken::new(),
@@ -1822,7 +1854,7 @@ fn revocation_cache_uses_epoch_and_coalesces_refresh() {
     let org_id = OrgId::new();
 
     assert!(matches!(
-        cache.probe(session_id),
+        cache.probe(session_id, REVOCATION_MAX_STALENESS),
         RevocationProbe::RefreshSession
     ));
 
@@ -1830,7 +1862,7 @@ fn revocation_cache_uses_epoch_and_coalesces_refresh() {
     assert_eq!(cache.cached_epoch(session_id), Some(10));
     assert_eq!(cache.cached_org_epoch(org_id), Some(20));
     assert!(matches!(
-        cache.probe(session_id),
+        cache.probe(session_id, REVOCATION_MAX_STALENESS),
         RevocationProbe::Fresh(true)
     ));
 
@@ -1838,7 +1870,7 @@ fn revocation_cache_uses_epoch_and_coalesces_refresh() {
     assert_eq!(cache.cached_epoch(session_id), Some(10));
     assert_eq!(cache.cached_org_epoch(org_id), Some(20));
     assert!(matches!(
-        cache.probe(session_id),
+        cache.probe(session_id, REVOCATION_MAX_STALENESS),
         RevocationProbe::Fresh(true)
     ));
 
@@ -1846,17 +1878,17 @@ fn revocation_cache_uses_epoch_and_coalesces_refresh() {
     assert_eq!(cache.cached_epoch(session_id), Some(11));
     assert_eq!(cache.cached_org_epoch(org_id), Some(21));
     assert!(matches!(
-        cache.probe(session_id),
+        cache.probe(session_id, REVOCATION_MAX_STALENESS),
         RevocationProbe::Fresh(false)
     ));
 
     cache.remember_active(session_id, 12, org_id, 22, Duration::from_millis(0));
-    let guard = match cache.probe(session_id) {
+    let guard = match cache.probe(session_id, REVOCATION_MAX_STALENESS) {
         RevocationProbe::RefreshOrg(refresh) => refresh.guard,
         other => panic!("expected refresh probe for expired entry, got {other:?}"),
     };
     assert!(matches!(
-        cache.probe(session_id),
+        cache.probe(session_id, REVOCATION_MAX_STALENESS),
         RevocationProbe::RefreshInFlight(true)
     ));
     drop(guard);
@@ -1873,7 +1905,7 @@ fn revocation_cache_refreshes_session_behind_org_epoch() {
 
     cache.remember_active(session_id, 10, org_id, 20, Duration::from_secs(60));
     assert!(matches!(
-        cache.probe(session_id),
+        cache.probe(session_id, REVOCATION_MAX_STALENESS),
         RevocationProbe::Fresh(true)
     ));
 
@@ -1883,7 +1915,7 @@ fn revocation_cache_refreshes_session_behind_org_epoch() {
     // the old epoch, so it must be re-fetched rather than reported fresh.
     cache.remember_org_epoch(org_id, 21, Duration::from_secs(60));
     assert!(matches!(
-        cache.probe(session_id),
+        cache.probe(session_id, REVOCATION_MAX_STALENESS),
         RevocationProbe::RefreshSession
     ));
 
@@ -1891,7 +1923,7 @@ fn revocation_cache_refreshes_session_behind_org_epoch() {
     // cache answers from memory again.
     cache.remember_active(session_id, 11, org_id, 21, Duration::from_secs(60));
     assert!(matches!(
-        cache.probe(session_id),
+        cache.probe(session_id, REVOCATION_MAX_STALENESS),
         RevocationProbe::Fresh(true)
     ));
 }
@@ -1903,7 +1935,7 @@ async fn revocation_cache_coalesces_concurrent_org_refreshes() {
     let org_id = OrgId::new();
     cache.remember_active(session_id, 10, org_id, 20, Duration::ZERO);
 
-    let guard = match cache.probe(session_id) {
+    let guard = match cache.probe(session_id, REVOCATION_MAX_STALENESS) {
         RevocationProbe::RefreshOrg(refresh) => refresh.guard,
         other => panic!("expected first probe to own refresh, got {other:?}"),
     };
@@ -1912,7 +1944,7 @@ async fn revocation_cache_coalesces_concurrent_org_refreshes() {
             let cache = Arc::clone(&cache);
             tokio::spawn(async move {
                 matches!(
-                    cache.probe(session_id),
+                    cache.probe(session_id, REVOCATION_MAX_STALENESS),
                     RevocationProbe::RefreshInFlight(true)
                 )
             })
@@ -1924,6 +1956,41 @@ async fn revocation_cache_coalesces_concurrent_org_refreshes() {
     }
 
     drop(guard);
+}
+
+#[test]
+fn revocation_cache_keeps_a_confirmed_verdict_only_within_the_staleness_bound() {
+    let cache = Arc::new(RevocationCache::default());
+    let session_id = DataPlaneSessionId::Process(Default::default());
+    let org_id = OrgId::new();
+    assert!(!cache.confirmed_active(session_id, REVOCATION_MAX_STALENESS));
+
+    // Confirmed just now, and already due for a refresh.
+    cache.remember_active(session_id, 10, org_id, 20, Duration::ZERO);
+    assert!(cache.confirmed_active(session_id, REVOCATION_MAX_STALENESS));
+    assert!(!cache.confirmed_active(session_id, Duration::ZERO));
+
+    // While another stream's refresh is in flight the cached verdict answers
+    // within the bound; past it, this session is re-read.
+    let _guard = match cache.probe(session_id, REVOCATION_MAX_STALENESS) {
+        RevocationProbe::RefreshOrg(refresh) => refresh.guard,
+        other => panic!("expected the first probe to own the refresh, got {other:?}"),
+    };
+    assert!(matches!(
+        cache.probe(session_id, REVOCATION_MAX_STALENESS),
+        RevocationProbe::RefreshInFlight(true)
+    ));
+    assert!(matches!(
+        cache.probe(session_id, Duration::ZERO),
+        RevocationProbe::RefreshSession
+    ));
+
+    // A verdict read under an older org epoch no longer counts, nor does a
+    // revoked one.
+    cache.remember_org_epoch(org_id, 21, Duration::from_secs(60));
+    assert!(!cache.confirmed_active(session_id, REVOCATION_MAX_STALENESS));
+    cache.remember_state(session_id, 11, false, org_id, 21, Duration::from_secs(60));
+    assert!(!cache.confirmed_active(session_id, REVOCATION_MAX_STALENESS));
 }
 
 #[test]

@@ -782,12 +782,40 @@ pub(super) fn revocation_check_interval(state: &DataPlaneState) -> tokio::time::
     interval
 }
 
+/// Whether an attached stream's session has been revoked, checked on each
+/// revocation tick.
+///
+/// A check that fails keeps the session's last confirmed verdict while that
+/// verdict is younger than the staleness bound, so a brief cluster API or
+/// database outage does not end every attached stream. Past the bound the
+/// error is returned and the stream fails closed. A confirmed revocation is
+/// reported at once.
 pub(super) async fn session_is_revoked(
     state: &DataPlaneState,
     session_id: DataPlaneSessionId,
 ) -> Result<bool, StreamBridgeError> {
+    match check_session_revocation(state, session_id).await {
+        Err(error)
+            if state
+                .revocation_cache
+                .confirmed_active(session_id, state.revocation_max_staleness) =>
+        {
+            tracing::warn!(%error, "revocation check failed; keeping the last confirmed verdict");
+            Ok(false)
+        }
+        result => result,
+    }
+}
+
+async fn check_session_revocation(
+    state: &DataPlaneState,
+    session_id: DataPlaneSessionId,
+) -> Result<bool, StreamBridgeError> {
     let kind = session_id.kind().as_str();
-    match state.revocation_cache.probe(session_id) {
+    match state
+        .revocation_cache
+        .probe(session_id, state.revocation_max_staleness)
+    {
         RevocationProbe::Fresh(active) => {
             pplx_space_metrics::data_plane::revocation_cache_probe(kind, "fresh");
             Ok(!active)
