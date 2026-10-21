@@ -279,6 +279,15 @@ must supply the destination RPC's existing import header and file chunks.
 Source lifecycle, encryption restrictions, and destination validation still
 apply. The node-api service account cannot invoke these local artifact methods.
 
+Sandbox export obtains its bounded file inventory and file bytes from
+node-manager, which owns filesystem access. Sandbox-manager relays them while
+holding its lifecycle and artifact guards; it does not need directory-listing access to
+retained instances. Deploy node-manager before sandbox-manager when adopting
+this protocol. An older node-manager rejects the inventory RPC, so export ends
+with a stream error before publishing its header; the caller must discard the
+incomplete transfer and retry after the services are compatible. No data or
+permission migration is required.
+
 ## TLS interception exemptions
 
 `NetworkPolicyV1.tls_interception_exemptions` uses the same destination selectors

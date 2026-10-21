@@ -89,6 +89,13 @@ service NodeManager {
   // Inspect all resources for one sandbox (processes, network, cgroup, filesystem, state).
   rpc InspectSandbox(InspectSandboxRequest) returns (InspectSandboxResponse);
 
+  // Enumerate an operator export without granting sandbox-manager directory
+  // listing rights on per-sandbox instance directories. Paths are derived here.
+  rpc ListSandboxExportFiles(ListSandboxExportFilesRequest)
+      returns (ListSandboxExportFilesResponse);
+  rpc ReadSandboxExportFile(ReadSandboxExportFileRequest)
+      returns (stream SandboxExportFileChunk);
+
   // Capture the privileged host process and vsock binding for the currently
   // registered sandbox runtime. Sandbox-manager binds this evidence to its
   // execution generation and activation attempt before persisting it.
@@ -780,6 +787,33 @@ message InspectSandboxResponse {
   bool slot_allocated = 50;
   optional string template = 51;
   ExecutionFence execution_fence = 60;
+}
+
+message ListSandboxExportFilesRequest {
+  string sandbox_id = 1;
+  bool include_snapshot = 2;
+}
+
+message SandboxExportFile {
+  // A direct instance filename or snapshot/<filename>, never a host path.
+  string name = 1;
+  uint64 size_bytes = 2;
+}
+
+message ListSandboxExportFilesResponse {
+  repeated SandboxExportFile files = 1;
+}
+
+message ReadSandboxExportFileRequest {
+  string sandbox_id = 1;
+  // Direct instance filename or snapshot/<filename>, never a host path.
+  string name = 2;
+}
+
+message SandboxExportFileChunk {
+  uint64 offset = 1;
+  bytes data = 2;
+  bool eof = 3;
 }
 
 message CaptureSandboxEndpointProofRequest {

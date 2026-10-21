@@ -154,47 +154,39 @@ pub(crate) fn sandbox_export_files(
     instance: &Path,
     snapshot: Option<&Path>,
     delta: Option<&Path>,
+    manifest: Vec<pplx_space_node_mgr_client::proto::SandboxExportFile>,
 ) -> Result<(Vec<(String, std::path::PathBuf)>, u64), Status> {
+    if manifest.len() > MAX_TRANSFER_FILES {
+        return Err(Status::resource_exhausted("too many entries in export"));
+    }
     let mut files = Vec::new();
     let mut bytes = 0_u64;
-    for (directory, prefix) in [(Some(instance), ""), (snapshot, "snapshot/")] {
-        let Some(directory) = directory else {
-            continue;
-        };
-        for (index, entry) in std::fs::read_dir(directory)
-            .map_err(|error| Status::internal(format!("read export directory: {error}")))?
-            .enumerate()
-        {
-            if index >= MAX_TRANSFER_FILES || files.len() >= MAX_TRANSFER_FILES {
-                return Err(Status::resource_exhausted("too many entries in export"));
-            }
-            let entry =
-                entry.map_err(|error| Status::internal(format!("read export entry: {error}")))?;
-            let kind = entry
-                .file_type()
-                .map_err(|error| Status::internal(format!("inspect export entry: {error}")))?;
-            if kind.is_symlink() {
-                return Err(Status::failed_precondition("export contains a symlink"));
-            }
-            if !kind.is_file() {
-                continue;
-            }
-            let name = entry
-                .file_name()
-                .into_string()
-                .map_err(|_| Status::failed_precondition("export filename is not UTF-8"))?;
-            let (name, path) = match (prefix.is_empty() && name == "rootfs.ext4", delta) {
-                (true, Some(delta)) => ("rootfs.ext4.diff".to_owned(), delta.to_owned()),
-                _ => (format!("{prefix}{name}"), entry.path()),
-            };
-            let size = std::fs::metadata(&path)
-                .map_err(|error| Status::internal(format!("stat export file: {error}")))?
-                .len();
-            bytes = bytes
-                .checked_add(size)
-                .ok_or_else(|| Status::out_of_range("export size overflow"))?;
-            files.push((name, path));
+    let mut names = std::collections::HashSet::new();
+    for file in manifest {
+        let (name, is_snapshot) = super::validate_import_sandbox_file_name(&file.name)?;
+        if !names.insert(file.name.clone()) {
+            return Err(Status::data_loss("duplicate file in export manifest"));
         }
+        let directory = if is_snapshot {
+            snapshot
+                .ok_or_else(|| Status::data_loss("unexpected snapshot file in export manifest"))?
+        } else {
+            instance
+        };
+        let (name, path, size) = match (!is_snapshot && name == "rootfs.ext4", delta) {
+            (true, Some(delta)) => (
+                "rootfs.ext4.diff".to_owned(),
+                delta.to_owned(),
+                std::fs::metadata(delta)
+                    .map_err(|error| Status::internal(format!("stat export delta: {error}")))?
+                    .len(),
+            ),
+            _ => (file.name.clone(), directory.join(name), file.size_bytes),
+        };
+        bytes = bytes
+            .checked_add(size)
+            .ok_or_else(|| Status::out_of_range("export size overflow"))?;
+        files.push((name, path));
     }
     files.sort_by(|left, right| left.0.cmp(&right.0));
     Ok((files, bytes))
