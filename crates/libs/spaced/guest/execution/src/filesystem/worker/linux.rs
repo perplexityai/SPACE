@@ -24,6 +24,7 @@ use super::super::{FilesystemWorkerService, WORKER_PROTOCOL_VERSION};
 const WORKER_PROCESS_NAME: &std::ffi::CStr = c"spaced-fsworker";
 
 const WORKER_MODE_ENV: &str = "SPACE_SPACED_FILESYSTEM_WORKER";
+const WORKER_IDENTITY_POLICY_ENV: &str = "SPACE_SPACED_FILESYSTEM_WORKER_IDENTITY_POLICY";
 const WORKER_USER_ENV: &str = "SPACE_SPACED_FILESYSTEM_WORKER_USER";
 const WORKER_FD_ENV: &str = "SPACE_SPACED_FILESYSTEM_WORKER_FD";
 /// Resolved before every OTel setting, so it is how a child names itself.
@@ -174,6 +175,7 @@ enum ClientAcquisition {
 #[derive(Clone)]
 pub(crate) struct WorkerPool {
     executable: crate::WorkerExecutable,
+    identity_policy: crate::IdentityPolicy,
     guest_cgroups: Option<Arc<crate::ExecutionCgroups>>,
     shutdown: CancellationToken,
     workers: Arc<Mutex<HashMap<GuestUserName, WorkerEntry>>>,
@@ -267,9 +269,11 @@ impl WorkerPool {
         shutdown: CancellationToken,
         guest_cgroups: Option<Arc<crate::ExecutionCgroups>>,
         executable: crate::WorkerExecutable,
+        identity_policy: crate::IdentityPolicy,
     ) -> Self {
         Self {
             executable,
+            identity_policy,
             guest_cgroups,
             shutdown,
             workers: Arc::new(Mutex::new(HashMap::new())),
@@ -615,8 +619,11 @@ impl WorkerPool {
                 ))
             })?;
         let lookup_user = user.clone();
+        let policy = self.identity_policy;
         let process_slot = tokio::task::spawn_blocking(move || {
-            GuestAccount::resolve(lookup_user).map_err(|error| error.into_status())?;
+            GuestAccount::resolve(lookup_user)
+                .map_err(|error| error.into_status())?
+                .validate_policy(policy)?;
             Ok::<_, Status>(process_slot)
         })
         .await
@@ -632,7 +639,12 @@ impl WorkerPool {
         .map_err(|error| worker_io_status(io::Error::from(error)))?;
         let worker_raw_fd = worker_fd.as_raw_fd();
         let executable = self.executable.clone();
-        let mut command = worker_command(&executable.path(), user, worker_raw_fd);
+        let mut command = worker_command(
+            &executable.path(),
+            user,
+            worker_raw_fd,
+            self.identity_policy,
+        );
         // The socketpair is CLOEXEC by default. Clear it only in the forked
         // worker so concurrent user process spawns cannot inherit this fd.
         // SAFETY: `pre_exec` installs a closure that runs in the forked child
@@ -749,11 +761,17 @@ impl WorkerPool {
     }
 }
 
-fn worker_command(executable: &Path, user: &GuestUserName, worker_raw_fd: RawFd) -> ChildCommand {
+fn worker_command(
+    executable: &Path,
+    user: &GuestUserName,
+    worker_raw_fd: RawFd,
+    identity_policy: crate::IdentityPolicy,
+) -> ChildCommand {
     worker_command_from_environment(
         executable,
         user,
         worker_raw_fd,
+        identity_policy,
         &pplx_space_common_core::env::ProcessEnvironment,
     )
 }
@@ -761,6 +779,7 @@ fn worker_command_from_environment(
     executable: &Path,
     user: &GuestUserName,
     worker_raw_fd: RawFd,
+    identity_policy: crate::IdentityPolicy,
     env: &dyn pplx_space_common_core::env::Environment,
 ) -> ChildCommand {
     let mut command = ChildCommand::new(executable);
@@ -771,7 +790,16 @@ fn worker_command_from_environment(
         .env(WORKER_MODE_ENV, "1")
         .env(WORKER_USER_ENV, user.as_str())
         .env(WORKER_FD_ENV, worker_raw_fd.to_string())
+        .env(WORKER_IDENTITY_POLICY_ENV, identity_policy.as_str())
         .kill_on_drop(true);
+    if identity_policy == crate::IdentityPolicy::Restricted {
+        // SAFETY: prctl is called only in the forked child before exec.
+        // Prevent the selected artifact itself from acquiring extra privileges;
+        // it retains the launcher's authority until it installs the account.
+        unsafe {
+            command.pre_exec(|| rustix::thread::set_no_new_privs(true).map_err(Into::into));
+        }
+    }
     for name in WORKER_ENV_ALLOWLIST {
         if let Some(value) = env.var_os(name) {
             command.env(name, value);
@@ -852,6 +880,14 @@ fn supervise_worker(
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum FilesystemWorkerError {
+    #[error("filesystem worker identity policy is missing: {0}")]
+    MissingIdentityPolicy(#[source] std::env::VarError),
+    #[error("invalid filesystem worker identity policy: {0}")]
+    InvalidIdentityPolicy(#[source] crate::identity_policy::ParseIdentityPolicyError),
+    #[error("cannot inspect filesystem worker threads: {0}")]
+    InspectThreads(#[source] std::io::Error),
+    #[error("restricted filesystem worker must start single-threaded")]
+    MultipleThreads,
     #[error("failed to set filesystem worker process name: {0}")]
     SetProcessName(#[source] nix::errno::Errno),
     #[error("filesystem worker user is missing: {0}")]
@@ -893,11 +929,36 @@ pub(crate) fn run_from_environment() -> Result<bool, FilesystemWorkerError> {
         .map_err(FilesystemWorkerError::MissingFd)?
         .parse::<RawFd>()
         .map_err(FilesystemWorkerError::InvalidFd)?;
-    run_worker(user, raw_fd)?;
+    let policy = std::env::var(WORKER_IDENTITY_POLICY_ENV)
+        .map_err(FilesystemWorkerError::MissingIdentityPolicy)?;
+    let policy = crate::IdentityPolicy::parse(&policy)
+        .map_err(FilesystemWorkerError::InvalidIdentityPolicy)?;
+    run_worker(user, raw_fd, policy)?;
     Ok(true)
 }
 
-fn run_worker(user: GuestUserName, raw_fd: RawFd) -> Result<(), FilesystemWorkerError> {
+fn run_worker(
+    user: GuestUserName,
+    raw_fd: RawFd,
+    policy: crate::IdentityPolicy,
+) -> Result<(), FilesystemWorkerError> {
+    if policy == crate::IdentityPolicy::Restricted {
+        // capset and no_new_privs affect only the calling thread. Dispatch must
+        // precede application initialization; reject an already threaded host.
+        let tasks =
+            std::fs::read_dir("/proc/self/task").map_err(FilesystemWorkerError::InspectThreads)?;
+        let mut count = 0;
+        for task in tasks {
+            task.map_err(FilesystemWorkerError::InspectThreads)?;
+            count += 1;
+            if count > 1 {
+                return Err(FilesystemWorkerError::MultipleThreads);
+            }
+        }
+        if count != 1 {
+            return Err(FilesystemWorkerError::MultipleThreads);
+        }
+    }
     // SAFETY: `raw_fd` is inherited exclusively from the root router's
     // socketpair and ownership is transferred into this UnixStream exactly
     // once at worker startup.
@@ -907,7 +968,7 @@ fn run_worker(user: GuestUserName, raw_fd: RawFd) -> Result<(), FilesystemWorker
         .map_err(FilesystemWorkerError::ConfigureStream)?;
     let account = GuestAccount::resolve(user).map_err(FilesystemWorkerError::ResolveAccount)?;
     account
-        .assume_process_credentials()
+        .assume_process_credentials(policy)
         .map_err(FilesystemWorkerError::AssumeIdentity)?;
 
     let runtime = tokio::runtime::Builder::new_current_thread()

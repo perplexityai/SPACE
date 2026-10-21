@@ -366,6 +366,7 @@ impl SpacedGuestService {
                 cancellation_grace: config.cancellation_grace,
                 guest_memory_bytes: meta::guest_mem_total_bytes(),
                 worker_executable,
+                identity_policy: pplx_space_spaced_guest_execution::IdentityPolicy::Guest,
             },
             guest_cgroups.map(|cgroups| Arc::clone(&cgroups.placement)),
         )?;

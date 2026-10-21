@@ -5,14 +5,17 @@ use super::*;
 ///
 /// # Defaults
 ///
-/// Linux defaults to identity workers without selecting an executable. Callers
-/// must set [`Self::worker_executable`] before constructing the service; the
-/// default alone returns [`CreateExecutionServiceError::MissingWorkerExecutable`].
-/// Other platforms default to Direct filesystem execution.
+/// Linux defaults to restricted identity workers. Callers must supply
+/// [`Self::worker_executable`] and a root launcher with effective CAP_SETUID and
+/// CAP_SETGID; otherwise construction returns
+/// [`CreateExecutionServiceError::MissingWorkerExecutable`] or
+/// [`CreateExecutionServiceError::RestrictedRequiresPrivilege`], respectively.
+/// Other platforms default to Direct filesystem execution with the guest policy.
 #[derive(Clone, Debug)]
 pub struct ExecutionServiceConfig {
     pub default_operation_user: GuestUserName,
     pub filesystem_execution: FilesystemExecutionMode,
+    pub identity_policy: IdentityPolicy,
     /// Required on Linux when using identity workers. Never inferred from the host.
     pub worker_executable: Option<crate::WorkerExecutable>,
     pub cancellation_grace: Duration,
@@ -33,6 +36,11 @@ impl Default for ExecutionServiceConfig {
             cancellation_grace: filesystem::router::DEFAULT_CANCELLATION_GRACE,
             guest_memory_bytes: None,
             worker_executable: None,
+            identity_policy: if cfg!(target_os = "linux") {
+                IdentityPolicy::Restricted
+            } else {
+                IdentityPolicy::Guest
+            },
         }
     }
 }
@@ -43,6 +51,12 @@ pub enum CreateExecutionServiceError {
     MissingWorkerExecutable,
     #[error("identity workers require Linux")]
     UnsupportedIdentityWorkers,
+    #[error("restricted identities require identity workers, not Direct filesystem execution")]
+    RestrictedRequiresIdentityWorkers,
+    #[error("restricted identities require a root launcher with CAP_SETUID and CAP_SETGID")]
+    RestrictedRequiresPrivilege,
+    #[error("cannot inspect launcher capabilities: {0}")]
+    InspectPrivileges(#[source] std::io::Error),
 }
 
 #[derive(Clone)]
@@ -58,6 +72,7 @@ pub(super) struct ExecutionServiceInner {
     pub(super) start_gate: std::sync::Mutex<()>,
     pub(super) process_payload_slots: Arc<Semaphore>,
     pub(super) default_operation_user: GuestUserName,
+    pub(super) identity_policy: IdentityPolicy,
     pub(super) process_env: RwLock<EnvMap>,
     pub(super) processes: ProcessRegistry,
     pub(super) idempotency: IdempotencyStore,
@@ -73,6 +88,11 @@ impl ExecutionService {
     /// Identity workers require an explicit executable on Linux. Selecting them
     /// on another platform returns an unsupported-mode error. No worker is
     /// launched during construction; protocol and account checks occur at worker startup.
+    /// Restricted identities require identity workers and a root launcher with
+    /// effective CAP_SETUID and CAP_SETGID. This checks the calling thread's
+    /// current authority, not what the worker retains across exec: securebits,
+    /// capability bounding sets and executable attributes can still cause worker
+    /// startup to fail closed. Restricted requests must resolve to a nonzero UID.
     pub fn with_config(
         shutdown: CancellationToken,
         config: ExecutionServiceConfig,
@@ -93,11 +113,15 @@ impl ExecutionService {
         let filesystem = filesystem::FilesystemRouter::new(
             config.filesystem_execution,
             config.worker_executable,
+            config.identity_policy,
             config.default_operation_user.clone(),
             shutdown.clone(),
             config.cancellation_grace,
             guest_cgroups.clone(),
         )?;
+        config
+            .identity_policy
+            .validate(config.filesystem_execution)?;
         Ok(Self {
             inner: Arc::new(ExecutionServiceInner {
                 shutdown,
@@ -107,6 +131,7 @@ impl ExecutionService {
                     pplx_space_spaced_guest_protocol::process_limits::PAYLOAD_SLOTS,
                 )),
                 default_operation_user: config.default_operation_user,
+                identity_policy: config.identity_policy,
                 process_env: RwLock::new(EnvMap::empty()),
                 processes: ProcessRegistry::new(process::ProcessOutputBudget::for_guest_memory(
                     config.guest_memory_bytes,

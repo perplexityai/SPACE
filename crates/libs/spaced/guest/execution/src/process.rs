@@ -1998,11 +1998,6 @@ impl Process for ExecutionService {
         };
         let mut command = Command::new(program);
         command.args(args);
-        if let Some(cwd) = &cwd {
-            command.current_dir(cwd.expose());
-        } else {
-            command.current_dir(account.home());
-        }
         command.env_clear();
         command.env("PATH", DEFAULT_LOGIN_PATH);
         command.env("HOME", account.home());
@@ -2042,7 +2037,13 @@ impl Process for ExecutionService {
         if !uses_pty {
             command.process_group(0);
         }
-        account.configure_child_credentials(&mut command)?;
+        account.configure_child_credentials(
+            &mut command,
+            self.inner.identity_policy,
+            cwd.as_ref()
+                .map(|cwd| std::path::Path::new(cwd.expose()))
+                .unwrap_or(account.home()),
+        )?;
         let mut prepared_pty = pty_config
             .map(|pty_config| prepare_pty(pty_config.size))
             .transpose()?;

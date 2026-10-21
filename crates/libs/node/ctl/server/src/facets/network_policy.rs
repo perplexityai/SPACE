@@ -344,7 +344,7 @@ pub(super) async fn publish_network_policy(
             sandboxes_seen,
             templates_seen,
             node_status,
-            execution_inventory: None,
+            execution_observation: None,
             auto_lifecycle_delete_completions: Vec::new(),
             pending_local_backups: None,
         },

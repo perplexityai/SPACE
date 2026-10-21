@@ -43,6 +43,8 @@ fn test_admin_node_row() -> AdminNodeRow {
         metadata: None,
         last_heartbeat: None,
         status_observed_at: None,
+        execution_inventory_status: None,
+        execution_inventory_received_at: None,
         status_health_healthy: None,
         status_services: None,
         status_node_ctl: None,
@@ -2165,4 +2167,63 @@ fn require_undrained_refuses_every_existing_drain_phase() {
         );
     }
     assert!(!refuses_existing_drain(DrainAction::Drain, true, None));
+}
+
+#[tokio::test]
+async fn node_inspection_reports_execution_receipt_independently_of_heartbeat() -> TestResult<()> {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let state = AppState::from_pool(db.pool.clone()).await?;
+    let actor =
+        inventory_test_actor(crate::routes::authz::cluster_managing_org_id(&db.pool).await?);
+    let node_id = NodeId::new();
+    pplx_space_db_test_fixtures::insert_ready_worker_node(&db.pool, node_id).await?;
+    for collection in [None, Some("complete"), Some("unavailable"), Some("legacy")] {
+        sqlx::query(sql!(
+            "INSERT INTO node_status_snapshots (
+                node_id, observed_at, stale_after, reachable, services, updated_at,
+                execution_inventory_status, execution_inventory_received_at
+             ) VALUES ($1, NOW(), NOW() + INTERVAL '30 seconds', TRUE, '[]', NOW(),
+                       $2, CASE WHEN $2::TEXT IS NOT NULL THEN to_timestamp(0) ELSE NULL END)
+             ON CONFLICT (node_id) DO UPDATE SET
+                observed_at = EXCLUDED.observed_at,
+                execution_inventory_status = EXCLUDED.execution_inventory_status,
+                execution_inventory_received_at = EXCLUDED.execution_inventory_received_at"
+        ))
+        .bind(node_id)
+        .bind(collection)
+        .execute(&db.pool)
+        .await?;
+        let response = get_admin_node(
+            Query(GetAdminNodeFilters {
+                include_occupancy: Some(false),
+            }),
+            State(state.clone()),
+            Extension(AuthUser(actor.clone())),
+            Path(node_id.to_string()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: AdminNodeResponse =
+            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 100_000).await?)?;
+        let status = body.status.unwrap();
+        assert!(!status.stale);
+        match (collection, status.execution_inventory) {
+            (None, None) => {}
+            (Some(expected), Some(observation)) => {
+                assert_eq!(observation.status, expected);
+                assert_eq!(
+                    OffsetDateTime::parse(
+                        &observation.received_at,
+                        &time::format_description::well_known::Rfc3339
+                    )?,
+                    OffsetDateTime::UNIX_EPOCH,
+                );
+                assert_ne!(observation.received_at, status.observed_at);
+            }
+            unexpected => panic!("unexpected execution receipt: {unexpected:?}"),
+        }
+    }
+    Ok(())
 }

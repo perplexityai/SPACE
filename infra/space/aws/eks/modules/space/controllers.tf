@@ -18,7 +18,7 @@ locals {
   )
 
   # The groups general_serving_node_group names, each with the recorded floor
-  # its live min has to meet: one group, or every per-AZ group for
+  # its min has to meet: one group, or every per-AZ group for
   # general-per-az. Its validations guarantee the names exist in
   # general_node_groups: general can only be retired while another group
   # serves, and general-2 or the per-AZ groups can only serve once they're
@@ -29,6 +29,11 @@ locals {
       var.general_blue_green_node_group == null && var.general_per_az_node_groups == null ? 1 : var.general_min_size
     )
   }
+  general_node_groups_outside_bounds = [
+    for group in concat(aws_eks_node_group.general_blue_green, values(aws_eks_node_group.general_per_az)) : group.node_group_name
+    if group.scaling_config[0].desired_size < group.scaling_config[0].min_size ||
+    group.scaling_config[0].desired_size > group.scaling_config[0].max_size
+  ]
   serving_general_node_groups = {
     for name in keys(local.serving_general_node_group_floors) : name => local.general_node_groups[name]
   }

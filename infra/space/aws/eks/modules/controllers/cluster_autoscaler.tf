@@ -10,10 +10,12 @@
 # the same ASG ARNs for the same reason.
 #
 # Discovery rather than `--nodes=<min>:<max>:<asg>` because a discovered group's
-# bounds are the ASG's own min and max, read live. Terraform leaves the node
-# group's sizes alone after creation, so an operator resizes the pool through
-# the EKS API and cluster-autoscaler follows, and no apply ever sends a stale
-# desired size back to the group.
+# bounds are the ASG's own min and max, read live: the caller's apply sets them,
+# and cluster-autoscaler follows without its arguments changing. The caller
+# leaves the group's desired size to cluster-autoscaler, so only an apply that
+# changes min or max sends a desired size back to the group, the one in its
+# plan, or one that creates or replaces the group, which comes up at its
+# configured size.
 #
 # Several groups are the general pool split one per zone. A single-zone ASG
 # never runs AZRebalance, which EKS drains without honoring PodDisruptionBudgets

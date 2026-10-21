@@ -1,4 +1,5 @@
 use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use pplx_space_common_core::types::GuestUserName;
@@ -95,7 +96,22 @@ impl GuestAccount {
         &self.shell
     }
 
-    pub(crate) fn assume_process_credentials(&self) -> std::io::Result<()> {
+    pub(crate) fn validate_policy(&self, policy: crate::IdentityPolicy) -> Result<(), Status> {
+        if policy == crate::IdentityPolicy::Restricted && self.uid == 0 {
+            return Err(Status::failed_precondition(
+                "restricted identities require a non-root account",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn assume_process_credentials(
+        &self,
+        policy: crate::IdentityPolicy,
+    ) -> std::io::Result<()> {
+        if policy == crate::IdentityPolicy::Restricted {
+            return assume_restricted_credentials(self.uid, self.gid, &self.supplementary_groups);
+        }
         nix::unistd::setgroups(&self.supplementary_groups)
             .map_err(|error| std::io::Error::from_raw_os_error(error as i32))?;
         // SAFETY: this runs in the worker subprocess before constructing its
@@ -105,8 +121,34 @@ impl GuestAccount {
         Ok(())
     }
 
-    pub(crate) fn configure_child_credentials(&self, command: &mut Command) -> Result<(), Status> {
+    pub(crate) fn configure_child_credentials(
+        &self,
+        command: &mut Command,
+        policy: crate::IdentityPolicy,
+        cwd: &Path,
+    ) -> Result<(), Status> {
         use nix::unistd::{Gid, Uid};
+
+        self.validate_policy(policy)?;
+        if policy == crate::IdentityPolicy::Restricted {
+            let cwd = CString::new(cwd.as_os_str().as_bytes())
+                .map_err(|_| Status::invalid_argument("working directory contains a NUL byte"))?;
+            let uid = self.uid;
+            let gid = self.gid;
+            let groups = self.supplementary_groups.clone();
+            // Command::current_dir runs before pre_exec. Enter the directory
+            // after dropping authority so every ancestor is checked as the user.
+            // SAFETY: all storage is prepared before fork; the hook only uses
+            // credential/capability syscalls and async-signal-safe chdir.
+            unsafe {
+                command.pre_exec(move || {
+                    assume_restricted_credentials(uid, gid, &groups)?;
+                    nix::unistd::chdir(cwd.as_c_str()).map_err(std::io::Error::from)
+                });
+            }
+            return Ok(());
+        }
+        command.current_dir(cwd);
 
         // An unprivileged test harness can already run as the requested
         // identity, but cannot call setgroups. Reusing it is safe only if its
@@ -147,4 +189,45 @@ impl GuestAccount {
         }
         Ok(())
     }
+}
+
+// Called in a forked child or after the worker entrypoint checks thread count.
+// no_new_privs persists across subsequent execs.
+// Bounding capabilities are a ceiling, not granted authority: clearing all
+// active sets and forbidding exec gains leaves no capabilities to recover.
+fn assume_restricted_credentials(
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    groups: &[nix::unistd::Gid],
+) -> std::io::Result<()> {
+    use nix::unistd::{Gid, Uid};
+    use rustix::thread::{CapabilitySet, CapabilitySets};
+
+    // UID 0 retains ownership and signal authority even without capabilities.
+    if uid == 0 {
+        return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+    }
+    rustix::thread::set_no_new_privs(true)?;
+    nix::unistd::setgroups(groups)?;
+    let uid = Uid::from_raw(uid);
+    let gid = Gid::from_raw(gid);
+    nix::unistd::setresgid(gid, gid, gid)?;
+    nix::unistd::setresuid(uid, uid, uid)?;
+    rustix::thread::clear_ambient_capability_set()?;
+    let empty = CapabilitySets {
+        effective: CapabilitySet::empty(),
+        permitted: CapabilitySet::empty(),
+        inheritable: CapabilitySet::empty(),
+    };
+    rustix::thread::set_capabilities(None, empty)?;
+    let uids = nix::unistd::getresuid()?;
+    let gids = nix::unistd::getresgid()?;
+    if [uids.real, uids.effective, uids.saved] != [uid; 3]
+        || [gids.real, gids.effective, gids.saved] != [gid; 3]
+        || rustix::thread::capabilities(None)? != empty
+        || !rustix::thread::no_new_privs()?
+    {
+        return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+    }
+    Ok(())
 }

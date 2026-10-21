@@ -141,8 +141,12 @@ async fn execution_metadata_and_node_capabilities_are_queryable() -> TestResult 
     let mut sandbox = published_sandbox_state(sandbox_id, "started");
     sandbox.execution = Some((&execution).into());
 
+    let mut tx = db.pool.begin().await?;
+    let observation =
+        crate::execution_observation::prepare(&mut tx, node_id, None, Some(&inventory)).await?;
+    crate::execution_observation::publish(&mut tx, observation).await?;
+    tx.commit().await?;
     let mut conn = db.pool.acquire().await?;
-    publish_execution_inventory(&mut conn, node_id, &inventory).await?;
     publish_template_states(&mut conn, node_id, NodeRole::Builder, &[template]).await?;
     publish_sandbox_states(&mut conn, node_id, &[sandbox]).await?;
     drop(conn);

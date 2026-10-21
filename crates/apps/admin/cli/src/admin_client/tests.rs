@@ -1090,3 +1090,45 @@ fn inventory_null_counts_decode_and_render_as_unknown() {
         single_node_url("http://localhost", "node-id", true).ends_with("include_occupancy=true")
     );
 }
+
+#[test]
+fn node_detail_preserves_unknown_and_absent_execution_reporting() {
+    for outcome in [
+        None,
+        Some("complete"),
+        Some("unavailable"),
+        Some("legacy"),
+        Some("future_outcome"),
+    ] {
+        let mut status = serde_json::json!({
+            "observed_at": "2026-10-20T12:00:00Z",
+            "stale_after": "2026-10-20T12:00:30Z",
+            "stale": false,
+            "reachable": true
+        });
+        if let Some(outcome) = outcome {
+            status["execution_inventory"] = serde_json::json!({
+                "status": outcome,
+                "received_at": "2026-10-19T12:00:00Z"
+            });
+        }
+        let mut node = row("11111111-1111-1111-1111-111111111111");
+        // Old API responses omit the block; future labels remain readable.
+        node.status = Some(serde_json::from_value(status).unwrap());
+        let rendered = render_node_detail(&node);
+        let collection = rendered
+            .lines()
+            .find(|line| line.starts_with("Execution Collection"))
+            .unwrap();
+        assert!(collection.ends_with(outcome.unwrap_or("not reported")));
+        let receipt = rendered
+            .lines()
+            .find(|line| line.starts_with("Execution Receipt"))
+            .unwrap();
+        assert!(receipt.ends_with(if outcome.is_some() {
+            "2026-10-19T12:00:00Z"
+        } else {
+            "-"
+        }));
+    }
+}

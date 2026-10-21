@@ -100,6 +100,14 @@ output "managed_node_groups" {
       scaling_config = group.scaling_config
     }
   }
+
+  # desired_size is ignored, so the plan carries the size EKS reported when it
+  # refreshed, and a min/max change sends that size with the new bounds. EKS
+  # refuses one outside them partway through the apply; this refuses the plan.
+  precondition {
+    condition     = length(local.managed_node_groups_outside_bounds) == 0
+    error_message = "The live desired size of ${join(", ", local.managed_node_groups_outside_bounds)} is outside its configured min_size and max_size, and EKS refuses those bounds. Move the live group to the new bounds through the EKS API, in the order the comment on aws_eks_node_group.managed in the eks-cluster module gives, and re-plan; or change the configured sizes, which for a group being created or replaced are its creation sizes."
+  }
 }
 
 output "managed_node_group_arns" {

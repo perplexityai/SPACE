@@ -976,7 +976,26 @@ message PublishNodeStateRequest {
   // do when there is no report: an empty list treated as a complete one
   // releases a node over artifacts nobody enumerated.
   optional PendingLocalBackupReport pending_local_backups = 10;
+  // Absent means this publication makes no observation, or uses the legacy
+  // execution_inventory field. Complete reports may also populate field 8 for
+  // old readers, but both inventories must agree. An unavailable observation
+  // must not carry field 8. This reports inventory collection, not readiness.
+  // Contradictory reports and missing/unknown outcomes reject the entire
+  // publication with InvalidArgument; collection failures use unavailable.
+  optional ExecutionInventoryObservation execution_observation = 11;
 }
+
+message ExecutionInventoryObservation {
+  oneof outcome {
+    // A successful collection, including an empty inventory.
+    space.execution.v1.NodeExecutionInventory complete = 1;
+    ExecutionInventoryUnavailable unavailable = 2;
+  }
+}
+
+// No authoritative answer was obtained. Detailed local errors stay in node
+// diagnostics; this must not be interpreted as an empty installation set.
+message ExecutionInventoryUnavailable {}
 
 // A node's whole answer to "which artifacts on this disk have no durable
 // copy yet". An empty `pending` here does mean nothing is pending; it is

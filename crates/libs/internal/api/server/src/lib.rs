@@ -145,7 +145,7 @@ pub use published_state::publish_sandbox_states;
 mod sandbox_quarantine_store;
 use published_state::{
     capture_host_cpu, project_ready_suspend_snapshot, prune_absent_node_templates,
-    publish_execution_inventory, publish_template_states, snapshot_execution_metadata,
+    publish_template_states, snapshot_execution_metadata,
 };
 
 const SUPPORTED_TEMPLATE_RUNTIMES: &[RuntimeKind] = &[RuntimeKind::Firecracker];
@@ -1680,6 +1680,7 @@ fn normalize_ip(value: IpAddr) -> IpAddr {
 mod adapter;
 mod auto_lifecycle_delete_completions;
 mod backup_generation_fence;
+mod execution_observation;
 mod metadata;
 mod node_local_backup_pending;
 mod publish;

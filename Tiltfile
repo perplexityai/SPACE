@@ -97,9 +97,6 @@ CHART_SET = TELEMETRY_SET + [
     "storageCredentials=" + STORAGE_CREDENTIALS,
     "storageExchange.secretChecksum=" + STS_BRIDGE_SECRET_CHECKSUM,
 ]
-# The build SHA every SPACE image records, matching the version the workloads
-# report; see telemetry_config.py.
-KIND_GIT_SHA = TELEMETRY_CONFIG["commit"] or "unknown"
 watch_file("infra/space/kind/charts/space-kind-telemetry")
 # Reconcile before returning any changed producer manifests, including on a
 # watched profile transition. Resource startup dependencies alone do not gate
@@ -213,8 +210,32 @@ def pull_base_images(*dockerfiles):
 # dependency stages from the registry layer cache main CI writes, so an
 # unchanged package list downloads nothing. A miss, an unreachable cache or a
 # cached layer that cannot be read builds those layers cold.
-def image_build(image):
-    return "bash infra/space/kind/scripts/runtime-image-cache.sh build " + image
+#
+# Each build goes through infra/space/kind/scripts/image-provenance.py, which
+# computes the image's build identity when the build runs, not when this file
+# loads: the commit, or `<commit>-dirty-<content>` for an image the worktree's
+# changes reach. It passes the identity as the SPACE_GIT_SHA build argument
+# (the bare `--build-arg SPACE_GIT_SHA` below takes it from the environment);
+# for the UI and seed-publish, whose Dockerfiles take no such argument, it also
+# sets the revision label (revision_label). It records the image for the smoke
+# bring-up's provenance check. It certifies an image as the commit's only when
+# the build's inputs were the commit's from the chain's first step, which
+# compiles Rust or assembles the seed, to the end of its docker build:
+# BUILD_INPUTS_SNAPSHOT runs first in every chain, and image_build hands its
+# result to the script as --since. Every build sets --provenance=false:
+# BuildKit's default attestation records the build time, so the image ID would
+# change on every build, unchanged content or not, and the workload would roll.
+BUILD_INPUTS_SNAPSHOT = 'SPACE_BUILD_INPUTS="$(python3 infra/space/kind/scripts/image-provenance.py snapshot)"'
+
+def image_build(image, revision_label = False):
+    return ("python3 infra/space/kind/scripts/image-provenance.py build --cluster {cluster} --image {image} " +
+            '--since "$SPACE_BUILD_INPUTS"{label} -- ' +
+            "bash infra/space/kind/scripts/runtime-image-cache.sh build {image} " +
+            "--provenance=false --sbom=false").format(
+                cluster = KIND_CLUSTER,
+                image = image,
+                label = " --revision-label" if revision_label else "",
+            )
 
 # Up to eight updates at once instead of Tilt's default three. Every Rust image
 # waits on the artifact lock anyway, so the default mostly kept image builds and
@@ -233,14 +254,14 @@ update_settings(max_parallel_updates = MAX_PARALLEL_UPDATES)
 
 def rust_runtime_image(name, dockerfile, runtime_deps):
     cmd = " && ".join([
+        BUILD_INPUTS_SNAPSHOT,
         pull_base_images(dockerfile),
         RUST_ARTIFACT_BUILD,
         ("{build} -t $EXPECTED_REF " +
          "--build-arg SPACE_RUST_BUILD_IMAGE={rust_image} " +
-         "--build-arg SPACE_GIT_SHA={git_sha} .").format(
+         "--build-arg SPACE_GIT_SHA .").format(
             build = image_build(name),
             rust_image = RUST_ARTIFACT_IMAGE,
-            git_sha = KIND_GIT_SHA,
         ),
     ])
     custom_build(
@@ -286,14 +307,15 @@ rust_runtime_image(
 custom_build(
     ref = "space-worker:local",
     command = " && ".join([
+        BUILD_INPUTS_SNAPSHOT,
         pull_base_images("docker/Dockerfile.worker"),
         RUST_ARTIFACT_BUILD,
-        # --provenance=false keeps buildx from emitting a multi-platform
-        # manifest list, which `kind load docker-image` cannot ingest
-        # ("content digest ... not found").
-        (image_build("space-worker") + " --provenance=false --sbom=false -t $EXPECTED_REF " +
-         "--build-arg SPACE_RUST_BUILD_IMAGE={} --build-arg SPACE_GIT_SHA={} .").format(
-            RUST_ARTIFACT_IMAGE, KIND_GIT_SHA),
+        # --provenance=false (image_build) also keeps buildx from emitting a
+        # multi-platform manifest list, which `kind load docker-image` cannot
+        # ingest ("content digest ... not found").
+        (image_build("space-worker") + " -t $EXPECTED_REF " +
+         "--build-arg SPACE_RUST_BUILD_IMAGE={} --build-arg SPACE_GIT_SHA .").format(
+            RUST_ARTIFACT_IMAGE),
     ]),
     deps = RUST_ARTIFACT_DEPS + [
             "docker/Dockerfile.worker",
@@ -316,10 +338,11 @@ custom_build(
 custom_build(
     ref = "space-seed-publish:local",
     command = " && ".join([
+        BUILD_INPUTS_SNAPSHOT,
         pull_base_images("docker/Dockerfile.seed-publish"),
         RUST_ARTIFACT_BUILD,
         "SPACE_RUST_BUILD_IMAGE={} bash infra/space/kind/scripts/build-seed.sh".format(RUST_ARTIFACT_IMAGE),
-        (image_build("space-seed-publish") + " --provenance=false --sbom=false -t $EXPECTED_REF " +
+        (image_build("space-seed-publish", revision_label = True) + " -t $EXPECTED_REF " +
          "--build-context seed=$HOME/.space-devbox/kind/seed/build ."),
     ]),
     deps = RUST_ARTIFACT_DEPS + [
@@ -337,9 +360,9 @@ custom_build(
 custom_build(
     ref = "space-kind-sts-bridge:local",
     command = " && ".join([
+        BUILD_INPUTS_SNAPSHOT,
         pull_base_images("docker/Dockerfile.kind-sts-bridge"),
-        (image_build("space-kind-sts-bridge") + " --provenance=false --sbom=false -t $EXPECTED_REF " +
-         "--build-arg SPACE_GIT_SHA={} .").format(KIND_GIT_SHA),
+        image_build("space-kind-sts-bridge") + " -t $EXPECTED_REF --build-arg SPACE_GIT_SHA .",
     ]),
     deps = ["docker/Dockerfile.kind-sts-bridge", "infra/space/kind/sts-bridge"],
     skips_local_docker = False,
@@ -352,8 +375,9 @@ custom_build(
 custom_build(
     ref = "space-ui:local",
     command = " && ".join([
+        BUILD_INPUTS_SNAPSHOT,
         pull_base_images("docker/Dockerfile.ui"),
-        (image_build("space-ui") + " -t $EXPECTED_REF " +
+        (image_build("space-ui", revision_label = True) + " -t $EXPECTED_REF " +
          "--build-arg NEXT_PUBLIC_API_URL=http://space-api:8080 ."),
     ]),
     deps = ["docker/Dockerfile.ui", "ui"],

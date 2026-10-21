@@ -51,6 +51,41 @@ fn read_decoded_rootfs_chunk_coalesces_short_reads() {
     assert!(eof.is_none());
 }
 
+/// The decoder sees every input byte once, in order, and the off-thread
+/// digest covers exactly those bytes, however reads split across pooled
+/// buffers that are recycled many times over.
+#[test]
+fn hashed_compressed_input_matches_a_whole_file_digest() {
+    let bytes: Vec<u8> = (0..10_000u32).map(|i| (i * 31 % 251) as u8).collect();
+    for (chunk_size, depth, max_read) in [(1, 1, 1), (7, 2, 3), (64, 3, 64), (20_000, 3, 4096)] {
+        let mut input = HashedCompressedInput::new(
+            ShortReader {
+                bytes: bytes.clone(),
+                pos: 0,
+                max_read,
+            },
+            chunk_size,
+            depth,
+        )
+        .unwrap();
+        let mut seen = Vec::new();
+        let mut scratch = [0u8; 5];
+        loop {
+            let read = input.read(&mut scratch).unwrap();
+            if read == 0 {
+                break;
+            }
+            seen.extend_from_slice(&scratch[..read]);
+        }
+        assert_eq!(seen, bytes, "chunk {chunk_size}, depth {depth}");
+        assert_eq!(
+            input.finish_hash().unwrap(),
+            sha256_bytes(&bytes),
+            "chunk {chunk_size}, depth {depth}"
+        );
+    }
+}
+
 #[rstest::rstest]
 #[case::default(None)]
 #[case::sha256(Some(HashAlg::Sha256))]

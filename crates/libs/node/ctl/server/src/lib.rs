@@ -1474,6 +1474,7 @@ impl NodeCtlWorker {
             NETWORK_POLICY_OUTBOUND_RECONCILER,
             SANDBOX_INVENTORY_OUTBOUND_RECONCILER,
             TEMPLATE_INVENTORY_OUTBOUND_RECONCILER,
+            NODE_STATUS_OUTBOUND_RECONCILER,
         ] {
             tx.execute(
                 "UPDATE reconciliation_status

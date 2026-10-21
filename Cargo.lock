@@ -7077,6 +7077,7 @@ dependencies = [
  "pplx-space-spaced-guest-execution",
  "pplx-space-spaced-guest-protocol",
  "pplx-space-test-env",
+ "rustix",
  "tempfile",
  "tokio",
  "tokio-stream",

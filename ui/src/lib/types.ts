@@ -368,6 +368,11 @@ export interface NodeSchedulingStatus {
   network_pool_max_slots: number | null;
 }
 
+export interface ExecutionInventoryObservation {
+  status: string;
+  received_at: string;
+}
+
 export interface NodeStatusSnapshot {
   observed_at: string;
   stale_after: string;
@@ -378,6 +383,7 @@ export interface NodeStatusSnapshot {
   node_id_reported: string | null;
   scheduling: NodeSchedulingStatus | null;
   health: NodeHealthStatus | null;
+  execution_inventory?: ExecutionInventoryObservation;
 }
 
 export interface SpaceNode {

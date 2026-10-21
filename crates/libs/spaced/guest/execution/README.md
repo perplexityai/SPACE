@@ -43,6 +43,32 @@ execution metadata.
   runs filesystem syscalls with the daemon's credentials; its `user` selects path
   interpretation and ownership handling, not impersonation. Neither mode creates
   a filesystem sandbox. The daemon runs inside the guest's isolation boundary.
+- Linux execution services default to `IdentityPolicy::Restricted`. This requires
+  identity workers and a root launcher with effective `CAP_SETUID` and `CAP_SETGID`;
+  Direct mode and insufficient launcher privileges fail construction. This
+  preflight checks current authority; securebits, capability bounding sets and
+  executable attributes may remove required authority across exec, in which case
+  worker startup fails closed before serving operations.
+  Command children and filesystem workers install the account's real, effective,
+  saved and filesystem IDs and supplementary groups. They clear effective,
+  permitted, inheritable and ambient capabilities and set `no_new_privs`, preventing
+  set-ID and file-capability executables from granting additional authority.
+  Accounts resolving to UID 0 are rejected with `FailedPrecondition` for both
+  process and filesystem calls: root retains ownership and signal authority even
+  without capabilities. Primary and supplementary groups, including GID 0, are
+  preserved: callers must provision accounts whose group-based access is appropriate
+  for the workload. Process children enter their working directory only after the
+  drop, enforcing the account's access to every ancestor. The capability
+  bounding set is retained as a ceiling; it grants no active capabilities.
+  Only child credentials change, before worker threads or command exec. Custom
+  entrypoints must dispatch worker mode before starting threads; restricted
+  workers reject startup if another thread already exists.
+- The daemon explicitly selects `IdentityPolicy::Guest`, retaining its existing
+  account switching, root authority and executable privilege semantics. Other
+  platforms retain Guest/Direct defaults. Restricted is a Linux-only policy;
+  neither policy restricts reachable paths or replaces caller-provided isolation.
+  Changing policy requires constructing a new execution service. Use a worker
+  built with the same library: older worker protocols are rejected before dispatch.
 - The daemon registers `filesystem_grpc_service()` and `process_grpc_service()`
   to retain transport payload admission as well as the execution limits. Calling
   generated traits directly does not install the transport admission layer.
@@ -58,15 +84,20 @@ execution metadata.
   service does not establish that every descendant has exited.
 
 This crate retains the daemon contract. General application embedding requires
-credential/capability policy, native admission and shutdown semantics, and
+native admission and shutdown semantics, and
 stronger descendant ownership. Explicit launching alone does not establish those
 guarantees or advertise general embedding support.
 
 The Linux `embedding` integration in the worker app uses the execution crate
 without the guest server. It covers a separate worker artifact, atomic path
 replacement, account-specific writes, idempotency, process output, failed startup,
-cancelled callers and worker reaping. Run it as root in a disposable environment
-with a provisioned `nobody` account using
+cancelled callers and worker reaping. It checks child IDs/groups and capability
+sets with and without a PTY, set-ID/file-capability privilege suppression,
+root-account and launcher rejection, working-directory traversal, late worker
+entrypoint rejection, and unchanged authority on every surviving host thread.
+Run it as root in a disposable environment with a provisioned `nobody` account,
+`CAP_NET_RAW` and `CAP_SETFCAP`, and a writable filesystem that supports executable
+set-ID and file capabilities (not `nosuid`), using
 `cargo test -p pplx-space-spaced-guest-worker --test embedding`.
 CI assigns it to the privileged test group. Broader embedding acceptance remains
 tracked by the RFC.

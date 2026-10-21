@@ -41,9 +41,6 @@ kind_load() {
 }
 
 RUST_ARTIFACT_IMAGE="space-rust-build-kind:local"
-# The build SHA every SPACE image records, matching the version the workloads
-# report; see telemetry_config.py.
-KIND_GIT_SHA="$(python3 "$REPO_ROOT/infra/space/kind/scripts/telemetry_config.py" commit)"
 
 # The one Rust build every runtime image below copies from. Owned by
 # build-rust-artifacts.sh: an incremental cargo build (inside the CI builder
@@ -58,9 +55,27 @@ build_rust_artifacts() {
 # `docker build` for one runtime image, as the Tiltfile runs it: its Dockerfile,
 # its bases from the GHCR mirror when SPACE_CI_IMAGE_MIRROR is set, and its
 # dependency stages from the registry layer cache when
-# SPACE_KIND_BUILD_CACHE_REPOSITORY is set (see runtime-image-cache.sh).
+# SPACE_KIND_BUILD_CACHE_REPOSITORY is set (see runtime-image-cache.sh), under
+# image-provenance.py, which stamps the image's build identity (the commit, or
+# `<commit>-dirty-<content>` for an image the worktree's changes reach) into
+# SPACE_GIT_SHA, read by the bare `--build-arg SPACE_GIT_SHA` below, and
+# records a build it loads for the provenance check. --revision-label sets the
+# revision label on an image whose Dockerfile takes no SPACE_GIT_SHA. The
+# identity is the commit only if the build's inputs were the commit's from
+# BUILD_INPUTS, taken before this script's first build step, to the end of the
+# image's docker build.
+BUILD_INPUTS="$(python3 "$REPO_ROOT/infra/space/kind/scripts/image-provenance.py" snapshot)"
 image_build() {
-  bash "$REPO_ROOT/infra/space/kind/scripts/runtime-image-cache.sh" build "$@"
+  local image=$1 record=()
+  shift
+  (( LOAD_INTO_KIND )) && record=(--cluster "$KIND_CLUSTER")
+  if [[ "${1:-}" == --revision-label ]]; then
+    record+=(--revision-label)
+    shift
+  fi
+  python3 "$REPO_ROOT/infra/space/kind/scripts/image-provenance.py" build \
+    "${record[@]}" --image "$image" --since "$BUILD_INPUTS" -- \
+    bash "$REPO_ROOT/infra/space/kind/scripts/runtime-image-cache.sh" build "$image" "$@"
 }
 
 # Build the runtime image that copies its binaries out of the shared artifact
@@ -74,7 +89,7 @@ build_rust_runtime() {
   log "building runtime image: $runtime_ref ($dockerfile)"
   image_build "$name" --provenance=false --sbom=false -t "$runtime_ref" \
     --build-arg "SPACE_RUST_BUILD_IMAGE=${RUST_ARTIFACT_IMAGE}" \
-    --build-arg "SPACE_GIT_SHA=${KIND_GIT_SHA:-unknown}" \
+    --build-arg SPACE_GIT_SHA \
     .
 
   kind_load "$runtime_ref"
@@ -100,7 +115,7 @@ build_space_kind_key_broker() {
 build_space_kind_sts_bridge() {
   log "building runtime image: space-kind-sts-bridge:local (docker/Dockerfile.kind-sts-bridge)"
   image_build space-kind-sts-bridge --provenance=false --sbom=false -t space-kind-sts-bridge:local \
-    --build-arg "SPACE_GIT_SHA=${KIND_GIT_SHA:-unknown}" \
+    --build-arg SPACE_GIT_SHA \
     .
   kind_load space-kind-sts-bridge:local
 }
@@ -128,7 +143,7 @@ build_space_seed_publish() {
     bash "$REPO_ROOT/infra/space/kind/scripts/build-seed.sh"
 
   log "building runtime image: space-seed-publish:local (docker/Dockerfile.seed-publish)"
-  image_build space-seed-publish --provenance=false --sbom=false -t space-seed-publish:local \
+  image_build space-seed-publish --revision-label --provenance=false --sbom=false -t space-seed-publish:local \
     --build-context "seed=$SEED_OUTPUT_DIR" \
     .
 
@@ -141,7 +156,7 @@ build_space_seed_publish() {
 # in-cluster Service DNS (Tilt uses the same value).
 build_space_ui() {
   log "building runtime image: space-ui:local (docker/Dockerfile.ui)"
-  image_build space-ui --provenance=false --sbom=false -t space-ui:local \
+  image_build space-ui --revision-label --provenance=false --sbom=false -t space-ui:local \
     --build-arg NEXT_PUBLIC_API_URL=http://space-api:8080 \
     --build-arg NEXT_PUBLIC_DATA_PLANE_URL=http://space-data-plane:8090 \
     .

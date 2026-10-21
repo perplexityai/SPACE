@@ -252,7 +252,8 @@ resource "aws_eks_node_group" "general_blue_green" {
   scaling_config {
     desired_size = var.general_blue_green_node_group.recorded_active_size
     max_size     = var.general_blue_green_node_group.max_size
-    min_size     = var.general_blue_green_node_group.recorded_active_size
+    # As on general: the recorded floor only while this pool serves.
+    min_size = var.general_serving_node_group == "general-2" ? var.general_blue_green_node_group.recorded_active_size : 0
   }
 
   update_config {
@@ -279,16 +280,16 @@ resource "aws_eks_node_group" "general_blue_green" {
     delete = "2h"
   }
 
-  # After creation, operators scale this pool between zero and its active
-  # target through EKS, and while it serves, cluster-autoscaler moves its
-  # desired size inside those bounds. Unrelated Terraform applies must not
-  # wake a dormant pool or scale down one that is carrying the active general
-  # workload.
+  # Same ownership split as module.eks's managed groups, and the same
+  # constraint on raising min_size above the live desired size: min and max
+  # are code-owned, desired moves through EKS or, while this pool serves,
+  # cluster-autoscaler. So switching general_serving_node_group to a pool
+  # parked at zero, this one, general or a per-AZ group, needs it grown
+  # through EKS first, and the switch, like any bound change, should be
+  # planned immediately before it's applied (see the per-AZ steps below).
   lifecycle {
     ignore_changes = [
-      scaling_config[0].min_size,
       scaling_config[0].desired_size,
-      scaling_config[0].max_size,
     ]
   }
 }
@@ -304,11 +305,18 @@ resource "aws_eks_node_group" "general_blue_green" {
 #
 # Moving a cluster onto them takes three applies, each with nothing else in it:
 # 1. Declare general_per_az_node_groups. The groups come up at their floors
-#    beside the serving group, which keeps serving. A serving general's live
-#    min_size now has to hold general_min_size, as it does beside general-2.
+#    beside the serving group, which keeps serving. Their minimums stay zero
+#    until they serve.
 # 2. Set general_serving_node_group = "general-per-az". The discovery tags move,
 #    so cluster-autoscaler stops scaling the old group and balances the new
-#    ones. Then cordon the old group's nodes and drain them through the
+#    ones, and the per-AZ minimums rise to each zone's min_size while the old
+#    group's falls to zero. The plan refuses a minimum above a group's live
+#    desired size, so grow any per-AZ group scaled below its floor through EKS
+#    and plan again. Each bound change sends the desired size from the plan,
+#    and cluster-autoscaler is still scaling the old group until this apply
+#    moves its tag, so plan immediately before applying: a saved plan applied
+#    after the autoscaler has grown the old group shrinks it back.
+#    Then cordon the old group's nodes and drain them through the
 #    eviction API, which honors PodDisruptionBudgets and each pod's grace
 #    period; the evicted pods land on the per-AZ groups, which
 #    cluster-autoscaler grows as they go Pending (without it, grow them through
@@ -356,7 +364,8 @@ resource "aws_eks_node_group" "general_per_az" {
   scaling_config {
     desired_size = each.value.min_size
     max_size     = each.value.max_size
-    min_size     = each.value.min_size
+    # As on general-2: each zone's floor only while the per-AZ groups serve.
+    min_size = var.general_serving_node_group == "general-per-az" ? each.value.min_size : 0
   }
 
   update_config {
@@ -383,14 +392,10 @@ resource "aws_eks_node_group" "general_per_az" {
     delete = "2h"
   }
 
-  # The same contract as general-2: after creation each group is sized through
-  # EKS, and while the groups serve, cluster-autoscaler moves their desired
-  # sizes, so no apply sends a stale size back.
+  # The same ownership split as general-2.
   lifecycle {
     ignore_changes = [
-      scaling_config[0].min_size,
       scaling_config[0].desired_size,
-      scaling_config[0].max_size,
     ]
   }
 }

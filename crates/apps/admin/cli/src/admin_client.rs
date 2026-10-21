@@ -715,8 +715,8 @@ pub(crate) fn render_nodes_table(nodes: &[AdminNodeResponse], verbose: bool) -> 
 /// puts one field per line regardless of width.
 ///
 /// Not every field the admin API returns: `node_api_endpoint`, `updated_at`,
-/// `deleted_at`, the `status` snapshot, the `metadata` blob, and the
-/// drainability block's `local_snapshots` mirror are all omitted. Use `--json`
+/// `deleted_at`, the `status` snapshot except its execution receipt, the
+/// `metadata` blob, and the drainability block's `local_snapshots` mirror are all omitted. Use `--json`
 /// for those.
 pub(crate) fn render_node_detail(node: &AdminNodeResponse) -> String {
     let mut fields: Vec<(&str, String)> = vec![
@@ -743,6 +743,19 @@ pub(crate) fn render_node_detail(node: &AdminNodeResponse) -> String {
         ("Last Heartbeat", opt(node.last_heartbeat.as_deref())),
         ("Created At", node.created_at.clone()),
     ];
+    if let Some(status) = &node.status {
+        let observation = status.execution_inventory.as_ref();
+        fields.push((
+            "Execution Collection",
+            observation
+                .map_or("not reported", |report| report.status.as_str())
+                .to_owned(),
+        ));
+        fields.push((
+            "Execution Receipt",
+            opt(observation.map(|report| report.received_at.as_str())),
+        ));
+    }
     // Appended as a group, policy line first, because it qualifies three of the
     // counts below it and has to be read before them: the discount is the
     // server's `present` flag, which gates `Terminate Blockers`,

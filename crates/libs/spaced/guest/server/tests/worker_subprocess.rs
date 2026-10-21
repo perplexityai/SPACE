@@ -91,6 +91,24 @@ async fn run() {
     .await
     .expect("connect");
     let mut client = FilesystemClient::new(channel);
+    if nix::unistd::Uid::effective().is_root() {
+        use std::os::unix::fs::PermissionsExt;
+        // Guest root retains its existing DAC override; embedding restrictions
+        // must not silently change the daemon's filesystem authority.
+        let protected = directory.path().join("protected");
+        std::fs::create_dir(&protected).expect("protected directory");
+        let file = protected.join("file");
+        std::fs::write(&file, b"guest root").expect("protected file");
+        std::fs::set_permissions(&protected, std::fs::Permissions::from_mode(0o000))
+            .expect("deny ordinary directory traversal");
+        client
+            .stat_info(StatRequest {
+                path: file.display().to_string(),
+                user: None,
+            })
+            .await
+            .expect("daemon root keeps its existing authority");
+    }
     // Public messages at the wire limit must fit after the router adds its
     // private execution identity. Keep a live worker to detect collateral reset.
     client

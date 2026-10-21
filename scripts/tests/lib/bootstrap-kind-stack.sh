@@ -18,10 +18,13 @@
 # SPACE node is published through ClusterApi and schedulable, the
 # cluster-controller Deployment is on its latest generation, Tilt has no
 # build pending or in progress and every workload in the namespace has
-# finished rolling, (when DATA_PLANE_URL is supplied) the public data plane
-# is reachable, and no node carries a tombstone contradicted by kube. A Tilt
-# build that fails ends the bring-up with that resource's log instead of
-# consuming the timeout; a Tilt bound to a deleted cluster is restarted.
+# finished rolling, every SPACE container runs the latest build of its image
+# (recorded in $SPACE_KIND_RUN_DIR/provenance.json; under SKIP_BOOTSTRAP=1
+# checked too, unless Tilt still has an update pending), (when DATA_PLANE_URL is
+# supplied) the public data plane is reachable, and no node carries a
+# tombstone contradicted by kube. A Tilt build that fails ends the bring-up
+# with that resource's log instead of consuming the timeout; a Tilt bound to a
+# deleted cluster is restarted.
 #
 # Public entry points: `bootstrap_kind_stack`, `kind_stack_prepare_cluster`, plus
 # `kind_stack_sweep_stale_node_tombstones` and `kind_stack_psql` for suites that
@@ -40,6 +43,12 @@
 #                       (infra/space/kind/lib/storage-credentials.sh); a live
 #                       Tilt running the other mode is restarted in this one
 #   BOOTSTRAP_TIMEOUT — per-stage seconds for blocking initialization/readiness
+#   SPACE_KIND_RUN_DIR — the run's output directory, where the bring-up writes
+#                       provenance.json, the image every SPACE container runs
+#                       against the latest build of it (default: a new
+#                       directory under ~/.space-devbox/kind/runs, named by the
+#                       time and cluster, which the bring-up sets this to so
+#                       the sourcing script can cite the record)
 #   SPACE_TILT_DETACH_TIMEOUT — registration wait for a detached start (default
 #                       60 seconds, at most 240). A timeout leaves the detached
 #                       watcher running; inspect its log and retry once ready.
@@ -473,6 +482,47 @@ bootstrap_kind_stack__wait_for_tilt_quiet() {
             exit 1
         fi
     done < <(kubectl --context "kind-${KIND_CLUSTER}" -n space get deploy,statefulset,daemonset -o name 2>/dev/null)
+}
+
+# Settled is not the same as current: a Tilt stopped between a build and its
+# rollout, or a workload pinned to an earlier image, leaves pods on a build
+# that is no longer the latest, and every wait above passes. Compare every
+# SPACE container's image with the last build of it (image-provenance.py),
+# refuse a mismatch naming the workload, and keep the record in the run's
+# output directory for a report to cite.
+bootstrap_kind_stack__check_provenance() {
+    if [[ -z "${SPACE_KIND_RUN_DIR:-}" ]]; then
+        # mktemp, so two runs starting in the same second keep two records.
+        local runs="${SPACE_TILT_STATE_DIR:-$HOME/.space-devbox/kind}/runs"
+        mkdir -p "$runs"
+        SPACE_KIND_RUN_DIR="$(mktemp -d "$runs/$(date -u +%Y%m%dT%H%M%SZ)-${KIND_CLUSTER}.XXXXXX")"
+    fi
+    echo "[bootstrap] checking that every SPACE pod runs the latest build of its image"
+    if ! python3 "$REPO_ROOT/infra/space/kind/scripts/image-provenance.py" check \
+            --cluster "$KIND_CLUSTER" --output "$SPACE_KIND_RUN_DIR/provenance.json"; then
+        exit 1
+    fi
+}
+
+# Under SKIP_BOOTSTRAP=1, the mode a live stack is used in and so where a
+# workload left on an earlier build after an edit is most likely met, the same
+# check runs once Tilt has nothing pending or in progress. While Tilt is still
+# updating, a mismatch may be the rollout it is about to make, so the check is
+# skipped with a warning rather than refused. No cluster, nothing to check:
+# tested first, as the mount check does, so a box without one writes nothing.
+bootstrap_kind_stack__check_live_provenance() {
+    kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER" || return 0
+    # A Tilt that does not answer has nothing pending either: a stopped Tilt
+    # is how a workload is left on an earlier build, so the check runs.
+    local busy
+    busy="$(bootstrap_kind_stack__tilt_busy_resources)" || busy=""
+    busy="${busy% }"
+    if [[ -n "${busy// /}" ]]; then
+        echo "[bootstrap] WARNING: Tilt is still updating ${busy}; not checking which build each" \
+            "SPACE pod runs. Rerun once \`tilt get uiresources\` shows nothing pending." >&2
+        return 0
+    fi
+    bootstrap_kind_stack__check_provenance
 }
 
 bootstrap_kind_stack__wait_for_api() {
@@ -1096,6 +1146,7 @@ bootstrap_kind_stack__bring_up() {
             exit 1
         fi
         echo "[bootstrap] SKIP_BOOTSTRAP=1; assuming kind+tilt are already running"
+        bootstrap_kind_stack__check_live_provenance
         return
     fi
 
@@ -1287,6 +1338,8 @@ bootstrap_kind_stack__bring_up() {
         bootstrap_kind_stack__worker_reapply_hint
         exit 1
     fi
+
+    bootstrap_kind_stack__check_provenance
 
     if [[ -n "${DATA_PLANE_URL:-}" ]]; then
         echo "[bootstrap] waiting up to ${BOOTSTRAP_TIMEOUT}s for $DATA_PLANE_URL/healthz"
