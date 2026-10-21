@@ -1300,9 +1300,11 @@ load-balanced entry, scaled on load.
 - **cluster-controller** runs two replicas with leader election on: the Lease
   holder runs every reconciler and the other stands by, Ready, to take over.
   The typed scenario `local.leader_election_brownout_keeps_one_leader`
-  exercises the handoff. It needs `otel` mode. It takes about 30 minutes, so
-  Kind CI's duration-balanced sharding gives it one shard's ECW pass to itself;
-  that shard's native pass runs after it. Run it alone with
+  exercises the handoff. It needs `otel` mode. It lowers the controller's
+  liveness budget to its floor for its own run, through a test hook that is
+  inert unless the `test-hooks` feature is compiled in, as the Kind build
+  does, and puts the standing value back at the end; it takes about 13
+  minutes. Run it alone with
   `uv run --frozen --python 3.11 -m space_smoke run
   local.leader_election_brownout_keeps_one_leader`.
 - **internal-api** (ClusterApi) runs two replicas behind its ClusterIP

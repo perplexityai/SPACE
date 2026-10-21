@@ -1361,8 +1361,52 @@ fn derive_timings_floors_an_operator_supplied_liveness_budget() {
     );
 }
 
+/// The test-hook budget is a request to `Timings::derive` like the default:
+/// honoured between the floor and the ceiling, clamped outside them, and an
+/// absent or unusable value leaves the default.
+#[test]
+fn the_liveness_budget_override_is_bounded_like_the_default() {
+    use super::{
+        DEFAULT_LEASE_FAILURE_GRACE, DEFAULT_LEASE_TTL, LEASE_FAILURE_GRACE_TEST_ENV,
+        LeaderElectionConfig, MAX_LEASE_FAILURE_GRACE, MIN_GRACE_LEASE_TTL_MULTIPLE,
+    };
+
+    let budget = |value: Option<&str>| {
+        let mut env = pplx_space_test_env::TestEnv::default();
+        env.set("HOSTNAME", "space-cluster-controller-abc123");
+        if let Some(value) = value {
+            env.set(LEASE_FAILURE_GRACE_TEST_ENV, value);
+        }
+        LeaderElectionConfig::from_environment(&env).lease_failure_grace
+    };
+    let floor = DEFAULT_LEASE_TTL * MIN_GRACE_LEASE_TTL_MULTIPLE;
+
+    assert_budget_near(
+        budget(Some("300")),
+        Duration::from_secs(300),
+        "a budget between the bounds is honoured",
+    );
+    assert_budget_near(
+        budget(Some("10")),
+        floor,
+        "a budget below the floor is raised to it",
+    );
+    assert_budget_near(
+        budget(Some("999999")),
+        MAX_LEASE_FAILURE_GRACE,
+        "a budget above the ceiling is lowered to it",
+    );
+    for unusable in [None, Some(""), Some("0"), Some("ten"), Some("-5")] {
+        assert_budget_near(
+            budget(unusable),
+            DEFAULT_LEASE_FAILURE_GRACE,
+            &format!("{unusable:?} leaves the default"),
+        );
+    }
+}
+
 /// The cadence floor must never grow so large that it disables the budget it
-/// exists to protect. A typo'd `retryIntervalSecs` of ~1e9 would otherwise
+/// exists to protect. A typo'd retry interval of ~1e9 seconds would otherwise
 /// saturate the floor to `Duration::MAX`, leaving the replica permanently
 /// NotReady with a liveness budget it can never reach — the exact failure the
 /// floor prevents, reached from the other side.
@@ -1542,7 +1586,7 @@ fn the_budget_is_spread_across_replica_identities() {
     );
 
     // And a *floored* budget must be spread too. This is the common case, not a
-    // corner: raising retryIntervalSecs floors every replica to the same value,
+    // corner: raising the retry interval floors every replica to the same value,
     // so spreading only the honoured path would leave the whole fleet in
     // lockstep exactly when an operator has tuned the knobs.
     let floored = |identity: &str| {
@@ -1564,9 +1608,9 @@ fn the_budget_is_spread_across_replica_identities() {
 }
 
 /// The budget is spent by *sampling* the lease, so it is floored against the
-/// retry cadence as well as the TTL. Without this a wide `retryIntervalSecs` —
-/// a chart knob — decides from too few points: an apiserver healthy except at
-/// the sampling instants would restart the pod on a handful of them.
+/// retry cadence as well as the TTL. Without this a wide retry interval decides
+/// from too few points: an apiserver healthy except at the sampling instants
+/// would restart the pod on a handful of them.
 #[test]
 fn derive_timings_floors_the_budget_against_the_retry_cadence() {
     use super::{MIN_GRACE_RETRY_INTERVALS, Timings};
@@ -1634,7 +1678,7 @@ fn derive_timings_floors_the_budget_against_the_retry_cadence() {
 /// crash-loop with no reconciler running that the liveness budget never sees,
 /// because every call *succeeded*.
 ///
-/// The TTL cap alone accepts it: at `leaseTtlSecs: 30`, `retryIntervalSecs: 25`
+/// The TTL cap alone accepts it: at a 30s TTL, a 25s retry interval
 /// sits under both the TTL and `MAX_RETRY_INTERVAL`. Worse, the operator text
 /// used to suggest raising this very knob when acquisitions time out.
 #[test]

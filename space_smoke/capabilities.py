@@ -2235,10 +2235,26 @@ class ControllerLeaseWatch(Protocol):
         ...
 
 
+class NodeExitWatch(Protocol):
+    """A running watch of one node's container exits, read from its containerd."""
+
+    def exits(self) -> dict[str, tuple[int, float]]:
+        """Container id -> (exit code, exit time) for every exit seen so far."""
+        ...
+
+    def diagnostics(self) -> str:
+        """Whether the watch still runs, and the end of its stderr, for evidence."""
+        ...
+
+    def stop(self) -> None:
+        """End the watch; idempotent."""
+        ...
+
+
 class LeaderElectionControl(TelemetryBackendControl, Protocol):
     """Kind-only operations for the cluster-controller leader-election scenario.
 
-    The faults are a third contender Deployment that runs the controller's own
+    The faults are a third contender Pod that runs the controller's own
     pod template under a ServiceAccount with no `leases` grant, and the
     control-plane apiserver's static-pod manifest moved out of kubelet's
     manifest directory. Everything asserted is read from Kubernetes objects,
@@ -2258,6 +2274,27 @@ class LeaderElectionControl(TelemetryBackendControl, Protocol):
         """The Deployment's leader-election kill switch is on."""
         ...
 
+    def controller_liveness_budget_env(self, *, refused_contender: bool = False) -> str | None:
+        """The liveness-budget test hook's literal on the healthy Deployment or the contender's.
+
+        None when unset; a `valueFrom` entry is refused.
+        """
+        ...
+
+    def set_controller_liveness_budget_env(self, seconds: str) -> None:
+        """Set the hook to whole seconds under the caller's mutation Lease and await the rollout."""
+        ...
+
+    def restore_controller_liveness_budget_env(
+        self, standing: str | None, *, wait: bool = True
+    ) -> None:
+        """Put a captured literal back verbatim, removing the key for None.
+
+        Awaits the rollout unless `wait` is False, which cleanup uses so the
+        write fits its budget.
+        """
+        ...
+
     def controller_lease(self) -> ControllerLease | None:
         """The leadership Lease, or None when it does not exist yet."""
         ...
@@ -2270,16 +2307,29 @@ class LeaderElectionControl(TelemetryBackendControl, Protocol):
         """The healthy Deployment's pods, or the refused contender's."""
         ...
 
-    def start_refused_contender(self) -> None:
-        """Run one more replica of the controller's pod template without `leases` RBAC.
+    def place_refused_contender(self) -> None:
+        """Place one more pod of the controller's pod template without `leases` RBAC.
 
-        Refuses when the substitute ServiceAccount can read Leases, since every
-        lease call then succeeds and nothing would be refused.
+        Returns once its gate container runs, holding the controller container
+        back until `release_refused_contender`. Refuses when the substitute
+        ServiceAccount can read Leases, since every lease call then succeeds
+        and nothing would be refused.
         """
         ...
 
-    def remove_refused_contender(self) -> None:
-        """Delete the contender and wait for its pods to be gone; idempotent."""
+    def release_refused_contender(self) -> None:
+        """Open the placed contender's gate through its node's CRI, so its controller starts."""
+        ...
+
+    def remove_refused_contender(self, *, wait: bool = True) -> None:
+        """Delete the contender, and any earlier Deployment of it; idempotent.
+
+        Waits for its pods to be gone unless `wait` is False.
+        """
+        ...
+
+    def watch_node_container_exits(self, node_name: str) -> NodeExitWatch:
+        """Start recording the node's container exits as containerd reports them."""
         ...
 
     def control_plane_node(self) -> str:
@@ -2294,8 +2344,11 @@ class LeaderElectionControl(TelemetryBackendControl, Protocol):
         """Move the apiserver's static-pod manifest out of kubelet's directory."""
         ...
 
-    def restore_apiserver(self, node_name: str) -> None:
-        """Put a parked apiserver manifest back; a no-op when none is parked."""
+    def restore_apiserver(self, node_name: str, *, timeout: float = 30) -> None:
+        """Put a parked apiserver manifest back; a no-op when none is parked.
+
+        The node exec is bounded by `timeout`.
+        """
         ...
 
     def node_controller_containers(self, node_name: str, pod_name: str) -> list[NodeContainer]:
