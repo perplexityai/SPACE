@@ -2,14 +2,14 @@
 //! otherwise hold one of its shared execution slots.
 //!
 //! Dispatcher executions run inside [`scope`] with a [`RetryDeferral`]. A
-//! step that would keep sleeping before retrying (today only the fenced
-//! restore-claim lap in the Kubernetes wake path) calls [`defer_retry_wait`]
+//! step that would keep sleeping before retrying (the fenced restore-claim
+//! lap in the Kubernetes wake path) calls [`defer_retry_wait`]
 //! instead, returns its retryable error, and the dispatcher requeues the
 //! operation without spending an attempt. HTTP callers never set a scope and
 //! keep their in-budget waits. It is a task-local, like
-//! [`crate::wake_trace`], because the decision is made above the `Substrate`
-//! trait that every HTTP path shares; detached work re-enters it with
-//! [`current`] and [`scope`].
+//! [`crate::wake_trace`], because the request and its record are per
+//! execution, several controller calls above the step that reads them;
+//! detached work re-enters it with [`current`] and [`scope`].
 
 use std::future::Future;
 use std::sync::Arc;

@@ -9,8 +9,8 @@ use pplx_space_api::egress_profiles::EgressProfiles;
 use pplx_space_api::fork_operation_executor::ForkSandboxOperationExecutor;
 use pplx_space_api::public_operation_driver::{
     DEFAULT_CLAIM_STALE_AFTER, DEFAULT_M1_MAX_AGE, DEFAULT_MAX_RETRY_ATTEMPTS, DEFAULT_RETRY_AFTER,
-    DEFAULT_RETRY_BACKOFF_BASE, DEFAULT_RETRY_BACKOFF_MAX, OperationExecutionConfig,
-    OperationExecutor, claim_renewal_interval, drive_claimed_operation, execution_span,
+    OperationExecutionConfig, OperationExecutor, claim_renewal_interval, drive_claimed_operation,
+    execution_span,
 };
 pub use pplx_space_api::public_operation_driver::{OperationExecutionResult, TickReport};
 use pplx_space_api::public_operations::{
@@ -47,12 +47,6 @@ const DEFAULT_CLAIM_LIMIT: u32 = 64;
 const DEFAULT_EXECUTION_CONCURRENCY: usize = 16;
 const MAX_EXECUTION_CONCURRENCY: usize = 128;
 const M1_MAX_AGE_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_M1_MAX_AGE_SECS";
-const MAX_RETRY_ATTEMPTS_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_MAX_RETRY_ATTEMPTS";
-const MAX_RETRY_ATTEMPTS_CEILING: u32 = 64;
-const RETRY_BACKOFF_BASE_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_RETRY_BACKOFF_BASE_SECS";
-const RETRY_BACKOFF_BASE_CEILING: Duration = Duration::from_secs(60);
-const RETRY_BACKOFF_MAX_ENV: &str = "SPACE_PUBLIC_OPERATION_DISPATCHER_RETRY_BACKOFF_MAX_SECS";
-const RETRY_BACKOFF_MAX_CEILING: Duration = Duration::from_secs(900);
 /// How soon an operation handed back because its key is already executing
 /// in this process becomes claimable again.
 const BUSY_KEY_RETRY_AFTER: Duration = Duration::from_secs(1);
@@ -69,13 +63,10 @@ pub struct ReconcilerConfig {
     pub retry_after: Duration,
     pub max_retry_attempts: i32,
     pub m1_max_age: Option<Duration>,
-    pub retry_backoff_base: Duration,
-    pub retry_backoff_max: Duration,
-    /// Kill switch for the keyed work queue: off restores the unkeyed claim
-    /// and the executor's fixed pacing for counted retries.
+    /// Kill switch for the keyed work queue: off restores the unkeyed claim.
     pub keyed_claim_enabled: bool,
     /// Kill switch for retry deferral, independent of the keyed claim: off
-    /// keeps every retry wait inside the execution's slot, as before.
+    /// keeps every retry wait inside the execution's slot.
     pub retry_deferral_enabled: bool,
 }
 
@@ -90,8 +81,6 @@ impl Default for ReconcilerConfig {
             retry_after: DEFAULT_RETRY_AFTER,
             max_retry_attempts: DEFAULT_MAX_RETRY_ATTEMPTS,
             m1_max_age: Some(DEFAULT_M1_MAX_AGE),
-            retry_backoff_base: DEFAULT_RETRY_BACKOFF_BASE,
-            retry_backoff_max: DEFAULT_RETRY_BACKOFF_MAX,
             keyed_claim_enabled: true,
             retry_deferral_enabled: true,
         }
@@ -131,22 +120,7 @@ impl ReconcilerConfig {
                 DEFAULT_CLAIM_STALE_AFTER,
             ),
             retry_after: DEFAULT_RETRY_AFTER,
-            max_retry_attempts: i32::try_from(config.bounded_u32(
-                MAX_RETRY_ATTEMPTS_ENV,
-                DEFAULT_MAX_RETRY_ATTEMPTS.unsigned_abs(),
-                MAX_RETRY_ATTEMPTS_CEILING,
-            ))
-            .unwrap_or(DEFAULT_MAX_RETRY_ATTEMPTS),
-            retry_backoff_base: config.bounded_duration_secs(
-                RETRY_BACKOFF_BASE_ENV,
-                default.retry_backoff_base,
-                RETRY_BACKOFF_BASE_CEILING,
-            ),
-            retry_backoff_max: config.bounded_duration_secs(
-                RETRY_BACKOFF_MAX_ENV,
-                default.retry_backoff_max,
-                RETRY_BACKOFF_MAX_CEILING,
-            ),
+            max_retry_attempts: DEFAULT_MAX_RETRY_ATTEMPTS,
             keyed_claim_enabled: config
                 .truthy_default(KEYED_CLAIM_ENABLED_ENV, default.keyed_claim_enabled),
             retry_deferral_enabled: config
@@ -169,14 +143,6 @@ fn execution_config(config: &ReconcilerConfig) -> OperationExecutionConfig {
         retry_after: config.retry_after,
         max_retry_attempts: config.max_retry_attempts,
         m1_max_age: config.m1_max_age,
-        // A zero base makes a counted retry wait exactly the executor's hint,
-        // the pacing before backoff existed.
-        retry_backoff_base: if config.keyed_claim_enabled {
-            config.retry_backoff_base
-        } else {
-            Duration::ZERO
-        },
-        retry_backoff_max: config.retry_backoff_max.max(config.retry_backoff_base),
     }
 }
 
@@ -372,9 +338,6 @@ pub async fn run<E>(
     // so without this line an over-ceiling setting looks like it took effect.
     tracing::info!(
         execution_concurrency = config.execution_concurrency,
-        max_retry_attempts = config.max_retry_attempts,
-        retry_backoff_base_secs = config.retry_backoff_base.as_secs(),
-        retry_backoff_max_secs = config.retry_backoff_max.as_secs(),
         keyed_claim_enabled = config.keyed_claim_enabled,
         retry_deferral_enabled = config.retry_deferral_enabled,
         "starting public-operation-dispatcher"
@@ -396,8 +359,8 @@ pub async fn run<E>(
     let mut task_keys: HashMap<tokio::task::Id, String> = HashMap::new();
     let mut hand_backs = JoinSet::new();
     // Reclaiming an operation still executing here means its execution lost
-    // the claim and notices only at its next renewal; any other collision is
-    // an execution already finished in the store but not yet reaped.
+    // the claim and notices only at its next renewal. Any other collision is
+    // an execution whose result reached the store before its task returned.
     let stale_reclaim_retry_after = claim_renewal_interval(execution_config.claim_stale_after);
     let mut last_claim_failure_warn: Option<Instant> = None;
     let mut suppressed_claim_failures: u64 = 0;
@@ -417,6 +380,11 @@ pub async fn run<E>(
                 let started = Instant::now();
                 match claim_up_to(&config, &store, &executor, free).await {
                     Ok(claim) => {
+                        // An execution that committed while the claim ran
+                        // must not make its successor look busy.
+                        while let Some(joined) = in_flight.try_join_next_with_id() {
+                            finish_execution(joined, &mut busy_keys, &mut task_keys);
+                        }
                         let claimed = claim.operations.len();
                         for operation in claim.operations {
                             let key = config
@@ -675,9 +643,10 @@ where
         OperationExecutor::Dispatcher,
         async move {
             let mut result = execution.await;
-            // A requeue after a step handed its wait back spends no attempt
-            // and is bounded by the operation's age instead.
+            // A transient retry after a step handed its wait back is the
+            // deferral; other requeue reasons keep their own accounting.
             if result.state == OperationState::Queued
+                && result.requeue_reason == PublicOperationRequeueReason::TransientFailure
                 && recorded.as_ref().is_some_and(RetryDeferral::deferred)
             {
                 result.requeue_reason = PublicOperationRequeueReason::RetryDeferred;

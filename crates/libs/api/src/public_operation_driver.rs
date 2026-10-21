@@ -27,10 +27,13 @@ pub const DEFAULT_CLAIM_STALE_AFTER: Duration = Duration::from_secs(60);
 pub const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(5);
 pub const DEFAULT_MAX_RETRY_ATTEMPTS: i32 = 16;
 pub const DEFAULT_M1_MAX_AGE: Duration = Duration::from_secs(1_800);
-/// First counted-retry backoff ceiling; each later counted retry doubles it.
-pub const DEFAULT_RETRY_BACKOFF_BASE: Duration = Duration::from_secs(2);
-/// Largest counted-retry backoff ceiling.
-pub const DEFAULT_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// How long an operation may keep deferring its retry waits, from its first
+/// claim. Deferred retries spend no attempts, so this matches the longest a
+/// fenced restore can retry in its slot on the attempt budget: 16 attempts of
+/// a 130 s wait plus the 5 s requeue hint.
+pub const DEFERRED_RETRY_WINDOW: Duration = Duration::from_secs(16 * 135);
+/// Largest spacing ceiling between deferred retries.
+const DEFERRED_RETRY_MAX_SPACING: Duration = Duration::from_secs(60);
 
 fn m1_deadline_message(max_age_seconds: u64) -> String {
     let max_age = format_simple_duration(Duration::from_secs(max_age_seconds));
@@ -76,7 +79,6 @@ pub fn execution_span(operation: &ClaimedPublicOperation) -> tracing::Span {
         origin_sampled = tracing::field::Empty,
         otel.status_code = tracing::field::Empty,
         otel.status_description = tracing::field::Empty,
-        retry_backoff_ms = tracing::field::Empty,
     );
     if let Some(traceparent) = operation.traceparent.as_deref() {
         pplx_space_observability::trace_propagation::link_root_to_origins(&span, [traceparent]);
@@ -90,10 +92,6 @@ pub struct OperationExecutionConfig {
     pub retry_after: Duration,
     pub max_retry_attempts: i32,
     pub m1_max_age: Option<Duration>,
-    /// Counted retries back off exponentially from this ceiling, with
-    /// jitter, but never sooner than the executor's own retry hint.
-    pub retry_backoff_base: Duration,
-    pub retry_backoff_max: Duration,
 }
 
 impl Default for OperationExecutionConfig {
@@ -103,8 +101,6 @@ impl Default for OperationExecutionConfig {
             retry_after: DEFAULT_RETRY_AFTER,
             max_retry_attempts: DEFAULT_MAX_RETRY_ATTEMPTS,
             m1_max_age: Some(DEFAULT_M1_MAX_AGE),
-            retry_backoff_base: DEFAULT_RETRY_BACKOFF_BASE,
-            retry_backoff_max: DEFAULT_RETRY_BACKOFF_MAX,
         }
     }
 }
@@ -298,11 +294,16 @@ where
             };
             let retry_deferred =
                 supported_requeue && requeue_reason == PublicOperationRequeueReason::RetryDeferred;
-            // Deferred retries spend no attempts, so the operation's age is
-            // what bounds them, whatever its kind or product.
-            let deadline = if retry_deferred {
-                Some(config.m1_max_age.unwrap_or(DEFAULT_M1_MAX_AGE))
-            } else if is_native_m1_terminalized_kind(api_product, kind) {
+            // Deferred retries spend no attempts; past the deferral window
+            // they fail as an exhausted budget would.
+            let deferred_for = if retry_deferred {
+                store.time_since_first_claim(operation_id).await?
+            } else {
+                None
+            };
+            let deferral_exhausted =
+                deferred_for.is_some_and(|deferred_for| deferred_for >= DEFERRED_RETRY_WINDOW);
+            let deadline = if is_native_m1_terminalized_kind(api_product, kind) {
                 config.m1_max_age
             } else {
                 None
@@ -366,8 +367,9 @@ where
                     );
                 }
                 updated
-            } else if !preserve_retry_budget
-                && retry_budget_exhausted(attempts, config.max_retry_attempts)
+            } else if deferral_exhausted
+                || (!preserve_retry_budget
+                    && retry_budget_exhausted(attempts, config.max_retry_attempts))
             {
                 let terminal_error_code = result
                     .terminal_error_code
@@ -407,19 +409,6 @@ where
                         OperationState::Failed.as_str(),
                         executor_label,
                     );
-                    pplx_space_metrics::operations::retry_exhausted(
-                        api_product_label,
-                        kind.as_str(),
-                    );
-                    tracing::warn!(
-                        operation_id = %operation_id,
-                        api_product = api_product_label,
-                        kind = kind.as_str(),
-                        retry_reason,
-                        attempts,
-                        max_retry_attempts = config.max_retry_attempts.max(1),
-                        "public operation failed after exhausting its retry attempts"
-                    );
                 }
                 updated
             } else {
@@ -427,32 +416,12 @@ where
                     .retry_after
                     .filter(|retry_after| !retry_after.is_zero())
                     .unwrap_or(config.retry_after);
-                // A transient failure backs off per operation, so one
-                // repeatedly failing sandbox is retried ever more rarely
-                // instead of at its executor's fixed hint; budget-preserving
-                // requeues, deferred retries included, keep the executor's
-                // pacing.
-                let retry_after = if preserve_retry_budget {
-                    retry_hint
-                } else {
-                    let backoff = counted_retry_backoff(
-                        operation_id,
-                        attempts,
-                        retry_hint,
-                        config.retry_backoff_base,
-                        config.retry_backoff_max,
-                    );
-                    pplx_space_metrics::operations::retry_backoff(
-                        api_product_label,
-                        kind.as_str(),
-                        backoff.as_secs_f64(),
-                    );
-                    backoff
+                let retry_after = match deferred_for {
+                    Some(deferred_for) => {
+                        deferred_retry_delay(operation_id, deferred_for, retry_hint)
+                    }
+                    None => retry_hint,
                 };
-                tracing::Span::current().record(
-                    "retry_backoff_ms",
-                    u64::try_from(retry_after.as_millis()).unwrap_or(u64::MAX),
-                );
                 let updated = store
                     .release_claimed_operation(ReleaseClaimedPublicOperation {
                         claim_token,
@@ -495,34 +464,25 @@ pub fn claim_renewal_interval(claim_stale_after: Duration) -> Duration {
     (claim_stale_after / 3).max(Duration::from_millis(10))
 }
 
-/// The delay before the next attempt after counted attempt `attempts`
-/// failed: an equal-jitter exponential backoff whose ceiling starts at
-/// `base` and doubles to `max`, floored at the executor's `hint`. The jitter
-/// is derived from the operation and attempt, so operations that failed
-/// together spread apart while one operation's schedule stays reproducible.
-pub fn counted_retry_backoff(
+/// The delay before re-driving an operation that deferred its retry wait:
+/// the executor's `hint` plus an equal-jittered eighth of how long it has
+/// been deferring, capped at a minute. A fence that clears quickly is retried
+/// within seconds; a long one is retried about once a minute.
+pub fn deferred_retry_delay(
     operation_id: OperationId,
-    attempts: i32,
+    deferred_for: Duration,
     hint: Duration,
-    base: Duration,
-    max: Duration,
 ) -> Duration {
-    if base.is_zero() {
-        return hint;
-    }
-    let doublings = u32::try_from(attempts.saturating_sub(1).clamp(0, 20)).unwrap_or(0);
-    let ceiling = base.saturating_mul(1_u32 << doublings).min(max.max(base));
-    let half = ceiling / 2;
-    let jittered = half + half.mul_f64(retry_jitter_fraction(operation_id, attempts));
-    jittered.max(hint)
+    let half = (deferred_for / 8).min(DEFERRED_RETRY_MAX_SPACING) / 2;
+    hint + half + half.mul_f64(retry_jitter_fraction(operation_id, deferred_for.as_secs()))
 }
 
-fn retry_jitter_fraction(operation_id: OperationId, attempts: i32) -> f64 {
+fn retry_jitter_fraction(operation_id: OperationId, seed: u64) -> f64 {
     use std::hash::{DefaultHasher, Hash, Hasher};
 
     let mut hasher = DefaultHasher::new();
     operation_id.to_string().hash(&mut hasher);
-    attempts.hash(&mut hasher);
+    seed.hash(&mut hasher);
     // The top 53 bits fill an f64 mantissa exactly: a fraction in [0, 1).
     (hasher.finish() >> 11) as f64 / (1_u64 << 53) as f64
 }

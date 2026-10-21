@@ -3,12 +3,12 @@
 //! backed-off retry budget.
 
 use super::*;
-use pplx_space_api::public_operation_driver::counted_retry_backoff;
 use pplx_space_api::public_operations::PUBLIC_OPERATION_CLAIM_LOCK_KEY;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const STUCK_PREFIX: &str = "sbx_stuck_";
+const SLOW_PREFIX: &str = "sbx_slow_";
 
 /// Succeeds every operation after a short pause, except on `sbx_stuck_*`
 /// sandboxes, which always fail retryably the way a wake behind a lingering
@@ -19,8 +19,6 @@ const STUCK_PREFIX: &str = "sbx_stuck_";
 struct KeyedRecordingExecutor {
     running_per_key: Arc<Mutex<HashMap<String, usize>>>,
     max_overlap_per_key: Arc<AtomicUsize>,
-    stuck_running: Arc<AtomicUsize>,
-    max_stuck_running: Arc<AtomicUsize>,
     stuck_attempts: Arc<AtomicUsize>,
     undeferred_stuck_attempts: Arc<AtomicUsize>,
     completed: Arc<Mutex<Vec<(String, OperationId)>>>,
@@ -50,15 +48,12 @@ impl PublicOperationExecutor for KeyedRecordingExecutor {
             self.max_overlap_per_key.fetch_max(*count, Ordering::SeqCst);
         }
         let result = if key.starts_with(STUCK_PREFIX) {
-            let now = self.stuck_running.fetch_add(1, Ordering::SeqCst) + 1;
-            self.max_stuck_running.fetch_max(now, Ordering::SeqCst);
             self.stuck_attempts.fetch_add(1, Ordering::SeqCst);
             if !pplx_space_api::retry_deferral::defer_retry_wait("test") {
                 self.undeferred_stuck_attempts
                     .fetch_add(1, Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_secs(30)).await;
             }
-            self.stuck_running.fetch_sub(1, Ordering::SeqCst);
             OperationExecutionResult {
                 state: OperationState::Queued,
                 progress_message: "deferring restore: lingering prior-generation pod".to_string(),
@@ -69,7 +64,12 @@ impl PublicOperationExecutor for KeyedRecordingExecutor {
                 requeue_reason: PublicOperationRequeueReason::TransientFailure,
             }
         } else {
-            tokio::time::sleep(Duration::from_millis(15)).await;
+            let run_for = if key.starts_with(SLOW_PREFIX) {
+                300
+            } else {
+                15
+            };
+            tokio::time::sleep(Duration::from_millis(run_for)).await;
             self.completed
                 .lock()
                 .expect("lock")
@@ -244,6 +244,23 @@ async fn one_sandboxs_operations_never_overlap_across_two_dispatchers() -> TestR
                 .push(operation_id);
         }
     }
+    // A delete passes a wake in backoff; the wake comes due while the delete
+    // still runs, so neither dispatcher may start it until the delete ends.
+    let mut bypassed = Vec::new();
+    for sandbox in 0..4 {
+        let key = format!("{SLOW_PREFIX}{sandbox}");
+        let wake = create_op(&store, org_id, OperationKind::WakeSandbox, &key).await?;
+        sqlx::query(sql!(
+            "UPDATE public_operations
+             SET next_attempt_at = NOW() + INTERVAL '100 milliseconds'
+             WHERE operation_id = $1"
+        ))
+        .bind(wake.as_uuid())
+        .execute(&db.pool)
+        .await?;
+        bypassed.push(wake);
+        bypassed.push(create_op(&store, org_id, OperationKind::DeleteSandbox, &key).await?);
+    }
     let executor = KeyedRecordingExecutor::default();
     let shutdown = CancellationToken::new();
     let dispatchers = [
@@ -261,7 +278,7 @@ async fn one_sandboxs_operations_never_overlap_across_two_dispatchers() -> TestR
         )),
     ];
 
-    for operation_id in expected.values().flatten() {
+    for operation_id in expected.values().flatten().chain(&bypassed) {
         wait_for_state(&db.pool, *operation_id, OperationState::Succeeded).await?;
     }
     shutdown.cancel();
@@ -292,9 +309,11 @@ async fn claim_holds_back_operations_behind_their_sandboxs_live_or_earlier_work(
     let first = create_op(&store, org_id, OperationKind::WakeSandbox, "sbx_keyed").await?;
     let second = create_op(&store, org_id, OperationKind::StopSandbox, "sbx_keyed").await?;
     let other = create_op(&store, org_id, OperationKind::WakeSandbox, "sbx_other").await?;
+    // Forks keep their own source lock and stay outside the key.
+    let fork = create_op(&store, org_id, OperationKind::ForkSandbox, "sbx_keyed").await?;
 
     let claim = claim_all(&store).await?;
-    assert_eq!(claimed_ids(&claim), vec![first, other]);
+    assert_eq!(claimed_ids(&claim), vec![first, other, fork]);
     // The first operation is running under a live claim.
     assert!(claimed_ids(&claim_all(&store).await?).is_empty());
 
@@ -320,15 +339,23 @@ async fn claim_holds_back_operations_behind_their_sandboxs_live_or_earlier_work(
 }
 
 #[tokio::test]
-async fn delete_supersedes_a_backed_off_wake_but_not_a_pending_create() -> TestResult {
+async fn delete_supersedes_backed_off_work_but_not_a_pending_create() -> TestResult {
     let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
         return Ok(());
     };
     let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
     let store = PublicOperationStore::new(db.pool.clone());
 
-    // A wake due now is about to run: the delete waits for it.
+    // A wake due now is about to run: the delete waits for it. A second
+    // wake, a client retry, queues behind the first.
     let wake = create_op(
+        &store,
+        org_id,
+        OperationKind::WakeSandbox,
+        "sbx_wake_delete",
+    )
+    .await?;
+    let second_wake = create_op(
         &store,
         org_id,
         OperationKind::WakeSandbox,
@@ -371,8 +398,8 @@ async fn delete_supersedes_a_backed_off_wake_but_not_a_pending_create() -> TestR
     let claim = claim_all(&store).await?;
     assert_eq!(claimed_ids(&claim), vec![wake, unrelated]);
 
-    // The wake fails retryably into a long backoff: the delete no longer
-    // waits for it.
+    // The first wake fails retryably into a long backoff: the delete no
+    // longer waits for it, nor for the second wake queued behind it.
     store
         .release_claimed_operation(ReleaseClaimedPublicOperation {
             claim_token: claim.claim_token.clone(),
@@ -383,10 +410,12 @@ async fn delete_supersedes_a_backed_off_wake_but_not_a_pending_create() -> TestR
         })
         .await?;
     assert_eq!(claimed_ids(&claim_all(&store).await?), vec![delete]);
-    assert_eq!(
-        operation_state(&db.pool, delete_after_create).await?,
-        OperationState::Queued.as_str()
-    );
+    for held in [second_wake, delete_after_create] {
+        assert_eq!(
+            operation_state(&db.pool, held).await?,
+            OperationState::Queued.as_str()
+        );
+    }
     Ok(())
 }
 
@@ -433,6 +462,36 @@ async fn stale_claim_recovery_keeps_the_sandboxs_order() -> TestResult {
         operation_state(&db.pool, later).await?,
         OperationState::Queued.as_str()
     );
+
+    // A delete that passed a wake in backoff goes stale. Once the wake is
+    // due, the delete is reclaimed first, fencing its old execution, rather
+    // than letting the wake start beside it.
+    let wake = create_op(
+        &store,
+        org_id,
+        OperationKind::WakeSandbox,
+        "sbx_stale_bypass",
+    )
+    .await?;
+    defer_until(&db.pool, wake, 600).await?;
+    let delete = create_op(
+        &store,
+        org_id,
+        OperationKind::DeleteSandbox,
+        "sbx_stale_bypass",
+    )
+    .await?;
+    assert_eq!(claimed_ids(&claim_all(&store).await?), vec![delete]);
+    sqlx::query(sql!(
+        "UPDATE public_operations
+         SET claimed_at = NOW() - INTERVAL '120 seconds'
+         WHERE operation_id = $1"
+    ))
+    .bind(delete.as_uuid())
+    .execute(&db.pool)
+    .await?;
+    defer_until(&db.pool, wake, 0).await?;
+    assert_eq!(claimed_ids(&claim_all(&store).await?), vec![delete]);
     Ok(())
 }
 
@@ -460,140 +519,6 @@ async fn claim_takes_nothing_while_another_replica_is_mid_claim() -> TestResult 
 }
 
 #[tokio::test]
-async fn counted_retries_back_off_and_fail_terminally_at_the_cap() -> TestResult {
-    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
-        return Ok(());
-    };
-    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
-    let store = PublicOperationStore::new(db.pool.clone());
-    let operation_id = create_op(&store, org_id, OperationKind::WakeSandbox, "sbx_capped").await?;
-    let config = ReconcilerConfig {
-        max_retry_attempts: 4,
-        retry_backoff_base: Duration::from_secs(8),
-        retry_backoff_max: Duration::from_secs(20),
-        ..single_claim_config()
-    };
-
-    let mut delays = Vec::new();
-    for _ in 0..3 {
-        let report = tick(&config, &store, &AlwaysRetryExecutor).await?;
-        assert_eq!(report.retried, 1);
-        let delay_secs: f64 = sqlx::query_scalar(sql!(
-            "SELECT EXTRACT(EPOCH FROM next_attempt_at - NOW())::DOUBLE PRECISION
-             FROM public_operations WHERE operation_id = $1"
-        ))
-        .bind(operation_id.as_uuid())
-        .fetch_one(&db.pool)
-        .await?;
-        delays.push(delay_secs);
-        defer_until(&db.pool, operation_id, 0).await?;
-    }
-    // Ceilings of 8s, 16s, then the 20s cap, each jittered into its upper
-    // half and floored at the executor's 1s hint.
-    for (delay, (low, high)) in delays.iter().zip([(3.0, 8.5), (7.0, 16.5), (9.0, 20.5)]) {
-        assert!((low..=high).contains(delay), "{delays:?}");
-    }
-
-    let report = tick(&config, &store, &AlwaysRetryExecutor).await?;
-    assert_eq!(report.failed, 1);
-    let operation = store
-        .fetch_operation(org_id, operation_id)
-        .await?
-        .expect("operation remains visible");
-    assert_eq!(operation.state, OperationState::Failed);
-    assert_eq!(
-        operation.terminal_error_code,
-        Some(PublicErrorCode::Internal)
-    );
-    Ok(())
-}
-
-#[test]
-fn counted_retry_backoff_doubles_to_its_cap_with_bounded_jitter_and_honors_the_hint() {
-    let base = Duration::from_secs(2);
-    let max = Duration::from_secs(60);
-    let hint = Duration::from_millis(500);
-    for _ in 0..50 {
-        let operation_id = OperationId::new();
-        let mut ceiling = base;
-        for attempts in 1..=16 {
-            let delay = counted_retry_backoff(operation_id, attempts, hint, base, max);
-            assert!(
-                delay >= ceiling / 2 && delay <= ceiling,
-                "{attempts}: {delay:?}"
-            );
-            assert_eq!(
-                delay,
-                counted_retry_backoff(operation_id, attempts, hint, base, max)
-            );
-            ceiling = (ceiling * 2).min(max);
-        }
-    }
-    let long_hint = Duration::from_secs(30);
-    assert_eq!(
-        counted_retry_backoff(OperationId::new(), 1, long_hint, base, max),
-        long_hint
-    );
-    assert_eq!(
-        counted_retry_backoff(OperationId::new(), 3, hint, Duration::ZERO, max),
-        hint
-    );
-}
-
-#[test]
-fn retry_cap_and_backoff_read_bounded_env_values() {
-    let read = |env: &pplx_space_test_env::TestEnv| {
-        let config = ReconcilerConfig::from_environment(env);
-        (
-            config.max_retry_attempts,
-            config.retry_backoff_base,
-            config.retry_backoff_max,
-        )
-    };
-    let mut env = pplx_space_test_env::TestEnv::default();
-    assert_eq!(
-        read(&env),
-        (
-            DEFAULT_MAX_RETRY_ATTEMPTS,
-            DEFAULT_RETRY_BACKOFF_BASE,
-            DEFAULT_RETRY_BACKOFF_MAX
-        )
-    );
-    env.set(MAX_RETRY_ATTEMPTS_ENV, "5");
-    env.set(RETRY_BACKOFF_BASE_ENV, "3");
-    env.set(RETRY_BACKOFF_MAX_ENV, "120");
-    assert_eq!(
-        read(&env),
-        (5, Duration::from_secs(3), Duration::from_secs(120))
-    );
-    env.set(MAX_RETRY_ATTEMPTS_ENV, "100000");
-    env.set(RETRY_BACKOFF_BASE_ENV, "100000");
-    env.set(RETRY_BACKOFF_MAX_ENV, "100000");
-    assert_eq!(
-        read(&env),
-        (
-            i32::try_from(MAX_RETRY_ATTEMPTS_CEILING).expect("ceiling fits"),
-            RETRY_BACKOFF_BASE_CEILING,
-            RETRY_BACKOFF_MAX_CEILING
-        )
-    );
-    for invalid in ["0", "-1", "abc", ""] {
-        env.set(MAX_RETRY_ATTEMPTS_ENV, invalid);
-        env.set(RETRY_BACKOFF_BASE_ENV, invalid);
-        env.set(RETRY_BACKOFF_MAX_ENV, invalid);
-        assert_eq!(
-            read(&env),
-            (
-                DEFAULT_MAX_RETRY_ATTEMPTS,
-                DEFAULT_RETRY_BACKOFF_BASE,
-                DEFAULT_RETRY_BACKOFF_MAX
-            ),
-            "{invalid:?}"
-        );
-    }
-}
-
-#[tokio::test]
 async fn an_unclaimable_kind_never_holds_back_its_sandbox() -> TestResult {
     let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
         return Ok(());
@@ -617,37 +542,26 @@ async fn an_unclaimable_kind_never_holds_back_its_sandbox() -> TestResult {
 }
 
 #[tokio::test]
-async fn kill_switch_restores_the_unkeyed_claim_and_fixed_retry_pacing() -> TestResult {
+async fn kill_switch_restores_the_unkeyed_claim() -> TestResult {
     let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
         return Ok(());
     };
     let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
     let store = PublicOperationStore::new(db.pool.clone());
-    let first = create_op(&store, org_id, OperationKind::WakeSandbox, "sbx_unkeyed").await?;
-    let second = create_op(&store, org_id, OperationKind::WakeSandbox, "sbx_unkeyed").await?;
+    for _ in 0..2 {
+        create_op(&store, org_id, OperationKind::WakeSandbox, "sbx_unkeyed").await?;
+    }
     let config = ReconcilerConfig {
         keyed_claim_enabled: false,
-        retry_backoff_base: Duration::from_secs(30),
         claim_limit: 8,
         max_retry_attempts: 4,
         ..single_claim_config()
     };
 
     let report = tick(&config, &store, &AlwaysRetryExecutor).await?;
-    // Both wakes on the sandbox ran in the same pass, as before keying.
+    // Unkeyed, both wakes on the sandbox run in the same pass.
     assert_eq!(report.claimed, 2);
     assert_eq!(report.retried, 2);
-    for operation_id in [first, second] {
-        let delay_secs: f64 = sqlx::query_scalar(sql!(
-            "SELECT EXTRACT(EPOCH FROM next_attempt_at - NOW())::DOUBLE PRECISION
-             FROM public_operations WHERE operation_id = $1"
-        ))
-        .bind(operation_id.as_uuid())
-        .fetch_one(&db.pool)
-        .await?;
-        // The executor's 1s hint, not the 30s backoff base.
-        assert!(delay_secs <= 1.5, "{delay_secs}");
-    }
     Ok(())
 }
 
@@ -661,10 +575,10 @@ fn keyed_claim_kill_switch_reads_from_env() {
     assert!(ReconcilerConfig::from_environment(&env).keyed_claim_enabled);
 }
 
-/// Regression: before the keyed claim, a delete requested after a create
-/// could run first and hard-delete the row, and the create would then
-/// rebuild the sandbox under the same id. The delete now waits for the
-/// create, even while the create sits in retry backoff.
+/// Regression: a delete requested after a create must not run first and
+/// hard-delete the row, or the create would rebuild the sandbox under the
+/// same id. The delete waits for the create, even while the create sits in
+/// retry backoff.
 #[tokio::test]
 async fn a_delete_requested_after_a_create_never_runs_first() -> TestResult {
     let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
@@ -710,21 +624,21 @@ async fn a_delete_requested_after_a_create_never_runs_first() -> TestResult {
     Ok(())
 }
 
-#[tokio::test]
-async fn a_reclaim_of_a_locally_running_operation_waits_for_its_next_renewal() -> TestResult {
+/// Runs a delete until it blocks and returns how long the next claim on its
+/// sandbox was handed back. Without `second_delete`, the running delete's
+/// claim goes stale under it and the delete is reclaimed. With it, the store
+/// records the running delete as finished before its execution returns (it
+/// is not yet reaped), and a second delete on the sandbox is claimed.
+async fn busy_key_hand_back_delay(
+    second_delete: bool,
+) -> Result<Option<(f64, ReconcilerConfig)>, Box<dyn std::error::Error + Send + Sync>> {
     let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db_with_max_connections(8).await?
     else {
-        return Ok(());
+        return Ok(None);
     };
     let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
     let store = PublicOperationStore::new(db.pool.clone());
-    let operation_id = create_op(
-        &store,
-        org_id,
-        OperationKind::DeleteSandbox,
-        "sbx_reclaimed",
-    )
-    .await?;
+    let running = create_op(&store, org_id, OperationKind::DeleteSandbox, "sbx_busy").await?;
     let executor = BlockingExecutor::default();
     let config = fast_loop_config(2);
     let shutdown = CancellationToken::new();
@@ -735,24 +649,33 @@ async fn a_reclaim_of_a_locally_running_operation_waits_for_its_next_renewal() -
         shutdown.clone(),
     ));
     tokio::time::timeout(Duration::from_secs(5), executor.started.notified()).await?;
-
-    // The claim goes stale under the still-running execution, so the next
-    // tick reclaims it and finds its key busy here.
-    sqlx::query(sql!(
-        "UPDATE public_operations SET claimed_at = NOW() - INTERVAL '1 hour'
-         WHERE operation_id = $1"
-    ))
-    .bind(operation_id.as_uuid())
-    .execute(&db.pool)
-    .await?;
+    let handed_back = if second_delete {
+        create_op(&store, org_id, OperationKind::DeleteSandbox, "sbx_busy").await?
+    } else {
+        running
+    };
+    let stale = if second_delete {
+        sqlx::query(sql!(
+            "UPDATE public_operations
+             SET state = 'succeeded', claim_token = '', completed_at = NOW()
+             WHERE operation_id = $1"
+        ))
+    } else {
+        sqlx::query(sql!(
+            "UPDATE public_operations SET claimed_at = NOW() - INTERVAL '1 hour'
+             WHERE operation_id = $1"
+        ))
+    };
+    stale.bind(running.as_uuid()).execute(&db.pool).await?;
     let delay_secs: f64 = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let delay: Option<f64> = sqlx::query_scalar(sql!(
                 "SELECT EXTRACT(EPOCH FROM next_attempt_at - updated_at)::DOUBLE PRECISION
                  FROM public_operations
-                 WHERE operation_id = $1 AND state = 'queued' AND claim_token = ''"
+                 WHERE operation_id = $1 AND state = 'queued'
+                   AND progress_message = 'waiting for an earlier operation on the same sandbox'"
             ))
-            .bind(operation_id.as_uuid())
+            .bind(handed_back.as_uuid())
             .fetch_optional(&db.pool)
             .await?;
             if let Some(delay) = delay {
@@ -765,13 +688,34 @@ async fn a_reclaim_of_a_locally_running_operation_waits_for_its_next_renewal() -
     executor.release.notify_one();
     shutdown.cancel();
     tokio::time::timeout(Duration::from_secs(5), dispatcher).await??;
+    Ok(Some((delay_secs, config)))
+}
 
+#[tokio::test]
+async fn a_reclaim_of_a_locally_running_operation_waits_for_its_next_renewal() -> TestResult {
+    // The claim goes stale under the still-running execution, so the next
+    // tick reclaims it and finds its key busy here.
+    let Some((delay_secs, config)) = busy_key_hand_back_delay(false).await? else {
+        return Ok(());
+    };
     // Handed back until the running execution's next renewal notices it
     // lost the claim, not re-claimed every second until then.
     let renewal = config.claim_stale_after / 3;
     assert!(
         (delay_secs - renewal.as_secs_f64()).abs() < 0.5,
         "handed back for {delay_secs}s, renewal is {renewal:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_claim_onto_a_key_busy_with_another_operation_retries_after_a_second() -> TestResult {
+    let Some((delay_secs, _)) = busy_key_hand_back_delay(true).await? else {
+        return Ok(());
+    };
+    assert!(
+        (delay_secs - 1.0).abs() < 0.3,
+        "handed back for {delay_secs}s"
     );
     Ok(())
 }

@@ -218,6 +218,24 @@ impl PublicOperationStore {
         Ok(seconds.map(|seconds| Duration::from_secs(u64::try_from(seconds).unwrap_or(0))))
     }
 
+    /// How long ago the operation was first claimed, if it has been.
+    pub async fn time_since_first_claim(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<Option<Duration>, PublicOperationStoreError> {
+        let seconds = sqlx::query_scalar::<_, Option<f64>>(pplx_space_common_core::sql!(
+            "SELECT EXTRACT(EPOCH FROM NOW() - started_at)::DOUBLE PRECISION
+             FROM public_operations
+             WHERE operation_id = $1"
+        ))
+        .bind(operation_id.as_uuid())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(seconds
+            .flatten()
+            .map(|seconds| Duration::from_secs_f64(seconds.max(0.0))))
+    }
+
     pub async fn fetch_operation(
         &self,
         org_id: OrgId,
@@ -1498,26 +1516,80 @@ async fn claim_operations(
     }
     // Across keys, claim in order of when each operation became claimable,
     // so a requeued retry waits behind work queued before its backoff
-    // expired. With `$11` (keyed) set, a candidate is held back while another
-    // claimable operation on its sandbox runs under a live claim, or was
-    // requested earlier and is still queued or stale. A delete is held back
-    // only by those that are live, an earlier create, or due now, so it is
-    // not stuck behind a wake in retry backoff. Forks name their source by a
-    // different id form and keep their own lifecycle lock, so they stay
-    // outside the key. `contended` limits the key probe to sandboxes with
-    // more than one active operation. With `$11` unset (the kill switch) the
-    // key rule and `contended` are skipped.
+    // expired. With `$11` (keyed) set, `blocked` lets at most one operation
+    // per sandbox start: none while one runs under a live claim; otherwise a
+    // stale claim first, so its token is rotated before anything else on the
+    // sandbox can start beside its old execution; otherwise the
+    // earliest-requested one if it is due; otherwise the earliest due delete
+    // with no create requested before it, so a delete is not stuck behind
+    // work in retry backoff but never overtakes a create. Forks name
+    // their source by a different id form and keep their own lifecycle lock,
+    // so they stay outside the key. With `$11` unset (the kill switch)
+    // `blocked` is empty.
     let rows = sqlx::query_as::<_, DispatcherClaimRow>(sql!(
-        "WITH contended AS MATERIALIZED (
-             SELECT org_id, target_id
+        "WITH keyed AS MATERIALIZED (
+             SELECT operation_id,
+                    org_id,
+                    target_id,
+                    requested_at,
+                    kind = $9
+                        AND next_attempt_at <= NOW()
+                        AND NOT COALESCE(
+                            BOOL_OR(kind = $10) OVER (
+                                queue ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                            ),
+                            FALSE
+                        ) AS free_delete,
+                    ROW_NUMBER() OVER queue AS position,
+                    FIRST_VALUE(next_attempt_at <= NOW()) OVER queue AS head_due,
+                    state = $5 AND claim_token <> ''
+                        AND claimed_at <= NOW() - make_interval(secs => $2::BIGINT) AS stale,
+                    BOOL_OR(
+                        state = $5
+                        AND claim_token <> ''
+                        AND claimed_at > NOW() - make_interval(secs => $2::BIGINT)
+                    ) OVER sandbox AS sandbox_live,
+                    COUNT(*) OVER sandbox AS active_on_sandbox
              FROM public_operations
-             WHERE state IN ($4, $5)
+             WHERE $11::BOOLEAN
+               AND state IN ($4, $5)
                AND target_type = $7
                AND target_id IS NOT NULL
                AND kind = ANY($6)
                AND kind <> $8
-             GROUP BY org_id, target_id
-             HAVING COUNT(*) > 1
+             WINDOW sandbox AS (PARTITION BY org_id, target_id),
+                    queue AS (
+                        PARTITION BY org_id, target_id ORDER BY requested_at, operation_id
+                    )
+         ),
+         blocked AS (
+             SELECT operation_id
+             FROM (
+                 SELECT operation_id,
+                        position,
+                        head_due,
+                        sandbox_live,
+                        active_on_sandbox,
+                        BOOL_OR(stale) OVER (PARTITION BY org_id, target_id) AS sandbox_stale,
+                        stale
+                            AND ROW_NUMBER() OVER (
+                                PARTITION BY org_id, target_id, stale
+                                ORDER BY requested_at, operation_id
+                            ) = 1 AS first_stale,
+                        free_delete
+                            AND ROW_NUMBER() OVER (
+                                PARTITION BY org_id, target_id, free_delete
+                                ORDER BY requested_at, operation_id
+                            ) = 1 AS first_free_delete
+                 FROM keyed
+             ) ranked
+             WHERE active_on_sandbox > 1
+               AND (
+                   sandbox_live
+                   OR (sandbox_stale AND NOT first_stale)
+                   OR (NOT sandbox_stale AND head_due AND position > 1)
+                   OR (NOT sandbox_stale AND NOT head_due AND NOT first_free_delete)
+               )
          ),
          picked AS (
              SELECT candidate.operation_id,
@@ -1531,42 +1603,7 @@ async fn claim_operations(
                    candidate.claim_token = ''
                    OR candidate.claimed_at <= NOW() - make_interval(secs => $2::BIGINT)
                )
-               AND NOT (
-                   $11::BOOLEAN
-                   AND candidate.target_type = $7
-                   AND candidate.target_id IS NOT NULL
-                   AND candidate.kind <> $8
-                   AND (candidate.org_id, candidate.target_id) IN (
-                       SELECT org_id, target_id FROM contended
-                   )
-                   AND EXISTS (
-                       SELECT 1
-                       FROM public_operations other
-                       WHERE other.org_id = candidate.org_id
-                         AND other.target_type = candidate.target_type
-                         AND other.target_id = candidate.target_id
-                         AND other.operation_id <> candidate.operation_id
-                         AND other.state IN ($4, $5)
-                         AND other.kind = ANY($6)
-                         AND other.kind <> $8
-                         AND (
-                             (
-                                 other.state = $5
-                                 AND other.claim_token <> ''
-                                 AND other.claimed_at > NOW() - make_interval(secs => $2::BIGINT)
-                             )
-                             OR (
-                                 (other.requested_at, other.operation_id)
-                                     < (candidate.requested_at, candidate.operation_id)
-                                 AND (
-                                     candidate.kind <> $9
-                                     OR other.kind = $10
-                                     OR other.next_attempt_at <= NOW()
-                                 )
-                             )
-                         )
-                   )
-               )
+               AND candidate.operation_id NOT IN (SELECT operation_id FROM blocked)
              ORDER BY candidate.next_attempt_at ASC, candidate.requested_at ASC, candidate.operation_id ASC
              LIMIT $1
              FOR UPDATE OF candidate SKIP LOCKED

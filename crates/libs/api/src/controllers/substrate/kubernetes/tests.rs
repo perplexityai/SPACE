@@ -5305,7 +5305,6 @@ mod kubernetes_tests {
         let deferral = crate::retry_deferral::RetryDeferral::new();
 
         // Act.
-        let capture = pplx_space_metrics::test_capture::capture_counters_guard();
         let started = tokio::time::Instant::now();
         let result = tokio::time::timeout(
             Duration::from_secs(10),
@@ -5322,7 +5321,6 @@ mod kubernetes_tests {
         .await
         .expect("a deferred re-drive must not wait out its 60s readiness budget");
         let elapsed = started.elapsed();
-        let counters = capture.finish();
 
         // Assert: the caller kept retrying in place through the grace, then
         // handed the wait back and recorded that it did.
@@ -5332,18 +5330,9 @@ mod kubernetes_tests {
             "the grace keeps fast retries in place: {elapsed:?}"
         );
         // The last in-place sleep is cut to the grace instead of doubling
-        // past it (it would otherwise leave at ~3.1 s).
+        // past it to ~3.1 s.
         assert!(elapsed < grace + Duration::from_secs(1), "{elapsed:?}");
         assert!(deferral.deferred());
-        let redrives: u64 = counters
-            .iter()
-            .filter(|counter| counter.tags.iter().any(|tag| tag == "lap:conflict_redrive"))
-            .map(|counter| counter.value)
-            .sum();
-        assert!(
-            redrives >= 2,
-            "expected in-place retries during the grace: {counters:?}"
-        );
         let error = match result {
             Ok(_) => panic!("a fence-blocked wake cannot win the claim"),
             Err(error) => error,
@@ -5351,113 +5340,6 @@ mod kubernetes_tests {
         assert!(
             matches!(error, SubstrateError::RestoreInFlight { .. }),
             "expected a retryable error, got {error:?}"
-        );
-        assert_eq!(request_count.load(Ordering::SeqCst), 0);
-        Ok(())
-    }
-
-    /// A deferring dispatcher caller that owns the coalesced wake run fails
-    /// that run fast, but an HTTP caller joined to it keeps its own pacing:
-    /// it re-races inside its own readiness budget and only then reports
-    /// the budget elapsed, never the dispatcher's deferral.
-    #[tokio::test(flavor = "current_thread")]
-    async fn http_joiner_of_a_deferred_run_re_races_within_its_own_budget() -> Result<(), BoxError>
-    {
-        // Arrange.
-        let db = pplx_space_db_test_fixtures::pg_test_db().await?;
-        let pool = db.pool.clone();
-        let sandbox_id = SandboxId::new();
-        insert_test_sandbox_row(&pool, sandbox_id, "suspended").await?;
-        sqlx::query(
-            "INSERT INTO sandbox_k8s_executions
-                 (sandbox_id, generation, pod_name, pod_namespace, pod_ip, state, active)
-             VALUES ($1, 1, 'space-sbx-ghost-g1', 'space', '127.0.0.1', 'creating', TRUE)",
-        )
-        .bind(sandbox_id)
-        .execute(&pool)
-        .await?;
-        let sandbox = fetch_sandbox(&pool, sandbox_id)
-            .await?
-            .expect("inserted sandbox must be visible");
-        let (substrate, request_count) = substrate_with_failed_pod_creates(pool);
-        let http_budget = Duration::from_secs(5);
-
-        // Act: the dispatcher caller is polled first, so it owns the run the
-        // HTTP caller joins.
-        let capture = pplx_space_metrics::test_capture::capture_counters_guard();
-        let started = tokio::time::Instant::now();
-        let (dispatcher, http) = tokio::join!(
-            async {
-                let result = crate::retry_deferral::scope(
-                    Some(crate::retry_deferral::RetryDeferral::new()),
-                    substrate.wake_execution_with_metric_identity(
-                        &sandbox,
-                        Duration::from_secs(60),
-                        SandboxApiMetricIdentity::native("wake"),
-                        crate::controllers::substrate::RecoveryCharge::Exempt,
-                    ),
-                )
-                .await;
-                (result, started.elapsed())
-            },
-            async {
-                let result = substrate
-                    .wake_execution_with_metric_identity(
-                        &sandbox,
-                        http_budget,
-                        SandboxApiMetricIdentity::ecw("connect"),
-                        crate::controllers::substrate::RecoveryCharge::Exempt,
-                    )
-                    .await;
-                (result, started.elapsed())
-            },
-        );
-
-        let counters = capture.finish();
-
-        // Assert.
-        let http_reraced = counters.iter().any(|counter| {
-            counter.name == "sandbox.api.wake_coalescer.outcome"
-                && counter
-                    .tags
-                    .iter()
-                    .any(|tag| tag == "outcome:joiner_reraced")
-                && counter.tags.iter().any(|tag| tag == "op:connect")
-        });
-        assert!(
-            http_reraced,
-            "the HTTP caller must have joined the dispatcher's run and re-raced: {counters:?}"
-        );
-        let (dispatcher_result, dispatcher_elapsed) = dispatcher;
-        let dispatcher_error = match dispatcher_result {
-            Ok(_) => panic!("a fence-blocked wake cannot win the claim"),
-            Err(error) => error,
-        };
-        assert!(
-            dispatcher_error.to_string().contains("deferring"),
-            "{dispatcher_error}"
-        );
-        assert!(
-            dispatcher_elapsed < http_budget - Duration::from_secs(1),
-            "{dispatcher_elapsed:?}"
-        );
-
-        let (http_result, http_elapsed) = http;
-        let http_error = match http_result {
-            Ok(_) => panic!("a fence-blocked wake cannot win the claim"),
-            Err(error) => error,
-        };
-        assert!(
-            matches!(http_error, SubstrateError::RestoreInFlight { .. }),
-            "{http_error:?}"
-        );
-        assert!(
-            !http_error.to_string().contains("deferring"),
-            "an HTTP caller must not inherit the dispatcher's deferral: {http_error}"
-        );
-        assert!(
-            http_elapsed >= http_budget - Duration::from_millis(200),
-            "the HTTP caller re-raced through its own budget, not out early: {http_elapsed:?}"
         );
         assert_eq!(request_count.load(Ordering::SeqCst), 0);
         Ok(())
