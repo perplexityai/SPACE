@@ -3,11 +3,6 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::time::Duration;
 use tempfile::tempdir;
 
-mod service_mutex_handoff_tests;
-
-#[allow(unused_imports)]
-use service_mutex_handoff_tests::*;
-
 fn mutex_path(dir: &tempfile::TempDir) -> PathBuf {
     dir.path().join("service.mutex")
 }

@@ -31,6 +31,8 @@ pub mod peer_auth;
 pub mod rate_limiter;
 pub mod redis;
 pub mod service_mutex;
+#[cfg(test)]
+mod service_mutex_handoff_tests;
 pub mod shared_valkey;
 pub mod space_api_route;
 pub mod space_api_route_capability;

@@ -1,6 +1,16 @@
 //! The local handoff contract between the service mutex and Unix socket takeover.
 
-use super::*;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use tempfile::tempdir;
+use tokio_util::sync::CancellationToken;
+
+use crate::service_mutex::{AcquireOutcome, ServiceMutex};
+
+fn mutex_path(dir: &tempfile::TempDir) -> PathBuf {
+    dir.path().join("service.mutex")
+}
 
 /// The full local handoff contract, simulated end to end in one process
 /// (flock is per-open-file-description, so two instances here contend
@@ -10,7 +20,7 @@ use super::*;
 /// staging-rename, and serves new connections — while the predecessor's
 /// established connections keep working on the unlinked inode.
 #[tokio::test]
-pub(super) async fn handoff_moves_new_connections_and_preserves_established_ones() {
+async fn handoff_moves_new_connections_and_preserves_established_ones() {
     use crate::bootstrap::{UnixSocketOptions, bind_unix_socket};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixStream;
