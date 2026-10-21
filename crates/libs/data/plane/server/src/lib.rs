@@ -461,16 +461,21 @@ pub async fn run(
     .map_err(RunDataPlaneError::Serve)
 }
 
-/// Accepted data-plane connections probe an idle peer after 30 seconds and
-/// every 10 seconds after, and are dropped after 3 unanswered probes. On Linux,
-/// data left unacknowledged for a minute drops them too. A client whose
-/// connection dies silently then releases its stream, and the node's
-/// per-sandbox permit behind it, in about a minute.
+/// How long an accepted connection may sit idle before its first keepalive
+/// probe.
 const DATA_PLANE_TCP_KEEPALIVE_TIME: Duration = Duration::from_secs(30);
+/// How long between keepalive probes.
 const DATA_PLANE_TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+/// How many unanswered keepalive probes drop the connection.
 const DATA_PLANE_TCP_KEEPALIVE_RETRIES: u32 = 3;
+/// How long an accepted connection may go without its peer acknowledging data
+/// sent to it, or, on Linux 5.11 and later, keep a zero receive window while
+/// answering window probes, before it is dropped. This is the longest a client
+/// may stop reading a stream with output pending. It is minutes, not seconds,
+/// so a client or proxy that pauses reading under backpressure keeps its
+/// stream.
 #[cfg(target_os = "linux")]
-const DATA_PLANE_TCP_USER_TIMEOUT: Duration = Duration::from_secs(60);
+const DATA_PLANE_TCP_USER_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 type DataPlaneListener = axum::serve::TapIo<
     pplx_space_common_svc::http_listener::NodelayListener,
@@ -478,7 +483,15 @@ type DataPlaneListener = axum::serve::TapIo<
 >;
 
 /// Accept connections with `TCP_NODELAY` and the data plane's dead-peer
-/// detection set.
+/// detection set, on every route this listener serves, ECW's included.
+///
+/// Keepalive probes a connection that carries nothing for 30 seconds and drops
+/// it after about a minute of silence. A stream that sends regularly, such as
+/// SSE with its 15-second keep-alive comments, is never idle, so it is
+/// `TCP_USER_TIMEOUT` that drops it when its peer stops acknowledging, after 5
+/// minutes. Either way a connection that dies silently releases its stream,
+/// and the node's per-sandbox permit behind it. Both detect the immediate TCP
+/// peer, which is often a proxy rather than the end client.
 fn data_plane_listener(listener: tokio::net::TcpListener) -> DataPlaneListener {
     fn set_dead_peer_detection(tcp: &mut tokio::net::TcpStream) {
         let socket = socket2::SockRef::from(&*tcp);
