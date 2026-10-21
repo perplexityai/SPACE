@@ -378,11 +378,6 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 		emitShimStepError("create", "parse_auto_lifecycle_authority", "parse_auto_lifecycle_authority", err)
 		return nil, status.Errorf(codes.InvalidArgument, "parse sandbox auto lifecycle authority: %v", err)
 	}
-	sandboxNetworkPolicy, err := spec.sandboxNetworkPolicy()
-	if err != nil {
-		emitShimStepError("create", "parse_network_policy", "parse_network_policy", err)
-		return nil, status.Errorf(codes.InvalidArgument, "parse sandbox network policy: %v", err)
-	}
 	sandboxEnv := spec.sandboxEnv()
 	sandboxExecutionGeneration, err := spec.sandboxExecutionGeneration()
 	if err != nil {
@@ -626,6 +621,12 @@ func (s *spaceTaskService) Create(ctx context.Context, r *taskAPI.CreateTaskRequ
 	if err != nil {
 		emitShimStepError("create", "parse_volume_encryption", "parse_volume_encryption", err)
 		return nil, status.Errorf(codes.InvalidArgument, "parse sandbox volume encryption: %v", err)
+	}
+	// Only a cold create seeds the manager's policy; restores keep the stored one.
+	sandboxNetworkPolicy, err := spec.sandboxNetworkPolicy()
+	if err != nil {
+		emitShimStepError("create", "parse_network_policy", "parse_network_policy", err)
+		return nil, status.Errorf(codes.InvalidArgument, "parse sandbox network policy: %v", err)
 	}
 	createReq := &pb.CreateRequest{
 		Template:                sandboxTemplate,
@@ -2499,6 +2500,9 @@ func parseNetworkPolicyJSON(raw string) (*netpb.NetworkPolicyV1, error) {
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&decoded); err != nil {
 		return nil, fmt.Errorf("invalid JSON: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, errors.New("invalid JSON: trailing content after the policy object")
 	}
 	version := "v1"
 	if decoded.Version != nil {

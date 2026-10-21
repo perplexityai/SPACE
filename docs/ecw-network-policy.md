@@ -39,3 +39,15 @@ HEAD-capable API and policy consumers, including gateways, before enabling rules
 that list HEAD; older consumers reject the new method. Existing GET/POST rules
 retain their behavior. Remove HEAD from policies before rolling consumers back to
 a version that cannot read it.
+
+## Adding policy fields
+
+On a cold create, the containerd shim converts the pod's network-policy
+annotation for sandbox-manager and rejects any field it does not recognize, at
+any level, instead of dropping it. Restores keep sandbox-manager's stored policy
+and do not read the annotation. Serialize a new field only when it is used, so
+policies without it stay readable by every shim. Roll a shim that accepts the
+field out to every sandbox node before any API sets it. On a node whose shim
+predates the field, those cold creates fail with `InvalidArgument` and count in
+`space.shim.operation.error` with `step:parse_network_policy`. Keep the field in
+the shim while any pod annotated with it remains.

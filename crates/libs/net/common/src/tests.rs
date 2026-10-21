@@ -622,6 +622,85 @@ fn network_policy_json_ignores_unknown_top_level_fields() {
     .unwrap_err();
 }
 
+/// The containerd shim decodes the policy annotation strictly; its Go test
+/// decodes this same fixture.
+#[cfg(feature = "serde")]
+#[test]
+fn network_policy_json_matches_shim_fixture() {
+    let destinations = |prefix: &str| {
+        vec![
+            EgressDestinationV1::Ip(format!("192.0.2.{prefix}").parse().unwrap()),
+            EgressDestinationV1::Ip(format!("2001:db8::{prefix}").parse().unwrap()),
+            EgressDestinationV1::Cidr(format!("198.51.100.{prefix}/32").parse().unwrap()),
+            EgressDestinationV1::Cidr(format!("2001:db8:{prefix}::/48").parse().unwrap()),
+            EgressDestinationV1::Domain(format!("host-{prefix}.example.test").parse().unwrap()),
+            EgressDestinationV1::WildcardDomain(
+                format!("*.zone-{prefix}.example.test").parse().unwrap(),
+            ),
+        ]
+    };
+    let binding = |header_name: &str, reference: &str| CredentialHeaderBindingV1 {
+        header_name: header_name.to_string(),
+        credential_reference_id: reference.parse().unwrap(),
+    };
+    let policy = NetworkPolicyV1 {
+        version: NetworkPolicyVersion::V1,
+        egress: EgressPolicyV1::new(
+            EgressDefaultAction::Deny,
+            destinations("10"),
+            destinations("20"),
+        )
+        .unwrap(),
+        tls_interception: TlsInterception::On,
+        network_credential_rules: vec![
+            NetworkCredentialRuleV1 {
+                rule_id: "custom-port".to_string(),
+                destination: NetworkCredentialDestinationV1::new(
+                    "api.example.test".parse().unwrap(),
+                    Some(8443),
+                    Some("/v1".to_string()),
+                )
+                .unwrap(),
+                credential_header_bindings: vec![
+                    binding("authorization", "00000000-0000-4000-8000-000000000001"),
+                    binding("x-api-key", "00000000-0000-4000-8000-000000000002"),
+                ],
+                supported_http_methods: vec![
+                    NetworkCredentialHttpMethodV1::Get,
+                    NetworkCredentialHttpMethodV1::Post,
+                    NetworkCredentialHttpMethodV1::Head,
+                ],
+            },
+            NetworkCredentialRuleV1 {
+                rule_id: "default-port".to_string(),
+                destination: NetworkCredentialDestinationV1::new(
+                    "files.example.test".parse().unwrap(),
+                    None,
+                    None,
+                )
+                .unwrap(),
+                credential_header_bindings: vec![binding(
+                    "authorization",
+                    "00000000-0000-4000-8000-000000000003",
+                )],
+                supported_http_methods: vec![NetworkCredentialHttpMethodV1::Get],
+            },
+        ],
+        tls_interception_exemptions: destinations("30"),
+    };
+    let fixture = include_str!("../../../../../shim/testdata/network-policy-v1.json");
+    let rendered = serde_json::to_string_pretty(&policy).unwrap() + "\n";
+
+    assert_eq!(
+        rendered, fixture,
+        "regenerate shim/testdata/network-policy-v1.json from this policy and make the shim accept any new field"
+    );
+    assert_eq!(
+        serde_json::from_str::<NetworkPolicyV1>(fixture).unwrap(),
+        policy
+    );
+}
+
 #[test]
 fn tls_interception_proto_unspecified_defaults_off_and_on_round_trips() {
     use prost::Message;
