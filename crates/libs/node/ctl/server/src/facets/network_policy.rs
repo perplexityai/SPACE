@@ -205,10 +205,14 @@ where
                 }
             }
             Err(error) => {
-                return Err(format!(
-                    "failed to apply sandbox network policy {}: {error}",
-                    sandbox.sandbox_id
-                ));
+                record_element_error(
+                    &mut result.element_errors,
+                    &NetworkPolicyTarget::sandbox(sandbox_id).to_string(),
+                    &format!(
+                        "failed to apply sandbox network policy {}: {error}",
+                        sandbox.sandbox_id
+                    ),
+                );
             }
         }
     }
