@@ -16,6 +16,7 @@ import subprocess
 import tempfile
 import threading
 import socket
+import sys
 import time
 import uuid
 from collections import deque
@@ -488,8 +489,8 @@ REDIS_REPLICAS_ANNOTATION = "space.pplx.net/smoke-redis-replicas"
 # (`KindHarness._fast_rollout`) runs with every replacement surged at once and
 # no `minReadySeconds`, and the Deployment carries the `minReadySeconds` and
 # `maxSurge` it stood at (JSON, null for unset) until they are back. A run
-# killed in between leaves the record, and the next fast rollout of that
-# Deployment restores the recorded values rather than its own fast ones.
+# killed in between leaves the record, and every Kind scenario run first puts
+# the recorded values back (`repair_orphaned_rollout_pace`).
 FAST_ROLLOUT_STANDING_ANNOTATION = "space.pplx.net/smoke-fast-rollout-standing"
 FAST_ROLLOUT_MAX_SURGE = "100%"
 DRAIN_KEEP_ANNOTATION = "space.pplx.net/drain-keep"
@@ -3244,10 +3245,13 @@ ON CONFLICT (key_hash) DO NOTHING;
                 try:
                     self._restore_rollout_pace(name, armed[-1])
                 except Exception as restore_error:  # noqa: BLE001 - attached to the body's error below
-                    error.add_note(
+                    note = (
                         f"restoring the rollout pace of {name} also failed: {restore_error!r}; "
                         "the next scenario's preflight repair restores it from the Deployment's record"
                     )
+                    error.add_note(note)
+                    # A verdict reports only the body's error, not its notes.
+                    print(f"PACE RESTORE FAILED: {note}", file=sys.stderr, flush=True)
             raise
         if armed:
             self._restore_rollout_pace(name, armed[-1])
@@ -3284,8 +3288,9 @@ ON CONFLICT (key_hash) DO NOTHING;
     def _restore_rollout_pace(self, name: str, pace: _RolloutPace | None) -> None:
         """Put back the pace `pace` recorded, or with None the one the Deployment's record names.
 
-        Only a field still at its fast value is written: one something else
-        has rewritten since (a chart re-apply) is newer than the record.
+        Only while every recorded field still holds its fast value, the rule
+        `_speed_up_rollout` trusts a record by: otherwise something else (a
+        chart re-apply) has written the pace since, and only the record goes.
         """
 
         def restore_patch(deployment: Mapping[str, Any]) -> list[dict[str, object]]:
@@ -3299,9 +3304,8 @@ ON CONFLICT (key_hash) DO NOTHING;
             standing = pace.standing if pace is not None else _fast_rollout_record(recorded, name)
             fast = _fast_pace(deployment)
             patch: list[dict[str, object]] = []
-            for pointer, value in standing.items():
-                if not _holds_fast_value(deployment, pointer, fast):
-                    continue
+            still_fast = all(_holds_fast_value(deployment, pointer, fast) for pointer in standing)
+            for pointer, value in standing.items() if still_fast else ():
                 if value is not None:
                     patch.append({"op": "add", "path": pointer, "value": value})
                 elif _json_pointer_get(deployment, pointer) is not None:
@@ -4294,6 +4298,7 @@ ON CONFLICT (key_hash) DO NOTHING;
         )
         if not recorded:
             return False
+        self._require_isolated_kind("orphaned rollout-pace repair")
         try:
             release = self.acquire_public_api_mutation()
         except SmokeConfigurationError as error:
