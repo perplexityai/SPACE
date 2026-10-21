@@ -283,3 +283,106 @@ async fn pre_frame_node_permit_converts_without_double_acquisition() {
     );
     assert_eq!(limiter.node_snapshot(), 0);
 }
+
+fn expect_limited(result: Result<UdsPerSandboxPermit, Status>, scope: &str) {
+    let error = result.err().expect("request over its budget is rejected");
+    assert_eq!(error.code(), Code::ResourceExhausted);
+    assert_eq!(
+        pplx_space_common_grpc::UdsPerSandboxLimitExceeded::from_status(&error),
+        Some(pplx_space_common_grpc::UdsPerSandboxLimitExceeded)
+    );
+    assert!(
+        error.message().contains(&format!("scope={scope},")),
+        "{}",
+        error.message()
+    );
+}
+
+#[tokio::test]
+async fn control_calls_keep_their_permits_when_the_shared_budget_is_full() {
+    let limiter = UdsPerSandboxLimiter::for_tests_with_control(2, 1, 8);
+    let shared = [
+        limiter
+            .acquire("SpacedConnectProcess", SANDBOX_A)
+            .await
+            .unwrap(),
+        limiter.acquire("SpacedWaitReady", SANDBOX_A).await.unwrap(),
+    ];
+    expect_limited(
+        limiter.acquire("SpacedWaitReady", SANDBOX_A).await,
+        "sandbox",
+    );
+
+    let kill = limiter
+        .acquire_in(SandboxBudget::Control, "SpacedKillProcess", SANDBOX_A)
+        .await
+        .expect("a control call is admitted while the shared budget is full");
+    expect_limited(
+        limiter
+            .acquire_in(SandboxBudget::Control, "SpacedListProcesses", SANDBOX_A)
+            .await,
+        "sandbox_control",
+    );
+    assert_eq!(limiter.sandbox_snapshot(SANDBOX_A), Some(2));
+    assert_eq!(limiter.control_snapshot(SANDBOX_A), Some(1));
+
+    drop(kill);
+    drop(shared);
+    assert_eq!(limiter.sandbox_snapshot(SANDBOX_A), None);
+    assert_eq!(limiter.control_snapshot(SANDBOX_A), None);
+    assert_eq!(limiter.node_snapshot(), 0);
+}
+
+#[tokio::test]
+async fn limiter_without_a_control_budget_admits_control_calls_from_shared_permits() {
+    let limiter = UdsPerSandboxLimiter::for_tests(limits(1), limits(2));
+    let _kill = limiter
+        .acquire_in(SandboxBudget::Control, "SpacedKillProcess", SANDBOX_A)
+        .await
+        .unwrap();
+    expect_limited(limiter.acquire("SpacedStat", SANDBOX_A).await, "sandbox");
+    assert_eq!(limiter.sandbox_snapshot(SANDBOX_A), Some(1));
+}
+
+#[tokio::test(start_paused = true)]
+async fn default_budget_admits_control_calls_with_streams_and_long_calls_holding_every_shared_permit()
+ {
+    let limiter = UdsPerSandboxLimiter::control();
+    let mut shared = Vec::new();
+    for method in ["SpacedConnectProcess", "SpacedWaitReady"]
+        .into_iter()
+        .cycle()
+        .take(UDS_PER_SANDBOX_PERMITS)
+    {
+        shared.push(limiter.acquire(method, SANDBOX_A).await.unwrap());
+    }
+    expect_limited(
+        limiter.acquire("SpacedWaitReady", SANDBOX_A).await,
+        "sandbox",
+    );
+
+    let mut control = Vec::new();
+    for method in [
+        "SpacedKillProcess",
+        "SpacedSendSignal",
+        "SpacedListProcesses",
+        "KillSandbox",
+    ]
+    .into_iter()
+    .cycle()
+    .take(UDS_PER_SANDBOX_CONTROL_PERMITS)
+    {
+        control.push(
+            limiter
+                .acquire_in(SandboxBudget::Control, method, SANDBOX_A)
+                .await
+                .unwrap_or_else(|error| panic!("{method} rejected: {error}")),
+        );
+    }
+    expect_limited(
+        limiter
+            .acquire_in(SandboxBudget::Control, "SpacedKillProcess", SANDBOX_A)
+            .await,
+        "sandbox_control",
+    );
+}

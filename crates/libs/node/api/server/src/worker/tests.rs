@@ -164,3 +164,48 @@ fn policy_mutation_requires_control_plane_authority() {
         .expect_err("denied caller is refused");
     assert_eq!(denied.code(), tonic::Code::PermissionDenied);
 }
+
+/// Method names passed to each `invocation` in `source`: the first string
+/// literal after it, which rustfmt may move to a later line.
+fn admitted_methods<'a>(source: &'a str, invocation: &str) -> std::collections::BTreeSet<&'a str> {
+    source
+        .split(invocation)
+        .skip(1)
+        .map(|rest| rest.split('"').nth(1).expect("method literal"))
+        .collect()
+}
+
+// The control reserve exists so these calls stay available while streams and
+// long unary calls hold the shared permits; a call routed there by accident
+// would take that guarantee away.
+#[test]
+fn only_process_and_sandbox_control_rpcs_take_the_control_budget() {
+    let source = include_str!("../worker.rs");
+    assert_eq!(
+        source.matches("SandboxBudget::Control").count(),
+        1,
+        "only fwd_sbx_control! may request the control budget"
+    );
+    let control = admitted_methods(source, "fwd_sbx_control!(");
+    assert_eq!(
+        control,
+        [
+            "KillSandbox",
+            "SpacedKillProcess",
+            "SpacedListProcesses",
+            "SpacedSendSignal",
+        ]
+        .into_iter()
+        .collect()
+    );
+
+    let mut shared = admitted_methods(source, "fwd_sbx!(");
+    shared.extend(admitted_methods(source, "fwd_sbx_stream!("));
+    shared.extend(admitted_methods(source, "limited_sbx_operation("));
+    assert!(shared.contains("SpacedWaitReady") && shared.contains("SpacedStartProcess"));
+    assert!(
+        control.is_disjoint(&shared),
+        "{:?}",
+        control.intersection(&shared)
+    );
+}
