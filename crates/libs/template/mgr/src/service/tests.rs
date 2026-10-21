@@ -1205,6 +1205,7 @@ async fn get_template_authorizes_and_resolves_before_using_cached_builds(
                     assert_eq!(resolved_tag, tag.unwrap_or_default());
                     assert_eq!(caller, scoped.then_some(org));
                     Ok(ResolvedRelease {
+                        authorized_org: caller,
                         hash: selected.clone(),
                         storage_uris: vec![],
                         visibility:

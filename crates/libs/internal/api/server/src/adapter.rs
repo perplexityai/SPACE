@@ -80,8 +80,9 @@ impl ClusterApiService {
     /// tokens with complete claims use the reviewed node name and UID. Missing
     /// claims and static-token callers retain the registered-address binding;
     /// malformed claims or a mismatched UID never fall back. A caller with no
-    /// matching registered node resolves
-    /// generic templates only. A request that reached the handler without the
+    /// matching registered node resolves generic templates only.
+    /// Forwarded origins further intersect this scope;
+    /// they never borrow the receiving node's placements. A request without the
     /// auth layer (tests, local simulators) is unscoped, matching how the
     /// other narrow authorities treat a missing extension.
     async fn template_read_scope<T>(
@@ -143,6 +144,104 @@ impl ClusterApiService {
             .node_scope_for_address(normalize_ip(remote_addr.ip()))
             .await
             .map_err(|err| Status::internal(format!("resolve caller nodes: {err}")))
+    }
+
+    async fn forwarded_template_scope(
+        &self,
+        delegation: Option<TemplateLookupScope>,
+    ) -> Result<Option<super::template_releases_store::TemplateReadScope>, Status> {
+        match delegation {
+            Some(
+                TemplateLookupScope::Node(address)
+                | TemplateLookupScope::Sandbox {
+                    caller_node: Some(address),
+                    ..
+                },
+            ) => self
+                .template_releases_store
+                .node_scope_for_address(normalize_ip(address))
+                .await
+                .map(Some)
+                .map_err(|error| {
+                    Status::internal(format!("resolve delegated caller nodes: {error}"))
+                }),
+            Some(TemplateLookupScope::LocalExecution) => Err(Status::permission_denied(
+                "local execution is not a cluster authority",
+            )),
+            _ => Ok(None),
+        }
+    }
+
+    async fn authorize_forwarded_template(
+        &self,
+        release: &TemplateRelease,
+        caller_org: Option<OrgId>,
+        scope: Option<&super::template_releases_store::TemplateReadScope>,
+    ) -> Result<(), Status> {
+        let Some(scope) = scope else { return Ok(()) };
+        let hash = validated_release_hash(&release.hash)?;
+        let bare_hash = hash.strip_prefix("sha256:").unwrap_or(&hash);
+        // Intersect grants, not node IDs: both migration peers may hold the release.
+        let rows = self
+            .template_releases_store
+            .find_by_hash(
+                &release.template_name,
+                &hash,
+                bare_hash,
+                caller_org,
+                scope,
+                false,
+            )
+            .await
+            .map_err(|error| Status::internal(format!("authorize delegated release: {error}")))?;
+        if !rows
+            .iter()
+            .any(|row| row.release_id.to_string() == release.id)
+        {
+            return Err(Status::not_found("template release not found"));
+        }
+        Ok(())
+    }
+
+    async fn template_lookup_org(
+        &self,
+        delegation: Option<TemplateLookupScope>,
+        asserted_org: Option<&str>,
+        template_name: &str,
+        scope: &super::template_releases_store::TemplateReadScope,
+        forwarded_scope: Option<&super::template_releases_store::TemplateReadScope>,
+    ) -> Result<Option<OrgId>, Status> {
+        let asserted = asserted_org
+            .map(str::parse::<OrgId>)
+            .transpose()
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let Some(TemplateLookupScope::Sandbox { id, .. }) = delegation else {
+            return Ok(asserted);
+        };
+        let sandbox = pplx_space_sandbox_store::get(&self.pool, id)
+            .await
+            .map_err(|error| Status::internal(format!("read template sandbox owner: {error}")))?
+            .ok_or_else(|| Status::not_found("template sandbox not found"))?;
+        if sandbox.template_id.as_deref() != Some(template_name)
+            || asserted.is_some_and(|org| org != sandbox.org_id)
+        {
+            return Err(Status::permission_denied("template sandbox scope mismatch"));
+        }
+        for scope in std::iter::once(scope).chain(forwarded_scope) {
+            if let super::template_releases_store::TemplateReadScope::NodeScoped { node_ids } =
+                scope
+                && !sandbox
+                    .active_node_id
+                    .iter()
+                    .chain(sandbox.target_node_id.iter())
+                    .any(|id| node_ids.contains(id))
+            {
+                return Err(Status::permission_denied(
+                    "template sandbox is not placed on caller node",
+                ));
+            }
+        }
+        Ok(Some(sandbox.org_id))
     }
 }
 
@@ -429,23 +528,28 @@ impl ClusterApi for ClusterApiService {
         request: Request<FindTemplateReleaseRequest>,
     ) -> Result<Response<FindTemplateReleaseResponse>, Status> {
         let scope = self.template_read_scope(&request).await?;
-        let delegation = TemplateLookupScope::from_request(&request)?;
-        if delegation.is_none() {
+        let receipt = TemplateLookupScope::from_request(&request)?;
+        if receipt.is_none() {
             pplx_space_metrics::auth::template_lookup_compatibility("missing_scope");
         }
+        let delegation = TemplateLookupScope::authorization_from_request(&request)?;
+        let forwarded_scope = self.forwarded_template_scope(delegation).await?;
         let request = request.into_inner();
         let template_name = trimmed_required(&request.template_name, "template_name")?;
         let runtime = validated_template_runtime(&request.runtime)?;
         let tag = trimmed_required(&request.tag, "tag")?;
 
-        // Authorization, release, and storage locations share one DB snapshot.
+        // Catalog authorization, release, and storage share one DB snapshot per scope.
         // The cached visibility appended below is advisory, never an auth gate.
-        let caller_org = request
-            .caller_org_id
-            .as_deref()
-            .map(str::parse::<OrgId>)
-            .transpose()
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let caller_org = self
+            .template_lookup_org(
+                delegation,
+                request.caller_org_id.as_deref(),
+                &template_name,
+                &scope,
+                forwarded_scope.as_ref(),
+            )
+            .await?;
         let rows = self
             .template_releases_store
             .find_by_tag(
@@ -473,6 +577,9 @@ impl ClusterApi for ClusterApiService {
             }
         };
 
+        self.authorize_forwarded_template(&release, caller_org, forwarded_scope.as_ref())
+            .await?;
+
         let storage_locations = rows
             .into_iter()
             .filter_map(|row| {
@@ -502,6 +609,9 @@ impl ClusterApi for ClusterApiService {
             template_visibility: visibility.into(),
         });
         if let Some(scope) = delegation {
+            scope.acknowledge_authorization(&mut response);
+        }
+        if let Some(scope) = receipt {
             scope.receipt(&mut response);
         }
         Ok(response)
@@ -512,10 +622,12 @@ impl ClusterApi for ClusterApiService {
         request: Request<FindTemplateReleaseByHashRequest>,
     ) -> Result<Response<FindTemplateReleaseResponse>, Status> {
         let scope = self.template_read_scope(&request).await?;
-        let delegation = TemplateLookupScope::from_request(&request)?;
-        if delegation.is_none() {
+        let receipt = TemplateLookupScope::from_request(&request)?;
+        if receipt.is_none() {
             pplx_space_metrics::auth::template_lookup_compatibility("missing_scope");
         }
+        let delegation = TemplateLookupScope::authorization_from_request(&request)?;
+        let forwarded_scope = self.forwarded_template_scope(delegation).await?;
         let request = request.into_inner();
         let template_name = trimmed_required(&request.template_name, "template_name")?;
         // Canonical `sha256:`-prefixed form.
@@ -533,12 +645,15 @@ impl ClusterApi for ClusterApiService {
 
         // Digests resolve without a tag and authorize in the same statement.
         // Artifact digests already identify the runtime variant.
-        let caller_org = request
-            .caller_org_id
-            .as_deref()
-            .map(str::parse::<OrgId>)
-            .transpose()
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let caller_org = self
+            .template_lookup_org(
+                delegation,
+                request.caller_org_id.as_deref(),
+                &template_name,
+                &scope,
+                forwarded_scope.as_ref(),
+            )
+            .await?;
         let rows = self
             .template_releases_store
             .find_by_hash(
@@ -566,6 +681,9 @@ impl ClusterApi for ClusterApiService {
             }
         };
 
+        self.authorize_forwarded_template(&release, caller_org, forwarded_scope.as_ref())
+            .await?;
+
         let storage_locations = rows
             .into_iter()
             .filter_map(|row| {
@@ -595,6 +713,9 @@ impl ClusterApi for ClusterApiService {
             template_visibility: visibility.into(),
         });
         if let Some(scope) = delegation {
+            scope.acknowledge_authorization(&mut response);
+        }
+        if let Some(scope) = receipt {
             scope.receipt(&mut response);
         }
         Ok(response)

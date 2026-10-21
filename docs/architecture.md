@@ -38,11 +38,25 @@ that a downstream peer received it or that the scope was authorized. Check
 all participating services and exercise cache misses as well as hits; an idle
 service or a cached lookup cannot prove the catalog supports the protocol.
 
-Deploy this compatibility phase before introducing stricter lookup rules.
-Strict enforcement requires a separate authorization acknowledgement; it must
-not accept the compatibility receipt as proof. Existing clients that omit scope
-must be migrated before enforcing it. Rollback to the previous version remains
-compatible with these requests and replies.
+Install compatible clients before activating stricter lookup rules. After every
+API, catalog, node-api, sandbox-manager, builder, and template-manager runs the
+compatible protocol, install the enforcement-capable version with
+`SPACE_TEMPLATE_LOOKUP_ENFORCEMENT` unset or `false`. On template-manager,
+`true` activates authorization before delegated cache reads; any other value
+fails startup. The setting is read once at startup.
+
+Enable it only after all catalog replicas support required-scope requests and
+API replicas record placement before dispatching direct creates. Then update
+template-managers progressively and exercise authorized and denied requests on
+cache hits and misses. Compatibility observations alone do not establish these
+prerequisites. An enforcing template-manager rejects a catalog that only sends
+a compatibility receipt; it never falls back to cached access on that failure.
+
+Trusted local execution retains offline access to cached artifacts. Remote
+lookups require catalog availability, including cache hits. Disabling the
+setting or rolling template-manager back restores legacy cache access, so that
+rollback also removes enforcement. Complete enforcement requires the setting
+on every serving template-manager; code deployment alone is not activation.
 
 ## Request and execution flow
 

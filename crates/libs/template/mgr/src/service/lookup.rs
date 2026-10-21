@@ -26,7 +26,19 @@ impl TemplateManagerService {
             .get_template_resolving(
                 request,
                 async |name, hash, tag, org| {
-                    crate::volume::find_release_in_scope(name, hash, tag, org, scope).await
+                    if self.enforce_lookup_scope {
+                        // Local cache authority never becomes catalog authority.
+                        let catalog_scope = match scope {
+                            None | Some(TemplateLookupScope::LocalExecution) => {
+                                TemplateLookupScope::Cluster
+                            }
+                            Some(scope) => scope,
+                        };
+                        crate::volume::find_authorized_release(name, hash, tag, org, catalog_scope)
+                            .await
+                    } else {
+                        crate::volume::find_release_in_scope(name, hash, tag, org, scope).await
+                    }
                 },
                 async |spec, resolve_elapsed, release| {
                     self.volume_puller
@@ -37,6 +49,9 @@ impl TemplateManagerService {
             .await?;
         if let Some(scope) = scope {
             scope.receipt(&mut response);
+            if self.enforce_lookup_scope {
+                scope.acknowledge_authorization(&mut response);
+            }
         }
         Ok(response)
     }
@@ -59,8 +74,40 @@ impl TemplateManagerService {
             crate::volume::ResolvedRelease,
         ) -> crate::volume::PullOutcome,
     ) -> Result<Response<crate::proto::GetTemplateResponse>, Status> {
-        self.authorize_peer(&request, "GetTemplate", ALLOW_TEMPLATE_OBSERVER)?;
+        let peer = self.authorize_peer(&request, "GetTemplate", ALLOW_TEMPLATE_OBSERVER)?;
         let scope = TemplateLookupScope::from_request(&request)?;
+        let local_execution = !self.enforce_lookup_scope
+            || match (scope, peer.principal()) {
+                (
+                    Some(TemplateLookupScope::Cluster | TemplateLookupScope::Node(_)),
+                    UdsPeerPrincipal::Root
+                    | UdsPeerPrincipal::Service(SPACE_NODEAPI_ACCOUNT | SPACE_SBXMGR_ACCOUNT),
+                ) => false,
+                (
+                    Some(TemplateLookupScope::Sandbox { .. }),
+                    UdsPeerPrincipal::Root | UdsPeerPrincipal::Service(SPACE_SBXMGR_ACCOUNT),
+                ) => false,
+                (
+                    Some(TemplateLookupScope::LocalExecution),
+                    UdsPeerPrincipal::Root | UdsPeerPrincipal::Service(SPACE_SBXMGR_ACCOUNT),
+                ) => true,
+                (
+                    None,
+                    UdsPeerPrincipal::Root
+                    | UdsPeerPrincipal::Role(LocalRole::Admin | LocalRole::Operator),
+                ) => true,
+                (None, UdsPeerPrincipal::Service(SPACE_NODEAPI_ACCOUNT | SPACE_SBXMGR_ACCOUNT)) => {
+                    return Err(Status::permission_denied(
+                        "forwarded template lookup requires caller scope",
+                    ));
+                }
+                (None, _) => false,
+                _ => {
+                    return Err(Status::permission_denied(
+                        "peer cannot delegate template lookup scope",
+                    ));
+                }
+            };
         let req = request.get_ref();
         let tmpl_ref = req
             .template
@@ -87,9 +134,11 @@ impl TemplateManagerService {
         // below.
         let requested_hash = req_hash.clone();
         let resolve_started = std::time::Instant::now();
-        // Explicit tags need authoritative resolution even on cache hits. Trusted
-        // name-only policy refreshes and exact-digest reads can still work offline.
-        let release = if caller_org.is_some() || (req_hash.is_empty() && !req_tag.is_empty()) {
+        // Enforced delegated reads authorize before inspecting the local cache.
+        let release = if !local_execution
+            || caller_org.is_some()
+            || (req_hash.is_empty() && !req_tag.is_empty())
+        {
             Some(
                 resolve(template_id, &req_hash, &req_tag, caller_org)
                     .await
@@ -110,6 +159,11 @@ impl TemplateManagerService {
             )
         } else {
             None
+        };
+        let authorized_org = if self.enforce_lookup_scope {
+            release.as_ref().and_then(|release| release.authorized_org)
+        } else {
+            caller_org
         };
         let resolve_elapsed = resolve_started.elapsed();
         let req_hash = release
@@ -200,7 +254,7 @@ impl TemplateManagerService {
         .await
         {
             Ok(mut resp) => {
-                resp.authorized_org_id = caller_org.map(|org| org.to_string());
+                resp.authorized_org_id = authorized_org.map(|org| org.to_string());
                 pplx_space_metrics::template::get_cache_hit(&cache_tags);
                 if snapshot_selector.is_none() && resp.snapshot_dir.is_none() {
                     self.spawn_desired_base_snapshot_reconcile(
@@ -271,7 +325,7 @@ impl TemplateManagerService {
                     }
                 })
                 .map(|mut response| {
-                    response.authorized_org_id = caller_org.map(|org| org.to_string());
+                    response.authorized_org_id = authorized_org.map(|org| org.to_string());
                     Response::new(response)
                 })
                 .inspect_err(|_| {
