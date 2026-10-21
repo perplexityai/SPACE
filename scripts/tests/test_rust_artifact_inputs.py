@@ -179,8 +179,11 @@ def test_a_lane_covers_what_its_binaries_reach_without_dev_dependencies(tmp_path
             "libs/windows-only",
         )
     )
+    # No package of this lane names fixture-patched, but a `[patch]` applies
+    # under registry crates too, so every lane covers it.
     assert bundle_builds.rust_artifact_packages("other", tmp_path) == (
         Path("apps/other"),
+        Path("libs/patched"),
         Path("libs/unrelated"),
     )
     with pytest.raises(
@@ -220,6 +223,13 @@ def test_a_lane_covers_what_its_binaries_reach_without_dev_dependencies(tmp_path
             'paths = ["vendor/fixture-vendored"]\n',
             "outside the workspace members: vendor/fixture-vendored$",
         ),
+        (
+            ".cargo/config.toml",
+            "",
+            '[source.crates-io]\nreplace-with = "vendored"\n[source.vendored]\ndirectory = "vendor"\n',
+            "replaced by a local directory: vendored$",
+        ),
+        (".cargo/config.toml", "", 'include = ["overrides.toml"]\n', "no `include`"),
     ],
 )
 def test_a_workspace_the_reader_cannot_cover_fails_loudly(tmp_path, path, old, new, error):

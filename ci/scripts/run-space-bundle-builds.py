@@ -618,11 +618,26 @@ def rust_binaries(package_root: Path, manifest: dict[str, Any]) -> frozenset[str
     )
 
 
-def rust_local_overrides(source_root: Path, root_manifest: dict[str, Any]) -> list[str]:
+def rust_local_overrides(source_root: Path) -> list[str]:
     """The local crates that `[patch]`, `[replace]` or `paths` build in place
-    of the crates they name, from the root manifest and `.cargo/config.toml`."""
+    of the crates they name, from the root manifest and `.cargo/config.toml`.
+    Exits on what it cannot follow: a config `include`, and a source replaced
+    by a local directory, which no lane hashes."""
+    root_manifest = read_cargo_manifest(source_root / "Cargo.toml")
     config_path = source_root / ".cargo/config.toml"
     config = read_cargo_manifest(config_path) if config_path.exists() else {}
+    if "include" in config:
+        raise SystemExit("Rust artifact inputs follow no `include` in .cargo/config.toml")
+    vendored = sorted(
+        name
+        for name, source in config.get("source", {}).items()
+        if "directory" in source or "local-registry" in source
+    )
+    if vendored:
+        raise SystemExit(
+            "Rust artifact inputs cover no source replaced by a local directory: "
+            + ", ".join(vendored)
+        )
     paths = list(config.get("paths", []))
     for source in (root_manifest, config):
         for table in (*source.get("patch", {}).values(), source.get("replace", {})):
@@ -638,7 +653,7 @@ def rust_workspace_packages(source_root: Path) -> dict[Path, RustPackage]:
     """Read each workspace package from its manifest. As in Cargo, a path
     dependency is a member whether or not `members` lists it, and as in
     `cargo metadata`, a dependency reaches the member with its package name
-    from any source, so a member that a `[patch]` substitutes is covered."""
+    from any source."""
     root_manifest = read_cargo_manifest(source_root / "Cargo.toml")
     workspace = root_manifest.get("workspace", {})
     if (
@@ -677,7 +692,7 @@ def rust_workspace_packages(source_root: Path) -> dict[Path, RustPackage]:
     # No lane would hash the sources of a substitute outside the workspace.
     outside = [
         path
-        for path in rust_local_overrides(source_root, root_manifest)
+        for path in rust_local_overrides(source_root)
         if repository_relative(Path(path)) not in manifests
     ]
     if outside:
@@ -712,10 +727,11 @@ def rust_artifact_packages(feature: str, source_root: Path = REPO_ROOT) -> tuple
         raise SystemExit(
             f"Could not find workspace packages for Rust binaries: {', '.join(sorted(missing))}"
         )
+    # Cargo also builds a local override wherever the crate it replaces sits
+    # in the graph, under registry crates too, so every lane covers each one.
     pending = [
-        directory
-        for directory, package in packages.items()
-        if package.binaries & binaries
+        *(directory for directory, package in packages.items() if package.binaries & binaries),
+        *(repository_relative(Path(path)) for path in rust_local_overrides(source_root)),
     ]
     selected: set[Path] = set()
     while pending:
