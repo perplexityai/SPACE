@@ -72,6 +72,22 @@ impl EnvironmentDefinition {
         .with_environment(self.reference()))
     }
 
+    /// Check a cold-boot consumer against the source image contract. Runtime
+    /// version, state format and environment reference describe the producer;
+    /// only explicit compatible selection may replace those with a consumer.
+    /// This check is not installation evidence or execution authorization.
+    pub fn check_cold_boot_source(
+        &self,
+        source: &ExecutionMetadata,
+    ) -> Result<(), EnvironmentBindingError> {
+        let spec = self.descriptor().spec();
+        let RuntimeBinding::ManagedRelease(release) = &spec.runtime;
+        if source.runtime().kind != release.runtime.kind || source.guest() != spec.guest {
+            return Err(EnvironmentBindingError::RuntimeOrGuest);
+        }
+        self.check_boot_components(source)
+    }
+
     /// Bind observations only after checking their complete supported shape.
     /// Kernel bytes take precedence over historical directory-name aliases,
     /// matching the existing runtime component resolver's identity semantics.
@@ -96,16 +112,15 @@ impl EnvironmentDefinition {
                 expected: self.reference(),
             });
         }
+        self.check_runtime(execution)?;
+        self.check_boot_components(execution)
+    }
+
+    fn check_boot_components(
+        &self,
+        execution: &ExecutionMetadata,
+    ) -> Result<(), EnvironmentBindingError> {
         let spec = self.descriptor().spec();
-        let RuntimeBinding::ManagedRelease(release) = &spec.runtime;
-        if execution.runtime() != &release.runtime || execution.guest() != spec.guest {
-            return Err(EnvironmentBindingError::RuntimeOrGuest);
-        }
-        let ExecutionCompatibilityProfile::FirecrackerSnapshotV1 { state_format } =
-            &spec.compatibility;
-        if execution.state_format() != Some(state_format) {
-            return Err(EnvironmentBindingError::StateFormat);
-        }
         let BootProfile::LinuxDirectV1 { kernel } = &spec.boot;
         let [observed] = execution.components() else {
             return Err(EnvironmentBindingError::BootComponents);

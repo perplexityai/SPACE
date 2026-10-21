@@ -103,7 +103,9 @@ impl NodeManagerService {
             };
         };
         if let Some(actual) = execution.environment() {
-            let initial = self.allowed_definition(None, ExecutionSelectionMode::NewColdBoot)?;
+            let initial = super::super::node_artifacts::initial_environment()?
+                .definition()
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
             validate_binding(reference, actual, initial.reference())?;
         } else {
             return if reference.is_some() {

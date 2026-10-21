@@ -112,6 +112,7 @@ impl BuildExecutionBinding {
             let mut node = pplx_space_node_mgr_client::connect().await?;
             Ok::<_, BuildExecutionBindingError>(
                 node.resolve_execution_environment(ResolveExecutionEnvironmentRequest {
+                    compatible: None,
                     reference: reference.map(|value| value.to_string()),
                 })
                 .await?

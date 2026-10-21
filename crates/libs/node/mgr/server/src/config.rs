@@ -16,7 +16,7 @@ pub(crate) struct ServiceSettings {
     pub lifecycle_limiter: crate::lifecycle_limiter::LifecycleLimiter,
     pub runtime_paths: RuntimePaths,
     pub guest_console_logs: bool,
-    pub production: bool,
+    pub execution_policy: pplx_space_node_runtime_core::selection::ExecutionPolicy,
     pub memory_admission_sources: crate::memory_admission::MemoryAdmissionSources,
     pub runtime_supervisor: crate::runtime_supervisor_client::RuntimeSupervisorLazyClient,
     pub node_status_dirty: std::sync::Arc<dyn crate::node_state_sync::NodeStatusDirtySink>,
@@ -54,8 +54,9 @@ impl Default for ArtifactStorePaths {
 }
 
 impl ServiceSettings {
-    pub fn from_env() -> Self {
+    pub fn from_env() -> Result<Self, SelectionConfigurationError> {
         let settings = Self {
+            execution_policy: execution_policy_from_env()?,
             disk_admission: CacheDiskAdmissionConfig::from_env(),
             lifecycle_limiter: crate::lifecycle_limiter::LifecycleLimiter::from_env(),
             runtime_paths: RuntimePaths {
@@ -70,9 +71,6 @@ impl ServiceSettings {
                 ),
                 store: ArtifactStorePaths::default(),
             },
-            production: deployment_is_production(
-                std::env::var_os(pplx_space_observability::logging::SPACE_ENV).as_deref(),
-            ),
             guest_console_logs: std::env::var("SPACE_ENABLE_GUEST_CONSOLE_LOGS").is_ok_and(
                 |value| {
                     matches!(
@@ -92,10 +90,12 @@ impl ServiceSettings {
         tracing::info!(
             disk_admission = ?settings.disk_admission,
             guest_console_logs = settings.guest_console_logs,
-            production = settings.production,
+            allowed_environments = ?settings.execution_policy.allowed_references().collect::<Vec<_>>(),
+            default_environment = ?settings.execution_policy.default_reference(),
+            legacy_unbound_allowed = settings.execution_policy.legacy_unbound_allowed(),
             "resolved startup-only node-manager host settings"
         );
-        settings
+        Ok(settings)
     }
 }
 
@@ -108,24 +108,65 @@ fn path(name: &str, default: &str) -> PathBuf {
     path
 }
 
-/// Only explicit non-production deployment identities relax the E0 restriction.
-/// Missing, malformed, or unfamiliar deployment identities retain production admission.
-fn deployment_is_production(value: Option<&std::ffi::OsStr>) -> bool {
-    !value
-        .and_then(std::ffi::OsStr::to_str)
-        .is_some_and(|value| {
-            let normalized = value.trim().to_ascii_lowercase();
-            normalized.strip_prefix("local-").is_some_and(|suffix| {
-                !suffix.is_empty()
-                    && suffix.bytes().all(|byte| {
-                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
-                    })
-            }) || matches!(
-                normalized.as_str(),
-                "dev" | "development" | "local" | "kind-local" | "test" | "testing" | "staging"
-            )
-        })
-}
-
 #[cfg(test)]
 mod tests;
+
+#[derive(Debug, thiserror::Error)]
+pub enum SelectionConfigurationError {
+    #[error("invalid execution selection setting: {0}")]
+    Environment(#[from] std::env::VarError),
+    #[error("invalid execution selection: {0}")]
+    Policy(#[from] pplx_space_node_runtime_core::selection::PolicyError),
+    #[error("cannot load execution catalog: {0}")]
+    Catalog(#[from] pplx_space_node_runtime_core::catalog::CatalogError),
+    #[error("unsupported host architecture: {0}")]
+    Architecture(#[from] pplx_space_common_core::types::ArchParseError),
+}
+
+fn execution_policy_from_env()
+-> Result<pplx_space_node_runtime_core::selection::ExecutionPolicy, SelectionConfigurationError> {
+    use pplx_space_node_runtime_core::{catalog::CompiledEnvironment, selection::*};
+    let read = |name| match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(error),
+    };
+    let allowed = read(ALLOWED_ENVIRONMENTS)?;
+    let default = read(DEFAULT_ENVIRONMENT)?;
+    let architecture = std::env::consts::ARCH.parse()?;
+    execution_policy_with_catalog(
+        allowed.as_deref(),
+        default.as_deref(),
+        architecture,
+        CompiledEnvironment::for_architecture(architecture),
+    )
+}
+
+fn execution_policy_with_catalog(
+    allowed: Option<&str>,
+    default: Option<&str>,
+    architecture: pplx_space_common_core::types::Arch,
+    catalog: Result<
+        Vec<pplx_space_node_runtime_core::catalog::CompiledEnvironment>,
+        pplx_space_node_runtime_core::catalog::CatalogError,
+    >,
+) -> Result<pplx_space_node_runtime_core::selection::ExecutionPolicy, SelectionConfigurationError> {
+    use pplx_space_node_runtime_core::{
+        catalog::{CatalogError, InitialEnvironment},
+        selection::ExecutionPolicy,
+    };
+    match catalog {
+        Ok(catalog) => Ok(ExecutionPolicy::parse(allowed, default, &catalog)?),
+        Err(error) => {
+            let initial = InitialEnvironment::for_architecture(architecture)?;
+            let fallback = [initial
+                .compiled_environment()
+                .map_err(CatalogError::EnvironmentDefinition)?];
+            // Parse against the independently loaded initial binding. This accepts
+            // explicit spellings of the default but never drops requested candidates.
+            tracing::warn!(%error, "candidate catalog unavailable; validating policy against initial binding");
+            let policy = ExecutionPolicy::parse(allowed, default, &fallback)?;
+            Ok(policy)
+        }
+    }
+}

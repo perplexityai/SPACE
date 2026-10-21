@@ -29,6 +29,7 @@ fn fixture() -> ResolveExecutionEnvironmentResponse {
         )
         .unwrap();
     ResolveExecutionEnvironmentResponse {
+        accepted_selection: 0,
         definition: Some((&definition).into()),
         execution: Some((&execution).into()),
     }
@@ -257,6 +258,7 @@ async fn derived_vm_requests_keep_unbound_releases_on_the_legacy_protocol() {
     let other = BuildExecutionBinding::from_response(
         None,
         ResolveExecutionEnvironmentResponse {
+            accepted_selection: 0,
             definition: Some((&definition).into()),
             execution: Some((&requirements).into()),
         },

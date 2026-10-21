@@ -104,10 +104,15 @@ pub(super) async fn prepare<'a>(
     Ok(Some(PreparedObservation { node_id, report }))
 }
 
+pub(super) struct PublishedExecutionObservation {
+    pub status: InventoryStatus,
+    pub policy: Option<pplx_space_common_core::types::ExecutionPolicyObservation>,
+}
+
 pub(super) async fn publish(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     prepared: Option<PreparedObservation<'_>>,
-) -> Result<Option<InventoryStatus>, Status> {
+) -> Result<Option<PublishedExecutionObservation>, Status> {
     let Some(PreparedObservation { node_id, report }) = prepared else {
         return Ok(None);
     };
@@ -119,7 +124,18 @@ pub(super) async fn publish(
     if let Some(inventory) = inventory {
         publish_inventory(tx, node_id, inventory).await?;
     }
-    Ok(Some(status))
+    let policy = inventory
+        .and_then(|inventory| inventory.policy.as_ref())
+        .and_then(|policy| {
+            match pplx_space_common_core::types::ExecutionPolicyObservation::try_from(policy) {
+                Ok(policy) => Some(policy),
+                Err(error) => {
+                    tracing::warn!(%error, %node_id, "invalid execution policy observation; withholding policy evidence");
+                    None
+                }
+            }
+        });
+    Ok(Some(PublishedExecutionObservation { status, policy }))
 }
 
 /// Reconcile a complete inventory without rewriting unchanged artifact rows.

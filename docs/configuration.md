@@ -457,11 +457,24 @@ forwarding never relabels it.
 | `SPACE_DB_APP_LOCK_TIMEOUT` | `bootstrap-roles` application-role `lock_timeout`; same as `--app-lock-timeout`. `0` resets it, unset leaves it unchanged. |
 | `SPACE_API_URL`, `SPACE_API_TOKEN` | Admin CLI. |
 
+## Execution eligibility
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `SPACE_ALLOWED_EXECUTION_ENVIRONMENTS` | `e0,legacy` on x86_64; `legacy` on aarch64 | Comma-separated compiled environment names and optional historical-unbound permission. Surrounding whitespace is ignored; empty, duplicate and unknown entries fail startup. |
+| `SPACE_DEFAULT_EXECUTION_ENVIRONMENT` | `e0` on x86_64; `legacy` on aarch64 | Must be allowed. Used for unpinned scratch builds, not to replace a bound source. |
+
+These settings replace the former `SPACE_ENV` admission rule. Before upgrading
+a node that runs non-E0 work, explicitly allow every environment that must remain
+usable. Leaving settings absent revokes those bindings even on development or
+Kind nodes. See [execution policy and rollout](execution-environments.md) for
+cohort constraints and the separate permission for historical unbound work.
+
 ## Observability and feature flags
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `SPACE_ENV` | unset | Deployment identity for telemetry and node-manager execution admission. Recognized development identities, including `local-*`, permit approved non-default environments; missing or unrecognized identities restrict explicit selection to E0. |
+| `SPACE_ENV` | unset | Deployment identity for telemetry; it does not authorize execution environments. |
 | `SPACE_SERVICE_NAME`, `SPACE_VERSION` | unset | SPACE identity tier: outrank `OTEL_SERVICE_NAME`/`OTEL_RESOURCE_ATTRIBUTES` and `DD_*`. |
 | `SPACE_K8S_POD_NAME` | unset | Reported as `k8s.pod.name` on the metrics resource. |
 | `SPACE_LOG_FORMAT` | auto | `json`, `compact`, `pretty` or `text`. |

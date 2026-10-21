@@ -752,6 +752,7 @@ async fn explicit_selection_checks_legacy_base_evidence_before_create() {
         .unwrap();
         let verified = definition.bind_execution(requirements.clone()).unwrap();
         let response = ResolveExecutionEnvironmentResponse {
+            accepted_selection: 0,
             definition: Some((&definition).into()),
             execution: Some((&verified).into()),
         };
@@ -813,6 +814,7 @@ async fn selected_create_persists_the_binding_used_by_first_start() {
         std::fs::write(build.dir.path().join("metadata.json"), &metadata_bytes).unwrap();
         let bound = definition.bind_execution(execution).unwrap();
         let response = ResolveExecutionEnvironmentResponse {
+            accepted_selection: 0,
             definition: Some((&definition).into()),
             execution: Some((&bound).into()),
         };

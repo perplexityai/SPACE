@@ -973,9 +973,12 @@ func (x *ArtifactComponentInstallation) GetLegacyDefault() bool {
 }
 
 type NodeExecutionInventory struct {
-	state         protoimpl.MessageState           `protogen:"open.v1"`
-	Runtimes      []*RuntimeInstallation           `protobuf:"bytes,1,rep,name=runtimes,proto3" json:"runtimes,omitempty"`
-	Components    []*ArtifactComponentInstallation `protobuf:"bytes,2,rep,name=components,proto3" json:"components,omitempty"`
+	state      protoimpl.MessageState           `protogen:"open.v1"`
+	Runtimes   []*RuntimeInstallation           `protobuf:"bytes,1,rep,name=runtimes,proto3" json:"runtimes,omitempty"`
+	Components []*ArtifactComponentInstallation `protobuf:"bytes,2,rep,name=components,proto3" json:"components,omitempty"`
+	// Effective startup policy, independent of installed/usable artifacts. Absence
+	// means unknown support, never implicit E0 approval.
+	Policy        *ExecutionPolicyObservation `protobuf:"bytes,3,opt,name=policy,proto3" json:"policy,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1024,6 +1027,83 @@ func (x *NodeExecutionInventory) GetComponents() []*ArtifactComponentInstallatio
 	return nil
 }
 
+func (x *NodeExecutionInventory) GetPolicy() *ExecutionPolicyObservation {
+	if x != nil {
+		return x.Policy
+	}
+	return nil
+}
+
+type ExecutionPolicyObservation struct {
+	state                        protoimpl.MessageState `protogen:"open.v1"`
+	SchemaVersion                uint32                 `protobuf:"varint,1,opt,name=schema_version,json=schemaVersion,proto3" json:"schema_version,omitempty"`
+	AllowedEnvironmentReferences []string               `protobuf:"bytes,2,rep,name=allowed_environment_references,json=allowedEnvironmentReferences,proto3" json:"allowed_environment_references,omitempty"`
+	// Absent with an empty list on architectures using the legacy default.
+	DefaultEnvironmentReference *string `protobuf:"bytes,3,opt,name=default_environment_reference,json=defaultEnvironmentReference,proto3,oneof" json:"default_environment_reference,omitempty"`
+	// Permission for unbound historical contracts, not an environment identity.
+	LegacyUnboundAllowed bool `protobuf:"varint,4,opt,name=legacy_unbound_allowed,json=legacyUnboundAllowed,proto3" json:"legacy_unbound_allowed,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
+}
+
+func (x *ExecutionPolicyObservation) Reset() {
+	*x = ExecutionPolicyObservation{}
+	mi := &file_execution_v1_execution_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExecutionPolicyObservation) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExecutionPolicyObservation) ProtoMessage() {}
+
+func (x *ExecutionPolicyObservation) ProtoReflect() protoreflect.Message {
+	mi := &file_execution_v1_execution_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExecutionPolicyObservation.ProtoReflect.Descriptor instead.
+func (*ExecutionPolicyObservation) Descriptor() ([]byte, []int) {
+	return file_execution_v1_execution_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *ExecutionPolicyObservation) GetSchemaVersion() uint32 {
+	if x != nil {
+		return x.SchemaVersion
+	}
+	return 0
+}
+
+func (x *ExecutionPolicyObservation) GetAllowedEnvironmentReferences() []string {
+	if x != nil {
+		return x.AllowedEnvironmentReferences
+	}
+	return nil
+}
+
+func (x *ExecutionPolicyObservation) GetDefaultEnvironmentReference() string {
+	if x != nil && x.DefaultEnvironmentReference != nil {
+		return *x.DefaultEnvironmentReference
+	}
+	return ""
+}
+
+func (x *ExecutionPolicyObservation) GetLegacyUnboundAllowed() bool {
+	if x != nil {
+		return x.LegacyUnboundAllowed
+	}
+	return false
+}
+
 type HostPlatform struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Os            HostOperatingSystem    `protobuf:"varint,1,opt,name=os,proto3,enum=space.execution.v1.HostOperatingSystem" json:"os,omitempty"`
@@ -1034,7 +1114,7 @@ type HostPlatform struct {
 
 func (x *HostPlatform) Reset() {
 	*x = HostPlatform{}
-	mi := &file_execution_v1_execution_proto_msgTypes[9]
+	mi := &file_execution_v1_execution_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1046,7 +1126,7 @@ func (x *HostPlatform) String() string {
 func (*HostPlatform) ProtoMessage() {}
 
 func (x *HostPlatform) ProtoReflect() protoreflect.Message {
-	mi := &file_execution_v1_execution_proto_msgTypes[9]
+	mi := &file_execution_v1_execution_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1059,7 +1139,7 @@ func (x *HostPlatform) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HostPlatform.ProtoReflect.Descriptor instead.
 func (*HostPlatform) Descriptor() ([]byte, []int) {
-	return file_execution_v1_execution_proto_rawDescGZIP(), []int{9}
+	return file_execution_v1_execution_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *HostPlatform) GetOs() HostOperatingSystem {
@@ -1089,7 +1169,7 @@ type ManagedRuntimeRelease struct {
 
 func (x *ManagedRuntimeRelease) Reset() {
 	*x = ManagedRuntimeRelease{}
-	mi := &file_execution_v1_execution_proto_msgTypes[10]
+	mi := &file_execution_v1_execution_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1101,7 +1181,7 @@ func (x *ManagedRuntimeRelease) String() string {
 func (*ManagedRuntimeRelease) ProtoMessage() {}
 
 func (x *ManagedRuntimeRelease) ProtoReflect() protoreflect.Message {
-	mi := &file_execution_v1_execution_proto_msgTypes[10]
+	mi := &file_execution_v1_execution_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1114,7 +1194,7 @@ func (x *ManagedRuntimeRelease) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ManagedRuntimeRelease.ProtoReflect.Descriptor instead.
 func (*ManagedRuntimeRelease) Descriptor() ([]byte, []int) {
-	return file_execution_v1_execution_proto_rawDescGZIP(), []int{10}
+	return file_execution_v1_execution_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *ManagedRuntimeRelease) GetRuntime() *RuntimeIdentity {
@@ -1157,7 +1237,7 @@ type RuntimeBinding struct {
 
 func (x *RuntimeBinding) Reset() {
 	*x = RuntimeBinding{}
-	mi := &file_execution_v1_execution_proto_msgTypes[11]
+	mi := &file_execution_v1_execution_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1169,7 +1249,7 @@ func (x *RuntimeBinding) String() string {
 func (*RuntimeBinding) ProtoMessage() {}
 
 func (x *RuntimeBinding) ProtoReflect() protoreflect.Message {
-	mi := &file_execution_v1_execution_proto_msgTypes[11]
+	mi := &file_execution_v1_execution_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1182,7 +1262,7 @@ func (x *RuntimeBinding) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RuntimeBinding.ProtoReflect.Descriptor instead.
 func (*RuntimeBinding) Descriptor() ([]byte, []int) {
-	return file_execution_v1_execution_proto_rawDescGZIP(), []int{11}
+	return file_execution_v1_execution_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *RuntimeBinding) GetProvider() isRuntimeBinding_Provider {
@@ -1221,7 +1301,7 @@ type LinuxDirectBootV1 struct {
 
 func (x *LinuxDirectBootV1) Reset() {
 	*x = LinuxDirectBootV1{}
-	mi := &file_execution_v1_execution_proto_msgTypes[12]
+	mi := &file_execution_v1_execution_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1233,7 +1313,7 @@ func (x *LinuxDirectBootV1) String() string {
 func (*LinuxDirectBootV1) ProtoMessage() {}
 
 func (x *LinuxDirectBootV1) ProtoReflect() protoreflect.Message {
-	mi := &file_execution_v1_execution_proto_msgTypes[12]
+	mi := &file_execution_v1_execution_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1246,7 +1326,7 @@ func (x *LinuxDirectBootV1) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LinuxDirectBootV1.ProtoReflect.Descriptor instead.
 func (*LinuxDirectBootV1) Descriptor() ([]byte, []int) {
-	return file_execution_v1_execution_proto_rawDescGZIP(), []int{12}
+	return file_execution_v1_execution_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *LinuxDirectBootV1) GetKernel() *EnvironmentComponent {
@@ -1267,7 +1347,7 @@ type EnvironmentComponent struct {
 
 func (x *EnvironmentComponent) Reset() {
 	*x = EnvironmentComponent{}
-	mi := &file_execution_v1_execution_proto_msgTypes[13]
+	mi := &file_execution_v1_execution_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1279,7 +1359,7 @@ func (x *EnvironmentComponent) String() string {
 func (*EnvironmentComponent) ProtoMessage() {}
 
 func (x *EnvironmentComponent) ProtoReflect() protoreflect.Message {
-	mi := &file_execution_v1_execution_proto_msgTypes[13]
+	mi := &file_execution_v1_execution_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1292,7 +1372,7 @@ func (x *EnvironmentComponent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EnvironmentComponent.ProtoReflect.Descriptor instead.
 func (*EnvironmentComponent) Descriptor() ([]byte, []int) {
-	return file_execution_v1_execution_proto_rawDescGZIP(), []int{13}
+	return file_execution_v1_execution_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *EnvironmentComponent) GetKind() ArtifactComponentKind {
@@ -1328,7 +1408,7 @@ type BootProfile struct {
 
 func (x *BootProfile) Reset() {
 	*x = BootProfile{}
-	mi := &file_execution_v1_execution_proto_msgTypes[14]
+	mi := &file_execution_v1_execution_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1340,7 +1420,7 @@ func (x *BootProfile) String() string {
 func (*BootProfile) ProtoMessage() {}
 
 func (x *BootProfile) ProtoReflect() protoreflect.Message {
-	mi := &file_execution_v1_execution_proto_msgTypes[14]
+	mi := &file_execution_v1_execution_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1353,7 +1433,7 @@ func (x *BootProfile) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BootProfile.ProtoReflect.Descriptor instead.
 func (*BootProfile) Descriptor() ([]byte, []int) {
-	return file_execution_v1_execution_proto_rawDescGZIP(), []int{14}
+	return file_execution_v1_execution_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *BootProfile) GetProfile() isBootProfile_Profile {
@@ -1391,7 +1471,7 @@ type FirecrackerSnapshotCompatibilityV1 struct {
 
 func (x *FirecrackerSnapshotCompatibilityV1) Reset() {
 	*x = FirecrackerSnapshotCompatibilityV1{}
-	mi := &file_execution_v1_execution_proto_msgTypes[15]
+	mi := &file_execution_v1_execution_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1403,7 +1483,7 @@ func (x *FirecrackerSnapshotCompatibilityV1) String() string {
 func (*FirecrackerSnapshotCompatibilityV1) ProtoMessage() {}
 
 func (x *FirecrackerSnapshotCompatibilityV1) ProtoReflect() protoreflect.Message {
-	mi := &file_execution_v1_execution_proto_msgTypes[15]
+	mi := &file_execution_v1_execution_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1416,7 +1496,7 @@ func (x *FirecrackerSnapshotCompatibilityV1) ProtoReflect() protoreflect.Message
 
 // Deprecated: Use FirecrackerSnapshotCompatibilityV1.ProtoReflect.Descriptor instead.
 func (*FirecrackerSnapshotCompatibilityV1) Descriptor() ([]byte, []int) {
-	return file_execution_v1_execution_proto_rawDescGZIP(), []int{15}
+	return file_execution_v1_execution_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *FirecrackerSnapshotCompatibilityV1) GetStateFormat() *StateFormatIdentity {
@@ -1438,7 +1518,7 @@ type ExecutionCompatibilityProfile struct {
 
 func (x *ExecutionCompatibilityProfile) Reset() {
 	*x = ExecutionCompatibilityProfile{}
-	mi := &file_execution_v1_execution_proto_msgTypes[16]
+	mi := &file_execution_v1_execution_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1450,7 +1530,7 @@ func (x *ExecutionCompatibilityProfile) String() string {
 func (*ExecutionCompatibilityProfile) ProtoMessage() {}
 
 func (x *ExecutionCompatibilityProfile) ProtoReflect() protoreflect.Message {
-	mi := &file_execution_v1_execution_proto_msgTypes[16]
+	mi := &file_execution_v1_execution_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1463,7 +1543,7 @@ func (x *ExecutionCompatibilityProfile) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExecutionCompatibilityProfile.ProtoReflect.Descriptor instead.
 func (*ExecutionCompatibilityProfile) Descriptor() ([]byte, []int) {
-	return file_execution_v1_execution_proto_rawDescGZIP(), []int{16}
+	return file_execution_v1_execution_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *ExecutionCompatibilityProfile) GetProfile() isExecutionCompatibilityProfile_Profile {
@@ -1508,7 +1588,7 @@ type EnvironmentDescriptor struct {
 
 func (x *EnvironmentDescriptor) Reset() {
 	*x = EnvironmentDescriptor{}
-	mi := &file_execution_v1_execution_proto_msgTypes[17]
+	mi := &file_execution_v1_execution_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1520,7 +1600,7 @@ func (x *EnvironmentDescriptor) String() string {
 func (*EnvironmentDescriptor) ProtoMessage() {}
 
 func (x *EnvironmentDescriptor) ProtoReflect() protoreflect.Message {
-	mi := &file_execution_v1_execution_proto_msgTypes[17]
+	mi := &file_execution_v1_execution_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1533,7 +1613,7 @@ func (x *EnvironmentDescriptor) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EnvironmentDescriptor.ProtoReflect.Descriptor instead.
 func (*EnvironmentDescriptor) Descriptor() ([]byte, []int) {
-	return file_execution_v1_execution_proto_rawDescGZIP(), []int{17}
+	return file_execution_v1_execution_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *EnvironmentDescriptor) GetHost() *HostPlatform {
@@ -1597,7 +1677,7 @@ type EnvironmentDefinition struct {
 
 func (x *EnvironmentDefinition) Reset() {
 	*x = EnvironmentDefinition{}
-	mi := &file_execution_v1_execution_proto_msgTypes[18]
+	mi := &file_execution_v1_execution_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1609,7 +1689,7 @@ func (x *EnvironmentDefinition) String() string {
 func (*EnvironmentDefinition) ProtoMessage() {}
 
 func (x *EnvironmentDefinition) ProtoReflect() protoreflect.Message {
-	mi := &file_execution_v1_execution_proto_msgTypes[18]
+	mi := &file_execution_v1_execution_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1622,7 +1702,7 @@ func (x *EnvironmentDefinition) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EnvironmentDefinition.ProtoReflect.Descriptor instead.
 func (*EnvironmentDefinition) Descriptor() ([]byte, []int) {
-	return file_execution_v1_execution_proto_rawDescGZIP(), []int{18}
+	return file_execution_v1_execution_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *EnvironmentDefinition) GetSchemaVersion() uint32 {
@@ -1693,12 +1773,19 @@ const file_execution_v1_execution_proto_rawDesc = "" +
 	"\x1dArtifactComponentInstallation\x12C\n" +
 	"\tcomponent\x18\x01 \x01(\v2%.space.execution.v1.ArtifactComponentR\tcomponent\x12&\n" +
 	"\x0fdefault_for_new\x18\x02 \x01(\bR\rdefaultForNew\x12%\n" +
-	"\x0elegacy_default\x18\x03 \x01(\bR\rlegacyDefault\"\xb0\x01\n" +
+	"\x0elegacy_default\x18\x03 \x01(\bR\rlegacyDefault\"\xf8\x01\n" +
 	"\x16NodeExecutionInventory\x12C\n" +
 	"\bruntimes\x18\x01 \x03(\v2'.space.execution.v1.RuntimeInstallationR\bruntimes\x12Q\n" +
 	"\n" +
 	"components\x18\x02 \x03(\v21.space.execution.v1.ArtifactComponentInstallationR\n" +
-	"components\"\x90\x01\n" +
+	"components\x12F\n" +
+	"\x06policy\x18\x03 \x01(\v2..space.execution.v1.ExecutionPolicyObservationR\x06policy\"\xaa\x02\n" +
+	"\x1aExecutionPolicyObservation\x12%\n" +
+	"\x0eschema_version\x18\x01 \x01(\rR\rschemaVersion\x12D\n" +
+	"\x1eallowed_environment_references\x18\x02 \x03(\tR\x1callowedEnvironmentReferences\x12G\n" +
+	"\x1ddefault_environment_reference\x18\x03 \x01(\tH\x00R\x1bdefaultEnvironmentReference\x88\x01\x01\x124\n" +
+	"\x16legacy_unbound_allowed\x18\x04 \x01(\bR\x14legacyUnboundAllowedB \n" +
+	"\x1e_default_environment_reference\"\x90\x01\n" +
 	"\fHostPlatform\x127\n" +
 	"\x02os\x18\x01 \x01(\x0e2'.space.execution.v1.HostOperatingSystemR\x02os\x12G\n" +
 	"\farchitecture\x18\x02 \x01(\x0e2#.space.execution.v1.CpuArchitectureR\farchitecture\"\xea\x01\n" +
@@ -1794,7 +1881,7 @@ func file_execution_v1_execution_proto_rawDescGZIP() []byte {
 }
 
 var file_execution_v1_execution_proto_enumTypes = make([]protoimpl.EnumInfo, 9)
-var file_execution_v1_execution_proto_msgTypes = make([]protoimpl.MessageInfo, 19)
+var file_execution_v1_execution_proto_msgTypes = make([]protoimpl.MessageInfo, 20)
 var file_execution_v1_execution_proto_goTypes = []any{
 	(RuntimeKind)(0),                           // 0: space.execution.v1.RuntimeKind
 	(GuestOperatingSystem)(0),                  // 1: space.execution.v1.GuestOperatingSystem
@@ -1814,16 +1901,17 @@ var file_execution_v1_execution_proto_goTypes = []any{
 	(*RuntimeInstallation)(nil),                // 15: space.execution.v1.RuntimeInstallation
 	(*ArtifactComponentInstallation)(nil),      // 16: space.execution.v1.ArtifactComponentInstallation
 	(*NodeExecutionInventory)(nil),             // 17: space.execution.v1.NodeExecutionInventory
-	(*HostPlatform)(nil),                       // 18: space.execution.v1.HostPlatform
-	(*ManagedRuntimeRelease)(nil),              // 19: space.execution.v1.ManagedRuntimeRelease
-	(*RuntimeBinding)(nil),                     // 20: space.execution.v1.RuntimeBinding
-	(*LinuxDirectBootV1)(nil),                  // 21: space.execution.v1.LinuxDirectBootV1
-	(*EnvironmentComponent)(nil),               // 22: space.execution.v1.EnvironmentComponent
-	(*BootProfile)(nil),                        // 23: space.execution.v1.BootProfile
-	(*FirecrackerSnapshotCompatibilityV1)(nil), // 24: space.execution.v1.FirecrackerSnapshotCompatibilityV1
-	(*ExecutionCompatibilityProfile)(nil),      // 25: space.execution.v1.ExecutionCompatibilityProfile
-	(*EnvironmentDescriptor)(nil),              // 26: space.execution.v1.EnvironmentDescriptor
-	(*EnvironmentDefinition)(nil),              // 27: space.execution.v1.EnvironmentDefinition
+	(*ExecutionPolicyObservation)(nil),         // 18: space.execution.v1.ExecutionPolicyObservation
+	(*HostPlatform)(nil),                       // 19: space.execution.v1.HostPlatform
+	(*ManagedRuntimeRelease)(nil),              // 20: space.execution.v1.ManagedRuntimeRelease
+	(*RuntimeBinding)(nil),                     // 21: space.execution.v1.RuntimeBinding
+	(*LinuxDirectBootV1)(nil),                  // 22: space.execution.v1.LinuxDirectBootV1
+	(*EnvironmentComponent)(nil),               // 23: space.execution.v1.EnvironmentComponent
+	(*BootProfile)(nil),                        // 24: space.execution.v1.BootProfile
+	(*FirecrackerSnapshotCompatibilityV1)(nil), // 25: space.execution.v1.FirecrackerSnapshotCompatibilityV1
+	(*ExecutionCompatibilityProfile)(nil),      // 26: space.execution.v1.ExecutionCompatibilityProfile
+	(*EnvironmentDescriptor)(nil),              // 27: space.execution.v1.EnvironmentDescriptor
+	(*EnvironmentDefinition)(nil),              // 28: space.execution.v1.EnvironmentDefinition
 }
 var file_execution_v1_execution_proto_depIdxs = []int32{
 	0,  // 0: space.execution.v1.RuntimeIdentity.kind:type_name -> space.execution.v1.RuntimeKind
@@ -1841,30 +1929,31 @@ var file_execution_v1_execution_proto_depIdxs = []int32{
 	12, // 12: space.execution.v1.ArtifactComponentInstallation.component:type_name -> space.execution.v1.ArtifactComponent
 	15, // 13: space.execution.v1.NodeExecutionInventory.runtimes:type_name -> space.execution.v1.RuntimeInstallation
 	16, // 14: space.execution.v1.NodeExecutionInventory.components:type_name -> space.execution.v1.ArtifactComponentInstallation
-	5,  // 15: space.execution.v1.HostPlatform.os:type_name -> space.execution.v1.HostOperatingSystem
-	2,  // 16: space.execution.v1.HostPlatform.architecture:type_name -> space.execution.v1.CpuArchitecture
-	9,  // 17: space.execution.v1.ManagedRuntimeRelease.runtime:type_name -> space.execution.v1.RuntimeIdentity
-	18, // 18: space.execution.v1.ManagedRuntimeRelease.target:type_name -> space.execution.v1.HostPlatform
-	8,  // 19: space.execution.v1.ManagedRuntimeRelease.layout:type_name -> space.execution.v1.RuntimePayloadLayout
-	19, // 20: space.execution.v1.RuntimeBinding.managed_release:type_name -> space.execution.v1.ManagedRuntimeRelease
-	22, // 21: space.execution.v1.LinuxDirectBootV1.kernel:type_name -> space.execution.v1.EnvironmentComponent
-	3,  // 22: space.execution.v1.EnvironmentComponent.kind:type_name -> space.execution.v1.ArtifactComponentKind
-	21, // 23: space.execution.v1.BootProfile.linux_direct_v1:type_name -> space.execution.v1.LinuxDirectBootV1
-	11, // 24: space.execution.v1.FirecrackerSnapshotCompatibilityV1.state_format:type_name -> space.execution.v1.StateFormatIdentity
-	24, // 25: space.execution.v1.ExecutionCompatibilityProfile.firecracker_snapshot_v1:type_name -> space.execution.v1.FirecrackerSnapshotCompatibilityV1
-	18, // 26: space.execution.v1.EnvironmentDescriptor.host:type_name -> space.execution.v1.HostPlatform
-	10, // 27: space.execution.v1.EnvironmentDescriptor.guest:type_name -> space.execution.v1.GuestPlatform
-	20, // 28: space.execution.v1.EnvironmentDescriptor.runtime:type_name -> space.execution.v1.RuntimeBinding
-	6,  // 29: space.execution.v1.EnvironmentDescriptor.backend:type_name -> space.execution.v1.HypervisorBackend
-	23, // 30: space.execution.v1.EnvironmentDescriptor.boot:type_name -> space.execution.v1.BootProfile
-	7,  // 31: space.execution.v1.EnvironmentDescriptor.isolation:type_name -> space.execution.v1.IsolationClass
-	25, // 32: space.execution.v1.EnvironmentDescriptor.compatibility:type_name -> space.execution.v1.ExecutionCompatibilityProfile
-	26, // 33: space.execution.v1.EnvironmentDefinition.descriptor:type_name -> space.execution.v1.EnvironmentDescriptor
-	34, // [34:34] is the sub-list for method output_type
-	34, // [34:34] is the sub-list for method input_type
-	34, // [34:34] is the sub-list for extension type_name
-	34, // [34:34] is the sub-list for extension extendee
-	0,  // [0:34] is the sub-list for field type_name
+	18, // 15: space.execution.v1.NodeExecutionInventory.policy:type_name -> space.execution.v1.ExecutionPolicyObservation
+	5,  // 16: space.execution.v1.HostPlatform.os:type_name -> space.execution.v1.HostOperatingSystem
+	2,  // 17: space.execution.v1.HostPlatform.architecture:type_name -> space.execution.v1.CpuArchitecture
+	9,  // 18: space.execution.v1.ManagedRuntimeRelease.runtime:type_name -> space.execution.v1.RuntimeIdentity
+	19, // 19: space.execution.v1.ManagedRuntimeRelease.target:type_name -> space.execution.v1.HostPlatform
+	8,  // 20: space.execution.v1.ManagedRuntimeRelease.layout:type_name -> space.execution.v1.RuntimePayloadLayout
+	20, // 21: space.execution.v1.RuntimeBinding.managed_release:type_name -> space.execution.v1.ManagedRuntimeRelease
+	23, // 22: space.execution.v1.LinuxDirectBootV1.kernel:type_name -> space.execution.v1.EnvironmentComponent
+	3,  // 23: space.execution.v1.EnvironmentComponent.kind:type_name -> space.execution.v1.ArtifactComponentKind
+	22, // 24: space.execution.v1.BootProfile.linux_direct_v1:type_name -> space.execution.v1.LinuxDirectBootV1
+	11, // 25: space.execution.v1.FirecrackerSnapshotCompatibilityV1.state_format:type_name -> space.execution.v1.StateFormatIdentity
+	25, // 26: space.execution.v1.ExecutionCompatibilityProfile.firecracker_snapshot_v1:type_name -> space.execution.v1.FirecrackerSnapshotCompatibilityV1
+	19, // 27: space.execution.v1.EnvironmentDescriptor.host:type_name -> space.execution.v1.HostPlatform
+	10, // 28: space.execution.v1.EnvironmentDescriptor.guest:type_name -> space.execution.v1.GuestPlatform
+	21, // 29: space.execution.v1.EnvironmentDescriptor.runtime:type_name -> space.execution.v1.RuntimeBinding
+	6,  // 30: space.execution.v1.EnvironmentDescriptor.backend:type_name -> space.execution.v1.HypervisorBackend
+	24, // 31: space.execution.v1.EnvironmentDescriptor.boot:type_name -> space.execution.v1.BootProfile
+	7,  // 32: space.execution.v1.EnvironmentDescriptor.isolation:type_name -> space.execution.v1.IsolationClass
+	26, // 33: space.execution.v1.EnvironmentDescriptor.compatibility:type_name -> space.execution.v1.ExecutionCompatibilityProfile
+	27, // 34: space.execution.v1.EnvironmentDefinition.descriptor:type_name -> space.execution.v1.EnvironmentDescriptor
+	35, // [35:35] is the sub-list for method output_type
+	35, // [35:35] is the sub-list for method input_type
+	35, // [35:35] is the sub-list for extension type_name
+	35, // [35:35] is the sub-list for extension extendee
+	0,  // [0:35] is the sub-list for field type_name
 }
 
 func init() { file_execution_v1_execution_proto_init() }
@@ -1874,13 +1963,14 @@ func file_execution_v1_execution_proto_init() {
 	}
 	file_execution_v1_execution_proto_msgTypes[3].OneofWrappers = []any{}
 	file_execution_v1_execution_proto_msgTypes[4].OneofWrappers = []any{}
-	file_execution_v1_execution_proto_msgTypes[11].OneofWrappers = []any{
+	file_execution_v1_execution_proto_msgTypes[9].OneofWrappers = []any{}
+	file_execution_v1_execution_proto_msgTypes[12].OneofWrappers = []any{
 		(*RuntimeBinding_ManagedRelease)(nil),
 	}
-	file_execution_v1_execution_proto_msgTypes[14].OneofWrappers = []any{
+	file_execution_v1_execution_proto_msgTypes[15].OneofWrappers = []any{
 		(*BootProfile_LinuxDirectV1)(nil),
 	}
-	file_execution_v1_execution_proto_msgTypes[16].OneofWrappers = []any{
+	file_execution_v1_execution_proto_msgTypes[17].OneofWrappers = []any{
 		(*ExecutionCompatibilityProfile_FirecrackerSnapshotV1)(nil),
 	}
 	type x struct{}
@@ -1889,7 +1979,7 @@ func file_execution_v1_execution_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_execution_v1_execution_proto_rawDesc), len(file_execution_v1_execution_proto_rawDesc)),
 			NumEnums:      9,
-			NumMessages:   19,
+			NumMessages:   20,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

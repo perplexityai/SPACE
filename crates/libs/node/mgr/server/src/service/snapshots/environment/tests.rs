@@ -44,8 +44,7 @@ fn selected_snapshot_identity_rejects_conflicts_and_malformed_values() {
 
 #[tokio::test]
 async fn unapproved_snapshot_environment_is_refused_before_host_io() {
-    let mut service = crate::service::tests::service_tests::service_for_unit_tests().await;
-    service.production = true;
+    let service = crate::service::tests::service_tests::service_for_unit_tests().await;
     let reference = "sha256:959f1181ac69f0dde7125fbc81be6fcd75b64e9e06e7a393f067b96eb6fb2ac4"
         .parse()
         .unwrap();
@@ -54,7 +53,7 @@ async fn unapproved_snapshot_environment_is_refused_before_host_io() {
         .await
         .unwrap_err();
     assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-    assert!(error.message().contains("production execution"));
+    assert!(error.message().contains("not allowed"));
 }
 
 #[test]

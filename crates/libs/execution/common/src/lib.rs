@@ -8,6 +8,7 @@ use pplx_space_common_core::types::{
 };
 
 pub mod environment;
+pub mod policy;
 
 pub mod proto {
     tonic::include_proto!("space.execution.v1");

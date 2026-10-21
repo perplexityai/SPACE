@@ -16,8 +16,7 @@ Firecracker and jailer binaries, not their download archive.
 
 The implementation includes domain types, protobuf messages, a versioned JSON
 codec, and explicit seed/build binding. E0 remains the default. Designated nodes
-can select other approved compiled bindings through the regular APIs in
-non-production deployments;
+can select other approved compiled bindings through the regular APIs when the node execution policy allows them;
 installation alone never authorizes selection. Cluster policy tables and fleet
 selection are separate operations.
 
@@ -547,18 +546,17 @@ The 1.17.0 / 6.1.155 binding has reference:
 sha256:6e97c03b2523af6cc7b8e67bcde3fd89cf756c1958b10c24472aeadd68a32e0a
 ```
 
-Installation does not select an environment. Node-manager uses the existing
-`SPACE_ENV` deployment identity for its production restriction: explicit
-`dev`, `development`, `local`, `kind-local`, `test`, `testing`, `staging` and
-well-formed `local-*` identities may select any compiled binding; production, missing, malformed and
-unrecognized identities restrict explicit selection to E0. This adds no
-experiment-specific configuration, API, or stored policy.
+Installation does not select an environment. Node-manager loads an explicit
+allowed/default policy at startup. Absent settings retain E0 and historical
+unbound contracts; `SPACE_ENV` is not an admission signal. Compiled names resolve
+to complete references, while `legacy` separately permits historical contracts.
+The policy is rechecked on exact prepare and launch admission.
 
 Artifacts belonging to compiled bindings are removal-protected independently of
 deployment mode, installation state and service restarts. Retiring a binding will
 require reference-aware fleet and node guards. Keep compatible readers while
-bound templates and sandbox records remain. Changing deployment identity is not
-a workload retirement operation.
+bound templates and sandbox records remain. Removing execution permission is not
+a workload retirement or artifact deletion operation.
 
 Node-manager verifies each environment's release and kernel from the managed
 store and stages its kernel into the execution cache. Cache loss triggers
@@ -594,7 +592,7 @@ the returned job/sandbox identity if available before retrying.
 Roll out readers first: node-manager, template-manager, sandbox-manager, then
 builder and operator clients. Ordinary unselected E0 traffic continues during
 mixed versions. Submit non-default work only after compatible readers are
-deployed on the target non-production nodes. Work sent early fails explicitly; it does
+deployed on the target nodes with the requested policy. Work sent early fails explicitly; it does
 not require a cluster-wide outage. A queued selected build retains its reference
 in a versioned job payload. A downgraded worker cannot decode that payload as an
 ordinary build and silently substitute E0; such work must be inspected/resubmitted
@@ -671,3 +669,85 @@ boot-component availability. A missing or damaged local kernel therefore blocks
 cold boots using that kernel, without preventing restore through an otherwise
 usable, approved runtime. Restore never substitutes a local default kernel into
 the snapshot's execution evidence. Pause/resume also keeps the resident kernel.
+
+### Execution policy and compatible resolution
+
+Scratch builds call `ResolveExecutionEnvironment` without a reference to resolve
+the configured default, then validate the verified runtime and guest locally.
+Cold boots from recorded execution and snapshot restores use compatible-selection
+requests. The resolver acknowledges the intent and returns a complete verified
+consumer. Callers persist the exact result before effects; prepare and launch
+recheck eligibility. Old resolvers
+without the acknowledgement retain the previous exact contract during rollout,
+never authorize an unacknowledged upgrade.
+
+Node-manager reads two startup settings:
+
+```text
+SPACE_ALLOWED_EXECUTION_ENVIRONMENTS=e0,legacy
+SPACE_DEFAULT_EXECUTION_ENVIRONMENT=e0
+```
+
+On x86_64, absent settings mean `e0,legacy` and default `e0`. Compiled names
+are `e0`, `fc-1.17.0-linux-6.1.155`, and `fc-1.17.0-linux-6.18.44`.
+`legacy` is a separate permission for unbound historical contracts, not an
+environment reference or a selectable default on x86_64. The default must be
+allowed. Surrounding whitespace is ignored. Empty, duplicate or unknown names
+fail startup. Compiled names resolve to immutable references and cannot approve arbitrary downloads or unqualified
+pairs. On aarch64, where no environment descriptor is qualified, absent settings
+mean `legacy` for both settings: builders and activations retain the existing
+unbound initial contract. The report has no compiled references or default but
+has `legacy_unbound_allowed=true`. Explicit compiled names fail startup on that
+architecture; existing artifact pins do not establish environment qualification.
+
+The configured default is used only for work without source or exact selection.
+A bound source prefers its exact environment, then compatible fallback if it is
+revoked, absent or permanently unavailable. A transient exact-source failure
+returns the existing retryable inventory error (`Internal`) without choosing or
+persisting a new consumer.
+Cold fallback preserves the guest kernel; restore fallback
+also requires the same compiled state-format profile and qualified memory-state
+support. CPU, memory and device checks remain in the restore path. Firecracker
+1.17 cannot load E0 format 9 snapshots. Ordering of fallback candidates belongs
+to the runtime adapter, and never assembles unqualified runtime/kernel pairs.
+
+Bound activations always require an allowed compiled environment. Unbound
+metadata that exactly identifies a compiled contract also obeys its eligibility;
+other historical contracts require `legacy`. Existing inventory validation,
+custom-kernel matching and the ban on unbound managed non-default runtimes still
+apply. A historical restore retains its kernel provenance without requiring a
+boot image. Removing `legacy` deliberately disables custom unbound contracts;
+audit templates, sandboxes and stored snapshots before doing so. Removing a
+compiled environment can strand its bound work without a compatible consumer.
+A runtime/kernel incident affecting unbound work also requires removing `legacy`;
+revoking a compiled pair alone cannot classify every historical custom contract.
+Neither permission affects artifact retention or rewrites producer metadata.
+
+Successful fallback decisions emit a warning with source and consumer references
+and increment `node_mgr.execution.consumer_fallback`. This counts resolver
+attempts, including retries, rather than completed launches. Transient exact-source
+errors follow the existing inventory refresh backoff and the caller's activation
+retry/deadline; selection itself does not wait or write a consumer.
+
+The temporary node settings will yield authority to cluster desired policy.
+Until placement consumes environment eligibility and fresh usability evidence,
+keep allowed/default policy uniform within each role/host-platform cohort and
+verify that builder outputs work on every worker cohort that may receive them.
+Keep shared fleet defaults at E0: cluster-owned non-default Create remains refused.
+Additional bindings can be exercised through designated node-local paths without
+publishing their templates for shared fleet consumption.
+
+`GetExecutionInventory` reports resolved references and the separate legacy permission.
+Node-ctl forwards it through periodic publication; the cluster records it with
+its own database receipt time in node status, and the admin node response exposes
+both. Older cluster writers can refresh inventory without refreshing policy; use
+`policy_received_at` to assess policy freshness independently.
+Missing, invalid, future-schema or failed policy observations withhold policy
+evidence. An unrelated publication does not renew it. Policy is not proof of
+installation or usability, and reporting does not implement placement gating.
+Deploy the additive migration and cluster readers before node publishers. Inspect
+cohort drift and collection freshness before enabling workloads. Upgrades no longer
+infer permission from `SPACE_ENV`: absent settings revoke non-E0 bindings even on
+Kind and development nodes. Before upgrading a deployment that needs those existing
+bindings, configure its explicit allowlist while keeping the default at E0. Do not
+expand every development deployment's policy merely because of its name.

@@ -43,6 +43,8 @@ fn test_admin_node_row() -> AdminNodeRow {
         metadata: None,
         last_heartbeat: None,
         status_observed_at: None,
+        execution_policy: None,
+        execution_policy_received_at: None,
         execution_inventory_status: None,
         execution_inventory_received_at: None,
         status_health_healthy: None,
@@ -2224,6 +2226,57 @@ async fn node_inspection_reports_execution_receipt_independently_of_heartbeat() 
             }
             unexpected => panic!("unexpected execution receipt: {unexpected:?}"),
         }
+    }
+    let reference = format!("sha256:{}", "11".repeat(32));
+    let valid = serde_json::json!({
+        "schema_version": 1,
+        "allowed_environment_references": [reference],
+        "default_environment_reference": reference,
+        "legacy_unbound_allowed": false,
+    });
+    for (field, value, expected) in [
+        ("schema_version", serde_json::json!(1), true),
+        ("schema_version", serde_json::json!(2), false),
+        (
+            "allowed_environment_references",
+            serde_json::json!([reference, reference]),
+            false,
+        ),
+        (
+            "default_environment_reference",
+            serde_json::json!(format!("sha256:{}", "22".repeat(32))),
+            false,
+        ),
+    ] {
+        let mut document = valid.clone();
+        document[field] = value;
+        sqlx::query(sql!(
+            "UPDATE node_status_snapshots SET execution_policy = $2,
+                execution_policy_received_at = clock_timestamp() WHERE node_id = $1"
+        ))
+        .bind(node_id)
+        .bind(sqlx::types::Json(document))
+        .execute(&db.pool)
+        .await?;
+        // Use the real row decoder and administrative lock, not a constructed
+        // Rust row: JSON decoding must not abort either database operation.
+        let row = node_store::AdminNodeStore::new(db.pool.clone())
+            .fetch(node_id)
+            .await?
+            .unwrap();
+        let observation = admin_node_status(&row)
+            .unwrap()
+            .execution_inventory
+            .unwrap();
+        assert_eq!(observation.policy.is_some(), expected);
+        assert_eq!(observation.policy_received_at.is_some(), expected);
+        let mut tx = db.pool.begin().await?;
+        assert!(
+            node_store::lock_node_for_update(&mut tx, node_id)
+                .await?
+                .is_some()
+        );
+        tx.rollback().await?;
     }
     Ok(())
 }

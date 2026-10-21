@@ -685,7 +685,15 @@ pub(super) mod service_tests {
                 },
             },
             guest_console_logs: false,
-            production: true,
+            execution_policy: pplx_space_node_runtime_core::selection::ExecutionPolicy::parse(
+                None,
+                None,
+                &pplx_space_node_runtime_core::catalog::CompiledEnvironment::for_architecture(
+                    pplx_space_common_core::types::Arch::X86_64,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
             lifecycle_limiter: std::sync::Arc::new(
                 crate::lifecycle_limiter::tests::default_limiter(),
             ),

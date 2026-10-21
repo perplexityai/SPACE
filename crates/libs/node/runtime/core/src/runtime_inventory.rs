@@ -1303,6 +1303,7 @@ impl RuntimeInventory {
             })
             .collect();
         proto::NodeExecutionInventory {
+            policy: None,
             runtimes,
             components,
         }

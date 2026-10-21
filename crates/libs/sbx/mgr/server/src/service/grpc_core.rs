@@ -175,6 +175,7 @@ impl SandboxManagerService {
                 .map_err(|error| Status::unavailable(error.to_string()))?;
             node.resolve_execution_environment(
                 pplx_space_node_mgr_client::proto::ResolveExecutionEnvironmentRequest {
+                    compatible: None,
                     reference: Some(reference.to_string()),
                 },
             )

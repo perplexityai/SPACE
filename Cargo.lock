@@ -6469,7 +6469,9 @@ dependencies = [
  "pplx-space-common-core",
  "pplx-space-common-grpc",
  "pplx-space-common-svc",
+ "pplx-space-execution-common",
  "pplx-space-node-mgr-protocol",
+ "prost",
  "thiserror 2.0.20",
  "tonic",
 ]
