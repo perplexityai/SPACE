@@ -8,6 +8,29 @@ published seed release.
 
 ## Build and publish system templates
 
+Seed formatting creates an empty ext4 filesystem, then loop-mounts it and
+populates it through the kernel using GNU tar. The copy preserves numeric
+ownership, modes, hard links, sparse files, ACLs and extended attributes
+(including file capabilities). The image must unmount successfully before
+read-only fsck validation, minimum-size compaction and headroom expansion;
+each stage requires fsck exit status zero rather than repairing errors.
+After a clean read-only check, `tune2fs -T now` records that check before
+resizing: read-only fsck alone leaves the timestamp older than the kernel
+mount and can make `resize2fs` refuse the image. Population rejects remaining
+mounts in the source tree. The privileged builder creates missing loop-device
+nodes when its container's `/dev` predates the kernel's free loop index.
+
+Kernel population keeps long symlinks block-backed, avoiding the inline-symlink
+fsck and resize failures in [e2fsprogs #295](https://github.com/tytso/e2fsprogs/issues/295).
+The population test checks metadata preservation and symlink/xattr integrity
+through shrink and expansion, with `inline_data` enabled and disabled.
+On a disposable Linux environment with root loop-mount access, GNU tar,
+e2fsprogs, `attr`, `acl` and `libcap2-bin`, run:
+
+```bash
+bash templates/firecracker/seed/test-ext4-population.sh
+```
+
 Install the CLI from the same source version as the deployment:
 
 ```bash

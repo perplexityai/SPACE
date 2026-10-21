@@ -774,6 +774,17 @@ jobs:
           docker run "${docker_args[@]}" "space-ci:${GITHUB_SHA}" \
             bash -c 'git config --global --add safe.directory /workspace && exec bash -c "$SPACE_CI_COMMAND"'
 
+      - name: Test seed ext4 population
+        if: >-
+          !cancelled() && matrix.privileged_tests == true &&
+          (steps.run.outcome == 'success' || steps.run.outcome == 'failure')
+        run: |
+          docker run --rm --user root --privileged \
+            --volume "${GITHUB_WORKSPACE}:/workspace:ro" \
+            --workdir /workspace \
+            "space-ci:${GITHUB_SHA}" \
+            bash templates/firecracker/seed/test-ext4-population.sh
+
       # The nextest group `privileged`: tests that need root, CAP_SYS_ADMIN,
       # a seccomp profile allowing pidfd_getfd, or a Docker socket, or whose
       # root path differs, plus NoCoW tests on a disposable btrfs filesystem.
