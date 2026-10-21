@@ -109,8 +109,10 @@ def fixture_workspace(root: Path) -> None:
         root,
         "apps/other/Cargo.toml",
         '[package]\nname = "fixture-other"\nversion = "0.1.0"\nedition = "2021"\n'
+        '[[bin]]\nname = "other-main"\npath = "src/main.rs"\n'
         '[dependencies]\nunrelated = { path = "../../libs/unrelated", package = "fixture-unrelated" }\n',
     )
+    write(root, "apps/other/src/main.rs", "fn main() {}\n")
     write(root, "apps/other/src/bin/other-tool.rs", "fn main() {}\n")
     write(
         root,
@@ -136,7 +138,11 @@ def test_a_lane_covers_what_its_binaries_reach_without_dev_dependencies(tmp_path
     monkeypatch.setattr(
         bundle_builds,
         "RUST_ARTIFACT_BINARIES",
-        {"tool": ("fixture-tool",), "other": ("other-tool",), "missing": ("fixture-svc", "gone")},
+        {
+            "tool": ("fixture-tool",),
+            "other": ("other-tool", "other-main"),
+            "missing": ("fixture-svc", "fixture-other", "gone"),
+        },
     )
 
     assert bundle_builds.rust_artifact_packages("tool", tmp_path) == tuple(
@@ -156,7 +162,8 @@ def test_a_lane_covers_what_its_binaries_reach_without_dev_dependencies(tmp_path
         Path("apps/other"),
         Path("libs/unrelated"),
     )
-    with pytest.raises(SystemExit, match="Rust binaries: gone$"):
+    # An explicit target at src/main.rs replaces the one named after the package.
+    with pytest.raises(SystemExit, match="Rust binaries: fixture-other, gone$"):
         bundle_builds.rust_artifact_packages("missing", tmp_path)
     if cargo() is not None:
         assert bundle_builds.rust_workspace_packages(tmp_path) == cargo_packages(tmp_path)
