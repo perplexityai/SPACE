@@ -48,10 +48,12 @@ _DURATION_SECONDS = {
         "ecw.timeout_update": 55,
         "ecw.warm_pool_environment": 13,
         "ecw.watcher_identity": 5,
-        "local.btrfs_send_restore_fails_closed_without_parent_source": 135,
-        "local.btrfs_send_restore_pulls_parent_template": 20,
-        "local.btrfs_send_restore_rejects_corrupted_stream": 133,
-        "local.cold_sandbox_eviction_wake_round_trip": 137,
+        # The next four: three otel-mode Kind runs each. Both failure scenarios
+        # wait out the Kind chart's 45 s data-plane readiness timeout.
+        "local.btrfs_send_restore_fails_closed_without_parent_source": 60,
+        "local.btrfs_send_restore_pulls_parent_template": 30,
+        "local.btrfs_send_restore_rejects_corrupted_stream": 60,
+        "local.cold_sandbox_eviction_wake_round_trip": 148,
         "local.concurrent_restore_converges_to_one_execution": 60,
         "local.ecw_template_build_from_oci_boots": 40,
         "local.encrypted_resuspend_preserves_cow": 60,
@@ -63,7 +65,8 @@ _DURATION_SECONDS = {
         # 760 s of phases, a one-tick runner window, the outage's budget wait,
         # then the contender's watch of about 350 s.
         "local.leader_election_brownout_keeps_one_leader": 765,
-        "local.node_ctl_fence_refuses_and_reconciles": 18,
+        # Three otel-mode Kind runs at the chart's 20 s node-ctl poll: 27-29 s.
+        "local.node_ctl_fence_refuses_and_reconciles": 28,
         # Two Kind runs with fast-pace env rollouts: 38 and 38 s.
         "local.node_group_boundary_schedules": 40,
         # Two Kind runs with fast-pace env rollouts: 63 and 63 s.
@@ -71,7 +74,8 @@ _DURATION_SECONDS = {
         # Three Kind runs measured 92-101 s: two controller rollouts, three
         # suspend/restore cycles, three threshold-bound reaps, one survival window.
         "local.orphaned_restore_pod_gc_reaps_only_superseded": 95,
-        "local.pending_backup_census_reports_blocked_upload": 216,
+        # Three otel-mode Kind runs at the 20 s node-ctl poll: 56-60 s.
+        "local.pending_backup_census_reports_blocked_upload": 57,
         # Kind bench runs (otel), template deletes concurrent: 60-64 s.
         "local.private_template_build_isolation": 63,
         # Two Kind runs with fast-pace env rollouts: 61 and 57 s. Kind bench
@@ -80,21 +84,24 @@ _DURATION_SECONDS = {
         # Estimate until a CI run refreshes it: sandbox setup, then up to one
         # 300 s GC tick.
         "local.reconcile_queue_gc_prunes_only_gone_nodes": 330,
-        # One Kind run: 16 s of phases (8.5 s suspend with the retried upload)
-        # plus sandbox cleanup.
-        "local.restarted_btrfs_send_is_rejected_and_retried": 30,
+        # Three otel-mode Kind runs: 34-35 s, 19 s of it the suspend with the
+        # retried upload.
+        "local.restarted_btrfs_send_is_rejected_and_retried": 34,
         "local.retention_claim_finish_forward": 65,
         "local.retention_restore_source_guard": 50,
         # Kind bench runs (otel), probes concurrent: 21-23 s.
         "local.sandbox_network_isolation_holds": 21,
-        "local.snapshot_reaper_reclaims_backed_fork_snapshot": 147,
+        # Three otel-mode Kind runs with the chart's 60 s reaper idle: 80-83 s.
+        "local.snapshot_reaper_reclaims_backed_fork_snapshot": 81,
         "local.storage_exchange_scoping": 30,
         "local.suspend_restore_cross_node_from_object_storage": 14,
         "local.suspend_snapshot_rows_are_per_attempt": 21,
-        # Measured 37-38 s; Tempo's 30 s search cutoff is most of it.
-        "local.telemetry_reaches_local_backends": 40,
-        # Three Kind runs measured 101-120 s with the rendered 1.5 GiB budget.
-        "local.template_cache_lru_eviction_reclaims": 120,
+        # Three otel-mode Kind runs with the Kind profile's 5 s Tempo search
+        # cutoff: 23-26 s.
+        "local.telemetry_reaches_local_backends": 25,
+        # Three otel-mode Kind runs measured 48 s with the rendered 1.5 GiB
+        # budget and 20 s grace.
+        "local.template_cache_lru_eviction_reclaims": 48,
         "local.template_startup_recovery_decision_table": 45,
         "network_policy.v1_cidr_allow": 11,
         "network_policy.v1_cidr_deny": 13,
@@ -129,6 +136,10 @@ _DURATION_SECONDS = {
         # Docker Hub: 15-18 s, of which SDK generation is 2-5 s.
         "native.m1_generated_sdk_conformance": 20,
         "native.resident_pause": 5,
+        # Two otel-mode Kind runs: 41 and 51 s, most of it the node-local
+        # cleanup after the delete, which waits out sbx-manager's 10 s
+        # quiescence window and then one node-ctl poll.
+        "native.stopped_restart_preserves_rootfs": 46,
         "native_contract.command_validation": 6,
         "native_contract.idempotency_conflict": 5,
         "native_contract.tenant_isolation": 5,

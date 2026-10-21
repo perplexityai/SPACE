@@ -10,6 +10,11 @@ networkPolicy:
 images:
   collector: otel/opentelemetry-collector-contrib:0.161.0
   tempo: grafana/tempo:3.0.3
+tempo:
+  # A bench reads back the trace it just caused, and nothing else queries this
+  # Tempo; at Tempo's 30s default every such read first waits half a minute
+  # (local.telemetry_reaches_local_backends).
+  queryEndCutoff: 5s
 collector:
   # The shim and runtime-supervisor on a Kind node have no cluster DNS, so
   # they address this Collector here; NODE_COLLECTORS in

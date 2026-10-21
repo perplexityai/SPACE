@@ -19,10 +19,12 @@ scenario's own sandbox, never for whatever an earlier scenario left behind:
 Each check records what it read, at the scenario's start and at its last poll
 where it compares the two, so a failure's evidence shows which leg stopped.
 
-Every read polls to a budget of its delivery floor plus margin. Both SDKs export
-metrics every 10 s and flush spans every 5 s, and the Collectors batch for 1 s.
-Tempo search also withholds the newest 30 s whatever the requested end, so a
-trace is findable no sooner than about 36 s after its spans end.
+Every read polls to a budget of its delivery floor plus margin. In the Kind
+otel profile the Rust services export metrics every 2 s and the shim every
+10 s, both SDKs flush spans every 5 s, and the Collectors batch for 1 s. Tempo
+search also withholds the newest spans whatever the requested end (5 s in the
+Kind profile, Tempo's own default 30 s), so a trace is findable no sooner than
+about 11 s after its spans end.
 """
 
 from __future__ import annotations
@@ -42,10 +44,12 @@ API_SERVICE = "space-api"
 # Two metric export periods plus the Collector's batch, with room for a slow
 # runner.
 DELIVERY_BUDGET_SECONDS = 60.0
-# Tempo's 30 s search cutoff, a span flush and the Collector's batch, with
-# room for a slow runner.
+# Tempo's search cutoff, a span flush and the Collector's batch, with room
+# for a slow runner and for a Tempo left at its 30 s default.
 TRACE_BUDGET_SECONDS = 90.0
-# Tempo's query_end_cutoff: search never covers the newest 30 s.
+# At least Tempo's query_end_cutoff (5 s in the Kind profile, 30 s by
+# default): search never covers the newest spans, so the window starts this
+# much before the scenario to keep it non-empty either way.
 TEMPO_SEARCH_CUTOFF_SECONDS = 30
 POLL_SECONDS = 3.0
 # The Kind nodes share this host's clock; this covers second rounding and the
@@ -78,7 +82,7 @@ class TelemetryDeliveryAssertions:
 
         def search(query: str, limit: int = 5) -> list[str]:
             # The query names this sandbox, so a wider window cannot match
-            # another scenario's trace; Tempo rejects one its 30 s cutoff
+            # another scenario's trace; Tempo rejects one its cutoff
             # leaves empty.
             body = self._control.telemetry_query(
                 "tempo",

@@ -128,16 +128,17 @@ sandboxEviction:
 # start.
 #
 # Smoke-sized like the two loops above: `engageFraction: "0"` is the
-# documented always-on gate; `idleSecs: "120"` and `graceSecs: "60"` let
+# documented always-on gate; `idleSecs: "60"` and `graceSecs: "60"` let
 # `local.snapshot_reaper_reclaims_backed_fork_snapshot` wait out a candidate.
 # "Idle" is `local_artifacts.last_touched_at`,
 # set at insert and moved only by a suspend re-stage or a restore lease
-# commit; a fork's source snapshot gets neither, so it is reapable two minutes
+# commit; a fork's source snapshot gets neither, so it is reapable one minute
 # after the fork. Grace counts from the newer of insert and last touch, so the
-# delay can never drop below 60 s; two minutes leaves the scenario's positive
-# probe, which runs right after the fork returns, a wide margin on a slow
-# runner. What else this reaches on a bench: nothing unbacked, nothing
-# younger than two minutes, and nothing pinned — a suspended or restored
+# delay can never drop below 60 s, and idle is set to that floor. The
+# scenario's positive probe runs right after the fork returns, which takes
+# about 10 s on a bench, so a minute still leaves it several times that on a
+# slow runner. What else this reaches on a bench: nothing unbacked, nothing
+# younger than a minute, and nothing pinned — a suspended or restored
 # sandbox pins its current artifact (the pin is cleared only while a
 # re-suspend is in flight, and that re-suspend deletes the previous rows
 # when it publishes) — i.e. only cold named snapshots that already have a
@@ -150,7 +151,7 @@ snapshotReaper:
   targetFraction: "0"
   intervalSecs: "15"
   graceSecs: "60"
-  idleSecs: "120"
+  idleSecs: "60"
 
 # On SIGTERM sandbox-manager drains for up to 25 s before handing its mutex to
 # the successor, then spends up to another 25 s on in-flight RPCs

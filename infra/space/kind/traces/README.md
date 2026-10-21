@@ -48,7 +48,8 @@ verify the running pods. Never unset blindly, change the general OTLP endpoint,
 or alter metrics/logs. Coordinate with the local bench owner before rolling
 SPACE deployments.
 
-Queries (allow at least 30 seconds after the workload):
+Queries (allow at least 5 seconds after the workload on Kind, 30 seconds at
+Tempo's default cutoff):
 
 ```bash
 curl -fsSG http://127.0.0.1:13200/api/search \
@@ -60,9 +61,10 @@ curl -fsS -H 'Accept: application/json' \
   http://127.0.0.1:13200/api/traces/YOUR_HEX_TRACE_ID
 ```
 
-Tempo 3's default `query_frontend.query_end_cutoff=30s` deliberately excludes
-the newest 30 seconds, **even with explicit end bounds**. Very short windows
-can yield an invalid effective range. Use a wider window and bounded polling;
+Tempo 3's `query_frontend.query_end_cutoff` deliberately excludes the newest
+spans, **even with explicit end bounds**: 30 seconds by default, 5 seconds in
+the chart's Kind profile (`tempo.queryEndCutoff`). Very short windows can yield
+an invalid effective range. Use a wider window and bounded polling;
 export acknowledgement alone is not evidence that a trace is searchable yet.
 
 Other useful TraceQL examples:

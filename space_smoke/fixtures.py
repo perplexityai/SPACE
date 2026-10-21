@@ -3321,7 +3321,7 @@ class TemplateCacheAssertions:
                     )
                 },
             )
-            self._fixture.wait(5)
+            self._fixture.wait(2)
 
     def expect_reclaimed(
         self, node_name: str, name: str, *, timeout: float | None = None
@@ -3400,8 +3400,12 @@ class TemplateCacheAssertions:
 # crates/libs/template/mgr/src/volume.rs).
 TEMPLATE_PULL_DURATION_METRIC = "space_template_pull_duration_milliseconds"
 ON_DEMAND_PULL_RESULTS = "materialized|coalesced|recovered"
-# Several of the Kind exporter's ~10 s flushes plus scrape lag.
-ON_DEMAND_PULL_SETTLE_SECONDS = 25.0
+# Several of the Kind exporter's 2 s flushes (`OTEL_METRIC_EXPORT_INTERVAL`,
+# set in otel mode by infra/space/kind/scripts/telemetry_config.py) plus the
+# Collector's 1 s batch; the Collector pushes to Prometheus, so nothing waits
+# on a scrape. Polled at a fraction of the flush.
+ON_DEMAND_PULL_SETTLE_SECONDS = 10.0
+METRIC_POLL_SECONDS = 2.0
 
 
 def _rfc3339(epoch: float) -> str:
@@ -3420,7 +3424,7 @@ TEMPLATE_EVICTION_RETRY_SECONDS = 3.0
 
 # node-manager's `node_mgr.btrfs_send.stream_rejected` counter, as Prometheus names it.
 BTRFS_SEND_STREAM_REJECTED_METRIC = "space_node_mgr_btrfs_send_stream_rejected_total"
-# Export flushes plus scrape lag, as for the on-demand pull counts.
+# Export flushes plus the Collector's batch, as for the on-demand pull counts.
 STREAM_REJECTIONS_SETTLE_SECONDS = ON_DEMAND_PULL_SETTLE_SECONDS
 
 
@@ -3605,7 +3609,7 @@ class SuspendCodecAssertions:
                 worker_node=node_name,
                 stream_rejections=counts,
             )
-            self._fixture.wait(5)
+            self._fixture.wait(METRIC_POLL_SECONDS)
             now = self.stream_rejections(node_name)
             if now != counts:
                 counts, unchanged_since = now, time.monotonic()
@@ -3646,7 +3650,7 @@ class SuspendCodecAssertions:
             }
             if delta or time.monotonic() > deadline:
                 break
-            self._fixture.wait(5)
+            self._fixture.wait(METRIC_POLL_SECONDS)
         self._fixture.verify(
             bool(delta),
             "no streamed upload attempt failed on node-manager's rejection of a "
@@ -3907,11 +3911,11 @@ class SuspendCodecAssertions:
     ) -> dict[str, float]:
         """The on-demand pull counts once they have stopped moving: the baseline.
 
-        The exporter flushes every few seconds and Prometheus scrapes after
-        that, so a single read can miss an earlier pull's increment that
+        The exporter flushes every few seconds and the Collector batches
+        after that, so a single read can miss an earlier pull's increment that
         lands later and would then read as this restore's pull. Polled until
-        unchanged for `settle_seconds`, several export intervals plus scrape
-        lag; the value at that point is the baseline.
+        unchanged for `settle_seconds`, several export intervals plus the
+        batch; the value at that point is the baseline.
         """
 
         started = time.time()
@@ -3927,7 +3931,7 @@ class SuspendCodecAssertions:
                 on_demand_pulls=counts,
                 settle_seconds=settle_seconds,
             )
-            self._fixture.wait(5)
+            self._fixture.wait(METRIC_POLL_SECONDS)
             now = self.on_demand_pull_counts(node_name, template)
             if now != counts:
                 counts, unchanged_since = now, time.monotonic()
@@ -3992,7 +3996,7 @@ class SuspendCodecAssertions:
                 on_demand_pulls_before=before,
                 on_demand_pulls_now=now,
             )
-            self._fixture.wait(5)
+            self._fixture.wait(METRIC_POLL_SECONDS)
         self._fixture.record(
             "on_demand_pulls", {"before": before, "after": now, "read_at": _rfc3339(time.time())}
         )
@@ -4262,7 +4266,9 @@ class StartupRecoveryAssertions:
     recovery, can also drop a row, so the stale plant is read `ready`
     immediately before the restart: that proves no eviction removed it
     earlier, and the successful read restarts the build's eviction grace
-    (`SPACE_TEMPLATE_GC_GRACE_SECS`), which outlasts a restart.
+    (`SPACE_TEMPLATE_GC_GRACE_SECS`). The loop reclaims only while the worker
+    is over its cache budget, least recently used first, so the 4 MiB plants
+    it has just read are the last builds it would take.
 
     No SQLite anywhere: "no row" states are made by stashing the digest
     directory aside, running the daemon's own `delete-template`, and putting
@@ -4849,7 +4855,9 @@ class SnapshotReaperAssertions:
                     )
                 },
             )
-            self._fixture.wait(15)
+            # Well under the reaper's tick, so the wait ends within a few
+            # seconds of the reap rather than on a later poll.
+            self._fixture.wait(3)
 
     def expect_durable_copy_kept(self, backed: tuple[str, ...]) -> None:
         """Every artifact that was backed before the reap is still backed after it."""
@@ -5000,7 +5008,8 @@ class ColdEvictionAssertions:
                     )
                 },
             )
-            self._fixture.wait(15)
+            # Well under the loop's tick, as for the snapshot reaper.
+            self._fixture.wait(3)
         self._fixture.record(
             "evicted_after_seconds", round(timeout - (deadline - time.monotonic()), 1)
         )

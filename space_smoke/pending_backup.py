@@ -125,7 +125,10 @@ class PendingBackupAssertions:
                     ][-6:]
                 },
             )
-            self._fixture.wait(10)
+            # Short against the census interval: the store comes back only
+            # once the row is seen, and the transfer's next retry, about 35 s
+            # after its first attempt, uploads only if it already has.
+            self._fixture.wait(2)
         return self._artifact
 
     def restore_uploads(self) -> None:
@@ -163,7 +166,7 @@ class PendingBackupAssertions:
                 snapshot_states=self._control.snapshot_states(sandbox_id),
                 suspend_operation_state=self._operation_state(),
             )
-            self._fixture.wait(10)
+            self._fixture.wait(2)
 
     def expect_suspend_succeeded(self, *, timeout: float = 120) -> None:
         """The suspend operation that ran through the outage ends `succeeded` once the upload landed."""

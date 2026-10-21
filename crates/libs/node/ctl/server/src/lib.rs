@@ -402,6 +402,8 @@ struct NodeCtlWorker {
     db: Arc<Mutex<Connection>>,
     node_id: String,
     node_role: Option<NodeRole>,
+    /// The resolved reconciliation poll, as `spawn_poll_loop` runs it.
+    poll_interval: Duration,
     cluster_reconcile_trigger: ClusterReconcileTrigger,
     resource_status_reader: NodeResourceStatusReader,
     network_pool_status_reader: NetworkPoolStatusReader,
@@ -524,6 +526,7 @@ pub async fn run(
         db: db.clone(),
         node_id: node_id.clone(),
         node_role,
+        poll_interval: poll_interval(poll_interval_secs),
         cluster_reconcile_trigger: cluster_reconcile_trigger.clone(),
         resource_status_reader,
         network_pool_status_reader,
@@ -783,14 +786,21 @@ fn node_role_label(role: Option<NodeRole>) -> &'static str {
     }
 }
 
+/// The poll period for a configured interval; a zero interval polls every
+/// second rather than spinning.
+fn poll_interval(interval_secs: u64) -> Duration {
+    Duration::from_secs(interval_secs.max(1))
+}
+
 fn spawn_poll_loop(
     tx: mpsc::Sender<WorkItem>,
     interval_secs: u64,
     shutdown_token: CancellationToken,
 ) {
     tokio::spawn(async move {
-        let interval_secs = interval_secs.max(1);
-        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+        let period = poll_interval(interval_secs);
+        let interval_secs = period.as_secs();
+        let mut interval = tokio::time::interval(period);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
@@ -1154,6 +1164,7 @@ impl NodeCtlWorker {
                 Ok(false) => {
                     let node_id = self.node_id.clone();
                     let node_role = self.node_role;
+                    let poll_interval = self.poll_interval;
                     let facet_token = shutdown_token.child_token();
                     let (scope_kind, scope_items) = facet_scope_span_fields(&scope);
                     let span = tracing::info_span!(
@@ -1178,7 +1189,7 @@ impl NodeCtlWorker {
                                     facet.name(),
                                     FACET_RUN_TIMEOUT.as_secs()
                                 )),
-                                result = facet.run_inbound(&node_id, node_role, scope, progress.clone()) => result,
+                                result = facet.run_inbound(&node_id, node_role, scope, progress.clone(), poll_interval) => result,
                             };
                             (facet, status_name, started_at, result)
                         }

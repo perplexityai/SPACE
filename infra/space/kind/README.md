@@ -436,9 +436,10 @@ curl -sG localhost:13101/loki/api/v1/query_range \
   -d start=$((now - 3600))000000000 -d end=${now}000000000 -d limit=100
 ```
 
-Tempo search never returns the newest 30 seconds, whatever `end` says
-(`query_end_cutoff`), and rejects a window that the cutoff leaves empty, so
-poll for a trace you just caused; fetching a trace by ID has no such delay.
+Tempo search never returns the newest 5 seconds, whatever `end` says
+(`query_end_cutoff`, which the Kind profile lowers from Tempo's 30 s default),
+and rejects a window that the cutoff leaves empty, so poll for a trace you just
+caused; fetching a trace by ID has no such delay.
 For tag values use `/api/v2/search/tag/resource.service.name/values`: the v1
 route answers scoped names with an empty list. Span IDs in fetched traces are
 base64. A Rust service's log line written inside a traced span carries that
@@ -1407,10 +1408,11 @@ Postgres**: credential state belongs to the control-plane credential-manager
 authority (below). Node status uses the normal 30-second freshness window. Both bring-up paths end by waiting until
 the admin node list (`GET /admin/api/v1/nodes`) reports every sandbox and
 builder node reachable, with scheduling status `ready`, and observed within the
-five node-ctl ticks the API trusts a census for
+five minutes the API trusts a census for
 (`scripts/wait-node-publication.sh`): ready pods alone are not a registered
 node. The wait does not require `stale: false`: node-ctl publishes every 60
-seconds, so an idle healthy node reads stale about half the time.
+seconds by default, so an idle healthy node reads stale about half the time
+(Kind's 20 s poll keeps it fresh, but the wait does not rely on that).
 
 ## Node services
 
@@ -1768,7 +1770,9 @@ asks of the hosting deployment.
 | `/space/cache` is btrfs on instance-store NVMe, reformatted on every boot | btrfs on a sparse loopback image at `/var/lib/space-cache.img` on the kind node (40 GiB, same code paths, less I/O headroom), mounted `nosuid,noatime` on the node's `/space/cache` by `space-cache.service`, which reformats it on every start of the node container, so like the NVMe it outlives pod restarts but not node restarts |
 | The node bootstrap installs a checksum-verified `containerd-shim-space-v2` before containerd starts, and registers the `space` runtime under `io.containerd.cri.v1.runtime` with a `CniConfDir` option | the node image registers the same runtime with the same options (in kind's version 2 config format, which containerd migrates to that plugin), so containerd loads it on its first start; the binary arrives after the cluster exists, copied onto each running sandbox worker by `install-shim.sh`, which checks its SHA-256 on the node. Installing it at boot would need the shim built and staged on a host path before `kind create` in every bring-up path |
 | Every node group's bootstrap sets kubelet `eventRecordQPS: 0` and `--fail-swap-on=false` | the same settings on sandbox workers and builders, baked into the node image as a kubelet `--config-dir` drop-in (`node/kubelet/50-space.conf`); the infra node runs the unmodified base image, so its kubelet keeps kind's event rate limit (`failSwapOn` is already `false` there). No sandbox pod runs on it, so none of their events pass through that limit |
-| Release binaries read no test hooks | every binary is built with `test-hooks`, and the charts set these hooks on every run: sandbox-manager's on-node snapshot reaper at target fraction 0, interval 15 s, grace 60 s and idle 120 s, against release values of 0.40, 300 s, 1800 s and 86400 s (`charts/space-sandbox-manager-local/values.yaml`, `snapshot_gc.rs`); template-manager's cache GC at interval 15 s and grace 60 s, against 300 s and 1800 s, and its prefetch latest-N at 1, against 5 (`charts/space-template-manager-local/values.yaml`, `eviction.rs`, `prefetch.rs`); and the disk-admission reservation below. Scenarios shorten further hooks, such as the snapshot-retention sweeper's minimum age and the activation-admission burst, for their own run and restore them. The public-operation dispatcher's tick, claim limit and claim staleness stay at their release values |
+| Release binaries read no test hooks | every binary is built with `test-hooks`, and the charts set these hooks on every run: sandbox-manager's on-node snapshot reaper at target fraction 0, interval 15 s, grace 60 s and idle 60 s, against release values of 0.40, 300 s, 1800 s and 86400 s (`charts/space-sandbox-manager-local/values.yaml`, `snapshot_gc.rs`); template-manager's cache GC at interval 15 s and grace 20 s, against 300 s and 1800 s, and its prefetch latest-N at 1, against 5 (`charts/space-template-manager-local/values.yaml`, `eviction.rs`, `prefetch.rs`); and the disk-admission reservation below. Scenarios shorten further hooks, such as the snapshot-retention sweeper's minimum age and the activation-admission burst, for their own run and restore them. The public-operation dispatcher's tick, claim limit and claim staleness stay at their release values |
+| node-ctl reconciles on a 60 s poll (the deployed chart's `pollIntervalSecs` and the binary default) | a 20 s poll (`charts/space-node-ctl-local/values.yaml`), so a timer-driven census or reconcile reaches the control plane sooner; node status (stale 30 s after a publish) therefore reads fresh on an idle node instead of about half the time |
+| Services export OTLP metrics every 10 s (the SDK default) | in `otel` mode the Rust services in Pods export every 2 s (`telemetry.otlpMetricExportIntervalMillis`, `scripts/telemetry_config.py`) to the bench's own Prometheus, and Tempo search withholds the newest 5 s instead of 30 s (`tempo.queryEndCutoff` in the traces chart's Kind profile); the shim and runtime-supervisor keep 10 s |
 | 8 GiB disk-admission reservation per cache allocation (release default) | 1 GiB through the `SPACE_NODE_DISK_ADMISSION_ALLOCATION_RESERVATION_BYTES` test hook, with the 1 GiB `MIN_AVAILABLE_BYTES` floor, so allocations fit the 40 GiB cache (`charts/space-node-service/values.yaml`) |
 | Postgres on RDS, secrets via ExternalSecrets / AWS Secrets Manager | In-cluster `space-postgres` StatefulSet, one pod on a 1 GiB volume, static Kubernetes Secrets |
 | PostgreSQL 17 | The same major version (`postgres:17`; CI takes it from the image mirror at a pinned digest) |

@@ -32,8 +32,8 @@ import space_smoke as smoke
 # never fail.
 @smoke.scenario(
     "local.template_cache_lru_eviction_reclaims",
-    # Write and hash the rendered cache budget, then wait out the 60 s grace
-    # and a few 15 s ticks; the sandbox itself is idle throughout.
+    # Write and hash the rendered cache budget, then wait out the rendered
+    # grace and a few ticks; the sandbox itself is idle throughout.
     sandbox=smoke.SandboxConfig(timeout=900),
 
 )

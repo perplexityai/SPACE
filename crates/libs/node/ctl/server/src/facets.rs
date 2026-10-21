@@ -307,13 +307,14 @@ impl FacetKind {
         node_role: Option<NodeRole>,
         scope: FacetScope,
         progress: crate::FacetProgress,
+        sync_interval: std::time::Duration,
     ) -> Result<InboundFacetResult, String> {
         match self {
             Self::NetworkPolicy => refresh_network_policy(node_id, node_role, scope, progress)
                 .await
                 .map(InboundFacetResult::from_stats),
             Self::SandboxDesiredState => {
-                refresh_sandbox_desired_state(node_id, node_role, scope).await
+                refresh_sandbox_desired_state(node_id, node_role, scope, sync_interval).await
             }
             Self::TemplateBaseSnapshotPolicy => {
                 refresh_template_base_snapshot_policy(node_id, node_role, scope)

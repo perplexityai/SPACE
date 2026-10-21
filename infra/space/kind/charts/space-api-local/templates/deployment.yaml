@@ -258,6 +258,10 @@ spec:
               value: {{ .Values.k8s.sandboxNodeSelectorKey | quote }}
             - name: SPACE_SANDBOX_NODE_SELECTOR_VALUE
               value: {{ .Values.k8s.sandboxNodeSelectorValue | quote }}
+            {{- with .Values.k8s.createDataPlaneReadyTimeoutSecs }}
+            - name: SPACE_CREATE_DATA_PLANE_READY_TIMEOUT_SECS
+              value: {{ . | quote }}
+            {{- end }}
             - name: SPACE_INTERNAL_SECRET_NAME
               value: {{ .Values.internal.secretName | quote }}
             {{- if $shared }}

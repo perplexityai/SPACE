@@ -5,8 +5,9 @@ import space_smoke as smoke
 
 # The populated half of the contract is only observable with the upload
 # broken: a natural suspend is unbacked for seconds while the census fires
-# once a minute. The object store is scaled to zero for the suspend with its
-# scale-back armed first and restored the moment the queue row is seen, so
+# once per node-ctl poll (60 s deployed, 20 s on Kind). The object store is
+# scaled to zero for the suspend with its scale-back armed first and restored
+# the moment the queue row is seen, so
 # the downtime stays inside the API's 300 s durable-suspend budget and the
 # transfer's fifth retry never runs against a dead store; the drain budget
 # covers a transfer that waited out the whole 455 s ladder. Do not run

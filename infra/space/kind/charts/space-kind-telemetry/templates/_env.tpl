@@ -55,6 +55,10 @@ Context: the chart root, or any dict whose `Values` carries `telemetry`,
 - name: OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE
   value: {{ . | quote }}
 {{- end }}
+{{- with .Values.telemetry.otlpMetricExportIntervalMillis }}
+- name: OTEL_METRIC_EXPORT_INTERVAL
+  value: {{ . | quote }}
+{{- end }}
 {{- end }}
 {{- if eq .Values.telemetry.traceExporter "otlp" }}
 - name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT

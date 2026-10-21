@@ -22,6 +22,7 @@ pub(super) async fn refresh_sandbox_desired_state(
     node_id: &str,
     node_role: Option<NodeRole>,
     scope: FacetScope,
+    sync_interval: std::time::Duration,
 ) -> Result<InboundFacetResult, String> {
     let sandbox_ids = resolve_sandbox_scope(scope).await?;
     let mut stats = ReconcileStats {
@@ -220,7 +221,7 @@ pub(super) async fn refresh_sandbox_desired_state(
                 }
                 Err(status) => status,
             };
-            match cluster_deleted_evict_refusal_disposition(status) {
+            match cluster_deleted_evict_refusal_disposition(status, sync_interval) {
                 ClusterDeletedEvictDisposition::RetryNextSync => {
                     deferred = deferred.saturating_add(1);
                     pplx_space_metrics::reconcile::cluster_deleted_evict(
