@@ -221,6 +221,8 @@ impl LocalBackupInventoryReport {
 /// `pplx_space_common_svc::sql::sandbox_residency` for the gates that read it.
 /// `local_backup_inventory_reported_at` is the same shape one column over, for
 /// the pending-backup mirror — see [`LocalBackupInventoryReport`].
+/// Execution collection has its own receipt time: only a supplied outcome
+/// advances it. Heartbeats and other facets preserve the previous evidence.
 pub(super) async fn upsert_node_status_from_publish(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
@@ -228,6 +230,7 @@ pub(super) async fn upsert_node_status_from_publish(
     node_status: Option<PublishedNodeStatusDb>,
     inventory_prune: SandboxInventoryPrune,
     local_backup_report: LocalBackupInventoryReport,
+    execution_observation: Option<crate::execution_observation::InventoryStatus>,
 ) -> Result<(), Status> {
     let (
         scheduling_status,
@@ -278,6 +281,8 @@ pub(super) async fn upsert_node_status_from_publish(
              node_ctl,
              sandbox_inventory_pruned_at,
              local_backup_inventory_reported_at,
+             execution_inventory_status,
+             execution_inventory_received_at,
              updated_at
          )
          SELECT n.id,
@@ -301,6 +306,8 @@ pub(super) async fn upsert_node_status_from_publish(
                 $12::JSONB,
                 CASE WHEN $13::BOOLEAN THEN NOW() ELSE NULL END,
                 CASE WHEN $14::BOOLEAN THEN NOW() ELSE NULL END,
+                $16::TEXT,
+                CASE WHEN $16::TEXT IS NOT NULL THEN clock_timestamp() ELSE NULL END,
                 NOW()
          FROM nodes n
          WHERE n.id = $1
@@ -378,6 +385,14 @@ pub(super) async fn upsert_node_status_from_publish(
                      node_status_snapshots.local_backup_inventory_reported_at
                  )
              END,
+             execution_inventory_status = COALESCE(
+                 EXCLUDED.execution_inventory_status,
+                 node_status_snapshots.execution_inventory_status
+             ),
+             execution_inventory_received_at = CASE
+                 WHEN $16::TEXT IS NOT NULL THEN clock_timestamp()
+                 ELSE node_status_snapshots.execution_inventory_received_at
+             END,
              updated_at = NOW()"
     ))
     .bind(node_id)
@@ -395,6 +410,7 @@ pub(super) async fn upsert_node_status_from_publish(
     .bind(inventory_prune.stamps_pruned_at())
     .bind(local_backup_report.stamps_reported_at())
     .bind(local_backup_report.clears_reported_at())
+    .bind(execution_observation.map(crate::execution_observation::InventoryStatus::as_str))
     .execute(&mut *conn)
     .await
     .map_err(|err| Status::internal(format!("upsert node status from publish: {err}")))?;

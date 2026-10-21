@@ -156,6 +156,44 @@ This is guidance for the owning implementations. It adds no policy tables,
 protobuf fields, configuration variables or execution behavior. Concrete disk
 profiles and other runtime adapters remain separate changes with real consumers.
 
+### Inventory collection evidence
+
+`PublishNodeState.execution_observation` distinguishes successful collection
+(including an empty inventory) from an unavailable node-manager. An omitted
+observation with no legacy inventory means this publication did not sample
+execution inventory. It neither clears nor refreshes the previous observation.
+
+The cluster records `execution_inventory_status` and
+`execution_inventory_received_at` on `node_status_snapshots` in the same
+transaction as the runtime/component projection. Both are NULL until a report
+is received; unrelated publications preserve them. A complete empty inventory
+clears that projection. Unavailable collection retains the last artifact rows
+for diagnostics but marks the observation unavailable. Legacy-only reports
+replace the old projection and record `legacy`, including after a node-ctl
+rollback; they do not establish support for the observation protocol.
+
+New publishers may duplicate a complete inventory in the legacy field for old
+cluster readers. New readers reject disagreement between the two fields,
+unavailable reports carrying an inventory, and unknown or missing outcomes.
+These are protocol errors: the whole request is rejected with `InvalidArgument`
+rather than acknowledging contradictory evidence as a collection failure.
+Readers supporting the observation envelope serialize replacements by locking
+the registered node, including when the inventory is empty. Artifact writes
+still precede the status upsert, preserving the lock order of legacy readers.
+A failed publication rolls back both the observation and its artifact
+projection, together with other writes in that request.
+
+`execution_inventory_received_at` is control-plane receipt time, not a node
+sampling timestamp or an environment readiness attestation. Inventory receipt
+does not establish host prerequisites, operation compatibility, or freshness of
+particular bytes.
+Placement remains unchanged until environment observations, freshness rules and
+the separately activated enforcement gate are implemented. Deploy the migration
+and cluster readers before node publishers; older readers ignore the new field.
+During a mixed cluster-reader rollout, old readers can update artifact rows
+without updating observation receipts. Neither strict rejection nor an
+unavailable observation is a placement quarantine.
+
 ## Canonical identity and stored representation
 
 The schema-1 canonical encoding is defined by

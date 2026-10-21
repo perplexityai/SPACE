@@ -105,13 +105,19 @@ impl ClusterApiService {
             .await
             .map_err(|err| Status::internal(format!("begin node state publish: {err}")))?;
 
+        let execution_observation = crate::execution_observation::prepare(
+            &mut tx,
+            origin.id,
+            request.execution_observation.as_ref(),
+            request.execution_inventory.as_ref(),
+        )
+        .await?;
         let templates_accepted =
             publish_template_states(&mut tx, origin.id, origin.role, &request.templates).await?;
         let sandbox_publication =
             publish_sandbox_states(&mut tx, origin.id, &request.sandboxes).await?;
-        if let Some(execution_inventory) = request.execution_inventory.as_ref() {
-            publish_execution_inventory(&mut tx, origin.id, execution_inventory).await?;
-        }
+        let execution_observation =
+            crate::execution_observation::publish(&mut tx, execution_observation).await?;
         // Produce the census-freshness verdict from the branch that prunes,
         // rather than from the wire flag. The timestamp and
         // `sandbox_observed_states` are then written from one decision in one
@@ -177,6 +183,7 @@ impl ClusterApiService {
             node_status,
             inventory_prune,
             local_backup_report,
+            execution_observation,
         )
         .await?;
         // Consume receipts only after this publication's sandbox, execution,

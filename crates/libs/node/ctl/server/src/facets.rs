@@ -435,6 +435,7 @@ async fn publish_node_state(
             role: proto_node_role(node_role),
             node_status: state.node_status,
             execution_inventory: state.execution_inventory,
+            execution_observation: None,
             auto_lifecycle_delete_completions: state.auto_lifecycle_delete_completions,
             pending_local_backups: state.pending_local_backups,
         })
