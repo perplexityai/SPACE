@@ -2,13 +2,13 @@
 
 import importlib.util
 import json
-import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+from required_test_deps import unavailable_dependency
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = REPO_ROOT / "ci/scripts/run-space-bundle-builds.py"
@@ -27,10 +27,10 @@ def load_bundle_builds_module():
 bundle_builds = load_bundle_builds_module()
 
 
-def cargo() -> str | None:
+def cargo() -> str:
     found = shutil.which("cargo")
-    if found is None and os.environ.get("SPACE_CI_REQUIRE_TEST_DEPS") == "1":
-        pytest.fail("cargo is required for the metadata oracle in CI")
+    if found is None:
+        unavailable_dependency("cargo", "not on PATH; the cargo metadata oracle needs the Rust toolchain")
     return found
 
 
@@ -190,8 +190,6 @@ def test_a_lane_covers_what_its_binaries_reach_without_dev_dependencies(tmp_path
         SystemExit, match="Rust binaries: fixture-manual, fixture-other, gone, skipped$"
     ):
         bundle_builds.rust_artifact_packages("missing", tmp_path)
-    if cargo() is not None:
-        assert bundle_builds.rust_workspace_packages(tmp_path) == cargo_packages(tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -250,6 +248,10 @@ def test_every_lane_resolves_and_hashes_on_this_workspace():
         )
 
 
-@pytest.mark.skipif(cargo() is None, reason="cargo not installed")
+def test_the_manifest_reader_matches_cargo_on_the_fixture(tmp_path):
+    fixture_workspace(tmp_path)
+    assert bundle_builds.rust_workspace_packages(tmp_path) == cargo_packages(tmp_path)
+
+
 def test_the_manifest_reader_matches_cargo_on_this_workspace():
     assert bundle_builds.rust_workspace_packages(REPO_ROOT) == cargo_packages(REPO_ROOT)
