@@ -1213,7 +1213,7 @@ async fn replay_of_an_ended_session_is_refused() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {
         return Ok(());
     };
-    for state in ["closed", "revoked", "failed"] {
+    for state in ["closing", "closed", "revoked", "failed"] {
         let create = ReplayableCreate::seed(&db.pool, &format!("{state}-session-replay")).await?;
         let first = create.create().await?;
         let first_hash = hash_token(&first.attach.as_ref().expect("attach token").token);
@@ -1236,5 +1236,37 @@ async fn replay_of_an_ended_session_is_refused() -> TestResult {
             "{state}"
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn replay_of_an_expired_session_is_refused_as_expired() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let create = ReplayableCreate::seed(&db.pool, "expired-session-replay").await?;
+    let first = create.create().await?;
+    let first_hash = hash_token(&first.attach.as_ref().expect("attach token").token);
+    sqlx::query(sql!(
+        "UPDATE data_plane_sessions
+         SET expires_at = NOW() - INTERVAL '1 minute'
+         WHERE session_id = $1"
+    ))
+    .bind(first.id.to_string())
+    .execute(&db.pool)
+    .await?;
+
+    let replay = create
+        .create()
+        .await
+        .expect_err("an expired session's replay must be refused");
+    assert!(
+        matches!(replay, PublicSessionStoreError::SessionExpired),
+        "{replay:?}"
+    );
+    assert_eq!(
+        stored_token_hash(&db.pool, first.id).await?,
+        Some(first_hash)
+    );
     Ok(())
 }

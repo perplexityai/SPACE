@@ -59,6 +59,8 @@ pub enum PublicSessionStoreError {
     MissingIdempotencyTarget,
     #[error("session was revoked or ended")]
     SessionRevoked,
+    #[error("session has expired")]
+    SessionExpired,
     #[error("database error: {0}")]
     Sql(#[from] sqlx::Error),
 }
@@ -111,9 +113,19 @@ impl PublicSessionStore {
                 .await?
                 .ok_or(PublicSessionStoreError::MissingIdempotencyTarget)?;
             let token = refresh_attach_token_tx(&mut tx, session_id).await?;
-            let row = fetch_session_tx(&mut tx, input.org_id, input.sandbox_id, session_id)
-                .await?
-                .ok_or(PublicSessionStoreError::MissingIdempotencyTarget)?;
+            let Some(row) =
+                fetch_session_tx(&mut tx, input.org_id, input.sandbox_id, session_id).await?
+            else {
+                return Err(
+                    if session_expired_tx(&mut tx, input.org_id, input.sandbox_id, session_id)
+                        .await?
+                    {
+                        PublicSessionStoreError::SessionExpired
+                    } else {
+                        PublicSessionStoreError::MissingIdempotencyTarget
+                    },
+                );
+            };
             // The refresh skips a session that has ended, which still exists
             // after a revoke or close; a replay must not hand out a token for it.
             let Some(token) = token else {
@@ -605,7 +617,7 @@ async fn refresh_attach_token_tx(
              updated_at = NOW()
          WHERE session_id = $1
            AND revocation_status = 'active'
-           AND state NOT IN ('closed', 'revoked', 'failed')"
+           AND state NOT IN ('closing', 'closed', 'revoked', 'failed')"
     ))
     .bind(&session_id_string)
     .bind(token.hash.as_str())
@@ -614,6 +626,30 @@ async fn refresh_attach_token_tx(
     .execute(&mut **tx)
     .await?;
     Ok((refreshed.rows_affected() > 0).then_some(token))
+}
+
+async fn session_expired_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    org_id: OrgId,
+    sandbox_id: PublicSandboxId,
+    session_id: DataPlaneSessionId,
+) -> Result<bool, sqlx::Error> {
+    let session_id_string = session_id.to_string();
+    sqlx::query_scalar::<_, bool>(sql!(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM data_plane_sessions
+             WHERE org_id = $1
+               AND sandbox_id = $2
+               AND session_id = $3
+               AND expires_at <= NOW()
+         )"
+    ))
+    .bind(org_id)
+    .bind(sandbox_id.as_uuid())
+    .bind(&session_id_string)
+    .fetch_one(&mut **tx)
+    .await
 }
 
 async fn fetch_session_tx(

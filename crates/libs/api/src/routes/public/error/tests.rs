@@ -373,3 +373,24 @@ async fn revoked_session_replay_is_a_non_retryable_conflict_with_a_reason() {
         }]
     );
 }
+
+#[tokio::test]
+async fn expired_session_replay_is_a_non_retryable_conflict_with_a_reason() {
+    use axum::response::IntoResponse;
+
+    let error =
+        PublicApiError::from(crate::public_sessions::PublicSessionStoreError::SessionExpired);
+    let response = error.into_response();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let envelope: PublicErrorEnvelope =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(envelope.code, PublicErrorCode::Conflict);
+    assert!(!envelope.retryable);
+    assert_eq!(
+        envelope.details,
+        vec![pplx_space_public_api::PublicErrorDetail {
+            key: "reason".to_string(),
+            value: "session_expired".to_string(),
+        }]
+    );
+}

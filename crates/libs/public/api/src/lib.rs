@@ -2028,6 +2028,11 @@ pub const CONFLICT_REASON_DETAIL_KEY: &str = "reason";
 /// no token; create a new session with a new idempotency key.
 pub const CONFLICT_REASON_SESSION_REVOKED: &str = "session_revoked";
 
+/// [`CONFLICT_REASON_DETAIL_KEY`] value of a `conflict` for replaying a
+/// session create whose session is past its expiry. The replay returns no
+/// token; create a new session with a new idempotency key.
+pub const CONFLICT_REASON_SESSION_EXPIRED: &str = "session_expired";
+
 open_wire_enum!(DataPlaneHttpErrorCode, "data-plane HTTP error code", {
     InvalidRequest => "invalid_request",
     Unauthorized => "unauthorized",

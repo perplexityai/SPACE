@@ -383,6 +383,16 @@ impl From<crate::public_sessions::PublicSessionStoreError> for PublicApiError {
                 });
                 error
             }
+            crate::public_sessions::PublicSessionStoreError::SessionExpired => {
+                let mut error = Self::conflict(
+                    "session has expired; create a new session with a new idempotency key",
+                );
+                error.details.push(PublicErrorDetail {
+                    key: pplx_space_public_api::CONFLICT_REASON_DETAIL_KEY.to_string(),
+                    value: pplx_space_public_api::CONFLICT_REASON_SESSION_EXPIRED.to_string(),
+                });
+                error
+            }
             crate::public_sessions::PublicSessionStoreError::Sql(error) => Self::from(error),
             other => {
                 tracing::error!(error = %other, "public session store error");
