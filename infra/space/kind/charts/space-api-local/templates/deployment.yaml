@@ -106,7 +106,7 @@ spec:
             - name: SPACE_CLUSTER_API_TOKEN_PATH
               value: "/var/run/space-publication/cluster-api.token"
             # The substrate's NodeApi credentials (SpaceBearerToken,
-            # crates/libs/common/svc/src/bearer_token.rs): one projected
+            # crates/libs/bearer-token/src/lib.rs): one projected
             # token per node-api surface, which node-api admits by TokenReview
             # (space-node-api-local's auth allowlists). An explicit path makes a
             # missing file an error rather than a fall back to the static token.

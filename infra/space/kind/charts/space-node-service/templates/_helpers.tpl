@@ -352,7 +352,7 @@ a root listener reads it as owner.
 {{/*
 The 600 s lifetime is the node services' deployed one; the kubelet refreshes
 the file at 80% of it and the client rereads it (TOKEN_FILE_CACHE_TTL,
-bearer_token.rs).
+crates/libs/bearer-token/src/lib.rs).
 */}}
 {{- define "space-node-service.volume.clusterApiToken" -}}
 - name: cluster-api-token
