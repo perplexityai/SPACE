@@ -556,11 +556,17 @@ impl K8sStore {
         sandbox_id: SandboxId,
         generation: i64,
     ) -> Result<StartedRecoveryObservation, SubstrateError> {
-        let row = sqlx::query_as::<_, (i64, String, String, Option<String>)>(sql!(
-            "SELECT generation, state, pod_name, host(pod_ip)
-             FROM sandbox_k8s_executions
-             WHERE sandbox_id = $1 AND generation >= $2 AND active
-               AND state IN ($3, $4, $5)"
+        // The sandbox's lifecycle decides what a running execution means: a
+        // suspend and a restore can land while a follower waits, and the
+        // generation it then finds running is that restore's. Until the row
+        // is `started` that restore can still be rolled back, so it is no
+        // recovery to hand out (see `join_restore_before_dial`).
+        let row = sqlx::query_as::<_, (i64, String, String, Option<String>, String)>(sql!(
+            "SELECT e.generation, e.state, e.pod_name, host(e.pod_ip), s.lifecycle
+             FROM sandbox_k8s_executions e
+             JOIN sandboxes s ON s.id = e.sandbox_id
+             WHERE e.sandbox_id = $1 AND e.generation >= $2 AND e.active
+               AND e.state IN ($3, $4, $5)"
         ))
         .bind(sandbox_id.as_uuid())
         .bind(generation)
@@ -571,7 +577,7 @@ impl K8sStore {
         .await
         .db_context("failed to observe started sandbox recovery")?;
 
-        let Some((generation, state, pod_name, pod_ip)) = row else {
+        let Some((generation, state, pod_name, pod_ip, lifecycle)) = row else {
             return Ok(StartedRecoveryObservation::Failed);
         };
         let state =
@@ -581,13 +587,24 @@ impl K8sStore {
                     message: format!("failed to parse started recovery execution state: {err}"),
                 })?;
 
+        let lifecycle =
+            lifecycle
+                .parse::<SandboxLifecycle>()
+                .map_err(|err| SubstrateError::Failed {
+                    message: format!("failed to parse started recovery sandbox lifecycle: {err}"),
+                })?;
         Ok(match (state, pod_ip) {
-            (ActiveExecutionState::Running, Some(pod_ip)) => {
+            (ActiveExecutionState::Running, Some(pod_ip))
+                if lifecycle == SandboxLifecycle::Started =>
+            {
                 StartedRecoveryObservation::Succeeded {
                     generation,
                     pod_name,
                     pod_ip,
                 }
+            }
+            (ActiveExecutionState::Running, _) if lifecycle == SandboxLifecycle::Restoring => {
+                StartedRecoveryObservation::Pending
             }
             (ActiveExecutionState::Creating | ActiveExecutionState::Recovering, _) => {
                 StartedRecoveryObservation::Pending

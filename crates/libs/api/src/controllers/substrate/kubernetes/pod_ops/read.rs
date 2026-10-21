@@ -196,7 +196,12 @@ impl KubernetesSubstrate {
         let Some(row) = self.store.active_execution_status(sandbox_id).await? else {
             return Ok(None);
         };
-        if is_suspended_lifecycle(&row.lifecycle) || execution_pod_lookup_in_flight(row.state) {
+        // A restoring pod is not reachable for a request: see
+        // `join_restore_before_dial`.
+        if is_suspended_lifecycle(&row.lifecycle)
+            || is_restoring_lifecycle(&row.lifecycle)
+            || execution_pod_lookup_in_flight(row.state)
+        {
             return Ok(None);
         }
         let Some(pod) = self
@@ -466,6 +471,7 @@ impl KubernetesSubstrate {
             ip,
             pod_uid: pod_uid.as_deref().and_then(|uid| PodUid::parse(uid).ok()),
             generation: row.generation,
+            sandbox_restoring: is_restoring_lifecycle(&row.lifecycle),
         }))
     }
 }

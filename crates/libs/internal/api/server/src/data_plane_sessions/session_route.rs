@@ -78,7 +78,9 @@ pub(crate) async fn resolve_session_route(
             Ok(SessionKind::Port | SessionKind::Protocol)
         );
         let sandbox_id = row.sandbox_id;
+        let restoring = row.sandbox_lifecycle == SandboxLifecycle::Restoring;
         let result = async {
+            refuse_restoring_route(row.sandbox_lifecycle)?;
             if matches!(
                 row.kind.parse::<SessionKind>(),
                 Ok(SessionKind::Port | SessionKind::Protocol)
@@ -207,17 +209,23 @@ pub(crate) async fn resolve_session_route(
             Ok(response) => return Ok(response),
             Err(error) => error,
         };
-        let Some(owner) =
-            activation.filter(|_| !activated && activation_may_repair(ingress, &error))
+        let Some(owner) = activation
+            .filter(|_| !activated && (restoring || activation_may_repair(ingress, &error)))
         else {
             return Err(error);
         };
-        owner
+        // A restoring row waits on its restore here; if that fails, the
+        // caller still gets the retryable refusal rather than the waiter's
+        // error.
+        if let Err(prepare_error) = owner
             .prepare(
                 sandbox_id,
                 deadline.saturating_duration_since(tokio::time::Instant::now()),
             )
-            .await?;
+            .await
+        {
+            return Err(if restoring { error } else { prepare_error });
+        }
         activated = true;
         // Re-read identity and authorization after activation; never replay bytes.
     }

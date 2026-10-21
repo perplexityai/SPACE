@@ -94,6 +94,11 @@ impl KubernetesSubstrate {
             }
             Err(_) => return Err(first_error),
         };
+        if current.sandbox_restoring {
+            // A replacement mid-restore isn't dialed for a user request (see
+            // `join_restore_before_dial`); the caller's recovery joins it.
+            return Err(first_error);
+        }
         if !current.same_instance(pod) {
             pplx_space_metrics::grpc::client_channel_cache("worker-node-api", "pod_moved");
         }

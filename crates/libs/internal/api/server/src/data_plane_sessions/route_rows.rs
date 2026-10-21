@@ -74,7 +74,13 @@ pub(super) async fn update_route_row(
     backend_endpoint: &str,
     backend_transport: &str,
 ) -> Result<SessionRouteRow, Status> {
-    sqlx::query_as::<_, SessionRouteRow>(sql!(
+    // The update re-reads the sandbox, and is rolled back if it refuses
+    // what it read, so a refused refresh changes no route.
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|error| Status::internal(format!("update data-plane session route: {error}")))?;
+    let row = sqlx::query_as::<_, SessionRouteRow>(sql!(
         "UPDATE data_plane_sessions d
          SET current_node_id = $2,
              backend_endpoint = $3,
@@ -138,10 +144,18 @@ pub(super) async fn update_route_row(
     .bind(current_node_id)
     .bind(backend_endpoint)
     .bind(backend_transport)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|error| Status::internal(format!("update data-plane session route: {error}")))?
-    .ok_or_else(|| Status::not_found("data-plane session not found"))
+    .ok_or_else(|| Status::not_found("data-plane session not found"))?;
+    // A suspend and a restore may have committed since the caller's first
+    // read, and the refreshed identity is then the restoring replacement's.
+    // Dropping the transaction rolls the route change back.
+    refuse_restoring_route(row.sandbox_lifecycle)?;
+    tx.commit()
+        .await
+        .map_err(|error| Status::internal(format!("update data-plane session route: {error}")))?;
+    Ok(row)
 }
 
 /// Explicit registered endpoints win; database INET host values need IPv6 brackets.

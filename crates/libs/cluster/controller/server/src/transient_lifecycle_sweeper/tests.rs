@@ -511,7 +511,7 @@ impl SweepSink for FakeSink {
         &self,
         sandbox_id: SandboxId,
         _lifecycle: SandboxLifecycle,
-        _write_token: &str,
+        _reverted: &RevertedToSuspended,
         _preserve_local_artifact: bool,
     ) -> Result<bool, sqlx::Error> {
         let mut state = self.0.lock().unwrap();
@@ -524,10 +524,16 @@ impl SweepSink for FakeSink {
         sandbox_id: SandboxId,
         _lifecycle: SandboxLifecycle,
         _age: PositiveDuration,
-    ) -> Result<Option<String>, sqlx::Error> {
+        _fence: &RetireFence,
+    ) -> Result<Option<RevertedToSuspended>, sqlx::Error> {
         let mut state = self.0.lock().unwrap();
         state.revert_calls.push(sandbox_id);
-        Ok((!state.cas_unclaimed.contains(&sandbox_id)).then(|| "revert-write".to_string()))
+        Ok(
+            (!state.cas_unclaimed.contains(&sandbox_id)).then(|| RevertedToSuspended {
+                write_token: "revert-write".to_string(),
+                prior_placement_changed_at: None,
+            }),
+        )
     }
 
     async fn fail_aged_candidate(
@@ -829,6 +835,7 @@ fn config_with_all_overrides(age: PositiveDuration) -> ReconcilerConfig {
         .unwrap(),
         unrestorable_restoring_enabled: true,
         unrestorable_restoring_min_placement_age: age,
+        abandoned_restore_retirement: Default::default(),
     }
 }
 
@@ -4116,6 +4123,7 @@ mod postgres_backed {
             .bind(SandboxLifecycle::Restoring.to_string())
             .bind(token)
             .bind(false)
+            .bind(None::<time::OffsetDateTime>)
             .fetch_optional(pool)
             .await
         };
@@ -4189,6 +4197,7 @@ mod postgres_backed {
                 .bind(SandboxLifecycle::Restoring.to_string())
                 .bind(write_token)
                 .bind(true)
+                .bind(None::<time::OffsetDateTime>)
                 .fetch_optional(pool)
                 .await?;
         assert!(restored.is_some(), "the undo must claim its own write");

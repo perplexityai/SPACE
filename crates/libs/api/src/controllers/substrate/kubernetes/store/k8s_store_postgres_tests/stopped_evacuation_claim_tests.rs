@@ -244,10 +244,12 @@ pub(super) async fn a_fresh_stopped_claim_is_not_rolled_back_on_a_clean_failure(
          is no lease for the failure path to release"
     );
 
-    fixture
-        .store
-        .revert_lifecycle_after_rollback_best_effort(sandbox_id, "stopped", None)
-        .await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET lifecycle = 'stopped' WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(pool)
+    .await?;
     assert_eq!(
         claim_row(pool, sandbox_id).await?,
         StoppedClaimRow {

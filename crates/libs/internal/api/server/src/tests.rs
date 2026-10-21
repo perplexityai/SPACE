@@ -3017,7 +3017,7 @@ fn route_credential_proof(
     }
 }
 
-async fn insert_data_plane_worker_node(
+pub(crate) async fn insert_data_plane_worker_node(
     pool: &sqlx::PgPool,
     node_id: NodeId,
     address: &str,
@@ -3076,7 +3076,7 @@ async fn insert_data_plane_k8s_worker_node_without_address(
     Ok(())
 }
 
-async fn insert_data_plane_active_sandbox(
+pub(crate) async fn insert_data_plane_active_sandbox(
     pool: &sqlx::PgPool,
     sandbox_id: SandboxId,
     node_id: NodeId,
@@ -3116,7 +3116,7 @@ async fn mark_sandbox_command_ready_pending(
     Ok(())
 }
 
-async fn insert_active_execution(
+pub(crate) async fn insert_active_execution(
     pool: &sqlx::PgPool,
     sandbox_id: SandboxId,
     pod_ip: &str,
@@ -3200,7 +3200,7 @@ fn sha256_hex(value: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-async fn insert_data_plane_session(
+pub(crate) async fn insert_data_plane_session(
     pool: &sqlx::PgPool,
     session_id: &str,
     sandbox_id: SandboxId,
@@ -7263,6 +7263,7 @@ async fn a_missing_templates_table_degrades_end_to_end() -> TestResult {
 
 mod backup_generation_fence;
 mod publication;
+mod restoring_routes;
 
 #[tokio::test(flavor = "current_thread")]
 async fn ecw_route_resolve_enforces_key_surface_and_organization() -> TestResult {

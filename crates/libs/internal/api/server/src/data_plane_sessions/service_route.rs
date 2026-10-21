@@ -67,11 +67,16 @@ pub(crate) async fn unstable_resolve_sandbox_service_route(
             None
         };
         let ingress = transport == SandboxServiceRouteTransport::ServicePortIngress;
+        let lifecycle: Result<SandboxLifecycle, Status> = row
+            .lifecycle
+            .parse()
+            .map_err(|error| Status::internal(format!("invalid sandbox lifecycle: {error}")));
+        let restoring = matches!(lifecycle, Ok(SandboxLifecycle::Restoring));
         let result = async {
+            let lifecycle = lifecycle?;
+            refuse_restoring_route(lifecycle)?;
             if transport == SandboxServiceRouteTransport::ServicePortIngress {
-                require_started_ingress(row.lifecycle.parse().map_err(|error| {
-                    Status::internal(format!("invalid sandbox lifecycle: {error}"))
-                })?)?;
+                require_started_ingress(lifecycle)?;
             }
             let current_node_id = row.active_node_id.ok_or_else(|| {
                 sandbox_service_route_not_ready_status(
@@ -197,17 +202,23 @@ pub(crate) async fn unstable_resolve_sandbox_service_route(
             Ok(response) => return Ok(response),
             Err(error) => error,
         };
-        let Some(owner) =
-            activation.filter(|_| !activated && activation_may_repair(ingress, &error))
+        let Some(owner) = activation
+            .filter(|_| !activated && (restoring || activation_may_repair(ingress, &error)))
         else {
             return Err(error);
         };
-        owner
+        // A restoring row waits on its restore here; if that fails, the
+        // caller still gets the retryable refusal rather than the waiter's
+        // error.
+        if let Err(prepare_error) = owner
             .prepare(
                 sandbox_id,
                 deadline.saturating_duration_since(tokio::time::Instant::now()),
             )
-            .await?;
+            .await
+        {
+            return Err(if restoring { error } else { prepare_error });
+        }
         activated = true;
         // Re-read identity and authorization after activation; never replay bytes.
     }

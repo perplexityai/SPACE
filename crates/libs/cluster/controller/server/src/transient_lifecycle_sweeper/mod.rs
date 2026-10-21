@@ -119,7 +119,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use pplx_space_api::controllers::substrate::{
-    CommandReadyProbe, PodFenceMismatch, RetireExecutionOutcome, RetireFence, Substrate,
+    AbandonedRestoreRetirement, CommandReadyProbe, PodFenceMismatch, RetireExecutionOutcome,
+    RetireFence, Substrate,
 };
 use pplx_space_common_core::types::{PositiveDuration, SandboxId, SandboxLifecycle};
 use pplx_space_events::{
@@ -682,6 +683,12 @@ pub struct ReconcilerConfig {
     /// `restoring` row is failed. See
     /// [`DEFAULT_UNRESTORABLE_RESTORING_AGE_SECS`].
     pub unrestorable_restoring_min_placement_age: PositiveDuration,
+    /// Whether the revert to `suspended` retires the abandoned restore's
+    /// execution (`SPACE_ABANDONED_RESTORE_RETIREMENT_ENABLED`, default off;
+    /// see [`AbandonedRestoreRetirement`]). Disabled, the revert only moves
+    /// the lifecycle and the cleanup retires the execution afterwards,
+    /// refusing a pod that came up since the candidate was observed.
+    pub abandoned_restore_retirement: AbandonedRestoreRetirement,
 }
 
 /// Per-lifecycle override resolution.
@@ -730,6 +737,7 @@ impl Default for ReconcilerConfig {
             unrestorable_restoring_min_placement_age: PositiveDuration::new_panic(
                 Duration::from_secs(DEFAULT_UNRESTORABLE_RESTORING_AGE_SECS),
             ),
+            abandoned_restore_retirement: AbandonedRestoreRetirement::Disabled,
         }
     }
 }
@@ -781,6 +789,7 @@ impl ReconcilerConfig {
             unrestorable_restoring_enabled: true,
             unrestorable_restoring_min_placement_age: default
                 .unrestorable_restoring_min_placement_age,
+            abandoned_restore_retirement: AbandonedRestoreRetirement::from_env(),
         }
     }
 
@@ -835,6 +844,15 @@ fn env_lifecycle_age(var: &str) -> LifecycleAge {
             .unwrap_or(LifecycleAge::UseDefault),
         None => LifecycleAge::UseDefault,
     }
+}
+
+/// A revert to `suspended` the CAS claimed, with what undoing it needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevertedToSuspended {
+    /// Names the exact lifecycle write the revert made.
+    pub write_token: String,
+    /// The row's `placement_changed_at` before the revert cleared it.
+    pub prior_placement_changed_at: Option<time::OffsetDateTime>,
 }
 
 /// A `failed` row with an active Kubernetes execution that the
@@ -937,14 +955,35 @@ pub trait SweepSink: Send + Sync + 'static {
     /// implementation hard-pins `lifecycle = 'restoring'`: every other
     /// transient lifecycle's matching backup is a stale prior-cycle copy
     /// (see `classify::decide`), so the CAS must claim nothing even if
-    /// classification drifts. Returns the token naming the lifecycle write
-    /// this call made, or `None` if it claimed nothing.
+    /// classification drifts.
+    ///
+    /// With abandoned-restore retirement enabled, the same transaction
+    /// retires the restore's execution as `replaced`, matching `fence`'s
+    /// recorded identity (or, for a candidate observed with no execution,
+    /// requires that none exists). That retirement is what records the
+    /// restore as abandoned, so the revert claims nothing unless it lands
+    /// too. Disabled (the default, see
+    /// [`ReconcilerConfig::abandoned_restore_retirement`]), the revert moves
+    /// only the lifecycle, and the cleanup retires the execution afterwards
+    /// under `fence`.
+    ///
+    /// A retiring revert also clears `placement_changed_at`, as the API
+    /// store's markerless restoring recovery does. A restore whose pod bound
+    /// moved it past the pre-restore snapshot, and both the suspended restore
+    /// selector and `durably_restorable` take a markerless snapshot only when
+    /// it is newer than the last placement: left in place, the proven source isn't
+    /// selected, and a fenced release of the abandoned pod's runtime is held
+    /// until the next suspend.
+    ///
+    /// Returns what the write needs to be undone, or `None` if it claimed
+    /// nothing.
     fn revert_to_suspended(
         &self,
         sandbox_id: SandboxId,
         lifecycle: SandboxLifecycle,
         age: PositiveDuration,
-    ) -> impl std::future::Future<Output = Result<Option<String>, sqlx::Error>> + Send;
+        fence: &RetireFence,
+    ) -> impl std::future::Future<Output = Result<Option<RevertedToSuspended>, sqlx::Error>> + Send;
 
     /// CAS one provably-unrecoverable row from `lifecycle` to `'failed'`,
     /// with the same evacuation-exemption guards as the candidate select.
@@ -1020,21 +1059,34 @@ pub trait SweepSink: Send + Sync + 'static {
         fence: RetireFence,
     ) -> impl std::future::Future<Output = Result<RetireExecutionOutcome, String>> + Send;
 
-    /// Undo a revert this sweep just made, when the retire it was supposed to
-    /// enable turned out to be refused.
+    /// Undo a revert this sweep just made, when the cleanup it was supposed
+    /// to enable turned out to be refused.
     ///
-    /// The pre-check narrows that window but cannot close it: a pod that
-    /// recovers between the question and the CAS — a Pending pod going Running
-    /// is enough, since that alone changes the resourceVersion — leaves a
-    /// `suspended` row owning a live execution, and no reconciler revisits a
-    /// suspended row. Putting the lifecycle back is also simply correct in
-    /// that case: the restore the sweep judged dead is running after all.
+    /// With abandoned-restore retirement disabled (the default), the revert
+    /// moved only the lifecycle and the cleanup retires the execution under
+    /// the candidate's fence. A pod that came up after the pre-check, which a
+    /// Pending pod going Running is enough for, fails that fence and leaves a
+    /// `suspended` row owning a live execution, which no reconciler revisits;
+    /// the restore the sweep judged dead is running after all, so putting the
+    /// lifecycle back is simply correct.
+    ///
+    /// With retirement enabled, the revert retired the restore's execution in
+    /// its own transaction, so the cleanup refuses only when an execution it
+    /// never observed is active by the time it runs. Putting the lifecycle
+    /// back lets the next tick judge the row afresh; the retired execution
+    /// stays `replaced`, since a restore never re-adopts a retired
+    /// generation. A pod that merely came up after the pre-check isn't a
+    /// refusal then: the cleanup deletes it as the abandoned restore's
+    /// leftover (see `candidate_pod_fence_with_observation`).
+    ///
     /// CAS-guarded on the row still being `suspended`, so a genuine suspend
-    /// that landed since is not clobbered.
-    /// `write_token` is what the revert CAS returned, naming that exact
-    /// lifecycle write. Undoing on the lifecycle value alone would reach past
-    /// this sweep's own transition and drag a later, legitimate suspend back
-    /// to `restoring`.
+    /// that landed since is not clobbered. `reverted` is what the revert CAS
+    /// returned. Its write token names that
+    /// exact lifecycle write: undoing on the lifecycle value alone would reach
+    /// past this sweep's own transition and drag a later, legitimate suspend
+    /// back to `restoring`. Its prior `placement_changed_at` is put back, so
+    /// the restored `restoring` row keeps the placement clock its restore
+    /// retry window reads.
     ///
     /// `preserve_local_artifact` is the candidate's `fork_restore`, restored
     /// alongside the lifecycle because leaving `restoring` cleared it. Without
@@ -1044,7 +1096,7 @@ pub trait SweepSink: Send + Sync + 'static {
         &self,
         sandbox_id: SandboxId,
         lifecycle: SandboxLifecycle,
-        write_token: &str,
+        reverted: &RevertedToSuspended,
         preserve_local_artifact: bool,
     ) -> impl std::future::Future<Output = Result<bool, sqlx::Error>> + Send;
 
@@ -1508,10 +1560,11 @@ impl<S: SweepSink> Reconciler<S> {
         report: &mut TickReport,
     ) {
         // Ask before committing (a UID backfill aside, this changes nothing).
-        // The revert below moves the sandbox to
-        // `suspended`, which no reconciler revisits, so a fence lost between
-        // the candidate select and here must be discovered *now* — after the
-        // CAS, the only remedy is a dormant row owning a live execution.
+        // The revert below moves the sandbox to `suspended`, which no
+        // reconciler revisits. Its transaction re-checks the execution row's
+        // recorded identity, but only this check can see the live pod: a pod
+        // replaced or moved on since the candidate select must stop the
+        // revert here.
         match self
             .sink
             .retire_fence_mismatch(candidate.sandbox_id, &candidate.pod_fence)
@@ -1541,9 +1594,14 @@ impl<S: SweepSink> Reconciler<S> {
             }
         }
 
-        let write_token = match self
+        let reverted = match self
             .sink
-            .revert_to_suspended(candidate.sandbox_id, candidate.lifecycle, age)
+            .revert_to_suspended(
+                candidate.sandbox_id,
+                candidate.lifecycle,
+                age,
+                &candidate.pod_fence,
+            )
             .await
         {
             Ok(claimed) => claimed,
@@ -1556,7 +1614,7 @@ impl<S: SweepSink> Reconciler<S> {
                 return;
             }
         };
-        let Some(write_token) = write_token else {
+        let Some(reverted) = reverted else {
             OutcomeEvent::aged_transient(
                 AgedTransientOutcome::CasLost,
                 candidate.lifecycle.as_str(),
@@ -1586,18 +1644,16 @@ impl<S: SweepSink> Reconciler<S> {
             "recoverable_snapshot",
         );
 
-        // A claimed revert leaves the wedged restore's execution shape
-        // behind: an active `sandbox_k8s_executions` row, `placement =
-        // 'placed'`, and possibly a still-Running pod.
-        // `suspended` is a contract that none of those exist — the normal
-        // suspend completion clears them all in one transaction — and no
-        // reconciler collects them on a dormant row (the orphaned-sandbox
-        // reconciler excludes dormant lifecycles; the failed-cleanup pass
-        // only lists `failed`). Retire the execution the same way the fail
-        // path does: it tears down the pod while preserving node-local state,
-        // finishes the execution row, and unplaces the sandbox. Best-effort:
-        // the row is already `suspended`,
-        // so a failure here is logged loudly and leaves only a leak.
+        // The revert already retired the restore's execution, so what's left
+        // of the wedged restore is its pod and the row's placement:
+        // `suspended` is a contract that neither remains, and no reconciler
+        // collects them on a dormant row (the orphaned-sandbox reconciler
+        // excludes dormant lifecycles; the failed-cleanup pass only lists
+        // `failed`). The retire finds no active execution, deletes the pods
+        // recorded on inactive rows and unplaces the sandbox. Best-effort: a
+        // pod it misses belongs to no active execution, which the
+        // orphaned-restore-pod GC and the next restore's lingering-pod sweep
+        // both reap.
         emit_revert_cleanup_event(
             candidate.sandbox_id,
             SandboxEventType::CleanupStarted,
@@ -1648,16 +1704,17 @@ impl<S: SweepSink> Reconciler<S> {
                     );
                     return;
                 }
-                // The revert is already durable and the execution it was meant
-                // to retire is still live, so leaving the row `suspended`
-                // strands it where nothing looks again. Put the lifecycle back
-                // and let the next tick judge it afresh.
+                // The revert retired the restore's execution, so the cleanup
+                // refused because an execution it never observed is active
+                // now. Leaving the row `suspended` would strand that one where
+                // nothing looks again. Put the lifecycle back, if the revert is
+                // still the row's last write, and let the next tick judge it.
                 match self
                     .sink
                     .undo_revert_to_suspended(
                         candidate.sandbox_id,
                         candidate.lifecycle,
-                        &write_token,
+                        &reverted,
                         candidate.fork_restore,
                     )
                     .await
@@ -1682,8 +1739,8 @@ impl<S: SweepSink> Reconciler<S> {
                         sandbox_id = %candidate.sandbox_id,
                         error = %err,
                         lifecycle = %candidate.lifecycle,
-                        "could not undo a revert whose retire was refused; the row is \
-                         suspended with a live execution and no reconciler revisits it"
+                        "could not undo a revert whose cleanup was refused; the row is \
+                         suspended with an active execution and no reconciler revisits it"
                     ),
                 }
             }
@@ -1694,11 +1751,15 @@ impl<S: SweepSink> Reconciler<S> {
                 )
                 .sandbox_id(candidate.sandbox_id)
                 .error(&err)
-                .detail(
+                .detail(if self.config.abandoned_restore_retirement.is_enabled() {
+                    "pod cleanup failed after revert to suspended; the execution is \
+                     retired, so orphan GC or the next restore removes the pod, but the \
+                     row keeps its placement, which nothing revisits on a suspended row"
+                } else {
                     "execution retire failed after revert to suspended; stale execution, \
                      placement, and pod persist until the node terminates (no reconciler \
-                     retries them on a suspended row)",
-                )
+                     retries them on a suspended row)"
+                })
                 .warn();
                 report.cleanup_failures += 1;
                 emit_revert_cleanup_event(
@@ -2592,6 +2653,7 @@ pub async fn run_with_substrate(
     substrate: Arc<Substrate>,
     shutdown_token: CancellationToken,
 ) {
-    let sink = SubstrateSweepSink::new(pool, substrate);
+    let sink = SubstrateSweepSink::new(pool, substrate)
+        .with_abandoned_restore_retirement(config.abandoned_restore_retirement);
     run(config, sink, shutdown_token).await;
 }

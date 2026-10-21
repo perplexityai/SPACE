@@ -3,8 +3,8 @@
 use axum::http::{Method, StatusCode};
 
 use super::super::scripted_test_doubles::{
-    KubeLog, ScriptedReply, ScriptedWorkerConfig, kube_status, pod_path, requests_matching,
-    scripted_kube_client, start_scripted_worker,
+    KubeLog, ScriptedReply, ScriptedWorkerConfig, kube_status, pod_path, pod_reply,
+    requests_matching, scripted_kube_client, start_scripted_worker,
 };
 use super::super::tests::{
     insert_test_sandbox_row, node_with_network_slots, sandbox_pod_on_node,
@@ -12,6 +12,8 @@ use super::super::tests::{
     substrate_with_store_client_proxy_port_and_pod,
 };
 use super::*;
+use crate::controllers::substrate::{PodIdentityFence, RecordedExecution};
+use pplx_space_common_core::types::{PodName, PodResourceVersion, PodUid};
 
 // ── create_execution ────────────────────────────────────────────────────────
 
@@ -465,5 +467,181 @@ async fn teardown_propagates_an_apiserver_fault_while_resolving_the_runtime() ->
     );
     assert!(requests_matching(&log, &Method::DELETE).is_empty());
     assert_eq!(active_execution_count(&db.pool, sandbox_id).await?, 1);
+    Ok(())
+}
+
+/// The shape the sweeper's lifecycle-only revert leaves with abandoned-restore
+/// retirement disabled, the default until every routing replica refuses to
+/// route to a `restoring` sandbox: the restore's execution still active. A
+/// restore pod that came up after the sweeper's live-pod check may then have
+/// served a user request through a replica without that guard. The cleanup
+/// that follows the revert retires under the candidate's fence, which sees the
+/// pod at a newer resourceVersion and refuses: the pod and its execution are
+/// kept, so the sweeper puts the row back to `restoring` rather than losing
+/// what the pod served. (That the revert leaves this shape with retirement
+/// disabled is pinned in the sweeper's own store tests.)
+#[tokio::test(flavor = "current_thread")]
+async fn without_retirement_the_sweeper_cleanup_keeps_a_restore_pod_that_came_up_after_its_check()
+-> TestResult {
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let sandbox_id = SandboxId::new();
+    let pod_name = "space-sbx-late-serve-g1";
+    insert_test_sandbox_row(&db.pool, sandbox_id, "suspended").await?;
+    // What the lifecycle-only revert left: the restore's execution still
+    // active and the row still placed.
+    insert_execution(
+        &db.pool,
+        sandbox_id,
+        ExecutionSeed::running(pod_name, "late-serve-uid"),
+    )
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET placement = 'on_node' WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(&db.pool)
+    .await?;
+    // The pod bound and came up after the check: a newer resourceVersion.
+    let (client, log) = scripted_kube_client(move |request| match request.method {
+        Method::DELETE => kube_status(StatusCode::OK, "Success"),
+        _ => {
+            let mut pod = (*sandbox_pod_on_node(pod_name, WORKER_NODE, 1, "Running")).clone();
+            pod.metadata.uid = Some("late-serve-uid".to_string());
+            pod.metadata.resource_version = Some("2".to_string());
+            pod_reply(&pod)
+        }
+    });
+    let substrate = substrate_with_store_and_client(db.pool.clone(), client);
+    let observed = PodIdentityFence::new(PodName::parse(pod_name)?)
+        .with_recorded(RecordedExecution::Read {
+            pod_uid: Some(PodUid::parse("late-serve-uid")?),
+            route_activation_id: None,
+        })
+        .with_generation(1)
+        .with_pod_uid(PodUid::parse("late-serve-uid")?)
+        .with_resource_version(PodResourceVersion::parse("1")?);
+
+    let outcome = substrate
+        .retire_execution(RetireExecutionRequest::fenced(sandbox_id, observed))
+        .await?;
+
+    assert!(
+        matches!(outcome, RetireExecutionOutcome::PodIdentityChanged { .. }),
+        "the cleanup must refuse a pod that came up after the check: {outcome:?}"
+    );
+    assert!(
+        requests_matching(&log, &Method::DELETE).is_empty(),
+        "a pod that may have served a request must not be deleted"
+    );
+    assert_eq!(active_execution_count(&db.pool, sandbox_id).await?, 1);
+    Ok(())
+}
+
+/// The transient-lifecycle sweeper reverts an aged `restoring` row by
+/// retiring its execution as `replaced` in the revert's own transaction, and
+/// only after checking the candidate's live pod. A restore pod that binds and
+/// comes up after that check is the abandoned restore's leftover: the cleanup
+/// that follows deletes it rather than letting it recover, the row stays
+/// `suspended`, and restore still selects the durable pre-restore snapshot
+/// the revert proved.
+#[tokio::test(flavor = "current_thread")]
+async fn sweeper_revert_cleanup_deletes_a_restore_pod_that_bound_after_its_check() -> TestResult {
+    let db = pplx_space_db_test_fixtures::pg_test_db().await?;
+    let sandbox_id = SandboxId::new();
+    let pod_name = "space-sbx-late-bind-g1";
+    let source_uri = "s3://space-test/pre-restore?region=us-east-1";
+    insert_test_sandbox_row(&db.pool, sandbox_id, "suspended").await?;
+    sqlx::query(sql!(
+        "INSERT INTO snapshots (id, sandbox_id, type, state, timestamp, org_id)
+         VALUES ($1, $2, 'full', 'ready', NOW() - INTERVAL '10 minutes',
+                 '00000000-0000-0000-0000-000000000001')"
+    ))
+    .bind(Uuid::now_v7())
+    .bind(sandbox_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO snapshot_storage_locations (snapshot_id, storage_connection_string, org_id)
+         SELECT id, $2, org_id FROM snapshots WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox_id)
+    .bind(source_uri)
+    .execute(&db.pool)
+    .await?;
+    // What the sweeper's revert left: its execution retired as an abandoned
+    // restore, the row still reading as placed from when the pod bound, and
+    // the placement clock the bind moved past the snapshot cleared.
+    insert_execution(
+        &db.pool,
+        sandbox_id,
+        ExecutionSeed {
+            state: "replaced",
+            ..ExecutionSeed::running(pod_name, "late-bind-uid")
+        },
+    )
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions SET active = FALSE WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET placement = 'on_node',
+                placement_changed_at = NULL
+          WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(&db.pool)
+    .await?;
+    // The live pod has moved on since the candidate observed it: it bound
+    // and is Running at a newer resourceVersion.
+    let (client, log) = scripted_kube_client(move |request| match request.method {
+        Method::DELETE => kube_status(StatusCode::OK, "Success"),
+        _ => {
+            let mut pod = (*sandbox_pod_on_node(pod_name, WORKER_NODE, 1, "Running")).clone();
+            pod.metadata.uid = Some("late-bind-uid".to_string());
+            pod.metadata.resource_version = Some("2".to_string());
+            pod_reply(&pod)
+        }
+    });
+    let substrate = substrate_with_store_and_client(db.pool.clone(), client);
+    let observed = PodIdentityFence::new(PodName::parse(pod_name)?)
+        .with_recorded(RecordedExecution::Read {
+            pod_uid: Some(PodUid::parse("late-bind-uid")?),
+            route_activation_id: None,
+        })
+        .with_generation(1)
+        .with_pod_uid(PodUid::parse("late-bind-uid")?)
+        .with_resource_version(PodResourceVersion::parse("1")?);
+
+    let outcome = substrate
+        .retire_execution(RetireExecutionRequest::fenced(sandbox_id, observed))
+        .await?;
+
+    assert_eq!(outcome, RetireExecutionOutcome::Retired);
+    let deletes = requests_matching(&log, &Method::DELETE);
+    assert!(
+        deletes
+            .iter()
+            .any(|request| request.path == pod_path(pod_name)),
+        "the late-bound restore pod must be deleted: {deletes:?}"
+    );
+    assert_eq!(sandbox_lifecycle(&db.pool, sandbox_id).await?, "suspended");
+    assert_eq!(active_execution_count(&db.pool, sandbox_id).await?, 0);
+    let sandbox = crate::controllers::sandbox::fetch_sandbox(&db.pool, sandbox_id)
+        .await?
+        .expect("sandbox row exists");
+    assert_eq!(sandbox.placement, "unplaced");
+    assert_eq!(
+        substrate
+            .store
+            .selected_suspend_restore_storage_uri(&sandbox, false)
+            .await?
+            .as_deref(),
+        Some(source_uri),
+        "the next wake must restore from the durable pre-restore snapshot"
+    );
     Ok(())
 }

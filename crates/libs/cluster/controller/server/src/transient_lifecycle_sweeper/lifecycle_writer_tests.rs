@@ -30,10 +30,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use pplx_space_api::controllers::substrate::Substrate;
 use pplx_space_api::controllers::substrate::direct::DirectSubstrate;
+use pplx_space_api::controllers::substrate::{
+    AbandonedRestoreRetirement, PodIdentityFence, RecordedExecution, RetireFence, Substrate,
+};
 use pplx_space_common_core::sql;
-use pplx_space_common_core::types::{NodeId, PositiveDuration, SandboxId, SandboxLifecycle};
+use pplx_space_common_core::types::{
+    NodeId, PodName, PodUid, PositiveDuration, SandboxActivationAttemptId, SandboxId,
+    SandboxLifecycle,
+};
 use pplx_space_db_test_fixtures::{pg_test_db, pg_test_db_with_max_connections};
 use pplx_space_placement::StoredSandboxLifecycle;
 use pplx_space_placement::test_support::stored_lifecycle_matrix;
@@ -43,7 +48,8 @@ use sqlx::PgPool;
 use super::{SWEEPABLE_LIFECYCLES, SubstrateSweepSink, SweepSink};
 use crate::lifecycle_writer_test_support::{
     ExecutionSeed, SandboxSeed, bounded, insert_execution, insert_sandbox, insert_snapshot,
-    kubernetes_substrate, pin_local_artifact, single_backend_pool, wait_until_blocked,
+    kubernetes_substrate, pin_local_artifact, pod_name, pod_uid, single_backend_pool,
+    wait_until_blocked,
 };
 
 fn age() -> PositiveDuration {
@@ -58,6 +64,7 @@ fn direct_sink(pool: &PgPool) -> SubstrateSweepSink {
         pool.clone(),
         Arc::new(Substrate::from_direct(DirectSubstrate::new(pool.clone()))),
     )
+    .with_abandoned_restore_retirement(AbandonedRestoreRetirement::Enabled)
 }
 
 /// The Postgres `sandboxes` columns a sweeper write moves.
@@ -525,7 +532,12 @@ async fn revert_cas_moves_only_restoring_rows() -> TestResult {
         insert_snapshot(pool, sandbox_id, "ready", -60).await?;
 
         let claimed = sink
-            .revert_to_suspended(sandbox_id, SandboxLifecycle::Restoring, age())
+            .revert_to_suspended(
+                sandbox_id,
+                SandboxLifecycle::Restoring,
+                age(),
+                &RetireFence::NoExecution,
+            )
             .await?
             .is_some();
 
@@ -566,7 +578,12 @@ async fn revert_cas_moves_only_restoring_rows() -> TestResult {
             .await?;
         }
         let claimed = sink
-            .revert_to_suspended(sandbox_id, SandboxLifecycle::Restoring, age())
+            .revert_to_suspended(
+                sandbox_id,
+                SandboxLifecycle::Restoring,
+                age(),
+                &RetireFence::NoExecution,
+            )
             .await?;
         assert!(claimed.is_none(), "{case}");
         assert_eq!(
@@ -575,6 +592,386 @@ async fn revert_cas_moves_only_restoring_rows() -> TestResult {
             "{case}"
         );
     }
+    Ok(())
+}
+
+/// The revert CAS retires the restore's execution as `replaced` in its own
+/// transaction, and claims nothing unless the execution still matches every
+/// part of the identity the candidate select recorded: a revert that can't
+/// record the abandonment on the right execution would strand that execution
+/// active on a `suspended` row. A candidate observed with no execution reverts
+/// only while none exists, and one that observed nothing never reverts.
+///
+/// The execution row sits under the direct sink's `space` row (see the
+/// module doc): the retirement matches the execution by sandbox and identity,
+/// whatever substrate labels the row.
+#[tokio::test(flavor = "current_thread")]
+async fn revert_cas_retires_only_the_observed_execution() -> TestResult {
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+    let sink = direct_sink(pool);
+
+    let observed = |sandbox_id: SandboxId| {
+        PodIdentityFence::new(PodName::parse(pod_name(sandbox_id, 1)).expect("pod name"))
+            .with_recorded(RecordedExecution::Read {
+                pod_uid: Some(PodUid::parse(pod_uid(sandbox_id, 1)).expect("pod uid")),
+                route_activation_id: None,
+            })
+            .with_generation(1)
+    };
+    struct Case {
+        name: &'static str,
+        retires: bool,
+        fence: fn(PodIdentityFence) -> RetireFence,
+        /// Whether the execution row records its pod UID. One that records
+        /// none is what only the unread-fence refusal can tell apart.
+        records_pod_uid: bool,
+    }
+    fn case(name: &'static str, retires: bool, fence: fn(PodIdentityFence) -> RetireFence) -> Case {
+        Case {
+            name,
+            retires,
+            fence,
+            records_pod_uid: true,
+        }
+    }
+    let cases = [
+        case("the observed execution", true, RetireFence::Pod),
+        case("another generation", false, |fence| {
+            RetireFence::Pod(fence.with_generation(2))
+        }),
+        case("another pod", false, |fence| {
+            let mut fence = fence;
+            fence.pod_name = PodName::parse("space-sbx-elsewhere-g1").expect("pod name");
+            RetireFence::Pod(fence)
+        }),
+        case("another pod uid", false, |fence| {
+            RetireFence::Pod(fence.with_recorded(RecordedExecution::Read {
+                pod_uid: Some(PodUid::parse("uid-of-a-replacement").expect("pod uid")),
+                route_activation_id: None,
+            }))
+        }),
+        case("another activation attempt", false, |fence| {
+            RetireFence::Pod(fence.with_activation_attempt(SandboxActivationAttemptId::new()))
+        }),
+        case("another route activation", false, |fence| {
+            let pod_uid = fence.recorded.pod_uid().cloned();
+            RetireFence::Pod(fence.with_recorded(RecordedExecution::Read {
+                pod_uid,
+                route_activation_id: Some(SandboxActivationAttemptId::new()),
+            }))
+        }),
+        Case {
+            records_pod_uid: false,
+            ..case("an unread row", false, |fence| {
+                RetireFence::Pod(fence.with_recorded(RecordedExecution::Unread))
+            })
+        },
+        case("no execution observed", false, |_| RetireFence::NoExecution),
+        case("nothing observed", false, |_| RetireFence::Unobserved),
+    ];
+
+    let mut mismatches = Vec::new();
+    for Case {
+        name,
+        retires,
+        fence,
+        records_pod_uid,
+    } in cases
+    {
+        let sandbox_id = SandboxId::new();
+        insert_row(pool, sandbox_id, &Row::bare("restoring")).await?;
+        insert_snapshot(pool, sandbox_id, "ready", -60).await?;
+        insert_execution(pool, sandbox_id, ExecutionSeed::RUNNING).await?;
+        sqlx::query(sql!(
+            "UPDATE sandboxes SET placement = 'on_node' WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .execute(pool)
+        .await?;
+        if !records_pod_uid {
+            sqlx::query(sql!(
+                "UPDATE sandbox_k8s_executions SET pod_uid = NULL WHERE sandbox_id = $1"
+            ))
+            .bind(sandbox_id)
+            .execute(pool)
+            .await?;
+        }
+
+        let claimed = sink
+            .revert_to_suspended(
+                sandbox_id,
+                SandboxLifecycle::Restoring,
+                age(),
+                &fence(observed(sandbox_id)),
+            )
+            .await?
+            .is_some();
+
+        let (lifecycle, placement, active, state): (String, String, bool, String) =
+            sqlx::query_as(sql!(
+                "SELECT s.lifecycle, s.placement, e.active, e.state
+               FROM sandboxes s
+               JOIN sandbox_k8s_executions e ON e.sandbox_id = s.id
+              WHERE s.id = $1"
+            ))
+            .bind(sandbox_id)
+            .fetch_one(pool)
+            .await?;
+        // A retiring revert also unplaces the row, so it doesn't stay placed
+        // if the best-effort cleanup that follows never runs.
+        let expected = if retires {
+            ("suspended", "unplaced", false, "replaced")
+        } else {
+            ("restoring", "on_node", true, "running")
+        };
+        if claimed != retires
+            || (
+                lifecycle.as_str(),
+                placement.as_str(),
+                active,
+                state.as_str(),
+            ) != expected
+        {
+            mismatches.push(format!(
+                "{name}: claimed {claimed}, row ({lifecycle}, {placement}, {active}, {state})"
+            ));
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
+    Ok(())
+}
+
+/// With abandoned-restore retirement disabled (the default), the revert CAS
+/// moves only the lifecycle, as before retirement existed: the restore's
+/// execution stays active, the row stays placed and keeps its placement
+/// clock, and the cleanup that follows retires the execution under the
+/// candidate's fence, which refuses a pod that came up after the check.
+#[tokio::test(flavor = "current_thread")]
+async fn without_retirement_the_revert_moves_only_the_lifecycle() -> TestResult {
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+    let sink =
+        direct_sink(pool).with_abandoned_restore_retirement(AbandonedRestoreRetirement::Disabled);
+
+    let sandbox_id = SandboxId::new();
+    insert_row(pool, sandbox_id, &Row::bare("restoring")).await?;
+    insert_snapshot(pool, sandbox_id, "ready", -60).await?;
+    insert_execution(pool, sandbox_id, ExecutionSeed::RUNNING).await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET placement = 'on_node',
+                placement_changed_at = lifecycle_changed_at + INTERVAL '30 seconds'
+          WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(pool)
+    .await?;
+    let placement_clock = || async {
+        sqlx::query_scalar::<_, Option<time::OffsetDateTime>>(sql!(
+            "SELECT placement_changed_at FROM sandboxes WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(pool)
+        .await
+    };
+    let clock_before = placement_clock().await?;
+    let fence = RetireFence::Pod(
+        PodIdentityFence::new(PodName::parse(pod_name(sandbox_id, 1)).expect("pod name"))
+            .with_recorded(RecordedExecution::Read {
+                pod_uid: Some(PodUid::parse(pod_uid(sandbox_id, 1)).expect("pod uid")),
+                route_activation_id: None,
+            })
+            .with_generation(1),
+    );
+
+    let reverted = sink
+        .revert_to_suspended(sandbox_id, SandboxLifecycle::Restoring, age(), &fence)
+        .await?
+        .expect("the revert CAS claims");
+
+    let (lifecycle, placement, active, state): (String, String, bool, String) =
+        sqlx::query_as(sql!(
+            "SELECT s.lifecycle, s.placement, e.active, e.state
+               FROM sandboxes s
+               JOIN sandbox_k8s_executions e ON e.sandbox_id = s.id
+              WHERE s.id = $1"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(pool)
+        .await?;
+    assert_eq!(
+        (
+            lifecycle.as_str(),
+            placement.as_str(),
+            active,
+            state.as_str()
+        ),
+        ("suspended", "on_node", true, "running")
+    );
+    assert_eq!(placement_clock().await?, clock_before);
+    assert_eq!(reverted.prior_placement_changed_at, clock_before);
+    Ok(())
+}
+
+/// A placed-then-reverted restore is durably restorable as soon as the revert
+/// lands. Its pod's bind moved `placement_changed_at` past the pre-restore
+/// snapshot, and `durably_restorable`, which gates the fenced release of the
+/// abandoned pod's runtime, takes a markerless snapshot only when it is newer
+/// than the last placement. The revert clears the clock, as the API store's
+/// markerless restoring recovery does; left in place, the release would wait
+/// for the next suspend and the pod would count against `teardown_stuck`.
+#[tokio::test(flavor = "current_thread")]
+async fn placed_then_reverted_restore_is_durably_restorable_at_once() -> TestResult {
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+    let sink = direct_sink(pool);
+
+    let sandbox_id = SandboxId::new();
+    insert_row(pool, sandbox_id, &Row::bare("restoring")).await?;
+    insert_snapshot(pool, sandbox_id, "ready", -60).await?;
+    // The restore's pod bound after the pre-restore snapshot was taken.
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET placement_changed_at = lifecycle_changed_at + INTERVAL '30 seconds'
+          WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(pool)
+    .await?;
+
+    let reverted = sink
+        .revert_to_suspended(
+            sandbox_id,
+            SandboxLifecycle::Restoring,
+            age(),
+            &RetireFence::NoExecution,
+        )
+        .await?
+        .expect("the revert CAS claims");
+
+    assert_eq!(row(pool, sandbox_id).await?.lifecycle, "suspended");
+    assert!(
+        pplx_space_sandbox_store::durably_restorable(pool, sandbox_id).await?,
+        "a fenced release must not wait for the next suspend"
+    );
+    assert!(reverted.prior_placement_changed_at.is_some());
+    Ok(())
+}
+
+/// A restore's owner commits `restoring -> started` under its own lease as
+/// soon as its wake succeeds, before its request dials the runtime (the API's
+/// `complete_owned_user_restore`). A revert the sweeper decided on before that
+/// commit claims nothing after it, so it can't retire the runtime the owner's
+/// request is using, even with the observed execution's exact fence.
+#[tokio::test(flavor = "current_thread")]
+async fn revert_after_the_owner_commits_started_claims_nothing() -> TestResult {
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+    let sink = direct_sink(pool);
+
+    let sandbox_id = SandboxId::new();
+    insert_row(pool, sandbox_id, &Row::bare("restoring").leased()).await?;
+    insert_snapshot(pool, sandbox_id, "ready", -60).await?;
+    insert_execution(pool, sandbox_id, ExecutionSeed::RUNNING).await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes SET placement = 'on_node' WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(pool)
+    .await?;
+    // The sweep observed the restore's execution before the owner finished.
+    let fence = RetireFence::Pod(
+        PodIdentityFence::new(PodName::parse(pod_name(sandbox_id, 1)).expect("pod name"))
+            .with_recorded(RecordedExecution::Read {
+                pod_uid: Some(PodUid::parse(pod_uid(sandbox_id, 1)).expect("pod uid")),
+                route_activation_id: None,
+            })
+            .with_generation(1),
+    );
+    // The owner's commit: under the row's own lease token, from `restoring`.
+    // `complete_owned_user_restore` is private to the API's Kubernetes store
+    // (and tested there); what this pins is the sweeper side: a `started` row.
+    let committed = sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET lifecycle = 'started', placement = 'on_node'
+          WHERE id = $1
+            AND lifecycle = 'restoring'
+            AND restore_lease_token IS NOT NULL"
+    ))
+    .bind(sandbox_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    assert_eq!(committed, 1);
+
+    let claimed = sink
+        .revert_to_suspended(sandbox_id, SandboxLifecycle::Restoring, age(), &fence)
+        .await?;
+
+    assert!(claimed.is_none(), "the revert must not claim a started row");
+    assert_eq!(row(pool, sandbox_id).await?.lifecycle, "started");
+    let (active, state): (bool, String) = sqlx::query_as(sql!(
+        "SELECT active, state FROM sandbox_k8s_executions WHERE sandbox_id = $1"
+    ))
+    .bind(sandbox_id)
+    .fetch_one(pool)
+    .await?;
+    assert_eq!((active, state.as_str()), (true, "running"));
+    Ok(())
+}
+
+/// The revert undo puts back the exact `placement_changed_at` the revert
+/// cleared, so the `restoring` row's restore retry window reads the same
+/// placement clock it did before the sweep.
+#[tokio::test(flavor = "current_thread")]
+async fn revert_undo_restores_the_placement_clock() -> TestResult {
+    let db = pg_test_db().await?;
+    let pool = &db.pool;
+    let sink = direct_sink(pool);
+
+    let sandbox_id = SandboxId::new();
+    insert_row(pool, sandbox_id, &Row::bare("restoring").leased()).await?;
+    insert_snapshot(pool, sandbox_id, "ready", -60).await?;
+    sqlx::query(sql!(
+        "UPDATE sandboxes
+            SET placement_changed_at = lifecycle_changed_at + INTERVAL '30 seconds'
+          WHERE id = $1"
+    ))
+    .bind(sandbox_id)
+    .execute(pool)
+    .await?;
+    let placement_clock = || async {
+        sqlx::query_scalar::<_, Option<time::OffsetDateTime>>(sql!(
+            "SELECT placement_changed_at FROM sandboxes WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .fetch_one(pool)
+        .await
+    };
+    let original = placement_clock().await?;
+
+    let reverted = sink
+        .revert_to_suspended(
+            sandbox_id,
+            SandboxLifecycle::Restoring,
+            age(),
+            &RetireFence::NoExecution,
+        )
+        .await?
+        .expect("the revert CAS claims");
+    assert_eq!(
+        placement_clock().await?,
+        None,
+        "the revert clears the clock"
+    );
+
+    assert!(
+        sink.undo_revert_to_suspended(sandbox_id, SandboxLifecycle::Restoring, &reverted, false)
+            .await?
+    );
+    assert_eq!(row(pool, sandbox_id).await?.lifecycle, "restoring");
+    assert_eq!(placement_clock().await?, original);
     Ok(())
 }
 
@@ -598,7 +995,12 @@ async fn revert_undo_reverts_only_its_own_suspended_write() -> TestResult {
         .await?;
         insert_snapshot(pool, sandbox_id, "ready", -60).await?;
         let token = sink
-            .revert_to_suspended(sandbox_id, SandboxLifecycle::Restoring, age())
+            .revert_to_suspended(
+                sandbox_id,
+                SandboxLifecycle::Restoring,
+                age(),
+                &RetireFence::NoExecution,
+            )
             .await?
             .expect("the accepting revert CAS claims");
         relabel_keeping_write_token(pool, sandbox_id, stored).await?;

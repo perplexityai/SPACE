@@ -26,7 +26,8 @@ use sqlx::PgPool;
 
 use super::classify::{ExecutionRoutability, ProbeObservation};
 use super::probe::{ProbeNodeError, SweepCandidate};
-use super::{CommandReadyPendingCandidate, FailedCleanupCandidate, SweepSink};
+use super::{CommandReadyPendingCandidate, FailedCleanupCandidate, RevertedToSuspended, SweepSink};
+use pplx_space_api::controllers::substrate::AbandonedRestoreRetirement;
 
 /// Max preserved `command_ready_pending` rows resolved per tick. Each costs one
 /// non-recovering guest probe (bounded by the configured probe timeout), so the
@@ -169,9 +170,11 @@ const LIFECYCLE_WRITE_TOKEN: &str = "to_char(lifecycle_changed_at, 'YYYY-MM-DD H
 
 /// Put a reverted row back, bound to the revert's own write.
 ///
-/// Restores `preserve_local_artifact_on_restore_failure` alongside the
-/// lifecycle: leaving `restoring` fired `sandboxes_clear_restore_lease`, which
-/// clears it, and a fork restore that came back without its preservation
+/// Restores the `placement_changed_at` a retiring revert cleared (a clock
+/// still set, by a lifecycle-only revert or a pod bind since, is kept), and
+/// `preserve_local_artifact_on_restore_failure` alongside the lifecycle:
+/// leaving `restoring` fired `sandboxes_clear_restore_lease`, which clears
+/// it, and a fork restore that came back without its preservation
 /// contract could discard the local artifact it was supposed to keep. The
 /// lease itself is deliberately *not* restored — another actor may hold one by
 /// now.
@@ -179,7 +182,8 @@ pub(crate) fn undo_revert_to_suspended_query() -> String {
     format!(
         "UPDATE sandboxes
             SET lifecycle = $3,
-                preserve_local_artifact_on_restore_failure = $5
+                preserve_local_artifact_on_restore_failure = $5,
+                placement_changed_at = COALESCE(placement_changed_at, $6)
           WHERE id = $1
             AND managed_by = $2
             AND lifecycle = 'suspended'
@@ -329,10 +333,26 @@ pub(crate) struct AgedTransientRow {
 /// upgraded with what the substrate currently sees.
 ///
 /// The persisted UID cannot tell a pod that *moved*: a Pending pod becoming
-/// Running keeps its UID, and that is precisely the recovery this sweep must
-/// not destroy — its evidence is a node probe, and a pod coming up after that
-/// probe invalidates it. A resourceVersion observed here, before the probe and
-/// the CAS, is what the substrate re-checks at teardown to notice.
+/// Running keeps its UID, and the sweep's evidence that the sandbox has no
+/// live runtime is a node probe, which a pod coming up after it invalidates.
+/// A resourceVersion observed here, before the probe and the CAS, is what the
+/// substrate re-checks to notice.
+///
+/// The revert to `suspended` re-checks it once, before its CAS
+/// (`retire_fence_mismatch`). With abandoned-restore retirement disabled (the
+/// default), the cleanup then retires the still-active execution under this
+/// fence and refuses a pod that came up since, and the revert is undone.
+/// Enabled, the revert retires the execution in the CAS's own transaction,
+/// and a restore pod that binds after that check is the abandoned
+/// restore's leftover: the restore's lease has expired, its row aged past the
+/// sweep's window, and the revert's snapshot proof says restore selection
+/// picks a durable pre-restore source. So the cleanup deletes it, the row
+/// stays `suspended`, and the next wake restores from that source. The row
+/// never reached `started`, and no user request reached its VM: the API's
+/// access, runtime-client, ingress and data-plane route paths never dial a
+/// `restoring` sandbox's pod, so nothing it holds is newer than the source.
+/// That holds only once every routing replica runs those paths, which is why
+/// retirement stays disabled until then (see `AbandonedRestoreRetirement`).
 ///
 /// The observation may only *confirm* the row's persisted UID, never replace
 /// it. The row is read by one query and the pods by a later one, so a row that
@@ -603,7 +623,32 @@ pub(crate) fn converge_restoring_query() -> String {
 /// * the suspended-revert-safe restore snapshot predicate, so a late artifact
 ///   published by a failed restore branch can't become the snapshot a later
 ///   suspended restore selects.
+///
+/// It also clears `placement_changed_at` (see
+/// [`SweepSink::revert_to_suspended`]).
 pub(crate) fn revert_to_suspended_query() -> String {
+    let ready_snapshot = restore_retry_suspended_revert_snapshot_exists("sandboxes");
+    format!(
+        "UPDATE sandboxes
+            SET lifecycle = 'suspended',
+                placement_changed_at = NULL
+          WHERE managed_by = $1
+            AND lifecycle = $2
+            AND lifecycle = 'restoring'
+            AND lifecycle_changed_at < NOW() - make_interval(secs => $3::BIGINT)
+            AND (restore_lease_expires_at IS NULL
+                 OR restore_lease_expires_at < NOW() - make_interval(secs => $3::BIGINT))
+            AND ({ready_snapshot})
+            AND id = $4
+          RETURNING {LIFECYCLE_WRITE_TOKEN}"
+    )
+}
+
+/// [`revert_to_suspended_query`] with abandoned-restore retirement disabled:
+/// the same guards, moving only the lifecycle. The execution, placement and
+/// placement clock stay, and the cleanup that follows retires the execution
+/// under the candidate's fence, refusing a pod that came up since.
+pub(crate) fn revert_to_suspended_lifecycle_only_query() -> String {
     let ready_snapshot = restore_retry_suspended_revert_snapshot_exists("sandboxes");
     format!(
         "UPDATE sandboxes
@@ -618,6 +663,80 @@ pub(crate) fn revert_to_suspended_query() -> String {
             AND id = $4
           RETURNING {LIFECYCLE_WRITE_TOKEN}"
     )
+}
+
+/// Retire the reverted restore's execution as `replaced` inside the revert
+/// CAS's transaction, matching the identity the candidate select recorded
+/// (see [`SweepSink::revert_to_suspended`]). A crash, error or refusal
+/// between a revert and a separate retire would leave a `suspended` row with
+/// its same-generation execution still active, which nothing revisits.
+///
+/// Returns `false`, and the caller rolls the revert back, when the active
+/// execution is no longer the one the candidate observed.
+async fn retire_reverted_restore_execution(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    sandbox_id: SandboxId,
+    fence: &PodIdentityFence,
+) -> Result<bool, sqlx::Error> {
+    if fence.recorded == RecordedExecution::Unread {
+        return Ok(false);
+    }
+    let retired = sqlx::query(sql!(
+        "UPDATE sandbox_k8s_executions
+            SET active = FALSE,
+                state = 'replaced',
+                pod_ip = NULL,
+                terminated_at = COALESCE(terminated_at, NOW()),
+                updated_at = NOW()
+          WHERE sandbox_id = $1
+            AND active
+            AND pod_name = $2
+            AND generation IS NOT DISTINCT FROM $3
+            AND activation_attempt_id IS NOT DISTINCT FROM $4
+            AND NULLIF(BTRIM(pod_uid), '') IS NOT DISTINCT FROM $5::TEXT
+            AND route_activation_id IS NOT DISTINCT FROM $6"
+    ))
+    .bind(sandbox_id)
+    .bind(fence.pod_name.as_str())
+    .bind(fence.generation)
+    .bind(fence.activation_attempt_id)
+    .bind(fence.recorded.pod_uid().map(PodUid::as_str))
+    .bind(fence.recorded.route_activation_id())
+    .execute(&mut **tx)
+    .await?
+    .rows_affected()
+        == 1;
+    if retired {
+        // The retired execution no longer places the row. The cleanup that
+        // follows unplaces it too, but it is best-effort, and a `suspended`
+        // row left reading as placed is one nothing revisits.
+        sqlx::query(sql!(
+            "UPDATE sandboxes
+                SET placement = 'unplaced',
+                    active_node_id = NULL
+              WHERE id = $1"
+        ))
+        .bind(sandbox_id)
+        .execute(&mut **tx)
+        .await?;
+        // The node state the open exposures described died with the runtime.
+        sqlx::query(sql!(
+            "UPDATE sandbox_port_exposures
+                SET apply_state = 'pending',
+                    last_applied_node_id = NULL,
+                    last_error = NULL,
+                    last_bridge_status = NULL,
+                    last_applied_bridge_generation = NULL,
+                    last_observed_at = NULL,
+                    updated_at = NOW()
+              WHERE sandbox_id = $1
+                AND desired_state = 'open'"
+        ))
+        .bind(sandbox_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(retired)
 }
 
 /// Shared predicate for the unrestorable-`restoring` sweep: a markerless
@@ -737,6 +856,8 @@ pub struct SubstrateSweepSink {
     /// replaced node-api pod gets a fresh connection. Probing is sequential,
     /// so the `tokio::sync::Mutex` is uncontended.
     probe_clients: tokio::sync::Mutex<HashMap<String, CachedProbeClient>>,
+    /// See [`super::ReconcilerConfig::abandoned_restore_retirement`].
+    abandoned_restore_retirement: AbandonedRestoreRetirement,
 }
 
 #[derive(Clone)]
@@ -768,7 +889,18 @@ impl SubstrateSweepSink {
             pool,
             substrate,
             probe_clients: tokio::sync::Mutex::new(HashMap::new()),
+            abandoned_restore_retirement: AbandonedRestoreRetirement::Disabled,
         }
+    }
+
+    /// Whether [`SweepSink::revert_to_suspended`] retires the abandoned
+    /// restore's execution. Disabled by default.
+    pub fn with_abandoned_restore_retirement(
+        mut self,
+        retirement: AbandonedRestoreRetirement,
+    ) -> Self {
+        self.abandoned_restore_retirement = retirement;
+        self
     }
 
     async fn probe_client(
@@ -1061,7 +1193,7 @@ impl SweepSink for SubstrateSweepSink {
         &self,
         sandbox_id: SandboxId,
         lifecycle: SandboxLifecycle,
-        write_token: &str,
+        reverted: &RevertedToSuspended,
         preserve_local_artifact: bool,
     ) -> Result<bool, sqlx::Error> {
         let managed_by = self.substrate.managed_by();
@@ -1075,8 +1207,9 @@ impl SweepSink for SubstrateSweepSink {
         .bind(sandbox_id)
         .bind(managed_by)
         .bind(lifecycle.to_string())
-        .bind(write_token)
+        .bind(&reverted.write_token)
         .bind(preserve_local_artifact)
+        .bind(reverted.prior_placement_changed_at)
         .fetch_optional(&self.pool)
         .await?;
         Ok(restored.is_some())
@@ -1087,17 +1220,84 @@ impl SweepSink for SubstrateSweepSink {
         sandbox_id: SandboxId,
         lifecycle: SandboxLifecycle,
         age: PositiveDuration,
-    ) -> Result<Option<String>, sqlx::Error> {
+        fence: &RetireFence,
+    ) -> Result<Option<RevertedToSuspended>, sqlx::Error> {
         let managed_by = self.substrate.managed_by();
-        let claimed =
-            sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql!(revert_to_suspended_query())))
-                .bind(managed_by)
-                .bind(lifecycle.to_string())
-                .bind(Self::age_secs_bind(age))
+        let mut tx = self.pool.begin().await?;
+        // Take the sandbox row lock that every execution claim also takes, so
+        // the execution check below can't race a new claim, and read the
+        // placement clock the CAS clears while holding it.
+        let prior_placement_changed_at: Option<Option<time::OffsetDateTime>> =
+            sqlx::query_scalar(sql!(
+                "SELECT placement_changed_at
+                   FROM sandboxes
+                  WHERE id = $1
+                    AND managed_by = $2
+                    FOR UPDATE"
+            ))
+            .bind(sandbox_id)
+            .bind(managed_by)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(prior_placement_changed_at) = prior_placement_changed_at else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let retire = self.abandoned_restore_retirement.is_enabled();
+        let query = if retire {
+            revert_to_suspended_query()
+        } else {
+            revert_to_suspended_lifecycle_only_query()
+        };
+        let claimed = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql!(query.as_str())))
+            .bind(managed_by)
+            .bind(lifecycle.to_string())
+            .bind(Self::age_secs_bind(age))
+            .bind(sandbox_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(write_token) = claimed else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        if !retire {
+            // The cleanup retires the execution afterwards, under the fence.
+            tx.commit().await?;
+            return Ok(Some(RevertedToSuspended {
+                write_token,
+                prior_placement_changed_at,
+            }));
+        }
+        let execution_settled = match fence {
+            RetireFence::Pod(pod_fence) => {
+                retire_reverted_restore_execution(&mut tx, sandbox_id, pod_fence).await?
+            }
+            RetireFence::NoExecution => {
+                !sqlx::query_scalar::<_, bool>(sql!(
+                    "SELECT EXISTS (
+                     SELECT 1
+                       FROM sandbox_k8s_executions
+                      WHERE sandbox_id = $1
+                        AND active
+                 )"
+                ))
                 .bind(sandbox_id)
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(claimed)
+                .fetch_one(&mut *tx)
+                .await?
+            }
+            // The candidate select always observes one of the two above; a
+            // caller that observed nothing can't name the execution to retire.
+            RetireFence::Unobserved => false,
+        };
+        if !execution_settled {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        tx.commit().await?;
+        Ok(Some(RevertedToSuspended {
+            write_token,
+            prior_placement_changed_at,
+        }))
     }
 
     async fn fail_aged_candidate(

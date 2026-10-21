@@ -170,3 +170,53 @@ async fn stalled_current_worker_leaves_time_for_delegated_recovery() {
         .await
         .unwrap();
 }
+
+/// A session whose stored route is stale is re-pointed by `update_route_row`,
+/// which re-reads the sandbox. A suspend and a restore can commit between the
+/// resolver's first read, which saw the sandbox `started`, and that update; the
+/// refreshed row then names the restoring replacement, and must be refused
+/// retryably rather than signed and returned.
+#[tokio::test(flavor = "current_thread")]
+async fn a_route_refresh_refuses_a_sandbox_that_started_restoring()
+-> pplx_space_test_env::TestResult {
+    let Some(db) = pplx_space_db_test_fixtures::try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let pool = &db.pool;
+    let node_id = NodeId::new();
+    let sandbox_id = SandboxId::new();
+    let session_id = format!("term_{}", uuid::Uuid::now_v7());
+    crate::tests::insert_data_plane_worker_node(pool, node_id, "10.0.0.45").await?;
+    crate::tests::insert_data_plane_active_sandbox(pool, sandbox_id, node_id).await?;
+    crate::tests::insert_active_execution(pool, sandbox_id, "10.80.0.45", 2).await?;
+    crate::tests::insert_data_plane_session(pool, &session_id, sandbox_id).await?;
+    let first = route_rows::fetch_route_row(pool, &session_id, None).await?;
+    assert_eq!(first.sandbox_lifecycle, SandboxLifecycle::Started);
+    // A same-node suspend and restore commit after that read.
+    sqlx::query("UPDATE sandboxes SET lifecycle = 'restoring' WHERE id = $1")
+        .bind(sandbox_id)
+        .execute(pool)
+        .await?;
+
+    let refreshed =
+        route_rows::update_route_row(pool, &session_id, node_id, "10.0.0.45:50051", "grpc").await;
+
+    let error = refreshed.expect_err("a restoring sandbox must not be routed to");
+    assert_eq!(error.code(), tonic::Code::Unavailable, "{error:?}");
+    assert!(error.message().contains("restoring"), "{error:?}");
+    // The refused refresh changed no route.
+    let after = route_rows::fetch_route_row(pool, &session_id, None).await?;
+    assert_eq!(
+        (
+            after.route_generation,
+            after.current_node_id,
+            after.backend_endpoint
+        ),
+        (
+            first.route_generation,
+            first.current_node_id,
+            first.backend_endpoint
+        )
+    );
+    Ok(())
+}

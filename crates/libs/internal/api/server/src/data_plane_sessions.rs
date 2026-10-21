@@ -95,6 +95,23 @@ fn activation_may_repair(ingress: bool, error: &Status) -> bool {
         )
 }
 
+/// No data-plane route resolves to a sandbox that is `restoring`: its
+/// restore can still fail and be rolled back, and the rollback retires the
+/// execution and deletes its pod, discarding whatever it served. The
+/// resolvers turn this refusal into a wait on the restore through the
+/// activation owner, then retry, and return it (retryable `Unavailable`)
+/// when the restore didn't reach `started` in their budget.
+fn refuse_restoring_route(lifecycle: SandboxLifecycle) -> Result<(), Status> {
+    if lifecycle == SandboxLifecycle::Restoring {
+        Err(sandbox_service_route_not_ready_status(
+            Code::Unavailable,
+            "sandbox is restoring; retry once the restore completes",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn require_started_ingress(lifecycle: SandboxLifecycle) -> Result<(), Status> {
     if lifecycle == SandboxLifecycle::Started {
         Ok(())

@@ -25,6 +25,13 @@
 //! Process death during the redrive still loses the write; the sweeper
 //! remains the backstop, exactly as `CancelGuard` defers to the reconciler
 //! when it cannot clean up itself.
+//!
+//! On Kubernetes the restore's owner commits `started` in the substrate under
+//! its own lease token before the wake returns
+//! (`K8sStore::complete_owned_user_restore`, this module's CAS with the
+//! lease-expiry guard replaced by that token). The shield covers the wakes
+//! whose owner commit didn't land, and a redrive that finds the row already
+//! `started` has nothing left to do.
 
 use pplx_space_common_core::sql;
 use std::sync::{Arc, LazyLock};
