@@ -17,8 +17,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 # internal
-pplx-space-common-core = { workspace = true }
 pplx-space-common-svc = { workspace = true, features = ["migration-checksums"] }
+pplx-space-sql-locator = { workspace = true }
 
 [dev-dependencies]
 hex = { workspace = true }

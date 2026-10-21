@@ -6,6 +6,9 @@
 //! that issued it. The comment is a single whitespace-free token, so it
 //! survives `track_activity_query_size` truncation (it leads the statement)
 //! and consumes only one word of sqlx's word-based query summary.
+//!
+//! It is its own crate, with no dependencies, so a crate that needs only the
+//! locator does not depend on `pplx-space-common-core` for it.
 
 /// Prepend a `/*module_path:line*/` locator comment to a SQL statement.
 ///
@@ -18,7 +21,7 @@
 /// # Examples
 ///
 /// ```rust
-/// use pplx_space_common_core::sql;
+/// use pplx_space_sql_locator::sql;
 ///
 /// let static_sql: &'static str = sql!("SELECT 1");
 /// assert!(static_sql.starts_with("/*"));

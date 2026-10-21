@@ -22,6 +22,7 @@ pplx-space-durations = { workspace = true }
 pplx-space-env-vars = { workspace = true }
 pplx-space-net-common = { workspace = true }
 pplx-space-semver = { workspace = true }
+pplx-space-sql-locator = { workspace = true }
 rusqlite = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"], optional = true }
 serde_json = { workspace = true, optional = true }

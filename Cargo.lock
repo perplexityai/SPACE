@@ -5379,6 +5379,7 @@ dependencies = [
  "pplx-space-env-vars",
  "pplx-space-net-common",
  "pplx-space-semver",
+ "pplx-space-sql-locator",
  "rusqlite",
  "serde",
  "serde_json",
@@ -7255,13 +7256,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-sql-locator"
+version = "0.8.0"
+
+[[package]]
 name = "pplx-space-sqlite"
 version = "0.8.0"
 dependencies = [
  "hex",
- "pplx-space-common-core",
  "pplx-space-common-svc",
  "pplx-space-observability",
+ "pplx-space-sql-locator",
  "rusqlite",
  "sqlx",
  "tempfile",

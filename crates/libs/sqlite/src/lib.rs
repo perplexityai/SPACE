@@ -10,8 +10,8 @@
 pub mod baselines;
 pub mod runtime_manager;
 
-use pplx_space_common_core::sql;
 use pplx_space_common_svc::sql::migration_checksums::AcceptedChecksums;
+use pplx_space_sql_locator::sql;
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt::Display;

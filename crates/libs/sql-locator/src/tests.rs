@@ -4,7 +4,7 @@ fn literal_form_is_static_and_carries_module_and_line() {
     let sql: &'static str = crate::sql!("SELECT 1");
     assert_eq!(
         sql,
-        format!("/*pplx_space_common_core::sql_locator::tests:{expected_line}*/ SELECT 1")
+        format!("/*pplx_space_sql_locator::tests:{expected_line}*/ SELECT 1")
     );
 }
 
@@ -23,7 +23,7 @@ fn expr_form_prepends_locator_to_runtime_sql() {
     assert_eq!(
         sql,
         format!(
-            "/*pplx_space_common_core::sql_locator::tests:{expected_line}*/ \
+            "/*pplx_space_sql_locator::tests:{expected_line}*/ \
                  DELETE FROM sandboxes"
         )
     );
