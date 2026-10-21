@@ -183,6 +183,18 @@ impl PublicApiError {
         error
     }
 
+    /// An `invalid_request` that names each rejected request field.
+    pub fn invalid_fields(message: impl Into<String>, fields: &[&str]) -> Self {
+        let mut error = Self::bad_request(message);
+        error
+            .details
+            .extend(fields.iter().map(|field| PublicErrorDetail {
+                key: pplx_space_public_api::INVALID_REQUEST_FIELD_DETAIL_KEY.to_string(),
+                value: (*field).to_string(),
+            }));
+        error
+    }
+
     /// A `conflict` that names why it was refused in a `reason` detail.
     pub fn conflict_with_reason(message: impl Into<String>, reason: &str) -> Self {
         let mut error = Self::conflict(message);

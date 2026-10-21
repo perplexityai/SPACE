@@ -722,6 +722,89 @@ async fn binding_survives_a_client_that_disconnects_mid_bind() {
     assert_eq!(fake.bound_process_ids.lock().unwrap().len(), 1);
 }
 
+/// Server-sent events carry no input, so a process session that asks for stdin
+/// or a pty is refused before the worker is asked to start it.
+#[tokio::test]
+async fn events_stream_refuses_process_sessions_that_need_input() {
+    use http_body_util::BodyExt;
+    use prost::Message as _;
+    if !binding_fake_test_process() {
+        return;
+    }
+    for adapter_state in [
+        r#"{"command":["cat"],"stdin":true}"#,
+        r#"{"command":["sh"],"pty":{"rows":24,"cols":80}}"#,
+    ] {
+        let session_id = DataPlaneSessionId::new_for_kind(SessionKind::Process);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let mut route = crate::tests::route_response_with_token(session_id, None);
+        route.backend.as_mut().unwrap().endpoint = endpoint.clone();
+        route.adapter_state_json = adapter_state.to_string();
+        let route = route.encode_to_vec();
+        let calls = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorded = Arc::clone(&calls);
+        let service = axum::Router::new().fallback(move |request: Request<Body>| {
+            let route = route.clone();
+            let recorded = Arc::clone(&recorded);
+            async move {
+                let path = request.uri().path().to_string();
+                recorded.lock().unwrap().push(path.clone());
+                if path.ends_with("/Check") {
+                    return crate::tests::grpc_test_response(vec![8, 1]);
+                }
+                if path.ends_with("/ResolveDataPlaneSessionRoute") {
+                    return crate::tests::grpc_test_response(route);
+                }
+                tonic::Status::unimplemented("not part of this fake").into_http::<Body>()
+            }
+        });
+        tokio::spawn(async move {
+            axum::serve(listener, service).await.unwrap();
+        });
+        let mut state = crate::tests::test_data_plane_state().await;
+        state.cluster_api = ClusterApiClients::service_only(
+            pplx_space_node_api_client::cluster::connect(endpoint, "test")
+                .await
+                .unwrap(),
+        );
+        let token = format!("{DATA_PLANE_TOKEN_PREFIX}{}", "c".repeat(64));
+        let response = tower::ServiceExt::oneshot(
+            router(state.clone()),
+            Request::get(format!("/v1/sessions/{session_id}/events"))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{adapter_state}"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], "invalid_request", "{body}");
+        assert_eq!(body["error"]["retryable"], false, "{body}");
+        let calls = calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|path| path.ends_with("/ResolveDataPlaneSessionRoute")),
+            "{calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|path| path.ends_with("/SpacedStartProcess")),
+            "no process was started: {calls:?}"
+        );
+        assert!(!state.native_sessions.is_active(session_id));
+    }
+}
+
 /// How a fake cluster API answers revocation checks.
 #[derive(Clone, Copy)]
 enum FakeRevocation {

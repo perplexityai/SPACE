@@ -82,6 +82,18 @@ pub(crate) async fn session_events(
     if state.drain_started.is_cancelled() {
         return native_draining_response(session_id.kind().as_str());
     }
+    // Refused before anything starts: the process would wait on input this
+    // stream cannot deliver and outlive the request.
+    if attached.kind == SessionKind::Process && process_session_needs_input(&attached) {
+        return data_plane_http_error(
+            StatusCode::BAD_REQUEST,
+            DataPlaneHttpErrorCode::InvalidRequest,
+            "events stream cannot send input; attach a stdin or pty process session over WebSocket",
+            false,
+            ResponseOrigin::Client,
+            ResponseKind::Validation,
+        );
+    }
     let stream_permit = match state.attached_streams.try_acquire_attached(&attached) {
         Ok(permit) => permit,
         Err(limit) => {

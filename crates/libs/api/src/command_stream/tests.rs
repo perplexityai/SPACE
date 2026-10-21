@@ -145,6 +145,21 @@ async fn post_command(
     idempotency_key: Option<&str>,
     accept: Option<&str>,
 ) -> TestDbResult<Answer> {
+    post_command_body(
+        fixture,
+        idempotency_key,
+        accept,
+        &json!({"command": ["echo", "hello"]}),
+    )
+    .await
+}
+
+async fn post_command_body(
+    fixture: &Fixture,
+    idempotency_key: Option<&str>,
+    accept: Option<&str>,
+    body: &Value,
+) -> TestDbResult<Answer> {
     let mut request = Request::builder()
         .method(Method::POST)
         .uri(&fixture.commands_path)
@@ -156,7 +171,7 @@ async fn post_command(
     if let Some(accept) = accept {
         request = request.header(header::ACCEPT, accept);
     }
-    let body = serde_json::to_vec(&json!({"command": ["echo", "hello"]}))?;
+    let body = serde_json::to_vec(body)?;
     let response = fixture
         .app
         .clone()
@@ -347,6 +362,74 @@ async fn create_errors_are_unchanged_and_never_open_a_stream() -> TestDbResult<(
     assert_eq!(not_found.content_type.as_deref(), Some("application/json"));
 
     assert!(seen.lock().unwrap().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn streamed_commands_that_ask_for_input_are_refused_before_the_create() -> TestDbResult<()> {
+    let (origin, seen) = spawn_data_plane(DataPlaneMode::Stream).await;
+    let fixture = fixture(Some(proxy(&origin))).await?;
+    let pty = json!({"rows": 24, "cols": 80});
+    for (key, body, fields) in [
+        (
+            "stdin",
+            json!({"command": ["cat"], "stdin": true}),
+            vec!["stdin"],
+        ),
+        ("pty", json!({"command": ["sh"], "pty": pty}), vec!["pty"]),
+        (
+            "both",
+            json!({"command": ["sh"], "stdin": true, "pty": pty}),
+            vec!["stdin", "pty"],
+        ),
+    ] {
+        let refused =
+            post_command_body(&fixture, Some(key), Some("text/event-stream"), &body).await?;
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.body);
+        let envelope: Value = serde_json::from_str(&refused.body)?;
+        assert_eq!(envelope["code"], "invalid_request", "{envelope}");
+        assert_eq!(envelope["retryable"], false, "{envelope}");
+        let expected: Vec<Value> = fields
+            .iter()
+            .map(|field| json!({"key": "field", "value": field}))
+            .collect();
+        assert_eq!(envelope["details"], json!(expected), "{envelope}");
+
+        // Nothing was stored under the key: a different body reusing it
+        // creates a command instead of answering idempotency_conflict.
+        let reused = post_command(&fixture, Some(key), None).await?;
+        assert_eq!(reused.status, StatusCode::CREATED, "{}", reused.body);
+        // A JSON create keeps accepting input, for callers that attach over
+        // WebSocket.
+        let json_create =
+            post_command_body(&fixture, Some(&format!("{key}-json")), None, &body).await?;
+        assert_eq!(
+            json_create.status,
+            StatusCode::CREATED,
+            "{}",
+            json_create.body
+        );
+    }
+    assert!(seen.lock().unwrap().is_empty());
+
+    // `stdin: false` asks for no input.
+    let closed_stdin = post_command_body(
+        &fixture,
+        Some("closed-stdin"),
+        Some("text/event-stream"),
+        &json!({"command": ["true"], "stdin": false}),
+    )
+    .await?;
+    assert_eq!(
+        closed_stdin.status,
+        StatusCode::CREATED,
+        "{}",
+        closed_stdin.body
+    );
+    assert_eq!(
+        closed_stdin.content_type.as_deref(),
+        Some("text/event-stream")
+    );
     Ok(())
 }
 

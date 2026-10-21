@@ -151,6 +151,10 @@ pub async fn create_command(
     let sandbox_id = parse_public_sandbox_id(&sandbox_id)?;
     let _sandbox = ensure_sandbox_owner(authorized, &state.pool, org.id, sandbox_id).await?;
     let idempotency_key = idempotency_key(&headers)?;
+    let event_stream = accepts_event_stream(&headers);
+    if event_stream {
+        reject_streamed_input(&request)?;
+    }
     let command = create_command_session(
         &state.public_session_store(),
         org.id,
@@ -162,8 +166,9 @@ pub async fn create_command(
     .await?;
 
     // Streaming is negotiated after the create, so validation, owner scope,
-    // idempotency replay, and their errors are identical in both modes.
-    if accepts_event_stream(&headers)
+    // idempotency replay, and their errors are identical in both modes, apart
+    // from the input check above.
+    if event_stream
         && let Some(proxy) = state.command_stream.as_ref()
         && let Some(response) = proxy.stream(&command).await
     {
@@ -589,6 +594,27 @@ fn validate_terminal_size(size: Option<&TerminalSize>) -> Result<(), PublicApiEr
         ));
     }
     Ok(())
+}
+
+/// Server-sent events carry no input, so a streamed command that asks for
+/// stdin or a terminal would wait on input that never arrives. Checked before
+/// the create, whether or not the stream then opens, so nothing is persisted.
+fn reject_streamed_input(request: &CreateCommandRequest) -> Result<(), PublicApiError> {
+    let fields: Vec<&str> = [
+        ("stdin", request.stdin == Some(true)),
+        ("pty", request.pty.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(field, requested)| requested.then_some(field))
+    .collect();
+    if fields.is_empty() {
+        return Ok(());
+    }
+    Err(PublicApiError::invalid_fields(
+        "an event-stream command cannot use stdin or pty; create it without them, \
+         or attach over WebSocket",
+        &fields,
+    ))
 }
 
 fn validate_process_request(request: &CreateProcessRequest) -> Result<(), PublicApiError> {

@@ -1587,7 +1587,16 @@ pub struct CreateCommandRequest {
     #[cfg_attr(feature = "serde", serde(default))]
     #[cfg_attr(feature = "schema", schemars(schema_with = "schema::environment_map"))]
     pub env: EnvMap,
+    /// Runs the command in a pseudo-terminal of this size. Server-sent events
+    /// carry no input, so a command with `pty` is rejected with
+    /// `invalid_request` when created with `Accept: text/event-stream` or
+    /// attached at `/sessions/{session_id}/events`. Only a WebSocket attach
+    /// can drive it.
     pub pty: Option<TerminalSize>,
+    /// Keeps standard input open for writing. Server-sent events carry no
+    /// input, so `true` is rejected with `invalid_request` when created with
+    /// `Accept: text/event-stream` or attached at
+    /// `/sessions/{session_id}/events`. Only a WebSocket attach can write it.
     pub stdin: Option<bool>,
     /// Guest user to run as. Defaults to the sandbox's configured user.
     #[cfg_attr(
@@ -2010,7 +2019,9 @@ pub struct PublicErrorEnvelope {
     /// the sandbox is yours and the path inside it does not exist; any other
     /// `not_found`, including a missing or unowned sandbox, carries none. A
     /// `conflict` from replaying a session create whose session has ended
-    /// carries `{"key": "reason", "value": "session_ended"}`.
+    /// carries `{"key": "reason", "value": "session_ended"}`. An
+    /// `invalid_request` for a streamed command that asks for input names each
+    /// offending field as `{"key": "field", "value": "stdin"}` or `"pty"`.
     pub details: Vec<PublicErrorDetail>,
 }
 
@@ -2021,6 +2032,10 @@ pub const NOT_FOUND_RESOURCE_DETAIL_KEY: &str = "resource";
 /// a sandbox the caller owns. Never set for the sandbox itself, so a missing
 /// sandbox and another org's sandbox stay indistinguishable.
 pub const NOT_FOUND_RESOURCE_PATH: &str = "path";
+
+/// [`PublicErrorDetail::key`] naming a request field an `invalid_request`
+/// rejects; the value is the field's name.
+pub const INVALID_REQUEST_FIELD_DETAIL_KEY: &str = "field";
 
 /// [`PublicErrorDetail::key`] naming why a `conflict` was refused.
 pub const CONFLICT_REASON_DETAIL_KEY: &str = "reason";
