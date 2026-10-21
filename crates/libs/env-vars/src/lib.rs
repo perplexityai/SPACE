@@ -1,8 +1,9 @@
-//! Shared parsing for boolean ("flag") environment variables.
+//! The [`Environment`] source and shared parsing for flag, destructive-gate
+//! and positive-`f64` environment variables.
 //!
 //! SPACE services read on/off knobs from env vars in many places, and each
 //! call site historically re-invented the truthy/falsy vocabulary with a
-//! local `matches!`. This module is the single vocabulary:
+//! local `matches!`. This crate is the single vocabulary:
 //!
 //! - truthy: `1`, `true`, `yes`, `on`, `enabled`
 //! - falsy: `0`, `false`, `no`, `off`, `disabled`
