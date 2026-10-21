@@ -234,6 +234,17 @@ clusterActivationAdmission:
 clientConcurrency:
   mode: "observe"
 
+# Native operations the manifest hides by default (docs/configuration.md):
+# `orgs` is SPACE_NATIVE_HIDDEN_OPERATIONS_ORGS, `*` or comma-separated org
+# ids; `flagEnabled` is the space-native-hidden-operations flag's env master.
+# Both empty, so the binary's defaults stand: no org listed, master on. Keep
+# `orgs` empty here, since infra/space/cluster installs this chart too: set it
+# per install, for example `--set nativeHiddenOperations.orgs=<org id>` on a
+# local bench that needs snapshots in the console.
+nativeHiddenOperations:
+  orgs: ""
+  flagEnabled: ""
+
 # The store both limiters keep their state in: the space-redis Deployment
 # (charts/space-redis-local). Each limiter reads SPACE_REDIS_URL when the
 # process builds its state, above the `--surface` branch
