@@ -904,6 +904,32 @@ impl PublicOperationStore {
         fail_claimed_operation(&self.pool, input).await
     }
 
+    /// Record an operation claimed for the first time as `expired` rather
+    /// than run it: the terminal write [`Self::fail_claimed_operation`]
+    /// makes, in the `expired` state, with an `operation.expired` event. The
+    /// claim's attempt and start are undone, as the operation never ran. Its
+    /// `operation.claimed` event stays, already committed with the claim and
+    /// possibly read, so the history reads claimed, then expired.
+    pub async fn expire_claimed_operation(
+        &self,
+        input: ExpirePublicOperation,
+        claim_token: &str,
+    ) -> Result<bool, PublicOperationStoreError> {
+        expire_claimed_operation(&self.pool, input, claim_token).await
+    }
+
+    /// Expire up to `input.limit` of the oldest queued operations of
+    /// `input.kinds` created more than `input.max_age` ago that have never
+    /// started, whatever holds them back, recording for each the terminal
+    /// error `expiry` builds. Returns the operations expired.
+    pub async fn expire_overdue_queued_operations(
+        &self,
+        input: OverdueQueuedPublicOperations<'_>,
+        expiry: impl Fn(&OverdueQueuedPublicOperation) -> ExpirePublicOperation,
+    ) -> Result<Vec<OverdueQueuedPublicOperation>, PublicOperationStoreError> {
+        expire_overdue_queued_operations(&self.pool, input, expiry).await
+    }
+
     pub async fn release_claimed_operation(
         &self,
         input: ReleaseClaimedPublicOperation,
@@ -1068,7 +1094,9 @@ async fn claim_created_operation_tx(
                    payload_json,
                    attempts,
                    claim_generation,
-                   traceparent"
+                   traceparent,
+                   FLOOR(EXTRACT(EPOCH FROM NOW() - created_at))::BIGINT
+                       AS age_at_first_claim_secs"
     ))
     .bind(operation_id.as_uuid())
     .bind(&claim_token)
@@ -1292,6 +1320,10 @@ pub struct ClaimedPublicOperation {
     /// each attempt links to. `None` for an operation created outside a
     /// traced request or before the column existed.
     pub traceparent: Option<String>,
+    /// How many whole seconds ago the operation was created, by the database
+    /// clock, when this claim, its first start, took it. `None` once the
+    /// operation has started before, including a reclaimed stale claim.
+    pub age_at_first_claim_secs: Option<u32>,
 }
 
 impl ClaimedPublicOperation {
@@ -1381,6 +1413,32 @@ pub struct FailClaimedPublicOperation {
     pub progress_message: String,
     pub terminal_error_code: PublicErrorCode,
     pub terminal_error_json: serde_json::Value,
+}
+
+/// The terminal record of an operation that passed its deadline before it
+/// could run.
+#[derive(Debug, Clone)]
+pub struct ExpirePublicOperation {
+    pub operation_id: OperationId,
+    pub progress_message: String,
+    pub terminal_error_code: PublicErrorCode,
+    pub terminal_error_json: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct OverdueQueuedPublicOperations<'a> {
+    pub api_product: ApiProduct,
+    pub kinds: &'a [OperationKind],
+    pub max_age: Duration,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct OverdueQueuedPublicOperation {
+    pub id: OperationId,
+    pub kind: OperationKind,
+    pub attempts: i32,
+    pub progress_message: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1683,7 +1741,8 @@ async fn claim_operations(
          picked AS (
              SELECT candidate.operation_id,
                     GREATEST(candidate.requested_at, candidate.next_attempt_at) AS claimable_at,
-                    candidate.claim_token <> '' AS reclaimed
+                    candidate.claim_token <> '' AS reclaimed,
+                    candidate.started_at IS NULL AS first_start
              FROM public_operations candidate
              WHERE candidate.state IN ($4, $5)
                AND candidate.kind = ANY($6)
@@ -1722,6 +1781,9 @@ async fn claim_operations(
                    o.attempts,
                    o.claim_generation,
                    o.traceparent,
+                   CASE WHEN picked.first_start
+                       THEN FLOOR(EXTRACT(EPOCH FROM NOW() - o.created_at))::BIGINT
+                   END AS age_at_first_claim_secs,
                    (EXTRACT(EPOCH FROM NOW() - picked.claimable_at) * 1000)::DOUBLE PRECISION
                        AS queue_wait_ms,
                    picked.reclaimed"
@@ -1874,6 +1936,174 @@ async fn fail_claimed_operation(
     }
     tx.commit().await?;
     Ok(updated.is_some())
+}
+
+async fn expire_claimed_operation(
+    pool: &PgPool,
+    input: ExpirePublicOperation,
+    claim_token: &str,
+) -> Result<bool, PublicOperationStoreError> {
+    let mut tx = pool.begin().await?;
+    let updated = sqlx::query_scalar::<_, Uuid>(sql!(
+        "UPDATE public_operations
+         SET state = $3,
+             claim_token = '',
+             attempts = GREATEST(attempts - 1, 0),
+             started_at = NULL,
+             completed_at = NOW(),
+             progress_message = $4,
+             terminal_error_code = $5,
+             terminal_error_json = $6,
+             payload_json = CASE WHEN kind = 'create_sandbox'
+                 THEN payload_json #- '{federated_create,service_grant_base64}'::text[]
+                 ELSE payload_json END,
+             updated_at = NOW()
+         WHERE operation_id = $1
+           AND claim_token = $2
+           AND state = $7
+         RETURNING operation_id"
+    ))
+    .bind(input.operation_id.as_uuid())
+    .bind(claim_token)
+    .bind(OperationState::Expired.as_str())
+    .bind(&input.progress_message)
+    .bind(input.terminal_error_code.as_str())
+    .bind(Json(input.terminal_error_json.clone()))
+    .bind(OperationState::Running.as_str())
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    if updated.is_some() {
+        append_operation_event_tx(
+            &mut tx,
+            input.operation_id,
+            PublicOperationEventType::Expired,
+            expired_event(&input),
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(updated.is_some())
+}
+
+fn expired_event(input: &ExpirePublicOperation) -> serde_json::Value {
+    serde_json::json!({
+        "state": OperationState::Expired.as_str(),
+        "code": input.terminal_error_code.as_str(),
+        "error": input.terminal_error_json,
+    })
+}
+
+async fn expire_overdue_queued_operations(
+    pool: &PgPool,
+    input: OverdueQueuedPublicOperations<'_>,
+    expiry: impl Fn(&OverdueQueuedPublicOperation) -> ExpirePublicOperation,
+) -> Result<Vec<OverdueQueuedPublicOperation>, PublicOperationStoreError> {
+    let kind_labels = input
+        .kinds
+        .iter()
+        .map(|kind| kind.as_str().to_string())
+        .collect::<Vec<_>>();
+    let mut tx = pool.begin().await?;
+    // Locked, so nothing claims them between this read and the write below.
+    let rows = sqlx::query_as::<_, (Uuid, String, i32, String)>(sql!(
+        "SELECT operation_id, kind, attempts, progress_message
+         FROM public_operations
+         WHERE state = $1
+           AND claim_token = ''
+           AND started_at IS NULL
+           AND api_product = $2
+           AND kind = ANY($3)
+           AND created_at <= NOW() - make_interval(secs => $4::BIGINT)
+         ORDER BY created_at, operation_id
+         LIMIT $5
+         FOR UPDATE SKIP LOCKED"
+    ))
+    .bind(OperationState::Queued.as_str())
+    .bind(input.api_product.as_str())
+    .bind(&kind_labels)
+    .bind(duration_secs_i64(input.max_age))
+    .bind(i64::from(input.limit))
+    .fetch_all(&mut *tx)
+    .await?;
+    if rows.is_empty() {
+        tx.rollback().await?;
+        return Ok(Vec::new());
+    }
+    let overdue = rows
+        .into_iter()
+        .map(|(operation_id, kind, attempts, progress_message)| {
+            Ok(OverdueQueuedPublicOperation {
+                id: OperationId::from_uuid(operation_id),
+                kind: parse_stored_enum("kind", &kind)?,
+                attempts,
+                progress_message,
+            })
+        })
+        .collect::<Result<Vec<_>, PublicOperationStoreError>>()?;
+    let expiries = overdue.iter().map(&expiry).collect::<Vec<_>>();
+    let ids = expiries
+        .iter()
+        .map(|expiry| expiry.operation_id.as_uuid())
+        .collect::<Vec<_>>();
+    let messages = expiries
+        .iter()
+        .map(|expiry| expiry.progress_message.clone())
+        .collect::<Vec<_>>();
+    let codes = expiries
+        .iter()
+        .map(|expiry| expiry.terminal_error_code.as_str().to_string())
+        .collect::<Vec<_>>();
+    let errors = expiries
+        .iter()
+        .map(|expiry| Json(expiry.terminal_error_json.clone()))
+        .collect::<Vec<_>>();
+    let events = expiries
+        .iter()
+        .map(|expiry| Json(expired_event(expiry)))
+        .collect::<Vec<_>>();
+    sqlx::query(sql!(
+        "UPDATE public_operations o
+         SET state = $1,
+             completed_at = NOW(),
+             progress_message = expiry.progress_message,
+             terminal_error_code = expiry.terminal_error_code,
+             terminal_error_json = expiry.terminal_error_json,
+             payload_json = CASE WHEN o.kind = 'create_sandbox'
+                 THEN o.payload_json #- '{federated_create,service_grant_base64}'::text[]
+                 ELSE o.payload_json END,
+             updated_at = NOW()
+         FROM UNNEST($2::UUID[], $3::TEXT[], $4::TEXT[], $5::JSONB[])
+              AS expiry(operation_id, progress_message, terminal_error_code, terminal_error_json)
+         WHERE o.operation_id = expiry.operation_id"
+    ))
+    .bind(OperationState::Expired.as_str())
+    .bind(&ids)
+    .bind(&messages)
+    .bind(&codes)
+    .bind(&errors)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(sql!(
+        "INSERT INTO public_operation_events (operation_id, sequence, event_type, event_json)
+         SELECT expired.operation_id,
+                COALESCE(
+                    (SELECT MAX(event.sequence)
+                     FROM public_operation_events event
+                     WHERE event.operation_id = expired.operation_id),
+                    0
+                ) + 1,
+                $3,
+                expired.event_json
+         FROM UNNEST($1::UUID[], $2::JSONB[]) AS expired(operation_id, event_json)"
+    ))
+    .bind(&ids)
+    .bind(&events)
+    .bind(PublicOperationEventType::Expired.as_str())
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(overdue)
 }
 
 async fn release_claimed_operation(
@@ -2223,6 +2453,7 @@ struct ClaimedPublicOperationRow {
     attempts: i32,
     claim_generation: i64,
     traceparent: Option<String>,
+    age_at_first_claim_secs: Option<i64>,
 }
 
 #[derive(Debug, FromRow)]
@@ -2393,6 +2624,9 @@ impl TryFrom<ClaimedPublicOperationRow> for ClaimedPublicOperation {
             traceparent: row.traceparent.filter(|traceparent| {
                 pplx_space_observability::is_storable_traceparent(traceparent)
             }),
+            age_at_first_claim_secs: row
+                .age_at_first_claim_secs
+                .map(|secs| u32::try_from(secs.max(0)).unwrap_or(u32::MAX)),
         })
     }
 }

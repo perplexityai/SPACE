@@ -149,6 +149,7 @@ fn tick_report_merge_sums_outcomes_without_claim_double_counting() {
         failed: 2,
         retried: 3,
         stale_claims: 4,
+        expired: 5,
     });
 
     assert_eq!(
@@ -159,6 +160,7 @@ fn tick_report_merge_sums_outcomes_without_claim_double_counting() {
             failed: 2,
             retried: 3,
             stale_claims: 4,
+            expired: 5,
         }
     );
 }
@@ -736,9 +738,12 @@ async fn success_after_native_m1_age_threshold_still_wins() -> TestResult {
         "sbx_late_success",
     )
     .await?;
-    backdate_operations(&db.pool, &[operation_id]).await?;
+    let executor = AgesWhileRunning {
+        pool: db.pool.clone(),
+        inner: AlwaysSuccessExecutor,
+    };
 
-    let report = tick(&single_claim_config(), &store, &AlwaysSuccessExecutor).await?;
+    let report = tick(&single_claim_config(), &store, &executor).await?;
 
     assert_eq!(report.succeeded, 1);
     let state: String = sqlx::query_scalar(sql!(
@@ -785,6 +790,7 @@ async fn native_executor_requeues_create_when_cluster_admission_rejects() -> Tes
         attempts: 1,
         claim_generation: 1,
         traceparent: None,
+        age_at_first_claim_secs: None,
     };
     // Admission sees zero eligible nodes and rejects before any create.
     let executor = direct_native_executor(&db.pool, true, None, EgressProfiles::default());
@@ -914,6 +920,7 @@ async fn native_executor_persists_operator_policy_on_update_and_template_reset()
                 attempts: 1,
                 claim_generation: 1,
                 traceparent: None,
+                age_at_first_claim_secs: None,
             };
             let mut first_generation = None;
             for _ in 0..2 {
@@ -982,7 +989,6 @@ async fn assert_deadline_failure(
         "sbx_expired_m1",
     )
     .await?;
-    backdate_operations(&db.pool, &[operation_id]).await?;
     let config = ReconcilerConfig {
         max_retry_attempts: 10,
         m1_max_age: Some(m1_max_age),
@@ -990,7 +996,15 @@ async fn assert_deadline_failure(
     };
 
     let metrics = pplx_space_metrics::test_capture::capture_counters_guard();
-    let report = tick(&config, &store, &executor).await?;
+    let report = tick(
+        &config,
+        &store,
+        &AgesWhileRunning {
+            pool: db.pool.clone(),
+            inner: executor.clone(),
+        },
+    )
+    .await?;
     let deadline_metric = metrics
         .finish()
         .into_iter()
@@ -1202,6 +1216,33 @@ impl PublicOperationExecutor for FixedExecutor {
             retry_after: Some(Duration::from_secs(1)),
             requeue_reason: self.requeue_reason,
         }
+    }
+}
+
+/// Runs `inner` after backdating the operation past the default M1 deadline,
+/// so the deadline passes while the operation runs rather than before its
+/// claim, which would expire it unrun.
+#[derive(Clone)]
+struct AgesWhileRunning<E> {
+    pool: PgPool,
+    inner: E,
+}
+
+#[async_trait::async_trait]
+impl<E: PublicOperationExecutor> PublicOperationExecutor for AgesWhileRunning<E> {
+    fn supported_kinds(&self) -> &'static [OperationKind] {
+        self.inner.supported_kinds()
+    }
+
+    async fn execute(
+        &self,
+        claim_token: &str,
+        operation: ClaimedPublicOperation,
+    ) -> OperationExecutionResult {
+        backdate_operations(&self.pool, &[operation.id])
+            .await
+            .expect("backdate the running operation");
+        self.inner.execute(claim_token, operation).await
     }
 }
 
@@ -1485,6 +1526,7 @@ fn test_route_ed25519_authority() -> Arc<SpaceApiRouteEd25519Authority> {
     }
 }
 
+mod deadline;
 mod deferral;
 mod keyed_queue;
 

@@ -219,8 +219,11 @@ async fn a_deferred_operation_past_its_window_fails_with_its_existing_error() ->
         "sbx_fenced_wake",
     )
     .await?;
-    age_and_make_due(&db.pool, wake, max_age.as_secs() as i64 + 1).await?;
-    assert_eq!(tick(&config, &store, &executor).await?.failed, 1);
+    let aging = AgesWhileRunning {
+        pool: db.pool.clone(),
+        inner: executor.clone(),
+    };
+    assert_eq!(tick(&config, &store, &aging).await?.failed, 1);
     let (_, _, _, error) = operation_row(&db.pool, wake).await?;
     let error = error.expect("a failed operation carries its error envelope");
     assert_eq!(error["reason"], "operation_deadline_exceeded");
