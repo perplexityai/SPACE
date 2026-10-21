@@ -670,6 +670,26 @@ pub enum SubstrateError {
     LockContention { message: String },
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum DurableSnapshotError {
+    /// No staging or transfer work started; retry the same durable operation.
+    #[error("durable snapshot copy admission is busy")]
+    Backpressure,
+    #[error("node-api durable snapshot creation error: {0}")]
+    NodeRpc(#[source] tonic::Status),
+    #[error(transparent)]
+    Substrate(#[from] SubstrateError),
+}
+
+pub(crate) fn durable_snapshot_rpc_error(error: tonic::Status) -> DurableSnapshotError {
+    if error.code() == tonic::Code::ResourceExhausted
+        && pplx_space_common_grpc::is_refused_before_start(&error)
+    {
+        return DurableSnapshotError::Backpressure;
+    }
+    DurableSnapshotError::NodeRpc(error)
+}
+
 /// Classify a `sqlx` error raised by one of the substrate's own statements.
 ///
 /// A contention SQLSTATE means the statement lost a race and can succeed on
@@ -1272,7 +1292,7 @@ pub trait SubstrateAdapter: Send + Sync {
         target_sandbox_id: SandboxId,
         source_storage_uri: String,
         destination_storage_uri: String,
-    ) -> Result<PublishedDurableSnapshot, SubstrateError> {
+    ) -> Result<PublishedDurableSnapshot, DurableSnapshotError> {
         let endpoint_addr = self.resolve_node_api_endpoint(target).await?;
         let mut node_api = retrying_worker_node_api(&endpoint_addr, Duration::from_secs(30))?;
         let mut client = RetryingWorkerApiClient::new(&mut node_api);
@@ -1303,9 +1323,7 @@ pub trait SubstrateAdapter: Send + Sync {
                 Duration::from_secs(600),
             )
             .await
-            .map_err(|error| SubstrateError::Failed {
-                message: format!("node-api durable snapshot creation error: {error}"),
-            })?
+            .map_err(durable_snapshot_rpc_error)?
             .into_inner();
         let published =
             response
@@ -2623,7 +2641,7 @@ impl SubstrateAdapter for Substrate {
         target_sandbox_id: SandboxId,
         source_storage_uri: String,
         destination_storage_uri: String,
-    ) -> Result<PublishedDurableSnapshot, SubstrateError> {
+    ) -> Result<PublishedDurableSnapshot, DurableSnapshotError> {
         match &self.inner {
             Inner::Direct(substrate) => {
                 SubstrateAdapter::create_snapshot_from_durable_artifact(

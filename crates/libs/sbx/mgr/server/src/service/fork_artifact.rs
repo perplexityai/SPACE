@@ -482,9 +482,9 @@ async fn acquire_copy_permit(
 ) -> Result<CopyAdmissionPermit, Status> {
     let started_at = Instant::now();
     let busy = || {
-        pplx_space_common_grpc::rate_limited_status(
-            "fork copy admission is busy; retry the same operation",
-            Some(Duration::from_secs(1)),
+        pplx_space_common_grpc::refused_before_start(
+            Status::resource_exhausted("fork copy admission is busy; retry the same operation"),
+            Duration::from_secs(1),
         )
     };
     let permit = match slots.request(1) {

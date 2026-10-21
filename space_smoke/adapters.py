@@ -6203,14 +6203,11 @@ class _SdkSandbox:
         return _race_request(request, timeout=timeout, gate=gate)
 
     def fork_response(
-        self, *, timeout: int, idempotency_key: str | None = None,
-        request_timeout: float | None = None,
+        self, *, timeout: int, idempotency_key: str | None = None
     ) -> Mapping[str, Any]:
         # The server accepts exactly one child per request today.
         key = idempotency_key or f"space-smoke-fork-{secrets.token_hex(16)}"
-        # Explicit request budgets are independent of the child's lifetime.
-        budget = timeout + 60 if request_timeout is None else request_timeout
-        deadline = time.monotonic() + budget
+        deadline = time.monotonic() + timeout + 60
         for attempt in range(3):
             try:
                 results = _ecw_control_plane_json(

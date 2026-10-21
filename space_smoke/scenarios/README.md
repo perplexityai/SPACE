@@ -69,6 +69,9 @@ timings. It changes no worker limits, faults, or scheduling configuration.
 Use a dedicated bench with headroom for eight children and the sentinel,
 including control-plane and object-store disk space, not only worker resources.
 This is bounded functional evidence, not proof of maximum capacity or a latency SLO.
+Fork calls retain the normal response wait rather than a short client-side
+timeout: the server owns the operation deadline, and cleanup replays the same
+idempotency key if a response is lost.
 
 ## Temporarily omitted lifecycle cases
 

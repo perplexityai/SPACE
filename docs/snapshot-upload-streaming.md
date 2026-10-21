@@ -101,7 +101,11 @@ waiting requests. A waiter gives up after five seconds. A full queue or an
 expired wait returns retryable `ResourceExhausted` with a one-second retry
 hint before allocating staging data or submitting transfers. The fork executor
 requeues the same durable operation, retaining its selected source artifact
-and target identity; admission pressure does not trigger disk-transfer fallback.
+and target identity. Refusals carry the shared before-start marker so RPC hops
+do not retry locally; the executor treats them as workflow waits, without
+spending the transient-failure retry budget, until the fork's hard deadline.
+Unmarked storage and transfer errors retain their bounded failure retries.
+Admission pressure does not trigger disk-transfer fallback.
 Cancelled waiters release their queue places. This bounds copy admission,
 not running VM capacity: target activations retain the shared activation
 limiter, scheduler resource requests, and existing disk admission checks.

@@ -63,7 +63,7 @@ def fork_saturation_safety(test: smoke.KindEcw) -> None:
         started = time.monotonic()
         # The collection pre-arms cleanup and recovers ambiguous replies by
         # replaying the original idempotency key, not by creating a new fork.
-        result = test.sandboxes.fork(test.sandbox, request_timeout=60)
+        result = test.sandboxes.fork(test.sandbox)
         return result, time.monotonic() - started
 
     with ThreadPoolExecutor(max_workers=1) as health:

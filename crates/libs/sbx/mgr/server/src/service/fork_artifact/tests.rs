@@ -312,6 +312,7 @@ async fn copy_admission_bounds_its_queue_wait() {
     };
     assert_eq!(error.code(), tonic::Code::ResourceExhausted);
     assert!(pplx_space_common_grpc::retry_after(&error).is_some());
+    assert!(pplx_space_common_grpc::is_refused_before_start(&error));
 }
 
 #[tokio::test(start_paused = true)]
@@ -346,6 +347,7 @@ async fn copy_admission_rejects_overflow_and_reuses_cancelled_queue_places() {
     };
     assert_eq!(error.code(), tonic::Code::ResourceExhausted);
     assert!(pplx_space_common_grpc::retry_after(&error).is_some());
+    assert!(pplx_space_common_grpc::is_refused_before_start(&error));
 
     drop(queued.pop());
     let mut replacement = Box::pin(acquire_copy_permit(
