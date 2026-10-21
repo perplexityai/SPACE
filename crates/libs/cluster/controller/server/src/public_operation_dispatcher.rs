@@ -10,7 +10,7 @@ use pplx_space_api::fork_operation_executor::ForkSandboxOperationExecutor;
 use pplx_space_api::public_operation_driver::{
     DEFAULT_CLAIM_STALE_AFTER, DEFAULT_M1_MAX_AGE, DEFAULT_MAX_RETRY_ATTEMPTS, DEFAULT_RETRY_AFTER,
     OperationExecutionConfig, OperationExecutor, claim_renewal_interval, drive_claimed_operation,
-    execution_span,
+    execution_span, expire_overdue_queued_operations,
 };
 pub use pplx_space_api::public_operation_driver::{OperationExecutionResult, TickReport};
 use pplx_space_api::public_operations::{
@@ -43,6 +43,11 @@ use crate::env_config;
 const DEFAULT_TICK: Duration = Duration::from_millis(25);
 /// A failing claim fails on every tick; warn about it at most this often.
 const CLAIM_FAILURE_WARN_INTERVAL: Duration = Duration::from_secs(1);
+/// How often the loop expires queued operations past their age deadline that
+/// nothing claims, such as one held back behind its sandbox's running work.
+/// A claimed operation is checked as it is claimed, so this bounds only how
+/// long such an operation can read `queued` past the deadline.
+const EXPIRY_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_CLAIM_LIMIT: u32 = 64;
 const DEFAULT_EXECUTION_CONCURRENCY: usize = 16;
 const MAX_EXECUTION_CONCURRENCY: usize = 128;
@@ -364,6 +369,7 @@ pub async fn run<E>(
     let stale_reclaim_retry_after = claim_renewal_interval(execution_config.claim_stale_after);
     let mut last_claim_failure_warn: Option<Instant> = None;
     let mut suppressed_claim_failures: u64 = 0;
+    let mut last_expiry_sweep: Option<Instant> = None;
 
     loop {
         tokio::select! {
@@ -373,6 +379,21 @@ pub async fn run<E>(
                     finish_execution(joined, &mut busy_keys, &mut task_keys);
                 }
                 pplx_space_metrics::operations::dispatcher_slots(in_flight.len(), concurrency);
+                if last_expiry_sweep.is_none_or(|at| at.elapsed() >= EXPIRY_SWEEP_INTERVAL) {
+                    last_expiry_sweep = Some(Instant::now());
+                    if let Err(error) = expire_overdue_queued_operations(
+                        &store,
+                        execution_config,
+                        config.claim_limit,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            error = %error,
+                            "public-operation-dispatcher could not expire overdue queued operations"
+                        );
+                    }
+                }
                 let free = concurrency.saturating_sub(in_flight.len());
                 if free == 0 {
                     continue;

@@ -152,6 +152,8 @@ _DURATION_SECONDS = {
         "native_recovery.attached_stream_drains_through_data_plane_restart": 60,
         "native_recovery.command_survives_data_plane_restart": 15,
         "native_recovery.queued_create_survives_api_restart": 25,
+        # One local Kind run: two controller rollouts around a 30 s outage.
+        "native_recovery.stale_queued_work_expires_after_controller_outage": 75,
     },
 }
 

@@ -31,6 +31,7 @@ fn claimed_create_operation() -> ClaimedPublicOperation {
         attempts: 1,
         claim_generation: 1,
         traceparent: None,
+        age_at_first_claim_secs: None,
     }
 }
 
@@ -59,6 +60,7 @@ fn claimed_create_operation_for(
         attempts: 1,
         claim_generation: 1,
         traceparent: None,
+        age_at_first_claim_secs: None,
     }
 }
 
@@ -760,6 +762,7 @@ async fn seed_unpinned_create_operation(pool: &PgPool) -> ClaimedPublicOperation
         attempts: 1,
         claim_generation: 1,
         traceparent: None,
+        age_at_first_claim_secs: None,
     }
 }
 
