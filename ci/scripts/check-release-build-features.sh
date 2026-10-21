@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Fail when a release build in docker/Dockerfile.rust-build-common resolves a
-# test-only Cargo feature (`test-hooks` or `test-support`) on any crate.
+# test-only Cargo feature: `test-hooks` or `test-support` on any package, or
+# any `test-*` feature on a package built from this checkout.
 #
 # Why this reads the Dockerfile instead of checking a `-p` selection, as
 # run_sbxmgr_production_checks in run-rust-checks.sh does: the release stages
@@ -12,14 +13,37 @@
 # `cargo chef cook` invocation in the file is read back with its own package
 # and feature selection, and `cargo tree` lists the features each package in
 # that selection resolves to, `-F` ones included. A new release stage is
-# covered without editing this script, and an invocation it cannot read fails
-# the check instead of being skipped.
+# covered without editing this script.
 #
-# `cargo chef cook` runs `cargo build` with the same selection on a skeleton of
-# the same manifests and lockfile, so it resolves the same features. `--bin`
-# and `--release` do not change feature resolution and are dropped. Without a
+# Third-party `test-*` features are out of scope. aws-config turns on
+# `test-util` in aws-credential-types and, through it, the aws-smithy crates,
+# and libdd-data-pipeline turns it on in tokio, all in their normal
+# dependencies upstream. So this check does not claim that a release build
+# carries no test-only feature at all.
+#
+# `cargo chef cook` passes its selection to `cargo build` on a skeleton of the
+# same manifests and lockfile, so it resolves the same features. `--bin` and
+# `--release` do not change feature resolution and are dropped. Without a
 # `--target`, the graph is resolved for every target, a superset of the host
 # the image builds on.
+#
+# The file is read through a small grammar, and anything outside it fails
+# rather than being skipped:
+#   - Instructions are joined across backslash continuations. Comment lines and
+#     blank lines inside one are dropped, as Docker drops them. A parser
+#     directive that changes the escape character, and a SHELL instruction,
+#     fail.
+#   - A RUN is in shell form without a heredoc. A RUN in exec form, or with
+#     `<<` anywhere in it, fails, and so does `cargo` in any other instruction.
+#   - In a RUN, `cargo` is a word of its own. `cargo build` and
+#     `cargo chef cook` are checked. `cargo chef prepare`, `cargo --version`
+#     and `cargo install` without `--path` build nothing from the workspace and
+#     pass. Any other subcommand fails. So does any `cargo` the word scan did
+#     not reach: one inside `$(...)`, backticks or an `sh -c` string, or after
+#     a separator with no space, such as `true;cargo`.
+#   - Every argument of a checked invocation, including the values of options
+#     it drops such as `--bin`, is a literal word: a quoted literal is read as
+#     its contents, and an expansion, glob or redirection fails.
 #
 # Usage: check-release-build-features.sh [DOCKERFILE [WORKSPACE_DIR]]
 set -euo pipefail
@@ -35,17 +59,22 @@ if [ ! -f "${dockerfile}" ]; then
 fi
 shown="${dockerfile#"${REPO_ROOT}/"}"
 
+# A literal word an invocation may carry: no quote, expansion, glob,
+# redirection or separator character.
+LITERAL='^[A-Za-z0-9_./,:=+@-]+$'
+
 # One line per instruction, as "<first line number><TAB><stage><TAB><text>",
-# with backslash continuations joined. Docker drops comment lines, including
-# those inside a continued instruction, so they are dropped here too.
+# with backslash continuations joined.
 instructions() {
     awk '
         /^[[:space:]]*#/ { next }
+        continued && /^[[:space:]]*$/ { next }
         {
             line = $0
             if (!start) start = NR
-            if (sub(/\\[[:space:]]*$/, "", line)) { text = text line " "; next }
+            if (sub(/\\[[:space:]]*$/, "", line)) { text = text line " "; continued = 1; next }
             text = text line
+            continued = 0
             if (toupper(text) ~ /^[[:space:]]*FROM[[:space:]]/) {
                 n = split(text, words, /[[:space:]]+/)
                 for (i = 1; i < n; i++) if (toupper(words[i]) == "AS") stage = words[i + 1]
@@ -53,7 +82,19 @@ instructions() {
             if (text ~ /[^[:space:]]/) print start "\t" stage "\t" text
             text = ""; start = 0
         }
+        END { if (text ~ /[^[:space:]]/) print start "\t" stage "\t" text }
     ' "${dockerfile}"
+}
+
+# The number of times `cargo` appears in $1 as a word of its own, wherever it
+# is: after a space, a separator, `$(`, a backtick or a quote.
+count_cargo() {
+    local rest="$1" count=0
+    while [[ "${rest}" =~ (^|[^A-Za-z0-9_.-])cargo([^A-Za-z0-9_.-]|$)(.*) ]]; do
+        count=$((count + 1))
+        rest="${BASH_REMATCH[3]}"
+    done
+    echo "${count}"
 }
 
 failures=0
@@ -69,37 +110,55 @@ fail() {
 check_selection() {
     local where="$1"
     shift
-    local graph
-    local leaked=()
+    local leaked
     echo "${where}:"
     echo "  cargo tree --locked -e normal,build $*"
-    # Each package with the features it resolved to, one per line. Not the
-    # `-e features` graph: it leaves out the features a selected package's own
-    # `[features]` table turns on, so `-p x -F x/test-hooks` would read clean.
-    # Assigned under errexit so a cargo error fails the check rather than
-    # reading as an empty, clean graph.
-    graph="$(cd "${workspace}" && cargo tree --locked -e normal,build --prefix none \
-        --format $'{p}\t{f}' "$@")"
-    # A blank line separates the trees of several roots.
-    if [ -z "${graph}" ] || awk -F '\t' 'NF == 1 { bad = 1 } END { exit !bad }' <<<"${graph}"; then
-        fail "${where}: cargo tree did not list each package's features"
+    # `{f}` prints each package with the features it resolved to, one per
+    # line. Not the `-e features` graph: it leaves out the features a selected
+    # package's own `[features]` table turns on, so `-p x -F x/test-hooks`
+    # would read clean. One checked pipeline, with no temporary file: awk
+    # rejects a line without the format's tab and an empty graph, and a cargo,
+    # awk or sort failure fails the selection instead of reading as clean. A
+    # blank line separates the trees of several roots. A path package is one
+    # built from this checkout.
+    if ! leaked="$(cd "${workspace}" && cargo tree --locked -e normal,build --prefix none \
+        --format $'{p}\t{f}' "$@" </dev/null | awk -F '\t' '
+            NF == 0 { next }
+            NF == 1 { bad = 1; exit }
+            {
+                packages++
+                sub(/ \(\*\)$/, "", $2)
+                split($1, package, " ")
+                ours = $1 ~ / \(\//
+                n = split($2, features, ",")
+                for (i = 1; i <= n; i++)
+                    if (features[i] == "test-hooks" || features[i] == "test-support" \
+                        || (ours && features[i] ~ /^test-/))
+                        print package[1] " feature \"" features[i] "\""
+            }
+            END { if (bad) exit 3; if (!packages) exit 4 }
+        ' | sort -u)"; then
+        fail "${where}: could not resolve the selection or read its features"
         return
     fi
-    mapfile -t leaked < <(awk -F '\t' '{
-        sub(/ \(\*\)$/, "", $2)
-        split($1, package, " ")
-        n = split($2, features, ",")
-        for (i = 1; i <= n; i++)
-            if (features[i] == "test-hooks" || features[i] == "test-support")
-                print package[1] " feature \"" features[i] "\""
-    }' <<<"${graph}" | sort -u)
     checked=$((checked + 1))
-    if [ "${#leaked[@]}" -gt 0 ]; then
+    if [ -n "${leaked}" ]; then
         fail "${where} enables test-only features:"
-        printf '    %s\n' "${leaked[@]}" >&2
+        printf '    %s\n' "${leaked//$'\n'/$'\n'    }" >&2
     else
         echo "  ok: no test-only features"
     fi
+}
+
+# Read a literal word: a whole quoted literal as its contents. Prints nothing
+# and returns 1 for a word that needs the shell to expand it.
+literal() {
+    local word="$1"
+    if [[ "${word}" =~ ^\"([^\"]*)\"$ || "${word}" =~ ^\'([^\']*)\'$ ]]; then
+        word="${BASH_REMATCH[1]}"
+    fi
+    [[ "${word}" =~ ${LITERAL} ]] || return 1
+    printf '%s\n' "${word}"
 }
 
 # Read the arguments of one `cargo build` or `cargo chef cook` invocation into
@@ -109,45 +168,37 @@ check_invocation() {
     shift
     local selection=() has_target=false arg value
     while [ "$#" -gt 0 ]; do
-        arg="$1"
-        shift
-        # A whole quoted word, such as a quoted feature list, is read as its
-        # contents. Anything else that needs the shell to expand it is not
-        # something this check can resolve.
-        if [[ "${arg}" =~ ^\"([^\"\'\$\`\\]*)\"$ || "${arg}" =~ ^\'([^\']*)\'$ ]]; then
-            arg="${BASH_REMATCH[1]}"
-        fi
-        if [[ "${arg}" == *[\"\'\$\`\\\*\?]* ]]; then
-            fail "${where}: cannot read argument ${arg}"
+        if ! arg="$(literal "$1")"; then
+            fail "${where}: cannot read argument $1"
             return
         fi
+        shift
         case "${arg}" in
-            --locked | --frozen | --offline | --release | -v | --verbose | --timings) ;;
-            --bin | --profile | --recipe-path | -j | --jobs)
-                [ "$#" -gt 0 ] || { fail "${where}: ${arg} has no value"; return; }
-                shift
-                ;;
-            --bin=* | --profile=* | --recipe-path=* | --jobs=*) ;;
-            --bins | --lib) ;;
+            --locked | --frozen | --offline | --release | -v | --verbose | --timings | --bins | --lib) ;;
             --workspace | --all | --all-features | --no-default-features)
                 selection+=("${arg}")
                 ;;
-            -p | --package | -F | --features | --exclude | --target)
-                [ "$#" -gt 0 ] || { fail "${where}: ${arg} has no value"; return; }
-                value="$1"
-                shift
-                if [[ "${value}" =~ ^\"([^\"\'\$\`\\]*)\"$ ]]; then
-                    value="${BASH_REMATCH[1]}"
-                fi
-                if [[ -z "${value}" || "${value}" == -* || "${value}" == *[\"\'\$\`\\\*\?]* ]]; then
-                    fail "${where}: cannot read ${arg} ${value}"
+            --bin | --profile | --recipe-path | -j | --jobs | -p | --package | -F | --features | --exclude | --target)
+                if [ "$#" -eq 0 ] || ! value="$(literal "$1")" || [[ "${value}" == -* ]]; then
+                    fail "${where}: cannot read ${arg} ${1:-without a value}"
                     return
                 fi
-                [ "${arg}" != --target ] || has_target=true
-                selection+=("${arg}" "${value}")
+                shift
+                case "${arg}" in
+                    --bin | --profile | --recipe-path | -j | --jobs) ;;
+                    --target)
+                        has_target=true
+                        selection+=("${arg}" "${value}")
+                        ;;
+                    *) selection+=("${arg}" "${value}") ;;
+                esac
                 ;;
-            --package=* | --features=* | --exclude=* | --target=*)
-                [[ "${arg}" != --target=* ]] || has_target=true
+            --bin=* | --profile=* | --recipe-path=* | --jobs=*) ;;
+            --target=*)
+                has_target=true
+                selection+=("${arg}")
+                ;;
+            --package=* | --features=* | --exclude=*)
                 selection+=("${arg}")
                 ;;
             *)
@@ -164,25 +215,22 @@ check_invocation() {
     check_selection "${where}" "${selection[@]}"
 }
 
-builds=0
-while IFS=$'\t' read -r line_number stage text; do
-    if ! [[ "$(tr '[:lower:]' '[:upper:]' <<<"${text}")" =~ ^[[:space:]]*RUN[[:space:]] ]]; then
-        continue
-    fi
-    if [[ "${text}" != *cargo* ]]; then
-        continue
-    fi
-    if [[ "${text}" == *"<<"* ]]; then
-        fail "${shown}:${line_number} (${stage:-no stage}): cannot read a RUN heredoc that mentions cargo"
-        continue
-    fi
-    read -ra words <<<"${text}"
-    index=0
-    # The `case` branch an invocation sits in, such as the cook's `worker)`.
-    branch=""
+# Check one RUN instruction's shell-form body.
+check_run() {
+    local at="$1" body="$2"
+    local words word index=0 handled=0 expected branch="" where subcommand kind
+    local args=()
+    expected="$(count_cargo "${body}")"
+    [ "${expected}" -gt 0 ] || return 0
+    # Word splitting without globbing: the words are only compared below.
+    set -f
+    # shellcheck disable=SC2206
+    words=(${body})
+    set +f
     while [ "${index}" -lt "${#words[@]}" ]; do
         word="${words[index]}"
         index=$((index + 1))
+        # The `case` branch an invocation sits in, such as the cook's `worker)`.
         if [[ "${word}" =~ ^([A-Za-z0-9_.-]+)\)$ ]]; then
             branch="${BASH_REMATCH[1]}"
             continue
@@ -190,7 +238,8 @@ while IFS=$'\t' read -r line_number stage text; do
         if [ "${word}" != cargo ] && [[ "${word}" != */cargo ]]; then
             continue
         fi
-        where="${shown}:${line_number} (${stage:-no stage}${branch:+, ${branch}})"
+        handled=$((handled + 1))
+        where="${at}${branch:+, ${branch}})"
         subcommand="${words[index]:-}"
         case "${subcommand}" in
             build)
@@ -204,9 +253,7 @@ while IFS=$'\t' read -r line_number stage text; do
                         index=$((index + 2))
                         ;;
                     # Writes the recipe; compiles nothing.
-                    prepare)
-                        continue
-                        ;;
+                    prepare) continue ;;
                     *)
                         fail "${where}: unrecognized cargo chef ${words[index + 1]:-}"
                         continue
@@ -215,14 +262,19 @@ while IFS=$'\t' read -r line_number stage text; do
                 ;;
             # Installs a tool from its registry, outside the workspace graph.
             install)
-                if [[ " ${words[*]:index} " == *" --path "* ]]; then
-                    fail "${where}: cannot read cargo install --path"
-                fi
+                while [ "${index}" -lt "${#words[@]}" ]; do
+                    case "${words[index]}" in
+                        '&&' | '||' | ';;' | ';' | '|' | ')' | *';') break ;;
+                        --path | --path=*)
+                            fail "${where}: cannot read cargo install ${words[index]}"
+                            break
+                            ;;
+                    esac
+                    index=$((index + 1))
+                done
                 continue
                 ;;
-            --version | -V)
-                continue
-                ;;
+            --version | -V) continue ;;
             *)
                 fail "${where}: unrecognized cargo ${subcommand}"
                 continue
@@ -244,7 +296,51 @@ while IFS=$'\t' read -r line_number stage text; do
         builds=$((builds + 1))
         check_invocation "${where} ${kind}" ${args[@]+"${args[@]}"}
     done
-done < <(instructions)
+    if [ "${handled}" -ne "${expected}" ]; then
+        fail "${at}): cargo appears where this check cannot read it, such as inside" \
+            "\$(...), backticks, a quoted command or after a separator with no space"
+    fi
+}
+
+if grep -qiE '^[[:space:]]*#[[:space:]]*escape[[:space:]]*=' "${dockerfile}"; then
+    fail "${shown}: cannot read a file with an escape parser directive"
+fi
+
+# Collected first, so a failure to read the file fails here under errexit.
+parsed="$(instructions)"
+builds=0
+while IFS=$'\t' read -r line_number stage text; do
+    [ -n "${line_number}" ] || continue
+    at="${shown}:${line_number} (${stage:-no stage}"
+    # Leading whitespace, then the instruction keyword.
+    text="${text#"${text%%[![:space:]]*}"}"
+    keyword="${text%%[[:space:]]*}"
+    keyword="${keyword^^}"
+    if [ "${keyword}" = SHELL ]; then
+        fail "${at}): cannot read RUN instructions under a SHELL instruction"
+        continue
+    fi
+    if [ "${keyword}" != RUN ]; then
+        if [ "$(count_cargo "${text}")" -gt 0 ]; then
+            fail "${at}): cannot read cargo in a ${keyword} instruction"
+        fi
+        continue
+    fi
+    if [[ "${text}" == *"<<"* ]]; then
+        fail "${at}): cannot read a RUN with a heredoc"
+        continue
+    fi
+    # The RUN keyword and its options, such as --mount.
+    body="${text:3}"
+    while [[ "${body}" =~ ^[[:space:]]*--[^[:space:]]*(.*)$ ]]; do
+        body="${BASH_REMATCH[1]}"
+    done
+    if [[ "${body}" =~ ^[[:space:]]*\[ ]]; then
+        fail "${at}): cannot read a RUN in exec form"
+        continue
+    fi
+    check_run "${at}" "${body}"
+done < <(printf '%s\n' "${parsed}")
 
 if [ "${builds}" -eq 0 ]; then
     fail "${shown}: found no cargo build or cargo chef cook invocation to check"

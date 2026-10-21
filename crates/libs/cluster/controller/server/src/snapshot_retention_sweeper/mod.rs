@@ -121,7 +121,7 @@ impl ReconcilerConfig {
             enabled: config
                 .truthy_default("SPACE_SNAPSHOT_RETENTION_SWEEPER_ENABLED", default.enabled),
             dry_run: config
-                .truthy_default("SPACE_SNAPSHOT_RETENTION_SWEEPER_DRY_RUN", default.dry_run),
+                .safe_mode_flag("SPACE_SNAPSHOT_RETENTION_SWEEPER_DRY_RUN", default.dry_run),
             tick: config
                 .test_duration_secs("SPACE_SNAPSHOT_RETENTION_SWEEPER_TICK_SECS", default.tick),
             keep_n: config.positive_u32("SPACE_SNAPSHOT_RETENTION_SWEEPER_KEEP_N", default.keep_n),

@@ -55,17 +55,25 @@ fn environment_overrides_policy_and_scope() {
 }
 
 #[test]
-fn dry_run_is_read_as_an_operator_setting() {
+fn dry_run_fails_toward_not_deleting() {
     for (value, expected) in [
-        ("true", true),
-        ("1", true),
-        ("false", false),
-        ("bogus", false),
+        (None, false),
+        (Some("true"), true),
+        (Some("false"), false),
+        (Some("yes"), true),
+        (Some("no"), false),
+        (Some("on"), true),
+        (Some("off"), false),
+        (Some(" TRUE "), true),
+        (Some("bogus"), true),
+        (Some(""), true),
     ] {
         let mut env = pplx_space_test_env::TestEnv::default();
-        env.set("SPACE_SNAPSHOT_RETENTION_SWEEPER_DRY_RUN", value);
+        if let Some(value) = value {
+            env.set("SPACE_SNAPSHOT_RETENTION_SWEEPER_DRY_RUN", value);
+        }
         let config = ReconcilerConfig::from_environment(&env);
-        assert_eq!(config.dry_run, expected, "DRY_RUN={value}");
+        assert_eq!(config.dry_run, expected, "DRY_RUN={value:?}");
         assert_eq!(RetentionPolicy::from(config).dry_run, expected);
     }
 }
