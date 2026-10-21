@@ -5,6 +5,9 @@
 //! successor blocks on [`ServiceMutex::acquire`] until the predecessor
 //! releases the mutex — cooperatively on `SIGTERM` drain, or via kernel-level
 //! release on process death.
+//!
+//! It is its own crate so a service can take the mutex without the rest of
+//! `pplx-space-common-svc`, which re-exports it as `service_mutex`.
 
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};

@@ -5516,6 +5516,7 @@ dependencies = [
  "pplx-space-migration-checksums",
  "pplx-space-observability",
  "pplx-space-rustls-provider",
+ "pplx-space-service-mutex",
  "pplx-space-systemd-watchdog",
  "pplx-space-test-env",
  "pplx-space-tokio-runtime",
@@ -6949,6 +6950,18 @@ dependencies = [
  "serde",
  "sqlx",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "pplx-space-service-mutex"
+version = "0.8.0"
+dependencies = [
+ "nix 0.31.3",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

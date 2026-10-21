@@ -30,7 +30,7 @@ pub mod page_cache;
 pub mod peer_auth;
 pub mod rate_limiter;
 pub mod redis;
-pub mod service_mutex;
+pub use pplx_space_service_mutex as service_mutex;
 #[cfg(test)]
 mod service_mutex_handoff_tests;
 pub mod shared_valkey;

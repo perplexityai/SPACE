@@ -12,11 +12,7 @@ async fn acquires_on_fresh_file() {
     // Umask is process-wide, so exercise it in a child running only this test.
     if std::env::var_os("SPACE_MUTEX_MODE_TEST_CHILD").is_none() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "service_mutex::tests::acquires_on_fresh_file",
-                "--nocapture",
-            ])
+            .args(["--exact", "tests::acquires_on_fresh_file", "--nocapture"])
             .env("SPACE_MUTEX_MODE_TEST_CHILD", "1")
             .output()
             .expect("run isolated mode test");
