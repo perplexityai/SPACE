@@ -51,7 +51,7 @@ impl RecordingExecutor {
 async fn claim_everything(store: &PublicOperationStore) -> TestResult {
     store
         .claim_operations(ClaimPublicOperations {
-            limit: 64,
+            limits: ClaimLimits::any(64),
             claim_stale_after: DEFAULT_CLAIM_STALE_AFTER,
             claimable_kinds: NATIVE_PUBLIC_OPERATION_KINDS,
         })
@@ -208,7 +208,7 @@ async fn work_handed_back_unrun_at_its_first_claim_still_expires_past_its_deadli
     .await?;
     let claim = store
         .claim_operations(ClaimPublicOperations {
-            limit: 64,
+            limits: ClaimLimits::any(64),
             claim_stale_after: DEFAULT_CLAIM_STALE_AFTER,
             claimable_kinds: NATIVE_PUBLIC_OPERATION_KINDS,
         })

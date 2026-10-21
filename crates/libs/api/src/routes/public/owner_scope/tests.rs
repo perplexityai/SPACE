@@ -191,7 +191,9 @@ async fn native_admission_records_effective_owner_and_scopes_replay_and_polling(
 
 #[tokio::test]
 async fn deleted_sandbox_replay_is_authorized_by_its_retained_operation() -> TestDbResult<()> {
-    use crate::public_operations::{ClaimPublicOperations, CompleteClaimedPublicOperation};
+    use crate::public_operations::{
+        ClaimLimits, ClaimPublicOperations, CompleteClaimedPublicOperation,
+    };
     use pplx_space_public_api::{
         OperationKind, PublicOperationResult, PublicSandboxOperationResult, SandboxLifecycleAction,
         SandboxLifecycleState,
@@ -224,7 +226,7 @@ async fn deleted_sandbox_replay_is_authorized_by_its_retained_operation() -> Tes
         let store = PublicOperationStore::new(fixture.db.pool.clone());
         let claim = store
             .claim_operations(ClaimPublicOperations {
-                limit: 1,
+                limits: ClaimLimits::any(1),
                 claim_stale_after: Duration::from_secs(60),
                 claimable_kinds: &[OperationKind::DeleteSandbox],
             })
@@ -597,7 +599,9 @@ async fn a_local_credential_in_a_materialized_org_cannot_access_federated_resour
 #[tokio::test]
 async fn queued_native_create_grant_renewal_is_monotone_and_terminal_payload_is_scrubbed()
 -> TestDbResult<()> {
-    use crate::public_operations::{ClaimPublicOperations, CompleteClaimedPublicOperation};
+    use crate::public_operations::{
+        ClaimLimits, ClaimPublicOperations, CompleteClaimedPublicOperation,
+    };
     use pplx_space_public_api::OperationKind;
     use std::time::Duration;
     let fixture = fixture().await?;
@@ -639,7 +643,7 @@ async fn queued_native_create_grant_renewal_is_monotone_and_terminal_payload_is_
     let store = PublicOperationStore::new(fixture.db.pool.clone());
     let claim = store
         .claim_operations(ClaimPublicOperations {
-            limit: 1,
+            limits: ClaimLimits::any(1),
             claim_stale_after: Duration::from_secs(60),
             claimable_kinds: &[OperationKind::CreateSandbox],
         })

@@ -243,7 +243,9 @@ mod delete {
     use pplx_space_test_env::TestResult;
 
     use super::*;
-    use crate::public_operations::{ClaimPublicOperations, CompleteClaimedPublicOperation};
+    use crate::public_operations::{
+        ClaimLimits, ClaimPublicOperations, CompleteClaimedPublicOperation,
+    };
 
     // Long enough to observe a queued row a few times, short enough that a
     // dispatcher-free test stays fast.
@@ -303,7 +305,7 @@ mod delete {
 
         let claimed = store
             .claim_operations(ClaimPublicOperations {
-                limit: 1,
+                limits: ClaimLimits::any(1),
                 claim_stale_after: Duration::from_secs(60),
                 claimable_kinds: &[OperationKind::DeleteSandbox],
             })
@@ -385,7 +387,7 @@ mod delete {
         };
         let mut claimed = store
             .claim_operations(ClaimPublicOperations {
-                limit: 1,
+                limits: ClaimLimits::any(1),
                 claim_stale_after: Duration::from_secs(60),
                 claimable_kinds: &[OperationKind::DeleteSandbox],
             })

@@ -398,7 +398,7 @@ async fn queued_delete_survives_observer_loss_and_reaches_authoritative_finality
     let dispatcher_store = PublicOperationStore::new(db.pool.clone());
     let claimed = dispatcher_store
         .claim_operations(ClaimPublicOperations {
-            limit: 1,
+            limits: ClaimLimits::any(1),
             claim_stale_after: Duration::from_secs(60),
             claimable_kinds: &[OperationKind::DeleteSandbox],
         })
@@ -463,7 +463,7 @@ async fn create_claimed_operation_is_invisible_to_fresh_dispatcher_claims() -> T
     // the inline claim.
     let claim = store
         .claim_operations(ClaimPublicOperations {
-            limit: 10,
+            limits: ClaimLimits::any(10),
             claim_stale_after: Duration::from_secs(300),
             claimable_kinds: &[OperationKind::DeleteSandbox],
         })
@@ -517,7 +517,7 @@ async fn stale_inline_claim_is_reclaimed_for_background_redrive() -> TestResult 
     // same idempotent delete.
     let claim = store
         .claim_operations(ClaimPublicOperations {
-            limit: 10,
+            limits: ClaimLimits::any(10),
             claim_stale_after: Duration::ZERO,
             claimable_kinds: &[OperationKind::DeleteSandbox],
         })
@@ -598,7 +598,7 @@ async fn claimed_operation_returns_the_traceparent_it_was_created_with() -> Test
 
     let claim = store
         .claim_operations(ClaimPublicOperations {
-            limit: 10,
+            limits: ClaimLimits::any(10),
             claim_stale_after: Duration::from_secs(60),
             claimable_kinds: &[OperationKind::DeleteSandbox],
         })
@@ -639,7 +639,7 @@ async fn claim_operations_filters_kind_and_marks_running() -> TestResult {
 
     let claim = store
         .claim_operations(ClaimPublicOperations {
-            limit: 10,
+            limits: ClaimLimits::any(10),
             claim_stale_after: Duration::from_secs(60),
             claimable_kinds: &[OperationKind::WakeSandbox],
         })
@@ -678,7 +678,7 @@ async fn claimed_payload_updates_require_the_active_claim_generation() -> TestRe
             .expect_created();
     let claim = store
         .claim_operations(ClaimPublicOperations {
-            limit: 1,
+            limits: ClaimLimits::any(1),
             claim_stale_after: Duration::from_secs(60),
             claimable_kinds: &[OperationKind::ForkSandbox],
         })
@@ -739,7 +739,7 @@ async fn complete_claimed_operation_terminalizes_and_unclaims() -> TestResult {
             .expect_created();
     let claim = store
         .claim_operations(ClaimPublicOperations {
-            limit: 1,
+            limits: ClaimLimits::any(1),
             claim_stale_after: Duration::from_secs(60),
             claimable_kinds: &[OperationKind::WakeSandbox],
         })
@@ -772,7 +772,7 @@ async fn complete_claimed_operation_terminalizes_and_unclaims() -> TestResult {
 
     let empty_claim = store
         .claim_operations(ClaimPublicOperations {
-            limit: 1,
+            limits: ClaimLimits::any(1),
             claim_stale_after: Duration::from_secs(60),
             claimable_kinds: &[OperationKind::WakeSandbox],
         })
@@ -794,7 +794,7 @@ async fn release_claimed_operation_requeues_with_backoff() -> TestResult {
             .expect_created();
     let claim = store
         .claim_operations(ClaimPublicOperations {
-            limit: 1,
+            limits: ClaimLimits::any(1),
             claim_stale_after: Duration::from_secs(60),
             claimable_kinds: &[OperationKind::WakeSandbox],
         })
@@ -832,7 +832,7 @@ async fn release_claimed_operation_requeues_with_backoff() -> TestResult {
 
     let immediate_claim = store
         .claim_operations(ClaimPublicOperations {
-            limit: 1,
+            limits: ClaimLimits::any(1),
             claim_stale_after: Duration::from_secs(60),
             claimable_kinds: &[OperationKind::WakeSandbox],
         })
@@ -856,7 +856,7 @@ async fn backpressure_release_rolls_back_claim_attempt() -> TestResult {
     // First claim increments attempts to 1.
     let claim = store
         .claim_operations(ClaimPublicOperations {
-            limit: 1,
+            limits: ClaimLimits::any(1),
             claim_stale_after: Duration::from_secs(60),
             claimable_kinds: &[OperationKind::WakeSandbox],
         })
@@ -881,7 +881,7 @@ async fn backpressure_release_rolls_back_claim_attempt() -> TestResult {
     // long limiter wait never inflates a later ordinary error's budget.
     let reclaim = store
         .claim_operations(ClaimPublicOperations {
-            limit: 1,
+            limits: ClaimLimits::any(1),
             claim_stale_after: Duration::from_secs(60),
             claimable_kinds: &[OperationKind::WakeSandbox],
         })
@@ -1509,7 +1509,7 @@ async fn renewing_a_claim_prevents_stale_dispatcher_takeover() -> TestResult {
     );
     let competing = store
         .claim_operations(ClaimPublicOperations {
-            limit: 1,
+            limits: ClaimLimits::any(1),
             claim_stale_after: Duration::from_secs(60),
             claimable_kinds: &[OperationKind::DeleteSandbox],
         })

@@ -120,7 +120,7 @@ async fn claim_all(
 ) -> Result<PublicOperationClaim, pplx_space_api::public_operations::PublicOperationStoreError> {
     store
         .claim_operations(ClaimPublicOperations {
-            limit: 64,
+            limits: ClaimLimits::any(64),
             claim_stale_after: Duration::from_secs(60),
             claimable_kinds: NATIVE_PUBLIC_OPERATION_KINDS,
         })
@@ -538,7 +538,7 @@ async fn an_unclaimable_kind_never_holds_back_its_sandbox() -> TestResult {
 
     let claim = store
         .claim_operations(ClaimPublicOperations {
-            limit: 8,
+            limits: ClaimLimits::any(8),
             claim_stale_after: Duration::from_secs(60),
             claimable_kinds: &[OperationKind::WakeSandbox],
         })

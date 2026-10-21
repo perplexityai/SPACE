@@ -1283,9 +1283,39 @@ pub enum CreateClaimedPublicOperationResult {
 
 #[derive(Debug, Clone)]
 pub struct ClaimPublicOperations<'a> {
-    pub limit: u32,
+    pub limits: ClaimLimits,
     pub claim_stale_after: Duration,
     pub claimable_kinds: &'a [OperationKind],
+}
+
+/// Sandbox deletes and kills: operations that tear down a sandbox's VM and
+/// so free capacity, which the dispatcher keeps execution slots for.
+pub const TEARDOWN_KINDS: &[OperationKind] =
+    &[OperationKind::DeleteSandbox, OperationKind::KillSandbox];
+
+/// How many operations one claim may take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaimLimits {
+    /// Operations of any kind.
+    pub total: u32,
+    /// Of those, operations other than teardowns ([`TEARDOWN_KINDS`]), so
+    /// execution slots kept for teardowns are not taken by other work.
+    pub non_teardown: u32,
+    /// Of those, teardowns while other work is also due, so execution slots
+    /// kept for other work are not taken by teardowns. With no other work
+    /// due, teardowns may take all `total`.
+    pub teardown_while_other_due: u32,
+}
+
+impl ClaimLimits {
+    /// Up to `total` operations, of any kinds.
+    pub const fn any(total: u32) -> Self {
+        Self {
+            total,
+            non_teardown: total,
+            teardown_while_other_due: total,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1635,7 +1665,7 @@ async fn claim_operations(
     input: ClaimPublicOperations<'_>,
     mode: ClaimMode,
 ) -> Result<PublicOperationClaim, PublicOperationStoreError> {
-    if input.limit == 0 || input.claimable_kinds.is_empty() {
+    if input.limits.total == 0 || input.claimable_kinds.is_empty() {
         return Ok(PublicOperationClaim {
             claim_token: new_claim_token(),
             operations: Vec::new(),
@@ -1649,6 +1679,10 @@ async fn claim_operations(
         .map(|kind| kind.as_str().to_string())
         .collect::<Vec<_>>();
 
+    let teardown_labels = TEARDOWN_KINDS
+        .iter()
+        .map(|kind| kind.as_str().to_string())
+        .collect::<Vec<_>>();
     let mut tx = pool.begin().await?;
     let keyed = mode == ClaimMode::Keyed;
     if keyed {
@@ -1687,7 +1721,12 @@ async fn claim_operations(
     // pass reads just those, in one sort. Forks name
     // their source by a different id form and keep their own lifecycle lock,
     // so they stay outside the key. With `$11` unset (the kill switch)
-    // `blocked` is empty.
+    // `blocked` is empty. Teardowns (`$14`: deletes and kills) and other work
+    // are picked apart. At most `$12` of the claim are other work, which keeps
+    // the slots reserved for teardowns free of it. While other work is due, at
+    // most `$13` are teardowns, which keeps the slots reserved for other work
+    // free of them; with none due, teardowns may take any free slot. The claim
+    // then takes the first `$1` of both, in the same order.
     let rows = sqlx::query_as::<_, DispatcherClaimRow>(sql!(
         "WITH shared AS (
              SELECT org_id, target_id
@@ -1748,14 +1787,17 @@ async fn claim_operations(
                 OR (NOT sandbox_stale AND head_due AND position > 1)
                 OR (NOT sandbox_stale AND NOT head_due AND NOT first_free_delete)
          ),
-         picked AS (
+         picked_other AS (
              SELECT candidate.operation_id,
+                    candidate.next_attempt_at,
+                    candidate.requested_at,
                     GREATEST(candidate.requested_at, candidate.next_attempt_at) AS claimable_at,
                     candidate.claim_token <> '' AS reclaimed,
                     candidate.started_at IS NULL AS first_start
              FROM public_operations candidate
              WHERE candidate.state IN ($4, $5)
                AND candidate.kind = ANY($6)
+               AND candidate.kind <> ALL($14)
                AND candidate.next_attempt_at <= NOW()
                AND (
                    candidate.claim_token = ''
@@ -1763,8 +1805,39 @@ async fn claim_operations(
                )
                AND candidate.operation_id NOT IN (SELECT operation_id FROM blocked)
              ORDER BY candidate.next_attempt_at ASC, candidate.requested_at ASC, candidate.operation_id ASC
-             LIMIT $1
+             LIMIT $12
              FOR UPDATE OF candidate SKIP LOCKED
+         ),
+         picked_teardown AS (
+             SELECT candidate.operation_id,
+                    candidate.next_attempt_at,
+                    candidate.requested_at,
+                    GREATEST(candidate.requested_at, candidate.next_attempt_at) AS claimable_at,
+                    candidate.claim_token <> '' AS reclaimed,
+                    candidate.started_at IS NULL AS first_start
+             FROM public_operations candidate
+             WHERE candidate.state IN ($4, $5)
+               AND candidate.kind = ANY($6)
+               AND candidate.kind = ANY($14)
+               AND candidate.next_attempt_at <= NOW()
+               AND (
+                   candidate.claim_token = ''
+                   OR candidate.claimed_at <= NOW() - make_interval(secs => $2::BIGINT)
+               )
+               AND candidate.operation_id NOT IN (SELECT operation_id FROM blocked)
+             ORDER BY candidate.next_attempt_at ASC, candidate.requested_at ASC, candidate.operation_id ASC
+             LIMIT CASE WHEN EXISTS (SELECT 1 FROM picked_other) THEN $13 ELSE $1 END
+             FOR UPDATE OF candidate SKIP LOCKED
+         ),
+         picked AS (
+             SELECT operation_id, claimable_at, reclaimed, first_start
+             FROM (
+                 SELECT * FROM picked_other
+                 UNION ALL
+                 SELECT * FROM picked_teardown
+             ) claimable
+             ORDER BY next_attempt_at ASC, requested_at ASC, operation_id ASC
+             LIMIT $1
          )
          UPDATE public_operations o
          SET state = $5,
@@ -1798,7 +1871,7 @@ async fn claim_operations(
                        AS queue_wait_ms,
                    picked.reclaimed"
     ))
-    .bind(i64::from(input.limit))
+    .bind(i64::from(input.limits.total))
     .bind(duration_secs_i64(input.claim_stale_after))
     .bind(&claim_token)
     .bind(OperationState::Queued.as_str())
@@ -1809,6 +1882,14 @@ async fn claim_operations(
     .bind(OperationKind::DeleteSandbox.as_str())
     .bind(OperationKind::CreateSandbox.as_str())
     .bind(keyed)
+    .bind(i64::from(input.limits.non_teardown.min(input.limits.total)))
+    .bind(i64::from(
+        input
+            .limits
+            .teardown_while_other_due
+            .min(input.limits.total),
+    ))
+    .bind(&teardown_labels)
     .fetch_all(&mut *tx)
     .await?;
 

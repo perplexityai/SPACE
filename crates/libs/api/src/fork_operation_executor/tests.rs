@@ -10,7 +10,7 @@ async fn unfrozen_source_selects_capture_before_yielding() -> pplx_space_test_en
     use pplx_space_public_api::{OperationKind, OperationTargetType};
 
     use crate::public_operations::{
-        ApiProduct, ClaimPublicOperations, CreateClaimedPublicOperationResult,
+        ApiProduct, ClaimLimits, ClaimPublicOperations, CreateClaimedPublicOperationResult,
         CreatePublicOperation, PublicOperationStore, ReleaseClaimedPublicOperation,
     };
 
@@ -92,7 +92,7 @@ async fn unfrozen_source_selects_capture_before_yielding() -> pplx_space_test_en
     );
     let resumed = store
         .claim_operations(ClaimPublicOperations {
-            limit: 1,
+            limits: ClaimLimits::any(1),
             claim_stale_after: Duration::from_secs(30),
             claimable_kinds: &[OperationKind::ForkSandbox],
         })
