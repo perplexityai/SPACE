@@ -184,6 +184,7 @@ pub(super) fn insert_sandbox_operation_paths(
                 "413": { "description": "Request body is too large" },
                 "415": { "description": "Content-Type must be application/json" },
                 "422": { "description": "JSON body does not match CreateSandboxRequest" },
+                "429": { "description": "Your organization is at its sandbox limit. Not retryable: delete a sandbox, then create again" },
                 "500": { "description": "Sandbox operation could not be persisted" },
                 "503": { "description": "Sandbox operation is temporarily unavailable" }
             }

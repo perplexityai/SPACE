@@ -74,6 +74,9 @@ const DEFAULT_IDEMPOTENCY_TTL_HOURS: i64 = 24;
 /// Advisory transaction lock that serializes dispatcher claims across
 /// controller replicas so the keyed-claim rule sees every committed claim.
 pub const PUBLIC_OPERATION_CLAIM_LOCK_KEY: i64 = 0x7370_6163_655f_6f70;
+/// Stable namespace for the per-org advisory transaction lock that
+/// serializes native-create quota admission.
+const ORG_SANDBOX_QUOTA_LOCK_SEED: i64 = 0x6f72_675f_7162;
 
 mod responses;
 pub(crate) use responses::ResponseAdmissionError;
@@ -1029,6 +1032,57 @@ impl PublicOperationAdmission {
             .map_err(sqlx::Error::from)?
             .is_some_and(|record| record.lifecycle != SandboxLifecycle::Deleting.as_str());
         Ok(exists)
+    }
+
+    /// Whether `org_id` holds fewer than `limit` sandboxes, counting its
+    /// sandbox rows plus its queued or running native creates that have no
+    /// row yet. Call only for a genuinely new create, then record it through
+    /// this admission so the count and the insert commit together.
+    ///
+    /// Two creates for the same org must not both see `limit - 1`. A
+    /// per-org advisory transaction lock serializes them: a second create
+    /// waits here until the first commits or rolls back, and the count runs
+    /// as its own statement after the lock is granted, so under READ
+    /// COMMITTED its snapshot includes the first create's operation row.
+    /// Deletes do not take the lock; one landing concurrently only lowers
+    /// the count. Take it after the idempotency-key lock, as every native
+    /// create does, so the two cannot deadlock.
+    pub(crate) async fn org_sandbox_quota_allows_create(
+        &mut self,
+        org_id: OrgId,
+        limit: u32,
+    ) -> Result<bool, PublicOperationStoreError> {
+        sqlx::query(sql!(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1::text, $2))"
+        ))
+        .bind(org_id)
+        .bind(ORG_SANDBOX_QUOTA_LOCK_SEED)
+        .execute(&mut *self.tx)
+        .await?;
+        // A create's target is the public sandbox id, its row's id with the
+        // public prefix, so one already past its row insert counts once.
+        let held = sqlx::query_scalar::<_, i64>(sql!(
+            "SELECT (SELECT COUNT(*) FROM sandboxes WHERE org_id = $1)
+                  + (SELECT COUNT(*)
+                       FROM public_operations op
+                      WHERE op.org_id = $1
+                        AND op.api_product = $2
+                        AND op.kind = $3
+                        AND op.state IN ('queued', 'running')
+                        AND NOT EXISTS (
+                            SELECT 1
+                              FROM sandboxes s
+                             WHERE s.org_id = $1
+                               AND $4 || s.id::text = op.target_id
+                        ))"
+        ))
+        .bind(org_id)
+        .bind(ApiProduct::Native.as_str())
+        .bind(OperationKind::CreateSandbox.as_str())
+        .bind(pplx_space_public_api::PUBLIC_SANDBOX_ID_PREFIX)
+        .fetch_one(&mut *self.tx)
+        .await?;
+        Ok(held < i64::from(limit))
     }
 
     pub async fn create(

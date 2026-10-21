@@ -1839,3 +1839,171 @@ async fn operation_reads_survive_a_column_change_on_the_same_connection() -> Tes
     );
     Ok(())
 }
+
+/// The org quota counts every sandbox row of the org plus each queued or
+/// running native create that has no row yet, so a create past its row
+/// insert counts once. Finished creates and other orgs do not count.
+#[tokio::test]
+async fn org_sandbox_quota_counts_rows_and_unmaterialized_creates_once() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let actor_id = UserId::from_uuid(seed_user(&db.pool, org_id).await?);
+    let other_org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let other_actor_id = UserId::from_uuid(seed_user(&db.pool, other_org_id).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+
+    let materialized = SandboxId::new();
+    for (sandbox_id, lifecycle) in [(materialized, "started"), (SandboxId::new(), "deleting")] {
+        seed_sandbox(&db.pool, sandbox_id, actor_id, org_id, lifecycle).await?;
+    }
+    seed_sandbox(
+        &db.pool,
+        SandboxId::new(),
+        other_actor_id,
+        other_org_id,
+        "started",
+    )
+    .await?;
+    let create = |target: SandboxId| {
+        let store = store.clone();
+        async move {
+            let target_id = PublicSandboxId::from_uuid(target.as_uuid()).to_string();
+            let result: TestResult<OperationId> = match store
+                .create_operation(CreatePublicOperation {
+                    org_id,
+                    actor_user_id: Some(actor_id),
+                    api_product: ApiProduct::Native,
+                    kind: OperationKind::CreateSandbox,
+                    target_type: Some(OperationTargetType::Sandbox),
+                    target_id: Some(&target_id),
+                    payload_json: serde_json::json!({}),
+                    idempotency: None,
+                    traceparent: None,
+                })
+                .await?
+            {
+                CreatePublicOperationResult::Created(operation_id) => Ok(operation_id),
+                other => Err(format!("create was not recorded: {other:?}").into()),
+            };
+            result
+        }
+    };
+    // In flight past its row insert, so already counted by its row.
+    create(materialized).await?;
+    // In flight before its row insert.
+    create(SandboxId::new()).await?;
+    for terminal in ["succeeded", "failed"] {
+        let operation_id = create(SandboxId::new()).await?;
+        sqlx::query(sql!(
+            "UPDATE public_operations SET state = $2 WHERE operation_id = $1"
+        ))
+        .bind(operation_id.as_uuid())
+        .bind(terminal)
+        .execute(&db.pool)
+        .await?;
+    }
+
+    // Two rows plus one unmaterialized create hold three.
+    for (limit, admits) in [(3, false), (4, true)] {
+        let key = IdempotencyKey::parse(format!("org-quota-count-{limit}"))?;
+        let fingerprint = RequestFingerprint::parse("d".repeat(64))?;
+        let mut admission = store
+            .begin_operation_admission(
+                org_id,
+                ApiProduct::Native,
+                &CreatePublicOperationIdempotency {
+                    method: HttpOperationMethod::Post,
+                    path_template: OperationPathTemplate::new("/sandboxes"),
+                    key: &key,
+                    request_fingerprint: &fingerprint,
+                },
+            )
+            .await?;
+        assert_eq!(
+            admission
+                .org_sandbox_quota_allows_create(org_id, limit)
+                .await?,
+            admits,
+            "limit {limit}"
+        );
+        admission.finish().await?;
+    }
+    Ok(())
+}
+
+/// Two creates for one org at `limit - 1` must not both be admitted: the
+/// second waits on the first's quota lock and, once the first commits,
+/// counts its operation.
+#[tokio::test]
+async fn org_sandbox_quota_admits_only_one_of_two_racing_creates() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let org_id = OrgId::from_uuid(seed_org(&db.pool).await?);
+    let actor_id = UserId::from_uuid(seed_user(&db.pool, org_id).await?);
+    let store = PublicOperationStore::new(db.pool.clone());
+    let fingerprint = RequestFingerprint::parse("e".repeat(64))?;
+    let first_key = IdempotencyKey::parse("org-quota-race-first")?;
+    let first_idempotency = CreatePublicOperationIdempotency {
+        method: HttpOperationMethod::Post,
+        path_template: OperationPathTemplate::new("/sandboxes"),
+        key: &first_key,
+        request_fingerprint: &fingerprint,
+    };
+
+    let mut first = store
+        .begin_operation_admission(org_id, ApiProduct::Native, &first_idempotency)
+        .await?;
+    assert!(first.org_sandbox_quota_allows_create(org_id, 1).await?);
+
+    let second = tokio::spawn({
+        let store = store.clone();
+        let fingerprint = fingerprint.clone();
+        async move {
+            let key = IdempotencyKey::parse("org-quota-race-second")?;
+            let mut admission = store
+                .begin_operation_admission(
+                    org_id,
+                    ApiProduct::Native,
+                    &CreatePublicOperationIdempotency {
+                        method: HttpOperationMethod::Post,
+                        path_template: OperationPathTemplate::new("/sandboxes"),
+                        key: &key,
+                        request_fingerprint: &fingerprint,
+                    },
+                )
+                .await?;
+            let admits = admission.org_sandbox_quota_allows_create(org_id, 1).await?;
+            admission.finish().await?;
+            TestResult::Ok(admits)
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        !second.is_finished(),
+        "a racing create must wait until the first commits or rolls back"
+    );
+
+    let target_id = PublicSandboxId::new().to_string();
+    let created = first
+        .create(CreatePublicOperation {
+            org_id,
+            actor_user_id: Some(actor_id),
+            api_product: ApiProduct::Native,
+            kind: OperationKind::CreateSandbox,
+            target_type: Some(OperationTargetType::Sandbox),
+            target_id: Some(&target_id),
+            payload_json: serde_json::json!({}),
+            idempotency: Some(first_idempotency.clone()),
+            traceparent: None,
+        })
+        .await?;
+    assert!(matches!(created, CreatePublicOperationResult::Created(_)));
+    assert!(
+        !second.await?.map_err(|error| error.to_string())?,
+        "the racing create must count the first one"
+    );
+    Ok(())
+}

@@ -49,7 +49,7 @@ fn control_plane_examples(
         codes
             .into_iter()
             .map(|code| {
-                let (_, retryable) = error_contract(&code);
+                let retryable = control_plane_example_retryable(operation, &code);
                 let name = code.as_str().to_owned();
                 let message = match code {
                     Conflict => "Request conflicts with the current state",
@@ -70,6 +70,16 @@ fn control_plane_examples(
             })
             .collect(),
     ))
+}
+
+/// The `retryable` an example of `code` from `operation` carries: the error
+/// contract's, except that createSandbox's 429 is the org sandbox quota, which
+/// clears only when the caller deletes a sandbox.
+fn control_plane_example_retryable(operation: NativeOperation, code: &PublicErrorCode) -> bool {
+    if operation == CREATE_SANDBOX && matches!(code, PublicErrorCode::RateLimited) {
+        return false;
+    }
+    error_contract(code).1
 }
 
 fn data_plane_examples(status: &str, message: &str) -> Option<Value> {

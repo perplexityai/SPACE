@@ -50,6 +50,11 @@ pub struct PublicApiError {
 /// rather than declaring capacity gone. `CapacityUnavailable` is reserved for
 /// placement failing after a request was admitted.
 ///
+/// `RateLimited` also answers a create refused by the org's live-sandbox quota
+/// ([`PublicApiError::sandbox_quota_exceeded`]), the one case that clears the
+/// flag: the refusal lifts only when the caller deletes a sandbox, so waiting
+/// and resending does not help.
+///
 /// The statuses here are what this API's own handlers answer. A rejection the
 /// framework produces before a handler runs (405 unsupported method, 413 body
 /// too large, 415 wrong `Content-Type`, 422 body not matching the schema) is
@@ -153,6 +158,19 @@ impl PublicApiError {
             ResponseOrigin::Cluster,
             ResponseKind::Admission,
         )
+    }
+
+    /// A create refused because the org already holds as many sandboxes as its
+    /// quota allows. A 429 like [`Self::rate_limited`], but not retryable: it
+    /// clears only when the caller deletes a sandbox, not with time.
+    pub fn sandbox_quota_exceeded(message: impl Into<String>) -> Self {
+        Self::from_contract(
+            PublicErrorCode::RateLimited,
+            message,
+            ResponseOrigin::Client,
+            ResponseKind::Admission,
+        )
+        .not_retryable()
     }
 
     /// Clear the `retryable` flag, and any `Retry-After` with it.
