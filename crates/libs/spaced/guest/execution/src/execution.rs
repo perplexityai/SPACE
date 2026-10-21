@@ -166,19 +166,25 @@ impl ExecutionService {
         Ok(())
     }
 
-    pub(super) fn close_process_admission(&self) {
+    /// Close operation admission and signal cancellation of owned work.
+    ///
+    /// Calls through every service clone and previously obtained filesystem handle
+    /// are refused once admission is closed. Repeated calls are harmless. Work
+    /// admitted earlier may still finish; this does not wait for cleanup.
+    pub fn close(&self) {
         let _start_gate = self
             .inner
             .start_gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.inner.shutdown.cancel();
         self.inner.process_tasks.close();
     }
 
     /// Drain guest-owned work during the daemon's cancellation and listener
     /// shutdown. The daemon owns the overall shutdown deadline.
     pub async fn drain(&self) {
-        self.close_process_admission();
+        self.close();
         tokio::join!(
             self.inner.filesystem.drain(),
             self.inner.process_tasks.wait()
@@ -190,8 +196,11 @@ impl ExecutionService {
     /// [`EnvMap`] enforces the shared entry-count, key, value and aggregate byte
     /// limits at construction. Request environment entries override these defaults;
     /// `clean_env` skips them. Already-started processes keep their environment.
-    pub async fn configure_process_env(&self, env: EnvMap) {
+    /// Returns a refused `Unavailable` status when operation admission is closed.
+    pub async fn configure_process_env(&self, env: EnvMap) -> Result<(), Status> {
+        self.require_running()?;
         *self.inner.process_env.write().await = env;
+        Ok(())
     }
 
     /// Owned, nameable filesystem handle for both native and generated-trait calls.
