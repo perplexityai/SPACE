@@ -563,8 +563,8 @@ store and stages its kernel into the execution cache. Cache loss triggers
 reconstruction. Missing or corrupt non-default artifacts cannot replace or
 withdraw E0. Each compiled binding records its qualified lifecycle support; the
 1.17.0 / 6.18.44 and 1.17.0 / 6.1.155 bindings support cold execution and
-same-environment memory snapshots. Restoring across environment identities is
-not an upgrade path: each snapshot retains its original VMM and kernel binding.
+same-environment memory snapshots. Cross-environment restore requires a
+qualified compatible loader; each snapshot retains its original producer binding.
 The 6.1.155 kernel keeps its existing artifact identity when paired with 1.17.0.
 Non-default snapshot capture carries an environment-bound sandbox identity on
 `CreateSnapshot`, with the legacy sandbox ID omitted. Old node-managers reject
@@ -765,3 +765,24 @@ infer permission from `SPACE_ENV`: absent settings revoke non-E0 bindings even o
 Kind and development nodes. Before upgrading a deployment that needs those existing
 bindings, configure its explicit allowlist while keeping the default at E0. Do not
 expand every development deployment's policy merely because of its name.
+
+### Selecting a restore consumer
+
+The snapshot manifest retains original runtime, kernel and state-format identity.
+After claiming activation ownership, sandbox-manager saves the selected loader in
+the sandbox row before preparing files or allocating a slot. Prepare and Launch
+receive that exact consumer. A failed attempt can leave it recorded; cleanup
+retains the checkpoint and a later restore attempt resolves again from producer
+evidence. A subsequent snapshot describes the runtime that actually ran.
+
+Pause/resume keeps the resident VM. This policy change does not kill running VMs
+or add isolated resume refusal: incident-driven stopping, resource reclamation and
+resume revocation must ship together. Stop and delete remain available. Operators
+must stop affected resident VMs when revoking execution during an incident.
+
+A future kernel or incompatible-state upgrade requires explicit memory-loss
+consent, activation fencing and a preserved matching disk/checkpoint pair. Keep
+the old pair until the new cold boot is verified; a failed cold boot must not
+mutate the only rollback disk. Retention is not permission to restore a revoked
+runtime. Retire the checkpoint through a durable lifecycle operation before later
+object garbage collection, never by deleting S3 vmstate and editing lifecycle rows.
