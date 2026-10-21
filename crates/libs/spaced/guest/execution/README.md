@@ -70,7 +70,8 @@ execution metadata.
   Changing policy requires constructing a new execution service. Use a worker
   built with the same library: older worker protocols are rejected before dispatch.
 - Native callers use the generated `Process` trait and the owned, cloneable
-  `Filesystem` implementation returned by `filesystem_service()`. Unary calls
+  `FilesystemHandle` returned by `filesystem_service()`, which implements the
+  generated `Filesystem` trait and has an inherent `write_file`. Unary calls
   check the existing protobuf message-size limits. Payload-bearing calls share
   the same weighted capacity with gRPC; filesystem mutations retain admission
   through owned execution and cleanup, including after caller cancellation.
@@ -83,17 +84,20 @@ execution metadata.
   to retain predecode protection. Handlers reuse that admission without charging
   twice. Native calls cannot install predecode protection retroactively.
 - Native uploads use `ExecutionService::write_file` with
-  `Request<impl Stream<Item = Result<WriteRequest, Status>> + Send>`; keep a service
-  clone for uploads when handing out `filesystem_service()` handles.
+  `Request<impl Stream<Item = Result<WriteRequest, Status>> + Send>`, or the same
+  method on `FilesystemHandle`. Both use the same service state.
   The stream starts with `Open`, then yields `Data` messages using the existing
   protobuf types. It shares gRPC's upload path, admission, per-message size checks
   and bounded relay. Admission precedes the first poll; EOF completes the write.
   Input errors and dropped callers use the same cancellation and partial-write
   semantics as gRPC. Borrowed streams and streams without `Unpin` are supported.
-  There is no idle timeout before `Open` or between `Data` messages. Stalled streams
-  retain payload capacity and, after dispatch, execution capacity. Bound uploads
-  in the caller, for example with `tokio::time::timeout`; cancellation can retain
-  capacity until cleanup settles.
+  Each native wait for input, including `Open`, has a 30-second idle timeout,
+  configurable through `ExecutionServiceConfig::native_upload_idle_timeout`.
+  Expiry returns `DeadlineExceeded` and cancels the upload. Execution backpressure
+  is not input idle time; gRPC retains its existing transport behavior. Callers
+  can additionally bound total upload duration with `tokio::time::timeout`.
+  Cancellation can retain capacity until cleanup settles and does not undo append
+  effects or establish that a fresh-key retry is safe.
   After an upload reserves its idempotency key, a stalled upload also blocks
   retries for the same user and key. Each admitted retry holds its own payload
   slot while waiting, for up to the retention window.
@@ -104,7 +108,11 @@ execution metadata.
   Native callers can use `EnvMap::try_from` to reject invalid maps. The daemon
   retains its wire adapter's sanitization of invalid entries before configuration.
   Native `StartRequest.env` still uses `parse_env`: invalid entries are dropped
-  with a warning, rather than rejecting the start.
+  with a warning, rather than rejecting the start. This deliberately preserves
+  the generated `Process` contract for both native and gRPC callers; transport
+  selection does not change environment semantics. Callers requiring rejection
+  should validate with `EnvMap::try_from` before constructing `StartRequest.env`
+  (use `pplx_space_spaced_guest_protocol::proto_env` to convert the validated map).
 - The daemon cancels the shared token and coordinates listener shutdown with draining work.
   `drain()` joins tracked work; it is not a reusable shutdown-and-reject contract
   for subsequent direct calls. Direct filesystem calls can still have effects.

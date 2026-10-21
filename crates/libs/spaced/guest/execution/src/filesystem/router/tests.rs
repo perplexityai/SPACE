@@ -19,8 +19,8 @@ fn current_user() -> GuestUserName {
     .expect("current user is valid")
 }
 
-fn identity_router() -> FilesystemRouter {
-    FilesystemRouter::new(
+fn identity_router() -> FilesystemHandle {
+    FilesystemHandle::new(
         FilesystemExecutionMode::IdentityWorkers,
         Some(crate::WorkerExecutable::open("/proc/self/exe").expect("test executable")),
         crate::IdentityPolicy::Guest,
@@ -33,7 +33,7 @@ fn identity_router() -> FilesystemRouter {
 }
 
 async fn connected_worker(
-    router: &FilesystemRouter,
+    router: &FilesystemHandle,
 ) -> (
     Channel,
     tokio::task::JoinHandle<io::Result<(u64, u64)>>,
@@ -45,7 +45,7 @@ async fn connected_worker(
 
 /// A worker behind a proxy that counts the bytes the worker sends.
 async fn connected_counted_worker(
-    router: &FilesystemRouter,
+    router: &FilesystemHandle,
 ) -> (
     Channel,
     tokio::task::JoinHandle<io::Result<(u64, u64)>>,
@@ -233,7 +233,7 @@ async fn a_read_through_a_workers_descriptor_ends_with_the_worker() {
     assert_eq!(read[..], data[..read.len()]);
 }
 
-async fn read_file(router: &FilesystemRouter, path: &std::path::Path) -> GuestFileChunkStream {
+async fn read_file(router: &FilesystemHandle, path: &std::path::Path) -> GuestFileChunkStream {
     Filesystem::read(
         router,
         Request::new(ReadRequest {

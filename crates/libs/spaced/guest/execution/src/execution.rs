@@ -22,6 +22,11 @@ pub struct ExecutionServiceConfig {
     /// Required on Linux when using identity workers. Never inferred from the host.
     pub worker_executable: Option<crate::WorkerExecutable>,
     pub cancellation_grace: Duration,
+    /// Maximum wait for each native upload message, including the initial `Open`.
+    /// Defaults to 30 seconds. Applies only to native `write_file`; the gRPC
+    /// stream retains its existing transport behavior. Does not bound cleanup,
+    /// execution backpressure or the total upload duration.
+    pub native_upload_idle_timeout: Duration,
     /// Guest memory used to size retained process output; None uses the fallback budget.
     pub guest_memory_bytes: Option<u64>,
 }
@@ -38,6 +43,7 @@ impl Default for ExecutionServiceConfig {
                 FilesystemExecutionMode::Direct
             },
             cancellation_grace: filesystem::router::DEFAULT_CANCELLATION_GRACE,
+            native_upload_idle_timeout: Duration::from_secs(30),
             guest_memory_bytes: None,
             worker_executable: None,
             identity_policy: if cfg!(target_os = "linux") {
@@ -81,7 +87,7 @@ pub(super) struct ExecutionServiceInner {
     pub(super) process_env: RwLock<EnvMap>,
     pub(super) processes: ProcessRegistry,
     pub(super) idempotency: IdempotencyStore,
-    pub(super) filesystem: filesystem::FilesystemRouter,
+    pub(super) filesystem: filesystem::FilesystemHandle,
     pub(super) guest_cgroups: Option<Arc<ExecutionCgroups>>,
 }
 
@@ -115,7 +121,7 @@ impl ExecutionService {
         config: ExecutionServiceConfig,
         guest_cgroups: Option<Arc<ExecutionCgroups>>,
     ) -> Result<Self, CreateExecutionServiceError> {
-        let filesystem = filesystem::FilesystemRouter::new(
+        let filesystem = filesystem::FilesystemHandle::new(
             config.filesystem_execution,
             config.worker_executable,
             config.identity_policy,
@@ -123,7 +129,8 @@ impl ExecutionService {
             shutdown.clone(),
             config.cancellation_grace,
             guest_cgroups.clone(),
-        )?;
+        )?
+        .with_native_upload_idle_timeout(config.native_upload_idle_timeout);
         config
             .identity_policy
             .validate(config.filesystem_execution)?;
@@ -184,13 +191,8 @@ impl ExecutionService {
         *self.inner.process_env.write().await = env;
     }
 
-    /// Native calls use the same filesystem operations and payload budgets as gRPC.
-    /// Use [`Self::write_file`] for uploads from a native stream.
-    pub fn filesystem_service(
-        &self,
-    ) -> impl pplx_space_spaced_guest_protocol::proto::bridge_guest::filesystem_server::Filesystem
-    + Clone
-    + use<> {
+    /// Owned, nameable filesystem handle for both native and generated-trait calls.
+    pub fn filesystem_service(&self) -> crate::FilesystemHandle {
         self.inner.filesystem.clone()
     }
 
@@ -203,10 +205,11 @@ impl ExecutionService {
     /// gRPC. Admission remains held until owned execution and cleanup settle.
     /// Caller-owned buffers and allocations before yielding input are not bounded
     /// by the service. The stream may borrow from the caller and need not be `Unpin`.
-    /// There is no idle timeout before `Open` or between `Data` messages. A stalled
-    /// stream retains payload capacity and, after dispatch, execution capacity.
-    /// Callers should bound the upload, for example with `tokio::time::timeout`;
-    /// dropping its future cancels the upload but cleanup can retain capacity.
+    /// Each wait for input has the configured native upload idle timeout (30
+    /// seconds by default), including before `Open`. Timeout cancels the upload
+    /// and returns `DeadlineExceeded`; cleanup can retain capacity. Backpressure
+    /// from execution is not input idle time. Callers can also bound total upload
+    /// duration, for example with `tokio::time::timeout`.
     /// After an upload reserves its idempotency key, a stalled upload also blocks
     /// retries for the same user and key. Each admitted retry holds its own payload
     /// slot while waiting, for up to the retention window.
@@ -217,7 +220,7 @@ impl ExecutionService {
     where
         S: futures_util::Stream<Item = Result<WriteRequest, Status>> + Send,
     {
-        self.inner.filesystem.write_from_stream(request).await
+        self.inner.filesystem.write_file(request).await
     }
 
     pub fn filesystem_grpc_service(

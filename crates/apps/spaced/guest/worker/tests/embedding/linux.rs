@@ -154,7 +154,9 @@ pub(super) async fn run() {
     // Borrowed, !Unpin input exercises the native adapter without a transport stream.
     let input = futures_util::stream::iter(upload.iter())
         .then(|message| async move { Ok(message.clone()) });
-    let upload_future = service.write_file(tonic::Request::new(input));
+    let filesystem: pplx_space_spaced_guest_execution::FilesystemHandle =
+        service.filesystem_service();
+    let upload_future = filesystem.write_file(tonic::Request::new(input));
     fn assert_send(_: &impl Send) {}
     assert_send(&upload_future);
     upload_future.await.expect("native upload");

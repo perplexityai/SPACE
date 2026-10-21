@@ -40,7 +40,7 @@ mod operations;
 pub(crate) mod router;
 mod worker;
 
-pub(crate) use router::FilesystemRouter;
+pub(crate) use router::FilesystemHandle;
 #[cfg(target_os = "linux")]
 pub(crate) use worker::FilesystemWorkerError;
 
