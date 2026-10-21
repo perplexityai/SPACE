@@ -603,10 +603,11 @@ class SmokeServices:
 
 
 def repair_orphaned_kind_faults(environment: Mapping[str, str]) -> bool:
-    """On the kind backend, undo a limiter fault an earlier run left, or refuse.
+    """On the kind backend, undo a limiter fault or a fast rollout pace an earlier run left, or refuse.
 
     Runs before every scenario, whatever its fixture: a scenario that takes no
-    Lease would otherwise run against shrunk caps or a store scaled to zero.
+    Lease would otherwise run against shrunk caps, a store scaled to zero, or
+    a control-plane Deployment that rolls without the charts' pace.
     """
 
     values = dict(environment)
@@ -620,7 +621,8 @@ def repair_orphaned_kind_faults(environment: Mapping[str, str]) -> bool:
         ),
         environment=values,
     )
-    return harness.repair_orphaned_limiter_faults()
+    limiter = harness.repair_orphaned_limiter_faults()
+    return harness.repair_orphaned_rollout_pace() or limiter
 
 
 @dataclass(frozen=True)
