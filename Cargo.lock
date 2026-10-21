@@ -5513,6 +5513,7 @@ dependencies = [
  "pplx-space-db-test-fixtures",
  "pplx-space-dependency-drain",
  "pplx-space-metrics",
+ "pplx-space-migration-checksums",
  "pplx-space-observability",
  "pplx-space-rustls-provider",
  "pplx-space-systemd-watchdog",
@@ -5532,7 +5533,6 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
- "toml",
  "tonic",
  "tonic-health",
  "tonic-prost",
@@ -5969,6 +5969,20 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "pplx-space-migration-checksums"
+version = "0.8.0"
+dependencies = [
+ "hex",
+ "pplx-space-db-test-fixtures",
+ "pplx-space-sql-locator",
+ "serde",
+ "sqlx",
+ "thiserror 2.0.20",
+ "tokio",
+ "toml",
 ]
 
 [[package]]
@@ -7264,7 +7278,7 @@ name = "pplx-space-sqlite"
 version = "0.8.0"
 dependencies = [
  "hex",
- "pplx-space-common-svc",
+ "pplx-space-migration-checksums",
  "pplx-space-observability",
  "pplx-space-sql-locator",
  "rusqlite",

@@ -364,7 +364,7 @@ run_clippy_checks() {
 
     # Built alone, so a sqlx or common-svc feature these crates need but only
     # get through unification with the rest of the workspace fails here.
-    echo "--- :rust: Running isolated SQLite helper clippy"
+    echo "--- :rust: Running isolated SQLite helper and migration-checksums clippy"
     CARGO_TARGET_DIR="${target_dir}" cargo clippy \
         --locked \
         -p pplx-space-sqlite \
@@ -376,6 +376,12 @@ run_clippy_checks() {
         -p pplx-space-common-svc \
         --no-default-features \
         --features migration-checksums \
+        -- \
+        -D warnings
+    CARGO_TARGET_DIR="${target_dir}" cargo clippy \
+        --locked \
+        -p pplx-space-migration-checksums \
+        --lib \
         -- \
         -D warnings
 

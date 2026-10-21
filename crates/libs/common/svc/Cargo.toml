@@ -19,7 +19,7 @@ datadog-otel = ["otel", "datadog"]
 k8s = ["dep:k8s-openapi", "dep:kube"]
 # Exposes `sql::migration_checksums`, the accepted-checksums adapter every
 # migration runner embeds.
-migration-checksums = ["dep:toml", "sqlx/migrate"]
+migration-checksums = ["dep:pplx-space-migration-checksums"]
 # Exposes shared route and authentication test helpers to other crates.
 # Unit tests get them under `cfg(test)`; external test suites opt in through
 # a dev-dependency. Mirrors `pplx-space-metrics`'s `test-capture`.
@@ -55,7 +55,6 @@ time = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "rt", "signal", "time"] }
 tokio-stream = { workspace = true, features = ["net"] }
 tokio-util = { workspace = true }
-toml = { workspace = true, optional = true }
 tonic = { workspace = true }
 tonic-health = { workspace = true }
 tower = { workspace = true, features = ["util"] }
@@ -69,6 +68,7 @@ pplx-space-common-core = { workspace = true, features = ["serde", "sqlx"] }
 pplx-space-common-grpc = { workspace = true }
 pplx-space-dependency-drain = { workspace = true }
 pplx-space-metrics = { workspace = true }
+pplx-space-migration-checksums = { workspace = true, optional = true }
 pplx-space-observability = { workspace = true }
 pplx-space-rustls-provider = { workspace = true }
 pplx-space-systemd-watchdog = { workspace = true }
@@ -76,8 +76,6 @@ pplx-space-tokio-runtime = { workspace = true }
 pplx-space-unix-socket-path = { workspace = true }
 
 [dev-dependencies]
-# The accepted-checksums tests migrate in-memory SQLite databases.
-sqlx = { workspace = true, features = ["sqlite-bundled"] }
 insta = { workspace = true }
 pplx-space-common-core = { workspace = true, features = ["test-hooks"] }
 nix = { workspace = true, features = ["signal"] }

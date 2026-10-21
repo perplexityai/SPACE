@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
-use pplx_space_common_core::sql;
 use pplx_space_db_test_fixtures::{TestDbResult, try_raw_pg_test_db};
+use pplx_space_sql_locator::sql;
 use sqlx::SqlSafeStr as _;
 use sqlx::migrate::{Migration, MigrationType};
 

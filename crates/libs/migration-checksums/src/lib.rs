@@ -10,6 +10,11 @@
 //! The manifest is embedded in every migration runner. Stored history is never
 //! rewritten: fresh databases record the bundled SQL's checksum, while upgrades
 //! accept any listed historical checksum without replaying an applied migration.
+//!
+//! It is its own crate because it depends only on serde, hex, toml and SQLx's
+//! `migrate` support, so a migration runner such as `pplx-space-sqlite` can use
+//! it without depending on `pplx-space-common-svc`, which re-exports it as
+//! `sql::migration_checksums` under its `migration-checksums` feature.
 
 use std::collections::BTreeSet;
 
@@ -95,7 +100,7 @@ impl AcceptedChecksums {
     }
 
     pub fn embedded() -> Result<Self, MigrateError> {
-        Self::from_toml(include_str!("../../../../../../db/accepted-checksums.toml"))
+        Self::from_toml(include_str!("../../../../db/accepted-checksums.toml"))
             .map_err(|error| MigrateError::Source(Box::new(error)))
     }
 
