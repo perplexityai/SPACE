@@ -75,6 +75,10 @@ execution metadata.
   the same weighted capacity with gRPC; filesystem mutations retain admission
   through owned execution and cleanup, including after caller cancellation.
   Native callers remain responsible for allocations made before calling the service.
+  Oversized messages return `OutOfRange`; exhausted payload capacity returns
+  `ResourceExhausted`. Use `pplx_space_common_grpc::is_refused_before_start`
+  to identify refusal before execution rather than parsing error messages.
+  An error without that marker does not establish that retrying is safe.
 - The daemon registers `filesystem_grpc_service()` and `process_grpc_service()`
   to retain predecode protection. Handlers reuse that admission without charging
   twice. Native calls cannot install predecode protection retroactively.
