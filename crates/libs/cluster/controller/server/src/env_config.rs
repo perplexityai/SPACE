@@ -10,10 +10,6 @@ impl EnvConfig<'_> {
         pplx_space_common_core::env::test_hook(self.0, var)
     }
 
-    pub(crate) fn test_truthy_default(&self, var: &str, default: bool) -> bool {
-        pplx_space_common_core::env::env_flag(self.test_raw(var).as_deref(), default)
-    }
-
     pub(crate) fn test_duration_secs(&self, var: &str, default: Duration) -> Duration {
         match self.test_raw(var).and_then(|raw| raw.parse::<u64>().ok()) {
             Some(secs) if secs > 0 => Duration::from_secs(secs),

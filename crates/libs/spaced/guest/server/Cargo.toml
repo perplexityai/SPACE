@@ -25,7 +25,7 @@ workspace = true
 # The service entry point: process-mode dispatch, telemetry init, the Tokio
 # runtime, and the readiness loop that `spaced-svc`'s `main` calls. Off by
 # default because it is the only thing here that needs `common-svc`: consumers
-# that link this crate for its service types or `test-support` -- the in-VM
+# that link this crate for its service types or `loopback-diagnostic` -- the in-VM
 # loopback diagnostic, the spaced host test suites -- would otherwise compile
 # `common-svc`'s Postgres, Redis, and TLS stack to reach code they never call.
 service-entrypoint = ["dep:pplx-space-common-svc", "pplx-space-spaced-guest-execution/telemetry"]
@@ -39,7 +39,10 @@ datadog = ["otel", "service-entrypoint", "pplx-space-common-svc/datadog", "pplx-
 # Deprecated for one release; use otel and datadog.
 datadog-otel = ["otel", "datadog"]
 # Exposes the in-VM loopback diagnostic without stabilizing runtime internals.
-test-support = []
+# The diagnostic is a workspace binary that enables this in its normal
+# dependencies, so release builds resolve it too; it adds an export, not
+# behaviour, and is deliberately not named as a test-only feature.
+loopback-diagnostic = []
 
 [dependencies]
 futures-util = { version = "0.3" }
