@@ -2170,3 +2170,67 @@ fn template_refresh_preserves_nocow_and_timestamps() {
     file.write_all_at(b"changed", 0).unwrap();
     assert_eq!(std::fs::read(&dst).unwrap(), vec![7; 8192]);
 }
+
+#[rstest::rstest]
+#[case::default(None)]
+#[case::sha256_override(Some(HashAlg::Sha256))]
+#[tokio::test]
+async fn register_template_uses_producer_algorithm(#[case] override_algorithm: Option<HashAlg>) {
+    let (fixture, sha256, bytes) = expanded_test_rootfs_setup();
+    let expected = match override_algorithm {
+        None | Some(HashAlg::Blake3) => format!("blake3:{}", blake3::hash(&bytes)),
+        Some(HashAlg::Sha256) => sha256,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let name = "registration-hash-test";
+    let source = root.path().join(name).join("build.importing.test");
+    std::fs::create_dir_all(&source).unwrap();
+    for file in [TEMPLATE_ROOTFS_FILE, "metadata.json"] {
+        std::fs::copy(fixture.path().join(file), source.join(file)).unwrap();
+    }
+    let mut service =
+        TemplateManagerService::new_with_template_root(crate::db::test_conn(), root.path())
+            .unwrap()
+            .without_sbx_connect_retries();
+    if let Some(algorithm) = override_algorithm {
+        service = service.with_production_hash_algorithm(algorithm);
+    }
+    let response = service
+        .register_template(internal_request(crate::proto::RegisterTemplateRequest {
+            template: Some(crate::proto::TemplateRef {
+                name: name.into(),
+                ..Default::default()
+            }),
+            staging_dir: Some("build.importing.test".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let observed = response.template.unwrap().content_hash.unwrap();
+    let published = root.path().join(name).join(&observed);
+    // Registration schedules compression; keep its task-owned directory until it finishes.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while rootfs_zstd_generation_inflight()
+            .lock()
+            .unwrap()
+            .contains(&published)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("registration compression should finish");
+    assert_eq!(observed, expected);
+    assert_eq!(
+        std::fs::read(published.join(TEMPLATE_ROOTFS_FILE)).unwrap(),
+        bytes
+    );
+    let manifest: pplx_space_common_core::types::TemplateManifest =
+        serde_json::from_slice(&std::fs::read(published.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest.content_hash, expected);
+    let build = crate::db::get_build(&service.db.lock().unwrap(), name, &expected)
+        .unwrap()
+        .expect("registered identity must be persisted");
+    assert_eq!(build.content_hash, expected);
+}
