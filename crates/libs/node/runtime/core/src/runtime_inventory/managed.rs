@@ -225,8 +225,9 @@ impl RuntimeInventory {
         Ok(inventory)
     }
 
-    /// Include a complete pinned environment; never change new/legacy defaults.
-    /// Missing or invalid environment bytes withdraw that binding, not E0.
+    /// Include pinned artifacts independently; never change new/legacy defaults.
+    /// Runtime failures withdraw all operations for this binding; boot-component
+    /// failures withdraw cold boots only. Other bindings remain independent.
     pub fn include_environment(
         &mut self,
         store: &ArtifactStore,
@@ -254,8 +255,7 @@ impl RuntimeInventory {
                 // External installations share version keys but lack digest evidence.
                 self.environments
                     .values()
-                    .filter_map(|entry| entry.as_ref().ok())
-                    .map(|entry| &entry.runtime)
+                    .filter_map(|entry| entry.runtime.as_ref().ok())
                     .find(|entry| {
                         entry.runtime == release.release
                             && entry.files.paths().all(|path| {
@@ -336,12 +336,9 @@ impl RuntimeInventory {
         };
         // A failed managed binding cannot remove or borrow a legacy installation.
         // Keep a failed entry too, so explicit requests cannot fall back to it.
-        let installed = match (runtime, component) {
-            (Ok(runtime), Ok(component)) => Ok(InstalledEnvironment {
-                runtime,
-                components: vec![component],
-            }),
-            (Err(error), _) | (_, Err(error)) => Err(error),
+        let installed = InstalledEnvironment {
+            runtime,
+            components: component.map(|component| vec![component]),
         };
         self.environments
             .insert(environment.definition().reference(), installed);

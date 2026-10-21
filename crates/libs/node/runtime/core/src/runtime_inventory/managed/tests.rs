@@ -207,9 +207,22 @@ fn managed_e0_survives_cache_loss_without_selecting_other_installs() {
                 binding
                     .resolve(Some(&legacy), RuntimeKind::Firecracker, mode)
                     .is_ok(),
-                allowed,
-                "legacy marker {target} must not silently change kernels"
+                allowed || mode == ExecutionSelectionMode::PersistedStateRestore,
+                "only a cold boot depends on the legacy marker {target}"
             );
+            if mode == ExecutionSelectionMode::PersistedStateRestore {
+                let resolved = binding
+                    .resolve(Some(&legacy), RuntimeKind::Firecracker, mode)
+                    .unwrap();
+                assert!(resolved.components.is_empty());
+                assert!(resolved.execution.components().is_empty());
+                assert_eq!(
+                    resolved.environment,
+                    (legacy.guest() == initial.definition().unwrap().descriptor().spec().guest)
+                        .then(|| initial.definition().unwrap().reference())
+                );
+                assert_eq!(resolved.execution.environment(), None);
+            }
         }
     }
     let mut component = selected.components[0].metadata.clone();
@@ -520,7 +533,12 @@ fn legacy_asset_alias_retains_e0_boot_and_restore() {
         let selected = managed
             .resolve(requested, RuntimeKind::Firecracker, mode)
             .unwrap_or_else(|error| panic!("{mode:?}: {error}"));
-        assert_eq!(selected.components[0].path, image.canonicalize().unwrap());
+        if mode == ExecutionSelectionMode::PersistedStateRestore {
+            assert!(selected.components.is_empty());
+            assert_eq!(selected.execution.components(), legacy.components());
+        } else {
+            assert_eq!(selected.components[0].path, image.canonicalize().unwrap());
+        }
     }
     assert!(managed.check_files_unchanged());
     let other = assets.join("v1.16.0/kernel/vmlinux.bin");
@@ -660,7 +678,13 @@ fn nondefault_inventory_preserves_e0_and_recovers_only_the_exact_pair() {
                     .path(RuntimeFileRole::FirecrackerBinary),
                 Some(legacy_bin.join("firecracker").as_path())
             );
-            assert_eq!(legacy.components[0].path, legacy_kernel);
+            if mode == ExecutionSelectionMode::PersistedStateRestore {
+                assert_eq!(legacy.environment, None);
+                assert!(legacy.components.is_empty());
+                assert_eq!(legacy.execution.components(), legacy_request.components());
+            } else {
+                assert_eq!(legacy.components[0].path, legacy_kernel);
+            }
         }
         let report = inventory.to_proto();
         assert!(report.runtimes.iter().any(|entry| {

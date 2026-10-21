@@ -662,3 +662,12 @@ integrations. Use the node-local clients for explicit non-default selection.
 
 See the [runtime benchmark procedure](../scripts/benchmarks/README.md#runtime-environment-benchmark)
 for building distinct templates and checking the identities that actually ran.
+
+### Restore inputs
+
+A memory snapshot retains the identity of its guest kernel, but restoring it does
+not read a boot kernel image. Node-manager verifies the runtime independently of
+boot-component availability. A missing or damaged local kernel therefore blocks
+cold boots using that kernel, without preventing restore through an otherwise
+usable, approved runtime. Restore never substitutes a local default kernel into
+the snapshot's execution evidence. Pause/resume also keeps the resident kernel.

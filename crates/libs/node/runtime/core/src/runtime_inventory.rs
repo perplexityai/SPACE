@@ -126,7 +126,9 @@ struct ArtifactComponentInstallation {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedExecutionEnvironment {
-    /// Inventory-owned binding selected with these runtime files and components.
+    /// Inventory-owned source binding for authenticating these runtime files.
+    /// An unbound restore can use its verified runtime without asserting a
+    /// kernel identity that its historical snapshot never recorded.
     pub environment: Option<EnvironmentReference>,
     pub execution: ExecutionMetadata,
     pub runtime_files: RuntimeInstallationFiles,
@@ -155,8 +157,8 @@ impl ResolvedExecutionEnvironment {
 /// Artifacts verified for one explicit binding, separate from legacy discovery.
 #[derive(Clone, Debug)]
 struct InstalledEnvironment {
-    runtime: RuntimeInstallation,
-    components: Vec<ArtifactComponentInstallation>,
+    runtime: Result<RuntimeInstallation, std::sync::Arc<RuntimeInventoryError>>,
+    components: Result<Vec<ArtifactComponentInstallation>, std::sync::Arc<RuntimeInventoryError>>,
 }
 
 #[derive(Clone, Debug)]
@@ -167,10 +169,7 @@ pub struct RuntimeInventory {
     /// layout's default for the bounded legacy execution path.
     defaults: Vec<RuntimeIdentity>,
     fingerprints: Vec<(PathBuf, PathFingerprint)>,
-    environments: BTreeMap<
-        EnvironmentReference,
-        Result<InstalledEnvironment, std::sync::Arc<RuntimeInventoryError>>,
-    >,
+    environments: BTreeMap<EnvironmentReference, InstalledEnvironment>,
     #[cfg(feature = "artifact-store")]
     unavailable: Vec<UnavailableArtifact>,
     retry_after: Option<tokio::time::Instant>,
@@ -853,19 +852,19 @@ impl RuntimeInventory {
             .iter()
             .flat_map(|entry| entry.files.files.values().map(PathBuf::as_path))
             .chain(self.components.iter().map(|entry| entry.path.as_path()))
-            .chain(
-                self.environments
-                    .values()
-                    .filter_map(|entry| entry.as_ref().ok())
-                    .flat_map(|environment| {
-                        environment.runtime.files.paths().chain(
-                            environment
-                                .components
-                                .iter()
-                                .map(|entry| entry.path.as_path()),
-                        )
-                    }),
-            )
+            .chain(self.environments.values().flat_map(|environment| {
+                environment
+                    .runtime
+                    .iter()
+                    .flat_map(|runtime| runtime.files.paths())
+                    .chain(
+                        environment
+                            .components
+                            .iter()
+                            .flatten()
+                            .map(|entry| entry.path.as_path()),
+                    )
+            }))
     }
 
     /// Blocking validation of root-controlled file metadata and, for external
@@ -1104,19 +1103,32 @@ impl RuntimeInventory {
     ) -> Result<ResolvedExecutionEnvironment, RuntimeInventoryError> {
         let binding = requested
             .and_then(|metadata| metadata.environment())
-            .and_then(|reference| self.environments.get(&reference))
-            .map(|entry| {
-                entry
+            .and_then(|reference| self.environments.get(&reference));
+        let runtimes = match binding {
+            Some(environment) => std::slice::from_ref(
+                environment
+                    .runtime
                     .as_ref()
-                    .map_err(|error| RuntimeInventoryError::UnavailableBinding(error.clone()))
-            })
-            .transpose()?;
-        let runtimes = binding
-            .map(|environment| std::slice::from_ref(&environment.runtime))
-            .unwrap_or(&self.runtimes);
-        let components = binding
-            .map(|environment| environment.components.as_slice())
-            .unwrap_or(&self.components);
+                    .map_err(|error| RuntimeInventoryError::UnavailableBinding(error.clone()))?,
+            ),
+            None => &self.runtimes,
+        };
+        // A snapshot already contains the running guest kernel. Its recorded
+        // identity remains provenance, not a dependency on a boot image file.
+        let restoring = mode == ExecutionSelectionMode::PersistedStateRestore;
+        let components = match binding {
+            Some(environment) if !restoring => environment
+                .components
+                .as_ref()
+                .map_err(|error| RuntimeInventoryError::UnavailableBinding(error.clone()))?
+                .as_slice(),
+            Some(environment) => environment
+                .components
+                .as_ref()
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+            None => &self.components,
+        };
         let find_runtime = |identity: &RuntimeIdentity| {
             runtimes
                 .iter()
@@ -1179,77 +1191,58 @@ impl RuntimeInventory {
         let mut selected_components = Vec::new();
         if let Some(requested) = requested {
             for component in requested.components() {
-                match components
+                if restoring && component.kind == ArtifactComponentKind::Kernel {
+                    resolved_components.push(component.clone());
+                    continue;
+                }
+                let installed = components
                     .iter()
                     .find(|installed| component_matches(&installed.metadata, component))
-                {
-                    Some(installed) => resolved_components.push(installed.metadata.clone()),
-                    None if mode == ExecutionSelectionMode::PersistedStateRestore
-                        && component.kind == ArtifactComponentKind::Kernel =>
-                    {
-                        tracing::warn!(
-                            ?component,
-                            "requested restore kernel component is not installed; snapshot restore does not require the boot kernel"
-                        );
-                        resolved_components.push(component.clone());
-                    }
-                    None => {
-                        return Err(RuntimeInventoryError::NoCompatibleComponent(
-                            component.clone(),
-                        ));
-                    }
-                }
+                    .ok_or_else(|| {
+                        RuntimeInventoryError::NoCompatibleComponent(component.clone())
+                    })?;
+                resolved_components.push(installed.metadata.clone());
             }
         }
-        let boot_role = boot_component_role();
-        let requested_kernel = requested.and_then(|metadata| {
-            metadata.component(ArtifactComponentKind::Kernel, Some(&boot_role))
-        });
-        let kernel = if let Some(requested_kernel) = requested_kernel
-            && mode != ExecutionSelectionMode::PersistedStateRestore
-        {
-            components
-                .iter()
-                .find(|installed| component_matches(&installed.metadata, requested_kernel))
-        } else if let Some(requested_kernel) = requested_kernel {
-            components
-                .iter()
-                .find(|installed| component_matches(&installed.metadata, requested_kernel))
-                .or_else(|| {
-                    components.iter().find(|installed| {
-                        installed.metadata.kind == ArtifactComponentKind::Kernel
-                            && installed.legacy_default
-                    })
+        if !restoring {
+            let boot_role = boot_component_role();
+            let requested_kernel = requested.and_then(|metadata| {
+                metadata.component(ArtifactComponentKind::Kernel, Some(&boot_role))
+            });
+            let kernel = if let Some(requested_kernel) = requested_kernel {
+                components
+                    .iter()
+                    .find(|installed| component_matches(&installed.metadata, requested_kernel))
+            } else {
+                components.iter().find(|installed| {
+                    installed.metadata.kind == ArtifactComponentKind::Kernel
+                        && if mode == ExecutionSelectionMode::NewColdBoot {
+                            installed.default_for_new
+                        } else {
+                            installed.legacy_default
+                        }
                 })
-        } else if mode != ExecutionSelectionMode::NewColdBoot {
-            components.iter().find(|installed| {
-                installed.metadata.kind == ArtifactComponentKind::Kernel && installed.legacy_default
-            })
-        } else {
-            components.iter().find(|installed| {
-                installed.metadata.kind == ArtifactComponentKind::Kernel
-                    && installed.default_for_new
-            })
-        }
-        .ok_or_else(|| match requested_kernel {
-            Some(component) => RuntimeInventoryError::NoCompatibleComponent(component.clone()),
-            None => RuntimeInventoryError::NoDefaultComponent {
-                kind: ArtifactComponentKind::Kernel,
-                selection: if mode != ExecutionSelectionMode::NewColdBoot {
-                    ComponentDefaultSelection::LegacyArtifact
-                } else {
-                    ComponentDefaultSelection::NewArtifact
+            }
+            .ok_or_else(|| match requested_kernel {
+                Some(component) => RuntimeInventoryError::NoCompatibleComponent(component.clone()),
+                None => RuntimeInventoryError::NoDefaultComponent {
+                    kind: ArtifactComponentKind::Kernel,
+                    selection: if mode == ExecutionSelectionMode::NewColdBoot {
+                        ComponentDefaultSelection::NewArtifact
+                    } else {
+                        ComponentDefaultSelection::LegacyArtifact
+                    },
                 },
-            },
-        })?;
-        if requested_kernel.is_none() {
-            resolved_components.push(kernel.metadata.clone());
+            })?;
+            if requested_kernel.is_none() {
+                resolved_components.push(kernel.metadata.clone());
+            }
+            selected_components.push(ResolvedArtifactComponent {
+                metadata: kernel.metadata.clone(),
+                path: kernel.path.clone(),
+                integrity: kernel.integrity,
+            });
         }
-        selected_components.push(ResolvedArtifactComponent {
-            metadata: kernel.metadata.clone(),
-            path: kernel.path.clone(),
-            integrity: kernel.integrity,
-        });
         let execution = ExecutionMetadata::new(
             selected_runtime.runtime.clone(),
             selected_runtime.guest,
@@ -1261,7 +1254,15 @@ impl RuntimeInventory {
         } else {
             self.initial_environment
                 .as_ref()
-                .filter(|definition| definition.check_execution(&execution).is_ok())
+                .filter(|definition| {
+                    if definition.check_execution(&execution).is_ok() {
+                        return true;
+                    }
+                    // Restore does not consume boot inputs. Authenticate the
+                    // initial runtime independently without inventing kernel
+                    // provenance in the returned ExecutionMetadata.
+                    restoring && definition.check_runtime(&execution).is_ok()
+                })
                 .map(|definition| definition.reference())
         };
         Ok(ResolvedExecutionEnvironment {

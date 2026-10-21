@@ -28,6 +28,25 @@ pub enum EnvironmentRequirementsError {
 }
 
 impl EnvironmentDefinition {
+    /// Authenticate runtime, guest and state-format provenance without requiring
+    /// boot inputs. Snapshot restore does not consume a guest kernel file.
+    pub fn check_runtime(
+        &self,
+        execution: &ExecutionMetadata,
+    ) -> Result<(), EnvironmentBindingError> {
+        let spec = self.descriptor().spec();
+        let RuntimeBinding::ManagedRelease(release) = &spec.runtime;
+        if execution.runtime() != &release.runtime || execution.guest() != spec.guest {
+            return Err(EnvironmentBindingError::RuntimeOrGuest);
+        }
+        let ExecutionCompatibilityProfile::FirecrackerSnapshotV1 { state_format } =
+            &spec.compatibility;
+        if execution.state_format() != Some(state_format) {
+            return Err(EnvironmentBindingError::StateFormat);
+        }
+        Ok(())
+    }
+
     /// Construct a request for this binding. Only a verified node resolver can
     /// turn these requirements into evidence that the environment is usable.
     pub fn execution_requirements(

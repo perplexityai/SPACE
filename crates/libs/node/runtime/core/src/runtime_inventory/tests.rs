@@ -467,7 +467,7 @@ fn digest_matches_even_when_kernel_labels_differ() {
 fn persisted_restore_does_not_require_the_recorded_kernel_to_be_installed() {
     let inventory = RuntimeInventory {
         runtimes: vec![installation("1.16.0", "10.0.0")],
-        components: vec![kernel("vmlinux-6.1.158", 0x42, true, true)],
+        components: vec![kernel("unrelated-default", 0x42, true, true)],
         defaults: Vec::new(),
         fingerprints: Vec::new(),
         environments: BTreeMap::new(),
@@ -487,10 +487,7 @@ fn persisted_restore_does_not_require_the_recorded_kernel_to_be_installed() {
         )
         .unwrap();
 
-    assert_eq!(
-        selected_kernel_path(&selected),
-        Path::new("/kernels/vmlinux-6.1.158/vmlinux.bin")
-    );
+    assert!(selected.components.is_empty());
     assert_eq!(
         selected
             .execution
@@ -498,6 +495,59 @@ fn persisted_restore_does_not_require_the_recorded_kernel_to_be_installed() {
             .unwrap(),
         &requested_kernel
     );
+}
+
+#[test]
+fn binding_availability_depends_on_the_operation() {
+    let reference = EnvironmentReference::new(Digest::sha256([7; 32]));
+    let component = kernel("6.1.155", 42, false, false);
+    let requested =
+        requested("1.15.1", "9.0.0", vec![component.metadata.clone()]).with_environment(reference);
+    for runtime_available in [false, true] {
+        for kernel_available in [false, true] {
+            let mut inventory = inventory(Vec::new());
+            inventory.environments.insert(
+                reference,
+                InstalledEnvironment {
+                    runtime: if runtime_available {
+                        Ok(installation("1.15.1", "9.0.0"))
+                    } else {
+                        Err(std::sync::Arc::new(
+                            RuntimeInventoryError::NoInstalledRuntime(RuntimeKind::Firecracker),
+                        ))
+                    },
+                    components: if kernel_available {
+                        Ok(vec![component.clone()])
+                    } else {
+                        Err(std::sync::Arc::new(
+                            RuntimeInventoryError::NoCompatibleComponent(
+                                component.metadata.clone(),
+                            ),
+                        ))
+                    },
+                },
+            );
+            for mode in [
+                ExecutionSelectionMode::NewColdBoot,
+                ExecutionSelectionMode::ExistingColdBoot,
+                ExecutionSelectionMode::PersistedStateRestore,
+            ] {
+                let result = inventory.resolve(Some(&requested), RuntimeKind::Firecracker, mode);
+                let restoring = mode == ExecutionSelectionMode::PersistedStateRestore;
+                if runtime_available && (restoring || kernel_available) {
+                    let resolved = result.unwrap();
+                    assert_eq!(resolved.execution.components(), requested.components());
+                    assert_eq!(resolved.components.is_empty(), restoring);
+                    assert_eq!(resolved.environment, Some(reference));
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(RuntimeInventoryError::UnavailableBinding(_))
+                    ));
+                }
+            }
+        }
+    }
 }
 
 #[test]
