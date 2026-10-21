@@ -858,7 +858,9 @@ class TemplateBuildControl(Protocol):
 
     def build_sandbox_started(self, node_name: str) -> bool:
         """Whether the builder still runs the build's own sandbox: the `builder@local`
-        sandbox holding the committed prepared rootfs, listed `starting` or `started`."""
+        sandbox holding the committed prepared rootfs, listed as not yet run or running.
+
+        A probe that could not list the sandboxes raises instead."""
         ...
 
     def published_guest_metadata(self, node_name: str, alias: str) -> GuestMetadata: ...

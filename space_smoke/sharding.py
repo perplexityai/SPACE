@@ -129,9 +129,6 @@ _DURATION_SECONDS = {
         # Docker Hub: 15-18 s, of which SDK generation is 2-5 s.
         "native.m1_generated_sdk_conformance": 20,
         "native.resident_pause": 5,
-        # Three Kind runs measured 39-84 s: the deleted rootfs is reclaimed at
-        # node-ctl's next periodic sync.
-        "native.stopped_restart_preserves_rootfs": 60,
         "native_contract.command_validation": 6,
         "native_contract.idempotency_conflict": 5,
         "native_contract.tenant_isolation": 5,

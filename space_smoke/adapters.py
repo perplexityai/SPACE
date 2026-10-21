@@ -4289,7 +4289,7 @@ ON CONFLICT (key_hash) DO NOTHING;
 
     def build_sandbox_started(self, node_name: str) -> bool:
         result = self._node_shell_exec(node_name, _BUILD_SANDBOX_STARTED_SCRIPT, timeout=60)
-        if result.returncode not in (0, 1):
+        if result.returncode not in (0, 3):
             raise RuntimeError(
                 f"could not list the build sandbox on {node_name} ({result.returncode}): "
                 f"{result.detail() or '<no output>'}"
@@ -6326,8 +6326,9 @@ exit 1
 """
 
 # Exits 0 while the builder@local sandbox holding a committed prepared rootfs is
-# listed `starting` or `started` (the build's RUN steps run in it), 1 when
-# there is none. The list's cells are separated by `┆`.
+# listed before or in its run (the build's RUN steps run in it), and 3 when
+# there is none, so a failed listing (any other exit, under `set -e`) is never
+# read as "the build finished". The list's cells are separated by `┆`.
 _BUILD_SANDBOX_STARTED_SCRIPT = r"""set -eu
 sandboxes="$(/space/bin/space-sbxmgr list)"
 for marker in /space/cache/firecracker/sandboxes/*/instance/.space-prepared-rootfs-ready; do
@@ -6335,11 +6336,11 @@ for marker in /space/cache/firecracker/sandboxes/*/instance/.space-prepared-root
   sandbox_dir="${marker%/instance/.space-prepared-rootfs-ready}"
   short_id="$(printf '%s' "${sandbox_dir##*/}" | cut -c 29-36)"
   if printf '%s\n' "$sandboxes" | grep -F "$short_id" | grep -F 'builder@local' \
-      | grep -Eq '┆ *(starting|started) *┆'; then
+      | grep -Eq '┆ *(creating|created|starting|started) *┆'; then
     exit 0
   fi
 done
-exit 1
+exit 3
 """
 
 # Prints three lines: the bundle version inside the rootfs, then metadata.json's

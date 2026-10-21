@@ -168,13 +168,22 @@ def concurrent_restore_converges_to_one_execution(test: smoke.KindEcw) -> None:
         # admitted before the callers drained and is listed by now. Keep
         # watching until every such pod is gone, however long one sat Pending
         # first, and for at least one restore as measured on this runner above
-        # plus the watch's polls. The verdict below fails on a pod still left.
-        race.wait_for_pods_gone()
+        # plus the watch's polls. A pod still listed when the drain gives up
+        # fails here: the watch cannot close while one remains.
+        remaining = race.wait_for_pods_gone()
         window = restore_seconds + 2 * pod_watch.interval_seconds
         watched = round(max(window, time.monotonic() - joined + pod_watch.interval_seconds), 1)
         test.record("teardown_no_running_window_seconds", watched)
         running_after_lift = pod_watch.stop_after(
             seconds=max(pod_watch.interval_seconds, joined + window - time.monotonic())
+        )
+        test.verify(
+            not remaining,
+            "teardown: an admitted pod never drained, so whether it ran is unknown",
+            pods=[(p.pod_name, p.phase, p.deleting) for p in remaining],
+            pods_reached_running_after_lift=[
+                (p.pod_name, p.execution_generation) for p in running_after_lift
+            ],
         )
         race.expect_torn_down(
             outcomes,
